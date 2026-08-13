@@ -93,6 +93,7 @@ pub(crate) fn smoke_local_webrtc_round_trip(
                     &stream_key,
                     &DaemonRequest::Drain {
                         session_id: session_id.clone(),
+                        subscription_id: None,
                     },
                 )
                 .await?;

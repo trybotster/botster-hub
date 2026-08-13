@@ -72,7 +72,7 @@ export type DaemonRequest =
   | { type: "mode_gated_input"; session_id: string; data: string; mode_generation: number; mode_revision: number }
   | { type: "resize"; session_id: string; rows: number; cols: number }
   | { type: "shutdown_session"; session_id: string }
-  | { type: "drain"; session_id: string }
+  | { type: "drain"; session_id: string; subscription_id?: string }
   | { type: "read_screen"; session_id: string }
   | { type: "read_mode_flags"; session_id: string }
   | { type: "capture_snapshot"; session_id: string }

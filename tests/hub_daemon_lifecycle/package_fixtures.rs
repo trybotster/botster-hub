@@ -513,7 +513,12 @@ pub(crate) fn write_required_dependency_package(root: &Path) {
     .expect("write required dependency package manifest");
 }
 
-pub(crate) fn write_supervised_package(root: &Path, package_name: &str, command: &str, args: &[&str]) {
+pub(crate) fn write_supervised_package(
+    root: &Path,
+    package_name: &str,
+    command: &str,
+    args: &[&str],
+) {
     fs::create_dir_all(root).expect("create supervised package root");
     fs::write(root.join("plugin.lua"), "return botster.register({})\n")
         .expect("write plugin entrypoint");
@@ -698,7 +703,12 @@ pub(crate) fn write_reloadable_app_package(root: &Path, version: &str, local_url
     write_reloadable_app_package_named(root, "runtime.reloadable", version, local_url);
 }
 
-pub(crate) fn write_reloadable_app_package_named(root: &Path, name: &str, version: &str, local_url: &str) {
+pub(crate) fn write_reloadable_app_package_named(
+    root: &Path,
+    name: &str,
+    version: &str,
+    local_url: &str,
+) {
     fs::create_dir_all(root).expect("create reloadable app package root");
     fs::write(root.join("plugin.lua"), "return botster.register({})\n")
         .expect("write reloadable app plugin entrypoint");
@@ -1255,7 +1265,10 @@ pub(crate) fn write_python_wait_then_write_script(release_path: &Path, bytes: &[
     script_path
 }
 
-pub(crate) fn write_python_split_utf8_script(first_release: &Path, second_release: &Path) -> PathBuf {
+pub(crate) fn write_python_split_utf8_script(
+    first_release: &Path,
+    second_release: &Path,
+) -> PathBuf {
     let script_path = unique_short_test_dir("live-split-script").join("write.py");
     fs::create_dir_all(script_path.parent().expect("script parent")).expect("create script dir");
     fs::write(
@@ -1694,7 +1707,10 @@ return botster.register({ handlers = {
     fs::write(root.join("plugin.lua"), plugin).expect("write mutation plugin");
 }
 
-pub(crate) fn enable_mutation_package(endpoint: &botster_hub_client::DaemonEndpoint, package_dir: PathBuf) {
+pub(crate) fn enable_mutation_package(
+    endpoint: &botster_hub_client::DaemonEndpoint,
+    package_dir: PathBuf,
+) {
     let enabled = botster_hub_client::request(
         endpoint,
         botster_hub_client::DaemonRequest::EnablePackageLocalPath { path: package_dir },
@@ -1731,4 +1747,3 @@ pub(crate) fn mutation_action(
     )
     .expect("surface action")
 }
-

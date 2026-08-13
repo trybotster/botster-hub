@@ -53,7 +53,8 @@ use super::*;
 
 pub(crate) const OPERATOR_CONSOLE_READINESS_LIVENESS_BACKSTOP: Duration = Duration::from_secs(60);
 pub(crate) const OPERATOR_CONSOLE_READER_DRAIN_BACKSTOP: Duration = Duration::from_secs(2);
-pub(crate) const OPERATOR_CONSOLE_OUTPUT_PROGRESS_BACKSTOP: Duration = LOCAL_RUNTIME_DAEMON_READINESS_BUDGET;
+pub(crate) const OPERATOR_CONSOLE_OUTPUT_PROGRESS_BACKSTOP: Duration =
+    LOCAL_RUNTIME_DAEMON_READINESS_BUDGET;
 pub(crate) const DETERMINISTIC_FOREGROUND_INTERRUPT_SCRIPT: &str = "trap '' INT; node -e 'process.on(\"SIGINT\", () => process.exit(130)); console.log(\"foreground-forward-ready\"); setInterval(() => {}, 1000)' & child=$!; wait \"$child\"";
 pub(crate) struct OperatorConsolePty {
     pub(crate) child: Box<dyn portable_pty::Child + Send + Sync>,
@@ -341,7 +342,11 @@ impl OperatorConsolePty {
         )
     }
 
-    pub(crate) fn spawn_binary_with_env(binary: &Path, data_dir: &Path, environment: &[(&str, &str)]) -> Self {
+    pub(crate) fn spawn_binary_with_env(
+        binary: &Path,
+        data_dir: &Path,
+        environment: &[(&str, &str)],
+    ) -> Self {
         let pty = native_pty_system()
             .openpty(PtySize {
                 rows: 30,
@@ -556,7 +561,11 @@ impl OperatorConsolePty {
         )
     }
 
-    pub(crate) fn try_wait_for_occurrences(&mut self, needle: &str, expected: usize) -> Result<(), String> {
+    pub(crate) fn try_wait_for_occurrences(
+        &mut self,
+        needle: &str,
+        expected: usize,
+    ) -> Result<(), String> {
         let output = Arc::clone(&self.output);
         let result = wait_for_child_condition_with_budget(
             &mut self.child,
@@ -650,4 +659,3 @@ impl Drop for OperatorConsolePty {
         let _ = self.finish_reader_after_exit(OPERATOR_CONSOLE_READER_DRAIN_BACKSTOP);
     }
 }
-

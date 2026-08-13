@@ -162,7 +162,10 @@ pub(crate) fn daemon_protocol_typescript() -> String {
                 ],
             ),
             ("shutdown_session", &[("session_id", "string")]),
-            ("drain", &[("session_id", "string")]),
+            (
+                "drain",
+                &[("session_id", "string"), ("subscription_id?", "string")],
+            ),
             ("read_screen", &[("session_id", "string")]),
             ("read_mode_flags", &[("session_id", "string")]),
             ("capture_snapshot", &[("session_id", "string")]),

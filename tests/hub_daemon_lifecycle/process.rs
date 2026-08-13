@@ -263,7 +263,8 @@ pub(crate) struct SessionWorkerProcessIdentity {
 }
 
 /// Portable census of true `botster-session-worker` binaries (not hub argv mentions).
-pub(crate) fn session_worker_process_identities() -> Result<Vec<SessionWorkerProcessIdentity>, String> {
+pub(crate) fn session_worker_process_identities()
+-> Result<Vec<SessionWorkerProcessIdentity>, String> {
     let output = Command::new("ps")
         .args(["-axo", "pid=,command="])
         .output()
@@ -352,7 +353,10 @@ pub(crate) fn worker_owned_descendant_pids(root_pid: u32) -> Result<Vec<u32>, St
     Ok(owned)
 }
 
-pub(crate) fn worker_belongs_to_data_dir(worker: &SessionWorkerProcessIdentity, data_dir: &Path) -> bool {
+pub(crate) fn worker_belongs_to_data_dir(
+    worker: &SessionWorkerProcessIdentity,
+    data_dir: &Path,
+) -> bool {
     let dir = data_dir.to_string_lossy();
     if dir.is_empty() {
         return false;
@@ -506,7 +510,10 @@ pub(crate) fn linux_process_cpu_ticks(pid: u32) -> Option<u64> {
     Some(fields.get(11)?.parse::<u64>().ok()? + fields.get(12)?.parse::<u64>().ok()?)
 }
 
-pub(crate) fn start_cli_daemon_with_session_worker(data_dir: &Path, session_worker_bin: &Path) -> Child {
+pub(crate) fn start_cli_daemon_with_session_worker(
+    data_dir: &Path,
+    session_worker_bin: &Path,
+) -> Child {
     let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
     command
         .arg("start")
@@ -575,4 +582,3 @@ pub(crate) fn process_thread_count(pid: u32) -> Option<usize> {
     }
     None
 }
-

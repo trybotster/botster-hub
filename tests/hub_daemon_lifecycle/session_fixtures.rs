@@ -223,9 +223,10 @@ pub(crate) fn collect_attach_events(
     let mut events = Vec::new();
     while Instant::now() < deadline {
         let drain = connection
-            .request(&botster_hub_client::DaemonRequest::Drain {
-                session_id: session_id.to_string(),
-            })
+            .request(&botster_hub_client::DaemonRequest::drain_subscription(
+                session_id,
+                subscription_id,
+            ))
             .expect("drain");
         events.extend(drain.events);
         let attached = events.iter().any(|event| {
@@ -277,6 +278,54 @@ pub(crate) fn first_snapshot_payload(
         }
     }
     panic!("expected Snapshot event for {subscription_id}, got {events:?}");
+}
+
+pub(crate) fn install_incremental_attach_snapshots(
+    events: &[botster_hub_client::DaemonEvent],
+    subscription_id: &str,
+    rows: u16,
+    cols: u16,
+) -> botster_terminal_ghostty::GhosttyClientProjection {
+    let mut projection = botster_terminal_ghostty::GhosttyClientProjection::new(
+        botster_core::TerminalScreenSize::new(rows, cols),
+    )
+    .expect("create incremental client projection");
+    let mut saw_ready = false;
+    for event in events {
+        let botster_hub_client::DaemonEvent::Snapshot {
+            subscription_id: event_subscription,
+            history,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        if event_subscription != subscription_id {
+            continue;
+        }
+        let bytes = history
+            .decoded_bytes()
+            .expect("snapshot payload decodes")
+            .to_vec();
+        if !saw_ready {
+            assert_eq!(
+                projection
+                    .install_ghostsnp_ready(bytes)
+                    .expect("READY snapshot"),
+                botster_terminal_ghostty::GhosttySnapshotDecodeProgress::Ready
+            );
+            saw_ready = true;
+        } else {
+            let _ = projection
+                .apply_ghostsnp_history(bytes)
+                .expect("PAGE or FINISH snapshot");
+        }
+    }
+    assert!(
+        saw_ready,
+        "expected a READY Snapshot for {subscription_id}, got {events:?}"
+    );
+    projection
 }
 
 /// Production path: shut down the durable worker session, then remove it from the registry.
@@ -372,14 +421,43 @@ pub(crate) fn python_script_command(script_path: &Path) -> String {
 pub(crate) fn drain_until(
     connection: &mut botster_hub_client::DaemonConnection,
     session_id: &str,
+    predicate: impl FnMut(&botster_hub_client::DaemonEvent) -> bool,
+) -> Vec<botster_hub_client::DaemonEvent> {
+    drain_until_subscription(connection, session_id, None, predicate)
+}
+
+pub(crate) fn drain_until_subscription(
+    connection: &mut botster_hub_client::DaemonConnection,
+    session_id: &str,
+    subscription_id: Option<&str>,
+    predicate: impl FnMut(&botster_hub_client::DaemonEvent) -> bool,
+) -> Vec<botster_hub_client::DaemonEvent> {
+    drain_until_subscription_deadline(
+        connection,
+        session_id,
+        subscription_id,
+        Duration::from_secs(5),
+        predicate,
+    )
+}
+
+pub(crate) fn drain_until_subscription_deadline(
+    connection: &mut botster_hub_client::DaemonConnection,
+    session_id: &str,
+    subscription_id: Option<&str>,
+    timeout: Duration,
     mut predicate: impl FnMut(&botster_hub_client::DaemonEvent) -> bool,
 ) -> Vec<botster_hub_client::DaemonEvent> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + timeout;
     let mut events = Vec::new();
     while Instant::now() < deadline {
         let drain = connection
-            .request(&botster_hub_client::DaemonRequest::Drain {
-                session_id: session_id.to_string(),
+            .request(&match subscription_id {
+                Some(subscription_id) => botster_hub_client::DaemonRequest::drain_subscription(
+                    session_id,
+                    subscription_id,
+                ),
+                None => botster_hub_client::DaemonRequest::drain_session(session_id),
             })
             .expect("drain live output");
         let found = drain.events.iter().any(&mut predicate);
@@ -434,4 +512,3 @@ pub(crate) fn wait_for_session_type_metadata(
     assert_eq!(entity.session_type_lifecycle.as_deref(), Some("task"));
     assert_eq!(entity.traits, vec!["test"]);
 }
-

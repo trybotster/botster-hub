@@ -660,13 +660,9 @@ pub(super) fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut Dae
         .keys()
         .cloned()
         .collect::<BTreeSet<_>>();
-    state.pending_runtime.events.retain(|session_id, _| {
-        active_session_ids.contains(session_id)
-            && state
-                .pending_runtime
-                .active_subscriptions
-                .contains_key(session_id)
-    });
+    state
+        .pending_runtime
+        .retain_active_sessions(&active_session_ids);
     for record in state.reconciliation.records.values() {
         let session_id = record.session.session_id.0.clone();
         if record.lifecycle.as_ref().is_some_and(|lifecycle| {
@@ -677,6 +673,13 @@ pub(super) fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut Dae
         }) {
             continue;
         }
+        if state
+            .pending_runtime
+            .active_subscriptions
+            .contains_key(&session_id)
+        {
+            continue;
+        }
         let drain_cursor = state
             .drain_cursors
             .entry(session_id.clone())
@@ -685,21 +688,7 @@ pub(super) fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut Dae
             .lifecycle_counters
             .lifecycle_session_drains
             .saturating_add(1);
-        if let Ok(output) =
-            runtime.drain_runtime_once(&SessionId(session_id.clone()), *drain_cursor)
-        {
-            let has_client_egress = !output.client_egress.is_empty();
-            let events = crate::client_api::events_from_drain(output);
-            if has_client_egress && !events.is_empty() {
-                *drain_cursor = tick(&mut state.logical_clock);
-                state
-                    .pending_runtime
-                    .events
-                    .entry(session_id)
-                    .or_default()
-                    .extend(events);
-            }
-        }
+        let _ = runtime.drain_runtime_once(&SessionId(session_id.clone()), *drain_cursor);
     }
     state.lifecycle_counters.live_entity_subscriptions = state.entity_subscriptions.len() as u64;
 }

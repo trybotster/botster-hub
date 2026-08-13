@@ -1553,3 +1553,21 @@ The matrix marks JSON plugin surface render/action dispatch and the Hub-owned
 does not claim shipped Web/TUI rendering: browser ticket
 `ticket_1785298229_125024` and terminal ticket
 `ticket_1785438029_926883` owns those production entity-store/binding paths.
+
+Making `Drain.subscription_id` optional advances `CONFORMANCE_FIXTURE_REVISION`
+to 38. `PROTOCOL_VERSION` remains 7. Attach returns `AttachState attaching` for
+the requesting subscription. Snapshot frames and `attached` stream on a
+subscription-owned drain. Hub does not inspect Snapshot payload bytes.
+
+Core owns the incremental phase machine. The success order is READY, PAGE*,
+FINISH, `attached`, then `TerminalOutput`. A pre-READY failure is Core
+`drain_subscription` returning an error, which Hub maps to `AttachState
+attach_failed`. A post-READY history failure is READY, zero or more PAGE
+frames, `AttachState snapshot_history_incomplete`, `attached`, then
+`TerminalOutput`, with no FINISH Snapshot.
+
+`snapshot_delivery=ready_then_history` is defined and has a request-specific
+requirement (`DaemonCompatibilityRequirement::for_ready_then_history_attach()`).
+It is not advertised until Hub clean review. On the success path a real opaque
+FINISH Snapshot precedes `attached`. A production socket Drain receives READY
+before later PAGE/FINISH frames.

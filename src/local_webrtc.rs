@@ -33,6 +33,7 @@ use webrtc::runtime::{Runtime, Sender as AsyncSender, channel, default_runtime, 
 
 use crate::daemon_transport::{
     ControlMessage, ControlSender, ENTITY_SUBSCRIPTION_QUEUE_CAPACITY, EntityFrameSender,
+    response_records_attach_ownership,
 };
 
 const GRANT_TTL_SECONDS: u64 = 120;
@@ -571,6 +572,41 @@ pub(crate) struct LocalWebrtcAttachedSubscription {
 enum LocalWebrtcAttachedSubscriptionChange {
     Attach(LocalWebrtcAttachedSubscription),
     Detach(LocalWebrtcAttachedSubscription),
+}
+
+fn local_webrtc_attach_change_for_response(
+    request: &DaemonRequest,
+    response: &DaemonResponse,
+) -> Option<LocalWebrtcAttachedSubscriptionChange> {
+    if let Some((session_id, subscription_id)) =
+        response.events.iter().find_map(|event| match event {
+            botster_hub_client::DaemonEvent::AttachState {
+                session_id,
+                subscription_id,
+                state,
+            } if state == botster_hub_client::ATTACH_STATE_ATTACH_FAILED => {
+                Some((session_id.clone(), subscription_id.clone()))
+            }
+            _ => None,
+        })
+    {
+        return match request {
+            DaemonRequest::Drain {
+                subscription_id: Some(_),
+                ..
+            } => Some(LocalWebrtcAttachedSubscriptionChange::Detach(
+                LocalWebrtcAttachedSubscription {
+                    session_id,
+                    subscription_id,
+                },
+            )),
+            _ => None,
+        };
+    }
+    if !response_records_attach_ownership(response) {
+        return None;
+    }
+    LocalWebrtcAttachedSubscriptionChange::from_request(request)
 }
 
 impl LocalWebrtcAttachedSubscriptionChange {
@@ -1215,7 +1251,7 @@ where
             terminal_cause = LocalWebrtcTerminalCause::ChannelClosed;
             break;
         }
-        let subscription_change = LocalWebrtcAttachedSubscriptionChange::from_request(&request);
+        let ownership_request = request.as_ref().clone();
         let entity_subscription_change = match request.as_ref() {
             DaemonRequest::SubscribeEntities {
                 subscription_id, ..
@@ -1288,11 +1324,12 @@ where
                 "runtime request timed out",
             )),
         };
-        // Only record peer-side attach ownership when the control plane accepted the change.
-        // Stale/failed Attach must not create residual bookkeeping for PeerClosed snapshots.
-        if response.kind != botster_hub_client::DaemonResponseKind::OperatorError {
-            peer_state.apply_subscription_change(subscription_change);
-        }
+        // OperatorError and Attach attach_failed create no ownership. Drain attach_failed
+        // releases any pending route so PeerClosed does not send Detach for a failed attach.
+        peer_state.apply_subscription_change(local_webrtc_attach_change_for_response(
+            &ownership_request,
+            &response,
+        ));
         if let Some((subscribed, subscription_id)) = entity_subscription_change {
             if subscribed
                 && response.kind == botster_hub_client::DaemonResponseKind::EntitySubscribed

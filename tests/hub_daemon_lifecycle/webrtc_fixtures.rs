@@ -51,9 +51,11 @@ use crate::support::{
 
 use super::*;
 
-pub(crate) const LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE: &str = "local-webrtc-sender-terminal.json";
+pub(crate) const LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE: &str =
+    "local-webrtc-sender-terminal.json";
 pub(crate) const LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_MAX_BYTES: usize = 4096;
-pub(crate) const TEST_CLOSE_LOCAL_WEBRTC_OPERATION_ENV: &str = "BOTSTER_HUB_TEST_CLOSE_LOCAL_WEBRTC_OPERATION";
+pub(crate) const TEST_CLOSE_LOCAL_WEBRTC_OPERATION_ENV: &str =
+    "BOTSTER_HUB_TEST_CLOSE_LOCAL_WEBRTC_OPERATION";
 pub(crate) struct LocalWebrtcOffererHandler {
     pub(crate) gather_complete_tx: AsyncSender<()>,
     pub(crate) connected_tx: AsyncSender<()>,
@@ -84,7 +86,8 @@ pub(crate) struct LocalWebrtcOfferPeer {
 }
 
 impl LocalWebrtcOfferPeer {
-    pub(crate) async fn create_offer() -> Result<(Self, serde_json::Value), Box<dyn std::error::Error>> {
+    pub(crate) async fn create_offer()
+    -> Result<(Self, serde_json::Value), Box<dyn std::error::Error>> {
         let runtime =
             default_runtime().ok_or_else(|| std::io::Error::other("no async runtime found"))?;
         let (gather_complete_tx, mut gather_complete_rx) = channel::<()>(1);
@@ -694,7 +697,9 @@ pub(crate) fn rewrite_botster_web_entrypoint(
     .expect("write refreshed botster-web manifest");
 }
 
-pub(crate) fn botster_web_page_bootstrap(web_origin: &str) -> botster_hub_client::DaemonLocalWebrtcBootstrap {
+pub(crate) fn botster_web_page_bootstrap(
+    web_origin: &str,
+) -> botster_hub_client::DaemonLocalWebrtcBootstrap {
     let (headers, body) = read_http_path(web_origin, "/");
     assert!(
         headers.starts_with("HTTP/1.1 200") || headers.starts_with("HTTP/1.0 200"),
@@ -1073,4 +1078,3 @@ pub(crate) fn local_webrtc_bounded_stderr_tail(stderr: &[u8], data_dir: &Path) -
         tail
     }
 }
-

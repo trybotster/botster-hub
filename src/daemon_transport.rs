@@ -18,8 +18,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use botster_core::{
-    EndpointId, EnvelopeCursor, EnvelopeDeliveryState, EnvelopeId, EnvelopeTarget, PackageSource,
-    RequestId, RoutedEnvelope, RoutedEnvelopePayload, RunnableEntrypointKind,
+    ClientId, EndpointId, EnvelopeCursor, EnvelopeDeliveryState, EnvelopeId, EnvelopeTarget,
+    PackageSource, RequestId, RoutedEnvelope, RoutedEnvelopePayload, RunnableEntrypointKind,
     RunnableEntrypointLaunchMode, SessionId, SessionLifecycleState, SubscriptionId,
     TerminalAttachState,
 };
@@ -103,6 +103,10 @@ use crate::{
     SpawnTarget, SpawnTargetCreate, SpawnTargetError, SpawnTargetUpdate, SpawnTargetValidation,
 };
 use crate::{Worktree, WorktreeCreate, WorktreeError};
+
+#[path = "daemon_attach_stream.rs"]
+mod daemon_attach_stream;
+use daemon_attach_stream::{AttachStreamOwner, AttachStreamRegistry};
 
 #[path = "daemon_package_control.rs"]
 mod daemon_package_control;
@@ -496,7 +500,7 @@ async fn handle_connection_async(
         } else {
             (None, None)
         };
-        let active_change = AttachedSubscriptionChange::from_request(&request);
+        let ownership_request = request.clone();
         control_tx
             .send(ControlMessage::Request {
                 request: Box::new(request),
@@ -508,9 +512,10 @@ async fn handle_connection_async(
             .await
             .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
         let response = receive_control_response(reply_rx).await?;
-        if response.kind != DaemonResponseKind::OperatorError {
-            cleanup.apply_subscription_change(active_change);
-        }
+        cleanup.apply_subscription_change(attached_subscription_change_for_response(
+            &ownership_request,
+            &response,
+        ));
         let write_result = write_async_frame(&mut write_half, &response).await;
         if let Some(response_delivery_tx) = response_delivery_tx {
             let _ = response_delivery_tx.send(());
@@ -887,6 +892,7 @@ fn handle_connection_cleanup(
                 egress: &state.egress_diagnostics,
                 lifecycle: &state.lifecycle_counters,
                 client_id: Some(&cleanup.client_id),
+                grant_id: None,
             },
             control_tx.clone(),
             DaemonRequest::Detach {
@@ -1172,9 +1178,19 @@ pub(crate) fn handle_control_message(
                 };
                 return send_control_response(reply_tx, Ok(response), response_delivery_rx);
             }
-            let attached_change = AttachedSubscriptionChange::from_request(&request);
+            let request = *request;
+            let drain_owned_before = match &request {
+                DaemonRequest::Drain {
+                    session_id,
+                    subscription_id: Some(subscription_id),
+                } => state
+                    .pending_runtime
+                    .stream_owner_client_id(session_id, subscription_id)
+                    .is_some(),
+                _ => false,
+            };
             let reconcile_after_request = matches!(
-                request.as_ref(),
+                request,
                 DaemonRequest::Spawn { .. }
                     | DaemonRequest::Resize { .. }
                     | DaemonRequest::ShutdownSession { .. }
@@ -1189,9 +1205,10 @@ pub(crate) fn handle_control_message(
                     egress: &state.egress_diagnostics,
                     lifecycle: &state.lifecycle_counters,
                     client_id: client_id.as_deref(),
+                    grant_id: grant_id.as_deref(),
                 },
                 control_tx,
-                *request,
+                request.clone(),
             )
             .or_else(|error| match error {
                 DaemonTransportError::Client(error) => Ok(daemon_operator_error(error)),
@@ -1204,13 +1221,23 @@ pub(crate) fn handle_control_message(
                 error @ DaemonTransportError::PackageCompensation { .. } => {
                     Ok(daemon_package_compensation_error(error))
                 }
+                error @ DaemonTransportError::SnapshotStreamForbidden { .. } => {
+                    Ok(daemon_snapshot_stream_forbidden_error(error))
+                }
                 error => Err(error),
             });
-            if response
-                .as_ref()
-                .is_ok_and(|response| response.kind != DaemonResponseKind::OperatorError)
-            {
-                record_attached_subscription_change(state, attached_change, grant_id.as_deref());
+            if let Ok(response) = response.as_ref() {
+                let change = attached_subscription_change_for_response(&request, response);
+                let change = match change {
+                    Some(AttachedSubscriptionChange::Detach(_))
+                        if matches!(request, DaemonRequest::Drain { .. })
+                            && !drain_owned_before =>
+                    {
+                        None
+                    }
+                    change => change,
+                };
+                record_attached_subscription_change(state, change, grant_id.as_deref());
             }
             if reconcile_after_request && !state.entity_subscriptions.is_empty() {
                 drive_entity_subscriptions(daemon, state);
@@ -1235,6 +1262,7 @@ pub(crate) fn handle_control_message(
                 );
             }
             // Reply first so surface-action publish can return before fanout delivery.
+            // Attach writes `attaching` before Core attach work; Drain advances the stream.
             let reply_result = send_control_response(reply_tx, response, response_delivery_rx);
             drive_package_entity_fanout(daemon, state);
             drive_package_entity_resync(daemon, state);
@@ -1386,6 +1414,7 @@ pub(crate) fn handle_control_message(
                     egress: &state.egress_diagnostics,
                     lifecycle: &state.lifecycle_counters,
                     client_id: None,
+                    grant_id: None,
                 },
                 detach_list,
             );
@@ -1494,6 +1523,7 @@ struct DaemonObservability<'a> {
     egress: &'a DaemonEgressDiagnostics,
     lifecycle: &'a DaemonLifecycleCounters,
     client_id: Option<&'a str>,
+    grant_id: Option<&'a str>,
 }
 
 fn handle_control_request(
@@ -1921,24 +1951,31 @@ fn handle_runtime_control_request(
             subscription_id,
         } => {
             let now = tick(logical_clock);
-            let tracked_session_id = session_id.clone();
-            let tracked_subscription_id = subscription_id.clone();
-            let response = api.handle_request(
+            let owner = AttachStreamOwner {
+                client_id: observability
+                    .client_id
+                    .unwrap_or("botster-hub-daemon-socket")
+                    .to_string(),
+                grant_id: observability.grant_id.map(str::to_string),
+            };
+            pending_runtime.start_attach(owner, session_id.clone(), subscription_id.clone());
+            let events = match pending_runtime.begin_core_attach(
                 runtime,
-                &packages,
-                HubClientRequest::Attach {
-                    request_id: request_id("daemon-sessions-attach"),
-                    session_id: SessionId(session_id),
-                    subscription_id: SubscriptionId(subscription_id),
-                    now_seconds: now,
-                },
-            )?;
-            pending_runtime
-                .active_subscriptions
-                .entry(tracked_session_id)
-                .or_default()
-                .insert(tracked_subscription_id);
-            events_response(response.body)
+                &session_id,
+                &subscription_id,
+                now,
+            ) {
+                Ok(events) => events,
+                Err(_) => {
+                    pending_runtime.cancel_stream(&session_id, &subscription_id);
+                    vec![DaemonEvent::AttachState {
+                        session_id: session_id.clone(),
+                        subscription_id: subscription_id.clone(),
+                        state: botster_hub_client::ATTACH_STATE_ATTACH_FAILED.to_string(),
+                    }]
+                }
+            };
+            Ok(daemon_events(events))
         }
         DaemonRequest::Detach {
             session_id,
@@ -1947,6 +1984,7 @@ fn handle_runtime_control_request(
             let now = tick(logical_clock);
             let tracked_session_id = session_id.clone();
             let tracked_subscription_id = subscription_id.clone();
+            pending_runtime.cancel_stream(&tracked_session_id, &tracked_subscription_id);
             let response = api.handle_request(
                 runtime,
                 &packages,
@@ -1957,21 +1995,10 @@ fn handle_runtime_control_request(
                     now_seconds: now,
                 },
             )?;
-            if let Some(subscriptions) = pending_runtime
-                .active_subscriptions
-                .get_mut(&tracked_session_id)
-            {
-                subscriptions.remove(&tracked_subscription_id);
-                if subscriptions.is_empty() {
-                    pending_runtime
-                        .active_subscriptions
-                        .remove(&tracked_session_id);
-                    pending_runtime.events.remove(&tracked_session_id);
-                }
-            }
             events_response(response.body)
         }
         DaemonRequest::SendInput { session_id, data } => {
+            let data = data.into_bytes();
             let now = tick(logical_clock);
             let response = api.handle_request(
                 runtime,
@@ -1979,7 +2006,7 @@ fn handle_runtime_control_request(
                 HubClientRequest::Input {
                     request_id: request_id("daemon-sessions-send-input"),
                     session_id: SessionId(session_id),
-                    data: data.into_bytes(),
+                    data,
                     now_seconds: now,
                 },
             )?;
@@ -1991,6 +2018,7 @@ fn handle_runtime_control_request(
             mode_generation,
             mode_revision,
         } => {
+            let data = data.into_bytes();
             let now = tick(logical_clock);
             let response = api.handle_request(
                 runtime,
@@ -1998,7 +2026,7 @@ fn handle_runtime_control_request(
                 HubClientRequest::ModeGatedInput {
                     request_id: request_id("daemon-sessions-mode-gated-input"),
                     session_id: SessionId(session_id),
-                    data: data.into_bytes(),
+                    data,
                     mode_generation,
                     mode_revision,
                     now_seconds: now,
@@ -2072,10 +2100,51 @@ fn handle_runtime_control_request(
             };
             events_response(response.body)
         }
-        DaemonRequest::Drain { session_id } => {
+        DaemonRequest::Drain {
+            session_id,
+            subscription_id,
+        } => {
             let cursor = drain_cursors
                 .entry(session_id.clone())
                 .or_insert_with(|| tick(logical_clock));
+            let now = *cursor;
+            if let Some(subscription_id) = subscription_id {
+                pending_runtime.authorize_drain(
+                    &session_id,
+                    &subscription_id,
+                    observability.client_id,
+                    observability.grant_id,
+                )?;
+                let client_id = ClientId(
+                    pending_runtime
+                        .stream_owner_client_id(&session_id, &subscription_id)
+                        .or_else(|| observability.client_id.map(str::to_string))
+                        .unwrap_or_else(|| "botster-hub-daemon-socket".to_string()),
+                );
+                let events = match runtime.drain_subscription(
+                    &client_id,
+                    &SessionId(session_id.clone()),
+                    &SubscriptionId(subscription_id.clone()),
+                    now,
+                ) {
+                    Ok(output) => crate::client_api::events_from_drain(output)
+                        .into_iter()
+                        .map(daemon_event_from_client)
+                        .collect(),
+                    Err(_) => {
+                        pending_runtime.cancel_stream(&session_id, &subscription_id);
+                        vec![DaemonEvent::AttachState {
+                            session_id: session_id.clone(),
+                            subscription_id,
+                            state: botster_hub_client::ATTACH_STATE_ATTACH_FAILED.to_string(),
+                        }]
+                    }
+                };
+                if !events.is_empty() {
+                    *cursor = tick(logical_clock);
+                }
+                return Ok(daemon_events(events));
+            }
             let response = api.handle_request(
                 runtime,
                 &packages,
@@ -2085,15 +2154,7 @@ fn handle_runtime_control_request(
                     last_output_at: *cursor,
                 },
             )?;
-            let mut response = events_response(response.body)?;
-            if let Some(pending) = pending_runtime.events.remove(&session_id) {
-                let mut pending = pending
-                    .into_iter()
-                    .map(daemon_event_from_client)
-                    .collect::<Vec<_>>();
-                pending.extend(response.events);
-                response.events = pending;
-            }
+            let response = events_response(response.body)?;
             if !response.events.is_empty() {
                 *cursor = tick(logical_clock);
             }
@@ -3265,14 +3326,36 @@ pub(crate) enum ControlMessage {
     },
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(crate) struct PendingRuntimeState {
-    events: BTreeMap<String, Vec<HubClientEvent>>,
-    pub(crate) active_subscriptions: BTreeMap<String, BTreeSet<String>>,
-    /// WebRTC grant that owns each attach row created with a tagged Request.
-    /// Key is (session_id, subscription_id). Used so PeerClosed can sweep residual
-    /// attaches even when the peer-side ownership snapshot was empty.
-    pub(crate) attach_owner_grant_ids: BTreeMap<(String, String), String>,
+    pub(crate) streams: AttachStreamRegistry,
+}
+
+impl fmt::Debug for PendingRuntimeState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PendingRuntimeState")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::ops::Deref for PendingRuntimeState {
+    type Target = AttachStreamRegistry;
+    fn deref(&self) -> &Self::Target {
+        &self.streams
+    }
+}
+
+impl std::ops::DerefMut for PendingRuntimeState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.streams
+    }
+}
+
+impl PendingRuntimeState {
+    pub(super) fn retain_active_sessions(&mut self, active_session_ids: &BTreeSet<String>) {
+        self.streams.retain_active_sessions(active_session_ids);
+    }
 }
 
 #[derive(Debug)]
@@ -3287,6 +3370,7 @@ pub(crate) struct DaemonControlState {
     next_reconciliation: Instant,
     released_entity_generations: u64,
     pub(crate) released_attach_generations: u64,
+    live_attach_routes: BTreeSet<(String, String)>,
     pending_hub_update_reply: Option<ControlReplySender>,
 }
 
@@ -3303,6 +3387,7 @@ impl Default for DaemonControlState {
             next_reconciliation: Instant::now(),
             released_entity_generations: 0,
             released_attach_generations: 0,
+            live_attach_routes: BTreeSet::new(),
             pending_hub_update_reply: None,
         }
     }
@@ -3409,6 +3494,13 @@ fn record_attached_subscription_change(
     };
     match change {
         AttachedSubscriptionChange::Attach(subscription) => {
+            let route = (
+                subscription.session_id.clone(),
+                subscription.subscription_id.clone(),
+            );
+            if !state.live_attach_routes.insert(route.clone()) {
+                return;
+            }
             if state.released_attach_generations > 0 {
                 state.released_attach_generations -= 1;
                 state.lifecycle_counters.reconnect_registrations = state
@@ -3425,25 +3517,23 @@ fn record_attached_subscription_change(
                 .high_water_attach_subscriptions
                 .max(state.lifecycle_counters.live_attach_subscriptions);
             if let Some(grant_id) = owner_grant_id {
-                state.pending_runtime.attach_owner_grant_ids.insert(
-                    (
-                        subscription.session_id.clone(),
-                        subscription.subscription_id.clone(),
-                    ),
-                    grant_id.to_string(),
-                );
+                state
+                    .pending_runtime
+                    .attach_owner_grant_ids
+                    .insert(route, grant_id.to_string());
             }
         }
         AttachedSubscriptionChange::Detach(subscription) => {
+            let route = (subscription.session_id, subscription.subscription_id);
+            if !state.live_attach_routes.remove(&route) {
+                return;
+            }
             state.lifecycle_counters.live_attach_subscriptions = state
                 .lifecycle_counters
                 .live_attach_subscriptions
                 .saturating_sub(1);
             state.released_attach_generations = state.released_attach_generations.saturating_add(1);
-            state
-                .pending_runtime
-                .attach_owner_grant_ids
-                .remove(&(subscription.session_id, subscription.subscription_id));
+            state.pending_runtime.attach_owner_grant_ids.remove(&route);
         }
     }
 }
@@ -3482,6 +3572,55 @@ fn local_webrtc_peer_gone_request_error(operation: &str) -> DaemonResponse {
         )],
     });
     response
+}
+
+fn response_has_attach_failed(response: &DaemonResponse) -> bool {
+    response.events.iter().any(|event| {
+        matches!(
+            event,
+            DaemonEvent::AttachState { state, .. }
+                if state == botster_hub_client::ATTACH_STATE_ATTACH_FAILED
+        )
+    })
+}
+
+pub(crate) fn response_records_attach_ownership(response: &DaemonResponse) -> bool {
+    response.kind != DaemonResponseKind::OperatorError && !response_has_attach_failed(response)
+}
+
+fn attach_failed_route(response: &DaemonResponse) -> Option<AttachedSubscription> {
+    response.events.iter().find_map(|event| match event {
+        DaemonEvent::AttachState {
+            session_id,
+            subscription_id,
+            state,
+        } if state == botster_hub_client::ATTACH_STATE_ATTACH_FAILED => {
+            Some(AttachedSubscription {
+                session_id: session_id.clone(),
+                subscription_id: subscription_id.clone(),
+            })
+        }
+        _ => None,
+    })
+}
+
+fn attached_subscription_change_for_response(
+    request: &DaemonRequest,
+    response: &DaemonResponse,
+) -> Option<AttachedSubscriptionChange> {
+    if let Some(failed) = attach_failed_route(response) {
+        return match request {
+            DaemonRequest::Drain {
+                subscription_id: Some(_),
+                ..
+            } => Some(AttachedSubscriptionChange::Detach(failed)),
+            _ => None,
+        };
+    }
+    if response.kind == DaemonResponseKind::OperatorError {
+        return None;
+    }
+    AttachedSubscriptionChange::from_request(request)
 }
 
 impl AttachedSubscriptionChange {
@@ -4441,6 +4580,21 @@ fn daemon_state_error(error: crate::HubStateStoreError) -> DaemonResponse {
     if let Some(error) = &response.error {
         response.diagnostics = error.diagnostics.clone();
     }
+    response
+}
+
+fn daemon_snapshot_stream_forbidden_error(error: DaemonTransportError) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
+    response.error = Some(DaemonOperatorError {
+        code: "snapshot_stream_forbidden".to_string(),
+        request_id: "daemon-sessions-drain".to_string(),
+        operation: "drain".to_string(),
+        message: error.to_string(),
+        diagnostics: vec![DaemonDiagnostic::action_failure(
+            "drain",
+            "snapshot stream is owned by another connection",
+        )],
+    });
     response
 }
 
@@ -5614,7 +5768,7 @@ fn daemon_operator_error_from_local_webrtc(error: crate::LocalWebrtcError) -> Da
     }
 }
 
-fn daemon_event_from_client(event: HubClientEvent) -> DaemonEvent {
+pub(super) fn daemon_event_from_client(event: HubClientEvent) -> DaemonEvent {
     match event {
         HubClientEvent::SessionLifecycle { session_id, state } => DaemonEvent::SessionLifecycle {
             session_id: session_id.0,
@@ -5765,6 +5919,9 @@ fn lifecycle_label(state: &SessionLifecycleState) -> &'static str {
 fn attach_state_label(state: &TerminalAttachState) -> &'static str {
     match state {
         TerminalAttachState::Attaching => "attaching",
+        TerminalAttachState::SnapshotHistoryIncomplete => {
+            botster_hub_client::ATTACH_STATE_SNAPSHOT_HISTORY_INCOMPLETE
+        }
         TerminalAttachState::Attached => "attached",
         TerminalAttachState::Detached => "detached",
     }
@@ -5798,6 +5955,10 @@ pub enum DaemonTransportError {
     PackageCompensation {
         original: Box<DaemonTransportError>,
         rollbacks: Vec<PackageRollbackFailure>,
+    },
+    SnapshotStreamForbidden {
+        session_id: String,
+        subscription_id: String,
     },
 }
 
@@ -5843,6 +6004,13 @@ impl fmt::Display for DaemonTransportError {
                     rollbacks.len()
                 )
             }
+            Self::SnapshotStreamForbidden {
+                session_id,
+                subscription_id,
+            } => write!(
+                formatter,
+                "snapshot stream forbidden session={session_id} subscription={subscription_id}"
+            ),
         }
     }
 }
@@ -6146,6 +6314,169 @@ mod tests {
             .join()
             .expect("join daemon connection")
             .expect("client disconnect is a clean connection close");
+    }
+
+    #[test]
+    fn attach_failed_events_do_not_detach_on_client_eof() {
+        let (server, mut client) = UnixStream::pair().expect("create daemon socket pair");
+        let (control_tx, mut control_rx) = tokio_mpsc::channel(DAEMON_CONTROL_QUEUE_CAPACITY);
+        let connection = thread::spawn(move || handle_connection(server, control_tx));
+
+        write_frame(
+            &mut client,
+            &DaemonHello {
+                protocol: PROTOCOL.to_string(),
+                compatibility: botster_hub_client::DaemonCompatibilityRequirement::current(),
+            },
+        )
+        .expect("write daemon hello");
+        let _: DaemonHelloAck = read_frame(&mut client).expect("read daemon hello ack");
+
+        write_frame(
+            &mut client,
+            &DaemonRequest::Attach {
+                session_id: "missing-session".to_string(),
+                subscription_id: "missing-sub".to_string(),
+            },
+        )
+        .expect("write attach request");
+        let ControlMessage::Request {
+            request, reply_tx, ..
+        } = receive_test_control_message(&mut control_rx)
+        else {
+            panic!("expected attach control request");
+        };
+        assert!(matches!(*request, DaemonRequest::Attach { .. }));
+        reply_tx
+            .send(Ok(daemon_events(vec![DaemonEvent::AttachState {
+                session_id: "missing-session".to_string(),
+                subscription_id: "missing-sub".to_string(),
+                state: botster_hub_client::ATTACH_STATE_ATTACH_FAILED.to_string(),
+            }])))
+            .expect("reply with attach_failed");
+        let _: DaemonResponse = read_frame(&mut client).expect("read attach_failed response");
+
+        client
+            .shutdown(Shutdown::Both)
+            .expect("disconnect daemon client");
+        connection
+            .join()
+            .expect("join daemon connection")
+            .expect("client disconnect is a clean connection close");
+        assert!(
+            control_rx.try_recv().is_err(),
+            "pre-READY attach_failed must not enqueue Detach cleanup"
+        );
+    }
+
+    #[test]
+    fn drain_attach_failed_releases_pending_connection_ownership() {
+        let (server, mut client) = UnixStream::pair().expect("create daemon socket pair");
+        let (control_tx, mut control_rx) = tokio_mpsc::channel(DAEMON_CONTROL_QUEUE_CAPACITY);
+        let connection = thread::spawn(move || handle_connection(server, control_tx));
+
+        write_frame(
+            &mut client,
+            &DaemonHello {
+                protocol: PROTOCOL.to_string(),
+                compatibility: botster_hub_client::DaemonCompatibilityRequirement::current(),
+            },
+        )
+        .expect("write daemon hello");
+        let _: DaemonHelloAck = read_frame(&mut client).expect("read daemon hello ack");
+
+        write_frame(
+            &mut client,
+            &DaemonRequest::Attach {
+                session_id: "session".to_string(),
+                subscription_id: "subscription".to_string(),
+            },
+        )
+        .expect("write attach request");
+        let ControlMessage::Request {
+            request, reply_tx, ..
+        } = receive_test_control_message(&mut control_rx)
+        else {
+            panic!("expected attach control request");
+        };
+        assert!(matches!(*request, DaemonRequest::Attach { .. }));
+        reply_tx
+            .send(Ok(daemon_events(vec![DaemonEvent::AttachState {
+                session_id: "session".to_string(),
+                subscription_id: "subscription".to_string(),
+                state: "attaching".to_string(),
+            }])))
+            .expect("reply with attaching");
+        let _: DaemonResponse = read_frame(&mut client).expect("read attaching response");
+
+        write_frame(
+            &mut client,
+            &DaemonRequest::drain_subscription("session", "subscription"),
+        )
+        .expect("write scoped drain");
+        let ControlMessage::Request {
+            request, reply_tx, ..
+        } = receive_test_control_message(&mut control_rx)
+        else {
+            panic!("expected drain control request");
+        };
+        assert!(matches!(*request, DaemonRequest::Drain { .. }));
+        reply_tx
+            .send(Ok(daemon_events(vec![DaemonEvent::AttachState {
+                session_id: "session".to_string(),
+                subscription_id: "subscription".to_string(),
+                state: botster_hub_client::ATTACH_STATE_ATTACH_FAILED.to_string(),
+            }])))
+            .expect("reply with drain attach_failed");
+        let _: DaemonResponse = read_frame(&mut client).expect("read drain attach_failed");
+
+        client
+            .shutdown(Shutdown::Both)
+            .expect("disconnect daemon client");
+        connection
+            .join()
+            .expect("join daemon connection")
+            .expect("client disconnect is a clean connection close");
+        assert!(
+            control_rx.try_recv().is_err(),
+            "Drain attach_failed must release pending ownership before disconnect cleanup"
+        );
+    }
+
+    #[test]
+    fn drain_attach_failed_decrements_live_attach_once() {
+        let mut state = DaemonControlState::default();
+        record_attached_subscription_change(
+            &mut state,
+            Some(AttachedSubscriptionChange::Attach(AttachedSubscription {
+                session_id: "session".to_string(),
+                subscription_id: "subscription".to_string(),
+            })),
+            None,
+        );
+        assert_eq!(state.lifecycle_counters.live_attach_subscriptions, 1);
+
+        let drain = DaemonRequest::drain_subscription("session", "subscription");
+        let failed = daemon_events(vec![DaemonEvent::AttachState {
+            session_id: "session".to_string(),
+            subscription_id: "subscription".to_string(),
+            state: botster_hub_client::ATTACH_STATE_ATTACH_FAILED.to_string(),
+        }]);
+        let change = attached_subscription_change_for_response(&drain, &failed);
+        assert!(matches!(
+            change,
+            Some(AttachedSubscriptionChange::Detach(AttachedSubscription {
+                ref session_id,
+                ref subscription_id,
+            })) if session_id == "session" && subscription_id == "subscription"
+        ));
+        record_attached_subscription_change(&mut state, change.clone(), None);
+        assert_eq!(state.lifecycle_counters.live_attach_subscriptions, 0);
+        record_attached_subscription_change(&mut state, change, None);
+        assert_eq!(
+            state.lifecycle_counters.live_attach_subscriptions, 0,
+            "a second Drain attach_failed must not decrement another route"
+        );
     }
 
     #[test]
@@ -6468,6 +6799,7 @@ mod tests {
             egress: &egress,
             lifecycle: &lifecycle,
             client_id: None,
+            grant_id: None,
         };
         let mut clock = 1;
         let mut drain_cursors = BTreeMap::new();
