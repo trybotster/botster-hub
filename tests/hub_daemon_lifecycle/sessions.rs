@@ -1,0 +1,4928 @@
+#[test]
+fn fast_exit_attach_diagnostic_records_subscription_event_order() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("fast-exit-attach-diagnostic");
+    let config = explicit_config(&data_dir);
+    let socket_path = config
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("test config has local socket")
+        .path
+        .clone();
+    let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
+    let child = start_cli_daemon(&data_dir);
+    let session_id = format!(
+        "smoke-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos()
+    );
+    let subscription_id = format!("{session_id}-subscription");
+    let marker = "botster-smoke-terminal-ok";
+    let expected = format!("smoke:{marker}");
+
+    let spawn = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: session_id.clone(),
+            command: format!("printf 'smoke:{marker}\\n'"),
+        },
+    )
+    .expect("spawn immediate-output diagnostic session");
+    assert_eq!(spawn.kind, botster_hub_client::DaemonResponseKind::Spawned);
+
+    // Mirrors stream_attach_connected in crates/botster-hub-client/src/lib.rs:123-172.
+    // Any production boundary change there must update this diagnostic mirror.
+    let mut connection = botster_hub_client::DaemonConnection::connect(&endpoint)
+        .expect("connect diagnostic client");
+    let mut response = connection
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: session_id.clone(),
+            subscription_id: subscription_id.clone(),
+        })
+        .expect("attach diagnostic subscription");
+    let started_at = Instant::now();
+    let mut observed = String::new();
+    let mut matching_observed = String::new();
+    let mut mismatched_marker = false;
+    let mut opaque_history_bytes = 0;
+    let mut saw_process_exit = false;
+    let mut ordered_observations = Vec::new();
+    let mut response_index = 0;
+    let mut request_kind = "attach";
+    let mut idle_drains = 0;
+
+    let boundary_reason = loop {
+        let mut response_observations = Vec::new();
+        let mut response_renderable_bytes = 0;
+        for event in &response.events {
+            let observation = match event {
+                botster_hub_client::DaemonEvent::SessionLifecycle {
+                    session_id: event_session_id,
+                    state,
+                } => format!("session_lifecycle:session={event_session_id}:state={state}"),
+                botster_hub_client::DaemonEvent::TerminalOutput {
+                    session_id: event_session_id,
+                    subscription_id: event_subscription_id,
+                    payload,
+                } => {
+                    let data = live_output_utf8(payload);
+                    response_renderable_bytes += data.len();
+                    observed.push_str(&data);
+                    if event_session_id == &session_id && event_subscription_id == &subscription_id
+                    {
+                        matching_observed.push_str(&data);
+                    } else if data.contains(&expected) {
+                        mismatched_marker = true;
+                    }
+                    format!(
+                        "terminal_output:session={event_session_id}:subscription={event_subscription_id}:bytes={}",
+                        data.len()
+                    )
+                }
+                botster_hub_client::DaemonEvent::Snapshot {
+                    session_id: event_session_id,
+                    subscription_id: event_subscription_id,
+                    history,
+                } => {
+                    opaque_history_bytes += history.bytes;
+                    format!(
+                        "snapshot:session={event_session_id}:subscription={event_subscription_id}:bytes={}",
+                        history.bytes
+                    )
+                }
+                botster_hub_client::DaemonEvent::Scrollback {
+                    session_id: event_session_id,
+                    subscription_id: event_subscription_id,
+                    history,
+                } => {
+                    opaque_history_bytes += history.bytes;
+                    format!(
+                        "scrollback:session={event_session_id}:subscription={event_subscription_id}:bytes={}",
+                        history.bytes
+                    )
+                }
+                botster_hub_client::DaemonEvent::ProcessExit {
+                    session_id: event_session_id,
+                    subscription_id: event_subscription_id,
+                    code,
+                } => {
+                    saw_process_exit = true;
+                    format!(
+                        "process_exit:session={event_session_id}:subscription={event_subscription_id}:code={code:?}"
+                    )
+                }
+                botster_hub_client::DaemonEvent::AttachState {
+                    session_id: event_session_id,
+                    subscription_id: event_subscription_id,
+                    state,
+                } => {
+                    format!(
+                        "attach_state:session={event_session_id}:subscription={event_subscription_id}:state={state}"
+                    )
+                }
+                botster_hub_client::DaemonEvent::RuntimeObservation { kind } => {
+                    format!("runtime_observation:{kind}")
+                }
+                botster_hub_client::DaemonEvent::WorktreeLifecycle { .. } => {
+                    "worktree_lifecycle".to_string()
+                }
+            };
+            response_observations.push(observation.clone());
+            ordered_observations.push(format!(
+                "elapsed_us={}:response={response_index}:request={request_kind}:event={}:{}",
+                started_at.elapsed().as_micros(),
+                response_observations.len() - 1,
+                observation
+            ));
+        }
+        println!(
+            "fast_exit_attach_diagnostic elapsed_us={} response={response_index} request={request_kind} events=[{}] renderable_bytes={response_renderable_bytes} cumulative_renderable_bytes={}",
+            started_at.elapsed().as_micros(),
+            response_observations.join(","),
+            observed.len()
+        );
+
+        if saw_process_exit {
+            break "process_exit";
+        }
+        if request_kind == "drain" {
+            if response.events.is_empty() {
+                idle_drains += 1;
+            } else {
+                idle_drains = 0;
+            }
+            if idle_drains >= 20 {
+                break "idle_quiescence";
+            }
+        }
+
+        thread::sleep(Duration::from_millis(25));
+        response = connection
+            .request(&botster_hub_client::DaemonRequest::Drain {
+                session_id: session_id.clone(),
+            })
+            .expect("drain diagnostic subscription before production boundary");
+        response_index += 1;
+        request_kind = "drain";
+    };
+
+    let renderable_bytes_at_boundary = observed.len();
+    let matching_bytes_at_boundary = matching_observed.len();
+    let marker_at_boundary = observed.contains(&expected);
+    println!(
+        "fast_exit_attach_diagnostic boundary elapsed_us={} reason={boundary_reason} response={response_index} input_bytes=0 renderable_bytes_at_boundary={renderable_bytes_at_boundary} matching_bytes_at_boundary={matching_bytes_at_boundary} marker_at_boundary={marker_at_boundary} idle_drains={idle_drains}",
+        started_at.elapsed().as_micros()
+    );
+
+    let mut tail_matching_observed = String::new();
+    let mut tail_error = None;
+    if !marker_at_boundary {
+        let mut tail_idle_drains = 0;
+        while tail_idle_drains < 20 {
+            thread::sleep(Duration::from_millis(25));
+            let tail_response =
+                match connection.request(&botster_hub_client::DaemonRequest::Drain {
+                    session_id: session_id.clone(),
+                }) {
+                    Ok(response) => response,
+                    Err(error) => {
+                        tail_error = Some(error.to_string());
+                        break;
+                    }
+                };
+            response_index += 1;
+            if tail_response.events.is_empty() {
+                tail_idle_drains += 1;
+            } else {
+                tail_idle_drains = 0;
+            }
+            for (event_index, event) in tail_response.events.iter().enumerate() {
+                let elapsed_us = started_at.elapsed().as_micros();
+                match event {
+                    botster_hub_client::DaemonEvent::TerminalOutput {
+                        session_id: event_session_id,
+                        subscription_id: event_subscription_id,
+                        payload,
+                    } => {
+                        let data = live_output_utf8(payload);
+                        if event_session_id == &session_id
+                            && event_subscription_id == &subscription_id
+                        {
+                            tail_matching_observed.push_str(&data);
+                        } else if data.contains(&expected) {
+                            mismatched_marker = true;
+                        }
+                        println!(
+                            "fast_exit_attach_tail_event elapsed_us={elapsed_us} response={response_index} event={event_index} type=terminal_output session={event_session_id} subscription={event_subscription_id} bytes={}",
+                            data.len()
+                        );
+                    }
+                    botster_hub_client::DaemonEvent::Snapshot {
+                        session_id: event_session_id,
+                        subscription_id: event_subscription_id,
+                        history,
+                    } => {
+                        opaque_history_bytes += history.bytes;
+                        println!(
+                            "fast_exit_attach_tail_event elapsed_us={elapsed_us} response={response_index} event={event_index} type=snapshot session={event_session_id} subscription={event_subscription_id} bytes={}",
+                            history.bytes
+                        );
+                    }
+                    botster_hub_client::DaemonEvent::Scrollback {
+                        session_id: event_session_id,
+                        subscription_id: event_subscription_id,
+                        history,
+                    } => {
+                        opaque_history_bytes += history.bytes;
+                        println!(
+                            "fast_exit_attach_tail_event elapsed_us={elapsed_us} response={response_index} event={event_index} type=scrollback session={event_session_id} subscription={event_subscription_id} bytes={}",
+                            history.bytes
+                        );
+                    }
+                    botster_hub_client::DaemonEvent::ProcessExit {
+                        session_id: event_session_id,
+                        subscription_id: event_subscription_id,
+                        code,
+                    } => println!(
+                        "fast_exit_attach_tail_event elapsed_us={elapsed_us} response={response_index} event={event_index} type=process_exit session={event_session_id} subscription={event_subscription_id} code={code:?} bytes=0"
+                    ),
+                    botster_hub_client::DaemonEvent::AttachState {
+                        session_id: event_session_id,
+                        subscription_id: event_subscription_id,
+                        state,
+                    } => println!(
+                        "fast_exit_attach_tail_event elapsed_us={elapsed_us} response={response_index} event={event_index} type=attach_state session={event_session_id} subscription={event_subscription_id} state={state} bytes=0"
+                    ),
+                    botster_hub_client::DaemonEvent::SessionLifecycle {
+                        session_id: event_session_id,
+                        state,
+                    } => println!(
+                        "fast_exit_attach_tail_event elapsed_us={elapsed_us} response={response_index} event={event_index} type=session_lifecycle session={event_session_id} subscription=none state={state} bytes=0"
+                    ),
+                    botster_hub_client::DaemonEvent::RuntimeObservation { kind } => println!(
+                        "fast_exit_attach_tail_event elapsed_us={elapsed_us} response={response_index} event={event_index} type=runtime_observation session=none subscription=none kind={kind} bytes=0"
+                    ),
+                    botster_hub_client::DaemonEvent::WorktreeLifecycle { .. } => println!(
+                        "fast_exit_attach_tail_event elapsed_us={elapsed_us} response={response_index} event={event_index} type=worktree_lifecycle session=none subscription=none bytes=0"
+                    ),
+                }
+            }
+        }
+    }
+
+    let (read_screen_bytes, read_screen_marker, read_screen_error) = if marker_at_boundary {
+        (0, false, None)
+    } else {
+        match connection.request(&botster_hub_client::DaemonRequest::ReadScreen {
+            session_id: session_id.clone(),
+        }) {
+            Ok(response) => match response.read_screen {
+                Some(screen) => (screen.text.len(), screen.text.contains(&expected), None),
+                None => (0, false, Some("missing_read_screen_body".to_string())),
+            },
+            Err(error) => (0, false, Some(error.to_string())),
+        }
+    };
+
+    let status = connection.request(&botster_hub_client::DaemonRequest::Status);
+    let daemon_lifecycle = status
+        .as_ref()
+        .ok()
+        .and_then(|response| response.status.as_ref())
+        .map(|status| status.lifecycle_state.as_str())
+        .unwrap_or("missing");
+
+    let sessions = connection
+        .request(&botster_hub_client::DaemonRequest::ListSessions)
+        .expect("list sessions after frozen production boundary");
+    let session_lifecycle = sessions
+        .sessions
+        .iter()
+        .find(|session| session.session_id == session_id)
+        .map(|session| session.lifecycle.as_str())
+        .unwrap_or("missing");
+    let tail_matching_marker = tail_matching_observed.contains(&expected);
+    println!(
+        "fast_exit_attach_diagnostic state elapsed_us={} daemon_lifecycle={daemon_lifecycle} session_lifecycle={session_lifecycle} process_exit={saw_process_exit} renderable_bytes_at_boundary={renderable_bytes_at_boundary} matching_bytes_at_boundary={matching_bytes_at_boundary} tail_matching_bytes={} tail_matching_marker={tail_matching_marker} mismatched_marker={mismatched_marker} opaque_history_bytes={opaque_history_bytes} read_screen_bytes={read_screen_bytes} read_screen_marker={read_screen_marker} read_screen_error={read_screen_error:?} tail_error={tail_error:?} event_order=[{}]",
+        started_at.elapsed().as_micros(),
+        tail_matching_observed.len(),
+        ordered_observations.join(",")
+    );
+
+    let detach = connection.request(&botster_hub_client::DaemonRequest::Detach {
+        session_id: session_id.clone(),
+        subscription_id: subscription_id.clone(),
+    });
+    println!(
+        "fast_exit_attach_diagnostic cleanup elapsed_us={} detach_response={detach:?}",
+        started_at.elapsed().as_micros()
+    );
+    let _ = connection.request(&botster_hub_client::DaemonRequest::ShutdownSession {
+        session_id: session_id.clone(),
+    });
+
+    let shutdown = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("shutdown")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("run botster-hub shutdown after fast-exit diagnostic");
+    let daemon = child
+        .wait_with_output()
+        .expect("wait for diagnostic daemon child");
+    let shutdown_validation = validate_cli_daemon_shutdown(&shutdown, &daemon);
+
+    if !marker_at_boundary {
+        let classification = if mismatched_marker && tail_matching_marker {
+            "ambiguous_subscription_mismatch_and_output_queued_after_harness_stop"
+        } else if mismatched_marker {
+            "subscription_mismatch"
+        } else if tail_matching_marker {
+            "output_queued_after_harness_stop"
+        } else if read_screen_marker {
+            "output_produced_not_routed"
+        } else if read_screen_error.is_some() {
+            "retained_history_or_readback_failure"
+        } else if tail_error.is_some() {
+            "unclassified_diagnostic_transport_failure"
+        } else {
+            "output_never_produced"
+        };
+        println!(
+            "fast_exit_attach_failure classification={classification} boundary_reason={boundary_reason} input_bytes=0 renderable_bytes_at_boundary={renderable_bytes_at_boundary} matching_bytes_at_boundary={matching_bytes_at_boundary} opaque_history_bytes={opaque_history_bytes} daemon_exit_status={} shutdown_status={} daemon_stdout_begin\n{}\ndaemon_stdout_end daemon_stderr_begin\n{}\ndaemon_stderr_end test_stdout_stderr=run_log",
+            daemon.status,
+            shutdown.status,
+            String::from_utf8_lossy(&daemon.stdout),
+            String::from_utf8_lossy(&daemon.stderr)
+        );
+    }
+
+    assert!(
+        shutdown_validation.is_ok(),
+        "diagnostic daemon cleanup failed: {shutdown_validation:?}"
+    );
+    assert!(
+        marker_at_boundary,
+        "fast-exit marker missing at production boundary; renderable_bytes_at_boundary={renderable_bytes_at_boundary} matching_bytes_at_boundary={matching_bytes_at_boundary} tail_matching_marker={tail_matching_marker} mismatched_marker={mismatched_marker} read_screen_marker={read_screen_marker} read_screen_error={read_screen_error:?} tail_error={tail_error:?}"
+    );
+}
+
+#[test]
+fn cli_sessions_spawn_and_list_route_through_client_api() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("cli-sessions");
+    let child = start_cli_daemon(&data_dir);
+    let spawn = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("sessions")
+        .arg("spawn")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--session-id")
+        .arg("runtime-session")
+        .arg("--")
+        .arg("printf 'runtime-ok\\n'; IFS= read -r line; printf 'runtime:%s\\n' \"$line\"")
+        .output()
+        .expect("run botster-hub sessions spawn");
+
+    assert!(
+        spawn.status.success(),
+        "spawn failed: {}",
+        String::from_utf8_lossy(&spawn.stderr)
+    );
+    let stdout = String::from_utf8(spawn.stdout).expect("stdout is utf8");
+    assert!(stdout.contains("response=spawned"));
+    assert!(stdout.contains("session_id=runtime-session"));
+    assert!(stdout.contains("lifecycle=running"));
+    assert!(stdout.contains("event_count=0"));
+    assert!(!stdout.contains(data_dir.to_string_lossy().as_ref()));
+
+    let list = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("sessions")
+        .arg("list")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("run botster-hub sessions list");
+
+    assert!(
+        list.status.success(),
+        "list failed: {}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let stdout = String::from_utf8(list.stdout).expect("stdout is utf8");
+    assert!(stdout.contains("response=sessions"));
+    assert!(stdout.contains("session_count=1"));
+    assert!(stdout.contains("session id=runtime-session lifecycle=running"));
+    assert!(!stdout.contains(data_dir.to_string_lossy().as_ref()));
+
+    let resize = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("sessions")
+        .arg("resize")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("runtime-session")
+        .arg("30")
+        .arg("100")
+        .output()
+        .expect("run botster-hub sessions resize");
+    assert!(
+        resize.status.success(),
+        "resize failed: {}",
+        String::from_utf8_lossy(&resize.stderr)
+    );
+
+    let attach = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::Attach {
+            session_id: "runtime-session".to_string(),
+            subscription_id: "botster-hub-cli-subscription".to_string(),
+        },
+    )
+    .expect("attach before explicit detach");
+    assert_eq!(attach.kind, botster_hub::DaemonResponseKind::Events);
+
+    let detach = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("sessions")
+        .arg("detach")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("runtime-session")
+        .output()
+        .expect("run botster-hub sessions detach");
+    assert!(
+        detach.status.success(),
+        "detach failed: {}",
+        String::from_utf8_lossy(&detach.stderr)
+    );
+
+    let mut attach_child = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("sessions")
+        .arg("attach")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("runtime-session")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn botster-hub sessions attach");
+    let mut attach_stdout = BufReader::new(
+        attach_child
+            .stdout
+            .take()
+            .expect("attach child stdout is piped"),
+    );
+    let mut stdout = String::new();
+    attach_stdout
+        .read_line(&mut stdout)
+        .expect("read initial attach output");
+    assert!(stdout.contains("runtime-ok"));
+
+    let send = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("sessions")
+        .arg("send-input")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("runtime-session")
+        .arg("--")
+        .arg("from-cli\r")
+        .output()
+        .expect("run botster-hub sessions send-input");
+    assert!(
+        send.status.success(),
+        "send-input failed: {}",
+        String::from_utf8_lossy(&send.stderr)
+    );
+
+    let attach_status = attach_child.wait().expect("wait for attach child");
+    attach_stdout
+        .read_to_string(&mut stdout)
+        .expect("read remaining attach output");
+    let mut stderr = String::new();
+    attach_child
+        .stderr
+        .take()
+        .expect("attach child stderr is piped")
+        .read_to_string(&mut stderr)
+        .expect("read attach stderr");
+    assert!(attach_status.success(), "attach failed: {}", stderr);
+    assert!(stdout.contains("runtime-ok"));
+    assert!(stdout.contains("runtime:from-cli"));
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn cli_short_lived_session_shutdown_returns_structured_cleanup() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("cli-short-lived-shutdown");
+    let child = start_cli_daemon(&data_dir);
+
+    let spawn = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("sessions")
+        .arg("spawn")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--session-id")
+        .arg("runtime-session")
+        .arg("--")
+        .arg("printf 'runtime-ok\\n'; IFS= read -r line; printf 'runtime:%s\\n' \"$line\"")
+        .output()
+        .expect("run botster-hub sessions spawn");
+    assert!(
+        spawn.status.success(),
+        "spawn failed: {}",
+        String::from_utf8_lossy(&spawn.stderr)
+    );
+
+    let attach_child = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("sessions")
+        .arg("attach")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("runtime-session")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run botster-hub sessions attach");
+
+    thread::sleep(Duration::from_millis(150));
+    let send = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("sessions")
+        .arg("send-input")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("runtime-session")
+        .arg("--")
+        .arg("done\r")
+        .output()
+        .expect("run botster-hub sessions send-input");
+    assert!(
+        send.status.success(),
+        "send-input failed: {}",
+        String::from_utf8_lossy(&send.stderr)
+    );
+
+    let attach = attach_child
+        .wait_with_output()
+        .expect("wait for attach child");
+    assert!(
+        attach.status.success(),
+        "attach failed: {}",
+        String::from_utf8_lossy(&attach.stderr)
+    );
+    let attach_stdout = String::from_utf8(attach.stdout).expect("attach stdout is utf8");
+    assert!(attach_stdout.contains("runtime-ok"));
+    assert!(attach_stdout.contains("runtime:done"));
+
+    let shutdown = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("sessions")
+        .arg("shutdown")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("runtime-session")
+        .output()
+        .expect("run botster-hub sessions shutdown");
+    assert!(
+        shutdown.status.success(),
+        "shutdown failed: {}",
+        String::from_utf8_lossy(&shutdown.stderr)
+    );
+    let stdout = String::from_utf8(shutdown.stdout).expect("shutdown stdout is utf8");
+    let stderr = String::from_utf8(shutdown.stderr).expect("shutdown stderr is utf8");
+    assert!(stdout.contains("response=session_cleanup"));
+    assert!(stdout.contains("session_id=runtime-session"));
+    assert!(stdout.contains("outcome=already_exited"));
+    assert!(!stdout.contains("client disconnected"));
+    assert!(!stderr.contains("client disconnected"));
+    assert!(!stdout.contains(data_dir.to_string_lossy().as_ref()));
+    assert!(!stderr.contains(data_dir.to_string_lossy().as_ref()));
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn cli_request_level_runtime_error_returns_operator_frame_and_keeps_daemon_responsive() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("cli-operator-error");
+    let child = start_cli_daemon(&data_dir);
+
+    let send = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("sessions")
+        .arg("send-input")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("missing-session")
+        .arg("--")
+        .arg("input\r")
+        .output()
+        .expect("run botster-hub sessions send-input");
+    assert!(
+        !send.status.success(),
+        "missing-session send-input should fail with operator frame"
+    );
+    let stdout = String::from_utf8(send.stdout).expect("send stdout is utf8");
+    let stderr = String::from_utf8(send.stderr).expect("send stderr is utf8");
+    assert!(stdout.contains("response=operator_error"));
+    assert!(stdout.contains("error_code=unknown_session"));
+    assert!(stdout.contains("operation=input"));
+    assert!(stderr.contains("operator error: unknown_session"));
+    assert!(!stdout.contains("client disconnected"));
+    assert!(!stderr.contains("client disconnected"));
+    assert!(!stdout.contains(data_dir.to_string_lossy().as_ref()));
+    assert!(!stderr.contains(data_dir.to_string_lossy().as_ref()));
+
+    let status = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("status")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("run botster-hub status after operator error");
+    assert!(
+        status.status.success(),
+        "status failed after operator error: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let stdout = String::from_utf8(status.stdout).expect("status stdout is utf8");
+    assert!(stdout.contains("event=status"));
+    assert!(stdout.contains("lifecycle_state=running"));
+    assert!(!stdout.contains(data_dir.to_string_lossy().as_ref()));
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn external_hub_client_read_mode_flags_drives_real_daemon_socket_protocol() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("external-hub-client");
+    let config = explicit_config(&data_dir);
+    let socket_path = config
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("test config has local socket")
+        .path
+        .clone();
+    let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
+    let child = start_cli_daemon(&data_dir);
+
+    let status = botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+        .expect("external client status request");
+    assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
+    assert!(status.diagnostics.iter().any(|diagnostic| {
+        diagnostic.kind == botster_hub_client::DaemonDiagnosticKind::Connected
+            && diagnostic.operation.as_deref() == Some("status")
+    }));
+    assert!(!has_failure_diagnostic(&status.diagnostics));
+    assert_eq!(
+        status
+            .status
+            .as_ref()
+            .expect("status response body")
+            .lifecycle_state,
+        "running"
+    );
+
+    let list =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::ListSessions)
+            .expect("external client list sessions request");
+    assert_eq!(list.kind, botster_hub_client::DaemonResponseKind::Sessions);
+
+    let spawn = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: "external-client-session".to_string(),
+            command:
+                "printf '\\033[?1000h\\033[?1006h'; printf 'external-ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done"
+                    .to_string(),
+        },
+    )
+    .expect("external client spawn request");
+    assert_eq!(spawn.kind, botster_hub_client::DaemonResponseKind::Spawned);
+    assert!(
+        spawn
+            .sessions
+            .iter()
+            .any(|session| session.session_id == "external-client-session"
+                && session.lifecycle == "running")
+    );
+
+    let mut connection =
+        botster_hub_client::DaemonConnection::connect(&endpoint).expect("external connect");
+    let attach = connection
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: "external-client-session".to_string(),
+            subscription_id: "external-client-subscription".to_string(),
+        })
+        .expect("external attach request");
+    assert_eq!(attach.kind, botster_hub_client::DaemonResponseKind::Events);
+
+    let resize = connection
+        .request(&botster_hub_client::DaemonRequest::Resize {
+            session_id: "external-client-session".to_string(),
+            rows: 31,
+            cols: 101,
+        })
+        .expect("external resize request");
+    assert_eq!(resize.kind, botster_hub_client::DaemonResponseKind::Events);
+
+    let send = connection
+        .request(&botster_hub_client::DaemonRequest::SendInput {
+            session_id: "external-client-session".to_string(),
+            data: "external-input\n".to_string(),
+        })
+        .expect("external send input request");
+    assert_eq!(send.kind, botster_hub_client::DaemonResponseKind::Events);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut observed = String::new();
+    while std::time::Instant::now() < deadline {
+        let drain = connection
+            .request(&botster_hub_client::DaemonRequest::Drain {
+                session_id: "external-client-session".to_string(),
+            })
+            .expect("external drain request");
+        for event in drain.events {
+            if let botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } = event {
+                observed.push_str(&live_output_utf8(payload));
+            }
+        }
+        if observed.contains("echo:external-input") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+    assert!(
+        observed.contains("echo:external-input"),
+        "external client should drain terminal output through the hub protocol, got {observed:?}"
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mode_flags = loop {
+        let response = connection
+            .request(&botster_hub_client::DaemonRequest::ReadModeFlags {
+                session_id: "external-client-session".to_string(),
+            })
+            .expect("external read_mode_flags request");
+        assert_eq!(
+            response.kind,
+            botster_hub_client::DaemonResponseKind::ReadModeFlags
+        );
+        let mode_flags = response.mode_flags.expect("read_mode_flags response body");
+        if mode_flags.mouse_mode == 9 {
+            break mode_flags;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for exact combined mouse mode, last value {}",
+            mode_flags.mouse_mode
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(mode_flags.session_id, "external-client-session");
+    assert_eq!(mode_flags.mouse_mode, 9);
+    assert_ne!(
+        mode_flags.mode_generation, 0,
+        "freshness generation must be non-zero on a live worker"
+    );
+    assert!(
+        mode_flags.mode_revision >= 1,
+        "freshness revision should advance with mode changes, got {}",
+        mode_flags.mode_revision
+    );
+
+    let detach = connection
+        .request(&botster_hub_client::DaemonRequest::Detach {
+            session_id: "external-client-session".to_string(),
+            subscription_id: "external-client-subscription".to_string(),
+        })
+        .expect("external detach request");
+    assert_eq!(detach.kind, botster_hub_client::DaemonResponseKind::Events);
+
+    let terminal_unavailable = connection
+        .request(&botster_hub_client::DaemonRequest::Drain {
+            session_id: "missing-external-client-session".to_string(),
+        })
+        .expect("missing terminal drain returns operator response");
+    assert_eq!(
+        terminal_unavailable.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError
+    );
+    assert!(terminal_unavailable.diagnostics.iter().any(|diagnostic| {
+        diagnostic.kind == botster_hub_client::DaemonDiagnosticKind::TerminalStreamUnavailable
+            && diagnostic.operation.as_deref() == Some("drain_runtime")
+            && diagnostic.feature.as_deref() == Some(botster_hub_client::FEATURE_TERMINAL_STREAMING)
+    }));
+    assert!(!has_diagnostic_kind(
+        &terminal_unavailable.diagnostics,
+        botster_hub_client::DaemonDiagnosticKind::Connected
+    ));
+    let terminal_debug = format!("{:?}", terminal_unavailable.diagnostics);
+    assert!(!terminal_debug.contains(&data_dir.to_string_lossy().to_string()));
+    assert!(!terminal_debug.contains(concat!("/", "Users", "/")));
+    assert!(!terminal_debug.contains("/home/"));
+
+    let missing_read_screen = connection
+        .request(&botster_hub_client::DaemonRequest::ReadScreen {
+            session_id: "missing-external-client-session".to_string(),
+        })
+        .expect("missing read_screen returns operator response");
+    assert_eq!(
+        missing_read_screen.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError
+    );
+    let error = missing_read_screen.error.expect("read_screen error frame");
+    assert_eq!(error.code, "unknown_session");
+    assert_eq!(error.operation, "read_screen");
+
+    let status_after_read_error = connection
+        .request(&botster_hub_client::DaemonRequest::Status)
+        .expect("connection stays usable after read_screen error");
+    assert_eq!(
+        status_after_read_error.kind,
+        botster_hub_client::DaemonResponseKind::Status
+    );
+
+    let missing_mode_flags = connection
+        .request(&botster_hub_client::DaemonRequest::ReadModeFlags {
+            session_id: "missing-external-client-session".to_string(),
+        })
+        .expect("missing read_mode_flags returns operator response");
+    assert_eq!(
+        missing_mode_flags.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError
+    );
+    assert!(
+        missing_mode_flags.mode_flags.is_none(),
+        "unknown session must not fabricate a successful mouse-off body"
+    );
+    let error = missing_mode_flags
+        .error
+        .expect("read_mode_flags error frame");
+    assert_eq!(error.code, "unknown_session");
+    assert_eq!(error.operation, "read_mode_flags");
+
+    let status_after_mode_error = connection
+        .request(&botster_hub_client::DaemonRequest::Status)
+        .expect("connection stays usable after read_mode_flags error");
+    assert_eq!(
+        status_after_mode_error.kind,
+        botster_hub_client::DaemonResponseKind::Status
+    );
+
+    let missing_snapshot = connection
+        .request(&botster_hub_client::DaemonRequest::CaptureSnapshot {
+            session_id: "missing-external-client-session".to_string(),
+        })
+        .expect("missing capture_snapshot returns operator response");
+    assert_eq!(
+        missing_snapshot.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError
+    );
+    let error = missing_snapshot
+        .error
+        .expect("capture_snapshot error frame");
+    assert_eq!(error.code, "unknown_session");
+    assert_eq!(error.operation, "capture_snapshot");
+
+    let status_after_snapshot_error = connection
+        .request(&botster_hub_client::DaemonRequest::Status)
+        .expect("connection stays usable after capture_snapshot error");
+    assert_eq!(
+        status_after_snapshot_error.kind,
+        botster_hub_client::DaemonResponseKind::Status
+    );
+
+    drop(connection);
+
+    let reconnect =
+        botster_hub_client::DaemonConnection::connect(&endpoint).expect("external reconnect");
+    drop(reconnect);
+
+    let shutdown_session = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::ShutdownSession {
+            session_id: "external-client-session".to_string(),
+        },
+    )
+    .expect("external shutdown session request");
+    assert_eq!(
+        shutdown_session.kind,
+        botster_hub_client::DaemonResponseKind::Events
+    );
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn external_hub_ghostty_snapshot_install_before_live_rejects_scrollback_as_ghostsnp() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("external-hub-ghostsnp-order");
+    let config = explicit_config(&data_dir);
+    let socket_path = config
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("local socket")
+        .path
+        .clone();
+    let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
+    let child = start_cli_daemon(&data_dir);
+    let mut connection = botster_hub_client::DaemonConnection::connect(&endpoint).expect("connect");
+
+    connection
+        .request(&botster_hub_client::DaemonRequest::Spawn {
+            session_id: "ghostsnp-order-session".to_string(),
+            command: "printf 'retained-before-attach\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done".to_string(),
+        })
+        .expect("spawn");
+    let mut session_cleanup = SessionCleanupGuard::new(&data_dir, "ghostsnp-order-session");
+    connection
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: "ghostsnp-order-session".to_string(),
+            subscription_id: "ghostsnp-order-sub".to_string(),
+        })
+        .expect("attach");
+
+    // Seed retained content, then reattach so Snapshot is non-empty history.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut observed = String::new();
+    while Instant::now() < deadline {
+        let drain = connection
+            .request(&botster_hub_client::DaemonRequest::Drain {
+                session_id: "ghostsnp-order-session".to_string(),
+            })
+            .expect("drain");
+        for event in drain.events {
+            if let botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } = event {
+                observed.push_str(&live_output_utf8(payload));
+            }
+        }
+        if observed.contains("retained-before-attach") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    connection
+        .request(&botster_hub_client::DaemonRequest::Detach {
+            session_id: "ghostsnp-order-session".to_string(),
+            subscription_id: "ghostsnp-order-sub".to_string(),
+        })
+        .expect("detach");
+    connection
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: "ghostsnp-order-session".to_string(),
+            subscription_id: "ghostsnp-order-resub".to_string(),
+        })
+        .expect("reattach");
+    connection
+        .request(&botster_hub_client::DaemonRequest::SendInput {
+            session_id: "ghostsnp-order-session".to_string(),
+            data: "live-after-snapshot\n".to_string(),
+        })
+        .expect("live input");
+
+    let events = collect_attach_events(
+        &mut connection,
+        "ghostsnp-order-session",
+        "ghostsnp-order-resub",
+        Some("echo:live-after-snapshot"),
+    );
+
+    let attaching = events.iter().position(|event| {
+        matches!(
+            event,
+            botster_hub_client::DaemonEvent::AttachState {
+                subscription_id,
+                state,
+                ..
+            } if subscription_id == "ghostsnp-order-resub" && state == "attaching"
+        )
+    });
+    let snapshot = events.iter().position(|event| {
+        matches!(
+            event,
+            botster_hub_client::DaemonEvent::Snapshot {
+                subscription_id,
+                ..
+            } if subscription_id == "ghostsnp-order-resub"
+        )
+    });
+    let attached = events.iter().position(|event| {
+        matches!(
+            event,
+            botster_hub_client::DaemonEvent::AttachState {
+                subscription_id,
+                state,
+                ..
+            } if subscription_id == "ghostsnp-order-resub" && state == "attached"
+        )
+    });
+    let live = events.iter().position(|event| {
+        matches!(
+            event,
+            botster_hub_client::DaemonEvent::TerminalOutput {
+                subscription_id,
+                payload,
+                ..
+            } if subscription_id == "ghostsnp-order-resub"
+                && live_output_contains(payload, "echo:live-after-snapshot")
+        )
+    });
+    let (attaching, snapshot, attached, live) = (
+        attaching.expect("attaching"),
+        snapshot.expect("snapshot"),
+        attached.expect("attached"),
+        live.expect("live"),
+    );
+    assert!(
+        attaching < snapshot && snapshot < attached && attached < live,
+        "ordering attaching < Snapshot < attached < live failed: {events:?}"
+    );
+
+    let payload = first_snapshot_payload(&events, "ghostsnp-order-resub");
+    assert!(
+        payload.starts_with(GHOSTSNP_MAGIC),
+        "Snapshot must be GHOSTSNP; got {:?}",
+        &payload[..payload.len().min(16)]
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            botster_hub_client::DaemonEvent::Scrollback {
+                subscription_id,
+                history,
+                ..
+            } if subscription_id == "ghostsnp-order-resub"
+                && history
+                    .decoded_bytes()
+                    .map(|bytes| bytes.starts_with(GHOSTSNP_MAGIC))
+                    .unwrap_or(false)
+        )),
+        "Scrollback must never carry GHOSTSNP magic: {events:?}"
+    );
+
+    // Control path CaptureSnapshot is metadata-only — never GHOSTSNP bytes.
+    let capture = connection
+        .request(&botster_hub_client::DaemonRequest::CaptureSnapshot {
+            session_id: "ghostsnp-order-session".to_string(),
+        })
+        .expect("capture snapshot metadata");
+    assert_eq!(
+        capture.kind,
+        botster_hub_client::DaemonResponseKind::CaptureSnapshot
+    );
+    let meta = capture.capture_snapshot.as_ref().expect("capture body");
+    assert!(meta.payload_bytes > 0);
+    assert_eq!(
+        meta.payload_format.as_deref(),
+        Some("ghostty-terminal-snapshot-v1")
+    );
+    let capture_json = serde_json::to_value(&capture).expect("serialize capture");
+    assert!(
+        capture_json.get("payload_base64").is_none(),
+        "control CaptureSnapshot must not expose payload_base64: {capture_json}"
+    );
+
+    production_shutdown_and_remove_session(&endpoint, "ghostsnp-order-session");
+    session_cleanup.disarm();
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn external_hub_live_output_preserves_exact_bytes() {
+    let _guard = daemon_test_guard();
+    let expected: &[u8] = &[0x00, 0x1b, 0x5b, 0x31, 0x6d, 0xff, 0xc0];
+    let hub = start_isolated_live_output_hub("live-exact-bytes");
+    let endpoint = hub.endpoint().clone();
+    let release_path = unique_short_test_dir("live-exact-bytes-release").join("go");
+    let script_path = write_python_wait_then_write_script(&release_path, expected);
+    let mut connection = botster_hub_client::DaemonConnection::connect(&endpoint).expect("connect");
+    connection
+        .request(&botster_hub_client::DaemonRequest::Spawn {
+            session_id: "exact-bytes-session".to_string(),
+            command: python_script_command(&script_path),
+        })
+        .expect("spawn write(2) producer");
+    connection
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: "exact-bytes-session".to_string(),
+            subscription_id: "exact-bytes-sub".to_string(),
+        })
+        .expect("attach");
+    fs::create_dir_all(release_path.parent().expect("release parent")).expect("create release dir");
+    fs::write(&release_path, b"go").expect("release write(2) producer");
+
+    let events = drain_until(
+        &mut connection,
+        "exact-bytes-session",
+        |event| match event {
+            botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } => {
+                live_output_decoded_bytes(payload)
+                    .windows(expected.len())
+                    .any(|window| window == expected)
+            }
+            _ => false,
+        },
+    );
+    let mut concatenated = Vec::new();
+    for event in &events {
+        if let botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } = event {
+            let bytes = live_output_decoded_bytes(payload);
+            assert!(
+                !payload_has_utf8_replacement(&bytes),
+                "live payload must not contain U+FFFD: {bytes:?}"
+            );
+            concatenated.extend(bytes);
+        }
+    }
+    assert!(
+        concatenated
+            .windows(expected.len())
+            .any(|window| window == expected),
+        "concatenated live bytes must preserve the write(2) sequence, got {concatenated:?}"
+    );
+
+    shutdown_short_lived_session(&endpoint, "exact-bytes-session");
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn external_hub_live_output_preserves_split_utf8_frames() {
+    let _guard = daemon_test_guard();
+    let first = [0xE2];
+    let second = [0x82, 0xAC];
+    let hub = start_isolated_live_output_hub("live-split-utf8");
+    let endpoint = hub.endpoint().clone();
+    let mut connection = botster_hub_client::DaemonConnection::connect(&endpoint).expect("connect");
+    let first_release = unique_short_test_dir("live-split-first").join("go");
+    let second_release = unique_short_test_dir("live-split-second").join("go");
+    let script_path = write_python_split_utf8_script(&first_release, &second_release);
+    connection
+        .request(&botster_hub_client::DaemonRequest::Spawn {
+            session_id: "split-utf8-session".to_string(),
+            command: python_script_command(&script_path),
+        })
+        .expect("spawn split UTF-8 producer");
+    connection
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: "split-utf8-session".to_string(),
+            subscription_id: "split-utf8-sub".to_string(),
+        })
+        .expect("attach");
+    fs::create_dir_all(first_release.parent().expect("first release parent"))
+        .expect("create first release dir");
+    fs::write(&first_release, b"go").expect("release first fragment");
+
+    let first_events = drain_until(&mut connection, "split-utf8-session", |event| {
+        event_is_exact_live_payload(event, "split-utf8-sub", &first)
+    });
+    let first_index = first_events
+        .iter()
+        .position(|event| event_is_exact_live_payload(event, "split-utf8-sub", &first))
+        .expect("first fragment payload");
+    assert!(
+        first_events[first_index + 1..].iter().all(|event| {
+            !matches!(
+                event,
+                botster_hub_client::DaemonEvent::TerminalOutput {
+                    subscription_id,
+                    ..
+                } if subscription_id == "split-utf8-sub"
+            )
+        }),
+        "second live frame arrived before producer release: {first_events:?}"
+    );
+    for _ in 0..5 {
+        let extra = connection
+            .request(&botster_hub_client::DaemonRequest::Drain {
+                session_id: "split-utf8-session".to_string(),
+            })
+            .expect("drain before release");
+        assert!(
+            extra.events.iter().all(|event| {
+                !matches!(
+                    event,
+                    botster_hub_client::DaemonEvent::TerminalOutput {
+                        subscription_id,
+                        ..
+                    } if subscription_id == "split-utf8-sub"
+                )
+            }),
+            "second live frame arrived before producer release: {extra:?}"
+        );
+    }
+
+    fs::create_dir_all(second_release.parent().expect("second release parent"))
+        .expect("create second release dir");
+    fs::write(&second_release, b"go").expect("release second fragment");
+
+    let second_events = drain_until(&mut connection, "split-utf8-session", |event| {
+        event_is_exact_live_payload(event, "split-utf8-sub", &second)
+    });
+    let second_index = second_events
+        .iter()
+        .position(|event| event_is_exact_live_payload(event, "split-utf8-sub", &second))
+        .expect("second fragment payload");
+    let first_payload = live_output_decoded_bytes(match &first_events[first_index] {
+        botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } => payload,
+        other => panic!("expected first live payload, got {other:?}"),
+    });
+    let second_payload = live_output_decoded_bytes(match &second_events[second_index] {
+        botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } => payload,
+        other => panic!("expected second live payload, got {other:?}"),
+    });
+    assert_eq!(first_payload, first);
+    assert_eq!(second_payload, second);
+    let mut concatenated = first_payload;
+    concatenated.extend(second_payload);
+    assert_eq!(concatenated, [0xE2, 0x82, 0xAC]);
+    assert!(!payload_has_utf8_replacement(&concatenated));
+
+    shutdown_short_lived_session(&endpoint, "split-utf8-session");
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn external_hub_live_output_keeps_ghostsnp_then_attached_then_bytes() {
+    let _guard = daemon_test_guard();
+    let expected = b"live-payload-bytes";
+    let hub = start_isolated_live_output_hub("live-order-bytes");
+    let endpoint = hub.endpoint().clone();
+    let release_path = unique_short_test_dir("live-order-release").join("go");
+    let script_path = write_python_wait_then_write_script(&release_path, expected);
+    let mut connection = botster_hub_client::DaemonConnection::connect(&endpoint).expect("connect");
+    connection
+        .request(&botster_hub_client::DaemonRequest::Spawn {
+            session_id: "order-bytes-session".to_string(),
+            command: python_script_command(&script_path),
+        })
+        .expect("spawn live producer");
+    let attach = connection
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: "order-bytes-session".to_string(),
+            subscription_id: "order-bytes-sub".to_string(),
+        })
+        .expect("attach");
+    fs::create_dir_all(release_path.parent().expect("release parent")).expect("create release dir");
+    fs::write(&release_path, b"go").expect("release live producer");
+
+    let mut events = attach.events;
+    events.extend(drain_until(
+        &mut connection,
+        "order-bytes-session",
+        |event| {
+            event_is_exact_live_payload(event, "order-bytes-sub", expected)
+                || matches!(
+                    event,
+                    botster_hub_client::DaemonEvent::TerminalOutput { payload, .. }
+                        if live_output_decoded_bytes(payload)
+                            .windows(expected.len())
+                            .any(|window| window == expected)
+                )
+        },
+    ));
+
+    let attaching = events.iter().position(|event| {
+        matches!(
+            event,
+            botster_hub_client::DaemonEvent::AttachState {
+                subscription_id,
+                state,
+                ..
+            } if subscription_id == "order-bytes-sub" && state == "attaching"
+        )
+    });
+    let snapshot = events.iter().position(|event| {
+        matches!(
+            event,
+            botster_hub_client::DaemonEvent::Snapshot {
+                subscription_id,
+                ..
+            } if subscription_id == "order-bytes-sub"
+        )
+    });
+    let attached = events.iter().position(|event| {
+        matches!(
+            event,
+            botster_hub_client::DaemonEvent::AttachState {
+                subscription_id,
+                state,
+                ..
+            } if subscription_id == "order-bytes-sub" && state == "attached"
+        )
+    });
+    let live = events.iter().position(|event| {
+        matches!(
+            event,
+            botster_hub_client::DaemonEvent::TerminalOutput {
+                subscription_id,
+                payload,
+                ..
+            } if subscription_id == "order-bytes-sub"
+                && live_output_decoded_bytes(payload)
+                    .windows(expected.len())
+                    .any(|window| window == expected)
+        )
+    });
+    let (attaching, snapshot, attached, live) = (
+        attaching.expect("attaching"),
+        snapshot.expect("snapshot"),
+        attached.expect("attached"),
+        live.expect("live bytes"),
+    );
+    assert!(
+        attaching < snapshot && snapshot < attached && attached < live,
+        "ordering attaching < Snapshot < attached < live failed: {events:?}"
+    );
+    let snapshot_bytes = first_snapshot_payload(&events, "order-bytes-sub");
+    assert!(
+        snapshot_bytes.starts_with(GHOSTSNP_MAGIC),
+        "Snapshot must start with GHOSTSNP"
+    );
+    for event in &events {
+        if let botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } = event {
+            let value = serde_json::to_value(event).expect("serialize live event");
+            assert!(
+                value.get("data").is_none(),
+                "live event must not have data: {value}"
+            );
+            assert_eq!(value["payload_encoding"], "base64");
+            assert_eq!(value["bytes"], payload.bytes);
+            assert!(value.get("payload_base64").is_some());
+        }
+    }
+
+    shutdown_short_lived_session(&endpoint, "order-bytes-session");
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn external_hub_attach_response_owns_fresh_subscription_snapshot() {
+    let _guard = daemon_test_guard();
+    let hub = start_isolated_live_output_hub("attach-route");
+    let endpoint = hub.endpoint().clone();
+    let session_id = "attach-response-route-session";
+    let subscription_a = "attach-response-route-a";
+    let subscription_b = "attach-response-route-b";
+    let screen_marker = "alternate-screen-owned-by-b";
+    let output_marker = "pending-output-owned-by-a";
+    let mut connection_a =
+        botster_hub_client::DaemonConnection::connect(&endpoint).expect("connect A");
+    let mut connection_b =
+        botster_hub_client::DaemonConnection::connect(&endpoint).expect("connect B");
+
+    connection_a
+        .request(&botster_hub_client::DaemonRequest::Spawn {
+            session_id: session_id.to_string(),
+            command: format!(
+                "printf '\\033[?1049h\\033[2J\\033[H{screen_marker}'; while IFS= read -r line; do printf '%s' \"$line\"; done"
+            ),
+        })
+        .expect("spawn alternate-screen producer");
+    connection_a
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: session_id.to_string(),
+            subscription_id: subscription_a.to_string(),
+        })
+        .expect("attach A");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let screen = connection_a
+            .request(&botster_hub_client::DaemonRequest::ReadScreen {
+                session_id: session_id.to_string(),
+            })
+            .expect("read painted alternate screen");
+        if screen
+            .read_screen
+            .as_ref()
+            .is_some_and(|screen| screen.text.contains(screen_marker))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the child to paint the alternate screen"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    connection_a
+        .request(&botster_hub_client::DaemonRequest::SendInput {
+            session_id: session_id.to_string(),
+            data: format!("{output_marker}\n"),
+        })
+        .expect("queue output for A before B attaches");
+    let attach_b = connection_b
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: session_id.to_string(),
+            subscription_id: subscription_b.to_string(),
+        })
+        .expect("attach B");
+
+    assert_eq!(
+        attach_b.events.len(),
+        3,
+        "B attach must own its complete initial sequence: {:?}",
+        attach_b.events
+    );
+    assert!(matches!(
+        &attach_b.events[0],
+        botster_hub_client::DaemonEvent::AttachState {
+            subscription_id,
+            state,
+            ..
+        } if subscription_id == subscription_b && state == "attaching"
+    ));
+    assert!(matches!(
+        &attach_b.events[1],
+        botster_hub_client::DaemonEvent::Snapshot {
+            subscription_id,
+            ..
+        } if subscription_id == subscription_b
+    ));
+    assert!(matches!(
+        &attach_b.events[2],
+        botster_hub_client::DaemonEvent::AttachState {
+            subscription_id,
+            state,
+            ..
+        } if subscription_id == subscription_b && state == "attached"
+    ));
+    let snapshot_bytes = first_snapshot_payload(&attach_b.events, subscription_b);
+    let mut projection = botster_terminal_ghostty::GhosttyClientProjection::new(
+        botster_core::TerminalScreenSize::new(24, 80),
+    )
+    .expect("create client projection");
+    projection
+        .install_ghostsnp(&snapshot_bytes)
+        .expect("install B attach GHOSTSNP");
+    let viewport = projection
+        .project_viewport()
+        .expect("project imported snapshot viewport");
+    let imported: String = viewport
+        .cells
+        .iter()
+        .map(|cell| cell.grapheme.as_str())
+        .collect();
+    assert!(
+        imported.contains(screen_marker),
+        "imported B snapshot must contain the painted alternate screen: {imported:?}"
+    );
+
+    let a_events = drain_until(&mut connection_a, session_id, |event| {
+        matches!(
+            event,
+            botster_hub_client::DaemonEvent::TerminalOutput {
+                subscription_id,
+                payload,
+                ..
+            } if subscription_id == subscription_a && live_output_contains(payload, output_marker)
+        )
+    });
+    assert!(
+        a_events.iter().all(|event| {
+            !matches!(
+                event,
+                botster_hub_client::DaemonEvent::Snapshot {
+                    subscription_id,
+                    ..
+                } if subscription_id == subscription_b
+            )
+        }),
+        "A must not receive B's Snapshot: {a_events:?}"
+    );
+    assert!(
+        a_events.iter().any(|event| {
+            matches!(
+                event,
+                botster_hub_client::DaemonEvent::TerminalOutput {
+                    subscription_id,
+                    payload,
+                    ..
+                } if subscription_id == subscription_a && live_output_contains(payload, output_marker)
+            )
+        }),
+        "A must receive its own TerminalOutput with the queued marker: {a_events:?}"
+    );
+
+    shutdown_short_lived_session(&endpoint, session_id);
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+/// Fresh idle Ghostty attach: production emits GHOSTSNP Snapshot before Attached.
+///
+/// Aligns shared no_history_then_live fixtures with the verified producer
+/// (blank GHOSTSNP present; ReadScreen empty; no Scrollback-as-GHOSTSNP).
+#[test]
+fn external_hub_idle_attach_emits_ghostsnp_snapshot_before_attached() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("external-hub-idle-ghostsnp");
+    let config = explicit_config(&data_dir);
+    let socket_path = config
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("local socket")
+        .path
+        .clone();
+    let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
+    let child = start_cli_daemon(&data_dir);
+    let mut connection = botster_hub_client::DaemonConnection::connect(&endpoint).expect("connect");
+
+    // Idle session: no prior renderable output before attach.
+    connection
+        .request(&botster_hub_client::DaemonRequest::Spawn {
+            session_id: "idle-ghostsnp-session".to_string(),
+            command: "sleep 30".to_string(),
+        })
+        .expect("spawn idle session");
+    let mut session_cleanup = SessionCleanupGuard::new(&data_dir, "idle-ghostsnp-session");
+    connection
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: "idle-ghostsnp-session".to_string(),
+            subscription_id: "idle-ghostsnp-sub".to_string(),
+        })
+        .expect("attach idle session");
+
+    let events = collect_attach_events(
+        &mut connection,
+        "idle-ghostsnp-session",
+        "idle-ghostsnp-sub",
+        None,
+    );
+
+    let attaching = events.iter().position(|event| {
+        matches!(
+            event,
+            botster_hub_client::DaemonEvent::AttachState {
+                subscription_id,
+                state,
+                ..
+            } if subscription_id == "idle-ghostsnp-sub" && state == "attaching"
+        )
+    });
+    let snapshot = events.iter().position(|event| {
+        matches!(
+            event,
+            botster_hub_client::DaemonEvent::Snapshot {
+                subscription_id,
+                ..
+            } if subscription_id == "idle-ghostsnp-sub"
+        )
+    });
+    let attached = events.iter().position(|event| {
+        matches!(
+            event,
+            botster_hub_client::DaemonEvent::AttachState {
+                subscription_id,
+                state,
+                ..
+            } if subscription_id == "idle-ghostsnp-sub" && state == "attached"
+        )
+    });
+    let (attaching, snapshot, attached) = (
+        attaching.expect("idle attach emits attaching"),
+        snapshot.expect("idle attach emits Snapshot"),
+        attached.expect("idle attach emits attached"),
+    );
+    assert!(
+        attaching < snapshot && snapshot < attached,
+        "ordering attaching < Snapshot < attached failed: {events:?}"
+    );
+
+    let payload = first_snapshot_payload(&events, "idle-ghostsnp-sub");
+    assert!(
+        payload.starts_with(GHOSTSNP_MAGIC),
+        "idle Snapshot must be GHOSTSNP; got {:?}",
+        &payload[..payload.len().min(16)]
+    );
+    assert!(
+        payload.len() > GHOSTSNP_MAGIC.len(),
+        "idle GHOSTSNP must be non-trivial (beyond magic only)"
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            botster_hub_client::DaemonEvent::Scrollback {
+                subscription_id,
+                history,
+                ..
+            } if subscription_id == "idle-ghostsnp-sub"
+                && history
+                    .decoded_bytes()
+                    .map(|bytes| bytes.starts_with(GHOSTSNP_MAGIC))
+                    .unwrap_or(false)
+        )),
+        "Scrollback must never carry GHOSTSNP magic on idle attach: {events:?}"
+    );
+
+    let screen = connection
+        .request(&botster_hub_client::DaemonRequest::ReadScreen {
+            session_id: "idle-ghostsnp-session".to_string(),
+        })
+        .expect("ReadScreen on idle session");
+    assert_eq!(
+        screen.kind,
+        botster_hub_client::DaemonResponseKind::ReadScreen
+    );
+    let text = screen.read_screen.expect("read_screen body").text;
+    let non_ws: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        non_ws.is_empty(),
+        "fresh idle ReadScreen must be blank; got {:?}",
+        text.chars().take(120).collect::<String>()
+    );
+
+    // Prefer equality with Golden B when dimensions/env match; if not, both must
+    // still be blank-importable GHOSTSNP (fixture golden is separately proven).
+    let golden_b = botster_hub_test_support::late_attach_no_history_payload_bytes();
+    if payload.as_slice() != golden_b {
+        eprintln!(
+            "idle live Snapshot SHA differs from frozen Golden B (len live={} golden={}); \
+             both remain authentic blank GHOSTSNP under production path",
+            payload.len(),
+            golden_b.len()
+        );
+    }
+
+    production_shutdown_and_remove_session(&endpoint, "idle-ghostsnp-session");
+    session_cleanup.disarm();
+    assert!(
+        !session_ids_from_list(&endpoint).contains(&"idle-ghostsnp-session".to_string()),
+        "production cleanup must remove idle-ghostsnp-session"
+    );
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn external_hub_mode_gated_kitty_stale_token_rejects_and_reprobe_admits() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("external-hub-mode-gated-kitty");
+    let config = explicit_config(&data_dir);
+    let socket_path = config
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("local socket")
+        .path
+        .clone();
+    let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
+    let child = start_cli_daemon(&data_dir);
+    let mut connection = botster_hub_client::DaemonConnection::connect(&endpoint).expect("connect");
+
+    connection
+        .request(&botster_hub_client::DaemonRequest::Spawn {
+            session_id: "mode-gated-kitty".to_string(),
+            command: concat!(
+                "printf ready; while IFS= read -r line; do ",
+                "printf \"echo:%s\\n\" \"$line\"; ",
+                "if [ \"$line\" = enable-modes ]; then ",
+                "printf '\\033[?1000h\\033[?1006h\\033[=1;1u'; ",
+                "fi; ",
+                "done"
+            )
+            .to_string(),
+        })
+        .expect("spawn");
+    let mut session_cleanup = SessionCleanupGuard::new(&data_dir, "mode-gated-kitty");
+    connection
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: "mode-gated-kitty".to_string(),
+            subscription_id: "mode-gated-kitty-sub".to_string(),
+        })
+        .expect("attach");
+
+    let baseline = wait_for_mode_flags(&mut connection, "mode-gated-kitty", |flags| {
+        flags.mode_generation != 0
+    });
+
+    let enable = connection
+        .request(&botster_hub_client::DaemonRequest::ModeGatedInput {
+            session_id: "mode-gated-kitty".to_string(),
+            data: "enable-modes\n".to_string(),
+            mode_generation: baseline.mode_generation,
+            mode_revision: baseline.mode_revision,
+        })
+        .expect("enable modes");
+    assert_eq!(
+        enable.kind,
+        botster_hub_client::DaemonResponseKind::ModeGatedInput
+    );
+    let enable_result = enable.mode_gated_input.expect("enable result");
+    assert!(enable_result.admitted, "baseline token should admit enable");
+
+    let after = wait_for_mode_flags(&mut connection, "mode-gated-kitty", |flags| {
+        flags.kitty_enabled && flags.mouse_mode == 9
+    });
+    assert!(after.kitty_enabled);
+    assert_eq!(after.mouse_mode, 9);
+
+    let stale = connection
+        .request(&botster_hub_client::DaemonRequest::ModeGatedInput {
+            session_id: "mode-gated-kitty".to_string(),
+            data: "stale-kitty\n".to_string(),
+            mode_generation: baseline.mode_generation,
+            mode_revision: baseline.mode_revision,
+        })
+        .expect("stale gated input");
+    let stale_result = stale.mode_gated_input.expect("stale result");
+    assert!(!stale_result.admitted, "stale token must reject");
+    assert_eq!(stale_result.bytes_written, 0);
+
+    thread::sleep(Duration::from_millis(100));
+    let screen = connection
+        .request(&botster_hub_client::DaemonRequest::ReadScreen {
+            session_id: "mode-gated-kitty".to_string(),
+        })
+        .expect("screen after stale");
+    let text = screen.read_screen.expect("screen body").text;
+    assert!(
+        !text.contains("echo:stale-kitty"),
+        "stale gated input must write zero PTY bytes; screen={text}"
+    );
+
+    let fresh = connection
+        .request(&botster_hub_client::DaemonRequest::ModeGatedInput {
+            session_id: "mode-gated-kitty".to_string(),
+            data: "fresh-kitty\n".to_string(),
+            mode_generation: after.mode_generation,
+            mode_revision: after.mode_revision,
+        })
+        .expect("fresh gated input");
+    let fresh_result = fresh.mode_gated_input.expect("fresh result");
+    assert!(fresh_result.admitted, "reprobed token must admit");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut saw_fresh = false;
+    while Instant::now() < deadline {
+        let screen = connection
+            .request(&botster_hub_client::DaemonRequest::ReadScreen {
+                session_id: "mode-gated-kitty".to_string(),
+            })
+            .expect("screen after fresh");
+        if screen
+            .read_screen
+            .expect("screen body")
+            .text
+            .contains("echo:fresh-kitty")
+        {
+            saw_fresh = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+    assert!(saw_fresh, "fresh gated input should reach the PTY");
+
+    production_shutdown_and_remove_session(&endpoint, "mode-gated-kitty");
+    session_cleanup.disarm();
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn external_hub_mode_gated_mouse_stale_token_rejects_and_reprobe_admits() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("external-hub-mode-gated-mouse");
+    let config = explicit_config(&data_dir);
+    let socket_path = config
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("local socket")
+        .path
+        .clone();
+    let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
+    let child = start_cli_daemon(&data_dir);
+    let mut connection = botster_hub_client::DaemonConnection::connect(&endpoint).expect("connect");
+
+    connection
+        .request(&botster_hub_client::DaemonRequest::Spawn {
+            session_id: "mode-gated-mouse".to_string(),
+            command: concat!(
+                "printf ready; while IFS= read -r line; do ",
+                "printf \"echo:%s\\n\" \"$line\"; ",
+                "if [ \"$line\" = enable-mouse ]; then ",
+                "printf '\\033[?1000h\\033[?1006h'; ",
+                "fi; ",
+                "done"
+            )
+            .to_string(),
+        })
+        .expect("spawn");
+    let mut session_cleanup = SessionCleanupGuard::new(&data_dir, "mode-gated-mouse");
+    connection
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: "mode-gated-mouse".to_string(),
+            subscription_id: "mode-gated-mouse-sub".to_string(),
+        })
+        .expect("attach");
+
+    let baseline = wait_for_mode_flags(&mut connection, "mode-gated-mouse", |flags| {
+        flags.mode_generation != 0
+    });
+    let enable = connection
+        .request(&botster_hub_client::DaemonRequest::ModeGatedInput {
+            session_id: "mode-gated-mouse".to_string(),
+            data: "enable-mouse\n".to_string(),
+            mode_generation: baseline.mode_generation,
+            mode_revision: baseline.mode_revision,
+        })
+        .expect("enable mouse");
+    assert!(enable.mode_gated_input.expect("enable body").admitted);
+
+    let after = wait_for_mode_flags(&mut connection, "mode-gated-mouse", |flags| {
+        flags.mouse_mode == 9
+    });
+    assert_eq!(after.mouse_mode, 9);
+
+    let stale = connection
+        .request(&botster_hub_client::DaemonRequest::ModeGatedInput {
+            session_id: "mode-gated-mouse".to_string(),
+            data: "stale-mouse\n".to_string(),
+            mode_generation: baseline.mode_generation,
+            mode_revision: baseline.mode_revision,
+        })
+        .expect("stale mouse input");
+    assert!(!stale.mode_gated_input.expect("stale body").admitted);
+
+    let fresh = connection
+        .request(&botster_hub_client::DaemonRequest::ModeGatedInput {
+            session_id: "mode-gated-mouse".to_string(),
+            data: "fresh-mouse\n".to_string(),
+            mode_generation: after.mode_generation,
+            mode_revision: after.mode_revision,
+        })
+        .expect("fresh mouse input");
+    assert!(fresh.mode_gated_input.expect("fresh body").admitted);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut saw_fresh = false;
+    while Instant::now() < deadline {
+        let screen = connection
+            .request(&botster_hub_client::DaemonRequest::ReadScreen {
+                session_id: "mode-gated-mouse".to_string(),
+            })
+            .expect("screen");
+        if screen
+            .read_screen
+            .expect("body")
+            .text
+            .contains("echo:fresh-mouse")
+        {
+            saw_fresh = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+    assert!(saw_fresh, "fresh mouse gated input should reach PTY");
+
+    production_shutdown_and_remove_session(&endpoint, "mode-gated-mouse");
+    session_cleanup.disarm();
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn external_hub_ghostty_snapshot_reflects_osc_palette_and_specials() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("external-hub-osc-snapshot");
+    let config = explicit_config(&data_dir);
+    let socket_path = config
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("local socket")
+        .path
+        .clone();
+    let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
+    let child = start_cli_daemon(&data_dir);
+    let mut connection = botster_hub_client::DaemonConnection::connect(&endpoint).expect("connect");
+
+    connection
+        .request(&botster_hub_client::DaemonRequest::Spawn {
+            session_id: "osc-snapshot-session".to_string(),
+            command: [
+                "printf ready; ",
+                "printf '\\033]4;3;rgb:1111/2222/3333\\033\\\\'; ",
+                "printf '\\033]10;rgb:aaaa/bbbb/cccc\\033\\\\'; ",
+                "printf '\\033]11;rgb:0101/0202/0303\\033\\\\'; ",
+                "printf '\\033]12;rgb:fefe/fdfd/fcfc\\033\\\\'; ",
+                "printf 'echo:color-mutated\\n'; ",
+                "while IFS= read -r line; do printf \"echo:%s\\n\" \"$line\"; done",
+            ]
+            .concat(),
+        })
+        .expect("spawn");
+    let mut session_cleanup = SessionCleanupGuard::new(&data_dir, "osc-snapshot-session");
+
+    // Wait for mutations to land, then attach for data-plane Snapshot.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let screen = botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::ReadScreen {
+                session_id: "osc-snapshot-session".to_string(),
+            },
+        )
+        .expect("read screen");
+        if screen
+            .read_screen
+            .as_ref()
+            .map(|body| body.text.contains("echo:color-mutated"))
+            .unwrap_or(false)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timeout waiting for color mutation"
+        );
+        thread::sleep(Duration::from_millis(30));
+    }
+
+    connection
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: "osc-snapshot-session".to_string(),
+            subscription_id: "osc-snapshot-sub".to_string(),
+        })
+        .expect("attach");
+    let events = collect_attach_events(
+        &mut connection,
+        "osc-snapshot-session",
+        "osc-snapshot-sub",
+        None,
+    );
+    let payload = first_snapshot_payload(&events, "osc-snapshot-sub");
+    assert!(
+        payload.starts_with(GHOSTSNP_MAGIC),
+        "post-OSC Snapshot must be GHOSTSNP; got {:?}",
+        &payload[..payload.len().min(16)]
+    );
+    assert!(
+        payload.len() > GHOSTSNP_MAGIC.len(),
+        "GHOSTSNP payload must carry durable color/mode state beyond magic"
+    );
+    // Current colors live in GHOSTSNP only after session start. Hub startup
+    // defaults (#FFFFFF/#282C34) must not be treated as current post-install.
+    // Hub does not decode GHOSTSNP; Core proves color agreement. Here we prove
+    // the authoritative byte path is Snapshot and is non-empty GHOSTSNP.
+
+    production_shutdown_and_remove_session(&endpoint, "osc-snapshot-session");
+    session_cleanup.disarm();
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn external_hub_osc_101112_session_side_replies_with_startup_baseline() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("external-hub-osc-baseline");
+    let config = explicit_config(&data_dir);
+    let socket_path = config
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("local socket")
+        .path
+        .clone();
+    let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
+    let child = start_cli_daemon(&data_dir);
+
+    let script_path = data_dir.join("osc_query_child.py");
+    fs::create_dir_all(&data_dir).expect("data dir");
+    fs::write(
+        &script_path,
+        r#"#!/usr/bin/env python3
+import sys
+import time
+sys.stdout.write("ready\n")
+sys.stdout.flush()
+sys.stdout.buffer.write(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]12;?\x1b\\")
+sys.stdout.flush()
+time.sleep(2)
+sys.stdout.write("done\n")
+sys.stdout.flush()
+"#,
+    )
+    .expect("write script");
+
+    // No client attach: OSC replies must come from session-side Ghostty using the
+    // Hub startup baseline profile, not Hub query synthesis.
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: "osc-baseline-session".to_string(),
+            command: format!("python3 {}", script_path.display()),
+        },
+    )
+    .expect("spawn osc child");
+    let mut session_cleanup = SessionCleanupGuard::new(&data_dir, "osc-baseline-session");
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut text = String::new();
+    while Instant::now() < deadline {
+        let screen = botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::ReadScreen {
+                session_id: "osc-baseline-session".to_string(),
+            },
+        )
+        .expect("read screen");
+        text = screen.read_screen.expect("screen body").text;
+        if text.to_ascii_lowercase().contains("]12;rgb:") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let lowered = text.to_ascii_lowercase();
+    // Product defaults: FG #FFFFFF, BG #282C34, cursor #FFFFFF
+    for expected in [
+        "]10;rgb:ffff/ffff/ffff",
+        "]11;rgb:2828/2c2c/3434",
+        "]12;rgb:ffff/ffff/ffff",
+    ] {
+        assert!(
+            lowered.contains(expected),
+            "expected OSC baseline {expected} in session screen; text={text}"
+        );
+    }
+    let seq10 = lowered.find("]10;rgb:ffff/ffff/ffff").expect("osc10");
+    let seq11 = lowered.find("]11;rgb:2828/2c2c/3434").expect("osc11");
+    let seq12 = lowered.find("]12;rgb:ffff/ffff/ffff").expect("osc12");
+    assert!(
+        seq10 < seq11 && seq11 < seq12,
+        "OSC reply order broken: {text}"
+    );
+
+    production_shutdown_and_remove_session(&endpoint, "osc-baseline-session");
+    session_cleanup.disarm();
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+/// Failure path: an armed SessionCleanupGuard must shut down a durable unbounded
+/// worker session when production RemoveSession never ran (panic / early return).
+///
+/// Proves logical-session exit/removal **and** authoritative absence of the
+/// captured session-worker PID and at least one exact non-root shell descendant.
+#[test]
+fn session_cleanup_guard_failure_path_reaps_durable_unbounded_session() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("session-cleanup-guard-failure");
+    let config = explicit_config(&data_dir);
+    let socket_path = config
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("local socket")
+        .path
+        .clone();
+    let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path.clone());
+    let child = start_cli_daemon(&data_dir);
+
+    let before_pids: std::collections::BTreeSet<u32> = session_worker_process_identities()
+        .expect("baseline worker census must succeed")
+        .into_iter()
+        .map(|worker| worker.pid)
+        .collect();
+
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: "cleanup-guard-session".to_string(),
+            command:
+                "printf ready; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done"
+                    .to_string(),
+        },
+    )
+    .expect("spawn unbounded session");
+    // Arm immediately after Spawn so census/assertion panics still clean up.
+    let session_cleanup = SessionCleanupGuard::new(&data_dir, "cleanup-guard-session");
+    let list_before =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::ListSessions)
+            .expect("list before failure path");
+    assert!(
+        list_before.sessions.iter().any(|session| {
+            session.session_id == "cleanup-guard-session" && session.lifecycle == "running"
+        }),
+        "spawned unbounded session must be running before failure-path cleanup"
+    );
+
+    let owned_workers = capture_new_session_workers_for_data_dir(&data_dir, &before_pids)
+        .expect("must capture worker + live shell descendant after Spawn");
+    assert!(
+        !owned_workers.is_empty(),
+        "must capture live botster-session-worker for this data_dir after Spawn"
+    );
+
+    let mut tracked_worker_pids = Vec::new();
+    let mut tracked_shell_pids = Vec::new();
+    for worker in &owned_workers {
+        process_must_be_alive(worker.pid, "worker")
+            .unwrap_or_else(|error| panic!("{error}; worker={worker:?}"));
+        assert!(
+            !worker.shell_descendant_pids.is_empty(),
+            "fixture starts sh -c; must observe at least one live non-root shell PID before cleanup: {worker:?}"
+        );
+        for shell_pid in &worker.shell_descendant_pids {
+            assert_ne!(
+                *shell_pid, worker.pid,
+                "shell descendant must differ from worker root: {worker:?}"
+            );
+            process_must_be_alive(*shell_pid, "shell descendant")
+                .unwrap_or_else(|error| panic!("{error}; worker={worker:?}"));
+            tracked_shell_pids.push(*shell_pid);
+        }
+        tracked_worker_pids.push(worker.pid);
+    }
+    assert!(
+        !tracked_shell_pids.is_empty(),
+        "must track exact non-root shell PIDs before guard drop"
+    );
+
+    // Same guard, simulated unwind before production RemoveSession.
+    drop(session_cleanup);
+
+    // Bounded process oracle: exact worker + exact shell descendant PIDs must be absent.
+    let tracked_pids: Vec<u32> = tracked_worker_pids
+        .iter()
+        .chain(tracked_shell_pids.iter())
+        .copied()
+        .collect();
+    let process_deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let mut all_absent = true;
+        let mut survivors = Vec::new();
+        for pid in &tracked_pids {
+            match process_is_alive_u32(*pid) {
+                Ok(true) => {
+                    all_absent = false;
+                    survivors.push(*pid);
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    panic!("process probe failed for pid {pid} after guard drop: {error}");
+                }
+            }
+        }
+        if all_absent {
+            break;
+        }
+        assert!(
+            Instant::now() < process_deadline,
+            "SessionCleanupGuard drop must reap exact worker and shell PIDs; still live={survivors:?} workers={owned_workers:?} shells={tracked_shell_pids:?}"
+        );
+        thread::sleep(Duration::from_millis(40));
+    }
+    for pid in &tracked_worker_pids {
+        process_must_be_absent(*pid, "worker after guard drop")
+            .unwrap_or_else(|error| panic!("{error}"));
+    }
+    for pid in &tracked_shell_pids {
+        process_must_be_absent(*pid, "shell descendant after guard drop")
+            .unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let exited = loop {
+        let list =
+            botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::ListSessions)
+                .expect("list after failure-path guard drop");
+        if let Some(session) = list
+            .sessions
+            .iter()
+            .find(|session| session.session_id == "cleanup-guard-session")
+        {
+            if session.lifecycle == "exited" {
+                break session.lifecycle.clone();
+            }
+        } else {
+            break "absent".to_string();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "SessionCleanupGuard drop must shut down durable worker session"
+        );
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        exited == "exited" || exited == "absent",
+        "failure-path cleanup must leave session exited or removed, got {exited}"
+    );
+
+    // Production-style registry removal after guard reaped the worker tree.
+    if session_ids_from_list(&endpoint)
+        .iter()
+        .any(|id| id == "cleanup-guard-session")
+    {
+        let remove = botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::RemoveSession {
+                session_id: "cleanup-guard-session".to_string(),
+            },
+        )
+        .expect("remove exited session after failure-path shutdown");
+        assert_eq!(
+            remove.kind,
+            botster_hub_client::DaemonResponseKind::SessionRemoved
+        );
+    }
+    assert!(
+        !session_ids_from_list(&endpoint)
+            .iter()
+            .any(|id| id == "cleanup-guard-session"),
+        "ListSessions must not retain cleanup-guard-session after RemoveSession"
+    );
+    // Re-check exact tracked PIDs after logical removal (no resurrection).
+    for pid in &tracked_worker_pids {
+        process_must_be_absent(*pid, "worker after RemoveSession")
+            .unwrap_or_else(|error| panic!("{error}"));
+    }
+    for pid in &tracked_shell_pids {
+        process_must_be_absent(*pid, "shell descendant after RemoveSession")
+            .unwrap_or_else(|error| panic!("{error}"));
+    }
+    assert!(
+        socket_path.exists(),
+        "daemon control socket remains for hub shutdown after session cleanup"
+    );
+
+    shutdown_cli_daemon(&data_dir, child);
+    assert!(
+        !socket_path.exists(),
+        "hub shutdown must remove the control socket after durable-session cleanup"
+    );
+}
+
+#[test]
+fn session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnect() {
+    let _guard = daemon_test_guard();
+    let conformance_hub = botster_hub_test_support::IsolatedHubBuilder::new()
+        .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
+        .session_worker_bin(session_worker_binary_path())
+        .root(PathBuf::from("/tmp/bh-slc"))
+        .name("published-runner")
+        .start()
+        .expect("start isolated hub for published session lifecycle conformance");
+    let conformance_report =
+        botster_hub_test_support::run_session_lifecycle_subscription_conformance(&conformance_hub)
+            .expect("run published session lifecycle conformance against real topology");
+    assert!(conformance_report.initial_snapshot_authoritative);
+    assert!(conformance_report.concurrent_subscribers_consistent);
+    assert!(conformance_report.spawn_upsert_observed);
+    assert!(conformance_report.lifecycle_patch_observed);
+    assert!(conformance_report.natural_exit_patch_observed);
+    assert!(conformance_report.remove_observed);
+    assert!(conformance_report.sequences_strictly_increasing);
+    assert!(conformance_report.disconnect_cleanup_released_subscription);
+    assert!(conformance_report.fresh_subscription_snapshot_authoritative);
+    assert_eq!(
+        conformance_report.overflow_resync_reason,
+        "subscriber_overflow"
+    );
+    assert!(conformance_report.failed_snapshot_delivery_closes_subscription);
+    conformance_hub
+        .shutdown()
+        .expect("shutdown published session lifecycle conformance hub");
+
+    let data_dir = unique_test_dir("session-entity-subscription");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("test config has local socket")
+            .path
+            .clone(),
+    );
+    let child = PanicSafeCliDaemon::start(&data_dir, "session entity daemon evidence");
+
+    let mut first = botster_hub_client::subscribe_session_entities(&endpoint, "entities-first")
+        .expect("subscribe first session entity stream");
+    first
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound first entity reads");
+    let initial = first.next_frame().expect("initial authoritative snapshot");
+    assert!(matches!(
+        initial,
+        botster_hub_client::DaemonEntityFrame::Snapshot {
+            snapshot_seq: 0,
+            ref items,
+            resync_reason: None,
+            ..
+        } if items.is_empty()
+    ));
+
+    let mut second = botster_hub_client::subscribe_session_entities(&endpoint, "entities-second")
+        .expect("subscribe independent session entity stream");
+    second
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound second entity reads");
+    assert!(matches!(
+        second.next_frame().expect("second authoritative snapshot"),
+        botster_hub_client::DaemonEntityFrame::Snapshot { .. }
+    ));
+
+    let spawn = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: "entity-session".to_string(),
+            command: "printf 'entity-before\\nentity-ready\\n'; IFS= read -r release; \
+                      printf 'entity-after:%s\\n' \"$release\""
+                .to_string(),
+        },
+    )
+    .expect("spawn entity session");
+    assert_eq!(spawn.kind, botster_hub_client::DaemonResponseKind::Spawned);
+    let mut session_cleanup = SessionCleanupGuard::new(&data_dir, "entity-session");
+
+    let first_upsert = first.next_frame().expect("first subscriber upsert");
+    let second_upsert = second.next_frame().expect("second subscriber upsert");
+    let upsert_sequence = match first_upsert {
+        botster_hub_client::DaemonEntityFrame::Upsert {
+            snapshot_seq,
+            ref id,
+            ref entity,
+            ..
+        } if id == "entity-session" => {
+            assert_eq!(
+                entity
+                    .get("lifecycle_class")
+                    .and_then(serde_json::Value::as_str),
+                Some("current")
+            );
+            snapshot_seq
+        }
+        other => panic!("expected first upsert, got {other:?}"),
+    };
+    assert!(matches!(
+        second_upsert,
+        botster_hub_client::DaemonEntityFrame::Upsert {
+            snapshot_seq,
+            ref id,
+            ..
+        } if id == "entity-session" && snapshot_seq == upsert_sequence
+    ));
+
+    let mut terminal =
+        botster_hub_client::DaemonConnection::connect(&endpoint).expect("terminal connection");
+    terminal
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: "entity-session".to_string(),
+            subscription_id: "terminal-alongside-entities".to_string(),
+        })
+        .expect("attach while entity pump is active");
+    let terminal_deadline = Instant::now() + Duration::from_secs(5);
+    let mut terminal_output = String::new();
+    while Instant::now() < terminal_deadline && !terminal_output.contains("entity-ready") {
+        let drain = terminal
+            .request(&botster_hub_client::DaemonRequest::Drain {
+                session_id: "entity-session".to_string(),
+            })
+            .expect("drain terminal output alongside entity pump");
+        for event in drain.events {
+            if let botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } = event {
+                terminal_output.push_str(&live_output_utf8(payload));
+            }
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        terminal_output.contains("entity-before") && terminal_output.contains("entity-ready"),
+        "entity fixture must publish semantic readiness through retained terminal egress, \
+         got {terminal_output:?}"
+    );
+
+    let resize = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Resize {
+            session_id: "entity-session".to_string(),
+            rows: 31,
+            cols: 101,
+        },
+    )
+    .expect("resize entity session");
+    assert_eq!(
+        resize.kind,
+        botster_hub_client::DaemonResponseKind::Events,
+        "live semantic barrier must keep resize accepted: {resize:?}"
+    );
+    let first_resize = first
+        .next_frame()
+        .expect("first subscriber resize transition");
+    let second_resize = second
+        .next_frame()
+        .expect("second subscriber resize transition");
+    let resize_sequence = match &first_resize {
+        botster_hub_client::DaemonEntityFrame::Patch {
+            snapshot_seq,
+            id,
+            patch,
+            ..
+        } if id == "entity-session"
+            && patch.get("rows").and_then(serde_json::Value::as_u64) == Some(31)
+            && patch.get("cols").and_then(serde_json::Value::as_u64) == Some(101) =>
+        {
+            *snapshot_seq
+        }
+        _ => panic!(
+            "expected rows=31/cols=101 as the first post-resize frame for both subscribers; \
+             resize={resize:?} first={first_resize:?} second={second_resize:?}"
+        ),
+    };
+    assert!(resize_sequence > upsert_sequence);
+    let second_resize_sequence = match &second_resize {
+        botster_hub_client::DaemonEntityFrame::Patch {
+            snapshot_seq,
+            id,
+            patch,
+            ..
+        } if id == "entity-session"
+            && patch.get("rows").and_then(serde_json::Value::as_u64) == Some(31)
+            && patch.get("cols").and_then(serde_json::Value::as_u64) == Some(101) =>
+        {
+            *snapshot_seq
+        }
+        _ => panic!(
+            "expected rows=31/cols=101 as the first post-resize frame for both subscribers; \
+             resize={resize:?} first={first_resize:?} second={second_resize:?}"
+        ),
+    };
+    assert_eq!(
+        second_resize_sequence, resize_sequence,
+        "subscriber resize sequences diverged: first={first_resize:?} second={second_resize:?}"
+    );
+
+    let release = terminal
+        .request(&botster_hub_client::DaemonRequest::SendInput {
+            session_id: "entity-session".to_string(),
+            data: "release\r".to_string(),
+        })
+        .expect("release entity fixture through terminal input");
+    assert_eq!(release.kind, botster_hub_client::DaemonResponseKind::Events);
+    for event in release.events {
+        if let botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } = event {
+            terminal_output.push_str(&live_output_utf8(payload));
+        }
+    }
+    let release_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < release_deadline && !terminal_output.contains("entity-after:release") {
+        let drain = terminal
+            .request(&botster_hub_client::DaemonRequest::Drain {
+                session_id: "entity-session".to_string(),
+            })
+            .expect("drain terminal output after releasing entity fixture");
+        for event in drain.events {
+            if let botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } = event {
+                terminal_output.push_str(&live_output_utf8(payload));
+            }
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        terminal_output.contains("entity-after:release"),
+        "entity lifecycle pumping must retain terminal egress through natural exit, \
+         got {terminal_output:?}"
+    );
+
+    let first_exit = first.next_frame().expect("first subscriber natural exit");
+    let second_exit = second.next_frame().expect("second subscriber natural exit");
+    let exit_sequence = match &first_exit {
+        botster_hub_client::DaemonEntityFrame::Patch {
+            snapshot_seq,
+            id,
+            patch,
+            ..
+        } if id == "entity-session"
+            && patch.get("lifecycle").and_then(serde_json::Value::as_str) == Some("exited")
+            && patch
+                .get("lifecycle_class")
+                .and_then(serde_json::Value::as_str)
+                == Some("ended")
+            && patch.get("exit_code").and_then(serde_json::Value::as_i64) == Some(0) =>
+        {
+            *snapshot_seq
+        }
+        _ => panic!(
+            "expected natural exit_code=0 as the first post-release frame for both subscribers; \
+             first={first_exit:?} second={second_exit:?}"
+        ),
+    };
+    let second_exit_sequence = match &second_exit {
+        botster_hub_client::DaemonEntityFrame::Patch {
+            snapshot_seq,
+            id,
+            patch,
+            ..
+        } if id == "entity-session"
+            && patch.get("lifecycle").and_then(serde_json::Value::as_str) == Some("exited")
+            && patch
+                .get("lifecycle_class")
+                .and_then(serde_json::Value::as_str)
+                == Some("ended")
+            && patch.get("exit_code").and_then(serde_json::Value::as_i64) == Some(0) =>
+        {
+            *snapshot_seq
+        }
+        _ => panic!(
+            "expected natural exit_code=0 as the first post-release frame for both subscribers; \
+             first={first_exit:?} second={second_exit:?}"
+        ),
+    };
+    assert!(exit_sequence > resize_sequence);
+    assert_eq!(
+        second_exit_sequence, exit_sequence,
+        "subscriber exit sequences diverged: first={first_exit:?} second={second_exit:?}"
+    );
+
+    let removed = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::RemoveSession {
+            session_id: "entity-session".to_string(),
+        },
+    )
+    .expect("remove terminal entity session");
+    assert_eq!(
+        removed.kind,
+        botster_hub_client::DaemonResponseKind::SessionRemoved
+    );
+    session_cleanup.disarm();
+    assert!(matches!(
+        first.next_frame().expect("remove delta"),
+        botster_hub_client::DaemonEntityFrame::Remove {
+            snapshot_seq,
+            ref id,
+            ..
+        } if id == "entity-session" && snapshot_seq > exit_sequence
+    ));
+
+    drop(first);
+    let cleanup_deadline = Instant::now() + Duration::from_secs(2);
+    let cleanup_probe = loop {
+        match botster_hub_client::subscribe_session_entities(&endpoint, "entities-first") {
+            Ok(subscription) => break subscription,
+            Err(_) if Instant::now() < cleanup_deadline => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => panic!("socket EOF should release the old subscription: {error}"),
+        }
+    };
+    cleanup_probe
+        .unsubscribe()
+        .expect("unsubscribe cleanup probe stream");
+    let mut reconnected =
+        botster_hub_client::subscribe_session_entities(&endpoint, "entities-reconnected")
+            .expect("fresh reconnect subscription");
+    reconnected
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound reconnect entity reads");
+    assert!(matches!(
+        reconnected.next_frame().expect("fresh reconnect snapshot"),
+        botster_hub_client::DaemonEntityFrame::Snapshot {
+            ref subscription_id,
+            ref items,
+            ..
+        } if subscription_id == "entities-reconnected" && items.is_empty()
+    ));
+    reconnected
+        .unsubscribe()
+        .expect("unsubscribe reconnect stream");
+    second.unsubscribe().expect("unsubscribe second stream");
+    child.shutdown();
+}
+
+#[test]
+fn session_entity_subscription_projects_stale_row_as_indeterminate() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("session-entity-stale");
+    let config = explicit_config(&data_dir);
+    let session_id = SessionId("session-entity-stale".to_string());
+    let registry = SessionRegistry::new(config.data_directory.clone());
+    let mut stale_record = RegistryRecord::running(
+        session_id.clone(),
+        Some(ProcessIdentity {
+            pid: Some(42),
+            runtime_id: Some("stale-runtime".to_string()),
+        }),
+        ResizePayload { rows: 24, cols: 80 },
+        "sh".to_string(),
+        1,
+    );
+    stale_record.observe_restart_contract(serde_json::json!({"session": "stale"}), 2);
+    registry
+        .save(&stale_record)
+        .expect("save stale registry fixture");
+
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("test config has local socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    let mut subscription =
+        botster_hub_client::subscribe_session_entities(&endpoint, "stale-session-entities")
+            .expect("subscribe to stale session projection");
+    subscription
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound stale projection read");
+    let snapshot = subscription
+        .next_frame()
+        .expect("authoritative stale snapshot");
+    assert!(matches!(
+        snapshot,
+        botster_hub_client::DaemonEntityFrame::Snapshot { ref items, .. }
+            if items.iter().any(|entity| {
+                entity.get("session_uuid").and_then(serde_json::Value::as_str)
+                    == Some(session_id.0.as_str())
+                    && entity.get("registry_state").and_then(serde_json::Value::as_str)
+                        == Some("stale")
+                    && entity.get("lifecycle_class").and_then(serde_json::Value::as_str)
+                        == Some("indeterminate")
+            })
+    ));
+    subscription
+        .unsubscribe()
+        .expect("unsubscribe stale projection");
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("focused-connection-lifecycle");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("test config has local socket")
+            .path
+            .clone(),
+    );
+    let daemon = PanicSafeCliDaemon::start(&data_dir, "connection lifecycle daemon evidence");
+    let daemon_pid = daemon.child.as_ref().expect("panic-safe daemon child").id();
+    let startup_counters =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+            .expect("status before first entity subscription")
+            .status
+            .expect("startup status body")
+            .lifecycle_counters;
+    assert_eq!(startup_counters.lifecycle_baseline_reads, 1);
+    let mut subscription =
+        botster_hub_client::subscribe_session_entities(&endpoint, "focused-idle")
+            .expect("subscribe focused idle entity stream");
+    subscription
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound initial snapshot read");
+    assert!(matches!(
+        subscription.next_frame().expect("initial focused snapshot"),
+        botster_hub_client::DaemonEntityFrame::Snapshot { .. }
+    ));
+    let before_idle =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+            .expect("status before focused idle window")
+            .status
+            .expect("focused status body")
+            .lifecycle_counters;
+    assert_eq!(
+        before_idle.lifecycle_baseline_reads, startup_counters.lifecycle_baseline_reads,
+        "first live subscriber must consume the startup-seeded baseline without owner-path I/O"
+    );
+    thread::sleep(Duration::from_millis(1_100));
+    let after_idle =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+            .expect("status after focused idle window")
+            .status
+            .expect("focused status body")
+            .lifecycle_counters;
+    assert_eq!(
+        after_idle.lifecycle_baseline_reads, before_idle.lifecycle_baseline_reads,
+        "steady-state idle reconciliation must not rescan the session registry"
+    );
+    assert_eq!(
+        after_idle.entity_delivery_attempts, before_idle.entity_delivery_attempts,
+        "an idle entity stream must not receive timer-driven frames"
+    );
+    assert!(
+        after_idle
+            .lifecycle_change_reads
+            .saturating_sub(before_idle.lifecycle_change_reads)
+            <= 4,
+        "the one shared idle backstop must stay low-frequency"
+    );
+
+    const FLOOD_CONNECTIONS: usize = 32;
+    const FLOOD_REQUESTS_PER_CONNECTION: usize = 512;
+    let mut flood_writers = Vec::new();
+    let mut flood_readers = Vec::new();
+    for _ in 0..FLOOD_CONNECTIONS {
+        let mut writer =
+            UnixStream::connect(&endpoint.socket_path).expect("connect pipelined pressure fixture");
+        botster_hub_client::write_frame(
+            &mut writer,
+            &botster_hub_client::DaemonHello {
+                protocol: botster_hub_client::PROTOCOL.to_string(),
+                compatibility: botster_hub_client::DaemonCompatibilityRequirement::current(),
+            },
+        )
+        .expect("write pressure-fixture hello");
+        let _: botster_hub_client::DaemonHelloAck =
+            botster_hub_client::read_frame(&mut writer).expect("read pressure-fixture hello ack");
+        let mut reader = BufReader::new(
+            writer
+                .try_clone()
+                .expect("clone pressure-fixture response reader"),
+        );
+        flood_readers.push(thread::spawn(move || {
+            for _ in 0..FLOOD_REQUESTS_PER_CONNECTION {
+                let _: botster_hub_client::DaemonResponse =
+                    botster_hub_client::read_frame_from_reader(&mut reader)
+                        .expect("drain pipelined status response");
+            }
+        }));
+        flood_writers.push(writer);
+    }
+    let flood_before =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+            .expect("status before sustained control pressure")
+            .status
+            .expect("sustained control pressure status body")
+            .lifecycle_counters;
+    for writer in &mut flood_writers {
+        for _ in 0..FLOOD_REQUESTS_PER_CONNECTION {
+            botster_hub_client::write_frame(writer, &botster_hub_client::DaemonRequest::Status)
+                .expect("pipeline sustained status request");
+        }
+    }
+    thread::sleep(Duration::from_millis(1_100));
+    let flood_after =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+            .expect("status during sustained control pressure")
+            .status
+            .expect("post-pressure status body")
+            .lifecycle_counters;
+    drop(flood_writers);
+    for flood_reader in flood_readers {
+        flood_reader
+            .join()
+            .expect("join pipelined status response drain");
+    }
+    assert!(
+        flood_after.reconciliation_wakes > flood_before.reconciliation_wakes,
+        "a continuously busy control queue must not starve shared entity reconciliation"
+    );
+
+    for index in 0..8 {
+        botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::Spawn {
+                session_id: format!("focused-idle-session-{index}"),
+                command: "sleep 10".to_string(),
+            },
+        )
+        .expect("spawn focused session-count fixture");
+    }
+    let mut upserts = BTreeMap::new();
+    while upserts.len() < 8 {
+        if let botster_hub_client::DaemonEntityFrame::Upsert { id, .. } = subscription
+            .next_frame()
+            .expect("session-count fixture upsert")
+        {
+            upserts.insert(id, ());
+        }
+    }
+    let mut additional_subscriptions = Vec::new();
+    for index in 1..8 {
+        let mut additional = botster_hub_client::subscribe_session_entities(
+            &endpoint,
+            format!("focused-idle-{index}"),
+        )
+        .expect("subscribe additional idle entity stream");
+        additional
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("bound additional snapshot read");
+        assert!(matches!(
+            additional.next_frame().expect("additional idle snapshot"),
+            botster_hub_client::DaemonEntityFrame::Snapshot { ref items, .. }
+                if items.len() == 8
+        ));
+        additional_subscriptions.push(additional);
+    }
+    thread::sleep(Duration::from_millis(600));
+    let many_before =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+            .expect("status before many-session idle window")
+            .status
+            .expect("many-session status body")
+            .lifecycle_counters;
+    thread::sleep(Duration::from_millis(1_100));
+    let many_after =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+            .expect("status after many-session idle window")
+            .status
+            .expect("many-session status body")
+            .lifecycle_counters;
+    assert_eq!(
+        many_after.lifecycle_baseline_reads, many_before.lifecycle_baseline_reads,
+        "session count must not restore filesystem-backed baseline polling"
+    );
+    assert_eq!(
+        many_after.entity_delivery_attempts, many_before.entity_delivery_attempts,
+        "subscriber count must not create timer-driven entity delivery"
+    );
+    assert!(
+        many_after
+            .reconciliation_wakes
+            .saturating_sub(many_before.reconciliation_wakes)
+            <= 4,
+        "shared wake count must stay independent of session count"
+    );
+    assert!(
+        many_after.lifecycle_session_drains > many_before.lifecycle_session_drains,
+        "live sessions must drive the published lifecycle_session_drains producer"
+    );
+
+    let mut attached = botster_hub_client::DaemonConnection::connect(&endpoint)
+        .expect("connect persistent attach counter fixture");
+    attached
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: "focused-idle-session-0".to_string(),
+            subscription_id: "focused-attach".to_string(),
+        })
+        .expect("attach persistent counter fixture");
+    let attached_counters =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+            .expect("status with live attach")
+            .status
+            .expect("live attach status body")
+            .lifecycle_counters;
+    assert_eq!(attached_counters.live_attach_subscriptions, 1);
+    assert!(attached_counters.high_water_attach_subscriptions >= 1);
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::ShutdownSession {
+            session_id: "focused-idle-session-0".to_string(),
+        },
+    )
+    .expect("shutdown attached cleanup-race fixture");
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::RemoveSession {
+            session_id: "focused-idle-session-0".to_string(),
+        },
+    )
+    .expect("remove attached cleanup-race fixture");
+    drop(attached);
+
+    let attached_cleanup_deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let counters =
+            botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+                .expect("status while waiting for idempotent detach cleanup")
+                .status
+                .expect("idempotent cleanup status body")
+                .lifecycle_counters;
+        if counters.cleanup_completed > attached_counters.cleanup_completed {
+            assert_eq!(counters.live_attach_subscriptions, 0);
+            assert_eq!(counters.cleanup_failed, attached_counters.cleanup_failed);
+            break;
+        }
+        assert!(
+            Instant::now() < attached_cleanup_deadline,
+            "idempotent cleanup did not settle: {counters:?}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    drop(subscription);
+    drop(additional_subscriptions);
+
+    let cleanup_deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let counters =
+            botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+                .expect("status while waiting for entity cleanup")
+                .status
+                .expect("cleanup status body")
+                .lifecycle_counters;
+        if counters.live_entity_subscriptions == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < cleanup_deadline,
+            "dropped entity stream did not release its subscription"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let churn_start =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+            .expect("status before rapid reconnect churn")
+            .status
+            .expect("rapid reconnect start status")
+            .lifecycle_counters;
+    for index in 0..16 {
+        let mut churn = botster_hub_client::subscribe_session_entities(
+            &endpoint,
+            format!("focused-churn-{index}"),
+        )
+        .expect("register fresh-id reconnect generation");
+        churn
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("bound churn snapshot read");
+        assert!(matches!(
+            churn.next_frame().expect("fresh-id churn snapshot"),
+            botster_hub_client::DaemonEntityFrame::Snapshot { .. }
+        ));
+        drop(churn);
+        let generation_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let counters =
+                botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+                    .expect("status while releasing reconnect generation")
+                    .status
+                    .expect("reconnect generation status body")
+                    .lifecycle_counters;
+            if counters.live_entity_subscriptions == 0 {
+                assert_eq!(counters.high_water_entity_subscriptions, 8);
+                break;
+            }
+            assert!(
+                Instant::now() < generation_deadline,
+                "reconnect generation {index} did not release: {counters:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    let churn_end =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+            .expect("status after rapid reconnect churn")
+            .status
+            .expect("rapid reconnect end status")
+            .lifecycle_counters;
+    assert_eq!(
+        churn_end
+            .reconnect_registrations
+            .saturating_sub(churn_start.reconnect_registrations),
+        16,
+        "every released generation followed by a fresh subscription id is a reconnect"
+    );
+    assert!(
+        churn_end
+            .cleanup_by_reason
+            .get("eof")
+            .copied()
+            .unwrap_or_default()
+            .saturating_sub(
+                churn_start
+                    .cleanup_by_reason
+                    .get("eof")
+                    .copied()
+                    .unwrap_or_default()
+            )
+            >= 16
+    );
+
+    let connection_baseline_threads = process_thread_count(daemon_pid);
+    let mut idle_connections = Vec::new();
+    for _ in 0..64 {
+        idle_connections.push(
+            botster_hub_client::DaemonConnection::connect(&endpoint)
+                .expect("admit bounded idle connection"),
+        );
+    }
+    let saturated = idle_connections[0]
+        .request(&botster_hub_client::DaemonRequest::Status)
+        .expect("existing client stays responsive at admission bound")
+        .status
+        .expect("saturated status body")
+        .lifecycle_counters;
+    assert_eq!(saturated.live_connections, 64);
+    assert_eq!(saturated.high_water_live_connections, 64);
+    assert!(saturated.accepted_connections >= 64);
+    if let (Some(baseline), Some(peak)) = (
+        connection_baseline_threads,
+        process_thread_count(daemon_pid),
+    ) {
+        assert!(
+            peak.saturating_sub(baseline) <= 8,
+            "64 idle connections created too many OS threads: baseline={baseline} peak={peak}"
+        );
+    }
+
+    let stalled_rejection =
+        UnixStream::connect(&endpoint.socket_path).expect("connect stalled over-cap peer");
+    let rejection_started = Instant::now();
+    let mut rejected = botster_hub_client::DaemonConnection::connect(&endpoint)
+        .expect("over-cap client receives typed admission hello");
+    assert!(
+        rejection_started.elapsed() < Duration::from_secs(1),
+        "one silent over-cap peer must not head-of-line block typed rejection"
+    );
+    assert!(
+        rejected
+            .request(&botster_hub_client::DaemonRequest::Status)
+            .is_err(),
+        "over-cap connection must not enter the runtime request path"
+    );
+    let rejection_counter_deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let rejected_status = idle_connections[0]
+            .request(&botster_hub_client::DaemonRequest::Status)
+            .expect("admitted client remains healthy after rejection")
+            .status
+            .expect("post-rejection status body")
+            .lifecycle_counters;
+        if rejected_status.rejected_connections >= 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < rejection_counter_deadline,
+            "typed rejection counter did not converge"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    drop(stalled_rejection);
+    drop(rejected);
+    drop(idle_connections);
+    let release_deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let counters =
+            match botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+            {
+                Ok(response) => {
+                    response
+                        .status
+                        .expect("released-connection status body")
+                        .lifecycle_counters
+                }
+                Err(_) if Instant::now() < release_deadline => {
+                    thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
+                Err(error) => panic!("connection admission did not recover: {error}"),
+            };
+        if counters.live_connections <= 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < release_deadline,
+            "idle connection owners did not release: {counters:?}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let mut malformed =
+        UnixStream::connect(&endpoint.socket_path).expect("connect malformed raw daemon client");
+    botster_hub_client::write_frame(
+        &mut malformed,
+        &botster_hub_client::DaemonHello {
+            protocol: botster_hub_client::PROTOCOL.to_string(),
+            compatibility: botster_hub_client::DaemonCompatibilityRequirement::current(),
+        },
+    )
+    .expect("write malformed-client hello");
+    let _: botster_hub_client::DaemonHelloAck =
+        botster_hub_client::read_frame(&mut malformed).expect("read malformed-client hello ack");
+    malformed
+        .write_all(b"{\"type\":}\n")
+        .expect("write malformed complete frame");
+    drop(malformed);
+
+    let mut half_open =
+        UnixStream::connect(&endpoint.socket_path).expect("connect half-open raw daemon client");
+    half_open
+        .set_read_timeout(Some(Duration::from_secs(4)))
+        .expect("bound half-open handshake close observation");
+    let mut closed = [0_u8; 1];
+    assert!(
+        half_open.read(&mut closed).is_ok_and(|count| count == 0),
+        "half-open handshake deadline must close the connection"
+    );
+    drop(half_open);
+
+    let mut incomplete =
+        UnixStream::connect(&endpoint.socket_path).expect("connect incomplete raw daemon client");
+    botster_hub_client::write_frame(
+        &mut incomplete,
+        &botster_hub_client::DaemonHello {
+            protocol: botster_hub_client::PROTOCOL.to_string(),
+            compatibility: botster_hub_client::DaemonCompatibilityRequirement::current(),
+        },
+    )
+    .expect("write incomplete-client hello");
+    let _: botster_hub_client::DaemonHelloAck =
+        botster_hub_client::read_frame(&mut incomplete).expect("read incomplete-client hello ack");
+    incomplete
+        .write_all(b"{\"type\":\"status\"")
+        .expect("write incomplete frame");
+    incomplete
+        .set_read_timeout(Some(Duration::from_secs(4)))
+        .expect("bound incomplete-frame close observation");
+    assert!(
+        incomplete.read(&mut closed).is_ok_and(|count| count == 0),
+        "incomplete frame deadline must close the connection"
+    );
+    drop(incomplete);
+
+    let cleanup_deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let counters =
+            botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+                .expect("status after malformed and incomplete clients")
+                .status
+                .expect("terminal cleanup status body")
+                .lifecycle_counters;
+        if counters
+            .cleanup_by_reason
+            .get("protocol")
+            .copied()
+            .unwrap_or_default()
+            >= 3
+            && counters.live_connections <= 1
+        {
+            assert!(counters.cleanup_completed >= 67);
+            break;
+        }
+        assert!(
+            Instant::now() < cleanup_deadline,
+            "transport cleanup counters did not settle: {counters:?}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    for index in 1..8 {
+        let session_id = format!("focused-idle-session-{index}");
+        botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::ShutdownSession {
+                session_id: session_id.clone(),
+            },
+        )
+        .expect("shutdown focused session-count fixture");
+        botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::RemoveSession { session_id },
+        )
+        .expect("remove focused session-count fixture");
+    }
+
+    daemon.shutdown();
+}
+
+#[test]
+fn session_entity_subscription_observes_natural_exit_without_terminal_attach() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("session-entity-no-terminal");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("test config has local socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    let mut subscription =
+        botster_hub_client::subscribe_session_entities(&endpoint, "entities-no-terminal")
+            .expect("subscribe without terminal attach");
+    subscription
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound entity read");
+    let _ = subscription.next_frame().expect("initial snapshot");
+
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: "entity-no-terminal".to_string(),
+            command: "sleep 0.1".to_string(),
+        },
+    )
+    .expect("spawn session without terminal attach");
+    assert!(matches!(
+        subscription.next_frame().expect("spawn upsert"),
+        botster_hub_client::DaemonEntityFrame::Upsert { ref id, .. }
+            if id == "entity-no-terminal"
+    ));
+    loop {
+        match subscription.next_frame().expect("natural exit delta") {
+            botster_hub_client::DaemonEntityFrame::Patch { patch, .. }
+                if patch.get("lifecycle").and_then(serde_json::Value::as_str) == Some("exited") =>
+            {
+                break;
+            }
+            _ => {}
+        }
+    }
+    subscription
+        .unsubscribe()
+        .expect("unsubscribe entity stream");
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn shutdown_from_another_connection_preserves_process_exit_for_attached_subscription() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("cross-shutdown-egress");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("test config has local socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    let session_id = "cross-connection-shutdown";
+    let subscription_id = "cross-connection-terminal";
+    let marker_path = data_dir.join("natural-exit-marker");
+    let release_path = data_dir.join("natural-exit-release");
+
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: session_id.to_string(),
+            command: format!(
+                "printf ready; IFS= read -r line; printf 'cross-connection-exiting:%s\\n' \"$line\"; \
+                 printf observed > '{}'; while [ ! -e '{}' ]; do sleep 0.01; done; \
+                 printf 'cross-connection-tail\\n'; exit 0",
+                marker_path.display(),
+                release_path.display()
+            ),
+        },
+    )
+    .expect("spawn cross-connection shutdown session");
+    let mut attached =
+        botster_hub_client::DaemonConnection::connect(&endpoint).expect("terminal connection");
+    attached
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: session_id.to_string(),
+            subscription_id: subscription_id.to_string(),
+        })
+        .expect("attach terminal subscription");
+    attached
+        .request(&botster_hub_client::DaemonRequest::SendInput {
+            session_id: session_id.to_string(),
+            data: "finish\r".to_string(),
+        })
+        .expect("release terminal fixture to its exit marker");
+    for _ in 0..500 {
+        if marker_path.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        marker_path.exists(),
+        "terminal fixture did not publish its marker"
+    );
+
+    let mut observed_marker = false;
+    for _ in 0..100 {
+        let marker_drain = attached
+            .request(&botster_hub_client::DaemonRequest::Drain {
+                session_id: session_id.to_string(),
+            })
+            .expect("drain terminal marker before natural exit");
+        observed_marker |= marker_drain.events.iter().any(|event| {
+            matches!(
+                event,
+                botster_hub_client::DaemonEvent::TerminalOutput { payload, .. }
+                    if live_output_contains(payload, "cross-connection-exiting")
+            )
+        });
+        assert!(
+            marker_drain
+                .events
+                .iter()
+                .all(|event| !matches!(event, botster_hub_client::DaemonEvent::ProcessExit { .. })),
+            "fixture must remain live until its explicit release: {:?}",
+            marker_drain.events
+        );
+        if observed_marker {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        observed_marker,
+        "attached subscription did not observe the exit marker"
+    );
+
+    let registry: serde_json::Value = serde_json::from_slice(
+        &fs::read(data_dir.join("sessions").join(format!("{session_id}.json")))
+            .expect("read worker session registry"),
+    )
+    .expect("parse worker session registry");
+    let pty_child_pid = registry["process"]["pid"]
+        .as_u64()
+        .expect("registry PTY child pid") as u32;
+    let worker_socket = PathBuf::from(
+        registry["recovery_identity"]["worker_control_socket"]
+            .as_str()
+            .expect("registry worker control socket"),
+    );
+    fs::write(&release_path, b"release").expect("release controlled natural exit");
+    for _ in 0..500 {
+        if !process_exists(pty_child_pid) && UnixStream::connect(&worker_socket).is_err() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !process_exists(pty_child_pid) && UnixStream::connect(&worker_socket).is_err(),
+        "worker process and control route did not complete before shutdown"
+    );
+
+    let shutdown = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::ShutdownSession {
+            session_id: session_id.to_string(),
+        },
+    )
+    .expect("shutdown session from a separate connection");
+    assert!(
+        shutdown.events.iter().all(|event| !matches!(
+            event,
+            botster_hub_client::DaemonEvent::ProcessExit {
+                subscription_id: event_subscription_id,
+                ..
+            } if event_subscription_id == subscription_id
+        )),
+        "shutdown caller must not consume the attached subscription's process exit: {:?}",
+        shutdown.events
+    );
+
+    let attached_drain = attached
+        .request(&botster_hub_client::DaemonRequest::Drain {
+            session_id: session_id.to_string(),
+        })
+        .expect("drain attached subscription after cross-connection shutdown");
+    assert_eq!(
+        attached_drain
+            .events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                botster_hub_client::DaemonEvent::ProcessExit {
+                    session_id: event_session_id,
+                    subscription_id: event_subscription_id,
+                    ..
+                } if event_session_id == session_id && event_subscription_id == subscription_id
+            ))
+            .count(),
+        1,
+        "attached subscription must receive one process exit: {:?}",
+        attached_drain.events
+    );
+    assert!(
+        attached_drain.events.iter().any(|event| matches!(
+            event,
+            botster_hub_client::DaemonEvent::TerminalOutput { payload, .. }
+                if live_output_contains(payload, "cross-connection-tail")
+        )),
+        "final terminal output must be preserved with the process exit: {:?}",
+        attached_drain.events
+    );
+    let drained_again = attached
+        .request(&botster_hub_client::DaemonRequest::Drain {
+            session_id: session_id.to_string(),
+        })
+        .expect("repeat drain after cross-connection shutdown");
+    assert!(
+        drained_again.events.iter().all(|event| !matches!(
+            event,
+            botster_hub_client::DaemonEvent::ProcessExit {
+                subscription_id: event_subscription_id,
+                ..
+            } if event_subscription_id == subscription_id
+        )),
+        "subscription-scoped process exit must be delivered once: {:?}",
+        drained_again.events
+    );
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn session_entity_subscription_observes_attached_natural_exit_with_pending_egress() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("session-entity-attached-exit");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("test config has local socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    let mut subscription =
+        botster_hub_client::subscribe_session_entities(&endpoint, "entities-attached-exit")
+            .expect("subscribe before attached natural exit");
+    subscription
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound entity reads");
+    let _ = subscription.next_frame().expect("initial snapshot");
+
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: "entity-attached-exit".to_string(),
+            command: "sleep 0.15; printf 'pending-first\\n'; sleep 0.15; printf 'pending-second\\n'; exit 7"
+                .to_string(),
+        },
+    )
+    .expect("spawn attached natural-exit session");
+    assert!(matches!(
+        subscription.next_frame().expect("spawn upsert"),
+        botster_hub_client::DaemonEntityFrame::Upsert { ref id, .. }
+            if id == "entity-attached-exit"
+    ));
+
+    let mut terminal =
+        botster_hub_client::DaemonConnection::connect(&endpoint).expect("terminal connection");
+    terminal
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: "entity-attached-exit".to_string(),
+            subscription_id: "terminal-attached-exit".to_string(),
+        })
+        .expect("attach before output becomes pending");
+
+    let exit_sequence = loop {
+        match subscription
+            .next_frame()
+            .expect("natural exit delta with pending terminal egress")
+        {
+            botster_hub_client::DaemonEntityFrame::Patch {
+                snapshot_seq,
+                id,
+                patch,
+                ..
+            } if id == "entity-attached-exit"
+                && patch.get("lifecycle").and_then(serde_json::Value::as_str) == Some("exited") =>
+            {
+                assert_eq!(
+                    patch.get("exit_code").and_then(serde_json::Value::as_i64),
+                    Some(7)
+                );
+                break snapshot_seq;
+            }
+            _ => {}
+        }
+    };
+    assert!(exit_sequence > 0);
+
+    let retained = terminal
+        .request(&botster_hub_client::DaemonRequest::Drain {
+            session_id: "entity-attached-exit".to_string(),
+        })
+        .expect("drain retained terminal output after exit patch");
+    let retained_output = retained
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } => {
+                Some(live_output_utf8(payload))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    assert_eq!(retained_output.matches("pending-first").count(), 1);
+    assert_eq!(retained_output.matches("pending-second").count(), 1);
+    assert!(
+        retained_output.find("pending-first") < retained_output.find("pending-second"),
+        "retained terminal output must preserve production order, got {retained_output:?}"
+    );
+    assert_eq!(
+        retained
+            .events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                botster_hub_client::DaemonEvent::ProcessExit { code: Some(7), .. }
+            ))
+            .count(),
+        1,
+        "retained terminal events must include the process exit exactly once"
+    );
+
+    let drained_again = terminal
+        .request(&botster_hub_client::DaemonRequest::Drain {
+            session_id: "entity-attached-exit".to_string(),
+        })
+        .expect("second terminal drain after retained batch");
+    assert!(
+        drained_again.events.iter().all(|event| {
+            !matches!(
+                event,
+                botster_hub_client::DaemonEvent::TerminalOutput { payload, .. }
+                    if live_output_contains(payload, "pending-first") || live_output_contains(payload, "pending-second")
+            ) && !matches!(
+                event,
+                botster_hub_client::DaemonEvent::ProcessExit { code: Some(7), .. }
+            )
+        }),
+        "retained terminal events must only be delivered once, got {:?}",
+        drained_again.events
+    );
+
+    subscription
+        .unsubscribe()
+        .expect("unsubscribe entity stream");
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn session_entity_subscription_recovers_after_terminal_disconnect_with_pending_egress() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("entity-drop");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("test config has local socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    let mut subscription =
+        botster_hub_client::subscribe_session_entities(&endpoint, "entities-terminal-disconnect")
+            .expect("subscribe before terminal disconnect");
+    subscription
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound entity reads");
+    let _ = subscription.next_frame().expect("initial snapshot");
+
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: "entity-terminal-disconnect".to_string(),
+            command: "sleep 0.3; printf 'orphaned-output\\n'; sleep 0.6; exit 7".to_string(),
+        },
+    )
+    .expect("spawn terminal disconnect session");
+    assert!(matches!(
+        subscription.next_frame().expect("spawn upsert"),
+        botster_hub_client::DaemonEntityFrame::Upsert { ref id, .. }
+            if id == "entity-terminal-disconnect"
+    ));
+
+    let mut terminal =
+        botster_hub_client::DaemonConnection::connect(&endpoint).expect("terminal connection");
+    terminal
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: "entity-terminal-disconnect".to_string(),
+            subscription_id: "terminal-disconnect".to_string(),
+        })
+        .expect("attach terminal before ungraceful disconnect");
+    thread::sleep(Duration::from_millis(500));
+    drop(terminal);
+
+    let exit_sequence = loop {
+        match subscription
+            .next_frame()
+            .expect("exit delta after terminal disconnect")
+        {
+            botster_hub_client::DaemonEntityFrame::Patch {
+                snapshot_seq,
+                patch,
+                ..
+            } if patch.get("lifecycle").and_then(serde_json::Value::as_str) == Some("exited") => {
+                assert_eq!(
+                    patch.get("exit_code").and_then(serde_json::Value::as_i64),
+                    Some(7)
+                );
+                break snapshot_seq;
+            }
+            _ => {}
+        }
+    };
+
+    let removed = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::RemoveSession {
+            session_id: "entity-terminal-disconnect".to_string(),
+        },
+    )
+    .expect("remove session after disconnected terminal exit");
+    assert_eq!(
+        removed.kind,
+        botster_hub_client::DaemonResponseKind::SessionRemoved
+    );
+    assert!(matches!(
+        subscription.next_frame().expect("remove delta"),
+        botster_hub_client::DaemonEntityFrame::Remove {
+            snapshot_seq,
+            ref id,
+            ..
+        } if id == "entity-terminal-disconnect" && snapshot_seq > exit_sequence
+    ));
+
+    subscription
+        .unsubscribe()
+        .expect("unsubscribe entity stream");
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn external_hub_client_spawn_failure_returns_actionable_diagnostics() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("spawn-fail");
+    let bad_worker = data_dir.join("missing-botster-session-worker");
+    let config = explicit_config(&data_dir);
+    let socket_path = config
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("test config has local socket")
+        .path
+        .clone();
+    let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
+    let child = start_cli_daemon_with_session_worker(&data_dir, &bad_worker);
+
+    let mut connection =
+        botster_hub_client::DaemonConnection::connect(&endpoint).expect("external connect");
+    let spawn = connection
+        .request(&botster_hub_client::DaemonRequest::Spawn {
+            session_id: "botster-web-runtime-session".to_string(),
+            command: "printf 'should-not-start\\n'".to_string(),
+        })
+        .expect("spawn failure should return operator frame");
+    assert_eq!(
+        spawn.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError
+    );
+    let error = spawn.error.as_ref().expect("operator error body");
+    assert_eq!(
+        error.code, "spawn_failed",
+        "unexpected spawn operator error: {error:?} diagnostics={:?}",
+        spawn.diagnostics
+    );
+    assert_eq!(error.operation, "spawn");
+    assert!(
+        spawn.diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == botster_hub_client::DaemonDiagnosticKind::ActionFailure
+                && diagnostic.operation.as_deref() == Some("spawn")
+                && diagnostic
+                    .message
+                    .as_deref()
+                    .is_some_and(|message| message.contains("session worker"))
+        }),
+        "spawn failure should carry an actionable diagnostic row, got {:?}",
+        spawn.diagnostics
+    );
+    assert!(!has_diagnostic_kind(
+        &spawn.diagnostics,
+        botster_hub_client::DaemonDiagnosticKind::Connected
+    ));
+    let debug = format!("{error:?} {:?}", spawn.diagnostics);
+    assert!(!debug.contains(&data_dir.to_string_lossy().to_string()));
+    assert!(!debug.contains(&bad_worker.to_string_lossy().to_string()));
+    assert!(!debug.contains(concat!("/", "Users", "/")));
+    assert!(!debug.contains("/home/"));
+
+    let status = connection
+        .request(&botster_hub_client::DaemonRequest::Status)
+        .expect("daemon remains responsive after spawn failure");
+    assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn external_hub_client_reports_compatibility_descriptor_and_mismatch_diagnostics() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("compat");
+    let config = explicit_config(&data_dir);
+    let socket_path = config
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("test config has local socket")
+        .path
+        .clone();
+    let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path.clone());
+    let child = start_cli_daemon(&data_dir);
+
+    let mut stream = UnixStream::connect(&socket_path).expect("connect raw compatibility socket");
+    botster_hub_client::write_frame(
+        &mut stream,
+        &botster_hub_client::DaemonHello {
+            protocol: botster_hub_client::PROTOCOL.to_string(),
+            compatibility: botster_hub_client::DaemonCompatibilityRequirement::current(),
+        },
+    )
+    .expect("write hello");
+    let ack: botster_hub_client::DaemonHelloAck =
+        botster_hub_client::read_frame(&mut stream).expect("read hello ack");
+    assert_eq!(ack.protocol, botster_hub_client::PROTOCOL);
+    assert!(ack.diagnostics.iter().any(|diagnostic| {
+        diagnostic.kind == botster_hub_client::DaemonDiagnosticKind::Connected
+            && diagnostic.operation.as_deref() == Some("hello")
+    }));
+    assert!(!has_failure_diagnostic(&ack.diagnostics));
+    assert_eq!(ack.compatibility.protocol, botster_hub_client::PROTOCOL);
+    assert_eq!(
+        ack.compatibility.protocol_version,
+        botster_hub_client::PROTOCOL_VERSION
+    );
+    assert!(
+        ack.compatibility
+            .supports_feature(botster_hub_client::FEATURE_SESSIONS)
+    );
+    assert!(
+        ack.compatibility
+            .supports_feature(botster_hub_client::FEATURE_TERMINAL_STREAMING)
+    );
+    assert!(
+        ack.compatibility
+            .supports_feature(botster_hub_client::FEATURE_RESIZE)
+    );
+    assert!(
+        ack.compatibility
+            .supports_feature(botster_hub_client::FEATURE_PLUGIN_SURFACE_RENDER)
+    );
+    assert!(
+        ack.compatibility
+            .supports_feature(botster_hub_client::FEATURE_PLUGIN_SURFACE_ACTION)
+    );
+    assert_eq!(
+        ack.compatibility.conformance_fixture_revision,
+        botster_hub_client::CONFORMANCE_FIXTURE_REVISION
+    );
+
+    let status = botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+        .expect("external client status request");
+    assert!(status.diagnostics.iter().any(|diagnostic| {
+        diagnostic.kind == botster_hub_client::DaemonDiagnosticKind::Connected
+            && diagnostic.operation.as_deref() == Some("status")
+    }));
+    assert!(!has_failure_diagnostic(&status.diagnostics));
+    let status = status.status.expect("status response body");
+    assert_eq!(status.compatibility, ack.compatibility);
+    assert!(status.diagnostics.is_empty());
+
+    let mut stale_requirement = botster_hub_client::DaemonCompatibilityRequirement::current();
+    stale_requirement.client_name = "stale-5-29-client".to_string();
+    stale_requirement.protocol_version = 5;
+    stale_requirement.minimum_conformance_fixture_revision = 29;
+    for attempt in ["initial connect", "reconnect"] {
+        let error =
+            botster_hub_client::connect_and_hello_with_requirement(&endpoint, &stale_requirement)
+                .expect_err("stale client must fail before dispatching a removed operation");
+        let message = error.to_string();
+        assert!(
+            message.contains("stale-5-29-client"),
+            "{attempt}: {message}"
+        );
+        assert!(
+            message.contains("unsupported protocol version 7"),
+            "{attempt}: {message}"
+        );
+    }
+
+    let mut version_requirement = botster_hub_client::DaemonCompatibilityRequirement::current();
+    version_requirement.client_name = "future-version-client".to_string();
+    version_requirement.protocol_version = botster_hub_client::PROTOCOL_VERSION + 1;
+    let version_error =
+        botster_hub_client::connect_and_hello_with_requirement(&endpoint, &version_requirement)
+            .expect_err("future protocol version should fail compatibility");
+    let version_message = version_error.to_string();
+    assert!(version_message.contains("future-version-client"));
+    assert!(version_message.contains("unsupported protocol version"));
+    assert!(!version_message.contains(&data_dir.to_string_lossy().to_string()));
+    let botster_hub_client::DaemonTransportError::Compatibility(version_error) = version_error
+    else {
+        panic!("version mismatch should be a compatibility error");
+    };
+    assert!(version_error.diagnostics.iter().any(|diagnostic| {
+        diagnostic.kind == botster_hub_client::DaemonDiagnosticKind::CompatibilityMismatch
+            && diagnostic
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("unsupported protocol version"))
+    }));
+    assert!(!has_diagnostic_kind(
+        &version_error.diagnostics,
+        botster_hub_client::DaemonDiagnosticKind::Connected
+    ));
+    assert!(!has_diagnostic_kind(
+        &version_error.diagnostics,
+        botster_hub_client::DaemonDiagnosticKind::ActionFailure
+    ));
+
+    let mut feature_requirement = botster_hub_client::DaemonCompatibilityRequirement::current();
+    feature_requirement.client_name = "future-feature-client".to_string();
+    feature_requirement
+        .required_features
+        .push("future_feature".to_string());
+    let feature_error =
+        botster_hub_client::connect_and_hello_with_requirement(&endpoint, &feature_requirement)
+            .expect_err("future feature should fail compatibility");
+    let feature_message = feature_error.to_string();
+    assert!(feature_message.contains("future-feature-client"));
+    assert!(feature_message.contains("missing required feature(s): future_feature"));
+    assert!(!feature_message.contains(&data_dir.to_string_lossy().to_string()));
+    let botster_hub_client::DaemonTransportError::Compatibility(feature_error) = feature_error
+    else {
+        panic!("feature mismatch should be a compatibility error");
+    };
+    assert!(feature_error.diagnostics.iter().any(|diagnostic| {
+        diagnostic.kind == botster_hub_client::DaemonDiagnosticKind::UnsupportedFeature
+            && diagnostic.feature.as_deref() == Some("future_feature")
+    }));
+    assert!(!has_diagnostic_kind(
+        &feature_error.diagnostics,
+        botster_hub_client::DaemonDiagnosticKind::Connected
+    ));
+    assert!(!has_diagnostic_kind(
+        &feature_error.diagnostics,
+        botster_hub_client::DaemonDiagnosticKind::ActionFailure
+    ));
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn process_ownership_external_hub_test_support_cleans_up_isolated_daemon() {
+    let _guard = daemon_test_guard();
+    let first = botster_hub_test_support::IsolatedHubBuilder::new()
+        .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
+        .session_worker_bin(session_worker_binary_path())
+        .root(PathBuf::from("/tmp/bh-test-support"))
+        .name("downstream-shape")
+        .start()
+        .expect("start isolated hub through public test-support harness");
+    assert!(first.data_dir().starts_with("/tmp/bh-test-support"));
+    assert!(first.endpoint().socket_path.starts_with(first.data_dir()));
+    let support_matrix = botster_hub_test_support::first_party_client_support_matrix();
+    let first_report =
+        botster_hub_test_support::run_client_conformance(&first).expect("run client conformance");
+    assert_eq!(first_report.lifecycle_state, "running");
+    assert_eq!(first_report.initial_session_count, 0);
+    assert_eq!(first_report.spawned_lifecycle, "running");
+    assert_eq!(
+        support_matrix.session_actions,
+        vec![
+            "status",
+            "list_sessions",
+            "subscribe_entities",
+            "unsubscribe_entities",
+            "remove_session",
+            "spawn",
+            "attach",
+            "drain",
+            "send_input",
+            "resize",
+            "shutdown_session",
+        ]
+    );
+    assert!(first_report.stream_contains_ready);
+    assert!(first_report.stream_contains_echo);
+    assert!(first_report.stream_contains_resize);
+    assert_eq!(first_report.compatibility_protocol, support_matrix.protocol);
+    assert_eq!(
+        first_report.compatibility_protocol_version,
+        support_matrix.protocol_version
+    );
+    assert_eq!(
+        first_report.compatibility_features,
+        support_matrix.supported_features
+    );
+    assert_eq!(
+        first_report.compatibility_conformance_fixture_revision,
+        support_matrix.conformance_fixture_revision
+    );
+    assert_eq!(first_report.connected_diagnostic_operation, "status");
+    assert_eq!(first_report.validation_error_operation, "drain_runtime");
+    assert_eq!(
+        first_report.validation_diagnostic_kind,
+        support_matrix
+            .terminal_streaming
+            .missing_session_diagnostic_kind
+    );
+    assert!(support_matrix.terminal_streaming.supported);
+    assert!(support_matrix.terminal_streaming.held_open_stream);
+    assert_eq!(
+        support_matrix.terminal_streaming.conformance_ready_output,
+        "conformance-ready"
+    );
+    assert_eq!(
+        support_matrix.terminal_streaming.conformance_echo_output,
+        "echo:from-conformance"
+    );
+    assert!(support_matrix.resize.supported);
+    assert_eq!(support_matrix.resize.action, "resize");
+    assert_eq!(support_matrix.resize.conformance_output_prefix, "winsize:");
+
+    let plugin_report = botster_hub_test_support::run_plugin_contract_matrix_conformance(
+        &first,
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join("plugins")
+            .join("plugin-contract-matrix"),
+    )
+    .expect("run plugin contract matrix conformance");
+    assert_eq!(plugin_report.enabled_state, "enabled");
+    assert!(support_matrix.plugin_surfaces.render_supported);
+    assert!(support_matrix.plugin_surfaces.action_supported);
+    assert_eq!(
+        plugin_report.app_surface_kind,
+        support_matrix.plugin_surfaces.rendered_surface_kind
+    );
+    assert_eq!(
+        plugin_report.app_surface_node_id,
+        support_matrix.plugin_surfaces.rendered_surface_node_id
+    );
+    assert_eq!(
+        plugin_report.session_surface_id,
+        support_matrix.session_entities.plugin_surface_id
+    );
+    assert_eq!(
+        plugin_report.session_surface_binding_family,
+        support_matrix.session_entities.binding_family
+    );
+    assert!(plugin_report.session_surface_matches_fixture);
+    assert_eq!(plugin_report.action_error_state, "error");
+    assert_eq!(
+        plugin_report.action_error_diagnostic_kind,
+        support_matrix
+            .plugin_surfaces
+            .invalid_action_diagnostic_kind
+    );
+    assert_eq!(
+        plugin_report.client_render_check.class,
+        botster_hub_test_support::ConformanceFailureClass::ClientRendering
+    );
+
+    let terminal_app_report =
+        botster_hub_test_support::run_foreground_terminal_app_open_conformance(&first)
+            .expect("run foreground terminal app open conformance");
+    assert_eq!(terminal_app_report.package_state, "enabled");
+    assert_eq!(
+        terminal_app_report.package_name,
+        "first-party.terminal-client"
+    );
+    assert_eq!(terminal_app_report.app_id, "tui");
+    assert_eq!(terminal_app_report.entrypoint_id, "tui");
+    assert_eq!(terminal_app_report.app_kind, "terminal_app");
+    assert_eq!(terminal_app_report.launch_mode, "foreground_stdio");
+    assert!(terminal_app_report.hub_connection_env_present);
+    assert_eq!(terminal_app_report.hub_connection_transport, "unix_socket");
+    assert!(terminal_app_report.hub_connection_socket_path_absolute);
+    assert!(terminal_app_report.hub_data_dir_env_present);
+    assert!(terminal_app_report.hub_data_dir_env_absolute);
+    assert!(terminal_app_report.launch_working_directory_is_package_root);
+    assert!(terminal_app_report.launch_working_directory_differs_from_daemon_cwd);
+    assert_eq!(terminal_app_report.real_hub_action_operation, "status");
+    assert_eq!(terminal_app_report.real_hub_action_result, "running");
+    assert_eq!(terminal_app_report.exit_code, Some(0));
+    assert!(
+        terminal_app_report
+            .stdout
+            .contains("hub_connection_present=true")
+    );
+    assert!(
+        terminal_app_report
+            .stdout
+            .contains("hub_connection_transport=unix_socket")
+    );
+    assert!(
+        terminal_app_report
+            .stdout
+            .contains("hub_connection_socket_absolute=true")
+    );
+    assert!(
+        terminal_app_report
+            .stdout
+            .contains("hub_data_dir_present=true")
+    );
+    assert!(terminal_app_report.stderr.is_empty());
+    first.shutdown().expect("shutdown first isolated hub");
+
+    let second = botster_hub_test_support::IsolatedHubBuilder::new()
+        .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
+        .session_worker_bin(session_worker_binary_path())
+        .root(PathBuf::from("/tmp/bh-test-support"))
+        .name("downstream-shape-determinism")
+        .start()
+        .expect("start second isolated hub through public test-support harness");
+    let second_report =
+        botster_hub_test_support::run_client_conformance(&second).expect("rerun conformance");
+    assert_eq!(second_report, first_report);
+    second.shutdown().expect("shutdown second isolated hub");
+}
+
+#[test]
+fn external_hub_client_many_pty_adversarial_conformance_ci() {
+    let _guard = daemon_test_guard();
+    let hub = botster_hub_test_support::IsolatedHubBuilder::new()
+        .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
+        .session_worker_bin(session_worker_binary_path())
+        .root(PathBuf::from("/tmp/bh-test-support"))
+        .name("many-pty-client-attach-ci")
+        .start()
+        .expect("start isolated hub for CI-safe many-PTY proof");
+
+    let report = botster_hub_test_support::run_many_pty_client_attach_conformance(&hub, 8)
+        .expect("run CI-safe many-PTY client attach proof");
+    // Ok(report) is the behavioral oracle; stage-labeled errors identify which
+    // required observation failed. These assertions pin scenario and cleanup size.
+    assert_eq!(report.total_sessions, 8);
+    assert_eq!(report.quiet_sessions, 7);
+    assert_eq!(report.cleaned_sessions, 8);
+
+    hub.shutdown().expect("shutdown CI-safe many-PTY hub");
+}
+
+#[test]
+#[ignore = "larger local adversarial proof; run explicitly with the documented command"]
+fn external_hub_client_many_pty_adversarial_conformance_local() {
+    let _guard = daemon_test_guard();
+    let hub = botster_hub_test_support::IsolatedHubBuilder::new()
+        .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
+        .session_worker_bin(session_worker_binary_path())
+        .root(PathBuf::from("/tmp/bh-test-support"))
+        .name("many-pty-client-attach-local")
+        .start()
+        .expect("start isolated hub for larger local many-PTY proof");
+
+    let report = botster_hub_test_support::run_many_pty_client_attach_conformance(&hub, 32)
+        .expect("run larger local many-PTY client attach proof");
+    // Ok(report) is the behavioral oracle; stage-labeled errors identify which
+    // required observation failed. These assertions pin scenario and cleanup size.
+    assert_eq!(report.total_sessions, 32);
+    assert_eq!(report.quiet_sessions, 31);
+    assert_eq!(report.cleaned_sessions, 32);
+
+    hub.shutdown().expect("shutdown larger local many-PTY hub");
+}
+
+#[test]
+fn external_daemon_same_session_reattach_replays_opaque_history_before_live_output() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("late-history");
+    let config = explicit_config(&data_dir);
+    let child = start_cli_daemon(&data_dir);
+    let mut connection =
+        botster_hub::DaemonConnection::connect(&config).expect("connect daemon socket");
+
+    let spawn = connection
+        .request(&botster_hub::DaemonRequest::Spawn {
+            session_id: "late-history-session".to_string(),
+            command: "printf 'retained-before-attach\\n'; while IFS= read -r line; do printf 'after:%s\\n' \"$line\"; done".to_string(),
+        })
+        .expect("spawn late-history session");
+    assert_eq!(spawn.kind, botster_hub::DaemonResponseKind::Spawned);
+
+    let first_attach = connection
+        .request(&botster_hub::DaemonRequest::Attach {
+            session_id: "late-history-session".to_string(),
+            subscription_id: "late-history-first-subscription".to_string(),
+        })
+        .expect("attach first subscription");
+    assert_eq!(first_attach.kind, botster_hub::DaemonResponseKind::Events);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut first_observed = String::new();
+    while std::time::Instant::now() < deadline {
+        let drain = connection
+            .request(&botster_hub::DaemonRequest::Drain {
+                session_id: "late-history-session".to_string(),
+            })
+            .expect("drain first subscription output");
+        for event in drain.events {
+            if let botster_hub::DaemonEvent::TerminalOutput {
+                subscription_id,
+                payload,
+                ..
+            } = event
+                && subscription_id == "late-history-first-subscription"
+            {
+                first_observed.push_str(&live_output_utf8(payload));
+            }
+        }
+        if first_observed.contains("retained-before-attach") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+    assert!(
+        first_observed.contains("retained-before-attach"),
+        "first subscription should observe initial output before late attach, got {first_observed:?}"
+    );
+
+    let retained_after_attach = connection
+        .request(&botster_hub::DaemonRequest::SendInput {
+            session_id: "late-history-session".to_string(),
+            data: "retained-after-attach\n".to_string(),
+        })
+        .expect("send second retained marker before socket loss");
+    assert_eq!(
+        retained_after_attach.kind,
+        botster_hub::DaemonResponseKind::Events
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let drain = connection
+            .request(&botster_hub::DaemonRequest::Drain {
+                session_id: "late-history-session".to_string(),
+            })
+            .expect("drain second retained marker on first subscription");
+        for event in drain.events {
+            if let botster_hub::DaemonEvent::TerminalOutput {
+                subscription_id,
+                payload,
+                ..
+            } = event
+                && subscription_id == "late-history-first-subscription"
+            {
+                first_observed.push_str(&live_output_utf8(payload));
+            }
+        }
+        if first_observed.contains("after:retained-after-attach") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+    assert!(
+        first_observed.contains("after:retained-after-attach"),
+        "first subscription should observe the second marker before socket loss, got {first_observed:?}"
+    );
+
+    drop(connection);
+    let mut connection =
+        botster_hub::DaemonConnection::connect(&config).expect("reconnect daemon socket");
+    let late_attach = connection
+        .request(&botster_hub::DaemonRequest::Attach {
+            session_id: "late-history-session".to_string(),
+            subscription_id: "late-history-reattach-subscription".to_string(),
+        })
+        .expect("reattach same session with a fresh subscription id");
+    assert_eq!(late_attach.kind, botster_hub::DaemonResponseKind::Events);
+
+    let read_screen = connection
+        .request(&botster_hub::DaemonRequest::ReadScreen {
+            session_id: "late-history-session".to_string(),
+        })
+        .expect("read retained screen before later live output");
+    assert_eq!(
+        read_screen.kind,
+        botster_hub::DaemonResponseKind::ReadScreen
+    );
+    let screen_text = read_screen
+        .read_screen
+        .expect("retained screen response body")
+        .text;
+    for marker in ["retained-before-attach", "after:retained-after-attach"] {
+        assert_eq!(
+            screen_text.matches(marker).count(),
+            1,
+            "ReadScreen should contain {marker:?} exactly once, got {screen_text:?}"
+        );
+    }
+    assert!(
+        screen_text.find("retained-before-attach")
+            < screen_text.find("after:retained-after-attach"),
+        "ReadScreen should preserve retained marker order, got {screen_text:?}"
+    );
+
+    let send = connection
+        .request(&botster_hub::DaemonRequest::SendInput {
+            session_id: "late-history-session".to_string(),
+            data: "live-after-late\n".to_string(),
+        })
+        .expect("send later live output");
+    assert_eq!(send.kind, botster_hub::DaemonResponseKind::Events);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut observed_events = Vec::new();
+    while std::time::Instant::now() < deadline {
+        let drain = connection
+            .request(&botster_hub::DaemonRequest::Drain {
+                session_id: "late-history-session".to_string(),
+            })
+            .expect("drain late subscription output");
+        observed_events.extend(drain.events);
+        let saw_live = observed_events.iter().any(|event| {
+            matches!(
+                event,
+                botster_hub::DaemonEvent::TerminalOutput {
+                    subscription_id,
+                    payload,
+                    ..
+                } if subscription_id == "late-history-reattach-subscription"
+                    && live_output_contains(payload, "after:live-after-late")
+            )
+        });
+        if saw_live {
+            break;
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+
+    let attaching_index = observed_events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                botster_hub::DaemonEvent::AttachState {
+                    subscription_id,
+                    state,
+                    ..
+                } if subscription_id == "late-history-reattach-subscription" && state == "attaching"
+            )
+        })
+        .expect("late subscription should enter attaching state on daemon socket");
+    let history_events = observed_events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| match event {
+            botster_hub::DaemonEvent::Snapshot {
+                subscription_id,
+                history,
+                ..
+            }
+            | botster_hub::DaemonEvent::Scrollback {
+                subscription_id,
+                history,
+                ..
+            } if subscription_id == "late-history-reattach-subscription" => Some((index, history)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !history_events.is_empty(),
+        "reattach should receive opaque history"
+    );
+    for (_, history) in &history_events {
+        let payload = history
+            .decoded_bytes()
+            .expect("real daemon opaque history payload decodes");
+        assert_eq!(
+            history.payload_encoding,
+            botster_hub_client::DaemonHistoryEncoding::Base64
+        );
+        assert_eq!(history.bytes, payload.len());
+        assert!(
+            !payload.is_empty(),
+            "opaque history payload must not be empty"
+        );
+    }
+    let history_index = history_events
+        .first()
+        .map(|(index, _)| *index)
+        .unwrap_or_else(|| {
+            panic!("reattach should receive retained history, got {observed_events:?}")
+        });
+    let last_history_index = history_events
+        .last()
+        .map(|(index, _)| *index)
+        .expect("reattach history should have a last event");
+    let live_index = observed_events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                botster_hub::DaemonEvent::TerminalOutput {
+                    subscription_id,
+                    payload,
+                    ..
+                } if subscription_id == "late-history-reattach-subscription"
+                    && live_output_contains(payload, "after:live-after-late")
+            )
+        })
+        .expect("late subscription should receive later live output");
+    let attached_index = observed_events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                botster_hub::DaemonEvent::AttachState {
+                    subscription_id,
+                    state,
+                    ..
+                } if subscription_id == "late-history-reattach-subscription" && state == "attached"
+            )
+        })
+        .expect("late subscription should become attached after history on daemon socket");
+    let first_terminal_output_index = observed_events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                botster_hub::DaemonEvent::TerminalOutput {
+                    subscription_id,
+                    ..
+                } if subscription_id == "late-history-reattach-subscription"
+            )
+        })
+        .expect("late subscription should receive terminal output on daemon socket");
+    assert!(
+        attaching_index < history_index
+            && last_history_index < attached_index
+            && attached_index < first_terminal_output_index
+            && attached_index < live_index,
+        "fresh reattach subscription should observe attaching < history < attached < live, got {observed_events:?}"
+    );
+    assert!(
+        !observed_events.iter().any(|event| {
+            matches!(
+                event,
+                botster_hub::DaemonEvent::TerminalOutput {
+                    subscription_id,
+                    payload,
+                    ..
+                } if subscription_id == "late-history-first-subscription"
+                    && live_output_contains(payload, "after:live-after-late")
+            )
+        }),
+        "socket cleanup should detach the old subscription before later live output, got {observed_events:?}"
+    );
+
+    let no_history_spawn = connection
+        .request(&botster_hub::DaemonRequest::Spawn {
+            session_id: "no-history-session".to_string(),
+            command: "while IFS= read -r line; do printf 'after:%s\\n' \"$line\"; done".to_string(),
+        })
+        .expect("spawn no-history session");
+    assert_eq!(
+        no_history_spawn.kind,
+        botster_hub::DaemonResponseKind::Spawned
+    );
+
+    let first_no_history_attach = connection
+        .request(&botster_hub::DaemonRequest::Attach {
+            session_id: "no-history-session".to_string(),
+            subscription_id: "no-history-first-subscription".to_string(),
+        })
+        .expect("attach first no-history subscription");
+    assert_eq!(
+        first_no_history_attach.kind,
+        botster_hub::DaemonResponseKind::Events
+    );
+
+    drop(connection);
+    let mut connection =
+        botster_hub::DaemonConnection::connect(&config).expect("reconnect idle daemon socket");
+    let late_no_history_attach = connection
+        .request(&botster_hub::DaemonRequest::Attach {
+            session_id: "no-history-session".to_string(),
+            subscription_id: "no-history-reattach-subscription".to_string(),
+        })
+        .expect("reattach idle session with a fresh subscription id");
+    assert_eq!(
+        late_no_history_attach.kind,
+        botster_hub::DaemonResponseKind::Events
+    );
+
+    let no_history_read_screen = connection
+        .request(&botster_hub::DaemonRequest::ReadScreen {
+            session_id: "no-history-session".to_string(),
+        })
+        .expect("read blank screen before sending live output");
+    assert_eq!(
+        no_history_read_screen.kind,
+        botster_hub::DaemonResponseKind::ReadScreen
+    );
+    let no_history_screen = no_history_read_screen
+        .read_screen
+        .expect("blank read screen response body");
+    assert!(
+        no_history_screen.text.is_empty(),
+        "idle session should have no prior renderable output, got {:?}",
+        no_history_screen.text
+    );
+
+    let no_history_send = connection
+        .request(&botster_hub::DaemonRequest::SendInput {
+            session_id: "no-history-session".to_string(),
+            data: "live-only\n".to_string(),
+        })
+        .expect("send no-history live output");
+    assert_eq!(
+        no_history_send.kind,
+        botster_hub::DaemonResponseKind::Events
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut no_history_events = Vec::new();
+    while std::time::Instant::now() < deadline {
+        let drain = connection
+            .request(&botster_hub::DaemonRequest::Drain {
+                session_id: "no-history-session".to_string(),
+            })
+            .expect("drain no-history live output");
+        no_history_events.extend(drain.events);
+        let saw_live = no_history_events.iter().any(|event| {
+            matches!(
+                event,
+                botster_hub::DaemonEvent::TerminalOutput {
+                    subscription_id,
+                    payload,
+                    ..
+                } if subscription_id == "no-history-reattach-subscription"
+                    && live_output_contains(payload, "after:live-only")
+            )
+        });
+        if saw_live {
+            break;
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+
+    assert!(
+        !no_history_events.iter().any(|event| {
+            matches!(
+                event,
+                botster_hub::DaemonEvent::Scrollback {
+                    subscription_id,
+                    ..
+                } if subscription_id == "no-history-reattach-subscription"
+            )
+        }),
+        "idle subscription should not receive fabricated scrollback, got {no_history_events:?}"
+    );
+    let no_history_attaching_index = no_history_events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                botster_hub::DaemonEvent::AttachState {
+                    subscription_id,
+                    state,
+                    ..
+                } if subscription_id == "no-history-reattach-subscription" && state == "attaching"
+            )
+        })
+        .expect("late no-history subscription should enter attaching state");
+    let no_history_attached_index = no_history_events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                botster_hub::DaemonEvent::AttachState {
+                    subscription_id,
+                    state,
+                    ..
+                } if subscription_id == "no-history-reattach-subscription" && state == "attached"
+            )
+        })
+        .expect("late no-history subscription should become attached");
+    let no_history_live_index = no_history_events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                botster_hub::DaemonEvent::TerminalOutput {
+                    subscription_id,
+                    payload,
+                    ..
+                } if subscription_id == "no-history-reattach-subscription"
+                    && live_output_contains(payload, "after:live-only")
+            )
+        })
+        .expect("late no-history subscription should receive live output");
+    let no_history_last_initial_state_index = no_history_events.iter().rposition(|event| {
+        matches!(
+            event,
+            botster_hub::DaemonEvent::Snapshot {
+                subscription_id,
+                ..
+            } | botster_hub::DaemonEvent::Scrollback {
+                subscription_id,
+                ..
+            } if subscription_id == "no-history-reattach-subscription"
+        )
+    });
+    let no_history_first_terminal_output_index = no_history_events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                botster_hub::DaemonEvent::TerminalOutput {
+                    subscription_id,
+                    ..
+                } if subscription_id == "no-history-reattach-subscription"
+            )
+        })
+        .expect("late no-history subscription should receive terminal output");
+    assert!(
+        no_history_attaching_index < no_history_attached_index
+            && no_history_last_initial_state_index
+                .is_none_or(|index| index < no_history_attached_index)
+            && no_history_attached_index < no_history_first_terminal_output_index
+            && no_history_attached_index < no_history_live_index,
+        "idle subscription should observe attaching < optional initial state < attached < live, got {no_history_events:?}"
+    );
+
+    let shutdown_session = connection
+        .request(&botster_hub::DaemonRequest::ShutdownSession {
+            session_id: "late-history-session".to_string(),
+        })
+        .expect("shutdown late-history session");
+    assert_eq!(
+        shutdown_session.kind,
+        botster_hub::DaemonResponseKind::Events
+    );
+    let shutdown_no_history_session = connection
+        .request(&botster_hub::DaemonRequest::ShutdownSession {
+            session_id: "no-history-session".to_string(),
+        })
+        .expect("shutdown no-history session");
+    assert_eq!(
+        shutdown_no_history_session.kind,
+        botster_hub::DaemonResponseKind::Events
+    );
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn daemon_detaches_subscription_when_attach_connection_drops() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("cli-attach-eof");
+    let config = explicit_config(&data_dir);
+    let child = start_cli_daemon(&data_dir);
+
+    let spawn = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::Spawn {
+            session_id: "eof-session".to_string(),
+            command:
+                "printf 'ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done"
+                    .to_string(),
+        },
+    )
+    .expect("spawn eof test session");
+    assert_eq!(spawn.kind, botster_hub::DaemonResponseKind::Spawned);
+
+    let attach = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::Attach {
+            session_id: "eof-session".to_string(),
+            subscription_id: "dropped-subscription".to_string(),
+        },
+    )
+    .expect("attach dropped subscription");
+    assert_eq!(attach.kind, botster_hub::DaemonResponseKind::Events);
+
+    thread::sleep(Duration::from_millis(150));
+
+    botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::SendInput {
+            session_id: "eof-session".to_string(),
+            data: "after-eof\r".to_string(),
+        },
+    )
+    .expect("send input after dropped attach");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    let mut observed_events = Vec::new();
+    while std::time::Instant::now() < deadline {
+        let drain = botster_hub::daemon_transport_request(
+            &config,
+            botster_hub::DaemonRequest::Drain {
+                session_id: "eof-session".to_string(),
+            },
+        )
+        .expect("drain after dropped attach");
+        observed_events.extend(drain.events);
+        thread::sleep(Duration::from_millis(30));
+    }
+
+    assert!(
+        observed_events.iter().all(|event| {
+            !matches!(
+                event,
+                botster_hub::DaemonEvent::TerminalOutput {
+                    subscription_id,
+                    payload,
+                    ..
+                } if subscription_id == "dropped-subscription"
+                    && live_output_contains(payload, "after-eof")
+            )
+        }),
+        "dropped attach subscription received later terminal output: {observed_events:?}"
+    );
+
+    let shutdown_session = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ShutdownSession {
+            session_id: "eof-session".to_string(),
+        },
+    )
+    .expect("shutdown eof test session");
+    assert_eq!(
+        shutdown_session.kind,
+        botster_hub::DaemonResponseKind::Events
+    );
+    let sessions_after_shutdown =
+        botster_hub::daemon_transport_request(&config, botster_hub::DaemonRequest::ListSessions)
+            .expect("list sessions after eof test session shutdown");
+    assert!(
+        sessions_after_shutdown
+            .sessions
+            .iter()
+            .any(|session| session.session_id == "eof-session" && session.lifecycle == "exited"),
+        "eof-session should be exited after shutdown: {:?}",
+        sessions_after_shutdown.sessions
+    );
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn daemon_notify_session_defers_without_observed_readiness_over_socket() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("daemon-notify-session");
+    let config = explicit_config(&data_dir);
+    let child = start_cli_daemon(&data_dir);
+
+    let spawn = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::Spawn {
+            session_id: "notify-socket-session".to_string(),
+            command:
+                "printf 'ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done"
+                    .to_string(),
+        },
+    )
+    .expect("spawn guarded socket session");
+    assert_eq!(spawn.kind, botster_hub::DaemonResponseKind::Spawned);
+
+    let mut connection =
+        botster_hub::DaemonConnection::connect(&config).expect("connect TUI-grade socket");
+    connection
+        .request(&botster_hub::DaemonRequest::Attach {
+            session_id: "notify-socket-session".to_string(),
+            subscription_id: "notify-socket-subscription".to_string(),
+        })
+        .expect("attach persistent socket subscription");
+
+    let write = connection
+        .request(&botster_hub::DaemonRequest::NotifySession {
+            session_id: "notify-socket-session".to_string(),
+            data: "notify-socket\n".to_string(),
+        })
+        .expect("notify session over daemon socket");
+    assert_eq!(write.kind, botster_hub::DaemonResponseKind::SessionNotified);
+    let notify = write
+        .coordination
+        .and_then(|coordination| coordination.notify)
+        .expect("notify response body");
+    assert!(notify.decision.starts_with("Defer"));
+    assert_eq!(notify.states, vec!["accepted", "deferred"]);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut observed = String::new();
+    while std::time::Instant::now() < deadline {
+        let drain = connection
+            .request(&botster_hub::DaemonRequest::Drain {
+                session_id: "notify-socket-session".to_string(),
+            })
+            .expect("drain guarded socket session");
+        for event in drain.events {
+            if let botster_hub::DaemonEvent::TerminalOutput { payload, .. } = event {
+                observed.push_str(&live_output_utf8(payload));
+            }
+        }
+        if observed.contains("echo:notify-socket") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+    assert!(
+        !observed.contains("echo:notify-socket"),
+        "notify session without observed readiness should not reach PTY input path, got {observed:?}"
+    );
+
+    let shutdown_session = connection
+        .request(&botster_hub::DaemonRequest::ShutdownSession {
+            session_id: "notify-socket-session".to_string(),
+        })
+        .expect("shutdown guarded socket session");
+    assert_eq!(
+        shutdown_session.kind,
+        botster_hub::DaemonResponseKind::Events
+    );
+    let sessions_after_shutdown = connection
+        .request(&botster_hub::DaemonRequest::ListSessions)
+        .expect("list sessions after guarded socket session shutdown");
+    assert!(
+        sessions_after_shutdown.sessions.iter().any(|session| {
+            session.session_id == "notify-socket-session" && session.lifecycle == "exited"
+        }),
+        "notify-socket-session should be exited after shutdown: {:?}",
+        sessions_after_shutdown.sessions
+    );
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn stalled_attach_stdout_does_not_block_other_daemon_commands() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("cli-stalled-attach");
+    let child = start_cli_daemon(&data_dir);
+
+    let mut spawn_command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    spawn_command
+        .arg("sessions")
+        .arg("spawn")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--session-id")
+        .arg("slow-consumer")
+        .arg("--")
+        .arg(
+            "i=0; while [ \"$i\" -lt 50000 ]; do printf 'flood-line-%05d\\n' \"$i\"; i=$((i + 1)); done; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
+        );
+    let spawn = run_command_with_timeout_diagnostics(
+        "spawn",
+        spawn_command,
+        LOCAL_RUNTIME_DAEMON_READINESS_BUDGET,
+    );
+    assert!(
+        spawn.output.status.success(),
+        "spawn failed: {}",
+        spawn.diagnostics(),
+    );
+
+    let mut attach_child = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("sessions")
+        .arg("attach")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("slow-consumer")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn stalled attach");
+    let buffered_attach_stdout = wait_for_buffered_child_stdout(
+        &mut attach_child,
+        STALLED_ATTACH_MIN_BUFFERED_STDOUT_BYTES,
+        STALLED_ATTACH_STABLE_SAMPLES,
+        LOCAL_RUNTIME_DAEMON_READINESS_BUDGET,
+    )
+    .unwrap_or_else(|error| panic!("stalled attach did not reach stdout backpressure: {error}"));
+    assert!(
+        buffered_attach_stdout.available_bytes >= STALLED_ATTACH_MIN_BUFFERED_STDOUT_BYTES,
+        "stalled attach should retain at least {} unread stdout bytes, got {} after {:?}; recent_samples={:?}",
+        STALLED_ATTACH_MIN_BUFFERED_STDOUT_BYTES,
+        buffered_attach_stdout.available_bytes,
+        buffered_attach_stdout.elapsed,
+        buffered_attach_stdout.recent_samples,
+    );
+    if let Some(status) = attach_child.try_wait().expect("poll stalled attach") {
+        let (stdout, stderr) = collect_child_output(&mut attach_child);
+        panic!(
+            "attach exited before the slow-consumer check after {:?}: status={status} backpressure={buffered_attach_stdout:?} stdout={stdout:?} stderr={stderr:?}",
+            buffered_attach_stdout.elapsed,
+        );
+    }
+
+    let mut list_command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    list_command
+        .arg("sessions")
+        .arg("list")
+        .arg("--data-dir")
+        .arg(&data_dir);
+    let list = run_command_with_timeout_diagnostics(
+        "list",
+        list_command,
+        LOCAL_RUNTIME_DAEMON_READINESS_BUDGET,
+    );
+    assert!(
+        list.output.status.success(),
+        "list failed while attach stdout was blocked: {}; attach_child={}",
+        list.diagnostics(),
+        child_state_diagnostics(&mut attach_child),
+    );
+
+    let mut send_command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    send_command
+        .arg("sessions")
+        .arg("send-input")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("slow-consumer")
+        .arg("--")
+        .arg("still-responsive\r");
+    let send = run_command_with_timeout_diagnostics(
+        "send-input",
+        send_command,
+        LOCAL_RUNTIME_DAEMON_READINESS_BUDGET,
+    );
+    assert!(
+        send.output.status.success(),
+        "send-input failed while attach stdout was blocked: {}; attach_child={}",
+        send.diagnostics(),
+        child_state_diagnostics(&mut attach_child),
+    );
+
+    let mut resize_command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    resize_command
+        .arg("sessions")
+        .arg("resize")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("slow-consumer")
+        .arg("32")
+        .arg("120");
+    let resize = run_command_with_timeout_diagnostics(
+        "resize",
+        resize_command,
+        LOCAL_RUNTIME_DAEMON_READINESS_BUDGET,
+    );
+    assert!(
+        resize.output.status.success(),
+        "resize failed while attach stdout was blocked: {}; attach_child={}",
+        resize.diagnostics(),
+        child_state_diagnostics(&mut attach_child),
+    );
+
+    let mut shutdown_command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    shutdown_command
+        .arg("shutdown")
+        .arg("--data-dir")
+        .arg(&data_dir);
+    let shutdown = run_command_with_timeout_diagnostics(
+        "shutdown",
+        shutdown_command,
+        LOCAL_RUNTIME_DAEMON_READINESS_BUDGET,
+    );
+    assert!(
+        shutdown.output.status.success(),
+        "shutdown failed while attach stdout was blocked: {}; attach_child={}",
+        shutdown.diagnostics(),
+        child_state_diagnostics(&mut attach_child),
+    );
+
+    let _ = attach_child.kill();
+    let _ = attach_child.wait_with_output();
+    let output = child.wait_with_output().expect("wait for daemon child");
+    assert!(
+        output.status.success(),
+        "daemon failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let cleanup_child = start_cli_daemon(&data_dir);
+    let shutdown_session = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("sessions")
+        .arg("shutdown")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("slow-consumer")
+        .output()
+        .expect("shut down recovered slow-consumer session");
+    assert!(
+        shutdown_session.status.success(),
+        "recovered session shutdown failed: {}",
+        String::from_utf8_lossy(&shutdown_session.stderr)
+    );
+    let shutdown_session_stdout =
+        String::from_utf8(shutdown_session.stdout).expect("session shutdown stdout is utf8");
+    let returned_shutdown_events = shutdown_session_stdout.contains("response=events");
+    let returned_terminal_cleanup = shutdown_session_stdout.contains("response=session_cleanup")
+        && shutdown_session_stdout.contains("session_id=slow-consumer")
+        && shutdown_session_stdout.contains("outcome=already_exited");
+    assert!(
+        returned_shutdown_events || returned_terminal_cleanup,
+        "recovered session shutdown should return events or terminal cleanup: {shutdown_session_stdout:?}"
+    );
+
+    let sessions_after_shutdown = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("sessions")
+        .arg("list")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("list sessions after recovered slow-consumer shutdown");
+    assert!(
+        sessions_after_shutdown.status.success(),
+        "list failed after recovered slow-consumer shutdown: {}",
+        String::from_utf8_lossy(&sessions_after_shutdown.stderr)
+    );
+    let sessions_after_shutdown_stdout = String::from_utf8(sessions_after_shutdown.stdout)
+        .expect("sessions after shutdown stdout is utf8");
+    assert!(
+        !sessions_after_shutdown_stdout.contains("session_id=slow-consumer"),
+        "slow-consumer should be absent after recovered session shutdown: {sessions_after_shutdown_stdout:?}"
+    );
+
+    shutdown_cli_daemon(&data_dir, cleanup_child);
+}
+

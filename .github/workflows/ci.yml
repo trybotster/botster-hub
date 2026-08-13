@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Verify workspace
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_TERM_COLOR: always
+      BOTSTER_ENV: test
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Record locked Core SHA
+        run: |
+          locked_core_sha="$(
+            sed -n '/name = "botster-core"/,/^$/p' Cargo.lock \
+              | sed -n 's/^source = "git+[^#]*#\([0-9a-f]\{40\}\)"$/\1/p' \
+              | head -n 1
+          )"
+          if [[ ! "$locked_core_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            printf 'unable to resolve locked botster-core SHA from Cargo.lock\n'
+            exit 1
+          fi
+          {
+            printf 'hub_sha=%s\n' "$GITHUB_SHA"
+            printf 'locked_core_sha=%s\n' "$locked_core_sha"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Install pinned Zig toolchain
+        # botster-terminal-ghostty's libghostty-vt build requires Zig 0.16.0.
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal --component rustfmt,clippy
+          rustup default 1.97.0
+          rustc --version
+          cargo --version
+          rustup show active-toolchain
+          zig version
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint workspace
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test workspace
+        run: ./test.sh --locked
