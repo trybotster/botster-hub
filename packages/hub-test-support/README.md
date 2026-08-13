@@ -18,10 +18,10 @@ node packages/hub-test-support/scripts/sync-assets.mjs
 
 ## Usage
 
-Use this command for version 0.1.32:
+Use this command for version 0.1.33:
 
 ```sh
-npm install --save-dev @trybotster/ui-contract@0.3.2 @trybotster/hub-test-support@0.1.32
+npm install --save-dev @trybotster/ui-contract@0.3.2 @trybotster/hub-test-support@0.1.33
 ```
 
 ```js
@@ -81,12 +81,12 @@ Use this exact package spec in npm-based client repos:
 ```json
 {
   "devDependencies": {
-    "@trybotster/hub-test-support": "0.1.32"
+    "@trybotster/hub-test-support": "0.1.33"
   }
 }
 ```
 
-`@trybotster/hub-test-support@0.1.32` carries byte-faithful live
+`@trybotster/hub-test-support@0.1.33` carries byte-faithful live
 `terminal_output` payloads (`payload_base64`, `payload_encoding`, `bytes`)
 and authentic dual GHOSTSNP late-attach fixtures (conformance revision 38).
 History attach uses incremental READY, PAGE, and FINISH Snapshot frames.
@@ -112,11 +112,14 @@ appended as terminal text. Version 0.1.6 / conformance revision 13 uses
 superseded JSON number arrays, while version 0.1.5 / revision 12 exposes
 lossy string history. Neither is current binary-history contract authority.
 
-Version 0.1.32 carries protocol version 7 / conformance revision 38 with
+Version 0.1.33 carries protocol version 7 / conformance revision 38 with
+advertised optional `snapshot_delivery=ready_then_history` support,
 byte-faithful live `terminal_output` payloads, incremental GHOSTSNP
 READY/PAGE/FINISH goldens, `mode_gated_input` ModeGatedInput +
 ModeFlags freshness, Snapshot-only GHOSTSNP rules, and the
-`DaemonSessionTypeExecution` contract. The contract
+`DaemonSessionTypeExecution` contract. Version 0.1.32 is the prior published
+coordinate at the same protocol and revision. It does not advertise
+`snapshot_delivery=ready_then_history`. The contract
 defines the explicit `relative_executable` and `shell_command` modes.
 It also carries spawn-point session-type listing
 (`list_session_types_for_target`) and the session-type authoring view

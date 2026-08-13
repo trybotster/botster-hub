@@ -1566,8 +1566,9 @@ attach_failed`. A post-READY history failure is READY, zero or more PAGE
 frames, `AttachState snapshot_history_incomplete`, `attached`, then
 `TerminalOutput`, with no FINISH Snapshot.
 
-`snapshot_delivery=ready_then_history` is defined and has a request-specific
-requirement (`DaemonCompatibilityRequirement::for_ready_then_history_attach()`).
-It is not advertised until Hub clean review. On the success path a real opaque
-FINISH Snapshot precedes `attached`. A production socket Drain receives READY
-before later PAGE/FINISH frames.
+`snapshot_delivery=ready_then_history` is advertised as optional support.
+`DaemonCompatibilityRequirement::current()` does not require it. Attach
+clients that need incremental READY-then-history use
+`DaemonCompatibilityRequirement::for_ready_then_history_attach()`. On the
+success path a real opaque FINISH Snapshot precedes `attached`. A production
+socket Drain receives READY before later PAGE/FINISH frames.
