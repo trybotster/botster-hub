@@ -5,6 +5,7 @@ edition = "2024"
 description = "Shared botster-hub managed-installation receipt contract, layout, and lease"
 repository = "https://github.com/trybotster/botster-hub"
 license-file = "../../LICENSE"
+publish = false
 
 [dependencies]
 getrandom = "0.3.4"
