@@ -12,6 +12,7 @@ use std::io::Write;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -19,14 +20,11 @@ use std::time::{Duration, Instant};
 use botster_core::{
     EndpointId, EnvelopeCursor, EnvelopeDeliveryState, EnvelopeId, EnvelopeTarget,
     PackageConfigurationValue, PackageSource, RequestId, RoutedEnvelope, RoutedEnvelopePayload,
-    RunnableEntrypointKind, RunnableEntrypointLaunchMode, RunnableEntrypointProcessState,
-    RunnableEntrypointResultField, SessionId, SessionLifecycleState, SubscriptionId,
-    TerminalAttachState,
+    RunnableEntrypointKind, RunnableEntrypointLaunchMode, SessionId, SessionLifecycleState,
+    SubscriptionId, TerminalAttachState,
 };
 use botster_core_daemon::{
     GuardedWriteDecision, GuardedWriteDeliveryState, ReadinessEvidence, RegistrySessionState,
-    SessionLifecycleBaseline, SessionLifecycleChangeKind, SessionLifecycleCursor,
-    SessionLifecycleRecord,
 };
 use botster_hub_client::DaemonTransportError as ClientDaemonTransportError;
 pub use botster_hub_client::{
@@ -59,9 +57,7 @@ pub use botster_hub_client::{
     FEATURE_PLUGIN_SURFACE_ACTION, FEATURE_PLUGIN_SURFACE_RENDER, PROTOCOL, read_frame,
     read_frame_from_reader, write_frame,
 };
-use botster_ui_contract::{
-    PackageSurfaceDescriptor, PackageSurfaceKind, UiActionResult, UiActionResultState,
-};
+use botster_ui_contract::{UiActionResult, UiActionResultState};
 use serde_json::Value;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
@@ -70,6 +66,14 @@ use tokio::net::{UnixListener as TokioUnixListener, UnixStream as TokioUnixStrea
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc as tokio_mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
+use crate::daemon_projection::{
+    app_local_url, apps_from_registry, available_package_action, available_package_actions,
+    blocked_action, daemon_operator_error_from_client, daemon_operator_error_from_package,
+    daemon_status_from_status, package_action_label, package_navigation_entries,
+    package_route_descriptors, package_state_label, request_for_entrypoint, request_for_package,
+    request_for_package_with_pin, runnable_entrypoint_kind_label, runnable_launch_mode_label,
+    unavailable_action,
+};
 use crate::local_webrtc::{
     LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE, LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_MAX_BYTES,
     LocalWebrtcAttachedSubscription, LocalWebrtcSenderTerminalRecord, LocalWebrtcSignalRequest,
@@ -84,15 +88,14 @@ use crate::{
     AvailablePackage, AvailablePackageState, FileHubStateStore, HubClientApi,
     HubClientCaptureSnapshot, HubClientEvent, HubClientModeFlags, HubClientPackage,
     HubClientPackageAvailabilityReason, HubClientPackageAvailabilityState,
-    HubClientPackageClassification, HubClientPackageNavigationEntry,
-    HubClientPackageNavigationTarget, HubClientPluginLifecycle, HubClientPluginLifecycleReport,
-    HubClientPluginSurface, HubClientPluginWorkerCounters, HubClientReadScreen, HubClientRequest,
-    HubClientResponseBody, HubClientSession, HubConfig, HubDaemon, HubDaemonStatus,
-    HubStateLoadSource, HubStateStore, McpToolDescriptor, PackageAction, PackageAdmissionReason,
-    PackageCompatibilityResult, PackageDecision, PackageInstallPlan, PackagePin, PackageRegistry,
-    PackageRegistryEntrySourceKind, PackageRegistryError, PackageSessionType,
-    PackageSessionTypeWorkingDirectory, PackageState, PackageUpdatePolicy, ResolvedSessionType,
-    SessionTypeContextInput, SessionTypeMutationSource, SessionTypeRequest,
+    HubClientPackageClassification, HubClientPackageNavigationEntry, HubClientPluginLifecycle,
+    HubClientPluginLifecycleReport, HubClientPluginSurface, HubClientPluginWorkerCounters,
+    HubClientReadScreen, HubClientRequest, HubClientResponseBody, HubClientSession, HubConfig,
+    HubDaemon, HubDaemonStatus, HubStateStore, McpToolDescriptor, PackageAction,
+    PackageAdmissionReason, PackageCompatibilityResult, PackageDecision, PackageInstallPlan,
+    PackagePin, PackageRegistry, PackageRegistryEntrySourceKind, PackageRegistryError,
+    PackageSessionType, PackageSessionTypeWorkingDirectory, PackageState, PackageUpdatePolicy,
+    ResolvedSessionType, SessionTypeContextInput, SessionTypeMutationSource, SessionTypeRequest,
     resolve_foreground_launch_contract,
 };
 use crate::{EntrypointProcessSnapshot, EntrypointSupervisorError};
@@ -100,6 +103,15 @@ use crate::{
     SpawnTarget, SpawnTargetCreate, SpawnTargetError, SpawnTargetUpdate, SpawnTargetValidation,
 };
 use crate::{Worktree, WorktreeCreate, WorktreeError};
+
+#[path = "daemon_entity_subscriptions.rs"]
+mod daemon_entity_subscriptions;
+pub(crate) use daemon_entity_subscriptions::{EntityFrameSender, EntitySubscriptionState};
+use daemon_entity_subscriptions::{
+    EntityReconciliationState, drive_entity_subscriptions, drive_package_entity_fanout,
+    drive_package_entity_resync, entity_subscription_error, register_entity_subscription,
+    seed_lifecycle_reconciliation,
+};
 
 const MESSAGE_CONTENT_TYPE: &str = "application/vnd.botster.coordination.message+text";
 const WEBRTC_SIGNAL_OPERATION: &str = "local_webrtc_signal";
@@ -112,6 +124,7 @@ const DAEMON_MAX_REJECTION_TASKS: usize = 8;
 const DAEMON_CONTROL_QUEUE_CAPACITY: usize = 256;
 pub(crate) const ENTITY_SUBSCRIPTION_QUEUE_CAPACITY: usize = 64;
 const ENTITY_RECONCILIATION_INTERVAL: Duration = Duration::from_millis(500);
+static NEXT_SOCKET_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) type ControlSender = tokio_mpsc::Sender<ControlMessage>;
 type ControlReplySender = oneshot::Sender<DaemonTransportResult<DaemonResponse>>;
@@ -391,9 +404,17 @@ async fn handle_connection_async(
     cleanup_tx: SyncSender<ConnectionCleanup>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> DaemonTransportResult<()> {
+    let client_id = format!(
+        "botster-hub-daemon-socket-{}",
+        NEXT_SOCKET_CLIENT_ID.fetch_add(1, Ordering::Relaxed)
+    );
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = AsyncBufReader::new(read_half);
-    let mut cleanup = ConnectionCleanupGuard::new(cleanup_tx, ConnectionTerminalReason::Protocol);
+    let mut cleanup = ConnectionCleanupGuard::new(
+        cleanup_tx,
+        client_id.clone(),
+        ConnectionTerminalReason::Protocol,
+    );
     let hello: DaemonHello =
         match read_async_frame(&mut reader, Some(DAEMON_HANDSHAKE_TIMEOUT)).await {
             Ok(hello) => hello,
@@ -474,6 +495,7 @@ async fn handle_connection_async(
                 reply_tx,
                 response_delivery_rx,
                 grant_id: None,
+                client_id: Some(client_id.clone()),
             })
             .await
             .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
@@ -721,6 +743,7 @@ impl ConnectionTerminalReason {
 
 #[derive(Debug)]
 struct ConnectionCleanup {
+    client_id: String,
     attached_subscriptions: Vec<AttachedSubscription>,
     entity_subscription_ids: BTreeSet<String>,
     reason: ConnectionTerminalReason,
@@ -732,10 +755,15 @@ struct ConnectionCleanupGuard {
 }
 
 impl ConnectionCleanupGuard {
-    fn new(cleanup_tx: SyncSender<ConnectionCleanup>, reason: ConnectionTerminalReason) -> Self {
+    fn new(
+        cleanup_tx: SyncSender<ConnectionCleanup>,
+        client_id: String,
+        reason: ConnectionTerminalReason,
+    ) -> Self {
         Self {
             cleanup_tx,
             cleanup: Some(ConnectionCleanup {
+                client_id,
                 attached_subscriptions: Vec::new(),
                 entity_subscription_ids: BTreeSet::new(),
                 reason,
@@ -850,6 +878,7 @@ fn handle_connection_cleanup(
             DaemonObservability {
                 egress: &state.egress_diagnostics,
                 lifecycle: &state.lifecycle_counters,
+                client_id: Some(&cleanup.client_id),
             },
             control_tx.clone(),
             DaemonRequest::Detach {
@@ -1006,6 +1035,7 @@ pub(crate) fn handle_control_message(
             reply_tx,
             response_delivery_rx,
             grant_id,
+            client_id,
         } => {
             // Late WebRTC Requests after PeerClosed must not create durable ownership or run
             // stale control against a gone peer. Socket path leaves grant_id = None.
@@ -1150,6 +1180,7 @@ pub(crate) fn handle_control_message(
                 DaemonObservability {
                     egress: &state.egress_diagnostics,
                     lifecycle: &state.lifecycle_counters,
+                    client_id: client_id.as_deref(),
                 },
                 control_tx,
                 *request,
@@ -1343,6 +1374,7 @@ pub(crate) fn handle_control_message(
                 DaemonObservability {
                     egress: &state.egress_diagnostics,
                     lifecycle: &state.lifecycle_counters,
+                    client_id: None,
                 },
                 detach_list,
             );
@@ -1450,6 +1482,7 @@ fn detach_local_webrtc_subscriptions(
 struct DaemonObservability<'a> {
     egress: &'a DaemonEgressDiagnostics,
     lifecycle: &'a DaemonLifecycleCounters,
+    client_id: Option<&'a str>,
 }
 
 fn handle_control_request(
@@ -1926,8 +1959,7 @@ fn handle_control_request(
             logical_clock,
             drain_cursors,
             pending_runtime,
-            observability.egress,
-            observability.lifecycle,
+            observability,
             other,
         ),
     }
@@ -1938,12 +1970,16 @@ fn handle_runtime_control_request(
     logical_clock: &mut u64,
     drain_cursors: &mut BTreeMap<String, u64>,
     pending_runtime: &mut PendingRuntimeState,
-    egress_diagnostics: &DaemonEgressDiagnostics,
-    lifecycle_counters: &DaemonLifecycleCounters,
+    observability: DaemonObservability<'_>,
     request: DaemonRequest,
 ) -> DaemonTransportResult<DaemonResponse> {
     let status = daemon.status();
-    let api = HubClientApi::local_operator("botster-hub-daemon-socket");
+    let api = HubClientApi::local_operator(
+        observability
+            .client_id
+            .map(str::to_string)
+            .unwrap_or_else(|| runtime_client_id(&request)),
+    );
     let packages = daemon.package_registry().clone();
     let Some(runtime) = daemon.runtime_mut() else {
         return Err(DaemonTransportError::DaemonNotRunning);
@@ -1990,8 +2026,8 @@ fn handle_runtime_control_request(
             Ok(daemon_status(
                 status,
                 client_status.session_count,
-                egress_diagnostics.diagnostics(),
-                lifecycle_counters.clone(),
+                observability.egress.diagnostics(),
+                observability.lifecycle.clone(),
             ))
         }
         DaemonRequest::ListSessions => {
@@ -2609,7 +2645,9 @@ fn handle_runtime_control_request(
                     .map_err(crate::HubRuntimeError::from)?
                     .len(),
                 Vec::new(),
-                lifecycle_counters.clone(),
+                observability.lifecycle.clone(),
+                software_identity(),
+                installation_identity(),
             )),
             sessions: Vec::new(),
             session_types: Vec::new(),
@@ -2694,6 +2732,18 @@ fn handle_runtime_control_request(
         | DaemonRequest::PackageEntrypointStatus { .. } => {
             unreachable!("package requests are handled before runtime borrow")
         }
+    }
+}
+
+fn runtime_client_id(request: &DaemonRequest) -> String {
+    match request {
+        DaemonRequest::Attach {
+            subscription_id, ..
+        }
+        | DaemonRequest::Detach {
+            subscription_id, ..
+        } => format!("botster-hub-daemon-subscription-{subscription_id}"),
+        _ => "botster-hub-daemon-socket".to_string(),
     }
 }
 
@@ -3205,576 +3255,6 @@ fn apply_entrypoint_snapshots(
     }
 }
 
-fn apps_from_registry(
-    registry: &PackageRegistry,
-    snapshots: Vec<EntrypointProcessSnapshot>,
-) -> Vec<DaemonApp> {
-    let snapshots = snapshots
-        .into_iter()
-        .map(|snapshot| {
-            (
-                (
-                    snapshot.package_name.clone(),
-                    snapshot.entrypoint_id.clone(),
-                ),
-                snapshot,
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    registry
-        .packages()
-        .into_iter()
-        .flat_map(|record| apps_from_record(record, &snapshots))
-        .collect()
-}
-
-fn apps_from_record(
-    record: &crate::PackageRecord,
-    snapshots: &BTreeMap<(String, String), EntrypointProcessSnapshot>,
-) -> Vec<DaemonApp> {
-    let package_state = package_state_label(record.state.into()).to_string();
-    record
-        .runnable_entrypoints
-        .iter()
-        .map(|entrypoint| {
-            let snapshot = snapshots.get(&(record.manifest.name.clone(), entrypoint.id.clone()));
-            let lifecycle_state = snapshot
-                .and_then(|snapshot| snapshot.launch_result.as_ref())
-                .map(|result| runnable_process_state_label(&result.process_state).to_string())
-                .or_else(|| snapshot.map(|snapshot| snapshot.state.clone()))
-                .unwrap_or_else(|| "not_started".to_string());
-            let diagnostics: Vec<DaemonPackageDiagnostic> = snapshot
-                .map(|snapshot| {
-                    snapshot
-                        .diagnostics
-                        .iter()
-                        .map(|diagnostic| DaemonPackageDiagnostic {
-                            kind: diagnostic.kind.clone(),
-                            message: diagnostic.message.clone(),
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            let blocked_reasons = app_blocked_reasons(&package_state, entrypoint);
-            let actions = app_entrypoint_actions(
-                &record.manifest.name,
-                &package_state,
-                &entrypoint.id,
-                entrypoint,
-                &lifecycle_state,
-            );
-            DaemonApp {
-                package_name: record.manifest.name.clone(),
-                app_id: entrypoint.id.clone(),
-                entrypoint_id: entrypoint.id.clone(),
-                kind: runnable_entrypoint_kind_label(&entrypoint.kind).to_string(),
-                launch_mode: runnable_launch_mode_label(&entrypoint.launch_mode).to_string(),
-                lifecycle_state,
-                diagnostics: diagnostics.clone(),
-                actions,
-                blocked_reasons: blocked_reasons.clone(),
-                launch_target: DaemonAppLaunchTarget {
-                    kind: runnable_entrypoint_kind_label(&entrypoint.kind).to_string(),
-                    local_url: app_local_url(entrypoint, snapshot),
-                },
-                route: Some(app_entrypoint_route_descriptor(
-                    record,
-                    entrypoint,
-                    &package_state,
-                    blocked_reasons,
-                    diagnostics.clone(),
-                )),
-            }
-        })
-        .collect()
-}
-
-fn app_blocked_reasons(
-    package_state: &str,
-    entrypoint: &crate::PackageRunnableEntrypoint,
-) -> Vec<String> {
-    let mut reasons = Vec::new();
-    if package_state != "enabled" {
-        reasons.push("package_not_enabled".to_string());
-    }
-    if matches!(
-        entrypoint.launch_mode,
-        RunnableEntrypointLaunchMode::Background
-    ) && !entrypoint.may_supervise
-    {
-        reasons.push("entrypoint_not_supervisable".to_string());
-    }
-    let supported = matches!(
-        (&entrypoint.kind, &entrypoint.launch_mode),
-        (
-            RunnableEntrypointKind::WebApp,
-            RunnableEntrypointLaunchMode::Background
-        ) | (
-            RunnableEntrypointKind::TerminalApp,
-            RunnableEntrypointLaunchMode::ForegroundStdio
-        )
-    );
-    if !supported {
-        reasons.push("unsupported_launch_mode".to_string());
-    }
-    reasons
-}
-
-fn app_entrypoint_actions(
-    package_name: &str,
-    package_state: &str,
-    entrypoint_id: &str,
-    entrypoint: &crate::PackageRunnableEntrypoint,
-    lifecycle_state: &str,
-) -> Vec<DaemonPackageActionState> {
-    if !matches!(
-        entrypoint.launch_mode,
-        RunnableEntrypointLaunchMode::Background
-    ) {
-        return Vec::new();
-    }
-    if !entrypoint.may_supervise {
-        return vec![
-            unavailable_action(
-                "start_package_entrypoint",
-                "entrypoint_not_supervisable",
-                "entrypoint cannot be supervised by the hub",
-            ),
-            unavailable_action(
-                "stop_package_entrypoint",
-                "entrypoint_not_supervisable",
-                "entrypoint cannot be supervised by the hub",
-            ),
-            unavailable_action(
-                "restart_package_entrypoint",
-                "entrypoint_not_supervisable",
-                "entrypoint cannot be supervised by the hub",
-            ),
-        ];
-    }
-    if package_state != "enabled" {
-        return vec![
-            blocked_action(
-                "start_package_entrypoint",
-                "package_not_enabled",
-                Vec::new(),
-                Vec::new(),
-            ),
-            blocked_action(
-                "stop_package_entrypoint",
-                "package_not_enabled",
-                Vec::new(),
-                Vec::new(),
-            ),
-            blocked_action(
-                "restart_package_entrypoint",
-                "package_not_enabled",
-                Vec::new(),
-                Vec::new(),
-            ),
-        ];
-    }
-    let running = lifecycle_state == "running";
-    let mut actions = Vec::new();
-    if running {
-        actions.push(unavailable_action(
-            "start_package_entrypoint",
-            "already_running",
-            "entrypoint is already running",
-        ));
-        actions.push(available_package_action(
-            "stop_package_entrypoint",
-            request_for_entrypoint("stop_package_entrypoint", package_name, entrypoint_id),
-        ));
-    } else {
-        actions.push(available_package_action(
-            "start_package_entrypoint",
-            request_for_entrypoint("start_package_entrypoint", package_name, entrypoint_id),
-        ));
-        actions.push(unavailable_action(
-            "stop_package_entrypoint",
-            "not_running",
-            "entrypoint is not running",
-        ));
-    }
-    actions.push(available_package_action(
-        "restart_package_entrypoint",
-        request_for_entrypoint("restart_package_entrypoint", package_name, entrypoint_id),
-    ));
-    actions
-}
-
-fn app_local_url(
-    entrypoint: &crate::PackageRunnableEntrypoint,
-    snapshot: Option<&EntrypointProcessSnapshot>,
-) -> Option<String> {
-    let declares_local_url = entrypoint.readiness.as_ref().is_some_and(|readiness| {
-        readiness
-            .result_fields
-            .iter()
-            .any(|field| matches!(field, RunnableEntrypointResultField::LocalUrl))
-    });
-    if !declares_local_url {
-        return None;
-    }
-    snapshot
-        .and_then(|snapshot| snapshot.launch_result.as_ref())
-        .and_then(|result| result.local_url.clone())
-}
-
-fn package_route_descriptors(package: &HubClientPackage) -> Vec<DaemonPackageRouteDescriptor> {
-    let package_state = package_state_label(package.state).to_string();
-    let supports_settings = package.configuration.schema.is_some();
-    let mut routes = package
-        .surfaces
-        .iter()
-        .map(|surface| {
-            plugin_surface_route_descriptor(
-                &package.package_name,
-                &package_state,
-                &package.requested_capabilities,
-                surface,
-                supports_settings,
-            )
-        })
-        .collect::<Vec<_>>();
-    routes.extend(package.runnable_entrypoints.iter().map(|entrypoint| {
-        client_entrypoint_route_descriptor(
-            &package.package_name,
-            &package_state,
-            entrypoint,
-            supports_settings,
-        )
-    }));
-    if supports_settings {
-        routes.push(settings_route_descriptor(
-            &package.package_name,
-            &package_state,
-            &package.configuration,
-        ));
-    }
-    routes
-}
-
-fn package_navigation_entries(
-    navigation: Vec<HubClientPackageNavigationEntry>,
-    packages: &[HubClientPackage],
-) -> Vec<DaemonPackageNavigationEntry> {
-    navigation
-        .into_iter()
-        .map(|entry| package_navigation_entry(entry, packages))
-        .collect()
-}
-
-fn package_navigation_entry(
-    entry: HubClientPackageNavigationEntry,
-    packages: &[HubClientPackage],
-) -> DaemonPackageNavigationEntry {
-    let (route_id, source) = match &entry.target {
-        HubClientPackageNavigationTarget::Surface { surface_id } => (
-            surface_route_id(surface_id),
-            DaemonPackageNavigationSource {
-                kind: "surface".to_string(),
-                surface_id: Some(surface_id.clone()),
-                entrypoint_id: None,
-            },
-        ),
-    };
-    let route = packages
-        .iter()
-        .find(|package| package.package_name == entry.package_name)
-        .and_then(|package| {
-            package_route_descriptors(package)
-                .into_iter()
-                .find(|route| route.route_id == route_id)
-        });
-
-    match route {
-        Some(route) => DaemonPackageNavigationEntry {
-            package_name: entry.package_name,
-            item_id: entry.item_id,
-            label: entry.label,
-            icon: entry.icon,
-            description: entry.description,
-            route_id: route.route_id,
-            route_path: route.route_path,
-            target: route.target,
-            source,
-            enabled: route.enabled,
-            blocked: route.blocked,
-            diagnostics: route.diagnostics,
-        },
-        None => DaemonPackageNavigationEntry {
-            package_name: entry.package_name.clone(),
-            item_id: entry.item_id,
-            label: entry.label,
-            icon: entry.icon,
-            description: entry.description,
-            route_id,
-            route_path: String::new(),
-            target: match entry.target {
-                HubClientPackageNavigationTarget::Surface { surface_id } => {
-                    DaemonPackageRouteTarget {
-                        kind: "plugin_surface".to_string(),
-                        entrypoint_id: None,
-                        surface_id: Some(surface_id),
-                    }
-                }
-            },
-            source,
-            enabled: false,
-            blocked: true,
-            diagnostics: vec![DaemonPackageDiagnostic {
-                kind: "navigation_target_not_found".to_string(),
-                message: "navigation target route is not declared".to_string(),
-            }],
-        },
-    }
-}
-
-fn plugin_surface_route_descriptor(
-    package_name: &str,
-    package_state: &str,
-    requested_capabilities: &[crate::HubClientCapability],
-    surface: &PackageSurfaceDescriptor,
-    supports_settings: bool,
-) -> DaemonPackageRouteDescriptor {
-    let diagnostics = route_state_diagnostics(package_state);
-    DaemonPackageRouteDescriptor {
-        package_name: package_name.to_string(),
-        route_id: surface_route_id(&surface.id),
-        route_path: surface_route_path(package_name, &surface.id),
-        target: DaemonPackageRouteTarget {
-            kind: "plugin_surface".to_string(),
-            entrypoint_id: None,
-            surface_id: Some(surface.id.clone()),
-        },
-        title: surface.title.clone(),
-        label: surface.title.clone(),
-        app_id: (surface.kind == PackageSurfaceKind::App).then(|| surface.id.clone()),
-        surface_id: Some(surface.id.clone()),
-        icon: surface.icon.clone(),
-        category: surface.category.clone(),
-        layout_mode: "plugin_surface".to_string(),
-        required_capabilities: requested_capabilities
-            .iter()
-            .filter(|capability| capability.surface.eq_ignore_ascii_case("surfaces"))
-            .map(daemon_capability_from_client)
-            .collect(),
-        enabled: package_state == "enabled",
-        blocked: !diagnostics.is_empty(),
-        diagnostics,
-        supports_settings,
-    }
-}
-
-fn client_entrypoint_route_descriptor(
-    package_name: &str,
-    package_state: &str,
-    entrypoint: &crate::HubClientPackageRunnableEntrypoint,
-    supports_settings: bool,
-) -> DaemonPackageRouteDescriptor {
-    let mut diagnostics = route_state_diagnostics(package_state);
-    diagnostics.extend(
-        client_app_blocked_reasons(package_state, entrypoint)
-            .into_iter()
-            .map(|reason| DaemonPackageDiagnostic {
-                kind: reason,
-                message: format!("{package_name}/{} cannot be opened", entrypoint.id),
-            }),
-    );
-    DaemonPackageRouteDescriptor {
-        package_name: package_name.to_string(),
-        route_id: app_route_id(&entrypoint.id),
-        route_path: app_route_path(package_name, &entrypoint.id),
-        target: DaemonPackageRouteTarget {
-            kind: "app_entrypoint".to_string(),
-            entrypoint_id: Some(entrypoint.id.clone()),
-            surface_id: None,
-        },
-        title: entrypoint.id.clone(),
-        label: entrypoint.id.clone(),
-        app_id: Some(entrypoint.id.clone()),
-        surface_id: None,
-        icon: None,
-        category: Some("apps".to_string()),
-        layout_mode: "app_entrypoint".to_string(),
-        required_capabilities: entrypoint
-            .capabilities
-            .iter()
-            .map(daemon_capability_from_client)
-            .collect(),
-        enabled: package_state == "enabled" && diagnostics.is_empty(),
-        blocked: !diagnostics.is_empty(),
-        diagnostics,
-        supports_settings,
-    }
-}
-
-fn client_app_blocked_reasons(
-    package_state: &str,
-    entrypoint: &crate::HubClientPackageRunnableEntrypoint,
-) -> Vec<String> {
-    let mut reasons = Vec::new();
-    if package_state != "enabled" {
-        reasons.push("package_not_enabled".to_string());
-    }
-    if entrypoint.launch_mode == "background" && !entrypoint.may_supervise {
-        reasons.push("entrypoint_not_supervisable".to_string());
-    }
-    let supported = (entrypoint.kind == "web_app" && entrypoint.launch_mode == "background")
-        || (entrypoint.kind == "terminal_app" && entrypoint.launch_mode == "foreground_stdio");
-    if !supported {
-        reasons.push("unsupported_launch_mode".to_string());
-    }
-    reasons
-}
-
-fn app_entrypoint_route_descriptor(
-    record: &crate::PackageRecord,
-    entrypoint: &crate::PackageRunnableEntrypoint,
-    package_state: &str,
-    blocked_reasons: Vec<String>,
-    mut diagnostics: Vec<DaemonPackageDiagnostic>,
-) -> DaemonPackageRouteDescriptor {
-    diagnostics.extend(
-        blocked_reasons
-            .iter()
-            .map(|reason| DaemonPackageDiagnostic {
-                kind: reason.clone(),
-                message: format!("{} cannot be opened", entrypoint.id),
-            }),
-    );
-    DaemonPackageRouteDescriptor {
-        package_name: record.manifest.name.clone(),
-        route_id: app_route_id(&entrypoint.id),
-        route_path: app_route_path(&record.manifest.name, &entrypoint.id),
-        target: DaemonPackageRouteTarget {
-            kind: "app_entrypoint".to_string(),
-            entrypoint_id: Some(entrypoint.id.clone()),
-            surface_id: None,
-        },
-        title: entrypoint.id.clone(),
-        label: entrypoint.id.clone(),
-        app_id: Some(entrypoint.id.clone()),
-        surface_id: None,
-        icon: None,
-        category: Some("apps".to_string()),
-        layout_mode: "app_entrypoint".to_string(),
-        required_capabilities: entrypoint
-            .capabilities
-            .iter()
-            .map(|capability| DaemonCapability {
-                surface: core_capability_surface_label(&capability.surface).to_string(),
-                scope: capability.scope.clone(),
-            })
-            .collect(),
-        enabled: package_state == "enabled" && diagnostics.is_empty(),
-        blocked: !diagnostics.is_empty(),
-        diagnostics,
-        supports_settings: record.configuration_view().schema.is_some(),
-    }
-}
-
-fn settings_route_descriptor(
-    package_name: &str,
-    package_state: &str,
-    configuration: &crate::HubClientPackageConfiguration,
-) -> DaemonPackageRouteDescriptor {
-    let mut diagnostics = route_state_diagnostics(package_state);
-    diagnostics.extend(configuration.diagnostics.iter().map(|diagnostic| {
-        DaemonPackageDiagnostic {
-            kind: diagnostic.kind.clone(),
-            message: diagnostic.message.clone(),
-        }
-    }));
-    for key in &configuration.missing_required {
-        diagnostics.push(DaemonPackageDiagnostic {
-            kind: "missing_required_configuration".to_string(),
-            message: format!("configuration field {key} is required"),
-        });
-    }
-    DaemonPackageRouteDescriptor {
-        package_name: package_name.to_string(),
-        route_id: "settings".to_string(),
-        route_path: settings_route_path(package_name),
-        target: DaemonPackageRouteTarget {
-            kind: "package_settings".to_string(),
-            entrypoint_id: None,
-            surface_id: None,
-        },
-        title: "Settings".to_string(),
-        label: "Settings".to_string(),
-        app_id: None,
-        surface_id: None,
-        icon: Some("settings".to_string()),
-        category: Some("settings".to_string()),
-        layout_mode: "settings_form".to_string(),
-        required_capabilities: Vec::new(),
-        enabled: true,
-        blocked: false,
-        diagnostics,
-        supports_settings: true,
-    }
-}
-
-fn route_state_diagnostics(package_state: &str) -> Vec<DaemonPackageDiagnostic> {
-    if package_state == "enabled" {
-        Vec::new()
-    } else {
-        vec![DaemonPackageDiagnostic {
-            kind: "package_not_enabled".to_string(),
-            message: "package is not enabled".to_string(),
-        }]
-    }
-}
-
-fn daemon_capability_from_client(capability: &crate::HubClientCapability) -> DaemonCapability {
-    DaemonCapability {
-        surface: capability.surface.clone(),
-        scope: capability.scope.clone(),
-    }
-}
-
-fn core_capability_surface_label(surface: &botster_core::CapabilitySurface) -> &'static str {
-    match surface {
-        botster_core::CapabilitySurface::ClientAdmission => "ClientAdmission",
-        botster_core::CapabilitySurface::PairingInvites => "PairingInvites",
-        botster_core::CapabilitySurface::SignalingRelay => "SignalingRelay",
-        botster_core::CapabilitySurface::HubPresence => "HubPresence",
-        botster_core::CapabilitySurface::BrowserShell => "BrowserShell",
-        botster_core::CapabilitySurface::Secrets => "Secrets",
-        botster_core::CapabilitySurface::Crypto => "Crypto",
-        botster_core::CapabilitySurface::Network => "Network",
-        botster_core::CapabilitySurface::Surfaces => "Surfaces",
-        botster_core::CapabilitySurface::SessionActions => "SessionActions",
-        botster_core::CapabilitySurface::Mcp => "Mcp",
-        botster_core::CapabilitySurface::PluginDb => "PluginDb",
-        botster_core::CapabilitySurface::Filesystem => "Filesystem",
-        botster_core::CapabilitySurface::Timers => "Timers",
-    }
-}
-
-fn surface_route_id(surface_id: &str) -> String {
-    format!("surface:{surface_id}")
-}
-
-fn app_route_id(entrypoint_id: &str) -> String {
-    format!("app:{entrypoint_id}")
-}
-
-fn surface_route_path(package_name: &str, surface_id: &str) -> String {
-    format!("/packages/{package_name}/surfaces/{surface_id}")
-}
-
-fn app_route_path(package_name: &str, entrypoint_id: &str) -> String {
-    format!("/packages/{package_name}/apps/{entrypoint_id}")
-}
-
-fn settings_route_path(package_name: &str) -> String {
-    format!("/packages/{package_name}/settings")
-}
-
 fn issue_local_webrtc_bootstrap_response(
     daemon: &mut HubDaemon,
     package_name: &str,
@@ -4000,11 +3480,11 @@ fn classify_shutdown_session(
     }
 }
 
-fn request_id(value: &str) -> RequestId {
+pub(super) fn request_id(value: &str) -> RequestId {
     RequestId(value.to_string())
 }
 
-fn tick(logical_clock: &mut u64) -> u64 {
+pub(super) fn tick(logical_clock: &mut u64) -> u64 {
     let current = *logical_clock;
     *logical_clock += 1;
     current
@@ -4033,6 +3513,7 @@ fn install_signal_forwarder(control_tx: ControlSender) -> DaemonTransportResult<
                 reply_tx,
                 response_delivery_rx: None,
                 grant_id: None,
+                client_id: None,
             });
         }
     });
@@ -4115,6 +3596,8 @@ pub(crate) enum ControlMessage {
         /// When set, admission requires a still-live local WebRTC peer for this grant.
         /// Socket-path and signal-handler requests leave this `None`.
         grant_id: Option<String>,
+        /// Stable Core client identity for one transport connection.
+        client_id: Option<String>,
     },
     HubUpdateCheckCompleted {
         update: DaemonHubUpdate,
@@ -4128,69 +3611,6 @@ pub(crate) enum ControlMessage {
         entity_subscription_ids: Vec<String>,
         terminal_record: LocalWebrtcSenderTerminalRecord,
     },
-}
-
-#[derive(Debug)]
-pub(crate) enum EntityFrameSender {
-    #[cfg(test)]
-    Blocking(SyncSender<DaemonEntityFrame>),
-    Async(tokio::sync::mpsc::Sender<DaemonEntityFrame>),
-}
-
-#[derive(Debug)]
-pub(crate) enum EntityFrameTrySendError {
-    Full,
-    Disconnected,
-}
-
-impl EntityFrameSender {
-    pub(crate) fn try_send(&self, frame: DaemonEntityFrame) -> Result<(), EntityFrameTrySendError> {
-        match self {
-            #[cfg(test)]
-            Self::Blocking(sender) => sender.try_send(frame).map_err(|error| match error {
-                mpsc::TrySendError::Full(_) => EntityFrameTrySendError::Full,
-                mpsc::TrySendError::Disconnected(_) => EntityFrameTrySendError::Disconnected,
-            }),
-            Self::Async(sender) => sender.try_send(frame).map_err(|error| match error {
-                tokio::sync::mpsc::error::TrySendError::Full(_) => EntityFrameTrySendError::Full,
-                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                    EntityFrameTrySendError::Disconnected
-                }
-            }),
-        }
-    }
-}
-
-fn entity_frame_exceeds_limit(frame: &DaemonEntityFrame) -> bool {
-    serde_json::to_vec(frame)
-        .expect("daemon entity frame values always serialize")
-        .len()
-        > DAEMON_MAX_FRAME_BYTES
-}
-
-#[derive(Debug)]
-pub(crate) struct EntitySubscriptionState {
-    sender: EntityFrameSender,
-    entity_type: String,
-    cursor: Option<SessionLifecycleCursor>,
-    entities: BTreeMap<String, DaemonSessionEntity>,
-    definition_generation: u64,
-    definition_entities: BTreeMap<String, Value>,
-    resync_reason: Option<String>,
-    /// Local WebRTC grant that owns this subscription, when registered over DataChannel.
-    /// Used so PeerClosed can sweep rows that arrived after cleanup_once's id snapshot.
-    pub(crate) owner_grant_id: Option<String>,
-    /// Highest package-entity snapshot/delta seq successfully applied to this stream.
-    /// Built-in `session` / `session_type` families leave this `None`.
-    package_last_applied_seq: Option<u64>,
-    /// Package-entity subscriber is gated to targeted snapshots until caught up.
-    package_catching_up: bool,
-}
-
-#[derive(Debug, Default)]
-struct EntityReconciliationState {
-    cursor: Option<SessionLifecycleCursor>,
-    records: BTreeMap<String, SessionLifecycleRecord>,
 }
 
 #[derive(Debug, Default)]
@@ -4434,249 +3854,6 @@ impl AttachedSubscriptionChange {
     }
 }
 
-fn register_entity_subscription(
-    daemon: &mut HubDaemon,
-    state: &mut DaemonControlState,
-    entity_type: String,
-    subscription_id: String,
-    sender: EntityFrameSender,
-    owner_grant_id: Option<String>,
-) -> DaemonTransportResult<DaemonResponse> {
-    if state.entity_subscriptions.contains_key(&subscription_id) {
-        return Ok(entity_subscription_error(
-            "duplicate_entity_subscription",
-            &subscription_id,
-            "entity subscription id is already active",
-        ));
-    }
-    if entity_type == "session_type" {
-        let (snapshot_seq, entities) = match session_type_entity_snapshot(daemon) {
-            Ok(snapshot) => snapshot,
-            Err(DaemonTransportError::Client(crate::HubClientError::SessionType {
-                kind,
-                message,
-                ..
-            })) => {
-                // Keep entity-subscription operator frames on the subscribe_entities
-                // convention (request_id = subscription_id), not list_session_types.
-                return Ok(entity_subscription_error(kind, &subscription_id, &message));
-            }
-            Err(error) => return Err(error),
-        };
-        let snapshot = DaemonEntityFrame::Snapshot {
-            subscription_id: subscription_id.clone(),
-            entity_type: entity_type.clone(),
-            snapshot_seq,
-            items: entities.values().cloned().collect(),
-            resync_reason: None,
-        };
-        if entity_frame_exceeds_limit(&snapshot) {
-            return Ok(entity_subscription_error(
-                "entity_provider_frame_too_large",
-                &subscription_id,
-                "session type snapshot exceeds daemon frame limit",
-            ));
-        }
-        sender
-            .try_send(snapshot)
-            .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
-        state.entity_subscriptions.insert(
-            subscription_id.clone(),
-            EntitySubscriptionState {
-                sender,
-                entity_type,
-                cursor: None,
-                entities: BTreeMap::new(),
-                definition_generation: snapshot_seq,
-                definition_entities: entities,
-                resync_reason: None,
-                owner_grant_id,
-                package_last_applied_seq: None,
-                package_catching_up: false,
-            },
-        );
-        state.lifecycle_counters.live_entity_subscriptions =
-            state.entity_subscriptions.len() as u64;
-        state.lifecycle_counters.high_water_entity_subscriptions = state
-            .lifecycle_counters
-            .high_water_entity_subscriptions
-            .max(state.lifecycle_counters.live_entity_subscriptions);
-        return Ok(daemon_response_base(DaemonResponseKind::EntitySubscribed));
-    }
-    if entity_type != "session" {
-        let (snapshot_seq, items, catching_up) = {
-            let runtime = daemon
-                .runtime_mut()
-                .ok_or(DaemonTransportError::DaemonNotRunning)?;
-            let (snapshot_seq, items) =
-                match runtime.plugin_entity_snapshot(&entity_type, &subscription_id) {
-                    Ok(snapshot) => snapshot,
-                    Err(error) => {
-                        return Ok(entity_subscription_error(
-                            &error.code,
-                            &subscription_id,
-                            &error.message,
-                        ));
-                    }
-                };
-            // Advance monotonic family floor from provider; never lower it.
-            let _ = runtime.apply_package_entity_provider_snapshot(&entity_type, snapshot_seq);
-            let family_floor = runtime
-                .package_entity_family_state(&entity_type)
-                .map(|family| family.last_accepted_seq)
-                .unwrap_or(snapshot_seq);
-            // New subscriber may receive this snapshot (never-applied). Behind
-            // relative to family floor means catching_up; advanced peers are not
-            // touched here because we only deliver to this subscription.
-            let catching_up = snapshot_seq < family_floor;
-            if catching_up {
-                // New catching-up subscriber re-arms even after degraded.
-                runtime.rearm_package_entity_resync(&entity_type);
-            }
-            (snapshot_seq, items, catching_up)
-        };
-        let snapshot = DaemonEntityFrame::Snapshot {
-            subscription_id: subscription_id.clone(),
-            entity_type: entity_type.clone(),
-            snapshot_seq,
-            items,
-            resync_reason: None,
-        };
-        if entity_frame_exceeds_limit(&snapshot) {
-            return Ok(entity_subscription_error(
-                "entity_provider_frame_too_large",
-                &subscription_id,
-                "entity provider snapshot exceeds daemon frame limit",
-            ));
-        }
-        sender
-            .try_send(snapshot)
-            .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
-        state.entity_subscriptions.insert(
-            subscription_id.clone(),
-            EntitySubscriptionState {
-                sender,
-                entity_type,
-                cursor: None,
-                entities: BTreeMap::new(),
-                definition_generation: 0,
-                definition_entities: BTreeMap::new(),
-                resync_reason: None,
-                owner_grant_id,
-                package_last_applied_seq: Some(snapshot_seq),
-                package_catching_up: catching_up,
-            },
-        );
-        state.lifecycle_counters.live_entity_subscriptions =
-            state.entity_subscriptions.len() as u64;
-        state.lifecycle_counters.high_water_entity_subscriptions = state
-            .lifecycle_counters
-            .high_water_entity_subscriptions
-            .max(state.lifecycle_counters.live_entity_subscriptions);
-        // Fanout any pending mutations unlocked by the floor advance.
-        drive_package_entity_fanout(daemon, state);
-        return Ok(daemon_response_base(DaemonResponseKind::EntitySubscribed));
-    }
-    let baseline = if let Some(cursor) = state.reconciliation.cursor.clone() {
-        SessionLifecycleBaseline {
-            cursor,
-            sessions: state.reconciliation.records.values().cloned().collect(),
-        }
-    } else {
-        let packages = daemon.package_registry().clone();
-        let runtime = daemon
-            .runtime_mut()
-            .ok_or(DaemonTransportError::DaemonNotRunning)?;
-        let api = HubClientApi::local_operator("botster-hub-daemon-entity-stream");
-        let response = api.handle_request(
-            runtime,
-            &packages,
-            HubClientRequest::SubscribeEntities {
-                request_id: request_id("daemon-entity-subscribe"),
-                entity_type,
-                subscription_id: subscription_id.clone(),
-            },
-        );
-        let response = match response {
-            Ok(response) => response,
-            Err(error) => return Ok(daemon_operator_error(error)),
-        };
-        let HubClientResponseBody::SessionLifecycleBaseline(baseline) = response.body else {
-            return Err(DaemonTransportError::UnexpectedResponse);
-        };
-        state.lifecycle_counters.lifecycle_baseline_reads = state
-            .lifecycle_counters
-            .lifecycle_baseline_reads
-            .saturating_add(1);
-        baseline
-    };
-    if state.reconciliation.cursor.is_none() {
-        state.reconciliation.cursor = Some(baseline.cursor.clone());
-        state.reconciliation.records = baseline
-            .sessions
-            .iter()
-            .cloned()
-            .map(|record| (record.session.session_id.0.clone(), record))
-            .collect();
-    }
-    let cursor = baseline.cursor.clone();
-    let (entities, snapshot) = entity_snapshot(&subscription_id, baseline, None);
-    sender
-        .try_send(snapshot)
-        .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
-    state.entity_subscriptions.insert(
-        subscription_id.clone(),
-        EntitySubscriptionState {
-            sender,
-            entity_type: "session".to_string(),
-            cursor: Some(cursor),
-            entities,
-            definition_generation: 0,
-            definition_entities: BTreeMap::new(),
-            resync_reason: None,
-            owner_grant_id,
-            package_last_applied_seq: None,
-            package_catching_up: false,
-        },
-    );
-    state.lifecycle_counters.live_entity_subscriptions = state
-        .lifecycle_counters
-        .live_entity_subscriptions
-        .saturating_add(1);
-    state.lifecycle_counters.high_water_entity_subscriptions = state
-        .lifecycle_counters
-        .high_water_entity_subscriptions
-        .max(state.lifecycle_counters.live_entity_subscriptions);
-    if state.released_entity_generations > 0 {
-        state.released_entity_generations -= 1;
-        state.lifecycle_counters.reconnect_registrations = state
-            .lifecycle_counters
-            .reconnect_registrations
-            .saturating_add(1);
-    }
-    state.next_reconciliation = Instant::now();
-    Ok(daemon_response_base(DaemonResponseKind::EntitySubscribed))
-}
-
-fn seed_lifecycle_reconciliation(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
-    let Some(runtime) = daemon.runtime_mut() else {
-        return;
-    };
-    state.lifecycle_counters.lifecycle_baseline_reads = state
-        .lifecycle_counters
-        .lifecycle_baseline_reads
-        .saturating_add(1);
-    let Ok(baseline) = runtime.session_lifecycle_baseline() else {
-        return;
-    };
-    state.reconciliation.cursor = Some(baseline.cursor);
-    state.reconciliation.records = baseline
-        .sessions
-        .into_iter()
-        .map(|record| (record.session.session_id.0.clone(), record))
-        .collect();
-}
-
 fn session_type_entity_snapshot(
     daemon: &mut HubDaemon,
 ) -> DaemonTransportResult<(u64, BTreeMap<String, Value>)> {
@@ -4789,933 +3966,6 @@ fn force_advance_session_type_generation(daemon: &mut HubDaemon) -> DaemonTransp
     Ok(())
 }
 
-fn drive_session_type_subscriptions(
-    subscriptions: &mut BTreeMap<String, EntitySubscriptionState>,
-    generation: u64,
-    entities: &BTreeMap<String, Value>,
-) {
-    subscriptions.retain(|subscription_id, subscription| {
-        if subscription.entity_type != "session_type" {
-            return true;
-        }
-
-        if let Some(reason) = subscription.resync_reason.clone() {
-            let frame = DaemonEntityFrame::Snapshot {
-                subscription_id: subscription_id.clone(),
-                entity_type: "session_type".to_string(),
-                snapshot_seq: generation,
-                items: entities.values().cloned().collect(),
-                resync_reason: Some(reason),
-            };
-            if entity_frame_exceeds_limit(&frame) {
-                let error = DaemonEntityFrame::Error {
-                    subscription_id: subscription_id.clone(),
-                    entity_type: "session_type".to_string(),
-                    code: "entity_provider_frame_too_large".to_string(),
-                    message: "session type snapshot exceeds daemon frame limit".to_string(),
-                };
-                return match subscription.sender.try_send(error) {
-                    Ok(()) | Err(EntityFrameTrySendError::Disconnected) => false,
-                    Err(EntityFrameTrySendError::Full) => true,
-                };
-            }
-            return match subscription.sender.try_send(frame) {
-                Ok(()) => {
-                    subscription.definition_generation = generation;
-                    subscription.definition_entities = entities.clone();
-                    subscription.resync_reason = None;
-                    true
-                }
-                Err(EntityFrameTrySendError::Full) => true,
-                Err(EntityFrameTrySendError::Disconnected) => false,
-            };
-        }
-
-        if subscription.definition_generation == generation {
-            return true;
-        }
-
-        let mut frames = subscription
-            .definition_entities
-            .keys()
-            .filter(|id| !entities.contains_key(*id))
-            .map(|id| DaemonEntityFrame::Remove {
-                subscription_id: subscription_id.clone(),
-                entity_type: "session_type".to_string(),
-                snapshot_seq: generation,
-                id: id.clone(),
-            })
-            .collect::<Vec<_>>();
-        frames.extend(
-            entities
-                .iter()
-                .filter(|(id, entity)| subscription.definition_entities.get(*id) != Some(*entity))
-                .map(|(id, entity)| DaemonEntityFrame::Upsert {
-                    subscription_id: subscription_id.clone(),
-                    entity_type: "session_type".to_string(),
-                    snapshot_seq: generation,
-                    id: id.clone(),
-                    entity: entity.clone(),
-                }),
-        );
-        for frame in frames {
-            match subscription.sender.try_send(frame) {
-                Ok(()) => {}
-                Err(EntityFrameTrySendError::Full) => {
-                    subscription.resync_reason = Some("subscriber_overflow".to_string());
-                    return true;
-                }
-                Err(EntityFrameTrySendError::Disconnected) => return false,
-            }
-        }
-        subscription.definition_generation = generation;
-        subscription.definition_entities = entities.clone();
-        true
-    });
-}
-
-fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
-    // Package mutation fanout and bounded provider resync run even when only
-    // session subscriptions exist, so call them before the empty early-return.
-    drive_package_entity_fanout(daemon, state);
-    drive_package_entity_resync(daemon, state);
-
-    if state.entity_subscriptions.is_empty() {
-        return;
-    }
-    let packages = daemon.package_registry().clone();
-    let Some(runtime) = daemon.runtime_mut() else {
-        state.entity_subscriptions.clear();
-        state.lifecycle_counters.live_entity_subscriptions = 0;
-        return;
-    };
-    state.entity_subscriptions.retain(|_, subscription| {
-        subscription.entity_type == "session"
-            || subscription.entity_type == "session_type"
-            || runtime.has_plugin_entity_provider_family(&subscription.entity_type)
-    });
-    state.lifecycle_counters.live_entity_subscriptions = state.entity_subscriptions.len() as u64;
-
-    state.lifecycle_counters.reconciliation_wakes = state
-        .lifecycle_counters
-        .reconciliation_wakes
-        .saturating_add(1);
-
-    if state
-        .entity_subscriptions
-        .values()
-        .any(|subscription| subscription.entity_type == "session_type")
-    {
-        let records = packages.packages();
-        let runtime_state = runtime.state();
-        let generation = runtime_state.session_type_generation;
-        if let Ok(session_types) =
-            crate::session_types::list_session_types(&records, &runtime_state)
-        {
-            let entities = session_types
-                .into_iter()
-                .map(daemon_session_type_from_client)
-                .filter_map(|session_type| {
-                    let id = session_type.session_type_id.clone();
-                    serde_json::to_value(session_type)
-                        .ok()
-                        .map(|value| (id, value))
-                })
-                .collect::<BTreeMap<_, _>>();
-            drive_session_type_subscriptions(
-                &mut state.entity_subscriptions,
-                generation,
-                &entities,
-            );
-        }
-    }
-
-    let Some(cursor) = state.reconciliation.cursor.clone() else {
-        return;
-    };
-    if state.entity_subscriptions.values().any(|subscription| {
-        subscription.entity_type == "session" && subscription.resync_reason.is_some()
-    }) {
-        let baseline = SessionLifecycleBaseline {
-            cursor: cursor.clone(),
-            sessions: state.reconciliation.records.values().cloned().collect(),
-        };
-        state
-            .entity_subscriptions
-            .retain(|subscription_id, subscription| {
-                if subscription.entity_type != "session" {
-                    return true;
-                }
-                let Some(reason) = subscription.resync_reason.clone() else {
-                    return true;
-                };
-                try_resync_subscription(
-                    subscription_id,
-                    subscription,
-                    baseline.clone(),
-                    reason,
-                    &mut state.lifecycle_counters,
-                )
-            });
-    }
-    state.lifecycle_counters.lifecycle_change_reads = state
-        .lifecycle_counters
-        .lifecycle_change_reads
-        .saturating_add(1);
-    let changes = runtime.session_lifecycle_changes(&cursor);
-    if let Some(reason) = changes.resync_required {
-        state.lifecycle_counters.lifecycle_resync_reads = state
-            .lifecycle_counters
-            .lifecycle_resync_reads
-            .saturating_add(1);
-        state.lifecycle_counters.lifecycle_baseline_reads = state
-            .lifecycle_counters
-            .lifecycle_baseline_reads
-            .saturating_add(1);
-        let Ok(baseline) = runtime.session_lifecycle_baseline() else {
-            return;
-        };
-        state.reconciliation.cursor = Some(baseline.cursor.clone());
-        state.reconciliation.records = baseline
-            .sessions
-            .iter()
-            .cloned()
-            .map(|record| (record.session.session_id.0.clone(), record))
-            .collect();
-        let reason = format!("core_{reason:?}").to_lowercase();
-        state
-            .entity_subscriptions
-            .retain(|subscription_id, subscription| {
-                if subscription.entity_type != "session" {
-                    return true;
-                }
-                try_resync_subscription(
-                    subscription_id,
-                    subscription,
-                    baseline.clone(),
-                    reason.clone(),
-                    &mut state.lifecycle_counters,
-                )
-            });
-    } else if changes.changes.iter().any(|change| {
-        !matches!(
-            &change.kind,
-            SessionLifecycleChangeKind::Upsert { .. } | SessionLifecycleChangeKind::Removed { .. }
-        )
-    }) {
-        state.lifecycle_counters.lifecycle_resync_reads = state
-            .lifecycle_counters
-            .lifecycle_resync_reads
-            .saturating_add(1);
-        state.lifecycle_counters.lifecycle_baseline_reads = state
-            .lifecycle_counters
-            .lifecycle_baseline_reads
-            .saturating_add(1);
-        let Ok(baseline) = runtime.session_lifecycle_baseline() else {
-            return;
-        };
-        state.reconciliation.cursor = Some(baseline.cursor.clone());
-        state.reconciliation.records = baseline
-            .sessions
-            .iter()
-            .cloned()
-            .map(|record| (record.session.session_id.0.clone(), record))
-            .collect();
-        state
-            .entity_subscriptions
-            .retain(|subscription_id, subscription| {
-                try_resync_subscription(
-                    subscription_id,
-                    subscription,
-                    baseline.clone(),
-                    "unknown_core_change".to_string(),
-                    &mut state.lifecycle_counters,
-                )
-            });
-    } else {
-        let mut unsupported_change = false;
-        for change in changes.changes {
-            match &change.kind {
-                SessionLifecycleChangeKind::Upsert { record } => {
-                    state
-                        .reconciliation
-                        .records
-                        .insert(record.session.session_id.0.clone(), record.clone());
-                }
-                SessionLifecycleChangeKind::Removed { session_id } => {
-                    state.reconciliation.records.remove(&session_id.0);
-                }
-                _ => {
-                    unsupported_change = true;
-                    break;
-                }
-            }
-            state.reconciliation.cursor = Some(change.cursor.clone());
-            state
-                .entity_subscriptions
-                .retain(|subscription_id, subscription| {
-                    if subscription.entity_type != "session" {
-                        return true;
-                    }
-                    deliver_lifecycle_change(
-                        subscription_id,
-                        subscription,
-                        &change,
-                        &mut state.lifecycle_counters,
-                    )
-                });
-        }
-        if unsupported_change {
-            state.lifecycle_counters.lifecycle_resync_reads = state
-                .lifecycle_counters
-                .lifecycle_resync_reads
-                .saturating_add(1);
-            state.lifecycle_counters.lifecycle_baseline_reads = state
-                .lifecycle_counters
-                .lifecycle_baseline_reads
-                .saturating_add(1);
-            let Ok(baseline) = runtime.session_lifecycle_baseline() else {
-                return;
-            };
-            state.reconciliation.cursor = Some(baseline.cursor.clone());
-            state.reconciliation.records = baseline
-                .sessions
-                .iter()
-                .cloned()
-                .map(|record| (record.session.session_id.0.clone(), record))
-                .collect();
-            state
-                .entity_subscriptions
-                .retain(|subscription_id, subscription| {
-                    if subscription.entity_type != "session" {
-                        return true;
-                    }
-                    try_resync_subscription(
-                        subscription_id,
-                        subscription,
-                        baseline.clone(),
-                        "unknown_core_change".to_string(),
-                        &mut state.lifecycle_counters,
-                    )
-                });
-        } else {
-            state.reconciliation.cursor = Some(changes.cursor);
-        }
-    }
-
-    let active_session_ids = state
-        .reconciliation
-        .records
-        .keys()
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    state.pending_runtime.events.retain(|session_id, _| {
-        active_session_ids.contains(session_id)
-            && state
-                .pending_runtime
-                .active_subscriptions
-                .contains_key(session_id)
-    });
-    for record in state.reconciliation.records.values() {
-        let session_id = record.session.session_id.0.clone();
-        if record.lifecycle.as_ref().is_some_and(|lifecycle| {
-            matches!(
-                lifecycle,
-                SessionLifecycleState::Exited { .. } | SessionLifecycleState::Failed { .. }
-            )
-        }) {
-            continue;
-        }
-        let drain_cursor = state
-            .drain_cursors
-            .entry(session_id.clone())
-            .or_insert_with(|| tick(&mut state.logical_clock));
-        state.lifecycle_counters.lifecycle_session_drains = state
-            .lifecycle_counters
-            .lifecycle_session_drains
-            .saturating_add(1);
-        if let Ok(output) =
-            runtime.drain_runtime_once(&SessionId(session_id.clone()), *drain_cursor)
-        {
-            let has_client_egress = !output.client_egress.is_empty();
-            let events = crate::client_api::events_from_drain(output);
-            if has_client_egress && !events.is_empty() {
-                *drain_cursor = tick(&mut state.logical_clock);
-                state
-                    .pending_runtime
-                    .events
-                    .entry(session_id)
-                    .or_default()
-                    .extend(events);
-            }
-        }
-    }
-    state.lifecycle_counters.live_entity_subscriptions = state.entity_subscriptions.len() as u64;
-}
-
-fn drive_package_entity_fanout(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
-    let Some(runtime) = daemon.runtime() else {
-        return;
-    };
-    let mutations = runtime.take_package_entity_fanout();
-    if mutations.is_empty() {
-        return;
-    }
-    for mutation in mutations {
-        state.lifecycle_counters.package_entity_publish_accepted = state
-            .lifecycle_counters
-            .package_entity_publish_accepted
-            .saturating_add(1);
-        let entity_type = mutation.entity_type().to_string();
-        let seq = mutation.snapshot_seq();
-        let mut dead = Vec::new();
-        for (subscription_id, subscription) in state.entity_subscriptions.iter_mut() {
-            if subscription.entity_type != entity_type {
-                continue;
-            }
-            // Catching_up subscribers receive only targeted resync snapshots.
-            // Do not treat applied < family_floor alone as catching_up here: the
-            // sequential next delta always has applied == floor-1 before delivery.
-            if subscription.package_catching_up {
-                continue;
-            }
-            let Some(applied) = subscription.package_last_applied_seq else {
-                subscription.package_catching_up = true;
-                runtime.mark_package_entity_resync_needed(&entity_type);
-                continue;
-            };
-            if seq < applied + 1 {
-                // Already applied or behind relative to this subscriber.
-                continue;
-            }
-            if seq > applied + 1 {
-                // Gap relative to this subscriber — schedule targeted resync.
-                subscription.package_catching_up = true;
-                runtime.mark_package_entity_resync_needed(&entity_type);
-                continue;
-            }
-            // seq == applied + 1
-            let frame = package_mutation_to_daemon_frame(subscription_id, &mutation);
-            if entity_frame_exceeds_limit(&frame) {
-                state.lifecycle_counters.entity_delivery_attempts = state
-                    .lifecycle_counters
-                    .entity_delivery_attempts
-                    .saturating_add(1);
-                let error = DaemonEntityFrame::Error {
-                    subscription_id: subscription_id.clone(),
-                    entity_type: entity_type.clone(),
-                    code: "entity_provider_frame_too_large".to_string(),
-                    message: "package entity mutation exceeds daemon frame limit".to_string(),
-                };
-                match subscription.sender.try_send(error) {
-                    Ok(()) => {
-                        state.lifecycle_counters.entity_delivery_successes = state
-                            .lifecycle_counters
-                            .entity_delivery_successes
-                            .saturating_add(1);
-                        // Do not advance applied seq; schedule resync for recovery.
-                        subscription.package_catching_up = true;
-                        subscription.resync_reason =
-                            Some("entity_provider_frame_too_large".to_string());
-                        runtime.mark_package_entity_resync_needed(&entity_type);
-                    }
-                    Err(EntityFrameTrySendError::Full) => {
-                        state.lifecycle_counters.entity_delivery_overflows = state
-                            .lifecycle_counters
-                            .entity_delivery_overflows
-                            .saturating_add(1);
-                        subscription.package_catching_up = true;
-                        subscription.resync_reason = Some("subscriber_overflow".to_string());
-                        runtime.mark_package_entity_resync_needed(&entity_type);
-                    }
-                    Err(EntityFrameTrySendError::Disconnected) => {
-                        state.lifecycle_counters.entity_delivery_failures = state
-                            .lifecycle_counters
-                            .entity_delivery_failures
-                            .saturating_add(1);
-                        dead.push(subscription_id.clone());
-                    }
-                }
-                continue;
-            }
-            state.lifecycle_counters.entity_delivery_attempts = state
-                .lifecycle_counters
-                .entity_delivery_attempts
-                .saturating_add(1);
-            match subscription.sender.try_send(frame) {
-                Ok(()) => {
-                    state.lifecycle_counters.entity_delivery_successes = state
-                        .lifecycle_counters
-                        .entity_delivery_successes
-                        .saturating_add(1);
-                    subscription.package_last_applied_seq = Some(seq);
-                    subscription.package_catching_up = false;
-                }
-                Err(EntityFrameTrySendError::Full) => {
-                    state.lifecycle_counters.entity_delivery_overflows = state
-                        .lifecycle_counters
-                        .entity_delivery_overflows
-                        .saturating_add(1);
-                    subscription.package_catching_up = true;
-                    subscription.resync_reason = Some("subscriber_overflow".to_string());
-                    runtime.mark_package_entity_resync_needed(&entity_type);
-                }
-                Err(EntityFrameTrySendError::Disconnected) => {
-                    state.lifecycle_counters.entity_delivery_failures = state
-                        .lifecycle_counters
-                        .entity_delivery_failures
-                        .saturating_add(1);
-                    dead.push(subscription_id.clone());
-                }
-            }
-        }
-        for subscription_id in dead {
-            state.entity_subscriptions.remove(&subscription_id);
-        }
-    }
-    state.lifecycle_counters.live_entity_subscriptions = state.entity_subscriptions.len() as u64;
-}
-
-fn package_mutation_to_daemon_frame(
-    subscription_id: &str,
-    mutation: &crate::package_entity_fanout::PackageEntityMutation,
-) -> DaemonEntityFrame {
-    match mutation {
-        crate::package_entity_fanout::PackageEntityMutation::Upsert {
-            entity_type,
-            snapshot_seq,
-            id,
-            entity,
-        } => DaemonEntityFrame::Upsert {
-            subscription_id: subscription_id.to_string(),
-            entity_type: entity_type.clone(),
-            snapshot_seq: *snapshot_seq,
-            id: id.clone(),
-            entity: entity.clone(),
-        },
-        crate::package_entity_fanout::PackageEntityMutation::Patch {
-            entity_type,
-            snapshot_seq,
-            id,
-            patch,
-        } => DaemonEntityFrame::Patch {
-            subscription_id: subscription_id.to_string(),
-            entity_type: entity_type.clone(),
-            snapshot_seq: *snapshot_seq,
-            id: id.clone(),
-            patch: patch.clone(),
-        },
-        crate::package_entity_fanout::PackageEntityMutation::Remove {
-            entity_type,
-            snapshot_seq,
-            id,
-        } => DaemonEntityFrame::Remove {
-            subscription_id: subscription_id.to_string(),
-            entity_type: entity_type.clone(),
-            snapshot_seq: *snapshot_seq,
-            id: id.clone(),
-        },
-    }
-}
-
-fn drive_package_entity_resync(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
-    // Stagnant catching_up / overflow may keep `needed` set when not degraded.
-    // Do not rearm degraded families here — only a new publish or a newly
-    // catching-up subscribe may clear degradation and start another cycle.
-    if let Some(runtime) = daemon.runtime() {
-        for subscription in state.entity_subscriptions.values() {
-            if subscription.package_catching_up || subscription.resync_reason.is_some() {
-                runtime.mark_package_entity_resync_needed(&subscription.entity_type);
-            }
-        }
-    }
-    let eligible = {
-        let Some(runtime) = daemon.runtime() else {
-            return;
-        };
-        runtime.package_entity_resync_eligible_families()
-    };
-    if eligible.is_empty() {
-        return;
-    }
-    for entity_type in eligible {
-        // Also resync when any subscriber is catching_up even without a gap.
-        let has_catching_up = state.entity_subscriptions.values().any(|subscription| {
-            subscription.entity_type == entity_type && subscription.package_catching_up
-        });
-        let family_needs = daemon
-            .runtime()
-            .and_then(|runtime| runtime.package_entity_family_state(&entity_type))
-            .is_some_and(|family| {
-                family.resync.needed
-                    || family.last_accepted_seq < family.high_water_seq
-                    || !family.pending_by_seq.is_empty()
-            });
-        if !has_catching_up && !family_needs {
-            continue;
-        }
-
-        let degraded = {
-            let Some(runtime) = daemon.runtime() else {
-                return;
-            };
-            state.lifecycle_counters.package_entity_resync_attempts = state
-                .lifecycle_counters
-                .package_entity_resync_attempts
-                .saturating_add(1);
-            runtime.record_package_entity_resync_attempt(&entity_type)
-        };
-        if degraded {
-            state.lifecycle_counters.package_entity_resync_degraded = state
-                .lifecycle_counters
-                .package_entity_resync_degraded
-                .saturating_add(1);
-            continue;
-        }
-
-        let subscription_id_for_provider = state
-            .entity_subscriptions
-            .iter()
-            .find(|(_, subscription)| subscription.entity_type == entity_type)
-            .map(|(id, _)| id.clone())
-            .unwrap_or_else(|| format!("package-entity-resync-{entity_type}"));
-
-        let provider_result = {
-            let Some(runtime) = daemon.runtime_mut() else {
-                return;
-            };
-            runtime.plugin_entity_snapshot(&entity_type, &subscription_id_for_provider)
-        };
-        let Ok((snapshot_seq, items)) = provider_result else {
-            // Failed provider: keep schedule (attempt already recorded with backoff).
-            continue;
-        };
-
-        let ready = {
-            let Some(runtime) = daemon.runtime() else {
-                return;
-            };
-            runtime.apply_package_entity_provider_snapshot(&entity_type, snapshot_seq)
-        };
-        if !ready.is_empty() {
-            // Queue drained pending for the shared fanout path.
-            // apply_package_entity_provider_snapshot already enqueued them.
-        }
-
-        let family_floor = daemon
-            .runtime()
-            .and_then(|runtime| runtime.package_entity_family_state(&entity_type))
-            .map(|family| family.last_accepted_seq)
-            .unwrap_or(snapshot_seq);
-
-        let mut dead = Vec::new();
-        for (subscription_id, subscription) in state.entity_subscriptions.iter_mut() {
-            if subscription.entity_type != entity_type {
-                continue;
-            }
-            // Targeted delivery: only catching_up / overflow / never-applied, and never
-            // roll an advanced subscriber backward.
-            let applied = subscription.package_last_applied_seq;
-            let needs_snapshot = subscription.package_catching_up
-                || subscription.resync_reason.is_some()
-                || applied.is_none()
-                || applied.is_some_and(|seq| seq < family_floor);
-            if !needs_snapshot {
-                continue;
-            }
-            if applied.is_some_and(|seq| snapshot_seq < seq) {
-                // Behind for this advanced subscriber — skip.
-                continue;
-            }
-            let frame = DaemonEntityFrame::Snapshot {
-                subscription_id: subscription_id.clone(),
-                entity_type: entity_type.clone(),
-                snapshot_seq,
-                items: items.clone(),
-                resync_reason: subscription
-                    .resync_reason
-                    .clone()
-                    .or_else(|| Some("package_entity_resync".to_string())),
-            };
-            if entity_frame_exceeds_limit(&frame) {
-                continue;
-            }
-            state.lifecycle_counters.entity_delivery_attempts = state
-                .lifecycle_counters
-                .entity_delivery_attempts
-                .saturating_add(1);
-            match subscription.sender.try_send(frame) {
-                Ok(()) => {
-                    state.lifecycle_counters.entity_delivery_successes = state
-                        .lifecycle_counters
-                        .entity_delivery_successes
-                        .saturating_add(1);
-                    subscription.package_last_applied_seq = Some(snapshot_seq);
-                    subscription.package_catching_up = snapshot_seq < family_floor;
-                    subscription.resync_reason = None;
-                }
-                Err(EntityFrameTrySendError::Full) => {
-                    state.lifecycle_counters.entity_delivery_overflows = state
-                        .lifecycle_counters
-                        .entity_delivery_overflows
-                        .saturating_add(1);
-                    subscription.package_catching_up = true;
-                    subscription.resync_reason = Some("subscriber_overflow".to_string());
-                    if let Some(runtime) = daemon.runtime() {
-                        runtime.mark_package_entity_resync_needed(&entity_type);
-                    }
-                }
-                Err(EntityFrameTrySendError::Disconnected) => {
-                    state.lifecycle_counters.entity_delivery_failures = state
-                        .lifecycle_counters
-                        .entity_delivery_failures
-                        .saturating_add(1);
-                    dead.push(subscription_id.clone());
-                }
-            }
-        }
-        for subscription_id in dead {
-            state.entity_subscriptions.remove(&subscription_id);
-        }
-
-        // After snapshot floor advance, fanout any drained pending deltas.
-        drive_package_entity_fanout(daemon, state);
-
-        // Clear need when floor matches high water and no catching_up remains.
-        if let Some(runtime) = daemon.runtime() {
-            let still_catching_up = state.entity_subscriptions.values().any(|subscription| {
-                subscription.entity_type == entity_type && subscription.package_catching_up
-            });
-            if !still_catching_up {
-                runtime.recompute_package_entity_resync(&entity_type);
-            } else {
-                runtime.mark_package_entity_resync_needed(&entity_type);
-            }
-        }
-    }
-    state.lifecycle_counters.live_entity_subscriptions = state.entity_subscriptions.len() as u64;
-}
-
-fn deliver_lifecycle_change(
-    subscription_id: &str,
-    state: &mut EntitySubscriptionState,
-    change: &botster_core_daemon::SessionLifecycleChange,
-    counters: &mut DaemonLifecycleCounters,
-) -> bool {
-    let sequence = change.cursor.sequence;
-    let frame = match &change.kind {
-        SessionLifecycleChangeKind::Upsert { record } => {
-            let entity = project_session_entity(record);
-            let id = entity.session_uuid.clone();
-            match state.entities.insert(id.clone(), entity.clone()) {
-                None => DaemonEntityFrame::Upsert {
-                    subscription_id: subscription_id.to_string(),
-                    entity_type: "session".to_string(),
-                    snapshot_seq: sequence,
-                    id,
-                    entity: serde_json::to_value(entity).expect("serialize session entity"),
-                },
-                Some(previous) => {
-                    let patch = session_entity_patch(&previous, &entity);
-                    if patch.as_object().is_some_and(serde_json::Map::is_empty) {
-                        state.cursor = Some(change.cursor.clone());
-                        return true;
-                    }
-                    DaemonEntityFrame::Patch {
-                        subscription_id: subscription_id.to_string(),
-                        entity_type: "session".to_string(),
-                        snapshot_seq: sequence,
-                        id,
-                        patch,
-                    }
-                }
-            }
-        }
-        SessionLifecycleChangeKind::Removed { session_id } => {
-            state.entities.remove(&session_id.0);
-            DaemonEntityFrame::Remove {
-                subscription_id: subscription_id.to_string(),
-                entity_type: "session".to_string(),
-                snapshot_seq: sequence,
-                id: session_id.0.clone(),
-            }
-        }
-        _ => {
-            state.resync_reason = Some("unknown_core_change".to_string());
-            return true;
-        }
-    };
-    counters.entity_delivery_attempts = counters.entity_delivery_attempts.saturating_add(1);
-    match state.sender.try_send(frame) {
-        Ok(()) => {
-            counters.entity_delivery_successes =
-                counters.entity_delivery_successes.saturating_add(1);
-            state.cursor = Some(change.cursor.clone());
-            true
-        }
-        Err(EntityFrameTrySendError::Full) => {
-            counters.entity_delivery_overflows =
-                counters.entity_delivery_overflows.saturating_add(1);
-            state.resync_reason = Some("subscriber_overflow".to_string());
-            true
-        }
-        Err(EntityFrameTrySendError::Disconnected) => {
-            counters.entity_delivery_failures = counters.entity_delivery_failures.saturating_add(1);
-            false
-        }
-    }
-}
-
-fn try_resync_subscription(
-    subscription_id: &str,
-    state: &mut EntitySubscriptionState,
-    baseline: SessionLifecycleBaseline,
-    reason: String,
-    counters: &mut DaemonLifecycleCounters,
-) -> bool {
-    let cursor = baseline.cursor.clone();
-    let (entities, snapshot) = entity_snapshot(subscription_id, baseline, Some(reason));
-    match state.sender.try_send(snapshot) {
-        Ok(()) => {
-            counters.entity_delivery_attempts = counters.entity_delivery_attempts.saturating_add(1);
-            counters.entity_delivery_successes =
-                counters.entity_delivery_successes.saturating_add(1);
-            state.cursor = Some(cursor);
-            state.entities = entities;
-            state.resync_reason = None;
-            true
-        }
-        Err(EntityFrameTrySendError::Full) => {
-            counters.entity_delivery_attempts = counters.entity_delivery_attempts.saturating_add(1);
-            counters.entity_delivery_overflows =
-                counters.entity_delivery_overflows.saturating_add(1);
-            true
-        }
-        Err(EntityFrameTrySendError::Disconnected) => {
-            counters.entity_delivery_attempts = counters.entity_delivery_attempts.saturating_add(1);
-            counters.entity_delivery_failures = counters.entity_delivery_failures.saturating_add(1);
-            false
-        }
-    }
-}
-
-fn entity_snapshot(
-    subscription_id: &str,
-    baseline: SessionLifecycleBaseline,
-    resync_reason: Option<String>,
-) -> (BTreeMap<String, DaemonSessionEntity>, DaemonEntityFrame) {
-    let entities = baseline
-        .sessions
-        .iter()
-        .map(project_session_entity)
-        .map(|entity| (entity.session_uuid.clone(), entity))
-        .collect::<BTreeMap<_, _>>();
-    let frame = DaemonEntityFrame::Snapshot {
-        subscription_id: subscription_id.to_string(),
-        entity_type: "session".to_string(),
-        snapshot_seq: baseline.cursor.sequence,
-        items: entities
-            .values()
-            .map(|entity| serde_json::to_value(entity).expect("serialize session entity"))
-            .collect(),
-        resync_reason,
-    };
-    (entities, frame)
-}
-
-fn project_session_entity(record: &SessionLifecycleRecord) -> DaemonSessionEntity {
-    let (lifecycle, exit_code, failure_reason) = match &record.lifecycle {
-        Some(SessionLifecycleState::Starting) => (Some("starting".to_string()), None, None),
-        Some(SessionLifecycleState::Running) => (Some("running".to_string()), None, None),
-        Some(SessionLifecycleState::Stopping) => (Some("stopping".to_string()), None, None),
-        Some(SessionLifecycleState::Exited { code }) => (Some("exited".to_string()), *code, None),
-        Some(SessionLifecycleState::Failed { reason }) => {
-            (Some("failed".to_string()), None, Some(reason.clone()))
-        }
-        None => (None, None, None),
-    };
-    let lifecycle_class =
-        session_lifecycle_class(&record.session.registry_state, record.lifecycle.as_ref());
-    let metadata = &record.metadata.entries;
-    let traits = metadata
-        .get("botster.session_type.traits")
-        .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
-        .unwrap_or_default();
-    DaemonSessionEntity {
-        session_uuid: record.session.session_id.0.clone(),
-        registry_state: match record.session.registry_state {
-            RegistrySessionState::Running => "running",
-            RegistrySessionState::Stopping => "stopping",
-            RegistrySessionState::Exited => "exited",
-            RegistrySessionState::Stale => "stale",
-        }
-        .to_string(),
-        lifecycle,
-        lifecycle_class: lifecycle_class.to_string(),
-        rows: record.session.size.rows,
-        cols: record.session.size.cols,
-        updated_at: record.session.updated_at,
-        exit_code,
-        failure_reason,
-        session_type_id: metadata.get("botster.session_type.id").cloned(),
-        session_type_source: metadata.get("botster.session_type.source").cloned(),
-        role: metadata.get("botster.session_type.role").cloned(),
-        traits,
-        interaction: metadata.get("botster.session_type.interaction").cloned(),
-        session_type_lifecycle: metadata.get("botster.session_type.lifecycle").cloned(),
-    }
-}
-
-fn session_lifecycle_class(
-    registry_state: &RegistrySessionState,
-    lifecycle: Option<&SessionLifecycleState>,
-) -> &'static str {
-    if registry_state == &RegistrySessionState::Stale {
-        "indeterminate"
-    } else {
-        match lifecycle {
-            Some(
-                SessionLifecycleState::Starting
-                | SessionLifecycleState::Running
-                | SessionLifecycleState::Stopping,
-            ) => "current",
-            Some(SessionLifecycleState::Exited { .. } | SessionLifecycleState::Failed { .. }) => {
-                "ended"
-            }
-            None => "indeterminate",
-        }
-    }
-}
-
-fn session_entity_patch(previous: &DaemonSessionEntity, current: &DaemonSessionEntity) -> Value {
-    let previous = serde_json::to_value(previous).expect("serialize previous session entity");
-    let current = serde_json::to_value(current).expect("serialize current session entity");
-    let previous = previous.as_object().expect("session entity object");
-    let current = current.as_object().expect("session entity object");
-    Value::Object(
-        current
-            .iter()
-            .filter(|(key, value)| previous.get(*key) != Some(*value))
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect(),
-    )
-}
-
-fn entity_subscription_error(code: &str, subscription_id: &str, message: &str) -> DaemonResponse {
-    let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
-    response.error = Some(DaemonOperatorError {
-        code: code.to_string(),
-        request_id: subscription_id.to_string(),
-        operation: "subscribe_entities".to_string(),
-        message: message.to_string(),
-        diagnostics: vec![DaemonDiagnostic::action_failure(
-            "subscribe_entities",
-            message,
-        )],
-    });
-    response
-}
-
 fn daemon_response_base(kind: DaemonResponseKind) -> DaemonResponse {
     DaemonResponse {
         kind,
@@ -5772,6 +4022,8 @@ fn daemon_status(
         session_count,
         egress_diagnostics.clone(),
         lifecycle_counters,
+        software_identity(),
+        installation_identity(),
     ));
     response.diagnostics = vec![DaemonDiagnostic::connected("status")];
     response.diagnostics.append(&mut egress_diagnostics);
@@ -6489,7 +4741,7 @@ fn daemon_unknown_session_cleanup(session_id: &str) -> DaemonResponse {
     response
 }
 
-fn daemon_operator_error(error: crate::HubClientError) -> DaemonResponse {
+pub(super) fn daemon_operator_error(error: crate::HubClientError) -> DaemonResponse {
     let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
     response.error = Some(daemon_operator_error_from_client(error));
     if let Some(error) = &response.error {
@@ -7105,97 +5357,6 @@ fn installed_package_actions(package: &HubClientPackage) -> Vec<DaemonPackageAct
     actions
 }
 
-fn available_package_actions(
-    package: &AvailablePackage,
-    registry_path: Option<&PathBuf>,
-) -> Vec<DaemonPackageActionState> {
-    let mut actions = Vec::new();
-    let compatible = matches!(
-        package.compatibility.result,
-        PackageCompatibilityResult::Compatible
-    );
-    let install_blocked = !matches!(package.state, AvailablePackageState::Available) || !compatible;
-    if install_blocked {
-        let reason = if compatible {
-            "already_installed"
-        } else {
-            "botster_compatibility"
-        };
-        let diagnostics = package
-            .compatibility
-            .diagnostics
-            .iter()
-            .map(|message| DaemonPackageDiagnostic {
-                kind: "botster_compatibility".to_string(),
-                message: message.clone(),
-            })
-            .collect();
-        actions.push(blocked_action(
-            "install_package_registry_entry",
-            reason,
-            diagnostics,
-            Vec::new(),
-        ));
-    } else if let Some(registry_path) = registry_path {
-        actions.push(available_package_action(
-            "install_package_registry_entry",
-            Some(DaemonPackageActionRequest {
-                request_type: "install_package_registry_entry".to_string(),
-                pin: None,
-                package_name: Some(package.package_name.clone()),
-                entry_id: Some(package.entry_id.clone()),
-                entrypoint_id: None,
-                registry_path: Some(registry_path.to_string_lossy().to_string()),
-            }),
-        ));
-    } else {
-        actions.push(blocked_action(
-            "install_package_registry_entry",
-            "registry_path_required",
-            vec![DaemonPackageDiagnostic {
-                kind: "registry_path_required".to_string(),
-                message:
-                    "install request mapping requires the registry path used to list the package"
-                        .to_string(),
-            }],
-            vec![DaemonPackageActionRequiredReference {
-                kind: "registry".to_string(),
-                key: "registry_path".to_string(),
-            }],
-        ));
-    }
-
-    for action_id in [
-        "enable_package",
-        "disable_package",
-        "remove_package",
-        "start_package_entrypoint",
-        "stop_package_entrypoint",
-        "restart_package_entrypoint",
-        "check_package_update",
-        "preview_package_update",
-        "apply_package_update",
-        "set_package_configuration",
-    ] {
-        actions.push(unavailable_action(
-            action_id,
-            "install_required",
-            "install the package before running installed-package lifecycle actions",
-        ));
-    }
-    actions.push(unavailable_action(
-        "reload_package",
-        "unsupported",
-        "package reload is not supported by the hub daemon",
-    ));
-    actions.push(unavailable_action(
-        "restart_hub",
-        "unsupported",
-        "hub restart is not exposed as a package lifecycle action",
-    ));
-    actions
-}
-
 fn entrypoint_actions(
     package_name: &str,
     package_state: &str,
@@ -7365,94 +5526,6 @@ fn package_required_references(
         }
     }
     references
-}
-
-fn available_package_action(
-    action_id: &str,
-    request: Option<DaemonPackageActionRequest>,
-) -> DaemonPackageActionState {
-    DaemonPackageActionState {
-        action_id: action_id.to_string(),
-        status: DaemonPackageActionStatus::Available,
-        reason: None,
-        diagnostics: Vec::new(),
-        required_references: Vec::new(),
-        request,
-    }
-}
-
-fn blocked_action(
-    action_id: &str,
-    reason: &str,
-    diagnostics: Vec<DaemonPackageDiagnostic>,
-    required_references: Vec<DaemonPackageActionRequiredReference>,
-) -> DaemonPackageActionState {
-    DaemonPackageActionState {
-        action_id: action_id.to_string(),
-        status: DaemonPackageActionStatus::Blocked,
-        reason: Some(reason.to_string()),
-        diagnostics,
-        required_references,
-        request: None,
-    }
-}
-
-fn unavailable_action(action_id: &str, reason: &str, message: &str) -> DaemonPackageActionState {
-    DaemonPackageActionState {
-        action_id: action_id.to_string(),
-        status: DaemonPackageActionStatus::Unavailable,
-        reason: Some(reason.to_string()),
-        diagnostics: vec![DaemonPackageDiagnostic {
-            kind: reason.to_string(),
-            message: message.to_string(),
-        }],
-        required_references: Vec::new(),
-        request: None,
-    }
-}
-
-fn request_for_package(
-    request_type: &str,
-    package_name: &str,
-) -> Option<DaemonPackageActionRequest> {
-    Some(DaemonPackageActionRequest {
-        request_type: request_type.to_string(),
-        pin: None,
-        package_name: Some(package_name.to_string()),
-        entry_id: None,
-        entrypoint_id: None,
-        registry_path: None,
-    })
-}
-
-fn request_for_package_with_pin(
-    request_type: &str,
-    package_name: &str,
-    pin: Option<DaemonPackagePin>,
-) -> Option<DaemonPackageActionRequest> {
-    Some(DaemonPackageActionRequest {
-        request_type: request_type.to_string(),
-        pin,
-        package_name: Some(package_name.to_string()),
-        entry_id: None,
-        entrypoint_id: None,
-        registry_path: None,
-    })
-}
-
-fn request_for_entrypoint(
-    request_type: &str,
-    package_name: &str,
-    entrypoint_id: &str,
-) -> Option<DaemonPackageActionRequest> {
-    Some(DaemonPackageActionRequest {
-        request_type: request_type.to_string(),
-        pin: None,
-        package_name: Some(package_name.to_string()),
-        entry_id: None,
-        entrypoint_id: Some(entrypoint_id.to_string()),
-        registry_path: None,
-    })
 }
 
 fn daemon_package_pin_from_policy(pin: PackagePin) -> DaemonPackagePin {
@@ -7690,224 +5763,10 @@ fn daemon_plugin_worker_counters_from_client(
     }
 }
 
-fn daemon_status_from_status(
-    status: &HubDaemonStatus,
-    session_count: usize,
-    diagnostics: Vec<DaemonDiagnostic>,
-    lifecycle_counters: DaemonLifecycleCounters,
-) -> DaemonStatus {
-    DaemonStatus {
-        lifecycle_state: match status.lifecycle_state {
-            crate::HubDaemonState::Created => "created",
-            crate::HubDaemonState::Running => "running",
-            crate::HubDaemonState::Stopped => "stopped",
-        }
-        .to_string(),
-        compatibility: DaemonCompatibility::current(),
-        software: software_identity(),
-        installation: installation_identity(),
-        host_id: status.host_id.clone(),
-        host_display_name: status.host_display_name.clone(),
-        schema_version: status.schema_version,
-        data_dir_configured: status.data_dir_configured,
-        core_initialized: status.core_initialized,
-        state_source: match status.state_source {
-            HubStateLoadSource::Loaded => "loaded",
-            HubStateLoadSource::Initialized => "initialized",
-        }
-        .to_string(),
-        package_count: status.package_count,
-        enabled_package_count: status.enabled_package_count,
-        provider_count: status.provider_count,
-        enabled_provider_count: status.enabled_provider_count,
-        session_count,
-        recovered_sessions: status
-            .recovered_sessions
-            .iter()
-            .map(|session_id| session_id.0.clone())
-            .collect(),
-        stale_sessions: status
-            .stale_sessions
-            .iter()
-            .map(|session_id| session_id.0.clone())
-            .collect(),
-        lifecycle_counters,
-        diagnostics,
-    }
-}
-
 fn daemon_session_from_client(session: HubClientSession) -> DaemonSession {
     DaemonSession {
         session_id: session.session_id.0,
         lifecycle: lifecycle_label(&session.lifecycle).to_string(),
-    }
-}
-
-fn daemon_operator_error_from_client(error: crate::HubClientError) -> DaemonOperatorError {
-    match error {
-        crate::HubClientError::InvalidRequest {
-            request_id,
-            operation,
-            message,
-        } => DaemonOperatorError {
-            code: "invalid_request".to_string(),
-            request_id: request_id.0,
-            operation: operation_label(operation).to_string(),
-            diagnostics: vec![DaemonDiagnostic::action_failure(
-                operation_label(operation),
-                &message,
-            )],
-            message,
-        },
-        crate::HubClientError::AdmissionDenied {
-            request_id,
-            operation,
-            role,
-        } => DaemonOperatorError {
-            code: "admission_denied".to_string(),
-            request_id: request_id.0,
-            operation: operation_label(operation).to_string(),
-            message: format!("{role:?} is not allowed to run {operation:?}"),
-            diagnostics: Vec::new(),
-        },
-        crate::HubClientError::Runtime {
-            request_id,
-            operation,
-            kind,
-        } => {
-            let operation_label = operation_label(operation).to_string();
-            let message = runtime_error_message(operation, kind);
-            DaemonOperatorError {
-                code: runtime_error_code(operation, kind).to_string(),
-                request_id: request_id.0,
-                diagnostics: runtime_error_diagnostics(operation, kind, &message),
-                operation: operation_label,
-                message,
-            }
-        }
-        crate::HubClientError::PackageCapabilityDenied {
-            request_id,
-            operation,
-            package_name,
-        } => DaemonOperatorError {
-            code: "package_capability_denied".to_string(),
-            request_id: request_id.0,
-            operation: operation_label(operation).to_string(),
-            message: format!("{package_name} is not allowed to run {operation:?}"),
-            diagnostics: Vec::new(),
-        },
-        crate::HubClientError::SessionType {
-            request_id,
-            operation,
-            kind,
-            message,
-        } => DaemonOperatorError {
-            code: kind.to_string(),
-            request_id: request_id.0,
-            operation: operation_label(operation).to_string(),
-            message,
-            diagnostics: Vec::new(),
-        },
-        crate::HubClientError::Plugin {
-            request_id,
-            operation,
-            code,
-            message,
-        } => DaemonOperatorError {
-            diagnostics: plugin_error_diagnostics(operation, &code, &message),
-            code,
-            request_id: request_id.0,
-            operation: operation_label(operation).to_string(),
-            message,
-        },
-    }
-}
-
-fn plugin_error_diagnostics(
-    operation: crate::HubClientOperation,
-    code: &str,
-    message: &str,
-) -> Vec<DaemonDiagnostic> {
-    if matches!(
-        code,
-        "undeclared_plugin_surface" | "unsupported_plugin_surface_operation"
-    ) {
-        let feature = match operation {
-            crate::HubClientOperation::PluginSurfaceRender => FEATURE_PLUGIN_SURFACE_RENDER,
-            crate::HubClientOperation::PluginSurfaceAction => FEATURE_PLUGIN_SURFACE_ACTION,
-            _ => return Vec::new(),
-        };
-        return vec![DaemonDiagnostic {
-            kind: botster_hub_client::DaemonDiagnosticKind::UnsupportedFeature,
-            operation: Some(operation_label(operation).to_string()),
-            feature: Some(feature.to_string()),
-            message: Some(message.to_string()),
-        }];
-    }
-    if operation == crate::HubClientOperation::PluginSurfaceRender && code == "invalid_surface" {
-        return vec![DaemonDiagnostic::action_failure(
-            operation_label(operation),
-            message.to_string(),
-        )];
-    }
-
-    Vec::new()
-}
-
-fn daemon_operator_error_from_package(error: crate::PackageRegistryError) -> DaemonOperatorError {
-    let package_name = package_error_display_name(&error);
-    let operation = package_action_label(error.action).to_string();
-    let diagnostics = package_registry_error_diagnostics(&error, &operation);
-    DaemonOperatorError {
-        code: "package_policy_error".to_string(),
-        request_id: "daemon-package-mutation".to_string(),
-        operation: operation.clone(),
-        message: format!(
-            "package {} denied for {}: {:?}",
-            package_name, operation, error.reason
-        ),
-        diagnostics,
-    }
-}
-
-fn package_registry_error_diagnostics(
-    error: &crate::PackageRegistryError,
-    operation: &str,
-) -> Vec<DaemonDiagnostic> {
-    match &error.reason {
-        PackageAdmissionReason::InvalidConfiguration(diagnostics) => diagnostics
-            .iter()
-            .map(|diagnostic| DaemonDiagnostic {
-                kind: botster_hub_client::DaemonDiagnosticKind::ActionFailure,
-                operation: Some(operation.to_string()),
-                feature: Some("package_registry".to_string()),
-                message: Some(diagnostic.message.clone()),
-            })
-            .collect(),
-        PackageAdmissionReason::MissingRequiredConfiguration(fields) => fields
-            .iter()
-            .map(|field| DaemonDiagnostic {
-                kind: botster_hub_client::DaemonDiagnosticKind::ActionFailure,
-                operation: Some(operation.to_string()),
-                feature: Some("package_registry".to_string()),
-                message: Some(format!("required configuration field {field} is missing")),
-            })
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-fn package_error_display_name(error: &crate::PackageRegistryError) -> &str {
-    if error
-        .audit_reason
-        .contains("refresh local package registrations")
-    {
-        return &error.package_name;
-    }
-    match error.reason {
-        PackageAdmissionReason::InvalidLocalManifest(_)
-        | PackageAdmissionReason::UnsafeLocalPath(_) => "<local-package>",
-        _ => &error.package_name,
     }
 }
 
@@ -8116,167 +5975,6 @@ fn shutdown_error_is_unknown_session(error: &crate::HubClientError) -> bool {
     )
 }
 
-fn runtime_error_code(
-    operation: crate::HubClientOperation,
-    kind: crate::HubClientRuntimeErrorKind,
-) -> &'static str {
-    match (operation, kind) {
-        (_, crate::HubClientRuntimeErrorKind::UnknownSession) => "unknown_session",
-        (_, crate::HubClientRuntimeErrorKind::SessionAlreadyExists) => "session_already_exists",
-        (_, crate::HubClientRuntimeErrorKind::SpawnFailed)
-        | (
-            crate::HubClientOperation::Spawn | crate::HubClientOperation::SpawnSessionType,
-            crate::HubClientRuntimeErrorKind::Runtime,
-        ) => "spawn_failed",
-        (_, crate::HubClientRuntimeErrorKind::ModeReadFailed) => "mode_read_failed",
-        (_, crate::HubClientRuntimeErrorKind::Runtime) => "runtime_error",
-        (_, crate::HubClientRuntimeErrorKind::State) => "state_error",
-    }
-}
-
-fn runtime_error_message(
-    operation: crate::HubClientOperation,
-    kind: crate::HubClientRuntimeErrorKind,
-) -> String {
-    match (operation, kind) {
-        (crate::HubClientOperation::Spawn, crate::HubClientRuntimeErrorKind::SessionAlreadyExists) => {
-            "spawn rejected because a session with that id already exists".to_string()
-        }
-        (crate::HubClientOperation::Spawn, crate::HubClientRuntimeErrorKind::SpawnFailed)
-        | (crate::HubClientOperation::Spawn, crate::HubClientRuntimeErrorKind::Runtime) => {
-            "spawn failed before the session started; verify the configured session worker and command"
-                .to_string()
-        }
-        (
-            crate::HubClientOperation::SpawnSessionType,
-            crate::HubClientRuntimeErrorKind::SessionAlreadyExists,
-        ) => "session type spawn rejected because a session with that id already exists".to_string(),
-        (
-            crate::HubClientOperation::SpawnSessionType,
-            crate::HubClientRuntimeErrorKind::SpawnFailed
-            | crate::HubClientRuntimeErrorKind::Runtime,
-        ) => "session type spawn failed before the session started; verify the configured session worker and session type command"
-            .to_string(),
-        (crate::HubClientOperation::ReadModeFlags, crate::HubClientRuntimeErrorKind::ModeReadFailed) => {
-            "session worker failed the authoritative mode read; replace or terminate the incompatible worker"
-                .to_string()
-        }
-        _ => format!("runtime failed while handling {operation:?}: {kind:?}"),
-    }
-}
-
-fn runtime_error_diagnostics(
-    operation: crate::HubClientOperation,
-    kind: crate::HubClientRuntimeErrorKind,
-    message: &str,
-) -> Vec<DaemonDiagnostic> {
-    if matches!(
-        operation,
-        crate::HubClientOperation::Spawn | crate::HubClientOperation::SpawnSessionType
-    ) {
-        match kind {
-            crate::HubClientRuntimeErrorKind::SessionAlreadyExists => {
-                let message = if operation == crate::HubClientOperation::SpawnSessionType {
-                    "session type spawn rejected because a session with that id already exists"
-                } else {
-                    "spawn rejected because a session with that id already exists"
-                };
-                return vec![DaemonDiagnostic::action_failure(
-                    operation_label(operation),
-                    message,
-                )];
-            }
-            crate::HubClientRuntimeErrorKind::SpawnFailed => {
-                let message = if operation == crate::HubClientOperation::SpawnSessionType {
-                    "session type spawn failed before the session started; verify the configured session worker and session type command"
-                } else {
-                    "spawn failed before the session started; verify the configured session worker and command"
-                };
-                return vec![DaemonDiagnostic::action_failure(
-                    operation_label(operation),
-                    message,
-                )];
-            }
-            crate::HubClientRuntimeErrorKind::Runtime => {
-                let message = if operation == crate::HubClientOperation::SpawnSessionType {
-                    "session type spawn failed before the session started; verify the configured session worker and session type command"
-                } else {
-                    "spawn failed before the session started; verify the configured session worker and command"
-                };
-                return vec![DaemonDiagnostic::action_failure(
-                    operation_label(operation),
-                    message,
-                )];
-            }
-            _ => {}
-        }
-    }
-
-    if kind == crate::HubClientRuntimeErrorKind::UnknownSession
-        && matches!(
-            operation,
-            crate::HubClientOperation::Attach | crate::HubClientOperation::DrainRuntime
-        )
-    {
-        return vec![DaemonDiagnostic::terminal_stream_unavailable(
-            operation_label(operation),
-            message,
-        )];
-    }
-
-    if kind == crate::HubClientRuntimeErrorKind::ModeReadFailed
-        && operation == crate::HubClientOperation::ReadModeFlags
-    {
-        return vec![DaemonDiagnostic::worker_compatibility(
-            operation_label(operation),
-            message,
-        )];
-    }
-
-    Vec::new()
-}
-
-fn operation_label(operation: crate::HubClientOperation) -> &'static str {
-    match operation {
-        crate::HubClientOperation::Status => "status",
-        crate::HubClientOperation::ListSessions => "list_sessions",
-        crate::HubClientOperation::SubscribeEntities => "subscribe_entities",
-        crate::HubClientOperation::UnsubscribeEntities => "unsubscribe_entities",
-        crate::HubClientOperation::RemoveSession => "remove_session",
-        crate::HubClientOperation::Spawn => "spawn",
-        crate::HubClientOperation::Attach => "attach",
-        crate::HubClientOperation::Detach => "detach",
-        crate::HubClientOperation::Input => "input",
-        crate::HubClientOperation::ModeGatedInput => "mode_gated_input",
-        crate::HubClientOperation::Resize => "resize",
-        crate::HubClientOperation::DrainRuntime => "drain_runtime",
-        crate::HubClientOperation::Shutdown => "shutdown",
-        crate::HubClientOperation::GuardedNotificationWrite => "guarded_notification_write",
-        crate::HubClientOperation::NotifySession => "notify_session",
-        crate::HubClientOperation::PublishRoutedEnvelope => "publish_routed_envelope",
-        crate::HubClientOperation::DrainRoutedEnvelopes => "drain_routed_envelopes",
-        crate::HubClientOperation::AcknowledgeRoutedEnvelope => "acknowledge_routed_envelope",
-        crate::HubClientOperation::ReadScreen => "read_screen",
-        crate::HubClientOperation::ReadModeFlags => "read_mode_flags",
-        crate::HubClientOperation::CaptureSnapshot => "capture_snapshot",
-        crate::HubClientOperation::ListPackages => "list_packages",
-        crate::HubClientOperation::ListPackageNavigation => "list_package_navigation",
-        crate::HubClientOperation::ListSessionTypes => "list_session_types",
-        crate::HubClientOperation::ListSessionTypesForTarget => "list_session_types_for_target",
-        crate::HubClientOperation::ShowSessionType => "show_session_type",
-        crate::HubClientOperation::ShowSessionTypeDefinition => "show_session_type_definition",
-        crate::HubClientOperation::CreateSessionType => "create_session_type",
-        crate::HubClientOperation::UpdateSessionType => "update_session_type",
-        crate::HubClientOperation::DeleteSessionType => "delete_session_type",
-        crate::HubClientOperation::ResolveSessionType => "resolve_session_type",
-        crate::HubClientOperation::SpawnSessionType => "spawn_session_type",
-        crate::HubClientOperation::ReadSessionContext => "read_session_context",
-        crate::HubClientOperation::PluginLifecycleStatus => "plugin_lifecycle_status",
-        crate::HubClientOperation::PluginSurfaceRender => "plugin_surface_render",
-        crate::HubClientOperation::PluginSurfaceAction => "plugin_surface_action",
-    }
-}
-
 fn envelope_target_label(target: &EnvelopeTarget) -> String {
     match target {
         EnvelopeTarget::Endpoint { endpoint_id } => format!("endpoint:{}", endpoint_id.0),
@@ -8296,37 +5994,6 @@ fn package_classification_label(classification: HubClientPackageClassification) 
     match classification {
         HubClientPackageClassification::Plugin => "plugin",
         HubClientPackageClassification::Provider => "provider",
-    }
-}
-
-fn package_state_label(state: crate::HubClientPackageState) -> &'static str {
-    match state {
-        crate::HubClientPackageState::Installed => "installed",
-        crate::HubClientPackageState::Enabled => "enabled",
-        crate::HubClientPackageState::Disabled => "disabled",
-    }
-}
-
-fn runnable_entrypoint_kind_label(kind: &RunnableEntrypointKind) -> &'static str {
-    match kind {
-        RunnableEntrypointKind::WebApp => "web_app",
-        RunnableEntrypointKind::TerminalApp => "terminal_app",
-    }
-}
-
-fn runnable_launch_mode_label(mode: &RunnableEntrypointLaunchMode) -> &'static str {
-    match mode {
-        RunnableEntrypointLaunchMode::Background => "background",
-        RunnableEntrypointLaunchMode::ForegroundStdio => "foreground_stdio",
-    }
-}
-
-fn runnable_process_state_label(state: &RunnableEntrypointProcessState) -> &'static str {
-    match state {
-        RunnableEntrypointProcessState::NotStarted => "not_started",
-        RunnableEntrypointProcessState::Running => "running",
-        RunnableEntrypointProcessState::Exited => "exited",
-        RunnableEntrypointProcessState::Failed => "failed",
     }
 }
 
@@ -8369,23 +6036,6 @@ fn guarded_write_delivery_state_label(state: GuardedWriteDeliveryState) -> &'sta
         GuardedWriteDeliveryState::Written => "written",
         GuardedWriteDeliveryState::Delivered => "delivered",
         GuardedWriteDeliveryState::Acknowledged => "acknowledged",
-    }
-}
-
-fn package_action_label(action: PackageAction) -> &'static str {
-    match action {
-        PackageAction::Install => "install",
-        PackageAction::Show => "show",
-        PackageAction::Configure => "configure",
-        PackageAction::Reload => "reload",
-        PackageAction::Enable => "enable",
-        PackageAction::Disable => "disable",
-        PackageAction::Remove => "remove",
-        PackageAction::CheckUpdate => "check_update",
-        PackageAction::PreviewUpdate => "preview_update",
-        PackageAction::ApplyUpdate => "apply_update",
-        PackageAction::Pin => "pin",
-        PackageAction::Prepare => "prepare",
     }
 }
 
@@ -8621,6 +6271,7 @@ fn handle_connection(stream: UnixStream, control_tx: ControlSender) -> DaemonTra
                     reply_tx,
                     response_delivery_rx: None,
                     grant_id: None,
+                    client_id: Some(cleanup.client_id.clone()),
                 })
                 .is_ok()
             {
@@ -8635,186 +6286,6 @@ fn handle_connection(stream: UnixStream, control_tx: ControlSender) -> DaemonTra
 mod tests {
     use super::*;
     use std::net::Shutdown;
-
-    #[test]
-    fn session_lifecycle_class_is_total_and_stale_first() {
-        let concrete = [
-            (SessionLifecycleState::Starting, "current"),
-            (SessionLifecycleState::Running, "current"),
-            (SessionLifecycleState::Stopping, "current"),
-            (SessionLifecycleState::Exited { code: Some(0) }, "ended"),
-            (
-                SessionLifecycleState::Failed {
-                    reason: "failed".to_string(),
-                },
-                "ended",
-            ),
-        ];
-        for (lifecycle, expected) in &concrete {
-            assert_eq!(
-                session_lifecycle_class(&RegistrySessionState::Running, Some(lifecycle)),
-                *expected
-            );
-            assert_eq!(
-                session_lifecycle_class(&RegistrySessionState::Stale, Some(lifecycle)),
-                "indeterminate"
-            );
-        }
-        assert_eq!(
-            session_lifecycle_class(&RegistrySessionState::Running, None),
-            "indeterminate"
-        );
-        assert_eq!(
-            session_lifecycle_class(&RegistrySessionState::Stale, None),
-            "indeterminate"
-        );
-    }
-
-    #[test]
-    fn session_entity_patch_explicitly_updates_required_lifecycle_class() {
-        let entity = |registry_state: &str, lifecycle: Option<&str>, lifecycle_class: &str| {
-            DaemonSessionEntity {
-                session_uuid: "session-1".to_string(),
-                registry_state: registry_state.to_string(),
-                lifecycle: lifecycle.map(str::to_string),
-                lifecycle_class: lifecycle_class.to_string(),
-                rows: 24,
-                cols: 80,
-                updated_at: 1,
-                exit_code: None,
-                failure_reason: None,
-                session_type_id: None,
-                session_type_source: None,
-                role: None,
-                traits: Vec::new(),
-                interaction: None,
-                session_type_lifecycle: None,
-            }
-        };
-        let current = entity("running", Some("running"), "current");
-        let ended = entity("exited", Some("exited"), "ended");
-        let no_lifecycle = entity("running", None, "indeterminate");
-        let stale = entity("stale", Some("running"), "indeterminate");
-
-        assert_eq!(
-            session_entity_patch(&current, &ended)["lifecycle_class"],
-            "ended"
-        );
-        assert_eq!(
-            session_entity_patch(&current, &no_lifecycle)["lifecycle_class"],
-            "indeterminate"
-        );
-        assert_eq!(
-            session_entity_patch(&current, &stale)["lifecycle_class"],
-            "indeterminate"
-        );
-    }
-
-    #[test]
-    fn live_session_entity_subscription_emits_exact_stale_transition_patch() {
-        let data_directory = std::env::temp_dir().join(format!(
-            "botster-hub-stale-transition-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock after epoch")
-                .as_nanos()
-        ));
-        let config = crate::HubStartupOptions {
-            host: crate::HostIdentityOptions {
-                id: "stale-transition-test".to_string(),
-                display_name: "Stale Transition Test".to_string(),
-                fingerprint: None,
-            },
-            data_directory: crate::DataDirectoryOption::Explicit(data_directory.clone()),
-            session_defaults: crate::SessionDefaults {
-                shell: "/bin/sh".to_string(),
-                working_directory: Some(".".into()),
-                initial_rows: 24,
-                initial_cols: 80,
-            },
-            transports: crate::TransportBindings::default(),
-            ..crate::HubStartupOptions::default()
-        }
-        .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
-        .expect("build stale transition config");
-        let mut daemon = HubDaemon::start(config).expect("start stale transition daemon");
-        let session_id = SessionId("stale-transition-session".to_string());
-        daemon
-            .runtime_mut()
-            .expect("runtime initialized")
-            .spawn_session(
-                botster_core::SessionSpawnRequest {
-                    request_id: RequestId("stale-transition-spawn".to_string()),
-                    session_id: session_id.clone(),
-                    executable: "/bin/sh".to_string(),
-                    arguments: vec![
-                        "-c".to_string(),
-                        "while IFS= read -r line; do printf '%s\\n' \"$line\"; done".to_string(),
-                    ],
-                    working_directory: botster_core::SpawnWorkingDirectory {
-                        path: ".".to_string(),
-                    },
-                    environment: botster_core::SpawnEnvironment::default(),
-                    initial_pty_size: Some(botster_core::ResizePayload { rows: 24, cols: 80 }),
-                },
-                botster_core::CoreSessionMetadata::new(),
-                1,
-            )
-            .expect("spawn worker-backed session");
-
-        let mut state = DaemonControlState::default();
-        seed_lifecycle_reconciliation(&mut daemon, &mut state);
-        let (sender, receiver) = mpsc::sync_channel(4);
-        let response = register_entity_subscription(
-            &mut daemon,
-            &mut state,
-            "session".to_string(),
-            "stale-transition-subscription".to_string(),
-            EntityFrameSender::Blocking(sender),
-            None,
-        )
-        .expect("register entity subscription");
-        assert_eq!(response.kind, DaemonResponseKind::EntitySubscribed);
-        assert!(matches!(
-            receiver.recv().expect("initial current snapshot"),
-            DaemonEntityFrame::Snapshot { ref items, .. }
-                if items.iter().any(|entity| {
-                    entity.get("session_uuid").and_then(Value::as_str) == Some(&session_id.0)
-                        && entity.get("registry_state").and_then(Value::as_str) == Some("running")
-                        && entity.get("lifecycle").and_then(Value::as_str) == Some("running")
-                        && entity.get("lifecycle_class").and_then(Value::as_str) == Some("current")
-                })
-        ));
-
-        daemon
-            .runtime()
-            .expect("runtime initialized")
-            .mark_session_stale(&session_id, 2)
-            .expect("mark live session stale through core daemon");
-        drive_entity_subscriptions(&mut daemon, &mut state);
-        assert!(matches!(
-            receiver.recv().expect("stale transition patch"),
-            DaemonEntityFrame::Patch {
-                ref id,
-                ref patch,
-                ..
-            } if id == &session_id.0
-                && patch == &serde_json::json!({
-                    "registry_state": "stale",
-                    "lifecycle_class": "indeterminate",
-                    "updated_at": 2
-                })
-        ));
-
-        daemon
-            .runtime_mut()
-            .expect("runtime initialized")
-            .shutdown_session(session_id, 3)
-            .expect("stop worker-backed test session");
-        daemon.stop();
-        let _ = fs::remove_dir_all(data_directory);
-    }
 
     #[test]
     fn due_reconciliation_precedes_an_already_ready_control_message() {
@@ -9159,6 +6630,7 @@ mod tests {
             reply_tx,
             response_delivery_rx,
             grant_id,
+            ..
         } = receive_test_control_message(&mut control_rx)
         else {
             panic!("expected shutdown control request");
@@ -9191,223 +6663,5 @@ mod tests {
                 .recv_timeout(Duration::from_secs(1))
                 .expect("failed response delivery releases daemon stop")
         );
-    }
-
-    #[test]
-    fn entity_overflow_requires_empty_snapshot_resync_and_failed_delivery_disconnects() {
-        let fixture =
-            botster_hub_test_support::session_lifecycle_subscription_conformance_scenario();
-        let overflow_reason = fixture.overflow.resync_reason.clone();
-        assert!(fixture.overflow.empty_snapshot_valid);
-        assert!(fixture.overflow.snapshot_precedes_later_deltas);
-        assert!(
-            fixture
-                .overflow
-                .failed_snapshot_delivery_closes_subscription
-        );
-        let cursor = SessionLifecycleCursor {
-            source_id: botster_core_daemon::SessionLifecycleSourceId("source".to_string()),
-            sequence: 9,
-        };
-        let baseline = || SessionLifecycleBaseline {
-            cursor: cursor.clone(),
-            sessions: Vec::new(),
-        };
-        let (sender, receiver) = mpsc::sync_channel(1);
-        sender
-            .try_send(DaemonEntityFrame::Snapshot {
-                subscription_id: "subscription".to_string(),
-                entity_type: "session".to_string(),
-                snapshot_seq: 8,
-                items: Vec::new(),
-                resync_reason: None,
-            })
-            .expect("fill bounded subscriber queue");
-        let mut state = EntitySubscriptionState {
-            sender: EntityFrameSender::Blocking(sender),
-            entity_type: "session".to_string(),
-            cursor: Some(SessionLifecycleCursor {
-                source_id: botster_core_daemon::SessionLifecycleSourceId("source".to_string()),
-                sequence: 8,
-            }),
-            entities: BTreeMap::new(),
-            definition_generation: 0,
-            definition_entities: BTreeMap::new(),
-            resync_reason: Some(overflow_reason.clone()),
-            owner_grant_id: None,
-            package_last_applied_seq: None,
-            package_catching_up: false,
-        };
-        let mut counters = DaemonLifecycleCounters::default();
-
-        assert!(try_resync_subscription(
-            "subscription",
-            &mut state,
-            baseline(),
-            overflow_reason.clone(),
-            &mut counters,
-        ));
-        assert_eq!(
-            state.resync_reason.as_deref(),
-            Some(overflow_reason.as_str())
-        );
-        let _ = receiver.recv().expect("drain stale queued frame");
-        assert!(try_resync_subscription(
-            "subscription",
-            &mut state,
-            baseline(),
-            overflow_reason.clone(),
-            &mut counters,
-        ));
-        assert!(state.resync_reason.is_none());
-        assert!(matches!(
-            receiver.recv().expect("receive empty resync snapshot"),
-            DaemonEntityFrame::Snapshot {
-                snapshot_seq: 9,
-                ref items,
-                resync_reason: Some(ref reason),
-                ..
-            } if items.is_empty() && reason == &overflow_reason
-        ));
-
-        drop(receiver);
-        state.resync_reason = Some(overflow_reason.clone());
-        assert!(!try_resync_subscription(
-            "subscription",
-            &mut state,
-            baseline(),
-            overflow_reason,
-            &mut counters,
-        ));
-        assert_eq!(counters.entity_delivery_attempts, 3);
-        assert_eq!(counters.entity_delivery_successes, 1);
-        assert_eq!(counters.entity_delivery_overflows, 1);
-        assert_eq!(counters.entity_delivery_failures, 1);
-    }
-
-    #[test]
-    fn session_type_resync_replaces_oversized_snapshot_with_typed_error() {
-        let (sender, receiver) = mpsc::sync_channel(1);
-        let mut subscriptions = BTreeMap::from([(
-            "oversized-session-types".to_string(),
-            EntitySubscriptionState {
-                sender: EntityFrameSender::Blocking(sender),
-                entity_type: "session_type".to_string(),
-                cursor: None,
-                entities: BTreeMap::new(),
-                definition_generation: 1,
-                definition_entities: BTreeMap::new(),
-                resync_reason: Some("subscriber_overflow".to_string()),
-                owner_grant_id: None,
-                package_last_applied_seq: None,
-                package_catching_up: false,
-            },
-        )]);
-        let entities = BTreeMap::from([(
-            "device/oversized".to_string(),
-            serde_json::json!({ "description": "x".repeat(DAEMON_MAX_FRAME_BYTES) }),
-        )]);
-
-        drive_session_type_subscriptions(&mut subscriptions, 2, &entities);
-
-        assert!(
-            subscriptions.is_empty(),
-            "typed error closes the subscription"
-        );
-        assert!(matches!(
-            receiver.recv().expect("receive bounded typed error"),
-            DaemonEntityFrame::Error {
-                ref subscription_id,
-                ref entity_type,
-                ref code,
-                ..
-            } if subscription_id == "oversized-session-types"
-                && entity_type == "session_type"
-                && code == "entity_provider_frame_too_large"
-        ));
-    }
-
-    #[test]
-    fn async_entity_overflow_requires_empty_snapshot_resync_and_closed_delivery_disconnects() {
-        let overflow_reason = "subscriber_overflow".to_string();
-        let cursor = SessionLifecycleCursor {
-            source_id: botster_core_daemon::SessionLifecycleSourceId("source".to_string()),
-            sequence: 9,
-        };
-        let baseline = || SessionLifecycleBaseline {
-            cursor: cursor.clone(),
-            sessions: Vec::new(),
-        };
-        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
-        sender
-            .try_send(DaemonEntityFrame::Snapshot {
-                subscription_id: "async-subscription".to_string(),
-                entity_type: "session".to_string(),
-                snapshot_seq: 8,
-                items: Vec::new(),
-                resync_reason: None,
-            })
-            .expect("fill bounded async subscriber queue");
-        let mut state = EntitySubscriptionState {
-            sender: EntityFrameSender::Async(sender),
-            entity_type: "session".to_string(),
-            cursor: Some(SessionLifecycleCursor {
-                source_id: botster_core_daemon::SessionLifecycleSourceId("source".to_string()),
-                sequence: 8,
-            }),
-            entities: BTreeMap::new(),
-            definition_generation: 0,
-            definition_entities: BTreeMap::new(),
-            resync_reason: Some(overflow_reason.clone()),
-            owner_grant_id: None,
-            package_last_applied_seq: None,
-            package_catching_up: false,
-        };
-        let mut counters = DaemonLifecycleCounters::default();
-
-        assert!(try_resync_subscription(
-            "async-subscription",
-            &mut state,
-            baseline(),
-            overflow_reason.clone(),
-            &mut counters,
-        ));
-        assert_eq!(
-            state.resync_reason.as_deref(),
-            Some(overflow_reason.as_str()),
-            "a full production WebRTC queue must retain its pending resync"
-        );
-        let _ = receiver.try_recv().expect("drain stale async frame");
-        assert!(try_resync_subscription(
-            "async-subscription",
-            &mut state,
-            baseline(),
-            overflow_reason.clone(),
-            &mut counters,
-        ));
-        assert!(state.resync_reason.is_none());
-        assert!(matches!(
-            receiver.try_recv().expect("receive async resync snapshot"),
-            DaemonEntityFrame::Snapshot {
-                snapshot_seq: 9,
-                ref items,
-                resync_reason: Some(ref reason),
-                ..
-            } if items.is_empty() && reason == &overflow_reason
-        ));
-
-        drop(receiver);
-        state.resync_reason = Some(overflow_reason.clone());
-        assert!(!try_resync_subscription(
-            "async-subscription",
-            &mut state,
-            baseline(),
-            overflow_reason,
-            &mut counters,
-        ));
-        assert_eq!(counters.entity_delivery_attempts, 3);
-        assert_eq!(counters.entity_delivery_successes, 1);
-        assert_eq!(counters.entity_delivery_overflows, 1);
-        assert_eq!(counters.entity_delivery_failures, 1);
     }
 }

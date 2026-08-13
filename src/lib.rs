@@ -27,7 +27,19 @@
 //!     policy.registry().granted_capabilities().len(),
 //!     profile.default_capability_grants().len()
 //! );
+//!
+//! let summary = botster_hub::architecture_summary();
+//! assert!(summary.crate_exports().iter().any(|export| {
+//!     export.name() == "daemon_transport Daemon* DTO re-exports"
+//!         && export.class() == botster_hub::HubCrateExportClass::ClientContract
+//!         && export.stability() == botster_hub::HubCrateExportStability::KeepPublic
+//! }));
 //! ```
+//!
+//! Crate-root module visibility is unchanged. [`architecture_summary`] classifies
+//! Hub policy exports, `botster-hub-client` contract re-exports, and internal
+//! modules. A later dedicated API change may hide `FutureInternal` modules.
+//! `AlreadyInternal` marks modules that are already crate-private.
 
 pub mod auth;
 pub mod capabilities;
@@ -35,6 +47,7 @@ pub mod client_api;
 pub mod config;
 pub mod credentials;
 pub mod daemon;
+mod daemon_projection;
 pub mod daemon_transport;
 pub mod entrypoint_supervisor;
 pub mod lifecycle;
@@ -190,6 +203,7 @@ pub use worktrees::{
 pub struct ArchitectureSummary {
     profile: &'static HostProfileManifest,
     facade_decisions: &'static [HubFacadeDecision],
+    crate_exports: &'static [HubCrateExport],
 }
 
 impl ArchitectureSummary {
@@ -215,6 +229,12 @@ impl ArchitectureSummary {
     #[must_use]
     pub const fn facade_decisions(&self) -> &'static [HubFacadeDecision] {
         self.facade_decisions
+    }
+
+    /// Crate-root export classification. Visibility is unchanged by this audit.
+    #[must_use]
+    pub const fn crate_exports(&self) -> &'static [HubCrateExport] {
+        self.crate_exports
     }
 }
 
@@ -263,6 +283,79 @@ impl HubFacadeDecision {
     }
 
     /// Short reason for the hub facade decision.
+    #[must_use]
+    pub const fn reason(&self) -> &'static str {
+        self.reason
+    }
+}
+
+/// Where a crate-root export belongs after a dedicated visibility change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HubCrateExportClass {
+    /// Host-profile policy. Stays public on `botster-hub`.
+    HubPolicy,
+    /// Wire or protocol surface already owned by `botster-hub-client`.
+    ClientContract,
+    /// Implementation module. Current visibility stays until a dedicated API change.
+    Internal,
+    /// Core type re-exported because host-profile surfaces name it.
+    CoreReexport,
+}
+
+/// Current stability of a crate-root export. This audit does not change visibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HubCrateExportStability {
+    /// Keep the current public export.
+    KeepPublic,
+    /// Future dedicated visibility change may hide this. Not changed here.
+    FutureInternal,
+    /// Already crate-private. This audit does not change that.
+    AlreadyInternal,
+}
+
+/// One audited crate-root module or re-export group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HubCrateExport {
+    name: &'static str,
+    class: HubCrateExportClass,
+    stability: HubCrateExportStability,
+    reason: &'static str,
+}
+
+impl HubCrateExport {
+    const fn new(
+        name: &'static str,
+        class: HubCrateExportClass,
+        stability: HubCrateExportStability,
+        reason: &'static str,
+    ) -> Self {
+        Self {
+            name,
+            class,
+            stability,
+            reason,
+        }
+    }
+
+    /// Crate-root module or re-export group name.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// Ownership class for a later dedicated API change.
+    #[must_use]
+    pub const fn class(&self) -> HubCrateExportClass {
+        self.class
+    }
+
+    /// Current stability. `FutureInternal` rows stay public; `AlreadyInternal` is private.
+    #[must_use]
+    pub const fn stability(&self) -> HubCrateExportStability {
+        self.stability
+    }
+
+    /// Short reason for the classification.
     #[must_use]
     pub const fn reason(&self) -> &'static str {
         self.reason
@@ -367,12 +460,196 @@ const HUB_FACADE_DECISIONS: &[HubFacadeDecision] = &[
     ),
 ];
 
+const HUB_CRATE_EXPORTS: &[HubCrateExport] = &[
+    HubCrateExport::new(
+        "auth",
+        HubCrateExportClass::HubPolicy,
+        HubCrateExportStability::KeepPublic,
+        "host admission and identity policy",
+    ),
+    HubCrateExport::new(
+        "capabilities",
+        HubCrateExportClass::HubPolicy,
+        HubCrateExportStability::KeepPublic,
+        "capability grant policy",
+    ),
+    HubCrateExport::new(
+        "client_api",
+        HubCrateExportClass::HubPolicy,
+        HubCrateExportStability::KeepPublic,
+        "local HubRuntime client API; not the daemon wire crate",
+    ),
+    HubCrateExport::new(
+        "config",
+        HubCrateExportClass::HubPolicy,
+        HubCrateExportStability::KeepPublic,
+        "startup composition and host configuration",
+    ),
+    HubCrateExport::new(
+        "credentials",
+        HubCrateExportClass::HubPolicy,
+        HubCrateExportStability::KeepPublic,
+        "credential policy and store admission",
+    ),
+    HubCrateExport::new(
+        "daemon",
+        HubCrateExportClass::HubPolicy,
+        HubCrateExportStability::KeepPublic,
+        "HubDaemon host lifecycle",
+    ),
+    HubCrateExport::new(
+        "daemon_projection",
+        HubCrateExportClass::Internal,
+        HubCrateExportStability::AlreadyInternal,
+        "pure DTO projection; already crate-private",
+    ),
+    HubCrateExport::new(
+        "daemon_transport",
+        HubCrateExportClass::HubPolicy,
+        HubCrateExportStability::KeepPublic,
+        "same-device server adapter: accept, handshake, control, cleanup",
+    ),
+    HubCrateExport::new(
+        "entrypoint_supervisor",
+        HubCrateExportClass::HubPolicy,
+        HubCrateExportStability::KeepPublic,
+        "package entrypoint supervision admission",
+    ),
+    HubCrateExport::new(
+        "lifecycle",
+        HubCrateExportClass::HubPolicy,
+        HubCrateExportStability::KeepPublic,
+        "plugin lifecycle policy",
+    ),
+    HubCrateExport::new(
+        "local_webrtc",
+        HubCrateExportClass::Internal,
+        HubCrateExportStability::FutureInternal,
+        "first-party transport adapter; external clients use botster-hub-client",
+    ),
+    HubCrateExport::new(
+        "lua_runtime",
+        HubCrateExportClass::HubPolicy,
+        HubCrateExportStability::KeepPublic,
+        "first-party Lua plugin host",
+    ),
+    HubCrateExport::new(
+        "maintenance",
+        HubCrateExportClass::HubPolicy,
+        HubCrateExportStability::KeepPublic,
+        "software and installation identity",
+    ),
+    HubCrateExport::new(
+        "managed_git_worktrees",
+        HubCrateExportClass::Internal,
+        HubCrateExportStability::FutureInternal,
+        "git worktree implementation behind the worktrees facade",
+    ),
+    HubCrateExport::new(
+        "mcp",
+        HubCrateExportClass::HubPolicy,
+        HubCrateExportStability::KeepPublic,
+        "MCP registration and host serving",
+    ),
+    HubCrateExport::new(
+        "package_entity_fanout",
+        HubCrateExportClass::Internal,
+        HubCrateExportStability::FutureInternal,
+        "package entity fanout implementation",
+    ),
+    HubCrateExport::new(
+        "packages",
+        HubCrateExportClass::HubPolicy,
+        HubCrateExportStability::KeepPublic,
+        "package admission, install, pin, and enablement policy",
+    ),
+    HubCrateExport::new(
+        "persistence",
+        HubCrateExportClass::HubPolicy,
+        HubCrateExportStability::KeepPublic,
+        "durable hub-state persistence",
+    ),
+    HubCrateExport::new(
+        "profile",
+        HubCrateExportClass::HubPolicy,
+        HubCrateExportStability::KeepPublic,
+        "host-profile manifesto",
+    ),
+    HubCrateExport::new(
+        "runtime",
+        HubCrateExportClass::HubPolicy,
+        HubCrateExportStability::KeepPublic,
+        "HubRuntime control-plane facade",
+    ),
+    HubCrateExport::new(
+        "session_types",
+        HubCrateExportClass::HubPolicy,
+        HubCrateExportStability::KeepPublic,
+        "session type admission and projection policy",
+    ),
+    HubCrateExport::new(
+        "source_update",
+        HubCrateExportClass::Internal,
+        HubCrateExportStability::FutureInternal,
+        "already doc-hidden; used by the first-party update command",
+    ),
+    HubCrateExport::new(
+        "spawn_targets",
+        HubCrateExportClass::HubPolicy,
+        HubCrateExportStability::KeepPublic,
+        "spawn target policy",
+    ),
+    HubCrateExport::new(
+        "worktrees",
+        HubCrateExportClass::HubPolicy,
+        HubCrateExportStability::KeepPublic,
+        "worktree policy facade",
+    ),
+    HubCrateExport::new(
+        "botster_core RunnableEntrypoint* re-exports",
+        HubCrateExportClass::CoreReexport,
+        HubCrateExportStability::KeepPublic,
+        "host-profile package surfaces name these core types",
+    ),
+    HubCrateExport::new(
+        "LOCAL_RUNTIME_DAEMON_READINESS_BUDGET",
+        HubCrateExportClass::HubPolicy,
+        HubCrateExportStability::KeepPublic,
+        "lifecycle harnesses observe this production readiness budget",
+    ),
+    HubCrateExport::new(
+        "daemon_transport Daemon* DTO re-exports",
+        HubCrateExportClass::ClientContract,
+        HubCrateExportStability::KeepPublic,
+        "wire DTOs already live in botster-hub-client; hub re-export stays for compatibility",
+    ),
+    HubCrateExport::new(
+        "serve_daemon / daemon_transport_request",
+        HubCrateExportClass::HubPolicy,
+        HubCrateExportStability::KeepPublic,
+        "host server adapter and first-party control helper",
+    ),
+    HubCrateExport::new(
+        "stream_attach",
+        HubCrateExportClass::ClientContract,
+        HubCrateExportStability::KeepPublic,
+        "held-open attach helper already owned by botster-hub-client",
+    ),
+    HubCrateExport::new(
+        "HubClient* re-exports",
+        HubCrateExportClass::HubPolicy,
+        HubCrateExportStability::KeepPublic,
+        "local request API over HubRuntime, not the external daemon wire crate",
+    ),
+];
+
 /// Return the public architecture summary used by docs and tests.
 #[must_use]
 pub const fn architecture_summary() -> ArchitectureSummary {
     ArchitectureSummary {
         profile: host_profile(),
         facade_decisions: HUB_FACADE_DECISIONS,
+        crate_exports: HUB_CRATE_EXPORTS,
     }
 }
 
@@ -441,5 +718,132 @@ mod tests {
                 && decision.exposure() == HubFacadeExposure::Deferred
                 && decision.reason().contains("delivery-pressure")
         }));
+    }
+
+    #[test]
+    fn architecture_summary_classifies_every_crate_root_module() {
+        let names: Vec<_> = architecture_summary()
+            .crate_exports()
+            .iter()
+            .map(HubCrateExport::name)
+            .collect();
+
+        for module in [
+            "auth",
+            "capabilities",
+            "client_api",
+            "config",
+            "credentials",
+            "daemon",
+            "daemon_projection",
+            "daemon_transport",
+            "entrypoint_supervisor",
+            "lifecycle",
+            "local_webrtc",
+            "lua_runtime",
+            "maintenance",
+            "managed_git_worktrees",
+            "mcp",
+            "package_entity_fanout",
+            "packages",
+            "persistence",
+            "profile",
+            "runtime",
+            "session_types",
+            "source_update",
+            "spawn_targets",
+            "worktrees",
+        ] {
+            assert!(
+                names.contains(&module),
+                "missing crate-root module {module}"
+            );
+        }
+    }
+
+    #[test]
+    fn architecture_summary_keeps_current_public_modules_and_reexports() {
+        // Compiling these imports is the stability proof. This audit must not hide them.
+        #[allow(unused_imports)]
+        use crate::{
+            DaemonRequest, HubClientRequest, HubRuntime, LOCAL_RUNTIME_DAEMON_READINESS_BUDGET,
+            LocalWebrtcTransport, PackageRegistry, auth, capabilities, client_api, config,
+            credentials, daemon, daemon_transport, entrypoint_supervisor, lifecycle, local_webrtc,
+            lua_runtime, maintenance, managed_git_worktrees, mcp, package_entity_fanout, packages,
+            persistence, profile, runtime, session_types, source_update, spawn_targets, worktrees,
+        };
+
+        let _: Option<DaemonRequest> = None;
+        let _: Option<HubClientRequest> = None;
+        let _: Option<HubRuntime> = None;
+        let _: Option<PackageRegistry> = None;
+        let _: Option<LocalWebrtcTransport> = None;
+        let _ = LOCAL_RUNTIME_DAEMON_READINESS_BUDGET;
+        let _ = source_update::mark_update_running;
+        let _ = std::any::type_name::<auth::AuthHook>();
+    }
+
+    #[test]
+    fn architecture_summary_defers_visibility_changes_for_internal_modules() {
+        let summary = architecture_summary();
+        let projection = summary
+            .crate_exports()
+            .iter()
+            .find(|export| export.name() == "daemon_projection")
+            .expect("daemon_projection");
+        assert_eq!(projection.class(), HubCrateExportClass::Internal);
+        assert_eq!(
+            projection.stability(),
+            HubCrateExportStability::AlreadyInternal
+        );
+
+        for name in [
+            "local_webrtc",
+            "managed_git_worktrees",
+            "package_entity_fanout",
+            "source_update",
+        ] {
+            let export = summary
+                .crate_exports()
+                .iter()
+                .find(|export| export.name() == name)
+                .unwrap_or_else(|| panic!("missing export {name}"));
+            assert_eq!(export.class(), HubCrateExportClass::Internal, "{name}");
+            assert_eq!(
+                export.stability(),
+                HubCrateExportStability::FutureInternal,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn architecture_summary_keeps_client_contract_reexports_public() {
+        let summary = architecture_summary();
+        for name in ["daemon_transport Daemon* DTO re-exports", "stream_attach"] {
+            let export = summary
+                .crate_exports()
+                .iter()
+                .find(|export| export.name() == name)
+                .unwrap_or_else(|| panic!("missing export {name}"));
+            assert_eq!(
+                export.class(),
+                HubCrateExportClass::ClientContract,
+                "{name}"
+            );
+            assert_eq!(
+                export.stability(),
+                HubCrateExportStability::KeepPublic,
+                "{name}"
+            );
+        }
+
+        let client_api = summary
+            .crate_exports()
+            .iter()
+            .find(|export| export.name() == "client_api")
+            .expect("client_api");
+        assert_eq!(client_api.class(), HubCrateExportClass::HubPolicy);
+        assert!(client_api.reason().contains("not the daemon wire crate"));
     }
 }

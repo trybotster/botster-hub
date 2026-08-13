@@ -1264,6 +1264,7 @@ where
                         reply_tx,
                         response_delivery_rx,
                         grant_id: Some(peer_state.grant_id.clone()),
+                        client_id: Some(format!("botster-hub-webrtc-{}", peer_state.grant_id)),
                     })
                     .await
             }
@@ -2038,6 +2039,7 @@ mod tests {
                 reply_tx,
                 response_delivery_rx,
                 grant_id,
+                ..
             } = receive_test_runtime_message(&mut runtime_rx)
             else {
                 panic!("expected daemon shutdown request");
@@ -3509,6 +3511,7 @@ mod tests {
                     reply_tx,
                     response_delivery_rx: None,
                     grant_id: None,
+                    client_id: None,
                 },
             );
             reply_rx.blocking_recv().ok().and_then(|result| result.ok())
@@ -4865,6 +4868,7 @@ mod tests {
                 reply_tx,
                 response_delivery_rx: None,
                 grant_id: Some(grant_id.clone()),
+                client_id: Some(format!("botster-hub-webrtc-{grant_id}")),
             },
         );
 
@@ -4936,6 +4940,7 @@ mod tests {
                 reply_tx,
                 response_delivery_rx: None,
                 grant_id: Some(grant_id.clone()),
+                client_id: Some(format!("botster-hub-webrtc-{grant_id}")),
             },
         );
 
