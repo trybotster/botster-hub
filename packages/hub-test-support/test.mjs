@@ -135,7 +135,7 @@ assert.equal(metadata.package_name, "@trybotster/hub-test-support");
 assert.equal(metadata.package_version, "0.1.32");
 assert.equal(metadata.protocol, "botster-hub-daemon-v1");
 assert.equal(metadata.protocol_version, 7);
-assert.equal(metadata.conformance_fixture_revision, 37);
+assert.equal(metadata.conformance_fixture_revision, 38);
 
 // Package README ships in the npm tarball; keep install pin sites tied to package.json.
 {
@@ -372,7 +372,7 @@ assert.deepEqual(
 );
 assert.equal(supportMatrix.session_type_authoring.admission_group, "allow_runtime");
 
-assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 37);
+assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 38);
 assert.equal(sessionLifecycleFixture.entity_type, "session");
 assert.deepEqual(
   sessionLifecycleFixture.normalized_frames.map((frame) => frame.type),
@@ -410,7 +410,7 @@ assert.equal(
 assert.equal(sessionLifecycleFixture.overflow.snapshot_precedes_later_deltas, true);
 assert.equal(sessionLifecycleFixture.overflow.failed_snapshot_delivery_closes_subscription, true);
 
-assert.equal(sessionPluginBindingFixture.conformance_fixture_revision, 37);
+assert.equal(sessionPluginBindingFixture.conformance_fixture_revision, 38);
 assert.equal(sessionPluginBindingFixture.binding_family, "/session");
 const sessionPluginMaterialization = materializeSessionPluginBindingScenario(
   sessionPluginBindingFixture,
@@ -615,9 +615,9 @@ assert.equal(
 );
 const GHOSTSNP_MAGIC = Buffer.from("GHOSTSNP");
 const GOLDEN_A_SHA256 =
-  "fc8664159efdc7bd6959dd294485c6bc2f87ad8ea2fb3a0a16ab78b2eb87fd77";
+  "fbcdda31d682a61420251eed68f72e413485f057e3f374c57582955b0316bb6d";
 const GOLDEN_B_SHA256 =
-  "b0e28fe69ba590f067236a2a0b1eb8b05d2aa0be74fda4324e55a6066eac328c";
+  "06962b11d4a3acfb9b7c52b673a7b476904ddee2dd754b89b190ff82fdcfd0cc";
 const historyIndex = lateAttachFixture.history_then_live.findIndex(
   (event) =>
     (event.type === "snapshot" || event.type === "scrollback") &&
@@ -647,12 +647,20 @@ assert.equal(historyPayload.subarray(0, 8).equals(GHOSTSNP_MAGIC), true);
 assert.equal(createHash("sha256").update(historyPayload).digest("hex"), GOLDEN_A_SHA256);
 // Authentic GHOSTSNP may embed screen glyphs in binary form; clients must restore
 // via Ghostty import / ReadScreen, never by appending snapshot bytes as text.
-for (const event of lateAttachFixture.history_then_live) {
-  if (event.type === "snapshot" || event.type === "scrollback") {
-    const payload = Buffer.from(event.payload_base64, "base64");
-    assert.equal(event.bytes, payload.length);
-    assert.equal(event.payload_encoding, "base64");
+// Only the first Snapshot is a READY frame with GHOSTSNP magic. Later PAGE and
+// FINISH frames are continuation bytes.
+const historySnapshots = lateAttachFixture.history_then_live.filter(
+  (event) => event.type === "snapshot",
+);
+assert.ok(historySnapshots.length >= 2);
+for (const [index, event] of historySnapshots.entries()) {
+  const payload = Buffer.from(event.payload_base64, "base64");
+  assert.equal(event.bytes, payload.length);
+  assert.equal(event.payload_encoding, "base64");
+  if (index === 0) {
     assert.equal(payload.subarray(0, 8).equals(GHOSTSNP_MAGIC), true);
+  } else {
+    assert.equal(payload.subarray(0, 8).equals(GHOSTSNP_MAGIC), false);
   }
 }
 assert.equal(lateAttachFixture.read_screen_text.match(/history-before-live/g)?.length, 1);
@@ -717,9 +725,9 @@ assert.equal(historyPayload.equals(noHistoryPayload), false);
 // Exactly one Snapshot on no_history and empty ReadScreen oracle.
 assert.equal(
   lateAttachFixture.no_history_then_live.filter((event) => event.type === "snapshot").length,
-  1,
+  2,
 );
-assert.equal(lateAttachFixture.conformance_fixture_revision, 37);
+assert.equal(lateAttachFixture.conformance_fixture_revision, 38);
 
 const verification = verifyPackageAssets();
 assert.deepEqual(verification, { ok: true, failures: [] });

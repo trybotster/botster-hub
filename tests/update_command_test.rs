@@ -519,13 +519,18 @@ fn update_all_replaces_an_incompatible_preupdate_worker_and_proves_attach_order(
     assert_eq!(spawn.kind, botster_hub_client::DaemonResponseKind::Spawned);
     let mut connection =
         botster_hub_client::DaemonConnection::connect(&endpoint).expect("connect updated daemon");
-    connection
+    let attach = connection
         .request(&botster_hub_client::DaemonRequest::Attach {
             session_id: new_session.to_string(),
             subscription_id: "postupdate-attach".to_string(),
         })
         .expect("attach updated session");
-    let events = collect_attach_events(&mut connection, new_session, "postupdate-attach");
+    let mut events = attach.events;
+    events.extend(collect_attach_events(
+        &mut connection,
+        new_session,
+        "postupdate-attach",
+    ));
     let attaching = event_position(&events, "postupdate-attach", "attaching");
     let snapshot = events
         .iter()
@@ -740,9 +745,10 @@ fn collect_attach_events(
     let mut events = Vec::new();
     for _ in 0..200 {
         let response = connection
-            .request(&botster_hub_client::DaemonRequest::Drain {
-                session_id: session_id.to_string(),
-            })
+            .request(&botster_hub_client::DaemonRequest::drain_subscription(
+                session_id,
+                subscription_id,
+            ))
             .expect("drain attach events");
         events.extend(response.events);
         if events.iter().any(|event| {

@@ -52,6 +52,13 @@ use crate::support::{
 use super::*;
 
 pub(crate) fn start_cli_daemon(data_dir: &Path) -> Child {
+    start_cli_daemon_with_worker_egress_capacity(data_dir, None)
+}
+
+pub(crate) fn start_cli_daemon_with_worker_egress_capacity(
+    data_dir: &Path,
+    egress_capacity: Option<usize>,
+) -> Child {
     ensure_session_worker_binary();
     let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
     command
@@ -60,9 +67,33 @@ pub(crate) fn start_cli_daemon(data_dir: &Path) -> Child {
         .arg(data_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(capacity) = egress_capacity {
+        command.env(
+            "BOTSTER_HUB_TEST_WORKER_EGRESS_CAPACITY",
+            capacity.to_string(),
+        );
+    }
     configure_test_process_group(&mut command);
     let mut child = command.spawn().expect("spawn botster-hub start");
 
+    wait_for_status(data_dir, &mut child);
+    child
+}
+
+pub(crate) fn start_cli_daemon_with_snapshot_history_failure(data_dir: &Path) -> Child {
+    ensure_session_worker_binary();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    command
+        .arg("start")
+        .arg("--data-dir")
+        .arg(data_dir)
+        .env("BOTSTER_HUB_TEST_FAIL_SNAPSHOT_HISTORY_AFTER_READY", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_test_process_group(&mut command);
+    let mut child = command
+        .spawn()
+        .expect("spawn botster-hub start with snapshot history failure");
     wait_for_status(data_dir, &mut child);
     child
 }
@@ -212,8 +243,8 @@ pub(crate) fn spawn_stalled_release_metadata_fixture(
     )
 }
 
-pub(crate) fn spawn_timeout_release_metadata_fixture() -> (String, mpsc::Receiver<()>, thread::JoinHandle<()>)
-{
+pub(crate) fn spawn_timeout_release_metadata_fixture()
+-> (String, mpsc::Receiver<()>, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind timeout release fixture");
     let address = listener.local_addr().expect("timeout fixture address");
     let (accepted_tx, accepted_rx) = mpsc::channel();
@@ -511,7 +542,11 @@ pub(crate) fn run_local_runtime_smoke_with_fault(
     command.output().expect("run botster-hub smoke")
 }
 
-pub(crate) fn ensure_runtime_packages(data_dir: &Path, web_package_path: &Path, tui_package_path: &Path) {
+pub(crate) fn ensure_runtime_packages(
+    data_dir: &Path,
+    web_package_path: &Path,
+    tui_package_path: &Path,
+) {
     ensure_session_worker_binary();
     let config = explicit_config(data_dir);
     let mut setup_daemon =
@@ -669,4 +704,3 @@ pub(crate) struct BufferedStdoutObservation {
     pub(crate) elapsed: Duration,
     pub(crate) recent_samples: VecDeque<(Duration, usize)>,
 }
-

@@ -16,9 +16,9 @@ use std::time::{Duration, Instant};
 
 use botster_core::{RunnableEntrypointHubConnection, RunnableEntrypointHubConnectionTransport};
 use botster_hub_client::{
-    DaemonCompatibility, DaemonCompatibilityRequirement, DaemonConnection, DaemonDiagnosticKind,
-    DaemonEndpoint, DaemonEntityFrame, DaemonEvent, DaemonLiveOutputPayload, DaemonOperatorError,
-    DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonTransportError, ensure_compatible,
+    DaemonCompatibilityRequirement, DaemonConnection, DaemonDiagnosticKind, DaemonEndpoint,
+    DaemonEntityFrame, DaemonEvent, DaemonLiveOutputPayload, DaemonOperatorError, DaemonRequest,
+    DaemonResponse, DaemonResponseKind, DaemonTransportError, ensure_compatible,
 };
 use botster_ui_contract::{
     UiActionId, UiActionKind, UiActionRequest, UiActionRequestId, UiActionResult,
@@ -34,11 +34,18 @@ pub(crate) use conformance_data::{
     APPLICATION_PRIMITIVE_NODE_KINDS, CONFORMANCE_ECHO, CONFORMANCE_READY, CONFORMANCE_SESSION_ID,
     CONFORMANCE_SUBSCRIPTION_ID, CONFORMANCE_WINSIZE_PREFIX, DAEMON_PROTOCOL_TYPESCRIPT_ARTIFACT,
     GHOSTSNP_MAGIC, LATE_ATTACH_GHOSTSNP_CORE_PIN, LATE_ATTACH_GHOSTSNP_GHOSTTY_PIN,
+    LATE_ATTACH_HISTORY_FINISH_PAYLOAD, LATE_ATTACH_HISTORY_FINISH_PAYLOAD_LEN,
+    LATE_ATTACH_HISTORY_FINISH_PAYLOAD_SHA256, LATE_ATTACH_HISTORY_PAGE_PAYLOAD,
+    LATE_ATTACH_HISTORY_PAGE_PAYLOAD_LEN, LATE_ATTACH_HISTORY_PAGE_PAYLOAD_SHA256,
     LATE_ATTACH_HISTORY_PAYLOAD, LATE_ATTACH_HISTORY_PAYLOAD_LEN,
-    LATE_ATTACH_HISTORY_PAYLOAD_SHA256, LATE_ATTACH_HISTORY_SCREEN_TEXT,
-    LATE_ATTACH_HISTORY_SESSION_ID, LATE_ATTACH_HISTORY_SUBSCRIPTION_ID, LATE_ATTACH_LIVE_DATA,
-    LATE_ATTACH_NO_HISTORY_LIVE_DATA, LATE_ATTACH_NO_HISTORY_PAYLOAD,
-    LATE_ATTACH_NO_HISTORY_PAYLOAD_LEN, LATE_ATTACH_NO_HISTORY_PAYLOAD_SHA256,
+    LATE_ATTACH_HISTORY_PAYLOAD_SHA256, LATE_ATTACH_HISTORY_READY_PAYLOAD,
+    LATE_ATTACH_HISTORY_SCREEN_TEXT, LATE_ATTACH_HISTORY_SESSION_ID,
+    LATE_ATTACH_HISTORY_SUBSCRIPTION_ID, LATE_ATTACH_INCOMPLETE_SESSION_ID,
+    LATE_ATTACH_INCOMPLETE_SUBSCRIPTION_ID, LATE_ATTACH_LIVE_DATA,
+    LATE_ATTACH_NO_HISTORY_FINISH_PAYLOAD, LATE_ATTACH_NO_HISTORY_FINISH_PAYLOAD_LEN,
+    LATE_ATTACH_NO_HISTORY_FINISH_PAYLOAD_SHA256, LATE_ATTACH_NO_HISTORY_LIVE_DATA,
+    LATE_ATTACH_NO_HISTORY_PAYLOAD, LATE_ATTACH_NO_HISTORY_PAYLOAD_LEN,
+    LATE_ATTACH_NO_HISTORY_PAYLOAD_SHA256, LATE_ATTACH_NO_HISTORY_READY_PAYLOAD,
     LATE_ATTACH_NO_HISTORY_SESSION_ID, LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID,
     PLUGIN_CONTRACT_ACCEPTED_REPLACEMENT_SCOPE, PLUGIN_CONTRACT_ACTION,
     PLUGIN_CONTRACT_APP_SURFACE, PLUGIN_CONTRACT_BLOCKED_SURFACE,
@@ -67,7 +74,8 @@ pub use conformance_data::{
     daemon_protocol_typescript_artifact, first_party_client_support_matrix,
     late_attach_ghostsnp_provenance, late_attach_history_conformance_fixture_json,
     late_attach_history_conformance_scenario, late_attach_history_events,
-    late_attach_history_payload_bytes, late_attach_history_payload_sha256,
+    late_attach_history_incomplete_events, late_attach_history_payload_bytes,
+    late_attach_history_payload_sha256, late_attach_incremental_frame_identity,
     late_attach_no_history_events, late_attach_no_history_payload_bytes,
     late_attach_no_history_payload_sha256, local_webrtc_delivery_chunk_conformance_fixture_json,
     materialize_session_plugin_bindings, materialize_session_plugin_rows,
@@ -735,6 +743,7 @@ fn run_many_pty_client_attach_scenario(
             connection,
             &DaemonRequest::Drain {
                 session_id: MANY_PTY_NOISY_SESSION_ID.to_string(),
+                subscription_id: None,
             },
             ManyPtyConformanceStage::Drain,
             MANY_PTY_NOISY_SESSION_ID,
@@ -877,6 +886,7 @@ fn wait_for_quiet_sessions(
                 connection,
                 &DaemonRequest::Drain {
                     session_id: session_id.clone(),
+                    subscription_id: None,
                 },
                 ManyPtyConformanceStage::Spawn,
                 session_id,
@@ -952,6 +962,7 @@ fn wait_for_many_pty_screen_marker(
             connection,
             &DaemonRequest::Drain {
                 session_id: MANY_PTY_NOISY_SESSION_ID.to_string(),
+                subscription_id: None,
             },
             ManyPtyConformanceStage::History,
             MANY_PTY_NOISY_SESSION_ID,
@@ -1606,6 +1617,7 @@ pub fn run_client_conformance(
         hub.endpoint(),
         DaemonRequest::Drain {
             session_id: "missing-conformance-session".to_string(),
+            subscription_id: None,
         },
         "validation_error",
     )?;
@@ -4767,6 +4779,7 @@ impl From<serde_json::Error> for ConformanceError {
 mod tests {
     use super::isolated_hub::{cleanup_child, default_socket_name, explicit_path};
     use super::*;
+    use botster_hub_client::DaemonCompatibility;
     use std::env;
     #[cfg(unix)]
     use std::io::Write;
@@ -5795,11 +5808,6 @@ mod tests {
                         botster_hub_client::DaemonHistoryEncoding::Base64
                     );
                     assert!(!payload.is_empty());
-                    assert!(
-                        payload.starts_with(GHOSTSNP_MAGIC),
-                        "late-attach Snapshot must start with GHOSTSNP, got {:?}",
-                        &payload[..payload.len().min(16)]
-                    );
                 }
                 _ => {}
             }
@@ -5832,12 +5840,38 @@ mod tests {
             hex_sha256(LATE_ATTACH_NO_HISTORY_PAYLOAD),
             LATE_ATTACH_NO_HISTORY_PAYLOAD_SHA256
         );
-        assert!(LATE_ATTACH_HISTORY_PAYLOAD.starts_with(GHOSTSNP_MAGIC));
-        assert!(LATE_ATTACH_NO_HISTORY_PAYLOAD.starts_with(GHOSTSNP_MAGIC));
+        assert_eq!(
+            LATE_ATTACH_HISTORY_PAGE_PAYLOAD.len(),
+            LATE_ATTACH_HISTORY_PAGE_PAYLOAD_LEN
+        );
+        assert_eq!(
+            LATE_ATTACH_HISTORY_FINISH_PAYLOAD.len(),
+            LATE_ATTACH_HISTORY_FINISH_PAYLOAD_LEN
+        );
+        assert_eq!(
+            LATE_ATTACH_NO_HISTORY_FINISH_PAYLOAD.len(),
+            LATE_ATTACH_NO_HISTORY_FINISH_PAYLOAD_LEN
+        );
+        assert_eq!(
+            hex_sha256(LATE_ATTACH_HISTORY_PAGE_PAYLOAD),
+            LATE_ATTACH_HISTORY_PAGE_PAYLOAD_SHA256
+        );
+        assert_eq!(
+            hex_sha256(LATE_ATTACH_HISTORY_FINISH_PAYLOAD),
+            LATE_ATTACH_HISTORY_FINISH_PAYLOAD_SHA256
+        );
+        assert_eq!(
+            hex_sha256(LATE_ATTACH_NO_HISTORY_FINISH_PAYLOAD),
+            LATE_ATTACH_NO_HISTORY_FINISH_PAYLOAD_SHA256
+        );
+        assert!(LATE_ATTACH_HISTORY_READY_PAYLOAD.starts_with(GHOSTSNP_MAGIC));
+        assert!(LATE_ATTACH_NO_HISTORY_READY_PAYLOAD.starts_with(GHOSTSNP_MAGIC));
+        assert!(!LATE_ATTACH_HISTORY_PAGE_PAYLOAD.starts_with(GHOSTSNP_MAGIC));
+        assert!(!LATE_ATTACH_HISTORY_FINISH_PAYLOAD.starts_with(GHOSTSNP_MAGIC));
         // Provenance pins required by the approved plan.
         assert_eq!(
             LATE_ATTACH_GHOSTSNP_CORE_PIN,
-            "2c5171a6cb3b073c53620a9838d8b08480dd215c"
+            "033cd01ca307e57fb9fd8c8b6deadb6d691ab45b"
         );
         assert_eq!(
             LATE_ATTACH_GHOSTSNP_GHOSTTY_PIN,
@@ -5847,26 +5881,39 @@ mod tests {
 
     #[test]
     fn late_attach_ghostsnp_goldens_import_with_semantic_screen_state() {
-        use botster_core::contract::terminal_screen::{
-            TerminalScreenSize, TerminalSnapshotPayload,
-        };
-        use botster_core::engine::TerminalScreenRuntime;
-        use botster_terminal_ghostty::{GHOSTTY_SNAPSHOT_FORMAT, GhosttyTerminal};
+        use botster_core::contract::terminal_screen::TerminalScreenSize;
+        use botster_terminal_ghostty::{GhosttyClientProjection, GhosttySnapshotDecodeProgress};
 
-        let size = TerminalScreenSize::new(24, 80);
-
-        let mut history_restored = GhosttyTerminal::new(size).expect("history import terminal");
-        history_restored
-            .import_snapshot(&TerminalSnapshotPayload::new(
-                LATE_ATTACH_HISTORY_PAYLOAD.to_vec(),
-                size,
-                Some(GHOSTTY_SNAPSHOT_FORMAT.to_owned()),
-            ))
-            .expect("import Golden A");
-        let history_text = history_restored.screen_state().plain_text;
+        let mut history_client =
+            GhosttyClientProjection::new(TerminalScreenSize::new(24, 80)).expect("history client");
+        assert_eq!(
+            history_client
+                .install_ghostsnp_ready(LATE_ATTACH_HISTORY_READY_PAYLOAD.to_vec())
+                .expect("history READY"),
+            GhosttySnapshotDecodeProgress::Ready
+        );
+        assert_eq!(
+            history_client
+                .apply_ghostsnp_history(LATE_ATTACH_HISTORY_PAGE_PAYLOAD.to_vec())
+                .expect("history PAGE"),
+            GhosttySnapshotDecodeProgress::History
+        );
+        assert_eq!(
+            history_client
+                .apply_ghostsnp_history(LATE_ATTACH_HISTORY_FINISH_PAYLOAD.to_vec())
+                .expect("history FINISH"),
+            GhosttySnapshotDecodeProgress::Finish
+        );
+        let history_text: String = history_client
+            .project_viewport()
+            .expect("history viewport")
+            .cells
+            .iter()
+            .map(|cell| cell.grapheme.as_str())
+            .collect();
         assert!(
             history_text.contains("history-before-live"),
-            "Golden A import must contain history marker; got {:?}",
+            "READY+PAGE+FINISH must restore history marker; got {:?}",
             history_text.chars().take(120).collect::<String>()
         );
         assert!(
@@ -5874,19 +5921,31 @@ mod tests {
             "Golden A must not be the complete-v1 alternate-screen story"
         );
 
-        let mut blank_restored = GhosttyTerminal::new(size).expect("blank import terminal");
-        blank_restored
-            .import_snapshot(&TerminalSnapshotPayload::new(
-                LATE_ATTACH_NO_HISTORY_PAYLOAD.to_vec(),
-                size,
-                Some(GHOSTTY_SNAPSHOT_FORMAT.to_owned()),
-            ))
-            .expect("import Golden B");
-        let blank_text = blank_restored.screen_state().plain_text;
+        let mut blank_client =
+            GhosttyClientProjection::new(TerminalScreenSize::new(24, 80)).expect("blank client");
+        assert_eq!(
+            blank_client
+                .install_ghostsnp_ready(LATE_ATTACH_NO_HISTORY_READY_PAYLOAD.to_vec())
+                .expect("blank READY"),
+            GhosttySnapshotDecodeProgress::Ready
+        );
+        assert_eq!(
+            blank_client
+                .apply_ghostsnp_history(LATE_ATTACH_NO_HISTORY_FINISH_PAYLOAD.to_vec())
+                .expect("blank FINISH"),
+            GhosttySnapshotDecodeProgress::Finish
+        );
+        let blank_text: String = blank_client
+            .project_viewport()
+            .expect("blank viewport")
+            .cells
+            .iter()
+            .map(|cell| cell.grapheme.as_str())
+            .collect();
         let non_ws: String = blank_text.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(
             non_ws.is_empty(),
-            "Golden B import must be blank; got {:?}",
+            "blank READY+FINISH must be empty; got {:?}",
             blank_text.chars().take(120).collect::<String>()
         );
         assert!(!blank_text.contains("history-before-live"));
@@ -5942,10 +6001,20 @@ mod tests {
     #[test]
     fn late_attach_history_fixture_serializes_to_stable_client_json() {
         let value = late_attach_history_conformance_fixture_json();
-        let history_payload =
-            botster_hub_client::DaemonOpaqueHistoryPayload::from_bytes(LATE_ATTACH_HISTORY_PAYLOAD);
-        let blank_payload = botster_hub_client::DaemonOpaqueHistoryPayload::from_bytes(
-            LATE_ATTACH_NO_HISTORY_PAYLOAD,
+        let history_ready = botster_hub_client::DaemonOpaqueHistoryPayload::from_bytes(
+            LATE_ATTACH_HISTORY_READY_PAYLOAD,
+        );
+        let history_page = botster_hub_client::DaemonOpaqueHistoryPayload::from_bytes(
+            LATE_ATTACH_HISTORY_PAGE_PAYLOAD,
+        );
+        let history_finish = botster_hub_client::DaemonOpaqueHistoryPayload::from_bytes(
+            LATE_ATTACH_HISTORY_FINISH_PAYLOAD,
+        );
+        let blank_ready = botster_hub_client::DaemonOpaqueHistoryPayload::from_bytes(
+            LATE_ATTACH_NO_HISTORY_READY_PAYLOAD,
+        );
+        let blank_finish = botster_hub_client::DaemonOpaqueHistoryPayload::from_bytes(
+            LATE_ATTACH_NO_HISTORY_FINISH_PAYLOAD,
         );
         let history_live = DaemonLiveOutputPayload::from_bytes(LATE_ATTACH_LIVE_DATA.as_bytes());
         let no_history_live =
@@ -5972,9 +6041,25 @@ mod tests {
                         "type": "snapshot",
                         "session_id": LATE_ATTACH_HISTORY_SESSION_ID,
                         "subscription_id": LATE_ATTACH_HISTORY_SUBSCRIPTION_ID,
-                        "payload_base64": history_payload.payload_base64,
+                        "payload_base64": history_ready.payload_base64,
                         "payload_encoding": "base64",
-                        "bytes": LATE_ATTACH_HISTORY_PAYLOAD.len(),
+                        "bytes": LATE_ATTACH_HISTORY_READY_PAYLOAD.len(),
+                    },
+                    {
+                        "type": "snapshot",
+                        "session_id": LATE_ATTACH_HISTORY_SESSION_ID,
+                        "subscription_id": LATE_ATTACH_HISTORY_SUBSCRIPTION_ID,
+                        "payload_base64": history_page.payload_base64,
+                        "payload_encoding": "base64",
+                        "bytes": LATE_ATTACH_HISTORY_PAGE_PAYLOAD.len(),
+                    },
+                    {
+                        "type": "snapshot",
+                        "session_id": LATE_ATTACH_HISTORY_SESSION_ID,
+                        "subscription_id": LATE_ATTACH_HISTORY_SUBSCRIPTION_ID,
+                        "payload_base64": history_finish.payload_base64,
+                        "payload_encoding": "base64",
+                        "bytes": LATE_ATTACH_HISTORY_FINISH_PAYLOAD.len(),
                     },
                     {
                         "type": "attach_state",
@@ -6008,9 +6093,17 @@ mod tests {
                         "type": "snapshot",
                         "session_id": LATE_ATTACH_NO_HISTORY_SESSION_ID,
                         "subscription_id": LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID,
-                        "payload_base64": blank_payload.payload_base64,
+                        "payload_base64": blank_ready.payload_base64,
                         "payload_encoding": "base64",
-                        "bytes": LATE_ATTACH_NO_HISTORY_PAYLOAD.len(),
+                        "bytes": LATE_ATTACH_NO_HISTORY_READY_PAYLOAD.len(),
+                    },
+                    {
+                        "type": "snapshot",
+                        "session_id": LATE_ATTACH_NO_HISTORY_SESSION_ID,
+                        "subscription_id": LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID,
+                        "payload_base64": blank_finish.payload_base64,
+                        "payload_encoding": "base64",
+                        "bytes": LATE_ATTACH_NO_HISTORY_FINISH_PAYLOAD.len(),
                     },
                     {
                         "type": "attach_state",
@@ -6031,6 +6124,42 @@ mod tests {
                         "session_id": LATE_ATTACH_NO_HISTORY_SESSION_ID,
                         "subscription_id": LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID,
                         "code": 0,
+                    },
+                ],
+                "history_incomplete_then_live": [
+                    {
+                        "type": "attach_state",
+                        "session_id": LATE_ATTACH_INCOMPLETE_SESSION_ID,
+                        "subscription_id": LATE_ATTACH_INCOMPLETE_SUBSCRIPTION_ID,
+                        "state": "attaching",
+                    },
+                    {
+                        "type": "snapshot",
+                        "session_id": LATE_ATTACH_INCOMPLETE_SESSION_ID,
+                        "subscription_id": LATE_ATTACH_INCOMPLETE_SUBSCRIPTION_ID,
+                        "payload_base64": history_ready.payload_base64,
+                        "payload_encoding": "base64",
+                        "bytes": LATE_ATTACH_HISTORY_READY_PAYLOAD.len(),
+                    },
+                    {
+                        "type": "attach_state",
+                        "session_id": LATE_ATTACH_INCOMPLETE_SESSION_ID,
+                        "subscription_id": LATE_ATTACH_INCOMPLETE_SUBSCRIPTION_ID,
+                        "state": "snapshot_history_incomplete",
+                    },
+                    {
+                        "type": "attach_state",
+                        "session_id": LATE_ATTACH_INCOMPLETE_SESSION_ID,
+                        "subscription_id": LATE_ATTACH_INCOMPLETE_SUBSCRIPTION_ID,
+                        "state": "attached",
+                    },
+                    {
+                        "type": "terminal_output",
+                        "session_id": LATE_ATTACH_INCOMPLETE_SESSION_ID,
+                        "subscription_id": LATE_ATTACH_INCOMPLETE_SUBSCRIPTION_ID,
+                        "payload_base64": history_live.payload_base64,
+                        "payload_encoding": "base64",
+                        "bytes": LATE_ATTACH_LIVE_DATA.len(),
                     },
                 ],
             })

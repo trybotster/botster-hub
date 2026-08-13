@@ -349,6 +349,7 @@ fn external_hub_webrtc_live_output_preserves_exact_bytes() {
                     &stream_key,
                     &botster_hub_client::DaemonRequest::Drain {
                         session_id: "webrtc-exact-bytes-session".to_string(),
+                    subscription_id: None,
                     },
                 )
                 .await
@@ -706,6 +707,7 @@ fn local_webrtc_chunks_oversized_encrypted_daemon_response() {
                     &stream_key,
                     &botster_hub_client::DaemonRequest::Drain {
                         session_id: "local-webrtc-session".to_string(),
+                    subscription_id: None,
                     },
                 )
                 .await
@@ -1347,6 +1349,7 @@ fn local_webrtc_peer_close_detaches_terminal_subscriptions() {
         let drain = connection
             .request(&botster_hub_client::DaemonRequest::Drain {
                 session_id: "local-webrtc-drop-session".to_string(),
+            subscription_id: None,
             })
             .expect("drain after WebRTC peer close");
         for event in drain.events {
@@ -1465,6 +1468,7 @@ fn external_hub_client_spawns_botster_web_runtime_session_request_shape() {
         let drain = connection
             .request(&botster_hub_client::DaemonRequest::Drain {
                 session_id: "botster-web-runtime-session".to_string(),
+            subscription_id: None,
             })
             .expect("drain botster-web runtime session");
         for event in drain.events {
@@ -1576,6 +1580,7 @@ fn external_hub_client_duplicate_botster_web_runtime_spawn_is_rejected_without_c
         let drain = connection
             .request(&botster_hub_client::DaemonRequest::Drain {
                 session_id: "botster-web-runtime-session".to_string(),
+            subscription_id: None,
             })
             .expect("drain original botster-web runtime session after duplicate rejection");
         for event in drain.events {

@@ -1,5 +1,4 @@
 #![cfg(unix)]
-
 #![allow(dead_code, unused_imports)]
 
 use std::collections::{BTreeMap, VecDeque};
@@ -46,15 +45,14 @@ use webrtc::runtime::{
     timeout,
 };
 
-mod support;
 mod hub_daemon_lifecycle;
+mod support;
 
+use hub_daemon_lifecycle::*;
 use support::{
     ensure_session_worker_binary, recovering_mutex_guard, validate_cli_daemon_shutdown,
     wait_for_cli_daemon_shutdown,
 };
-use hub_daemon_lifecycle::*;
-
 
 include!("hub_daemon_lifecycle/shutdown.rs");
 include!("hub_daemon_lifecycle/packages.rs");

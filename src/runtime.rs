@@ -1916,7 +1916,9 @@ impl HubRuntime {
         )
     }
 
-    /// Drain available daemon output through core's subscription path.
+    /// Drain available daemon output through core's session path.
+    ///
+    /// Attaching subscriptions must use [`Self::drain_subscription`].
     pub fn drain_runtime_once(
         &mut self,
         session_id: &SessionId,
@@ -1926,6 +1928,20 @@ impl HubRuntime {
             .lock()
             .expect("core daemon mutex")
             .drain(session_id, last_output_at)
+    }
+
+    /// Drain one subscription without consuming another route's frames.
+    pub fn drain_subscription(
+        &mut self,
+        client_id: &ClientId,
+        session_id: &SessionId,
+        subscription_id: &SubscriptionId,
+        last_output_at: u64,
+    ) -> Result<DrainResult, CoreDaemonError> {
+        self.core_daemon
+            .lock()
+            .expect("core daemon mutex")
+            .drain_subscription(client_id, session_id, subscription_id, last_output_at)
     }
 
     /// Read the current daemon-owned terminal screen through the production core path.
@@ -2700,9 +2716,18 @@ fn json_null() -> serde_json::Value {
 fn core_daemon_config(config: &HubConfig) -> CoreDaemonConfig {
     // Host profile supplies the initial/reset Ghostty color baseline. After
     // attach, current colors come from data-plane GHOSTSNP only.
-    CoreDaemonConfig::new(&config.data_directory)
+    let mut core = CoreDaemonConfig::new(&config.data_directory)
         .with_worker_path(session_worker_path(config))
-        .with_terminal_color_profile(default_terminal_color_profile())
+        .with_terminal_color_profile(default_terminal_color_profile());
+    if let Ok(raw) = std::env::var("BOTSTER_HUB_TEST_WORKER_EGRESS_CAPACITY")
+        && let Ok(capacity) = raw.parse::<usize>()
+    {
+        core = core.with_test_worker_egress_capacity(Some(capacity));
+    }
+    if std::env::var("BOTSTER_HUB_TEST_FAIL_SNAPSHOT_HISTORY_AFTER_READY").as_deref() == Ok("1") {
+        core = core.with_test_fail_snapshot_history_after_ready(true);
+    }
+    core
 }
 
 /// Product default Ghostty special colors for pre-attach OSC 10/11/12 replies.

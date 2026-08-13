@@ -588,7 +588,10 @@ pub(crate) fn payload_has_utf8_replacement(bytes: &[u8]) -> bool {
     bytes.windows(3).any(|window| window == [0xEF, 0xBF, 0xBD])
 }
 
-pub(crate) fn shutdown_short_lived_session(endpoint: &botster_hub_client::DaemonEndpoint, session_id: &str) {
+pub(crate) fn shutdown_short_lived_session(
+    endpoint: &botster_hub_client::DaemonEndpoint,
+    session_id: &str,
+) {
     let shutdown = botster_hub_client::request(
         endpoint,
         botster_hub_client::DaemonRequest::ShutdownSession {
@@ -607,7 +610,9 @@ pub(crate) fn shutdown_short_lived_session(endpoint: &botster_hub_client::Daemon
     );
 }
 
-pub(crate) fn daemon_endpoint(config: &botster_hub::HubConfig) -> botster_hub_client::DaemonEndpoint {
+pub(crate) fn daemon_endpoint(
+    config: &botster_hub::HubConfig,
+) -> botster_hub_client::DaemonEndpoint {
     botster_hub_client::DaemonEndpoint::new(
         config
             .transports
@@ -641,6 +646,7 @@ pub(crate) fn wait_for_managed_git_session_exit(data_dir: &Path, session_id: &st
             &explicit_config(data_dir),
             botster_hub::DaemonRequest::Drain {
                 session_id: session_id.to_string(),
+                subscription_id: None,
             },
         )
         .unwrap_or_else(|error| {
@@ -938,4 +944,3 @@ where
         }
     }
 }
-

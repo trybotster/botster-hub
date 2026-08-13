@@ -96,7 +96,7 @@ hub-native routed envelopes and guarded notification writes:
 
 | Surface | Status on the product path |
 | --- | --- |
-| Attach + drain terminal egress | Product. Control ops ack through CoreDaemon; bytes arrive via drain/subscription. Late attach may replay prior output as Snapshot/Scrollback/TerminalOutput events when the worker path emits them. |
+| Attach + drain terminal egress | Product. Attach acks `attaching` on the requesting subscription. READY, HISTORY page, and FINISH `Snapshot` frames stream on scoped `Drain { subscription_id }`. `attached` means live PTY may flow. `Scrollback` is never importable as GHOSTSNP. |
 | Hub `ReadScreen` / `ReadModeFlags` / `ModeGatedInput` / `CaptureSnapshot` | Product. Routes `HubClientApi` → `HubRuntime` → `CoreDaemon` readback. `ReadScreen` returns session text; `ReadModeFlags` returns full authoritative `ModeFlags` plus `mode_generation`/`mode_revision` freshness; `ModeGatedInput` admits race-free mode-dependent Kitty/mouse input via Core's 5s default timeout; `CaptureSnapshot` returns metadata only (rows/cols/format/byte count) — never GHOSTSNP bytes. Errors stay errors rather than fabricated mouse-off results, and mode readback has no pushed event. Opaque GHOSTSNP snapshot bytes stay only on the attach/drain `DaemonEvent::Snapshot` data plane (`Scrollback` is never importable as GHOSTSNP). Hub never decodes snapshot wire magic or synthesizes OSC 10/11/12 replies — startup color baseline is applied once via Core `with_terminal_color_profile` (FG `#FFFFFF` / BG `#282C34` / cursor `#FFFFFF`) for pre-attach session-side replies. |
 | Subscription history | Product. History and live terminal output flow through attach/drain events, not through readback responses. |
 | `report_delivery_*` pressure helpers | Still unfinished. Not exposed on the hub client product surface yet. |
@@ -592,7 +592,7 @@ let response = botster_hub_client::request_with_requirement(
 ```
 
 This requirement fails before request dispatch when the daemon does not
-advertise `hub_source_update` or does not provide conformance revision 37.
+advertise `hub_source_update` or does not provide conformance revision 38.
 
 The source command builds the debug profile under `target/debug`. It does not
 build a release profile.
@@ -642,7 +642,7 @@ data_dir=resolved:$HOME/.botster/hub
 daemon=started
 protocol=botster-hub-daemon-v1
 protocol_version=7
-conformance_fixture_revision=37
+conformance_fixture_revision=38
 package_count=2
 enabled_package_count=2
 app_count=2

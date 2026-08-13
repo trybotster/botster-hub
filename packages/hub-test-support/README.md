@@ -88,22 +88,23 @@ Use this exact package spec in npm-based client repos:
 
 `@trybotster/hub-test-support@0.1.32` carries byte-faithful live
 `terminal_output` payloads (`payload_base64`, `payload_encoding`, `bytes`)
-and authentic dual GHOSTSNP late-attach fixtures (conformance revision 37).
-History Snapshot is a frozen history-marker golden and no-history Snapshot is
-a distinct blank golden. Import-visible state matches the ReadScreen oracles;
-do not dual-use a history-bearing golden as no-history. Protocol version is 7,
-including the live-output envelope, the `mode_gated_input` feature, full
-`ModeFlags` freshness fields, explicit session-type execution modes,
-spawn-point session-type listing (`list_session_types_for_target`), and the
-session-type authoring view (`show_session_type_definition`). First-party
-clients should pin this coordinate when they use these contracts.
+and authentic dual GHOSTSNP late-attach fixtures (conformance revision 38).
+History attach uses incremental READY, PAGE, and FINISH Snapshot frames.
+No-history attach uses READY then FINISH. Import-visible state matches the
+ReadScreen oracles; do not dual-use a history-bearing golden as no-history.
+Protocol version is 7, including the live-output envelope, the
+`mode_gated_input` feature, full `ModeFlags` freshness fields, explicit
+session-type execution modes, spawn-point session-type listing
+(`list_session_types_for_target`), and the session-type authoring view
+(`show_session_type_definition`). First-party clients should pin this
+coordinate when they use these contracts.
 
 The support matrix is generated from the Rust compatibility descriptors.
 `terminal_readback` appears in both `supported_features` and
 `required_features`; downstream compatibility checks must implement it rather
 than treating it as optional. The late-attach fixture is generated from the
-Rust serde scenario and preserves `attaching -> Snapshot -> attached -> live`
-ordering for both history and no-history sequences. An opaque authoritative
+Rust serde scenario and preserves attaching, READY, optional PAGE frames,
+FINISH or `snapshot_history_incomplete`, attached, then live output. An opaque authoritative
 snapshot may represent a blank terminal; clients must not infer visible
 history from payload byte length. Only `read_screen_text` is renderable
 restored content; `snapshot` and `scrollback` base64 payloads must never be
@@ -111,9 +112,9 @@ appended as terminal text. Version 0.1.6 / conformance revision 13 uses
 superseded JSON number arrays, while version 0.1.5 / revision 12 exposes
 lossy string history. Neither is current binary-history contract authority.
 
-Version 0.1.32 carries protocol version 7 / conformance revision 37 with
-byte-faithful live `terminal_output` payloads, distinct frozen GHOSTSNP
-goldens (history marker vs blank idle), `mode_gated_input` ModeGatedInput +
+Version 0.1.32 carries protocol version 7 / conformance revision 38 with
+byte-faithful live `terminal_output` payloads, incremental GHOSTSNP
+READY/PAGE/FINISH goldens, `mode_gated_input` ModeGatedInput +
 ModeFlags freshness, Snapshot-only GHOSTSNP rules, and the
 `DaemonSessionTypeExecution` contract. The contract
 defines the explicit `relative_executable` and `shell_command` modes.

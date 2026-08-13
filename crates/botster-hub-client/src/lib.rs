@@ -22,7 +22,7 @@ mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 pub const PROTOCOL_VERSION: u16 = 7;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 37;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 38;
 /// Oldest conformance revision accepted by the default first-party client requirement.
 pub const DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 36;
 /// Version of the local WebRTC delivery chunk framing protocol.
@@ -47,6 +47,17 @@ pub const FEATURE_PLUGIN_ENTITY_SUBSCRIPTIONS: &str = "plugin_entity_subscriptio
 /// Race-free mode-dependent terminal input via `ModeGatedInput` + mode freshness.
 pub const FEATURE_MODE_GATED_INPUT: &str = "mode_gated_input";
 pub const FEATURE_HUB_SOURCE_UPDATE: &str = "hub_source_update";
+/// Cold-turkey first-party attach streams READY, HISTORY pages, then FINISH.
+///
+/// Not advertised until a production Drain can receive READY before Core
+/// encode returns. Success path: FINISH then `attached`. Post-READY history
+/// failure: `snapshot_history_incomplete` then `attached`, with no FINISH.
+pub const FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY: &str =
+    "snapshot_delivery=ready_then_history";
+/// Wire `AttachState.state` after a post-READY history failure.
+pub const ATTACH_STATE_SNAPSHOT_HISTORY_INCOMPLETE: &str = "snapshot_history_incomplete";
+/// Wire `AttachState.state` when attach fails before any READY Snapshot.
+pub const ATTACH_STATE_ATTACH_FAILED: &str = "attach_failed";
 const ATTACH_DRAIN_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Authenticated plaintext carried by one complete local WebRTC delivery.
@@ -263,6 +274,7 @@ fn stream_attach_connected(
             stream,
             &DaemonRequest::Drain {
                 session_id: session_id.to_string(),
+                subscription_id: Some(subscription_id.to_string()),
             },
         )?;
         let response: DaemonResponse = read_frame(stream)?;
@@ -567,6 +579,17 @@ impl DaemonCompatibilityRequirement {
         requirement.minimum_conformance_fixture_revision = CONFORMANCE_FIXTURE_REVISION;
         requirement
     }
+
+    /// Build the requirement for READY-then-history snapshot attach.
+    #[must_use]
+    pub fn for_ready_then_history_attach() -> Self {
+        let mut requirement = Self::current();
+        requirement
+            .required_features
+            .push(FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY.to_string());
+        requirement.minimum_conformance_fixture_revision = CONFORMANCE_FIXTURE_REVISION;
+        requirement
+    }
 }
 
 impl Default for DaemonCompatibilityRequirement {
@@ -781,6 +804,8 @@ pub enum DaemonRequest {
     },
     Drain {
         session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subscription_id: Option<String>,
     },
     ReadScreen {
         session_id: String,
@@ -1000,6 +1025,27 @@ pub enum DaemonRequest {
         request: UiActionRequest,
     },
     DaemonShutdown,
+}
+
+impl DaemonRequest {
+    #[must_use]
+    pub fn drain_session(session_id: impl Into<String>) -> Self {
+        Self::Drain {
+            session_id: session_id.into(),
+            subscription_id: None,
+        }
+    }
+
+    #[must_use]
+    pub fn drain_subscription(
+        session_id: impl Into<String>,
+        subscription_id: impl Into<String>,
+    ) -> Self {
+        Self::Drain {
+            session_id: session_id.into(),
+            subscription_id: Some(subscription_id.into()),
+        }
+    }
 }
 
 /// Server response variants for one local daemon request.
@@ -2773,6 +2819,7 @@ mod tests {
 
             let drain = DaemonRequest::Drain {
                 session_id: "session".to_string(),
+                subscription_id: Some("subscription".to_string()),
             };
             for _ in 0..20 {
                 expect_request(&mut server, &drain);
@@ -2859,6 +2906,7 @@ mod tests {
 
             let drain = DaemonRequest::Drain {
                 session_id: "session".to_string(),
+                subscription_id: Some("subscription".to_string()),
             };
             for _ in 0..20 {
                 expect_request(&mut server, &drain);
@@ -2960,7 +3008,7 @@ mod tests {
         assert!(
             error
                 .diagnostic
-                .contains("unsupported conformance fixture revision 36; requires at least 37")
+                .contains("unsupported conformance fixture revision 36; requires at least 38")
         );
 
         previous_daemon.conformance_fixture_revision = CONFORMANCE_FIXTURE_REVISION;
@@ -2974,6 +3022,23 @@ mod tests {
 
         ensure_compatible(&requirement, &DaemonCompatibility::current())
             .expect("a source-update client accepts the current daemon");
+    }
+
+    #[test]
+    fn ready_then_history_is_not_advertised_until_clean_review() {
+        assert!(
+            !DaemonCompatibility::current()
+                .supports_feature(FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY),
+            "do not advertise ready-then-history before clean review"
+        );
+        let requirement = DaemonCompatibilityRequirement::for_ready_then_history_attach();
+        let error = ensure_compatible(&requirement, &DaemonCompatibility::current())
+            .expect_err("the request-specific requirement must reject the current daemon");
+        assert!(
+            error
+                .diagnostic
+                .contains("missing required feature(s): snapshot_delivery=ready_then_history")
+        );
     }
 
     #[test]
@@ -3341,7 +3406,7 @@ mod tests {
     #[test]
     fn protocol_seven_rejects_protocol_six_and_accepts_conformance_floor_thirty_five() {
         assert_eq!(PROTOCOL_VERSION, 7);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 37);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 38);
 
         let protocol_six = DaemonCompatibilityRequirement {
             protocol_version: 6,
@@ -4844,6 +4909,7 @@ mod tests {
             },
             DaemonRequest::Drain {
                 session_id: "session".to_string(),
+                subscription_id: None,
             },
             DaemonRequest::ReadScreen {
                 session_id: "session".to_string(),
@@ -5855,7 +5921,7 @@ mod tests {
     #[test]
     fn protocol_six_and_conformance_thirty_two_define_the_cold_cut_boundary() {
         assert_eq!(PROTOCOL_VERSION, 7);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 37);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 38);
 
         let requirement = DaemonCompatibilityRequirement::current();
         let protocol_error = ensure_compatible(
@@ -5920,7 +5986,7 @@ mod tests {
         // conformance revision: bumping the protocol would break every existing
         // first-party client that never issues this request.
         assert_eq!(PROTOCOL_VERSION, 7);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 37);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 38);
         assert_eq!(DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION, 36);
         assert_eq!(
             current_feature_list(),
