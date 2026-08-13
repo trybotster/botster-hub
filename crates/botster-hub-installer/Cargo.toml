@@ -5,6 +5,7 @@ edition = "2024"
 description = "Managed installer for the revision-coupled botster-hub distribution"
 repository = "https://github.com/trybotster/botster-hub"
 license-file = "../../LICENSE"
+publish = false
 
 [[bin]]
 name = "botster-hub-installer"

@@ -5,12 +5,22 @@ usage() {
   cat >&2 <<'USAGE'
 usage: script/publish-npm-packages [--dry-run]
 
+One release process for the UI contract and the Hub test-support npm package.
+
 Builds, verifies, packs, and publishes:
+  crates.io botster-ui-contract
   @trybotster/ui-contract
   @trybotster/hub-test-support
 
-Both packages are packed before either package is published. Publishing happens
-in dependency order. Use --dry-run to stop after producing verified tarballs.
+The crates.io crate version and the npm UI-contract version must be equal.
+Both UI-contract packages are packed before either registry is published.
+Publishing happens in dependency order. Use --dry-run to stop after producing
+verified tarballs and the packed crate.
+
+Already-published coordinates whose integrity matches the local artifact are
+skipped. A published coordinate whose integrity differs is a hard error.
+This script never publishes botster-hub, botster-hub-client, or
+botster-hub-test-support to crates.io.
 USAGE
   exit 64
 }
@@ -26,6 +36,7 @@ esac
 repo_dir=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd -P)
 ui_dir=$repo_dir/packages/ui-contract
 hub_dir=$repo_dir/packages/hub-test-support
+crate_manifest=$repo_dir/crates/botster-ui-contract/Cargo.toml
 release_dir=$(mktemp -d "${TMPDIR:-/tmp}/botster-npm-release.XXXXXX")
 npm_config_cache=$release_dir/npm-cache
 export npm_config_cache
@@ -53,6 +64,35 @@ package_coordinate() {
     cd "$package_dir"
     node -p 'const package = require("./package.json"); `${package.name}@${package.version}`'
   )
+}
+
+npm_package_version() {
+  package_dir=$1
+  (
+    cd "$package_dir"
+    node -p 'require("./package.json").version'
+  )
+}
+
+crate_version() {
+  # First [package] version in the crate manifest. Do not read workspace files.
+  awk '
+    $0 == "[package]" { in_pkg = 1; next }
+    in_pkg && /^\[/ { exit }
+    in_pkg && $1 == "version" {
+      gsub(/"/, "", $3)
+      print $3
+      exit
+    }
+  ' "$crate_manifest"
+}
+
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
 }
 
 pack_package() {
@@ -164,7 +204,135 @@ publish_package() {
   }
 }
 
-for command_name in cargo git node npm; do
+crate_api_status() {
+  crate_name=$1
+  crate_ver=$2
+  status_file=$release_dir/crates-io-status
+  body_file=$release_dir/crates-io-version.json
+  error_file=$release_dir/crates-io-error
+
+  if ! curl -sS -A "trybotster-botster-hub-publish-ui-contract" \
+    -o "$body_file" -w "%{http_code}" \
+    "https://crates.io/api/v1/crates/${crate_name}/${crate_ver}" \
+    >"$status_file" 2>"$error_file"; then
+    cat "$error_file" >&2
+    exit 69
+  fi
+  cat "$status_file"
+}
+
+crate_is_published() {
+  crate_name=$1
+  crate_ver=$2
+  status=$(crate_api_status "$crate_name" "$crate_ver")
+  case "$status" in
+    200) return 0 ;;
+    404) return 1 ;;
+    *)
+      printf 'crates.io lookup failed for %s %s: HTTP %s\n' "$crate_name" "$crate_ver" "$status" >&2
+      cat "$release_dir/crates-io-version.json" >&2
+      exit 69
+      ;;
+  esac
+}
+
+published_crate_checksum() {
+  node -e '
+    const fs = require("node:fs");
+    const body = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    const checksum = body && body.version && body.version.checksum;
+    if (!checksum) {
+      process.stderr.write("crates.io response missing version.checksum\n");
+      process.exit(1);
+    }
+    process.stdout.write(checksum);
+  ' "$release_dir/crates-io-version.json"
+}
+
+validate_published_crate() {
+  crate_name=$1
+  crate_ver=$2
+  crate_file=$3
+  expected=$(sha256_file "$crate_file")
+  actual=$(published_crate_checksum)
+
+  [ "$actual" = "$expected" ] || {
+    printf 'Published crate does not match the locally packed crate: %s %s\nexpected: %s\nactual:   %s\n' \
+      "$crate_name" "$crate_ver" "$expected" "$actual" >&2
+    exit 67
+  }
+}
+
+require_cargo_credentials() {
+  if [ -n "${CARGO_REGISTRY_TOKEN-}" ]; then
+    return
+  fi
+  if [ -f "$HOME/.cargo/credentials.toml" ] || [ -f "$HOME/.cargo/credentials" ]; then
+    return
+  fi
+  printf 'CARGO_REGISTRY_TOKEN or ~/.cargo/credentials is required to publish crates.io crates.\n' >&2
+  exit 70
+}
+
+wait_for_published_crate() {
+  crate_name=$1
+  crate_ver=$2
+  attempt=1
+
+  while [ "$attempt" -le 18 ]; do
+    if crate_is_published "$crate_name" "$crate_ver"; then
+      return
+    fi
+    if [ "$attempt" -eq 18 ]; then
+      printf 'Published crate did not become visible within ninety seconds: %s %s\n' \
+        "$crate_name" "$crate_ver" >&2
+      return 1
+    fi
+
+    log "Waiting for crates.io to expose ${crate_name} ${crate_ver} (attempt $attempt of 18)" >&2
+    sleep 5
+    attempt=$((attempt + 1))
+  done
+}
+
+publish_crate() {
+  crate_name=$1
+  crate_ver=$2
+  crate_file=$3
+
+  if crate_is_published "$crate_name" "$crate_ver"; then
+    validate_published_crate "$crate_name" "$crate_ver" "$crate_file"
+    log "crates.io ${crate_name} ${crate_ver} is already published with matching checksum; skipping"
+    return
+  fi
+
+  require_cargo_credentials
+  log "Publishing crates.io ${crate_name} ${crate_ver}"
+  (
+    cd "$repo_dir"
+    cargo publish -p "$crate_name" --locked --no-verify
+  )
+  wait_for_published_crate "$crate_name" "$crate_ver" || {
+    printf 'Could not verify published crate %s %s\n' "$crate_name" "$crate_ver" >&2
+    exit 69
+  }
+  validate_published_crate "$crate_name" "$crate_ver" "$crate_file"
+}
+
+target_directory() {
+  (
+    cd "$repo_dir"
+    cargo metadata --format-version 1 --no-deps --offline --manifest-path "$crate_manifest"
+  ) | node -e '
+    let raw = "";
+    process.stdin.on("data", (chunk) => { raw += chunk; });
+    process.stdin.on("end", () => {
+      process.stdout.write(JSON.parse(raw).target_directory);
+    });
+  '
+}
+
+for command_name in cargo curl git node npm; do
   command -v "$command_name" >/dev/null 2>&1 || {
     printf 'Required command is unavailable: %s\n' "$command_name" >&2
     exit 69
@@ -175,6 +343,20 @@ require_clean_worktree
 
 ui_coordinate=$(package_coordinate "$ui_dir")
 hub_coordinate=$(package_coordinate "$hub_dir")
+ui_version=$(npm_package_version "$ui_dir")
+rust_crate_version=$(crate_version)
+crate_name=botster-ui-contract
+
+[ -n "$rust_crate_version" ] || {
+  printf 'Could not read version from %s\n' "$crate_manifest" >&2
+  exit 66
+}
+
+[ "$ui_version" = "$rust_crate_version" ] || {
+  printf 'UI contract versions must match before publish.\nnpm %s version: %s\ncrate %s version: %s\n' \
+    "$ui_coordinate" "$ui_version" "$crate_name" "$rust_crate_version" >&2
+  exit 67
+}
 
 log "Building $ui_coordinate"
 (
@@ -216,15 +398,29 @@ hub_tarball=$release_dir/$hub_tarball_name
   exit 66
 }
 
+log "Packing crates.io ${crate_name} ${rust_crate_version}"
+(
+  cd "$repo_dir"
+  cargo package -p "$crate_name" --locked --no-verify
+)
+crate_file=$(target_directory)/package/${crate_name}-${rust_crate_version}.crate
+[ -f "$crate_file" ] || {
+  printf 'Expected crate package was not created: %s\n' "$crate_file" >&2
+  exit 66
+}
+
 if package_is_published "$ui_coordinate"; then
   validate_published_package "$ui_coordinate" "$ui_tarball"
 fi
 if package_is_published "$hub_coordinate"; then
   validate_published_package "$hub_coordinate" "$hub_tarball"
 fi
+if crate_is_published "$crate_name" "$rust_crate_version"; then
+  validate_published_crate "$crate_name" "$rust_crate_version" "$crate_file"
+fi
 
 if [ "$dry_run" = true ]; then
-  log "Dry run passed for $ui_coordinate and $hub_coordinate"
+  log "Dry run passed for $ui_coordinate, crates.io ${crate_name} ${rust_crate_version}, and $hub_coordinate"
   exit 0
 fi
 
@@ -232,6 +428,7 @@ log "Checking npm authentication"
 npm whoami >/dev/null
 
 publish_package "$ui_coordinate" "$ui_tarball"
+publish_crate "$crate_name" "$rust_crate_version" "$crate_file"
 publish_package "$hub_coordinate" "$hub_tarball"
 
-log "Published $ui_coordinate and $hub_coordinate"
+log "Published $ui_coordinate, crates.io ${crate_name} ${rust_crate_version}, and $hub_coordinate"
