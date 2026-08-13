@@ -18,7 +18,7 @@
   "first_party_client_support_matrix": {
     "artifact_path": "first-party-client-support-matrix.json",
     "source_artifact_path": "botster_hub_test_support::first_party_client_support_matrix()",
-    "sha256": "ea53e8a988a13d1944f99603efeda99a1ab5b2de78dc92a4c371b683b611a156"
+    "sha256": "84965c58bb03210371dbd6eeb4646c7f6b91813922037e8754f8e6cd37eb3274"
   },
   "session_lifecycle_subscription_conformance_fixture": {
     "artifact_path": "session-lifecycle-subscription-conformance-fixture.json",

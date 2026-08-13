@@ -571,6 +571,29 @@ The replacement daemon reads the execution record from its resolved data
 directory. Clients must negotiate the `hub_source_update` feature before they
 send either request.
 
+The default client requirement accepts revision 36 daemons. The default
+requirement does not require the optional `hub_source_update` feature. A client
+that sends either source-update request must use the explicit requirement:
+
+```rust,no_run
+let endpoint = botster_hub_client::DaemonEndpoint::new("/tmp/botster-hub.sock");
+let mut requirement =
+    botster_hub_client::DaemonCompatibilityRequirement::for_hub_source_update();
+requirement.client_name = "example-client".to_string();
+
+let response = botster_hub_client::request_with_requirement(
+    &endpoint,
+    botster_hub_client::DaemonRequest::StartHubUpdate {
+        scope: botster_hub_client::DaemonHubUpdateScope::All,
+    },
+    &requirement,
+)?;
+# Ok::<(), botster_hub_client::DaemonTransportError>(())
+```
+
+This requirement fails before request dispatch when the daemon does not
+advertise `hub_source_update` or does not provide conformance revision 37.
+
 The source command builds the debug profile under `target/debug`. It does not
 build a release profile.
 

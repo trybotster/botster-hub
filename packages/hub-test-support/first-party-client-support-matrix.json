@@ -16,8 +16,7 @@
     "session_entity_subscriptions",
     "session_type_entity_subscriptions",
     "plugin_entity_subscriptions",
-    "mode_gated_input",
-    "hub_source_update"
+    "mode_gated_input"
   ],
   "supported_features": [
     "sessions",
