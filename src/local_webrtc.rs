@@ -145,7 +145,7 @@ impl LocalWebrtcTransport {
         package_name: &str,
         entrypoint_id: &str,
         expected_origin: &str,
-    ) -> LocalWebrtcResult<DaemonLocalWebrtcBootstrap> {
+    ) -> Result<DaemonLocalWebrtcBootstrap, LocalWebrtcError> {
         let now = now_seconds();
         self.prune_expired_grants(now);
         let grant_id = random_token("grant")?;
@@ -521,7 +521,7 @@ impl LocalWebrtcTransport {
     }
 }
 
-pub struct LocalWebrtcSignalRequest {
+pub(crate) struct LocalWebrtcSignalRequest {
     pub grant_id: String,
     pub grant_secret: String,
     pub origin: String,
@@ -1808,7 +1808,7 @@ fn now_seconds() -> u64 {
         .unwrap_or(0)
 }
 
-pub type LocalWebrtcResult<T> = Result<T, LocalWebrtcError>;
+pub(crate) type LocalWebrtcResult<T> = Result<T, LocalWebrtcError>;
 
 #[derive(Debug)]
 pub enum LocalWebrtcError {

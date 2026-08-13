@@ -1,8 +1,8 @@
 //! Local runtime daemon process ownership.
 //!
 //! Owns start, reuse, metadata, PID validation, signal, reap, and stale-daemon
-//! recovery. Package refresh, web launch, operator-console composition, and
-//! WebRTC smoke stay in `main`.
+//! recovery. Package refresh, web launch, and operator-console composition stay
+//! in `main`. WebRTC smoke lives in `local_webrtc_smoke`.
 
 use std::env;
 use std::io::{self, BufRead, BufReader};
