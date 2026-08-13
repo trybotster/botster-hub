@@ -23,6 +23,8 @@ mod typescript;
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 pub const PROTOCOL_VERSION: u16 = 7;
 pub const CONFORMANCE_FIXTURE_REVISION: u16 = 37;
+/// Oldest conformance revision accepted by the default first-party client requirement.
+pub const DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 36;
 /// Version of the local WebRTC delivery chunk framing protocol.
 pub const LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION: u16 = 2;
 /// Serialized local WebRTC delivery frames must remain strictly below this size.
@@ -90,7 +92,20 @@ pub fn request(
     endpoint: &DaemonEndpoint,
     request: DaemonRequest,
 ) -> DaemonTransportResult<DaemonResponse> {
-    let mut stream = connect_and_hello(endpoint)?;
+    request_with_requirement(
+        endpoint,
+        request,
+        &DaemonCompatibilityRequirement::current(),
+    )
+}
+
+/// Connect with an explicit compatibility requirement and send one request.
+pub fn request_with_requirement(
+    endpoint: &DaemonEndpoint,
+    request: DaemonRequest,
+    requirement: &DaemonCompatibilityRequirement,
+) -> DaemonTransportResult<DaemonResponse> {
+    let mut stream = connect_and_hello_with_requirement(endpoint, requirement)?;
     write_frame(&mut stream, &request)?;
     read_daemon_response(&mut stream)
 }
@@ -511,7 +526,10 @@ pub struct DaemonCompatibilityRequirement {
 }
 
 impl DaemonCompatibilityRequirement {
-    /// Build the current first-party daemon compatibility requirement.
+    /// Build the default first-party daemon compatibility requirement.
+    ///
+    /// The default requirement contains capabilities that all first-party clients need.
+    /// A client must use a request-specific requirement for an optional capability.
     ///
     /// ```
     /// let mut requirement = botster_hub_client::DaemonCompatibilityRequirement::current();
@@ -530,13 +548,24 @@ impl DaemonCompatibilityRequirement {
         Self {
             protocol: PROTOCOL.to_string(),
             protocol_version: PROTOCOL_VERSION,
-            required_features: current_feature_list()
+            required_features: default_required_feature_list()
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
-            minimum_conformance_fixture_revision: CONFORMANCE_FIXTURE_REVISION,
+            minimum_conformance_fixture_revision: DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION,
             client_name: "botster-hub-client".to_string(),
         }
+    }
+
+    /// Build the requirement for `StartHubUpdate` and `GetHubUpdateExecution`.
+    #[must_use]
+    pub fn for_hub_source_update() -> Self {
+        let mut requirement = Self::current();
+        requirement
+            .required_features
+            .push(FEATURE_HUB_SOURCE_UPDATE.to_string());
+        requirement.minimum_conformance_fixture_revision = CONFORMANCE_FIXTURE_REVISION;
+        requirement
     }
 }
 
@@ -650,6 +679,12 @@ fn compatibility_diagnostic(reason: &str) -> DaemonDiagnostic {
 }
 
 fn current_feature_list() -> Vec<&'static str> {
+    let mut features = default_required_feature_list();
+    features.push(FEATURE_HUB_SOURCE_UPDATE);
+    features
+}
+
+fn default_required_feature_list() -> Vec<&'static str> {
     vec![
         FEATURE_SESSIONS,
         FEATURE_TERMINAL_STREAMING,
@@ -665,7 +700,6 @@ fn current_feature_list() -> Vec<&'static str> {
         FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS,
         FEATURE_PLUGIN_ENTITY_SUBSCRIPTIONS,
         FEATURE_MODE_GATED_INPUT,
-        FEATURE_HUB_SOURCE_UPDATE,
     ]
 }
 
@@ -2898,6 +2932,48 @@ mod tests {
             &DaemonCompatibility::current(),
         )
         .expect("current client and hub are compatible");
+    }
+
+    #[test]
+    fn default_requirement_accepts_daemon_before_optional_source_update() {
+        let mut previous_daemon = DaemonCompatibility::current();
+        previous_daemon.conformance_fixture_revision = DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION;
+        previous_daemon
+            .features
+            .retain(|feature| feature != FEATURE_HUB_SOURCE_UPDATE);
+
+        ensure_compatible(&DaemonCompatibilityRequirement::current(), &previous_daemon)
+            .expect("the optional source-update capability must not break default clients");
+    }
+
+    #[test]
+    fn source_update_requirement_rejects_old_daemon_and_accepts_current_daemon() {
+        let requirement = DaemonCompatibilityRequirement::for_hub_source_update();
+        let mut previous_daemon = DaemonCompatibility::current();
+        previous_daemon.conformance_fixture_revision = DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION;
+        previous_daemon
+            .features
+            .retain(|feature| feature != FEATURE_HUB_SOURCE_UPDATE);
+
+        let error = ensure_compatible(&requirement, &previous_daemon)
+            .expect_err("a source-update client must reject an old daemon");
+        assert!(
+            error
+                .diagnostic
+                .contains("unsupported conformance fixture revision 36; requires at least 37")
+        );
+
+        previous_daemon.conformance_fixture_revision = CONFORMANCE_FIXTURE_REVISION;
+        let error = ensure_compatible(&requirement, &previous_daemon)
+            .expect_err("a source-update client must require the advertised feature");
+        assert!(
+            error
+                .diagnostic
+                .contains("missing required feature(s): hub_source_update")
+        );
+
+        ensure_compatible(&requirement, &DaemonCompatibility::current())
+            .expect("a source-update client accepts the current daemon");
     }
 
     #[test]
@@ -5845,6 +5921,7 @@ mod tests {
         // first-party client that never issues this request.
         assert_eq!(PROTOCOL_VERSION, 7);
         assert_eq!(CONFORMANCE_FIXTURE_REVISION, 37);
+        assert_eq!(DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION, 36);
         assert_eq!(
             current_feature_list(),
             vec![
@@ -5864,7 +5941,27 @@ mod tests {
                 FEATURE_MODE_GATED_INPUT,
                 FEATURE_HUB_SOURCE_UPDATE,
             ],
-            "the authoring read is a request, not a negotiated capability",
+            "the daemon advertises all current capabilities",
+        );
+        assert_eq!(
+            default_required_feature_list(),
+            vec![
+                FEATURE_SESSIONS,
+                FEATURE_TERMINAL_STREAMING,
+                FEATURE_RESIZE,
+                FEATURE_PLUGIN_SURFACE_RENDER,
+                FEATURE_PLUGIN_SURFACE_ACTION,
+                FEATURE_PACKAGE_ROUTES,
+                FEATURE_PACKAGE_NAVIGATION,
+                FEATURE_SPAWN_TARGETS,
+                FEATURE_WORKTREES,
+                FEATURE_TERMINAL_READBACK,
+                FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
+                FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS,
+                FEATURE_PLUGIN_ENTITY_SUBSCRIPTIONS,
+                FEATURE_MODE_GATED_INPUT,
+            ],
+            "the default client requirement excludes optional capabilities",
         );
 
         let pinned_at_thirty_one = DaemonCompatibilityRequirement {
