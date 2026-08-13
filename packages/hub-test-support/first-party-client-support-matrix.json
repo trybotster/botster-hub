@@ -33,7 +33,8 @@
     "session_type_entity_subscriptions",
     "plugin_entity_subscriptions",
     "mode_gated_input",
-    "hub_source_update"
+    "hub_source_update",
+    "snapshot_delivery=ready_then_history"
   ],
   "diagnostic_kinds": [
     "connected",

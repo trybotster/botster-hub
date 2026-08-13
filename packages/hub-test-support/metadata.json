@@ -1,6 +1,6 @@
 {
   "package_name": "@trybotster/hub-test-support",
-  "package_version": "0.1.32",
+  "package_version": "0.1.33",
   "protocol": "botster-hub-daemon-v1",
   "protocol_version": 7,
   "conformance_fixture_revision": 38,
@@ -18,7 +18,7 @@
   "first_party_client_support_matrix": {
     "artifact_path": "first-party-client-support-matrix.json",
     "source_artifact_path": "botster_hub_test_support::first_party_client_support_matrix()",
-    "sha256": "e2744e1e82fc1cb48622d5b60793593209b0ef75950a47fee5f5ce5debc2f35a"
+    "sha256": "1aa553779983435d544c19c42fe9e71e0b1ca379996c9011bf7fe6b7d8bcee24"
   },
   "session_lifecycle_subscription_conformance_fixture": {
     "artifact_path": "session-lifecycle-subscription-conformance-fixture.json",

@@ -704,6 +704,7 @@ fn compatibility_diagnostic(reason: &str) -> DaemonDiagnostic {
 fn current_feature_list() -> Vec<&'static str> {
     let mut features = default_required_feature_list();
     features.push(FEATURE_HUB_SOURCE_UPDATE);
+    features.push(FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY);
     features
 }
 
@@ -3025,20 +3026,45 @@ mod tests {
     }
 
     #[test]
-    fn ready_then_history_is_not_advertised_until_clean_review() {
-        assert!(
-            !DaemonCompatibility::current()
-                .supports_feature(FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY),
-            "do not advertise ready-then-history before clean review"
-        );
+    fn default_requirement_accepts_daemon_before_optional_ready_then_history() {
+        let mut previous_daemon = DaemonCompatibility::current();
+        previous_daemon.conformance_fixture_revision = DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION;
+        previous_daemon
+            .features
+            .retain(|feature| feature != FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY);
+
+        ensure_compatible(&DaemonCompatibilityRequirement::current(), &previous_daemon)
+            .expect("the optional ready-then-history capability must not break default clients");
+    }
+
+    #[test]
+    fn ready_then_history_requirement_rejects_old_daemon_and_accepts_current_daemon() {
         let requirement = DaemonCompatibilityRequirement::for_ready_then_history_attach();
-        let error = ensure_compatible(&requirement, &DaemonCompatibility::current())
-            .expect_err("the request-specific requirement must reject the current daemon");
+        let mut previous_daemon = DaemonCompatibility::current();
+        previous_daemon.conformance_fixture_revision = DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION;
+        previous_daemon
+            .features
+            .retain(|feature| feature != FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY);
+
+        let error = ensure_compatible(&requirement, &previous_daemon)
+            .expect_err("a ready-then-history client must reject an old daemon");
+        assert!(
+            error
+                .diagnostic
+                .contains("unsupported conformance fixture revision 36; requires at least 38")
+        );
+
+        previous_daemon.conformance_fixture_revision = CONFORMANCE_FIXTURE_REVISION;
+        let error = ensure_compatible(&requirement, &previous_daemon)
+            .expect_err("a ready-then-history client must require the advertised feature");
         assert!(
             error
                 .diagnostic
                 .contains("missing required feature(s): snapshot_delivery=ready_then_history")
         );
+
+        ensure_compatible(&requirement, &DaemonCompatibility::current())
+            .expect("a ready-then-history client accepts the current daemon");
     }
 
     #[test]
@@ -6006,6 +6032,7 @@ mod tests {
                 FEATURE_PLUGIN_ENTITY_SUBSCRIPTIONS,
                 FEATURE_MODE_GATED_INPUT,
                 FEATURE_HUB_SOURCE_UPDATE,
+                FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY,
             ],
             "the daemon advertises all current capabilities",
         );

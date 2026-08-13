@@ -5477,6 +5477,7 @@ mod tests {
                     botster_hub_client::FEATURE_PLUGIN_ENTITY_SUBSCRIPTIONS,
                     botster_hub_client::FEATURE_MODE_GATED_INPUT,
                     botster_hub_client::FEATURE_HUB_SOURCE_UPDATE,
+                    botster_hub_client::FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY,
                 ],
                 "diagnostic_kinds": [
                     "connected",
