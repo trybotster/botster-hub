@@ -273,12 +273,12 @@ fn spawn_attach_input_and_drain(
     )
     .expect("attach through client api");
     *logical_clock += 1;
-    drain_until(
+    read_screen_until(
         runtime,
         api,
         packages,
         &session_id,
-        b"runtime:ready",
+        "runtime:ready",
         logical_clock,
     );
 
@@ -309,6 +309,39 @@ fn spawn_attach_input_and_drain(
             .any(|window| window == INPUT_MARKER),
         "drain should include input marker"
     );
+}
+
+fn read_screen_until(
+    runtime: &mut botster_hub::HubRuntime,
+    api: &HubClientApi,
+    packages: &PackageRegistry,
+    session_id: &SessionId,
+    needle: &str,
+    logical_clock: &mut u64,
+) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let response = api
+            .handle_request(
+                runtime,
+                packages,
+                HubClientRequest::ReadScreen {
+                    request_id: request_id("runtime-read-screen"),
+                    session_id: session_id.clone(),
+                    now_seconds: *logical_clock,
+                },
+            )
+            .expect("read screen through client api");
+        *logical_clock += 1;
+        let HubClientResponseBody::ReadScreen(screen) = response.body else {
+            panic!("read screen response expected");
+        };
+        if screen.text.contains(needle) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("timed out waiting for {needle:?} in ReadScreen");
 }
 
 fn drain_until(

@@ -2763,6 +2763,39 @@ fn drain_until(
     );
 }
 
+fn read_screen_until(
+    api: &HubClientApi,
+    runtime: &mut HubRuntime,
+    packages: &PackageRegistry,
+    session_id: &SessionId,
+    needle: &str,
+    logical_clock: &mut u64,
+) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let response = api
+            .handle_request(
+                runtime,
+                packages,
+                HubClientRequest::ReadScreen {
+                    request_id: request_id("read-screen-until"),
+                    session_id: session_id.clone(),
+                    now_seconds: *logical_clock,
+                },
+            )
+            .expect("read screen through client api");
+        *logical_clock += 1;
+        let HubClientResponseBody::ReadScreen(screen) = response.body else {
+            panic!("read screen should return typed response");
+        };
+        if screen.text.contains(needle) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("timed out waiting for {needle:?} in ReadScreen");
+}
+
 fn drain_events_until(
     api: &HubClientApi,
     runtime: &mut HubRuntime,
@@ -2908,16 +2941,16 @@ fn late_attach_receives_opaque_history_before_later_live_output() {
         )
         .expect("attach first subscription");
     logical_clock += 1;
-    drain_until(
+    read_screen_until(
         &first_api,
         &mut runtime,
         &packages,
         &session_id,
-        b"before-late",
+        "before-late",
         &mut logical_clock,
     );
 
-    late_api
+    let late_attach = late_api
         .handle_request(
             &mut runtime,
             &packages,
@@ -2929,6 +2962,9 @@ fn late_attach_receives_opaque_history_before_later_live_output() {
             },
         )
         .expect("attach late subscription");
+    let HubClientResponseBody::Events(mut events) = late_attach.body else {
+        panic!("late attach should return initial events");
+    };
     logical_clock += 1;
 
     let readback = late_api
@@ -2967,7 +3003,7 @@ fn late_attach_receives_opaque_history_before_later_live_output() {
         .expect("send live output after late attach");
     logical_clock += 1;
 
-    let events = drain_events_until(
+    events.extend(drain_events_until(
         &late_api,
         &mut runtime,
         &packages,
@@ -2975,7 +3011,7 @@ fn late_attach_receives_opaque_history_before_later_live_output() {
         &late_subscription,
         b"after:live-after-late",
         &mut logical_clock,
-    );
+    ));
     let attaching_index = events
         .iter()
         .position(|event| {
@@ -3131,7 +3167,7 @@ fn late_attach_without_prior_output_does_not_fabricate_history() {
         .expect("attach first no-history subscription");
     logical_clock += 1;
 
-    late_api
+    let late_attach = late_api
         .handle_request(
             &mut runtime,
             &packages,
@@ -3143,6 +3179,9 @@ fn late_attach_without_prior_output_does_not_fabricate_history() {
             },
         )
         .expect("attach late no-history subscription");
+    let HubClientResponseBody::Events(mut events) = late_attach.body else {
+        panic!("late no-history attach should return initial events");
+    };
     logical_clock += 1;
 
     let readback = late_api
@@ -3180,7 +3219,7 @@ fn late_attach_without_prior_output_does_not_fabricate_history() {
         .expect("send live output after no-history late attach");
     logical_clock += 1;
 
-    let events = drain_events_until(
+    events.extend(drain_events_until(
         &late_api,
         &mut runtime,
         &packages,
@@ -3188,7 +3227,7 @@ fn late_attach_without_prior_output_does_not_fabricate_history() {
         &late_subscription,
         b"after:live-only",
         &mut logical_clock,
-    );
+    ));
 
     assert!(
         !events.iter().any(|event| {
@@ -3363,12 +3402,12 @@ fn local_client_api_exercises_status_spawn_attach_input_resize_detach_shutdown_a
         .expect("attach second client through client api");
     logical_clock += 1;
 
-    drain_until(
+    read_screen_until(
         &api,
         &mut runtime,
         &packages,
         &session_id,
-        b"ready",
+        "ready",
         &mut logical_clock,
     );
 
@@ -3584,12 +3623,12 @@ fn guarded_notification_write_is_hub_admitted_and_core_delivered() {
     .expect("attach through client api");
     logical_clock += 1;
 
-    drain_until(
+    read_screen_until(
         &api,
         &mut runtime,
         &packages,
         &session_id,
-        b"ready",
+        "ready",
         &mut logical_clock,
     );
 
