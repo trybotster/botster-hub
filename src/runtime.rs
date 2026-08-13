@@ -16,12 +16,12 @@ use botster_core::{
     SessionRuntimeErrorKind, SessionSpawnRequest, SubscriptionId, TerminalColorProfile,
 };
 use botster_core_daemon::{
-    AcknowledgeRoutedEnvelopeRequest, CaptureSnapshotRequest, CaptureSnapshotResult, CoreDaemon,
-    CoreDaemonConfig, CoreDaemonError, DaemonSession, DrainResult, DrainRoutedEnvelopesRequest,
-    GuardedWriteRequest, GuardedWriteResult, ModeGatedInputOutcome, PublishRoutedEnvelopeRequest,
-    ReadModeFlagsRequest, ReadModeFlagsResult, ReadScreenRequest, ReadScreenResult,
-    RegistrySessionState, RoutedEnvelopeDeliveryStateResult, SessionAdoptionReport,
-    SessionAdoptionState, SessionLifecycleBaseline, SessionLifecycleChanges,
+    AcknowledgeRoutedEnvelopeRequest, AttachedSession, CaptureSnapshotRequest,
+    CaptureSnapshotResult, CoreDaemon, CoreDaemonConfig, CoreDaemonError, DaemonSession,
+    DrainResult, DrainRoutedEnvelopesRequest, GuardedWriteRequest, GuardedWriteResult,
+    ModeGatedInputOutcome, PublishRoutedEnvelopeRequest, ReadModeFlagsRequest, ReadModeFlagsResult,
+    ReadScreenRequest, ReadScreenResult, RegistrySessionState, RoutedEnvelopeDeliveryStateResult,
+    SessionAdoptionReport, SessionAdoptionState, SessionLifecycleBaseline, SessionLifecycleChanges,
     SessionLifecycleCursor, SpawnSessionRequest,
 };
 use botster_ui_contract::{UiActionRequest, UiActionResult, UiNode};
@@ -1830,12 +1830,13 @@ impl HubRuntime {
         session_id: SessionId,
         subscription_id: SubscriptionId,
         now_seconds: u64,
-    ) -> Result<(), CoreDaemonError> {
-        self.core_daemon
-            .lock()
-            .expect("core daemon mutex")
-            .attach(client_id, session_id, subscription_id, now_seconds)
-            .map(|_| ())
+    ) -> Result<AttachedSession, CoreDaemonError> {
+        self.core_daemon.lock().expect("core daemon mutex").attach(
+            client_id,
+            session_id,
+            subscription_id,
+            now_seconds,
+        )
     }
 
     /// Detach a client subscription from a session through the core daemon.

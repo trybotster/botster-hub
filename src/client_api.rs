@@ -152,7 +152,7 @@ impl HubClientApi {
                 now_seconds,
                 ..
             } => {
-                runtime
+                let attached = runtime
                     .attach_client(
                         self.identity.client_id.clone(),
                         session_id,
@@ -160,7 +160,10 @@ impl HubClientApi {
                         now_seconds,
                     )
                     .map_err(|error| runtime_error(request_id.clone(), operation, error))?;
-                HubClientResponseBody::Events(Vec::new())
+                HubClientResponseBody::Events(events_from_drain(botster_core_daemon::DrainResult {
+                    client_egress: attached.client_egress,
+                    ..botster_core_daemon::DrainResult::default()
+                }))
             }
             HubClientRequest::Detach {
                 session_id,
