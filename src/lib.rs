@@ -49,6 +49,8 @@ pub mod persistence;
 pub mod profile;
 pub mod runtime;
 pub mod session_types;
+#[doc(hidden)]
+pub mod source_update;
 pub mod spawn_targets;
 pub mod worktrees;
 
@@ -100,6 +102,7 @@ pub use daemon_transport::{
     DaemonApp, DaemonAppLaunchTarget, DaemonAvailablePackage, DaemonCapability,
     DaemonCompatibility, DaemonConnection, DaemonCoordination, DaemonEnvelope, DaemonEnvelopeAck,
     DaemonEnvelopeDelivery, DaemonEnvelopePublish, DaemonEvent, DaemonHubUpdate,
+    DaemonHubUpdateExecution, DaemonHubUpdateExecutionState, DaemonHubUpdateScope,
     DaemonHubUpdateState, DaemonIdentity, DaemonInstallationDiagnostic, DaemonInstallationIdentity,
     DaemonInstallationMode, DaemonModeFlags, DaemonNotify, DaemonOperatorError, DaemonPackage,
     DaemonPackageActionRequest, DaemonPackageActionRequiredReference, DaemonPackageActionState,

@@ -1721,6 +1721,7 @@ fn response_with_diagnostic(diagnostic: DaemonDiagnostic) -> DaemonResponse {
         install_plan: None,
         update_status: None,
         hub_update: None,
+        hub_update_execution: None,
         package_decision: None,
         lifecycle: Vec::new(),
         plugin_worker_counters: None,

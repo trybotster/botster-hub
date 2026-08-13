@@ -51,6 +51,13 @@ impl UpdateScope {
             _ => Err(usage()),
         }
     }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Core => "core",
+            Self::All => "all",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -345,6 +352,35 @@ pub(super) fn run(args: Vec<String>) -> Result<(), String> {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
     };
     execute(options, &source_root, &mut ProcessCommandRunner)
+}
+
+pub(super) fn run_handoff(args: Vec<String>) -> Result<(), String> {
+    if args.len() != 5 || args[1] != "--data-dir" || args[3] != "--update-id" {
+        return Err("invalid internal update handoff".to_string());
+    }
+    let scope = UpdateScope::parse(&args[0])?;
+    let data_directory = PathBuf::from(&args[2]);
+    let update_id = &args[4];
+    let mut gate = [0_u8; 1];
+    io::stdin()
+        .read_exact(&mut gate)
+        .map_err(|error| format!("wait for update handoff: {error}"))?;
+    botster_hub::source_update::mark_update_running(&data_directory, update_id)?;
+    let result = run(vec![
+        scope.as_str().to_string(),
+        "--data-dir".to_string(),
+        data_directory.display().to_string(),
+    ]);
+    match result {
+        Ok(()) => {
+            botster_hub::source_update::mark_update_complete(&data_directory, update_id)?;
+            Ok(())
+        }
+        Err(error) => {
+            botster_hub::source_update::mark_update_failed(&data_directory, update_id, &error)?;
+            Err(error)
+        }
+    }
 }
 
 fn execute(

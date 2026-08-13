@@ -61,6 +61,94 @@ fn update_rejects_a_dirty_source_repository_through_the_production_cli() {
 }
 
 #[test]
+fn daemon_api_starts_and_reports_a_failed_source_update() {
+    ensure_session_worker_binary();
+    let root = unique_test_dir("daemon-api-update");
+    let data_dir = root.join("data");
+    let source = root.join("source");
+    fs::create_dir_all(&source).unwrap();
+    git(&source, &["init"]);
+    git(
+        &source,
+        &["config", "user.email", "update-test@example.invalid"],
+    );
+    git(&source, &["config", "user.name", "Update Test"]);
+    fs::write(source.join("tracked"), "clean\n").unwrap();
+    git(&source, &["add", "tracked"]);
+    git(&source, &["commit", "-m", "fixture"]);
+    fs::write(source.join("operator-change"), "preserve\n").unwrap();
+
+    let hub_bin = PathBuf::from(env!("CARGO_BIN_EXE_botster-hub"))
+        .canonicalize()
+        .unwrap();
+    let worker_bin = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target/debug/botster-session-worker")
+        .canonicalize()
+        .unwrap();
+    let daemon_pid =
+        start_detached_daemon_with_update_source(&hub_bin, &worker_bin, &data_dir, &source, &root);
+    wait_for_status(&hub_bin, &data_dir);
+    write_runtime_metadata(&data_dir, &data_dir, &hub_bin, &worker_bin, daemon_pid);
+    let daemon_command = Command::new("ps")
+        .args(["-p", &daemon_pid.to_string(), "-o", "command="])
+        .output()
+        .unwrap();
+    assert!(daemon_command.status.success());
+    assert!(
+        String::from_utf8_lossy(&daemon_command.stdout).contains(" start "),
+        "{}",
+        String::from_utf8_lossy(&daemon_command.stdout)
+    );
+    let endpoint = botster_hub_client::DaemonEndpoint::new(data_dir.join("botster-hub.sock"));
+
+    let accepted = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::StartHubUpdate {
+            scope: botster_hub_client::DaemonHubUpdateScope::Core,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        accepted.kind,
+        botster_hub_client::DaemonResponseKind::HubUpdateExecution
+    );
+    let accepted = accepted.hub_update_execution.unwrap();
+    assert_eq!(
+        accepted.state,
+        botster_hub_client::DaemonHubUpdateExecutionState::Started
+    );
+    assert!(accepted.updater_pid > 0);
+
+    let failed = wait_for_update_execution(
+        &endpoint,
+        botster_hub_client::DaemonHubUpdateExecutionState::Failed,
+    );
+    assert_eq!(failed.update_id, accepted.update_id);
+    assert!(
+        failed
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("repository is dirty")),
+        "{failed:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(source.join("operator-change")).unwrap(),
+        "preserve\n"
+    );
+    let status =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status).unwrap();
+    assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
+
+    let shutdown = Command::new(&hub_bin)
+        .args(["down", "--data-dir"])
+        .arg(&data_dir)
+        .output()
+        .unwrap();
+    assert!(shutdown.status.success());
+    wait_for_process_exit(daemon_pid);
+}
+
+#[test]
 fn update_build_failure_leaves_the_running_daemon_unchanged() {
     ensure_session_worker_binary();
     let root = unique_test_dir("build-failure");
@@ -334,17 +422,23 @@ fn update_all_replaces_an_incompatible_preupdate_worker_and_proves_attach_order(
     let hub_bin = PathBuf::from(env!("CARGO_BIN_EXE_botster-hub"))
         .canonicalize()
         .unwrap();
-    let old_pid = start_detached_daemon(&hub_bin, &preupdate_worker, &data_dir, &root);
+    let old_pid = start_detached_daemon_with_update_source(
+        &hub_bin,
+        &preupdate_worker,
+        &data_dir,
+        &source,
+        &root,
+    );
     wait_for_status(&hub_bin, &data_dir);
     let data_directory_arg = data_dir.clone();
-    let data_dir = data_dir.canonicalize().unwrap();
     write_runtime_metadata(
-        &data_dir,
+        &data_directory_arg,
         &data_directory_arg,
         &hub_bin,
         &preupdate_worker,
         old_pid,
     );
+    let data_dir = data_dir.canonicalize().unwrap();
     let endpoint = botster_hub_client::DaemonEndpoint::new(data_dir.join("botster-hub.sock"));
     let old_session = "preupdate-incompatible-session";
     let spawn = botster_hub_client::request(
@@ -375,28 +469,31 @@ fn update_all_replaces_an_incompatible_preupdate_worker_and_proves_attach_order(
         "fixed pre-update worker must reproduce the incompatibility: {old_probe:?}"
     );
 
-    let path = format!(
-        "{}:{}",
-        source.join("fake-bin").display(),
-        std::env::var("PATH").unwrap_or_default()
+    let accepted = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::StartHubUpdate {
+            scope: botster_hub_client::DaemonHubUpdateScope::All,
+        },
+    )
+    .expect("start production update through the client contract")
+    .hub_update_execution
+    .expect("accepted Hub update execution");
+    assert_eq!(
+        accepted.state,
+        botster_hub_client::DaemonHubUpdateExecutionState::Started
     );
-    let update = Command::new(&hub_bin)
-        .args(["update", "all", "--data-dir"])
-        .arg(&data_dir)
-        .env("BOTSTER_ENV", "test")
-        .env("BOTSTER_HUB_TEST_UPDATE_SOURCE_ROOT", &source)
-        .env("PATH", path)
-        .output()
-        .expect("run production update with a pre-update worker");
-    assert!(
-        update.status.success(),
-        "{}",
-        String::from_utf8_lossy(&update.stderr)
+    let completed = wait_for_update_execution(
+        &endpoint,
+        botster_hub_client::DaemonHubUpdateExecutionState::Complete,
     );
-    let stdout = String::from_utf8_lossy(&update.stdout);
+    assert_eq!(completed.update_id, accepted.update_id);
+    let update_log = fs::read_to_string(
+        data_dir.join(format!(".botster-hub-update-{}.log", accepted.update_id)),
+    )
+    .expect("read detached updater log");
     assert!(
-        stdout.contains("\"code\":\"unsafe_mode_generation\"")
-            || stdout.contains("\"code\":\"read_mode_flags_rejected\"")
+        update_log.contains("\"code\":\"unsafe_mode_generation\"")
+            || update_log.contains("\"code\":\"read_mode_flags_rejected\"")
     );
     wait_for_process_exit(old_identity.0);
     assert!(
@@ -733,6 +830,40 @@ fn start_detached_daemon(hub_bin: &Path, worker_bin: &Path, data_dir: &Path, roo
         .unwrap()
 }
 
+fn start_detached_daemon_with_update_source(
+    hub_bin: &Path,
+    worker_bin: &Path,
+    data_dir: &Path,
+    source: &Path,
+    root: &Path,
+) -> u32 {
+    let pid_file = root.join("daemon-api.pid");
+    let path_prefix = source.join("fake-bin");
+    let path_assignment = if path_prefix.is_dir() {
+        format!("PATH={}:$PATH ", path_prefix.display())
+    } else {
+        String::new()
+    };
+    let command = format!(
+        "BOTSTER_ENV=test BOTSTER_HUB_TEST_UPDATE_SOURCE_ROOT={} {path_assignment}{} start --data-dir {} --session-worker-bin {} >/dev/null 2>&1 & echo $! > {}",
+        source.display(),
+        hub_bin.display(),
+        data_dir.display(),
+        worker_bin.display(),
+        pid_file.display()
+    );
+    let status = Command::new("/bin/sh")
+        .args(["-c", &command])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    fs::read_to_string(pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
 fn write_runtime_metadata(
     data_dir: &Path,
     data_directory_arg: &Path,
@@ -740,9 +871,12 @@ fn write_runtime_metadata(
     worker_bin: &Path,
     pid: u32,
 ) {
+    let stable_data_directory = data_dir
+        .canonicalize()
+        .unwrap_or_else(|_| data_dir.to_path_buf());
     let metadata = serde_json::json!({
         "pid": pid,
-        "data_directory": data_dir.to_string_lossy(),
+        "data_directory": stable_data_directory.to_string_lossy(),
         "data_directory_arg": data_directory_arg.to_string_lossy(),
         "socket_path": data_dir.join("botster-hub.sock").to_string_lossy(),
         "hub_bin": hub_bin.to_string_lossy(),
@@ -768,6 +902,29 @@ fn wait_for_status(hub_bin: &Path, data_dir: &Path) {
         thread::sleep(Duration::from_millis(20));
     }
     panic!("daemon did not become ready");
+}
+
+fn wait_for_update_execution(
+    endpoint: &botster_hub_client::DaemonEndpoint,
+    expected: botster_hub_client::DaemonHubUpdateExecutionState,
+) -> botster_hub_client::DaemonHubUpdateExecution {
+    for _ in 0..8_000 {
+        let Ok(response) = botster_hub_client::request(
+            endpoint,
+            botster_hub_client::DaemonRequest::GetHubUpdateExecution,
+        ) else {
+            thread::sleep(Duration::from_millis(25));
+            continue;
+        };
+        let execution = response
+            .hub_update_execution
+            .expect("Hub update execution body");
+        if execution.state == expected {
+            return execution;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!("Hub update execution did not reach {expected:?}");
 }
 
 fn unique_test_dir(label: &str) -> PathBuf {
