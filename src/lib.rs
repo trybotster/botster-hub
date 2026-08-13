@@ -34,12 +34,20 @@
 //!         && export.class() == botster_hub::HubCrateExportClass::ClientContract
 //!         && export.stability() == botster_hub::HubCrateExportStability::KeepPublic
 //! }));
+//!
+//! let mut transport = botster_hub::LocalWebrtcTransport::default();
+//! assert!(
+//!     transport
+//!         .issue_bootstrap("botster-web", "web-client", "http://127.0.0.1:1")
+//!         .is_ok()
+//! );
+//! transport.stop_all();
 //! ```
 //!
-//! Crate-root module visibility is unchanged. [`architecture_summary`] classifies
-//! Hub policy exports, `botster-hub-client` contract re-exports, and internal
-//! modules. A later dedicated API change may hide `FutureInternal` modules.
-//! `AlreadyInternal` marks modules that are already crate-private.
+//! [`architecture_summary`] classifies Hub policy exports, `botster-hub-client`
+//! contract re-exports, and internal modules. `AlreadyInternal` marks
+//! crate-private modules. A later dedicated API change may hide remaining
+//! `FutureInternal` modules.
 
 pub mod auth;
 pub mod capabilities;
@@ -51,7 +59,7 @@ mod daemon_projection;
 pub mod daemon_transport;
 pub mod entrypoint_supervisor;
 pub mod lifecycle;
-pub mod local_webrtc;
+pub(crate) mod local_webrtc;
 pub mod lua_runtime;
 pub mod maintenance;
 pub mod managed_git_worktrees;
@@ -524,8 +532,8 @@ const HUB_CRATE_EXPORTS: &[HubCrateExport] = &[
     HubCrateExport::new(
         "local_webrtc",
         HubCrateExportClass::Internal,
-        HubCrateExportStability::FutureInternal,
-        "first-party transport adapter; external clients use botster-hub-client",
+        HubCrateExportStability::AlreadyInternal,
+        "crate-private adapter; LocalWebrtcError and LocalWebrtcTransport stay public at crate root",
     ),
     HubCrateExport::new(
         "lua_runtime",
@@ -767,16 +775,18 @@ mod tests {
         #[allow(unused_imports)]
         use crate::{
             DaemonRequest, HubClientRequest, HubRuntime, LOCAL_RUNTIME_DAEMON_READINESS_BUDGET,
-            LocalWebrtcTransport, PackageRegistry, auth, capabilities, client_api, config,
-            credentials, daemon, daemon_transport, entrypoint_supervisor, lifecycle, local_webrtc,
-            lua_runtime, maintenance, managed_git_worktrees, mcp, package_entity_fanout, packages,
-            persistence, profile, runtime, session_types, source_update, spawn_targets, worktrees,
+            LocalWebrtcError, LocalWebrtcTransport, PackageRegistry, auth, capabilities,
+            client_api, config, credentials, daemon, daemon_transport, entrypoint_supervisor,
+            lifecycle, lua_runtime, maintenance, managed_git_worktrees, mcp, package_entity_fanout,
+            packages, persistence, profile, runtime, session_types, source_update, spawn_targets,
+            worktrees,
         };
 
         let _: Option<DaemonRequest> = None;
         let _: Option<HubClientRequest> = None;
         let _: Option<HubRuntime> = None;
         let _: Option<PackageRegistry> = None;
+        let _: Option<LocalWebrtcError> = None;
         let _: Option<LocalWebrtcTransport> = None;
         let _ = LOCAL_RUNTIME_DAEMON_READINESS_BUDGET;
         let _ = source_update::mark_update_running;
@@ -786,19 +796,21 @@ mod tests {
     #[test]
     fn architecture_summary_defers_visibility_changes_for_internal_modules() {
         let summary = architecture_summary();
-        let projection = summary
-            .crate_exports()
-            .iter()
-            .find(|export| export.name() == "daemon_projection")
-            .expect("daemon_projection");
-        assert_eq!(projection.class(), HubCrateExportClass::Internal);
-        assert_eq!(
-            projection.stability(),
-            HubCrateExportStability::AlreadyInternal
-        );
+        for name in ["daemon_projection", "local_webrtc"] {
+            let export = summary
+                .crate_exports()
+                .iter()
+                .find(|export| export.name() == name)
+                .unwrap_or_else(|| panic!("missing export {name}"));
+            assert_eq!(export.class(), HubCrateExportClass::Internal, "{name}");
+            assert_eq!(
+                export.stability(),
+                HubCrateExportStability::AlreadyInternal,
+                "{name}"
+            );
+        }
 
         for name in [
-            "local_webrtc",
             "managed_git_worktrees",
             "package_entity_fanout",
             "source_update",

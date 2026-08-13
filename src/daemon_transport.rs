@@ -18,10 +18,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use botster_core::{
-    EndpointId, EnvelopeCursor, EnvelopeDeliveryState, EnvelopeId, EnvelopeTarget,
-    PackageConfigurationValue, PackageSource, RequestId, RoutedEnvelope, RoutedEnvelopePayload,
-    RunnableEntrypointKind, RunnableEntrypointLaunchMode, SessionId, SessionLifecycleState,
-    SubscriptionId, TerminalAttachState,
+    EndpointId, EnvelopeCursor, EnvelopeDeliveryState, EnvelopeId, EnvelopeTarget, PackageSource,
+    RequestId, RoutedEnvelope, RoutedEnvelopePayload, RunnableEntrypointKind,
+    RunnableEntrypointLaunchMode, SessionId, SessionLifecycleState, SubscriptionId,
+    TerminalAttachState,
 };
 use botster_core_daemon::{
     GuardedWriteDecision, GuardedWriteDeliveryState, ReadinessEvidence, RegistrySessionState,
@@ -103,6 +103,14 @@ use crate::{
     SpawnTarget, SpawnTargetCreate, SpawnTargetError, SpawnTargetUpdate, SpawnTargetValidation,
 };
 use crate::{Worktree, WorktreeCreate, WorktreeError};
+
+#[path = "daemon_package_control.rs"]
+mod daemon_package_control;
+use daemon_package_control::{
+    apply_package_update, configure_package, disable_package, enable_package,
+    enable_package_local_path, install_local_package, install_registry_package,
+    refresh_local_packages, reload_package, remove_package,
+};
 
 #[path = "daemon_entity_subscriptions.rs"]
 mod daemon_entity_subscriptions;
@@ -1193,6 +1201,9 @@ pub(crate) fn handle_control_message(
                 DaemonTransportError::State(error) => Ok(daemon_state_error(error)),
                 DaemonTransportError::Entrypoint(error) => Ok(daemon_entrypoint_error(error)),
                 DaemonTransportError::LocalWebrtc(error) => Ok(daemon_local_webrtc_error(error)),
+                error @ DaemonTransportError::PackageCompensation { .. } => {
+                    Ok(daemon_package_compensation_error(error))
+                }
                 error => Err(error),
             });
             if response
@@ -1679,47 +1690,9 @@ fn handle_control_request(
         DaemonRequest::InstallPackageRegistryEntry {
             registry_path,
             entry_id,
-        } => {
-            let before_session_types = session_type_definition_map(daemon)?;
-            let decision = {
-                let record = daemon.package_registry_mut().install_registry_entry(
-                    registry_path,
-                    &entry_id,
-                    "daemon socket install registry package",
-                )?;
-                PackageDecision {
-                    package_name: record.manifest.name.clone(),
-                    action: PackageAction::Install,
-                    state: record.state,
-                    classification: record.classification,
-                    admitted_host_profile: None,
-                    audit_reason: record.last_audit_reason.clone(),
-                }
-            };
-            persist_package_registry(daemon)?;
-            advance_session_type_generation_if_changed(daemon, &before_session_types)?;
-            package_decision_response(daemon, decision)
-        }
+        } => install_registry_package(daemon, registry_path, entry_id),
         DaemonRequest::PluginLifecycleStatus => plugin_lifecycle_response(daemon),
-        DaemonRequest::InstallPackageLocalPath { path } => {
-            let before_session_types = session_type_definition_map(daemon)?;
-            let decision = {
-                let record = daemon
-                    .package_registry_mut()
-                    .install_local_path(path, "daemon socket install local package")?;
-                PackageDecision {
-                    package_name: record.manifest.name.clone(),
-                    action: PackageAction::Install,
-                    state: record.state,
-                    classification: record.classification,
-                    admitted_host_profile: None,
-                    audit_reason: record.last_audit_reason.clone(),
-                }
-            };
-            persist_package_registry(daemon)?;
-            advance_session_type_generation_if_changed(daemon, &before_session_types)?;
-            package_decision_response(daemon, decision)
-        }
+        DaemonRequest::InstallPackageLocalPath { path } => install_local_package(daemon, path),
         DaemonRequest::CheckPackageUpdate { package_name } => {
             check_package_update_response(daemon, &package_name)
         }
@@ -1727,142 +1700,19 @@ fn handle_control_request(
             preview_package_update_response(daemon, &package_name, pin)
         }
         DaemonRequest::ApplyPackageUpdate { package_name, pin } => {
-            let before_session_types = session_type_definition_map(daemon)?;
-            let update_status = package_update_status(daemon, &package_name, Some(pin.clone()))?;
-            let decision = {
-                let pin = package_pin_from_daemon(pin)?;
-                let record = daemon.package_registry_mut().pin(
-                    &package_name,
-                    pin,
-                    "daemon socket apply package update",
-                )?;
-                PackageDecision {
-                    package_name: record.manifest.name.clone(),
-                    action: PackageAction::ApplyUpdate,
-                    state: record.state,
-                    classification: record.classification,
-                    admitted_host_profile: record.admitted_host_profile.clone(),
-                    audit_reason: record.last_audit_reason.clone(),
-                }
-            };
-            persist_package_registry(daemon)?;
-            advance_session_type_generation_if_changed(daemon, &before_session_types)?;
-            let mut response = package_decision_response(daemon, decision)?;
-            response.update_status = Some(update_status);
-            Ok(response)
+            apply_package_update(daemon, package_name, pin)
         }
         DaemonRequest::ShowPackage { package_name } => show_package_response(daemon, &package_name),
         DaemonRequest::SetPackageConfiguration {
             package_name,
             values,
-        } => {
-            let values = values
-                .into_iter()
-                .map(|(key, value)| {
-                    serde_json::from_value::<PackageConfigurationValue>(value)
-                        .map(|value| (key.clone(), value))
-                        .map_err(|error| {
-                            PackageRegistryError::without_record(
-                                package_name.clone(),
-                                PackageAction::Configure,
-                                PackageAdmissionReason::InvalidConfiguration(vec![
-                                    crate::PackageConfigurationDiagnostic {
-                                        kind: "value_decode_error".to_string(),
-                                        field: Some(key),
-                                        message: format!(
-                                            "configuration value is not a package configuration value: {error}"
-                                        ),
-                                    },
-                                ]),
-                                "daemon socket configure package".to_string(),
-                            )
-                        })
-                })
-                .collect::<Result<BTreeMap<_, _>, _>>()?;
-            daemon.package_registry_mut().set_configuration(
-                &package_name,
-                values,
-                "daemon socket configure package",
-            )?;
-            persist_package_registry(daemon)?;
-            show_package_response(daemon, &package_name)
-        }
-        DaemonRequest::ReloadPackage { package_name } => {
-            let before_session_types = session_type_definition_map(daemon)?;
-            let running_entrypoints = daemon
-                .entrypoint_supervisor()
-                .snapshots()
-                .into_iter()
-                .filter(|snapshot| {
-                    snapshot.package_name == package_name && snapshot.state == "running"
-                })
-                .map(|snapshot| snapshot.entrypoint_id)
-                .collect::<Vec<_>>();
-            let (candidate, decision) = daemon
-                .package_registry()
-                .refreshed_local_package(&package_name, "daemon socket reload local package")?;
-            commit_package_registry(daemon, candidate)?;
-            if decision.state == PackageState::Enabled {
-                reload_package_after_reload(daemon, &package_name)?;
-            }
-            restart_running_package_entrypoints(daemon, &package_name, &running_entrypoints)?;
-            advance_session_type_generation_if_changed(daemon, &before_session_types)?;
-            package_decision_response(daemon, decision)
-        }
-        DaemonRequest::RefreshLocalPackages => {
-            let before_session_types = session_type_definition_map(daemon)?;
-            let response = refresh_local_packages_response(daemon)?;
-            advance_session_type_generation_if_changed(daemon, &before_session_types)?;
-            Ok(response)
-        }
-        DaemonRequest::EnablePackageLocalPath { path } => {
-            let before_session_types = session_type_definition_map(daemon)?;
-            let package_name = {
-                let record = daemon
-                    .package_registry_mut()
-                    .install_local_path(path, "daemon socket enable local package")?;
-                record.manifest.name.clone()
-            };
-            let decision = daemon
-                .package_registry_mut()
-                .enable(&package_name, "daemon socket enable local package")?;
-            persist_package_registry(daemon)?;
-            load_package_after_enable(daemon, &package_name)?;
-            advance_session_type_generation_if_changed(daemon, &before_session_types)?;
-            package_decision_response(daemon, decision)
-        }
-        DaemonRequest::EnablePackage { package_name } => {
-            let before_session_types = session_type_definition_map(daemon)?;
-            let decision = daemon
-                .package_registry_mut()
-                .enable(&package_name, "daemon socket enable package")?;
-            persist_package_registry(daemon)?;
-            load_package_after_enable(daemon, &package_name)?;
-            advance_session_type_generation_if_changed(daemon, &before_session_types)?;
-            package_decision_response(daemon, decision)
-        }
-        DaemonRequest::DisablePackage { package_name } => {
-            let before_session_types = session_type_definition_map(daemon)?;
-            daemon.entrypoint_supervisor().stop_package(&package_name);
-            let decision = daemon
-                .package_registry_mut()
-                .disable(&package_name, "daemon socket disable package")?;
-            persist_package_registry(daemon)?;
-            unload_package_after_disable(daemon, &package_name)?;
-            advance_session_type_generation_if_changed(daemon, &before_session_types)?;
-            package_decision_response(daemon, decision)
-        }
-        DaemonRequest::RemovePackage { package_name } => {
-            let before_session_types = session_type_definition_map(daemon)?;
-            daemon.entrypoint_supervisor().stop_package(&package_name);
-            unload_package_after_disable(daemon, &package_name)?;
-            let decision = daemon
-                .package_registry_mut()
-                .remove(&package_name, "daemon socket remove package")?;
-            persist_package_registry(daemon)?;
-            advance_session_type_generation_if_changed(daemon, &before_session_types)?;
-            package_decision_response(daemon, decision)
-        }
+        } => configure_package(daemon, package_name, values),
+        DaemonRequest::ReloadPackage { package_name } => reload_package(daemon, package_name),
+        DaemonRequest::RefreshLocalPackages => refresh_local_packages(daemon),
+        DaemonRequest::EnablePackageLocalPath { path } => enable_package_local_path(daemon, path),
+        DaemonRequest::EnablePackage { package_name } => enable_package(daemon, package_name),
+        DaemonRequest::DisablePackage { package_name } => disable_package(daemon, package_name),
+        DaemonRequest::RemovePackage { package_name } => remove_package(daemon, package_name),
         DaemonRequest::StartPackageEntrypoint {
             package_name,
             entrypoint_id,
@@ -2747,175 +2597,9 @@ fn runtime_client_id(request: &DaemonRequest) -> String {
     }
 }
 
-fn load_package_after_enable(
-    daemon: &mut HubDaemon,
-    package_name: &str,
-) -> DaemonTransportResult<()> {
-    let package_registry = daemon.package_registry().clone();
-    let prepared = package_registry.prepare_local_package(
-        package_name,
-        "daemon socket load enabled local plugin package",
-    )?;
-    if prepared.selected_lua_entrypoint().is_some() {
-        daemon
-            .runtime_mut()
-            .ok_or(DaemonTransportError::DaemonNotRunning)?
-            .load_lua_plugin_package(&package_registry, package_name)
-            .map_err(crate::HubDaemonError::from)?;
-    }
-    Ok(())
-}
-
-fn reload_package_after_reload(
-    daemon: &mut HubDaemon,
-    package_name: &str,
-) -> DaemonTransportResult<()> {
-    let package_registry = daemon.package_registry().clone();
-    let prepared = package_registry.prepare_local_package(
-        package_name,
-        "daemon socket reload enabled local plugin package",
-    )?;
-    if prepared.selected_lua_entrypoint().is_some() {
-        daemon
-            .runtime_mut()
-            .ok_or(DaemonTransportError::DaemonNotRunning)?
-            .reload_lua_plugin_package(
-                request_id(&format!("daemon-reload-{package_name}")),
-                &package_registry,
-                package_name,
-            )
-            .map_err(crate::HubDaemonError::from)?;
-    }
-    Ok(())
-}
-
-fn unload_package_after_disable(
-    daemon: &mut HubDaemon,
-    package_name: &str,
-) -> DaemonTransportResult<()> {
-    let _ = daemon
-        .runtime_mut()
-        .ok_or(DaemonTransportError::DaemonNotRunning)?
-        .unload_plugin_package(
-            request_id(&format!("daemon-disable-{package_name}")),
-            package_name,
-        );
-    Ok(())
-}
-
-fn restart_running_package_entrypoints(
-    daemon: &mut HubDaemon,
-    package_name: &str,
-    entrypoint_ids: &[String],
-) -> DaemonTransportResult<()> {
-    if entrypoint_ids.is_empty() {
-        return Ok(());
-    }
-    let config = daemon
-        .runtime()
-        .ok_or(DaemonTransportError::DaemonNotRunning)?
-        .config()
-        .clone();
-    let packages = daemon.package_registry().clone();
-    for entrypoint_id in entrypoint_ids {
-        let environment = daemon
-            .entrypoint_supervisor()
-            .launch_environment(package_name, entrypoint_id);
-        let launch = supervised_launch_contract(
-            &config,
-            &packages,
-            package_name,
-            entrypoint_id,
-            &environment,
-        )?;
-        daemon.entrypoint_supervisor().restart(
-            &packages,
-            package_name,
-            entrypoint_id,
-            &launch.args,
-            &launch.environment,
-        )?;
-    }
-    Ok(())
-}
-
-fn refresh_local_packages_response(
+pub(super) fn list_packages_response(
     daemon: &mut HubDaemon,
 ) -> DaemonTransportResult<DaemonResponse> {
-    let previous_packages = daemon.package_registry().clone();
-    let running_entrypoints = daemon
-        .entrypoint_supervisor()
-        .snapshots()
-        .into_iter()
-        .filter(|snapshot| snapshot.state == "running")
-        .fold(
-            BTreeMap::<String, Vec<String>>::new(),
-            |mut running, snapshot| {
-                running
-                    .entry(snapshot.package_name)
-                    .or_default()
-                    .push(snapshot.entrypoint_id);
-                running
-            },
-        );
-    let (candidate, decisions) = daemon
-        .package_registry()
-        .refreshed_local_packages("daemon socket refresh local package registrations")?;
-    commit_package_registry(daemon, candidate)?;
-
-    for decision in &decisions {
-        if decision.state == PackageState::Enabled {
-            reload_package_after_reload(daemon, &decision.package_name)?;
-        }
-        if let Some(entrypoint_ids) = running_entrypoints.get(&decision.package_name) {
-            let changed_entrypoint_ids = entrypoint_ids
-                .iter()
-                .filter(|entrypoint_id| {
-                    runnable_entrypoint_definition_changed(
-                        &previous_packages,
-                        daemon.package_registry(),
-                        &decision.package_name,
-                        entrypoint_id,
-                    )
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            restart_running_package_entrypoints(
-                daemon,
-                &decision.package_name,
-                &changed_entrypoint_ids,
-            )?;
-        }
-    }
-
-    list_packages_response(daemon)
-}
-
-fn runnable_entrypoint_definition_changed(
-    previous_packages: &PackageRegistry,
-    refreshed_packages: &PackageRegistry,
-    package_name: &str,
-    entrypoint_id: &str,
-) -> bool {
-    let Some(previous) = previous_packages.package(package_name) else {
-        return true;
-    };
-    let Some(refreshed) = refreshed_packages.package(package_name) else {
-        return true;
-    };
-    let previous_entrypoint = previous
-        .runnable_entrypoints
-        .iter()
-        .find(|entrypoint| entrypoint.id == entrypoint_id);
-    let refreshed_entrypoint = refreshed
-        .runnable_entrypoints
-        .iter()
-        .find(|entrypoint| entrypoint.id == entrypoint_id);
-
-    previous.manifest != refreshed.manifest || previous_entrypoint != refreshed_entrypoint
-}
-
-fn list_packages_response(daemon: &mut HubDaemon) -> DaemonTransportResult<DaemonResponse> {
     let packages = daemon.package_registry().clone();
     let api = HubClientApi::local_operator("botster-hub-daemon-socket");
     let Some(runtime) = daemon.runtime_mut() else {
@@ -2997,7 +2681,7 @@ fn resolve_package_route_response(
     }
 }
 
-fn supervised_launch_contract(
+pub(super) fn supervised_launch_contract(
     config: &HubConfig,
     registry: &PackageRegistry,
     package_name: &str,
@@ -3171,7 +2855,7 @@ fn preview_package_install_response(
     Ok(daemon_package_install_plan(plan))
 }
 
-fn show_package_response(
+pub(super) fn show_package_response(
     daemon: &mut HubDaemon,
     package_name: &str,
 ) -> DaemonTransportResult<DaemonResponse> {
@@ -3211,7 +2895,7 @@ fn plugin_lifecycle_response(daemon: &mut HubDaemon) -> DaemonTransportResult<Da
     Ok(daemon_plugin_lifecycle(report))
 }
 
-fn package_decision_response(
+pub(super) fn package_decision_response(
     daemon: &mut HubDaemon,
     decision: PackageDecision,
 ) -> DaemonTransportResult<DaemonResponse> {
@@ -3339,38 +3023,6 @@ fn origin_from_local_url(local_url: &str) -> Option<String> {
         return None;
     }
     Some(local_url[..authority_end].to_string())
-}
-
-fn persist_package_registry(daemon: &mut HubDaemon) -> DaemonTransportResult<()> {
-    let runtime = daemon
-        .runtime()
-        .ok_or(DaemonTransportError::DaemonNotRunning)?;
-    let config = runtime.config().clone();
-    let snapshot = daemon.package_registry().snapshot();
-    let store = FileHubStateStore::for_data_directory(&config.data_directory);
-    let state = store.update(&config, |state| {
-        state.package_registry = snapshot;
-    })?;
-    daemon.replace_state(state);
-    Ok(())
-}
-
-fn commit_package_registry(
-    daemon: &mut HubDaemon,
-    package_registry: PackageRegistry,
-) -> DaemonTransportResult<()> {
-    let runtime = daemon
-        .runtime()
-        .ok_or(DaemonTransportError::DaemonNotRunning)?;
-    let config = runtime.config().clone();
-    let snapshot = package_registry.snapshot();
-    let store = FileHubStateStore::for_data_directory(&config.data_directory);
-    let state = store.update(&config, |state| {
-        state.package_registry = snapshot;
-    })?;
-    daemon.replace_package_registry(package_registry);
-    daemon.replace_state(state);
-    Ok(())
 }
 
 fn persist_spawn_targets(
@@ -3886,7 +3538,7 @@ fn session_type_entity_snapshot(
     Ok((generation, entities))
 }
 
-fn session_type_definition_map(
+pub(super) fn session_type_definition_map(
     daemon: &mut HubDaemon,
 ) -> DaemonTransportResult<BTreeMap<String, Value>> {
     session_type_entity_snapshot(daemon).map(|(_, entities)| entities)
@@ -3943,7 +3595,7 @@ fn ensure_update_would_not_enable_invalid_repo_session_types(
     ensure_repo_session_types_valid_for_enabled_root(&resulting_root)
 }
 
-fn advance_session_type_generation_if_changed(
+pub(super) fn advance_session_type_generation_if_changed(
     daemon: &mut HubDaemon,
     before: &BTreeMap<String, Value>,
 ) -> DaemonTransportResult<()> {
@@ -4792,6 +4444,67 @@ fn daemon_state_error(error: crate::HubStateStoreError) -> DaemonResponse {
     response
 }
 
+fn daemon_package_compensation_error(error: DaemonTransportError) -> DaemonResponse {
+    const MESSAGE_BOUND: usize = 512;
+    let DaemonTransportError::PackageCompensation {
+        original,
+        rollbacks,
+    } = error
+    else {
+        let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
+        response.error = Some(DaemonOperatorError {
+            code: "package_compensation_failed".to_string(),
+            request_id: "daemon-package-mutation".to_string(),
+            operation: "package_mutation_compensation".to_string(),
+            message: error.to_string(),
+            diagnostics: Vec::new(),
+        });
+        return response;
+    };
+
+    let mut diagnostics = vec![DaemonDiagnostic {
+        kind: botster_hub_client::DaemonDiagnosticKind::ActionFailure,
+        operation: Some("original".to_string()),
+        feature: None,
+        message: Some(bound_compensation_message(
+            original.to_string(),
+            MESSAGE_BOUND,
+        )),
+    }];
+    for rollback in &rollbacks {
+        diagnostics.push(DaemonDiagnostic {
+            kind: botster_hub_client::DaemonDiagnosticKind::ActionFailure,
+            operation: Some(rollback.step.to_string()),
+            feature: rollback.package_name.clone(),
+            message: Some(bound_compensation_message(
+                rollback.error.to_string(),
+                MESSAGE_BOUND,
+            )),
+        });
+    }
+
+    let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
+    response.error = Some(DaemonOperatorError {
+        code: "package_compensation_failed".to_string(),
+        request_id: "daemon-package-mutation".to_string(),
+        operation: "package_mutation_compensation".to_string(),
+        message: format!(
+            "package mutation failed ({original}); rollback failures: {}",
+            rollbacks.len()
+        ),
+        diagnostics: diagnostics.clone(),
+    });
+    response.diagnostics = diagnostics;
+    response
+}
+
+fn bound_compensation_message(message: String, bound: usize) -> String {
+    if message.chars().count() <= bound {
+        return message;
+    }
+    message.chars().take(bound).collect()
+}
+
 fn daemon_entrypoint_error(error: EntrypointSupervisorError) -> DaemonResponse {
     let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
     response.error = Some(daemon_operator_error_from_entrypoint(error));
@@ -5563,7 +5276,7 @@ fn daemon_availability_reason(
     }
 }
 
-fn package_update_status(
+pub(super) fn package_update_status(
     daemon: &mut HubDaemon,
     package_name: &str,
     proposed_pin: Option<DaemonPackagePin>,
@@ -5707,7 +5420,7 @@ fn package_update_plan(
     })
 }
 
-fn package_pin_from_daemon(pin: DaemonPackagePin) -> DaemonTransportResult<PackagePin> {
+pub(super) fn package_pin_from_daemon(pin: DaemonPackagePin) -> DaemonTransportResult<PackagePin> {
     let update_policy = match pin.update_policy.as_str() {
         "manual" => PackageUpdatePolicy::Manual,
         "track_source" => PackageUpdatePolicy::TrackSource,
@@ -6081,6 +5794,19 @@ pub enum DaemonTransportError {
     LocalWebrtc(crate::LocalWebrtcError),
     Runtime(crate::HubRuntimeError),
     Lifecycle(crate::HubLifecycleError),
+    /// A package mutation side effect failed, and one or more rollback steps also failed.
+    PackageCompensation {
+        original: Box<DaemonTransportError>,
+        rollbacks: Vec<PackageRollbackFailure>,
+    },
+}
+
+/// One failed compensation step after a package mutation side-effect failure.
+#[derive(Debug)]
+pub struct PackageRollbackFailure {
+    pub step: &'static str,
+    pub package_name: Option<String>,
+    pub error: Box<DaemonTransportError>,
 }
 
 impl fmt::Display for DaemonTransportError {
@@ -6107,6 +5833,16 @@ impl fmt::Display for DaemonTransportError {
             Self::LocalWebrtc(error) => write!(formatter, "{error}"),
             Self::Runtime(error) => write!(formatter, "{error:?}"),
             Self::Lifecycle(error) => write!(formatter, "{error:?}"),
+            Self::PackageCompensation {
+                original,
+                rollbacks,
+            } => {
+                write!(
+                    formatter,
+                    "package mutation failed ({original}); rollback failures: {}",
+                    rollbacks.len()
+                )
+            }
         }
     }
 }
@@ -6286,6 +6022,7 @@ fn handle_connection(stream: UnixStream, control_tx: ControlSender) -> DaemonTra
 mod tests {
     use super::*;
     use std::net::Shutdown;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn due_reconciliation_precedes_an_already_ready_control_message() {
@@ -6663,5 +6400,776 @@ mod tests {
                 .recv_timeout(Duration::from_secs(1))
                 .expect("failed response delivery releases daemon stop")
         );
+    }
+
+    fn unique_package_control_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos();
+        PathBuf::from("target")
+            .join("botster-hub-test-data")
+            .join("package-control")
+            .join(name)
+            .join(nanos.to_string())
+    }
+
+    fn package_control_config(data_directory: PathBuf) -> crate::HubConfig {
+        crate::HubStartupOptions {
+            host: crate::HostIdentityOptions {
+                id: "package-control-test".to_string(),
+                display_name: "Package Control Test".to_string(),
+                fingerprint: None,
+            },
+            data_directory: crate::DataDirectoryOption::Explicit(data_directory),
+            session_defaults: crate::SessionDefaults {
+                shell: "/bin/sh".to_string(),
+                working_directory: Some(".".into()),
+                initial_rows: 24,
+                initial_cols: 80,
+            },
+            ..crate::HubStartupOptions::default()
+        }
+        .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
+        .expect("build package control config")
+    }
+
+    fn write_package_control_manifest(root: &Path, name: &str, extra: serde_json::Value) {
+        std::fs::create_dir_all(root).expect("create package root");
+        let mut manifest = serde_json::json!({
+            "name": name,
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "source": { "type": "path", "path": "." },
+            "capabilities": [],
+            "entrypoints": []
+        });
+        if let Some(object) = extra.as_object() {
+            for (key, value) in object {
+                manifest[key] = value.clone();
+            }
+        }
+        std::fs::write(
+            root.join("botster-package.json"),
+            serde_json::to_vec_pretty(&manifest).expect("serialize package manifest"),
+        )
+        .expect("write package manifest");
+    }
+
+    fn drive_package_request(
+        daemon: &mut HubDaemon,
+        request: DaemonRequest,
+    ) -> DaemonTransportResult<DaemonResponse> {
+        let (control_tx, _control_rx) = tokio_mpsc::channel(8);
+        let egress = DaemonEgressDiagnostics::default();
+        let lifecycle = DaemonLifecycleCounters::default();
+        let observability = DaemonObservability {
+            egress: &egress,
+            lifecycle: &lifecycle,
+            client_id: None,
+        };
+        let mut clock = 1;
+        let mut drain_cursors = BTreeMap::new();
+        let mut pending = PendingRuntimeState::default();
+        handle_control_request(
+            daemon,
+            &mut clock,
+            &mut drain_cursors,
+            &mut pending,
+            observability,
+            control_tx,
+            request,
+        )
+    }
+
+    fn live_and_durable_registries(
+        daemon: &HubDaemon,
+        config: &crate::HubConfig,
+    ) -> (
+        crate::PackageRegistrySnapshot,
+        crate::PackageRegistrySnapshot,
+    ) {
+        let live = daemon.package_registry().snapshot();
+        let store = FileHubStateStore::for_data_directory(&config.data_directory);
+        let durable = store
+            .load_or_initialize(config)
+            .expect("load durable hub state")
+            .package_registry;
+        (live, durable)
+    }
+
+    #[test]
+    fn package_compensation_projects_every_rollback_to_socket_diagnostics() {
+        let error = DaemonTransportError::PackageCompensation {
+            original: Box::new(DaemonTransportError::Entrypoint(
+                EntrypointSupervisorError::ReadinessFailed {
+                    package_name: "reload.plugin".to_string(),
+                    entrypoint_id: "sleeper".to_string(),
+                    details: "entrypoint state after restart is failed".to_string(),
+                },
+            )),
+            rollbacks: vec![
+                PackageRollbackFailure {
+                    step: "persist",
+                    package_name: None,
+                    error: Box::new(DaemonTransportError::State(
+                        crate::HubStateStoreError::InjectedWriteFailure,
+                    )),
+                },
+                PackageRollbackFailure {
+                    step: "entrypoint",
+                    package_name: Some("reload.plugin".to_string()),
+                    error: Box::new(DaemonTransportError::Entrypoint(
+                        EntrypointSupervisorError::ReadinessFailed {
+                            package_name: "reload.plugin".to_string(),
+                            entrypoint_id: "sleeper".to_string(),
+                            details: "restore spawn failed".to_string(),
+                        },
+                    )),
+                },
+            ],
+        };
+
+        let response = daemon_package_compensation_error(error);
+        assert_eq!(response.kind, DaemonResponseKind::OperatorError);
+        let operator = response.error.expect("operator error");
+        assert_eq!(operator.code, "package_compensation_failed");
+        assert_eq!(response.diagnostics, operator.diagnostics);
+        assert_eq!(operator.diagnostics.len(), 3);
+
+        let original = &operator.diagnostics[0];
+        assert_eq!(
+            original.kind,
+            botster_hub_client::DaemonDiagnosticKind::ActionFailure
+        );
+        assert_eq!(original.operation.as_deref(), Some("original"));
+        assert!(
+            original.message.as_deref().is_some_and(
+                |message| message.contains("reload.plugin") && message.contains("failed")
+            )
+        );
+
+        let persist = operator
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.operation.as_deref() == Some("persist"))
+            .expect("persist rollback diagnostic");
+        assert_eq!(persist.feature, None);
+        assert!(
+            persist
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("injected"))
+        );
+
+        let entrypoint = operator
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.operation.as_deref() == Some("entrypoint"))
+            .expect("entrypoint rollback diagnostic");
+        assert_eq!(entrypoint.feature.as_deref(), Some("reload.plugin"));
+        assert!(
+            entrypoint
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("restore spawn failed"))
+        );
+    }
+
+    fn package_state(daemon: &HubDaemon, name: &str) -> PackageState {
+        daemon
+            .package_registry()
+            .package(name)
+            .expect("package record")
+            .state
+    }
+
+    fn plugin_is_loaded(daemon: &HubDaemon, name: &str) -> bool {
+        daemon
+            .runtime()
+            .expect("runtime")
+            .plugin_lifecycle_status(daemon.package_registry())
+            .into_iter()
+            .any(|status| status.package_name == name && status.loaded)
+    }
+
+    fn write_sleeper_script(package_dir: &Path) {
+        std::fs::create_dir_all(package_dir.join("bin")).expect("create bin");
+        std::fs::write(
+            package_dir.join("bin/sleeper"),
+            "#!/bin/sh\nexec /bin/sleep \"$@\"\n",
+        )
+        .expect("write sleeper");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(package_dir.join("bin/sleeper"))
+                .expect("sleeper metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(package_dir.join("bin/sleeper"), permissions)
+                .expect("chmod sleeper");
+        }
+    }
+
+    fn sleeper_manifest(args: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "runnable_entrypoints": [{
+                "id": "sleeper",
+                "kind": "terminal_app",
+                "command": "bin/sleeper",
+                "args": args,
+                "launch_mode": "background",
+                "may_supervise": true
+            }]
+        })
+    }
+
+    fn lua_and_sleeper_manifest(args: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "capabilities": [{ "surface": "surfaces" }],
+            "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }],
+            "runnable_entrypoints": [{
+                "id": "sleeper",
+                "kind": "terminal_app",
+                "command": "bin/sleeper",
+                "args": args,
+                "launch_mode": "background",
+                "may_supervise": true
+            }]
+        })
+    }
+
+    fn write_lua_plugin(package_dir: &Path) {
+        std::fs::write(
+            package_dir.join("plugin.lua"),
+            "return botster.register({})\n",
+        )
+        .expect("write lua plugin");
+    }
+
+    fn write_broken_entrypoint(package_dir: &Path) {
+        std::fs::create_dir_all(package_dir.join("bin")).expect("create bin");
+        std::fs::write(package_dir.join("bin/gone"), "not-executable\n").expect("write decoy");
+    }
+
+    fn broken_sleeper_manifest() -> serde_json::Value {
+        serde_json::json!({
+            "runnable_entrypoints": [{
+                "id": "sleeper",
+                "kind": "terminal_app",
+                "command": "bin/gone",
+                "args": ["30"],
+                "launch_mode": "background",
+                "may_supervise": true
+            }]
+        })
+    }
+
+    fn entrypoint_is_running(daemon: &mut HubDaemon, package_name: &str) -> bool {
+        daemon
+            .entrypoint_supervisor()
+            .snapshots()
+            .iter()
+            .any(|snapshot| {
+                snapshot.package_name == package_name
+                    && snapshot.entrypoint_id == "sleeper"
+                    && snapshot.state == "running"
+            })
+    }
+
+    fn entrypoint_command<'a>(daemon: &'a HubDaemon, package_name: &str) -> &'a str {
+        daemon
+            .package_registry()
+            .package(package_name)
+            .expect("package")
+            .runnable_entrypoints
+            .iter()
+            .find(|entrypoint| entrypoint.id == "sleeper")
+            .expect("sleeper entrypoint")
+            .command
+            .as_str()
+    }
+
+    #[test]
+    fn failed_package_persist_leaves_live_registry_equal_to_durable_snapshot() {
+        let root = unique_package_control_dir("persist-failure");
+        let data_directory = root.join("data");
+        let package_dir = root.join("mutate.plugin");
+        write_package_control_manifest(&package_dir, "mutate.plugin", serde_json::json!({}));
+        let config = package_control_config(data_directory);
+        let mut daemon = HubDaemon::start(config.clone()).expect("start package control daemon");
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::InstallPackageLocalPath { path: package_dir },
+        )
+        .expect("install local package");
+        assert_eq!(
+            package_state(&daemon, "mutate.plugin"),
+            PackageState::Installed
+        );
+
+        FileHubStateStore::inject_next_save_failure();
+        let error = drive_package_request(
+            &mut daemon,
+            DaemonRequest::EnablePackage {
+                package_name: "mutate.plugin".to_string(),
+            },
+        )
+        .expect_err("injected persist failure");
+        assert!(matches!(
+            error,
+            DaemonTransportError::State(crate::HubStateStoreError::InjectedWriteFailure)
+        ));
+        assert_eq!(
+            package_state(&daemon, "mutate.plugin"),
+            PackageState::Installed
+        );
+        let (live, durable) = live_and_durable_registries(&daemon, &config);
+        assert_eq!(live, durable);
+        daemon.stop();
+    }
+
+    #[test]
+    fn failed_disable_commit_does_not_stop_or_unload_running_package() {
+        let root = unique_package_control_dir("disable-running");
+        let data_directory = root.join("data");
+        let package_dir = root.join("running.plugin");
+        write_package_control_manifest(
+            &package_dir,
+            "running.plugin",
+            lua_and_sleeper_manifest(&["30"]),
+        );
+        write_sleeper_script(&package_dir);
+        write_lua_plugin(&package_dir);
+        let config = package_control_config(data_directory);
+        let mut daemon = HubDaemon::start(config.clone()).expect("start disable-running daemon");
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::InstallPackageLocalPath { path: package_dir },
+        )
+        .expect("install running package");
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::EnablePackage {
+                package_name: "running.plugin".to_string(),
+            },
+        )
+        .expect("enable running package");
+        assert!(
+            plugin_is_loaded(&daemon, "running.plugin"),
+            "lua plugin must be loaded before failed disable"
+        );
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::StartPackageEntrypoint {
+                package_name: "running.plugin".to_string(),
+                entrypoint_id: "sleeper".to_string(),
+                environment_overrides: BTreeMap::new(),
+            },
+        )
+        .expect("start supervised sleeper");
+        assert!(
+            daemon
+                .entrypoint_supervisor()
+                .snapshots()
+                .iter()
+                .any(|snapshot| {
+                    snapshot.package_name == "running.plugin"
+                        && snapshot.entrypoint_id == "sleeper"
+                        && snapshot.state == "running"
+                }),
+            "sleeper must be running before failed disable"
+        );
+
+        FileHubStateStore::inject_next_save_failure();
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::DisablePackage {
+                package_name: "running.plugin".to_string(),
+            },
+        )
+        .expect_err("injected disable persist failure");
+        assert_eq!(
+            package_state(&daemon, "running.plugin"),
+            PackageState::Enabled
+        );
+        assert!(
+            daemon
+                .entrypoint_supervisor()
+                .snapshots()
+                .iter()
+                .any(|snapshot| {
+                    snapshot.package_name == "running.plugin"
+                        && snapshot.entrypoint_id == "sleeper"
+                        && snapshot.state == "running"
+                }),
+            "failed disable must not stop the running entrypoint"
+        );
+        assert!(
+            plugin_is_loaded(&daemon, "running.plugin"),
+            "failed disable commit must keep the plugin loaded"
+        );
+        let (live, durable) = live_and_durable_registries(&daemon, &config);
+        assert_eq!(live, durable);
+        daemon.stop();
+    }
+
+    #[test]
+    fn enable_load_failure_rolls_back_registry_and_durable_state() {
+        let root = unique_package_control_dir("enable-load-rollback");
+        let data_directory = root.join("data");
+        let package_dir = root.join("broken.plugin");
+        write_package_control_manifest(
+            &package_dir,
+            "broken.plugin",
+            serde_json::json!({
+                "capabilities": [{ "surface": "surfaces" }],
+                "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+            }),
+        );
+        std::fs::write(package_dir.join("plugin.lua"), "-- placeholder").expect("write lua");
+        let config = package_control_config(data_directory);
+        let mut daemon = HubDaemon::start(config.clone()).expect("start enable-load daemon");
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::InstallPackageLocalPath {
+                path: package_dir.clone(),
+            },
+        )
+        .expect("install broken package");
+        std::fs::remove_file(package_dir.join("plugin.lua")).expect("remove lua before enable");
+
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::EnablePackage {
+                package_name: "broken.plugin".to_string(),
+            },
+        )
+        .expect_err("missing lua must fail enable load");
+        assert_eq!(
+            package_state(&daemon, "broken.plugin"),
+            PackageState::Installed
+        );
+        let (live, durable) = live_and_durable_registries(&daemon, &config);
+        assert_eq!(live, durable);
+        daemon.stop();
+    }
+
+    #[test]
+    fn failed_reload_keeps_prior_registry_and_runtime_state() {
+        let root = unique_package_control_dir("reload-failure");
+        let data_directory = root.join("data");
+        let package_dir = root.join("reload.plugin");
+        write_package_control_manifest(&package_dir, "reload.plugin", serde_json::json!({}));
+        let config = package_control_config(data_directory);
+        let mut daemon = HubDaemon::start(config.clone()).expect("start reload daemon");
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::InstallPackageLocalPath { path: package_dir },
+        )
+        .expect("install reload package");
+        let before = daemon.package_registry().snapshot();
+        FileHubStateStore::inject_next_save_failure();
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::ReloadPackage {
+                package_name: "reload.plugin".to_string(),
+            },
+        )
+        .expect_err("injected reload persist failure");
+        assert_eq!(daemon.package_registry().snapshot(), before);
+        let (live, durable) = live_and_durable_registries(&daemon, &config);
+        assert_eq!(live, durable);
+        daemon.stop();
+    }
+
+    #[test]
+    fn failed_reload_after_commit_restores_prior_process() {
+        let root = unique_package_control_dir("reload-restart-failure");
+        let data_directory = root.join("data");
+        let package_dir = root.join("reload.plugin");
+        write_package_control_manifest(&package_dir, "reload.plugin", sleeper_manifest(&["30"]));
+        write_sleeper_script(&package_dir);
+        let config = package_control_config(data_directory);
+        let mut daemon = HubDaemon::start(config.clone()).expect("start reload runtime daemon");
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::InstallPackageLocalPath {
+                path: package_dir.clone(),
+            },
+        )
+        .expect("install");
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::EnablePackage {
+                package_name: "reload.plugin".to_string(),
+            },
+        )
+        .expect("enable");
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::StartPackageEntrypoint {
+                package_name: "reload.plugin".to_string(),
+                entrypoint_id: "sleeper".to_string(),
+                environment_overrides: BTreeMap::new(),
+            },
+        )
+        .expect("start");
+        assert!(entrypoint_is_running(&mut daemon, "reload.plugin"));
+
+        write_broken_entrypoint(&package_dir);
+        write_package_control_manifest(&package_dir, "reload.plugin", broken_sleeper_manifest());
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::ReloadPackage {
+                package_name: "reload.plugin".to_string(),
+            },
+        )
+        .expect_err("broken candidate restart must fail");
+        assert_eq!(entrypoint_command(&daemon, "reload.plugin"), "bin/sleeper");
+        assert!(
+            entrypoint_is_running(&mut daemon, "reload.plugin"),
+            "compensation must restart the prior sleeper definition"
+        );
+        let (live, durable) = live_and_durable_registries(&daemon, &config);
+        assert_eq!(live, durable);
+        daemon.stop();
+    }
+
+    #[test]
+    fn failed_refresh_restores_earlier_package_runtime() {
+        let root = unique_package_control_dir("refresh-later-failure");
+        let data_directory = root.join("data");
+        let alpha_dir = root.join("alpha.plugin");
+        let zeta_dir = root.join("zeta.plugin");
+        write_package_control_manifest(&alpha_dir, "alpha.plugin", sleeper_manifest(&["30"]));
+        write_sleeper_script(&alpha_dir);
+        write_package_control_manifest(&zeta_dir, "zeta.plugin", sleeper_manifest(&["30"]));
+        write_sleeper_script(&zeta_dir);
+        let config = package_control_config(data_directory);
+        let mut daemon = HubDaemon::start(config.clone()).expect("start refresh daemon");
+        for dir in [&alpha_dir, &zeta_dir] {
+            drive_package_request(
+                &mut daemon,
+                DaemonRequest::InstallPackageLocalPath { path: dir.clone() },
+            )
+            .expect("install");
+        }
+        for name in ["alpha.plugin", "zeta.plugin"] {
+            drive_package_request(
+                &mut daemon,
+                DaemonRequest::EnablePackage {
+                    package_name: name.to_string(),
+                },
+            )
+            .expect("enable");
+            drive_package_request(
+                &mut daemon,
+                DaemonRequest::StartPackageEntrypoint {
+                    package_name: name.to_string(),
+                    entrypoint_id: "sleeper".to_string(),
+                    environment_overrides: BTreeMap::new(),
+                },
+            )
+            .expect("start");
+        }
+        write_package_control_manifest(&alpha_dir, "alpha.plugin", sleeper_manifest(&["31"]));
+        write_broken_entrypoint(&zeta_dir);
+        write_package_control_manifest(&zeta_dir, "zeta.plugin", broken_sleeper_manifest());
+
+        drive_package_request(&mut daemon, DaemonRequest::RefreshLocalPackages)
+            .expect_err("later zeta restart must fail refresh");
+        assert_eq!(entrypoint_command(&daemon, "alpha.plugin"), "bin/sleeper");
+        assert_eq!(
+            daemon
+                .package_registry()
+                .package("alpha.plugin")
+                .expect("alpha")
+                .runnable_entrypoints[0]
+                .args,
+            ["30"]
+        );
+        assert!(entrypoint_is_running(&mut daemon, "alpha.plugin"));
+        assert_eq!(entrypoint_command(&daemon, "zeta.plugin"), "bin/sleeper");
+        assert!(entrypoint_is_running(&mut daemon, "zeta.plugin"));
+        daemon.stop();
+    }
+
+    #[test]
+    fn enable_load_rollback_persist_failure_preserves_original_error() {
+        let root = unique_package_control_dir("rollback-persist-failure");
+        let data_directory = root.join("data");
+        let package_dir = root.join("broken.plugin");
+        write_package_control_manifest(
+            &package_dir,
+            "broken.plugin",
+            serde_json::json!({
+                "capabilities": [{ "surface": "surfaces" }],
+                "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+            }),
+        );
+        std::fs::write(package_dir.join("plugin.lua"), "-- placeholder").expect("write lua");
+        let config = package_control_config(data_directory);
+        let mut daemon = HubDaemon::start(config.clone()).expect("start rollback persist daemon");
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::InstallPackageLocalPath {
+                path: package_dir.clone(),
+            },
+        )
+        .expect("install");
+        std::fs::remove_file(package_dir.join("plugin.lua")).expect("remove lua");
+        FileHubStateStore::inject_save_failure_after(1);
+        let error = drive_package_request(
+            &mut daemon,
+            DaemonRequest::EnablePackage {
+                package_name: "broken.plugin".to_string(),
+            },
+        )
+        .expect_err("load failure plus rollback persist failure");
+        let DaemonTransportError::PackageCompensation {
+            original,
+            rollbacks,
+        } = error
+        else {
+            panic!("expected typed compensation error, got {error:?}");
+        };
+        assert!(matches!(&*original, DaemonTransportError::Package(_)));
+        assert!(rollbacks.iter().any(|rollback| rollback.step == "persist"
+            && matches!(
+                &*rollback.error,
+                DaemonTransportError::State(crate::HubStateStoreError::InjectedWriteFailure)
+            )));
+        daemon.stop();
+    }
+
+    #[test]
+    fn reload_restore_failure_preserves_original_and_runtime_error() {
+        let root = unique_package_control_dir("restore-runtime-failure");
+        let data_directory = root.join("data");
+        let package_dir = root.join("reload.plugin");
+        write_package_control_manifest(&package_dir, "reload.plugin", sleeper_manifest(&["30"]));
+        write_sleeper_script(&package_dir);
+        let config = package_control_config(data_directory);
+        let mut daemon = HubDaemon::start(config.clone()).expect("start restore-failure daemon");
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::InstallPackageLocalPath {
+                path: package_dir.clone(),
+            },
+        )
+        .expect("install");
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::EnablePackage {
+                package_name: "reload.plugin".to_string(),
+            },
+        )
+        .expect("enable");
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::StartPackageEntrypoint {
+                package_name: "reload.plugin".to_string(),
+                entrypoint_id: "sleeper".to_string(),
+                environment_overrides: BTreeMap::new(),
+            },
+        )
+        .expect("start");
+        write_broken_entrypoint(&package_dir);
+        write_package_control_manifest(&package_dir, "reload.plugin", broken_sleeper_manifest());
+        std::fs::remove_file(package_dir.join("bin/sleeper")).expect("delete prior binary");
+        let error = drive_package_request(
+            &mut daemon,
+            DaemonRequest::ReloadPackage {
+                package_name: "reload.plugin".to_string(),
+            },
+        )
+        .expect_err("restart and restore should both fail");
+        let DaemonTransportError::PackageCompensation {
+            original,
+            rollbacks,
+        } = error
+        else {
+            panic!("expected typed compensation error, got {error:?}");
+        };
+        assert!(matches!(&*original, DaemonTransportError::Entrypoint(_)));
+        assert!(
+            rollbacks
+                .iter()
+                .any(|rollback| rollback.step == "entrypoint"
+                    && rollback.package_name.as_deref() == Some("reload.plugin"))
+        );
+        daemon.stop();
+    }
+
+    #[test]
+    fn session_type_generation_advances_only_after_successful_commit() {
+        let root = unique_package_control_dir("session-type-generation");
+        let data_directory = root.join("data");
+        let package_dir = root.join("types.plugin");
+        write_package_control_manifest(
+            &package_dir,
+            "types.plugin",
+            serde_json::json!({
+                "session_types": [{
+                    "id": "init",
+                    "label": "Mutate agent",
+                    "role": "botster.agent",
+                    "interaction": "interactive",
+                    "traits": ["test"],
+                    "lifecycle": "task",
+                    "command": "bin/init.sh"
+                }]
+            }),
+        );
+        let config = package_control_config(data_directory);
+        let mut daemon = HubDaemon::start(config.clone()).expect("start generation daemon");
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::InstallPackageLocalPath { path: package_dir },
+        )
+        .expect("install types package");
+        let generation_after_install = daemon
+            .runtime()
+            .expect("runtime")
+            .state()
+            .session_type_generation;
+
+        FileHubStateStore::inject_next_save_failure();
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::EnablePackage {
+                package_name: "types.plugin".to_string(),
+            },
+        )
+        .expect_err("injected enable persist failure");
+        assert_eq!(
+            daemon
+                .runtime()
+                .expect("runtime")
+                .state()
+                .session_type_generation,
+            generation_after_install
+        );
+
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::EnablePackage {
+                package_name: "types.plugin".to_string(),
+            },
+        )
+        .expect("enable types package");
+        assert!(
+            daemon
+                .runtime()
+                .expect("runtime")
+                .state()
+                .session_type_generation
+                > generation_after_install,
+            "successful enable must advance session-type generation after commit"
+        );
+        daemon.stop();
     }
 }

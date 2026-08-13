@@ -7,6 +7,8 @@
 //! when a write fails before rename, but concurrent hub processes can still
 //! produce last-writer-wins updates.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, File};
@@ -368,6 +370,23 @@ impl FileHubStateStore {
         self.write_temporary_file(state)?;
         Err(HubStateStoreError::InjectedWriteFailure)
     }
+
+    /// Fail the next `save` after writing the temporary file, before rename.
+    #[cfg(test)]
+    pub fn inject_next_save_failure() {
+        Self::inject_save_failure_after(0);
+    }
+
+    /// Allow `successful_saves` durable writes, then fail the next `save`.
+    #[cfg(test)]
+    pub fn inject_save_failure_after(successful_saves: u32) {
+        SAVES_UNTIL_FAILURE.with(|remaining| remaining.set(Some(successful_saves)));
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static SAVES_UNTIL_FAILURE: Cell<Option<u32>> = const { Cell::new(None) };
 }
 
 impl HubStateStore for FileHubStateStore {
@@ -398,6 +417,14 @@ impl HubStateStore for FileHubStateStore {
         state
             .validate_version()
             .map_err(HubStateStoreError::State)?;
+        #[cfg(test)]
+        if let Some(remaining) = SAVES_UNTIL_FAILURE.with(|cell| cell.get()) {
+            if remaining == 0 {
+                SAVES_UNTIL_FAILURE.with(|cell| cell.set(None));
+                return self.save_with_injected_failure(state);
+            }
+            SAVES_UNTIL_FAILURE.with(|cell| cell.set(Some(remaining - 1)));
+        }
         self.write_atomically(state)
     }
 }
