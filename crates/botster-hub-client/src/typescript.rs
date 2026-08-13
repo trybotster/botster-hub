@@ -96,6 +96,8 @@ pub(crate) fn daemon_protocol_typescript() -> String {
         &[
             ("status", &[]),
             ("check_hub_update", &[]),
+            ("start_hub_update", &[("scope", "DaemonHubUpdateScope")]),
+            ("get_hub_update_execution", &[]),
             ("list_sessions", &[]),
             (
                 "subscribe_entities",
@@ -399,6 +401,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("install_plan?", "DaemonPackageInstallPlan | null"),
             ("update_status?", "DaemonPackageUpdateStatus | null"),
             ("hub_update?", "DaemonHubUpdate | null"),
+            ("hub_update_execution?", "DaemonHubUpdateExecution | null"),
             ("package_decision", "DaemonPackageDecision | null"),
             ("lifecycle", "DaemonPluginLifecycle[]"),
             (
@@ -515,6 +518,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
         &[
             "status",
             "hub_update",
+            "hub_update_execution",
             "sessions",
             "entity_subscribed",
             "entity_unsubscribed",
@@ -1273,6 +1277,23 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("build_revision?", "string | null"),
             ("reason?", "string | null"),
             ("action?", "string | null"),
+        ],
+    );
+    emit_string_union(&mut output, "DaemonHubUpdateScope", &["core", "all"]);
+    emit_string_union(
+        &mut output,
+        "DaemonHubUpdateExecutionState",
+        &["started", "running", "complete", "failed"],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonHubUpdateExecution",
+        &[
+            ("update_id", "string"),
+            ("scope", "DaemonHubUpdateScope"),
+            ("state", "DaemonHubUpdateExecutionState"),
+            ("updater_pid", "number"),
+            ("error?", "string | null"),
         ],
     );
     emit_interface(

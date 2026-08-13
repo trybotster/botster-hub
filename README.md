@@ -547,6 +547,30 @@ The source checkout update command is separate from `check-update`. The latter
 checks managed release metadata. The source command does not use the managed
 installer and does not change a sibling Core checkout.
 
+Daemon clients can start the same source update through the client contract:
+
+```json
+{"type":"start_hub_update","scope":"all"}
+```
+
+The scope is `core` or `all`. The daemon starts the current Hub executable as
+a detached updater. The updater owns Git, Cargo, package builds, daemon
+replacement, and verification. The daemon does not run these operations.
+
+The accepted response has kind `hub_update_execution`. Its body contains the
+update ID, scope, `started` state, and updater PID. A client can reconnect after
+daemon replacement and request the latest durable result:
+
+```json
+{"type":"get_hub_update_execution"}
+```
+
+Execution states are `started`, `running`, `complete`, and `failed`. A live
+updater blocks a second update. A dead updater cannot keep the update busy.
+The replacement daemon reads the execution record from its resolved data
+directory. Clients must negotiate the `hub_source_update` feature before they
+send either request.
+
 The source command builds the debug profile under `target/debug`. It does not
 build a release profile.
 
@@ -595,7 +619,7 @@ data_dir=resolved:$HOME/.botster/hub
 daemon=started
 protocol=botster-hub-daemon-v1
 protocol_version=7
-conformance_fixture_revision=36
+conformance_fixture_revision=37
 package_count=2
 enabled_package_count=2
 app_count=2

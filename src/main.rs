@@ -118,6 +118,7 @@ fn dispatch_command(command: &str, args: Vec<String>) -> Result<CommandOutcome, 
             .map(|()| CommandOutcome::Completed)
             .map_err(|error| error.to_string()),
         "update" => update::run(args).map(|()| CommandOutcome::Completed),
+        "__update-handoff" => update::run_handoff(args).map(|()| CommandOutcome::Completed),
         "down" => local_runtime_down(args)
             .map(|()| CommandOutcome::DaemonStopped)
             .map_err(|error| error.to_string()),
@@ -3507,6 +3508,21 @@ fn print_daemon_response(response: DaemonResponse) -> Result<(), OperatorError> 
                     format!("{:?}", update.state).to_ascii_lowercase()
                 );
                 println!("current_version={}", update.current_version);
+            }
+        }
+        DaemonResponseKind::HubUpdateExecution => {
+            println!("response=hub_update_execution");
+            if let Some(execution) = response.hub_update_execution {
+                println!("update_id={}", execution.update_id);
+                println!("scope={}", execution.scope.as_str());
+                println!(
+                    "state={}",
+                    format!("{:?}", execution.state).to_ascii_lowercase()
+                );
+                println!("updater_pid={}", execution.updater_pid);
+                if let Some(error) = execution.error {
+                    println!("error={error}");
+                }
             }
         }
         DaemonResponseKind::Sessions => {

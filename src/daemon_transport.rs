@@ -34,10 +34,11 @@ pub use botster_hub_client::{
     DaemonCaptureSnapshot, DaemonCompatibility, DaemonConnection as ClientDaemonConnection,
     DaemonCoordination, DaemonDiagnostic, DaemonEndpoint, DaemonEntityFrame, DaemonEnvelope,
     DaemonEnvelopeAck, DaemonEnvelopeDelivery, DaemonEnvelopePublish, DaemonEvent, DaemonHello,
-    DaemonHelloAck, DaemonHubUpdate, DaemonHubUpdateState, DaemonIdentity,
-    DaemonInstallationDiagnostic, DaemonInstallationIdentity, DaemonInstallationMode,
-    DaemonLifecycleCounters, DaemonLocalWebrtcAnswer, DaemonLocalWebrtcBootstrap, DaemonModeFlags,
-    DaemonNotify, DaemonOperatorError, DaemonPackage, DaemonPackageActionRequest,
+    DaemonHelloAck, DaemonHubUpdate, DaemonHubUpdateExecution, DaemonHubUpdateExecutionState,
+    DaemonHubUpdateScope, DaemonHubUpdateState, DaemonIdentity, DaemonInstallationDiagnostic,
+    DaemonInstallationIdentity, DaemonInstallationMode, DaemonLifecycleCounters,
+    DaemonLocalWebrtcAnswer, DaemonLocalWebrtcBootstrap, DaemonModeFlags, DaemonNotify,
+    DaemonOperatorError, DaemonPackage, DaemonPackageActionRequest,
     DaemonPackageActionRequiredReference, DaemonPackageActionState, DaemonPackageActionStatus,
     DaemonPackageAvailability, DaemonPackageAvailabilityReason, DaemonPackageAvailabilityState,
     DaemonPackageCompatibility, DaemonPackageConfiguration, DaemonPackageDecision,
@@ -78,6 +79,7 @@ use crate::maintenance::{
     software_identity,
 };
 use crate::packages::{PackageResolvedEntrypointLaunch, resolve_entrypoint_launch_contract};
+use crate::source_update::{current_update_execution, mark_update_failed, start_update_handoff};
 use crate::{
     AvailablePackage, AvailablePackageState, FileHubStateStore, HubClientApi,
     HubClientCaptureSnapshot, HubClientEvent, HubClientModeFlags, HubClientPackage,
@@ -457,7 +459,9 @@ async fn handle_connection_async(
         }
         let (reply_tx, reply_rx) = oneshot::channel();
         let close_after_response = matches!(request, DaemonRequest::DaemonShutdown);
-        let (response_delivery_tx, response_delivery_rx) = if close_after_response {
+        let requires_delivery_ack =
+            close_after_response || matches!(request, DaemonRequest::StartHubUpdate { .. });
+        let (response_delivery_tx, response_delivery_rx) = if requires_delivery_ack {
             let (tx, rx) = mpsc::channel();
             (Some(tx), Some(rx))
         } else {
@@ -1049,6 +1053,86 @@ pub(crate) fn handle_control_message(
                         false
                     }
                 };
+            }
+            if let DaemonRequest::StartHubUpdate { scope } = request.as_ref() {
+                let data_directory = match daemon.runtime() {
+                    Some(runtime) => runtime.config().data_directory.clone(),
+                    None => {
+                        return send_control_response(
+                            reply_tx,
+                            Ok(hub_update_execution_error(
+                                "hub_update_runtime_unavailable",
+                                "start_hub_update",
+                                "the Hub runtime is not available",
+                            )),
+                            response_delivery_rx,
+                        );
+                    }
+                };
+                return match start_update_handoff(&data_directory, *scope) {
+                    Ok((execution, handoff)) => {
+                        let update_id = execution.update_id.clone();
+                        let response_received = reply_tx
+                            .send(Ok(daemon_hub_update_execution(execution)))
+                            .is_ok();
+                        wait_for_response_delivery(
+                            response_received,
+                            response_received,
+                            response_delivery_rx,
+                        );
+                        if response_received {
+                            if let Err(error) = handoff.release() {
+                                let _ = mark_update_failed(&data_directory, &update_id, &error);
+                            }
+                        } else {
+                            handoff.stop();
+                            let _ = mark_update_failed(
+                                &data_directory,
+                                &update_id,
+                                "client disconnected before update handoff",
+                            );
+                        }
+                        false
+                    }
+                    Err(error) => send_control_response(
+                        reply_tx,
+                        Ok(hub_update_execution_error(
+                            if error.contains("already active") {
+                                "hub_update_busy"
+                            } else {
+                                "hub_update_start_failed"
+                            },
+                            "start_hub_update",
+                            &error,
+                        )),
+                        response_delivery_rx,
+                    ),
+                };
+            }
+            if matches!(request.as_ref(), DaemonRequest::GetHubUpdateExecution) {
+                let response = match daemon.runtime() {
+                    Some(runtime) => {
+                        match current_update_execution(&runtime.config().data_directory) {
+                            Ok(Some(execution)) => daemon_hub_update_execution(execution),
+                            Ok(None) => hub_update_execution_error(
+                                "hub_update_execution_not_found",
+                                "get_hub_update_execution",
+                                "no Hub update execution record exists",
+                            ),
+                            Err(error) => hub_update_execution_error(
+                                "hub_update_execution_read_failed",
+                                "get_hub_update_execution",
+                                &error,
+                            ),
+                        }
+                    }
+                    None => hub_update_execution_error(
+                        "hub_update_runtime_unavailable",
+                        "get_hub_update_execution",
+                        "the Hub runtime is not available",
+                    ),
+                };
+                return send_control_response(reply_tx, Ok(response), response_delivery_rx);
             }
             let attached_change = AttachedSubscriptionChange::from_request(&request);
             let reconcile_after_request = matches!(
@@ -2548,6 +2632,7 @@ fn handle_runtime_control_request(
             install_plan: None,
             update_status: None,
             hub_update: None,
+            hub_update_execution: None,
             package_decision: None,
             lifecycle: Vec::new(),
             plugin_worker_counters: None,
@@ -2566,8 +2651,10 @@ fn handle_runtime_control_request(
         }),
         DaemonRequest::IssueLocalWebrtcBootstrap { .. }
         | DaemonRequest::LocalWebrtcSignal { .. } => Err(DaemonTransportError::UnexpectedResponse),
-        DaemonRequest::CheckHubUpdate => {
-            unreachable!("Hub update checks are handled before runtime borrow")
+        DaemonRequest::CheckHubUpdate
+        | DaemonRequest::StartHubUpdate { .. }
+        | DaemonRequest::GetHubUpdateExecution => {
+            unreachable!("Hub update requests are handled before runtime borrow")
         }
         DaemonRequest::ListApps
         | DaemonRequest::ResolveAppLaunch { .. }
@@ -4304,6 +4391,8 @@ fn control_request_operation_label(request: &DaemonRequest) -> &'static str {
         DaemonRequest::RemoveSession { .. } => "remove_session",
         DaemonRequest::DaemonShutdown => "daemon_shutdown",
         DaemonRequest::CheckHubUpdate => "check_hub_update",
+        DaemonRequest::StartHubUpdate { .. } => "start_hub_update",
+        DaemonRequest::GetHubUpdateExecution => "get_hub_update_execution",
         _ => "request",
     }
 }
@@ -5652,6 +5741,7 @@ fn daemon_response_base(kind: DaemonResponseKind) -> DaemonResponse {
         install_plan: None,
         update_status: None,
         hub_update: None,
+        hub_update_execution: None,
         package_decision: None,
         lifecycle: Vec::new(),
         plugin_worker_counters: None,
@@ -5691,6 +5781,24 @@ fn daemon_status(
 fn daemon_hub_update(update: DaemonHubUpdate) -> DaemonResponse {
     let mut response = daemon_response_base(DaemonResponseKind::HubUpdate);
     response.hub_update = Some(update);
+    response
+}
+
+fn daemon_hub_update_execution(execution: DaemonHubUpdateExecution) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::HubUpdateExecution);
+    response.hub_update_execution = Some(execution);
+    response
+}
+
+fn hub_update_execution_error(code: &str, operation: &str, message: &str) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
+    response.error = Some(DaemonOperatorError {
+        code: code.to_string(),
+        request_id: format!("daemon-{operation}"),
+        operation: operation.to_string(),
+        message: message.to_string(),
+        diagnostics: vec![DaemonDiagnostic::action_failure(operation, message)],
+    });
     response
 }
 

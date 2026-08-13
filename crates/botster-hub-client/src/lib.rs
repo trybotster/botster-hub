@@ -22,7 +22,7 @@ mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 pub const PROTOCOL_VERSION: u16 = 7;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 36;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 37;
 /// Version of the local WebRTC delivery chunk framing protocol.
 pub const LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION: u16 = 2;
 /// Serialized local WebRTC delivery frames must remain strictly below this size.
@@ -44,6 +44,7 @@ pub const FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS: &str = "session_type_entity
 pub const FEATURE_PLUGIN_ENTITY_SUBSCRIPTIONS: &str = "plugin_entity_subscriptions";
 /// Race-free mode-dependent terminal input via `ModeGatedInput` + mode freshness.
 pub const FEATURE_MODE_GATED_INPUT: &str = "mode_gated_input";
+pub const FEATURE_HUB_SOURCE_UPDATE: &str = "hub_source_update";
 const ATTACH_DRAIN_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Authenticated plaintext carried by one complete local WebRTC delivery.
@@ -664,6 +665,7 @@ fn current_feature_list() -> Vec<&'static str> {
         FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS,
         FEATURE_PLUGIN_ENTITY_SUBSCRIPTIONS,
         FEATURE_MODE_GATED_INPUT,
+        FEATURE_HUB_SOURCE_UPDATE,
     ]
 }
 
@@ -673,6 +675,10 @@ fn current_feature_list() -> Vec<&'static str> {
 pub enum DaemonRequest {
     Status,
     CheckHubUpdate,
+    StartHubUpdate {
+        scope: DaemonHubUpdateScope,
+    },
+    GetHubUpdateExecution,
     ListSessions,
     SubscribeEntities {
         entity_type: String,
@@ -1007,6 +1013,8 @@ pub struct DaemonResponse {
     pub update_status: Option<DaemonPackageUpdateStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hub_update: Option<DaemonHubUpdate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hub_update_execution: Option<DaemonHubUpdateExecution>,
     pub package_decision: Option<DaemonPackageDecision>,
     pub lifecycle: Vec<DaemonPluginLifecycle>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1054,6 +1062,7 @@ pub struct DaemonUiTreeSnapshot {
 pub enum DaemonResponseKind {
     Status,
     HubUpdate,
+    HubUpdateExecution,
     Sessions,
     EntitySubscribed,
     EntityUnsubscribed,
@@ -2033,6 +2042,42 @@ pub struct DaemonHubUpdate {
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonHubUpdateScope {
+    Core,
+    All,
+}
+
+impl DaemonHubUpdateScope {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Core => "core",
+            Self::All => "all",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonHubUpdateExecutionState {
+    Started,
+    Running,
+    Complete,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonHubUpdateExecution {
+    pub update_id: String,
+    pub scope: DaemonHubUpdateScope,
+    pub state: DaemonHubUpdateExecutionState,
+    pub updater_pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Sanitized daemon transport and subscription lifecycle observations.
@@ -3220,7 +3265,7 @@ mod tests {
     #[test]
     fn protocol_seven_rejects_protocol_six_and_accepts_conformance_floor_thirty_five() {
         assert_eq!(PROTOCOL_VERSION, 7);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 36);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 37);
 
         let protocol_six = DaemonCompatibilityRequirement {
             protocol_version: 6,
@@ -4654,6 +4699,10 @@ mod tests {
         vec![
             DaemonRequest::Status,
             DaemonRequest::CheckHubUpdate,
+            DaemonRequest::StartHubUpdate {
+                scope: DaemonHubUpdateScope::All,
+            },
+            DaemonRequest::GetHubUpdateExecution,
             DaemonRequest::ListSessions,
             DaemonRequest::SubscribeEntities {
                 entity_type: "session".to_string(),
@@ -4928,6 +4977,8 @@ mod tests {
         match request {
             DaemonRequest::Status => "status",
             DaemonRequest::CheckHubUpdate => "check_hub_update",
+            DaemonRequest::StartHubUpdate { .. } => "start_hub_update",
+            DaemonRequest::GetHubUpdateExecution => "get_hub_update_execution",
             DaemonRequest::ListSessions => "list_sessions",
             DaemonRequest::SubscribeEntities { .. } => "subscribe_entities",
             DaemonRequest::UnsubscribeEntities { .. } => "unsubscribe_entities",
@@ -5008,6 +5059,7 @@ mod tests {
         vec![
             DaemonResponseKind::Status,
             DaemonResponseKind::HubUpdate,
+            DaemonResponseKind::HubUpdateExecution,
             DaemonResponseKind::Sessions,
             DaemonResponseKind::EntitySubscribed,
             DaemonResponseKind::EntityUnsubscribed,
@@ -5056,6 +5108,7 @@ mod tests {
         match kind {
             DaemonResponseKind::Status => "status",
             DaemonResponseKind::HubUpdate => "hub_update",
+            DaemonResponseKind::HubUpdateExecution => "hub_update_execution",
             DaemonResponseKind::Sessions => "sessions",
             DaemonResponseKind::EntitySubscribed => "entity_subscribed",
             DaemonResponseKind::EntityUnsubscribed => "entity_unsubscribed",
@@ -5377,6 +5430,13 @@ mod tests {
                 reason: Some("up_to_date".to_string()),
                 action: None,
             }),
+            hub_update_execution: Some(DaemonHubUpdateExecution {
+                update_id: "update-example".to_string(),
+                scope: DaemonHubUpdateScope::All,
+                state: DaemonHubUpdateExecutionState::Running,
+                updater_pid: 42,
+                error: None,
+            }),
             package_decision: Some(DaemonPackageDecision {
                 package_name: "workflow.plugin".to_string(),
                 action: "enable".to_string(),
@@ -5667,6 +5727,35 @@ mod tests {
     }
 
     #[test]
+    fn hub_source_update_execution_contract_is_serde_stable_and_generated() {
+        assert_eq!(
+            serde_json::to_value(DaemonRequest::StartHubUpdate {
+                scope: DaemonHubUpdateScope::All,
+            })
+            .unwrap(),
+            serde_json::json!({ "type": "start_hub_update", "scope": "all" })
+        );
+        assert_eq!(
+            serde_json::to_value(DaemonRequest::GetHubUpdateExecution).unwrap(),
+            serde_json::json!({ "type": "get_hub_update_execution" })
+        );
+        let response = daemon_response_example(DaemonResponseKind::HubUpdateExecution);
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(value["kind"], "hub_update_execution");
+        assert_eq!(value["hub_update_execution"]["scope"], "all");
+        assert_eq!(value["hub_update_execution"]["state"], "running");
+        assert_eq!(value["hub_update_execution"]["updater_pid"], 42);
+
+        let generated = daemon_protocol_typescript();
+        assert!(generated.contains("{ type: \"start_hub_update\"; scope: DaemonHubUpdateScope }"));
+        assert!(generated.contains("{ type: \"get_hub_update_execution\" }"));
+        assert!(generated.contains("export type DaemonHubUpdateScope ="));
+        assert!(generated.contains("export type DaemonHubUpdateExecutionState ="));
+        assert!(generated.contains("export interface DaemonHubUpdateExecution"));
+        assert!(generated.contains("hub_update_execution?: DaemonHubUpdateExecution | null;"));
+    }
+
+    #[test]
     fn hub_maintenance_optional_fields_follow_serde_omission() {
         let mut response = daemon_response_example(DaemonResponseKind::Status);
         response.hub_update = None;
@@ -5690,7 +5779,7 @@ mod tests {
     #[test]
     fn protocol_six_and_conformance_thirty_two_define_the_cold_cut_boundary() {
         assert_eq!(PROTOCOL_VERSION, 7);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 36);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 37);
 
         let requirement = DaemonCompatibilityRequirement::current();
         let protocol_error = ensure_compatible(
@@ -5755,7 +5844,7 @@ mod tests {
         // conformance revision: bumping the protocol would break every existing
         // first-party client that never issues this request.
         assert_eq!(PROTOCOL_VERSION, 7);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 36);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 37);
         assert_eq!(
             current_feature_list(),
             vec![
@@ -5773,6 +5862,7 @@ mod tests {
                 FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS,
                 FEATURE_PLUGIN_ENTITY_SUBSCRIPTIONS,
                 FEATURE_MODE_GATED_INPUT,
+                FEATURE_HUB_SOURCE_UPDATE,
             ],
             "the authoring read is a request, not a negotiated capability",
         );

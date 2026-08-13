@@ -1,9 +1,9 @@
 {
   "package_name": "@trybotster/hub-test-support",
-  "package_version": "0.1.31",
+  "package_version": "0.1.32",
   "protocol": "botster-hub-daemon-v1",
   "protocol_version": 7,
-  "conformance_fixture_revision": 36,
+  "conformance_fixture_revision": 37,
   "ui_contract": {
     "conformance_fixture_export": "@trybotster/ui-contract/conformance-fixtures",
     "package_name": "@trybotster/ui-contract",
@@ -13,27 +13,27 @@
   "daemon_protocol": {
     "artifact_path": "daemon-protocol.ts",
     "source_artifact_path": "crates/botster-hub-client/generated/daemon-protocol.ts",
-    "sha256": "2ad463eb4cb739dfa5110f9b05f1da87f0494c71e000255a49595d2a5ad43a55"
+    "sha256": "70ef4fc239b8814b0f145343338734a43c6b97ddacdb84acefd274407764abc4"
   },
   "first_party_client_support_matrix": {
     "artifact_path": "first-party-client-support-matrix.json",
     "source_artifact_path": "botster_hub_test_support::first_party_client_support_matrix()",
-    "sha256": "dae85c20191c41b5182687e2bd2e10ad4b2957a470e8ac66a443fda8f2f79745"
+    "sha256": "ea53e8a988a13d1944f99603efeda99a1ab5b2de78dc92a4c371b683b611a156"
   },
   "session_lifecycle_subscription_conformance_fixture": {
     "artifact_path": "session-lifecycle-subscription-conformance-fixture.json",
     "source_artifact_path": "botster_hub_test_support::session_lifecycle_subscription_conformance_fixture_json()",
-    "sha256": "1b5dfb89bb6e14d4bf2700c1b210bf510f1d402700de00cee283aed54fb335ba"
+    "sha256": "f0b640937a9bf2f9470ed9d8d9cc77a3d0c40b8f016c8a3477032d0e0828fe27"
   },
   "session_plugin_binding_conformance_fixture": {
     "artifact_path": "session-plugin-binding-conformance-fixture.json",
     "source_artifact_path": "botster_hub_test_support::session_plugin_binding_conformance_fixture_json()",
-    "sha256": "e2e9901f758edfd57b850a802e0385a74a35958f7972887d09dd1f03f77f4629"
+    "sha256": "dc1b5f2e760871bb88a0d2e552d80d8104579b832124d9117902fe635ff17572"
   },
   "late_attach_history_conformance_fixture": {
     "artifact_path": "late-attach-history-conformance-fixture.json",
     "source_artifact_path": "botster_hub_test_support::late_attach_history_conformance_fixture_json()",
-    "sha256": "4c9c67ba7bbbafed57ca40925bf5ac9304668564b81a09265202e28f82c861f7"
+    "sha256": "6f979c6ff277c3d520756fc71df3bd1948fe3a6724d08eeb8b2595d13a716e93"
   },
   "local_webrtc_delivery_chunk_conformance_fixture": {
     "artifact_path": "local-webrtc-delivery-chunk-conformance-fixture.json",
@@ -43,7 +43,7 @@
   "mode_flags_conformance_fixture": {
     "artifact_path": "mode-flags-conformance-fixture.json",
     "source_artifact_path": "botster_hub_test_support::mode_flags_conformance_fixture_json()",
-    "sha256": "067378be7e5d7bc5e3987134daddb9911698e96db40d526aef7c9e7b378e9495"
+    "sha256": "e0591ba32d7a319300b6a2545762f9d9c2a7b32d272b92fb8a2fa9bc868f28e4"
   },
   "plugin_contract_matrix": {
     "package_name": "botster.plugin-contract-matrix",

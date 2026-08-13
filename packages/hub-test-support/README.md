@@ -18,10 +18,10 @@ node packages/hub-test-support/scripts/sync-assets.mjs
 
 ## Usage
 
-Use this command for version 0.1.31:
+Use this command for version 0.1.32:
 
 ```sh
-npm install --save-dev @trybotster/ui-contract@0.3.2 @trybotster/hub-test-support@0.1.31
+npm install --save-dev @trybotster/ui-contract@0.3.2 @trybotster/hub-test-support@0.1.32
 ```
 
 ```js
@@ -81,14 +81,14 @@ Use this exact package spec in npm-based client repos:
 ```json
 {
   "devDependencies": {
-    "@trybotster/hub-test-support": "0.1.31"
+    "@trybotster/hub-test-support": "0.1.32"
   }
 }
 ```
 
-`@trybotster/hub-test-support@0.1.31` carries byte-faithful live
+`@trybotster/hub-test-support@0.1.32` carries byte-faithful live
 `terminal_output` payloads (`payload_base64`, `payload_encoding`, `bytes`)
-and authentic dual GHOSTSNP late-attach fixtures (conformance revision 36).
+and authentic dual GHOSTSNP late-attach fixtures (conformance revision 37).
 History Snapshot is a frozen history-marker golden and no-history Snapshot is
 a distinct blank golden. Import-visible state matches the ReadScreen oracles;
 do not dual-use a history-bearing golden as no-history. Protocol version is 7,
@@ -111,7 +111,7 @@ appended as terminal text. Version 0.1.6 / conformance revision 13 uses
 superseded JSON number arrays, while version 0.1.5 / revision 12 exposes
 lossy string history. Neither is current binary-history contract authority.
 
-Version 0.1.31 carries protocol version 7 / conformance revision 36 with
+Version 0.1.32 carries protocol version 7 / conformance revision 37 with
 byte-faithful live `terminal_output` payloads, distinct frozen GHOSTSNP
 goldens (history marker vs blank idle), `mode_gated_input` ModeGatedInput +
 ModeFlags freshness, Snapshot-only GHOSTSNP rules, and the
