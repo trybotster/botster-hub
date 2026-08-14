@@ -1110,32 +1110,120 @@ fn core_write_budget_hard_stop_emits_core_adapter_closed() {
         &mut reader,
         "cwb-live",
         "sub-live",
-        "sleep 30",
+        "while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
         &mut envelopes,
         &mut events,
     );
-    thread::sleep(Duration::from_secs(2));
+
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(30);
+    let mut pre_close_status = None;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .expect("read timeout");
+    while Instant::now() < deadline {
+        let stall_closed = events.iter().any(|event| {
+            matches!(
+                event,
+                botster_hub_client::DaemonEvent::TerminalSubscriptionClosed {
+                    session_id,
+                    ..
+                } if session_id == "cwb-stall"
+            )
+        });
+        let pressure_started = envelopes
+            .iter()
+            .any(|envelope| envelope.session_id == "cwb-stall")
+            || started.elapsed() >= Duration::from_millis(200);
+        if pre_close_status.is_none() && pressure_started && !stall_closed {
+            stream.set_read_timeout(None).expect("clear read timeout");
+            let status = request_collecting_mux(
+                &mut stream,
+                &mut reader,
+                &botster_hub_client::DaemonRequest::Status,
+                &mut envelopes,
+                &mut events,
+            );
+            assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
+            assert!(
+                events.iter().all(|event| {
+                    !matches!(
+                        event,
+                        botster_hub_client::DaemonEvent::TerminalSubscriptionClosed {
+                            session_id,
+                            ..
+                        } if session_id == "cwb-stall"
+                    )
+                }),
+                "pre-close Status must arrive before core_adapter_closed: {events:?}"
+            );
+            pre_close_status = Some(status);
+            stream
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("read timeout");
+        }
+        if stall_closed {
+            break;
+        }
+        match botster_hub_client::read_unix_mux_frame_from_reader(&mut reader) {
+            Ok(botster_hub_client::DaemonUnixMuxFrame::Terminal(envelope)) => {
+                assert!(envelope.is_unix_terminal_plane());
+                envelopes.push(envelope);
+            }
+            Ok(botster_hub_client::DaemonUnixMuxFrame::Event(event)) => events.push(event),
+            Ok(botster_hub_client::DaemonUnixMuxFrame::Response(_)) => {}
+            Err(_) => {}
+        }
+    }
+    stream.set_read_timeout(None).expect("clear read timeout");
+
     assert!(
-        wait_for_subscription_closed(
-            &mut stream,
-            &mut reader,
-            "cwb-stall",
-            "sub-stall",
-            &mut envelopes,
-            &mut events,
-        ),
-        "write-budget hard-stop must emit TerminalSubscriptionClosed: {events:?}"
+        pre_close_status.is_some(),
+        "must send Status after pressure starts and before core_adapter_closed"
     );
-    assert!(events.iter().any(|event| matches!(
-        event,
-        botster_hub_client::DaemonEvent::TerminalSubscriptionClosed {
-            session_id,
-            reason,
-            ..
-        } if session_id == "cwb-stall"
-            && reason == botster_hub_client::TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER
-    )));
-    let sibling = request_collecting_mux(
+    let stall_closes: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            botster_hub_client::DaemonEvent::TerminalSubscriptionClosed {
+                session_id,
+                subscription_id,
+                reason,
+                ..
+            } if session_id == "cwb-stall" && subscription_id == "sub-stall" => {
+                Some(reason.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        stall_closes.as_slice(),
+        [botster_hub_client::TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER],
+        "exact core_adapter_closed required: {events:?}"
+    );
+    assert!(
+        events.iter().all(|event| {
+            !matches!(
+                event,
+                botster_hub_client::DaemonEvent::TerminalSubscriptionClosed {
+                    session_id,
+                    reason,
+                    ..
+                } if session_id == "cwb-stall"
+                    && reason == botster_hub_client::TERMINAL_SUBSCRIPTION_CLOSED_HOST_ADAPTER
+            )
+        }),
+        "host_adapter_closed is not the Core write-budget oracle: {events:?}"
+    );
+
+    let status = request_collecting_mux(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::Status,
+        &mut envelopes,
+        &mut events,
+    );
+    assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
+    let listed = request_collecting_mux(
         &mut stream,
         &mut reader,
         &botster_hub_client::DaemonRequest::ListSessions,
@@ -1143,11 +1231,61 @@ fn core_write_budget_hard_stop_emits_core_adapter_closed() {
         &mut events,
     );
     assert!(
-        sibling
+        listed
             .sessions
             .iter()
             .any(|session| session.session_id == "cwb-live" && session.lifecycle == "running")
     );
+
+    request_collecting_mux(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::SendInput {
+            session_id: "cwb-live".to_string(),
+            data: "cwb-sibling-live\r".to_string(),
+        },
+        &mut envelopes,
+        &mut events,
+    );
+    let sibling_deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < sibling_deadline
+        && !unix_envelope_contains_live_bytes(&envelopes, "echo:cwb-sibling-live")
+    {
+        let drain = request_collecting_mux(
+            &mut stream,
+            &mut reader,
+            &botster_hub_client::DaemonRequest::drain_subscription("cwb-live", "sub-live"),
+            &mut envelopes,
+            &mut events,
+        );
+        assert_ne!(
+            drain.kind,
+            botster_hub_client::DaemonResponseKind::OperatorError,
+            "sibling scoped Drain must stay owned: {:?}",
+            drain.error
+        );
+        assert!(
+            drain
+                .events
+                .iter()
+                .all(|event| !event_is_terminal_body(event)),
+            "content-blind sibling Drain must stay bound: {:?}",
+            drain.events
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        unix_envelope_contains_live_bytes(&envelopes, "echo:cwb-sibling-live"),
+        "same-connection sibling must produce a new terminal envelope: {envelopes:?}"
+    );
+
+    eprintln!(
+        "core_write_budget provenance hub_bin={} session_worker={} hub_sha={} locked_core=f4f6bf5babe92dfb9241a760c414187f711c2c42",
+        env!("CARGO_BIN_EXE_botster-hub"),
+        session_worker_binary_path().display(),
+        option_env!("BOTSTER_HUB_GIT_SHA").unwrap_or("worktree")
+    );
+
     shutdown_short_lived_session(hub.endpoint(), "cwb-stall");
     shutdown_short_lived_session(hub.endpoint(), "cwb-live");
     hub.shutdown().expect("shutdown isolated hub");
