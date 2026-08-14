@@ -3651,12 +3651,16 @@ fn session_entity_subscription_observes_attached_natural_exit_with_pending_egres
         first_pos.zip(second_pos).is_some_and(|(first, second)| first < second),
         "retained terminal output must preserve production order, drain={retained_output:?} screen={screen_text:?}"
     );
-    assert!(
-        retained_events.iter().any(|event| matches!(
-            event,
-            botster_hub_client::DaemonEvent::ProcessExit { code: Some(7), .. }
-        )) || screen_text.contains("pending-second"),
-        "natural exit should publish ProcessExit or leave retained screen, drain={retained_events:?} screen={screen_text:?}",
+    assert_eq!(
+        retained_events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                botster_hub_client::DaemonEvent::ProcessExit { code: Some(7), .. }
+            ))
+            .count(),
+        1,
+        "natural exit must translate ProcessExit code 7 on unbound Drain: drain={retained_events:?} screen={screen_text:?}"
     );
 
     let drained_again = terminal
@@ -4370,13 +4374,7 @@ fn external_daemon_same_session_reattach_replays_opaque_history_before_live_outp
                 } if subscription_id == "late-history-reattach-subscription"
                     && live_output_contains(payload, "after:live-after-late")
             )
-        }) || connection
-            .request(&botster_hub::DaemonRequest::ReadScreen {
-                session_id: "late-history-session".to_string(),
-            })
-            .ok()
-            .and_then(|response| response.read_screen)
-            .is_some_and(|screen| screen.text.contains("after:live-after-late"));
+        });
         if saw_live {
             break;
         }

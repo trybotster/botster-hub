@@ -22,8 +22,8 @@ use botster_core::{
     AesGcmEnvelope, AesGcmKey, Capability, CapabilitySurface, ClientId, CoreSessionMetadata,
     ExtensionEntrypoint, ExtensionKind, ExtensionRuntime, HostProfileMetadata,
     HostProfilePolicySection, PackageSource, ProcessIdentity, RequestId, ResizePayload, SessionId,
-    SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId, decrypt_aes_gcm,
-    encrypt_aes_gcm,
+    SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId, TransportEgress,
+    decrypt_aes_gcm, encrypt_aes_gcm,
 };
 use botster_core_daemon::{RegistryRecord, SessionRegistry};
 use botster_hub::{
@@ -113,27 +113,32 @@ pub(crate) fn drain_until_client_output(
 ) -> Vec<HubClientEvent> {
     let mut observed = Vec::new();
     for _ in 0..100 {
-        let _ = runtime.drain_subscription(
+        if let Ok(output) = runtime.drain_subscription(
             &ClientId(client_id.to_string()),
             session_id,
             subscription_id,
             *logical_clock,
-        );
-        let response = api
-            .handle_request(
-                runtime,
-                packages,
-                HubClientRequest::DrainRuntime {
-                    request_id: RequestId("hub-daemon-drain".to_string()),
-                    session_id: session_id.clone(),
-                    last_output_at: *logical_clock,
-                },
-            )
-            .expect("drain through hub client api");
-        *logical_clock += 1;
-        if let HubClientResponseBody::Events(events) = response.body {
-            observed.extend(events);
+        ) {
+            for (_, frame) in output.client_egress {
+                if let botster_core::TransportEgress::TerminalOutput { data, .. } = frame {
+                    observed.push(HubClientEvent::TerminalOutput {
+                        session_id: session_id.clone(),
+                        subscription_id: subscription_id.clone(),
+                        data,
+                    });
+                }
+            }
         }
+        let _ = api.handle_request(
+            runtime,
+            packages,
+            HubClientRequest::DrainRuntime {
+                request_id: RequestId("hub-daemon-drain".to_string()),
+                session_id: session_id.clone(),
+                last_output_at: *logical_clock,
+            },
+        );
+        *logical_clock += 1;
 
         if observed.iter().any(|event| {
             matches!(
@@ -144,27 +149,45 @@ pub(crate) fn drain_until_client_output(
         }) {
             return observed;
         }
-        if let Ok(screen) = runtime.read_screen(
-            RequestId("hub-daemon-read-screen".to_string()),
-            session_id.clone(),
-            *logical_clock,
-        ) && screen
-            .screen
-            .text
-            .as_bytes()
-            .windows(needle.len())
-            .any(|window| window == needle)
-        {
-            return observed;
-        }
-
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 
     panic!(
-        "timed out waiting for {:?} in client output or ReadScreen",
+        "timed out waiting for {:?} in client Drain TerminalOutput",
         String::from_utf8_lossy(needle)
     );
+}
+
+pub(crate) fn drain_until_attached(
+    runtime: &mut botster_hub::HubRuntime,
+    session_id: &SessionId,
+    subscription_id: &SubscriptionId,
+    client_id: &str,
+    logical_clock: &mut u64,
+) {
+    for _ in 0..100 {
+        if let Ok(output) = runtime.drain_subscription(
+            &ClientId(client_id.to_string()),
+            session_id,
+            subscription_id,
+            *logical_clock,
+        ) {
+            *logical_clock += 1;
+            if output.client_egress.iter().any(|(_, frame)| {
+                matches!(
+                    frame,
+                    TransportEgress::AttachState {
+                        state: botster_core::TerminalAttachState::Attached,
+                        ..
+                    }
+                )
+            }) {
+                return;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    panic!("timed out waiting for Attached on scoped Drain");
 }
 
 pub(crate) struct SessionCleanupGuard {
@@ -284,13 +307,7 @@ pub(crate) fn collect_attach_events(
                         ..
                     } if sub == subscription_id && live_output_contains(payload, marker)
                 )
-            }) || connection
-                .request(&botster_hub_client::DaemonRequest::ReadScreen {
-                    session_id: session_id.to_string(),
-                })
-                .ok()
-                .and_then(|response| response.read_screen)
-                .is_some_and(|screen| screen.text.contains(marker))
+            })
         });
         if attached && saw_live {
             break;

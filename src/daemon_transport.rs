@@ -949,10 +949,25 @@ fn handle_connection_cleanup(
     }
     let bound_subscriptions = state
         .pending_runtime
-        .bound_route_keys_for_client(&cleanup.client_id);
+        .take_connection_bound_routes(&cleanup.client_id);
     state
         .pending_runtime
         .close_adapters_for_client(&cleanup.client_id);
+    if !bound_subscriptions.is_empty() {
+        *state
+            .lifecycle_counters
+            .cleanup_by_reason
+            .entry("bound_adapter_close".to_string())
+            .or_insert(0) += bound_subscriptions.len() as u64;
+    }
+    for (session_id, subscription_id) in &bound_subscriptions {
+        state
+            .pending_runtime
+            .cancel_stream(session_id, subscription_id);
+        state
+            .live_attach_routes
+            .remove(&(session_id.clone(), subscription_id.clone()));
+    }
     for subscription in cleanup.attached_subscriptions {
         let bound = bound_subscriptions.contains(&(
             subscription.session_id.clone(),
@@ -971,6 +986,11 @@ fn handle_connection_cleanup(
             ));
             Ok(daemon_events(Vec::new()))
         } else {
+            *state
+                .lifecycle_counters
+                .cleanup_by_reason
+                .entry("cleanup_hub_detach".to_string())
+                .or_insert(0) += 1;
             handle_control_request(
                 daemon,
                 &mut state.logical_clock,
@@ -1329,6 +1349,17 @@ pub(crate) fn handle_control_message(
                 }
                 error => Err(error),
             });
+            if matches!(request, DaemonRequest::Detach { .. })
+                && response
+                    .as_ref()
+                    .is_ok_and(|response| response.kind != DaemonResponseKind::OperatorError)
+            {
+                *state
+                    .lifecycle_counters
+                    .cleanup_by_reason
+                    .entry("explicit_detach".to_string())
+                    .or_insert(0) += 1;
+            }
             if let Ok(response) = response.as_ref() {
                 let change = attached_subscription_change_for_response(&request, response);
                 let change = match change {

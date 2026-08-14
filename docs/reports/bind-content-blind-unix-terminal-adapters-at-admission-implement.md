@@ -10,7 +10,7 @@
 | Pipeline worktree | this run's Hub worktree |
 | Ticket | `ticket_1786661008_634435` |
 | Run | `run_1786681880_322827` |
-| Step | `botster_stack_implement` (`run_step_1786695601_609679`, Review-loop) |
+| Step | `botster_stack_implement` (`run_step_1786698327_602397`, Review-loop) |
 | Approved plan | `docs/plans/bind-content-blind-unix-terminal-adapters-at-admission.md` revision 6 |
 | Merge policy | direct (no PR) |
 | Locked Core SHA | `f4f6bf5babe92dfb9241a760c414187f711c2c42` |
@@ -119,10 +119,12 @@ Plan acceptance checks that remain true: bind only when Hello requires the featu
 
 | Finding | Resolution |
 | --- | --- |
-| Bound socket death took Hub Detach | Snapshot `bound_route_keys_for_client` before `close_adapters_for_client`. Bound routes close the adapter, cancel the Hub route, and release `live_attach_routes` without `DaemonRequest::Detach`. IsolatedHub replacement Attach after disconnect is the one-Core-detach proof. |
-| Required workspace suite failed | Integrated `origin/main` `d92aace` (stale-peer occupancy). Adapted Core-pin consumers to scoped Drain + `ReadScreen`. `./test.sh --locked` now passes. |
-| `test.mjs` still asserted revision 38 | All four asserts are 39. Clean `npm install --omit=dev` + `npm test` passed. |
-| Plan leaked an absolute user path | Authoritative path is now spawn target `botster-hub`. Leak scan of the plan and report has no user home paths. Known-positive control matched. |
+| Bound socket death took Hub Detach | Snapshot bound keys before close. Connection-scoped bound routes survive later adapter-flag clears. Bound death does not increment `cleanup_hub_detach`. Explicit Detach increments `explicit_detach`. IsolatedHub asserts that delta. |
+| Required workspace suite failed | Integrated `origin/main` `d92aace`. `./test.sh --locked` exits 0. |
+| `test.mjs` still asserted revision 38 | All four asserts are 39. |
+| Plan leaked an absolute user path | Authoritative path is spawn target `botster-hub`. |
+| Unbound Drain lost TerminalOutput | Unbound scoped Drain still translates Snapshot, later TerminalOutput, and ProcessExit. Tests that wait for live bytes now collect scoped Drain events. They do not treat ReadScreen as a Drain oracle. Public conformance collects TerminalOutput from the same scoped Drain request. |
+| Disconnect test did not prove omitted Detach | Status `cleanup_by_reason` records `bound_adapter_close`, `cleanup_hub_detach`, and `explicit_detach`. Bound disconnect asserts `cleanup_hub_detach` delta is 0. Explicit Detach asserts `explicit_detach` is 1. |
 
 ## Runtime-teardown lenses implemented
 
@@ -149,7 +151,7 @@ Commands (all with `BOTSTER_ENV=test`):
 - `cargo fmt --all -- --check` — exit 0
 - Clean `npm install --omit=dev && npm test` in a temp copy of `packages/hub-test-support` — exit 0
 - Plan/report leak scan vs a known-positive absolute home-path control — plan and report have no user home paths
-- `./test.sh --locked` — workspace wrapper exit 0. `hub_daemon_lifecycle_test`: 173 passed, 0 failed, 1 ignored. Other workspace members and doctests passed.
+- `./test.sh --locked` — workspace wrapper exit 0. `hub_daemon_lifecycle_test`: 174 passed, 0 failed, 1 ignored. Other workspace members and doctests passed.
 
 Production entry points:
 

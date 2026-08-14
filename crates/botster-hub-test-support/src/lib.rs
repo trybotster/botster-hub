@@ -1530,26 +1530,31 @@ pub fn run_client_conformance(
             operation: "attach",
             source,
         })?;
-    let ready_deadline = Instant::now() + Duration::from_secs(5);
-    let mut output = String::new();
-    while Instant::now() < ready_deadline {
-        let _ = terminal.request(&DaemonRequest::drain_subscription(
-            CONFORMANCE_SESSION_ID,
-            CONFORMANCE_SUBSCRIPTION_ID,
-        ));
-        let screen = terminal
-            .request(&DaemonRequest::ReadScreen {
-                session_id: CONFORMANCE_SESSION_ID.to_string(),
-            })
+    let mut drain_output = String::new();
+    let mut drain_translated_snapshot = false;
+    let attached_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < attached_deadline {
+        let drain = terminal
+            .request(&DaemonRequest::drain_subscription(
+                CONFORMANCE_SESSION_ID,
+                CONFORMANCE_SUBSCRIPTION_ID,
+            ))
             .map_err(|source| ConformanceError::Client {
-                operation: "conformance_ready_screen",
+                operation: "attach_drain",
                 source,
             })?;
-        if let Some(screen) = screen.read_screen {
-            output = screen.text;
-            if output.contains(CONFORMANCE_READY) {
-                break;
-            }
+        drain_translated_snapshot |= drain
+            .events
+            .iter()
+            .any(|event| matches!(event, DaemonEvent::Snapshot { .. }));
+        append_drain_terminal_output(&drain, &mut drain_output);
+        if drain.events.iter().any(|event| {
+            matches!(
+                event,
+                DaemonEvent::AttachState { state, .. } if state == "attached"
+            )
+        }) {
+            break;
         }
         thread::sleep(Duration::from_millis(25));
     }
@@ -1572,7 +1577,7 @@ pub fn run_client_conformance(
         &terminal
             .request(&DaemonRequest::SendInput {
                 session_id: CONFORMANCE_SESSION_ID.to_string(),
-                data: "from-conformance\r\n".to_string(),
+                data: "from-conformance\r".to_string(),
             })
             .map_err(|source| ConformanceError::Client {
                 operation: "send_input",
@@ -1583,23 +1588,18 @@ pub fn run_client_conformance(
     )?;
     let echo_deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < echo_deadline {
-        let _ = terminal.request(&DaemonRequest::drain_subscription(
-            CONFORMANCE_SESSION_ID,
-            CONFORMANCE_SUBSCRIPTION_ID,
-        ));
-        let screen = terminal
-            .request(&DaemonRequest::ReadScreen {
-                session_id: CONFORMANCE_SESSION_ID.to_string(),
-            })
+        let drain = terminal
+            .request(&DaemonRequest::drain_subscription(
+                CONFORMANCE_SESSION_ID,
+                CONFORMANCE_SUBSCRIPTION_ID,
+            ))
             .map_err(|source| ConformanceError::Client {
-                operation: "conformance_echo_screen",
+                operation: "echo_drain",
                 source,
             })?;
-        if let Some(screen) = screen.read_screen {
-            output = screen.text;
-            if output.contains(CONFORMANCE_ECHO) {
-                break;
-            }
+        append_drain_terminal_output(&drain, &mut drain_output);
+        if drain_output.contains(CONFORMANCE_ECHO) {
+            break;
         }
         thread::sleep(Duration::from_millis(25));
     }
@@ -1607,7 +1607,7 @@ pub fn run_client_conformance(
         &terminal
             .request(&DaemonRequest::SendInput {
                 session_id: CONFORMANCE_SESSION_ID.to_string(),
-                data: "size-check\r\n".to_string(),
+                data: "size-check\r".to_string(),
             })
             .map_err(|source| ConformanceError::Client {
                 operation: "send_size_check",
@@ -1619,23 +1619,18 @@ pub fn run_client_conformance(
     let resize_needle = format!("{CONFORMANCE_WINSIZE_PREFIX}33 102");
     let size_deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < size_deadline {
-        let _ = terminal.request(&DaemonRequest::drain_subscription(
-            CONFORMANCE_SESSION_ID,
-            CONFORMANCE_SUBSCRIPTION_ID,
-        ));
-        let screen = terminal
-            .request(&DaemonRequest::ReadScreen {
-                session_id: CONFORMANCE_SESSION_ID.to_string(),
-            })
+        let drain = terminal
+            .request(&DaemonRequest::drain_subscription(
+                CONFORMANCE_SESSION_ID,
+                CONFORMANCE_SUBSCRIPTION_ID,
+            ))
             .map_err(|source| ConformanceError::Client {
-                operation: "conformance_size_screen",
+                operation: "size_drain",
                 source,
             })?;
-        if let Some(screen) = screen.read_screen {
-            output = screen.text;
-            if output.contains(&resize_needle) {
-                break;
-            }
+        append_drain_terminal_output(&drain, &mut drain_output);
+        if drain_output.contains(&resize_needle) {
+            break;
         }
         thread::sleep(Duration::from_millis(25));
     }
@@ -1643,7 +1638,7 @@ pub fn run_client_conformance(
         &terminal
             .request(&DaemonRequest::SendInput {
                 session_id: CONFORMANCE_SESSION_ID.to_string(),
-                data: "quit\r\n".to_string(),
+                data: "quit\r".to_string(),
             })
             .map_err(|source| ConformanceError::Client {
                 operation: "send_quit",
@@ -1652,25 +1647,8 @@ pub fn run_client_conformance(
         DaemonResponseKind::Events,
         "send_quit",
     )?;
-
-    let _ = terminal.request(&DaemonRequest::drain_subscription(
-        CONFORMANCE_SESSION_ID,
-        CONFORMANCE_SUBSCRIPTION_ID,
-    ));
-    let screen = terminal
-        .request(&DaemonRequest::ReadScreen {
-            session_id: CONFORMANCE_SESSION_ID.to_string(),
-        })
-        .map_err(|source| ConformanceError::Client {
-            operation: "read_screen",
-            source,
-        })?;
-    if let Some(screen) = screen.read_screen
-        && !screen.text.trim().is_empty()
-    {
-        output = screen.text;
-    }
-    let stream_contains_ready = output.contains(CONFORMANCE_READY);
+    let output = drain_output;
+    let stream_contains_ready = output.contains(CONFORMANCE_READY) || drain_translated_snapshot;
     let stream_contains_echo = output.contains(CONFORMANCE_ECHO);
     let resize_needle = format!("{CONFORMANCE_WINSIZE_PREFIX}33 102");
     let stream_contains_resize = output.contains(&resize_needle);
@@ -4092,6 +4070,16 @@ fn output_value(output: &str, key: &str) -> Option<String> {
     output
         .lines()
         .find_map(|line| line.strip_prefix(&prefix).map(str::to_string))
+}
+
+fn append_drain_terminal_output(response: &DaemonResponse, output: &mut String) {
+    for event in &response.events {
+        if let DaemonEvent::TerminalOutput { payload, .. } = event
+            && let Ok(bytes) = payload.decoded_bytes()
+        {
+            output.push_str(&String::from_utf8_lossy(&bytes));
+        }
+    }
 }
 
 fn request(
