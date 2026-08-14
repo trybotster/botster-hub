@@ -10,11 +10,12 @@
 | Pipeline worktree | this run's Hub worktree |
 | Ticket | `ticket_1786661008_247079` |
 | Run | `run_1786704125_619383` |
-| Step | `botster_stack_implement` (`run_step_1786705967_585311`) |
+| Step | `botster_stack_implement` (`run_step_1786709213_775323`) |
 | Approved plan | `docs/plans/bind-content-blind-webrtc-terminal-adapters-at-admission.md` revision 2 |
 | Merge policy | direct (no PR) |
 | Locked Core SHA | `f4f6bf5babe92dfb9241a760c414187f711c2c42` |
-| Worktree HEAD before implement commit | `9d1f858fbfaf87ff2e95cf292690b03e91558695` |
+| Rebased onto Hub main | `aafd6c2cde430804f1bb54094c568fc88c15944b` |
+| First implement commit | `fc946d198801a6800de451b3dba41e7537ea3440` |
 
 Routing verified independently: `project_pipelines_current_context` ticket/run `target_id` and the approved Plan artifact both map `tgt_7e208a0c76a44980a83b63af976b1f22` → `botster-hub`. Implementation stayed in this run worktree.
 
@@ -59,7 +60,8 @@ Routing verified independently: `project_pipelines_current_context` ticket/run `
 - Do not implement Core, Unix rewrite, Drain cold-cut, Web decoder, TUI, or Project Pipelines
 - Use `./test.sh` / `BOTSTER_ENV=test` wrappers
 - Advertise `webrtc_terminal_adapter` without raising `DaemonCompatibilityRequirement::current()`
-- `PROTOCOL_VERSION` stays 7; bump `CONFORMANCE_FIXTURE_REVISION` 39 → 40
+- `PROTOCOL_VERSION` stays 7; keep `CONFORMANCE_FIXTURE_REVISION` at 40 with `terminal_subscription_closed`
+- Preserve split Hello `terminal_compatibility` and `TerminalSubscriptionClosed` from `aafd6c2`
 - Runtime-teardown lenses are implemented, not deferred
 
 ## Files changed
@@ -171,3 +173,58 @@ None blocked implementation. After merge, capture:
 - DataChannel `local_close` uses `LOCAL_WEBRTC_PEER_CLOSE_BOUND` before `cleanup_once`.
 
 Do not capture the proposed north star as ratified from this ticket alone.
+
+## Review-fix pass
+
+Rebase and review findings from `review_1786709196_893623`. This pass sits on Hub main `aafd6c2` (split Hello terminal compatibility and `TerminalSubscriptionClosed`).
+
+### Review findings
+
+| Finding | Fix |
+| --- | --- |
+| `finding_1786709196_581026` Multiple DataChannels can send the same terminal frame | `LocalWebrtcPeerState::claim_data_channel()` admits the first channel only. Extra channels close within `LOCAL_WEBRTC_PEER_CLOSE_BOUND`. Live proof: `webrtc_terminal_adapter_second_data_channel_does_not_receive_terminal_frames`. |
+| `finding_1786709196_301296` Adapter wake can be lost before the sender waits | `AdapterWake` stores a permit and rechecks after wait registration. Proof: `wait_observes_a_write_that_happens_after_an_empty_scan`. |
+| `finding_1786709196_978605` Live peer-loss check permits zero adapter closes | IsolatedHub proof now requires `bound_adapter_close >= 1`, `cleanup_hub_detach == 0`, and occupancy drop. IsolatedHub inventory is `live_attach_subscriptions`. Core inventory absence stays in `webrtc_hello_bind_echoes_capability_set_and_closes_adapter_on_peer_loss`. |
+
+### Control contract preserved from `aafd6c2`
+
+- `DaemonHello` / `DaemonHelloAck` keep independent `terminal_compatibility`.
+- WebRTC Hello that fails `ensure_terminal_compatible` stores `WebrtcTerminalAdmission::Rejected`. The next Attach returns `OperatorError`. The DataChannel stays up.
+- HelloAck still advertises `TerminalCompatibility::current()`.
+- Unix `TerminalSubscriptionClosed` path is unchanged. Bound WebRTC peer loss is connection death, so that event is not emitted. Unbound `Disconnected` stays recoverable.
+
+### Additional teardown fixes required by the live IsolatedHub oracle
+
+- `send_text_or_peer_terminal` bounds hung `local_send_text` with `LOCAL_WEBRTC_PEER_CLOSE_BOUND` and drains DataChannel events during send.
+- `OnClosing` is terminal. IsolatedHub can emit it before `OnClose`.
+- The idle sender prefers poll over `wait_for_write` and yields after an empty adapter flush.
+- `RTCPeerConnectionState::Disconnected` is terminal only when the peer mux has bound adapter routes. IsolatedHub offer-peer close often stays `Disconnected` instead of `Closed`/`Failed`. Unbound recoverable disconnect is unchanged.
+
+### Review-fix files
+
+| Path | Change |
+| --- | --- |
+| `src/webrtc_terminal_adapter.rs` | Permit wake; `has_bound_routes()` |
+| `src/local_webrtc.rs` | One-channel claim; bounded send; `OnClosing`; bound `Disconnected`; split Hello admission |
+| `src/daemon_transport.rs` | `WebrtcTerminalAdmission` Admitted/Rejected; Attach reject on mismatch |
+| `src/daemon_attach_stream.rs` | `close_from_host`; bind uses Hello terminal requirement |
+| `tests/hub_daemon_lifecycle/webrtc_terminal_adapter.rs` | Two-channel proof; strict live peer-loss oracles |
+| `tests/hub_daemon_lifecycle/webrtc_fixtures.rs` | Extra DataChannel helper; parks terminal frames during request |
+| `packages/hub-test-support/metadata.json` | Regenerated hashes after matrix/feature merge |
+
+### Review-fix tests
+
+```sh
+./test.sh --locked --test hub_daemon_lifecycle_test webrtc_terminal -- --test-threads=1
+BOTSTER_ENV=test cargo test --locked --lib hung_send_text -- --test-threads=1
+BOTSTER_ENV=test cargo test --locked --lib webrtc_hello_bind -- --test-threads=1
+BOTSTER_ENV=test cargo test --locked --lib peer_admits_only -- --test-threads=1
+BOTSTER_ENV=test cargo test --locked --lib wait_observes -- --test-threads=1
+```
+
+Results:
+
+- `webrtc_terminal` 8 passed, including `webrtc_terminal_adapter_bound_peer_loss_closes_adapter_without_hub_detach`.
+- Hung-send, one-channel claim, wake-permit, and in-process bound peer-loss unit tests passed.
+
+Unverified in this pass: full `./test.sh --locked` workspace rerun after the rebase. The first implement pass already ran that wrapper on the pre-rebase commit. This pass reran the review-finding oracles and IsolatedHub live peer-loss.

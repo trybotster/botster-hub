@@ -32,9 +32,13 @@ use webrtc::peer_connection::{
 };
 use webrtc::runtime::{Runtime, Sender as AsyncSender, channel, default_runtime, timeout};
 
+use botster_terminal_protocol::{
+    TerminalCompatibility, ensure_compatible as ensure_terminal_compatible,
+};
+
 use crate::daemon_transport::{
     ControlMessage, ControlSender, ENTITY_SUBSCRIPTION_QUEUE_CAPACITY, EntityFrameSender,
-    response_records_attach_ownership,
+    WebrtcTerminalAdmission, response_records_attach_ownership,
 };
 use crate::webrtc_terminal_adapter::WebRtcConnectionMux;
 
@@ -643,6 +647,7 @@ struct LocalWebrtcPeerState {
     peer_terminal_tx: watch::Sender<Option<LocalWebrtcTerminalCause>>,
     peer_terminal_published: AtomicBool,
     cleanup_sent: AtomicBool,
+    data_channel_claimed: AtomicBool,
     mux: WebRtcConnectionMux,
     #[cfg(test)]
     force_local_close_hang: AtomicBool,
@@ -821,6 +826,7 @@ impl LocalWebrtcPeerState {
             peer_terminal_tx,
             peer_terminal_published: AtomicBool::new(false),
             cleanup_sent: AtomicBool::new(false),
+            data_channel_claimed: AtomicBool::new(false),
             mux: WebRtcConnectionMux::new(),
             #[cfg(test)]
             force_local_close_hang: AtomicBool::new(false),
@@ -859,6 +865,12 @@ impl LocalWebrtcPeerState {
             .lock()
             .expect("local WebRTC entity subscription mutex")
             .remove(subscription_id);
+    }
+
+    fn claim_data_channel(&self) -> bool {
+        self.data_channel_claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 
     fn owns_entity_subscription(&self, subscription_id: &str) -> bool {
@@ -926,6 +938,9 @@ impl LocalWebrtcPeerState {
         let cause = match state {
             RTCPeerConnectionState::Failed => LocalWebrtcTerminalCause::PeerFailed,
             RTCPeerConnectionState::Closed => LocalWebrtcTerminalCause::PeerClosed,
+            RTCPeerConnectionState::Disconnected if self.mux.has_bound_routes() => {
+                LocalWebrtcTerminalCause::PeerDisconnected
+            }
             _ => return None,
         };
         self.publish_peer_terminal(cause);
@@ -1060,6 +1075,15 @@ impl PeerConnectionEventHandler for LocalWebrtcHandler {
     }
 
     async fn on_data_channel(&self, data_channel: Arc<dyn DataChannel>) {
+        if !self.peer_state.claim_data_channel() {
+            eprintln!(
+                "local WebRTC rejecting extra DataChannel: grant_id={}",
+                self.peer_state.grant_id
+            );
+            let _ = tokio::time::timeout(LOCAL_WEBRTC_PEER_CLOSE_BOUND, data_channel.local_close())
+                .await;
+            return;
+        }
         let peer_state = self.peer_state.clone();
         let runtime_tx = peer_state.runtime_tx.clone();
         let stream_key = self.stream_key.clone();
@@ -1099,6 +1123,44 @@ impl PeerConnectionEventHandler for LocalWebrtcHandler {
             )
             .await;
         }));
+    }
+}
+
+async fn send_text_or_peer_terminal<D>(
+    data_channel: &D,
+    stream_key: &AesGcmKey,
+    frame: &str,
+    pending_requests: &mut VecDeque<PendingLocalWebrtcRequest>,
+    flow_control: &mut LocalWebrtcFlowControl,
+    mux: &WebRtcConnectionMux,
+    peer_terminal_rx: &mut watch::Receiver<Option<LocalWebrtcTerminalCause>>,
+) -> Result<(), LocalWebrtcTerminalCause>
+where
+    D: LocalWebrtcDataChannel + ?Sized,
+{
+    if let Some(cause) = *peer_terminal_rx.borrow_and_update() {
+        return Err(cause);
+    }
+    tokio::select! {
+        send = data_channel.local_send_text(frame) => {
+            send.map_err(|_| LocalWebrtcTerminalCause::SendText)
+        }
+        event = poll_data_channel_or_peer_terminal(data_channel, peer_terminal_rx) => {
+            match event {
+                Ok(Some(channel_event)) => apply_data_channel_event(
+                    channel_event,
+                    stream_key,
+                    pending_requests,
+                    flow_control,
+                    mux,
+                ),
+                Ok(None) => Err(LocalWebrtcTerminalCause::PollEnded),
+                Err(cause) => Err(cause),
+            }
+        }
+        _ = tokio::time::sleep(LOCAL_WEBRTC_PEER_CLOSE_BOUND) => {
+            Err(LocalWebrtcTerminalCause::SendText)
+        }
     }
 }
 
@@ -1159,6 +1221,7 @@ where
             request
         } else {
             let inbound = tokio::select! {
+                biased;
                 channel = poll_data_channel_or_peer_terminal(data_channel, &mut peer_terminal_rx) => {
                     LocalWebrtcInbound::Channel(channel)
                 }
@@ -1167,7 +1230,7 @@ where
                         frame.expect("local WebRTC peer owns its entity subscription sender")
                     )
                 }
-                _ = peer_state.mux.notify().notified() => {
+                _ = peer_state.mux.wait_for_write() => {
                     LocalWebrtcInbound::AdapterReady
                 }
             };
@@ -1197,6 +1260,7 @@ where
                         send_failure = Some(failure);
                         break;
                     }
+                    tokio::task::yield_now().await;
                     continue;
                 }
                 LocalWebrtcInbound::Channel(Ok(Some(DataChannelEvent::OnMessage(message)))) => {
@@ -1213,7 +1277,9 @@ where
                         }
                     }
                 }
-                LocalWebrtcInbound::Channel(Ok(Some(DataChannelEvent::OnClose))) => {
+                LocalWebrtcInbound::Channel(Ok(Some(
+                    DataChannelEvent::OnClose | DataChannelEvent::OnClosing,
+                ))) => {
                     terminal_cause = LocalWebrtcTerminalCause::ChannelClosed;
                     break;
                 }
@@ -1248,11 +1314,25 @@ where
                 break;
             }
             if !peer_state.cleanup_sent.load(Ordering::Acquire) {
+                let admission = if let Some(requirement) = hello.terminal_compatibility.as_ref()
+                    && let Err(error) =
+                        ensure_terminal_compatible(requirement, &TerminalCompatibility::current())
+                {
+                    WebrtcTerminalAdmission::Rejected {
+                        code: "terminal_compatibility",
+                        diagnostic: DaemonDiagnostic::compatibility_mismatch(error.diagnostic),
+                    }
+                } else {
+                    WebrtcTerminalAdmission::Admitted {
+                        required_features: hello.compatibility.required_features.clone(),
+                        mux: peer_state.mux.clone(),
+                        terminal_requirement: hello.terminal_compatibility.clone(),
+                    }
+                };
                 let _ = runtime_tx
                     .send(ControlMessage::RegisterWebrtcAdmission {
                         grant_id: peer_state.grant_id.clone(),
-                        required_features: hello.compatibility.required_features.clone(),
-                        mux: peer_state.mux.clone(),
+                        admission,
                     })
                     .await;
             }
@@ -1260,9 +1340,7 @@ where
             let ack = DaemonHelloAck {
                 protocol: PROTOCOL.to_string(),
                 compatibility: DaemonCompatibility::current(),
-                terminal_compatibility: Some(
-                    botster_terminal_protocol::TerminalCompatibility::current(),
-                ),
+                terminal_compatibility: Some(TerminalCompatibility::current()),
                 diagnostics: vec![DaemonDiagnostic::connected("hello")],
             };
             let Ok(frames) = framed_daemon_hello_ack(stream_key, &ack) else {
@@ -1581,12 +1659,18 @@ where
             }
         }
 
-        if data_channel.local_send_text(frame).await.is_err() {
-            return Err(failure(
-                chunk_index,
-                LocalWebrtcTerminalCause::SendText,
-                flow_control,
-            ));
+        if let Err(cause) = send_text_or_peer_terminal(
+            data_channel,
+            stream_key,
+            frame,
+            pending_requests,
+            flow_control,
+            &peer_state.mux,
+            &mut peer_terminal_rx,
+        )
+        .await
+        {
+            return Err(failure(chunk_index, cause, flow_control));
         }
         peer_state.record_response_progress(chunk_index + 1, flow_control.pressured);
 
@@ -1665,7 +1749,9 @@ fn apply_data_channel_event(
             pending_requests.push_back(pending);
             Ok(())
         }
-        DataChannelEvent::OnClose => Err(LocalWebrtcTerminalCause::ChannelClosed),
+        DataChannelEvent::OnClose | DataChannelEvent::OnClosing => {
+            Err(LocalWebrtcTerminalCause::ChannelClosed)
+        }
         DataChannelEvent::OnError => Err(LocalWebrtcTerminalCause::ChannelError),
         _ => Ok(()),
     }
@@ -2134,6 +2220,7 @@ mod tests {
         sent: Mutex<Vec<String>>,
         closed: AtomicBool,
         send_fails: AtomicBool,
+        send_hangs: AtomicBool,
         sent_before_low_water: AtomicBool,
         poll_ends: AtomicBool,
         event_notify: tokio::sync::Notify,
@@ -2156,6 +2243,9 @@ mod tests {
         }
 
         async fn local_send_text(&self, text: &str) -> Result<(), String> {
+            if self.send_hangs.load(Ordering::Acquire) {
+                std::future::pending::<()>().await;
+            }
             if self.send_fails.load(Ordering::Acquire) {
                 return Err("fixture send failure".to_string());
             }
@@ -2204,6 +2294,13 @@ mod tests {
     fn test_peer_state(grant_id: &str) -> LocalWebrtcPeerState {
         let (runtime_tx, _runtime_rx) = tokio_mpsc::channel(64);
         LocalWebrtcPeerState::new(grant_id.to_string(), runtime_tx)
+    }
+
+    #[test]
+    fn peer_admits_only_the_first_data_channel() {
+        let peer_state = test_peer_state("grant-one-channel");
+        assert!(peer_state.claim_data_channel());
+        assert!(!peer_state.claim_data_channel());
     }
 
     fn receive_test_runtime_message(
@@ -3333,6 +3430,10 @@ mod tests {
                 LocalWebrtcTerminalCause::ChannelClosed,
             ),
             (
+                DataChannelEvent::OnClosing,
+                LocalWebrtcTerminalCause::ChannelClosed,
+            ),
+            (
                 DataChannelEvent::OnError,
                 LocalWebrtcTerminalCause::ChannelError,
             ),
@@ -3352,7 +3453,10 @@ mod tests {
                 ))
                 .expect_err("terminal channel event must fail response delivery");
             assert_eq!(failure.cause, expected_cause);
-            assert_eq!(failure.next_chunk_index, 1);
+            assert!(
+                failure.next_chunk_index <= 1,
+                "terminal event must fail the in-flight or next chunk: {failure:?}"
+            );
             assert_eq!(failure.total_chunks, 1);
         }
 
@@ -3389,6 +3493,81 @@ mod tests {
         assert_eq!(send.cause, LocalWebrtcTerminalCause::SendText);
         assert_eq!(send.next_chunk_index, 0);
         assert_eq!(send.last_sent_chunk_index, None);
+    }
+
+    #[test]
+    fn hung_send_text_fails_when_peer_terminal_arrives() {
+        let data_channel = FakeDataChannel::default();
+        data_channel.send_hangs.store(true, Ordering::Release);
+        let key = AesGcmKey::from_slice(&[16; 32]).unwrap();
+        let mut pending = VecDeque::new();
+        let mut flow_control = LocalWebrtcFlowControl::default();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let peer_state = test_peer_state("grant-hung-send-terminal");
+
+        let frames = ["response".to_string()];
+        let failure = runtime
+            .block_on(async {
+                let send = send_response_frames(
+                    &data_channel,
+                    &key,
+                    &frames,
+                    &mut pending,
+                    &mut flow_control,
+                    &peer_state,
+                );
+                tokio::pin!(send);
+                tokio::select! {
+                    result = &mut send => result,
+                    () = async {
+                        tokio::task::yield_now().await;
+                        peer_state.publish_peer_terminal(LocalWebrtcTerminalCause::PeerClosed);
+                        std::future::pending::<()>().await;
+                    } => unreachable!("peer terminal must abort the hung send"),
+                }
+            })
+            .expect_err("peer terminal must abort a hung send_text");
+        assert_eq!(failure.cause, LocalWebrtcTerminalCause::PeerClosed);
+        assert_eq!(failure.next_chunk_index, 0);
+        assert!(data_channel.sent.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn hung_send_text_times_out_within_close_bound() {
+        let data_channel = FakeDataChannel::default();
+        data_channel.send_hangs.store(true, Ordering::Release);
+        let key = AesGcmKey::from_slice(&[17; 32]).unwrap();
+        let mut pending = VecDeque::new();
+        let mut flow_control = LocalWebrtcFlowControl::default();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let peer_state = test_peer_state("grant-hung-send-timeout");
+        let started = Instant::now();
+        let failure = runtime
+            .block_on(send_response_frames(
+                &data_channel,
+                &key,
+                &["response".to_string()],
+                &mut pending,
+                &mut flow_control,
+                &peer_state,
+            ))
+            .expect_err("hung send_text must fail within the close bound");
+        let elapsed = started.elapsed();
+        assert_eq!(failure.cause, LocalWebrtcTerminalCause::SendText);
+        assert!(
+            elapsed >= LOCAL_WEBRTC_PEER_CLOSE_BOUND,
+            "hung send must wait the close bound: {elapsed:?}"
+        );
+        assert!(
+            elapsed < LOCAL_WEBRTC_PEER_CLOSE_HANDLER_JOIN_DEADLINE,
+            "hung send must not block cleanup: {elapsed:?}"
+        );
     }
 
     #[test]

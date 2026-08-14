@@ -185,6 +185,99 @@ fn webrtc_terminal_adapter_bind_returns_only_attaching_then_terminal_frames() {
 }
 
 #[test]
+fn webrtc_terminal_adapter_second_data_channel_does_not_receive_terminal_frames() {
+    let _guard = daemon_test_guard();
+    let (hub, endpoint, bootstrap) = start_webrtc_adapter_hub("w2c");
+    let session_id = "w2c-session";
+    let subscription_id = "w2c-sub";
+    block_on(async {
+        let (mut peer, key) = open_local_webrtc_peer(&endpoint, &bootstrap).await;
+        peer.encrypted_hello(&key, &webrtc_terminal_adapter_hello())
+            .await
+            .expect("hello");
+        peer.encrypted_request(
+            &key,
+            &botster_hub_client::DaemonRequest::Spawn {
+                session_id: session_id.to_string(),
+                command: "printf 'webrtc-two-channel-ready\\n'; sleep 30".to_string(),
+            },
+        )
+        .await
+        .expect("spawn");
+        peer.encrypted_request(
+            &key,
+            &botster_hub_client::DaemonRequest::Attach {
+                session_id: session_id.to_string(),
+                subscription_id: subscription_id.to_string(),
+            },
+        )
+        .await
+        .expect("attach");
+        let mut extra = peer
+            .create_extra_data_channel()
+            .await
+            .expect("create extra DataChannel");
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut saw_terminal_frame = false;
+        while Instant::now() < deadline && !saw_terminal_frame {
+            let drain = peer
+                .encrypted_request(
+                    &key,
+                    &botster_hub_client::DaemonRequest::drain_subscription(
+                        session_id,
+                        subscription_id,
+                    ),
+                )
+                .await
+                .expect("bound drain");
+            assert!(
+                drain
+                    .events
+                    .iter()
+                    .all(|event| !webrtc_event_is_terminal_body(event)),
+                "bound drain must not emit terminal bodies: {:?}",
+                drain.events
+            );
+            if let Ok(bytes) = timeout(Duration::from_millis(200), peer.next_terminal_frame(&key))
+                .await
+            {
+                let bytes = bytes.expect("terminal frame");
+                assert!(!bytes.is_empty());
+                saw_terminal_frame = true;
+            }
+        }
+        assert!(
+            saw_terminal_frame,
+            "admitted channel must receive DaemonTerminalFrame chunks"
+        );
+        let extra_deadline = Instant::now() + Duration::from_millis(400);
+        let mut extra_terminal_frames = 0;
+        while Instant::now() < extra_deadline {
+            match timeout(Duration::from_millis(50), extra.messages.recv()).await {
+                Ok(Some(message)) => {
+                    if let Ok(chunk) = serde_json::from_str::<
+                        botster_hub_client::DaemonLocalWebrtcDeliveryChunk,
+                    >(&message)
+                        && chunk.delivery_kind
+                            == botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonTerminalFrame
+                    {
+                        extra_terminal_frames += 1;
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        assert_eq!(
+            extra_terminal_frames, 0,
+            "rejected extra DataChannel must not receive terminal frames"
+        );
+        peer.peer.close().await.expect("close offer peer");
+    });
+    shutdown_short_lived_session(&endpoint, session_id);
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
 fn webrtc_terminal_adapter_unbound_attach_still_drains_snapshot_without_terminal_frames() {
     let _guard = daemon_test_guard();
     let (hub, endpoint, bootstrap) = start_webrtc_adapter_hub("wau");
@@ -234,6 +327,10 @@ fn webrtc_terminal_adapter_unbound_attach_still_drains_snapshot_without_terminal
             });
         }
         assert!(saw_snapshot, "unbound WebRTC attach must still Drain Snapshot");
+        assert!(
+            peer.pending_terminal_frames.is_empty(),
+            "unbound attach must not receive daemon_terminal_frame"
+        );
         peer.peer.close().await.expect("close offer peer");
     });
     shutdown_short_lived_session(&endpoint, session_id);
@@ -251,7 +348,7 @@ fn webrtc_terminal_adapter_bound_peer_loss_closes_adapter_without_hub_detach() {
         .status
         .expect("status body")
         .lifecycle_counters;
-    block_on(async {
+    let attached = block_on(async {
         let (mut peer, key) = open_local_webrtc_peer(&endpoint, &bootstrap).await;
         peer.encrypted_hello(&key, &webrtc_terminal_adapter_hello())
             .await
@@ -274,9 +371,22 @@ fn webrtc_terminal_adapter_bound_peer_loss_closes_adapter_without_hub_detach() {
         )
         .await
         .expect("attach");
+        let attached = botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::Status,
+        )
+        .expect("status after attach")
+        .status
+        .expect("status body")
+        .lifecycle_counters;
         peer.peer.close().await.expect("close offer peer");
+        attached
     });
-    let deadline = Instant::now() + Duration::from_secs(5);
+    assert!(
+        attached.live_attach_subscriptions >= 1,
+        "bind must occupy a live attach route: {attached:?}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
     let mut after = before.clone();
     while Instant::now() < deadline {
         after = botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
@@ -284,9 +394,7 @@ fn webrtc_terminal_adapter_bound_peer_loss_closes_adapter_without_hub_detach() {
             .status
             .expect("status body")
             .lifecycle_counters;
-        if cleanup_delta(&before, &after, "bound_adapter_close") >= 1
-            || after.cleanup_completed > before.cleanup_completed
-        {
+        if cleanup_delta(&before, &after, "bound_adapter_close") >= 1 {
             break;
         }
         thread::sleep(Duration::from_millis(20));
@@ -297,9 +405,12 @@ fn webrtc_terminal_adapter_bound_peer_loss_closes_adapter_without_hub_detach() {
         "bound peer loss must not Hub-Detach: before={before:?} after={after:?}"
     );
     assert!(
-        cleanup_delta(&before, &after, "bound_adapter_close") >= 1
-            || cleanup_delta(&before, &after, "cleanup_hub_detach") == 0,
-        "bound peer loss must close the adapter or at least omit Hub Detach: before={before:?} after={after:?}"
+        cleanup_delta(&before, &after, "bound_adapter_close") >= 1,
+        "bound peer loss must close the adapter: before={before:?} after={after:?}"
+    );
+    assert!(
+        after.live_attach_subscriptions < attached.live_attach_subscriptions,
+        "bound occupancy must drop after adapter close: attached={attached:?} after={after:?}"
     );
     let listed = botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::ListSessions)
         .expect("list");
