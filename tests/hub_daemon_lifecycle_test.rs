@@ -58,5 +58,6 @@ include!("hub_daemon_lifecycle/shutdown.rs");
 include!("hub_daemon_lifecycle/packages.rs");
 include!("hub_daemon_lifecycle/sessions.rs");
 include!("hub_daemon_lifecycle/webrtc_proofs.rs");
+include!("hub_daemon_lifecycle/unix_terminal_adapter.rs");
 include!("hub_daemon_lifecycle/operator_console.rs");
 include!("hub_daemon_lifecycle/plugin_bounds.rs");

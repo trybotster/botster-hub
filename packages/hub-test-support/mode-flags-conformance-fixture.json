@@ -5,7 +5,7 @@
     "operation": "read_mode_flags",
     "response_kind": "operator_error"
   },
-  "conformance_fixture_revision": 38,
+  "conformance_fixture_revision": 39,
   "mouse_off": {
     "mode_flags": {
       "alt_screen": false,

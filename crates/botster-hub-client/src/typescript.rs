@@ -69,6 +69,17 @@ pub(crate) fn daemon_protocol_typescript() -> String {
     );
     emit_interface(
         &mut output,
+        "DaemonUnixTerminalEnvelope",
+        &[
+            ("plane", "string"),
+            ("kind", "string"),
+            ("session_id", "string"),
+            ("subscription_id", "string"),
+            ("payload_base64", "string"),
+        ],
+    );
+    emit_interface(
+        &mut output,
         "DaemonCompatibility",
         &[
             ("protocol", "string"),

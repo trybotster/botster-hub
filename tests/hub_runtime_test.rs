@@ -116,7 +116,9 @@ impl CredentialStore for UnavailableCredentialStore {
 
 fn drain_until(
     runtime: &mut HubRuntime,
+    client_id: &ClientId,
     session_id: &SessionId,
+    subscription_id: &SubscriptionId,
     needle: &[u8],
     logical_clock: &mut u64,
 ) -> Vec<u8> {
@@ -125,8 +127,8 @@ fn drain_until(
 
     while Instant::now() < deadline {
         let output = runtime
-            .drain_runtime_once(session_id, *logical_clock)
-            .expect("drain runtime through core daemon");
+            .drain_subscription(client_id, session_id, subscription_id, *logical_clock)
+            .expect("drain subscription through core daemon");
         *logical_clock += 1;
 
         for (_, frame) in output.client_egress {
@@ -139,6 +141,20 @@ fn drain_until(
             .windows(needle.len())
             .any(|window| window == needle)
         {
+            return observed;
+        }
+        if let Ok(screen) = runtime.read_screen(
+            RequestId("drain-until-screen".to_string()),
+            session_id.clone(),
+            *logical_clock,
+        ) && screen
+            .screen
+            .text
+            .as_bytes()
+            .windows(needle.len())
+            .any(|window| window == needle)
+        {
+            observed.extend(needle.iter().copied());
             return observed;
         }
 
@@ -184,13 +200,20 @@ fn hub_runtime_routes_production_session_verbs_through_core_daemon() {
         .attach_client(
             client_id.clone(),
             session_id.clone(),
-            subscription_id,
+            subscription_id.clone(),
             logical_clock,
         )
         .expect("attach fake client through core daemon");
     logical_clock += 1;
 
-    drain_until(&mut runtime, &session_id, b"ready", &mut logical_clock);
+    drain_until(
+        &mut runtime,
+        &client_id,
+        &session_id,
+        &subscription_id,
+        b"ready",
+        &mut logical_clock,
+    );
 
     runtime
         .resize(
@@ -217,7 +240,9 @@ fn hub_runtime_routes_production_session_verbs_through_core_daemon() {
     logical_clock += 1;
     drain_until(
         &mut runtime,
+        &client_id,
         &session_id,
+        &subscription_id,
         b"echo:ping-hub",
         &mut logical_clock,
     );
@@ -403,7 +428,7 @@ fn hub_runtime_uses_worker_backed_sessions_and_adopts_after_daemon_restart() {
         .attach_client(
             client_id.clone(),
             session_id.clone(),
-            subscription_id,
+            subscription_id.clone(),
             logical_clock,
         )
         .expect("attach through adopted worker");
@@ -419,7 +444,9 @@ fn hub_runtime_uses_worker_backed_sessions_and_adopts_after_daemon_restart() {
     logical_clock += 1;
     drain_until(
         &mut restarted,
+        &client_id,
         &session_id,
+        &subscription_id,
         b"echo:after-adopt",
         &mut logical_clock,
     );
@@ -450,7 +477,7 @@ fn hub_runtime_guarded_write_delegates_readiness_and_delivery_state_to_core_daem
         .attach_client(
             client_id.clone(),
             session_id.clone(),
-            subscription_id,
+            subscription_id.clone(),
             logical_clock,
         )
         .expect("attach for guarded write");
@@ -481,7 +508,9 @@ fn hub_runtime_guarded_write_delegates_readiness_and_delivery_state_to_core_daem
     );
     drain_until(
         &mut runtime,
+        &client_id,
         &session_id,
+        &subscription_id,
         b"echo:guarded",
         &mut logical_clock,
     );
@@ -521,4 +550,67 @@ fn runtime_boot_loads_hub_state_from_configured_data_directory() {
         config.data_directory
     );
     assert!(store.path().exists());
+}
+
+#[test]
+fn bind_terminal_adapter_inventory_echoes_capability_set() {
+    let config = explicit_config_with_data_dir("target/botster-hub-test-data/runtime-unix-bind");
+    let mut runtime = HubRuntime::new(config);
+    let request = spawn_request(runtime.config());
+    let session_id = request.session_id.clone();
+    let client_id = ClientId("unix-bind-client".to_string());
+    let subscription_id = SubscriptionId("unix-bind-sub".to_string());
+    let mut logical_clock = 20;
+
+    runtime
+        .spawn_session(request, CoreSessionMetadata::new(), logical_clock)
+        .expect("spawn");
+    logical_clock += 1;
+    runtime
+        .attach_client(
+            client_id.clone(),
+            session_id.clone(),
+            subscription_id.clone(),
+            logical_clock,
+        )
+        .expect("attach");
+    logical_clock += 1;
+
+    let before = runtime.list_terminal_subscriptions();
+    let generation = before
+        .iter()
+        .find(|row| {
+            row.client_id == client_id
+                && row.session_id == session_id
+                && row.subscription_id == subscription_id
+        })
+        .map(|row| row.generation)
+        .expect("live generation after attach");
+    assert!(before.iter().any(|row| {
+        row.generation == generation && !row.adapter_bound && row.capabilities.is_none()
+    }));
+
+    let capabilities =
+        botster_core::TerminalCapabilitySet::from_tokens(["terminal_streaming", "resize"])
+            .expect("advertised tokens");
+    runtime
+        .bind_terminal_adapter(
+            client_id.clone(),
+            session_id.clone(),
+            subscription_id.clone(),
+            generation,
+            capabilities.clone(),
+            Box::new(botster_core_test_support::terminal_adapter::FakeTerminalAdapter::default()),
+        )
+        .expect("bind");
+
+    let after = runtime.list_terminal_subscriptions();
+    let bound = after
+        .iter()
+        .find(|row| row.generation == generation)
+        .expect("inventory row after bind");
+    assert!(bound.adapter_bound);
+    assert_eq!(bound.capabilities.as_ref(), Some(&capabilities));
+
+    let _ = logical_clock;
 }

@@ -1,17 +1,27 @@
 //! Owner registry for subscription-owned attach drains.
 //!
 //! Core owns incremental frames, FINISH, `attached`, and queued input/resize.
-//! Hub authorizes the route and pulls `drain_subscription` once per Drain.
+//! Hub authorizes the route and records generation plus adapter-bound flags.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use botster_core::{ClientId, SessionId, SubscriptionId};
+use botster_core::{
+    ClientId, SessionId, SubscriptionId, TerminalCapabilitySet, TerminalSubscriptionGeneration,
+    TerminalSubscriptionRecord,
+};
 use botster_core_daemon::CoreDaemonError;
-use botster_hub_client::DaemonEvent;
+use botster_hub_client::{
+    ATTACH_STATE_ATTACHING, DaemonEvent, FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY,
+    FEATURE_UNIX_TERMINAL_ADAPTER,
+};
+use botster_terminal_protocol::TerminalCompatibility;
 
 use super::{DaemonTransportError, DaemonTransportResult, daemon_event_from_client};
 use crate::HubRuntime;
 use crate::client_api::events_from_drain;
+use crate::unix_terminal_adapter::{
+    UnixConnectionMux, UnixTerminalAdapter, UnixTerminalAdapterHandle,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AttachStreamOwner {
@@ -21,11 +31,19 @@ pub(crate) struct AttachStreamOwner {
 
 pub(crate) struct AttachStream {
     owner: AttachStreamOwner,
+    generation: Option<TerminalSubscriptionGeneration>,
+    adapter_bound: bool,
+    adapter: Option<UnixTerminalAdapterHandle>,
 }
 
 impl AttachStream {
     fn new(owner: AttachStreamOwner) -> Self {
-        Self { owner }
+        Self {
+            owner,
+            generation: None,
+            adapter_bound: false,
+            adapter: None,
+        }
     }
 
     pub(crate) fn owner_client_id(&self) -> String {
@@ -43,22 +61,20 @@ impl AttachStream {
             _ => false,
         }
     }
+
+    fn close_adapter(&mut self) {
+        if let Some(adapter) = self.adapter.take() {
+            adapter.close();
+        }
+        self.adapter_bound = false;
+    }
 }
 
+#[derive(Default)]
 pub(crate) struct AttachStreamRegistry {
     streams: BTreeMap<(String, String), AttachStream>,
     pub(crate) active_subscriptions: BTreeMap<String, BTreeSet<String>>,
     pub(crate) attach_owner_grant_ids: BTreeMap<(String, String), String>,
-}
-
-impl Default for AttachStreamRegistry {
-    fn default() -> Self {
-        Self {
-            streams: BTreeMap::new(),
-            active_subscriptions: BTreeMap::new(),
-            attach_owner_grant_ids: BTreeMap::new(),
-        }
-    }
 }
 
 impl AttachStreamRegistry {
@@ -163,6 +179,302 @@ impl AttachStreamRegistry {
             self.cancel_stream(&session_id, &subscription_id);
         }
     }
+
+    pub(crate) fn is_adapter_bound(&self, session_id: &str, subscription_id: &str) -> bool {
+        self.streams
+            .get(&(session_id.to_string(), subscription_id.to_string()))
+            .is_some_and(|stream| stream.adapter_bound)
+    }
+
+    pub(crate) fn close_adapter(&mut self, session_id: &str, subscription_id: &str) {
+        if let Some(stream) = self
+            .streams
+            .get_mut(&(session_id.to_string(), subscription_id.to_string()))
+        {
+            stream.close_adapter();
+        }
+    }
+
+    pub(crate) fn bound_routes(&self) -> Vec<(String, String, UnixTerminalAdapterHandle)> {
+        self.streams
+            .iter()
+            .filter_map(|((session_id, subscription_id), stream)| {
+                stream
+                    .adapter
+                    .clone()
+                    .map(|handle| (session_id.clone(), subscription_id.clone(), handle))
+            })
+            .collect()
+    }
+
+    pub(crate) fn close_adapters_for_client(&mut self, client_id: &str) {
+        let keys: Vec<(String, String)> = self
+            .streams
+            .iter()
+            .filter(|(_, stream)| stream.owner.client_id == client_id && stream.adapter_bound)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for (session_id, subscription_id) in keys {
+            self.close_adapter(&session_id, &subscription_id);
+        }
+    }
+
+    pub(crate) fn reconcile_inventory(&mut self, inventory: &[TerminalSubscriptionRecord]) {
+        let stale: Vec<(String, String)> = self
+            .streams
+            .iter()
+            .filter(|((session_id, subscription_id), stream)| {
+                stream.adapter_bound
+                    && !inventory.iter().any(|row| {
+                        row.session_id.0 == *session_id
+                            && row.subscription_id.0 == *subscription_id
+                            && stream
+                                .generation
+                                .is_none_or(|generation| row.generation == generation)
+                    })
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for (session_id, subscription_id) in stale {
+            self.close_adapter(&session_id, &subscription_id);
+            self.cancel_stream(&session_id, &subscription_id);
+        }
+    }
+
+    pub(crate) fn record_generation(
+        &mut self,
+        session_id: &str,
+        subscription_id: &str,
+        generation: TerminalSubscriptionGeneration,
+    ) {
+        if let Some(stream) = self
+            .streams
+            .get_mut(&(session_id.to_string(), subscription_id.to_string()))
+        {
+            stream.generation = Some(generation);
+        }
+    }
+
+    pub(crate) fn mark_adapter_bound(
+        &mut self,
+        session_id: &str,
+        subscription_id: &str,
+        generation: TerminalSubscriptionGeneration,
+        adapter: UnixTerminalAdapterHandle,
+    ) {
+        if let Some(stream) = self
+            .streams
+            .get_mut(&(session_id.to_string(), subscription_id.to_string()))
+        {
+            stream.generation = Some(generation);
+            stream.adapter_bound = true;
+            stream.adapter = Some(adapter);
+        }
+    }
+}
+
+pub(crate) fn is_terminal_body_event(event: &DaemonEvent) -> bool {
+    matches!(
+        event,
+        DaemonEvent::Snapshot { .. }
+            | DaemonEvent::Scrollback { .. }
+            | DaemonEvent::TerminalOutput { .. }
+            | DaemonEvent::ProcessExit { .. }
+            | DaemonEvent::AttachState { .. }
+    )
+}
+
+pub(crate) fn terminal_event_is_pre_bind_forbidden(event: &DaemonEvent) -> bool {
+    match event {
+        DaemonEvent::Snapshot { .. }
+        | DaemonEvent::Scrollback { .. }
+        | DaemonEvent::TerminalOutput { .. }
+        | DaemonEvent::ProcessExit { .. } => true,
+        DaemonEvent::AttachState { state, .. } => state != ATTACH_STATE_ATTACHING,
+        _ => false,
+    }
+}
+
+pub(crate) fn initial_attaching_only(events: &[DaemonEvent]) -> bool {
+    let terminal: Vec<_> = events
+        .iter()
+        .filter(|event| is_terminal_body_event(event))
+        .collect();
+    matches!(
+        terminal.as_slice(),
+        [event] if !terminal_event_is_pre_bind_forbidden(event)
+    )
+}
+
+pub(crate) fn negotiated_unix_capability_set(
+    required_features: &[String],
+) -> Result<TerminalCapabilitySet, botster_core::TerminalCapabilitySetError> {
+    let include_snapshot = required_features
+        .iter()
+        .any(|feature| feature == FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY);
+    let tokens: Vec<String> = TerminalCompatibility::current()
+        .features
+        .into_iter()
+        .filter(|token| {
+            if token == FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY {
+                include_snapshot
+            } else {
+                true
+            }
+        })
+        .collect();
+    TerminalCapabilitySet::from_tokens(tokens)
+}
+
+pub(crate) fn hello_requires_unix_adapter(required_features: &[String]) -> bool {
+    required_features
+        .iter()
+        .any(|feature| feature == FEATURE_UNIX_TERMINAL_ADAPTER)
+}
+
+pub(crate) fn live_generation_for_route(
+    inventory: &[TerminalSubscriptionRecord],
+    client_id: &str,
+    session_id: &str,
+    subscription_id: &str,
+) -> Option<TerminalSubscriptionGeneration> {
+    inventory.iter().find_map(|row| {
+        if row.client_id.0 == client_id
+            && row.session_id.0 == session_id
+            && row.subscription_id.0 == subscription_id
+        {
+            Some(row.generation)
+        } else {
+            None
+        }
+    })
+}
+
+pub(crate) fn attach_failed_events(session_id: &str, subscription_id: &str) -> Vec<DaemonEvent> {
+    vec![DaemonEvent::AttachState {
+        session_id: session_id.to_string(),
+        subscription_id: subscription_id.to_string(),
+        state: botster_hub_client::ATTACH_STATE_ATTACH_FAILED.to_string(),
+    }]
+}
+
+pub(crate) fn fail_closed_pre_bind_attach(
+    registry: &mut AttachStreamRegistry,
+    runtime: &mut HubRuntime,
+    client_id: &str,
+    session_id: &str,
+    subscription_id: &str,
+    now_seconds: u64,
+    adapter: Option<UnixTerminalAdapterHandle>,
+) -> Vec<DaemonEvent> {
+    if let Some(adapter) = adapter {
+        adapter.close();
+    }
+    registry.close_adapter(session_id, subscription_id);
+    let generation = live_generation_for_route(
+        &runtime.list_terminal_subscriptions(),
+        client_id,
+        session_id,
+        subscription_id,
+    );
+    if let Some(generation) = generation {
+        let _ = runtime.detach_terminal_subscription(
+            ClientId(client_id.to_string()),
+            SessionId(session_id.to_string()),
+            SubscriptionId(subscription_id.to_string()),
+            generation,
+            now_seconds,
+        );
+    }
+    registry.cancel_stream(session_id, subscription_id);
+    attach_failed_events(session_id, subscription_id)
+}
+
+pub(crate) struct UnixBindRequest<'a> {
+    pub client_id: &'a str,
+    pub session_id: &'a str,
+    pub subscription_id: &'a str,
+    pub required_features: &'a [String],
+    pub now_seconds: u64,
+    pub mux: Option<&'a UnixConnectionMux>,
+}
+
+pub(crate) fn bind_unix_adapter_after_attaching(
+    registry: &mut AttachStreamRegistry,
+    runtime: &mut HubRuntime,
+    request: UnixBindRequest<'_>,
+) -> Result<Option<UnixTerminalAdapterHandle>, Vec<DaemonEvent>> {
+    let inventory = runtime.list_terminal_subscriptions();
+    let Some(generation) = live_generation_for_route(
+        &inventory,
+        request.client_id,
+        request.session_id,
+        request.subscription_id,
+    ) else {
+        return Err(fail_closed_pre_bind_attach(
+            registry,
+            runtime,
+            request.client_id,
+            request.session_id,
+            request.subscription_id,
+            request.now_seconds,
+            None,
+        ));
+    };
+    registry.record_generation(request.session_id, request.subscription_id, generation);
+    let capabilities = match negotiated_unix_capability_set(request.required_features) {
+        Ok(capabilities) => capabilities,
+        Err(_) => {
+            return Err(fail_closed_pre_bind_attach(
+                registry,
+                runtime,
+                request.client_id,
+                request.session_id,
+                request.subscription_id,
+                request.now_seconds,
+                None,
+            ));
+        }
+    };
+    let (adapter, handle) = match request.mux {
+        Some(mux) => mux.create_adapter(),
+        None => UnixTerminalAdapter::pair(),
+    };
+    if runtime
+        .bind_terminal_adapter(
+            ClientId(request.client_id.to_string()),
+            SessionId(request.session_id.to_string()),
+            SubscriptionId(request.subscription_id.to_string()),
+            generation,
+            capabilities,
+            Box::new(adapter),
+        )
+        .is_err()
+    {
+        return Err(fail_closed_pre_bind_attach(
+            registry,
+            runtime,
+            request.client_id,
+            request.session_id,
+            request.subscription_id,
+            request.now_seconds,
+            Some(handle),
+        ));
+    }
+    registry.mark_adapter_bound(
+        request.session_id,
+        request.subscription_id,
+        generation,
+        handle.clone(),
+    );
+    if let Some(mux) = request.mux {
+        mux.register(
+            request.session_id.to_string(),
+            request.subscription_id.to_string(),
+            handle.clone(),
+        );
+    }
+    Ok(Some(handle))
 }
 
 #[cfg(test)]
@@ -203,5 +515,94 @@ mod tests {
         registry.cancel_stream("s", "sub");
         assert_eq!(registry.stream_owner_client_id("s", "sub"), None);
         assert!(!registry.active_subscriptions.contains_key("s"));
+    }
+
+    #[test]
+    fn only_the_initial_attaching_frame_is_accepted_before_bind() {
+        let attaching = DaemonEvent::AttachState {
+            session_id: "s".to_string(),
+            subscription_id: "sub".to_string(),
+            state: ATTACH_STATE_ATTACHING.to_string(),
+        };
+        assert!(initial_attaching_only(std::slice::from_ref(&attaching)));
+        assert!(initial_attaching_only(&[
+            DaemonEvent::SessionLifecycle {
+                session_id: "s".to_string(),
+                state: "running".to_string(),
+            },
+            attaching.clone(),
+        ]));
+        assert!(!initial_attaching_only(&[]));
+        assert!(!initial_attaching_only(&[DaemonEvent::AttachState {
+            session_id: "s".to_string(),
+            subscription_id: "sub".to_string(),
+            state: "attached".to_string(),
+        }]));
+        assert!(!initial_attaching_only(&[
+            attaching.clone(),
+            DaemonEvent::Snapshot {
+                session_id: "s".to_string(),
+                subscription_id: "sub".to_string(),
+                history: botster_hub_client::DaemonOpaqueHistoryPayload::from_bytes(b"x"),
+            },
+        ]));
+        assert!(terminal_event_is_pre_bind_forbidden(
+            &DaemonEvent::TerminalOutput {
+                session_id: "s".to_string(),
+                subscription_id: "sub".to_string(),
+                payload: botster_hub_client::DaemonLiveOutputPayload::from_bytes(b"out"),
+            }
+        ));
+        assert!(terminal_event_is_pre_bind_forbidden(
+            &DaemonEvent::ProcessExit {
+                session_id: "s".to_string(),
+                subscription_id: "sub".to_string(),
+                code: Some(0),
+            }
+        ));
+    }
+
+    #[test]
+    fn reconcile_releases_routes_missing_from_core_inventory() {
+        let mut registry = AttachStreamRegistry::default();
+        registry.start_attach(owner(), "s".into(), "sub".into());
+        registry.record_generation("s", "sub", TerminalSubscriptionGeneration(1));
+        let (_, handle) = UnixTerminalAdapter::pair();
+        registry.mark_adapter_bound("s", "sub", TerminalSubscriptionGeneration(1), handle);
+        registry.reconcile_inventory(&[]);
+        assert_eq!(registry.stream_owner_client_id("s", "sub"), None);
+
+        registry.start_attach(owner(), "s".into(), "unbound".into());
+        registry.reconcile_inventory(&[]);
+        assert_eq!(
+            registry.stream_owner_client_id("s", "unbound").as_deref(),
+            Some("client-a"),
+            "unbound routes stay until session retain or explicit detach"
+        );
+    }
+
+    #[test]
+    fn capability_intersection_includes_snapshot_only_when_hello_requires_it() {
+        let without = negotiated_unix_capability_set(&[FEATURE_UNIX_TERMINAL_ADAPTER.to_string()])
+            .expect("advertised tokens");
+        assert!(!without.contains(FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY));
+        let with = negotiated_unix_capability_set(&[
+            FEATURE_UNIX_TERMINAL_ADAPTER.to_string(),
+            FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY.to_string(),
+        ])
+        .expect("advertised tokens");
+        assert!(with.contains(FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY));
+    }
+
+    #[test]
+    fn attach_stream_source_does_not_branch_on_snapshot_phases() {
+        let source = include_str!("daemon_attach_stream.rs");
+        let production = source.split("mod tests").next().expect("production source");
+        for forbidden in [r#""READY""#, r#""PAGE""#, r#""FINISH""#, "GHOSTSNP"] {
+            assert!(
+                !production.contains(forbidden),
+                "attach stream must stay content-blind: found {forbidden}"
+            );
+        }
     }
 }

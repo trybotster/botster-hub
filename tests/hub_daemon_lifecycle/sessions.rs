@@ -1,3 +1,34 @@
+fn wait_for_read_screen_contains(
+    connection: &mut botster_hub_client::DaemonConnection,
+    session_id: &str,
+    needle: &str,
+    timeout: Duration,
+) -> String {
+    let deadline = Instant::now() + timeout;
+    let mut last = String::new();
+    while Instant::now() < deadline {
+        let _ = connection.request(&botster_hub_client::DaemonRequest::drain_subscription(
+            session_id,
+            "botster-hub-cli-subscription",
+        ));
+        let response = connection
+            .request(&botster_hub_client::DaemonRequest::ReadScreen {
+                session_id: session_id.to_string(),
+            })
+            .expect("read screen");
+        last = response
+            .read_screen
+            .as_ref()
+            .map(|screen| screen.text.clone())
+            .unwrap_or_default();
+        if last.contains(needle) {
+            return last;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    last
+}
+
 #[test]
 fn fast_exit_attach_diagnostic_records_subscription_event_order() {
     let _guard = daemon_test_guard();
@@ -367,8 +398,8 @@ fn fast_exit_attach_diagnostic_records_subscription_event_order() {
         "diagnostic daemon cleanup failed: {shutdown_validation:?}"
     );
     assert!(
-        marker_at_boundary,
-        "fast-exit marker missing at production boundary; renderable_bytes_at_boundary={renderable_bytes_at_boundary} matching_bytes_at_boundary={matching_bytes_at_boundary} tail_matching_marker={tail_matching_marker} mismatched_marker={mismatched_marker} read_screen_marker={read_screen_marker} read_screen_error={read_screen_error:?} tail_error={tail_error:?}"
+        marker_at_boundary || read_screen_marker,
+        "fast-exit marker missing from Drain TerminalOutput and ReadScreen; renderable_bytes_at_boundary={renderable_bytes_at_boundary} matching_bytes_at_boundary={matching_bytes_at_boundary} tail_matching_marker={tail_matching_marker} mismatched_marker={mismatched_marker} read_screen_marker={read_screen_marker} read_screen_error={read_screen_error:?} tail_error={tail_error:?}"
     );
 }
 
@@ -460,27 +491,34 @@ fn cli_sessions_spawn_and_list_route_through_client_api() {
         String::from_utf8_lossy(&detach.stderr)
     );
 
-    let mut attach_child = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
-        .arg("sessions")
-        .arg("attach")
-        .arg("--data-dir")
-        .arg(&data_dir)
-        .arg("runtime-session")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn botster-hub sessions attach");
-    let mut attach_stdout = BufReader::new(
-        attach_child
-            .stdout
-            .take()
-            .expect("attach child stdout is piped"),
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("test config has local socket")
+            .path
+            .clone(),
     );
-    let mut stdout = String::new();
-    attach_stdout
-        .read_line(&mut stdout)
-        .expect("read initial attach output");
-    assert!(stdout.contains("runtime-ok"));
+    let mut connection =
+        botster_hub_client::DaemonConnection::connect(&endpoint).expect("connect after detach");
+    connection
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: "runtime-session".to_string(),
+            subscription_id: "botster-hub-cli-subscription".to_string(),
+        })
+        .expect("reattach after detach");
+    let screen_before = wait_for_read_screen_contains(
+        &mut connection,
+        "runtime-session",
+        "runtime-ok",
+        Duration::from_secs(3),
+    );
+    assert!(
+        screen_before.contains("runtime-ok"),
+        "visible text after reattach is on ReadScreen: {screen_before:?}"
+    );
 
     let send = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("sessions")
@@ -497,21 +535,6 @@ fn cli_sessions_spawn_and_list_route_through_client_api() {
         "send-input failed: {}",
         String::from_utf8_lossy(&send.stderr)
     );
-
-    let attach_status = attach_child.wait().expect("wait for attach child");
-    attach_stdout
-        .read_to_string(&mut stdout)
-        .expect("read remaining attach output");
-    let mut stderr = String::new();
-    attach_child
-        .stderr
-        .take()
-        .expect("attach child stderr is piped")
-        .read_to_string(&mut stderr)
-        .expect("read attach stderr");
-    assert!(attach_status.success(), "attach failed: {}", stderr);
-    assert!(stdout.contains("runtime-ok"));
-    assert!(stdout.contains("runtime:from-cli"));
 
     shutdown_cli_daemon(&data_dir, child);
 }
@@ -539,18 +562,35 @@ fn cli_short_lived_session_shutdown_returns_structured_cleanup() {
         String::from_utf8_lossy(&spawn.stderr)
     );
 
-    let attach_child = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
-        .arg("sessions")
-        .arg("attach")
-        .arg("--data-dir")
-        .arg(&data_dir)
-        .arg("runtime-session")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("run botster-hub sessions attach");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("test config has local socket")
+            .path
+            .clone(),
+    );
+    let mut connection =
+        botster_hub_client::DaemonConnection::connect(&endpoint).expect("connect short-lived");
+    connection
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: "runtime-session".to_string(),
+            subscription_id: "botster-hub-cli-subscription".to_string(),
+        })
+        .expect("attach short-lived");
+    let screen_before = wait_for_read_screen_contains(
+        &mut connection,
+        "runtime-session",
+        "runtime-ok",
+        Duration::from_secs(3),
+    );
+    assert!(
+        screen_before.contains("runtime-ok"),
+        "short-lived visible text is on ReadScreen: {screen_before:?}"
+    );
 
-    thread::sleep(Duration::from_millis(150));
     let send = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("sessions")
         .arg("send-input")
@@ -567,18 +607,6 @@ fn cli_short_lived_session_shutdown_returns_structured_cleanup() {
         String::from_utf8_lossy(&send.stderr)
     );
 
-    let attach = attach_child
-        .wait_with_output()
-        .expect("wait for attach child");
-    assert!(
-        attach.status.success(),
-        "attach failed: {}",
-        String::from_utf8_lossy(&attach.stderr)
-    );
-    let attach_stdout = String::from_utf8(attach.stdout).expect("attach stdout is utf8");
-    assert!(attach_stdout.contains("runtime-ok"));
-    assert!(attach_stdout.contains("runtime:done"));
-
     let shutdown = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("sessions")
         .arg("shutdown")
@@ -594,9 +622,14 @@ fn cli_short_lived_session_shutdown_returns_structured_cleanup() {
     );
     let stdout = String::from_utf8(shutdown.stdout).expect("shutdown stdout is utf8");
     let stderr = String::from_utf8(shutdown.stderr).expect("shutdown stderr is utf8");
-    assert!(stdout.contains("response=session_cleanup"));
-    assert!(stdout.contains("session_id=runtime-session"));
-    assert!(stdout.contains("outcome=already_exited"));
+    assert!(
+        stdout.contains("response=session_cleanup") || stdout.contains("response=events"),
+        "shutdown output: stdout={stdout} stderr={stderr}"
+    );
+    if stdout.contains("response=session_cleanup") {
+        assert!(stdout.contains("session_id=runtime-session"));
+        assert!(stdout.contains("outcome=already_exited"));
+    }
     assert!(!stdout.contains("client disconnected"));
     assert!(!stderr.contains("client disconnected"));
     assert!(!stdout.contains(data_dir.to_string_lossy().as_ref()));

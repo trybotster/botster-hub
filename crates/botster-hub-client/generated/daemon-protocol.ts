@@ -36,6 +36,14 @@ export interface DaemonHelloAck {
   diagnostics?: DaemonDiagnostic[];
 }
 
+export interface DaemonUnixTerminalEnvelope {
+  plane: string;
+  kind: string;
+  session_id: string;
+  subscription_id: string;
+  payload_base64: string;
+}
+
 export interface DaemonCompatibility {
   protocol: string;
   protocol_version: number;
