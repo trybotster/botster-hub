@@ -165,6 +165,7 @@ impl AttachStreamRegistry {
 
     pub(crate) fn cancel_stream(&mut self, session_id: &str, subscription_id: &str) {
         self.forget_connection_bound_route(session_id, subscription_id);
+        self.close_adapter(session_id, subscription_id);
         self.streams
             .remove(&(session_id.to_string(), subscription_id.to_string()));
         if let Some(subscriptions) = self.active_subscriptions.get_mut(session_id) {

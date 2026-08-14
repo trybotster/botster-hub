@@ -513,6 +513,7 @@ fn unix_adapter_stale_disconnect_does_not_cancel_replacement_owner() {
     drop(owner_a);
     drop(reader_a);
     let deadline = Instant::now() + Duration::from_secs(3);
+    let mut after = before.clone();
     while Instant::now() < deadline {
         let status = request_skipping_envelopes(
             &mut owner_b,
@@ -520,12 +521,28 @@ fn unix_adapter_stale_disconnect_does_not_cancel_replacement_owner() {
             &botster_hub_client::DaemonRequest::Status,
             &mut envelopes_b,
         );
-        let counters = status.status.expect("status body").lifecycle_counters;
-        if counters.cleanup_completed > before.cleanup_completed {
+        after = status.status.expect("status body").lifecycle_counters;
+        if after.cleanup_completed > before.cleanup_completed {
             break;
         }
         thread::sleep(Duration::from_millis(20));
     }
+    let stale_closes = after
+        .cleanup_by_reason
+        .get("bound_adapter_close")
+        .copied()
+        .unwrap_or(0)
+        .saturating_sub(
+            before
+                .cleanup_by_reason
+                .get("bound_adapter_close")
+                .copied()
+                .unwrap_or(0),
+        );
+    assert_eq!(
+        stale_closes, 0,
+        "A's disconnect must not close B's bound route: before={before:?} after={after:?}"
+    );
 
     request_skipping_envelopes(
         &mut owner_b,
@@ -541,17 +558,39 @@ fn unix_adapter_stale_disconnect_does_not_cancel_replacement_owner() {
     while Instant::now() < output_deadline
         && !unix_envelope_contains_live_bytes(&envelopes_b, marker)
     {
-        let _ = request_skipping_envelopes(
+        let drain = request_skipping_envelopes(
             &mut owner_b,
             &mut reader_b,
             &botster_hub_client::DaemonRequest::drain_subscription(session_id, subscription_id),
             &mut envelopes_b,
         );
+        assert!(
+            drain
+                .events
+                .iter()
+                .all(|event| !event_is_terminal_body(event)),
+            "B's scoped Drain must stay bound after A's disconnect; terminal bodies mean Hub cancelled B: {:?}",
+            drain.events
+        );
         thread::sleep(Duration::from_millis(50));
     }
     assert!(
         unix_envelope_contains_live_bytes(&envelopes_b, marker),
-        "B must keep receiving terminal frames after A disconnects: {envelopes_b:?}"
+        "B must keep receiving opaque adapter frames after A disconnects: {envelopes_b:?}"
+    );
+    let confirm = request_skipping_envelopes(
+        &mut owner_b,
+        &mut reader_b,
+        &botster_hub_client::DaemonRequest::drain_subscription(session_id, subscription_id),
+        &mut envelopes_b,
+    );
+    assert!(
+        confirm
+            .events
+            .iter()
+            .all(|event| !event_is_terminal_body(event)),
+        "B's scoped Drain must stay bound after live echo; terminal bodies mean Hub cancelled B: {:?}",
+        confirm.events
     );
 
     drop(owner_b);
