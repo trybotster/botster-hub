@@ -138,12 +138,92 @@ fn unix_adapter_bind_returns_only_attaching_then_opaque_envelopes() {
         session_worker_binary_path().display()
     );
 
+    let before = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Status,
+    )
+    .expect("status before bound disconnect")
+    .status
+    .expect("status body")
+    .lifecycle_counters;
     drop(stream);
     let leftover = botster_hub_client::request(
         &endpoint,
         botster_hub_client::DaemonRequest::ListSessions,
     )
     .expect("list after disconnect");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut counters = before.clone();
+    while Instant::now() < deadline {
+        let status = botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::Status,
+        )
+        .expect("status after bound disconnect");
+        counters = status.status.expect("status body").lifecycle_counters;
+        let bound_closes = counters
+            .cleanup_by_reason
+            .get("bound_adapter_close")
+            .copied()
+            .unwrap_or(0);
+        let before_closes = before
+            .cleanup_by_reason
+            .get("bound_adapter_close")
+            .copied()
+            .unwrap_or(0);
+        if bound_closes > before_closes || counters.cleanup_completed > before.cleanup_completed {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let bound_closes = counters
+        .cleanup_by_reason
+        .get("bound_adapter_close")
+        .copied()
+        .unwrap_or(0)
+        .saturating_sub(
+            before
+                .cleanup_by_reason
+                .get("bound_adapter_close")
+                .copied()
+                .unwrap_or(0),
+        );
+    let cleanup_detaches = counters
+        .cleanup_by_reason
+        .get("cleanup_hub_detach")
+        .copied()
+        .unwrap_or(0)
+        .saturating_sub(
+            before
+                .cleanup_by_reason
+                .get("cleanup_hub_detach")
+                .copied()
+                .unwrap_or(0),
+        );
+    let explicit = counters
+        .cleanup_by_reason
+        .get("explicit_detach")
+        .copied()
+        .unwrap_or(0)
+        .saturating_sub(
+            before
+                .cleanup_by_reason
+                .get("explicit_detach")
+                .copied()
+                .unwrap_or(0),
+        );
+    assert!(
+        bound_closes >= 1 || cleanup_detaches == 0,
+        "bound socket death must close the adapter or at least omit Hub Detach: closes={bound_closes} detaches={cleanup_detaches} before={before:?} after={counters:?}"
+    );
+    assert_eq!(
+        cleanup_detaches, 0,
+        "bound socket death must not issue Hub Detach: before={before:?} after={counters:?}"
+    );
+    assert_eq!(
+        explicit, 0,
+        "bound socket death must not use the authorized Detach path: before={before:?} after={counters:?}"
+    );
     assert!(
         leftover
             .sessions
@@ -176,6 +256,65 @@ fn unix_adapter_bind_returns_only_attaching_then_opaque_envelopes() {
         reattach.events
     );
     drop(replacement);
+    shutdown_short_lived_session(&endpoint, session_id);
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn unix_adapter_unbound_scoped_drain_delivers_terminal_output() {
+    let _guard = daemon_test_guard();
+    let hub = start_isolated_live_output_hub("uud");
+    let endpoint = hub.endpoint().clone();
+    let session_id = "uud-session";
+    let subscription_id = "uud-sub";
+    let mut connection =
+        botster_hub_client::DaemonConnection::connect(&endpoint).expect("default hello");
+    connection
+        .request(&botster_hub_client::DaemonRequest::Spawn {
+            session_id: session_id.to_string(),
+            command: "printf 'unbound-drain-ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done".to_string(),
+        })
+        .expect("spawn");
+    connection
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: session_id.to_string(),
+            subscription_id: subscription_id.to_string(),
+        })
+        .expect("unbound attach");
+    let attached = drain_until_subscription(&mut connection, session_id, Some(subscription_id), |event| {
+        matches!(
+            event,
+            botster_hub_client::DaemonEvent::AttachState { state, .. } if state == "attached"
+        )
+    });
+    assert!(
+        attached.iter().any(|event| matches!(
+            event,
+            botster_hub_client::DaemonEvent::Snapshot { .. }
+        )),
+        "unbound scoped Drain must still translate Snapshot: {attached:?}"
+    );
+    connection
+        .request(&botster_hub_client::DaemonRequest::SendInput {
+            session_id: session_id.to_string(),
+            data: "from-unbound\r".to_string(),
+        })
+        .expect("send");
+    let echoed = drain_until_subscription(&mut connection, session_id, Some(subscription_id), |event| {
+        matches!(
+            event,
+            botster_hub_client::DaemonEvent::TerminalOutput { payload, .. }
+                if live_output_contains(payload, "echo:from-unbound")
+        )
+    });
+    assert!(
+        echoed.iter().any(|event| matches!(
+            event,
+            botster_hub_client::DaemonEvent::TerminalOutput { payload, .. }
+                if live_output_contains(payload, "echo:from-unbound")
+        )),
+        "unbound scoped Drain must keep translating later TerminalOutput: {echoed:?}"
+    );
     shutdown_short_lived_session(&endpoint, session_id);
     hub.shutdown().expect("shutdown isolated hub");
 }
@@ -228,6 +367,23 @@ fn unix_adapter_explicit_detach_is_separate_from_connection_death() {
         &mut envelopes,
     );
     assert_eq!(detach.kind, botster_hub_client::DaemonResponseKind::Events);
+    let status = request_skipping_envelopes(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::Status,
+        &mut envelopes,
+    );
+    let counters = status.status.expect("status body").lifecycle_counters;
+    assert_eq!(
+        counters.cleanup_by_reason.get("explicit_detach").copied(),
+        Some(1),
+        "explicit Detach must use the authorized path: {counters:?}"
+    );
+    assert_eq!(
+        counters.cleanup_by_reason.get("bound_adapter_close").copied(),
+        None,
+        "explicit Detach must not use bound socket-death cleanup: {counters:?}"
+    );
 
     let second = request_skipping_envelopes(
         &mut stream,

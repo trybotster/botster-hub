@@ -75,6 +75,7 @@ pub(crate) struct AttachStreamRegistry {
     streams: BTreeMap<(String, String), AttachStream>,
     pub(crate) active_subscriptions: BTreeMap<String, BTreeSet<String>>,
     pub(crate) attach_owner_grant_ids: BTreeMap<(String, String), String>,
+    connection_bound_routes: BTreeMap<String, BTreeSet<(String, String)>>,
 }
 
 impl AttachStreamRegistry {
@@ -268,14 +269,31 @@ impl AttachStreamRegistry {
         generation: TerminalSubscriptionGeneration,
         adapter: UnixTerminalAdapterHandle,
     ) {
-        if let Some(stream) = self
+        let key = (session_id.to_string(), subscription_id.to_string());
+        let client_id = self
             .streams
-            .get_mut(&(session_id.to_string(), subscription_id.to_string()))
-        {
+            .get(&key)
+            .map(|stream| stream.owner.client_id.clone());
+        if let Some(stream) = self.streams.get_mut(&key) {
             stream.generation = Some(generation);
             stream.adapter_bound = true;
             stream.adapter = Some(adapter);
         }
+        if let Some(client_id) = client_id {
+            self.connection_bound_routes
+                .entry(client_id)
+                .or_default()
+                .insert(key);
+        }
+    }
+
+    pub(crate) fn take_connection_bound_routes(
+        &mut self,
+        client_id: &str,
+    ) -> BTreeSet<(String, String)> {
+        self.connection_bound_routes
+            .remove(client_id)
+            .unwrap_or_default()
     }
 }
 
@@ -580,6 +598,11 @@ mod tests {
         assert!(
             !registry.is_adapter_bound("s", "sub"),
             "close must not be used as the bound-route classifier"
+        );
+        let recorded = registry.take_connection_bound_routes("client-a");
+        assert!(
+            recorded.contains(&("s".to_string(), "sub".to_string())),
+            "connection-scoped bound routes must survive adapter close"
         );
     }
 

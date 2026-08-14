@@ -269,6 +269,7 @@ fn stream_attach_connected(
     subscription_id: &str,
     output: &mut impl Write,
 ) -> DaemonTransportResult<()> {
+    let mut reader = BufReader::new(stream.try_clone().map_err(normalize_socket_io_error)?);
     write_frame(
         stream,
         &DaemonRequest::Attach {
@@ -276,7 +277,7 @@ fn stream_attach_connected(
             subscription_id: subscription_id.to_string(),
         },
     )?;
-    let response: DaemonResponse = read_frame(stream)?;
+    let response = read_daemon_response_from_reader(&mut reader)?;
     write_terminal_events(&response.events, output)?;
     if stream_attach_should_complete(&response.events, false) {
         return Ok(());
@@ -294,7 +295,7 @@ fn stream_attach_connected(
                 subscription_id: Some(subscription_id.to_string()),
             },
         )?;
-        let response: DaemonResponse = read_frame(stream)?;
+        let response = read_daemon_response_from_reader(&mut reader)?;
         if response.events.is_empty() {
             idle_drains += 1;
         } else {
@@ -302,14 +303,14 @@ fn stream_attach_connected(
         }
         write_terminal_events(&response.events, output)?;
         if !restored_screen && events_ready_for_read_screen(&response.events) {
-            restored_screen = write_read_screen(stream, session_id, output)?;
+            restored_screen = write_read_screen(&mut reader, stream, session_id, output)?;
         }
         if stream_attach_should_complete(&response.events, lifecycle_exited) {
             return Ok(());
         }
         if idle_drains >= 20 {
             write_frame(stream, &DaemonRequest::ListSessions)?;
-            let response: DaemonResponse = read_frame(stream)?;
+            let response = read_daemon_response_from_reader(&mut reader)?;
             if response
                 .sessions
                 .iter()
@@ -530,6 +531,7 @@ fn stream_attach_should_complete(events: &[DaemonEvent], lifecycle_exited: bool)
 }
 
 fn write_read_screen(
+    reader: &mut BufReader<UnixStream>,
     stream: &mut UnixStream,
     session_id: &str,
     output: &mut impl Write,
@@ -540,7 +542,7 @@ fn write_read_screen(
             session_id: session_id.to_string(),
         },
     )?;
-    let response: DaemonResponse = read_frame(stream)?;
+    let response = read_daemon_response_from_reader(reader)?;
     let Some(screen) = response.read_screen else {
         return Ok(false);
     };

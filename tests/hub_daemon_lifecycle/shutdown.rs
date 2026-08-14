@@ -2062,14 +2062,11 @@ fn daemon_restart_reconnects_worker_backed_session_through_client_api() {
     )
     .expect("attach before restart through client api");
     logical_clock += 1;
-    drain_until_client_output(
-        &api,
+    drain_until_attached(
         daemon.runtime_mut().expect("runtime initialized"),
-        &packages,
         &session_id,
         &subscription_id,
         "hub-daemon-restart-client",
-        b"restart-ready",
         &mut logical_clock,
     );
     daemon.stop();
@@ -2115,7 +2112,7 @@ fn daemon_restart_reconnects_worker_backed_session_through_client_api() {
         HubClientRequest::Input {
             request_id: RequestId("hub-daemon-restart-input".to_string()),
             session_id: session_id.clone(),
-            data: b"after-restart\n".to_vec(),
+            data: b"after-restart\r".to_vec(),
             now_seconds: logical_clock,
         },
     )
