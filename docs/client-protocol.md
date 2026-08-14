@@ -41,7 +41,7 @@ Node-based first-party clients can consume the same checked artifact without a
 sibling hub checkout through the public package:
 
 ```sh
-npm install --save-dev @trybotster/ui-contract@0.3.1 @trybotster/hub-test-support@0.1.20
+npm install --save-dev @trybotster/ui-contract@0.3.2 @trybotster/hub-test-support@0.1.20
 ```
 
 ```js
@@ -1411,7 +1411,7 @@ Node client tests should use the declared npm dependency instead of a relative
 hub checkout:
 
 ```sh
-npm install --save-dev @trybotster/ui-contract@0.3.1 @trybotster/hub-test-support@0.1.20
+npm install --save-dev @trybotster/ui-contract@0.3.2 @trybotster/hub-test-support@0.1.20
 ```
 
 ```js
