@@ -1325,6 +1325,77 @@ fn core_write_budget_hard_stop_emits_core_adapter_closed() {
 }
 
 #[test]
+fn subscribe_entities_on_bound_unix_mux_returns_operator_error_and_keeps_route() {
+    let _guard = daemon_test_guard();
+    let hub = start_isolated_live_output_hub("sem");
+    let (mut stream, mut reader) = unix_adapter_connection(hub.endpoint());
+    let mut envelopes = Vec::new();
+    let mut events = Vec::new();
+    spawn_and_bind(
+        &mut stream,
+        &mut reader,
+        "sem-live",
+        "sub-live",
+        "sleep 30",
+        &mut envelopes,
+        &mut events,
+    );
+
+    let subscribe = request_collecting_mux(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::SubscribeEntities {
+            entity_type: "session".to_string(),
+            subscription_id: "sem-entities".to_string(),
+        },
+        &mut envelopes,
+        &mut events,
+    );
+    assert_eq!(
+        subscribe.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError,
+        "SubscribeEntities on a bound Unix mux must fail closed: {subscribe:?}"
+    );
+    assert_eq!(
+        subscribe.error.as_ref().map(|error| error.code.as_str()),
+        Some("unix_mux_owns_connection")
+    );
+
+    let status = request_collecting_mux(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::Status,
+        &mut envelopes,
+        &mut events,
+    );
+    assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
+    let drain = request_collecting_mux(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::drain_subscription("sem-live", "sub-live"),
+        &mut envelopes,
+        &mut events,
+    );
+    assert_ne!(
+        drain.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError,
+        "bound Drain must stay owned after rejected SubscribeEntities: {:?}",
+        drain.error
+    );
+    assert!(
+        drain
+            .events
+            .iter()
+            .all(|event| !event_is_terminal_body(event)),
+        "content-blind Drain must stay bound: {:?}",
+        drain.events
+    );
+
+    shutdown_short_lived_session(hub.endpoint(), "sem-live");
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
 fn failed_remove_session_does_not_suppress_later_core_close() {
     let _guard = daemon_test_guard();
     let hub = start_isolated_live_output_hub("frm");
