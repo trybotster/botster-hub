@@ -3663,10 +3663,7 @@ mod tests {
             .expect_err("queued OnClose must still fail after the ready send");
         assert_eq!(failure.cause, LocalWebrtcTerminalCause::ChannelClosed);
         assert_eq!(failure.next_chunk_index, 1);
-        assert_eq!(
-            data_channel.sent.lock().unwrap().as_slice(),
-            &["must-send"]
-        );
+        assert_eq!(data_channel.sent.lock().unwrap().as_slice(), &["must-send"]);
     }
 
     #[test]
