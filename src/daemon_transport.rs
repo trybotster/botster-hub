@@ -88,6 +88,7 @@ use crate::maintenance::{
 use crate::packages::{PackageResolvedEntrypointLaunch, resolve_entrypoint_launch_contract};
 use crate::source_update::{current_update_execution, mark_update_failed, start_update_handoff};
 use crate::unix_terminal_adapter::{UnixConnectionMux, UnixTerminalAdapterHandle};
+use crate::webrtc_terminal_adapter::WebRtcConnectionMux;
 use crate::{
     AvailablePackage, AvailablePackageState, FileHubStateStore, HubClientApi,
     HubClientCaptureSnapshot, HubClientEvent, HubClientModeFlags, HubClientPackage,
@@ -110,11 +111,12 @@ use crate::{Worktree, WorktreeCreate, WorktreeError};
 
 #[path = "daemon_attach_stream.rs"]
 mod daemon_attach_stream;
+pub(crate) use daemon_attach_stream::negotiated_unix_capability_set;
 use daemon_attach_stream::{
-    AttachStreamOwner, AttachStreamRegistry, UnixBindRequest, attach_failed_events,
-    bind_unix_adapter_after_attaching, fail_closed_pre_bind_attach, hello_requires_unix_adapter,
+    AttachStreamOwner, AttachStreamRegistry, UnixBindRequest, WebrtcBindRequest,
+    attach_failed_events, bind_unix_adapter_after_attaching, bind_webrtc_adapter_after_attaching,
+    fail_closed_pre_bind_attach, hello_requires_unix_adapter, hello_requires_webrtc_adapter,
     initial_attaching_only, is_terminal_body_event, live_generation_for_route,
-    negotiated_unix_capability_set,
 };
 
 #[path = "daemon_package_control.rs"]
@@ -1869,6 +1871,18 @@ pub(crate) fn handle_control_message(
                 .insert(client_id, admission);
             false
         }
+        ControlMessage::RegisterWebrtcAdmission {
+            grant_id,
+            admission,
+        } => {
+            if daemon.local_webrtc().has_live_peer(&grant_id) {
+                state
+                    .pending_runtime
+                    .webrtc_admissions
+                    .insert(grant_id, admission);
+            }
+            false
+        }
         ControlMessage::SubscribeEntities {
             entity_type,
             subscription_id,
@@ -2329,6 +2343,36 @@ pub(crate) fn handle_control_message(
                     None,
                 );
             }
+            let mut bound_detach = Vec::new();
+            let mut unbound_detach = Vec::new();
+            for subscription in detach_list {
+                if state
+                    .pending_runtime
+                    .is_adapter_bound(&subscription.session_id, &subscription.subscription_id)
+                {
+                    bound_detach.push(subscription);
+                } else {
+                    unbound_detach.push(subscription);
+                }
+            }
+            if !bound_detach.is_empty() {
+                *state
+                    .lifecycle_counters
+                    .cleanup_by_reason
+                    .entry("bound_adapter_close".to_string())
+                    .or_insert(0) += bound_detach.len() as u64;
+            }
+            for grant_id in &removed_grants {
+                state.pending_runtime.close_adapters_for_grant(grant_id);
+            }
+            for subscription in &bound_detach {
+                state
+                    .pending_runtime
+                    .cancel_stream(&subscription.session_id, &subscription.subscription_id);
+            }
+            for grant_id in &removed_grants {
+                state.pending_runtime.webrtc_admissions.remove(grant_id);
+            }
             // Residual same-grant index rows can survive a no-op Core Detach. Drop them
             // after occupancy release. Preserve replacement owners.
             state
@@ -2347,7 +2391,7 @@ pub(crate) fn handle_control_message(
                     client_id: None,
                     grant_id: None,
                 },
-                detach_list,
+                unbound_detach,
             );
             false
         }
@@ -2895,6 +2939,15 @@ fn handle_runtime_control_request(
                     diagnostic.clone(),
                 ));
             }
+            if let Some(grant_id) = observability.grant_id
+                && let Some(WebrtcTerminalAdmission::Rejected { code, diagnostic }) =
+                    pending_runtime.webrtc_admissions.get(grant_id)
+            {
+                return Ok(terminal_compatibility_attach_error(
+                    code,
+                    diagnostic.clone(),
+                ));
+            }
             let owner = AttachStreamOwner {
                 client_id: client_id.clone(),
                 grant_id: observability.grant_id.map(str::to_string),
@@ -2915,16 +2968,27 @@ fn handle_runtime_control_request(
                     )));
                 }
             };
-            let admission = pending_runtime.unix_admissions.get(&client_id).cloned();
+            let unix_admission = pending_runtime.unix_admissions.get(&client_id).cloned();
+            let webrtc_admission = observability
+                .grant_id
+                .and_then(|grant_id| pending_runtime.webrtc_admissions.get(grant_id).cloned());
+            let bind_webrtc = observability.grant_id.is_some()
+                && matches!(
+                    webrtc_admission.as_ref(),
+                    Some(WebrtcTerminalAdmission::Admitted {
+                        required_features,
+                        ..
+                    }) if hello_requires_webrtc_adapter(required_features)
+                );
             let bind_unix = observability.grant_id.is_none()
                 && matches!(
-                    admission.as_ref(),
+                    unix_admission.as_ref(),
                     Some(UnixTerminalAdmission::Admitted {
                         required_features,
                         ..
                     }) if hello_requires_unix_adapter(required_features)
                 );
-            if !bind_unix {
+            if !bind_webrtc && !bind_unix {
                 return Ok(daemon_events(events));
             }
             if !initial_attaching_only(&events) {
@@ -2938,9 +3002,35 @@ fn handle_runtime_control_request(
                     None,
                 )));
             }
+            if bind_webrtc {
+                let Some(WebrtcTerminalAdmission::Admitted {
+                    required_features,
+                    mux,
+                    terminal_requirement,
+                }) = webrtc_admission.as_ref()
+                else {
+                    return Ok(daemon_events(events));
+                };
+                return match bind_webrtc_adapter_after_attaching(
+                    pending_runtime,
+                    runtime,
+                    WebrtcBindRequest {
+                        client_id: &client_id,
+                        session_id: &session_id,
+                        subscription_id: &subscription_id,
+                        required_features,
+                        terminal_requirement: terminal_requirement.as_ref(),
+                        now_seconds: now,
+                        mux: Some(mux),
+                    },
+                ) {
+                    Ok(_) => Ok(daemon_events(events)),
+                    Err(failed) => Ok(daemon_events(failed)),
+                };
+            }
             let Some(UnixTerminalAdmission::Admitted {
                 capabilities, mux, ..
-            }) = admission.as_ref()
+            }) = unix_admission.as_ref()
             else {
                 return Ok(daemon_events(events));
             };
@@ -4439,6 +4529,10 @@ pub(crate) enum ControlMessage {
         client_id: String,
         admission: UnixTerminalAdmission,
     },
+    RegisterWebrtcAdmission {
+        grant_id: String,
+        admission: WebrtcTerminalAdmission,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -4454,10 +4548,24 @@ pub(crate) enum UnixTerminalAdmission {
     },
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum WebrtcTerminalAdmission {
+    Admitted {
+        required_features: Vec<String>,
+        mux: WebRtcConnectionMux,
+        terminal_requirement: Option<botster_terminal_protocol::TerminalCompatibilityRequirement>,
+    },
+    Rejected {
+        code: &'static str,
+        diagnostic: DaemonDiagnostic,
+    },
+}
+
 #[derive(Default)]
 pub(crate) struct PendingRuntimeState {
     pub(crate) streams: AttachStreamRegistry,
     unix_admissions: BTreeMap<String, UnixTerminalAdmission>,
+    webrtc_admissions: BTreeMap<String, WebrtcTerminalAdmission>,
 }
 
 impl fmt::Debug for PendingRuntimeState {
@@ -7290,7 +7398,8 @@ fn receive_test_control_request(
 ) -> ControlMessage {
     loop {
         match receive_test_control_message(receiver) {
-            ControlMessage::RegisterUnixAdmission { .. } => {}
+            ControlMessage::RegisterUnixAdmission { .. }
+            | ControlMessage::RegisterWebrtcAdmission { .. } => {}
             message => return message,
         }
     }

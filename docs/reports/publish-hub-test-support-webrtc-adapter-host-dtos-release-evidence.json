@@ -1,0 +1,28 @@
+{
+  "coordinate": "@trybotster/hub-test-support@0.1.35",
+  "target_repository": "trybotster/botster-hub",
+  "target_id": "tgt_7e208a0c76a44980a83b63af976b1f22",
+  "published_tree_sha": "e1999a08c328577ccbccf939719f69b4d5495456",
+  "plan_base_sha": "24517f4879a6effdd87eacddbb4b40aca13104c1",
+  "dist_integrity": "sha512-KIUC4JKaeZHGtUz6wq0P1vS1ByepFShIETVdiSDvvVeYpBbLihCCb41I4ptRmDLMu3nmRqWIMQYCLcA59SXKOQ==",
+  "dist_tarball": "https://registry.npmjs.org/@trybotster/hub-test-support/-/hub-test-support-0.1.35.tgz",
+  "protocol_version": 7,
+  "conformance_fixture_revision": 40,
+  "ui_contract": "@trybotster/ui-contract@0.3.2",
+  "ui_contract_integrity": "sha512-lWzx8j2Z+OQhRAhURWpqUSLQyAMFycOOV6MgFAfMHRgU/27bkyc0v95komBGdJjv5IWjMRWJHlgmX7GlXGWR0Q==",
+  "occupancy": "0.1.35 unused at publish time",
+  "teardown_class_applies": false,
+  "external_smoke": {
+    "install": "npm install @trybotster/hub-test-support@0.1.35 --prefer-online",
+    "verifyPackageAssets": true,
+    "tokens": [
+      "DaemonLocalWebrtcDeliveryKind",
+      "daemon_terminal_frame",
+      "DaemonHello.terminal_compatibility?",
+      "DaemonHelloAck.terminal_compatibility?",
+      "webrtc_terminal_adapter",
+      "terminal_subscription_closed"
+    ],
+    "readme_prior_coordinate": "0.1.33 protocol 7 / revision 38"
+  }
+}

@@ -1592,9 +1592,10 @@ socket Drain receives READY before later PAGE/FINISH frames.
 advertises it. `DaemonCompatibilityRequirement::current()` does not require
 it. Clients that want the adapter plane use
 `DaemonCompatibilityRequirement::for_unix_terminal_adapter()`.
-`PROTOCOL_VERSION` remains 7. Advertising this feature and
-`terminal_subscription_closed` advances `CONFORMANCE_FIXTURE_REVISION` to 40.
-The default client requirement stays at revision 36.
+`PROTOCOL_VERSION` remains 7. Advertising this feature,
+`terminal_subscription_closed`, and `webrtc_terminal_adapter` advances
+`CONFORMANCE_FIXTURE_REVISION` to 40. The default client requirement stays
+at revision 36.
 
 `DaemonHello` may send a Core `TerminalCompatibilityRequirement`. Absence is
 not a mismatch. `DaemonHelloAck` always advertises independent
@@ -1646,3 +1647,50 @@ Current clients that omit the feature stay on Drain translation until the
 cold-cut ticket. WebRTC attaches (`grant_id` present) do not receive a Unix
 adapter. Use `parse_unix_mux_value` to separate control responses from
 opaque adapter envelopes.
+
+## WebRTC terminal adapter plane
+
+`webrtc_terminal_adapter` is an optional Hub daemon feature. The daemon
+advertises it. `DaemonCompatibilityRequirement::current()` does not require
+it. Clients that want the adapter plane send an encrypted DataChannel
+`DaemonHello` whose `required_features` include
+`webrtc_terminal_adapter`, then call
+`DaemonCompatibilityRequirement::for_webrtc_terminal_adapter()`.
+`PROTOCOL_VERSION` remains 7. Advertising this feature advances
+`CONFORMANCE_FIXTURE_REVISION` to 40.
+
+WebRTC protocol admission is DataChannel Hello after pairing, grant,
+origin, and AES-GCM crypto. Hub replies with encrypted `DaemonHelloAck`
+plaintext framed as a `daemon_response` delivery. Hello never creates a
+route. Attach binds only when that Hello required the feature and
+`grant_id` is present.
+
+When DataChannel Hello requires `webrtc_terminal_adapter` and Attach
+succeeds:
+
+1. The Attach response may carry only the initial `AttachState attaching`
+   event. That one-frame exception is transitional.
+   `ticket_1786661010_198387` removes it.
+2. Any other pre-bind terminal event is fail-closed: Hub cancels the
+   route, closes any adapter candidate, detaches the live generation, and
+   returns `attach_failed`.
+3. Hub intersects `TerminalCompatibility` advertised tokens with Hello
+   admission, includes `snapshot_delivery=ready_then_history` only when
+   Hello required that feature, and binds the resulting
+   `TerminalCapabilitySet` into Core.
+4. Later terminal frames leave only as encrypted
+   `DaemonLocalWebrtcDeliveryKind::DaemonTerminalFrame` chunks. One frame
+   occupies the adapter slot until every chunk of that delivery is sent.
+   Hub does not inspect READY, PAGE, FINISH, later AttachState, or
+   GHOSTSNP bodies.
+5. Bound-route Drain still advances control-plane lifecycle. It must not
+   return AttachState, Snapshot, TerminalOutput, or ProcessExited.
+6. Bound-route DataChannel close, peer failure, and grant `remove_peer`
+   close the adapter only. Hub does not send Detach. `local_close` waits
+   at most `LOCAL_WEBRTC_PEER_CLOSE_BOUND` and then continues cleanup.
+   Explicit client Detach remains a separate authorized request.
+   Neither path shuts down the host session.
+
+Current WebRTC clients that omit DataChannel Hello stay on Drain
+translation until the Web decoder ticket. They must not receive
+`daemon_terminal_frame`.

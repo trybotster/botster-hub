@@ -74,6 +74,7 @@ pub mod session_types;
 pub mod source_update;
 pub mod spawn_targets;
 mod unix_terminal_adapter;
+mod webrtc_terminal_adapter;
 pub mod worktrees;
 
 use botster_core::CapabilitySurface;
