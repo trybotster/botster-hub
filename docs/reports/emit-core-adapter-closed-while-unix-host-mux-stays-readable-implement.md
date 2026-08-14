@@ -145,7 +145,7 @@ IsolatedHub oracles observed on the live path:
 - Sibling `echo:cwb-sibling-live` envelope after the close
 - Content-blind sibling Drain stayed owned (not `OperatorError`, no terminal bodies)
 - Locked Core SHA `f4f6bf5babe92dfb9241a760c414187f711c2c42`
-- Hub binary `CARGO_BIN_EXE_botster-hub` from this worktree; base SHA `aafd6c2`
+- Hub binary `CARGO_BIN_EXE_botster-hub` from this worktree; base SHA `aafd6c2`; implement commit `016536aa2e1d43823295fb9e8dc9106f28de7b2a`
 
 Downstream: no public hub-client API change. TUI scratch `cargo check` was not required.
 
