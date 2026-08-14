@@ -1,5 +1,11 @@
 # Plan: publish hub-test-support with WebRTC adapter host DTOs
 
+**Revision 2** — addresses Plan Review `review_1786725170_922494` (`changes_required`).
+
+Product finding `finding_1786725170_664633`: build the complete intended publish tree, including the README prior-coordinate correction, and pack that tree before any occupancy decision. Compare registry integrity only to that corrected tarball. If occupied `0.1.35` differs, allocate the next unused patch. The installed package must contain the corrected prior-coordinate statement.
+
+Process finding `finding_1786725170_644718`: this revision resubmits `plan_uri`, `artifact_id`, `checklist_id`, `target_id`, and `target_repository` on both the gate and the step-advance evidence. No new vault checklist.
+
 ## Target repository and target_id
 
 | Field | Value |
@@ -64,35 +70,41 @@ This ticket is not a consumer of Hub session-type eligibility work. Do not injec
 
 ## Context loaded
 
-- Pipeline context: ticket, run, empty artifacts/reviews/findings, no blocking dependencies, no existing vault checklist.
+- Return visit after Plan Review `review_1786725170_922494` (`changes_required`).
+- Product finding: occupied `0.1.35` must not be accepted against the current stale-README tree. Process finding: resubmit required identifiers on gate and advance evidence. Do not create another checklist.
 - Project: Botster Terminal Transport North Star. Direct-merge. Do not create a pull request.
 - Authoritative spawn target `tgt_7e208a0c76a44980a83b63af976b1f22` is `trybotster/botster-hub`.
-- Assigned worktree is at `origin/main` `24517f4`. Tracked `.gitignore` is present and non-empty. The worktree path has no colon.
+- Assigned worktree started at `origin/main` `24517f4`. Tracked `.gitignore` is present and non-empty. The worktree path has no colon.
 - Hub source `packages/hub-test-support` is already `@trybotster/hub-test-support@0.1.35`, protocol 7, conformance fixture revision 40, ui-contract `0.3.2`.
-- Public npm latest is `0.1.33` (protocol 7, revision 38, ui-contract `0.3.2`). Versions `0.1.34` and `0.1.35` are unpublished.
+- Public npm latest at Plan time is `0.1.33` (protocol 7, revision 38, ui-contract `0.3.2`). Versions `0.1.34` and `0.1.35` were unpublished then. Re-check at Implement time.
 - Published `0.1.33` `daemon-protocol.ts` has `DaemonLocalWebrtcDeliveryKind` but lacks `daemon_terminal_frame`, `terminal_compatibility`, `webrtc_terminal_adapter`, and `terminal_subscription_closed`.
 - Source `0.1.35` `daemon-protocol.ts` has `DaemonLocalWebrtcDeliveryKind` including `daemon_terminal_frame`, optional `DaemonHello.terminal_compatibility`, optional `DaemonHelloAck.terminal_compatibility`, and `terminal_subscription_closed`.
 - Source `first-party-client-support-matrix.json` lists optional `webrtc_terminal_adapter` and `terminal_subscription_closed` under `supported_features`, not `required_features`.
-- `npm whoami` returned HTTP 401 in this Plan environment.
+- Shipped README still says `0.1.32` is the prior published coordinate at the same protocol and revision. That sentence is part of the published contract.
+- `npm whoami` returned HTTP 401 in the first Plan visit.
 - Downstream Web ticket `ticket_1786661008_897067` already depends on this ticket (`dependency_1786724311_472762`).
-- Sibling tickets stay out of this run: Core `ticket_1786723347_177328` (publish `@trybotster/terminal-protocol`) and Hub `ticket_1786724303_284888` (emit `TerminalSubscriptionClosed` on WebRTC).
+- Sibling tickets stay out of this run: Core `ticket_1786723347_177328` and Hub `ticket_1786724303_284888`.
+- Vault checklist `checklist_1786724715_318556` already exists for this ticket. Skip a new checklist.
 
 ## Scope
 
-Publish a new unused `@trybotster/hub-test-support` coordinate from the already-synced Hub main assets.
+Publish a new unused `@trybotster/hub-test-support` coordinate from the already-synced Hub main assets plus the required README correction.
 
-Preferred coordinate: `0.1.35`.
+Preferred coordinate: `0.1.35`, only when that version is unused or already equals the corrected tarball.
 
-1. Re-check registry occupancy at Implement time. Prefer `0.1.35` while it remains unused.
-2. If `0.1.35` is taken with matching `dist.integrity`, treat publication as done. Still run the external content smoke and write the report.
-3. If `0.1.35` is taken with different bytes, allocate the next unused patch (`0.1.36` or later). Bump `package.json`, regenerate `metadata.json`, update README pin sites and `test.mjs`, then publish that unused coordinate.
-4. Keep `protocol_version` 7 and `@trybotster/ui-contract@0.3.2`.
-5. Before first publish of unpublished `0.1.35`, correct the shipped README sentence that still calls `0.1.32` the prior published coordinate at the same protocol and revision. The prior published coordinate is `0.1.33` at revision 38. This tree is revision 40. Re-run package tests after that one-sentence fix. Do not bump the version for that README-only fix while `0.1.35` remains unpublished.
-6. Publish with `script/publish-npm-packages`. Use `--dry-run` first. Do not skip an already-published coordinate on version-exists alone. Compare `dist.integrity` to the locally packed tarball.
-7. If `npm whoami` fails, ask a blocking human. Do not invent a file, git, or `/tmp` coordinate.
-8. After publish, prove a clean external install of the registry coordinate.
-9. Persist a report under `docs/reports/` with coordinate, integrity, Hub SHA, and smoke evidence.
-10. Merge directly into `main`. Do not create a pull request.
+1. Build the complete intended publish tree first. Correct the shipped README sentence that still calls `0.1.32` the prior published coordinate at the same protocol and revision. The prior published coordinate is `0.1.33` at protocol 7 / revision 38. This tree is revision 40.
+2. Re-run package tests on that corrected tree. Do not make the occupancy decision against the stale-README bytes.
+3. Pack the corrected tree. Record that local tarball integrity. Use `script/publish-npm-packages --dry-run` or an equivalent pack of the same tree.
+4. Then re-check registry occupancy.
+5. If `0.1.35` is unused, publish the corrected tarball as `0.1.35`.
+6. If `0.1.35` is occupied and `dist.integrity` equals the corrected tarball, treat publication as done. Still run the external content smoke, including the README prior-coordinate check.
+7. If `0.1.35` is occupied and `dist.integrity` differs from the corrected tarball, allocate the next unused patch (`0.1.36` or later). Bump `package.json`, regenerate `metadata.json`, update README pin sites and `test.mjs`, pack again, and publish that unused coordinate. A stale-README `0.1.35` is a mismatch. Do not accept it as done.
+8. Keep `protocol_version` 7 and `@trybotster/ui-contract@0.3.2`.
+9. Publish with `script/publish-npm-packages`. Do not skip an already-published coordinate on version-exists alone.
+10. If `npm whoami` fails, ask a blocking human. Do not invent a file, git, or `/tmp` coordinate.
+11. After publish, prove a clean external install of the registry coordinate.
+12. Persist a report under `docs/reports/` with coordinate, integrity, Hub SHA, and smoke evidence.
+13. Merge directly into `main`. Do not create a pull request.
 
 ## Non-scope
 
@@ -125,7 +137,7 @@ No new cross-repo dependency is required on this ticket. The Web consumer alread
 - Assumption: optional `terminal_compatibility` fields must stay optional in the published TypeScript.
 - Assumption: public npm remains the approved distribution path.
 - Unknown: npm authentication in the Implement environment. Plan observed HTTP 401. Implement must ask a human if publish is unauthorized.
-- Unknown: whether `0.1.35` remains unpublished at Implement time. Re-read the registry before publish.
+- Unknown: whether `0.1.35` remains unpublished at Implement time. Re-read the registry only after packing the corrected tree.
 
 ## Affected surfaces/files
 
@@ -138,7 +150,7 @@ Likely files:
 - `docs/reports/publish-hub-test-support-webrtc-adapter-host-dtos-implement-report.md` — Implement report
 - optional evidence JSON beside that report
 
-Touch these files only if `0.1.35` is taken with different bytes:
+Touch these files only if occupied `0.1.35` differs from the corrected tarball:
 
 - `packages/hub-test-support/package.json`
 - `packages/hub-test-support/metadata.json`
@@ -149,9 +161,9 @@ Do not touch Rust adapter, daemon, or emitter files unless `node packages/hub-te
 ## Risks
 
 - Publishing without an external content smoke can ship a self-consistent stale tarball. Mitigation: clean-dir install and token grep after registry visibility.
-- Skipping because the version exists can hide a bad publish. Mitigation: integrity compare, then extra unused version on mismatch.
+- Skipping because the version exists can hide a bad publish. Mitigation: integrity compare against the corrected tarball only, then extra unused version on mismatch.
 - npm auth can block publish. Mitigation: blocking human question. No unapproved fallback coordinate.
-- README can ship a false prior-coordinate claim. Mitigation: one-sentence fix before first `0.1.35` publish.
+- Another publisher can occupy `0.1.35` with stale-README bytes between Plan and Implement. Mitigation: always pack the README-corrected tree first. Treat any integrity mismatch, including a stale-README `0.1.35`, as a new unused patch.
 - A later main commit can change package bytes before publish. Mitigation: publish from a recorded SHA and pack that tree.
 
 ## Acceptance checks/tests
@@ -162,10 +174,11 @@ Production path: botster-web and other external clients install the public npm c
 
 1. `node packages/hub-test-support/scripts/sync-assets.mjs --check` passes on the publish tree.
 2. `node packages/hub-test-support/test.mjs` passes.
-3. `script/publish-npm-packages --dry-run` packs `@trybotster/hub-test-support` at the chosen unused version and `@trybotster/ui-contract@0.3.2` with matching integrity if that ui-contract version is already published.
-4. `npm view @trybotster/hub-test-support version` reports a version newer than `0.1.33`.
-5. `npm view @trybotster/hub-test-support@<published>` reports `dist.integrity` equal to the locally packed tarball.
-6. A clean temporary directory can `npm install @trybotster/hub-test-support@<published> --prefer-online` and then:
+3. Occupancy is decided only after the README-corrected tree is packed. Registry `0.1.35` is accepted only when its `dist.integrity` equals that corrected tarball.
+4. `script/publish-npm-packages --dry-run` packs `@trybotster/hub-test-support` at the chosen unused version, or confirms occupied `0.1.35` matches the corrected tarball, and packs `@trybotster/ui-contract@0.3.2` with matching integrity if that ui-contract version is already published.
+5. `npm view @trybotster/hub-test-support version` reports a version newer than `0.1.33`.
+6. `npm view @trybotster/hub-test-support@<published>` reports `dist.integrity` equal to the locally packed corrected tarball.
+7. A clean temporary directory can `npm install @trybotster/hub-test-support@<published> --prefer-online` and then:
    - `metadata.package_version` equals the published version
    - `metadata.protocol_version === 7`
    - `metadata.conformance_fixture_revision === 40`
@@ -173,8 +186,9 @@ Production path: botster-web and other external clients install the public npm c
    - `verifyPackageAssets()` succeeds
    - `readDaemonProtocolTypescript()` contains `DaemonLocalWebrtcDeliveryKind`, `daemon_terminal_frame`, `DaemonHello` `terminal_compatibility`, and `DaemonHelloAck` `terminal_compatibility`
    - installed package files contain `webrtc_terminal_adapter` and `terminal_subscription_closed`
-7. Do not require a full Hub `./test.sh` unless Implement changes Rust or daemon source.
-8. Merge the plan, report, and any README or version files directly into `main`. Do not open a pull request.
+   - the installed README names `0.1.33` as the prior published coordinate at protocol 7 / revision 38 and does not claim `0.1.32` is the prior coordinate at the same protocol and revision
+8. Do not require a full Hub `./test.sh` unless Implement changes Rust or daemon source.
+9. Merge the plan, report, and any README or version files directly into `main`. Do not open a pull request.
 
 ## Vault gaps worth capturing
 
@@ -184,12 +198,13 @@ Production path: botster-web and other external clients install the public npm c
 ## Implement sequence
 
 1. Confirm the assigned worktree is based on current `origin/main`. Restore tracked `.gitignore` from HEAD if it is empty. Set a colon-free `CARGO_TARGET_DIR` only if the path contains `:`.
-2. Re-run `npm view @trybotster/hub-test-support versions --json --prefer-online`.
-3. Confirm source tokens and `sync-assets.mjs --check`.
-4. Fix the README prior-coordinate sentence if still stale.
-5. Run package tests and `script/publish-npm-packages --dry-run`.
-6. Check `npm whoami`. Ask a human if unauthorized.
-7. Publish with `script/publish-npm-packages`.
-8. Run the clean-dir registry smoke.
-9. Write the Implement report with coordinate, integrity, SHA, and smoke commands.
-10. Merge to `main` without a pull request.
+2. Confirm source tokens and `sync-assets.mjs --check`.
+3. Correct the README prior-coordinate sentence on the intended publish tree.
+4. Run package tests on that corrected tree.
+5. Pack the corrected tree and record its integrity. Then run `npm view @trybotster/hub-test-support versions --json --prefer-online`.
+6. Decide occupancy only against the corrected tarball. Publish `0.1.35` if unused. Accept occupied `0.1.35` only on exact integrity match. Otherwise allocate the next unused patch and pack again.
+7. Check `npm whoami`. Ask a human if unauthorized.
+8. Publish with `script/publish-npm-packages`.
+9. Run the clean-dir registry smoke, including the installed README prior-coordinate check.
+10. Write the Implement report with coordinate, integrity, SHA, and smoke commands.
+11. Merge to `main` without a pull request.
