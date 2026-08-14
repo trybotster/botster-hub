@@ -228,3 +228,18 @@ Results:
 - Hung-send, one-channel claim, wake-permit, and in-process bound peer-loss unit tests passed.
 
 Unverified in this pass: full `./test.sh --locked` workspace rerun after the rebase. The first implement pass already ran that wrapper on the pre-rebase commit. This pass reran the review-finding oracles and IsolatedHub live peer-loss.
+
+## Review-fix pass 2
+
+`review_1786719188_807880` found that `send_text_or_peer_terminal` returned `Ok` after a nonterminal DataChannel event and cancelled `local_send_text`. `send_response_frames` then recorded the chunk as sent.
+
+Fix: pin one `local_send_text` future for the current frame. Keep that future alive while nonterminal events update pressure or pending requests. Return `Ok` only when that send completes. Use one `LOCAL_WEBRTC_PEER_CLOSE_BOUND` deadline for the whole operation. Terminal events, poll end, and peer-terminal causes still abort.
+
+Proof:
+
+- `nonterminal_channel_event_does_not_drop_in_flight_send`
+- `outer_loop_routes_idle_pressure_before_next_request_delivery`
+- `active_pressure_does_not_expire_and_wakes_for_each_peer_terminal_cause`
+- `recoverable_disconnect_after_response_preserves_followup_shutdown`
+- `./test.sh --locked --test hub_daemon_lifecycle_test webrtc_terminal -- --test-threads=1` (8 passed)
+- `cargo clippy --locked -p botster-hub --all-targets -- -D warnings`
