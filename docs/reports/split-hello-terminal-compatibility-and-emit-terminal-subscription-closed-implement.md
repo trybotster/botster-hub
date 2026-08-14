@@ -10,7 +10,7 @@
 | Pipeline worktree | the pipeline-provided ticket worktree |
 | Ticket | `ticket_1786705502_228757` |
 | Run | `run_1786705508_262530` |
-| Step | `botster_stack_implement` (`run_step_1786710108_556857`) |
+| Step | `botster_stack_implement` (`run_step_1786711105_780347`) |
 | Approved plan | `docs/plans/split-hello-terminal-compatibility-and-emit-terminal-subscription-closed.md` revision 2 |
 | Human answer | `question_1786705427_821834` chose **1B** |
 | Merge policy | direct into `main`; do not create a PR |
@@ -115,7 +115,7 @@ Unix `try_write` still serializes opaque `TerminalFrame` bytes only. Close obser
 | Lens | Implementation |
 | --- | --- |
 | Isolation | One closed route is `(client_id, session_id, subscription_id, generation)` plus its adapter handle. Sibling mux routes stay up. |
-| Bounds | Adapter `close()` is non-blocking. Emit is one mux write. Envelope/event flush uses a 50ms non-blocking write so a full socket does not `block_on` the connection task. |
+| Bounds | Adapter `close()` is non-blocking. Emit is one mux write. Envelope/event flush keeps one serialized frame with a byte offset and resumes with cancellation-safe `write` calls under a 50ms timeout so a full socket does not `block_on` the connection task. |
 | Late-message matrix | Hello is complete. Rejected Attach returns `OperatorError` before `start_attach`. Detach suppresses the event. Connection `close_all` sets dying and does not emit. ShutdownSession / RemoveSession / non-running lifecycle suppress. |
 | Production-path proof | IsolatedHub Unix path: mismatch Hello then Attach; host close; Core write-budget stall; Detach; process exit / ShutdownSession; two-connection replacement owner. |
 | Ownership identity | Mux routes are keyed by generation. Event for N does not close N+1. Two-connection test: A observes N closed, B stays bound and echoes. |
@@ -123,11 +123,12 @@ Unix `try_write` still serializes opaque `TerminalFrame` bytes only. Close obser
 
 ## Deviations from plan
 
-1. Mux envelope and close-event writes use a 50ms non-blocking `write_all`. A blocking write with the existing 2s deadline would treat a full socket as connection death and could not emit `core_adapter_closed`. This is required for the write-budget production path.
+1. Mux envelope and close-event writes keep one serialized frame with a byte offset and resume with cancellation-safe `write` calls under a 50ms timeout. A blocking write with the existing 2s deadline would treat a full socket as connection death and could not emit `core_adapter_closed`. This is required for the write-budget production path. Commit `1746862` removed the earlier timed `write_all` design because it was not cancellation-safe.
 2. Same-connection re-attach of one subscription fail-closes (`attach_failed`) because Core reuses the live generation for the same client. Host-close emit is proved by re-attaching one of two sessions on the same connection. Replacement-owner proof uses two connections: B attaches the same key, Core hard-stops A, A receives `TerminalSubscriptionClosed` for generation 1, B stays bound.
 3. IsolatedHub cannot call `list_terminal_subscriptions`. Mismatched Hello then Attach is proved by `OperatorError` before `start_attach`, no `AttachFailed`, no adapter envelopes, and Status still succeeding.
 4. `packages/hub-test-support/test.mjs` was not executed as a Node process because `@trybotster/ui-contract` is not installed in that package directory. Rust `botster-hub-test-support` tests, including node-package copy equality, passed.
-5. Review `review_1786710092_413915` required three high fixes: resumable mux writes, suppress-after-success, and path-neutral report wording. Those are in this revision.
+5. Review `review_1786710092_413915` required three high fixes: resumable mux writes, suppress-after-success, and path-neutral report wording. Those are in commit `1746862`.
+6. Review `review_1786711094_595748` (`finding_1786711094_197080`) required this report to describe the resumable frame and byte-offset design and the exact suite totals. This revision is that report correction.
 
 No accepted product-scope change. The committed plan's acceptance checks remain the contract.
 
@@ -147,11 +148,11 @@ Repo wrapper is `./test.sh` (`BOTSTER_ENV=test cargo test --workspace`).
 | `stale_generation_close_does_not_sweep_replacement_owner` | pass |
 | `terminal_subscription_closed_feature_does_not_raise_default_requirement` | pass |
 | `botster-hub-client` lib (70) | pass |
-| `botster-hub` lib including Unix adapter conformance harness (242) | pass |
+| `botster-hub` lib including Unix adapter conformance harness (244) | pass |
 | `botster-hub-test-support` lib (44) | pass |
 | `cargo clippy --workspace --all-targets --all-features --offline -- -D warnings` | `CLIPPY_EXIT=0` |
 
-Full workspace `./test.sh --offline` passed (exit 0), including `hub_daemon_lifecycle_test` (185 tests), installer, capability, client API, and crate doctests.
+Full workspace `./test.sh --offline` passed (exit 0), including `hub_daemon_lifecycle_test` (186 tests: 185 passed, 1 ignored), installer, capability, client API, and crate doctests.
 
 Review-loop tests added:
 
