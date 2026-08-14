@@ -1449,9 +1449,11 @@ pub struct ForegroundTerminalAppOpenConformanceReport {
 /// Run the hub-owned conformance flow for same-device external clients.
 ///
 /// The flow starts from an already isolated hub, then exercises status, session
-/// list, spawn, attach/drain through `botster_hub_client::stream_attach`, input,
-/// resize, validation error handling, and session teardown using only public
-/// `botster-hub-client` calls.
+/// list, spawn, `DaemonConnection` Attach plus scoped Drain, input, resize,
+/// validation error handling, and session teardown using only public
+/// `botster-hub-client` calls. Held-open `botster_hub_client::stream_attach` is
+/// a separate production helper; live IsolatedHub proof lives in
+/// `unix_adapter_unbound_stream_attach_returns_late_bytes`.
 ///
 /// # Example
 ///
