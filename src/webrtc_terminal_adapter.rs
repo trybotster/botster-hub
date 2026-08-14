@@ -13,6 +13,41 @@ use botster_core::contract::terminal_adapter::{
 use botster_terminal_protocol::TerminalFrame;
 use tokio::sync::Notify;
 
+/// Wake that stores a permit so a write cannot be lost before the sender waits.
+#[derive(Clone)]
+struct AdapterWake {
+    notify: Arc<Notify>,
+    pending: Arc<AtomicBool>,
+}
+
+impl AdapterWake {
+    fn new() -> Self {
+        Self {
+            notify: Arc::new(Notify::new()),
+            pending: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn wake(&self) {
+        self.pending.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    async fn wait(&self) {
+        loop {
+            if self.pending.swap(false, Ordering::SeqCst) {
+                return;
+            }
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            if self.pending.swap(false, Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
 /// One-slot WebRTC adapter bound to an admitted DataChannel.
 pub struct WebRtcTerminalAdapter {
     inner: Arc<WebRtcTerminalAdapterInner>,
@@ -28,7 +63,7 @@ struct WebRtcTerminalAdapterInner {
     closed: AtomicBool,
     would_block: AtomicBool,
     slot: Mutex<Option<Vec<u8>>>,
-    notify: Arc<Notify>,
+    wake: AdapterWake,
 }
 
 impl WebRtcTerminalAdapterInner {
@@ -37,7 +72,7 @@ impl WebRtcTerminalAdapterInner {
             closed: AtomicBool::new(false),
             would_block: AtomicBool::new(false),
             slot: Mutex::new(None),
-            notify: Arc::new(Notify::new()),
+            wake: AdapterWake::new(),
         }
     }
 
@@ -56,12 +91,12 @@ impl WebRtcTerminalAdapterInner {
                 *poisoned.into_inner() = None;
             }
         }
-        self.notify.notify_waiters();
+        self.wake.wake();
     }
 
     fn set_would_block(&self, pressured: bool) {
         self.would_block.store(pressured, Ordering::SeqCst);
-        self.notify.notify_waiters();
+        self.wake.wake();
     }
 
     fn pressure(&self) -> TerminalAdapterPressure {
@@ -114,7 +149,7 @@ impl WebRtcTerminalAdapterInner {
         }
         *slot = Some(bytes);
         drop(slot);
-        self.notify.notify_waiters();
+        self.wake.wake();
         Ok(())
     }
 
@@ -155,7 +190,7 @@ impl WebRtcTerminalAdapterInner {
             }
             Err(_) => None,
         };
-        self.notify.notify_waiters();
+        self.wake.wake();
         taken
     }
 }
@@ -172,14 +207,12 @@ impl WebRtcTerminalAdapter {
     /// Create the production adapter and the peer-owned write handle.
     #[must_use]
     pub(crate) fn pair() -> (Self, WebRtcTerminalAdapterHandle) {
-        Self::pair_with_notify(Arc::new(Notify::new()))
+        Self::pair_with_wake(AdapterWake::new())
     }
 
-    /// Create an adapter that wakes `notify` on write or close.
-    #[must_use]
-    pub(crate) fn pair_with_notify(notify: Arc<Notify>) -> (Self, WebRtcTerminalAdapterHandle) {
+    fn pair_with_wake(wake: AdapterWake) -> (Self, WebRtcTerminalAdapterHandle) {
         let mut inner = WebRtcTerminalAdapterInner::new();
-        inner.notify = notify;
+        inner.wake = wake;
         let inner = Arc::new(inner);
         (
             Self {
@@ -241,7 +274,7 @@ impl std::fmt::Debug for WebRtcConnectionMux {
 }
 
 struct WebRtcMuxInner {
-    notify: Arc<Notify>,
+    wake: AdapterWake,
     routes: Mutex<Vec<(String, String, WebRtcTerminalAdapterHandle)>>,
 }
 
@@ -249,18 +282,14 @@ impl WebRtcConnectionMux {
     pub(crate) fn new() -> Self {
         Self {
             inner: Arc::new(WebRtcMuxInner {
-                notify: Arc::new(Notify::new()),
+                wake: AdapterWake::new(),
                 routes: Mutex::new(Vec::new()),
             }),
         }
     }
 
-    pub(crate) fn notify_arc(&self) -> Arc<Notify> {
-        Arc::clone(&self.inner.notify)
-    }
-
     pub(crate) fn create_adapter(&self) -> (WebRtcTerminalAdapter, WebRtcTerminalAdapterHandle) {
-        WebRtcTerminalAdapter::pair_with_notify(self.notify_arc())
+        WebRtcTerminalAdapter::pair_with_wake(self.inner.wake.clone())
     }
 
     pub(crate) fn register(
@@ -275,7 +304,14 @@ impl WebRtcConnectionMux {
             });
             routes.push((session_id, subscription_id, handle));
         }
-        self.inner.notify.notify_waiters();
+        self.inner.wake.wake();
+    }
+
+    pub(crate) fn has_bound_routes(&self) -> bool {
+        self.inner
+            .routes
+            .lock()
+            .is_ok_and(|routes| !routes.is_empty())
     }
 
     pub(crate) fn close_all(&self) {
@@ -284,7 +320,7 @@ impl WebRtcConnectionMux {
                 handle.close();
             }
         }
-        self.inner.notify.notify_waiters();
+        self.inner.wake.wake();
     }
 
     pub(crate) fn set_would_block(&self, pressured: bool) {
@@ -293,7 +329,7 @@ impl WebRtcConnectionMux {
                 handle.set_would_block(pressured);
             }
         }
-        self.inner.notify.notify_waiters();
+        self.inner.wake.wake();
     }
 
     pub(crate) fn snapshot_writes(
@@ -317,8 +353,8 @@ impl WebRtcConnectionMux {
             .collect()
     }
 
-    pub(crate) fn notify(&self) -> &Notify {
-        self.inner.notify.as_ref()
+    pub(crate) async fn wait_for_write(&self) {
+        self.inner.wake.wait().await;
     }
 }
 
@@ -347,6 +383,8 @@ impl WebRtcTerminalAdapterHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
     use botster_core_test_support::terminal_adapter::{
         TerminalAdapterHarnessDriver, assert_terminal_adapter_conformance,
     };
@@ -428,6 +466,30 @@ mod tests {
         assert!(handle.complete_active().is_some());
         assert!(handle.complete_active().is_none());
         assert_eq!(adapter.pressure(), TerminalAdapterPressure::Ready);
+    }
+
+    #[test]
+    fn wait_observes_a_write_that_happens_after_an_empty_scan() {
+        let mux = WebRtcConnectionMux::new();
+        let (mut adapter, handle) = mux.create_adapter();
+        mux.register("s".into(), "sub".into(), handle);
+        assert!(
+            mux.snapshot_writes().is_empty(),
+            "scan is empty before the race write"
+        );
+        let frame = TerminalFrame::from_bytes(br#"{"type":"terminal_output","marker":"race"}"#)
+            .expect("opaque frame");
+        assert_eq!(adapter.try_write(&frame), Ok(()));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_millis(50), mux.wait_for_write())
+                .await
+                .expect("write after empty scan must store a wake permit");
+        });
+        assert_eq!(mux.snapshot_writes().len(), 1);
     }
 
     #[test]

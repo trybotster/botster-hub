@@ -86,6 +86,10 @@ pub(crate) struct LocalWebrtcOfferPeer {
     pub(crate) pending_terminal_frames: VecDeque<(String, Vec<u8>)>,
 }
 
+pub(crate) struct ExtraWebrtcDataChannel {
+    pub(crate) messages: AsyncReceiver<String>,
+}
+
 impl LocalWebrtcOfferPeer {
     pub(crate) async fn create_offer()
     -> Result<(Self, serde_json::Value), Box<dyn std::error::Error>> {
@@ -215,10 +219,8 @@ impl LocalWebrtcOfferPeer {
                         .push_back(serde_json::from_slice(&plaintext)?);
                 }
                 botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonTerminalFrame => {
-                    return Err(std::io::Error::other(
-                        "unexpected daemon_terminal_frame on unbound receive path",
-                    )
-                    .into());
+                    self.pending_terminal_frames
+                        .push_back((String::new(), plaintext));
                 }
             }
         }
@@ -231,21 +233,23 @@ impl LocalWebrtcOfferPeer {
         if let Some(frame) = self.pending_entity_frames.pop_front() {
             return Ok(frame);
         }
-        let (delivery_kind, plaintext, _) = self.receive_delivery(key).await?;
-        match delivery_kind {
-            botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonEntityFrame => {
-                Ok(serde_json::from_slice(&plaintext)?)
+        loop {
+            let (delivery_kind, plaintext, _) = self.receive_delivery(key).await?;
+            match delivery_kind {
+                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonEntityFrame => {
+                    return Ok(serde_json::from_slice(&plaintext)?);
+                }
+                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonResponse => {
+                    return Err(std::io::Error::other(
+                        "received uncorrelated daemon response while waiting for entity frame",
+                    )
+                    .into());
+                }
+                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonTerminalFrame => {
+                    self.pending_terminal_frames
+                        .push_back((String::new(), plaintext));
+                }
             }
-            botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonResponse => {
-                Err(std::io::Error::other(
-                    "received uncorrelated daemon response while waiting for entity frame",
-                )
-                .into())
-            }
-            botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonTerminalFrame => Err(
-                std::io::Error::other("unexpected daemon_terminal_frame on unbound receive path")
-                    .into(),
-            ),
         }
     }
 
@@ -381,6 +385,50 @@ impl LocalWebrtcOfferPeer {
                 maximum_frame_bytes,
             },
         ))
+    }
+
+    pub(crate) async fn create_extra_data_channel(
+        &mut self,
+    ) -> Result<ExtraWebrtcDataChannel, Box<dyn std::error::Error>> {
+        let runtime =
+            default_runtime().ok_or_else(|| std::io::Error::other("no async runtime found"))?;
+        let (open_tx, mut open_rx) = channel::<()>(1);
+        let (message_tx, message_rx) = channel::<String>(256);
+        let extra = self
+            .peer
+            .create_data_channel(
+                "botster-extra",
+                Some(RTCDataChannelInit {
+                    ordered: true,
+                    max_retransmits: None,
+                    max_packet_life_time: None,
+                    ..Default::default()
+                }),
+            )
+            .await?;
+        {
+            let extra = extra.clone();
+            runtime.spawn(Box::pin(async move {
+                while let Some(event) = extra.poll().await {
+                    match event {
+                        DataChannelEvent::OnOpen => {
+                            let _ = open_tx.try_send(());
+                        }
+                        DataChannelEvent::OnMessage(message) => {
+                            if let Ok(text) = String::from_utf8(message.data.to_vec()) {
+                                let _ = message_tx.try_send(text);
+                            }
+                        }
+                        DataChannelEvent::OnClose => break,
+                        _ => {}
+                    }
+                }
+            }));
+        }
+        let _ = timeout(Duration::from_secs(5), open_rx.recv()).await;
+        Ok(ExtraWebrtcDataChannel {
+            messages: message_rx,
+        })
     }
 }
 

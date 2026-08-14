@@ -39,6 +39,13 @@ impl BoundAdapterHandle {
             Self::WebRtc(handle) => handle.close(),
         }
     }
+
+    pub(crate) fn close_from_host(&self) {
+        match self {
+            Self::Unix(handle) => handle.close_from_host(),
+            Self::WebRtc(handle) => handle.close(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -572,6 +579,7 @@ pub(crate) fn bind_unix_adapter_after_attaching(
         mux.register(
             request.session_id.to_string(),
             request.subscription_id.to_string(),
+            generation.0,
             handle.clone(),
         );
     }
@@ -583,6 +591,8 @@ pub(crate) struct WebrtcBindRequest<'a> {
     pub session_id: &'a str,
     pub subscription_id: &'a str,
     pub required_features: &'a [String],
+    pub terminal_requirement:
+        Option<&'a botster_terminal_protocol::TerminalCompatibilityRequirement>,
     pub now_seconds: u64,
     pub mux: Option<&'a WebRtcConnectionMux>,
 }
@@ -610,7 +620,10 @@ pub(crate) fn bind_webrtc_adapter_after_attaching(
         ));
     };
     registry.record_generation(request.session_id, request.subscription_id, generation);
-    let capabilities = match negotiated_unix_capability_set(request.required_features, None) {
+    let capabilities = match negotiated_unix_capability_set(
+        request.required_features,
+        request.terminal_requirement,
+    ) {
         Ok(capabilities) => capabilities,
         Err(_) => {
             return Err(fail_closed_pre_bind_attach(
@@ -659,7 +672,6 @@ pub(crate) fn bind_webrtc_adapter_after_attaching(
         mux.register(
             request.session_id.to_string(),
             request.subscription_id.to_string(),
-            generation.0,
             handle.clone(),
         );
     }
