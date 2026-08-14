@@ -1592,8 +1592,24 @@ socket Drain receives READY before later PAGE/FINISH frames.
 advertises it. `DaemonCompatibilityRequirement::current()` does not require
 it. Clients that want the adapter plane use
 `DaemonCompatibilityRequirement::for_unix_terminal_adapter()`.
-`PROTOCOL_VERSION` remains 7. Advertising this feature advances
-`CONFORMANCE_FIXTURE_REVISION` to 39.
+`PROTOCOL_VERSION` remains 7. Advertising this feature and
+`terminal_subscription_closed` advances `CONFORMANCE_FIXTURE_REVISION` to 40.
+The default client requirement stays at revision 36.
+
+`DaemonHello` may send a Core `TerminalCompatibilityRequirement`. Absence is
+not a mismatch. `DaemonHelloAck` always advertises independent
+`TerminalCompatibility`. Host `DaemonCompatibility` stays a separate field.
+A present terminal requirement that fails `ensure_compatible` stores
+`UnixTerminalAdmission::Rejected` and returns `OperatorError` on the next
+Attach. The socket stays up for host operations.
+
+When a bound adapter or Core write-budget hard-stop closes a live generation
+and the connection stays up, Hub emits unsolicited
+`DaemonEvent::TerminalSubscriptionClosed` with `session_id`,
+`subscription_id`, `generation`, and reason `host_adapter_closed` or
+`core_adapter_closed`. `parse_unix_mux_value` classifies that frame as
+`DaemonUnixMuxFrame::Event`, not a request reply. Connection death, Detach,
+process exit, and session removal do not emit this event.
 
 Unix admission is Hello plus LocalOperator. There is no WebRTC-style
 `BootstrapGrant` on the local Unix socket. The admission lifetime is the
@@ -1610,8 +1626,9 @@ When Hello requires `unix_terminal_adapter` and Attach succeeds:
    `attach_failed`. Hub does not drop those frames.
 3. Hub intersects `TerminalCompatibility` advertised tokens with LocalOperator
    admission, includes `snapshot_delivery=ready_then_history` only when Hello
-   required that feature, and binds the resulting `TerminalCapabilitySet`
-   into Core.
+   or the terminal requirement asked for that feature, and binds the stored
+   Hello-time `TerminalCapabilitySet` into Core. Attach does not recompute a
+   different set.
 4. Later terminal frames leave only as unsolicited
    `DaemonUnixTerminalEnvelope` JSON lines: `plane=terminal`, `kind=frame`,
    plus opaque `payload_base64` from `TerminalFrame::to_bytes()`. Hub does

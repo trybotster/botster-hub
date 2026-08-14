@@ -28,12 +28,29 @@ export type DaemonLocalWebrtcDeliveryKind =
 export interface DaemonHello {
   protocol: string;
   compatibility: DaemonCompatibilityRequirement;
+  terminal_compatibility?: TerminalCompatibilityRequirement;
 }
 
 export interface DaemonHelloAck {
   protocol: string;
   compatibility: DaemonCompatibility;
+  terminal_compatibility?: TerminalCompatibility;
   diagnostics?: DaemonDiagnostic[];
+}
+
+export interface TerminalCompatibility {
+  protocol: string;
+  protocol_version: number;
+  features: string[];
+  conformance_fixture_revision: number;
+}
+
+export interface TerminalCompatibilityRequirement {
+  protocol: string;
+  protocol_version: number;
+  required_features: string[];
+  minimum_conformance_fixture_revision: number;
+  client_name: string;
 }
 
 export interface DaemonUnixTerminalEnvelope {
@@ -955,4 +972,5 @@ export type DaemonEvent =
   | { type: "process_exit"; session_id: string; subscription_id: string; code: number | null }
   | { type: "attach_state"; session_id: string; subscription_id: string; state: string }
   | { type: "runtime_observation"; kind: string }
-  | { type: "worktree_lifecycle"; event: DaemonWorktreeLifecycleEvent };
+  | { type: "worktree_lifecycle"; event: DaemonWorktreeLifecycleEvent }
+  | { type: "terminal_subscription_closed"; session_id: string; subscription_id: string; generation: number; reason: string };

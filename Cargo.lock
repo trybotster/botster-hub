@@ -471,6 +471,7 @@ name = "botster-hub-client"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "botster-terminal-protocol",
  "botster-ui-contract",
  "serde",
  "serde_json",

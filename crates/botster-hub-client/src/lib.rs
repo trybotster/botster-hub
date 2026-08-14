@@ -18,11 +18,16 @@ use botster_ui_contract::{PackageSurfaceDescriptor, UiActionRequest, UiActionRes
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub use botster_terminal_protocol::ensure_compatible as ensure_terminal_compatible;
+pub use botster_terminal_protocol::{
+    TerminalCompatibility, TerminalCompatibilityError, TerminalCompatibilityRequirement,
+};
+
 mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 pub const PROTOCOL_VERSION: u16 = 7;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 39;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 40;
 /// Oldest conformance revision accepted by the default first-party client requirement.
 pub const DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 36;
 /// Version of the local WebRTC delivery chunk framing protocol.
@@ -56,6 +61,12 @@ pub const FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY: &str =
     "snapshot_delivery=ready_then_history";
 /// Optional Hub Unix adapter plane. Bind happens only when Hello requires this.
 pub const FEATURE_UNIX_TERMINAL_ADAPTER: &str = "unix_terminal_adapter";
+/// Optional host event when a bound terminal subscription closes and the socket stays up.
+pub const FEATURE_TERMINAL_SUBSCRIPTION_CLOSED: &str = "terminal_subscription_closed";
+/// Hub closed this bound adapter while the connection stayed alive.
+pub const TERMINAL_SUBSCRIPTION_CLOSED_HOST_ADAPTER: &str = "host_adapter_closed";
+/// Core closed this bound adapter while the connection stayed alive.
+pub const TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER: &str = "core_adapter_closed";
 /// Mux envelope plane tag. Not a Snapshot/READY/PAGE/FINISH field.
 pub const UNIX_TERMINAL_PLANE: &str = "terminal";
 /// Mux envelope kind tag. The payload stays an opaque `TerminalFrame` blob.
@@ -374,6 +385,7 @@ pub fn connect_and_hello_with_requirement(
         &DaemonHello {
             protocol: PROTOCOL.to_string(),
             compatibility: requirement.clone(),
+            terminal_compatibility: None,
         },
     )?;
     let ack = read_hello_ack(&mut stream)?;
@@ -385,6 +397,45 @@ pub fn connect_and_hello_with_requirement(
     ensure_compatible(requirement, &ack.compatibility)
         .map_err(DaemonTransportError::Compatibility)?;
     Ok(stream)
+}
+
+/// Connect with a host requirement and an optional Core terminal requirement.
+///
+/// A missing terminal requirement is not a mismatch. Status-only clients can
+/// omit it. This helper does not force a terminal requirement into the default
+/// host Hello path.
+pub fn connect_and_hello_with_terminal_requirement(
+    endpoint: &DaemonEndpoint,
+    requirement: &DaemonCompatibilityRequirement,
+    terminal_compatibility: Option<&TerminalCompatibilityRequirement>,
+) -> DaemonTransportResult<(UnixStream, DaemonHelloAck)> {
+    let mut stream = UnixStream::connect(&endpoint.socket_path).map_err(|error| {
+        if matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+        ) {
+            DaemonTransportError::NotRunning
+        } else {
+            normalize_socket_io_error(error)
+        }
+    })?;
+    write_frame(
+        &mut stream,
+        &DaemonHello {
+            protocol: PROTOCOL.to_string(),
+            compatibility: requirement.clone(),
+            terminal_compatibility: terminal_compatibility.cloned(),
+        },
+    )?;
+    let ack = read_hello_ack(&mut stream)?;
+    if ack.protocol != PROTOCOL {
+        return Err(DaemonTransportError::Protocol(
+            "unexpected hello ack protocol",
+        ));
+    }
+    ensure_compatible(requirement, &ack.compatibility)
+        .map_err(DaemonTransportError::Compatibility)?;
+    Ok((stream, ack))
 }
 
 pub fn write_frame<T: Serialize>(stream: &mut UnixStream, frame: &T) -> DaemonTransportResult<()> {
@@ -568,12 +619,18 @@ pub struct DaemonHello {
     /// validate hub compatibility from `DaemonHelloAck` and `DaemonStatus`.
     #[serde(default)]
     pub compatibility: DaemonCompatibilityRequirement,
+    /// Optional Core terminal-plane requirement. Absence is not a mismatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_compatibility: Option<TerminalCompatibilityRequirement>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonHelloAck {
     pub protocol: String,
     pub compatibility: DaemonCompatibility,
+    /// Independent Core terminal compatibility. Host `compatibility` stays separate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_compatibility: Option<TerminalCompatibility>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<DaemonDiagnostic>,
 }
@@ -795,6 +852,7 @@ fn current_feature_list() -> Vec<&'static str> {
     features.push(FEATURE_HUB_SOURCE_UPDATE);
     features.push(FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY);
     features.push(FEATURE_UNIX_TERMINAL_ADAPTER);
+    features.push(FEATURE_TERMINAL_SUBSCRIPTION_CLOSED);
     features
 }
 
@@ -2741,6 +2799,16 @@ pub enum DaemonEvent {
     WorktreeLifecycle {
         event: DaemonWorktreeLifecycleEvent,
     },
+    /// Bound terminal subscription closed while this connection stayed alive.
+    ///
+    /// This is an unsolicited host event. It is not a request reply and not
+    /// `AttachFailed`.
+    TerminalSubscriptionClosed {
+        session_id: String,
+        subscription_id: String,
+        generation: u64,
+        reason: String,
+    },
 }
 
 impl DaemonEvent {
@@ -2796,6 +2864,7 @@ impl DaemonUnixTerminalEnvelope {
 pub enum DaemonUnixMuxFrame {
     Response(Box<DaemonResponse>),
     Terminal(DaemonUnixTerminalEnvelope),
+    Event(DaemonEvent),
 }
 
 /// Classify one decoded JSON line without inspecting terminal payload bytes.
@@ -2804,6 +2873,9 @@ pub fn parse_unix_mux_value(value: Value) -> Result<DaemonUnixMuxFrame, serde_js
         && value.get("kind").and_then(Value::as_str) == Some(UNIX_TERMINAL_KIND)
     {
         return serde_json::from_value(value).map(DaemonUnixMuxFrame::Terminal);
+    }
+    if value.get("type").and_then(Value::as_str) == Some("terminal_subscription_closed") {
+        return serde_json::from_value(value).map(DaemonUnixMuxFrame::Event);
     }
     serde_json::from_value(value)
         .map(Box::new)
@@ -3156,11 +3228,10 @@ mod tests {
 
         let error = ensure_compatible(&requirement, &previous_daemon)
             .expect_err("a source-update client must reject an old daemon");
-        assert!(
-            error
-                .diagnostic
-                .contains("unsupported conformance fixture revision 36; requires at least 39")
-        );
+        assert!(error.diagnostic.contains(&format!(
+            "unsupported conformance fixture revision {}; requires at least {CONFORMANCE_FIXTURE_REVISION}",
+            DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION
+        )));
 
         previous_daemon.conformance_fixture_revision = CONFORMANCE_FIXTURE_REVISION;
         let error = ensure_compatible(&requirement, &previous_daemon)
@@ -3198,11 +3269,10 @@ mod tests {
 
         let error = ensure_compatible(&requirement, &previous_daemon)
             .expect_err("a ready-then-history client must reject an old daemon");
-        assert!(
-            error
-                .diagnostic
-                .contains("unsupported conformance fixture revision 36; requires at least 39")
-        );
+        assert!(error.diagnostic.contains(&format!(
+            "unsupported conformance fixture revision {}; requires at least {CONFORMANCE_FIXTURE_REVISION}",
+            DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION
+        )));
 
         previous_daemon.conformance_fixture_revision = CONFORMANCE_FIXTURE_REVISION;
         let error = ensure_compatible(&requirement, &previous_daemon)
@@ -3279,7 +3349,36 @@ mod tests {
                     br#"{"type":"terminal_output","marker":"opaque"}"#
                 );
             }
-            DaemonUnixMuxFrame::Response(_) => panic!("envelope must not parse as a response"),
+            DaemonUnixMuxFrame::Response(_) | DaemonUnixMuxFrame::Event(_) => {
+                panic!("envelope must not parse as a response or host event")
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_subscription_closed_is_a_mux_event_not_a_request_reply() {
+        let event = DaemonEvent::TerminalSubscriptionClosed {
+            session_id: "session".to_string(),
+            subscription_id: "sub".to_string(),
+            generation: 2,
+            reason: TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER.to_string(),
+        };
+        let value = serde_json::to_value(&event).expect("event serializes");
+        assert_eq!(value["type"], "terminal_subscription_closed");
+        assert!(value.get("kind").is_none());
+        match parse_unix_mux_value(value).expect("parse event") {
+            DaemonUnixMuxFrame::Event(DaemonEvent::TerminalSubscriptionClosed {
+                session_id,
+                subscription_id,
+                generation,
+                reason,
+            }) => {
+                assert_eq!(session_id, "session");
+                assert_eq!(subscription_id, "sub");
+                assert_eq!(generation, 2);
+                assert_eq!(reason, TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER);
+            }
+            other => panic!("close event must not parse as {other:?}"),
         }
     }
 
@@ -3648,7 +3747,7 @@ mod tests {
     #[test]
     fn protocol_seven_rejects_protocol_six_and_accepts_conformance_floor_thirty_five() {
         assert_eq!(PROTOCOL_VERSION, 7);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 39);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 40);
 
         let protocol_six = DaemonCompatibilityRequirement {
             protocol_version: 6,
@@ -4197,6 +4296,7 @@ mod tests {
         let hello_ack = DaemonHelloAck {
             protocol: PROTOCOL.to_string(),
             compatibility: DaemonCompatibility::current(),
+            terminal_compatibility: None,
             diagnostics: Vec::new(),
         };
         assert_serde_omits_empty_diagnostics(
@@ -6004,6 +6104,7 @@ mod tests {
             DaemonEvent::AttachState { .. } => "attach_state",
             DaemonEvent::RuntimeObservation { .. } => "runtime_observation",
             DaemonEvent::WorktreeLifecycle { .. } => "worktree_lifecycle",
+            DaemonEvent::TerminalSubscriptionClosed { .. } => "terminal_subscription_closed",
         }
     }
 
@@ -6163,7 +6264,7 @@ mod tests {
     #[test]
     fn protocol_six_and_conformance_thirty_two_define_the_cold_cut_boundary() {
         assert_eq!(PROTOCOL_VERSION, 7);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 39);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 40);
 
         let requirement = DaemonCompatibilityRequirement::current();
         let protocol_error = ensure_compatible(
@@ -6228,7 +6329,7 @@ mod tests {
         // conformance revision: bumping the protocol would break every existing
         // first-party client that never issues this request.
         assert_eq!(PROTOCOL_VERSION, 7);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 39);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 40);
         assert_eq!(DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION, 36);
         assert_eq!(
             current_feature_list(),
@@ -6250,6 +6351,7 @@ mod tests {
                 FEATURE_HUB_SOURCE_UPDATE,
                 FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY,
                 FEATURE_UNIX_TERMINAL_ADAPTER,
+                FEATURE_TERMINAL_SUBSCRIPTION_CLOSED,
             ],
             "the daemon advertises all current capabilities",
         );

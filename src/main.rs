@@ -3011,6 +3011,16 @@ fn print_daemon_events(events: &[DaemonEvent]) {
                     event.failure_kind.as_deref().unwrap_or("none")
                 );
             }
+            DaemonEvent::TerminalSubscriptionClosed {
+                session_id,
+                subscription_id,
+                generation,
+                reason,
+            } => {
+                println!(
+                    "event=terminal_subscription_closed session_id={session_id} subscription_id={subscription_id} generation={generation} reason={reason}"
+                );
+            }
         }
     }
 }

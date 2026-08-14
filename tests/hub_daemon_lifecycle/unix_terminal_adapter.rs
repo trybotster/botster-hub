@@ -19,6 +19,17 @@ fn request_skipping_envelopes(
     request: &botster_hub_client::DaemonRequest,
     envelopes: &mut Vec<botster_hub_client::DaemonUnixTerminalEnvelope>,
 ) -> botster_hub_client::DaemonResponse {
+    let mut events = Vec::new();
+    request_collecting_mux(stream, reader, request, envelopes, &mut events)
+}
+
+fn request_collecting_mux(
+    stream: &mut std::os::unix::net::UnixStream,
+    reader: &mut std::io::BufReader<std::os::unix::net::UnixStream>,
+    request: &botster_hub_client::DaemonRequest,
+    envelopes: &mut Vec<botster_hub_client::DaemonUnixTerminalEnvelope>,
+    events: &mut Vec<botster_hub_client::DaemonEvent>,
+) -> botster_hub_client::DaemonResponse {
     botster_hub_client::write_frame(stream, request).expect("write request");
     loop {
         match botster_hub_client::read_unix_mux_frame_from_reader(reader).expect("read mux") {
@@ -27,6 +38,7 @@ fn request_skipping_envelopes(
                 assert!(envelope.is_unix_terminal_plane());
                 envelopes.push(envelope);
             }
+            botster_hub_client::DaemonUnixMuxFrame::Event(event) => events.push(event),
         }
     }
 }
@@ -793,4 +805,596 @@ fn unix_adapter_feature_does_not_raise_default_requirement() {
     botster_hub_client::ensure_compatible(&adapter_requirement, &previous)
         .expect_err("the unix adapter requirement must fail closed without the feature");
     assert_eq!(botster_hub_client::PROTOCOL_VERSION, 7);
+}
+
+fn spawn_and_bind(
+    stream: &mut std::os::unix::net::UnixStream,
+    reader: &mut std::io::BufReader<std::os::unix::net::UnixStream>,
+    session_id: &str,
+    subscription_id: &str,
+    command: &str,
+    envelopes: &mut Vec<botster_hub_client::DaemonUnixTerminalEnvelope>,
+    events: &mut Vec<botster_hub_client::DaemonEvent>,
+) {
+    let spawned = request_collecting_mux(
+        stream,
+        reader,
+        &botster_hub_client::DaemonRequest::Spawn {
+            session_id: session_id.to_string(),
+            command: command.to_string(),
+        },
+        envelopes,
+        events,
+    );
+    assert_eq!(spawned.kind, botster_hub_client::DaemonResponseKind::Spawned);
+    let attach = request_collecting_mux(
+        stream,
+        reader,
+        &botster_hub_client::DaemonRequest::Attach {
+            session_id: session_id.to_string(),
+            subscription_id: subscription_id.to_string(),
+        },
+        envelopes,
+        events,
+    );
+    assert_eq!(attach.kind, botster_hub_client::DaemonResponseKind::Events);
+    assert!(
+        attach.events.iter().any(|event| matches!(
+            event,
+            botster_hub_client::DaemonEvent::AttachState { state, .. }
+                if state == botster_hub_client::ATTACH_STATE_ATTACHING
+        )),
+        "bind must return Attaching: {:?}",
+        attach.events
+    );
+}
+
+fn wait_for_subscription_closed(
+    stream: &mut std::os::unix::net::UnixStream,
+    reader: &mut std::io::BufReader<std::os::unix::net::UnixStream>,
+    session_id: &str,
+    subscription_id: &str,
+    envelopes: &mut Vec<botster_hub_client::DaemonUnixTerminalEnvelope>,
+    events: &mut Vec<botster_hub_client::DaemonEvent>,
+) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        if events.iter().any(|event| {
+            matches!(
+                event,
+                botster_hub_client::DaemonEvent::TerminalSubscriptionClosed {
+                    session_id: closed_session,
+                    subscription_id: closed_subscription,
+                    ..
+                } if closed_session == session_id && closed_subscription == subscription_id
+            )
+        }) {
+            stream.set_read_timeout(None).expect("clear read timeout");
+            return true;
+        }
+        stream
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("read timeout");
+        match botster_hub_client::read_unix_mux_frame_from_reader(reader) {
+            Ok(botster_hub_client::DaemonUnixMuxFrame::Terminal(envelope)) => {
+                assert!(envelope.is_unix_terminal_plane());
+                envelopes.push(envelope);
+            }
+            Ok(botster_hub_client::DaemonUnixMuxFrame::Event(event)) => events.push(event),
+            Ok(botster_hub_client::DaemonUnixMuxFrame::Response(_)) => {}
+            Err(_) => {
+                stream.set_read_timeout(None).expect("clear read timeout");
+                let _ = request_collecting_mux(
+                    stream,
+                    reader,
+                    &botster_hub_client::DaemonRequest::Status,
+                    envelopes,
+                    events,
+                );
+            }
+        }
+    }
+    false
+}
+
+#[test]
+fn hello_ack_advertises_independent_terminal_compatibility() {
+    let _guard = daemon_test_guard();
+    let hub = start_isolated_live_output_hub("htc");
+    let (stream, ack) = botster_hub_client::connect_and_hello_with_terminal_requirement(
+        hub.endpoint(),
+        &botster_hub_client::DaemonCompatibilityRequirement::current(),
+        None,
+    )
+    .expect("hello");
+    drop(stream);
+    let terminal = ack
+        .terminal_compatibility
+        .expect("HelloAck must advertise terminal compatibility");
+    assert_eq!(terminal.protocol, botster_terminal_protocol::PROTOCOL);
+    assert_eq!(
+        terminal.protocol_version,
+        botster_terminal_protocol::PROTOCOL_VERSION
+    );
+    assert_ne!(terminal.protocol, ack.compatibility.protocol);
+    assert!(
+        ack.compatibility
+            .supports_feature(botster_hub_client::FEATURE_TERMINAL_SUBSCRIPTION_CLOSED)
+    );
+    assert!(
+        !botster_hub_client::DaemonCompatibilityRequirement::current()
+            .required_features
+            .iter()
+            .any(|feature| feature == botster_hub_client::FEATURE_TERMINAL_SUBSCRIPTION_CLOSED)
+    );
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn mismatched_terminal_hello_rejects_attach_before_core_ownership() {
+    let _guard = daemon_test_guard();
+    let hub = start_isolated_live_output_hub("htm");
+    let endpoint = hub.endpoint().clone();
+    let mut terminal = botster_terminal_protocol::TerminalCompatibilityRequirement::current();
+    terminal.protocol_version = terminal.protocol_version.saturating_add(1);
+    terminal.client_name = "mismatch-client".to_string();
+    let (mut stream, ack) = botster_hub_client::connect_and_hello_with_terminal_requirement(
+        &endpoint,
+        &botster_hub_client::DaemonCompatibilityRequirement::for_unix_terminal_adapter(),
+        Some(&terminal),
+    )
+    .expect("mismatched terminal hello still returns a host connection");
+    assert!(
+        ack.diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == botster_hub_client::DaemonDiagnosticKind::CompatibilityMismatch
+        }),
+        "HelloAck must carry a typed terminal diagnostic: {:?}",
+        ack.diagnostics
+    );
+    let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
+    let mut envelopes = Vec::new();
+    let mut events = Vec::new();
+    request_collecting_mux(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::Spawn {
+            session_id: "htm-session".to_string(),
+            command: "sleep 30".to_string(),
+        },
+        &mut envelopes,
+        &mut events,
+    );
+    let attach = request_collecting_mux(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::Attach {
+            session_id: "htm-session".to_string(),
+            subscription_id: "htm-sub".to_string(),
+        },
+        &mut envelopes,
+        &mut events,
+    );
+    assert_eq!(
+        attach.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError
+    );
+    let error = attach.error.expect("operator error");
+    assert_eq!(error.code, "terminal_compatibility");
+    assert_eq!(error.operation, "attach");
+    assert!(
+        !attach
+            .events
+            .iter()
+            .any(|event| matches!(event, botster_hub_client::DaemonEvent::AttachState { .. })),
+        "rejected attach must not emit AttachFailed: {:?}",
+        attach.events
+    );
+    let status = request_collecting_mux(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::Status,
+        &mut envelopes,
+        &mut events,
+    );
+    assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
+    assert!(envelopes.is_empty(), "rejected attach must not bind: {envelopes:?}");
+    drop(stream);
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn host_adapter_close_emits_terminal_subscription_closed_for_one_route() {
+    let _guard = daemon_test_guard();
+    let hub = start_isolated_live_output_hub("hac");
+    let (mut stream, mut reader) = unix_adapter_connection(hub.endpoint());
+    let mut envelopes = Vec::new();
+    let mut events = Vec::new();
+    spawn_and_bind(
+        &mut stream,
+        &mut reader,
+        "hac-a",
+        "sub-a",
+        "sleep 30",
+        &mut envelopes,
+        &mut events,
+    );
+    spawn_and_bind(
+        &mut stream,
+        &mut reader,
+        "hac-b",
+        "sub-b",
+        "sleep 30",
+        &mut envelopes,
+        &mut events,
+    );
+    let reattach = request_collecting_mux(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::Attach {
+            session_id: "hac-a".to_string(),
+            subscription_id: "sub-a".to_string(),
+        },
+        &mut envelopes,
+        &mut events,
+    );
+    assert_eq!(reattach.kind, botster_hub_client::DaemonResponseKind::Events);
+    assert!(
+        wait_for_subscription_closed(
+            &mut stream,
+            &mut reader,
+            "hac-a",
+            "sub-a",
+            &mut envelopes,
+            &mut events,
+        ),
+        "host close of generation N must emit TerminalSubscriptionClosed: {events:?}"
+    );
+    let closed = events
+        .iter()
+        .find_map(|event| match event {
+            botster_hub_client::DaemonEvent::TerminalSubscriptionClosed {
+                session_id,
+                subscription_id,
+                generation,
+                reason,
+            } if session_id == "hac-a" && subscription_id == "sub-a" => {
+                Some((*generation, reason.clone()))
+            }
+            _ => None,
+        })
+        .expect("closed event");
+    assert_eq!(
+        closed.1,
+        botster_hub_client::TERMINAL_SUBSCRIPTION_CLOSED_HOST_ADAPTER
+    );
+    assert!(closed.0 >= 1);
+    let sibling = request_collecting_mux(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::Status,
+        &mut envelopes,
+        &mut events,
+    );
+    assert_eq!(sibling.kind, botster_hub_client::DaemonResponseKind::Status);
+    let listed = request_collecting_mux(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::ListSessions,
+        &mut envelopes,
+        &mut events,
+    );
+    assert!(listed.sessions.iter().any(|session| session.session_id == "hac-b"));
+    shutdown_short_lived_session(hub.endpoint(), "hac-a");
+    shutdown_short_lived_session(hub.endpoint(), "hac-b");
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn core_write_budget_hard_stop_emits_core_adapter_closed() {
+    let _guard = daemon_test_guard();
+    let hub = start_isolated_live_output_hub("cwb");
+    let (mut stream, mut reader) = unix_adapter_connection(hub.endpoint());
+    let mut envelopes = Vec::new();
+    let mut events = Vec::new();
+    spawn_and_bind(
+        &mut stream,
+        &mut reader,
+        "cwb-stall",
+        "sub-stall",
+        "yes write-budget-stall",
+        &mut envelopes,
+        &mut events,
+    );
+    spawn_and_bind(
+        &mut stream,
+        &mut reader,
+        "cwb-live",
+        "sub-live",
+        "sleep 30",
+        &mut envelopes,
+        &mut events,
+    );
+    thread::sleep(Duration::from_secs(2));
+    assert!(
+        wait_for_subscription_closed(
+            &mut stream,
+            &mut reader,
+            "cwb-stall",
+            "sub-stall",
+            &mut envelopes,
+            &mut events,
+        ),
+        "write-budget hard-stop must emit TerminalSubscriptionClosed: {events:?}"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        botster_hub_client::DaemonEvent::TerminalSubscriptionClosed {
+            session_id,
+            reason,
+            ..
+        } if session_id == "cwb-stall"
+            && reason == botster_hub_client::TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER
+    )));
+    let sibling = request_collecting_mux(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::ListSessions,
+        &mut envelopes,
+        &mut events,
+    );
+    assert!(
+        sibling
+            .sessions
+            .iter()
+            .any(|session| session.session_id == "cwb-live" && session.lifecycle == "running")
+    );
+    shutdown_short_lived_session(hub.endpoint(), "cwb-stall");
+    shutdown_short_lived_session(hub.endpoint(), "cwb-live");
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn connection_death_and_detach_do_not_emit_terminal_subscription_closed() {
+    let _guard = daemon_test_guard();
+    let hub = start_isolated_live_output_hub("cdn");
+    let endpoint = hub.endpoint().clone();
+    let (mut stream, mut reader) = unix_adapter_connection(&endpoint);
+    let mut envelopes = Vec::new();
+    let mut events = Vec::new();
+    spawn_and_bind(
+        &mut stream,
+        &mut reader,
+        "cdn-session",
+        "cdn-sub",
+        "sleep 30",
+        &mut envelopes,
+        &mut events,
+    );
+    let detach = request_collecting_mux(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::Detach {
+            session_id: "cdn-session".to_string(),
+            subscription_id: "cdn-sub".to_string(),
+        },
+        &mut envelopes,
+        &mut events,
+    );
+    assert_eq!(detach.kind, botster_hub_client::DaemonResponseKind::Events);
+    assert!(
+        events.iter().all(|event| {
+            !matches!(
+                event,
+                botster_hub_client::DaemonEvent::TerminalSubscriptionClosed { .. }
+            )
+        }),
+        "explicit Detach must not emit TerminalSubscriptionClosed: {events:?}"
+    );
+    drop(stream);
+    drop(reader);
+    let (mut replacement, mut replacement_reader) = unix_adapter_connection(&endpoint);
+    let mut replacement_events = Vec::new();
+    let mut replacement_envelopes = Vec::new();
+    spawn_and_bind(
+        &mut replacement,
+        &mut replacement_reader,
+        "cdn-death",
+        "cdn-death-sub",
+        "sleep 30",
+        &mut replacement_envelopes,
+        &mut replacement_events,
+    );
+    drop(replacement);
+    thread::sleep(Duration::from_millis(200));
+    assert!(
+        replacement_events.iter().all(|event| {
+            !matches!(
+                event,
+                botster_hub_client::DaemonEvent::TerminalSubscriptionClosed { .. }
+            )
+        }),
+        "connection death must not emit TerminalSubscriptionClosed"
+    );
+    shutdown_short_lived_session(&endpoint, "cdn-session");
+    shutdown_short_lived_session(&endpoint, "cdn-death");
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn process_exit_and_shutdown_session_do_not_emit_terminal_subscription_closed() {
+    let _guard = daemon_test_guard();
+    let hub = start_isolated_live_output_hub("pex");
+    let (mut stream, mut reader) = unix_adapter_connection(hub.endpoint());
+    let mut envelopes = Vec::new();
+    let mut events = Vec::new();
+    spawn_and_bind(
+        &mut stream,
+        &mut reader,
+        "pex-exit",
+        "sub-exit",
+        "printf 'done\\n'",
+        &mut envelopes,
+        &mut events,
+    );
+    spawn_and_bind(
+        &mut stream,
+        &mut reader,
+        "pex-shutdown",
+        "sub-shutdown",
+        "sleep 30",
+        &mut envelopes,
+        &mut events,
+    );
+    thread::sleep(Duration::from_secs(1));
+    let shutdown = request_collecting_mux(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::ShutdownSession {
+            session_id: "pex-shutdown".to_string(),
+        },
+        &mut envelopes,
+        &mut events,
+    );
+    assert_ne!(
+        shutdown.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError
+    );
+    let listed = request_collecting_mux(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::ListSessions,
+        &mut envelopes,
+        &mut events,
+    );
+    let _ = listed;
+    assert!(
+        events.iter().all(|event| {
+            !matches!(
+                event,
+                botster_hub_client::DaemonEvent::TerminalSubscriptionClosed { .. }
+            )
+        }),
+        "process exit and ShutdownSession must stay on lifecycle paths: {events:?}"
+    );
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn stale_generation_close_does_not_sweep_replacement_owner() {
+    let _guard = daemon_test_guard();
+    let hub = start_isolated_live_output_hub("sgo");
+    let endpoint = hub.endpoint().clone();
+    let (mut owner_a, mut reader_a) = unix_adapter_connection(&endpoint);
+    let mut envelopes_a = Vec::new();
+    let mut events_a = Vec::new();
+    spawn_and_bind(
+        &mut owner_a,
+        &mut reader_a,
+        "sgo-session",
+        "sgo-sub",
+        "while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
+        &mut envelopes_a,
+        &mut events_a,
+    );
+
+    let (mut owner_b, mut reader_b) = unix_adapter_connection(&endpoint);
+    let mut envelopes_b = Vec::new();
+    let mut events_b = Vec::new();
+    let attach_b = request_collecting_mux(
+        &mut owner_b,
+        &mut reader_b,
+        &botster_hub_client::DaemonRequest::Attach {
+            session_id: "sgo-session".to_string(),
+            subscription_id: "sgo-sub".to_string(),
+        },
+        &mut envelopes_b,
+        &mut events_b,
+    );
+    assert_eq!(attach_b.kind, botster_hub_client::DaemonResponseKind::Events);
+    assert!(
+        !attach_b.events.iter().any(|event| matches!(
+            event,
+            botster_hub_client::DaemonEvent::AttachState { state, .. }
+                if state == botster_hub_client::ATTACH_STATE_ATTACH_FAILED
+        )),
+        "replacement owner B must bind: {:?}",
+        attach_b.events
+    );
+    assert!(
+        wait_for_subscription_closed(
+            &mut owner_a,
+            &mut reader_a,
+            "sgo-session",
+            "sgo-sub",
+            &mut envelopes_a,
+            &mut events_a,
+        ),
+        "A must observe TerminalSubscriptionClosed for generation N: {events_a:?}"
+    );
+    let closed_generation = events_a.iter().find_map(|event| match event {
+        botster_hub_client::DaemonEvent::TerminalSubscriptionClosed {
+            generation,
+            session_id,
+            ..
+        } if session_id == "sgo-session" => Some(*generation),
+        _ => None,
+    });
+    assert_eq!(closed_generation, Some(1));
+
+    request_collecting_mux(
+        &mut owner_b,
+        &mut reader_b,
+        &botster_hub_client::DaemonRequest::SendInput {
+            session_id: "sgo-session".to_string(),
+            data: "after-replace\r".to_string(),
+        },
+        &mut envelopes_b,
+        &mut events_b,
+    );
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline
+        && !unix_envelope_contains_live_bytes(&envelopes_b, "echo:after-replace")
+    {
+        let drain = request_collecting_mux(
+            &mut owner_b,
+            &mut reader_b,
+            &botster_hub_client::DaemonRequest::drain_subscription("sgo-session", "sgo-sub"),
+            &mut envelopes_b,
+            &mut events_b,
+        );
+        assert!(
+            drain
+                .events
+                .iter()
+                .all(|event| !event_is_terminal_body(event)),
+            "B's scoped Drain must stay bound after A's stale close: {:?}",
+            drain.events
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        unix_envelope_contains_live_bytes(&envelopes_b, "echo:after-replace"),
+        "generation N+1 must stay owned after N closed: {envelopes_b:?}"
+    );
+    drop(owner_a);
+    shutdown_short_lived_session(&endpoint, "sgo-session");
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn terminal_subscription_closed_feature_does_not_raise_default_requirement() {
+    let requirement = botster_hub_client::DaemonCompatibilityRequirement::current();
+    let mut previous = botster_hub_client::DaemonCompatibility::current();
+    previous.features.retain(|feature| {
+        feature != botster_hub_client::FEATURE_TERMINAL_SUBSCRIPTION_CLOSED
+    });
+    previous.conformance_fixture_revision =
+        botster_hub_client::DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION;
+    botster_hub_client::ensure_compatible(&requirement, &previous)
+        .expect("default clients still accept a daemon without terminal_subscription_closed");
+    assert_eq!(botster_hub_client::CONFORMANCE_FIXTURE_REVISION, 40);
+    assert_eq!(
+        botster_hub_client::DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION,
+        36
+    );
 }

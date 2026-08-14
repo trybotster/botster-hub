@@ -71,7 +71,7 @@ impl AttachStream {
 
     fn close_adapter(&mut self) {
         if let Some(adapter) = self.adapter.take() {
-            adapter.close();
+            adapter.close_from_host();
         }
         self.adapter_bound = false;
     }
@@ -374,10 +374,17 @@ pub(crate) fn initial_attaching_only(events: &[DaemonEvent]) -> bool {
 
 pub(crate) fn negotiated_unix_capability_set(
     required_features: &[String],
+    terminal_requirement: Option<&botster_terminal_protocol::TerminalCompatibilityRequirement>,
 ) -> Result<TerminalCapabilitySet, botster_core::TerminalCapabilitySetError> {
     let include_snapshot = required_features
         .iter()
-        .any(|feature| feature == FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY);
+        .any(|feature| feature == FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY)
+        || terminal_requirement.is_some_and(|requirement| {
+            requirement
+                .required_features
+                .iter()
+                .any(|feature| feature == FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY)
+        });
     let tokens: Vec<String> = TerminalCompatibility::current()
         .features
         .into_iter()
@@ -460,7 +467,7 @@ pub(crate) struct UnixBindRequest<'a> {
     pub client_id: &'a str,
     pub session_id: &'a str,
     pub subscription_id: &'a str,
-    pub required_features: &'a [String],
+    pub capabilities: TerminalCapabilitySet,
     pub now_seconds: u64,
     pub mux: Option<&'a UnixConnectionMux>,
 }
@@ -488,20 +495,7 @@ pub(crate) fn bind_unix_adapter_after_attaching(
         ));
     };
     registry.record_generation(request.session_id, request.subscription_id, generation);
-    let capabilities = match negotiated_unix_capability_set(request.required_features) {
-        Ok(capabilities) => capabilities,
-        Err(_) => {
-            return Err(fail_closed_pre_bind_attach(
-                registry,
-                runtime,
-                request.client_id,
-                request.session_id,
-                request.subscription_id,
-                request.now_seconds,
-                None,
-            ));
-        }
-    };
+    let capabilities = request.capabilities.clone();
     let (adapter, handle) = match request.mux {
         Some(mux) => mux.create_adapter(),
         None => UnixTerminalAdapter::pair(),
@@ -537,6 +531,7 @@ pub(crate) fn bind_unix_adapter_after_attaching(
         mux.register(
             request.session_id.to_string(),
             request.subscription_id.to_string(),
+            generation.0,
             handle.clone(),
         );
     }
@@ -724,15 +719,25 @@ mod tests {
 
     #[test]
     fn capability_intersection_includes_snapshot_only_when_hello_requires_it() {
-        let without = negotiated_unix_capability_set(&[FEATURE_UNIX_TERMINAL_ADAPTER.to_string()])
-            .expect("advertised tokens");
+        let without =
+            negotiated_unix_capability_set(&[FEATURE_UNIX_TERMINAL_ADAPTER.to_string()], None)
+                .expect("advertised tokens");
         assert!(!without.contains(FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY));
-        let with = negotiated_unix_capability_set(&[
-            FEATURE_UNIX_TERMINAL_ADAPTER.to_string(),
-            FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY.to_string(),
-        ])
+        let with = negotiated_unix_capability_set(
+            &[
+                FEATURE_UNIX_TERMINAL_ADAPTER.to_string(),
+                FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY.to_string(),
+            ],
+            None,
+        )
         .expect("advertised tokens");
         assert!(with.contains(FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY));
+        let from_terminal = negotiated_unix_capability_set(
+            &[FEATURE_UNIX_TERMINAL_ADAPTER.to_string()],
+            Some(&botster_terminal_protocol::TerminalCompatibilityRequirement::for_ready_then_history_attach()),
+        )
+        .expect("terminal requirement tokens");
+        assert!(from_terminal.contains(FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY));
     }
 
     #[test]

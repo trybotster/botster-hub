@@ -161,6 +161,16 @@ fn fast_exit_attach_diagnostic_records_subscription_event_order() {
                 botster_hub_client::DaemonEvent::WorktreeLifecycle { .. } => {
                     "worktree_lifecycle".to_string()
                 }
+                botster_hub_client::DaemonEvent::TerminalSubscriptionClosed {
+                    session_id: event_session_id,
+                    subscription_id: event_subscription_id,
+                    generation,
+                    reason,
+                } => {
+                    format!(
+                        "terminal_subscription_closed:session={event_session_id}:subscription={event_subscription_id}:generation={generation}:reason={reason}"
+                    )
+                }
             };
             response_observations.push(observation.clone());
             ordered_observations.push(format!(
@@ -301,6 +311,14 @@ fn fast_exit_attach_diagnostic_records_subscription_event_order() {
                     ),
                     botster_hub_client::DaemonEvent::WorktreeLifecycle { .. } => println!(
                         "fast_exit_attach_tail_event elapsed_us={elapsed_us} response={response_index} event={event_index} type=worktree_lifecycle session=none subscription=none bytes=0"
+                    ),
+                    botster_hub_client::DaemonEvent::TerminalSubscriptionClosed {
+                        session_id: event_session_id,
+                        subscription_id: event_subscription_id,
+                        generation,
+                        reason,
+                    } => println!(
+                        "fast_exit_attach_tail_event elapsed_us={elapsed_us} response={response_index} event={event_index} type=terminal_subscription_closed session={event_session_id} subscription={event_subscription_id} generation={generation} reason={reason} bytes=0"
                     ),
                 }
             }
@@ -2807,6 +2825,7 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
             &botster_hub_client::DaemonHello {
                 protocol: botster_hub_client::PROTOCOL.to_string(),
                 compatibility: botster_hub_client::DaemonCompatibilityRequirement::current(),
+                terminal_compatibility: None,
             },
         )
         .expect("write pressure-fixture hello");
@@ -3163,6 +3182,7 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
         &botster_hub_client::DaemonHello {
             protocol: botster_hub_client::PROTOCOL.to_string(),
             compatibility: botster_hub_client::DaemonCompatibilityRequirement::current(),
+            terminal_compatibility: None,
         },
     )
     .expect("write malformed-client hello");
@@ -3192,6 +3212,7 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
         &botster_hub_client::DaemonHello {
             protocol: botster_hub_client::PROTOCOL.to_string(),
             compatibility: botster_hub_client::DaemonCompatibilityRequirement::current(),
+            terminal_compatibility: None,
         },
     )
     .expect("write incomplete-client hello");
@@ -3869,6 +3890,7 @@ fn external_hub_client_reports_compatibility_descriptor_and_mismatch_diagnostics
         &botster_hub_client::DaemonHello {
             protocol: botster_hub_client::PROTOCOL.to_string(),
             compatibility: botster_hub_client::DaemonCompatibilityRequirement::current(),
+            terminal_compatibility: None,
         },
     )
     .expect("write hello");
