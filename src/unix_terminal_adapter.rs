@@ -416,12 +416,18 @@ impl UnixConnectionMux {
         count
     }
 
-    pub(crate) fn take_pending_events(&self) -> Vec<DaemonEvent> {
+    pub(crate) fn pop_pending_event(&self) -> Option<DaemonEvent> {
         self.inner
             .pending_events
             .lock()
-            .map(|mut pending| pending.drain(..).collect())
-            .unwrap_or_default()
+            .ok()
+            .and_then(|mut pending| {
+                if pending.is_empty() {
+                    None
+                } else {
+                    Some(pending.remove(0))
+                }
+            })
     }
 
     pub(crate) fn has_unsent_mux_writes(&self) -> bool {
@@ -431,18 +437,6 @@ impl UnixConnectionMux {
             .lock()
             .is_ok_and(|pending| !pending.is_empty());
         pending || !self.snapshot_writes().is_empty()
-    }
-
-    pub(crate) fn prepend_pending_events(&self, events: Vec<DaemonEvent>) {
-        if events.is_empty() {
-            return;
-        }
-        if let Ok(mut pending) = self.inner.pending_events.lock() {
-            let mut rest = pending.split_off(0);
-            pending.extend(events);
-            pending.append(&mut rest);
-        }
-        self.inner.notify.notify_waiters();
     }
 
     pub(crate) fn snapshot_writes(

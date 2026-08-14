@@ -6,11 +6,11 @@
 | --- | --- |
 | Target repository | `botster-hub` (`trybotster/botster-hub`) |
 | `target_id` | `tgt_7e208a0c76a44980a83b63af976b1f22` |
-| Authoritative spawn target | `botster-hub` → `/Users/jasonconigliari/Projects/botster-hub` |
-| Pipeline worktree | `/Users/jasonconigliari/botster-sessions/trybotster-botster-hub-project-pipelines-ticket_1786705502_228757` |
+| Authoritative spawn target | `botster-hub` |
+| Pipeline worktree | the pipeline-provided ticket worktree |
 | Ticket | `ticket_1786705502_228757` |
 | Run | `run_1786705508_262530` |
-| Step | `botster_stack_implement` (`run_step_1786707159_147666`) |
+| Step | `botster_stack_implement` (`run_step_1786710108_556857`) |
 | Approved plan | `docs/plans/split-hello-terminal-compatibility-and-emit-terminal-subscription-closed.md` revision 2 |
 | Human answer | `question_1786705427_821834` chose **1B** |
 | Merge policy | direct into `main`; do not create a PR |
@@ -127,6 +127,7 @@ Unix `try_write` still serializes opaque `TerminalFrame` bytes only. Close obser
 2. Same-connection re-attach of one subscription fail-closes (`attach_failed`) because Core reuses the live generation for the same client. Host-close emit is proved by re-attaching one of two sessions on the same connection. Replacement-owner proof uses two connections: B attaches the same key, Core hard-stops A, A receives `TerminalSubscriptionClosed` for generation 1, B stays bound.
 3. IsolatedHub cannot call `list_terminal_subscriptions`. Mismatched Hello then Attach is proved by `OperatorError` before `start_attach`, no `AttachFailed`, no adapter envelopes, and Status still succeeding.
 4. `packages/hub-test-support/test.mjs` was not executed as a Node process because `@trybotster/ui-contract` is not installed in that package directory. Rust `botster-hub-test-support` tests, including node-package copy equality, passed.
+5. Review `review_1786710092_413915` required three high fixes: resumable mux writes, suppress-after-success, and path-neutral report wording. Those are in this revision.
 
 No accepted product-scope change. The committed plan's acceptance checks remain the contract.
 
@@ -152,6 +153,12 @@ Repo wrapper is `./test.sh` (`BOTSTER_ENV=test cargo test --workspace`).
 
 Full workspace `./test.sh --offline` passed (exit 0), including `hub_daemon_lifecycle_test` (185 tests), installer, capability, client API, and crate doctests.
 
+Review-loop tests added:
+
+- `daemon_transport::mux_write_resume_tests::resumable_mux_write_keeps_offset_and_emits_one_valid_frame`
+- `daemon_transport::mux_write_resume_tests::resumable_mux_write_does_not_start_a_second_frame_while_first_is_pending`
+- `failed_remove_session_does_not_suppress_later_core_close`
+
 ### Production entry points
 
 - Hello: `handle_connection_async` writes `DaemonHelloAck` with `Some(TerminalCompatibility::current())` and registers `UnixTerminalAdmission`.
@@ -163,17 +170,17 @@ IsolatedHub launches `CARGO_BIN_EXE_botster-hub`. Locked Core worker remains `f4
 
 ### Downstream proof
 
-TUI scratch worktree `/tmp/botster-tui-hello-closed-scratch` at `5d2af28`, `CARGO_TARGET_DIR=/tmp/botster-tui-hello-closed-target`, `[patch]` to this worktree's `botster-hub-client` and `botster-ui-contract`:
+TUI scratch worktree at `5d2af28`, isolated Cargo target dir, `[patch]` to this ticket worktree's `botster-hub-client` and `botster-ui-contract`:
 
 - `cargo check --workspace` exit 0
 - `cargo check --workspace --all-targets` exit 0
 
 This TUI revision has no Hello struct literals or exhaustive `DaemonEvent` matches that break. First-party attach consumption remains TUI ticket `ticket_1786661009_551067`.
 
-Web scratch worktree `/tmp/botster-web-hello-closed-scratch` at `e2c3192`:
+Web scratch worktree at `e2c3192`:
 
 ```sh
-BOTSTER_HUB_CLIENT_DAEMON_PROTOCOL=<hub-worktree>/crates/botster-hub-client/generated/daemon-protocol.ts \
+BOTSTER_HUB_CLIENT_DAEMON_PROTOCOL=/path/to/botster-hub/crates/botster-hub-client/generated/daemon-protocol.ts \
   npm test
 ```
 

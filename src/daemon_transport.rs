@@ -87,7 +87,7 @@ use crate::maintenance::{
 };
 use crate::packages::{PackageResolvedEntrypointLaunch, resolve_entrypoint_launch_contract};
 use crate::source_update::{current_update_execution, mark_update_failed, start_update_handoff};
-use crate::unix_terminal_adapter::UnixConnectionMux;
+use crate::unix_terminal_adapter::{UnixConnectionMux, UnixTerminalAdapterHandle};
 use crate::{
     AvailablePackage, AvailablePackageState, FileHubStateStore, HubClientApi,
     HubClientCaptureSnapshot, HubClientEvent, HubClientModeFlags, HubClientPackage,
@@ -458,6 +458,7 @@ async fn handle_connection_async(
     }
     cleanup.set_reason(ConnectionTerminalReason::Eof);
 
+    let mut mux_write = MuxWriteState::default();
     let mux = match &admission {
         UnixTerminalAdmission::Admitted { mux, .. } => mux.clone(),
         UnixTerminalAdmission::Rejected { .. } => UnixConnectionMux::new(),
@@ -474,15 +475,15 @@ async fn handle_connection_async(
         let request = tokio::select! {
             request = read_async_frame::<DaemonRequest, _>(&mut reader, None) => request,
             _ = mux.notify().notified() => {
-                if let Err(error) = flush_unix_mux_writes(&mut write_half, &mux).await {
+                if let Err(error) = flush_unix_mux_writes(&mut write_half, &mux, &mut mux_write).await {
                     cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
                     mux.close_all();
                     return Err(error);
                 }
                 continue;
             }
-            _ = tokio::time::sleep(Duration::from_millis(25)), if mux.has_unsent_mux_writes() => {
-                if let Err(error) = flush_unix_mux_writes(&mut write_half, &mux).await {
+            _ = tokio::time::sleep(Duration::from_millis(25)), if mux.has_unsent_mux_writes() || mux_write.has_pending() => {
+                if let Err(error) = flush_unix_mux_writes(&mut write_half, &mux, &mut mux_write).await {
                     cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
                     mux.close_all();
                     return Err(error);
@@ -560,7 +561,7 @@ async fn handle_connection_async(
             mux.close_all();
             return Err(error);
         }
-        if let Err(error) = flush_unix_mux_writes(&mut write_half, &mux).await {
+        if let Err(error) = flush_unix_mux_writes(&mut write_half, &mux, &mut mux_write).await {
             cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
             mux.close_all();
             return Err(error);
@@ -572,29 +573,37 @@ async fn handle_connection_async(
     }
 }
 
+#[derive(Default)]
+struct MuxWriteState {
+    pending: Option<PendingMuxFrame>,
+}
+
+impl MuxWriteState {
+    fn has_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+}
+
+struct PendingMuxFrame {
+    bytes: Vec<u8>,
+    offset: usize,
+    complete_envelope: Option<UnixTerminalAdapterHandle>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum MuxWrite {
+    Written,
+    Pending,
+}
+
 async fn flush_unix_mux_writes(
     writer: &mut (impl tokio::io::AsyncWrite + Unpin),
     mux: &UnixConnectionMux,
+    write_state: &mut MuxWriteState,
 ) -> DaemonTransportResult<()> {
-    flush_unix_adapter_envelopes(writer, mux).await?;
-    let events = mux.take_pending_events();
-    let mut unsent = Vec::new();
-    for event in events {
-        match write_async_frame_nowait(writer, &event).await? {
-            MuxWrite::Written => {}
-            MuxWrite::Pending => unsent.push(event),
-        }
+    if resume_pending_mux_write(writer, write_state).await? == MuxWrite::Pending {
+        return Ok(());
     }
-    if !unsent.is_empty() {
-        mux.prepend_pending_events(unsent);
-    }
-    Ok(())
-}
-
-async fn flush_unix_adapter_envelopes(
-    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
-    mux: &UnixConnectionMux,
-) -> DaemonTransportResult<()> {
     for (session_id, subscription_id, handle, bytes) in mux.snapshot_writes() {
         if handle.is_closed() {
             continue;
@@ -604,36 +613,225 @@ async fn flush_unix_adapter_envelopes(
             subscription_id,
             &bytes,
         );
-        match write_async_frame_nowait(writer, &envelope).await? {
-            MuxWrite::Written => {
-                if !handle.is_closed() {
-                    let _ = handle.complete_active();
-                }
-            }
-            MuxWrite::Pending => break,
+        write_state.pending = Some(serialize_pending_frame(&envelope, Some(handle))?);
+        if resume_pending_mux_write(writer, write_state).await? == MuxWrite::Pending {
+            return Ok(());
+        }
+    }
+    while let Some(event) = mux.pop_pending_event() {
+        write_state.pending = Some(serialize_pending_frame(&event, None)?);
+        if resume_pending_mux_write(writer, write_state).await? == MuxWrite::Pending {
+            return Ok(());
         }
     }
     Ok(())
 }
 
-enum MuxWrite {
-    Written,
-    Pending,
-}
-
-async fn write_async_frame_nowait<T>(
-    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+fn serialize_pending_frame<T: serde::Serialize>(
     frame: &T,
-) -> DaemonTransportResult<MuxWrite>
-where
-    T: serde::Serialize,
-{
+    complete_envelope: Option<UnixTerminalAdapterHandle>,
+) -> DaemonTransportResult<PendingMuxFrame> {
     let mut bytes = serde_json::to_vec(frame).map_err(DaemonTransportError::Json)?;
     bytes.push(b'\n');
-    match tokio::time::timeout(Duration::from_millis(50), writer.write_all(&bytes)).await {
-        Ok(Ok(())) => Ok(MuxWrite::Written),
-        Ok(Err(error)) => Err(DaemonTransportError::Io(error)),
-        Err(_) => Ok(MuxWrite::Pending),
+    Ok(PendingMuxFrame {
+        bytes,
+        offset: 0,
+        complete_envelope,
+    })
+}
+
+async fn resume_pending_mux_write(
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+    write_state: &mut MuxWriteState,
+) -> DaemonTransportResult<MuxWrite> {
+    let Some(pending) = write_state.pending.as_mut() else {
+        return Ok(MuxWrite::Written);
+    };
+    match write_frame_bytes_resumable(writer, pending).await? {
+        MuxWrite::Written => {
+            if let Some(handle) = write_state
+                .pending
+                .take()
+                .and_then(|pending| pending.complete_envelope)
+                && !handle.is_closed()
+            {
+                let _ = handle.complete_active();
+            }
+            Ok(MuxWrite::Written)
+        }
+        MuxWrite::Pending => Ok(MuxWrite::Pending),
+    }
+}
+
+async fn write_frame_bytes_resumable(
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+    pending: &mut PendingMuxFrame,
+) -> DaemonTransportResult<MuxWrite> {
+    while pending.offset < pending.bytes.len() {
+        match tokio::time::timeout(
+            Duration::from_millis(50),
+            writer.write(&pending.bytes[pending.offset..]),
+        )
+        .await
+        {
+            Ok(Ok(0)) => {
+                return Err(DaemonTransportError::Io(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "unix mux write returned zero bytes",
+                )));
+            }
+            Ok(Ok(written)) => pending.offset += written,
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                return Ok(MuxWrite::Pending);
+            }
+            Ok(Err(error)) => return Err(DaemonTransportError::Io(error)),
+            Err(_) => return Ok(MuxWrite::Pending),
+        }
+    }
+    Ok(MuxWrite::Written)
+}
+
+#[cfg(test)]
+mod mux_write_resume_tests {
+    use super::{MuxWrite, PendingMuxFrame, write_frame_bytes_resumable};
+    use botster_hub_client::{
+        DaemonEvent, TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER, parse_unix_mux_value,
+    };
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::AsyncWrite;
+
+    struct PrefixStallWriter {
+        written: Vec<u8>,
+        stall_after: usize,
+        allow_remainder: bool,
+    }
+
+    impl AsyncWrite for PrefixStallWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            let room = this.stall_after.saturating_sub(this.written.len());
+            if room == 0 && !this.allow_remainder {
+                return Poll::Pending;
+            }
+            let take = if this.allow_remainder {
+                buf.len()
+            } else {
+                room.min(buf.len())
+            };
+            if take == 0 {
+                return Poll::Pending;
+            }
+            this.written.extend_from_slice(&buf[..take]);
+            Poll::Ready(Ok(take))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn closed_event() -> DaemonEvent {
+        DaemonEvent::TerminalSubscriptionClosed {
+            session_id: "session".to_string(),
+            subscription_id: "sub".to_string(),
+            generation: 2,
+            reason: TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER.to_string(),
+        }
+    }
+
+    fn frame_bytes(event: &DaemonEvent) -> Vec<u8> {
+        let mut bytes = serde_json::to_vec(event).expect("serialize");
+        bytes.push(b'\n');
+        bytes
+    }
+
+    #[tokio::test]
+    async fn resumable_mux_write_keeps_offset_and_emits_one_valid_frame() {
+        let event = closed_event();
+        let expected = frame_bytes(&event);
+        let prefix = 8.min(expected.len() - 1);
+        let mut writer = PrefixStallWriter {
+            written: Vec::new(),
+            stall_after: prefix,
+            allow_remainder: false,
+        };
+        let mut pending = PendingMuxFrame {
+            bytes: expected.clone(),
+            offset: 0,
+            complete_envelope: None,
+        };
+
+        let result = write_frame_bytes_resumable(&mut writer, &mut pending).await;
+        assert!(matches!(result, Ok(MuxWrite::Pending)));
+        assert_eq!(pending.offset, prefix);
+        assert_eq!(writer.written, expected[..prefix]);
+
+        writer.allow_remainder = true;
+        let second = write_frame_bytes_resumable(&mut writer, &mut pending)
+            .await
+            .expect("resume write");
+        assert!(matches!(second, MuxWrite::Written));
+        assert_eq!(writer.written, expected);
+        assert_eq!(
+            writer.written.iter().filter(|byte| **byte == b'\n').count(),
+            1
+        );
+        let line = std::str::from_utf8(&writer.written)
+            .expect("utf8")
+            .trim_end();
+        let parsed = parse_unix_mux_value(serde_json::from_str(line).expect("json"))
+            .expect("classify mux frame");
+        match parsed {
+            botster_hub_client::DaemonUnixMuxFrame::Event(
+                DaemonEvent::TerminalSubscriptionClosed {
+                    session_id,
+                    generation,
+                    reason,
+                    ..
+                },
+            ) => {
+                assert_eq!(session_id, "session");
+                assert_eq!(generation, 2);
+                assert_eq!(reason, TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER);
+            }
+            other => panic!("expected one close event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resumable_mux_write_does_not_start_a_second_frame_while_first_is_pending() {
+        let first_bytes = frame_bytes(&closed_event());
+        let second_bytes = frame_bytes(&DaemonEvent::TerminalSubscriptionClosed {
+            session_id: "other".to_string(),
+            subscription_id: "sub-2".to_string(),
+            generation: 3,
+            reason: TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER.to_string(),
+        });
+        let mut writer = PrefixStallWriter {
+            written: Vec::new(),
+            stall_after: 4,
+            allow_remainder: false,
+        };
+        let mut pending = PendingMuxFrame {
+            bytes: first_bytes.clone(),
+            offset: 0,
+            complete_envelope: None,
+        };
+        let result = write_frame_bytes_resumable(&mut writer, &mut pending).await;
+        assert!(matches!(result, Ok(MuxWrite::Pending)));
+        assert_eq!(writer.written, first_bytes[..4]);
+        assert_ne!(writer.written, [first_bytes.clone(), second_bytes].concat());
+        assert_eq!(pending.bytes, first_bytes);
     }
 }
 
@@ -2072,7 +2270,6 @@ fn handle_runtime_control_request(
             ))
         }
         DaemonRequest::RemoveSession { session_id } => {
-            suppress_unix_session_close_events(pending_runtime, &session_id);
             let response = api.handle_request(
                 runtime,
                 &packages,
@@ -2091,6 +2288,7 @@ fn handle_runtime_control_request(
                     "session must be terminal before it can be removed",
                 ));
             }
+            suppress_unix_session_close_events(pending_runtime, &session_id);
             Ok(daemon_response_base(DaemonResponseKind::SessionRemoved))
         }
         DaemonRequest::Status => {
@@ -2236,22 +2434,14 @@ fn handle_runtime_control_request(
             let now = tick(logical_clock);
             let tracked_session_id = session_id.clone();
             let tracked_subscription_id = subscription_id.clone();
-            if let Some(client_id) = observability.client_id
-                && let Some(UnixTerminalAdmission::Admitted { mux, .. }) =
-                    pending_runtime.unix_admissions.get(client_id)
-                && let Some(generation) = live_generation_for_route(
+            let generation = observability.client_id.and_then(|client_id| {
+                live_generation_for_route(
                     &runtime.list_terminal_subscriptions(),
                     client_id,
                     &tracked_session_id,
                     &tracked_subscription_id,
                 )
-            {
-                mux.suppress_generation(
-                    tracked_session_id.clone(),
-                    tracked_subscription_id.clone(),
-                    generation.0,
-                );
-            }
+            });
             let response = api.handle_request(
                 runtime,
                 &packages,
@@ -2262,6 +2452,17 @@ fn handle_runtime_control_request(
                     now_seconds: now,
                 },
             )?;
+            if let Some(client_id) = observability.client_id
+                && let Some(UnixTerminalAdmission::Admitted { mux, .. }) =
+                    pending_runtime.unix_admissions.get(client_id)
+                && let Some(generation) = generation
+            {
+                mux.suppress_generation(
+                    tracked_session_id.clone(),
+                    tracked_subscription_id.clone(),
+                    generation.0,
+                );
+            }
             pending_runtime.close_adapter(&tracked_session_id, &tracked_subscription_id);
             pending_runtime.cancel_stream(&tracked_session_id, &tracked_subscription_id);
             events_response(response.body)
@@ -2327,7 +2528,6 @@ fn handle_runtime_control_request(
         }
         DaemonRequest::ShutdownSession { session_id } => {
             let now = tick(logical_clock);
-            suppress_unix_session_close_events(pending_runtime, &session_id);
             match classify_shutdown_session(runtime, &session_id)? {
                 ShutdownSessionClassification::Active => {}
                 ShutdownSessionClassification::Cleanup(cleanup) => {
@@ -2350,6 +2550,7 @@ fn handle_runtime_control_request(
                 Ok(response) => response,
                 Err(error) => {
                     if shutdown_error_is_unknown_session(&error) {
+                        suppress_unix_session_close_events(pending_runtime, &session_id);
                         return Ok(daemon_session_cleanup(DaemonSessionCleanup {
                             session_id: session_id.clone(),
                             outcome: "already_exited".to_string(),
@@ -2357,9 +2558,11 @@ fn handle_runtime_control_request(
                     }
                     return match classify_shutdown_session(runtime, &session_id)? {
                         ShutdownSessionClassification::Cleanup(cleanup) => {
+                            suppress_unix_session_close_events(pending_runtime, &session_id);
                             Ok(daemon_session_cleanup(cleanup))
                         }
                         ShutdownSessionClassification::Missing => {
+                            suppress_unix_session_close_events(pending_runtime, &session_id);
                             Ok(daemon_unknown_session_cleanup(&session_id))
                         }
                         ShutdownSessionClassification::Active => {
@@ -2368,6 +2571,7 @@ fn handle_runtime_control_request(
                     };
                 }
             };
+            suppress_unix_session_close_events(pending_runtime, &session_id);
             events_response(response.body)
         }
         DaemonRequest::Drain {

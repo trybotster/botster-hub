@@ -1154,6 +1154,64 @@ fn core_write_budget_hard_stop_emits_core_adapter_closed() {
 }
 
 #[test]
+fn failed_remove_session_does_not_suppress_later_core_close() {
+    let _guard = daemon_test_guard();
+    let hub = start_isolated_live_output_hub("frm");
+    let (mut stream, mut reader) = unix_adapter_connection(hub.endpoint());
+    let mut envelopes = Vec::new();
+    let mut events = Vec::new();
+    spawn_and_bind(
+        &mut stream,
+        &mut reader,
+        "frm-stall",
+        "sub-stall",
+        "yes remove-session-still-live",
+        &mut envelopes,
+        &mut events,
+    );
+    let removed = request_collecting_mux(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::RemoveSession {
+            session_id: "frm-stall".to_string(),
+        },
+        &mut envelopes,
+        &mut events,
+    );
+    assert_eq!(
+        removed.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError
+    );
+    assert_eq!(
+        removed.error.as_ref().map(|error| error.code.as_str()),
+        Some("session_not_terminal")
+    );
+    thread::sleep(Duration::from_secs(2));
+    assert!(
+        wait_for_subscription_closed(
+            &mut stream,
+            &mut reader,
+            "frm-stall",
+            "sub-stall",
+            &mut envelopes,
+            &mut events,
+        ),
+        "failed RemoveSession must not suppress later Core hard-stop: {events:?}"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        botster_hub_client::DaemonEvent::TerminalSubscriptionClosed {
+            session_id,
+            reason,
+            ..
+        } if session_id == "frm-stall"
+            && reason == botster_hub_client::TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER
+    )));
+    shutdown_short_lived_session(hub.endpoint(), "frm-stall");
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
 fn connection_death_and_detach_do_not_emit_terminal_subscription_closed() {
     let _guard = daemon_test_guard();
     let hub = start_isolated_live_output_hub("cdn");
