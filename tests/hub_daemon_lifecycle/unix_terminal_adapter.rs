@@ -527,6 +527,11 @@ fn unix_adapter_stale_disconnect_does_not_cancel_replacement_owner() {
         }
         thread::sleep(Duration::from_millis(20));
     }
+    assert_eq!(
+        after.cleanup_completed.saturating_sub(before.cleanup_completed),
+        1,
+        "A's disconnect must complete Hub cleanup exactly once before sibling-survival checks: before={before:?} after={after:?}"
+    );
     let stale_closes = after
         .cleanup_by_reason
         .get("bound_adapter_close")

@@ -10,7 +10,7 @@
 | Pipeline worktree | this run's Hub worktree |
 | Ticket | `ticket_1786661008_634435` |
 | Run | `run_1786681880_322827` |
-| Step | `botster_stack_implement` (`run_step_1786701773_868027`, Review-loop 5) |
+| Step | `botster_stack_implement` (`run_step_1786702661_447775`, Review-loop 6) |
 | Approved plan | `docs/plans/bind-content-blind-unix-terminal-adapters-at-admission.md` revision 6 |
 | Merge policy | direct (no PR) |
 | Locked Core SHA | `f4f6bf5babe92dfb9241a760c414187f711c2c42` |
@@ -133,6 +133,7 @@ Plan acceptance checks that remain true: bind only when Hello requires the featu
 | Stale connection-bound keys can cancel a replacement owner | Ledger entries store session, subscription, and generation. `cancel_stream` forgets the key on Detach, replacement Attach, reconcile, and fail-closed. Cleanup cancels or Detaches a route only when the current owner and generation still match the closing connection. IsolatedHub: A binds, A detaches and stays connected, B binds the same key, A disconnects, B still receives `echo:after-a-drop`. |
 | Claimed stream_attach conformance path does not call stream_attach | Published conformance stays on `DaemonConnection` Attach + scoped Drain. Docs state that split. `unix_adapter_unbound_stream_attach_returns_late_bytes` calls `botster_hub_client::stream_attach`, produces output after Attached, exits the process, and asserts the helper returns the late bytes and completes. |
 | Live stale-owner test stayed green without ledger guards | Mux envelopes are not the owner oracle. After A disconnects the test asserts `bound_adapter_close` delta is 0, then requires B's scoped Drain to stay free of Snapshot/TerminalOutput/ProcessExit while opaque envelopes continue. `cancel_stream` now closes the adapter so a stale cancel cannot leave Core writing to a dropped Hub route. Ablation: `forget_connection_bound_route` no-op plus `connection_bound_route_still_owned` always true reddens at `A's disconnect must not close B's bound route` (`bound_adapter_close` 1 vs 0). Worktree restored after the probe. |
+| Stale-owner test did not require A cleanup to complete | After A disconnects the test now requires `cleanup_completed` delta 1, then `bound_adapter_close` delta 0, then bound Drain filtering and opaque echo. Guard ablation still reddens at `bound_adapter_close` after `cleanup_completed` advances 1 → 2. |
 
 ## Runtime-teardown lenses implemented
 
@@ -150,7 +151,7 @@ Plan acceptance checks that remain true: bind only when Hello requires the featu
 Commands (all with `BOTSTER_ENV=test`):
 
 - `./test.sh --locked --offline --test hub_daemon_lifecycle_test unix_adapter` — IsolatedHub bind, detach, unbound Snapshot, feature floor
-- IsolatedHub `unix_adapter_stale_disconnect_does_not_cancel_replacement_owner` — after A disconnects, `bound_adapter_close` delta is 0, B's scoped Drain has no terminal bodies, and opaque envelopes still carry `echo:after-a-drop`
+- IsolatedHub `unix_adapter_stale_disconnect_does_not_cancel_replacement_owner` — after A disconnects, `cleanup_completed` delta is 1, `bound_adapter_close` delta is 0, B's scoped Drain has no terminal bodies, and opaque envelopes still carry `echo:after-a-drop`
 - IsolatedHub `unix_adapter_unbound_stream_attach_returns_late_bytes` — public `stream_attach` returns `late-stream-attach` and completes
 - IsolatedHub `unix_adapter_unbound_printf_stream_attach_completes` — `ReadScreen` has the smoke marker; host session stays `running`
 - `fast_exit_attach_diagnostic_records_subscription_event_order` — official diagnostic; `read_screen_marker=true`
