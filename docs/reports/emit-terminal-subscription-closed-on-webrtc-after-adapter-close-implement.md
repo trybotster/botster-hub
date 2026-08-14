@@ -6,7 +6,7 @@
 | --- | --- |
 | Target repository | `botster-hub` (`trybotster/botster-hub`) |
 | `target_id` | `tgt_7e208a0c76a44980a83b63af976b1f22` |
-| Authoritative spawn target | `botster-hub` at `/Users/jasonconigliari/Projects/botster-hub` |
+| Authoritative spawn target | `botster-hub` from `list_spawn_targets` |
 | Pipeline worktree | this run worktree |
 | Ticket | `ticket_1786724303_284888` |
 | Run | `run_1786724337_992334` |
@@ -181,22 +181,27 @@ Results:
 
 Provenance:
 
-- Hub binary realpath: `/Users/jasonconigliari/botster-sessions/trybotster-botster-hub-project-pipelines-ticket_1786724303_284888/target/debug/botster-hub`
-- session-worker realpath: `/Users/jasonconigliari/botster-sessions/trybotster-botster-hub-project-pipelines-ticket_1786724303_284888/target/debug/botster-session-worker`
+- Hub binary realpath: `target/debug/botster-hub` under this run worktree
+- session-worker realpath: `target/debug/botster-session-worker` under this run worktree
 - Integrated Hub SHA before implement commit: `4f30d6952f9a29541ab3a670a54bf5e136b8eb8e`
 - Implement commit: `5bfa3089124a1a979dee6aa89a6586ff882d5a67`
 - Locked Core SHA: `f4f6bf5babe92dfb9241a760c414187f711c2c42`
 
 `./test.sh -p botster-hub-client` ran the workspace wrapper once before IsolatedHub oracle fixes. That run executed Unix and WebRTC lifecycle tests; the three then-failing IsolatedHub oracles are now green under the named commands above. A second full workspace wrapper was not rerun after the README revision-41 fix.
 
-`node packages/hub-test-support/test.mjs` failed because `@trybotster/ui-contract` is not installed in this worktree. `sync-assets.mjs --check` passed through `./test.sh`.
+Review `review_1786733091_328642` returned two findings. This follow-up:
+
+- Updated `packages/hub-test-support/test.mjs` revision asserts 40 → 41 at the four fixture sites.
+- Replaced committed absolute paths in this report with spawn-target and repository-relative paths.
+- `script/production-package-runtime-evidence pii-scan` on the plan and this report: `ok=true`, findings `[]`.
+- `node packages/hub-test-support/test.mjs` with local `@trybotster/ui-contract` installed via `--install-links` into `node_modules`: exit 0 (`hub test-support package import and fixture materialization passed`). `package.json` remains pinned at `@trybotster/ui-contract@0.3.2`.
+- `node packages/hub-test-support/scripts/sync-assets.mjs --check`: exit 0.
 
 ## Unverified behavior or residual risk
 
 - Browser Web decode of `daemon_event` is intentionally unverified here. Web ticket `ticket_1786661008_897067` owns that after publish `ticket_1786730686_674642`.
 - npm publish of `@trybotster/hub-test-support@0.1.36` is not done here.
 - IsolatedHub loopback did reach keep-reading `core_adapter_closed` without a new Hub terminal policy queue. Fast DataChannels may still complete most sends; the production flush path is what the test drives.
-- `node packages/hub-test-support/test.mjs` was not a green local Node install in this worktree.
 
 ## Missing vault guidance discovered
 
