@@ -10,7 +10,7 @@
 | Pipeline worktree | this run's Hub worktree |
 | Ticket | `ticket_1786661008_634435` |
 | Run | `run_1786681880_322827` |
-| Step | `botster_stack_implement` (`run_step_1786687578_189614`) |
+| Step | `botster_stack_implement` (`run_step_1786695601_609679`, Review-loop) |
 | Approved plan | `docs/plans/bind-content-blind-unix-terminal-adapters-at-admission.md` revision 6 |
 | Merge policy | direct (no PR) |
 | Locked Core SHA | `f4f6bf5babe92dfb9241a760c414187f711c2c42` |
@@ -71,18 +71,22 @@ Routing verified independently: `project_pipelines_current_context` ticket/run `
 | `src/unix_terminal_adapter.rs` | Production one-slot adapter, mux, Core harness driver |
 | `src/lib.rs` | Private `unix_terminal_adapter` module |
 | `src/runtime.rs` | `bind_terminal_adapter` / `list_terminal_subscriptions` / `detach_terminal_subscription` facades; `BindTerminalAdapter` error class |
-| `src/daemon_attach_stream.rs` | Generation + bound flags; `#[derive(Default)]`; fail-closed helpers; capability intersection |
-| `src/daemon_transport.rs` | Hello admission, Attach bind sequence, bound Drain filter, bound disconnect close-only, inventory reconcile pump, `RegisterUnixAdmission` |
+| `src/daemon_attach_stream.rs` | Generation + bound flags; `#[derive(Default)]`; fail-closed helpers; capability intersection; `bound_route_keys_for_client` snapshot before close |
+| `src/daemon_transport.rs` | Hello admission, Attach bind sequence, bound Drain filter, bound disconnect close-only, inventory reconcile pump, `RegisterUnixAdmission`; occupancy release on bound EOF |
 | `src/config.rs` | Default fields required by the Core pin |
 | `src/main.rs` | Unbound smoke uses Attach + scoped Drain + `ReadScreen` after the Core pin |
 | `crates/botster-hub-client/src/lib.rs` | Optional feature, mux types, `for_unix_terminal_adapter()`, revision 39 |
 | `crates/botster-hub-client/src/typescript.rs` + generated TS | Feature + envelope types |
 | `docs/client-protocol.md` / `README.md` | Optional Unix adapter plane; revision 39 |
-| `packages/hub-test-support/*` | Version 0.1.33 → 0.1.34; regenerated fixtures |
-| `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs` | IsolatedHub production-path proofs |
-| `tests/hub_daemon_lifecycle/sessions.rs` | Fast-exit diagnostic accepts `ReadScreen` as visible-state proof |
+| `packages/hub-test-support/*` | Version 0.1.33 → 0.1.34; regenerated fixtures; `test.mjs` asserts revision 39 |
+| `crates/botster-hub-test-support/src/lib.rs` | Conformance runner uses one attached connection + `ReadScreen`; matrix includes `unix_terminal_adapter` |
+| `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs` | IsolatedHub production-path proofs; replacement Attach after disconnect is the one-Core-detach proof |
+| `tests/hub_daemon_lifecycle/sessions.rs` | Fast-exit, late-history, mode flags, entity, shutdown consumers use scoped Drain + `ReadScreen` |
+| `tests/hub_daemon_lifecycle/shutdown.rs` | Restart recovery attaches, drains, and reads the screen on the same connection |
+| `tests/hub_daemon_lifecycle/session_fixtures.rs` / `webrtc_proofs.rs` | Shared helpers drain the bound/unbound route before ReadScreen/mode flags; WebRTC uses scoped Drain |
+| `tests/hub_test_support_conformance_test.rs` | Incremental history frames collapse to attaching → history → attached → live |
 | `tests/hub_runtime_test.rs` / `tests/hub_capability_runtime_test.rs` | Scoped drain + `ReadScreen` after Core pin |
-| `docs/plans/bind-content-blind-unix-terminal-adapters-at-admission.md` | Approved revision-6 plan |
+| `docs/plans/bind-content-blind-unix-terminal-adapters-at-admission.md` | Approved revision-6 plan; Authoritative path is spawn-target wording (no user home path) |
 | `docs/reports/bind-content-blind-unix-terminal-adapters-at-admission-implement.md` | This report |
 
 ## Ownership boundaries preserved
@@ -111,6 +115,15 @@ Routing verified independently: `project_pipelines_current_context` ticket/run `
 
 Plan acceptance checks that remain true: bind only when Hello requires the feature; one-frame Attaching exception; fail-closed on any other pre-bind terminal event; bound Drain has no terminal bodies; connection death closes adapter only; explicit Detach is separate; host session stays listed; harness passes; feature is optional.
 
+## Review findings in this Implement loop
+
+| Finding | Resolution |
+| --- | --- |
+| Bound socket death took Hub Detach | Snapshot `bound_route_keys_for_client` before `close_adapters_for_client`. Bound routes close the adapter, cancel the Hub route, and release `live_attach_routes` without `DaemonRequest::Detach`. IsolatedHub replacement Attach after disconnect is the one-Core-detach proof. |
+| Required workspace suite failed | Integrated `origin/main` `d92aace` (stale-peer occupancy). Adapted Core-pin consumers to scoped Drain + `ReadScreen`. `./test.sh --locked` now passes. |
+| `test.mjs` still asserted revision 38 | All four asserts are 39. Clean `npm install --omit=dev` + `npm test` passed. |
+| Plan leaked an absolute user path | Authoritative path is now spawn target `botster-hub`. Leak scan of the plan and report has no user home paths. Known-positive control matched. |
+
 ## Runtime-teardown lenses implemented
 
 | Lens | Implementation |
@@ -133,7 +146,10 @@ Commands (all with `BOTSTER_ENV=test`):
 - `./test.sh --locked --offline --lib unix_terminal` — Core harness + close-without-wait + content-blind source scan
 - `./test.sh --locked --offline -p botster-hub-client unix_terminal` — optional feature does not raise the default requirement
 - `cargo clippy --workspace --all-targets --locked --offline -- -D warnings` — exit 0
-- `./test.sh --locked` — workspace wrapper completed. `hub_daemon_lifecycle_test`: 162 passed, 11 failed, 1 ignored. Failures are Core-pin unbound Drain/ProcessExit/ReadScreen contract changes (listed below), not IsolatedHub Unix-adapter bind proofs. Those 11 still need ReadScreen/`ProcessExit` adaptations or are WebRTC close/mode-flag readiness races after the pin.
+- `cargo fmt --all -- --check` — exit 0
+- Clean `npm install --omit=dev && npm test` in a temp copy of `packages/hub-test-support` — exit 0
+- Plan/report leak scan vs a known-positive absolute home-path control — plan and report have no user home paths
+- `./test.sh --locked` — workspace wrapper exit 0. `hub_daemon_lifecycle_test`: 173 passed, 0 failed, 1 ignored. Other workspace members and doctests passed.
 
 Production entry points:
 
@@ -143,12 +159,11 @@ Production entry points:
 
 ## Unverified behavior or residual risk
 
-- `stream_attach` now restores visible text from `ReadScreen` after Snapshot/`Attached`. It still completes only on `ProcessExit`, `attach_failed`, or host `exited`. A long-running session that never exits still streams. A fast-exit session whose child is already dead during attach may stay attached until the caller detaches; smoke no longer uses that wait.
-- `./test.sh --locked` failed 11 `hub_daemon_lifecycle_test` cases after the required Core pin: missing Drain `TerminalOutput`/`ProcessExit`, empty WebRTC drain bytes, mode-flag `OperatorError` before flags are readable, entity-subscription readiness via retained egress, and restart ReadScreen emptiness. Isolated adapter proofs and daily-commands/smoke no longer hang. These 11 are residual Core-pin consumer adaptations, not missing Unix bind wiring.
+- `stream_attach` now restores visible text from `ReadScreen` after Snapshot/`Attached`. It still completes only on `ProcessExit`, `attach_failed`, or host `exited`. A long-running session that never exits still streams. A fast-exit session whose child is already dead during attach may stay attached until the caller detaches; smoke and published conformance no longer wait on that path.
 - Unexpected pre-bind fail-closed is unit-tested, not IsolatedHub-injected.
 - Inventory capability echo is an in-process `HubRuntime` proof, not a Unix socket DTO (no public inventory request).
-- WebRTC adapter path is unchanged and unclaimed.
-- Full `./test.sh --locked` result is recorded in the gate after this report is committed.
+- WebRTC adapter path is unchanged and unclaimed. WebRTC proofs still use the unbound Drain path with scoped subscription drains.
+- After the Core pin, entity lifecycle patches still require a terminal Drain to advance the Core journal. Tests drain while they wait. Hub does not add an `observe_lifecycle` facade because Core `f4f6bf5` does not export that method.
 
 ## Missing vault guidance discovered
 

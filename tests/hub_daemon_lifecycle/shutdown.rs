@@ -2067,6 +2067,8 @@ fn daemon_restart_reconnects_worker_backed_session_through_client_api() {
         daemon.runtime_mut().expect("runtime initialized"),
         &packages,
         &session_id,
+        &subscription_id,
+        "hub-daemon-restart-client",
         b"restart-ready",
         &mut logical_clock,
     );
@@ -2124,6 +2126,8 @@ fn daemon_restart_reconnects_worker_backed_session_through_client_api() {
         restarted.runtime_mut().expect("runtime initialized"),
         &packages,
         &session_id,
+        &subscription_id,
+        "hub-daemon-restart-client",
         b"echo:after-restart",
         &mut logical_clock,
     );
@@ -2389,6 +2393,15 @@ fn process_ownership_daemon_restart_adopts_then_shuts_down_worker_session() {
     let session_id = format!("cli-restart-session-{}", std::process::id());
 
     let child = start_cli_daemon(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("test config has local socket")
+            .path
+            .clone(),
+    );
     let spawn = botster_hub::daemon_transport_request(
         &config,
         botster_hub::DaemonRequest::Spawn {
@@ -2409,6 +2422,43 @@ fn process_ownership_daemon_restart_adopts_then_shuts_down_worker_session() {
             .iter()
             .any(|session| session.session_id == session_id && session.lifecycle == "running")
     );
+
+    let mut pre_restart = botster_hub_client::DaemonConnection::connect(&endpoint)
+        .expect("connect before daemon restart");
+    pre_restart
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: session_id.to_string(),
+            subscription_id: "cli-restart-subscription-before".to_string(),
+        })
+        .expect("attach before daemon restart");
+    let before = {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut text = String::new();
+        while Instant::now() < deadline {
+            let _ = pre_restart.request(&botster_hub_client::DaemonRequest::drain_subscription(
+                session_id.as_str(),
+                "cli-restart-subscription-before",
+            ));
+            text = pre_restart
+                .request(&botster_hub_client::DaemonRequest::ReadScreen {
+                    session_id: session_id.to_string(),
+                })
+                .ok()
+                .and_then(|response| response.read_screen)
+                .map(|screen| screen.text)
+                .unwrap_or_default();
+            if text.contains("restart-ready") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        text
+    };
+    assert!(
+        before.contains("restart-ready"),
+        "session must be readable before restart, got {before:?}"
+    );
+    drop(pre_restart);
 
     shutdown_cli_daemon(&data_dir, child);
     let restarted_child = start_cli_daemon(&data_dir);
@@ -2452,15 +2502,6 @@ fn process_ownership_daemon_restart_adopts_then_shuts_down_worker_session() {
     )
     .expect("resize after daemon restart");
     assert_eq!(resize.kind, botster_hub::DaemonResponseKind::Events);
-    let endpoint = botster_hub_client::DaemonEndpoint::new(
-        config
-            .transports
-            .local_socket
-            .as_ref()
-            .expect("test config has local socket")
-            .path
-            .clone(),
-    );
     let mut connection = botster_hub_client::DaemonConnection::connect(&endpoint)
         .expect("connect after daemon restart");
     connection
@@ -2469,16 +2510,44 @@ fn process_ownership_daemon_restart_adopts_then_shuts_down_worker_session() {
             subscription_id: "cli-restart-subscription-after".to_string(),
         })
         .expect("attach after daemon restart");
-    let send = botster_hub::daemon_transport_request(
-        &config,
-        botster_hub::DaemonRequest::SendInput {
+    let ready_deadline = Instant::now() + Duration::from_secs(8);
+    let mut attached = false;
+    while Instant::now() < ready_deadline {
+        let drain = connection
+            .request(&botster_hub_client::DaemonRequest::drain_subscription(
+                session_id.as_str(),
+                "cli-restart-subscription-after",
+            ))
+            .ok();
+        attached |= drain.is_some_and(|response| {
+            response.events.iter().any(|event| {
+                matches!(
+                    event,
+                    botster_hub_client::DaemonEvent::AttachState { state, .. } if state == "attached"
+                )
+            })
+        });
+        let screen = connection
+            .request(&botster_hub_client::DaemonRequest::ReadScreen {
+                session_id: session_id.to_string(),
+            })
+            .ok()
+            .and_then(|response| response.read_screen)
+            .map(|screen| screen.text)
+            .unwrap_or_default();
+        if attached && (screen.contains("restart-ready") || !screen.trim().is_empty()) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    let send = connection
+        .request(&botster_hub_client::DaemonRequest::SendInput {
             session_id: session_id.to_string(),
-            data: "after-restart\n".to_string(),
-        },
-    )
-    .expect("send input after daemon restart");
-    assert_eq!(send.kind, botster_hub::DaemonResponseKind::Events);
-    let deadline = Instant::now() + Duration::from_secs(3);
+            data: "after-restart\r".to_string(),
+        })
+        .expect("send input after daemon restart");
+    assert_eq!(send.kind, botster_hub_client::DaemonResponseKind::Events);
+    let deadline = Instant::now() + Duration::from_secs(8);
     let mut screen_text = String::new();
     while Instant::now() < deadline {
         let _ = connection.request(&botster_hub_client::DaemonRequest::drain_subscription(

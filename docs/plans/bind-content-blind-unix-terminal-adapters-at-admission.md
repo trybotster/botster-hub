@@ -43,7 +43,7 @@ Hub intersection: take `TerminalCompatibility::current()` advertised tokens, kee
 | Target repository | `botster-hub` (`trybotster/botster-hub`) |
 | Target id | `tgt_7e208a0c76a44980a83b63af976b1f22` |
 | Spawn-target name | `botster-hub` |
-| Authoritative path | `/Users/jasonconigliari/Projects/botster-hub` |
+| Authoritative path | spawn target `botster-hub` (`trybotster/botster-hub`) |
 | Plan worktree | this pipeline worktree; Plan does not mutate `Cargo.lock` |
 | Worktree hygiene | tracked `.gitignore` has content; path has no `:`; no `CARGO_TARGET_DIR` override required |
 | Merge policy | direct into `main`; do not create a PR |

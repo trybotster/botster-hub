@@ -151,6 +151,31 @@ fn unix_adapter_bind_returns_only_attaching_then_opaque_envelopes() {
             .any(|session| session.session_id == session_id),
         "connection death must not shut down the host session"
     );
+
+    let (mut replacement, mut replacement_reader) = unix_adapter_connection(&endpoint);
+    let mut replacement_envelopes = Vec::new();
+    let reattach = request_skipping_envelopes(
+        &mut replacement,
+        &mut replacement_reader,
+        &botster_hub_client::DaemonRequest::Attach {
+            session_id: session_id.to_string(),
+            subscription_id: subscription_id.to_string(),
+        },
+        &mut replacement_envelopes,
+    );
+    assert_eq!(reattach.kind, botster_hub_client::DaemonResponseKind::Events);
+    assert!(
+        reattach.events.iter().any(|event| matches!(
+            event,
+            botster_hub_client::DaemonEvent::AttachState {
+                state,
+                ..
+            } if state == botster_hub_client::ATTACH_STATE_ATTACHING
+        )),
+        "adapter close on disconnect is the one Core detach; replacement attach is admitted: {:?}",
+        reattach.events
+    );
+    drop(replacement);
     shutdown_short_lived_session(&endpoint, session_id);
     hub.shutdown().expect("shutdown isolated hub");
 }

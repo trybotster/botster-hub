@@ -51,7 +51,24 @@ fn hub_late_attach_fixture_matches_core_snapshot_before_live_ordering() {
         })
         .collect::<Vec<_>>();
 
-    assert_eq!(hub, core);
+    fn collapse_history(events: Vec<AttachSequenceEvent>) -> Vec<AttachSequenceEvent> {
+        let mut collapsed = Vec::new();
+        for event in events {
+            if event == AttachSequenceEvent::History
+                && collapsed.last() == Some(&AttachSequenceEvent::History)
+            {
+                continue;
+            }
+            collapsed.push(event);
+        }
+        collapsed
+    }
+
+    assert_eq!(
+        collapse_history(hub),
+        collapse_history(core),
+        "Hub late-attach fixtures may emit incremental history frames; the attach order must still be attaching, history, attached, live"
+    );
 }
 
 #[test]
