@@ -5,7 +5,6 @@ edition = "2024"
 description = "External-client test harness for isolated botster-hub daemon tests"
 repository = "https://github.com/trybotster/botster-hub"
 license-file = "../../LICENSE"
-publish = false
 include = [
     "Cargo.toml",
     "src/**/*.rs",
@@ -17,7 +16,7 @@ include = [
 [dependencies]
 botster-core = { git = "https://github.com/trybotster/botster-core", branch = "main" }
 botster-hub-client = { path = "../botster-hub-client" }
-botster-ui-contract = "0.3.2"
+botster-ui-contract = { path = "../botster-ui-contract" }
 libc = "0.2.177"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
