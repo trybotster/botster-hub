@@ -14,6 +14,7 @@
 | Approved plan | `docs/plans/emit-terminal-subscription-closed-on-webrtc-after-adapter-close.md` revision 2 |
 | Merge policy | direct into `main`; do not create a PR |
 | Integrated base | `origin/main` `4f30d6952f9a29541ab3a670a54bf5e136b8eb8e` (includes published hub-test-support `0.1.35`) |
+| Implement commit | `5bfa3089124a1a979dee6aa89a6586ff882d5a67` |
 | Locked Core | `Cargo.lock` pins `botster-core` and `botster-terminal-protocol` at `f4f6bf5babe92dfb9241a760c414187f711c2c42` |
 | `teardown_class_applies` | yes |
 | Session-type eligibility consumer | false |
@@ -182,7 +183,8 @@ Provenance:
 
 - Hub binary realpath: `/Users/jasonconigliari/botster-sessions/trybotster-botster-hub-project-pipelines-ticket_1786724303_284888/target/debug/botster-hub`
 - session-worker realpath: `/Users/jasonconigliari/botster-sessions/trybotster-botster-hub-project-pipelines-ticket_1786724303_284888/target/debug/botster-session-worker`
-- Integrated Hub SHA: `4f30d6952f9a29541ab3a670a54bf5e136b8eb8e`
+- Integrated Hub SHA before implement commit: `4f30d6952f9a29541ab3a670a54bf5e136b8eb8e`
+- Implement commit: `5bfa3089124a1a979dee6aa89a6586ff882d5a67`
 - Locked Core SHA: `f4f6bf5babe92dfb9241a760c414187f711c2c42`
 
 `./test.sh -p botster-hub-client` ran the workspace wrapper once before IsolatedHub oracle fixes. That run executed Unix and WebRTC lifecycle tests; the three then-failing IsolatedHub oracles are now green under the named commands above. A second full workspace wrapper was not rerun after the README revision-41 fix.
