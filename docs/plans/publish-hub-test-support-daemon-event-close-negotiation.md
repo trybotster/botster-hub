@@ -1,5 +1,11 @@
 # Plan: publish hub-test-support with daemon_event close negotiation
 
+**Revision 2** — addresses Plan Review `review_1786735286_352959` (`changes_required`).
+
+Product finding `finding_1786735287_983629`: `script/publish-npm-packages` calls `require_clean_worktree` and exits 65 on any tracked edit. Commit the complete corrected publish tree before dry-run or publish. Keep the implement report as a separate post-publish commit. Run the release script only from that clean committed SHA.
+
+No new vault checklist. Reuse `checklist_1786734746_785303`.
+
 ## Target repository and target_id
 
 | Field | Value |
@@ -93,7 +99,8 @@ This ticket is not a consumer of Hub session-type eligibility work. Do not injec
 - `npm whoami` returned `tonksthebear` in this Plan visit. Re-check at Implement time. If publish is unauthorized, ask a human. Do not invent a file, git, or `/tmp` coordinate.
 - Downstream Web ticket `ticket_1786661008_897067` already depends on this ticket (`dependency_1786730694_799927`) against this Hub target. Do not edit `botster-web`.
 - Parent runtime ticket `ticket_1786724303_284888` is closed. Sibling publish ticket `ticket_1786723348_522242` is closed and published `0.1.35` without `daemon_event`.
-- Vault checklist `checklist_1786734746_785303` is the one Plan-visit checklist. Create-vault-checklist timed out after commit; the owner list was read before any retry.
+- Vault checklist `checklist_1786734746_785303` already exists for this ticket. This return visit skipped a second checklist.
+- Return visit after Plan Review `review_1786735286_352959`. The product finding is that revision 1 edited the README and then invoked `script/publish-npm-packages` before any commit. That script refuses a dirty worktree.
 
 ## Scope
 
@@ -105,17 +112,18 @@ Preferred coordinate: `0.1.36`, only when that version is unused or already equa
    - Correct the shipped README sentence that still calls `0.1.33` the prior published coordinate at protocol 7 / revision 38. The prior published coordinate is `0.1.35` at protocol 7 / revision 40. This tree is revision 41.
    - Document the negotiated-close admission contract in the shipped README: protocol 7 Hello must require `terminal_subscription_closed` (`FEATURE_TERMINAL_SUBSCRIPTION_CLOSED` / `DaemonCompatibilityRequirement::for_webrtc_terminal_subscription_closed()`) before Hub sends `DaemonLocalWebrtcDeliveryKind` `daemon_event`. Keep the feature optional in default `required_features`.
 2. Re-run package tests on that corrected tree. Do not make the occupancy decision against the stale-README bytes.
-3. Pack the corrected tree. Record that local tarball integrity. Use `script/publish-npm-packages --dry-run` or an equivalent pack of the same tree.
-4. Then re-check registry occupancy.
-5. If `0.1.36` is unused, publish the corrected tarball as `0.1.36`.
-6. If `0.1.36` is occupied and `dist.integrity` equals the corrected tarball, treat publication as done. Still run the external content smoke, including the README contract checks.
-7. If `0.1.36` is occupied and `dist.integrity` differs from the corrected tarball, allocate the next unused patch (`0.1.37` or later). Bump `package.json`, regenerate `metadata.json`, update README pin sites and `test.mjs`, pack again, and publish that unused coordinate. A stale-README `0.1.36` is a mismatch. Do not accept it as done.
-8. Keep `protocol_version` 7 and `@trybotster/ui-contract@0.3.2`. Keep `CONFORMANCE_FIXTURE_REVISION` at the parent-merge value `41` unless a later main commit allocated a newer unused revision. Do not reuse published revision 40 bytes.
-9. Publish with `script/publish-npm-packages`. Do not skip an already-published coordinate on version-exists alone.
-10. If `npm whoami` fails, ask a blocking human. Do not invent a file, git, or `/tmp` coordinate.
-11. After publish, prove a clean external install of the registry coordinate.
-12. Persist a report under `docs/reports/` with coordinate, integrity, Hub SHA, and smoke evidence.
-13. Merge directly into `main`. Do not create a pull request.
+3. Commit the complete corrected publish tree. Record that SHA. `git status --porcelain` must be empty. `script/publish-npm-packages` calls `require_clean_worktree` and exits 65 on tracked edits, so dry-run and publish are illegal from an uncommitted README.
+4. From that clean committed SHA, pack the corrected tree and record tarball integrity. Use `script/publish-npm-packages --dry-run` or an equivalent pack of the same committed tree.
+5. Then re-check registry occupancy.
+6. If `0.1.36` is unused, publish the committed tarball as `0.1.36` with `script/publish-npm-packages` from the same clean SHA.
+7. If `0.1.36` is occupied and `dist.integrity` equals the committed tarball, treat publication as done. Still run the external content smoke, including the README contract checks.
+8. If `0.1.36` is occupied and `dist.integrity` differs from the committed tarball, allocate the next unused patch (`0.1.37` or later). Bump `package.json`, regenerate `metadata.json`, update README pin sites and `test.mjs`, commit that reallocation tree, then publish from the new clean SHA. A stale-README `0.1.36` is a mismatch. Do not accept it as done.
+9. Keep `protocol_version` 7 and `@trybotster/ui-contract@0.3.2`. Keep `CONFORMANCE_FIXTURE_REVISION` at the parent-merge value `41` unless a later main commit allocated a newer unused revision. Do not reuse published revision 40 bytes.
+10. Do not skip an already-published coordinate on version-exists alone.
+11. If `npm whoami` fails, ask a blocking human. Do not invent a file, git, or `/tmp` coordinate.
+12. After publish, prove a clean external install of the registry coordinate.
+13. Persist a report under `docs/reports/` with coordinate, integrity, publish SHA, and smoke evidence. Commit that report separately after publish.
+14. Merge directly into `main`. Do not create a pull request.
 
 ## Non-scope
 
@@ -176,6 +184,7 @@ Do not touch Rust adapter, daemon, or emitter files unless `node packages/hub-te
 - npm auth can block publish. Mitigation: blocking human question. No unapproved fallback coordinate.
 - Another publisher can occupy `0.1.36` with stale-README bytes between Plan and Implement. Mitigation: always pack the README-corrected tree first. Treat any integrity mismatch, including a stale-README `0.1.36`, as a new unused patch.
 - A later main commit can change package bytes before publish. Mitigation: publish from a recorded SHA and pack that tree.
+- `script/publish-npm-packages` refuses a dirty worktree. Mitigation: commit the complete corrected package tree first; keep the report as a later commit; prove `git status --porcelain` is empty immediately before every release-script invocation. If `npm run sync` dirties the tree mid-script, stop and ask a human.
 - README-only contract documentation can miss the ticket's `FEATURE_TERMINAL_SUBSCRIPTION_CLOSED` grep. Mitigation: the shipped README must contain `daemon_event`, `terminal_subscription_closed`, `FEATURE_TERMINAL_SUBSCRIPTION_CLOSED`, and `for_webrtc_terminal_subscription_closed`.
 - Moving the feature into default `required_features` would break old protocol-7 clients. Mitigation: keep it optional in the matrix and document the request-specific Hello requirement only.
 
@@ -187,11 +196,12 @@ Production path: botster-web and other external clients install the public npm c
 
 1. `node packages/hub-test-support/scripts/sync-assets.mjs --check` passes on the publish tree.
 2. `node packages/hub-test-support/test.mjs` passes.
-3. Occupancy is decided only after the README-corrected tree is packed. Registry `0.1.36` is accepted only when its `dist.integrity` equals that corrected tarball.
-4. `script/publish-npm-packages --dry-run` packs `@trybotster/hub-test-support` at the chosen unused version, or confirms occupied `0.1.36` matches the corrected tarball, and packs `@trybotster/ui-contract@0.3.2` with matching integrity if that ui-contract version is already published.
-5. `npm view @trybotster/hub-test-support version` reports a version newer than any `0.1.35` published by sibling `ticket_1786723348_522242`.
-6. `npm view @trybotster/hub-test-support@<published>` reports `dist.integrity` equal to the locally packed corrected tarball.
-7. A clean temporary directory can `npm install @trybotster/hub-test-support@<published> --prefer-online` and then:
+3. The complete corrected publish tree is committed before any `script/publish-npm-packages` invocation. Evidence: recorded publish SHA, `git status --porcelain` empty, and `git show <sha>:packages/hub-test-support/README.md` contains the prior-coordinate and Hello-gate sentences.
+4. Occupancy is decided only after that committed tree is packed. Registry `0.1.36` is accepted only when its `dist.integrity` equals that committed tarball.
+5. `script/publish-npm-packages --dry-run` and the real publish both run from that clean committed SHA. The dry-run packs `@trybotster/hub-test-support` at the chosen unused version, or confirms occupied `0.1.36` matches the committed tarball, and packs `@trybotster/ui-contract@0.3.2` with matching integrity if that ui-contract version is already published.
+6. `npm view @trybotster/hub-test-support version` reports a version newer than any `0.1.35` published by sibling `ticket_1786723348_522242`.
+7. `npm view @trybotster/hub-test-support@<published>` reports `dist.integrity` equal to the tarball packed from the recorded publish SHA.
+8. A clean temporary directory can `npm install @trybotster/hub-test-support@<published> --prefer-online` and then:
    - `metadata.package_version` equals the published version
    - `metadata.protocol_version === 7`
    - `metadata.conformance_fixture_revision === 41`
@@ -203,8 +213,8 @@ Production path: botster-web and other external clients install the public npm c
    - installed README contains `FEATURE_TERMINAL_SUBSCRIPTION_CLOSED` and `for_webrtc_terminal_subscription_closed`
    - installed README states that protocol-7 Hello must require `terminal_subscription_closed` before Hub sends `daemon_event`
    - installed README names `0.1.35` as the prior published coordinate at protocol 7 / revision 40 and does not claim `0.1.33` is the prior coordinate at the same protocol and revision
-8. Do not require a full Hub `./test.sh` unless Implement changes Rust or daemon source.
-9. Merge the plan, report, and any README or version files directly into `main`. Do not open a pull request.
+9. Do not require a full Hub `./test.sh` unless Implement changes Rust or daemon source.
+10. The implement report is a separate post-publish commit. Merge the pre-publish package SHA, report, and plan directly into `main`. Do not open a pull request.
 
 ## Vault gaps worth capturing
 
@@ -218,9 +228,10 @@ Production path: botster-web and other external clients install the public npm c
 2. Confirm `node packages/hub-test-support/scripts/sync-assets.mjs --check` still passes. If it fails, stop and ask a human.
 3. Edit the shipped README first: prior coordinate `0.1.35` / protocol 7 / revision 40, plus the Hello `required_features` / `FEATURE_TERMINAL_SUBSCRIPTION_CLOSED` / `for_webrtc_terminal_subscription_closed()` contract sentence.
 4. Run `node packages/hub-test-support/test.mjs`.
-5. Pack the corrected tree and record tarball integrity.
-6. Re-read `npm view @trybotster/hub-test-support versions` and `0.1.36` occupancy only after that pack.
-7. Publish the unused matching coordinate with `script/publish-npm-packages`.
-8. Prove the clean external install checks above.
-9. Write `docs/reports/publish-hub-test-support-daemon-event-close-negotiation-implement-report.md` and optional evidence JSON.
-10. Commit on the ticket branch and merge directly to `main`. Do not open a pull request.
+5. Commit the complete corrected publish tree. Record that SHA. Confirm `git status --porcelain` is empty.
+6. From that clean SHA, pack the tree or run `script/publish-npm-packages --dry-run`. Record tarball integrity.
+7. Re-read `npm view @trybotster/hub-test-support versions` and `0.1.36` occupancy only after that pack.
+8. If unused or integrity-matched, publish with `script/publish-npm-packages` from the same clean SHA. If occupied bytes differ, bump, test, commit the reallocation tree, then publish from the new clean SHA.
+9. Prove the clean external install checks above.
+10. Write `docs/reports/publish-hub-test-support-daemon-event-close-negotiation-implement-report.md` and optional evidence JSON.
+11. Commit the report separately after publish. Merge directly to `main`. Do not open a pull request.
