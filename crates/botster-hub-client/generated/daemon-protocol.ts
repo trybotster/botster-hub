@@ -23,7 +23,8 @@ export interface DaemonLocalWebrtcDeliveryChunk {
 
 export type DaemonLocalWebrtcDeliveryKind =
   | "daemon_response"
-  | "daemon_entity_frame";
+  | "daemon_entity_frame"
+  | "daemon_terminal_frame";
 
 export interface DaemonHello {
   protocol: string;

@@ -67,6 +67,8 @@ pub const FEATURE_TERMINAL_SUBSCRIPTION_CLOSED: &str = "terminal_subscription_cl
 pub const TERMINAL_SUBSCRIPTION_CLOSED_HOST_ADAPTER: &str = "host_adapter_closed";
 /// Core closed this bound adapter while the connection stayed alive.
 pub const TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER: &str = "core_adapter_closed";
+/// Optional Hub WebRTC adapter plane. Bind happens only when DataChannel Hello requires this.
+pub const FEATURE_WEBRTC_TERMINAL_ADAPTER: &str = "webrtc_terminal_adapter";
 /// Mux envelope plane tag. Not a Snapshot/READY/PAGE/FINISH field.
 pub const UNIX_TERMINAL_PLANE: &str = "terminal";
 /// Mux envelope kind tag. The payload stays an opaque `TerminalFrame` blob.
@@ -85,6 +87,7 @@ const ATTACH_DRAIN_INTERVAL: Duration = Duration::from_millis(25);
 pub enum DaemonLocalWebrtcDeliveryKind {
     DaemonResponse,
     DaemonEntityFrame,
+    DaemonTerminalFrame,
 }
 
 /// One frame of an encrypted daemon delivery sent over the local WebRTC DataChannel.
@@ -736,6 +739,17 @@ impl DaemonCompatibilityRequirement {
         requirement.minimum_conformance_fixture_revision = CONFORMANCE_FIXTURE_REVISION;
         requirement
     }
+
+    /// Build the requirement for the optional WebRTC terminal adapter plane.
+    #[must_use]
+    pub fn for_webrtc_terminal_adapter() -> Self {
+        let mut requirement = Self::current();
+        requirement
+            .required_features
+            .push(FEATURE_WEBRTC_TERMINAL_ADAPTER.to_string());
+        requirement.minimum_conformance_fixture_revision = CONFORMANCE_FIXTURE_REVISION;
+        requirement
+    }
 }
 
 impl Default for DaemonCompatibilityRequirement {
@@ -853,6 +867,7 @@ fn current_feature_list() -> Vec<&'static str> {
     features.push(FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY);
     features.push(FEATURE_UNIX_TERMINAL_ADAPTER);
     features.push(FEATURE_TERMINAL_SUBSCRIPTION_CLOSED);
+    features.push(FEATURE_WEBRTC_TERMINAL_ADAPTER);
     features
 }
 
@@ -3326,6 +3341,47 @@ mod tests {
 
         ensure_compatible(&requirement, &DaemonCompatibility::current())
             .expect("a unix-adapter client accepts the current daemon");
+    }
+
+    #[test]
+    fn default_requirement_accepts_daemon_before_optional_webrtc_terminal_adapter() {
+        let mut previous_daemon = DaemonCompatibility::current();
+        previous_daemon.conformance_fixture_revision = DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION;
+        previous_daemon
+            .features
+            .retain(|feature| feature != FEATURE_WEBRTC_TERMINAL_ADAPTER);
+
+        ensure_compatible(&DaemonCompatibilityRequirement::current(), &previous_daemon)
+            .expect("the optional webrtc adapter capability must not break default clients");
+    }
+
+    #[test]
+    fn webrtc_terminal_adapter_requirement_rejects_old_daemon_and_accepts_current_daemon() {
+        let requirement = DaemonCompatibilityRequirement::for_webrtc_terminal_adapter();
+        let mut previous_daemon = DaemonCompatibility::current();
+        previous_daemon.conformance_fixture_revision = DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION;
+        previous_daemon
+            .features
+            .retain(|feature| feature != FEATURE_WEBRTC_TERMINAL_ADAPTER);
+
+        let error = ensure_compatible(&requirement, &previous_daemon)
+            .expect_err("a webrtc-adapter client must reject an old daemon");
+        assert!(error.diagnostic.contains(&format!(
+            "unsupported conformance fixture revision {}; requires at least {CONFORMANCE_FIXTURE_REVISION}",
+            DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION
+        )));
+
+        previous_daemon.conformance_fixture_revision = CONFORMANCE_FIXTURE_REVISION;
+        let error = ensure_compatible(&requirement, &previous_daemon)
+            .expect_err("a webrtc-adapter client must require the advertised feature");
+        assert!(
+            error
+                .diagnostic
+                .contains("missing required feature(s): webrtc_terminal_adapter")
+        );
+
+        ensure_compatible(&requirement, &DaemonCompatibility::current())
+            .expect("a webrtc-adapter client accepts the current daemon");
     }
 
     #[test]
@@ -6352,6 +6408,7 @@ mod tests {
                 FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY,
                 FEATURE_UNIX_TERMINAL_ADAPTER,
                 FEATURE_TERMINAL_SUBSCRIPTION_CLOSED,
+                FEATURE_WEBRTC_TERMINAL_ADAPTER,
             ],
             "the daemon advertises all current capabilities",
         );

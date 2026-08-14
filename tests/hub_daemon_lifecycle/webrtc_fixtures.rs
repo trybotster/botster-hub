@@ -83,6 +83,7 @@ pub(crate) struct LocalWebrtcOfferPeer {
     pub(crate) data_channel_open_rx: AsyncReceiver<()>,
     pub(crate) data_channel_message_rx: AsyncReceiver<String>,
     pub(crate) pending_entity_frames: VecDeque<botster_hub_client::DaemonEntityFrame>,
+    pub(crate) pending_terminal_frames: VecDeque<(String, Vec<u8>)>,
 }
 
 impl LocalWebrtcOfferPeer {
@@ -158,6 +159,7 @@ impl LocalWebrtcOfferPeer {
                 data_channel_open_rx,
                 data_channel_message_rx,
                 pending_entity_frames: VecDeque::new(),
+                pending_terminal_frames: VecDeque::new(),
             },
             offer,
         ))
@@ -212,6 +214,12 @@ impl LocalWebrtcOfferPeer {
                     self.pending_entity_frames
                         .push_back(serde_json::from_slice(&plaintext)?);
                 }
+                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonTerminalFrame => {
+                    return Err(std::io::Error::other(
+                        "unexpected daemon_terminal_frame on unbound receive path",
+                    )
+                    .into());
+                }
             }
         }
     }
@@ -233,6 +241,57 @@ impl LocalWebrtcOfferPeer {
                     "received uncorrelated daemon response while waiting for entity frame",
                 )
                 .into())
+            }
+            botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonTerminalFrame => Err(
+                std::io::Error::other("unexpected daemon_terminal_frame on unbound receive path")
+                    .into(),
+            ),
+        }
+    }
+
+    pub(crate) async fn encrypted_hello(
+        &mut self,
+        key: &AesGcmKey,
+        hello: &botster_hub_client::DaemonHello,
+    ) -> Result<botster_hub_client::DaemonHelloAck, Box<dyn std::error::Error>> {
+        let plaintext = serde_json::to_vec(hello)?;
+        let envelope = encrypt_aes_gcm(key, &plaintext, 1)?;
+        self.data_channel
+            .send_text(&serde_json::to_string(&envelope)?)
+            .await?;
+        let (delivery_kind, plaintext, _) = self.receive_delivery(key).await?;
+        if delivery_kind != botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonResponse {
+            return Err(std::io::Error::other(format!(
+                "hello ack used unexpected delivery kind {delivery_kind:?}"
+            ))
+            .into());
+        }
+        Ok(serde_json::from_slice(&plaintext)?)
+    }
+
+    pub(crate) async fn next_terminal_frame(
+        &mut self,
+        key: &AesGcmKey,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        if let Some((_message_id, bytes)) = self.pending_terminal_frames.pop_front() {
+            return Ok(bytes);
+        }
+        loop {
+            let (delivery_kind, plaintext, _) = self.receive_delivery(key).await?;
+            match delivery_kind {
+                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonTerminalFrame => {
+                    return Ok(plaintext);
+                }
+                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonEntityFrame => {
+                    self.pending_entity_frames
+                        .push_back(serde_json::from_slice(&plaintext)?);
+                }
+                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonResponse => {
+                    return Err(std::io::Error::other(
+                        "received daemon response while waiting for terminal frame",
+                    )
+                    .into());
+                }
             }
         }
     }

@@ -114,7 +114,7 @@ lossy string history. Neither is current binary-history contract authority.
 
 Version 0.1.35 carries protocol version 7 / conformance revision 40 with
 advertised optional `unix_terminal_adapter`,
-`terminal_subscription_closed`, and
+`terminal_subscription_closed`, `webrtc_terminal_adapter`, and
 `snapshot_delivery=ready_then_history` support,
 byte-faithful live `terminal_output` payloads, incremental GHOSTSNP
 READY/PAGE/FINISH goldens, `mode_gated_input` ModeGatedInput +
