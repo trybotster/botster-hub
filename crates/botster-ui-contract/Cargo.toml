@@ -5,6 +5,7 @@ edition = "2024"
 description = "Renderer-neutral Botster plugin UI contract"
 repository = "https://github.com/trybotster/botster-hub"
 license-file = "../../LICENSE"
+readme = "README.md"
 
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }

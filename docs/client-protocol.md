@@ -10,10 +10,12 @@ The renderer-neutral UI contract used by those protocol DTOs lives in:
 - `crates/botster-ui-contract/src/lib.rs`
 - `packages/ui-contract`
 
-Rust clients consume `botster-ui-contract`; TypeScript clients consume the
-prepared `@trybotster/ui-contract@0.3.1`. The generated declarations, schema, and
-conformance fixtures are one contract surface and must not be copied into a
-client repository.
+Rust clients consume Hub Git tag `botster-ui-contract-v0.3.2`; TypeScript
+clients consume the prepared `@trybotster/ui-contract@0.3.2`. Those packages
+are one contract version. Do not pin the Rust crate from a Hub commit SHA,
+a `rev`, or crates.io. The generated declarations, schema, and conformance
+fixtures are one contract surface and must not be copied into a client
+repository.
 
 Implementation baseline before this split: `9b39f1607144319138151cdf776e8909f35a63d4`. The pipeline implementation commit should be treated as the final protocol revision once merged.
 
@@ -1356,13 +1358,21 @@ coordinate is `@trybotster/hub-test-support@0.1.31`.
 
 External clients that need a true live-hub integration test should depend on the
 client protocol crate plus the test-support crate, not on the full `botster-hub`
-library. Until these crates are published to crates.io, the supported
-out-of-repo dependency shape is a git dependency pinned to the same repository
-revision for both crates. Use one exact commit SHA for every Botster crate in
-the downstream test so the client protocol crate, test harness crate, hub
-binary, and session-worker binary all come from the same protocol revision:
+library. The UI contract is not a Hub commit SHA: depend on tag
+`botster-ui-contract-v0.3.2`. Git `botster-hub-client` and
+`botster-hub-test-support` already resolve that tag; do not add a second
+`rev` pin for `botster-ui-contract`.
+
+Until the client and test-support crates themselves are published to crates.io,
+the supported out-of-repo dependency shape for those two crates is a git
+dependency pinned to the same repository revision. Use one exact commit SHA for
+the client protocol crate, test harness crate, hub binary, and session-worker
+binary so they all come from the same protocol revision:
 
 ```toml
+[dependencies]
+botster-ui-contract = { git = "https://github.com/trybotster/botster-hub.git", tag = "botster-ui-contract-v0.3.2" }
+
 [dev-dependencies]
 botster-hub-client = { git = "https://github.com/trybotster/botster-hub.git", package = "botster-hub-client", rev = "<hub-rev>" }
 botster-hub-test-support = { git = "https://github.com/trybotster/botster-hub.git", package = "botster-hub-test-support", rev = "<hub-rev>" }
