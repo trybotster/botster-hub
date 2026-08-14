@@ -47,7 +47,11 @@ pub(crate) fn daemon_protocol_typescript() -> String {
     emit_string_union(
         &mut output,
         "DaemonLocalWebrtcDeliveryKind",
-        &["daemon_response", "daemon_entity_frame"],
+        &[
+            "daemon_response",
+            "daemon_entity_frame",
+            "daemon_terminal_frame",
+        ],
     );
 
     emit_interface(
