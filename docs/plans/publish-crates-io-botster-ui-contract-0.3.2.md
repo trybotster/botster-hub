@@ -111,7 +111,7 @@ Seam guidance, not a second ownership charter:
 
   That kit ticket is already blocked on this Hub ticket (`dependency_1786661471_370439`). This run does not edit TUI Kit.
 - `script/publish-npm-packages` already packs and publishes `@trybotster/ui-contract` and `@trybotster/hub-test-support` together. It does not publish the Rust crate or enforce crates.io lockstep.
-- `packages/ui-contract/README.md` still documents a manual `npm publish` after merge. That sentence stays frozen because the file is part of published npm `0.3.2`. Implement documents the one process in the crate README, Hub docs, and the release script instead of republishing npm.
+- `packages/ui-contract/README.md` still documents a manual `npm publish` after merge. That is not one release process.
 - Worktree hygiene: tracked `.gitignore` is present and unchanged (5 lines). The ticket worktree path has no `:`; no `CARGO_TARGET_DIR` override is required.
 - `CARGO_REGISTRY_TOKEN` is unset and no Cargo credentials file is present in this Plan environment. Implement must fail closed and ask a human for crates.io publish rights. Dry-run is not publication.
 - Repo-owned gates: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `./test.sh --locked`.
@@ -195,7 +195,7 @@ Unknowns that stop Implement rather than invent a coordinate:
 | `Cargo.toml` | Workspace-only `[patch.crates-io]` to `crates/botster-ui-contract`. Optional `publish = false` on unpublished members. |
 | `Cargo.lock` | Refresh for the registry+patch identity. No unrelated transitive churn. |
 | `script/publish-npm-packages` or a replacement Hub UI-contract release script | One process for npm + crates.io, version lockstep, skip-if-matching, refuse-if-mismatch |
-| `packages/ui-contract/README.md` | **Unchanged.** This file is inside the published npm `0.3.2` tarball. Rewriting it would fail the integrity skip/refuse rule and republishing `0.3.2` is forbidden. The one release process is documented in the crate README, root README, client-protocol, and `script/publish-npm-packages`. |
+| `packages/ui-contract/README.md` | Replace manual npm-only publish with the one release process and the crates.io coordinate |
 | crate README or `docs/client-protocol.md` / root `README.md` | Only the sentences that still describe the Rust contract as a Hub-git / workspace-only identity |
 | `docs/plans/publish-crates-io-botster-ui-contract-0.3.2.md` | This plan |
 | `docs/reports/publish-crates-io-botster-ui-contract-0.3.2.md` | Implement report after publication and graph proof |
@@ -240,7 +240,6 @@ Registry and lockstep:
 - `cargo search botster-ui-contract` shows `0.3.2`.
 - `npm view @trybotster/ui-contract@0.3.2 version` remains `0.3.2` and was not republished.
 - Release script documents and enforces equal npm/crate versions.
-- `packages/ui-contract/README.md` remains byte-identical to published npm `0.3.2`; process docs live in the crate README, Hub docs, and the script.
 - Published crate source is the Hub `crates/botster-ui-contract` tree at `0.3.2`, not a git tag identity.
 
 External consumer (required; code existence is not enough):

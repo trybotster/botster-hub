@@ -198,14 +198,12 @@ Snapshot readback returns metadata only; opaque snapshot bytes stay on the
 attach/drain data plane. Subscription history still flows through attach/drain
 events rather than through readback responses.
 
-The renderer-neutral plugin UI wire contract is owned by crates.io
-`botster-ui-contract = "0.3.2"` and its generated `@trybotster/ui-contract@0.3.2`
-package. Those packages are one contract version, released together by
-`script/publish-npm-packages`. The Hub workspace path-resolves the crate for
-local development only. Hub runtime code validates and routes those types but
-does not own renderer presentation policy. `botster-hub-client` re-exports the
-same typed daemon bodies; clients must not maintain local `UiNode` or
-action-result mirrors.
+The renderer-neutral plugin UI wire contract is owned by the standalone
+`botster-ui-contract` workspace crate and its generated
+`@trybotster/ui-contract` package. Hub runtime code validates and routes those
+types but does not own renderer presentation policy. `botster-hub-client`
+re-exports the same typed daemon bodies; clients must not maintain local
+`UiNode` or action-result mirrors.
 Hub validates plugin surfaces and accepted replacement trees as authored
 UiNodes. Required bindable fields are the explicit seven-field contract:
 Button/IconButton/MenuItem `label`, Form `submit_label`, Iframe `src` and
