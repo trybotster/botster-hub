@@ -1137,6 +1137,39 @@ fn core_write_budget_hard_stop_emits_core_adapter_closed() {
             || started.elapsed() >= Duration::from_millis(200);
         if pre_close_status.is_none() && pressure_started && !stall_closed {
             stream.set_read_timeout(None).expect("clear read timeout");
+            let stall_drain = request_collecting_mux(
+                &mut stream,
+                &mut reader,
+                &botster_hub_client::DaemonRequest::drain_subscription("cwb-stall", "sub-stall"),
+                &mut envelopes,
+                &mut events,
+            );
+            assert_ne!(
+                stall_drain.kind,
+                botster_hub_client::DaemonResponseKind::OperatorError,
+                "stalled adapter Drain must stay owned before Status: {:?}",
+                stall_drain.error
+            );
+            assert!(
+                stall_drain
+                    .events
+                    .iter()
+                    .all(|event| !event_is_terminal_body(event)),
+                "content-blind stall Drain must stay bound before Status: {:?}",
+                stall_drain.events
+            );
+            assert!(
+                events.iter().all(|event| {
+                    !matches!(
+                        event,
+                        botster_hub_client::DaemonEvent::TerminalSubscriptionClosed {
+                            session_id,
+                            ..
+                        } if session_id == "cwb-stall"
+                    )
+                }),
+                "owned stall Drain must precede core_adapter_closed: {events:?}"
+            );
             let status = request_collecting_mux(
                 &mut stream,
                 &mut reader,
