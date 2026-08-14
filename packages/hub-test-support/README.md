@@ -120,8 +120,13 @@ negotiated WebRTC `daemon_event` close delivery, and
 byte-faithful live `terminal_output` payloads, incremental GHOSTSNP
 READY/PAGE/FINISH goldens, `mode_gated_input` ModeGatedInput +
 ModeFlags freshness, Snapshot-only GHOSTSNP rules, and the
-`DaemonSessionTypeExecution` contract. Version 0.1.33 is the prior published
-coordinate at protocol 7 / revision 38. The contract
+`DaemonSessionTypeExecution` contract. Version 0.1.35 is the prior published
+coordinate at protocol 7 / revision 40. Protocol 7 Hello must require
+`terminal_subscription_closed`
+(`FEATURE_TERMINAL_SUBSCRIPTION_CLOSED` /
+`DaemonCompatibilityRequirement::for_webrtc_terminal_subscription_closed()`)
+before Hub sends `DaemonLocalWebrtcDeliveryKind` `daemon_event`. The feature
+stays optional in default `required_features`. The contract
 defines the explicit `relative_executable` and `shell_command` modes.
 It also carries spawn-point session-type listing
 (`list_session_types_for_target`) and the session-type authoring view
