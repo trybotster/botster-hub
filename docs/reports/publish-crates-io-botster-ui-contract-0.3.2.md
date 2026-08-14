@@ -34,8 +34,8 @@ Relative to planned base `f9f0d8df`:
 | `crates/botster-hub-test-support/Cargo.toml` | Tag pin |
 | `crates/botster-ui-contract/Cargo.toml` | `readme = "README.md"` |
 | `crates/botster-ui-contract/README.md` | Tag consumer identity |
-| `docs/client-protocol.md` | Tag pin; no Hub SHA / crates.io identity |
-| `docs/plans/publish-crates-io-botster-ui-contract-0.3.2.md` | Resynchronized to the Implement-stage human revision |
+| `docs/client-protocol.md` | Tag pin; npm install examples `@trybotster/ui-contract@0.3.2` |
+| `docs/plans/publish-crates-io-botster-ui-contract-0.3.2.md` | Live tag-only plan. Crates.io instructions are historical/superseded only |
 | `docs/reports/publish-crates-io-botster-ui-contract-0.3.2.md` | This report |
 | `script/tag-ui-contract` | Create/verify annotated tag; no crates.io publish |
 
@@ -93,3 +93,25 @@ Captured to vault inbox:
 
 - `first-party-rust-consumers-pin-the-ui-contract-git-tag-not-a-hub-rev.md`
 - `git-visible-hub-member-manifests-must-use-the-ui-contract-tag.md`
+
+## Review return (`review_1786667862_882744`)
+
+Review approved the product proof and sent the run back for two artifact defects.
+
+`finding_1786667862_323988` (high): the committed plan still mixed live crates.io
+release instructions with the required Git tag. The plan is now tag-only. Crates.io
+text remains only as labeled superseded history or as explicit "do not publish"
+checks. Isolated crate tests are documented as
+`BOTSTER_ENV=test cargo test --locked -p botster-ui-contract` because `./test.sh`
+always prepends `--workspace`.
+
+`finding_1786667862_991448` (medium): `docs/client-protocol.md` still installed
+`@trybotster/ui-contract@0.3.1` at the two touched command fences. Both now
+install `0.3.2`. `@trybotster/hub-test-support@0.1.20` is unchanged.
+
+Human answer `question_1786667676_293745` is now in the live plan: this Hub ticket
+provides and proves the tag; durable TUI Kit and TUI adoption stay on their
+routed tickets.
+
+The annotated tag remains `botster-ui-contract-v0.3.2` on `0775e66`. This return
+does not retag.
