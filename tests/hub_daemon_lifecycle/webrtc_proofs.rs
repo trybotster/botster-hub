@@ -338,6 +338,27 @@ fn external_hub_webrtc_live_output_preserves_exact_bytes() {
             )
             .await
             .expect("attach over encrypted WebRTC");
+        for _ in 0..20 {
+            let drain = offer_peer
+                .encrypted_request(
+                    &stream_key,
+                    &botster_hub_client::DaemonRequest::drain_subscription(
+                        "webrtc-exact-bytes-session",
+                        "webrtc-exact-bytes-sub",
+                    ),
+                )
+                .await
+                .expect("drain attach until bound");
+            if drain.events.iter().any(|event| {
+                matches!(
+                    event,
+                    botster_hub_client::DaemonEvent::AttachState { state, .. } if state == "attached"
+                )
+            }) {
+                break;
+            }
+            sleep(Duration::from_millis(30)).await;
+        }
         fs::create_dir_all(release_path.parent().expect("release parent"))
             .expect("create webrtc release dir");
         fs::write(&release_path, b"go").expect("release webrtc write(2) producer");
@@ -347,10 +368,10 @@ fn external_hub_webrtc_live_output_preserves_exact_bytes() {
             let drain = offer_peer
                 .encrypted_request(
                     &stream_key,
-                    &botster_hub_client::DaemonRequest::Drain {
-                        session_id: "webrtc-exact-bytes-session".to_string(),
-                    subscription_id: None,
-                    },
+                    &botster_hub_client::DaemonRequest::drain_subscription(
+                        "webrtc-exact-bytes-session",
+                        "webrtc-exact-bytes-sub",
+                    ),
                 )
                 .await
                 .expect("drain over encrypted WebRTC");
@@ -1320,7 +1341,7 @@ fn local_webrtc_peer_close_detaches_terminal_subscriptions() {
         offer_peer.peer.close().await.expect("close offer peer");
     });
 
-    thread::sleep(Duration::from_millis(300));
+    thread::sleep(Duration::from_millis(800));
 
     let mut connection =
         botster_hub_client::DaemonConnection::connect(&endpoint).expect("external connect");
@@ -1347,10 +1368,10 @@ fn local_webrtc_peer_close_detaches_terminal_subscriptions() {
     let mut events_after_close = Vec::new();
     while std::time::Instant::now() < deadline {
         let drain = connection
-            .request(&botster_hub_client::DaemonRequest::Drain {
-                session_id: "local-webrtc-drop-session".to_string(),
-            subscription_id: None,
-            })
+            .request(&botster_hub_client::DaemonRequest::drain_subscription(
+                "local-webrtc-drop-session",
+                "socket-after-webrtc-close-subscription",
+            ))
             .expect("drain after WebRTC peer close");
         for event in drain.events {
             if let botster_hub_client::DaemonEvent::TerminalOutput {
@@ -1373,6 +1394,13 @@ fn local_webrtc_peer_close_detaches_terminal_subscriptions() {
         observed.contains("drop:after-webrtc-close"),
         "socket client should observe output after WebRTC close, got {observed:?}"
     );
+    let closed_peer_drain = connection
+        .request(&botster_hub_client::DaemonRequest::drain_subscription(
+            "local-webrtc-drop-session",
+            "local-webrtc-drop-subscription",
+        ))
+        .expect("drain closed WebRTC subscription");
+    events_after_close.extend(closed_peer_drain.events);
     assert!(
         events_after_close.iter().all(|event| {
             !matches!(

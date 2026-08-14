@@ -1516,99 +1516,160 @@ pub fn run_client_conformance(
             session_id: CONFORMANCE_SESSION_ID.to_string(),
         })?;
 
-    let endpoint = hub.endpoint().clone();
-    let (attach_tx, attach_rx) = std::sync::mpsc::channel();
-    thread::spawn(move || {
-        let mut output = Vec::new();
-        let result = botster_hub_client::stream_attach(
-            &endpoint,
+    let mut terminal =
+        DaemonConnection::connect(hub.endpoint()).map_err(|source| ConformanceError::Client {
+            operation: "connect",
+            source,
+        })?;
+    terminal
+        .request(&DaemonRequest::Attach {
+            session_id: CONFORMANCE_SESSION_ID.to_string(),
+            subscription_id: CONFORMANCE_SUBSCRIPTION_ID.to_string(),
+        })
+        .map_err(|source| ConformanceError::Client {
+            operation: "attach",
+            source,
+        })?;
+    let ready_deadline = Instant::now() + Duration::from_secs(5);
+    let mut output = String::new();
+    while Instant::now() < ready_deadline {
+        let _ = terminal.request(&DaemonRequest::drain_subscription(
             CONFORMANCE_SESSION_ID,
             CONFORMANCE_SUBSCRIPTION_ID,
-            &mut output,
-        )
-        .map(|()| output);
-        let _ = attach_tx.send(result);
-    });
-    // `stream_attach` writes the initial attach events and then drains the
-    // session, so late-arriving output is still captured; this just gives the
-    // subscription a head start before we drive input.
-    thread::sleep(Duration::from_millis(100));
+        ));
+        let screen = terminal
+            .request(&DaemonRequest::ReadScreen {
+                session_id: CONFORMANCE_SESSION_ID.to_string(),
+            })
+            .map_err(|source| ConformanceError::Client {
+                operation: "conformance_ready_screen",
+                source,
+            })?;
+        if let Some(screen) = screen.read_screen {
+            output = screen.text;
+            if output.contains(CONFORMANCE_READY) {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
 
     expect_kind(
-        &request(
-            hub.endpoint(),
-            DaemonRequest::Resize {
+        &terminal
+            .request(&DaemonRequest::Resize {
                 session_id: CONFORMANCE_SESSION_ID.to_string(),
                 rows: 33,
                 cols: 102,
-            },
-            "resize",
-        )?,
+            })
+            .map_err(|source| ConformanceError::Client {
+                operation: "resize",
+                source,
+            })?,
         DaemonResponseKind::Events,
         "resize",
     )?;
     expect_kind(
-        &request(
-            hub.endpoint(),
-            DaemonRequest::SendInput {
+        &terminal
+            .request(&DaemonRequest::SendInput {
                 session_id: CONFORMANCE_SESSION_ID.to_string(),
-                data: "from-conformance\n".to_string(),
-            },
-            "send_input",
-        )?,
+                data: "from-conformance\r\n".to_string(),
+            })
+            .map_err(|source| ConformanceError::Client {
+                operation: "send_input",
+                source,
+            })?,
         DaemonResponseKind::Events,
         "send_input",
     )?;
-    expect_kind(
-        &request(
-            hub.endpoint(),
-            DaemonRequest::SendInput {
+    let echo_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < echo_deadline {
+        let _ = terminal.request(&DaemonRequest::drain_subscription(
+            CONFORMANCE_SESSION_ID,
+            CONFORMANCE_SUBSCRIPTION_ID,
+        ));
+        let screen = terminal
+            .request(&DaemonRequest::ReadScreen {
                 session_id: CONFORMANCE_SESSION_ID.to_string(),
-                data: "size-check\n".to_string(),
-            },
-            "send_size_check",
-        )?,
+            })
+            .map_err(|source| ConformanceError::Client {
+                operation: "conformance_echo_screen",
+                source,
+            })?;
+        if let Some(screen) = screen.read_screen {
+            output = screen.text;
+            if output.contains(CONFORMANCE_ECHO) {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    expect_kind(
+        &terminal
+            .request(&DaemonRequest::SendInput {
+                session_id: CONFORMANCE_SESSION_ID.to_string(),
+                data: "size-check\r\n".to_string(),
+            })
+            .map_err(|source| ConformanceError::Client {
+                operation: "send_size_check",
+                source,
+            })?,
         DaemonResponseKind::Events,
         "send_size_check",
     )?;
-    expect_kind(
-        &request(
-            hub.endpoint(),
-            DaemonRequest::SendInput {
+    let resize_needle = format!("{CONFORMANCE_WINSIZE_PREFIX}33 102");
+    let size_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < size_deadline {
+        let _ = terminal.request(&DaemonRequest::drain_subscription(
+            CONFORMANCE_SESSION_ID,
+            CONFORMANCE_SUBSCRIPTION_ID,
+        ));
+        let screen = terminal
+            .request(&DaemonRequest::ReadScreen {
                 session_id: CONFORMANCE_SESSION_ID.to_string(),
-                data: "quit\n".to_string(),
-            },
-            "send_quit",
-        )?,
+            })
+            .map_err(|source| ConformanceError::Client {
+                operation: "conformance_size_screen",
+                source,
+            })?;
+        if let Some(screen) = screen.read_screen {
+            output = screen.text;
+            if output.contains(&resize_needle) {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    expect_kind(
+        &terminal
+            .request(&DaemonRequest::SendInput {
+                session_id: CONFORMANCE_SESSION_ID.to_string(),
+                data: "quit\r\n".to_string(),
+            })
+            .map_err(|source| ConformanceError::Client {
+                operation: "send_quit",
+                source,
+            })?,
         DaemonResponseKind::Events,
         "send_quit",
     )?;
 
-    let output = match attach_rx.recv_timeout(std::time::Duration::from_secs(8)) {
-        Ok(Ok(output)) => String::from_utf8_lossy(&output).to_string(),
-        Ok(Err(source)) => {
-            return Err(ConformanceError::Client {
-                operation: "stream_attach",
-                source,
-            });
-        }
-        Err(_) => String::new(),
-    };
-    let output = if output.contains(CONFORMANCE_READY) {
-        output
-    } else {
-        let screen = request(
-            hub.endpoint(),
-            DaemonRequest::ReadScreen {
-                session_id: CONFORMANCE_SESSION_ID.to_string(),
-            },
-            "read_screen",
-        )?;
-        screen
-            .read_screen
-            .map(|screen| screen.text)
-            .unwrap_or(output)
-    };
+    let _ = terminal.request(&DaemonRequest::drain_subscription(
+        CONFORMANCE_SESSION_ID,
+        CONFORMANCE_SUBSCRIPTION_ID,
+    ));
+    let screen = terminal
+        .request(&DaemonRequest::ReadScreen {
+            session_id: CONFORMANCE_SESSION_ID.to_string(),
+        })
+        .map_err(|source| ConformanceError::Client {
+            operation: "read_screen",
+            source,
+        })?;
+    if let Some(screen) = screen.read_screen
+        && !screen.text.trim().is_empty()
+    {
+        output = screen.text;
+    }
     let stream_contains_ready = output.contains(CONFORMANCE_READY);
     let stream_contains_echo = output.contains(CONFORMANCE_ECHO);
     let resize_needle = format!("{CONFORMANCE_WINSIZE_PREFIX}33 102");
@@ -5497,6 +5558,7 @@ mod tests {
                     botster_hub_client::FEATURE_MODE_GATED_INPUT,
                     botster_hub_client::FEATURE_HUB_SOURCE_UPDATE,
                     botster_hub_client::FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY,
+                    botster_hub_client::FEATURE_UNIX_TERMINAL_ADAPTER,
                 ],
                 "diagnostic_kinds": [
                     "connected",

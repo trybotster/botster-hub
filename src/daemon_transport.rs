@@ -947,13 +947,17 @@ fn handle_connection_cleanup(
     {
         admission.mux.close_all();
     }
+    let bound_subscriptions = state
+        .pending_runtime
+        .bound_route_keys_for_client(&cleanup.client_id);
     state
         .pending_runtime
         .close_adapters_for_client(&cleanup.client_id);
     for subscription in cleanup.attached_subscriptions {
-        let bound = state
-            .pending_runtime
-            .is_adapter_bound(&subscription.session_id, &subscription.subscription_id);
+        let bound = bound_subscriptions.contains(&(
+            subscription.session_id.clone(),
+            subscription.subscription_id.clone(),
+        ));
         let result = if bound {
             state
                 .pending_runtime
@@ -961,6 +965,10 @@ fn handle_connection_cleanup(
             state
                 .pending_runtime
                 .cancel_stream(&subscription.session_id, &subscription.subscription_id);
+            state.live_attach_routes.remove(&(
+                subscription.session_id.clone(),
+                subscription.subscription_id.clone(),
+            ));
             Ok(daemon_events(Vec::new()))
         } else {
             handle_control_request(

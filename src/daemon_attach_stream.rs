@@ -207,13 +207,19 @@ impl AttachStreamRegistry {
             .collect()
     }
 
-    pub(crate) fn close_adapters_for_client(&mut self, client_id: &str) {
-        let keys: Vec<(String, String)> = self
-            .streams
+    pub(crate) fn bound_route_keys_for_client(
+        &self,
+        client_id: &str,
+    ) -> BTreeSet<(String, String)> {
+        self.streams
             .iter()
             .filter(|(_, stream)| stream.owner.client_id == client_id && stream.adapter_bound)
             .map(|(key, _)| key.clone())
-            .collect();
+            .collect()
+    }
+
+    pub(crate) fn close_adapters_for_client(&mut self, client_id: &str) {
+        let keys = self.bound_route_keys_for_client(client_id);
         for (session_id, subscription_id) in keys {
             self.close_adapter(&session_id, &subscription_id);
         }
@@ -560,6 +566,21 @@ mod tests {
                 code: Some(0),
             }
         ));
+    }
+
+    #[test]
+    fn bound_route_keys_are_captured_before_close_clears_the_flag() {
+        let mut registry = AttachStreamRegistry::default();
+        registry.start_attach(owner(), "s".into(), "sub".into());
+        let (_, handle) = UnixTerminalAdapter::pair();
+        registry.mark_adapter_bound("s", "sub", TerminalSubscriptionGeneration(1), handle);
+        let keys = registry.bound_route_keys_for_client("client-a");
+        registry.close_adapters_for_client("client-a");
+        assert!(keys.contains(&("s".to_string(), "sub".to_string())));
+        assert!(
+            !registry.is_adapter_bound("s", "sub"),
+            "close must not be used as the bound-route classifier"
+        );
     }
 
     #[test]

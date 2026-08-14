@@ -19,7 +19,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use botster_core::{
-    AesGcmEnvelope, AesGcmKey, Capability, CapabilitySurface, CoreSessionMetadata,
+    AesGcmEnvelope, AesGcmKey, Capability, CapabilitySurface, ClientId, CoreSessionMetadata,
     ExtensionEntrypoint, ExtensionKind, ExtensionRuntime, HostProfileMetadata,
     HostProfilePolicySection, PackageSource, ProcessIdentity, RequestId, ResizePayload, SessionId,
     SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId, decrypt_aes_gcm,
@@ -100,16 +100,25 @@ pub(crate) fn spawn_request(config: &botster_hub::HubConfig) -> SessionSpawnRequ
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn drain_until_client_output(
     api: &HubClientApi,
     runtime: &mut botster_hub::HubRuntime,
     packages: &PackageRegistry,
     session_id: &SessionId,
+    subscription_id: &SubscriptionId,
+    client_id: &str,
     needle: &[u8],
     logical_clock: &mut u64,
 ) -> Vec<HubClientEvent> {
     let mut observed = Vec::new();
     for _ in 0..100 {
+        let _ = runtime.drain_subscription(
+            &ClientId(client_id.to_string()),
+            session_id,
+            subscription_id,
+            *logical_clock,
+        );
         let response = api
             .handle_request(
                 runtime,
@@ -122,10 +131,9 @@ pub(crate) fn drain_until_client_output(
             )
             .expect("drain through hub client api");
         *logical_clock += 1;
-        let HubClientResponseBody::Events(events) = response.body else {
-            panic!("drain should return events");
-        };
-        observed.extend(events);
+        if let HubClientResponseBody::Events(events) = response.body {
+            observed.extend(events);
+        }
 
         if observed.iter().any(|event| {
             matches!(
@@ -136,12 +144,25 @@ pub(crate) fn drain_until_client_output(
         }) {
             return observed;
         }
+        if let Ok(screen) = runtime.read_screen(
+            RequestId("hub-daemon-read-screen".to_string()),
+            session_id.clone(),
+            *logical_clock,
+        ) && screen
+            .screen
+            .text
+            .as_bytes()
+            .windows(needle.len())
+            .any(|window| window == needle)
+        {
+            return observed;
+        }
 
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 
     panic!(
-        "timed out waiting for {:?} in client output",
+        "timed out waiting for {:?} in client output or ReadScreen",
         String::from_utf8_lossy(needle)
     );
 }
@@ -185,13 +206,21 @@ pub(crate) const GHOSTSNP_MAGIC: &[u8] = b"GHOSTSNP";
 pub(crate) fn wait_for_mode_flags<F>(
     connection: &mut botster_hub_client::DaemonConnection,
     session_id: &str,
+    subscription_id: &str,
     mut predicate: F,
 ) -> botster_hub_client::DaemonModeFlags
 where
     F: FnMut(&botster_hub_client::DaemonModeFlags) -> bool,
 {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(8);
     loop {
+        let _ = connection.request(&botster_hub_client::DaemonRequest::drain_subscription(
+            session_id,
+            subscription_id,
+        ));
+        let _ = connection.request(&botster_hub_client::DaemonRequest::ReadScreen {
+            session_id: session_id.to_string(),
+        });
         let response = connection
             .request(&botster_hub_client::DaemonRequest::ReadModeFlags {
                 session_id: session_id.to_string(),
@@ -200,8 +229,9 @@ where
         if response.kind != botster_hub_client::DaemonResponseKind::ReadModeFlags {
             assert!(
                 Instant::now() < deadline,
-                "timed out waiting for mode flags on {session_id}: {:?}",
-                response.kind
+                "timed out waiting for mode flags on {session_id}: {:?} error={:?}",
+                response.kind,
+                response.error
             );
             thread::sleep(Duration::from_millis(20));
             continue;
@@ -254,7 +284,13 @@ pub(crate) fn collect_attach_events(
                         ..
                     } if sub == subscription_id && live_output_contains(payload, marker)
                 )
-            })
+            }) || connection
+                .request(&botster_hub_client::DaemonRequest::ReadScreen {
+                    session_id: session_id.to_string(),
+                })
+                .ok()
+                .and_then(|response| response.read_screen)
+                .is_some_and(|screen| screen.text.contains(marker))
         });
         if attached && saw_live {
             break;
