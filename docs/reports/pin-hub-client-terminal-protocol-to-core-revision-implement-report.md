@@ -126,7 +126,7 @@ Production entry point: Git consumers of `botster-hub-client` resolve `botster-t
 | `cargo fmt --all -- --check` | Exit 0 |
 | `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` | Exit 0 |
 
-TUI parent base commit: `97b6202b33b77645a3527bd77e9f3bc3b2c0fdbe`. Hub candidate commit is recorded after this report is committed.
+TUI parent base commit: `97b6202b33b77645a3527bd77e9f3bc3b2c0fdbe`. Hub candidate commit: `175dd364824ff5bc7ff4f3bf5ce582ae5b7b617d`. The disposable TUI tree and check used a path pin of the same candidate checkout that this commit records.
 
 ## Unverified behavior or residual risk
 
