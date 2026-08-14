@@ -10,6 +10,10 @@ use std::sync::{Arc, Mutex, TryLockError};
 use botster_core::contract::terminal_adapter::{
     TerminalAdapter, TerminalAdapterPressure, TerminalAdapterWriteError,
 };
+use botster_hub_client::{
+    DaemonEvent, TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER,
+    TERMINAL_SUBSCRIPTION_CLOSED_HOST_ADAPTER,
+};
 use botster_terminal_protocol::TerminalFrame;
 use tokio::sync::Notify;
 
@@ -26,6 +30,7 @@ pub(crate) struct UnixTerminalAdapterHandle {
 
 struct UnixTerminalAdapterInner {
     closed: AtomicBool,
+    host_closed: AtomicBool,
     would_block: AtomicBool,
     slot: Mutex<Option<Vec<u8>>>,
     notify: Arc<Notify>,
@@ -35,6 +40,7 @@ impl UnixTerminalAdapterInner {
     fn new() -> Self {
         Self {
             closed: AtomicBool::new(false),
+            host_closed: AtomicBool::new(false),
             would_block: AtomicBool::new(false),
             slot: Mutex::new(None),
             notify: Arc::new(Notify::new()),
@@ -43,6 +49,15 @@ impl UnixTerminalAdapterInner {
 
     fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
+    }
+
+    fn close_from_host(&self) {
+        self.host_closed.store(true, Ordering::SeqCst);
+        self.close();
+    }
+
+    fn host_closed(&self) -> bool {
+        self.host_closed.load(Ordering::SeqCst)
     }
 
     fn close(&self) {
@@ -237,7 +252,19 @@ impl std::fmt::Debug for UnixConnectionMux {
 
 struct UnixMuxInner {
     notify: Arc<Notify>,
-    routes: Mutex<Vec<(String, String, UnixTerminalAdapterHandle)>>,
+    dying: AtomicBool,
+    routes: Mutex<Vec<UnixMuxRoute>>,
+    pending_events: Mutex<Vec<DaemonEvent>>,
+    suppress_sessions: Mutex<Vec<String>>,
+    suppress_generations: Mutex<Vec<(String, String, u64)>>,
+}
+
+struct UnixMuxRoute {
+    session_id: String,
+    subscription_id: String,
+    generation: u64,
+    handle: UnixTerminalAdapterHandle,
+    reported: bool,
 }
 
 impl UnixConnectionMux {
@@ -245,7 +272,11 @@ impl UnixConnectionMux {
         Self {
             inner: Arc::new(UnixMuxInner {
                 notify: Arc::new(Notify::new()),
+                dying: AtomicBool::new(false),
                 routes: Mutex::new(Vec::new()),
+                pending_events: Mutex::new(Vec::new()),
+                suppress_sessions: Mutex::new(Vec::new()),
+                suppress_generations: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -262,22 +293,154 @@ impl UnixConnectionMux {
         &self,
         session_id: String,
         subscription_id: String,
+        generation: u64,
         handle: UnixTerminalAdapterHandle,
     ) {
         if let Ok(mut routes) = self.inner.routes.lock() {
-            routes.retain(|(existing_session, existing_subscription, _)| {
-                existing_session != &session_id || existing_subscription != &subscription_id
+            routes.retain(|route| {
+                !(route.session_id == session_id
+                    && route.subscription_id == subscription_id
+                    && route.generation == generation)
             });
-            routes.push((session_id, subscription_id, handle));
+            routes.push(UnixMuxRoute {
+                session_id,
+                subscription_id,
+                generation,
+                handle,
+                reported: false,
+            });
         }
         self.inner.notify.notify_waiters();
     }
 
     pub(crate) fn close_all(&self) {
+        self.inner.dying.store(true, Ordering::SeqCst);
         if let Ok(mut routes) = self.inner.routes.lock() {
-            for (_, _, handle) in routes.drain(..) {
-                handle.close();
+            for route in routes.drain(..) {
+                route.handle.close_from_host();
             }
+        }
+        self.inner.notify.notify_waiters();
+    }
+
+    pub(crate) fn is_dying(&self) -> bool {
+        self.inner.dying.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn suppress_session(&self, session_id: impl Into<String>) {
+        if let Ok(mut sessions) = self.inner.suppress_sessions.lock() {
+            let session_id = session_id.into();
+            if !sessions.iter().any(|existing| existing == &session_id) {
+                sessions.push(session_id);
+            }
+        }
+    }
+
+    pub(crate) fn suppress_generation(
+        &self,
+        session_id: impl Into<String>,
+        subscription_id: impl Into<String>,
+        generation: u64,
+    ) {
+        if let Ok(mut generations) = self.inner.suppress_generations.lock() {
+            let key = (session_id.into(), subscription_id.into(), generation);
+            if !generations.iter().any(|existing| existing == &key) {
+                generations.push(key);
+            }
+        }
+    }
+
+    pub(crate) fn queue_closed_subscription_events(
+        &self,
+        session_is_live: impl Fn(&str) -> bool,
+    ) -> usize {
+        if self.is_dying() {
+            if let Ok(mut routes) = self.inner.routes.lock() {
+                for route in routes.iter_mut() {
+                    route.reported = true;
+                }
+            }
+            return 0;
+        }
+        let suppressed_sessions = self
+            .inner
+            .suppress_sessions
+            .lock()
+            .map(|sessions| sessions.clone())
+            .unwrap_or_default();
+        let suppressed_generations = self
+            .inner
+            .suppress_generations
+            .lock()
+            .map(|generations| generations.clone())
+            .unwrap_or_default();
+        let mut queued = Vec::new();
+        if let Ok(mut routes) = self.inner.routes.lock() {
+            for route in routes.iter_mut() {
+                if route.reported || !route.handle.is_closed() {
+                    continue;
+                }
+                route.reported = true;
+                if suppressed_sessions
+                    .iter()
+                    .any(|session| session == &route.session_id)
+                    || suppressed_generations.iter().any(|key| {
+                        key.0 == route.session_id
+                            && key.1 == route.subscription_id
+                            && key.2 == route.generation
+                    })
+                    || !session_is_live(&route.session_id)
+                {
+                    continue;
+                }
+                let reason = if route.handle.host_closed() {
+                    TERMINAL_SUBSCRIPTION_CLOSED_HOST_ADAPTER
+                } else {
+                    TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER
+                };
+                queued.push(DaemonEvent::TerminalSubscriptionClosed {
+                    session_id: route.session_id.clone(),
+                    subscription_id: route.subscription_id.clone(),
+                    generation: route.generation,
+                    reason: reason.to_string(),
+                });
+            }
+        }
+        let count = queued.len();
+        if count > 0 {
+            if let Ok(mut pending) = self.inner.pending_events.lock() {
+                pending.extend(queued);
+            }
+            self.inner.notify.notify_waiters();
+        }
+        count
+    }
+
+    pub(crate) fn take_pending_events(&self) -> Vec<DaemonEvent> {
+        self.inner
+            .pending_events
+            .lock()
+            .map(|mut pending| pending.drain(..).collect())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn has_unsent_mux_writes(&self) -> bool {
+        let pending = self
+            .inner
+            .pending_events
+            .lock()
+            .is_ok_and(|pending| !pending.is_empty());
+        pending || !self.snapshot_writes().is_empty()
+    }
+
+    pub(crate) fn prepend_pending_events(&self, events: Vec<DaemonEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        if let Ok(mut pending) = self.inner.pending_events.lock() {
+            let mut rest = pending.split_off(0);
+            pending.extend(events);
+            pending.append(&mut rest);
         }
         self.inner.notify.notify_waiters();
     }
@@ -290,12 +453,12 @@ impl UnixConnectionMux {
         };
         routes
             .iter()
-            .filter_map(|(session_id, subscription_id, handle)| {
-                handle.snapshot_active().map(|bytes| {
+            .filter_map(|route| {
+                route.handle.snapshot_active().map(|bytes| {
                     (
-                        session_id.clone(),
-                        subscription_id.clone(),
-                        handle.clone(),
+                        route.session_id.clone(),
+                        route.subscription_id.clone(),
+                        route.handle.clone(),
                         bytes,
                     )
                 })
@@ -311,6 +474,14 @@ impl UnixConnectionMux {
 impl UnixTerminalAdapterHandle {
     pub(crate) fn close(&self) {
         self.inner.close();
+    }
+
+    pub(crate) fn close_from_host(&self) {
+        self.inner.close_from_host();
+    }
+
+    pub(crate) fn host_closed(&self) -> bool {
+        self.inner.host_closed()
     }
 
     pub(crate) fn is_closed(&self) -> bool {

@@ -5549,6 +5549,7 @@ mod tests {
                     botster_hub_client::FEATURE_HUB_SOURCE_UPDATE,
                     botster_hub_client::FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY,
                     botster_hub_client::FEATURE_UNIX_TERMINAL_ADAPTER,
+                    botster_hub_client::FEATURE_TERMINAL_SUBSCRIPTION_CLOSED,
                 ],
                 "diagnostic_kinds": [
                     "connected",

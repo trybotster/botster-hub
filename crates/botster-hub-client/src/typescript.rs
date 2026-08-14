@@ -56,6 +56,10 @@ pub(crate) fn daemon_protocol_typescript() -> String {
         &[
             ("protocol", "string"),
             ("compatibility", "DaemonCompatibilityRequirement"),
+            (
+                "terminal_compatibility?",
+                "TerminalCompatibilityRequirement",
+            ),
         ],
     );
     emit_interface(
@@ -64,7 +68,29 @@ pub(crate) fn daemon_protocol_typescript() -> String {
         &[
             ("protocol", "string"),
             ("compatibility", "DaemonCompatibility"),
+            ("terminal_compatibility?", "TerminalCompatibility"),
             ("diagnostics?", "DaemonDiagnostic[]"),
+        ],
+    );
+    emit_interface(
+        &mut output,
+        "TerminalCompatibility",
+        &[
+            ("protocol", "string"),
+            ("protocol_version", "number"),
+            ("features", "string[]"),
+            ("conformance_fixture_revision", "number"),
+        ],
+    );
+    emit_interface(
+        &mut output,
+        "TerminalCompatibilityRequirement",
+        &[
+            ("protocol", "string"),
+            ("protocol_version", "number"),
+            ("required_features", "string[]"),
+            ("minimum_conformance_fixture_revision", "number"),
+            ("client_name", "string"),
         ],
     );
     emit_interface(
@@ -1520,6 +1546,15 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             (
                 "worktree_lifecycle",
                 &[("event", "DaemonWorktreeLifecycleEvent")],
+            ),
+            (
+                "terminal_subscription_closed",
+                &[
+                    ("session_id", "string"),
+                    ("subscription_id", "string"),
+                    ("generation", "number"),
+                    ("reason", "string"),
+                ],
             ),
         ],
     );

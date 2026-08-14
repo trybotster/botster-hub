@@ -21,7 +21,7 @@ use botster_core::{
     ClientId, EndpointId, EnvelopeCursor, EnvelopeDeliveryState, EnvelopeId, EnvelopeTarget,
     PackageSource, RequestId, RoutedEnvelope, RoutedEnvelopePayload, RunnableEntrypointKind,
     RunnableEntrypointLaunchMode, SessionId, SessionLifecycleState, SubscriptionId,
-    TerminalAttachState,
+    TerminalAttachState, TerminalCapabilitySet,
 };
 use botster_core_daemon::{
     GuardedWriteDecision, GuardedWriteDeliveryState, ReadinessEvidence, RegistrySessionState,
@@ -56,6 +56,9 @@ pub use botster_hub_client::{
     DaemonUiTreeSnapshot, DaemonWorktree, DaemonWorktreeGitMetadata, DaemonWorktreeLifecycleEvent,
     FEATURE_PLUGIN_SURFACE_ACTION, FEATURE_PLUGIN_SURFACE_RENDER, PROTOCOL, read_frame,
     read_frame_from_reader, write_frame,
+};
+use botster_terminal_protocol::{
+    TerminalCompatibility, ensure_compatible as ensure_terminal_compatible,
 };
 use botster_ui_contract::{UiActionResult, UiActionResultState};
 use serde_json::Value;
@@ -110,7 +113,8 @@ mod daemon_attach_stream;
 use daemon_attach_stream::{
     AttachStreamOwner, AttachStreamRegistry, UnixBindRequest, attach_failed_events,
     bind_unix_adapter_after_attaching, fail_closed_pre_bind_attach, hello_requires_unix_adapter,
-    initial_attaching_only, is_terminal_body_event,
+    initial_attaching_only, is_terminal_body_event, live_generation_for_route,
+    negotiated_unix_capability_set,
 };
 
 #[path = "daemon_package_control.rs"]
@@ -410,14 +414,10 @@ async fn reject_connection_async(stream: TokioUnixStream) {
     }
     let _ = write_async_frame(
         &mut write_half,
-        &DaemonHelloAck {
-            protocol: PROTOCOL.to_string(),
-            compatibility: DaemonCompatibility::current(),
-            diagnostics: vec![DaemonDiagnostic::backpressure(
-                "daemon_connection_admission",
-                "daemon connection capacity reached",
-            )],
-        },
+        &daemon_hello_ack(vec![DaemonDiagnostic::backpressure(
+            "daemon_connection_admission",
+            "daemon connection capacity reached",
+        )]),
     )
     .await;
 }
@@ -451,27 +451,21 @@ async fn handle_connection_async(
     if hello.protocol != PROTOCOL {
         return Err(DaemonTransportError::Protocol("unexpected hello protocol"));
     }
-    if let Err(error) = write_async_frame(
-        &mut write_half,
-        &DaemonHelloAck {
-            protocol: PROTOCOL.to_string(),
-            compatibility: DaemonCompatibility::current(),
-            diagnostics: vec![DaemonDiagnostic::connected("hello")],
-        },
-    )
-    .await
-    {
+    let (admission, hello_ack) = unix_hello_admission(&hello);
+    if let Err(error) = write_async_frame(&mut write_half, &hello_ack).await {
         cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
         return Err(error);
     }
     cleanup.set_reason(ConnectionTerminalReason::Eof);
 
-    let mux = UnixConnectionMux::new();
+    let mux = match &admission {
+        UnixTerminalAdmission::Admitted { mux, .. } => mux.clone(),
+        UnixTerminalAdmission::Rejected { .. } => UnixConnectionMux::new(),
+    };
     control_tx
         .send(ControlMessage::RegisterUnixAdmission {
             client_id: client_id.clone(),
-            required_features: hello.compatibility.required_features.clone(),
-            mux: mux.clone(),
+            admission,
         })
         .await
         .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
@@ -480,7 +474,15 @@ async fn handle_connection_async(
         let request = tokio::select! {
             request = read_async_frame::<DaemonRequest, _>(&mut reader, None) => request,
             _ = mux.notify().notified() => {
-                if let Err(error) = flush_unix_adapter_envelopes(&mut write_half, &mux).await {
+                if let Err(error) = flush_unix_mux_writes(&mut write_half, &mux).await {
+                    cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
+                    mux.close_all();
+                    return Err(error);
+                }
+                continue;
+            }
+            _ = tokio::time::sleep(Duration::from_millis(25)), if mux.has_unsent_mux_writes() => {
+                if let Err(error) = flush_unix_mux_writes(&mut write_half, &mux).await {
                     cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
                     mux.close_all();
                     return Err(error);
@@ -558,7 +560,7 @@ async fn handle_connection_async(
             mux.close_all();
             return Err(error);
         }
-        if let Err(error) = flush_unix_adapter_envelopes(&mut write_half, &mux).await {
+        if let Err(error) = flush_unix_mux_writes(&mut write_half, &mux).await {
             cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
             mux.close_all();
             return Err(error);
@@ -568,6 +570,25 @@ async fn handle_connection_async(
             return Ok(());
         }
     }
+}
+
+async fn flush_unix_mux_writes(
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+    mux: &UnixConnectionMux,
+) -> DaemonTransportResult<()> {
+    flush_unix_adapter_envelopes(writer, mux).await?;
+    let events = mux.take_pending_events();
+    let mut unsent = Vec::new();
+    for event in events {
+        match write_async_frame_nowait(writer, &event).await? {
+            MuxWrite::Written => {}
+            MuxWrite::Pending => unsent.push(event),
+        }
+    }
+    if !unsent.is_empty() {
+        mux.prepend_pending_events(unsent);
+    }
+    Ok(())
 }
 
 async fn flush_unix_adapter_envelopes(
@@ -583,13 +604,37 @@ async fn flush_unix_adapter_envelopes(
             subscription_id,
             &bytes,
         );
-        write_async_frame(writer, &envelope).await?;
-        if handle.is_closed() {
-            continue;
+        match write_async_frame_nowait(writer, &envelope).await? {
+            MuxWrite::Written => {
+                if !handle.is_closed() {
+                    let _ = handle.complete_active();
+                }
+            }
+            MuxWrite::Pending => break,
         }
-        let _ = handle.complete_active();
     }
     Ok(())
+}
+
+enum MuxWrite {
+    Written,
+    Pending,
+}
+
+async fn write_async_frame_nowait<T>(
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+    frame: &T,
+) -> DaemonTransportResult<MuxWrite>
+where
+    T: serde::Serialize,
+{
+    let mut bytes = serde_json::to_vec(frame).map_err(DaemonTransportError::Json)?;
+    bytes.push(b'\n');
+    match tokio::time::timeout(Duration::from_millis(50), writer.write_all(&bytes)).await {
+        Ok(Ok(())) => Ok(MuxWrite::Written),
+        Ok(Err(error)) => Err(DaemonTransportError::Io(error)),
+        Err(_) => Ok(MuxWrite::Pending),
+    }
 }
 
 async fn handle_entity_subscription_async(
@@ -940,12 +985,12 @@ fn handle_connection_cleanup(
             state.released_entity_generations = state.released_entity_generations.saturating_add(1);
         }
     }
-    if let Some(admission) = state
+    if let Some(UnixTerminalAdmission::Admitted { mux, .. }) = state
         .pending_runtime
         .unix_admissions
         .remove(&cleanup.client_id)
     {
-        admission.mux.close_all();
+        mux.close_all();
     }
     let bound_claims = state
         .pending_runtime
@@ -1085,16 +1130,12 @@ pub(crate) fn handle_control_message(
         ControlMessage::AcceptedConnection { .. } | ControlMessage::RejectedConnection => false,
         ControlMessage::RegisterUnixAdmission {
             client_id,
-            required_features,
-            mux,
+            admission,
         } => {
-            state.pending_runtime.unix_admissions.insert(
-                client_id,
-                UnixAdmission {
-                    required_features,
-                    mux,
-                },
-            );
+            state
+                .pending_runtime
+                .unix_admissions
+                .insert(client_id, admission);
             false
         }
         ControlMessage::SubscribeEntities {
@@ -1376,6 +1417,9 @@ pub(crate) fn handle_control_message(
                     .cleanup_by_reason
                     .entry("explicit_detach".to_string())
                     .or_insert(0) += 1;
+            }
+            if let Some(runtime) = daemon.runtime() {
+                queue_unix_subscription_closed_events(runtime, &state.pending_runtime);
             }
             if let Ok(response) = response.as_ref() {
                 let change = attached_subscription_change_for_response(&request, response);
@@ -2028,6 +2072,7 @@ fn handle_runtime_control_request(
             ))
         }
         DaemonRequest::RemoveSession { session_id } => {
+            suppress_unix_session_close_events(pending_runtime, &session_id);
             let response = api.handle_request(
                 runtime,
                 &packages,
@@ -2111,6 +2156,14 @@ fn handle_runtime_control_request(
                 .client_id
                 .unwrap_or("botster-hub-daemon-socket")
                 .to_string();
+            if let Some(UnixTerminalAdmission::Rejected { code, diagnostic }) =
+                pending_runtime.unix_admissions.get(&client_id)
+            {
+                return Ok(terminal_compatibility_attach_error(
+                    code,
+                    diagnostic.clone(),
+                ));
+            }
             let owner = AttachStreamOwner {
                 client_id: client_id.clone(),
                 grant_id: observability.grant_id.map(str::to_string),
@@ -2133,9 +2186,13 @@ fn handle_runtime_control_request(
             };
             let admission = pending_runtime.unix_admissions.get(&client_id).cloned();
             let bind_unix = observability.grant_id.is_none()
-                && admission.as_ref().is_some_and(|admission| {
-                    hello_requires_unix_adapter(&admission.required_features)
-                });
+                && matches!(
+                    admission.as_ref(),
+                    Some(UnixTerminalAdmission::Admitted {
+                        required_features,
+                        ..
+                    }) if hello_requires_unix_adapter(required_features)
+                );
             if !bind_unix {
                 return Ok(daemon_events(events));
             }
@@ -2150,6 +2207,12 @@ fn handle_runtime_control_request(
                     None,
                 )));
             }
+            let Some(UnixTerminalAdmission::Admitted {
+                capabilities, mux, ..
+            }) = admission.as_ref()
+            else {
+                return Ok(daemon_events(events));
+            };
             match bind_unix_adapter_after_attaching(
                 pending_runtime,
                 runtime,
@@ -2157,12 +2220,9 @@ fn handle_runtime_control_request(
                     client_id: &client_id,
                     session_id: &session_id,
                     subscription_id: &subscription_id,
-                    required_features: admission
-                        .as_ref()
-                        .map(|admission| admission.required_features.as_slice())
-                        .unwrap_or(&[]),
+                    capabilities: capabilities.clone(),
                     now_seconds: now,
-                    mux: admission.as_ref().map(|admission| &admission.mux),
+                    mux: Some(mux),
                 },
             ) {
                 Ok(_) => Ok(daemon_events(events)),
@@ -2176,6 +2236,22 @@ fn handle_runtime_control_request(
             let now = tick(logical_clock);
             let tracked_session_id = session_id.clone();
             let tracked_subscription_id = subscription_id.clone();
+            if let Some(client_id) = observability.client_id
+                && let Some(UnixTerminalAdmission::Admitted { mux, .. }) =
+                    pending_runtime.unix_admissions.get(client_id)
+                && let Some(generation) = live_generation_for_route(
+                    &runtime.list_terminal_subscriptions(),
+                    client_id,
+                    &tracked_session_id,
+                    &tracked_subscription_id,
+                )
+            {
+                mux.suppress_generation(
+                    tracked_session_id.clone(),
+                    tracked_subscription_id.clone(),
+                    generation.0,
+                );
+            }
             let response = api.handle_request(
                 runtime,
                 &packages,
@@ -2251,6 +2327,7 @@ fn handle_runtime_control_request(
         }
         DaemonRequest::ShutdownSession { session_id } => {
             let now = tick(logical_clock);
+            suppress_unix_session_close_events(pending_runtime, &session_id);
             match classify_shutdown_session(runtime, &session_id)? {
                 ShutdownSessionClassification::Active => {}
                 ShutdownSessionClassification::Cleanup(cleanup) => {
@@ -3355,6 +3432,110 @@ enum ShutdownSessionClassification {
     Missing,
 }
 
+fn daemon_hello_ack(diagnostics: Vec<DaemonDiagnostic>) -> DaemonHelloAck {
+    DaemonHelloAck {
+        protocol: PROTOCOL.to_string(),
+        compatibility: DaemonCompatibility::current(),
+        terminal_compatibility: Some(TerminalCompatibility::current()),
+        diagnostics,
+    }
+}
+
+fn unix_hello_admission(hello: &DaemonHello) -> (UnixTerminalAdmission, DaemonHelloAck) {
+    let mut diagnostics = vec![DaemonDiagnostic::connected("hello")];
+    if let Some(requirement) = hello.terminal_compatibility.as_ref()
+        && let Err(error) =
+            ensure_terminal_compatible(requirement, &TerminalCompatibility::current())
+    {
+        let diagnostic = DaemonDiagnostic::compatibility_mismatch(error.diagnostic);
+        diagnostics.push(diagnostic.clone());
+        return (
+            UnixTerminalAdmission::Rejected {
+                code: "terminal_compatibility",
+                diagnostic,
+            },
+            daemon_hello_ack(diagnostics),
+        );
+    }
+    let capabilities = negotiated_unix_capability_set(
+        &hello.compatibility.required_features,
+        hello.terminal_compatibility.as_ref(),
+    )
+    .unwrap_or_else(|_| TerminalCapabilitySet::empty());
+    (
+        UnixTerminalAdmission::Admitted {
+            required_features: hello.compatibility.required_features.clone(),
+            capabilities,
+            mux: UnixConnectionMux::new(),
+        },
+        daemon_hello_ack(diagnostics),
+    )
+}
+
+fn terminal_compatibility_attach_error(
+    code: &'static str,
+    diagnostic: DaemonDiagnostic,
+) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
+    response.error = Some(DaemonOperatorError {
+        code: code.to_string(),
+        request_id: "daemon-attach-terminal-compatibility".to_string(),
+        operation: "attach".to_string(),
+        message: diagnostic
+            .message
+            .clone()
+            .unwrap_or_else(|| "terminal compatibility mismatch".to_string()),
+        diagnostics: vec![diagnostic],
+    });
+    response
+}
+
+fn suppress_unix_session_close_events(pending_runtime: &PendingRuntimeState, session_id: &str) {
+    for admission in pending_runtime.unix_admissions.values() {
+        if let UnixTerminalAdmission::Admitted { mux, .. } = admission {
+            mux.suppress_session(session_id);
+        }
+    }
+}
+
+fn session_suppresses_terminal_subscription_closed(
+    runtime: &crate::HubRuntime,
+    session_id: &str,
+) -> bool {
+    let Ok(baseline) = runtime.session_lifecycle_baseline() else {
+        return true;
+    };
+    let Some(record) = baseline
+        .sessions
+        .iter()
+        .find(|record| record.session.session_id.0 == session_id)
+    else {
+        return true;
+    };
+    if record.session.registry_state != RegistrySessionState::Running {
+        return true;
+    }
+    matches!(
+        record.lifecycle,
+        Some(SessionLifecycleState::Exited { .. })
+            | Some(SessionLifecycleState::Failed { .. })
+            | Some(SessionLifecycleState::Stopping)
+    )
+}
+
+fn queue_unix_subscription_closed_events(
+    runtime: &crate::HubRuntime,
+    pending_runtime: &PendingRuntimeState,
+) {
+    for admission in pending_runtime.unix_admissions.values() {
+        if let UnixTerminalAdmission::Admitted { mux, .. } = admission {
+            mux.queue_closed_subscription_events(|session_id| {
+                !session_suppresses_terminal_subscription_closed(runtime, session_id)
+            });
+        }
+    }
+}
+
 fn classify_shutdown_session(
     runtime: &mut crate::HubRuntime,
     session_id: &str,
@@ -3436,6 +3617,7 @@ fn prepare_socket_path(path: &PathBuf) -> DaemonTransportResult<()> {
                 &DaemonHello {
                     protocol: PROTOCOL.to_string(),
                     compatibility: botster_hub_client::DaemonCompatibilityRequirement::current(),
+                    terminal_compatibility: None,
                 },
             );
             match hello {
@@ -3518,21 +3700,27 @@ pub(crate) enum ControlMessage {
     },
     RegisterUnixAdmission {
         client_id: String,
-        required_features: Vec<String>,
-        mux: UnixConnectionMux,
+        admission: UnixTerminalAdmission,
     },
 }
 
-#[derive(Clone)]
-struct UnixAdmission {
-    required_features: Vec<String>,
-    mux: UnixConnectionMux,
+#[derive(Clone, Debug)]
+pub(crate) enum UnixTerminalAdmission {
+    Admitted {
+        required_features: Vec<String>,
+        capabilities: TerminalCapabilitySet,
+        mux: UnixConnectionMux,
+    },
+    Rejected {
+        code: &'static str,
+        diagnostic: DaemonDiagnostic,
+    },
 }
 
 #[derive(Default)]
 pub(crate) struct PendingRuntimeState {
     pub(crate) streams: AttachStreamRegistry,
-    unix_admissions: BTreeMap<String, UnixAdmission>,
+    unix_admissions: BTreeMap<String, UnixTerminalAdmission>,
 }
 
 impl fmt::Debug for PendingRuntimeState {
@@ -3571,6 +3759,7 @@ fn pump_bound_unix_routes(daemon: &mut HubDaemon, state: &mut DaemonControlState
     };
     let inventory = runtime.list_terminal_subscriptions();
     state.pending_runtime.reconcile_inventory(&inventory);
+    queue_unix_subscription_closed_events(runtime, &state.pending_runtime);
     let now = state.logical_clock;
     let routes = state.pending_runtime.bound_routes();
     for (session_id, subscription_id, _) in routes {
@@ -6509,6 +6698,7 @@ mod tests {
             &DaemonHello {
                 protocol: PROTOCOL.to_string(),
                 compatibility: botster_hub_client::DaemonCompatibilityRequirement::current(),
+                terminal_compatibility: None,
             },
         )
         .expect("write daemon hello");
@@ -6571,6 +6761,7 @@ mod tests {
             &DaemonHello {
                 protocol: PROTOCOL.to_string(),
                 compatibility: botster_hub_client::DaemonCompatibilityRequirement::current(),
+                terminal_compatibility: None,
             },
         )
         .expect("write daemon hello");
@@ -6624,6 +6815,7 @@ mod tests {
             &DaemonHello {
                 protocol: PROTOCOL.to_string(),
                 compatibility: botster_hub_client::DaemonCompatibilityRequirement::current(),
+                terminal_compatibility: None,
             },
         )
         .expect("write daemon hello");
@@ -6930,6 +7122,7 @@ mod tests {
             &DaemonHello {
                 protocol: PROTOCOL.to_string(),
                 compatibility: botster_hub_client::DaemonCompatibilityRequirement::current(),
+                terminal_compatibility: None,
             },
         )
         .expect("write daemon hello");
