@@ -1147,6 +1147,7 @@ where
     tokio::pin!(deadline);
     loop {
         tokio::select! {
+            biased;
             send = &mut send => {
                 return send.map_err(|_| LocalWebrtcTerminalCause::SendText);
             }
@@ -3632,6 +3633,40 @@ mod tests {
             .expect("high-water during send must not drop the frame");
         assert_eq!(data_channel.sent.lock().unwrap().as_slice(), &["keep-me"]);
         assert!(flow_control.pressured);
+    }
+
+    #[test]
+    fn ready_send_completes_before_queued_on_close() {
+        let data_channel = FakeDataChannel::default();
+        data_channel
+            .events
+            .lock()
+            .unwrap()
+            .push_back(DataChannelEvent::OnClose);
+        let key = AesGcmKey::from_slice(&[19; 32]).unwrap();
+        let mut pending = VecDeque::new();
+        let mut flow_control = LocalWebrtcFlowControl::default();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let peer_state = test_peer_state("grant-send-first");
+        let failure = runtime
+            .block_on(send_response_frames(
+                &data_channel,
+                &key,
+                &["must-send".to_string()],
+                &mut pending,
+                &mut flow_control,
+                &peer_state,
+            ))
+            .expect_err("queued OnClose must still fail after the ready send");
+        assert_eq!(failure.cause, LocalWebrtcTerminalCause::ChannelClosed);
+        assert_eq!(failure.next_chunk_index, 1);
+        assert_eq!(
+            data_channel.sent.lock().unwrap().as_slice(),
+            &["must-send"]
+        );
     }
 
     #[test]
