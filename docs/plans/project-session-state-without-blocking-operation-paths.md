@@ -2,19 +2,20 @@
 
 ## Plan Review revision
 
-Plan Review `review_1786733111_104540` returned `changes_required`.
-This fifth Plan visit consumes the merged Core parent
-`ticket_1786733177_803101` at `aef6516d5809d563961ed7fdd07da29a7b4edddc`.
-All registered dependencies are closed.
+Plan Review `review_1786751913_513221` returned `changes_required`.
+This sixth Plan visit adds the clean-checkout session-worker build
+that review proved is required. Earlier product findings stay
+resolved on Core `aef6516` and Hub `origin/main` `279d828`.
 
 | Finding | Response |
 | --- | --- |
-| Core baseline pages still perform unbounded full-set work | Closed. Core `aef6516` `lifecycle_baseline_page(snapshot, after, LifecycleBaselineBudget)` walks the registry directory under `max_rows`, `max_bytes`, and `max_elapsed`. It does not `load_all()` or clone the remaining freeze. Setup-only yields keep freeze identity and `complete = false`. |
-| Plan omits exact Core pins in three Cargo manifests | Pin `https://github.com/trybotster/botster-core.git` rev `aef6516d5809d563961ed7fdd07da29a7b4edddc` in `Cargo.toml`, `crates/botster-hub-client/Cargo.toml`, `crates/botster-hub-test-support/Cargo.toml`, and `Cargo.lock`. No `branch = "main"`. No `>=`. Add a drift check that every Git-visible Hub member uses that one URL and revision. |
-| Core observe and baseline defeat slice bounds | Owner loop calls `observe_lifecycle_slice` and `lifecycle_baseline_page` with budgets only. Never `observe_lifecycle` or `lifecycle_baseline`. |
-| Core refresh does not compile | Merge Hub `main` first. Then apply the exact `aef6516` pin and the worker-knob / `BindTerminalAdapter` mapping already in this plan. |
-| Baseline gates cannot reach tests | WebRTC owner ticket is closed (`d92aace`). Merge Hub `main` before `./test.sh --locked`. |
-| Snapshot order can depend on default executor width | One in-flight session-family frame per plugin and snapshot sequence. Advance only after the matching successful completion. Test with background concurrency above one and skewed handler durations. |
+| Clean-checkout gate omits the required session-worker build | Load [[botster session worker requires explicit build in dogfood launchers]] and [[live hub proof records distinct hub and locked core binary provenance]]. Before `./test.sh --locked`, run `cargo build --locked -p botster-core-daemon --bin botster-session-worker` from the same Hub worktree and the same `CARGO_TARGET_DIR` / checkout `target`. Record Hub SHA, lockfile Core SHA, and both binary realpaths under that checkout. Do not share a foreign target dir. |
+| Core baseline pages still perform unbounded full-set work | Resolved. Core `aef6516` pages under `LifecycleBaselineBudget`. |
+| Plan omits exact Core pins in three Cargo manifests | Resolved in plan: pin `aef6516` in the three manifests plus `Cargo.lock`. |
+| Core observe and baseline defeat slice bounds | Resolved. Owner loop uses the bounded slice APIs only. |
+| Core refresh does not compile | Resolved against current Hub `main` at `aef6516`. |
+| Baseline gates cannot reach tests | Resolved on Hub `279d828` after the worker build. |
+| Snapshot order can depend on default executor width | Resolved in plan: completion fence plus concurrency `> 1`. |
 
 Duplicate vault checklist `checklist_1786689631_664448` remains unused.
 This visit keeps `checklist_1786689614_825667` and does not create another.
@@ -91,6 +92,8 @@ Hub charter notes implicated by this ticket:
 - [[session UUID is the sole routing key across all layers]]
 - [[hub shutdown preserves durable session workers]]
 - [[session wide drains cannot deliver subscription owned initial state]]
+- [[botster session worker requires explicit build in dogfood launchers]]
+- [[live hub proof records distinct hub and locked core binary provenance]]
 
 Hub-client surface overlay:
 
@@ -335,6 +338,8 @@ merge Hub `main`, then pin every Git-visible Core dependency to
     proofs to observe-slice / page / projection.
 19. After merging Hub `main`, do not re-fix the closed WebRTC
     replacement-owner ticket unless the focused test regresses.
+20. Before any worker-backed test or `./test.sh --locked`, build
+    `botster-session-worker` in this checkout's target directory.
 
 ## Non-scope
 
@@ -492,16 +497,34 @@ Likely untouched:
 - Changing client `DaemonEntityFrame` without a feature constant
   would break Web/TUI at protocol 7.
 - Growing `daemon_transport.rs` further recreates Hub gravity.
+- Running `./test.sh --locked` without first building
+  `botster-session-worker` fails worker-backed Spawn on a clean
+  checkout. Sharing a foreign `CARGO_TARGET_DIR` breaks Hub/Core
+  binary provenance.
 
 ## Acceptance checks/tests
 
 Charter gates after merge of Hub `main` and an exact pin to
-`aef6516d5809d563961ed7fdd07da29a7b4edddc`:
+`aef6516d5809d563961ed7fdd07da29a7b4edddc`. Run every command from the
+final Hub worktree. Use one checkout-local target directory. Do not
+point `CARGO_TARGET_DIR` at a shared or foreign tree.
 
-- `cargo fmt --all -- --check`
-- `cargo clippy --workspace --all-targets --locked -- -D warnings`
-- `./test.sh --locked`
-- `cargo test --doc --workspace --locked`
+1. `cargo fmt --all -- --check`
+2. `cargo clippy --workspace --all-targets --locked -- -D warnings`
+3. `cargo build --locked -p botster-core-daemon --bin botster-session-worker`
+4. Resolve realpaths for `target/debug/botster-hub` (or the built Hub
+   binary) and `target/debug/botster-session-worker`. Both must live
+   under this checkout's target directory.
+5. Record Hub checkout SHA and the Core SHA from this checkout's
+   `Cargo.lock`. They are distinct identities
+   ([[live hub proof records distinct hub and locked core binary provenance]]).
+6. `./test.sh --locked`
+7. `cargo test --doc --workspace --locked`
+
+A clean checkout without step 3 fails worker-backed Spawn. Plan Review
+proved that on Hub `279d828`: format and clippy passed; `./test.sh
+--locked` failed until the explicit worker build ran in the same
+target. A shared target also produced provenance failures.
 
 Product proofs through the production owner loop:
 
@@ -556,6 +579,8 @@ Downstream proof:
 Live Hub pin:
 
 - Record Hub source SHA and lockfile-pinned Core SHA separately.
+- Resolve both `botster-hub` and `botster-session-worker` realpaths
+  under the same checkout target directory.
 - Core SHA must be `aef6516d5809d563961ed7fdd07da29a7b4edddc`.
 - Every Git-visible Hub member manifest must declare
   `https://github.com/trybotster/botster-core.git` and that `rev`.
