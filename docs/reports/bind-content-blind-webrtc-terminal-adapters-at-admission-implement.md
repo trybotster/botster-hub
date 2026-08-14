@@ -271,3 +271,7 @@ BOTSTER_ENV=test cargo clippy --locked -p botster-hub --all-targets -- -D warnin
 ```
 
 All passed. Full workspace `./test.sh --locked` was not rerun after this rebase.
+
+## Review-fix pass 4
+
+`finding_1786720519_933820`: `cargo fmt --all -- --check` failed on one `assert_eq!` wrap in `src/local_webrtc.rs`. Ran `cargo fmt --all` and committed only that format change as `49b973f`. `cargo fmt --all -- --check` now passes.
