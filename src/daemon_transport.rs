@@ -512,6 +512,13 @@ async fn handle_connection_async(
             subscription_id,
         } = request
         {
+            if mux_write.has_pending() {
+                cleanup.set_reason(ConnectionTerminalReason::Protocol);
+                mux.close_all();
+                return Err(DaemonTransportError::Protocol(
+                    "entity subscription cannot start while a mux frame is pending",
+                ));
+            }
             return handle_entity_subscription_async(
                 write_half,
                 reader,
@@ -550,32 +557,19 @@ async fn handle_connection_async(
             &response,
         ));
         mux_write.enqueue_response(&response, response_delivery_tx, close_after_response)?;
-        let flush_started = Instant::now();
-        loop {
-            if let Err(error) = flush_unix_mux_writes(&mut write_half, &mux, &mut mux_write).await {
-                cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
-                let _ = control_tx.try_send(ControlMessage::EgressWriteFailed {
-                    delivery_kind: daemon_delivery_kind(&response),
-                });
-                mux.close_all();
-                return Err(error);
-            }
-            if !close_after_response || !mux_write.has_close_after_pending() {
-                break;
-            }
-            if flush_started.elapsed() >= DAEMON_CLIENT_WRITE_TIMEOUT {
-                cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
-                let _ = control_tx.try_send(ControlMessage::EgressWriteFailed {
-                    delivery_kind: daemon_delivery_kind(&response),
-                });
-                mux.close_all();
-                return Err(DaemonTransportError::Io(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "daemon client write deadline elapsed",
-                )));
-            }
+        debug_assert_eq!(mux_write.pending_response_count(), 1);
+        if let Err(error) =
+            flush_pending_responses(&mut write_half, &mux, &mut mux_write, Instant::now()).await
+        {
+            cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
+            let _ = control_tx.try_send(ControlMessage::EgressWriteFailed {
+                delivery_kind: daemon_delivery_kind(&response),
+            });
+            mux.close_all();
+            return Err(error);
         }
         if close_after_response {
+            debug_assert!(!mux_write.has_close_after_pending());
             cleanup.set_reason(ConnectionTerminalReason::NormalClose);
             return Ok(());
         }
@@ -596,6 +590,21 @@ impl MuxWriteState {
     fn has_close_after_pending(&self) -> bool {
         self.pending.as_ref().is_some_and(|frame| frame.close_after)
             || self.queued_responses.iter().any(|frame| frame.close_after)
+    }
+
+    fn has_pending_response(&self) -> bool {
+        self.pending
+            .as_ref()
+            .is_some_and(|frame| frame.class == PendingMuxClass::Response)
+            || !self.queued_responses.is_empty()
+    }
+
+    fn pending_response_count(&self) -> usize {
+        let pending =
+            self.pending
+                .as_ref()
+                .is_some_and(|frame| frame.class == PendingMuxClass::Response) as usize;
+        pending + self.queued_responses.len()
     }
 
     fn enqueue_response(
@@ -636,6 +645,26 @@ struct PendingMuxFrame {
 enum MuxWrite {
     Written,
     Pending,
+}
+
+async fn flush_pending_responses(
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+    mux: &UnixConnectionMux,
+    write_state: &mut MuxWriteState,
+    started: Instant,
+) -> DaemonTransportResult<()> {
+    loop {
+        flush_unix_mux_writes(writer, mux, write_state).await?;
+        if !write_state.has_pending_response() {
+            return Ok(());
+        }
+        if started.elapsed() >= DAEMON_CLIENT_WRITE_TIMEOUT {
+            return Err(DaemonTransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "daemon client write deadline elapsed",
+            )));
+        }
+    }
 }
 
 async fn flush_unix_mux_writes(
@@ -793,7 +822,7 @@ async fn write_frame_bytes_resumable(
 mod mux_write_resume_tests {
     use super::{
         MuxWrite, MuxWriteState, PendingMuxClass, PendingMuxFrame, daemon_response_base,
-        flush_unix_mux_writes, write_frame_bytes_resumable,
+        flush_pending_responses, flush_unix_mux_writes, write_frame_bytes_resumable,
     };
     use crate::unix_terminal_adapter::{UnixConnectionMux, UnixTerminalAdapter};
     use botster_core::contract::terminal_adapter::TerminalAdapter;
@@ -806,6 +835,7 @@ mod mux_write_resume_tests {
     use std::pin::Pin;
     use std::sync::mpsc;
     use std::task::{Context, Poll};
+    use std::time::{Duration, Instant};
     use tokio::io::AsyncWrite;
 
     struct PrefixStallWriter {
@@ -1182,6 +1212,67 @@ mod mux_write_resume_tests {
             botster_hub_client::DaemonUnixMuxFrame::Response(ref response)
                 if response.kind == DaemonResponseKind::HubUpdate
         ));
+    }
+
+    #[tokio::test]
+    async fn stalled_response_stays_bounded_and_blocks_entity_subscription() {
+        let mux = UnixConnectionMux::new();
+        let _stall = occupy_route(&mux, "stall", "sub", "flood");
+        let mut writer = PrefixStallWriter {
+            written: Vec::new(),
+            stall_after: 6,
+            allow_remainder: false,
+        };
+        let mut write_state = MuxWriteState::default();
+        flush_unix_mux_writes(&mut writer, &mux, &mut write_state)
+            .await
+            .expect("partial terminal");
+        write_state
+            .enqueue_response(
+                &daemon_response_base(DaemonResponseKind::Status),
+                None,
+                false,
+            )
+            .expect("enqueue status");
+        flush_unix_mux_writes(&mut writer, &mux, &mut write_state)
+            .await
+            .expect("response remains pending");
+        assert!(write_state.has_pending_response());
+        assert_eq!(write_state.pending_response_count(), 1);
+        assert!(
+            write_state.has_pending(),
+            "entity subscription must not start while a mux frame is pending"
+        );
+        let timed_out = flush_pending_responses(
+            &mut writer,
+            &mux,
+            &mut write_state,
+            Instant::now() - Duration::from_secs(3),
+        )
+        .await;
+        assert!(
+            timed_out.is_err(),
+            "a stalled Response must not return until Written or timeout"
+        );
+        assert_eq!(write_state.pending_response_count(), 1);
+        writer.allow_remainder = true;
+        writer.stall_after = usize::MAX;
+        flush_pending_responses(&mut writer, &mux, &mut write_state, Instant::now())
+            .await
+            .expect("finish the one pending Response");
+        assert!(!write_state.has_pending_response());
+        let lines = parse_written_mux_lines(&writer.written);
+        assert_eq!(lines.len(), 2);
+        assert!(matches!(
+            lines[0],
+            botster_hub_client::DaemonUnixMuxFrame::Terminal(_)
+        ));
+        assert!(matches!(
+            lines[1],
+            botster_hub_client::DaemonUnixMuxFrame::Response(ref response)
+                if response.kind == DaemonResponseKind::Status
+        ));
+        assert!(!write_state.has_pending());
     }
 }
 
