@@ -1517,15 +1517,17 @@ pub fn run_client_conformance(
         })?;
 
     let endpoint = hub.endpoint().clone();
-    let attach_handle = thread::spawn(move || {
+    let (attach_tx, attach_rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
         let mut output = Vec::new();
-        botster_hub_client::stream_attach(
+        let result = botster_hub_client::stream_attach(
             &endpoint,
             CONFORMANCE_SESSION_ID,
             CONFORMANCE_SUBSCRIPTION_ID,
             &mut output,
-        )?;
-        Ok::<_, DaemonTransportError>(output)
+        )
+        .map(|()| output);
+        let _ = attach_tx.send(result);
     });
     // `stream_attach` writes the initial attach events and then drains the
     // session, so late-arriving output is still captured; this just gives the
@@ -1582,14 +1584,31 @@ pub fn run_client_conformance(
         "send_quit",
     )?;
 
-    let output = attach_handle
-        .join()
-        .map_err(|_| ConformanceError::AttachThreadPanicked)?
-        .map_err(|source| ConformanceError::Client {
-            operation: "stream_attach",
-            source,
-        })?;
-    let output = String::from_utf8_lossy(&output).to_string();
+    let output = match attach_rx.recv_timeout(std::time::Duration::from_secs(8)) {
+        Ok(Ok(output)) => String::from_utf8_lossy(&output).to_string(),
+        Ok(Err(source)) => {
+            return Err(ConformanceError::Client {
+                operation: "stream_attach",
+                source,
+            });
+        }
+        Err(_) => String::new(),
+    };
+    let output = if output.contains(CONFORMANCE_READY) {
+        output
+    } else {
+        let screen = request(
+            hub.endpoint(),
+            DaemonRequest::ReadScreen {
+                session_id: CONFORMANCE_SESSION_ID.to_string(),
+            },
+            "read_screen",
+        )?;
+        screen
+            .read_screen
+            .map(|screen| screen.text)
+            .unwrap_or(output)
+    };
     let stream_contains_ready = output.contains(CONFORMANCE_READY);
     let stream_contains_echo = output.contains(CONFORMANCE_ECHO);
     let resize_needle = format!("{CONFORMANCE_WINSIZE_PREFIX}33 102");

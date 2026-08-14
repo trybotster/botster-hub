@@ -84,6 +84,7 @@ use crate::maintenance::{
 };
 use crate::packages::{PackageResolvedEntrypointLaunch, resolve_entrypoint_launch_contract};
 use crate::source_update::{current_update_execution, mark_update_failed, start_update_handoff};
+use crate::unix_terminal_adapter::UnixConnectionMux;
 use crate::{
     AvailablePackage, AvailablePackageState, FileHubStateStore, HubClientApi,
     HubClientCaptureSnapshot, HubClientEvent, HubClientModeFlags, HubClientPackage,
@@ -106,7 +107,11 @@ use crate::{Worktree, WorktreeCreate, WorktreeError};
 
 #[path = "daemon_attach_stream.rs"]
 mod daemon_attach_stream;
-use daemon_attach_stream::{AttachStreamOwner, AttachStreamRegistry};
+use daemon_attach_stream::{
+    AttachStreamOwner, AttachStreamRegistry, UnixBindRequest, attach_failed_events,
+    bind_unix_adapter_after_attaching, fail_closed_pre_bind_attach, hello_requires_unix_adapter,
+    initial_attaching_only, is_terminal_body_event,
+};
 
 #[path = "daemon_package_control.rs"]
 mod daemon_package_control;
@@ -200,10 +205,16 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
         while let Ok(cleanup) = cleanup_rx.try_recv() {
             handle_connection_cleanup(&mut daemon, &mut control_state, control_tx.clone(), cleanup);
         }
-        let wait = control_state
-            .next_reconciliation
-            .saturating_duration_since(Instant::now());
-        match transport_runtime.block_on(receive_owner_event(&mut control_rx, wait)) {
+        let event = match control_rx.try_recv() {
+            Ok(message) => OwnerEvent::Control(Box::new(Some(message))),
+            Err(_) => {
+                let wait = control_state
+                    .next_reconciliation
+                    .saturating_duration_since(Instant::now());
+                transport_runtime.block_on(receive_owner_event(&mut control_rx, wait))
+            }
+        };
+        match event {
             OwnerEvent::Control(message) => match *message {
                 Some(ControlMessage::AcceptedConnection {
                     stream,
@@ -269,6 +280,7 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
                     drive_entity_subscriptions(&mut daemon, &mut control_state);
                     control_state.next_reconciliation =
                         Instant::now() + ENTITY_RECONCILIATION_INTERVAL;
+                    pump_bound_unix_routes(&mut daemon, &mut control_state);
                 }
                 if !socket_path.exists() {
                     rebind_missing_socket_path(&socket_path);
@@ -454,9 +466,27 @@ async fn handle_connection_async(
     }
     cleanup.set_reason(ConnectionTerminalReason::Eof);
 
+    let mux = UnixConnectionMux::new();
+    control_tx
+        .send(ControlMessage::RegisterUnixAdmission {
+            client_id: client_id.clone(),
+            required_features: hello.compatibility.required_features.clone(),
+            mux: mux.clone(),
+        })
+        .await
+        .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
+
     loop {
         let request = tokio::select! {
             request = read_async_frame::<DaemonRequest, _>(&mut reader, None) => request,
+            _ = mux.notify().notified() => {
+                if let Err(error) = flush_unix_adapter_envelopes(&mut write_half, &mux).await {
+                    cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
+                    mux.close_all();
+                    return Err(error);
+                }
+                continue;
+            }
             changed = shutdown_rx.changed() => {
                 let _ = changed;
                 cleanup.set_reason(ConnectionTerminalReason::Shutdown);
@@ -525,6 +555,12 @@ async fn handle_connection_async(
             let _ = control_tx.try_send(ControlMessage::EgressWriteFailed {
                 delivery_kind: daemon_delivery_kind(&response),
             });
+            mux.close_all();
+            return Err(error);
+        }
+        if let Err(error) = flush_unix_adapter_envelopes(&mut write_half, &mux).await {
+            cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
+            mux.close_all();
             return Err(error);
         }
         if close_after_response {
@@ -532,6 +568,28 @@ async fn handle_connection_async(
             return Ok(());
         }
     }
+}
+
+async fn flush_unix_adapter_envelopes(
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+    mux: &UnixConnectionMux,
+) -> DaemonTransportResult<()> {
+    for (session_id, subscription_id, handle, bytes) in mux.snapshot_writes() {
+        if handle.is_closed() {
+            continue;
+        }
+        let envelope = botster_hub_client::DaemonUnixTerminalEnvelope::from_frame_bytes(
+            session_id,
+            subscription_id,
+            &bytes,
+        );
+        write_async_frame(writer, &envelope).await?;
+        if handle.is_closed() {
+            continue;
+        }
+        let _ = handle.complete_active();
+    }
+    Ok(())
 }
 
 async fn handle_entity_subscription_async(
@@ -882,24 +940,47 @@ fn handle_connection_cleanup(
             state.released_entity_generations = state.released_entity_generations.saturating_add(1);
         }
     }
+    if let Some(admission) = state
+        .pending_runtime
+        .unix_admissions
+        .remove(&cleanup.client_id)
+    {
+        admission.mux.close_all();
+    }
+    state
+        .pending_runtime
+        .close_adapters_for_client(&cleanup.client_id);
     for subscription in cleanup.attached_subscriptions {
-        let result = handle_control_request(
-            daemon,
-            &mut state.logical_clock,
-            &mut state.drain_cursors,
-            &mut state.pending_runtime,
-            DaemonObservability {
-                egress: &state.egress_diagnostics,
-                lifecycle: &state.lifecycle_counters,
-                client_id: Some(&cleanup.client_id),
-                grant_id: None,
-            },
-            control_tx.clone(),
-            DaemonRequest::Detach {
-                session_id: subscription.session_id,
-                subscription_id: subscription.subscription_id,
-            },
-        );
+        let bound = state
+            .pending_runtime
+            .is_adapter_bound(&subscription.session_id, &subscription.subscription_id);
+        let result = if bound {
+            state
+                .pending_runtime
+                .close_adapter(&subscription.session_id, &subscription.subscription_id);
+            state
+                .pending_runtime
+                .cancel_stream(&subscription.session_id, &subscription.subscription_id);
+            Ok(daemon_events(Vec::new()))
+        } else {
+            handle_control_request(
+                daemon,
+                &mut state.logical_clock,
+                &mut state.drain_cursors,
+                &mut state.pending_runtime,
+                DaemonObservability {
+                    egress: &state.egress_diagnostics,
+                    lifecycle: &state.lifecycle_counters,
+                    client_id: Some(&cleanup.client_id),
+                    grant_id: None,
+                },
+                control_tx.clone(),
+                DaemonRequest::Detach {
+                    session_id: subscription.session_id,
+                    subscription_id: subscription.subscription_id,
+                },
+            )
+        };
         state.lifecycle_counters.live_attach_subscriptions = state
             .lifecycle_counters
             .live_attach_subscriptions
@@ -957,6 +1038,20 @@ pub(crate) fn handle_control_message(
 ) -> bool {
     match message {
         ControlMessage::AcceptedConnection { .. } | ControlMessage::RejectedConnection => false,
+        ControlMessage::RegisterUnixAdmission {
+            client_id,
+            required_features,
+            mux,
+        } => {
+            state.pending_runtime.unix_admissions.insert(
+                client_id,
+                UnixAdmission {
+                    required_features,
+                    mux,
+                },
+            );
+            false
+        }
         ControlMessage::SubscribeEntities {
             entity_type,
             subscription_id,
@@ -1951,11 +2046,12 @@ fn handle_runtime_control_request(
             subscription_id,
         } => {
             let now = tick(logical_clock);
+            let client_id = observability
+                .client_id
+                .unwrap_or("botster-hub-daemon-socket")
+                .to_string();
             let owner = AttachStreamOwner {
-                client_id: observability
-                    .client_id
-                    .unwrap_or("botster-hub-daemon-socket")
-                    .to_string(),
+                client_id: client_id.clone(),
                 grant_id: observability.grant_id.map(str::to_string),
             };
             pending_runtime.start_attach(owner, session_id.clone(), subscription_id.clone());
@@ -1968,14 +2064,49 @@ fn handle_runtime_control_request(
                 Ok(events) => events,
                 Err(_) => {
                     pending_runtime.cancel_stream(&session_id, &subscription_id);
-                    vec![DaemonEvent::AttachState {
-                        session_id: session_id.clone(),
-                        subscription_id: subscription_id.clone(),
-                        state: botster_hub_client::ATTACH_STATE_ATTACH_FAILED.to_string(),
-                    }]
+                    return Ok(daemon_events(attach_failed_events(
+                        &session_id,
+                        &subscription_id,
+                    )));
                 }
             };
-            Ok(daemon_events(events))
+            let admission = pending_runtime.unix_admissions.get(&client_id).cloned();
+            let bind_unix = observability.grant_id.is_none()
+                && admission.as_ref().is_some_and(|admission| {
+                    hello_requires_unix_adapter(&admission.required_features)
+                });
+            if !bind_unix {
+                return Ok(daemon_events(events));
+            }
+            if !initial_attaching_only(&events) {
+                return Ok(daemon_events(fail_closed_pre_bind_attach(
+                    pending_runtime,
+                    runtime,
+                    &client_id,
+                    &session_id,
+                    &subscription_id,
+                    now,
+                    None,
+                )));
+            }
+            match bind_unix_adapter_after_attaching(
+                pending_runtime,
+                runtime,
+                UnixBindRequest {
+                    client_id: &client_id,
+                    session_id: &session_id,
+                    subscription_id: &subscription_id,
+                    required_features: admission
+                        .as_ref()
+                        .map(|admission| admission.required_features.as_slice())
+                        .unwrap_or(&[]),
+                    now_seconds: now,
+                    mux: admission.as_ref().map(|admission| &admission.mux),
+                },
+            ) {
+                Ok(_) => Ok(daemon_events(events)),
+                Err(failed) => Ok(daemon_events(failed)),
+            }
         }
         DaemonRequest::Detach {
             session_id,
@@ -1984,7 +2115,6 @@ fn handle_runtime_control_request(
             let now = tick(logical_clock);
             let tracked_session_id = session_id.clone();
             let tracked_subscription_id = subscription_id.clone();
-            pending_runtime.cancel_stream(&tracked_session_id, &tracked_subscription_id);
             let response = api.handle_request(
                 runtime,
                 &packages,
@@ -1995,6 +2125,8 @@ fn handle_runtime_control_request(
                     now_seconds: now,
                 },
             )?;
+            pending_runtime.close_adapter(&tracked_session_id, &tracked_subscription_id);
+            pending_runtime.cancel_stream(&tracked_session_id, &tracked_subscription_id);
             events_response(response.body)
         }
         DaemonRequest::SendInput { session_id, data } => {
@@ -2121,6 +2253,7 @@ fn handle_runtime_control_request(
                         .or_else(|| observability.client_id.map(str::to_string))
                         .unwrap_or_else(|| "botster-hub-daemon-socket".to_string()),
                 );
+                let bound = pending_runtime.is_adapter_bound(&session_id, &subscription_id);
                 let events = match runtime.drain_subscription(
                     &client_id,
                     &SessionId(session_id.clone()),
@@ -2130,14 +2263,12 @@ fn handle_runtime_control_request(
                     Ok(output) => crate::client_api::events_from_drain(output)
                         .into_iter()
                         .map(daemon_event_from_client)
+                        .filter(|event| !bound || !is_terminal_body_event(event))
                         .collect(),
                     Err(_) => {
+                        pending_runtime.close_adapter(&session_id, &subscription_id);
                         pending_runtime.cancel_stream(&session_id, &subscription_id);
-                        vec![DaemonEvent::AttachState {
-                            session_id: session_id.clone(),
-                            subscription_id,
-                            state: botster_hub_client::ATTACH_STATE_ATTACH_FAILED.to_string(),
-                        }]
+                        attach_failed_events(&session_id, &subscription_id)
                     }
                 };
                 if !events.is_empty() {
@@ -3324,11 +3455,23 @@ pub(crate) enum ControlMessage {
         entity_subscription_ids: Vec<String>,
         terminal_record: LocalWebrtcSenderTerminalRecord,
     },
+    RegisterUnixAdmission {
+        client_id: String,
+        required_features: Vec<String>,
+        mux: UnixConnectionMux,
+    },
+}
+
+#[derive(Clone)]
+struct UnixAdmission {
+    required_features: Vec<String>,
+    mux: UnixConnectionMux,
 }
 
 #[derive(Default)]
 pub(crate) struct PendingRuntimeState {
     pub(crate) streams: AttachStreamRegistry,
+    unix_admissions: BTreeMap<String, UnixAdmission>,
 }
 
 impl fmt::Debug for PendingRuntimeState {
@@ -3355,6 +3498,33 @@ impl std::ops::DerefMut for PendingRuntimeState {
 impl PendingRuntimeState {
     pub(super) fn retain_active_sessions(&mut self, active_session_ids: &BTreeSet<String>) {
         self.streams.retain_active_sessions(active_session_ids);
+    }
+}
+
+fn pump_bound_unix_routes(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
+    if state.pending_runtime.bound_routes().is_empty() {
+        return;
+    }
+    let Some(runtime) = daemon.runtime_mut() else {
+        return;
+    };
+    let inventory = runtime.list_terminal_subscriptions();
+    state.pending_runtime.reconcile_inventory(&inventory);
+    let now = state.logical_clock;
+    let routes = state.pending_runtime.bound_routes();
+    for (session_id, subscription_id, _) in routes {
+        let Some(client_id) = state
+            .pending_runtime
+            .stream_owner_client_id(&session_id, &subscription_id)
+        else {
+            continue;
+        };
+        let _ = runtime.drain_subscription(
+            &ClientId(client_id),
+            &SessionId(session_id),
+            &SubscriptionId(subscription_id),
+            now,
+        );
     }
 }
 
@@ -3498,7 +3668,8 @@ fn record_attached_subscription_change(
                 subscription.session_id.clone(),
                 subscription.subscription_id.clone(),
             );
-            if !state.live_attach_routes.insert(route.clone()) {
+            let inserted = state.live_attach_routes.insert(route.clone());
+            if !inserted && state.lifecycle_counters.live_attach_subscriptions > 0 {
                 return;
             }
             if state.released_attach_generations > 0 {
@@ -6127,6 +6298,18 @@ fn receive_test_control_message(
 }
 
 #[cfg(test)]
+fn receive_test_control_request(
+    receiver: &mut tokio_mpsc::Receiver<ControlMessage>,
+) -> ControlMessage {
+    loop {
+        match receive_test_control_message(receiver) {
+            ControlMessage::RegisterUnixAdmission { .. } => {}
+            message => return message,
+        }
+    }
+}
+
+#[cfg(test)]
 fn receive_test_control_reply(
     receiver: oneshot::Receiver<DaemonTransportResult<DaemonResponse>>,
 ) -> DaemonTransportResult<DaemonResponse> {
@@ -6280,7 +6463,7 @@ mod tests {
         .expect("write attach request");
         let ControlMessage::Request {
             request, reply_tx, ..
-        } = receive_test_control_message(&mut control_rx)
+        } = receive_test_control_request(&mut control_rx)
         else {
             panic!("expected attach control request");
         };
@@ -6295,7 +6478,7 @@ mod tests {
             .expect("disconnect daemon client");
         let ControlMessage::Request {
             request, reply_tx, ..
-        } = receive_test_control_message(&mut control_rx)
+        } = receive_test_control_request(&mut control_rx)
         else {
             panic!("expected detach control request");
         };
@@ -6342,7 +6525,7 @@ mod tests {
         .expect("write attach request");
         let ControlMessage::Request {
             request, reply_tx, ..
-        } = receive_test_control_message(&mut control_rx)
+        } = receive_test_control_request(&mut control_rx)
         else {
             panic!("expected attach control request");
         };
@@ -6395,7 +6578,7 @@ mod tests {
         .expect("write attach request");
         let ControlMessage::Request {
             request, reply_tx, ..
-        } = receive_test_control_message(&mut control_rx)
+        } = receive_test_control_request(&mut control_rx)
         else {
             panic!("expected attach control request");
         };
@@ -6416,7 +6599,7 @@ mod tests {
         .expect("write scoped drain");
         let ControlMessage::Request {
             request, reply_tx, ..
-        } = receive_test_control_message(&mut control_rx)
+        } = receive_test_control_request(&mut control_rx)
         else {
             panic!("expected drain control request");
         };
@@ -6699,7 +6882,7 @@ mod tests {
             response_delivery_rx,
             grant_id,
             ..
-        } = receive_test_control_message(&mut control_rx)
+        } = receive_test_control_request(&mut control_rx)
         else {
             panic!("expected shutdown control request");
         };

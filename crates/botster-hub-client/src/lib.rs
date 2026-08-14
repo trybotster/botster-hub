@@ -22,7 +22,7 @@ mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 pub const PROTOCOL_VERSION: u16 = 7;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 38;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 39;
 /// Oldest conformance revision accepted by the default first-party client requirement.
 pub const DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 36;
 /// Version of the local WebRTC delivery chunk framing protocol.
@@ -54,6 +54,14 @@ pub const FEATURE_HUB_SOURCE_UPDATE: &str = "hub_source_update";
 /// failure: `snapshot_history_incomplete` then `attached`, with no FINISH.
 pub const FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY: &str =
     "snapshot_delivery=ready_then_history";
+/// Optional Hub Unix adapter plane. Bind happens only when Hello requires this.
+pub const FEATURE_UNIX_TERMINAL_ADAPTER: &str = "unix_terminal_adapter";
+/// Mux envelope plane tag. Not a Snapshot/READY/PAGE/FINISH field.
+pub const UNIX_TERMINAL_PLANE: &str = "terminal";
+/// Mux envelope kind tag. The payload stays an opaque `TerminalFrame` blob.
+pub const UNIX_TERMINAL_KIND: &str = "frame";
+/// Wire `AttachState.state` for the initial pre-bind handshake.
+pub const ATTACH_STATE_ATTACHING: &str = "attaching";
 /// Wire `AttachState.state` after a post-READY history failure.
 pub const ATTACH_STATE_SNAPSHOT_HISTORY_INCOMPLETE: &str = "snapshot_history_incomplete";
 /// Wire `AttachState.state` when attach fails before any READY Snapshot.
@@ -137,7 +145,15 @@ pub struct DaemonConnection {
 impl DaemonConnection {
     /// Connect to the daemon and complete the socket protocol handshake.
     pub fn connect(endpoint: &DaemonEndpoint) -> DaemonTransportResult<Self> {
-        let stream = connect_and_hello(endpoint)?;
+        Self::connect_with_requirement(endpoint, &DaemonCompatibilityRequirement::current())
+    }
+
+    /// Connect with an explicit Hello requirement.
+    pub fn connect_with_requirement(
+        endpoint: &DaemonEndpoint,
+        requirement: &DaemonCompatibilityRequirement,
+    ) -> DaemonTransportResult<Self> {
+        let stream = connect_and_hello_with_requirement(endpoint, requirement)?;
         let reader = BufReader::new(stream.try_clone().map_err(normalize_socket_io_error)?);
         Ok(Self { stream, reader })
     }
@@ -262,11 +278,12 @@ fn stream_attach_connected(
     )?;
     let response: DaemonResponse = read_frame(stream)?;
     write_terminal_events(&response.events, output)?;
-    if response.events.iter().any(DaemonEvent::is_process_exit) {
+    if stream_attach_should_complete(&response.events, false) {
         return Ok(());
     }
     let mut idle_drains = 0;
     let mut lifecycle_exited = false;
+    let mut restored_screen = false;
 
     loop {
         thread::sleep(ATTACH_DRAIN_INTERVAL);
@@ -284,7 +301,10 @@ fn stream_attach_connected(
             idle_drains = 0;
         }
         write_terminal_events(&response.events, output)?;
-        if response.events.iter().any(DaemonEvent::is_process_exit) || lifecycle_exited {
+        if !restored_screen && events_ready_for_read_screen(&response.events) {
+            restored_screen = write_read_screen(stream, session_id, output)?;
+        }
+        if stream_attach_should_complete(&response.events, lifecycle_exited) {
             return Ok(());
         }
         if idle_drains >= 20 {
@@ -406,6 +426,14 @@ fn read_value_frame_from_reader(
     serde_json::from_str(&line).map_err(DaemonTransportError::Json)
 }
 
+/// Read one muxed Unix line: a control response or an opaque terminal envelope.
+pub fn read_unix_mux_frame_from_reader(
+    reader: &mut BufReader<UnixStream>,
+) -> DaemonTransportResult<DaemonUnixMuxFrame> {
+    let value = read_value_frame_from_reader(reader)?;
+    parse_unix_mux_value(value).map_err(DaemonTransportError::Json)
+}
+
 fn read_hello_ack(stream: &mut UnixStream) -> DaemonTransportResult<DaemonHelloAck> {
     let mut reader = BufReader::new(stream.try_clone().map_err(normalize_socket_io_error)?);
     let value = read_value_frame_from_reader(&mut reader)?;
@@ -479,6 +507,54 @@ fn write_terminal_events(
         }
     }
     Ok(())
+}
+
+fn events_ready_for_read_screen(events: &[DaemonEvent]) -> bool {
+    events.iter().any(|event| match event {
+        DaemonEvent::Snapshot { .. } => true,
+        DaemonEvent::AttachState { state, .. } => state == "attached",
+        _ => false,
+    })
+}
+
+fn stream_attach_should_complete(events: &[DaemonEvent], lifecycle_exited: bool) -> bool {
+    lifecycle_exited
+        || events.iter().any(|event| {
+            event.is_process_exit()
+                || matches!(
+                    event,
+                    DaemonEvent::AttachState { state, .. }
+                        if state == ATTACH_STATE_ATTACH_FAILED
+                )
+        })
+}
+
+fn write_read_screen(
+    stream: &mut UnixStream,
+    session_id: &str,
+    output: &mut impl Write,
+) -> DaemonTransportResult<bool> {
+    write_frame(
+        stream,
+        &DaemonRequest::ReadScreen {
+            session_id: session_id.to_string(),
+        },
+    )?;
+    let response: DaemonResponse = read_frame(stream)?;
+    let Some(screen) = response.read_screen else {
+        return Ok(false);
+    };
+    if screen.text.trim().is_empty() {
+        return Ok(false);
+    }
+    output
+        .write_all(screen.text.as_bytes())
+        .map_err(DaemonTransportError::Io)?;
+    if !screen.text.ends_with('\n') {
+        output.write_all(b"\n").map_err(DaemonTransportError::Io)?;
+    }
+    output.flush().map_err(DaemonTransportError::Io)?;
+    Ok(true)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -587,6 +663,17 @@ impl DaemonCompatibilityRequirement {
         requirement
             .required_features
             .push(FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY.to_string());
+        requirement.minimum_conformance_fixture_revision = CONFORMANCE_FIXTURE_REVISION;
+        requirement
+    }
+
+    /// Build the requirement for the optional Unix terminal adapter plane.
+    #[must_use]
+    pub fn for_unix_terminal_adapter() -> Self {
+        let mut requirement = Self::current();
+        requirement
+            .required_features
+            .push(FEATURE_UNIX_TERMINAL_ADAPTER.to_string());
         requirement.minimum_conformance_fixture_revision = CONFORMANCE_FIXTURE_REVISION;
         requirement
     }
@@ -705,6 +792,7 @@ fn current_feature_list() -> Vec<&'static str> {
     let mut features = default_required_feature_list();
     features.push(FEATURE_HUB_SOURCE_UPDATE);
     features.push(FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY);
+    features.push(FEATURE_UNIX_TERMINAL_ADAPTER);
     features
 }
 
@@ -2660,6 +2748,66 @@ impl DaemonEvent {
     }
 }
 
+/// Content-blind Unix adapter envelope. Plane and kind are tags only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct DaemonUnixTerminalEnvelope {
+    pub plane: String,
+    pub kind: String,
+    pub session_id: String,
+    pub subscription_id: String,
+    pub payload_base64: String,
+}
+
+impl DaemonUnixTerminalEnvelope {
+    /// Wrap opaque terminal-frame bytes. Does not inspect the payload.
+    #[must_use]
+    pub fn from_frame_bytes(
+        session_id: impl Into<String>,
+        subscription_id: impl Into<String>,
+        frame_bytes: &[u8],
+    ) -> Self {
+        Self {
+            plane: UNIX_TERMINAL_PLANE.to_string(),
+            kind: UNIX_TERMINAL_KIND.to_string(),
+            session_id: session_id.into(),
+            subscription_id: subscription_id.into(),
+            payload_base64: base64::engine::general_purpose::STANDARD.encode(frame_bytes),
+        }
+    }
+
+    /// Decode the opaque payload. Does not interpret Snapshot or attach phases.
+    pub fn payload_bytes(&self) -> Result<Vec<u8>, String> {
+        base64::engine::general_purpose::STANDARD
+            .decode(&self.payload_base64)
+            .map_err(|error| format!("invalid unix terminal payload base64: {error}"))
+    }
+
+    #[must_use]
+    pub fn is_unix_terminal_plane(&self) -> bool {
+        self.plane == UNIX_TERMINAL_PLANE && self.kind == UNIX_TERMINAL_KIND
+    }
+}
+
+/// One JSON line on a muxed Unix adapter connection.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DaemonUnixMuxFrame {
+    Response(Box<DaemonResponse>),
+    Terminal(DaemonUnixTerminalEnvelope),
+}
+
+/// Classify one decoded JSON line without inspecting terminal payload bytes.
+pub fn parse_unix_mux_value(value: Value) -> Result<DaemonUnixMuxFrame, serde_json::Error> {
+    if value.get("plane").and_then(Value::as_str) == Some(UNIX_TERMINAL_PLANE)
+        && value.get("kind").and_then(Value::as_str) == Some(UNIX_TERMINAL_KIND)
+    {
+        return serde_json::from_value(value).map(DaemonUnixMuxFrame::Terminal);
+    }
+    serde_json::from_value(value)
+        .map(Box::new)
+        .map(DaemonUnixMuxFrame::Response)
+}
+
 pub type DaemonTransportResult<T> = Result<T, DaemonTransportError>;
 
 /// Deterministic TypeScript definitions for the browser-visible daemon protocol.
@@ -3009,7 +3157,7 @@ mod tests {
         assert!(
             error
                 .diagnostic
-                .contains("unsupported conformance fixture revision 36; requires at least 38")
+                .contains("unsupported conformance fixture revision 36; requires at least 39")
         );
 
         previous_daemon.conformance_fixture_revision = CONFORMANCE_FIXTURE_REVISION;
@@ -3051,7 +3199,7 @@ mod tests {
         assert!(
             error
                 .diagnostic
-                .contains("unsupported conformance fixture revision 36; requires at least 38")
+                .contains("unsupported conformance fixture revision 36; requires at least 39")
         );
 
         previous_daemon.conformance_fixture_revision = CONFORMANCE_FIXTURE_REVISION;
@@ -3065,6 +3213,72 @@ mod tests {
 
         ensure_compatible(&requirement, &DaemonCompatibility::current())
             .expect("a ready-then-history client accepts the current daemon");
+    }
+
+    #[test]
+    fn default_requirement_accepts_daemon_before_optional_unix_terminal_adapter() {
+        let mut previous_daemon = DaemonCompatibility::current();
+        previous_daemon.conformance_fixture_revision = DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION;
+        previous_daemon
+            .features
+            .retain(|feature| feature != FEATURE_UNIX_TERMINAL_ADAPTER);
+
+        ensure_compatible(&DaemonCompatibilityRequirement::current(), &previous_daemon)
+            .expect("the optional unix adapter capability must not break default clients");
+    }
+
+    #[test]
+    fn unix_terminal_adapter_requirement_rejects_old_daemon_and_accepts_current_daemon() {
+        let requirement = DaemonCompatibilityRequirement::for_unix_terminal_adapter();
+        let mut previous_daemon = DaemonCompatibility::current();
+        previous_daemon.conformance_fixture_revision = DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION;
+        previous_daemon
+            .features
+            .retain(|feature| feature != FEATURE_UNIX_TERMINAL_ADAPTER);
+
+        let error = ensure_compatible(&requirement, &previous_daemon)
+            .expect_err("a unix-adapter client must reject an old daemon");
+        assert!(error.diagnostic.contains(&format!(
+            "unsupported conformance fixture revision {}; requires at least {CONFORMANCE_FIXTURE_REVISION}",
+            DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION
+        )));
+
+        previous_daemon.conformance_fixture_revision = CONFORMANCE_FIXTURE_REVISION;
+        let error = ensure_compatible(&requirement, &previous_daemon)
+            .expect_err("a unix-adapter client must require the advertised feature");
+        assert!(
+            error
+                .diagnostic
+                .contains("missing required feature(s): unix_terminal_adapter")
+        );
+
+        ensure_compatible(&requirement, &DaemonCompatibility::current())
+            .expect("a unix-adapter client accepts the current daemon");
+    }
+
+    #[test]
+    fn unix_mux_helper_is_content_blind() {
+        let envelope = DaemonUnixTerminalEnvelope::from_frame_bytes(
+            "session",
+            "sub",
+            br#"{"type":"terminal_output","marker":"opaque"}"#,
+        );
+        assert!(envelope.is_unix_terminal_plane());
+        let value = serde_json::to_value(&envelope).expect("envelope serializes");
+        assert_eq!(value["plane"], UNIX_TERMINAL_PLANE);
+        assert_eq!(value["kind"], UNIX_TERMINAL_KIND);
+        assert!(value.get("history").is_none());
+        assert!(value.get("state").is_none());
+        let parsed = parse_unix_mux_value(value).expect("parse envelope");
+        match parsed {
+            DaemonUnixMuxFrame::Terminal(parsed) => {
+                assert_eq!(
+                    parsed.payload_bytes().expect("payload decodes"),
+                    br#"{"type":"terminal_output","marker":"opaque"}"#
+                );
+            }
+            DaemonUnixMuxFrame::Response(_) => panic!("envelope must not parse as a response"),
+        }
     }
 
     #[test]
@@ -3432,7 +3646,7 @@ mod tests {
     #[test]
     fn protocol_seven_rejects_protocol_six_and_accepts_conformance_floor_thirty_five() {
         assert_eq!(PROTOCOL_VERSION, 7);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 38);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 39);
 
         let protocol_six = DaemonCompatibilityRequirement {
             protocol_version: 6,
@@ -5947,7 +6161,7 @@ mod tests {
     #[test]
     fn protocol_six_and_conformance_thirty_two_define_the_cold_cut_boundary() {
         assert_eq!(PROTOCOL_VERSION, 7);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 38);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 39);
 
         let requirement = DaemonCompatibilityRequirement::current();
         let protocol_error = ensure_compatible(
@@ -6012,7 +6226,7 @@ mod tests {
         // conformance revision: bumping the protocol would break every existing
         // first-party client that never issues this request.
         assert_eq!(PROTOCOL_VERSION, 7);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 38);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 39);
         assert_eq!(DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION, 36);
         assert_eq!(
             current_feature_list(),
@@ -6033,6 +6247,7 @@ mod tests {
                 FEATURE_MODE_GATED_INPUT,
                 FEATURE_HUB_SOURCE_UPDATE,
                 FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY,
+                FEATURE_UNIX_TERMINAL_ADAPTER,
             ],
             "the daemon advertises all current capabilities",
         );

@@ -1582,3 +1582,44 @@ clients that need incremental READY-then-history use
 `DaemonCompatibilityRequirement::for_ready_then_history_attach()`. On the
 success path a real opaque FINISH Snapshot precedes `attached`. A production
 socket Drain receives READY before later PAGE/FINISH frames.
+
+## Unix terminal adapter plane
+
+`unix_terminal_adapter` is an optional Hub daemon feature. The daemon
+advertises it. `DaemonCompatibilityRequirement::current()` does not require
+it. Clients that want the adapter plane use
+`DaemonCompatibilityRequirement::for_unix_terminal_adapter()`.
+`PROTOCOL_VERSION` remains 7. Advertising this feature advances
+`CONFORMANCE_FIXTURE_REVISION` to 39.
+
+Unix admission is Hello plus LocalOperator. There is no WebRTC-style
+`BootstrapGrant` on the local Unix socket. The admission lifetime is the
+connection lifetime. EOF, write failure, or close revokes that admission.
+
+When Hello requires `unix_terminal_adapter` and Attach succeeds:
+
+1. The Attach response may carry only the initial `AttachState attaching`
+   event. That one-frame exception is transitional.
+   `ticket_1786661010_198387` removes it.
+2. Any other pre-bind terminal event (Snapshot, later AttachState,
+   TerminalOutput, ProcessExit) is fail-closed: Hub cancels the route, closes
+   any adapter candidate, detaches the live generation, and returns
+   `attach_failed`. Hub does not drop those frames.
+3. Hub intersects `TerminalCompatibility` advertised tokens with LocalOperator
+   admission, includes `snapshot_delivery=ready_then_history` only when Hello
+   required that feature, and binds the resulting `TerminalCapabilitySet`
+   into Core.
+4. Later terminal frames leave only as unsolicited
+   `DaemonUnixTerminalEnvelope` JSON lines: `plane=terminal`, `kind=frame`,
+   plus opaque `payload_base64` from `TerminalFrame::to_bytes()`. Hub does
+   not inspect READY, PAGE, FINISH, later AttachState, or GHOSTSNP bodies.
+5. Bound-route Drain still advances control-plane lifecycle. It must not
+   return AttachState, Snapshot, TerminalOutput, or ProcessExited.
+6. Bound-route connection death closes the adapter only. Hub does not send
+   Detach. Explicit client Detach remains a separate authorized request.
+   Neither path shuts down the host session.
+
+Current clients that omit the feature stay on Drain translation until the
+cold-cut ticket. WebRTC attaches (`grant_id` present) do not receive a Unix
+adapter. Use `parse_unix_mux_value` to separate control responses from
+opaque adapter envelopes.

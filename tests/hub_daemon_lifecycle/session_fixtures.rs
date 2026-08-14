@@ -197,10 +197,15 @@ where
                 session_id: session_id.to_string(),
             })
             .expect("read_mode_flags");
-        assert_eq!(
-            response.kind,
-            botster_hub_client::DaemonResponseKind::ReadModeFlags
-        );
+        if response.kind != botster_hub_client::DaemonResponseKind::ReadModeFlags {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for mode flags on {session_id}: {:?}",
+                response.kind
+            );
+            thread::sleep(Duration::from_millis(20));
+            continue;
+        }
         let mode_flags = response.mode_flags.expect("mode flags body");
         if predicate(&mode_flags) {
             return mode_flags;

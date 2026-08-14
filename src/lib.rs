@@ -73,6 +73,7 @@ pub mod session_types;
 #[doc(hidden)]
 pub mod source_update;
 pub mod spawn_targets;
+mod unix_terminal_adapter;
 pub mod worktrees;
 
 use botster_core::CapabilitySurface;
