@@ -111,12 +111,14 @@ use crate::{Worktree, WorktreeCreate, WorktreeError};
 
 #[path = "daemon_attach_stream.rs"]
 mod daemon_attach_stream;
-pub(crate) use daemon_attach_stream::negotiated_unix_capability_set;
 use daemon_attach_stream::{
     AttachStreamOwner, AttachStreamRegistry, UnixBindRequest, WebrtcBindRequest,
     attach_failed_events, bind_unix_adapter_after_attaching, bind_webrtc_adapter_after_attaching,
     fail_closed_pre_bind_attach, hello_requires_unix_adapter, hello_requires_webrtc_adapter,
     initial_attaching_only, is_terminal_body_event, live_generation_for_route,
+};
+pub(crate) use daemon_attach_stream::{
+    hello_requires_terminal_subscription_closed, negotiated_unix_capability_set,
 };
 
 #[path = "daemon_package_control.rs"]
@@ -2165,6 +2167,7 @@ pub(crate) fn handle_control_message(
             }
             if let Some(runtime) = daemon.runtime() {
                 queue_unix_subscription_closed_events(runtime, &state.pending_runtime);
+                queue_webrtc_subscription_closed_events(runtime, &state.pending_runtime);
             }
             if let Ok(response) = response.as_ref() {
                 let change = attached_subscription_change_for_response(&request, response);
@@ -2866,6 +2869,7 @@ fn handle_runtime_control_request(
                 ));
             }
             suppress_unix_session_close_events(pending_runtime, &session_id);
+            suppress_webrtc_session_close_events(pending_runtime, &session_id);
             Ok(daemon_response_base(DaemonResponseKind::SessionRemoved))
         }
         DaemonRequest::Status => {
@@ -3086,6 +3090,17 @@ fn handle_runtime_control_request(
                     generation.0,
                 );
             }
+            if let Some(grant_id) = observability.grant_id
+                && let Some(WebrtcTerminalAdmission::Admitted { mux, .. }) =
+                    pending_runtime.webrtc_admissions.get(grant_id)
+                && let Some(generation) = generation
+            {
+                mux.suppress_generation(
+                    tracked_session_id.clone(),
+                    tracked_subscription_id.clone(),
+                    generation.0,
+                );
+            }
             pending_runtime.close_adapter(&tracked_session_id, &tracked_subscription_id);
             pending_runtime.cancel_stream(&tracked_session_id, &tracked_subscription_id);
             events_response(response.body)
@@ -3174,6 +3189,7 @@ fn handle_runtime_control_request(
                 Err(error) => {
                     if shutdown_error_is_unknown_session(&error) {
                         suppress_unix_session_close_events(pending_runtime, &session_id);
+                        suppress_webrtc_session_close_events(pending_runtime, &session_id);
                         return Ok(daemon_session_cleanup(DaemonSessionCleanup {
                             session_id: session_id.clone(),
                             outcome: "already_exited".to_string(),
@@ -3182,10 +3198,12 @@ fn handle_runtime_control_request(
                     return match classify_shutdown_session(runtime, &session_id)? {
                         ShutdownSessionClassification::Cleanup(cleanup) => {
                             suppress_unix_session_close_events(pending_runtime, &session_id);
+                            suppress_webrtc_session_close_events(pending_runtime, &session_id);
                             Ok(daemon_session_cleanup(cleanup))
                         }
                         ShutdownSessionClassification::Missing => {
                             suppress_unix_session_close_events(pending_runtime, &session_id);
+                            suppress_webrtc_session_close_events(pending_runtime, &session_id);
                             Ok(daemon_unknown_session_cleanup(&session_id))
                         }
                         ShutdownSessionClassification::Active => {
@@ -3195,6 +3213,7 @@ fn handle_runtime_control_request(
                 }
             };
             suppress_unix_session_close_events(pending_runtime, &session_id);
+            suppress_webrtc_session_close_events(pending_runtime, &session_id);
             events_response(response.body)
         }
         DaemonRequest::Drain {
@@ -4325,6 +4344,14 @@ fn suppress_unix_session_close_events(pending_runtime: &PendingRuntimeState, ses
     }
 }
 
+fn suppress_webrtc_session_close_events(pending_runtime: &PendingRuntimeState, session_id: &str) {
+    for admission in pending_runtime.webrtc_admissions.values() {
+        if let WebrtcTerminalAdmission::Admitted { mux, .. } = admission {
+            mux.suppress_session(session_id);
+        }
+    }
+}
+
 fn session_suppresses_terminal_subscription_closed(
     runtime: &crate::HubRuntime,
     session_id: &str,
@@ -4356,6 +4383,19 @@ fn queue_unix_subscription_closed_events(
 ) {
     for admission in pending_runtime.unix_admissions.values() {
         if let UnixTerminalAdmission::Admitted { mux, .. } = admission {
+            mux.queue_closed_subscription_events(|session_id| {
+                !session_suppresses_terminal_subscription_closed(runtime, session_id)
+            });
+        }
+    }
+}
+
+fn queue_webrtc_subscription_closed_events(
+    runtime: &crate::HubRuntime,
+    pending_runtime: &PendingRuntimeState,
+) {
+    for admission in pending_runtime.webrtc_admissions.values() {
+        if let WebrtcTerminalAdmission::Admitted { mux, .. } = admission {
             mux.queue_closed_subscription_events(|session_id| {
                 !session_suppresses_terminal_subscription_closed(runtime, session_id)
             });
@@ -4604,6 +4644,7 @@ fn pump_bound_unix_routes(daemon: &mut HubDaemon, state: &mut DaemonControlState
     };
     let inventory = runtime.list_terminal_subscriptions();
     queue_unix_subscription_closed_events(runtime, &state.pending_runtime);
+    queue_webrtc_subscription_closed_events(runtime, &state.pending_runtime);
     state.pending_runtime.reconcile_inventory(&inventory);
     let now = state.logical_clock;
     let routes = state.pending_runtime.bound_routes();

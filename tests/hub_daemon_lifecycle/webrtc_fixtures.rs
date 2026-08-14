@@ -84,6 +84,8 @@ pub(crate) struct LocalWebrtcOfferPeer {
     pub(crate) data_channel_message_rx: AsyncReceiver<String>,
     pub(crate) pending_entity_frames: VecDeque<botster_hub_client::DaemonEntityFrame>,
     pub(crate) pending_terminal_frames: VecDeque<(String, Vec<u8>)>,
+    pub(crate) pending_host_events: VecDeque<botster_hub_client::DaemonEvent>,
+    pub(crate) accept_host_events: bool,
 }
 
 pub(crate) struct ExtraWebrtcDataChannel {
@@ -164,6 +166,8 @@ impl LocalWebrtcOfferPeer {
                 data_channel_message_rx,
                 pending_entity_frames: VecDeque::new(),
                 pending_terminal_frames: VecDeque::new(),
+                pending_host_events: VecDeque::new(),
+                accept_host_events: false,
             },
             offer,
         ))
@@ -222,6 +226,9 @@ impl LocalWebrtcOfferPeer {
                     self.pending_terminal_frames
                         .push_back((String::new(), plaintext));
                 }
+                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonEvent => {
+                    self.park_or_reject_host_event(&plaintext)?;
+                }
             }
         }
     }
@@ -248,6 +255,9 @@ impl LocalWebrtcOfferPeer {
                 botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonTerminalFrame => {
                     self.pending_terminal_frames
                         .push_back((String::new(), plaintext));
+                }
+                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonEvent => {
+                    self.park_or_reject_host_event(&plaintext)?;
                 }
             }
         }
@@ -293,6 +303,59 @@ impl LocalWebrtcOfferPeer {
                 botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonResponse => {
                     return Err(std::io::Error::other(
                         "received daemon response while waiting for terminal frame",
+                    )
+                    .into());
+                }
+                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonEvent => {
+                    self.park_or_reject_host_event(&plaintext)?;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn enable_host_events(&mut self) {
+        self.accept_host_events = true;
+    }
+
+    fn park_or_reject_host_event(
+        &mut self,
+        plaintext: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !self.accept_host_events {
+            return Err(std::io::Error::other(
+                "unnegotiated IsolatedHub receive path must not decode daemon_event",
+            )
+            .into());
+        }
+        self.pending_host_events
+            .push_back(serde_json::from_slice(plaintext)?);
+        Ok(())
+    }
+
+    pub(crate) async fn next_host_event(
+        &mut self,
+        key: &AesGcmKey,
+    ) -> Result<botster_hub_client::DaemonEvent, Box<dyn std::error::Error>> {
+        if let Some(event) = self.pending_host_events.pop_front() {
+            return Ok(event);
+        }
+        loop {
+            let (delivery_kind, plaintext, _) = self.receive_delivery(key).await?;
+            match delivery_kind {
+                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonEvent => {
+                    return Ok(serde_json::from_slice(&plaintext)?);
+                }
+                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonTerminalFrame => {
+                    self.pending_terminal_frames
+                        .push_back((String::new(), plaintext));
+                }
+                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonEntityFrame => {
+                    self.pending_entity_frames
+                        .push_back(serde_json::from_slice(&plaintext)?);
+                }
+                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonResponse => {
+                    return Err(std::io::Error::other(
+                        "received daemon response while waiting for host event",
                     )
                     .into());
                 }

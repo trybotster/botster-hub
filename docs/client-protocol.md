@@ -1594,7 +1594,7 @@ it. Clients that want the adapter plane use
 `DaemonCompatibilityRequirement::for_unix_terminal_adapter()`.
 `PROTOCOL_VERSION` remains 7. Advertising this feature,
 `terminal_subscription_closed`, and `webrtc_terminal_adapter` advances
-`CONFORMANCE_FIXTURE_REVISION` to 40. The default client requirement stays
+`CONFORMANCE_FIXTURE_REVISION` to 41. The default client requirement stays
 at revision 36.
 
 `DaemonHello` may send a Core `TerminalCompatibilityRequirement`. Absence is
@@ -1656,8 +1656,8 @@ it. Clients that want the adapter plane send an encrypted DataChannel
 `DaemonHello` whose `required_features` include
 `webrtc_terminal_adapter`, then call
 `DaemonCompatibilityRequirement::for_webrtc_terminal_adapter()`.
-`PROTOCOL_VERSION` remains 7. Advertising this feature advances
-`CONFORMANCE_FIXTURE_REVISION` to 40.
+`PROTOCOL_VERSION` remains 7. Advertising this feature and the negotiated
+`daemon_event` close delivery advances `CONFORMANCE_FIXTURE_REVISION` to 41.
 
 WebRTC protocol admission is DataChannel Hello after pairing, grant,
 origin, and AES-GCM crypto. Hub replies with encrypted `DaemonHelloAck`
@@ -1691,6 +1691,26 @@ succeeds:
    Explicit client Detach remains a separate authorized request.
    Neither path shuts down the host session.
 
+When a bound WebRTC adapter or Core write-budget hard-stop closes a live
+generation and the peer stays up, Hub emits unsolicited
+`DaemonEvent::TerminalSubscriptionClosed` with `session_id`,
+`subscription_id`, `generation`, and reason `host_adapter_closed` or
+`core_adapter_closed`. Hub sends that event only as
+`DaemonLocalWebrtcDeliveryKind::DaemonEvent`, and only after encrypted
+DataChannel Hello required `terminal_subscription_closed`. Protocol stays
+7. Unnegotiated protocol-7 adapter clients never receive or decode the
+new delivery kind. Host Status and ListSessions stay available on the
+same peer. A sibling adapter on that peer may keep writing
+`daemon_terminal_frame`. `host_adapter_closed` is host egress close. It is
+not the Core write-budget oracle. Connection death, Detach, process exit,
+and session removal do not emit this event.
+
+Clients that want the close event use
+`DaemonCompatibilityRequirement::for_webrtc_terminal_subscription_closed()`.
+That helper requires both `webrtc_terminal_adapter` and
+`terminal_subscription_closed`. `for_webrtc_terminal_adapter()` and
+`DaemonCompatibilityRequirement::current()` do not add the close feature.
+
 Current WebRTC clients that omit DataChannel Hello stay on Drain
 translation until the Web decoder ticket. They must not receive
-`daemon_terminal_frame`.
+`daemon_terminal_frame` or `daemon_event`.

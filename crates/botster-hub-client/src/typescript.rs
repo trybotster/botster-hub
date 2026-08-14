@@ -51,6 +51,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             "daemon_response",
             "daemon_entity_frame",
             "daemon_terminal_frame",
+            "daemon_event",
         ],
     );
 
