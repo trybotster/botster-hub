@@ -983,10 +983,13 @@ The control-plane production route is:
 `botster_hub_client::DaemonConnection::request`
 to the daemon socket, then `src/daemon_transport.rs` `serve_daemon`/`handle_connection`, then `handle_runtime_control_request`, then `HubClientApi::handle_request`, then `HubRuntime` and the core daemon `SessionIo`/`ClientWorker` terminal data plane.
 
-Terminal attach and drain conformance uses `botster_hub_client::stream_attach`.
-That helper still connects through the daemon socket, but terminal bytes are
-delivered by the hub-owned client/session actor data plane rather than by a
-private session-worker frame contract.
+Published client conformance drives Attach and scoped Drain through
+`botster_hub_client::DaemonConnection`. Held-open `stream_attach` is a separate
+production helper: it still connects through the daemon socket, and a live
+IsolatedHub test (`unix_adapter_unbound_stream_attach_returns_late_bytes`)
+proves it returns late terminal bytes and completes after the process exits.
+Terminal bytes are delivered by the hub-owned client/session actor data plane
+rather than by a private session-worker frame contract.
 
 `DaemonEvent::TerminalOutput` carries renderable live PTY bytes in the same
 validated envelope as Snapshot/Scrollback: `payload_base64`, literal

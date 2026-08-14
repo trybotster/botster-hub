@@ -23,6 +23,13 @@ use crate::unix_terminal_adapter::{
     UnixConnectionMux, UnixTerminalAdapter, UnixTerminalAdapterHandle,
 };
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ConnectionBoundRoute {
+    pub session_id: String,
+    pub subscription_id: String,
+    pub generation: TerminalSubscriptionGeneration,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AttachStreamOwner {
     pub client_id: String,
@@ -75,7 +82,7 @@ pub(crate) struct AttachStreamRegistry {
     streams: BTreeMap<(String, String), AttachStream>,
     pub(crate) active_subscriptions: BTreeMap<String, BTreeSet<String>>,
     pub(crate) attach_owner_grant_ids: BTreeMap<(String, String), String>,
-    connection_bound_routes: BTreeMap<String, BTreeSet<(String, String)>>,
+    connection_bound_routes: BTreeMap<String, BTreeSet<ConnectionBoundRoute>>,
 }
 
 impl AttachStreamRegistry {
@@ -157,6 +164,7 @@ impl AttachStreamRegistry {
     }
 
     pub(crate) fn cancel_stream(&mut self, session_id: &str, subscription_id: &str) {
+        self.forget_connection_bound_route(session_id, subscription_id);
         self.streams
             .remove(&(session_id.to_string(), subscription_id.to_string()));
         if let Some(subscriptions) = self.active_subscriptions.get_mut(session_id) {
@@ -167,6 +175,21 @@ impl AttachStreamRegistry {
         }
         self.attach_owner_grant_ids
             .remove(&(session_id.to_string(), subscription_id.to_string()));
+    }
+
+    fn forget_connection_bound_route(&mut self, session_id: &str, subscription_id: &str) {
+        let mut empty_clients = Vec::new();
+        for (client_id, routes) in &mut self.connection_bound_routes {
+            routes.retain(|route| {
+                route.session_id != session_id || route.subscription_id != subscription_id
+            });
+            if routes.is_empty() {
+                empty_clients.push(client_id.clone());
+            }
+        }
+        for client_id in empty_clients {
+            self.connection_bound_routes.remove(&client_id);
+        }
     }
 
     pub(crate) fn retain_active_sessions(&mut self, active_session_ids: &BTreeSet<String>) {
@@ -283,17 +306,35 @@ impl AttachStreamRegistry {
             self.connection_bound_routes
                 .entry(client_id)
                 .or_default()
-                .insert(key);
+                .insert(ConnectionBoundRoute {
+                    session_id: key.0,
+                    subscription_id: key.1,
+                    generation,
+                });
         }
     }
 
     pub(crate) fn take_connection_bound_routes(
         &mut self,
         client_id: &str,
-    ) -> BTreeSet<(String, String)> {
+    ) -> BTreeSet<ConnectionBoundRoute> {
         self.connection_bound_routes
             .remove(client_id)
             .unwrap_or_default()
+    }
+
+    pub(crate) fn connection_bound_route_still_owned(
+        &self,
+        client_id: &str,
+        session_id: &str,
+        subscription_id: &str,
+        generation: TerminalSubscriptionGeneration,
+    ) -> bool {
+        self.streams
+            .get(&(session_id.to_string(), subscription_id.to_string()))
+            .is_some_and(|stream| {
+                stream.owner.client_id == client_id && stream.generation == Some(generation)
+            })
     }
 }
 
@@ -601,9 +642,64 @@ mod tests {
         );
         let recorded = registry.take_connection_bound_routes("client-a");
         assert!(
-            recorded.contains(&("s".to_string(), "sub".to_string())),
+            recorded.iter().any(|route| {
+                route.session_id == "s"
+                    && route.subscription_id == "sub"
+                    && route.generation == TerminalSubscriptionGeneration(1)
+            }),
             "connection-scoped bound routes must survive adapter close"
         );
+        assert!(
+            registry.connection_bound_route_still_owned(
+                "client-a",
+                "s",
+                "sub",
+                TerminalSubscriptionGeneration(1)
+            ),
+            "close must keep owner and generation for cleanup matching"
+        );
+    }
+
+    #[test]
+    fn cancel_stream_forgets_connection_bound_ledger_and_rejects_stale_owner() {
+        let mut registry = AttachStreamRegistry::default();
+        registry.start_attach(owner(), "s".into(), "sub".into());
+        let (_, handle_a) = UnixTerminalAdapter::pair();
+        registry.mark_adapter_bound("s", "sub", TerminalSubscriptionGeneration(1), handle_a);
+        registry.cancel_stream("s", "sub");
+        assert!(
+            registry.take_connection_bound_routes("client-a").is_empty(),
+            "every cancel path must drop the closing client's ledger entry"
+        );
+
+        let replacement = AttachStreamOwner {
+            client_id: "client-b".to_string(),
+            grant_id: None,
+        };
+        registry.start_attach(replacement, "s".into(), "sub".into());
+        let (_, handle_b) = UnixTerminalAdapter::pair();
+        registry.mark_adapter_bound("s", "sub", TerminalSubscriptionGeneration(2), handle_b);
+        assert!(
+            !registry.connection_bound_route_still_owned(
+                "client-a",
+                "s",
+                "sub",
+                TerminalSubscriptionGeneration(1)
+            ),
+            "stale owner+generation must not match the replacement route"
+        );
+        assert!(registry.connection_bound_route_still_owned(
+            "client-b",
+            "s",
+            "sub",
+            TerminalSubscriptionGeneration(2)
+        ));
+        let recorded_b = registry.take_connection_bound_routes("client-b");
+        assert!(recorded_b.iter().any(|route| {
+            route.session_id == "s"
+                && route.subscription_id == "sub"
+                && route.generation == TerminalSubscriptionGeneration(2)
+        }));
     }
 
     #[test]

@@ -31,6 +31,29 @@ fn request_skipping_envelopes(
     }
 }
 
+fn unix_envelope_contains_live_bytes(
+    envelopes: &[botster_hub_client::DaemonUnixTerminalEnvelope],
+    marker: &str,
+) -> bool {
+    envelopes.iter().any(|envelope| {
+        let Ok(bytes) = envelope.payload_bytes() else {
+            return false;
+        };
+        if bytes.windows(marker.len()).any(|window| window == marker.as_bytes()) {
+            return true;
+        }
+        let Ok(event) = serde_json::from_slice::<botster_hub_client::DaemonEvent>(&bytes) else {
+            return false;
+        };
+        match event {
+            botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } => {
+                live_output_contains(&payload, marker)
+            }
+            _ => false,
+        }
+    })
+}
+
 fn event_is_terminal_body(event: &botster_hub_client::DaemonEvent) -> bool {
     matches!(
         event,
@@ -414,6 +437,129 @@ fn unix_adapter_explicit_detach_is_separate_from_connection_death() {
 }
 
 #[test]
+fn unix_adapter_stale_disconnect_does_not_cancel_replacement_owner() {
+    let _guard = daemon_test_guard();
+    let hub = start_isolated_live_output_hub("uso");
+    let endpoint = hub.endpoint().clone();
+    let session_id = "uso-session";
+    let subscription_id = "uso-sub";
+
+    let (mut owner_a, mut reader_a) = unix_adapter_connection(&endpoint);
+    let mut envelopes_a = Vec::new();
+    request_skipping_envelopes(
+        &mut owner_a,
+        &mut reader_a,
+        &botster_hub_client::DaemonRequest::Spawn {
+            session_id: session_id.to_string(),
+            command: "while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done".to_string(),
+        },
+        &mut envelopes_a,
+    );
+    let attach_a = request_skipping_envelopes(
+        &mut owner_a,
+        &mut reader_a,
+        &botster_hub_client::DaemonRequest::Attach {
+            session_id: session_id.to_string(),
+            subscription_id: subscription_id.to_string(),
+        },
+        &mut envelopes_a,
+    );
+    assert!(attach_a.events.iter().any(|event| matches!(
+        event,
+        botster_hub_client::DaemonEvent::AttachState { state, .. }
+            if state == botster_hub_client::ATTACH_STATE_ATTACHING
+    )));
+    let detach_a = request_skipping_envelopes(
+        &mut owner_a,
+        &mut reader_a,
+        &botster_hub_client::DaemonRequest::Detach {
+            session_id: session_id.to_string(),
+            subscription_id: subscription_id.to_string(),
+        },
+        &mut envelopes_a,
+    );
+    assert_eq!(detach_a.kind, botster_hub_client::DaemonResponseKind::Events);
+
+    let (mut owner_b, mut reader_b) = unix_adapter_connection(&endpoint);
+    let mut envelopes_b = Vec::new();
+    let attach_b = request_skipping_envelopes(
+        &mut owner_b,
+        &mut reader_b,
+        &botster_hub_client::DaemonRequest::Attach {
+            session_id: session_id.to_string(),
+            subscription_id: subscription_id.to_string(),
+        },
+        &mut envelopes_b,
+    );
+    assert!(
+        attach_b.events.iter().any(|event| matches!(
+            event,
+            botster_hub_client::DaemonEvent::AttachState { state, .. }
+                if state == botster_hub_client::ATTACH_STATE_ATTACHING
+        )),
+        "replacement owner B must bind the same key: {:?}",
+        attach_b.events
+    );
+
+    let before = request_skipping_envelopes(
+        &mut owner_b,
+        &mut reader_b,
+        &botster_hub_client::DaemonRequest::Status,
+        &mut envelopes_b,
+    )
+    .status
+    .expect("status body")
+    .lifecycle_counters;
+    drop(owner_a);
+    drop(reader_a);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        let status = request_skipping_envelopes(
+            &mut owner_b,
+            &mut reader_b,
+            &botster_hub_client::DaemonRequest::Status,
+            &mut envelopes_b,
+        );
+        let counters = status.status.expect("status body").lifecycle_counters;
+        if counters.cleanup_completed > before.cleanup_completed {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    request_skipping_envelopes(
+        &mut owner_b,
+        &mut reader_b,
+        &botster_hub_client::DaemonRequest::SendInput {
+            session_id: session_id.to_string(),
+            data: "after-a-drop\r".to_string(),
+        },
+        &mut envelopes_b,
+    );
+    let marker = "echo:after-a-drop";
+    let output_deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < output_deadline
+        && !unix_envelope_contains_live_bytes(&envelopes_b, marker)
+    {
+        let _ = request_skipping_envelopes(
+            &mut owner_b,
+            &mut reader_b,
+            &botster_hub_client::DaemonRequest::drain_subscription(session_id, subscription_id),
+            &mut envelopes_b,
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        unix_envelope_contains_live_bytes(&envelopes_b, marker),
+        "B must keep receiving terminal frames after A disconnects: {envelopes_b:?}"
+    );
+
+    drop(owner_b);
+    shutdown_short_lived_session(&endpoint, session_id);
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
 fn unix_adapter_unbound_attach_still_drains_snapshot() {
     let _guard = daemon_test_guard();
     let hub = start_isolated_live_output_hub("uau");
@@ -539,6 +685,48 @@ fn unix_adapter_unbound_printf_stream_attach_completes() {
             .any(|session| session.session_id == session_id && session.lifecycle == "running"),
         "ProcessExited must not shut down the host session: {:?}",
         listed.sessions
+    );
+
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn unix_adapter_unbound_stream_attach_returns_late_bytes() {
+    let _guard = daemon_test_guard();
+    let hub = start_isolated_live_output_hub("usa");
+    let endpoint = hub.endpoint().clone();
+    let session_id = "usa-session";
+    let subscription_id = "usa-sub";
+    let late = "late-stream-attach";
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: session_id.to_string(),
+            command: format!("printf 'pre-attach\\n'; sleep 1; printf '{late}\\n'"),
+        },
+    )
+    .expect("spawn exiting writer");
+
+    let (tx, rx) = mpsc::channel();
+    let attach_endpoint = endpoint.clone();
+    thread::spawn(move || {
+        let mut output = Vec::new();
+        let result = botster_hub_client::stream_attach(
+            &attach_endpoint,
+            session_id,
+            subscription_id,
+            &mut output,
+        );
+        let _ = tx.send((result, output));
+    });
+    let (result, output) = rx
+        .recv_timeout(Duration::from_secs(8))
+        .expect("production stream_attach must complete after the process exits");
+    result.expect("stream_attach");
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        text.contains(late),
+        "stream_attach must return late terminal bytes after Attached: {text:?}"
     );
 
     hub.shutdown().expect("shutdown isolated hub");

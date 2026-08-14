@@ -947,12 +947,30 @@ fn handle_connection_cleanup(
     {
         admission.mux.close_all();
     }
-    let bound_subscriptions = state
+    let bound_claims = state
         .pending_runtime
         .take_connection_bound_routes(&cleanup.client_id);
     state
         .pending_runtime
         .close_adapters_for_client(&cleanup.client_id);
+    let mut bound_subscriptions = BTreeSet::new();
+    for claim in bound_claims {
+        if !state.pending_runtime.connection_bound_route_still_owned(
+            &cleanup.client_id,
+            &claim.session_id,
+            &claim.subscription_id,
+            claim.generation,
+        ) {
+            continue;
+        }
+        bound_subscriptions.insert((claim.session_id.clone(), claim.subscription_id.clone()));
+        state
+            .pending_runtime
+            .cancel_stream(&claim.session_id, &claim.subscription_id);
+        state
+            .live_attach_routes
+            .remove(&(claim.session_id, claim.subscription_id));
+    }
     if !bound_subscriptions.is_empty() {
         *state
             .lifecycle_counters
@@ -960,15 +978,14 @@ fn handle_connection_cleanup(
             .entry("bound_adapter_close".to_string())
             .or_insert(0) += bound_subscriptions.len() as u64;
     }
-    for (session_id, subscription_id) in &bound_subscriptions {
-        state
-            .pending_runtime
-            .cancel_stream(session_id, subscription_id);
-        state
-            .live_attach_routes
-            .remove(&(session_id.clone(), subscription_id.clone()));
-    }
     for subscription in cleanup.attached_subscriptions {
+        if state
+            .pending_runtime
+            .stream_owner_client_id(&subscription.session_id, &subscription.subscription_id)
+            .is_some_and(|owner| owner != cleanup.client_id)
+        {
+            continue;
+        }
         let bound = bound_subscriptions.contains(&(
             subscription.session_id.clone(),
             subscription.subscription_id.clone(),

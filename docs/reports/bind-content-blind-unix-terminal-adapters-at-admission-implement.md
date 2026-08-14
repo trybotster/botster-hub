@@ -10,7 +10,7 @@
 | Pipeline worktree | this run's Hub worktree |
 | Ticket | `ticket_1786661008_634435` |
 | Run | `run_1786681880_322827` |
-| Step | `botster_stack_implement` (`run_step_1786698327_602397`, Review-loop) |
+| Step | `botster_stack_implement` (`run_step_1786700130_331425`, Review-loop 4) |
 | Approved plan | `docs/plans/bind-content-blind-unix-terminal-adapters-at-admission.md` revision 6 |
 | Merge policy | direct (no PR) |
 | Locked Core SHA | `f4f6bf5babe92dfb9241a760c414187f711c2c42` |
@@ -24,6 +24,7 @@ Routing verified independently: `project_pipelines_current_context` ticket/run `
 - [[implementer-playbook]]
 - [[botster-implementer-playbook]]
 - [[botster-hub-playbook]] — ownership charter
+- [[botster-hub-client-playbook]] — public `stream_attach` helper
 - [[botster playbooks compose role with changed surface overlays]] — runtime surface plus class overlay
 - [[botster runtime teardown lenses]] — required; class applies
 
@@ -45,6 +46,9 @@ Routing verified independently: `project_pipelines_current_context` ticket/run `
 - [[additive daemon capabilities do not raise the default client requirement]]
 - [[adding a hub client feature constant is a three site change]]
 - [[Hub test support capability cutovers use a new unpublished package version]]
+- [[Core terminal subscription ownership is session, subscription, and generation]]
+- [[PeerClosed attach occupancy must use the live attach route set]]
+- [[attach failed cleanup is route aware and idempotent]]
 - [[rust repo strict lints must be verified before dismissing warnings]]
 - [[cli-patterns]]
 
@@ -71,16 +75,16 @@ Routing verified independently: `project_pipelines_current_context` ticket/run `
 | `src/unix_terminal_adapter.rs` | Production one-slot adapter, mux, Core harness driver |
 | `src/lib.rs` | Private `unix_terminal_adapter` module |
 | `src/runtime.rs` | `bind_terminal_adapter` / `list_terminal_subscriptions` / `detach_terminal_subscription` facades; `BindTerminalAdapter` error class |
-| `src/daemon_attach_stream.rs` | Generation + bound flags; `#[derive(Default)]`; fail-closed helpers; capability intersection; `bound_route_keys_for_client` snapshot before close |
-| `src/daemon_transport.rs` | Hello admission, Attach bind sequence, bound Drain filter, bound disconnect close-only, inventory reconcile pump, `RegisterUnixAdmission`; occupancy release on bound EOF |
+| `src/daemon_attach_stream.rs` | Generation + bound flags; connection-bound ledger stores owner+generation; `cancel_stream` forgets the key; cleanup match is owner+generation |
+| `src/daemon_transport.rs` | Hello admission, Attach bind sequence, bound Drain filter, bound disconnect close-only; cleanup mutates a route only when the closing client still owns that generation |
 | `src/config.rs` | Default fields required by the Core pin |
 | `src/main.rs` | Unbound smoke uses Attach + scoped Drain + `ReadScreen` after the Core pin |
 | `crates/botster-hub-client/src/lib.rs` | Optional feature, mux types, `for_unix_terminal_adapter()`, revision 39 |
 | `crates/botster-hub-client/src/typescript.rs` + generated TS | Feature + envelope types |
 | `docs/client-protocol.md` / `README.md` | Optional Unix adapter plane; revision 39 |
 | `packages/hub-test-support/*` | Version 0.1.33 → 0.1.34; regenerated fixtures; `test.mjs` asserts revision 39 |
-| `crates/botster-hub-test-support/src/lib.rs` | Conformance runner uses one attached connection + `ReadScreen`; matrix includes `unix_terminal_adapter` |
-| `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs` | IsolatedHub production-path proofs; replacement Attach after disconnect is the one-Core-detach proof |
+| `crates/botster-hub-test-support/src/lib.rs` | Published conformance uses `DaemonConnection` Attach + scoped Drain; docs no longer claim that runner calls `stream_attach` |
+| `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs` | IsolatedHub bind/detach/unbound proofs; stale A-disconnect after B bind; live `stream_attach` late-byte completion |
 | `tests/hub_daemon_lifecycle/sessions.rs` | Fast-exit, late-history, mode flags, entity, shutdown consumers use scoped Drain + `ReadScreen` |
 | `tests/hub_daemon_lifecycle/shutdown.rs` | Restart recovery attaches, drains, and reads the screen on the same connection |
 | `tests/hub_daemon_lifecycle/session_fixtures.rs` / `webrtc_proofs.rs` | Shared helpers drain the bound/unbound route before ReadScreen/mode flags; WebRTC uses scoped Drain |
@@ -125,6 +129,8 @@ Plan acceptance checks that remain true: bind only when Hello requires the featu
 | Plan leaked an absolute user path | Authoritative path is spawn target `botster-hub`. |
 | Unbound Drain lost TerminalOutput | Unbound scoped Drain still translates Snapshot, later TerminalOutput, and ProcessExit. Tests that wait for live bytes now collect scoped Drain events. They do not treat ReadScreen as a Drain oracle. Public conformance collects TerminalOutput from the same scoped Drain request. |
 | Disconnect test did not prove omitted Detach | Status `cleanup_by_reason` records `bound_adapter_close`, `cleanup_hub_detach`, and `explicit_detach`. Bound disconnect asserts `cleanup_hub_detach` delta is 0. Explicit Detach asserts `explicit_detach` is 1. |
+| Stale connection-bound keys can cancel a replacement owner | Ledger entries store session, subscription, and generation. `cancel_stream` forgets the key on Detach, replacement Attach, reconcile, and fail-closed. Cleanup cancels or Detaches a route only when the current owner and generation still match the closing connection. IsolatedHub: A binds, A detaches and stays connected, B binds the same key, A disconnects, B still receives `echo:after-a-drop`. |
+| Claimed stream_attach conformance path does not call stream_attach | Published conformance stays on `DaemonConnection` Attach + scoped Drain. Docs state that split. `unix_adapter_unbound_stream_attach_returns_late_bytes` calls `botster_hub_client::stream_attach`, produces output after Attached, exits the process, and asserts the helper returns the late bytes and completes. |
 
 ## Runtime-teardown lenses implemented
 
@@ -134,7 +140,7 @@ Plan acceptance checks that remain true: bind only when Hello requires the featu
 | Bounded teardown | `try_write` / `close` / `Drop` are non-blocking and lock-free for the writer. Core harness plus `close_does_not_wait_on_occupied_slot` prove this. No `block_on(close)` on the owner thread. |
 | Late-message matrix | Attach fail-closes unexpected pre-bind frames. Bind rejects stale/unknown/already-bound. Bound EOF/write failure closes adapter only. Explicit Detach is authorized. Drain filters terminal bodies on bound routes. Inventory reconcile drops Hub rows Core no longer reports. WebRTC grant path unchanged. |
 | Production-path hard-stop | IsolatedHub: Hello + feature → Attach only `Attaching` → opaque envelopes → bound Drain has no terminal bodies → drop connection → session still listed. Provenance printed from the live Hub binary and session-worker path. |
-| Ownership identity | Route key is `(client_id, session_id, subscription_id, generation)`. Unix `grant_id` is `None`. Reconcile matches generation. Disconnect cleanup is owner-tagged by `client_id`. |
+| Ownership identity | Route key is `(client_id, session_id, subscription_id, generation)`. The connection-bound ledger stores that generation. Every cancel path forgets the key. A delayed disconnect mutates the live route only when owner and generation still match. Unix `grant_id` is `None`. |
 | Sibling / fail-closed | Adapter close does not call `ShutdownSession`. Explicit Detach is a separate IsolatedHub test. Unbound printf stays `running` after process exit. |
 
 ## Tests and downstream proof run
@@ -142,6 +148,8 @@ Plan acceptance checks that remain true: bind only when Hello requires the featu
 Commands (all with `BOTSTER_ENV=test`):
 
 - `./test.sh --locked --offline --test hub_daemon_lifecycle_test unix_adapter` — IsolatedHub bind, detach, unbound Snapshot, feature floor
+- IsolatedHub `unix_adapter_stale_disconnect_does_not_cancel_replacement_owner` — B receives live adapter frames after A disconnects
+- IsolatedHub `unix_adapter_unbound_stream_attach_returns_late_bytes` — public `stream_attach` returns `late-stream-attach` and completes
 - IsolatedHub `unix_adapter_unbound_printf_stream_attach_completes` — `ReadScreen` has the smoke marker; host session stays `running`
 - `fast_exit_attach_diagnostic_records_subscription_event_order` — official diagnostic; `read_screen_marker=true`
 - `./test.sh --locked --offline --test hub_runtime_test bind_terminal_adapter_inventory_echoes_capability_set`
@@ -151,7 +159,7 @@ Commands (all with `BOTSTER_ENV=test`):
 - `cargo fmt --all -- --check` — exit 0
 - Clean `npm install --omit=dev && npm test` in a temp copy of `packages/hub-test-support` — exit 0
 - Plan/report leak scan vs a known-positive absolute home-path control — plan and report have no user home paths
-- `./test.sh --locked` — workspace wrapper exit 0. `hub_daemon_lifecycle_test`: 174 passed, 0 failed, 1 ignored. Other workspace members and doctests passed.
+- `./test.sh --locked` — workspace wrapper exit 0. `hub_daemon_lifecycle_test`: 176 passed, 0 failed, 1 ignored. Other workspace members and doctests passed.
 
 Production entry points:
 
@@ -161,7 +169,7 @@ Production entry points:
 
 ## Unverified behavior or residual risk
 
-- `stream_attach` now restores visible text from `ReadScreen` after Snapshot/`Attached`. It still completes only on `ProcessExit`, `attach_failed`, or host `exited`. A long-running session that never exits still streams. A fast-exit session whose child is already dead during attach may stay attached until the caller detaches; smoke and published conformance no longer wait on that path.
+- `stream_attach` now has a live IsolatedHub proof for the sleep-then-print-then-exit path. It still completes only on `ProcessExit`, `attach_failed`, or host `exited`. A long-running session that never exits still streams. A fast-exit session whose child is already dead during attach may stay attached until the caller detaches; smoke and published conformance still use Attach + scoped Drain + `ReadScreen` for that case.
 - Unexpected pre-bind fail-closed is unit-tested, not IsolatedHub-injected.
 - Inventory capability echo is an in-process `HubRuntime` proof, not a Unix socket DTO (no public inventory request).
 - WebRTC adapter path is unchanged and unclaimed. WebRTC proofs still use the unbound Drain path with scoped subscription drains.
