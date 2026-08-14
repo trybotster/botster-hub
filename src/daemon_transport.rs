@@ -1486,19 +1486,24 @@ pub(crate) fn handle_control_message(
                     }
                 })
                 .collect();
-            // Drop owner index rows for removed grants before Detach so counters stay consistent
-            // even if Detach is a no-op for an already-gone session. Preserve replacement owners.
+            // Occupancy set is the counter source of truth. PeerClosed must release
+            // live_attach_routes here so a replacement Attach can become live.
+            for subscription in &detach_list {
+                record_attached_subscription_change(
+                    state,
+                    Some(AttachedSubscriptionChange::Detach(AttachedSubscription {
+                        session_id: subscription.session_id.clone(),
+                        subscription_id: subscription.subscription_id.clone(),
+                    })),
+                    None,
+                );
+            }
+            // Residual same-grant index rows can survive a no-op Core Detach. Drop them
+            // after occupancy release. Preserve replacement owners.
             state
                 .pending_runtime
                 .attach_owner_grant_ids
                 .retain(|_, owner| !removed_grants.contains(owner.as_str()));
-            state.lifecycle_counters.live_attach_subscriptions = state
-                .lifecycle_counters
-                .live_attach_subscriptions
-                .saturating_sub(detach_list.len() as u64);
-            state.released_attach_generations = state
-                .released_attach_generations
-                .saturating_add(detach_list.len() as u64);
             detach_local_webrtc_subscriptions(
                 daemon,
                 &mut state.logical_clock,
