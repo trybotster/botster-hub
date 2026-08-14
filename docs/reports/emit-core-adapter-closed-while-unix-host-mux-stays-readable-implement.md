@@ -10,7 +10,7 @@
 | Pipeline worktree | this run worktree |
 | Ticket | `ticket_1786716545_417854` |
 | Run | `run_1786717046_410510` |
-| Step | `botster_stack_implement` (`run_step_1786720443_967922`) |
+| Step | `botster_stack_implement` (`run_step_1786721731_448860`) |
 | Approved plan | `docs/plans/emit-core-adapter-closed-while-unix-host-mux-stays-readable.md` revision 3 |
 | Merge policy | direct into `main`; do not create a PR |
 | Base | worktree `HEAD` `aafd6c2cde430804f1bb54094c568fc88c15944b` |
@@ -74,8 +74,8 @@ Routing verified independently: `project_pipelines_current_context` ticket/run `
 
 | Path | Change |
 | --- | --- |
-| `src/daemon_transport.rs` | One `MuxWriteState` for Response, Event, and Terminal; delivery_ack and close_after on queued Responses; host-first flush; abandon zero-progress terminal starts; ack only after Written; every Response waits in `flush_pending_responses` up to `DAEMON_CLIENT_WRITE_TIMEOUT`; no new request or `SubscribeEntities` while a mux frame is pending; queue close events before inventory reconcile |
-| `src/unix_terminal_adapter.rs` | Flush-defer flag skipped by `snapshot_writes`; `close_from_host` does not claim host reason after Core already closed |
+| `src/daemon_transport.rs` | One `MuxWriteState` for Response, Event, and Terminal; delivery_ack and close_after on queued Responses; host-first flush; abandon zero-progress terminal starts; ack only after Written; every Response waits in `flush_pending_responses` up to `DAEMON_CLIENT_WRITE_TIMEOUT`; `SubscribeEntities` is rejected with `unix_mux_owns_connection` while write state, unsent mux frames, or any bound route exists; reject does not `close_all`; queue close events before inventory reconcile |
+| `src/unix_terminal_adapter.rs` | Flush-defer flag skipped by `snapshot_writes`; `close_from_host` does not claim host reason after Core already closed; `has_bound_routes` for the entity-subscription guard |
 | `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs` | IsolatedHub keep-reading proof: owned stall Drain then Status before close, exact `core_adapter_closed`, live sibling envelope, content-blind sibling Drain |
 | `docs/client-protocol.md` | Host-readable / sibling-live / not-host-oracle wording |
 | `docs/plans/emit-core-adapter-closed-while-unix-host-mux-stays-readable.md` | Approved plan revision 3 |
@@ -107,7 +107,7 @@ Review `review_1786720426_744133` required one more bound: every Response, not o
 | Lens | Implementation |
 | --- | --- |
 | Isolation | One mux route and its one-slot adapter die. Same-connection sibling stays bound and writable. `close_all()` remains connection death only. |
-| Bounds | Mux writes stay 50ms slices. Every Response, including `DaemonShutdown` / `StartHubUpdate`, waits at most 2s. The connection does not read another request while a Response is pending. `SubscribeEntities` fails closed if any mux frame is pending. Terminal Pending does not `close_all`. Adapter `close()` stays non-blocking. |
+| Bounds | Mux writes stay 50ms slices. Every Response, including `DaemonShutdown` / `StartHubUpdate`, waits at most 2s. The connection does not read another request while a Response is pending. `SubscribeEntities` fails closed if write state, unsent mux frames, or any bound route exists. That reject keeps the mux and does not `close_all`. Terminal Pending does not `close_all`. Adapter `close()` stays non-blocking. |
 | Late-message matrix | Existing host-close, Detach, connection-death, process-exit, stale-generation, and failed-RemoveSession tests still pass. A scoped stall Drain stays owned immediately before the pre-close Status. Status is proven after Core close. Sibling Drain stays owned. |
 | Production-path proof | IsolatedHub Unix path through `CARGO_BIN_EXE_botster-hub` and `botster-hub-client::read_unix_mux_frame_from_reader`. Not a fixture. |
 | Ownership identity | Event is `(session_id, subscription_id, generation)`. Stale generation N does not sweep N+1. |
@@ -131,7 +131,7 @@ Production entry points that use the new behavior:
 | `./test.sh --offline --test hub_daemon_lifecycle_test -- --exact process_exit_and_shutdown_session_do_not_emit_terminal_subscription_closed` | 1 passed, 185 filtered |
 | `./test.sh --offline --test hub_daemon_lifecycle_test -- --exact stale_generation_close_does_not_sweep_replacement_owner` | 1 passed, 185 filtered |
 | `./test.sh --offline --test hub_daemon_lifecycle_test -- --exact failed_remove_session_does_not_suppress_later_core_close` | 1 passed, 185 filtered |
-| `./test.sh --offline -p botster-hub --lib mux_write_resume_tests` | 8 passed, 244 filtered (includes `stalled_response_stays_bounded_and_blocks_entity_subscription`) |
+| `./test.sh --offline -p botster-hub --lib mux_write_resume_tests` | 9 passed, 244 filtered (includes bound-route entity-subscription fail-closed) |
 | `./test.sh --offline -p botster-hub --lib daemon_shutdown_waits_for_response_delivery_before_stopping` | 1 passed, 250 filtered |
 | `./test.sh --offline -p botster-hub --lib daemon_shutdown_releases_when_delivery_owner_drops` | 1 passed, 250 filtered |
 | `./test.sh --offline -p botster-hub --lib host_close_after_core_close_does_not_claim_host_reason` | 1 passed, 250 filtered |
@@ -156,7 +156,8 @@ Downstream: no public hub-client API change. TUI scratch `cargo check` was not r
 
 | Finding | Fix |
 | --- | --- |
-| `finding_1786720427_976374` Blocked responses can grow the connection queue | `flush_pending_responses` waits for every Response with a 2s bound. The connection does not read another request while a Response is pending. `SubscribeEntities` fails closed if any mux frame is pending. |
+| `finding_1786720427_976374` Blocked responses can grow the connection queue | `flush_pending_responses` waits for every Response with a 2s bound. The connection does not read another request while a Response is pending. |
+| `finding_1786721717_230428` SubscribeEntities can still transition while the Unix mux owns unread output | One predicate: `mux_write.has_pending()` or `mux.has_unsent_mux_writes()` or `mux.has_bound_routes()`. Reject with `OperatorError` `unix_mux_owns_connection` and keep the mux. Do not `close_all`. |
 | `finding_1786720427_613559` Pre-close Status does not prove the adapter is open | IsolatedHub now issues a scoped stall Drain and requires it to stay owned immediately before Status. |
 | `finding_1786720427_607821` Required regression ablations were not executed | Narrow production ablations were run. Results are in the table below. |
 

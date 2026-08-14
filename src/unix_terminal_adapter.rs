@@ -451,6 +451,13 @@ impl UnixConnectionMux {
         pending || !self.snapshot_writes().is_empty()
     }
 
+    pub(crate) fn has_bound_routes(&self) -> bool {
+        self.inner
+            .routes
+            .lock()
+            .is_ok_and(|routes| !routes.is_empty())
+    }
+
     pub(crate) fn snapshot_writes(
         &self,
     ) -> Vec<(String, String, UnixTerminalAdapterHandle, Vec<u8>)> {
@@ -600,6 +607,7 @@ mod tests {
         handle.defer_flush();
         assert!(mux.snapshot_writes().is_empty());
         assert!(handle.snapshot_active().is_some());
+        assert!(mux.has_bound_routes());
     }
 
     #[test]
