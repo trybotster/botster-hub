@@ -32,6 +32,7 @@ struct UnixTerminalAdapterInner {
     closed: AtomicBool,
     host_closed: AtomicBool,
     would_block: AtomicBool,
+    deferred: AtomicBool,
     slot: Mutex<Option<Vec<u8>>>,
     notify: Arc<Notify>,
 }
@@ -42,6 +43,7 @@ impl UnixTerminalAdapterInner {
             closed: AtomicBool::new(false),
             host_closed: AtomicBool::new(false),
             would_block: AtomicBool::new(false),
+            deferred: AtomicBool::new(false),
             slot: Mutex::new(None),
             notify: Arc::new(Notify::new()),
         }
@@ -52,7 +54,9 @@ impl UnixTerminalAdapterInner {
     }
 
     fn close_from_host(&self) {
-        self.host_closed.store(true, Ordering::SeqCst);
+        if !self.is_closed() {
+            self.host_closed.store(true, Ordering::SeqCst);
+        }
         self.close();
     }
 
@@ -148,6 +152,14 @@ impl UnixTerminalAdapterInner {
             }
             Err(_) => None,
         }
+    }
+
+    fn defer_flush(&self) {
+        self.deferred.store(true, Ordering::SeqCst);
+    }
+
+    fn is_flush_deferred(&self) -> bool {
+        self.deferred.load(Ordering::SeqCst)
     }
 
     fn complete_active(&self) -> Option<Vec<u8>> {
@@ -448,6 +460,9 @@ impl UnixConnectionMux {
         routes
             .iter()
             .filter_map(|route| {
+                if route.handle.is_flush_deferred() {
+                    return None;
+                }
                 route.handle.snapshot_active().map(|bytes| {
                     (
                         route.session_id.clone(),
@@ -488,6 +503,14 @@ impl UnixTerminalAdapterHandle {
 
     pub(crate) fn complete_active(&self) -> Option<Vec<u8>> {
         self.inner.complete_active()
+    }
+
+    pub(crate) fn defer_flush(&self) {
+        self.inner.defer_flush();
+    }
+
+    pub(crate) fn is_flush_deferred(&self) -> bool {
+        self.inner.is_flush_deferred()
     }
 }
 
@@ -549,6 +572,34 @@ mod tests {
     fn production_unix_adapter_passes_core_conformance_harness() {
         let mut driver = UnixTerminalAdapterDriver::default();
         assert_terminal_adapter_conformance(&mut driver);
+    }
+
+    #[test]
+    fn host_close_after_core_close_does_not_claim_host_reason() {
+        let (mut adapter, handle) = UnixTerminalAdapter::pair();
+        adapter.close();
+        assert!(handle.is_closed());
+        assert!(!handle.host_closed());
+        handle.close_from_host();
+        assert!(handle.is_closed());
+        assert!(
+            !handle.host_closed(),
+            "a later host sweep must not rewrite Core close as host_adapter_closed"
+        );
+    }
+
+    #[test]
+    fn deferred_route_is_omitted_from_snapshot_writes() {
+        let mux = UnixConnectionMux::new();
+        let (mut adapter, handle) = mux.create_adapter();
+        mux.register("stall".to_string(), "sub".to_string(), 1, handle.clone());
+        let frame = TerminalFrame::from_bytes(br#"{"type":"terminal_output","marker":"flood"}"#)
+            .expect("opaque frame");
+        assert_eq!(adapter.try_write(&frame), Ok(()));
+        assert_eq!(mux.snapshot_writes().len(), 1);
+        handle.defer_flush();
+        assert!(mux.snapshot_writes().is_empty());
+        assert!(handle.snapshot_active().is_some());
     }
 
     #[test]

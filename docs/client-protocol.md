@@ -1607,7 +1607,10 @@ When a bound adapter or Core write-budget hard-stop closes a live generation
 and the connection stays up, Hub emits unsolicited
 `DaemonEvent::TerminalSubscriptionClosed` with `session_id`,
 `subscription_id`, `generation`, and reason `host_adapter_closed` or
-`core_adapter_closed`. `parse_unix_mux_value` classifies that frame as
+`core_adapter_closed`. Host Response and Event frames stay readable on the
+same connection. A sibling adapter on that connection may keep writing
+terminal envelopes. `host_adapter_closed` is host egress close. It is not
+the Core write-budget oracle. `parse_unix_mux_value` classifies that frame as
 `DaemonUnixMuxFrame::Event`, not a request reply. Connection death, Detach,
 process exit, and session removal do not emit this event.
 
