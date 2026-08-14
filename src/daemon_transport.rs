@@ -512,12 +512,17 @@ async fn handle_connection_async(
             subscription_id,
         } = request
         {
-            if mux_write.has_pending() {
-                cleanup.set_reason(ConnectionTerminalReason::Protocol);
-                mux.close_all();
-                return Err(DaemonTransportError::Protocol(
-                    "entity subscription cannot start while a mux frame is pending",
-                ));
+            if unix_mux_blocks_entity_subscription(&mux, &mux_write) {
+                mux_write.enqueue_response(&entity_subscription_mux_busy_error(), None, false)?;
+                if let Err(error) =
+                    flush_pending_responses(&mut write_half, &mux, &mut mux_write, Instant::now())
+                        .await
+                {
+                    cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
+                    mux.close_all();
+                    return Err(error);
+                }
+                continue;
             }
             return handle_entity_subscription_async(
                 write_half,
@@ -645,6 +650,29 @@ struct PendingMuxFrame {
 enum MuxWrite {
     Written,
     Pending,
+}
+
+fn unix_mux_blocks_entity_subscription(
+    mux: &UnixConnectionMux,
+    write_state: &MuxWriteState,
+) -> bool {
+    write_state.has_pending() || mux.has_unsent_mux_writes() || mux.has_bound_routes()
+}
+
+fn entity_subscription_mux_busy_error() -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
+    response.error = Some(DaemonOperatorError {
+        code: "unix_mux_owns_connection".to_string(),
+        request_id: "daemon-subscribe-entities".to_string(),
+        operation: "subscribe_entities".to_string(),
+        message: "entity subscription cannot start while the Unix mux owns this connection"
+            .to_string(),
+        diagnostics: vec![DaemonDiagnostic::action_failure(
+            "subscribe_entities",
+            "unix mux still owns bound routes or unsent frames",
+        )],
+    });
+    response
 }
 
 async fn flush_pending_responses(
@@ -822,7 +850,8 @@ async fn write_frame_bytes_resumable(
 mod mux_write_resume_tests {
     use super::{
         MuxWrite, MuxWriteState, PendingMuxClass, PendingMuxFrame, daemon_response_base,
-        flush_pending_responses, flush_unix_mux_writes, write_frame_bytes_resumable,
+        entity_subscription_mux_busy_error, flush_pending_responses, flush_unix_mux_writes,
+        unix_mux_blocks_entity_subscription, write_frame_bytes_resumable,
     };
     use crate::unix_terminal_adapter::{UnixConnectionMux, UnixTerminalAdapter};
     use botster_core::contract::terminal_adapter::TerminalAdapter;
@@ -1261,6 +1290,10 @@ mod mux_write_resume_tests {
             .await
             .expect("finish the one pending Response");
         assert!(!write_state.has_pending_response());
+        assert!(
+            unix_mux_blocks_entity_subscription(&mux, &write_state),
+            "a bound Unix route must still block the entity-subscription handoff"
+        );
         let lines = parse_written_mux_lines(&writer.written);
         assert_eq!(lines.len(), 2);
         assert!(matches!(
@@ -1273,6 +1306,65 @@ mod mux_write_resume_tests {
                 if response.kind == DaemonResponseKind::Status
         ));
         assert!(!write_state.has_pending());
+    }
+
+    #[tokio::test]
+    async fn bound_route_or_queued_event_blocks_entity_subscription_without_closing_routes() {
+        let mux = UnixConnectionMux::new();
+        let idle = MuxWriteState::default();
+        assert!(!unix_mux_blocks_entity_subscription(&mux, &idle));
+
+        let _stall = occupy_route(&mux, "stall", "sub", "flood");
+        assert!(mux.has_bound_routes());
+        assert!(unix_mux_blocks_entity_subscription(&mux, &idle));
+        let handle = mux.snapshot_writes()[0].2.clone();
+        assert!(!handle.host_closed());
+
+        handle.close();
+        assert_eq!(mux.queue_closed_subscription_events(|_| true), 1);
+        assert!(mux.has_unsent_mux_writes());
+        assert!(unix_mux_blocks_entity_subscription(&mux, &idle));
+        assert!(
+            !handle.host_closed(),
+            "rejecting SubscribeEntities must not host-close the bound route"
+        );
+        assert!(mux.has_bound_routes());
+
+        let mut writer = PrefixStallWriter {
+            written: Vec::new(),
+            stall_after: usize::MAX,
+            allow_remainder: true,
+        };
+        let mut write_state = MuxWriteState::default();
+        write_state
+            .enqueue_response(&entity_subscription_mux_busy_error(), None, false)
+            .expect("enqueue reject");
+        flush_pending_responses(&mut writer, &mux, &mut write_state, Instant::now())
+            .await
+            .expect("write reject");
+        let lines = parse_written_mux_lines(&writer.written);
+        assert!(
+            matches!(
+                lines.first(),
+                Some(botster_hub_client::DaemonUnixMuxFrame::Response(response))
+                    if response.kind == DaemonResponseKind::OperatorError
+                        && response.error.as_ref().is_some_and(|error| {
+                            error.code == "unix_mux_owns_connection"
+                        })
+            ),
+            "reject must be an OperatorError Response: {lines:?}"
+        );
+        assert!(
+            matches!(
+                lines.get(1),
+                Some(botster_hub_client::DaemonUnixMuxFrame::Event(
+                    DaemonEvent::TerminalSubscriptionClosed { session_id, .. }
+                )) if session_id == "stall"
+            ),
+            "close Event must still flush after the reject: {lines:?}"
+        );
+        assert!(mux.has_bound_routes());
+        assert!(!handle.host_closed());
     }
 }
 
