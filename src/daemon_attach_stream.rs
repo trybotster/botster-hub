@@ -45,20 +45,11 @@ impl AttachStream {
     }
 }
 
+#[derive(Default)]
 pub(crate) struct AttachStreamRegistry {
     streams: BTreeMap<(String, String), AttachStream>,
     pub(crate) active_subscriptions: BTreeMap<String, BTreeSet<String>>,
     pub(crate) attach_owner_grant_ids: BTreeMap<(String, String), String>,
-}
-
-impl Default for AttachStreamRegistry {
-    fn default() -> Self {
-        Self {
-            streams: BTreeMap::new(),
-            active_subscriptions: BTreeMap::new(),
-            attach_owner_grant_ids: BTreeMap::new(),
-        }
-    }
 }
 
 impl AttachStreamRegistry {
