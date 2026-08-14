@@ -1141,25 +1141,31 @@ where
     if let Some(cause) = *peer_terminal_rx.borrow_and_update() {
         return Err(cause);
     }
-    tokio::select! {
-        send = data_channel.local_send_text(frame) => {
-            send.map_err(|_| LocalWebrtcTerminalCause::SendText)
-        }
-        event = poll_data_channel_or_peer_terminal(data_channel, peer_terminal_rx) => {
-            match event {
-                Ok(Some(channel_event)) => apply_data_channel_event(
-                    channel_event,
-                    stream_key,
-                    pending_requests,
-                    flow_control,
-                    mux,
-                ),
-                Ok(None) => Err(LocalWebrtcTerminalCause::PollEnded),
-                Err(cause) => Err(cause),
+    let send = data_channel.local_send_text(frame);
+    tokio::pin!(send);
+    let deadline = tokio::time::sleep(LOCAL_WEBRTC_PEER_CLOSE_BOUND);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            send = &mut send => {
+                return send.map_err(|_| LocalWebrtcTerminalCause::SendText);
             }
-        }
-        _ = tokio::time::sleep(LOCAL_WEBRTC_PEER_CLOSE_BOUND) => {
-            Err(LocalWebrtcTerminalCause::SendText)
+            event = poll_data_channel_or_peer_terminal(data_channel, peer_terminal_rx) => {
+                match event {
+                    Ok(Some(channel_event)) => apply_data_channel_event(
+                        channel_event,
+                        stream_key,
+                        pending_requests,
+                        flow_control,
+                        mux,
+                    )?,
+                    Ok(None) => return Err(LocalWebrtcTerminalCause::PollEnded),
+                    Err(cause) => return Err(cause),
+                }
+            }
+            () = &mut deadline => {
+                return Err(LocalWebrtcTerminalCause::SendText);
+            }
         }
     }
 }
@@ -2224,6 +2230,7 @@ mod tests {
         sent_before_low_water: AtomicBool,
         poll_ends: AtomicBool,
         event_notify: tokio::sync::Notify,
+        send_notify: tokio::sync::Notify,
     }
 
     #[async_trait]
@@ -2243,8 +2250,13 @@ mod tests {
         }
 
         async fn local_send_text(&self, text: &str) -> Result<(), String> {
-            if self.send_hangs.load(Ordering::Acquire) {
-                std::future::pending::<()>().await;
+            while self.send_hangs.load(Ordering::Acquire) {
+                let notified = self.send_notify.notified();
+                tokio::pin!(notified);
+                if !self.send_hangs.load(Ordering::Acquire) {
+                    break;
+                }
+                notified.await;
             }
             if self.send_fails.load(Ordering::Acquire) {
                 return Err("fixture send failure".to_string());
@@ -2278,6 +2290,18 @@ mod tests {
         async fn local_close(&self) -> Result<(), String> {
             self.closed.store(true, Ordering::Release);
             Ok(())
+        }
+    }
+
+    impl FakeDataChannel {
+        fn push_event(&self, event: DataChannelEvent) {
+            self.events.lock().unwrap().push_back(event);
+            self.event_notify.notify_waiters();
+        }
+
+        fn release_hung_send(&self) {
+            self.send_hangs.store(false, Ordering::Release);
+            self.send_notify.notify_waiters();
         }
     }
 
@@ -3568,6 +3592,46 @@ mod tests {
             elapsed < LOCAL_WEBRTC_PEER_CLOSE_HANDLER_JOIN_DEADLINE,
             "hung send must not block cleanup: {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn nonterminal_channel_event_does_not_drop_in_flight_send() {
+        let data_channel = FakeDataChannel::default();
+        data_channel.send_hangs.store(true, Ordering::Release);
+        let key = AesGcmKey::from_slice(&[18; 32]).unwrap();
+        let mut pending = VecDeque::new();
+        let mut flow_control = LocalWebrtcFlowControl::default();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let peer_state = test_peer_state("grant-keep-in-flight-send");
+        let frames = ["keep-me".to_string()];
+        runtime
+            .block_on(async {
+                let send = send_response_frames(
+                    &data_channel,
+                    &key,
+                    &frames,
+                    &mut pending,
+                    &mut flow_control,
+                    &peer_state,
+                );
+                tokio::pin!(send);
+                tokio::select! {
+                    result = &mut send => result,
+                    () = async {
+                        tokio::task::yield_now().await;
+                        data_channel.push_event(DataChannelEvent::OnBufferedAmountHigh);
+                        tokio::task::yield_now().await;
+                        data_channel.release_hung_send();
+                        std::future::pending::<()>().await;
+                    } => unreachable!("in-flight send must complete after a nonterminal event"),
+                }
+            })
+            .expect("high-water during send must not drop the frame");
+        assert_eq!(data_channel.sent.lock().unwrap().as_slice(), &["keep-me"]);
+        assert!(flow_control.pressured);
     }
 
     #[test]
