@@ -1,5 +1,21 @@
 # Hub: project session state without blocking operation paths
 
+## Plan Review revision
+
+Plan Review `review_1786690443_941755` returned `changes_required`.
+This revision answers the four product findings. It does not reopen
+target routing.
+
+| Finding | Response |
+| --- | --- |
+| Core observe and baseline defeat slice bounds | Do not call unbounded `observe_lifecycle` or `lifecycle_baseline` as a maintenance slice. Registered Core ticket `ticket_1786690597_161141` on `tgt_1f7bce66eb304881980f9b4a2a5ae3fe` for item/byte/elapsed sliced observe and paged baseline. Hub Implement waits on that merge. |
+| Core refresh does not compile | Scope now includes the six new `PluginWorkerEngineConfig` host knobs and the `CoreDaemonError::BindTerminalAdapter` projection, with policy and tests. |
+| Baseline gates cannot reach tests | Recorded exact current-lock evidence. This ticket owns the `derivable_impls` cleanup. WebRTC ownership failure is owned by `ticket_1786690597_154692` on the Hub target and is a blocking dependency. |
+| Snapshot order can depend on default executor width | One in-flight session-family frame per plugin and snapshot sequence. Advance only after the matching successful completion. Test with background concurrency above one and skewed handler durations. |
+
+Duplicate vault checklist `checklist_1786689631_664448` remains unused.
+This visit keeps `checklist_1786689614_825667` and does not create another.
+
 ## Target repository and target_id
 
 - Target repository: `botster-hub` (`trybotster/botster-hub`).
@@ -11,12 +27,9 @@
 - Run: `run_1786689005_381068`.
 - Project: Botster Non-Blocking Event Plane, Stage A Hub slice.
 - Assigned worktree is the pipeline-created Hub worktree for this ticket.
-- Plan-time HEAD: `173e528` (`Align the UI contract plan and protocol
-  examples with the Git tag.`).
-- Locked Core in this worktree: `033cd01`. Core `main` already contains the
-  closed parent APIs (`5e1c1fa` journal wake/page, `bb334d7` class-aware
-  admission, `b832e47` Hub-shaped consume recovery). Implement must refresh
-  `Cargo.lock` to current Core `main` before compiling against those APIs.
+- First Plan HEAD: `173e528`. Plan artifact commit: `ddb0c60`.
+- Locked Core in this worktree: `033cd01`. Verified Core `origin/main`
+  at Plan Review: `a047574`.
 
 ## Repository playbook loaded
 
@@ -39,6 +52,7 @@ Planner must-load maps and orchestration notes:
 - [[project pipelines ui contract belongs in the plugin readme]]
 - [[botster orchestration should spawn agents with explicit target ids]]
 - [[botster orchestration prompts must bind agents to explicit worktrees]]
+- [[cross repo dependency registration must use dependency repo target]]
 
 Hub charter notes implicated by this ticket:
 
@@ -56,6 +70,7 @@ Hub charter notes implicated by this ticket:
 - [[worker isolation now has a Core try-admit non-blocking primitive]]
 - [[worker isolated and non blocking are different dispatch guarantees]]
 - [[Core class-aware plugin admission reserves request-response executors]]
+- [[plugin worker queue capacity and executor concurrency are independent host profile knobs]]
 - [[package entity hydration uses explicit providers not mcp naming]]
 - [[botster plugin entity hydration has full id and scoped contracts]]
 - [[plugin surfaces request model state through ui bindings not hub subscribe]]
@@ -65,8 +80,7 @@ Hub charter notes implicated by this ticket:
 - [[hub shutdown preserves durable session workers]]
 - [[session wide drains cannot deliver subscription owned initial state]]
 
-Hub-client surface overlay (in-repo crate; DTO/feature changes only if
-Implement must add client-visible session snapshot frames):
+Hub-client surface overlay:
 
 - [[botster-hub-client-playbook]]
 - [[botster hub client crate is the external client boundary]]
@@ -87,247 +101,251 @@ Intentionally not loaded:
 
 - [[project-pipelines-playbook]] — this ticket does not change Project
   Pipelines package/plugin paths or workflow policy.
-- [[botster runtime teardown lenses]] — this ticket is not runtime-teardown
-  class. It removes Hub terminal Drain from lifecycle inference; it does
-  not implement WebRTC/peer teardown, SessionIo/ClientWorker teardown,
-  multi-peer ownership, or CPU/battery/FD spin. Core already answered
-  teardown lenses on the journal parent.
-- Session-type eligibility consumer pins — this ticket is not a consumer
-  of Hub session-type eligibility.
+- [[botster runtime teardown lenses]] — `teardown_class_applies` is no.
+  The closed Core journal parent already answered teardown lenses.
+  This Hub ticket consumes bounded journal/observe pages; it does not
+  implement WebRTC/peer teardown or SessionIo/ClientWorker teardown.
+- Session-type eligibility consumer pins — not that consumer.
 
 ## Context loaded
 
-Repository evidence:
+### Current Hub (this worktree, Core `033cd01`)
 
-- Root `README.md` production path: `HubDaemon` / `HubRuntime` /
-  `CoreDaemon`. `docs/plans/` is the living plan home (135 mainline
-  plans; no retired-directory stub).
-- `src/daemon_entity_subscriptions.rs` owns one shared
-  `EntityReconciliationState` cursor plus `drive_entity_subscriptions`.
-- That pump early-returns when `entity_subscriptions` is empty after
-  package fanout/resync. Zero Web/TUI subscribers therefore stop session
-  projection. Ticket acceptance forbids that.
+- `drive_entity_subscriptions` early-returns when
+  `entity_subscriptions` is empty after package fanout/resync. Zero
+  Web/TUI subscribers stop session projection.
 - The same pump calls `HubRuntime::drain_runtime_once` for every
   non-exited, non-attached session. That is terminal Drain used to
-  discover lifecycle. Ticket forbids it.
-- Owner loop (`src/daemon_transport.rs`) also calls
-  `drive_entity_subscriptions` after Spawn / Resize / ShutdownSession /
-  RemoveSession when any subscriber exists, and calls
-  `drive_package_entity_fanout` plus provider resync after every control
-  reply.
-- `HubRuntime::session_lifecycle_changes` still uses unbounded
-  `CoreDaemon::lifecycle_changes`. It does not call
-  `observe_lifecycle`, `take_journal_advanced_wake`, or
-  `lifecycle_changes_page`.
-- `HubRuntime::invoke_plugin` is blocking. `emit_plugin_event` and
-  package `entity_provider` / MCP / UI paths all wait on `invoke`.
-  Request-response MCP/UI/subscribe snapshots may keep blocking
-  `invoke`. Background lifecycle and session-family delivery must move
-  to `try_admit(Background)` plus bounded `drain_completions`.
-- `src/maintenance.rs` is software-update identity, not owner-loop
-  slices. New session-projection maintenance belongs in a dedicated
-  daemon-control module, not that file.
+  discover lifecycle.
+- Owner loop also runs that pump after Spawn / Resize /
+  ShutdownSession / RemoveSession when any subscriber exists, and runs
+  fanout plus provider resync after every control reply.
+- `HubRuntime::session_lifecycle_changes` uses unbounded
+  `CoreDaemon::lifecycle_changes`.
+- `HubRuntime::invoke_plugin` is blocking. Background lifecycle
+  emission uses that path.
 - Client session wire is `DaemonEntityFrame::{Snapshot,Upsert,Patch,Remove}`
-  at protocol 7 / conformance 38. Plugin UI bindings already consume
-  Hub-owned `/session` through that family.
-- Existing lifecycle classification in `session_lifecycle_class` already
-  matches the ticket's ended-evidence rule: stale or missing lifecycle
-  is `indeterminate`; `exited`/`failed` is `ended`; remove is not ended.
-- Existing tests
-  `session_entity_subscription_observes_natural_exit_without_terminal_attach`
-  and the focused idle counter that requires
-  `lifecycle_session_drains` to increase are the production-path
-  oracles that must change meaning.
+  at protocol 7 / conformance 38.
+- `session_lifecycle_class` already matches ended-evidence rules.
+- `src/config.rs` `plugin_worker_config()` constructs
+  `PluginWorkerEngineConfig` with only
+  `per_plugin_queue_capacity` and `per_plugin_executor_concurrency`.
+- `managed_session_core_error_class` does not match
+  `CoreDaemonError::BindTerminalAdapter`.
+- `AttachStreamRegistry` has a hand-written `Default` that clippy
+  `derivable_impls` rejects at `src/daemon_attach_stream.rs:54`.
 
-Closed Core parents (already registered; do not re-open):
+### Current-lock baseline evidence (Plan Review, Hub `173e528`)
 
-- `ticket_1786663581_962361` on `tgt_1f7bce66eb304881980f9b4a2a5ae3fe`
-  (`botster-core`): `observe_lifecycle`, coalesced
-  `take_journal_advanced_wake`, bounded `lifecycle_changes_page`.
-- `ticket_1786663581_723222` on the same Core target:
-  `PluginInvocationClass::{RequestResponse,Background}`, `try_admit`,
-  `drain_completions`.
+- `cargo fmt --all -- --check` passed.
+- `cargo test --doc --workspace` passed.
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`
+  failed at `src/daemon_attach_stream.rs:54` (`derivable_impls`).
+- `./test.sh --locked` reached execution and repeatedly failed
+  `local_webrtc_stale_peer_attach_snapshot_does_not_detach_replacement_owner`
+  in `src/local_webrtc.rs`.
 
-Core's isolated Hub-shaped consumer
-(`botster-core-test-support` `hub-lifecycle-shaped`) is the consume
-contract this Hub run must adopt:
+### Core `a047574` consume contract
 
-1. `observe_lifecycle` is the progress tick. Page/wake/baseline do not
-   advance runtimes.
-2. Safe consume order: take, page until `next == watermark` or resync,
-   take again, re-page if that second take is true.
-3. Never page-then-take-then-sleep.
-4. `BudgetTooSmall` raises `max_bytes` to `minimum_bytes`. It is not
-   catch-up and not sleep.
-5. Empty successful page after a valid budget recovers through a fresh
-   `lifecycle_baseline`.
-6. Existing unbounded `lifecycle_changes` is compatibility only.
+Closed parents already published:
+
+- `observe_lifecycle` — visits **every** live session. No item, byte,
+  cursor, or elapsed input. Not a maintenance-slice primitive.
+- `lifecycle_baseline` — `registry.load_all()` of every row. Same
+  problem.
+- `take_journal_advanced_wake` and bounded `lifecycle_changes_page`.
+- `PluginInvocationClass`, `try_admit`, `drain_completions`.
+- `PluginWorkerEngineConfig` now has eight fields. Hub maps two.
+- `CoreDaemonError::BindTerminalAdapter`.
+
+Hub-shaped consume order remains: take, page until
+`next == watermark` or resync, take, re-page if woke. That order still
+applies to journal pages. It does **not** make unbounded observe or
+unbounded baseline legal slices.
+
+Plan Review compiled Hub against `a047574` in a temporary clone.
+Compilation failed at `src/config.rs:356` and `src/runtime.rs:2390`
+before any test ran.
 
 ## Scope
 
-One Hub-internal session projection that stays live without client
-subscribers, without blocking operation handlers, and without using
-terminal Drain to infer lifecycle.
+Hub Implement of the owner-loop projection is gated on
+`ticket_1786690597_161141` (Core, `tgt_1f7bce66eb304881980f9b4a2a5ae3fe`).
+Do not shim sliced observe or paged baseline inside Hub.
 
-1. Refresh `Cargo.lock` to Core `main` that contains both closed
-   parents. Record the locked Hub SHA and locked Core SHA separately.
-2. Split the owner loop so a ready Spawn, Attach, Drain, Input, Resize,
-   Shutdown, MCP, UI, or entity-mutation request is handled without
-   `drive_entity_subscriptions`, package fanout, provider resync, or
-   background plugin invocation. After an authoritative mutation, set
-   at most one O(1) coalesced `try_wake` bit.
-3. Keep one Hub lifecycle cursor and one canonical in-memory session
+### A. Consume the Core refresh (this repo, before owner-loop work)
+
+1. Refresh `Cargo.lock` to Core `main` that includes both closed
+   parents **and** `ticket_1786690597_161141` once that ticket merges.
+   Until then, compatibility work may compile against `a047574`, but
+   projection slices must not call the unbounded observe/baseline
+   forms as if they were bounded.
+2. Map all eight `PluginWorkerEngineConfig` fields from Hub host
+   policy. Keep the two existing knobs. Add six new
+   `CoreEngineOptions` fields with Core defaults:
+   - `reserved_request_response_executors` (default 1)
+   - `request_response_queue_byte_capacity`
+   - `background_queue_capacity`
+   - `background_queue_byte_capacity`
+   - `completion_queue_capacity`
+   - `completion_queue_byte_capacity`
+3. Validate: every capacity is positive; reserved executors `>= 1`
+   and strictly less than `plugin_worker_executor_concurrency`. Reject
+   invalid configs the way Core rejects them.
+4. Prove distinct live queue, executor, reservation, background, and
+   completion values through Core's `PluginWorkerDebugSnapshot` on the
+   real plugin lifecycle path, plus unload retirement. Configuration
+   JSON is not enough ([[plugin worker queue capacity and executor concurrency are independent host profile knobs]]).
+5. Project `CoreDaemonError::BindTerminalAdapter` in
+   `managed_session_core_error_class` to typed class strings for
+   `BindBeforeAttach`, `UnknownSubscription`, `StaleGeneration`, and
+   `AlreadyBound`. This uses the Core engine contract, not
+   `botster-terminal-protocol-client`.
+6. Replace `AttachStreamRegistry`'s hand-written `Default` with
+   `#[derive(Default)]` so current-lock clippy passes.
+
+### B. Owner-loop projection (after Core sliced observe/baseline)
+
+7. Split the owner loop so a ready Spawn, Attach, Drain, Input,
+   Resize, Shutdown, MCP, UI, or entity-mutation request is handled
+   without `drive_entity_subscriptions`, package fanout, provider
+   resync, or background plugin invocation. After an authoritative
+   mutation, set at most one O(1) coalesced `try_wake` bit.
+8. Keep one Hub lifecycle cursor and one canonical in-memory session
    projection, independent of subscriber count.
-4. Process work in round-robin maintenance slices. One owner turn runs
-   at most one slice, then yields to a ready operation. Slice kinds:
-   - observe (`CoreDaemon::observe_lifecycle`)
-   - journal pull (take wake + one bounded `lifecycle_changes_page`)
+9. Process work in round-robin maintenance slices. One owner turn
+   runs at most one slice, then yields to a ready operation. Slice
+   kinds:
+   - observe — **sliced** Core observe only
+   - journal pull — take wake + one `lifecycle_changes_page`
    - projection apply
-   - host-bridge fulfillment (pending RequestResponse bridges plus
-     authorized session-family delivery)
+   - host-bridge fulfillment
    - subscriber delivery
-   - completion drain (`drain_completions`)
+   - completion drain
    - package-entity provider resync
-5. Bound every slice by item count, encoded byte count, and elapsed
-   time. Publish those budgets as named test constants.
-6. Deliver Hub-owned `/session` to any authorized synthetic plugin
-   through `snapshot_begin`, bounded `snapshot_chunk`, and
-   `snapshot_end` at one snapshot sequence. Queue live deltas behind
-   `snapshot_end`. Pressure or handler failure marks a gap and requires
-   a complete baseline. Session state frames never expire.
-7. Keep client `SubscribeEntities { entity_type: "session" }` on the
-   existing `entity_snapshot` / upsert / patch / remove host-control
-   contract unless a single snapshot exceeds `DAEMON_MAX_FRAME_BYTES`.
-   Do not raise the default client requirement. Do not bump
-   `PROTOCOL_VERSION` for an additive plugin host-bridge.
-8. Move background plugin work (`emit_plugin_event` and session-family
-   delivery) to `try_admit(Background)`. Keep blocking `invoke` only for
-   RequestResponse MCP, UI render/action, and package-provider subscribe
-   snapshots.
-9. Add Hub source tests that fail if the new projection path imports
-   terminal semantic bodies or names Workspaces/membership/package
-   cleanup policy.
-10. Update the existing Drain-based natural-exit and
-    `lifecycle_session_drains` proofs to the observe/page/projection
-    path.
+   - paged baseline recovery when a resync is required
+10. Bound every slice by item count, encoded byte count, and elapsed
+    time using the Core sliced APIs. Hub must not call unbounded
+    `observe_lifecycle` or `lifecycle_baseline` from the owner loop.
+    An incomplete baseline page is not finished ended evidence.
+11. Publish slice budgets as named test constants after measuring the
+    isolated daemon path. Add a load test that scales live-session
+    count and proves ready-operation wait through the production
+    owner loop.
+
+### C. Plugin session-family delivery
+
+12. Deliver Hub-owned `/session` through `snapshot_begin`, bounded
+    `snapshot_chunk`, and `snapshot_end` at one snapshot sequence.
+13. Admit at most one in-flight session-family frame per plugin and
+    snapshot sequence. Do not admit the next chunk, `snapshot_end`,
+    or any live delta until the matching completion for the previous
+    frame succeeds. FIFO `try_admit` is not a completion fence.
+14. On admission failure, completion failure, or handler failure,
+    mark a gap and require a complete baseline. Session state frames
+    never expire.
+15. Keep client `SubscribeEntities { entity_type: "session" }` on
+    `entity_snapshot` / upsert / patch / remove unless a single
+    snapshot exceeds `DAEMON_MAX_FRAME_BYTES`. Do not raise the
+    default client requirement. Ask a human before adding
+    `DaemonEntityFrame` variants.
+16. Move background plugin work to `try_admit(Background)`. Keep
+    blocking `invoke` only for RequestResponse MCP, UI render/action,
+    and package-provider subscribe snapshots.
+
+### D. Evidence and architecture
+
+17. Add Hub source tests that fail if the new projection path imports
+    terminal semantic bodies or names Workspaces/membership/package
+    cleanup policy.
+18. Update Drain-based natural-exit and `lifecycle_session_drains`
+    proofs to observe/page/projection.
+19. Do not merge this ticket while
+    `ticket_1786690597_154692` is open unless that focused WebRTC
+    test is already green on the same revision.
 
 ## Non-scope
 
-- Package event declarations, `events.emit`, the Send-safe event
-  router, or client `SubscribeEvents`. Those are later Hub tickets in
-  this project.
-- Web or TUI UI work. Downstream clients keep consuming the existing
-  session entity frames.
-- Workspaces membership, cleanup rules, or any package-specific
-  session policy.
-- Changing ClientWorker, SessionIo, attach phase machines, GHOSTSNP,
-  or terminal Drain semantics. Terminal Drain remains a terminal-plane
-  operation for attached subscribers.
-- Automatic `remove_session` after exit. Session shutdown still does
-  not remove the row.
-- Replacing RequestResponse `invoke` for MCP/UI with `try_admit`.
-- Publishing `@trybotster/hub-test-support` unless Implement actually
-  changes shipped fixture bytes. Current published coordinate is
-  `0.1.33` / protocol 7 / conformance 38. Do not mutate those bytes
-  in place.
-- Dual-pipelining a teardown-lens implementation. One Plan → Implement
-  path.
+- Implementing sliced observe or paged baseline inside Hub.
+- Package events, `events.emit`, client `SubscribeEvents`.
+- Web or TUI UI work.
+- Workspaces membership or package cleanup rules.
+- Changing ClientWorker, SessionIo, attach phase machines, or
+  terminal Drain semantics, except the separately owned WebRTC
+  replacement-owner ticket.
+- Replacing RequestResponse `invoke` for MCP/UI.
+- Publishing `@trybotster/hub-test-support` unless shipped fixture
+  bytes change. Current coordinate: `0.1.33` / protocol 7 /
+  conformance 38.
+- Dual-pipelining teardown-lens implementation.
 
 ## Repository ownership boundaries and cross-repo dependencies
 
-Hub owns:
+Hub owns projection, scheduling, host-bridge, `/session` admission,
+and host-profile worker knobs.
 
-- Whether and when to call `observe_lifecycle`.
-- The canonical sanitized session projection and `/session` admission.
-- Owner-loop scheduling, slice budgets, and try-wake coalescing.
-- Host-bridge fulfillment and authorized plugin consumption.
-- Host retention/removal policy after exit.
+Core owns lifecycle facts, the journal, wake/page, sliced observe,
+paged baseline, and `try_admit`.
 
-Core owns:
+`botster-hub-client` owns public host-control DTOs. Plugin
+`snapshot_begin`/`chunk`/`end` stay on the Hub-owned host-bridge.
 
-- Lifecycle facts, the journal, the wake bit, and bounded pages.
-- `try_admit` / `drain_completions` / class reservations.
-- Terminal Drain, `ProcessExited`, and attach phases.
+Hub must not depend on `botster-terminal-protocol-client`.
 
-`botster-hub-client` owns public host-control DTOs. This ticket should
-not invent a second client snapshot machine. Plugin
-`snapshot_begin`/`chunk`/`end` live on the Hub-owned plugin host-bridge
-and `docs/lua-plugin-abi.md`, not on the terminal protocol crates.
+Registered dependencies (this ticket cannot complete until these
+close):
 
-Hub must not depend on `botster-terminal-protocol-client`. Hub may
-forward opaque terminal envelopes only. Session projection must not
-decode `ProcessExited`, terminal silence, terminal output, or attach
-state.
+| Ticket | Target | Repo | Why |
+| --- | --- | --- | --- |
+| `ticket_1786663581_962361` | `tgt_1f7bce66eb304881980f9b4a2a5ae3fe` | botster-core | Journal wake/page (closed) |
+| `ticket_1786663581_723222` | `tgt_1f7bce66eb304881980f9b4a2a5ae3fe` | botster-core | Class-aware `try_admit` (closed) |
+| `ticket_1786690597_161141` | `tgt_1f7bce66eb304881980f9b4a2a5ae3fe` | botster-core | Sliced observe + paged baseline (open). Run `run_1786690610_471868`. |
+| `ticket_1786690597_154692` | `tgt_7e208a0c76a44980a83b63af976b1f22` | botster-hub | Current-lock WebRTC replacement-owner failure (open). Run `run_1786690609_367424`. |
 
-Cross-repo dependencies already registered against the Core target
-`tgt_1f7bce66eb304881980f9b4a2a5ae3fe`:
+Do not implement Core observe/baseline bounding in this Hub worktree.
+Do not treat the WebRTC failure as an acceptable caveat on
+`./test.sh --locked`.
 
-- `ticket_1786663581_962361` (closed)
-- `ticket_1786663581_723222` (closed)
-
-Do not register a second Hub ticket to consume those APIs. Do not
-silently implement Core journal or admission changes in this run.
-
-No new Web, TUI, Workspaces, or Project Pipelines dependency is
-required if client session frames stay `entity_snapshot`. If Implement
-discovers that a single session snapshot cannot fit
-`DAEMON_MAX_FRAME_BYTES` without client-visible chunking, stop and ask
-a human before adding `DaemonEntityFrame` variants. That would be an
-additive capability with a new unpublished hub-test-support version,
-not a silent protocol 8 flag day.
+No new Web, TUI, Workspaces, or Project Pipelines dependency while
+client session frames stay `entity_snapshot`.
 
 ## Assumptions and unknowns
 
 Assumptions:
 
-- Target routing from `list_spawn_targets` is authoritative. This run
-  edits only `botster-hub`.
-- Core `main` at Implement time still exposes
-  `observe_lifecycle`, `take_journal_advanced_wake`,
-  `lifecycle_changes_page`, `SessionLifecyclePageError::BudgetTooSmall`,
-  `PluginInvocationClass`, `try_admit`, and `drain_completions`. If the
-  lockfile refresh cannot compile those names, stop; do not shim them
-  in Hub.
-- The Hub-shaped consume loop in Core test-support is the required
-  consume order. Hub may slice that loop across owner turns, but it
-  must not invert take/page/take.
-- One `observe_lifecycle` call is one observe slice. Core already walks
-  live sessions in `SessionId` order and retains per-session errors.
-- RequestResponse `invoke` on MCP/UI/package-provider subscribe is the
-  operation. Removing it would break the request. The ticket forbids
-  *background* invocation on those handlers, not the request itself.
-- Client `entity_snapshot` remains the host-control session contract
-  for this ticket. Plugin `snapshot_begin`/`chunk`/`end` is the same
-  semantic contract on the plugin host-bridge: one snapshot sequence,
-  deltas only after `snapshot_end`, gap requires a complete baseline,
-  frames never expire, ended evidence is only a live ended patch or a
-  finished baseline ended row.
+- Target routing from `list_spawn_targets` is authoritative.
+- Hub Implement of slices waits for
+  `ticket_1786690597_161141` to publish named Core APIs. This plan
+  names the required properties, not speculative Rust signatures.
+  Implement must consume the merged names, not invent a second Hub
+  walk over `list_sessions`.
+- RequestResponse `invoke` on MCP/UI/package-provider subscribe is
+  the operation.
+- Client `entity_snapshot` remains the host-control session contract.
+- Plugin begin/chunk/end is the same semantic contract on the
+  host-bridge, with a completion fence.
 - Existing `session_lifecycle_class` stays the total classifier.
-  Incomplete baseline, omitted UUID, `indeterminate`, `entity_remove`,
-  and gap must not be treated as ended.
 - `lifecycle_session_drains` as a required idle-progress counter is
-  obsolete. Replace the producer with observe/page counters. Do not
-  keep calling terminal Drain just to satisfy the old counter.
+  obsolete.
 - Worktree path has no `:`. Tracked `.gitignore` is present and
-  non-empty. No `CARGO_TARGET_DIR` override.
+  non-empty.
 - This is not a Hub session-type eligibility consumer.
 - Direct-merge pipeline. No pull request.
 
 Unknowns Implement must not invent:
 
-- Exact numeric owner-turn and ready-operation budgets. Publish them
-  as named test constants after measuring the isolated daemon path.
-  Proposed starting points to beat, not silent defaults:
-  `MAX_OWNER_TURN_MS` and `MAX_READY_OPERATION_WAIT_MS`. Acceptance
-  fails if they are unpublished.
-- Whether later saturated-event Stage D needs client-visible snapshot
-  chunking. Out of scope unless the current daemon frame limit is hit
-  by the tests in this ticket.
-- Event-router product names, schemas, or audiences.
+- Exact Core sliced-observe and paged-baseline type names. Read the
+  merged Core docs and rustdoc after
+  `ticket_1786690597_161141` closes.
+- Exact numeric `MAX_OWNER_TURN_MS` and
+  `MAX_READY_OPERATION_WAIT_MS`. Publish them after measurement.
+  Acceptance fails if they are unpublished or if they only hold
+  because observe still walks every session.
+- Whether later Stage D needs client-visible snapshot chunking.
 
 ## Implementation shape
 
-Production entry:
+Production entry after the Core parent merges:
 
 ```
 authoritative Hub mutation
@@ -338,15 +356,20 @@ idle / wake
   -> one maintenance slice
   -> yield
 observe slice
-  -> CoreDaemon::observe_lifecycle
+  -> Core sliced observe(max_sessions, max_bytes, max_elapsed)
+  -> resume cursor if incomplete
 journal-pull slice
   -> take_journal_advanced_wake
   -> lifecycle_changes_page(after, max_changes, max_bytes)
 projection-apply slice
   -> upsert/remove into the one Hub projection
+paged-baseline slice
+  -> only on resync; assemble one snapshot sequence
+  -> incomplete page is not ended evidence
 host-bridge slice
   -> fulfill pending RequestResponse bridges
-  -> try_admit(Background) session snapshot_begin/chunk/end
+  -> admit at most one session-family frame per plugin/sequence
+  -> wait for that completion before the next admit
 subscriber-delivery slice
   -> bounded client entity_snapshot / upsert / patch / remove
 completion-drain slice
@@ -355,159 +378,137 @@ resync slice
   -> bounded package provider resync
 ```
 
-Natural zero-client exit must converge through observe + page +
-projection with no `CoreDaemon::drain`, no attach, and no Web/TUI
-subscriber.
+Suggested module split (keep gravity down):
 
-Suggested module split (keep gravity down; do not grow
-`daemon_transport.rs`):
-
-- `src/session_projection.rs` — cursor, canonical rows, apply, ended
-  evidence helpers, architecture-test hooks.
-- `src/daemon_maintenance.rs` — wake bit, round-robin slice scheduler,
+- `src/session_projection.rs` — cursor, rows, apply, ended evidence.
+- `src/daemon_maintenance.rs` — wake bit, round-robin scheduler,
   slice budgets. Do not reuse `src/maintenance.rs`.
-- Thin `HubRuntime` facades for observe / take / page / try_admit /
-  drain_completions.
-- `src/daemon_entity_subscriptions.rs` — client delivery only. Remove
-  Drain-based discovery and the empty-subscriber early return that
-  skips projection.
-- `docs/lua-plugin-abi.md` — document the `/session` host-bridge
-  snapshot sequence.
-- `docs/client-protocol.md` — document that lifecycle projection no
-  longer depends on subscribers or terminal Drain.
+- `src/config.rs` / `src/runtime.rs` — worker knobs and
+  `BindTerminalAdapter` class mapping.
+- `src/daemon_attach_stream.rs` — derive `Default`.
+- `src/daemon_entity_subscriptions.rs` — client delivery only.
+- `docs/lua-plugin-abi.md`, `docs/client-protocol.md`.
 
 ## Affected surfaces/files
 
-Expected to change:
+Expected to change in this Hub ticket:
 
-- `Cargo.lock` — pin Core `main` after the closed parents.
-- `src/runtime.rs` — Core observe/wake/page/try_admit/drain_completions
-  facades; stop using unbounded `lifecycle_changes` on this path; move
-  `emit_plugin_event` to Background admission.
-- `src/daemon_transport.rs` — owner-loop scheduling only. Remove
-  inline `drive_entity_subscriptions` / fanout / resync from request
-  handlers.
-- `src/daemon_entity_subscriptions.rs` — projection independence,
-  Drain removal, sliced client delivery.
-- New `src/session_projection.rs` and `src/daemon_maintenance.rs`.
-- `src/lib.rs` / `src/daemon.rs` module wiring as needed.
-- `docs/lua-plugin-abi.md`, `docs/client-protocol.md`, this plan.
+- `Cargo.lock`
+- `src/config.rs` — six new worker knobs, validation, serde
+- `src/runtime.rs` — facades; `BindTerminalAdapter` class mapping;
+  Background `try_admit`
+- `src/persistence.rs` / config tests if durable core_engine JSON
+  grows
+- `src/daemon_attach_stream.rs` — `#[derive(Default)]`
+- `src/daemon_transport.rs` — owner-loop scheduling only
+- `src/daemon_entity_subscriptions.rs`
+- New `src/session_projection.rs` and `src/daemon_maintenance.rs`
+- `docs/lua-plugin-abi.md`, `docs/client-protocol.md`, this plan
 - Tests:
+  - `tests/hub_plugin_lifecycle_test.rs` / `plugin_bounds.rs` —
+    distinct live knobs including reservation, background, and
+    completion
   - `tests/hub_daemon_lifecycle/sessions.rs`
   - `tests/hub_client_api_test.rs`
-  - `tests/hub_lua_runtime_test.rs` or a new synthetic-plugin fixture
-  - new source architecture tests for terminal-body and Workspaces
-    policy exclusion
-- `src/daemon_entity_subscriptions.rs` unit tests for ended evidence.
+  - new synthetic-plugin fixture with executor concurrency `> 1`
+  - new session-count load / ready-operation test
+  - new architecture tests
 
-Likely untouched:
+Likely untouched in this ticket:
 
-- `src/local_webrtc.rs`, attach/drain terminal adapters
+- `src/local_webrtc.rs` — owned by `ticket_1786690597_154692`
 - `src/session_types.rs` eligibility
-- package event router ticket surfaces
+- package event router surfaces
 - `src/maintenance.rs` update-check code
-- Workspaces fixtures except to prove they are not named by the new
-  projection path
 
 ## Risks
 
-- Refreshing Core past `033cd01` can pull unrelated Core attach or
-  admission changes. Compile and rerun Hub daemon lifecycle tests
-  against the new lockfile before rewriting the owner loop.
-- Leaving `drain_runtime_once` in the session pump would keep the
-  forbidden lifecycle-from-Drain path and fail the new architecture
-  tests.
-- Keeping the empty-subscriber early return would fail zero-subscriber
+- Implementing slices against unbounded `observe_lifecycle` would
+  fail the ticket's own owner-turn proof. Do not do that.
+- Refreshing Core before `ticket_1786690597_161141` merges can
+  compile compatibility work but cannot finish projection.
+- Leaving `drain_runtime_once` in the session pump keeps the
+  forbidden lifecycle-from-Drain path.
+- Keeping the empty-subscriber early return fails zero-subscriber
   projection.
-- Calling `lifecycle_changes` instead of `lifecycle_changes_page`
-  would ignore page budgets and the Hub-shaped consume contract.
-- Page-then-take-then-sleep can drop a wake. Copy Core's take / page /
-  take order, sliced across turns.
-- Treating worker isolation as non-blocking would leave Spawn/MCP/UI
-  coupled to slow handlers. Review must see `try_admit(Background)` on
-  the background path.
-- Blocking `invoke` inside a maintenance slice would recreate owner
-  stalls. Host-bridge session delivery must be admit-and-yield.
-- Changing client `DaemonEntityFrame` without a feature constant would
-  break Web/TUI at protocol 7. Do not do that in this ticket.
-- Existing focused-idle test that requires
-  `lifecycle_session_drains` will fail if Drain is removed without
-  rewriting the oracle.
-- Growing `daemon_transport.rs` further recreates Hub gravity. Put
-  the scheduler and projection in new modules.
+- Page-then-take-then-sleep can drop a wake.
+- Admitting the next snapshot chunk before the previous completion
+  returns can reorder frames when background executors `> 1`.
+- Treating worker isolation as non-blocking leaves Spawn/MCP/UI
+  coupled to slow handlers.
+- Changing client `DaemonEntityFrame` without a feature constant
+  would break Web/TUI at protocol 7.
+- Claiming `./test.sh --locked` while the WebRTC replacement-owner
+  test still fails is a gate lie. That failure has an owner ticket.
+- Growing `daemon_transport.rs` further recreates Hub gravity.
 
 ## Acceptance checks/tests
 
-Charter gates (CI-matching):
+Charter gates (CI-matching), only after both open dependencies are
+closed or independently green on the same revision:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`
 - `./test.sh --locked`
 - `cargo test --doc --workspace --locked`
 
-Product proofs (new or rewritten; must exercise the production owner
-loop, not only helper existence):
+Product proofs through the production owner loop:
 
 1. Zero Web/TUI subscribers: spawn a short-lived session, never
-   `SubscribeEntities`, never Attach/Drain. After observe/page slices,
-   the Hub projection contains a finished baseline ended row.
-2. Synthetic plugin consumption: an admitted fixture plugin with no
-   Workspaces names receives `snapshot_begin`, one or more bounded
-   `snapshot_chunk`s, and `snapshot_end` at one sequence, then a live
-   ended patch or a later complete baseline ended row. Same ended
-   evidence rules as clients.
-3. False-ended matrix: incomplete baseline, omitted UUID,
-   `indeterminate` row, `entity_remove`, and gap each fail an
-   `is_ended` helper. A live ended patch and a finished baseline ended
-   row pass.
-4. Slow Background handler: a synthetic handler sleeps beyond the
-   ready-operation budget. Spawn, Drain, MCP, and UI requests still
-   complete within the published ready-operation wait. Completions
-   drain on a later slice.
-5. Owner-turn budget: with ready operations queued, one maintenance
-   slice returns within `MAX_OWNER_TURN_MS`. The next owner turn
-   handles the operation rather than another slice.
-6. Consume-order: dropped wake still converges by paging from the last
-   cursor. `BudgetTooSmall` raises `max_bytes`. SourceChanged /
-   CursorExpired / CursorAhead install a fresh baseline.
-7. Architecture: Hub source tests fail if the projection/maintenance
-   modules import `botster-terminal-protocol-client`, match
-   `ProcessExited` bodies, or contain `botster-workspaces`,
-   `membership`, or package cleanup-rule identifiers.
-8. Existing session entity subscription tests still pass on
-   `entity_snapshot` / upsert / patch / remove, including reconnect
-   snapshot authority and stale-as-indeterminate.
-9. Rewrite
-   `session_entity_subscription_observes_natural_exit_without_terminal_attach`
-   so the oracle is the Hub projection / entity patch, not a terminal
-   Drain event. Keep the no-attach fixture.
+   `SubscribeEntities`, never Attach/Drain. After sliced observe and
+   page slices, the Hub projection contains a finished baseline ended
+   row. Incomplete baseline pages must not satisfy this.
+2. Session-count load: raise live sessions well above one observe
+   slice budget. Ready Spawn/Drain/MCP/UI wait stays within
+   `MAX_READY_OPERATION_WAIT_MS`. Owner turn stays within
+   `MAX_OWNER_TURN_MS`. Red on revert: calling unbounded
+   `observe_lifecycle` from the owner loop.
+3. Synthetic plugin consumption with
+   `plugin_worker_executor_concurrency > 1` and reserved
+   RequestResponse `= 1`. Earlier frames have longer handlers than
+   later frames. The plugin still sees
+   `snapshot_begin` then chunks then `snapshot_end` then deltas.
+   A live ended patch or a finished complete baseline ended row is
+   the only ended evidence.
+4. False-ended matrix: incomplete baseline, omitted UUID,
+   `indeterminate`, `entity_remove`, and gap each fail `is_ended`.
+5. Slow Background handler cannot delay Spawn, Drain, MCP, or UI
+   beyond the published ready-operation wait.
+6. Consume-order: dropped wake still converges. `BudgetTooSmall`
+   raises `max_bytes`. Resync installs a **paged** complete baseline,
+   not one unbounded `load_all`.
+7. Architecture: projection/maintenance modules must not import
+   `botster-terminal-protocol-client`, match `ProcessExited` bodies,
+   or contain `botster-workspaces`, `membership`, or package
+   cleanup-rule identifiers.
+8. Distinct live worker knobs: queue, executor, reservation,
+   background queue/bytes, and completion queue/bytes all appear in
+   Core debug snapshots with the configured values. Unload returns
+   to baseline.
+9. `BindTerminalAdapter` class mapping is total over the four
+   published variants.
+10. Existing session entity subscription tests still pass on
+    `entity_snapshot` / upsert / patch / remove.
+11. Rewrite
+    `session_entity_subscription_observes_natural_exit_without_terminal_attach`
+    so the oracle is the Hub projection, not a terminal Drain event.
 
 Downstream proof:
 
-- Not required in Web or TUI checkouts while the client session frame
-  vocabulary is unchanged.
-- Required in-repo: generated TypeScript / hub-test-support stay at
-  protocol 7 / conformance 38 unless Implement actually changes
-  shipped client frames. If frames change, bump conformance, pick a
-  new unpublished hub-test-support version, and ask a human before
-  raising protocol.
+- Not required in Web or TUI checkouts while client session frames
+  stay `entity_snapshot`.
+- In-repo TypeScript / hub-test-support stay at protocol 7 /
+  conformance 38 unless client frames change.
 
-Live Hub pin / charter live proof:
+Live Hub pin:
 
 - Record Hub source SHA and lockfile-pinned Core SHA separately after
-  the Core refresh.
-- Isolated daemon with an explicit data directory is the production
-  path. Do not use a second in-process engine story.
+  the Core refresh. The Core SHA must be at or after the merge of
+  `ticket_1786690597_161141`.
 
 ## Runtime-teardown class
 
 `teardown_class_applies`: no.
-
-This ticket projects host session state from Core journal pages and
-moves background work off operation handlers. It does not implement
-peer/session/runtime teardown. Terminal-state vs live-runtime
-divergence is owned by the closed Core journal parent. Hub's duty is
-to stop using terminal Drain as a lifecycle oracle.
 
 ## Worktree hygiene
 
@@ -518,26 +519,24 @@ to stop using terminal Drain as a lifecycle oracle.
 
 ## Vault gaps worth capturing
 
-- Hub now has a required consume loop (observe, take, page, take)
-  distinct from terminal Drain. After merge, capture that Hub
-  lifecycle projection must not early-return on zero subscribers and
-  must not call `drain_runtime_once` to discover exit.
-- Worker isolation vs non-blocking already exists. After merge, extend
-  it with the concrete Hub Background `try_admit` adoption on session
-  projection, or leave a short inbox note if the existing drift note
-  is enough.
-- Do not capture Workspaces cleanup policy. That remains a package
-  concern.
-- Do not capture unpublished owner-turn numbers until Verify measures
-  them.
+- After the Core sliced-observe parent merges, capture that Hub
+  maintenance slices must call the sliced observe/baseline APIs, not
+  the compatibility full-walk wrappers.
+- After this Hub merge, capture that Hub projection must not
+  early-return on zero subscribers and must not use
+  `drain_runtime_once` to discover exit.
+- Do not capture unpublished owner-turn numbers until Verify
+  measures them.
 
 ## Pipeline gates and artifacts
 
-- Plan destination: `docs/plans/project-session-state-without-blocking-operation-paths.md`
-  (repo-owned living plan directory).
+- Plan destination:
+  `docs/plans/project-session-state-without-blocking-operation-paths.md`
 - Direct merge into `main` after Verify. No pull request.
-- Implement must leave command evidence for the charter gates and the
-  product proofs above.
-- Review overlays: [[botster-runtime-reviewer-playbook]] for the owner
-  loop; [[botster-package-reviewer-playbook]] only for the synthetic
-  plugin fixture and lua-plugin-abi host-bridge contract.
+- Vault checklist for this ticket:
+  `checklist_1786689614_825667`. Skip further vault-checklist
+  creation. Unused duplicate:
+  `checklist_1786689631_664448`.
+- Review overlays: [[botster-runtime-reviewer-playbook]] for the
+  owner loop; [[botster-package-reviewer-playbook]] for the synthetic
+  plugin fixture.
