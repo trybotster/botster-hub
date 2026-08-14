@@ -1,4 +1,9 @@
-# Plan: publish crates.io botster-ui-contract 0.3.2 as the consumer identity
+# Plan: Hub Git tag botster-ui-contract-v0.3.2 as the consumer identity
+
+Implement-stage human answer `question_1786664733_777672` revised this ticket:
+do not publish crates.io, do not request a crates.io token, and use GitHub tag
+`botster-ui-contract-v0.3.2` as the Rust consumer identity. The Plan-time
+crates.io decision is superseded. This plan is resynchronized to that answer.
 
 ## Target and routing
 
@@ -68,7 +73,7 @@ Botster maps required by the planner overlay:
 
 Primary ticket / identity notes:
 
-- [[botster rust consumers that share ui contract must pin one hub revision]] — **current vault rule**. This ticket plus the human answer supersede it for consumer identity. Cargo identity must become crates.io `botster-ui-contract` `0.3.2`, not a Hub Git SHA.
+- [[botster rust consumers that share ui contract must pin one hub revision]] — **current vault rule**. Implement-stage human answer `question_1786664733_777672` supersedes crates.io and Hub `rev` identity. Cargo identity must become Hub Git tag `botster-ui-contract-v0.3.2`. Manifests must use `tag` and must not use `rev`.
 - [[public protocol versions host control and Core terminal planes independently]] — clients pin protocol and contract versions, not Hub revisions. Current Hub Git identity is the cost this ticket removes for the UI contract.
 - [[botster package surface semantics live in ui contract while hub owns admission]] — contract ownership stays in Hub. This run publishes that crate; it does not move the owner.
 - [[botster hub is a first party host profile over core]] — Hub remains the host profile. The published crate is a sibling contract package, not a Core or TUI Kit extraction.
@@ -119,25 +124,20 @@ Seam guidance, not a second ownership charter:
 
 ## Scope
 
-1. Publish crates.io `botster-ui-contract` version `0.3.2` from the current Hub-owned crate. Do not bump the version. Do not extract a new repository. Do not move ownership into TUI Kit.
-2. Make git-consumed Hub package metadata resolve that crates.io version:
-   - `crates/botster-hub-client/Cargo.toml` and `crates/botster-hub-test-support/Cargo.toml` must declare `botster-ui-contract = "0.3.2"` with **no** `path` or `git` source.
-   - Keep Hub workspace path resolution for **local development only** via a workspace `[patch.crates-io]` (or equivalent workspace-only patch) pointing at `crates/botster-ui-contract`.
-   - The root `botster-hub` package may keep a path dependency. External consumers do not take UI-contract identity from the Hub binary crate.
-3. Define one release process for npm `@trybotster/ui-contract` and crates.io `botster-ui-contract` so both packages represent the same UI contract version. Extend the existing Hub release script rather than adding a second ad hoc publish path. The process must:
-   - refuse to publish when the npm package version and crate version differ;
-   - skip an already-published registry coordinate whose integrity matches the local artifact;
-   - refuse to overwrite a published coordinate whose integrity differs;
-   - publish the missing crates.io `0.3.2` in this ticket;
-   - leave already-published npm `@trybotster/ui-contract@0.3.2` unpublished.
-4. Prove the exact crates.io coordinate with an external Cargo consumer that is not the Hub workspace.
-5. Prove a disposable TUI graph that pins:
+1. Do not publish crates.io `botster-ui-contract`. Revert unmerged crates.io publication changes from `fdfc80a`.
+2. Make git-consumed Hub package metadata resolve tag `botster-ui-contract-v0.3.2`:
+   - `crates/botster-hub-client/Cargo.toml` and `crates/botster-hub-test-support/Cargo.toml` must declare `botster-ui-contract = { git = "https://github.com/trybotster/botster-hub.git", tag = "botster-ui-contract-v0.3.2" }` with **no** `path`, `rev`, or crates.io source.
+   - Keep Hub workspace path resolution for **local development only** via a workspace `[patch."https://github.com/trybotster/botster-hub.git"]` pointing at `crates/botster-ui-contract`.
+   - The root `botster-hub` package may keep a path dependency.
+3. Keep npm `@trybotster/ui-contract@0.3.2` unchanged. Do not republish it.
+4. Add the smallest tag create/verify support (`script/tag-ui-contract`) and document the tag identity in the crate README, root README, and client-protocol.
+5. Prove an external Cargo consumer outside the Hub workspace depends on the tag and compiles a public contract type.
+6. Prove a disposable TUI graph that pins:
    - `botster-hub-client` from Hub **git** at this ticket's merged/pushed Hub revision;
-   - `botster-ui-contract = "0.3.2"` from crates.io;
+   - `botster-ui-contract` from Hub git **tag** `botster-ui-contract-v0.3.2` (no `rev`);
    - a path-pinned TUI Kit;
-   and resolves **exactly one** `botster-ui-contract` source from the crates.io registry, with no `git+botster-hub` SHA identity.
-6. Document the published coordinate and the one release process in the crate/package READMEs and any Hub client-protocol sentence that still implies Git-SHA identity for the Rust contract.
-7. Merge directly into `main`. Do not create a PR.
+   and resolves **exactly one** `botster-ui-contract` source from that tag, with no Hub `rev` identity and no crates.io identity.
+7. Merge directly into `main`. Create and push annotated tag `botster-ui-contract-v0.3.2` on the merged main commit. Do not create a PR.
 
 ## Non-scope
 
@@ -169,7 +169,7 @@ Cross-repo rule: [[cross repo dependency registration must use dependency repo t
 
 Assumptions:
 
-1. Human answer choose A is the identity decision. crates.io `botster-ui-contract` `0.3.2` is the consumer identity.
+1. Implement-stage human answer `question_1786664733_777672` supersedes Plan-time choose A. Hub Git tag `botster-ui-contract-v0.3.2` is the consumer identity. crates.io is not published.
 2. Empty `cargo search botster-ui-contract` means the crate is unpublished. Implement must revalidate immediately before `cargo publish`.
 3. Local crate `0.3.2` is the same contract version as already-published npm `@trybotster/ui-contract@0.3.2`. Implement must prove that before calling them one release. If generated schema/fixtures diverge from the published npm tarball, stop and ask a human. Do not republish npm `0.3.2` and do not silently publish a drifted Rust crate under the same version.
 4. `{ version, path }` on a git-consumed member is not enough. Version-only member deps plus a workspace-only `[patch.crates-io]` is the Cargo mechanism that keeps local Hub development on the path crate while git hub-client consumers resolve crates.io.
@@ -189,14 +189,14 @@ Unknowns that stop Implement rather than invent a coordinate:
 
 | Path | Change |
 | --- | --- |
-| `crates/botster-ui-contract/Cargo.toml` | Publish metadata only if cargo/crates.io requires it (`readme`, `include`, explicit `license-file` packaging). Do not bump `0.3.2`. |
-| `crates/botster-hub-client/Cargo.toml` | `botster-ui-contract = "0.3.2"` with no path/git source |
-| `crates/botster-hub-test-support/Cargo.toml` | `botster-ui-contract = "0.3.2"` with no path/git source |
-| `Cargo.toml` | Workspace-only `[patch.crates-io]` to `crates/botster-ui-contract`. Optional `publish = false` on unpublished members. |
-| `Cargo.lock` | Refresh for the registry+patch identity. No unrelated transitive churn. |
-| `script/publish-npm-packages` or a replacement Hub UI-contract release script | One process for npm + crates.io, version lockstep, skip-if-matching, refuse-if-mismatch |
-| `packages/ui-contract/README.md` | Replace manual npm-only publish with the one release process and the crates.io coordinate |
-| crate README or `docs/client-protocol.md` / root `README.md` | Only the sentences that still describe the Rust contract as a Hub-git / workspace-only identity |
+| `crates/botster-ui-contract/Cargo.toml` | Add `readme` only. Do not bump `0.3.2`. |
+| `crates/botster-ui-contract/README.md` | Document the Git tag identity |
+| `crates/botster-hub-client/Cargo.toml` | git tag `botster-ui-contract-v0.3.2`, no path/rev/crates.io |
+| `crates/botster-hub-test-support/Cargo.toml` | same tag pin |
+| `Cargo.toml` | Workspace-only `[patch."https://github.com/trybotster/botster-hub.git"]` to the path crate |
+| `Cargo.lock` | Refresh only if the tag+patch identity requires it |
+| `script/tag-ui-contract` | Create/verify the annotated tag. No crates.io publish |
+| `packages/ui-contract/README.md` | Unchanged. npm `0.3.2` stays unpublished |
 | `docs/plans/publish-crates-io-botster-ui-contract-0.3.2.md` | This plan |
 | `docs/reports/publish-crates-io-botster-ui-contract-0.3.2.md` | Implement report after publication and graph proof |
 
@@ -204,16 +204,14 @@ Not changed unless packaging requires it: `crates/botster-ui-contract/src/**`, g
 
 ## Implementation sequence
 
-1. Revalidate registry state: `cargo search botster-ui-contract`, `npm view @trybotster/ui-contract@0.3.2 version`, and compare local generated schema/fixtures to the published npm tarball.
-2. Change git-visible member manifests to version-only `botster-ui-contract = "0.3.2"` and add the workspace `[patch.crates-io]`.
-3. Land the one release process in repo-owned script and docs.
-4. Run Hub workspace gates through `./test.sh` and CI-equivalent fmt/clippy. The patch must keep local development on the path crate.
-5. `cargo package -p botster-ui-contract` and an external temp consumer against the packed `.crate` as a rehearsal.
-6. If Cargo credentials are missing, ask a human. Then `cargo publish -p botster-ui-contract` for `0.3.2`.
-7. Prove `cargo search` / crates.io shows `botster-ui-contract` `0.3.2`.
-8. Prove a clean external consumer (`botster-ui-contract = "0.3.2"`, no Hub checkout) compiles a public contract type.
-9. Merge/push the metadata change, then prove the disposable TUI graph against Hub **git** + crates.io `0.3.2` + path kit. Inspect `cargo tree -i botster-ui-contract` and `Cargo.lock`. An ambiguous multi-source result is failure.
-10. Write the implement report. Merge directly to `main`.
+1. Revert unmerged crates.io publication changes from `fdfc80a`.
+2. Change git-visible member manifests to tag `botster-ui-contract-v0.3.2` and add the workspace git `[patch]`.
+3. Land `script/tag-ui-contract` and document the tag identity.
+4. Run Hub workspace gates. The patch must keep local development on the path crate.
+5. Merge directly to `main`. Create and push annotated tag `botster-ui-contract-v0.3.2` on the merged main commit.
+6. Prove an external consumer against the tag.
+7. Prove the disposable TUI graph against Hub git hub-client + tag UI contract + path kit.
+8. Write the implement report.
 
 ## Risks
 
@@ -237,23 +235,22 @@ Hub workspace (production entry is the published crate plus git-visible member m
 
 Registry and lockstep:
 
-- `cargo search botster-ui-contract` shows `0.3.2`.
 - `npm view @trybotster/ui-contract@0.3.2 version` remains `0.3.2` and was not republished.
-- Release script documents and enforces equal npm/crate versions.
-- Published crate source is the Hub `crates/botster-ui-contract` tree at `0.3.2`, not a git tag identity.
+- `script/tag-ui-contract --verify` confirms tag `botster-ui-contract-v0.3.2` points at crate version `0.3.2`.
+- crates.io `botster-ui-contract` remains unpublished.
 
 External consumer (required; code existence is not enough):
 
-- A temp crate outside the Hub workspace depends on `botster-ui-contract = "0.3.2"` and compiles a public type such as `UiNode` or `validate_ui_node`.
-- That consumer's `Cargo.lock` source is the crates.io registry, not `git+https://github.com/trybotster/botster-hub.git`.
+- A temp crate outside the Hub workspace depends on `botster-ui-contract = { git = "https://github.com/trybotster/botster-hub.git", tag = "botster-ui-contract-v0.3.2" }` and compiles a public type such as `UiNode` or `validate_ui_node`.
+- That consumer's `Cargo.lock` source is the Hub git tag, not crates.io and not a `rev`.
 
 Disposable TUI graph (charter downstream proof):
 
 - Pins `botster-hub-client` from Hub git at this ticket's published Hub revision.
-- Pins `botster-ui-contract = "0.3.2"` from crates.io.
+- Pins `botster-ui-contract` from Hub git tag `botster-ui-contract-v0.3.2` with no `rev`.
 - Path-pins TUI Kit.
-- `cargo tree -i botster-ui-contract` resolves exactly one package from crates.io.
-- `Cargo.lock` has one `botster-ui-contract` entry and no `git+botster-hub` identity for that crate.
+- `cargo tree -i botster-ui-contract` resolves exactly one package from that tag.
+- `Cargo.lock` has one `botster-ui-contract` entry and no Hub `rev` or crates.io identity for that crate.
 - The `botster-tui` binary compiles. Handshake or fixture failures from unfinished TUI product work do not fail this ticket ([[kit UI contract pin proof uses an already split TUI consumer]]). Dual-source `E0308` does fail this ticket.
 
 Merge:
@@ -262,9 +259,9 @@ Merge:
 
 ## Vault gaps worth capturing
 
-1. [[botster rust consumers that share ui contract must pin one hub revision]] will be stale for consumer identity after this ticket. Capture that first-party Rust consumers pin crates.io `botster-ui-contract` and that git hub-client / hub-test-support must not reintroduce a Hub SHA path identity.
-2. New convention candidate: Hub workspace `[patch.crates-io]` is local-only; git-visible member manifests for published contract crates must be version-only.
-3. No capture needed for the human choose-A decision itself once the published coordinate exists; the crate and release script are the durable record.
+1. [[botster rust consumers that share ui contract must pin one hub revision]] will be stale for consumer identity after this ticket. Capture that first-party Rust consumers pin Hub Git tag `botster-ui-contract-v0.3.2` and must not use `rev` or crates.io.
+2. New convention candidate: Hub workspace git `[patch]` is local-only; git-visible member manifests for the UI contract must use the versioned tag.
+3. Capture the Implement-stage human revision that superseded crates.io choose A.
 
 Do not capture those notes during Plan. Capture after Implement proves the coordinate, or record why no capture was needed if the existing notes are updated in a later vault pass.
 
