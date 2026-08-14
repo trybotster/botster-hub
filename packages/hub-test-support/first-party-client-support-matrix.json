@@ -36,7 +36,8 @@
     "hub_source_update",
     "snapshot_delivery=ready_then_history",
     "unix_terminal_adapter",
-    "terminal_subscription_closed"
+    "terminal_subscription_closed",
+    "webrtc_terminal_adapter"
   ],
   "diagnostic_kinds": [
     "connected",
