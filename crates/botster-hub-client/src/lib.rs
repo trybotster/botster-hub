@@ -27,7 +27,7 @@ mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 pub const PROTOCOL_VERSION: u16 = 7;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 40;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 41;
 /// Oldest conformance revision accepted by the default first-party client requirement.
 pub const DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 36;
 /// Version of the local WebRTC delivery chunk framing protocol.
@@ -88,6 +88,7 @@ pub enum DaemonLocalWebrtcDeliveryKind {
     DaemonResponse,
     DaemonEntityFrame,
     DaemonTerminalFrame,
+    DaemonEvent,
 }
 
 /// One frame of an encrypted daemon delivery sent over the local WebRTC DataChannel.
@@ -748,6 +749,16 @@ impl DaemonCompatibilityRequirement {
             .required_features
             .push(FEATURE_WEBRTC_TERMINAL_ADAPTER.to_string());
         requirement.minimum_conformance_fixture_revision = CONFORMANCE_FIXTURE_REVISION;
+        requirement
+    }
+
+    /// Build the requirement for WebRTC adapter close events on protocol 7.
+    #[must_use]
+    pub fn for_webrtc_terminal_subscription_closed() -> Self {
+        let mut requirement = Self::for_webrtc_terminal_adapter();
+        requirement
+            .required_features
+            .push(FEATURE_TERMINAL_SUBSCRIPTION_CLOSED.to_string());
         requirement
     }
 }
@@ -3382,6 +3393,51 @@ mod tests {
 
         ensure_compatible(&requirement, &DaemonCompatibility::current())
             .expect("a webrtc-adapter client accepts the current daemon");
+        assert!(
+            !requirement
+                .required_features
+                .iter()
+                .any(|feature| feature == FEATURE_TERMINAL_SUBSCRIPTION_CLOSED),
+            "the adapter helper must not require terminal_subscription_closed"
+        );
+    }
+
+    #[test]
+    fn webrtc_terminal_subscription_closed_requirement_requires_both_features() {
+        let requirement = DaemonCompatibilityRequirement::for_webrtc_terminal_subscription_closed();
+        assert!(
+            requirement
+                .required_features
+                .iter()
+                .any(|feature| feature == FEATURE_WEBRTC_TERMINAL_ADAPTER)
+        );
+        assert!(
+            requirement
+                .required_features
+                .iter()
+                .any(|feature| feature == FEATURE_TERMINAL_SUBSCRIPTION_CLOSED)
+        );
+        assert!(
+            !DaemonCompatibilityRequirement::current()
+                .required_features
+                .iter()
+                .any(|feature| feature == FEATURE_TERMINAL_SUBSCRIPTION_CLOSED)
+        );
+
+        let mut previous_daemon = DaemonCompatibility::current();
+        previous_daemon.conformance_fixture_revision = CONFORMANCE_FIXTURE_REVISION;
+        previous_daemon
+            .features
+            .retain(|feature| feature != FEATURE_TERMINAL_SUBSCRIPTION_CLOSED);
+        let error = ensure_compatible(&requirement, &previous_daemon)
+            .expect_err("close-event clients must require the negotiated feature");
+        assert!(
+            error
+                .diagnostic
+                .contains("missing required feature(s): terminal_subscription_closed")
+        );
+        ensure_compatible(&requirement, &DaemonCompatibility::current())
+            .expect("a negotiated close-event client accepts the current daemon");
     }
 
     #[test]
@@ -3803,7 +3859,7 @@ mod tests {
     #[test]
     fn protocol_seven_rejects_protocol_six_and_accepts_conformance_floor_thirty_five() {
         assert_eq!(PROTOCOL_VERSION, 7);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 40);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 41);
 
         let protocol_six = DaemonCompatibilityRequirement {
             protocol_version: 6,
@@ -6320,7 +6376,7 @@ mod tests {
     #[test]
     fn protocol_six_and_conformance_thirty_two_define_the_cold_cut_boundary() {
         assert_eq!(PROTOCOL_VERSION, 7);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 40);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 41);
 
         let requirement = DaemonCompatibilityRequirement::current();
         let protocol_error = ensure_compatible(
@@ -6385,7 +6441,7 @@ mod tests {
         // conformance revision: bumping the protocol would break every existing
         // first-party client that never issues this request.
         assert_eq!(PROTOCOL_VERSION, 7);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 40);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 41);
         assert_eq!(DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION, 36);
         assert_eq!(
             current_feature_list(),

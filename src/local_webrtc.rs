@@ -16,9 +16,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use botster_core::{AesGcmEnvelope, AesGcmKey, decrypt_aes_gcm, encrypt_aes_gcm};
 use botster_hub_client::{
-    DaemonCompatibility, DaemonDiagnostic, DaemonEntityFrame, DaemonHello, DaemonHelloAck,
-    DaemonLocalWebrtcAnswer, DaemonLocalWebrtcBootstrap, DaemonLocalWebrtcDeliveryChunk,
-    DaemonLocalWebrtcDeliveryKind, DaemonRequest, DaemonResponse,
+    DaemonCompatibility, DaemonDiagnostic, DaemonEntityFrame, DaemonEvent, DaemonHello,
+    DaemonHelloAck, DaemonLocalWebrtcAnswer, DaemonLocalWebrtcBootstrap,
+    DaemonLocalWebrtcDeliveryChunk, DaemonLocalWebrtcDeliveryKind, DaemonRequest, DaemonResponse,
     LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION, LOCAL_WEBRTC_MAX_DELIVERY_BYTES,
     LOCAL_WEBRTC_MAX_FRAME_BYTES, PROTOCOL,
 };
@@ -38,7 +38,8 @@ use botster_terminal_protocol::{
 
 use crate::daemon_transport::{
     ControlMessage, ControlSender, ENTITY_SUBSCRIPTION_QUEUE_CAPACITY, EntityFrameSender,
-    WebrtcTerminalAdmission, response_records_attach_ownership,
+    WebrtcTerminalAdmission, hello_requires_terminal_subscription_closed,
+    response_records_attach_ownership,
 };
 use crate::webrtc_terminal_adapter::WebRtcConnectionMux;
 
@@ -1210,6 +1211,20 @@ where
     let mut peer_terminal_rx = peer_state.subscribe_peer_terminal();
     let mut open = true;
     while open {
+        if let Err(failure) = flush_webrtc_host_events(
+            data_channel,
+            stream_key,
+            peer_state,
+            &mut pending_requests,
+            &mut flow_control,
+        )
+        .await
+        {
+            eprintln!("{failure}");
+            terminal_cause = failure.cause;
+            send_failure = Some(failure);
+            break;
+        }
         if let Err(failure) = flush_webrtc_adapter_frames(
             data_channel,
             stream_key,
@@ -1253,6 +1268,20 @@ where
                     break;
                 }
                 LocalWebrtcInbound::AdapterReady => {
+                    if let Err(failure) = flush_webrtc_host_events(
+                        data_channel,
+                        stream_key,
+                        peer_state,
+                        &mut pending_requests,
+                        &mut flow_control,
+                    )
+                    .await
+                    {
+                        eprintln!("{failure}");
+                        terminal_cause = failure.cause;
+                        send_failure = Some(failure);
+                        break;
+                    }
                     if let Err(failure) = flush_webrtc_adapter_frames(
                         data_channel,
                         stream_key,
@@ -1332,7 +1361,14 @@ where
                 } else {
                     WebrtcTerminalAdmission::Admitted {
                         required_features: hello.compatibility.required_features.clone(),
-                        mux: peer_state.mux.clone(),
+                        mux: {
+                            if hello_requires_terminal_subscription_closed(
+                                &hello.compatibility.required_features,
+                            ) {
+                                peer_state.mux.admit_close_events();
+                            }
+                            peer_state.mux.clone()
+                        },
                         terminal_requirement: hello.terminal_compatibility.clone(),
                     }
                 };
@@ -1906,6 +1942,59 @@ fn framed_daemon_hello_ack(
         &message_id,
         &encrypted,
     )
+}
+
+fn framed_daemon_event(key: &AesGcmKey, event: &DaemonEvent) -> LocalWebrtcResult<Vec<String>> {
+    let plaintext =
+        serde_json::to_vec(event).map_err(|error| LocalWebrtcError::Webrtc(error.to_string()))?;
+    let envelope = encrypt_aes_gcm(key, &plaintext, 1)
+        .map_err(|error| LocalWebrtcError::Webrtc(error.to_string()))?;
+    let encrypted = serde_json::to_string(&envelope)
+        .map_err(|error| LocalWebrtcError::Webrtc(error.to_string()))?;
+    if encrypted.len() > LOCAL_WEBRTC_MAX_DELIVERY_BYTES {
+        return Err(LocalWebrtcError::Webrtc(format!(
+            "encrypted daemon event exceeded {LOCAL_WEBRTC_MAX_DELIVERY_BYTES} byte limit"
+        )));
+    }
+    let message_id = random_token("event")?;
+    frame_encrypted_daemon_delivery(
+        DaemonLocalWebrtcDeliveryKind::DaemonEvent,
+        &message_id,
+        &encrypted,
+    )
+}
+
+async fn flush_webrtc_host_events<D>(
+    data_channel: &D,
+    stream_key: &AesGcmKey,
+    peer_state: &LocalWebrtcPeerState,
+    pending_requests: &mut VecDeque<PendingLocalWebrtcRequest>,
+    flow_control: &mut LocalWebrtcFlowControl,
+) -> Result<(), LocalWebrtcSendFailure>
+where
+    D: LocalWebrtcDataChannel + ?Sized,
+{
+    if !peer_state.mux.close_events_admitted() {
+        peer_state.mux.drop_pending_events();
+        return Ok(());
+    }
+    while let Some(event) = peer_state.mux.pop_pending_event() {
+        peer_state.begin_operation("host_event_delivery");
+        let frames = match framed_daemon_event(stream_key, &event) {
+            Ok(frames) => frames,
+            Err(_) => continue,
+        };
+        send_response_frames(
+            data_channel,
+            stream_key,
+            &frames,
+            pending_requests,
+            flow_control,
+            peer_state,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 fn framed_daemon_terminal_frame(key: &AesGcmKey, bytes: &[u8]) -> LocalWebrtcResult<Vec<String>> {
@@ -4087,6 +4176,9 @@ mod tests {
                     }
                     DaemonLocalWebrtcDeliveryKind::DaemonTerminalFrame => {
                         panic!("unbound peer helper must not receive daemon_terminal_frame");
+                    }
+                    DaemonLocalWebrtcDeliveryKind::DaemonEvent => {
+                        panic!("unnegotiated peer helper must not receive daemon_event");
                     }
                 }
             }

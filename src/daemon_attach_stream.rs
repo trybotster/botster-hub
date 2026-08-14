@@ -12,7 +12,8 @@ use botster_core::{
 use botster_core_daemon::CoreDaemonError;
 use botster_hub_client::{
     ATTACH_STATE_ATTACHING, DaemonEvent, FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY,
-    FEATURE_UNIX_TERMINAL_ADAPTER, FEATURE_WEBRTC_TERMINAL_ADAPTER,
+    FEATURE_TERMINAL_SUBSCRIPTION_CLOSED, FEATURE_UNIX_TERMINAL_ADAPTER,
+    FEATURE_WEBRTC_TERMINAL_ADAPTER,
 };
 use botster_terminal_protocol::TerminalCompatibility;
 
@@ -43,7 +44,7 @@ impl BoundAdapterHandle {
     pub(crate) fn close_from_host(&self) {
         match self {
             Self::Unix(handle) => handle.close_from_host(),
-            Self::WebRtc(handle) => handle.close(),
+            Self::WebRtc(handle) => handle.close_from_host(),
         }
     }
 }
@@ -453,6 +454,12 @@ pub(crate) fn hello_requires_webrtc_adapter(required_features: &[String]) -> boo
         .any(|feature| feature == FEATURE_WEBRTC_TERMINAL_ADAPTER)
 }
 
+pub(crate) fn hello_requires_terminal_subscription_closed(required_features: &[String]) -> bool {
+    required_features
+        .iter()
+        .any(|feature| feature == FEATURE_TERMINAL_SUBSCRIPTION_CLOSED)
+}
+
 pub(crate) fn live_generation_for_route(
     inventory: &[TerminalSubscriptionRecord],
     client_id: &str,
@@ -672,6 +679,7 @@ pub(crate) fn bind_webrtc_adapter_after_attaching(
         mux.register(
             request.session_id.to_string(),
             request.subscription_id.to_string(),
+            generation.0,
             handle.clone(),
         );
     }
