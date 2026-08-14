@@ -3,16 +3,17 @@
 ## Plan Review revision
 
 Plan Review `review_1786733111_104540` returned `changes_required`.
-This fourth Plan visit answers the two new product findings and keeps
-the earlier answers.
+This fifth Plan visit consumes the merged Core parent
+`ticket_1786733177_803101` at `aef6516d5809d563961ed7fdd07da29a7b4edddc`.
+All registered dependencies are closed.
 
 | Finding | Response |
 | --- | --- |
-| Core baseline pages still perform unbounded full-set work | `159d926` `lifecycle_baseline_page` still `load_all()`s on mint and clones remaining rows before applying page limits. It has no elapsed budget. New Core ticket `ticket_1786733177_803101` on `tgt_1f7bce66eb304881980f9b4a2a5ae3fe`. Hub Implement waits on that merge SHA. |
-| Plan omits exact Core pins in three Cargo manifests | Pin one exact Core `.git` URL and revision in `Cargo.toml`, `crates/botster-hub-client/Cargo.toml`, `crates/botster-hub-test-support/Cargo.toml`, and `Cargo.lock`. No `branch = "main"`. No `>=`. Add a drift check that every Git-visible Hub member uses that one URL and revision ([[Git-consumed Hub members pin Core protocol by exact revision]]). |
-| Core observe and baseline defeat slice bounds | Observe is solved by `observe_lifecycle_slice` on `159d926`. Baseline is not. Do not treat `159d926` as the consumable pin. |
-| Core refresh does not compile | Merge Hub `main` first. Then pin the new Core ticket's exact merge SHA, not `>= 159d926`. |
-| Baseline gates cannot reach tests | WebRTC owner ticket `ticket_1786690597_154692` is closed (`d92aace`). Merge Hub `main` before `./test.sh --locked`. |
+| Core baseline pages still perform unbounded full-set work | Closed. Core `aef6516` `lifecycle_baseline_page(snapshot, after, LifecycleBaselineBudget)` walks the registry directory under `max_rows`, `max_bytes`, and `max_elapsed`. It does not `load_all()` or clone the remaining freeze. Setup-only yields keep freeze identity and `complete = false`. |
+| Plan omits exact Core pins in three Cargo manifests | Pin `https://github.com/trybotster/botster-core.git` rev `aef6516d5809d563961ed7fdd07da29a7b4edddc` in `Cargo.toml`, `crates/botster-hub-client/Cargo.toml`, `crates/botster-hub-test-support/Cargo.toml`, and `Cargo.lock`. No `branch = "main"`. No `>=`. Add a drift check that every Git-visible Hub member uses that one URL and revision. |
+| Core observe and baseline defeat slice bounds | Owner loop calls `observe_lifecycle_slice` and `lifecycle_baseline_page` with budgets only. Never `observe_lifecycle` or `lifecycle_baseline`. |
+| Core refresh does not compile | Merge Hub `main` first. Then apply the exact `aef6516` pin and the worker-knob / `BindTerminalAdapter` mapping already in this plan. |
+| Baseline gates cannot reach tests | WebRTC owner ticket is closed (`d92aace`). Merge Hub `main` before `./test.sh --locked`. |
 | Snapshot order can depend on default executor width | One in-flight session-family frame per plugin and snapshot sequence. Advance only after the matching successful completion. Test with background concurrency above one and skewed handler durations. |
 
 Duplicate vault checklist `checklist_1786689631_664448` remains unused.
@@ -30,16 +31,16 @@ This visit keeps `checklist_1786689614_825667` and does not create another.
 - Project: Botster Non-Blocking Event Plane, Stage A Hub slice.
 - Assigned worktree is the pipeline-created Hub worktree for this ticket.
 - First Plan HEAD: `173e528`. Prior plan commits: `ddb0c60`, `d4dfb8e`,
-  `a37a430`.
+  `a37a430`, `293c19d`.
 - This worktree still sits behind current Hub `main`. Implement must
   merge Hub `main` (includes `d92aace` WebRTC owner fix) before owner-loop
   work.
-- Required Core pin: the exact merge SHA of
-  `ticket_1786733177_803101`, once that ticket is closed. Not
-  `159d926`. Not `branch = "main"`. Not a `>=` range. Current Hub
-  `main` still pins Core `f4f6bf5babe92dfb9241a760c414187f711c2c42`.
-  This worktree still uses `branch = "main"` in `Cargo.toml`; that
-  form is forbidden for Git-visible members.
+- Required Core pin, exact, all Git-visible members:
+  `https://github.com/trybotster/botster-core.git`
+  rev `aef6516d5809d563961ed7fdd07da29a7b4edddc`.
+  Not `159d926`. Not `f4f6bf5`. Not `branch = "main"`. Not a `>=`
+  range. This worktree still uses `branch = "main"` in `Cargo.toml`;
+  that form is forbidden.
 
 ## Repository playbook loaded
 
@@ -116,12 +117,11 @@ Intentionally not loaded:
 
 ## Context loaded
 
-### Merged Core parent (`159d926`) — observe only
+### Merged Core parents (`159d926` observe + `aef6516` baseline)
 
-Inspected `botster-core-daemon` on Core `origin/main` at `159d926`.
+Inspected `botster-core-daemon` on Core `origin/main` at `aef6516`.
 Living contract: Core `docs/architecture/control-plane-lifecycle-journal.md`.
-`observe_lifecycle_slice` is consumable. `lifecycle_baseline_page` on
-this revision is **not** consumable as a bounded owner-loop slice.
+Both production slice APIs are now consumable.
 
 Production APIs Hub must call:
 
@@ -152,28 +152,32 @@ CoreDaemon::observe_lifecycle_slice(
   `CoreDaemonError`.
 - Sessions that appear after mint wait for a new pass.
 
-`159d926` `lifecycle_baseline_page` is insufficient. On that revision:
+```
+CoreDaemon::lifecycle_baseline_page(
+    snapshot: Option<&SessionLifecycleCursor>,
+    after: Option<&SessionId>,
+    budget: LifecycleBaselineBudget {
+        max_rows,
+        max_bytes,
+        max_elapsed,
+    },
+) -> Result<SessionLifecycleBaselinePage, SessionLifecyclePageError>
+```
 
-- There is no elapsed-time argument.
-- `snapshot = None` calls `mint_baseline_freeze()`, which `load_all()`s
-  every registry row, maps `lifecycle_record`, sorts the full set, and
-  retains it before any page returns.
-- Each later page clones every remaining frozen row, then applies
-  `max_rows` / `max_bytes`.
+- `snapshot = None` mints at the current journal watermark and walks
+  the registry directory under the call budget. It does not
+  `load_all()` or sort the remaining name set.
+- Later pages continue the same directory iterator, then walk only the
+  next frozen suffix. They do not clone the remaining freeze.
+- Setup-only and index-in-progress yields keep freeze identity, return
+  no rows, set `next = None`, and have `complete = false`.
+- `complete` is true only on the last frozen row or an empty sealed
+  snapshot. An incomplete page is not finished ended evidence.
+- Dropped/foreign freeze returns `SnapshotUnavailable` or
+  `SourceChanged`. A complete page drops the freeze.
 
-Hub must wait for `ticket_1786733177_803101` to publish a baseline
-page that:
-
-- Takes an elapsed-time budget in addition to `max_rows` and
-  `max_bytes`.
-- Can return the first page before the whole registry is copied.
-- Walks only the next bounded suffix on later pages. No full remaining
-  clone.
-- Keeps one `snapshot_sequence`, `complete = false` on incomplete
-  pages, and the existing resync reasons.
-
-Implement must consume the merged names from that ticket. Do not
-invent a Hub-side walk over `list()` / `load_all()`.
+Do not invent a Hub-side walk over `list()` / `load_all()`. Do not
+call the `159d926` four-argument `lifecycle_baseline_page`.
 
 Forbidden on the Hub owner loop:
 
@@ -195,9 +199,8 @@ Core production host loop for this ticket:
 1. One `observe_lifecycle_slice` per owner turn until `complete` or a
    budget yield. Store the resume cursor.
 2. `take_journal_advanced_wake`.
-3. The post-`ticket_1786733177_803101` bounded baseline page until
-   `complete` when installing or resyncing. Not `159d926`
-   `lifecycle_baseline_page`. Not `lifecycle_baseline()`.
+3. `lifecycle_baseline_page(snapshot, after, LifecycleBaselineBudget)`
+   until `complete` when installing or resyncing.
 4. `lifecycle_changes_page` after the snapshot watermark.
 5. Take again; re-page if woke.
 
@@ -215,8 +218,8 @@ Hub `main` already contains:
 - Core lock `f4f6bf5`, which is **before** sliced observe/baseline.
 
 This Plan worktree is still on the plan-only branch. Implement must
-merge Hub `main`, then pin every Git-visible Core dependency to the
-exact merge SHA of `ticket_1786733177_803101`.
+merge Hub `main`, then pin every Git-visible Core dependency to
+`aef6516d5809d563961ed7fdd07da29a7b4edddc`.
 
 ### This worktree (pre-merge) still has the original defects
 
@@ -232,9 +235,10 @@ exact merge SHA of `ticket_1786733177_803101`.
 
 1. Merge current Hub `main` into this worktree so the WebRTC owner
    fix and `AttachStreamRegistry` derive land first.
-2. After `ticket_1786733177_803101` closes, pin **one exact** Core
-   revision (that merge SHA) in all four places, using the `.git` URL
-   form from current Hub `main`:
+2. Pin **one exact** Core revision in all four places, using the
+   `.git` URL form:
+   `https://github.com/trybotster/botster-core.git`
+   rev `aef6516d5809d563961ed7fdd07da29a7b4edddc`.
    - `Cargo.toml` (`botster-core`, `botster-core-daemon`,
      `botster-terminal-protocol`, and the matching dev-dependencies)
    - `crates/botster-hub-client/Cargo.toml`
@@ -245,12 +249,12 @@ exact merge SHA of `ticket_1786733177_803101`.
 3. Replace this worktree's `branch = "main"` selectors. Do not leave
    any Git-visible Core dependency on a branch or a `>=` range.
 4. Add a Hub source test that every Git-visible member manifest uses
-   the same Core git URL and the same `rev`.
+   that same Core git URL and that same `rev`.
 5. Record Hub SHA and locked Core SHA separately.
 6. Fix any additional compile breaks the pin introduces. Do not invent
    Hub wrappers that call unbounded `observe_lifecycle` or
-   `lifecycle_baseline`. Do not call `159d926`
-   `lifecycle_baseline_page` as a bounded slice.
+   `lifecycle_baseline`. Do not call the pre-`aef6516` four-argument
+   `lifecycle_baseline_page`.
 7. Promote these six host-profile knobs from silent Core defaults to
    `CoreEngineOptions` fields with Core defaults and positive-value
    validation:
@@ -284,10 +288,11 @@ exact merge SHA of `ticket_1786733177_803101`.
      `ObserveLifecycleBudget`
    - journal pull — take + one `lifecycle_changes_page`
    - projection apply
-   - paged baseline recovery — the post-`ticket_1786733177_803101`
-     bounded baseline page until `complete` on resync only. Must
-     honor item, byte, **and elapsed** budgets. Must not
-     `load_all()` or clone the remaining freeze on the owner turn.
+   - paged baseline recovery —
+     `lifecycle_baseline_page(..., LifecycleBaselineBudget)` until
+     `complete` on resync only. Must honor `max_rows`, `max_bytes`,
+     and `max_elapsed`. Must not `load_all()` or clone the remaining
+     freeze on the owner turn.
    - host-bridge fulfillment
    - subscriber delivery
    - completion drain
@@ -336,7 +341,7 @@ exact merge SHA of `ticket_1786733177_803101`.
 - Reimplementing sliced observe or paged baseline inside Hub.
 - Calling unbounded `observe_lifecycle` / `lifecycle_baseline` from
   the owner loop.
-- Calling `159d926` `lifecycle_baseline_page` as if it were bounded.
+- Calling the pre-`aef6516` four-argument `lifecycle_baseline_page`.
 - Package events, `events.emit`, client `SubscribeEvents`.
 - Web or TUI UI work.
 - Workspaces membership or package cleanup rules.
@@ -361,9 +366,9 @@ Registered dependencies (all closed):
 | --- | --- | --- | --- |
 | `ticket_1786663581_962361` | `tgt_1f7bce66eb304881980f9b4a2a5ae3fe` | botster-core | closed (journal wake/page) |
 | `ticket_1786663581_723222` | `tgt_1f7bce66eb304881980f9b4a2a5ae3fe` | botster-core | closed (`try_admit`) |
-| `ticket_1786690597_161141` | `tgt_1f7bce66eb304881980f9b4a2a5ae3fe` | botster-core | closed at `159d926` (observe only) |
+| `ticket_1786690597_161141` | `tgt_1f7bce66eb304881980f9b4a2a5ae3fe` | botster-core | closed at `159d926` (`observe_lifecycle_slice`) |
 | `ticket_1786690597_154692` | `tgt_7e208a0c76a44980a83b63af976b1f22` | botster-hub | closed at `d92aace` |
-| `ticket_1786733177_803101` | `tgt_1f7bce66eb304881980f9b4a2a5ae3fe` | botster-core | open. Run `run_1786733190_220788`. Elapsed + no full-set clone on baseline pages. |
+| `ticket_1786733177_803101` | `tgt_1f7bce66eb304881980f9b4a2a5ae3fe` | botster-core | closed at `aef6516` (`LifecycleBaselineBudget`) |
 
 No new Web, TUI, Workspaces, or Project Pipelines dependency while
 client session frames stay `entity_snapshot`.
@@ -373,9 +378,9 @@ client session frames stay `entity_snapshot`.
 Assumptions:
 
 - Target routing from `list_spawn_targets` is authoritative.
-- The consumable Core pin is the merge SHA of
-  `ticket_1786733177_803101`, not `159d926`. Implement uses the
-  merged baseline-page names from that ticket.
+- The consumable Core pin is
+  `aef6516d5809d563961ed7fdd07da29a7b4edddc`. Implement uses
+  `lifecycle_baseline_page(snapshot, after, LifecycleBaselineBudget)`.
 - RequestResponse `invoke` on MCP/UI/package-provider subscribe is
   the operation.
 - Client `entity_snapshot` remains the host-control session contract.
@@ -417,9 +422,9 @@ journal-pull slice
 projection-apply slice
   -> upsert/remove into the one Hub projection
 paged-baseline slice
-  -> post-ticket_1786733177_803101 bounded baseline page
+  -> lifecycle_baseline_page(snapshot, after, LifecycleBaselineBudget)
   -> elapsed starts at API entry
-  -> first page may yield before the freeze is fully copied
+  -> setup-only / index-in-progress yields keep freeze identity
   -> later pages walk only the next bounded suffix
   -> stop when complete; incomplete is not ended evidence
 host-bridge slice
@@ -474,8 +479,8 @@ Likely untouched:
 
 - Calling unbounded `observe_lifecycle` from the owner loop fails the
   ticket's own load proof.
-- Calling `159d926` `lifecycle_baseline_page` reintroduces
-  `load_all()` and a remaining-row clone into an owner turn.
+- Calling `lifecycle_baseline()` or the pre-`aef6516` four-argument
+  page reintroduces `load_all()` into an owner turn.
 - Pinning Core only in `Cargo.lock` while manifests stay on
   `f4f6bf5` or `branch = "main"` lets Git consumers float protocol
   identity.
@@ -490,8 +495,8 @@ Likely untouched:
 
 ## Acceptance checks/tests
 
-Charter gates after merge of Hub `main` and an exact pin to the
-`ticket_1786733177_803101` merge SHA:
+Charter gates after merge of Hub `main` and an exact pin to
+`aef6516d5809d563961ed7fdd07da29a7b4edddc`:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`
@@ -517,8 +522,8 @@ Product proofs through the production owner loop:
    stay within item, byte, and elapsed budgets. Incomplete pages have
    `complete = false` and do not prove ended. `SnapshotUnavailable`
    remints. Assembled complete pages match the freeze watermark.
-   Red on revert: mint still `load_all()`s or clones remaining rows
-   on the owner turn.
+   Red on revert: mint still `load_all()`s, or the owner loop calls
+   the four-argument pre-`aef6516` page.
 5. Synthetic plugin with `plugin_worker_executor_concurrency > 1` and
    reserved RequestResponse `= 1`. Earlier frames have longer
    handlers. Order remains begin → chunks → end → deltas.
@@ -551,9 +556,9 @@ Downstream proof:
 Live Hub pin:
 
 - Record Hub source SHA and lockfile-pinned Core SHA separately.
-- Core SHA must be the exact merge of `ticket_1786733177_803101`.
-- Every Git-visible Hub member manifest must declare that same
-  `.git` URL and `rev`.
+- Core SHA must be `aef6516d5809d563961ed7fdd07da29a7b4edddc`.
+- Every Git-visible Hub member manifest must declare
+  `https://github.com/trybotster/botster-core.git` and that `rev`.
 
 ## Runtime-teardown class
 
