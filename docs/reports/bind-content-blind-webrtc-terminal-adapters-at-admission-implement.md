@@ -243,3 +243,31 @@ Proof:
 - `recoverable_disconnect_after_response_preserves_followup_shutdown`
 - `./test.sh --locked --test hub_daemon_lifecycle_test webrtc_terminal -- --test-threads=1` (8 passed)
 - `cargo clippy --locked -p botster-hub --all-targets -- -D warnings`
+
+## Review-fix pass 3
+
+`review_1786719693_984507` required two more fixes.
+
+### `finding_1786719693_945840` Nondeterministic send vs close
+
+`send_text_or_peer_terminal` now uses `tokio::select! { biased; send first; ... }`. A ready `local_send_text` completes before a queued `OnClose` is taken. The deadline stays one `LOCAL_WEBRTC_PEER_CLOSE_BOUND` for the whole send.
+
+Negative control: `ready_send_completes_before_queued_on_close` requires the frame in `sent` and `next_chunk_index == 1`. Removing `biased` with send first makes that test fail.
+
+`outer_loop_routes_idle_pressure_before_next_request_delivery` now passes on this branch.
+
+### `finding_1786719693_799033` Missing Hub main `3bee3a5`
+
+Rebased onto `3bee3a57cc7a031b93c6c63d8e9f267d6a9e0c79`. `git merge-base --is-ancestor 3bee3a5 HEAD` succeeds. Cargo pins stay on Core rev `f4f6bf5babe92dfb9241a760c414187f711c2c42` for `botster-core`, `botster-core-daemon`, `botster-terminal-protocol`, test support, and Ghostty. Split Hello `terminal_compatibility` and Unix `TerminalSubscriptionClosed` remain.
+
+### Proof on this HEAD
+
+```sh
+cargo build --locked -p botster-core-daemon --bin botster-session-worker
+./test.sh --locked --test hub_daemon_lifecycle_test webrtc_terminal -- --test-threads=1
+BOTSTER_ENV=test cargo test --locked --lib ready_send_completes_before_queued_on_close -- --test-threads=1
+BOTSTER_ENV=test cargo test --locked --lib outer_loop_routes_idle_pressure -- --test-threads=1
+BOTSTER_ENV=test cargo clippy --locked -p botster-hub --all-targets -- -D warnings
+```
+
+All passed. Full workspace `./test.sh --locked` was not rerun after this rebase.
