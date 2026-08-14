@@ -119,9 +119,8 @@ advertised optional `unix_terminal_adapter`,
 byte-faithful live `terminal_output` payloads, incremental GHOSTSNP
 READY/PAGE/FINISH goldens, `mode_gated_input` ModeGatedInput +
 ModeFlags freshness, Snapshot-only GHOSTSNP rules, and the
-`DaemonSessionTypeExecution` contract. Version 0.1.32 is the prior published
-coordinate at the same protocol and revision. It does not advertise
-`snapshot_delivery=ready_then_history`. The contract
+`DaemonSessionTypeExecution` contract. Version 0.1.33 is the prior published
+coordinate at protocol 7 / revision 38. The contract
 defines the explicit `relative_executable` and `shell_command` modes.
 It also carries spawn-point session-type listing
 (`list_session_types_for_target`) and the session-type authoring view
