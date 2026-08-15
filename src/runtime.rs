@@ -1994,7 +1994,7 @@ impl HubRuntime {
 
 /// Result of one bounded engine-lifecycle lookup.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SessionRuntimeLifecycleLookup {
+pub(crate) enum SessionRuntimeLifecycleLookup {
     /// The snapshot contained this session and Core reported a lifecycle.
     Found(SessionLifecycleState),
     /// The completed snapshot did not contain this session.
@@ -2005,47 +2005,59 @@ pub enum SessionRuntimeLifecycleLookup {
     Error,
 }
 
+/// Cursor for one ShutdownSession classify walk.
+///
+/// Retries continue this walk. They do not start a new 1 s scan.
+#[derive(Debug, Default)]
+pub(crate) struct SessionLifecycleWalk {
+    snapshot: Option<SessionLifecycleCursor>,
+    after: Option<SessionId>,
+    resyncs: usize,
+    stalls: usize,
+}
+
 impl HubRuntime {
     /// Return Core's in-memory engine lifecycle for one session.
     ///
     /// Registry state can lag when `read_screen` parks `ProcessExited`.
     /// Shutdown classify uses this control-plane record, not terminal Drain.
-    /// The walk uses paged baseline calls until the row is found or the
-    /// snapshot is complete. Incomplete scans and page errors are not
-    /// reported as absence.
-    pub fn session_runtime_lifecycle(
+    /// The walk uses paged baseline calls until the row is found, the
+    /// snapshot is complete, or `deadline` expires. Incomplete scans and
+    /// page errors are not reported as absence.
+    pub(crate) fn session_runtime_lifecycle(
         &self,
         session_id: &SessionId,
+        deadline: Instant,
+        walk: &mut SessionLifecycleWalk,
     ) -> SessionRuntimeLifecycleLookup {
-        const BUDGET: LifecycleBaselineBudget = LifecycleBaselineBudget {
-            max_rows: 32,
-            max_bytes: 64 * 1024,
-            max_elapsed: Duration::from_millis(250),
-        };
+        const PAGE_ELAPSED: Duration = Duration::from_millis(250);
         const MAX_RESYNCS: usize = 3;
         const MAX_STALLS: usize = 8;
-        const MAX_WALK: Duration = Duration::from_millis(1000);
-        let deadline = Instant::now() + MAX_WALK;
-        let mut snapshot = None;
-        let mut after = None;
-        let mut resyncs = 0;
-        let mut stalls = 0;
         loop {
-            if Instant::now() >= deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 return SessionRuntimeLifecycleLookup::Incomplete;
             }
-            let page = match self.lifecycle_baseline_page(snapshot.as_ref(), after.as_ref(), BUDGET)
-            {
+            let budget = LifecycleBaselineBudget {
+                max_rows: 32,
+                max_bytes: 64 * 1024,
+                max_elapsed: remaining.min(PAGE_ELAPSED),
+            };
+            let page = match self.lifecycle_baseline_page(
+                walk.snapshot.as_ref(),
+                walk.after.as_ref(),
+                budget,
+            ) {
                 Ok(page) => page,
                 Err(_) => return SessionRuntimeLifecycleLookup::Error,
             };
             if page.resync_required.is_some() {
-                resyncs += 1;
-                if resyncs > MAX_RESYNCS {
+                walk.resyncs += 1;
+                if walk.resyncs > MAX_RESYNCS {
                     return SessionRuntimeLifecycleLookup::Incomplete;
                 }
-                snapshot = None;
-                after = None;
+                walk.snapshot = None;
+                walk.after = None;
                 continue;
             }
             if let Some(lifecycle) = page.sessions.iter().find_map(|record| {
@@ -2059,13 +2071,13 @@ impl HubRuntime {
             if page.complete {
                 return SessionRuntimeLifecycleLookup::CompleteAbsent;
             }
-            snapshot = Some(page.snapshot_sequence);
+            walk.snapshot = Some(page.snapshot_sequence);
             if page.next.is_some() {
-                after = page.next;
-                stalls = 0;
+                walk.after = page.next;
+                walk.stalls = 0;
             } else {
-                stalls += 1;
-                if stalls > MAX_STALLS {
+                walk.stalls += 1;
+                if walk.stalls > MAX_STALLS {
                     return SessionRuntimeLifecycleLookup::Incomplete;
                 }
             }

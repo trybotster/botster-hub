@@ -3249,25 +3249,20 @@ fn handle_runtime_control_request(
             events_response(response.body)
         }
         DaemonRequest::ShutdownSession { session_id } => {
+            let deadline = Instant::now() + SHUTDOWN_CLASSIFY_BUDGET;
+            let mut walk = crate::runtime::SessionLifecycleWalk::default();
             let now = tick(logical_clock);
             observe_lifecycle_turn(runtime, now);
-            match classify_shutdown_session(runtime, &session_id)? {
-                ShutdownSessionClassification::Active => {}
-                ShutdownSessionClassification::Incomplete => {
-                    for _ in 0..8 {
-                        observe_lifecycle_turn(runtime, tick(logical_clock));
-                        match classify_shutdown_session(runtime, &session_id)? {
-                            ShutdownSessionClassification::Active
-                            | ShutdownSessionClassification::Incomplete => {}
-                            ShutdownSessionClassification::Cleanup(cleanup) => {
-                                return Ok(daemon_session_cleanup(cleanup));
-                            }
-                            ShutdownSessionClassification::Missing => {
-                                return Ok(daemon_unknown_session_cleanup(&session_id));
-                            }
-                        }
-                    }
+            let mut observed = true;
+            match finish_shutdown_classify(deadline, || {
+                if !observed {
+                    observe_lifecycle_turn(runtime, tick(logical_clock));
                 }
+                observed = false;
+                classify_shutdown_session(runtime, &session_id, deadline, &mut walk)
+            })? {
+                ShutdownSessionClassification::Active
+                | ShutdownSessionClassification::Incomplete => {}
                 ShutdownSessionClassification::Cleanup(cleanup) => {
                     return Ok(daemon_session_cleanup(cleanup));
                 }
@@ -3287,28 +3282,15 @@ fn handle_runtime_control_request(
             ) {
                 Ok(response) => response,
                 Err(error) => {
-                    for _ in 0..8 {
-                        let now = tick(logical_clock);
-                        observe_lifecycle_turn(runtime, now);
-                        match classify_shutdown_session(runtime, &session_id)? {
-                            ShutdownSessionClassification::Active
-                            | ShutdownSessionClassification::Incomplete
-                                if !shutdown_error_is_already_gone(&error) => {}
-                            classification => {
-                                let response =
-                                    shutdown_error_response(classification, error, &session_id)?;
-                                suppress_unix_session_close_events(pending_runtime, &session_id);
-                                suppress_webrtc_session_close_events(pending_runtime, &session_id);
-                                return Ok(response);
-                            }
+                    observed = false;
+                    let classification = finish_shutdown_classify(deadline, || {
+                        if !observed {
+                            observe_lifecycle_turn(runtime, tick(logical_clock));
                         }
-                    }
-                    observe_lifecycle_turn(runtime, tick(logical_clock));
-                    let response = shutdown_error_response(
-                        classify_shutdown_session(runtime, &session_id)?,
-                        error,
-                        &session_id,
-                    )?;
+                        observed = false;
+                        classify_shutdown_session(runtime, &session_id, deadline, &mut walk)
+                    })?;
+                    let response = shutdown_error_response(classification, error, &session_id)?;
                     suppress_unix_session_close_events(pending_runtime, &session_id);
                     suppress_webrtc_session_close_events(pending_runtime, &session_id);
                     return Ok(response);
@@ -4341,11 +4323,32 @@ fn events_response(body: HubClientResponseBody) -> DaemonTransportResult<DaemonR
     Ok(daemon_events(events_from_client(events)))
 }
 
+#[derive(Debug)]
 enum ShutdownSessionClassification {
     Active,
     Cleanup(DaemonSessionCleanup),
     Missing,
     Incomplete,
+}
+
+const SHUTDOWN_CLASSIFY_BUDGET: Duration = Duration::from_millis(1000);
+
+fn finish_shutdown_classify<F>(
+    deadline: Instant,
+    mut classify: F,
+) -> Result<ShutdownSessionClassification, crate::HubRuntimeError>
+where
+    F: FnMut() -> Result<ShutdownSessionClassification, crate::HubRuntimeError>,
+{
+    loop {
+        let classification = classify()?;
+        if matches!(classification, ShutdownSessionClassification::Incomplete)
+            && Instant::now() < deadline
+        {
+            continue;
+        }
+        return Ok(classification);
+    }
 }
 
 fn daemon_hello_ack(diagnostics: Vec<DaemonDiagnostic>) -> DaemonHelloAck {
@@ -4527,6 +4530,8 @@ fn shutdown_error_response(
 fn classify_shutdown_session(
     runtime: &mut crate::HubRuntime,
     session_id: &str,
+    deadline: Instant,
+    walk: &mut crate::runtime::SessionLifecycleWalk,
 ) -> Result<ShutdownSessionClassification, crate::HubRuntimeError> {
     let Some(session) = runtime
         .list_sessions()
@@ -4559,30 +4564,34 @@ fn classify_shutdown_session(
 
     Ok(shutdown_classification_from_engine_lookup(
         session_id,
-        runtime.session_runtime_lifecycle(&SessionId(session_id.to_string())),
+        runtime.session_runtime_lifecycle(&SessionId(session_id.to_string()), deadline, walk),
     ))
 }
 
 fn shutdown_classification_from_engine_lookup(
     session_id: &str,
-    lookup: crate::SessionRuntimeLifecycleLookup,
+    lookup: crate::runtime::SessionRuntimeLifecycleLookup,
 ) -> ShutdownSessionClassification {
     match lookup {
-        crate::SessionRuntimeLifecycleLookup::Found(SessionLifecycleState::Stopping)
-        | crate::SessionRuntimeLifecycleLookup::Found(SessionLifecycleState::Exited { .. })
-        | crate::SessionRuntimeLifecycleLookup::Found(SessionLifecycleState::Failed { .. }) => {
-            ShutdownSessionClassification::Cleanup(DaemonSessionCleanup {
-                session_id: session_id.to_string(),
-                outcome: "already_exited".to_string(),
-            })
-        }
-        crate::SessionRuntimeLifecycleLookup::Found(SessionLifecycleState::Starting)
-        | crate::SessionRuntimeLifecycleLookup::Found(SessionLifecycleState::Running)
-        | crate::SessionRuntimeLifecycleLookup::CompleteAbsent => {
+        crate::runtime::SessionRuntimeLifecycleLookup::Found(SessionLifecycleState::Stopping)
+        | crate::runtime::SessionRuntimeLifecycleLookup::Found(SessionLifecycleState::Exited {
+            ..
+        })
+        | crate::runtime::SessionRuntimeLifecycleLookup::Found(SessionLifecycleState::Failed {
+            ..
+        }) => ShutdownSessionClassification::Cleanup(DaemonSessionCleanup {
+            session_id: session_id.to_string(),
+            outcome: "already_exited".to_string(),
+        }),
+        crate::runtime::SessionRuntimeLifecycleLookup::Found(SessionLifecycleState::Starting)
+        | crate::runtime::SessionRuntimeLifecycleLookup::Found(SessionLifecycleState::Running)
+        | crate::runtime::SessionRuntimeLifecycleLookup::CompleteAbsent => {
             ShutdownSessionClassification::Active
         }
-        crate::SessionRuntimeLifecycleLookup::Incomplete
-        | crate::SessionRuntimeLifecycleLookup::Error => ShutdownSessionClassification::Incomplete,
+        crate::runtime::SessionRuntimeLifecycleLookup::Incomplete
+        | crate::runtime::SessionRuntimeLifecycleLookup::Error => {
+            ShutdownSessionClassification::Incomplete
+        }
     }
 }
 
@@ -7635,33 +7644,59 @@ mod tests {
         assert!(matches!(
             shutdown_classification_from_engine_lookup(
                 "late-session",
-                crate::SessionRuntimeLifecycleLookup::Incomplete,
+                crate::runtime::SessionRuntimeLifecycleLookup::Incomplete,
             ),
             ShutdownSessionClassification::Incomplete
         ));
         assert!(matches!(
             shutdown_classification_from_engine_lookup(
                 "error-session",
-                crate::SessionRuntimeLifecycleLookup::Error,
+                crate::runtime::SessionRuntimeLifecycleLookup::Error,
             ),
             ShutdownSessionClassification::Incomplete
         ));
         assert!(matches!(
             shutdown_classification_from_engine_lookup(
                 "missing-session",
-                crate::SessionRuntimeLifecycleLookup::CompleteAbsent,
+                crate::runtime::SessionRuntimeLifecycleLookup::CompleteAbsent,
             ),
             ShutdownSessionClassification::Active
         ));
         assert!(matches!(
             shutdown_classification_from_engine_lookup(
                 "exited-session",
-                crate::SessionRuntimeLifecycleLookup::Found(SessionLifecycleState::Exited {
-                    code: Some(0)
-                }),
+                crate::runtime::SessionRuntimeLifecycleLookup::Found(
+                    SessionLifecycleState::Exited { code: Some(0) }
+                ),
             ),
             ShutdownSessionClassification::Cleanup(_)
         ));
+    }
+
+    #[test]
+    fn incomplete_classify_retries_share_one_deadline() {
+        let deadline = Instant::now() + Duration::from_millis(80);
+        let mut calls = 0;
+        let started = Instant::now();
+        let result = finish_shutdown_classify(deadline, || {
+            calls += 1;
+            thread::sleep(Duration::from_millis(25));
+            Ok(ShutdownSessionClassification::Incomplete)
+        })
+        .expect("forced Incomplete classify");
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(result, ShutdownSessionClassification::Incomplete),
+            "forced Incomplete must stay Incomplete, got {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "shared deadline must bound retries, elapsed={elapsed:?} calls={calls}"
+        );
+        assert!(
+            (2..=6).contains(&calls),
+            "shared 80 ms deadline must retry a few 25 ms walks, calls={calls}"
+        );
     }
 
     #[test]
