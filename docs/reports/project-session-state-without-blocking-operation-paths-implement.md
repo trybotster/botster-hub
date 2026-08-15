@@ -11,6 +11,7 @@
 - Approved plan: `docs/plans/project-session-state-without-blocking-operation-paths.md` (`c4fad52`)
 - `teardown_class_applies`: no
 - Delivery: direct-merge, no pull request
+- Implement commit: `424902bf5443b0725a373161cd956508ca0001a2`
 
 ## Playbooks and notes applied
 
