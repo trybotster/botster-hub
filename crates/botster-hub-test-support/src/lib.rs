@@ -5095,11 +5095,18 @@ mod tests {
                 .contains(&botster_hub_client::FEATURE_SESSIONS.to_string())
         );
         assert!(
-            matrix
+            !matrix
                 .supported_features
-                .contains(&matrix.terminal_streaming.feature)
+                .contains(&matrix.terminal_streaming.feature),
+            "terminal mechanism tokens belong on Hello.terminal_compatibility, not host features"
         );
-        assert!(matrix.supported_features.contains(&matrix.resize.feature));
+        assert!(
+            !matrix.supported_features.contains(&matrix.resize.feature),
+            "terminal mechanism tokens belong on Hello.terminal_compatibility, not host features"
+        );
+        assert!(!matrix.supported_features.contains(
+            &botster_hub_client::FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY.to_string()
+        ));
         assert!(
             matrix
                 .supported_features

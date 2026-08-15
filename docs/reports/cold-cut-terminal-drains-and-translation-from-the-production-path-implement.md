@@ -125,17 +125,20 @@ Passed on this tree:
 - IsolatedHub Unix always-bind, empty Attach, host Drain empty, ReadScreen marker, replacement-owner
 - Lifecycle oracles rewritten off Attach/Drain translation: mux frames, `ReadScreen`, host OperatorError, session-entity patches
 - `hub_daemon_lifecycle_test`: 201 passed, 1 ignored (larger local many-PTY)
+- Full `./test.sh --locked` workspace: all binaries ok (lifecycle 201/1 ignored; lib 269; no FAILED results)
 - `cli_smoke_proves_local_runtime_daemon_package_app_session_and_webrtc` passed in the locked suite
 - Missing-session host Drain is a typed OperatorError (`drain_runtime` / `terminal_stream_unavailable`)
-- SendInput/ModeGatedInput schedule entity reconcile so process-exit patches can publish without a Drain pump
+- SendInput/ModeGatedInput/Resize/Spawn/Shutdown/Remove observe through `pump_bound_unix_routes` so host inventory advances without terminal Drain
+- Idle observe ticks the host logical clock on each slice
 - Replacement Attach detaches generation N before bind of N+1
+- Support-matrix descriptor test now requires `terminal_streaming`, `resize`, and `snapshot_delivery=ready_then_history` to stay off host `supported_features`
 
 ## Unverified behavior or residual risk
 
 - Live TUI at `fc1ff623` and live Web against this candidate Hub were not attached in this Implement turn. Verify must run that proof and record Hub SHA plus locked Core SHA separately.
 - `HubRuntime::drain_*` helpers still exist for tests. They are not on the owner loop.
-- Under heavy parallel load, a session-entity test may observe host `ListSessions` exit before the subscriber patch; the reconnect/RemoveSession path remains the durable proof.
-- Control-thread `try_recv` prefers queued host requests over idle reconcile. Burst `ReadScreen` can delay entity fanout until the queue drains.
+- Control-thread `try_recv` prefers queued host requests over idle reconcile. Burst `ReadScreen` can delay the 500 ms idle observe until the queue drains. Mutations now observe on the request path.
+- CoreDaemon on `aef6516` does not expose `pump_bound_adapters`. Owner-loop observe uses `observe_lifecycle_slice`, which calls Core `drain_runtime_once` internally.
 
 ## Missing vault guidance discovered
 
