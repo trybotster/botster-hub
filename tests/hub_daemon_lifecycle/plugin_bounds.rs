@@ -3,12 +3,9 @@ fn daemon_restart_preserves_split_plugin_worker_configuration() {
     let mut config = explicit_config(unique_test_dir("plugin-worker-config-restart"));
     config.core_engine.plugin_worker_queue_capacity = 9;
     config.core_engine.plugin_worker_executor_concurrency = 3;
-    config
-        .core_engine
-        .plugin_worker_class
-        .reserved_request_response_executors = 1;
-    config.core_engine.plugin_worker_class.background_queue_capacity = 6;
-    config.core_engine.plugin_worker_class.completion_queue_capacity = 5;
+    config.plugin_worker_class.reserved_request_response_executors = 1;
+    config.plugin_worker_class.background_queue_capacity = 6;
+    config.plugin_worker_class.completion_queue_capacity = 5;
 
     let mut daemon = HubDaemon::start(config.clone()).expect("start configured daemon");
     let initial = daemon

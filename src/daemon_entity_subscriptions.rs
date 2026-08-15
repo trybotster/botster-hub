@@ -1059,37 +1059,36 @@ fn continue_session_snapshot_assembly(
     if items.is_empty() && more {
         return close_oversized_session_snapshot(subscription_id, state, counters);
     }
-    let snapshot = DaemonEntityFrame::Snapshot {
-        subscription_id: subscription_id.to_string(),
-        entity_type: "session".to_string(),
-        snapshot_seq: state.next_seq,
-        items: items.clone(),
-        resync_reason: state.resync_reason.clone(),
-    };
+    store_snapshot_items(state, &items);
+    state.delivery_after = last_id;
+    let snapshot = complete_session_snapshot_frame(subscription_id, state);
     if entity_frame_exceeds_limit(&snapshot) {
         return close_oversized_session_snapshot(subscription_id, state, counters);
+    }
+    if more {
+        state.needs_delivery = true;
+        return SnapshotAssemble::Continue {
+            page: DeliveryPage {
+                items: items.len(),
+                bytes: 0,
+                more: true,
+            },
+        };
     }
     counters.entity_delivery_attempts = counters.entity_delivery_attempts.saturating_add(1);
     match state.sender.try_send_kind(snapshot) {
         Ok(()) => {
             counters.entity_delivery_successes =
                 counters.entity_delivery_successes.saturating_add(1);
-            store_snapshot_items(state, &items);
             state.resync_reason = None;
-            if more {
-                state.delivery_phase = DeliveryPhase::Rows;
-                state.delivery_after = last_id;
-                state.needs_delivery = true;
-            } else {
-                state.delivery_phase = DeliveryPhase::Removes;
-                state.delivery_after = None;
-                state.needs_delivery = false;
-            }
+            state.delivery_phase = DeliveryPhase::Removes;
+            state.delivery_after = None;
+            state.needs_delivery = false;
             SnapshotAssemble::Continue {
                 page: DeliveryPage {
                     items: items.len(),
                     bytes: 0,
-                    more,
+                    more: false,
                 },
             }
         }
@@ -1111,6 +1110,23 @@ fn continue_session_snapshot_assembly(
                 frame_too_large: false,
             }
         }
+    }
+}
+
+fn complete_session_snapshot_frame(
+    subscription_id: &str,
+    state: &EntitySubscriptionState,
+) -> DaemonEntityFrame {
+    DaemonEntityFrame::Snapshot {
+        subscription_id: subscription_id.to_string(),
+        entity_type: "session".to_string(),
+        snapshot_seq: state.next_seq,
+        items: state
+            .entities
+            .values()
+            .map(|entity| serde_json::to_value(entity).expect("serialize session entity"))
+            .collect(),
+        resync_reason: state.resync_reason.clone(),
     }
 }
 
@@ -2343,7 +2359,90 @@ mod tests {
             needs_delivery: true,
         };
         let mut counters = DaemonLifecycleCounters::default();
-        let started = Instant::now();
+        let mut pages = 0;
+        loop {
+            let started = Instant::now();
+            let SnapshotAssemble::Continue { page } = continue_session_snapshot_assembly(
+                "sub",
+                &mut state,
+                &projection,
+                &mut counters,
+                SESSION_DELIVERY_MAX_ITEMS,
+                SESSION_DELIVERY_MAX_BYTES,
+                SESSION_DELIVERY_MAX_ELAPSED,
+            ) else {
+                panic!("assembly must stay alive");
+            };
+            assert!(started.elapsed() < Duration::from_millis(crate::MAX_OWNER_TURN_MS));
+            pages += 1;
+            if !page.more {
+                break;
+            }
+            assert!(
+                matches!(state.delivery_phase, DeliveryPhase::Assembling { .. }),
+                "must keep assembling until the complete snapshot"
+            );
+            assert!(receiver.try_iter().next().is_none());
+            assert!(pages < 8);
+        }
+        assert!(pages > 1);
+        let frames: Vec<_> = receiver.try_iter().collect();
+        assert_eq!(frames.len(), 1);
+        match &frames[0] {
+            DaemonEntityFrame::Snapshot {
+                items,
+                resync_reason,
+                ..
+            } => {
+                assert_eq!(items.len(), 24);
+                assert_eq!(resync_reason, &None);
+            }
+            other => panic!("expected one complete snapshot, got {other:?}"),
+        }
+        assert_eq!(state.delivery_phase, DeliveryPhase::Removes);
+        assert!(!state.needs_delivery);
+    }
+
+    #[test]
+    fn catch_up_restarts_when_a_prefix_id_changes() {
+        let record = |id: &str, updated_at: u64| SessionLifecycleRecord {
+            session: botster_core_daemon::DaemonSession {
+                session_id: SessionId(id.to_string()),
+                registry_state: RegistrySessionState::Running,
+                size: botster_core::ResizePayload { rows: 24, cols: 80 },
+                process: None,
+                updated_at,
+            },
+            metadata: botster_core::CoreSessionMetadata::new(),
+            lifecycle: Some(SessionLifecycleState::Running),
+        };
+        let mut projection = crate::session_projection::SessionProjection::default();
+        projection.ingest_baseline_rows(
+            1,
+            (0..24).map(|index| record(&format!("session-{index:02}"), 1)),
+        );
+        projection.seal_baseline(SessionLifecycleCursor {
+            source_id: botster_core_daemon::SessionLifecycleSourceId("s".into()),
+            sequence: 1,
+        });
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let mut state = EntitySubscriptionState {
+            sender: EntityFrameSender::Blocking(sender),
+            entity_type: "session".to_string(),
+            cursor: projection.cursor.clone(),
+            entities: BTreeMap::new(),
+            definition_generation: 0,
+            definition_entities: BTreeMap::new(),
+            resync_reason: None,
+            owner_grant_id: None,
+            package_last_applied_seq: None,
+            package_catching_up: false,
+            delivery_after: None,
+            delivery_phase: DeliveryPhase::Assembling { source_seq: 1 },
+            next_seq: 1,
+            needs_delivery: true,
+        };
+        let mut counters = DaemonLifecycleCounters::default();
         let SnapshotAssemble::Continue { page } = continue_session_snapshot_assembly(
             "sub",
             &mut state,
@@ -2353,27 +2452,17 @@ mod tests {
             SESSION_DELIVERY_MAX_BYTES,
             SESSION_DELIVERY_MAX_ELAPSED,
         ) else {
-            panic!("first page must stay alive");
+            panic!("first page");
         };
-        assert!(started.elapsed() < Duration::from_millis(crate::MAX_OWNER_TURN_MS));
         assert!(page.more);
-        assert_eq!(state.delivery_phase, DeliveryPhase::Rows);
-        let first = receiver.try_iter().collect::<Vec<_>>();
-        assert_eq!(first.len(), 1);
-        match &first[0] {
-            DaemonEntityFrame::Snapshot {
-                items,
-                resync_reason,
-                ..
-            } => {
-                assert_eq!(items.len(), SESSION_DELIVERY_MAX_ITEMS);
-                assert_eq!(resync_reason, &None);
-            }
-            other => panic!("expected bounded first snapshot, got {other:?}"),
-        }
+        assert!(receiver.try_iter().next().is_none());
+        projection.ingest_baseline_rows(2, [record("session-00", 9)]);
+        projection.seal_baseline(SessionLifecycleCursor {
+            source_id: botster_core_daemon::SessionLifecycleSourceId("s".into()),
+            sequence: 2,
+        });
         loop {
-            let started = Instant::now();
-            let (alive, page) = deliver_projection_delta_page(
+            let SnapshotAssemble::Continue { page } = continue_session_snapshot_assembly(
                 "sub",
                 &mut state,
                 &projection,
@@ -2381,25 +2470,28 @@ mod tests {
                 SESSION_DELIVERY_MAX_ITEMS,
                 SESSION_DELIVERY_MAX_BYTES,
                 SESSION_DELIVERY_MAX_ELAPSED,
-            );
-            assert!(alive);
-            assert!(started.elapsed() < Duration::from_millis(crate::MAX_OWNER_TURN_MS));
+            ) else {
+                panic!("restarted assembly");
+            };
             if !page.more {
                 break;
             }
         }
-        let rest = receiver.try_iter().collect::<Vec<_>>();
-        assert!(
-            rest.iter()
-                .all(|frame| matches!(frame, DaemonEntityFrame::Upsert { .. })),
-            "remaining rows must stream as upserts"
-        );
-        let snapshot_len = match &first[0] {
-            DaemonEntityFrame::Snapshot { items, .. } => items.len(),
-            _ => 0,
-        };
-        assert_eq!(snapshot_len + rest.len(), 24);
-        assert!(!state.needs_delivery);
+        let frames: Vec<_> = receiver.try_iter().collect();
+        assert_eq!(frames.len(), 1);
+        match &frames[0] {
+            DaemonEntityFrame::Snapshot { items, .. } => {
+                let first = items
+                    .iter()
+                    .find(|item| {
+                        item.get("session_uuid").and_then(Value::as_str) == Some("session-00")
+                    })
+                    .expect("prefix row");
+                assert_eq!(first.get("updated_at").and_then(Value::as_u64), Some(9));
+                assert_eq!(items.len(), 24);
+            }
+            other => panic!("expected complete snapshot, got {other:?}"),
+        }
     }
 
     #[test]

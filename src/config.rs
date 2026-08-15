@@ -43,6 +43,8 @@ pub struct HubStartupOptions {
     pub provider_directories: DirectoryList,
     pub transports: TransportBindings,
     pub core_engine: CoreEngineOptions,
+    #[serde(default)]
+    pub plugin_worker_class: PluginWorkerClassOptions,
 }
 
 impl Default for HubStartupOptions {
@@ -55,6 +57,7 @@ impl Default for HubStartupOptions {
             provider_directories: DirectoryList::default(),
             transports: TransportBindings::default(),
             core_engine: CoreEngineOptions::default(),
+            plugin_worker_class: PluginWorkerClassOptions::default(),
         }
     }
 }
@@ -96,12 +99,15 @@ impl HubStartupOptions {
             provider_directories,
             transports,
             core_engine: self.core_engine,
+            plugin_worker_class: self.plugin_worker_class,
         })
     }
 
     fn validate(&self) -> Result<(), HubConfigError> {
         self.session_defaults.validate()?;
         self.core_engine.validate()?;
+        self.plugin_worker_class
+            .validate(self.core_engine.plugin_worker_executor_concurrency)?;
         self.transports.validate()
     }
 }
@@ -121,6 +127,15 @@ pub struct HubConfig {
     pub provider_directories: Vec<PathBuf>,
     pub transports: TransportBindings,
     pub core_engine: CoreEngineOptions,
+    #[serde(default)]
+    pub plugin_worker_class: PluginWorkerClassOptions,
+}
+
+impl HubConfig {
+    pub(crate) fn plugin_worker_config(&self) -> botster_core::PluginWorkerEngineConfig {
+        self.core_engine
+            .plugin_worker_config(&self.plugin_worker_class)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -353,6 +368,39 @@ impl Default for PluginWorkerClassOptions {
     }
 }
 
+impl PluginWorkerClassOptions {
+    fn validate(&self, plugin_worker_executor_concurrency: usize) -> Result<(), HubConfigError> {
+        if self.reserved_request_response_executors < 1
+            || self.reserved_request_response_executors >= plugin_worker_executor_concurrency
+        {
+            return Err(HubConfigError::InvalidPluginWorkerReservation {
+                field: "plugin_worker_class.reserved_request_response_executors",
+            });
+        }
+        validate_positive_usize(
+            "plugin_worker_class.request_response_queue_byte_capacity",
+            self.request_response_queue_byte_capacity,
+        )?;
+        validate_positive_usize(
+            "plugin_worker_class.background_queue_capacity",
+            self.background_queue_capacity,
+        )?;
+        validate_positive_usize(
+            "plugin_worker_class.background_queue_byte_capacity",
+            self.background_queue_byte_capacity,
+        )?;
+        validate_positive_usize(
+            "plugin_worker_class.completion_queue_capacity",
+            self.completion_queue_capacity,
+        )?;
+        validate_positive_usize(
+            "plugin_worker_class.completion_queue_byte_capacity",
+            self.completion_queue_byte_capacity,
+        )?;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CoreEngineOptions {
@@ -367,9 +415,6 @@ pub struct CoreEngineOptions {
     pub plugin_worker_queue_capacity: usize,
     /// Per-plugin executor concurrency passed to core plugin worker primitives.
     pub plugin_worker_executor_concurrency: usize,
-    /// Class-specific worker-queue knobs. Defaults keep older JSON valid.
-    #[serde(default)]
-    pub plugin_worker_class: PluginWorkerClassOptions,
 }
 
 impl Default for CoreEngineOptions {
@@ -389,7 +434,6 @@ impl Default for CoreEngineOptions {
             ),
             plugin_worker_queue_capacity: plugin_worker.per_plugin_queue_capacity,
             plugin_worker_executor_concurrency: plugin_worker.per_plugin_executor_concurrency,
-            plugin_worker_class: PluginWorkerClassOptions::default(),
         }
     }
 }
@@ -410,24 +454,22 @@ impl CoreEngineOptions {
             session_io_coalescing,
             plugin_worker_queue_capacity,
             plugin_worker_executor_concurrency,
-            ..Self::default()
         }
     }
 
-    pub(crate) fn plugin_worker_config(&self) -> PluginWorkerEngineConfig {
+    pub(crate) fn plugin_worker_config(
+        &self,
+        class: &PluginWorkerClassOptions,
+    ) -> PluginWorkerEngineConfig {
         PluginWorkerEngineConfig {
             per_plugin_queue_capacity: self.plugin_worker_queue_capacity,
             per_plugin_executor_concurrency: self.plugin_worker_executor_concurrency,
-            reserved_request_response_executors: self
-                .plugin_worker_class
-                .reserved_request_response_executors,
-            request_response_queue_byte_capacity: self
-                .plugin_worker_class
-                .request_response_queue_byte_capacity,
-            background_queue_capacity: self.plugin_worker_class.background_queue_capacity,
-            background_queue_byte_capacity: self.plugin_worker_class.background_queue_byte_capacity,
-            completion_queue_capacity: self.plugin_worker_class.completion_queue_capacity,
-            completion_queue_byte_capacity: self.plugin_worker_class.completion_queue_byte_capacity,
+            reserved_request_response_executors: class.reserved_request_response_executors,
+            request_response_queue_byte_capacity: class.request_response_queue_byte_capacity,
+            background_queue_capacity: class.background_queue_capacity,
+            background_queue_byte_capacity: class.background_queue_byte_capacity,
+            completion_queue_capacity: class.completion_queue_capacity,
+            completion_queue_byte_capacity: class.completion_queue_byte_capacity,
         }
     }
 
@@ -439,35 +481,6 @@ impl CoreEngineOptions {
         validate_positive_usize(
             "core_engine.plugin_worker_executor_concurrency",
             self.plugin_worker_executor_concurrency,
-        )?;
-        if self.plugin_worker_class.reserved_request_response_executors < 1
-            || self.plugin_worker_class.reserved_request_response_executors
-                >= self.plugin_worker_executor_concurrency
-        {
-            return Err(HubConfigError::InvalidPluginWorkerReservation {
-                field: "core_engine.plugin_worker_class.reserved_request_response_executors",
-            });
-        }
-        validate_positive_usize(
-            "core_engine.plugin_worker_class.request_response_queue_byte_capacity",
-            self.plugin_worker_class
-                .request_response_queue_byte_capacity,
-        )?;
-        validate_positive_usize(
-            "core_engine.plugin_worker_class.background_queue_capacity",
-            self.plugin_worker_class.background_queue_capacity,
-        )?;
-        validate_positive_usize(
-            "core_engine.plugin_worker_class.background_queue_byte_capacity",
-            self.plugin_worker_class.background_queue_byte_capacity,
-        )?;
-        validate_positive_usize(
-            "core_engine.plugin_worker_class.completion_queue_capacity",
-            self.plugin_worker_class.completion_queue_capacity,
-        )?;
-        validate_positive_usize(
-            "core_engine.plugin_worker_class.completion_queue_byte_capacity",
-            self.plugin_worker_class.completion_queue_byte_capacity,
         )?;
         self.session_io_coalescing.validate()?;
         if let Some(path) = &self.session_worker_path {
@@ -690,17 +703,12 @@ mod tests {
     #[test]
     fn omitted_worker_class_knobs_take_core_defaults() {
         let defaults = PluginWorkerEngineConfig::default();
-        let value = serde_json::json!({
-            "queue_capacities": [],
-            "session_io_coalescing": {
-                "max_output_bytes": 1,
-                "max_output_frames": 1,
-                "max_window_ms": 1
-            },
-            "plugin_worker_queue_capacity": 4,
-            "plugin_worker_executor_concurrency": 3
-        });
-        let options: CoreEngineOptions =
+        let mut value = serde_json::to_value(HubStartupOptions::default()).expect("serialize");
+        value
+            .as_object_mut()
+            .expect("object")
+            .remove("plugin_worker_class");
+        let options: HubStartupOptions =
             serde_json::from_value(value).expect("deserialize without class knobs");
         assert_eq!(
             options
@@ -712,10 +720,6 @@ mod tests {
             options.plugin_worker_class.background_queue_capacity,
             defaults.background_queue_capacity
         );
-        assert_eq!(
-            options.plugin_worker_class.completion_queue_capacity,
-            defaults.completion_queue_capacity
-        );
     }
 
     #[test]
@@ -726,23 +730,21 @@ mod tests {
             ..CoreEngineOptions::default()
         };
         assert_eq!(options.plugin_worker_queue_capacity, 9);
-        assert_eq!(
-            options
-                .plugin_worker_class
-                .reserved_request_response_executors,
-            1
-        );
+        assert_eq!(options.plugin_worker_executor_concurrency, 3);
     }
 
     #[test]
     fn reserved_request_response_executors_must_leave_a_background_slot() {
-        let options = CoreEngineOptions {
-            plugin_worker_executor_concurrency: 2,
+        let options = HubStartupOptions {
+            core_engine: CoreEngineOptions {
+                plugin_worker_executor_concurrency: 2,
+                ..CoreEngineOptions::default()
+            },
             plugin_worker_class: PluginWorkerClassOptions {
                 reserved_request_response_executors: 2,
                 ..PluginWorkerClassOptions::default()
             },
-            ..CoreEngineOptions::default()
+            ..HubStartupOptions::default()
         };
         let error = options.validate().expect_err("reservation must be strict");
         assert!(matches!(
