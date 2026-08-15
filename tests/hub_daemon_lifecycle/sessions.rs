@@ -3256,9 +3256,13 @@ fn shutdown_after_observed_exit_returns_session_cleanup() {
 }
 
 #[test]
-fn shutdown_session_stays_bounded_with_a_large_registry() {
+// Registry stays Running after ReadScreen parks ProcessExited. The target
+// sorts after 33 pads, so one 32-row baseline page cannot see it. Removing
+// session_runtime_lifecycle makes classify treat Running as Active and
+// ShutdownSession returns OperatorError.
+fn shutdown_session_classifies_parked_exit_beyond_one_baseline_page() {
     let _guard = daemon_test_guard();
-    let data_dir = unique_test_dir("shutdown-large-registry");
+    let data_dir = unique_test_dir("shutdown-parked-late-row");
     let config = explicit_config(&data_dir);
     let endpoint = botster_hub_client::DaemonEndpoint::new(
         config
@@ -3270,12 +3274,12 @@ fn shutdown_session_stays_bounded_with_a_large_registry() {
             .clone(),
     );
     let child = start_cli_daemon(&data_dir);
-    for index in 0..39 {
+    for index in 0..33 {
         botster_hub_client::request(
             &endpoint,
             botster_hub_client::DaemonRequest::Spawn {
                 session_id: format!("aaa-{index:02}"),
-                command: "/bin/sh -c true".to_string(),
+                command: "/bin/sh -c 'sleep 30'".to_string(),
             },
         )
         .expect("spawn pad session");
@@ -3284,30 +3288,44 @@ fn shutdown_session_stays_bounded_with_a_large_registry() {
         &endpoint,
         botster_hub_client::DaemonRequest::Spawn {
             session_id: "zzz-target".to_string(),
-            command: "sleep 0.1".to_string(),
+            command: "printf 'zzz-target-ready\\n'".to_string(),
         },
     )
     .expect("spawn target session");
+    let mut connection = botster_hub_client::DaemonConnection::connect(&endpoint)
+        .expect("open host connection for ReadScreen");
     let deadline = Instant::now() + Duration::from_secs(10);
-    let mut listed = None;
+    let mut screen = String::new();
     while Instant::now() < deadline {
-        listed =
-            botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::ListSessions)
-                .ok()
-                .and_then(|response| {
-                    response.sessions.iter().find_map(|session| {
-                        (session.session_id == "zzz-target").then(|| session.lifecycle.clone())
-                    })
-                });
-        if listed.as_deref() == Some("exited") {
+        let response = connection
+            .request(&botster_hub_client::DaemonRequest::ReadScreen {
+                session_id: "zzz-target".to_string(),
+            })
+            .expect("read target screen");
+        screen = response
+            .read_screen
+            .as_ref()
+            .map(|body| body.text.clone())
+            .unwrap_or_default();
+        if screen.contains("zzz-target-ready") {
             break;
         }
-        thread::sleep(Duration::from_millis(50));
+        thread::sleep(Duration::from_millis(25));
     }
+    assert!(
+        screen.contains("zzz-target-ready"),
+        "ReadScreen must observe target output before ShutdownSession, last={screen:?}"
+    );
+    let listed =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::ListSessions)
+            .expect("list sessions before shutdown");
+    let target_lifecycle = listed.sessions.iter().find_map(|session| {
+        (session.session_id == "zzz-target").then(|| session.lifecycle.clone())
+    });
     assert_eq!(
-        listed.as_deref(),
-        Some("exited"),
-        "owner loop must observe target exit before ShutdownSession"
+        target_lifecycle.as_deref(),
+        Some("running"),
+        "registry must still be Running so classify uses engine lifecycle, got {target_lifecycle:?}"
     );
     let started = Instant::now();
     let shutdown = botster_hub_client::request(
@@ -3316,16 +3334,19 @@ fn shutdown_session_stays_bounded_with_a_large_registry() {
             session_id: "zzz-target".to_string(),
         },
     )
-    .expect("shutdown last session in a large registry");
+    .expect("shutdown parked late session");
     let elapsed = started.elapsed();
     assert!(
-        elapsed < Duration::from_millis(500),
-        "ShutdownSession must stay bounded with more than one baseline page, elapsed={elapsed:?}"
+        elapsed < Duration::from_secs(1),
+        "ShutdownSession must finish the paged lookup, elapsed={elapsed:?}"
     );
-    assert_eq!(
-        shutdown.kind,
-        botster_hub_client::DaemonResponseKind::SessionCleanup,
-        "ShutdownSession of an exited late session must be cleanup, got {:?}",
+    assert!(
+        matches!(
+            shutdown.kind,
+            botster_hub_client::DaemonResponseKind::Events
+                | botster_hub_client::DaemonResponseKind::SessionCleanup
+        ),
+        "parked late-row exit must not return OperatorError, got {:?}",
         shutdown.kind
     );
     shutdown_cli_daemon(&data_dir, child);
