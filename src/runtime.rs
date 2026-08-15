@@ -117,6 +117,7 @@ pub struct HubRuntime {
     family_source: std::cell::RefCell<Option<CausalOp>>,
     family_overflow: std::cell::RefCell<Option<CausalOp>>,
     source_ops: std::cell::RefCell<VecDeque<CausalOp>>,
+    source_held: std::cell::RefCell<Option<CausalOp>>,
     event_plane_owner_ops: std::cell::RefCell<crate::package_event_router::EventPlaneOwnerOps>,
 }
 
@@ -284,6 +285,7 @@ impl HubRuntime {
             family_source: std::cell::RefCell::new(None),
             family_overflow: std::cell::RefCell::new(None),
             source_ops: std::cell::RefCell::new(VecDeque::new()),
+            source_held: std::cell::RefCell::new(None),
             event_plane_owner_ops: std::cell::RefCell::new(
                 crate::package_event_router::EventPlaneOwnerOps::default(),
             ),
@@ -377,6 +379,7 @@ impl HubRuntime {
             family_source: std::cell::RefCell::new(None),
             family_overflow: std::cell::RefCell::new(None),
             source_ops: std::cell::RefCell::new(VecDeque::new()),
+            source_held: std::cell::RefCell::new(None),
             event_plane_owner_ops: std::cell::RefCell::new(
                 crate::package_event_router::EventPlaneOwnerOps::default(),
             ),
@@ -529,6 +532,7 @@ impl HubRuntime {
             || self.family_source.borrow().is_some()
             || self.family_overflow.borrow().is_some()
             || !self.source_ops.borrow().is_empty()
+            || self.source_held.borrow().is_some()
             || self.has_family_leftovers()
     }
 
@@ -757,19 +761,28 @@ impl HubRuntime {
                     CausalAdmitResult::Retry(CausalOp::Release { scope_id, identity })
                 }
             }
-            CausalOp::Transfer { scope_id, from, to } => {
-                if self.causal_scopes.try_retract(scope_id, from.clone()) {
-                    CausalAdmitResult::Applied
-                } else {
-                    CausalAdmitResult::Retry(CausalOp::Transfer { scope_id, from, to })
-                }
-            }
+            op => CausalAdmitResult::Retry(op),
+        }
+    }
+
+    fn hold_source_retry(&self, op: CausalOp) -> CausalAdmitResult {
+        let mut held = self.source_held.borrow_mut();
+        if held.is_none() {
+            *held = Some(op);
+            CausalAdmitResult::Applied
+        } else {
+            CausalAdmitResult::Retry(op)
         }
     }
 
     fn keep_or_reject(&self, op: CausalOp) -> CausalAdmitResult {
         if let CausalAdmitResult::Retry(op) = self.keep_source_op(op) {
-            return self.reject_unsent(op);
+            if matches!(op, CausalOp::Transfer { .. }) {
+                return self.hold_source_retry(op);
+            }
+            if let CausalAdmitResult::Retry(op) = self.reject_unsent(op) {
+                return self.hold_source_retry(op);
+            }
         }
         CausalAdmitResult::Applied
     }
@@ -867,6 +880,7 @@ impl HubRuntime {
         self.retry_one_held(&self.family_held, &mut applied, started);
         self.retry_one_held(&self.family_source, &mut applied, started);
         self.retry_one_held(&self.family_overflow, &mut applied, started);
+        self.retry_one_held(&self.source_held, &mut applied, started);
         let mut pending = std::mem::take(&mut *self.source_ops.borrow_mut());
         let mut leftover = VecDeque::new();
         while let Some(op) = pending.pop_front() {
@@ -1070,6 +1084,37 @@ impl HubRuntime {
     #[doc(hidden)]
     pub fn test_keep_source_op(&self, op: CausalOp) -> CausalAdmitResult {
         self.keep_or_reject(op)
+    }
+
+    #[must_use]
+    #[doc(hidden)]
+    pub fn test_source_held(&self) -> bool {
+        self.source_held.borrow().is_some()
+    }
+
+    #[doc(hidden)]
+    pub fn test_settle_publish(
+        &self,
+        family: &str,
+        scope_id: u64,
+        plugin_key: &str,
+        seq: u64,
+        resync_needed: bool,
+    ) {
+        let result = crate::package_entity_fanout::PackageEntityPublishResult {
+            ok: true,
+            status: crate::package_entity_fanout::PackageEntityPublishStatus::Accepted,
+            last_accepted_seq: seq,
+            high_water_seq: seq,
+            resync_needed,
+            resync_degraded: false,
+        };
+        let mut state = self
+            .package_entity_families
+            .lock()
+            .expect("package entity family lock");
+        let entry = state.entry(family.to_string()).or_default();
+        self.settle_entity_publish_lease(entry, scope_id, plugin_key, family, seq, &result);
     }
 
     #[doc(hidden)]
@@ -2139,7 +2184,7 @@ impl HubRuntime {
             )))
             && let CausalAdmitResult::Retry(_op) = self.keep_or_reject(op)
         {
-            // Retract failed while the global source store was full.
+            family.forget_resync_lease(scope_id, entity_type);
         }
     }
 
@@ -2483,6 +2528,7 @@ impl HubRuntime {
             || self.family_source.borrow().is_some()
             || self.family_overflow.borrow().is_some()
             || !self.source_ops.borrow().is_empty()
+            || self.source_held.borrow().is_some()
         {
             return true;
         }
