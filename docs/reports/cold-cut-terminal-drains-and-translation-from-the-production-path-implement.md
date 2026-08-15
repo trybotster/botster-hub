@@ -14,7 +14,7 @@ Plan: `docs/plans/cold-cut-terminal-drains-and-translation-from-the-production-p
 | Worktree HEAD before edits | `959c58f55726d098299cced8af151d8f496f41e3` |
 | Locked Core SHA | `aef6516d5809d563961ed7fdd07da29a7b4edddc` |
 | Merge policy | direct into `main`; no PR |
-| Review follow-up | `review_1786830072_881433` on `899bb58` |
+| Review follow-up | `review_1786830875_230401` on `2c7411f` |
 
 Independent routing matched the approved plan. This run did not infer the repository from the ambient directory.
 
@@ -44,6 +44,12 @@ Applied before edits:
 - [[test script required for rust tests not cargo test]]
 - [[implement gate must verify committed work and pr link before review]]
 - [[first-party clients put terminal mechanism tokens only in terminal compatibility]]
+- [[hub shutdown preserves durable session workers]]
+- [[Hub keeps CoreDaemon single owned without a concurrent worker]]
+- [[a regression test must be shown to go red with the fix reverted]]
+- [[rust repo strict lints must be verified before dismissing warnings]]
+- [[implementation artifacts must match actual git state]]
+- [[implementation steps must persist report artifacts for review]]
 
 Not loaded: [[project-pipelines-playbook]] (package/plugin paths out of scope).
 
@@ -67,7 +73,8 @@ Not loaded: [[project-pipelines-playbook]] (package/plugin paths out of scope).
 - `packages/hub-test-support/**` (0.1.37 / revision 42, regenerated)
 - `README.md`, `docs/client-protocol.md`
 - Tests under `tests/hub_client_api_test.rs`, `tests/hub_local_runtime_test.rs`, `tests/hub_daemon_lifecycle/*`
-- Plan and this report (Review follow-up on `review_1786830072_881433`)
+- Plan and this report (Review follow-up on `review_1786830875_230401`)
+- This visit: `src/daemon_transport.rs` and this report only
 
 ## Ownership boundaries preserved
 
@@ -254,6 +261,17 @@ This visit:
 - Cleanup shuts down owned sessions through `HubRuntime::shutdown_session` and `shutdown_core_for_test`. Drop then waits until a fresh exported Hub spawn succeeds.
 - Required sequence with no manual delay: pass (2.35s), ablation fail (exit 101), immediate restore pass (2.34s), second pass (2.31s).
 
+Review `review_1786830875_230401` required one follow-up on `2c7411f`:
+
+- `finding_1786830875_353947` — `wait_until_exported_spawn_succeeds` returned after one successful probe spawn. It did not wait for that probe worker to release. Both immediate restored runs failed at spawn `aaa-00` under Review load.
+
+This visit:
+
+- Removed the spawn probe. Cleanup no longer creates a new worker to prove reuse.
+- `OwnedSessionRuntime` now holds `Option<HubRuntime>`. After `shutdown_session` and `shutdown_core_for_test`, Drop takes and drops Core before it claims resources are free.
+- The barrier retries `remove_dir_all` until the owned data directory is gone. It does not copy Core `worker_socket_dir`, scan `ps`, or treat `DaemonSession.process.pid` as a worker PID.
+- Required sequence with no manual delay or cleanup: pass (2.32s), ablation fail (exit 101, OperatorError Runtime), immediate restore pass (2.25s), second pass (2.28s). This-worktree worker count stayed at 75 across that sequence. `git diff` on `reset_walk_after_active_classify` is clean.
+
 ## Runtime-teardown lenses
 
 | Lens | Implemented |
@@ -316,7 +334,8 @@ Passed on this tree:
 - Narrow ablation of only `walk.reset()` inside `reset_walk_after_active_classify` made `production_core_error_cleanup_requires_reset_of_nonfinal_walk` and `production_reset_clears_a_held_lifecycle_walk` fail (exit 101). Active Runtime/State mapper tests stayed green. The reset was restored.
 - `shutdown_session_classifies_parked_exit_beyond_one_baseline_page` passed isolated (2.68s)
 - rustfmt `--check` and `cargo clippy --workspace --all-targets --offline -- -D warnings` passed
-- `production_core_error_cleanup_requires_reset_of_nonfinal_walk` now waits for owned workers to exit before Drop returns. Sequence: pass, ablation fail, immediate restore pass, second pass, 0 leftover workers
+- `production_core_error_cleanup_requires_reset_of_nonfinal_walk` now drops Core and waits until the owned data directory is gone. Sequence: pass (2.32s), ablation fail (exit 101), immediate restore pass (2.25s), second pass (2.28s). This-worktree worker count stayed at 75.
+- `./test.sh --locked` after that sequence: lifecycle 206/1 ignored, lib 287, client API 34, no FAILED results. Parked-exit and exact-bytes stayed green.
 - `shutdown_after_observed_exit_returns_session_cleanup` passed isolated
 - Live Web `1e57685` `npm run smoke:live-packaged-protocol` against copied bins from this tree: Hello protocol 7 / rev 42, session spawn, `proveLiveTerminalAfterAttach`, and `assertTerminalAttachChronology` (cycle 0 plus reconnect cycles) completed. The harness then failed twice at the later Web-owned `proveRapidAlternateScreenReattach` cycle 0 ReadScreen oracle (`lost final row marker`). That stage is after attaching, snapshots, attached, and live `daemon_terminal_event` output.
 
@@ -329,6 +348,7 @@ Passed on this tree:
 - Downstream TUI/Web crates that still imported the deleted hub-client `FEATURE_*` constants must import `botster-terminal-protocol` instead. Those consumers are separately routed.
 - Production Hub no longer calls Core `drain` or unbounded `lifecycle_baseline()`. After a Core shutdown error, classify uses one shared 1 s deadline. Active resets the walk. Incomplete keeps the cursor. Unconfirmed Active or Incomplete stays OperatorError.
 - Live Web packaged-protocol attach chronology was proved at `b961e27`. The same smoke still fails later at Web `proveRapidAlternateScreenReattach` cycle 0. That later oracle is unchanged by this Drain removal.
+- Reset-test cleanup now waits for owned Core drop plus data-directory removal. It does not inspect Core's private worker-socket directory. Pre-existing leftover workers from earlier visits were left in place.
 
 ## Missing vault guidance discovered
 
