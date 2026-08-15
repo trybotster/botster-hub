@@ -110,7 +110,6 @@ pub struct HubRuntime {
     unfinished_finishes: Mutex<VecDeque<CausalOp>>,
     unfinished_overflow: Mutex<VecDeque<CausalOp>>,
     unfinished_held: Mutex<VecDeque<CausalOp>>,
-    source_ops: std::cell::RefCell<VecDeque<CausalOp>>,
     event_plane_owner_ops: std::cell::RefCell<crate::package_event_router::EventPlaneOwnerOps>,
 }
 
@@ -271,7 +270,6 @@ impl HubRuntime {
             unfinished_finishes: Mutex::new(VecDeque::new()),
             unfinished_overflow: Mutex::new(VecDeque::new()),
             unfinished_held: Mutex::new(VecDeque::new()),
-            source_ops: std::cell::RefCell::new(VecDeque::new()),
             event_plane_owner_ops: std::cell::RefCell::new(
                 crate::package_event_router::EventPlaneOwnerOps::default(),
             ),
@@ -358,7 +356,6 @@ impl HubRuntime {
             unfinished_finishes: Mutex::new(VecDeque::new()),
             unfinished_overflow: Mutex::new(VecDeque::new()),
             unfinished_held: Mutex::new(VecDeque::new()),
-            source_ops: std::cell::RefCell::new(VecDeque::new()),
             event_plane_owner_ops: std::cell::RefCell::new(
                 crate::package_event_router::EventPlaneOwnerOps::default(),
             ),
@@ -503,7 +500,6 @@ impl HubRuntime {
                 .lock()
                 .map(|pending| !pending.is_empty())
                 .unwrap_or(false)
-            || !self.source_ops.borrow().is_empty()
             || self.has_finish_only_fanout()
     }
 
@@ -511,7 +507,6 @@ impl HubRuntime {
         let _ = self.causal_scopes.flush_pending();
         self.harvest_publish_releases();
         self.retry_unfinished_finishes();
-        self.retry_source_ops();
         self.retry_finish_only_fanout();
         let _ = self.causal_scopes.flush_pending();
         self.event_plane_owner_ops
@@ -535,7 +530,7 @@ impl HubRuntime {
                 if let CausalAdmitResult::Retry(op) =
                     self.keep_owned(self.entity_publish_bridge.park_release(op))
                 {
-                    self.keep_source_op(op);
+                    let _ = self.entity_publish_bridge.park_release(op);
                 }
                 break;
             }
@@ -635,34 +630,10 @@ impl HubRuntime {
         CausalAdmitResult::Applied
     }
 
-    fn keep_source_op(&self, op: CausalOp) {
-        if let CausalAdmitResult::Retry(op) = self.entity_publish_bridge.leave_source(op) {
-            self.source_ops.borrow_mut().push_back(op);
-        }
-    }
-
-    fn keep_or_source(&self, result: CausalAdmitResult) {
+    fn keep_or_park(&self, result: CausalAdmitResult) {
         if let CausalAdmitResult::Retry(op) = self.keep_owned(result) {
-            self.keep_source_op(op);
+            let _ = self.entity_publish_bridge.park_release(op);
         }
-    }
-
-    fn retry_source_ops(&self) {
-        let started = Instant::now();
-        let mut applied = 0;
-        let mut leftover = VecDeque::new();
-        let pending = std::mem::take(&mut *self.source_ops.borrow_mut());
-        for op in pending {
-            if applied >= CAUSAL_FLUSH_MAX || started.elapsed() >= Duration::from_millis(8) {
-                leftover.push_back(op);
-                continue;
-            }
-            match self.keep_owned(CausalAdmitResult::Retry(op)) {
-                CausalAdmitResult::Applied => applied += 1,
-                CausalAdmitResult::Retry(op) => leftover.push_back(op),
-            }
-        }
-        self.source_ops.borrow_mut().extend(leftover);
     }
 
     fn has_finish_only_fanout(&self) -> bool {
@@ -1494,8 +1465,20 @@ impl HubRuntime {
 
     fn fulfill_pending_entity_publish_requests(&self) {
         self.harvest_publish_releases();
-        self.retry_source_ops();
         while let Some(pending) = self.entity_publish_bridge.take_pending() {
+            if let Some(scope_id) = pending.scope_id
+                && !self.causal_scopes.acquire(
+                    scope_id,
+                    LeaseIdentity::PendingEntityPublish {
+                        plugin_key: pending.plugin_key.0.clone(),
+                    },
+                )
+            {
+                let _ = pending
+                    .response
+                    .send(Err("causal scope lease could not be acquired".to_string()));
+                continue;
+            }
             let result = self.admit_package_entity_publish(
                 pending.plugin_key.clone(),
                 pending.frame,
@@ -1520,8 +1503,10 @@ impl HubRuntime {
             && let CausalAdmitResult::Retry(op) =
                 release_or_retract(&self.causal_scopes, scope_id, pending_identity)
             && let CausalAdmitResult::Retry(op) = self.entity_publish_bridge.park_release(op)
+            && let CausalAdmitResult::Retry(op) =
+                self.keep_owned(self.entity_publish_bridge.mark_orphan(op))
         {
-            self.keep_or_source(self.entity_publish_bridge.mark_orphan(op));
+            let _ = self.entity_publish_bridge.park_release(op);
         }
         result
     }
@@ -1643,7 +1628,7 @@ impl HubRuntime {
         mutation_seq: u64,
         result: &PackageEntityPublishResult,
     ) {
-        self.keep_or_source(self.admit_causal_op(settle_entity_publish_op(
+        self.keep_or_park(self.admit_causal_op(settle_entity_publish_op(
             family,
             scope_id,
             plugin_key,
@@ -1655,7 +1640,7 @@ impl HubRuntime {
 
     fn release_resync_leases(&self, leases: BTreeSet<(u64, String)>) {
         for (scope_id, family) in leases {
-            self.keep_or_source(self.admit_causal_op(CausalOp::Release {
+            self.keep_or_park(self.admit_causal_op(CausalOp::Release {
                 scope_id,
                 identity: LeaseIdentity::ProviderResyncNeed { family },
             }));
@@ -1747,7 +1732,7 @@ impl HubRuntime {
             });
         }
         for discarded in family.take_discarded_pending_leases() {
-            self.keep_or_source(self.admit_causal_op(CausalOp::Release {
+            self.keep_or_park(self.admit_causal_op(CausalOp::Release {
                 scope_id: discarded.scope_id,
                 identity: LeaseIdentity::AdmittedEntityMutation {
                     family: discarded.family,
@@ -1860,7 +1845,7 @@ impl HubRuntime {
             if let Some(mut family) = state.remove(family_name) {
                 let pending_leases = std::mem::take(&mut family.pending_leases);
                 for lease in pending_leases.into_values() {
-                    self.keep_or_source(self.admit_causal_op(CausalOp::Release {
+                    self.keep_or_park(self.admit_causal_op(CausalOp::Release {
                         scope_id: lease.scope_id,
                         identity: LeaseIdentity::AdmittedEntityMutation {
                             family: lease.family,
@@ -1878,7 +1863,7 @@ impl HubRuntime {
         fanout.retain(|item| {
             if families.contains(item.mutation.entity_type()) {
                 if let Some(lease) = item.lease.clone() {
-                    self.keep_or_source(self.admit_causal_op(CausalOp::Release {
+                    self.keep_or_park(self.admit_causal_op(CausalOp::Release {
                         scope_id: lease.scope_id,
                         identity: LeaseIdentity::AdmittedEntityMutation {
                             family: lease.family,
@@ -2255,7 +2240,7 @@ impl HubRuntime {
             })),
         });
         if let Some(scope_id) = scope_id {
-            self.keep_or_source(self.admit_causal_op(CausalOp::Release {
+            self.keep_or_park(self.admit_causal_op(CausalOp::Release {
                 scope_id,
                 identity: crate::package_event_router::LeaseIdentity::ProviderInFlight {
                     request_id: request_id.0.clone(),

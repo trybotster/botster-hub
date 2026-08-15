@@ -32,7 +32,7 @@ use crate::capabilities::{HubCapabilityRuntime, PluginStoreBatchMutation, Plugin
 use crate::lifecycle::{HubPluginEventHandler, HubPluginRuntimeBundle, package_entity_owner_token};
 use crate::package_event_router::{
     CAUSAL_PENDING_MAX, CausalAdmitResult, CausalOp, CausalScopeTable, EventPlaneStatus,
-    LeaseIdentity, PackageEventRouter, release_or_retract,
+    PackageEventRouter,
 };
 use crate::packages::{PackageConfigurationView, PackageRecord, PreparedLocalPackage};
 use crate::runtime::{SharedSessionTypeSpawner, SharedSpawnTargets, SharedWorktrees};
@@ -1028,12 +1028,7 @@ fn install_botster_api(
     )?;
     botster.set(
         "entity_publish",
-        entity_publish_function(
-            lua,
-            plugin_key,
-            host_api.entity_publish,
-            host_api.causal_scopes,
-        )?,
+        entity_publish_function(lua, plugin_key, host_api.entity_publish)?,
     )?;
     globals.set("botster", botster)?;
     Ok(())
@@ -1043,23 +1038,10 @@ fn entity_publish_function(
     lua: &Lua,
     plugin_key: PluginKey,
     bridge: HubEntityPublishBridge,
-    scopes: Arc<CausalScopeTable>,
 ) -> Result<Function, mlua::Error> {
     lua.create_function(move |lua, args: Value| {
         let value = lua.from_value::<serde_json::Value>(args)?;
         let scope_id = current_causal_scope();
-        if let Some(scope_id) = scope_id
-            && !scopes.acquire(
-                scope_id,
-                LeaseIdentity::PendingEntityPublish {
-                    plugin_key: plugin_key.0.clone(),
-                },
-            )
-        {
-            return Err(mlua::Error::RuntimeError(
-                "causal scope lease could not be acquired".to_string(),
-            ));
-        }
         let result = match bridge.publish(plugin_key.clone(), value, scope_id) {
             Ok(result) => result,
             Err(EntityPublishError::OwnerFinished(error)) => {
@@ -1071,19 +1053,6 @@ fn entity_publish_function(
                 ));
             }
             Err(EntityPublishError::NeverQueued(error)) => {
-                if let Some(scope_id) = scope_id
-                    && let CausalAdmitResult::Retry(op) = release_or_retract(
-                        &scopes,
-                        scope_id,
-                        LeaseIdentity::PendingEntityPublish {
-                            plugin_key: plugin_key.0.clone(),
-                        },
-                    )
-                    && let CausalAdmitResult::Retry(op) = bridge.park_release(op)
-                    && let CausalAdmitResult::Retry(op) = bridge.mark_orphan(op)
-                {
-                    let _ = bridge.leave_source(op);
-                }
                 return Err(mlua::Error::RuntimeError(error));
             }
         };
