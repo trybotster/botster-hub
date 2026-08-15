@@ -508,6 +508,7 @@ dependencies = [
  "botster-core",
  "botster-hub-client",
  "botster-terminal-ghostty",
+ "botster-terminal-protocol",
  "botster-ui-contract",
  "libc",
  "serde",
