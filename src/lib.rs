@@ -66,6 +66,8 @@ pub mod maintenance;
 pub mod managed_git_worktrees;
 pub mod mcp;
 pub mod package_entity_fanout;
+pub mod package_event_router;
+pub(crate) mod package_event_schema;
 pub mod packages;
 pub mod persistence;
 pub mod profile;
@@ -113,8 +115,8 @@ pub use client_api::{
 pub use config::{
     CoreEngineOptions, CoreQueueCapacity, DataDirectoryOption, DirectoryList, HostIdentity,
     HostIdentityOptions, HubConfig, HubConfigError, HubStartupOptions, LocalSocketBinding,
-    RuntimeEnvironment, SessionDefaults, SessionIoCoalescingOptions, TcpBinding, TransportBindings,
-    build_default_config_for_runtime,
+    PackageEventPlaneOptions, PackageEventPlanePolicy, RuntimeEnvironment, SessionDefaults,
+    SessionIoCoalescingOptions, TcpBinding, TransportBindings, build_default_config_for_runtime,
 };
 pub use credentials::{
     CredentialKeyPurpose, CredentialPolicyError, CredentialProviderKind, OsKeychainCredentialStore,
@@ -166,19 +168,21 @@ pub use mcp::{
     McpCallRequest, McpServeError, McpToolDescriptor, McpToolError, McpToolProvider,
     McpToolRegistry, McpToolResult, NativeHubToolProvider, PluginHubToolProvider, serve_mcp_stdio,
 };
+pub use package_event_router::{EventPlaneStatus, PackageEventRouter};
 pub use packages::{
-    AvailablePackage, AvailablePackageState, HubPackageManifest, LOCAL_PACKAGE_MANIFEST_FILE,
-    LOCAL_PACKAGE_REGISTRY_FILE, PackageAction, PackageAdmissionPolicy, PackageAdmissionReason,
-    PackageClassification, PackageCompatibility, PackageCompatibilityResult,
-    PackageConfigurationDiagnostic, PackageConfigurationState, PackageConfigurationView,
-    PackageDecision, PackageEnvironmentRequirement, PackageInstallDiagnostic, PackageInstallEffect,
-    PackageInstallPlan, PackagePin, PackageProvenance, PackageRecord, PackageRegistry,
-    PackageRegistryEntrySourceKind, PackageRegistryError, PackageRegistryResult,
-    PackageRegistrySnapshot, PackageRegistrySnapshotError, PackageRegistrySource,
-    PackageRegistrySourceKind, PackageResolvedForegroundLaunch, PackageRunnableDiagnostic,
-    PackageRunnableEntrypoint, PackageRunnableProcess, PackageRunnableProcessState,
-    PackageRunnableWorkingDirectory, PackageSourceMetadata, PackageState, PackageTrust,
-    PackageTrustClassification, PackageUpdatePolicy, PreparedLocalPackage, default_package_policy,
+    AvailablePackage, AvailablePackageState, HubEmittedEvent, HubPackageEvents, HubPackageManifest,
+    LOCAL_PACKAGE_MANIFEST_FILE, LOCAL_PACKAGE_REGISTRY_FILE, PackageAction,
+    PackageAdmissionPolicy, PackageAdmissionReason, PackageClassification, PackageCompatibility,
+    PackageCompatibilityResult, PackageConfigurationDiagnostic, PackageConfigurationState,
+    PackageConfigurationView, PackageDecision, PackageEnvironmentRequirement,
+    PackageInstallDiagnostic, PackageInstallEffect, PackageInstallPlan, PackagePin,
+    PackageProvenance, PackageRecord, PackageRegistry, PackageRegistryEntrySourceKind,
+    PackageRegistryError, PackageRegistryResult, PackageRegistrySnapshot,
+    PackageRegistrySnapshotError, PackageRegistrySource, PackageRegistrySourceKind,
+    PackageResolvedForegroundLaunch, PackageRunnableDiagnostic, PackageRunnableEntrypoint,
+    PackageRunnableProcess, PackageRunnableProcessState, PackageRunnableWorkingDirectory,
+    PackageSourceMetadata, PackageState, PackageTrust, PackageTrustClassification,
+    PackageUpdatePolicy, PreparedLocalPackage, default_package_policy,
     resolve_foreground_launch_contract,
 };
 pub use persistence::{

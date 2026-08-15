@@ -1150,7 +1150,7 @@ fn install_event_probe_registry(name: &str) -> PackageRegistry {
     fs::write(
         root.join("plugin.lua"),
         r#"
-events.on("worktree_created", function(event)
+events.on("hub", "worktree_created", function(event)
   return {
     received = event.event,
     worktree_id = event.worktree_id,
@@ -1158,14 +1158,14 @@ events.on("worktree_created", function(event)
   }
 end)
 
-events.on("worktree_deleted", function(event)
+events.on("hub", "worktree_deleted", function(event)
   return {
     received = event.event,
     worktree_id = event.worktree_id,
   }
 end)
 
-events.on("worktree_created", function(event)
+events.on("hub", "worktree_created", function(event)
   return {
     received = event.event,
     observer = "second",
@@ -1226,14 +1226,23 @@ fn events_on_registers_exact_event_subscription_and_invokes_worker_handler() {
     hub.load_lua_plugin_package(&registry, "event-probe.plugin")
         .expect("load event probe plugin");
 
-    let outcomes = hub.emit_plugin_event(
-        "worktree_created",
-        serde_json::json!({
-            "event": "worktree_created",
-            "worktree_id": "wt_1",
-            "target_id": "tgt_1",
-        }),
+    let created = serde_json::json!({
+        "event": "worktree_created",
+        "worktree_id": "wt_1",
+        "target_id": "tgt_1",
+    });
+    assert_eq!(
+        hub.package_event_router()
+            .try_ingress(
+                "hub",
+                "worktree_created",
+                &created,
+                std::time::Instant::now()
+            )
+            .as_str(),
+        "accepted"
     );
+    let outcomes = hub.drive_package_events_for_test();
     assert_eq!(outcomes.len(), 2);
     let payloads = completed_payloads(&outcomes);
     assert!(payloads.contains(&serde_json::json!({
@@ -1247,13 +1256,22 @@ fn events_on_registers_exact_event_subscription_and_invokes_worker_handler() {
         "worktree_id": "wt_1",
     })));
 
-    let deleted = hub.emit_plugin_event(
-        "worktree_deleted",
-        serde_json::json!({
-            "event": "worktree_deleted",
-            "worktree_id": "wt_1",
-        }),
+    let deleted_payload = serde_json::json!({
+        "event": "worktree_deleted",
+        "worktree_id": "wt_1",
+    });
+    assert_eq!(
+        hub.package_event_router()
+            .try_ingress(
+                "hub",
+                "worktree_deleted",
+                &deleted_payload,
+                std::time::Instant::now()
+            )
+            .as_str(),
+        "accepted"
     );
+    let deleted = hub.drive_package_events_for_test();
     assert_eq!(deleted.len(), 1);
     assert_eq!(
         completed_payloads(&deleted),
@@ -1263,19 +1281,25 @@ fn events_on_registers_exact_event_subscription_and_invokes_worker_handler() {
         })]
     );
 
-    let unmatched = hub.emit_plugin_event(
-        "worktree_create_failed",
-        serde_json::json!({ "event": "worktree_create_failed" }),
+    assert_eq!(
+        hub.package_event_router()
+            .try_ingress(
+                "hub",
+                "worktree_create_failed",
+                &serde_json::json!({ "event": "worktree_create_failed" }),
+                std::time::Instant::now()
+            )
+            .as_str(),
+        "accepted"
     );
+    let unmatched = hub.drive_package_events_for_test();
     assert!(
         unmatched.is_empty(),
         "event subscriptions should match exact event names"
     );
 }
 
-fn completed_payloads(
-    outcomes: &[botster_core::PluginInvocationOutcome],
-) -> Vec<serde_json::Value> {
+fn completed_payloads(outcomes: &[botster_core::PluginCompletion]) -> Vec<serde_json::Value> {
     outcomes
         .iter()
         .map(|outcome| {
@@ -2961,6 +2985,8 @@ fn reload_replaces_lua_tool_descriptors_and_removes_stale_handlers() {
             session_types: hub.session_type_spawner(),
             spawn_targets: hub.spawn_targets(),
             worktrees: hub.worktrees(),
+            package_event_router: hub.package_event_router().clone(),
+            causal_scopes: hub.causal_scopes().clone(),
         },
         registry.packages().into_iter().cloned().collect(),
     )

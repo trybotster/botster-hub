@@ -143,6 +143,14 @@ pub(super) fn reload_package(
     let (candidate, decision) =
         previous.refreshed_local_package(&package_name, "daemon socket reload local package")?;
     commit_package_registry(daemon, candidate)?;
+    record_event_plane_owner_ops(
+        daemon,
+        &package_name,
+        &[
+            crate::package_event_router::OwnerOpKind::Unload,
+            crate::package_event_router::OwnerOpKind::Reload,
+        ],
+    );
     if let Err(error) =
         apply_reload_side_effects(daemon, &package_name, decision.state, &running_entrypoints)
     {
@@ -253,6 +261,11 @@ pub(super) fn disable_package(
     commit_package_registry(daemon, candidate)?;
     daemon.entrypoint_supervisor().stop_package(&package_name);
     unload_package_after_disable(daemon, &package_name)?;
+    record_event_plane_owner_ops(
+        daemon,
+        &package_name,
+        &[crate::package_event_router::OwnerOpKind::Unload],
+    );
     advance_session_type_generation_if_changed(daemon, &before_session_types)?;
     package_decision_response(daemon, decision)
 }
@@ -267,6 +280,11 @@ pub(super) fn remove_package(
     commit_package_registry(daemon, candidate)?;
     daemon.entrypoint_supervisor().stop_package(&package_name);
     unload_package_after_disable(daemon, &package_name)?;
+    record_event_plane_owner_ops(
+        daemon,
+        &package_name,
+        &[crate::package_event_router::OwnerOpKind::Unload],
+    );
     advance_session_type_generation_if_changed(daemon, &before_session_types)?;
     package_decision_response(daemon, decision)
 }
@@ -362,6 +380,23 @@ fn reload_package_after_reload(
             .map_err(crate::HubDaemonError::from)?;
     }
     Ok(())
+}
+
+fn record_event_plane_owner_ops(
+    daemon: &HubDaemon,
+    package_name: &str,
+    kinds: &[crate::package_event_router::OwnerOpKind],
+) {
+    let Some(runtime) = daemon.runtime() else {
+        return;
+    };
+    for (index, kind) in kinds.iter().copied().enumerate() {
+        runtime.record_event_plane_owner_op(crate::package_event_router::OwnerOp {
+            kind,
+            owner: package_name.to_string(),
+            generation: index as u64 + 1,
+        });
+    }
 }
 
 fn unload_package_after_disable(

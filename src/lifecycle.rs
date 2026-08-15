@@ -306,6 +306,29 @@ impl HubPluginLifecycle {
         self.event_handlers_for_page(event_name, None, usize::MAX).0
     }
 
+    /// Return the handler for one exact owner+name subscription on a plugin.
+    #[must_use]
+    pub fn event_handler_for(
+        &self,
+        plugin_key: &str,
+        owner: &str,
+        event_name: &str,
+        handler_id: &str,
+    ) -> Option<HubPluginEventHandler> {
+        self.event_handlers
+            .lock()
+            .expect("hub plugin lifecycle event handlers lock")
+            .get(plugin_key)
+            .into_iter()
+            .flatten()
+            .find(|handler| {
+                handler.event_owner == owner
+                    && handler.event_name == event_name
+                    && handler.handler.handler_id == handler_id
+            })
+            .cloned()
+    }
+
     /// Return one bounded page of Event-kind handlers for an exact event name.
     ///
     /// `max_items` counts visited plugin keys, including keys that do not
@@ -356,6 +379,7 @@ impl HubPluginLifecycle {
             .entry(plugin_key.to_string())
             .or_default()
             .push(HubPluginEventHandler {
+                event_owner: "hub".to_string(),
                 event_name: event_name.to_string(),
                 handler: PluginHandlerRef {
                     plugin_key: PluginKey(plugin_key.to_string()),
@@ -420,6 +444,8 @@ pub struct HubPluginRuntimeBundle {
 /// Hub-owned event subscription metadata for one plugin handler.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HubPluginEventHandler {
+    /// Exact owner string passed to `events.on(owner, name, ...)`.
+    pub event_owner: String,
     /// Exact event name passed to `events.on(...)`.
     pub event_name: String,
     /// Stable handler address invoked through the core plugin worker.

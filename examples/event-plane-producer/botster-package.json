@@ -1,0 +1,28 @@
+{
+  "name": "event-plane-producer",
+  "version": "1.0.0",
+  "kind": "plugin",
+  "botster": ">=0.1.0",
+  "source": { "type": "path", "path": "." },
+  "capabilities": [],
+  "entrypoints": [
+    { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+  ],
+  "events": {
+    "emitted": [
+      {
+        "name": "sample.ready",
+        "audience": ["plugins"],
+        "payload_schema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "ok": { "type": "boolean" },
+            "token": { "type": "string" }
+          },
+          "required": ["ok"]
+        }
+      }
+    ]
+  }
+}

@@ -560,6 +560,7 @@ mod tests {
             surfaces: Vec::new(),
             runnable_entrypoints: Vec::new(),
             navigation: Vec::new(),
+            events: crate::HubPackageEvents::default(),
         }
     }
 

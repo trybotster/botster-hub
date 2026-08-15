@@ -3,6 +3,7 @@
 //! This module intentionally exposes a narrow ABI: plugin registration,
 //! handler invocation by stable id, and selected hub capability helpers.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
@@ -10,7 +11,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use botster_core::{
     BoundaryJson, CapabilityOperation, CapabilityOperationId, CapabilityRuntimeErrorKind,
@@ -29,8 +30,23 @@ use serde_json::json;
 
 use crate::capabilities::{HubCapabilityRuntime, PluginStoreBatchMutation, PluginStoreBatchResult};
 use crate::lifecycle::{HubPluginEventHandler, HubPluginRuntimeBundle, package_entity_owner_token};
+use crate::package_event_router::{
+    CausalScopeTable, EventPlaneStatus, EventSubscription, LeaseIdentity, PackageEventRouter,
+};
 use crate::packages::{PackageConfigurationView, PackageRecord, PreparedLocalPackage};
 use crate::runtime::{SharedSessionTypeSpawner, SharedSpawnTargets, SharedWorktrees};
+
+thread_local! {
+    static INVOCATION_CAUSAL_SCOPE: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+pub(crate) fn current_causal_scope() -> Option<u64> {
+    INVOCATION_CAUSAL_SCOPE.with(Cell::get)
+}
+
+fn set_current_causal_scope(scope_id: Option<u64>) {
+    INVOCATION_CAUSAL_SCOPE.with(|cell| cell.set(scope_id));
+}
 use crate::session_types::{
     ManagedSessionTypeRequest, SessionTypeContextInput, SessionTypeRequest,
 };
@@ -218,6 +234,8 @@ struct LuaHostApi {
     spawn_targets: SharedSpawnTargets,
     worktrees: SharedWorktrees,
     package_records: Vec<PackageRecord>,
+    package_event_router: Arc<PackageEventRouter>,
+    causal_scopes: Arc<CausalScopeTable>,
 }
 
 /// Shared hub-owned primitives exposed to one Lua plugin runtime.
@@ -229,6 +247,8 @@ pub struct LuaPluginHostApi {
     pub session_types: SharedSessionTypeSpawner,
     pub spawn_targets: SharedSpawnTargets,
     pub worktrees: SharedWorktrees,
+    pub package_event_router: Arc<PackageEventRouter>,
+    pub causal_scopes: Arc<CausalScopeTable>,
 }
 
 /// Real Lua runtime for one loaded plugin package.
@@ -261,6 +281,8 @@ impl LuaPluginRuntime {
             spawn_targets: api.spawn_targets,
             worktrees: api.worktrees,
             package_records,
+            package_event_router: api.package_event_router,
+            causal_scopes: api.causal_scopes,
         };
         let loaded = LoadedLuaPlugin::load(plugin_key.clone(), selected_entrypoint_path, host_api)?;
         Ok(HubPluginRuntimeBundle {
@@ -385,7 +407,14 @@ impl PluginRuntime for LuaPluginRuntime {
             }
         };
 
-        match function.call::<Value>(payload) {
+        let scope_id = request
+            .context
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.0.get("causal_scope_id"))
+            .and_then(serde_json::Value::as_u64);
+        set_current_causal_scope(scope_id);
+        let outcome = match function.call::<Value>(payload) {
             Ok(Value::Nil) => PluginInvocationResult::Completed(PluginInvocationSuccess {
                 request_id: request.request_id,
                 handler: request.handler,
@@ -408,7 +437,9 @@ impl PluginRuntime for LuaPluginRuntime {
                 PluginInvocationFailureKind::HandlerFailed,
                 sanitize_lua_error(error),
             ),
-        }
+        };
+        set_current_causal_scope(None);
+        outcome
     }
 
     fn stop(&self, _plugin_key: &PluginKey) {
@@ -541,7 +572,14 @@ impl LoadedLuaPlugin {
                         "event handlers require a non-empty event name".to_string(),
                     ));
                 }
+                let event_owner = handler.event_owner.unwrap_or_default();
+                if event_owner.trim().is_empty() {
+                    return Err(LuaPluginRuntimeError::Lua(
+                        EventPlaneStatus::RejectedInvalid.as_str().to_string(),
+                    ));
+                }
                 event_handlers.push(HubPluginEventHandler {
+                    event_owner,
                     event_name,
                     handler: handler_ref.clone(),
                 });
@@ -610,6 +648,7 @@ struct LuaHandlerRegistration {
     id: String,
     kind: PluginHandlerKind,
     descriptor_id: String,
+    event_owner: Option<String>,
     event_name: Option<String>,
     body: serde_json::Value,
 }
@@ -633,32 +672,83 @@ fn install_botster_api(
     globals.set("package", Value::Nil)?;
 
     let events = lua.create_table()?;
+    let subscribe_router = host_api.package_event_router.clone();
+    let subscribe_plugin = plugin_key.clone();
     events.set(
         "on",
-        lua.create_function(|lua, (event_name, handler): (String, Function)| {
-            if event_name.trim().is_empty() {
-                return Err(mlua::Error::RuntimeError(
-                    "events.on requires a non-empty event name".to_string(),
-                ));
-            }
-            let registration = lua.globals().get::<Table>("__botster_registration")?;
-            let handler_table: Table = match registration.get("handlers") {
-                Ok(handler_table) => handler_table,
-                Err(_) => {
-                    let handler_table = lua.create_table()?;
-                    registration.set("handlers", handler_table.clone())?;
-                    handler_table
+        lua.create_function(
+            move |lua, (owner, name, handler): (Value, Value, Option<Value>)| {
+                let (Value::String(owner), Value::String(name), Some(Value::Function(handler))) =
+                    (owner, name, handler)
+                else {
+                    return Err(mlua::Error::RuntimeError(
+                        EventPlaneStatus::RejectedInvalid.as_str().to_string(),
+                    ));
+                };
+                let owner = owner.to_str()?.to_string();
+                let name = name.to_str()?.to_string();
+                if owner.trim().is_empty()
+                    || name.trim().is_empty()
+                    || owner.contains('*')
+                    || name.contains('*')
+                    || owner.contains('?')
+                    || name.contains('?')
+                {
+                    return Err(mlua::Error::RuntimeError(
+                        EventPlaneStatus::RejectedWildcard.as_str().to_string(),
+                    ));
                 }
-            };
-            let handler_id = format!("event:{event_name}:{}", handler_table.raw_len() + 1);
-            let handlers = lua.globals().get::<Table>("__botster_handlers")?;
-            handlers.set(handler_id.clone(), handler)?;
-            let entry = lua.create_table()?;
-            entry.set("id", handler_id)?;
-            entry.set("kind", "event")?;
-            entry.set("event", event_name)?;
-            handler_table.set(handler_table.raw_len() + 1, entry)?;
-            Ok(())
+                let session_family = owner == "hub" && name == "session_family";
+                let registration = lua.globals().get::<Table>("__botster_registration")?;
+                let handler_table: Table = match registration.get("handlers") {
+                    Ok(handler_table) => handler_table,
+                    Err(_) => {
+                        let handler_table = lua.create_table()?;
+                        registration.set("handlers", handler_table.clone())?;
+                        handler_table
+                    }
+                };
+                let handler_id = format!("event:{owner}:{name}:{}", handler_table.raw_len() + 1);
+                if !session_family {
+                    let status = subscribe_router.try_subscribe(EventSubscription {
+                        plugin_key: subscribe_plugin.0.clone(),
+                        owner: owner.clone(),
+                        name: name.clone(),
+                        handler_id: handler_id.clone(),
+                        generation: subscribe_router.next_holder_generation(),
+                    });
+                    if status != EventPlaneStatus::Accepted {
+                        return Err(mlua::Error::RuntimeError(status.as_str().to_string()));
+                    }
+                }
+                let handlers = lua.globals().get::<Table>("__botster_handlers")?;
+                handlers.set(handler_id.clone(), handler)?;
+                let entry = lua.create_table()?;
+                entry.set("id", handler_id)?;
+                entry.set("kind", "event")?;
+                entry.set("event_owner", owner)?;
+                entry.set("event", name)?;
+                handler_table.set(handler_table.raw_len() + 1, entry)?;
+                Ok(())
+            },
+        )?,
+    )?;
+    let emit_router = host_api.package_event_router.clone();
+    let emit_plugin = plugin_key.clone();
+    let emit_scopes = host_api.causal_scopes.clone();
+    events.set(
+        "emit",
+        lua.create_function(move |lua, (name, payload): (String, Value)| {
+            if let Some(scope_id) = current_causal_scope()
+                && emit_scopes.is_live(scope_id)
+            {
+                return lua.to_value(&json!({
+                    "status": EventPlaneStatus::RejectedCausalScope.as_str(),
+                }));
+            }
+            let payload = lua.from_value::<serde_json::Value>(payload)?;
+            let status = emit_router.try_ingress(&emit_plugin.0, &name, &payload, Instant::now());
+            lua.to_value(&json!({ "status": status.as_str() }))
         })?,
     )?;
     globals.set("__botster_registration", lua.create_table()?)?;
@@ -771,7 +861,12 @@ fn install_botster_api(
     )?;
     botster.set(
         "entity_publish",
-        entity_publish_function(lua, plugin_key, host_api.entity_publish)?,
+        entity_publish_function(
+            lua,
+            plugin_key,
+            host_api.entity_publish,
+            host_api.causal_scopes,
+        )?,
     )?;
     globals.set("botster", botster)?;
     Ok(())
@@ -781,9 +876,18 @@ fn entity_publish_function(
     lua: &Lua,
     plugin_key: PluginKey,
     bridge: HubEntityPublishBridge,
+    scopes: Arc<CausalScopeTable>,
 ) -> Result<Function, mlua::Error> {
     lua.create_function(move |lua, args: Value| {
         let value = lua.from_value::<serde_json::Value>(args)?;
+        if let Some(scope_id) = current_causal_scope() {
+            let _ = scopes.acquire(
+                scope_id,
+                LeaseIdentity::PendingEntityPublish {
+                    plugin_key: plugin_key.0.clone(),
+                },
+            );
+        }
         let result = bridge
             .publish(plugin_key.clone(), value)
             .map_err(mlua::Error::RuntimeError)?;
@@ -1505,6 +1609,10 @@ fn registration_from_value(
                     .get("descriptor_id")
                     .or_else(|_| handler.get("id"))
                     .map_err(LuaPluginRuntimeError::from)?,
+                event_owner: handler
+                    .get::<Option<String>>("event_owner")
+                    .map_err(LuaPluginRuntimeError::from)?
+                    .or_else(|| handler.get::<Option<String>>("owner").ok().flatten()),
                 event_name: handler
                     .get::<Option<String>>("event")
                     .map_err(LuaPluginRuntimeError::from)?

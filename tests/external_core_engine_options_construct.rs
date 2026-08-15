@@ -39,6 +39,7 @@ fn external_crate_constructs_hub_startup_options_with_prior_exhaustive_literal()
         provider_directories: DirectoryList::default(),
         transports: TransportBindings::default(),
         core_engine: CoreEngineOptions::default(),
+        package_event_plane: botster_hub::PackageEventPlaneOptions::default(),
     };
     assert_eq!(
         options.core_engine.plugin_worker_queue_capacity,
@@ -64,6 +65,7 @@ fn external_crate_constructs_hub_config_with_prior_exhaustive_literal() {
         provider_directories: DirectoryList::default(),
         transports: TransportBindings::default(),
         core_engine: CoreEngineOptions::default(),
+        package_event_plane: botster_hub::PackageEventPlaneOptions::default(),
     }
     .build_config_for_environment(&botster_hub::RuntimeEnvironment::from_values(None, None))
     .expect("build config");
@@ -75,6 +77,7 @@ fn external_crate_constructs_hub_config_with_prior_exhaustive_literal() {
         provider_directories: built.provider_directories,
         transports: built.transports,
         core_engine: built.core_engine,
+        package_event_plane: built.package_event_plane,
     };
     assert_eq!(
         config.core_engine.plugin_worker_executor_concurrency,
@@ -104,6 +107,7 @@ fn executor_concurrency_one_is_rejected_at_hub_construction() {
             plugin_worker_executor_concurrency: 1,
             ..CoreEngineOptions::default()
         },
+        package_event_plane: botster_hub::PackageEventPlaneOptions::default(),
     }
     .build_config_for_environment(&botster_hub::RuntimeEnvironment::from_values(None, None))
     .expect_err("concurrency 1 must leave a background slot");

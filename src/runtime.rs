@@ -100,6 +100,9 @@ pub struct HubRuntime {
     package_entity_fanout: Arc<Mutex<VecDeque<PackageEntityMutation>>>,
     last_capability_cleanup: Option<PluginCleanupResult>,
     session_contexts: SharedSessionContexts,
+    package_event_router: Arc<crate::package_event_router::PackageEventRouter>,
+    causal_scopes: Arc<crate::package_event_router::CausalScopeTable>,
+    event_plane_owner_ops: std::cell::RefCell<crate::package_event_router::EventPlaneOwnerOps>,
 }
 
 type SharedCoreDaemon = Mutex<CoreDaemon>;
@@ -233,6 +236,9 @@ impl HubRuntime {
         let core_config = core_daemon_config(&config);
         let plugin_worker_config = config.plugin_worker_config();
         let core_daemon = Mutex::new(CoreDaemon::new(core_config));
+        let package_event_router = Arc::new(crate::package_event_router::PackageEventRouter::new(
+            config.package_event_plane,
+        ));
         Self {
             capability_runtime: Arc::new(Mutex::new(HubCapabilityRuntime::from_config(&config))),
             spawn_targets: Arc::new(Mutex::new(state.spawn_targets.clone())),
@@ -251,6 +257,11 @@ impl HubRuntime {
             plugin_lifecycle: HubPluginLifecycle::with_config(plugin_worker_config),
             last_capability_cleanup: None,
             session_contexts: Arc::new(Mutex::new(BTreeMap::new())),
+            package_event_router,
+            causal_scopes: Arc::new(crate::package_event_router::CausalScopeTable::new()),
+            event_plane_owner_ops: std::cell::RefCell::new(
+                crate::package_event_router::EventPlaneOwnerOps::default(),
+            ),
         }
     }
 
@@ -308,6 +319,9 @@ impl HubRuntime {
         let core_config = core_daemon_config(&config);
         let plugin_worker_config = config.plugin_worker_config();
         let core_daemon = Mutex::new(CoreDaemon::new(core_config));
+        let package_event_router = Arc::new(crate::package_event_router::PackageEventRouter::new(
+            config.package_event_plane,
+        ));
         let mut runtime = Self {
             capability_runtime: Arc::new(Mutex::new(HubCapabilityRuntime::from_config(&config))),
             spawn_targets: Arc::new(Mutex::new(state.spawn_targets.clone())),
@@ -326,6 +340,11 @@ impl HubRuntime {
             plugin_lifecycle: HubPluginLifecycle::with_config(plugin_worker_config),
             last_capability_cleanup: None,
             session_contexts: Arc::new(Mutex::new(BTreeMap::new())),
+            package_event_router,
+            causal_scopes: Arc::new(crate::package_event_router::CausalScopeTable::new()),
+            event_plane_owner_ops: std::cell::RefCell::new(
+                crate::package_event_router::EventPlaneOwnerOps::default(),
+            ),
         };
         runtime.reconcile_sessions(0)?;
         Ok(runtime)
@@ -424,7 +443,38 @@ impl HubRuntime {
             session_types: self.session_type_spawner.clone(),
             spawn_targets: self.spawn_targets.clone(),
             worktrees: self.worktrees.clone(),
+            package_event_router: self.package_event_router.clone(),
+            causal_scopes: self.causal_scopes.clone(),
         }
+    }
+
+    #[must_use]
+    pub fn package_event_router(&self) -> &Arc<crate::package_event_router::PackageEventRouter> {
+        &self.package_event_router
+    }
+
+    #[must_use]
+    pub fn causal_scopes(&self) -> &Arc<crate::package_event_router::CausalScopeTable> {
+        &self.causal_scopes
+    }
+
+    pub fn record_event_plane_owner_op(&self, op: crate::package_event_router::OwnerOp) {
+        self.event_plane_owner_ops.borrow_mut().record(op);
+        let _ = self
+            .event_plane_owner_ops
+            .borrow_mut()
+            .apply_ready(&self.package_event_router);
+    }
+
+    #[must_use]
+    pub fn event_plane_owner_ops_pending(&self) -> bool {
+        !self.event_plane_owner_ops.borrow().is_empty()
+    }
+
+    pub fn apply_event_plane_owner_ops(&self) -> Vec<crate::package_event_router::OwnerOp> {
+        self.event_plane_owner_ops
+            .borrow_mut()
+            .apply_ready(&self.package_event_router)
     }
 
     /// Return the startup reconciliation decisions made against the core daemon registry.
@@ -457,6 +507,11 @@ impl HubRuntime {
             .package(package_name)
             .map(|record| record.configuration_view())
             .expect("prepared local package must have a registry record");
+        if let Some(record) = registry.package(package_name)
+            && let Ok(contracts) = record.manifest.compiled_event_contracts()
+        {
+            let _ = self.package_event_router.try_register_contracts(contracts);
+        }
         let bundle = LuaPluginRuntime::load_prepared(
             &prepared,
             configuration,
@@ -482,6 +537,11 @@ impl HubRuntime {
             .package(package_name)
             .map(|record| record.configuration_view())
             .expect("prepared local package must have a registry record");
+        if let Some(record) = registry.package(package_name)
+            && let Ok(contracts) = record.manifest.compiled_event_contracts()
+        {
+            let _ = self.package_event_router.try_register_contracts(contracts);
+        }
         let bundle = LuaPluginRuntime::load_prepared(
             &prepared,
             configuration,
@@ -545,38 +605,6 @@ impl HubRuntime {
                 }
             }
         }
-    }
-
-    /// Emit a hub lifecycle event to matching plugin event handlers.
-    #[must_use]
-    pub fn emit_plugin_event(
-        &self,
-        event_name: &str,
-        payload: serde_json::Value,
-    ) -> Vec<PluginInvocationOutcome> {
-        self.plugin_lifecycle
-            .event_handlers_for(event_name)
-            .into_iter()
-            .map(|event_handler| {
-                self.invoke_plugin(PluginInvocationRequest {
-                    request_id: RequestId(format!(
-                        "plugin-event-{}-{}",
-                        event_name, event_handler.handler.plugin_key.0
-                    )),
-                    handler: event_handler.handler,
-                    timeout_ms: PLUGIN_EVENT_TIMEOUT_MS,
-                    context: botster_core::PluginInvocationContext {
-                        client_id: None,
-                        session_id: None,
-                        subscription_id: None,
-                        surface_id: None,
-                        origin: Some("hub-worktree-lifecycle".to_string()),
-                        metadata: None,
-                    },
-                    payload: BoundaryJson(payload.clone()),
-                })
-            })
-            .collect()
     }
 
     /// Reload an enabled package through core plugin worker cleanup and replacement.
@@ -1843,6 +1871,122 @@ impl HubRuntime {
             .lock()
             .expect("core daemon mutex")
             .lifecycle_changes_page(after, max_changes, max_bytes)
+    }
+
+    /// Admit ready package-event deliveries and wait for completions.
+    ///
+    /// Production delivery uses the owner-loop `PackageEventDelivery` slice.
+    /// Tests use this helper when they do not own that loop.
+    pub fn drive_package_events_for_test(&self) -> Vec<botster_core::PluginCompletion> {
+        use std::time::{Duration, Instant};
+
+        use botster_core::{
+            PluginAdmissionResult, PluginInvocationClass, PluginInvocationContext,
+            PluginInvocationResult,
+        };
+
+        let batch = self
+            .package_event_router
+            .pull_ready_batch(16, 64 * 1024, Instant::now(), Duration::from_millis(20))
+            .unwrap_or_default();
+        let mut waiting = Vec::new();
+        for delivery in batch {
+            let Some(handler) = self.package_event_handler(
+                &delivery.holder.plugin_key,
+                &delivery.owner,
+                &delivery.name,
+                &delivery.holder.handler_id,
+            ) else {
+                let _ = self.package_event_router.retire_holder(
+                    delivery.envelope_id,
+                    &delivery.holder.plugin_key,
+                    delivery.holder.generation,
+                );
+                continue;
+            };
+            let request_id = RequestId(format!(
+                "package-event-test-{}-{}",
+                delivery.name, delivery.envelope_id
+            ));
+            match self.try_admit_plugin(
+                PluginInvocationClass::Background,
+                PluginInvocationRequest {
+                    request_id: request_id.clone(),
+                    handler: handler.handler,
+                    timeout_ms: 1_000,
+                    context: PluginInvocationContext {
+                        client_id: None,
+                        session_id: None,
+                        subscription_id: None,
+                        surface_id: None,
+                        origin: Some("package-event-test".to_string()),
+                        metadata: None,
+                    },
+                    payload: BoundaryJson(delivery.payload_json),
+                },
+            ) {
+                PluginAdmissionResult::Queued { .. } => {
+                    let _ = self.package_event_router.note_admitted(
+                        delivery.envelope_id,
+                        &delivery.holder.plugin_key,
+                        delivery.holder.generation,
+                    );
+                    waiting.push((
+                        request_id.0,
+                        delivery.envelope_id,
+                        delivery.holder.plugin_key,
+                        delivery.holder.generation,
+                    ));
+                }
+                _ => {
+                    let _ = self.package_event_router.retire_holder(
+                        delivery.envelope_id,
+                        &delivery.holder.plugin_key,
+                        delivery.holder.generation,
+                    );
+                }
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut outcomes = Vec::new();
+        while !waiting.is_empty() && Instant::now() < deadline {
+            let drain = self.drain_plugin_completions(16, 64 * 1024);
+            for completion in drain.completions {
+                let request_id = match &completion.result {
+                    PluginInvocationResult::Completed(success) => success.request_id.0.clone(),
+                    PluginInvocationResult::Failed(failure) => failure.request_id.0.clone(),
+                };
+                if let Some(index) = waiting
+                    .iter()
+                    .position(|(waiting_id, _, _, _)| waiting_id == &request_id)
+                {
+                    let (_, envelope_id, plugin_key, generation) = waiting.remove(index);
+                    let _ = self.package_event_router.retire_holder(
+                        envelope_id,
+                        &plugin_key,
+                        generation,
+                    );
+                    outcomes.push(completion);
+                }
+            }
+            if !waiting.is_empty() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        outcomes
+    }
+
+    /// Look up one exact package-event handler.
+    #[must_use]
+    pub fn package_event_handler(
+        &self,
+        plugin_key: &str,
+        owner: &str,
+        event_name: &str,
+        handler_id: &str,
+    ) -> Option<crate::lifecycle::HubPluginEventHandler> {
+        self.plugin_lifecycle
+            .event_handler_for(plugin_key, owner, event_name, handler_id)
     }
 
     /// Admit one plugin invocation without waiting.
