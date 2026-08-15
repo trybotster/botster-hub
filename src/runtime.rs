@@ -113,6 +113,8 @@ pub struct HubRuntime {
     in_hand: std::cell::RefCell<Option<CausalOp>>,
     retry_ops: std::cell::RefCell<VecDeque<CausalOp>>,
     family_causal: std::cell::RefCell<VecDeque<CausalOp>>,
+    family_held: std::cell::RefCell<Option<CausalOp>>,
+    family_source: std::cell::RefCell<Option<CausalOp>>,
     event_plane_owner_ops: std::cell::RefCell<crate::package_event_router::EventPlaneOwnerOps>,
 }
 
@@ -276,6 +278,8 @@ impl HubRuntime {
             in_hand: std::cell::RefCell::new(None),
             retry_ops: std::cell::RefCell::new(VecDeque::new()),
             family_causal: std::cell::RefCell::new(VecDeque::new()),
+            family_held: std::cell::RefCell::new(None),
+            family_source: std::cell::RefCell::new(None),
             event_plane_owner_ops: std::cell::RefCell::new(
                 crate::package_event_router::EventPlaneOwnerOps::default(),
             ),
@@ -365,6 +369,8 @@ impl HubRuntime {
             in_hand: std::cell::RefCell::new(None),
             retry_ops: std::cell::RefCell::new(VecDeque::new()),
             family_causal: std::cell::RefCell::new(VecDeque::new()),
+            family_held: std::cell::RefCell::new(None),
+            family_source: std::cell::RefCell::new(None),
             event_plane_owner_ops: std::cell::RefCell::new(
                 crate::package_event_router::EventPlaneOwnerOps::default(),
             ),
@@ -513,7 +519,9 @@ impl HubRuntime {
             || self.in_hand.borrow().is_some()
             || !self.retry_ops.borrow().is_empty()
             || !self.family_causal.borrow().is_empty()
-            || self.has_family_source_ops()
+            || self.family_held.borrow().is_some()
+            || self.family_source.borrow().is_some()
+            || self.has_unloading_families()
     }
 
     pub fn apply_event_plane_owner_ops(&self) -> Vec<crate::package_event_router::OwnerOp> {
@@ -711,14 +719,10 @@ impl HubRuntime {
         self.retry_ops.borrow_mut().append(&mut leftover);
     }
 
-    fn has_family_source_ops(&self) -> bool {
+    fn has_unloading_families(&self) -> bool {
         self.package_entity_families
             .lock()
-            .map(|families| {
-                families
-                    .values()
-                    .any(|family| family.unloading || family.held_causal.is_some())
-            })
+            .map(|families| families.values().any(|family| family.unloading))
             .unwrap_or(false)
     }
 
@@ -732,27 +736,52 @@ impl HubRuntime {
         }
     }
 
-    fn keep_on_family(family: &mut PackageEntityFamilyState, op: CausalOp) -> CausalAdmitResult {
-        if family.held_causal.is_none() {
-            family.held_causal = Some(op);
+    fn hold_family(&self, op: CausalOp) -> CausalAdmitResult {
+        let mut held = self.family_held.borrow_mut();
+        if held.is_none() {
+            *held = Some(op);
             CausalAdmitResult::Applied
         } else {
             CausalAdmitResult::Retry(op)
         }
     }
 
-    fn restore_family_source(&self, family: &str, op: CausalOp) -> CausalAdmitResult {
-        let Ok(mut state) = self.package_entity_families.lock() else {
-            return CausalAdmitResult::Retry(op);
-        };
-        Self::keep_on_family(state.entry(family.to_string()).or_default(), op)
+    fn hold_source(&self, op: CausalOp) -> CausalAdmitResult {
+        let mut source = self.family_source.borrow_mut();
+        if source.is_none() {
+            *source = Some(op);
+            CausalAdmitResult::Applied
+        } else {
+            CausalAdmitResult::Retry(op)
+        }
     }
 
     fn enqueue_or_family(&self, result: CausalAdmitResult) -> CausalAdmitResult {
-        if let CausalAdmitResult::Retry(op) = self.enqueue_retry(result) {
-            return self.park_on_family(op);
+        if let CausalAdmitResult::Retry(op) = self.enqueue_retry(result)
+            && let CausalAdmitResult::Retry(op) = self.park_on_family(op)
+            && let CausalAdmitResult::Retry(op) = self.hold_family(op)
+        {
+            return self.hold_source(op);
         }
         CausalAdmitResult::Applied
+    }
+
+    fn retry_one_held(
+        &self,
+        slot: &std::cell::RefCell<Option<CausalOp>>,
+        applied: &mut usize,
+        started: Instant,
+    ) {
+        if *applied >= CAUSAL_FLUSH_MAX || started.elapsed() >= Duration::from_millis(8) {
+            return;
+        }
+        let Some(op) = slot.borrow_mut().take() else {
+            return;
+        };
+        match self.enqueue_retry(CausalAdmitResult::Retry(op)) {
+            CausalAdmitResult::Applied => *applied += 1,
+            CausalAdmitResult::Retry(op) => *slot.borrow_mut() = Some(op),
+        }
     }
 
     fn retry_family_causal(&self) {
@@ -776,6 +805,8 @@ impl HubRuntime {
             }
         }
         self.family_causal.borrow_mut().append(&mut leftover);
+        self.retry_one_held(&self.family_held, &mut applied, started);
+        self.retry_one_held(&self.family_source, &mut applied, started);
     }
 
     fn retry_unloading_families(&self) {
@@ -784,29 +815,27 @@ impl HubRuntime {
         let Ok(mut state) = self.package_entity_families.lock() else {
             return;
         };
-        let names: Vec<String> = state
-            .iter()
-            .filter(|(_, family)| family.unloading || family.held_causal.is_some())
-            .map(|(name, _)| name.clone())
-            .collect();
+        let mut names = Vec::new();
+        for (name, family) in state.iter() {
+            if applied >= CAUSAL_FLUSH_MAX || started.elapsed() >= Duration::from_millis(8) {
+                break;
+            }
+            if !family.unloading {
+                continue;
+            }
+            names.push(name.clone());
+            if names.len() >= CAUSAL_FLUSH_MAX {
+                break;
+            }
+        }
+        let mut remove = Vec::new();
         for name in names {
             if applied >= CAUSAL_FLUSH_MAX || started.elapsed() >= Duration::from_millis(8) {
                 break;
             }
-            let Some(mut family) = state.remove(&name) else {
+            let Some(family) = state.get_mut(&name) else {
                 continue;
             };
-            if let Some(op) = family.held_causal.take() {
-                if applied >= CAUSAL_FLUSH_MAX || started.elapsed() >= Duration::from_millis(8) {
-                    family.held_causal = Some(op);
-                    state.insert(name, family);
-                    break;
-                }
-                match self.enqueue_retry(CausalAdmitResult::Retry(op)) {
-                    CausalAdmitResult::Applied => applied += 1,
-                    CausalAdmitResult::Retry(op) => family.held_causal = Some(op),
-                }
-            }
             let mut pending_leases = std::mem::take(&mut family.pending_leases);
             let mut leftover = BTreeMap::new();
             loop {
@@ -838,12 +867,15 @@ impl HubRuntime {
                     family.remember_resync_lease(scope_id, family_name);
                 }
             }
-            if !family.pending_leases.is_empty()
-                || !family.resync.leases.is_empty()
-                || family.held_causal.is_some()
+            if family.unloading
+                && family.pending_leases.is_empty()
+                && family.resync.leases.is_empty()
             {
-                state.insert(name, family);
+                remove.push(name);
             }
+        }
+        for name in remove {
+            state.remove(&name);
         }
     }
 
@@ -941,11 +973,8 @@ impl HubRuntime {
     }
 
     #[doc(hidden)]
-    pub fn test_enqueue_or_family(&self, family: &str, op: CausalOp) -> CausalAdmitResult {
-        if let CausalAdmitResult::Retry(op) = self.enqueue_or_family(CausalAdmitResult::Retry(op)) {
-            return self.restore_family_source(family, op);
-        }
-        CausalAdmitResult::Applied
+    pub fn test_enqueue_or_family(&self, _family: &str, op: CausalOp) -> CausalAdmitResult {
+        self.enqueue_or_family(CausalAdmitResult::Retry(op))
     }
 
     #[doc(hidden)]
@@ -961,27 +990,77 @@ impl HubRuntime {
 
     #[must_use]
     #[doc(hidden)]
-    pub fn test_family_held(&self, family: &str) -> bool {
-        self.package_entity_families
-            .lock()
-            .expect("package entity family lock")
-            .get(family)
-            .is_some_and(|state| state.held_causal.is_some())
-    }
-
-    #[doc(hidden)]
-    pub fn test_restore_family_source(&self, family: &str, op: CausalOp) -> CausalAdmitResult {
-        self.restore_family_source(family, op)
+    pub fn test_family_held(&self) -> bool {
+        self.family_held.borrow().is_some()
     }
 
     #[must_use]
     #[doc(hidden)]
-    pub fn test_held_family_count(&self) -> usize {
+    pub fn test_family_source(&self) -> bool {
+        self.family_source.borrow().is_some()
+    }
+
+    #[doc(hidden)]
+    pub fn test_hold_family(&self, op: CausalOp) -> CausalAdmitResult {
+        self.hold_family(op)
+    }
+
+    #[doc(hidden)]
+    pub fn test_hold_source(&self, op: CausalOp) -> CausalAdmitResult {
+        self.hold_source(op)
+    }
+
+    #[must_use]
+    #[doc(hidden)]
+    pub fn test_family_seq(&self, family: &str) -> u64 {
+        self.package_entity_families
+            .lock()
+            .expect("package entity family lock")
+            .get(family)
+            .map(|state| state.last_accepted_seq)
+            .unwrap_or(0)
+    }
+
+    #[doc(hidden)]
+    pub fn test_set_family_seq(&self, family: &str, seq: u64) {
+        let mut state = self
+            .package_entity_families
+            .lock()
+            .expect("package entity family lock");
+        let entry = state.entry(family.to_string()).or_default();
+        entry.last_accepted_seq = seq;
+        entry.high_water_seq = seq;
+    }
+
+    #[must_use]
+    #[doc(hidden)]
+    pub fn test_family_exists(&self, family: &str) -> bool {
+        self.package_entity_families
+            .lock()
+            .expect("package entity family lock")
+            .contains_key(family)
+    }
+
+    #[doc(hidden)]
+    pub fn test_mark_unloading(&self, family: &str) {
+        if let Some(family) = self
+            .package_entity_families
+            .lock()
+            .expect("package entity family lock")
+            .get_mut(family)
+        {
+            family.unloading = true;
+        }
+    }
+
+    #[must_use]
+    #[doc(hidden)]
+    pub fn test_unloading_family_count(&self) -> usize {
         self.package_entity_families
             .lock()
             .expect("package entity family lock")
             .values()
-            .filter(|family| family.held_causal.is_some())
+            .filter(|family| family.unloading)
             .count()
     }
 
@@ -1801,12 +1880,8 @@ impl HubRuntime {
             && result.is_err()
             && let CausalAdmitResult::Retry(op) =
                 release_or_retract(&self.causal_scopes, scope_id, pending_identity)
-            && let CausalAdmitResult::Retry(op) =
-                self.enqueue_or_family(CausalAdmitResult::Retry(op))
-            && let CausalAdmitResult::Retry(_op) = self.restore_family_source(&plugin_key.0, op)
         {
-            // Family source already holds one overflow. The lease stays on the
-            // scope until a later retract after other leftovers drain.
+            let _ = self.enqueue_or_family(CausalAdmitResult::Retry(op));
         }
         result
     }
@@ -1928,19 +2003,14 @@ impl HubRuntime {
         mutation_seq: u64,
         result: &PackageEntityPublishResult,
     ) {
-        if let CausalAdmitResult::Retry(op) =
-            self.enqueue_or_family(self.admit_causal_op(settle_entity_publish_op(
-                family,
-                scope_id,
-                plugin_key,
-                entity_type,
-                mutation_seq,
-                result,
-            )))
-            && let CausalAdmitResult::Retry(_op) = Self::keep_on_family(family, op)
-        {
-            // Source already holds one overflow. The lease stays on the scope.
-        }
+        let _ = self.enqueue_or_family(self.admit_causal_op(settle_entity_publish_op(
+            family,
+            scope_id,
+            plugin_key,
+            entity_type,
+            mutation_seq,
+            result,
+        )));
     }
 
     fn release_resync_leases(&self, leases: BTreeSet<(u64, String)>) -> BTreeSet<(u64, String)> {
@@ -2194,10 +2264,7 @@ impl HubRuntime {
                 for (scope_id, name) in self.release_resync_leases(family.take_resync_leases()) {
                     family.remember_resync_lease(scope_id, name);
                 }
-                if !family.pending_leases.is_empty()
-                    || !family.resync.leases.is_empty()
-                    || family.held_causal.is_some()
-                {
+                if !family.pending_leases.is_empty() || !family.resync.leases.is_empty() {
                     family.unloading = true;
                     state.insert(family_name.clone(), family);
                 }
@@ -2252,7 +2319,11 @@ impl HubRuntime {
         if self.package_entity_resync_still_needed() {
             return true;
         }
-        if self.has_family_source_ops() || !self.family_causal.borrow().is_empty() {
+        if self.has_unloading_families()
+            || !self.family_causal.borrow().is_empty()
+            || self.family_held.borrow().is_some()
+            || self.family_source.borrow().is_some()
+        {
             return true;
         }
         !self
@@ -2599,17 +2670,13 @@ impl HubRuntime {
                 "subscription_id": subscription_id,
             })),
         });
-        if let Some(scope_id) = scope_id
-            && let CausalAdmitResult::Retry(op) =
-                self.enqueue_or_family(self.admit_causal_op(CausalOp::Release {
-                    scope_id,
-                    identity: crate::package_event_router::LeaseIdentity::ProviderInFlight {
-                        request_id: request_id.0.clone(),
-                    },
-                }))
-            && let CausalAdmitResult::Retry(_op) = self.restore_family_source(entity_type, op)
-        {
-            // Source already holds one overflow. The lease stays on the scope.
+        if let Some(scope_id) = scope_id {
+            let _ = self.enqueue_or_family(self.admit_causal_op(CausalOp::Release {
+                scope_id,
+                identity: crate::package_event_router::LeaseIdentity::ProviderInFlight {
+                    request_id: request_id.0.clone(),
+                },
+            }));
         }
         let value = completed_plugin_payload(outcome.result, "plugin entity provider")?;
         let value = coerce_entity_frame_empty_items(value);
