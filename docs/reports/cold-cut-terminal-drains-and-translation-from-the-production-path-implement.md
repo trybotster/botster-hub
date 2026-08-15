@@ -14,7 +14,7 @@ Plan: `docs/plans/cold-cut-terminal-drains-and-translation-from-the-production-p
 | Worktree HEAD before edits | `959c58f55726d098299cced8af151d8f496f41e3` |
 | Locked Core SHA | `aef6516d5809d563961ed7fdd07da29a7b4edddc` |
 | Merge policy | direct into `main`; no PR |
-| Review follow-up | `review_1786829214_495930` on `7d41db7` |
+| Review follow-up | `review_1786830072_881433` on `899bb58` |
 
 Independent routing matched the approved plan. This run did not infer the repository from the ambient directory.
 
@@ -67,7 +67,7 @@ Not loaded: [[project-pipelines-playbook]] (package/plugin paths out of scope).
 - `packages/hub-test-support/**` (0.1.37 / revision 42, regenerated)
 - `README.md`, `docs/client-protocol.md`
 - Tests under `tests/hub_client_api_test.rs`, `tests/hub_local_runtime_test.rs`, `tests/hub_daemon_lifecycle/*`
-- Plan and this report (Review follow-up on `review_1786829214_495930`)
+- Plan and this report (Review follow-up on `review_1786830072_881433`)
 
 ## Ownership boundaries preserved
 
@@ -242,6 +242,17 @@ This visit:
 - Cleanup no longer reads child PIDs. It shuts down each tracked session, then calls `HubRuntime::shutdown_core_for_test` (`CoreDaemon::shutdown(None)`).
 - A bounded barrier waits until no `botster-session-worker` process holds this runtime's Core control-socket directory (`bcd-<hash>`). SIGKILL is used only after that wait, and only when the live command line still names that worker and socket directory.
 - Required sequence with no manual delay: pass (5.00s), ablation fail (exit 101), immediate restore pass (5.07s), second pass (5.07s), 0 leftover worktree workers.
+
+Review `review_1786830072_881433` required one follow-up on `899bb58`:
+
+- `finding_1786830072_259933` — Hub copied Core's private `worker_socket_dir` hash and scanned `ps`. Immediate restored runs still failed at `spawn aaa-00` under Review.
+
+This visit:
+
+- Removed the private `bcd-<hash>` copy, process scan, and SIGKILL path.
+- The reset proof now uses five sessions and a test-only page-row limit of 2 on `SessionLifecycleWalk`. Production still pages 32 rows. The walk limit is `cfg(test)` only and survives `reset()`.
+- Cleanup shuts down owned sessions through `HubRuntime::shutdown_session` and `shutdown_core_for_test`. Drop then waits until a fresh exported Hub spawn succeeds.
+- Required sequence with no manual delay: pass (2.35s), ablation fail (exit 101), immediate restore pass (2.34s), second pass (2.31s).
 
 ## Runtime-teardown lenses
 

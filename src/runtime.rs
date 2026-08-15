@@ -2015,11 +2015,19 @@ pub(crate) struct SessionLifecycleWalk {
     after: Option<SessionId>,
     resyncs: usize,
     stalls: usize,
+    #[cfg(test)]
+    page_row_limit: Option<usize>,
 }
 
 impl SessionLifecycleWalk {
     pub(crate) fn reset(&mut self) {
+        #[cfg(test)]
+        let page_row_limit = self.page_row_limit;
         *self = Self::default();
+        #[cfg(test)]
+        {
+            self.page_row_limit = page_row_limit;
+        }
     }
 
     #[cfg(test)]
@@ -2034,16 +2042,33 @@ impl SessionLifecycleWalk {
             sequence: 1,
         });
     }
+
+    #[cfg(test)]
+    pub(crate) fn set_page_row_limit(&mut self, max_rows: usize) {
+        self.page_row_limit = Some(max_rows);
+    }
+
+    fn page_row_limit(&self) -> usize {
+        #[cfg(test)]
+        {
+            self.page_row_limit.unwrap_or(32)
+        }
+        #[cfg(not(test))]
+        {
+            32
+        }
+    }
 }
 
 pub(crate) fn shutdown_lifecycle_page_budget(
     remaining: Duration,
+    max_rows: usize,
 ) -> Option<LifecycleBaselineBudget> {
     if remaining.is_zero() {
         return None;
     }
     Some(LifecycleBaselineBudget {
-        max_rows: 32,
+        max_rows,
         max_bytes: 64 * 1024,
         max_elapsed: remaining.min(Duration::from_millis(250)),
     })
@@ -2067,7 +2092,8 @@ impl HubRuntime {
         const MAX_STALLS: usize = 8;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let Some(budget) = shutdown_lifecycle_page_budget(remaining) else {
+            let Some(budget) = shutdown_lifecycle_page_budget(remaining, walk.page_row_limit())
+            else {
                 return SessionRuntimeLifecycleLookup::Incomplete;
             };
             let page = match self.lifecycle_baseline_page(
