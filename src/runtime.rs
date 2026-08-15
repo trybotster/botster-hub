@@ -2008,12 +2008,37 @@ pub(crate) enum SessionRuntimeLifecycleLookup {
 /// Cursor for one ShutdownSession classify walk.
 ///
 /// Retries continue this walk. They do not start a new 1 s scan.
+/// After an Active classify, callers must reset before a later classify.
 #[derive(Debug, Default)]
 pub(crate) struct SessionLifecycleWalk {
     snapshot: Option<SessionLifecycleCursor>,
     after: Option<SessionId>,
     resyncs: usize,
     stalls: usize,
+}
+
+impl SessionLifecycleWalk {
+    pub(crate) fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_holding_snapshot(&self) -> bool {
+        self.snapshot.is_some()
+    }
+}
+
+pub(crate) fn shutdown_lifecycle_page_budget(
+    remaining: Duration,
+) -> Option<LifecycleBaselineBudget> {
+    if remaining.is_zero() {
+        return None;
+    }
+    Some(LifecycleBaselineBudget {
+        max_rows: 32,
+        max_bytes: 64 * 1024,
+        max_elapsed: remaining.min(Duration::from_millis(250)),
+    })
 }
 
 impl HubRuntime {
@@ -2030,18 +2055,12 @@ impl HubRuntime {
         deadline: Instant,
         walk: &mut SessionLifecycleWalk,
     ) -> SessionRuntimeLifecycleLookup {
-        const PAGE_ELAPSED: Duration = Duration::from_millis(250);
         const MAX_RESYNCS: usize = 3;
         const MAX_STALLS: usize = 8;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
+            let Some(budget) = shutdown_lifecycle_page_budget(remaining) else {
                 return SessionRuntimeLifecycleLookup::Incomplete;
-            }
-            let budget = LifecycleBaselineBudget {
-                max_rows: 32,
-                max_bytes: 64 * 1024,
-                max_elapsed: remaining.min(PAGE_ELAPSED),
             };
             let page = match self.lifecycle_baseline_page(
                 walk.snapshot.as_ref(),
