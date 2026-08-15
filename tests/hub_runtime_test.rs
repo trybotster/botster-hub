@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use botster_core::{
     ClientId, CoreSessionMetadata, CredentialRecord, CredentialStore, CredentialStoreError,
     ModeFlags, RequestId, ResizePayload, SessionId, SessionLifecycleState, SessionSpawnRequest,
-    SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId, TransportEgress,
+    SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId,
 };
 use botster_core_daemon::{
     GuardedWriteDecision, GuardedWriteDeliveryState, GuardedWriteRequest, ReadinessEvidence,
@@ -116,9 +116,9 @@ impl CredentialStore for UnavailableCredentialStore {
 
 fn drain_until(
     runtime: &mut HubRuntime,
-    client_id: &ClientId,
+    _client_id: &ClientId,
     session_id: &SessionId,
-    subscription_id: &SubscriptionId,
+    _subscription_id: &SubscriptionId,
     needle: &[u8],
     logical_clock: &mut u64,
 ) -> Vec<u8> {
@@ -126,23 +126,16 @@ fn drain_until(
     let mut observed = Vec::new();
 
     while Instant::now() < deadline {
-        let output = runtime
-            .drain_subscription(client_id, session_id, subscription_id, *logical_clock)
-            .expect("drain subscription through core daemon");
+        let _ = runtime.observe_lifecycle_slice(
+            *logical_clock,
+            None,
+            botster_core_daemon::ObserveLifecycleBudget {
+                max_sessions: 32,
+                max_encoded_result_bytes: 64 * 1024,
+                max_elapsed: Duration::from_millis(25),
+            },
+        );
         *logical_clock += 1;
-
-        for (_, frame) in output.client_egress {
-            if let TransportEgress::TerminalOutput { data, .. } = frame {
-                observed.extend(data);
-            }
-        }
-
-        if observed
-            .windows(needle.len())
-            .any(|window| window == needle)
-        {
-            return observed;
-        }
         if let Ok(screen) = runtime.read_screen(
             RequestId("drain-until-screen".to_string()),
             session_id.clone(),

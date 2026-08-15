@@ -5105,7 +5105,7 @@ mod tests {
             "terminal mechanism tokens belong on Hello.terminal_compatibility, not host features"
         );
         assert!(!matrix.supported_features.contains(
-            &botster_hub_client::FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY.to_string()
+            &botster_terminal_protocol::FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY.to_string()
         ));
         assert!(
             matrix
@@ -5517,7 +5517,7 @@ mod tests {
                 ],
                 "terminal_streaming": {
                     "supported": true,
-                    "feature": botster_hub_client::FEATURE_TERMINAL_STREAMING,
+                    "feature": botster_terminal_protocol::FEATURE_TERMINAL_STREAMING,
                     "helper": "botster_hub_client::stream_attach",
                     "held_open_stream": true,
                     "conformance_ready_output": CONFORMANCE_READY,
@@ -5546,7 +5546,7 @@ mod tests {
                 },
                 "resize": {
                     "supported": true,
-                    "feature": botster_hub_client::FEATURE_RESIZE,
+                    "feature": botster_terminal_protocol::FEATURE_RESIZE,
                     "action": "resize",
                     "conformance_output_prefix": CONFORMANCE_WINSIZE_PREFIX,
                 },

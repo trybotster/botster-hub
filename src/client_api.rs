@@ -6,8 +6,6 @@
 
 use std::collections::BTreeMap;
 
-#[cfg(test)]
-use botster_core::{BotsterEngineObservation, TransportEgress};
 use botster_core::{
     CapabilitySurface, ClientId, CoreSession, CoreSessionMetadata, EnvelopeCursor,
     EnvelopeDeliveryState, EnvelopeId, EnvelopeTarget, PackageBlockedReason,
@@ -15,7 +13,7 @@ use botster_core::{
     RequestId, RoutedEnvelope, RoutedEnvelopeDrainOutcome, RoutedEnvelopePublishOutcome,
     RunnableEntrypointKind, RunnableEntrypointLaunchMode, SessionId, SessionLifecycleState,
     SessionRuntimeErrorKind, SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory,
-    SubscriptionId, TerminalAttachState,
+    SubscriptionId,
 };
 use botster_core_daemon::{
     GuardedWriteDecision, GuardedWriteDeliveryState, GuardedWriteRequest, GuardedWriteResult,
@@ -1354,57 +1352,9 @@ pub enum HubClientEvent {
         session_id: SessionId,
         state: SessionLifecycleState,
     },
-    TerminalOutput {
-        session_id: SessionId,
-        subscription_id: SubscriptionId,
-        data: Vec<u8>,
-    },
-    Snapshot {
-        session_id: SessionId,
-        subscription_id: SubscriptionId,
-        data: Vec<u8>,
-    },
-    Scrollback {
-        session_id: SessionId,
-        subscription_id: SubscriptionId,
-        data: Vec<u8>,
-    },
-    ProcessExit {
-        session_id: SessionId,
-        subscription_id: SubscriptionId,
-        code: Option<i32>,
-    },
-    AttachState {
-        session_id: SessionId,
-        subscription_id: SubscriptionId,
-        state: TerminalAttachState,
-    },
     RuntimeObservation {
         kind: HubClientObservationKind,
     },
-}
-
-impl HubClientEvent {
-    #[cfg(test)]
-    fn from_observation(observation: BotsterEngineObservation) -> Self {
-        match observation {
-            BotsterEngineObservation::SessionLifecycle { session_id, state } => {
-                Self::SessionLifecycle { session_id, state }
-            }
-            BotsterEngineObservation::SessionActivity { .. } => Self::RuntimeObservation {
-                kind: HubClientObservationKind::SessionActivity,
-            },
-            BotsterEngineObservation::Subscription(_) => Self::RuntimeObservation {
-                kind: HubClientObservationKind::Subscription,
-            },
-            BotsterEngineObservation::Backpressure(_) => Self::RuntimeObservation {
-                kind: HubClientObservationKind::Backpressure,
-            },
-            BotsterEngineObservation::RoutedEnvelope(_) => Self::RuntimeObservation {
-                kind: HubClientObservationKind::RoutedEnvelope,
-            },
-        }
-    }
 }
 
 /// Sanitized observation family.
@@ -2220,78 +2170,6 @@ fn session_type_client_metadata(mut metadata: CoreSessionMetadata) -> CoreSessio
     metadata
 }
 
-#[cfg(test)]
-pub(crate) fn events_from_drain(output: botster_core_daemon::DrainResult) -> Vec<HubClientEvent> {
-    let mut events = Vec::new();
-
-    events.extend(
-        output
-            .observations
-            .into_iter()
-            .map(HubClientEvent::from_observation),
-    );
-
-    events.extend(
-        output
-            .client_egress
-            .into_iter()
-            .filter_map(|(_, frame)| match frame {
-                TransportEgress::TerminalOutput {
-                    session_id,
-                    subscription_id,
-                    data,
-                } => Some(HubClientEvent::TerminalOutput {
-                    session_id,
-                    subscription_id,
-                    data,
-                }),
-                TransportEgress::Snapshot {
-                    session_id,
-                    subscription_id,
-                    data,
-                } => Some(HubClientEvent::Snapshot {
-                    session_id,
-                    subscription_id,
-                    data,
-                }),
-                TransportEgress::Scrollback {
-                    session_id,
-                    subscription_id,
-                    data,
-                } => Some(HubClientEvent::Scrollback {
-                    session_id,
-                    subscription_id,
-                    data,
-                }),
-                TransportEgress::ProcessExit {
-                    session_id,
-                    subscription_id,
-                    code,
-                } => Some(HubClientEvent::ProcessExit {
-                    session_id,
-                    subscription_id,
-                    code,
-                }),
-                TransportEgress::AttachState {
-                    session_id,
-                    subscription_id,
-                    state,
-                } => Some(HubClientEvent::AttachState {
-                    session_id,
-                    subscription_id,
-                    state,
-                }),
-                TransportEgress::FocusChanged { .. }
-                | TransportEgress::Binary { .. }
-                | TransportEgress::BoundaryPayload { .. }
-                | TransportEgress::Pong { .. }
-                | TransportEgress::Close { .. } => None,
-            }),
-    );
-
-    events
-}
-
 #[allow(dead_code)]
 fn _runtime_error_type_is_not_public_payload(_: HubRuntimeError) {}
 
@@ -2348,63 +2226,5 @@ mod tests {
         assert!(editor_only.allows(HubClientOperation::UpdateSessionType));
         assert!(editor_only.allows(HubClientOperation::DeleteSessionType));
         assert!(!editor_only.allows(HubClientOperation::ShowSessionType));
-    }
-
-    #[test]
-    fn drain_projection_preserves_snapshot_and_scrollback_payloads_before_live_output() {
-        let session_id = SessionId("projection-session".to_string());
-        let subscription_id = SubscriptionId("projection-subscription".to_string());
-        let client_id = ClientId("projection-client".to_string());
-        let events = events_from_drain(botster_core_daemon::DrainResult {
-            client_egress: vec![
-                (
-                    client_id.clone(),
-                    TransportEgress::Snapshot {
-                        session_id: session_id.clone(),
-                        subscription_id: subscription_id.clone(),
-                        data: b"snapshot-history".to_vec(),
-                    },
-                ),
-                (
-                    client_id.clone(),
-                    TransportEgress::Scrollback {
-                        session_id: session_id.clone(),
-                        subscription_id: subscription_id.clone(),
-                        data: b"scrollback-history".to_vec(),
-                    },
-                ),
-                (
-                    client_id,
-                    TransportEgress::TerminalOutput {
-                        session_id: session_id.clone(),
-                        subscription_id: subscription_id.clone(),
-                        data: b"live-output".to_vec(),
-                    },
-                ),
-            ],
-            observations: Vec::new(),
-            backpressure: Vec::new(),
-        });
-
-        assert_eq!(
-            events,
-            vec![
-                HubClientEvent::Snapshot {
-                    session_id: session_id.clone(),
-                    subscription_id: subscription_id.clone(),
-                    data: b"snapshot-history".to_vec(),
-                },
-                HubClientEvent::Scrollback {
-                    session_id: session_id.clone(),
-                    subscription_id: subscription_id.clone(),
-                    data: b"scrollback-history".to_vec(),
-                },
-                HubClientEvent::TerminalOutput {
-                    session_id,
-                    subscription_id,
-                    data: b"live-output".to_vec(),
-                },
-            ]
-        );
     }
 }

@@ -38,8 +38,6 @@ pub const LOCAL_WEBRTC_MAX_FRAME_BYTES: usize = 64 * 1024;
 /// Maximum serialized encrypted delivery envelope accepted for reassembly.
 pub const LOCAL_WEBRTC_MAX_DELIVERY_BYTES: usize = 16 * 1024 * 1024;
 pub const FEATURE_SESSIONS: &str = "sessions";
-pub const FEATURE_TERMINAL_STREAMING: &str = "terminal_streaming";
-pub const FEATURE_RESIZE: &str = "resize";
 pub const FEATURE_PLUGIN_SURFACE_RENDER: &str = "plugin_surface_render";
 pub const FEATURE_PLUGIN_SURFACE_ACTION: &str = "plugin_surface_action";
 pub const FEATURE_PACKAGE_ROUTES: &str = "package_routes";
@@ -53,13 +51,6 @@ pub const FEATURE_PLUGIN_ENTITY_SUBSCRIPTIONS: &str = "plugin_entity_subscriptio
 /// Race-free mode-dependent terminal input via `ModeGatedInput` + mode freshness.
 pub const FEATURE_MODE_GATED_INPUT: &str = "mode_gated_input";
 pub const FEATURE_HUB_SOURCE_UPDATE: &str = "hub_source_update";
-/// Cold-turkey first-party attach streams READY, HISTORY pages, then FINISH.
-///
-/// Not advertised until a production Drain can receive READY before Core
-/// encode returns. Success path: FINISH then `attached`. Post-READY history
-/// failure: `snapshot_history_incomplete` then `attached`, with no FINISH.
-pub const FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY: &str =
-    "snapshot_delivery=ready_then_history";
 /// Optional Hub Unix adapter plane. Bind happens only when Hello requires this.
 pub const FEATURE_UNIX_TERMINAL_ADAPTER: &str = "unix_terminal_adapter";
 /// Optional host event when a bound terminal subscription closes and the socket stays up.
@@ -671,7 +662,7 @@ impl DaemonCompatibilityRequirement {
     /// assert_eq!(requirement.protocol, botster_hub_client::PROTOCOL);
     /// assert!(!requirement
     ///     .required_features
-    ///     .contains(&botster_hub_client::FEATURE_TERMINAL_STREAMING.to_string()));
+    ///     .contains(&botster_terminal_protocol::FEATURE_TERMINAL_STREAMING.to_string()));
     /// ```
     #[must_use]
     pub fn current() -> Self {
@@ -2513,7 +2504,7 @@ impl DaemonDiagnostic {
         Self {
             kind: DaemonDiagnosticKind::TerminalStreamUnavailable,
             operation: Some(operation.into()),
-            feature: Some(FEATURE_TERMINAL_STREAMING.to_string()),
+            feature: Some(botster_terminal_protocol::FEATURE_TERMINAL_STREAMING.to_string()),
             message: Some(message.into()),
         }
     }
@@ -3189,9 +3180,9 @@ mod tests {
     fn default_requirement_accepts_daemon_before_optional_ready_then_history() {
         let mut previous_daemon = DaemonCompatibility::current();
         previous_daemon.conformance_fixture_revision = DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION;
-        previous_daemon
-            .features
-            .retain(|feature| feature != FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY);
+        previous_daemon.features.retain(|feature| {
+            feature != botster_terminal_protocol::FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY
+        });
 
         ensure_compatible(&DaemonCompatibilityRequirement::current(), &previous_daemon)
             .expect("the optional ready-then-history capability must not break default clients");
@@ -3202,9 +3193,9 @@ mod tests {
         let requirement = DaemonCompatibilityRequirement::for_ready_then_history_attach();
         let mut previous_daemon = DaemonCompatibility::current();
         previous_daemon.conformance_fixture_revision = DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION;
-        previous_daemon
-            .features
-            .retain(|feature| feature != FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY);
+        previous_daemon.features.retain(|feature| {
+            feature != botster_terminal_protocol::FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY
+        });
 
         let error = ensure_compatible(&requirement, &previous_daemon)
             .expect_err("a ready-then-history client must reject an old daemon");

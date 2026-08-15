@@ -7,13 +7,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
 use std::sync::mpsc::{self, SyncSender};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::{HubClientApi, HubClientRequest, HubClientResponseBody};
 use botster_core::SessionLifecycleState;
 use botster_core_daemon::{
-    RegistrySessionState, SessionLifecycleBaseline, SessionLifecycleChangeKind,
-    SessionLifecycleCursor, SessionLifecycleRecord,
+    LifecycleBaselineBudget, RegistrySessionState, SessionLifecycleBaseline,
+    SessionLifecycleChangeKind, SessionLifecycleCursor, SessionLifecycleRecord,
 };
 use botster_hub_client::{
     DaemonDiagnostic, DaemonEntityFrame, DaemonLifecycleCounters, DaemonOperatorError,
@@ -89,10 +89,26 @@ pub(crate) struct EntitySubscriptionState {
 }
 
 #[derive(Debug, Default)]
+struct BaselineContinuation {
+    snapshot: Option<SessionLifecycleCursor>,
+    after: Option<botster_core::SessionId>,
+    rows: Vec<SessionLifecycleRecord>,
+}
+
+#[derive(Debug, Default)]
 pub(super) struct EntityReconciliationState {
     cursor: Option<SessionLifecycleCursor>,
     records: BTreeMap<String, SessionLifecycleRecord>,
+    baseline_continuation: Option<BaselineContinuation>,
 }
+
+const LIFECYCLE_PAGE_BUDGET: LifecycleBaselineBudget = LifecycleBaselineBudget {
+    max_rows: 32,
+    max_bytes: 64 * 1024,
+    max_elapsed: Duration::from_millis(25),
+};
+const LIFECYCLE_CHANGE_MAX: usize = 32;
+const LIFECYCLE_CHANGE_BYTES: usize = 64 * 1024;
 
 pub(super) fn register_entity_subscription(
     daemon: &mut HubDaemon,
@@ -318,6 +334,132 @@ pub(super) fn register_entity_subscription(
     Ok(daemon_response_base(DaemonResponseKind::EntitySubscribed))
 }
 
+fn start_baseline_continuation(state: &mut DaemonControlState) {
+    state.reconciliation.baseline_continuation = Some(BaselineContinuation::default());
+}
+
+fn take_baseline_page(runtime: &crate::HubRuntime, state: &mut DaemonControlState) {
+    let Some(continuation) = state.reconciliation.baseline_continuation.as_mut() else {
+        return;
+    };
+    state.lifecycle_counters.lifecycle_baseline_reads = state
+        .lifecycle_counters
+        .lifecycle_baseline_reads
+        .saturating_add(1);
+    let Ok(page) = runtime.lifecycle_baseline_page(
+        continuation.snapshot.as_ref(),
+        continuation.after.as_ref(),
+        LIFECYCLE_PAGE_BUDGET,
+    ) else {
+        return;
+    };
+    if page.resync_required.is_some() {
+        *continuation = BaselineContinuation::default();
+        return;
+    }
+    continuation.rows.extend(page.sessions);
+    if page.complete {
+        state.reconciliation.cursor = Some(page.snapshot_sequence);
+        state.reconciliation.records = std::mem::take(&mut continuation.rows)
+            .into_iter()
+            .map(|record| (record.session.session_id.0.clone(), record))
+            .collect();
+        state.reconciliation.baseline_continuation = None;
+    } else {
+        continuation.snapshot = Some(page.snapshot_sequence);
+        continuation.after = page.next;
+    }
+}
+
+fn apply_supported_change(
+    state: &mut DaemonControlState,
+    change: &botster_core_daemon::SessionLifecycleChange,
+) -> bool {
+    match &change.kind {
+        SessionLifecycleChangeKind::Upsert { record } => {
+            state
+                .reconciliation
+                .records
+                .insert(record.session.session_id.0.clone(), record.clone());
+            state.reconciliation.cursor = Some(change.cursor.clone());
+            true
+        }
+        SessionLifecycleChangeKind::Removed { session_id } => {
+            state.reconciliation.records.remove(&session_id.0);
+            state.reconciliation.cursor = Some(change.cursor.clone());
+            true
+        }
+        _ => false,
+    }
+}
+
+fn advance_session_projection(
+    runtime: &crate::HubRuntime,
+    state: &mut DaemonControlState,
+) -> (Vec<botster_core_daemon::SessionLifecycleChange>, bool) {
+    if state.reconciliation.baseline_continuation.is_some() {
+        let rebuilding = true;
+        take_baseline_page(runtime, state);
+        return (
+            Vec::new(),
+            rebuilding && state.reconciliation.baseline_continuation.is_none(),
+        );
+    }
+    let Some(cursor) = state.reconciliation.cursor.clone() else {
+        start_baseline_continuation(state);
+        take_baseline_page(runtime, state);
+        return (
+            Vec::new(),
+            state.reconciliation.baseline_continuation.is_none(),
+        );
+    };
+    state.lifecycle_counters.lifecycle_change_reads = state
+        .lifecycle_counters
+        .lifecycle_change_reads
+        .saturating_add(1);
+    let Ok(page) =
+        runtime.lifecycle_changes_page(&cursor, LIFECYCLE_CHANGE_MAX, LIFECYCLE_CHANGE_BYTES)
+    else {
+        return (Vec::new(), false);
+    };
+    if page.resync_required.is_some()
+        || page.changes.iter().any(|change| {
+            !matches!(
+                &change.kind,
+                SessionLifecycleChangeKind::Upsert { .. }
+                    | SessionLifecycleChangeKind::Removed { .. }
+            )
+        })
+    {
+        state.lifecycle_counters.lifecycle_resync_reads = state
+            .lifecycle_counters
+            .lifecycle_resync_reads
+            .saturating_add(1);
+        start_baseline_continuation(state);
+        take_baseline_page(runtime, state);
+        return (
+            Vec::new(),
+            state.reconciliation.baseline_continuation.is_none(),
+        );
+    }
+    let mut applied = Vec::new();
+    for change in page.changes {
+        if !apply_supported_change(state, &change) {
+            start_baseline_continuation(state);
+            take_baseline_page(runtime, state);
+            return (
+                Vec::new(),
+                state.reconciliation.baseline_continuation.is_none(),
+            );
+        }
+        applied.push(change);
+    }
+    if applied.is_empty() {
+        state.reconciliation.cursor = Some(page.next);
+    }
+    (applied, false)
+}
+
 pub(super) fn seed_lifecycle_reconciliation(
     daemon: &mut HubDaemon,
     state: &mut DaemonControlState,
@@ -325,19 +467,8 @@ pub(super) fn seed_lifecycle_reconciliation(
     let Some(runtime) = daemon.runtime_mut() else {
         return;
     };
-    state.lifecycle_counters.lifecycle_baseline_reads = state
-        .lifecycle_counters
-        .lifecycle_baseline_reads
-        .saturating_add(1);
-    let Ok(baseline) = runtime.session_lifecycle_baseline() else {
-        return;
-    };
-    state.reconciliation.cursor = Some(baseline.cursor);
-    state.reconciliation.records = baseline
-        .sessions
-        .into_iter()
-        .map(|record| (record.session.session_id.0.clone(), record))
-        .collect();
+    start_baseline_continuation(state);
+    take_baseline_page(runtime, state);
 }
 
 fn drive_session_type_subscriptions(
@@ -431,13 +562,23 @@ pub(super) fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut Dae
     drive_package_entity_fanout(daemon, state);
     drive_package_entity_resync(daemon, state);
 
-    if state.entity_subscriptions.is_empty() {
-        return;
-    }
     let packages = daemon.package_registry().clone();
     let Some(runtime) = daemon.runtime_mut() else {
         state.entity_subscriptions.clear();
         state.lifecycle_counters.live_entity_subscriptions = 0;
+        return;
+    };
+    let (applied_changes, projection_replaced) = advance_session_projection(runtime, state);
+    if let Ok(sessions) = runtime.list_sessions() {
+        let active_session_ids = sessions
+            .iter()
+            .map(|session| session.session_id.0.clone())
+            .collect::<BTreeSet<_>>();
+        state
+            .pending_runtime
+            .retain_active_sessions(&active_session_ids);
+    }
+    if state.entity_subscriptions.is_empty() {
         return;
     };
     state.entity_subscriptions.retain(|_, subscription| {
@@ -484,56 +625,15 @@ pub(super) fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut Dae
     let Some(cursor) = state.reconciliation.cursor.clone() else {
         return;
     };
-    if state.entity_subscriptions.values().any(|subscription| {
-        subscription.entity_type == "session" && subscription.resync_reason.is_some()
-    }) {
-        let baseline = SessionLifecycleBaseline {
-            cursor: cursor.clone(),
-            sessions: state.reconciliation.records.values().cloned().collect(),
-        };
-        state
-            .entity_subscriptions
-            .retain(|subscription_id, subscription| {
-                if subscription.entity_type != "session" {
-                    return true;
-                }
-                let Some(reason) = subscription.resync_reason.clone() else {
-                    return true;
-                };
-                try_resync_subscription(
-                    subscription_id,
-                    subscription,
-                    baseline.clone(),
-                    reason,
-                    &mut state.lifecycle_counters,
-                )
-            });
-    }
-    state.lifecycle_counters.lifecycle_change_reads = state
-        .lifecycle_counters
-        .lifecycle_change_reads
-        .saturating_add(1);
-    let changes = runtime.session_lifecycle_changes(&cursor);
-    if let Some(reason) = changes.resync_required {
-        state.lifecycle_counters.lifecycle_resync_reads = state
-            .lifecycle_counters
-            .lifecycle_resync_reads
-            .saturating_add(1);
-        state.lifecycle_counters.lifecycle_baseline_reads = state
-            .lifecycle_counters
-            .lifecycle_baseline_reads
-            .saturating_add(1);
-        let Ok(baseline) = runtime.session_lifecycle_baseline() else {
-            return;
-        };
-        state.reconciliation.cursor = Some(baseline.cursor.clone());
-        state.reconciliation.records = baseline
-            .sessions
-            .iter()
-            .cloned()
-            .map(|record| (record.session.session_id.0.clone(), record))
-            .collect();
-        let reason = format!("core_{reason:?}").to_lowercase();
+    let baseline = SessionLifecycleBaseline {
+        cursor,
+        sessions: state.reconciliation.records.values().cloned().collect(),
+    };
+    if projection_replaced
+        || state.entity_subscriptions.values().any(|subscription| {
+            subscription.entity_type == "session" && subscription.resync_reason.is_some()
+        })
+    {
         state
             .entity_subscriptions
             .retain(|subscription_id, subscription| {
@@ -544,64 +644,15 @@ pub(super) fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut Dae
                     subscription_id,
                     subscription,
                     baseline.clone(),
-                    reason.clone(),
-                    &mut state.lifecycle_counters,
-                )
-            });
-    } else if changes.changes.iter().any(|change| {
-        !matches!(
-            &change.kind,
-            SessionLifecycleChangeKind::Upsert { .. } | SessionLifecycleChangeKind::Removed { .. }
-        )
-    }) {
-        state.lifecycle_counters.lifecycle_resync_reads = state
-            .lifecycle_counters
-            .lifecycle_resync_reads
-            .saturating_add(1);
-        state.lifecycle_counters.lifecycle_baseline_reads = state
-            .lifecycle_counters
-            .lifecycle_baseline_reads
-            .saturating_add(1);
-        let Ok(baseline) = runtime.session_lifecycle_baseline() else {
-            return;
-        };
-        state.reconciliation.cursor = Some(baseline.cursor.clone());
-        state.reconciliation.records = baseline
-            .sessions
-            .iter()
-            .cloned()
-            .map(|record| (record.session.session_id.0.clone(), record))
-            .collect();
-        state
-            .entity_subscriptions
-            .retain(|subscription_id, subscription| {
-                try_resync_subscription(
-                    subscription_id,
-                    subscription,
-                    baseline.clone(),
-                    "unknown_core_change".to_string(),
+                    subscription
+                        .resync_reason
+                        .clone()
+                        .unwrap_or_else(|| "projection_replaced".to_string()),
                     &mut state.lifecycle_counters,
                 )
             });
     } else {
-        let mut unsupported_change = false;
-        for change in changes.changes {
-            match &change.kind {
-                SessionLifecycleChangeKind::Upsert { record } => {
-                    state
-                        .reconciliation
-                        .records
-                        .insert(record.session.session_id.0.clone(), record.clone());
-                }
-                SessionLifecycleChangeKind::Removed { session_id } => {
-                    state.reconciliation.records.remove(&session_id.0);
-                }
-                _ => {
-                    unsupported_change = true;
-                    break;
-                }
-            }
-            state.reconciliation.cursor = Some(change.cursor.clone());
+        for change in applied_changes {
             state
                 .entity_subscriptions
                 .retain(|subscription_id, subscription| {
@@ -616,53 +667,7 @@ pub(super) fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut Dae
                     )
                 });
         }
-        if unsupported_change {
-            state.lifecycle_counters.lifecycle_resync_reads = state
-                .lifecycle_counters
-                .lifecycle_resync_reads
-                .saturating_add(1);
-            state.lifecycle_counters.lifecycle_baseline_reads = state
-                .lifecycle_counters
-                .lifecycle_baseline_reads
-                .saturating_add(1);
-            let Ok(baseline) = runtime.session_lifecycle_baseline() else {
-                return;
-            };
-            state.reconciliation.cursor = Some(baseline.cursor.clone());
-            state.reconciliation.records = baseline
-                .sessions
-                .iter()
-                .cloned()
-                .map(|record| (record.session.session_id.0.clone(), record))
-                .collect();
-            state
-                .entity_subscriptions
-                .retain(|subscription_id, subscription| {
-                    if subscription.entity_type != "session" {
-                        return true;
-                    }
-                    try_resync_subscription(
-                        subscription_id,
-                        subscription,
-                        baseline.clone(),
-                        "unknown_core_change".to_string(),
-                        &mut state.lifecycle_counters,
-                    )
-                });
-        } else {
-            state.reconciliation.cursor = Some(changes.cursor);
-        }
     }
-
-    let active_session_ids = state
-        .reconciliation
-        .records
-        .keys()
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    state
-        .pending_runtime
-        .retain_active_sessions(&active_session_ids);
     state.lifecycle_counters.live_entity_subscriptions = state.entity_subscriptions.len() as u64;
 }
 

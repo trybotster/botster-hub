@@ -11,11 +11,12 @@ use botster_core::{
 };
 use botster_core_daemon::CoreDaemonError;
 use botster_hub_client::{
-    ATTACH_STATE_ATTACHING, DaemonEvent, FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY,
-    FEATURE_TERMINAL_SUBSCRIPTION_CLOSED, FEATURE_UNIX_TERMINAL_ADAPTER,
+    DaemonEvent, FEATURE_TERMINAL_SUBSCRIPTION_CLOSED, FEATURE_UNIX_TERMINAL_ADAPTER,
     FEATURE_WEBRTC_TERMINAL_ADAPTER,
 };
-use botster_terminal_protocol::TerminalCompatibility;
+use botster_terminal_protocol::{
+    FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY, TerminalCompatibility,
+};
 
 use super::{DaemonTransportError, DaemonTransportResult};
 use crate::HubRuntime;
@@ -377,42 +378,6 @@ impl AttachStreamRegistry {
     }
 }
 
-#[allow(dead_code)]
-pub(crate) fn is_terminal_body_event(event: &DaemonEvent) -> bool {
-    matches!(
-        event,
-        DaemonEvent::Snapshot { .. }
-            | DaemonEvent::Scrollback { .. }
-            | DaemonEvent::TerminalOutput { .. }
-            | DaemonEvent::ProcessExit { .. }
-            | DaemonEvent::AttachState { .. }
-    )
-}
-
-#[allow(dead_code)]
-pub(crate) fn terminal_event_is_pre_bind_forbidden(event: &DaemonEvent) -> bool {
-    match event {
-        DaemonEvent::Snapshot { .. }
-        | DaemonEvent::Scrollback { .. }
-        | DaemonEvent::TerminalOutput { .. }
-        | DaemonEvent::ProcessExit { .. } => true,
-        DaemonEvent::AttachState { state, .. } => state != ATTACH_STATE_ATTACHING,
-        _ => false,
-    }
-}
-
-#[allow(dead_code)]
-pub(crate) fn initial_attaching_only(events: &[DaemonEvent]) -> bool {
-    let terminal: Vec<_> = events
-        .iter()
-        .filter(|event| is_terminal_body_event(event))
-        .collect();
-    matches!(
-        terminal.as_slice(),
-        [event] if !terminal_event_is_pre_bind_forbidden(event)
-    )
-}
-
 pub(crate) fn negotiated_unix_capability_set(
     _required_features: &[String],
     terminal_requirement: Option<&botster_terminal_protocol::TerminalCompatibilityRequirement>,
@@ -721,51 +686,6 @@ mod tests {
         registry.cancel_stream("s", "sub");
         assert_eq!(registry.stream_owner_client_id("s", "sub"), None);
         assert!(!registry.active_subscriptions.contains_key("s"));
-    }
-
-    #[test]
-    fn only_the_initial_attaching_frame_is_accepted_before_bind() {
-        let attaching = DaemonEvent::AttachState {
-            session_id: "s".to_string(),
-            subscription_id: "sub".to_string(),
-            state: ATTACH_STATE_ATTACHING.to_string(),
-        };
-        assert!(initial_attaching_only(std::slice::from_ref(&attaching)));
-        assert!(initial_attaching_only(&[
-            DaemonEvent::SessionLifecycle {
-                session_id: "s".to_string(),
-                state: "running".to_string(),
-            },
-            attaching.clone(),
-        ]));
-        assert!(!initial_attaching_only(&[]));
-        assert!(!initial_attaching_only(&[DaemonEvent::AttachState {
-            session_id: "s".to_string(),
-            subscription_id: "sub".to_string(),
-            state: "attached".to_string(),
-        }]));
-        assert!(!initial_attaching_only(&[
-            attaching.clone(),
-            DaemonEvent::Snapshot {
-                session_id: "s".to_string(),
-                subscription_id: "sub".to_string(),
-                history: botster_hub_client::DaemonOpaqueHistoryPayload::from_bytes(b"x"),
-            },
-        ]));
-        assert!(terminal_event_is_pre_bind_forbidden(
-            &DaemonEvent::TerminalOutput {
-                session_id: "s".to_string(),
-                subscription_id: "sub".to_string(),
-                payload: botster_hub_client::DaemonLiveOutputPayload::from_bytes(b"out"),
-            }
-        ));
-        assert!(terminal_event_is_pre_bind_forbidden(
-            &DaemonEvent::ProcessExit {
-                session_id: "s".to_string(),
-                subscription_id: "sub".to_string(),
-                code: Some(0),
-            }
-        ));
     }
 
     #[test]

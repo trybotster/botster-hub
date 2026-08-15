@@ -558,7 +558,7 @@ pub fn first_party_client_support_matrix() -> FirstPartyClientSupportMatrix {
         ],
         terminal_streaming: TerminalStreamingSupport {
             supported: true,
-            feature: botster_hub_client::FEATURE_TERMINAL_STREAMING.to_string(),
+            feature: botster_terminal_protocol::FEATURE_TERMINAL_STREAMING.to_string(),
             helper: "botster_hub_client::stream_attach".to_string(),
             held_open_stream: true,
             conformance_ready_output: CONFORMANCE_READY.to_string(),
@@ -605,7 +605,7 @@ pub fn first_party_client_support_matrix() -> FirstPartyClientSupportMatrix {
         },
         resize: ResizeSupport {
             supported: true,
-            feature: botster_hub_client::FEATURE_RESIZE.to_string(),
+            feature: botster_terminal_protocol::FEATURE_RESIZE.to_string(),
             action: "resize".to_string(),
             conformance_output_prefix: CONFORMANCE_WINSIZE_PREFIX.to_string(),
         },

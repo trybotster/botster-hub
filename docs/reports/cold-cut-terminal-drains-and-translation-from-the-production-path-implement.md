@@ -89,7 +89,9 @@ None accepted as scope changes.
 
 Production implementation follows rev 4: Core pin, observe/baseline slices, always bind, fail-closed local Attach, empty Attach bodies, host-only Drain, no `ATTACH_DRAIN_INTERVAL`, host tokens removed, protocol 7.
 
-`HubRuntime::drain_subscription` / `drain_runtime_once` remain as unused-by-production helpers so integration tests can still name Core Drain. Production owner loop, Drain handler, entity tick, and smoke do not call them.
+`HubRuntime::drain_subscription` / `drain_runtime_once` compile only under `cfg(test)` for in-crate unit tests. Integration tests use observe + ReadScreen. Production owner loop, Drain handler, entity tick, and smoke do not call them.
+
+Review `review_1786778236_174399` required four follow-ups: keep the canonical session projection current with zero subscribers using paged observe/baseline/journal APIs; delete Hub terminal event translation and retired attach-phase predicates; remove Hub-owned terminal mechanism constants; scan every production item, not the prefix before the first `#[cfg(test)]`.
 
 `DaemonConnection` skips Unix mux terminal frames when reading a host response and retains those frames for callers. Always-bind inserts mux frames on default Unix connections; without this skip, host ReadScreen after Attach cannot parse. IsolatedHub live-byte tests now observe retained adapter frames instead of Drain bodies.
 
@@ -132,13 +134,17 @@ Passed on this tree:
 - Idle observe ticks the host logical clock on each slice
 - Replacement Attach detaches generation N before bind of N+1
 - Support-matrix descriptor test now requires `terminal_streaming`, `resize`, and `snapshot_delivery=ready_then_history` to stay off host `supported_features`
+- Owner-loop session projection advances with zero entity subscribers; later subscribe receives the ended row (`session_projection_observes_exit_without_subscribers_then_later_snapshot_includes_ended_row`)
+- `HubClientEvent` no longer has terminal variants. Architecture scan covers items after `#[cfg(test)]` imports
+- Hub-owned `FEATURE_TERMINAL_STREAMING` / `FEATURE_RESIZE` / `FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY` constants deleted; negotiation uses `botster-terminal-protocol`
 
 ## Unverified behavior or residual risk
 
 - Live TUI at `fc1ff623` and live Web against this candidate Hub were not attached in this Implement turn. Verify must run that proof and record Hub SHA plus locked Core SHA separately.
-- `HubRuntime::drain_*` helpers still exist for tests. They are not on the owner loop.
+- `HubRuntime::drain_*` exists only under `cfg(test)` for in-crate unit tests.
 - Control-thread `try_recv` prefers queued host requests over idle reconcile. Burst `ReadScreen` can delay the 500 ms idle observe until the queue drains. Mutations now observe on the request path.
 - CoreDaemon on `aef6516` does not expose `pump_bound_adapters`. Owner-loop observe uses `observe_lifecycle_slice`, which calls Core `drain_runtime_once` internally.
+- Downstream TUI/Web crates that still imported the deleted hub-client `FEATURE_*` constants must import `botster-terminal-protocol` instead. Those consumers are separately routed.
 
 ## Missing vault guidance discovered
 
