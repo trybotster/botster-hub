@@ -3257,9 +3257,10 @@ fn shutdown_after_observed_exit_returns_session_cleanup() {
 
 #[test]
 // Registry stays Running after ReadScreen parks ProcessExited. The target
-// sorts after 33 pads, so one 32-row baseline page cannot see it. Removing
-// session_runtime_lifecycle makes classify treat Running as Active and
-// ShutdownSession returns OperatorError.
+// sorts after 33 pads, so one 32-row baseline page cannot see it. The lookup
+// must return SessionCleanup. Locked Core treats Active shutdown of an
+// Exited engine row as Events, so Events is the no-lookup result. Live
+// Active→Events is covered by external_hub_webrtc_live_output_preserves_exact_bytes.
 fn shutdown_session_classifies_parked_exit_beyond_one_baseline_page() {
     let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("shutdown-parked-late-row");
@@ -3340,13 +3341,10 @@ fn shutdown_session_classifies_parked_exit_beyond_one_baseline_page() {
         elapsed < Duration::from_secs(1),
         "ShutdownSession must finish the paged lookup, elapsed={elapsed:?}"
     );
-    assert!(
-        matches!(
-            shutdown.kind,
-            botster_hub_client::DaemonResponseKind::Events
-                | botster_hub_client::DaemonResponseKind::SessionCleanup
-        ),
-        "parked late-row exit must not return OperatorError, got {:?}",
+    assert_eq!(
+        shutdown.kind,
+        botster_hub_client::DaemonResponseKind::SessionCleanup,
+        "parked late-row exit must use engine lookup SessionCleanup, got {:?}",
         shutdown.kind
     );
     shutdown_cli_daemon(&data_dir, child);
