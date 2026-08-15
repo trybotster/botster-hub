@@ -59,9 +59,11 @@ use crate::managed_git_worktrees::{
     rollback_prepared_worktree,
 };
 use crate::package_entity_fanout::{
-    PackageEntityFamilyState, PackageEntityMutation, PackageEntityPublishResult,
-    coerce_entity_frame_empty_items, parse_publish_mutation,
+    EntityMutationLease, PackageEntityFamilyState, PackageEntityMutation,
+    PackageEntityPublishResult, PackageEntityPublishStatus, coerce_entity_frame_empty_items,
+    parse_publish_mutation,
 };
+use crate::package_event_router::{EventPlaneStatus, EventSubscription, LeaseIdentity};
 use crate::packages::{PackageRecord, PackageRegistry, PackageRegistryError, PackageState};
 use crate::persistence::{FileHubStateStore, HubState, HubStateStore, HubStateStoreError};
 use crate::session_types::{
@@ -97,7 +99,7 @@ pub struct HubRuntime {
     coordination_bridge: HubCoordinationBridge,
     entity_publish_bridge: HubEntityPublishBridge,
     package_entity_families: Arc<Mutex<BTreeMap<String, PackageEntityFamilyState>>>,
-    package_entity_fanout: Arc<Mutex<VecDeque<PackageEntityMutation>>>,
+    package_entity_fanout: Arc<Mutex<VecDeque<LeasedFanoutMutation>>>,
     last_capability_cleanup: Option<PluginCleanupResult>,
     session_contexts: SharedSessionContexts,
     package_event_router: Arc<crate::package_event_router::PackageEventRouter>,
@@ -507,14 +509,6 @@ impl HubRuntime {
             .package(package_name)
             .map(|record| record.configuration_view())
             .expect("prepared local package must have a registry record");
-        let _ = self
-            .package_event_router
-            .begin_package_generation(package_name);
-        if let Some(record) = registry.package(package_name)
-            && let Ok(contracts) = record.manifest.compiled_event_contracts()
-        {
-            let _ = self.package_event_router.try_register_contracts(contracts);
-        }
         let bundle = LuaPluginRuntime::load_prepared(
             &prepared,
             configuration,
@@ -522,8 +516,20 @@ impl HubRuntime {
             registry.packages().into_iter().cloned().collect(),
         )
         .map_err(HubLuaPluginLoadError::Lua)?;
-        self.load_plugin_package(registry, package_name, bundle)
-            .map_err(HubLuaPluginLoadError::Lifecycle)
+        let event_handlers = bundle.event_handlers.clone();
+        let key = self
+            .load_plugin_package(registry, package_name, bundle)
+            .map_err(HubLuaPluginLoadError::Lifecycle)?;
+        if let Err(status) =
+            self.commit_loaded_package_event_plane(package_name, registry, &event_handlers)
+        {
+            let _ = self.unload_plugin_package(
+                RequestId(format!("event-plane-rollback-{package_name}")),
+                package_name,
+            );
+            return Err(HubLuaPluginLoadError::EventPlane(status));
+        }
+        Ok(key)
     }
 
     /// Re-read and replace an enabled local Lua package through the real Lua runtime.
@@ -540,14 +546,6 @@ impl HubRuntime {
             .package(package_name)
             .map(|record| record.configuration_view())
             .expect("prepared local package must have a registry record");
-        let _ = self
-            .package_event_router
-            .begin_package_generation(package_name);
-        if let Some(record) = registry.package(package_name)
-            && let Ok(contracts) = record.manifest.compiled_event_contracts()
-        {
-            let _ = self.package_event_router.try_register_contracts(contracts);
-        }
         let bundle = LuaPluginRuntime::load_prepared(
             &prepared,
             configuration,
@@ -555,8 +553,55 @@ impl HubRuntime {
             registry.packages().into_iter().cloned().collect(),
         )
         .map_err(HubLuaPluginLoadError::Lua)?;
-        self.reload_plugin_package(request_id, registry, package_name, bundle)
-            .map_err(HubLuaPluginLoadError::Lifecycle)
+        let event_handlers = bundle.event_handlers.clone();
+        let cleanup = self
+            .reload_plugin_package(request_id, registry, package_name, bundle)
+            .map_err(HubLuaPluginLoadError::Lifecycle)?;
+        if let Err(status) =
+            self.commit_loaded_package_event_plane(package_name, registry, &event_handlers)
+        {
+            let _ = self.unload_plugin_package(
+                RequestId(format!("event-plane-rollback-{package_name}")),
+                package_name,
+            );
+            return Err(HubLuaPluginLoadError::EventPlane(status));
+        }
+        Ok(cleanup)
+    }
+
+    fn commit_loaded_package_event_plane(
+        &self,
+        package_name: &str,
+        registry: &PackageRegistry,
+        event_handlers: &[crate::lifecycle::HubPluginEventHandler],
+    ) -> Result<u64, EventPlaneStatus> {
+        let contracts = match registry.package(package_name) {
+            Some(record) => record
+                .manifest
+                .compiled_event_contracts()
+                .map_err(|_| EventPlaneStatus::RejectedInvalid)?,
+            None => Vec::new(),
+        };
+        let subscriptions = event_handlers
+            .iter()
+            .filter(|handler| {
+                !(handler.event_owner == crate::package_event_router::HUB_EVENT_OWNER
+                    && handler.event_name == "session_family")
+            })
+            .map(|handler| EventSubscription {
+                plugin_key: package_name.to_string(),
+                owner: handler.event_owner.clone(),
+                name: handler.event_name.clone(),
+                handler_id: handler.handler.handler_id.clone(),
+                generation: self.package_event_router.next_holder_generation(),
+                ..EventSubscription::default()
+            })
+            .collect();
+        self.package_event_router.try_commit_package_generation(
+            package_name,
+            contracts,
+            subscriptions,
+        )
     }
 
     /// Invoke a plugin handler through core plugin worker mechanics.
@@ -1200,7 +1245,26 @@ impl HubRuntime {
         frame: serde_json::Value,
         scope_id: Option<u64>,
     ) -> Result<PackageEntityPublishResult, String> {
+        let pending_identity = LeaseIdentity::PendingEntityPublish {
+            plugin_key: plugin_key.0.clone(),
+        };
+        let result = self.admit_package_entity_publish_inner(plugin_key, frame, scope_id);
+        if let Some(scope_id) = scope_id
+            && result.is_err()
+        {
+            self.causal_scopes.release(scope_id, pending_identity);
+        }
+        result
+    }
+
+    fn admit_package_entity_publish_inner(
+        &self,
+        plugin_key: PluginKey,
+        frame: serde_json::Value,
+        scope_id: Option<u64>,
+    ) -> Result<PackageEntityPublishResult, String> {
         let mutation = parse_publish_mutation(frame)?;
+        let mutation_seq = mutation.snapshot_seq();
         let entity_type = mutation.entity_type().to_string();
         let package_name = plugin_key.0.as_str();
         let owned_families = self.plugin_entity_provider_families(package_name);
@@ -1229,39 +1293,45 @@ impl HubRuntime {
             .expect("package entity family lock");
         let family = families.entry(entity_type.clone()).or_default();
         let (result, ready) = family.admit(mutation, now);
+        let incoming_lease = scope_id.map(|scope_id| EntityMutationLease {
+            scope_id,
+            family: entity_type.clone(),
+            seq: mutation_seq,
+        });
+        if matches!(result.status, PackageEntityPublishStatus::PendingGap)
+            && let Some(lease) = incoming_lease.clone()
+        {
+            family.store_pending_lease(lease);
+        }
+        let mut leased_ready = Vec::new();
+        for ready_mutation in ready {
+            let seq = ready_mutation.snapshot_seq();
+            let lease = family
+                .take_pending_lease(seq)
+                .or_else(|| incoming_lease.clone().filter(|lease| lease.seq == seq));
+            leased_ready.push(LeasedFanoutMutation {
+                mutation: ready_mutation,
+                lease,
+            });
+        }
         if let Some(scope_id) = scope_id {
-            self.causal_scopes.release(
+            settle_entity_publish_lease(
+                &self.causal_scopes,
+                family,
                 scope_id,
-                crate::package_event_router::LeaseIdentity::PendingEntityPublish {
-                    plugin_key: plugin_key.0.clone(),
-                },
+                &plugin_key.0,
+                &entity_type,
+                mutation_seq,
+                &result,
             );
-            if result.ok {
-                let _ = self.causal_scopes.acquire(
-                    scope_id,
-                    crate::package_event_router::LeaseIdentity::AdmittedEntityMutation {
-                        family: entity_type.clone(),
-                        seq: result.last_accepted_seq,
-                    },
-                );
-                if result.resync_needed {
-                    let _ = self.causal_scopes.acquire(
-                        scope_id,
-                        crate::package_event_router::LeaseIdentity::ProviderResyncNeed {
-                            family: entity_type.clone(),
-                        },
-                    );
-                }
-                family.causal_scope_id = Some(scope_id);
-            }
         }
         drop(families);
-        if !ready.is_empty() {
+        if !leased_ready.is_empty() {
             let mut fanout = self
                 .package_entity_fanout
                 .lock()
                 .expect("package entity fanout lock");
-            fanout.extend(ready);
+            fanout.extend(leased_ready);
         }
         Ok(result)
     }
@@ -1273,7 +1343,21 @@ impl HubRuntime {
             .package_entity_fanout
             .lock()
             .expect("package entity fanout lock");
-        fanout.drain(..).collect()
+        fanout
+            .drain(..)
+            .map(|item| {
+                if let Some(lease) = item.lease {
+                    self.causal_scopes.release(
+                        lease.scope_id,
+                        LeaseIdentity::AdmittedEntityMutation {
+                            family: lease.family,
+                            seq: lease.seq,
+                        },
+                    );
+                }
+                item.mutation
+            })
+            .collect()
     }
 
     /// Snapshot of package entity family admission state for one family.
@@ -1304,31 +1388,38 @@ impl HubRuntime {
             .expect("package entity family lock");
         let family = families.entry(entity_type.to_string()).or_default();
         let ready = family.apply_provider_snapshot_seq(snapshot_seq, now);
-        if !family.resync.needed
-            && let Some(scope_id) = family.causal_scope_id.take()
-        {
+        let mut leased_ready = Vec::new();
+        for ready_mutation in ready {
+            let lease = family.take_pending_lease(ready_mutation.snapshot_seq());
+            leased_ready.push(LeasedFanoutMutation {
+                mutation: ready_mutation,
+                lease,
+            });
+        }
+        for discarded in family.take_discarded_pending_leases() {
             self.causal_scopes.release(
-                scope_id,
-                crate::package_event_router::LeaseIdentity::ProviderResyncNeed {
-                    family: entity_type.to_string(),
-                },
-            );
-            self.causal_scopes.release(
-                scope_id,
-                crate::package_event_router::LeaseIdentity::AdmittedEntityMutation {
-                    family: entity_type.to_string(),
-                    seq: family.last_accepted_seq,
+                discarded.scope_id,
+                LeaseIdentity::AdmittedEntityMutation {
+                    family: discarded.family,
+                    seq: discarded.seq,
                 },
             );
         }
-        if !ready.is_empty() {
+        if !family.resync.needed {
+            release_resync_leases(&self.causal_scopes, family.take_resync_leases());
+        }
+        let mutations: Vec<PackageEntityMutation> = leased_ready
+            .iter()
+            .map(|item| item.mutation.clone())
+            .collect();
+        if !leased_ready.is_empty() {
             let mut fanout = self
                 .package_entity_fanout
                 .lock()
                 .expect("package entity fanout lock");
-            fanout.extend(ready.iter().cloned());
+            fanout.extend(leased_ready);
         }
-        ready
+        mutations
     }
 
     /// Mark family resync needed (e.g. overflow or residual gap).
@@ -1385,11 +1476,12 @@ impl HubRuntime {
             .package_entity_families
             .lock()
             .expect("package entity family lock");
-        families
-            .entry(entity_type.to_string())
-            .or_default()
-            .resync
-            .record_attempt(now)
+        let family = families.entry(entity_type.to_string()).or_default();
+        let degraded = family.resync.record_attempt(now);
+        if degraded || !family.resync.needed {
+            release_resync_leases(&self.causal_scopes, family.take_resync_leases());
+        }
+        degraded
     }
 
     /// Clear resync need after successful convergence when no gap remains.
@@ -1401,6 +1493,9 @@ impl HubRuntime {
             .expect("package entity family lock");
         if let Some(family) = families.get_mut(entity_type) {
             family.recompute_resync_need(now);
+            if !family.resync.needed {
+                release_resync_leases(&self.causal_scopes, family.take_resync_leases());
+            }
         }
     }
 
@@ -1411,14 +1506,41 @@ impl HubRuntime {
             .package_entity_families
             .lock()
             .expect("package entity family lock");
-        for family in &families {
-            state.remove(family);
+        for family_name in &families {
+            if let Some(mut family) = state.remove(family_name) {
+                let pending_leases = std::mem::take(&mut family.pending_leases);
+                for lease in pending_leases.into_values() {
+                    self.causal_scopes.release(
+                        lease.scope_id,
+                        LeaseIdentity::AdmittedEntityMutation {
+                            family: lease.family,
+                            seq: lease.seq,
+                        },
+                    );
+                }
+                release_resync_leases(&self.causal_scopes, family.take_resync_leases());
+            }
         }
         let mut fanout = self
             .package_entity_fanout
             .lock()
             .expect("package entity fanout lock");
-        fanout.retain(|mutation| !families.contains(mutation.entity_type()));
+        fanout.retain(|item| {
+            if families.contains(item.mutation.entity_type()) {
+                if let Some(lease) = item.lease.clone() {
+                    self.causal_scopes.release(
+                        lease.scope_id,
+                        LeaseIdentity::AdmittedEntityMutation {
+                            family: lease.family,
+                            seq: lease.seq,
+                        },
+                    );
+                }
+                false
+            } else {
+                true
+            }
+        });
     }
 
     /// Resync attempt counter for observability (attempts field across families).
@@ -1748,7 +1870,7 @@ impl HubRuntime {
         })?;
         let scope_id = self
             .package_entity_family_state(entity_type)
-            .and_then(|family| family.causal_scope_id);
+            .and_then(|family| family.provider_scope_id());
         let request_id = RequestId(format!("plugin-entity-provider-{subscription_id}"));
         if let Some(scope_id) = scope_id
             && !self.causal_scopes.acquire(
@@ -3107,6 +3229,7 @@ pub enum HubLuaPluginLoadError {
     Package(PackageRegistryError),
     Lua(LuaPluginRuntimeError),
     Lifecycle(crate::HubLifecycleError),
+    EventPlane(EventPlaneStatus),
 }
 
 impl fmt::Display for HubLuaPluginLoadError {
@@ -3115,6 +3238,7 @@ impl fmt::Display for HubLuaPluginLoadError {
             Self::Package(error) => write!(formatter, "{error:?}"),
             Self::Lua(error) => write!(formatter, "{error}"),
             Self::Lifecycle(error) => write!(formatter, "{error:?}"),
+            Self::EventPlane(status) => write!(formatter, "{}", status.as_str()),
         }
     }
 }
@@ -3125,7 +3249,60 @@ impl Error for HubLuaPluginLoadError {
             Self::Package(_) => None,
             Self::Lua(error) => Some(error),
             Self::Lifecycle(_) => None,
+            Self::EventPlane(_) => None,
         }
+    }
+}
+
+struct LeasedFanoutMutation {
+    mutation: PackageEntityMutation,
+    lease: Option<EntityMutationLease>,
+}
+
+fn settle_entity_publish_lease(
+    scopes: &crate::package_event_router::CausalScopeTable,
+    family: &mut PackageEntityFamilyState,
+    scope_id: u64,
+    plugin_key: &str,
+    entity_type: &str,
+    mutation_seq: u64,
+    result: &PackageEntityPublishResult,
+) {
+    let pending = LeaseIdentity::PendingEntityPublish {
+        plugin_key: plugin_key.to_string(),
+    };
+    if !result.ok {
+        scopes.release(scope_id, pending);
+        return;
+    }
+    let mut next = Vec::new();
+    if matches!(
+        result.status,
+        PackageEntityPublishStatus::Accepted | PackageEntityPublishStatus::PendingGap
+    ) {
+        next.push(LeaseIdentity::AdmittedEntityMutation {
+            family: entity_type.to_string(),
+            seq: mutation_seq,
+        });
+    }
+    if result.resync_needed && family.remember_resync_lease(scope_id, entity_type.to_string()) {
+        next.push(LeaseIdentity::ProviderResyncNeed {
+            family: entity_type.to_string(),
+        });
+    }
+    if next.is_empty() {
+        scopes.release(scope_id, pending);
+    } else {
+        let _ = scopes.transfer(scope_id, pending, next);
+    }
+}
+
+fn release_resync_leases(
+    scopes: &crate::package_event_router::CausalScopeTable,
+    leases: BTreeSet<(u64, String)>,
+) {
+    for (scope_id, family) in leases {
+        scopes.release(scope_id, LeaseIdentity::ProviderResyncNeed { family });
     }
 }
 
@@ -4008,6 +4185,69 @@ mod tests {
                 .success()
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn settle_entity_publish_transfers_exact_seq_and_closes_on_error() {
+        let scopes = crate::package_event_router::CausalScopeTable::new();
+        let mut family = PackageEntityFamilyState::default();
+        let accepted = scopes
+            .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+                plugin_key: "producer".into(),
+            }))
+            .expect("mint");
+        settle_entity_publish_lease(
+            &scopes,
+            &mut family,
+            accepted,
+            "producer",
+            "producer.item",
+            32,
+            &PackageEntityPublishResult {
+                ok: true,
+                status: PackageEntityPublishStatus::PendingGap,
+                last_accepted_seq: 0,
+                high_water_seq: 32,
+                resync_needed: true,
+                resync_degraded: false,
+            },
+        );
+        assert_eq!(
+            scopes.identities(accepted),
+            Some(BTreeSet::from([
+                LeaseIdentity::AdmittedEntityMutation {
+                    family: "producer.item".into(),
+                    seq: 32,
+                },
+                LeaseIdentity::ProviderResyncNeed {
+                    family: "producer.item".into(),
+                },
+            ]))
+        );
+
+        let errored = scopes
+            .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+                plugin_key: "producer".into(),
+            }))
+            .expect("mint error scope");
+        settle_entity_publish_lease(
+            &scopes,
+            &mut family,
+            errored,
+            "producer",
+            "producer.item",
+            1,
+            &PackageEntityPublishResult {
+                ok: false,
+                status: PackageEntityPublishStatus::StaleSequence,
+                last_accepted_seq: 5,
+                high_water_seq: 5,
+                resync_needed: false,
+                resync_degraded: false,
+            },
+        );
+        assert!(!scopes.is_live(errored));
+        assert_eq!(scopes.lease_count(errored), None);
     }
 
     fn current_unix_nanos() -> u128 {

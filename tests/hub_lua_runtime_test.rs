@@ -13,6 +13,7 @@ use botster_core::{
     PluginInvocationSuccess, PluginKey, RequestId, RoutedEnvelope, RoutedEnvelopePayload,
     SessionId,
 };
+use botster_hub::package_event_router::LeaseIdentity;
 use botster_hub::{
     DataDirectoryOption, HostIdentityOptions, HubClientApi, HubClientRequest,
     HubClientResponseBody, HubRuntime, HubStartupOptions, LuaPluginHostApi, LuaPluginRuntime,
@@ -3896,5 +3897,312 @@ return botster.register({
     assert!(
         hub.take_package_entity_fanout().is_empty(),
         "oversized mutation must not enter fanout"
+    );
+}
+
+fn install_named_lua_package(
+    name: &str,
+    plugin_lua: &str,
+    manifest: serde_json::Value,
+) -> PackageRegistry {
+    let root = unique_short_test_dir(name);
+    fs::create_dir_all(&root).expect("create package");
+    let mut manifest = manifest;
+    manifest["source"] = serde_json::json!({
+        "type": "path",
+        "path": root.canonicalize().expect("path")
+    });
+    fs::write(root.join("botster-package.json"), manifest.to_string()).expect("manifest");
+    fs::write(root.join("plugin.lua"), plugin_lua).expect("plugin");
+    let mut policy = default_package_policy();
+    policy
+        .install_local_path(&root, "install")
+        .expect("install");
+    let package_name = manifest["name"].as_str().expect("name");
+    policy.enable(package_name, "enable").expect("enable");
+    policy.registry().clone()
+}
+
+fn scoped_command(
+    plugin: &str,
+    handler_id: &str,
+    payload: serde_json::Value,
+    scope_id: u64,
+) -> PluginInvocationRequest {
+    PluginInvocationRequest {
+        request_id: RequestId(format!("lease-{handler_id}")),
+        handler: PluginHandlerRef {
+            plugin_key: PluginKey(plugin.to_string()),
+            kind: PluginHandlerKind::Command,
+            handler_id: handler_id.to_string(),
+        },
+        timeout_ms: 1_000,
+        context: PluginInvocationContext {
+            client_id: None,
+            session_id: None,
+            subscription_id: None,
+            surface_id: None,
+            origin: Some("hub-lua-runtime-test".to_string()),
+            metadata: Some(BoundaryJson(
+                serde_json::json!({ "causal_scope_id": scope_id }),
+            )),
+        },
+        payload: BoundaryJson(payload),
+    }
+}
+
+fn lease_probe_plugin() -> &'static str {
+    r#"
+return botster.register({
+  handlers = {
+    {
+      id = "runs",
+      kind = "entity_provider",
+      descriptor_id = "lease-probe.item",
+      descriptor = { entity_type = "lease-probe.item", id_field = "id" },
+      call = function()
+        return {
+          type = "entity_snapshot",
+          entity_type = "lease-probe.item",
+          snapshot_seq = 0,
+          items = {},
+        }
+      end,
+    },
+    {
+      id = "publish",
+      kind = "command",
+      call = function(args)
+        return botster.entity_publish({
+          type = "entity_upsert",
+          entity_type = "lease-probe.item",
+          snapshot_seq = args.seq,
+          id = args.id or "item-1",
+          entity = { id = args.id or "item-1" },
+        })
+      end,
+    },
+    {
+      id = "bad",
+      kind = "command",
+      call = function()
+        return botster.entity_publish({
+          type = "entity_upsert",
+          entity_type = "not-owned.item",
+          snapshot_seq = 1,
+          id = "x",
+          entity = { id = "x" },
+        })
+      end,
+    },
+  },
+})
+"#
+}
+
+fn lease_probe_manifest() -> serde_json::Value {
+    serde_json::json!({
+        "name": "lease-probe",
+        "version": "1.0.0",
+        "kind": "plugin",
+        "botster": ">=0.1.0",
+        "capabilities": [],
+        "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+    })
+}
+
+#[test]
+fn failed_lua_load_does_not_leave_router_subscriptions() {
+    let registry = install_named_lua_package(
+        "failed-load-subs",
+        r#"
+events.on("hub", "worktree_created", function(event)
+  return { received = event.event }
+end)
+error("deliberate load failure after events.on")
+"#,
+        serde_json::json!({
+            "name": "failed-load.plugin",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "capabilities": [],
+            "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+        }),
+    );
+    let mut hub = explicit_runtime("failed-load-subs");
+    assert!(
+        hub.load_lua_plugin_package(&registry, "failed-load.plugin")
+            .is_err()
+    );
+    assert_eq!(
+        hub.package_event_router()
+            .test_subscription_count("failed-load.plugin"),
+        0
+    );
+    assert_eq!(
+        hub.package_event_router()
+            .try_ingress(
+                "hub",
+                "worktree_created",
+                &serde_json::json!({
+                    "event": "worktree_created",
+                    "worktree_id": "wt",
+                    "target_id": "tgt"
+                }),
+                std::time::Instant::now()
+            )
+            .as_str(),
+        "accepted"
+    );
+    let batch = hub
+        .package_event_router()
+        .pull_ready_batch(
+            8,
+            64 * 1024,
+            std::time::Instant::now(),
+            std::time::Duration::from_millis(8),
+        )
+        .expect("batch");
+    assert!(batch.is_empty(), "failed load must not leave a subscriber");
+}
+
+#[test]
+fn held_router_load_fails_without_partial_contracts_or_subscriptions() {
+    let registry = install_named_lua_package(
+        "held-router-load",
+        r#"
+events.on("hub", "worktree_created", function(event)
+  return { received = event.event }
+end)
+return botster.register({})
+"#,
+        serde_json::json!({
+            "name": "held-router.plugin",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "capabilities": [],
+            "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }],
+            "events": {
+                "emitted": [{
+                    "name": "sample.ready",
+                    "audience": ["plugins"],
+                    "payload_schema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": { "ok": { "type": "boolean" } },
+                        "required": ["ok"]
+                    }
+                }]
+            }
+        }),
+    );
+    let mut hub = explicit_runtime("held-router-load");
+    let router = hub.package_event_router().clone();
+    let result = router
+        .test_with_inner_held(|| hub.load_lua_plugin_package(&registry, "held-router.plugin"));
+    assert!(
+        result.is_err(),
+        "held router must fail the load, got {result:?}"
+    );
+    assert!(!router.test_has_contract("held-router.plugin", "sample.ready"));
+    assert_eq!(router.test_subscription_count("held-router.plugin"), 0);
+    assert_eq!(
+        router
+            .current_package_generation("held-router.plugin")
+            .expect("generation"),
+        0
+    );
+}
+
+#[test]
+fn entity_lease_scope_closes_after_success_error_fanout_degradation_and_unload() {
+    let registry =
+        install_named_lua_package("lease-close", lease_probe_plugin(), lease_probe_manifest());
+    let mut hub = explicit_runtime("lease-close");
+    hub.load_lua_plugin_package(&registry, "lease-probe")
+        .expect("load");
+    let scopes = hub.causal_scopes().clone();
+
+    let success = scopes.mint_with_lease(None).expect("success scope");
+    let published = hub.invoke_plugin(scoped_command(
+        "lease-probe",
+        "publish",
+        serde_json::json!({ "seq": 1 }),
+        success,
+    ));
+    assert!(matches!(
+        published.result,
+        PluginInvocationResult::Completed(_)
+    ));
+    assert!(scopes.is_live(success), "admitted mutation holds the scope");
+    assert_eq!(
+        scopes.identities(success),
+        Some(std::collections::BTreeSet::from([
+            LeaseIdentity::AdmittedEntityMutation {
+                family: "lease-probe.item".into(),
+                seq: 1,
+            }
+        ]))
+    );
+    assert_eq!(hub.take_package_entity_fanout().len(), 1);
+    assert!(
+        !scopes.is_live(success),
+        "fanout must close the success scope"
+    );
+
+    let errored = scopes.mint_with_lease(None).expect("error scope");
+    let failed = hub.invoke_plugin(scoped_command(
+        "lease-probe",
+        "bad",
+        serde_json::json!({}),
+        errored,
+    ));
+    assert!(matches!(failed.result, PluginInvocationResult::Failed(_)));
+    assert!(
+        !scopes.is_live(errored),
+        "ownership error must release pending"
+    );
+
+    let degraded = scopes.mint_with_lease(None).expect("degraded scope");
+    let far = hub.invoke_plugin(scoped_command(
+        "lease-probe",
+        "publish",
+        serde_json::json!({ "seq": 32, "id": "far" }),
+        degraded,
+    ));
+    assert!(matches!(far.result, PluginInvocationResult::Completed(_)));
+    assert_eq!(
+        scopes.identities(degraded),
+        Some(std::collections::BTreeSet::from([
+            LeaseIdentity::ProviderResyncNeed {
+                family: "lease-probe.item".into(),
+            }
+        ]))
+    );
+    let mut entered_degraded = false;
+    for _ in 0..8 {
+        entered_degraded = hub.record_package_entity_resync_attempt("lease-probe.item");
+    }
+    assert!(entered_degraded);
+    assert!(
+        !scopes.is_live(degraded),
+        "max attempts must release ProviderResyncNeed"
+    );
+
+    let unloaded = scopes.mint_with_lease(None).expect("unload scope");
+    let gap = hub.invoke_plugin(scoped_command(
+        "lease-probe",
+        "publish",
+        serde_json::json!({ "seq": 3, "id": "gap" }),
+        unloaded,
+    ));
+    assert!(matches!(gap.result, PluginInvocationResult::Completed(_)));
+    assert!(scopes.is_live(unloaded));
+    let _ = hub.unload_plugin_package(RequestId("lease-unload".into()), "lease-probe");
+    assert!(
+        !scopes.is_live(unloaded),
+        "unload must release remaining family leases"
     );
 }

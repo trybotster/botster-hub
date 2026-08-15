@@ -31,7 +31,7 @@ use serde_json::json;
 use crate::capabilities::{HubCapabilityRuntime, PluginStoreBatchMutation, PluginStoreBatchResult};
 use crate::lifecycle::{HubPluginEventHandler, HubPluginRuntimeBundle, package_entity_owner_token};
 use crate::package_event_router::{
-    CausalScopeTable, EventPlaneStatus, EventSubscription, LeaseIdentity, PackageEventRouter,
+    CausalScopeTable, EventPlaneStatus, LeaseIdentity, PackageEventRouter,
 };
 use crate::packages::{PackageConfigurationView, PackageRecord, PreparedLocalPackage};
 use crate::runtime::{SharedSessionTypeSpawner, SharedSpawnTargets, SharedWorktrees};
@@ -69,6 +69,7 @@ pub struct HubCoordinationBridge {
 pub struct HubEntityPublishBridge {
     owner_thread: thread::ThreadId,
     pending: Arc<Mutex<VecDeque<PendingEntityPublishRequest>>>,
+    next_token: Arc<AtomicU64>,
 }
 
 impl HubEntityPublishBridge {
@@ -76,6 +77,7 @@ impl HubEntityPublishBridge {
         Self {
             owner_thread: thread::current().id(),
             pending: Arc::new(Mutex::new(VecDeque::new())),
+            next_token: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -84,26 +86,52 @@ impl HubEntityPublishBridge {
         plugin_key: PluginKey,
         frame: serde_json::Value,
         scope_id: Option<u64>,
-    ) -> Result<crate::package_entity_fanout::PackageEntityPublishResult, String> {
+    ) -> Result<crate::package_entity_fanout::PackageEntityPublishResult, EntityPublishError> {
         if thread::current().id() == self.owner_thread {
-            return Err(
+            return Err(EntityPublishError::NeverQueued(
                 "botster.entity_publish is only available during handler invocation, not at plugin load"
                     .to_string(),
-            );
+            ));
         }
+        let token = self.next_token.fetch_add(1, Ordering::SeqCst);
         let (response, receiver) = mpsc::channel();
         self.pending
             .lock()
-            .map_err(|_| "entity publish queue lock poisoned".to_string())?
+            .map_err(|_| {
+                EntityPublishError::NeverQueued("entity publish queue lock poisoned".to_string())
+            })?
             .push_back(PendingEntityPublishRequest {
+                token,
                 plugin_key,
                 frame,
                 scope_id,
                 response,
             });
-        receiver
-            .recv_timeout(Duration::from_millis(ENTITY_PUBLISH_REQUEST_TIMEOUT_MS))
-            .map_err(|_| "entity publish request did not complete before timeout".to_string())?
+        match receiver.recv_timeout(Duration::from_millis(ENTITY_PUBLISH_REQUEST_TIMEOUT_MS)) {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(error)) => Err(EntityPublishError::OwnerFinished(error)),
+            Err(_) => {
+                if self.try_retract(token) {
+                    Err(EntityPublishError::NeverQueued(
+                        "entity publish request did not complete before timeout".to_string(),
+                    ))
+                } else {
+                    Err(EntityPublishError::TimeoutInFlight)
+                }
+            }
+        }
+    }
+
+    fn try_retract(&self, token: u64) -> bool {
+        let Ok(mut pending) = self.pending.lock() else {
+            return false;
+        };
+        if let Some(index) = pending.iter().position(|request| request.token == token) {
+            pending.remove(index);
+            true
+        } else {
+            false
+        }
     }
 
     pub(crate) fn take_pending(&self) -> Option<PendingEntityPublishRequest> {
@@ -114,7 +142,14 @@ impl HubEntityPublishBridge {
     }
 }
 
+enum EntityPublishError {
+    NeverQueued(String),
+    OwnerFinished(String),
+    TimeoutInFlight,
+}
+
 pub(crate) struct PendingEntityPublishRequest {
+    token: u64,
     pub(crate) plugin_key: PluginKey,
     pub(crate) frame: serde_json::Value,
     pub(crate) scope_id: Option<u64>,
@@ -675,8 +710,6 @@ fn install_botster_api(
     globals.set("package", Value::Nil)?;
 
     let events = lua.create_table()?;
-    let subscribe_router = host_api.package_event_router.clone();
-    let subscribe_plugin = plugin_key.clone();
     events.set(
         "on",
         lua.create_function(
@@ -701,7 +734,6 @@ fn install_botster_api(
                         EventPlaneStatus::RejectedWildcard.as_str().to_string(),
                     ));
                 }
-                let session_family = owner == "hub" && name == "session_family";
                 let registration = lua.globals().get::<Table>("__botster_registration")?;
                 let handler_table: Table = match registration.get("handlers") {
                     Ok(handler_table) => handler_table,
@@ -712,19 +744,6 @@ fn install_botster_api(
                     }
                 };
                 let handler_id = format!("event:{owner}:{name}:{}", handler_table.raw_len() + 1);
-                if !session_family {
-                    let status = subscribe_router.try_subscribe(EventSubscription {
-                        plugin_key: subscribe_plugin.0.clone(),
-                        owner: owner.clone(),
-                        name: name.clone(),
-                        handler_id: handler_id.clone(),
-                        generation: subscribe_router.next_holder_generation(),
-                        ..EventSubscription::default()
-                    });
-                    if status != EventPlaneStatus::Accepted {
-                        return Err(mlua::Error::RuntimeError(status.as_str().to_string()));
-                    }
-                }
                 let handlers = lua.globals().get::<Table>("__botster_handlers")?;
                 handlers.set(handler_id.clone(), handler)?;
                 let entry = lua.create_table()?;
@@ -897,9 +916,28 @@ fn entity_publish_function(
                 "causal scope lease could not be acquired".to_string(),
             ));
         }
-        let result = bridge
-            .publish(plugin_key.clone(), value, scope_id)
-            .map_err(mlua::Error::RuntimeError)?;
+        let result = match bridge.publish(plugin_key.clone(), value, scope_id) {
+            Ok(result) => result,
+            Err(EntityPublishError::OwnerFinished(error)) => {
+                return Err(mlua::Error::RuntimeError(error));
+            }
+            Err(EntityPublishError::TimeoutInFlight) => {
+                return Err(mlua::Error::RuntimeError(
+                    "entity publish request did not complete before timeout".to_string(),
+                ));
+            }
+            Err(EntityPublishError::NeverQueued(error)) => {
+                if let Some(scope_id) = scope_id {
+                    scopes.release(
+                        scope_id,
+                        LeaseIdentity::PendingEntityPublish {
+                            plugin_key: plugin_key.0.clone(),
+                        },
+                    );
+                }
+                return Err(mlua::Error::RuntimeError(error));
+            }
+        };
         lua.to_value(&json!({
             "ok": result.ok,
             "status": result.status.as_str(),
