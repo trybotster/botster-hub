@@ -63,7 +63,9 @@ use crate::package_entity_fanout::{
     PackageEntityPublishResult, PackageEntityPublishStatus, coerce_entity_frame_empty_items,
     parse_publish_mutation,
 };
-use crate::package_event_router::{EventPlaneStatus, EventSubscription, LeaseIdentity};
+use crate::package_event_router::{
+    CausalAdmitResult, CausalOp, EventPlaneStatus, EventSubscription, LeaseIdentity,
+};
 use crate::packages::{PackageRecord, PackageRegistry, PackageRegistryError, PackageState};
 use crate::persistence::{FileHubStateStore, HubState, HubStateStore, HubStateStoreError};
 use crate::session_types::{
@@ -477,7 +479,26 @@ impl HubRuntime {
         let _ = self.causal_scopes.flush_pending();
         self.event_plane_owner_ops
             .borrow_mut()
+            .apply_causal(&self.causal_scopes);
+        self.event_plane_owner_ops
+            .borrow_mut()
             .apply_ready(&self.package_event_router)
+    }
+
+    /// Admit a required causal op or park it on the owner-thread retry machine.
+    pub fn admit_causal_op(&self, op: CausalOp) {
+        match self.causal_scopes.try_admit(op) {
+            CausalAdmitResult::Applied => {}
+            CausalAdmitResult::Retry(op) => {
+                self.event_plane_owner_ops.borrow_mut().record_causal(op);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn pending_causal_retries(&self) -> Vec<CausalOp> {
+        self.event_plane_owner_ops.borrow().pending_causal()
     }
 
     /// Return the startup reconciliation decisions made against the core daemon registry.
@@ -1261,7 +1282,10 @@ impl HubRuntime {
         if let Some(scope_id) = scope_id
             && result.is_err()
         {
-            self.causal_scopes.release(scope_id, pending_identity);
+            self.admit_causal_op(CausalOp::Release {
+                scope_id,
+                identity: pending_identity,
+            });
         }
         result
     }
@@ -1324,8 +1348,7 @@ impl HubRuntime {
             });
         }
         if let Some(scope_id) = scope_id {
-            settle_entity_publish_lease(
-                &self.causal_scopes,
+            self.settle_entity_publish_lease(
                 family,
                 scope_id,
                 &plugin_key.0,
@@ -1371,6 +1394,34 @@ impl HubRuntime {
             .collect()
     }
 
+    fn settle_entity_publish_lease(
+        &self,
+        family: &mut PackageEntityFamilyState,
+        scope_id: u64,
+        plugin_key: &str,
+        entity_type: &str,
+        mutation_seq: u64,
+        result: &PackageEntityPublishResult,
+    ) {
+        self.admit_causal_op(settle_entity_publish_op(
+            family,
+            scope_id,
+            plugin_key,
+            entity_type,
+            mutation_seq,
+            result,
+        ));
+    }
+
+    fn release_resync_leases(&self, leases: BTreeSet<(u64, String)>) {
+        for (scope_id, family) in leases {
+            self.admit_causal_op(CausalOp::Release {
+                scope_id,
+                identity: LeaseIdentity::ProviderResyncNeed { family },
+            });
+        }
+    }
+
     /// Release or convert the mutation lease after subscriber decisions finish.
     pub fn finish_package_entity_mutation_fanout(
         &self,
@@ -1395,18 +1446,24 @@ impl HubRuntime {
             let added = family.remember_resync_lease(lease.scope_id, lease.family.clone());
             drop(families);
             if added {
-                self.causal_scopes.transfer(
-                    lease.scope_id,
-                    admitted,
-                    [LeaseIdentity::ProviderResyncNeed {
+                self.admit_causal_op(CausalOp::Transfer {
+                    scope_id: lease.scope_id,
+                    from: admitted,
+                    to: vec![LeaseIdentity::ProviderResyncNeed {
                         family: lease.family,
                     }],
-                );
+                });
             } else {
-                self.causal_scopes.release(lease.scope_id, admitted);
+                self.admit_causal_op(CausalOp::Release {
+                    scope_id: lease.scope_id,
+                    identity: admitted,
+                });
             }
         } else {
-            self.causal_scopes.release(lease.scope_id, admitted);
+            self.admit_causal_op(CausalOp::Release {
+                scope_id: lease.scope_id,
+                identity: admitted,
+            });
         }
     }
 
@@ -1447,16 +1504,16 @@ impl HubRuntime {
             });
         }
         for discarded in family.take_discarded_pending_leases() {
-            self.causal_scopes.release(
-                discarded.scope_id,
-                LeaseIdentity::AdmittedEntityMutation {
+            self.admit_causal_op(CausalOp::Release {
+                scope_id: discarded.scope_id,
+                identity: LeaseIdentity::AdmittedEntityMutation {
                     family: discarded.family,
                     seq: discarded.seq,
                 },
-            );
+            });
         }
         if !family.resync.needed {
-            release_resync_leases(&self.causal_scopes, family.take_resync_leases());
+            self.release_resync_leases(family.take_resync_leases());
         }
         let mutations: Vec<PackageEntityMutation> = leased_ready
             .iter()
@@ -1529,7 +1586,7 @@ impl HubRuntime {
         let family = families.entry(entity_type.to_string()).or_default();
         let degraded = family.resync.record_attempt(now);
         if degraded || !family.resync.needed {
-            release_resync_leases(&self.causal_scopes, family.take_resync_leases());
+            self.release_resync_leases(family.take_resync_leases());
         }
         degraded
     }
@@ -1544,7 +1601,7 @@ impl HubRuntime {
         if let Some(family) = families.get_mut(entity_type) {
             family.recompute_resync_need(now);
             if !family.resync.needed {
-                release_resync_leases(&self.causal_scopes, family.take_resync_leases());
+                self.release_resync_leases(family.take_resync_leases());
             }
         }
     }
@@ -1560,15 +1617,15 @@ impl HubRuntime {
             if let Some(mut family) = state.remove(family_name) {
                 let pending_leases = std::mem::take(&mut family.pending_leases);
                 for lease in pending_leases.into_values() {
-                    self.causal_scopes.release(
-                        lease.scope_id,
-                        LeaseIdentity::AdmittedEntityMutation {
+                    self.admit_causal_op(CausalOp::Release {
+                        scope_id: lease.scope_id,
+                        identity: LeaseIdentity::AdmittedEntityMutation {
                             family: lease.family,
                             seq: lease.seq,
                         },
-                    );
+                    });
                 }
-                release_resync_leases(&self.causal_scopes, family.take_resync_leases());
+                self.release_resync_leases(family.take_resync_leases());
             }
         }
         let mut fanout = self
@@ -1578,13 +1635,13 @@ impl HubRuntime {
         fanout.retain(|item| {
             if families.contains(item.mutation.entity_type()) {
                 if let Some(lease) = item.lease.clone() {
-                    self.causal_scopes.release(
-                        lease.scope_id,
-                        LeaseIdentity::AdmittedEntityMutation {
+                    self.admit_causal_op(CausalOp::Release {
+                        scope_id: lease.scope_id,
+                        identity: LeaseIdentity::AdmittedEntityMutation {
                             family: lease.family,
                             seq: lease.seq,
                         },
-                    );
+                    });
                 }
                 false
             } else {
@@ -1955,12 +2012,12 @@ impl HubRuntime {
             })),
         });
         if let Some(scope_id) = scope_id {
-            self.causal_scopes.release(
+            self.admit_causal_op(CausalOp::Release {
                 scope_id,
-                crate::package_event_router::LeaseIdentity::ProviderInFlight {
+                identity: crate::package_event_router::LeaseIdentity::ProviderInFlight {
                     request_id: request_id.0.clone(),
                 },
-            );
+            });
         }
         let value = completed_plugin_payload(outcome.result, "plugin entity provider")?;
         let value = coerce_entity_frame_empty_items(value);
@@ -3320,21 +3377,22 @@ pub struct TakenPackageEntityMutation {
     lease: Option<EntityMutationLease>,
 }
 
-fn settle_entity_publish_lease(
-    scopes: &crate::package_event_router::CausalScopeTable,
+fn settle_entity_publish_op(
     family: &mut PackageEntityFamilyState,
     scope_id: u64,
     plugin_key: &str,
     entity_type: &str,
     mutation_seq: u64,
     result: &PackageEntityPublishResult,
-) {
+) -> CausalOp {
     let pending = LeaseIdentity::PendingEntityPublish {
         plugin_key: plugin_key.to_string(),
     };
     if !result.ok {
-        scopes.release(scope_id, pending);
-        return;
+        return CausalOp::Release {
+            scope_id,
+            identity: pending,
+        };
     }
     let mut next = Vec::new();
     if matches!(
@@ -3352,18 +3410,16 @@ fn settle_entity_publish_lease(
         });
     }
     if next.is_empty() {
-        scopes.release(scope_id, pending);
+        CausalOp::Release {
+            scope_id,
+            identity: pending,
+        }
     } else {
-        let _ = scopes.transfer(scope_id, pending, next);
-    }
-}
-
-fn release_resync_leases(
-    scopes: &crate::package_event_router::CausalScopeTable,
-    leases: BTreeSet<(u64, String)>,
-) {
-    for (scope_id, family) in leases {
-        scopes.release(scope_id, LeaseIdentity::ProviderResyncNeed { family });
+        CausalOp::Transfer {
+            scope_id,
+            from: pending,
+            to: next,
+        }
     }
 }
 
@@ -4257,21 +4313,23 @@ mod tests {
                 plugin_key: "producer".into(),
             }))
             .expect("mint");
-        settle_entity_publish_lease(
-            &scopes,
-            &mut family,
-            accepted,
-            "producer",
-            "producer.item",
-            32,
-            &PackageEntityPublishResult {
-                ok: true,
-                status: PackageEntityPublishStatus::PendingGap,
-                last_accepted_seq: 0,
-                high_water_seq: 32,
-                resync_needed: true,
-                resync_degraded: false,
-            },
+        assert_eq!(
+            scopes.try_admit(settle_entity_publish_op(
+                &mut family,
+                accepted,
+                "producer",
+                "producer.item",
+                32,
+                &PackageEntityPublishResult {
+                    ok: true,
+                    status: PackageEntityPublishStatus::PendingGap,
+                    last_accepted_seq: 0,
+                    high_water_seq: 32,
+                    resync_needed: true,
+                    resync_degraded: false,
+                },
+            )),
+            crate::package_event_router::CausalAdmitResult::Applied
         );
         assert_eq!(
             scopes.identities(accepted),
@@ -4291,21 +4349,23 @@ mod tests {
                 plugin_key: "producer".into(),
             }))
             .expect("mint error scope");
-        settle_entity_publish_lease(
-            &scopes,
-            &mut family,
-            errored,
-            "producer",
-            "producer.item",
-            1,
-            &PackageEntityPublishResult {
-                ok: false,
-                status: PackageEntityPublishStatus::StaleSequence,
-                last_accepted_seq: 5,
-                high_water_seq: 5,
-                resync_needed: false,
-                resync_degraded: false,
-            },
+        assert_eq!(
+            scopes.try_admit(settle_entity_publish_op(
+                &mut family,
+                errored,
+                "producer",
+                "producer.item",
+                1,
+                &PackageEntityPublishResult {
+                    ok: false,
+                    status: PackageEntityPublishStatus::StaleSequence,
+                    last_accepted_seq: 5,
+                    high_water_seq: 5,
+                    resync_needed: false,
+                    resync_degraded: false,
+                },
+            )),
+            crate::package_event_router::CausalAdmitResult::Applied
         );
         assert!(!scopes.is_live(errored));
         assert_eq!(scopes.lease_count(errored), None);

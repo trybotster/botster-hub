@@ -928,7 +928,7 @@ fn entity_publish_function(
             }
             Err(EntityPublishError::NeverQueued(error)) => {
                 if let Some(scope_id) = scope_id {
-                    scopes.release(
+                    let _ = scopes.release(
                         scope_id,
                         LeaseIdentity::PendingEntityPublish {
                             plugin_key: plugin_key.0.clone(),

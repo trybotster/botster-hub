@@ -3,7 +3,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use botster_core::{
     BoundaryJson, Capability, CapabilitySurface, EndpointId, EnvelopeDeliveryStatus, EnvelopeId,
@@ -13,7 +13,9 @@ use botster_core::{
     PluginInvocationSuccess, PluginKey, RequestId, RoutedEnvelope, RoutedEnvelopePayload,
     SessionId,
 };
-use botster_hub::package_event_router::LeaseIdentity;
+use botster_hub::package_event_router::{
+    CAUSAL_FLUSH_MAX, CAUSAL_PENDING_MAX, CausalAdmitResult, LeaseIdentity,
+};
 use botster_hub::{
     DataDirectoryOption, HostIdentityOptions, HubClientApi, HubClientRequest,
     HubClientResponseBody, HubRuntime, HubStartupOptions, LuaPluginHostApi, LuaPluginRuntime,
@@ -4313,5 +4315,111 @@ fn entity_lease_scope_closes_after_success_error_fanout_degradation_and_unload()
     assert!(
         !scopes.is_live(unloaded),
         "unload must release remaining family leases"
+    );
+}
+
+#[test]
+fn production_fanout_finish_returns_the_513th_op_without_spinning() {
+    let registry =
+        install_named_lua_package("lease-nospin", lease_probe_plugin(), lease_probe_manifest());
+    let mut hub = explicit_runtime("lease-nospin");
+    hub.load_lua_plugin_package(&registry, "lease-probe")
+        .expect("load");
+    let scopes = hub.causal_scopes().clone();
+    let success = scopes.mint_with_lease(None).expect("success scope");
+    let published = hub.invoke_plugin(scoped_command(
+        "lease-probe",
+        "publish",
+        serde_json::json!({ "seq": 1 }),
+        success,
+    ));
+    assert!(matches!(
+        published.result,
+        PluginInvocationResult::Completed(_)
+    ));
+    let taken = hub.take_leased_package_entity_fanout();
+    assert_eq!(taken.len(), 1);
+
+    let capacity = CAUSAL_PENDING_MAX * 2;
+    let mut fillers = Vec::new();
+    for index in 0..capacity {
+        let scope = scopes
+            .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+                plugin_key: format!("fill{index}"),
+            }))
+            .expect("mint filler");
+        fillers.push(scope);
+    }
+    scopes.test_with_inner_held(|| {
+        for (index, scope) in fillers.iter().enumerate() {
+            assert_eq!(
+                scopes.transfer(
+                    *scope,
+                    LeaseIdentity::PendingEntityPublish {
+                        plugin_key: format!("fill{index}"),
+                    },
+                    [LeaseIdentity::AdmittedEntityMutation {
+                        family: "f".into(),
+                        seq: index as u64,
+                    }],
+                ),
+                CausalAdmitResult::Applied
+            );
+        }
+        let started = Instant::now();
+        hub.finish_package_entity_mutation_fanout(&taken[0], true);
+        assert!(
+            started.elapsed() < Duration::from_millis(20),
+            "production finish must return without spinning: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            hub.event_plane_owner_ops_pending(),
+            "unsent finish must stay on the owner retry machine"
+        );
+    });
+    assert_eq!(
+        scopes.identities(success),
+        Some(std::collections::BTreeSet::from([
+            LeaseIdentity::AdmittedEntityMutation {
+                family: "lease-probe.item".into(),
+                seq: 1,
+            }
+        ])),
+        "finish must not commit the transfer before retry ownership is durable"
+    );
+    let first = scopes.flush_pending();
+    assert!(first > 0);
+    assert!(
+        first <= CAUSAL_FLUSH_MAX,
+        "one owner turn must not drain without a bound: {first}"
+    );
+    assert_eq!(
+        scopes.identities(fillers[0]),
+        Some(std::collections::BTreeSet::from([
+            LeaseIdentity::AdmittedEntityMutation {
+                family: "f".into(),
+                seq: 0,
+            }
+        ]))
+    );
+    while scopes.pending_ops() {
+        let _ = scopes.flush_pending();
+    }
+    let _ = hub.apply_event_plane_owner_ops();
+    while scopes.pending_ops() {
+        let _ = scopes.flush_pending();
+    }
+    assert!(
+        !hub.event_plane_owner_ops_pending(),
+        "owner turn must admit the parked production transfer"
+    );
+    assert_eq!(
+        scopes.identities(success),
+        Some(std::collections::BTreeSet::from([
+            LeaseIdentity::ProviderResyncNeed {
+                family: "lease-probe.item".into(),
+            }
+        ]))
     );
 }

@@ -780,12 +780,12 @@ fn retire_event_holder(runtime: &HubRuntime, flight: &EventDeliveryFlight) -> bo
     ) {
         Ok(_) => {
             if let Some(scope_id) = flight.scope_id {
-                runtime.causal_scopes().release(
+                runtime.admit_causal_op(crate::package_event_router::CausalOp::Release {
                     scope_id,
-                    crate::package_event_router::LeaseIdentity::EventInFlight {
+                    identity: crate::package_event_router::LeaseIdentity::EventInFlight {
                         request_id: flight.request_id.clone(),
                     },
-                );
+                });
             }
             true
         }

@@ -1050,10 +1050,32 @@ fn retire_holder_locked(
     true
 }
 
+/// Required causal transfer or release that has not yet been admitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CausalOp {
+    Transfer {
+        scope_id: u64,
+        from: LeaseIdentity,
+        to: Vec<LeaseIdentity>,
+    },
+    Release {
+        scope_id: u64,
+        identity: LeaseIdentity,
+    },
+}
+
+/// One-shot causal admission. `Retry` returns ownership to the caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CausalAdmitResult {
+    Applied,
+    Retry(CausalOp),
+}
+
 /// Owner-thread-only keyed operations. No mutex. Workers never read this map.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct EventPlaneOwnerOps {
     pending: BTreeMap<String, VecDeque<OwnerOp>>,
+    causal: VecDeque<CausalOp>,
 }
 
 impl EventPlaneOwnerOps {
@@ -1064,9 +1086,13 @@ impl EventPlaneOwnerOps {
             .push_back(op);
     }
 
+    pub fn record_causal(&mut self, op: CausalOp) {
+        self.causal.push_back(op);
+    }
+
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.pending.values().all(VecDeque::is_empty)
+        self.pending.values().all(VecDeque::is_empty) && self.causal.is_empty()
     }
 
     pub fn apply_ready(&mut self, router: &PackageEventRouter) -> Vec<OwnerOp> {
@@ -1091,6 +1117,25 @@ impl EventPlaneOwnerOps {
         applied
     }
 
+    /// Retry parked causal ops for one owner-loop slice.
+    pub fn apply_causal(&mut self, scopes: &CausalScopeTable) -> usize {
+        let started = Instant::now();
+        let mut applied = 0;
+        while applied < CAUSAL_FLUSH_MAX && started.elapsed() < Duration::from_millis(8) {
+            let Some(op) = self.causal.pop_front() else {
+                break;
+            };
+            match scopes.try_admit(op) {
+                CausalAdmitResult::Applied => applied += 1,
+                CausalAdmitResult::Retry(op) => {
+                    self.causal.push_front(op);
+                    break;
+                }
+            }
+        }
+        applied
+    }
+
     #[cfg(test)]
     #[must_use]
     pub fn pending_for(&self, owner: &str) -> Vec<OwnerOp> {
@@ -1101,20 +1146,12 @@ impl EventPlaneOwnerOps {
             .cloned()
             .collect()
     }
-}
 
-/// Owner-thread retry ledger for causal-scope transfer and release.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CausalOp {
-    Transfer {
-        scope_id: u64,
-        from: LeaseIdentity,
-        to: Vec<LeaseIdentity>,
-    },
-    Release {
-        scope_id: u64,
-        identity: LeaseIdentity,
-    },
+    #[cfg(test)]
+    #[must_use]
+    pub fn pending_causal(&self) -> Vec<CausalOp> {
+        self.causal.iter().cloned().collect()
+    }
 }
 
 pub const CAUSAL_PENDING_MAX: usize = 256;
@@ -1209,54 +1246,46 @@ impl CausalScopeTable {
         scope_id: u64,
         from: LeaseIdentity,
         to: impl IntoIterator<Item = LeaseIdentity>,
-    ) -> OwnerApplyResult {
-        self.apply_or_queue(CausalOp::Transfer {
+    ) -> CausalAdmitResult {
+        self.try_admit(CausalOp::Transfer {
             scope_id,
             from,
             to: to.into_iter().collect(),
         })
     }
 
-    pub fn release(&self, scope_id: u64, identity: LeaseIdentity) -> OwnerApplyResult {
-        self.apply_or_queue(CausalOp::Release { scope_id, identity })
+    pub fn release(&self, scope_id: u64, identity: LeaseIdentity) -> CausalAdmitResult {
+        self.try_admit(CausalOp::Release { scope_id, identity })
     }
 
-    fn apply_or_queue(&self, op: CausalOp) -> OwnerApplyResult {
+    /// Admit one causal op or return it. Never waits or spins.
+    pub fn try_admit(&self, op: CausalOp) -> CausalAdmitResult {
         match self.pending_tx.try_send(op) {
             Ok(()) => {
                 self.pending_len.fetch_add(1, Ordering::SeqCst);
                 let _ = self.flush_pending();
+                CausalAdmitResult::Applied
             }
-            Err(TrySendError::Full(op) | TrySendError::Disconnected(op)) => {
-                self.retain(op);
-            }
+            Err(TrySendError::Full(op) | TrySendError::Disconnected(op)) => self.retain(op),
         }
-        OwnerApplyResult::Applied
     }
 
-    fn retain(&self, mut op: CausalOp) {
-        loop {
-            match self.retries.try_lock() {
-                Ok(mut retries) if retries.len() < CAUSAL_PENDING_MAX => {
-                    retries.push_back(op);
-                    self.pending_len.fetch_add(1, Ordering::SeqCst);
-                    return;
-                }
-                Ok(_) | Err(_) => {
-                    let _ = self.flush_pending();
-                    match self.pending_tx.try_send(op) {
-                        Ok(()) => {
-                            self.pending_len.fetch_add(1, Ordering::SeqCst);
-                            return;
-                        }
-                        Err(
-                            TrySendError::Full(returned) | TrySendError::Disconnected(returned),
-                        ) => {
-                            op = returned;
-                        }
-                    }
-                }
+    fn retain(&self, op: CausalOp) -> CausalAdmitResult {
+        match self.retries.try_lock() {
+            Ok(mut retries) if retries.len() < CAUSAL_PENDING_MAX => {
+                retries.push_back(op);
+                self.pending_len.fetch_add(1, Ordering::SeqCst);
+                CausalAdmitResult::Applied
             }
+            Ok(_) | Err(_) => match self.pending_tx.try_send(op) {
+                Ok(()) => {
+                    self.pending_len.fetch_add(1, Ordering::SeqCst);
+                    CausalAdmitResult::Applied
+                }
+                Err(TrySendError::Full(op) | TrySendError::Disconnected(op)) => {
+                    CausalAdmitResult::Retry(op)
+                }
+            },
         }
     }
 
@@ -1895,7 +1924,7 @@ mod tests {
                     seq: 32,
                 }],
             ),
-            OwnerApplyResult::Applied
+            CausalAdmitResult::Applied
         );
         assert!(table.is_live(scope));
         assert_eq!(table.lease_count(scope), Some(1));
@@ -2098,7 +2127,7 @@ mod tests {
                         seq: 1,
                     }],
                 ),
-                OwnerApplyResult::Applied
+                CausalAdmitResult::Applied
             );
             assert_eq!(
                 table.release(
@@ -2108,7 +2137,7 @@ mod tests {
                         seq: 1,
                     },
                 ),
-                OwnerApplyResult::Applied
+                CausalAdmitResult::Applied
             );
             assert!(table.pending_ops());
         });
@@ -2148,7 +2177,7 @@ mod tests {
                             seq: index as u64,
                         }],
                     ),
-                    OwnerApplyResult::Applied
+                    CausalAdmitResult::Applied
                 );
             }
             assert_eq!(
@@ -2156,7 +2185,7 @@ mod tests {
                     scopes[0],
                     LeaseIdentity::ProviderResyncNeed { family: "f".into() },
                 ),
-                OwnerApplyResult::Applied
+                CausalAdmitResult::Applied
             );
             assert_eq!(
                 table.release(
@@ -2165,7 +2194,7 @@ mod tests {
                         request_id: "evt".into(),
                     },
                 ),
-                OwnerApplyResult::Applied
+                CausalAdmitResult::Applied
             );
             assert_eq!(
                 table.release(
@@ -2174,7 +2203,7 @@ mod tests {
                         request_id: "prov".into(),
                     },
                 ),
-                OwnerApplyResult::Applied
+                CausalAdmitResult::Applied
             );
             assert!(table.pending_ops());
         });
@@ -2218,9 +2247,92 @@ mod tests {
                         seq: index as u64,
                     },
                 ),
-                OwnerApplyResult::Applied
+                CausalAdmitResult::Applied
             );
             assert!(!table.is_live(*scope));
+        }
+    }
+
+    #[test]
+    fn full_causal_path_returns_the_513th_operation_without_spinning() {
+        let table = CausalScopeTable::new();
+        let capacity = CAUSAL_PENDING_MAX * 2;
+        let mut scopes = Vec::new();
+        for index in 0..=capacity {
+            let scope = table
+                .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+                    plugin_key: format!("p{index}"),
+                }))
+                .expect("mint");
+            scopes.push(scope);
+        }
+        let overflow = table.test_with_inner_held(|| {
+            for (index, scope) in scopes.iter().take(capacity).enumerate() {
+                assert_eq!(
+                    table.transfer(
+                        *scope,
+                        LeaseIdentity::PendingEntityPublish {
+                            plugin_key: format!("p{index}"),
+                        },
+                        [LeaseIdentity::AdmittedEntityMutation {
+                            family: "f".into(),
+                            seq: index as u64,
+                        }],
+                    ),
+                    CausalAdmitResult::Applied
+                );
+            }
+            let started = Instant::now();
+            let result = table.transfer(
+                scopes[capacity],
+                LeaseIdentity::PendingEntityPublish {
+                    plugin_key: format!("p{capacity}"),
+                },
+                [LeaseIdentity::AdmittedEntityMutation {
+                    family: "f".into(),
+                    seq: capacity as u64,
+                }],
+            );
+            assert!(
+                started.elapsed() < StdDuration::from_millis(20),
+                "full path must return without spinning: {:?}",
+                started.elapsed()
+            );
+            result
+        });
+        let CausalAdmitResult::Retry(overflow) = overflow else {
+            panic!("the 513th transfer must return to the caller: {overflow:?}");
+        };
+        let first = table.flush_pending();
+        assert!(first > 0);
+        assert!(
+            first <= CAUSAL_FLUSH_MAX,
+            "one owner turn must not drain without a bound: {first}"
+        );
+        assert_eq!(
+            table.identities(scopes[0]),
+            Some(BTreeSet::from([LeaseIdentity::AdmittedEntityMutation {
+                family: "f".into(),
+                seq: 0,
+            }]))
+        );
+        let mut applied = first;
+        while table.pending_ops() {
+            applied += table.flush_pending();
+        }
+        assert_eq!(applied, capacity);
+        assert_eq!(table.try_admit(overflow), CausalAdmitResult::Applied);
+        while table.pending_ops() {
+            let _ = table.flush_pending();
+        }
+        for (index, scope) in scopes.iter().enumerate() {
+            assert_eq!(
+                table.identities(*scope),
+                Some(BTreeSet::from([LeaseIdentity::AdmittedEntityMutation {
+                    family: "f".into(),
+                    seq: index as u64,
+                }]))
+            );
         }
     }
 
