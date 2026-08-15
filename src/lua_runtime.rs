@@ -248,6 +248,38 @@ impl HubEntityPublishBridge {
         self.reject_next.store(true, Ordering::SeqCst);
     }
 
+    #[must_use]
+    #[doc(hidden)]
+    pub fn pending_publish_count(&self) -> usize {
+        self.pending
+            .lock()
+            .map(|pending| pending.len())
+            .unwrap_or(0)
+    }
+
+    #[doc(hidden)]
+    pub fn test_queue_publish(
+        &self,
+        plugin_key: PluginKey,
+        frame: serde_json::Value,
+        scope_id: Option<u64>,
+    ) -> mpsc::Receiver<Result<crate::package_entity_fanout::PackageEntityPublishResult, String>>
+    {
+        let token = self.next_token.fetch_add(1, Ordering::SeqCst);
+        let (response, receiver) = mpsc::channel();
+        self.pending
+            .lock()
+            .expect("entity publish queue lock")
+            .push_back(PendingEntityPublishRequest {
+                token,
+                plugin_key,
+                frame,
+                scope_id,
+                response,
+            });
+        receiver
+    }
+
     fn publish(
         &self,
         plugin_key: PluginKey,

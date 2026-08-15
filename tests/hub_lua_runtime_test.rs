@@ -5863,6 +5863,134 @@ fn production_transfer_stays_owned_when_every_store_is_full() {
 }
 
 #[test]
+fn fulfill_leaves_the_next_publish_on_the_bridge_until_a_slot_frees() {
+    let hub = explicit_runtime("lease-fulfill-gate");
+    let scopes = hub.causal_scopes().clone();
+    let fill = mint_leftover_fill(&scopes);
+    let first = scopes
+        .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+            plugin_key: "xfer".into(),
+        }))
+        .expect("first");
+    let second = scopes.mint_with_lease(None).expect("second");
+    let bridge = hub.entity_publish_bridge();
+    scopes.test_with_inner_held(|| {
+        fill_every_leftover_store(&hub, &scopes, &fill);
+        hub.test_settle_publish("probe.item", first, "xfer", 1, true);
+        assert!(hub.test_unsettled());
+        assert!(!hub.test_leftover_slot_available());
+        assert_eq!(hub.test_resync_lease_count("probe.item"), 1);
+        let waiting = bridge.test_queue_publish(
+            PluginKey("waiting".into()),
+            serde_json::json!({}),
+            Some(second),
+        );
+        assert_eq!(bridge.pending_publish_count(), 1);
+        hub.test_fulfill_pending_publishes();
+        assert_eq!(
+            bridge.pending_publish_count(),
+            1,
+            "fulfill must leave the next request on the bridge while no leftover slot remains"
+        );
+        assert!(waiting.try_recv().is_err());
+    });
+    assert_eq!(
+        scopes.identities(second),
+        Some(std::collections::BTreeSet::new()),
+        "untaken publish must not acquire PendingEntityPublish"
+    );
+    while !hub.test_leftover_slot_available()
+        && (scopes.pending_ops() || hub.event_plane_owner_ops_pending())
+    {
+        let _ = hub.apply_event_plane_owner_ops();
+        let _ = scopes.flush_pending();
+    }
+    assert!(hub.test_leftover_slot_available());
+    assert_eq!(bridge.pending_publish_count(), 1);
+    hub.test_fulfill_pending_publishes();
+    assert_eq!(bridge.pending_publish_count(), 0);
+    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+        let _ = hub.apply_event_plane_owner_ops();
+        let _ = scopes.flush_pending();
+    }
+    assert_eq!(
+        hub.keep_owned_op(CausalOp::Release {
+            scope_id: first,
+            identity: LeaseIdentity::AdmittedEntityMutation {
+                family: "probe.item".into(),
+                seq: 1,
+            },
+        }),
+        CausalAdmitResult::Applied
+    );
+    assert_eq!(
+        hub.keep_owned_op(CausalOp::Release {
+            scope_id: first,
+            identity: LeaseIdentity::ProviderResyncNeed {
+                family: "probe.item".into(),
+            },
+        }),
+        CausalAdmitResult::Applied
+    );
+    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+        let _ = hub.apply_event_plane_owner_ops();
+        let _ = scopes.flush_pending();
+    }
+    assert!(!scopes.is_live(first));
+    assert!(!scopes.is_live(second));
+}
+
+#[test]
+fn provider_snapshot_stays_busy_when_every_store_is_full() {
+    let registry = install_named_lua_package(
+        "lease-provider-gate",
+        lease_probe_plugin(),
+        lease_probe_manifest(),
+    );
+    let mut hub = explicit_runtime("lease-provider-gate");
+    hub.load_lua_plugin_package(&registry, "lease-probe")
+        .expect("load");
+    let scopes = hub.causal_scopes().clone();
+    let fill = mint_leftover_fill(&scopes);
+    let provider = scopes
+        .mint_with_lease(Some(LeaseIdentity::ProviderResyncNeed {
+            family: "lease-probe.item".into(),
+        }))
+        .expect("provider");
+    let first = scopes
+        .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+            plugin_key: "xfer".into(),
+        }))
+        .expect("first");
+    scopes.test_with_inner_held(|| {
+        fill_every_leftover_store(&hub, &scopes, &fill);
+        hub.test_settle_publish("probe.item", first, "xfer", 1, true);
+        hub.test_store_resync_lease(provider, "lease-probe.item");
+        assert!(!hub.test_leftover_slot_available());
+        let error = hub
+            .plugin_entity_snapshot("lease-probe.item", "saturated-sub")
+            .expect_err("saturated provider must refuse before acquire");
+        assert_eq!(error.code, "causal_scope_busy");
+    });
+    assert_eq!(
+        scopes.identities(provider),
+        Some(
+            [LeaseIdentity::ProviderResyncNeed {
+                family: "lease-probe.item".into(),
+            }]
+            .into_iter()
+            .collect()
+        ),
+        "provider snapshot must not acquire ProviderInFlight when the leftover gate is closed"
+    );
+    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+        let _ = hub.apply_event_plane_owner_ops();
+        let _ = scopes.flush_pending();
+    }
+    assert!(!hub.test_unsettled());
+}
+
+#[test]
 fn lock_held_transfer_stays_owned_after_family_commit() {
     let hub = explicit_runtime("lease-source-held-transfer");
     let scopes = hub.causal_scopes().clone();

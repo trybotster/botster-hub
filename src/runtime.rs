@@ -1194,6 +1194,17 @@ impl HubRuntime {
         self.unsettled_op.borrow().is_some()
     }
 
+    #[must_use]
+    #[doc(hidden)]
+    pub fn test_leftover_slot_available(&self) -> bool {
+        self.leftover_slot_available()
+    }
+
+    #[doc(hidden)]
+    pub fn test_fulfill_pending_publishes(&self) {
+        self.fulfill_pending_entity_publish_requests();
+    }
+
     #[doc(hidden)]
     pub fn test_admit_publish(
         &self,
