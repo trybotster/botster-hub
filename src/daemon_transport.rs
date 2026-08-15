@@ -478,6 +478,7 @@ async fn handle_connection_async(
         let request = tokio::select! {
             request = read_async_frame::<DaemonRequest, _>(&mut reader, None) => request,
             _ = mux.notify().notified() => {
+                mux.clear_deferred_flushes();
                 if let Err(error) = flush_unix_mux_writes(&mut write_half, &mux, &mut mux_write).await {
                     cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
                     mux.close_all();
@@ -486,6 +487,7 @@ async fn handle_connection_async(
                 continue;
             }
             _ = tokio::time::sleep(Duration::from_millis(25)), if mux.has_unsent_mux_writes() || mux_write.has_pending() => {
+                mux.clear_deferred_flushes();
                 if let Err(error) = flush_unix_mux_writes(&mut write_half, &mux, &mut mux_write).await {
                     cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
                     mux.close_all();
@@ -573,6 +575,12 @@ async fn handle_connection_async(
             let _ = control_tx.try_send(ControlMessage::EgressWriteFailed {
                 delivery_kind: daemon_delivery_kind(&response),
             });
+            mux.close_all();
+            return Err(error);
+        }
+        mux.clear_deferred_flushes();
+        if let Err(error) = flush_unix_mux_writes(&mut write_half, &mux, &mut mux_write).await {
+            cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
             mux.close_all();
             return Err(error);
         }
@@ -784,6 +792,9 @@ fn abandon_pending_terminal(write_state: &mut MuxWriteState) {
         && let Some(handle) = pending.complete_envelope
     {
         handle.defer_flush();
+        // Free the adapter slot. Holding an unsent frame here blocks
+        // ClientWorker, so ProcessExited never reaches observe.
+        let _ = handle.complete_active();
     }
 }
 
@@ -857,7 +868,7 @@ mod mux_write_resume_tests {
         unix_mux_blocks_entity_subscription, write_frame_bytes_resumable,
     };
     use crate::unix_terminal_adapter::{UnixConnectionMux, UnixTerminalAdapter};
-    use botster_core::contract::terminal_adapter::TerminalAdapter;
+    use botster_core::contract::terminal_adapter::{TerminalAdapter, TerminalAdapterPressure};
     use botster_hub_client::{
         DaemonEvent, DaemonResponseKind, DaemonUnixTerminalEnvelope,
         TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER, parse_unix_mux_value,
@@ -1038,6 +1049,45 @@ mod mux_write_resume_tests {
                     .expect("classify mux frame")
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn abandoned_zero_progress_terminal_frees_slot_for_later_frames() {
+        let mux = UnixConnectionMux::new();
+        let mut stall = occupy_route(&mux, "stall", "sub", "flood");
+        assert_eq!(mux.snapshot_writes().len(), 1);
+
+        let mut writer = PrefixStallWriter {
+            written: Vec::new(),
+            stall_after: 0,
+            allow_remainder: false,
+        };
+        let mut write_state = MuxWriteState::default();
+        flush_unix_mux_writes(&mut writer, &mux, &mut write_state)
+            .await
+            .expect("zero-progress terminal start is abandoned");
+        assert_eq!(
+            stall.pressure(),
+            TerminalAdapterPressure::Ready,
+            "abandon must free the adapter slot so later frames can enqueue"
+        );
+
+        let later = TerminalFrame::from_bytes(br#"{"type":"terminal_output","marker":"exit"}"#)
+            .expect("opaque later frame");
+        assert_eq!(stall.try_write(&later), Ok(()));
+        mux.clear_deferred_flushes();
+        writer.allow_remainder = true;
+        writer.stall_after = usize::MAX;
+        flush_unix_mux_writes(&mut writer, &mux, &mut write_state)
+            .await
+            .expect("flush the frame that replaced the abandoned slot");
+        let lines = parse_written_mux_lines(&writer.written);
+        assert!(
+            lines
+                .iter()
+                .any(|line| matches!(line, botster_hub_client::DaemonUnixMuxFrame::Terminal(_))),
+            "later frame after abandon must reach the mux, lines={lines:?}"
+        );
     }
 
     #[tokio::test]
@@ -3251,33 +3301,39 @@ fn handle_runtime_control_request(
             Ok(daemon_events(Vec::new()))
         }
         DaemonRequest::ReadScreen { session_id } => {
+            let now = tick(logical_clock);
+            let session_id = SessionId(session_id);
             let response = api.handle_request(
                 runtime,
                 &packages,
                 HubClientRequest::ReadScreen {
                     request_id: request_id("daemon-sessions-read-screen"),
-                    session_id: SessionId(session_id),
-                    now_seconds: tick(logical_clock),
+                    session_id: session_id.clone(),
+                    now_seconds: now,
                 },
             )?;
             let HubClientResponseBody::ReadScreen(screen) = response.body else {
                 return Err(DaemonTransportError::UnexpectedResponse);
             };
+            let _ = runtime.apply_retained_lifecycle_observations(&session_id, now);
             Ok(daemon_read_screen(screen))
         }
         DaemonRequest::ReadModeFlags { session_id } => {
+            let now = tick(logical_clock);
+            let session_id = SessionId(session_id);
             let response = api.handle_request(
                 runtime,
                 &packages,
                 HubClientRequest::ReadModeFlags {
                     request_id: request_id("daemon-sessions-read-mode-flags"),
-                    session_id: SessionId(session_id),
-                    now_seconds: tick(logical_clock),
+                    session_id: session_id.clone(),
+                    now_seconds: now,
                 },
             )?;
             let HubClientResponseBody::ModeFlags(mode_flags) = response.body else {
                 return Err(DaemonTransportError::UnexpectedResponse);
             };
+            let _ = runtime.apply_retained_lifecycle_observations(&session_id, now);
             Ok(daemon_mode_flags(mode_flags))
         }
         DaemonRequest::CaptureSnapshot { session_id } => {

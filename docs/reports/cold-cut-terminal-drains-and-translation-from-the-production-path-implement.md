@@ -14,7 +14,7 @@ Plan: `docs/plans/cold-cut-terminal-drains-and-translation-from-the-production-p
 | Worktree HEAD before edits | `959c58f55726d098299cced8af151d8f496f41e3` |
 | Locked Core SHA | `aef6516d5809d563961ed7fdd07da29a7b4edddc` |
 | Merge policy | direct into `main`; no PR |
-| Review follow-up | `review_1786780308_178506` on `a5d8fcf` |
+| Review follow-up | `review_1786782306_835066` on `49e98fd` |
 
 Independent routing matched the approved plan. This run did not infer the repository from the ambient directory.
 
@@ -105,7 +105,15 @@ Review `review_1786780308_178506` required three follow-ups on `a5d8fcf`:
 2. `finding_1786780308_358706` — delete reachable AttachState construction and production terminal-body matching.
 3. `finding_1786780308_712158` — handle one-line `#[cfg(test)]` items and add a known-positive for every forbidden construct.
 
+Review `review_1786782306_835066` required one follow-up on `49e98fd`:
+
+- `finding_1786782306_311566` — attached session exit stayed `running` until the terminal connection dropped.
+
 This visit:
+
+- After host `ReadScreen` and `ReadModeFlags`, Hub applies the lifecycle observations Core retained for the next drain. `observe_lifecycle_slice` does not take that pending set. The helper discards terminal bodies.
+- A zero-progress Unix mux terminal abandon now frees the adapter slot. A later ProcessExited frame can enqueue while the connection stays live.
+- Deferred mux flushes clear after a host response and on the idle flush path.
 
 - Deleted `HubRuntime::session_lifecycle_baseline()`.
 - Changed `HubClientApi::SubscribeEntities` to return `SessionLifecycleBaselinePage`.
@@ -142,12 +150,13 @@ Passed on this tree:
 - Session-worker locked build
 - rustfmt
 - strict clippy
-- Hub lib tests: 269 passed, including fail-closed local Attach, negative architecture scan, WebRTC bind/peer-loss/fail-closed sibling, one-line `#[cfg(test)]` scan controls, and `early_session_subscription_waits_for_complete_paged_projection`
+- Hub lib tests: 270 passed, including fail-closed local Attach, negative architecture scan, WebRTC bind/peer-loss/fail-closed sibling, one-line `#[cfg(test)]` scan controls, and `early_session_subscription_waits_for_complete_paged_projection`
 - `hub_client_api_test`: 34 passed, including `session_entity_subscription_returns_a_bounded_page_not_a_complete_baseline`
 - IsolatedHub Unix always-bind, empty Attach, host Drain empty, ReadScreen marker, replacement-owner
 - Lifecycle oracles rewritten off Attach/Drain translation: mux frames, `ReadScreen`, host OperatorError, session-entity patches
 - `hub_daemon_lifecycle_test`: 202 passed, 1 ignored (larger local many-PTY)
-- Full `./test.sh --locked` workspace: all binaries ok (lifecycle 202/1 ignored; lib 269; client API 34; no FAILED results)
+- Full `./test.sh --locked` workspace: all binaries ok (lifecycle 202/1 ignored; lib 270; client API 34; no FAILED results)
+- `session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnect` passed isolated three times (4.3–4.6s) and in the locked suite
 - `cli_smoke_proves_local_runtime_daemon_package_app_session_and_webrtc` passed in the locked suite
 - Missing-session host Drain is a typed OperatorError (`drain_runtime` / `terminal_stream_unavailable`)
 - SendInput/ModeGatedInput/Resize/Spawn/Shutdown/Remove observe through `pump_bound_unix_routes` so host inventory advances without terminal Drain
