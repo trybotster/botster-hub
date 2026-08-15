@@ -219,11 +219,11 @@ impl AttachStreamRegistry {
         }
     }
 
-    pub(crate) fn retain_active_sessions(&mut self, active_session_ids: &BTreeSet<String>) {
+    pub(crate) fn retain_sessions_present_in(&mut self, present: impl Fn(&str) -> bool) {
         let stale: Vec<(String, String)> = self
             .streams
             .keys()
-            .filter(|(session_id, _)| !active_session_ids.contains(session_id))
+            .filter(|(session_id, _)| !present(session_id))
             .cloned()
             .collect();
         for (session_id, subscription_id) in stale {

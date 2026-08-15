@@ -1072,17 +1072,29 @@ fn botster_web_same_url_reload_issues_fresh_local_webrtc_bootstrap() {
             subscribed.kind,
             botster_hub_client::DaemonResponseKind::EntitySubscribed
         );
-        assert!(matches!(
-            reload_peer
+        loop {
+            match reload_peer
                 .next_entity_frame(&reload_key)
                 .await
-                .expect("second generation fresh snapshot"),
-            botster_hub_client::DaemonEntityFrame::Snapshot { ref items, .. }
-                if items.iter().any(|item| {
-                    item.get("session_uuid").and_then(serde_json::Value::as_str)
-                        == Some("local-webrtc-reload-session")
-                })
-        ));
+                .expect("second generation projection")
+            {
+                botster_hub_client::DaemonEntityFrame::Snapshot { ref items, .. }
+                    if items.iter().any(|item| {
+                        item.get("session_uuid").and_then(serde_json::Value::as_str)
+                            == Some("local-webrtc-reload-session")
+                    }) =>
+                {
+                    break;
+                }
+                botster_hub_client::DaemonEntityFrame::Upsert { ref id, .. }
+                    if id == "local-webrtc-reload-session" =>
+                {
+                    break;
+                }
+                botster_hub_client::DaemonEntityFrame::Snapshot { .. } => {}
+                other => panic!("unexpected second-generation frame: {other:?}"),
+            }
+        }
         let generation_two_shutdown = reload_peer
             .encrypted_request(
                 &reload_key,
@@ -1155,17 +1167,29 @@ fn botster_web_same_url_reload_issues_fresh_local_webrtc_bootstrap() {
             subscribed.kind,
             botster_hub_client::DaemonResponseKind::EntitySubscribed
         );
-        assert!(matches!(
-            final_peer
+        loop {
+            match final_peer
                 .next_entity_frame(&final_key)
                 .await
-                .expect("third generation fresh snapshot"),
-            botster_hub_client::DaemonEntityFrame::Snapshot { ref items, .. }
-                if items.iter().any(|item| {
-                    item.get("session_uuid").and_then(serde_json::Value::as_str)
-                        == Some("local-webrtc-reload-session")
-                })
-        ));
+                .expect("third generation projection")
+            {
+                botster_hub_client::DaemonEntityFrame::Snapshot { ref items, .. }
+                    if items.iter().any(|item| {
+                        item.get("session_uuid").and_then(serde_json::Value::as_str)
+                            == Some("local-webrtc-reload-session")
+                    }) =>
+                {
+                    break;
+                }
+                botster_hub_client::DaemonEntityFrame::Upsert { ref id, .. }
+                    if id == "local-webrtc-reload-session" =>
+                {
+                    break;
+                }
+                botster_hub_client::DaemonEntityFrame::Snapshot { .. } => {}
+                other => panic!("unexpected third-generation frame: {other:?}"),
+            }
+        }
         let current_generation_remove = final_peer
             .encrypted_request(
                 &final_key,

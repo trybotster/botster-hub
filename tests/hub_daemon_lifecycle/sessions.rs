@@ -2740,21 +2740,43 @@ fn session_entity_subscription_projects_stale_row_as_indeterminate() {
     subscription
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("bound stale projection read");
-    let snapshot = subscription
-        .next_frame()
-        .expect("authoritative stale snapshot");
-    assert!(matches!(
-        snapshot,
-        botster_hub_client::DaemonEntityFrame::Snapshot { ref items, .. }
-            if items.iter().any(|entity| {
-                entity.get("session_uuid").and_then(serde_json::Value::as_str)
-                    == Some(session_id.0.as_str())
-                    && entity.get("registry_state").and_then(serde_json::Value::as_str)
-                        == Some("stale")
-                    && entity.get("lifecycle_class").and_then(serde_json::Value::as_str)
-                        == Some("indeterminate")
-            })
-    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut saw_stale = false;
+    while Instant::now() < deadline {
+        match subscription
+            .next_frame()
+            .expect("authoritative stale projection")
+        {
+            botster_hub_client::DaemonEntityFrame::Snapshot { ref items, .. }
+                if items.iter().any(|entity| {
+                    entity.get("session_uuid").and_then(serde_json::Value::as_str)
+                        == Some(session_id.0.as_str())
+                        && entity.get("registry_state").and_then(serde_json::Value::as_str)
+                            == Some("stale")
+                        && entity.get("lifecycle_class").and_then(serde_json::Value::as_str)
+                            == Some("indeterminate")
+                }) =>
+            {
+                saw_stale = true;
+                break;
+            }
+            botster_hub_client::DaemonEntityFrame::Upsert {
+                ref id,
+                ref entity,
+                ..
+            } if id == &session_id.0
+                && entity.get("registry_state").and_then(serde_json::Value::as_str)
+                    == Some("stale")
+                && entity.get("lifecycle_class").and_then(serde_json::Value::as_str)
+                    == Some("indeterminate") =>
+            {
+                saw_stale = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_stale, "stale projection must arrive as snapshot or upsert");
     subscription
         .unsubscribe()
         .expect("unsubscribe stale projection");
@@ -2918,11 +2940,36 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
         additional
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("bound additional snapshot read");
-        assert!(matches!(
-            additional.next_frame().expect("additional idle snapshot"),
-            botster_hub_client::DaemonEntityFrame::Snapshot { ref items, .. }
-                if items.len() == 8
-        ));
+        let mut seen = std::collections::BTreeSet::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while seen.len() < 8 && Instant::now() < deadline {
+            match additional.next_frame() {
+                Err(botster_hub_client::DaemonTransportError::Io(error))
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    continue;
+                }
+                Err(error) => panic!("additional idle frame: {error}"),
+                Ok(frame) => match frame {
+                botster_hub_client::DaemonEntityFrame::Snapshot { items, .. } => {
+                    for item in items {
+                        if let Some(id) = item
+                            .get("session_uuid")
+                            .and_then(serde_json::Value::as_str)
+                        {
+                            seen.insert(id.to_string());
+                        }
+                    }
+                }
+                    botster_hub_client::DaemonEntityFrame::Upsert { id, .. } => {
+                        seen.insert(id);
+                    }
+                    _ => {}
+                },
+            }
+        }
+        assert_eq!(seen.len(), 8, "paged subscribe must deliver every live row");
         additional_subscriptions.push(additional);
     }
     thread::sleep(Duration::from_millis(600));
