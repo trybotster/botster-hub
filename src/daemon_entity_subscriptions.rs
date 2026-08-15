@@ -632,17 +632,19 @@ pub(super) fn drive_package_entity_fanout(daemon: &mut HubDaemon, state: &mut Da
     let Some(runtime) = daemon.runtime() else {
         return;
     };
-    let mutations = runtime.take_package_entity_fanout();
+    let mutations = runtime.take_leased_package_entity_fanout();
     if mutations.is_empty() {
         return;
     }
-    for mutation in mutations {
+    for item in mutations {
+        let mutation = &item.mutation;
         state.lifecycle_counters.package_entity_publish_accepted = state
             .lifecycle_counters
             .package_entity_publish_accepted
             .saturating_add(1);
         let entity_type = mutation.entity_type().to_string();
         let seq = mutation.snapshot_seq();
+        let mut scheduled_resync = false;
         let mut dead = Vec::new();
         for (subscription_id, subscription) in state.entity_subscriptions.iter_mut() {
             if subscription.entity_type != entity_type {
@@ -657,6 +659,7 @@ pub(super) fn drive_package_entity_fanout(daemon: &mut HubDaemon, state: &mut Da
             let Some(applied) = subscription.package_last_applied_seq else {
                 subscription.package_catching_up = true;
                 runtime.mark_package_entity_resync_needed(&entity_type);
+                scheduled_resync = true;
                 continue;
             };
             if seq < applied + 1 {
@@ -667,10 +670,11 @@ pub(super) fn drive_package_entity_fanout(daemon: &mut HubDaemon, state: &mut Da
                 // Gap relative to this subscriber — schedule targeted resync.
                 subscription.package_catching_up = true;
                 runtime.mark_package_entity_resync_needed(&entity_type);
+                scheduled_resync = true;
                 continue;
             }
             // seq == applied + 1
-            let frame = package_mutation_to_daemon_frame(subscription_id, &mutation);
+            let frame = package_mutation_to_daemon_frame(subscription_id, mutation);
             if entity_frame_exceeds_limit(&frame) {
                 state.lifecycle_counters.entity_delivery_attempts = state
                     .lifecycle_counters
@@ -693,6 +697,7 @@ pub(super) fn drive_package_entity_fanout(daemon: &mut HubDaemon, state: &mut Da
                         subscription.resync_reason =
                             Some("entity_provider_frame_too_large".to_string());
                         runtime.mark_package_entity_resync_needed(&entity_type);
+                        scheduled_resync = true;
                     }
                     Err(EntityFrameTrySendError::Full(_)) => {
                         state.lifecycle_counters.entity_delivery_overflows = state
@@ -702,6 +707,7 @@ pub(super) fn drive_package_entity_fanout(daemon: &mut HubDaemon, state: &mut Da
                         subscription.package_catching_up = true;
                         subscription.resync_reason = Some("subscriber_overflow".to_string());
                         runtime.mark_package_entity_resync_needed(&entity_type);
+                        scheduled_resync = true;
                     }
                     Err(EntityFrameTrySendError::Disconnected) => {
                         state.lifecycle_counters.entity_delivery_failures = state
@@ -734,6 +740,7 @@ pub(super) fn drive_package_entity_fanout(daemon: &mut HubDaemon, state: &mut Da
                     subscription.package_catching_up = true;
                     subscription.resync_reason = Some("subscriber_overflow".to_string());
                     runtime.mark_package_entity_resync_needed(&entity_type);
+                    scheduled_resync = true;
                 }
                 Err(EntityFrameTrySendError::Disconnected) => {
                     state.lifecycle_counters.entity_delivery_failures = state
@@ -744,6 +751,7 @@ pub(super) fn drive_package_entity_fanout(daemon: &mut HubDaemon, state: &mut Da
                 }
             }
         }
+        runtime.finish_package_entity_mutation_fanout(&item, scheduled_resync);
         for subscription_id in dead {
             state.entity_subscriptions.remove(&subscription_id);
         }

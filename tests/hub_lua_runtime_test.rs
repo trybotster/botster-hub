@@ -3953,6 +3953,7 @@ fn scoped_command(
 
 fn lease_probe_plugin() -> &'static str {
     r#"
+local provider_status = "none"
 return botster.register({
   handlers = {
     {
@@ -3961,12 +3962,21 @@ return botster.register({
       descriptor_id = "lease-probe.item",
       descriptor = { entity_type = "lease-probe.item", id_field = "id" },
       call = function()
+        local emitted = events.emit("unused", { ok = true })
+        provider_status = emitted.status
         return {
           type = "entity_snapshot",
           entity_type = "lease-probe.item",
           snapshot_seq = 0,
           items = {},
         }
+      end,
+    },
+    {
+      id = "last_provider",
+      kind = "command",
+      call = function()
+        return { status = provider_status }
       end,
     },
     {
@@ -4117,6 +4127,69 @@ return botster.register({})
 }
 
 #[test]
+fn held_router_reload_keeps_one_generation_until_owner_apply() {
+    let registry = install_named_lua_package(
+        "held-router-reload",
+        r#"
+events.on("hub", "worktree_created", function(event)
+  return { received = event.event }
+end)
+return botster.register({})
+"#,
+        serde_json::json!({
+            "name": "held-reload.plugin",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "capabilities": [],
+            "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }],
+            "events": {
+                "emitted": [{
+                    "name": "sample.ready",
+                    "audience": ["plugins"],
+                    "payload_schema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": { "ok": { "type": "boolean" } },
+                        "required": ["ok"]
+                    }
+                }]
+            }
+        }),
+    );
+    let mut hub = explicit_runtime("held-router-reload");
+    hub.load_lua_plugin_package(&registry, "held-reload.plugin")
+        .expect("load");
+    let router = hub.package_event_router().clone();
+    let first = router
+        .current_package_generation("held-reload.plugin")
+        .expect("first");
+    assert!(router.test_has_contract("held-reload.plugin", "sample.ready"));
+    let result = router.test_with_inner_held(|| {
+        hub.reload_lua_plugin_package(
+            RequestId("held-reload".into()),
+            &registry,
+            "held-reload.plugin",
+        )
+    });
+    assert!(result.is_ok(), "reload stages while the router is held");
+    assert_eq!(
+        router
+            .current_package_generation("held-reload.plugin")
+            .expect("unchanged"),
+        first
+    );
+    assert!(router.test_has_contract("held-reload.plugin", "sample.ready"));
+    let _ = hub.apply_event_plane_owner_ops();
+    let after = router
+        .current_package_generation("held-reload.plugin")
+        .expect("replaced");
+    assert!(after > first, "owner apply must commit the replacement");
+    assert!(router.test_has_contract("held-reload.plugin", "sample.ready"));
+    assert_eq!(router.test_subscription_count("held-reload.plugin"), 1);
+}
+
+#[test]
 fn entity_lease_scope_closes_after_success_error_fanout_degradation_and_unload() {
     let registry =
         install_named_lua_package("lease-close", lease_probe_plugin(), lease_probe_manifest());
@@ -4146,11 +4219,33 @@ fn entity_lease_scope_closes_after_success_error_fanout_degradation_and_unload()
             }
         ]))
     );
-    assert_eq!(hub.take_package_entity_fanout().len(), 1);
+    let taken = hub.take_leased_package_entity_fanout();
+    assert_eq!(taken.len(), 1);
     assert!(
-        !scopes.is_live(success),
-        "fanout must close the success scope"
+        scopes.is_live(success),
+        "drain must keep the mutation lease until fanout finishes"
     );
+    hub.finish_package_entity_mutation_fanout(&taken[0], true);
+    assert!(
+        scopes.is_live(success),
+        "fanout-created resync must keep the mutation scope"
+    );
+    hub.plugin_entity_snapshot("lease-probe.item", "fanout-resync")
+        .expect("provider after fanout resync");
+    let provider = hub.invoke_plugin(scoped_command(
+        "lease-probe",
+        "last_provider",
+        serde_json::json!({}),
+        success,
+    ));
+    let PluginInvocationResult::Completed(PluginInvocationSuccess {
+        payload: Some(payload),
+        ..
+    }) = provider.result
+    else {
+        panic!("provider status command should complete");
+    };
+    assert_eq!(payload.0["status"], "rejected_causal_scope");
 
     let errored = scopes.mint_with_lease(None).expect("error scope");
     let failed = hub.invoke_plugin(scoped_command(

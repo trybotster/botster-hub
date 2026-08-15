@@ -143,7 +143,6 @@ pub(super) fn reload_package(
     let (candidate, decision) =
         previous.refreshed_local_package(&package_name, "daemon socket reload local package")?;
     commit_package_registry(daemon, candidate)?;
-    record_event_plane_unload(daemon, &package_name);
     if let Err(error) =
         apply_reload_side_effects(daemon, &package_name, decision.state, &running_entrypoints)
     {
