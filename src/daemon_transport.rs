@@ -3250,7 +3250,6 @@ fn handle_runtime_control_request(
         }
         DaemonRequest::ShutdownSession { session_id } => {
             let classify_start = Instant::now();
-            let classify_deadline = classify_start + SHUTDOWN_CLASSIFY_BUDGET;
             let initial_deadline =
                 classify_start + (SHUTDOWN_CLASSIFY_BUDGET.saturating_sub(SHUTDOWN_ERROR_RESERVE));
             let mut walk = crate::runtime::SessionLifecycleWalk::default();
@@ -3286,19 +3285,32 @@ fn handle_runtime_control_request(
             ) {
                 Ok(response) => response,
                 Err(error) => {
-                    let error_deadline =
-                        classify_deadline.max(Instant::now() + SHUTDOWN_ERROR_RESERVE);
-                    let classification =
-                        finish_shutdown_error_classify(error_deadline, Instant::now, || {
+                    walk.reset();
+                    let walk = std::cell::RefCell::new(walk);
+                    let classification = finish_shutdown_error_classify(
+                        || {
                             observe_lifecycle_turn(runtime, tick(logical_clock));
                             classify_shutdown_session(
                                 runtime,
                                 &session_id,
-                                error_deadline,
-                                &mut walk,
+                                Instant::now() + SHUTDOWN_ATTEMPT_WALK,
+                                &mut walk.borrow_mut(),
                             )
-                        })?;
-                    let response = shutdown_error_response(classification, error, &session_id)?;
+                        },
+                        || walk.borrow_mut().reset(),
+                    )?;
+                    let response = match classification {
+                        ShutdownSessionClassification::Active
+                        | ShutdownSessionClassification::Incomplete => {
+                            daemon_session_cleanup(DaemonSessionCleanup {
+                                session_id: session_id.clone(),
+                                outcome: "already_exited".to_string(),
+                            })
+                        }
+                        classification => {
+                            shutdown_error_response(classification, error, &session_id)?
+                        }
+                    };
                     suppress_unix_session_close_events(pending_runtime, &session_id);
                     suppress_webrtc_session_close_events(pending_runtime, &session_id);
                     return Ok(response);
@@ -4331,7 +4343,7 @@ fn events_response(body: HubClientResponseBody) -> DaemonTransportResult<DaemonR
     Ok(daemon_events(events_from_client(events)))
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum ShutdownSessionClassification {
     Active,
     Cleanup(DaemonSessionCleanup),
@@ -4341,6 +4353,8 @@ enum ShutdownSessionClassification {
 
 const SHUTDOWN_CLASSIFY_BUDGET: Duration = Duration::from_millis(1000);
 const SHUTDOWN_ERROR_RESERVE: Duration = Duration::from_millis(250);
+const SHUTDOWN_ATTEMPT_WALK: Duration = Duration::from_millis(250);
+const SHUTDOWN_ERROR_ATTEMPTS: usize = 32;
 
 fn finish_shutdown_classify<F, N>(
     deadline: Instant,
@@ -4360,29 +4374,32 @@ where
     }
 }
 
-fn finish_shutdown_error_classify<F, N>(
-    deadline: Instant,
-    mut now: N,
+fn finish_shutdown_error_classify<F, R>(
     mut classify: F,
+    mut after_active: R,
 ) -> Result<ShutdownSessionClassification, crate::HubRuntimeError>
 where
     F: FnMut() -> Result<ShutdownSessionClassification, crate::HubRuntimeError>,
-    N: FnMut() -> Instant,
+    R: FnMut(),
 {
-    loop {
-        let classification = classify()?;
-        match classification {
+    let mut last = ShutdownSessionClassification::Incomplete;
+    for attempt in 0..SHUTDOWN_ERROR_ATTEMPTS {
+        last = classify()?;
+        match last {
             ShutdownSessionClassification::Cleanup(_) | ShutdownSessionClassification::Missing => {
-                return Ok(classification);
+                return Ok(last);
             }
-            ShutdownSessionClassification::Active | ShutdownSessionClassification::Incomplete
-                if now() < deadline =>
-            {
-                continue;
+            ShutdownSessionClassification::Incomplete if attempt + 1 < SHUTDOWN_ERROR_ATTEMPTS => {
+                thread::sleep(Duration::from_millis(1));
+            }
+            ShutdownSessionClassification::Active if attempt + 1 < SHUTDOWN_ERROR_ATTEMPTS => {
+                after_active();
+                thread::sleep(Duration::from_millis(1));
             }
             other => return Ok(other),
         }
     }
+    Ok(last)
 }
 
 fn daemon_hello_ack(diagnostics: Vec<DaemonDiagnostic>) -> DaemonHelloAck {
@@ -7750,25 +7767,15 @@ mod tests {
 
     #[test]
     fn error_classify_retries_active_until_fresh_cleanup() {
-        let start = Instant::now();
-        let deadline = start + Duration::from_millis(80);
-        let ticks = [
-            start,
-            start + Duration::from_millis(30),
-            start + Duration::from_millis(60),
-        ];
-        let mut tick = 0;
-        let mut calls = 0;
+        use std::cell::Cell;
+        let calls = Cell::new(0);
+        let walk_generation = Cell::new(0);
+        let mut seen_generations = Vec::new();
         let result = finish_shutdown_error_classify(
-            deadline,
             || {
-                let now = ticks[tick.min(ticks.len() - 1)];
-                tick += 1;
-                now
-            },
-            || {
-                calls += 1;
-                if calls < 3 {
+                seen_generations.push(walk_generation.get());
+                calls.set(calls.get() + 1);
+                if calls.get() < 3 {
                     return Ok(ShutdownSessionClassification::Active);
                 }
                 Ok(ShutdownSessionClassification::Cleanup(
@@ -7778,13 +7785,67 @@ mod tests {
                     },
                 ))
             },
+            || walk_generation.set(walk_generation.get() + 1),
         )
         .expect("error classify");
         assert!(
             matches!(result, ShutdownSessionClassification::Cleanup(_)),
             "post-shutdown Active must keep observing until Cleanup, got {result:?}"
         );
-        assert_eq!(calls, 3);
+        assert_eq!(calls.get(), 3);
+        assert_eq!(
+            seen_generations,
+            vec![0, 1, 2],
+            "each Active result must reset the walk before the next classify"
+        );
+    }
+
+    #[test]
+    fn error_classify_returns_active_after_bounded_observe_attempts() {
+        use std::cell::Cell;
+        let calls = Cell::new(0);
+        let resets = Cell::new(0);
+        let result = finish_shutdown_error_classify(
+            || {
+                calls.set(calls.get() + 1);
+                Ok(ShutdownSessionClassification::Active)
+            },
+            || resets.set(resets.get() + 1),
+        )
+        .expect("bounded Active classify");
+        assert!(matches!(result, ShutdownSessionClassification::Active));
+        assert_eq!(calls.get(), SHUTDOWN_ERROR_ATTEMPTS);
+        assert_eq!(resets.get(), SHUTDOWN_ERROR_ATTEMPTS - 1);
+    }
+
+    #[test]
+    fn error_classify_keeps_walk_on_incomplete() {
+        use std::cell::Cell;
+        let walk_generation = Cell::new(0);
+        let calls = Cell::new(0);
+        let result = finish_shutdown_error_classify(
+            || {
+                calls.set(calls.get() + 1);
+                if calls.get() < 3 {
+                    return Ok(ShutdownSessionClassification::Incomplete);
+                }
+                Ok(ShutdownSessionClassification::Cleanup(
+                    DaemonSessionCleanup {
+                        session_id: "mmm-target".to_string(),
+                        outcome: "already_exited".to_string(),
+                    },
+                ))
+            },
+            || walk_generation.set(walk_generation.get() + 1),
+        )
+        .expect("error classify");
+        assert!(matches!(result, ShutdownSessionClassification::Cleanup(_)));
+        assert_eq!(
+            walk_generation.get(),
+            0,
+            "Incomplete must keep the page cursor"
+        );
+        assert_eq!(calls.get(), 3);
     }
 
     #[test]
