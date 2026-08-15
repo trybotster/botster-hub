@@ -1008,9 +1008,10 @@ fn next_session_family_admission(
             state.scheduler.try_wake();
             return None;
         }
-        let Some(payload) = peek_session_family_payload(state, plugin_key) else {
+        let Some(peeked) = peek_session_family_payload(state, plugin_key) else {
             continue;
         };
+        let payload = peeked.frame().clone();
         let bytes = serde_json::to_vec(&payload)
             .map(|body| body.len())
             .unwrap_or(0);
@@ -1018,7 +1019,7 @@ fn next_session_family_admission(
             state.scheduler.try_wake();
             return None;
         }
-        commit_session_family_payload(state, plugin_key, &payload);
+        commit_session_family_payload(state, plugin_key, peeked);
         let handler = state
             .session_family
             .consumers
@@ -1036,23 +1037,46 @@ fn next_session_family_admission(
     None
 }
 
+enum PeekedFamilyPayload {
+    Queued(serde_json::Value),
+    Chunk {
+        frame: serde_json::Value,
+        last_id: String,
+    },
+    End(serde_json::Value),
+}
+
+impl PeekedFamilyPayload {
+    fn frame(&self) -> &serde_json::Value {
+        match self {
+            Self::Queued(frame) | Self::Chunk { frame, .. } | Self::End(frame) => frame,
+        }
+    }
+}
+
 fn peek_session_family_payload(
     state: &MaintenanceState,
     plugin_key: &str,
-) -> Option<serde_json::Value> {
+) -> Option<PeekedFamilyPayload> {
     let consumer = state.session_family.consumers.get(plugin_key)?;
     if consumer.in_flight.is_some() || consumer.handler.is_none() {
         return None;
     }
     if let Some(payload) = consumer.pending.front() {
-        return Some(payload.clone());
+        return Some(PeekedFamilyPayload::Queued(payload.clone()));
     }
     if !consumer.need_snapshot_chunks {
         return None;
     }
     match next_projection_chunk(&state.projection, consumer.snapshot_after.as_deref()) {
-        Ok(Some((chunk, _))) => Some(session_chunk_frame(consumer.snapshot_sequence, &chunk)),
-        Ok(None) => Some(session_end_frame(consumer.snapshot_sequence, true)),
+        Ok(Some((chunk, last_id))) => Some(PeekedFamilyPayload::Chunk {
+            frame: session_chunk_frame(consumer.snapshot_sequence, &chunk),
+            last_id,
+        }),
+        Ok(None) => Some(PeekedFamilyPayload::End(session_end_frame(
+            consumer.snapshot_sequence,
+            true,
+        ))),
         Err(()) => None,
     }
 }
@@ -1060,35 +1084,26 @@ fn peek_session_family_payload(
 fn commit_session_family_payload(
     state: &mut MaintenanceState,
     plugin_key: &str,
-    payload: &serde_json::Value,
+    peeked: PeekedFamilyPayload,
 ) {
-    match family_frame_kind(payload) {
-        FamilyFrameKind::Begin | FamilyFrameKind::Delta => {
+    match peeked {
+        PeekedFamilyPayload::Queued(payload) => {
             state
                 .session_family
                 .touch_existing_consumer(plugin_key, |consumer| {
-                    if consumer.pending.front() == Some(payload) {
+                    if consumer.pending.front() == Some(&payload) {
                         consumer.pending.pop_front();
                     }
                 });
         }
-        FamilyFrameKind::Chunk => {
-            if let Ok(Some((_, last_id))) = next_projection_chunk(
-                &state.projection,
-                state
-                    .session_family
-                    .consumers
-                    .get(plugin_key)
-                    .and_then(|consumer| consumer.snapshot_after.as_deref()),
-            ) {
-                state
-                    .session_family
-                    .touch_existing_consumer(plugin_key, |consumer| {
-                        consumer.snapshot_after = Some(last_id);
-                    });
-            }
+        PeekedFamilyPayload::Chunk { last_id, .. } => {
+            state
+                .session_family
+                .touch_existing_consumer(plugin_key, |consumer| {
+                    consumer.snapshot_after = Some(last_id);
+                });
         }
-        FamilyFrameKind::End => {
+        PeekedFamilyPayload::End(_) => {
             state
                 .session_family
                 .touch_existing_consumer(plugin_key, |consumer| {
@@ -1103,8 +1118,9 @@ fn next_session_family_payload(
     state: &mut MaintenanceState,
     plugin_key: &str,
 ) -> Option<serde_json::Value> {
-    let payload = peek_session_family_payload(state, plugin_key)?;
-    commit_session_family_payload(state, plugin_key, &payload);
+    let peeked = peek_session_family_payload(state, plugin_key)?;
+    let payload = peeked.frame().clone();
+    commit_session_family_payload(state, plugin_key, peeked);
     Some(payload)
 }
 
@@ -1203,6 +1219,9 @@ fn fanout_family_frame(
     let mut visited = 0;
     for plugin_key in &keys {
         if !budget.take() {
+            break;
+        }
+        if !budget.add_bytes(job.bytes) {
             break;
         }
         if !state
@@ -1853,6 +1872,54 @@ mod tests {
                 .expect("consumer")
                 .pending,
             pending_before
+        );
+    }
+
+    #[test]
+    fn fanout_stops_before_shared_byte_limit() {
+        let mut state = MaintenanceState::default();
+        seed_family_consumers(&mut state, 2);
+        queue_family_delta(
+            &mut state,
+            &SessionLifecycleChange {
+                cursor: botster_core_daemon::SessionLifecycleCursor {
+                    source_id: botster_core_daemon::SessionLifecycleSourceId("s".into()),
+                    sequence: 2,
+                },
+                kind: botster_core_daemon::SessionLifecycleChangeKind::Removed {
+                    session_id: SessionId("gone".into()),
+                },
+            },
+        );
+        {
+            let job = state
+                .session_family
+                .pending_fanout
+                .front_mut()
+                .expect("job");
+            job.bytes = HOST_BRIDGE_MAX_BYTES / 2 + 1;
+        }
+        continue_family_fanout(&mut state, &mut HostBridgeBudget::new());
+        let first = state
+            .session_family
+            .consumers
+            .get("plugin.00")
+            .expect("first");
+        let second = state
+            .session_family
+            .consumers
+            .get("plugin.01")
+            .expect("second");
+        assert_eq!(first.pending.len(), 1);
+        assert!(second.pending.is_empty());
+        assert_eq!(state.session_family.pending_fanout.len(), 1);
+        assert_eq!(
+            state
+                .session_family
+                .pending_fanout
+                .front()
+                .and_then(|job| job.after.as_deref()),
+            Some("plugin.00")
         );
     }
 }

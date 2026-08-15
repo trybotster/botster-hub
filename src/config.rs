@@ -43,8 +43,6 @@ pub struct HubStartupOptions {
     pub provider_directories: DirectoryList,
     pub transports: TransportBindings,
     pub core_engine: CoreEngineOptions,
-    #[serde(default)]
-    pub plugin_worker_class: PluginWorkerClassOptions,
 }
 
 impl Default for HubStartupOptions {
@@ -57,7 +55,6 @@ impl Default for HubStartupOptions {
             provider_directories: DirectoryList::default(),
             transports: TransportBindings::default(),
             core_engine: CoreEngineOptions::default(),
-            plugin_worker_class: PluginWorkerClassOptions::default(),
         }
     }
 }
@@ -99,15 +96,12 @@ impl HubStartupOptions {
             provider_directories,
             transports,
             core_engine: self.core_engine,
-            plugin_worker_class: self.plugin_worker_class,
         })
     }
 
     fn validate(&self) -> Result<(), HubConfigError> {
         self.session_defaults.validate()?;
         self.core_engine.validate()?;
-        self.plugin_worker_class
-            .validate(self.core_engine.plugin_worker_executor_concurrency)?;
         self.transports.validate()
     }
 }
@@ -127,14 +121,12 @@ pub struct HubConfig {
     pub provider_directories: Vec<PathBuf>,
     pub transports: TransportBindings,
     pub core_engine: CoreEngineOptions,
-    #[serde(default)]
-    pub plugin_worker_class: PluginWorkerClassOptions,
 }
 
 impl HubConfig {
     pub(crate) fn plugin_worker_config(&self) -> botster_core::PluginWorkerEngineConfig {
         self.core_engine
-            .plugin_worker_config(&self.plugin_worker_class)
+            .plugin_worker_config(&PluginWorkerClassOptions::default())
     }
 }
 
@@ -329,7 +321,10 @@ pub struct TcpBinding {
 /// The hub records queue, session I/O coalescing, and plugin-worker tuning here
 /// so startup policy is explicit. The underlying queues, session I/O worker,
 /// plugin worker engine, and delivery mechanics remain owned by `botster-core`.
-/// Class-specific plugin-worker queue knobs nested under [`CoreEngineOptions`].
+/// Class-specific plugin-worker queue knobs.
+///
+/// These knobs use Core defaults. They are not fields on
+/// [`HubStartupOptions`], [`HubConfig`], or [`CoreEngineOptions`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginWorkerClassOptions {
     /// RequestResponse executor slots reserved by Core. Must be >= 1 and
@@ -369,6 +364,7 @@ impl Default for PluginWorkerClassOptions {
 }
 
 impl PluginWorkerClassOptions {
+    #[cfg_attr(not(test), allow(dead_code))]
     fn validate(&self, plugin_worker_executor_concurrency: usize) -> Result<(), HubConfigError> {
         if self.reserved_request_response_executors < 1
             || self.reserved_request_response_executors >= plugin_worker_executor_concurrency
@@ -694,30 +690,23 @@ mod tests {
         assert_eq!(round_trip, options);
         assert!(json.contains("\"plugin_worker_queue_capacity\""));
         assert!(json.contains("\"plugin_worker_executor_concurrency\""));
-        assert!(json.contains("\"reserved_request_response_executors\""));
-        assert!(json.contains("\"background_queue_capacity\""));
-        assert!(json.contains("\"completion_queue_capacity\""));
+        assert!(!json.contains("\"plugin_worker_class\""));
         assert!(!json.contains("\"plugin_worker_capacity\""));
     }
 
     #[test]
     fn omitted_worker_class_knobs_take_core_defaults() {
         let defaults = PluginWorkerEngineConfig::default();
-        let mut value = serde_json::to_value(HubStartupOptions::default()).expect("serialize");
-        value
-            .as_object_mut()
-            .expect("object")
-            .remove("plugin_worker_class");
-        let options: HubStartupOptions =
-            serde_json::from_value(value).expect("deserialize without class knobs");
+        let options = HubStartupOptions::default();
+        let mapped = options
+            .core_engine
+            .plugin_worker_config(&PluginWorkerClassOptions::default());
         assert_eq!(
-            options
-                .plugin_worker_class
-                .reserved_request_response_executors,
+            mapped.reserved_request_response_executors,
             defaults.reserved_request_response_executors
         );
         assert_eq!(
-            options.plugin_worker_class.background_queue_capacity,
+            mapped.background_queue_capacity,
             defaults.background_queue_capacity
         );
     }
@@ -735,18 +724,11 @@ mod tests {
 
     #[test]
     fn reserved_request_response_executors_must_leave_a_background_slot() {
-        let options = HubStartupOptions {
-            core_engine: CoreEngineOptions {
-                plugin_worker_executor_concurrency: 2,
-                ..CoreEngineOptions::default()
-            },
-            plugin_worker_class: PluginWorkerClassOptions {
-                reserved_request_response_executors: 2,
-                ..PluginWorkerClassOptions::default()
-            },
-            ..HubStartupOptions::default()
+        let class = PluginWorkerClassOptions {
+            reserved_request_response_executors: 2,
+            ..PluginWorkerClassOptions::default()
         };
-        let error = options.validate().expect_err("reservation must be strict");
+        let error = class.validate(2).expect_err("reservation must be strict");
         assert!(matches!(
             error,
             HubConfigError::InvalidPluginWorkerReservation { .. }
