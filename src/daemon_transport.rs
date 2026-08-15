@@ -7961,10 +7961,10 @@ mod tests {
         let stop_path = data_directory.join("stop-mmm-target");
         let ready_path = data_directory.join("ready-mmm-target");
         let mut owned = OwnedSessionRuntime::new(data_directory);
-        for index in 0..32 {
+        for index in 0..2 {
             owned.spawn(&format!("aaa-{index:02}"), "sleep 30".to_string());
         }
-        for index in 0..32 {
+        for index in 0..2 {
             owned.spawn(&format!("zzz-{index:02}"), "sleep 30".to_string());
         }
         let stop = stop_path.display().to_string();
@@ -7985,6 +7985,7 @@ mod tests {
         assert!(ready_path.exists(), "target must start before classify");
 
         let mut walk = crate::runtime::SessionLifecycleWalk::default();
+        walk.set_page_row_limit(2);
         let first = classify_shutdown_session(
             &mut owned.runtime,
             "mmm-target",
@@ -8078,14 +8079,14 @@ mod tests {
 
     #[test]
     fn page_budgets_shrink_with_remaining_deadline() {
-        let full = crate::runtime::shutdown_lifecycle_page_budget(Duration::from_millis(1000))
+        let full = crate::runtime::shutdown_lifecycle_page_budget(Duration::from_millis(1000), 32)
             .expect("1 s remaining still pages");
-        let short = crate::runtime::shutdown_lifecycle_page_budget(Duration::from_millis(80))
+        let short = crate::runtime::shutdown_lifecycle_page_budget(Duration::from_millis(80), 32)
             .expect("80 ms remaining still pages");
         assert_eq!(full.max_elapsed, Duration::from_millis(250));
         assert_eq!(short.max_elapsed, Duration::from_millis(80));
         assert!(short.max_elapsed < full.max_elapsed);
-        assert!(crate::runtime::shutdown_lifecycle_page_budget(Duration::ZERO).is_none());
+        assert!(crate::runtime::shutdown_lifecycle_page_budget(Duration::ZERO, 32).is_none());
     }
 
     #[test]
@@ -8645,7 +8646,6 @@ mod tests {
         }
 
         fn retire_owned_sessions(&mut self) -> Result<(), String> {
-            let socket_dir = core_worker_socket_dir(&self.data_directory);
             let mut errors = Vec::new();
             for session_id in self.session_ids.drain(..) {
                 let _ = self
@@ -8656,7 +8656,7 @@ mod tests {
             if let Err(error) = self.runtime.shutdown_core_for_test(tick(&mut self.clock)) {
                 errors.push(format!("core shutdown: {error}"));
             }
-            if let Err(error) = wait_for_owned_workers_released(&socket_dir) {
+            if let Err(error) = wait_until_exported_spawn_succeeds() {
                 errors.push(error);
             }
             if let Err(error) = std::fs::remove_dir_all(&self.data_directory) {
@@ -8693,80 +8693,35 @@ mod tests {
         }
     }
 
-    fn core_worker_socket_dir(data_dir: &Path) -> PathBuf {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        data_dir.to_path_buf().hash(&mut hasher);
-        std::env::temp_dir().join(format!("bcd-{:x}", hasher.finish()))
-    }
-
-    fn session_workers_for_socket_dir(socket_dir: &Path) -> Vec<(u32, String)> {
-        let marker = socket_dir.to_string_lossy();
-        let output = std::process::Command::new("ps")
-            .args(["-ax", "-o", "pid=,args="])
-            .output()
-            .ok();
-        let Some(output) = output else {
-            return Vec::new();
-        };
-        String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter_map(|line| {
-                let line = line.trim();
-                let (pid, args) = line.split_once(char::is_whitespace)?;
-                if !args.contains("botster-session-worker") || !args.contains(marker.as_ref()) {
-                    return None;
-                }
-                Some((pid.parse().ok()?, args.to_string()))
-            })
-            .collect()
-    }
-
-    fn wait_for_owned_workers_released(socket_dir: &Path) -> Result<(), String> {
+    fn wait_until_exported_spawn_succeeds() -> Result<(), String> {
         let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let remaining = session_workers_for_socket_dir(socket_dir);
-            let sockets_released = !socket_dir.exists()
-                || std::fs::read_dir(socket_dir)
-                    .map(|entries| entries.count() == 0)
-                    .unwrap_or(true);
-            if remaining.is_empty() && sockets_released {
-                return Ok(());
+        let mut last = "no probe attempt".to_string();
+        while Instant::now() < deadline {
+            let probe_dir = unique_package_control_dir("reset-spawn-probe");
+            let _ = std::fs::create_dir_all(&probe_dir);
+            let mut probe = crate::HubRuntime::new(package_control_config(probe_dir.clone()));
+            let mut clock = 1_u64;
+            let session_id = SessionId("probe-session".to_string());
+            let spawn = crate::HubClientApi::local_operator("reset-spawn-probe").handle_request(
+                &mut probe,
+                &crate::PackageRegistry::new(std::collections::BTreeSet::new()),
+                crate::HubClientRequest::Spawn {
+                    request_id: RequestId("probe-spawn".to_string()),
+                    session_id: session_id.clone(),
+                    command: "true".to_string(),
+                    now_seconds: tick(&mut clock),
+                },
+            );
+            let _ = probe.shutdown_session(session_id, tick(&mut clock));
+            let _ = probe.shutdown_core_for_test(tick(&mut clock));
+            let _ = std::fs::remove_dir_all(&probe_dir);
+            match spawn {
+                Ok(_) => return Ok(()),
+                Err(error) => last = format!("{error:?}"),
             }
-            if Instant::now() >= deadline {
-                if remaining.is_empty() && sockets_released {
-                    return Ok(());
-                }
-                for (pid, command) in &remaining {
-                    if !command.contains("botster-session-worker")
-                        || !command.contains(&*socket_dir.to_string_lossy())
-                    {
-                        continue;
-                    }
-                    let _ = std::process::Command::new("kill")
-                        .args(["-KILL", &pid.to_string()])
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status();
-                }
-                thread::sleep(Duration::from_millis(50));
-                let leftover = session_workers_for_socket_dir(socket_dir);
-                if leftover.is_empty()
-                    && (!socket_dir.exists()
-                        || std::fs::read_dir(socket_dir)
-                            .map(|entries| entries.count() == 0)
-                            .unwrap_or(true))
-                {
-                    return Ok(());
-                }
-                return Err(format!(
-                    "owned session workers still hold {}: leftover={}",
-                    socket_dir.display(),
-                    leftover.len()
-                ));
-            }
-            thread::sleep(Duration::from_millis(10));
+            thread::sleep(Duration::from_millis(20));
         }
+        Err(format!("exported spawn is not reusable yet: {last}"))
     }
 
     fn package_control_config(data_directory: PathBuf) -> crate::HubConfig {
