@@ -564,7 +564,12 @@ Product proofs through the production owner loop:
     completion. Unload returns to baseline.
 11. `BindTerminalAdapter` mapping is total over the four published
     variants.
-12. Existing session entity subscription tests still pass.
+12. Existing session entity subscription tests still pass. The attached
+    natural-exit proof uses the entity patch as the lifecycle oracle.
+    Unbound Drain may surface `SessionLifecycle` exited from
+    observe-retained control-plane observations, or `ProcessExit` when
+    Core still places that frame on client egress. ReadScreen remains
+    the pending-output proof when Drain has no terminal bytes.
 13. Rewrite
     `session_entity_subscription_observes_natural_exit_without_terminal_attach`
     so the oracle is the Hub projection, not a terminal Drain event.

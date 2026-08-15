@@ -174,11 +174,14 @@ dispatch, and show the diagnostic in the hub connection state.
 ## Session entity subscriptions
 
 `subscribe_session_entities` opens a dedicated held-open connection for the
-built-in `session` family. The first pushed frame is an authoritative,
+built-in `session` family. Hub maintains one canonical session projection
+from Core observe slices and journal pages even when no Web or TUI
+subscriber is connected. The first pushed frame is an authoritative,
 stable-id-ordered `entity_snapshot`; later `entity_upsert`, sparse
 `entity_patch`, and `entity_remove` frames carry strictly increasing sequence
-values from CoreDaemon's lifecycle cursor. Every frame includes the caller's
+values from that projection. Every frame includes the caller's
 connection-scoped `subscription_id` and `entity_type: "session"`.
+Client session frames stay `entity_snapshot` / upsert / patch / remove.
 
 Package-owned families use the same held-open request and `DaemonEntityFrame`
 wire envelope with generic JSON records. They require the advertised

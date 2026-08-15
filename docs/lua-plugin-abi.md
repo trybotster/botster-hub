@@ -170,6 +170,13 @@ delivery is bounded and isolated, but it is synchronous with the emitting
 worktree CRUD request; a slow handler can add latency until the worker timeout.
 Event names match exactly.
 
+Authorized plugins consume the Hub-owned `/session` family through
+`events.on("session_family", ...)`. Hub admits those frames as Background
+work: `snapshot_begin`, bounded `snapshot_chunk`, `snapshot_end` at one
+snapshot sequence, then live deltas. At most one session-family frame is
+in flight per plugin. Admission, completion, or handler failure marks a
+gap and requires a complete baseline. These frames do not expire.
+
 Worktree lifecycle events are emitted by hub-owned worktree CRUD:
 
 - `worktree_created`

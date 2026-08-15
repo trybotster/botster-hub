@@ -353,6 +353,9 @@ fn hub_runtime_passes_split_plugin_worker_config_to_core_engine() {
         core_engine: CoreEngineOptions {
             plugin_worker_queue_capacity: 7,
             plugin_worker_executor_concurrency: 3,
+            reserved_request_response_executors: 1,
+            background_queue_capacity: 4,
+            completion_queue_capacity: 5,
             ..CoreEngineOptions::default()
         },
         ..HubStartupOptions::default()
@@ -384,6 +387,9 @@ fn hub_runtime_passes_split_plugin_worker_config_to_core_engine() {
     let snapshot = hub.plugin_worker_debug_snapshot();
     assert_eq!(snapshot.configured_queue_capacity, 7);
     assert_eq!(snapshot.configured_executor_concurrency, 3);
+    assert_eq!(snapshot.configured_reserved_request_response_executors, 1);
+    assert_eq!(snapshot.configured_background_queue_capacity, 4);
+    assert_eq!(snapshot.configured_completion_queue_capacity, 5);
     assert_eq!(snapshot.live_plugin_executors, 1);
     assert_eq!(snapshot.live_executor_workers, 3);
 
