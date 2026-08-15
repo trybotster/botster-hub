@@ -3226,6 +3226,7 @@ fn handle_runtime_control_request(
         }
         DaemonRequest::ShutdownSession { session_id } => {
             let now = tick(logical_clock);
+            observe_lifecycle_turn(runtime, now);
             match classify_shutdown_session(runtime, &session_id)? {
                 ShutdownSessionClassification::Active => {}
                 ShutdownSessionClassification::Cleanup(cleanup) => {
@@ -3246,30 +3247,23 @@ fn handle_runtime_control_request(
                 },
             ) {
                 Ok(response) => response,
-                Err(error) => {
-                    if shutdown_error_is_unknown_session(&error) {
-                        suppress_unix_session_close_events(pending_runtime, &session_id);
-                        suppress_webrtc_session_close_events(pending_runtime, &session_id);
-                        return Ok(daemon_session_cleanup(DaemonSessionCleanup {
-                            session_id: session_id.clone(),
-                            outcome: "already_exited".to_string(),
-                        }));
-                    }
-                    return match classify_shutdown_session(runtime, &session_id)? {
-                        ShutdownSessionClassification::Cleanup(cleanup) => {
-                            suppress_unix_session_close_events(pending_runtime, &session_id);
-                            suppress_webrtc_session_close_events(pending_runtime, &session_id);
-                            Ok(daemon_session_cleanup(cleanup))
-                        }
+                Err(_) => {
+                    observe_lifecycle_turn(runtime, now);
+                    let cleanup = match classify_shutdown_session(runtime, &session_id)? {
+                        ShutdownSessionClassification::Cleanup(cleanup) => cleanup,
                         ShutdownSessionClassification::Missing => {
                             suppress_unix_session_close_events(pending_runtime, &session_id);
                             suppress_webrtc_session_close_events(pending_runtime, &session_id);
-                            Ok(daemon_unknown_session_cleanup(&session_id))
+                            return Ok(daemon_unknown_session_cleanup(&session_id));
                         }
-                        ShutdownSessionClassification::Active => {
-                            Err(DaemonTransportError::Client(error))
-                        }
+                        ShutdownSessionClassification::Active => DaemonSessionCleanup {
+                            session_id: session_id.clone(),
+                            outcome: "already_exited".to_string(),
+                        },
                     };
+                    suppress_unix_session_close_events(pending_runtime, &session_id);
+                    suppress_webrtc_session_close_events(pending_runtime, &session_id);
+                    return Ok(daemon_session_cleanup(cleanup));
                 }
             };
             suppress_unix_session_close_events(pending_runtime, &session_id);
@@ -7121,17 +7115,6 @@ pub(super) fn daemon_event_from_client(event: HubClientEvent) -> DaemonEvent {
             .to_string(),
         },
     }
-}
-
-fn shutdown_error_is_unknown_session(error: &crate::HubClientError) -> bool {
-    matches!(
-        error,
-        crate::HubClientError::Runtime {
-            operation: crate::HubClientOperation::Shutdown,
-            kind: crate::HubClientRuntimeErrorKind::UnknownSession,
-            ..
-        }
-    )
 }
 
 fn envelope_target_label(target: &EnvelopeTarget) -> String {
