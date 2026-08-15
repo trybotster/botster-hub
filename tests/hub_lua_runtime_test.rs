@@ -4985,15 +4985,18 @@ fn unload_retries_restored_family_leases_until_scopes_close() {
             assert_eq!(hub.keep_owned_op(dummy.clone()), CausalAdmitResult::Applied);
         }
         assert_eq!(hub.test_retry_ops_len(), CAUSAL_PENDING_MAX);
-        hub.test_enqueue_or_family(
-            "lease-probe.item",
-            CausalOp::Release {
-                scope_id: lives[0],
-                identity: LeaseIdentity::AdmittedEntityMutation {
-                    family: "lease-probe.item".into(),
-                    seq: 0,
+        assert_eq!(
+            hub.test_enqueue_or_family(
+                "lease-probe.item",
+                CausalOp::Release {
+                    scope_id: lives[0],
+                    identity: LeaseIdentity::AdmittedEntityMutation {
+                        family: "lease-probe.item".into(),
+                        seq: 0,
+                    },
                 },
-            },
+            ),
+            CausalAdmitResult::Applied
         );
         hub.drop_package_entity_families_for("lease-probe");
         assert!(hub.test_family_unloading("lease-probe.item"));
@@ -5014,6 +5017,116 @@ fn unload_retries_restored_family_leases_until_scopes_close() {
         let _ = scopes.flush_pending();
     }
     assert!(!hub.test_family_unloading("lease-probe.item"));
+    for scope in lives {
+        assert!(!scopes.is_live(scope));
+    }
+}
+
+#[test]
+fn family_causal_is_one_global_fifo_and_257th_stays_at_source() {
+    let hub = explicit_runtime("lease-family-bound");
+    let scopes = hub.causal_scopes().clone();
+    let mut parked = Vec::new();
+    for index in 0..CAUSAL_PENDING_MAX {
+        let scope = scopes
+            .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+                family: format!("f{index}"),
+                seq: index as u64,
+            }))
+            .expect("mint");
+        assert_eq!(
+            hub.test_park_family_causal(CausalOp::Release {
+                scope_id: scope,
+                identity: LeaseIdentity::AdmittedEntityMutation {
+                    family: format!("f{index}"),
+                    seq: index as u64,
+                },
+            }),
+            CausalAdmitResult::Applied
+        );
+        parked.push(scope);
+    }
+    assert_eq!(hub.test_family_causal_len(), CAUSAL_PENDING_MAX);
+    let overflow = scopes
+        .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+            family: "source".into(),
+            seq: 0,
+        }))
+        .expect("overflow");
+    let rejected = hub.test_park_family_causal(CausalOp::Release {
+        scope_id: overflow,
+        identity: LeaseIdentity::AdmittedEntityMutation {
+            family: "source".into(),
+            seq: 0,
+        },
+    });
+    let CausalAdmitResult::Retry(op) = rejected else {
+        panic!("257th family leftover must stay with the caller");
+    };
+    assert_eq!(hub.test_family_causal_len(), CAUSAL_PENDING_MAX);
+    assert_eq!(
+        hub.test_restore_family_source("source", op),
+        CausalAdmitResult::Applied
+    );
+    assert!(hub.test_family_held("source"));
+    assert_eq!(hub.test_held_family_count(), 1);
+    let _ = hub.apply_event_plane_owner_ops();
+    let remaining = hub.test_family_causal_len();
+    assert!(
+        remaining > 0 && remaining < CAUSAL_PENDING_MAX,
+        "one owner turn must stop family_causal iteration: {remaining}"
+    );
+    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+        let _ = hub.apply_event_plane_owner_ops();
+        let _ = scopes.flush_pending();
+    }
+    assert_eq!(hub.test_family_causal_len(), 0);
+    assert!(!hub.test_family_held("source"));
+    for scope in parked {
+        assert!(!scopes.is_live(scope));
+    }
+    assert!(!scopes.is_live(overflow));
+}
+
+#[test]
+fn family_source_retry_stops_iteration_after_the_slice() {
+    let hub = explicit_runtime("lease-family-slice");
+    let scopes = hub.causal_scopes().clone();
+    let mut lives = Vec::new();
+    for index in 0..(CAUSAL_FLUSH_MAX + 8) {
+        let scope = scopes
+            .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+                family: format!("held{index}"),
+                seq: index as u64,
+            }))
+            .expect("mint");
+        assert_eq!(
+            hub.test_restore_family_source(
+                &format!("held{index}"),
+                CausalOp::Release {
+                    scope_id: scope,
+                    identity: LeaseIdentity::AdmittedEntityMutation {
+                        family: format!("held{index}"),
+                        seq: index as u64,
+                    },
+                },
+            ),
+            CausalAdmitResult::Applied
+        );
+        lives.push(scope);
+    }
+    assert_eq!(hub.test_held_family_count(), CAUSAL_FLUSH_MAX + 8);
+    let _ = hub.apply_event_plane_owner_ops();
+    let remaining = hub.test_held_family_count();
+    assert!(
+        remaining > 0 && remaining < CAUSAL_FLUSH_MAX + 8,
+        "one owner turn must stop family-source iteration: {remaining}"
+    );
+    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+        let _ = hub.apply_event_plane_owner_ops();
+        let _ = scopes.flush_pending();
+    }
+    assert_eq!(hub.test_held_family_count(), 0);
     for scope in lives {
         assert!(!scopes.is_live(scope));
     }
