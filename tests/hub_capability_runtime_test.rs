@@ -13,7 +13,7 @@ use botster_core::{
     HttpCapabilityRequest, HttpHeader, PluginKey, PluginStoreCapabilityRequest, PluginStoreKey,
     PluginStoreOperation, PluginStoreResult, RequestId, ResizePayload, ScopedRelativePath,
     SessionId, SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId,
-    TimerCapabilityRequest, TransportEgress, WebSocketCapabilityRequest,
+    TimerCapabilityRequest, WebSocketCapabilityRequest,
 };
 use botster_hub::{
     DataDirectoryOption, HostIdentityOptions, HubRuntime, HubStartupOptions, RuntimeEnvironment,
@@ -221,31 +221,25 @@ fn spawn_request(config: &botster_hub::HubConfig) -> SessionSpawnRequest {
 
 fn drain_session_until(
     runtime: &mut HubRuntime,
-    client_id: &ClientId,
+    _client_id: &ClientId,
     session_id: &SessionId,
-    subscription_id: &SubscriptionId,
+    _subscription_id: &SubscriptionId,
     needle: &[u8],
     logical_clock: &mut u64,
 ) {
     let deadline = Instant::now() + Duration::from_secs(5);
-    let mut observed = Vec::new();
 
     while Instant::now() < deadline {
-        let output = runtime
-            .drain_subscription(client_id, session_id, subscription_id, *logical_clock)
-            .expect("drain subscription");
+        let _ = runtime.observe_lifecycle_slice(
+            *logical_clock,
+            None,
+            botster_core_daemon::ObserveLifecycleBudget {
+                max_sessions: 32,
+                max_encoded_result_bytes: 64 * 1024,
+                max_elapsed: Duration::from_millis(25),
+            },
+        );
         *logical_clock += 1;
-        for (_, frame) in output.client_egress {
-            if let TransportEgress::TerminalOutput { data, .. } = frame {
-                observed.extend(data);
-            }
-        }
-        if observed
-            .windows(needle.len())
-            .any(|window| window == needle)
-        {
-            return;
-        }
         if let Ok(screen) = runtime.read_screen(
             RequestId("capability-drain-screen".to_string()),
             session_id.clone(),

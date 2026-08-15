@@ -3135,6 +3135,78 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
 }
 
 #[test]
+fn session_projection_observes_exit_without_subscribers_then_later_snapshot_includes_ended_row() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("session-projection-zero-subs");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("test config has local socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: "zero-sub-exit".to_string(),
+            command: "sleep 0.1".to_string(),
+        },
+    )
+    .expect("spawn session with no entity subscribers");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut listed = None;
+    while Instant::now() < deadline {
+        listed = botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::ListSessions,
+        )
+        .ok()
+        .and_then(|response| {
+            response.sessions.iter().find_map(|session| {
+                (session.session_id == "zero-sub-exit").then(|| session.lifecycle.clone())
+            })
+        });
+        if listed.as_deref() == Some("exited") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        listed.as_deref(),
+        Some("exited"),
+        "owner loop must observe natural exit with zero entity subscribers"
+    );
+
+    let mut subscription =
+        botster_hub_client::subscribe_session_entities(&endpoint, "entities-after-exit")
+            .expect("subscribe after unobserved-by-clients exit");
+    subscription
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound later subscriber reads");
+    let snapshot = subscription
+        .next_frame()
+        .expect("later subscriber snapshot");
+    let botster_hub_client::DaemonEntityFrame::Snapshot { items, .. } = snapshot else {
+        panic!("expected snapshot, got {snapshot:?}");
+    };
+    assert!(
+        items.iter().any(|item| {
+            item.get("session_uuid").and_then(serde_json::Value::as_str) == Some("zero-sub-exit")
+                && item.get("lifecycle").and_then(serde_json::Value::as_str) == Some("exited")
+        }),
+        "later subscriber must receive the ended row, items={items:?}"
+    );
+    subscription
+        .unsubscribe()
+        .expect("unsubscribe later subscriber");
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
 fn session_entity_subscription_observes_natural_exit_without_terminal_attach() {
     let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("session-entity-no-terminal");
@@ -3750,11 +3822,11 @@ fn external_hub_client_reports_compatibility_descriptor_and_mismatch_diagnostics
     );
     assert!(
         !ack.compatibility
-            .supports_feature(botster_hub_client::FEATURE_TERMINAL_STREAMING)
+            .supports_feature(botster_terminal_protocol::FEATURE_TERMINAL_STREAMING)
     );
     assert!(
         !ack.compatibility
-            .supports_feature(botster_hub_client::FEATURE_RESIZE)
+            .supports_feature(botster_terminal_protocol::FEATURE_RESIZE)
     );
     assert!(
         ack.compatibility

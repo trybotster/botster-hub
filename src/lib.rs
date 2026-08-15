@@ -861,6 +861,58 @@ mod tests {
         assert!(client_api.reason().contains("not the daemon wire crate"));
     }
 
+    fn production_source(source: &str) -> String {
+        let mut out = String::new();
+        let mut skip_depth = 0i32;
+        let mut skipping_item = false;
+        let mut seen_body = false;
+        for line in source.lines() {
+            let trimmed = line.trim();
+            let opens = line.matches('{').count() as i32;
+            let closes = line.matches('}').count() as i32;
+            if trimmed.starts_with("#[cfg(test)]") {
+                skipping_item = true;
+                seen_body = false;
+                skip_depth = 0;
+                continue;
+            }
+            if skipping_item {
+                skip_depth += opens - closes;
+                if skip_depth > 0 {
+                    seen_body = true;
+                }
+                if (seen_body && skip_depth <= 0) || (!seen_body && trimmed.ends_with(';')) {
+                    skipping_item = false;
+                    skip_depth = 0;
+                }
+                continue;
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn production_source_scan_covers_items_after_cfg_test_imports() {
+        let source = concat!(
+            "#[cfg(test)]\n",
+            "use crate::test_only;\n",
+            "#[cfg(test)]\n",
+            "fn helper(\n",
+            "    x: u8,\n",
+            ") {\n",
+            "    drain_subscription();\n",
+            "}\n",
+            "fn production() {}\n",
+            "fn sneaky() { drain_subscription(); }\n",
+        );
+        let scanned = production_source(source);
+        assert!(scanned.contains("fn production()"));
+        assert!(scanned.contains("drain_subscription()"));
+        assert!(!scanned.contains("test_only"));
+    }
+
     #[test]
     fn production_sources_reject_terminal_drain_and_snapshot_phase_decode() {
         let files = [
@@ -881,13 +933,7 @@ mod tests {
             ("src/main.rs", include_str!("main.rs")),
         ];
         for (path, source) in files {
-            let production = source
-                .split("#[cfg(test)]")
-                .next()
-                .unwrap_or(source)
-                .split("mod tests")
-                .next()
-                .unwrap_or(source);
+            let production = production_source(source);
             for forbidden in [r#""READY""#, r#""PAGE""#, r#""FINISH""#] {
                 assert!(
                     !production.contains(forbidden),
@@ -900,13 +946,11 @@ mod tests {
                     "{path} production source must not decode GHOSTSNP"
                 );
             }
-            if path != "src/runtime.rs" {
-                for forbidden in ["drain_subscription(", "drain_runtime_once("] {
-                    assert!(
-                        !production.contains(forbidden),
-                        "{path} production source must not call {forbidden}"
-                    );
-                }
+            for forbidden in ["drain_subscription(", "drain_runtime_once("] {
+                assert!(
+                    !production.contains(forbidden),
+                    "{path} production source must not call {forbidden}"
+                );
             }
         }
     }

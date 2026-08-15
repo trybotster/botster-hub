@@ -21,7 +21,7 @@ use botster_core::{
     ClientId, EndpointId, EnvelopeCursor, EnvelopeDeliveryState, EnvelopeId, EnvelopeTarget,
     PackageSource, RequestId, RoutedEnvelope, RoutedEnvelopePayload, RunnableEntrypointKind,
     RunnableEntrypointLaunchMode, SessionId, SessionLifecycleState, SubscriptionId,
-    TerminalAttachState, TerminalCapabilitySet,
+    TerminalCapabilitySet,
 };
 use botster_core_daemon::{
     GuardedWriteDecision, GuardedWriteDeliveryState, ReadinessEvidence, RegistrySessionState,
@@ -2185,9 +2185,7 @@ pub(crate) fn handle_control_message(
             }
             if reconcile_after_request {
                 pump_bound_unix_routes(daemon, state);
-                if !state.entity_subscriptions.is_empty() {
-                    drive_entity_subscriptions(daemon, state);
-                }
+                drive_entity_subscriptions(daemon, state);
                 state.next_reconciliation = Instant::now() + ENTITY_RECONCILIATION_INTERVAL;
             }
             if response
@@ -4362,25 +4360,16 @@ fn session_suppresses_terminal_subscription_closed(
     runtime: &crate::HubRuntime,
     session_id: &str,
 ) -> bool {
-    let Ok(baseline) = runtime.session_lifecycle_baseline() else {
+    let Ok(sessions) = runtime.list_sessions() else {
         return true;
     };
-    let Some(record) = baseline
-        .sessions
+    let Some(session) = sessions
         .iter()
-        .find(|record| record.session.session_id.0 == session_id)
+        .find(|session| session.session_id.0 == session_id)
     else {
         return true;
     };
-    if record.session.registry_state != RegistrySessionState::Running {
-        return true;
-    }
-    matches!(
-        record.lifecycle,
-        Some(SessionLifecycleState::Exited { .. })
-            | Some(SessionLifecycleState::Failed { .. })
-            | Some(SessionLifecycleState::Stopping)
-    )
+    session.registry_state != RegistrySessionState::Running
 }
 
 fn queue_unix_subscription_closed_events(
@@ -7104,51 +7093,6 @@ pub(super) fn daemon_event_from_client(event: HubClientEvent) -> DaemonEvent {
             session_id: session_id.0,
             state: lifecycle_label(&state).to_string(),
         },
-        HubClientEvent::TerminalOutput {
-            session_id,
-            subscription_id,
-            data,
-        } => DaemonEvent::TerminalOutput {
-            session_id: session_id.0,
-            subscription_id: subscription_id.0,
-            payload: botster_hub_client::DaemonLiveOutputPayload::from_bytes(&data),
-        },
-        HubClientEvent::Snapshot {
-            session_id,
-            subscription_id,
-            data,
-        } => DaemonEvent::Snapshot {
-            session_id: session_id.0,
-            subscription_id: subscription_id.0,
-            history: botster_hub_client::DaemonOpaqueHistoryPayload::from_bytes(&data),
-        },
-        HubClientEvent::Scrollback {
-            session_id,
-            subscription_id,
-            data,
-        } => DaemonEvent::Scrollback {
-            session_id: session_id.0,
-            subscription_id: subscription_id.0,
-            history: botster_hub_client::DaemonOpaqueHistoryPayload::from_bytes(&data),
-        },
-        HubClientEvent::ProcessExit {
-            session_id,
-            subscription_id,
-            code,
-        } => DaemonEvent::ProcessExit {
-            session_id: session_id.0,
-            subscription_id: subscription_id.0,
-            code,
-        },
-        HubClientEvent::AttachState {
-            session_id,
-            subscription_id,
-            state,
-        } => DaemonEvent::AttachState {
-            session_id: session_id.0,
-            subscription_id: subscription_id.0,
-            state: attach_state_label(&state).to_string(),
-        },
         HubClientEvent::RuntimeObservation { kind } => DaemonEvent::RuntimeObservation {
             kind: match kind {
                 crate::HubClientObservationKind::SessionActivity => "session_activity",
@@ -7243,17 +7187,6 @@ fn lifecycle_label(state: &SessionLifecycleState) -> &'static str {
         SessionLifecycleState::Stopping => "stopping",
         SessionLifecycleState::Exited { .. } => "exited",
         SessionLifecycleState::Failed { .. } => "failed",
-    }
-}
-
-fn attach_state_label(state: &TerminalAttachState) -> &'static str {
-    match state {
-        TerminalAttachState::Attaching => "attaching",
-        TerminalAttachState::SnapshotHistoryIncomplete => {
-            botster_hub_client::ATTACH_STATE_SNAPSHOT_HISTORY_INCOMPLETE
-        }
-        TerminalAttachState::Attached => "attached",
-        TerminalAttachState::Detached => "detached",
     }
 }
 
@@ -7822,77 +7755,6 @@ mod tests {
         assert_eq!(
             state.lifecycle_counters.live_attach_subscriptions, 0,
             "a second Drain attach_failed must not decrement another route"
-        );
-    }
-
-    #[test]
-    fn daemon_event_projection_round_trips_opaque_history_bytes_without_loss() {
-        let session_id = SessionId("daemon-projection-session".to_string());
-        let subscription_id = SubscriptionId("daemon-projection-subscription".to_string());
-        let snapshot = daemon_event_from_client(HubClientEvent::Snapshot {
-            session_id: session_id.clone(),
-            subscription_id: subscription_id.clone(),
-            data: vec![b's', b'n', b'a', b'p', 0xff],
-        });
-        let scrollback = daemon_event_from_client(HubClientEvent::Scrollback {
-            session_id,
-            subscription_id,
-            data: b"scrollback".to_vec(),
-        });
-
-        assert_eq!(
-            snapshot,
-            DaemonEvent::Snapshot {
-                session_id: "daemon-projection-session".to_string(),
-                subscription_id: "daemon-projection-subscription".to_string(),
-                history: botster_hub_client::DaemonOpaqueHistoryPayload::from_bytes(&[
-                    b's', b'n', b'a', b'p', 0xff,
-                ]),
-            }
-        );
-        assert_eq!(
-            scrollback,
-            DaemonEvent::Scrollback {
-                session_id: "daemon-projection-session".to_string(),
-                subscription_id: "daemon-projection-subscription".to_string(),
-                history: botster_hub_client::DaemonOpaqueHistoryPayload::from_bytes(b"scrollback"),
-            }
-        );
-    }
-
-    #[test]
-    fn daemon_event_projection_preserves_exact_live_output_bytes() {
-        let session_id = SessionId("daemon-live-session".to_string());
-        let subscription_id = SubscriptionId("daemon-live-subscription".to_string());
-        let payload = vec![0x00, 0x1b, 0xff, 0xc0, 0xe2];
-        let live = daemon_event_from_client(HubClientEvent::TerminalOutput {
-            session_id,
-            subscription_id,
-            data: payload.clone(),
-        });
-
-        assert_eq!(
-            live,
-            DaemonEvent::TerminalOutput {
-                session_id: "daemon-live-session".to_string(),
-                subscription_id: "daemon-live-subscription".to_string(),
-                payload: botster_hub_client::DaemonLiveOutputPayload::from_bytes(&payload),
-            }
-        );
-        let DaemonEvent::TerminalOutput {
-            payload: decoded, ..
-        } = live
-        else {
-            panic!("expected live output");
-        };
-        assert_eq!(
-            decoded.decoded_bytes().expect("validated live payload"),
-            payload
-        );
-        assert_ne!(
-            String::from_utf8_lossy(&payload).as_bytes(),
-            payload.as_slice(),
-            "lossy UTF-8 would have changed these bytes"
         );
     }
 
