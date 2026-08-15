@@ -189,6 +189,12 @@ struct SessionFamilyConsumer {
     snapshot_after: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FanoutJob {
+    frame: serde_json::Value,
+    after: Option<String>,
+}
+
 /// Hub-owned `/session` delivery with one in-flight frame per plugin.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionFamilyBridge {
@@ -197,11 +203,38 @@ pub struct SessionFamilyBridge {
     refresh_after: Option<String>,
     refresh_seen: BTreeSet<String>,
     in_flight_by_request: BTreeMap<String, String>,
-    fanout_after: Option<String>,
-    pending_fanout: Option<serde_json::Value>,
+    pending_fanout: VecDeque<FanoutJob>,
+    gap_after: Option<String>,
+    need_gap_pass: bool,
+    snapshot_start_after: Option<String>,
+    snapshot_start_sequence: Option<u64>,
+    admit_after: Option<String>,
+    busy_count: u32,
+}
+
+fn consumer_busy(consumer: &SessionFamilyConsumer) -> bool {
+    consumer.in_flight.is_some()
+        || !consumer.pending.is_empty()
+        || !consumer.held_deltas.is_empty()
+        || consumer.need_snapshot_chunks
 }
 
 impl SessionFamilyBridge {
+    fn has_work(&self) -> bool {
+        self.busy_count > 0
+            || !self.pending_fanout.is_empty()
+            || self.need_gap_pass
+            || self.snapshot_start_sequence.is_some()
+    }
+
+    fn adjust_busy(&mut self, was_busy: bool, now_busy: bool) {
+        if now_busy && !was_busy {
+            self.busy_count = self.busy_count.saturating_add(1);
+        } else if !now_busy && was_busy {
+            self.busy_count = self.busy_count.saturating_sub(1);
+        }
+    }
+
     fn consumer_mut(&mut self, plugin_key: &str) -> &mut SessionFamilyConsumer {
         self.consumers
             .entry(plugin_key.to_string())
@@ -228,30 +261,32 @@ impl SessionFamilyBridge {
         if let Some(request_id) = request_id {
             self.in_flight_by_request.remove(&request_id.0);
         }
-        let consumer = self.consumer_mut(plugin_key);
-        consumer.gap = true;
-        consumer.snapshot_complete = false;
-        consumer.need_snapshot_chunks = false;
-        consumer.snapshot_after = None;
-        consumer.pending.clear();
-        consumer.held_deltas.clear();
-        consumer.in_flight = None;
+        self.touch_consumer(plugin_key, |consumer| {
+            consumer.gap = true;
+            consumer.snapshot_complete = false;
+            consumer.need_snapshot_chunks = false;
+            consumer.snapshot_after = None;
+            consumer.pending.clear();
+            consumer.held_deltas.clear();
+            consumer.in_flight = None;
+        });
     }
 
     fn begin_snapshot(&mut self, plugin_key: &str, sequence: u64) {
-        let consumer = self.consumer_mut(plugin_key);
-        consumer.snapshot_sequence = sequence;
-        consumer.snapshot_complete = false;
-        consumer.gap = false;
-        consumer.need_snapshot_chunks = true;
-        consumer.snapshot_after = None;
-        consumer.pending.clear();
-        consumer.held_deltas.clear();
-        consumer.pending.push_back(serde_json::json!({
-            "type": "snapshot_begin",
-            "family": "/session",
-            "snapshot_sequence": sequence,
-        }));
+        self.touch_consumer(plugin_key, |consumer| {
+            consumer.snapshot_sequence = sequence;
+            consumer.snapshot_complete = false;
+            consumer.gap = false;
+            consumer.need_snapshot_chunks = true;
+            consumer.snapshot_after = None;
+            consumer.pending.clear();
+            consumer.held_deltas.clear();
+            consumer.pending.push_back(serde_json::json!({
+                "type": "snapshot_begin",
+                "family": "/session",
+                "snapshot_sequence": sequence,
+            }));
+        });
     }
 
     #[cfg(test)]
@@ -282,27 +317,56 @@ impl SessionFamilyBridge {
     }
 
     fn queue_delta(&mut self, plugin_key: &str, frame: serde_json::Value) -> bool {
-        let consumer = self.consumer_mut(plugin_key);
-        if consumer.gap {
-            return true;
-        }
-        let bytes = serde_json::to_vec(&frame)
-            .map(|body| body.len())
-            .unwrap_or(0);
-        let queued_items = consumer.pending.len() + consumer.held_deltas.len();
-        let queued_bytes =
-            queued_queue_bytes(&consumer.pending) + queued_queue_bytes(&consumer.held_deltas);
-        if queued_items >= FAMILY_QUEUE_MAX_ITEMS
-            || queued_bytes.saturating_add(bytes) > FAMILY_QUEUE_MAX_BYTES
-        {
-            return false;
-        }
-        if !consumer.snapshot_complete {
-            consumer.held_deltas.push_back(frame);
-        } else {
-            consumer.pending.push_back(frame);
-        }
-        true
+        self.touch_consumer(plugin_key, |consumer| {
+            if consumer.gap {
+                return true;
+            }
+            let bytes = serde_json::to_vec(&frame)
+                .map(|body| body.len())
+                .unwrap_or(0);
+            let queued_items = consumer.pending.len() + consumer.held_deltas.len();
+            let queued_bytes =
+                queued_queue_bytes(&consumer.pending) + queued_queue_bytes(&consumer.held_deltas);
+            if queued_items >= FAMILY_QUEUE_MAX_ITEMS
+                || queued_bytes.saturating_add(bytes) > FAMILY_QUEUE_MAX_BYTES
+            {
+                return false;
+            }
+            if !consumer.snapshot_complete {
+                consumer.held_deltas.push_back(frame);
+            } else {
+                consumer.pending.push_back(frame);
+            }
+            true
+        })
+    }
+
+    fn touch_consumer<R>(
+        &mut self,
+        plugin_key: &str,
+        f: impl FnOnce(&mut SessionFamilyConsumer) -> R,
+    ) -> R {
+        let was_busy = self.consumers.get(plugin_key).is_some_and(consumer_busy);
+        let result = f(self.consumer_mut(plugin_key));
+        let now_busy = self.consumers.get(plugin_key).is_some_and(consumer_busy);
+        self.adjust_busy(was_busy, now_busy);
+        result
+    }
+
+    fn touch_existing_consumer(
+        &mut self,
+        plugin_key: &str,
+        f: impl FnOnce(&mut SessionFamilyConsumer),
+    ) {
+        let was_busy = self.consumers.get(plugin_key).is_some_and(consumer_busy);
+        let now_busy = {
+            let Some(consumer) = self.consumers.get_mut(plugin_key) else {
+                return;
+            };
+            f(consumer);
+            consumer_busy(consumer)
+        };
+        self.adjust_busy(was_busy, now_busy);
     }
 
     fn next_request_id(&mut self, plugin_key: &str, sequence: u64) -> RequestId {
@@ -345,12 +409,7 @@ impl MaintenanceState {
             || self.baseline.is_some()
             || !self.pending_changes.is_empty()
             || self.observe_resume.is_some()
-            || self.session_family.consumers.values().any(|consumer| {
-                consumer.in_flight.is_some()
-                    || !consumer.pending.is_empty()
-                    || !consumer.held_deltas.is_empty()
-                    || consumer.need_snapshot_chunks
-            })
+            || self.session_family.has_work()
     }
 }
 
@@ -562,6 +621,9 @@ fn run_baseline_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
 
 fn run_host_bridge_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
     refresh_session_family_consumers(runtime, state);
+    continue_gap_pass(state);
+    continue_snapshot_starts(state);
+    continue_family_fanout(state);
     let Some((plugin_key, handler, payload)) = next_session_family_admission(state) else {
         return;
     };
@@ -590,13 +652,15 @@ fn run_host_bridge_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
     );
     match admission {
         PluginAdmissionResult::Queued { .. } => {
-            if let Some(consumer) = state.session_family.consumers.get_mut(&plugin_key) {
-                consumer.in_flight = Some(InFlightSessionFamily {
-                    request_id: request_id.clone(),
-                    snapshot_sequence: consumer.snapshot_sequence,
-                    kind,
+            state
+                .session_family
+                .touch_consumer(&plugin_key, |consumer| {
+                    consumer.in_flight = Some(InFlightSessionFamily {
+                        request_id: request_id.clone(),
+                        snapshot_sequence: consumer.snapshot_sequence,
+                        kind,
+                    });
                 });
-            }
             state
                 .session_family
                 .in_flight_by_request
@@ -625,21 +689,23 @@ fn run_completion_drain_slice(runtime: &HubRuntime, state: &mut MaintenanceState
             continue;
         };
         let success = matches!(completion.result, PluginInvocationResult::Completed(_));
-        if let Some(consumer) = state.session_family.consumers.get_mut(&plugin_key) {
-            let ended_snapshot = consumer
-                .in_flight
-                .as_ref()
-                .is_some_and(|flight| flight.kind == FamilyFrameKind::End);
-            consumer.in_flight = None;
-            if !success {
-                state.session_family.mark_gap(&plugin_key);
-                start_baseline_recovery(state);
-                continue;
-            }
-            if ended_snapshot {
-                consumer.snapshot_complete = true;
-                consumer.pending.extend(consumer.held_deltas.drain(..));
-            }
+        state
+            .session_family
+            .touch_existing_consumer(&plugin_key, |consumer| {
+                let ended_this_snapshot = consumer.in_flight.as_ref().is_some_and(|flight| {
+                    flight.kind == FamilyFrameKind::End
+                        && flight.snapshot_sequence == consumer.snapshot_sequence
+                });
+                consumer.in_flight = None;
+                if ended_this_snapshot && success {
+                    consumer.snapshot_complete = true;
+                    consumer.pending.extend(consumer.held_deltas.drain(..));
+                }
+            });
+        if !success {
+            state.session_family.mark_gap(&plugin_key);
+            start_baseline_recovery(state);
+            continue;
         }
         state.scheduler.try_wake();
     }
@@ -650,18 +716,87 @@ pub fn start_baseline_recovery(state: &mut MaintenanceState) {
     state.projection.begin_baseline_recovery();
     state.pending_changes.clear();
     state.observe_resume = None;
-    let keys = consumer_keys_page(&state.session_family.consumers, None, CONSUMER_REFRESH_MAX);
+    state.session_family.need_gap_pass = true;
+    state.session_family.gap_after = None;
+    state.session_family.pending_fanout.clear();
+    state.session_family.snapshot_start_sequence = None;
+    state.session_family.snapshot_start_after = None;
+    state.baseline = None;
+    state.scheduler.try_wake();
+}
+
+fn continue_gap_pass(state: &mut MaintenanceState) {
+    if !state.session_family.need_gap_pass {
+        return;
+    }
+    let started = Instant::now();
+    let keys = consumer_keys_page(
+        &state.session_family.consumers,
+        state.session_family.gap_after.as_deref(),
+        CONSUMER_REFRESH_MAX,
+    );
+    let mut last_key = state.session_family.gap_after.clone();
+    let mut visited = 0;
     for plugin_key in &keys {
+        if started.elapsed() >= CONSUMER_REFRESH_MAX_ELAPSED {
+            break;
+        }
         state.session_family.mark_gap(plugin_key);
+        last_key = Some(plugin_key.clone());
+        visited += 1;
     }
-    if keys.len() == CONSUMER_REFRESH_MAX {
+    if visited < keys.len() || keys.len() == CONSUMER_REFRESH_MAX {
+        state.session_family.gap_after = last_key;
         state.scheduler.try_wake();
+        return;
     }
+    state.session_family.need_gap_pass = false;
+    state.session_family.gap_after = None;
     state.baseline = Some(BaselineRecovery {
         snapshot: None,
         after: None,
     });
     state.scheduler.try_wake();
+}
+
+fn continue_snapshot_starts(state: &mut MaintenanceState) {
+    let Some(sequence) = state.session_family.snapshot_start_sequence else {
+        return;
+    };
+    let started = Instant::now();
+    let keys = consumer_keys_page(
+        &state.session_family.consumers,
+        state.session_family.snapshot_start_after.as_deref(),
+        CONSUMER_REFRESH_MAX,
+    );
+    let mut last_key = state.session_family.snapshot_start_after.clone();
+    let mut visited = 0;
+    for plugin_key in &keys {
+        if started.elapsed() >= CONSUMER_REFRESH_MAX_ELAPSED {
+            break;
+        }
+        state.session_family.begin_snapshot(plugin_key, sequence);
+        last_key = Some(plugin_key.clone());
+        visited += 1;
+    }
+    if visited < keys.len() || keys.len() == CONSUMER_REFRESH_MAX {
+        state.session_family.snapshot_start_after = last_key;
+        state.scheduler.try_wake();
+        return;
+    }
+    state.session_family.snapshot_start_sequence = None;
+    state.session_family.snapshot_start_after = None;
+}
+
+fn continue_family_fanout(state: &mut MaintenanceState) {
+    let Some(mut job) = state.session_family.pending_fanout.pop_front() else {
+        return;
+    };
+    fanout_family_frame(state, &mut job);
+    if job.after.is_some() {
+        state.session_family.pending_fanout.push_front(job);
+        state.scheduler.try_wake();
+    }
 }
 
 fn handle_resync_reason(state: &mut MaintenanceState, reason: SessionLifecycleResyncReason) {
@@ -678,29 +813,21 @@ fn handle_resync_reason(state: &mut MaintenanceState, reason: SessionLifecycleRe
 }
 
 fn refresh_session_family_consumers(runtime: &HubRuntime, state: &mut MaintenanceState) {
-    let mut handlers = runtime
-        .session_family_event_handlers()
-        .into_iter()
-        .filter(|handler| handler.handler.kind == PluginHandlerKind::Event)
-        .collect::<Vec<_>>();
-    handlers.sort_by(|left, right| left.handler.plugin_key.0.cmp(&right.handler.plugin_key.0));
-    let after = state.session_family.refresh_after.clone();
     let started = Instant::now();
-    let mut visited = 0;
-    let mut last_key = after.clone();
+    let after = state.session_family.refresh_after.clone();
+    let (handlers, more) =
+        runtime.session_family_event_handlers_page(after.as_deref(), CONSUMER_REFRESH_MAX);
+    let mut last_key = after;
     for handler in handlers {
-        let plugin_key = handler.handler.plugin_key.0.clone();
-        if after
-            .as_ref()
-            .is_some_and(|after| plugin_key.as_str() <= after.as_str())
-        {
-            continue;
-        }
-        if visited >= CONSUMER_REFRESH_MAX || started.elapsed() >= CONSUMER_REFRESH_MAX_ELAPSED {
+        if started.elapsed() >= CONSUMER_REFRESH_MAX_ELAPSED {
             state.session_family.refresh_after = last_key;
             state.scheduler.try_wake();
             return;
         }
+        if handler.handler.kind != PluginHandlerKind::Event {
+            continue;
+        }
+        let plugin_key = handler.handler.plugin_key.0.clone();
         state.session_family.refresh_seen.insert(plugin_key.clone());
         let existed = state.session_family.consumers.contains_key(&plugin_key);
         let consumer = state.session_family.consumer_mut(&plugin_key);
@@ -718,34 +845,65 @@ fn refresh_session_family_consumers(runtime: &HubRuntime, state: &mut Maintenanc
             }
         }
         last_key = Some(plugin_key);
-        visited += 1;
+    }
+    if more {
+        state.session_family.refresh_after = last_key;
+        state.scheduler.try_wake();
+        return;
     }
     let seen = std::mem::take(&mut state.session_family.refresh_seen);
-    state
-        .session_family
-        .consumers
-        .retain(|key, _| seen.contains(key));
+    let mut dropped_busy = 0u32;
+    let mut dropped_requests = Vec::new();
+    state.session_family.consumers.retain(|key, consumer| {
+        if seen.contains(key) {
+            return true;
+        }
+        if consumer_busy(consumer) {
+            dropped_busy = dropped_busy.saturating_add(1);
+        }
+        if let Some(flight) = &consumer.in_flight {
+            dropped_requests.push(flight.request_id.0.clone());
+        }
+        false
+    });
+    for request_id in dropped_requests {
+        state
+            .session_family
+            .in_flight_by_request
+            .remove(&request_id);
+    }
+    state.session_family.busy_count = state.session_family.busy_count.saturating_sub(dropped_busy);
     state.session_family.refresh_after = None;
 }
 
 fn next_session_family_admission(
     state: &mut MaintenanceState,
 ) -> Option<(String, PluginHandlerRef, serde_json::Value)> {
-    let keys = state
-        .session_family
-        .consumers
-        .keys()
-        .cloned()
-        .collect::<Vec<_>>();
-    for plugin_key in keys {
-        if let Some(payload) = next_session_family_payload(state, &plugin_key) {
+    let keys = consumer_keys_page(
+        &state.session_family.consumers,
+        state.session_family.admit_after.as_deref(),
+        CONSUMER_REFRESH_MAX,
+    );
+    if keys.is_empty() {
+        state.session_family.admit_after = None;
+        return None;
+    }
+    for plugin_key in &keys {
+        if let Some(payload) = next_session_family_payload(state, plugin_key) {
             let handler = state
                 .session_family
                 .consumers
-                .get(&plugin_key)
+                .get(plugin_key)
                 .and_then(|consumer| consumer.handler.clone())?;
-            return Some((plugin_key, handler, payload));
+            state.session_family.admit_after = Some(plugin_key.clone());
+            return Some((plugin_key.clone(), handler, payload));
         }
+    }
+    if keys.len() == CONSUMER_REFRESH_MAX {
+        state.session_family.admit_after = keys.last().cloned();
+        state.scheduler.try_wake();
+    } else {
+        state.session_family.admit_after = None;
     }
     None
 }
@@ -754,27 +912,50 @@ fn next_session_family_payload(
     state: &mut MaintenanceState,
     plugin_key: &str,
 ) -> Option<serde_json::Value> {
-    let consumer = state.session_family.consumers.get_mut(plugin_key)?;
-    if consumer.in_flight.is_some() || consumer.handler.is_none() {
+    let mut queued = None;
+    let mut blocked = false;
+    let mut need_chunks = false;
+    let mut sequence = 0;
+    let mut after = None;
+    state
+        .session_family
+        .touch_existing_consumer(plugin_key, |consumer| {
+            if consumer.in_flight.is_some() || consumer.handler.is_none() {
+                blocked = true;
+                return;
+            }
+            if let Some(payload) = consumer.pending.pop_front() {
+                queued = Some(payload);
+                return;
+            }
+            need_chunks = consumer.need_snapshot_chunks;
+            sequence = consumer.snapshot_sequence;
+            after = consumer.snapshot_after.clone();
+        });
+    if blocked {
         return None;
     }
-    if let Some(payload) = consumer.pending.pop_front() {
-        return Some(payload);
+    if queued.is_some() {
+        return queued;
     }
-    if !consumer.need_snapshot_chunks {
+    if !need_chunks {
         return None;
     }
-    let sequence = consumer.snapshot_sequence;
-    let after = consumer.snapshot_after.clone();
     match next_projection_chunk(&state.projection, after.as_deref()) {
         Ok(Some((chunk, last_id))) => {
-            let consumer = state.session_family.consumers.get_mut(plugin_key)?;
-            consumer.snapshot_after = Some(last_id);
+            state
+                .session_family
+                .touch_existing_consumer(plugin_key, |consumer| {
+                    consumer.snapshot_after = Some(last_id);
+                });
             Some(session_chunk_frame(sequence, &chunk))
         }
         Ok(None) => {
-            let consumer = state.session_family.consumers.get_mut(plugin_key)?;
-            consumer.need_snapshot_chunks = false;
+            state
+                .session_family
+                .touch_existing_consumer(plugin_key, |consumer| {
+                    consumer.need_snapshot_chunks = false;
+                });
             Some(session_end_frame(sequence, true))
         }
         Err(()) => {
@@ -790,10 +971,11 @@ fn next_projection_chunk(
 ) -> Result<Option<(Vec<serde_json::Value>, String)>, ()> {
     let mut packed = Vec::new();
     let mut last_id = None;
-    for (id, row) in &projection.rows {
-        if after.is_some_and(|after| id.as_str() <= after) {
-            continue;
-        }
+    let start = match after {
+        Some(after) => Bound::Excluded(after),
+        None => Bound::Unbounded,
+    };
+    for (id, row) in projection.rows.range::<str, _>((start, Bound::Unbounded)) {
         let item =
             serde_json::to_value(SessionProjection::project_entity(&row.record)).map_err(|_| ())?;
         packed.push(item);
@@ -846,20 +1028,30 @@ fn queue_family_delta(state: &mut MaintenanceState, change: &SessionLifecycleCha
         }
         _ => return,
     };
-    if let Some(pending) = state.session_family.pending_fanout.take() {
-        fanout_family_frame(state, pending);
-    }
-    fanout_family_frame(state, frame);
+    state
+        .session_family
+        .pending_fanout
+        .push_back(FanoutJob { frame, after: None });
+    state.scheduler.try_wake();
 }
 
-fn fanout_family_frame(state: &mut MaintenanceState, frame: serde_json::Value) {
+fn fanout_family_frame(state: &mut MaintenanceState, job: &mut FanoutJob) {
+    let started = Instant::now();
     let keys = consumer_keys_page(
         &state.session_family.consumers,
-        state.session_family.fanout_after.as_deref(),
+        job.after.as_deref(),
         CONSUMER_REFRESH_MAX,
     );
+    let mut last_key = job.after.clone();
+    let mut visited = 0;
     for plugin_key in &keys {
-        if !state.session_family.queue_delta(plugin_key, frame.clone()) {
+        if started.elapsed() >= CONSUMER_REFRESH_MAX_ELAPSED {
+            break;
+        }
+        if !state
+            .session_family
+            .queue_delta(plugin_key, job.frame.clone())
+        {
             state.session_family.mark_gap(plugin_key);
             if state.projection.baseline_complete {
                 let sequence = state
@@ -871,22 +1063,20 @@ fn fanout_family_frame(state: &mut MaintenanceState, frame: serde_json::Value) {
                 state.session_family.begin_snapshot(plugin_key, sequence);
             }
         }
+        last_key = Some(plugin_key.clone());
+        visited += 1;
     }
-    if keys.len() == CONSUMER_REFRESH_MAX {
-        state.session_family.fanout_after = keys.last().cloned();
-        state.session_family.pending_fanout = Some(frame);
-        state.scheduler.try_wake();
+    if visited < keys.len() || keys.len() == CONSUMER_REFRESH_MAX {
+        job.after = last_key;
     } else {
-        state.session_family.fanout_after = None;
-        state.session_family.pending_fanout = None;
+        job.after = None;
     }
 }
 
 fn begin_family_snapshots(state: &mut MaintenanceState, sequence: u64) {
-    let keys = consumer_keys_page(&state.session_family.consumers, None, CONSUMER_REFRESH_MAX);
-    for plugin_key in keys {
-        state.session_family.begin_snapshot(&plugin_key, sequence);
-    }
+    state.session_family.snapshot_start_sequence = Some(sequence);
+    state.session_family.snapshot_start_after = None;
+    state.scheduler.try_wake();
 }
 
 fn consumer_keys_page(
@@ -1198,6 +1388,7 @@ mod tests {
                 },
             };
             queue_family_delta(&mut state, &change);
+            continue_family_fanout(&mut state);
             let consumer = state
                 .session_family
                 .consumers
@@ -1254,5 +1445,152 @@ mod tests {
         assert!(projection.baseline_complete);
         assert!(!projection.gap);
         assert_eq!(BASELINE_PAGE_BUDGET.max_rows, 16);
+    }
+
+    fn seed_family_consumers(state: &mut MaintenanceState, count: usize) {
+        for index in 0..count {
+            let plugin_key = format!("plugin.{index:02}");
+            state.session_family.begin_snapshot(&plugin_key, 1);
+            let consumer = state
+                .session_family
+                .consumers
+                .get_mut(&plugin_key)
+                .expect("consumer");
+            consumer.snapshot_complete = true;
+            consumer.need_snapshot_chunks = false;
+            consumer.pending.clear();
+            consumer.held_deltas.clear();
+            consumer.handler = Some(PluginHandlerRef {
+                plugin_key: botster_core::PluginKey(plugin_key),
+                kind: PluginHandlerKind::Event,
+                handler_id: "session_family".to_string(),
+            });
+        }
+    }
+
+    fn drain_family_fanout(state: &mut MaintenanceState) {
+        let started = Instant::now();
+        while !state.session_family.pending_fanout.is_empty() {
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "family fanout hang"
+            );
+            continue_family_fanout(state);
+        }
+    }
+
+    #[test]
+    fn family_fanout_keeps_ordered_frames_for_more_than_sixteen_consumers() {
+        let mut projection = SessionProjection::default();
+        projection.replace_complete_baseline(
+            botster_core_daemon::SessionLifecycleCursor {
+                source_id: botster_core_daemon::SessionLifecycleSourceId("s".into()),
+                sequence: 2,
+            },
+            Vec::new(),
+        );
+        let mut state = MaintenanceState {
+            projection,
+            ..MaintenanceState::default()
+        };
+        seed_family_consumers(&mut state, 20);
+        for (index, id) in ["first", "second"].into_iter().enumerate() {
+            queue_family_delta(
+                &mut state,
+                &SessionLifecycleChange {
+                    cursor: botster_core_daemon::SessionLifecycleCursor {
+                        source_id: botster_core_daemon::SessionLifecycleSourceId("s".into()),
+                        sequence: 3 + index as u64,
+                    },
+                    kind: botster_core_daemon::SessionLifecycleChangeKind::Removed {
+                        session_id: SessionId(id.to_string()),
+                    },
+                },
+            );
+        }
+        drain_family_fanout(&mut state);
+        for index in 0..20 {
+            let consumer = state
+                .session_family
+                .consumers
+                .get(&format!("plugin.{index:02}"))
+                .expect("consumer");
+            let ids = consumer
+                .pending
+                .iter()
+                .filter_map(|frame| frame.get("id")?.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(ids, ["first", "second"], "plugin.{index:02} lost a frame");
+        }
+    }
+
+    #[test]
+    fn baseline_restart_marks_every_consumer_then_starts_snapshots() {
+        let mut state = MaintenanceState::default();
+        seed_family_consumers(&mut state, 20);
+        start_baseline_recovery(&mut state);
+        let started = Instant::now();
+        while state.session_family.need_gap_pass {
+            assert!(started.elapsed() < Duration::from_secs(1), "gap pass hang");
+            continue_gap_pass(&mut state);
+        }
+        for index in 0..20 {
+            let consumer = state
+                .session_family
+                .consumers
+                .get(&format!("plugin.{index:02}"))
+                .expect("consumer");
+            assert!(consumer.gap, "plugin.{index:02} missed the gap");
+        }
+        begin_family_snapshots(&mut state, 9);
+        while state.session_family.snapshot_start_sequence.is_some() {
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "snapshot start hang"
+            );
+            continue_snapshot_starts(&mut state);
+        }
+        for index in 0..20 {
+            let consumer = state
+                .session_family
+                .consumers
+                .get(&format!("plugin.{index:02}"))
+                .expect("consumer");
+            assert!(!consumer.gap);
+            assert_eq!(
+                consumer.pending.front().and_then(|frame| frame.get("type")),
+                Some(&serde_json::json!("snapshot_begin"))
+            );
+            assert_eq!(consumer.snapshot_sequence, 9);
+        }
+    }
+
+    #[test]
+    fn many_plugin_owner_turn_stays_within_budget() {
+        let mut state = MaintenanceState::default();
+        seed_family_consumers(&mut state, 64);
+        for index in 0..3 {
+            queue_family_delta(
+                &mut state,
+                &SessionLifecycleChange {
+                    cursor: botster_core_daemon::SessionLifecycleCursor {
+                        source_id: botster_core_daemon::SessionLifecycleSourceId("s".into()),
+                        sequence: 4 + index,
+                    },
+                    kind: botster_core_daemon::SessionLifecycleChangeKind::Removed {
+                        session_id: SessionId(format!("gone-{index}")),
+                    },
+                },
+            );
+        }
+        let started = Instant::now();
+        assert!(state.needs_work());
+        continue_family_fanout(&mut state);
+        start_baseline_recovery(&mut state);
+        continue_gap_pass(&mut state);
+        assert!(started.elapsed() < Duration::from_millis(MAX_OWNER_TURN_MS));
+        assert!(state.session_family.has_work());
+        assert!(state.session_family.need_gap_pass);
+        assert_eq!(state.session_family.pending_fanout.len(), 0);
     }
 }

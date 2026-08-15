@@ -303,13 +303,45 @@ impl HubPluginLifecycle {
     /// Return Event-kind plugin handlers subscribed to one exact event name.
     #[must_use]
     pub fn event_handlers_for(&self, event_name: &str) -> Vec<HubPluginEventHandler> {
-        self.event_handlers
+        self.event_handlers_for_page(event_name, None, usize::MAX).0
+    }
+
+    /// Return one bounded page of Event-kind handlers for an exact event name.
+    #[must_use]
+    pub fn event_handlers_for_page(
+        &self,
+        event_name: &str,
+        after_plugin_key: Option<&str>,
+        max_items: usize,
+    ) -> (Vec<HubPluginEventHandler>, bool) {
+        let lock = self
+            .event_handlers
             .lock()
-            .expect("hub plugin lifecycle event handlers lock")
-            .values()
-            .flat_map(|handlers| handlers.iter().cloned())
-            .filter(|handler| handler.event_name == event_name)
-            .collect()
+            .expect("hub plugin lifecycle event handlers lock");
+        let start = match after_plugin_key {
+            Some(key) => std::ops::Bound::Excluded(key),
+            None => std::ops::Bound::Unbounded,
+        };
+        let mut page = Vec::new();
+        let mut plugins_taken = 0;
+        let mut more = false;
+        for (_key, handlers) in lock.range::<str, _>((start, std::ops::Bound::Unbounded)) {
+            let matching = handlers
+                .iter()
+                .filter(|handler| handler.event_name == event_name)
+                .cloned()
+                .collect::<Vec<_>>();
+            if matching.is_empty() {
+                continue;
+            }
+            if plugins_taken >= max_items {
+                more = true;
+                break;
+            }
+            page.extend(matching);
+            plugins_taken += 1;
+        }
+        (page, more)
     }
 
     /// Return package-level lifecycle status without exposing core worker internals.
