@@ -1331,6 +1331,23 @@ impl CausalScopeTable {
             .and_then(|inner| inner.scopes.get(&scope_id).map(|scope| scope.leases))
     }
 
+    #[must_use]
+    pub fn pending_publish_leases(&self) -> Vec<(u64, LeaseIdentity)> {
+        let Ok(inner) = self.inner.try_lock() else {
+            return Vec::new();
+        };
+        inner
+            .scopes
+            .iter()
+            .filter_map(|(scope_id, scope)| {
+                scope.identities.iter().find_map(|identity| {
+                    matches!(identity, LeaseIdentity::PendingEntityPublish { .. })
+                        .then(|| (*scope_id, identity.clone()))
+                })
+            })
+            .collect()
+    }
+
     #[doc(hidden)]
     #[must_use]
     pub fn identities(&self, scope_id: u64) -> Option<BTreeSet<LeaseIdentity>> {

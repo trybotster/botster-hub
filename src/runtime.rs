@@ -109,6 +109,7 @@ pub struct HubRuntime {
     causal_scopes: Arc<crate::package_event_router::CausalScopeTable>,
     unfinished_finishes: Mutex<VecDeque<CausalOp>>,
     unfinished_overflow: Mutex<VecDeque<CausalOp>>,
+    unfinished_held: Mutex<VecDeque<CausalOp>>,
     event_plane_owner_ops: std::cell::RefCell<crate::package_event_router::EventPlaneOwnerOps>,
 }
 
@@ -268,6 +269,7 @@ impl HubRuntime {
             causal_scopes: Arc::new(crate::package_event_router::CausalScopeTable::new()),
             unfinished_finishes: Mutex::new(VecDeque::new()),
             unfinished_overflow: Mutex::new(VecDeque::new()),
+            unfinished_held: Mutex::new(VecDeque::new()),
             event_plane_owner_ops: std::cell::RefCell::new(
                 crate::package_event_router::EventPlaneOwnerOps::default(),
             ),
@@ -353,6 +355,7 @@ impl HubRuntime {
             causal_scopes: Arc::new(crate::package_event_router::CausalScopeTable::new()),
             unfinished_finishes: Mutex::new(VecDeque::new()),
             unfinished_overflow: Mutex::new(VecDeque::new()),
+            unfinished_held: Mutex::new(VecDeque::new()),
             event_plane_owner_ops: std::cell::RefCell::new(
                 crate::package_event_router::EventPlaneOwnerOps::default(),
             ),
@@ -492,12 +495,18 @@ impl HubRuntime {
                 .lock()
                 .map(|pending| !pending.is_empty())
                 .unwrap_or(false)
+            || self
+                .unfinished_held
+                .lock()
+                .map(|pending| !pending.is_empty())
+                .unwrap_or(false)
     }
 
     pub fn apply_event_plane_owner_ops(&self) -> Vec<crate::package_event_router::OwnerOp> {
         let _ = self.causal_scopes.flush_pending();
         self.harvest_publish_releases();
         self.retry_unfinished_finishes();
+        self.sweep_orphan_pending_publishes();
         let _ = self.causal_scopes.flush_pending();
         self.event_plane_owner_ops
             .borrow_mut()
@@ -530,6 +539,25 @@ impl HubRuntime {
         self.drain_unfinished(&self.unfinished_finishes, &mut applied, started);
         if applied < CAUSAL_FLUSH_MAX && started.elapsed() < Duration::from_millis(8) {
             self.drain_unfinished(&self.unfinished_overflow, &mut applied, started);
+        }
+        if applied < CAUSAL_FLUSH_MAX && started.elapsed() < Duration::from_millis(8) {
+            self.drain_unfinished(&self.unfinished_held, &mut applied, started);
+        }
+    }
+
+    fn sweep_orphan_pending_publishes(&self) {
+        for scope_id in self.entity_publish_bridge.take_orphans() {
+            let Some(identities) = self.causal_scopes.identities(scope_id) else {
+                continue;
+            };
+            for identity in identities {
+                if matches!(identity, LeaseIdentity::PendingEntityPublish { .. }) {
+                    self.keep_or_retract(
+                        self.causal_scopes
+                            .try_admit(CausalOp::Release { scope_id, identity }),
+                    );
+                }
+            }
         }
     }
 
@@ -570,6 +598,12 @@ impl HubRuntime {
             && overflow.len() < CAUSAL_PENDING_MAX
         {
             overflow.push_back(op);
+            return CausalAdmitResult::Applied;
+        }
+        if let Ok(mut held) = self.unfinished_held.lock()
+            && held.len() < CAUSAL_PENDING_MAX
+        {
+            held.push_back(op);
             return CausalAdmitResult::Applied;
         }
         CausalAdmitResult::Retry(op)
@@ -615,7 +649,12 @@ impl HubRuntime {
             .lock()
             .map(|pending| pending.len())
             .unwrap_or(0);
-        queued + overflow
+        let held = self
+            .unfinished_held
+            .lock()
+            .map(|pending| pending.len())
+            .unwrap_or(0);
+        queued + overflow + held
     }
 
     /// Return the startup reconciliation decisions made against the core daemon registry.

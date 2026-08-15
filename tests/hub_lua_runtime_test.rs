@@ -4499,7 +4499,7 @@ fn never_queued_release_stays_owned_when_release_queue_is_full() {
         }))
         .expect("live");
     let mut fillers = Vec::new();
-    for index in 0..CAUSAL_PENDING_MAX {
+    for index in 0..(CAUSAL_PENDING_MAX * 2) {
         let scope = scopes
             .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
                 plugin_key: format!("fill{index}"),
@@ -4509,7 +4509,7 @@ fn never_queued_release_stays_owned_when_release_queue_is_full() {
     }
     let bridge = hub.entity_publish_bridge();
     scopes.test_with_inner_held(|| {
-        for (index, scope) in fillers.iter().enumerate() {
+        for (index, scope) in fillers.iter().take(CAUSAL_PENDING_MAX).enumerate() {
             assert_eq!(
                 scopes.transfer(
                     *scope,
@@ -4536,7 +4536,7 @@ fn never_queued_release_stays_owned_when_release_queue_is_full() {
                 CausalAdmitResult::Applied
             );
         }
-        assert_eq!(bridge.release_count(), CAUSAL_PENDING_MAX);
+        assert_eq!(bridge.release_count(), CAUSAL_PENDING_MAX * 2);
         let overflow = release_or_retract(
             &scopes,
             live,
@@ -4547,8 +4547,11 @@ fn never_queued_release_stays_owned_when_release_queue_is_full() {
         let CausalAdmitResult::Retry(overflow) = overflow else {
             panic!("full table and held inner must return the release");
         };
-        assert_eq!(bridge.park_release(overflow), CausalAdmitResult::Applied);
-        assert_eq!(bridge.release_count(), CAUSAL_PENDING_MAX + 1);
+        assert!(matches!(
+            bridge.park_release(overflow),
+            CausalAdmitResult::Retry(_)
+        ));
+        bridge.mark_orphan(live);
     });
     let _ = hub.apply_event_plane_owner_ops();
     while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
@@ -4593,19 +4596,21 @@ fn unfinished_finishes_are_bounded_sliced_and_fifo() {
                 CausalAdmitResult::Applied
             );
         }
-        for (index, scope) in fillers.iter().enumerate() {
-            assert_eq!(
-                hub.keep_causal_op(CausalOp::Release {
-                    scope_id: *scope,
-                    identity: LeaseIdentity::AdmittedEntityMutation {
-                        family: "f".into(),
-                        seq: index as u64,
-                    },
-                }),
-                CausalAdmitResult::Applied
-            );
+        for _ in 0..2 {
+            for (index, scope) in fillers.iter().enumerate() {
+                assert_eq!(
+                    hub.keep_causal_op(CausalOp::Release {
+                        scope_id: *scope,
+                        identity: LeaseIdentity::AdmittedEntityMutation {
+                            family: "f".into(),
+                            seq: index as u64,
+                        },
+                    }),
+                    CausalAdmitResult::Applied
+                );
+            }
         }
-        assert_eq!(hub.unfinished_finish_count(), CAUSAL_PENDING_MAX);
+        assert_eq!(hub.unfinished_finish_count(), CAUSAL_PENDING_MAX * 2);
         assert_eq!(
             hub.keep_causal_op(CausalOp::Transfer {
                 scope_id: live,
@@ -4629,7 +4634,7 @@ fn unfinished_finishes_are_bounded_sliced_and_fifo() {
             }),
             CausalAdmitResult::Applied
         );
-        assert_eq!(hub.unfinished_finish_count(), CAUSAL_PENDING_MAX + 2);
+        assert_eq!(hub.unfinished_finish_count(), CAUSAL_PENDING_MAX * 2 + 2);
     });
     let before = hub.unfinished_finish_count();
     let _ = hub.apply_event_plane_owner_ops();
