@@ -108,7 +108,7 @@ pub struct HubRuntime {
     package_event_router: Arc<crate::package_event_router::PackageEventRouter>,
     causal_scopes: Arc<crate::package_event_router::CausalScopeTable>,
     unfinished_finishes: Mutex<VecDeque<CausalOp>>,
-    unfinished_reserved: Mutex<Option<CausalOp>>,
+    unfinished_overflow: Mutex<VecDeque<CausalOp>>,
     event_plane_owner_ops: std::cell::RefCell<crate::package_event_router::EventPlaneOwnerOps>,
 }
 
@@ -267,7 +267,7 @@ impl HubRuntime {
             package_event_router,
             causal_scopes: Arc::new(crate::package_event_router::CausalScopeTable::new()),
             unfinished_finishes: Mutex::new(VecDeque::new()),
-            unfinished_reserved: Mutex::new(None),
+            unfinished_overflow: Mutex::new(VecDeque::new()),
             event_plane_owner_ops: std::cell::RefCell::new(
                 crate::package_event_router::EventPlaneOwnerOps::default(),
             ),
@@ -352,7 +352,7 @@ impl HubRuntime {
             package_event_router,
             causal_scopes: Arc::new(crate::package_event_router::CausalScopeTable::new()),
             unfinished_finishes: Mutex::new(VecDeque::new()),
-            unfinished_reserved: Mutex::new(None),
+            unfinished_overflow: Mutex::new(VecDeque::new()),
             event_plane_owner_ops: std::cell::RefCell::new(
                 crate::package_event_router::EventPlaneOwnerOps::default(),
             ),
@@ -488,9 +488,9 @@ impl HubRuntime {
                 .map(|pending| !pending.is_empty())
                 .unwrap_or(false)
             || self
-                .unfinished_reserved
+                .unfinished_overflow
                 .lock()
-                .map(|reserved| reserved.is_some())
+                .map(|pending| !pending.is_empty())
                 .unwrap_or(false)
     }
 
@@ -525,25 +525,30 @@ impl HubRuntime {
     }
 
     fn retry_unfinished_finishes(&self) {
-        if let Ok(mut reserved) = self.unfinished_reserved.lock()
-            && let Some(op) = reserved.take()
-            && let CausalAdmitResult::Retry(op) = self.causal_scopes.try_admit(op)
-        {
-            *reserved = Some(op);
-            return;
+        let started = Instant::now();
+        let mut applied = 0;
+        self.drain_unfinished(&self.unfinished_finishes, &mut applied, started);
+        if applied < CAUSAL_FLUSH_MAX && started.elapsed() < Duration::from_millis(8) {
+            self.drain_unfinished(&self.unfinished_overflow, &mut applied, started);
         }
-        let Ok(mut pending) = self.unfinished_finishes.lock() else {
+    }
+
+    fn drain_unfinished(
+        &self,
+        queue: &Mutex<VecDeque<CausalOp>>,
+        applied: &mut usize,
+        started: Instant,
+    ) {
+        let Ok(mut pending) = queue.lock() else {
             return;
         };
-        let started = Instant::now();
         let mut leftover = VecDeque::new();
-        let mut applied = 0;
-        while applied < CAUSAL_FLUSH_MAX && started.elapsed() < Duration::from_millis(8) {
+        while *applied < CAUSAL_FLUSH_MAX && started.elapsed() < Duration::from_millis(8) {
             let Some(op) = pending.pop_front() else {
                 break;
             };
             match self.causal_scopes.try_admit(op) {
-                CausalAdmitResult::Applied => applied += 1,
+                CausalAdmitResult::Applied => *applied += 1,
                 CausalAdmitResult::Retry(op) => {
                     leftover.push_front(op);
                     break;
@@ -561,10 +566,10 @@ impl HubRuntime {
             pending.push_back(op);
             return CausalAdmitResult::Applied;
         }
-        if let Ok(mut reserved) = self.unfinished_reserved.lock()
-            && reserved.is_none()
+        if let Ok(mut overflow) = self.unfinished_overflow.lock()
+            && overflow.len() < CAUSAL_PENDING_MAX
         {
-            *reserved = Some(op);
+            overflow.push_back(op);
             return CausalAdmitResult::Applied;
         }
         CausalAdmitResult::Retry(op)
@@ -578,11 +583,24 @@ impl HubRuntime {
     }
 
     fn keep_or_retract(&self, result: CausalAdmitResult) {
-        if let CausalAdmitResult::Retry(op) = self.keep_if_retry(result)
-            && let CausalOp::Release { scope_id, identity } = op
-        {
-            let _ = self.causal_scopes.try_retract(scope_id, identity);
+        if let CausalAdmitResult::Retry(op) = self.keep_if_retry(result) {
+            match op {
+                CausalOp::Release { scope_id, identity } => {
+                    if !self.causal_scopes.try_retract(scope_id, identity.clone()) {
+                        let _ =
+                            self.keep_unfinished_finish(CausalOp::Release { scope_id, identity });
+                    }
+                }
+                op => {
+                    let _ = self.keep_unfinished_finish(op);
+                }
+            }
         }
+    }
+
+    #[doc(hidden)]
+    pub fn keep_causal_op(&self, op: CausalOp) -> CausalAdmitResult {
+        self.keep_if_retry(CausalAdmitResult::Retry(op))
     }
 
     #[must_use]
@@ -592,12 +610,12 @@ impl HubRuntime {
             .lock()
             .map(|pending| pending.len())
             .unwrap_or(0);
-        let reserved = self
-            .unfinished_reserved
+        let overflow = self
+            .unfinished_overflow
             .lock()
-            .map(|reserved| reserved.is_some() as usize)
+            .map(|pending| pending.len())
             .unwrap_or(0);
-        queued + reserved
+        queued + overflow
     }
 
     /// Return the startup reconciliation decisions made against the core daemon registry.
