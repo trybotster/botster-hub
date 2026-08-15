@@ -115,6 +115,7 @@ pub struct HubRuntime {
     family_causal: std::cell::RefCell<VecDeque<CausalOp>>,
     family_held: std::cell::RefCell<Option<CausalOp>>,
     family_source: std::cell::RefCell<Option<CausalOp>>,
+    family_overflow: std::cell::RefCell<Option<CausalOp>>,
     event_plane_owner_ops: std::cell::RefCell<crate::package_event_router::EventPlaneOwnerOps>,
 }
 
@@ -280,6 +281,7 @@ impl HubRuntime {
             family_causal: std::cell::RefCell::new(VecDeque::new()),
             family_held: std::cell::RefCell::new(None),
             family_source: std::cell::RefCell::new(None),
+            family_overflow: std::cell::RefCell::new(None),
             event_plane_owner_ops: std::cell::RefCell::new(
                 crate::package_event_router::EventPlaneOwnerOps::default(),
             ),
@@ -371,6 +373,7 @@ impl HubRuntime {
             family_causal: std::cell::RefCell::new(VecDeque::new()),
             family_held: std::cell::RefCell::new(None),
             family_source: std::cell::RefCell::new(None),
+            family_overflow: std::cell::RefCell::new(None),
             event_plane_owner_ops: std::cell::RefCell::new(
                 crate::package_event_router::EventPlaneOwnerOps::default(),
             ),
@@ -521,6 +524,7 @@ impl HubRuntime {
             || !self.family_causal.borrow().is_empty()
             || self.family_held.borrow().is_some()
             || self.family_source.borrow().is_some()
+            || self.family_overflow.borrow().is_some()
             || self.has_unloading_families()
     }
 
@@ -756,12 +760,23 @@ impl HubRuntime {
         }
     }
 
+    fn hold_overflow(&self, op: CausalOp) -> CausalAdmitResult {
+        let mut overflow = self.family_overflow.borrow_mut();
+        if overflow.is_none() {
+            *overflow = Some(op);
+            CausalAdmitResult::Applied
+        } else {
+            CausalAdmitResult::Retry(op)
+        }
+    }
+
     fn enqueue_or_family(&self, result: CausalAdmitResult) -> CausalAdmitResult {
         if let CausalAdmitResult::Retry(op) = self.enqueue_retry(result)
             && let CausalAdmitResult::Retry(op) = self.park_on_family(op)
             && let CausalAdmitResult::Retry(op) = self.hold_family(op)
+            && let CausalAdmitResult::Retry(op) = self.hold_source(op)
         {
-            return self.hold_source(op);
+            return self.hold_overflow(op);
         }
         CausalAdmitResult::Applied
     }
@@ -807,6 +822,7 @@ impl HubRuntime {
         self.family_causal.borrow_mut().append(&mut leftover);
         self.retry_one_held(&self.family_held, &mut applied, started);
         self.retry_one_held(&self.family_source, &mut applied, started);
+        self.retry_one_held(&self.family_overflow, &mut applied, started);
     }
 
     fn retry_unloading_families(&self) {
@@ -860,12 +876,10 @@ impl HubRuntime {
                 }
             }
             family.pending_leases = leftover;
-            if applied < CAUSAL_FLUSH_MAX && started.elapsed() < Duration::from_millis(8) {
-                for (scope_id, family_name) in
-                    self.release_resync_leases(family.take_resync_leases())
-                {
-                    family.remember_resync_lease(scope_id, family_name);
-                }
+            for (scope_id, family_name) in
+                self.release_resync_leases(family.take_resync_leases(), &mut applied, started)
+            {
+                family.remember_resync_lease(scope_id, family_name);
             }
             if family.unloading
                 && family.pending_leases.is_empty()
@@ -1008,6 +1022,33 @@ impl HubRuntime {
     #[doc(hidden)]
     pub fn test_hold_source(&self, op: CausalOp) -> CausalAdmitResult {
         self.hold_source(op)
+    }
+
+    #[must_use]
+    #[doc(hidden)]
+    pub fn test_family_overflow(&self) -> bool {
+        self.family_overflow.borrow().is_some()
+    }
+
+    #[doc(hidden)]
+    pub fn test_store_resync_lease(&self, scope_id: u64, family: &str) {
+        self.package_entity_families
+            .lock()
+            .expect("package entity family lock")
+            .entry(family.to_string())
+            .or_default()
+            .remember_resync_lease(scope_id, family.to_string());
+    }
+
+    #[must_use]
+    #[doc(hidden)]
+    pub fn test_resync_lease_count(&self, family: &str) -> usize {
+        self.package_entity_families
+            .lock()
+            .expect("package entity family lock")
+            .get(family)
+            .map(|state| state.resync.leases.len())
+            .unwrap_or(0)
     }
 
     #[must_use]
@@ -2013,9 +2054,23 @@ impl HubRuntime {
         )));
     }
 
-    fn release_resync_leases(&self, leases: BTreeSet<(u64, String)>) -> BTreeSet<(u64, String)> {
+    fn release_resync_leases(
+        &self,
+        leases: BTreeSet<(u64, String)>,
+        applied: &mut usize,
+        started: Instant,
+    ) -> BTreeSet<(u64, String)> {
         let mut leftover = BTreeSet::new();
-        for (scope_id, family) in leases {
+        let mut pending = leases;
+        loop {
+            if *applied >= CAUSAL_FLUSH_MAX || started.elapsed() >= Duration::from_millis(8) {
+                leftover.extend(pending);
+                break;
+            }
+            let Some((scope_id, family)) = pending.pop_first() else {
+                break;
+            };
+            *applied += 1;
             if let CausalAdmitResult::Retry(_) =
                 self.enqueue_retry(self.admit_causal_op(CausalOp::Release {
                     scope_id,
@@ -2128,7 +2183,11 @@ impl HubRuntime {
             }
         }
         if !family.resync.needed {
-            for (scope_id, family_name) in self.release_resync_leases(family.take_resync_leases()) {
+            let started = Instant::now();
+            let mut applied = 0;
+            for (scope_id, family_name) in
+                self.release_resync_leases(family.take_resync_leases(), &mut applied, started)
+            {
                 family.remember_resync_lease(scope_id, family_name);
             }
         }
@@ -2203,7 +2262,11 @@ impl HubRuntime {
         let family = families.entry(entity_type.to_string()).or_default();
         let degraded = family.resync.record_attempt(now);
         if degraded || !family.resync.needed {
-            for (scope_id, family_name) in self.release_resync_leases(family.take_resync_leases()) {
+            let started = Instant::now();
+            let mut applied = 0;
+            for (scope_id, family_name) in
+                self.release_resync_leases(family.take_resync_leases(), &mut applied, started)
+            {
                 family.remember_resync_lease(scope_id, family_name);
             }
         }
@@ -2220,8 +2283,10 @@ impl HubRuntime {
         if let Some(family) = families.get_mut(entity_type) {
             family.recompute_resync_need(now);
             if !family.resync.needed {
+                let started = Instant::now();
+                let mut applied = 0;
                 for (scope_id, family_name) in
-                    self.release_resync_leases(family.take_resync_leases())
+                    self.release_resync_leases(family.take_resync_leases(), &mut applied, started)
                 {
                     family.remember_resync_lease(scope_id, family_name);
                 }
@@ -2261,7 +2326,11 @@ impl HubRuntime {
                     }
                 }
                 family.pending_leases = leftover;
-                for (scope_id, name) in self.release_resync_leases(family.take_resync_leases()) {
+                let started = Instant::now();
+                let mut applied = 0;
+                for (scope_id, name) in
+                    self.release_resync_leases(family.take_resync_leases(), &mut applied, started)
+                {
                     family.remember_resync_lease(scope_id, name);
                 }
                 if !family.pending_leases.is_empty() || !family.resync.leases.is_empty() {
@@ -2323,6 +2392,7 @@ impl HubRuntime {
             || !self.family_causal.borrow().is_empty()
             || self.family_held.borrow().is_some()
             || self.family_source.borrow().is_some()
+            || self.family_overflow.borrow().is_some()
         {
             return true;
         }
