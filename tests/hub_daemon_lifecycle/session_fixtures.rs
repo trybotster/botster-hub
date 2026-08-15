@@ -518,9 +518,23 @@ pub(crate) fn drain_until_subscription_deadline(
                 None => botster_hub_client::DaemonRequest::drain_session(session_id),
             })
             .expect("drain live output");
-        let found = drain.events.iter().any(&mut predicate);
         events.extend(drain.events);
-        if found {
+        events.extend(connection.take_skipped_events());
+        for envelope in connection.take_skipped_terminal() {
+            if let Ok(bytes) = envelope.payload_bytes() {
+                if let Ok(event) = serde_json::from_slice::<botster_hub_client::DaemonEvent>(&bytes)
+                {
+                    events.push(event);
+                } else {
+                    events.push(botster_hub_client::DaemonEvent::TerminalOutput {
+                        session_id: session_id.to_string(),
+                        subscription_id: subscription_id.unwrap_or("").to_string(),
+                        payload: botster_hub_client::DaemonLiveOutputPayload::from_bytes(&bytes),
+                    });
+                }
+            }
+        }
+        if events.iter().any(&mut predicate) {
             return events;
         }
         thread::sleep(Duration::from_millis(20));

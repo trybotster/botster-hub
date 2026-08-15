@@ -91,7 +91,7 @@ Production implementation follows rev 4: Core pin, observe/baseline slices, alwa
 
 `HubRuntime::drain_subscription` / `drain_runtime_once` remain as unused-by-production helpers so integration tests can still name Core Drain. Production owner loop, Drain handler, entity tick, and smoke do not call them.
 
-`DaemonConnection` now skips Unix mux terminal frames when reading a host response. Always-bind inserts mux frames on default Unix connections; without this skip, host ReadScreen after Attach cannot parse.
+`DaemonConnection` skips Unix mux terminal frames when reading a host response and retains those frames for callers. Always-bind inserts mux frames on default Unix connections; without this skip, host ReadScreen after Attach cannot parse. IsolatedHub live-byte tests now observe retained adapter frames instead of Drain bodies.
 
 ## Runtime-teardown lenses
 

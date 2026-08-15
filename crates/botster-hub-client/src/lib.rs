@@ -155,6 +155,8 @@ pub fn request_with_requirement(
 pub struct DaemonConnection {
     stream: UnixStream,
     reader: BufReader<UnixStream>,
+    skipped_terminal: Vec<DaemonUnixTerminalEnvelope>,
+    skipped_events: Vec<DaemonEvent>,
 }
 
 impl DaemonConnection {
@@ -170,13 +172,32 @@ impl DaemonConnection {
     ) -> DaemonTransportResult<Self> {
         let stream = connect_and_hello_with_requirement(endpoint, requirement)?;
         let reader = BufReader::new(stream.try_clone().map_err(normalize_socket_io_error)?);
-        Ok(Self { stream, reader })
+        Ok(Self {
+            stream,
+            reader,
+            skipped_terminal: Vec::new(),
+            skipped_events: Vec::new(),
+        })
     }
 
     /// Send one request over this persistent connection.
     pub fn request(&mut self, request: &DaemonRequest) -> DaemonTransportResult<DaemonResponse> {
         write_frame(&mut self.stream, request)?;
-        read_daemon_response_from_reader(&mut self.reader)
+        read_daemon_response_collecting(
+            &mut self.reader,
+            &mut self.skipped_terminal,
+            &mut self.skipped_events,
+        )
+    }
+
+    /// Opaque adapter frames skipped while waiting for a host response.
+    pub fn take_skipped_terminal(&mut self) -> Vec<DaemonUnixTerminalEnvelope> {
+        std::mem::take(&mut self.skipped_terminal)
+    }
+
+    /// Host events skipped while waiting for a host response.
+    pub fn take_skipped_events(&mut self) -> Vec<DaemonEvent> {
+        std::mem::take(&mut self.skipped_events)
     }
 }
 
@@ -471,6 +492,16 @@ fn read_daemon_response(stream: &mut UnixStream) -> DaemonTransportResult<Daemon
 fn read_daemon_response_from_reader(
     reader: &mut BufReader<UnixStream>,
 ) -> DaemonTransportResult<DaemonResponse> {
+    let mut terminals = Vec::new();
+    let mut events = Vec::new();
+    read_daemon_response_collecting(reader, &mut terminals, &mut events)
+}
+
+fn read_daemon_response_collecting(
+    reader: &mut BufReader<UnixStream>,
+    terminals: &mut Vec<DaemonUnixTerminalEnvelope>,
+    events: &mut Vec<DaemonEvent>,
+) -> DaemonTransportResult<DaemonResponse> {
     loop {
         let value = read_value_frame_from_reader(reader)?;
         if status_missing_compatibility(&value) {
@@ -478,7 +509,8 @@ fn read_daemon_response_from_reader(
         }
         match parse_unix_mux_value(value).map_err(DaemonTransportError::Json)? {
             DaemonUnixMuxFrame::Response(response) => return Ok(*response),
-            DaemonUnixMuxFrame::Terminal(_) | DaemonUnixMuxFrame::Event(_) => {}
+            DaemonUnixMuxFrame::Terminal(envelope) => terminals.push(envelope),
+            DaemonUnixMuxFrame::Event(event) => events.push(event),
         }
     }
 }
