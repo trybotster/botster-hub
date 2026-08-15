@@ -319,7 +319,7 @@ fn external_hub_webrtc_live_output_preserves_exact_bytes() {
             .expect("offer peer accepts answer");
 
         let release_path = unique_short_test_dir("webrtc-exact-release").join("go");
-        let script_path = write_python_wait_then_write_and_hold_script(&release_path, expected);
+        let script_path = write_python_wait_then_write_script(&release_path, expected);
         botster_hub_client::request(
             &endpoint,
             botster_hub_client::DaemonRequest::Spawn {

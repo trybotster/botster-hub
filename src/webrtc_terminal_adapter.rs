@@ -557,6 +557,10 @@ impl WebRtcTerminalAdapterHandle {
     pub(crate) fn complete_active(&self) -> Option<Vec<u8>> {
         self.inner.complete_active()
     }
+
+    pub(crate) fn write_opaque_frame(&self, frame: &TerminalFrame) {
+        let _ = self.inner.try_write(frame);
+    }
 }
 
 #[cfg(test)]

@@ -112,9 +112,9 @@ use crate::{Worktree, WorktreeCreate, WorktreeError};
 #[path = "daemon_attach_stream.rs"]
 mod daemon_attach_stream;
 use daemon_attach_stream::{
-    AttachStreamOwner, AttachStreamRegistry, UnixBindRequest, WebrtcBindRequest,
-    bind_unix_adapter_after_attaching, bind_webrtc_adapter_after_attaching,
-    fail_closed_pre_bind_attach, live_generation_for_route,
+    AttachStreamOwner, AttachStreamRegistry, BoundAdapterHandle, UnixBindRequest,
+    WebrtcBindRequest, bind_unix_adapter_after_attaching, bind_webrtc_adapter_after_attaching,
+    fail_closed_pre_bind_attach, forward_attach_bootstrap, live_generation_for_route,
 };
 pub(crate) use daemon_attach_stream::{
     hello_requires_terminal_subscription_closed, negotiated_unix_capability_set,
@@ -3023,16 +3023,21 @@ fn handle_runtime_control_request(
                     now,
                 );
             }
-            if pending_runtime
-                .begin_core_attach(runtime, &session_id, &subscription_id, now)
-                .is_err()
-            {
-                pending_runtime.cancel_stream(&session_id, &subscription_id);
-                return Ok(attach_bind_operator_error(
-                    "invalid_request",
-                    "attach failed before adapter bind",
-                ));
-            }
+            let bootstrap_egress = match pending_runtime.begin_core_attach(
+                runtime,
+                &session_id,
+                &subscription_id,
+                now,
+            ) {
+                Ok(egress) => egress,
+                Err(_) => {
+                    pending_runtime.cancel_stream(&session_id, &subscription_id);
+                    return Ok(attach_bind_operator_error(
+                        "invalid_request",
+                        "attach failed before adapter bind",
+                    ));
+                }
+            };
             let unix_admission = pending_runtime.unix_admissions.get(&client_id).cloned();
             let webrtc_admission = observability
                 .grant_id
@@ -3071,7 +3076,13 @@ fn handle_runtime_control_request(
                         mux: Some(mux),
                     },
                 ) {
-                    Ok(_) => {
+                    Ok(handle) => {
+                        if let Some(handle) = handle {
+                            forward_attach_bootstrap(
+                                &BoundAdapterHandle::WebRtc(handle),
+                                &bootstrap_egress,
+                            );
+                        }
                         observe_lifecycle_turn(runtime, tick(logical_clock));
                         Ok(daemon_events(Vec::new()))
                     }
@@ -3111,7 +3122,13 @@ fn handle_runtime_control_request(
                     mux: Some(mux),
                 },
             ) {
-                Ok(_) => {
+                Ok(handle) => {
+                    if let Some(handle) = handle {
+                        forward_attach_bootstrap(
+                            &BoundAdapterHandle::Unix(handle),
+                            &bootstrap_egress,
+                        );
+                    }
                     observe_lifecycle_turn(runtime, tick(logical_clock));
                     Ok(daemon_events(Vec::new()))
                 }
@@ -3243,6 +3260,19 @@ fn handle_runtime_control_request(
                     return Ok(daemon_unknown_session_cleanup(&session_id));
                 }
             }
+            let now = tick(logical_clock);
+            let _ =
+                runtime.apply_parked_lifecycle_observations(&SessionId(session_id.clone()), now);
+            observe_lifecycle_turn(runtime, now);
+            match classify_shutdown_session(runtime, &session_id)? {
+                ShutdownSessionClassification::Active => {}
+                ShutdownSessionClassification::Cleanup(cleanup) => {
+                    return Ok(daemon_session_cleanup(cleanup));
+                }
+                ShutdownSessionClassification::Missing => {
+                    return Ok(daemon_unknown_session_cleanup(&session_id));
+                }
+            }
             let shutdown_session_id = session_id.clone();
             let response = match api.handle_request(
                 runtime,
@@ -3270,7 +3300,18 @@ fn handle_runtime_control_request(
                             }
                         }
                     }
-                    return Err(DaemonTransportError::Client(error));
+                    let now = tick(logical_clock);
+                    let _ = runtime
+                        .apply_parked_lifecycle_observations(&SessionId(session_id.clone()), now);
+                    observe_lifecycle_turn(runtime, now);
+                    let response = shutdown_error_response(
+                        classify_shutdown_session(runtime, &session_id)?,
+                        error,
+                        &session_id,
+                    )?;
+                    suppress_unix_session_close_events(pending_runtime, &session_id);
+                    suppress_webrtc_session_close_events(pending_runtime, &session_id);
+                    return Ok(response);
                 }
             };
             suppress_unix_session_close_events(pending_runtime, &session_id);

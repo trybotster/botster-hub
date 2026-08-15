@@ -33,7 +33,29 @@ pub(crate) enum BoundAdapterHandle {
     WebRtc(WebRtcTerminalAdapterHandle),
 }
 
+pub(crate) fn forward_attach_bootstrap(
+    handle: &BoundAdapterHandle,
+    egress: &[botster_core::TransportEgress],
+) {
+    for frame in egress {
+        let Ok(bytes) = serde_json::to_vec(frame) else {
+            continue;
+        };
+        let Ok(opaque) = botster_terminal_protocol::TerminalFrame::from_bytes(&bytes) else {
+            continue;
+        };
+        handle.write_opaque_frame(&opaque);
+    }
+}
+
 impl BoundAdapterHandle {
+    pub(crate) fn write_opaque_frame(&self, frame: &botster_terminal_protocol::TerminalFrame) {
+        match self {
+            Self::Unix(handle) => handle.write_opaque_frame(frame),
+            Self::WebRtc(handle) => handle.write_opaque_frame(frame),
+        }
+    }
+
     pub(crate) fn close(&self) {
         match self {
             Self::Unix(handle) => handle.close(),
@@ -137,9 +159,9 @@ impl AttachStreamRegistry {
         session_id: &str,
         subscription_id: &str,
         now_seconds: u64,
-    ) -> Result<(), CoreDaemonError> {
+    ) -> Result<Vec<botster_core::TransportEgress>, CoreDaemonError> {
         let Some(client_id) = self.stream_owner_client_id(session_id, subscription_id) else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         let attached = runtime.attach_client(
             ClientId(client_id),
@@ -147,8 +169,11 @@ impl AttachStreamRegistry {
             SubscriptionId(subscription_id.to_string()),
             now_seconds,
         )?;
-        let _ = attached.client_egress;
-        Ok(())
+        Ok(attached
+            .client_egress
+            .into_iter()
+            .map(|(_, egress)| egress)
+            .collect())
     }
 
     pub(crate) fn stream_owner_client_id(
