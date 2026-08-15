@@ -89,6 +89,7 @@ pub struct EmittedContract {
     pub name: String,
     pub audience: BTreeSet<EventAudience>,
     pub schema: CompiledEventSchema,
+    pub package_generation: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,13 +111,15 @@ pub enum OwnerApplyResult {
     WouldBlock,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct EventSubscription {
     pub plugin_key: String,
     pub owner: String,
     pub name: String,
     pub handler_id: String,
     pub generation: u64,
+    pub event_generation: u64,
+    pub plugin_generation: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -198,6 +201,7 @@ struct RouterInner {
     admitted: HashMap<(u64, String, u64), AdmittedHolder>,
     buckets: HashMap<String, TokenBucket>,
     next_envelope: u64,
+    package_generation: HashMap<String, u64>,
 }
 
 /// Send + Sync router. Every public API uses `try_lock` only.
@@ -222,6 +226,7 @@ impl PackageEventRouter {
                     name: (*name).to_string(),
                     audience: BTreeSet::from([EventAudience::Plugins]),
                     schema: schema.clone(),
+                    package_generation: 0,
                 },
             );
         }
@@ -237,6 +242,7 @@ impl PackageEventRouter {
                 admitted: HashMap::new(),
                 buckets: HashMap::new(),
                 next_envelope: 1,
+                package_generation: HashMap::new(),
             }),
             delivery_wake: AtomicBool::new(false),
             next_holder_key: AtomicU64::new(1),
@@ -249,15 +255,41 @@ impl PackageEventRouter {
         self.policy
     }
 
+    pub fn current_package_generation(&self, owner: &str) -> Result<u64, EventPlaneStatus> {
+        let inner = lock_inner(&self.inner)?;
+        Ok(inner.package_generation.get(owner).copied().unwrap_or(0))
+    }
+
+    pub fn begin_package_generation(&self, owner: &str) -> Result<u64, EventPlaneStatus> {
+        if owner == HUB_EVENT_OWNER {
+            return Ok(0);
+        }
+        let mut inner = lock_inner(&self.inner)?;
+        Ok(bump_package_generation(&mut inner, owner))
+    }
+
     pub fn try_register_contracts(
         &self,
         contracts: Vec<EmittedContract>,
     ) -> Result<(), EventPlaneStatus> {
         let mut inner = lock_inner(&self.inner)?;
-        for contract in contracts {
+        let mut owners = BTreeSet::new();
+        for contract in &contracts {
             if contract.owner == HUB_EVENT_OWNER {
                 return Err(EventPlaneStatus::RejectedForeign);
             }
+            owners.insert(contract.owner.clone());
+        }
+        for owner in &owners {
+            bump_package_generation(&mut inner, owner);
+        }
+        for mut contract in contracts {
+            let generation = inner
+                .package_generation
+                .get(&contract.owner)
+                .copied()
+                .unwrap_or(0);
+            contract.package_generation = generation;
             inner
                 .contracts
                 .insert((contract.owner.clone(), contract.name.clone()), contract);
@@ -283,6 +315,12 @@ impl PackageEventRouter {
         if !contract.audience.contains(&EventAudience::Plugins) {
             return EventPlaneStatus::RejectedAudience;
         }
+        let event_generation = contract.package_generation;
+        let plugin_generation = inner
+            .package_generation
+            .get(&subscription.plugin_key)
+            .copied()
+            .unwrap_or(0);
         let plugin_count = inner
             .subscriptions_per_plugin
             .get(&subscription.plugin_key)
@@ -296,10 +334,14 @@ impl PackageEventRouter {
         if event_subs.len() >= max_subscribers {
             return EventPlaneStatus::RejectedOverFanout;
         }
-        event_subs.push(subscription.clone());
+        let mut subscription = subscription;
+        subscription.event_generation = event_generation;
+        subscription.plugin_generation = plugin_generation;
+        let plugin_key = subscription.plugin_key.clone();
+        event_subs.push(subscription);
         *inner
             .subscriptions_per_plugin
-            .entry(subscription.plugin_key)
+            .entry(plugin_key)
             .or_insert(0) += 1;
         EventPlaneStatus::Accepted
     }
@@ -590,8 +632,8 @@ impl PackageEventRouter {
             Err(_) => return OwnerApplyResult::WouldBlock,
         };
         match op.kind {
-            OwnerOpKind::Unload => apply_unload(&mut inner, &op.owner),
-            OwnerOpKind::Reload => apply_unload(&mut inner, &op.owner),
+            OwnerOpKind::Unload => apply_unload(&mut inner, &op.owner, op.generation),
+            OwnerOpKind::Reload => {}
         }
         OwnerApplyResult::Applied
     }
@@ -694,29 +736,47 @@ fn consume_token(inner: &mut RouterInner, owner: &str, now: Instant) -> bool {
     true
 }
 
-fn apply_unload(inner: &mut RouterInner, owner: &str) {
+fn bump_package_generation(inner: &mut RouterInner, owner: &str) -> u64 {
+    let next = inner
+        .package_generation
+        .get(owner)
+        .copied()
+        .unwrap_or(0)
+        .saturating_add(1);
+    inner.package_generation.insert(owner.to_string(), next);
+    next
+}
+
+fn apply_unload(inner: &mut RouterInner, owner: &str, generation: u64) {
     if owner == HUB_EVENT_OWNER {
         return;
     }
-    inner
-        .contracts
-        .retain(|(contract_owner, _), _| contract_owner != owner);
-    let mut removed_plugins = BTreeSet::new();
+    inner.contracts.retain(|(contract_owner, _), contract| {
+        contract_owner != owner || contract.package_generation > generation
+    });
+    let mut removed_counts: HashMap<String, usize> = HashMap::new();
     for subscriptions in inner.subscriptions.values_mut() {
         subscriptions.retain(|subscription| {
-            let keep = subscription.owner != owner && subscription.plugin_key != owner;
-            if !keep {
-                removed_plugins.insert(subscription.plugin_key.clone());
+            let drop_producer =
+                subscription.owner == owner && subscription.event_generation <= generation;
+            let drop_consumer =
+                subscription.plugin_key == owner && subscription.plugin_generation <= generation;
+            if drop_producer || drop_consumer {
+                *removed_counts
+                    .entry(subscription.plugin_key.clone())
+                    .or_insert(0) += 1;
+                false
+            } else {
+                true
             }
-            keep
         });
     }
     inner
         .subscriptions
         .retain(|_, subscriptions| !subscriptions.is_empty());
-    for plugin in &removed_plugins {
-        if let Some(count) = inner.subscriptions_per_plugin.get_mut(plugin) {
-            *count = count.saturating_sub(1);
+    for (plugin, removed) in removed_counts {
+        if let Some(count) = inner.subscriptions_per_plugin.get_mut(&plugin) {
+            *count = count.saturating_sub(removed);
         }
     }
     drop_queued_for_owner(inner, owner);
@@ -890,15 +950,20 @@ impl CausalScopeTable {
 
     #[must_use]
     pub fn mint(&self) -> Option<u64> {
+        self.mint_with_lease(None)
+    }
+
+    #[must_use]
+    pub fn mint_with_lease(&self, identity: Option<LeaseIdentity>) -> Option<u64> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let mut inner = lock_causal(&self.inner)?;
-        inner.scopes.insert(
-            id,
-            CausalScope {
-                leases: 0,
-                identities: BTreeSet::new(),
-            },
-        );
+        let mut identities = BTreeSet::new();
+        let mut leases = 0;
+        if let Some(identity) = identity {
+            identities.insert(identity);
+            leases = 1;
+        }
+        inner.scopes.insert(id, CausalScope { leases, identities });
         Some(id)
     }
 
@@ -984,6 +1049,7 @@ mod tests {
                 "required": ["ok"]
             }))
             .expect("sample schema"),
+            package_generation: 0,
         }
     }
 
@@ -995,6 +1061,7 @@ mod tests {
                 name: name.to_string(),
                 handler_id: format!("event:{owner}:{name}"),
                 generation: 1,
+                ..EventSubscription::default()
             }),
             EventPlaneStatus::Accepted
         );
@@ -1166,6 +1233,7 @@ mod tests {
                 name: "sample.ready".into(),
                 handler_id: "x".into(),
                 generation: 1,
+                ..EventSubscription::default()
             }),
             EventPlaneStatus::RejectedWildcard
         );
@@ -1308,6 +1376,148 @@ mod tests {
     }
 
     #[test]
+    fn unload_subtracts_every_removed_subscription() {
+        let policy = PackageEventPlanePolicy {
+            subscriptions_per_plugin_max: 2,
+            ..PackageEventPlanePolicy::default()
+        };
+        let router = PackageEventRouter::new(policy);
+        router
+            .try_register_contracts(vec![
+                sample_contract("producer", "one"),
+                sample_contract("producer", "two"),
+            ])
+            .expect("register");
+        subscribe(&router, "consumer", "producer", "one");
+        subscribe(&router, "consumer", "producer", "two");
+        let generation = router
+            .current_package_generation("producer")
+            .expect("generation");
+        assert_eq!(
+            router.try_apply(&OwnerOp {
+                kind: OwnerOpKind::Unload,
+                owner: "producer".into(),
+                generation,
+            }),
+            OwnerApplyResult::Applied
+        );
+        router
+            .begin_package_generation("consumer")
+            .expect("consumer gen");
+        router
+            .try_register_contracts(vec![
+                sample_contract("producer", "one"),
+                sample_contract("producer", "two"),
+            ])
+            .expect("register again");
+        subscribe(&router, "consumer", "producer", "one");
+        subscribe(&router, "consumer", "producer", "two");
+        assert_eq!(
+            router.try_subscribe(EventSubscription {
+                plugin_key: "consumer".into(),
+                owner: "producer".into(),
+                name: "one".into(),
+                handler_id: "extra".into(),
+                generation: 9,
+                ..EventSubscription::default()
+            }),
+            EventPlaneStatus::RejectedInvalid
+        );
+    }
+
+    #[test]
+    fn old_generation_unload_keeps_replacement_contracts() {
+        let router = router();
+        router
+            .try_register_contracts(vec![sample_contract("producer", "sample.ready")])
+            .expect("register");
+        let old = router
+            .current_package_generation("producer")
+            .expect("old gen");
+        router
+            .try_register_contracts(vec![sample_contract("producer", "sample.ready")])
+            .expect("replacement");
+        subscribe(&router, "consumer", "producer", "sample.ready");
+        assert_eq!(
+            router.try_apply(&OwnerOp {
+                kind: OwnerOpKind::Unload,
+                owner: "producer".into(),
+                generation: old,
+            }),
+            OwnerApplyResult::Applied
+        );
+        assert_eq!(
+            router.try_ingress(
+                "producer",
+                "sample.ready",
+                &serde_json::json!({ "ok": true }),
+                Instant::now()
+            ),
+            EventPlaneStatus::Accepted
+        );
+    }
+
+    #[test]
+    fn mint_with_lease_is_live_before_any_later_acquire() {
+        let table = CausalScopeTable::new();
+        let scope = table
+            .mint_with_lease(Some(LeaseIdentity::EventInFlight {
+                request_id: "req-1".into(),
+            }))
+            .expect("mint");
+        assert!(table.is_live(scope));
+        assert_eq!(table.lease_count(scope), Some(1));
+    }
+
+    #[test]
+    fn held_router_retire_can_be_retried() {
+        let router = router();
+        router
+            .try_register_contracts(vec![sample_contract("producer", "sample.ready")])
+            .expect("register");
+        subscribe(&router, "consumer", "producer", "sample.ready");
+        assert_eq!(
+            router.try_ingress(
+                "producer",
+                "sample.ready",
+                &serde_json::json!({ "ok": true }),
+                Instant::now()
+            ),
+            EventPlaneStatus::Accepted
+        );
+        let batch = router
+            .pull_ready_batch(8, 64 * 1024, Instant::now(), StdDuration::from_millis(8))
+            .expect("batch");
+        let delivery = &batch[0];
+        router
+            .note_admitted(
+                delivery.envelope_id,
+                &delivery.holder.plugin_key,
+                delivery.holder.generation,
+            )
+            .expect("admit");
+        let busy = router.test_with_inner_held(|| {
+            router.retire_holder(
+                delivery.envelope_id,
+                &delivery.holder.plugin_key,
+                delivery.holder.generation,
+            )
+        });
+        assert_eq!(busy, Err(EventPlaneStatus::ShedBusy));
+        assert!(
+            router
+                .retire_holder(
+                    delivery.envelope_id,
+                    &delivery.holder.plugin_key,
+                    delivery.holder.generation,
+                )
+                .expect("retry")
+        );
+        let snapshot = router.snapshot().expect("snapshot");
+        assert_eq!(snapshot.global_in_flight_bytes, 0);
+    }
+
+    #[test]
     fn clients_only_subscription_is_rejected() {
         let router = router();
         let mut contract = sample_contract("producer", "notice");
@@ -1322,6 +1532,7 @@ mod tests {
                 name: "notice".into(),
                 handler_id: "event".into(),
                 generation: 1,
+                ..EventSubscription::default()
             }),
             EventPlaneStatus::RejectedAudience
         );

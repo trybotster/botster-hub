@@ -289,6 +289,7 @@ pub struct PackageEntityFamilyState {
     pub high_water_seq: u64,
     pub pending_by_seq: BTreeMap<u64, PackageEntityMutation>,
     pub resync: PackageEntityResyncState,
+    pub causal_scope_id: Option<u64>,
 }
 
 impl PackageEntityFamilyState {

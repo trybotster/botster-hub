@@ -83,6 +83,7 @@ impl HubEntityPublishBridge {
         &self,
         plugin_key: PluginKey,
         frame: serde_json::Value,
+        scope_id: Option<u64>,
     ) -> Result<crate::package_entity_fanout::PackageEntityPublishResult, String> {
         if thread::current().id() == self.owner_thread {
             return Err(
@@ -97,6 +98,7 @@ impl HubEntityPublishBridge {
             .push_back(PendingEntityPublishRequest {
                 plugin_key,
                 frame,
+                scope_id,
                 response,
             });
         receiver
@@ -115,6 +117,7 @@ impl HubEntityPublishBridge {
 pub(crate) struct PendingEntityPublishRequest {
     pub(crate) plugin_key: PluginKey,
     pub(crate) frame: serde_json::Value,
+    pub(crate) scope_id: Option<u64>,
     pub(crate) response:
         mpsc::Sender<Result<crate::package_entity_fanout::PackageEntityPublishResult, String>>,
 }
@@ -716,6 +719,7 @@ fn install_botster_api(
                         name: name.clone(),
                         handler_id: handler_id.clone(),
                         generation: subscribe_router.next_holder_generation(),
+                        ..EventSubscription::default()
                     });
                     if status != EventPlaneStatus::Accepted {
                         return Err(mlua::Error::RuntimeError(status.as_str().to_string()));
@@ -880,16 +884,21 @@ fn entity_publish_function(
 ) -> Result<Function, mlua::Error> {
     lua.create_function(move |lua, args: Value| {
         let value = lua.from_value::<serde_json::Value>(args)?;
-        if let Some(scope_id) = current_causal_scope() {
-            let _ = scopes.acquire(
+        let scope_id = current_causal_scope();
+        if let Some(scope_id) = scope_id
+            && !scopes.acquire(
                 scope_id,
                 LeaseIdentity::PendingEntityPublish {
                     plugin_key: plugin_key.0.clone(),
                 },
-            );
+            )
+        {
+            return Err(mlua::Error::RuntimeError(
+                "causal scope lease could not be acquired".to_string(),
+            ));
         }
         let result = bridge
-            .publish(plugin_key.clone(), value)
+            .publish(plugin_key.clone(), value, scope_id)
             .map_err(mlua::Error::RuntimeError)?;
         lua.to_value(&json!({
             "ok": result.ok,

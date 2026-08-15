@@ -444,6 +444,7 @@ pub struct MaintenanceState {
     pub baseline_page_reads: u64,
     pub projection_dirty: bool,
     pub event_in_flight: BTreeMap<String, EventDeliveryFlight>,
+    pub pending_retirements: VecDeque<EventDeliveryFlight>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -452,6 +453,7 @@ pub struct EventDeliveryFlight {
     pub plugin_key: String,
     pub generation: u64,
     pub scope_id: Option<u64>,
+    pub request_id: String,
 }
 
 impl MaintenanceState {
@@ -471,6 +473,7 @@ impl MaintenanceState {
             || !self.pending_changes.is_empty()
             || self.observe_resume.is_some()
             || self.session_family.has_work()
+            || !self.pending_retirements.is_empty()
     }
 }
 
@@ -756,7 +759,47 @@ const EVENT_DELIVERY_MAX_ITEMS: usize = 8;
 const EVENT_DELIVERY_MAX_BYTES: usize = 32 * 1024;
 const EVENT_DELIVERY_MAX_ELAPSED: Duration = Duration::from_millis(8);
 
+fn flush_pending_event_retirements(runtime: &HubRuntime, state: &mut MaintenanceState) {
+    let mut kept = VecDeque::new();
+    while let Some(flight) = state.pending_retirements.pop_front() {
+        if !retire_event_holder(runtime, &flight) {
+            kept.push_back(flight);
+        }
+    }
+    state.pending_retirements = kept;
+    if !state.pending_retirements.is_empty() {
+        state.scheduler.try_wake();
+    }
+}
+
+fn retire_event_holder(runtime: &HubRuntime, flight: &EventDeliveryFlight) -> bool {
+    match runtime.package_event_router().retire_holder(
+        flight.envelope_id,
+        &flight.plugin_key,
+        flight.generation,
+    ) {
+        Ok(_) => {
+            if let Some(scope_id) = flight.scope_id {
+                runtime.causal_scopes().release(
+                    scope_id,
+                    crate::package_event_router::LeaseIdentity::EventInFlight {
+                        request_id: flight.request_id.clone(),
+                    },
+                );
+            }
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+fn queue_event_retirement(state: &mut MaintenanceState, flight: EventDeliveryFlight) {
+    state.pending_retirements.push_back(flight);
+    state.scheduler.try_wake();
+}
+
 fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
+    flush_pending_event_retirements(runtime, state);
     let applied = runtime.apply_event_plane_owner_ops();
     if !applied.is_empty() || runtime.event_plane_owner_ops_pending() {
         state.scheduler.try_wake();
@@ -782,26 +825,48 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
         }
     };
     for delivery in batch {
+        let request_id = RequestId(format!(
+            "package-event-{}-{}-{}",
+            delivery.owner, delivery.name, delivery.envelope_id
+        ));
         let Some(handler) = runtime.package_event_handler(
             &delivery.holder.plugin_key,
             &delivery.owner,
             &delivery.name,
             &delivery.holder.handler_id,
         ) else {
-            let _ = runtime.package_event_router().retire_holder(
-                delivery.envelope_id,
-                &delivery.holder.plugin_key,
-                delivery.holder.generation,
-            );
+            let flight = EventDeliveryFlight {
+                envelope_id: delivery.envelope_id,
+                plugin_key: delivery.holder.plugin_key,
+                generation: delivery.holder.generation,
+                scope_id: None,
+                request_id: request_id.0,
+            };
+            if !retire_event_holder(runtime, &flight) {
+                queue_event_retirement(state, flight);
+            }
             continue;
         };
-        let scope_id = runtime.causal_scopes().mint();
-        let request_id = RequestId(format!(
-            "package-event-{}-{}-{}",
-            delivery.owner, delivery.name, delivery.envelope_id
+        let Some(scope_id) = runtime.causal_scopes().mint_with_lease(Some(
+            crate::package_event_router::LeaseIdentity::EventInFlight {
+                request_id: request_id.0.clone(),
+            },
+        )) else {
+            let flight = EventDeliveryFlight {
+                envelope_id: delivery.envelope_id,
+                plugin_key: delivery.holder.plugin_key.clone(),
+                generation: delivery.holder.generation,
+                scope_id: None,
+                request_id: request_id.0.clone(),
+            };
+            if !retire_event_holder(runtime, &flight) {
+                queue_event_retirement(state, flight);
+            }
+            continue;
+        };
+        let metadata = Some(BoundaryJson(
+            serde_json::json!({ "causal_scope_id": scope_id }),
         ));
-        let metadata = scope_id
-            .map(|scope_id| BoundaryJson(serde_json::json!({ "causal_scope_id": scope_id })));
         let admission = runtime.try_admit_plugin(
             PluginInvocationClass::Background,
             PluginInvocationRequest {
@@ -821,35 +886,39 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
         );
         match admission {
             PluginAdmissionResult::Queued { .. } => {
-                let _ = runtime.package_event_router().note_admitted(
-                    delivery.envelope_id,
-                    &delivery.holder.plugin_key,
-                    delivery.holder.generation,
-                );
-                if let Some(scope_id) = scope_id {
-                    let _ = runtime.causal_scopes().acquire(
-                        scope_id,
-                        crate::package_event_router::LeaseIdentity::EventInFlight {
-                            request_id: request_id.0.clone(),
-                        },
-                    );
+                if runtime
+                    .package_event_router()
+                    .note_admitted(
+                        delivery.envelope_id,
+                        &delivery.holder.plugin_key,
+                        delivery.holder.generation,
+                    )
+                    .is_err()
+                {
+                    state.scheduler.try_wake();
                 }
                 state.event_in_flight.insert(
-                    request_id.0,
+                    request_id.0.clone(),
                     EventDeliveryFlight {
                         envelope_id: delivery.envelope_id,
                         plugin_key: delivery.holder.plugin_key,
                         generation: delivery.holder.generation,
-                        scope_id,
+                        scope_id: Some(scope_id),
+                        request_id: request_id.0,
                     },
                 );
             }
             _ => {
-                let _ = runtime.package_event_router().retire_holder(
-                    delivery.envelope_id,
-                    &delivery.holder.plugin_key,
-                    delivery.holder.generation,
-                );
+                let flight = EventDeliveryFlight {
+                    envelope_id: delivery.envelope_id,
+                    plugin_key: delivery.holder.plugin_key,
+                    generation: delivery.holder.generation,
+                    scope_id: Some(scope_id),
+                    request_id: request_id.0,
+                };
+                if !retire_event_holder(runtime, &flight) {
+                    queue_event_retirement(state, flight);
+                }
             }
         }
     }
@@ -862,6 +931,7 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
 }
 
 fn run_completion_drain_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
+    flush_pending_event_retirements(runtime, state);
     let drain =
         runtime.drain_plugin_completions(COMPLETION_DRAIN_MAX_ITEMS, COMPLETION_DRAIN_MAX_BYTES);
     for completion in drain.completions {
@@ -870,18 +940,8 @@ fn run_completion_drain_slice(runtime: &HubRuntime, state: &mut MaintenanceState
             PluginInvocationResult::Failed(failure) => failure.request_id.clone(),
         };
         if let Some(flight) = state.event_in_flight.remove(&request_id.0) {
-            let _ = runtime.package_event_router().retire_holder(
-                flight.envelope_id,
-                &flight.plugin_key,
-                flight.generation,
-            );
-            if let Some(scope_id) = flight.scope_id {
-                runtime.causal_scopes().release(
-                    scope_id,
-                    crate::package_event_router::LeaseIdentity::EventInFlight {
-                        request_id: request_id.0.clone(),
-                    },
-                );
+            if !retire_event_holder(runtime, &flight) {
+                queue_event_retirement(state, flight);
             }
             state.scheduler.try_wake();
             continue;
