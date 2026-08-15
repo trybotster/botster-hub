@@ -14,6 +14,7 @@ Plan: `docs/plans/cold-cut-terminal-drains-and-translation-from-the-production-p
 | Worktree HEAD before edits | `959c58f55726d098299cced8af151d8f496f41e3` |
 | Locked Core SHA | `aef6516d5809d563961ed7fdd07da29a7b4edddc` |
 | Merge policy | direct into `main`; no PR |
+| Review follow-up | `review_1786780308_178506` on `a5d8fcf` |
 
 Independent routing matched the approved plan. This run did not infer the repository from the ambient directory.
 
@@ -27,6 +28,9 @@ Applied before edits:
 - [[botster runtime teardown lenses]] (class applies)
 - [[Core control-plane lifecycle journal advances without a terminal client or Hub terminal Drain]]
 - [[Hub owner loop calls bounded Core lifecycle page APIs]]
+- [[Hub session projection continues without subscribers or terminal Drain]]
+- [[a known positive control proves a scan is live not that its pattern set is complete]]
+- [[sanitized projection plus wholesale replacement update contracts silent data loss]]
 - [[public protocol versions host control and Core terminal planes independently]]
 - [[Core terminal protocol separates Hub-safe envelopes from client semantic bodies]]
 - [[botster hub is a first party host profile over core]]
@@ -61,7 +65,7 @@ Not loaded: [[project-pipelines-playbook]] (package/plugin paths out of scope).
 - `packages/hub-test-support/**` (0.1.37 / revision 42, regenerated)
 - `README.md`, `docs/client-protocol.md`
 - Tests under `tests/hub_client_api_test.rs`, `tests/hub_local_runtime_test.rs`, `tests/hub_daemon_lifecycle/*`
-- Plan and this report
+- Plan and this report (Review follow-up on `review_1786780308_178506`)
 
 ## Ownership boundaries preserved
 
@@ -95,6 +99,22 @@ Review `review_1786778236_174399` required four follow-ups: keep the canonical s
 
 `DaemonConnection` skips Unix mux terminal frames when reading a host response and retains those frames for callers. Always-bind inserts mux frames on default Unix connections; without this skip, host ReadScreen after Attach cannot parse. IsolatedHub live-byte tests now observe retained adapter frames instead of Drain bodies.
 
+Review `review_1786780308_178506` required three follow-ups on `a5d8fcf`:
+
+1. `finding_1786780308_349189` — do not expose one baseline page as `SessionLifecycleBaseline`.
+2. `finding_1786780308_358706` — delete reachable AttachState construction and production terminal-body matching.
+3. `finding_1786780308_712158` — handle one-line `#[cfg(test)]` items and add a known-positive for every forbidden construct.
+
+This visit:
+
+- Deleted `HubRuntime::session_lifecycle_baseline()`.
+- Changed `HubClientApi::SubscribeEntities` to return `SessionLifecycleBaselinePage`.
+- Daemon `register_entity_subscription` waits for the owner-loop complete projection when no cursor exists. It does not stamp the first page as complete.
+- `fail_closed_pre_bind_attach` returns unit. `attach_failed_events` is gone.
+- `print_daemon_events` no longer matches terminal event bodies.
+- Unix/WebRTC attach occupancy no longer inspects `AttachState`.
+- `production_source` treats a one-line `{ ... }` body as a finished test item. The scan now also rejects `DaemonEvent::TerminalOutput`, `Snapshot`, `Scrollback`, `ProcessExit`, and `AttachState`.
+
 ## Runtime-teardown lenses
 
 | Lens | Implemented |
@@ -122,12 +142,12 @@ Passed on this tree:
 - Session-worker locked build
 - rustfmt
 - strict clippy
-- Hub lib tests: 269 passed, including fail-closed local Attach, negative architecture scan, WebRTC bind/peer-loss/fail-closed sibling
-- `hub_client_api_test`: 33 passed
+- Hub lib tests: 269 passed, including fail-closed local Attach, negative architecture scan, WebRTC bind/peer-loss/fail-closed sibling, one-line `#[cfg(test)]` scan controls, and `early_session_subscription_waits_for_complete_paged_projection`
+- `hub_client_api_test`: 34 passed, including `session_entity_subscription_returns_a_bounded_page_not_a_complete_baseline`
 - IsolatedHub Unix always-bind, empty Attach, host Drain empty, ReadScreen marker, replacement-owner
 - Lifecycle oracles rewritten off Attach/Drain translation: mux frames, `ReadScreen`, host OperatorError, session-entity patches
-- `hub_daemon_lifecycle_test`: 201 passed, 1 ignored (larger local many-PTY)
-- Full `./test.sh --locked` workspace: all binaries ok (lifecycle 201/1 ignored; lib 269; no FAILED results)
+- `hub_daemon_lifecycle_test`: 202 passed, 1 ignored (larger local many-PTY)
+- Full `./test.sh --locked` workspace: all binaries ok (lifecycle 202/1 ignored; lib 269; client API 34; no FAILED results)
 - `cli_smoke_proves_local_runtime_daemon_package_app_session_and_webrtc` passed in the locked suite
 - Missing-session host Drain is a typed OperatorError (`drain_runtime` / `terminal_stream_unavailable`)
 - SendInput/ModeGatedInput/Resize/Spawn/Shutdown/Remove observe through `pump_bound_unix_routes` so host inventory advances without terminal Drain
@@ -135,8 +155,10 @@ Passed on this tree:
 - Replacement Attach detaches generation N before bind of N+1
 - Support-matrix descriptor test now requires `terminal_streaming`, `resize`, and `snapshot_delivery=ready_then_history` to stay off host `supported_features`
 - Owner-loop session projection advances with zero entity subscribers; later subscribe receives the ended row (`session_projection_observes_exit_without_subscribers_then_later_snapshot_includes_ended_row`)
-- `HubClientEvent` no longer has terminal variants. Architecture scan covers items after `#[cfg(test)]` imports
+- `HubClientEvent` no longer has terminal variants. Architecture scan covers items after `#[cfg(test)]` imports and one-line `#[cfg(test)]` helpers
 - Hub-owned `FEATURE_TERMINAL_STREAMING` / `FEATURE_RESIZE` / `FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY` constants deleted; negotiation uses `botster-terminal-protocol`
+- Local SubscribeEntities returns a paged baseline. Daemon registration waits for the complete owner-loop projection before sending a session snapshot
+- Production Hub no longer constructs `DaemonEvent::AttachState` or matches TerminalOutput/Snapshot/Scrollback/ProcessExit/AttachState bodies
 
 ## Unverified behavior or residual risk
 

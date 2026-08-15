@@ -5,6 +5,7 @@
 //! API already proves the production path through [`crate::HubRuntime`].
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use botster_core::{
     CapabilitySurface, ClientId, CoreSession, CoreSessionMetadata, EnvelopeCursor,
@@ -17,7 +18,7 @@ use botster_core::{
 };
 use botster_core_daemon::{
     GuardedWriteDecision, GuardedWriteDeliveryState, GuardedWriteRequest, GuardedWriteResult,
-    ReadinessEvidence, SessionLifecycleBaseline,
+    LifecycleBaselineBudget, ReadinessEvidence, SessionLifecycleBaselinePage,
 };
 use botster_ui_contract::{
     PackageNavigationTarget, PackageSurfaceDescriptor, PackageSurfaceKind, PackageSurfaceOperation,
@@ -116,9 +117,18 @@ impl HubClientApi {
                         message: format!("unsupported entity type: {entity_type}"),
                     });
                 }
-                HubClientResponseBody::SessionLifecycleBaseline(
+                HubClientResponseBody::SessionLifecycleBaselinePage(
                     runtime
-                        .session_lifecycle_baseline()
+                        .lifecycle_baseline_page(
+                            None,
+                            None,
+                            LifecycleBaselineBudget {
+                                max_rows: 32,
+                                max_bytes: 64 * 1024,
+                                max_elapsed: Duration::from_millis(25),
+                            },
+                        )
+                        .map_err(|_| botster_core_daemon::CoreDaemonError::Shutdown)
                         .map_err(|error| runtime_error(request_id.clone(), operation, error))?,
                 )
             }
@@ -1097,7 +1107,7 @@ pub struct HubClientResponse {
 pub enum HubClientResponseBody {
     Status(HubClientStatus),
     Sessions(Vec<HubClientSession>),
-    SessionLifecycleBaseline(SessionLifecycleBaseline),
+    SessionLifecycleBaselinePage(SessionLifecycleBaselinePage),
     SessionRemoved(bool),
     Spawned(HubClientSpawned),
     Events(Vec<HubClientEvent>),

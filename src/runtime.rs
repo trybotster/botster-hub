@@ -24,8 +24,8 @@ use botster_core_daemon::{
     ObserveLifecycleCursor, ObserveLifecycleSlice, PublishRoutedEnvelopeRequest,
     ReadModeFlagsRequest, ReadModeFlagsResult, ReadScreenRequest, ReadScreenResult,
     RegistrySessionState, RoutedEnvelopeDeliveryStateResult, SessionAdoptionReport,
-    SessionAdoptionState, SessionLifecycleBaseline, SessionLifecycleBaselinePage,
-    SessionLifecycleCursor, SessionLifecyclePage, SessionLifecyclePageError, SpawnSessionRequest,
+    SessionAdoptionState, SessionLifecycleBaselinePage, SessionLifecycleCursor,
+    SessionLifecyclePage, SessionLifecyclePageError, SpawnSessionRequest,
 };
 use botster_ui_contract::{UiActionRequest, UiActionResult, UiNode};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -1789,26 +1789,6 @@ impl HubRuntime {
             .lock()
             .expect("core daemon mutex")
             .lifecycle_changes_page(after, max_changes, max_bytes)
-    }
-
-    /// Return the first bounded baseline page. Owner-loop callers must continue
-    /// across turns instead of assembling every page here.
-    pub fn session_lifecycle_baseline(&self) -> Result<SessionLifecycleBaseline, CoreDaemonError> {
-        let page = self
-            .lifecycle_baseline_page(
-                None,
-                None,
-                LifecycleBaselineBudget {
-                    max_rows: 32,
-                    max_bytes: 64 * 1024,
-                    max_elapsed: Duration::from_millis(25),
-                },
-            )
-            .map_err(|_| CoreDaemonError::Shutdown)?;
-        Ok(SessionLifecycleBaseline {
-            cursor: page.snapshot_sequence,
-            sessions: page.sessions,
-        })
     }
 
     /// Forget one terminal session through CoreDaemon's lifecycle authority.

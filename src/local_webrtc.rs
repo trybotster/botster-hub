@@ -586,31 +586,6 @@ fn local_webrtc_attach_change_for_response(
     request: &DaemonRequest,
     response: &DaemonResponse,
 ) -> Option<LocalWebrtcAttachedSubscriptionChange> {
-    if let Some((session_id, subscription_id)) =
-        response.events.iter().find_map(|event| match event {
-            botster_hub_client::DaemonEvent::AttachState {
-                session_id,
-                subscription_id,
-                state,
-            } if state == botster_hub_client::ATTACH_STATE_ATTACH_FAILED => {
-                Some((session_id.clone(), subscription_id.clone()))
-            }
-            _ => None,
-        })
-    {
-        return match request {
-            DaemonRequest::Drain {
-                subscription_id: Some(_),
-                ..
-            } => Some(LocalWebrtcAttachedSubscriptionChange::Detach(
-                LocalWebrtcAttachedSubscription {
-                    session_id,
-                    subscription_id,
-                },
-            )),
-            _ => None,
-        };
-    }
     if !response_records_attach_ownership(response) {
         return None;
     }
