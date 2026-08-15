@@ -378,6 +378,25 @@ impl Default for CoreEngineOptions {
 }
 
 impl CoreEngineOptions {
+    /// Construct the original public field set. Newer worker-queue knobs use defaults.
+    #[must_use]
+    pub fn new(
+        queue_capacities: Vec<CoreQueueCapacity>,
+        session_worker_path: Option<PathBuf>,
+        session_io_coalescing: SessionIoCoalescingOptions,
+        plugin_worker_queue_capacity: usize,
+        plugin_worker_executor_concurrency: usize,
+    ) -> Self {
+        Self {
+            queue_capacities,
+            session_worker_path,
+            session_io_coalescing,
+            plugin_worker_queue_capacity,
+            plugin_worker_executor_concurrency,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn plugin_worker_config(&self) -> PluginWorkerEngineConfig {
         PluginWorkerEngineConfig {
             per_plugin_queue_capacity: self.plugin_worker_queue_capacity,

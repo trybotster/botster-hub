@@ -1869,7 +1869,18 @@ impl HubRuntime {
     /// Event handlers subscribed to the Hub-owned `/session` family.
     #[must_use]
     pub fn session_family_event_handlers(&self) -> Vec<crate::lifecycle::HubPluginEventHandler> {
-        self.plugin_lifecycle.event_handlers_for("session_family")
+        self.session_family_event_handlers_page(None, usize::MAX).0
+    }
+
+    /// One bounded page of `/session` family event handlers.
+    #[must_use]
+    pub fn session_family_event_handlers_page(
+        &self,
+        after_plugin_key: Option<&str>,
+        max_items: usize,
+    ) -> (Vec<crate::lifecycle::HubPluginEventHandler>, bool) {
+        self.plugin_lifecycle
+            .event_handlers_for_page("session_family", after_plugin_key, max_items)
     }
 
     /// Forget one terminal session through CoreDaemon's lifecycle authority.
