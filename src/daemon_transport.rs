@@ -792,9 +792,6 @@ fn abandon_pending_terminal(write_state: &mut MuxWriteState) {
         && let Some(handle) = pending.complete_envelope
     {
         handle.defer_flush();
-        // Free the adapter slot. Holding an unsent frame here blocks
-        // ClientWorker, so ProcessExited never reaches observe.
-        let _ = handle.complete_active();
     }
 }
 
@@ -1052,9 +1049,9 @@ mod mux_write_resume_tests {
     }
 
     #[tokio::test]
-    async fn abandoned_zero_progress_terminal_frees_slot_for_later_frames() {
+    async fn abandoned_zero_progress_terminal_retries_the_original_frame() {
         let mux = UnixConnectionMux::new();
-        let mut stall = occupy_route(&mux, "stall", "sub", "flood");
+        let stall = occupy_route(&mux, "stall", "sub", "flood");
         assert_eq!(mux.snapshot_writes().len(), 1);
 
         let mut writer = PrefixStallWriter {
@@ -1068,25 +1065,26 @@ mod mux_write_resume_tests {
             .expect("zero-progress terminal start is abandoned");
         assert_eq!(
             stall.pressure(),
-            TerminalAdapterPressure::Ready,
-            "abandon must free the adapter slot so later frames can enqueue"
+            TerminalAdapterPressure::Full,
+            "abandon must keep the original adapter frame"
+        );
+        assert!(
+            mux.snapshot_writes().is_empty(),
+            "deferred flush omits the frame only for this pass"
         );
 
-        let later = TerminalFrame::from_bytes(br#"{"type":"terminal_output","marker":"exit"}"#)
-            .expect("opaque later frame");
-        assert_eq!(stall.try_write(&later), Ok(()));
         mux.clear_deferred_flushes();
         writer.allow_remainder = true;
         writer.stall_after = usize::MAX;
         flush_unix_mux_writes(&mut writer, &mux, &mut write_state)
             .await
-            .expect("flush the frame that replaced the abandoned slot");
+            .expect("retry the original deferred frame");
         let lines = parse_written_mux_lines(&writer.written);
         assert!(
             lines
                 .iter()
                 .any(|line| matches!(line, botster_hub_client::DaemonUnixMuxFrame::Terminal(_))),
-            "later frame after abandon must reach the mux, lines={lines:?}"
+            "the original flood frame must still be delivered, lines={lines:?}"
         );
     }
 
@@ -3302,38 +3300,36 @@ fn handle_runtime_control_request(
         }
         DaemonRequest::ReadScreen { session_id } => {
             let now = tick(logical_clock);
-            let session_id = SessionId(session_id);
+            observe_lifecycle_turn(runtime, now);
             let response = api.handle_request(
                 runtime,
                 &packages,
                 HubClientRequest::ReadScreen {
                     request_id: request_id("daemon-sessions-read-screen"),
-                    session_id: session_id.clone(),
+                    session_id: SessionId(session_id),
                     now_seconds: now,
                 },
             )?;
             let HubClientResponseBody::ReadScreen(screen) = response.body else {
                 return Err(DaemonTransportError::UnexpectedResponse);
             };
-            let _ = runtime.apply_retained_lifecycle_observations(&session_id, now);
             Ok(daemon_read_screen(screen))
         }
         DaemonRequest::ReadModeFlags { session_id } => {
             let now = tick(logical_clock);
-            let session_id = SessionId(session_id);
+            observe_lifecycle_turn(runtime, now);
             let response = api.handle_request(
                 runtime,
                 &packages,
                 HubClientRequest::ReadModeFlags {
                     request_id: request_id("daemon-sessions-read-mode-flags"),
-                    session_id: session_id.clone(),
+                    session_id: SessionId(session_id),
                     now_seconds: now,
                 },
             )?;
             let HubClientResponseBody::ModeFlags(mode_flags) = response.body else {
                 return Err(DaemonTransportError::UnexpectedResponse);
             };
-            let _ = runtime.apply_retained_lifecycle_observations(&session_id, now);
             Ok(daemon_mode_flags(mode_flags))
         }
         DaemonRequest::CaptureSnapshot { session_id } => {
@@ -4693,6 +4689,18 @@ impl PendingRuntimeState {
             Some(WebrtcTerminalAdmission::Admitted { .. })
         )
     }
+}
+
+fn observe_lifecycle_turn(runtime: &crate::HubRuntime, now: u64) {
+    let _ = runtime.observe_lifecycle_slice(
+        now,
+        None,
+        botster_core_daemon::ObserveLifecycleBudget {
+            max_sessions: 32,
+            max_encoded_result_bytes: 64 * 1024,
+            max_elapsed: Duration::from_millis(25),
+        },
+    );
 }
 
 fn pump_bound_unix_routes(daemon: &mut HubDaemon, state: &mut DaemonControlState) {

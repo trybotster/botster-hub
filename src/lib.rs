@@ -900,6 +900,7 @@ mod tests {
         "GHOSTSNP",
         "drain_subscription(",
         "drain_runtime_once(",
+        ".drain(session_id",
         "DaemonEvent::TerminalOutput",
         "DaemonEvent::Snapshot",
         "DaemonEvent::Scrollback",

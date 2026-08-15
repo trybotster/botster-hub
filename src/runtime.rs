@@ -1991,23 +1991,6 @@ impl HubRuntime {
         )
     }
 
-    /// Apply lifecycle observations that ReadScreen retained for the next drain.
-    ///
-    /// Core `read_screen` keeps those observations out of `observe_lifecycle_slice`.
-    /// The owner loop must apply them without inspecting terminal bodies.
-    pub fn apply_retained_lifecycle_observations(
-        &mut self,
-        session_id: &SessionId,
-        now_seconds: u64,
-    ) -> Result<(), CoreDaemonError> {
-        let _ = self
-            .core_daemon
-            .lock()
-            .expect("core daemon mutex")
-            .drain(session_id, now_seconds)?;
-        Ok(())
-    }
-
     /// Test helper for Core terminal Drain. Production daemon paths must not call this.
     #[cfg(test)]
     pub fn drain_runtime_once(
