@@ -215,6 +215,34 @@ impl HubEntityPublishBridge {
         self.release_count() > 0
     }
 
+    #[must_use]
+    pub fn has_release_room(&self) -> bool {
+        self.pending_releases
+            .try_lock()
+            .map(|pending| pending.len() < CAUSAL_PENDING_MAX)
+            .unwrap_or(false)
+            || self
+                .scope_releases
+                .try_lock()
+                .map(|scopes| scopes.len() < CAUSAL_PENDING_MAX)
+                .unwrap_or(false)
+            || self
+                .orphan_ops
+                .try_lock()
+                .map(|orphans| orphans.len() < CAUSAL_PENDING_MAX)
+                .unwrap_or(false)
+            || self
+                .held_release
+                .try_lock()
+                .map(|held| held.is_none())
+                .unwrap_or(false)
+            || self
+                .source_release
+                .try_lock()
+                .map(|source| source.is_none())
+                .unwrap_or(false)
+    }
+
     #[doc(hidden)]
     pub fn reject_next_publish(&self) {
         self.reject_next.store(true, Ordering::SeqCst);

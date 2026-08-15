@@ -118,6 +118,7 @@ pub struct HubRuntime {
     family_overflow: std::cell::RefCell<Option<CausalOp>>,
     source_ops: std::cell::RefCell<VecDeque<CausalOp>>,
     source_held: std::cell::RefCell<VecDeque<CausalOp>>,
+    unsettled_op: std::cell::RefCell<Option<CausalOp>>,
     event_plane_owner_ops: std::cell::RefCell<crate::package_event_router::EventPlaneOwnerOps>,
 }
 
@@ -287,6 +288,7 @@ impl HubRuntime {
             family_overflow: std::cell::RefCell::new(None),
             source_ops: std::cell::RefCell::new(VecDeque::new()),
             source_held: std::cell::RefCell::new(VecDeque::new()),
+            unsettled_op: std::cell::RefCell::new(None),
             event_plane_owner_ops: std::cell::RefCell::new(
                 crate::package_event_router::EventPlaneOwnerOps::default(),
             ),
@@ -381,6 +383,7 @@ impl HubRuntime {
             family_overflow: std::cell::RefCell::new(None),
             source_ops: std::cell::RefCell::new(VecDeque::new()),
             source_held: std::cell::RefCell::new(VecDeque::new()),
+            unsettled_op: std::cell::RefCell::new(None),
             event_plane_owner_ops: std::cell::RefCell::new(
                 crate::package_event_router::EventPlaneOwnerOps::default(),
             ),
@@ -534,11 +537,13 @@ impl HubRuntime {
             || self.family_overflow.borrow().is_some()
             || !self.source_ops.borrow().is_empty()
             || !self.source_held.borrow().is_empty()
+            || self.unsettled_op.borrow().is_some()
             || self.has_family_leftovers()
     }
 
     pub fn apply_event_plane_owner_ops(&self) -> Vec<crate::package_event_router::OwnerOp> {
         let _ = self.causal_scopes.flush_pending();
+        self.retry_unsettled();
         self.retry_in_hand();
         self.retry_owner_ops();
         self.retry_family_causal();
@@ -786,6 +791,73 @@ impl HubRuntime {
             }
         }
         CausalAdmitResult::Applied
+    }
+
+    fn hold_unsettled(&self, op: CausalOp) -> CausalAdmitResult {
+        let mut held = self.unsettled_op.borrow_mut();
+        if held.is_none() {
+            *held = Some(op);
+            CausalAdmitResult::Applied
+        } else {
+            CausalAdmitResult::Retry(op)
+        }
+    }
+
+    fn park_production(&self, result: CausalAdmitResult) -> CausalAdmitResult {
+        if let CausalAdmitResult::Retry(op) = self.enqueue_or_family(result)
+            && let CausalAdmitResult::Retry(op) = self.keep_or_reject(op)
+        {
+            return self.hold_unsettled(op);
+        }
+        CausalAdmitResult::Applied
+    }
+
+    fn leftover_slot_available(&self) -> bool {
+        self.unsettled_op.borrow().is_none()
+            || self.in_hand.borrow().is_none()
+            || self.family_held.borrow().is_none()
+            || self.family_source.borrow().is_none()
+            || self.family_overflow.borrow().is_none()
+            || self.retry_ops.borrow().len() < CAUSAL_PENDING_MAX
+            || self.family_causal.borrow().len() < CAUSAL_PENDING_MAX
+            || self.source_ops.borrow().len() < CAUSAL_PENDING_MAX
+            || self.source_held.borrow().len() < SOURCE_HELD_MAX
+            || self.unfinished_has_room()
+            || self.entity_publish_bridge.has_release_room()
+    }
+
+    fn unfinished_has_room(&self) -> bool {
+        self.unfinished_finishes
+            .lock()
+            .map(|pending| pending.len() < CAUSAL_PENDING_MAX)
+            .unwrap_or(false)
+            || self
+                .unfinished_overflow
+                .lock()
+                .map(|pending| pending.len() < CAUSAL_PENDING_MAX)
+                .unwrap_or(false)
+            || self
+                .unfinished_held
+                .lock()
+                .map(|pending| pending.len() < CAUSAL_PENDING_MAX)
+                .unwrap_or(false)
+    }
+
+    fn retry_unsettled(&self) {
+        let Some(op) = self.unsettled_op.borrow_mut().take() else {
+            return;
+        };
+        match self.causal_scopes.try_admit(op) {
+            CausalAdmitResult::Applied => {}
+            CausalAdmitResult::Retry(op) => {
+                if let CausalAdmitResult::Retry(op) =
+                    self.enqueue_or_family(CausalAdmitResult::Retry(op))
+                    && let CausalAdmitResult::Retry(op) = self.keep_or_reject(op)
+                {
+                    let _ = self.hold_unsettled(op);
+                }
+            }
+        }
     }
 
     fn park_on_family(&self, op: CausalOp) -> CausalAdmitResult {
@@ -1114,6 +1186,22 @@ impl HubRuntime {
     #[doc(hidden)]
     pub fn test_source_held_len(&self) -> usize {
         self.source_held.borrow().len()
+    }
+
+    #[must_use]
+    #[doc(hidden)]
+    pub fn test_unsettled(&self) -> bool {
+        self.unsettled_op.borrow().is_some()
+    }
+
+    #[doc(hidden)]
+    pub fn test_admit_publish(
+        &self,
+        plugin_key: &str,
+        frame: serde_json::Value,
+        scope_id: Option<u64>,
+    ) -> Result<PackageEntityPublishResult, String> {
+        self.admit_package_entity_publish(PluginKey(plugin_key.to_string()), frame, scope_id)
     }
 
     #[doc(hidden)]
@@ -2034,7 +2122,10 @@ impl HubRuntime {
 
     fn fulfill_pending_entity_publish_requests(&self) {
         self.harvest_publish_releases();
-        while let Some(pending) = self.entity_publish_bridge.take_pending() {
+        while self.leftover_slot_available() {
+            let Some(pending) = self.entity_publish_bridge.take_pending() else {
+                break;
+            };
             if let Some(scope_id) = pending.scope_id
                 && !self.causal_scopes.acquire(
                     scope_id,
@@ -2069,13 +2160,12 @@ impl HubRuntime {
         let result = self.admit_package_entity_publish_inner(plugin_key.clone(), frame, scope_id);
         if let Some(scope_id) = scope_id
             && result.is_err()
-            && let CausalAdmitResult::Retry(op) =
-                release_or_retract(&self.causal_scopes, scope_id, pending_identity)
-            && let CausalAdmitResult::Retry(op) =
-                self.enqueue_or_family(CausalAdmitResult::Retry(op))
-            && let CausalAdmitResult::Retry(_op) = self.keep_or_reject(op)
         {
-            // Retract failed while the global source store was full.
+            let _ = self.park_production(release_or_retract(
+                &self.causal_scopes,
+                scope_id,
+                pending_identity,
+            ));
         }
         result
     }
@@ -2205,9 +2295,7 @@ impl HubRuntime {
             mutation_seq,
             result,
         );
-        if let CausalAdmitResult::Retry(op) = self.enqueue_or_family(self.admit_causal_op(op))
-            && let CausalAdmitResult::Retry(_op) = self.keep_or_reject(op)
-        {
+        if let CausalAdmitResult::Retry(_) = self.park_production(self.admit_causal_op(op)) {
             return;
         }
         if result.resync_needed {
@@ -2556,6 +2644,7 @@ impl HubRuntime {
             || self.family_overflow.borrow().is_some()
             || !self.source_ops.borrow().is_empty()
             || !self.source_held.borrow().is_empty()
+            || self.unsettled_op.borrow().is_some()
         {
             return true;
         }
@@ -2871,6 +2960,12 @@ impl HubRuntime {
             .package_entity_family_state(entity_type)
             .and_then(|family| family.provider_scope_id());
         let request_id = RequestId(format!("plugin-entity-provider-{subscription_id}"));
+        if scope_id.is_some() && !self.leftover_slot_available() {
+            return Err(crate::McpToolError::new(
+                "causal_scope_busy",
+                "could not acquire provider causal lease",
+            ));
+        }
         if let Some(scope_id) = scope_id
             && !self.causal_scopes.acquire(
                 scope_id,
@@ -2903,17 +2998,13 @@ impl HubRuntime {
                 "subscription_id": subscription_id,
             })),
         });
-        if let Some(scope_id) = scope_id
-            && let CausalAdmitResult::Retry(op) =
-                self.enqueue_or_family(self.admit_causal_op(CausalOp::Release {
-                    scope_id,
-                    identity: crate::package_event_router::LeaseIdentity::ProviderInFlight {
-                        request_id: request_id.0.clone(),
-                    },
-                }))
-            && let CausalAdmitResult::Retry(_op) = self.keep_or_reject(op)
-        {
-            // Retract failed while the global source store was full.
+        if let Some(scope_id) = scope_id {
+            let _ = self.park_production(self.admit_causal_op(CausalOp::Release {
+                scope_id,
+                identity: crate::package_event_router::LeaseIdentity::ProviderInFlight {
+                    request_id: request_id.0.clone(),
+                },
+            }));
         }
         let value = completed_plugin_payload(outcome.result, "plugin entity provider")?;
         let value = coerce_entity_frame_empty_items(value);
