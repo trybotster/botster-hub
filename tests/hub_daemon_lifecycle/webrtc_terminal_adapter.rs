@@ -45,12 +45,8 @@ async fn spawn_and_bind_webrtc(
         .expect("attach");
     assert_eq!(attach.kind, botster_hub_client::DaemonResponseKind::Events);
     assert!(
-        attach.events.iter().any(|event| matches!(
-            event,
-            botster_hub_client::DaemonEvent::AttachState { state, .. }
-                if state == botster_hub_client::ATTACH_STATE_ATTACHING
-        )),
-        "bind must return Attaching: {:?}",
+        attach.events.is_empty(),
+        "WebRTC bind must return empty Attach bodies: {:?}",
         attach.events
     );
 }
@@ -238,26 +234,11 @@ fn webrtc_terminal_adapter_bind_returns_only_attaching_then_terminal_frames() {
             .await
             .expect("attach");
         assert_eq!(attach.kind, botster_hub_client::DaemonResponseKind::Events);
-        let terminal: Vec<_> = attach
-            .events
-            .iter()
-            .filter(|event| webrtc_event_is_terminal_body(event))
-            .collect();
-        assert_eq!(
-            terminal.len(),
-            1,
-            "attach may carry only the initial Attaching frame: {:?}",
+        assert!(
+            attach.events.is_empty(),
+            "WebRTC Attach must not return terminal bodies: {:?}",
             attach.events
         );
-        assert!(matches!(
-            terminal[0],
-            botster_hub_client::DaemonEvent::AttachState {
-                state,
-                subscription_id: event_subscription,
-                ..
-            } if state == botster_hub_client::ATTACH_STATE_ATTACHING
-                && event_subscription == subscription_id
-        ));
 
         let deadline = Instant::now() + Duration::from_secs(8);
         let mut saw_terminal_frame = false;
@@ -415,6 +396,9 @@ fn webrtc_terminal_adapter_unbound_attach_still_drains_snapshot_without_terminal
     let subscription_id = "wau-sub";
     block_on(async {
         let (mut peer, key) = open_local_webrtc_peer(&endpoint, &bootstrap).await;
+        peer.encrypted_hello(&key, &webrtc_terminal_adapter_hello())
+            .await
+            .expect("hello");
         let spawned = peer
             .encrypted_request(
                 &key,
@@ -435,31 +419,53 @@ fn webrtc_terminal_adapter_unbound_attach_still_drains_snapshot_without_terminal
                 },
             )
             .await
-            .expect("unbound attach");
+            .expect("always-bind attach");
         assert_eq!(attach.kind, botster_hub_client::DaemonResponseKind::Events);
+        assert!(
+            attach.events.is_empty(),
+            "WebRTC Attach must not return Snapshot: {:?}",
+            attach.events
+        );
+        let drain = peer
+            .encrypted_request(
+                &key,
+                &botster_hub_client::DaemonRequest::drain_subscription(
+                    session_id,
+                    subscription_id,
+                ),
+            )
+            .await
+            .expect("host drain");
+        assert!(
+            drain.events.is_empty(),
+            "host Drain must not return Snapshot: {:?}",
+            drain.events
+        );
         let deadline = Instant::now() + Duration::from_secs(8);
-        let mut saw_snapshot = attach.events.iter().any(|event| {
-            matches!(event, botster_hub_client::DaemonEvent::Snapshot { .. })
-        });
-        while Instant::now() < deadline && !saw_snapshot {
-            let drain = peer
+        let mut text = String::new();
+        while Instant::now() < deadline {
+            let screen = peer
                 .encrypted_request(
                     &key,
-                    &botster_hub_client::DaemonRequest::drain_subscription(
-                        session_id,
-                        subscription_id,
-                    ),
+                    &botster_hub_client::DaemonRequest::ReadScreen {
+                        session_id: session_id.to_string(),
+                    },
                 )
                 .await
-                .expect("unbound drain");
-            saw_snapshot = drain.events.iter().any(|event| {
-                matches!(event, botster_hub_client::DaemonEvent::Snapshot { .. })
-            });
+                .expect("read screen");
+            text = screen
+                .read_screen
+                .as_ref()
+                .map(|screen| screen.text.clone())
+                .unwrap_or_default();
+            if text.contains("unbound-webrtc-ready") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
         }
-        assert!(saw_snapshot, "unbound WebRTC attach must still Drain Snapshot");
         assert!(
-            peer.pending_terminal_frames.is_empty(),
-            "unbound attach must not receive daemon_terminal_frame"
+            text.contains("unbound-webrtc-ready"),
+            "visible text is on ReadScreen: {text:?}"
         );
         peer.peer.close().await.expect("close offer peer");
     });
@@ -1270,5 +1276,5 @@ fn webrtc_terminal_adapter_close_event_feature_stays_optional_on_protocol_7() {
             .any(|feature| feature == botster_hub_client::FEATURE_TERMINAL_SUBSCRIPTION_CLOSED)
     );
     assert_eq!(botster_hub_client::PROTOCOL_VERSION, 7);
-    assert_eq!(botster_hub_client::CONFORMANCE_FIXTURE_REVISION, 41);
+    assert_eq!(botster_hub_client::CONFORMANCE_FIXTURE_REVISION, 42);
 }

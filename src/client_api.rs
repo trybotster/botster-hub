@@ -6,14 +6,16 @@
 
 use std::collections::BTreeMap;
 
+#[cfg(test)]
+use botster_core::{BotsterEngineObservation, TransportEgress};
 use botster_core::{
-    BotsterEngineObservation, CapabilitySurface, ClientId, CoreSession, CoreSessionMetadata,
-    EnvelopeCursor, EnvelopeDeliveryState, EnvelopeId, EnvelopeTarget, PackageBlockedReason,
+    CapabilitySurface, ClientId, CoreSession, CoreSessionMetadata, EnvelopeCursor,
+    EnvelopeDeliveryState, EnvelopeId, EnvelopeTarget, PackageBlockedReason,
     PackageDependencyResolution, PackageFeatureResolution, PackageResolutionState, PackageSource,
     RequestId, RoutedEnvelope, RoutedEnvelopeDrainOutcome, RoutedEnvelopePublishOutcome,
     RunnableEntrypointKind, RunnableEntrypointLaunchMode, SessionId, SessionLifecycleState,
     SessionRuntimeErrorKind, SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory,
-    SubscriptionId, TerminalAttachState, TransportEgress,
+    SubscriptionId, TerminalAttachState,
 };
 use botster_core_daemon::{
     GuardedWriteDecision, GuardedWriteDeliveryState, GuardedWriteRequest, GuardedWriteResult,
@@ -146,24 +148,13 @@ impl HubClientApi {
                     events: Vec::new(),
                 })
             }
-            HubClientRequest::Attach {
-                session_id,
-                subscription_id,
-                now_seconds,
-                ..
-            } => {
-                let attached = runtime
-                    .attach_client(
-                        self.identity.client_id.clone(),
-                        session_id,
-                        subscription_id,
-                        now_seconds,
-                    )
-                    .map_err(|error| runtime_error(request_id.clone(), operation, error))?;
-                HubClientResponseBody::Events(events_from_drain(botster_core_daemon::DrainResult {
-                    client_egress: attached.client_egress,
-                    ..botster_core_daemon::DrainResult::default()
-                }))
+            HubClientRequest::Attach { .. } => {
+                return Err(HubClientError::InvalidRequest {
+                    request_id,
+                    operation,
+                    message: "Attach requires a Unix or WebRTC adapter-bound daemon path"
+                        .to_string(),
+                });
             }
             HubClientRequest::Detach {
                 session_id,
@@ -237,16 +228,7 @@ impl HubClientApi {
                     .map_err(|error| runtime_error(request_id.clone(), operation, error))?;
                 HubClientResponseBody::Events(Vec::new())
             }
-            HubClientRequest::DrainRuntime {
-                session_id,
-                last_output_at,
-                ..
-            } => {
-                let output = runtime
-                    .drain_runtime_once(&session_id, last_output_at)
-                    .map_err(|error| runtime_error(request_id.clone(), operation, error))?;
-                HubClientResponseBody::Events(events_from_drain(output))
-            }
+            HubClientRequest::DrainRuntime { .. } => HubClientResponseBody::Events(Vec::new()),
             HubClientRequest::Shutdown {
                 session_id,
                 now_seconds,
@@ -1403,6 +1385,7 @@ pub enum HubClientEvent {
 }
 
 impl HubClientEvent {
+    #[cfg(test)]
     fn from_observation(observation: BotsterEngineObservation) -> Self {
         match observation {
             BotsterEngineObservation::SessionLifecycle { session_id, state } => {
@@ -2237,6 +2220,7 @@ fn session_type_client_metadata(mut metadata: CoreSessionMetadata) -> CoreSessio
     metadata
 }
 
+#[cfg(test)]
 pub(crate) fn events_from_drain(output: botster_core_daemon::DrainResult) -> Vec<HubClientEvent> {
     let mut events = Vec::new();
 

@@ -10,8 +10,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use botster_core::{
-    ClientId, CoreSessionMetadata, RequestId, ResizePayload, SessionId, SessionLifecycleState,
-    SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId, TransportEgress,
+    CoreSessionMetadata, RequestId, ResizePayload, SessionId, SessionLifecycleState,
+    SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId,
 };
 use botster_hub::{
     DaemonApp, DaemonCompatibility, DaemonEvent, DaemonOperatorError, DaemonPackage,
@@ -796,10 +796,6 @@ fn smoke_session_round_trip(config: &botster_hub::HubConfig) -> Result<(), Smoke
             &spawn,
         )));
     }
-    // After the Core capability-bind pin, a fast-exit attach still returns the
-    // initial Attaching handshake and Snapshot/Attached on Drain. Visible text
-    // is on ReadScreen. ProcessExit does not change host lifecycle, so
-    // stream_attach's ProcessExit/exited wait never completes.
     let mut connection =
         botster_hub::DaemonConnection::connect(config).map_err(SmokeError::Transport)?;
     let attach = connection
@@ -808,45 +804,38 @@ fn smoke_session_round_trip(config: &botster_hub::HubConfig) -> Result<(), Smoke
             subscription_id: subscription_id.clone(),
         })
         .map_err(SmokeError::Transport)?;
+    if attach.kind == DaemonResponseKind::OperatorError {
+        return Err(SmokeError::OperatorResponse(operator_response_message(
+            &attach,
+        )));
+    }
+    if !attach.events.is_empty() {
+        return Err(SmokeError::SessionRoundTrip(format!(
+            "attach returned terminal bodies: {:?}",
+            attach.events
+        )));
+    }
     let deadline = Instant::now() + SMOKE_TIMEOUT;
-    let mut attached = attach_state_is(&attach.events, "attached");
-    while !attached && Instant::now() < deadline {
-        let drain = connection
-            .request(&DaemonRequest::drain_subscription(
-                &session_id,
-                &subscription_id,
-            ))
+    let mut observed = String::new();
+    while Instant::now() < deadline {
+        let screen = connection
+            .request(&DaemonRequest::ReadScreen {
+                session_id: session_id.clone(),
+            })
             .map_err(SmokeError::Transport)?;
-        attached = attach_state_is(&drain.events, "attached");
-        if attached {
-            break;
+        observed = screen
+            .read_screen
+            .as_ref()
+            .map(|screen| screen.text.clone())
+            .unwrap_or_default();
+        if observed.contains(&format!("smoke:{marker}")) {
+            let _ = daemon_transport_request(config, DaemonRequest::ShutdownSession { session_id });
+            return Ok(());
         }
         thread::sleep(Duration::from_millis(25));
     }
-    let screen = connection
-        .request(&DaemonRequest::ReadScreen {
-            session_id: session_id.clone(),
-        })
-        .map_err(SmokeError::Transport)?;
-    let observed = screen
-        .read_screen
-        .as_ref()
-        .map(|screen| screen.text.clone())
-        .unwrap_or_default();
     let _ = daemon_transport_request(config, DaemonRequest::ShutdownSession { session_id });
-    if attached && observed.contains(&format!("smoke:{marker}")) {
-        return Ok(());
-    }
     Err(SmokeError::SessionRoundTrip(observed))
-}
-
-fn attach_state_is(events: &[DaemonEvent], expected: &str) -> bool {
-    events.iter().any(|event| {
-        matches!(
-            event,
-            DaemonEvent::AttachState { state, .. } if state == expected
-        )
-    })
 }
 
 fn operator_response_message(response: &DaemonResponse) -> String {
@@ -4148,37 +4137,12 @@ fn run_one(args: Vec<String>) -> Result<(), RunOneError> {
         initial_pty_size: Some(ResizePayload { rows: 24, cols: 80 }),
     };
     let session_id = request.session_id.clone();
-    let client_id = ClientId("botster-hub-smoke-client".to_string());
-    let subscription_id = SubscriptionId("botster-hub-smoke-subscription".to_string());
     let mut logical_clock = 1;
 
     let spawn = runtime.spawn_session(request, CoreSessionMetadata::new(), logical_clock)?;
     logical_clock += 1;
-    runtime.attach_client(
-        client_id.clone(),
-        session_id.clone(),
-        subscription_id.clone(),
-        logical_clock,
-    )?;
-    logical_clock += 1;
 
-    runtime.resize(
-        client_id.clone(),
-        session_id.clone(),
-        30,
-        100,
-        logical_clock,
-    )?;
-    logical_clock += 1;
-
-    let observed = drain_until_marker(&mut runtime, &session_id, &mut logical_clock)?;
-    runtime.detach_client(
-        client_id,
-        session_id.clone(),
-        subscription_id,
-        logical_clock,
-    )?;
-    logical_clock += 1;
+    let observed = read_screen_until_marker(&mut runtime, &session_id, &mut logical_clock)?;
     runtime.shutdown_session(session_id.clone(), logical_clock)?;
 
     println!(
@@ -4193,25 +4157,31 @@ fn run_one(args: Vec<String>) -> Result<(), RunOneError> {
     Ok(())
 }
 
-fn drain_until_marker(
+fn read_screen_until_marker(
     runtime: &mut HubRuntime,
     session_id: &SessionId,
     logical_clock: &mut u64,
 ) -> Result<Vec<u8>, RunOneError> {
     let deadline = Instant::now() + SMOKE_TIMEOUT;
     let marker = SMOKE_MARKER.as_bytes();
-    let mut observed = Vec::new();
 
     while Instant::now() < deadline {
-        let output = runtime.drain_runtime_once(session_id, *logical_clock)?;
+        let _ = runtime.observe_lifecycle_slice(
+            *logical_clock,
+            None,
+            botster_core_daemon::ObserveLifecycleBudget {
+                max_sessions: 32,
+                max_encoded_result_bytes: 64 * 1024,
+                max_elapsed: Duration::from_millis(25),
+            },
+        );
+        let output = runtime.read_screen(
+            RequestId(format!("botster-hub-smoke-read-{}", *logical_clock)),
+            session_id.clone(),
+            *logical_clock,
+        )?;
         *logical_clock += 1;
-
-        for (_, frame) in output.client_egress {
-            if let TransportEgress::TerminalOutput { data, .. } = frame {
-                observed.extend(data);
-            }
-        }
-
+        let observed = output.screen.text.into_bytes();
         if observed
             .windows(marker.len())
             .any(|window| window == marker)

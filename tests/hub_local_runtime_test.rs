@@ -9,9 +9,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use botster_core::{RequestId, SessionId, SessionLifecycleState, SubscriptionId};
 use botster_hub::{
     CoreEngineOptions, DataDirectoryOption, FileHubStateStore, HostIdentityOptions, HubClientApi,
-    HubClientEvent, HubClientPackageClassification, HubClientPackageState, HubClientRequest,
-    HubClientResponseBody, HubDaemon, HubStartupOptions, HubStateLoadSource, HubStateStore,
-    PackageRegistry, RuntimeEnvironment, SessionDefaults, TransportBindings,
+    HubClientPackageClassification, HubClientPackageState, HubClientRequest, HubClientResponseBody,
+    HubDaemon, HubStartupOptions, HubStateLoadSource, HubStateStore, PackageRegistry,
+    RuntimeEnvironment, SessionDefaults, TransportBindings,
 };
 
 mod support;
@@ -261,17 +261,32 @@ fn spawn_attach_input_and_drain(
     };
     assert_eq!(spawned.session.lifecycle, SessionLifecycleState::Running);
 
-    api.handle_request(
-        runtime,
-        packages,
-        HubClientRequest::Attach {
-            request_id: request_id("runtime-attach"),
-            session_id: session_id.clone(),
-            subscription_id: subscription_id.clone(),
-            now_seconds: *logical_clock,
-        },
-    )
-    .expect("attach through client api");
+    runtime
+        .attach_client(
+            api.identity().client_id.clone(),
+            session_id.clone(),
+            subscription_id.clone(),
+            *logical_clock,
+        )
+        .expect("runtime attach");
+    *logical_clock += 1;
+    let generation = runtime
+        .list_terminal_subscriptions()
+        .into_iter()
+        .find(|row| row.session_id == session_id && row.subscription_id == subscription_id)
+        .map(|row| row.generation)
+        .expect("live generation");
+    runtime
+        .bind_terminal_adapter(
+            api.identity().client_id.clone(),
+            session_id.clone(),
+            subscription_id.clone(),
+            generation,
+            botster_core::TerminalCapabilitySet::from_tokens(["terminal_streaming", "resize"])
+                .expect("tokens"),
+            Box::new(botster_core_test_support::terminal_adapter::FakeTerminalAdapter::default()),
+        )
+        .expect("bind test adapter");
     *logical_clock += 1;
     read_screen_until(
         runtime,
@@ -321,6 +336,15 @@ fn read_screen_until(
 ) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
+        let _ = runtime.observe_lifecycle_slice(
+            *logical_clock,
+            None,
+            botster_core_daemon::ObserveLifecycleBudget {
+                max_sessions: 32,
+                max_encoded_result_bytes: 64 * 1024,
+                max_elapsed: Duration::from_millis(20),
+            },
+        );
         let response = api
             .handle_request(
                 runtime,
@@ -355,8 +379,18 @@ fn drain_until(
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut observed = Vec::new();
 
+    let needle_text = String::from_utf8_lossy(needle);
     while Instant::now() < deadline {
-        let response = api
+        let _ = runtime.observe_lifecycle_slice(
+            *logical_clock,
+            None,
+            botster_core_daemon::ObserveLifecycleBudget {
+                max_sessions: 32,
+                max_encoded_result_bytes: 64 * 1024,
+                max_elapsed: Duration::from_millis(20),
+            },
+        );
+        let drain = api
             .handle_request(
                 runtime,
                 packages,
@@ -366,21 +400,35 @@ fn drain_until(
                     last_output_at: *logical_clock,
                 },
             )
-            .expect("drain through client api");
+            .expect("host DrainRuntime");
         *logical_clock += 1;
-
-        let HubClientResponseBody::Events(events) = response.body else {
+        let HubClientResponseBody::Events(events) = drain.body else {
             panic!("drain should return events");
         };
-        for event in events {
-            if let HubClientEvent::TerminalOutput { data, .. } = event {
-                observed.extend(data);
-            }
-        }
-
+        assert!(
+            events.is_empty(),
+            "DrainRuntime must not return terminal bodies: {events:?}"
+        );
+        let response = api
+            .handle_request(
+                runtime,
+                packages,
+                HubClientRequest::ReadScreen {
+                    request_id: request_id("runtime-read-after-drain"),
+                    session_id: session_id.clone(),
+                    now_seconds: *logical_clock,
+                },
+            )
+            .expect("read screen");
+        *logical_clock += 1;
+        let HubClientResponseBody::ReadScreen(screen) = response.body else {
+            panic!("read screen response expected");
+        };
+        observed = screen.text.into_bytes();
         if observed
             .windows(needle.len())
             .any(|window| window == needle)
+            || String::from_utf8_lossy(&observed).contains(needle_text.as_ref())
         {
             return observed;
         }

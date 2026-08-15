@@ -10,6 +10,7 @@ use std::fmt;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+#[cfg(test)]
 use std::thread;
 use std::time::Duration;
 
@@ -27,7 +28,7 @@ mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 pub const PROTOCOL_VERSION: u16 = 7;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 41;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 42;
 /// Oldest conformance revision accepted by the default first-party client requirement.
 pub const DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 36;
 /// Version of the local WebRTC delivery chunk framing protocol.
@@ -79,7 +80,6 @@ pub const ATTACH_STATE_ATTACHING: &str = "attaching";
 pub const ATTACH_STATE_SNAPSHOT_HISTORY_INCOMPLETE: &str = "snapshot_history_incomplete";
 /// Wire `AttachState.state` when attach fails before any READY Snapshot.
 pub const ATTACH_STATE_ATTACH_FAILED: &str = "attach_failed";
-const ATTACH_DRAIN_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Authenticated plaintext carried by one complete local WebRTC delivery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -265,7 +265,7 @@ pub fn subscribe_entities(
     })
 }
 
-/// Attach and stream terminal bytes until the session exits or the connection closes.
+/// Attach and restore the current screen. Terminal bytes flow through the bound adapter.
 pub fn stream_attach(
     endpoint: &DaemonEndpoint,
     session_id: &str,
@@ -293,49 +293,13 @@ fn stream_attach_connected(
         },
     )?;
     let response = read_daemon_response_from_reader(&mut reader)?;
-    write_terminal_events(&response.events, output)?;
-    if stream_attach_should_complete(&response.events, false) {
-        return Ok(());
+    if response.kind == DaemonResponseKind::OperatorError {
+        return Err(DaemonTransportError::Protocol(
+            "attach failed before adapter bind",
+        ));
     }
-    let mut idle_drains = 0;
-    let mut lifecycle_exited = false;
-    let mut restored_screen = false;
-
-    loop {
-        thread::sleep(ATTACH_DRAIN_INTERVAL);
-        write_frame(
-            stream,
-            &DaemonRequest::Drain {
-                session_id: session_id.to_string(),
-                subscription_id: Some(subscription_id.to_string()),
-            },
-        )?;
-        let response = read_daemon_response_from_reader(&mut reader)?;
-        if response.events.is_empty() {
-            idle_drains += 1;
-        } else {
-            idle_drains = 0;
-        }
-        write_terminal_events(&response.events, output)?;
-        if !restored_screen && events_ready_for_read_screen(&response.events) {
-            restored_screen = write_read_screen(&mut reader, stream, session_id, output)?;
-        }
-        if stream_attach_should_complete(&response.events, lifecycle_exited) {
-            return Ok(());
-        }
-        if idle_drains >= 20 {
-            write_frame(stream, &DaemonRequest::ListSessions)?;
-            let response = read_daemon_response_from_reader(&mut reader)?;
-            if response
-                .sessions
-                .iter()
-                .any(|session| session.session_id == session_id && session.lifecycle == "exited")
-            {
-                lifecycle_exited = true;
-            }
-            idle_drains = 0;
-        }
-    }
+    let _ = write_read_screen(&mut reader, stream, session_id, output)?;
+    Ok(())
 }
 
 fn detach_stream_subscription(stream: &mut UnixStream, session_id: &str, subscription_id: &str) {
@@ -507,11 +471,16 @@ fn read_daemon_response(stream: &mut UnixStream) -> DaemonTransportResult<Daemon
 fn read_daemon_response_from_reader(
     reader: &mut BufReader<UnixStream>,
 ) -> DaemonTransportResult<DaemonResponse> {
-    let value = read_value_frame_from_reader(reader)?;
-    if status_missing_compatibility(&value) {
-        return Err(precompatibility_hub_error());
+    loop {
+        let value = read_value_frame_from_reader(reader)?;
+        if status_missing_compatibility(&value) {
+            return Err(precompatibility_hub_error());
+        }
+        match parse_unix_mux_value(value).map_err(DaemonTransportError::Json)? {
+            DaemonUnixMuxFrame::Response(response) => return Ok(*response),
+            DaemonUnixMuxFrame::Terminal(_) | DaemonUnixMuxFrame::Event(_) => {}
+        }
     }
-    serde_json::from_value(value).map_err(DaemonTransportError::Json)
 }
 
 fn normalize_socket_io_error(error: std::io::Error) -> DaemonTransportError {
@@ -549,6 +518,7 @@ fn precompatibility_hub_error() -> DaemonTransportError {
     })
 }
 
+#[cfg(test)]
 fn write_terminal_events(
     events: &[DaemonEvent],
     output: &mut impl Write,
@@ -563,26 +533,6 @@ fn write_terminal_events(
         }
     }
     Ok(())
-}
-
-fn events_ready_for_read_screen(events: &[DaemonEvent]) -> bool {
-    events.iter().any(|event| match event {
-        DaemonEvent::Snapshot { .. } => true,
-        DaemonEvent::AttachState { state, .. } => state == "attached",
-        _ => false,
-    })
-}
-
-fn stream_attach_should_complete(events: &[DaemonEvent], lifecycle_exited: bool) -> bool {
-    lifecycle_exited
-        || events.iter().any(|event| {
-            event.is_process_exit()
-                || matches!(
-                    event,
-                    DaemonEvent::AttachState { state, .. }
-                        if state == ATTACH_STATE_ATTACH_FAILED
-                )
-        })
 }
 
 fn write_read_screen(
@@ -685,12 +635,9 @@ impl DaemonCompatibilityRequirement {
     /// ```
     /// let mut requirement = botster_hub_client::DaemonCompatibilityRequirement::current();
     /// requirement.client_name = "botster-tui".to_string();
-    /// requirement
-    ///     .required_features
-    ///     .push(botster_hub_client::FEATURE_TERMINAL_STREAMING.to_string());
     ///
     /// assert_eq!(requirement.protocol, botster_hub_client::PROTOCOL);
-    /// assert!(requirement
+    /// assert!(!requirement
     ///     .required_features
     ///     .contains(&botster_hub_client::FEATURE_TERMINAL_STREAMING.to_string()));
     /// ```
@@ -719,13 +666,10 @@ impl DaemonCompatibilityRequirement {
         requirement
     }
 
-    /// Build the requirement for READY-then-history snapshot attach.
+    /// Build the host requirement used with a terminal-plane ready-then-history Hello.
     #[must_use]
     pub fn for_ready_then_history_attach() -> Self {
         let mut requirement = Self::current();
-        requirement
-            .required_features
-            .push(FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY.to_string());
         requirement.minimum_conformance_fixture_revision = CONFORMANCE_FIXTURE_REVISION;
         requirement
     }
@@ -875,7 +819,6 @@ fn compatibility_diagnostic(reason: &str) -> DaemonDiagnostic {
 fn current_feature_list() -> Vec<&'static str> {
     let mut features = default_required_feature_list();
     features.push(FEATURE_HUB_SOURCE_UPDATE);
-    features.push(FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY);
     features.push(FEATURE_UNIX_TERMINAL_ADAPTER);
     features.push(FEATURE_TERMINAL_SUBSCRIPTION_CLOSED);
     features.push(FEATURE_WEBRTC_TERMINAL_ADAPTER);
@@ -885,8 +828,6 @@ fn current_feature_list() -> Vec<&'static str> {
 fn default_required_feature_list() -> Vec<&'static str> {
     vec![
         FEATURE_SESSIONS,
-        FEATURE_TERMINAL_STREAMING,
-        FEATURE_RESIZE,
         FEATURE_PLUGIN_SURFACE_RENDER,
         FEATURE_PLUGIN_SURFACE_ACTION,
         FEATURE_PACKAGE_ROUTES,
@@ -3301,13 +3242,8 @@ mod tests {
         )));
 
         previous_daemon.conformance_fixture_revision = CONFORMANCE_FIXTURE_REVISION;
-        let error = ensure_compatible(&requirement, &previous_daemon)
-            .expect_err("a ready-then-history client must require the advertised feature");
-        assert!(
-            error
-                .diagnostic
-                .contains("missing required feature(s): snapshot_delivery=ready_then_history")
-        );
+        ensure_compatible(&requirement, &previous_daemon)
+            .expect("ready-then-history is a terminal-plane requirement, not a host feature");
 
         ensure_compatible(&requirement, &DaemonCompatibility::current())
             .expect("a ready-then-history client accepts the current daemon");
@@ -3859,7 +3795,7 @@ mod tests {
     #[test]
     fn protocol_seven_rejects_protocol_six_and_accepts_conformance_floor_thirty_five() {
         assert_eq!(PROTOCOL_VERSION, 7);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 41);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 42);
 
         let protocol_six = DaemonCompatibilityRequirement {
             protocol_version: 6,
@@ -6376,7 +6312,7 @@ mod tests {
     #[test]
     fn protocol_six_and_conformance_thirty_two_define_the_cold_cut_boundary() {
         assert_eq!(PROTOCOL_VERSION, 7);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 41);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 42);
 
         let requirement = DaemonCompatibilityRequirement::current();
         let protocol_error = ensure_compatible(
@@ -6441,14 +6377,12 @@ mod tests {
         // conformance revision: bumping the protocol would break every existing
         // first-party client that never issues this request.
         assert_eq!(PROTOCOL_VERSION, 7);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 41);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 42);
         assert_eq!(DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION, 36);
         assert_eq!(
             current_feature_list(),
             vec![
                 FEATURE_SESSIONS,
-                FEATURE_TERMINAL_STREAMING,
-                FEATURE_RESIZE,
                 FEATURE_PLUGIN_SURFACE_RENDER,
                 FEATURE_PLUGIN_SURFACE_ACTION,
                 FEATURE_PACKAGE_ROUTES,
@@ -6461,19 +6395,16 @@ mod tests {
                 FEATURE_PLUGIN_ENTITY_SUBSCRIPTIONS,
                 FEATURE_MODE_GATED_INPUT,
                 FEATURE_HUB_SOURCE_UPDATE,
-                FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY,
                 FEATURE_UNIX_TERMINAL_ADAPTER,
                 FEATURE_TERMINAL_SUBSCRIPTION_CLOSED,
                 FEATURE_WEBRTC_TERMINAL_ADAPTER,
             ],
-            "the daemon advertises all current capabilities",
+            "the daemon advertises host-plane capabilities only",
         );
         assert_eq!(
             default_required_feature_list(),
             vec![
                 FEATURE_SESSIONS,
-                FEATURE_TERMINAL_STREAMING,
-                FEATURE_RESIZE,
                 FEATURE_PLUGIN_SURFACE_RENDER,
                 FEATURE_PLUGIN_SURFACE_ACTION,
                 FEATURE_PACKAGE_ROUTES,

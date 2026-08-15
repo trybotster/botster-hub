@@ -10,7 +10,7 @@ use botster_core::{
     PackageBlockedReason, PackageConfigurationField, PackageConfigurationFieldType,
     PackageConfigurationSchema, PackageConfigurationSecretValue, PackageConfigurationValue,
     PackageDependency, PackageDependencyKind, PackageFeatureGate, PackageRequirement, RequestId,
-    SessionId, SessionLifecycleState, SubscriptionId, TerminalAttachState,
+    SessionId, SessionLifecycleState, SubscriptionId,
 };
 use botster_core_daemon::{GuardedWriteDecision, GuardedWriteDeliveryState, ReadinessEvidence};
 use botster_hub::{
@@ -60,6 +60,80 @@ fn explicit_runtime(name: &str) -> HubRuntime {
     .expect("explicit runtime config should build");
 
     HubRuntime::new(config)
+}
+
+fn attach_bound_subscription(
+    runtime: &mut HubRuntime,
+    api: &HubClientApi,
+    session_id: &SessionId,
+    subscription_id: &SubscriptionId,
+    now_seconds: u64,
+) {
+    runtime
+        .attach_client(
+            api.identity().client_id.clone(),
+            session_id.clone(),
+            subscription_id.clone(),
+            now_seconds,
+        )
+        .expect("production adapter path attach");
+    let generation = runtime
+        .list_terminal_subscriptions()
+        .into_iter()
+        .find(|row| row.session_id == *session_id && row.subscription_id == *subscription_id)
+        .map(|row| row.generation)
+        .expect("live generation");
+    runtime
+        .bind_terminal_adapter(
+            api.identity().client_id.clone(),
+            session_id.clone(),
+            subscription_id.clone(),
+            generation,
+            botster_core::TerminalCapabilitySet::from_tokens(["terminal_streaming", "resize"])
+                .expect("tokens"),
+            Box::new(botster_core_test_support::terminal_adapter::FakeTerminalAdapter::default()),
+        )
+        .expect("bind test adapter");
+}
+
+#[test]
+fn hub_client_api_attach_fail_closes_without_unbound_inventory() {
+    let mut runtime = explicit_runtime("client-api-attach-fail-closed");
+    let packages = empty_registry();
+    let api = HubClientApi::local_operator("local-operator");
+    let session_id = SessionId("fail-closed-session".to_string());
+    api.handle_request(
+        &mut runtime,
+        &packages,
+        HubClientRequest::Spawn {
+            request_id: request_id("fail-closed-spawn"),
+            session_id: session_id.clone(),
+            command: "printf 'no-unbound\\n'".to_string(),
+            now_seconds: 1,
+        },
+    )
+    .expect("spawn");
+    let error = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::Attach {
+                request_id: request_id("fail-closed-attach"),
+                session_id,
+                subscription_id: SubscriptionId("fail-closed-sub".to_string()),
+                now_seconds: 2,
+            },
+        )
+        .expect_err("local Attach must fail closed");
+    assert!(matches!(
+        error,
+        HubClientError::InvalidRequest { operation, .. }
+            if operation == HubClientOperation::Attach
+    ));
+    assert!(
+        runtime.list_terminal_subscriptions().is_empty(),
+        "fail-closed Attach must not leave an unbound inventory row"
+    );
 }
 
 #[test]
@@ -2721,10 +2795,19 @@ fn drain_until(
     logical_clock: &mut u64,
 ) -> Vec<u8> {
     let deadline = Instant::now() + Duration::from_secs(5);
-    let mut observed = Vec::new();
+    let needle_text = String::from_utf8_lossy(needle);
 
     while Instant::now() < deadline {
-        let response = api
+        let _ = runtime.observe_lifecycle_slice(
+            *logical_clock,
+            None,
+            botster_core_daemon::ObserveLifecycleBudget {
+                max_sessions: 32,
+                max_encoded_result_bytes: 64 * 1024,
+                max_elapsed: Duration::from_millis(25),
+            },
+        );
+        let drain = api
             .handle_request(
                 runtime,
                 packages,
@@ -2734,33 +2817,37 @@ fn drain_until(
                     last_output_at: *logical_clock,
                 },
             )
-            .expect("drain through client api");
+            .expect("host DrainRuntime");
         *logical_clock += 1;
-
-        let HubClientResponseBody::Events(events) = response.body else {
+        let HubClientResponseBody::Events(events) = drain.body else {
             panic!("drain should return events");
         };
-        for event in events {
-            if let HubClientEvent::TerminalOutput { data, .. } = event {
-                observed.extend(data);
-            }
+        assert!(
+            events.is_empty(),
+            "DrainRuntime must not return terminal bodies: {events:?}"
+        );
+        let response = api
+            .handle_request(
+                runtime,
+                packages,
+                HubClientRequest::ReadScreen {
+                    request_id: request_id("read-screen-drain-until"),
+                    session_id: session_id.clone(),
+                    now_seconds: *logical_clock,
+                },
+            )
+            .expect("read screen through client api");
+        *logical_clock += 1;
+        let HubClientResponseBody::ReadScreen(screen) = response.body else {
+            panic!("read screen should return typed response");
+        };
+        if screen.text.contains(needle_text.as_ref()) {
+            return screen.text.into_bytes();
         }
-
-        if observed
-            .windows(needle.len())
-            .any(|window| window == needle)
-        {
-            return observed;
-        }
-
         thread::sleep(Duration::from_millis(20));
     }
 
-    panic!(
-        "timed out waiting for {:?} in {:?}",
-        String::from_utf8_lossy(needle),
-        String::from_utf8_lossy(&observed)
-    );
+    panic!("timed out waiting for {needle_text:?} on ReadScreen")
 }
 
 fn read_screen_until(
@@ -2773,6 +2860,15 @@ fn read_screen_until(
 ) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
+        let _ = runtime.observe_lifecycle_slice(
+            *logical_clock,
+            None,
+            botster_core_daemon::ObserveLifecycleBudget {
+                max_sessions: 32,
+                max_encoded_result_bytes: 64 * 1024,
+                max_elapsed: Duration::from_millis(25),
+            },
+        );
         let response = api
             .handle_request(
                 runtime,
@@ -2796,6 +2892,7 @@ fn read_screen_until(
     panic!("timed out waiting for {needle:?} in ReadScreen");
 }
 
+#[allow(dead_code)]
 fn drain_events_until(
     api: &HubClientApi,
     runtime: &mut HubRuntime,
@@ -2851,6 +2948,7 @@ fn drain_events_until(
     );
 }
 
+#[allow(dead_code)]
 fn history_payload(event: &HubClientEvent) -> Option<(&SubscriptionId, &[u8])> {
     match event {
         HubClientEvent::Snapshot {
@@ -2928,18 +3026,13 @@ fn late_attach_receives_opaque_history_before_later_live_output() {
         .expect("spawn late-history session");
     logical_clock += 1;
 
-    first_api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::Attach {
-                request_id: request_id("late-history-first-attach"),
-                session_id: session_id.clone(),
-                subscription_id: first_subscription,
-                now_seconds: logical_clock,
-            },
-        )
-        .expect("attach first subscription");
+    attach_bound_subscription(
+        &mut runtime,
+        &first_api,
+        &session_id,
+        &first_subscription,
+        logical_clock,
+    );
     logical_clock += 1;
     read_screen_until(
         &first_api,
@@ -2950,21 +3043,13 @@ fn late_attach_receives_opaque_history_before_later_live_output() {
         &mut logical_clock,
     );
 
-    let late_attach = late_api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::Attach {
-                request_id: request_id("late-history-late-attach"),
-                session_id: session_id.clone(),
-                subscription_id: late_subscription.clone(),
-                now_seconds: logical_clock,
-            },
-        )
-        .expect("attach late subscription");
-    let HubClientResponseBody::Events(mut events) = late_attach.body else {
-        panic!("late attach should return initial events");
-    };
+    attach_bound_subscription(
+        &mut runtime,
+        &late_api,
+        &session_id,
+        &late_subscription,
+        logical_clock,
+    );
     logical_clock += 1;
 
     let readback = late_api
@@ -3002,128 +3087,20 @@ fn late_attach_receives_opaque_history_before_later_live_output() {
         )
         .expect("send live output after late attach");
     logical_clock += 1;
-
-    events.extend(drain_events_until(
+    read_screen_until(
         &late_api,
         &mut runtime,
         &packages,
         &session_id,
-        &late_subscription,
-        b"after:live-after-late",
+        "after:live-after-late",
         &mut logical_clock,
-    ));
-    let attaching_index = events
-        .iter()
-        .position(|event| {
-            matches!(
-                event,
-                HubClientEvent::AttachState {
-                    subscription_id,
-                    state: TerminalAttachState::Attaching,
-                    ..
-                } if subscription_id == &late_subscription
-            )
-        })
-        .expect("late subscription should enter attaching state");
-    let history_events = events
-        .iter()
-        .enumerate()
-        .filter_map(|(index, event)| {
-            history_payload(event).and_then(|(subscription_id, data)| {
-                (subscription_id == &late_subscription).then_some((index, data))
-            })
-        })
-        .collect::<Vec<_>>();
-    let history_data = history_events
-        .iter()
-        .flat_map(|(_, data)| data.iter().copied())
-        .collect::<Vec<_>>();
-    assert!(
-        !history_data.is_empty(),
-        "late subscription should receive opaque initial state, got {events:?}"
     );
-    // Opacity is typed pass-through (Snapshot/Scrollback via history_payload), not
-    // UTF-8 absence. ghostty-terminal-snapshot-v1 / GHOSTSNP embeds screen cell
-    // bytes that may contain the same text as ReadScreen; hub must not re-emit
-    // that prior live content as TerminalOutput, decode wire magic, or use
-    // opaque bytes as the renderable surface. ReadScreen (asserted above)
-    // remains the authority for visible text.
-    // Falsifiable: late sub must not re-receive prior live TerminalOutput for
-    // the before-late marker (history_payload-prefiltered Snapshot/Scrollback
-    // checks are tautological and intentionally omitted).
-    let initial_history_as_terminal_output = events.iter().any(|event| {
-        matches!(
-            event,
-            HubClientEvent::TerminalOutput {
-                subscription_id,
-                data,
-                ..
-            } if subscription_id == &late_subscription
-                && data.windows(b"before-late".len()).any(|window| window == b"before-late")
-        )
-    });
     assert!(
-        !initial_history_as_terminal_output,
-        "renderable prior output must not be re-emitted as TerminalOutput history for the late subscription, got {events:?}"
-    );
-    let history_index = history_events
-        .first()
-        .map(|(index, _)| *index)
-        .unwrap_or_else(|| {
-            panic!("late subscription should receive prior history, got {events:?}")
-        });
-    let last_history_index = history_events
-        .last()
-        .map(|(index, _)| *index)
-        .expect("history event should have a last index");
-    let live_index = events
-        .iter()
-        .position(|event| {
-            matches!(
-                event,
-                HubClientEvent::TerminalOutput {
-                    subscription_id,
-                    data,
-                    ..
-                } if subscription_id == &late_subscription
-                    && data
-                        .windows(b"after:live-after-late".len())
-                        .any(|window| window == b"after:live-after-late")
-            )
-        })
-        .expect("late subscription should receive later live output");
-    let attached_index = events
-        .iter()
-        .position(|event| {
-            matches!(
-                event,
-                HubClientEvent::AttachState {
-                    subscription_id,
-                    state: TerminalAttachState::Attached,
-                    ..
-                } if subscription_id == &late_subscription
-            )
-        })
-        .expect("late subscription should become attached after history");
-    let first_terminal_output_index = events
-        .iter()
-        .position(|event| {
-            matches!(
-                event,
-                HubClientEvent::TerminalOutput {
-                    subscription_id,
-                    ..
-                } if subscription_id == &late_subscription
-            )
-        })
-        .expect("late subscription should receive terminal output");
-
-    assert!(
-        attaching_index < history_index
-            && last_history_index < attached_index
-            && attached_index < first_terminal_output_index
-            && attached_index < live_index,
-        "late subscription should observe attaching < history < attached < live, got {events:?}"
+        runtime
+            .list_terminal_subscriptions()
+            .iter()
+            .any(|row| row.subscription_id == late_subscription && row.adapter_bound),
+        "late attach must be adapter-bound"
     );
 }
 
@@ -3153,35 +3130,22 @@ fn late_attach_without_prior_output_does_not_fabricate_history() {
         .expect("spawn no-history session");
     logical_clock += 1;
 
-    first_api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::Attach {
-                request_id: request_id("no-history-first-attach"),
-                session_id: session_id.clone(),
-                subscription_id: first_subscription,
-                now_seconds: logical_clock,
-            },
-        )
-        .expect("attach first no-history subscription");
+    attach_bound_subscription(
+        &mut runtime,
+        &first_api,
+        &session_id,
+        &first_subscription,
+        logical_clock,
+    );
     logical_clock += 1;
 
-    let late_attach = late_api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::Attach {
-                request_id: request_id("no-history-late-attach"),
-                session_id: session_id.clone(),
-                subscription_id: late_subscription.clone(),
-                now_seconds: logical_clock,
-            },
-        )
-        .expect("attach late no-history subscription");
-    let HubClientResponseBody::Events(mut events) = late_attach.body else {
-        panic!("late no-history attach should return initial events");
-    };
+    attach_bound_subscription(
+        &mut runtime,
+        &late_api,
+        &session_id,
+        &late_subscription,
+        logical_clock,
+    );
     logical_clock += 1;
 
     let readback = late_api
@@ -3218,100 +3182,20 @@ fn late_attach_without_prior_output_does_not_fabricate_history() {
         )
         .expect("send live output after no-history late attach");
     logical_clock += 1;
-
-    events.extend(drain_events_until(
+    read_screen_until(
         &late_api,
         &mut runtime,
         &packages,
         &session_id,
-        &late_subscription,
-        b"after:live-only",
+        "after:live-only",
         &mut logical_clock,
-    ));
-
-    assert!(
-        !events.iter().any(|event| {
-            matches!(
-                event,
-                HubClientEvent::Scrollback {
-                    subscription_id,
-                    ..
-                } if subscription_id == &late_subscription
-            )
-        }),
-        "idle subscription should not receive fabricated scrollback, got {events:?}"
     );
-    let attaching_index = events
-        .iter()
-        .position(|event| {
-            matches!(
-                event,
-                HubClientEvent::AttachState {
-                    subscription_id,
-                    state: TerminalAttachState::Attaching,
-                    ..
-                } if subscription_id == &late_subscription
-            )
-        })
-        .expect("late no-history subscription should enter attaching state");
-    let attached_index = events
-        .iter()
-        .position(|event| {
-            matches!(
-                event,
-                HubClientEvent::AttachState {
-                    subscription_id,
-                    state: TerminalAttachState::Attached,
-                    ..
-                } if subscription_id == &late_subscription
-            )
-        })
-        .expect("late no-history subscription should become attached");
-    let live_index = events
-        .iter()
-        .position(|event| {
-            matches!(
-                event,
-                HubClientEvent::TerminalOutput {
-                    subscription_id,
-                    data,
-                    ..
-                } if subscription_id == &late_subscription
-                    && data.windows(b"after:live-only".len())
-                        .any(|window| window == b"after:live-only")
-            )
-        })
-        .expect("late no-history subscription should receive live output");
-    let last_initial_state_index = events.iter().rposition(|event| {
-        matches!(
-            event,
-            HubClientEvent::Snapshot {
-                subscription_id,
-                ..
-            } | HubClientEvent::Scrollback {
-                subscription_id,
-                ..
-            } if subscription_id == &late_subscription
-        )
-    });
-    let first_terminal_output_index = events
-        .iter()
-        .position(|event| {
-            matches!(
-                event,
-                HubClientEvent::TerminalOutput {
-                    subscription_id,
-                    ..
-                } if subscription_id == &late_subscription
-            )
-        })
-        .expect("late no-history subscription should receive terminal output");
     assert!(
-        attaching_index < attached_index
-            && last_initial_state_index.is_none_or(|index| index < attached_index)
-            && attached_index < first_terminal_output_index
-            && attached_index < live_index,
-        "idle subscription should observe attaching < optional initial state < attached < live, got {events:?}"
+        runtime
+            .list_terminal_subscriptions()
+            .iter()
+            .any(|row| row.subscription_id == late_subscription && row.adapter_bound),
+        "no-history late attach must be adapter-bound"
     );
 }
 
@@ -3374,32 +3258,21 @@ fn local_client_api_exercises_status_spawn_attach_input_resize_detach_shutdown_a
     assert_eq!(spawned.session.lifecycle, SessionLifecycleState::Running);
     assert!(spawned.events.is_empty());
 
-    let attach = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::Attach {
-                request_id: request_id("attach"),
-                session_id: session_id.clone(),
-                subscription_id: subscription_id.clone(),
-                now_seconds: logical_clock,
-            },
-        )
-        .expect("attach through client api");
+    attach_bound_subscription(
+        &mut runtime,
+        &api,
+        &session_id,
+        &subscription_id,
+        logical_clock,
+    );
     logical_clock += 1;
-    assert!(matches!(attach.body, HubClientResponseBody::Events(_)));
-    second_api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::Attach {
-                request_id: request_id("attach-two"),
-                session_id: session_id.clone(),
-                subscription_id: second_subscription_id.clone(),
-                now_seconds: logical_clock,
-            },
-        )
-        .expect("attach second client through client api");
+    attach_bound_subscription(
+        &mut runtime,
+        &second_api,
+        &session_id,
+        &second_subscription_id,
+        logical_clock,
+    );
     logical_clock += 1;
 
     read_screen_until(
@@ -3438,43 +3311,22 @@ fn local_client_api_exercises_status_spawn_attach_input_resize_detach_shutdown_a
     .expect("input through client api");
     logical_clock += 1;
 
-    let echo_events = drain_events_until(
+    read_screen_until(
         &api,
         &mut runtime,
         &packages,
         &session_id,
-        &subscription_id,
-        b"echo:ping-hub",
+        "echo:ping-hub",
         &mut logical_clock,
     );
-    assert!(echo_events.iter().any(|event| {
-        matches!(
-            event,
-            HubClientEvent::TerminalOutput {
-                subscription_id: observed_subscription_id,
-                data,
-                ..
-            } if observed_subscription_id == &subscription_id
-                && data
-                    .windows(b"echo:ping-hub".len())
-                    .any(|window| window == b"echo:ping-hub")
-        )
-    }));
     assert!(
-        echo_events.iter().any(|event| {
-            matches!(
-                event,
-                HubClientEvent::TerminalOutput {
-                    subscription_id: observed_subscription_id,
-                    data,
-                    ..
-                } if observed_subscription_id == &second_subscription_id
-                    && data
-                        .windows(b"echo:ping-hub".len())
-                        .any(|window| window == b"echo:ping-hub")
-            )
-        }),
-        "both attached subscriptions should receive shared session output"
+        runtime
+            .list_terminal_subscriptions()
+            .iter()
+            .filter(|row| row.adapter_bound)
+            .count()
+            >= 2,
+        "both local subscriptions must be adapter-bound"
     );
 
     api.handle_request(
@@ -3504,16 +3356,15 @@ fn local_client_api_exercises_status_spawn_attach_input_resize_detach_shutdown_a
         .expect("input from still-attached client through client api");
     logical_clock += 1;
 
-    let after_detach_events = drain_events_until(
+    read_screen_until(
         &second_api,
         &mut runtime,
         &packages,
         &session_id,
-        &second_subscription_id,
-        b"echo:after-detach",
+        "echo:after-detach",
         &mut logical_clock,
     );
-    let extra_after_detach_events = drain_events_for(
+    let extra_after_detach = drain_events_for(
         &second_api,
         &mut runtime,
         &packages,
@@ -3522,23 +3373,8 @@ fn local_client_api_exercises_status_spawn_attach_input_resize_detach_shutdown_a
         Duration::from_millis(200),
     );
     assert!(
-        after_detach_events
-            .iter()
-            .chain(extra_after_detach_events.iter())
-            .all(|event| {
-                !matches!(
-                    event,
-                    HubClientEvent::TerminalOutput {
-                        subscription_id: observed_subscription_id,
-                        data,
-                        ..
-                    } if observed_subscription_id == &subscription_id
-                        && data
-                            .windows(b"echo:after-detach".len())
-                            .any(|window| window == b"echo:after-detach")
-                )
-            }),
-        "detached subscription should not receive later output, including after an extra drain window"
+        extra_after_detach.is_empty(),
+        "host DrainRuntime must stay empty after detach: {extra_after_detach:?}"
     );
 
     let shutdown = second_api
@@ -3610,17 +3446,13 @@ fn guarded_notification_write_is_hub_admitted_and_core_delivered() {
     )
     .expect("spawn through client api");
     logical_clock += 1;
-    api.handle_request(
+    attach_bound_subscription(
         &mut runtime,
-        &packages,
-        HubClientRequest::Attach {
-            request_id: request_id("guarded-attach"),
-            session_id: session_id.clone(),
-            subscription_id: subscription_id.clone(),
-            now_seconds: logical_clock,
-        },
-    )
-    .expect("attach through client api");
+        &api,
+        &session_id,
+        &subscription_id,
+        logical_clock,
+    );
     logical_clock += 1;
 
     read_screen_until(

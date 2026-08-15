@@ -8,11 +8,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use botster_core::{AesGcmEnvelope, AesGcmKey, decrypt_aes_gcm, encrypt_aes_gcm};
-use botster_hub::{DaemonEvent, DaemonRequest, DaemonResponse, daemon_transport_request};
+use botster_hub::{DaemonRequest, DaemonResponse, daemon_transport_request};
 use botster_hub_client::{
-    DaemonLocalWebrtcBootstrap, DaemonLocalWebrtcDeliveryChunk, DaemonLocalWebrtcDeliveryKind,
+    DaemonCompatibilityRequirement, DaemonHello, DaemonLocalWebrtcBootstrap,
+    DaemonLocalWebrtcDeliveryChunk, DaemonLocalWebrtcDeliveryKind,
     LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION, LOCAL_WEBRTC_MAX_DELIVERY_BYTES,
-    LOCAL_WEBRTC_MAX_FRAME_BYTES,
+    LOCAL_WEBRTC_MAX_FRAME_BYTES, PROTOCOL,
 };
 use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit};
 use webrtc::peer_connection::{
@@ -53,6 +54,16 @@ pub(crate) fn smoke_local_webrtc_round_trip(
             .clone();
         offer_peer.accept_answer(answer).await?;
         offer_peer
+            .encrypted_hello(
+                &stream_key,
+                &DaemonHello {
+                    protocol: PROTOCOL.to_string(),
+                    compatibility: DaemonCompatibilityRequirement::for_webrtc_terminal_adapter(),
+                    terminal_compatibility: None,
+                },
+            )
+            .await?;
+        offer_peer
             .encrypted_request(&stream_key, &DaemonRequest::Status)
             .await?;
 
@@ -88,20 +99,16 @@ pub(crate) fn smoke_local_webrtc_round_trip(
         let mut observed = Vec::new();
         let marker = b"webrtc:from-smoke-webrtc";
         for _ in 0..120 {
-            let drain = offer_peer
+            let screen = offer_peer
                 .encrypted_request(
                     &stream_key,
-                    &DaemonRequest::Drain {
+                    &DaemonRequest::ReadScreen {
                         session_id: session_id.clone(),
-                        subscription_id: None,
                     },
                 )
                 .await?;
-            for event in drain.events {
-                if let DaemonEvent::TerminalOutput { payload, .. } = event {
-                    let bytes = payload.decoded_bytes().map_err(SmokeError::Webrtc)?;
-                    observed.extend_from_slice(&bytes);
-                }
+            if let Some(screen) = screen.read_screen {
+                observed = screen.text.into_bytes();
             }
             if observed
                 .windows(marker.len())
@@ -297,6 +304,45 @@ impl LocalWebrtcOfferPeer {
         Ok(())
     }
 
+    async fn encrypted_hello(
+        &mut self,
+        key: &AesGcmKey,
+        hello: &DaemonHello,
+    ) -> Result<botster_hub_client::DaemonHelloAck, SmokeError> {
+        let plaintext =
+            serde_json::to_vec(hello).map_err(|error| SmokeError::Webrtc(error.to_string()))?;
+        let envelope = encrypt_aes_gcm(key, &plaintext, 1)
+            .map_err(|error| SmokeError::Webrtc(error.to_string()))?;
+        self.data_channel
+            .send_text(
+                &serde_json::to_string(&envelope)
+                    .map_err(|error| SmokeError::Webrtc(error.to_string()))?,
+            )
+            .await
+            .map_err(|error| SmokeError::Webrtc(error.to_string()))?;
+        let mut encrypted = String::new();
+        loop {
+            let response = timeout(Duration::from_secs(10), self.data_channel_message_rx.recv())
+                .await
+                .map_err(|_| SmokeError::Webrtc("hello ack timeout".to_string()))?
+                .ok_or_else(|| SmokeError::Webrtc("channel closed during hello".to_string()))?;
+            let chunk = serde_json::from_str::<DaemonLocalWebrtcDeliveryChunk>(&response)
+                .map_err(|error| SmokeError::Webrtc(error.to_string()))?;
+            if chunk.delivery_kind != DaemonLocalWebrtcDeliveryKind::DaemonResponse {
+                continue;
+            }
+            encrypted.push_str(&chunk.payload);
+            if chunk.chunk_index + 1 == chunk.chunk_count {
+                break;
+            }
+        }
+        let envelope = serde_json::from_str::<AesGcmEnvelope>(&encrypted)
+            .map_err(|error| SmokeError::Webrtc(error.to_string()))?;
+        let plaintext = decrypt_aes_gcm(key, &envelope)
+            .map_err(|error| SmokeError::Webrtc(error.to_string()))?;
+        serde_json::from_slice(&plaintext).map_err(|error| SmokeError::Webrtc(error.to_string()))
+    }
+
     async fn encrypted_request(
         &mut self,
         key: &AesGcmKey,
@@ -346,8 +392,10 @@ impl LocalWebrtcOfferPeer {
             }
             let chunk = serde_json::from_str::<DaemonLocalWebrtcDeliveryChunk>(&response)
                 .map_err(|error| SmokeError::Webrtc(error.to_string()))?;
+            if chunk.delivery_kind != DaemonLocalWebrtcDeliveryKind::DaemonResponse {
+                continue;
+            }
             if chunk.version != LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION
-                || chunk.delivery_kind != DaemonLocalWebrtcDeliveryKind::DaemonResponse
                 || chunk.chunk_index != next_chunk_index
                 || chunk.total_bytes as usize > LOCAL_WEBRTC_MAX_DELIVERY_BYTES
                 || message_id
@@ -387,6 +435,7 @@ fn smoke_local_webrtc_request_operation(request: &DaemonRequest) -> &'static str
         DaemonRequest::Attach { .. } => "attach",
         DaemonRequest::SendInput { .. } => "send_input",
         DaemonRequest::Drain { .. } => "drain",
+        DaemonRequest::ReadScreen { .. } => "read_screen",
         DaemonRequest::ShutdownSession { .. } => "shutdown_session",
         _ => "other",
     }

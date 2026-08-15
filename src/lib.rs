@@ -860,4 +860,54 @@ mod tests {
         assert_eq!(client_api.class(), HubCrateExportClass::HubPolicy);
         assert!(client_api.reason().contains("not the daemon wire crate"));
     }
+
+    #[test]
+    fn production_sources_reject_terminal_drain_and_snapshot_phase_decode() {
+        let files = [
+            ("src/runtime.rs", include_str!("runtime.rs")),
+            ("src/client_api.rs", include_str!("client_api.rs")),
+            (
+                "src/daemon_transport.rs",
+                include_str!("daemon_transport.rs"),
+            ),
+            (
+                "src/daemon_entity_subscriptions.rs",
+                include_str!("daemon_entity_subscriptions.rs"),
+            ),
+            (
+                "src/daemon_attach_stream.rs",
+                include_str!("daemon_attach_stream.rs"),
+            ),
+            ("src/main.rs", include_str!("main.rs")),
+        ];
+        for (path, source) in files {
+            let production = source
+                .split("#[cfg(test)]")
+                .next()
+                .unwrap_or(source)
+                .split("mod tests")
+                .next()
+                .unwrap_or(source);
+            for forbidden in [r#""READY""#, r#""PAGE""#, r#""FINISH""#] {
+                assert!(
+                    !production.contains(forbidden),
+                    "{path} production source must not contain {forbidden}"
+                );
+            }
+            if path != "src/runtime.rs" {
+                assert!(
+                    !production.contains("GHOSTSNP"),
+                    "{path} production source must not decode GHOSTSNP"
+                );
+            }
+            if path != "src/runtime.rs" {
+                for forbidden in ["drain_subscription(", "drain_runtime_once("] {
+                    assert!(
+                        !production.contains(forbidden),
+                        "{path} production source must not call {forbidden}"
+                    );
+                }
+            }
+        }
+    }
 }
