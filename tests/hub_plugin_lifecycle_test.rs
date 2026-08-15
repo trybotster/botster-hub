@@ -353,9 +353,12 @@ fn hub_runtime_passes_split_plugin_worker_config_to_core_engine() {
         core_engine: CoreEngineOptions {
             plugin_worker_queue_capacity: 7,
             plugin_worker_executor_concurrency: 3,
-            reserved_request_response_executors: 1,
-            background_queue_capacity: 4,
-            completion_queue_capacity: 5,
+            plugin_worker_class: botster_hub::PluginWorkerClassOptions {
+                reserved_request_response_executors: 1,
+                background_queue_capacity: 4,
+                completion_queue_capacity: 5,
+                ..botster_hub::PluginWorkerClassOptions::default()
+            },
             ..CoreEngineOptions::default()
         },
         ..HubStartupOptions::default()

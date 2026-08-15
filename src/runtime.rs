@@ -1878,9 +1878,20 @@ impl HubRuntime {
         &self,
         after_plugin_key: Option<&str>,
         max_items: usize,
-    ) -> (Vec<crate::lifecycle::HubPluginEventHandler>, bool) {
+    ) -> (
+        Vec<crate::lifecycle::HubPluginEventHandler>,
+        Option<String>,
+        usize,
+        bool,
+    ) {
         self.plugin_lifecycle
             .event_handlers_for_page("session_family", after_plugin_key, max_items)
+    }
+
+    #[cfg(test)]
+    pub fn insert_test_event_handler(&self, plugin_key: &str, event_name: &str) {
+        self.plugin_lifecycle
+            .insert_test_event_handler(plugin_key, event_name);
     }
 
     /// Forget one terminal session through CoreDaemon's lifecycle authority.

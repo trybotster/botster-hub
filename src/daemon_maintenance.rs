@@ -51,8 +51,9 @@ const COMPLETION_DRAIN_MAX_ITEMS: usize = 8;
 const COMPLETION_DRAIN_MAX_BYTES: usize = 32 * 1024;
 const FAMILY_QUEUE_MAX_ITEMS: usize = 32;
 const FAMILY_QUEUE_MAX_BYTES: usize = 64 * 1024;
+const FANOUT_QUEUE_MAX_ITEMS: usize = 32;
+const FANOUT_QUEUE_MAX_BYTES: usize = 64 * 1024;
 const CONSUMER_REFRESH_MAX: usize = 8;
-const CONSUMER_REFRESH_MAX_ELAPSED: Duration = Duration::from_millis(8);
 
 fn queued_queue_bytes(frames: &VecDeque<serde_json::Value>) -> usize {
     frames
@@ -193,6 +194,38 @@ struct SessionFamilyConsumer {
 struct FanoutJob {
     frame: serde_json::Value,
     after: Option<String>,
+    bytes: usize,
+}
+
+struct HostBridgeBudget {
+    started: Instant,
+    visits: usize,
+}
+
+impl HostBridgeBudget {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            visits: 0,
+        }
+    }
+
+    fn remaining_visits(&self) -> usize {
+        CONSUMER_REFRESH_MAX.saturating_sub(self.visits)
+    }
+
+    fn take(&mut self) -> bool {
+        if self.exhausted() {
+            return false;
+        }
+        self.visits = self.visits.saturating_add(1);
+        true
+    }
+
+    fn exhausted(&self) -> bool {
+        self.visits >= CONSUMER_REFRESH_MAX
+            || self.started.elapsed() >= Duration::from_millis(MAX_OWNER_TURN_MS)
+    }
 }
 
 /// Hub-owned `/session` delivery with one in-flight frame per plugin.
@@ -204,11 +237,14 @@ pub struct SessionFamilyBridge {
     refresh_seen: BTreeSet<String>,
     in_flight_by_request: BTreeMap<String, String>,
     pending_fanout: VecDeque<FanoutJob>,
+    fanout_bytes: usize,
     gap_after: Option<String>,
     need_gap_pass: bool,
     snapshot_start_after: Option<String>,
     snapshot_start_sequence: Option<u64>,
     admit_after: Option<String>,
+    prune_after: Option<String>,
+    need_prune: bool,
     busy_count: u32,
 }
 
@@ -225,6 +261,8 @@ impl SessionFamilyBridge {
             || !self.pending_fanout.is_empty()
             || self.need_gap_pass
             || self.snapshot_start_sequence.is_some()
+            || self.need_prune
+            || self.refresh_after.is_some()
     }
 
     fn adjust_busy(&mut self, was_busy: bool, now_busy: bool) {
@@ -620,13 +658,31 @@ fn run_baseline_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
 }
 
 fn run_host_bridge_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
-    refresh_session_family_consumers(runtime, state);
-    continue_gap_pass(state);
-    continue_snapshot_starts(state);
-    continue_family_fanout(state);
+    let mut budget = HostBridgeBudget::new();
+    refresh_session_family_consumers(runtime, state, &mut budget);
+    if !budget.exhausted() {
+        continue_gap_pass(state, &mut budget);
+    }
+    if !budget.exhausted() {
+        continue_snapshot_starts(state, &mut budget);
+    }
+    if !budget.exhausted() {
+        continue_family_fanout(state, &mut budget);
+    }
+    if !budget.exhausted() {
+        continue_consumer_prune(state, &mut budget);
+    }
+    if budget.exhausted() {
+        state.scheduler.try_wake();
+        return;
+    }
     let Some((plugin_key, handler, payload)) = next_session_family_admission(state) else {
         return;
     };
+    if !budget.take() {
+        state.scheduler.try_wake();
+        return;
+    }
     let sequence = payload
         .get("snapshot_sequence")
         .and_then(serde_json::Value::as_u64)
@@ -719,33 +775,37 @@ pub fn start_baseline_recovery(state: &mut MaintenanceState) {
     state.session_family.need_gap_pass = true;
     state.session_family.gap_after = None;
     state.session_family.pending_fanout.clear();
+    state.session_family.fanout_bytes = 0;
     state.session_family.snapshot_start_sequence = None;
     state.session_family.snapshot_start_after = None;
     state.baseline = None;
     state.scheduler.try_wake();
 }
 
-fn continue_gap_pass(state: &mut MaintenanceState) {
+fn continue_gap_pass(state: &mut MaintenanceState, budget: &mut HostBridgeBudget) {
     if !state.session_family.need_gap_pass {
         return;
     }
-    let started = Instant::now();
+    let max = budget.remaining_visits();
+    if max == 0 {
+        return;
+    }
     let keys = consumer_keys_page(
         &state.session_family.consumers,
         state.session_family.gap_after.as_deref(),
-        CONSUMER_REFRESH_MAX,
+        max,
     );
     let mut last_key = state.session_family.gap_after.clone();
     let mut visited = 0;
     for plugin_key in &keys {
-        if started.elapsed() >= CONSUMER_REFRESH_MAX_ELAPSED {
+        if !budget.take() {
             break;
         }
         state.session_family.mark_gap(plugin_key);
         last_key = Some(plugin_key.clone());
         visited += 1;
     }
-    if visited < keys.len() || keys.len() == CONSUMER_REFRESH_MAX {
+    if visited < keys.len() || keys.len() == max {
         state.session_family.gap_after = last_key;
         state.scheduler.try_wake();
         return;
@@ -759,27 +819,30 @@ fn continue_gap_pass(state: &mut MaintenanceState) {
     state.scheduler.try_wake();
 }
 
-fn continue_snapshot_starts(state: &mut MaintenanceState) {
+fn continue_snapshot_starts(state: &mut MaintenanceState, budget: &mut HostBridgeBudget) {
     let Some(sequence) = state.session_family.snapshot_start_sequence else {
         return;
     };
-    let started = Instant::now();
+    let max = budget.remaining_visits();
+    if max == 0 {
+        return;
+    }
     let keys = consumer_keys_page(
         &state.session_family.consumers,
         state.session_family.snapshot_start_after.as_deref(),
-        CONSUMER_REFRESH_MAX,
+        max,
     );
     let mut last_key = state.session_family.snapshot_start_after.clone();
     let mut visited = 0;
     for plugin_key in &keys {
-        if started.elapsed() >= CONSUMER_REFRESH_MAX_ELAPSED {
+        if !budget.take() {
             break;
         }
         state.session_family.begin_snapshot(plugin_key, sequence);
         last_key = Some(plugin_key.clone());
         visited += 1;
     }
-    if visited < keys.len() || keys.len() == CONSUMER_REFRESH_MAX {
+    if visited < keys.len() || keys.len() == max {
         state.session_family.snapshot_start_after = last_key;
         state.scheduler.try_wake();
         return;
@@ -788,12 +851,15 @@ fn continue_snapshot_starts(state: &mut MaintenanceState) {
     state.session_family.snapshot_start_after = None;
 }
 
-fn continue_family_fanout(state: &mut MaintenanceState) {
+fn continue_family_fanout(state: &mut MaintenanceState, budget: &mut HostBridgeBudget) {
     let Some(mut job) = state.session_family.pending_fanout.pop_front() else {
         return;
     };
-    fanout_family_frame(state, &mut job);
-    if job.after.is_some() {
+    state.session_family.fanout_bytes = state.session_family.fanout_bytes.saturating_sub(job.bytes);
+    let more = fanout_family_frame(state, &mut job, budget);
+    if more {
+        state.session_family.fanout_bytes =
+            state.session_family.fanout_bytes.saturating_add(job.bytes);
         state.session_family.pending_fanout.push_front(job);
         state.scheduler.try_wake();
     }
@@ -812,18 +878,24 @@ fn handle_resync_reason(state: &mut MaintenanceState, reason: SessionLifecycleRe
     }
 }
 
-fn refresh_session_family_consumers(runtime: &HubRuntime, state: &mut MaintenanceState) {
-    let started = Instant::now();
+fn refresh_session_family_consumers(
+    runtime: &HubRuntime,
+    state: &mut MaintenanceState,
+    budget: &mut HostBridgeBudget,
+) {
+    let max = budget.remaining_visits();
+    if max == 0 {
+        return;
+    }
     let after = state.session_family.refresh_after.clone();
-    let (handlers, more) =
-        runtime.session_family_event_handlers_page(after.as_deref(), CONSUMER_REFRESH_MAX);
-    let mut last_key = after;
-    for handler in handlers {
-        if started.elapsed() >= CONSUMER_REFRESH_MAX_ELAPSED {
-            state.session_family.refresh_after = last_key;
-            state.scheduler.try_wake();
-            return;
+    let (handlers, last_visited, visited, more) =
+        runtime.session_family_event_handlers_page(after.as_deref(), max);
+    for _ in 0..visited {
+        if !budget.take() {
+            break;
         }
+    }
+    for handler in handlers {
         if handler.handler.kind != PluginHandlerKind::Event {
             continue;
         }
@@ -844,36 +916,65 @@ fn refresh_session_family_consumers(runtime: &HubRuntime, state: &mut Maintenanc
                 state.session_family.begin_snapshot(&plugin_key, sequence);
             }
         }
-        last_key = Some(plugin_key);
     }
     if more {
-        state.session_family.refresh_after = last_key;
+        state.session_family.refresh_after = last_visited;
         state.scheduler.try_wake();
         return;
     }
-    let seen = std::mem::take(&mut state.session_family.refresh_seen);
-    let mut dropped_busy = 0u32;
-    let mut dropped_requests = Vec::new();
-    state.session_family.consumers.retain(|key, consumer| {
-        if seen.contains(key) {
-            return true;
-        }
-        if consumer_busy(consumer) {
-            dropped_busy = dropped_busy.saturating_add(1);
-        }
-        if let Some(flight) = &consumer.in_flight {
-            dropped_requests.push(flight.request_id.0.clone());
-        }
-        false
-    });
-    for request_id in dropped_requests {
-        state
-            .session_family
-            .in_flight_by_request
-            .remove(&request_id);
-    }
-    state.session_family.busy_count = state.session_family.busy_count.saturating_sub(dropped_busy);
     state.session_family.refresh_after = None;
+    state.session_family.need_prune = true;
+    state.session_family.prune_after = None;
+}
+
+fn continue_consumer_prune(state: &mut MaintenanceState, budget: &mut HostBridgeBudget) {
+    if !state.session_family.need_prune {
+        return;
+    }
+    let max = budget.remaining_visits();
+    if max == 0 {
+        return;
+    }
+    let keys = consumer_keys_page(
+        &state.session_family.consumers,
+        state.session_family.prune_after.as_deref(),
+        max,
+    );
+    let mut last_key = state.session_family.prune_after.clone();
+    let mut visited = 0;
+    let mut drop_keys = Vec::new();
+    for plugin_key in &keys {
+        if !budget.take() {
+            break;
+        }
+        last_key = Some(plugin_key.clone());
+        visited += 1;
+        if !state.session_family.refresh_seen.contains(plugin_key) {
+            drop_keys.push(plugin_key.clone());
+        }
+    }
+    for plugin_key in drop_keys {
+        let Some(consumer) = state.session_family.consumers.remove(&plugin_key) else {
+            continue;
+        };
+        if consumer_busy(&consumer) {
+            state.session_family.busy_count = state.session_family.busy_count.saturating_sub(1);
+        }
+        if let Some(flight) = consumer.in_flight {
+            state
+                .session_family
+                .in_flight_by_request
+                .remove(&flight.request_id.0);
+        }
+    }
+    if visited < keys.len() || keys.len() == max {
+        state.session_family.prune_after = last_key;
+        state.scheduler.try_wake();
+        return;
+    }
+    state.session_family.need_prune = false;
+    state.session_family.prune_after = None;
+    state.session_family.refresh_seen.clear();
 }
 
 fn next_session_family_admission(
@@ -1028,24 +1129,38 @@ fn queue_family_delta(state: &mut MaintenanceState, change: &SessionLifecycleCha
         }
         _ => return,
     };
-    state
-        .session_family
-        .pending_fanout
-        .push_back(FanoutJob { frame, after: None });
+    let bytes = serde_json::to_vec(&frame)
+        .map(|body| body.len())
+        .unwrap_or(0);
+    if state.session_family.pending_fanout.len() >= FANOUT_QUEUE_MAX_ITEMS
+        || state.session_family.fanout_bytes.saturating_add(bytes) > FANOUT_QUEUE_MAX_BYTES
+    {
+        start_baseline_recovery(state);
+        return;
+    }
+    state.session_family.fanout_bytes = state.session_family.fanout_bytes.saturating_add(bytes);
+    state.session_family.pending_fanout.push_back(FanoutJob {
+        frame,
+        after: None,
+        bytes,
+    });
     state.scheduler.try_wake();
 }
 
-fn fanout_family_frame(state: &mut MaintenanceState, job: &mut FanoutJob) {
-    let started = Instant::now();
-    let keys = consumer_keys_page(
-        &state.session_family.consumers,
-        job.after.as_deref(),
-        CONSUMER_REFRESH_MAX,
-    );
+fn fanout_family_frame(
+    state: &mut MaintenanceState,
+    job: &mut FanoutJob,
+    budget: &mut HostBridgeBudget,
+) -> bool {
+    let max = budget.remaining_visits();
+    if max == 0 {
+        return true;
+    }
+    let keys = consumer_keys_page(&state.session_family.consumers, job.after.as_deref(), max);
     let mut last_key = job.after.clone();
     let mut visited = 0;
     for plugin_key in &keys {
-        if started.elapsed() >= CONSUMER_REFRESH_MAX_ELAPSED {
+        if !budget.take() {
             break;
         }
         if !state
@@ -1066,10 +1181,12 @@ fn fanout_family_frame(state: &mut MaintenanceState, job: &mut FanoutJob) {
         last_key = Some(plugin_key.clone());
         visited += 1;
     }
-    if visited < keys.len() || keys.len() == CONSUMER_REFRESH_MAX {
+    if visited < keys.len() || keys.len() == max {
         job.after = last_key;
+        true
     } else {
         job.after = None;
+        false
     }
 }
 
@@ -1388,7 +1505,7 @@ mod tests {
                 },
             };
             queue_family_delta(&mut state, &change);
-            continue_family_fanout(&mut state);
+            continue_family_fanout(&mut state, &mut HostBridgeBudget::new());
             let consumer = state
                 .session_family
                 .consumers
@@ -1475,7 +1592,7 @@ mod tests {
                 started.elapsed() < Duration::from_secs(1),
                 "family fanout hang"
             );
-            continue_family_fanout(state);
+            continue_family_fanout(state, &mut HostBridgeBudget::new());
         }
     }
 
@@ -1532,7 +1649,7 @@ mod tests {
         let started = Instant::now();
         while state.session_family.need_gap_pass {
             assert!(started.elapsed() < Duration::from_secs(1), "gap pass hang");
-            continue_gap_pass(&mut state);
+            continue_gap_pass(&mut state, &mut HostBridgeBudget::new());
         }
         for index in 0..20 {
             let consumer = state
@@ -1548,7 +1665,7 @@ mod tests {
                 started.elapsed() < Duration::from_secs(1),
                 "snapshot start hang"
             );
-            continue_snapshot_starts(&mut state);
+            continue_snapshot_starts(&mut state, &mut HostBridgeBudget::new());
         }
         for index in 0..20 {
             let consumer = state
@@ -1585,12 +1702,76 @@ mod tests {
         }
         let started = Instant::now();
         assert!(state.needs_work());
-        continue_family_fanout(&mut state);
+        continue_family_fanout(&mut state, &mut HostBridgeBudget::new());
         start_baseline_recovery(&mut state);
-        continue_gap_pass(&mut state);
+        continue_gap_pass(&mut state, &mut HostBridgeBudget::new());
         assert!(started.elapsed() < Duration::from_millis(MAX_OWNER_TURN_MS));
         assert!(state.session_family.has_work());
         assert!(state.session_family.need_gap_pass);
         assert_eq!(state.session_family.pending_fanout.len(), 0);
+    }
+
+    #[test]
+    fn fanout_queue_pressure_starts_baseline_recovery() {
+        let mut state = MaintenanceState::default();
+        seed_family_consumers(&mut state, 1);
+        let mut saw_pressure = false;
+        for index in 0..(FANOUT_QUEUE_MAX_ITEMS + 8) {
+            assert!(state.session_family.pending_fanout.len() <= FANOUT_QUEUE_MAX_ITEMS);
+            assert!(state.session_family.fanout_bytes <= FANOUT_QUEUE_MAX_BYTES);
+            queue_family_delta(
+                &mut state,
+                &SessionLifecycleChange {
+                    cursor: botster_core_daemon::SessionLifecycleCursor {
+                        source_id: botster_core_daemon::SessionLifecycleSourceId("s".into()),
+                        sequence: 10 + index as u64,
+                    },
+                    kind: botster_core_daemon::SessionLifecycleChangeKind::Removed {
+                        session_id: SessionId(format!("gone-{index}")),
+                    },
+                },
+            );
+            if state.session_family.need_gap_pass {
+                saw_pressure = true;
+                break;
+            }
+        }
+        assert!(saw_pressure);
+        assert!(state.session_family.pending_fanout.is_empty());
+        assert_eq!(state.session_family.fanout_bytes, 0);
+    }
+
+    #[test]
+    fn host_bridge_slice_stays_within_budget_with_many_plugins() {
+        let data_directory = std::env::temp_dir().join(format!(
+            "hub-host-bridge-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let config = crate::HubStartupOptions {
+            host: crate::HostIdentityOptions {
+                id: "host-bridge".to_string(),
+                display_name: "Host Bridge".to_string(),
+                fingerprint: None,
+            },
+            data_directory: crate::DataDirectoryOption::Explicit(data_directory.clone()),
+            ..crate::HubStartupOptions::default()
+        }
+        .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
+        .expect("config");
+        let runtime = HubRuntime::new(config);
+        for index in 0..32 {
+            runtime.insert_test_event_handler(&format!("other.{index:02}"), "other_event");
+            runtime.insert_test_event_handler(&format!("session.{index:02}"), "session_family");
+        }
+        let mut state = MaintenanceState::default();
+        let started = Instant::now();
+        run_host_bridge_slice(&runtime, &mut state);
+        assert!(started.elapsed() < Duration::from_millis(MAX_OWNER_TURN_MS));
+        assert!(state.session_family.refresh_after.is_some() || state.session_family.has_work());
+        let _ = std::fs::remove_dir_all(data_directory);
     }
 }

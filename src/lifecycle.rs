@@ -307,13 +307,16 @@ impl HubPluginLifecycle {
     }
 
     /// Return one bounded page of Event-kind handlers for an exact event name.
+    ///
+    /// `max_items` counts visited plugin keys, including keys that do not
+    /// match `event_name`. The second return value is the last visited key.
     #[must_use]
     pub fn event_handlers_for_page(
         &self,
         event_name: &str,
         after_plugin_key: Option<&str>,
         max_items: usize,
-    ) -> (Vec<HubPluginEventHandler>, bool) {
+    ) -> (Vec<HubPluginEventHandler>, Option<String>, usize, bool) {
         let lock = self
             .event_handlers
             .lock()
@@ -323,25 +326,43 @@ impl HubPluginLifecycle {
             None => std::ops::Bound::Unbounded,
         };
         let mut page = Vec::new();
-        let mut plugins_taken = 0;
+        let mut last_key = after_plugin_key.map(str::to_string);
+        let mut visited = 0;
         let mut more = false;
-        for (_key, handlers) in lock.range::<str, _>((start, std::ops::Bound::Unbounded)) {
-            let matching = handlers
-                .iter()
-                .filter(|handler| handler.event_name == event_name)
-                .cloned()
-                .collect::<Vec<_>>();
-            if matching.is_empty() {
-                continue;
-            }
-            if plugins_taken >= max_items {
+        for (key, handlers) in lock.range::<str, _>((start, std::ops::Bound::Unbounded)) {
+            if visited >= max_items {
                 more = true;
                 break;
             }
-            page.extend(matching);
-            plugins_taken += 1;
+            last_key = Some(key.clone());
+            visited += 1;
+            page.extend(
+                handlers
+                    .iter()
+                    .filter(|handler| handler.event_name == event_name)
+                    .cloned(),
+            );
         }
-        (page, more)
+        (page, last_key, visited, more)
+    }
+
+    #[cfg(test)]
+    pub fn insert_test_event_handler(&self, plugin_key: &str, event_name: &str) {
+        use botster_core::{PluginHandlerKind, PluginHandlerRef, PluginKey};
+
+        self.event_handlers
+            .lock()
+            .expect("hub plugin lifecycle event handlers lock")
+            .entry(plugin_key.to_string())
+            .or_default()
+            .push(HubPluginEventHandler {
+                event_name: event_name.to_string(),
+                handler: PluginHandlerRef {
+                    plugin_key: PluginKey(plugin_key.to_string()),
+                    kind: PluginHandlerKind::Event,
+                    handler_id: event_name.to_string(),
+                },
+            });
     }
 
     /// Return package-level lifecycle status without exposing core worker internals.

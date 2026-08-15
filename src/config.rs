@@ -314,22 +314,11 @@ pub struct TcpBinding {
 /// The hub records queue, session I/O coalescing, and plugin-worker tuning here
 /// so startup policy is explicit. The underlying queues, session I/O worker,
 /// plugin worker engine, and delivery mechanics remain owned by `botster-core`.
+/// Class-specific plugin-worker queue knobs nested under [`CoreEngineOptions`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CoreEngineOptions {
-    /// Queue capacity choices keyed by core queue source name.
-    pub queue_capacities: Vec<CoreQueueCapacity>,
-    /// Explicit worker executable used for restart-durable daemon-backed sessions.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_worker_path: Option<PathBuf>,
-    /// Session I/O coalescing policy passed to core-owned session workers.
-    pub session_io_coalescing: SessionIoCoalescingOptions,
-    /// Per-plugin worker queue capacity passed to core plugin worker primitives.
-    pub plugin_worker_queue_capacity: usize,
-    /// Per-plugin executor concurrency passed to core plugin worker primitives.
-    pub plugin_worker_executor_concurrency: usize,
+pub struct PluginWorkerClassOptions {
     /// RequestResponse executor slots reserved by Core. Must be >= 1 and
-    /// strictly less than [`Self::plugin_worker_executor_concurrency`].
+    /// strictly less than [`CoreEngineOptions::plugin_worker_executor_concurrency`].
     #[serde(default = "default_reserved_request_response_executors")]
     pub reserved_request_response_executors: usize,
     /// Encoded RequestResponse waiting-queue byte capacity.
@@ -349,6 +338,40 @@ pub struct CoreEngineOptions {
     pub completion_queue_byte_capacity: usize,
 }
 
+impl Default for PluginWorkerClassOptions {
+    fn default() -> Self {
+        let plugin_worker = PluginWorkerEngineConfig::default();
+        Self {
+            reserved_request_response_executors: plugin_worker.reserved_request_response_executors,
+            request_response_queue_byte_capacity: plugin_worker
+                .request_response_queue_byte_capacity,
+            background_queue_capacity: plugin_worker.background_queue_capacity,
+            background_queue_byte_capacity: plugin_worker.background_queue_byte_capacity,
+            completion_queue_capacity: plugin_worker.completion_queue_capacity,
+            completion_queue_byte_capacity: plugin_worker.completion_queue_byte_capacity,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoreEngineOptions {
+    /// Queue capacity choices keyed by core queue source name.
+    pub queue_capacities: Vec<CoreQueueCapacity>,
+    /// Explicit worker executable used for restart-durable daemon-backed sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_worker_path: Option<PathBuf>,
+    /// Session I/O coalescing policy passed to core-owned session workers.
+    pub session_io_coalescing: SessionIoCoalescingOptions,
+    /// Per-plugin worker queue capacity passed to core plugin worker primitives.
+    pub plugin_worker_queue_capacity: usize,
+    /// Per-plugin executor concurrency passed to core plugin worker primitives.
+    pub plugin_worker_executor_concurrency: usize,
+    /// Class-specific worker-queue knobs. Defaults keep older JSON valid.
+    #[serde(default)]
+    pub plugin_worker_class: PluginWorkerClassOptions,
+}
+
 impl Default for CoreEngineOptions {
     fn default() -> Self {
         let plugin_worker = PluginWorkerEngineConfig::default();
@@ -366,13 +389,7 @@ impl Default for CoreEngineOptions {
             ),
             plugin_worker_queue_capacity: plugin_worker.per_plugin_queue_capacity,
             plugin_worker_executor_concurrency: plugin_worker.per_plugin_executor_concurrency,
-            reserved_request_response_executors: plugin_worker.reserved_request_response_executors,
-            request_response_queue_byte_capacity: plugin_worker
-                .request_response_queue_byte_capacity,
-            background_queue_capacity: plugin_worker.background_queue_capacity,
-            background_queue_byte_capacity: plugin_worker.background_queue_byte_capacity,
-            completion_queue_capacity: plugin_worker.completion_queue_capacity,
-            completion_queue_byte_capacity: plugin_worker.completion_queue_byte_capacity,
+            plugin_worker_class: PluginWorkerClassOptions::default(),
         }
     }
 }
@@ -401,12 +418,16 @@ impl CoreEngineOptions {
         PluginWorkerEngineConfig {
             per_plugin_queue_capacity: self.plugin_worker_queue_capacity,
             per_plugin_executor_concurrency: self.plugin_worker_executor_concurrency,
-            reserved_request_response_executors: self.reserved_request_response_executors,
-            request_response_queue_byte_capacity: self.request_response_queue_byte_capacity,
-            background_queue_capacity: self.background_queue_capacity,
-            background_queue_byte_capacity: self.background_queue_byte_capacity,
-            completion_queue_capacity: self.completion_queue_capacity,
-            completion_queue_byte_capacity: self.completion_queue_byte_capacity,
+            reserved_request_response_executors: self
+                .plugin_worker_class
+                .reserved_request_response_executors,
+            request_response_queue_byte_capacity: self
+                .plugin_worker_class
+                .request_response_queue_byte_capacity,
+            background_queue_capacity: self.plugin_worker_class.background_queue_capacity,
+            background_queue_byte_capacity: self.plugin_worker_class.background_queue_byte_capacity,
+            completion_queue_capacity: self.plugin_worker_class.completion_queue_capacity,
+            completion_queue_byte_capacity: self.plugin_worker_class.completion_queue_byte_capacity,
         }
     }
 
@@ -419,32 +440,34 @@ impl CoreEngineOptions {
             "core_engine.plugin_worker_executor_concurrency",
             self.plugin_worker_executor_concurrency,
         )?;
-        if self.reserved_request_response_executors < 1
-            || self.reserved_request_response_executors >= self.plugin_worker_executor_concurrency
+        if self.plugin_worker_class.reserved_request_response_executors < 1
+            || self.plugin_worker_class.reserved_request_response_executors
+                >= self.plugin_worker_executor_concurrency
         {
             return Err(HubConfigError::InvalidPluginWorkerReservation {
-                field: "core_engine.reserved_request_response_executors",
+                field: "core_engine.plugin_worker_class.reserved_request_response_executors",
             });
         }
         validate_positive_usize(
-            "core_engine.request_response_queue_byte_capacity",
-            self.request_response_queue_byte_capacity,
+            "core_engine.plugin_worker_class.request_response_queue_byte_capacity",
+            self.plugin_worker_class
+                .request_response_queue_byte_capacity,
         )?;
         validate_positive_usize(
-            "core_engine.background_queue_capacity",
-            self.background_queue_capacity,
+            "core_engine.plugin_worker_class.background_queue_capacity",
+            self.plugin_worker_class.background_queue_capacity,
         )?;
         validate_positive_usize(
-            "core_engine.background_queue_byte_capacity",
-            self.background_queue_byte_capacity,
+            "core_engine.plugin_worker_class.background_queue_byte_capacity",
+            self.plugin_worker_class.background_queue_byte_capacity,
         )?;
         validate_positive_usize(
-            "core_engine.completion_queue_capacity",
-            self.completion_queue_capacity,
+            "core_engine.plugin_worker_class.completion_queue_capacity",
+            self.plugin_worker_class.completion_queue_capacity,
         )?;
         validate_positive_usize(
-            "core_engine.completion_queue_byte_capacity",
-            self.completion_queue_byte_capacity,
+            "core_engine.plugin_worker_class.completion_queue_byte_capacity",
+            self.plugin_worker_class.completion_queue_byte_capacity,
         )?;
         self.session_io_coalescing.validate()?;
         if let Some(path) = &self.session_worker_path {
@@ -680,15 +703,17 @@ mod tests {
         let options: CoreEngineOptions =
             serde_json::from_value(value).expect("deserialize without class knobs");
         assert_eq!(
-            options.reserved_request_response_executors,
+            options
+                .plugin_worker_class
+                .reserved_request_response_executors,
             defaults.reserved_request_response_executors
         );
         assert_eq!(
-            options.background_queue_capacity,
+            options.plugin_worker_class.background_queue_capacity,
             defaults.background_queue_capacity
         );
         assert_eq!(
-            options.completion_queue_capacity,
+            options.plugin_worker_class.completion_queue_capacity,
             defaults.completion_queue_capacity
         );
     }
@@ -701,14 +726,22 @@ mod tests {
             ..CoreEngineOptions::default()
         };
         assert_eq!(options.plugin_worker_queue_capacity, 9);
-        assert_eq!(options.reserved_request_response_executors, 1);
+        assert_eq!(
+            options
+                .plugin_worker_class
+                .reserved_request_response_executors,
+            1
+        );
     }
 
     #[test]
     fn reserved_request_response_executors_must_leave_a_background_slot() {
         let options = CoreEngineOptions {
             plugin_worker_executor_concurrency: 2,
-            reserved_request_response_executors: 2,
+            plugin_worker_class: PluginWorkerClassOptions {
+                reserved_request_response_executors: 2,
+                ..PluginWorkerClassOptions::default()
+            },
             ..CoreEngineOptions::default()
         };
         let error = options.validate().expect_err("reservation must be strict");
