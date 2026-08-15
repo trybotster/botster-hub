@@ -659,7 +659,13 @@ fn run_many_pty_client_attach_scenario(
         ManyPtyConformanceStage::Attach,
         MANY_PTY_NOISY_SESSION_ID,
     )?;
-    let mut observed_events = attach.events;
+    if !attach.events.is_empty() {
+        return Err(many_pty_error(
+            ManyPtyConformanceStage::Attach,
+            MANY_PTY_NOISY_SESSION_ID,
+            "attach must not return terminal bodies",
+        ));
+    }
 
     // Re-confirm that the pre-attach marker remains readable after attach;
     // the earlier wait is the readiness oracle for the marker itself.
@@ -736,10 +742,9 @@ fn run_many_pty_client_attach_scenario(
         ManyPtyConformanceStage::Input,
         MANY_PTY_NOISY_SESSION_ID,
     )?;
-    observed_events.extend(input.events);
-
     let deadline = Instant::now() + MANY_PTY_DEADLINE;
-    while Instant::now() < deadline && !many_pty_saw_live_output(&observed_events) {
+    let mut live_screen = String::new();
+    while Instant::now() < deadline {
         let drain = many_pty_request(
             connection,
             &DaemonRequest::Drain {
@@ -755,111 +760,45 @@ fn run_many_pty_client_attach_scenario(
             ManyPtyConformanceStage::Drain,
             MANY_PTY_NOISY_SESSION_ID,
         )?;
-        observed_events.extend(drain.events);
-        if !many_pty_saw_live_output(&observed_events) {
-            thread::sleep(MANY_PTY_POLL_INTERVAL);
-        }
-    }
-
-    let attaching_index = observed_events
-        .iter()
-        .position(|event| {
+        if drain.events.iter().any(|event| {
             matches!(
                 event,
-                DaemonEvent::AttachState {
-                    subscription_id,
-                    state,
-                    ..
-                } if subscription_id == MANY_PTY_SUBSCRIPTION_ID && state == "attaching"
+                DaemonEvent::AttachState { .. }
+                    | DaemonEvent::Snapshot { .. }
+                    | DaemonEvent::Scrollback { .. }
+                    | DaemonEvent::TerminalOutput { .. }
+                    | DaemonEvent::ProcessExit { .. }
             )
-        })
-        .ok_or_else(|| {
-            many_pty_error(
-                ManyPtyConformanceStage::History,
-                MANY_PTY_NOISY_SESSION_ID,
-                "late attach did not emit attaching for the exact subscription",
-            )
-        })?;
-    // ReadScreen above proves that the pre-attach marker is renderable. The
-    // initial event remains backend-opaque, so its payload bytes are ordering
-    // evidence rather than a second semantic-history oracle.
-    let history_index = observed_events
-        .iter()
-        .rposition(|event| match event {
-            DaemonEvent::Snapshot {
-                subscription_id,
-                history,
-                ..
-            }
-            | DaemonEvent::Scrollback {
-                subscription_id,
-                history,
-                ..
-            } if subscription_id == MANY_PTY_SUBSCRIPTION_ID => history.bytes > 0,
-            _ => false,
-        })
-        .ok_or_else(|| {
-            many_pty_error(
-                ManyPtyConformanceStage::History,
-                MANY_PTY_NOISY_SESSION_ID,
-                "late attach did not return non-empty authoritative initial state",
-            )
-        })?;
-    let attached_index = observed_events
-        .iter()
-        .position(|event| {
-            matches!(
-                event,
-                DaemonEvent::AttachState {
-                    subscription_id,
-                    state,
-                    ..
-                } if subscription_id == MANY_PTY_SUBSCRIPTION_ID && state == "attached"
-            )
-        })
-        .ok_or_else(|| {
-            many_pty_error(
-                ManyPtyConformanceStage::History,
-                MANY_PTY_NOISY_SESSION_ID,
-                "late attach did not emit attached for the exact subscription",
-            )
-        })?;
-    let first_terminal_output_index = observed_events
-        .iter()
-        .position(|event| {
-            matches!(
-                event,
-                DaemonEvent::TerminalOutput { subscription_id, .. }
-                    if subscription_id == MANY_PTY_SUBSCRIPTION_ID
-            )
-        })
-        .ok_or_else(|| {
-            many_pty_error(
+        }) {
+            return Err(many_pty_error(
                 ManyPtyConformanceStage::Drain,
                 MANY_PTY_NOISY_SESSION_ID,
-                "late attach did not emit terminal output for the exact subscription",
-            )
-        })?;
-    let live_index = many_pty_live_output_index(&observed_events).ok_or_else(|| {
-        let output = many_pty_terminal_output(&observed_events);
-        let output_tail = many_pty_tail(&output);
-        many_pty_error(
+                "host Drain must not return terminal bodies",
+            ));
+        }
+        let screen = many_pty_request(
+            connection,
+            &DaemonRequest::ReadScreen {
+                session_id: MANY_PTY_NOISY_SESSION_ID.to_string(),
+            },
+            ManyPtyConformanceStage::Drain,
+            MANY_PTY_NOISY_SESSION_ID,
+        )?;
+        if let Some(body) = screen.read_screen {
+            live_screen = body.text;
+            if live_screen.contains(MANY_PTY_LIVE_MARKER) {
+                break;
+            }
+        }
+        thread::sleep(MANY_PTY_POLL_INTERVAL);
+    }
+    if !live_screen.contains(MANY_PTY_LIVE_MARKER) {
+        return Err(many_pty_error(
             ManyPtyConformanceStage::Drain,
             MANY_PTY_NOISY_SESSION_ID,
             format!(
-                "drain did not observe the input-driven live marker; terminal tail: {output_tail:?}"
+                "ReadScreen did not observe the input-driven live marker; text={live_screen:?}"
             ),
-        )
-    })?;
-    if !(attaching_index < history_index
-        && history_index < attached_index
-        && attached_index < first_terminal_output_index
-        && attached_index < live_index)
-    {
-        return Err(many_pty_error(
-            ManyPtyConformanceStage::History,
-            MANY_PTY_NOISY_SESSION_ID,
-            "late attach did not preserve attaching < initial state < attached < first/live output",
         ));
     }
 
@@ -1006,10 +945,12 @@ fn wait_for_many_pty_screen_marker(
     ))
 }
 
+#[allow(dead_code)]
 fn many_pty_saw_live_output(events: &[DaemonEvent]) -> bool {
     many_pty_live_output_index(events).is_some()
 }
 
+#[allow(dead_code)]
 fn many_pty_live_output_index(events: &[DaemonEvent]) -> Option<usize> {
     let mut output = String::new();
     for (index, event) in events.iter().enumerate() {
@@ -1029,6 +970,7 @@ fn many_pty_live_output_index(events: &[DaemonEvent]) -> Option<usize> {
     None
 }
 
+#[allow(dead_code)]
 fn many_pty_terminal_output(events: &[DaemonEvent]) -> String {
     let mut output = String::new();
     for event in events {
@@ -1045,6 +987,7 @@ fn many_pty_terminal_output(events: &[DaemonEvent]) -> String {
     output
 }
 
+#[allow(dead_code)]
 fn live_output_utf8(payload: &DaemonLiveOutputPayload) -> String {
     String::from_utf8_lossy(&payload.decoded_bytes().unwrap_or_default()).into_owned()
 }

@@ -329,6 +329,17 @@ fn external_hub_webrtc_live_output_preserves_exact_bytes() {
         )
         .expect("spawn write(2) producer");
         offer_peer
+            .encrypted_hello(
+                &stream_key,
+                &botster_hub_client::DaemonHello {
+                    protocol: botster_hub_client::PROTOCOL.to_string(),
+                    compatibility: botster_hub_client::DaemonCompatibilityRequirement::for_webrtc_terminal_adapter(),
+                    terminal_compatibility: None,
+                },
+            )
+            .await
+            .expect("webrtc adapter hello");
+        let attach = offer_peer
             .encrypted_request(
                 &stream_key,
                 &botster_hub_client::DaemonRequest::Attach {
@@ -338,46 +349,37 @@ fn external_hub_webrtc_live_output_preserves_exact_bytes() {
             )
             .await
             .expect("attach over encrypted WebRTC");
-        for _ in 0..20 {
-            let drain = offer_peer
-                .encrypted_request(
-                    &stream_key,
-                    &botster_hub_client::DaemonRequest::drain_subscription(
-                        "webrtc-exact-bytes-session",
-                        "webrtc-exact-bytes-sub",
-                    ),
-                )
-                .await
-                .expect("drain attach until bound");
-            if drain.events.iter().any(|event| {
-                matches!(
-                    event,
-                    botster_hub_client::DaemonEvent::AttachState { state, .. } if state == "attached"
-                )
-            }) {
-                break;
-            }
-            sleep(Duration::from_millis(30)).await;
-        }
+        assert!(
+            attach.events.is_empty(),
+            "WebRTC Attach must not return terminal bodies: {:?}",
+            attach.events
+        );
         fs::create_dir_all(release_path.parent().expect("release parent"))
             .expect("create webrtc release dir");
         fs::write(&release_path, b"go").expect("release webrtc write(2) producer");
 
         let mut concatenated = Vec::new();
         for _ in 0..120 {
-            let drain = offer_peer
+            let _ = offer_peer
                 .encrypted_request(
                     &stream_key,
-                    &botster_hub_client::DaemonRequest::drain_subscription(
-                        "webrtc-exact-bytes-session",
-                        "webrtc-exact-bytes-sub",
-                    ),
+                    &botster_hub_client::DaemonRequest::ReadScreen {
+                        session_id: "webrtc-exact-bytes-session".to_string(),
+                    },
                 )
-                .await
-                .expect("drain over encrypted WebRTC");
-            for event in drain.events {
-                if let botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } = event {
-                    let bytes = live_output_decoded_bytes(payload);
+                .await;
+            while let Some((_, bytes)) = offer_peer.pending_terminal_frames.pop_front() {
+                if let Ok(event) = serde_json::from_slice::<botster_hub_client::DaemonEvent>(&bytes)
+                {
+                    if let botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } = event {
+                        let decoded = live_output_decoded_bytes(payload);
+                        assert!(
+                            !payload_has_utf8_replacement(&decoded),
+                            "WebRTC live payload must not contain U+FFFD: {decoded:?}"
+                        );
+                        concatenated.extend(decoded);
+                    }
+                } else {
                     assert!(
                         !payload_has_utf8_replacement(&bytes),
                         "WebRTC live payload must not contain U+FFFD: {bytes:?}"
@@ -397,7 +399,7 @@ fn external_hub_webrtc_live_output_preserves_exact_bytes() {
             concatenated
                 .windows(expected.len())
                 .any(|window| window == expected),
-            "encrypted WebRTC Drain must preserve exact live bytes, got {concatenated:?}"
+            "encrypted WebRTC adapter frames must preserve exact live bytes, got {concatenated:?}"
         );
         let _ = offer_peer.peer.close().await;
     });
@@ -555,6 +557,17 @@ fn local_webrtc_chunks_oversized_encrypted_daemon_response() {
             .accept_answer(answer)
             .await
             .expect("offer peer accepts answer and opens channel");
+        offer_peer
+            .encrypted_hello(
+                &stream_key,
+                &botster_hub_client::DaemonHello {
+                    protocol: botster_hub_client::PROTOCOL.to_string(),
+                    compatibility: botster_hub_client::DaemonCompatibilityRequirement::for_webrtc_terminal_adapter(),
+                    terminal_compatibility: None,
+                },
+            )
+            .await
+            .expect("webrtc adapter hello before host requests");
 
         let status = offer_peer
             .encrypted_request(&stream_key, &botster_hub_client::DaemonRequest::Status)
@@ -723,18 +736,22 @@ fn local_webrtc_chunks_oversized_encrypted_daemon_response() {
 
         let mut observed = String::new();
         for _ in 0..120 {
-            let drain = offer_peer
+            let screen = offer_peer
                 .encrypted_request(
                     &stream_key,
-                    &botster_hub_client::DaemonRequest::Drain {
+                    &botster_hub_client::DaemonRequest::ReadScreen {
                         session_id: "local-webrtc-session".to_string(),
-                    subscription_id: None,
                     },
                 )
                 .await
-                .expect("drain over encrypted WebRTC data channel");
-            for event in drain.events {
-                if let botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } = event {
+                .expect("read screen over encrypted WebRTC data channel");
+            if let Some(body) = screen.read_screen {
+                observed = body.text;
+            }
+            while let Some((_, bytes)) = offer_peer.pending_terminal_frames.pop_front() {
+                if let Ok(event) = serde_json::from_slice::<botster_hub_client::DaemonEvent>(&bytes)
+                    && let botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } = event
+                {
                     observed.push_str(&live_output_utf8(payload));
                 }
             }
@@ -1326,6 +1343,17 @@ fn local_webrtc_peer_close_detaches_terminal_subscriptions() {
             .expect("spawn over encrypted WebRTC data channel");
         assert_eq!(spawn.kind, botster_hub_client::DaemonResponseKind::Spawned);
 
+        offer_peer
+            .encrypted_hello(
+                &stream_key,
+                &botster_hub_client::DaemonHello {
+                    protocol: botster_hub_client::PROTOCOL.to_string(),
+                    compatibility: botster_hub_client::DaemonCompatibilityRequirement::for_webrtc_terminal_adapter(),
+                    terminal_compatibility: None,
+                },
+            )
+            .await
+            .expect("webrtc adapter hello before attach");
         let attach = offer_peer
             .encrypted_request(
                 &stream_key,
@@ -1363,33 +1391,11 @@ fn local_webrtc_peer_close_detaches_terminal_subscriptions() {
         .expect("send input after WebRTC peer close");
     assert_eq!(send.kind, botster_hub_client::DaemonResponseKind::Events);
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let mut observed = String::new();
-    let mut events_after_close = Vec::new();
-    while std::time::Instant::now() < deadline {
-        let drain = connection
-            .request(&botster_hub_client::DaemonRequest::drain_subscription(
-                "local-webrtc-drop-session",
-                "socket-after-webrtc-close-subscription",
-            ))
-            .expect("drain after WebRTC peer close");
-        for event in drain.events {
-            if let botster_hub_client::DaemonEvent::TerminalOutput {
-                payload,
-                subscription_id,
-                ..
-            } = &event
-                && subscription_id == "socket-after-webrtc-close-subscription"
-            {
-                observed.push_str(&live_output_utf8(payload));
-            }
-            events_after_close.push(event);
-        }
-        if observed.contains("drop:after-webrtc-close") {
-            break;
-        }
-        thread::sleep(Duration::from_millis(30));
-    }
+    let observed = wait_for_read_screen_contains(
+        &mut connection,
+        "local-webrtc-drop-session",
+        "drop:after-webrtc-close",
+    );
     assert!(
         observed.contains("drop:after-webrtc-close"),
         "socket client should observe output after WebRTC close, got {observed:?}"
@@ -1400,7 +1406,7 @@ fn local_webrtc_peer_close_detaches_terminal_subscriptions() {
             "local-webrtc-drop-subscription",
         ))
         .expect("drain closed WebRTC subscription");
-    events_after_close.extend(closed_peer_drain.events);
+    let events_after_close = closed_peer_drain.events;
     assert!(
         events_after_close.iter().all(|event| {
             !matches!(
@@ -1490,28 +1496,14 @@ fn external_hub_client_spawns_botster_web_runtime_session_request_shape() {
         .expect("send input to botster-web runtime session");
     assert_eq!(send.kind, botster_hub_client::DaemonResponseKind::Events);
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let mut observed = String::new();
-    while std::time::Instant::now() < deadline {
-        let drain = connection
-            .request(&botster_hub_client::DaemonRequest::Drain {
-                session_id: "botster-web-runtime-session".to_string(),
-            subscription_id: None,
-            })
-            .expect("drain botster-web runtime session");
-        for event in drain.events {
-            if let botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } = event {
-                observed.push_str(&live_output_utf8(payload));
-            }
-        }
-        if observed.contains("web:from-web-action") {
-            break;
-        }
-        thread::sleep(Duration::from_millis(30));
-    }
+    let observed = wait_for_read_screen_contains(
+        &mut connection,
+        "botster-web-runtime-session",
+        "web:from-web-action",
+    );
     assert!(
         observed.contains("web:from-web-action"),
-        "botster-web runtime request shape should attach and drain output, got {observed:?}"
+        "botster-web runtime request shape should attach and show output, got {observed:?}"
     );
 
     let shutdown_session = connection
@@ -1602,25 +1594,11 @@ fn external_hub_client_duplicate_botster_web_runtime_spawn_is_rejected_without_c
         .expect("existing session remains writable after duplicate rejection");
     assert_eq!(send.kind, botster_hub_client::DaemonResponseKind::Events);
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let mut observed = String::new();
-    while std::time::Instant::now() < deadline {
-        let drain = connection
-            .request(&botster_hub_client::DaemonRequest::Drain {
-                session_id: "botster-web-runtime-session".to_string(),
-            subscription_id: None,
-            })
-            .expect("drain original botster-web runtime session after duplicate rejection");
-        for event in drain.events {
-            if let botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } = event {
-                observed.push_str(&live_output_utf8(payload));
-            }
-        }
-        if observed.contains("web:after-duplicate") {
-            break;
-        }
-        thread::sleep(Duration::from_millis(30));
-    }
+    let observed = wait_for_read_screen_contains(
+        &mut connection,
+        "botster-web-runtime-session",
+        "web:after-duplicate",
+    );
     assert!(
         observed.contains("web:after-duplicate"),
         "duplicate rejection must not clean up or replace the existing session, got {observed:?}"

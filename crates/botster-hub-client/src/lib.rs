@@ -3027,89 +3027,55 @@ mod tests {
         assert_eq!(&request, expected);
     }
 
+    fn read_screen_response(session_id: &str, text: &str) -> Value {
+        serde_json::json!({
+            "kind": "read_screen",
+            "status": null,
+            "sessions": [],
+            "packages": [],
+            "package_decision": null,
+            "lifecycle": [],
+            "events": [],
+            "cleanup": null,
+            "coordination": null,
+            "error": null,
+            "read_screen": {
+                "session_id": session_id,
+                "text": text
+            }
+        })
+    }
+
     #[test]
     fn stream_attach_retains_late_output_across_running_lifecycle_readbacks() {
         let (mut server, mut client) = UnixStream::pair().expect("pair unix streams");
         let server_handle = thread::spawn(move || {
-            let attach = DaemonRequest::Attach {
-                session_id: "session".to_string(),
-                subscription_id: "subscription".to_string(),
-            };
-            expect_request(&mut server, &attach);
+            expect_request(
+                &mut server,
+                &DaemonRequest::Attach {
+                    session_id: "session".to_string(),
+                    subscription_id: "subscription".to_string(),
+                },
+            );
             write_frame(&mut server, &empty_test_response(Vec::new(), Vec::new()))
                 .expect("write attach response");
-
-            let drain = DaemonRequest::Drain {
-                session_id: "session".to_string(),
-                subscription_id: Some("subscription".to_string()),
-            };
-            for _ in 0..20 {
-                expect_request(&mut server, &drain);
-                write_frame(&mut server, &empty_test_response(Vec::new(), Vec::new()))
-                    .expect("write empty drain response");
-            }
-
-            expect_request(&mut server, &DaemonRequest::ListSessions);
-            write_frame(
+            expect_request(
                 &mut server,
-                &empty_test_response(
-                    vec![DaemonSession {
-                        session_id: "session".to_string(),
-                        lifecycle: "running".to_string(),
-                    }],
-                    Vec::new(),
-                ),
-            )
-            .expect("write running lifecycle response");
-
-            for _ in 0..20 {
-                expect_request(&mut server, &drain);
-                write_frame(&mut server, &empty_test_response(Vec::new(), Vec::new()))
-                    .expect("write empty drain response");
-            }
-
-            expect_request(&mut server, &DaemonRequest::ListSessions);
-            write_frame(
-                &mut server,
-                &empty_test_response(
-                    vec![DaemonSession {
-                        session_id: "session".to_string(),
-                        lifecycle: "running".to_string(),
-                    }],
-                    Vec::new(),
-                ),
-            )
-            .expect("write second running lifecycle response");
-
-            expect_request(&mut server, &drain);
-            write_frame(
-                &mut server,
-                &empty_test_response(
-                    Vec::new(),
-                    vec![
-                        DaemonEvent::TerminalOutput {
-                            session_id: "session".to_string(),
-                            subscription_id: "subscription".to_string(),
-                            payload: DaemonLiveOutputPayload::from_bytes(b"late-output"),
-                        },
-                        DaemonEvent::ProcessExit {
-                            session_id: "session".to_string(),
-                            subscription_id: "subscription".to_string(),
-                            code: Some(0),
-                        },
-                    ],
-                ),
-            )
-            .expect("write late terminal output and process exit");
+                &DaemonRequest::ReadScreen {
+                    session_id: "session".to_string(),
+                },
+            );
+            write_frame(&mut server, &read_screen_response("session", "late-output"))
+                .expect("write read_screen response");
         });
         let mut output = Vec::new();
 
         stream_attach_connected(&mut client, "session", "subscription", &mut output)
-            .expect("stream remains attached through running lifecycle readback");
+            .expect("stream attach writes current ReadScreen text");
         drop(client);
         server_handle.join().expect("scripted server completes");
 
-        assert_eq!(output, b"late-output");
+        assert_eq!(output, b"late-output\n");
     }
 
     #[test]
@@ -3125,52 +3091,26 @@ mod tests {
             );
             write_frame(&mut server, &empty_test_response(Vec::new(), Vec::new()))
                 .expect("write attach response");
-
-            let drain = DaemonRequest::Drain {
-                session_id: "session".to_string(),
-                subscription_id: Some("subscription".to_string()),
-            };
-            for _ in 0..20 {
-                expect_request(&mut server, &drain);
-                write_frame(&mut server, &empty_test_response(Vec::new(), Vec::new()))
-                    .expect("write empty drain response");
-            }
-
-            expect_request(&mut server, &DaemonRequest::ListSessions);
+            expect_request(
+                &mut server,
+                &DaemonRequest::ReadScreen {
+                    session_id: "session".to_string(),
+                },
+            );
             write_frame(
                 &mut server,
-                &empty_test_response(
-                    vec![DaemonSession {
-                        session_id: "session".to_string(),
-                        lifecycle: "exited".to_string(),
-                    }],
-                    Vec::new(),
-                ),
+                &read_screen_response("session", "final-output"),
             )
-            .expect("write exited lifecycle response");
-
-            expect_request(&mut server, &drain);
-            write_frame(
-                &mut server,
-                &empty_test_response(
-                    Vec::new(),
-                    vec![DaemonEvent::TerminalOutput {
-                        session_id: "session".to_string(),
-                        subscription_id: "subscription".to_string(),
-                        payload: DaemonLiveOutputPayload::from_bytes(b"final-output"),
-                    }],
-                ),
-            )
-            .expect("write final drain response");
+            .expect("write read_screen response");
         });
         let mut output = Vec::new();
 
         stream_attach_connected(&mut client, "session", "subscription", &mut output)
-            .expect("exited lifecycle readback completes attachment");
+            .expect("exited session still returns current ReadScreen text");
         drop(client);
         server_handle.join().expect("scripted server completes");
 
-        assert_eq!(output, b"final-output");
+        assert_eq!(output, b"final-output\n");
     }
 
     #[test]

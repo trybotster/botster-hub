@@ -123,17 +123,19 @@ Passed on this tree:
 - Hub lib tests: 269 passed, including fail-closed local Attach, negative architecture scan, WebRTC bind/peer-loss/fail-closed sibling
 - `hub_client_api_test`: 33 passed
 - IsolatedHub Unix always-bind, empty Attach, host Drain empty, ReadScreen marker, replacement-owner
-
-`./test.sh --locked` last full pass still failed 34 `hub_daemon_lifecycle_test` cases that wait for Hub-translated Attach/Drain terminal bodies (`attaching`, READY Snapshot, ProcessExit on Drain, GHOSTSNP-on-Drain). Those tests are the old Drain-as-terminal oracle. Production no longer supplies that oracle.
-
-Conformance runner now uses Attach + empty Drain + `ReadScreen`. IsolatedHub client-conformance and several socket/GHOSTSNP-on-Drain tests still need the same oracle rewrite.
+- Lifecycle oracles rewritten off Attach/Drain translation: mux frames, `ReadScreen`, host OperatorError, session-entity patches
+- `hub_daemon_lifecycle_test`: 201 passed, 1 ignored (larger local many-PTY)
+- `cli_smoke_proves_local_runtime_daemon_package_app_session_and_webrtc` passed in the locked suite
+- Missing-session host Drain is a typed OperatorError (`drain_runtime` / `terminal_stream_unavailable`)
+- SendInput/ModeGatedInput schedule entity reconcile so process-exit patches can publish without a Drain pump
+- Replacement Attach detaches generation N before bind of N+1
 
 ## Unverified behavior or residual risk
 
 - Live TUI at `fc1ff623` and live Web against this candidate Hub were not attached in this Implement turn. Verify must run that proof and record Hub SHA plus locked Core SHA separately.
-- Remaining lifecycle tests listed above still assert the retired Attach/Drain translation. They do not prove a second production path. They need oracle updates to mux frames / `ReadScreen` / OperatorError.
 - `HubRuntime::drain_*` helpers still exist for tests. They are not on the owner loop.
-- WebRTC smoke now Hellos the adapter plane and reads `ReadScreen`. That path compiled; the full smoke test was not re-run after the last smoke edit.
+- Under heavy parallel load, a session-entity test may observe host `ListSessions` exit before the subscriber patch; the reconnect/RemoveSession path remains the durable proof.
+- Control-thread `try_recv` prefers queued host requests over idle reconcile. Burst `ReadScreen` can delay entity fanout until the queue drains.
 
 ## Missing vault guidance discovered
 

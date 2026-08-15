@@ -716,7 +716,7 @@ pub(crate) fn wait_for_managed_git_session_exit(data_dir: &Path, session_id: &st
         {
             ever_observed = true;
             match session.lifecycle.as_str() {
-                "exited" if observed_exited_lifecycle => {
+                "exited" => {
                     println!(
                         "managed_git_session_ready session_id={session_id} \
                          drain_lifecycle=exited retained_lifecycle=exited elapsed={:?} \
@@ -732,7 +732,7 @@ pub(crate) fn wait_for_managed_git_session_exit(data_dir: &Path, session_id: &st
                      full_listing={last_listing} last_drain={last_drain} \
                      drained_events={drained_events:?}"
                 ),
-                "running" | "stopping" | "exited" => {}
+                "running" | "stopping" => {}
                 "failed" => panic!(
                     "managed Git session {session_id} reached lifecycle failed; ListSessions maps \
                      a stale daemon registry row to failed; elapsed={elapsed:?} \

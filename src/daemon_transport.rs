@@ -18,8 +18,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use botster_core::{
-    EndpointId, EnvelopeCursor, EnvelopeDeliveryState, EnvelopeId, EnvelopeTarget, PackageSource,
-    RequestId, RoutedEnvelope, RoutedEnvelopePayload, RunnableEntrypointKind,
+    ClientId, EndpointId, EnvelopeCursor, EnvelopeDeliveryState, EnvelopeId, EnvelopeTarget,
+    PackageSource, RequestId, RoutedEnvelope, RoutedEnvelopePayload, RunnableEntrypointKind,
     RunnableEntrypointLaunchMode, SessionId, SessionLifecycleState, SubscriptionId,
     TerminalAttachState, TerminalCapabilitySet,
 };
@@ -2120,6 +2120,8 @@ pub(crate) fn handle_control_message(
                 request,
                 DaemonRequest::Spawn { .. }
                     | DaemonRequest::Resize { .. }
+                    | DaemonRequest::SendInput { .. }
+                    | DaemonRequest::ModeGatedInput { .. }
                     | DaemonRequest::ShutdownSession { .. }
                     | DaemonRequest::RemoveSession { .. }
             );
@@ -2955,7 +2957,22 @@ fn handle_runtime_control_request(
                 client_id: client_id.clone(),
                 grant_id: observability.grant_id.map(str::to_string),
             };
+            let previous_generation = live_generation_for_route(
+                &runtime.list_terminal_subscriptions(),
+                &client_id,
+                &session_id,
+                &subscription_id,
+            );
             pending_runtime.start_attach(owner, session_id.clone(), subscription_id.clone());
+            if let Some(generation) = previous_generation {
+                let _ = runtime.detach_terminal_subscription(
+                    ClientId(client_id.clone()),
+                    SessionId(session_id.clone()),
+                    SubscriptionId(subscription_id.clone()),
+                    generation,
+                    now,
+                );
+            }
             if pending_runtime
                 .begin_core_attach(runtime, &session_id, &subscription_id, now)
                 .is_err()
@@ -3214,6 +3231,14 @@ fn handle_runtime_control_request(
             session_id,
             subscription_id,
         } => {
+            let session_known = runtime.list_sessions().ok().is_some_and(|sessions| {
+                sessions
+                    .iter()
+                    .any(|session| session.session_id.0 == session_id)
+            });
+            if !session_known {
+                return Ok(missing_session_drain_error(&session_id));
+            }
             if let Some(subscription_id) = subscription_id {
                 pending_runtime.authorize_drain(
                     &session_id,
@@ -4297,6 +4322,23 @@ fn attach_bind_operator_error(code: &'static str, message: &str) -> DaemonRespon
     response
 }
 
+fn missing_session_drain_error(session_id: &str) -> DaemonResponse {
+    let message = format!("unknown session: {session_id}");
+    let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
+    response.diagnostics = vec![DaemonDiagnostic::terminal_stream_unavailable(
+        "drain_runtime",
+        message.clone(),
+    )];
+    response.error = Some(DaemonOperatorError {
+        code: "unknown_session".to_string(),
+        request_id: "daemon-sessions-drain".to_string(),
+        operation: "drain_runtime".to_string(),
+        message,
+        diagnostics: response.diagnostics.clone(),
+    });
+    response
+}
+
 fn suppress_unix_session_close_events(pending_runtime: &PendingRuntimeState, session_id: &str) {
     for admission in pending_runtime.unix_admissions.values() {
         if let UnixTerminalAdmission::Admitted { mux, .. } = admission {
@@ -4625,6 +4667,10 @@ fn pump_bound_unix_routes(daemon: &mut HubDaemon, state: &mut DaemonControlState
         },
     );
     if let Ok(slice) = slice {
+        state.lifecycle_counters.lifecycle_session_drains = state
+            .lifecycle_counters
+            .lifecycle_session_drains
+            .saturating_add(1);
         state.observe_resume = if slice.complete || slice.resync_required.is_some() {
             None
         } else {

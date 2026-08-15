@@ -2103,17 +2103,33 @@ fn daemon_restart_reconnects_worker_backed_session_through_client_api() {
         matches!(listed.body, HubClientResponseBody::Sessions(sessions) if sessions.iter().any(|session| session.session_id == session_id))
     );
 
-    api.handle_request(
-        restarted.runtime_mut().expect("runtime initialized"),
-        &packages,
-        HubClientRequest::Attach {
-            request_id: RequestId("hub-daemon-restart-reattach".to_string()),
-            session_id: session_id.clone(),
-            subscription_id: subscription_id.clone(),
-            now_seconds: logical_clock,
-        },
-    )
-    .expect("reattach after restart through client api");
+    let runtime = restarted.runtime_mut().expect("runtime initialized");
+    runtime
+        .attach_client(
+            api.identity().client_id.clone(),
+            session_id.clone(),
+            subscription_id.clone(),
+            logical_clock,
+        )
+        .expect("reattach after restart through runtime attach");
+    logical_clock += 1;
+    let generation = runtime
+        .list_terminal_subscriptions()
+        .into_iter()
+        .find(|row| row.session_id == session_id && row.subscription_id == subscription_id)
+        .map(|row| row.generation)
+        .expect("live generation after restart");
+    runtime
+        .bind_terminal_adapter(
+            api.identity().client_id.clone(),
+            session_id.clone(),
+            subscription_id.clone(),
+            generation,
+            botster_core::TerminalCapabilitySet::from_tokens(["terminal_streaming", "resize"])
+                .expect("tokens"),
+            Box::new(botster_core_test_support::terminal_adapter::FakeTerminalAdapter::default()),
+        )
+        .expect("bind after restart");
     logical_clock += 1;
     api.handle_request(
         restarted.runtime_mut().expect("runtime initialized"),
@@ -2127,15 +2143,43 @@ fn daemon_restart_reconnects_worker_backed_session_through_client_api() {
     )
     .expect("input after restart through client api");
     logical_clock += 1;
-    drain_until_client_output(
-        &api,
-        restarted.runtime_mut().expect("runtime initialized"),
-        &packages,
-        &session_id,
-        &subscription_id,
-        "hub-daemon-restart-client",
-        b"echo:after-restart",
-        &mut logical_clock,
+    let mut screen = String::new();
+    for _ in 0..100 {
+        let _ = restarted
+            .runtime_mut()
+            .expect("runtime initialized")
+            .observe_lifecycle_slice(
+                logical_clock,
+                None,
+                botster_core_daemon::ObserveLifecycleBudget {
+                    max_sessions: 32,
+                    max_encoded_result_bytes: 64 * 1024,
+                    max_elapsed: std::time::Duration::from_millis(25),
+                },
+            );
+        logical_clock += 1;
+        let response = api
+            .handle_request(
+                restarted.runtime_mut().expect("runtime initialized"),
+                &packages,
+                HubClientRequest::ReadScreen {
+                    request_id: RequestId("hub-daemon-restart-screen".to_string()),
+                    session_id: session_id.clone(),
+                    now_seconds: logical_clock,
+                },
+            )
+            .expect("read screen after restart");
+        if let HubClientResponseBody::ReadScreen(body) = response.body {
+            screen = body.text;
+            if screen.contains("echo:after-restart") {
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        screen.contains("echo:after-restart"),
+        "restarted worker must echo after bind+observe: {screen:?}"
     );
     api.handle_request(
         restarted.runtime_mut().expect("runtime initialized"),
