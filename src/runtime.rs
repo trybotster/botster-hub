@@ -231,7 +231,7 @@ impl HubRuntime {
     pub fn new(config: HubConfig) -> Self {
         let state = HubState::from_config(&config);
         let core_config = core_daemon_config(&config);
-        let plugin_worker_config = config.core_engine.plugin_worker_config();
+        let plugin_worker_config = config.plugin_worker_config();
         let core_daemon = Mutex::new(CoreDaemon::new(core_config));
         Self {
             capability_runtime: Arc::new(Mutex::new(HubCapabilityRuntime::from_config(&config))),
@@ -306,7 +306,7 @@ impl HubRuntime {
 
     fn from_validated_state(config: HubConfig, state: HubState) -> HubRuntimeResult<Self> {
         let core_config = core_daemon_config(&config);
-        let plugin_worker_config = config.core_engine.plugin_worker_config();
+        let plugin_worker_config = config.plugin_worker_config();
         let core_daemon = Mutex::new(CoreDaemon::new(core_config));
         let mut runtime = Self {
             capability_runtime: Arc::new(Mutex::new(HubCapabilityRuntime::from_config(&config))),

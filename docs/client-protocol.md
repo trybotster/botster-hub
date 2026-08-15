@@ -177,11 +177,11 @@ dispatch, and show the diagnostic in the hub connection state.
 built-in `session` family. Hub maintains one canonical session projection
 from Core observe slices and journal pages even when no Web or TUI
 subscriber is connected. The first pushed frame is an authoritative, stable-id-ordered
-`entity_snapshot`. Hub sends one bounded page as that first snapshot. Later
-rows arrive as `entity_upsert` frames in the same id order until the page
-cursor is exhausted. If one encoded snapshot page exceeds the daemon frame
-limit, Hub sends one `entity_provider_frame_too_large` error and closes the
-subscription. `entity_upsert`, sparse `entity_patch`, and
+`entity_snapshot`. Hub assembles that complete replace-all baseline off the
+control path. Live projection changes during assembly restart the baseline.
+If the encoded frame exceeds the daemon frame limit, Hub sends one
+`entity_provider_frame_too_large` error and closes the subscription.
+`entity_upsert`, sparse `entity_patch`, and
 `entity_remove` frames carry strictly increasing per-connection sequence
 values. An overflow resync snapshot continues that same sequence and does
 not move it backwards. Every frame includes the caller's
