@@ -4559,29 +4559,14 @@ fn never_queued_release_stays_owned_when_release_queue_is_full() {
 }
 
 #[test]
-fn unfinished_finishes_are_bounded_and_sliced() {
-    let registry = install_named_lua_package(
-        "lease-unfinished",
-        lease_probe_plugin(),
-        lease_probe_manifest(),
-    );
-    let mut hub = explicit_runtime("lease-unfinished");
-    hub.load_lua_plugin_package(&registry, "lease-probe")
-        .expect("load");
+fn unfinished_finishes_are_bounded_sliced_and_fifo() {
+    let hub = explicit_runtime("lease-unfinished");
     let scopes = hub.causal_scopes().clone();
-    let first_scope = scopes.mint_with_lease(None).expect("first");
-    let published = hub.invoke_plugin(scoped_command(
-        "lease-probe",
-        "publish",
-        serde_json::json!({ "seq": 1 }),
-        first_scope,
-    ));
-    assert!(matches!(
-        published.result,
-        PluginInvocationResult::Completed(_)
-    ));
-    let taken = hub.take_leased_package_entity_fanout();
-    assert_eq!(taken.len(), 1);
+    let live = scopes
+        .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+            plugin_key: "producer".into(),
+        }))
+        .expect("live");
     let mut fillers = Vec::new();
     for index in 0..CAUSAL_PENDING_MAX {
         fillers.push(
@@ -4608,24 +4593,57 @@ fn unfinished_finishes_are_bounded_and_sliced() {
                 CausalAdmitResult::Applied
             );
         }
-        for _ in 0..CAUSAL_PENDING_MAX {
-            hub.finish_package_entity_mutation_fanout(&taken[0], false);
+        for (index, scope) in fillers.iter().enumerate() {
+            assert_eq!(
+                hub.keep_causal_op(CausalOp::Release {
+                    scope_id: *scope,
+                    identity: LeaseIdentity::AdmittedEntityMutation {
+                        family: "f".into(),
+                        seq: index as u64,
+                    },
+                }),
+                CausalAdmitResult::Applied
+            );
         }
         assert_eq!(hub.unfinished_finish_count(), CAUSAL_PENDING_MAX);
-        hub.finish_package_entity_mutation_fanout(&taken[0], false);
-        assert_eq!(hub.unfinished_finish_count(), CAUSAL_PENDING_MAX + 1);
+        assert_eq!(
+            hub.keep_causal_op(CausalOp::Transfer {
+                scope_id: live,
+                from: LeaseIdentity::PendingEntityPublish {
+                    plugin_key: "producer".into(),
+                },
+                to: vec![LeaseIdentity::AdmittedEntityMutation {
+                    family: "producer.item".into(),
+                    seq: 1,
+                }],
+            }),
+            CausalAdmitResult::Applied
+        );
+        assert_eq!(
+            hub.keep_causal_op(CausalOp::Release {
+                scope_id: live,
+                identity: LeaseIdentity::AdmittedEntityMutation {
+                    family: "producer.item".into(),
+                    seq: 1,
+                },
+            }),
+            CausalAdmitResult::Applied
+        );
+        assert_eq!(hub.unfinished_finish_count(), CAUSAL_PENDING_MAX + 2);
     });
     let before = hub.unfinished_finish_count();
     let _ = hub.apply_event_plane_owner_ops();
     assert!(
         hub.unfinished_finish_count() < before,
-        "owner turn must slice unfinished work: before={before} after={}",
-        hub.unfinished_finish_count()
+        "owner turn must slice unfinished work"
     );
     while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
         let _ = hub.apply_event_plane_owner_ops();
         let _ = scopes.flush_pending();
     }
     assert_eq!(hub.unfinished_finish_count(), 0);
-    assert!(!scopes.is_live(first_scope));
+    assert!(
+        !scopes.is_live(live),
+        "older Transfer must apply before the overflow Release"
+    );
 }

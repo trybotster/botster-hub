@@ -71,7 +71,7 @@ pub struct HubEntityPublishBridge {
     owner_thread: thread::ThreadId,
     pending: Arc<Mutex<VecDeque<PendingEntityPublishRequest>>>,
     pending_releases: Arc<Mutex<VecDeque<CausalOp>>>,
-    reserved_release: Arc<Mutex<Option<CausalOp>>>,
+    scope_releases: Arc<Mutex<BTreeMap<u64, LeaseIdentity>>>,
     next_token: Arc<AtomicU64>,
     reject_next: Arc<AtomicBool>,
 }
@@ -82,7 +82,7 @@ impl HubEntityPublishBridge {
             owner_thread: thread::current().id(),
             pending: Arc::new(Mutex::new(VecDeque::new())),
             pending_releases: Arc::new(Mutex::new(VecDeque::new())),
-            reserved_release: Arc::new(Mutex::new(None)),
+            scope_releases: Arc::new(Mutex::new(BTreeMap::new())),
             next_token: Arc::new(AtomicU64::new(1)),
             reject_next: Arc::new(AtomicBool::new(false)),
         }
@@ -95,22 +95,28 @@ impl HubEntityPublishBridge {
             pending.push_back(op);
             return CausalAdmitResult::Applied;
         }
-        if let Ok(mut reserved) = self.reserved_release.try_lock()
-            && reserved.is_none()
+        if let CausalOp::Release { scope_id, identity } = &op
+            && let Ok(mut scopes) = self.scope_releases.try_lock()
         {
-            *reserved = Some(op);
+            scopes.insert(*scope_id, identity.clone());
             return CausalAdmitResult::Applied;
         }
         CausalAdmitResult::Retry(op)
     }
 
     pub fn take_release(&self) -> Option<CausalOp> {
-        if let Ok(mut reserved) = self.reserved_release.try_lock()
-            && let Some(op) = reserved.take()
+        if let Ok(mut pending) = self.pending_releases.try_lock()
+            && let Some(op) = pending.pop_front()
         {
             return Some(op);
         }
-        self.pending_releases.try_lock().ok()?.pop_front()
+        let Ok(mut scopes) = self.scope_releases.try_lock() else {
+            return None;
+        };
+        let scope_id = scopes.keys().next().copied()?;
+        scopes
+            .remove(&scope_id)
+            .map(|identity| CausalOp::Release { scope_id, identity })
     }
 
     #[must_use]
@@ -120,12 +126,12 @@ impl HubEntityPublishBridge {
             .try_lock()
             .map(|pending| pending.len())
             .unwrap_or(0);
-        let reserved = self
-            .reserved_release
+        let scoped = self
+            .scope_releases
             .try_lock()
-            .map(|reserved| reserved.is_some() as usize)
+            .map(|scopes| scopes.len())
             .unwrap_or(0);
-        queued + reserved
+        queued + scoped
     }
 
     #[must_use]
@@ -999,7 +1005,9 @@ fn entity_publish_function(
                     )
                     && let CausalAdmitResult::Retry(op) = bridge.park_release(op)
                 {
-                    let _ = bridge.park_release(op);
+                    let retry = bridge.park_release(op);
+                    debug_assert!(matches!(retry, CausalAdmitResult::Applied));
+                    let _ = retry;
                 }
                 return Err(mlua::Error::RuntimeError(error));
             }
