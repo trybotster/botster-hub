@@ -5,7 +5,8 @@
 //! persistence, or the owner loop.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
@@ -335,16 +336,10 @@ impl PackageEventRouter {
                 return Err(EventPlaneStatus::RejectedForeign);
             }
         }
-        let snapshot = snapshot_admission(&inner);
+        preview_package_replacement(&inner, owner, &contracts, &subscriptions)?;
         let unload_generation = inner.package_generation.get(owner).copied().unwrap_or(0);
         apply_unload(&mut inner, owner, unload_generation);
-        match commit_package_generation_locked(&mut inner, owner, contracts, subscriptions) {
-            Ok(generation) => Ok(generation),
-            Err(status) => {
-                restore_admission(&mut inner, snapshot);
-                Err(status)
-            }
-        }
+        commit_package_generation_locked(&mut inner, owner, contracts, subscriptions)
     }
 
     pub fn try_subscribe(&self, subscription: EventSubscription) -> EventPlaneStatus {
@@ -794,6 +789,78 @@ fn restore_admission(inner: &mut RouterInner, snapshot: AdmissionSnapshot) {
     inner.package_generation = snapshot.package_generation;
 }
 
+fn preview_package_replacement(
+    inner: &RouterInner,
+    owner: &str,
+    contracts: &[EmittedContract],
+    subscriptions: &[EventSubscription],
+) -> Result<(), EventPlaneStatus> {
+    let unload_generation = inner.package_generation.get(owner).copied().unwrap_or(0);
+    let mut contracts_view = inner.contracts.clone();
+    contracts_view.retain(|(contract_owner, _), contract| {
+        contract_owner != owner || contract.package_generation > unload_generation
+    });
+    for contract in contracts {
+        if contract.owner == HUB_EVENT_OWNER || contract.owner != owner {
+            return Err(EventPlaneStatus::RejectedForeign);
+        }
+        contracts_view.insert(
+            (contract.owner.clone(), contract.name.clone()),
+            contract.clone(),
+        );
+    }
+    let mut plugin_counts = inner.subscriptions_per_plugin.clone();
+    let mut event_counts: HashMap<(String, String), usize> = HashMap::new();
+    for (key, event_subs) in &inner.subscriptions {
+        let mut remaining = 0;
+        for subscription in event_subs {
+            let drop_producer =
+                subscription.owner == owner && subscription.event_generation <= unload_generation;
+            let drop_consumer = subscription.plugin_key == owner
+                && subscription.plugin_generation <= unload_generation;
+            if drop_producer || drop_consumer {
+                if let Some(count) = plugin_counts.get_mut(&subscription.plugin_key) {
+                    *count = count.saturating_sub(1);
+                }
+            } else {
+                remaining += 1;
+            }
+        }
+        event_counts.insert(key.clone(), remaining);
+    }
+    for subscription in subscriptions {
+        if is_wildcard(&subscription.owner) || is_wildcard(&subscription.name) {
+            return Err(EventPlaneStatus::RejectedWildcard);
+        }
+        if subscription.owner.trim().is_empty() || subscription.name.trim().is_empty() {
+            return Err(EventPlaneStatus::RejectedInvalid);
+        }
+        let key = (subscription.owner.clone(), subscription.name.clone());
+        let Some(contract) = contracts_view.get(&key) else {
+            return Err(EventPlaneStatus::RejectedUndeclared);
+        };
+        if !contract.audience.contains(&EventAudience::Plugins) {
+            return Err(EventPlaneStatus::RejectedAudience);
+        }
+        let plugin_count = plugin_counts
+            .get(&subscription.plugin_key)
+            .copied()
+            .unwrap_or(0);
+        if plugin_count >= inner.policy.subscriptions_per_plugin_max {
+            return Err(EventPlaneStatus::RejectedInvalid);
+        }
+        let event_count = event_counts.get(&key).copied().unwrap_or(0);
+        if event_count >= inner.policy.subscribers_per_event_max {
+            return Err(EventPlaneStatus::RejectedOverFanout);
+        }
+        *plugin_counts
+            .entry(subscription.plugin_key.clone())
+            .or_insert(0) += 1;
+        *event_counts.entry(key).or_insert(0) += 1;
+    }
+    Ok(())
+}
+
 fn commit_package_generation_locked(
     inner: &mut RouterInner,
     owner: &str,
@@ -1050,11 +1117,14 @@ pub enum CausalOp {
     },
 }
 
+const CAUSAL_PENDING_MAX: usize = 256;
+
 /// Causal-scope lease table. Send + Sync. Lives beside the router.
-#[derive(Debug)]
 pub struct CausalScopeTable {
     inner: Mutex<CausalInner>,
-    pending: Mutex<VecDeque<CausalOp>>,
+    pending_tx: SyncSender<CausalOp>,
+    pending_rx: Mutex<Receiver<CausalOp>>,
+    pending_len: AtomicUsize,
     next_id: AtomicU64,
 }
 
@@ -1087,9 +1157,12 @@ impl Default for CausalScopeTable {
 impl CausalScopeTable {
     #[must_use]
     pub fn new() -> Self {
+        let (pending_tx, pending_rx) = mpsc::sync_channel(CAUSAL_PENDING_MAX);
         Self {
             inner: Mutex::new(CausalInner::default()),
-            pending: Mutex::new(VecDeque::new()),
+            pending_tx,
+            pending_rx: Mutex::new(pending_rx),
+            pending_len: AtomicUsize::new(0),
             next_id: AtomicU64::new(1),
         }
     }
@@ -1146,83 +1219,33 @@ impl CausalScopeTable {
     }
 
     fn apply_or_queue(&self, op: CausalOp) -> OwnerApplyResult {
-        match self.try_apply(&op) {
-            OwnerApplyResult::Applied => OwnerApplyResult::Applied,
-            OwnerApplyResult::WouldBlock => match self.pending.try_lock() {
-                Ok(mut pending) => {
-                    pending.push_back(op);
-                    OwnerApplyResult::WouldBlock
-                }
-                Err(_) => OwnerApplyResult::WouldBlock,
-            },
+        if self.pending_tx.try_send(op).is_err() {
+            return OwnerApplyResult::WouldBlock;
         }
+        self.pending_len.fetch_add(1, Ordering::SeqCst);
+        let _ = self.flush_pending();
+        OwnerApplyResult::Applied
     }
 
     pub fn flush_pending(&self) -> usize {
-        let Ok(mut pending) = self.pending.try_lock() else {
+        let Ok(rx) = self.pending_rx.try_lock() else {
+            return 0;
+        };
+        let Ok(mut inner) = self.inner.try_lock() else {
             return 0;
         };
         let mut applied = 0;
-        let mut kept = VecDeque::new();
-        while let Some(op) = pending.pop_front() {
-            match self.try_apply(&op) {
-                OwnerApplyResult::Applied => applied += 1,
-                OwnerApplyResult::WouldBlock => {
-                    kept.push_back(op);
-                    kept.extend(pending.drain(..));
-                    break;
-                }
-            }
+        while let Ok(op) = rx.try_recv() {
+            self.pending_len.fetch_sub(1, Ordering::SeqCst);
+            apply_causal_locked(&mut inner, &op);
+            applied += 1;
         }
-        *pending = kept;
         applied
     }
 
     #[must_use]
     pub fn pending_ops(&self) -> bool {
-        self.pending
-            .try_lock()
-            .map(|pending| !pending.is_empty())
-            .unwrap_or(true)
-    }
-
-    pub fn try_apply(&self, op: &CausalOp) -> OwnerApplyResult {
-        let mut inner = match self.inner.try_lock() {
-            Ok(inner) => inner,
-            Err(TryLockError::WouldBlock) => return OwnerApplyResult::WouldBlock,
-            Err(TryLockError::Poisoned(poisoned)) => {
-                drop(poisoned.into_inner());
-                return OwnerApplyResult::WouldBlock;
-            }
-        };
-        match op {
-            CausalOp::Transfer { scope_id, from, to } => {
-                if let Some(scope) = inner.scopes.get_mut(scope_id) {
-                    if scope.identities.remove(from) {
-                        scope.leases = scope.leases.saturating_sub(1);
-                    }
-                    for identity in to {
-                        if scope.identities.insert(identity.clone()) {
-                            scope.leases = scope.leases.saturating_add(1);
-                        }
-                    }
-                    if scope.leases == 0 {
-                        inner.scopes.remove(scope_id);
-                    }
-                }
-            }
-            CausalOp::Release { scope_id, identity } => {
-                if let Some(scope) = inner.scopes.get_mut(scope_id) {
-                    if scope.identities.remove(identity) {
-                        scope.leases = scope.leases.saturating_sub(1);
-                    }
-                    if scope.leases == 0 {
-                        inner.scopes.remove(scope_id);
-                    }
-                }
-            }
-        }
-        OwnerApplyResult::Applied
+        self.pending_len.load(Ordering::SeqCst) > 0
     }
 
     #[doc(hidden)]
@@ -1266,6 +1289,36 @@ impl CausalScopeTable {
                 .get(&scope_id)
                 .map(|scope| scope.identities.clone())
         })
+    }
+}
+
+fn apply_causal_locked(inner: &mut CausalInner, op: &CausalOp) {
+    match op {
+        CausalOp::Transfer { scope_id, from, to } => {
+            if let Some(scope) = inner.scopes.get_mut(scope_id) {
+                if scope.identities.remove(from) {
+                    scope.leases = scope.leases.saturating_sub(1);
+                }
+                for identity in to {
+                    if scope.identities.insert(identity.clone()) {
+                        scope.leases = scope.leases.saturating_add(1);
+                    }
+                }
+                if scope.leases == 0 {
+                    inner.scopes.remove(scope_id);
+                }
+            }
+        }
+        CausalOp::Release { scope_id, identity } => {
+            if let Some(scope) = inner.scopes.get_mut(scope_id) {
+                if scope.identities.remove(identity) {
+                    scope.leases = scope.leases.saturating_sub(1);
+                }
+                if scope.leases == 0 {
+                    inner.scopes.remove(scope_id);
+                }
+            }
+        }
     }
 }
 
@@ -1981,47 +2034,40 @@ mod tests {
                 plugin_key: "producer".into(),
             }))
             .expect("mint");
-        let busy = table.test_with_inner_held(|| {
-            table.transfer(
-                scope,
-                LeaseIdentity::PendingEntityPublish {
-                    plugin_key: "producer".into(),
-                },
-                [LeaseIdentity::AdmittedEntityMutation {
-                    family: "f".into(),
-                    seq: 1,
-                }],
-            )
+        table.test_with_inner_held(|| {
+            assert_eq!(
+                table.transfer(
+                    scope,
+                    LeaseIdentity::PendingEntityPublish {
+                        plugin_key: "producer".into(),
+                    },
+                    [LeaseIdentity::AdmittedEntityMutation {
+                        family: "f".into(),
+                        seq: 1,
+                    }],
+                ),
+                OwnerApplyResult::Applied
+            );
+            assert_eq!(
+                table.release(
+                    scope,
+                    LeaseIdentity::AdmittedEntityMutation {
+                        family: "f".into(),
+                        seq: 1,
+                    },
+                ),
+                OwnerApplyResult::Applied
+            );
+            assert!(table.pending_ops());
         });
-        assert_eq!(busy, OwnerApplyResult::WouldBlock);
-        assert!(table.pending_ops());
         assert_eq!(
             table.identities(scope),
             Some(BTreeSet::from([LeaseIdentity::PendingEntityPublish {
                 plugin_key: "producer".into(),
             }]))
         );
-        assert_eq!(table.flush_pending(), 1);
+        assert_eq!(table.flush_pending(), 2);
         assert!(!table.pending_ops());
-        assert_eq!(
-            table.identities(scope),
-            Some(BTreeSet::from([LeaseIdentity::AdmittedEntityMutation {
-                family: "f".into(),
-                seq: 1,
-            }]))
-        );
-        let busy_release = table.test_with_inner_held(|| {
-            table.release(
-                scope,
-                LeaseIdentity::AdmittedEntityMutation {
-                    family: "f".into(),
-                    seq: 1,
-                },
-            )
-        });
-        assert_eq!(busy_release, OwnerApplyResult::WouldBlock);
-        assert!(table.is_live(scope));
-        assert_eq!(table.flush_pending(), 1);
         assert!(!table.is_live(scope));
     }
 
@@ -2055,6 +2101,49 @@ mod tests {
             router.current_package_generation("producer").expect("kept"),
             old
         );
+    }
+
+    #[test]
+    fn failed_replace_keeps_queued_old_generation_delivery() {
+        let router = router();
+        router
+            .try_register_contracts(vec![sample_contract("producer", "old")])
+            .expect("old");
+        subscribe(&router, "consumer", "producer", "old");
+        assert_eq!(
+            router.try_ingress(
+                "producer",
+                "old",
+                &serde_json::json!({ "ok": true }),
+                Instant::now()
+            ),
+            EventPlaneStatus::Accepted
+        );
+        let before = router.snapshot().expect("before");
+        assert_eq!(before.queued_holders, 1);
+        assert_eq!(
+            router.try_replace_package_generation(
+                "producer",
+                vec![sample_contract("producer", "new")],
+                vec![EventSubscription {
+                    plugin_key: "consumer".into(),
+                    owner: "producer".into(),
+                    name: "missing".into(),
+                    handler_id: "missing".into(),
+                    generation: 1,
+                    ..EventSubscription::default()
+                }],
+            ),
+            Err(EventPlaneStatus::RejectedUndeclared)
+        );
+        assert!(router.test_has_contract("producer", "old"));
+        let after = router.snapshot().expect("after");
+        assert_eq!(after.queued_holders, 1);
+        assert_eq!(after.global_in_flight_bytes, before.global_in_flight_bytes);
+        let batch = router
+            .pull_ready_batch(8, 64 * 1024, Instant::now(), StdDuration::from_millis(8))
+            .expect("batch");
+        assert_eq!(batch.len(), 1);
     }
 
     #[test]

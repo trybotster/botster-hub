@@ -4172,7 +4172,10 @@ return botster.register({})
             "held-reload.plugin",
         )
     });
-    assert!(result.is_ok(), "reload stages while the router is held");
+    assert!(
+        result.is_err(),
+        "held router must fail reload before replacing the worker"
+    );
     assert_eq!(
         router
             .current_package_generation("held-reload.plugin")
@@ -4180,13 +4183,24 @@ return botster.register({})
         first
     );
     assert!(router.test_has_contract("held-reload.plugin", "sample.ready"));
-    let _ = hub.apply_event_plane_owner_ops();
-    let after = router
-        .current_package_generation("held-reload.plugin")
-        .expect("replaced");
-    assert!(after > first, "owner apply must commit the replacement");
-    assert!(router.test_has_contract("held-reload.plugin", "sample.ready"));
     assert_eq!(router.test_subscription_count("held-reload.plugin"), 1);
+    let generation = router
+        .current_package_generation("held-reload.plugin")
+        .expect("generation");
+    hub.record_event_plane_owner_op(botster_hub::package_event_router::OwnerOp {
+        kind: botster_hub::package_event_router::OwnerOpKind::Unload,
+        owner: "held-reload.plugin".into(),
+        generation,
+    });
+    let _ = hub.unload_plugin_package(
+        RequestId("held-reload-disable".into()),
+        "held-reload.plugin",
+    );
+    let _ = hub.apply_event_plane_owner_ops();
+    assert!(
+        !router.test_has_contract("held-reload.plugin", "sample.ready"),
+        "disable after a failed reload must not resurrect contracts"
+    );
 }
 
 #[test]
