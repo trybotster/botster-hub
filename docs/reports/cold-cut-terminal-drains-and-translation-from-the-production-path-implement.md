@@ -14,7 +14,7 @@ Plan: `docs/plans/cold-cut-terminal-drains-and-translation-from-the-production-p
 | Worktree HEAD before edits | `959c58f55726d098299cced8af151d8f496f41e3` |
 | Locked Core SHA | `aef6516d5809d563961ed7fdd07da29a7b4edddc` |
 | Merge policy | direct into `main`; no PR |
-| Review follow-up | `review_1786823168_306416` on `0b2a520` |
+| Review follow-up | `review_1786825189_860162` on `5959d40` |
 
 Independent routing matched the approved plan. This run did not infer the repository from the ambient directory.
 
@@ -37,6 +37,8 @@ Applied before edits:
 - [[botster data plane bypasses the hub through session and client actors]]
 - [[botster local client api lives over hubruntime not raw core routers]]
 - [[cold turkey migrations eliminate dual code paths and version suffixes]]
+- [[narrow ablation at the enforcement point is the cleanest regression negative control]]
+- [[lifecycle baseline page freeze uses excluded IDs and copy on write]]
 - [[cold cut grep gates exclude rejection tests that name retired inputs]]
 - [[Hub test support capability cutovers use a new unpublished package version]]
 - [[test script required for rust tests not cargo test]]
@@ -65,7 +67,7 @@ Not loaded: [[project-pipelines-playbook]] (package/plugin paths out of scope).
 - `packages/hub-test-support/**` (0.1.37 / revision 42, regenerated)
 - `README.md`, `docs/client-protocol.md`
 - Tests under `tests/hub_client_api_test.rs`, `tests/hub_local_runtime_test.rs`, `tests/hub_daemon_lifecycle/*`
-- Plan and this report (Review follow-up on `review_1786823168_306416`)
+- Plan and this report (Review follow-up on `review_1786825189_860162`)
 
 ## Ownership boundaries preserved
 
@@ -196,12 +198,27 @@ Review `review_1786823168_306416` required two follow-ups on `0b2a520`:
 - `finding_1786823168_515572` — post-shutdown Active retries reused the same frozen walk. A 250 ms shared deadline could expire after the first Active and skip later observes.
 - `finding_1786823168_509891` — `external_hub_webrtc_live_output_preserves_exact_bytes` returned OperatorError under concurrent Review load.
 
+Review `review_1786825189_860162` required three follow-ups on `5959d40`:
+
+- `finding_1786825189_586141` — unconfirmed Active or Incomplete after a Core shutdown error became SessionCleanup. That hid Runtime and State failures.
+- `finding_1786825189_573717` — the 32 × 250 ms loop replaced one shared one-second error deadline.
+- `finding_1786825189_768348` — the production walk reset had no production-path red-on-revert proof.
+
+This visit:
+
+- Production Core-error mapping goes through `response_after_core_shutdown_error` → `shutdown_error_response`. SessionCleanup is only for Cleanup, Missing, or Active plus UnknownSession. Active plus Runtime or State stays OperatorError. Incomplete stays OperatorError.
+- One error-classify deadline is `Instant::now() + SHUTDOWN_ERROR_BUDGET` (1 s). Each walk receives the remaining time. There is no 32-attempt loop.
+- Production `ShutdownSession` error recovery is `recover_after_core_shutdown_error`. After each Active result it calls `reset_walk_after_active_classify`. Incomplete keeps the cursor.
+- Production-path test `production_core_error_cleanup_requires_reset_of_nonfinal_walk` places `mmm-target` on page 2 of 3. After ReadScreen parks exit, a reused freeze stays Active while registry stays Running. `recover_after_core_shutdown_error` with a Core Runtime error then returns SessionCleanup. Narrow ablation of only `walk.reset()` inside `reset_walk_after_active_classify` made that test and `production_reset_clears_a_held_lifecycle_walk` fail. Mapper tests stayed green. The reset was restored. `git diff` on the reset function is clean relative to this visit's intended body.
+- Unit tests `production_core_shutdown_error_keeps_active_runtime_as_operator_error` and `production_core_shutdown_error_keeps_active_state_as_operator_error` call the production mapper. `error_classify_shares_one_deadline_across_active_retries` uses a deterministic clock and requires four classifies against one 80 ms deadline.
+- No production Drain. No unsliced `lifecycle_baseline()`. No invented Cleanup.
+
 ## Runtime-teardown lenses
 
 | Lens | Implemented |
 | --- | --- |
 | Isolation | One attach owns one adapter, route, and generation. Sibling routes keep opaque frames. ProcessExited does not `ShutdownSession`. |
-| Bounds | Owner-loop observe/baseline use 32-item / 64 KiB / 25 ms budgets. ShutdownSession error classify uses eight observe-and-classify attempts. Each attempt has a fresh 250 ms walk. Active resets the walk. Incomplete keeps the cursor. WebRTC local close bound is unchanged. |
+| Bounds | Owner-loop observe/baseline use 32-item / 64 KiB / 25 ms budgets. ShutdownSession initial classify uses one 1 s budget minus a 250 ms reserve. A Core shutdown error uses one shared 1 s error deadline and remaining time per walk. Active resets the walk. Incomplete keeps the cursor. WebRTC local close bound is unchanged. |
 | Late-message matrix | Hello reject, Attach fail-closed without bind, Drain authorize-only, PeerClosed + observe sweep, Detach generation-aware, entity unsubscribe independent of terminals. |
 | Production-path hard-stop | IsolatedHub Unix bind + peer-loss WebRTC proofs drive production handlers. Adapter close uses the live route set. |
 | Ownership identity | Hub `(client_id, session_id, subscription_id, generation)` plus Unix `client_id` or WebRTC `grant_id`. Stale N must not delete N+1 (existing replacement-owner tests kept). |
@@ -223,12 +240,12 @@ Passed on this tree:
 - Session-worker locked build
 - rustfmt
 - strict clippy
-- Hub lib tests: 283 passed, including fail-closed local Attach, negative architecture scan, two-argument Drain scan, WebRTC bind/peer-loss/fail-closed sibling, one-line `#[cfg(test)]` scan controls, `early_session_subscription_waits_for_complete_paged_projection`, `failed_engine_lifecycle_lookup_is_not_active_or_cleanup`, and the Active-reset / Incomplete-keep / bounded-Active error-classify tests
+- Hub lib tests: 287 passed, including fail-closed local Attach, negative architecture scan, two-argument Drain scan, WebRTC bind/peer-loss/fail-closed sibling, one-line `#[cfg(test)]` scan controls, `early_session_subscription_waits_for_complete_paged_projection`, `failed_engine_lifecycle_lookup_is_not_active_or_cleanup`, the production mapper/reset tests, and `production_core_error_cleanup_requires_reset_of_nonfinal_walk`
 - `hub_client_api_test`: 34 passed, including `session_entity_subscription_returns_a_bounded_page_not_a_complete_baseline`
 - IsolatedHub Unix always-bind, empty Attach, host Drain empty, ReadScreen marker, replacement-owner
 - Lifecycle oracles rewritten off Attach/Drain translation: mux frames, `ReadScreen`, host OperatorError, session-entity patches
 - `hub_daemon_lifecycle_test`: 206 passed, 1 ignored (larger local many-PTY)
-- Full `./test.sh --locked` workspace: all binaries ok (lifecycle 206/1 ignored; lib 283; client API 34; no FAILED results)
+- Full `./test.sh --locked` workspace: all binaries ok (lifecycle 206/1 ignored; lib 287; client API 34; no FAILED results)
 - `session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnect` passed isolated three times after the Drain removal (4.2–5.0s) and in the locked suite
 - `cli_smoke_proves_local_runtime_daemon_package_app_session_and_webrtc` passed in the locked suite
 - Missing-session host Drain is a typed OperatorError (`drain_runtime` / `terminal_stream_unavailable`)
@@ -253,7 +270,11 @@ Passed on this tree:
 - Shutdown unit tests still pass: Active plus Runtime stays `OperatorError`; UnknownSession stays cleanup
 - `shutdown_session_classifies_parked_exit_beyond_one_baseline_page` passed isolated (2.48s) with `mmm-target` on page 2 of 3. It requires SessionCleanup
 - Deterministic classify unit tests passed isolated, including Active walk-generation 0,1,2
-- `external_hub_webrtc_live_output_preserves_exact_bytes` passed isolated (3.88s) and in `./test.sh --locked` after the post-shutdown already_exited policy
+- `external_hub_webrtc_live_output_preserves_exact_bytes` passed isolated (3.06s) and in `./test.sh --locked` after restoring honest `shutdown_error_response`
+- `production_core_error_cleanup_requires_reset_of_nonfinal_walk` passed isolated (4.91s) and in the locked suite
+- Narrow ablation of only `walk.reset()` inside `reset_walk_after_active_classify` made `production_core_error_cleanup_requires_reset_of_nonfinal_walk` and `production_reset_clears_a_held_lifecycle_walk` fail (exit 101). Active Runtime/State mapper tests stayed green. The reset was restored.
+- `shutdown_session_classifies_parked_exit_beyond_one_baseline_page` passed isolated (2.68s)
+- rustfmt `--check` and `cargo clippy --workspace --all-targets --offline -- -D warnings` passed
 - `shutdown_after_observed_exit_returns_session_cleanup` passed isolated
 - Live Web `1e57685` `npm run smoke:live-packaged-protocol` against copied bins from this tree: Hello protocol 7 / rev 42, session spawn, `proveLiveTerminalAfterAttach`, and `assertTerminalAttachChronology` (cycle 0 plus reconnect cycles) completed. The harness then failed twice at the later Web-owned `proveRapidAlternateScreenReattach` cycle 0 ReadScreen oracle (`lost final row marker`). That stage is after attaching, snapshots, attached, and live `daemon_terminal_event` output.
 
@@ -264,7 +285,7 @@ Passed on this tree:
 - Control-thread `try_recv` prefers queued host requests over idle reconcile. Burst `ReadScreen` can delay the 500 ms idle observe until the queue drains. Mutations now observe on the request path.
 - CoreDaemon on `aef6516` does not expose `pump_bound_adapters`. Owner-loop observe uses `observe_lifecycle_slice`, which calls Core `drain_runtime_once` internally.
 - Downstream TUI/Web crates that still imported the deleted hub-client `FEATURE_*` constants must import `botster-terminal-protocol` instead. Those consumers are separately routed.
-- Production Hub no longer calls Core `drain` or unbounded `lifecycle_baseline()`. After a Core shutdown error, classify progresses by observe-and-classify attempts. Active resets the walk. Incomplete keeps the cursor. A short shared wall-clock window no longer stops the first retry.
+- Production Hub no longer calls Core `drain` or unbounded `lifecycle_baseline()`. After a Core shutdown error, classify uses one shared 1 s deadline. Active resets the walk. Incomplete keeps the cursor. Unconfirmed Active or Incomplete stays OperatorError.
 - Live Web packaged-protocol attach chronology was proved at `b961e27`. The same smoke still fails later at Web `proveRapidAlternateScreenReattach` cycle 0. That later oracle is unchanged by this Drain removal.
 
 ## Missing vault guidance discovered

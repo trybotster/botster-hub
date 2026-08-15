@@ -3286,31 +3286,13 @@ fn handle_runtime_control_request(
                 Ok(response) => response,
                 Err(error) => {
                     walk.reset();
-                    let walk = std::cell::RefCell::new(walk);
-                    let classification = finish_shutdown_error_classify(
-                        || {
-                            observe_lifecycle_turn(runtime, tick(logical_clock));
-                            classify_shutdown_session(
-                                runtime,
-                                &session_id,
-                                Instant::now() + SHUTDOWN_ATTEMPT_WALK,
-                                &mut walk.borrow_mut(),
-                            )
-                        },
-                        || walk.borrow_mut().reset(),
+                    let response = recover_after_core_shutdown_error(
+                        runtime,
+                        &session_id,
+                        walk,
+                        error,
+                        logical_clock,
                     )?;
-                    let response = match classification {
-                        ShutdownSessionClassification::Active
-                        | ShutdownSessionClassification::Incomplete => {
-                            daemon_session_cleanup(DaemonSessionCleanup {
-                                session_id: session_id.clone(),
-                                outcome: "already_exited".to_string(),
-                            })
-                        }
-                        classification => {
-                            shutdown_error_response(classification, error, &session_id)?
-                        }
-                    };
                     suppress_unix_session_close_events(pending_runtime, &session_id);
                     suppress_webrtc_session_close_events(pending_runtime, &session_id);
                     return Ok(response);
@@ -4353,8 +4335,7 @@ enum ShutdownSessionClassification {
 
 const SHUTDOWN_CLASSIFY_BUDGET: Duration = Duration::from_millis(1000);
 const SHUTDOWN_ERROR_RESERVE: Duration = Duration::from_millis(250);
-const SHUTDOWN_ATTEMPT_WALK: Duration = Duration::from_millis(250);
-const SHUTDOWN_ERROR_ATTEMPTS: usize = 32;
+const SHUTDOWN_ERROR_BUDGET: Duration = Duration::from_millis(1000);
 
 fn finish_shutdown_classify<F, N>(
     deadline: Instant,
@@ -4374,32 +4355,67 @@ where
     }
 }
 
-fn finish_shutdown_error_classify<F, R>(
+fn reset_walk_after_active_classify(walk: &mut crate::runtime::SessionLifecycleWalk) {
+    walk.reset();
+}
+
+fn response_after_core_shutdown_error(
+    classification: ShutdownSessionClassification,
+    error: crate::HubClientError,
+    session_id: &str,
+) -> DaemonTransportResult<DaemonResponse> {
+    shutdown_error_response(classification, error, session_id)
+}
+
+fn recover_after_core_shutdown_error(
+    runtime: &mut crate::HubRuntime,
+    session_id: &str,
+    walk: crate::runtime::SessionLifecycleWalk,
+    error: crate::HubClientError,
+    logical_clock: &mut u64,
+) -> DaemonTransportResult<DaemonResponse> {
+    let walk = std::cell::RefCell::new(walk);
+    let error_deadline = Instant::now() + SHUTDOWN_ERROR_BUDGET;
+    let classification = finish_shutdown_error_classify(
+        error_deadline,
+        Instant::now,
+        || {
+            observe_lifecycle_turn(runtime, tick(logical_clock));
+            let remaining = error_deadline.saturating_duration_since(Instant::now());
+            classify_shutdown_session(
+                runtime,
+                session_id,
+                Instant::now() + remaining,
+                &mut walk.borrow_mut(),
+            )
+        },
+        || reset_walk_after_active_classify(&mut walk.borrow_mut()),
+    )?;
+    response_after_core_shutdown_error(classification, error, session_id)
+}
+
+fn finish_shutdown_error_classify<F, N, R>(
+    deadline: Instant,
+    mut now: N,
     mut classify: F,
     mut after_active: R,
 ) -> Result<ShutdownSessionClassification, crate::HubRuntimeError>
 where
     F: FnMut() -> Result<ShutdownSessionClassification, crate::HubRuntimeError>,
+    N: FnMut() -> Instant,
     R: FnMut(),
 {
-    let mut last = ShutdownSessionClassification::Incomplete;
-    for attempt in 0..SHUTDOWN_ERROR_ATTEMPTS {
-        last = classify()?;
-        match last {
+    loop {
+        let classification = classify()?;
+        match classification {
             ShutdownSessionClassification::Cleanup(_) | ShutdownSessionClassification::Missing => {
-                return Ok(last);
+                return Ok(classification);
             }
-            ShutdownSessionClassification::Incomplete if attempt + 1 < SHUTDOWN_ERROR_ATTEMPTS => {
-                thread::sleep(Duration::from_millis(1));
-            }
-            ShutdownSessionClassification::Active if attempt + 1 < SHUTDOWN_ERROR_ATTEMPTS => {
-                after_active();
-                thread::sleep(Duration::from_millis(1));
-            }
+            ShutdownSessionClassification::Incomplete if now() < deadline => {}
+            ShutdownSessionClassification::Active if now() < deadline => after_active(),
             other => return Ok(other),
         }
     }
-    Ok(last)
 }
 
 fn daemon_hello_ack(diagnostics: Vec<DaemonDiagnostic>) -> DaemonHelloAck {
@@ -7768,10 +7784,24 @@ mod tests {
     #[test]
     fn error_classify_retries_active_until_fresh_cleanup() {
         use std::cell::Cell;
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(80);
+        let ticks = [
+            start,
+            start + Duration::from_millis(20),
+            start + Duration::from_millis(40),
+        ];
+        let tick = Cell::new(0);
         let calls = Cell::new(0);
         let walk_generation = Cell::new(0);
         let mut seen_generations = Vec::new();
         let result = finish_shutdown_error_classify(
+            deadline,
+            || {
+                let index = tick.get();
+                tick.set(index + 1);
+                ticks[index.min(ticks.len() - 1)]
+            },
             || {
                 seen_generations.push(walk_generation.get());
                 calls.set(calls.get() + 1);
@@ -7801,11 +7831,26 @@ mod tests {
     }
 
     #[test]
-    fn error_classify_returns_active_after_bounded_observe_attempts() {
+    fn error_classify_shares_one_deadline_across_active_retries() {
         use std::cell::Cell;
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(80);
+        let ticks = [
+            start,
+            start + Duration::from_millis(30),
+            start + Duration::from_millis(60),
+            start + Duration::from_millis(90),
+        ];
+        let tick = Cell::new(0);
         let calls = Cell::new(0);
         let resets = Cell::new(0);
         let result = finish_shutdown_error_classify(
+            deadline,
+            || {
+                let index = tick.get();
+                tick.set(index + 1);
+                ticks[index.min(ticks.len() - 1)]
+            },
             || {
                 calls.set(calls.get() + 1);
                 Ok(ShutdownSessionClassification::Active)
@@ -7814,16 +7859,30 @@ mod tests {
         )
         .expect("bounded Active classify");
         assert!(matches!(result, ShutdownSessionClassification::Active));
-        assert_eq!(calls.get(), SHUTDOWN_ERROR_ATTEMPTS);
-        assert_eq!(resets.get(), SHUTDOWN_ERROR_ATTEMPTS - 1);
+        assert_eq!(calls.get(), 4, "clock must stop after the shared deadline");
+        assert_eq!(resets.get(), 3);
     }
 
     #[test]
     fn error_classify_keeps_walk_on_incomplete() {
         use std::cell::Cell;
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(80);
+        let ticks = [
+            start,
+            start + Duration::from_millis(20),
+            start + Duration::from_millis(40),
+        ];
+        let tick = Cell::new(0);
         let walk_generation = Cell::new(0);
         let calls = Cell::new(0);
         let result = finish_shutdown_error_classify(
+            deadline,
+            || {
+                let index = tick.get();
+                tick.set(index + 1);
+                ticks[index.min(ticks.len() - 1)]
+            },
             || {
                 calls.set(calls.get() + 1);
                 if calls.get() < 3 {
@@ -7846,6 +7905,189 @@ mod tests {
             "Incomplete must keep the page cursor"
         );
         assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn production_reset_clears_a_held_lifecycle_walk() {
+        let mut walk = crate::runtime::SessionLifecycleWalk::default();
+        walk.hold_snapshot_for_test();
+        assert!(walk.is_holding_snapshot());
+        reset_walk_after_active_classify(&mut walk);
+        assert!(
+            !walk.is_holding_snapshot(),
+            "production reset must drop the frozen snapshot"
+        );
+    }
+
+    #[test]
+    fn production_core_shutdown_error_keeps_active_runtime_as_operator_error() {
+        let error = response_after_core_shutdown_error(
+            ShutdownSessionClassification::Active,
+            shutdown_runtime_error(crate::HubClientRuntimeErrorKind::Runtime),
+            "live-session",
+        )
+        .expect_err("Active plus Runtime stays an error");
+        assert!(matches!(
+            error,
+            DaemonTransportError::Client(crate::HubClientError::Runtime {
+                operation: crate::HubClientOperation::Shutdown,
+                kind: crate::HubClientRuntimeErrorKind::Runtime,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn production_core_shutdown_error_keeps_active_state_as_operator_error() {
+        let error = response_after_core_shutdown_error(
+            ShutdownSessionClassification::Active,
+            shutdown_runtime_error(crate::HubClientRuntimeErrorKind::State),
+            "live-session",
+        )
+        .expect_err("Active plus State stays an error");
+        assert!(matches!(
+            error,
+            DaemonTransportError::Client(crate::HubClientError::Runtime {
+                operation: crate::HubClientOperation::Shutdown,
+                kind: crate::HubClientRuntimeErrorKind::State,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn production_core_error_cleanup_requires_reset_of_nonfinal_walk() {
+        let data_directory = unique_package_control_dir("shutdown-reset-nonfinal");
+        let stop_path = data_directory.join("stop-mmm-target");
+        let ready_path = data_directory.join("ready-mmm-target");
+        std::fs::create_dir_all(&data_directory).expect("create fixture directory");
+        let mut runtime = crate::HubRuntime::new(package_control_config(data_directory.clone()));
+        let api = crate::HubClientApi::local_operator("shutdown-reset-operator");
+        let packages = crate::PackageRegistry::new(std::collections::BTreeSet::new());
+        let mut clock = 1_u64;
+        for index in 0..32 {
+            api.handle_request(
+                &mut runtime,
+                &packages,
+                crate::HubClientRequest::Spawn {
+                    request_id: RequestId(format!("spawn-aaa-{index:02}")),
+                    session_id: SessionId(format!("aaa-{index:02}")),
+                    command: "sleep 30".to_string(),
+                    now_seconds: tick(&mut clock),
+                },
+            )
+            .expect("spawn earlier pad");
+        }
+        for index in 0..32 {
+            api.handle_request(
+                &mut runtime,
+                &packages,
+                crate::HubClientRequest::Spawn {
+                    request_id: RequestId(format!("spawn-zzz-{index:02}")),
+                    session_id: SessionId(format!("zzz-{index:02}")),
+                    command: "sleep 30".to_string(),
+                    now_seconds: tick(&mut clock),
+                },
+            )
+            .expect("spawn later pad");
+        }
+        let stop = stop_path.display().to_string();
+        let ready = ready_path.display().to_string();
+        api.handle_request(
+            &mut runtime,
+            &packages,
+            crate::HubClientRequest::Spawn {
+                request_id: RequestId("spawn-mmm-target".to_string()),
+                session_id: SessionId("mmm-target".to_string()),
+                command: format!(
+                    "printf x > '{ready}'; while [ ! -f '{stop}' ]; do sleep 0.05; done; rm -f '{ready}'"
+                ),
+                now_seconds: tick(&mut clock),
+            },
+        )
+        .expect("spawn nonfinal target");
+        let spawn_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < spawn_deadline {
+            if ready_path.exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert!(ready_path.exists(), "target must start before classify");
+
+        let mut walk = crate::runtime::SessionLifecycleWalk::default();
+        let first = classify_shutdown_session(
+            &mut runtime,
+            "mmm-target",
+            Instant::now() + Duration::from_secs(1),
+            &mut walk,
+        )
+        .expect("initial classify");
+        assert!(
+            matches!(first, ShutdownSessionClassification::Active),
+            "live nonfinal target must classify Active, got {first:?}"
+        );
+        assert!(
+            walk.is_holding_snapshot(),
+            "Found on a continuation page must freeze the walk"
+        );
+
+        std::fs::write(&stop_path, b"stop").expect("stop the target process");
+        let exit_deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < exit_deadline {
+            if !ready_path.exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            !ready_path.exists(),
+            "target process must exit before the frozen classify"
+        );
+        let screen_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < screen_deadline {
+            let _ = runtime.read_screen(
+                RequestId("reset-proof-screen".to_string()),
+                SessionId("mmm-target".to_string()),
+                tick(&mut clock),
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+
+        let listed = runtime.list_sessions().expect("list after exit");
+        let registry = listed
+            .iter()
+            .find(|session| session.session_id.0 == "mmm-target");
+        assert_eq!(
+            registry.map(|session| &session.registry_state),
+            Some(&RegistrySessionState::Running),
+            "registry must stay Running so classify uses the frozen engine row"
+        );
+
+        let frozen = classify_shutdown_session(
+            &mut runtime,
+            "mmm-target",
+            Instant::now() + Duration::from_secs(1),
+            &mut walk,
+        )
+        .expect("frozen classify");
+        assert!(
+            matches!(frozen, ShutdownSessionClassification::Active),
+            "without the production reset the frozen walk stays Active, got {frozen:?}"
+        );
+
+        let response = recover_after_core_shutdown_error(
+            &mut runtime,
+            "mmm-target",
+            walk,
+            shutdown_runtime_error(crate::HubClientRuntimeErrorKind::Runtime),
+            &mut clock,
+        )
+        .expect("production recover after Core Runtime error");
+        assert_eq!(response.kind, DaemonResponseKind::SessionCleanup);
+        let cleanup = response.cleanup.expect("cleanup body");
+        assert_eq!(cleanup.session_id, "mmm-target");
+        assert_eq!(cleanup.outcome, "already_exited");
     }
 
     #[test]
