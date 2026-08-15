@@ -2,19 +2,18 @@
 
 ## Plan Review revision
 
-Plan Review `review_1786778800_782745` returned `changes_required`
-after the previous four product findings were marked resolved at
-`5a5aa73`. This third Plan visit answers the three remaining
-product findings. It does not reopen the resolved config, schema,
-live-proof, playbook, or completion-evidence items.
+Plan Review `review_1786779559_826604` returned `changes_required`.
+The prior sync, admitted-holder, and lease-machine findings stay
+resolved at `4616ce3`. This fourth Plan visit answers the two
+narrower leftovers. It does not reopen config, schema, live-proof,
+playbook, or completion-evidence items.
 
 | Finding | Response |
 | --- | --- |
-| No non-blocking synchronization | One `Mutex<RouterInner>`. Every router API uses `try_lock` only, never `lock()`. Contention on `try_ingress` / `try_subscribe` is `shed_busy`. Owner delivery, expire, and unload never wait: they `try_lock` or enqueue a lock-free pending owner op. Held-lock and concurrent-emitter tests prove bounded return and no count/byte/fanout over-admission. |
-| Producer unload retires admitted holders too early | Unload/reload drop contracts and **queued** holders only. Admitted Background jobs stay until Core completion or cancellation. `retire_holder(envelope_id, holder_id)` is idempotent. Consumer unload has the same queued-vs-admitted split. Tests cover in-flight unload, no early reuse, no double retirement, no underflow. |
-| Causal scope has no ownership state machine | `CausalScope` is a lease count. Acquire/release is defined for the event handler, pending `entity_publish`, admitted mutation/fanout, provider resync, provider invocation, error, drop, reload, and unload. The real later callback is the package `entity_provider` invoked by `drive_package_entity_resync`. Independent emit after lease count 0 is accepted. |
+| Owner-operation fallback can lose unload/reload | Remove the router-side `Mutex<VecDeque<OwnerOp>>` and the atomic name slot. Owner-loop `EventPlaneOwnerOps` retains keyed ops on the owner thread. Unload/reload does not complete until `try_apply` succeeds. Apply pending ops before ingress or delivery. Two-owner unload and unload-then-reload tests under a held router lock. |
+| Unload releases causal leases for live admitted work | Keep `EventInFlight` and `ProviderInFlight` until `CompletionDrain` or confirmed cancel. Unload stops new leases and drops only work that cannot execute. Mutation and resync leases stay until their owner-loop rows finish. Blocked admitted-invocation unload test. |
 
-Earlier resolved findings (`review_1786777843_757483`) stay resolved.
+Earlier resolved findings stay resolved.
 Duplicate vault checklist `checklist_1786776879_257442` remains unused.
 This visit keeps `checklist_1786776870_999225`.
 
@@ -29,7 +28,7 @@ This visit keeps `checklist_1786776870_999225`.
 - Run: `run_1786776489_193956`.
 - Project: Botster Non-Blocking Event Plane, Stage B Hub slice.
 - Assigned worktree is the pipeline-created Hub worktree for this ticket.
-- First Plan commit: `97c1cdc`. Second Plan commit: `5a5aa73`.
+- First Plan commit: `97c1cdc`. Second: `5a5aa73`. Third: `4616ce3`.
 - First Plan HEAD was `b1652b3`. `origin/main` at this visit: `b1652b3`.
   No new Hub main to merge.
 - Required Core pin, exact, all Git-visible members:
@@ -342,13 +341,41 @@ Contention results:
 | `try_ingress` | `shed_busy` |
 | `try_subscribe` | `shed_busy` |
 | Delivery / expire slice | skip this slice, leave delivery-wake set |
-| Owner unload / reload | push `OwnerOp` onto a lock-free pending queue (`std::sync::Mutex<VecDeque<OwnerOp>>` also `try_lock` only; if that WouldBlocks, store the owner name in a fixed `pending_unload` atomic slot and wake). The next successful `Inner` acquisition applies pending ops **before** ingress or delivery. |
+| Owner `try_apply(OwnerOp)` | do not complete the daemon unload/reload; leave the op in the owner-loop registry and wake |
 
-`shed_busy` is a typed shed. It does not increment count, bytes,
-fanout, or token-bucket tokens.
+#### Lossless owner operations
 
-Token-bucket, occupancy, and fanout checks run only after `Inner`
-is held, so two concurrent emitters cannot over-admit.
+Do **not** store unload/reload inside the router behind another
+`try_lock` queue or an atomic name slot. That path is lossy.
+
+The owner loop owns `EventPlaneOwnerOps` on `DaemonControlState` /
+`MaintenanceState` (owner thread only, no mutex):
+
+```
+BTreeMap<PackageName, VecDeque<OwnerOp>>
+OwnerOp { kind: Unload | Reload, generation }
+```
+
+Rules:
+
+1. A package unload/reload request records the keyed `OwnerOp` and
+   calls `router.try_apply(op)`.
+2. The daemon request stays open until `try_apply` returns
+   `Applied`. `WouldBlock` is not success. The owner turn yields
+   and retries on the next slice. The caller never waits on the
+   router mutex.
+3. Two packages have two keys. Concurrent unloads cannot overwrite
+   each other.
+4. Unload then reload on one package is two queued ops in order.
+   Reload does not apply before its preceding unload.
+5. When `Inner` is held, `try_apply` and delivery both drain
+   `EventPlaneOwnerOps` **before** ingress or delivery mutation.
+   Worker `try_ingress` also applies any already-recorded ops if
+   it wins `Inner`, so a held delivery slice cannot strand them.
+6. After `Applied`, remove that op and then complete the daemon
+   response. Contracts and subscriptions remain until `Applied`.
+
+There is no single-slot fallback and no discarded owner name.
 
 Tests:
 
@@ -358,6 +385,17 @@ Tests:
   exceed producer count, producer bytes, global bytes, or fanout.
 - Owner delivery `try_lock` WouldBlock leaves queues unchanged and
   keeps the wake bit.
+- Held `Inner`: two owners' unloads both remain in
+  `EventPlaneOwnerOps` and both `Applied` after the lock is
+  released. Neither request completes early.
+- Held `Inner`: unload then reload on one owner applies in that
+  order. Reload never sees the pre-unload contracts.
+
+`shed_busy` is a typed shed. It does not increment count, bytes,
+fanout, or token-bucket tokens.
+
+Token-bucket, occupancy, and fanout checks run only after `Inner`
+is held, so two concurrent emitters cannot over-admit.
 
 Typed ingress results (Lua and Rust share the same names):
 
@@ -578,11 +616,31 @@ Do not add a public client or `EntityFrame` field.
 | Owner admits that publish (`accepted` / `pending_gap` / `resync_scheduled`) | convert pending lease → `AdmittedEntityMutation` (count unchanged) | Fanout of that mutation finishes |
 | Admit schedules provider resync (`resync_scheduled` or later gap) | +1 `ProviderResyncNeed` | Resync no longer needed, degraded, or max attempts |
 | `drive_package_entity_resync` `try_admit`s the package `entity_provider` | +1 `ProviderInFlight` | That provider completion or failed admit |
-| Plugin reload/unload | no new acquire | drop every lease owned by that plugin's pending publishes and in-flight request ids; convert remaining mutation/resync leases off that plugin to owner-loop rows until fanout/resync ends |
-| Isolated drop of a pending publish channel | | release `PendingEntityPublish` |
+| Isolated drop of a pending publish channel that will never be fulfilled | | release `PendingEntityPublish` only |
+
+Plugin reload/unload does **not** release `EventInFlight` or
+`ProviderInFlight`. Those stay until `CompletionDrain` or a
+confirmed Core cancellation that still produces a completion.
+
+On unload/reload:
+
+1. Stop new leases. No new `EventInFlight`, `PendingEntityPublish`,
+   or `ProviderInFlight` for that plugin.
+2. Drop only work that cannot execute: still-queued event copies
+   (already in the holder table) and `PendingEntityPublish` rows
+   whose bridge request will be failed without running plugin code.
+3. Keep `EventInFlight` and `ProviderInFlight` until completion or
+   confirmed cancel. A still-running admitted handler can call
+   `events.emit`; that must stay `rejected_causal_scope`.
+4. Keep `AdmittedEntityMutation` and `ProviderResyncNeed` until
+   their owner-loop fanout/resync rows finish, even if the plugin
+   is gone. Those rows cannot start a new plugin emit once the
+   plugin is unloaded; they still hold the lease so a replacement
+   load cannot emit inside the same scope.
 
 Close the scope only when `leases == 0`. Releases are idempotent
-per `LeaseKind` identity.
+per `LeaseKind` identity. Early unload must not drive the count to
+zero while an admitted invocation is still live.
 
 #### Real later plugin callback
 
@@ -608,8 +666,12 @@ Acceptance tests:
 3. After every lease is released (`leases == 0`), a fresh
    RequestResponse invoke (MCP/tool, no inherited scope) from the
    same plugin `events.emit`s successfully.
-4. Reload/unload of the emitting plugin cannot leave a scope with
-   `leases > 0` and no live owner-loop row. Snapshot the table.
+4. Blocked admitted-invocation unload: admit an Event or
+   `entity_provider` job, unload the plugin, prove a derived
+   `events.emit` from that still-running job is
+   `rejected_causal_scope`, prove one completion releases the
+   lease once, and prove a replacement-load independent emit
+   succeeds only after `leases == 0`.
 
 Do not invent a second event-handler re-entry to satisfy this
 proof. Use the production `entity_provider` path.
@@ -708,8 +770,11 @@ Assumptions:
   It is configurable.
 - Router synchronization is `try_lock` only. Contention is
   `shed_busy`, not a wait.
+- Unload/reload completion waits on `try_apply`, not on a router
+  mutex. Owner-loop `EventPlaneOwnerOps` is the lossless registry.
 - The later event-to-entity-to-event callback is the package
   `entity_provider` driven by `drive_package_entity_resync`.
+- `EventInFlight` and `ProviderInFlight` survive plugin unload.
 - Current Core pin `aef6516` is sufficient.
 - Worktree path has no `:`. Tracked `.gitignore` is present and
   non-empty.
@@ -740,7 +805,10 @@ Unknowns Implement must resolve by measurement, not invention:
   validated policy; delete `emit_plugin_event`; keep `try_admit_plugin`
 - `src/daemon_transport.rs` — worktree emit becomes `try_ingress`
 - `src/daemon_maintenance.rs` — `PackageEventDelivery` slice,
-  delivery-wake observe, event in-flight on `CompletionDrain`
+  delivery-wake observe, event in-flight on `CompletionDrain`,
+  owner-thread `EventPlaneOwnerOps`
+- `src/daemon.rs` / `src/daemon_transport.rs` — hold unload/reload
+  responses until `try_apply` returns `Applied`
 - `src/lib.rs` — module export
 - `Cargo.toml` — `jsonschema` if not already a hub-crate dep
   (ui-contract already uses `jsonschema` 0.49; do not add it to
@@ -770,9 +838,13 @@ Unknowns Implement must resolve by measurement, not invention:
 - Unload retiring admitted Background jobs and double-decrement on
   late completion. Mitigation: queued-only drop, idempotent
   `retire_holder`, in-flight unload tests.
-- Closing causal scope at handler return, or never naming the
-  later emit site. Mitigation: lease table; `entity_provider`
-  resync is the later callback.
+- Lossy owner-op fallback dropping a second package unload.
+  Mitigation: owner-loop keyed `EventPlaneOwnerOps`; request stays
+  open until `Applied`.
+- Closing causal scope at handler return, or releasing in-flight
+  leases on unload. Mitigation: lease table; `EventInFlight` /
+  `ProviderInFlight` survive unload; `entity_provider` resync is
+  the later callback.
 - Leaking producer/global bytes across unload or failed admit.
   Mitigation: remaining_holders table and baseline counter tests.
 - Starving session-family or ready operations with event delivery.
@@ -818,8 +890,10 @@ Production path that must be proven, not merely present:
 6. Causal-scope lease machine: Event handler emit is rejected.
    After that handler returns, the production `entity_provider`
    invoked by `drive_package_entity_resync` still gets
-   `rejected_causal_scope`. After `leases == 0`, a fresh
-   RequestResponse invoke from the same plugin emits successfully.
+   `rejected_causal_scope`. Unload during an admitted Event or
+   provider job keeps that lease until completion. After
+   `leases == 0`, a fresh RequestResponse invoke emits
+   successfully.
 7. `HubRuntime::emit_plugin_event` is gone. Architecture tests
    reject router imports of HubRuntime / CoreDaemon / mlua /
    persistence, and reject `Mutex::lock` in the router module.
