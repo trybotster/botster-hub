@@ -16,15 +16,18 @@ use botster_core::{
     SessionRuntimeErrorKind, SessionSpawnRequest, SubscriptionId, TerminalCapabilitySet,
     TerminalColorProfile, TerminalSubscriptionGeneration, TerminalSubscriptionRecord,
 };
+use botster_core_daemon::DrainResult;
 use botster_core_daemon::{
     AcknowledgeRoutedEnvelopeRequest, AttachedSession, CaptureSnapshotRequest,
     CaptureSnapshotResult, CoreDaemon, CoreDaemonConfig, CoreDaemonError, DaemonSession,
-    DetachTerminalSubscriptionResult, DrainResult, DrainRoutedEnvelopesRequest,
-    GuardedWriteRequest, GuardedWriteResult, ModeGatedInputOutcome, PublishRoutedEnvelopeRequest,
+    DetachTerminalSubscriptionResult, DrainRoutedEnvelopesRequest, GuardedWriteRequest,
+    GuardedWriteResult, LifecycleBaselineBudget, ModeGatedInputOutcome, ObserveLifecycleBudget,
+    ObserveLifecycleCursor, ObserveLifecycleSlice, PublishRoutedEnvelopeRequest,
     ReadModeFlagsRequest, ReadModeFlagsResult, ReadScreenRequest, ReadScreenResult,
     RegistrySessionState, RoutedEnvelopeDeliveryStateResult, SessionAdoptionReport,
-    SessionAdoptionState, SessionLifecycleBaseline, SessionLifecycleChanges,
-    SessionLifecycleCursor, SpawnSessionRequest,
+    SessionAdoptionState, SessionLifecycleBaseline, SessionLifecycleBaselinePage,
+    SessionLifecycleChanges, SessionLifecycleCursor, SessionLifecyclePageError,
+    SpawnSessionRequest,
 };
 use botster_ui_contract::{UiActionRequest, UiActionResult, UiNode};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -1751,12 +1754,73 @@ impl HubRuntime {
         self.core_daemon.lock().expect("core daemon mutex").list()
     }
 
-    /// Return CoreDaemon's authoritative session lifecycle baseline.
-    pub fn session_lifecycle_baseline(&self) -> Result<SessionLifecycleBaseline, CoreDaemonError> {
+    /// Return one bounded owner-loop observe slice.
+    pub fn observe_lifecycle_slice(
+        &self,
+        now_seconds: u64,
+        resume: Option<&ObserveLifecycleCursor>,
+        budget: ObserveLifecycleBudget,
+    ) -> Result<ObserveLifecycleSlice, SessionLifecyclePageError> {
         self.core_daemon
             .lock()
             .expect("core daemon mutex")
-            .lifecycle_baseline()
+            .observe_lifecycle_slice(now_seconds, resume, budget)
+    }
+
+    /// Return one bounded lifecycle baseline page.
+    pub fn lifecycle_baseline_page(
+        &self,
+        snapshot: Option<&SessionLifecycleCursor>,
+        after: Option<&SessionId>,
+        budget: LifecycleBaselineBudget,
+    ) -> Result<SessionLifecycleBaselinePage, SessionLifecyclePageError> {
+        self.core_daemon
+            .lock()
+            .expect("core daemon mutex")
+            .lifecycle_baseline_page(snapshot, after, budget)
+    }
+
+    /// Assemble a complete baseline from bounded pages. Does not call `lifecycle_baseline`.
+    pub fn collect_session_lifecycle_baseline(
+        &self,
+        budget: LifecycleBaselineBudget,
+    ) -> Result<SessionLifecycleBaseline, SessionLifecyclePageError> {
+        let mut snapshot = None;
+        let mut after = None;
+        let mut rows = Vec::new();
+        loop {
+            let page = self.lifecycle_baseline_page(snapshot.as_ref(), after.as_ref(), budget)?;
+            if page.resync_required.is_some() {
+                if snapshot.is_none() {
+                    rows.clear();
+                    after = None;
+                    continue;
+                }
+                snapshot = None;
+                after = None;
+                rows.clear();
+                continue;
+            }
+            rows.extend(page.sessions);
+            if page.complete {
+                return Ok(SessionLifecycleBaseline {
+                    cursor: page.snapshot_sequence,
+                    sessions: rows,
+                });
+            }
+            snapshot = Some(page.snapshot_sequence);
+            after = page.next;
+        }
+    }
+
+    /// Return CoreDaemon's authoritative session lifecycle baseline through paged reads.
+    pub fn session_lifecycle_baseline(&self) -> Result<SessionLifecycleBaseline, CoreDaemonError> {
+        self.collect_session_lifecycle_baseline(LifecycleBaselineBudget {
+            max_rows: 32,
+            max_bytes: 64 * 1024,
+            max_elapsed: Duration::from_millis(25),
+        })
+        .map_err(|_| CoreDaemonError::Shutdown)
     }
 
     /// Return ordered lifecycle changes after one CoreDaemon cursor.
@@ -1971,9 +2035,7 @@ impl HubRuntime {
         )
     }
 
-    /// Drain available daemon output through core's session path.
-    ///
-    /// Attaching subscriptions must use [`Self::drain_subscription`].
+    /// Test helper for Core terminal Drain. Production daemon paths must not call this.
     pub fn drain_runtime_once(
         &mut self,
         session_id: &SessionId,
@@ -1985,7 +2047,7 @@ impl HubRuntime {
             .drain(session_id, last_output_at)
     }
 
-    /// Drain one subscription without consuming another route's frames.
+    /// Test helper for Core terminal Drain. Production daemon paths must not call this.
     pub fn drain_subscription(
         &mut self,
         client_id: &ClientId,

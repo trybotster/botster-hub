@@ -2050,25 +2050,34 @@ fn daemon_restart_reconnects_worker_backed_session_through_client_api() {
     )
     .expect("spawn through hub client api");
     logical_clock += 1;
-    api.handle_request(
-        daemon.runtime_mut().expect("runtime initialized"),
-        &packages,
-        HubClientRequest::Attach {
-            request_id: RequestId("hub-daemon-restart-attach".to_string()),
-            session_id: session_id.clone(),
-            subscription_id: subscription_id.clone(),
-            now_seconds: logical_clock,
-        },
-    )
-    .expect("attach before restart through client api");
+    let runtime = daemon.runtime_mut().expect("runtime initialized");
+    runtime
+        .attach_client(
+            api.identity().client_id.clone(),
+            session_id.clone(),
+            subscription_id.clone(),
+            logical_clock,
+        )
+        .expect("attach before restart");
     logical_clock += 1;
-    drain_until_attached(
-        daemon.runtime_mut().expect("runtime initialized"),
-        &session_id,
-        &subscription_id,
-        "hub-daemon-restart-client",
-        &mut logical_clock,
-    );
+    let generation = runtime
+        .list_terminal_subscriptions()
+        .into_iter()
+        .find(|row| row.session_id == session_id && row.subscription_id == subscription_id)
+        .map(|row| row.generation)
+        .expect("live generation");
+    runtime
+        .bind_terminal_adapter(
+            api.identity().client_id.clone(),
+            session_id.clone(),
+            subscription_id.clone(),
+            generation,
+            botster_core::TerminalCapabilitySet::from_tokens(["terminal_streaming", "resize"])
+                .expect("tokens"),
+            Box::new(botster_core_test_support::terminal_adapter::FakeTerminalAdapter::default()),
+        )
+        .expect("bind before restart");
+    logical_clock += 1;
     daemon.stop();
 
     let mut restarted = HubDaemon::start(config).expect("restart hub daemon");

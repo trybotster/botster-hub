@@ -232,10 +232,10 @@ the only operation that makes a retained reference unavailable.
 | --- | --- | --- |
 | `execute_command(DefaultEngineCommand)` | Hidden | Generic core router would obscure hub admission/policy. Not the product session path. |
 | `list_sessions` | Exposed | Host visibility over daemon-recorded sessions. |
-| `lifecycle_baseline` / `lifecycle_changes` | Exposed through session entity subscriptions | CoreDaemon remains lifecycle authority; Hub owns the sanitized projection, bounded delivery, and reconnect baseline. |
+| `observe_lifecycle_slice` / `lifecycle_baseline_page` | Exposed through the owner loop and session entity subscriptions | CoreDaemon remains lifecycle authority; Hub advances adapters and projection with item, byte, and elapsed budgets. |
 | `remove_session` | Exposed for terminal sessions | Explicit host retention policy produces an ordered `entity_remove`; shutdown does not imply forgetting. |
 | `spawn_session` | Exposed | Host-admitted local session creation through CoreDaemon. |
-| `attach_client` | Exposed | Explicit client subscription handshake without global state hydration. |
+| `attach_client` | Exposed on the Unix/WebRTC daemon bind path | Local `HubClientApi::Attach` fail-closes. Successful Attach always binds an adapter. |
 | `detach_client` | Exposed | Explicit client subscription teardown through CoreDaemon. |
 | `write_bytes` | Exposed | Explicit client terminal input path through CoreDaemon. |
 | `resize` | Exposed | Explicit client terminal resize path through CoreDaemon. |

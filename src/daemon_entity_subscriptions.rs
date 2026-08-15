@@ -10,7 +10,7 @@ use std::sync::mpsc::{self, SyncSender};
 use std::time::Instant;
 
 use crate::{HubClientApi, HubClientRequest, HubClientResponseBody};
-use botster_core::{SessionId, SessionLifecycleState};
+use botster_core::SessionLifecycleState;
 use botster_core_daemon::{
     RegistrySessionState, SessionLifecycleBaseline, SessionLifecycleChangeKind,
     SessionLifecycleCursor, SessionLifecycleRecord,
@@ -24,7 +24,7 @@ use serde_json::Value;
 use super::{
     DAEMON_MAX_FRAME_BYTES, DaemonControlState, DaemonTransportError, DaemonTransportResult,
     HubDaemon, daemon_operator_error, daemon_response_base, daemon_session_type_from_client,
-    request_id, session_type_entity_snapshot, tick,
+    request_id, session_type_entity_snapshot,
 };
 
 #[derive(Debug)]
@@ -663,33 +663,6 @@ pub(super) fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut Dae
     state
         .pending_runtime
         .retain_active_sessions(&active_session_ids);
-    for record in state.reconciliation.records.values() {
-        let session_id = record.session.session_id.0.clone();
-        if record.lifecycle.as_ref().is_some_and(|lifecycle| {
-            matches!(
-                lifecycle,
-                SessionLifecycleState::Exited { .. } | SessionLifecycleState::Failed { .. }
-            )
-        }) {
-            continue;
-        }
-        if state
-            .pending_runtime
-            .active_subscriptions
-            .contains_key(&session_id)
-        {
-            continue;
-        }
-        let drain_cursor = state
-            .drain_cursors
-            .entry(session_id.clone())
-            .or_insert_with(|| tick(&mut state.logical_clock));
-        state.lifecycle_counters.lifecycle_session_drains = state
-            .lifecycle_counters
-            .lifecycle_session_drains
-            .saturating_add(1);
-        let _ = runtime.drain_runtime_once(&SessionId(session_id.clone()), *drain_cursor);
-    }
     state.lifecycle_counters.live_entity_subscriptions = state.entity_subscriptions.len() as u64;
 }
 

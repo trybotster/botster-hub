@@ -17,9 +17,8 @@ use botster_hub_client::{
 };
 use botster_terminal_protocol::TerminalCompatibility;
 
-use super::{DaemonTransportError, DaemonTransportResult, daemon_event_from_client};
+use super::{DaemonTransportError, DaemonTransportResult};
 use crate::HubRuntime;
-use crate::client_api::events_from_drain;
 use crate::unix_terminal_adapter::{
     UnixConnectionMux, UnixTerminalAdapter, UnixTerminalAdapterHandle,
 };
@@ -137,9 +136,9 @@ impl AttachStreamRegistry {
         session_id: &str,
         subscription_id: &str,
         now_seconds: u64,
-    ) -> Result<Vec<DaemonEvent>, CoreDaemonError> {
+    ) -> Result<(), CoreDaemonError> {
         let Some(client_id) = self.stream_owner_client_id(session_id, subscription_id) else {
-            return Ok(Vec::new());
+            return Ok(());
         };
         let attached = runtime.attach_client(
             ClientId(client_id),
@@ -147,13 +146,8 @@ impl AttachStreamRegistry {
             SubscriptionId(subscription_id.to_string()),
             now_seconds,
         )?;
-        Ok(events_from_drain(botster_core_daemon::DrainResult {
-            client_egress: attached.client_egress,
-            ..botster_core_daemon::DrainResult::default()
-        })
-        .into_iter()
-        .map(daemon_event_from_client)
-        .collect())
+        let _ = attached.client_egress;
+        Ok(())
     }
 
     pub(crate) fn stream_owner_client_id(
@@ -246,6 +240,7 @@ impl AttachStreamRegistry {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn bound_routes(&self) -> Vec<(String, String, BoundAdapterHandle)> {
         self.streams
             .iter()
@@ -382,6 +377,7 @@ impl AttachStreamRegistry {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn is_terminal_body_event(event: &DaemonEvent) -> bool {
     matches!(
         event,
@@ -393,6 +389,7 @@ pub(crate) fn is_terminal_body_event(event: &DaemonEvent) -> bool {
     )
 }
 
+#[allow(dead_code)]
 pub(crate) fn terminal_event_is_pre_bind_forbidden(event: &DaemonEvent) -> bool {
     match event {
         DaemonEvent::Snapshot { .. }
@@ -404,6 +401,7 @@ pub(crate) fn terminal_event_is_pre_bind_forbidden(event: &DaemonEvent) -> bool 
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn initial_attaching_only(events: &[DaemonEvent]) -> bool {
     let terminal: Vec<_> = events
         .iter()
@@ -416,18 +414,15 @@ pub(crate) fn initial_attaching_only(events: &[DaemonEvent]) -> bool {
 }
 
 pub(crate) fn negotiated_unix_capability_set(
-    required_features: &[String],
+    _required_features: &[String],
     terminal_requirement: Option<&botster_terminal_protocol::TerminalCompatibilityRequirement>,
 ) -> Result<TerminalCapabilitySet, botster_core::TerminalCapabilitySetError> {
-    let include_snapshot = required_features
-        .iter()
-        .any(|feature| feature == FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY)
-        || terminal_requirement.is_some_and(|requirement| {
-            requirement
-                .required_features
-                .iter()
-                .any(|feature| feature == FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY)
-        });
+    let include_snapshot = terminal_requirement.is_some_and(|requirement| {
+        requirement
+            .required_features
+            .iter()
+            .any(|feature| feature == FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY)
+    });
     let tokens: Vec<String> = TerminalCompatibility::current()
         .features
         .into_iter()
@@ -442,12 +437,14 @@ pub(crate) fn negotiated_unix_capability_set(
     TerminalCapabilitySet::from_tokens(tokens)
 }
 
+#[allow(dead_code)]
 pub(crate) fn hello_requires_unix_adapter(required_features: &[String]) -> bool {
     required_features
         .iter()
         .any(|feature| feature == FEATURE_UNIX_TERMINAL_ADAPTER)
 }
 
+#[allow(dead_code)]
 pub(crate) fn hello_requires_webrtc_adapter(required_features: &[String]) -> bool {
     required_features
         .iter()
@@ -899,7 +896,10 @@ mod tests {
             None,
         )
         .expect("advertised tokens");
-        assert!(with.contains(FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY));
+        assert!(
+            !with.contains(FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY),
+            "host Hello tokens must not grant snapshot capability"
+        );
         let from_terminal = negotiated_unix_capability_set(
             &[FEATURE_UNIX_TERMINAL_ADAPTER.to_string()],
             Some(&botster_terminal_protocol::TerminalCompatibilityRequirement::for_ready_then_history_attach()),

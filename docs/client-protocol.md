@@ -983,13 +983,11 @@ The control-plane production route is:
 `botster_hub_client::DaemonConnection::request`
 to the daemon socket, then `src/daemon_transport.rs` `serve_daemon`/`handle_connection`, then `handle_runtime_control_request`, then `HubClientApi::handle_request`, then `HubRuntime` and the core daemon `SessionIo`/`ClientWorker` terminal data plane.
 
-Published client conformance drives Attach and scoped Drain through
-`botster_hub_client::DaemonConnection`. Held-open `stream_attach` is a separate
-production helper: it still connects through the daemon socket, and a live
-IsolatedHub test (`unix_adapter_unbound_stream_attach_returns_late_bytes`)
-proves it returns late terminal bytes and completes after the process exits.
-Terminal bytes are delivered by the hub-owned client/session actor data plane
-rather than by a private session-worker frame contract.
+Published client conformance drives Attach plus `ReadScreen` through
+`botster_hub_client::DaemonConnection`. `stream_attach` is a host-completion
+helper: it sends Attach, writes the current `ReadScreen` text, and returns.
+It does not poll Drain. Terminal bytes after bind travel on the Unix or WebRTC
+adapter plane, not through Attach or Drain response bodies.
 
 `DaemonEvent::TerminalOutput` carries renderable live PTY bytes in the same
 validated envelope as Snapshot/Scrollback: `payload_base64`, literal
@@ -1005,18 +1003,14 @@ backend-specific decoding, or infer visible history from byte length or
 non-emptiness. The hub preserves both live and history bytes without UTF-8
 conversion.
 
-The attach/drain ordering contract is that explicit `Attach` enters the
-core-owned SessionIo/ClientWorker subscription path and requests initial
-terminal history for that subscription. The guaranteed per-subscription order
-is `attaching`, optional `snapshot` or `scrollback` history, `attached`, then
-later live `terminal_output`. Clients that restore Ghostty terminal state must
-import only verified `DaemonEvent::Snapshot` payloads that begin with the
-upstream `GHOSTSNP` / `ghostty-terminal-snapshot-v1` magic; `Scrollback` events
-are never GHOSTSNP and must not be imported as durable terminal state.
-`attaching` means the subscription was requested
-but authoritative initial history has not been delivered. `attached` means
-initial snapshot delivery is complete and live output may flow. Initial history
-is therefore delivered before readiness and later live output.
+Successful `Attach` is a host ack with empty terminal bodies. Hub always binds
+a Unix or WebRTC adapter after admitted Hello and a live inventory generation.
+`HubClientApi::Attach` fail-closes and does not create an unbound Core
+subscription. Readable protocol-7 `AttachState`, `Snapshot`, `TerminalOutput`,
+and `ProcessExited` fields are not the production terminal path. Clients that
+restore Ghostty terminal state consume opaque adapter frames and import only
+verified Snapshot payloads that begin with the upstream `GHOSTSNP` /
+`ghostty-terminal-snapshot-v1` magic. `Scrollback` events are never GHOSTSNP.
 Clients that restore visible content request `ReadScreen`, present its text,
 buffering any live terminal output bytes until restoration is installed, then
 append subsequent decoded live bytes. An idle terminal may produce `attaching`, an optional
@@ -1028,10 +1022,10 @@ and the daemon does not maintain a separate scrollback cache. The wire-defined
 `detached` state remains part of the client contract and clients must tolerate
 it, although no production core component emits it as of the core revision
 recorded in `Cargo.lock`.
-`stream_attach` writes only decoded `TerminalOutput` payload bytes into its
-output writer; clients that need event kind, opaque history payloads,
-byte-count metadata, or ordering metadata should use `DaemonConnection` with
-`Attach` and `Drain`.
+`stream_attach` writes current `ReadScreen` text and returns. Clients that need
+opaque adapter frames or host events should use `DaemonConnection` with
+`Attach` plus the bound mux plane. Host `Drain` stays readable and returns no
+terminal bodies.
 
 Each socket attach cycle owns a fresh transport-local `subscription_id`.
 When a persistent daemon socket closes without an explicit `Detach`, the hub

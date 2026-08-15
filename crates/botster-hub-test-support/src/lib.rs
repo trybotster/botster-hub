@@ -1524,7 +1524,7 @@ pub fn run_client_conformance(
             operation: "connect",
             source,
         })?;
-    terminal
+    let attach = terminal
         .request(&DaemonRequest::Attach {
             session_id: CONFORMANCE_SESSION_ID.to_string(),
             subscription_id: CONFORMANCE_SUBSCRIPTION_ID.to_string(),
@@ -1533,8 +1533,14 @@ pub fn run_client_conformance(
             operation: "attach",
             source,
         })?;
+    expect_kind(&attach, DaemonResponseKind::Events, "attach")?;
+    if !attach.events.is_empty() {
+        return Err(ConformanceError::MissingOutput {
+            needle: "empty attach bodies",
+            output: format!("{:?}", attach.events),
+        });
+    }
     let mut drain_output = String::new();
-    let mut drain_translated_snapshot = false;
     let attached_deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < attached_deadline {
         let drain = terminal
@@ -1546,17 +1552,14 @@ pub fn run_client_conformance(
                 operation: "attach_drain",
                 source,
             })?;
-        drain_translated_snapshot |= drain
-            .events
-            .iter()
-            .any(|event| matches!(event, DaemonEvent::Snapshot { .. }));
-        append_drain_terminal_output(&drain, &mut drain_output);
-        if drain.events.iter().any(|event| {
-            matches!(
-                event,
-                DaemonEvent::AttachState { state, .. } if state == "attached"
-            )
-        }) {
+        if !drain.events.is_empty() {
+            return Err(ConformanceError::MissingOutput {
+                needle: "empty host drain",
+                output: format!("{:?}", drain.events),
+            });
+        }
+        append_read_screen(&mut terminal, &mut drain_output)?;
+        if drain_output.contains(CONFORMANCE_READY) {
             break;
         }
         thread::sleep(Duration::from_millis(25));
@@ -1591,16 +1594,7 @@ pub fn run_client_conformance(
     )?;
     let echo_deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < echo_deadline {
-        let drain = terminal
-            .request(&DaemonRequest::drain_subscription(
-                CONFORMANCE_SESSION_ID,
-                CONFORMANCE_SUBSCRIPTION_ID,
-            ))
-            .map_err(|source| ConformanceError::Client {
-                operation: "echo_drain",
-                source,
-            })?;
-        append_drain_terminal_output(&drain, &mut drain_output);
+        append_read_screen(&mut terminal, &mut drain_output)?;
         if drain_output.contains(CONFORMANCE_ECHO) {
             break;
         }
@@ -1622,16 +1616,7 @@ pub fn run_client_conformance(
     let resize_needle = format!("{CONFORMANCE_WINSIZE_PREFIX}33 102");
     let size_deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < size_deadline {
-        let drain = terminal
-            .request(&DaemonRequest::drain_subscription(
-                CONFORMANCE_SESSION_ID,
-                CONFORMANCE_SUBSCRIPTION_ID,
-            ))
-            .map_err(|source| ConformanceError::Client {
-                operation: "size_drain",
-                source,
-            })?;
-        append_drain_terminal_output(&drain, &mut drain_output);
+        append_read_screen(&mut terminal, &mut drain_output)?;
         if drain_output.contains(&resize_needle) {
             break;
         }
@@ -1651,7 +1636,7 @@ pub fn run_client_conformance(
         "send_quit",
     )?;
     let output = drain_output;
-    let stream_contains_ready = output.contains(CONFORMANCE_READY) || drain_translated_snapshot;
+    let stream_contains_ready = output.contains(CONFORMANCE_READY);
     let stream_contains_echo = output.contains(CONFORMANCE_ECHO);
     let resize_needle = format!("{CONFORMANCE_WINSIZE_PREFIX}33 102");
     let stream_contains_resize = output.contains(&resize_needle);
@@ -4075,14 +4060,22 @@ fn output_value(output: &str, key: &str) -> Option<String> {
         .find_map(|line| line.strip_prefix(&prefix).map(str::to_string))
 }
 
-fn append_drain_terminal_output(response: &DaemonResponse, output: &mut String) {
-    for event in &response.events {
-        if let DaemonEvent::TerminalOutput { payload, .. } = event
-            && let Ok(bytes) = payload.decoded_bytes()
-        {
-            output.push_str(&String::from_utf8_lossy(&bytes));
-        }
+fn append_read_screen(
+    terminal: &mut DaemonConnection,
+    output: &mut String,
+) -> Result<(), ConformanceError> {
+    let screen = terminal
+        .request(&DaemonRequest::ReadScreen {
+            session_id: CONFORMANCE_SESSION_ID.to_string(),
+        })
+        .map_err(|source| ConformanceError::Client {
+            operation: "read_screen",
+            source,
+        })?;
+    if let Some(screen) = screen.read_screen {
+        *output = screen.text;
     }
+    Ok(())
 }
 
 fn request(
@@ -5518,8 +5511,6 @@ mod tests {
                 "conformance_fixture_revision": botster_hub_client::CONFORMANCE_FIXTURE_REVISION,
                 "required_features": [
                     botster_hub_client::FEATURE_SESSIONS,
-                    botster_hub_client::FEATURE_TERMINAL_STREAMING,
-                    botster_hub_client::FEATURE_RESIZE,
                     botster_hub_client::FEATURE_PLUGIN_SURFACE_RENDER,
                     botster_hub_client::FEATURE_PLUGIN_SURFACE_ACTION,
                     botster_hub_client::FEATURE_PACKAGE_ROUTES,
@@ -5534,8 +5525,6 @@ mod tests {
                 ],
                 "supported_features": [
                     botster_hub_client::FEATURE_SESSIONS,
-                    botster_hub_client::FEATURE_TERMINAL_STREAMING,
-                    botster_hub_client::FEATURE_RESIZE,
                     botster_hub_client::FEATURE_PLUGIN_SURFACE_RENDER,
                     botster_hub_client::FEATURE_PLUGIN_SURFACE_ACTION,
                     botster_hub_client::FEATURE_PACKAGE_ROUTES,
@@ -5548,7 +5537,6 @@ mod tests {
                     botster_hub_client::FEATURE_PLUGIN_ENTITY_SUBSCRIPTIONS,
                     botster_hub_client::FEATURE_MODE_GATED_INPUT,
                     botster_hub_client::FEATURE_HUB_SOURCE_UPDATE,
-                    botster_hub_client::FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY,
                     botster_hub_client::FEATURE_UNIX_TERMINAL_ADAPTER,
                     botster_hub_client::FEATURE_TERMINAL_SUBSCRIPTION_CLOSED,
                     botster_hub_client::FEATURE_WEBRTC_TERMINAL_ADAPTER,

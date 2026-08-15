@@ -108,26 +108,11 @@ fn unix_adapter_bind_returns_only_attaching_then_opaque_envelopes() {
         &mut envelopes,
     );
     assert_eq!(attach.kind, botster_hub_client::DaemonResponseKind::Events);
-    let terminal: Vec<_> = attach
-        .events
-        .iter()
-        .filter(|event| event_is_terminal_body(event))
-        .collect();
-    assert_eq!(
-        terminal.len(),
-        1,
-        "attach may carry only the initial Attaching frame: {:?}",
+    assert!(
+        attach.events.is_empty(),
+        "Attach must not return terminal bodies: {:?}",
         attach.events
     );
-    assert!(matches!(
-        terminal[0],
-        botster_hub_client::DaemonEvent::AttachState {
-            state,
-            subscription_id: event_subscription,
-            ..
-        } if state == botster_hub_client::ATTACH_STATE_ATTACHING
-            && event_subscription == subscription_id
-    ));
 
     let deadline = Instant::now() + Duration::from_secs(8);
     while envelopes.is_empty() && Instant::now() < deadline {
@@ -280,14 +265,8 @@ fn unix_adapter_bind_returns_only_attaching_then_opaque_envelopes() {
     );
     assert_eq!(reattach.kind, botster_hub_client::DaemonResponseKind::Events);
     assert!(
-        reattach.events.iter().any(|event| matches!(
-            event,
-            botster_hub_client::DaemonEvent::AttachState {
-                state,
-                ..
-            } if state == botster_hub_client::ATTACH_STATE_ATTACHING
-        )),
-        "adapter close on disconnect is the one Core detach; replacement attach is admitted: {:?}",
+        reattach.events.is_empty(),
+        "adapter close on disconnect is the one Core detach; replacement attach is admitted with empty bodies: {:?}",
         reattach.events
     );
     drop(replacement);
@@ -310,24 +289,27 @@ fn unix_adapter_unbound_scoped_drain_delivers_terminal_output() {
             command: "printf 'unbound-drain-ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done".to_string(),
         })
         .expect("spawn");
-    connection
+    let attach = connection
         .request(&botster_hub_client::DaemonRequest::Attach {
             session_id: session_id.to_string(),
             subscription_id: subscription_id.to_string(),
         })
-        .expect("unbound attach");
-    let attached = drain_until_subscription(&mut connection, session_id, Some(subscription_id), |event| {
-        matches!(
-            event,
-            botster_hub_client::DaemonEvent::AttachState { state, .. } if state == "attached"
-        )
-    });
+        .expect("default Hello attach");
     assert!(
-        attached.iter().any(|event| matches!(
-            event,
-            botster_hub_client::DaemonEvent::Snapshot { .. }
-        )),
-        "unbound scoped Drain must still translate Snapshot: {attached:?}"
+        attach.events.is_empty(),
+        "Attach has no terminal bodies: {:?}",
+        attach.events
+    );
+    let drain = connection
+        .request(&botster_hub_client::DaemonRequest::drain_subscription(
+            session_id,
+            subscription_id,
+        ))
+        .expect("host drain");
+    assert!(
+        drain.events.is_empty(),
+        "host Drain must not translate Snapshot: {:?}",
+        drain.events
     );
     connection
         .request(&botster_hub_client::DaemonRequest::SendInput {
@@ -335,20 +317,27 @@ fn unix_adapter_unbound_scoped_drain_delivers_terminal_output() {
             data: "from-unbound\r".to_string(),
         })
         .expect("send");
-    let echoed = drain_until_subscription(&mut connection, session_id, Some(subscription_id), |event| {
-        matches!(
-            event,
-            botster_hub_client::DaemonEvent::TerminalOutput { payload, .. }
-                if live_output_contains(payload, "echo:from-unbound")
-        )
-    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut text = String::new();
+    while Instant::now() < deadline {
+        let screen = connection
+            .request(&botster_hub_client::DaemonRequest::ReadScreen {
+                session_id: session_id.to_string(),
+            })
+            .expect("read screen");
+        text = screen
+            .read_screen
+            .as_ref()
+            .map(|screen| screen.text.clone())
+            .unwrap_or_default();
+        if text.contains("echo:from-unbound") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
     assert!(
-        echoed.iter().any(|event| matches!(
-            event,
-            botster_hub_client::DaemonEvent::TerminalOutput { payload, .. }
-                if live_output_contains(payload, "echo:from-unbound")
-        )),
-        "unbound scoped Drain must keep translating later TerminalOutput: {echoed:?}"
+        text.contains("echo:from-unbound"),
+        "visible echo is on ReadScreen after always-bind: {text:?}"
     );
     shutdown_short_lived_session(&endpoint, session_id);
     hub.shutdown().expect("shutdown isolated hub");
@@ -382,14 +371,11 @@ fn unix_adapter_explicit_detach_is_separate_from_connection_death() {
         },
         &mut envelopes,
     );
+    assert_eq!(attach.kind, botster_hub_client::DaemonResponseKind::Events);
     assert!(
-        attach.events.iter().any(|event| matches!(
-            event,
-            botster_hub_client::DaemonEvent::AttachState {
-                state,
-                ..
-            } if state == botster_hub_client::ATTACH_STATE_ATTACHING
-        ))
+        attach.events.is_empty(),
+        "Attach must not return terminal bodies: {:?}",
+        attach.events
     );
 
     let detach = request_skipping_envelopes(
@@ -476,11 +462,12 @@ fn unix_adapter_stale_disconnect_does_not_cancel_replacement_owner() {
         },
         &mut envelopes_a,
     );
-    assert!(attach_a.events.iter().any(|event| matches!(
-        event,
-        botster_hub_client::DaemonEvent::AttachState { state, .. }
-            if state == botster_hub_client::ATTACH_STATE_ATTACHING
-    )));
+    assert_eq!(attach_a.kind, botster_hub_client::DaemonResponseKind::Events);
+    assert!(
+        attach_a.events.is_empty(),
+        "owner A Attach must not return terminal bodies: {:?}",
+        attach_a.events
+    );
     let detach_a = request_skipping_envelopes(
         &mut owner_a,
         &mut reader_a,
@@ -503,13 +490,10 @@ fn unix_adapter_stale_disconnect_does_not_cancel_replacement_owner() {
         },
         &mut envelopes_b,
     );
+    assert_eq!(attach_b.kind, botster_hub_client::DaemonResponseKind::Events);
     assert!(
-        attach_b.events.iter().any(|event| matches!(
-            event,
-            botster_hub_client::DaemonEvent::AttachState { state, .. }
-                if state == botster_hub_client::ATTACH_STATE_ATTACHING
-        )),
-        "replacement owner B must bind the same key: {:?}",
+        attach_b.events.is_empty(),
+        "replacement owner B must bind the same key with empty bodies: {:?}",
         attach_b.events
     );
 
@@ -636,34 +620,23 @@ fn unix_adapter_unbound_attach_still_drains_snapshot() {
             session_id: session_id.to_string(),
             subscription_id: subscription_id.to_string(),
         })
-        .expect("unbound attach");
-    assert!(matches!(
-        &attach.events[0],
-        botster_hub_client::DaemonEvent::AttachState {
-            state,
-            ..
-        } if state == "attaching"
-    ));
-    let events = drain_until_subscription(
-        &mut connection,
-        session_id,
-        Some(subscription_id),
-        |event| {
-            matches!(
-                event,
-                botster_hub_client::DaemonEvent::AttachState {
-                    state,
-                    ..
-                } if state == "attached"
-            )
-        },
-    );
+        .expect("default Hello attach");
+    assert_eq!(attach.kind, botster_hub_client::DaemonResponseKind::Events);
     assert!(
-        events.iter().any(|event| matches!(
-            event,
-            botster_hub_client::DaemonEvent::Snapshot { .. }
-        )),
-        "unbound attach still drains Snapshot: {events:?}"
+        attach.events.is_empty(),
+        "default Hello Attach binds without terminal bodies: {:?}",
+        attach.events
+    );
+    let drain = connection
+        .request(&botster_hub_client::DaemonRequest::drain_subscription(
+            session_id,
+            subscription_id,
+        ))
+        .expect("host drain");
+    assert!(
+        drain.events.is_empty(),
+        "host Drain must not reconstruct Snapshot: {:?}",
+        drain.events
     );
 
     shutdown_short_lived_session(&endpoint, session_id);
@@ -694,42 +667,44 @@ fn unix_adapter_unbound_printf_stream_attach_completes() {
             subscription_id: subscription_id.to_string(),
         })
         .expect("attach");
+    assert_eq!(attach.kind, botster_hub_client::DaemonResponseKind::Events);
+    assert!(
+        attach.events.is_empty(),
+        "default Hello Attach must bind without terminal bodies: {:?}",
+        attach.events
+    );
     let deadline = Instant::now() + Duration::from_secs(5);
-    let mut attached = attach.events.iter().any(|event| {
-        matches!(
-            event,
-            botster_hub_client::DaemonEvent::AttachState { state, .. } if state == "attached"
-        )
-    });
-    while !attached && Instant::now() < deadline {
+    let mut text = String::new();
+    while Instant::now() < deadline {
         let drain = connection
             .request(&botster_hub_client::DaemonRequest::drain_subscription(
                 session_id,
                 subscription_id,
             ))
             .expect("drain");
-        attached = drain.events.iter().any(|event| {
-            matches!(
-                event,
-                botster_hub_client::DaemonEvent::AttachState { state, .. } if state == "attached"
-            )
-        });
+        assert!(
+            drain.events.is_empty(),
+            "host Drain must not return terminal bodies: {:?}",
+            drain.events
+        );
+        let screen = connection
+            .request(&botster_hub_client::DaemonRequest::ReadScreen {
+                session_id: session_id.to_string(),
+            })
+            .expect("read screen");
+        text = screen
+            .read_screen
+            .as_ref()
+            .map(|screen| screen.text.clone())
+            .unwrap_or_default();
+        if text.contains(&format!("smoke:{marker}")) {
+            break;
+        }
         thread::sleep(Duration::from_millis(25));
     }
-    assert!(attached, "unbound printf attach must reach Attached");
-    let screen = connection
-        .request(&botster_hub_client::DaemonRequest::ReadScreen {
-            session_id: session_id.to_string(),
-        })
-        .expect("read screen");
-    let text = screen
-        .read_screen
-        .as_ref()
-        .map(|screen| screen.text.as_str())
-        .unwrap_or("");
     assert!(
         text.contains(&format!("smoke:{marker}")),
-        "unbound printf visible text is on ReadScreen after Core pin: {text:?}"
+        "visible text is on ReadScreen: {text:?}"
     );
     let listed = connection
         .request(&botster_hub_client::DaemonRequest::ListSessions)
@@ -758,31 +733,18 @@ fn unix_adapter_unbound_stream_attach_returns_late_bytes() {
         &endpoint,
         botster_hub_client::DaemonRequest::Spawn {
             session_id: session_id.to_string(),
-            command: format!("printf 'pre-attach\\n'; sleep 1; printf '{late}\\n'"),
+            command: format!("printf 'pre-attach\\n'; sleep 1; printf '{late}\\n'; sleep 30"),
         },
     )
     .expect("spawn exiting writer");
-
-    let (tx, rx) = mpsc::channel();
-    let attach_endpoint = endpoint.clone();
-    thread::spawn(move || {
-        let mut output = Vec::new();
-        let result = botster_hub_client::stream_attach(
-            &attach_endpoint,
-            session_id,
-            subscription_id,
-            &mut output,
-        );
-        let _ = tx.send((result, output));
-    });
-    let (result, output) = rx
-        .recv_timeout(Duration::from_secs(8))
-        .expect("production stream_attach must complete after the process exits");
-    result.expect("stream_attach");
+    thread::sleep(Duration::from_millis(1500));
+    let mut output = Vec::new();
+    botster_hub_client::stream_attach(&endpoint, session_id, subscription_id, &mut output)
+        .expect("stream_attach");
     let text = String::from_utf8_lossy(&output);
     assert!(
         text.contains(late),
-        "stream_attach must return late terminal bytes after Attached: {text:?}"
+        "stream_attach writes current ReadScreen text: {text:?}"
     );
 
     hub.shutdown().expect("shutdown isolated hub");
@@ -839,12 +801,8 @@ fn spawn_and_bind(
     );
     assert_eq!(attach.kind, botster_hub_client::DaemonResponseKind::Events);
     assert!(
-        attach.events.iter().any(|event| matches!(
-            event,
-            botster_hub_client::DaemonEvent::AttachState { state, .. }
-                if state == botster_hub_client::ATTACH_STATE_ATTACHING
-        )),
-        "bind must return Attaching: {:?}",
+        attach.events.is_empty(),
+        "bind must return empty Attach bodies: {:?}",
         attach.events
     );
 }
@@ -1692,7 +1650,7 @@ fn terminal_subscription_closed_feature_does_not_raise_default_requirement() {
         botster_hub_client::DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION;
     botster_hub_client::ensure_compatible(&requirement, &previous)
         .expect("default clients still accept a daemon without terminal_subscription_closed");
-    assert_eq!(botster_hub_client::CONFORMANCE_FIXTURE_REVISION, 41);
+    assert_eq!(botster_hub_client::CONFORMANCE_FIXTURE_REVISION, 42);
     assert_eq!(
         botster_hub_client::DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION,
         36

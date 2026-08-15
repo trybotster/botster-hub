@@ -4593,6 +4593,25 @@ mod tests {
             response
         }
 
+        fn ensure_webrtc_adapter_hello(&mut self, peer: &mut LiveSignaledPeer) {
+            if self
+                .state
+                .pending_runtime
+                .webrtc_is_admitted(&peer.grant_id)
+            {
+                return;
+            }
+            let _ = self.hello_on_peer(
+                peer,
+                DaemonHello {
+                    protocol: PROTOCOL.to_string(),
+                    compatibility:
+                        botster_hub_client::DaemonCompatibilityRequirement::for_webrtc_terminal_adapter(),
+                    terminal_compatibility: None,
+                },
+            );
+        }
+
         fn hello_on_peer(
             &mut self,
             peer: &mut LiveSignaledPeer,
@@ -5426,16 +5445,18 @@ mod tests {
             hub_detaches, 0,
             "bound peer loss must not Hub-Detach: before={before:?} after={after:?}"
         );
-        let client_id = botster_core::ClientId(format!("botster-hub-webrtc-{grant_id}"));
         let _ = harness
             .daemon
             .runtime_mut()
             .expect("runtime")
-            .drain_subscription(
-                &client_id,
-                &botster_core::SessionId(session_id.to_string()),
-                &botster_core::SubscriptionId(subscription_id.to_string()),
+            .observe_lifecycle_slice(
                 1,
+                None,
+                botster_core_daemon::ObserveLifecycleBudget {
+                    max_sessions: 32,
+                    max_encoded_result_bytes: 64 * 1024,
+                    max_elapsed: Duration::from_millis(25),
+                },
             );
         let inventory = harness
             .daemon
@@ -5465,6 +5486,8 @@ mod tests {
         let session_b = "fail-closed-sibling-session";
         let attach_b = "fail-closed-sibling-attach";
 
+        harness.ensure_webrtc_adapter_hello(&mut peer_a);
+        harness.ensure_webrtc_adapter_hello(&mut peer_b);
         let _ = harness.subscribe_entities(&mut peer_a, "entity-fail-a");
         let _ = harness.subscribe_entities(&mut peer_b, "entity-fail-b");
         harness.spawn_and_attach_on_peer(&mut peer_b, session_b, attach_b);
@@ -6105,6 +6128,7 @@ mod tests {
         let session_id = "attach-sweep-session";
         let subscription_id = "attach-sweep-sub";
 
+        harness.ensure_webrtc_adapter_hello(&mut peer);
         harness.spawn_and_attach_on_peer(&mut peer, session_id, subscription_id);
         assert!(
             harness
@@ -6195,6 +6219,8 @@ mod tests {
         let session_id = "reused-attach-session";
         let subscription_id = "reused-attach-sub";
 
+        harness.ensure_webrtc_adapter_hello(&mut peer_a);
+        harness.ensure_webrtc_adapter_hello(&mut peer_b);
         harness.spawn_and_attach_on_peer(&mut peer_a, session_id, subscription_id);
         assert_eq!(
             harness

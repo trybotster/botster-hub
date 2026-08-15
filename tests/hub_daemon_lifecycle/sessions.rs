@@ -858,26 +858,19 @@ fn external_hub_client_read_mode_flags_drives_real_daemon_socket_protocol() {
         .expect("external detach request");
     assert_eq!(detach.kind, botster_hub_client::DaemonResponseKind::Events);
 
-    let terminal_unavailable = connection
+    let host_drain = connection
         .request(&botster_hub_client::DaemonRequest::Drain {
             session_id: "missing-external-client-session".to_string(),
             subscription_id: None,
         })
-        .expect("missing terminal drain returns operator response");
-    assert_eq!(
-        terminal_unavailable.kind,
-        botster_hub_client::DaemonResponseKind::OperatorError
+        .expect("host drain stays readable without Core terminal Drain");
+    assert_eq!(host_drain.kind, botster_hub_client::DaemonResponseKind::Events);
+    assert!(
+        host_drain.events.is_empty(),
+        "host Drain must not return terminal bodies: {:?}",
+        host_drain.events
     );
-    assert!(terminal_unavailable.diagnostics.iter().any(|diagnostic| {
-        diagnostic.kind == botster_hub_client::DaemonDiagnosticKind::TerminalStreamUnavailable
-            && diagnostic.operation.as_deref() == Some("drain_runtime")
-            && diagnostic.feature.as_deref() == Some(botster_hub_client::FEATURE_TERMINAL_STREAMING)
-    }));
-    assert!(!has_diagnostic_kind(
-        &terminal_unavailable.diagnostics,
-        botster_hub_client::DaemonDiagnosticKind::Connected
-    ));
-    let terminal_debug = format!("{:?}", terminal_unavailable.diagnostics);
+    let terminal_debug = format!("{:?}", host_drain.diagnostics);
     assert!(!terminal_debug.contains(&data_dir.to_string_lossy().to_string()));
     assert!(!terminal_debug.contains(concat!("/", "Users", "/")));
     assert!(!terminal_debug.contains("/home/"));
@@ -3912,11 +3905,11 @@ fn external_hub_client_reports_compatibility_descriptor_and_mismatch_diagnostics
             .supports_feature(botster_hub_client::FEATURE_SESSIONS)
     );
     assert!(
-        ack.compatibility
+        !ack.compatibility
             .supports_feature(botster_hub_client::FEATURE_TERMINAL_STREAMING)
     );
     assert!(
-        ack.compatibility
+        !ack.compatibility
             .supports_feature(botster_hub_client::FEATURE_RESIZE)
     );
     assert!(
@@ -5218,15 +5211,16 @@ fn socket_drain_receives_ready_before_later_snapshot_frames() {
         })
         .expect("attach");
     assert_eq!(
-        attach.events.len(),
-        1,
-        "attach acks attaching only: {:?}",
+        attach.kind,
+        botster_hub_client::DaemonResponseKind::Events,
+        "attach is a host ack: {:?}",
+        attach.error
+    );
+    assert!(
+        attach.events.is_empty(),
+        "attach acks with empty terminal bodies: {:?}",
         attach.events
     );
-    assert!(matches!(
-        &attach.events[0],
-        botster_hub_client::DaemonEvent::AttachState { state, .. } if state == "attaching"
-    ));
 
     connection
         .request(&botster_hub_client::DaemonRequest::SendInput {
@@ -5479,19 +5473,11 @@ fn socket_attach_missing_session_emits_attach_failed() {
             subscription_id: "missing-sub".to_string(),
         })
         .expect("attach missing session");
-    assert!(
-        attach.events.iter().any(|event| matches!(
-            event,
-            botster_hub_client::DaemonEvent::AttachState {
-                session_id,
-                subscription_id,
-                state,
-            } if session_id == "missing-session"
-                && subscription_id == "missing-sub"
-                && state == botster_hub_client::ATTACH_STATE_ATTACH_FAILED
-        )),
-        "missing session attach must emit attach_failed: {:?}",
-        attach.events
+    assert_eq!(
+        attach.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError,
+        "missing session attach must fail closed: {:?}",
+        attach.error
     );
     assert!(
         !attach.events.iter().any(|event| matches!(

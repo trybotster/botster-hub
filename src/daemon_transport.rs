@@ -18,8 +18,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use botster_core::{
-    ClientId, EndpointId, EnvelopeCursor, EnvelopeDeliveryState, EnvelopeId, EnvelopeTarget,
-    PackageSource, RequestId, RoutedEnvelope, RoutedEnvelopePayload, RunnableEntrypointKind,
+    EndpointId, EnvelopeCursor, EnvelopeDeliveryState, EnvelopeId, EnvelopeTarget, PackageSource,
+    RequestId, RoutedEnvelope, RoutedEnvelopePayload, RunnableEntrypointKind,
     RunnableEntrypointLaunchMode, SessionId, SessionLifecycleState, SubscriptionId,
     TerminalAttachState, TerminalCapabilitySet,
 };
@@ -113,9 +113,8 @@ use crate::{Worktree, WorktreeCreate, WorktreeError};
 mod daemon_attach_stream;
 use daemon_attach_stream::{
     AttachStreamOwner, AttachStreamRegistry, UnixBindRequest, WebrtcBindRequest,
-    attach_failed_events, bind_unix_adapter_after_attaching, bind_webrtc_adapter_after_attaching,
-    fail_closed_pre_bind_attach, hello_requires_unix_adapter, hello_requires_webrtc_adapter,
-    initial_attaching_only, is_terminal_body_event, live_generation_for_route,
+    bind_unix_adapter_after_attaching, bind_webrtc_adapter_after_attaching,
+    fail_closed_pre_bind_attach, live_generation_for_route,
 };
 pub(crate) use daemon_attach_stream::{
     hello_requires_terminal_subscription_closed, negotiated_unix_capability_set,
@@ -285,10 +284,10 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
             },
             OwnerEvent::Reconcile => {
                 if control_state.next_reconciliation <= Instant::now() {
+                    pump_bound_unix_routes(&mut daemon, &mut control_state);
                     drive_entity_subscriptions(&mut daemon, &mut control_state);
                     control_state.next_reconciliation =
                         Instant::now() + ENTITY_RECONCILIATION_INTERVAL;
-                    pump_bound_unix_routes(&mut daemon, &mut control_state);
                 }
                 if !socket_path.exists() {
                     rebind_missing_socket_path(&socket_path);
@@ -2957,63 +2956,40 @@ fn handle_runtime_control_request(
                 grant_id: observability.grant_id.map(str::to_string),
             };
             pending_runtime.start_attach(owner, session_id.clone(), subscription_id.clone());
-            let events = match pending_runtime.begin_core_attach(
-                runtime,
-                &session_id,
-                &subscription_id,
-                now,
-            ) {
-                Ok(events) => events,
-                Err(_) => {
-                    pending_runtime.cancel_stream(&session_id, &subscription_id);
-                    return Ok(daemon_events(attach_failed_events(
-                        &session_id,
-                        &subscription_id,
-                    )));
-                }
-            };
+            if pending_runtime
+                .begin_core_attach(runtime, &session_id, &subscription_id, now)
+                .is_err()
+            {
+                pending_runtime.cancel_stream(&session_id, &subscription_id);
+                return Ok(attach_bind_operator_error(
+                    "invalid_request",
+                    "attach failed before adapter bind",
+                ));
+            }
             let unix_admission = pending_runtime.unix_admissions.get(&client_id).cloned();
             let webrtc_admission = observability
                 .grant_id
                 .and_then(|grant_id| pending_runtime.webrtc_admissions.get(grant_id).cloned());
-            let bind_webrtc = observability.grant_id.is_some()
-                && matches!(
-                    webrtc_admission.as_ref(),
-                    Some(WebrtcTerminalAdmission::Admitted {
-                        required_features,
-                        ..
-                    }) if hello_requires_webrtc_adapter(required_features)
-                );
-            let bind_unix = observability.grant_id.is_none()
-                && matches!(
-                    unix_admission.as_ref(),
-                    Some(UnixTerminalAdmission::Admitted {
-                        required_features,
-                        ..
-                    }) if hello_requires_unix_adapter(required_features)
-                );
-            if !bind_webrtc && !bind_unix {
-                return Ok(daemon_events(events));
-            }
-            if !initial_attaching_only(&events) {
-                return Ok(daemon_events(fail_closed_pre_bind_attach(
-                    pending_runtime,
-                    runtime,
-                    &client_id,
-                    &session_id,
-                    &subscription_id,
-                    now,
-                    None,
-                )));
-            }
-            if bind_webrtc {
+            if observability.grant_id.is_some() {
                 let Some(WebrtcTerminalAdmission::Admitted {
                     required_features,
                     mux,
                     terminal_requirement,
                 }) = webrtc_admission.as_ref()
                 else {
-                    return Ok(daemon_events(events));
+                    let _ = fail_closed_pre_bind_attach(
+                        pending_runtime,
+                        runtime,
+                        &client_id,
+                        &session_id,
+                        &subscription_id,
+                        now,
+                        None,
+                    );
+                    return Ok(attach_bind_operator_error(
+                        "invalid_request",
+                        "Attach requires an admitted WebRTC adapter",
+                    ));
                 };
                 return match bind_webrtc_adapter_after_attaching(
                     pending_runtime,
@@ -3028,15 +3004,30 @@ fn handle_runtime_control_request(
                         mux: Some(mux),
                     },
                 ) {
-                    Ok(_) => Ok(daemon_events(events)),
-                    Err(failed) => Ok(daemon_events(failed)),
+                    Ok(_) => Ok(daemon_events(Vec::new())),
+                    Err(_) => Ok(attach_bind_operator_error(
+                        "invalid_request",
+                        "Attach failed to bind a WebRTC adapter",
+                    )),
                 };
             }
             let Some(UnixTerminalAdmission::Admitted {
                 capabilities, mux, ..
             }) = unix_admission.as_ref()
             else {
-                return Ok(daemon_events(events));
+                let _ = fail_closed_pre_bind_attach(
+                    pending_runtime,
+                    runtime,
+                    &client_id,
+                    &session_id,
+                    &subscription_id,
+                    now,
+                    None,
+                );
+                return Ok(attach_bind_operator_error(
+                    "invalid_request",
+                    "Attach requires an admitted Unix adapter",
+                ));
             };
             match bind_unix_adapter_after_attaching(
                 pending_runtime,
@@ -3050,8 +3041,11 @@ fn handle_runtime_control_request(
                     mux: Some(mux),
                 },
             ) {
-                Ok(_) => Ok(daemon_events(events)),
-                Err(failed) => Ok(daemon_events(failed)),
+                Ok(_) => Ok(daemon_events(Vec::new())),
+                Err(_) => Ok(attach_bind_operator_error(
+                    "invalid_request",
+                    "Attach failed to bind a Unix adapter",
+                )),
             }
         }
         DaemonRequest::Detach {
@@ -3220,10 +3214,6 @@ fn handle_runtime_control_request(
             session_id,
             subscription_id,
         } => {
-            let cursor = drain_cursors
-                .entry(session_id.clone())
-                .or_insert_with(|| tick(logical_clock));
-            let now = *cursor;
             if let Some(subscription_id) = subscription_id {
                 pending_runtime.authorize_drain(
                     &session_id,
@@ -3231,49 +3221,8 @@ fn handle_runtime_control_request(
                     observability.client_id,
                     observability.grant_id,
                 )?;
-                let client_id = ClientId(
-                    pending_runtime
-                        .stream_owner_client_id(&session_id, &subscription_id)
-                        .or_else(|| observability.client_id.map(str::to_string))
-                        .unwrap_or_else(|| "botster-hub-daemon-socket".to_string()),
-                );
-                let bound = pending_runtime.is_adapter_bound(&session_id, &subscription_id);
-                let events = match runtime.drain_subscription(
-                    &client_id,
-                    &SessionId(session_id.clone()),
-                    &SubscriptionId(subscription_id.clone()),
-                    now,
-                ) {
-                    Ok(output) => crate::client_api::events_from_drain(output)
-                        .into_iter()
-                        .map(daemon_event_from_client)
-                        .filter(|event| !bound || !is_terminal_body_event(event))
-                        .collect(),
-                    Err(_) => {
-                        pending_runtime.close_adapter(&session_id, &subscription_id);
-                        pending_runtime.cancel_stream(&session_id, &subscription_id);
-                        attach_failed_events(&session_id, &subscription_id)
-                    }
-                };
-                if !events.is_empty() {
-                    *cursor = tick(logical_clock);
-                }
-                return Ok(daemon_events(events));
             }
-            let response = api.handle_request(
-                runtime,
-                &packages,
-                HubClientRequest::DrainRuntime {
-                    request_id: request_id("daemon-sessions-drain"),
-                    session_id: SessionId(session_id.clone()),
-                    last_output_at: *cursor,
-                },
-            )?;
-            let response = events_response(response.body)?;
-            if !response.events.is_empty() {
-                *cursor = tick(logical_clock);
-            }
-            Ok(response)
+            Ok(daemon_events(Vec::new()))
         }
         DaemonRequest::ReadScreen { session_id } => {
             let response = api.handle_request(
@@ -4336,6 +4285,18 @@ fn terminal_compatibility_attach_error(
     response
 }
 
+fn attach_bind_operator_error(code: &'static str, message: &str) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
+    response.error = Some(DaemonOperatorError {
+        code: code.to_string(),
+        request_id: "daemon-attach-bind".to_string(),
+        operation: "attach".to_string(),
+        message: message.to_string(),
+        diagnostics: vec![DaemonDiagnostic::action_failure("attach", message)],
+    });
+    response
+}
+
 fn suppress_unix_session_close_events(pending_runtime: &PendingRuntimeState, session_id: &str) {
     for admission in pending_runtime.unix_admissions.values() {
         if let UnixTerminalAdmission::Admitted { mux, .. } = admission {
@@ -4578,6 +4539,7 @@ pub(crate) enum ControlMessage {
 #[derive(Clone, Debug)]
 pub(crate) enum UnixTerminalAdmission {
     Admitted {
+        #[allow(dead_code)]
         required_features: Vec<String>,
         capabilities: TerminalCapabilitySet,
         mux: UnixConnectionMux,
@@ -4633,12 +4595,17 @@ impl PendingRuntimeState {
     pub(super) fn retain_active_sessions(&mut self, active_session_ids: &BTreeSet<String>) {
         self.streams.retain_active_sessions(active_session_ids);
     }
+
+    #[cfg(test)]
+    pub(crate) fn webrtc_is_admitted(&self, grant_id: &str) -> bool {
+        matches!(
+            self.webrtc_admissions.get(grant_id),
+            Some(WebrtcTerminalAdmission::Admitted { .. })
+        )
+    }
 }
 
 fn pump_bound_unix_routes(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
-    if state.pending_runtime.bound_routes().is_empty() {
-        return;
-    }
     let Some(runtime) = daemon.runtime_mut() else {
         return;
     };
@@ -4647,20 +4614,25 @@ fn pump_bound_unix_routes(daemon: &mut HubDaemon, state: &mut DaemonControlState
     queue_webrtc_subscription_closed_events(runtime, &state.pending_runtime);
     state.pending_runtime.reconcile_inventory(&inventory);
     let now = state.logical_clock;
-    let routes = state.pending_runtime.bound_routes();
-    for (session_id, subscription_id, _) in routes {
-        let Some(client_id) = state
-            .pending_runtime
-            .stream_owner_client_id(&session_id, &subscription_id)
-        else {
-            continue;
+    let resume = state.observe_resume.as_ref();
+    let slice = runtime.observe_lifecycle_slice(
+        now,
+        resume,
+        botster_core_daemon::ObserveLifecycleBudget {
+            max_sessions: 32,
+            max_encoded_result_bytes: 64 * 1024,
+            max_elapsed: Duration::from_millis(25),
+        },
+    );
+    if let Ok(slice) = slice {
+        state.observe_resume = if slice.complete || slice.resync_required.is_some() {
+            None
+        } else {
+            Some(botster_core_daemon::ObserveLifecycleCursor {
+                pass_id: slice.pass_id,
+                last_visited: slice.last_visited,
+            })
         };
-        let _ = runtime.drain_subscription(
-            &ClientId(client_id),
-            &SessionId(session_id),
-            &SubscriptionId(subscription_id),
-            now,
-        );
     }
 }
 
@@ -4678,6 +4650,7 @@ pub(crate) struct DaemonControlState {
     pub(crate) released_attach_generations: u64,
     live_attach_routes: BTreeSet<(String, String)>,
     pending_hub_update_reply: Option<ControlReplySender>,
+    observe_resume: Option<botster_core_daemon::ObserveLifecycleCursor>,
 }
 
 impl Default for DaemonControlState {
@@ -4695,6 +4668,7 @@ impl Default for DaemonControlState {
             released_attach_generations: 0,
             live_attach_routes: BTreeSet::new(),
             pending_hub_update_reply: None,
+            observe_resume: None,
         }
     }
 }
