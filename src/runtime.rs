@@ -64,8 +64,8 @@ use crate::package_entity_fanout::{
     parse_publish_mutation,
 };
 use crate::package_event_router::{
-    CausalAdmitResult, CausalOp, EventPlaneStatus, EventSubscription, LeaseIdentity,
-    release_or_retract,
+    CAUSAL_FLUSH_MAX, CAUSAL_PENDING_MAX, CausalAdmitResult, CausalOp, EventPlaneStatus,
+    EventSubscription, LeaseIdentity, release_or_retract,
 };
 use crate::packages::{PackageRecord, PackageRegistry, PackageRegistryError, PackageState};
 use crate::persistence::{FileHubStateStore, HubState, HubStateStore, HubStateStoreError};
@@ -108,6 +108,7 @@ pub struct HubRuntime {
     package_event_router: Arc<crate::package_event_router::PackageEventRouter>,
     causal_scopes: Arc<crate::package_event_router::CausalScopeTable>,
     unfinished_finishes: Mutex<VecDeque<CausalOp>>,
+    unfinished_reserved: Mutex<Option<CausalOp>>,
     event_plane_owner_ops: std::cell::RefCell<crate::package_event_router::EventPlaneOwnerOps>,
 }
 
@@ -266,6 +267,7 @@ impl HubRuntime {
             package_event_router,
             causal_scopes: Arc::new(crate::package_event_router::CausalScopeTable::new()),
             unfinished_finishes: Mutex::new(VecDeque::new()),
+            unfinished_reserved: Mutex::new(None),
             event_plane_owner_ops: std::cell::RefCell::new(
                 crate::package_event_router::EventPlaneOwnerOps::default(),
             ),
@@ -350,6 +352,7 @@ impl HubRuntime {
             package_event_router,
             causal_scopes: Arc::new(crate::package_event_router::CausalScopeTable::new()),
             unfinished_finishes: Mutex::new(VecDeque::new()),
+            unfinished_reserved: Mutex::new(None),
             event_plane_owner_ops: std::cell::RefCell::new(
                 crate::package_event_router::EventPlaneOwnerOps::default(),
             ),
@@ -484,6 +487,11 @@ impl HubRuntime {
                 .lock()
                 .map(|pending| !pending.is_empty())
                 .unwrap_or(false)
+            || self
+                .unfinished_reserved
+                .lock()
+                .map(|reserved| reserved.is_some())
+                .unwrap_or(false)
     }
 
     pub fn apply_event_plane_owner_ops(&self) -> Vec<crate::package_event_router::OwnerOp> {
@@ -502,37 +510,94 @@ impl HubRuntime {
     }
 
     fn harvest_publish_releases(&self) {
-        while let Some(op) = self.entity_publish_bridge.take_release() {
+        let started = Instant::now();
+        let mut applied = 0;
+        while applied < CAUSAL_FLUSH_MAX && started.elapsed() < Duration::from_millis(8) {
+            let Some(op) = self.entity_publish_bridge.take_release() else {
+                break;
+            };
             if let CausalAdmitResult::Retry(op) = self.causal_scopes.try_admit(op) {
-                let _ = self.entity_publish_bridge.park_release(op);
+                self.keep_or_retract(self.entity_publish_bridge.park_release(op));
                 break;
             }
+            applied += 1;
         }
     }
 
     fn retry_unfinished_finishes(&self) {
+        if let Ok(mut reserved) = self.unfinished_reserved.lock()
+            && let Some(op) = reserved.take()
+            && let CausalAdmitResult::Retry(op) = self.causal_scopes.try_admit(op)
+        {
+            *reserved = Some(op);
+            return;
+        }
         let Ok(mut pending) = self.unfinished_finishes.lock() else {
             return;
         };
+        let started = Instant::now();
         let mut leftover = VecDeque::new();
-        while let Some(op) = pending.pop_front() {
-            if let CausalAdmitResult::Retry(op) = self.causal_scopes.try_admit(op) {
-                leftover.push_back(op);
+        let mut applied = 0;
+        while applied < CAUSAL_FLUSH_MAX && started.elapsed() < Duration::from_millis(8) {
+            let Some(op) = pending.pop_front() else {
+                break;
+            };
+            match self.causal_scopes.try_admit(op) {
+                CausalAdmitResult::Applied => applied += 1,
+                CausalAdmitResult::Retry(op) => {
+                    leftover.push_front(op);
+                    break;
+                }
             }
         }
+        leftover.append(&mut pending);
         *pending = leftover;
     }
 
-    fn keep_unfinished_finish(&self, op: CausalOp) {
-        if let Ok(mut pending) = self.unfinished_finishes.lock() {
+    fn keep_unfinished_finish(&self, op: CausalOp) -> CausalAdmitResult {
+        if let Ok(mut pending) = self.unfinished_finishes.lock()
+            && pending.len() < CAUSAL_PENDING_MAX
+        {
             pending.push_back(op);
+            return CausalAdmitResult::Applied;
+        }
+        if let Ok(mut reserved) = self.unfinished_reserved.lock()
+            && reserved.is_none()
+        {
+            *reserved = Some(op);
+            return CausalAdmitResult::Applied;
+        }
+        CausalAdmitResult::Retry(op)
+    }
+
+    fn keep_if_retry(&self, result: CausalAdmitResult) -> CausalAdmitResult {
+        match result {
+            CausalAdmitResult::Applied => CausalAdmitResult::Applied,
+            CausalAdmitResult::Retry(op) => self.keep_unfinished_finish(op),
         }
     }
 
-    fn keep_if_retry(&self, result: CausalAdmitResult) {
-        if let CausalAdmitResult::Retry(op) = result {
-            self.keep_unfinished_finish(op);
+    fn keep_or_retract(&self, result: CausalAdmitResult) {
+        if let CausalAdmitResult::Retry(op) = self.keep_if_retry(result)
+            && let CausalOp::Release { scope_id, identity } = op
+        {
+            let _ = self.causal_scopes.try_retract(scope_id, identity);
         }
+    }
+
+    #[must_use]
+    pub fn unfinished_finish_count(&self) -> usize {
+        let queued = self
+            .unfinished_finishes
+            .lock()
+            .map(|pending| pending.len())
+            .unwrap_or(0);
+        let reserved = self
+            .unfinished_reserved
+            .lock()
+            .map(|reserved| reserved.is_some() as usize)
+            .unwrap_or(0);
+        queued + reserved
     }
 
     /// Return the startup reconciliation decisions made against the core daemon registry.
@@ -1437,7 +1502,7 @@ impl HubRuntime {
         mutation_seq: u64,
         result: &PackageEntityPublishResult,
     ) {
-        self.keep_if_retry(self.admit_causal_op(settle_entity_publish_op(
+        self.keep_or_retract(self.admit_causal_op(settle_entity_publish_op(
             family,
             scope_id,
             plugin_key,
@@ -1449,7 +1514,7 @@ impl HubRuntime {
 
     fn release_resync_leases(&self, leases: BTreeSet<(u64, String)>) {
         for (scope_id, family) in leases {
-            self.keep_if_retry(self.admit_causal_op(CausalOp::Release {
+            self.keep_or_retract(self.admit_causal_op(CausalOp::Release {
                 scope_id,
                 identity: LeaseIdentity::ProviderResyncNeed { family },
             }));
@@ -1466,7 +1531,7 @@ impl HubRuntime {
             return;
         };
         let op = self.prepare_finish_op(&lease, scheduled_resync);
-        self.keep_if_retry(self.admit_causal_op(op));
+        self.keep_or_retract(self.admit_causal_op(op));
     }
 
     fn prepare_finish_op(&self, lease: &EntityMutationLease, scheduled_resync: bool) -> CausalOp {
@@ -1537,7 +1602,7 @@ impl HubRuntime {
             });
         }
         for discarded in family.take_discarded_pending_leases() {
-            self.keep_if_retry(self.admit_causal_op(CausalOp::Release {
+            self.keep_or_retract(self.admit_causal_op(CausalOp::Release {
                 scope_id: discarded.scope_id,
                 identity: LeaseIdentity::AdmittedEntityMutation {
                     family: discarded.family,
@@ -1650,7 +1715,7 @@ impl HubRuntime {
             if let Some(mut family) = state.remove(family_name) {
                 let pending_leases = std::mem::take(&mut family.pending_leases);
                 for lease in pending_leases.into_values() {
-                    self.keep_if_retry(self.admit_causal_op(CausalOp::Release {
+                    self.keep_or_retract(self.admit_causal_op(CausalOp::Release {
                         scope_id: lease.scope_id,
                         identity: LeaseIdentity::AdmittedEntityMutation {
                             family: lease.family,
@@ -1668,7 +1733,7 @@ impl HubRuntime {
         fanout.retain(|item| {
             if families.contains(item.mutation.entity_type()) {
                 if let Some(lease) = item.lease.clone() {
-                    self.keep_if_retry(self.admit_causal_op(CausalOp::Release {
+                    self.keep_or_retract(self.admit_causal_op(CausalOp::Release {
                         scope_id: lease.scope_id,
                         identity: LeaseIdentity::AdmittedEntityMutation {
                             family: lease.family,
@@ -2045,7 +2110,7 @@ impl HubRuntime {
             })),
         });
         if let Some(scope_id) = scope_id {
-            self.keep_if_retry(self.admit_causal_op(CausalOp::Release {
+            self.keep_or_retract(self.admit_causal_op(CausalOp::Release {
                 scope_id,
                 identity: crate::package_event_router::LeaseIdentity::ProviderInFlight {
                     request_id: request_id.0.clone(),

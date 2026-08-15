@@ -14,7 +14,8 @@ use botster_core::{
     SessionId,
 };
 use botster_hub::package_event_router::{
-    CAUSAL_FLUSH_MAX, CAUSAL_PENDING_MAX, CausalAdmitResult, LeaseIdentity,
+    CAUSAL_FLUSH_MAX, CAUSAL_PENDING_MAX, CausalAdmitResult, CausalOp, LeaseIdentity,
+    release_or_retract,
 };
 use botster_hub::{
     DataDirectoryOption, HostIdentityOptions, HubClientApi, HubClientRequest,
@@ -4479,4 +4480,152 @@ fn never_queued_publish_releases_after_full_causal_path() {
         !scopes.is_live(live),
         "NeverQueued must retract or later close the pending publish lease"
     );
+}
+
+#[test]
+fn never_queued_release_stays_owned_when_release_queue_is_full() {
+    let registry = install_named_lua_package(
+        "lease-bridge-full",
+        lease_probe_plugin(),
+        lease_probe_manifest(),
+    );
+    let mut hub = explicit_runtime("lease-bridge-full");
+    hub.load_lua_plugin_package(&registry, "lease-probe")
+        .expect("load");
+    let scopes = hub.causal_scopes().clone();
+    let live = scopes
+        .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+            plugin_key: "lease-probe".into(),
+        }))
+        .expect("live");
+    let mut fillers = Vec::new();
+    for index in 0..CAUSAL_PENDING_MAX {
+        let scope = scopes
+            .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+                plugin_key: format!("fill{index}"),
+            }))
+            .expect("mint");
+        fillers.push(scope);
+    }
+    let bridge = hub.entity_publish_bridge();
+    scopes.test_with_inner_held(|| {
+        for (index, scope) in fillers.iter().enumerate() {
+            assert_eq!(
+                scopes.transfer(
+                    *scope,
+                    LeaseIdentity::PendingEntityPublish {
+                        plugin_key: format!("fill{index}"),
+                    },
+                    [LeaseIdentity::AdmittedEntityMutation {
+                        family: "f".into(),
+                        seq: index as u64,
+                    }],
+                ),
+                CausalAdmitResult::Applied
+            );
+        }
+        for (index, scope) in fillers.iter().enumerate() {
+            assert_eq!(
+                bridge.park_release(CausalOp::Release {
+                    scope_id: *scope,
+                    identity: LeaseIdentity::AdmittedEntityMutation {
+                        family: "f".into(),
+                        seq: index as u64,
+                    },
+                }),
+                CausalAdmitResult::Applied
+            );
+        }
+        assert_eq!(bridge.release_count(), CAUSAL_PENDING_MAX);
+        let overflow = release_or_retract(
+            &scopes,
+            live,
+            LeaseIdentity::PendingEntityPublish {
+                plugin_key: "lease-probe".into(),
+            },
+        );
+        let CausalAdmitResult::Retry(overflow) = overflow else {
+            panic!("full table and held inner must return the release");
+        };
+        assert_eq!(bridge.park_release(overflow), CausalAdmitResult::Applied);
+        assert_eq!(bridge.release_count(), CAUSAL_PENDING_MAX + 1);
+    });
+    let _ = hub.apply_event_plane_owner_ops();
+    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+        let _ = hub.apply_event_plane_owner_ops();
+        let _ = scopes.flush_pending();
+    }
+    assert!(!scopes.is_live(live));
+}
+
+#[test]
+fn unfinished_finishes_are_bounded_and_sliced() {
+    let registry = install_named_lua_package(
+        "lease-unfinished",
+        lease_probe_plugin(),
+        lease_probe_manifest(),
+    );
+    let mut hub = explicit_runtime("lease-unfinished");
+    hub.load_lua_plugin_package(&registry, "lease-probe")
+        .expect("load");
+    let scopes = hub.causal_scopes().clone();
+    let first_scope = scopes.mint_with_lease(None).expect("first");
+    let published = hub.invoke_plugin(scoped_command(
+        "lease-probe",
+        "publish",
+        serde_json::json!({ "seq": 1 }),
+        first_scope,
+    ));
+    assert!(matches!(
+        published.result,
+        PluginInvocationResult::Completed(_)
+    ));
+    let taken = hub.take_leased_package_entity_fanout();
+    assert_eq!(taken.len(), 1);
+    let mut fillers = Vec::new();
+    for index in 0..CAUSAL_PENDING_MAX {
+        fillers.push(
+            scopes
+                .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+                    plugin_key: format!("fill{index}"),
+                }))
+                .expect("mint"),
+        );
+    }
+    scopes.test_with_inner_held(|| {
+        for (index, scope) in fillers.iter().enumerate() {
+            assert_eq!(
+                scopes.transfer(
+                    *scope,
+                    LeaseIdentity::PendingEntityPublish {
+                        plugin_key: format!("fill{index}"),
+                    },
+                    [LeaseIdentity::AdmittedEntityMutation {
+                        family: "f".into(),
+                        seq: index as u64,
+                    }],
+                ),
+                CausalAdmitResult::Applied
+            );
+        }
+        for _ in 0..CAUSAL_PENDING_MAX {
+            hub.finish_package_entity_mutation_fanout(&taken[0], false);
+        }
+        assert_eq!(hub.unfinished_finish_count(), CAUSAL_PENDING_MAX);
+        hub.finish_package_entity_mutation_fanout(&taken[0], false);
+        assert_eq!(hub.unfinished_finish_count(), CAUSAL_PENDING_MAX + 1);
+    });
+    let before = hub.unfinished_finish_count();
+    let _ = hub.apply_event_plane_owner_ops();
+    assert!(
+        hub.unfinished_finish_count() < before,
+        "owner turn must slice unfinished work: before={before} after={}",
+        hub.unfinished_finish_count()
+    );
+    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+        let _ = hub.apply_event_plane_owner_ops();
+        let _ = scopes.flush_pending();
+    }
+    assert_eq!(hub.unfinished_finish_count(), 0);
+    assert!(!scopes.is_live(first_scope));
 }
