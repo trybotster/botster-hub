@@ -567,21 +567,27 @@ fn external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup() {
                     .any(|window| window == expected),
                 "round {round} must observe live bytes before shutdown, got {concatenated:?}"
             );
-
-            // Force the process-exit / ShutdownSession race: the producer has
-            // already written and exited. One more ReadScreen can park that
-            // exit, then peer close happens before host ShutdownSession.
-            let _ = offer_peer
-                .encrypted_request(
-                    &stream_key,
-                    &botster_hub_client::DaemonRequest::ReadScreen {
-                        session_id: session_id.clone(),
-                    },
-                )
-                .await;
             let _ = offer_peer.peer.close().await;
         });
 
+        let observed_exit = (0..40).any(|_| {
+            let listed = botster_hub_client::request(
+                &endpoint,
+                botster_hub_client::DaemonRequest::ListSessions,
+            )
+            .ok()
+            .and_then(|response| {
+                response.sessions.into_iter().find_map(|session| {
+                    (session.session_id == session_id).then_some(session.lifecycle)
+                })
+            });
+            if listed.as_deref() == Some("exited") {
+                true
+            } else {
+                thread::sleep(Duration::from_millis(50));
+                false
+            }
+        });
         let shutdown = botster_hub_client::request(
             &endpoint,
             botster_hub_client::DaemonRequest::ShutdownSession {
@@ -589,20 +595,36 @@ fn external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup() {
             },
         )
         .expect("shutdown after live WebRTC exit");
-        assert!(
-            matches!(
+        if observed_exit {
+            assert_eq!(
                 shutdown.kind,
-                botster_hub_client::DaemonResponseKind::Events
-                    | botster_hub_client::DaemonResponseKind::SessionCleanup
-            ),
-            "round {round} ShutdownSession must be idempotent cleanup, got {:?}",
-            shutdown.kind
-        );
-        assert_ne!(
-            shutdown.kind,
-            botster_hub_client::DaemonResponseKind::OperatorError,
-            "round {round} ShutdownSession must not return OperatorError: {shutdown:?}"
-        );
+                botster_hub_client::DaemonResponseKind::SessionCleanup,
+                "round {round} observed exit must return SessionCleanup, got {:?}",
+                shutdown.kind
+            );
+            let cleanup = shutdown.cleanup.expect("cleanup body");
+            assert_eq!(cleanup.session_id, session_id);
+            assert_eq!(cleanup.outcome, "already_exited");
+        } else {
+            assert!(
+                matches!(
+                    shutdown.kind,
+                    botster_hub_client::DaemonResponseKind::Events
+                        | botster_hub_client::DaemonResponseKind::SessionCleanup
+                        | botster_hub_client::DaemonResponseKind::OperatorError
+                ),
+                "round {round} ShutdownSession must stay on a typed host frame, got {:?}",
+                shutdown.kind
+            );
+            if shutdown.kind == botster_hub_client::DaemonResponseKind::OperatorError {
+                let error = shutdown.error.as_ref().expect("operator error body");
+                assert!(
+                    error.code == "runtime_error" || error.code == "state_error",
+                    "round {round} Active shutdown failure must keep the original error, got {error:?}"
+                );
+                assert_eq!(error.operation, "shutdown");
+            }
+        }
     }
 
     hub.shutdown().expect("shutdown isolated hub");

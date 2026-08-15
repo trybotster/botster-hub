@@ -3247,23 +3247,17 @@ fn handle_runtime_control_request(
                 },
             ) {
                 Ok(response) => response,
-                Err(_) => {
+                Err(error) => {
+                    let now = tick(logical_clock);
                     observe_lifecycle_turn(runtime, now);
-                    let cleanup = match classify_shutdown_session(runtime, &session_id)? {
-                        ShutdownSessionClassification::Cleanup(cleanup) => cleanup,
-                        ShutdownSessionClassification::Missing => {
-                            suppress_unix_session_close_events(pending_runtime, &session_id);
-                            suppress_webrtc_session_close_events(pending_runtime, &session_id);
-                            return Ok(daemon_unknown_session_cleanup(&session_id));
-                        }
-                        ShutdownSessionClassification::Active => DaemonSessionCleanup {
-                            session_id: session_id.clone(),
-                            outcome: "already_exited".to_string(),
-                        },
-                    };
+                    let response = shutdown_error_response(
+                        classify_shutdown_session(runtime, &session_id)?,
+                        error,
+                        &session_id,
+                    )?;
                     suppress_unix_session_close_events(pending_runtime, &session_id);
                     suppress_webrtc_session_close_events(pending_runtime, &session_id);
-                    return Ok(daemon_session_cleanup(cleanup));
+                    return Ok(response);
                 }
             };
             suppress_unix_session_close_events(pending_runtime, &session_id);
@@ -4441,6 +4435,35 @@ fn queue_webrtc_subscription_closed_events(
                 !session_suppresses_terminal_subscription_closed(runtime, session_id)
             });
         }
+    }
+}
+
+fn shutdown_error_is_already_gone(error: &crate::HubClientError) -> bool {
+    matches!(
+        error,
+        crate::HubClientError::Runtime {
+            operation: crate::HubClientOperation::Shutdown,
+            kind: crate::HubClientRuntimeErrorKind::UnknownSession,
+            ..
+        }
+    )
+}
+
+fn shutdown_error_response(
+    classification: ShutdownSessionClassification,
+    error: crate::HubClientError,
+    session_id: &str,
+) -> DaemonTransportResult<DaemonResponse> {
+    match classification {
+        ShutdownSessionClassification::Cleanup(cleanup) => Ok(daemon_session_cleanup(cleanup)),
+        ShutdownSessionClassification::Missing => Ok(daemon_unknown_session_cleanup(session_id)),
+        ShutdownSessionClassification::Active if shutdown_error_is_already_gone(&error) => {
+            Ok(daemon_session_cleanup(DaemonSessionCleanup {
+                session_id: session_id.to_string(),
+                outcome: "already_exited".to_string(),
+            }))
+        }
+        ShutdownSessionClassification::Active => Err(DaemonTransportError::Client(error)),
     }
 }
 
@@ -7508,6 +7531,97 @@ mod tests {
         assert!(error.diagnostics.iter().any(|diagnostic| {
             diagnostic.kind == botster_hub_client::DaemonDiagnosticKind::WorkerCompatibility
         }));
+    }
+
+    fn shutdown_runtime_error(kind: crate::HubClientRuntimeErrorKind) -> crate::HubClientError {
+        crate::HubClientError::Runtime {
+            request_id: RequestId("daemon-sessions-shutdown".to_string()),
+            operation: crate::HubClientOperation::Shutdown,
+            kind,
+        }
+    }
+
+    #[test]
+    fn shutdown_unknown_session_error_while_active_is_already_exited_cleanup() {
+        let response = shutdown_error_response(
+            ShutdownSessionClassification::Active,
+            shutdown_runtime_error(crate::HubClientRuntimeErrorKind::UnknownSession),
+            "live-session",
+        )
+        .expect("unknown-session while Active is cleanup");
+        assert_eq!(response.kind, DaemonResponseKind::SessionCleanup);
+        let cleanup = response.cleanup.expect("cleanup body");
+        assert_eq!(cleanup.session_id, "live-session");
+        assert_eq!(cleanup.outcome, "already_exited");
+    }
+
+    #[test]
+    fn shutdown_exited_classification_returns_cleanup_for_any_shutdown_error() {
+        let response = shutdown_error_response(
+            ShutdownSessionClassification::Cleanup(DaemonSessionCleanup {
+                session_id: "exited-session".to_string(),
+                outcome: "already_exited".to_string(),
+            }),
+            shutdown_runtime_error(crate::HubClientRuntimeErrorKind::Runtime),
+            "exited-session",
+        )
+        .expect("Cleanup classification stays SessionCleanup");
+        assert_eq!(response.kind, DaemonResponseKind::SessionCleanup);
+        let cleanup = response.cleanup.expect("cleanup body");
+        assert_eq!(cleanup.session_id, "exited-session");
+        assert_eq!(cleanup.outcome, "already_exited");
+    }
+
+    #[test]
+    fn shutdown_active_runtime_error_remains_operator_error() {
+        let error = shutdown_error_response(
+            ShutdownSessionClassification::Active,
+            shutdown_runtime_error(crate::HubClientRuntimeErrorKind::Runtime),
+            "live-session",
+        )
+        .expect_err("Active plus Runtime stays an error");
+        assert!(matches!(
+            error,
+            DaemonTransportError::Client(crate::HubClientError::Runtime {
+                operation: crate::HubClientOperation::Shutdown,
+                kind: crate::HubClientRuntimeErrorKind::Runtime,
+                ..
+            })
+        ));
+        let response = daemon_operator_error(match error {
+            DaemonTransportError::Client(error) => error,
+            other => panic!("expected Client error, got {other:?}"),
+        });
+        assert_eq!(response.kind, DaemonResponseKind::OperatorError);
+        let operator = response.error.expect("operator error body");
+        assert_eq!(operator.code, "runtime_error");
+        assert_eq!(operator.operation, "shutdown");
+    }
+
+    #[test]
+    fn shutdown_active_state_error_remains_operator_error() {
+        let error = shutdown_error_response(
+            ShutdownSessionClassification::Active,
+            shutdown_runtime_error(crate::HubClientRuntimeErrorKind::State),
+            "live-session",
+        )
+        .expect_err("Active plus State stays an error");
+        assert!(matches!(
+            error,
+            DaemonTransportError::Client(crate::HubClientError::Runtime {
+                operation: crate::HubClientOperation::Shutdown,
+                kind: crate::HubClientRuntimeErrorKind::State,
+                ..
+            })
+        ));
+        let response = daemon_operator_error(match error {
+            DaemonTransportError::Client(error) => error,
+            other => panic!("expected Client error, got {other:?}"),
+        });
+        assert_eq!(response.kind, DaemonResponseKind::OperatorError);
+        let operator = response.error.expect("operator error body");
+        assert_eq!(operator.code, "state_error");
+        assert_eq!(operator.operation, "shutdown");
     }
 
     #[test]

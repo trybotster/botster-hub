@@ -548,11 +548,8 @@ fn cli_sessions_spawn_and_list_route_through_client_api() {
             subscription_id: "botster-hub-cli-subscription".to_string(),
         })
         .expect("reattach after detach");
-    let screen_before = wait_for_read_screen_contains(
-        &mut connection,
-        "runtime-session",
-        "runtime-ok",
-    );
+    let screen_before =
+        wait_for_read_screen_contains(&mut connection, "runtime-session", "runtime-ok");
     assert!(
         screen_before.contains("runtime-ok"),
         "visible text after reattach is on ReadScreen: {screen_before:?}"
@@ -618,11 +615,8 @@ fn cli_short_lived_session_shutdown_returns_structured_cleanup() {
             subscription_id: "botster-hub-cli-subscription".to_string(),
         })
         .expect("attach short-lived");
-    let screen_before = wait_for_read_screen_contains(
-        &mut connection,
-        "runtime-session",
-        "runtime-ok",
-    );
+    let screen_before =
+        wait_for_read_screen_contains(&mut connection, "runtime-session", "runtime-ok");
     assert!(
         screen_before.contains("runtime-ok"),
         "short-lived visible text is on ReadScreen: {screen_before:?}"
@@ -2262,11 +2256,8 @@ fn session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnec
             subscription_id: "terminal-alongside-entities".to_string(),
         })
         .expect("attach while entity pump is active");
-    let mut terminal_output = wait_for_read_screen_contains(
-        &mut terminal,
-        "entity-session",
-        "entity-ready",
-    );
+    let mut terminal_output =
+        wait_for_read_screen_contains(&mut terminal, "entity-session", "entity-ready");
     assert!(
         terminal_output.contains("entity-before") && terminal_output.contains("entity-ready"),
         "entity fixture must publish semantic readiness through ReadScreen, \
@@ -2399,16 +2390,14 @@ fn session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnec
                 cols: 101,
             },
         );
-        listed_lifecycle = botster_hub_client::request(
-            &endpoint,
-            botster_hub_client::DaemonRequest::ListSessions,
-        )
-        .ok()
-        .and_then(|response| {
-            response.sessions.iter().find_map(|session| {
-                (session.session_id == "entity-session").then(|| session.lifecycle.clone())
-            })
-        });
+        listed_lifecycle =
+            botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::ListSessions)
+                .ok()
+                .and_then(|response| {
+                    response.sessions.iter().find_map(|session| {
+                        (session.session_id == "entity-session").then(|| session.lifecycle.clone())
+                    })
+                });
         if listed_lifecycle.as_deref() == Some("exited") || listed_lifecycle.is_none() {
             break;
         }
@@ -2480,9 +2469,7 @@ fn session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnec
         match first.next_frame() {
             Ok(frame) => {
                 if let botster_hub_client::DaemonEntityFrame::Remove {
-                    snapshot_seq,
-                    id,
-                    ..
+                    snapshot_seq, id, ..
                 } = &frame
                     && id == "entity-session"
                     && *snapshot_seq > exit_sequence
@@ -3160,16 +3147,14 @@ fn session_projection_observes_exit_without_subscribers_then_later_snapshot_incl
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut listed = None;
     while Instant::now() < deadline {
-        listed = botster_hub_client::request(
-            &endpoint,
-            botster_hub_client::DaemonRequest::ListSessions,
-        )
-        .ok()
-        .and_then(|response| {
-            response.sessions.iter().find_map(|session| {
-                (session.session_id == "zero-sub-exit").then(|| session.lifecycle.clone())
-            })
-        });
+        listed =
+            botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::ListSessions)
+                .ok()
+                .and_then(|response| {
+                    response.sessions.iter().find_map(|session| {
+                        (session.session_id == "zero-sub-exit").then(|| session.lifecycle.clone())
+                    })
+                });
         if listed.as_deref() == Some("exited") {
             break;
         }
@@ -3203,6 +3188,70 @@ fn session_projection_observes_exit_without_subscribers_then_later_snapshot_incl
     subscription
         .unsubscribe()
         .expect("unsubscribe later subscriber");
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn shutdown_after_observed_exit_returns_session_cleanup() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("shutdown-after-observed-exit");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("test config has local socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: "observed-exit-shutdown".to_string(),
+            command: "sleep 0.1".to_string(),
+        },
+    )
+    .expect("spawn short-lived session");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut listed = None;
+    while Instant::now() < deadline {
+        listed =
+            botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::ListSessions)
+                .ok()
+                .and_then(|response| {
+                    response.sessions.iter().find_map(|session| {
+                        (session.session_id == "observed-exit-shutdown")
+                            .then(|| session.lifecycle.clone())
+                    })
+                });
+        if listed.as_deref() == Some("exited") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        listed.as_deref(),
+        Some("exited"),
+        "owner loop must observe natural exit before ShutdownSession"
+    );
+    let shutdown = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::ShutdownSession {
+            session_id: "observed-exit-shutdown".to_string(),
+        },
+    )
+    .expect("shutdown after observed exit");
+    assert_eq!(
+        shutdown.kind,
+        botster_hub_client::DaemonResponseKind::SessionCleanup,
+        "ShutdownSession after observed exit must be cleanup, got {:?}",
+        shutdown.kind
+    );
+    let cleanup = shutdown.cleanup.expect("cleanup body");
+    assert_eq!(cleanup.session_id, "observed-exit-shutdown");
+    assert_eq!(cleanup.outcome, "already_exited");
     shutdown_cli_daemon(&data_dir, child);
 }
 
@@ -3582,14 +3631,15 @@ fn session_entity_subscription_observes_attached_natural_exit_with_pending_egres
         .find("pending-second")
         .or_else(|| screen_text.find("pending-second"));
     assert!(
-        first_pos.zip(second_pos).is_some_and(|(first, second)| first < second),
+        first_pos
+            .zip(second_pos)
+            .is_some_and(|(first, second)| first < second),
         "retained terminal output must preserve production order, drain={retained_output:?} screen={screen_text:?}"
     );
     assert!(
-        retained_events.iter().all(|event| !matches!(
-            event,
-            botster_hub_client::DaemonEvent::ProcessExit { .. }
-        )),
+        retained_events
+            .iter()
+            .all(|event| !matches!(event, botster_hub_client::DaemonEvent::ProcessExit { .. })),
         "host Drain must not translate ProcessExit: drain={retained_events:?} screen={screen_text:?}"
     );
 
@@ -4976,7 +5026,8 @@ fn socket_drain_receives_ready_before_later_snapshot_frames() {
     let snapshot = snapshot.expect("latest queued resize must apply on CaptureSnapshot");
     assert_eq!((snapshot.rows, snapshot.cols), (40, 120));
 
-    let screen = wait_for_read_screen_contains(&mut connection, session_id, "echo:POST-BARRIER-MARKER");
+    let screen =
+        wait_for_read_screen_contains(&mut connection, session_id, "echo:POST-BARRIER-MARKER");
     assert!(
         screen.contains("echo:POST-BARRIER-MARKER"),
         "queued input must apply after attach: {screen:?}"
@@ -5124,7 +5175,9 @@ fn dropped_ready_attach_releases_barrier_for_a_new_subscription() {
         );
         for _ in 0..8 {
             let flushed = first
-                .request(&botster_hub_client::DaemonRequest::drain_session(session_id))
+                .request(&botster_hub_client::DaemonRequest::drain_session(
+                    session_id,
+                ))
                 .expect("flush pre-attach output");
             if flushed.events.is_empty() {
                 break;
@@ -5364,7 +5417,8 @@ fn socket_concurrent_attaches_queue_and_keep_scoped_routes() {
             data: "CONCURRENT-POST\n".to_string(),
         })
         .expect("input after concurrent attaches");
-    let live_b = wait_for_read_screen_contains(&mut connection_b, session_id, "echo:CONCURRENT-POST");
+    let live_b =
+        wait_for_read_screen_contains(&mut connection_b, session_id, "echo:CONCURRENT-POST");
     assert!(
         live_b.contains("echo:CONCURRENT-POST"),
         "B live output is on ReadScreen: {live_b:?}"
