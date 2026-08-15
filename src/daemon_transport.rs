@@ -8645,16 +8645,7 @@ mod tests {
         }
 
         fn retire_owned_sessions(&mut self) -> Result<(), String> {
-            let workers: Vec<(u32, String)> = self
-                .runtime
-                .list_sessions()
-                .into_iter()
-                .flatten()
-                .filter_map(|session| {
-                    let pid = session.process.and_then(|process| process.pid)?;
-                    process_command_line(pid).map(|command| (pid, command))
-                })
-                .collect();
+            let socket_dir = core_worker_socket_dir(&self.data_directory);
             let mut errors = Vec::new();
             for session_id in self.session_ids.drain(..) {
                 let _ = self
@@ -8662,24 +8653,11 @@ mod tests {
                     .shutdown_session(session_id.clone(), tick(&mut self.clock));
                 let _ = self.runtime.remove_terminal_session(&session_id);
             }
-            let wait_deadline = Instant::now() + Duration::from_secs(5);
-            for (pid, command) in &workers {
-                if wait_for_process_exit(*pid, wait_deadline) {
-                    continue;
-                }
-                if process_command_line(*pid).as_deref() != Some(command.as_str()) {
-                    continue;
-                }
-                let _ = std::process::Command::new("kill")
-                    .args(["-KILL", &pid.to_string()])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status();
-                if !wait_for_process_exit(*pid, wait_deadline)
-                    && process_command_line(*pid).as_deref() == Some(command.as_str())
-                {
-                    errors.push(format!("worker pid {pid} still running after shutdown"));
-                }
+            if let Err(error) = self.runtime.shutdown_core_for_test(tick(&mut self.clock)) {
+                errors.push(format!("core shutdown: {error}"));
+            }
+            if let Err(error) = wait_for_owned_workers_released(&socket_dir) {
+                errors.push(error);
             }
             if let Err(error) = std::fs::remove_dir_all(&self.data_directory) {
                 errors.push(format!("remove {}: {error}", self.data_directory.display()));
@@ -8715,40 +8693,80 @@ mod tests {
         }
     }
 
-    fn process_command_line(pid: u32) -> Option<String> {
+    fn core_worker_socket_dir(data_dir: &Path) -> PathBuf {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        data_dir.to_path_buf().hash(&mut hasher);
+        std::env::temp_dir().join(format!("bcd-{:x}", hasher.finish()))
+    }
+
+    fn session_workers_for_socket_dir(socket_dir: &Path) -> Vec<(u32, String)> {
+        let marker = socket_dir.to_string_lossy();
         let output = std::process::Command::new("ps")
-            .args(["-p", &pid.to_string(), "-o", "args="])
+            .args(["-ax", "-o", "pid=,args="])
             .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let command = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if command.is_empty() {
-            None
-        } else {
-            Some(command)
-        }
+            .ok();
+        let Some(output) = output else {
+            return Vec::new();
+        };
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                let (pid, args) = line.split_once(char::is_whitespace)?;
+                if !args.contains("botster-session-worker") || !args.contains(marker.as_ref()) {
+                    return None;
+                }
+                Some((pid.parse().ok()?, args.to_string()))
+            })
+            .collect()
     }
 
-    fn process_is_alive(pid: u32) -> bool {
-        std::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
-    }
-
-    fn wait_for_process_exit(pid: u32, deadline: Instant) -> bool {
-        while Instant::now() < deadline {
-            if !process_is_alive(pid) {
-                return true;
+    fn wait_for_owned_workers_released(socket_dir: &Path) -> Result<(), String> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let remaining = session_workers_for_socket_dir(socket_dir);
+            let sockets_released = !socket_dir.exists()
+                || std::fs::read_dir(socket_dir)
+                    .map(|entries| entries.count() == 0)
+                    .unwrap_or(true);
+            if remaining.is_empty() && sockets_released {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                if remaining.is_empty() && sockets_released {
+                    return Ok(());
+                }
+                for (pid, command) in &remaining {
+                    if !command.contains("botster-session-worker")
+                        || !command.contains(&*socket_dir.to_string_lossy())
+                    {
+                        continue;
+                    }
+                    let _ = std::process::Command::new("kill")
+                        .args(["-KILL", &pid.to_string()])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                }
+                thread::sleep(Duration::from_millis(50));
+                let leftover = session_workers_for_socket_dir(socket_dir);
+                if leftover.is_empty()
+                    && (!socket_dir.exists()
+                        || std::fs::read_dir(socket_dir)
+                            .map(|entries| entries.count() == 0)
+                            .unwrap_or(true))
+                {
+                    return Ok(());
+                }
+                return Err(format!(
+                    "owned session workers still hold {}: leftover={}",
+                    socket_dir.display(),
+                    leftover.len()
+                ));
             }
             thread::sleep(Duration::from_millis(10));
         }
-        !process_is_alive(pid)
     }
 
     fn package_control_config(data_directory: PathBuf) -> crate::HubConfig {

@@ -14,7 +14,7 @@ Plan: `docs/plans/cold-cut-terminal-drains-and-translation-from-the-production-p
 | Worktree HEAD before edits | `959c58f55726d098299cced8af151d8f496f41e3` |
 | Locked Core SHA | `aef6516d5809d563961ed7fdd07da29a7b4edddc` |
 | Merge policy | direct into `main`; no PR |
-| Review follow-up | `review_1786828089_377604` on `9462ab7` |
+| Review follow-up | `review_1786829214_495930` on `7d41db7` |
 
 Independent routing matched the approved plan. This run did not infer the repository from the ambient directory.
 
@@ -67,7 +67,7 @@ Not loaded: [[project-pipelines-playbook]] (package/plugin paths out of scope).
 - `packages/hub-test-support/**` (0.1.37 / revision 42, regenerated)
 - `README.md`, `docs/client-protocol.md`
 - Tests under `tests/hub_client_api_test.rs`, `tests/hub_local_runtime_test.rs`, `tests/hub_daemon_lifecycle/*`
-- Plan and this report (Review follow-up on `review_1786828089_377604`)
+- Plan and this report (Review follow-up on `review_1786829214_495930`)
 
 ## Ownership boundaries preserved
 
@@ -232,6 +232,16 @@ This visit:
 - `retire_owned_sessions` shuts down every tracked session through `HubRuntime::shutdown_session`. It waits for each recorded worker to exit before `Drop` returns. SIGKILL is used only when the live process command line still matches the saved worker identity. Cleanup failures panic outside unwind and print during unwind.
 - Required sequence with no manual delay or cleanup: pass (5.29s), reset ablation fail (exit 101), immediate restore pass (5.18s), second pass (5.25s). This worktree had 0 leftover workers after that sequence.
 - One `./test.sh --locked` run failed `shutdown_session_classifies_parked_exit_beyond_one_baseline_page` with Events. Isolated rerun passed (2.65s). A second full wrapper passed (lifecycle 206/1 ignored, lib 287, parked-exit and exact-bytes green).
+
+Review `review_1786829214_495930` required one follow-up on `7d41db7`:
+
+- `finding_1786829214_834265` — cleanup waited on `DaemonSession.process.pid`, which is the runtime-owned child PID, not the session-worker PID. Immediate restored spawn failed at `aaa-00`.
+
+This visit:
+
+- Cleanup no longer reads child PIDs. It shuts down each tracked session, then calls `HubRuntime::shutdown_core_for_test` (`CoreDaemon::shutdown(None)`).
+- A bounded barrier waits until no `botster-session-worker` process holds this runtime's Core control-socket directory (`bcd-<hash>`). SIGKILL is used only after that wait, and only when the live command line still names that worker and socket directory.
+- Required sequence with no manual delay: pass (5.00s), ablation fail (exit 101), immediate restore pass (5.07s), second pass (5.07s), 0 leftover worktree workers.
 
 ## Runtime-teardown lenses
 

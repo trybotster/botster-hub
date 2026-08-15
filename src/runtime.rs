@@ -2312,6 +2312,18 @@ impl HubRuntime {
             .shutdown(Some(session_id), now_seconds)
     }
 
+    /// Shut down every Core session and mark the daemon stopped.
+    #[cfg(test)]
+    pub(crate) fn shutdown_core_for_test(
+        &mut self,
+        now_seconds: u64,
+    ) -> Result<(), CoreDaemonError> {
+        self.core_daemon
+            .lock()
+            .expect("core daemon mutex")
+            .shutdown(None, now_seconds)
+    }
+
     fn reconcile_sessions(&mut self, now_seconds: u64) -> Result<(), CoreDaemonError> {
         self.reconciliation = HubSessionReconciliation::default();
         let reports = self
