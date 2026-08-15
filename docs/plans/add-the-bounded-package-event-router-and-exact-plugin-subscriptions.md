@@ -2,16 +2,14 @@
 
 ## Plan Review revision
 
-Plan Review `review_1786779559_826604` returned `changes_required`.
-The prior sync, admitted-holder, and lease-machine findings stay
-resolved at `4616ce3`. This fourth Plan visit answers the two
-narrower leftovers. It does not reopen config, schema, live-proof,
-playbook, or completion-evidence items.
+Plan Review `review_1786780157_760971` returned `changes_required`.
+The lossless owner-op and in-flight-lease findings stay resolved at
+`7ce1ac6`. This fifth Plan visit answers one leftover: workers
+cannot apply owner-thread-only ops.
 
 | Finding | Response |
 | --- | --- |
-| Owner-operation fallback can lose unload/reload | Remove the router-side `Mutex<VecDeque<OwnerOp>>` and the atomic name slot. Owner-loop `EventPlaneOwnerOps` retains keyed ops on the owner thread. Unload/reload does not complete until `try_apply` succeeds. Apply pending ops before ingress or delivery. Two-owner unload and unload-then-reload tests under a held router lock. |
-| Unload releases causal leases for live admitted work | Keep `EventInFlight` and `ProviderInFlight` until `CompletionDrain` or confirmed cancel. Unload stops new leases and drops only work that cannot execute. Mutation and resync leases stay until their owner-loop rows finish. Blocked admitted-invocation unload test. |
+| Worker ingress cannot apply owner-thread-only operations | Only the owner loop calls `try_apply`. Workers never read `EventPlaneOwnerOps`. While an owner op is pending, the old package generation stays active. `Applied` removes contracts/subscriptions under `RouterInner` before the daemon response completes. Ingress during the pending window uses the old generation. Ingress after `Applied` sees the new generation or a typed reject. |
 
 Earlier resolved findings stay resolved.
 Duplicate vault checklist `checklist_1786776879_257442` remains unused.
@@ -28,7 +26,7 @@ This visit keeps `checklist_1786776870_999225`.
 - Run: `run_1786776489_193956`.
 - Project: Botster Non-Blocking Event Plane, Stage B Hub slice.
 - Assigned worktree is the pipeline-created Hub worktree for this ticket.
-- First Plan commit: `97c1cdc`. Second: `5a5aa73`. Third: `4616ce3`.
+- Plan commits: `97c1cdc`, `5a5aa73`, `4616ce3`, `7ce1ac6`.
 - First Plan HEAD was `b1652b3`. `origin/main` at this visit: `b1652b3`.
   No new Hub main to merge.
 - Required Core pin, exact, all Git-visible members:
@@ -359,7 +357,7 @@ OwnerOp { kind: Unload | Reload, generation }
 Rules:
 
 1. A package unload/reload request records the keyed `OwnerOp` and
-   calls `router.try_apply(op)`.
+   the owner loop calls `router.try_apply(op)`.
 2. The daemon request stays open until `try_apply` returns
    `Applied`. `WouldBlock` is not success. The owner turn yields
    and retries on the next slice. The caller never waits on the
@@ -368,14 +366,21 @@ Rules:
    each other.
 4. Unload then reload on one package is two queued ops in order.
    Reload does not apply before its preceding unload.
-5. When `Inner` is held, `try_apply` and delivery both drain
-   `EventPlaneOwnerOps` **before** ingress or delivery mutation.
-   Worker `try_ingress` also applies any already-recorded ops if
-   it wins `Inner`, so a held delivery slice cannot strand them.
-6. After `Applied`, remove that op and then complete the daemon
-   response. Contracts and subscriptions remain until `Applied`.
+5. **Only the owner loop calls `try_apply`.** Plugin workers never
+   read `EventPlaneOwnerOps`. That map is owner-thread state and
+   is not shared, mutexed, or visible to `try_ingress`.
+6. While an `OwnerOp` is pending, the **old package generation
+   remains active**. Ingress, subscribe, and delivery continue to
+   use the pre-op contracts and subscriptions.
+7. `Applied` is the only transition. It removes or replaces
+   contracts and subscriptions under `RouterInner` **before** the
+   daemon response completes.
+8. After `Applied`, remove that op and then complete the daemon
+   response. Later ingress sees the new generation or a typed
+   reject (`rejected_undeclared` / `rejected_foreign` after
+   unload; the replacement contracts after reload).
 
-There is no single-slot fallback and no discarded owner name.
+There is no worker-drain path and no discarded owner name.
 
 Tests:
 
@@ -390,6 +395,11 @@ Tests:
   released. Neither request completes early.
 - Held `Inner`: unload then reload on one owner applies in that
   order. Reload never sees the pre-unload contracts.
+- Pending window: after unload is recorded and before `Applied`,
+  `try_ingress` still uses the old generation (accept or other
+  typed result, not the post-unload reject). After `Applied`,
+  the same emit is `rejected_undeclared` / `rejected_foreign`
+  or follows the new generation.
 
 `shed_busy` is a typed shed. It does not increment count, bytes,
 fanout, or token-bucket tokens.
@@ -770,8 +780,9 @@ Assumptions:
   It is configurable.
 - Router synchronization is `try_lock` only. Contention is
   `shed_busy`, not a wait.
-- Unload/reload completion waits on `try_apply`, not on a router
-  mutex. Owner-loop `EventPlaneOwnerOps` is the lossless registry.
+- Unload/reload completion waits on owner-loop `try_apply`, not on
+  a router mutex. Workers never apply owner ops. The old generation
+  stays active until `Applied`.
 - The later event-to-entity-to-event callback is the package
   `entity_provider` driven by `drive_package_entity_resync`.
 - `EventInFlight` and `ProviderInFlight` survive plugin unload.
@@ -841,6 +852,8 @@ Unknowns Implement must resolve by measurement, not invention:
 - Lossy owner-op fallback dropping a second package unload.
   Mitigation: owner-loop keyed `EventPlaneOwnerOps`; request stays
   open until `Applied`.
+- Workers applying owner-thread ops. Mitigation: only the owner
+  loop calls `try_apply`; pending window keeps the old generation.
 - Closing causal scope at handler return, or releasing in-flight
   leases on unload. Mitigation: lease table; `EventInFlight` /
   `ProviderInFlight` survive unload; `entity_provider` resync is
