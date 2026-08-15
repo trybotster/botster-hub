@@ -23,6 +23,8 @@ pub struct SessionProjectionRow {
     pub lifecycle_class: &'static str,
     /// True when a live journal upsert applied an ended class to this id.
     pub live_ended: bool,
+    /// Journal sequence that last mutated this row.
+    pub change_seq: u64,
 }
 
 /// One Hub lifecycle cursor and one canonical session projection.
@@ -101,6 +103,7 @@ impl SessionProjection {
                         record: record.clone(),
                         lifecycle_class,
                         live_ended,
+                        change_seq: change.cursor.sequence,
                     },
                 );
             }
@@ -119,6 +122,9 @@ impl SessionProjection {
         records: impl IntoIterator<Item = SessionLifecycleRecord>,
         complete: bool,
     ) {
+        if !complete {
+            return;
+        }
         for record in records {
             let lifecycle_class =
                 session_lifecycle_class(&record.session.registry_state, record.lifecycle.as_ref());
@@ -128,14 +134,13 @@ impl SessionProjection {
                     record,
                     lifecycle_class,
                     live_ended: false,
+                    change_seq: snapshot.sequence,
                 },
             );
         }
         self.cursor = Some(snapshot);
-        if complete {
-            self.baseline_complete = true;
-            self.gap = false;
-        }
+        self.baseline_complete = true;
+        self.gap = false;
     }
 
     /// Replace the projection with a complete baseline and clear the gap.
@@ -158,6 +163,7 @@ impl SessionProjection {
 
     /// Start a fresh baseline recovery without treating current rows as complete.
     pub fn begin_baseline_recovery(&mut self) {
+        self.gap = true;
         self.baseline_complete = false;
         self.rows.clear();
         self.cursor = None;
@@ -294,6 +300,24 @@ mod tests {
             RegistrySessionState::Exited => 3,
             RegistrySessionState::Stale => 4,
         }
+    }
+
+    #[test]
+    fn begin_baseline_recovery_marks_a_gap_without_a_cursor() {
+        let mut projection = SessionProjection::default();
+        projection.replace_complete_baseline(
+            cursor(4),
+            [record(
+                "done",
+                RegistrySessionState::Exited,
+                Some(SessionLifecycleState::Exited { code: Some(0) }),
+            )],
+        );
+        projection.begin_baseline_recovery();
+        assert!(projection.gap);
+        assert!(!projection.baseline_complete);
+        assert!(projection.cursor.is_none());
+        assert!(!projection.is_ended("done"));
     }
 
     #[test]

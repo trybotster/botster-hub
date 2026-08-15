@@ -142,14 +142,18 @@ struct SessionFamilyConsumer {
     snapshot_sequence: u64,
     in_flight: Option<InFlightSessionFamily>,
     pending: VecDeque<serde_json::Value>,
+    held_deltas: VecDeque<serde_json::Value>,
     snapshot_complete: bool,
     gap: bool,
+    need_snapshot_chunks: bool,
+    snapshot_after: Option<String>,
 }
 
 /// Hub-owned `/session` delivery with one in-flight frame per plugin.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionFamilyBridge {
     consumers: BTreeMap<String, SessionFamilyConsumer>,
+    next_request_serial: u64,
 }
 
 impl SessionFamilyBridge {
@@ -162,8 +166,11 @@ impl SessionFamilyBridge {
                 snapshot_sequence: 0,
                 in_flight: None,
                 pending: VecDeque::new(),
+                held_deltas: VecDeque::new(),
                 snapshot_complete: false,
                 gap: true,
+                need_snapshot_chunks: false,
+                snapshot_after: None,
             })
     }
 
@@ -171,48 +178,54 @@ impl SessionFamilyBridge {
         let consumer = self.consumer_mut(plugin_key);
         consumer.gap = true;
         consumer.snapshot_complete = false;
+        consumer.need_snapshot_chunks = false;
+        consumer.snapshot_after = None;
         consumer.pending.clear();
+        consumer.held_deltas.clear();
         consumer.in_flight = None;
     }
 
-    fn queue_snapshot(&mut self, plugin_key: &str, sequence: u64, items: &[serde_json::Value]) {
+    fn begin_snapshot(&mut self, plugin_key: &str, sequence: u64) {
         let consumer = self.consumer_mut(plugin_key);
         consumer.snapshot_sequence = sequence;
         consumer.snapshot_complete = false;
         consumer.gap = false;
+        consumer.need_snapshot_chunks = true;
+        consumer.snapshot_after = None;
         consumer.pending.clear();
+        consumer.held_deltas.clear();
         consumer.pending.push_back(serde_json::json!({
             "type": "snapshot_begin",
             "family": "/session",
             "snapshot_sequence": sequence,
         }));
-        for chunk in items.chunks(SESSION_CHUNK_MAX_ITEMS) {
-            let mut encoded = serde_json::json!({
-                "type": "snapshot_chunk",
-                "family": "/session",
-                "snapshot_sequence": sequence,
-                "items": chunk,
-            });
-            if serde_json::to_vec(&encoded)
-                .map(|bytes| bytes.len())
-                .unwrap_or(usize::MAX)
-                > SESSION_CHUNK_MAX_BYTES
-            {
-                encoded = serde_json::json!({
-                    "type": "snapshot_chunk",
-                    "family": "/session",
-                    "snapshot_sequence": sequence,
-                    "items": chunk.get(..1).unwrap_or(&[]),
-                });
+    }
+
+    #[cfg(test)]
+    fn queue_snapshot(&mut self, plugin_key: &str, sequence: u64, items: &[serde_json::Value]) {
+        self.begin_snapshot(plugin_key, sequence);
+        let consumer = self.consumer_mut(plugin_key);
+        let mut start = 0;
+        while start < items.len() {
+            match pack_session_chunk(items, start) {
+                Ok((chunk, next)) => {
+                    consumer
+                        .pending
+                        .push_back(session_chunk_frame(sequence, &chunk));
+                    start = next;
+                }
+                Err(()) => {
+                    consumer.gap = true;
+                    consumer.need_snapshot_chunks = false;
+                    consumer.pending.clear();
+                    return;
+                }
             }
-            consumer.pending.push_back(encoded);
         }
-        consumer.pending.push_back(serde_json::json!({
-            "type": "snapshot_end",
-            "family": "/session",
-            "snapshot_sequence": sequence,
-            "complete": true,
-        }));
+        consumer.need_snapshot_chunks = false;
+        consumer
+            .pending
+            .push_back(session_end_frame(sequence, true));
     }
 
     fn queue_delta(&mut self, plugin_key: &str, frame: serde_json::Value) {
@@ -221,10 +234,18 @@ impl SessionFamilyBridge {
             return;
         }
         if !consumer.snapshot_complete {
-            consumer.pending.push_back(frame);
+            consumer.held_deltas.push_back(frame);
             return;
         }
         consumer.pending.push_back(frame);
+    }
+
+    fn next_request_id(&mut self, plugin_key: &str, sequence: u64) -> RequestId {
+        self.next_request_serial = self.next_request_serial.saturating_add(1);
+        RequestId(format!(
+            "session-family-{plugin_key}-{sequence}-{}",
+            self.next_request_serial
+        ))
     }
 }
 
@@ -258,12 +279,61 @@ impl MaintenanceState {
             || self.baseline.is_some()
             || !self.pending_changes.is_empty()
             || self.observe_resume.is_some()
-            || self
-                .session_family
-                .consumers
-                .values()
-                .any(|consumer| consumer.in_flight.is_some() || !consumer.pending.is_empty())
+            || self.session_family.consumers.values().any(|consumer| {
+                consumer.in_flight.is_some()
+                    || !consumer.pending.is_empty()
+                    || !consumer.held_deltas.is_empty()
+                    || consumer.need_snapshot_chunks
+            })
     }
+}
+
+fn session_chunk_frame(sequence: u64, items: &[serde_json::Value]) -> serde_json::Value {
+    serde_json::json!({
+        "type": "snapshot_chunk",
+        "family": "/session",
+        "snapshot_sequence": sequence,
+        "items": items,
+    })
+}
+
+fn session_end_frame(sequence: u64, complete: bool) -> serde_json::Value {
+    serde_json::json!({
+        "type": "snapshot_end",
+        "family": "/session",
+        "snapshot_sequence": sequence,
+        "complete": complete,
+    })
+}
+
+/// Pack one snapshot chunk without dropping later rows.
+///
+/// `Err(())` means the item at `start` cannot fit the byte budget.
+pub(crate) fn pack_session_chunk(
+    items: &[serde_json::Value],
+    start: usize,
+) -> Result<(Vec<serde_json::Value>, usize), ()> {
+    if start >= items.len() {
+        return Ok((Vec::new(), start));
+    }
+    let mut packed = Vec::new();
+    let mut index = start;
+    while index < items.len() && packed.len() < SESSION_CHUNK_MAX_ITEMS {
+        packed.push(items[index].clone());
+        let encoded = session_chunk_frame(0, &packed);
+        let bytes = serde_json::to_vec(&encoded)
+            .map(|body| body.len())
+            .unwrap_or(usize::MAX);
+        if bytes > SESSION_CHUNK_MAX_BYTES {
+            packed.pop();
+            if packed.is_empty() {
+                return Err(());
+            }
+            break;
+        }
+        index += 1;
+    }
+    Ok((packed, index))
 }
 
 /// Run one runtime-owned maintenance slice through the production Core facades.
@@ -324,6 +394,12 @@ fn run_observe_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
 
 fn run_journal_pull_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
     let woke = runtime.take_journal_advanced_wake();
+    if state.baseline.is_some() || !state.projection.baseline_complete {
+        if woke && state.baseline.is_none() {
+            start_baseline_recovery(state);
+        }
+        return;
+    }
     let Some(cursor) = state.projection.cursor.clone() else {
         if woke {
             start_baseline_recovery(state);
@@ -355,6 +431,10 @@ fn run_journal_pull_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
 }
 
 fn run_projection_apply_slice(state: &mut MaintenanceState) {
+    if !state.projection.baseline_complete {
+        state.pending_changes.clear();
+        return;
+    }
     let mut applied = 0;
     while applied < APPLY_MAX_CHANGES {
         let Some(change) = state.pending_changes.pop_front() else {
@@ -386,8 +466,7 @@ fn run_baseline_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
             }
             recovery.snapshot = Some(page.snapshot_sequence.clone());
             recovery.after = page.next.clone();
-            let sessions = page.sessions;
-            recovery.assembled.extend(sessions.iter().cloned());
+            recovery.assembled.extend(page.sessions);
             if page.complete {
                 let snapshot = page.snapshot_sequence;
                 let assembled = state
@@ -395,14 +474,12 @@ fn run_baseline_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
                     .take()
                     .map(|recovery| recovery.assembled)
                     .unwrap_or_default();
+                let sequence = snapshot.sequence;
                 state
                     .projection
-                    .replace_complete_baseline(snapshot.clone(), assembled.clone());
-                queue_family_complete_snapshot(state, snapshot.sequence, &assembled);
+                    .replace_complete_baseline(snapshot, assembled);
+                begin_family_snapshots(state, sequence);
             } else {
-                state
-                    .projection
-                    .apply_baseline_page(page.snapshot_sequence, sessions, false);
                 state.scheduler.try_wake();
             }
         }
@@ -418,14 +495,11 @@ fn run_host_bridge_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
     let Some((plugin_key, handler, payload)) = next_session_family_admission(state) else {
         return;
     };
-    let request_id = RequestId(format!(
-        "session-family-{}-{}",
-        plugin_key,
-        payload
-            .get("snapshot_sequence")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0)
-    ));
+    let sequence = payload
+        .get("snapshot_sequence")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let request_id = state.session_family.next_request_id(&plugin_key, sequence);
     let admission = runtime.try_admit_plugin(
         PluginInvocationClass::Background,
         PluginInvocationRequest {
@@ -495,6 +569,7 @@ fn run_completion_drain_slice(runtime: &HubRuntime, state: &mut MaintenanceState
             }
             if ended_snapshot {
                 consumer.snapshot_complete = true;
+                consumer.pending.extend(consumer.held_deltas.drain(..));
             }
         }
         state.scheduler.try_wake();
@@ -506,6 +581,15 @@ pub fn start_baseline_recovery(state: &mut MaintenanceState) {
     state.projection.begin_baseline_recovery();
     state.pending_changes.clear();
     state.observe_resume = None;
+    let keys = state
+        .session_family
+        .consumers
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    for plugin_key in keys {
+        state.session_family.mark_gap(&plugin_key);
+    }
     state.baseline = Some(BaselineRecovery {
         snapshot: None,
         after: None,
@@ -542,16 +626,13 @@ fn refresh_session_family_consumers(runtime: &HubRuntime, state: &mut Maintenanc
         if !existed {
             consumer.gap = true;
             if state.projection.baseline_complete {
-                queue_family_complete_snapshot_for(
-                    state,
-                    &plugin_key,
-                    state
-                        .projection
-                        .cursor
-                        .as_ref()
-                        .map(|cursor| cursor.sequence)
-                        .unwrap_or(0),
-                );
+                let sequence = state
+                    .projection
+                    .cursor
+                    .as_ref()
+                    .map(|cursor| cursor.sequence)
+                    .unwrap_or(0);
+                state.session_family.begin_snapshot(&plugin_key, sequence);
             }
         }
     }
@@ -564,19 +645,97 @@ fn refresh_session_family_consumers(runtime: &HubRuntime, state: &mut Maintenanc
 fn next_session_family_admission(
     state: &mut MaintenanceState,
 ) -> Option<(String, PluginHandlerRef, serde_json::Value)> {
-    for consumer in state.session_family.consumers.values_mut() {
-        if consumer.in_flight.is_some() {
-            continue;
+    let keys = state
+        .session_family
+        .consumers
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    for plugin_key in keys {
+        if let Some(payload) = next_session_family_payload(state, &plugin_key) {
+            let handler = state
+                .session_family
+                .consumers
+                .get(&plugin_key)
+                .and_then(|consumer| consumer.handler.clone())?;
+            return Some((plugin_key, handler, payload));
         }
-        let Some(handler) = consumer.handler.clone() else {
-            continue;
-        };
-        let Some(payload) = consumer.pending.pop_front() else {
-            continue;
-        };
-        return Some((consumer.plugin_key.clone(), handler, payload));
     }
     None
+}
+
+fn next_session_family_payload(
+    state: &mut MaintenanceState,
+    plugin_key: &str,
+) -> Option<serde_json::Value> {
+    let consumer = state.session_family.consumers.get_mut(plugin_key)?;
+    if consumer.in_flight.is_some() || consumer.handler.is_none() {
+        return None;
+    }
+    if let Some(payload) = consumer.pending.pop_front() {
+        return Some(payload);
+    }
+    if !consumer.need_snapshot_chunks {
+        return None;
+    }
+    let sequence = consumer.snapshot_sequence;
+    let after = consumer.snapshot_after.clone();
+    match next_projection_chunk(&state.projection, after.as_deref()) {
+        Ok(Some((chunk, last_id))) => {
+            let consumer = state.session_family.consumers.get_mut(plugin_key)?;
+            consumer.snapshot_after = Some(last_id);
+            Some(session_chunk_frame(sequence, &chunk))
+        }
+        Ok(None) => {
+            let consumer = state.session_family.consumers.get_mut(plugin_key)?;
+            consumer.need_snapshot_chunks = false;
+            Some(session_end_frame(sequence, true))
+        }
+        Err(()) => {
+            state.session_family.mark_gap(plugin_key);
+            None
+        }
+    }
+}
+
+fn next_projection_chunk(
+    projection: &SessionProjection,
+    after: Option<&str>,
+) -> Result<Option<(Vec<serde_json::Value>, String)>, ()> {
+    let mut packed = Vec::new();
+    let mut last_id = None;
+    for (id, row) in &projection.rows {
+        if after.is_some_and(|after| id.as_str() <= after) {
+            continue;
+        }
+        let item =
+            serde_json::to_value(SessionProjection::project_entity(&row.record)).map_err(|_| ())?;
+        packed.push(item);
+        match pack_session_chunk(&packed, 0) {
+            Ok((chunk, next)) if next == packed.len() => {
+                last_id = Some(id.clone());
+                packed = chunk;
+                if packed.len() >= SESSION_CHUNK_MAX_ITEMS {
+                    break;
+                }
+            }
+            Ok((chunk, _)) => {
+                packed = chunk;
+                break;
+            }
+            Err(()) => {
+                if packed.len() == 1 {
+                    return Err(());
+                }
+                packed.pop();
+                break;
+            }
+        }
+    }
+    match last_id {
+        Some(id) if !packed.is_empty() => Ok(Some((packed, id))),
+        _ => Ok(None),
+    }
 }
 
 fn queue_family_delta(state: &mut MaintenanceState, change: &SessionLifecycleChange) {
@@ -612,18 +771,7 @@ fn queue_family_delta(state: &mut MaintenanceState, change: &SessionLifecycleCha
     }
 }
 
-fn queue_family_complete_snapshot(
-    state: &mut MaintenanceState,
-    sequence: u64,
-    records: &[SessionLifecycleRecord],
-) {
-    let items = records
-        .iter()
-        .map(|record| {
-            serde_json::to_value(SessionProjection::project_entity(record))
-                .expect("session entity serializes")
-        })
-        .collect::<Vec<_>>();
+fn begin_family_snapshots(state: &mut MaintenanceState, sequence: u64) {
     let keys = state
         .session_family
         .consumers
@@ -631,26 +779,8 @@ fn queue_family_complete_snapshot(
         .cloned()
         .collect::<Vec<_>>();
     for plugin_key in keys {
-        state
-            .session_family
-            .queue_snapshot(&plugin_key, sequence, &items);
+        state.session_family.begin_snapshot(&plugin_key, sequence);
     }
-}
-
-fn queue_family_complete_snapshot_for(
-    state: &mut MaintenanceState,
-    plugin_key: &str,
-    sequence: u64,
-) {
-    let items = state
-        .projection
-        .snapshot_entities()
-        .into_values()
-        .filter_map(|entity| serde_json::to_value(entity).ok())
-        .collect::<Vec<_>>();
-    state
-        .session_family
-        .queue_snapshot(plugin_key, sequence, &items);
 }
 
 /// Fail if this module's source imports terminal bodies or names product policy.
@@ -748,6 +878,48 @@ mod tests {
             next_session_family_admission(&mut state).is_none(),
             "must not admit the next frame while one is in flight"
         );
+    }
+
+    #[test]
+    fn pack_session_chunk_keeps_every_row_under_the_byte_budget() {
+        let items = (0..20)
+            .map(|index| serde_json::json!({ "session_uuid": format!("s{index:02}") }))
+            .collect::<Vec<_>>();
+        let mut start = 0;
+        let mut seen = Vec::new();
+        while start < items.len() {
+            let (chunk, next) = pack_session_chunk(&items, start).expect("chunk fits");
+            assert!(!chunk.is_empty());
+            let encoded = serde_json::to_vec(&session_chunk_frame(1, &chunk)).expect("encode");
+            assert!(encoded.len() <= SESSION_CHUNK_MAX_BYTES);
+            seen.extend(chunk.iter().filter_map(|item| {
+                item.get("session_uuid")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            }));
+            start = next;
+        }
+        assert_eq!(
+            seen,
+            items
+                .iter()
+                .filter_map(|item| item.get("session_uuid")?.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn pack_session_chunk_rejects_a_single_row_over_the_byte_budget() {
+        let huge = serde_json::json!({ "session_uuid": "x".repeat(SESSION_CHUNK_MAX_BYTES) });
+        assert!(pack_session_chunk(&[huge], 0).is_err());
+    }
+
+    #[test]
+    fn session_family_request_ids_are_unique_per_frame() {
+        let mut bridge = SessionFamilyBridge::default();
+        let first = bridge.next_request_id("plugin.one", 7);
+        let second = bridge.next_request_id("plugin.one", 7);
+        assert_ne!(first, second);
     }
 
     #[test]

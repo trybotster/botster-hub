@@ -2221,10 +2221,16 @@ pub(crate) fn handle_control_message(
                 };
                 record_attached_subscription_change(state, change, grant_id.as_deref());
             }
-            if reconcile_after_request {
-                state.maintenance.note_authoritative_mutation();
-            } else if matches!(request, DaemonRequest::PluginSurfaceAction { .. }) {
-                state.maintenance.try_wake();
+            if request_succeeded(response.as_ref()) {
+                if reconcile_after_request {
+                    state.maintenance.note_authoritative_mutation();
+                } else if matches!(request, DaemonRequest::PluginSurfaceAction { .. })
+                    && daemon
+                        .runtime()
+                        .is_some_and(crate::HubRuntime::package_entity_work_pending)
+                {
+                    state.maintenance.try_wake();
+                }
             }
             if response
                 .as_ref()
@@ -4882,6 +4888,13 @@ fn record_attached_subscription_change(
             state.pending_runtime.attach_owner_grant_ids.remove(&route);
         }
     }
+}
+
+fn request_succeeded(response: Result<&DaemonResponse, &DaemonTransportError>) -> bool {
+    matches!(
+        response,
+        Ok(response) if response.kind != DaemonResponseKind::OperatorError
+    )
 }
 
 fn control_request_operation_label(request: &DaemonRequest) -> &'static str {
