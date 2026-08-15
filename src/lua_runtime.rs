@@ -72,6 +72,7 @@ pub struct HubEntityPublishBridge {
     pending: Arc<Mutex<VecDeque<PendingEntityPublishRequest>>>,
     pending_releases: Arc<Mutex<VecDeque<CausalOp>>>,
     scope_releases: Arc<Mutex<BTreeMap<u64, LeaseIdentity>>>,
+    orphan_scopes: Arc<Mutex<BTreeSet<u64>>>,
     next_token: Arc<AtomicU64>,
     reject_next: Arc<AtomicBool>,
 }
@@ -83,9 +84,25 @@ impl HubEntityPublishBridge {
             pending: Arc::new(Mutex::new(VecDeque::new())),
             pending_releases: Arc::new(Mutex::new(VecDeque::new())),
             scope_releases: Arc::new(Mutex::new(BTreeMap::new())),
+            orphan_scopes: Arc::new(Mutex::new(BTreeSet::new())),
             next_token: Arc::new(AtomicU64::new(1)),
             reject_next: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn mark_orphan(&self, scope_id: u64) {
+        if let Ok(mut orphans) = self.orphan_scopes.try_lock()
+            && (orphans.len() < CAUSAL_PENDING_MAX || orphans.contains(&scope_id))
+        {
+            orphans.insert(scope_id);
+        }
+    }
+
+    pub fn take_orphans(&self) -> Vec<u64> {
+        self.orphan_scopes
+            .try_lock()
+            .map(|mut orphans| std::mem::take(&mut *orphans).into_iter().collect())
+            .unwrap_or_default()
     }
 
     pub fn park_release(&self, op: CausalOp) -> CausalAdmitResult {
@@ -97,6 +114,7 @@ impl HubEntityPublishBridge {
         }
         if let CausalOp::Release { scope_id, identity } = &op
             && let Ok(mut scopes) = self.scope_releases.try_lock()
+            && (scopes.len() < CAUSAL_PENDING_MAX || scopes.contains_key(scope_id))
         {
             scopes.insert(*scope_id, identity.clone());
             return CausalAdmitResult::Applied;
@@ -1003,11 +1021,9 @@ fn entity_publish_function(
                             plugin_key: plugin_key.0.clone(),
                         },
                     )
-                    && let CausalAdmitResult::Retry(op) = bridge.park_release(op)
+                    && let CausalAdmitResult::Retry(_) = bridge.park_release(op)
                 {
-                    let retry = bridge.park_release(op);
-                    debug_assert!(matches!(retry, CausalAdmitResult::Applied));
-                    let _ = retry;
+                    bridge.mark_orphan(scope_id);
                 }
                 return Err(mlua::Error::RuntimeError(error));
             }
