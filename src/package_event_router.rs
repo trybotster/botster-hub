@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
@@ -1117,16 +1117,15 @@ pub enum CausalOp {
     },
 }
 
-/// Lease transfer/release cannot shed. The ordered path is an unbounded
-/// channel so a required ownership change is never consumed by a full send.
-#[cfg(test)]
 pub const CAUSAL_PENDING_MAX: usize = 256;
+pub const CAUSAL_FLUSH_MAX: usize = 32;
 
 /// Causal-scope lease table. Send + Sync. Lives beside the router.
 pub struct CausalScopeTable {
     inner: Mutex<CausalInner>,
-    pending_tx: Sender<CausalOp>,
+    pending_tx: SyncSender<CausalOp>,
     pending_rx: Mutex<Receiver<CausalOp>>,
+    retries: Mutex<VecDeque<CausalOp>>,
     pending_len: AtomicUsize,
     next_id: AtomicU64,
 }
@@ -1160,11 +1159,12 @@ impl Default for CausalScopeTable {
 impl CausalScopeTable {
     #[must_use]
     pub fn new() -> Self {
-        let (pending_tx, pending_rx) = mpsc::channel();
+        let (pending_tx, pending_rx) = mpsc::sync_channel(CAUSAL_PENDING_MAX);
         Self {
             inner: Mutex::new(CausalInner::default()),
             pending_tx,
             pending_rx: Mutex::new(pending_rx),
+            retries: Mutex::new(VecDeque::new()),
             pending_len: AtomicUsize::new(0),
             next_id: AtomicU64::new(1),
         }
@@ -1222,12 +1222,42 @@ impl CausalScopeTable {
     }
 
     fn apply_or_queue(&self, op: CausalOp) -> OwnerApplyResult {
-        if self.pending_tx.send(op).is_err() {
-            return OwnerApplyResult::WouldBlock;
+        match self.pending_tx.try_send(op) {
+            Ok(()) => {
+                self.pending_len.fetch_add(1, Ordering::SeqCst);
+                let _ = self.flush_pending();
+            }
+            Err(TrySendError::Full(op) | TrySendError::Disconnected(op)) => {
+                self.retain(op);
+            }
         }
-        self.pending_len.fetch_add(1, Ordering::SeqCst);
-        let _ = self.flush_pending();
         OwnerApplyResult::Applied
+    }
+
+    fn retain(&self, mut op: CausalOp) {
+        loop {
+            match self.retries.try_lock() {
+                Ok(mut retries) if retries.len() < CAUSAL_PENDING_MAX => {
+                    retries.push_back(op);
+                    self.pending_len.fetch_add(1, Ordering::SeqCst);
+                    return;
+                }
+                Ok(_) | Err(_) => {
+                    let _ = self.flush_pending();
+                    match self.pending_tx.try_send(op) {
+                        Ok(()) => {
+                            self.pending_len.fetch_add(1, Ordering::SeqCst);
+                            return;
+                        }
+                        Err(
+                            TrySendError::Full(returned) | TrySendError::Disconnected(returned),
+                        ) => {
+                            op = returned;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub fn flush_pending(&self) -> usize {
@@ -1237,11 +1267,30 @@ impl CausalScopeTable {
         let Ok(mut inner) = self.inner.try_lock() else {
             return 0;
         };
+        let started = Instant::now();
         let mut applied = 0;
-        while let Ok(op) = rx.try_recv() {
-            self.pending_len.fetch_sub(1, Ordering::SeqCst);
-            apply_causal_locked(&mut inner, &op);
-            applied += 1;
+        while applied < CAUSAL_FLUSH_MAX && started.elapsed() < Duration::from_millis(8) {
+            match rx.try_recv() {
+                Ok(op) => {
+                    self.pending_len.fetch_sub(1, Ordering::SeqCst);
+                    apply_causal_locked(&mut inner, &op);
+                    applied += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        drop(inner);
+        drop(rx);
+        if let Ok(mut retries) = self.retries.try_lock() {
+            while let Some(op) = retries.pop_front() {
+                match self.pending_tx.try_send(op) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(op) | TrySendError::Disconnected(op)) => {
+                        retries.push_front(op);
+                        break;
+                    }
+                }
+            }
         }
         applied
     }
@@ -2129,12 +2178,28 @@ mod tests {
             );
             assert!(table.pending_ops());
         });
-        let applied = table.flush_pending();
+        let first = table.flush_pending();
+        assert!(first > 0);
+        assert!(
+            first <= CAUSAL_FLUSH_MAX,
+            "one owner turn must not drain without a bound: {first}"
+        );
+        assert!(table.pending_ops());
+        assert_eq!(
+            table.identities(scopes[0]),
+            Some(BTreeSet::from([LeaseIdentity::AdmittedEntityMutation {
+                family: "f".into(),
+                seq: 0,
+            }]))
+        );
+        let mut applied = first;
+        while table.pending_ops() {
+            applied += table.flush_pending();
+        }
         assert!(
             applied > CAUSAL_PENDING_MAX,
-            "the 257th transfer must survive: applied {applied}"
+            "the 257th transfer must be retained and applied: {applied}"
         );
-        assert!(!table.pending_ops());
         for (index, scope) in scopes.iter().enumerate() {
             assert_eq!(
                 table.identities(*scope),
