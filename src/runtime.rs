@@ -507,6 +507,9 @@ impl HubRuntime {
             .package(package_name)
             .map(|record| record.configuration_view())
             .expect("prepared local package must have a registry record");
+        let _ = self
+            .package_event_router
+            .begin_package_generation(package_name);
         if let Some(record) = registry.package(package_name)
             && let Ok(contracts) = record.manifest.compiled_event_contracts()
         {
@@ -537,6 +540,9 @@ impl HubRuntime {
             .package(package_name)
             .map(|record| record.configuration_view())
             .expect("prepared local package must have a registry record");
+        let _ = self
+            .package_event_router
+            .begin_package_generation(package_name);
         if let Some(record) = registry.package(package_name)
             && let Ok(contracts) = record.manifest.compiled_event_contracts()
         {
@@ -1179,7 +1185,11 @@ impl HubRuntime {
 
     fn fulfill_pending_entity_publish_requests(&self) {
         while let Some(pending) = self.entity_publish_bridge.take_pending() {
-            let result = self.admit_package_entity_publish(pending.plugin_key, pending.frame);
+            let result = self.admit_package_entity_publish(
+                pending.plugin_key.clone(),
+                pending.frame,
+                pending.scope_id,
+            );
             let _ = pending.response.send(result);
         }
     }
@@ -1188,6 +1198,7 @@ impl HubRuntime {
         &self,
         plugin_key: PluginKey,
         frame: serde_json::Value,
+        scope_id: Option<u64>,
     ) -> Result<PackageEntityPublishResult, String> {
         let mutation = parse_publish_mutation(frame)?;
         let entity_type = mutation.entity_type().to_string();
@@ -1216,8 +1227,34 @@ impl HubRuntime {
             .package_entity_families
             .lock()
             .expect("package entity family lock");
-        let family = families.entry(entity_type).or_default();
+        let family = families.entry(entity_type.clone()).or_default();
         let (result, ready) = family.admit(mutation, now);
+        if let Some(scope_id) = scope_id {
+            self.causal_scopes.release(
+                scope_id,
+                crate::package_event_router::LeaseIdentity::PendingEntityPublish {
+                    plugin_key: plugin_key.0.clone(),
+                },
+            );
+            if result.ok {
+                let _ = self.causal_scopes.acquire(
+                    scope_id,
+                    crate::package_event_router::LeaseIdentity::AdmittedEntityMutation {
+                        family: entity_type.clone(),
+                        seq: result.last_accepted_seq,
+                    },
+                );
+                if result.resync_needed {
+                    let _ = self.causal_scopes.acquire(
+                        scope_id,
+                        crate::package_event_router::LeaseIdentity::ProviderResyncNeed {
+                            family: entity_type.clone(),
+                        },
+                    );
+                }
+                family.causal_scope_id = Some(scope_id);
+            }
+        }
         drop(families);
         if !ready.is_empty() {
             let mut fanout = self
@@ -1267,6 +1304,23 @@ impl HubRuntime {
             .expect("package entity family lock");
         let family = families.entry(entity_type.to_string()).or_default();
         let ready = family.apply_provider_snapshot_seq(snapshot_seq, now);
+        if !family.resync.needed
+            && let Some(scope_id) = family.causal_scope_id.take()
+        {
+            self.causal_scopes.release(
+                scope_id,
+                crate::package_event_router::LeaseIdentity::ProviderResyncNeed {
+                    family: entity_type.to_string(),
+                },
+            );
+            self.causal_scopes.release(
+                scope_id,
+                crate::package_event_router::LeaseIdentity::AdmittedEntityMutation {
+                    family: entity_type.to_string(),
+                    seq: family.last_accepted_seq,
+                },
+            );
+        }
         if !ready.is_empty() {
             let mut fanout = self
                 .package_entity_fanout
@@ -1692,8 +1746,27 @@ impl HubRuntime {
                 format!("entity provider {entity_type} has no handler"),
             )
         })?;
+        let scope_id = self
+            .package_entity_family_state(entity_type)
+            .and_then(|family| family.causal_scope_id);
+        let request_id = RequestId(format!("plugin-entity-provider-{subscription_id}"));
+        if let Some(scope_id) = scope_id
+            && !self.causal_scopes.acquire(
+                scope_id,
+                crate::package_event_router::LeaseIdentity::ProviderInFlight {
+                    request_id: request_id.0.clone(),
+                },
+            )
+        {
+            return Err(crate::McpToolError::new(
+                "causal_scope_busy",
+                "could not acquire provider causal lease",
+            ));
+        }
+        let metadata = scope_id
+            .map(|scope_id| BoundaryJson(serde_json::json!({ "causal_scope_id": scope_id })));
         let outcome = self.invoke_plugin(PluginInvocationRequest {
-            request_id: RequestId(format!("plugin-entity-provider-{subscription_id}")),
+            request_id: request_id.clone(),
             handler,
             timeout_ms: PLUGIN_EVENT_TIMEOUT_MS,
             context: botster_core::PluginInvocationContext {
@@ -1702,13 +1775,21 @@ impl HubRuntime {
                 subscription_id: Some(SubscriptionId(subscription_id.to_string())),
                 surface_id: None,
                 origin: Some("local-client-api".to_string()),
-                metadata: None,
+                metadata,
             },
             payload: BoundaryJson(serde_json::json!({
                 "entity_type": entity_type,
                 "subscription_id": subscription_id,
             })),
         });
+        if let Some(scope_id) = scope_id {
+            self.causal_scopes.release(
+                scope_id,
+                crate::package_event_router::LeaseIdentity::ProviderInFlight {
+                    request_id: request_id.0.clone(),
+                },
+            );
+        }
         let value = completed_plugin_payload(outcome.result, "plugin entity provider")?;
         let value = coerce_entity_frame_empty_items(value);
         let frame: EntityFrame = serde_json::from_value(value).map_err(|error| {
@@ -1907,6 +1988,11 @@ impl HubRuntime {
             let request_id = RequestId(format!(
                 "package-event-test-{}-{}",
                 delivery.name, delivery.envelope_id
+            ));
+            let _ = self.causal_scopes.mint_with_lease(Some(
+                crate::package_event_router::LeaseIdentity::EventInFlight {
+                    request_id: request_id.0.clone(),
+                },
             ));
             match self.try_admit_plugin(
                 PluginInvocationClass::Background,

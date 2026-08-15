@@ -196,6 +196,83 @@ fn isolated_hub_two_packages_emit_and_consume_exact_event_without_blocking_workt
     hub.shutdown().expect("shutdown isolated hub");
 }
 
+#[test]
+fn isolated_hub_event_to_entity_provider_emit_stays_rejected_causal_scope() {
+    let _guard = daemon_test_guard();
+    let producer_src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/event-plane-producer");
+    let cycle_src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/event-plane-cycle");
+    let producer_dir = unique_test_dir("event-plane-producer-cycle");
+    let cycle_dir = unique_test_dir("event-plane-cycle");
+    copy_dir_all(&producer_src, &producer_dir);
+    copy_dir_all(&cycle_src, &cycle_dir);
+    rewrite_package_source_path(&producer_dir);
+    rewrite_package_source_path(&cycle_dir);
+
+    let hub = botster_hub_test_support::IsolatedHubBuilder::new()
+        .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
+        .session_worker_bin(session_worker_binary_path())
+        .root(PathBuf::from("/tmp/bh-event-plane-cycle"))
+        .name("package-event-cycle")
+        .start()
+        .expect("start isolated hub");
+
+    for path in [producer_dir, cycle_dir] {
+        let enabled = botster_hub_client::request(
+            hub.endpoint(),
+            botster_hub_client::DaemonRequest::EnablePackageLocalPath { path },
+        )
+        .expect("enable package");
+        assert_eq!(
+            enabled.kind,
+            botster_hub_client::DaemonResponseKind::PackageDecision
+        );
+    }
+
+    let emitted = botster_hub_client::request(
+        hub.endpoint(),
+        botster_hub_client::DaemonRequest::PluginMcpCallTool {
+            name: "event_plane.emit_ready".to_string(),
+            arguments: serde_json::json!({ "token": "cycle" }),
+        },
+    )
+    .expect("emit ready");
+    assert_eq!(emitted.plugin_tool_result["status"], "accepted");
+
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let mut last = None;
+    while Instant::now() < deadline {
+        let status = botster_hub_client::request(
+            hub.endpoint(),
+            botster_hub_client::DaemonRequest::PluginMcpCallTool {
+                name: "event_plane.cycle_status".to_string(),
+                arguments: serde_json::json!({}),
+            },
+        )
+        .expect("cycle status");
+        let handler = status.plugin_tool_result["handler_status"]
+            .as_str()
+            .unwrap_or("none");
+        let provider = status.plugin_tool_result["provider_status"]
+            .as_str()
+            .unwrap_or("none");
+        if handler == "rejected_causal_scope" && provider == "rejected_causal_scope" {
+            last = Some(status);
+            break;
+        }
+        thread::sleep(Duration::from_millis(40));
+    }
+    let status = last.expect("event handler and later provider emit stayed rejected_causal_scope");
+    assert_eq!(
+        status.plugin_tool_result["handler_status"],
+        "rejected_causal_scope"
+    );
+    assert_eq!(
+        status.plugin_tool_result["provider_status"],
+        "rejected_causal_scope"
+    );
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
 fn copy_dir_all(from: &Path, to: &Path) {
     fs::create_dir_all(to).expect("create dest");
     for entry in fs::read_dir(from).expect("read src") {

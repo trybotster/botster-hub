@@ -174,6 +174,7 @@ impl HubPackageManifest {
                 schema: crate::package_event_schema::CompiledEventSchema::compile(
                     &event.payload_schema,
                 )?,
+                package_generation: 0,
             });
         }
         Ok(contracts)
