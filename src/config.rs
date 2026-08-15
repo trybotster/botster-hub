@@ -125,8 +125,7 @@ pub struct HubConfig {
 
 impl HubConfig {
     pub(crate) fn plugin_worker_config(&self) -> botster_core::PluginWorkerEngineConfig {
-        self.core_engine
-            .plugin_worker_config(&PluginWorkerClassOptions::default())
+        self.core_engine.plugin_worker_config()
     }
 }
 
@@ -321,82 +320,8 @@ pub struct TcpBinding {
 /// The hub records queue, session I/O coalescing, and plugin-worker tuning here
 /// so startup policy is explicit. The underlying queues, session I/O worker,
 /// plugin worker engine, and delivery mechanics remain owned by `botster-core`.
-/// Class-specific plugin-worker queue knobs.
-///
-/// These knobs use Core defaults. They are not fields on
-/// [`HubStartupOptions`], [`HubConfig`], or [`CoreEngineOptions`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PluginWorkerClassOptions {
-    /// RequestResponse executor slots reserved by Core. Must be >= 1 and
-    /// strictly less than [`CoreEngineOptions::plugin_worker_executor_concurrency`].
-    #[serde(default = "default_reserved_request_response_executors")]
-    pub reserved_request_response_executors: usize,
-    /// Encoded RequestResponse waiting-queue byte capacity.
-    #[serde(default = "default_request_response_queue_byte_capacity")]
-    pub request_response_queue_byte_capacity: usize,
-    /// Per-plugin Background waiting-job capacity.
-    #[serde(default = "default_background_queue_capacity")]
-    pub background_queue_capacity: usize,
-    /// Encoded Background waiting-queue byte capacity.
-    #[serde(default = "default_background_queue_byte_capacity")]
-    pub background_queue_byte_capacity: usize,
-    /// Reserved async completion count.
-    #[serde(default = "default_completion_queue_capacity")]
-    pub completion_queue_capacity: usize,
-    /// Reserved async completion byte capacity.
-    #[serde(default = "default_completion_queue_byte_capacity")]
-    pub completion_queue_byte_capacity: usize,
-}
-
-impl Default for PluginWorkerClassOptions {
-    fn default() -> Self {
-        let plugin_worker = PluginWorkerEngineConfig::default();
-        Self {
-            reserved_request_response_executors: plugin_worker.reserved_request_response_executors,
-            request_response_queue_byte_capacity: plugin_worker
-                .request_response_queue_byte_capacity,
-            background_queue_capacity: plugin_worker.background_queue_capacity,
-            background_queue_byte_capacity: plugin_worker.background_queue_byte_capacity,
-            completion_queue_capacity: plugin_worker.completion_queue_capacity,
-            completion_queue_byte_capacity: plugin_worker.completion_queue_byte_capacity,
-        }
-    }
-}
-
-impl PluginWorkerClassOptions {
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn validate(&self, plugin_worker_executor_concurrency: usize) -> Result<(), HubConfigError> {
-        if self.reserved_request_response_executors < 1
-            || self.reserved_request_response_executors >= plugin_worker_executor_concurrency
-        {
-            return Err(HubConfigError::InvalidPluginWorkerReservation {
-                field: "plugin_worker_class.reserved_request_response_executors",
-            });
-        }
-        validate_positive_usize(
-            "plugin_worker_class.request_response_queue_byte_capacity",
-            self.request_response_queue_byte_capacity,
-        )?;
-        validate_positive_usize(
-            "plugin_worker_class.background_queue_capacity",
-            self.background_queue_capacity,
-        )?;
-        validate_positive_usize(
-            "plugin_worker_class.background_queue_byte_capacity",
-            self.background_queue_byte_capacity,
-        )?;
-        validate_positive_usize(
-            "plugin_worker_class.completion_queue_capacity",
-            self.completion_queue_capacity,
-        )?;
-        validate_positive_usize(
-            "plugin_worker_class.completion_queue_byte_capacity",
-            self.completion_queue_byte_capacity,
-        )?;
-        Ok(())
-    }
-}
-
+/// Class-specific plugin-worker queue knobs use Core defaults. They are not
+/// fields on [`HubStartupOptions`], [`HubConfig`], or this struct.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CoreEngineOptions {
@@ -453,19 +378,17 @@ impl CoreEngineOptions {
         }
     }
 
-    pub(crate) fn plugin_worker_config(
-        &self,
-        class: &PluginWorkerClassOptions,
-    ) -> PluginWorkerEngineConfig {
+    pub(crate) fn plugin_worker_config(&self) -> PluginWorkerEngineConfig {
+        let defaults = PluginWorkerEngineConfig::default();
         PluginWorkerEngineConfig {
             per_plugin_queue_capacity: self.plugin_worker_queue_capacity,
             per_plugin_executor_concurrency: self.plugin_worker_executor_concurrency,
-            reserved_request_response_executors: class.reserved_request_response_executors,
-            request_response_queue_byte_capacity: class.request_response_queue_byte_capacity,
-            background_queue_capacity: class.background_queue_capacity,
-            background_queue_byte_capacity: class.background_queue_byte_capacity,
-            completion_queue_capacity: class.completion_queue_capacity,
-            completion_queue_byte_capacity: class.completion_queue_byte_capacity,
+            reserved_request_response_executors: defaults.reserved_request_response_executors,
+            request_response_queue_byte_capacity: defaults.request_response_queue_byte_capacity,
+            background_queue_capacity: defaults.background_queue_capacity,
+            background_queue_byte_capacity: defaults.background_queue_byte_capacity,
+            completion_queue_capacity: defaults.completion_queue_capacity,
+            completion_queue_byte_capacity: defaults.completion_queue_byte_capacity,
         }
     }
 
@@ -478,6 +401,12 @@ impl CoreEngineOptions {
             "core_engine.plugin_worker_executor_concurrency",
             self.plugin_worker_executor_concurrency,
         )?;
+        let reserved = PluginWorkerEngineConfig::default().reserved_request_response_executors;
+        if reserved < 1 || reserved >= self.plugin_worker_executor_concurrency {
+            return Err(HubConfigError::InvalidPluginWorkerReservation {
+                field: "core_engine.plugin_worker_executor_concurrency",
+            });
+        }
         self.session_io_coalescing.validate()?;
         if let Some(path) = &self.session_worker_path {
             validate_non_empty_path("core_engine.session_worker_path", path)?;
@@ -651,30 +580,6 @@ fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-fn default_reserved_request_response_executors() -> usize {
-    PluginWorkerEngineConfig::default().reserved_request_response_executors
-}
-
-fn default_request_response_queue_byte_capacity() -> usize {
-    PluginWorkerEngineConfig::default().request_response_queue_byte_capacity
-}
-
-fn default_background_queue_capacity() -> usize {
-    PluginWorkerEngineConfig::default().background_queue_capacity
-}
-
-fn default_background_queue_byte_capacity() -> usize {
-    PluginWorkerEngineConfig::default().background_queue_byte_capacity
-}
-
-fn default_completion_queue_capacity() -> usize {
-    PluginWorkerEngineConfig::default().completion_queue_capacity
-}
-
-fn default_completion_queue_byte_capacity() -> usize {
-    PluginWorkerEngineConfig::default().completion_queue_byte_capacity
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -698,9 +603,7 @@ mod tests {
     fn omitted_worker_class_knobs_take_core_defaults() {
         let defaults = PluginWorkerEngineConfig::default();
         let options = HubStartupOptions::default();
-        let mapped = options
-            .core_engine
-            .plugin_worker_config(&PluginWorkerClassOptions::default());
+        let mapped = options.core_engine.plugin_worker_config();
         assert_eq!(
             mapped.reserved_request_response_executors,
             defaults.reserved_request_response_executors
@@ -724,11 +627,14 @@ mod tests {
 
     #[test]
     fn reserved_request_response_executors_must_leave_a_background_slot() {
-        let class = PluginWorkerClassOptions {
-            reserved_request_response_executors: 2,
-            ..PluginWorkerClassOptions::default()
+        let options = HubStartupOptions {
+            core_engine: CoreEngineOptions {
+                plugin_worker_executor_concurrency: 1,
+                ..CoreEngineOptions::default()
+            },
+            ..HubStartupOptions::default()
         };
-        let error = class.validate(2).expect_err("reservation must be strict");
+        let error = options.validate().expect_err("reservation must be strict");
         assert!(matches!(
             error,
             HubConfigError::InvalidPluginWorkerReservation { .. }

@@ -2,7 +2,7 @@
 
 use botster_hub::{
     CoreEngineOptions, DataDirectoryOption, DirectoryList, HostIdentityOptions, HubConfig,
-    HubStartupOptions, SessionDefaults, TransportBindings,
+    HubConfigError, HubStartupOptions, SessionDefaults, TransportBindings,
 };
 
 #[test]
@@ -80,5 +80,36 @@ fn external_crate_constructs_hub_config_with_prior_exhaustive_literal() {
         config.core_engine.plugin_worker_executor_concurrency,
         CoreEngineOptions::default().plugin_worker_executor_concurrency
     );
+    let _ = std::fs::remove_dir_all(data_directory);
+}
+
+#[test]
+fn executor_concurrency_one_is_rejected_at_hub_construction() {
+    let data_directory = std::env::temp_dir().join(format!(
+        "hub-concurrency-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let error = HubStartupOptions {
+        host: HostIdentityOptions::default(),
+        data_directory: DataDirectoryOption::Explicit(data_directory.clone()),
+        session_defaults: SessionDefaults::default(),
+        plugin_directories: DirectoryList::default(),
+        provider_directories: DirectoryList::default(),
+        transports: TransportBindings::default(),
+        core_engine: CoreEngineOptions {
+            plugin_worker_executor_concurrency: 1,
+            ..CoreEngineOptions::default()
+        },
+    }
+    .build_config_for_environment(&botster_hub::RuntimeEnvironment::from_values(None, None))
+    .expect_err("concurrency 1 must leave a background slot");
+    assert!(matches!(
+        error,
+        HubConfigError::InvalidPluginWorkerReservation { .. }
+    ));
     let _ = std::fs::remove_dir_all(data_directory);
 }

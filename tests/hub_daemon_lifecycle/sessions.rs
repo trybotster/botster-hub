@@ -3536,6 +3536,61 @@ fn ready_spawn_stays_within_budget_when_live_sessions_exceed_one_observe_slice()
 }
 
 #[test]
+fn ready_spawn_stays_within_budget_during_session_snapshot_assembly() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("snapshot-assemble-ready");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("test config has local socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    for index in 0..24 {
+        botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::Spawn {
+                session_id: format!("assemble-session-{index:02}"),
+                command: "sleep 8".to_string(),
+            },
+        )
+        .expect("spawn assemble session");
+    }
+    let mut subscription =
+        botster_hub_client::subscribe_session_entities(&endpoint, "assemble-sub")
+            .expect("assemble subscriber");
+    let started = Instant::now();
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: "assemble-ready-spawn".to_string(),
+            command: "sleep 0.05".to_string(),
+        },
+    )
+    .expect("ready spawn during snapshot assembly");
+    let waited = started.elapsed();
+    assert!(
+        waited <= Duration::from_millis(botster_hub::MAX_READY_OPERATION_WAIT_MS),
+        "ready spawn waited {waited:?} during snapshot assembly"
+    );
+    let first = subscription
+        .next_frame()
+        .expect("complete first snapshot");
+    match first {
+        botster_hub_client::DaemonEntityFrame::Snapshot { items, .. } => {
+            assert!(items.len() >= 24, "first snapshot must be complete");
+        }
+        other => panic!("expected complete snapshot, got {other:?}"),
+    }
+    let _ = subscription.unsubscribe();
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
 fn shutdown_from_another_connection_preserves_process_exit_for_attached_subscription() {
     let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("cross-shutdown-egress");

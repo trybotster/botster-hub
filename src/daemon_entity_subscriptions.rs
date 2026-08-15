@@ -45,7 +45,7 @@ pub(crate) enum EntityFrameSender {
 
 #[derive(Debug)]
 enum EntityFrameTrySendError {
-    Full,
+    Full(DaemonEntityFrame),
     Disconnected,
 }
 
@@ -54,11 +54,13 @@ impl EntityFrameSender {
         match self {
             #[cfg(test)]
             Self::Blocking(sender) => sender.try_send(frame).map_err(|error| match error {
-                mpsc::TrySendError::Full(_) => EntityFrameTrySendError::Full,
+                mpsc::TrySendError::Full(frame) => EntityFrameTrySendError::Full(frame),
                 mpsc::TrySendError::Disconnected(_) => EntityFrameTrySendError::Disconnected,
             }),
             Self::Async(sender) => sender.try_send(frame).map_err(|error| match error {
-                tokio::sync::mpsc::error::TrySendError::Full(_) => EntityFrameTrySendError::Full,
+                tokio::sync::mpsc::error::TrySendError::Full(frame) => {
+                    EntityFrameTrySendError::Full(frame)
+                }
                 tokio::sync::mpsc::error::TrySendError::Closed(_) => {
                     EntityFrameTrySendError::Disconnected
                 }
@@ -103,7 +105,9 @@ pub(crate) struct EntitySubscriptionState {
     delivery_phase: DeliveryPhase,
     /// Per-subscriber monotonic snapshot sequence.
     next_seq: u64,
-    /// Encoded item bytes accumulated while assembling a complete snapshot.
+    /// JSON values accumulated while assembling a complete first snapshot.
+    assembled_items: Vec<Value>,
+    /// Encoded item bytes plus JSON array separators for `assembled_items`.
     assembled_item_bytes: usize,
     /// True until a delivery page reports no remaining work.
     needs_delivery: bool,
@@ -178,6 +182,7 @@ pub(super) fn register_entity_subscription(
                 delivery_after: None,
                 delivery_phase: DeliveryPhase::Removes,
                 next_seq: 0,
+                assembled_items: Vec::new(),
                 assembled_item_bytes: 0,
                 needs_delivery: false,
             },
@@ -255,6 +260,7 @@ pub(super) fn register_entity_subscription(
                 delivery_after: None,
                 delivery_phase: DeliveryPhase::Removes,
                 next_seq: snapshot_seq,
+                assembled_items: Vec::new(),
                 assembled_item_bytes: 0,
                 needs_delivery: false,
             },
@@ -289,6 +295,7 @@ pub(super) fn register_entity_subscription(
             source_seq: snapshot_seq,
         },
         next_seq: snapshot_seq,
+        assembled_items: Vec::new(),
         assembled_item_bytes: 0,
         needs_delivery: true,
     };
@@ -376,7 +383,7 @@ fn drive_session_type_subscriptions(
                 };
                 return match subscription.sender.try_send_kind(error) {
                     Ok(()) | Err(EntityFrameTrySendError::Disconnected) => false,
-                    Err(EntityFrameTrySendError::Full) => true,
+                    Err(EntityFrameTrySendError::Full(_)) => true,
                 };
             }
             return match subscription.sender.try_send_kind(frame) {
@@ -386,7 +393,7 @@ fn drive_session_type_subscriptions(
                     subscription.resync_reason = None;
                     true
                 }
-                Err(EntityFrameTrySendError::Full) => true,
+                Err(EntityFrameTrySendError::Full(_)) => true,
                 Err(EntityFrameTrySendError::Disconnected) => false,
             };
         }
@@ -421,7 +428,7 @@ fn drive_session_type_subscriptions(
         for frame in frames {
             match subscription.sender.try_send_kind(frame) {
                 Ok(()) => {}
-                Err(EntityFrameTrySendError::Full) => {
+                Err(EntityFrameTrySendError::Full(_)) => {
                     subscription.resync_reason = Some("subscriber_overflow".to_string());
                     return true;
                 }
@@ -687,7 +694,7 @@ pub(super) fn drive_package_entity_fanout(daemon: &mut HubDaemon, state: &mut Da
                             Some("entity_provider_frame_too_large".to_string());
                         runtime.mark_package_entity_resync_needed(&entity_type);
                     }
-                    Err(EntityFrameTrySendError::Full) => {
+                    Err(EntityFrameTrySendError::Full(_)) => {
                         state.lifecycle_counters.entity_delivery_overflows = state
                             .lifecycle_counters
                             .entity_delivery_overflows
@@ -719,7 +726,7 @@ pub(super) fn drive_package_entity_fanout(daemon: &mut HubDaemon, state: &mut Da
                     subscription.package_last_applied_seq = Some(seq);
                     subscription.package_catching_up = false;
                 }
-                Err(EntityFrameTrySendError::Full) => {
+                Err(EntityFrameTrySendError::Full(_)) => {
                     state.lifecycle_counters.entity_delivery_overflows = state
                         .lifecycle_counters
                         .entity_delivery_overflows
@@ -922,7 +929,7 @@ pub(super) fn drive_package_entity_resync(daemon: &mut HubDaemon, state: &mut Da
                     subscription.package_catching_up = snapshot_seq < family_floor;
                     subscription.resync_reason = None;
                 }
-                Err(EntityFrameTrySendError::Full) => {
+                Err(EntityFrameTrySendError::Full(_)) => {
                     state.lifecycle_counters.entity_delivery_overflows = state
                         .lifecycle_counters
                         .entity_delivery_overflows
@@ -1043,19 +1050,8 @@ fn continue_session_snapshot_assembly(
         DeliveryPhase::Assembling { source_seq } => source_seq,
         _ => live_seq,
     };
-    if source_seq != live_seq {
-        state.entities.clear();
-        state.delivery_after = None;
-        state.assembled_item_bytes = 0;
-        state.delivery_phase = DeliveryPhase::Assembling {
-            source_seq: live_seq,
-        };
-    } else if !matches!(state.delivery_phase, DeliveryPhase::Assembling { .. }) {
-        state.entities.clear();
-        state.assembled_item_bytes = 0;
-        state.delivery_phase = DeliveryPhase::Assembling {
-            source_seq: live_seq,
-        };
+    if source_seq != live_seq || !matches!(state.delivery_phase, DeliveryPhase::Assembling { .. }) {
+        reset_snapshot_assembly(state, live_seq);
     }
     let (items, last_id, more) = take_snapshot_item_page(
         projection,
@@ -1067,10 +1063,11 @@ fn continue_session_snapshot_assembly(
     if items.is_empty() && more {
         return close_oversized_session_snapshot(subscription_id, state, counters);
     }
-    let page_bytes = items
-        .iter()
-        .map(|item| serde_json::to_vec(item).map(|body| body.len()).unwrap_or(0))
-        .sum::<usize>();
+    let page_item_bytes = encoded_item_bytes(&items);
+    let page_bytes = page_item_bytes.saturating_add(snapshot_separator_bytes(
+        state.assembled_items.len(),
+        items.len(),
+    ));
     let envelope = snapshot_envelope_bytes(subscription_id, state);
     if state
         .assembled_item_bytes
@@ -1080,20 +1077,28 @@ fn continue_session_snapshot_assembly(
     {
         return close_oversized_session_snapshot(subscription_id, state, counters);
     }
+    let page_item_count = items.len();
     store_snapshot_items(state, &items);
+    state.assembled_items.extend(items);
     state.assembled_item_bytes = state.assembled_item_bytes.saturating_add(page_bytes);
     state.delivery_after = last_id;
     if more {
         state.needs_delivery = true;
         return SnapshotAssemble::Continue {
             page: DeliveryPage {
-                items: items.len(),
+                items: page_item_count,
                 bytes: page_bytes,
                 more: true,
             },
         };
     }
-    let snapshot = complete_session_snapshot_frame(subscription_id, state);
+    let snapshot = DaemonEntityFrame::Snapshot {
+        subscription_id: subscription_id.to_string(),
+        entity_type: "session".to_string(),
+        snapshot_seq: state.next_seq,
+        items: std::mem::take(&mut state.assembled_items),
+        resync_reason: state.resync_reason.clone(),
+    };
     counters.entity_delivery_attempts = counters.entity_delivery_attempts.saturating_add(1);
     match state.sender.try_send_kind(snapshot) {
         Ok(()) => {
@@ -1102,16 +1107,20 @@ fn continue_session_snapshot_assembly(
             state.resync_reason = None;
             state.delivery_phase = DeliveryPhase::Removes;
             state.delivery_after = None;
+            state.assembled_item_bytes = 0;
             state.needs_delivery = false;
             SnapshotAssemble::Continue {
                 page: DeliveryPage {
-                    items: items.len(),
+                    items: page_item_count,
                     bytes: page_bytes,
                     more: false,
                 },
             }
         }
-        Err(EntityFrameTrySendError::Full) => {
+        Err(EntityFrameTrySendError::Full(frame)) => {
+            if let DaemonEntityFrame::Snapshot { items: queued, .. } = frame {
+                state.assembled_items = queued;
+            }
             counters.entity_delivery_overflows =
                 counters.entity_delivery_overflows.saturating_add(1);
             state.needs_delivery = true;
@@ -1132,6 +1141,30 @@ fn continue_session_snapshot_assembly(
     }
 }
 
+fn reset_snapshot_assembly(state: &mut EntitySubscriptionState, source_seq: u64) {
+    state.entities.clear();
+    state.assembled_items.clear();
+    state.assembled_item_bytes = 0;
+    state.delivery_after = None;
+    state.delivery_phase = DeliveryPhase::Assembling { source_seq };
+}
+
+fn encoded_item_bytes(items: &[Value]) -> usize {
+    items
+        .iter()
+        .map(|item| serde_json::to_vec(item).map(|body| body.len()).unwrap_or(0))
+        .sum()
+}
+
+fn snapshot_separator_bytes(existing_items: usize, new_items: usize) -> usize {
+    if new_items == 0 {
+        return 0;
+    }
+    new_items
+        .saturating_sub(1)
+        .saturating_add(usize::from(existing_items > 0))
+}
+
 fn snapshot_envelope_bytes(subscription_id: &str, state: &EntitySubscriptionState) -> usize {
     let empty = DaemonEntityFrame::Snapshot {
         subscription_id: subscription_id.to_string(),
@@ -1143,23 +1176,6 @@ fn snapshot_envelope_bytes(subscription_id: &str, state: &EntitySubscriptionStat
     serde_json::to_vec(&empty)
         .map(|body| body.len())
         .unwrap_or(256)
-}
-
-fn complete_session_snapshot_frame(
-    subscription_id: &str,
-    state: &EntitySubscriptionState,
-) -> DaemonEntityFrame {
-    DaemonEntityFrame::Snapshot {
-        subscription_id: subscription_id.to_string(),
-        entity_type: "session".to_string(),
-        snapshot_seq: state.next_seq,
-        items: state
-            .entities
-            .values()
-            .map(|entity| serde_json::to_value(entity).expect("serialize session entity"))
-            .collect(),
-        resync_reason: state.resync_reason.clone(),
-    }
 }
 
 fn close_oversized_session_snapshot(
@@ -1179,7 +1195,7 @@ fn close_oversized_session_snapshot(
             counters.entity_delivery_successes =
                 counters.entity_delivery_successes.saturating_add(1);
         }
-        Err(EntityFrameTrySendError::Full) => {
+        Err(EntityFrameTrySendError::Full(_)) => {
             counters.entity_delivery_overflows =
                 counters.entity_delivery_overflows.saturating_add(1);
         }
@@ -1191,6 +1207,7 @@ fn close_oversized_session_snapshot(
     state.resync_reason = None;
     state.delivery_phase = DeliveryPhase::Removes;
     state.delivery_after = None;
+    state.assembled_items.clear();
     state.assembled_item_bytes = 0;
     SnapshotAssemble::Closed {
         frame_too_large: true,
@@ -1434,7 +1451,7 @@ fn send_session_delta(
             }
             SendDelta::Alive { bytes }
         }
-        Err(EntityFrameTrySendError::Full) => {
+        Err(EntityFrameTrySendError::Full(_)) => {
             counters.entity_delivery_overflows =
                 counters.entity_delivery_overflows.saturating_add(1);
             state.resync_reason = Some("subscriber_overflow".to_string());
@@ -1467,7 +1484,7 @@ fn try_resync_subscription(
             state.resync_reason = None;
             true
         }
-        Err(EntityFrameTrySendError::Full) => {
+        Err(EntityFrameTrySendError::Full(_)) => {
             counters.entity_delivery_attempts = counters.entity_delivery_attempts.saturating_add(1);
             counters.entity_delivery_overflows =
                 counters.entity_delivery_overflows.saturating_add(1);
@@ -1891,6 +1908,7 @@ mod tests {
             delivery_after: None,
             delivery_phase: DeliveryPhase::Removes,
             next_seq: 0,
+            assembled_items: Vec::new(),
             assembled_item_bytes: 0,
             needs_delivery: false,
         };
@@ -1960,6 +1978,7 @@ mod tests {
                 delivery_after: None,
                 delivery_phase: DeliveryPhase::Removes,
                 next_seq: 0,
+                assembled_items: Vec::new(),
                 assembled_item_bytes: 0,
                 needs_delivery: false,
             },
@@ -2026,6 +2045,7 @@ mod tests {
             delivery_after: None,
             delivery_phase: DeliveryPhase::Removes,
             next_seq: 0,
+            assembled_items: Vec::new(),
             assembled_item_bytes: 0,
             needs_delivery: false,
         };
@@ -2117,6 +2137,7 @@ mod tests {
             delivery_after: None,
             delivery_phase: DeliveryPhase::Removes,
             next_seq: 0,
+            assembled_items: Vec::new(),
             assembled_item_bytes: 0,
             needs_delivery: false,
         };
@@ -2189,6 +2210,7 @@ mod tests {
             delivery_after: None,
             delivery_phase: DeliveryPhase::Rows,
             next_seq: 0,
+            assembled_items: Vec::new(),
             assembled_item_bytes: 0,
             needs_delivery: false,
         };
@@ -2256,6 +2278,7 @@ mod tests {
             delivery_after: None,
             delivery_phase: DeliveryPhase::Rows,
             next_seq: 110,
+            assembled_items: Vec::new(),
             assembled_item_bytes: 0,
             needs_delivery: true,
         };
@@ -2333,6 +2356,7 @@ mod tests {
                 delivery_after: None,
                 delivery_phase: DeliveryPhase::Rows,
                 next_seq: 0,
+                assembled_items: Vec::new(),
                 assembled_item_bytes: 0,
                 needs_delivery: false,
             };
@@ -2396,6 +2420,7 @@ mod tests {
             delivery_after: None,
             delivery_phase: DeliveryPhase::Assembling { source_seq: 1 },
             next_seq: 1,
+            assembled_items: Vec::new(),
             assembled_item_bytes: 0,
             needs_delivery: true,
         };
@@ -2481,6 +2506,7 @@ mod tests {
             delivery_after: None,
             delivery_phase: DeliveryPhase::Assembling { source_seq: 1 },
             next_seq: 1,
+            assembled_items: Vec::new(),
             assembled_item_bytes: 0,
             needs_delivery: true,
         };
@@ -2570,6 +2596,7 @@ mod tests {
             delivery_after: None,
             delivery_phase: DeliveryPhase::Assembling { source_seq: 1 },
             next_seq: 1,
+            assembled_items: Vec::new(),
             assembled_item_bytes: 0,
             needs_delivery: true,
         };
@@ -2643,6 +2670,7 @@ mod tests {
             delivery_after: None,
             delivery_phase: DeliveryPhase::Removes,
             next_seq: 1,
+            assembled_items: Vec::new(),
             assembled_item_bytes: 0,
             needs_delivery: true,
         };
@@ -2700,6 +2728,7 @@ mod tests {
             delivery_after: None,
             delivery_phase: DeliveryPhase::Assembling { source_seq: 1 },
             next_seq: 1,
+            assembled_items: Vec::new(),
             assembled_item_bytes: 0,
             needs_delivery: true,
         };
@@ -2718,17 +2747,162 @@ mod tests {
                 panic!("near-limit assembly");
             };
             assert!(started.elapsed() < Duration::from_millis(crate::MAX_OWNER_TURN_MS));
+            assert!(started.elapsed() < Duration::from_millis(crate::MAX_READY_OPERATION_WAIT_MS));
             if page.more {
                 assert_eq!(receiver.try_iter().count(), 0);
+                assert!(!state.assembled_items.is_empty());
             } else {
                 break;
             }
         }
+        assert!(state.assembled_items.is_empty());
         let frames: Vec<_> = receiver.try_iter().collect();
         assert_eq!(frames.len(), 1);
         match &frames[0] {
-            DaemonEntityFrame::Snapshot { items, .. } => assert_eq!(items.len(), 20),
+            DaemonEntityFrame::Snapshot { items, .. } => {
+                assert_eq!(items.len(), 20);
+                let encoded = serde_json::to_vec(frames.first().expect("frame"))
+                    .expect("encode")
+                    .len();
+                assert!(encoded <= DAEMON_MAX_FRAME_BYTES);
+            }
             other => panic!("expected complete snapshot, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn snapshot_size_charges_json_array_separators() {
+        assert_eq!(snapshot_separator_bytes(0, 0), 0);
+        assert_eq!(snapshot_separator_bytes(0, 1), 0);
+        assert_eq!(snapshot_separator_bytes(0, 3), 2);
+        assert_eq!(snapshot_separator_bytes(4, 1), 1);
+        assert_eq!(snapshot_separator_bytes(4, 2), 2);
+    }
+
+    #[test]
+    fn separators_close_when_item_bytes_fit_but_commas_do_not() {
+        let record = |id: String| SessionLifecycleRecord {
+            session: botster_core_daemon::DaemonSession {
+                session_id: SessionId(id),
+                registry_state: RegistrySessionState::Running,
+                size: botster_core::ResizePayload { rows: 24, cols: 80 },
+                process: None,
+                updated_at: 1,
+            },
+            metadata: botster_core::CoreSessionMetadata::new(),
+            lifecycle: Some(SessionLifecycleState::Running),
+        };
+        let probe = serde_json::to_value(
+            crate::session_projection::SessionProjection::project_entity(&record("sep-00".into())),
+        )
+        .expect("probe");
+        let probe_len = serde_json::to_vec(&probe).expect("encode probe").len();
+        let envelope = {
+            let (sender, _receiver) = mpsc::sync_channel(1);
+            snapshot_envelope_bytes(
+                "sub",
+                &EntitySubscriptionState {
+                    sender: EntityFrameSender::Blocking(sender),
+                    entity_type: "session".to_string(),
+                    cursor: None,
+                    entities: BTreeMap::new(),
+                    definition_generation: 0,
+                    definition_entities: BTreeMap::new(),
+                    resync_reason: None,
+                    owner_grant_id: None,
+                    package_last_applied_seq: None,
+                    package_catching_up: false,
+                    delivery_after: None,
+                    delivery_phase: DeliveryPhase::Assembling { source_seq: 1 },
+                    next_seq: 1,
+                    assembled_items: Vec::new(),
+                    assembled_item_bytes: 0,
+                    needs_delivery: true,
+                },
+            )
+        };
+        let mut pad = DAEMON_MAX_FRAME_BYTES
+            .saturating_sub(envelope)
+            .saturating_div(2)
+            .saturating_sub(probe_len)
+            .saturating_add(64);
+        let projection = loop {
+            let mut projection = crate::session_projection::SessionProjection::default();
+            projection.ingest_baseline_rows(
+                1,
+                [
+                    record(format!("sep-00-{}", "y".repeat(pad))),
+                    record(format!("sep-01-{}", "y".repeat(pad))),
+                ],
+            );
+            projection.seal_baseline(SessionLifecycleCursor {
+                source_id: botster_core_daemon::SessionLifecycleSourceId("s".into()),
+                sequence: 1,
+            });
+            let encoded_items: Vec<_> = projection
+                .rows
+                .values()
+                .map(|row| {
+                    serde_json::to_value(
+                        crate::session_projection::SessionProjection::project_entity(&row.record),
+                    )
+                    .expect("item")
+                })
+                .collect();
+            let item_only = encoded_item_bytes(&encoded_items);
+            let without_commas = item_only.saturating_add(envelope);
+            let with_commas =
+                without_commas.saturating_add(snapshot_separator_bytes(0, encoded_items.len()));
+            if without_commas <= DAEMON_MAX_FRAME_BYTES && with_commas > DAEMON_MAX_FRAME_BYTES {
+                break projection;
+            }
+            if without_commas > DAEMON_MAX_FRAME_BYTES {
+                pad = pad.saturating_sub(8);
+            } else {
+                pad = pad.saturating_add(1);
+            }
+            assert!(pad > 32, "failed to find separator boundary pad");
+        };
+        let (sender, receiver) = mpsc::sync_channel(2);
+        let mut state = EntitySubscriptionState {
+            sender: EntityFrameSender::Blocking(sender),
+            entity_type: "session".to_string(),
+            cursor: projection.cursor.clone(),
+            entities: BTreeMap::new(),
+            definition_generation: 0,
+            definition_entities: BTreeMap::new(),
+            resync_reason: None,
+            owner_grant_id: None,
+            package_last_applied_seq: None,
+            package_catching_up: false,
+            delivery_after: None,
+            delivery_phase: DeliveryPhase::Assembling { source_seq: 1 },
+            next_seq: 1,
+            assembled_items: Vec::new(),
+            assembled_item_bytes: 0,
+            needs_delivery: true,
+        };
+        let mut counters = DaemonLifecycleCounters::default();
+        let result = continue_session_snapshot_assembly(
+            "sub",
+            &mut state,
+            &projection,
+            &mut counters,
+            8,
+            DAEMON_MAX_FRAME_BYTES,
+            Duration::from_millis(crate::MAX_OWNER_TURN_MS),
+        );
+        assert!(matches!(
+            result,
+            SnapshotAssemble::Closed {
+                frame_too_large: true
+            }
+        ));
+        let frames: Vec<_> = receiver.try_iter().collect();
+        assert!(matches!(
+            frames.first(),
+            Some(DaemonEntityFrame::Error { code, .. })
+                if code == "entity_provider_frame_too_large"
+        ));
     }
 }
