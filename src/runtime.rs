@@ -2026,6 +2026,14 @@ impl SessionLifecycleWalk {
     pub(crate) fn is_holding_snapshot(&self) -> bool {
         self.snapshot.is_some()
     }
+
+    #[cfg(test)]
+    pub(crate) fn hold_snapshot_for_test(&mut self) {
+        self.snapshot = Some(SessionLifecycleCursor {
+            source_id: botster_core_daemon::SessionLifecycleSourceId("test".to_string()),
+            sequence: 1,
+        });
+    }
 }
 
 pub(crate) fn shutdown_lifecycle_page_budget(
