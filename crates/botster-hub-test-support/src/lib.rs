@@ -1397,7 +1397,7 @@ pub struct ForegroundTerminalAppOpenConformanceReport {
 /// validation error handling, and session teardown using only public
 /// `botster-hub-client` calls. Held-open `botster_hub_client::stream_attach` is
 /// a separate production helper; live IsolatedHub proof lives in
-/// `unix_adapter_unbound_stream_attach_returns_late_bytes`.
+/// `unix_adapter_always_bind_stream_attach_restores_current_screen`.
 ///
 /// # Example
 ///

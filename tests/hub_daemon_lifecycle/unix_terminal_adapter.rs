@@ -51,7 +51,10 @@ fn unix_envelope_contains_live_bytes(
         let Ok(bytes) = envelope.payload_bytes() else {
             return false;
         };
-        if bytes.windows(marker.len()).any(|window| window == marker.as_bytes()) {
+        if bytes
+            .windows(marker.len())
+            .any(|window| window == marker.as_bytes())
+        {
             return true;
         }
         let Ok(event) = serde_json::from_slice::<botster_hub_client::DaemonEvent>(&bytes) else {
@@ -96,7 +99,10 @@ fn unix_adapter_bind_returns_only_attaching_then_opaque_envelopes() {
         },
         &mut envelopes,
     );
-    assert_eq!(spawned.kind, botster_hub_client::DaemonResponseKind::Spawned);
+    assert_eq!(
+        spawned.kind,
+        botster_hub_client::DaemonResponseKind::Spawned
+    );
 
     let attach = request_skipping_envelopes(
         &mut stream,
@@ -123,7 +129,10 @@ fn unix_adapter_bind_returns_only_attaching_then_opaque_envelopes() {
             &mut envelopes,
         );
         assert!(
-            drain.events.iter().all(|event| !event_is_terminal_body(event)),
+            drain
+                .events
+                .iter()
+                .all(|event| !event_is_terminal_body(event)),
             "bound drain must not emit terminal bodies: {:?}",
             drain.events
         );
@@ -158,28 +167,21 @@ fn unix_adapter_bind_returns_only_attaching_then_opaque_envelopes() {
         session_worker_binary_path().display()
     );
 
-    let before = botster_hub_client::request(
-        &endpoint,
-        botster_hub_client::DaemonRequest::Status,
-    )
-    .expect("status before bound disconnect")
-    .status
-    .expect("status body")
-    .lifecycle_counters;
+    let before = botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+        .expect("status before bound disconnect")
+        .status
+        .expect("status body")
+        .lifecycle_counters;
     drop(stream);
-    let leftover = botster_hub_client::request(
-        &endpoint,
-        botster_hub_client::DaemonRequest::ListSessions,
-    )
-    .expect("list after disconnect");
+    let leftover =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::ListSessions)
+            .expect("list after disconnect");
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut counters = before.clone();
     while Instant::now() < deadline {
-        let status = botster_hub_client::request(
-            &endpoint,
-            botster_hub_client::DaemonRequest::Status,
-        )
-        .expect("status after bound disconnect");
+        let status =
+            botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+                .expect("status after bound disconnect");
         counters = status.status.expect("status body").lifecycle_counters;
         let bound_closes = counters
             .cleanup_by_reason
@@ -263,7 +265,10 @@ fn unix_adapter_bind_returns_only_attaching_then_opaque_envelopes() {
         },
         &mut replacement_envelopes,
     );
-    assert_eq!(reattach.kind, botster_hub_client::DaemonResponseKind::Events);
+    assert_eq!(
+        reattach.kind,
+        botster_hub_client::DaemonResponseKind::Events
+    );
     assert!(
         reattach.events.is_empty(),
         "adapter close on disconnect is the one Core detach; replacement attach is admitted with empty bodies: {:?}",
@@ -401,7 +406,10 @@ fn unix_adapter_explicit_detach_is_separate_from_connection_death() {
         "explicit Detach must use the authorized path: {counters:?}"
     );
     assert_eq!(
-        counters.cleanup_by_reason.get("bound_adapter_close").copied(),
+        counters
+            .cleanup_by_reason
+            .get("bound_adapter_close")
+            .copied(),
         None,
         "explicit Detach must not use bound socket-death cleanup: {counters:?}"
     );
@@ -415,7 +423,10 @@ fn unix_adapter_explicit_detach_is_separate_from_connection_death() {
         },
         &mut envelopes,
     );
-    assert_ne!(second.kind, botster_hub_client::DaemonResponseKind::OperatorError);
+    assert_ne!(
+        second.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError
+    );
 
     let listed = request_skipping_envelopes(
         &mut stream,
@@ -462,7 +473,10 @@ fn unix_adapter_stale_disconnect_does_not_cancel_replacement_owner() {
         },
         &mut envelopes_a,
     );
-    assert_eq!(attach_a.kind, botster_hub_client::DaemonResponseKind::Events);
+    assert_eq!(
+        attach_a.kind,
+        botster_hub_client::DaemonResponseKind::Events
+    );
     assert!(
         attach_a.events.is_empty(),
         "owner A Attach must not return terminal bodies: {:?}",
@@ -477,7 +491,10 @@ fn unix_adapter_stale_disconnect_does_not_cancel_replacement_owner() {
         },
         &mut envelopes_a,
     );
-    assert_eq!(detach_a.kind, botster_hub_client::DaemonResponseKind::Events);
+    assert_eq!(
+        detach_a.kind,
+        botster_hub_client::DaemonResponseKind::Events
+    );
 
     let (mut owner_b, mut reader_b) = unix_adapter_connection(&endpoint);
     let mut envelopes_b = Vec::new();
@@ -490,7 +507,10 @@ fn unix_adapter_stale_disconnect_does_not_cancel_replacement_owner() {
         },
         &mut envelopes_b,
     );
-    assert_eq!(attach_b.kind, botster_hub_client::DaemonResponseKind::Events);
+    assert_eq!(
+        attach_b.kind,
+        botster_hub_client::DaemonResponseKind::Events
+    );
     assert!(
         attach_b.events.is_empty(),
         "replacement owner B must bind the same key with empty bodies: {:?}",
@@ -524,7 +544,9 @@ fn unix_adapter_stale_disconnect_does_not_cancel_replacement_owner() {
         thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(
-        after.cleanup_completed.saturating_sub(before.cleanup_completed),
+        after
+            .cleanup_completed
+            .saturating_sub(before.cleanup_completed),
         1,
         "A's disconnect must complete Hub cleanup exactly once before sibling-survival checks: before={before:?} after={after:?}"
     );
@@ -659,7 +681,10 @@ fn unix_adapter_unbound_printf_stream_attach_completes() {
             command: format!("printf 'smoke:{marker}\\n'"),
         })
         .expect("spawn printf");
-    assert_eq!(spawned.kind, botster_hub_client::DaemonResponseKind::Spawned);
+    assert_eq!(
+        spawned.kind,
+        botster_hub_client::DaemonResponseKind::Spawned
+    );
 
     let attach = connection
         .request(&botster_hub_client::DaemonRequest::Attach {
@@ -722,29 +747,63 @@ fn unix_adapter_unbound_printf_stream_attach_completes() {
 }
 
 #[test]
-fn unix_adapter_unbound_stream_attach_returns_late_bytes() {
+fn unix_adapter_always_bind_stream_attach_restores_current_screen() {
     let _guard = daemon_test_guard();
     let hub = start_isolated_live_output_hub("usa");
     let endpoint = hub.endpoint().clone();
     let session_id = "usa-session";
     let subscription_id = "usa-sub";
     let late = "late-stream-attach";
+    let ready_dir = unique_short_test_dir("usa-ready");
+    let ready_path = ready_dir.join("ready");
+    fs::create_dir_all(&ready_dir).expect("create late-marker ready dir");
     botster_hub_client::request(
         &endpoint,
         botster_hub_client::DaemonRequest::Spawn {
             session_id: session_id.to_string(),
-            command: format!("printf 'pre-attach\\n'; sleep 1; printf '{late}\\n'; sleep 30"),
+            command: format!(
+                "printf 'pre-attach\\n'; printf '{late}\\n'; printf x > {}; sleep 30",
+                ready_path.display()
+            ),
         },
     )
-    .expect("spawn exiting writer");
-    thread::sleep(Duration::from_millis(1500));
+    .expect("spawn writer that publishes a ready file after the late marker");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !ready_path.exists() {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        ready_path.exists(),
+        "child must create the ready file after printing {late}"
+    );
+    let screen_deadline = Instant::now() + Duration::from_secs(5);
+    let mut screen_text = String::new();
+    while Instant::now() < screen_deadline {
+        screen_text = botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::ReadScreen {
+                session_id: session_id.to_string(),
+            },
+        )
+        .ok()
+        .and_then(|response| response.read_screen.map(|screen| screen.text))
+        .unwrap_or_default();
+        if screen_text.contains(late) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        screen_text.contains(late),
+        "host ReadScreen must contain the late marker before stream_attach: {screen_text:?}"
+    );
     let mut output = Vec::new();
     botster_hub_client::stream_attach(&endpoint, session_id, subscription_id, &mut output)
         .expect("stream_attach");
     let text = String::from_utf8_lossy(&output);
     assert!(
         text.contains(late),
-        "stream_attach writes current ReadScreen text: {text:?}"
+        "always-bind stream_attach restores current ReadScreen text: {text:?}"
     );
 
     hub.shutdown().expect("shutdown isolated hub");
@@ -788,7 +847,10 @@ fn spawn_and_bind(
         envelopes,
         events,
     );
-    assert_eq!(spawned.kind, botster_hub_client::DaemonResponseKind::Spawned);
+    assert_eq!(
+        spawned.kind,
+        botster_hub_client::DaemonResponseKind::Spawned
+    );
     let attach = request_collecting_mux(
         stream,
         reader,
@@ -955,7 +1017,10 @@ fn mismatched_terminal_hello_rejects_attach_before_core_ownership() {
         &mut events,
     );
     assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
-    assert!(envelopes.is_empty(), "rejected attach must not bind: {envelopes:?}");
+    assert!(
+        envelopes.is_empty(),
+        "rejected attach must not bind: {envelopes:?}"
+    );
     drop(stream);
     hub.shutdown().expect("shutdown isolated hub");
 }
@@ -995,7 +1060,10 @@ fn host_adapter_close_emits_terminal_subscription_closed_for_one_route() {
         &mut envelopes,
         &mut events,
     );
-    assert_eq!(reattach.kind, botster_hub_client::DaemonResponseKind::Events);
+    assert_eq!(
+        reattach.kind,
+        botster_hub_client::DaemonResponseKind::Events
+    );
     assert!(
         wait_for_subscription_closed(
             &mut stream,
@@ -1041,7 +1109,12 @@ fn host_adapter_close_emits_terminal_subscription_closed_for_one_route() {
         &mut envelopes,
         &mut events,
     );
-    assert!(listed.sessions.iter().any(|session| session.session_id == "hac-b"));
+    assert!(
+        listed
+            .sessions
+            .iter()
+            .any(|session| session.session_id == "hac-b")
+    );
     shutdown_short_lived_session(hub.endpoint(), "hac-a");
     shutdown_short_lived_session(hub.endpoint(), "hac-b");
     hub.shutdown().expect("shutdown isolated hub");
@@ -1568,7 +1641,10 @@ fn stale_generation_close_does_not_sweep_replacement_owner() {
         &mut envelopes_b,
         &mut events_b,
     );
-    assert_eq!(attach_b.kind, botster_hub_client::DaemonResponseKind::Events);
+    assert_eq!(
+        attach_b.kind,
+        botster_hub_client::DaemonResponseKind::Events
+    );
     assert!(
         !attach_b.events.iter().any(|event| matches!(
             event,
@@ -1643,9 +1719,9 @@ fn stale_generation_close_does_not_sweep_replacement_owner() {
 fn terminal_subscription_closed_feature_does_not_raise_default_requirement() {
     let requirement = botster_hub_client::DaemonCompatibilityRequirement::current();
     let mut previous = botster_hub_client::DaemonCompatibility::current();
-    previous.features.retain(|feature| {
-        feature != botster_hub_client::FEATURE_TERMINAL_SUBSCRIPTION_CLOSED
-    });
+    previous
+        .features
+        .retain(|feature| feature != botster_hub_client::FEATURE_TERMINAL_SUBSCRIPTION_CLOSED);
     previous.conformance_fixture_revision =
         botster_hub_client::DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION;
     botster_hub_client::ensure_compatible(&requirement, &previous)

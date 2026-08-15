@@ -14,7 +14,7 @@ Plan: `docs/plans/cold-cut-terminal-drains-and-translation-from-the-production-p
 | Worktree HEAD before edits | `959c58f55726d098299cced8af151d8f496f41e3` |
 | Locked Core SHA | `aef6516d5809d563961ed7fdd07da29a7b4edddc` |
 | Merge policy | direct into `main`; no PR |
-| Review follow-up | `review_1786786926_291745` on `b77ffae` |
+| Review follow-up | `review_1786788470_558598` on `2392d61` |
 
 Independent routing matched the approved plan. This run did not infer the repository from the ambient directory.
 
@@ -141,6 +141,16 @@ Review `review_1786786926_291745` required one follow-up on `b77ffae`:
 
 - `finding_1786786926_247494` — do not report an Active-session `Runtime` or `State` shutdown failure as `already_exited`.
 
+Review `review_1786788470_558598` required one follow-up on `2392d61`:
+
+- `finding_1786788470_105667` — `stream_attach` late-screen proof used a fixed 1500 ms sleep and kept the retired unbound name.
+
+This visit:
+
+- The child prints the late marker, then creates a ready file.
+- The test waits for that file, then waits for host `ReadScreen` to contain the marker, then calls `stream_attach`.
+- The test is now `unix_adapter_always_bind_stream_attach_restores_current_screen`.
+
 ## Runtime-teardown lenses
 
 | Lens | Implemented |
@@ -191,6 +201,7 @@ Passed on this tree:
 - `shutdown_after_observed_exit_returns_session_cleanup` passed isolated
 - `external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup` passed isolated after the extra parking `ReadScreen` was removed
 - `external_hub_webrtc_live_output_preserves_exact_bytes` passed isolated
+- `unix_adapter_always_bind_stream_attach_restores_current_screen` passed isolated three times (1.56–1.61s)
 
 ## Unverified behavior or residual risk
 
