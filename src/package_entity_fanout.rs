@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 use botster_core::{EntityFrame, EntityId, EntityKind};
 use serde_json::Value;
 
+use crate::package_event_router::CausalOp;
+
 /// Pending-window width for out-of-order publish admission.
 pub const PACKAGE_ENTITY_PENDING_WINDOW: u64 = 16;
 /// First backoff after an initial immediate resync attempt.
@@ -301,6 +303,7 @@ pub struct PackageEntityFamilyState {
     pub pending_leases: BTreeMap<u64, EntityMutationLease>,
     pub resync: PackageEntityResyncState,
     pub unloading: bool,
+    pub held_causal: Option<CausalOp>,
 }
 
 impl PackageEntityFamilyState {
