@@ -117,7 +117,7 @@ pub struct HubRuntime {
     family_source: std::cell::RefCell<Option<CausalOp>>,
     family_overflow: std::cell::RefCell<Option<CausalOp>>,
     source_ops: std::cell::RefCell<VecDeque<CausalOp>>,
-    source_held: std::cell::RefCell<Option<CausalOp>>,
+    source_held: std::cell::RefCell<VecDeque<CausalOp>>,
     event_plane_owner_ops: std::cell::RefCell<crate::package_event_router::EventPlaneOwnerOps>,
 }
 
@@ -125,6 +125,7 @@ type SharedCoreDaemon = Mutex<CoreDaemon>;
 type SharedSessionContexts = Arc<Mutex<BTreeMap<String, HubSessionContext>>>;
 const SESSION_TYPE_SPAWN_TIMEOUT_MS: u64 = 30_000;
 const PLUGIN_EVENT_TIMEOUT_MS: u64 = 1_000;
+const SOURCE_HELD_MAX: usize = 2;
 
 /// Shared hub-owned session-type spawn bridge exposed to Lua plugin workers.
 pub type SharedSessionTypeSpawner = Arc<HubSessionTypeSpawner>;
@@ -285,7 +286,7 @@ impl HubRuntime {
             family_source: std::cell::RefCell::new(None),
             family_overflow: std::cell::RefCell::new(None),
             source_ops: std::cell::RefCell::new(VecDeque::new()),
-            source_held: std::cell::RefCell::new(None),
+            source_held: std::cell::RefCell::new(VecDeque::new()),
             event_plane_owner_ops: std::cell::RefCell::new(
                 crate::package_event_router::EventPlaneOwnerOps::default(),
             ),
@@ -379,7 +380,7 @@ impl HubRuntime {
             family_source: std::cell::RefCell::new(None),
             family_overflow: std::cell::RefCell::new(None),
             source_ops: std::cell::RefCell::new(VecDeque::new()),
-            source_held: std::cell::RefCell::new(None),
+            source_held: std::cell::RefCell::new(VecDeque::new()),
             event_plane_owner_ops: std::cell::RefCell::new(
                 crate::package_event_router::EventPlaneOwnerOps::default(),
             ),
@@ -532,7 +533,7 @@ impl HubRuntime {
             || self.family_source.borrow().is_some()
             || self.family_overflow.borrow().is_some()
             || !self.source_ops.borrow().is_empty()
-            || self.source_held.borrow().is_some()
+            || !self.source_held.borrow().is_empty()
             || self.has_family_leftovers()
     }
 
@@ -767,8 +768,8 @@ impl HubRuntime {
 
     fn hold_source_retry(&self, op: CausalOp) -> CausalAdmitResult {
         let mut held = self.source_held.borrow_mut();
-        if held.is_none() {
-            *held = Some(op);
+        if held.len() < SOURCE_HELD_MAX {
+            held.push_back(op);
             CausalAdmitResult::Applied
         } else {
             CausalAdmitResult::Retry(op)
@@ -880,7 +881,24 @@ impl HubRuntime {
         self.retry_one_held(&self.family_held, &mut applied, started);
         self.retry_one_held(&self.family_source, &mut applied, started);
         self.retry_one_held(&self.family_overflow, &mut applied, started);
-        self.retry_one_held(&self.source_held, &mut applied, started);
+        let mut pending = std::mem::take(&mut *self.source_held.borrow_mut());
+        let mut leftover = VecDeque::new();
+        while let Some(op) = pending.pop_front() {
+            if applied >= CAUSAL_FLUSH_MAX || started.elapsed() >= Duration::from_millis(8) {
+                leftover.push_back(op);
+                leftover.append(&mut pending);
+                break;
+            }
+            match self.enqueue_retry(CausalAdmitResult::Retry(op)) {
+                CausalAdmitResult::Applied => applied += 1,
+                CausalAdmitResult::Retry(op) => {
+                    leftover.push_back(op);
+                    leftover.append(&mut pending);
+                    break;
+                }
+            }
+        }
+        self.source_held.borrow_mut().append(&mut leftover);
         let mut pending = std::mem::take(&mut *self.source_ops.borrow_mut());
         let mut leftover = VecDeque::new();
         while let Some(op) = pending.pop_front() {
@@ -1089,7 +1107,13 @@ impl HubRuntime {
     #[must_use]
     #[doc(hidden)]
     pub fn test_source_held(&self) -> bool {
-        self.source_held.borrow().is_some()
+        !self.source_held.borrow().is_empty()
+    }
+
+    #[must_use]
+    #[doc(hidden)]
+    pub fn test_source_held_len(&self) -> usize {
+        self.source_held.borrow().len()
     }
 
     #[doc(hidden)]
@@ -2173,18 +2197,21 @@ impl HubRuntime {
         mutation_seq: u64,
         result: &PackageEntityPublishResult,
     ) {
-        if let CausalAdmitResult::Retry(op) =
-            self.enqueue_or_family(self.admit_causal_op(settle_entity_publish_op(
-                family,
-                scope_id,
-                plugin_key,
-                entity_type,
-                mutation_seq,
-                result,
-            )))
+        let op = settle_entity_publish_op(
+            family,
+            scope_id,
+            plugin_key,
+            entity_type,
+            mutation_seq,
+            result,
+        );
+        if let CausalAdmitResult::Retry(op) = self.enqueue_or_family(self.admit_causal_op(op))
             && let CausalAdmitResult::Retry(_op) = self.keep_or_reject(op)
         {
-            family.forget_resync_lease(scope_id, entity_type);
+            return;
+        }
+        if result.resync_needed {
+            family.remember_resync_lease(scope_id, entity_type.to_string());
         }
     }
 
@@ -2528,7 +2555,7 @@ impl HubRuntime {
             || self.family_source.borrow().is_some()
             || self.family_overflow.borrow().is_some()
             || !self.source_ops.borrow().is_empty()
-            || self.source_held.borrow().is_some()
+            || !self.source_held.borrow().is_empty()
         {
             return true;
         }
@@ -4251,7 +4278,7 @@ pub struct TakenPackageEntityMutation {
 }
 
 fn settle_entity_publish_op(
-    family: &mut PackageEntityFamilyState,
+    _family: &mut PackageEntityFamilyState,
     scope_id: u64,
     plugin_key: &str,
     entity_type: &str,
@@ -4277,7 +4304,7 @@ fn settle_entity_publish_op(
             seq: mutation_seq,
         });
     }
-    if result.resync_needed && family.remember_resync_lease(scope_id, entity_type.to_string()) {
+    if result.resync_needed {
         next.push(LeaseIdentity::ProviderResyncNeed {
             family: entity_type.to_string(),
         });
