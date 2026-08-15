@@ -3260,19 +3260,6 @@ fn handle_runtime_control_request(
                     return Ok(daemon_unknown_session_cleanup(&session_id));
                 }
             }
-            let now = tick(logical_clock);
-            let _ =
-                runtime.apply_parked_lifecycle_observations(&SessionId(session_id.clone()), now);
-            observe_lifecycle_turn(runtime, now);
-            match classify_shutdown_session(runtime, &session_id)? {
-                ShutdownSessionClassification::Active => {}
-                ShutdownSessionClassification::Cleanup(cleanup) => {
-                    return Ok(daemon_session_cleanup(cleanup));
-                }
-                ShutdownSessionClassification::Missing => {
-                    return Ok(daemon_unknown_session_cleanup(&session_id));
-                }
-            }
             let shutdown_session_id = session_id.clone();
             let response = match api.handle_request(
                 runtime,
@@ -3300,10 +3287,7 @@ fn handle_runtime_control_request(
                             }
                         }
                     }
-                    let now = tick(logical_clock);
-                    let _ = runtime
-                        .apply_parked_lifecycle_observations(&SessionId(session_id.clone()), now);
-                    observe_lifecycle_turn(runtime, now);
+                    observe_lifecycle_turn(runtime, tick(logical_clock));
                     let response = shutdown_error_response(
                         classify_shutdown_session(runtime, &session_id)?,
                         error,
@@ -4535,19 +4519,40 @@ fn classify_shutdown_session(
     };
 
     match session.registry_state {
-        RegistrySessionState::Running => Ok(ShutdownSessionClassification::Active),
-        RegistrySessionState::Stopping | RegistrySessionState::Exited => Ok(
-            ShutdownSessionClassification::Cleanup(DaemonSessionCleanup {
-                session_id: session_id.to_string(),
-                outcome: "already_exited".to_string(),
-            }),
-        ),
-        RegistrySessionState::Stale => Ok(ShutdownSessionClassification::Cleanup(
+        RegistrySessionState::Stopping | RegistrySessionState::Exited => {
+            return Ok(ShutdownSessionClassification::Cleanup(
+                DaemonSessionCleanup {
+                    session_id: session_id.to_string(),
+                    outcome: "already_exited".to_string(),
+                },
+            ));
+        }
+        RegistrySessionState::Stale => {
+            return Ok(ShutdownSessionClassification::Cleanup(
+                DaemonSessionCleanup {
+                    session_id: session_id.to_string(),
+                    outcome: "stale_session".to_string(),
+                },
+            ));
+        }
+        RegistrySessionState::Running => {}
+    }
+
+    match runtime
+        .session_runtime_lifecycle(&SessionId(session_id.to_string()))
+        .map_err(crate::HubRuntimeError::from)?
+    {
+        Some(SessionLifecycleState::Stopping)
+        | Some(SessionLifecycleState::Exited { .. })
+        | Some(SessionLifecycleState::Failed { .. }) => Ok(ShutdownSessionClassification::Cleanup(
             DaemonSessionCleanup {
                 session_id: session_id.to_string(),
-                outcome: "stale_session".to_string(),
+                outcome: "already_exited".to_string(),
             },
         )),
+        Some(SessionLifecycleState::Starting) | Some(SessionLifecycleState::Running) | None => {
+            Ok(ShutdownSessionClassification::Active)
+        }
     }
 }
 
