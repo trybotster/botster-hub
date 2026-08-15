@@ -103,6 +103,8 @@ pub(crate) struct EntitySubscriptionState {
     delivery_phase: DeliveryPhase,
     /// Per-subscriber monotonic snapshot sequence.
     next_seq: u64,
+    /// Encoded item bytes accumulated while assembling a complete snapshot.
+    assembled_item_bytes: usize,
     /// True until a delivery page reports no remaining work.
     needs_delivery: bool,
 }
@@ -176,6 +178,7 @@ pub(super) fn register_entity_subscription(
                 delivery_after: None,
                 delivery_phase: DeliveryPhase::Removes,
                 next_seq: 0,
+                assembled_item_bytes: 0,
                 needs_delivery: false,
             },
         );
@@ -252,6 +255,7 @@ pub(super) fn register_entity_subscription(
                 delivery_after: None,
                 delivery_phase: DeliveryPhase::Removes,
                 next_seq: snapshot_seq,
+                assembled_item_bytes: 0,
                 needs_delivery: false,
             },
         );
@@ -285,6 +289,7 @@ pub(super) fn register_entity_subscription(
             source_seq: snapshot_seq,
         },
         next_seq: snapshot_seq,
+        assembled_item_bytes: 0,
         needs_delivery: true,
     };
     if complete {
@@ -1041,10 +1046,13 @@ fn continue_session_snapshot_assembly(
     if source_seq != live_seq {
         state.entities.clear();
         state.delivery_after = None;
+        state.assembled_item_bytes = 0;
         state.delivery_phase = DeliveryPhase::Assembling {
             source_seq: live_seq,
         };
     } else if !matches!(state.delivery_phase, DeliveryPhase::Assembling { .. }) {
+        state.entities.clear();
+        state.assembled_item_bytes = 0;
         state.delivery_phase = DeliveryPhase::Assembling {
             source_seq: live_seq,
         };
@@ -1059,22 +1067,33 @@ fn continue_session_snapshot_assembly(
     if items.is_empty() && more {
         return close_oversized_session_snapshot(subscription_id, state, counters);
     }
-    store_snapshot_items(state, &items);
-    state.delivery_after = last_id;
-    let snapshot = complete_session_snapshot_frame(subscription_id, state);
-    if entity_frame_exceeds_limit(&snapshot) {
+    let page_bytes = items
+        .iter()
+        .map(|item| serde_json::to_vec(item).map(|body| body.len()).unwrap_or(0))
+        .sum::<usize>();
+    let envelope = snapshot_envelope_bytes(subscription_id, state);
+    if state
+        .assembled_item_bytes
+        .saturating_add(page_bytes)
+        .saturating_add(envelope)
+        > DAEMON_MAX_FRAME_BYTES
+    {
         return close_oversized_session_snapshot(subscription_id, state, counters);
     }
+    store_snapshot_items(state, &items);
+    state.assembled_item_bytes = state.assembled_item_bytes.saturating_add(page_bytes);
+    state.delivery_after = last_id;
     if more {
         state.needs_delivery = true;
         return SnapshotAssemble::Continue {
             page: DeliveryPage {
                 items: items.len(),
-                bytes: 0,
+                bytes: page_bytes,
                 more: true,
             },
         };
     }
+    let snapshot = complete_session_snapshot_frame(subscription_id, state);
     counters.entity_delivery_attempts = counters.entity_delivery_attempts.saturating_add(1);
     match state.sender.try_send_kind(snapshot) {
         Ok(()) => {
@@ -1087,7 +1106,7 @@ fn continue_session_snapshot_assembly(
             SnapshotAssemble::Continue {
                 page: DeliveryPage {
                     items: items.len(),
-                    bytes: 0,
+                    bytes: page_bytes,
                     more: false,
                 },
             }
@@ -1111,6 +1130,19 @@ fn continue_session_snapshot_assembly(
             }
         }
     }
+}
+
+fn snapshot_envelope_bytes(subscription_id: &str, state: &EntitySubscriptionState) -> usize {
+    let empty = DaemonEntityFrame::Snapshot {
+        subscription_id: subscription_id.to_string(),
+        entity_type: "session".to_string(),
+        snapshot_seq: state.next_seq,
+        items: Vec::new(),
+        resync_reason: state.resync_reason.clone(),
+    };
+    serde_json::to_vec(&empty)
+        .map(|body| body.len())
+        .unwrap_or(256)
 }
 
 fn complete_session_snapshot_frame(
@@ -1159,6 +1191,7 @@ fn close_oversized_session_snapshot(
     state.resync_reason = None;
     state.delivery_phase = DeliveryPhase::Removes;
     state.delivery_after = None;
+    state.assembled_item_bytes = 0;
     SnapshotAssemble::Closed {
         frame_too_large: true,
     }
@@ -1858,6 +1891,7 @@ mod tests {
             delivery_after: None,
             delivery_phase: DeliveryPhase::Removes,
             next_seq: 0,
+            assembled_item_bytes: 0,
             needs_delivery: false,
         };
         let mut counters = DaemonLifecycleCounters::default();
@@ -1926,6 +1960,7 @@ mod tests {
                 delivery_after: None,
                 delivery_phase: DeliveryPhase::Removes,
                 next_seq: 0,
+                assembled_item_bytes: 0,
                 needs_delivery: false,
             },
         )]);
@@ -1991,6 +2026,7 @@ mod tests {
             delivery_after: None,
             delivery_phase: DeliveryPhase::Removes,
             next_seq: 0,
+            assembled_item_bytes: 0,
             needs_delivery: false,
         };
         let mut counters = DaemonLifecycleCounters::default();
@@ -2081,6 +2117,7 @@ mod tests {
             delivery_after: None,
             delivery_phase: DeliveryPhase::Removes,
             next_seq: 0,
+            assembled_item_bytes: 0,
             needs_delivery: false,
         };
         let mut counters = DaemonLifecycleCounters::default();
@@ -2152,6 +2189,7 @@ mod tests {
             delivery_after: None,
             delivery_phase: DeliveryPhase::Rows,
             next_seq: 0,
+            assembled_item_bytes: 0,
             needs_delivery: false,
         };
         let mut counters = DaemonLifecycleCounters::default();
@@ -2218,6 +2256,7 @@ mod tests {
             delivery_after: None,
             delivery_phase: DeliveryPhase::Rows,
             next_seq: 110,
+            assembled_item_bytes: 0,
             needs_delivery: true,
         };
         let mut counters = DaemonLifecycleCounters::default();
@@ -2294,6 +2333,7 @@ mod tests {
                 delivery_after: None,
                 delivery_phase: DeliveryPhase::Rows,
                 next_seq: 0,
+                assembled_item_bytes: 0,
                 needs_delivery: false,
             };
             let mut counters = DaemonLifecycleCounters::default();
@@ -2356,6 +2396,7 @@ mod tests {
             delivery_after: None,
             delivery_phase: DeliveryPhase::Assembling { source_seq: 1 },
             next_seq: 1,
+            assembled_item_bytes: 0,
             needs_delivery: true,
         };
         let mut counters = DaemonLifecycleCounters::default();
@@ -2440,6 +2481,7 @@ mod tests {
             delivery_after: None,
             delivery_phase: DeliveryPhase::Assembling { source_seq: 1 },
             next_seq: 1,
+            assembled_item_bytes: 0,
             needs_delivery: true,
         };
         let mut counters = DaemonLifecycleCounters::default();
@@ -2528,6 +2570,7 @@ mod tests {
             delivery_after: None,
             delivery_phase: DeliveryPhase::Assembling { source_seq: 1 },
             next_seq: 1,
+            assembled_item_bytes: 0,
             needs_delivery: true,
         };
         let mut counters = DaemonLifecycleCounters::default();
@@ -2600,6 +2643,7 @@ mod tests {
             delivery_after: None,
             delivery_phase: DeliveryPhase::Removes,
             next_seq: 1,
+            assembled_item_bytes: 0,
             needs_delivery: true,
         };
         let mut counters = DaemonLifecycleCounters::default();
@@ -2617,5 +2661,74 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(crate::MAX_OWNER_TURN_MS));
         assert!(page.more);
         assert!(state.delivery_after.is_some());
+    }
+
+    #[test]
+    fn near_limit_snapshot_assembly_stays_within_owner_turn() {
+        let record = |id: String| SessionLifecycleRecord {
+            session: botster_core_daemon::DaemonSession {
+                session_id: SessionId(id),
+                registry_state: RegistrySessionState::Running,
+                size: botster_core::ResizePayload { rows: 24, cols: 80 },
+                process: None,
+                updated_at: 1,
+            },
+            metadata: botster_core::CoreSessionMetadata::new(),
+            lifecycle: Some(SessionLifecycleState::Running),
+        };
+        let mut projection = crate::session_projection::SessionProjection::default();
+        projection.ingest_baseline_rows(
+            1,
+            (0..20).map(|index| record(format!("s{index:02}-{}", "x".repeat(40 * 1024)))),
+        );
+        projection.seal_baseline(SessionLifecycleCursor {
+            source_id: botster_core_daemon::SessionLifecycleSourceId("s".into()),
+            sequence: 1,
+        });
+        let (sender, receiver) = mpsc::sync_channel(2);
+        let mut state = EntitySubscriptionState {
+            sender: EntityFrameSender::Blocking(sender),
+            entity_type: "session".to_string(),
+            cursor: projection.cursor.clone(),
+            entities: BTreeMap::new(),
+            definition_generation: 0,
+            definition_entities: BTreeMap::new(),
+            resync_reason: None,
+            owner_grant_id: None,
+            package_last_applied_seq: None,
+            package_catching_up: false,
+            delivery_after: None,
+            delivery_phase: DeliveryPhase::Assembling { source_seq: 1 },
+            next_seq: 1,
+            assembled_item_bytes: 0,
+            needs_delivery: true,
+        };
+        let mut counters = DaemonLifecycleCounters::default();
+        loop {
+            let started = Instant::now();
+            let SnapshotAssemble::Continue { page } = continue_session_snapshot_assembly(
+                "sub",
+                &mut state,
+                &projection,
+                &mut counters,
+                SESSION_DELIVERY_MAX_ITEMS,
+                SESSION_DELIVERY_MAX_BYTES,
+                SESSION_DELIVERY_MAX_ELAPSED,
+            ) else {
+                panic!("near-limit assembly");
+            };
+            assert!(started.elapsed() < Duration::from_millis(crate::MAX_OWNER_TURN_MS));
+            if page.more {
+                assert_eq!(receiver.try_iter().count(), 0);
+            } else {
+                break;
+            }
+        }
+        let frames: Vec<_> = receiver.try_iter().collect();
+        assert_eq!(frames.len(), 1);
+        match &frames[0] {
+            DaemonEntityFrame::Snapshot { items, .. } => assert_eq!(items.len(), 20),
+            other => panic!("expected complete snapshot, got {other:?}"),
+        }
     }
 }

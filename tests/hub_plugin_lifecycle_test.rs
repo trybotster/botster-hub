@@ -355,12 +355,6 @@ fn hub_runtime_passes_split_plugin_worker_config_to_core_engine() {
             plugin_worker_executor_concurrency: 3,
             ..CoreEngineOptions::default()
         },
-        plugin_worker_class: botster_hub::PluginWorkerClassOptions {
-            reserved_request_response_executors: 1,
-            background_queue_capacity: 4,
-            completion_queue_capacity: 5,
-            ..botster_hub::PluginWorkerClassOptions::default()
-        },
         ..HubStartupOptions::default()
     }
     .build_config_for_environment(&RuntimeEnvironment::from_values(
@@ -390,9 +384,19 @@ fn hub_runtime_passes_split_plugin_worker_config_to_core_engine() {
     let snapshot = hub.plugin_worker_debug_snapshot();
     assert_eq!(snapshot.configured_queue_capacity, 7);
     assert_eq!(snapshot.configured_executor_concurrency, 3);
-    assert_eq!(snapshot.configured_reserved_request_response_executors, 1);
-    assert_eq!(snapshot.configured_background_queue_capacity, 4);
-    assert_eq!(snapshot.configured_completion_queue_capacity, 5);
+    let class = botster_hub::PluginWorkerClassOptions::default();
+    assert_eq!(
+        snapshot.configured_reserved_request_response_executors,
+        class.reserved_request_response_executors
+    );
+    assert_eq!(
+        snapshot.configured_background_queue_capacity,
+        class.background_queue_capacity
+    );
+    assert_eq!(
+        snapshot.configured_completion_queue_capacity,
+        class.completion_queue_capacity
+    );
     assert_eq!(snapshot.live_plugin_executors, 1);
     assert_eq!(snapshot.live_executor_workers, 3);
 
