@@ -5444,16 +5444,76 @@ fn production_source_owns_the_260th() {
             hub.test_enqueue_or_family("source.item", family_release(extra, "source.item", 2)),
             CausalAdmitResult::Applied
         );
-        assert!(hub.test_family_source_held("source.item"));
+        assert_eq!(hub.test_source_ops_len(), 1);
     });
     while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
         let _ = hub.apply_event_plane_owner_ops();
         let _ = scopes.flush_pending();
     }
-    assert!(!hub.test_family_source_held("source.item"));
+    assert_eq!(hub.test_source_ops_len(), 0);
     assert!(hub.test_family_exists("source.item"));
     assert_eq!(hub.test_family_seq("source.item"), 1);
     assert!(!scopes.is_live(extra));
+}
+
+#[test]
+fn source_ops_are_one_global_store_across_families() {
+    let hub = explicit_runtime("lease-source-bound");
+    let scopes = hub.causal_scopes().clone();
+    let mut parked = Vec::new();
+    for index in 0..CAUSAL_PENDING_MAX {
+        let family = format!("f{index}");
+        let scope = scopes
+            .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+                family: family.clone(),
+                seq: index as u64,
+            }))
+            .expect("mint");
+        assert_eq!(
+            hub.test_park_family_causal(family_release(scope, &family, index as u64)),
+            CausalAdmitResult::Applied
+        );
+        parked.push(scope);
+    }
+    assert_eq!(hub.test_family_causal_len(), CAUSAL_PENDING_MAX);
+    let mut sourced = Vec::new();
+    for index in 0..CAUSAL_PENDING_MAX {
+        let family = format!("s{index}");
+        let scope = scopes
+            .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+                family: family.clone(),
+                seq: index as u64,
+            }))
+            .expect("mint");
+        assert_eq!(
+            hub.test_keep_source_op(family_release(scope, &family, index as u64)),
+            CausalAdmitResult::Applied
+        );
+        sourced.push(scope);
+    }
+    assert_eq!(hub.test_family_causal_len(), CAUSAL_PENDING_MAX);
+    assert_eq!(hub.test_source_ops_len(), CAUSAL_PENDING_MAX);
+    let extra = scopes
+        .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+            family: "missing.item".into(),
+            seq: 0,
+        }))
+        .expect("extra");
+    assert_eq!(
+        hub.test_keep_source_op(family_release(extra, "missing.item", 0)),
+        CausalAdmitResult::Applied
+    );
+    assert_eq!(hub.test_source_ops_len(), CAUSAL_PENDING_MAX);
+    assert!(!scopes.is_live(extra));
+    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+        let _ = hub.apply_event_plane_owner_ops();
+        let _ = scopes.flush_pending();
+    }
+    assert_eq!(hub.test_family_causal_len(), 0);
+    assert_eq!(hub.test_source_ops_len(), 0);
+    for scope in parked.into_iter().chain(sourced) {
+        assert!(!scopes.is_live(scope));
+    }
 }
 
 #[test]
