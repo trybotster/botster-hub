@@ -12,7 +12,10 @@ use botster_core::{
     PackageDependency, PackageDependencyKind, PackageFeatureGate, PackageRequirement, RequestId,
     SessionId, SessionLifecycleState, SubscriptionId,
 };
-use botster_core_daemon::{GuardedWriteDecision, GuardedWriteDeliveryState, ReadinessEvidence};
+use botster_core_daemon::{
+    GuardedWriteDecision, GuardedWriteDeliveryState, LifecycleBaselineBudget,
+    ObserveLifecycleBudget, ObserveLifecycleCursor, ReadinessEvidence,
+};
 use botster_hub::{
     DataDirectoryOption, DeviceSessionTypeSource, FileHubStateStore, HostIdentityOptions,
     HubClientAdmission, HubClientApi, HubClientError, HubClientEvent, HubClientIdentity,
@@ -725,10 +728,11 @@ fn session_entity_subscription_uses_core_baseline_and_rejects_other_families() {
             },
         )
         .expect("session entity family is admitted");
-    let HubClientResponseBody::SessionLifecycleBaseline(baseline) = response.body else {
-        panic!("expected CoreDaemon lifecycle baseline");
+    let HubClientResponseBody::SessionLifecycleBaselinePage(page) = response.body else {
+        panic!("expected CoreDaemon lifecycle baseline page");
     };
-    assert!(baseline.sessions.is_empty());
+    assert!(page.sessions.is_empty());
+    assert!(page.complete);
 
     let error = api
         .handle_request(
@@ -748,6 +752,112 @@ fn session_entity_subscription_uses_core_baseline_and_rejects_other_families() {
             ..
         }
     ));
+}
+
+#[test]
+fn session_entity_subscription_returns_a_bounded_page_not_a_complete_baseline() {
+    let mut runtime = explicit_runtime("session-entity-paged-baseline");
+    let api = HubClientApi::local_operator("session-entity-paged-client");
+    let packages = empty_registry();
+
+    for index in 0..33 {
+        api.handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::Spawn {
+                request_id: request_id(&format!("spawn-{index}")),
+                session_id: SessionId(format!("paged-session-{index:02}")),
+                command: "sleep 30".to_string(),
+                now_seconds: index as u64 + 1,
+            },
+        )
+        .expect("spawn session for paged baseline");
+    }
+
+    assert_eq!(
+        runtime
+            .list_sessions()
+            .expect("list spawned sessions")
+            .len(),
+        33
+    );
+    let mut resume = None;
+    for now in 40..48 {
+        let slice = runtime
+            .observe_lifecycle_slice(
+                now,
+                resume.as_ref(),
+                ObserveLifecycleBudget {
+                    max_sessions: 32,
+                    max_encoded_result_bytes: 64 * 1024,
+                    max_elapsed: Duration::from_millis(25),
+                },
+            )
+            .expect("observe spawned sessions");
+        if slice.complete || slice.resync_required.is_some() {
+            break;
+        }
+        resume = Some(ObserveLifecycleCursor {
+            pass_id: slice.pass_id,
+            last_visited: slice.last_visited,
+        });
+    }
+
+    let response = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::SubscribeEntities {
+                request_id: request_id("subscribe-paged-sessions"),
+                entity_type: "session".to_string(),
+                subscription_id: "paged-session-entities".to_string(),
+            },
+        )
+        .expect("session entity family is admitted");
+    let HubClientResponseBody::SessionLifecycleBaselinePage(first_page) = response.body else {
+        panic!("expected a bounded lifecycle baseline page, got {response:?}");
+    };
+    assert!(
+        !first_page.complete || first_page.sessions.len() < 33,
+        "local API must not present one page as the complete 33-row baseline"
+    );
+    assert!(first_page.sessions.len() <= 32);
+
+    let budget = LifecycleBaselineBudget {
+        max_rows: 32,
+        max_bytes: 64 * 1024,
+        max_elapsed: Duration::from_millis(25),
+    };
+    let mut snapshot = Some(first_page.snapshot_sequence.clone());
+    let mut after = first_page.next.clone();
+    let mut rows = first_page.sessions.clone();
+    let mut complete = first_page.complete;
+    for _ in 0..8 {
+        if complete {
+            break;
+        }
+        let page = runtime
+            .lifecycle_baseline_page(snapshot.as_ref(), after.as_ref(), budget)
+            .expect("continue baseline pages");
+        rows.extend(page.sessions);
+        complete = page.complete;
+        snapshot = Some(page.snapshot_sequence);
+        after = page.next;
+    }
+    assert!(complete, "paged local API must finish the baseline");
+    assert_eq!(rows.len(), 33);
+
+    for index in 0..33 {
+        let _ = api.handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::Shutdown {
+                request_id: request_id(&format!("shutdown-{index}")),
+                session_id: SessionId(format!("paged-session-{index:02}")),
+                now_seconds: 100 + index as u64,
+            },
+        );
+    }
 }
 
 fn write_session_type_package(root: &std::path::Path) {

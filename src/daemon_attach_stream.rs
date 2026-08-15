@@ -11,7 +11,7 @@ use botster_core::{
 };
 use botster_core_daemon::CoreDaemonError;
 use botster_hub_client::{
-    DaemonEvent, FEATURE_TERMINAL_SUBSCRIPTION_CLOSED, FEATURE_UNIX_TERMINAL_ADAPTER,
+    FEATURE_TERMINAL_SUBSCRIPTION_CLOSED, FEATURE_UNIX_TERMINAL_ADAPTER,
     FEATURE_WEBRTC_TERMINAL_ADAPTER,
 };
 use botster_terminal_protocol::{
@@ -440,14 +440,6 @@ pub(crate) fn live_generation_for_route(
     })
 }
 
-pub(crate) fn attach_failed_events(session_id: &str, subscription_id: &str) -> Vec<DaemonEvent> {
-    vec![DaemonEvent::AttachState {
-        session_id: session_id.to_string(),
-        subscription_id: subscription_id.to_string(),
-        state: botster_hub_client::ATTACH_STATE_ATTACH_FAILED.to_string(),
-    }]
-}
-
 pub(crate) fn fail_closed_pre_bind_attach(
     registry: &mut AttachStreamRegistry,
     runtime: &mut HubRuntime,
@@ -456,7 +448,7 @@ pub(crate) fn fail_closed_pre_bind_attach(
     subscription_id: &str,
     now_seconds: u64,
     adapter: Option<BoundAdapterHandle>,
-) -> Vec<DaemonEvent> {
+) {
     if let Some(adapter) = adapter {
         adapter.close();
     }
@@ -477,7 +469,6 @@ pub(crate) fn fail_closed_pre_bind_attach(
         );
     }
     registry.cancel_stream(session_id, subscription_id);
-    attach_failed_events(session_id, subscription_id)
 }
 
 pub(crate) struct UnixBindRequest<'a> {
@@ -493,7 +484,7 @@ pub(crate) fn bind_unix_adapter_after_attaching(
     registry: &mut AttachStreamRegistry,
     runtime: &mut HubRuntime,
     request: UnixBindRequest<'_>,
-) -> Result<Option<UnixTerminalAdapterHandle>, Vec<DaemonEvent>> {
+) -> Result<Option<UnixTerminalAdapterHandle>, ()> {
     let inventory = runtime.list_terminal_subscriptions();
     let Some(generation) = live_generation_for_route(
         &inventory,
@@ -501,7 +492,7 @@ pub(crate) fn bind_unix_adapter_after_attaching(
         request.session_id,
         request.subscription_id,
     ) else {
-        return Err(fail_closed_pre_bind_attach(
+        fail_closed_pre_bind_attach(
             registry,
             runtime,
             request.client_id,
@@ -509,7 +500,8 @@ pub(crate) fn bind_unix_adapter_after_attaching(
             request.subscription_id,
             request.now_seconds,
             None,
-        ));
+        );
+        return Err(());
     };
     registry.record_generation(request.session_id, request.subscription_id, generation);
     let capabilities = request.capabilities.clone();
@@ -528,7 +520,7 @@ pub(crate) fn bind_unix_adapter_after_attaching(
         )
         .is_err()
     {
-        return Err(fail_closed_pre_bind_attach(
+        fail_closed_pre_bind_attach(
             registry,
             runtime,
             request.client_id,
@@ -536,7 +528,8 @@ pub(crate) fn bind_unix_adapter_after_attaching(
             request.subscription_id,
             request.now_seconds,
             Some(BoundAdapterHandle::Unix(handle)),
-        ));
+        );
+        return Err(());
     }
     registry.mark_adapter_bound(
         request.session_id,
@@ -570,7 +563,7 @@ pub(crate) fn bind_webrtc_adapter_after_attaching(
     registry: &mut AttachStreamRegistry,
     runtime: &mut HubRuntime,
     request: WebrtcBindRequest<'_>,
-) -> Result<Option<WebRtcTerminalAdapterHandle>, Vec<DaemonEvent>> {
+) -> Result<Option<WebRtcTerminalAdapterHandle>, ()> {
     let inventory = runtime.list_terminal_subscriptions();
     let Some(generation) = live_generation_for_route(
         &inventory,
@@ -578,7 +571,7 @@ pub(crate) fn bind_webrtc_adapter_after_attaching(
         request.session_id,
         request.subscription_id,
     ) else {
-        return Err(fail_closed_pre_bind_attach(
+        fail_closed_pre_bind_attach(
             registry,
             runtime,
             request.client_id,
@@ -586,7 +579,8 @@ pub(crate) fn bind_webrtc_adapter_after_attaching(
             request.subscription_id,
             request.now_seconds,
             None,
-        ));
+        );
+        return Err(());
     };
     registry.record_generation(request.session_id, request.subscription_id, generation);
     let capabilities = match negotiated_unix_capability_set(
@@ -595,7 +589,7 @@ pub(crate) fn bind_webrtc_adapter_after_attaching(
     ) {
         Ok(capabilities) => capabilities,
         Err(_) => {
-            return Err(fail_closed_pre_bind_attach(
+            fail_closed_pre_bind_attach(
                 registry,
                 runtime,
                 request.client_id,
@@ -603,7 +597,8 @@ pub(crate) fn bind_webrtc_adapter_after_attaching(
                 request.subscription_id,
                 request.now_seconds,
                 None,
-            ));
+            );
+            return Err(());
         }
     };
     let (adapter, handle) = match request.mux {
@@ -621,7 +616,7 @@ pub(crate) fn bind_webrtc_adapter_after_attaching(
         )
         .is_err()
     {
-        return Err(fail_closed_pre_bind_attach(
+        fail_closed_pre_bind_attach(
             registry,
             runtime,
             request.client_id,
@@ -629,7 +624,8 @@ pub(crate) fn bind_webrtc_adapter_after_attaching(
             request.subscription_id,
             request.now_seconds,
             Some(BoundAdapterHandle::WebRtc(handle)),
-        ));
+        );
+        return Err(());
     }
     registry.mark_adapter_bound(
         request.session_id,

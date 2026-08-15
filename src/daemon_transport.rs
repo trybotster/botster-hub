@@ -2995,7 +2995,7 @@ fn handle_runtime_control_request(
                     terminal_requirement,
                 }) = webrtc_admission.as_ref()
                 else {
-                    let _ = fail_closed_pre_bind_attach(
+                    fail_closed_pre_bind_attach(
                         pending_runtime,
                         runtime,
                         &client_id,
@@ -3033,7 +3033,7 @@ fn handle_runtime_control_request(
                 capabilities, mux, ..
             }) = unix_admission.as_ref()
             else {
-                let _ = fail_closed_pre_bind_attach(
+                fail_closed_pre_bind_attach(
                     pending_runtime,
                     runtime,
                     &client_id,
@@ -4775,19 +4775,8 @@ fn egress_backpressure_diagnostic(
     )
 }
 
-fn daemon_delivery_kind(response: &DaemonResponse) -> DaemonDeliveryKind {
-    if response.events.iter().any(|event| {
-        matches!(
-            event,
-            DaemonEvent::TerminalOutput { .. }
-                | DaemonEvent::Snapshot { .. }
-                | DaemonEvent::Scrollback { .. }
-        )
-    }) {
-        DaemonDeliveryKind::Terminal
-    } else {
-        DaemonDeliveryKind::Control
-    }
+fn daemon_delivery_kind(_response: &DaemonResponse) -> DaemonDeliveryKind {
+    DaemonDeliveryKind::Control
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4893,49 +4882,14 @@ fn local_webrtc_peer_gone_request_error(operation: &str) -> DaemonResponse {
     response
 }
 
-fn response_has_attach_failed(response: &DaemonResponse) -> bool {
-    response.events.iter().any(|event| {
-        matches!(
-            event,
-            DaemonEvent::AttachState { state, .. }
-                if state == botster_hub_client::ATTACH_STATE_ATTACH_FAILED
-        )
-    })
-}
-
 pub(crate) fn response_records_attach_ownership(response: &DaemonResponse) -> bool {
-    response.kind != DaemonResponseKind::OperatorError && !response_has_attach_failed(response)
-}
-
-fn attach_failed_route(response: &DaemonResponse) -> Option<AttachedSubscription> {
-    response.events.iter().find_map(|event| match event {
-        DaemonEvent::AttachState {
-            session_id,
-            subscription_id,
-            state,
-        } if state == botster_hub_client::ATTACH_STATE_ATTACH_FAILED => {
-            Some(AttachedSubscription {
-                session_id: session_id.clone(),
-                subscription_id: subscription_id.clone(),
-            })
-        }
-        _ => None,
-    })
+    response.kind != DaemonResponseKind::OperatorError
 }
 
 fn attached_subscription_change_for_response(
     request: &DaemonRequest,
     response: &DaemonResponse,
 ) -> Option<AttachedSubscriptionChange> {
-    if let Some(failed) = attach_failed_route(response) {
-        return match request {
-            DaemonRequest::Drain {
-                subscription_id: Some(_),
-                ..
-            } => Some(AttachedSubscriptionChange::Detach(failed)),
-            _ => None,
-        };
-    }
     if response.kind == DaemonResponseKind::OperatorError {
         return None;
     }
@@ -7594,7 +7548,7 @@ mod tests {
     }
 
     #[test]
-    fn attach_failed_events_do_not_detach_on_client_eof() {
+    fn attach_operator_error_does_not_detach_on_client_eof() {
         let (server, mut client) = UnixStream::pair().expect("create daemon socket pair");
         let (control_tx, mut control_rx) = tokio_mpsc::channel(DAEMON_CONTROL_QUEUE_CAPACITY);
         let connection = thread::spawn(move || handle_connection(server, control_tx));
@@ -7626,13 +7580,12 @@ mod tests {
         };
         assert!(matches!(*request, DaemonRequest::Attach { .. }));
         reply_tx
-            .send(Ok(daemon_events(vec![DaemonEvent::AttachState {
-                session_id: "missing-session".to_string(),
-                subscription_id: "missing-sub".to_string(),
-                state: botster_hub_client::ATTACH_STATE_ATTACH_FAILED.to_string(),
-            }])))
-            .expect("reply with attach_failed");
-        let _: DaemonResponse = read_frame(&mut client).expect("read attach_failed response");
+            .send(Ok(attach_bind_operator_error(
+                "invalid_request",
+                "attach failed before adapter bind",
+            )))
+            .expect("reply with attach operator error");
+        let _: DaemonResponse = read_frame(&mut client).expect("read attach operator error");
 
         client
             .shutdown(Shutdown::Both)
@@ -7643,12 +7596,12 @@ mod tests {
             .expect("client disconnect is a clean connection close");
         assert!(
             control_rx.try_recv().is_err(),
-            "pre-READY attach_failed must not enqueue Detach cleanup"
+            "pre-bind OperatorError must not enqueue Detach cleanup"
         );
     }
 
     #[test]
-    fn drain_attach_failed_releases_pending_connection_ownership() {
+    fn drain_does_not_inspect_legacy_attach_state_for_ownership() {
         let (server, mut client) = UnixStream::pair().expect("create daemon socket pair");
         let (control_tx, mut control_rx) = tokio_mpsc::channel(DAEMON_CONTROL_QUEUE_CAPACITY);
         let connection = thread::spawn(move || handle_connection(server, control_tx));
@@ -7680,13 +7633,12 @@ mod tests {
         };
         assert!(matches!(*request, DaemonRequest::Attach { .. }));
         reply_tx
-            .send(Ok(daemon_events(vec![DaemonEvent::AttachState {
-                session_id: "session".to_string(),
-                subscription_id: "subscription".to_string(),
-                state: "attaching".to_string(),
-            }])))
-            .expect("reply with attaching");
-        let _: DaemonResponse = read_frame(&mut client).expect("read attaching response");
+            .send(Ok(attach_bind_operator_error(
+                "invalid_request",
+                "attach failed before adapter bind",
+            )))
+            .expect("reply with attach operator error");
+        let _: DaemonResponse = read_frame(&mut client).expect("read attach operator error");
 
         write_frame(
             &mut client,
@@ -7701,13 +7653,9 @@ mod tests {
         };
         assert!(matches!(*request, DaemonRequest::Drain { .. }));
         reply_tx
-            .send(Ok(daemon_events(vec![DaemonEvent::AttachState {
-                session_id: "session".to_string(),
-                subscription_id: "subscription".to_string(),
-                state: botster_hub_client::ATTACH_STATE_ATTACH_FAILED.to_string(),
-            }])))
-            .expect("reply with drain attach_failed");
-        let _: DaemonResponse = read_frame(&mut client).expect("read drain attach_failed");
+            .send(Ok(daemon_events(Vec::new())))
+            .expect("reply with host drain");
+        let _: DaemonResponse = read_frame(&mut client).expect("read host drain");
 
         client
             .shutdown(Shutdown::Both)
@@ -7718,12 +7666,12 @@ mod tests {
             .expect("client disconnect is a clean connection close");
         assert!(
             control_rx.try_recv().is_err(),
-            "Drain attach_failed must release pending ownership before disconnect cleanup"
+            "pre-bind OperatorError plus host Drain must not enqueue Detach cleanup"
         );
     }
 
     #[test]
-    fn drain_attach_failed_decrements_live_attach_once() {
+    fn drain_does_not_change_attach_occupancy() {
         let mut state = DaemonControlState::default();
         record_attached_subscription_change(
             &mut state,
@@ -7736,43 +7684,32 @@ mod tests {
         assert_eq!(state.lifecycle_counters.live_attach_subscriptions, 1);
 
         let drain = DaemonRequest::drain_subscription("session", "subscription");
-        let failed = daemon_events(vec![DaemonEvent::AttachState {
+        let drain_ok = daemon_events(Vec::new());
+        assert!(attached_subscription_change_for_response(&drain, &drain_ok).is_none());
+        record_attached_subscription_change(
+            &mut state,
+            attached_subscription_change_for_response(&drain, &drain_ok),
+            None,
+        );
+        assert_eq!(state.lifecycle_counters.live_attach_subscriptions, 1);
+
+        let detach = DaemonRequest::Detach {
             session_id: "session".to_string(),
             subscription_id: "subscription".to_string(),
-            state: botster_hub_client::ATTACH_STATE_ATTACH_FAILED.to_string(),
-        }]);
-        let change = attached_subscription_change_for_response(&drain, &failed);
-        assert!(matches!(
-            change,
-            Some(AttachedSubscriptionChange::Detach(AttachedSubscription {
-                ref session_id,
-                ref subscription_id,
-            })) if session_id == "session" && subscription_id == "subscription"
-        ));
+        };
+        let change = attached_subscription_change_for_response(&detach, &drain_ok);
         record_attached_subscription_change(&mut state, change.clone(), None);
         assert_eq!(state.lifecycle_counters.live_attach_subscriptions, 0);
         record_attached_subscription_change(&mut state, change, None);
         assert_eq!(
             state.lifecycle_counters.live_attach_subscriptions, 0,
-            "a second Drain attach_failed must not decrement another route"
+            "a second Detach must not decrement another route"
         );
     }
 
     #[test]
     fn daemon_egress_diagnostics_classify_terminal_and_control_backpressure() {
-        let terminal = daemon_events(vec![DaemonEvent::TerminalOutput {
-            session_id: "session-redacted".to_string(),
-            subscription_id: "subscription-redacted".to_string(),
-            payload: botster_hub_client::DaemonLiveOutputPayload::from_bytes(
-                b"private terminal payload",
-            ),
-        }]);
         let control = daemon_response_base(DaemonResponseKind::Sessions);
-
-        assert_eq!(
-            daemon_delivery_kind(&terminal),
-            DaemonDeliveryKind::Terminal
-        );
         assert_eq!(daemon_delivery_kind(&control), DaemonDeliveryKind::Control);
 
         let mut diagnostics = DaemonEgressDiagnostics::default();
@@ -7780,7 +7717,7 @@ mod tests {
         record_egress_write_failure(
             &mut diagnostics,
             &mut counters,
-            daemon_delivery_kind(&terminal),
+            DaemonDeliveryKind::Terminal,
         );
         record_egress_write_failure(
             &mut diagnostics,

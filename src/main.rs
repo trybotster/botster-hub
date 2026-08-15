@@ -2938,55 +2938,6 @@ fn print_daemon_events(events: &[DaemonEvent]) {
             DaemonEvent::SessionLifecycle { session_id, state } => {
                 println!("event=session_lifecycle session_id={session_id} state={state}");
             }
-            DaemonEvent::TerminalOutput {
-                session_id,
-                subscription_id,
-                payload,
-            } => {
-                println!(
-                    "event=terminal_output session_id={session_id} subscription_id={subscription_id} bytes={}",
-                    payload.bytes
-                );
-            }
-            DaemonEvent::Snapshot {
-                session_id,
-                subscription_id,
-                history,
-            } => {
-                println!(
-                    "event=snapshot session_id={session_id} subscription_id={subscription_id} bytes={}",
-                    history.bytes
-                );
-            }
-            DaemonEvent::Scrollback {
-                session_id,
-                subscription_id,
-                history,
-            } => {
-                println!(
-                    "event=scrollback session_id={session_id} subscription_id={subscription_id} bytes={}",
-                    history.bytes
-                );
-            }
-            DaemonEvent::ProcessExit {
-                session_id,
-                subscription_id,
-                code,
-            } => {
-                println!(
-                    "event=process_exit session_id={session_id} subscription_id={subscription_id} code={}",
-                    code.map_or_else(|| "none".to_string(), |code| code.to_string())
-                );
-            }
-            DaemonEvent::AttachState {
-                session_id,
-                subscription_id,
-                state,
-            } => {
-                println!(
-                    "event=attach_state session_id={session_id} subscription_id={subscription_id} state={state}"
-                );
-            }
             DaemonEvent::RuntimeObservation { kind } => {
                 println!("event=runtime_observation kind={kind}");
             }
@@ -3009,6 +2960,9 @@ fn print_daemon_events(events: &[DaemonEvent]) {
                 println!(
                     "event=terminal_subscription_closed session_id={session_id} subscription_id={subscription_id} generation={generation} reason={reason}"
                 );
+            }
+            _ => {
+                println!("event=host_unrecognized");
             }
         }
     }

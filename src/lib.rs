@@ -878,7 +878,7 @@ mod tests {
             }
             if skipping_item {
                 skip_depth += opens - closes;
-                if skip_depth > 0 {
+                if opens > 0 {
                     seen_body = true;
                 }
                 if (seen_body && skip_depth <= 0) || (!seen_body && trimmed.ends_with(';')) {
@@ -892,6 +892,20 @@ mod tests {
         }
         out
     }
+
+    const FORBIDDEN_PRODUCTION_CONSTRUCTS: &[&str] = &[
+        r#""READY""#,
+        r#""PAGE""#,
+        r#""FINISH""#,
+        "GHOSTSNP",
+        "drain_subscription(",
+        "drain_runtime_once(",
+        "DaemonEvent::TerminalOutput",
+        "DaemonEvent::Snapshot",
+        "DaemonEvent::Scrollback",
+        "DaemonEvent::ProcessExit",
+        "DaemonEvent::AttachState",
+    ];
 
     #[test]
     fn production_source_scan_covers_items_after_cfg_test_imports() {
@@ -914,6 +928,33 @@ mod tests {
     }
 
     #[test]
+    fn production_source_scan_covers_items_after_one_line_cfg_test() {
+        let source = concat!(
+            "#[cfg(test)]\n",
+            "fn helper() {}\n",
+            "fn production() {}\n",
+            "fn sneaky() { drain_subscription(); }\n",
+        );
+        let scanned = production_source(source);
+        assert!(scanned.contains("fn production()"));
+        assert!(scanned.contains("drain_subscription()"));
+        assert!(!scanned.contains("fn helper()"));
+    }
+
+    #[test]
+    fn production_source_known_positives_catch_every_forbidden_construct() {
+        for forbidden in FORBIDDEN_PRODUCTION_CONSTRUCTS {
+            let source =
+                format!("#[cfg(test)]\nfn helper() {{}}\nfn sneaky() {{ {forbidden}; }}\n");
+            let scanned = production_source(&source);
+            assert!(
+                scanned.contains(forbidden),
+                "scanner must remain live for {forbidden}"
+            );
+        }
+    }
+
+    #[test]
     fn production_sources_reject_terminal_drain_and_snapshot_phase_decode() {
         let files = [
             ("src/runtime.rs", include_str!("runtime.rs")),
@@ -931,25 +972,17 @@ mod tests {
                 include_str!("daemon_attach_stream.rs"),
             ),
             ("src/main.rs", include_str!("main.rs")),
+            ("src/local_webrtc.rs", include_str!("local_webrtc.rs")),
         ];
         for (path, source) in files {
             let production = production_source(source);
-            for forbidden in [r#""READY""#, r#""PAGE""#, r#""FINISH""#] {
+            for forbidden in FORBIDDEN_PRODUCTION_CONSTRUCTS {
+                if *forbidden == "GHOSTSNP" && path == "src/runtime.rs" {
+                    continue;
+                }
                 assert!(
                     !production.contains(forbidden),
                     "{path} production source must not contain {forbidden}"
-                );
-            }
-            if path != "src/runtime.rs" {
-                assert!(
-                    !production.contains("GHOSTSNP"),
-                    "{path} production source must not decode GHOSTSNP"
-                );
-            }
-            for forbidden in ["drain_subscription(", "drain_runtime_once("] {
-                assert!(
-                    !production.contains(forbidden),
-                    "{path} production source must not call {forbidden}"
                 );
             }
         }

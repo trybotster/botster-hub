@@ -9,7 +9,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc::{self, SyncSender};
 use std::time::{Duration, Instant};
 
-use crate::{HubClientApi, HubClientRequest, HubClientResponseBody};
 use botster_core::SessionLifecycleState;
 use botster_core_daemon::{
     LifecycleBaselineBudget, RegistrySessionState, SessionLifecycleBaseline,
@@ -23,8 +22,7 @@ use serde_json::Value;
 
 use super::{
     DAEMON_MAX_FRAME_BYTES, DaemonControlState, DaemonTransportError, DaemonTransportResult,
-    HubDaemon, daemon_operator_error, daemon_response_base, daemon_session_type_from_client,
-    request_id, session_type_entity_snapshot,
+    HubDaemon, daemon_response_base, daemon_session_type_from_client, session_type_entity_snapshot,
 };
 
 #[derive(Debug)]
@@ -253,48 +251,47 @@ pub(super) fn register_entity_subscription(
         drive_package_entity_fanout(daemon, state);
         return Ok(daemon_response_base(DaemonResponseKind::EntitySubscribed));
     }
-    let baseline = if let Some(cursor) = state.reconciliation.cursor.clone() {
-        SessionLifecycleBaseline {
-            cursor,
-            sessions: state.reconciliation.records.values().cloned().collect(),
+    let Some(cursor) = state.reconciliation.cursor.clone() else {
+        if state.reconciliation.baseline_continuation.is_none() {
+            start_baseline_continuation(state);
         }
-    } else {
-        let packages = daemon.package_registry().clone();
-        let runtime = daemon
-            .runtime_mut()
-            .ok_or(DaemonTransportError::DaemonNotRunning)?;
-        let api = HubClientApi::local_operator("botster-hub-daemon-entity-stream");
-        let response = api.handle_request(
-            runtime,
-            &packages,
-            HubClientRequest::SubscribeEntities {
-                request_id: request_id("daemon-entity-subscribe"),
-                entity_type,
-                subscription_id: subscription_id.clone(),
+        state.entity_subscriptions.insert(
+            subscription_id.clone(),
+            EntitySubscriptionState {
+                sender,
+                entity_type: "session".to_string(),
+                cursor: None,
+                entities: BTreeMap::new(),
+                definition_generation: 0,
+                definition_entities: BTreeMap::new(),
+                resync_reason: None,
+                owner_grant_id,
+                package_last_applied_seq: None,
+                package_catching_up: false,
             },
         );
-        let response = match response {
-            Ok(response) => response,
-            Err(error) => return Ok(daemon_operator_error(error)),
-        };
-        let HubClientResponseBody::SessionLifecycleBaseline(baseline) = response.body else {
-            return Err(DaemonTransportError::UnexpectedResponse);
-        };
-        state.lifecycle_counters.lifecycle_baseline_reads = state
+        state.lifecycle_counters.live_entity_subscriptions = state
             .lifecycle_counters
-            .lifecycle_baseline_reads
+            .live_entity_subscriptions
             .saturating_add(1);
-        baseline
+        state.lifecycle_counters.high_water_entity_subscriptions = state
+            .lifecycle_counters
+            .high_water_entity_subscriptions
+            .max(state.lifecycle_counters.live_entity_subscriptions);
+        if state.released_entity_generations > 0 {
+            state.released_entity_generations -= 1;
+            state.lifecycle_counters.reconnect_registrations = state
+                .lifecycle_counters
+                .reconnect_registrations
+                .saturating_add(1);
+        }
+        state.next_reconciliation = Instant::now();
+        return Ok(daemon_response_base(DaemonResponseKind::EntitySubscribed));
     };
-    if state.reconciliation.cursor.is_none() {
-        state.reconciliation.cursor = Some(baseline.cursor.clone());
-        state.reconciliation.records = baseline
-            .sessions
-            .iter()
-            .cloned()
-            .map(|record| (record.session.session_id.0.clone(), record))
-            .collect();
-    }
+    let baseline = SessionLifecycleBaseline {
+        cursor,
+        sessions: state.reconciliation.records.values().cloned().collect(),
+    };
     let cursor = baseline.cursor.clone();
     let (entities, snapshot) = entity_snapshot(&subscription_id, baseline, None);
     sender
@@ -631,7 +628,8 @@ pub(super) fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut Dae
     };
     if projection_replaced
         || state.entity_subscriptions.values().any(|subscription| {
-            subscription.entity_type == "session" && subscription.resync_reason.is_some()
+            subscription.entity_type == "session"
+                && (subscription.resync_reason.is_some() || subscription.cursor.is_none())
         })
     {
         state
@@ -1432,6 +1430,106 @@ mod tests {
             .expect("runtime initialized")
             .shutdown_session(session_id, 3)
             .expect("stop worker-backed test session");
+        daemon.stop();
+        let _ = fs::remove_dir_all(data_directory);
+    }
+
+    #[test]
+    fn early_session_subscription_waits_for_complete_paged_projection() {
+        let data_directory = std::env::temp_dir().join(format!(
+            "botster-hub-paged-projection-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos()
+        ));
+        let config = crate::HubStartupOptions {
+            host: crate::HostIdentityOptions {
+                id: "paged-projection-test".to_string(),
+                display_name: "Paged Projection Test".to_string(),
+                fingerprint: None,
+            },
+            data_directory: crate::DataDirectoryOption::Explicit(data_directory.clone()),
+            session_defaults: crate::SessionDefaults {
+                shell: "/bin/sh".to_string(),
+                working_directory: Some(".".into()),
+                initial_rows: 24,
+                initial_cols: 80,
+            },
+            transports: crate::TransportBindings::default(),
+            ..crate::HubStartupOptions::default()
+        }
+        .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
+        .expect("build paged projection config");
+        let mut daemon = HubDaemon::start(config).expect("start paged projection daemon");
+        for index in 0..33 {
+            daemon
+                .runtime_mut()
+                .expect("runtime initialized")
+                .spawn_session(
+                    botster_core::SessionSpawnRequest {
+                        request_id: RequestId(format!("paged-projection-spawn-{index}")),
+                        session_id: SessionId(format!("paged-session-{index:02}")),
+                        executable: "/bin/sh".to_string(),
+                        arguments: vec!["-c".to_string(), "sleep 30".to_string()],
+                        working_directory: botster_core::SpawnWorkingDirectory {
+                            path: ".".to_string(),
+                        },
+                        environment: botster_core::SpawnEnvironment::default(),
+                        initial_pty_size: Some(botster_core::ResizePayload { rows: 24, cols: 80 }),
+                    },
+                    botster_core::CoreSessionMetadata::new(),
+                    index as u64 + 1,
+                )
+                .expect("spawn session for paged projection");
+        }
+
+        let mut state = DaemonControlState::default();
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let response = register_entity_subscription(
+            &mut daemon,
+            &mut state,
+            "session".to_string(),
+            "paged-projection-subscription".to_string(),
+            EntityFrameSender::Blocking(sender),
+            None,
+        )
+        .expect("register early entity subscription");
+        assert_eq!(response.kind, DaemonResponseKind::EntitySubscribed);
+        assert!(
+            receiver.try_recv().is_err(),
+            "early subscribe must not receive the first page as a complete snapshot"
+        );
+
+        let mut snapshot = None;
+        for _ in 0..8 {
+            drive_entity_subscriptions(&mut daemon, &mut state);
+            if let Ok(frame) = receiver.try_recv() {
+                snapshot = Some(frame);
+                break;
+            }
+        }
+        let DaemonEntityFrame::Snapshot { items, .. } =
+            snapshot.expect("complete projection snapshot")
+        else {
+            panic!("expected snapshot after paged projection completed");
+        };
+        assert_eq!(
+            items.len(),
+            33,
+            "complete projection must include every baseline row, items={items:?}"
+        );
+
+        for index in 0..33 {
+            let _ = daemon
+                .runtime_mut()
+                .expect("runtime initialized")
+                .shutdown_session(
+                    SessionId(format!("paged-session-{index:02}")),
+                    100 + index as u64,
+                );
+        }
         daemon.stop();
         let _ = fs::remove_dir_all(data_directory);
     }
