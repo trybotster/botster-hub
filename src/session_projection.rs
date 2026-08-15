@@ -116,6 +116,7 @@ impl SessionProjection {
     }
 
     /// Merge one baseline page. Incomplete pages are not ended evidence.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn apply_baseline_page(
         &mut self,
         snapshot: SessionLifecycleCursor,
@@ -125,6 +126,16 @@ impl SessionProjection {
         if !complete {
             return;
         }
+        self.ingest_baseline_rows(snapshot.sequence, records);
+        self.seal_baseline(snapshot);
+    }
+
+    /// Insert baseline rows without sealing the snapshot.
+    pub fn ingest_baseline_rows(
+        &mut self,
+        sequence: u64,
+        records: impl IntoIterator<Item = SessionLifecycleRecord>,
+    ) {
         for record in records {
             let lifecycle_class =
                 session_lifecycle_class(&record.session.registry_state, record.lifecycle.as_ref());
@@ -134,16 +145,21 @@ impl SessionProjection {
                     record,
                     lifecycle_class,
                     live_ended: false,
-                    change_seq: snapshot.sequence,
+                    change_seq: sequence,
                 },
             );
         }
+    }
+
+    /// Mark the assembled baseline complete. Incomplete pages stay a gap.
+    pub fn seal_baseline(&mut self, snapshot: SessionLifecycleCursor) {
         self.cursor = Some(snapshot);
         self.baseline_complete = true;
         self.gap = false;
     }
 
     /// Replace the projection with a complete baseline and clear the gap.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn replace_complete_baseline(
         &mut self,
         snapshot: SessionLifecycleCursor,
@@ -190,15 +206,6 @@ impl SessionProjection {
             return true;
         }
         self.baseline_complete && !self.gap
-    }
-
-    /// Snapshot entities currently in the projection.
-    #[must_use]
-    pub fn snapshot_entities(&self) -> BTreeMap<String, DaemonSessionEntity> {
-        self.rows
-            .iter()
-            .map(|(id, row)| (id.clone(), Self::project_entity(&row.record)))
-            .collect()
     }
 
     /// JSON patch from one entity to the next.

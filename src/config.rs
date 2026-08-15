@@ -675,6 +675,17 @@ mod tests {
     }
 
     #[test]
+    fn external_hub_consumer_constructs_core_engine_options_from_default() {
+        let options = CoreEngineOptions {
+            plugin_worker_queue_capacity: 9,
+            plugin_worker_executor_concurrency: 3,
+            ..CoreEngineOptions::default()
+        };
+        assert_eq!(options.plugin_worker_queue_capacity, 9);
+        assert_eq!(options.reserved_request_response_executors, 1);
+    }
+
+    #[test]
     fn reserved_request_response_executors_must_leave_a_background_slot() {
         let options = CoreEngineOptions {
             plugin_worker_executor_concurrency: 2,

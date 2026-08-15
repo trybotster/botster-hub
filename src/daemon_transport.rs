@@ -136,6 +136,7 @@ pub(crate) use daemon_entity_subscriptions::{EntityFrameSender, EntitySubscripti
 use daemon_entity_subscriptions::{
     drive_entity_subscriptions, drive_package_entity_fanout, drive_package_entity_resync,
     entity_subscription_error, register_entity_subscription, seed_lifecycle_reconciliation,
+    session_subscribers_need_delivery,
 };
 
 const MESSAGE_CONTENT_TYPE: &str = "application/vnd.botster.coordination.message+text";
@@ -198,6 +199,7 @@ fn run_one_owner_maintenance_slice(daemon: &mut HubDaemon, state: &mut DaemonCon
     state.lifecycle_counters.lifecycle_change_reads = state.maintenance.journal_page_reads;
     state.lifecycle_counters.lifecycle_baseline_reads = state.maintenance.baseline_page_reads;
     if state.maintenance.needs_work()
+        || session_subscribers_need_delivery(state)
         || daemon
             .runtime()
             .is_some_and(crate::HubRuntime::package_entity_resync_still_needed)
@@ -4671,12 +4673,6 @@ impl std::ops::Deref for PendingRuntimeState {
 impl std::ops::DerefMut for PendingRuntimeState {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.streams
-    }
-}
-
-impl PendingRuntimeState {
-    pub(super) fn retain_active_sessions(&mut self, active_session_ids: &BTreeSet<String>) {
-        self.streams.retain_active_sessions(active_session_ids);
     }
 }
 

@@ -4,8 +4,8 @@
 //! import terminal semantic bodies and does not name package-owned product
 //! policy.
 
-use std::collections::{BTreeMap, VecDeque};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use botster_core::SessionId;
 use botster_core::{
@@ -16,7 +16,7 @@ use botster_core::{
 use botster_core_daemon::{
     LifecycleBaselineBudget, ObserveLifecycleBudget, ObserveLifecycleCursor,
     SessionLifecycleChange, SessionLifecycleCursor, SessionLifecyclePageError,
-    SessionLifecycleRecord, SessionLifecycleResyncReason,
+    SessionLifecycleResyncReason,
 };
 
 use crate::HubRuntime;
@@ -48,6 +48,22 @@ const SESSION_CHUNK_MAX_ITEMS: usize = 8;
 const SESSION_CHUNK_MAX_BYTES: usize = 32 * 1024;
 const COMPLETION_DRAIN_MAX_ITEMS: usize = 8;
 const COMPLETION_DRAIN_MAX_BYTES: usize = 32 * 1024;
+const FAMILY_QUEUE_MAX_ITEMS: usize = 32;
+const FAMILY_QUEUE_MAX_BYTES: usize = 64 * 1024;
+const CONSUMER_REFRESH_MAX: usize = 8;
+const CONSUMER_REFRESH_MAX_ELAPSED: Duration = Duration::from_millis(8);
+
+fn queued_queue_bytes(frames: &VecDeque<serde_json::Value>) -> usize {
+    frames
+        .iter()
+        .map(|frame| {
+            serde_json::to_vec(frame)
+                .map(|body| body.len())
+                .unwrap_or(0)
+        })
+        .sum()
+}
+
 /// Round-robin maintenance kinds. One owner turn runs one of these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MaintenanceSliceKind {
@@ -104,6 +120,12 @@ impl MaintenanceScheduler {
         self.next = MaintenanceSliceKind::JournalPull;
     }
 
+    /// After a session subscriber registers, deliver a bounded page next.
+    pub fn prefer_subscriber_delivery(&mut self) {
+        self.wake = true;
+        self.next = MaintenanceSliceKind::SubscriberDelivery;
+    }
+
     /// True when an idle owner turn should run one slice.
     #[must_use]
     pub fn has_wake(&self) -> bool {
@@ -124,14 +146,31 @@ impl MaintenanceScheduler {
 pub struct BaselineRecovery {
     snapshot: Option<SessionLifecycleCursor>,
     after: Option<SessionId>,
-    assembled: Vec<SessionLifecycleRecord>,
 }
 
 /// One in-flight session-family frame waiting for a matching completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FamilyFrameKind {
+    Begin,
+    Chunk,
+    End,
+    Delta,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InFlightSessionFamily {
     request_id: RequestId,
     snapshot_sequence: u64,
+    kind: FamilyFrameKind,
+}
+
+fn family_frame_kind(payload: &serde_json::Value) -> FamilyFrameKind {
+    match payload.get("type").and_then(serde_json::Value::as_str) {
+        Some("snapshot_begin") => FamilyFrameKind::Begin,
+        Some("snapshot_chunk") => FamilyFrameKind::Chunk,
+        Some("snapshot_end") => FamilyFrameKind::End,
+        _ => FamilyFrameKind::Delta,
+    }
 }
 
 /// Pending session-family work for one plugin.
@@ -154,6 +193,8 @@ struct SessionFamilyConsumer {
 pub struct SessionFamilyBridge {
     consumers: BTreeMap<String, SessionFamilyConsumer>,
     next_request_serial: u64,
+    refresh_after: Option<String>,
+    refresh_seen: BTreeSet<String>,
 }
 
 impl SessionFamilyBridge {
@@ -228,16 +269,28 @@ impl SessionFamilyBridge {
             .push_back(session_end_frame(sequence, true));
     }
 
-    fn queue_delta(&mut self, plugin_key: &str, frame: serde_json::Value) {
+    fn queue_delta(&mut self, plugin_key: &str, frame: serde_json::Value) -> bool {
         let consumer = self.consumer_mut(plugin_key);
         if consumer.gap {
-            return;
+            return true;
+        }
+        let bytes = serde_json::to_vec(&frame)
+            .map(|body| body.len())
+            .unwrap_or(0);
+        let queued_items = consumer.pending.len() + consumer.held_deltas.len();
+        let queued_bytes =
+            queued_queue_bytes(&consumer.pending) + queued_queue_bytes(&consumer.held_deltas);
+        if queued_items >= FAMILY_QUEUE_MAX_ITEMS
+            || queued_bytes.saturating_add(bytes) > FAMILY_QUEUE_MAX_BYTES
+        {
+            return false;
         }
         if !consumer.snapshot_complete {
             consumer.held_deltas.push_back(frame);
-            return;
+        } else {
+            consumer.pending.push_back(frame);
         }
-        consumer.pending.push_back(frame);
+        true
     }
 
     fn next_request_id(&mut self, plugin_key: &str, sequence: u64) -> RequestId {
@@ -261,6 +314,7 @@ pub struct MaintenanceState {
     pub last_owner_turn: Duration,
     pub journal_page_reads: u64,
     pub baseline_page_reads: u64,
+    pub projection_dirty: bool,
 }
 
 impl MaintenanceState {
@@ -444,18 +498,23 @@ fn run_projection_apply_slice(state: &mut MaintenanceState) {
         queue_family_delta(state, &change);
         applied += 1;
     }
+    if applied > 0 {
+        state.projection_dirty = true;
+    }
     if applied > 0 || !state.pending_changes.is_empty() {
         state.scheduler.try_wake();
     }
 }
 
 fn run_baseline_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
-    let Some(recovery) = state.baseline.as_mut() else {
+    let Some(recovery) = state.baseline.as_ref() else {
         return;
     };
+    let snapshot_ref = recovery.snapshot.clone();
+    let after_ref = recovery.after.clone();
     match runtime.lifecycle_baseline_page(
-        recovery.snapshot.as_ref(),
-        recovery.after.as_ref(),
+        snapshot_ref.as_ref(),
+        after_ref.as_ref(),
         BASELINE_PAGE_BUDGET,
     ) {
         Ok(page) => {
@@ -464,21 +523,20 @@ fn run_baseline_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
                 handle_resync_reason(state, reason);
                 return;
             }
-            recovery.snapshot = Some(page.snapshot_sequence.clone());
-            recovery.after = page.next.clone();
-            recovery.assembled.extend(page.sessions);
-            if page.complete {
-                let snapshot = page.snapshot_sequence;
-                let assembled = state
-                    .baseline
-                    .take()
-                    .map(|recovery| recovery.assembled)
-                    .unwrap_or_default();
-                let sequence = snapshot.sequence;
-                state
-                    .projection
-                    .replace_complete_baseline(snapshot, assembled);
-                begin_family_snapshots(state, sequence);
+            let complete = page.complete;
+            let snapshot = page.snapshot_sequence.clone();
+            if let Some(recovery) = state.baseline.as_mut() {
+                recovery.snapshot = Some(snapshot.clone());
+                recovery.after = page.next.clone();
+            }
+            state
+                .projection
+                .ingest_baseline_rows(snapshot.sequence, page.sessions);
+            if complete {
+                state.baseline = None;
+                state.projection.seal_baseline(snapshot.clone());
+                state.projection_dirty = true;
+                begin_family_snapshots(state, snapshot.sequence);
             } else {
                 state.scheduler.try_wake();
             }
@@ -499,6 +557,7 @@ fn run_host_bridge_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
         .get("snapshot_sequence")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
+    let kind = family_frame_kind(&payload);
     let request_id = state.session_family.next_request_id(&plugin_key, sequence);
     let admission = runtime.try_admit_plugin(
         PluginInvocationClass::Background,
@@ -523,6 +582,7 @@ fn run_host_bridge_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
                 consumer.in_flight = Some(InFlightSessionFamily {
                     request_id,
                     snapshot_sequence: consumer.snapshot_sequence,
+                    kind,
                 });
             }
         }
@@ -560,7 +620,7 @@ fn run_completion_drain_slice(runtime: &HubRuntime, state: &mut MaintenanceState
             let ended_snapshot = consumer
                 .in_flight
                 .as_ref()
-                .is_some_and(|_| consumer.pending.front().is_none());
+                .is_some_and(|flight| flight.kind == FamilyFrameKind::End);
             consumer.in_flight = None;
             if !success {
                 state.session_family.mark_gap(&plugin_key);
@@ -593,7 +653,6 @@ pub fn start_baseline_recovery(state: &mut MaintenanceState) {
     state.baseline = Some(BaselineRecovery {
         snapshot: None,
         after: None,
-        assembled: Vec::new(),
     });
     state.scheduler.try_wake();
 }
@@ -612,14 +671,30 @@ fn handle_resync_reason(state: &mut MaintenanceState, reason: SessionLifecycleRe
 }
 
 fn refresh_session_family_consumers(runtime: &HubRuntime, state: &mut MaintenanceState) {
-    let handlers = runtime.session_family_event_handlers();
-    let mut live = BTreeMap::new();
+    let mut handlers = runtime
+        .session_family_event_handlers()
+        .into_iter()
+        .filter(|handler| handler.handler.kind == PluginHandlerKind::Event)
+        .collect::<Vec<_>>();
+    handlers.sort_by(|left, right| left.handler.plugin_key.0.cmp(&right.handler.plugin_key.0));
+    let after = state.session_family.refresh_after.clone();
+    let started = Instant::now();
+    let mut visited = 0;
+    let mut last_key = after.clone();
     for handler in handlers {
-        if handler.handler.kind != PluginHandlerKind::Event {
+        let plugin_key = handler.handler.plugin_key.0.clone();
+        if after
+            .as_ref()
+            .is_some_and(|after| plugin_key.as_str() <= after.as_str())
+        {
             continue;
         }
-        let plugin_key = handler.handler.plugin_key.0.clone();
-        live.insert(plugin_key.clone(), handler.handler.clone());
+        if visited >= CONSUMER_REFRESH_MAX || started.elapsed() >= CONSUMER_REFRESH_MAX_ELAPSED {
+            state.session_family.refresh_after = last_key;
+            state.scheduler.try_wake();
+            return;
+        }
+        state.session_family.refresh_seen.insert(plugin_key.clone());
         let existed = state.session_family.consumers.contains_key(&plugin_key);
         let consumer = state.session_family.consumer_mut(&plugin_key);
         consumer.handler = Some(handler.handler);
@@ -635,11 +710,15 @@ fn refresh_session_family_consumers(runtime: &HubRuntime, state: &mut Maintenanc
                 state.session_family.begin_snapshot(&plugin_key, sequence);
             }
         }
+        last_key = Some(plugin_key);
+        visited += 1;
     }
+    let seen = std::mem::take(&mut state.session_family.refresh_seen);
     state
         .session_family
         .consumers
-        .retain(|key, _| live.contains_key(key));
+        .retain(|key, _| seen.contains(key));
+    state.session_family.refresh_after = None;
 }
 
 fn next_session_family_admission(
@@ -767,7 +846,18 @@ fn queue_family_delta(state: &mut MaintenanceState, change: &SessionLifecycleCha
         .cloned()
         .collect::<Vec<_>>();
     for plugin_key in keys {
-        state.session_family.queue_delta(&plugin_key, frame.clone());
+        if !state.session_family.queue_delta(&plugin_key, frame.clone()) {
+            state.session_family.mark_gap(&plugin_key);
+            if state.projection.baseline_complete {
+                let sequence = state
+                    .projection
+                    .cursor
+                    .as_ref()
+                    .map(|cursor| cursor.sequence)
+                    .unwrap_or(0);
+                state.session_family.begin_snapshot(&plugin_key, sequence);
+            }
+        }
     }
 }
 
@@ -873,6 +963,7 @@ mod tests {
             .in_flight = Some(InFlightSessionFamily {
             request_id: RequestId("session-family-plugin.one-7".to_string()),
             snapshot_sequence: 7,
+            kind: FamilyFrameKind::Begin,
         });
         assert!(
             next_session_family_admission(&mut state).is_none(),
@@ -914,6 +1005,111 @@ mod tests {
         assert!(pack_session_chunk(&[huge], 0).is_err());
     }
 
+    fn test_record(id: &str) -> botster_core_daemon::SessionLifecycleRecord {
+        botster_core_daemon::SessionLifecycleRecord {
+            session: botster_core_daemon::DaemonSession {
+                session_id: SessionId(id.to_string()),
+                registry_state: botster_core_daemon::RegistrySessionState::Running,
+                size: botster_core::ResizePayload { rows: 24, cols: 80 },
+                process: None,
+                updated_at: 1,
+            },
+            metadata: botster_core::CoreSessionMetadata::new(),
+            lifecycle: Some(botster_core::SessionLifecycleState::Running),
+        }
+    }
+
+    fn complete_after_frame(state: &mut MaintenanceState, plugin_key: &str, kind: FamilyFrameKind) {
+        let consumer = state
+            .session_family
+            .consumers
+            .get_mut(plugin_key)
+            .expect("consumer");
+        consumer.in_flight = None;
+        if kind == FamilyFrameKind::End {
+            consumer.snapshot_complete = true;
+            consumer.pending.extend(consumer.held_deltas.drain(..));
+        }
+    }
+
+    #[test]
+    fn production_begin_completion_does_not_release_deltas() {
+        let mut projection = SessionProjection::default();
+        projection.replace_complete_baseline(
+            botster_core_daemon::SessionLifecycleCursor {
+                source_id: botster_core_daemon::SessionLifecycleSourceId("s".into()),
+                sequence: 3,
+            },
+            vec![test_record("a")],
+        );
+        let mut state = MaintenanceState {
+            projection,
+            ..MaintenanceState::default()
+        };
+        state.session_family.begin_snapshot("plugin.one", 3);
+        state
+            .session_family
+            .consumers
+            .get_mut("plugin.one")
+            .expect("consumer")
+            .handler = Some(PluginHandlerRef {
+            plugin_key: botster_core::PluginKey("plugin.one".to_string()),
+            kind: PluginHandlerKind::Event,
+            handler_id: "session_family".to_string(),
+        });
+        assert!(state.session_family.queue_delta(
+            "plugin.one",
+            serde_json::json!({"type": "entity_upsert", "id": "live-after-begin"}),
+        ));
+        let begin = next_session_family_payload(&mut state, "plugin.one").expect("begin");
+        assert_eq!(
+            begin.get("type"),
+            Some(&serde_json::json!("snapshot_begin"))
+        );
+        assert_eq!(family_frame_kind(&begin), FamilyFrameKind::Begin);
+        complete_after_frame(&mut state, "plugin.one", FamilyFrameKind::Begin);
+        {
+            let consumer = state
+                .session_family
+                .consumers
+                .get("plugin.one")
+                .expect("consumer");
+            assert!(!consumer.snapshot_complete);
+            assert_eq!(consumer.held_deltas.len(), 1);
+            assert!(consumer.need_snapshot_chunks);
+        }
+        let chunk = next_session_family_payload(&mut state, "plugin.one").expect("chunk");
+        assert_eq!(
+            chunk.get("type"),
+            Some(&serde_json::json!("snapshot_chunk"))
+        );
+        assert!(state.session_family.queue_delta(
+            "plugin.one",
+            serde_json::json!({"type": "entity_upsert", "id": "live-after-chunk"}),
+        ));
+        complete_after_frame(&mut state, "plugin.one", FamilyFrameKind::Chunk);
+        {
+            let consumer = state
+                .session_family
+                .consumers
+                .get("plugin.one")
+                .expect("consumer");
+            assert!(!consumer.snapshot_complete);
+            assert_eq!(consumer.held_deltas.len(), 2);
+        }
+        let end = next_session_family_payload(&mut state, "plugin.one").expect("end");
+        assert_eq!(end.get("type"), Some(&serde_json::json!("snapshot_end")));
+        complete_after_frame(&mut state, "plugin.one", FamilyFrameKind::End);
+        let consumer = state
+            .session_family
+            .consumers
+            .get("plugin.one")
+            .expect("consumer");
+        assert!(consumer.snapshot_complete);
+        assert!(consumer.held_deltas.is_empty());
+        assert_eq!(consumer.pending.len(), 2);
+    }
+
     #[test]
     fn session_family_request_ids_are_unique_per_frame() {
         let mut bridge = SessionFamilyBridge::default();
@@ -931,5 +1127,100 @@ mod tests {
         assert_eq!(scheduler.take_slice(), MaintenanceSliceKind::Observe);
         assert!(!scheduler.has_wake());
         assert_eq!(scheduler.take_slice(), MaintenanceSliceKind::JournalPull);
+    }
+
+    #[test]
+    fn queue_delta_pressure_restarts_a_complete_snapshot() {
+        let mut projection = SessionProjection::default();
+        projection.replace_complete_baseline(
+            botster_core_daemon::SessionLifecycleCursor {
+                source_id: botster_core_daemon::SessionLifecycleSourceId("s".into()),
+                sequence: 4,
+            },
+            Vec::new(),
+        );
+        let mut state = MaintenanceState {
+            projection,
+            ..MaintenanceState::default()
+        };
+        state.session_family.begin_snapshot("plugin.slow", 4);
+        {
+            let consumer = state
+                .session_family
+                .consumers
+                .get_mut("plugin.slow")
+                .expect("consumer");
+            consumer.snapshot_complete = true;
+            consumer.need_snapshot_chunks = false;
+            consumer.pending.clear();
+        }
+        let mut restarted = false;
+        for index in 0..(FAMILY_QUEUE_MAX_ITEMS + 2) {
+            let change = SessionLifecycleChange {
+                cursor: botster_core_daemon::SessionLifecycleCursor {
+                    source_id: botster_core_daemon::SessionLifecycleSourceId("s".into()),
+                    sequence: 4 + index as u64,
+                },
+                kind: botster_core_daemon::SessionLifecycleChangeKind::Removed {
+                    session_id: SessionId(format!("gone-{index}")),
+                },
+            };
+            queue_family_delta(&mut state, &change);
+            let consumer = state
+                .session_family
+                .consumers
+                .get("plugin.slow")
+                .expect("consumer");
+            if consumer.pending.front().and_then(|frame| frame.get("type"))
+                == Some(&serde_json::json!("snapshot_begin"))
+                && !consumer.snapshot_complete
+            {
+                restarted = true;
+                break;
+            }
+        }
+        assert!(restarted, "pressure must restart a snapshot");
+        let consumer = state
+            .session_family
+            .consumers
+            .get("plugin.slow")
+            .expect("consumer");
+        assert_eq!(
+            consumer.pending.front().and_then(|frame| frame.get("type")),
+            Some(&serde_json::json!("snapshot_begin"))
+        );
+        assert!(consumer.held_deltas.is_empty());
+        assert!(!consumer.snapshot_complete);
+        assert!(consumer.pending.len() < FAMILY_QUEUE_MAX_ITEMS);
+    }
+
+    #[test]
+    fn ingest_baseline_pages_stay_within_owner_turn() {
+        let mut projection = SessionProjection::default();
+        for page in 0..16 {
+            let started = Instant::now();
+            let rows = (0..BASELINE_PAGE_BUDGET.max_rows)
+                .map(|index| {
+                    test_record(&format!(
+                        "s-{:03}",
+                        page * BASELINE_PAGE_BUDGET.max_rows + index
+                    ))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(rows.len(), BASELINE_PAGE_BUDGET.max_rows);
+            projection.ingest_baseline_rows(1, rows);
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "one baseline ingest page hung"
+            );
+        }
+        projection.seal_baseline(botster_core_daemon::SessionLifecycleCursor {
+            source_id: botster_core_daemon::SessionLifecycleSourceId("s".into()),
+            sequence: 1,
+        });
+        assert_eq!(projection.rows.len(), 256);
+        assert!(projection.baseline_complete);
+        assert!(!projection.gap);
+        assert_eq!(BASELINE_PAGE_BUDGET.max_rows, 16);
     }
 }
