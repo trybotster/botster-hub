@@ -1265,6 +1265,24 @@ pub(crate) fn write_python_wait_then_write_script(release_path: &Path, bytes: &[
     script_path
 }
 
+pub(crate) fn write_python_wait_then_write_and_hold_script(
+    release_path: &Path,
+    bytes: &[u8],
+) -> PathBuf {
+    let script_path = unique_short_test_dir("live-output-hold-script").join("write.py");
+    fs::create_dir_all(script_path.parent().expect("script parent")).expect("create script dir");
+    fs::write(
+        &script_path,
+        format!(
+            "import os\nimport time\np = {path:?}\nwhile not os.path.exists(p):\n    time.sleep(0.01)\nos.write(1, bytes([{bytes}]))\nwhile True:\n    time.sleep(1)\n",
+            path = release_path,
+            bytes = python_bytes_literal(bytes),
+        ),
+    )
+    .expect("write wait-then-write-and-hold script");
+    script_path
+}
+
 pub(crate) fn write_python_split_utf8_script(
     first_release: &Path,
     second_release: &Path,

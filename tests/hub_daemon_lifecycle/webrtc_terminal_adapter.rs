@@ -1,7 +1,8 @@
 fn webrtc_terminal_adapter_hello() -> botster_hub_client::DaemonHello {
     botster_hub_client::DaemonHello {
         protocol: botster_hub_client::PROTOCOL.to_string(),
-        compatibility: botster_hub_client::DaemonCompatibilityRequirement::for_webrtc_terminal_adapter(),
+        compatibility:
+            botster_hub_client::DaemonCompatibilityRequirement::for_webrtc_terminal_adapter(),
         terminal_compatibility: None,
     }
 }
@@ -32,7 +33,10 @@ async fn spawn_and_bind_webrtc(
         )
         .await
         .expect("spawn");
-    assert_eq!(spawned.kind, botster_hub_client::DaemonResponseKind::Spawned);
+    assert_eq!(
+        spawned.kind,
+        botster_hub_client::DaemonResponseKind::Spawned
+    );
     let attach = peer
         .encrypted_request(
             key,
@@ -132,7 +136,9 @@ fn issue_second_webrtc_bootstrap(
     .expect("second bootstrap response includes local WebRTC bootstrap")
 }
 
-fn start_webrtc_adapter_hub(name: &str) -> (
+fn start_webrtc_adapter_hub(
+    name: &str,
+) -> (
     botster_hub_test_support::IsolatedHub,
     botster_hub_client::DaemonEndpoint,
     botster_hub_client::DaemonLocalWebrtcBootstrap,
@@ -221,7 +227,10 @@ fn webrtc_terminal_adapter_bind_returns_only_attaching_then_terminal_frames() {
             )
             .await
             .expect("spawn");
-        assert_eq!(spawned.kind, botster_hub_client::DaemonResponseKind::Spawned);
+        assert_eq!(
+            spawned.kind,
+            botster_hub_client::DaemonResponseKind::Spawned
+        );
 
         let attach = peer
             .encrypted_request(
@@ -261,8 +270,8 @@ fn webrtc_terminal_adapter_bind_returns_only_attaching_then_terminal_frames() {
                 "bound drain must not emit terminal bodies: {:?}",
                 drain.events
             );
-            if let Ok(bytes) = timeout(Duration::from_millis(200), peer.next_terminal_frame(&key))
-                .await
+            if let Ok(bytes) =
+                timeout(Duration::from_millis(200), peer.next_terminal_frame(&key)).await
             {
                 let bytes = bytes.expect("terminal frame");
                 assert!(!bytes.is_empty());
@@ -291,6 +300,47 @@ fn webrtc_terminal_adapter_bind_returns_only_attaching_then_terminal_frames() {
         env!("CARGO_BIN_EXE_botster-hub"),
         session_worker_binary_path().display()
     );
+    shutdown_short_lived_session(&endpoint, session_id);
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn webrtc_terminal_adapter_attach_pumps_chronology_without_host_drain() {
+    let _guard = daemon_test_guard();
+    let (hub, endpoint, bootstrap) = start_webrtc_adapter_hub("wac");
+    let session_id = "wac-session";
+    let subscription_id = "wac-sub";
+    block_on(async {
+        let (mut peer, key) = open_local_webrtc_peer(&endpoint, &bootstrap).await;
+        peer.encrypted_hello(&key, &webrtc_terminal_adapter_hello())
+            .await
+            .expect("datachannel hello");
+        spawn_and_bind_webrtc(
+            &mut peer,
+            &key,
+            session_id,
+            subscription_id,
+            "printf 'webrtc-attach-pumped\\n'; sleep 30",
+        )
+        .await;
+
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut saw_terminal_frame = false;
+        while Instant::now() < deadline && !saw_terminal_frame {
+            if let Ok(bytes) =
+                timeout(Duration::from_millis(200), peer.next_terminal_frame(&key)).await
+            {
+                let bytes = bytes.expect("terminal frame");
+                assert!(!bytes.is_empty());
+                saw_terminal_frame = true;
+            }
+        }
+        assert!(
+            saw_terminal_frame,
+            "Attach must pump bound WebRTC chronology without a later host Drain or ReadScreen"
+        );
+        peer.peer.close().await.expect("close offer peer");
+    });
     shutdown_short_lived_session(&endpoint, session_id);
     hub.shutdown().expect("shutdown isolated hub");
 }
@@ -349,8 +399,8 @@ fn webrtc_terminal_adapter_second_data_channel_does_not_receive_terminal_frames(
                 "bound drain must not emit terminal bodies: {:?}",
                 drain.events
             );
-            if let Ok(bytes) = timeout(Duration::from_millis(200), peer.next_terminal_frame(&key))
-                .await
+            if let Ok(bytes) =
+                timeout(Duration::from_millis(200), peer.next_terminal_frame(&key)).await
             {
                 let bytes = bytes.expect("terminal frame");
                 assert!(!bytes.is_empty());
@@ -409,7 +459,10 @@ fn webrtc_terminal_adapter_unbound_attach_still_drains_snapshot_without_terminal
             )
             .await
             .expect("spawn");
-        assert_eq!(spawned.kind, botster_hub_client::DaemonResponseKind::Spawned);
+        assert_eq!(
+            spawned.kind,
+            botster_hub_client::DaemonResponseKind::Spawned
+        );
         let attach = peer
             .encrypted_request(
                 &key,
@@ -429,10 +482,7 @@ fn webrtc_terminal_adapter_unbound_attach_still_drains_snapshot_without_terminal
         let drain = peer
             .encrypted_request(
                 &key,
-                &botster_hub_client::DaemonRequest::drain_subscription(
-                    session_id,
-                    subscription_id,
-                ),
+                &botster_hub_client::DaemonRequest::drain_subscription(session_id, subscription_id),
             )
             .await
             .expect("host drain");
@@ -507,14 +557,12 @@ fn webrtc_terminal_adapter_bound_peer_loss_closes_adapter_without_hub_detach() {
         )
         .await
         .expect("attach");
-        let attached = botster_hub_client::request(
-            &endpoint,
-            botster_hub_client::DaemonRequest::Status,
-        )
-        .expect("status after attach")
-        .status
-        .expect("status body")
-        .lifecycle_counters;
+        let attached =
+            botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+                .expect("status after attach")
+                .status
+                .expect("status body")
+                .lifecycle_counters;
         peer.peer.close().await.expect("close offer peer");
         attached
     });
@@ -548,8 +596,9 @@ fn webrtc_terminal_adapter_bound_peer_loss_closes_adapter_without_hub_detach() {
         after.live_attach_subscriptions < attached.live_attach_subscriptions,
         "bound occupancy must drop after adapter close: attached={attached:?} after={after:?}"
     );
-    let listed = botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::ListSessions)
-        .expect("list");
+    let listed =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::ListSessions)
+            .expect("list");
     assert!(
         listed
             .sessions
@@ -723,9 +772,10 @@ fn webrtc_terminal_adapter_host_close_emits_negotiated_terminal_subscription_clo
             .encrypted_hello(&key, &webrtc_close_event_hello())
             .await
             .expect("negotiated hello");
-        assert!(ack.compatibility.supports_feature(
-            botster_hub_client::FEATURE_TERMINAL_SUBSCRIPTION_CLOSED
-        ));
+        assert!(
+            ack.compatibility
+                .supports_feature(botster_hub_client::FEATURE_TERMINAL_SUBSCRIPTION_CLOSED)
+        );
         spawn_and_bind_webrtc(&mut peer, &key, "whc-a", "sub-a", "sleep 30").await;
         spawn_and_bind_webrtc(&mut peer, &key, "whc-b", "sub-b", "sleep 30").await;
         let reattach = peer
@@ -738,7 +788,10 @@ fn webrtc_terminal_adapter_host_close_emits_negotiated_terminal_subscription_clo
             )
             .await
             .expect("host close via replacement attach");
-        assert_eq!(reattach.kind, botster_hub_client::DaemonResponseKind::Events);
+        assert_eq!(
+            reattach.kind,
+            botster_hub_client::DaemonResponseKind::Events
+        );
         let closed = wait_for_webrtc_subscription_closed(&mut peer, &key, "whc-a", "sub-a")
             .await
             .expect("negotiated host close must emit TerminalSubscriptionClosed");
@@ -837,14 +890,9 @@ fn webrtc_terminal_adapter_write_budget_emits_core_adapter_closed_while_peer_sta
         )
         .await;
 
-        let closed = wait_for_webrtc_subscription_closed(
-            &mut peer,
-            &key,
-            "wwb-stall",
-            "sub-stall",
-        )
-        .await
-        .expect("keep-reading observer must see core_adapter_closed");
+        let closed = wait_for_webrtc_subscription_closed(&mut peer, &key, "wwb-stall", "sub-stall")
+            .await
+            .expect("keep-reading observer must see core_adapter_closed");
         match closed {
             botster_hub_client::DaemonEvent::TerminalSubscriptionClosed { reason, .. } => {
                 assert_eq!(
@@ -946,7 +994,9 @@ fn webrtc_terminal_adapter_unnegotiated_adapter_never_receives_or_decodes_daemon
                     saw_sibling = true;
                 }
                 Ok(Err(error)) => {
-                    panic!("unnegotiated receive path must fail closed without decoding daemon_event: {error}");
+                    panic!(
+                        "unnegotiated receive path must fail closed without decoding daemon_event: {error}"
+                    );
                 }
                 Err(_) => {}
             }
@@ -1021,8 +1071,7 @@ fn webrtc_terminal_adapter_detach_peer_death_process_exit_and_shutdown_do_not_em
             peer.pending_host_events
         );
 
-        let (mut death_peer, death_key) =
-            open_local_webrtc_peer(&endpoint, &death_bootstrap).await;
+        let (mut death_peer, death_key) = open_local_webrtc_peer(&endpoint, &death_bootstrap).await;
         death_peer.enable_host_events();
         death_peer
             .encrypted_hello(&death_key, &webrtc_close_event_hello())
@@ -1079,14 +1128,9 @@ fn webrtc_terminal_adapter_failed_remove_session_does_not_suppress_later_core_cl
             removed.error.as_ref().map(|error| error.code.as_str()),
             Some("session_not_terminal")
         );
-        let closed = wait_for_webrtc_subscription_closed(
-            &mut peer,
-            &key,
-            "wrm-stall",
-            "sub-stall",
-        )
-        .await
-        .expect("failed RemoveSession must not suppress later Core close");
+        let closed = wait_for_webrtc_subscription_closed(&mut peer, &key, "wrm-stall", "sub-stall")
+            .await
+            .expect("failed RemoveSession must not suppress later Core close");
         match closed {
             botster_hub_client::DaemonEvent::TerminalSubscriptionClosed { reason, .. } => {
                 assert_eq!(
@@ -1122,15 +1166,13 @@ fn webrtc_terminal_adapter_stale_generation_close_does_not_sweep_replacement_own
             "while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
         )
         .await;
-        let occupancy_after_a = botster_hub_client::request(
-            &endpoint,
-            botster_hub_client::DaemonRequest::Status,
-        )
-        .expect("status after A")
-        .status
-        .expect("status body")
-        .lifecycle_counters
-        .live_attach_subscriptions;
+        let occupancy_after_a =
+            botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+                .expect("status after A")
+                .status
+                .expect("status body")
+                .lifecycle_counters
+                .live_attach_subscriptions;
 
         let (mut owner_b, key_b) = open_local_webrtc_peer(&endpoint, &bootstrap_b).await;
         owner_b.enable_host_events();
@@ -1148,7 +1190,10 @@ fn webrtc_terminal_adapter_stale_generation_close_does_not_sweep_replacement_own
             )
             .await
             .expect("replacement attach");
-        assert_eq!(attach_b.kind, botster_hub_client::DaemonResponseKind::Events);
+        assert_eq!(
+            attach_b.kind,
+            botster_hub_client::DaemonResponseKind::Events
+        );
         assert!(
             !attach_b.events.iter().any(|event| matches!(
                 event,
@@ -1158,29 +1203,23 @@ fn webrtc_terminal_adapter_stale_generation_close_does_not_sweep_replacement_own
             "replacement owner B must bind: {:?}",
             attach_b.events
         );
-        let closed = wait_for_webrtc_subscription_closed(
-            &mut owner_a,
-            &key_a,
-            "wsg-session",
-            "wsg-sub",
-        )
-        .await
-        .expect("A must observe TerminalSubscriptionClosed for generation N");
+        let closed =
+            wait_for_webrtc_subscription_closed(&mut owner_a, &key_a, "wsg-session", "wsg-sub")
+                .await
+                .expect("A must observe TerminalSubscriptionClosed for generation N");
         match closed {
             botster_hub_client::DaemonEvent::TerminalSubscriptionClosed { generation, .. } => {
                 assert_eq!(generation, 1);
             }
             other => panic!("unexpected host event: {other:?}"),
         }
-        let occupancy_after_b = botster_hub_client::request(
-            &endpoint,
-            botster_hub_client::DaemonRequest::Status,
-        )
-        .expect("status after B")
-        .status
-        .expect("status body")
-        .lifecycle_counters
-        .live_attach_subscriptions;
+        let occupancy_after_b =
+            botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+                .expect("status after B")
+                .status
+                .expect("status body")
+                .lifecycle_counters
+                .live_attach_subscriptions;
         assert!(
             occupancy_after_b >= 1,
             "Hub-visible occupancy must keep B live: after_a={occupancy_after_a} after_b={occupancy_after_b}"
@@ -1220,8 +1259,11 @@ fn webrtc_terminal_adapter_stale_generation_close_does_not_sweep_replacement_own
         while Instant::now() < deadline
             && !webrtc_terminal_contains(&owner_b.pending_terminal_frames, "echo:after-replace")
         {
-            if let Ok(Ok(bytes)) =
-                timeout(Duration::from_millis(200), owner_b.next_terminal_frame(&key_b)).await
+            if let Ok(Ok(bytes)) = timeout(
+                Duration::from_millis(200),
+                owner_b.next_terminal_frame(&key_b),
+            )
+            .await
             {
                 owner_b
                     .pending_terminal_frames
@@ -1230,7 +1272,10 @@ fn webrtc_terminal_adapter_stale_generation_close_does_not_sweep_replacement_own
             let drain = owner_b
                 .encrypted_request(
                     &key_b,
-                    &botster_hub_client::DaemonRequest::drain_subscription("wsg-session", "wsg-sub"),
+                    &botster_hub_client::DaemonRequest::drain_subscription(
+                        "wsg-session",
+                        "wsg-sub",
+                    ),
                 )
                 .await
                 .expect("B keep-alive drain");
@@ -1261,9 +1306,9 @@ fn webrtc_terminal_adapter_stale_generation_close_does_not_sweep_replacement_own
 fn webrtc_terminal_adapter_close_event_feature_stays_optional_on_protocol_7() {
     let requirement = botster_hub_client::DaemonCompatibilityRequirement::current();
     let mut previous = botster_hub_client::DaemonCompatibility::current();
-    previous.features.retain(|feature| {
-        feature != botster_hub_client::FEATURE_TERMINAL_SUBSCRIPTION_CLOSED
-    });
+    previous
+        .features
+        .retain(|feature| feature != botster_hub_client::FEATURE_TERMINAL_SUBSCRIPTION_CLOSED);
     previous.conformance_fixture_revision =
         botster_hub_client::DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION;
     botster_hub_client::ensure_compatible(&requirement, &previous)

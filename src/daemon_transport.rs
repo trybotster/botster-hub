@@ -2167,6 +2167,7 @@ pub(crate) fn handle_control_message(
             let reconcile_after_request = matches!(
                 request,
                 DaemonRequest::Spawn { .. }
+                    | DaemonRequest::Attach { .. }
                     | DaemonRequest::Resize { .. }
                     | DaemonRequest::SendInput { .. }
                     | DaemonRequest::ModeGatedInput { .. }
@@ -3070,7 +3071,10 @@ fn handle_runtime_control_request(
                         mux: Some(mux),
                     },
                 ) {
-                    Ok(_) => Ok(daemon_events(Vec::new())),
+                    Ok(_) => {
+                        observe_lifecycle_turn(runtime, tick(logical_clock));
+                        Ok(daemon_events(Vec::new()))
+                    }
                     Err(_) => Ok(attach_bind_operator_error(
                         "invalid_request",
                         "Attach failed to bind a WebRTC adapter",
@@ -3107,7 +3111,10 @@ fn handle_runtime_control_request(
                     mux: Some(mux),
                 },
             ) {
-                Ok(_) => Ok(daemon_events(Vec::new())),
+                Ok(_) => {
+                    observe_lifecycle_turn(runtime, tick(logical_clock));
+                    Ok(daemon_events(Vec::new()))
+                }
                 Err(_) => Ok(attach_bind_operator_error(
                     "invalid_request",
                     "Attach failed to bind a Unix adapter",
@@ -3248,16 +3255,22 @@ fn handle_runtime_control_request(
             ) {
                 Ok(response) => response,
                 Err(error) => {
-                    let now = tick(logical_clock);
-                    observe_lifecycle_turn(runtime, now);
-                    let response = shutdown_error_response(
-                        classify_shutdown_session(runtime, &session_id)?,
-                        error,
-                        &session_id,
-                    )?;
-                    suppress_unix_session_close_events(pending_runtime, &session_id);
-                    suppress_webrtc_session_close_events(pending_runtime, &session_id);
-                    return Ok(response);
+                    for _ in 0..8 {
+                        let now = tick(logical_clock);
+                        observe_lifecycle_turn(runtime, now);
+                        match classify_shutdown_session(runtime, &session_id)? {
+                            ShutdownSessionClassification::Active
+                                if !shutdown_error_is_already_gone(&error) => {}
+                            classification => {
+                                let response =
+                                    shutdown_error_response(classification, error, &session_id)?;
+                                suppress_unix_session_close_events(pending_runtime, &session_id);
+                                suppress_webrtc_session_close_events(pending_runtime, &session_id);
+                                return Ok(response);
+                            }
+                        }
+                    }
+                    return Err(DaemonTransportError::Client(error));
                 }
             };
             suppress_unix_session_close_events(pending_runtime, &session_id);

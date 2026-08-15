@@ -14,7 +14,7 @@ Plan: `docs/plans/cold-cut-terminal-drains-and-translation-from-the-production-p
 | Worktree HEAD before edits | `959c58f55726d098299cced8af151d8f496f41e3` |
 | Locked Core SHA | `aef6516d5809d563961ed7fdd07da29a7b4edddc` |
 | Merge policy | direct into `main`; no PR |
-| Review follow-up | `review_1786788470_558598` on `2392d61` |
+| Review follow-up | `review_1786812405_677042` on `cf8769c` |
 
 Independent routing matched the approved plan. This run did not infer the repository from the ambient directory.
 
@@ -151,6 +151,20 @@ This visit:
 - The test waits for that file, then waits for host `ReadScreen` to contain the marker, then calls `stream_attach`.
 - The test is now `unix_adapter_always_bind_stream_attach_restores_current_screen`.
 
+Verify `review_1786812405_677042` required three follow-ups on `cf8769c`:
+
+- `finding_1786812405_392121` — live WebRTC `ShutdownSession` still returned `OperatorError` under `./test.sh --locked`.
+- `finding_1786812405_914932` — live Web attach never delivered terminal chronology.
+- `finding_1786812405_507488` — TUI IsolatedHub Hello at `fc1ff623` still requires removed host tokens.
+
+This visit:
+
+- Successful Unix/WebRTC Attach now observes a bounded lifecycle slice after bind. Attach is also a reconcile-after-request mutation.
+- `webrtc_terminal_adapter_attach_pumps_chronology_without_host_drain` waits for adapter frames after Attach with no later Drain or ReadScreen.
+- Live exact-bytes producer holds after `write(2)` so `ShutdownSession` shuts down a still-running session.
+- On Core shutdown error, Hub retries observe and classify up to eight times before returning `OperatorError`.
+- Host terminal tokens stay off the descriptor. TUI IsolatedHub `wait_for_ready` at `fc1ff623` is not production TUI Hello. Verify should start this tree IsolatedHub, then drive TUI `HubConnection`.
+
 ## Runtime-teardown lenses
 
 | Lens | Implemented |
@@ -182,8 +196,8 @@ Passed on this tree:
 - `hub_client_api_test`: 34 passed, including `session_entity_subscription_returns_a_bounded_page_not_a_complete_baseline`
 - IsolatedHub Unix always-bind, empty Attach, host Drain empty, ReadScreen marker, replacement-owner
 - Lifecycle oracles rewritten off Attach/Drain translation: mux frames, `ReadScreen`, host OperatorError, session-entity patches
-- `hub_daemon_lifecycle_test`: 204 passed, 1 ignored (larger local many-PTY)
-- Full `./test.sh --locked` workspace: all binaries ok (lifecycle 204/1 ignored; lib 274; client API 34; no FAILED results)
+- `hub_daemon_lifecycle_test`: 205 passed, 1 ignored (larger local many-PTY)
+- Full `./test.sh --locked` workspace: all binaries ok (lifecycle 205/1 ignored; lib 274; client API 34; no FAILED results)
 - `session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnect` passed isolated three times after the Drain removal (4.2–5.0s) and in the locked suite
 - `cli_smoke_proves_local_runtime_daemon_package_app_session_and_webrtc` passed in the locked suite
 - Missing-session host Drain is a typed OperatorError (`drain_runtime` / `terminal_stream_unavailable`)
@@ -202,6 +216,9 @@ Passed on this tree:
 - `external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup` passed isolated after the extra parking `ReadScreen` was removed
 - `external_hub_webrtc_live_output_preserves_exact_bytes` passed isolated
 - `unix_adapter_always_bind_stream_attach_restores_current_screen` passed isolated three times (1.56–1.61s)
+- `webrtc_terminal_adapter_attach_pumps_chronology_without_host_drain` passed isolated
+- `external_hub_webrtc_live_output_preserves_exact_bytes` passed isolated three times after the producer hold (2.62s, 2.46s, 2.50s)
+- Shutdown unit tests still pass: Active plus Runtime stays `OperatorError`; UnknownSession stays cleanup
 
 ## Unverified behavior or residual risk
 
@@ -210,7 +227,9 @@ Passed on this tree:
 - Control-thread `try_recv` prefers queued host requests over idle reconcile. Burst `ReadScreen` can delay the 500 ms idle observe until the queue drains. Mutations now observe on the request path.
 - CoreDaemon on `aef6516` does not expose `pump_bound_adapters`. Owner-loop observe uses `observe_lifecycle_slice`, which calls Core `drain_runtime_once` internally.
 - Downstream TUI/Web crates that still imported the deleted hub-client `FEATURE_*` constants must import `botster-terminal-protocol` instead. Those consumers are separately routed.
-- If Core `Shutdown` fails while `registry_state` is still `Running` after a second observe, and the error is `Runtime` or `State`, Hub returns `OperatorError`. `ReadScreen` can park `ProcessExited` in Core `pending_drain`. Observe does not take that drain. A later `ShutdownSession` can then miss the exit and surface `OperatorError`. That is a Core control-plane gap, not a Hub terminal Drain.
+- If Core `Shutdown` fails while `registry_state` is still `Running` after eight observe retries, and the error is `Runtime` or `State`, Hub returns `OperatorError`. `ReadScreen` can park `ProcessExited` in Core `pending_drain`. Observe does not take that drain.
+- Live Web `npm run smoke:live-packaged-protocol` against this new SHA was not rerun in this Implement turn. Verify must rerun it with `BOTSTER_HUB_BIN` and `BOTSTER_SESSION_WORKER_BIN` from this commit.
+- TUI IsolatedHub at `fc1ff623` still uses default Hello host tokens. Do not restore those tokens. Start Hub with this tree IsolatedHub, then drive production TUI Hello.
 
 ## Missing vault guidance discovered
 
