@@ -83,6 +83,13 @@ pub(crate) struct LocalWebrtcOfferPeer {
     pub(crate) data_channel_open_rx: AsyncReceiver<()>,
     pub(crate) data_channel_message_rx: AsyncReceiver<String>,
     pub(crate) pending_entity_frames: VecDeque<botster_hub_client::DaemonEntityFrame>,
+    pub(crate) pending_terminal_frames: VecDeque<(String, Vec<u8>)>,
+    pub(crate) pending_host_events: VecDeque<botster_hub_client::DaemonEvent>,
+    pub(crate) accept_host_events: bool,
+}
+
+pub(crate) struct ExtraWebrtcDataChannel {
+    pub(crate) messages: AsyncReceiver<String>,
 }
 
 impl LocalWebrtcOfferPeer {
@@ -158,6 +165,9 @@ impl LocalWebrtcOfferPeer {
                 data_channel_open_rx,
                 data_channel_message_rx,
                 pending_entity_frames: VecDeque::new(),
+                pending_terminal_frames: VecDeque::new(),
+                pending_host_events: VecDeque::new(),
+                accept_host_events: false,
             },
             offer,
         ))
@@ -212,6 +222,13 @@ impl LocalWebrtcOfferPeer {
                     self.pending_entity_frames
                         .push_back(serde_json::from_slice(&plaintext)?);
                 }
+                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonTerminalFrame => {
+                    self.pending_terminal_frames
+                        .push_back((String::new(), plaintext));
+                }
+                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonEvent => {
+                    self.park_or_reject_host_event(&plaintext)?;
+                }
             }
         }
     }
@@ -223,16 +240,125 @@ impl LocalWebrtcOfferPeer {
         if let Some(frame) = self.pending_entity_frames.pop_front() {
             return Ok(frame);
         }
-        let (delivery_kind, plaintext, _) = self.receive_delivery(key).await?;
-        match delivery_kind {
-            botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonEntityFrame => {
-                Ok(serde_json::from_slice(&plaintext)?)
+        loop {
+            let (delivery_kind, plaintext, _) = self.receive_delivery(key).await?;
+            match delivery_kind {
+                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonEntityFrame => {
+                    return Ok(serde_json::from_slice(&plaintext)?);
+                }
+                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonResponse => {
+                    return Err(std::io::Error::other(
+                        "received uncorrelated daemon response while waiting for entity frame",
+                    )
+                    .into());
+                }
+                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonTerminalFrame => {
+                    self.pending_terminal_frames
+                        .push_back((String::new(), plaintext));
+                }
+                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonEvent => {
+                    self.park_or_reject_host_event(&plaintext)?;
+                }
             }
-            botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonResponse => {
-                Err(std::io::Error::other(
-                    "received uncorrelated daemon response while waiting for entity frame",
-                )
-                .into())
+        }
+    }
+
+    pub(crate) async fn encrypted_hello(
+        &mut self,
+        key: &AesGcmKey,
+        hello: &botster_hub_client::DaemonHello,
+    ) -> Result<botster_hub_client::DaemonHelloAck, Box<dyn std::error::Error>> {
+        let plaintext = serde_json::to_vec(hello)?;
+        let envelope = encrypt_aes_gcm(key, &plaintext, 1)?;
+        self.data_channel
+            .send_text(&serde_json::to_string(&envelope)?)
+            .await?;
+        let (delivery_kind, plaintext, _) = self.receive_delivery(key).await?;
+        if delivery_kind != botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonResponse {
+            return Err(std::io::Error::other(format!(
+                "hello ack used unexpected delivery kind {delivery_kind:?}"
+            ))
+            .into());
+        }
+        Ok(serde_json::from_slice(&plaintext)?)
+    }
+
+    pub(crate) async fn next_terminal_frame(
+        &mut self,
+        key: &AesGcmKey,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        if let Some((_message_id, bytes)) = self.pending_terminal_frames.pop_front() {
+            return Ok(bytes);
+        }
+        loop {
+            let (delivery_kind, plaintext, _) = self.receive_delivery(key).await?;
+            match delivery_kind {
+                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonTerminalFrame => {
+                    return Ok(plaintext);
+                }
+                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonEntityFrame => {
+                    self.pending_entity_frames
+                        .push_back(serde_json::from_slice(&plaintext)?);
+                }
+                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonResponse => {
+                    return Err(std::io::Error::other(
+                        "received daemon response while waiting for terminal frame",
+                    )
+                    .into());
+                }
+                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonEvent => {
+                    self.park_or_reject_host_event(&plaintext)?;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn enable_host_events(&mut self) {
+        self.accept_host_events = true;
+    }
+
+    fn park_or_reject_host_event(
+        &mut self,
+        plaintext: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !self.accept_host_events {
+            return Err(std::io::Error::other(
+                "unnegotiated IsolatedHub receive path must not decode daemon_event",
+            )
+            .into());
+        }
+        self.pending_host_events
+            .push_back(serde_json::from_slice(plaintext)?);
+        Ok(())
+    }
+
+    pub(crate) async fn next_host_event(
+        &mut self,
+        key: &AesGcmKey,
+    ) -> Result<botster_hub_client::DaemonEvent, Box<dyn std::error::Error>> {
+        if let Some(event) = self.pending_host_events.pop_front() {
+            return Ok(event);
+        }
+        loop {
+            let (delivery_kind, plaintext, _) = self.receive_delivery(key).await?;
+            match delivery_kind {
+                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonEvent => {
+                    return Ok(serde_json::from_slice(&plaintext)?);
+                }
+                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonTerminalFrame => {
+                    self.pending_terminal_frames
+                        .push_back((String::new(), plaintext));
+                }
+                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonEntityFrame => {
+                    self.pending_entity_frames
+                        .push_back(serde_json::from_slice(&plaintext)?);
+                }
+                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonResponse => {
+                    return Err(std::io::Error::other(
+                        "received daemon response while waiting for host event",
+                    )
+                    .into());
+                }
             }
         }
     }
@@ -322,6 +448,50 @@ impl LocalWebrtcOfferPeer {
                 maximum_frame_bytes,
             },
         ))
+    }
+
+    pub(crate) async fn create_extra_data_channel(
+        &mut self,
+    ) -> Result<ExtraWebrtcDataChannel, Box<dyn std::error::Error>> {
+        let runtime =
+            default_runtime().ok_or_else(|| std::io::Error::other("no async runtime found"))?;
+        let (open_tx, mut open_rx) = channel::<()>(1);
+        let (message_tx, message_rx) = channel::<String>(256);
+        let extra = self
+            .peer
+            .create_data_channel(
+                "botster-extra",
+                Some(RTCDataChannelInit {
+                    ordered: true,
+                    max_retransmits: None,
+                    max_packet_life_time: None,
+                    ..Default::default()
+                }),
+            )
+            .await?;
+        {
+            let extra = extra.clone();
+            runtime.spawn(Box::pin(async move {
+                while let Some(event) = extra.poll().await {
+                    match event {
+                        DataChannelEvent::OnOpen => {
+                            let _ = open_tx.try_send(());
+                        }
+                        DataChannelEvent::OnMessage(message) => {
+                            if let Ok(text) = String::from_utf8(message.data.to_vec()) {
+                                let _ = message_tx.try_send(text);
+                            }
+                        }
+                        DataChannelEvent::OnClose => break,
+                        _ => {}
+                    }
+                }
+            }));
+        }
+        let _ = timeout(Duration::from_secs(5), open_rx.recv()).await;
+        Ok(ExtraWebrtcDataChannel {
+            messages: message_rx,
+        })
     }
 }
 

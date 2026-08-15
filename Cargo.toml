@@ -20,9 +20,10 @@ license-file = "LICENSE"
 botster-hub-client = { path = "crates/botster-hub-client" }
 botster-hub-installation = { path = "crates/botster-hub-installation" }
 botster-ui-contract = { path = "crates/botster-ui-contract" }
-# botster-hub intentionally tracks botster-core main; Cargo.lock records the tested revision.
-botster-core = { git = "https://github.com/trybotster/botster-core", branch = "main" }
-botster-core-daemon = { git = "https://github.com/trybotster/botster-core", branch = "main" }
+# Protocol identity and Hub runtime Core share this rev so TerminalFrame stays one crate.
+botster-core = { git = "https://github.com/trybotster/botster-core.git", rev = "f4f6bf5babe92dfb9241a760c414187f711c2c42" }
+botster-core-daemon = { git = "https://github.com/trybotster/botster-core.git", rev = "f4f6bf5babe92dfb9241a760c414187f711c2c42" }
+botster-terminal-protocol = { git = "https://github.com/trybotster/botster-core.git", rev = "f4f6bf5babe92dfb9241a760c414187f711c2c42" }
 libc = "0.2.177"
 mlua = { version = "0.11.6", features = ["lua54", "vendored", "serialize", "send"] }
 serde = { version = "1.0.228", features = ["derive"] }
@@ -39,8 +40,8 @@ keyring = "4.1.2"
 notify = "8.2.0"
 
 [dev-dependencies]
-botster-core-test-support = { git = "https://github.com/trybotster/botster-core", branch = "main" }
-botster-terminal-ghostty = { git = "https://github.com/trybotster/botster-core", branch = "main", features = ["libghostty-vt"] }
+botster-core-test-support = { git = "https://github.com/trybotster/botster-core.git", rev = "f4f6bf5babe92dfb9241a760c414187f711c2c42" }
+botster-terminal-ghostty = { git = "https://github.com/trybotster/botster-core.git", rev = "f4f6bf5babe92dfb9241a760c414187f711c2c42", features = ["libghostty-vt"] }
 botster-hub-test-support = { path = "crates/botster-hub-test-support" }
 portable-pty = "0.9.0"
 

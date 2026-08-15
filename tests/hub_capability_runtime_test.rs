@@ -221,7 +221,9 @@ fn spawn_request(config: &botster_hub::HubConfig) -> SessionSpawnRequest {
 
 fn drain_session_until(
     runtime: &mut HubRuntime,
+    client_id: &ClientId,
     session_id: &SessionId,
+    subscription_id: &SubscriptionId,
     needle: &[u8],
     logical_clock: &mut u64,
 ) {
@@ -230,8 +232,8 @@ fn drain_session_until(
 
     while Instant::now() < deadline {
         let output = runtime
-            .drain_runtime_once(session_id, *logical_clock)
-            .expect("drain runtime");
+            .drain_subscription(client_id, session_id, subscription_id, *logical_clock)
+            .expect("drain subscription");
         *logical_clock += 1;
         for (_, frame) in output.client_egress {
             if let TransportEgress::TerminalOutput { data, .. } = frame {
@@ -239,6 +241,19 @@ fn drain_session_until(
             }
         }
         if observed
+            .windows(needle.len())
+            .any(|window| window == needle)
+        {
+            return;
+        }
+        if let Ok(screen) = runtime.read_screen(
+            RequestId("capability-drain-screen".to_string()),
+            session_id.clone(),
+            *logical_clock,
+        ) && screen
+            .screen
+            .text
+            .as_bytes()
             .windows(needle.len())
             .any(|window| window == needle)
         {
@@ -663,7 +678,7 @@ fn hub_runtime_reports_bounded_http_failures_without_blocking_hot_path() {
         .attach_client(
             client_id.clone(),
             session_id.clone(),
-            subscription_id,
+            subscription_id.clone(),
             logical_clock,
         )
         .expect("attach through core");
@@ -682,10 +697,17 @@ fn hub_runtime_reports_bounded_http_failures_without_blocking_hot_path() {
         ))
         .expect("slow loopback HTTP should submit");
 
-    drain_session_until(&mut runtime, &session_id, b"ready", &mut logical_clock);
+    drain_session_until(
+        &mut runtime,
+        &client_id,
+        &session_id,
+        &subscription_id,
+        b"ready",
+        &mut logical_clock,
+    );
     runtime
         .write_bytes(
-            client_id,
+            client_id.clone(),
             session_id.clone(),
             b"ping-http-capability\n".to_vec(),
             logical_clock,
@@ -694,7 +716,9 @@ fn hub_runtime_reports_bounded_http_failures_without_blocking_hot_path() {
     logical_clock += 1;
     drain_session_until(
         &mut runtime,
+        &client_id,
         &session_id,
+        &subscription_id,
         b"echo:ping-http-capability",
         &mut logical_clock,
     );
@@ -863,7 +887,7 @@ fn hub_runtime_keeps_session_hot_path_responsive_during_failing_http_transport()
         .attach_client(
             client_id.clone(),
             session_id.clone(),
-            subscription_id,
+            subscription_id.clone(),
             logical_clock,
         )
         .expect("attach through core");
@@ -882,10 +906,17 @@ fn hub_runtime_keeps_session_hot_path_responsive_during_failing_http_transport()
         ))
         .expect("malformed loopback HTTP request should submit before transport failure");
 
-    drain_session_until(&mut runtime, &session_id, b"ready", &mut logical_clock);
+    drain_session_until(
+        &mut runtime,
+        &client_id,
+        &session_id,
+        &subscription_id,
+        b"ready",
+        &mut logical_clock,
+    );
     runtime
         .write_bytes(
-            client_id,
+            client_id.clone(),
             session_id.clone(),
             b"ping-http-failure-capability\n".to_vec(),
             logical_clock,
@@ -894,7 +925,9 @@ fn hub_runtime_keeps_session_hot_path_responsive_during_failing_http_transport()
     logical_clock += 1;
     drain_session_until(
         &mut runtime,
+        &client_id,
         &session_id,
+        &subscription_id,
         b"echo:ping-http-failure-capability",
         &mut logical_clock,
     );
@@ -1024,7 +1057,7 @@ fn capability_operations_do_not_block_session_hot_path() {
         .attach_client(
             client_id.clone(),
             session_id.clone(),
-            subscription_id,
+            subscription_id.clone(),
             logical_clock,
         )
         .expect("attach through core");
@@ -1047,10 +1080,17 @@ fn capability_operations_do_not_block_session_hot_path() {
             .expect("filesystem work should enqueue");
     }
 
-    drain_session_until(&mut runtime, &session_id, b"ready", &mut logical_clock);
+    drain_session_until(
+        &mut runtime,
+        &client_id,
+        &session_id,
+        &subscription_id,
+        b"ready",
+        &mut logical_clock,
+    );
     runtime
         .write_bytes(
-            client_id,
+            client_id.clone(),
             session_id.clone(),
             b"ping-capability\n".to_vec(),
             logical_clock,
@@ -1059,7 +1099,9 @@ fn capability_operations_do_not_block_session_hot_path() {
     logical_clock += 1;
     drain_session_until(
         &mut runtime,
+        &client_id,
         &session_id,
+        &subscription_id,
         b"echo:ping-capability",
         &mut logical_clock,
     );

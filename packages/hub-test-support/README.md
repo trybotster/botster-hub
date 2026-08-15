@@ -18,10 +18,10 @@ node packages/hub-test-support/scripts/sync-assets.mjs
 
 ## Usage
 
-Use this command for version 0.1.33:
+Use this command for version 0.1.36:
 
 ```sh
-npm install --save-dev @trybotster/ui-contract@0.3.2 @trybotster/hub-test-support@0.1.33
+npm install --save-dev @trybotster/ui-contract@0.3.2 @trybotster/hub-test-support@0.1.36
 ```
 
 ```js
@@ -81,14 +81,14 @@ Use this exact package spec in npm-based client repos:
 ```json
 {
   "devDependencies": {
-    "@trybotster/hub-test-support": "0.1.33"
+    "@trybotster/hub-test-support": "0.1.36"
   }
 }
 ```
 
-`@trybotster/hub-test-support@0.1.33` carries byte-faithful live
+`@trybotster/hub-test-support@0.1.36` carries byte-faithful live
 `terminal_output` payloads (`payload_base64`, `payload_encoding`, `bytes`)
-and authentic dual GHOSTSNP late-attach fixtures (conformance revision 38).
+and authentic dual GHOSTSNP late-attach fixtures (conformance revision 41).
 History attach uses incremental READY, PAGE, and FINISH Snapshot frames.
 No-history attach uses READY then FINISH. Import-visible state matches the
 ReadScreen oracles; do not dual-use a history-bearing golden as no-history.
@@ -112,14 +112,21 @@ appended as terminal text. Version 0.1.6 / conformance revision 13 uses
 superseded JSON number arrays, while version 0.1.5 / revision 12 exposes
 lossy string history. Neither is current binary-history contract authority.
 
-Version 0.1.33 carries protocol version 7 / conformance revision 38 with
-advertised optional `snapshot_delivery=ready_then_history` support,
+Version 0.1.36 carries protocol version 7 / conformance revision 41 with
+advertised optional `unix_terminal_adapter`,
+`terminal_subscription_closed`, `webrtc_terminal_adapter`,
+negotiated WebRTC `daemon_event` close delivery, and
+`snapshot_delivery=ready_then_history` support,
 byte-faithful live `terminal_output` payloads, incremental GHOSTSNP
 READY/PAGE/FINISH goldens, `mode_gated_input` ModeGatedInput +
 ModeFlags freshness, Snapshot-only GHOSTSNP rules, and the
-`DaemonSessionTypeExecution` contract. Version 0.1.32 is the prior published
-coordinate at the same protocol and revision. It does not advertise
-`snapshot_delivery=ready_then_history`. The contract
+`DaemonSessionTypeExecution` contract. Version 0.1.35 is the prior published
+coordinate at protocol 7 / revision 40. Protocol 7 Hello must require
+`terminal_subscription_closed`
+(`FEATURE_TERMINAL_SUBSCRIPTION_CLOSED` /
+`DaemonCompatibilityRequirement::for_webrtc_terminal_subscription_closed()`)
+before Hub sends `DaemonLocalWebrtcDeliveryKind` `daemon_event`. The feature
+stays optional in default `required_features`. The contract
 defines the explicit `relative_executable` and `shell_command` modes.
 It also carries spawn-point session-type listing
 (`list_session_types_for_target`) and the session-type authoring view

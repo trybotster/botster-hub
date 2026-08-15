@@ -352,10 +352,17 @@ impl Default for CoreEngineOptions {
 }
 
 impl CoreEngineOptions {
-    pub(crate) const fn plugin_worker_config(&self) -> PluginWorkerEngineConfig {
+    pub(crate) fn plugin_worker_config(&self) -> PluginWorkerEngineConfig {
+        let defaults = PluginWorkerEngineConfig::default();
         PluginWorkerEngineConfig {
             per_plugin_queue_capacity: self.plugin_worker_queue_capacity,
             per_plugin_executor_concurrency: self.plugin_worker_executor_concurrency,
+            reserved_request_response_executors: defaults.reserved_request_response_executors,
+            request_response_queue_byte_capacity: defaults.request_response_queue_byte_capacity,
+            background_queue_capacity: defaults.background_queue_capacity,
+            background_queue_byte_capacity: defaults.background_queue_byte_capacity,
+            completion_queue_capacity: defaults.completion_queue_capacity,
+            completion_queue_byte_capacity: defaults.completion_queue_byte_capacity,
         }
     }
 
