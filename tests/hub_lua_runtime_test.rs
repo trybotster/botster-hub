@@ -5561,6 +5561,83 @@ fn lock_held_release_stays_owned_when_source_ops_is_full() {
 }
 
 #[test]
+fn lock_held_second_overflow_stays_owned() {
+    let hub = explicit_runtime("lease-source-held-second");
+    let scopes = hub.causal_scopes().clone();
+    for index in 0..CAUSAL_PENDING_MAX {
+        let scope = scopes
+            .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+                family: format!("s{index}"),
+                seq: index as u64,
+            }))
+            .expect("mint");
+        assert_eq!(
+            hub.test_keep_source_op(family_release(scope, &format!("s{index}"), index as u64)),
+            CausalAdmitResult::Applied
+        );
+    }
+    let first = scopes
+        .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+            family: "first".into(),
+            seq: 0,
+        }))
+        .expect("first");
+    let second = scopes
+        .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+            family: "second".into(),
+            seq: 0,
+        }))
+        .expect("second");
+    let transfer = scopes
+        .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+            plugin_key: "xfer".into(),
+        }))
+        .expect("transfer");
+    scopes.test_with_inner_held(|| {
+        assert_eq!(
+            hub.test_keep_source_op(family_release(first, "first", 0)),
+            CausalAdmitResult::Applied
+        );
+        assert_eq!(hub.test_source_held_len(), 1);
+        assert_eq!(
+            hub.test_keep_source_op(family_release(second, "second", 0)),
+            CausalAdmitResult::Applied
+        );
+        assert_eq!(hub.test_source_held_len(), 2);
+        assert!(scopes.is_live(first));
+        assert!(scopes.is_live(second));
+        hub.test_settle_publish("probe.item", transfer, "xfer", 1, true);
+        assert!(
+            scopes.is_live(transfer),
+            "second-overflow settle must not retract PendingEntityPublish"
+        );
+        assert_eq!(hub.test_resync_lease_count("probe.item"), 1);
+    });
+    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+        let _ = hub.apply_event_plane_owner_ops();
+        let _ = scopes.flush_pending();
+    }
+    assert_eq!(hub.test_source_held_len(), 0);
+    assert!(!scopes.is_live(first));
+    assert!(!scopes.is_live(second));
+    assert_eq!(
+        hub.keep_owned_op(CausalOp::Release {
+            scope_id: transfer,
+            identity: LeaseIdentity::AdmittedEntityMutation {
+                family: "probe.item".into(),
+                seq: 1,
+            },
+        }),
+        CausalAdmitResult::Applied
+    );
+    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+        let _ = hub.apply_event_plane_owner_ops();
+        let _ = scopes.flush_pending();
+    }
+    assert!(!scopes.is_live(transfer));
+}
+
+#[test]
 fn lock_held_transfer_stays_owned_after_family_commit() {
     let hub = explicit_runtime("lease-source-held-transfer");
     let scopes = hub.causal_scopes().clone();
