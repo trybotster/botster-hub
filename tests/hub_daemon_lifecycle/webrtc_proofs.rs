@@ -424,6 +424,191 @@ fn external_hub_webrtc_live_output_preserves_exact_bytes() {
 }
 
 #[test]
+fn external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup() {
+    let _guard = daemon_test_guard();
+    let expected: &[u8] = &[0x00, 0x1b, 0xff, 0xc0];
+    let hub = start_isolated_live_output_hub("webrtc-sd-exit");
+    let package_dir = unique_test_dir("webrtc-sd-exit-web");
+    write_botster_web_package(&package_dir);
+    enable_supervised_package(hub.data_dir(), &package_dir);
+    let endpoint = hub.endpoint().clone();
+    let web_listener_port = unused_loopback_port();
+    let start = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::StartPackageEntrypoint {
+            package_name: "botster-web".to_string(),
+            entrypoint_id: "web-client".to_string(),
+            environment_overrides: BTreeMap::from([(
+                "BOTSTER_WEB_PORT".to_string(),
+                web_listener_port.to_string(),
+            )]),
+        },
+    )
+    .expect("start botster-web entrypoint");
+    assert_eq!(start.kind, botster_hub_client::DaemonResponseKind::Packages);
+
+    for round in 0..5 {
+        let session_id = format!("webrtc-sd-exit-{round}");
+        let subscription_id = format!("webrtc-sd-exit-sub-{round}");
+        let bootstrap = botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::IssueLocalWebrtcBootstrap {
+                package_name: "botster-web".to_string(),
+                entrypoint_id: "web-client".to_string(),
+                origin: format!("http://127.0.0.1:{web_listener_port}"),
+            },
+        )
+        .expect("issue local WebRTC bootstrap")
+        .local_webrtc_bootstrap
+        .expect("bootstrap response includes local WebRTC bootstrap");
+        let stream_key = local_webrtc_stream_key(&bootstrap.grant_secret);
+
+        block_on(async {
+            let (mut offer_peer, offer) = LocalWebrtcOfferPeer::create_offer()
+                .await
+                .expect("create WebRTC offer peer");
+            let signal = botster_hub_client::request(
+                &endpoint,
+                botster_hub_client::DaemonRequest::LocalWebrtcSignal {
+                    grant_id: bootstrap.grant_id.clone(),
+                    grant_secret: bootstrap.grant_secret.clone(),
+                    origin: bootstrap.expected_origin.clone(),
+                    offer,
+                },
+            )
+            .expect("signal local WebRTC offer");
+            let answer = signal
+                .local_webrtc_answer
+                .as_ref()
+                .expect("signal response includes WebRTC answer")
+                .answer
+                .clone();
+            offer_peer
+                .accept_answer(answer)
+                .await
+                .expect("offer peer accepts answer");
+
+            let release_path = unique_short_test_dir(&format!("webrtc-sd-rel-{round}")).join("go");
+            let script_path = write_python_wait_then_write_script(&release_path, expected);
+            botster_hub_client::request(
+                &endpoint,
+                botster_hub_client::DaemonRequest::Spawn {
+                    session_id: session_id.clone(),
+                    command: python_script_command(&script_path),
+                },
+            )
+            .expect("spawn write(2) producer that exits after output");
+            offer_peer
+                .encrypted_hello(
+                    &stream_key,
+                    &botster_hub_client::DaemonHello {
+                        protocol: botster_hub_client::PROTOCOL.to_string(),
+                        compatibility:
+                            botster_hub_client::DaemonCompatibilityRequirement::for_webrtc_terminal_adapter(
+                            ),
+                        terminal_compatibility: None,
+                    },
+                )
+                .await
+                .expect("webrtc adapter hello");
+            let attach = offer_peer
+                .encrypted_request(
+                    &stream_key,
+                    &botster_hub_client::DaemonRequest::Attach {
+                        session_id: session_id.clone(),
+                        subscription_id: subscription_id.clone(),
+                    },
+                )
+                .await
+                .expect("attach over encrypted WebRTC");
+            assert!(
+                attach.events.is_empty(),
+                "WebRTC Attach must not return terminal bodies: {:?}",
+                attach.events
+            );
+            fs::create_dir_all(release_path.parent().expect("release parent"))
+                .expect("create webrtc release dir");
+            fs::write(&release_path, b"go").expect("release webrtc write(2) producer");
+
+            let mut concatenated = Vec::new();
+            for _ in 0..120 {
+                let _ = offer_peer
+                    .encrypted_request(
+                        &stream_key,
+                        &botster_hub_client::DaemonRequest::ReadScreen {
+                            session_id: session_id.clone(),
+                        },
+                    )
+                    .await;
+                while let Some((_, bytes)) = offer_peer.pending_terminal_frames.pop_front() {
+                    if let Ok(event) =
+                        serde_json::from_slice::<botster_hub_client::DaemonEvent>(&bytes)
+                    {
+                        if let botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } =
+                            event
+                        {
+                            concatenated.extend(live_output_decoded_bytes(payload));
+                        }
+                    } else {
+                        concatenated.extend(bytes);
+                    }
+                }
+                if concatenated
+                    .windows(expected.len())
+                    .any(|window| window == expected)
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(30)).await;
+            }
+            assert!(
+                concatenated
+                    .windows(expected.len())
+                    .any(|window| window == expected),
+                "round {round} must observe live bytes before shutdown, got {concatenated:?}"
+            );
+
+            // Force the process-exit / ShutdownSession race: the producer has
+            // already written and exited. One more ReadScreen can park that
+            // exit, then peer close happens before host ShutdownSession.
+            let _ = offer_peer
+                .encrypted_request(
+                    &stream_key,
+                    &botster_hub_client::DaemonRequest::ReadScreen {
+                        session_id: session_id.clone(),
+                    },
+                )
+                .await;
+            let _ = offer_peer.peer.close().await;
+        });
+
+        let shutdown = botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::ShutdownSession {
+                session_id: session_id.clone(),
+            },
+        )
+        .expect("shutdown after live WebRTC exit");
+        assert!(
+            matches!(
+                shutdown.kind,
+                botster_hub_client::DaemonResponseKind::Events
+                    | botster_hub_client::DaemonResponseKind::SessionCleanup
+            ),
+            "round {round} ShutdownSession must be idempotent cleanup, got {:?}",
+            shutdown.kind
+        );
+        assert_ne!(
+            shutdown.kind,
+            botster_hub_client::DaemonResponseKind::OperatorError,
+            "round {round} ShutdownSession must not return OperatorError: {shutdown:?}"
+        );
+    }
+
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
 fn local_webrtc_chunks_oversized_encrypted_daemon_response() {
     let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("web-webrtc");

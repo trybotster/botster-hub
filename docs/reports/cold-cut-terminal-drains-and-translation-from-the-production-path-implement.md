@@ -14,7 +14,7 @@ Plan: `docs/plans/cold-cut-terminal-drains-and-translation-from-the-production-p
 | Worktree HEAD before edits | `959c58f55726d098299cced8af151d8f496f41e3` |
 | Locked Core SHA | `aef6516d5809d563961ed7fdd07da29a7b4edddc` |
 | Merge policy | direct into `main`; no PR |
-| Review follow-up | `review_1786784475_242031` on `cb39d1c` |
+| Review follow-up | `review_1786785734_421865` on `d9e3e12` |
 
 Independent routing matched the approved plan. This run did not infer the repository from the ambient directory.
 
@@ -125,6 +125,17 @@ This visit:
 - Unix/WebRTC attach occupancy no longer inspects `AttachState`.
 - `production_source` treats a one-line `{ ... }` body as a finished test item. The scan now also rejects `DaemonEvent::TerminalOutput`, `Snapshot`, `Scrollback`, `ProcessExit`, and `AttachState`.
 
+Review `review_1786785734_421865` required one follow-up on `d9e3e12`:
+
+- `finding_1786785734_528985` — `ShutdownSession` after live WebRTC output can return `OperatorError` when process exit wins the race with explicit shutdown.
+
+This visit:
+
+- `ShutdownSession` observes a bounded lifecycle slice before classify.
+- If Core shutdown fails, Hub observes again and returns `SessionCleanup`. If classify is still `Active`, the outcome is `already_exited`.
+- The path does not call Core terminal Drain.
+- `external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup` repeats the live WebRTC write-then-exit, extra `ReadScreen`, peer-close, host `ShutdownSession` sequence five times. It accepts `Events` or `SessionCleanup` and rejects `OperatorError`.
+
 ## Runtime-teardown lenses
 
 | Lens | Implemented |
@@ -156,8 +167,8 @@ Passed on this tree:
 - `hub_client_api_test`: 34 passed, including `session_entity_subscription_returns_a_bounded_page_not_a_complete_baseline`
 - IsolatedHub Unix always-bind, empty Attach, host Drain empty, ReadScreen marker, replacement-owner
 - Lifecycle oracles rewritten off Attach/Drain translation: mux frames, `ReadScreen`, host OperatorError, session-entity patches
-- `hub_daemon_lifecycle_test`: 202 passed, 1 ignored (larger local many-PTY)
-- Full `./test.sh --locked` workspace: all binaries ok (lifecycle 202/1 ignored; lib 270; client API 34; no FAILED results)
+- `hub_daemon_lifecycle_test`: 203 passed, 1 ignored (larger local many-PTY)
+- Full `./test.sh --locked` workspace: all binaries ok (lifecycle 203/1 ignored; lib 270; client API 34; no FAILED results)
 - `session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnect` passed isolated three times after the Drain removal (4.2–5.0s) and in the locked suite
 - `cli_smoke_proves_local_runtime_daemon_package_app_session_and_webrtc` passed in the locked suite
 - Missing-session host Drain is a typed OperatorError (`drain_runtime` / `terminal_stream_unavailable`)
@@ -170,6 +181,9 @@ Passed on this tree:
 - Hub-owned `FEATURE_TERMINAL_STREAMING` / `FEATURE_RESIZE` / `FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY` constants deleted; negotiation uses `botster-terminal-protocol`
 - Local SubscribeEntities returns a paged baseline. Daemon registration waits for the complete owner-loop projection before sending a session snapshot
 - Production Hub no longer constructs `DaemonEvent::AttachState` or matches TerminalOutput/Snapshot/Scrollback/ProcessExit/AttachState bodies
+- `ShutdownSession` observes before classify. A Core shutdown error observes again and returns `SessionCleanup` (`already_exited` if still Active)
+- `external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup` passed isolated three times (10.32s, 6.19s, 8.05s)
+- `external_hub_webrtc_live_output_preserves_exact_bytes` passed isolated two times (3.24s, 2.58s)
 
 ## Unverified behavior or residual risk
 
@@ -178,6 +192,7 @@ Passed on this tree:
 - Control-thread `try_recv` prefers queued host requests over idle reconcile. Burst `ReadScreen` can delay the 500 ms idle observe until the queue drains. Mutations now observe on the request path.
 - CoreDaemon on `aef6516` does not expose `pump_bound_adapters`. Owner-loop observe uses `observe_lifecycle_slice`, which calls Core `drain_runtime_once` internally.
 - Downstream TUI/Web crates that still imported the deleted hub-client `FEATURE_*` constants must import `botster-terminal-protocol` instead. Those consumers are separately routed.
+- If Core `Shutdown` fails while `registry_state` is still `Running` after a second observe, Hub now returns `SessionCleanup` with `already_exited`. A true operator failure on a still-running session would use that same frame. Review required this idempotent cleanup.
 
 ## Missing vault guidance discovered
 
