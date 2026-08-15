@@ -901,6 +901,7 @@ mod tests {
         "drain_subscription(",
         "drain_runtime_once(",
         ".drain(session_id",
+        "lifecycle_baseline()",
         "DaemonEvent::TerminalOutput",
         "DaemonEvent::Snapshot",
         "DaemonEvent::Scrollback",

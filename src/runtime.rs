@@ -1995,20 +1995,46 @@ impl HubRuntime {
     ///
     /// Registry state can lag when `read_screen` parks `ProcessExited`.
     /// Shutdown classify uses this control-plane record, not terminal Drain.
+    /// The walk uses paged baseline calls and a fixed page cap.
     pub fn session_runtime_lifecycle(
         &self,
         session_id: &SessionId,
     ) -> Result<Option<SessionLifecycleState>, CoreDaemonError> {
-        let baseline = self
-            .core_daemon
-            .lock()
-            .expect("core daemon mutex")
-            .lifecycle_baseline()?;
-        Ok(baseline
-            .sessions
-            .into_iter()
-            .find(|record| &record.session.session_id == session_id)
-            .and_then(|record| record.lifecycle))
+        const BUDGET: LifecycleBaselineBudget = LifecycleBaselineBudget {
+            max_rows: 32,
+            max_bytes: 64 * 1024,
+            max_elapsed: Duration::from_millis(250),
+        };
+        const MAX_PAGES: usize = 8;
+        let mut snapshot = None;
+        let mut after = None;
+        for _ in 0..MAX_PAGES {
+            let page = match self.lifecycle_baseline_page(snapshot.as_ref(), after.as_ref(), BUDGET)
+            {
+                Ok(page) => page,
+                Err(_) => return Ok(None),
+            };
+            if page.resync_required.is_some() {
+                snapshot = None;
+                after = None;
+                continue;
+            }
+            if let Some(record) = page
+                .sessions
+                .iter()
+                .find(|record| &record.session.session_id == session_id)
+            {
+                return Ok(record.lifecycle.clone());
+            }
+            if page.complete {
+                return Ok(None);
+            }
+            snapshot = Some(page.snapshot_sequence);
+            if page.next.is_some() {
+                after = page.next;
+            }
+        }
+        Ok(None)
     }
 
     /// Test helper for Core terminal Drain. Production daemon paths must not call this.
