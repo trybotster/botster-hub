@@ -3256,6 +3256,82 @@ fn shutdown_after_observed_exit_returns_session_cleanup() {
 }
 
 #[test]
+fn shutdown_session_stays_bounded_with_a_large_registry() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("shutdown-large-registry");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("test config has local socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    for index in 0..39 {
+        botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::Spawn {
+                session_id: format!("aaa-{index:02}"),
+                command: "/bin/sh -c true".to_string(),
+            },
+        )
+        .expect("spawn pad session");
+    }
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: "zzz-target".to_string(),
+            command: "sleep 0.1".to_string(),
+        },
+    )
+    .expect("spawn target session");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut listed = None;
+    while Instant::now() < deadline {
+        listed =
+            botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::ListSessions)
+                .ok()
+                .and_then(|response| {
+                    response.sessions.iter().find_map(|session| {
+                        (session.session_id == "zzz-target").then(|| session.lifecycle.clone())
+                    })
+                });
+        if listed.as_deref() == Some("exited") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        listed.as_deref(),
+        Some("exited"),
+        "owner loop must observe target exit before ShutdownSession"
+    );
+    let started = Instant::now();
+    let shutdown = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::ShutdownSession {
+            session_id: "zzz-target".to_string(),
+        },
+    )
+    .expect("shutdown last session in a large registry");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "ShutdownSession must stay bounded with more than one baseline page, elapsed={elapsed:?}"
+    );
+    assert_eq!(
+        shutdown.kind,
+        botster_hub_client::DaemonResponseKind::SessionCleanup,
+        "ShutdownSession of an exited late session must be cleanup, got {:?}",
+        shutdown.kind
+    );
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
 fn session_entity_subscription_observes_natural_exit_without_terminal_attach() {
     let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("session-entity-no-terminal");
