@@ -452,6 +452,10 @@ impl PackageEntityFamilyState {
         self.resync.leases.insert((scope_id, family))
     }
 
+    pub fn forget_resync_lease(&mut self, scope_id: u64, family: &str) {
+        self.resync.leases.remove(&(scope_id, family.to_string()));
+    }
+
     pub fn take_resync_leases(&mut self) -> BTreeSet<(u64, String)> {
         std::mem::take(&mut self.resync.leases)
     }
