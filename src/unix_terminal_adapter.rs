@@ -158,6 +158,10 @@ impl UnixTerminalAdapterInner {
         self.deferred.store(true, Ordering::SeqCst);
     }
 
+    fn clear_defer_flush(&self) {
+        self.deferred.store(false, Ordering::SeqCst);
+    }
+
     fn is_flush_deferred(&self) -> bool {
         self.deferred.load(Ordering::SeqCst)
     }
@@ -448,7 +452,16 @@ impl UnixConnectionMux {
             .pending_events
             .lock()
             .is_ok_and(|pending| !pending.is_empty());
-        pending || !self.snapshot_writes().is_empty()
+        pending || self.has_occupied_adapter_slot()
+    }
+
+    fn has_occupied_adapter_slot(&self) -> bool {
+        let Ok(routes) = self.inner.routes.lock() else {
+            return false;
+        };
+        routes
+            .iter()
+            .any(|route| route.handle.snapshot_active().is_some())
     }
 
     pub(crate) fn has_bound_routes(&self) -> bool {
@@ -485,6 +498,16 @@ impl UnixConnectionMux {
     pub(crate) fn notify(&self) -> &Notify {
         self.inner.notify.as_ref()
     }
+
+    /// Allow a later flush to retry a route that yielded to a host response.
+    pub(crate) fn clear_deferred_flushes(&self) {
+        let Ok(routes) = self.inner.routes.lock() else {
+            return;
+        };
+        for route in routes.iter() {
+            route.handle.clear_defer_flush();
+        }
+    }
 }
 
 impl UnixTerminalAdapterHandle {
@@ -514,6 +537,10 @@ impl UnixTerminalAdapterHandle {
 
     pub(crate) fn defer_flush(&self) {
         self.inner.defer_flush();
+    }
+
+    pub(crate) fn clear_defer_flush(&self) {
+        self.inner.clear_defer_flush();
     }
 
     pub(crate) fn is_flush_deferred(&self) -> bool {
@@ -608,6 +635,9 @@ mod tests {
         assert!(mux.snapshot_writes().is_empty());
         assert!(handle.snapshot_active().is_some());
         assert!(mux.has_bound_routes());
+        mux.clear_deferred_flushes();
+        assert_eq!(mux.snapshot_writes().len(), 1);
+        assert!(handle.snapshot_active().is_some());
     }
 
     #[test]
