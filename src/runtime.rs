@@ -1350,6 +1350,19 @@ impl HubRuntime {
             .unwrap_or(0)
     }
 
+    /// True when admitted fanout or a non-degraded resync is waiting.
+    #[must_use]
+    pub fn package_entity_work_pending(&self) -> bool {
+        if self.package_entity_resync_still_needed() {
+            return true;
+        }
+        !self
+            .package_entity_fanout
+            .lock()
+            .expect("package entity fanout lock")
+            .is_empty()
+    }
+
     /// True when a family still needs resync and has not degraded.
     #[must_use]
     pub fn package_entity_resync_still_needed(&self) -> bool {

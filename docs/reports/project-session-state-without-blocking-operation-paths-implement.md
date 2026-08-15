@@ -51,8 +51,9 @@ No new cross-repo work. Consumed closed Core dependencies at exact revision `aef
 ## Deviations from plan
 
 1. Complete observe slices do not `try_wake`. Incomplete observe still wakes to continue the pass.
-2. Read-only control replies do not `try_wake`. Spawn/Resize/Shutdown/Remove still prefer journal. Plugin surface actions wake. Pending package-entity resync keeps the loop awake until degraded or converged.
+2. Read-only control replies do not `try_wake`. Successful Spawn/Resize/Shutdown/Remove prefer journal. Plugin surface actions wake only when fanout or resync work is pending.
 3. Attached natural-exit Drain may surface `SessionLifecycle` exited instead of `ProcessExit`. The entity patch remains the lifecycle oracle. The committed plan item 12 records this.
+4. Review return: subscriber and plugin snapshot delivery are now paged. Incomplete baselines are a gap. Session-family request ids are unique per frame. Failed mutations do not wake.
 
 ## Tests and downstream proof
 

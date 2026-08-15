@@ -3463,6 +3463,12 @@ fn ready_spawn_stays_within_budget_when_live_sessions_exceed_one_observe_slice()
         )
         .expect("spawn load session");
     }
+    let mut first = botster_hub_client::subscribe_session_entities(&endpoint, "load-sub-one")
+        .expect("first load subscriber");
+    let mut second = botster_hub_client::subscribe_session_entities(&endpoint, "load-sub-two")
+        .expect("second load subscriber");
+    let _ = first.next_frame();
+    let _ = second.next_frame();
     let started = Instant::now();
     botster_hub_client::request(
         &endpoint,
@@ -3477,6 +3483,8 @@ fn ready_spawn_stays_within_budget_when_live_sessions_exceed_one_observe_slice()
         waited <= Duration::from_millis(botster_hub::MAX_READY_OPERATION_WAIT_MS),
         "ready spawn waited {waited:?}"
     );
+    let _ = first.unsubscribe();
+    let _ = second.unsubscribe();
     shutdown_cli_daemon(&data_dir, child);
 }
 
