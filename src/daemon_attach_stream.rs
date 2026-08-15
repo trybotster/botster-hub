@@ -314,6 +314,26 @@ impl AttachStreamRegistry {
         }
     }
 
+    pub(crate) fn bound_route_keys_for_session(
+        &self,
+        session_id: &str,
+    ) -> BTreeSet<(String, String)> {
+        self.streams
+            .iter()
+            .filter(|((bound_session, _), stream)| {
+                bound_session == session_id && stream.adapter_bound
+            })
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
+    pub(crate) fn close_adapters_for_session(&mut self, session_id: &str) {
+        let keys = self.bound_route_keys_for_session(session_id);
+        for (bound_session, subscription_id) in keys {
+            self.close_adapter(&bound_session, &subscription_id);
+        }
+    }
+
     pub(crate) fn reconcile_inventory(&mut self, inventory: &[TerminalSubscriptionRecord]) {
         let stale: Vec<(String, String)> = self
             .streams
@@ -744,6 +764,38 @@ mod tests {
                 TerminalSubscriptionGeneration(1)
             ),
             "close must keep owner and generation for cleanup matching"
+        );
+    }
+
+    #[test]
+    fn close_adapters_for_session_closes_only_that_session() {
+        let mut registry = AttachStreamRegistry::default();
+        registry.start_attach(owner(), "keep".into(), "sub-keep".into());
+        registry.start_attach(owner(), "drop".into(), "sub-drop".into());
+        let (_, keep_handle) = UnixTerminalAdapter::pair();
+        let (_, drop_handle) = UnixTerminalAdapter::pair();
+        registry.mark_adapter_bound(
+            "keep",
+            "sub-keep",
+            TerminalSubscriptionGeneration(1),
+            BoundAdapterHandle::Unix(keep_handle),
+        );
+        registry.mark_adapter_bound(
+            "drop",
+            "sub-drop",
+            TerminalSubscriptionGeneration(1),
+            BoundAdapterHandle::Unix(drop_handle),
+        );
+        let keys = registry.bound_route_keys_for_session("drop");
+        registry.close_adapters_for_session("drop");
+        assert!(keys.contains(&("drop".to_string(), "sub-drop".to_string())));
+        assert!(
+            !registry.is_adapter_bound("drop", "sub-drop"),
+            "session close must close that session adapter"
+        );
+        assert!(
+            registry.is_adapter_bound("keep", "sub-keep"),
+            "session close must not close a sibling session adapter"
         );
     }
 

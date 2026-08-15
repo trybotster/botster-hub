@@ -3253,8 +3253,10 @@ fn handle_runtime_control_request(
             let initial_deadline =
                 classify_start + (SHUTDOWN_CLASSIFY_BUDGET.saturating_sub(SHUTDOWN_ERROR_RESERVE));
             let mut walk = crate::runtime::SessionLifecycleWalk::default();
+            pending_runtime.close_adapters_for_session(&session_id);
             let now = tick(logical_clock);
             observe_lifecycle_turn(runtime, now);
+            observe_lifecycle_turn(runtime, tick(logical_clock));
             let mut observed = true;
             match finish_shutdown_classify(initial_deadline, Instant::now, || {
                 if !observed {

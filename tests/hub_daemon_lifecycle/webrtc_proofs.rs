@@ -404,6 +404,9 @@ fn external_hub_webrtc_live_output_preserves_exact_bytes() {
         let _ = offer_peer.peer.close().await;
     });
 
+    // Suite-load oracle: after live write(2) output, ShutdownSession must not
+    // report OperatorError. Isolated green is not this proof. ./test.sh --locked
+    // must return Events or SessionCleanup for the exited finite producer.
     let shutdown = botster_hub_client::request(
         &endpoint,
         botster_hub_client::DaemonRequest::ShutdownSession {
