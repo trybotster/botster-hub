@@ -176,10 +176,13 @@ dispatch, and show the diagnostic in the hub connection state.
 `subscribe_session_entities` opens a dedicated held-open connection for the
 built-in `session` family. Hub maintains one canonical session projection
 from Core observe slices and journal pages even when no Web or TUI
-subscriber is connected. The first pushed frame is an authoritative,
-stable-id-ordered `entity_snapshot`; later `entity_upsert`, sparse
-`entity_patch`, and `entity_remove` frames carry strictly increasing sequence
-values from that projection. Every frame includes the caller's
+subscriber is connected. The first pushed frame is an authoritative, stable-id-ordered
+`entity_snapshot`. Hub fills that snapshot with a bounded page of current
+rows. If more rows remain, they arrive as later `entity_upsert` frames in
+the same id order. `entity_upsert`, sparse `entity_patch`, and
+`entity_remove` frames carry strictly increasing per-connection sequence
+values. An overflow resync snapshot continues that same sequence and does
+not move it backwards. Every frame includes the caller's
 connection-scoped `subscription_id` and `entity_type: "session"`.
 Client session frames stay `entity_snapshot` / upsert / patch / remove.
 
