@@ -6,7 +6,6 @@ fn wait_for_read_screen_contains(
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut last = String::new();
     while Instant::now() < deadline {
-        let _ = connection.request(&botster_hub_client::DaemonRequest::drain_session(session_id));
         let response = connection
             .request(&botster_hub_client::DaemonRequest::ReadScreen {
                 session_id: session_id.to_string(),
@@ -2389,23 +2388,36 @@ fn session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnec
             second_exit = Some(frame);
         }
     }
-    let mut listed_exited = first_exit.is_some() && second_exit.is_some();
-    if !listed_exited {
-        let list_deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < list_deadline && !listed_exited {
-            thread::sleep(Duration::from_millis(200));
-            listed_exited = botster_hub_client::request(
-                &endpoint,
-                botster_hub_client::DaemonRequest::ListSessions,
-            )
-            .ok()
-            .is_some_and(|response| {
-                response.sessions.iter().any(|session| {
-                    session.session_id == "entity-session" && session.lifecycle == "exited"
-                })
-            });
+    let list_deadline = Instant::now() + Duration::from_secs(30);
+    let mut listed_lifecycle = None;
+    while Instant::now() < list_deadline {
+        let _ = botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::Resize {
+                session_id: "entity-session".to_string(),
+                rows: 31,
+                cols: 101,
+            },
+        );
+        listed_lifecycle = botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::ListSessions,
+        )
+        .ok()
+        .and_then(|response| {
+            response.sessions.iter().find_map(|session| {
+                (session.session_id == "entity-session").then(|| session.lifecycle.clone())
+            })
+        });
+        if listed_lifecycle.as_deref() == Some("exited") || listed_lifecycle.is_none() {
+            break;
         }
+        thread::sleep(Duration::from_millis(200));
     }
+    assert!(
+        listed_lifecycle.as_deref() == Some("exited") || listed_lifecycle.is_none(),
+        "host ListSessions must observe natural exit without Drain, last={listed_lifecycle:?}"
+    );
     let exit_sequence = match (first_exit.as_ref(), second_exit.as_ref()) {
         (Some(first_exit), Some(second_exit)) => {
             let first_seq = entity_exit_sequence(first_exit);
@@ -2417,19 +2429,31 @@ fn session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnec
             assert!(first_seq > resize_sequence);
             first_seq
         }
-        _ => {
-            let _ = listed_exited;
-            resize_sequence
-        }
+        _ => resize_sequence,
     };
 
-    let removed = botster_hub_client::request(
-        &endpoint,
-        botster_hub_client::DaemonRequest::RemoveSession {
-            session_id: "entity-session".to_string(),
-        },
-    )
-    .expect("remove terminal entity session");
+    let remove_deadline = Instant::now() + Duration::from_secs(10);
+    let removed = loop {
+        let removed = botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::RemoveSession {
+                session_id: "entity-session".to_string(),
+            },
+        )
+        .expect("remove terminal entity session");
+        if removed.kind == botster_hub_client::DaemonResponseKind::SessionRemoved
+            || !session_ids_from_list(&endpoint)
+                .iter()
+                .any(|id| id == "entity-session")
+        {
+            break removed;
+        }
+        assert!(
+            Instant::now() < remove_deadline,
+            "RemoveSession must succeed after host exit, last={removed:?}"
+        );
+        thread::sleep(Duration::from_millis(200));
+    };
     assert!(
         matches!(
             removed.kind,
@@ -2439,6 +2463,17 @@ fn session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnec
         "RemoveSession should remove or report already-gone, got {:?}",
         removed.kind
     );
+    let gone_deadline = Instant::now() + Duration::from_secs(5);
+    while session_ids_from_list(&endpoint)
+        .iter()
+        .any(|id| id == "entity-session")
+    {
+        assert!(
+            Instant::now() < gone_deadline,
+            "ListSessions retained entity-session after SessionRemoved"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
     session_cleanup.disarm();
     let remove_deadline = Instant::now() + Duration::from_secs(5);
     let removed_frame = loop {

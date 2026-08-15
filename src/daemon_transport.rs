@@ -2183,8 +2183,11 @@ pub(crate) fn handle_control_message(
                 };
                 record_attached_subscription_change(state, change, grant_id.as_deref());
             }
-            if reconcile_after_request && !state.entity_subscriptions.is_empty() {
-                drive_entity_subscriptions(daemon, state);
+            if reconcile_after_request {
+                pump_bound_unix_routes(daemon, state);
+                if !state.entity_subscriptions.is_empty() {
+                    drive_entity_subscriptions(daemon, state);
+                }
                 state.next_reconciliation = Instant::now() + ENTITY_RECONCILIATION_INTERVAL;
             }
             if response
@@ -4655,7 +4658,7 @@ fn pump_bound_unix_routes(daemon: &mut HubDaemon, state: &mut DaemonControlState
     queue_unix_subscription_closed_events(runtime, &state.pending_runtime);
     queue_webrtc_subscription_closed_events(runtime, &state.pending_runtime);
     state.pending_runtime.reconcile_inventory(&inventory);
-    let now = state.logical_clock;
+    let now = tick(&mut state.logical_clock);
     let resume = state.observe_resume.as_ref();
     let slice = runtime.observe_lifecycle_slice(
         now,
