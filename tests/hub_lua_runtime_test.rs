@@ -4802,3 +4802,105 @@ fn unfinished_finishes_are_bounded_sliced_and_fifo() {
         "caller-held Transfer must apply before the caller-held Release"
     );
 }
+
+#[test]
+fn keep_owned_park_retry_stays_at_source_when_every_store_is_full() {
+    let hub = explicit_runtime("lease-in-hand");
+    let scopes = hub.causal_scopes().clone();
+    let live = scopes
+        .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+            plugin_key: "producer".into(),
+        }))
+        .expect("live");
+    let mut fillers = Vec::new();
+    for index in 0..(CAUSAL_PENDING_MAX * 3 + 2) {
+        fillers.push(
+            scopes
+                .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+                    plugin_key: format!("fill{index}"),
+                }))
+                .expect("mint"),
+        );
+    }
+    let bridge = hub.entity_publish_bridge();
+    let overflow = scopes.test_with_inner_held(|| {
+        for (index, scope) in fillers.iter().take(CAUSAL_PENDING_MAX).enumerate() {
+            assert_eq!(
+                scopes.transfer(
+                    *scope,
+                    LeaseIdentity::PendingEntityPublish {
+                        plugin_key: format!("fill{index}"),
+                    },
+                    [LeaseIdentity::AdmittedEntityMutation {
+                        family: "f".into(),
+                        seq: index as u64,
+                    }],
+                ),
+                CausalAdmitResult::Applied
+            );
+        }
+        for _ in 0..3 {
+            for (index, scope) in fillers.iter().take(CAUSAL_PENDING_MAX).enumerate() {
+                assert_eq!(
+                    hub.keep_causal_op(CausalOp::Release {
+                        scope_id: *scope,
+                        identity: LeaseIdentity::AdmittedEntityMutation {
+                            family: "f".into(),
+                            seq: index as u64,
+                        },
+                    }),
+                    CausalAdmitResult::Applied
+                );
+            }
+        }
+        for (index, scope) in fillers.iter().enumerate() {
+            let op = CausalOp::Release {
+                scope_id: *scope,
+                identity: LeaseIdentity::AdmittedEntityMutation {
+                    family: "f".into(),
+                    seq: index as u64,
+                },
+            };
+            if let CausalAdmitResult::Retry(op) = bridge.park_release(op)
+                && let CausalAdmitResult::Retry(op) = bridge.mark_orphan(op)
+            {
+                assert_eq!(bridge.leave_source(op), CausalAdmitResult::Applied);
+            }
+        }
+        assert_eq!(hub.unfinished_finish_count(), CAUSAL_PENDING_MAX * 3);
+        assert_eq!(bridge.release_count(), CAUSAL_PENDING_MAX * 3 + 2);
+        assert_eq!(
+            hub.keep_owned_op(CausalOp::Release {
+                scope_id: live,
+                identity: LeaseIdentity::PendingEntityPublish {
+                    plugin_key: "producer".into(),
+                },
+            }),
+            CausalAdmitResult::Applied
+        );
+        let overflow = hub.keep_owned_op(CausalOp::Release {
+            scope_id: live,
+            identity: LeaseIdentity::PendingEntityPublish {
+                plugin_key: "producer".into(),
+            },
+        });
+        let CausalAdmitResult::Retry(overflow) = overflow else {
+            panic!("second overflow must stay with the caller");
+        };
+        assert!(hub.event_plane_owner_ops_pending());
+        overflow
+    });
+    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+        let _ = hub.apply_event_plane_owner_ops();
+        let _ = scopes.flush_pending();
+    }
+    let _ = hub.keep_owned_op(overflow);
+    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+        let _ = hub.apply_event_plane_owner_ops();
+        let _ = scopes.flush_pending();
+    }
+    assert!(
+        !scopes.is_live(live),
+        "in-hand Release must stay owned and later close the scope"
+    );
+}
