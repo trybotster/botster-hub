@@ -535,6 +535,10 @@ impl UnixTerminalAdapterHandle {
         self.inner.complete_active()
     }
 
+    pub(crate) fn write_opaque_frame(&self, frame: &botster_terminal_protocol::TerminalFrame) {
+        let _ = self.inner.try_write(frame);
+    }
+
     pub(crate) fn defer_flush(&self) {
         self.inner.defer_flush();
     }

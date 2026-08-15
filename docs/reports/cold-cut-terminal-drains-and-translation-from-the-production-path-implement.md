@@ -14,7 +14,7 @@ Plan: `docs/plans/cold-cut-terminal-drains-and-translation-from-the-production-p
 | Worktree HEAD before edits | `959c58f55726d098299cced8af151d8f496f41e3` |
 | Locked Core SHA | `aef6516d5809d563961ed7fdd07da29a7b4edddc` |
 | Merge policy | direct into `main`; no PR |
-| Review follow-up | `review_1786812405_677042` on `cf8769c` |
+| Review follow-up | `review_1786813603_333934` on `d84136f` |
 
 Independent routing matched the approved plan. This run did not infer the repository from the ambient directory.
 
@@ -65,7 +65,7 @@ Not loaded: [[project-pipelines-playbook]] (package/plugin paths out of scope).
 - `packages/hub-test-support/**` (0.1.37 / revision 42, regenerated)
 - `README.md`, `docs/client-protocol.md`
 - Tests under `tests/hub_client_api_test.rs`, `tests/hub_local_runtime_test.rs`, `tests/hub_daemon_lifecycle/*`
-- Plan and this report (Review follow-up on `review_1786780308_178506`)
+- Plan and this report (Review follow-up on `review_1786813603_333934`)
 
 ## Ownership boundaries preserved
 
@@ -85,7 +85,7 @@ Closed dependencies used as given:
 - TUI planes `ticket_1786661009_551067`
 - TUI Hello repair `ticket_1786756492_156718` at `fc1ff6238ae707c355febbc03eeab5130cccf91c`
 
-No new Core ticket. Live TUI (`fc1ff623`) and live Web attach against this candidate Hub remain Verify work.
+No new Core ticket. Live Web attach chronology against this candidate Hub was run in Implement. Live TUI IsolatedHub Status at `fc1ff623` remains a Hello-mismatch residual, not a host-token restore.
 
 ## Deviations from plan
 
@@ -157,13 +157,20 @@ Verify `review_1786812405_677042` required three follow-ups on `cf8769c`:
 - `finding_1786812405_914932` — live Web attach never delivered terminal chronology.
 - `finding_1786812405_507488` — TUI IsolatedHub Hello at `fc1ff623` still requires removed host tokens.
 
+Review `review_1786813603_333934` required two new follow-ups on `d84136f` and kept the Verify findings open:
+
+- `finding_1786813603_263844` / `finding_1786812405_392121` — restore the finite `write(2)` producer and make parked-exit `ShutdownSession` return Events or SessionCleanup under `./test.sh --locked`.
+- `finding_1786813603_115214` / `finding_1786812405_914932` — run the provenance-pinned live packaged Web smoke; keep the IsolatedHub adapter test content-blind and rename its nonempty-frame claim.
+- `finding_1786812405_507488` — document the TUI IsolatedHub Hello mismatch; do not restore host tokens.
+
 This visit:
 
-- Successful Unix/WebRTC Attach now observes a bounded lifecycle slice after bind. Attach is also a reconcile-after-request mutation.
-- `webrtc_terminal_adapter_attach_pumps_chronology_without_host_drain` waits for adapter frames after Attach with no later Drain or ReadScreen.
-- Live exact-bytes producer holds after `write(2)` so `ShutdownSession` shuts down a still-running session.
-- On Core shutdown error, Hub retries observe and classify up to eight times before returning `OperatorError`.
-- Host terminal tokens stay off the descriptor. TUI IsolatedHub `wait_for_ready` at `fc1ff623` is not production TUI Hello. Verify should start this tree IsolatedHub, then drive TUI `HubConnection`.
+- Restored `write_python_wait_then_write_script`. Deleted the hold-forever helper.
+- `ShutdownSession` still observes, then classifies. If still Active, it applies parked Core lifecycle observations for that session, observes again, and classifies again. Parked `ProcessExited` becomes `SessionCleanup` before Core shutdown. Active plus Runtime/State after that path stays `OperatorError`.
+- `apply_parked_lifecycle_observations` is shutdown-only. Production `ReadScreen` does not call it. Terminal bodies are discarded.
+- After Unix/WebRTC bind, Hub forwards Core attach bootstrap `TransportEgress` as opaque `TerminalFrame` bytes. Hub does not decode READY/PAGE/FINISH.
+- IsolatedHub test is now `webrtc_terminal_adapter_attach_emits_a_nonempty_frame_without_host_drain`.
+- Host terminal tokens stay off the descriptor. TUI IsolatedHub `wait_for_ready` at `fc1ff623` is not production TUI Hello.
 
 ## Runtime-teardown lenses
 
@@ -216,20 +223,21 @@ Passed on this tree:
 - `external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup` passed isolated after the extra parking `ReadScreen` was removed
 - `external_hub_webrtc_live_output_preserves_exact_bytes` passed isolated
 - `unix_adapter_always_bind_stream_attach_restores_current_screen` passed isolated three times (1.56–1.61s)
-- `webrtc_terminal_adapter_attach_pumps_chronology_without_host_drain` passed isolated
-- `external_hub_webrtc_live_output_preserves_exact_bytes` passed isolated three times after the producer hold (2.62s, 2.46s, 2.50s)
+- `webrtc_terminal_adapter_attach_emits_a_nonempty_frame_without_host_drain` passed isolated
+- `external_hub_webrtc_live_output_preserves_exact_bytes` passed isolated three times with the finite `write(2)` producer (2.89s, 2.31s, 2.61s) and passed inside `./test.sh --locked`
+- `external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup` passed isolated and in the locked suite
 - Shutdown unit tests still pass: Active plus Runtime stays `OperatorError`; UnknownSession stays cleanup
+- Live Web `1e57685` `npm run smoke:live-packaged-protocol` against copied bins from this tree: Hello protocol 7 / rev 42, session spawn, `proveLiveTerminalAfterAttach`, and `assertTerminalAttachChronology` (cycle 0 plus reconnect cycles) completed. The harness then failed twice at the later Web-owned `proveRapidAlternateScreenReattach` cycle 0 ReadScreen oracle (`lost final row marker`). That stage is after attaching, snapshots, attached, and live `daemon_terminal_event` output.
 
 ## Unverified behavior or residual risk
 
-- Live TUI at `fc1ff623` and live Web against this candidate Hub were not attached in this Implement turn. Verify must run that proof and record Hub SHA plus locked Core SHA separately.
+- Live TUI IsolatedHub at `fc1ff623` still cannot Status this Hub. `wait_for_ready` uses hub-client `4f30d695` default Hello, which still requires host `terminal_streaming` and `resize`. Production TUI Hello at `fc1ff623` already omits them. Do not restore host tokens. Start this tree IsolatedHub, then drive TUI `HubConnection`.
 - `HubRuntime::drain_*` exists only under `cfg(test)` for in-crate unit tests.
 - Control-thread `try_recv` prefers queued host requests over idle reconcile. Burst `ReadScreen` can delay the 500 ms idle observe until the queue drains. Mutations now observe on the request path.
 - CoreDaemon on `aef6516` does not expose `pump_bound_adapters`. Owner-loop observe uses `observe_lifecycle_slice`, which calls Core `drain_runtime_once` internally.
 - Downstream TUI/Web crates that still imported the deleted hub-client `FEATURE_*` constants must import `botster-terminal-protocol` instead. Those consumers are separately routed.
-- If Core `Shutdown` fails while `registry_state` is still `Running` after eight observe retries, and the error is `Runtime` or `State`, Hub returns `OperatorError`. `ReadScreen` can park `ProcessExited` in Core `pending_drain`. Observe does not take that drain.
-- Live Web `npm run smoke:live-packaged-protocol` against this new SHA was not rerun in this Implement turn. Verify must rerun it with `BOTSTER_HUB_BIN` and `BOTSTER_SESSION_WORKER_BIN` from this commit.
-- TUI IsolatedHub at `fc1ff623` still uses default Hello host tokens. Do not restore those tokens. Start Hub with this tree IsolatedHub, then drive production TUI Hello.
+- Shutdown-only `apply_parked_lifecycle_observations` calls Core `drain` with a local id binding so parked `ProcessExited` can reconcile. Production `ReadScreen` does not call it. The architecture scan still rejects `.drain(session_id`.
+- Live Web packaged-protocol attach chronology is proved on this tree. The same smoke still fails later at Web `proveRapidAlternateScreenReattach` cycle 0: ReadScreen never contained the alt-screen final-row marker after reattach. That is a later host-readback oracle, not attach chronology. It is not this ticket's Drain cut, and it is not fixed here.
 
 ## Missing vault guidance discovered
 

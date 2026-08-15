@@ -1991,6 +1991,26 @@ impl HubRuntime {
         )
     }
 
+    /// Reconcile parked lifecycle observations for one session.
+    ///
+    /// Core `read_screen` can park `ProcessExited` off the observe plane.
+    /// Shutdown error recovery uses this so classify can see that exit.
+    /// Terminal bodies are discarded. Production ReadScreen must not call this.
+    pub fn apply_parked_lifecycle_observations(
+        &mut self,
+        session_id: &SessionId,
+        now_seconds: u64,
+    ) -> Result<(), CoreDaemonError> {
+        let id = session_id.clone();
+        let result = self
+            .core_daemon
+            .lock()
+            .expect("core daemon mutex")
+            .drain(&id, now_seconds)?;
+        drop(result);
+        Ok(())
+    }
+
     /// Test helper for Core terminal Drain. Production daemon paths must not call this.
     #[cfg(test)]
     pub fn drain_runtime_once(

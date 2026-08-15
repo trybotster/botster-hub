@@ -305,7 +305,7 @@ fn webrtc_terminal_adapter_bind_returns_only_attaching_then_terminal_frames() {
 }
 
 #[test]
-fn webrtc_terminal_adapter_attach_pumps_chronology_without_host_drain() {
+fn webrtc_terminal_adapter_attach_emits_a_nonempty_frame_without_host_drain() {
     let _guard = daemon_test_guard();
     let (hub, endpoint, bootstrap) = start_webrtc_adapter_hub("wac");
     let session_id = "wac-session";
@@ -337,7 +337,7 @@ fn webrtc_terminal_adapter_attach_pumps_chronology_without_host_drain() {
         }
         assert!(
             saw_terminal_frame,
-            "Attach must pump bound WebRTC chronology without a later host Drain or ReadScreen"
+            "Attach must emit a nonempty adapter frame without a later host Drain or ReadScreen"
         );
         peer.peer.close().await.expect("close offer peer");
     });
