@@ -796,22 +796,57 @@ fn smoke_session_round_trip(config: &botster_hub::HubConfig) -> Result<(), Smoke
             &spawn,
         )));
     }
-    let mut observed = Vec::new();
-    stream_attach(
-        config,
-        SessionId(session_id.clone()),
-        SubscriptionId(subscription_id),
-        &mut observed,
-    )
-    .map_err(SmokeError::Transport)?;
-    let observed = String::from_utf8_lossy(&observed).to_string();
-    if observed.contains(&format!("smoke:{marker}")) {
-        let _ = daemon_transport_request(config, DaemonRequest::ShutdownSession { session_id });
+    // After the Core capability-bind pin, a fast-exit attach still returns the
+    // initial Attaching handshake and Snapshot/Attached on Drain. Visible text
+    // is on ReadScreen. ProcessExit does not change host lifecycle, so
+    // stream_attach's ProcessExit/exited wait never completes.
+    let mut connection =
+        botster_hub::DaemonConnection::connect(config).map_err(SmokeError::Transport)?;
+    let attach = connection
+        .request(&DaemonRequest::Attach {
+            session_id: session_id.clone(),
+            subscription_id: subscription_id.clone(),
+        })
+        .map_err(SmokeError::Transport)?;
+    let deadline = Instant::now() + SMOKE_TIMEOUT;
+    let mut attached = attach_state_is(&attach.events, "attached");
+    while !attached && Instant::now() < deadline {
+        let drain = connection
+            .request(&DaemonRequest::drain_subscription(
+                &session_id,
+                &subscription_id,
+            ))
+            .map_err(SmokeError::Transport)?;
+        attached = attach_state_is(&drain.events, "attached");
+        if attached {
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    let screen = connection
+        .request(&DaemonRequest::ReadScreen {
+            session_id: session_id.clone(),
+        })
+        .map_err(SmokeError::Transport)?;
+    let observed = screen
+        .read_screen
+        .as_ref()
+        .map(|screen| screen.text.clone())
+        .unwrap_or_default();
+    let _ = daemon_transport_request(config, DaemonRequest::ShutdownSession { session_id });
+    if attached && observed.contains(&format!("smoke:{marker}")) {
         return Ok(());
     }
-
-    let _ = daemon_transport_request(config, DaemonRequest::ShutdownSession { session_id });
     Err(SmokeError::SessionRoundTrip(observed))
+}
+
+fn attach_state_is(events: &[DaemonEvent], expected: &str) -> bool {
+    events.iter().any(|event| {
+        matches!(
+            event,
+            DaemonEvent::AttachState { state, .. } if state == expected
+        )
+    })
 }
 
 fn operator_response_message(response: &DaemonResponse) -> String {
@@ -2974,6 +3009,16 @@ fn print_daemon_events(events: &[DaemonEvent]) {
                     event.target_id.as_deref().unwrap_or("none"),
                     event.status.as_deref().unwrap_or("none"),
                     event.failure_kind.as_deref().unwrap_or("none")
+                );
+            }
+            DaemonEvent::TerminalSubscriptionClosed {
+                session_id,
+                subscription_id,
+                generation,
+                reason,
+            } => {
+                println!(
+                    "event=terminal_subscription_closed session_id={session_id} subscription_id={subscription_id} generation={generation} reason={reason}"
                 );
             }
         }

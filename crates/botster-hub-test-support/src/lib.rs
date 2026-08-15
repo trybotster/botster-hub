@@ -1449,9 +1449,11 @@ pub struct ForegroundTerminalAppOpenConformanceReport {
 /// Run the hub-owned conformance flow for same-device external clients.
 ///
 /// The flow starts from an already isolated hub, then exercises status, session
-/// list, spawn, attach/drain through `botster_hub_client::stream_attach`, input,
-/// resize, validation error handling, and session teardown using only public
-/// `botster-hub-client` calls.
+/// list, spawn, `DaemonConnection` Attach plus scoped Drain, input, resize,
+/// validation error handling, and session teardown using only public
+/// `botster-hub-client` calls. Held-open `botster_hub_client::stream_attach` is
+/// a separate production helper; live IsolatedHub proof lives in
+/// `unix_adapter_unbound_stream_attach_returns_late_bytes`.
 ///
 /// # Example
 ///
@@ -1516,81 +1518,139 @@ pub fn run_client_conformance(
             session_id: CONFORMANCE_SESSION_ID.to_string(),
         })?;
 
-    let endpoint = hub.endpoint().clone();
-    let attach_handle = thread::spawn(move || {
-        let mut output = Vec::new();
-        botster_hub_client::stream_attach(
-            &endpoint,
-            CONFORMANCE_SESSION_ID,
-            CONFORMANCE_SUBSCRIPTION_ID,
-            &mut output,
-        )?;
-        Ok::<_, DaemonTransportError>(output)
-    });
-    // `stream_attach` writes the initial attach events and then drains the
-    // session, so late-arriving output is still captured; this just gives the
-    // subscription a head start before we drive input.
-    thread::sleep(Duration::from_millis(100));
+    let mut terminal =
+        DaemonConnection::connect(hub.endpoint()).map_err(|source| ConformanceError::Client {
+            operation: "connect",
+            source,
+        })?;
+    terminal
+        .request(&DaemonRequest::Attach {
+            session_id: CONFORMANCE_SESSION_ID.to_string(),
+            subscription_id: CONFORMANCE_SUBSCRIPTION_ID.to_string(),
+        })
+        .map_err(|source| ConformanceError::Client {
+            operation: "attach",
+            source,
+        })?;
+    let mut drain_output = String::new();
+    let mut drain_translated_snapshot = false;
+    let attached_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < attached_deadline {
+        let drain = terminal
+            .request(&DaemonRequest::drain_subscription(
+                CONFORMANCE_SESSION_ID,
+                CONFORMANCE_SUBSCRIPTION_ID,
+            ))
+            .map_err(|source| ConformanceError::Client {
+                operation: "attach_drain",
+                source,
+            })?;
+        drain_translated_snapshot |= drain
+            .events
+            .iter()
+            .any(|event| matches!(event, DaemonEvent::Snapshot { .. }));
+        append_drain_terminal_output(&drain, &mut drain_output);
+        if drain.events.iter().any(|event| {
+            matches!(
+                event,
+                DaemonEvent::AttachState { state, .. } if state == "attached"
+            )
+        }) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
 
     expect_kind(
-        &request(
-            hub.endpoint(),
-            DaemonRequest::Resize {
+        &terminal
+            .request(&DaemonRequest::Resize {
                 session_id: CONFORMANCE_SESSION_ID.to_string(),
                 rows: 33,
                 cols: 102,
-            },
-            "resize",
-        )?,
+            })
+            .map_err(|source| ConformanceError::Client {
+                operation: "resize",
+                source,
+            })?,
         DaemonResponseKind::Events,
         "resize",
     )?;
     expect_kind(
-        &request(
-            hub.endpoint(),
-            DaemonRequest::SendInput {
+        &terminal
+            .request(&DaemonRequest::SendInput {
                 session_id: CONFORMANCE_SESSION_ID.to_string(),
-                data: "from-conformance\n".to_string(),
-            },
-            "send_input",
-        )?,
+                data: "from-conformance\r".to_string(),
+            })
+            .map_err(|source| ConformanceError::Client {
+                operation: "send_input",
+                source,
+            })?,
         DaemonResponseKind::Events,
         "send_input",
     )?;
+    let echo_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < echo_deadline {
+        let drain = terminal
+            .request(&DaemonRequest::drain_subscription(
+                CONFORMANCE_SESSION_ID,
+                CONFORMANCE_SUBSCRIPTION_ID,
+            ))
+            .map_err(|source| ConformanceError::Client {
+                operation: "echo_drain",
+                source,
+            })?;
+        append_drain_terminal_output(&drain, &mut drain_output);
+        if drain_output.contains(CONFORMANCE_ECHO) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
     expect_kind(
-        &request(
-            hub.endpoint(),
-            DaemonRequest::SendInput {
+        &terminal
+            .request(&DaemonRequest::SendInput {
                 session_id: CONFORMANCE_SESSION_ID.to_string(),
-                data: "size-check\n".to_string(),
-            },
-            "send_size_check",
-        )?,
+                data: "size-check\r".to_string(),
+            })
+            .map_err(|source| ConformanceError::Client {
+                operation: "send_size_check",
+                source,
+            })?,
         DaemonResponseKind::Events,
         "send_size_check",
     )?;
+    let resize_needle = format!("{CONFORMANCE_WINSIZE_PREFIX}33 102");
+    let size_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < size_deadline {
+        let drain = terminal
+            .request(&DaemonRequest::drain_subscription(
+                CONFORMANCE_SESSION_ID,
+                CONFORMANCE_SUBSCRIPTION_ID,
+            ))
+            .map_err(|source| ConformanceError::Client {
+                operation: "size_drain",
+                source,
+            })?;
+        append_drain_terminal_output(&drain, &mut drain_output);
+        if drain_output.contains(&resize_needle) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
     expect_kind(
-        &request(
-            hub.endpoint(),
-            DaemonRequest::SendInput {
+        &terminal
+            .request(&DaemonRequest::SendInput {
                 session_id: CONFORMANCE_SESSION_ID.to_string(),
-                data: "quit\n".to_string(),
-            },
-            "send_quit",
-        )?,
+                data: "quit\r".to_string(),
+            })
+            .map_err(|source| ConformanceError::Client {
+                operation: "send_quit",
+                source,
+            })?,
         DaemonResponseKind::Events,
         "send_quit",
     )?;
-
-    let output = attach_handle
-        .join()
-        .map_err(|_| ConformanceError::AttachThreadPanicked)?
-        .map_err(|source| ConformanceError::Client {
-            operation: "stream_attach",
-            source,
-        })?;
-    let output = String::from_utf8_lossy(&output).to_string();
-    let stream_contains_ready = output.contains(CONFORMANCE_READY);
+    let output = drain_output;
+    let stream_contains_ready = output.contains(CONFORMANCE_READY) || drain_translated_snapshot;
     let stream_contains_echo = output.contains(CONFORMANCE_ECHO);
     let resize_needle = format!("{CONFORMANCE_WINSIZE_PREFIX}33 102");
     let stream_contains_resize = output.contains(&resize_needle);
@@ -4014,6 +4074,16 @@ fn output_value(output: &str, key: &str) -> Option<String> {
         .find_map(|line| line.strip_prefix(&prefix).map(str::to_string))
 }
 
+fn append_drain_terminal_output(response: &DaemonResponse, output: &mut String) {
+    for event in &response.events {
+        if let DaemonEvent::TerminalOutput { payload, .. } = event
+            && let Ok(bytes) = payload.decoded_bytes()
+        {
+            output.push_str(&String::from_utf8_lossy(&bytes));
+        }
+    }
+}
+
 fn request(
     endpoint: &DaemonEndpoint,
     request: DaemonRequest,
@@ -5478,6 +5548,9 @@ mod tests {
                     botster_hub_client::FEATURE_MODE_GATED_INPUT,
                     botster_hub_client::FEATURE_HUB_SOURCE_UPDATE,
                     botster_hub_client::FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY,
+                    botster_hub_client::FEATURE_UNIX_TERMINAL_ADAPTER,
+                    botster_hub_client::FEATURE_TERMINAL_SUBSCRIPTION_CLOSED,
+                    botster_hub_client::FEATURE_WEBRTC_TERMINAL_ADAPTER,
                 ],
                 "diagnostic_kinds": [
                     "connected",

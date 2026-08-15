@@ -13,15 +13,17 @@ use botster_core::{
     PluginInvocationFailureKind, PluginInvocationOutcome, PluginInvocationRequest,
     PluginInvocationResult, PluginKey, PluginWorkerDebugSnapshot, RequestId, Rgb, RoutedEnvelope,
     RoutedEnvelopeDrainOutcome, RoutedEnvelopePublishOutcome, SessionId, SessionLifecycleState,
-    SessionRuntimeErrorKind, SessionSpawnRequest, SubscriptionId, TerminalColorProfile,
+    SessionRuntimeErrorKind, SessionSpawnRequest, SubscriptionId, TerminalCapabilitySet,
+    TerminalColorProfile, TerminalSubscriptionGeneration, TerminalSubscriptionRecord,
 };
 use botster_core_daemon::{
     AcknowledgeRoutedEnvelopeRequest, AttachedSession, CaptureSnapshotRequest,
     CaptureSnapshotResult, CoreDaemon, CoreDaemonConfig, CoreDaemonError, DaemonSession,
-    DrainResult, DrainRoutedEnvelopesRequest, GuardedWriteRequest, GuardedWriteResult,
-    ModeGatedInputOutcome, PublishRoutedEnvelopeRequest, ReadModeFlagsRequest, ReadModeFlagsResult,
-    ReadScreenRequest, ReadScreenResult, RegistrySessionState, RoutedEnvelopeDeliveryStateResult,
-    SessionAdoptionReport, SessionAdoptionState, SessionLifecycleBaseline, SessionLifecycleChanges,
+    DetachTerminalSubscriptionResult, DrainResult, DrainRoutedEnvelopesRequest,
+    GuardedWriteRequest, GuardedWriteResult, ModeGatedInputOutcome, PublishRoutedEnvelopeRequest,
+    ReadModeFlagsRequest, ReadModeFlagsResult, ReadScreenRequest, ReadScreenResult,
+    RegistrySessionState, RoutedEnvelopeDeliveryStateResult, SessionAdoptionReport,
+    SessionAdoptionState, SessionLifecycleBaseline, SessionLifecycleChanges,
     SessionLifecycleCursor, SpawnSessionRequest,
 };
 use botster_ui_contract::{UiActionRequest, UiActionResult, UiNode};
@@ -1855,6 +1857,59 @@ impl HubRuntime {
         )
     }
 
+    /// Bind a content-blind terminal adapter to a live attach generation.
+    pub fn bind_terminal_adapter(
+        &mut self,
+        client_id: ClientId,
+        session_id: SessionId,
+        subscription_id: SubscriptionId,
+        generation: TerminalSubscriptionGeneration,
+        capabilities: TerminalCapabilitySet,
+        adapter: Box<dyn botster_core::contract::terminal_adapter::TerminalAdapter + Send>,
+    ) -> Result<(), CoreDaemonError> {
+        self.core_daemon
+            .lock()
+            .expect("core daemon mutex")
+            .bind_terminal_adapter(
+                client_id,
+                session_id,
+                subscription_id,
+                generation,
+                capabilities,
+                adapter,
+            )
+    }
+
+    /// Control-plane terminal subscription inventory. No terminal bodies.
+    #[must_use]
+    pub fn list_terminal_subscriptions(&self) -> Vec<TerminalSubscriptionRecord> {
+        self.core_daemon
+            .lock()
+            .expect("core daemon mutex")
+            .list_terminal_subscriptions()
+    }
+
+    /// Detach one subscription generation without deleting a newer owner.
+    pub fn detach_terminal_subscription(
+        &mut self,
+        client_id: ClientId,
+        session_id: SessionId,
+        subscription_id: SubscriptionId,
+        generation: TerminalSubscriptionGeneration,
+        now_seconds: u64,
+    ) -> Result<DetachTerminalSubscriptionResult, CoreDaemonError> {
+        self.core_daemon
+            .lock()
+            .expect("core daemon mutex")
+            .detach_terminal_subscription(
+                client_id,
+                session_id,
+                subscription_id,
+                generation,
+                now_seconds,
+            )
+    }
+
     /// Write terminal bytes into a session through the core daemon.
     pub fn write_bytes(
         &mut self,
@@ -2426,6 +2481,7 @@ fn managed_session_core_error_class(error: &CoreDaemonError) -> &'static str {
         CoreDaemonError::Shutdown => "shutdown",
         CoreDaemonError::MissingScreenResponse(_) => "missing_screen_response",
         CoreDaemonError::MissingModeFlagsResponse(_) => "missing_mode_flags_response",
+        CoreDaemonError::BindTerminalAdapter(_) => "bind_terminal_adapter",
     }
 }
 

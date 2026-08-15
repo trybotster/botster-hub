@@ -1,0 +1,32 @@
+{
+  "coordinate": "@trybotster/hub-test-support@0.1.36",
+  "target_repository": "trybotster/botster-hub",
+  "target_id": "tgt_7e208a0c76a44980a83b63af976b1f22",
+  "published_tree_sha": "924ea9790ec42c1ea2ed18622bcdbd489a532c34",
+  "plan_base_sha": "b11ff3d0aeac5d5a46ea069067be7d945a0f8798",
+  "dist_integrity": "sha512-ar867LILkxUEbbZeoJb4Tcw8iMFIDURCMY54z0r28DTxZh+FSkmYNx+Zt3eRzcX+hB+iOchsd1n1PMFUg9bpCA==",
+  "dist_tarball": "https://registry.npmjs.org/@trybotster/hub-test-support/-/hub-test-support-0.1.36.tgz",
+  "protocol_version": 7,
+  "conformance_fixture_revision": 41,
+  "ui_contract": "@trybotster/ui-contract@0.3.2",
+  "ui_contract_integrity": "sha512-lWzx8j2Z+OQhRAhURWpqUSLQyAMFycOOV6MgFAfMHRgU/27bkyc0v95komBGdJjv5IWjMRWJHlgmX7GlXGWR0Q==",
+  "occupancy": "0.1.36 unused at publish time",
+  "publish_path": "script packed and auth-checked; human completed OTP publish; implementer verified matching dist.integrity",
+  "otp_question_id": "question_1786735791_717881",
+  "teardown_class_applies": false,
+  "external_smoke": {
+    "install": "npm install @trybotster/hub-test-support@0.1.36 --prefer-online",
+    "verifyPackageAssets": true,
+    "tokens": [
+      "DaemonLocalWebrtcDeliveryKind",
+      "daemon_event",
+      "terminal_subscription_closed",
+      "FEATURE_TERMINAL_SUBSCRIPTION_CLOSED",
+      "for_webrtc_terminal_subscription_closed"
+    ],
+    "supported_features_includes": "terminal_subscription_closed",
+    "required_features_includes": false,
+    "readme_prior_coordinate": "0.1.35 protocol 7 / revision 40",
+    "readme_hello_gate": "protocol 7 Hello must require terminal_subscription_closed before daemon_event"
+  }
+}

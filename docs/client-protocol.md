@@ -983,10 +983,13 @@ The control-plane production route is:
 `botster_hub_client::DaemonConnection::request`
 to the daemon socket, then `src/daemon_transport.rs` `serve_daemon`/`handle_connection`, then `handle_runtime_control_request`, then `HubClientApi::handle_request`, then `HubRuntime` and the core daemon `SessionIo`/`ClientWorker` terminal data plane.
 
-Terminal attach and drain conformance uses `botster_hub_client::stream_attach`.
-That helper still connects through the daemon socket, but terminal bytes are
-delivered by the hub-owned client/session actor data plane rather than by a
-private session-worker frame contract.
+Published client conformance drives Attach and scoped Drain through
+`botster_hub_client::DaemonConnection`. Held-open `stream_attach` is a separate
+production helper: it still connects through the daemon socket, and a live
+IsolatedHub test (`unix_adapter_unbound_stream_attach_returns_late_bytes`)
+proves it returns late terminal bytes and completes after the process exits.
+Terminal bytes are delivered by the hub-owned client/session actor data plane
+rather than by a private session-worker frame contract.
 
 `DaemonEvent::TerminalOutput` carries renderable live PTY bytes in the same
 validated envelope as Snapshot/Scrollback: `payload_base64`, literal
@@ -1582,3 +1585,132 @@ clients that need incremental READY-then-history use
 `DaemonCompatibilityRequirement::for_ready_then_history_attach()`. On the
 success path a real opaque FINISH Snapshot precedes `attached`. A production
 socket Drain receives READY before later PAGE/FINISH frames.
+
+## Unix terminal adapter plane
+
+`unix_terminal_adapter` is an optional Hub daemon feature. The daemon
+advertises it. `DaemonCompatibilityRequirement::current()` does not require
+it. Clients that want the adapter plane use
+`DaemonCompatibilityRequirement::for_unix_terminal_adapter()`.
+`PROTOCOL_VERSION` remains 7. Advertising this feature,
+`terminal_subscription_closed`, and `webrtc_terminal_adapter` advances
+`CONFORMANCE_FIXTURE_REVISION` to 41. The default client requirement stays
+at revision 36.
+
+`DaemonHello` may send a Core `TerminalCompatibilityRequirement`. Absence is
+not a mismatch. `DaemonHelloAck` always advertises independent
+`TerminalCompatibility`. Host `DaemonCompatibility` stays a separate field.
+A present terminal requirement that fails `ensure_compatible` stores
+`UnixTerminalAdmission::Rejected` and returns `OperatorError` on the next
+Attach. The socket stays up for host operations.
+
+When a bound adapter or Core write-budget hard-stop closes a live generation
+and the connection stays up, Hub emits unsolicited
+`DaemonEvent::TerminalSubscriptionClosed` with `session_id`,
+`subscription_id`, `generation`, and reason `host_adapter_closed` or
+`core_adapter_closed`. Host Response and Event frames stay readable on the
+same connection. A sibling adapter on that connection may keep writing
+terminal envelopes. `host_adapter_closed` is host egress close. It is not
+the Core write-budget oracle. `parse_unix_mux_value` classifies that frame as
+`DaemonUnixMuxFrame::Event`, not a request reply. Connection death, Detach,
+process exit, and session removal do not emit this event.
+
+Unix admission is Hello plus LocalOperator. There is no WebRTC-style
+`BootstrapGrant` on the local Unix socket. The admission lifetime is the
+connection lifetime. EOF, write failure, or close revokes that admission.
+
+When Hello requires `unix_terminal_adapter` and Attach succeeds:
+
+1. The Attach response may carry only the initial `AttachState attaching`
+   event. That one-frame exception is transitional.
+   `ticket_1786661010_198387` removes it.
+2. Any other pre-bind terminal event (Snapshot, later AttachState,
+   TerminalOutput, ProcessExit) is fail-closed: Hub cancels the route, closes
+   any adapter candidate, detaches the live generation, and returns
+   `attach_failed`. Hub does not drop those frames.
+3. Hub intersects `TerminalCompatibility` advertised tokens with LocalOperator
+   admission, includes `snapshot_delivery=ready_then_history` only when Hello
+   or the terminal requirement asked for that feature, and binds the stored
+   Hello-time `TerminalCapabilitySet` into Core. Attach does not recompute a
+   different set.
+4. Later terminal frames leave only as unsolicited
+   `DaemonUnixTerminalEnvelope` JSON lines: `plane=terminal`, `kind=frame`,
+   plus opaque `payload_base64` from `TerminalFrame::to_bytes()`. Hub does
+   not inspect READY, PAGE, FINISH, later AttachState, or GHOSTSNP bodies.
+5. Bound-route Drain still advances control-plane lifecycle. It must not
+   return AttachState, Snapshot, TerminalOutput, or ProcessExited.
+6. Bound-route connection death closes the adapter only. Hub does not send
+   Detach. Explicit client Detach remains a separate authorized request.
+   Neither path shuts down the host session.
+
+Current clients that omit the feature stay on Drain translation until the
+cold-cut ticket. WebRTC attaches (`grant_id` present) do not receive a Unix
+adapter. Use `parse_unix_mux_value` to separate control responses from
+opaque adapter envelopes.
+
+## WebRTC terminal adapter plane
+
+`webrtc_terminal_adapter` is an optional Hub daemon feature. The daemon
+advertises it. `DaemonCompatibilityRequirement::current()` does not require
+it. Clients that want the adapter plane send an encrypted DataChannel
+`DaemonHello` whose `required_features` include
+`webrtc_terminal_adapter`, then call
+`DaemonCompatibilityRequirement::for_webrtc_terminal_adapter()`.
+`PROTOCOL_VERSION` remains 7. Advertising this feature and the negotiated
+`daemon_event` close delivery advances `CONFORMANCE_FIXTURE_REVISION` to 41.
+
+WebRTC protocol admission is DataChannel Hello after pairing, grant,
+origin, and AES-GCM crypto. Hub replies with encrypted `DaemonHelloAck`
+plaintext framed as a `daemon_response` delivery. Hello never creates a
+route. Attach binds only when that Hello required the feature and
+`grant_id` is present.
+
+When DataChannel Hello requires `webrtc_terminal_adapter` and Attach
+succeeds:
+
+1. The Attach response may carry only the initial `AttachState attaching`
+   event. That one-frame exception is transitional.
+   `ticket_1786661010_198387` removes it.
+2. Any other pre-bind terminal event is fail-closed: Hub cancels the
+   route, closes any adapter candidate, detaches the live generation, and
+   returns `attach_failed`.
+3. Hub intersects `TerminalCompatibility` advertised tokens with Hello
+   admission, includes `snapshot_delivery=ready_then_history` only when
+   Hello required that feature, and binds the resulting
+   `TerminalCapabilitySet` into Core.
+4. Later terminal frames leave only as encrypted
+   `DaemonLocalWebrtcDeliveryKind::DaemonTerminalFrame` chunks. One frame
+   occupies the adapter slot until every chunk of that delivery is sent.
+   Hub does not inspect READY, PAGE, FINISH, later AttachState, or
+   GHOSTSNP bodies.
+5. Bound-route Drain still advances control-plane lifecycle. It must not
+   return AttachState, Snapshot, TerminalOutput, or ProcessExited.
+6. Bound-route DataChannel close, peer failure, and grant `remove_peer`
+   close the adapter only. Hub does not send Detach. `local_close` waits
+   at most `LOCAL_WEBRTC_PEER_CLOSE_BOUND` and then continues cleanup.
+   Explicit client Detach remains a separate authorized request.
+   Neither path shuts down the host session.
+
+When a bound WebRTC adapter or Core write-budget hard-stop closes a live
+generation and the peer stays up, Hub emits unsolicited
+`DaemonEvent::TerminalSubscriptionClosed` with `session_id`,
+`subscription_id`, `generation`, and reason `host_adapter_closed` or
+`core_adapter_closed`. Hub sends that event only as
+`DaemonLocalWebrtcDeliveryKind::DaemonEvent`, and only after encrypted
+DataChannel Hello required `terminal_subscription_closed`. Protocol stays
+7. Unnegotiated protocol-7 adapter clients never receive or decode the
+new delivery kind. Host Status and ListSessions stay available on the
+same peer. A sibling adapter on that peer may keep writing
+`daemon_terminal_frame`. `host_adapter_closed` is host egress close. It is
+not the Core write-budget oracle. Connection death, Detach, process exit,
+and session removal do not emit this event.
+
+Clients that want the close event use
+`DaemonCompatibilityRequirement::for_webrtc_terminal_subscription_closed()`.
+That helper requires both `webrtc_terminal_adapter` and
+`terminal_subscription_closed`. `for_webrtc_terminal_adapter()` and
+`DaemonCompatibilityRequirement::current()` do not add the close feature.
+
+Current WebRTC clients that omit DataChannel Hello stay on Drain
+translation until the Web decoder ticket. They must not receive
+`daemon_terminal_frame` or `daemon_event`.

@@ -1,7 +1,7 @@
 {
   "protocol": "botster-hub-daemon-v1",
   "protocol_version": 7,
-  "conformance_fixture_revision": 38,
+  "conformance_fixture_revision": 41,
   "required_features": [
     "sessions",
     "terminal_streaming",
@@ -34,7 +34,10 @@
     "plugin_entity_subscriptions",
     "mode_gated_input",
     "hub_source_update",
-    "snapshot_delivery=ready_then_history"
+    "snapshot_delivery=ready_then_history",
+    "unix_terminal_adapter",
+    "terminal_subscription_closed",
+    "webrtc_terminal_adapter"
   ],
   "diagnostic_kinds": [
     "connected",

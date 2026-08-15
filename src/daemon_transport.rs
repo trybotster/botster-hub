@@ -4,7 +4,7 @@
 //! mutable `HubRuntime` on the accept/control thread; socket threads submit discrete
 //! requests and never hold runtime access while writing to a client.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::fs;
@@ -21,7 +21,7 @@ use botster_core::{
     ClientId, EndpointId, EnvelopeCursor, EnvelopeDeliveryState, EnvelopeId, EnvelopeTarget,
     PackageSource, RequestId, RoutedEnvelope, RoutedEnvelopePayload, RunnableEntrypointKind,
     RunnableEntrypointLaunchMode, SessionId, SessionLifecycleState, SubscriptionId,
-    TerminalAttachState,
+    TerminalAttachState, TerminalCapabilitySet,
 };
 use botster_core_daemon::{
     GuardedWriteDecision, GuardedWriteDeliveryState, ReadinessEvidence, RegistrySessionState,
@@ -57,6 +57,9 @@ pub use botster_hub_client::{
     FEATURE_PLUGIN_SURFACE_ACTION, FEATURE_PLUGIN_SURFACE_RENDER, PROTOCOL, read_frame,
     read_frame_from_reader, write_frame,
 };
+use botster_terminal_protocol::{
+    TerminalCompatibility, ensure_compatible as ensure_terminal_compatible,
+};
 use botster_ui_contract::{UiActionResult, UiActionResultState};
 use serde_json::Value;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
@@ -84,6 +87,8 @@ use crate::maintenance::{
 };
 use crate::packages::{PackageResolvedEntrypointLaunch, resolve_entrypoint_launch_contract};
 use crate::source_update::{current_update_execution, mark_update_failed, start_update_handoff};
+use crate::unix_terminal_adapter::{UnixConnectionMux, UnixTerminalAdapterHandle};
+use crate::webrtc_terminal_adapter::WebRtcConnectionMux;
 use crate::{
     AvailablePackage, AvailablePackageState, FileHubStateStore, HubClientApi,
     HubClientCaptureSnapshot, HubClientEvent, HubClientModeFlags, HubClientPackage,
@@ -106,7 +111,15 @@ use crate::{Worktree, WorktreeCreate, WorktreeError};
 
 #[path = "daemon_attach_stream.rs"]
 mod daemon_attach_stream;
-use daemon_attach_stream::{AttachStreamOwner, AttachStreamRegistry};
+use daemon_attach_stream::{
+    AttachStreamOwner, AttachStreamRegistry, UnixBindRequest, WebrtcBindRequest,
+    attach_failed_events, bind_unix_adapter_after_attaching, bind_webrtc_adapter_after_attaching,
+    fail_closed_pre_bind_attach, hello_requires_unix_adapter, hello_requires_webrtc_adapter,
+    initial_attaching_only, is_terminal_body_event, live_generation_for_route,
+};
+pub(crate) use daemon_attach_stream::{
+    hello_requires_terminal_subscription_closed, negotiated_unix_capability_set,
+};
 
 #[path = "daemon_package_control.rs"]
 mod daemon_package_control;
@@ -200,10 +213,16 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
         while let Ok(cleanup) = cleanup_rx.try_recv() {
             handle_connection_cleanup(&mut daemon, &mut control_state, control_tx.clone(), cleanup);
         }
-        let wait = control_state
-            .next_reconciliation
-            .saturating_duration_since(Instant::now());
-        match transport_runtime.block_on(receive_owner_event(&mut control_rx, wait)) {
+        let event = match control_rx.try_recv() {
+            Ok(message) => OwnerEvent::Control(Box::new(Some(message))),
+            Err(_) => {
+                let wait = control_state
+                    .next_reconciliation
+                    .saturating_duration_since(Instant::now());
+                transport_runtime.block_on(receive_owner_event(&mut control_rx, wait))
+            }
+        };
+        match event {
             OwnerEvent::Control(message) => match *message {
                 Some(ControlMessage::AcceptedConnection {
                     stream,
@@ -269,6 +288,7 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
                     drive_entity_subscriptions(&mut daemon, &mut control_state);
                     control_state.next_reconciliation =
                         Instant::now() + ENTITY_RECONCILIATION_INTERVAL;
+                    pump_bound_unix_routes(&mut daemon, &mut control_state);
                 }
                 if !socket_path.exists() {
                     rebind_missing_socket_path(&socket_path);
@@ -398,14 +418,10 @@ async fn reject_connection_async(stream: TokioUnixStream) {
     }
     let _ = write_async_frame(
         &mut write_half,
-        &DaemonHelloAck {
-            protocol: PROTOCOL.to_string(),
-            compatibility: DaemonCompatibility::current(),
-            diagnostics: vec![DaemonDiagnostic::backpressure(
-                "daemon_connection_admission",
-                "daemon connection capacity reached",
-            )],
-        },
+        &daemon_hello_ack(vec![DaemonDiagnostic::backpressure(
+            "daemon_connection_admission",
+            "daemon connection capacity reached",
+        )]),
     )
     .await;
 }
@@ -439,24 +455,45 @@ async fn handle_connection_async(
     if hello.protocol != PROTOCOL {
         return Err(DaemonTransportError::Protocol("unexpected hello protocol"));
     }
-    if let Err(error) = write_async_frame(
-        &mut write_half,
-        &DaemonHelloAck {
-            protocol: PROTOCOL.to_string(),
-            compatibility: DaemonCompatibility::current(),
-            diagnostics: vec![DaemonDiagnostic::connected("hello")],
-        },
-    )
-    .await
-    {
+    let (admission, hello_ack) = unix_hello_admission(&hello);
+    if let Err(error) = write_async_frame(&mut write_half, &hello_ack).await {
         cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
         return Err(error);
     }
     cleanup.set_reason(ConnectionTerminalReason::Eof);
 
+    let mut mux_write = MuxWriteState::default();
+    let mux = match &admission {
+        UnixTerminalAdmission::Admitted { mux, .. } => mux.clone(),
+        UnixTerminalAdmission::Rejected { .. } => UnixConnectionMux::new(),
+    };
+    control_tx
+        .send(ControlMessage::RegisterUnixAdmission {
+            client_id: client_id.clone(),
+            admission,
+        })
+        .await
+        .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
+
     loop {
         let request = tokio::select! {
             request = read_async_frame::<DaemonRequest, _>(&mut reader, None) => request,
+            _ = mux.notify().notified() => {
+                if let Err(error) = flush_unix_mux_writes(&mut write_half, &mux, &mut mux_write).await {
+                    cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
+                    mux.close_all();
+                    return Err(error);
+                }
+                continue;
+            }
+            _ = tokio::time::sleep(Duration::from_millis(25)), if mux.has_unsent_mux_writes() || mux_write.has_pending() => {
+                if let Err(error) = flush_unix_mux_writes(&mut write_half, &mux, &mut mux_write).await {
+                    cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
+                    mux.close_all();
+                    return Err(error);
+                }
+                continue;
+            }
             changed = shutdown_rx.changed() => {
                 let _ = changed;
                 cleanup.set_reason(ConnectionTerminalReason::Shutdown);
@@ -479,6 +516,18 @@ async fn handle_connection_async(
             subscription_id,
         } = request
         {
+            if unix_mux_blocks_entity_subscription(&mux, &mux_write) {
+                mux_write.enqueue_response(&entity_subscription_mux_busy_error(), None, false)?;
+                if let Err(error) =
+                    flush_pending_responses(&mut write_half, &mux, &mut mux_write, Instant::now())
+                        .await
+                {
+                    cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
+                    mux.close_all();
+                    return Err(error);
+                }
+                continue;
+            }
             return handle_entity_subscription_async(
                 write_half,
                 reader,
@@ -516,21 +565,810 @@ async fn handle_connection_async(
             &ownership_request,
             &response,
         ));
-        let write_result = write_async_frame(&mut write_half, &response).await;
-        if let Some(response_delivery_tx) = response_delivery_tx {
-            let _ = response_delivery_tx.send(());
-        }
-        if let Err(error) = write_result {
+        mux_write.enqueue_response(&response, response_delivery_tx, close_after_response)?;
+        debug_assert_eq!(mux_write.pending_response_count(), 1);
+        if let Err(error) =
+            flush_pending_responses(&mut write_half, &mux, &mut mux_write, Instant::now()).await
+        {
             cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
             let _ = control_tx.try_send(ControlMessage::EgressWriteFailed {
                 delivery_kind: daemon_delivery_kind(&response),
             });
+            mux.close_all();
             return Err(error);
         }
         if close_after_response {
+            debug_assert!(!mux_write.has_close_after_pending());
             cleanup.set_reason(ConnectionTerminalReason::NormalClose);
             return Ok(());
         }
+    }
+}
+
+#[derive(Default)]
+struct MuxWriteState {
+    pending: Option<PendingMuxFrame>,
+    queued_responses: VecDeque<PendingMuxFrame>,
+}
+
+impl MuxWriteState {
+    fn has_pending(&self) -> bool {
+        self.pending.is_some() || !self.queued_responses.is_empty()
+    }
+
+    fn has_close_after_pending(&self) -> bool {
+        self.pending.as_ref().is_some_and(|frame| frame.close_after)
+            || self.queued_responses.iter().any(|frame| frame.close_after)
+    }
+
+    fn has_pending_response(&self) -> bool {
+        self.pending
+            .as_ref()
+            .is_some_and(|frame| frame.class == PendingMuxClass::Response)
+            || !self.queued_responses.is_empty()
+    }
+
+    fn pending_response_count(&self) -> usize {
+        let pending =
+            self.pending
+                .as_ref()
+                .is_some_and(|frame| frame.class == PendingMuxClass::Response) as usize;
+        pending + self.queued_responses.len()
+    }
+
+    fn enqueue_response(
+        &mut self,
+        response: &DaemonResponse,
+        delivery_ack: Option<mpsc::Sender<()>>,
+        close_after: bool,
+    ) -> DaemonTransportResult<()> {
+        self.queued_responses.push_back(serialize_mux_frame(
+            response,
+            None,
+            PendingMuxClass::Response,
+            delivery_ack,
+            close_after,
+        )?);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingMuxClass {
+    Terminal,
+    Event,
+    Response,
+}
+
+struct PendingMuxFrame {
+    bytes: Vec<u8>,
+    offset: usize,
+    complete_envelope: Option<UnixTerminalAdapterHandle>,
+    class: PendingMuxClass,
+    delivery_ack: Option<mpsc::Sender<()>>,
+    close_after: bool,
+    backpressured: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum MuxWrite {
+    Written,
+    Pending,
+}
+
+fn unix_mux_blocks_entity_subscription(
+    mux: &UnixConnectionMux,
+    write_state: &MuxWriteState,
+) -> bool {
+    write_state.has_pending() || mux.has_unsent_mux_writes() || mux.has_bound_routes()
+}
+
+fn entity_subscription_mux_busy_error() -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
+    response.error = Some(DaemonOperatorError {
+        code: "unix_mux_owns_connection".to_string(),
+        request_id: "daemon-subscribe-entities".to_string(),
+        operation: "subscribe_entities".to_string(),
+        message: "entity subscription cannot start while the Unix mux owns this connection"
+            .to_string(),
+        diagnostics: vec![DaemonDiagnostic::action_failure(
+            "subscribe_entities",
+            "unix mux still owns bound routes or unsent frames",
+        )],
+    });
+    response
+}
+
+async fn flush_pending_responses(
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+    mux: &UnixConnectionMux,
+    write_state: &mut MuxWriteState,
+    started: Instant,
+) -> DaemonTransportResult<()> {
+    loop {
+        flush_unix_mux_writes(writer, mux, write_state).await?;
+        if !write_state.has_pending_response() {
+            return Ok(());
+        }
+        if started.elapsed() >= DAEMON_CLIENT_WRITE_TIMEOUT {
+            return Err(DaemonTransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "daemon client write deadline elapsed",
+            )));
+        }
+    }
+}
+
+async fn flush_unix_mux_writes(
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+    mux: &UnixConnectionMux,
+    write_state: &mut MuxWriteState,
+) -> DaemonTransportResult<()> {
+    abandon_zero_offset_terminal_for_response(write_state);
+    if resume_pending_mux_write(writer, write_state).await? == MuxWrite::Pending {
+        return Ok(());
+    }
+    while let Some(frame) = write_state.queued_responses.pop_front() {
+        write_state.pending = Some(frame);
+        if resume_pending_mux_write(writer, write_state).await? == MuxWrite::Pending {
+            return Ok(());
+        }
+    }
+    while let Some(event) = mux.pop_pending_event() {
+        write_state.pending = Some(serialize_mux_frame(
+            &event,
+            None,
+            PendingMuxClass::Event,
+            None,
+            false,
+        )?);
+        if resume_pending_mux_write(writer, write_state).await? == MuxWrite::Pending {
+            return Ok(());
+        }
+    }
+    for (session_id, subscription_id, handle, bytes) in mux.snapshot_writes() {
+        if handle.is_closed() {
+            continue;
+        }
+        let envelope = botster_hub_client::DaemonUnixTerminalEnvelope::from_frame_bytes(
+            session_id,
+            subscription_id,
+            &bytes,
+        );
+        write_state.pending = Some(serialize_mux_frame(
+            &envelope,
+            Some(handle),
+            PendingMuxClass::Terminal,
+            None,
+            false,
+        )?);
+        if resume_pending_mux_write(writer, write_state).await? == MuxWrite::Pending {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+fn serialize_mux_frame<T: serde::Serialize>(
+    frame: &T,
+    complete_envelope: Option<UnixTerminalAdapterHandle>,
+    class: PendingMuxClass,
+    delivery_ack: Option<mpsc::Sender<()>>,
+    close_after: bool,
+) -> DaemonTransportResult<PendingMuxFrame> {
+    let mut bytes = serde_json::to_vec(frame).map_err(DaemonTransportError::Json)?;
+    bytes.push(b'\n');
+    Ok(PendingMuxFrame {
+        bytes,
+        offset: 0,
+        complete_envelope,
+        class,
+        delivery_ack,
+        close_after,
+        backpressured: false,
+    })
+}
+
+fn abandon_zero_offset_terminal_for_response(write_state: &mut MuxWriteState) {
+    let should_abandon = write_state.pending.as_ref().is_some_and(|pending| {
+        pending.class == PendingMuxClass::Terminal
+            && pending.offset == 0
+            && !write_state.queued_responses.is_empty()
+    });
+    if should_abandon {
+        abandon_pending_terminal(write_state);
+    }
+}
+
+fn abandon_pending_terminal(write_state: &mut MuxWriteState) {
+    if let Some(pending) = write_state.pending.take()
+        && let Some(handle) = pending.complete_envelope
+    {
+        handle.defer_flush();
+    }
+}
+
+async fn resume_pending_mux_write(
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+    write_state: &mut MuxWriteState,
+) -> DaemonTransportResult<MuxWrite> {
+    let Some(pending) = write_state.pending.as_mut() else {
+        return Ok(MuxWrite::Written);
+    };
+    match write_frame_bytes_resumable(writer, pending).await? {
+        MuxWrite::Written => {
+            let pending = write_state.pending.take().expect("pending mux frame");
+            if let Some(delivery_ack) = pending.delivery_ack {
+                let _ = delivery_ack.send(());
+            }
+            if let Some(handle) = pending.complete_envelope {
+                if pending.backpressured {
+                    handle.defer_flush();
+                }
+                if !handle.is_closed() {
+                    let _ = handle.complete_active();
+                }
+            }
+            Ok(MuxWrite::Written)
+        }
+        MuxWrite::Pending => {
+            if pending.class == PendingMuxClass::Terminal && pending.offset == 0 {
+                abandon_pending_terminal(write_state);
+                return Ok(MuxWrite::Written);
+            }
+            pending.backpressured = true;
+            Ok(MuxWrite::Pending)
+        }
+    }
+}
+
+async fn write_frame_bytes_resumable(
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+    pending: &mut PendingMuxFrame,
+) -> DaemonTransportResult<MuxWrite> {
+    while pending.offset < pending.bytes.len() {
+        match tokio::time::timeout(
+            Duration::from_millis(50),
+            writer.write(&pending.bytes[pending.offset..]),
+        )
+        .await
+        {
+            Ok(Ok(0)) => {
+                return Err(DaemonTransportError::Io(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "unix mux write returned zero bytes",
+                )));
+            }
+            Ok(Ok(written)) => pending.offset += written,
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                return Ok(MuxWrite::Pending);
+            }
+            Ok(Err(error)) => return Err(DaemonTransportError::Io(error)),
+            Err(_) => return Ok(MuxWrite::Pending),
+        }
+    }
+    Ok(MuxWrite::Written)
+}
+
+#[cfg(test)]
+mod mux_write_resume_tests {
+    use super::{
+        MuxWrite, MuxWriteState, PendingMuxClass, PendingMuxFrame, daemon_response_base,
+        entity_subscription_mux_busy_error, flush_pending_responses, flush_unix_mux_writes,
+        unix_mux_blocks_entity_subscription, write_frame_bytes_resumable,
+    };
+    use crate::unix_terminal_adapter::{UnixConnectionMux, UnixTerminalAdapter};
+    use botster_core::contract::terminal_adapter::TerminalAdapter;
+    use botster_hub_client::{
+        DaemonEvent, DaemonResponseKind, DaemonUnixTerminalEnvelope,
+        TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER, parse_unix_mux_value,
+    };
+    use botster_terminal_protocol::TerminalFrame;
+    use std::io;
+    use std::pin::Pin;
+    use std::sync::mpsc;
+    use std::task::{Context, Poll};
+    use std::time::{Duration, Instant};
+    use tokio::io::AsyncWrite;
+
+    struct PrefixStallWriter {
+        written: Vec<u8>,
+        stall_after: usize,
+        allow_remainder: bool,
+    }
+
+    impl AsyncWrite for PrefixStallWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            let room = this.stall_after.saturating_sub(this.written.len());
+            if room == 0 && !this.allow_remainder {
+                return Poll::Pending;
+            }
+            let take = if this.allow_remainder {
+                buf.len()
+            } else {
+                room.min(buf.len())
+            };
+            if take == 0 {
+                return Poll::Pending;
+            }
+            this.written.extend_from_slice(&buf[..take]);
+            Poll::Ready(Ok(take))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn closed_event() -> DaemonEvent {
+        DaemonEvent::TerminalSubscriptionClosed {
+            session_id: "session".to_string(),
+            subscription_id: "sub".to_string(),
+            generation: 2,
+            reason: TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER.to_string(),
+        }
+    }
+
+    fn frame_bytes(event: &DaemonEvent) -> Vec<u8> {
+        let mut bytes = serde_json::to_vec(event).expect("serialize");
+        bytes.push(b'\n');
+        bytes
+    }
+
+    #[tokio::test]
+    async fn resumable_mux_write_keeps_offset_and_emits_one_valid_frame() {
+        let event = closed_event();
+        let expected = frame_bytes(&event);
+        let prefix = 8.min(expected.len() - 1);
+        let mut writer = PrefixStallWriter {
+            written: Vec::new(),
+            stall_after: prefix,
+            allow_remainder: false,
+        };
+        let mut pending = PendingMuxFrame {
+            bytes: expected.clone(),
+            offset: 0,
+            complete_envelope: None,
+            class: PendingMuxClass::Event,
+            delivery_ack: None,
+            close_after: false,
+            backpressured: false,
+        };
+
+        let result = write_frame_bytes_resumable(&mut writer, &mut pending).await;
+        assert!(matches!(result, Ok(MuxWrite::Pending)));
+        assert_eq!(pending.offset, prefix);
+        assert_eq!(writer.written, expected[..prefix]);
+
+        writer.allow_remainder = true;
+        let second = write_frame_bytes_resumable(&mut writer, &mut pending)
+            .await
+            .expect("resume write");
+        assert!(matches!(second, MuxWrite::Written));
+        assert_eq!(writer.written, expected);
+        assert_eq!(
+            writer.written.iter().filter(|byte| **byte == b'\n').count(),
+            1
+        );
+        let line = std::str::from_utf8(&writer.written)
+            .expect("utf8")
+            .trim_end();
+        let parsed = parse_unix_mux_value(serde_json::from_str(line).expect("json"))
+            .expect("classify mux frame");
+        match parsed {
+            botster_hub_client::DaemonUnixMuxFrame::Event(
+                DaemonEvent::TerminalSubscriptionClosed {
+                    session_id,
+                    generation,
+                    reason,
+                    ..
+                },
+            ) => {
+                assert_eq!(session_id, "session");
+                assert_eq!(generation, 2);
+                assert_eq!(reason, TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER);
+            }
+            other => panic!("expected one close event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resumable_mux_write_does_not_start_a_second_frame_while_first_is_pending() {
+        let first_bytes = frame_bytes(&closed_event());
+        let second_bytes = frame_bytes(&DaemonEvent::TerminalSubscriptionClosed {
+            session_id: "other".to_string(),
+            subscription_id: "sub-2".to_string(),
+            generation: 3,
+            reason: TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER.to_string(),
+        });
+        let mut writer = PrefixStallWriter {
+            written: Vec::new(),
+            stall_after: 4,
+            allow_remainder: false,
+        };
+        let mut pending = PendingMuxFrame {
+            bytes: first_bytes.clone(),
+            offset: 0,
+            complete_envelope: None,
+            class: PendingMuxClass::Event,
+            delivery_ack: None,
+            close_after: false,
+            backpressured: false,
+        };
+        let result = write_frame_bytes_resumable(&mut writer, &mut pending).await;
+        assert!(matches!(result, Ok(MuxWrite::Pending)));
+        assert_eq!(writer.written, first_bytes[..4]);
+        assert_ne!(writer.written, [first_bytes.clone(), second_bytes].concat());
+        assert_eq!(pending.bytes, first_bytes);
+    }
+
+    fn occupy_route(
+        mux: &UnixConnectionMux,
+        session_id: &str,
+        subscription_id: &str,
+        marker: &str,
+    ) -> UnixTerminalAdapter {
+        let (mut adapter, handle) = mux.create_adapter();
+        mux.register(
+            session_id.to_string(),
+            subscription_id.to_string(),
+            1,
+            handle,
+        );
+        let payload = format!(r#"{{"type":"terminal_output","marker":"{marker}"}}"#);
+        let frame = TerminalFrame::from_bytes(payload.as_bytes()).expect("opaque frame");
+        assert_eq!(adapter.try_write(&frame), Ok(()));
+        adapter
+    }
+
+    fn parse_written_mux_lines(written: &[u8]) -> Vec<botster_hub_client::DaemonUnixMuxFrame> {
+        written
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                parse_unix_mux_value(serde_json::from_slice(line).expect("json line"))
+                    .expect("classify mux frame")
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn partial_terminal_then_response_parses_two_complete_mux_lines() {
+        let mux = UnixConnectionMux::new();
+        let _stall = occupy_route(&mux, "stall", "sub", "flood");
+        let terminal = mux.snapshot_writes();
+        let prefix = 8.min(terminal[0].3.len().saturating_add(16));
+        let mut writer = PrefixStallWriter {
+            written: Vec::new(),
+            stall_after: prefix,
+            allow_remainder: false,
+        };
+        let mut write_state = MuxWriteState::default();
+        flush_unix_mux_writes(&mut writer, &mux, &mut write_state)
+            .await
+            .expect("first flush");
+        assert!(write_state.pending.is_some());
+        assert!(write_state.pending.as_ref().is_some_and(|pending| {
+            pending.class == PendingMuxClass::Terminal && pending.offset == prefix
+        }));
+
+        let response = daemon_response_base(DaemonResponseKind::Status);
+        write_state
+            .enqueue_response(&response, None, false)
+            .expect("enqueue status");
+        writer.allow_remainder = true;
+        writer.stall_after = usize::MAX;
+        flush_unix_mux_writes(&mut writer, &mux, &mut write_state)
+            .await
+            .expect("resume flush");
+        assert!(!write_state.has_pending());
+        let lines = parse_written_mux_lines(&writer.written);
+        assert_eq!(lines.len(), 2, "expected two complete mux lines");
+        assert!(matches!(
+            lines[0],
+            botster_hub_client::DaemonUnixMuxFrame::Terminal(DaemonUnixTerminalEnvelope {
+                ref session_id,
+                ..
+            }) if session_id == "stall"
+        ));
+        assert!(matches!(
+            lines[1],
+            botster_hub_client::DaemonUnixMuxFrame::Response(ref response)
+                if response.kind == DaemonResponseKind::Status
+        ));
+    }
+
+    #[tokio::test]
+    async fn zero_progress_terminal_start_is_abandoned_without_completing_slot() {
+        let mux = UnixConnectionMux::new();
+        let _stall = occupy_route(&mux, "stall", "sub", "flood");
+        let mut writer = PrefixStallWriter {
+            written: Vec::new(),
+            stall_after: 0,
+            allow_remainder: false,
+        };
+        let mut write_state = MuxWriteState::default();
+        flush_unix_mux_writes(&mut writer, &mux, &mut write_state)
+            .await
+            .expect("abandon flush");
+        assert!(writer.written.is_empty());
+        assert!(write_state.pending.is_none());
+        assert!(mux.snapshot_writes().is_empty());
+        let _sibling = occupy_route(&mux, "sibling", "sub-live", "live");
+        writer.allow_remainder = true;
+        writer.stall_after = usize::MAX;
+        flush_unix_mux_writes(&mut writer, &mux, &mut write_state)
+            .await
+            .expect("sibling flush");
+        let lines = parse_written_mux_lines(&writer.written);
+        assert_eq!(lines.len(), 1);
+        assert!(matches!(
+            lines[0],
+            botster_hub_client::DaemonUnixMuxFrame::Terminal(DaemonUnixTerminalEnvelope {
+                ref session_id,
+                ..
+            }) if session_id == "sibling"
+        ));
+    }
+
+    #[tokio::test]
+    async fn host_event_flushes_before_new_terminal_slots() {
+        let mux = UnixConnectionMux::new();
+        let _stall = occupy_route(&mux, "stall", "sub", "flood");
+        let (mut closer, close_handle) = mux.create_adapter();
+        mux.register(
+            "closing".to_string(),
+            "sub-close".to_string(),
+            1,
+            close_handle.clone(),
+        );
+        let frame = TerminalFrame::from_bytes(br#"{"type":"terminal_output","marker":"close"}"#)
+            .expect("opaque frame");
+        assert_eq!(closer.try_write(&frame), Ok(()));
+        close_handle.close();
+        assert_eq!(mux.queue_closed_subscription_events(|_| true), 1);
+
+        let mut writer = PrefixStallWriter {
+            written: Vec::new(),
+            stall_after: usize::MAX,
+            allow_remainder: true,
+        };
+        let mut write_state = MuxWriteState::default();
+        flush_unix_mux_writes(&mut writer, &mux, &mut write_state)
+            .await
+            .expect("host-first flush");
+        let lines = parse_written_mux_lines(&writer.written);
+        assert!(
+            matches!(
+                lines.first(),
+                Some(botster_hub_client::DaemonUnixMuxFrame::Event(
+                    DaemonEvent::TerminalSubscriptionClosed { session_id, .. }
+                )) if session_id == "closing"
+            ),
+            "host Event must precede new terminal slots: {lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_terminal_then_shutdown_response_acks_after_written() {
+        let mux = UnixConnectionMux::new();
+        let _stall = occupy_route(&mux, "stall", "sub", "flood");
+        let mut writer = PrefixStallWriter {
+            written: Vec::new(),
+            stall_after: 6,
+            allow_remainder: false,
+        };
+        let mut write_state = MuxWriteState::default();
+        flush_unix_mux_writes(&mut writer, &mux, &mut write_state)
+            .await
+            .expect("partial terminal");
+        let (ack_tx, ack_rx) = mpsc::channel();
+        write_state
+            .enqueue_response(
+                &daemon_response_base(DaemonResponseKind::Shutdown),
+                Some(ack_tx),
+                true,
+            )
+            .expect("enqueue shutdown");
+        assert!(ack_rx.try_recv().is_err());
+        assert!(write_state.has_close_after_pending());
+        flush_unix_mux_writes(&mut writer, &mux, &mut write_state)
+            .await
+            .expect("cannot finish while stalled");
+        assert!(ack_rx.try_recv().is_err());
+        assert!(write_state.has_close_after_pending());
+        writer.allow_remainder = true;
+        writer.stall_after = usize::MAX;
+        flush_unix_mux_writes(&mut writer, &mux, &mut write_state)
+            .await
+            .expect("finish close-after");
+        ack_rx.try_recv().expect("ack after complete shutdown line");
+        assert!(!write_state.has_close_after_pending());
+        let lines = parse_written_mux_lines(&writer.written);
+        assert_eq!(lines.len(), 2);
+        assert!(matches!(
+            lines[0],
+            botster_hub_client::DaemonUnixMuxFrame::Terminal(_)
+        ));
+        assert!(matches!(
+            lines[1],
+            botster_hub_client::DaemonUnixMuxFrame::Response(ref response)
+                if response.kind == DaemonResponseKind::Shutdown
+        ));
+    }
+
+    #[tokio::test]
+    async fn partial_terminal_then_update_response_acks_after_written() {
+        let mux = UnixConnectionMux::new();
+        let _stall = occupy_route(&mux, "stall", "sub", "flood");
+        let mut writer = PrefixStallWriter {
+            written: Vec::new(),
+            stall_after: 6,
+            allow_remainder: false,
+        };
+        let mut write_state = MuxWriteState::default();
+        flush_unix_mux_writes(&mut writer, &mux, &mut write_state)
+            .await
+            .expect("partial terminal");
+        let (ack_tx, ack_rx) = mpsc::channel();
+        write_state
+            .enqueue_response(
+                &daemon_response_base(DaemonResponseKind::HubUpdate),
+                Some(ack_tx),
+                false,
+            )
+            .expect("enqueue update");
+        assert!(ack_rx.try_recv().is_err());
+        flush_unix_mux_writes(&mut writer, &mux, &mut write_state)
+            .await
+            .expect("still pending");
+        assert!(ack_rx.try_recv().is_err());
+        writer.allow_remainder = true;
+        writer.stall_after = usize::MAX;
+        flush_unix_mux_writes(&mut writer, &mux, &mut write_state)
+            .await
+            .expect("finish update");
+        ack_rx.try_recv().expect("ack after complete update line");
+        let lines = parse_written_mux_lines(&writer.written);
+        assert_eq!(lines.len(), 2);
+        assert!(matches!(
+            lines[1],
+            botster_hub_client::DaemonUnixMuxFrame::Response(ref response)
+                if response.kind == DaemonResponseKind::HubUpdate
+        ));
+    }
+
+    #[tokio::test]
+    async fn stalled_response_stays_bounded_and_blocks_entity_subscription() {
+        let mux = UnixConnectionMux::new();
+        let _stall = occupy_route(&mux, "stall", "sub", "flood");
+        let mut writer = PrefixStallWriter {
+            written: Vec::new(),
+            stall_after: 6,
+            allow_remainder: false,
+        };
+        let mut write_state = MuxWriteState::default();
+        flush_unix_mux_writes(&mut writer, &mux, &mut write_state)
+            .await
+            .expect("partial terminal");
+        write_state
+            .enqueue_response(
+                &daemon_response_base(DaemonResponseKind::Status),
+                None,
+                false,
+            )
+            .expect("enqueue status");
+        flush_unix_mux_writes(&mut writer, &mux, &mut write_state)
+            .await
+            .expect("response remains pending");
+        assert!(write_state.has_pending_response());
+        assert_eq!(write_state.pending_response_count(), 1);
+        assert!(
+            write_state.has_pending(),
+            "entity subscription must not start while a mux frame is pending"
+        );
+        let timed_out = flush_pending_responses(
+            &mut writer,
+            &mux,
+            &mut write_state,
+            Instant::now() - Duration::from_secs(3),
+        )
+        .await;
+        assert!(
+            timed_out.is_err(),
+            "a stalled Response must not return until Written or timeout"
+        );
+        assert_eq!(write_state.pending_response_count(), 1);
+        writer.allow_remainder = true;
+        writer.stall_after = usize::MAX;
+        flush_pending_responses(&mut writer, &mux, &mut write_state, Instant::now())
+            .await
+            .expect("finish the one pending Response");
+        assert!(!write_state.has_pending_response());
+        assert!(
+            unix_mux_blocks_entity_subscription(&mux, &write_state),
+            "a bound Unix route must still block the entity-subscription handoff"
+        );
+        let lines = parse_written_mux_lines(&writer.written);
+        assert_eq!(lines.len(), 2);
+        assert!(matches!(
+            lines[0],
+            botster_hub_client::DaemonUnixMuxFrame::Terminal(_)
+        ));
+        assert!(matches!(
+            lines[1],
+            botster_hub_client::DaemonUnixMuxFrame::Response(ref response)
+                if response.kind == DaemonResponseKind::Status
+        ));
+        assert!(!write_state.has_pending());
+    }
+
+    #[tokio::test]
+    async fn bound_route_or_queued_event_blocks_entity_subscription_without_closing_routes() {
+        let mux = UnixConnectionMux::new();
+        let idle = MuxWriteState::default();
+        assert!(!unix_mux_blocks_entity_subscription(&mux, &idle));
+
+        let _stall = occupy_route(&mux, "stall", "sub", "flood");
+        assert!(mux.has_bound_routes());
+        assert!(unix_mux_blocks_entity_subscription(&mux, &idle));
+        let handle = mux.snapshot_writes()[0].2.clone();
+        assert!(!handle.host_closed());
+
+        handle.close();
+        assert_eq!(mux.queue_closed_subscription_events(|_| true), 1);
+        assert!(mux.has_unsent_mux_writes());
+        assert!(unix_mux_blocks_entity_subscription(&mux, &idle));
+        assert!(
+            !handle.host_closed(),
+            "rejecting SubscribeEntities must not host-close the bound route"
+        );
+        assert!(mux.has_bound_routes());
+
+        let mut writer = PrefixStallWriter {
+            written: Vec::new(),
+            stall_after: usize::MAX,
+            allow_remainder: true,
+        };
+        let mut write_state = MuxWriteState::default();
+        write_state
+            .enqueue_response(&entity_subscription_mux_busy_error(), None, false)
+            .expect("enqueue reject");
+        flush_pending_responses(&mut writer, &mux, &mut write_state, Instant::now())
+            .await
+            .expect("write reject");
+        let lines = parse_written_mux_lines(&writer.written);
+        assert!(
+            matches!(
+                lines.first(),
+                Some(botster_hub_client::DaemonUnixMuxFrame::Response(response))
+                    if response.kind == DaemonResponseKind::OperatorError
+                        && response.error.as_ref().is_some_and(|error| {
+                            error.code == "unix_mux_owns_connection"
+                        })
+            ),
+            "reject must be an OperatorError Response: {lines:?}"
+        );
+        assert!(
+            matches!(
+                lines.get(1),
+                Some(botster_hub_client::DaemonUnixMuxFrame::Event(
+                    DaemonEvent::TerminalSubscriptionClosed { session_id, .. }
+                )) if session_id == "stall"
+            ),
+            "close Event must still flush after the reject: {lines:?}"
+        );
+        assert!(mux.has_bound_routes());
+        assert!(!handle.host_closed());
     }
 }
 
@@ -882,24 +1720,92 @@ fn handle_connection_cleanup(
             state.released_entity_generations = state.released_entity_generations.saturating_add(1);
         }
     }
+    if let Some(UnixTerminalAdmission::Admitted { mux, .. }) = state
+        .pending_runtime
+        .unix_admissions
+        .remove(&cleanup.client_id)
+    {
+        mux.close_all();
+    }
+    let bound_claims = state
+        .pending_runtime
+        .take_connection_bound_routes(&cleanup.client_id);
+    state
+        .pending_runtime
+        .close_adapters_for_client(&cleanup.client_id);
+    let mut bound_subscriptions = BTreeSet::new();
+    for claim in bound_claims {
+        if !state.pending_runtime.connection_bound_route_still_owned(
+            &cleanup.client_id,
+            &claim.session_id,
+            &claim.subscription_id,
+            claim.generation,
+        ) {
+            continue;
+        }
+        bound_subscriptions.insert((claim.session_id.clone(), claim.subscription_id.clone()));
+        state
+            .pending_runtime
+            .cancel_stream(&claim.session_id, &claim.subscription_id);
+        state
+            .live_attach_routes
+            .remove(&(claim.session_id, claim.subscription_id));
+    }
+    if !bound_subscriptions.is_empty() {
+        *state
+            .lifecycle_counters
+            .cleanup_by_reason
+            .entry("bound_adapter_close".to_string())
+            .or_insert(0) += bound_subscriptions.len() as u64;
+    }
     for subscription in cleanup.attached_subscriptions {
-        let result = handle_control_request(
-            daemon,
-            &mut state.logical_clock,
-            &mut state.drain_cursors,
-            &mut state.pending_runtime,
-            DaemonObservability {
-                egress: &state.egress_diagnostics,
-                lifecycle: &state.lifecycle_counters,
-                client_id: Some(&cleanup.client_id),
-                grant_id: None,
-            },
-            control_tx.clone(),
-            DaemonRequest::Detach {
-                session_id: subscription.session_id,
-                subscription_id: subscription.subscription_id,
-            },
-        );
+        if state
+            .pending_runtime
+            .stream_owner_client_id(&subscription.session_id, &subscription.subscription_id)
+            .is_some_and(|owner| owner != cleanup.client_id)
+        {
+            continue;
+        }
+        let bound = bound_subscriptions.contains(&(
+            subscription.session_id.clone(),
+            subscription.subscription_id.clone(),
+        ));
+        let result = if bound {
+            state
+                .pending_runtime
+                .close_adapter(&subscription.session_id, &subscription.subscription_id);
+            state
+                .pending_runtime
+                .cancel_stream(&subscription.session_id, &subscription.subscription_id);
+            state.live_attach_routes.remove(&(
+                subscription.session_id.clone(),
+                subscription.subscription_id.clone(),
+            ));
+            Ok(daemon_events(Vec::new()))
+        } else {
+            *state
+                .lifecycle_counters
+                .cleanup_by_reason
+                .entry("cleanup_hub_detach".to_string())
+                .or_insert(0) += 1;
+            handle_control_request(
+                daemon,
+                &mut state.logical_clock,
+                &mut state.drain_cursors,
+                &mut state.pending_runtime,
+                DaemonObservability {
+                    egress: &state.egress_diagnostics,
+                    lifecycle: &state.lifecycle_counters,
+                    client_id: Some(&cleanup.client_id),
+                    grant_id: None,
+                },
+                control_tx.clone(),
+                DaemonRequest::Detach {
+                    session_id: subscription.session_id,
+                    subscription_id: subscription.subscription_id,
+                },
+            )
+        };
         state.lifecycle_counters.live_attach_subscriptions = state
             .lifecycle_counters
             .live_attach_subscriptions
@@ -957,6 +1863,28 @@ pub(crate) fn handle_control_message(
 ) -> bool {
     match message {
         ControlMessage::AcceptedConnection { .. } | ControlMessage::RejectedConnection => false,
+        ControlMessage::RegisterUnixAdmission {
+            client_id,
+            admission,
+        } => {
+            state
+                .pending_runtime
+                .unix_admissions
+                .insert(client_id, admission);
+            false
+        }
+        ControlMessage::RegisterWebrtcAdmission {
+            grant_id,
+            admission,
+        } => {
+            if daemon.local_webrtc().has_live_peer(&grant_id) {
+                state
+                    .pending_runtime
+                    .webrtc_admissions
+                    .insert(grant_id, admission);
+            }
+            false
+        }
         ControlMessage::SubscribeEntities {
             entity_type,
             subscription_id,
@@ -1226,6 +2154,21 @@ pub(crate) fn handle_control_message(
                 }
                 error => Err(error),
             });
+            if matches!(request, DaemonRequest::Detach { .. })
+                && response
+                    .as_ref()
+                    .is_ok_and(|response| response.kind != DaemonResponseKind::OperatorError)
+            {
+                *state
+                    .lifecycle_counters
+                    .cleanup_by_reason
+                    .entry("explicit_detach".to_string())
+                    .or_insert(0) += 1;
+            }
+            if let Some(runtime) = daemon.runtime() {
+                queue_unix_subscription_closed_events(runtime, &state.pending_runtime);
+                queue_webrtc_subscription_closed_events(runtime, &state.pending_runtime);
+            }
             if let Ok(response) = response.as_ref() {
                 let change = attached_subscription_change_for_response(&request, response);
                 let change = match change {
@@ -1391,19 +2334,54 @@ pub(crate) fn handle_control_message(
                     }
                 })
                 .collect();
-            // Drop owner index rows for removed grants before Detach so counters stay consistent
-            // even if Detach is a no-op for an already-gone session. Preserve replacement owners.
+            // Occupancy set is the counter source of truth. PeerClosed must release
+            // live_attach_routes here so a replacement Attach can become live.
+            for subscription in &detach_list {
+                record_attached_subscription_change(
+                    state,
+                    Some(AttachedSubscriptionChange::Detach(AttachedSubscription {
+                        session_id: subscription.session_id.clone(),
+                        subscription_id: subscription.subscription_id.clone(),
+                    })),
+                    None,
+                );
+            }
+            let mut bound_detach = Vec::new();
+            let mut unbound_detach = Vec::new();
+            for subscription in detach_list {
+                if state
+                    .pending_runtime
+                    .is_adapter_bound(&subscription.session_id, &subscription.subscription_id)
+                {
+                    bound_detach.push(subscription);
+                } else {
+                    unbound_detach.push(subscription);
+                }
+            }
+            if !bound_detach.is_empty() {
+                *state
+                    .lifecycle_counters
+                    .cleanup_by_reason
+                    .entry("bound_adapter_close".to_string())
+                    .or_insert(0) += bound_detach.len() as u64;
+            }
+            for grant_id in &removed_grants {
+                state.pending_runtime.close_adapters_for_grant(grant_id);
+            }
+            for subscription in &bound_detach {
+                state
+                    .pending_runtime
+                    .cancel_stream(&subscription.session_id, &subscription.subscription_id);
+            }
+            for grant_id in &removed_grants {
+                state.pending_runtime.webrtc_admissions.remove(grant_id);
+            }
+            // Residual same-grant index rows can survive a no-op Core Detach. Drop them
+            // after occupancy release. Preserve replacement owners.
             state
                 .pending_runtime
                 .attach_owner_grant_ids
                 .retain(|_, owner| !removed_grants.contains(owner.as_str()));
-            state.lifecycle_counters.live_attach_subscriptions = state
-                .lifecycle_counters
-                .live_attach_subscriptions
-                .saturating_sub(detach_list.len() as u64);
-            state.released_attach_generations = state
-                .released_attach_generations
-                .saturating_add(detach_list.len() as u64);
             detach_local_webrtc_subscriptions(
                 daemon,
                 &mut state.logical_clock,
@@ -1416,7 +2394,7 @@ pub(crate) fn handle_control_message(
                     client_id: None,
                     grant_id: None,
                 },
-                detach_list,
+                unbound_detach,
             );
             false
         }
@@ -1890,6 +2868,8 @@ fn handle_runtime_control_request(
                     "session must be terminal before it can be removed",
                 ));
             }
+            suppress_unix_session_close_events(pending_runtime, &session_id);
+            suppress_webrtc_session_close_events(pending_runtime, &session_id);
             Ok(daemon_response_base(DaemonResponseKind::SessionRemoved))
         }
         DaemonRequest::Status => {
@@ -1951,11 +2931,29 @@ fn handle_runtime_control_request(
             subscription_id,
         } => {
             let now = tick(logical_clock);
+            let client_id = observability
+                .client_id
+                .unwrap_or("botster-hub-daemon-socket")
+                .to_string();
+            if let Some(UnixTerminalAdmission::Rejected { code, diagnostic }) =
+                pending_runtime.unix_admissions.get(&client_id)
+            {
+                return Ok(terminal_compatibility_attach_error(
+                    code,
+                    diagnostic.clone(),
+                ));
+            }
+            if let Some(grant_id) = observability.grant_id
+                && let Some(WebrtcTerminalAdmission::Rejected { code, diagnostic }) =
+                    pending_runtime.webrtc_admissions.get(grant_id)
+            {
+                return Ok(terminal_compatibility_attach_error(
+                    code,
+                    diagnostic.clone(),
+                ));
+            }
             let owner = AttachStreamOwner {
-                client_id: observability
-                    .client_id
-                    .unwrap_or("botster-hub-daemon-socket")
-                    .to_string(),
+                client_id: client_id.clone(),
                 grant_id: observability.grant_id.map(str::to_string),
             };
             pending_runtime.start_attach(owner, session_id.clone(), subscription_id.clone());
@@ -1968,14 +2966,93 @@ fn handle_runtime_control_request(
                 Ok(events) => events,
                 Err(_) => {
                     pending_runtime.cancel_stream(&session_id, &subscription_id);
-                    vec![DaemonEvent::AttachState {
-                        session_id: session_id.clone(),
-                        subscription_id: subscription_id.clone(),
-                        state: botster_hub_client::ATTACH_STATE_ATTACH_FAILED.to_string(),
-                    }]
+                    return Ok(daemon_events(attach_failed_events(
+                        &session_id,
+                        &subscription_id,
+                    )));
                 }
             };
-            Ok(daemon_events(events))
+            let unix_admission = pending_runtime.unix_admissions.get(&client_id).cloned();
+            let webrtc_admission = observability
+                .grant_id
+                .and_then(|grant_id| pending_runtime.webrtc_admissions.get(grant_id).cloned());
+            let bind_webrtc = observability.grant_id.is_some()
+                && matches!(
+                    webrtc_admission.as_ref(),
+                    Some(WebrtcTerminalAdmission::Admitted {
+                        required_features,
+                        ..
+                    }) if hello_requires_webrtc_adapter(required_features)
+                );
+            let bind_unix = observability.grant_id.is_none()
+                && matches!(
+                    unix_admission.as_ref(),
+                    Some(UnixTerminalAdmission::Admitted {
+                        required_features,
+                        ..
+                    }) if hello_requires_unix_adapter(required_features)
+                );
+            if !bind_webrtc && !bind_unix {
+                return Ok(daemon_events(events));
+            }
+            if !initial_attaching_only(&events) {
+                return Ok(daemon_events(fail_closed_pre_bind_attach(
+                    pending_runtime,
+                    runtime,
+                    &client_id,
+                    &session_id,
+                    &subscription_id,
+                    now,
+                    None,
+                )));
+            }
+            if bind_webrtc {
+                let Some(WebrtcTerminalAdmission::Admitted {
+                    required_features,
+                    mux,
+                    terminal_requirement,
+                }) = webrtc_admission.as_ref()
+                else {
+                    return Ok(daemon_events(events));
+                };
+                return match bind_webrtc_adapter_after_attaching(
+                    pending_runtime,
+                    runtime,
+                    WebrtcBindRequest {
+                        client_id: &client_id,
+                        session_id: &session_id,
+                        subscription_id: &subscription_id,
+                        required_features,
+                        terminal_requirement: terminal_requirement.as_ref(),
+                        now_seconds: now,
+                        mux: Some(mux),
+                    },
+                ) {
+                    Ok(_) => Ok(daemon_events(events)),
+                    Err(failed) => Ok(daemon_events(failed)),
+                };
+            }
+            let Some(UnixTerminalAdmission::Admitted {
+                capabilities, mux, ..
+            }) = unix_admission.as_ref()
+            else {
+                return Ok(daemon_events(events));
+            };
+            match bind_unix_adapter_after_attaching(
+                pending_runtime,
+                runtime,
+                UnixBindRequest {
+                    client_id: &client_id,
+                    session_id: &session_id,
+                    subscription_id: &subscription_id,
+                    capabilities: capabilities.clone(),
+                    now_seconds: now,
+                    mux: Some(mux),
+                },
+            ) {
+                Ok(_) => Ok(daemon_events(events)),
+                Err(failed) => Ok(daemon_events(failed)),
+            }
         }
         DaemonRequest::Detach {
             session_id,
@@ -1984,7 +3061,14 @@ fn handle_runtime_control_request(
             let now = tick(logical_clock);
             let tracked_session_id = session_id.clone();
             let tracked_subscription_id = subscription_id.clone();
-            pending_runtime.cancel_stream(&tracked_session_id, &tracked_subscription_id);
+            let generation = observability.client_id.and_then(|client_id| {
+                live_generation_for_route(
+                    &runtime.list_terminal_subscriptions(),
+                    client_id,
+                    &tracked_session_id,
+                    &tracked_subscription_id,
+                )
+            });
             let response = api.handle_request(
                 runtime,
                 &packages,
@@ -1995,6 +3079,30 @@ fn handle_runtime_control_request(
                     now_seconds: now,
                 },
             )?;
+            if let Some(client_id) = observability.client_id
+                && let Some(UnixTerminalAdmission::Admitted { mux, .. }) =
+                    pending_runtime.unix_admissions.get(client_id)
+                && let Some(generation) = generation
+            {
+                mux.suppress_generation(
+                    tracked_session_id.clone(),
+                    tracked_subscription_id.clone(),
+                    generation.0,
+                );
+            }
+            if let Some(grant_id) = observability.grant_id
+                && let Some(WebrtcTerminalAdmission::Admitted { mux, .. }) =
+                    pending_runtime.webrtc_admissions.get(grant_id)
+                && let Some(generation) = generation
+            {
+                mux.suppress_generation(
+                    tracked_session_id.clone(),
+                    tracked_subscription_id.clone(),
+                    generation.0,
+                );
+            }
+            pending_runtime.close_adapter(&tracked_session_id, &tracked_subscription_id);
+            pending_runtime.cancel_stream(&tracked_session_id, &tracked_subscription_id);
             events_response(response.body)
         }
         DaemonRequest::SendInput { session_id, data } => {
@@ -2080,6 +3188,8 @@ fn handle_runtime_control_request(
                 Ok(response) => response,
                 Err(error) => {
                     if shutdown_error_is_unknown_session(&error) {
+                        suppress_unix_session_close_events(pending_runtime, &session_id);
+                        suppress_webrtc_session_close_events(pending_runtime, &session_id);
                         return Ok(daemon_session_cleanup(DaemonSessionCleanup {
                             session_id: session_id.clone(),
                             outcome: "already_exited".to_string(),
@@ -2087,9 +3197,13 @@ fn handle_runtime_control_request(
                     }
                     return match classify_shutdown_session(runtime, &session_id)? {
                         ShutdownSessionClassification::Cleanup(cleanup) => {
+                            suppress_unix_session_close_events(pending_runtime, &session_id);
+                            suppress_webrtc_session_close_events(pending_runtime, &session_id);
                             Ok(daemon_session_cleanup(cleanup))
                         }
                         ShutdownSessionClassification::Missing => {
+                            suppress_unix_session_close_events(pending_runtime, &session_id);
+                            suppress_webrtc_session_close_events(pending_runtime, &session_id);
                             Ok(daemon_unknown_session_cleanup(&session_id))
                         }
                         ShutdownSessionClassification::Active => {
@@ -2098,6 +3212,8 @@ fn handle_runtime_control_request(
                     };
                 }
             };
+            suppress_unix_session_close_events(pending_runtime, &session_id);
+            suppress_webrtc_session_close_events(pending_runtime, &session_id);
             events_response(response.body)
         }
         DaemonRequest::Drain {
@@ -2121,6 +3237,7 @@ fn handle_runtime_control_request(
                         .or_else(|| observability.client_id.map(str::to_string))
                         .unwrap_or_else(|| "botster-hub-daemon-socket".to_string()),
                 );
+                let bound = pending_runtime.is_adapter_bound(&session_id, &subscription_id);
                 let events = match runtime.drain_subscription(
                     &client_id,
                     &SessionId(session_id.clone()),
@@ -2130,14 +3247,12 @@ fn handle_runtime_control_request(
                     Ok(output) => crate::client_api::events_from_drain(output)
                         .into_iter()
                         .map(daemon_event_from_client)
+                        .filter(|event| !bound || !is_terminal_body_event(event))
                         .collect(),
                     Err(_) => {
+                        pending_runtime.close_adapter(&session_id, &subscription_id);
                         pending_runtime.cancel_stream(&session_id, &subscription_id);
-                        vec![DaemonEvent::AttachState {
-                            session_id: session_id.clone(),
-                            subscription_id,
-                            state: botster_hub_client::ATTACH_STATE_ATTACH_FAILED.to_string(),
-                        }]
+                        attach_failed_events(&session_id, &subscription_id)
                     }
                 };
                 if !events.is_empty() {
@@ -3163,6 +4278,131 @@ enum ShutdownSessionClassification {
     Missing,
 }
 
+fn daemon_hello_ack(diagnostics: Vec<DaemonDiagnostic>) -> DaemonHelloAck {
+    DaemonHelloAck {
+        protocol: PROTOCOL.to_string(),
+        compatibility: DaemonCompatibility::current(),
+        terminal_compatibility: Some(TerminalCompatibility::current()),
+        diagnostics,
+    }
+}
+
+fn unix_hello_admission(hello: &DaemonHello) -> (UnixTerminalAdmission, DaemonHelloAck) {
+    let mut diagnostics = vec![DaemonDiagnostic::connected("hello")];
+    if let Some(requirement) = hello.terminal_compatibility.as_ref()
+        && let Err(error) =
+            ensure_terminal_compatible(requirement, &TerminalCompatibility::current())
+    {
+        let diagnostic = DaemonDiagnostic::compatibility_mismatch(error.diagnostic);
+        diagnostics.push(diagnostic.clone());
+        return (
+            UnixTerminalAdmission::Rejected {
+                code: "terminal_compatibility",
+                diagnostic,
+            },
+            daemon_hello_ack(diagnostics),
+        );
+    }
+    let capabilities = negotiated_unix_capability_set(
+        &hello.compatibility.required_features,
+        hello.terminal_compatibility.as_ref(),
+    )
+    .unwrap_or_else(|_| TerminalCapabilitySet::empty());
+    (
+        UnixTerminalAdmission::Admitted {
+            required_features: hello.compatibility.required_features.clone(),
+            capabilities,
+            mux: UnixConnectionMux::new(),
+        },
+        daemon_hello_ack(diagnostics),
+    )
+}
+
+fn terminal_compatibility_attach_error(
+    code: &'static str,
+    diagnostic: DaemonDiagnostic,
+) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
+    response.error = Some(DaemonOperatorError {
+        code: code.to_string(),
+        request_id: "daemon-attach-terminal-compatibility".to_string(),
+        operation: "attach".to_string(),
+        message: diagnostic
+            .message
+            .clone()
+            .unwrap_or_else(|| "terminal compatibility mismatch".to_string()),
+        diagnostics: vec![diagnostic],
+    });
+    response
+}
+
+fn suppress_unix_session_close_events(pending_runtime: &PendingRuntimeState, session_id: &str) {
+    for admission in pending_runtime.unix_admissions.values() {
+        if let UnixTerminalAdmission::Admitted { mux, .. } = admission {
+            mux.suppress_session(session_id);
+        }
+    }
+}
+
+fn suppress_webrtc_session_close_events(pending_runtime: &PendingRuntimeState, session_id: &str) {
+    for admission in pending_runtime.webrtc_admissions.values() {
+        if let WebrtcTerminalAdmission::Admitted { mux, .. } = admission {
+            mux.suppress_session(session_id);
+        }
+    }
+}
+
+fn session_suppresses_terminal_subscription_closed(
+    runtime: &crate::HubRuntime,
+    session_id: &str,
+) -> bool {
+    let Ok(baseline) = runtime.session_lifecycle_baseline() else {
+        return true;
+    };
+    let Some(record) = baseline
+        .sessions
+        .iter()
+        .find(|record| record.session.session_id.0 == session_id)
+    else {
+        return true;
+    };
+    if record.session.registry_state != RegistrySessionState::Running {
+        return true;
+    }
+    matches!(
+        record.lifecycle,
+        Some(SessionLifecycleState::Exited { .. })
+            | Some(SessionLifecycleState::Failed { .. })
+            | Some(SessionLifecycleState::Stopping)
+    )
+}
+
+fn queue_unix_subscription_closed_events(
+    runtime: &crate::HubRuntime,
+    pending_runtime: &PendingRuntimeState,
+) {
+    for admission in pending_runtime.unix_admissions.values() {
+        if let UnixTerminalAdmission::Admitted { mux, .. } = admission {
+            mux.queue_closed_subscription_events(|session_id| {
+                !session_suppresses_terminal_subscription_closed(runtime, session_id)
+            });
+        }
+    }
+}
+
+fn queue_webrtc_subscription_closed_events(
+    runtime: &crate::HubRuntime,
+    pending_runtime: &PendingRuntimeState,
+) {
+    for admission in pending_runtime.webrtc_admissions.values() {
+        if let WebrtcTerminalAdmission::Admitted { mux, .. } = admission {
+            mux.queue_closed_subscription_events(|session_id| {
+                !session_suppresses_terminal_subscription_closed(runtime, session_id)
+            });
+        }
+    }
+}
+
 fn classify_shutdown_session(
     runtime: &mut crate::HubRuntime,
     session_id: &str,
@@ -3244,6 +4484,7 @@ fn prepare_socket_path(path: &PathBuf) -> DaemonTransportResult<()> {
                 &DaemonHello {
                     protocol: PROTOCOL.to_string(),
                     compatibility: botster_hub_client::DaemonCompatibilityRequirement::current(),
+                    terminal_compatibility: None,
                 },
             );
             match hello {
@@ -3324,11 +4565,47 @@ pub(crate) enum ControlMessage {
         entity_subscription_ids: Vec<String>,
         terminal_record: LocalWebrtcSenderTerminalRecord,
     },
+    RegisterUnixAdmission {
+        client_id: String,
+        admission: UnixTerminalAdmission,
+    },
+    RegisterWebrtcAdmission {
+        grant_id: String,
+        admission: WebrtcTerminalAdmission,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum UnixTerminalAdmission {
+    Admitted {
+        required_features: Vec<String>,
+        capabilities: TerminalCapabilitySet,
+        mux: UnixConnectionMux,
+    },
+    Rejected {
+        code: &'static str,
+        diagnostic: DaemonDiagnostic,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum WebrtcTerminalAdmission {
+    Admitted {
+        required_features: Vec<String>,
+        mux: WebRtcConnectionMux,
+        terminal_requirement: Option<botster_terminal_protocol::TerminalCompatibilityRequirement>,
+    },
+    Rejected {
+        code: &'static str,
+        diagnostic: DaemonDiagnostic,
+    },
 }
 
 #[derive(Default)]
 pub(crate) struct PendingRuntimeState {
     pub(crate) streams: AttachStreamRegistry,
+    unix_admissions: BTreeMap<String, UnixTerminalAdmission>,
+    webrtc_admissions: BTreeMap<String, WebrtcTerminalAdmission>,
 }
 
 impl fmt::Debug for PendingRuntimeState {
@@ -3355,6 +4632,35 @@ impl std::ops::DerefMut for PendingRuntimeState {
 impl PendingRuntimeState {
     pub(super) fn retain_active_sessions(&mut self, active_session_ids: &BTreeSet<String>) {
         self.streams.retain_active_sessions(active_session_ids);
+    }
+}
+
+fn pump_bound_unix_routes(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
+    if state.pending_runtime.bound_routes().is_empty() {
+        return;
+    }
+    let Some(runtime) = daemon.runtime_mut() else {
+        return;
+    };
+    let inventory = runtime.list_terminal_subscriptions();
+    queue_unix_subscription_closed_events(runtime, &state.pending_runtime);
+    queue_webrtc_subscription_closed_events(runtime, &state.pending_runtime);
+    state.pending_runtime.reconcile_inventory(&inventory);
+    let now = state.logical_clock;
+    let routes = state.pending_runtime.bound_routes();
+    for (session_id, subscription_id, _) in routes {
+        let Some(client_id) = state
+            .pending_runtime
+            .stream_owner_client_id(&session_id, &subscription_id)
+        else {
+            continue;
+        };
+        let _ = runtime.drain_subscription(
+            &ClientId(client_id),
+            &SessionId(session_id),
+            &SubscriptionId(subscription_id),
+            now,
+        );
     }
 }
 
@@ -3498,7 +4804,8 @@ fn record_attached_subscription_change(
                 subscription.session_id.clone(),
                 subscription.subscription_id.clone(),
             );
-            if !state.live_attach_routes.insert(route.clone()) {
+            let inserted = state.live_attach_routes.insert(route.clone());
+            if !inserted && state.lifecycle_counters.live_attach_subscriptions > 0 {
                 return;
             }
             if state.released_attach_generations > 0 {
@@ -6127,6 +7434,19 @@ fn receive_test_control_message(
 }
 
 #[cfg(test)]
+fn receive_test_control_request(
+    receiver: &mut tokio_mpsc::Receiver<ControlMessage>,
+) -> ControlMessage {
+    loop {
+        match receive_test_control_message(receiver) {
+            ControlMessage::RegisterUnixAdmission { .. }
+            | ControlMessage::RegisterWebrtcAdmission { .. } => {}
+            message => return message,
+        }
+    }
+}
+
+#[cfg(test)]
 fn receive_test_control_reply(
     receiver: oneshot::Receiver<DaemonTransportResult<DaemonResponse>>,
 ) -> DaemonTransportResult<DaemonResponse> {
@@ -6265,6 +7585,7 @@ mod tests {
             &DaemonHello {
                 protocol: PROTOCOL.to_string(),
                 compatibility: botster_hub_client::DaemonCompatibilityRequirement::current(),
+                terminal_compatibility: None,
             },
         )
         .expect("write daemon hello");
@@ -6280,7 +7601,7 @@ mod tests {
         .expect("write attach request");
         let ControlMessage::Request {
             request, reply_tx, ..
-        } = receive_test_control_message(&mut control_rx)
+        } = receive_test_control_request(&mut control_rx)
         else {
             panic!("expected attach control request");
         };
@@ -6295,7 +7616,7 @@ mod tests {
             .expect("disconnect daemon client");
         let ControlMessage::Request {
             request, reply_tx, ..
-        } = receive_test_control_message(&mut control_rx)
+        } = receive_test_control_request(&mut control_rx)
         else {
             panic!("expected detach control request");
         };
@@ -6327,6 +7648,7 @@ mod tests {
             &DaemonHello {
                 protocol: PROTOCOL.to_string(),
                 compatibility: botster_hub_client::DaemonCompatibilityRequirement::current(),
+                terminal_compatibility: None,
             },
         )
         .expect("write daemon hello");
@@ -6342,7 +7664,7 @@ mod tests {
         .expect("write attach request");
         let ControlMessage::Request {
             request, reply_tx, ..
-        } = receive_test_control_message(&mut control_rx)
+        } = receive_test_control_request(&mut control_rx)
         else {
             panic!("expected attach control request");
         };
@@ -6380,6 +7702,7 @@ mod tests {
             &DaemonHello {
                 protocol: PROTOCOL.to_string(),
                 compatibility: botster_hub_client::DaemonCompatibilityRequirement::current(),
+                terminal_compatibility: None,
             },
         )
         .expect("write daemon hello");
@@ -6395,7 +7718,7 @@ mod tests {
         .expect("write attach request");
         let ControlMessage::Request {
             request, reply_tx, ..
-        } = receive_test_control_message(&mut control_rx)
+        } = receive_test_control_request(&mut control_rx)
         else {
             panic!("expected attach control request");
         };
@@ -6416,7 +7739,7 @@ mod tests {
         .expect("write scoped drain");
         let ControlMessage::Request {
             request, reply_tx, ..
-        } = receive_test_control_message(&mut control_rx)
+        } = receive_test_control_request(&mut control_rx)
         else {
             panic!("expected drain control request");
         };
@@ -6686,6 +8009,7 @@ mod tests {
             &DaemonHello {
                 protocol: PROTOCOL.to_string(),
                 compatibility: botster_hub_client::DaemonCompatibilityRequirement::current(),
+                terminal_compatibility: None,
             },
         )
         .expect("write daemon hello");
@@ -6699,7 +8023,7 @@ mod tests {
             response_delivery_rx,
             grant_id,
             ..
-        } = receive_test_control_message(&mut control_rx)
+        } = receive_test_control_request(&mut control_rx)
         else {
             panic!("expected shutdown control request");
         };
