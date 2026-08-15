@@ -3253,6 +3253,21 @@ fn handle_runtime_control_request(
             observe_lifecycle_turn(runtime, now);
             match classify_shutdown_session(runtime, &session_id)? {
                 ShutdownSessionClassification::Active => {}
+                ShutdownSessionClassification::Incomplete => {
+                    for _ in 0..8 {
+                        observe_lifecycle_turn(runtime, tick(logical_clock));
+                        match classify_shutdown_session(runtime, &session_id)? {
+                            ShutdownSessionClassification::Active
+                            | ShutdownSessionClassification::Incomplete => {}
+                            ShutdownSessionClassification::Cleanup(cleanup) => {
+                                return Ok(daemon_session_cleanup(cleanup));
+                            }
+                            ShutdownSessionClassification::Missing => {
+                                return Ok(daemon_unknown_session_cleanup(&session_id));
+                            }
+                        }
+                    }
+                }
                 ShutdownSessionClassification::Cleanup(cleanup) => {
                     return Ok(daemon_session_cleanup(cleanup));
                 }
@@ -3277,6 +3292,7 @@ fn handle_runtime_control_request(
                         observe_lifecycle_turn(runtime, now);
                         match classify_shutdown_session(runtime, &session_id)? {
                             ShutdownSessionClassification::Active
+                            | ShutdownSessionClassification::Incomplete
                                 if !shutdown_error_is_already_gone(&error) => {}
                             classification => {
                                 let response =
@@ -4329,6 +4345,7 @@ enum ShutdownSessionClassification {
     Active,
     Cleanup(DaemonSessionCleanup),
     Missing,
+    Incomplete,
 }
 
 fn daemon_hello_ack(diagnostics: Vec<DaemonDiagnostic>) -> DaemonHelloAck {
@@ -4501,7 +4518,9 @@ fn shutdown_error_response(
                 outcome: "already_exited".to_string(),
             }))
         }
-        ShutdownSessionClassification::Active => Err(DaemonTransportError::Client(error)),
+        ShutdownSessionClassification::Active | ShutdownSessionClassification::Incomplete => {
+            Err(DaemonTransportError::Client(error))
+        }
     }
 }
 
@@ -4538,21 +4557,32 @@ fn classify_shutdown_session(
         RegistrySessionState::Running => {}
     }
 
-    match runtime
-        .session_runtime_lifecycle(&SessionId(session_id.to_string()))
-        .map_err(crate::HubRuntimeError::from)?
-    {
-        Some(SessionLifecycleState::Stopping)
-        | Some(SessionLifecycleState::Exited { .. })
-        | Some(SessionLifecycleState::Failed { .. }) => Ok(ShutdownSessionClassification::Cleanup(
-            DaemonSessionCleanup {
+    Ok(shutdown_classification_from_engine_lookup(
+        session_id,
+        runtime.session_runtime_lifecycle(&SessionId(session_id.to_string())),
+    ))
+}
+
+fn shutdown_classification_from_engine_lookup(
+    session_id: &str,
+    lookup: crate::SessionRuntimeLifecycleLookup,
+) -> ShutdownSessionClassification {
+    match lookup {
+        crate::SessionRuntimeLifecycleLookup::Found(SessionLifecycleState::Stopping)
+        | crate::SessionRuntimeLifecycleLookup::Found(SessionLifecycleState::Exited { .. })
+        | crate::SessionRuntimeLifecycleLookup::Found(SessionLifecycleState::Failed { .. }) => {
+            ShutdownSessionClassification::Cleanup(DaemonSessionCleanup {
                 session_id: session_id.to_string(),
                 outcome: "already_exited".to_string(),
-            },
-        )),
-        Some(SessionLifecycleState::Starting) | Some(SessionLifecycleState::Running) | None => {
-            Ok(ShutdownSessionClassification::Active)
+            })
         }
+        crate::SessionRuntimeLifecycleLookup::Found(SessionLifecycleState::Starting)
+        | crate::SessionRuntimeLifecycleLookup::Found(SessionLifecycleState::Running)
+        | crate::SessionRuntimeLifecycleLookup::CompleteAbsent => {
+            ShutdownSessionClassification::Active
+        }
+        crate::SessionRuntimeLifecycleLookup::Incomplete
+        | crate::SessionRuntimeLifecycleLookup::Error => ShutdownSessionClassification::Incomplete,
     }
 }
 
@@ -7598,6 +7628,40 @@ mod tests {
             operation: crate::HubClientOperation::Shutdown,
             kind,
         }
+    }
+
+    #[test]
+    fn failed_engine_lifecycle_lookup_is_not_active_or_cleanup() {
+        assert!(matches!(
+            shutdown_classification_from_engine_lookup(
+                "late-session",
+                crate::SessionRuntimeLifecycleLookup::Incomplete,
+            ),
+            ShutdownSessionClassification::Incomplete
+        ));
+        assert!(matches!(
+            shutdown_classification_from_engine_lookup(
+                "error-session",
+                crate::SessionRuntimeLifecycleLookup::Error,
+            ),
+            ShutdownSessionClassification::Incomplete
+        ));
+        assert!(matches!(
+            shutdown_classification_from_engine_lookup(
+                "missing-session",
+                crate::SessionRuntimeLifecycleLookup::CompleteAbsent,
+            ),
+            ShutdownSessionClassification::Active
+        ));
+        assert!(matches!(
+            shutdown_classification_from_engine_lookup(
+                "exited-session",
+                crate::SessionRuntimeLifecycleLookup::Found(SessionLifecycleState::Exited {
+                    code: Some(0)
+                }),
+            ),
+            ShutdownSessionClassification::Cleanup(_)
+        ));
     }
 
     #[test]
