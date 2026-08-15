@@ -2990,7 +2990,6 @@ fn reload_replaces_lua_tool_descriptors_and_removes_stale_handlers() {
             worktrees: hub.worktrees(),
             package_event_router: hub.package_event_router().clone(),
             causal_scopes: hub.causal_scopes().clone(),
-            causal_retries: hub.causal_retries().clone(),
         },
         registry.packages().into_iter().cloned().collect(),
     )
@@ -4341,7 +4340,7 @@ fn production_fanout_finish_returns_the_513th_op_without_spinning() {
     let taken = hub.take_leased_package_entity_fanout();
     assert_eq!(taken.len(), 1);
 
-    let capacity = CAUSAL_PENDING_MAX * 2;
+    let capacity = CAUSAL_PENDING_MAX;
     let mut fillers = Vec::new();
     for index in 0..capacity {
         let scope = scopes
@@ -4437,7 +4436,7 @@ fn never_queued_publish_releases_after_full_causal_path() {
         .expect("load");
     let scopes = hub.causal_scopes().clone();
     let live = scopes.mint_with_lease(None).expect("live scope");
-    let capacity = CAUSAL_PENDING_MAX * 2;
+    let capacity = CAUSAL_PENDING_MAX;
     let mut fillers = Vec::new();
     for index in 0..capacity {
         let scope = scopes
@@ -4472,27 +4471,12 @@ fn never_queued_publish_releases_after_full_causal_path() {
         live,
     ));
     assert!(matches!(failed.result, PluginInvocationResult::Failed(_)));
-    assert_eq!(
-        scopes.identities(live),
-        Some(std::collections::BTreeSet::from([
-            LeaseIdentity::PendingEntityPublish {
-                plugin_key: "lease-probe".into(),
-            }
-        ]))
-    );
-    assert!(
-        hub.event_plane_owner_ops_pending(),
-        "NeverQueued release must stay on the caller inbox"
-    );
-    while scopes.pending_ops() {
-        let _ = scopes.flush_pending();
-    }
     let _ = hub.apply_event_plane_owner_ops();
     while scopes.pending_ops() {
         let _ = scopes.flush_pending();
     }
     assert!(
         !scopes.is_live(live),
-        "owner drain must close the NeverQueued lease"
+        "NeverQueued must retract or later close the pending publish lease"
     );
 }

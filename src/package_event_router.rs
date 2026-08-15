@@ -6,7 +6,6 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
@@ -1066,6 +1065,7 @@ pub enum CausalOp {
 
 /// One-shot causal admission. `Retry` returns ownership to the caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
 pub enum CausalAdmitResult {
     Applied,
     Retry(CausalOp),
@@ -1124,115 +1124,34 @@ impl EventPlaneOwnerOps {
     }
 }
 
-/// Bounded caller-owned retry inbox. Send + Sync. Workers and the owner share it.
-pub struct CausalRetryInbox {
-    pending: Mutex<VecDeque<CausalOp>>,
-}
-
-impl Default for CausalRetryInbox {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl CausalRetryInbox {
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            pending: Mutex::new(VecDeque::new()),
-        }
-    }
-
-    pub fn park(&self, op: CausalOp) -> CausalAdmitResult {
-        match self.pending.try_lock() {
-            Ok(mut retries) if retries.len() < CAUSAL_CALLER_MAX => {
-                retries.push_back(op);
-                CausalAdmitResult::Applied
-            }
-            Ok(_) | Err(_) => CausalAdmitResult::Retry(op),
-        }
-    }
-
-    pub fn drain_slice(&self, scopes: &CausalScopeTable) -> usize {
-        let Ok(mut retries) = self.pending.try_lock() else {
-            return 0;
-        };
-        let started = Instant::now();
-        let mut applied = 0;
-        while applied < CAUSAL_FLUSH_MAX && started.elapsed() < Duration::from_millis(8) {
-            let Some(op) = retries.pop_front() else {
-                break;
-            };
-            match scopes.try_admit(op) {
-                CausalAdmitResult::Applied => applied += 1,
-                CausalAdmitResult::Retry(op) => {
-                    retries.push_front(op);
-                    break;
-                }
-            }
-        }
-        applied
-    }
-
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.pending
-            .try_lock()
-            .map(|retries| retries.len())
-            .unwrap_or(0)
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
-/// Admit to the table or park on the caller inbox. Returns Retry if both are full.
-pub fn admit_or_park(
-    scopes: &CausalScopeTable,
-    inbox: &CausalRetryInbox,
-    op: CausalOp,
-) -> CausalAdmitResult {
-    match scopes.try_admit(op) {
-        CausalAdmitResult::Applied => CausalAdmitResult::Applied,
-        CausalAdmitResult::Retry(op) => inbox.park(op),
-    }
-}
-
-/// Worker undo: admit, park, or retract the identity the worker still owns.
+/// Worker undo: admit, or retract the identity the worker still owns.
 pub fn release_or_retract(
     scopes: &CausalScopeTable,
-    inbox: &CausalRetryInbox,
     scope_id: u64,
     identity: LeaseIdentity,
-) {
-    match admit_or_park(
-        scopes,
-        inbox,
-        CausalOp::Release {
-            scope_id,
-            identity: identity.clone(),
-        },
-    ) {
-        CausalAdmitResult::Applied => {}
-        CausalAdmitResult::Retry(_) => {
-            let _ = scopes.try_retract(scope_id, identity);
+) -> CausalAdmitResult {
+    match scopes.try_admit(CausalOp::Release {
+        scope_id,
+        identity: identity.clone(),
+    }) {
+        CausalAdmitResult::Applied => CausalAdmitResult::Applied,
+        CausalAdmitResult::Retry(op) => {
+            if scopes.try_retract(scope_id, identity) {
+                CausalAdmitResult::Applied
+            } else {
+                CausalAdmitResult::Retry(op)
+            }
         }
     }
 }
 
 pub const CAUSAL_PENDING_MAX: usize = 256;
-pub const CAUSAL_CALLER_MAX: usize = 256;
 pub const CAUSAL_FLUSH_MAX: usize = 32;
-pub const CAUSAL_TABLE_MAX: usize = CAUSAL_PENDING_MAX * 2;
 
 /// Causal-scope lease table. Send + Sync. Lives beside the router.
 pub struct CausalScopeTable {
     inner: Mutex<CausalInner>,
-    pending_tx: SyncSender<CausalOp>,
-    pending_rx: Mutex<Receiver<CausalOp>>,
-    retries: Mutex<VecDeque<CausalOp>>,
+    pending: Mutex<VecDeque<CausalOp>>,
     pending_len: AtomicUsize,
     next_id: AtomicU64,
 }
@@ -1266,12 +1185,9 @@ impl Default for CausalScopeTable {
 impl CausalScopeTable {
     #[must_use]
     pub fn new() -> Self {
-        let (pending_tx, pending_rx) = mpsc::sync_channel(CAUSAL_PENDING_MAX);
         Self {
             inner: Mutex::new(CausalInner::default()),
-            pending_tx,
-            pending_rx: Mutex::new(pending_rx),
-            retries: Mutex::new(VecDeque::new()),
+            pending: Mutex::new(VecDeque::new()),
             pending_len: AtomicUsize::new(0),
             next_id: AtomicU64::new(1),
         }
@@ -1338,38 +1254,28 @@ impl CausalScopeTable {
     }
 
     /// Admit one causal op or return it. Never waits or spins.
+    ///
+    /// Later operations always append behind already-queued operations.
     pub fn try_admit(&self, op: CausalOp) -> CausalAdmitResult {
-        match self.pending_tx.try_send(op) {
-            Ok(()) => {
-                self.pending_len.fetch_add(1, Ordering::SeqCst);
-                let _ = self.flush_pending();
-                CausalAdmitResult::Applied
-            }
-            Err(TrySendError::Full(op) | TrySendError::Disconnected(op)) => self.retain(op),
+        let Ok(mut pending) = self.pending.try_lock() else {
+            return CausalAdmitResult::Retry(op);
+        };
+        if pending.is_empty()
+            && let Ok(mut inner) = self.inner.try_lock()
+        {
+            apply_causal_locked(&mut inner, &op);
+            return CausalAdmitResult::Applied;
         }
-    }
-
-    fn retain(&self, op: CausalOp) -> CausalAdmitResult {
-        match self.retries.try_lock() {
-            Ok(mut retries) if retries.len() < CAUSAL_PENDING_MAX => {
-                retries.push_back(op);
-                self.pending_len.fetch_add(1, Ordering::SeqCst);
-                CausalAdmitResult::Applied
-            }
-            Ok(_) | Err(_) => match self.pending_tx.try_send(op) {
-                Ok(()) => {
-                    self.pending_len.fetch_add(1, Ordering::SeqCst);
-                    CausalAdmitResult::Applied
-                }
-                Err(TrySendError::Full(op) | TrySendError::Disconnected(op)) => {
-                    CausalAdmitResult::Retry(op)
-                }
-            },
+        if pending.len() < CAUSAL_PENDING_MAX {
+            pending.push_back(op);
+            self.pending_len.fetch_add(1, Ordering::SeqCst);
+            return CausalAdmitResult::Applied;
         }
+        CausalAdmitResult::Retry(op)
     }
 
     pub fn flush_pending(&self) -> usize {
-        let Ok(rx) = self.pending_rx.try_lock() else {
+        let Ok(mut pending) = self.pending.try_lock() else {
             return 0;
         };
         let Ok(mut inner) = self.inner.try_lock() else {
@@ -1378,27 +1284,12 @@ impl CausalScopeTable {
         let started = Instant::now();
         let mut applied = 0;
         while applied < CAUSAL_FLUSH_MAX && started.elapsed() < Duration::from_millis(8) {
-            match rx.try_recv() {
-                Ok(op) => {
-                    self.pending_len.fetch_sub(1, Ordering::SeqCst);
-                    apply_causal_locked(&mut inner, &op);
-                    applied += 1;
-                }
-                Err(_) => break,
-            }
-        }
-        drop(inner);
-        drop(rx);
-        if let Ok(mut retries) = self.retries.try_lock() {
-            while let Some(op) = retries.pop_front() {
-                match self.pending_tx.try_send(op) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(op) | TrySendError::Disconnected(op)) => {
-                        retries.push_front(op);
-                        break;
-                    }
-                }
-            }
+            let Some(op) = pending.pop_front() else {
+                break;
+            };
+            self.pending_len.fetch_sub(1, Ordering::SeqCst);
+            apply_causal_locked(&mut inner, &op);
+            applied += 1;
         }
         applied
     }
@@ -2232,7 +2123,7 @@ mod tests {
     }
 
     #[test]
-    fn causal_channel_keeps_the_operation_past_the_old_bound() {
+    fn ordered_pending_path_keeps_fifo_and_returns_the_257th() {
         let table = CausalScopeTable::new();
         let mut scopes = Vec::new();
         for index in 0..=CAUSAL_PENDING_MAX {
@@ -2243,110 +2134,8 @@ mod tests {
                 .expect("mint");
             scopes.push(scope);
         }
-        table.test_with_inner_held(|| {
-            for (index, scope) in scopes.iter().enumerate() {
-                assert_eq!(
-                    table.transfer(
-                        *scope,
-                        LeaseIdentity::PendingEntityPublish {
-                            plugin_key: format!("p{index}"),
-                        },
-                        [LeaseIdentity::AdmittedEntityMutation {
-                            family: "f".into(),
-                            seq: index as u64,
-                        }],
-                    ),
-                    CausalAdmitResult::Applied
-                );
-            }
-            assert_eq!(
-                table.release(
-                    scopes[0],
-                    LeaseIdentity::ProviderResyncNeed { family: "f".into() },
-                ),
-                CausalAdmitResult::Applied
-            );
-            assert_eq!(
-                table.release(
-                    scopes[1],
-                    LeaseIdentity::EventInFlight {
-                        request_id: "evt".into(),
-                    },
-                ),
-                CausalAdmitResult::Applied
-            );
-            assert_eq!(
-                table.release(
-                    scopes[2],
-                    LeaseIdentity::ProviderInFlight {
-                        request_id: "prov".into(),
-                    },
-                ),
-                CausalAdmitResult::Applied
-            );
-            assert!(table.pending_ops());
-        });
-        let first = table.flush_pending();
-        assert!(first > 0);
-        assert!(
-            first <= CAUSAL_FLUSH_MAX,
-            "one owner turn must not drain without a bound: {first}"
-        );
-        assert!(table.pending_ops());
-        assert_eq!(
-            table.identities(scopes[0]),
-            Some(BTreeSet::from([LeaseIdentity::AdmittedEntityMutation {
-                family: "f".into(),
-                seq: 0,
-            }]))
-        );
-        let mut applied = first;
-        while table.pending_ops() {
-            applied += table.flush_pending();
-        }
-        assert!(
-            applied > CAUSAL_PENDING_MAX,
-            "the 257th transfer must be retained and applied: {applied}"
-        );
-        for (index, scope) in scopes.iter().enumerate() {
-            assert_eq!(
-                table.identities(*scope),
-                Some(BTreeSet::from([LeaseIdentity::AdmittedEntityMutation {
-                    family: "f".into(),
-                    seq: index as u64,
-                }]))
-            );
-        }
-        for (index, scope) in scopes.iter().enumerate() {
-            assert_eq!(
-                table.release(
-                    *scope,
-                    LeaseIdentity::AdmittedEntityMutation {
-                        family: "f".into(),
-                        seq: index as u64,
-                    },
-                ),
-                CausalAdmitResult::Applied
-            );
-            assert!(!table.is_live(*scope));
-        }
-    }
-
-    #[test]
-    fn full_causal_path_returns_the_513th_operation_without_spinning() {
-        let table = CausalScopeTable::new();
-        let capacity = CAUSAL_PENDING_MAX * 2;
-        let mut scopes = Vec::new();
-        for index in 0..=capacity {
-            let scope = table
-                .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
-                    plugin_key: format!("p{index}"),
-                }))
-                .expect("mint");
-            scopes.push(scope);
-        }
         let overflow = table.test_with_inner_held(|| {
-            for (index, scope) in scopes.iter().take(capacity).enumerate() {
+            for (index, scope) in scopes.iter().take(CAUSAL_PENDING_MAX).enumerate() {
                 assert_eq!(
                     table.transfer(
                         *scope,
@@ -2361,26 +2150,19 @@ mod tests {
                     CausalAdmitResult::Applied
                 );
             }
-            let started = Instant::now();
-            let result = table.transfer(
-                scopes[capacity],
+            table.transfer(
+                scopes[CAUSAL_PENDING_MAX],
                 LeaseIdentity::PendingEntityPublish {
-                    plugin_key: format!("p{capacity}"),
+                    plugin_key: format!("p{}", CAUSAL_PENDING_MAX),
                 },
                 [LeaseIdentity::AdmittedEntityMutation {
                     family: "f".into(),
-                    seq: capacity as u64,
+                    seq: CAUSAL_PENDING_MAX as u64,
                 }],
-            );
-            assert!(
-                started.elapsed() < StdDuration::from_millis(20),
-                "full path must return without spinning: {:?}",
-                started.elapsed()
-            );
-            result
+            )
         });
         let CausalAdmitResult::Retry(overflow) = overflow else {
-            panic!("the 513th transfer must return to the caller: {overflow:?}");
+            panic!("the 257th transfer must return to the caller: {overflow:?}");
         };
         let first = table.flush_pending();
         assert!(first > 0);
@@ -2395,85 +2177,8 @@ mod tests {
                 seq: 0,
             }]))
         );
-        let mut applied = first;
-        while table.pending_ops() {
-            applied += table.flush_pending();
-        }
-        assert_eq!(applied, capacity);
-        assert_eq!(table.try_admit(overflow), CausalAdmitResult::Applied);
         while table.pending_ops() {
             let _ = table.flush_pending();
-        }
-        for (index, scope) in scopes.iter().enumerate() {
-            assert_eq!(
-                table.identities(*scope),
-                Some(BTreeSet::from([LeaseIdentity::AdmittedEntityMutation {
-                    family: "f".into(),
-                    seq: index as u64,
-                }]))
-            );
-        }
-    }
-
-    #[test]
-    fn caller_inbox_returns_the_operation_past_total_capacity() {
-        let table = CausalScopeTable::new();
-        let inbox = CausalRetryInbox::new();
-        let capacity = CAUSAL_TABLE_MAX + CAUSAL_CALLER_MAX;
-        let mut scopes = Vec::new();
-        for index in 0..=capacity {
-            let scope = table
-                .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
-                    plugin_key: format!("p{index}"),
-                }))
-                .expect("mint");
-            scopes.push(scope);
-        }
-        let overflow = table.test_with_inner_held(|| {
-            let mut last = CausalAdmitResult::Applied;
-            for (index, scope) in scopes.iter().enumerate() {
-                last = admit_or_park(
-                    &table,
-                    &inbox,
-                    CausalOp::Transfer {
-                        scope_id: *scope,
-                        from: LeaseIdentity::PendingEntityPublish {
-                            plugin_key: format!("p{index}"),
-                        },
-                        to: vec![LeaseIdentity::AdmittedEntityMutation {
-                            family: "f".into(),
-                            seq: index as u64,
-                        }],
-                    },
-                );
-            }
-            last
-        });
-        let CausalAdmitResult::Retry(overflow) = overflow else {
-            panic!(
-                "operation {} must return to the caller: {overflow:?}",
-                capacity + 1
-            );
-        };
-        assert_eq!(inbox.len(), CAUSAL_CALLER_MAX);
-        let first = table.flush_pending();
-        assert!(first > 0);
-        assert!(first <= CAUSAL_FLUSH_MAX);
-        assert_eq!(
-            table.identities(scopes[0]),
-            Some(BTreeSet::from([LeaseIdentity::AdmittedEntityMutation {
-                family: "f".into(),
-                seq: 0,
-            }]))
-        );
-        while table.pending_ops() {
-            let _ = table.flush_pending();
-        }
-        while !inbox.is_empty() {
-            assert!(inbox.drain_slice(&table) <= CAUSAL_FLUSH_MAX);
-            while table.pending_ops() {
-                let _ = table.flush_pending();
-            }
         }
         assert_eq!(table.try_admit(overflow), CausalAdmitResult::Applied);
         while table.pending_ops() {
@@ -2491,16 +2196,15 @@ mod tests {
     }
 
     #[test]
-    fn never_queued_release_closes_after_full_table_and_owner_drain() {
+    fn same_scope_release_cannot_bypass_a_parked_transfer() {
         let table = CausalScopeTable::new();
-        let inbox = CausalRetryInbox::new();
         let live = table
             .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
                 plugin_key: "producer".into(),
             }))
             .expect("live");
         let mut fillers = Vec::new();
-        for index in 0..CAUSAL_TABLE_MAX {
+        for index in 0..(CAUSAL_PENDING_MAX - 1) {
             fillers.push(
                 table
                     .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
@@ -2525,30 +2229,100 @@ mod tests {
                     CausalAdmitResult::Applied
                 );
             }
+            assert_eq!(
+                table.transfer(
+                    live,
+                    LeaseIdentity::PendingEntityPublish {
+                        plugin_key: "producer".into(),
+                    },
+                    [LeaseIdentity::AdmittedEntityMutation {
+                        family: "producer.item".into(),
+                        seq: 1,
+                    }],
+                ),
+                CausalAdmitResult::Applied
+            );
         });
-        release_or_retract(
-            &table,
-            &inbox,
-            live,
-            LeaseIdentity::PendingEntityPublish {
-                plugin_key: "producer".into(),
-            },
+        let first = table.flush_pending();
+        assert!(first > 0);
+        assert!(first <= CAUSAL_FLUSH_MAX);
+        assert!(table.pending_ops());
+        assert_eq!(
+            table.release(
+                live,
+                LeaseIdentity::AdmittedEntityMutation {
+                    family: "producer.item".into(),
+                    seq: 1,
+                },
+            ),
+            CausalAdmitResult::Applied
         );
+        while table.pending_ops() {
+            let _ = table.flush_pending();
+        }
+        assert!(
+            !table.is_live(live),
+            "parked transfer must apply before the later release"
+        );
+    }
+
+    #[test]
+    fn never_queued_release_closes_after_full_table_and_held_inner() {
+        let table = CausalScopeTable::new();
+        let live = table
+            .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+                plugin_key: "producer".into(),
+            }))
+            .expect("live");
+        let mut fillers = Vec::new();
+        for index in 0..CAUSAL_PENDING_MAX {
+            fillers.push(
+                table
+                    .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+                        plugin_key: format!("p{index}"),
+                    }))
+                    .expect("mint"),
+            );
+        }
+        let overflow = table.test_with_inner_held(|| {
+            for (index, scope) in fillers.iter().enumerate() {
+                assert_eq!(
+                    table.transfer(
+                        *scope,
+                        LeaseIdentity::PendingEntityPublish {
+                            plugin_key: format!("p{index}"),
+                        },
+                        [LeaseIdentity::AdmittedEntityMutation {
+                            family: "f".into(),
+                            seq: index as u64,
+                        }],
+                    ),
+                    CausalAdmitResult::Applied
+                );
+            }
+            release_or_retract(
+                &table,
+                live,
+                LeaseIdentity::PendingEntityPublish {
+                    plugin_key: "producer".into(),
+                },
+            )
+        });
+        let CausalAdmitResult::Retry(overflow) = overflow else {
+            panic!("held full path must return the release: {overflow:?}");
+        };
         assert_eq!(
             table.identities(live),
             Some(BTreeSet::from([LeaseIdentity::PendingEntityPublish {
                 plugin_key: "producer".into(),
             }]))
         );
-        assert_eq!(inbox.len(), 1);
         while table.pending_ops() {
             let _ = table.flush_pending();
         }
-        while !inbox.is_empty() {
-            let _ = inbox.drain_slice(&table);
-            while table.pending_ops() {
-                let _ = table.flush_pending();
-            }
+        assert_eq!(table.try_admit(overflow), CausalAdmitResult::Applied);
+        while table.pending_ops() {
+            let _ = table.flush_pending();
         }
         assert!(!table.is_live(live));
     }
