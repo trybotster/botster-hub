@@ -300,6 +300,7 @@ pub struct PackageEntityFamilyState {
     pub pending_by_seq: BTreeMap<u64, PackageEntityMutation>,
     pub pending_leases: BTreeMap<u64, EntityMutationLease>,
     pub resync: PackageEntityResyncState,
+    pub unloading: bool,
 }
 
 impl PackageEntityFamilyState {
