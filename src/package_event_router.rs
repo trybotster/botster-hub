@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
@@ -1117,12 +1117,15 @@ pub enum CausalOp {
     },
 }
 
-const CAUSAL_PENDING_MAX: usize = 256;
+/// Lease transfer/release cannot shed. The ordered path is an unbounded
+/// channel so a required ownership change is never consumed by a full send.
+#[cfg(test)]
+pub const CAUSAL_PENDING_MAX: usize = 256;
 
 /// Causal-scope lease table. Send + Sync. Lives beside the router.
 pub struct CausalScopeTable {
     inner: Mutex<CausalInner>,
-    pending_tx: SyncSender<CausalOp>,
+    pending_tx: Sender<CausalOp>,
     pending_rx: Mutex<Receiver<CausalOp>>,
     pending_len: AtomicUsize,
     next_id: AtomicU64,
@@ -1157,7 +1160,7 @@ impl Default for CausalScopeTable {
 impl CausalScopeTable {
     #[must_use]
     pub fn new() -> Self {
-        let (pending_tx, pending_rx) = mpsc::sync_channel(CAUSAL_PENDING_MAX);
+        let (pending_tx, pending_rx) = mpsc::channel();
         Self {
             inner: Mutex::new(CausalInner::default()),
             pending_tx,
@@ -1219,7 +1222,7 @@ impl CausalScopeTable {
     }
 
     fn apply_or_queue(&self, op: CausalOp) -> OwnerApplyResult {
-        if self.pending_tx.try_send(op).is_err() {
+        if self.pending_tx.send(op).is_err() {
             return OwnerApplyResult::WouldBlock;
         }
         self.pending_len.fetch_add(1, Ordering::SeqCst);
@@ -2069,6 +2072,91 @@ mod tests {
         assert_eq!(table.flush_pending(), 2);
         assert!(!table.pending_ops());
         assert!(!table.is_live(scope));
+    }
+
+    #[test]
+    fn causal_channel_keeps_the_operation_past_the_old_bound() {
+        let table = CausalScopeTable::new();
+        let mut scopes = Vec::new();
+        for index in 0..=CAUSAL_PENDING_MAX {
+            let scope = table
+                .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+                    plugin_key: format!("p{index}"),
+                }))
+                .expect("mint");
+            scopes.push(scope);
+        }
+        table.test_with_inner_held(|| {
+            for (index, scope) in scopes.iter().enumerate() {
+                assert_eq!(
+                    table.transfer(
+                        *scope,
+                        LeaseIdentity::PendingEntityPublish {
+                            plugin_key: format!("p{index}"),
+                        },
+                        [LeaseIdentity::AdmittedEntityMutation {
+                            family: "f".into(),
+                            seq: index as u64,
+                        }],
+                    ),
+                    OwnerApplyResult::Applied
+                );
+            }
+            assert_eq!(
+                table.release(
+                    scopes[0],
+                    LeaseIdentity::ProviderResyncNeed { family: "f".into() },
+                ),
+                OwnerApplyResult::Applied
+            );
+            assert_eq!(
+                table.release(
+                    scopes[1],
+                    LeaseIdentity::EventInFlight {
+                        request_id: "evt".into(),
+                    },
+                ),
+                OwnerApplyResult::Applied
+            );
+            assert_eq!(
+                table.release(
+                    scopes[2],
+                    LeaseIdentity::ProviderInFlight {
+                        request_id: "prov".into(),
+                    },
+                ),
+                OwnerApplyResult::Applied
+            );
+            assert!(table.pending_ops());
+        });
+        let applied = table.flush_pending();
+        assert!(
+            applied > CAUSAL_PENDING_MAX,
+            "the 257th transfer must survive: applied {applied}"
+        );
+        assert!(!table.pending_ops());
+        for (index, scope) in scopes.iter().enumerate() {
+            assert_eq!(
+                table.identities(*scope),
+                Some(BTreeSet::from([LeaseIdentity::AdmittedEntityMutation {
+                    family: "f".into(),
+                    seq: index as u64,
+                }]))
+            );
+        }
+        for (index, scope) in scopes.iter().enumerate() {
+            assert_eq!(
+                table.release(
+                    *scope,
+                    LeaseIdentity::AdmittedEntityMutation {
+                        family: "f".into(),
+                        seq: index as u64,
+                    },
+                ),
+                OwnerApplyResult::Applied
+            );
+            assert!(!table.is_live(*scope));
+        }
     }
 
     #[test]
