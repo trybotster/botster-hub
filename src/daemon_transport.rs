@@ -7960,52 +7960,21 @@ mod tests {
         let data_directory = unique_package_control_dir("shutdown-reset-nonfinal");
         let stop_path = data_directory.join("stop-mmm-target");
         let ready_path = data_directory.join("ready-mmm-target");
-        std::fs::create_dir_all(&data_directory).expect("create fixture directory");
-        let mut runtime = crate::HubRuntime::new(package_control_config(data_directory.clone()));
-        let api = crate::HubClientApi::local_operator("shutdown-reset-operator");
-        let packages = crate::PackageRegistry::new(std::collections::BTreeSet::new());
-        let mut clock = 1_u64;
+        let mut owned = OwnedSessionRuntime::new(data_directory);
         for index in 0..32 {
-            api.handle_request(
-                &mut runtime,
-                &packages,
-                crate::HubClientRequest::Spawn {
-                    request_id: RequestId(format!("spawn-aaa-{index:02}")),
-                    session_id: SessionId(format!("aaa-{index:02}")),
-                    command: "sleep 30".to_string(),
-                    now_seconds: tick(&mut clock),
-                },
-            )
-            .expect("spawn earlier pad");
+            owned.spawn(&format!("aaa-{index:02}"), "sleep 30".to_string());
         }
         for index in 0..32 {
-            api.handle_request(
-                &mut runtime,
-                &packages,
-                crate::HubClientRequest::Spawn {
-                    request_id: RequestId(format!("spawn-zzz-{index:02}")),
-                    session_id: SessionId(format!("zzz-{index:02}")),
-                    command: "sleep 30".to_string(),
-                    now_seconds: tick(&mut clock),
-                },
-            )
-            .expect("spawn later pad");
+            owned.spawn(&format!("zzz-{index:02}"), "sleep 30".to_string());
         }
         let stop = stop_path.display().to_string();
         let ready = ready_path.display().to_string();
-        api.handle_request(
-            &mut runtime,
-            &packages,
-            crate::HubClientRequest::Spawn {
-                request_id: RequestId("spawn-mmm-target".to_string()),
-                session_id: SessionId("mmm-target".to_string()),
-                command: format!(
-                    "printf x > '{ready}'; while [ ! -f '{stop}' ]; do sleep 0.05; done; rm -f '{ready}'"
-                ),
-                now_seconds: tick(&mut clock),
-            },
-        )
-        .expect("spawn nonfinal target");
+        owned.spawn(
+            "mmm-target",
+            format!(
+                "printf x > '{ready}'; while [ ! -f '{stop}' ]; do sleep 0.05; done; rm -f '{ready}'"
+            ),
+        );
         let spawn_deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < spawn_deadline {
             if ready_path.exists() {
@@ -8017,7 +7986,7 @@ mod tests {
 
         let mut walk = crate::runtime::SessionLifecycleWalk::default();
         let first = classify_shutdown_session(
-            &mut runtime,
+            &mut owned.runtime,
             "mmm-target",
             Instant::now() + Duration::from_secs(1),
             &mut walk,
@@ -8046,15 +8015,15 @@ mod tests {
         );
         let screen_deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < screen_deadline {
-            let _ = runtime.read_screen(
+            let _ = owned.runtime.read_screen(
                 RequestId("reset-proof-screen".to_string()),
                 SessionId("mmm-target".to_string()),
-                tick(&mut clock),
+                tick(&mut owned.clock),
             );
             thread::sleep(Duration::from_millis(25));
         }
 
-        let listed = runtime.list_sessions().expect("list after exit");
+        let listed = owned.runtime.list_sessions().expect("list after exit");
         let registry = listed
             .iter()
             .find(|session| session.session_id.0 == "mmm-target");
@@ -8065,7 +8034,7 @@ mod tests {
         );
 
         let frozen = classify_shutdown_session(
-            &mut runtime,
+            &mut owned.runtime,
             "mmm-target",
             Instant::now() + Duration::from_secs(1),
             &mut walk,
@@ -8077,11 +8046,11 @@ mod tests {
         );
 
         let response = recover_after_core_shutdown_error(
-            &mut runtime,
+            &mut owned.runtime,
             "mmm-target",
             walk,
             shutdown_runtime_error(crate::HubClientRuntimeErrorKind::Runtime),
-            &mut clock,
+            &mut owned.clock,
         )
         .expect("production recover after Core Runtime error");
         assert_eq!(response.kind, DaemonResponseKind::SessionCleanup);
@@ -8638,6 +8607,79 @@ mod tests {
             .join("package-control")
             .join(name)
             .join(nanos.to_string())
+    }
+
+    struct OwnedSessionRuntime {
+        runtime: crate::HubRuntime,
+        session_ids: Vec<SessionId>,
+        data_directory: PathBuf,
+        clock: u64,
+    }
+
+    impl OwnedSessionRuntime {
+        fn new(data_directory: PathBuf) -> Self {
+            std::fs::create_dir_all(&data_directory).expect("create fixture directory");
+            Self {
+                runtime: crate::HubRuntime::new(package_control_config(data_directory.clone())),
+                session_ids: Vec::new(),
+                data_directory,
+                clock: 1,
+            }
+        }
+
+        fn spawn(&mut self, session_id: &str, command: String) {
+            let id = SessionId(session_id.to_string());
+            crate::HubClientApi::local_operator("shutdown-reset-operator")
+                .handle_request(
+                    &mut self.runtime,
+                    &crate::PackageRegistry::new(std::collections::BTreeSet::new()),
+                    crate::HubClientRequest::Spawn {
+                        request_id: RequestId(format!("spawn-{session_id}")),
+                        session_id: id.clone(),
+                        command,
+                        now_seconds: tick(&mut self.clock),
+                    },
+                )
+                .unwrap_or_else(|error| panic!("spawn {session_id}: {error:?}"));
+            self.session_ids.push(id);
+        }
+
+        fn retire_owned_sessions(&mut self) {
+            let pids: Vec<u32> = self
+                .runtime
+                .list_sessions()
+                .into_iter()
+                .flatten()
+                .filter_map(|session| session.process.and_then(|process| process.pid))
+                .collect();
+            for pid in &pids {
+                let _ = std::process::Command::new("kill")
+                    .args(["-TERM", &pid.to_string()])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+            for session_id in self.session_ids.drain(..) {
+                let _ = self
+                    .runtime
+                    .shutdown_session(session_id.clone(), tick(&mut self.clock));
+                let _ = self.runtime.remove_terminal_session(&session_id);
+            }
+            for pid in pids {
+                let _ = std::process::Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+            let _ = std::fs::remove_dir_all(&self.data_directory);
+        }
+    }
+
+    impl Drop for OwnedSessionRuntime {
+        fn drop(&mut self) {
+            self.retire_owned_sessions();
+        }
     }
 
     fn package_control_config(data_directory: PathBuf) -> crate::HubConfig {
