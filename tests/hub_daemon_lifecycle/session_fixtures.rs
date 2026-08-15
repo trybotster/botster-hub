@@ -286,30 +286,51 @@ pub(crate) fn collect_attach_events(
                 subscription_id,
             ))
             .expect("drain");
-        events.extend(drain.events);
-        let attached = events.iter().any(|event| {
-            matches!(
+        assert!(
+            drain.events.iter().all(|event| !matches!(
                 event,
-                botster_hub_client::DaemonEvent::AttachState {
-                    subscription_id: sub,
-                    state,
-                    ..
-                } if sub == subscription_id && state == "attached"
-            )
-        });
+                botster_hub_client::DaemonEvent::AttachState { .. }
+                    | botster_hub_client::DaemonEvent::Snapshot { .. }
+                    | botster_hub_client::DaemonEvent::Scrollback { .. }
+                    | botster_hub_client::DaemonEvent::TerminalOutput { .. }
+                    | botster_hub_client::DaemonEvent::ProcessExit { .. }
+            )),
+            "host Drain must not return terminal bodies: {:?}",
+            drain.events
+        );
+        events.extend(connection.take_skipped_events());
+        for envelope in connection.take_skipped_terminal() {
+            if let Ok(bytes) = envelope.payload_bytes() {
+                if let Ok(event) = serde_json::from_slice::<botster_hub_client::DaemonEvent>(&bytes)
+                {
+                    events.push(event);
+                } else {
+                    events.push(botster_hub_client::DaemonEvent::TerminalOutput {
+                        session_id: session_id.to_string(),
+                        subscription_id: subscription_id.to_string(),
+                        payload: botster_hub_client::DaemonLiveOutputPayload::from_bytes(&bytes),
+                    });
+                }
+            }
+        }
         let saw_live = until_live_marker.is_none_or(|marker| {
             events.iter().any(|event| {
                 matches!(
                     event,
                     botster_hub_client::DaemonEvent::TerminalOutput {
-                        subscription_id: sub,
                         payload,
                         ..
-                    } if sub == subscription_id && live_output_contains(payload, marker)
+                    } if live_output_contains(payload, marker)
                 )
-            })
+            }) || connection
+                .request(&botster_hub_client::DaemonRequest::ReadScreen {
+                    session_id: session_id.to_string(),
+                })
+                .ok()
+                .and_then(|response| response.read_screen)
+                .is_some_and(|screen| screen.text.contains(marker))
         });
-        if attached && saw_live {
+        if saw_live {
             break;
         }
         thread::sleep(Duration::from_millis(30));

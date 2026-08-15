@@ -887,7 +887,7 @@ fn webrtc_terminal_adapter_write_budget_emits_core_adapter_closed_while_peer_sta
         .expect("sibling input");
         let sibling_deadline = Instant::now() + Duration::from_secs(8);
         while Instant::now() < sibling_deadline
-            && !webrtc_terminal_contains(&peer.pending_terminal_frames, "echo:wwb-sibling-live")
+            && !webrtc_terminal_contains(&peer.pending_terminal_frames, "wwb-sibling-live")
         {
             if let Ok(Ok(bytes)) =
                 timeout(Duration::from_millis(200), peer.next_terminal_frame(&key)).await
@@ -897,7 +897,7 @@ fn webrtc_terminal_adapter_write_budget_emits_core_adapter_closed_while_peer_sta
             }
         }
         assert!(
-            webrtc_terminal_contains(&peer.pending_terminal_frames, "echo:wwb-sibling-live"),
+            webrtc_terminal_contains(&peer.pending_terminal_frames, "wwb-sibling-live"),
             "sibling daemon_terminal_frame must continue: {:?}",
             peer.pending_terminal_frames
                 .iter()
