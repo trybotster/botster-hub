@@ -31,7 +31,8 @@ use serde_json::json;
 use crate::capabilities::{HubCapabilityRuntime, PluginStoreBatchMutation, PluginStoreBatchResult};
 use crate::lifecycle::{HubPluginEventHandler, HubPluginRuntimeBundle, package_entity_owner_token};
 use crate::package_event_router::{
-    CausalScopeTable, EventPlaneStatus, LeaseIdentity, PackageEventRouter,
+    CausalRetryInbox, CausalScopeTable, EventPlaneStatus, LeaseIdentity, PackageEventRouter,
+    release_or_retract,
 };
 use crate::packages::{PackageConfigurationView, PackageRecord, PreparedLocalPackage};
 use crate::runtime::{SharedSessionTypeSpawner, SharedSpawnTargets, SharedWorktrees};
@@ -70,6 +71,7 @@ pub struct HubEntityPublishBridge {
     owner_thread: thread::ThreadId,
     pending: Arc<Mutex<VecDeque<PendingEntityPublishRequest>>>,
     next_token: Arc<AtomicU64>,
+    reject_next: Arc<AtomicBool>,
 }
 
 impl HubEntityPublishBridge {
@@ -78,7 +80,13 @@ impl HubEntityPublishBridge {
             owner_thread: thread::current().id(),
             pending: Arc::new(Mutex::new(VecDeque::new())),
             next_token: Arc::new(AtomicU64::new(1)),
+            reject_next: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    #[doc(hidden)]
+    pub fn reject_next_publish(&self) {
+        self.reject_next.store(true, Ordering::SeqCst);
     }
 
     fn publish(
@@ -87,6 +95,11 @@ impl HubEntityPublishBridge {
         frame: serde_json::Value,
         scope_id: Option<u64>,
     ) -> Result<crate::package_entity_fanout::PackageEntityPublishResult, EntityPublishError> {
+        if self.reject_next.swap(false, Ordering::SeqCst) {
+            return Err(EntityPublishError::NeverQueued(
+                "entity publish rejected before queue".to_string(),
+            ));
+        }
         if thread::current().id() == self.owner_thread {
             return Err(EntityPublishError::NeverQueued(
                 "botster.entity_publish is only available during handler invocation, not at plugin load"
@@ -274,6 +287,7 @@ struct LuaHostApi {
     package_records: Vec<PackageRecord>,
     package_event_router: Arc<PackageEventRouter>,
     causal_scopes: Arc<CausalScopeTable>,
+    causal_retries: Arc<CausalRetryInbox>,
 }
 
 /// Shared hub-owned primitives exposed to one Lua plugin runtime.
@@ -287,6 +301,7 @@ pub struct LuaPluginHostApi {
     pub worktrees: SharedWorktrees,
     pub package_event_router: Arc<PackageEventRouter>,
     pub causal_scopes: Arc<CausalScopeTable>,
+    pub causal_retries: Arc<CausalRetryInbox>,
 }
 
 /// Real Lua runtime for one loaded plugin package.
@@ -321,6 +336,7 @@ impl LuaPluginRuntime {
             package_records,
             package_event_router: api.package_event_router,
             causal_scopes: api.causal_scopes,
+            causal_retries: api.causal_retries,
         };
         let loaded = LoadedLuaPlugin::load(plugin_key.clone(), selected_entrypoint_path, host_api)?;
         Ok(HubPluginRuntimeBundle {
@@ -889,6 +905,7 @@ fn install_botster_api(
             plugin_key,
             host_api.entity_publish,
             host_api.causal_scopes,
+            host_api.causal_retries,
         )?,
     )?;
     globals.set("botster", botster)?;
@@ -900,6 +917,7 @@ fn entity_publish_function(
     plugin_key: PluginKey,
     bridge: HubEntityPublishBridge,
     scopes: Arc<CausalScopeTable>,
+    retries: Arc<CausalRetryInbox>,
 ) -> Result<Function, mlua::Error> {
     lua.create_function(move |lua, args: Value| {
         let value = lua.from_value::<serde_json::Value>(args)?;
@@ -928,7 +946,9 @@ fn entity_publish_function(
             }
             Err(EntityPublishError::NeverQueued(error)) => {
                 if let Some(scope_id) = scope_id {
-                    let _ = scopes.release(
+                    release_or_retract(
+                        &scopes,
+                        &retries,
                         scope_id,
                         LeaseIdentity::PendingEntityPublish {
                             plugin_key: plugin_key.0.clone(),
