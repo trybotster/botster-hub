@@ -637,6 +637,10 @@ pub(super) fn drive_package_entity_fanout(daemon: &mut HubDaemon, state: &mut Da
         return;
     }
     for item in mutations {
+        if item.finish_only {
+            runtime.finish_package_entity_mutation_fanout(&item, item.scheduled_resync);
+            continue;
+        }
         let mutation = &item.mutation;
         state.lifecycle_counters.package_entity_publish_accepted = state
             .lifecycle_counters
