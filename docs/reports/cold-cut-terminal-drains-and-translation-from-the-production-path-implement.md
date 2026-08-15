@@ -14,7 +14,7 @@ Plan: `docs/plans/cold-cut-terminal-drains-and-translation-from-the-production-p
 | Worktree HEAD before edits | `959c58f55726d098299cced8af151d8f496f41e3` |
 | Locked Core SHA | `aef6516d5809d563961ed7fdd07da29a7b4edddc` |
 | Merge policy | direct into `main`; no PR |
-| Review follow-up | `review_1786785734_421865` on `d9e3e12` |
+| Review follow-up | `review_1786786926_291745` on `b77ffae` |
 
 Independent routing matched the approved plan. This run did not infer the repository from the ambient directory.
 
@@ -132,9 +132,14 @@ Review `review_1786785734_421865` required one follow-up on `d9e3e12`:
 This visit:
 
 - `ShutdownSession` observes a bounded lifecycle slice before classify.
-- If Core shutdown fails, Hub observes again and returns `SessionCleanup`. If classify is still `Active`, the outcome is `already_exited`.
-- The path does not call Core terminal Drain.
-- `external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup` repeats the live WebRTC write-then-exit, extra `ReadScreen`, peer-close, host `ShutdownSession` sequence five times. It accepts `Events` or `SessionCleanup` and rejects `OperatorError`.
+- If Core shutdown fails, Hub observes again on a fresh clock tick.
+- `SessionCleanup` is returned only when the second classify is `Cleanup`, or when the error is `HubClientRuntimeErrorKind::UnknownSession` (`SessionNotFound` maps to that kind).
+- If classify remains `Active` and the error is `Runtime` or `State`, Hub returns the original `OperatorError` and does not suppress route close events.
+- Deterministic unit tests cover both branches. `shutdown_after_observed_exit_returns_session_cleanup` waits for owner-loop `exited` and requires `SessionCleanup`.
+
+Review `review_1786786926_291745` required one follow-up on `b77ffae`:
+
+- `finding_1786786926_247494` — do not report an Active-session `Runtime` or `State` shutdown failure as `already_exited`.
 
 ## Runtime-teardown lenses
 
@@ -163,12 +168,12 @@ Passed on this tree:
 - Session-worker locked build
 - rustfmt
 - strict clippy
-- Hub lib tests: 270 passed, including fail-closed local Attach, negative architecture scan, WebRTC bind/peer-loss/fail-closed sibling, one-line `#[cfg(test)]` scan controls, and `early_session_subscription_waits_for_complete_paged_projection`
+- Hub lib tests: 274 passed, including fail-closed local Attach, negative architecture scan, WebRTC bind/peer-loss/fail-closed sibling, one-line `#[cfg(test)]` scan controls, and `early_session_subscription_waits_for_complete_paged_projection`
 - `hub_client_api_test`: 34 passed, including `session_entity_subscription_returns_a_bounded_page_not_a_complete_baseline`
 - IsolatedHub Unix always-bind, empty Attach, host Drain empty, ReadScreen marker, replacement-owner
 - Lifecycle oracles rewritten off Attach/Drain translation: mux frames, `ReadScreen`, host OperatorError, session-entity patches
-- `hub_daemon_lifecycle_test`: 203 passed, 1 ignored (larger local many-PTY)
-- Full `./test.sh --locked` workspace: all binaries ok (lifecycle 203/1 ignored; lib 270; client API 34; no FAILED results)
+- `hub_daemon_lifecycle_test`: 204 passed, 1 ignored (larger local many-PTY)
+- Full `./test.sh --locked` workspace: all binaries ok (lifecycle 204/1 ignored; lib 274; client API 34; no FAILED results)
 - `session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnect` passed isolated three times after the Drain removal (4.2–5.0s) and in the locked suite
 - `cli_smoke_proves_local_runtime_daemon_package_app_session_and_webrtc` passed in the locked suite
 - Missing-session host Drain is a typed OperatorError (`drain_runtime` / `terminal_stream_unavailable`)
@@ -181,9 +186,11 @@ Passed on this tree:
 - Hub-owned `FEATURE_TERMINAL_STREAMING` / `FEATURE_RESIZE` / `FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY` constants deleted; negotiation uses `botster-terminal-protocol`
 - Local SubscribeEntities returns a paged baseline. Daemon registration waits for the complete owner-loop projection before sending a session snapshot
 - Production Hub no longer constructs `DaemonEvent::AttachState` or matches TerminalOutput/Snapshot/Scrollback/ProcessExit/AttachState bodies
-- `ShutdownSession` observes before classify. A Core shutdown error observes again and returns `SessionCleanup` (`already_exited` if still Active)
-- `external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup` passed isolated three times (10.32s, 6.19s, 8.05s)
-- `external_hub_webrtc_live_output_preserves_exact_bytes` passed isolated two times (3.24s, 2.58s)
+- `ShutdownSession` observes before classify. A Core shutdown error observes again on a fresh tick. `SessionCleanup` is only for `Cleanup` classify or `UnknownSession`. `Active` plus `Runtime`/`State` stays `OperatorError`
+- Unit tests: `shutdown_unknown_session_error_while_active_is_already_exited_cleanup`, `shutdown_exited_classification_returns_cleanup_for_any_shutdown_error`, `shutdown_active_runtime_error_remains_operator_error`, `shutdown_active_state_error_remains_operator_error`
+- `shutdown_after_observed_exit_returns_session_cleanup` passed isolated
+- `external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup` passed isolated after the extra parking `ReadScreen` was removed
+- `external_hub_webrtc_live_output_preserves_exact_bytes` passed isolated
 
 ## Unverified behavior or residual risk
 
@@ -192,7 +199,7 @@ Passed on this tree:
 - Control-thread `try_recv` prefers queued host requests over idle reconcile. Burst `ReadScreen` can delay the 500 ms idle observe until the queue drains. Mutations now observe on the request path.
 - CoreDaemon on `aef6516` does not expose `pump_bound_adapters`. Owner-loop observe uses `observe_lifecycle_slice`, which calls Core `drain_runtime_once` internally.
 - Downstream TUI/Web crates that still imported the deleted hub-client `FEATURE_*` constants must import `botster-terminal-protocol` instead. Those consumers are separately routed.
-- If Core `Shutdown` fails while `registry_state` is still `Running` after a second observe, Hub now returns `SessionCleanup` with `already_exited`. A true operator failure on a still-running session would use that same frame. Review required this idempotent cleanup.
+- If Core `Shutdown` fails while `registry_state` is still `Running` after a second observe, and the error is `Runtime` or `State`, Hub returns `OperatorError`. `ReadScreen` can park `ProcessExited` in Core `pending_drain`. Observe does not take that drain. A later `ShutdownSession` can then miss the exit and surface `OperatorError`. That is a Core control-plane gap, not a Hub terminal Drain.
 
 ## Missing vault guidance discovered
 
