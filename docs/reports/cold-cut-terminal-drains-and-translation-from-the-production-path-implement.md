@@ -14,7 +14,7 @@ Plan: `docs/plans/cold-cut-terminal-drains-and-translation-from-the-production-p
 | Worktree HEAD before edits | `959c58f55726d098299cced8af151d8f496f41e3` |
 | Locked Core SHA | `aef6516d5809d563961ed7fdd07da29a7b4edddc` |
 | Merge policy | direct into `main`; no PR |
-| Review follow-up | `review_1786827237_767780` on `a25a72b` |
+| Review follow-up | `review_1786828089_377604` on `9462ab7` |
 
 Independent routing matched the approved plan. This run did not infer the repository from the ambient directory.
 
@@ -67,7 +67,7 @@ Not loaded: [[project-pipelines-playbook]] (package/plugin paths out of scope).
 - `packages/hub-test-support/**` (0.1.37 / revision 42, regenerated)
 - `README.md`, `docs/client-protocol.md`
 - Tests under `tests/hub_client_api_test.rs`, `tests/hub_local_runtime_test.rs`, `tests/hub_daemon_lifecycle/*`
-- Plan and this report (Review follow-up on `review_1786827237_767780`)
+- Plan and this report (Review follow-up on `review_1786828089_377604`)
 
 ## Ownership boundaries preserved
 
@@ -223,6 +223,16 @@ This visit:
 - Exact test passed twice in sequence (2.99s, 2.97s). This worktree had 0 leftover `botster-session-worker` processes after those runs.
 - Narrow ablation of only `walk.reset()` inside `reset_walk_after_active_classify` failed with exit 101 and left 0 leftover workers. After restore, the exact test passed twice again (2.96s, 2.87s) with 0 leftover workers. No manual process cleanup was used between those runs.
 
+Review `review_1786828089_377604` required one follow-up on `9462ab7`:
+
+- `finding_1786828089_648692` — cleanup returned before the next spawn could reuse the machine. Blind SIGKILL of saved PIDs had no identity check. Cleanup errors were ignored.
+
+This visit:
+
+- `retire_owned_sessions` shuts down every tracked session through `HubRuntime::shutdown_session`. It waits for each recorded worker to exit before `Drop` returns. SIGKILL is used only when the live process command line still matches the saved worker identity. Cleanup failures panic outside unwind and print during unwind.
+- Required sequence with no manual delay or cleanup: pass (5.29s), reset ablation fail (exit 101), immediate restore pass (5.18s), second pass (5.25s). This worktree had 0 leftover workers after that sequence.
+- One `./test.sh --locked` run failed `shutdown_session_classifies_parked_exit_beyond_one_baseline_page` with Events. Isolated rerun passed (2.65s). A second full wrapper passed (lifecycle 206/1 ignored, lib 287, parked-exit and exact-bytes green).
+
 ## Runtime-teardown lenses
 
 | Lens | Implemented |
@@ -285,7 +295,7 @@ Passed on this tree:
 - Narrow ablation of only `walk.reset()` inside `reset_walk_after_active_classify` made `production_core_error_cleanup_requires_reset_of_nonfinal_walk` and `production_reset_clears_a_held_lifecycle_walk` fail (exit 101). Active Runtime/State mapper tests stayed green. The reset was restored.
 - `shutdown_session_classifies_parked_exit_beyond_one_baseline_page` passed isolated (2.68s)
 - rustfmt `--check` and `cargo clippy --workspace --all-targets --offline -- -D warnings` passed
-- `production_core_error_cleanup_requires_reset_of_nonfinal_walk` now owns cleanup on Drop. Sequential isolated runs passed twice, then failed under reset ablation (exit 101, 0 leftover workers), then passed twice after restore with 0 leftover workers
+- `production_core_error_cleanup_requires_reset_of_nonfinal_walk` now waits for owned workers to exit before Drop returns. Sequence: pass, ablation fail, immediate restore pass, second pass, 0 leftover workers
 - `shutdown_after_observed_exit_returns_session_cleanup` passed isolated
 - Live Web `1e57685` `npm run smoke:live-packaged-protocol` against copied bins from this tree: Hello protocol 7 / rev 42, session spawn, `proveLiveTerminalAfterAttach`, and `assertTerminalAttachChronology` (cycle 0 plus reconnect cycles) completed. The harness then failed twice at the later Web-owned `proveRapidAlternateScreenReattach` cycle 0 ReadScreen oracle (`lost final row marker`). That stage is after attaching, snapshots, attached, and live `daemon_terminal_event` output.
 

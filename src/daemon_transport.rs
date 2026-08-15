@@ -8644,42 +8644,111 @@ mod tests {
             self.session_ids.push(id);
         }
 
-        fn retire_owned_sessions(&mut self) {
-            let pids: Vec<u32> = self
+        fn retire_owned_sessions(&mut self) -> Result<(), String> {
+            let workers: Vec<(u32, String)> = self
                 .runtime
                 .list_sessions()
                 .into_iter()
                 .flatten()
-                .filter_map(|session| session.process.and_then(|process| process.pid))
+                .filter_map(|session| {
+                    let pid = session.process.and_then(|process| process.pid)?;
+                    process_command_line(pid).map(|command| (pid, command))
+                })
                 .collect();
-            for pid in &pids {
-                let _ = std::process::Command::new("kill")
-                    .args(["-TERM", &pid.to_string()])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status();
-            }
+            let mut errors = Vec::new();
             for session_id in self.session_ids.drain(..) {
                 let _ = self
                     .runtime
                     .shutdown_session(session_id.clone(), tick(&mut self.clock));
                 let _ = self.runtime.remove_terminal_session(&session_id);
             }
-            for pid in pids {
+            let wait_deadline = Instant::now() + Duration::from_secs(5);
+            for (pid, command) in &workers {
+                if wait_for_process_exit(*pid, wait_deadline) {
+                    continue;
+                }
+                if process_command_line(*pid).as_deref() != Some(command.as_str()) {
+                    continue;
+                }
                 let _ = std::process::Command::new("kill")
                     .args(["-KILL", &pid.to_string()])
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
                     .status();
+                if !wait_for_process_exit(*pid, wait_deadline)
+                    && process_command_line(*pid).as_deref() == Some(command.as_str())
+                {
+                    errors.push(format!("worker pid {pid} still running after shutdown"));
+                }
             }
-            let _ = std::fs::remove_dir_all(&self.data_directory);
+            if let Err(error) = std::fs::remove_dir_all(&self.data_directory) {
+                errors.push(format!("remove {}: {error}", self.data_directory.display()));
+            }
+            let dir_deadline = Instant::now() + Duration::from_secs(2);
+            while self.data_directory.exists() && Instant::now() < dir_deadline {
+                let _ = std::fs::remove_dir_all(&self.data_directory);
+                thread::sleep(Duration::from_millis(10));
+            }
+            if self.data_directory.exists() {
+                errors.push(format!(
+                    "data directory still present: {}",
+                    self.data_directory.display()
+                ));
+            }
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(errors.join("; "))
+            }
         }
     }
 
     impl Drop for OwnedSessionRuntime {
         fn drop(&mut self) {
-            self.retire_owned_sessions();
+            if let Err(error) = self.retire_owned_sessions() {
+                if std::thread::panicking() {
+                    eprintln!("owned session cleanup failed during unwind: {error}");
+                } else {
+                    panic!("owned session cleanup failed: {error}");
+                }
+            }
         }
+    }
+
+    fn process_command_line(pid: u32) -> Option<String> {
+        let output = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "args="])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let command = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if command.is_empty() {
+            None
+        } else {
+            Some(command)
+        }
+    }
+
+    fn process_is_alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    fn wait_for_process_exit(pid: u32, deadline: Instant) -> bool {
+        while Instant::now() < deadline {
+            if !process_is_alive(pid) {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        !process_is_alive(pid)
     }
 
     fn package_control_config(data_directory: PathBuf) -> crate::HubConfig {
