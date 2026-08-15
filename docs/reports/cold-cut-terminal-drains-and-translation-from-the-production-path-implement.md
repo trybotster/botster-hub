@@ -14,7 +14,7 @@ Plan: `docs/plans/cold-cut-terminal-drains-and-translation-from-the-production-p
 | Worktree HEAD before edits | `959c58f55726d098299cced8af151d8f496f41e3` |
 | Locked Core SHA | `aef6516d5809d563961ed7fdd07da29a7b4edddc` |
 | Merge policy | direct into `main`; no PR |
-| Review follow-up | `review_1786813603_333934` on `d84136f` |
+| Review follow-up | `review_1786815982_996845` on `b961e27` |
 
 Independent routing matched the approved plan. This run did not infer the repository from the ambient directory.
 
@@ -65,7 +65,7 @@ Not loaded: [[project-pipelines-playbook]] (package/plugin paths out of scope).
 - `packages/hub-test-support/**` (0.1.37 / revision 42, regenerated)
 - `README.md`, `docs/client-protocol.md`
 - Tests under `tests/hub_client_api_test.rs`, `tests/hub_local_runtime_test.rs`, `tests/hub_daemon_lifecycle/*`
-- Plan and this report (Review follow-up on `review_1786813603_333934`)
+- Plan and this report (Review follow-up on `review_1786815982_996845`)
 
 ## Ownership boundaries preserved
 
@@ -163,14 +163,17 @@ Review `review_1786813603_333934` required two new follow-ups on `d84136f` and k
 - `finding_1786813603_115214` / `finding_1786812405_914932` — run the provenance-pinned live packaged Web smoke; keep the IsolatedHub adapter test content-blind and rename its nonempty-frame claim.
 - `finding_1786812405_507488` — document the TUI IsolatedHub Hello mismatch; do not restore host tokens.
 
+Review `review_1786815982_996845` required one new follow-up on `b961e27`:
+
+- `finding_1786815982_896987` — production `ShutdownSession` must not call `CoreDaemon::drain`. The scanner must not depend on a local variable name.
+
 This visit:
 
-- Restored `write_python_wait_then_write_script`. Deleted the hold-forever helper.
-- `ShutdownSession` still observes, then classifies. If still Active, it applies parked Core lifecycle observations for that session, observes again, and classifies again. Parked `ProcessExited` becomes `SessionCleanup` before Core shutdown. Active plus Runtime/State after that path stays `OperatorError`.
-- `apply_parked_lifecycle_observations` is shutdown-only. Production `ReadScreen` does not call it. Terminal bodies are discarded.
-- After Unix/WebRTC bind, Hub forwards Core attach bootstrap `TransportEgress` as opaque `TerminalFrame` bytes. Hub does not decode READY/PAGE/FINISH.
-- IsolatedHub test is now `webrtc_terminal_adapter_attach_emits_a_nonempty_frame_without_host_drain`.
-- Host terminal tokens stay off the descriptor. TUI IsolatedHub `wait_for_ready` at `fc1ff623` is not production TUI Hello.
+- Deleted `apply_parked_lifecycle_observations`. Production Hub does not call Core terminal Drain.
+- `ShutdownSession` classifies from registry state, then from Core engine lifecycle through `lifecycle_baseline`. `ProcessExited` already sets engine lifecycle to `Exited` before Hub classify. That is a control-plane read, not a terminal Drain.
+- Active plus Runtime/State stays `OperatorError`.
+- The architecture scan now rejects any two-argument `.drain(x, y)` in production sources, independent of local names. Collection `.drain(..)` remains allowed.
+- Finite `write(2)` producer, attach bootstrap forward, and IsolatedHub nonempty-frame rename stay from `b961e27`.
 
 ## Runtime-teardown lenses
 
@@ -199,12 +202,12 @@ Passed on this tree:
 - Session-worker locked build
 - rustfmt
 - strict clippy
-- Hub lib tests: 274 passed, including fail-closed local Attach, negative architecture scan, WebRTC bind/peer-loss/fail-closed sibling, one-line `#[cfg(test)]` scan controls, and `early_session_subscription_waits_for_complete_paged_projection`
+- Hub lib tests: 275 passed, including fail-closed local Attach, negative architecture scan, two-argument Drain scan, WebRTC bind/peer-loss/fail-closed sibling, one-line `#[cfg(test)]` scan controls, and `early_session_subscription_waits_for_complete_paged_projection`
 - `hub_client_api_test`: 34 passed, including `session_entity_subscription_returns_a_bounded_page_not_a_complete_baseline`
 - IsolatedHub Unix always-bind, empty Attach, host Drain empty, ReadScreen marker, replacement-owner
 - Lifecycle oracles rewritten off Attach/Drain translation: mux frames, `ReadScreen`, host OperatorError, session-entity patches
 - `hub_daemon_lifecycle_test`: 205 passed, 1 ignored (larger local many-PTY)
-- Full `./test.sh --locked` workspace: all binaries ok (lifecycle 205/1 ignored; lib 274; client API 34; no FAILED results)
+- Full `./test.sh --locked` workspace: all binaries ok (lifecycle 205/1 ignored; lib 275; client API 34; no FAILED results)
 - `session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnect` passed isolated three times after the Drain removal (4.2–5.0s) and in the locked suite
 - `cli_smoke_proves_local_runtime_daemon_package_app_session_and_webrtc` passed in the locked suite
 - Missing-session host Drain is a typed OperatorError (`drain_runtime` / `terminal_stream_unavailable`)
@@ -236,8 +239,8 @@ Passed on this tree:
 - Control-thread `try_recv` prefers queued host requests over idle reconcile. Burst `ReadScreen` can delay the 500 ms idle observe until the queue drains. Mutations now observe on the request path.
 - CoreDaemon on `aef6516` does not expose `pump_bound_adapters`. Owner-loop observe uses `observe_lifecycle_slice`, which calls Core `drain_runtime_once` internally.
 - Downstream TUI/Web crates that still imported the deleted hub-client `FEATURE_*` constants must import `botster-terminal-protocol` instead. Those consumers are separately routed.
-- Shutdown-only `apply_parked_lifecycle_observations` calls Core `drain` with a local id binding so parked `ProcessExited` can reconcile. Production `ReadScreen` does not call it. The architecture scan still rejects `.drain(session_id`.
-- Live Web packaged-protocol attach chronology is proved on this tree. The same smoke still fails later at Web `proveRapidAlternateScreenReattach` cycle 0: ReadScreen never contained the alt-screen final-row marker after reattach. That is a later host-readback oracle, not attach chronology. It is not this ticket's Drain cut, and it is not fixed here.
+- Production Hub no longer calls Core `drain`. Shutdown classify reads engine lifecycle through `lifecycle_baseline`. That wrapper loads every registry row for one host shutdown request. It is not the owner-loop projection path.
+- Live Web packaged-protocol attach chronology was proved at `b961e27`. The same smoke still fails later at Web `proveRapidAlternateScreenReattach` cycle 0. That later oracle is unchanged by this Drain removal.
 
 ## Missing vault guidance discovered
 

@@ -955,6 +955,32 @@ mod tests {
         }
     }
 
+    fn contains_two_argument_drain(source: &str) -> bool {
+        let mut rest = source;
+        while let Some(idx) = rest.find(".drain(") {
+            rest = &rest[idx + ".drain(".len()..];
+            let mut depth = 1i32;
+            let mut saw_comma = false;
+            for ch in rest.chars() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    ',' if depth == 1 => saw_comma = true,
+                    _ => {}
+                }
+            }
+            if saw_comma {
+                return true;
+            }
+        }
+        false
+    }
+
     #[test]
     fn production_sources_reject_terminal_drain_and_snapshot_phase_decode() {
         let files = [
@@ -986,6 +1012,24 @@ mod tests {
                     "{path} production source must not contain {forbidden}"
                 );
             }
+            assert!(
+                !contains_two_argument_drain(&production),
+                "{path} production source must not call two-argument Core drain"
+            );
         }
+    }
+
+    #[test]
+    fn two_argument_drain_scan_is_independent_of_local_variable_names() {
+        assert!(contains_two_argument_drain("core.drain(&id, now_seconds);"));
+        assert!(contains_two_argument_drain(
+            "core_daemon.drain(session_id, last_output_at)"
+        ));
+        assert!(!contains_two_argument_drain("operations.drain(..)"));
+        assert!(!contains_two_argument_drain("tasks.drain(..)"));
+        let sneaky = production_source(
+            "#[cfg(test)]\nfn helper() { core.drain(&id, now); }\nfn production() { core.drain(&id, now); }\n",
+        );
+        assert!(contains_two_argument_drain(&sneaky));
     }
 }
