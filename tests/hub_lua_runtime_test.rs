@@ -4499,7 +4499,7 @@ fn never_queued_release_stays_owned_when_release_queue_is_full() {
         }))
         .expect("live");
     let mut fillers = Vec::new();
-    for index in 0..(CAUSAL_PENDING_MAX * 2) {
+    for index in 0..(CAUSAL_PENDING_MAX * 3) {
         let scope = scopes
             .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
                 plugin_key: format!("fill{index}"),
@@ -4525,18 +4525,18 @@ fn never_queued_release_stays_owned_when_release_queue_is_full() {
             );
         }
         for (index, scope) in fillers.iter().enumerate() {
-            assert_eq!(
-                bridge.park_release(CausalOp::Release {
-                    scope_id: *scope,
-                    identity: LeaseIdentity::AdmittedEntityMutation {
-                        family: "f".into(),
-                        seq: index as u64,
-                    },
-                }),
-                CausalAdmitResult::Applied
-            );
+            let op = CausalOp::Release {
+                scope_id: *scope,
+                identity: LeaseIdentity::AdmittedEntityMutation {
+                    family: "f".into(),
+                    seq: index as u64,
+                },
+            };
+            if let CausalAdmitResult::Retry(op) = bridge.park_release(op) {
+                assert_eq!(bridge.mark_orphan(op), CausalAdmitResult::Applied);
+            }
         }
-        assert_eq!(bridge.release_count(), CAUSAL_PENDING_MAX * 2);
+        assert_eq!(bridge.release_count(), CAUSAL_PENDING_MAX * 3);
         let overflow = release_or_retract(
             &scopes,
             live,
@@ -4547,12 +4547,43 @@ fn never_queued_release_stays_owned_when_release_queue_is_full() {
         let CausalAdmitResult::Retry(overflow) = overflow else {
             panic!("full table and held inner must return the release");
         };
+        let CausalAdmitResult::Retry(overflow) = bridge.park_release(overflow) else {
+            panic!("full park stores must return the release");
+        };
+        assert_eq!(bridge.mark_orphan(overflow), CausalAdmitResult::Applied);
+        assert_eq!(bridge.release_count(), CAUSAL_PENDING_MAX * 3 + 1);
+    });
+    let _ = hub.apply_event_plane_owner_ops();
+    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+        let _ = hub.apply_event_plane_owner_ops();
+        let _ = scopes.flush_pending();
+    }
+    assert!(!scopes.is_live(live));
+}
+
+#[test]
+fn never_queued_mark_returns_the_op_when_orphan_stores_are_held() {
+    let hub = explicit_runtime("lease-orphan-held");
+    let scopes = hub.causal_scopes().clone();
+    let live = scopes
+        .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+            plugin_key: "lease-probe".into(),
+        }))
+        .expect("live");
+    let bridge = hub.entity_publish_bridge();
+    let overflow = CausalOp::Release {
+        scope_id: live,
+        identity: LeaseIdentity::PendingEntityPublish {
+            plugin_key: "lease-probe".into(),
+        },
+    };
+    bridge.test_with_orphan_stores_held(|| {
         assert!(matches!(
-            bridge.park_release(overflow),
+            bridge.mark_orphan(overflow.clone()),
             CausalAdmitResult::Retry(_)
         ));
-        bridge.mark_orphan(live);
     });
+    assert_eq!(bridge.mark_orphan(overflow), CausalAdmitResult::Applied);
     let _ = hub.apply_event_plane_owner_ops();
     while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
         let _ = hub.apply_event_plane_owner_ops();
@@ -4580,7 +4611,7 @@ fn unfinished_finishes_are_bounded_sliced_and_fifo() {
                 .expect("mint"),
         );
     }
-    scopes.test_with_inner_held(|| {
+    let (transfer, release) = scopes.test_with_inner_held(|| {
         for (index, scope) in fillers.iter().enumerate() {
             assert_eq!(
                 scopes.transfer(
@@ -4596,7 +4627,7 @@ fn unfinished_finishes_are_bounded_sliced_and_fifo() {
                 CausalAdmitResult::Applied
             );
         }
-        for _ in 0..2 {
+        for _ in 0..3 {
             for (index, scope) in fillers.iter().enumerate() {
                 assert_eq!(
                     hub.keep_causal_op(CausalOp::Release {
@@ -4610,31 +4641,32 @@ fn unfinished_finishes_are_bounded_sliced_and_fifo() {
                 );
             }
         }
-        assert_eq!(hub.unfinished_finish_count(), CAUSAL_PENDING_MAX * 2);
-        assert_eq!(
-            hub.keep_causal_op(CausalOp::Transfer {
-                scope_id: live,
-                from: LeaseIdentity::PendingEntityPublish {
-                    plugin_key: "producer".into(),
-                },
-                to: vec![LeaseIdentity::AdmittedEntityMutation {
-                    family: "producer.item".into(),
-                    seq: 1,
-                }],
-            }),
-            CausalAdmitResult::Applied
-        );
-        assert_eq!(
-            hub.keep_causal_op(CausalOp::Release {
-                scope_id: live,
-                identity: LeaseIdentity::AdmittedEntityMutation {
-                    family: "producer.item".into(),
-                    seq: 1,
-                },
-            }),
-            CausalAdmitResult::Applied
-        );
-        assert_eq!(hub.unfinished_finish_count(), CAUSAL_PENDING_MAX * 2 + 2);
+        assert_eq!(hub.unfinished_finish_count(), CAUSAL_PENDING_MAX * 3);
+        let transfer = hub.keep_causal_op(CausalOp::Transfer {
+            scope_id: live,
+            from: LeaseIdentity::PendingEntityPublish {
+                plugin_key: "producer".into(),
+            },
+            to: vec![LeaseIdentity::AdmittedEntityMutation {
+                family: "producer.item".into(),
+                seq: 1,
+            }],
+        });
+        let CausalAdmitResult::Retry(transfer) = transfer else {
+            panic!("operation 769 must stay with the caller");
+        };
+        let release = hub.keep_causal_op(CausalOp::Release {
+            scope_id: live,
+            identity: LeaseIdentity::AdmittedEntityMutation {
+                family: "producer.item".into(),
+                seq: 1,
+            },
+        });
+        let CausalAdmitResult::Retry(release) = release else {
+            panic!("operation 770 must stay with the caller");
+        };
+        assert_eq!(hub.unfinished_finish_count(), CAUSAL_PENDING_MAX * 3);
+        (transfer, release)
     });
     let before = hub.unfinished_finish_count();
     let _ = hub.apply_event_plane_owner_ops();
@@ -4642,6 +4674,8 @@ fn unfinished_finishes_are_bounded_sliced_and_fifo() {
         hub.unfinished_finish_count() < before,
         "owner turn must slice unfinished work"
     );
+    assert_eq!(hub.keep_causal_op(transfer), CausalAdmitResult::Applied);
+    assert_eq!(hub.keep_causal_op(release), CausalAdmitResult::Applied);
     while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
         let _ = hub.apply_event_plane_owner_ops();
         let _ = scopes.flush_pending();
@@ -4649,6 +4683,6 @@ fn unfinished_finishes_are_bounded_sliced_and_fifo() {
     assert_eq!(hub.unfinished_finish_count(), 0);
     assert!(
         !scopes.is_live(live),
-        "older Transfer must apply before the overflow Release"
+        "caller-held Transfer must apply before the caller-held Release"
     );
 }

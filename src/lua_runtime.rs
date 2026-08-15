@@ -72,7 +72,8 @@ pub struct HubEntityPublishBridge {
     pending: Arc<Mutex<VecDeque<PendingEntityPublishRequest>>>,
     pending_releases: Arc<Mutex<VecDeque<CausalOp>>>,
     scope_releases: Arc<Mutex<BTreeMap<u64, LeaseIdentity>>>,
-    orphan_scopes: Arc<Mutex<BTreeSet<u64>>>,
+    orphan_ops: Arc<Mutex<VecDeque<CausalOp>>>,
+    held_release: Arc<Mutex<Option<CausalOp>>>,
     next_token: Arc<AtomicU64>,
     reject_next: Arc<AtomicBool>,
 }
@@ -84,25 +85,40 @@ impl HubEntityPublishBridge {
             pending: Arc::new(Mutex::new(VecDeque::new())),
             pending_releases: Arc::new(Mutex::new(VecDeque::new())),
             scope_releases: Arc::new(Mutex::new(BTreeMap::new())),
-            orphan_scopes: Arc::new(Mutex::new(BTreeSet::new())),
+            orphan_ops: Arc::new(Mutex::new(VecDeque::new())),
+            held_release: Arc::new(Mutex::new(None)),
             next_token: Arc::new(AtomicU64::new(1)),
             reject_next: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    pub fn mark_orphan(&self, scope_id: u64) {
-        if let Ok(mut orphans) = self.orphan_scopes.try_lock()
-            && (orphans.len() < CAUSAL_PENDING_MAX || orphans.contains(&scope_id))
+    pub fn mark_orphan(&self, op: CausalOp) -> CausalAdmitResult {
+        if let Ok(mut orphans) = self.orphan_ops.try_lock()
+            && orphans.len() < CAUSAL_PENDING_MAX
         {
-            orphans.insert(scope_id);
+            orphans.push_back(op);
+            return CausalAdmitResult::Applied;
         }
+        if let Ok(mut held) = self.held_release.try_lock()
+            && held.is_none()
+        {
+            *held = Some(op);
+            return CausalAdmitResult::Applied;
+        }
+        CausalAdmitResult::Retry(op)
     }
 
-    pub fn take_orphans(&self) -> Vec<u64> {
-        self.orphan_scopes
+    #[doc(hidden)]
+    pub fn test_with_orphan_stores_held<R>(&self, body: impl FnOnce() -> R) -> R {
+        let _orphans = self
+            .orphan_ops
             .try_lock()
-            .map(|mut orphans| std::mem::take(&mut *orphans).into_iter().collect())
-            .unwrap_or_default()
+            .expect("test hold must acquire orphan ops");
+        let _held = self
+            .held_release
+            .try_lock()
+            .expect("test hold must acquire held release");
+        body()
     }
 
     pub fn park_release(&self, op: CausalOp) -> CausalAdmitResult {
@@ -128,13 +144,21 @@ impl HubEntityPublishBridge {
         {
             return Some(op);
         }
-        let Ok(mut scopes) = self.scope_releases.try_lock() else {
-            return None;
-        };
-        let scope_id = scopes.keys().next().copied()?;
-        scopes
-            .remove(&scope_id)
-            .map(|identity| CausalOp::Release { scope_id, identity })
+        if let Ok(mut scopes) = self.scope_releases.try_lock()
+            && let Some(scope_id) = scopes.keys().next().copied()
+            && let Some(identity) = scopes.remove(&scope_id)
+        {
+            return Some(CausalOp::Release { scope_id, identity });
+        }
+        if let Ok(mut orphans) = self.orphan_ops.try_lock()
+            && let Some(op) = orphans.pop_front()
+        {
+            return Some(op);
+        }
+        self.held_release
+            .try_lock()
+            .ok()
+            .and_then(|mut held| held.take())
     }
 
     #[must_use]
@@ -149,7 +173,17 @@ impl HubEntityPublishBridge {
             .try_lock()
             .map(|scopes| scopes.len())
             .unwrap_or(0);
-        queued + scoped
+        let orphans = self
+            .orphan_ops
+            .try_lock()
+            .map(|pending| pending.len())
+            .unwrap_or(0);
+        let held = self
+            .held_release
+            .try_lock()
+            .map(|held| usize::from(held.is_some()))
+            .unwrap_or(0);
+        queued + scoped + orphans + held
     }
 
     #[must_use]
@@ -1021,9 +1055,9 @@ fn entity_publish_function(
                             plugin_key: plugin_key.0.clone(),
                         },
                     )
-                    && let CausalAdmitResult::Retry(_) = bridge.park_release(op)
+                    && let CausalAdmitResult::Retry(op) = bridge.park_release(op)
                 {
-                    bridge.mark_orphan(scope_id);
+                    let _ = bridge.mark_orphan(op);
                 }
                 return Err(mlua::Error::RuntimeError(error));
             }
