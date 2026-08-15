@@ -14,7 +14,7 @@ Plan: `docs/plans/cold-cut-terminal-drains-and-translation-from-the-production-p
 | Worktree HEAD before edits | `959c58f55726d098299cced8af151d8f496f41e3` |
 | Locked Core SHA | `aef6516d5809d563961ed7fdd07da29a7b4edddc` |
 | Merge policy | direct into `main`; no PR |
-| Review follow-up | `review_1786830875_230401` on `2c7411f` |
+| Review follow-up | `review_1786832385_918328` on `35092c1` |
 
 Independent routing matched the approved plan. This run did not infer the repository from the ambient directory.
 
@@ -73,8 +73,8 @@ Not loaded: [[project-pipelines-playbook]] (package/plugin paths out of scope).
 - `packages/hub-test-support/**` (0.1.37 / revision 42, regenerated)
 - `README.md`, `docs/client-protocol.md`
 - Tests under `tests/hub_client_api_test.rs`, `tests/hub_local_runtime_test.rs`, `tests/hub_daemon_lifecycle/*`
-- Plan and this report (Review follow-up on `review_1786830875_230401`)
-- This visit: `src/daemon_transport.rs` and this report only
+- Plan and this report (Review follow-up on `review_1786832385_918328`)
+- This visit: `src/daemon_transport.rs`, `src/daemon_attach_stream.rs`, `tests/hub_daemon_lifecycle/webrtc_proofs.rs`, and this report
 
 ## Ownership boundaries preserved
 
@@ -272,6 +272,18 @@ This visit:
 - The barrier retries `remove_dir_all` until the owned data directory is gone. It does not copy Core `worker_socket_dir`, scan `ps`, or treat `DaemonSession.process.pid` as a worker PID.
 - Required sequence with no manual delay or cleanup: pass (2.32s), ablation fail (exit 101, OperatorError Runtime), immediate restore pass (2.25s), second pass (2.28s). This-worktree worker count stayed at 75 across that sequence. `git diff` on `reset_walk_after_active_classify` is clean.
 
+Review `review_1786832385_918328` required one follow-up on `35092c1`:
+
+- `finding_1786832385_719224` — isolated `external_hub_webrtc_live_output_preserves_exact_bytes` passed. `./test.sh --locked` returned OperatorError after the finite write(2) producer exited. This is the same runtime-teardown race as `finding_1786812405_392121`.
+
+This visit:
+
+- Production `ShutdownSession` now closes Hub adapters for that session before observe. A dying WebRTC DataChannel must not fail Core drain before ProcessExited is applied.
+- After that close, ShutdownSession observes twice, then classifies. Active plus Runtime or State still stays OperatorError. SessionCleanup is still only Cleanup, Missing, or Active plus UnknownSession.
+- `close_adapters_for_session` closes only that session. A sibling session adapter stays bound.
+- The exact-byte test is the suite-load oracle. Isolated pass is not the proof. `./test.sh --locked` must return Events or SessionCleanup.
+- No production Drain. No host tokens. No invented Cleanup. No Core worker-socket copy.
+
 ## Runtime-teardown lenses
 
 | Lens | Implemented |
@@ -335,7 +347,9 @@ Passed on this tree:
 - `shutdown_session_classifies_parked_exit_beyond_one_baseline_page` passed isolated (2.68s)
 - rustfmt `--check` and `cargo clippy --workspace --all-targets --offline -- -D warnings` passed
 - `production_core_error_cleanup_requires_reset_of_nonfinal_walk` now drops Core and waits until the owned data directory is gone. Sequence: pass (2.32s), ablation fail (exit 101), immediate restore pass (2.25s), second pass (2.28s). This-worktree worker count stayed at 75.
-- `./test.sh --locked` after that sequence: lifecycle 206/1 ignored, lib 287, client API 34, no FAILED results. Parked-exit and exact-bytes stayed green.
+- `close_adapters_for_session_closes_only_that_session` passed isolated
+- Isolated `external_hub_webrtc_live_output_preserves_exact_bytes` passed (2.82s). Full `hub_daemon_lifecycle_test` passed (206/1 ignored, exact-bytes green, 243s)
+- `./test.sh --locked` after the adapter-close fix: lib 288, lifecycle 206/1 ignored, client API 34, no FAILED results. Exact-bytes, parked-exit, Active Runtime/State mapper tests, and the reset proof stayed green.
 - `shutdown_after_observed_exit_returns_session_cleanup` passed isolated
 - Live Web `1e57685` `npm run smoke:live-packaged-protocol` against copied bins from this tree: Hello protocol 7 / rev 42, session spawn, `proveLiveTerminalAfterAttach`, and `assertTerminalAttachChronology` (cycle 0 plus reconnect cycles) completed. The harness then failed twice at the later Web-owned `proveRapidAlternateScreenReattach` cycle 0 ReadScreen oracle (`lost final row marker`). That stage is after attaching, snapshots, attached, and live `daemon_terminal_event` output.
 
@@ -349,6 +363,7 @@ Passed on this tree:
 - Production Hub no longer calls Core `drain` or unbounded `lifecycle_baseline()`. After a Core shutdown error, classify uses one shared 1 s deadline. Active resets the walk. Incomplete keeps the cursor. Unconfirmed Active or Incomplete stays OperatorError.
 - Live Web packaged-protocol attach chronology was proved at `b961e27`. The same smoke still fails later at Web `proveRapidAlternateScreenReattach` cycle 0. That later oracle is unchanged by this Drain removal.
 - Reset-test cleanup now waits for owned Core drop plus data-directory removal. It does not inspect Core's private worker-socket directory. Pre-existing leftover workers from earlier visits were left in place.
+- ShutdownSession now closes that session's Hub adapters before observe. This does not extend Core's two-second shutdown wait. A worker that never emits ProcessExited still returns OperatorError when classify stays Active.
 
 ## Missing vault guidance discovered
 
