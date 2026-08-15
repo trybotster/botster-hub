@@ -311,40 +311,40 @@ impl PackageEventRouter {
             return Err(EventPlaneStatus::RejectedForeign);
         }
         let mut inner = lock_inner(&self.inner)?;
-        if contracts.is_empty() && subscriptions.is_empty() {
-            return Ok(inner.package_generation.get(owner).copied().unwrap_or(0));
-        }
         for contract in &contracts {
             if contract.owner == HUB_EVENT_OWNER || contract.owner != owner {
                 return Err(EventPlaneStatus::RejectedForeign);
             }
         }
-        let previous_generation = inner.package_generation.get(owner).copied().unwrap_or(0);
-        let generation = bump_package_generation(&mut inner, owner);
-        let mut inserted_contracts = Vec::new();
-        for mut contract in contracts {
-            contract.package_generation = generation;
-            let key = (contract.owner.clone(), contract.name.clone());
-            inner.contracts.insert(key.clone(), contract);
-            inserted_contracts.push(key);
+        commit_package_generation_locked(&mut inner, owner, contracts, subscriptions)
+    }
+
+    /// Unload the live generation and commit the replacement under one lock.
+    pub fn try_replace_package_generation(
+        &self,
+        owner: &str,
+        contracts: Vec<EmittedContract>,
+        subscriptions: Vec<EventSubscription>,
+    ) -> Result<u64, EventPlaneStatus> {
+        if owner == HUB_EVENT_OWNER {
+            return Err(EventPlaneStatus::RejectedForeign);
         }
-        let mut inserted_subscriptions = Vec::new();
-        for subscription in subscriptions {
-            match subscribe_locked(&mut inner, subscription.clone()) {
-                EventPlaneStatus::Accepted => inserted_subscriptions.push(subscription),
-                status => {
-                    rollback_package_commit(
-                        &mut inner,
-                        owner,
-                        previous_generation,
-                        &inserted_contracts,
-                        &inserted_subscriptions,
-                    );
-                    return Err(status);
-                }
+        let mut inner = lock_inner(&self.inner)?;
+        for contract in &contracts {
+            if contract.owner == HUB_EVENT_OWNER || contract.owner != owner {
+                return Err(EventPlaneStatus::RejectedForeign);
             }
         }
-        Ok(generation)
+        let snapshot = snapshot_admission(&inner);
+        let unload_generation = inner.package_generation.get(owner).copied().unwrap_or(0);
+        apply_unload(&mut inner, owner, unload_generation);
+        match commit_package_generation_locked(&mut inner, owner, contracts, subscriptions) {
+            Ok(generation) => Ok(generation),
+            Err(status) => {
+                restore_admission(&mut inner, snapshot);
+                Err(status)
+            }
+        }
     }
 
     pub fn try_subscribe(&self, subscription: EventSubscription) -> EventPlaneStatus {
@@ -771,6 +771,56 @@ fn consume_token(inner: &mut RouterInner, owner: &str, now: Instant) -> bool {
     true
 }
 
+struct AdmissionSnapshot {
+    contracts: HashMap<(String, String), EmittedContract>,
+    subscriptions: HashMap<(String, String), Vec<EventSubscription>>,
+    subscriptions_per_plugin: HashMap<String, usize>,
+    package_generation: HashMap<String, u64>,
+}
+
+fn snapshot_admission(inner: &RouterInner) -> AdmissionSnapshot {
+    AdmissionSnapshot {
+        contracts: inner.contracts.clone(),
+        subscriptions: inner.subscriptions.clone(),
+        subscriptions_per_plugin: inner.subscriptions_per_plugin.clone(),
+        package_generation: inner.package_generation.clone(),
+    }
+}
+
+fn restore_admission(inner: &mut RouterInner, snapshot: AdmissionSnapshot) {
+    inner.contracts = snapshot.contracts;
+    inner.subscriptions = snapshot.subscriptions;
+    inner.subscriptions_per_plugin = snapshot.subscriptions_per_plugin;
+    inner.package_generation = snapshot.package_generation;
+}
+
+fn commit_package_generation_locked(
+    inner: &mut RouterInner,
+    owner: &str,
+    contracts: Vec<EmittedContract>,
+    subscriptions: Vec<EventSubscription>,
+) -> Result<u64, EventPlaneStatus> {
+    if contracts.is_empty() && subscriptions.is_empty() {
+        return Ok(inner.package_generation.get(owner).copied().unwrap_or(0));
+    }
+    let snapshot = snapshot_admission(inner);
+    let generation = bump_package_generation(inner, owner);
+    for mut contract in contracts {
+        contract.package_generation = generation;
+        inner
+            .contracts
+            .insert((contract.owner.clone(), contract.name.clone()), contract);
+    }
+    for subscription in subscriptions {
+        let status = subscribe_locked(inner, subscription);
+        if status != EventPlaneStatus::Accepted {
+            restore_admission(inner, snapshot);
+            return Err(status);
+        }
+    }
+    Ok(generation)
+}
+
 fn subscribe_locked(inner: &mut RouterInner, subscription: EventSubscription) -> EventPlaneStatus {
     if is_wildcard(&subscription.owner) || is_wildcard(&subscription.name) {
         return EventPlaneStatus::RejectedWildcard;
@@ -814,48 +864,6 @@ fn subscribe_locked(inner: &mut RouterInner, subscription: EventSubscription) ->
         .entry(plugin_key)
         .or_insert(0) += 1;
     EventPlaneStatus::Accepted
-}
-
-fn rollback_package_commit(
-    inner: &mut RouterInner,
-    owner: &str,
-    previous_generation: u64,
-    inserted_contracts: &[(String, String)],
-    inserted_subscriptions: &[EventSubscription],
-) {
-    for key in inserted_contracts {
-        inner.contracts.remove(key);
-    }
-    for subscription in inserted_subscriptions {
-        let key = (subscription.owner.clone(), subscription.name.clone());
-        if let Some(event_subs) = inner.subscriptions.get_mut(&key) {
-            event_subs.retain(|existing| {
-                existing.plugin_key != subscription.plugin_key
-                    || existing.handler_id != subscription.handler_id
-            });
-            if event_subs.is_empty() {
-                inner.subscriptions.remove(&key);
-            }
-        }
-        if let Some(count) = inner
-            .subscriptions_per_plugin
-            .get_mut(&subscription.plugin_key)
-        {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                inner
-                    .subscriptions_per_plugin
-                    .remove(&subscription.plugin_key);
-            }
-        }
-    }
-    if previous_generation == 0 {
-        inner.package_generation.remove(owner);
-    } else {
-        inner
-            .package_generation
-            .insert(owner.to_string(), previous_generation);
-    }
 }
 
 fn bump_package_generation(inner: &mut RouterInner, owner: &str) -> u64 {
@@ -1028,10 +1036,25 @@ impl EventPlaneOwnerOps {
     }
 }
 
+/// Owner-thread retry ledger for causal-scope transfer and release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CausalOp {
+    Transfer {
+        scope_id: u64,
+        from: LeaseIdentity,
+        to: Vec<LeaseIdentity>,
+    },
+    Release {
+        scope_id: u64,
+        identity: LeaseIdentity,
+    },
+}
+
 /// Causal-scope lease table. Send + Sync. Lives beside the router.
 #[derive(Debug)]
 pub struct CausalScopeTable {
     inner: Mutex<CausalInner>,
+    pending: Mutex<VecDeque<CausalOp>>,
     next_id: AtomicU64,
 }
 
@@ -1066,6 +1089,7 @@ impl CausalScopeTable {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(CausalInner::default()),
+            pending: Mutex::new(VecDeque::new()),
             next_id: AtomicU64::new(1),
         }
     }
@@ -1109,42 +1133,105 @@ impl CausalScopeTable {
         scope_id: u64,
         from: LeaseIdentity,
         to: impl IntoIterator<Item = LeaseIdentity>,
-    ) -> bool {
-        let Ok(mut inner) = self.inner.try_lock() else {
-            return false;
-        };
-        let Some(scope) = inner.scopes.get_mut(&scope_id) else {
-            return false;
-        };
-        if scope.identities.remove(&from) {
-            scope.leases = scope.leases.saturating_sub(1);
-        }
-        for identity in to {
-            if scope.identities.insert(identity) {
-                scope.leases = scope.leases.saturating_add(1);
-            }
-        }
-        if scope.leases == 0 {
-            inner.scopes.remove(&scope_id);
-        }
-        true
+    ) -> OwnerApplyResult {
+        self.apply_or_queue(CausalOp::Transfer {
+            scope_id,
+            from,
+            to: to.into_iter().collect(),
+        })
     }
 
-    pub fn release(&self, scope_id: u64, identity: LeaseIdentity) -> bool {
-        let Ok(mut inner) = self.inner.try_lock() else {
-            return false;
-        };
-        let Some(scope) = inner.scopes.get_mut(&scope_id) else {
-            return false;
-        };
-        if scope.identities.remove(&identity) {
-            scope.leases = scope.leases.saturating_sub(1);
+    pub fn release(&self, scope_id: u64, identity: LeaseIdentity) -> OwnerApplyResult {
+        self.apply_or_queue(CausalOp::Release { scope_id, identity })
+    }
+
+    fn apply_or_queue(&self, op: CausalOp) -> OwnerApplyResult {
+        match self.try_apply(&op) {
+            OwnerApplyResult::Applied => OwnerApplyResult::Applied,
+            OwnerApplyResult::WouldBlock => match self.pending.try_lock() {
+                Ok(mut pending) => {
+                    pending.push_back(op);
+                    OwnerApplyResult::WouldBlock
+                }
+                Err(_) => OwnerApplyResult::WouldBlock,
+            },
         }
-        if scope.leases == 0 {
-            inner.scopes.remove(&scope_id);
-            return true;
+    }
+
+    pub fn flush_pending(&self) -> usize {
+        let Ok(mut pending) = self.pending.try_lock() else {
+            return 0;
+        };
+        let mut applied = 0;
+        let mut kept = VecDeque::new();
+        while let Some(op) = pending.pop_front() {
+            match self.try_apply(&op) {
+                OwnerApplyResult::Applied => applied += 1,
+                OwnerApplyResult::WouldBlock => {
+                    kept.push_back(op);
+                    kept.extend(pending.drain(..));
+                    break;
+                }
+            }
         }
-        false
+        *pending = kept;
+        applied
+    }
+
+    #[must_use]
+    pub fn pending_ops(&self) -> bool {
+        self.pending
+            .try_lock()
+            .map(|pending| !pending.is_empty())
+            .unwrap_or(true)
+    }
+
+    pub fn try_apply(&self, op: &CausalOp) -> OwnerApplyResult {
+        let mut inner = match self.inner.try_lock() {
+            Ok(inner) => inner,
+            Err(TryLockError::WouldBlock) => return OwnerApplyResult::WouldBlock,
+            Err(TryLockError::Poisoned(poisoned)) => {
+                drop(poisoned.into_inner());
+                return OwnerApplyResult::WouldBlock;
+            }
+        };
+        match op {
+            CausalOp::Transfer { scope_id, from, to } => {
+                if let Some(scope) = inner.scopes.get_mut(scope_id) {
+                    if scope.identities.remove(from) {
+                        scope.leases = scope.leases.saturating_sub(1);
+                    }
+                    for identity in to {
+                        if scope.identities.insert(identity.clone()) {
+                            scope.leases = scope.leases.saturating_add(1);
+                        }
+                    }
+                    if scope.leases == 0 {
+                        inner.scopes.remove(scope_id);
+                    }
+                }
+            }
+            CausalOp::Release { scope_id, identity } => {
+                if let Some(scope) = inner.scopes.get_mut(scope_id) {
+                    if scope.identities.remove(identity) {
+                        scope.leases = scope.leases.saturating_sub(1);
+                    }
+                    if scope.leases == 0 {
+                        inner.scopes.remove(scope_id);
+                    }
+                }
+            }
+        }
+        OwnerApplyResult::Applied
+    }
+
+    #[doc(hidden)]
+    pub fn test_with_inner_held<R>(&self, body: impl FnOnce() -> R) -> R {
+        let _guard = self
+            .inner
+            .try_lock()
+            .expect("test hold must acquire causal inner");
+        body()
     }
 
     #[must_use]
@@ -1692,16 +1779,19 @@ mod tests {
                 plugin_key: "producer".into(),
             }))
             .expect("mint");
-        assert!(table.transfer(
-            scope,
-            LeaseIdentity::PendingEntityPublish {
-                plugin_key: "producer".into(),
-            },
-            [LeaseIdentity::AdmittedEntityMutation {
-                family: "producer.item".into(),
-                seq: 32,
-            }],
-        ));
+        assert_eq!(
+            table.transfer(
+                scope,
+                LeaseIdentity::PendingEntityPublish {
+                    plugin_key: "producer".into(),
+                },
+                [LeaseIdentity::AdmittedEntityMutation {
+                    family: "producer.item".into(),
+                    seq: 32,
+                }],
+            ),
+            OwnerApplyResult::Applied
+        );
         assert!(table.is_live(scope));
         assert_eq!(table.lease_count(scope), Some(1));
         assert_eq!(
@@ -1880,6 +1970,90 @@ mod tests {
                 .current_package_generation("producer")
                 .expect("unchanged"),
             generation
+        );
+    }
+
+    #[test]
+    fn held_causal_table_queues_transfer_and_release_until_flush() {
+        let table = CausalScopeTable::new();
+        let scope = table
+            .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+                plugin_key: "producer".into(),
+            }))
+            .expect("mint");
+        let busy = table.test_with_inner_held(|| {
+            table.transfer(
+                scope,
+                LeaseIdentity::PendingEntityPublish {
+                    plugin_key: "producer".into(),
+                },
+                [LeaseIdentity::AdmittedEntityMutation {
+                    family: "f".into(),
+                    seq: 1,
+                }],
+            )
+        });
+        assert_eq!(busy, OwnerApplyResult::WouldBlock);
+        assert!(table.pending_ops());
+        assert_eq!(
+            table.identities(scope),
+            Some(BTreeSet::from([LeaseIdentity::PendingEntityPublish {
+                plugin_key: "producer".into(),
+            }]))
+        );
+        assert_eq!(table.flush_pending(), 1);
+        assert!(!table.pending_ops());
+        assert_eq!(
+            table.identities(scope),
+            Some(BTreeSet::from([LeaseIdentity::AdmittedEntityMutation {
+                family: "f".into(),
+                seq: 1,
+            }]))
+        );
+        let busy_release = table.test_with_inner_held(|| {
+            table.release(
+                scope,
+                LeaseIdentity::AdmittedEntityMutation {
+                    family: "f".into(),
+                    seq: 1,
+                },
+            )
+        });
+        assert_eq!(busy_release, OwnerApplyResult::WouldBlock);
+        assert!(table.is_live(scope));
+        assert_eq!(table.flush_pending(), 1);
+        assert!(!table.is_live(scope));
+    }
+
+    #[test]
+    fn replace_package_generation_restores_snapshot_on_failed_subscribe() {
+        let router = router();
+        router
+            .try_register_contracts(vec![sample_contract("producer", "old")])
+            .expect("old");
+        let old = router
+            .current_package_generation("producer")
+            .expect("old gen");
+        assert_eq!(
+            router.try_replace_package_generation(
+                "producer",
+                vec![sample_contract("producer", "new")],
+                vec![EventSubscription {
+                    plugin_key: "consumer".into(),
+                    owner: "producer".into(),
+                    name: "missing".into(),
+                    handler_id: "missing".into(),
+                    generation: 1,
+                    ..EventSubscription::default()
+                }],
+            ),
+            Err(EventPlaneStatus::RejectedUndeclared)
+        );
+        assert!(router.test_has_contract("producer", "old"));
+        assert!(!router.test_has_contract("producer", "new"));
+        assert_eq!(
+            router.current_package_generation("producer").expect("kept"),
+            old
         );
     }
 

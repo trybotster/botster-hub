@@ -105,6 +105,7 @@ pub struct HubRuntime {
     package_event_router: Arc<crate::package_event_router::PackageEventRouter>,
     causal_scopes: Arc<crate::package_event_router::CausalScopeTable>,
     event_plane_owner_ops: std::cell::RefCell<crate::package_event_router::EventPlaneOwnerOps>,
+    pending_event_plane_replace: std::cell::RefCell<BTreeMap<String, PendingEventPlaneReplace>>,
 }
 
 type SharedCoreDaemon = Mutex<CoreDaemon>;
@@ -264,6 +265,7 @@ impl HubRuntime {
             event_plane_owner_ops: std::cell::RefCell::new(
                 crate::package_event_router::EventPlaneOwnerOps::default(),
             ),
+            pending_event_plane_replace: std::cell::RefCell::new(BTreeMap::new()),
         }
     }
 
@@ -347,6 +349,7 @@ impl HubRuntime {
             event_plane_owner_ops: std::cell::RefCell::new(
                 crate::package_event_router::EventPlaneOwnerOps::default(),
             ),
+            pending_event_plane_replace: std::cell::RefCell::new(BTreeMap::new()),
         };
         runtime.reconcile_sessions(0)?;
         Ok(runtime)
@@ -471,12 +474,40 @@ impl HubRuntime {
     #[must_use]
     pub fn event_plane_owner_ops_pending(&self) -> bool {
         !self.event_plane_owner_ops.borrow().is_empty()
+            || !self.pending_event_plane_replace.borrow().is_empty()
+            || self.causal_scopes.pending_ops()
     }
 
     pub fn apply_event_plane_owner_ops(&self) -> Vec<crate::package_event_router::OwnerOp> {
-        self.event_plane_owner_ops
+        let _ = self.causal_scopes.flush_pending();
+        let applied = self
+            .event_plane_owner_ops
             .borrow_mut()
-            .apply_ready(&self.package_event_router)
+            .apply_ready(&self.package_event_router);
+        self.flush_pending_event_plane_replaces();
+        applied
+    }
+
+    fn flush_pending_event_plane_replaces(&self) {
+        let pending: Vec<(String, PendingEventPlaneReplace)> =
+            std::mem::take(&mut *self.pending_event_plane_replace.borrow_mut())
+                .into_iter()
+                .collect();
+        for (owner, staged) in pending {
+            match self.package_event_router.try_replace_package_generation(
+                &owner,
+                staged.contracts.clone(),
+                staged.subscriptions.clone(),
+            ) {
+                Ok(_) => {}
+                Err(EventPlaneStatus::ShedBusy) => {
+                    self.pending_event_plane_replace
+                        .borrow_mut()
+                        .insert(owner, staged);
+                }
+                Err(_) => {}
+            }
+        }
     }
 
     /// Return the startup reconciliation decisions made against the core daemon registry.
@@ -554,27 +585,40 @@ impl HubRuntime {
         )
         .map_err(HubLuaPluginLoadError::Lua)?;
         let event_handlers = bundle.event_handlers.clone();
+        let staged = self
+            .staged_package_event_plane(package_name, registry, &event_handlers)
+            .map_err(HubLuaPluginLoadError::EventPlane)?;
         let cleanup = self
             .reload_plugin_package(request_id, registry, package_name, bundle)
             .map_err(HubLuaPluginLoadError::Lifecycle)?;
-        if let Err(status) =
-            self.commit_loaded_package_event_plane(package_name, registry, &event_handlers)
-        {
-            let _ = self.unload_plugin_package(
-                RequestId(format!("event-plane-rollback-{package_name}")),
-                package_name,
-            );
-            return Err(HubLuaPluginLoadError::EventPlane(status));
+        match self.package_event_router.try_replace_package_generation(
+            package_name,
+            staged.contracts.clone(),
+            staged.subscriptions.clone(),
+        ) {
+            Ok(_) => {}
+            Err(EventPlaneStatus::ShedBusy) => {
+                self.pending_event_plane_replace
+                    .borrow_mut()
+                    .insert(package_name.to_string(), staged);
+            }
+            Err(status) => {
+                let _ = self.unload_plugin_package(
+                    RequestId(format!("event-plane-rollback-{package_name}")),
+                    package_name,
+                );
+                return Err(HubLuaPluginLoadError::EventPlane(status));
+            }
         }
         Ok(cleanup)
     }
 
-    fn commit_loaded_package_event_plane(
+    fn staged_package_event_plane(
         &self,
         package_name: &str,
         registry: &PackageRegistry,
         event_handlers: &[crate::lifecycle::HubPluginEventHandler],
-    ) -> Result<u64, EventPlaneStatus> {
+    ) -> Result<PendingEventPlaneReplace, EventPlaneStatus> {
         let contracts = match registry.package(package_name) {
             Some(record) => record
                 .manifest
@@ -597,10 +641,23 @@ impl HubRuntime {
                 ..EventSubscription::default()
             })
             .collect();
-        self.package_event_router.try_commit_package_generation(
-            package_name,
+        Ok(PendingEventPlaneReplace {
             contracts,
             subscriptions,
+        })
+    }
+
+    fn commit_loaded_package_event_plane(
+        &self,
+        package_name: &str,
+        registry: &PackageRegistry,
+        event_handlers: &[crate::lifecycle::HubPluginEventHandler],
+    ) -> Result<u64, EventPlaneStatus> {
+        let staged = self.staged_package_event_plane(package_name, registry, event_handlers)?;
+        self.package_event_router.try_commit_package_generation(
+            package_name,
+            staged.contracts,
+            staged.subscriptions,
         )
     }
 
@@ -1339,25 +1396,64 @@ impl HubRuntime {
     /// Drain admitted package entity mutations for control-path fanout.
     #[must_use]
     pub fn take_package_entity_fanout(&self) -> Vec<PackageEntityMutation> {
+        self.take_leased_package_entity_fanout()
+            .into_iter()
+            .map(|item| item.mutation)
+            .collect()
+    }
+
+    #[must_use]
+    pub fn take_leased_package_entity_fanout(&self) -> Vec<TakenPackageEntityMutation> {
         let mut fanout = self
             .package_entity_fanout
             .lock()
             .expect("package entity fanout lock");
         fanout
             .drain(..)
-            .map(|item| {
-                if let Some(lease) = item.lease {
-                    self.causal_scopes.release(
-                        lease.scope_id,
-                        LeaseIdentity::AdmittedEntityMutation {
-                            family: lease.family,
-                            seq: lease.seq,
-                        },
-                    );
-                }
-                item.mutation
+            .map(|item| TakenPackageEntityMutation {
+                mutation: item.mutation,
+                lease: item.lease,
             })
             .collect()
+    }
+
+    /// Release or convert the mutation lease after subscriber decisions finish.
+    pub fn finish_package_entity_mutation_fanout(
+        &self,
+        item: &TakenPackageEntityMutation,
+        scheduled_resync: bool,
+    ) {
+        let Some(lease) = item.lease.clone() else {
+            return;
+        };
+        let admitted = LeaseIdentity::AdmittedEntityMutation {
+            family: lease.family.clone(),
+            seq: lease.seq,
+        };
+        if scheduled_resync {
+            let now = Instant::now();
+            let mut families = self
+                .package_entity_families
+                .lock()
+                .expect("package entity family lock");
+            let family = families.entry(lease.family.clone()).or_default();
+            family.resync.mark_needed(now);
+            let added = family.remember_resync_lease(lease.scope_id, lease.family.clone());
+            drop(families);
+            if added {
+                self.causal_scopes.transfer(
+                    lease.scope_id,
+                    admitted,
+                    [LeaseIdentity::ProviderResyncNeed {
+                        family: lease.family,
+                    }],
+                );
+            } else {
+                self.causal_scopes.release(lease.scope_id, admitted);
+            }
+        } else {
+            self.causal_scopes.release(lease.scope_id, admitted);
+        }
     }
 
     /// Snapshot of package entity family admission state for one family.
@@ -3256,6 +3352,17 @@ impl Error for HubLuaPluginLoadError {
 
 struct LeasedFanoutMutation {
     mutation: PackageEntityMutation,
+    lease: Option<EntityMutationLease>,
+}
+
+struct PendingEventPlaneReplace {
+    contracts: Vec<crate::package_event_router::EmittedContract>,
+    subscriptions: Vec<EventSubscription>,
+}
+
+/// One drained mutation plus the lease that stays live until fanout finishes.
+pub struct TakenPackageEntityMutation {
+    pub mutation: PackageEntityMutation,
     lease: Option<EntityMutationLease>,
 }
 
