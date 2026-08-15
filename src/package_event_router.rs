@@ -297,53 +297,62 @@ impl PackageEventRouter {
         Ok(())
     }
 
+    /// Commit one package generation, its contracts, and its exact subscriptions
+    /// under a single `try_lock`. Callers must invoke this only after Lua and
+    /// lifecycle admission succeed. Contention returns `shed_busy` with no
+    /// partial mutation. A later subscribe failure rolls the generation back.
+    pub fn try_commit_package_generation(
+        &self,
+        owner: &str,
+        contracts: Vec<EmittedContract>,
+        subscriptions: Vec<EventSubscription>,
+    ) -> Result<u64, EventPlaneStatus> {
+        if owner == HUB_EVENT_OWNER {
+            return Err(EventPlaneStatus::RejectedForeign);
+        }
+        let mut inner = lock_inner(&self.inner)?;
+        if contracts.is_empty() && subscriptions.is_empty() {
+            return Ok(inner.package_generation.get(owner).copied().unwrap_or(0));
+        }
+        for contract in &contracts {
+            if contract.owner == HUB_EVENT_OWNER || contract.owner != owner {
+                return Err(EventPlaneStatus::RejectedForeign);
+            }
+        }
+        let previous_generation = inner.package_generation.get(owner).copied().unwrap_or(0);
+        let generation = bump_package_generation(&mut inner, owner);
+        let mut inserted_contracts = Vec::new();
+        for mut contract in contracts {
+            contract.package_generation = generation;
+            let key = (contract.owner.clone(), contract.name.clone());
+            inner.contracts.insert(key.clone(), contract);
+            inserted_contracts.push(key);
+        }
+        let mut inserted_subscriptions = Vec::new();
+        for subscription in subscriptions {
+            match subscribe_locked(&mut inner, subscription.clone()) {
+                EventPlaneStatus::Accepted => inserted_subscriptions.push(subscription),
+                status => {
+                    rollback_package_commit(
+                        &mut inner,
+                        owner,
+                        previous_generation,
+                        &inserted_contracts,
+                        &inserted_subscriptions,
+                    );
+                    return Err(status);
+                }
+            }
+        }
+        Ok(generation)
+    }
+
     pub fn try_subscribe(&self, subscription: EventSubscription) -> EventPlaneStatus {
-        if is_wildcard(&subscription.owner) || is_wildcard(&subscription.name) {
-            return EventPlaneStatus::RejectedWildcard;
-        }
-        if subscription.owner.trim().is_empty() || subscription.name.trim().is_empty() {
-            return EventPlaneStatus::RejectedInvalid;
-        }
         let mut inner = match lock_inner(&self.inner) {
             Ok(inner) => inner,
             Err(status) => return status,
         };
-        let key = (subscription.owner.clone(), subscription.name.clone());
-        let Some(contract) = inner.contracts.get(&key) else {
-            return EventPlaneStatus::RejectedUndeclared;
-        };
-        if !contract.audience.contains(&EventAudience::Plugins) {
-            return EventPlaneStatus::RejectedAudience;
-        }
-        let event_generation = contract.package_generation;
-        let plugin_generation = inner
-            .package_generation
-            .get(&subscription.plugin_key)
-            .copied()
-            .unwrap_or(0);
-        let plugin_count = inner
-            .subscriptions_per_plugin
-            .get(&subscription.plugin_key)
-            .copied()
-            .unwrap_or(0);
-        if plugin_count >= inner.policy.subscriptions_per_plugin_max {
-            return EventPlaneStatus::RejectedInvalid;
-        }
-        let max_subscribers = inner.policy.subscribers_per_event_max;
-        let event_subs = inner.subscriptions.entry(key).or_default();
-        if event_subs.len() >= max_subscribers {
-            return EventPlaneStatus::RejectedOverFanout;
-        }
-        let mut subscription = subscription;
-        subscription.event_generation = event_generation;
-        subscription.plugin_generation = plugin_generation;
-        let plugin_key = subscription.plugin_key.clone();
-        event_subs.push(subscription);
-        *inner
-            .subscriptions_per_plugin
-            .entry(plugin_key)
-            .or_insert(0) += 1;
-        EventPlaneStatus::Accepted
+        subscribe_locked(&mut inner, subscription)
     }
 
     pub fn try_ingress(
@@ -679,10 +688,36 @@ impl PackageEventRouter {
         self.next_holder_key.fetch_add(1, Ordering::SeqCst)
     }
 
-    #[cfg(test)]
+    #[doc(hidden)]
     pub fn test_with_inner_held<R>(&self, body: impl FnOnce() -> R) -> R {
         let _guard = self.inner.try_lock().expect("test hold must acquire inner");
         body()
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn test_subscription_count(&self, plugin_key: &str) -> usize {
+        lock_inner(&self.inner)
+            .map(|inner| {
+                inner
+                    .subscriptions_per_plugin
+                    .get(plugin_key)
+                    .copied()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0)
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn test_has_contract(&self, owner: &str, name: &str) -> bool {
+        lock_inner(&self.inner)
+            .map(|inner| {
+                inner
+                    .contracts
+                    .contains_key(&(owner.to_string(), name.to_string()))
+            })
+            .unwrap_or(false)
     }
 }
 
@@ -734,6 +769,93 @@ fn consume_token(inner: &mut RouterInner, owner: &str, now: Instant) -> bool {
     }
     bucket.tokens -= 1.0;
     true
+}
+
+fn subscribe_locked(inner: &mut RouterInner, subscription: EventSubscription) -> EventPlaneStatus {
+    if is_wildcard(&subscription.owner) || is_wildcard(&subscription.name) {
+        return EventPlaneStatus::RejectedWildcard;
+    }
+    if subscription.owner.trim().is_empty() || subscription.name.trim().is_empty() {
+        return EventPlaneStatus::RejectedInvalid;
+    }
+    let key = (subscription.owner.clone(), subscription.name.clone());
+    let Some(contract) = inner.contracts.get(&key) else {
+        return EventPlaneStatus::RejectedUndeclared;
+    };
+    if !contract.audience.contains(&EventAudience::Plugins) {
+        return EventPlaneStatus::RejectedAudience;
+    }
+    let event_generation = contract.package_generation;
+    let plugin_generation = inner
+        .package_generation
+        .get(&subscription.plugin_key)
+        .copied()
+        .unwrap_or(0);
+    let plugin_count = inner
+        .subscriptions_per_plugin
+        .get(&subscription.plugin_key)
+        .copied()
+        .unwrap_or(0);
+    if plugin_count >= inner.policy.subscriptions_per_plugin_max {
+        return EventPlaneStatus::RejectedInvalid;
+    }
+    let max_subscribers = inner.policy.subscribers_per_event_max;
+    let event_subs = inner.subscriptions.entry(key).or_default();
+    if event_subs.len() >= max_subscribers {
+        return EventPlaneStatus::RejectedOverFanout;
+    }
+    let mut subscription = subscription;
+    subscription.event_generation = event_generation;
+    subscription.plugin_generation = plugin_generation;
+    let plugin_key = subscription.plugin_key.clone();
+    event_subs.push(subscription);
+    *inner
+        .subscriptions_per_plugin
+        .entry(plugin_key)
+        .or_insert(0) += 1;
+    EventPlaneStatus::Accepted
+}
+
+fn rollback_package_commit(
+    inner: &mut RouterInner,
+    owner: &str,
+    previous_generation: u64,
+    inserted_contracts: &[(String, String)],
+    inserted_subscriptions: &[EventSubscription],
+) {
+    for key in inserted_contracts {
+        inner.contracts.remove(key);
+    }
+    for subscription in inserted_subscriptions {
+        let key = (subscription.owner.clone(), subscription.name.clone());
+        if let Some(event_subs) = inner.subscriptions.get_mut(&key) {
+            event_subs.retain(|existing| {
+                existing.plugin_key != subscription.plugin_key
+                    || existing.handler_id != subscription.handler_id
+            });
+            if event_subs.is_empty() {
+                inner.subscriptions.remove(&key);
+            }
+        }
+        if let Some(count) = inner
+            .subscriptions_per_plugin
+            .get_mut(&subscription.plugin_key)
+        {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                inner
+                    .subscriptions_per_plugin
+                    .remove(&subscription.plugin_key);
+            }
+        }
+    }
+    if previous_generation == 0 {
+        inner.package_generation.remove(owner);
+    } else {
+        inner
+            .package_generation
+            .insert(owner.to_string(), previous_generation);
+    }
 }
 
 fn bump_package_generation(inner: &mut RouterInner, owner: &str) -> u64 {
@@ -980,6 +1102,34 @@ impl CausalScopeTable {
         true
     }
 
+    /// Replace one identity with zero or more identities under a single lock so
+    /// the scope row cannot disappear between release and acquire.
+    pub fn transfer(
+        &self,
+        scope_id: u64,
+        from: LeaseIdentity,
+        to: impl IntoIterator<Item = LeaseIdentity>,
+    ) -> bool {
+        let Ok(mut inner) = self.inner.try_lock() else {
+            return false;
+        };
+        let Some(scope) = inner.scopes.get_mut(&scope_id) else {
+            return false;
+        };
+        if scope.identities.remove(&from) {
+            scope.leases = scope.leases.saturating_sub(1);
+        }
+        for identity in to {
+            if scope.identities.insert(identity) {
+                scope.leases = scope.leases.saturating_add(1);
+            }
+        }
+        if scope.leases == 0 {
+            inner.scopes.remove(&scope_id);
+        }
+        true
+    }
+
     pub fn release(&self, scope_id: u64, identity: LeaseIdentity) -> bool {
         let Ok(mut inner) = self.inner.try_lock() else {
             return false;
@@ -999,11 +1149,17 @@ impl CausalScopeTable {
 
     #[must_use]
     pub fn is_live(&self, scope_id: u64) -> bool {
-        self.inner
-            .try_lock()
-            .ok()
-            .and_then(|inner| inner.scopes.get(&scope_id).map(|scope| scope.leases > 0))
-            .unwrap_or(true)
+        match self.inner.try_lock() {
+            Ok(inner) => inner
+                .scopes
+                .get(&scope_id)
+                .is_some_and(|scope| scope.leases > 0),
+            Err(TryLockError::WouldBlock) => true,
+            Err(TryLockError::Poisoned(poisoned)) => {
+                drop(poisoned.into_inner());
+                true
+            }
+        }
     }
 
     #[must_use]
@@ -1012,6 +1168,17 @@ impl CausalScopeTable {
             .try_lock()
             .ok()
             .and_then(|inner| inner.scopes.get(&scope_id).map(|scope| scope.leases))
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn identities(&self, scope_id: u64) -> Option<BTreeSet<LeaseIdentity>> {
+        self.inner.try_lock().ok().and_then(|inner| {
+            inner
+                .scopes
+                .get(&scope_id)
+                .map(|scope| scope.identities.clone())
+        })
     }
 }
 
@@ -1515,6 +1682,205 @@ mod tests {
         );
         let snapshot = router.snapshot().expect("snapshot");
         assert_eq!(snapshot.global_in_flight_bytes, 0);
+    }
+
+    #[test]
+    fn transfer_keeps_scope_live_across_identity_handoff() {
+        let table = CausalScopeTable::new();
+        let scope = table
+            .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+                plugin_key: "producer".into(),
+            }))
+            .expect("mint");
+        assert!(table.transfer(
+            scope,
+            LeaseIdentity::PendingEntityPublish {
+                plugin_key: "producer".into(),
+            },
+            [LeaseIdentity::AdmittedEntityMutation {
+                family: "producer.item".into(),
+                seq: 32,
+            }],
+        ));
+        assert!(table.is_live(scope));
+        assert_eq!(table.lease_count(scope), Some(1));
+        assert_eq!(
+            table.identities(scope),
+            Some(BTreeSet::from([LeaseIdentity::AdmittedEntityMutation {
+                family: "producer.item".into(),
+                seq: 32,
+            }]))
+        );
+    }
+
+    #[test]
+    fn oversize_payload_is_rejected_oversize_without_occupancy() {
+        let policy = PackageEventPlanePolicy {
+            payload_max_bytes: 4,
+            ..PackageEventPlanePolicy::default()
+        };
+        let router = PackageEventRouter::new(policy);
+        router
+            .try_register_contracts(vec![sample_contract("producer", "sample.ready")])
+            .expect("register");
+        subscribe(&router, "consumer", "producer", "sample.ready");
+        assert_eq!(
+            router.try_ingress(
+                "producer",
+                "sample.ready",
+                &serde_json::json!({ "ok": true }),
+                Instant::now()
+            ),
+            EventPlaneStatus::RejectedOversize
+        );
+        let snapshot = router.snapshot().expect("snapshot");
+        assert_eq!(snapshot.global_in_flight_bytes, 0);
+        assert_eq!(snapshot.queued_holders, 0);
+        assert_eq!(
+            snapshot
+                .producer_events
+                .get("producer")
+                .copied()
+                .unwrap_or(0),
+            0
+        );
+    }
+
+    #[test]
+    fn exhausted_tokens_are_rejected_over_rate_without_occupancy() {
+        let policy = PackageEventPlanePolicy {
+            package_rate_per_sec: 1,
+            package_burst: 1,
+            ..PackageEventPlanePolicy::default()
+        };
+        let router = PackageEventRouter::new(policy);
+        router
+            .try_register_contracts(vec![sample_contract("producer", "sample.ready")])
+            .expect("register");
+        subscribe(&router, "consumer", "producer", "sample.ready");
+        let now = Instant::now();
+        assert_eq!(
+            router.try_ingress(
+                "producer",
+                "sample.ready",
+                &serde_json::json!({ "ok": true }),
+                now
+            ),
+            EventPlaneStatus::Accepted
+        );
+        assert_eq!(
+            router.try_ingress(
+                "producer",
+                "sample.ready",
+                &serde_json::json!({ "ok": true }),
+                now
+            ),
+            EventPlaneStatus::RejectedOverRate
+        );
+        let snapshot = router.snapshot().expect("snapshot");
+        assert_eq!(snapshot.queued_holders, 1);
+        assert_eq!(
+            snapshot
+                .producer_events
+                .get("producer")
+                .copied()
+                .unwrap_or(0),
+            1
+        );
+        let batch = router
+            .pull_ready_batch(8, 64 * 1024, Instant::now(), StdDuration::from_millis(8))
+            .expect("batch");
+        assert_eq!(batch.len(), 1);
+        router
+            .note_admitted(batch[0].envelope_id, "consumer", 1)
+            .expect("admit");
+        router
+            .retire_holder(batch[0].envelope_id, "consumer", 1)
+            .expect("retire");
+        let after = router.snapshot().expect("after");
+        assert_eq!(after.global_in_flight_bytes, 0);
+        assert_eq!(after.queued_holders, 0);
+    }
+
+    #[test]
+    fn ingress_over_fanout_is_rejected_without_occupancy() {
+        let policy = PackageEventPlanePolicy {
+            fanout_per_emit_max: 1,
+            subscribers_per_event_max: 2,
+            ..PackageEventPlanePolicy::default()
+        };
+        let router = PackageEventRouter::new(policy);
+        router
+            .try_register_contracts(vec![sample_contract("producer", "sample.ready")])
+            .expect("register");
+        subscribe(&router, "consumer-a", "producer", "sample.ready");
+        subscribe(&router, "consumer-b", "producer", "sample.ready");
+        assert_eq!(
+            router.try_ingress(
+                "producer",
+                "sample.ready",
+                &serde_json::json!({ "ok": true }),
+                Instant::now()
+            ),
+            EventPlaneStatus::RejectedOverFanout
+        );
+        let snapshot = router.snapshot().expect("snapshot");
+        assert_eq!(snapshot.global_in_flight_bytes, 0);
+        assert_eq!(snapshot.queued_holders, 0);
+        assert_eq!(
+            snapshot
+                .producer_events
+                .get("producer")
+                .copied()
+                .unwrap_or(0),
+            0
+        );
+    }
+
+    #[test]
+    fn commit_package_generation_is_atomic_and_held_lock_is_shed_busy() {
+        let router = router();
+        let contracts = vec![sample_contract("producer", "sample.ready")];
+        let subscriptions = vec![EventSubscription {
+            plugin_key: "consumer".into(),
+            owner: "producer".into(),
+            name: "sample.ready".into(),
+            handler_id: "event:producer:sample.ready:1".into(),
+            generation: 1,
+            ..EventSubscription::default()
+        }];
+        let generation = router
+            .try_commit_package_generation("producer", contracts.clone(), subscriptions.clone())
+            .expect("commit");
+        assert!(generation > 0);
+        assert!(router.test_has_contract("producer", "sample.ready"));
+        assert_eq!(router.test_subscription_count("consumer"), 1);
+
+        let undeclared = vec![EventSubscription {
+            plugin_key: "consumer".into(),
+            owner: "producer".into(),
+            name: "missing".into(),
+            handler_id: "missing".into(),
+            generation: 2,
+            ..EventSubscription::default()
+        }];
+        assert_eq!(
+            router.try_commit_package_generation("other", Vec::new(), undeclared),
+            Err(EventPlaneStatus::RejectedUndeclared)
+        );
+        assert!(!router.test_has_contract("other", "missing"));
+        assert_eq!(router.current_package_generation("other").expect("gen"), 0);
+
+        let busy = router.test_with_inner_held(|| {
+            router.try_commit_package_generation("producer", contracts, subscriptions)
+        });
+        assert_eq!(busy, Err(EventPlaneStatus::ShedBusy));
+        assert_eq!(
+            router
+                .current_package_generation("producer")
+                .expect("unchanged"),
+            generation
+        );
     }
 
     #[test]
