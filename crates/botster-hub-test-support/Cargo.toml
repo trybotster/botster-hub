@@ -14,7 +14,7 @@ include = [
 ]
 
 [dependencies]
-botster-core = { git = "https://github.com/trybotster/botster-core.git", rev = "f4f6bf5babe92dfb9241a760c414187f711c2c42" }
+botster-core = { git = "https://github.com/trybotster/botster-core.git", rev = "aef6516d5809d563961ed7fdd07da29a7b4edddc" }
 botster-hub-client = { path = "../botster-hub-client" }
 botster-ui-contract = { git = "https://github.com/trybotster/botster-hub.git", tag = "botster-ui-contract-v0.3.2" }
 libc = "0.2.177"
@@ -25,5 +25,5 @@ serde_json = "1.0.150"
 # Import-semantic proof for frozen GHOSTSNP late-attach goldens. Same Core pin
 # as the workspace lockfile. Requires Zig 0.16.0 for libghostty-vt, matching
 # hub session-worker production builds.
-botster-terminal-ghostty = { git = "https://github.com/trybotster/botster-core.git", rev = "f4f6bf5babe92dfb9241a760c414187f711c2c42", features = ["libghostty-vt"] }
+botster-terminal-ghostty = { git = "https://github.com/trybotster/botster-core.git", rev = "aef6516d5809d563961ed7fdd07da29a7b4edddc", features = ["libghostty-vt"] }
 sha2 = "0.10"

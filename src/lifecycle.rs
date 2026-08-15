@@ -9,10 +9,11 @@ use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 
 use botster_core::{
-    BoundaryJson, PluginCleanupResult, PluginCleanupScope, PluginDescriptorKind,
-    PluginHandlerRegistration, PluginInvocationOutcome, PluginInvocationRequest, PluginKey,
-    PluginLoadSpec, PluginOwnedDescriptor, PluginReloadSpec, PluginResourceRef, PluginRuntime,
-    PluginUnloadSpec, PluginWorkerDebugSnapshot, PluginWorkerEngine, PluginWorkerEngineConfig,
+    BoundaryJson, PluginAdmissionResult, PluginCleanupResult, PluginCleanupScope,
+    PluginCompletionDrain, PluginDescriptorKind, PluginHandlerRegistration, PluginInvocationClass,
+    PluginInvocationOutcome, PluginInvocationRequest, PluginKey, PluginLoadSpec,
+    PluginOwnedDescriptor, PluginReloadSpec, PluginResourceRef, PluginRuntime, PluginUnloadSpec,
+    PluginWorkerDebugSnapshot, PluginWorkerEngine, PluginWorkerEngineConfig,
     PluginWorkerRegistration, RequestId,
 };
 
@@ -140,6 +141,22 @@ impl HubPluginLifecycle {
     #[must_use]
     pub fn invoke(&self, request: PluginInvocationRequest) -> PluginInvocationOutcome {
         self.engine.invoke(request)
+    }
+
+    /// Admit one invocation without waiting for execution or completion.
+    #[must_use]
+    pub fn try_admit(
+        &self,
+        class: PluginInvocationClass,
+        request: PluginInvocationRequest,
+    ) -> PluginAdmissionResult {
+        self.engine.try_admit(class, request)
+    }
+
+    /// Drain previously published async completions without waiting.
+    #[must_use]
+    pub fn drain_completions(&self, max_items: usize, max_bytes: usize) -> PluginCompletionDrain {
+        self.engine.drain_completions(max_items, max_bytes)
     }
 
     /// Reload an enabled package through core worker reload cleanup and replacement.

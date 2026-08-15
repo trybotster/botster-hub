@@ -3,6 +3,9 @@ fn daemon_restart_preserves_split_plugin_worker_configuration() {
     let mut config = explicit_config(unique_test_dir("plugin-worker-config-restart"));
     config.core_engine.plugin_worker_queue_capacity = 9;
     config.core_engine.plugin_worker_executor_concurrency = 3;
+    config.core_engine.reserved_request_response_executors = 1;
+    config.core_engine.background_queue_capacity = 6;
+    config.core_engine.completion_queue_capacity = 5;
 
     let mut daemon = HubDaemon::start(config.clone()).expect("start configured daemon");
     let initial = daemon
@@ -11,6 +14,9 @@ fn daemon_restart_preserves_split_plugin_worker_configuration() {
         .plugin_worker_debug_snapshot();
     assert_eq!(initial.configured_queue_capacity, 9);
     assert_eq!(initial.configured_executor_concurrency, 3);
+    assert_eq!(initial.configured_reserved_request_response_executors, 1);
+    assert_eq!(initial.configured_background_queue_capacity, 6);
+    assert_eq!(initial.configured_completion_queue_capacity, 5);
     daemon.stop();
 
     let mut restarted = HubDaemon::start(config).expect("restart configured daemon");
@@ -20,6 +26,9 @@ fn daemon_restart_preserves_split_plugin_worker_configuration() {
         .plugin_worker_debug_snapshot();
     assert_eq!(reopened.configured_queue_capacity, 9);
     assert_eq!(reopened.configured_executor_concurrency, 3);
+    assert_eq!(reopened.configured_reserved_request_response_executors, 1);
+    assert_eq!(reopened.configured_background_queue_capacity, 6);
+    assert_eq!(reopened.configured_completion_queue_capacity, 5);
     restarted.stop();
 }
 

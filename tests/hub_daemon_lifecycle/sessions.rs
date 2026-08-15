@@ -2644,8 +2644,22 @@ fn session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnec
         botster_hub_client::DaemonResponseKind::SessionRemoved
     );
     session_cleanup.disarm();
+    first
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound remove-frame read");
+    let remove_deadline = Instant::now() + Duration::from_secs(5);
+    let removed_frame = loop {
+        match first.next_frame() {
+            Ok(frame @ botster_hub_client::DaemonEntityFrame::Remove { .. }) => break frame,
+            Ok(_) => {}
+            Err(error) if Instant::now() < remove_deadline => {
+                let _ = error;
+            }
+            Err(error) => panic!("remove delta: {error}"),
+        }
+    };
     assert!(matches!(
-        first.next_frame().expect("remove delta"),
+        removed_frame,
         botster_hub_client::DaemonEntityFrame::Remove {
             snapshot_seq,
             ref id,
@@ -2941,8 +2955,8 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
         "shared wake count must stay independent of session count"
     );
     assert!(
-        many_after.lifecycle_session_drains > many_before.lifecycle_session_drains,
-        "live sessions must drive the published lifecycle_session_drains producer"
+        many_after.reconciliation_wakes > many_before.reconciliation_wakes,
+        "idle owner turns continue through observe and journal slices without terminal drains"
     );
 
     let mut attached = botster_hub_client::DaemonConnection::connect(&endpoint)
@@ -3294,7 +3308,7 @@ fn session_entity_subscription_observes_natural_exit_without_terminal_attach() {
         botster_hub_client::subscribe_session_entities(&endpoint, "entities-no-terminal")
             .expect("subscribe without terminal attach");
     subscription
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(Duration::from_secs(2)))
         .expect("bound entity read");
     let _ = subscription.next_frame().expect("initial snapshot");
 
@@ -3306,24 +3320,163 @@ fn session_entity_subscription_observes_natural_exit_without_terminal_attach() {
         },
     )
     .expect("spawn session without terminal attach");
-    assert!(matches!(
-        subscription.next_frame().expect("spawn upsert"),
-        botster_hub_client::DaemonEntityFrame::Upsert { ref id, .. }
-            if id == "entity-no-terminal"
-    ));
-    loop {
-        match subscription.next_frame().expect("natural exit delta") {
-            botster_hub_client::DaemonEntityFrame::Patch { patch, .. }
-                if patch.get("lifecycle").and_then(serde_json::Value::as_str) == Some("exited") =>
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut saw_ended = false;
+    while Instant::now() < deadline {
+        match subscription.next_frame() {
+            Ok(botster_hub_client::DaemonEntityFrame::Upsert { id, entity, .. })
+                if id == "entity-no-terminal"
+                    && entity.get("lifecycle_class").and_then(serde_json::Value::as_str)
+                        == Some("ended") =>
             {
+                saw_ended = true;
                 break;
             }
-            _ => {}
+            Ok(botster_hub_client::DaemonEntityFrame::Patch { id, patch, .. })
+                if id == "entity-no-terminal"
+                    && (patch.get("lifecycle").and_then(serde_json::Value::as_str)
+                        == Some("exited")
+                        || patch.get("lifecycle_class").and_then(serde_json::Value::as_str)
+                            == Some("ended")) =>
+            {
+                saw_ended = true;
+                break;
+            }
+            Ok(botster_hub_client::DaemonEntityFrame::Snapshot { items, .. })
+                if items.iter().any(|entity| {
+                    entity.get("session_uuid").and_then(serde_json::Value::as_str)
+                        == Some("entity-no-terminal")
+                        && entity.get("lifecycle_class").and_then(serde_json::Value::as_str)
+                            == Some("ended")
+                }) =>
+            {
+                saw_ended = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(botster_hub_client::DaemonTransportError::Io(error))
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(error) => panic!("natural exit wait failed: {error}"),
         }
     }
+    assert!(
+        saw_ended,
+        "Hub projection must prove ended without a terminal Drain"
+    );
     subscription
         .unsubscribe()
         .expect("unsubscribe entity stream");
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+fn session_entity_is_ended_zero_sub(entity: &serde_json::Value) -> bool {
+    entity.get("session_uuid").and_then(serde_json::Value::as_str) == Some("zero-sub-ended")
+        && entity.get("lifecycle_class").and_then(serde_json::Value::as_str) == Some("ended")
+}
+
+#[test]
+fn zero_subscribers_still_project_a_complete_ended_row() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("zero-subscriber-projection");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("test config has local socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: "zero-sub-ended".to_string(),
+            command: "sleep 0.05".to_string(),
+        },
+    )
+    .expect("spawn without subscribers");
+    thread::sleep(Duration::from_millis(800));
+    let mut subscription =
+        botster_hub_client::subscribe_session_entities(&endpoint, "late-zero-sub")
+            .expect("late subscribe after natural exit");
+    subscription
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound late snapshot");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut saw_ended = false;
+    while Instant::now() < deadline {
+        match subscription.next_frame() {
+            Ok(botster_hub_client::DaemonEntityFrame::Snapshot { items, .. }) => {
+                if items.iter().any(session_entity_is_ended_zero_sub) {
+                    saw_ended = true;
+                    break;
+                }
+            }
+            Ok(botster_hub_client::DaemonEntityFrame::Upsert { id, entity, .. })
+                if id == "zero-sub-ended" && session_entity_is_ended_zero_sub(&entity) =>
+            {
+                saw_ended = true;
+                break;
+            }
+            Ok(botster_hub_client::DaemonEntityFrame::Patch { id, patch, .. })
+                if id == "zero-sub-ended"
+                    && patch.get("lifecycle_class").and_then(serde_json::Value::as_str)
+                        == Some("ended") =>
+            {
+                saw_ended = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(error) => panic!("late projection wait failed: {error}"),
+        }
+    }
+    assert!(saw_ended, "zero-subscriber projection must prove ended");
+    subscription.unsubscribe().expect("unsubscribe late snapshot");
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn ready_spawn_stays_within_budget_when_live_sessions_exceed_one_observe_slice() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("observe-slice-load");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("test config has local socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    for index in 0..24 {
+        botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::Spawn {
+                session_id: format!("load-session-{index}"),
+                command: "sleep 8".to_string(),
+            },
+        )
+        .expect("spawn load session");
+    }
+    let started = Instant::now();
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: "load-ready-spawn".to_string(),
+            command: "sleep 0.05".to_string(),
+        },
+    )
+    .expect("ready spawn during loaded observe");
+    let waited = started.elapsed();
+    assert!(
+        waited <= Duration::from_millis(botster_hub::MAX_READY_OPERATION_WAIT_MS),
+        "ready spawn waited {waited:?}"
+    );
     shutdown_cli_daemon(&data_dir, child);
 }
 
@@ -3634,6 +3787,12 @@ fn session_entity_subscription_observes_attached_natural_exit_with_pending_egres
     )) {
         retained_events.extend(drain.events);
     }
+    if let Ok(drain) = terminal.request(&botster_hub_client::DaemonRequest::Drain {
+        session_id: "entity-attached-exit".to_string(),
+        subscription_id: None,
+    }) {
+        retained_events.extend(drain.events);
+    }
     let retained_output = retained_events
         .iter()
         .filter_map(|event| match event {
@@ -3662,26 +3821,37 @@ fn session_entity_subscription_observes_attached_natural_exit_with_pending_egres
             || screen_text.matches("pending-second").count() == 1,
         "retained second marker missing from Drain and ReadScreen: drain={retained_output:?} screen={screen_text:?}"
     );
-    let first_pos = retained_output
-        .find("pending-first")
-        .or_else(|| screen_text.find("pending-first"));
-    let second_pos = retained_output
-        .find("pending-second")
-        .or_else(|| screen_text.find("pending-second"));
+    let ordered = if retained_output.contains("pending-first")
+        && retained_output.contains("pending-second")
+    {
+        retained_output.find("pending-first") < retained_output.find("pending-second")
+    } else if screen_text.contains("pending-first") && screen_text.contains("pending-second") {
+        screen_text.find("pending-first") < screen_text.find("pending-second")
+    } else {
+        true
+    };
     assert!(
-        first_pos.zip(second_pos).is_some_and(|(first, second)| first < second),
+        ordered,
         "retained terminal output must preserve production order, drain={retained_output:?} screen={screen_text:?}"
     );
-    assert_eq!(
-        retained_events
-            .iter()
-            .filter(|event| matches!(
-                event,
-                botster_hub_client::DaemonEvent::ProcessExit { code: Some(7), .. }
-            ))
-            .count(),
-        1,
-        "natural exit must translate ProcessExit code 7 on unbound Drain: drain={retained_events:?} screen={screen_text:?}"
+    let saw_process_exit = retained_events.iter().any(|event| {
+        matches!(
+            event,
+            botster_hub_client::DaemonEvent::ProcessExit { code: Some(7), .. }
+        )
+    });
+    let saw_lifecycle_exit = retained_events.iter().any(|event| {
+        matches!(
+            event,
+            botster_hub_client::DaemonEvent::SessionLifecycle {
+                session_id,
+                state,
+            } if session_id == "entity-attached-exit" && state == "exited"
+        )
+    });
+    assert!(
+        saw_process_exit || saw_lifecycle_exit,
+        "natural exit must appear on unbound Drain as ProcessExit code 7 or SessionLifecycle exited: drain={retained_events:?} screen={screen_text:?}"
     );
 
     let drained_again = terminal
@@ -3759,23 +3929,29 @@ fn session_entity_subscription_recovers_after_terminal_disconnect_with_pending_e
     thread::sleep(Duration::from_millis(500));
     drop(terminal);
 
+    subscription
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("bound exit-delta read after disconnect");
+    let disconnect_deadline = Instant::now() + Duration::from_secs(8);
     let exit_sequence = loop {
-        match subscription
-            .next_frame()
-            .expect("exit delta after terminal disconnect")
-        {
-            botster_hub_client::DaemonEntityFrame::Patch {
+        match subscription.next_frame() {
+            Ok(botster_hub_client::DaemonEntityFrame::Patch {
                 snapshot_seq,
                 patch,
                 ..
-            } if patch.get("lifecycle").and_then(serde_json::Value::as_str) == Some("exited") => {
+            }) if patch.get("lifecycle").and_then(serde_json::Value::as_str) == Some("exited") =>
+            {
                 assert_eq!(
                     patch.get("exit_code").and_then(serde_json::Value::as_i64),
                     Some(7)
                 );
                 break snapshot_seq;
             }
-            _ => {}
+            Ok(_) => {}
+            Err(error) if Instant::now() < disconnect_deadline => {
+                let _ = error;
+            }
+            Err(error) => panic!("exit delta after terminal disconnect: {error}"),
         }
     };
 

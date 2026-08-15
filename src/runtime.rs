@@ -6,10 +6,11 @@
 //! through `botster-core-daemon`.
 
 use botster_core::{
-    BotsterEngineObservation, BotsterEngineOutput, BoundaryJson, ClientId, CoreSession,
-    CoreSessionMetadata, EntityContract, EntityFrame, EntityKind, EnvelopeId, EnvelopeTarget,
-    ManagedSessionRuntimeError, ModeFreshnessToken, MultiplexerEngineError,
-    PluginCapabilityRuntime, PluginCleanupResult, PluginHandlerKind, PluginInvocationFailure,
+    BindTerminalAdapterError, BotsterEngineObservation, BotsterEngineOutput, BoundaryJson,
+    ClientId, CoreSession, CoreSessionMetadata, EntityContract, EntityFrame, EntityKind,
+    EnvelopeId, EnvelopeTarget, ManagedSessionRuntimeError, ModeFreshnessToken,
+    MultiplexerEngineError, PluginAdmissionResult, PluginCapabilityRuntime, PluginCleanupResult,
+    PluginCompletionDrain, PluginHandlerKind, PluginInvocationClass, PluginInvocationFailure,
     PluginInvocationFailureKind, PluginInvocationOutcome, PluginInvocationRequest,
     PluginInvocationResult, PluginKey, PluginWorkerDebugSnapshot, RequestId, Rgb, RoutedEnvelope,
     RoutedEnvelopeDrainOutcome, RoutedEnvelopePublishOutcome, SessionId, SessionLifecycleState,
@@ -20,11 +21,13 @@ use botster_core_daemon::{
     AcknowledgeRoutedEnvelopeRequest, AttachedSession, CaptureSnapshotRequest,
     CaptureSnapshotResult, CoreDaemon, CoreDaemonConfig, CoreDaemonError, DaemonSession,
     DetachTerminalSubscriptionResult, DrainResult, DrainRoutedEnvelopesRequest,
-    GuardedWriteRequest, GuardedWriteResult, ModeGatedInputOutcome, PublishRoutedEnvelopeRequest,
-    ReadModeFlagsRequest, ReadModeFlagsResult, ReadScreenRequest, ReadScreenResult,
-    RegistrySessionState, RoutedEnvelopeDeliveryStateResult, SessionAdoptionReport,
-    SessionAdoptionState, SessionLifecycleBaseline, SessionLifecycleChanges,
-    SessionLifecycleCursor, SpawnSessionRequest,
+    GuardedWriteRequest, GuardedWriteResult, LifecycleBaselineBudget, ModeGatedInputOutcome,
+    ObserveLifecycleBudget, ObserveLifecycleCursor, ObserveLifecycleSlice,
+    PublishRoutedEnvelopeRequest, ReadModeFlagsRequest, ReadModeFlagsResult, ReadScreenRequest,
+    ReadScreenResult, RegistrySessionState, RoutedEnvelopeDeliveryStateResult,
+    SessionAdoptionReport, SessionAdoptionState, SessionLifecycleBaseline,
+    SessionLifecycleBaselinePage, SessionLifecycleChanges, SessionLifecycleCursor,
+    SessionLifecyclePage, SessionLifecyclePageError, SpawnSessionRequest,
 };
 use botster_ui_contract::{UiActionRequest, UiActionResult, UiNode};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -1347,6 +1350,16 @@ impl HubRuntime {
             .unwrap_or(0)
     }
 
+    /// True when a family still needs resync and has not degraded.
+    #[must_use]
+    pub fn package_entity_resync_still_needed(&self) -> bool {
+        self.package_entity_families
+            .lock()
+            .expect("package entity family lock")
+            .values()
+            .any(|family| family.resync.needed && !family.resync.degraded)
+    }
+
     /// Whether the family is currently marked resync_degraded.
     #[must_use]
     pub fn package_entity_resync_degraded(&self, entity_type: &str) -> bool {
@@ -1769,6 +1782,81 @@ impl HubRuntime {
             .lock()
             .expect("core daemon mutex")
             .lifecycle_changes(after)
+    }
+
+    /// Advance one bounded observe slice. Do not call `observe_lifecycle`.
+    pub fn observe_lifecycle_slice(
+        &self,
+        now_seconds: u64,
+        resume: Option<&ObserveLifecycleCursor>,
+        budget: ObserveLifecycleBudget,
+    ) -> Result<ObserveLifecycleSlice, SessionLifecyclePageError> {
+        self.core_daemon
+            .lock()
+            .expect("core daemon mutex")
+            .observe_lifecycle_slice(now_seconds, resume, budget)
+    }
+
+    /// Return one bounded baseline page. Do not call `lifecycle_baseline`.
+    pub fn lifecycle_baseline_page(
+        &self,
+        snapshot: Option<&SessionLifecycleCursor>,
+        after: Option<&SessionId>,
+        budget: LifecycleBaselineBudget,
+    ) -> Result<SessionLifecycleBaselinePage, SessionLifecyclePageError> {
+        self.core_daemon
+            .lock()
+            .expect("core daemon mutex")
+            .lifecycle_baseline_page(snapshot, after, budget)
+    }
+
+    /// Take the coalesced Core journal-advanced wake bit.
+    #[must_use]
+    pub fn take_journal_advanced_wake(&self) -> bool {
+        self.core_daemon
+            .lock()
+            .expect("core daemon mutex")
+            .take_journal_advanced_wake()
+    }
+
+    /// Return one bounded journal page after a cursor.
+    pub fn lifecycle_changes_page(
+        &self,
+        after: &SessionLifecycleCursor,
+        max_changes: usize,
+        max_bytes: usize,
+    ) -> Result<SessionLifecyclePage, SessionLifecyclePageError> {
+        self.core_daemon
+            .lock()
+            .expect("core daemon mutex")
+            .lifecycle_changes_page(after, max_changes, max_bytes)
+    }
+
+    /// Admit one plugin invocation without waiting.
+    #[must_use]
+    pub fn try_admit_plugin(
+        &self,
+        class: PluginInvocationClass,
+        request: PluginInvocationRequest,
+    ) -> PluginAdmissionResult {
+        self.plugin_lifecycle.try_admit(class, request)
+    }
+
+    /// Drain previously published plugin completions without waiting.
+    #[must_use]
+    pub fn drain_plugin_completions(
+        &self,
+        max_items: usize,
+        max_bytes: usize,
+    ) -> PluginCompletionDrain {
+        self.plugin_lifecycle
+            .drain_completions(max_items, max_bytes)
+    }
+
+    /// Event handlers subscribed to the Hub-owned `/session` family.
+    #[must_use]
+    pub fn session_family_event_handlers(&self) -> Vec<crate::lifecycle::HubPluginEventHandler> {
+        self.plugin_lifecycle.event_handlers_for("session_family")
     }
 
     /// Forget one terminal session through CoreDaemon's lifecycle authority.
@@ -2481,7 +2569,18 @@ fn managed_session_core_error_class(error: &CoreDaemonError) -> &'static str {
         CoreDaemonError::Shutdown => "shutdown",
         CoreDaemonError::MissingScreenResponse(_) => "missing_screen_response",
         CoreDaemonError::MissingModeFlagsResponse(_) => "missing_mode_flags_response",
-        CoreDaemonError::BindTerminalAdapter(_) => "bind_terminal_adapter",
+        CoreDaemonError::BindTerminalAdapter(error) => match error {
+            BindTerminalAdapterError::BindBeforeAttach { .. } => {
+                "bind_terminal_adapter.bind_before_attach"
+            }
+            BindTerminalAdapterError::UnknownSubscription { .. } => {
+                "bind_terminal_adapter.unknown_subscription"
+            }
+            BindTerminalAdapterError::StaleGeneration { .. } => {
+                "bind_terminal_adapter.stale_generation"
+            }
+            BindTerminalAdapterError::AlreadyBound { .. } => "bind_terminal_adapter.already_bound",
+        },
     }
 }
 
@@ -3432,6 +3531,49 @@ mod tests {
             managed_session_core_error_class(&generic),
             "runtime.spawn_failed"
         );
+    }
+
+    #[test]
+    fn bind_terminal_adapter_mapping_is_total_over_published_variants() {
+        let session_id = SessionId("session".to_string());
+        let subscription_id = SubscriptionId("sub".to_string());
+        let mapped = [
+            (
+                BindTerminalAdapterError::BindBeforeAttach {
+                    session_id: session_id.clone(),
+                    subscription_id: subscription_id.clone(),
+                },
+                "bind_terminal_adapter.bind_before_attach",
+            ),
+            (
+                BindTerminalAdapterError::UnknownSubscription {
+                    session_id: session_id.clone(),
+                    subscription_id: subscription_id.clone(),
+                },
+                "bind_terminal_adapter.unknown_subscription",
+            ),
+            (
+                BindTerminalAdapterError::StaleGeneration {
+                    live: None,
+                    requested: TerminalSubscriptionGeneration(1),
+                },
+                "bind_terminal_adapter.stale_generation",
+            ),
+            (
+                BindTerminalAdapterError::AlreadyBound {
+                    session_id,
+                    subscription_id,
+                    generation: TerminalSubscriptionGeneration(1),
+                },
+                "bind_terminal_adapter.already_bound",
+            ),
+        ];
+        for (error, class) in mapped {
+            assert_eq!(
+                managed_session_core_error_class(&CoreDaemonError::BindTerminalAdapter(error)),
+                class
+            );
+        }
     }
     #[test]
     fn hub_core_daemon_config_always_supplies_worker_path() {

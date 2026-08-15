@@ -55,6 +55,7 @@ pub mod client_api;
 pub mod config;
 pub mod credentials;
 pub mod daemon;
+mod daemon_maintenance;
 mod daemon_projection;
 pub mod daemon_transport;
 pub mod entrypoint_supervisor;
@@ -69,6 +70,7 @@ pub mod packages;
 pub mod persistence;
 pub mod profile;
 pub mod runtime;
+mod session_projection;
 pub mod session_types;
 #[doc(hidden)]
 pub mod source_update;
@@ -121,6 +123,7 @@ pub use credentials::{
 pub use daemon::{
     HubDaemon, HubDaemonError, HubDaemonResult, HubDaemonState, HubDaemonStatus, HubStateLoadSource,
 };
+pub use daemon_maintenance::{MAX_OWNER_TURN_MS, MAX_READY_OPERATION_WAIT_MS};
 pub use daemon_transport::{
     DaemonApp, DaemonAppLaunchTarget, DaemonAvailablePackage, DaemonCapability,
     DaemonCompatibility, DaemonConnection, DaemonCoordination, DaemonEnvelope, DaemonEnvelopeAck,
