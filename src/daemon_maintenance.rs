@@ -78,6 +78,7 @@ pub enum MaintenanceSliceKind {
     SubscriberDelivery,
     CompletionDrain,
     ProviderResync,
+    PackageEventDelivery,
 }
 
 impl MaintenanceSliceKind {
@@ -90,7 +91,8 @@ impl MaintenanceSliceKind {
             Self::HostBridge => Self::SubscriberDelivery,
             Self::SubscriberDelivery => Self::CompletionDrain,
             Self::CompletionDrain => Self::ProviderResync,
-            Self::ProviderResync => Self::Observe,
+            Self::ProviderResync => Self::PackageEventDelivery,
+            Self::PackageEventDelivery => Self::Observe,
         }
     }
 }
@@ -441,6 +443,15 @@ pub struct MaintenanceState {
     pub journal_page_reads: u64,
     pub baseline_page_reads: u64,
     pub projection_dirty: bool,
+    pub event_in_flight: BTreeMap<String, EventDeliveryFlight>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventDeliveryFlight {
+    pub envelope_id: u64,
+    pub plugin_key: String,
+    pub generation: u64,
+    pub scope_id: Option<u64>,
 }
 
 impl MaintenanceState {
@@ -524,6 +535,9 @@ pub fn run_maintenance_kind(
         MaintenanceSliceKind::Baseline => run_baseline_slice(runtime, state),
         MaintenanceSliceKind::HostBridge => run_host_bridge_slice(runtime, state),
         MaintenanceSliceKind::CompletionDrain => run_completion_drain_slice(runtime, state),
+        MaintenanceSliceKind::PackageEventDelivery => {
+            run_package_event_delivery_slice(runtime, state)
+        }
         MaintenanceSliceKind::SubscriberDelivery | MaintenanceSliceKind::ProviderResync => {}
     }
 }
@@ -738,6 +752,115 @@ fn run_host_bridge_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
     }
 }
 
+const EVENT_DELIVERY_MAX_ITEMS: usize = 8;
+const EVENT_DELIVERY_MAX_BYTES: usize = 32 * 1024;
+const EVENT_DELIVERY_MAX_ELAPSED: Duration = Duration::from_millis(8);
+
+fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
+    let applied = runtime.apply_event_plane_owner_ops();
+    if !applied.is_empty() || runtime.event_plane_owner_ops_pending() {
+        state.scheduler.try_wake();
+    }
+    let woke = runtime.package_event_router().take_delivery_wake();
+    if runtime.package_event_router().peek_delivery_wake() {
+        state.scheduler.try_wake();
+    }
+    if !woke && applied.is_empty() {
+        return;
+    }
+    let batch = match runtime.package_event_router().pull_ready_batch(
+        EVENT_DELIVERY_MAX_ITEMS,
+        EVENT_DELIVERY_MAX_BYTES,
+        Instant::now(),
+        EVENT_DELIVERY_MAX_ELAPSED,
+    ) {
+        Ok(batch) => batch,
+        Err(_) => {
+            runtime.package_event_router().set_delivery_wake();
+            state.scheduler.try_wake();
+            return;
+        }
+    };
+    for delivery in batch {
+        let Some(handler) = runtime.package_event_handler(
+            &delivery.holder.plugin_key,
+            &delivery.owner,
+            &delivery.name,
+            &delivery.holder.handler_id,
+        ) else {
+            let _ = runtime.package_event_router().retire_holder(
+                delivery.envelope_id,
+                &delivery.holder.plugin_key,
+                delivery.holder.generation,
+            );
+            continue;
+        };
+        let scope_id = runtime.causal_scopes().mint();
+        let request_id = RequestId(format!(
+            "package-event-{}-{}-{}",
+            delivery.owner, delivery.name, delivery.envelope_id
+        ));
+        let metadata = scope_id
+            .map(|scope_id| BoundaryJson(serde_json::json!({ "causal_scope_id": scope_id })));
+        let admission = runtime.try_admit_plugin(
+            PluginInvocationClass::Background,
+            PluginInvocationRequest {
+                request_id: request_id.clone(),
+                handler: handler.handler,
+                timeout_ms: 1_000,
+                context: PluginInvocationContext {
+                    client_id: None,
+                    session_id: None,
+                    subscription_id: None,
+                    surface_id: None,
+                    origin: Some("package-event".to_string()),
+                    metadata,
+                },
+                payload: BoundaryJson(delivery.payload_json),
+            },
+        );
+        match admission {
+            PluginAdmissionResult::Queued { .. } => {
+                let _ = runtime.package_event_router().note_admitted(
+                    delivery.envelope_id,
+                    &delivery.holder.plugin_key,
+                    delivery.holder.generation,
+                );
+                if let Some(scope_id) = scope_id {
+                    let _ = runtime.causal_scopes().acquire(
+                        scope_id,
+                        crate::package_event_router::LeaseIdentity::EventInFlight {
+                            request_id: request_id.0.clone(),
+                        },
+                    );
+                }
+                state.event_in_flight.insert(
+                    request_id.0,
+                    EventDeliveryFlight {
+                        envelope_id: delivery.envelope_id,
+                        plugin_key: delivery.holder.plugin_key,
+                        generation: delivery.holder.generation,
+                        scope_id,
+                    },
+                );
+            }
+            _ => {
+                let _ = runtime.package_event_router().retire_holder(
+                    delivery.envelope_id,
+                    &delivery.holder.plugin_key,
+                    delivery.holder.generation,
+                );
+            }
+        }
+    }
+    if runtime.package_event_router().peek_delivery_wake()
+        || !state.event_in_flight.is_empty()
+        || runtime.event_plane_owner_ops_pending()
+    {
+        state.scheduler.try_wake();
+    }
+}
+
 fn run_completion_drain_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
     let drain =
         runtime.drain_plugin_completions(COMPLETION_DRAIN_MAX_ITEMS, COMPLETION_DRAIN_MAX_BYTES);
@@ -746,6 +869,23 @@ fn run_completion_drain_slice(runtime: &HubRuntime, state: &mut MaintenanceState
             PluginInvocationResult::Completed(success) => success.request_id.clone(),
             PluginInvocationResult::Failed(failure) => failure.request_id.clone(),
         };
+        if let Some(flight) = state.event_in_flight.remove(&request_id.0) {
+            let _ = runtime.package_event_router().retire_holder(
+                flight.envelope_id,
+                &flight.plugin_key,
+                flight.generation,
+            );
+            if let Some(scope_id) = flight.scope_id {
+                runtime.causal_scopes().release(
+                    scope_id,
+                    crate::package_event_router::LeaseIdentity::EventInFlight {
+                        request_id: request_id.0.clone(),
+                    },
+                );
+            }
+            state.scheduler.try_wake();
+            continue;
+        }
         let Some(plugin_key) = state
             .session_family
             .in_flight_by_request

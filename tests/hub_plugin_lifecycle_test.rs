@@ -149,6 +149,7 @@ fn plugin_manifest(name: &str, capabilities: Vec<Capability>) -> HubPackageManif
         surfaces: Vec::new(),
         runnable_entrypoints: Vec::new(),
         navigation: Vec::new(),
+        events: botster_hub::HubPackageEvents::default(),
     }
 }
 
@@ -188,6 +189,7 @@ fn provider_manifest(name: &str, capabilities: Vec<Capability>) -> HubPackageMan
         surfaces: Vec::new(),
         runnable_entrypoints: Vec::new(),
         navigation: Vec::new(),
+        events: botster_hub::HubPackageEvents::default(),
     }
 }
 

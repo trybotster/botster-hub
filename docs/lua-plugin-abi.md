@@ -153,25 +153,26 @@ Plugins subscribe to hub-emitted lifecycle events with the injected `events`
 global:
 
 ```lua
-events.on("worktree_created", function(event)
+events.on("hub", "worktree_created", function(event)
   return {
     worktree_id = event.worktree_id,
     target_id = event.target_id,
   }
 end)
 
+local result = events.emit("sample.ready", { ok = true })
+-- result.status is accepted, rejected_*, or shed_*
+
 return botster.register({})
 ```
 
-`events.on(name, fn)` is narrow sugar over an Event-kind handler registration.
-Handlers run through the normal plugin worker invocation path, so a failing
-callback does not roll back the hub operation that emitted the event. Event
-delivery is bounded and isolated, but it is synchronous with the emitting
-worktree CRUD request; a slow handler can add latency until the worker timeout.
-Event names match exactly.
+`events.on(owner, name, fn)` is the only subscription form. The old
+single-name form is a typed reject. Packages emit only their own declared
+events through `events.emit(name, payload)`. Emit is one non-blocking
+router ingress; it does not wait for handlers.
 
 Authorized plugins consume the Hub-owned `/session` family through
-`events.on("session_family", ...)`. Hub admits those frames as Background
+`events.on("hub", "session_family", ...)`. Hub admits those frames as Background
 work: `snapshot_begin`, bounded `snapshot_chunk`, `snapshot_end` at one
 snapshot sequence, then live deltas. At most one session-family frame is
 in flight per plugin. Admission, completion, or handler failure marks a

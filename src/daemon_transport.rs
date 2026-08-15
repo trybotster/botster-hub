@@ -189,8 +189,23 @@ fn run_one_owner_maintenance_slice(daemon: &mut HubDaemon, state: &mut DaemonCon
             drive_package_entity_fanout(daemon, state);
             drive_package_entity_resync(daemon, state);
         }
+        MaintenanceSliceKind::PackageEventDelivery => {
+            if let Some(runtime) = daemon.runtime() {
+                run_maintenance_kind(
+                    runtime,
+                    &mut state.maintenance,
+                    MaintenanceSliceKind::PackageEventDelivery,
+                );
+            }
+        }
         other => {
             if let Some(runtime) = daemon.runtime() {
+                let _ = runtime.apply_event_plane_owner_ops();
+                if runtime.package_event_router().peek_delivery_wake()
+                    || runtime.event_plane_owner_ops_pending()
+                {
+                    state.maintenance.try_wake();
+                }
                 run_maintenance_kind(runtime, &mut state.maintenance, other);
             }
         }
@@ -203,6 +218,10 @@ fn run_one_owner_maintenance_slice(daemon: &mut HubDaemon, state: &mut DaemonCon
         || daemon
             .runtime()
             .is_some_and(crate::HubRuntime::package_entity_resync_still_needed)
+        || daemon.runtime().is_some_and(|runtime| {
+            runtime.package_event_router().peek_delivery_wake()
+                || runtime.event_plane_owner_ops_pending()
+        })
     {
         state.maintenance.try_wake();
     }
@@ -2233,6 +2252,12 @@ pub(crate) fn handle_control_message(
                 {
                     state.maintenance.try_wake();
                 }
+            }
+            if daemon.runtime().is_some_and(|runtime| {
+                runtime.package_event_router().peek_delivery_wake()
+                    || runtime.event_plane_owner_ops_pending()
+            }) {
+                state.maintenance.try_wake();
             }
             if response
                 .as_ref()
@@ -5521,7 +5546,15 @@ fn emit_worktree_lifecycle_event(
     if let Some(runtime) = daemon.runtime()
         && let Ok(payload) = serde_json::to_value(&event)
     {
-        let _ = runtime.emit_plugin_event(&event.event, payload);
+        let _ = runtime.package_event_router().try_ingress(
+            crate::package_event_router::HUB_EVENT_OWNER,
+            &event.event,
+            &payload,
+            std::time::Instant::now(),
+        );
+        if runtime.package_event_router().peek_delivery_wake() {
+            // Delivery is owner-loop work. The mutating response does not wait.
+        }
     }
     response
         .events
