@@ -3249,17 +3249,20 @@ fn handle_runtime_control_request(
             events_response(response.body)
         }
         DaemonRequest::ShutdownSession { session_id } => {
-            let deadline = Instant::now() + SHUTDOWN_CLASSIFY_BUDGET;
+            let classify_start = Instant::now();
+            let classify_deadline = classify_start + SHUTDOWN_CLASSIFY_BUDGET;
+            let initial_deadline =
+                classify_start + (SHUTDOWN_CLASSIFY_BUDGET.saturating_sub(SHUTDOWN_ERROR_RESERVE));
             let mut walk = crate::runtime::SessionLifecycleWalk::default();
             let now = tick(logical_clock);
             observe_lifecycle_turn(runtime, now);
             let mut observed = true;
-            match finish_shutdown_classify(deadline, || {
+            match finish_shutdown_classify(initial_deadline, Instant::now, || {
                 if !observed {
                     observe_lifecycle_turn(runtime, tick(logical_clock));
                 }
                 observed = false;
-                classify_shutdown_session(runtime, &session_id, deadline, &mut walk)
+                classify_shutdown_session(runtime, &session_id, initial_deadline, &mut walk)
             })? {
                 ShutdownSessionClassification::Active
                 | ShutdownSessionClassification::Incomplete => {}
@@ -3270,6 +3273,7 @@ fn handle_runtime_control_request(
                     return Ok(daemon_unknown_session_cleanup(&session_id));
                 }
             }
+            walk.reset();
             let shutdown_session_id = session_id.clone();
             let response = match api.handle_request(
                 runtime,
@@ -3282,14 +3286,18 @@ fn handle_runtime_control_request(
             ) {
                 Ok(response) => response,
                 Err(error) => {
-                    observed = false;
-                    let classification = finish_shutdown_classify(deadline, || {
-                        if !observed {
+                    let error_deadline =
+                        classify_deadline.max(Instant::now() + SHUTDOWN_ERROR_RESERVE);
+                    let classification =
+                        finish_shutdown_error_classify(error_deadline, Instant::now, || {
                             observe_lifecycle_turn(runtime, tick(logical_clock));
-                        }
-                        observed = false;
-                        classify_shutdown_session(runtime, &session_id, deadline, &mut walk)
-                    })?;
+                            classify_shutdown_session(
+                                runtime,
+                                &session_id,
+                                error_deadline,
+                                &mut walk,
+                            )
+                        })?;
                     let response = shutdown_error_response(classification, error, &session_id)?;
                     suppress_unix_session_close_events(pending_runtime, &session_id);
                     suppress_webrtc_session_close_events(pending_runtime, &session_id);
@@ -4332,22 +4340,48 @@ enum ShutdownSessionClassification {
 }
 
 const SHUTDOWN_CLASSIFY_BUDGET: Duration = Duration::from_millis(1000);
+const SHUTDOWN_ERROR_RESERVE: Duration = Duration::from_millis(250);
 
-fn finish_shutdown_classify<F>(
+fn finish_shutdown_classify<F, N>(
     deadline: Instant,
+    mut now: N,
     mut classify: F,
 ) -> Result<ShutdownSessionClassification, crate::HubRuntimeError>
 where
     F: FnMut() -> Result<ShutdownSessionClassification, crate::HubRuntimeError>,
+    N: FnMut() -> Instant,
 {
     loop {
         let classification = classify()?;
-        if matches!(classification, ShutdownSessionClassification::Incomplete)
-            && Instant::now() < deadline
-        {
+        if matches!(classification, ShutdownSessionClassification::Incomplete) && now() < deadline {
             continue;
         }
         return Ok(classification);
+    }
+}
+
+fn finish_shutdown_error_classify<F, N>(
+    deadline: Instant,
+    mut now: N,
+    mut classify: F,
+) -> Result<ShutdownSessionClassification, crate::HubRuntimeError>
+where
+    F: FnMut() -> Result<ShutdownSessionClassification, crate::HubRuntimeError>,
+    N: FnMut() -> Instant,
+{
+    loop {
+        let classification = classify()?;
+        match classification {
+            ShutdownSessionClassification::Cleanup(_) | ShutdownSessionClassification::Missing => {
+                return Ok(classification);
+            }
+            ShutdownSessionClassification::Active | ShutdownSessionClassification::Incomplete
+                if now() < deadline =>
+            {
+                continue;
+            }
+            other => return Ok(other),
+        }
     }
 }
 
@@ -7675,28 +7709,121 @@ mod tests {
 
     #[test]
     fn incomplete_classify_retries_share_one_deadline() {
-        let deadline = Instant::now() + Duration::from_millis(80);
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(80);
+        let ticks = [
+            start,
+            start + Duration::from_millis(30),
+            start + Duration::from_millis(60),
+            start + Duration::from_millis(90),
+        ];
+        let mut tick = 0;
         let mut calls = 0;
-        let started = Instant::now();
-        let result = finish_shutdown_classify(deadline, || {
-            calls += 1;
-            thread::sleep(Duration::from_millis(25));
-            Ok(ShutdownSessionClassification::Incomplete)
-        })
+        let mut deadlines = Vec::new();
+        let result = finish_shutdown_classify(
+            deadline,
+            || {
+                let now = ticks[tick.min(ticks.len() - 1)];
+                tick += 1;
+                now
+            },
+            || {
+                calls += 1;
+                deadlines.push(deadline);
+                Ok(ShutdownSessionClassification::Incomplete)
+            },
+        )
         .expect("forced Incomplete classify");
-        let elapsed = started.elapsed();
         assert!(
             matches!(result, ShutdownSessionClassification::Incomplete),
             "forced Incomplete must stay Incomplete, got {result:?}"
         );
-        assert!(
-            elapsed < Duration::from_millis(200),
-            "shared deadline must bound retries, elapsed={elapsed:?} calls={calls}"
+        assert_eq!(
+            calls, 4,
+            "clock must stop after the deadline, calls={calls}"
         );
         assert!(
-            (2..=6).contains(&calls),
-            "shared 80 ms deadline must retry a few 25 ms walks, calls={calls}"
+            deadlines.iter().all(|seen| *seen == deadline),
+            "every retry must receive the same deadline"
         );
+    }
+
+    #[test]
+    fn error_classify_retries_active_until_fresh_cleanup() {
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(80);
+        let ticks = [
+            start,
+            start + Duration::from_millis(30),
+            start + Duration::from_millis(60),
+        ];
+        let mut tick = 0;
+        let mut calls = 0;
+        let result = finish_shutdown_error_classify(
+            deadline,
+            || {
+                let now = ticks[tick.min(ticks.len() - 1)];
+                tick += 1;
+                now
+            },
+            || {
+                calls += 1;
+                if calls < 3 {
+                    return Ok(ShutdownSessionClassification::Active);
+                }
+                Ok(ShutdownSessionClassification::Cleanup(
+                    DaemonSessionCleanup {
+                        session_id: "mmm-target".to_string(),
+                        outcome: "already_exited".to_string(),
+                    },
+                ))
+            },
+        )
+        .expect("error classify");
+        assert!(
+            matches!(result, ShutdownSessionClassification::Cleanup(_)),
+            "post-shutdown Active must keep observing until Cleanup, got {result:?}"
+        );
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn initial_classify_stops_on_active_without_post_shutdown_retry() {
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(80);
+        let mut calls = 0;
+        let result = finish_shutdown_classify(deadline, Instant::now, || {
+            calls += 1;
+            Ok(ShutdownSessionClassification::Active)
+        })
+        .expect("initial Active classify");
+        assert!(matches!(result, ShutdownSessionClassification::Active));
+        assert_eq!(
+            calls, 1,
+            "initial classify must not spend the error reserve retrying Active"
+        );
+    }
+
+    #[test]
+    fn page_budgets_shrink_with_remaining_deadline() {
+        let full = crate::runtime::shutdown_lifecycle_page_budget(Duration::from_millis(1000))
+            .expect("1 s remaining still pages");
+        let short = crate::runtime::shutdown_lifecycle_page_budget(Duration::from_millis(80))
+            .expect("80 ms remaining still pages");
+        assert_eq!(full.max_elapsed, Duration::from_millis(250));
+        assert_eq!(short.max_elapsed, Duration::from_millis(80));
+        assert!(short.max_elapsed < full.max_elapsed);
+        assert!(crate::runtime::shutdown_lifecycle_page_budget(Duration::ZERO).is_none());
+    }
+
+    #[test]
+    fn post_shutdown_walk_reset_drops_a_held_snapshot() {
+        let mut walk = crate::runtime::SessionLifecycleWalk::default();
+        assert!(!walk.is_holding_snapshot());
+        // A nonfinal Found leaves the previous page snapshot in the walk.
+        // Production resets after Active so the error classify cannot reuse it.
+        walk.reset();
+        assert!(!walk.is_holding_snapshot());
     }
 
     #[test]

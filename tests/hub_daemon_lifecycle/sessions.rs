@@ -3257,10 +3257,11 @@ fn shutdown_after_observed_exit_returns_session_cleanup() {
 
 #[test]
 // Registry stays Running after ReadScreen parks ProcessExited. The target
-// sorts after 33 pads, so one 32-row baseline page cannot see it. The lookup
-// must return SessionCleanup. Locked Core treats Active shutdown of an
-// Exited engine row as Events, so Events is the no-lookup result. Live
-// Active→Events is covered by external_hub_webrtc_live_output_preserves_exact_bytes.
+// sits on page 2 of 3 (32 prior pads, 32 later pads). A reused freeze would
+// keep the pre-shutdown row. The lookup must return SessionCleanup. Locked
+// Core treats Active shutdown of an Exited engine row as Events, so Events
+// is the no-lookup result. Live Active→Events is covered by
+// external_hub_webrtc_live_output_preserves_exact_bytes.
 fn shutdown_session_classifies_parked_exit_beyond_one_baseline_page() {
     let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("shutdown-parked-late-row");
@@ -3275,7 +3276,7 @@ fn shutdown_session_classifies_parked_exit_beyond_one_baseline_page() {
             .clone(),
     );
     let child = start_cli_daemon(&data_dir);
-    for index in 0..33 {
+    for index in 0..32 {
         botster_hub_client::request(
             &endpoint,
             botster_hub_client::DaemonRequest::Spawn {
@@ -3283,13 +3284,23 @@ fn shutdown_session_classifies_parked_exit_beyond_one_baseline_page() {
                 command: "/bin/sh -c 'sleep 30'".to_string(),
             },
         )
-        .expect("spawn pad session");
+        .expect("spawn earlier pad session");
+    }
+    for index in 0..32 {
+        botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::Spawn {
+                session_id: format!("zzz-{index:02}"),
+                command: "/bin/sh -c 'sleep 30'".to_string(),
+            },
+        )
+        .expect("spawn later pad session");
     }
     botster_hub_client::request(
         &endpoint,
         botster_hub_client::DaemonRequest::Spawn {
-            session_id: "zzz-target".to_string(),
-            command: "printf 'zzz-target-ready\\n'".to_string(),
+            session_id: "mmm-target".to_string(),
+            command: "printf 'mmm-target-ready\\n'".to_string(),
         },
     )
     .expect("spawn target session");
@@ -3300,7 +3311,7 @@ fn shutdown_session_classifies_parked_exit_beyond_one_baseline_page() {
     while Instant::now() < deadline {
         let response = connection
             .request(&botster_hub_client::DaemonRequest::ReadScreen {
-                session_id: "zzz-target".to_string(),
+                session_id: "mmm-target".to_string(),
             })
             .expect("read target screen");
         screen = response
@@ -3308,20 +3319,20 @@ fn shutdown_session_classifies_parked_exit_beyond_one_baseline_page() {
             .as_ref()
             .map(|body| body.text.clone())
             .unwrap_or_default();
-        if screen.contains("zzz-target-ready") {
+        if screen.contains("mmm-target-ready") {
             break;
         }
         thread::sleep(Duration::from_millis(25));
     }
     assert!(
-        screen.contains("zzz-target-ready"),
+        screen.contains("mmm-target-ready"),
         "ReadScreen must observe target output before ShutdownSession, last={screen:?}"
     );
     let listed =
         botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::ListSessions)
             .expect("list sessions before shutdown");
     let target_lifecycle = listed.sessions.iter().find_map(|session| {
-        (session.session_id == "zzz-target").then(|| session.lifecycle.clone())
+        (session.session_id == "mmm-target").then(|| session.lifecycle.clone())
     });
     assert_eq!(
         target_lifecycle.as_deref(),
@@ -3332,7 +3343,7 @@ fn shutdown_session_classifies_parked_exit_beyond_one_baseline_page() {
     let shutdown = botster_hub_client::request(
         &endpoint,
         botster_hub_client::DaemonRequest::ShutdownSession {
-            session_id: "zzz-target".to_string(),
+            session_id: "mmm-target".to_string(),
         },
     )
     .expect("shutdown parked late session");
