@@ -71,6 +71,7 @@ pub struct HubEntityPublishBridge {
     owner_thread: thread::ThreadId,
     pending: Arc<Mutex<VecDeque<PendingEntityPublishRequest>>>,
     pending_releases: Arc<Mutex<VecDeque<CausalOp>>>,
+    reserved_release: Arc<Mutex<Option<CausalOp>>>,
     next_token: Arc<AtomicU64>,
     reject_next: Arc<AtomicBool>,
 }
@@ -81,32 +82,55 @@ impl HubEntityPublishBridge {
             owner_thread: thread::current().id(),
             pending: Arc::new(Mutex::new(VecDeque::new())),
             pending_releases: Arc::new(Mutex::new(VecDeque::new())),
+            reserved_release: Arc::new(Mutex::new(None)),
             next_token: Arc::new(AtomicU64::new(1)),
             reject_next: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn park_release(&self, op: CausalOp) -> CausalAdmitResult {
-        let Ok(mut pending) = self.pending_releases.try_lock() else {
-            return CausalAdmitResult::Retry(op);
-        };
-        if pending.len() >= CAUSAL_PENDING_MAX {
-            return CausalAdmitResult::Retry(op);
+        if let Ok(mut pending) = self.pending_releases.try_lock()
+            && pending.len() < CAUSAL_PENDING_MAX
+        {
+            pending.push_back(op);
+            return CausalAdmitResult::Applied;
         }
-        pending.push_back(op);
-        CausalAdmitResult::Applied
+        if let Ok(mut reserved) = self.reserved_release.try_lock()
+            && reserved.is_none()
+        {
+            *reserved = Some(op);
+            return CausalAdmitResult::Applied;
+        }
+        CausalAdmitResult::Retry(op)
     }
 
     pub fn take_release(&self) -> Option<CausalOp> {
+        if let Ok(mut reserved) = self.reserved_release.try_lock()
+            && let Some(op) = reserved.take()
+        {
+            return Some(op);
+        }
         self.pending_releases.try_lock().ok()?.pop_front()
     }
 
     #[must_use]
-    pub fn has_pending_releases(&self) -> bool {
-        self.pending_releases
+    pub fn release_count(&self) -> usize {
+        let queued = self
+            .pending_releases
             .try_lock()
-            .map(|pending| !pending.is_empty())
-            .unwrap_or(false)
+            .map(|pending| pending.len())
+            .unwrap_or(0);
+        let reserved = self
+            .reserved_release
+            .try_lock()
+            .map(|reserved| reserved.is_some() as usize)
+            .unwrap_or(0);
+        queued + reserved
+    }
+
+    #[must_use]
+    pub fn has_pending_releases(&self) -> bool {
+        self.release_count() > 0
     }
 
     #[doc(hidden)]
@@ -973,6 +997,7 @@ fn entity_publish_function(
                             plugin_key: plugin_key.0.clone(),
                         },
                     )
+                    && let CausalAdmitResult::Retry(op) = bridge.park_release(op)
                 {
                     let _ = bridge.park_release(op);
                 }
