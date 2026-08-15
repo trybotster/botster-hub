@@ -654,6 +654,8 @@ pub(super) fn drive_package_entity_fanout(daemon: &mut HubDaemon, state: &mut Da
             // Do not treat applied < family_floor alone as catching_up here: the
             // sequential next delta always has applied == floor-1 before delivery.
             if subscription.package_catching_up {
+                runtime.mark_package_entity_resync_needed(&entity_type);
+                scheduled_resync = true;
                 continue;
             }
             let Some(applied) = subscription.package_last_applied_seq else {
