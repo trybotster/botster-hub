@@ -84,7 +84,7 @@ Representative external Hub consumer: `tests/hub_plugin_lifecycle_test.rs` const
 
 Recorded after the implement commit. Hub SHA and lockfile Core SHA are distinct. Both binaries resolve under this checkout target:
 
-- Hub checkout: `d8b4f74ab73ab67ff519d271e292a6c470aac56d`
+- Hub checkout: `db8055b7c5781e0f3442f1730392c74e7f78a80e`
 - Core lock: `aef6516d5809d563961ed7fdd07da29a7b4edddc`
 - `target/debug/botster-hub`
 - `target/debug/botster-session-worker`
