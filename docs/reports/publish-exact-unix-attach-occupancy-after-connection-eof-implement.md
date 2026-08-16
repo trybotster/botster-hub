@@ -189,7 +189,14 @@ Scratch TUI probe (`fc1ff62`, isolated worktree, `CARGO_TARGET_DIR` local, then 
 - npm publish of `@trybotster/hub-test-support` is intentionally not done.
 - Web consumers of generated protocol are not updated.
 - A delayed IsolatedHub Status probe can increment `cleanup_completed` before a later attach EOF. Occupancy tests wait for that counter, then assert pair absence. They do not treat the counter as the occupancy oracle.
-- `BOTSTER_HUB_UNIX_EOF_ABLATION` is readable whenever `BOTSTER_ENV=test`. It is not a production control.
+- `BOTSTER_HUB_UNIX_EOF_ABLATION` is readable whenever `BOTSTER_ENV=test`. It is not a production control. Only `leave_route`, `skip_core_detach`, and `pair_only_detach` remain.
+
+## Review follow-up (`review_1786876602_932994`)
+
+Open findings addressed:
+
+- `finding_1786876602_398203`: removed unused `UnixEofAblation::IndependentCounter` and `UnixEofAblation::SkipRegisterAck`. Occupancy-set vs counter remains a unit test. Register ack remains a socket-order unit test. IsolatedHub env only selects modes that IsolatedHub tests set.
+- `finding_1786876602_873661`: `ShutdownSession` now takes one bounded `observe_lifecycle_slice` before exact-session classify, and again before recover reclassify. Empty-candidate Unix EOF no longer lists Core inventory. After locked worker build, `./test.sh --test hub_daemon_lifecycle_test` returned **219 passed, 0 failed, 1 ignored** in 323s. `external_hub_webrtc_live_output_preserves_exact_bytes` passed in that full integration target. The oracle still requires Events or SessionCleanup. A later default `./test.sh` failed in untouched `separators_close_when_item_bytes_fit_but_commas_do_not` during parallel `--lib`. Isolated rerun passed. The same test failed on `origin/main` under parallel `--lib` earlier in this run. That is not the Review ShutdownSession oracle.
 
 ## Missing vault guidance discovered
 
