@@ -3167,21 +3167,55 @@ mod tests {
             needs_delivery: true,
         };
         let mut counters = DaemonLifecycleCounters::default();
-        let result = continue_session_snapshot_assembly(
-            "sub",
-            &mut state,
-            &projection,
-            &mut counters,
-            8,
-            DAEMON_MAX_FRAME_BYTES,
-            Duration::from_millis(crate::MAX_OWNER_TURN_MS),
-        );
-        assert!(matches!(
-            result,
-            SnapshotAssemble::Closed {
-                frame_too_large: true
+        // This case proves separator accounting, not owner-turn latency. A 25 ms
+        // page can yield after the first half-megabyte item under lib-suite load.
+        const MAX_SEPARATOR_PAGES: usize = 3;
+        let mut accepted_items = 0usize;
+        let mut closed_too_large = false;
+        for page_index in 0..MAX_SEPARATOR_PAGES {
+            match continue_session_snapshot_assembly(
+                "sub",
+                &mut state,
+                &projection,
+                &mut counters,
+                8,
+                DAEMON_MAX_FRAME_BYTES,
+                Duration::from_secs(5),
+            ) {
+                SnapshotAssemble::Closed {
+                    frame_too_large: true,
+                } => {
+                    if accepted_items == 0 {
+                        let (probe_items, _, _) = take_snapshot_item_page(
+                            &projection,
+                            None,
+                            8,
+                            DAEMON_MAX_FRAME_BYTES,
+                            Duration::from_secs(5),
+                        );
+                        assert!(
+                            !probe_items.is_empty(),
+                            "empty-item close is elapsed-empty, not separator proof"
+                        );
+                    }
+                    closed_too_large = true;
+                    break;
+                }
+                SnapshotAssemble::Closed {
+                    frame_too_large: false,
+                } => panic!("closed without frame_too_large"),
+                SnapshotAssemble::Continue { page } => {
+                    assert!(page.items > 0, "empty-item continue is not separator proof");
+                    accepted_items = accepted_items.saturating_add(page.items);
+                    assert!(page.more, "completed snapshot without charging separators");
+                    assert!(
+                        page_index + 1 < MAX_SEPARATOR_PAGES,
+                        "two items cannot need more than two useful pages"
+                    );
+                }
             }
-        ));
+        }
+        assert!(closed_too_large, "separator close did not fire");
         let frames: Vec<_> = receiver.try_iter().collect();
         assert!(matches!(
             frames.first(),
