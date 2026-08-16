@@ -93,6 +93,7 @@ pub(crate) fn provider_manifest() -> HubPackageManifest {
         surfaces: Vec::new(),
         runnable_entrypoints: Vec::new(),
         navigation: Vec::new(),
+        events: botster_hub::HubPackageEvents::default(),
     }
 }
 

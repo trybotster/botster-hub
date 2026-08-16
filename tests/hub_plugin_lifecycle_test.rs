@@ -149,6 +149,7 @@ fn plugin_manifest(name: &str, capabilities: Vec<Capability>) -> HubPackageManif
         surfaces: Vec::new(),
         runnable_entrypoints: Vec::new(),
         navigation: Vec::new(),
+        events: botster_hub::HubPackageEvents::default(),
     }
 }
 
@@ -188,6 +189,7 @@ fn provider_manifest(name: &str, capabilities: Vec<Capability>) -> HubPackageMan
         surfaces: Vec::new(),
         runnable_entrypoints: Vec::new(),
         navigation: Vec::new(),
+        events: botster_hub::HubPackageEvents::default(),
     }
 }
 
@@ -384,6 +386,19 @@ fn hub_runtime_passes_split_plugin_worker_config_to_core_engine() {
     let snapshot = hub.plugin_worker_debug_snapshot();
     assert_eq!(snapshot.configured_queue_capacity, 7);
     assert_eq!(snapshot.configured_executor_concurrency, 3);
+    let defaults = botster_core::PluginWorkerEngineConfig::default();
+    assert_eq!(
+        snapshot.configured_reserved_request_response_executors,
+        defaults.reserved_request_response_executors
+    );
+    assert_eq!(
+        snapshot.configured_background_queue_capacity,
+        defaults.background_queue_capacity
+    );
+    assert_eq!(
+        snapshot.configured_completion_queue_capacity,
+        defaults.completion_queue_capacity
+    );
     assert_eq!(snapshot.live_plugin_executors, 1);
     assert_eq!(snapshot.live_executor_workers, 3);
 

@@ -9,8 +9,21 @@ fn daemon_restart_preserves_split_plugin_worker_configuration() {
         .runtime()
         .expect("runtime initialized")
         .plugin_worker_debug_snapshot();
+    let defaults = botster_core::PluginWorkerEngineConfig::default();
     assert_eq!(initial.configured_queue_capacity, 9);
     assert_eq!(initial.configured_executor_concurrency, 3);
+    assert_eq!(
+        initial.configured_reserved_request_response_executors,
+        defaults.reserved_request_response_executors
+    );
+    assert_eq!(
+        initial.configured_background_queue_capacity,
+        defaults.background_queue_capacity
+    );
+    assert_eq!(
+        initial.configured_completion_queue_capacity,
+        defaults.completion_queue_capacity
+    );
     daemon.stop();
 
     let mut restarted = HubDaemon::start(config).expect("restart configured daemon");
@@ -20,6 +33,18 @@ fn daemon_restart_preserves_split_plugin_worker_configuration() {
         .plugin_worker_debug_snapshot();
     assert_eq!(reopened.configured_queue_capacity, 9);
     assert_eq!(reopened.configured_executor_concurrency, 3);
+    assert_eq!(
+        reopened.configured_reserved_request_response_executors,
+        defaults.reserved_request_response_executors
+    );
+    assert_eq!(
+        reopened.configured_background_queue_capacity,
+        defaults.background_queue_capacity
+    );
+    assert_eq!(
+        reopened.configured_completion_queue_capacity,
+        defaults.completion_queue_capacity
+    );
     restarted.stop();
 }
 

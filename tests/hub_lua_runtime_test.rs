@@ -3,7 +3,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use botster_core::{
     BoundaryJson, Capability, CapabilitySurface, EndpointId, EnvelopeDeliveryStatus, EnvelopeId,
@@ -12,6 +12,10 @@ use botster_core::{
     PluginInvocationFailureKind, PluginInvocationRequest, PluginInvocationResult,
     PluginInvocationSuccess, PluginKey, RequestId, RoutedEnvelope, RoutedEnvelopePayload,
     SessionId,
+};
+use botster_hub::package_event_router::{
+    CAUSAL_FLUSH_MAX, CAUSAL_PENDING_MAX, CausalAdmitResult, CausalOp, CausalScopeTable,
+    LeaseIdentity, release_or_retract,
 };
 use botster_hub::{
     DataDirectoryOption, HostIdentityOptions, HubClientApi, HubClientRequest,
@@ -1150,7 +1154,7 @@ fn install_event_probe_registry(name: &str) -> PackageRegistry {
     fs::write(
         root.join("plugin.lua"),
         r#"
-events.on("worktree_created", function(event)
+events.on("hub", "worktree_created", function(event)
   return {
     received = event.event,
     worktree_id = event.worktree_id,
@@ -1158,14 +1162,14 @@ events.on("worktree_created", function(event)
   }
 end)
 
-events.on("worktree_deleted", function(event)
+events.on("hub", "worktree_deleted", function(event)
   return {
     received = event.event,
     worktree_id = event.worktree_id,
   }
 end)
 
-events.on("worktree_created", function(event)
+events.on("hub", "worktree_created", function(event)
   return {
     received = event.event,
     observer = "second",
@@ -1226,14 +1230,23 @@ fn events_on_registers_exact_event_subscription_and_invokes_worker_handler() {
     hub.load_lua_plugin_package(&registry, "event-probe.plugin")
         .expect("load event probe plugin");
 
-    let outcomes = hub.emit_plugin_event(
-        "worktree_created",
-        serde_json::json!({
-            "event": "worktree_created",
-            "worktree_id": "wt_1",
-            "target_id": "tgt_1",
-        }),
+    let created = serde_json::json!({
+        "event": "worktree_created",
+        "worktree_id": "wt_1",
+        "target_id": "tgt_1",
+    });
+    assert_eq!(
+        hub.package_event_router()
+            .try_ingress(
+                "hub",
+                "worktree_created",
+                &created,
+                std::time::Instant::now()
+            )
+            .as_str(),
+        "accepted"
     );
+    let outcomes = hub.drive_package_events_for_test();
     assert_eq!(outcomes.len(), 2);
     let payloads = completed_payloads(&outcomes);
     assert!(payloads.contains(&serde_json::json!({
@@ -1247,13 +1260,22 @@ fn events_on_registers_exact_event_subscription_and_invokes_worker_handler() {
         "worktree_id": "wt_1",
     })));
 
-    let deleted = hub.emit_plugin_event(
-        "worktree_deleted",
-        serde_json::json!({
-            "event": "worktree_deleted",
-            "worktree_id": "wt_1",
-        }),
+    let deleted_payload = serde_json::json!({
+        "event": "worktree_deleted",
+        "worktree_id": "wt_1",
+    });
+    assert_eq!(
+        hub.package_event_router()
+            .try_ingress(
+                "hub",
+                "worktree_deleted",
+                &deleted_payload,
+                std::time::Instant::now()
+            )
+            .as_str(),
+        "accepted"
     );
+    let deleted = hub.drive_package_events_for_test();
     assert_eq!(deleted.len(), 1);
     assert_eq!(
         completed_payloads(&deleted),
@@ -1263,19 +1285,25 @@ fn events_on_registers_exact_event_subscription_and_invokes_worker_handler() {
         })]
     );
 
-    let unmatched = hub.emit_plugin_event(
-        "worktree_create_failed",
-        serde_json::json!({ "event": "worktree_create_failed" }),
+    assert_eq!(
+        hub.package_event_router()
+            .try_ingress(
+                "hub",
+                "worktree_create_failed",
+                &serde_json::json!({ "event": "worktree_create_failed" }),
+                std::time::Instant::now()
+            )
+            .as_str(),
+        "accepted"
     );
+    let unmatched = hub.drive_package_events_for_test();
     assert!(
         unmatched.is_empty(),
         "event subscriptions should match exact event names"
     );
 }
 
-fn completed_payloads(
-    outcomes: &[botster_core::PluginInvocationOutcome],
-) -> Vec<serde_json::Value> {
+fn completed_payloads(outcomes: &[botster_core::PluginCompletion]) -> Vec<serde_json::Value> {
     outcomes
         .iter()
         .map(|outcome| {
@@ -2961,6 +2989,8 @@ fn reload_replaces_lua_tool_descriptors_and_removes_stale_handlers() {
             session_types: hub.session_type_spawner(),
             spawn_targets: hub.spawn_targets(),
             worktrees: hub.worktrees(),
+            package_event_router: hub.package_event_router().clone(),
+            causal_scopes: hub.causal_scopes().clone(),
         },
         registry.packages().into_iter().cloned().collect(),
     )
@@ -3871,4 +3901,2255 @@ return botster.register({
         hub.take_package_entity_fanout().is_empty(),
         "oversized mutation must not enter fanout"
     );
+}
+
+fn install_named_lua_package(
+    name: &str,
+    plugin_lua: &str,
+    manifest: serde_json::Value,
+) -> PackageRegistry {
+    let root = unique_short_test_dir(name);
+    fs::create_dir_all(&root).expect("create package");
+    let mut manifest = manifest;
+    manifest["source"] = serde_json::json!({
+        "type": "path",
+        "path": root.canonicalize().expect("path")
+    });
+    fs::write(root.join("botster-package.json"), manifest.to_string()).expect("manifest");
+    fs::write(root.join("plugin.lua"), plugin_lua).expect("plugin");
+    let mut policy = default_package_policy();
+    policy
+        .install_local_path(&root, "install")
+        .expect("install");
+    let package_name = manifest["name"].as_str().expect("name");
+    policy.enable(package_name, "enable").expect("enable");
+    policy.registry().clone()
+}
+
+fn scoped_command(
+    plugin: &str,
+    handler_id: &str,
+    payload: serde_json::Value,
+    scope_id: u64,
+) -> PluginInvocationRequest {
+    PluginInvocationRequest {
+        request_id: RequestId(format!("lease-{handler_id}")),
+        handler: PluginHandlerRef {
+            plugin_key: PluginKey(plugin.to_string()),
+            kind: PluginHandlerKind::Command,
+            handler_id: handler_id.to_string(),
+        },
+        timeout_ms: 1_000,
+        context: PluginInvocationContext {
+            client_id: None,
+            session_id: None,
+            subscription_id: None,
+            surface_id: None,
+            origin: Some("hub-lua-runtime-test".to_string()),
+            metadata: Some(BoundaryJson(
+                serde_json::json!({ "causal_scope_id": scope_id }),
+            )),
+        },
+        payload: BoundaryJson(payload),
+    }
+}
+
+fn lease_probe_plugin() -> &'static str {
+    r#"
+local provider_status = "none"
+return botster.register({
+  handlers = {
+    {
+      id = "runs",
+      kind = "entity_provider",
+      descriptor_id = "lease-probe.item",
+      descriptor = { entity_type = "lease-probe.item", id_field = "id" },
+      call = function()
+        local emitted = events.emit("unused", { ok = true })
+        provider_status = emitted.status
+        return {
+          type = "entity_snapshot",
+          entity_type = "lease-probe.item",
+          snapshot_seq = 0,
+          items = {},
+        }
+      end,
+    },
+    {
+      id = "last_provider",
+      kind = "command",
+      call = function()
+        return { status = provider_status }
+      end,
+    },
+    {
+      id = "publish",
+      kind = "command",
+      call = function(args)
+        return botster.entity_publish({
+          type = "entity_upsert",
+          entity_type = "lease-probe.item",
+          snapshot_seq = args.seq,
+          id = args.id or "item-1",
+          entity = { id = args.id or "item-1" },
+        })
+      end,
+    },
+    {
+      id = "bad",
+      kind = "command",
+      call = function()
+        return botster.entity_publish({
+          type = "entity_upsert",
+          entity_type = "not-owned.item",
+          snapshot_seq = 1,
+          id = "x",
+          entity = { id = "x" },
+        })
+      end,
+    },
+  },
+})
+"#
+}
+
+fn lease_probe_manifest() -> serde_json::Value {
+    serde_json::json!({
+        "name": "lease-probe",
+        "version": "1.0.0",
+        "kind": "plugin",
+        "botster": ">=0.1.0",
+        "capabilities": [],
+        "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+    })
+}
+
+#[test]
+fn failed_lua_load_does_not_leave_router_subscriptions() {
+    let registry = install_named_lua_package(
+        "failed-load-subs",
+        r#"
+events.on("hub", "worktree_created", function(event)
+  return { received = event.event }
+end)
+error("deliberate load failure after events.on")
+"#,
+        serde_json::json!({
+            "name": "failed-load.plugin",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "capabilities": [],
+            "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+        }),
+    );
+    let mut hub = explicit_runtime("failed-load-subs");
+    assert!(
+        hub.load_lua_plugin_package(&registry, "failed-load.plugin")
+            .is_err()
+    );
+    assert_eq!(
+        hub.package_event_router()
+            .test_subscription_count("failed-load.plugin"),
+        0
+    );
+    assert_eq!(
+        hub.package_event_router()
+            .try_ingress(
+                "hub",
+                "worktree_created",
+                &serde_json::json!({
+                    "event": "worktree_created",
+                    "worktree_id": "wt",
+                    "target_id": "tgt"
+                }),
+                std::time::Instant::now()
+            )
+            .as_str(),
+        "accepted"
+    );
+    let batch = hub
+        .package_event_router()
+        .pull_ready_batch(
+            8,
+            64 * 1024,
+            std::time::Instant::now(),
+            std::time::Duration::from_millis(8),
+        )
+        .expect("batch");
+    assert!(batch.is_empty(), "failed load must not leave a subscriber");
+}
+
+#[test]
+fn held_router_load_fails_without_partial_contracts_or_subscriptions() {
+    let registry = install_named_lua_package(
+        "held-router-load",
+        r#"
+events.on("hub", "worktree_created", function(event)
+  return { received = event.event }
+end)
+return botster.register({})
+"#,
+        serde_json::json!({
+            "name": "held-router.plugin",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "capabilities": [],
+            "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }],
+            "events": {
+                "emitted": [{
+                    "name": "sample.ready",
+                    "audience": ["plugins"],
+                    "payload_schema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": { "ok": { "type": "boolean" } },
+                        "required": ["ok"]
+                    }
+                }]
+            }
+        }),
+    );
+    let mut hub = explicit_runtime("held-router-load");
+    let router = hub.package_event_router().clone();
+    let result = router
+        .test_with_inner_held(|| hub.load_lua_plugin_package(&registry, "held-router.plugin"));
+    assert!(
+        result.is_err(),
+        "held router must fail the load, got {result:?}"
+    );
+    assert!(!router.test_has_contract("held-router.plugin", "sample.ready"));
+    assert_eq!(router.test_subscription_count("held-router.plugin"), 0);
+    assert_eq!(
+        router
+            .current_package_generation("held-router.plugin")
+            .expect("generation"),
+        0
+    );
+}
+
+#[test]
+fn held_router_reload_keeps_one_generation_until_owner_apply() {
+    let registry = install_named_lua_package(
+        "held-router-reload",
+        r#"
+events.on("hub", "worktree_created", function(event)
+  return { received = event.event }
+end)
+return botster.register({})
+"#,
+        serde_json::json!({
+            "name": "held-reload.plugin",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "capabilities": [],
+            "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }],
+            "events": {
+                "emitted": [{
+                    "name": "sample.ready",
+                    "audience": ["plugins"],
+                    "payload_schema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": { "ok": { "type": "boolean" } },
+                        "required": ["ok"]
+                    }
+                }]
+            }
+        }),
+    );
+    let mut hub = explicit_runtime("held-router-reload");
+    hub.load_lua_plugin_package(&registry, "held-reload.plugin")
+        .expect("load");
+    let router = hub.package_event_router().clone();
+    let first = router
+        .current_package_generation("held-reload.plugin")
+        .expect("first");
+    assert!(router.test_has_contract("held-reload.plugin", "sample.ready"));
+    let result = router.test_with_inner_held(|| {
+        hub.reload_lua_plugin_package(
+            RequestId("held-reload".into()),
+            &registry,
+            "held-reload.plugin",
+        )
+    });
+    assert!(
+        result.is_err(),
+        "held router must fail reload before replacing the worker"
+    );
+    assert_eq!(
+        router
+            .current_package_generation("held-reload.plugin")
+            .expect("unchanged"),
+        first
+    );
+    assert!(router.test_has_contract("held-reload.plugin", "sample.ready"));
+    assert_eq!(router.test_subscription_count("held-reload.plugin"), 1);
+    let generation = router
+        .current_package_generation("held-reload.plugin")
+        .expect("generation");
+    hub.record_event_plane_owner_op(botster_hub::package_event_router::OwnerOp {
+        kind: botster_hub::package_event_router::OwnerOpKind::Unload,
+        owner: "held-reload.plugin".into(),
+        generation,
+    });
+    let _ = hub.unload_plugin_package(
+        RequestId("held-reload-disable".into()),
+        "held-reload.plugin",
+    );
+    let _ = hub.apply_event_plane_owner_ops();
+    assert!(
+        !router.test_has_contract("held-reload.plugin", "sample.ready"),
+        "disable after a failed reload must not resurrect contracts"
+    );
+}
+
+#[test]
+fn entity_lease_scope_closes_after_success_error_fanout_degradation_and_unload() {
+    let registry =
+        install_named_lua_package("lease-close", lease_probe_plugin(), lease_probe_manifest());
+    let mut hub = explicit_runtime("lease-close");
+    hub.load_lua_plugin_package(&registry, "lease-probe")
+        .expect("load");
+    let scopes = hub.causal_scopes().clone();
+
+    let success = scopes.mint_with_lease(None).expect("success scope");
+    let published = hub.invoke_plugin(scoped_command(
+        "lease-probe",
+        "publish",
+        serde_json::json!({ "seq": 1 }),
+        success,
+    ));
+    assert!(matches!(
+        published.result,
+        PluginInvocationResult::Completed(_)
+    ));
+    assert!(scopes.is_live(success), "admitted mutation holds the scope");
+    assert_eq!(
+        scopes.identities(success),
+        Some(std::collections::BTreeSet::from([
+            LeaseIdentity::AdmittedEntityMutation {
+                family: "lease-probe.item".into(),
+                seq: 1,
+            }
+        ]))
+    );
+    let taken = hub.take_leased_package_entity_fanout();
+    assert_eq!(taken.len(), 1);
+    assert!(
+        scopes.is_live(success),
+        "drain must keep the mutation lease until fanout finishes"
+    );
+    hub.finish_package_entity_mutation_fanout(&taken[0], true);
+    assert!(
+        scopes.is_live(success),
+        "fanout-created resync must keep the mutation scope"
+    );
+    hub.plugin_entity_snapshot("lease-probe.item", "fanout-resync")
+        .expect("provider after fanout resync");
+    let provider = hub.invoke_plugin(scoped_command(
+        "lease-probe",
+        "last_provider",
+        serde_json::json!({}),
+        success,
+    ));
+    let PluginInvocationResult::Completed(PluginInvocationSuccess {
+        payload: Some(payload),
+        ..
+    }) = provider.result
+    else {
+        panic!("provider status command should complete");
+    };
+    assert_eq!(payload.0["status"], "rejected_causal_scope");
+
+    let errored = scopes.mint_with_lease(None).expect("error scope");
+    let failed = hub.invoke_plugin(scoped_command(
+        "lease-probe",
+        "bad",
+        serde_json::json!({}),
+        errored,
+    ));
+    assert!(matches!(failed.result, PluginInvocationResult::Failed(_)));
+    assert!(
+        !scopes.is_live(errored),
+        "ownership error must release pending"
+    );
+
+    let degraded = scopes.mint_with_lease(None).expect("degraded scope");
+    let far = hub.invoke_plugin(scoped_command(
+        "lease-probe",
+        "publish",
+        serde_json::json!({ "seq": 32, "id": "far" }),
+        degraded,
+    ));
+    assert!(matches!(far.result, PluginInvocationResult::Completed(_)));
+    assert_eq!(
+        scopes.identities(degraded),
+        Some(std::collections::BTreeSet::from([
+            LeaseIdentity::ProviderResyncNeed {
+                family: "lease-probe.item".into(),
+            }
+        ]))
+    );
+    let mut entered_degraded = false;
+    for _ in 0..8 {
+        entered_degraded = hub.record_package_entity_resync_attempt("lease-probe.item");
+    }
+    assert!(entered_degraded);
+    assert!(
+        !scopes.is_live(degraded),
+        "max attempts must release ProviderResyncNeed"
+    );
+
+    let unloaded = scopes.mint_with_lease(None).expect("unload scope");
+    let gap = hub.invoke_plugin(scoped_command(
+        "lease-probe",
+        "publish",
+        serde_json::json!({ "seq": 3, "id": "gap" }),
+        unloaded,
+    ));
+    assert!(matches!(gap.result, PluginInvocationResult::Completed(_)));
+    assert!(scopes.is_live(unloaded));
+    let _ = hub.unload_plugin_package(RequestId("lease-unload".into()), "lease-probe");
+    assert!(
+        !scopes.is_live(unloaded),
+        "unload must release remaining family leases"
+    );
+}
+
+#[test]
+fn production_fanout_finish_returns_the_513th_op_without_spinning() {
+    let registry =
+        install_named_lua_package("lease-nospin", lease_probe_plugin(), lease_probe_manifest());
+    let mut hub = explicit_runtime("lease-nospin");
+    hub.load_lua_plugin_package(&registry, "lease-probe")
+        .expect("load");
+    let scopes = hub.causal_scopes().clone();
+    let success = scopes.mint_with_lease(None).expect("success scope");
+    let published = hub.invoke_plugin(scoped_command(
+        "lease-probe",
+        "publish",
+        serde_json::json!({ "seq": 1 }),
+        success,
+    ));
+    assert!(matches!(
+        published.result,
+        PluginInvocationResult::Completed(_)
+    ));
+    let taken = hub.take_leased_package_entity_fanout();
+    assert_eq!(taken.len(), 1);
+
+    let capacity = CAUSAL_PENDING_MAX;
+    let mut fillers = Vec::new();
+    for index in 0..capacity {
+        let scope = scopes
+            .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+                plugin_key: format!("fill{index}"),
+            }))
+            .expect("mint filler");
+        fillers.push(scope);
+    }
+    scopes.test_with_inner_held(|| {
+        for (index, scope) in fillers.iter().enumerate() {
+            assert_eq!(
+                scopes.transfer(
+                    *scope,
+                    LeaseIdentity::PendingEntityPublish {
+                        plugin_key: format!("fill{index}"),
+                    },
+                    [LeaseIdentity::AdmittedEntityMutation {
+                        family: "f".into(),
+                        seq: index as u64,
+                    }],
+                ),
+                CausalAdmitResult::Applied
+            );
+        }
+        let started = Instant::now();
+        hub.finish_package_entity_mutation_fanout(&taken[0], true);
+        assert!(
+            started.elapsed() < Duration::from_millis(20),
+            "production finish must return without spinning: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            hub.event_plane_owner_ops_pending(),
+            "unsent finish must stay on the owner retry machine"
+        );
+    });
+    assert_eq!(
+        scopes.identities(success),
+        Some(std::collections::BTreeSet::from([
+            LeaseIdentity::AdmittedEntityMutation {
+                family: "lease-probe.item".into(),
+                seq: 1,
+            }
+        ])),
+        "finish must not commit the transfer before retry ownership is durable"
+    );
+    let first = scopes.flush_pending();
+    assert!(first > 0);
+    assert!(
+        first <= CAUSAL_FLUSH_MAX,
+        "one owner turn must not drain without a bound: {first}"
+    );
+    assert_eq!(
+        scopes.identities(fillers[0]),
+        Some(std::collections::BTreeSet::from([
+            LeaseIdentity::AdmittedEntityMutation {
+                family: "f".into(),
+                seq: 0,
+            }
+        ]))
+    );
+    while scopes.pending_ops() {
+        let _ = scopes.flush_pending();
+    }
+    let _ = hub.apply_event_plane_owner_ops();
+    while scopes.pending_ops() {
+        let _ = scopes.flush_pending();
+    }
+    assert!(
+        !hub.event_plane_owner_ops_pending(),
+        "owner turn must admit the parked production transfer"
+    );
+    assert_eq!(
+        scopes.identities(success),
+        Some(std::collections::BTreeSet::from([
+            LeaseIdentity::ProviderResyncNeed {
+                family: "lease-probe.item".into(),
+            }
+        ]))
+    );
+}
+
+#[test]
+fn never_queued_publish_releases_after_full_causal_path() {
+    let registry = install_named_lua_package(
+        "lease-neverqueued",
+        lease_probe_plugin(),
+        lease_probe_manifest(),
+    );
+    let mut hub = explicit_runtime("lease-neverqueued");
+    hub.load_lua_plugin_package(&registry, "lease-probe")
+        .expect("load");
+    let scopes = hub.causal_scopes().clone();
+    let live = scopes.mint_with_lease(None).expect("live scope");
+    let capacity = CAUSAL_PENDING_MAX;
+    let mut fillers = Vec::new();
+    for index in 0..capacity {
+        let scope = scopes
+            .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+                plugin_key: format!("fill{index}"),
+            }))
+            .expect("mint filler");
+        fillers.push(scope);
+    }
+    scopes.test_with_inner_held(|| {
+        for (index, scope) in fillers.iter().enumerate() {
+            assert_eq!(
+                scopes.transfer(
+                    *scope,
+                    LeaseIdentity::PendingEntityPublish {
+                        plugin_key: format!("fill{index}"),
+                    },
+                    [LeaseIdentity::AdmittedEntityMutation {
+                        family: "f".into(),
+                        seq: index as u64,
+                    }],
+                ),
+                CausalAdmitResult::Applied
+            );
+        }
+    });
+    hub.entity_publish_bridge().reject_next_publish();
+    let failed = hub.invoke_plugin(scoped_command(
+        "lease-probe",
+        "publish",
+        serde_json::json!({ "seq": 1 }),
+        live,
+    ));
+    assert!(matches!(failed.result, PluginInvocationResult::Failed(_)));
+    let _ = hub.apply_event_plane_owner_ops();
+    while scopes.pending_ops() {
+        let _ = scopes.flush_pending();
+    }
+    assert!(
+        !scopes.is_live(live),
+        "NeverQueued must retract or later close the pending publish lease"
+    );
+}
+
+#[test]
+fn never_queued_release_stays_owned_when_release_queue_is_full() {
+    let registry = install_named_lua_package(
+        "lease-bridge-full",
+        lease_probe_plugin(),
+        lease_probe_manifest(),
+    );
+    let mut hub = explicit_runtime("lease-bridge-full");
+    hub.load_lua_plugin_package(&registry, "lease-probe")
+        .expect("load");
+    let scopes = hub.causal_scopes().clone();
+    let live = scopes
+        .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+            plugin_key: "lease-probe".into(),
+        }))
+        .expect("live");
+    let mut fillers = Vec::new();
+    for index in 0..(CAUSAL_PENDING_MAX * 3) {
+        let scope = scopes
+            .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+                plugin_key: format!("fill{index}"),
+            }))
+            .expect("mint");
+        fillers.push(scope);
+    }
+    let bridge = hub.entity_publish_bridge();
+    scopes.test_with_inner_held(|| {
+        for (index, scope) in fillers.iter().take(CAUSAL_PENDING_MAX).enumerate() {
+            assert_eq!(
+                scopes.transfer(
+                    *scope,
+                    LeaseIdentity::PendingEntityPublish {
+                        plugin_key: format!("fill{index}"),
+                    },
+                    [LeaseIdentity::AdmittedEntityMutation {
+                        family: "f".into(),
+                        seq: index as u64,
+                    }],
+                ),
+                CausalAdmitResult::Applied
+            );
+        }
+        for (index, scope) in fillers.iter().enumerate() {
+            let op = CausalOp::Release {
+                scope_id: *scope,
+                identity: LeaseIdentity::AdmittedEntityMutation {
+                    family: "f".into(),
+                    seq: index as u64,
+                },
+            };
+            if let CausalAdmitResult::Retry(op) = bridge.park_release(op) {
+                assert_eq!(bridge.mark_orphan(op), CausalAdmitResult::Applied);
+            }
+        }
+        assert_eq!(bridge.release_count(), CAUSAL_PENDING_MAX * 3);
+        let overflow = release_or_retract(
+            &scopes,
+            live,
+            LeaseIdentity::PendingEntityPublish {
+                plugin_key: "lease-probe".into(),
+            },
+        );
+        let CausalAdmitResult::Retry(overflow) = overflow else {
+            panic!("full table and held inner must return the release");
+        };
+        let CausalAdmitResult::Retry(overflow) = bridge.park_release(overflow) else {
+            panic!("full park stores must return the release");
+        };
+        assert_eq!(bridge.mark_orphan(overflow), CausalAdmitResult::Applied);
+        assert_eq!(bridge.release_count(), CAUSAL_PENDING_MAX * 3 + 1);
+    });
+    let _ = hub.apply_event_plane_owner_ops();
+    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+        let _ = hub.apply_event_plane_owner_ops();
+        let _ = scopes.flush_pending();
+    }
+    assert!(!scopes.is_live(live));
+}
+
+#[test]
+fn never_queued_mark_returns_the_op_when_orphan_stores_are_held() {
+    let hub = explicit_runtime("lease-orphan-held");
+    let scopes = hub.causal_scopes().clone();
+    let live = scopes
+        .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+            plugin_key: "lease-probe".into(),
+        }))
+        .expect("live");
+    let bridge = hub.entity_publish_bridge();
+    let overflow = CausalOp::Release {
+        scope_id: live,
+        identity: LeaseIdentity::PendingEntityPublish {
+            plugin_key: "lease-probe".into(),
+        },
+    };
+    bridge.test_with_orphan_stores_held(|| {
+        assert!(matches!(
+            bridge.mark_orphan(overflow.clone()),
+            CausalAdmitResult::Retry(_)
+        ));
+    });
+    assert_eq!(bridge.mark_orphan(overflow), CausalAdmitResult::Applied);
+    let _ = hub.apply_event_plane_owner_ops();
+    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+        let _ = hub.apply_event_plane_owner_ops();
+        let _ = scopes.flush_pending();
+    }
+    assert!(!scopes.is_live(live));
+}
+
+#[test]
+fn park_release_keeps_both_identities_for_one_scope() {
+    let hub = explicit_runtime("lease-two-identities");
+    let scopes = hub.causal_scopes().clone();
+    let live = scopes
+        .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+            family: "f".into(),
+            seq: 1,
+        }))
+        .expect("live");
+    assert!(scopes.acquire(
+        live,
+        LeaseIdentity::ProviderResyncNeed { family: "f".into() },
+    ));
+    let mut fillers = Vec::new();
+    for index in 0..CAUSAL_PENDING_MAX {
+        fillers.push(
+            scopes
+                .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+                    plugin_key: format!("fill{index}"),
+                }))
+                .expect("mint"),
+        );
+    }
+    let bridge = hub.entity_publish_bridge();
+    scopes.test_with_inner_held(|| {
+        for (index, scope) in fillers.iter().enumerate() {
+            assert_eq!(
+                scopes.transfer(
+                    *scope,
+                    LeaseIdentity::PendingEntityPublish {
+                        plugin_key: format!("fill{index}"),
+                    },
+                    [LeaseIdentity::AdmittedEntityMutation {
+                        family: "f".into(),
+                        seq: index as u64,
+                    }],
+                ),
+                CausalAdmitResult::Applied
+            );
+            assert_eq!(
+                bridge.park_release(CausalOp::Release {
+                    scope_id: *scope,
+                    identity: LeaseIdentity::AdmittedEntityMutation {
+                        family: "f".into(),
+                        seq: index as u64,
+                    },
+                }),
+                CausalAdmitResult::Applied
+            );
+        }
+        assert_eq!(
+            bridge.park_release(CausalOp::Release {
+                scope_id: live,
+                identity: LeaseIdentity::AdmittedEntityMutation {
+                    family: "f".into(),
+                    seq: 1,
+                },
+            }),
+            CausalAdmitResult::Applied
+        );
+        assert_eq!(
+            bridge.park_release(CausalOp::Release {
+                scope_id: live,
+                identity: LeaseIdentity::ProviderResyncNeed { family: "f".into() },
+            }),
+            CausalAdmitResult::Applied
+        );
+        assert_eq!(bridge.release_count(), CAUSAL_PENDING_MAX + 2);
+    });
+    let _ = hub.apply_event_plane_owner_ops();
+    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+        let _ = hub.apply_event_plane_owner_ops();
+        let _ = scopes.flush_pending();
+    }
+    assert!(!scopes.is_live(live));
+}
+
+#[test]
+fn never_queued_does_not_acquire_a_lease() {
+    let registry =
+        install_named_lua_package("lease-source", lease_probe_plugin(), lease_probe_manifest());
+    let mut hub = explicit_runtime("lease-source");
+    hub.load_lua_plugin_package(&registry, "lease-probe")
+        .expect("load");
+    let scopes = hub.causal_scopes().clone();
+    let live = scopes.mint_with_lease(None).expect("live");
+    let bridge = hub.entity_publish_bridge();
+    bridge.reject_next_publish();
+    let first = hub.invoke_plugin(scoped_command(
+        "lease-probe",
+        "publish",
+        serde_json::json!({ "seq": 1 }),
+        live,
+    ));
+    assert!(matches!(first.result, PluginInvocationResult::Failed(_)));
+    assert!(!scopes.is_live(live));
+    assert_eq!(
+        scopes.identities(live),
+        Some(std::collections::BTreeSet::new())
+    );
+    bridge.reject_next_publish();
+    let second = hub.invoke_plugin(scoped_command(
+        "lease-probe",
+        "publish",
+        serde_json::json!({ "seq": 2 }),
+        live,
+    ));
+    assert!(matches!(second.result, PluginInvocationResult::Failed(_)));
+    assert!(!scopes.is_live(live));
+    assert_eq!(
+        scopes.identities(live),
+        Some(std::collections::BTreeSet::new())
+    );
+}
+
+#[test]
+fn unfinished_finishes_are_bounded_sliced_and_fifo() {
+    let hub = explicit_runtime("lease-unfinished");
+    let scopes = hub.causal_scopes().clone();
+    let live = scopes
+        .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+            plugin_key: "producer".into(),
+        }))
+        .expect("live");
+    let mut fillers = Vec::new();
+    for index in 0..CAUSAL_PENDING_MAX {
+        fillers.push(
+            scopes
+                .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+                    plugin_key: format!("fill{index}"),
+                }))
+                .expect("mint"),
+        );
+    }
+    let (transfer, release) = scopes.test_with_inner_held(|| {
+        for (index, scope) in fillers.iter().enumerate() {
+            assert_eq!(
+                scopes.transfer(
+                    *scope,
+                    LeaseIdentity::PendingEntityPublish {
+                        plugin_key: format!("fill{index}"),
+                    },
+                    [LeaseIdentity::AdmittedEntityMutation {
+                        family: "f".into(),
+                        seq: index as u64,
+                    }],
+                ),
+                CausalAdmitResult::Applied
+            );
+        }
+        for _ in 0..3 {
+            for (index, scope) in fillers.iter().enumerate() {
+                assert_eq!(
+                    hub.keep_causal_op(CausalOp::Release {
+                        scope_id: *scope,
+                        identity: LeaseIdentity::AdmittedEntityMutation {
+                            family: "f".into(),
+                            seq: index as u64,
+                        },
+                    }),
+                    CausalAdmitResult::Applied
+                );
+            }
+        }
+        assert_eq!(hub.unfinished_finish_count(), CAUSAL_PENDING_MAX * 3);
+        let transfer = hub.keep_causal_op(CausalOp::Transfer {
+            scope_id: live,
+            from: LeaseIdentity::PendingEntityPublish {
+                plugin_key: "producer".into(),
+            },
+            to: vec![LeaseIdentity::AdmittedEntityMutation {
+                family: "producer.item".into(),
+                seq: 1,
+            }],
+        });
+        let CausalAdmitResult::Retry(transfer) = transfer else {
+            panic!("operation 769 must stay with the caller");
+        };
+        let release = hub.keep_causal_op(CausalOp::Release {
+            scope_id: live,
+            identity: LeaseIdentity::AdmittedEntityMutation {
+                family: "producer.item".into(),
+                seq: 1,
+            },
+        });
+        let CausalAdmitResult::Retry(release) = release else {
+            panic!("operation 770 must stay with the caller");
+        };
+        assert_eq!(hub.unfinished_finish_count(), CAUSAL_PENDING_MAX * 3);
+        (transfer, release)
+    });
+    let before = hub.unfinished_finish_count();
+    let _ = hub.apply_event_plane_owner_ops();
+    assert!(
+        hub.unfinished_finish_count() < before,
+        "owner turn must slice unfinished work"
+    );
+    assert_eq!(hub.keep_causal_op(transfer), CausalAdmitResult::Applied);
+    assert_eq!(hub.keep_causal_op(release), CausalAdmitResult::Applied);
+    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+        let _ = hub.apply_event_plane_owner_ops();
+        let _ = scopes.flush_pending();
+    }
+    assert_eq!(hub.unfinished_finish_count(), 0);
+    assert!(
+        !scopes.is_live(live),
+        "caller-held Transfer must apply before the caller-held Release"
+    );
+}
+
+#[test]
+fn keep_owned_park_retry_stays_at_source_when_every_store_is_full() {
+    let hub = explicit_runtime("lease-in-hand");
+    let scopes = hub.causal_scopes().clone();
+    let live = scopes
+        .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+            plugin_key: "producer".into(),
+        }))
+        .expect("live");
+    let mut fillers = Vec::new();
+    for index in 0..(CAUSAL_PENDING_MAX * 3 + 2) {
+        fillers.push(
+            scopes
+                .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+                    plugin_key: format!("fill{index}"),
+                }))
+                .expect("mint"),
+        );
+    }
+    let bridge = hub.entity_publish_bridge();
+    scopes.test_with_inner_held(|| {
+        for (index, scope) in fillers.iter().take(CAUSAL_PENDING_MAX).enumerate() {
+            assert_eq!(
+                scopes.transfer(
+                    *scope,
+                    LeaseIdentity::PendingEntityPublish {
+                        plugin_key: format!("fill{index}"),
+                    },
+                    [LeaseIdentity::AdmittedEntityMutation {
+                        family: "f".into(),
+                        seq: index as u64,
+                    }],
+                ),
+                CausalAdmitResult::Applied
+            );
+        }
+        for _ in 0..3 {
+            for (index, scope) in fillers.iter().take(CAUSAL_PENDING_MAX).enumerate() {
+                assert_eq!(
+                    hub.keep_causal_op(CausalOp::Release {
+                        scope_id: *scope,
+                        identity: LeaseIdentity::AdmittedEntityMutation {
+                            family: "f".into(),
+                            seq: index as u64,
+                        },
+                    }),
+                    CausalAdmitResult::Applied
+                );
+            }
+        }
+        for (index, scope) in fillers.iter().enumerate() {
+            let op = CausalOp::Release {
+                scope_id: *scope,
+                identity: LeaseIdentity::AdmittedEntityMutation {
+                    family: "f".into(),
+                    seq: index as u64,
+                },
+            };
+            if let CausalAdmitResult::Retry(op) = bridge.park_release(op)
+                && let CausalAdmitResult::Retry(op) = bridge.mark_orphan(op)
+            {
+                assert_eq!(bridge.leave_source(op), CausalAdmitResult::Applied);
+            }
+        }
+        assert_eq!(hub.unfinished_finish_count(), CAUSAL_PENDING_MAX * 3);
+        assert_eq!(bridge.release_count(), CAUSAL_PENDING_MAX * 3 + 2);
+        assert_eq!(
+            hub.keep_owned_op(CausalOp::Release {
+                scope_id: live,
+                identity: LeaseIdentity::PendingEntityPublish {
+                    plugin_key: "producer".into(),
+                },
+            }),
+            CausalAdmitResult::Applied
+        );
+        assert_eq!(
+            hub.keep_owned_op(CausalOp::Release {
+                scope_id: live,
+                identity: LeaseIdentity::PendingEntityPublish {
+                    plugin_key: "producer".into(),
+                },
+            }),
+            CausalAdmitResult::Applied
+        );
+        assert!(hub.event_plane_owner_ops_pending());
+    });
+    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+        let _ = hub.apply_event_plane_owner_ops();
+        let _ = scopes.flush_pending();
+    }
+    assert!(
+        !scopes.is_live(live),
+        "in-hand and retry-queue Releases must stay owned and later close the scope"
+    );
+}
+
+#[test]
+fn unload_retries_restored_family_leases_until_scopes_close() {
+    let registry =
+        install_named_lua_package("lease-unload", lease_probe_plugin(), lease_probe_manifest());
+    let mut hub = explicit_runtime("lease-unload");
+    hub.load_lua_plugin_package(&registry, "lease-probe")
+        .expect("load");
+    let scopes = hub.causal_scopes().clone();
+    let mut lives = Vec::new();
+    for seq in 0..(CAUSAL_FLUSH_MAX + 8) {
+        let scope = scopes
+            .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+                family: "lease-probe.item".into(),
+                seq: seq as u64,
+            }))
+            .expect("live");
+        hub.test_store_pending_lease(scope, "lease-probe.item", seq as u64);
+        lives.push(scope);
+    }
+    let mut fillers = Vec::new();
+    for index in 0..(CAUSAL_PENDING_MAX * 3 + 2) {
+        fillers.push(
+            scopes
+                .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+                    plugin_key: format!("fill{index}"),
+                }))
+                .expect("mint"),
+        );
+    }
+    let bridge = hub.entity_publish_bridge();
+    scopes.test_with_inner_held(|| {
+        for (index, scope) in fillers.iter().take(CAUSAL_PENDING_MAX).enumerate() {
+            assert_eq!(
+                scopes.transfer(
+                    *scope,
+                    LeaseIdentity::PendingEntityPublish {
+                        plugin_key: format!("fill{index}"),
+                    },
+                    [LeaseIdentity::AdmittedEntityMutation {
+                        family: "f".into(),
+                        seq: index as u64,
+                    }],
+                ),
+                CausalAdmitResult::Applied
+            );
+        }
+        for _ in 0..3 {
+            for (index, scope) in fillers.iter().take(CAUSAL_PENDING_MAX).enumerate() {
+                assert_eq!(
+                    hub.keep_causal_op(CausalOp::Release {
+                        scope_id: *scope,
+                        identity: LeaseIdentity::AdmittedEntityMutation {
+                            family: "f".into(),
+                            seq: index as u64,
+                        },
+                    }),
+                    CausalAdmitResult::Applied
+                );
+            }
+        }
+        for (index, scope) in fillers.iter().enumerate() {
+            let op = CausalOp::Release {
+                scope_id: *scope,
+                identity: LeaseIdentity::AdmittedEntityMutation {
+                    family: "f".into(),
+                    seq: index as u64,
+                },
+            };
+            if let CausalAdmitResult::Retry(op) = bridge.park_release(op)
+                && let CausalAdmitResult::Retry(op) = bridge.mark_orphan(op)
+            {
+                assert_eq!(bridge.leave_source(op), CausalAdmitResult::Applied);
+            }
+        }
+        let dummy = CausalOp::Release {
+            scope_id: fillers[0],
+            identity: LeaseIdentity::AdmittedEntityMutation {
+                family: "f".into(),
+                seq: 0,
+            },
+        };
+        assert_eq!(hub.keep_owned_op(dummy.clone()), CausalAdmitResult::Applied);
+        for _ in 0..CAUSAL_PENDING_MAX {
+            assert_eq!(hub.keep_owned_op(dummy.clone()), CausalAdmitResult::Applied);
+        }
+        assert_eq!(hub.test_retry_ops_len(), CAUSAL_PENDING_MAX);
+        assert_eq!(
+            hub.test_enqueue_or_family(
+                "lease-probe.item",
+                CausalOp::Release {
+                    scope_id: lives[0],
+                    identity: LeaseIdentity::AdmittedEntityMutation {
+                        family: "lease-probe.item".into(),
+                        seq: 0,
+                    },
+                },
+            ),
+            CausalAdmitResult::Applied
+        );
+        hub.drop_package_entity_families_for("lease-probe");
+        assert!(hub.test_family_unloading("lease-probe.item"));
+    });
+    assert!(hub.test_family_unloading("lease-probe.item"));
+    assert_eq!(
+        hub.test_unloading_lease_count("lease-probe.item"),
+        CAUSAL_FLUSH_MAX + 8
+    );
+    let _ = hub.apply_event_plane_owner_ops();
+    let remaining = hub.test_unloading_lease_count("lease-probe.item");
+    assert!(
+        remaining > 0 && remaining < CAUSAL_FLUSH_MAX + 8,
+        "one owner turn must slice unloading leases: {remaining}"
+    );
+    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+        let _ = hub.apply_event_plane_owner_ops();
+        let _ = scopes.flush_pending();
+    }
+    assert!(!hub.test_family_unloading("lease-probe.item"));
+    for scope in lives {
+        assert!(!scopes.is_live(scope));
+    }
+}
+
+fn family_release(scope: u64, family: &str, seq: u64) -> CausalOp {
+    CausalOp::Release {
+        scope_id: scope,
+        identity: LeaseIdentity::AdmittedEntityMutation {
+            family: family.into(),
+            seq,
+        },
+    }
+}
+
+struct LeftoverFill {
+    fillers: Vec<u64>,
+    parks: Vec<u64>,
+    held: u64,
+    source: u64,
+    overflow: u64,
+}
+
+fn mint_leftover_fill(scopes: &CausalScopeTable) -> LeftoverFill {
+    let mut fillers = Vec::new();
+    for index in 0..(CAUSAL_PENDING_MAX * 3 + 2) {
+        fillers.push(
+            scopes
+                .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+                    plugin_key: format!("fill{index}"),
+                }))
+                .expect("mint filler"),
+        );
+    }
+    let mut parks = Vec::new();
+    for index in 0..CAUSAL_PENDING_MAX {
+        parks.push(
+            scopes
+                .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+                    family: format!("p{index}"),
+                    seq: index as u64,
+                }))
+                .expect("mint park"),
+        );
+    }
+    LeftoverFill {
+        fillers,
+        parks,
+        held: scopes
+            .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+                family: "held".into(),
+                seq: 0,
+            }))
+            .expect("held"),
+        source: scopes
+            .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+                family: "source".into(),
+                seq: 0,
+            }))
+            .expect("source"),
+        overflow: scopes
+            .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+                family: "overflow".into(),
+                seq: 0,
+            }))
+            .expect("overflow"),
+    }
+}
+
+fn fill_every_leftover_store(hub: &HubRuntime, scopes: &CausalScopeTable, fill: &LeftoverFill) {
+    let bridge = hub.entity_publish_bridge();
+    for (index, scope) in fill.fillers.iter().take(CAUSAL_PENDING_MAX).enumerate() {
+        assert_eq!(
+            scopes.transfer(
+                *scope,
+                LeaseIdentity::PendingEntityPublish {
+                    plugin_key: format!("fill{index}"),
+                },
+                [LeaseIdentity::AdmittedEntityMutation {
+                    family: "f".into(),
+                    seq: index as u64,
+                }],
+            ),
+            CausalAdmitResult::Applied
+        );
+    }
+    for _ in 0..3 {
+        for (index, scope) in fill.fillers.iter().take(CAUSAL_PENDING_MAX).enumerate() {
+            assert_eq!(
+                hub.keep_causal_op(CausalOp::Release {
+                    scope_id: *scope,
+                    identity: LeaseIdentity::AdmittedEntityMutation {
+                        family: "f".into(),
+                        seq: index as u64,
+                    },
+                }),
+                CausalAdmitResult::Applied
+            );
+        }
+    }
+    for (index, scope) in fill.fillers.iter().enumerate() {
+        let op = CausalOp::Release {
+            scope_id: *scope,
+            identity: LeaseIdentity::AdmittedEntityMutation {
+                family: "f".into(),
+                seq: index as u64,
+            },
+        };
+        if let CausalAdmitResult::Retry(op) = bridge.park_release(op)
+            && let CausalAdmitResult::Retry(op) = bridge.mark_orphan(op)
+        {
+            assert_eq!(bridge.leave_source(op), CausalAdmitResult::Applied);
+        }
+    }
+    let dummy = CausalOp::Release {
+        scope_id: fill.fillers[0],
+        identity: LeaseIdentity::AdmittedEntityMutation {
+            family: "f".into(),
+            seq: 0,
+        },
+    };
+    assert_eq!(hub.keep_owned_op(dummy.clone()), CausalAdmitResult::Applied);
+    for _ in 0..CAUSAL_PENDING_MAX {
+        assert_eq!(hub.keep_owned_op(dummy.clone()), CausalAdmitResult::Applied);
+    }
+    for (index, scope) in fill.parks.iter().enumerate() {
+        assert_eq!(
+            hub.test_park_family_causal(family_release(*scope, &format!("p{index}"), index as u64)),
+            CausalAdmitResult::Applied
+        );
+    }
+    let CausalAdmitResult::Retry(op) =
+        hub.test_park_family_causal(family_release(fill.held, "held", 0))
+    else {
+        panic!("held");
+    };
+    assert_eq!(hub.test_hold_family(op), CausalAdmitResult::Applied);
+    let CausalAdmitResult::Retry(op) =
+        hub.test_park_family_causal(family_release(fill.source, "source", 0))
+    else {
+        panic!("source");
+    };
+    assert_eq!(hub.test_hold_source(op), CausalAdmitResult::Applied);
+    assert_eq!(
+        hub.test_enqueue_or_family("overflow", family_release(fill.overflow, "overflow", 0)),
+        CausalAdmitResult::Applied
+    );
+    assert!(hub.test_family_overflow());
+    assert_eq!(hub.test_retry_ops_len(), CAUSAL_PENDING_MAX);
+    for _ in 0..CAUSAL_PENDING_MAX {
+        assert_eq!(
+            hub.test_keep_source_op(dummy.clone()),
+            CausalAdmitResult::Applied
+        );
+    }
+    assert_eq!(hub.test_source_ops_len(), CAUSAL_PENDING_MAX);
+    assert_eq!(
+        hub.test_keep_source_op(dummy.clone()),
+        CausalAdmitResult::Applied
+    );
+    assert_eq!(
+        hub.test_keep_source_op(dummy.clone()),
+        CausalAdmitResult::Applied
+    );
+    assert_eq!(hub.test_source_held_len(), 2);
+    assert!(!hub.test_unsettled());
+}
+
+#[test]
+fn family_causal_is_one_global_fifo_and_258th_stays_at_source() {
+    let hub = explicit_runtime("lease-family-bound");
+    let scopes = hub.causal_scopes().clone();
+    let mut parked = Vec::new();
+    for index in 0..CAUSAL_PENDING_MAX {
+        let family = format!("f{index}");
+        let scope = scopes
+            .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+                family: family.clone(),
+                seq: index as u64,
+            }))
+            .expect("mint");
+        assert_eq!(
+            hub.test_park_family_causal(family_release(scope, &family, index as u64)),
+            CausalAdmitResult::Applied
+        );
+        parked.push(scope);
+    }
+    assert_eq!(hub.test_family_causal_len(), CAUSAL_PENDING_MAX);
+    let held_scope = scopes
+        .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+            family: "held".into(),
+            seq: 0,
+        }))
+        .expect("held");
+    let rejected = hub.test_park_family_causal(family_release(held_scope, "held", 0));
+    let CausalAdmitResult::Retry(op) = rejected else {
+        panic!("257th family leftover must stay with the caller");
+    };
+    assert_eq!(hub.test_hold_family(op), CausalAdmitResult::Applied);
+    assert!(hub.test_family_held());
+    let source_scope = scopes
+        .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+            family: "source".into(),
+            seq: 0,
+        }))
+        .expect("source");
+    let rejected = hub.test_park_family_causal(family_release(source_scope, "source", 0));
+    let CausalAdmitResult::Retry(op) = rejected else {
+        panic!("258th family leftover must stay with the caller");
+    };
+    assert_eq!(
+        hub.test_hold_family(op.clone()),
+        CausalAdmitResult::Retry(op.clone())
+    );
+    assert_eq!(hub.test_hold_source(op), CausalAdmitResult::Applied);
+    assert!(hub.test_family_source());
+    let extra = scopes
+        .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+            family: "extra".into(),
+            seq: 0,
+        }))
+        .expect("extra");
+    assert_eq!(
+        hub.test_enqueue_or_family("extra", family_release(extra, "extra", 0)),
+        CausalAdmitResult::Applied
+    );
+    assert_eq!(hub.test_family_causal_len(), CAUSAL_PENDING_MAX);
+    let _ = hub.apply_event_plane_owner_ops();
+    let remaining = hub.test_family_causal_len();
+    assert!(
+        remaining > 0 && remaining < CAUSAL_PENDING_MAX,
+        "one owner turn must stop family_causal iteration: {remaining}"
+    );
+    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+        let _ = hub.apply_event_plane_owner_ops();
+        let _ = scopes.flush_pending();
+    }
+    assert_eq!(hub.test_family_causal_len(), 0);
+    assert!(!hub.test_family_held());
+    assert!(!hub.test_family_source());
+    assert!(!hub.test_family_overflow());
+    for scope in parked {
+        assert!(!scopes.is_live(scope));
+    }
+    assert!(!scopes.is_live(held_scope));
+    assert!(!scopes.is_live(source_scope));
+    assert!(!scopes.is_live(extra));
+}
+
+#[test]
+fn unloading_family_scan_stops_after_the_slice() {
+    let hub = explicit_runtime("lease-family-scan");
+    let scopes = hub.causal_scopes().clone();
+    let mut lives = Vec::new();
+    for index in 0..(CAUSAL_FLUSH_MAX + 8) {
+        let family = format!("unload{index}");
+        let scope = scopes
+            .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+                family: family.clone(),
+                seq: index as u64,
+            }))
+            .expect("mint");
+        hub.test_store_pending_lease(scope, &family, index as u64);
+        hub.test_mark_unloading(&family);
+        lives.push(scope);
+    }
+    assert_eq!(hub.test_unloading_family_count(), CAUSAL_FLUSH_MAX + 8);
+    let _ = hub.apply_event_plane_owner_ops();
+    let remaining = hub.test_unloading_family_count();
+    assert!(
+        remaining > 0 && remaining < CAUSAL_FLUSH_MAX + 8,
+        "one owner turn must stop the unloading-family scan: {remaining}"
+    );
+    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+        let _ = hub.apply_event_plane_owner_ops();
+        let _ = scopes.flush_pending();
+    }
+    assert_eq!(hub.test_unloading_family_count(), 0);
+    for scope in lives {
+        assert!(!scopes.is_live(scope));
+    }
+}
+
+#[test]
+fn held_retry_does_not_delete_active_family_sequence() {
+    let hub = explicit_runtime("lease-family-keep");
+    let scopes = hub.causal_scopes().clone();
+    hub.test_set_family_seq("active.item", 5);
+    let leftover = scopes
+        .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+            family: "other.item".into(),
+            seq: 1,
+        }))
+        .expect("leftover");
+    assert_eq!(
+        hub.test_park_family_causal(family_release(leftover, "other.item", 1)),
+        CausalAdmitResult::Applied
+    );
+    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+        let _ = hub.apply_event_plane_owner_ops();
+        let _ = scopes.flush_pending();
+    }
+    assert!(hub.test_family_exists("active.item"));
+    assert_eq!(hub.test_family_seq("active.item"), 5);
+    assert!(!scopes.is_live(leftover));
+}
+
+#[test]
+fn production_enqueue_or_family_owns_the_259th() {
+    let hub = explicit_runtime("lease-family-259");
+    let scopes = hub.causal_scopes().clone();
+    let mut fillers = Vec::new();
+    for index in 0..(CAUSAL_PENDING_MAX * 3 + 2) {
+        fillers.push(
+            scopes
+                .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+                    plugin_key: format!("fill{index}"),
+                }))
+                .expect("mint"),
+        );
+    }
+    let mut parks = Vec::new();
+    for index in 0..CAUSAL_PENDING_MAX {
+        parks.push(
+            scopes
+                .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+                    family: format!("p{index}"),
+                    seq: index as u64,
+                }))
+                .expect("park"),
+        );
+    }
+    let held = scopes
+        .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+            family: "held".into(),
+            seq: 0,
+        }))
+        .expect("held");
+    let source = scopes
+        .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+            family: "source".into(),
+            seq: 0,
+        }))
+        .expect("source");
+    let extra = scopes
+        .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+            family: "extra".into(),
+            seq: 0,
+        }))
+        .expect("extra");
+    let bridge = hub.entity_publish_bridge();
+    scopes.test_with_inner_held(|| {
+        for (index, scope) in fillers.iter().take(CAUSAL_PENDING_MAX).enumerate() {
+            assert_eq!(
+                scopes.transfer(
+                    *scope,
+                    LeaseIdentity::PendingEntityPublish {
+                        plugin_key: format!("fill{index}"),
+                    },
+                    [LeaseIdentity::AdmittedEntityMutation {
+                        family: "f".into(),
+                        seq: index as u64,
+                    }],
+                ),
+                CausalAdmitResult::Applied
+            );
+        }
+        for _ in 0..3 {
+            for (index, scope) in fillers.iter().take(CAUSAL_PENDING_MAX).enumerate() {
+                assert_eq!(
+                    hub.keep_causal_op(CausalOp::Release {
+                        scope_id: *scope,
+                        identity: LeaseIdentity::AdmittedEntityMutation {
+                            family: "f".into(),
+                            seq: index as u64,
+                        },
+                    }),
+                    CausalAdmitResult::Applied
+                );
+            }
+        }
+        for (index, scope) in fillers.iter().enumerate() {
+            let op = CausalOp::Release {
+                scope_id: *scope,
+                identity: LeaseIdentity::AdmittedEntityMutation {
+                    family: "f".into(),
+                    seq: index as u64,
+                },
+            };
+            if let CausalAdmitResult::Retry(op) = bridge.park_release(op)
+                && let CausalAdmitResult::Retry(op) = bridge.mark_orphan(op)
+            {
+                assert_eq!(bridge.leave_source(op), CausalAdmitResult::Applied);
+            }
+        }
+        let dummy = CausalOp::Release {
+            scope_id: fillers[0],
+            identity: LeaseIdentity::AdmittedEntityMutation {
+                family: "f".into(),
+                seq: 0,
+            },
+        };
+        assert_eq!(hub.keep_owned_op(dummy.clone()), CausalAdmitResult::Applied);
+        for _ in 0..CAUSAL_PENDING_MAX {
+            assert_eq!(hub.keep_owned_op(dummy.clone()), CausalAdmitResult::Applied);
+        }
+        assert_eq!(hub.test_retry_ops_len(), CAUSAL_PENDING_MAX);
+        for (index, scope) in parks.iter().enumerate() {
+            assert_eq!(
+                hub.test_park_family_causal(family_release(
+                    *scope,
+                    &format!("p{index}"),
+                    index as u64
+                )),
+                CausalAdmitResult::Applied
+            );
+        }
+        let CausalAdmitResult::Retry(op) =
+            hub.test_park_family_causal(family_release(held, "held", 0))
+        else {
+            panic!("held");
+        };
+        assert_eq!(hub.test_hold_family(op), CausalAdmitResult::Applied);
+        let CausalAdmitResult::Retry(op) =
+            hub.test_park_family_causal(family_release(source, "source", 0))
+        else {
+            panic!("source");
+        };
+        assert_eq!(hub.test_hold_source(op), CausalAdmitResult::Applied);
+        assert_eq!(
+            hub.test_enqueue_or_family("extra", family_release(extra, "extra", 0)),
+            CausalAdmitResult::Applied
+        );
+        assert!(hub.test_family_overflow());
+    });
+    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+        let _ = hub.apply_event_plane_owner_ops();
+        let _ = scopes.flush_pending();
+    }
+    assert!(!hub.test_family_overflow());
+    assert!(!scopes.is_live(extra));
+}
+
+#[test]
+fn production_source_owns_the_260th() {
+    let hub = explicit_runtime("lease-family-260");
+    let scopes = hub.causal_scopes().clone();
+    hub.test_set_family_seq("source.item", 1);
+    let mut fillers = Vec::new();
+    for index in 0..(CAUSAL_PENDING_MAX * 3 + 2) {
+        fillers.push(
+            scopes
+                .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+                    plugin_key: format!("fill{index}"),
+                }))
+                .expect("mint"),
+        );
+    }
+    let mut parks = Vec::new();
+    for index in 0..CAUSAL_PENDING_MAX {
+        parks.push(
+            scopes
+                .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+                    family: format!("p{index}"),
+                    seq: index as u64,
+                }))
+                .expect("park"),
+        );
+    }
+    let held = scopes
+        .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+            family: "held".into(),
+            seq: 0,
+        }))
+        .expect("held");
+    let source = scopes
+        .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+            family: "source".into(),
+            seq: 0,
+        }))
+        .expect("source");
+    let overflow = scopes
+        .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+            family: "overflow".into(),
+            seq: 0,
+        }))
+        .expect("overflow");
+    let extra = scopes
+        .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+            family: "source.item".into(),
+            seq: 2,
+        }))
+        .expect("extra");
+    let bridge = hub.entity_publish_bridge();
+    scopes.test_with_inner_held(|| {
+        for (index, scope) in fillers.iter().take(CAUSAL_PENDING_MAX).enumerate() {
+            assert_eq!(
+                scopes.transfer(
+                    *scope,
+                    LeaseIdentity::PendingEntityPublish {
+                        plugin_key: format!("fill{index}"),
+                    },
+                    [LeaseIdentity::AdmittedEntityMutation {
+                        family: "f".into(),
+                        seq: index as u64,
+                    }],
+                ),
+                CausalAdmitResult::Applied
+            );
+        }
+        for _ in 0..3 {
+            for (index, scope) in fillers.iter().take(CAUSAL_PENDING_MAX).enumerate() {
+                assert_eq!(
+                    hub.keep_causal_op(CausalOp::Release {
+                        scope_id: *scope,
+                        identity: LeaseIdentity::AdmittedEntityMutation {
+                            family: "f".into(),
+                            seq: index as u64,
+                        },
+                    }),
+                    CausalAdmitResult::Applied
+                );
+            }
+        }
+        for (index, scope) in fillers.iter().enumerate() {
+            let op = CausalOp::Release {
+                scope_id: *scope,
+                identity: LeaseIdentity::AdmittedEntityMutation {
+                    family: "f".into(),
+                    seq: index as u64,
+                },
+            };
+            if let CausalAdmitResult::Retry(op) = bridge.park_release(op)
+                && let CausalAdmitResult::Retry(op) = bridge.mark_orphan(op)
+            {
+                assert_eq!(bridge.leave_source(op), CausalAdmitResult::Applied);
+            }
+        }
+        let dummy = CausalOp::Release {
+            scope_id: fillers[0],
+            identity: LeaseIdentity::AdmittedEntityMutation {
+                family: "f".into(),
+                seq: 0,
+            },
+        };
+        assert_eq!(hub.keep_owned_op(dummy.clone()), CausalAdmitResult::Applied);
+        for _ in 0..CAUSAL_PENDING_MAX {
+            assert_eq!(hub.keep_owned_op(dummy.clone()), CausalAdmitResult::Applied);
+        }
+        for (index, scope) in parks.iter().enumerate() {
+            assert_eq!(
+                hub.test_park_family_causal(family_release(
+                    *scope,
+                    &format!("p{index}"),
+                    index as u64
+                )),
+                CausalAdmitResult::Applied
+            );
+        }
+        let CausalAdmitResult::Retry(op) =
+            hub.test_park_family_causal(family_release(held, "held", 0))
+        else {
+            panic!("held");
+        };
+        assert_eq!(hub.test_hold_family(op), CausalAdmitResult::Applied);
+        let CausalAdmitResult::Retry(op) =
+            hub.test_park_family_causal(family_release(source, "source", 0))
+        else {
+            panic!("source");
+        };
+        assert_eq!(hub.test_hold_source(op), CausalAdmitResult::Applied);
+        assert_eq!(
+            hub.test_enqueue_or_family("overflow", family_release(overflow, "overflow", 0)),
+            CausalAdmitResult::Applied
+        );
+        assert!(hub.test_family_overflow());
+        assert_eq!(
+            hub.test_enqueue_or_family("source.item", family_release(extra, "source.item", 2)),
+            CausalAdmitResult::Applied
+        );
+        assert_eq!(hub.test_source_ops_len(), 1);
+    });
+    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+        let _ = hub.apply_event_plane_owner_ops();
+        let _ = scopes.flush_pending();
+    }
+    assert_eq!(hub.test_source_ops_len(), 0);
+    assert!(hub.test_family_exists("source.item"));
+    assert_eq!(hub.test_family_seq("source.item"), 1);
+    assert!(!scopes.is_live(extra));
+}
+
+#[test]
+fn source_ops_are_one_global_store_across_families() {
+    let hub = explicit_runtime("lease-source-bound");
+    let scopes = hub.causal_scopes().clone();
+    let mut parked = Vec::new();
+    for index in 0..CAUSAL_PENDING_MAX {
+        let family = format!("f{index}");
+        let scope = scopes
+            .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+                family: family.clone(),
+                seq: index as u64,
+            }))
+            .expect("mint");
+        assert_eq!(
+            hub.test_park_family_causal(family_release(scope, &family, index as u64)),
+            CausalAdmitResult::Applied
+        );
+        parked.push(scope);
+    }
+    assert_eq!(hub.test_family_causal_len(), CAUSAL_PENDING_MAX);
+    let mut sourced = Vec::new();
+    for index in 0..CAUSAL_PENDING_MAX {
+        let family = format!("s{index}");
+        let scope = scopes
+            .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+                family: family.clone(),
+                seq: index as u64,
+            }))
+            .expect("mint");
+        assert_eq!(
+            hub.test_keep_source_op(family_release(scope, &family, index as u64)),
+            CausalAdmitResult::Applied
+        );
+        sourced.push(scope);
+    }
+    assert_eq!(hub.test_family_causal_len(), CAUSAL_PENDING_MAX);
+    assert_eq!(hub.test_source_ops_len(), CAUSAL_PENDING_MAX);
+    let extra = scopes
+        .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+            family: "missing.item".into(),
+            seq: 0,
+        }))
+        .expect("extra");
+    assert_eq!(
+        hub.test_keep_source_op(family_release(extra, "missing.item", 0)),
+        CausalAdmitResult::Applied
+    );
+    assert_eq!(hub.test_source_ops_len(), CAUSAL_PENDING_MAX);
+    assert!(!scopes.is_live(extra));
+    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+        let _ = hub.apply_event_plane_owner_ops();
+        let _ = scopes.flush_pending();
+    }
+    assert_eq!(hub.test_family_causal_len(), 0);
+    assert_eq!(hub.test_source_ops_len(), 0);
+    for scope in parked.into_iter().chain(sourced) {
+        assert!(!scopes.is_live(scope));
+    }
+}
+
+#[test]
+fn lock_held_release_stays_owned_when_source_ops_is_full() {
+    let hub = explicit_runtime("lease-source-held-release");
+    let scopes = hub.causal_scopes().clone();
+    let mut sourced = Vec::new();
+    for index in 0..CAUSAL_PENDING_MAX {
+        let scope = scopes
+            .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+                family: format!("s{index}"),
+                seq: index as u64,
+            }))
+            .expect("mint");
+        assert_eq!(
+            hub.test_keep_source_op(family_release(scope, &format!("s{index}"), index as u64)),
+            CausalAdmitResult::Applied
+        );
+        sourced.push(scope);
+    }
+    assert_eq!(hub.test_source_ops_len(), CAUSAL_PENDING_MAX);
+    let extra = scopes
+        .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+            family: "held".into(),
+            seq: 0,
+        }))
+        .expect("extra");
+    scopes.test_with_inner_held(|| {
+        assert_eq!(
+            hub.test_keep_source_op(family_release(extra, "held", 0)),
+            CausalAdmitResult::Applied
+        );
+        assert!(hub.test_source_held());
+        assert!(scopes.is_live(extra));
+    });
+    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+        let _ = hub.apply_event_plane_owner_ops();
+        let _ = scopes.flush_pending();
+    }
+    assert!(!hub.test_source_held());
+    assert!(!scopes.is_live(extra));
+    for scope in sourced {
+        assert!(!scopes.is_live(scope));
+    }
+}
+
+#[test]
+fn lock_held_second_overflow_stays_owned() {
+    let hub = explicit_runtime("lease-source-held-second");
+    let scopes = hub.causal_scopes().clone();
+    for index in 0..CAUSAL_PENDING_MAX {
+        let scope = scopes
+            .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+                family: format!("s{index}"),
+                seq: index as u64,
+            }))
+            .expect("mint");
+        assert_eq!(
+            hub.test_keep_source_op(family_release(scope, &format!("s{index}"), index as u64)),
+            CausalAdmitResult::Applied
+        );
+    }
+    let first = scopes
+        .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+            family: "first".into(),
+            seq: 0,
+        }))
+        .expect("first");
+    let second = scopes
+        .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+            family: "second".into(),
+            seq: 0,
+        }))
+        .expect("second");
+    let transfer = scopes
+        .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+            plugin_key: "xfer".into(),
+        }))
+        .expect("transfer");
+    scopes.test_with_inner_held(|| {
+        assert_eq!(
+            hub.test_keep_source_op(family_release(first, "first", 0)),
+            CausalAdmitResult::Applied
+        );
+        assert_eq!(hub.test_source_held_len(), 1);
+        assert_eq!(
+            hub.test_keep_source_op(family_release(second, "second", 0)),
+            CausalAdmitResult::Applied
+        );
+        assert_eq!(hub.test_source_held_len(), 2);
+        assert!(scopes.is_live(first));
+        assert!(scopes.is_live(second));
+        hub.test_settle_publish("probe.item", transfer, "xfer", 1, true);
+        assert!(
+            scopes.is_live(transfer),
+            "second-overflow settle must not retract PendingEntityPublish"
+        );
+        assert_eq!(hub.test_resync_lease_count("probe.item"), 1);
+    });
+    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+        let _ = hub.apply_event_plane_owner_ops();
+        let _ = scopes.flush_pending();
+    }
+    assert_eq!(hub.test_source_held_len(), 0);
+    assert!(!scopes.is_live(first));
+    assert!(!scopes.is_live(second));
+    assert_eq!(
+        hub.keep_owned_op(CausalOp::Release {
+            scope_id: transfer,
+            identity: LeaseIdentity::AdmittedEntityMutation {
+                family: "probe.item".into(),
+                seq: 1,
+            },
+        }),
+        CausalAdmitResult::Applied
+    );
+    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+        let _ = hub.apply_event_plane_owner_ops();
+        let _ = scopes.flush_pending();
+    }
+    assert!(!scopes.is_live(transfer));
+}
+
+#[test]
+fn production_release_stays_owned_when_every_store_is_full() {
+    let hub = explicit_runtime("lease-saturated-release");
+    let scopes = hub.causal_scopes().clone();
+    let fill = mint_leftover_fill(&scopes);
+    let live = scopes
+        .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+            plugin_key: "missing".into(),
+        }))
+        .expect("live");
+    scopes.test_with_inner_held(|| {
+        fill_every_leftover_store(&hub, &scopes, &fill);
+        let err = hub
+            .test_admit_publish("missing", serde_json::json!({}), Some(live))
+            .expect_err("unknown family must fail");
+        assert!(err.contains("invalid entity_publish frame") || err.contains("not provided"));
+        assert!(
+            scopes.is_live(live),
+            "saturated production Release must stay owned"
+        );
+        assert!(hub.test_unsettled());
+    });
+    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+        let _ = hub.apply_event_plane_owner_ops();
+        let _ = scopes.flush_pending();
+    }
+    assert!(!hub.test_unsettled());
+    assert!(!scopes.is_live(live));
+}
+
+#[test]
+fn production_transfer_stays_owned_when_every_store_is_full() {
+    let hub = explicit_runtime("lease-saturated-transfer");
+    let scopes = hub.causal_scopes().clone();
+    let fill = mint_leftover_fill(&scopes);
+    let live = scopes
+        .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+            plugin_key: "xfer".into(),
+        }))
+        .expect("live");
+    scopes.test_with_inner_held(|| {
+        fill_every_leftover_store(&hub, &scopes, &fill);
+        hub.test_settle_publish("probe.item", live, "xfer", 1, false);
+        assert!(
+            scopes.is_live(live),
+            "saturated production Transfer must not retract PendingEntityPublish"
+        );
+        assert!(hub.test_unsettled());
+        assert_eq!(hub.test_resync_lease_count("probe.item"), 0);
+    });
+    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+        let _ = hub.apply_event_plane_owner_ops();
+        let _ = scopes.flush_pending();
+    }
+    assert!(!hub.test_unsettled());
+    assert_eq!(
+        hub.keep_owned_op(CausalOp::Release {
+            scope_id: live,
+            identity: LeaseIdentity::AdmittedEntityMutation {
+                family: "probe.item".into(),
+                seq: 1,
+            },
+        }),
+        CausalAdmitResult::Applied
+    );
+    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+        let _ = hub.apply_event_plane_owner_ops();
+        let _ = scopes.flush_pending();
+    }
+    assert!(!scopes.is_live(live));
+}
+
+#[test]
+fn fulfill_leaves_the_next_publish_on_the_bridge_until_a_slot_frees() {
+    let hub = explicit_runtime("lease-fulfill-gate");
+    let scopes = hub.causal_scopes().clone();
+    let fill = mint_leftover_fill(&scopes);
+    let first = scopes
+        .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+            plugin_key: "xfer".into(),
+        }))
+        .expect("first");
+    let second = scopes.mint_with_lease(None).expect("second");
+    let bridge = hub.entity_publish_bridge();
+    scopes.test_with_inner_held(|| {
+        fill_every_leftover_store(&hub, &scopes, &fill);
+        hub.test_settle_publish("probe.item", first, "xfer", 1, true);
+        assert!(hub.test_unsettled());
+        assert!(!hub.test_leftover_slot_available());
+        assert_eq!(hub.test_resync_lease_count("probe.item"), 1);
+        let waiting = bridge.test_queue_publish(
+            PluginKey("waiting".into()),
+            serde_json::json!({}),
+            Some(second),
+        );
+        assert_eq!(bridge.pending_publish_count(), 1);
+        hub.test_fulfill_pending_publishes();
+        assert_eq!(
+            bridge.pending_publish_count(),
+            1,
+            "fulfill must leave the next request on the bridge while no leftover slot remains"
+        );
+        assert!(waiting.try_recv().is_err());
+    });
+    assert_eq!(
+        scopes.identities(second),
+        Some(std::collections::BTreeSet::new()),
+        "untaken publish must not acquire PendingEntityPublish"
+    );
+    while !hub.test_leftover_slot_available()
+        && (scopes.pending_ops() || hub.event_plane_owner_ops_pending())
+    {
+        let _ = hub.apply_event_plane_owner_ops();
+        let _ = scopes.flush_pending();
+    }
+    assert!(hub.test_leftover_slot_available());
+    assert_eq!(bridge.pending_publish_count(), 1);
+    hub.test_fulfill_pending_publishes();
+    assert_eq!(bridge.pending_publish_count(), 0);
+    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+        let _ = hub.apply_event_plane_owner_ops();
+        let _ = scopes.flush_pending();
+    }
+    assert_eq!(
+        hub.keep_owned_op(CausalOp::Release {
+            scope_id: first,
+            identity: LeaseIdentity::AdmittedEntityMutation {
+                family: "probe.item".into(),
+                seq: 1,
+            },
+        }),
+        CausalAdmitResult::Applied
+    );
+    assert_eq!(
+        hub.keep_owned_op(CausalOp::Release {
+            scope_id: first,
+            identity: LeaseIdentity::ProviderResyncNeed {
+                family: "probe.item".into(),
+            },
+        }),
+        CausalAdmitResult::Applied
+    );
+    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+        let _ = hub.apply_event_plane_owner_ops();
+        let _ = scopes.flush_pending();
+    }
+    assert!(!scopes.is_live(first));
+    assert!(!scopes.is_live(second));
+}
+
+#[test]
+fn provider_snapshot_stays_busy_when_every_store_is_full() {
+    let registry = install_named_lua_package(
+        "lease-provider-gate",
+        lease_probe_plugin(),
+        lease_probe_manifest(),
+    );
+    let mut hub = explicit_runtime("lease-provider-gate");
+    hub.load_lua_plugin_package(&registry, "lease-probe")
+        .expect("load");
+    let scopes = hub.causal_scopes().clone();
+    let fill = mint_leftover_fill(&scopes);
+    let provider = scopes
+        .mint_with_lease(Some(LeaseIdentity::ProviderResyncNeed {
+            family: "lease-probe.item".into(),
+        }))
+        .expect("provider");
+    let first = scopes
+        .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+            plugin_key: "xfer".into(),
+        }))
+        .expect("first");
+    scopes.test_with_inner_held(|| {
+        fill_every_leftover_store(&hub, &scopes, &fill);
+        hub.test_settle_publish("probe.item", first, "xfer", 1, true);
+        hub.test_store_resync_lease(provider, "lease-probe.item");
+        assert!(!hub.test_leftover_slot_available());
+        let error = hub
+            .plugin_entity_snapshot("lease-probe.item", "saturated-sub")
+            .expect_err("saturated provider must refuse before acquire");
+        assert_eq!(error.code, "causal_scope_busy");
+    });
+    assert_eq!(
+        scopes.identities(provider),
+        Some(
+            [LeaseIdentity::ProviderResyncNeed {
+                family: "lease-probe.item".into(),
+            }]
+            .into_iter()
+            .collect()
+        ),
+        "provider snapshot must not acquire ProviderInFlight when the leftover gate is closed"
+    );
+    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+        let _ = hub.apply_event_plane_owner_ops();
+        let _ = scopes.flush_pending();
+    }
+    assert!(!hub.test_unsettled());
+}
+
+#[test]
+fn lock_held_transfer_stays_owned_after_family_commit() {
+    let hub = explicit_runtime("lease-source-held-transfer");
+    let scopes = hub.causal_scopes().clone();
+    let mut sourced = Vec::new();
+    for index in 0..CAUSAL_PENDING_MAX {
+        let scope = scopes
+            .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+                family: format!("s{index}"),
+                seq: index as u64,
+            }))
+            .expect("mint");
+        assert_eq!(
+            hub.test_keep_source_op(family_release(scope, &format!("s{index}"), index as u64)),
+            CausalAdmitResult::Applied
+        );
+        sourced.push(scope);
+    }
+    let live = scopes
+        .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+            plugin_key: "producer".into(),
+        }))
+        .expect("live");
+    let parked = scopes
+        .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+            plugin_key: "parked".into(),
+        }))
+        .expect("parked");
+    scopes.test_with_inner_held(|| {
+        hub.test_settle_publish("probe.item", live, "producer", 1, true);
+        assert!(
+            scopes.is_live(live),
+            "Transfer must not retract the pending identity after family commit"
+        );
+        assert_eq!(hub.test_resync_lease_count("probe.item"), 1);
+        assert_eq!(
+            hub.test_keep_source_op(CausalOp::Transfer {
+                scope_id: parked,
+                from: LeaseIdentity::PendingEntityPublish {
+                    plugin_key: "parked".into(),
+                },
+                to: vec![LeaseIdentity::AdmittedEntityMutation {
+                    family: "probe.item".into(),
+                    seq: 2,
+                }],
+            }),
+            CausalAdmitResult::Applied
+        );
+        assert!(hub.test_source_held());
+        assert!(
+            scopes.is_live(parked),
+            "full-store Transfer must stay owned instead of retracting"
+        );
+    });
+    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+        let _ = hub.apply_event_plane_owner_ops();
+        let _ = scopes.flush_pending();
+    }
+    assert!(!hub.test_source_held());
+    assert_eq!(
+        hub.keep_owned_op(CausalOp::Release {
+            scope_id: live,
+            identity: LeaseIdentity::AdmittedEntityMutation {
+                family: "probe.item".into(),
+                seq: 1,
+            },
+        }),
+        CausalAdmitResult::Applied
+    );
+    assert_eq!(
+        hub.keep_owned_op(CausalOp::Release {
+            scope_id: parked,
+            identity: LeaseIdentity::AdmittedEntityMutation {
+                family: "probe.item".into(),
+                seq: 2,
+            },
+        }),
+        CausalAdmitResult::Applied
+    );
+    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+        let _ = hub.apply_event_plane_owner_ops();
+        let _ = scopes.flush_pending();
+    }
+    assert!(!scopes.is_live(live));
+    assert!(!scopes.is_live(parked));
+    for scope in sourced {
+        assert!(!scopes.is_live(scope));
+    }
+}
+
+#[test]
+fn active_resync_leftovers_retry_after_convergence() {
+    let hub = explicit_runtime("lease-active-resync");
+    let scopes = hub.causal_scopes().clone();
+    hub.test_set_family_seq("active.item", 4);
+    let mut lives = Vec::new();
+    for _ in 0..(CAUSAL_FLUSH_MAX + 8) {
+        let scope = scopes
+            .mint_with_lease(Some(LeaseIdentity::ProviderResyncNeed {
+                family: "active.item".into(),
+            }))
+            .expect("mint");
+        hub.test_store_resync_lease(scope, "active.item");
+        lives.push(scope);
+    }
+    assert!(!hub.test_family_unloading("active.item"));
+    assert_eq!(
+        hub.test_resync_lease_count("active.item"),
+        CAUSAL_FLUSH_MAX + 8
+    );
+    assert!(hub.event_plane_owner_ops_pending());
+    let _ = hub.apply_event_plane_owner_ops();
+    let remaining = hub.test_resync_lease_count("active.item");
+    assert!(
+        remaining > 0 && remaining < CAUSAL_FLUSH_MAX + 8,
+        "one owner turn must retry active resync leftovers: {remaining}"
+    );
+    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+        let _ = hub.apply_event_plane_owner_ops();
+        let _ = scopes.flush_pending();
+    }
+    assert_eq!(hub.test_resync_lease_count("active.item"), 0);
+    assert!(hub.test_family_exists("active.item"));
+    assert_eq!(hub.test_family_seq("active.item"), 4);
+    for scope in lives {
+        assert!(!scopes.is_live(scope));
+    }
+}
+
+#[test]
+fn unloading_resync_leases_stop_after_the_slice() {
+    let hub = explicit_runtime("lease-resync-slice");
+    let scopes = hub.causal_scopes().clone();
+    let mut lives = Vec::new();
+    for _ in 0..(CAUSAL_FLUSH_MAX + 8) {
+        let scope = scopes
+            .mint_with_lease(Some(LeaseIdentity::ProviderResyncNeed {
+                family: "resync.item".into(),
+            }))
+            .expect("mint");
+        hub.test_store_resync_lease(scope, "resync.item");
+        lives.push(scope);
+    }
+    hub.test_mark_unloading("resync.item");
+    assert_eq!(
+        hub.test_resync_lease_count("resync.item"),
+        CAUSAL_FLUSH_MAX + 8
+    );
+    let _ = hub.apply_event_plane_owner_ops();
+    let remaining = hub.test_resync_lease_count("resync.item");
+    assert!(
+        remaining > 0 && remaining < CAUSAL_FLUSH_MAX + 8,
+        "one owner turn must stop resync-lease release: {remaining}"
+    );
+    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+        let _ = hub.apply_event_plane_owner_ops();
+        let _ = scopes.flush_pending();
+    }
+    assert_eq!(hub.test_resync_lease_count("resync.item"), 0);
+    for scope in lives {
+        assert!(!scopes.is_live(scope));
+    }
 }

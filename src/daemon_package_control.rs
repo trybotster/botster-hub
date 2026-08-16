@@ -253,6 +253,7 @@ pub(super) fn disable_package(
     commit_package_registry(daemon, candidate)?;
     daemon.entrypoint_supervisor().stop_package(&package_name);
     unload_package_after_disable(daemon, &package_name)?;
+    record_event_plane_unload(daemon, &package_name);
     advance_session_type_generation_if_changed(daemon, &before_session_types)?;
     package_decision_response(daemon, decision)
 }
@@ -267,6 +268,7 @@ pub(super) fn remove_package(
     commit_package_registry(daemon, candidate)?;
     daemon.entrypoint_supervisor().stop_package(&package_name);
     unload_package_after_disable(daemon, &package_name)?;
+    record_event_plane_unload(daemon, &package_name);
     advance_session_type_generation_if_changed(daemon, &before_session_types)?;
     package_decision_response(daemon, decision)
 }
@@ -362,6 +364,21 @@ fn reload_package_after_reload(
             .map_err(crate::HubDaemonError::from)?;
     }
     Ok(())
+}
+
+fn record_event_plane_unload(daemon: &HubDaemon, package_name: &str) {
+    let Some(runtime) = daemon.runtime() else {
+        return;
+    };
+    let generation = runtime
+        .package_event_router()
+        .current_package_generation(package_name)
+        .unwrap_or(0);
+    runtime.record_event_plane_owner_op(crate::package_event_router::OwnerOp {
+        kind: crate::package_event_router::OwnerOpKind::Unload,
+        owner: package_name.to_string(),
+        generation,
+    });
 }
 
 fn unload_package_after_disable(

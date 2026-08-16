@@ -77,11 +77,107 @@ pub struct HubPackageManifest {
     /// Package-authored discoverability intent.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub navigation: Vec<PackageNavigationEntry>,
+    /// Package-declared emitted event contracts. Owner is this package name.
+    #[serde(default, skip_serializing_if = "HubPackageEvents::is_empty")]
+    pub events: HubPackageEvents,
+}
+
+/// Hub-owned package event declarations.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct HubPackageEvents {
+    /// Events this package may emit.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub emitted: Vec<HubEmittedEvent>,
+}
+
+impl HubPackageEvents {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.emitted.is_empty()
+    }
+}
+
+/// One package-declared emitted event contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HubEmittedEvent {
+    /// Exact event name. Owner is the declaring package.
+    pub name: String,
+    /// Bounded payload schema compiled at admission.
+    pub payload_schema: serde_json::Value,
+    /// Non-empty audience set of `plugins` and/or `clients`.
+    pub audience: Vec<String>,
+    /// Optional owner. If present it must match the package name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
 }
 
 impl HubPackageManifest {
     fn validate_presentation(&self) -> Result<(), PackagePresentationValidationError> {
         validate_package_presentation(&self.surfaces, &self.navigation)
+    }
+
+    pub(crate) fn validate_event_contracts(&self) -> Result<(), String> {
+        if self.name == crate::package_event_router::HUB_EVENT_OWNER {
+            return Err("package name hub is reserved".to_string());
+        }
+        for event in &self.events.emitted {
+            if let Some(owner) = &event.owner
+                && (owner != &self.name || owner.contains('*') || owner == "*")
+            {
+                return Err(format!(
+                    "event {} owner must be the declaring package",
+                    event.name
+                ));
+            }
+            if event.name.trim().is_empty() || event.name.contains('*') || event.name.contains('?')
+            {
+                return Err(format!("event name {} is not an exact name", event.name));
+            }
+            if event.audience.is_empty() {
+                return Err(format!("event {} audience must not be empty", event.name));
+            }
+            for audience in &event.audience {
+                if audience != "plugins" && audience != "clients" {
+                    return Err(format!(
+                        "event {} has unsupported audience {audience}",
+                        event.name
+                    ));
+                }
+            }
+            crate::package_event_schema::CompiledEventSchema::compile(&event.payload_schema)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn compiled_event_contracts(
+        &self,
+    ) -> Result<Vec<crate::package_event_router::EmittedContract>, String> {
+        self.validate_event_contracts()?;
+        let mut contracts = Vec::new();
+        for event in &self.events.emitted {
+            let mut audience = std::collections::BTreeSet::new();
+            for value in &event.audience {
+                match value.as_str() {
+                    "plugins" => {
+                        audience.insert(crate::package_event_router::EventAudience::Plugins);
+                    }
+                    "clients" => {
+                        audience.insert(crate::package_event_router::EventAudience::Clients);
+                    }
+                    _ => {}
+                }
+            }
+            contracts.push(crate::package_event_router::EmittedContract {
+                owner: self.name.clone(),
+                name: event.name.clone(),
+                audience,
+                schema: crate::package_event_schema::CompiledEventSchema::compile(
+                    &event.payload_schema,
+                )?,
+                package_generation: 0,
+            });
+        }
+        Ok(contracts)
     }
 
     pub(crate) fn core_execution_manifest(&self) -> CorePackageManifest {
@@ -294,6 +390,24 @@ impl PackageRegistry {
                 audit_reason,
             ));
         }
+
+        if package_name == crate::package_event_router::HUB_EVENT_OWNER {
+            return Err(PackageRegistryError::without_record(
+                package_name,
+                PackageAction::Install,
+                PackageAdmissionReason::ReservedPackageName,
+                audit_reason,
+            ));
+        }
+
+        manifest.validate_event_contracts().map_err(|error| {
+            PackageRegistryError::without_record(
+                package_name.clone(),
+                PackageAction::Install,
+                PackageAdmissionReason::InvalidEventContract(error),
+                audit_reason.clone(),
+            )
+        })?;
 
         manifest.validate_presentation().map_err(|error| {
             PackageRegistryError::without_record(
@@ -2097,6 +2211,10 @@ pub enum PackageAdmissionReason {
     InvalidConfiguration(Vec<PackageConfigurationDiagnostic>),
     /// Required configuration keys are missing before enablement.
     MissingRequiredConfiguration(Vec<String>),
+    /// Package name `hub` is reserved for built-in host contracts.
+    ReservedPackageName,
+    /// Event declarations failed bounded schema or audience admission.
+    InvalidEventContract(String),
 }
 
 fn configuration_schema(
@@ -3255,6 +3373,7 @@ mod tests {
             surfaces: Vec::new(),
             runnable_entrypoints: Vec::new(),
             navigation: Vec::new(),
+            events: HubPackageEvents::default(),
         }
     }
 
@@ -3288,6 +3407,7 @@ mod tests {
             surfaces: Vec::new(),
             runnable_entrypoints: Vec::new(),
             navigation: Vec::new(),
+            events: HubPackageEvents::default(),
         }
     }
 

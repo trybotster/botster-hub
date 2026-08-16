@@ -9,10 +9,11 @@ use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 
 use botster_core::{
-    BoundaryJson, PluginCleanupResult, PluginCleanupScope, PluginDescriptorKind,
-    PluginHandlerRegistration, PluginInvocationOutcome, PluginInvocationRequest, PluginKey,
-    PluginLoadSpec, PluginOwnedDescriptor, PluginReloadSpec, PluginResourceRef, PluginRuntime,
-    PluginUnloadSpec, PluginWorkerDebugSnapshot, PluginWorkerEngine, PluginWorkerEngineConfig,
+    BoundaryJson, PluginAdmissionResult, PluginCleanupResult, PluginCleanupScope,
+    PluginCompletionDrain, PluginDescriptorKind, PluginHandlerRegistration, PluginInvocationClass,
+    PluginInvocationOutcome, PluginInvocationRequest, PluginKey, PluginLoadSpec,
+    PluginOwnedDescriptor, PluginReloadSpec, PluginResourceRef, PluginRuntime, PluginUnloadSpec,
+    PluginWorkerDebugSnapshot, PluginWorkerEngine, PluginWorkerEngineConfig,
     PluginWorkerRegistration, RequestId,
 };
 
@@ -140,6 +141,22 @@ impl HubPluginLifecycle {
     #[must_use]
     pub fn invoke(&self, request: PluginInvocationRequest) -> PluginInvocationOutcome {
         self.engine.invoke(request)
+    }
+
+    /// Admit one invocation without waiting for execution or completion.
+    #[must_use]
+    pub fn try_admit(
+        &self,
+        class: PluginInvocationClass,
+        request: PluginInvocationRequest,
+    ) -> PluginAdmissionResult {
+        self.engine.try_admit(class, request)
+    }
+
+    /// Drain previously published async completions without waiting.
+    #[must_use]
+    pub fn drain_completions(&self, max_items: usize, max_bytes: usize) -> PluginCompletionDrain {
+        self.engine.drain_completions(max_items, max_bytes)
     }
 
     /// Reload an enabled package through core worker reload cleanup and replacement.
@@ -286,13 +303,90 @@ impl HubPluginLifecycle {
     /// Return Event-kind plugin handlers subscribed to one exact event name.
     #[must_use]
     pub fn event_handlers_for(&self, event_name: &str) -> Vec<HubPluginEventHandler> {
+        self.event_handlers_for_page(event_name, None, usize::MAX).0
+    }
+
+    /// Return the handler for one exact owner+name subscription on a plugin.
+    #[must_use]
+    pub fn event_handler_for(
+        &self,
+        plugin_key: &str,
+        owner: &str,
+        event_name: &str,
+        handler_id: &str,
+    ) -> Option<HubPluginEventHandler> {
         self.event_handlers
             .lock()
             .expect("hub plugin lifecycle event handlers lock")
-            .values()
-            .flat_map(|handlers| handlers.iter().cloned())
-            .filter(|handler| handler.event_name == event_name)
-            .collect()
+            .get(plugin_key)
+            .into_iter()
+            .flatten()
+            .find(|handler| {
+                handler.event_owner == owner
+                    && handler.event_name == event_name
+                    && handler.handler.handler_id == handler_id
+            })
+            .cloned()
+    }
+
+    /// Return one bounded page of Event-kind handlers for an exact event name.
+    ///
+    /// `max_items` counts visited plugin keys, including keys that do not
+    /// match `event_name`. The second return value is the last visited key.
+    #[must_use]
+    pub fn event_handlers_for_page(
+        &self,
+        event_name: &str,
+        after_plugin_key: Option<&str>,
+        max_items: usize,
+    ) -> (Vec<HubPluginEventHandler>, Option<String>, usize, bool) {
+        let lock = self
+            .event_handlers
+            .lock()
+            .expect("hub plugin lifecycle event handlers lock");
+        let start = match after_plugin_key {
+            Some(key) => std::ops::Bound::Excluded(key),
+            None => std::ops::Bound::Unbounded,
+        };
+        let mut page = Vec::new();
+        let mut last_key = after_plugin_key.map(str::to_string);
+        let mut visited = 0;
+        let mut more = false;
+        for (key, handlers) in lock.range::<str, _>((start, std::ops::Bound::Unbounded)) {
+            if visited >= max_items {
+                more = true;
+                break;
+            }
+            last_key = Some(key.clone());
+            visited += 1;
+            page.extend(
+                handlers
+                    .iter()
+                    .filter(|handler| handler.event_name == event_name)
+                    .cloned(),
+            );
+        }
+        (page, last_key, visited, more)
+    }
+
+    #[cfg(test)]
+    pub fn insert_test_event_handler(&self, plugin_key: &str, event_name: &str) {
+        use botster_core::{PluginHandlerKind, PluginHandlerRef, PluginKey};
+
+        self.event_handlers
+            .lock()
+            .expect("hub plugin lifecycle event handlers lock")
+            .entry(plugin_key.to_string())
+            .or_default()
+            .push(HubPluginEventHandler {
+                event_owner: "hub".to_string(),
+                event_name: event_name.to_string(),
+                handler: PluginHandlerRef {
+                    plugin_key: PluginKey(plugin_key.to_string()),
+                    kind: PluginHandlerKind::Event,
+                    handler_id: event_name.to_string(),
+                },
+            });
     }
 
     /// Return package-level lifecycle status without exposing core worker internals.
@@ -350,6 +444,8 @@ pub struct HubPluginRuntimeBundle {
 /// Hub-owned event subscription metadata for one plugin handler.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HubPluginEventHandler {
+    /// Exact owner string passed to `events.on(owner, name, ...)`.
+    pub event_owner: String,
     /// Exact event name passed to `events.on(...)`.
     pub event_name: String,
     /// Stable handler address invoked through the core plugin worker.

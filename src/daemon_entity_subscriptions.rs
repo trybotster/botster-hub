@@ -4,16 +4,17 @@
 //! overflow, resync, and fanout. The daemon transport owns the accept loop,
 //! connection cleanup, and control dispatch.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+use std::ops::Bound;
 #[cfg(test)]
 use std::sync::mpsc::{self, SyncSender};
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
 use botster_core::SessionLifecycleState;
-use botster_core_daemon::{
-    LifecycleBaselineBudget, RegistrySessionState, SessionLifecycleBaseline,
-    SessionLifecycleChangeKind, SessionLifecycleCursor, SessionLifecycleRecord,
-};
+use botster_core_daemon::SessionLifecycleCursor;
+#[cfg(test)]
+use botster_core_daemon::{RegistrySessionState, SessionLifecycleBaseline, SessionLifecycleRecord};
 use botster_hub_client::{
     DaemonDiagnostic, DaemonEntityFrame, DaemonLifecycleCounters, DaemonOperatorError,
     DaemonResponse, DaemonResponseKind, DaemonSessionEntity,
@@ -25,6 +26,16 @@ use super::{
     HubDaemon, daemon_response_base, daemon_session_type_from_client, session_type_entity_snapshot,
 };
 
+const SESSION_DELIVERY_MAX_ITEMS: usize = 16;
+const SESSION_DELIVERY_MAX_BYTES: usize = 64 * 1024;
+const SESSION_DELIVERY_MAX_ELAPSED: Duration = Duration::from_millis(8);
+
+struct DeliveryPage {
+    items: usize,
+    bytes: usize,
+    more: bool,
+}
+
 #[derive(Debug)]
 pub(crate) enum EntityFrameSender {
     #[cfg(test)]
@@ -34,7 +45,7 @@ pub(crate) enum EntityFrameSender {
 
 #[derive(Debug)]
 enum EntityFrameTrySendError {
-    Full,
+    Full(DaemonEntityFrame),
     Disconnected,
 }
 
@@ -43,11 +54,13 @@ impl EntityFrameSender {
         match self {
             #[cfg(test)]
             Self::Blocking(sender) => sender.try_send(frame).map_err(|error| match error {
-                mpsc::TrySendError::Full(_) => EntityFrameTrySendError::Full,
+                mpsc::TrySendError::Full(frame) => EntityFrameTrySendError::Full(frame),
                 mpsc::TrySendError::Disconnected(_) => EntityFrameTrySendError::Disconnected,
             }),
             Self::Async(sender) => sender.try_send(frame).map_err(|error| match error {
-                tokio::sync::mpsc::error::TrySendError::Full(_) => EntityFrameTrySendError::Full,
+                tokio::sync::mpsc::error::TrySendError::Full(frame) => {
+                    EntityFrameTrySendError::Full(frame)
+                }
                 tokio::sync::mpsc::error::TrySendError::Closed(_) => {
                     EntityFrameTrySendError::Disconnected
                 }
@@ -71,6 +84,7 @@ fn entity_frame_exceeds_limit(frame: &DaemonEntityFrame) -> bool {
 pub(crate) struct EntitySubscriptionState {
     sender: EntityFrameSender,
     entity_type: String,
+    #[allow(dead_code)]
     cursor: Option<SessionLifecycleCursor>,
     entities: BTreeMap<String, DaemonSessionEntity>,
     definition_generation: u64,
@@ -84,29 +98,27 @@ pub(crate) struct EntitySubscriptionState {
     package_last_applied_seq: Option<u64>,
     /// Package-entity subscriber is gated to targeted snapshots until caught up.
     package_catching_up: bool,
+    /// Resume key for one bounded session-delivery page.
+    delivery_after: Option<String>,
+    /// Removes first, then projection rows. Prevents a high remove id from
+    /// skipping a later lower upsert id.
+    delivery_phase: DeliveryPhase,
+    /// Per-subscriber monotonic snapshot sequence.
+    next_seq: u64,
+    /// JSON values accumulated while assembling a complete first snapshot.
+    assembled_items: Vec<Value>,
+    /// Encoded item bytes plus JSON array separators for `assembled_items`.
+    assembled_item_bytes: usize,
+    /// True until a delivery page reports no remaining work.
+    needs_delivery: bool,
 }
 
-#[derive(Debug, Default)]
-struct BaselineContinuation {
-    snapshot: Option<SessionLifecycleCursor>,
-    after: Option<botster_core::SessionId>,
-    rows: Vec<SessionLifecycleRecord>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliveryPhase {
+    Assembling { source_seq: u64 },
+    Removes,
+    Rows,
 }
-
-#[derive(Debug, Default)]
-pub(super) struct EntityReconciliationState {
-    cursor: Option<SessionLifecycleCursor>,
-    records: BTreeMap<String, SessionLifecycleRecord>,
-    baseline_continuation: Option<BaselineContinuation>,
-}
-
-const LIFECYCLE_PAGE_BUDGET: LifecycleBaselineBudget = LifecycleBaselineBudget {
-    max_rows: 32,
-    max_bytes: 64 * 1024,
-    max_elapsed: Duration::from_millis(25),
-};
-const LIFECYCLE_CHANGE_MAX: usize = 32;
-const LIFECYCLE_CHANGE_BYTES: usize = 64 * 1024;
 
 pub(super) fn register_entity_subscription(
     daemon: &mut HubDaemon,
@@ -167,6 +179,12 @@ pub(super) fn register_entity_subscription(
                 owner_grant_id,
                 package_last_applied_seq: None,
                 package_catching_up: false,
+                delivery_after: None,
+                delivery_phase: DeliveryPhase::Removes,
+                next_seq: snapshot_seq,
+                assembled_items: Vec::new(),
+                assembled_item_bytes: 0,
+                needs_delivery: false,
             },
         );
         state.lifecycle_counters.live_entity_subscriptions =
@@ -239,6 +257,12 @@ pub(super) fn register_entity_subscription(
                 owner_grant_id,
                 package_last_applied_seq: Some(snapshot_seq),
                 package_catching_up: catching_up,
+                delivery_after: None,
+                delivery_phase: DeliveryPhase::Removes,
+                next_seq: snapshot_seq,
+                assembled_items: Vec::new(),
+                assembled_item_bytes: 0,
+                needs_delivery: false,
             },
         );
         state.lifecycle_counters.live_entity_subscriptions =
@@ -251,67 +275,58 @@ pub(super) fn register_entity_subscription(
         drive_package_entity_fanout(daemon, state);
         return Ok(daemon_response_base(DaemonResponseKind::EntitySubscribed));
     }
-    let Some(cursor) = state.reconciliation.cursor.clone() else {
-        if state.reconciliation.baseline_continuation.is_none() {
-            start_baseline_continuation(state);
-        }
-        state.entity_subscriptions.insert(
-            subscription_id.clone(),
-            EntitySubscriptionState {
-                sender,
-                entity_type: "session".to_string(),
-                cursor: None,
-                entities: BTreeMap::new(),
-                definition_generation: 0,
-                definition_entities: BTreeMap::new(),
-                resync_reason: None,
-                owner_grant_id,
-                package_last_applied_seq: None,
-                package_catching_up: false,
-            },
-        );
-        state.lifecycle_counters.live_entity_subscriptions = state
-            .lifecycle_counters
-            .live_entity_subscriptions
-            .saturating_add(1);
-        state.lifecycle_counters.high_water_entity_subscriptions = state
-            .lifecycle_counters
-            .high_water_entity_subscriptions
-            .max(state.lifecycle_counters.live_entity_subscriptions);
-        if state.released_entity_generations > 0 {
-            state.released_entity_generations -= 1;
-            state.lifecycle_counters.reconnect_registrations = state
-                .lifecycle_counters
-                .reconnect_registrations
-                .saturating_add(1);
-        }
-        state.next_reconciliation = Instant::now();
-        return Ok(daemon_response_base(DaemonResponseKind::EntitySubscribed));
-    };
-    let baseline = SessionLifecycleBaseline {
+    let complete =
+        state.maintenance.projection.baseline_complete && !state.maintenance.projection.gap;
+    let cursor = state.maintenance.projection.cursor.clone();
+    let snapshot_seq = cursor.as_ref().map(|cursor| cursor.sequence).unwrap_or(0);
+    let mut subscription = EntitySubscriptionState {
+        sender,
+        entity_type: "session".to_string(),
         cursor,
-        sessions: state.reconciliation.records.values().cloned().collect(),
-    };
-    let cursor = baseline.cursor.clone();
-    let (entities, snapshot) = entity_snapshot(&subscription_id, baseline, None);
-    sender
-        .try_send(snapshot)
-        .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
-    state.entity_subscriptions.insert(
-        subscription_id.clone(),
-        EntitySubscriptionState {
-            sender,
-            entity_type: "session".to_string(),
-            cursor: Some(cursor),
-            entities,
-            definition_generation: 0,
-            definition_entities: BTreeMap::new(),
-            resync_reason: None,
-            owner_grant_id,
-            package_last_applied_seq: None,
-            package_catching_up: false,
+        entities: BTreeMap::new(),
+        definition_generation: 0,
+        definition_entities: BTreeMap::new(),
+        resync_reason: None,
+        owner_grant_id,
+        package_last_applied_seq: None,
+        package_catching_up: false,
+        delivery_after: None,
+        delivery_phase: DeliveryPhase::Assembling {
+            source_seq: snapshot_seq,
         },
-    );
+        next_seq: snapshot_seq,
+        assembled_items: Vec::new(),
+        assembled_item_bytes: 0,
+        needs_delivery: true,
+    };
+    if complete {
+        match continue_session_snapshot_assembly(
+            &subscription_id,
+            &mut subscription,
+            &state.maintenance.projection,
+            &mut state.lifecycle_counters,
+            SESSION_DELIVERY_MAX_ITEMS,
+            SESSION_DELIVERY_MAX_BYTES,
+            SESSION_DELIVERY_MAX_ELAPSED,
+        ) {
+            SnapshotAssemble::Closed {
+                frame_too_large: true,
+            } => {
+                return Ok(entity_subscription_error(
+                    "entity_provider_frame_too_large",
+                    &subscription_id,
+                    "session snapshot exceeds daemon frame limit",
+                ));
+            }
+            SnapshotAssemble::Closed { .. } => {
+                return Err(DaemonTransportError::ControlThreadStopped);
+            }
+            SnapshotAssemble::Continue { .. } => {}
+        }
+    }
+    state
+        .entity_subscriptions
+        .insert(subscription_id.clone(), subscription);
     state.lifecycle_counters.live_entity_subscriptions = state
         .lifecycle_counters
         .live_entity_subscriptions
@@ -327,145 +342,18 @@ pub(super) fn register_entity_subscription(
             .reconnect_registrations
             .saturating_add(1);
     }
-    state.next_reconciliation = Instant::now();
+    state.maintenance.scheduler.prefer_subscriber_delivery();
     Ok(daemon_response_base(DaemonResponseKind::EntitySubscribed))
-}
-
-fn start_baseline_continuation(state: &mut DaemonControlState) {
-    state.reconciliation.baseline_continuation = Some(BaselineContinuation::default());
-}
-
-fn take_baseline_page(runtime: &crate::HubRuntime, state: &mut DaemonControlState) {
-    let Some(continuation) = state.reconciliation.baseline_continuation.as_mut() else {
-        return;
-    };
-    state.lifecycle_counters.lifecycle_baseline_reads = state
-        .lifecycle_counters
-        .lifecycle_baseline_reads
-        .saturating_add(1);
-    let Ok(page) = runtime.lifecycle_baseline_page(
-        continuation.snapshot.as_ref(),
-        continuation.after.as_ref(),
-        LIFECYCLE_PAGE_BUDGET,
-    ) else {
-        return;
-    };
-    if page.resync_required.is_some() {
-        *continuation = BaselineContinuation::default();
-        return;
-    }
-    continuation.rows.extend(page.sessions);
-    if page.complete {
-        state.reconciliation.cursor = Some(page.snapshot_sequence);
-        state.reconciliation.records = std::mem::take(&mut continuation.rows)
-            .into_iter()
-            .map(|record| (record.session.session_id.0.clone(), record))
-            .collect();
-        state.reconciliation.baseline_continuation = None;
-    } else {
-        continuation.snapshot = Some(page.snapshot_sequence);
-        continuation.after = page.next;
-    }
-}
-
-fn apply_supported_change(
-    state: &mut DaemonControlState,
-    change: &botster_core_daemon::SessionLifecycleChange,
-) -> bool {
-    match &change.kind {
-        SessionLifecycleChangeKind::Upsert { record } => {
-            state
-                .reconciliation
-                .records
-                .insert(record.session.session_id.0.clone(), record.clone());
-            state.reconciliation.cursor = Some(change.cursor.clone());
-            true
-        }
-        SessionLifecycleChangeKind::Removed { session_id } => {
-            state.reconciliation.records.remove(&session_id.0);
-            state.reconciliation.cursor = Some(change.cursor.clone());
-            true
-        }
-        _ => false,
-    }
-}
-
-fn advance_session_projection(
-    runtime: &crate::HubRuntime,
-    state: &mut DaemonControlState,
-) -> (Vec<botster_core_daemon::SessionLifecycleChange>, bool) {
-    if state.reconciliation.baseline_continuation.is_some() {
-        let rebuilding = true;
-        take_baseline_page(runtime, state);
-        return (
-            Vec::new(),
-            rebuilding && state.reconciliation.baseline_continuation.is_none(),
-        );
-    }
-    let Some(cursor) = state.reconciliation.cursor.clone() else {
-        start_baseline_continuation(state);
-        take_baseline_page(runtime, state);
-        return (
-            Vec::new(),
-            state.reconciliation.baseline_continuation.is_none(),
-        );
-    };
-    state.lifecycle_counters.lifecycle_change_reads = state
-        .lifecycle_counters
-        .lifecycle_change_reads
-        .saturating_add(1);
-    let Ok(page) =
-        runtime.lifecycle_changes_page(&cursor, LIFECYCLE_CHANGE_MAX, LIFECYCLE_CHANGE_BYTES)
-    else {
-        return (Vec::new(), false);
-    };
-    if page.resync_required.is_some()
-        || page.changes.iter().any(|change| {
-            !matches!(
-                &change.kind,
-                SessionLifecycleChangeKind::Upsert { .. }
-                    | SessionLifecycleChangeKind::Removed { .. }
-            )
-        })
-    {
-        state.lifecycle_counters.lifecycle_resync_reads = state
-            .lifecycle_counters
-            .lifecycle_resync_reads
-            .saturating_add(1);
-        start_baseline_continuation(state);
-        take_baseline_page(runtime, state);
-        return (
-            Vec::new(),
-            state.reconciliation.baseline_continuation.is_none(),
-        );
-    }
-    let mut applied = Vec::new();
-    for change in page.changes {
-        if !apply_supported_change(state, &change) {
-            start_baseline_continuation(state);
-            take_baseline_page(runtime, state);
-            return (
-                Vec::new(),
-                state.reconciliation.baseline_continuation.is_none(),
-            );
-        }
-        applied.push(change);
-    }
-    if applied.is_empty() {
-        state.reconciliation.cursor = Some(page.next);
-    }
-    (applied, false)
 }
 
 pub(super) fn seed_lifecycle_reconciliation(
     daemon: &mut HubDaemon,
     state: &mut DaemonControlState,
 ) {
-    let Some(runtime) = daemon.runtime_mut() else {
+    if daemon.runtime().is_none() {
         return;
     };
-    start_baseline_continuation(state);
-    take_baseline_page(runtime, state);
+    crate::daemon_maintenance::start_baseline_recovery(&mut state.maintenance);
 }
 
 fn drive_session_type_subscriptions(
@@ -479,10 +367,11 @@ fn drive_session_type_subscriptions(
         }
 
         if let Some(reason) = subscription.resync_reason.clone() {
+            let snapshot_seq = subscription.next_seq.saturating_add(1);
             let frame = DaemonEntityFrame::Snapshot {
                 subscription_id: subscription_id.clone(),
                 entity_type: "session_type".to_string(),
-                snapshot_seq: generation,
+                snapshot_seq,
                 items: entities.values().cloned().collect(),
                 resync_reason: Some(reason),
             };
@@ -495,17 +384,18 @@ fn drive_session_type_subscriptions(
                 };
                 return match subscription.sender.try_send_kind(error) {
                     Ok(()) | Err(EntityFrameTrySendError::Disconnected) => false,
-                    Err(EntityFrameTrySendError::Full) => true,
+                    Err(EntityFrameTrySendError::Full(_)) => true,
                 };
             }
             return match subscription.sender.try_send_kind(frame) {
                 Ok(()) => {
+                    subscription.next_seq = snapshot_seq;
                     subscription.definition_generation = generation;
                     subscription.definition_entities = entities.clone();
                     subscription.resync_reason = None;
                     true
                 }
-                Err(EntityFrameTrySendError::Full) => true,
+                Err(EntityFrameTrySendError::Full(_)) => true,
                 Err(EntityFrameTrySendError::Disconnected) => false,
             };
         }
@@ -521,7 +411,7 @@ fn drive_session_type_subscriptions(
             .map(|id| DaemonEntityFrame::Remove {
                 subscription_id: subscription_id.clone(),
                 entity_type: "session_type".to_string(),
-                snapshot_seq: generation,
+                snapshot_seq: 0,
                 id: id.clone(),
             })
             .collect::<Vec<_>>();
@@ -532,15 +422,19 @@ fn drive_session_type_subscriptions(
                 .map(|(id, entity)| DaemonEntityFrame::Upsert {
                     subscription_id: subscription_id.clone(),
                     entity_type: "session_type".to_string(),
-                    snapshot_seq: generation,
+                    snapshot_seq: 0,
                     id: id.clone(),
                     entity: entity.clone(),
                 }),
         );
         for frame in frames {
+            let snapshot_seq = subscription.next_seq.saturating_add(1);
+            let frame = with_session_type_snapshot_seq(frame, snapshot_seq);
             match subscription.sender.try_send_kind(frame) {
-                Ok(()) => {}
-                Err(EntityFrameTrySendError::Full) => {
+                Ok(()) => {
+                    subscription.next_seq = snapshot_seq;
+                }
+                Err(EntityFrameTrySendError::Full(_)) => {
                     subscription.resync_reason = Some("subscriber_overflow".to_string());
                     return true;
                 }
@@ -553,29 +447,73 @@ fn drive_session_type_subscriptions(
     });
 }
 
-pub(super) fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
-    // Package mutation fanout and bounded provider resync run even when only
-    // session subscriptions exist, so call them before the empty early-return.
-    drive_package_entity_fanout(daemon, state);
-    drive_package_entity_resync(daemon, state);
+fn with_session_type_snapshot_seq(
+    frame: DaemonEntityFrame,
+    snapshot_seq: u64,
+) -> DaemonEntityFrame {
+    match frame {
+        DaemonEntityFrame::Remove {
+            subscription_id,
+            entity_type,
+            id,
+            ..
+        } => DaemonEntityFrame::Remove {
+            subscription_id,
+            entity_type,
+            snapshot_seq,
+            id,
+        },
+        DaemonEntityFrame::Upsert {
+            subscription_id,
+            entity_type,
+            id,
+            entity,
+            ..
+        } => DaemonEntityFrame::Upsert {
+            subscription_id,
+            entity_type,
+            snapshot_seq,
+            id,
+            entity,
+        },
+        DaemonEntityFrame::Patch {
+            subscription_id,
+            entity_type,
+            id,
+            patch,
+            ..
+        } => DaemonEntityFrame::Patch {
+            subscription_id,
+            entity_type,
+            snapshot_seq,
+            id,
+            patch,
+        },
+        DaemonEntityFrame::Snapshot {
+            subscription_id,
+            entity_type,
+            items,
+            resync_reason,
+            ..
+        } => DaemonEntityFrame::Snapshot {
+            subscription_id,
+            entity_type,
+            snapshot_seq,
+            items,
+            resync_reason,
+        },
+        other => other,
+    }
+}
 
+pub(super) fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
+    if state.entity_subscriptions.is_empty() {
+        return;
+    }
     let packages = daemon.package_registry().clone();
     let Some(runtime) = daemon.runtime_mut() else {
         state.entity_subscriptions.clear();
         state.lifecycle_counters.live_entity_subscriptions = 0;
-        return;
-    };
-    let (applied_changes, projection_replaced) = advance_session_projection(runtime, state);
-    if let Ok(sessions) = runtime.list_sessions() {
-        let active_session_ids = sessions
-            .iter()
-            .map(|session| session.session_id.0.clone())
-            .collect::<BTreeSet<_>>();
-        state
-            .pending_runtime
-            .retain_active_sessions(&active_session_ids);
-    }
-    if state.entity_subscriptions.is_empty() {
         return;
     };
     state.entity_subscriptions.retain(|_, subscription| {
@@ -619,71 +557,163 @@ pub(super) fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut Dae
         }
     }
 
-    let Some(cursor) = state.reconciliation.cursor.clone() else {
-        return;
-    };
-    let baseline = SessionLifecycleBaseline {
-        cursor,
-        sessions: state.reconciliation.records.values().cloned().collect(),
-    };
-    if projection_replaced
-        || state.entity_subscriptions.values().any(|subscription| {
-            subscription.entity_type == "session"
-                && (subscription.resync_reason.is_some() || subscription.cursor.is_none())
-        })
-    {
-        state
+    let started = Instant::now();
+    let mut delivered = 0usize;
+    let mut delivered_bytes = 0usize;
+    let complete =
+        state.maintenance.projection.baseline_complete && !state.maintenance.projection.gap;
+    if complete {
+        let resync_ids = state
             .entity_subscriptions
-            .retain(|subscription_id, subscription| {
-                if subscription.entity_type != "session" {
+            .iter()
+            .filter(|(_, subscription)| {
+                subscription.entity_type == "session"
+                    && subscription.resync_reason.is_some()
+                    && !matches!(
+                        subscription.delivery_phase,
+                        DeliveryPhase::Assembling { .. }
+                    )
+            })
+            .map(|(id, _)| id.clone())
+            .take(1)
+            .collect::<Vec<_>>();
+        if let Some(subscription_id) = resync_ids.first() {
+            let reason = state
+                .entity_subscriptions
+                .get(subscription_id)
+                .and_then(|subscription| subscription.resync_reason.clone())
+                .unwrap_or_else(|| "projection_gap".to_string());
+            let before = state.entity_subscriptions.len();
+            state.entity_subscriptions.retain(|id, subscription| {
+                if id != subscription_id {
                     return true;
                 }
-                try_resync_subscription(
-                    subscription_id,
+                try_resync_from_projection(
+                    id,
                     subscription,
-                    baseline.clone(),
-                    subscription
-                        .resync_reason
-                        .clone()
-                        .unwrap_or_else(|| "projection_replaced".to_string()),
+                    &state.maintenance.projection,
+                    reason.clone(),
                     &mut state.lifecycle_counters,
                 )
             });
-    } else {
-        for change in applied_changes {
+            note_released_entity_generations(state, before);
+            state.maintenance.try_wake();
+        } else {
+            let mut more = false;
+            let before = state.entity_subscriptions.len();
             state
                 .entity_subscriptions
                 .retain(|subscription_id, subscription| {
                     if subscription.entity_type != "session" {
                         return true;
                     }
-                    deliver_lifecycle_change(
-                        subscription_id,
-                        subscription,
-                        &change,
-                        &mut state.lifecycle_counters,
-                    )
+                    if started.elapsed() >= SESSION_DELIVERY_MAX_ELAPSED
+                        || delivered >= SESSION_DELIVERY_MAX_ITEMS
+                        || delivered_bytes >= SESSION_DELIVERY_MAX_BYTES
+                    {
+                        more = true;
+                        return true;
+                    }
+                    let (alive, page) = if matches!(
+                        subscription.delivery_phase,
+                        DeliveryPhase::Assembling { .. }
+                    ) {
+                        match continue_session_snapshot_assembly(
+                            subscription_id,
+                            subscription,
+                            &state.maintenance.projection,
+                            &mut state.lifecycle_counters,
+                            SESSION_DELIVERY_MAX_ITEMS.saturating_sub(delivered),
+                            SESSION_DELIVERY_MAX_BYTES.saturating_sub(delivered_bytes),
+                            SESSION_DELIVERY_MAX_ELAPSED.saturating_sub(started.elapsed()),
+                        ) {
+                            SnapshotAssemble::Continue { page } => (true, page),
+                            SnapshotAssemble::Closed { .. } => (
+                                false,
+                                DeliveryPage {
+                                    items: 0,
+                                    bytes: 0,
+                                    more: false,
+                                },
+                            ),
+                        }
+                    } else {
+                        deliver_projection_delta_page(
+                            subscription_id,
+                            subscription,
+                            &state.maintenance.projection,
+                            &mut state.lifecycle_counters,
+                            SESSION_DELIVERY_MAX_ITEMS.saturating_sub(delivered),
+                            SESSION_DELIVERY_MAX_BYTES.saturating_sub(delivered_bytes),
+                            SESSION_DELIVERY_MAX_ELAPSED.saturating_sub(started.elapsed()),
+                        )
+                    };
+                    delivered = delivered.saturating_add(page.items);
+                    delivered_bytes = delivered_bytes.saturating_add(page.bytes);
+                    more |= page.more;
+                    alive
                 });
+            note_released_entity_generations(state, before);
+            if more {
+                state.maintenance.try_wake();
+            } else {
+                state.maintenance.projection_dirty = false;
+            }
         }
     }
+
+    if complete {
+        state
+            .pending_runtime
+            .retain_sessions_present_in(|session_id| {
+                state.maintenance.projection.rows.contains_key(session_id)
+            });
+    }
     state.lifecycle_counters.live_entity_subscriptions = state.entity_subscriptions.len() as u64;
+}
+
+fn note_released_entity_generations(state: &mut DaemonControlState, before: usize) {
+    let released = before.saturating_sub(state.entity_subscriptions.len()) as u64;
+    if released == 0 {
+        return;
+    }
+    state.released_entity_generations = state.released_entity_generations.saturating_add(released);
+    state.lifecycle_counters.live_entity_subscriptions = state.entity_subscriptions.len() as u64;
+}
+
+pub(super) fn session_subscribers_need_delivery(state: &DaemonControlState) -> bool {
+    let has_session_subscriber = state
+        .entity_subscriptions
+        .values()
+        .any(|subscription| subscription.entity_type == "session");
+    (state.maintenance.projection_dirty && has_session_subscriber)
+        || state.entity_subscriptions.values().any(|subscription| {
+            subscription.entity_type == "session"
+                && (subscription.needs_delivery || subscription.resync_reason.is_some())
+        })
 }
 
 pub(super) fn drive_package_entity_fanout(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
     let Some(runtime) = daemon.runtime() else {
         return;
     };
-    let mutations = runtime.take_package_entity_fanout();
+    let mutations = runtime.take_leased_package_entity_fanout();
     if mutations.is_empty() {
         return;
     }
-    for mutation in mutations {
+    for item in mutations {
+        if item.finish_only {
+            runtime.finish_package_entity_mutation_fanout(&item, item.scheduled_resync);
+            continue;
+        }
+        let mutation = &item.mutation;
         state.lifecycle_counters.package_entity_publish_accepted = state
             .lifecycle_counters
             .package_entity_publish_accepted
             .saturating_add(1);
         let entity_type = mutation.entity_type().to_string();
         let seq = mutation.snapshot_seq();
+        let mut scheduled_resync = false;
         let mut dead = Vec::new();
         for (subscription_id, subscription) in state.entity_subscriptions.iter_mut() {
             if subscription.entity_type != entity_type {
@@ -693,11 +723,14 @@ pub(super) fn drive_package_entity_fanout(daemon: &mut HubDaemon, state: &mut Da
             // Do not treat applied < family_floor alone as catching_up here: the
             // sequential next delta always has applied == floor-1 before delivery.
             if subscription.package_catching_up {
+                runtime.mark_package_entity_resync_needed(&entity_type);
+                scheduled_resync = true;
                 continue;
             }
             let Some(applied) = subscription.package_last_applied_seq else {
                 subscription.package_catching_up = true;
                 runtime.mark_package_entity_resync_needed(&entity_type);
+                scheduled_resync = true;
                 continue;
             };
             if seq < applied + 1 {
@@ -708,10 +741,11 @@ pub(super) fn drive_package_entity_fanout(daemon: &mut HubDaemon, state: &mut Da
                 // Gap relative to this subscriber — schedule targeted resync.
                 subscription.package_catching_up = true;
                 runtime.mark_package_entity_resync_needed(&entity_type);
+                scheduled_resync = true;
                 continue;
             }
             // seq == applied + 1
-            let frame = package_mutation_to_daemon_frame(subscription_id, &mutation);
+            let frame = package_mutation_to_daemon_frame(subscription_id, mutation);
             if entity_frame_exceeds_limit(&frame) {
                 state.lifecycle_counters.entity_delivery_attempts = state
                     .lifecycle_counters
@@ -734,8 +768,9 @@ pub(super) fn drive_package_entity_fanout(daemon: &mut HubDaemon, state: &mut Da
                         subscription.resync_reason =
                             Some("entity_provider_frame_too_large".to_string());
                         runtime.mark_package_entity_resync_needed(&entity_type);
+                        scheduled_resync = true;
                     }
-                    Err(EntityFrameTrySendError::Full) => {
+                    Err(EntityFrameTrySendError::Full(_)) => {
                         state.lifecycle_counters.entity_delivery_overflows = state
                             .lifecycle_counters
                             .entity_delivery_overflows
@@ -743,6 +778,7 @@ pub(super) fn drive_package_entity_fanout(daemon: &mut HubDaemon, state: &mut Da
                         subscription.package_catching_up = true;
                         subscription.resync_reason = Some("subscriber_overflow".to_string());
                         runtime.mark_package_entity_resync_needed(&entity_type);
+                        scheduled_resync = true;
                     }
                     Err(EntityFrameTrySendError::Disconnected) => {
                         state.lifecycle_counters.entity_delivery_failures = state
@@ -767,7 +803,7 @@ pub(super) fn drive_package_entity_fanout(daemon: &mut HubDaemon, state: &mut Da
                     subscription.package_last_applied_seq = Some(seq);
                     subscription.package_catching_up = false;
                 }
-                Err(EntityFrameTrySendError::Full) => {
+                Err(EntityFrameTrySendError::Full(_)) => {
                     state.lifecycle_counters.entity_delivery_overflows = state
                         .lifecycle_counters
                         .entity_delivery_overflows
@@ -775,6 +811,7 @@ pub(super) fn drive_package_entity_fanout(daemon: &mut HubDaemon, state: &mut Da
                     subscription.package_catching_up = true;
                     subscription.resync_reason = Some("subscriber_overflow".to_string());
                     runtime.mark_package_entity_resync_needed(&entity_type);
+                    scheduled_resync = true;
                 }
                 Err(EntityFrameTrySendError::Disconnected) => {
                     state.lifecycle_counters.entity_delivery_failures = state
@@ -785,6 +822,7 @@ pub(super) fn drive_package_entity_fanout(daemon: &mut HubDaemon, state: &mut Da
                 }
             }
         }
+        runtime.finish_package_entity_mutation_fanout(&item, scheduled_resync);
         for subscription_id in dead {
             state.entity_subscriptions.remove(&subscription_id);
         }
@@ -970,7 +1008,7 @@ pub(super) fn drive_package_entity_resync(daemon: &mut HubDaemon, state: &mut Da
                     subscription.package_catching_up = snapshot_seq < family_floor;
                     subscription.resync_reason = None;
                 }
-                Err(EntityFrameTrySendError::Full) => {
+                Err(EntityFrameTrySendError::Full(_)) => {
                     state.lifecycle_counters.entity_delivery_overflows = state
                         .lifecycle_counters
                         .entity_delivery_overflows
@@ -1012,76 +1050,500 @@ pub(super) fn drive_package_entity_resync(daemon: &mut HubDaemon, state: &mut Da
     state.lifecycle_counters.live_entity_subscriptions = state.entity_subscriptions.len() as u64;
 }
 
-fn deliver_lifecycle_change(
-    subscription_id: &str,
-    state: &mut EntitySubscriptionState,
-    change: &botster_core_daemon::SessionLifecycleChange,
-    counters: &mut DaemonLifecycleCounters,
-) -> bool {
-    let sequence = change.cursor.sequence;
-    let frame = match &change.kind {
-        SessionLifecycleChangeKind::Upsert { record } => {
-            let entity = project_session_entity(record);
-            let id = entity.session_uuid.clone();
-            match state.entities.insert(id.clone(), entity.clone()) {
-                None => DaemonEntityFrame::Upsert {
-                    subscription_id: subscription_id.to_string(),
-                    entity_type: "session".to_string(),
-                    snapshot_seq: sequence,
-                    id,
-                    entity: serde_json::to_value(entity).expect("serialize session entity"),
-                },
-                Some(previous) => {
-                    let patch = session_entity_patch(&previous, &entity);
-                    if patch.as_object().is_some_and(serde_json::Map::is_empty) {
-                        state.cursor = Some(change.cursor.clone());
-                        return true;
-                    }
-                    DaemonEntityFrame::Patch {
-                        subscription_id: subscription_id.to_string(),
-                        entity_type: "session".to_string(),
-                        snapshot_seq: sequence,
-                        id,
-                        patch,
-                    }
-                }
-            }
+fn take_snapshot_item_page(
+    projection: &crate::session_projection::SessionProjection,
+    after: Option<&str>,
+    max_items: usize,
+    max_bytes: usize,
+    max_elapsed: Duration,
+) -> (Vec<Value>, Option<String>, bool) {
+    let started = Instant::now();
+    let mut items = Vec::new();
+    let mut last_id = after.map(str::to_string);
+    let mut more = false;
+    for (id, row) in rows_after(&projection.rows, after) {
+        if items.len() >= max_items || started.elapsed() >= max_elapsed {
+            more = true;
+            break;
         }
-        SessionLifecycleChangeKind::Removed { session_id } => {
-            state.entities.remove(&session_id.0);
-            DaemonEntityFrame::Remove {
-                subscription_id: subscription_id.to_string(),
-                entity_type: "session".to_string(),
-                snapshot_seq: sequence,
-                id: session_id.0.clone(),
-            }
+        let entity = crate::session_projection::SessionProjection::project_entity(&row.record);
+        let value = serde_json::to_value(&entity).expect("serialize session entity");
+        items.push(value);
+        let trial = DaemonEntityFrame::Snapshot {
+            subscription_id: String::new(),
+            entity_type: "session".to_string(),
+            snapshot_seq: 0,
+            items: items.clone(),
+            resync_reason: None,
+        };
+        let encoded = serde_json::to_vec(&trial)
+            .map(|body| body.len())
+            .unwrap_or(0);
+        if encoded > max_bytes {
+            items.pop();
+            more = true;
+            break;
         }
-        _ => {
-            state.resync_reason = Some("unknown_core_change".to_string());
-            return true;
-        }
-    };
-    counters.entity_delivery_attempts = counters.entity_delivery_attempts.saturating_add(1);
-    match state.sender.try_send_kind(frame) {
-        Ok(()) => {
-            counters.entity_delivery_successes =
-                counters.entity_delivery_successes.saturating_add(1);
-            state.cursor = Some(change.cursor.clone());
-            true
-        }
-        Err(EntityFrameTrySendError::Full) => {
-            counters.entity_delivery_overflows =
-                counters.entity_delivery_overflows.saturating_add(1);
-            state.resync_reason = Some("subscriber_overflow".to_string());
-            true
-        }
-        Err(EntityFrameTrySendError::Disconnected) => {
-            counters.entity_delivery_failures = counters.entity_delivery_failures.saturating_add(1);
-            false
+        last_id = Some(id.clone());
+    }
+    (items, last_id, more)
+}
+
+fn store_snapshot_items(state: &mut EntitySubscriptionState, items: &[Value]) {
+    for value in items {
+        if let Ok(entity) = serde_json::from_value::<DaemonSessionEntity>(value.clone()) {
+            state.entities.insert(entity.session_uuid.clone(), entity);
         }
     }
 }
 
+enum SnapshotAssemble {
+    Continue { page: DeliveryPage },
+    Closed { frame_too_large: bool },
+}
+
+fn continue_session_snapshot_assembly(
+    subscription_id: &str,
+    state: &mut EntitySubscriptionState,
+    projection: &crate::session_projection::SessionProjection,
+    counters: &mut DaemonLifecycleCounters,
+    max_items: usize,
+    max_bytes: usize,
+    max_elapsed: Duration,
+) -> SnapshotAssemble {
+    if !projection.baseline_complete || projection.gap {
+        return SnapshotAssemble::Continue {
+            page: DeliveryPage {
+                items: 0,
+                bytes: 0,
+                more: true,
+            },
+        };
+    }
+    let live_seq = projection
+        .cursor
+        .as_ref()
+        .map(|cursor| cursor.sequence)
+        .unwrap_or(0);
+    let source_seq = match state.delivery_phase {
+        DeliveryPhase::Assembling { source_seq } => source_seq,
+        _ => live_seq,
+    };
+    if source_seq != live_seq || !matches!(state.delivery_phase, DeliveryPhase::Assembling { .. }) {
+        reset_snapshot_assembly(state, live_seq);
+    }
+    let (items, last_id, more) = take_snapshot_item_page(
+        projection,
+        state.delivery_after.as_deref(),
+        max_items.max(1),
+        max_bytes.max(1),
+        max_elapsed,
+    );
+    if items.is_empty() && more {
+        return close_oversized_session_snapshot(subscription_id, state, counters);
+    }
+    let page_item_bytes = encoded_item_bytes(&items);
+    let page_bytes = page_item_bytes.saturating_add(snapshot_separator_bytes(
+        state.assembled_items.len(),
+        items.len(),
+    ));
+    let envelope = snapshot_envelope_bytes(subscription_id, state);
+    if state
+        .assembled_item_bytes
+        .saturating_add(page_bytes)
+        .saturating_add(envelope)
+        > DAEMON_MAX_FRAME_BYTES
+    {
+        return close_oversized_session_snapshot(subscription_id, state, counters);
+    }
+    let page_item_count = items.len();
+    store_snapshot_items(state, &items);
+    state.assembled_items.extend(items);
+    state.assembled_item_bytes = state.assembled_item_bytes.saturating_add(page_bytes);
+    state.delivery_after = last_id;
+    if more {
+        state.needs_delivery = true;
+        return SnapshotAssemble::Continue {
+            page: DeliveryPage {
+                items: page_item_count,
+                bytes: page_bytes,
+                more: true,
+            },
+        };
+    }
+    let snapshot = DaemonEntityFrame::Snapshot {
+        subscription_id: subscription_id.to_string(),
+        entity_type: "session".to_string(),
+        snapshot_seq: state.next_seq,
+        items: std::mem::take(&mut state.assembled_items),
+        resync_reason: state.resync_reason.clone(),
+    };
+    counters.entity_delivery_attempts = counters.entity_delivery_attempts.saturating_add(1);
+    match state.sender.try_send_kind(snapshot) {
+        Ok(()) => {
+            counters.entity_delivery_successes =
+                counters.entity_delivery_successes.saturating_add(1);
+            state.resync_reason = None;
+            state.delivery_phase = DeliveryPhase::Removes;
+            state.delivery_after = None;
+            state.assembled_item_bytes = 0;
+            state.needs_delivery = false;
+            SnapshotAssemble::Continue {
+                page: DeliveryPage {
+                    items: page_item_count,
+                    bytes: page_bytes,
+                    more: false,
+                },
+            }
+        }
+        Err(EntityFrameTrySendError::Full(frame)) => {
+            if let DaemonEntityFrame::Snapshot { items: queued, .. } = frame {
+                state.assembled_items = queued;
+            }
+            counters.entity_delivery_overflows =
+                counters.entity_delivery_overflows.saturating_add(1);
+            state.needs_delivery = true;
+            SnapshotAssemble::Continue {
+                page: DeliveryPage {
+                    items: 0,
+                    bytes: 0,
+                    more: true,
+                },
+            }
+        }
+        Err(EntityFrameTrySendError::Disconnected) => {
+            counters.entity_delivery_failures = counters.entity_delivery_failures.saturating_add(1);
+            SnapshotAssemble::Closed {
+                frame_too_large: false,
+            }
+        }
+    }
+}
+
+fn reset_snapshot_assembly(state: &mut EntitySubscriptionState, source_seq: u64) {
+    state.entities.clear();
+    state.assembled_items.clear();
+    state.assembled_item_bytes = 0;
+    state.delivery_after = None;
+    state.delivery_phase = DeliveryPhase::Assembling { source_seq };
+}
+
+fn encoded_item_bytes(items: &[Value]) -> usize {
+    items
+        .iter()
+        .map(|item| serde_json::to_vec(item).map(|body| body.len()).unwrap_or(0))
+        .sum()
+}
+
+fn snapshot_separator_bytes(existing_items: usize, new_items: usize) -> usize {
+    if new_items == 0 {
+        return 0;
+    }
+    new_items
+        .saturating_sub(1)
+        .saturating_add(usize::from(existing_items > 0))
+}
+
+fn snapshot_envelope_bytes(subscription_id: &str, state: &EntitySubscriptionState) -> usize {
+    let empty = DaemonEntityFrame::Snapshot {
+        subscription_id: subscription_id.to_string(),
+        entity_type: "session".to_string(),
+        snapshot_seq: state.next_seq,
+        items: Vec::new(),
+        resync_reason: state.resync_reason.clone(),
+    };
+    serde_json::to_vec(&empty)
+        .map(|body| body.len())
+        .unwrap_or(256)
+}
+
+fn close_oversized_session_snapshot(
+    subscription_id: &str,
+    state: &mut EntitySubscriptionState,
+    counters: &mut DaemonLifecycleCounters,
+) -> SnapshotAssemble {
+    counters.entity_delivery_attempts = counters.entity_delivery_attempts.saturating_add(1);
+    let error = DaemonEntityFrame::Error {
+        subscription_id: subscription_id.to_string(),
+        entity_type: "session".to_string(),
+        code: "entity_provider_frame_too_large".to_string(),
+        message: "session snapshot exceeds daemon frame limit".to_string(),
+    };
+    match state.sender.try_send_kind(error) {
+        Ok(()) => {
+            counters.entity_delivery_successes =
+                counters.entity_delivery_successes.saturating_add(1);
+        }
+        Err(EntityFrameTrySendError::Full(_)) => {
+            counters.entity_delivery_overflows =
+                counters.entity_delivery_overflows.saturating_add(1);
+        }
+        Err(EntityFrameTrySendError::Disconnected) => {
+            counters.entity_delivery_failures = counters.entity_delivery_failures.saturating_add(1);
+        }
+    }
+    state.needs_delivery = false;
+    state.resync_reason = None;
+    state.delivery_phase = DeliveryPhase::Removes;
+    state.delivery_after = None;
+    state.assembled_items.clear();
+    state.assembled_item_bytes = 0;
+    SnapshotAssemble::Closed {
+        frame_too_large: true,
+    }
+}
+
+fn rows_after<'a, V>(
+    rows: &'a BTreeMap<String, V>,
+    after: Option<&str>,
+) -> impl Iterator<Item = (&'a String, &'a V)> + 'a {
+    let start = match after {
+        Some(after) => Bound::Excluded(after),
+        None => Bound::Unbounded,
+    };
+    rows.range::<str, _>((start, Bound::Unbounded))
+}
+
+fn encoded_frame_len(frame: &DaemonEntityFrame) -> usize {
+    serde_json::to_vec(frame)
+        .map(|body| body.len())
+        .unwrap_or(0)
+}
+
+fn try_resync_from_projection(
+    subscription_id: &str,
+    state: &mut EntitySubscriptionState,
+    projection: &crate::session_projection::SessionProjection,
+    reason: String,
+    counters: &mut DaemonLifecycleCounters,
+) -> bool {
+    state.next_seq = state.next_seq.saturating_add(1);
+    state.entities.clear();
+    state.delivery_after = None;
+    state.delivery_phase = DeliveryPhase::Assembling {
+        source_seq: projection
+            .cursor
+            .as_ref()
+            .map(|cursor| cursor.sequence)
+            .unwrap_or(0),
+    };
+    state.resync_reason = Some(reason);
+    state.needs_delivery = true;
+    match continue_session_snapshot_assembly(
+        subscription_id,
+        state,
+        projection,
+        counters,
+        SESSION_DELIVERY_MAX_ITEMS,
+        SESSION_DELIVERY_MAX_BYTES,
+        SESSION_DELIVERY_MAX_ELAPSED,
+    ) {
+        SnapshotAssemble::Continue { page } => {
+            if page.more {
+                state.needs_delivery = true;
+            }
+            true
+        }
+        SnapshotAssemble::Closed { .. } => false,
+    }
+}
+
+fn deliver_projection_delta_page(
+    subscription_id: &str,
+    state: &mut EntitySubscriptionState,
+    projection: &crate::session_projection::SessionProjection,
+    counters: &mut DaemonLifecycleCounters,
+    max_items: usize,
+    max_bytes: usize,
+    max_elapsed: Duration,
+) -> (bool, DeliveryPage) {
+    let started = Instant::now();
+    let mut page = DeliveryPage {
+        items: 0,
+        bytes: 0,
+        more: false,
+    };
+    let mut last_id = state.delivery_after.clone();
+    if state.delivery_phase == DeliveryPhase::Removes {
+        let after = state.delivery_after.clone();
+        let mut visited = Vec::new();
+        for (id, _) in rows_after(&state.entities, after.as_deref()) {
+            if started.elapsed() >= max_elapsed || visited.len() >= max_items.saturating_add(1) {
+                page.more = true;
+                break;
+            }
+            visited.push(id.clone());
+        }
+        for id in visited {
+            if page.items >= max_items || started.elapsed() >= max_elapsed {
+                page.more = true;
+                break;
+            }
+            last_id = Some(id.clone());
+            if projection.rows.contains_key(&id) {
+                continue;
+            }
+            state.next_seq = state.next_seq.saturating_add(1);
+            let frame = DaemonEntityFrame::Remove {
+                subscription_id: subscription_id.to_string(),
+                entity_type: "session".to_string(),
+                snapshot_seq: state.next_seq,
+                id: id.clone(),
+            };
+            let bytes = encoded_frame_len(&frame);
+            if bytes > max_bytes.saturating_sub(page.bytes) {
+                state.next_seq = state.next_seq.saturating_sub(1);
+                if page.items == 0 {
+                    counters.entity_delivery_overflows =
+                        counters.entity_delivery_overflows.saturating_add(1);
+                    state.resync_reason = Some("subscriber_overflow".to_string());
+                    return (true, page);
+                }
+                page.more = true;
+                break;
+            }
+            match send_session_delta(state, counters, frame, projection) {
+                SendDelta::Alive { bytes } => {
+                    page.items += 1;
+                    page.bytes = page.bytes.saturating_add(bytes);
+                    last_id = Some(id);
+                }
+                SendDelta::Overflow => return (true, page),
+                SendDelta::Dead => return (false, page),
+            }
+        }
+        if !page.more {
+            state.delivery_phase = DeliveryPhase::Rows;
+            state.delivery_after = None;
+            last_id = None;
+        }
+    }
+    if !page.more && state.delivery_phase == DeliveryPhase::Rows {
+        let after = state.delivery_after.clone();
+        for (id, row) in rows_after(&projection.rows, after.as_deref()) {
+            if page.items >= max_items || started.elapsed() >= max_elapsed {
+                page.more = true;
+                break;
+            }
+            let entity = crate::session_projection::SessionProjection::project_entity(&row.record);
+            let frame = match state.entities.get(id) {
+                None => {
+                    state.next_seq = state.next_seq.saturating_add(1);
+                    DaemonEntityFrame::Upsert {
+                        subscription_id: subscription_id.to_string(),
+                        entity_type: "session".to_string(),
+                        snapshot_seq: state.next_seq,
+                        id: id.clone(),
+                        entity: serde_json::to_value(&entity).expect("serialize session entity"),
+                    }
+                }
+                Some(previous) if previous != &entity => {
+                    state.next_seq = state.next_seq.saturating_add(1);
+                    DaemonEntityFrame::Patch {
+                        subscription_id: subscription_id.to_string(),
+                        entity_type: "session".to_string(),
+                        snapshot_seq: state.next_seq,
+                        id: id.clone(),
+                        patch: crate::session_projection::SessionProjection::entity_patch(
+                            previous, &entity,
+                        ),
+                    }
+                }
+                Some(_) => {
+                    last_id = Some(id.clone());
+                    continue;
+                }
+            };
+            let bytes = encoded_frame_len(&frame);
+            if bytes > max_bytes.saturating_sub(page.bytes) {
+                state.next_seq = state.next_seq.saturating_sub(1);
+                if page.items == 0 {
+                    counters.entity_delivery_overflows =
+                        counters.entity_delivery_overflows.saturating_add(1);
+                    state.resync_reason = Some("subscriber_overflow".to_string());
+                    return (true, page);
+                }
+                page.more = true;
+                break;
+            }
+            match send_session_delta(state, counters, frame, projection) {
+                SendDelta::Alive { bytes } => {
+                    page.items += 1;
+                    page.bytes = page.bytes.saturating_add(bytes);
+                    last_id = Some(id.clone());
+                }
+                SendDelta::Overflow => return (true, page),
+                SendDelta::Dead => return (false, page),
+            }
+        }
+        if !page.more {
+            state.delivery_phase = DeliveryPhase::Removes;
+            state.delivery_after = None;
+            state.needs_delivery = false;
+            return (true, page);
+        }
+    }
+    state.delivery_after = last_id;
+    (true, page)
+}
+
+enum SendDelta {
+    Alive { bytes: usize },
+    Overflow,
+    Dead,
+}
+
+fn send_session_delta(
+    state: &mut EntitySubscriptionState,
+    counters: &mut DaemonLifecycleCounters,
+    frame: DaemonEntityFrame,
+    projection: &crate::session_projection::SessionProjection,
+) -> SendDelta {
+    let bytes = serde_json::to_vec(&frame)
+        .map(|body| body.len())
+        .unwrap_or(0);
+    counters.entity_delivery_attempts = counters.entity_delivery_attempts.saturating_add(1);
+    match state.sender.try_send_kind(frame.clone()) {
+        Ok(()) => {
+            counters.entity_delivery_successes =
+                counters.entity_delivery_successes.saturating_add(1);
+            match frame {
+                DaemonEntityFrame::Remove { id, .. } => {
+                    state.entities.remove(&id);
+                }
+                DaemonEntityFrame::Upsert { id, entity, .. } => {
+                    if let Ok(parsed) = serde_json::from_value(entity) {
+                        state.entities.insert(id, parsed);
+                    }
+                }
+                DaemonEntityFrame::Patch { id, .. } => {
+                    if let Some(row) = projection.rows.get(&id) {
+                        state.entities.insert(
+                            id,
+                            crate::session_projection::SessionProjection::project_entity(
+                                &row.record,
+                            ),
+                        );
+                    }
+                }
+                _ => {}
+            }
+            SendDelta::Alive { bytes }
+        }
+        Err(EntityFrameTrySendError::Full(_)) => {
+            counters.entity_delivery_overflows =
+                counters.entity_delivery_overflows.saturating_add(1);
+            state.resync_reason = Some("subscriber_overflow".to_string());
+            SendDelta::Overflow
+        }
+        Err(EntityFrameTrySendError::Disconnected) => {
+            counters.entity_delivery_failures = counters.entity_delivery_failures.saturating_add(1);
+            SendDelta::Dead
+        }
+    }
+}
+
+#[cfg(test)]
 fn try_resync_subscription(
     subscription_id: &str,
     state: &mut EntitySubscriptionState,
@@ -1101,7 +1563,7 @@ fn try_resync_subscription(
             state.resync_reason = None;
             true
         }
-        Err(EntityFrameTrySendError::Full) => {
+        Err(EntityFrameTrySendError::Full(_)) => {
             counters.entity_delivery_attempts = counters.entity_delivery_attempts.saturating_add(1);
             counters.entity_delivery_overflows =
                 counters.entity_delivery_overflows.saturating_add(1);
@@ -1115,6 +1577,7 @@ fn try_resync_subscription(
     }
 }
 
+#[cfg(test)]
 fn entity_snapshot(
     subscription_id: &str,
     baseline: SessionLifecycleBaseline,
@@ -1139,6 +1602,7 @@ fn entity_snapshot(
     (entities, frame)
 }
 
+#[cfg(test)]
 fn project_session_entity(record: &SessionLifecycleRecord) -> DaemonSessionEntity {
     let (lifecycle, exit_code, failure_reason) = match &record.lifecycle {
         Some(SessionLifecycleState::Starting) => (Some("starting".to_string()), None, None),
@@ -1182,6 +1646,7 @@ fn project_session_entity(record: &SessionLifecycleRecord) -> DaemonSessionEntit
     }
 }
 
+#[cfg(test)]
 fn session_lifecycle_class(
     registry_state: &RegistrySessionState,
     lifecycle: Option<&SessionLifecycleState>,
@@ -1203,6 +1668,7 @@ fn session_lifecycle_class(
     }
 }
 
+#[cfg(test)]
 fn session_entity_patch(previous: &DaemonSessionEntity, current: &DaemonSessionEntity) -> Value {
     let previous = serde_json::to_value(previous).expect("serialize previous session entity");
     let current = serde_json::to_value(current).expect("serialize current session entity");
@@ -1383,6 +1849,16 @@ mod tests {
 
         let mut state = DaemonControlState::default();
         seed_lifecycle_reconciliation(&mut daemon, &mut state);
+        for _ in 0..16 {
+            let kind = state.maintenance.scheduler.take_slice();
+            if let Some(runtime) = daemon.runtime() {
+                crate::daemon_maintenance::run_maintenance_kind(
+                    runtime,
+                    &mut state.maintenance,
+                    kind,
+                );
+            }
+        }
         let (sender, receiver) = mpsc::sync_channel(4);
         let response = register_entity_subscription(
             &mut daemon,
@@ -1394,23 +1870,53 @@ mod tests {
         )
         .expect("register entity subscription");
         assert_eq!(response.kind, DaemonResponseKind::EntitySubscribed);
-        assert!(matches!(
-            receiver.recv().expect("initial current snapshot"),
-            DaemonEntityFrame::Snapshot { ref items, .. }
-                if items.iter().any(|entity| {
-                    entity.get("session_uuid").and_then(Value::as_str) == Some(&session_id.0)
-                        && entity.get("registry_state").and_then(Value::as_str) == Some("running")
-                        && entity.get("lifecycle").and_then(Value::as_str) == Some("running")
-                        && entity.get("lifecycle_class").and_then(Value::as_str) == Some("current")
-                })
-        ));
+        let mut first = receiver.try_recv().ok();
+        for _ in 0..32 {
+            if first.is_some() {
+                break;
+            }
+            let kind = state.maintenance.scheduler.take_slice();
+            if let Some(runtime) = daemon.runtime() {
+                crate::daemon_maintenance::run_maintenance_kind(
+                    runtime,
+                    &mut state.maintenance,
+                    kind,
+                );
+            }
+            drive_entity_subscriptions(&mut daemon, &mut state);
+            first = receiver.try_recv().ok();
+        }
+        let first = first.expect("initial authoritative snapshot");
+        match first {
+            DaemonEntityFrame::Snapshot { ref items, .. } => {
+                assert!(
+                    items.iter().any(|entity| {
+                        entity.get("session_uuid").and_then(Value::as_str) == Some(&session_id.0)
+                            && entity.get("lifecycle_class").and_then(Value::as_str)
+                                == Some("current")
+                    }),
+                    "first snapshot must contain the live session"
+                );
+            }
+            other => panic!("expected populated snapshot, got {other:?}"),
+        }
 
         daemon
             .runtime()
             .expect("runtime initialized")
             .mark_session_stale(&session_id, 2)
             .expect("mark live session stale through core daemon");
-        drive_entity_subscriptions(&mut daemon, &mut state);
+        for _ in 0..16 {
+            let kind = state.maintenance.scheduler.take_slice();
+            if let Some(runtime) = daemon.runtime() {
+                crate::daemon_maintenance::run_maintenance_kind(
+                    runtime,
+                    &mut state.maintenance,
+                    kind,
+                );
+            }
+            drive_entity_subscriptions(&mut daemon, &mut state);
+        }
         assert!(matches!(
             receiver.recv().expect("stale transition patch"),
             DaemonEntityFrame::Patch {
@@ -1430,106 +1936,6 @@ mod tests {
             .expect("runtime initialized")
             .shutdown_session(session_id, 3)
             .expect("stop worker-backed test session");
-        daemon.stop();
-        let _ = fs::remove_dir_all(data_directory);
-    }
-
-    #[test]
-    fn early_session_subscription_waits_for_complete_paged_projection() {
-        let data_directory = std::env::temp_dir().join(format!(
-            "botster-hub-paged-projection-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock after epoch")
-                .as_nanos()
-        ));
-        let config = crate::HubStartupOptions {
-            host: crate::HostIdentityOptions {
-                id: "paged-projection-test".to_string(),
-                display_name: "Paged Projection Test".to_string(),
-                fingerprint: None,
-            },
-            data_directory: crate::DataDirectoryOption::Explicit(data_directory.clone()),
-            session_defaults: crate::SessionDefaults {
-                shell: "/bin/sh".to_string(),
-                working_directory: Some(".".into()),
-                initial_rows: 24,
-                initial_cols: 80,
-            },
-            transports: crate::TransportBindings::default(),
-            ..crate::HubStartupOptions::default()
-        }
-        .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
-        .expect("build paged projection config");
-        let mut daemon = HubDaemon::start(config).expect("start paged projection daemon");
-        for index in 0..33 {
-            daemon
-                .runtime_mut()
-                .expect("runtime initialized")
-                .spawn_session(
-                    botster_core::SessionSpawnRequest {
-                        request_id: RequestId(format!("paged-projection-spawn-{index}")),
-                        session_id: SessionId(format!("paged-session-{index:02}")),
-                        executable: "/bin/sh".to_string(),
-                        arguments: vec!["-c".to_string(), "sleep 30".to_string()],
-                        working_directory: botster_core::SpawnWorkingDirectory {
-                            path: ".".to_string(),
-                        },
-                        environment: botster_core::SpawnEnvironment::default(),
-                        initial_pty_size: Some(botster_core::ResizePayload { rows: 24, cols: 80 }),
-                    },
-                    botster_core::CoreSessionMetadata::new(),
-                    index as u64 + 1,
-                )
-                .expect("spawn session for paged projection");
-        }
-
-        let mut state = DaemonControlState::default();
-        let (sender, receiver) = mpsc::sync_channel(4);
-        let response = register_entity_subscription(
-            &mut daemon,
-            &mut state,
-            "session".to_string(),
-            "paged-projection-subscription".to_string(),
-            EntityFrameSender::Blocking(sender),
-            None,
-        )
-        .expect("register early entity subscription");
-        assert_eq!(response.kind, DaemonResponseKind::EntitySubscribed);
-        assert!(
-            receiver.try_recv().is_err(),
-            "early subscribe must not receive the first page as a complete snapshot"
-        );
-
-        let mut snapshot = None;
-        for _ in 0..8 {
-            drive_entity_subscriptions(&mut daemon, &mut state);
-            if let Ok(frame) = receiver.try_recv() {
-                snapshot = Some(frame);
-                break;
-            }
-        }
-        let DaemonEntityFrame::Snapshot { items, .. } =
-            snapshot.expect("complete projection snapshot")
-        else {
-            panic!("expected snapshot after paged projection completed");
-        };
-        assert_eq!(
-            items.len(),
-            33,
-            "complete projection must include every baseline row, items={items:?}"
-        );
-
-        for index in 0..33 {
-            let _ = daemon
-                .runtime_mut()
-                .expect("runtime initialized")
-                .shutdown_session(
-                    SessionId(format!("paged-session-{index:02}")),
-                    100 + index as u64,
-                );
-        }
         daemon.stop();
         let _ = fs::remove_dir_all(data_directory);
     }
@@ -1578,6 +1984,12 @@ mod tests {
             owner_grant_id: None,
             package_last_applied_seq: None,
             package_catching_up: false,
+            delivery_after: None,
+            delivery_phase: DeliveryPhase::Removes,
+            next_seq: 0,
+            assembled_items: Vec::new(),
+            assembled_item_bytes: 0,
+            needs_delivery: false,
         };
         let mut counters = DaemonLifecycleCounters::default();
 
@@ -1642,6 +2054,12 @@ mod tests {
                 owner_grant_id: None,
                 package_last_applied_seq: None,
                 package_catching_up: false,
+                delivery_after: None,
+                delivery_phase: DeliveryPhase::Removes,
+                next_seq: 0,
+                assembled_items: Vec::new(),
+                assembled_item_bytes: 0,
+                needs_delivery: false,
             },
         )]);
         let entities = BTreeMap::from([(
@@ -1666,6 +2084,199 @@ mod tests {
                 && entity_type == "session_type"
                 && code == "entity_provider_frame_too_large"
         ));
+    }
+
+    fn session_type_subscription_state(
+        sender: mpsc::SyncSender<DaemonEntityFrame>,
+        definition_generation: u64,
+        next_seq: u64,
+        definition_entities: BTreeMap<String, Value>,
+        resync_reason: Option<String>,
+    ) -> EntitySubscriptionState {
+        EntitySubscriptionState {
+            sender: EntityFrameSender::Blocking(sender),
+            entity_type: "session_type".to_string(),
+            cursor: None,
+            entities: BTreeMap::new(),
+            definition_generation,
+            definition_entities,
+            resync_reason,
+            owner_grant_id: None,
+            package_last_applied_seq: None,
+            package_catching_up: false,
+            delivery_after: None,
+            delivery_phase: DeliveryPhase::Removes,
+            next_seq,
+            assembled_items: Vec::new(),
+            assembled_item_bytes: 0,
+            needs_delivery: false,
+        }
+    }
+
+    fn session_type_delta_seqs(
+        receiver: &mpsc::Receiver<DaemonEntityFrame>,
+    ) -> Vec<(String, u64, String)> {
+        receiver
+            .try_iter()
+            .filter_map(|frame| match frame {
+                DaemonEntityFrame::Upsert {
+                    subscription_id,
+                    snapshot_seq,
+                    id,
+                    ..
+                }
+                | DaemonEntityFrame::Remove {
+                    subscription_id,
+                    snapshot_seq,
+                    id,
+                    ..
+                } => Some((subscription_id, snapshot_seq, id)),
+                DaemonEntityFrame::Snapshot {
+                    subscription_id,
+                    snapshot_seq,
+                    ..
+                } => Some((subscription_id, snapshot_seq, "snapshot".to_string())),
+                DaemonEntityFrame::Error { .. } | DaemonEntityFrame::Patch { .. } => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn session_type_same_generation_multi_row_uses_contiguous_subscriber_seq() {
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let mut subscriptions = BTreeMap::from([(
+            "held-session-types".to_string(),
+            session_type_subscription_state(
+                sender,
+                1,
+                1,
+                BTreeMap::from([
+                    (
+                        "device/alpha".to_string(),
+                        serde_json::json!({ "label": "Alpha" }),
+                    ),
+                    (
+                        "device/beta".to_string(),
+                        serde_json::json!({ "label": "Beta" }),
+                    ),
+                ]),
+                None,
+            ),
+        )]);
+        let entities = BTreeMap::from([
+            (
+                "device/alpha".to_string(),
+                serde_json::json!({ "label": "Alpha 2" }),
+            ),
+            (
+                "device/beta".to_string(),
+                serde_json::json!({ "label": "Beta 2" }),
+            ),
+        ]);
+
+        drive_session_type_subscriptions(&mut subscriptions, 2, &entities);
+
+        let frames = session_type_delta_seqs(&receiver);
+        assert_eq!(
+            frames,
+            vec![
+                (
+                    "held-session-types".to_string(),
+                    2,
+                    "device/alpha".to_string()
+                ),
+                (
+                    "held-session-types".to_string(),
+                    3,
+                    "device/beta".to_string()
+                ),
+            ],
+            "one generation with two published diffs must deliver N+1 then N+2 on the held subscription"
+        );
+        assert_eq!(
+            subscriptions
+                .get("held-session-types")
+                .map(|subscription| subscription.next_seq),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn session_type_skipped_generation_uses_contiguous_subscriber_seq() {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let mut subscriptions = BTreeMap::from([(
+            "held-session-types".to_string(),
+            session_type_subscription_state(
+                sender,
+                1,
+                1,
+                BTreeMap::from([(
+                    "device/alpha".to_string(),
+                    serde_json::json!({ "label": "Alpha" }),
+                )]),
+                None,
+            ),
+        )]);
+        let entities = BTreeMap::from([(
+            "device/alpha".to_string(),
+            serde_json::json!({ "label": "Alpha 3" }),
+        )]);
+
+        drive_session_type_subscriptions(&mut subscriptions, 3, &entities);
+
+        let frames = session_type_delta_seqs(&receiver);
+        assert_eq!(
+            frames,
+            vec![(
+                "held-session-types".to_string(),
+                2,
+                "device/alpha".to_string()
+            )],
+            "a skipped dirty generation must still deliver the next contiguous subscriber seq, not the generation number"
+        );
+        assert_eq!(
+            subscriptions
+                .get("held-session-types")
+                .map(|subscription| subscription.next_seq),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn session_type_overflow_resync_advances_subscriber_seq_not_generation() {
+        let (sender, receiver) = mpsc::sync_channel(2);
+        let mut subscriptions = BTreeMap::from([(
+            "held-session-types".to_string(),
+            session_type_subscription_state(
+                sender,
+                7,
+                7,
+                BTreeMap::from([(
+                    "device/alpha".to_string(),
+                    serde_json::json!({ "label": "Alpha" }),
+                )]),
+                Some("subscriber_overflow".to_string()),
+            ),
+        )]);
+        let entities = BTreeMap::from([(
+            "device/alpha".to_string(),
+            serde_json::json!({ "label": "Alpha recovered" }),
+        )]);
+
+        drive_session_type_subscriptions(&mut subscriptions, 3, &entities);
+
+        let frames = session_type_delta_seqs(&receiver);
+        assert_eq!(
+            frames,
+            vec![("held-session-types".to_string(), 8, "snapshot".to_string())],
+            "overflow resync must send next_seq+1 and must not move snapshot_seq backwards to the generation"
+        );
+        let subscription = subscriptions
+            .get("held-session-types")
+            .expect("held subscription remains open");
+        assert_eq!(subscription.next_seq, 8);
+        assert_eq!(subscription.definition_generation, 3);
+        assert!(subscription.resync_reason.is_none());
     }
 
     #[test]
@@ -1703,6 +2314,12 @@ mod tests {
             owner_grant_id: None,
             package_last_applied_seq: None,
             package_catching_up: false,
+            delivery_after: None,
+            delivery_phase: DeliveryPhase::Removes,
+            next_seq: 0,
+            assembled_items: Vec::new(),
+            assembled_item_bytes: 0,
+            needs_delivery: false,
         };
         let mut counters = DaemonLifecycleCounters::default();
 
@@ -1750,5 +2367,814 @@ mod tests {
         assert_eq!(counters.entity_delivery_successes, 1);
         assert_eq!(counters.entity_delivery_overflows, 1);
         assert_eq!(counters.entity_delivery_failures, 1);
+    }
+
+    #[test]
+    fn delivery_page_does_not_skip_a_low_id_after_a_high_remove() {
+        let mut projection = crate::session_projection::SessionProjection::default();
+        projection.replace_complete_baseline(
+            SessionLifecycleCursor {
+                source_id: botster_core_daemon::SessionLifecycleSourceId("s".into()),
+                sequence: 2,
+            },
+            Vec::new(),
+        );
+        let record = |id: &str| botster_core_daemon::SessionLifecycleRecord {
+            session: botster_core_daemon::DaemonSession {
+                session_id: SessionId(id.to_string()),
+                registry_state: RegistrySessionState::Running,
+                size: botster_core::ResizePayload { rows: 24, cols: 80 },
+                process: None,
+                updated_at: 1,
+            },
+            metadata: botster_core::CoreSessionMetadata::new(),
+            lifecycle: Some(SessionLifecycleState::Running),
+        };
+        projection.ingest_baseline_rows(2, [record("a")]);
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let mut state = EntitySubscriptionState {
+            sender: EntityFrameSender::Blocking(sender),
+            entity_type: "session".to_string(),
+            cursor: projection.cursor.clone(),
+            entities: BTreeMap::from([(
+                "z".to_string(),
+                crate::session_projection::SessionProjection::project_entity(&record("z")),
+            )]),
+            definition_generation: 0,
+            definition_entities: BTreeMap::new(),
+            resync_reason: None,
+            owner_grant_id: None,
+            package_last_applied_seq: None,
+            package_catching_up: false,
+            delivery_after: None,
+            delivery_phase: DeliveryPhase::Removes,
+            next_seq: 0,
+            assembled_items: Vec::new(),
+            assembled_item_bytes: 0,
+            needs_delivery: false,
+        };
+        let mut counters = DaemonLifecycleCounters::default();
+        let (alive, first) = deliver_projection_delta_page(
+            "sub",
+            &mut state,
+            &projection,
+            &mut counters,
+            1,
+            usize::MAX,
+            Duration::from_secs(1),
+        );
+        assert!(alive);
+        assert!(first.more);
+        let (alive, second) = deliver_projection_delta_page(
+            "sub",
+            &mut state,
+            &projection,
+            &mut counters,
+            1,
+            usize::MAX,
+            Duration::from_secs(1),
+        );
+        assert!(alive);
+        assert!(!second.more);
+        let frames: Vec<_> = receiver.try_iter().collect();
+        assert!(frames.iter().any(|frame| matches!(
+            frame,
+            DaemonEntityFrame::Remove { id, .. } if id == "z"
+        )));
+        assert!(frames.iter().any(|frame| matches!(
+            frame,
+            DaemonEntityFrame::Upsert { id, .. } if id == "a"
+        )));
+    }
+
+    #[test]
+    fn delivery_page_keeps_snapshot_seq_monotonic_when_id_order_reverses_journal_order() {
+        let record = |id: &str| botster_core_daemon::SessionLifecycleRecord {
+            session: botster_core_daemon::DaemonSession {
+                session_id: SessionId(id.to_string()),
+                registry_state: RegistrySessionState::Running,
+                size: botster_core::ResizePayload { rows: 24, cols: 80 },
+                process: None,
+                updated_at: 1,
+            },
+            metadata: botster_core::CoreSessionMetadata::new(),
+            lifecycle: Some(SessionLifecycleState::Running),
+        };
+        let mut projection = crate::session_projection::SessionProjection::default();
+        projection.ingest_baseline_rows(1, [record("z")]);
+        projection.ingest_baseline_rows(2, [record("a")]);
+        projection.seal_baseline(SessionLifecycleCursor {
+            source_id: botster_core_daemon::SessionLifecycleSourceId("s".into()),
+            sequence: 2,
+        });
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let mut state = EntitySubscriptionState {
+            sender: EntityFrameSender::Blocking(sender),
+            entity_type: "session".to_string(),
+            cursor: projection.cursor.clone(),
+            entities: BTreeMap::new(),
+            definition_generation: 0,
+            definition_entities: BTreeMap::new(),
+            resync_reason: None,
+            owner_grant_id: None,
+            package_last_applied_seq: None,
+            package_catching_up: false,
+            delivery_after: None,
+            delivery_phase: DeliveryPhase::Rows,
+            next_seq: 0,
+            assembled_items: Vec::new(),
+            assembled_item_bytes: 0,
+            needs_delivery: false,
+        };
+        let mut counters = DaemonLifecycleCounters::default();
+        let _ = deliver_projection_delta_page(
+            "sub",
+            &mut state,
+            &projection,
+            &mut counters,
+            1,
+            usize::MAX,
+            Duration::from_secs(1),
+        );
+        let _ = deliver_projection_delta_page(
+            "sub",
+            &mut state,
+            &projection,
+            &mut counters,
+            1,
+            usize::MAX,
+            Duration::from_secs(1),
+        );
+        let seqs: Vec<u64> = receiver
+            .try_iter()
+            .filter_map(|frame| match frame {
+                DaemonEntityFrame::Upsert { snapshot_seq, .. }
+                | DaemonEntityFrame::Patch { snapshot_seq, .. } => Some(snapshot_seq),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(seqs, vec![1, 2]);
+    }
+
+    #[test]
+    fn overflow_resync_does_not_move_snapshot_seq_backwards() {
+        let record = |id: &str| botster_core_daemon::SessionLifecycleRecord {
+            session: botster_core_daemon::DaemonSession {
+                session_id: SessionId(id.to_string()),
+                registry_state: RegistrySessionState::Running,
+                size: botster_core::ResizePayload { rows: 24, cols: 80 },
+                process: None,
+                updated_at: 1,
+            },
+            metadata: botster_core::CoreSessionMetadata::new(),
+            lifecycle: Some(SessionLifecycleState::Running),
+        };
+        let mut projection = crate::session_projection::SessionProjection::default();
+        projection.ingest_baseline_rows(11, [record("a"), record("b"), record("c")]);
+        projection.seal_baseline(SessionLifecycleCursor {
+            source_id: botster_core_daemon::SessionLifecycleSourceId("s".into()),
+            sequence: 11,
+        });
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let mut state = EntitySubscriptionState {
+            sender: EntityFrameSender::Blocking(sender),
+            entity_type: "session".to_string(),
+            cursor: projection.cursor.clone(),
+            entities: BTreeMap::new(),
+            definition_generation: 0,
+            definition_entities: BTreeMap::new(),
+            resync_reason: None,
+            owner_grant_id: None,
+            package_last_applied_seq: None,
+            package_catching_up: false,
+            delivery_after: None,
+            delivery_phase: DeliveryPhase::Rows,
+            next_seq: 110,
+            assembled_items: Vec::new(),
+            assembled_item_bytes: 0,
+            needs_delivery: true,
+        };
+        let mut counters = DaemonLifecycleCounters::default();
+        let _ = deliver_projection_delta_page(
+            "sub",
+            &mut state,
+            &projection,
+            &mut counters,
+            1,
+            usize::MAX,
+            Duration::from_secs(1),
+        );
+        state.resync_reason = Some("subscriber_overflow".to_string());
+        assert!(try_resync_from_projection(
+            "sub",
+            &mut state,
+            &projection,
+            "subscriber_overflow".to_string(),
+            &mut counters,
+        ));
+        let seqs: Vec<u64> = receiver
+            .try_iter()
+            .filter_map(|frame| match frame {
+                DaemonEntityFrame::Upsert { snapshot_seq, .. }
+                | DaemonEntityFrame::Patch { snapshot_seq, .. }
+                | DaemonEntityFrame::Snapshot { snapshot_seq, .. }
+                | DaemonEntityFrame::Remove { snapshot_seq, .. } => Some(snapshot_seq),
+                DaemonEntityFrame::Error { .. } => None,
+            })
+            .collect();
+        assert!(seqs.len() >= 2);
+        for window in seqs.windows(2) {
+            assert!(window[0] < window[1], "sequences moved backwards: {seqs:?}");
+        }
+        assert!(seqs[0] > 110 || seqs.iter().any(|seq| *seq > 110));
+    }
+
+    #[test]
+    fn paged_delivery_stays_within_owner_turn_for_a_large_registry() {
+        let record = |id: String| botster_core_daemon::SessionLifecycleRecord {
+            session: botster_core_daemon::DaemonSession {
+                session_id: SessionId(id),
+                registry_state: RegistrySessionState::Running,
+                size: botster_core::ResizePayload { rows: 24, cols: 80 },
+                process: None,
+                updated_at: 1,
+            },
+            metadata: botster_core::CoreSessionMetadata::new(),
+            lifecycle: Some(SessionLifecycleState::Running),
+        };
+        let mut projection = crate::session_projection::SessionProjection::default();
+        projection.ingest_baseline_rows(
+            1,
+            (0..256).map(|index| record(format!("session-{index:03}"))),
+        );
+        projection.seal_baseline(SessionLifecycleCursor {
+            source_id: botster_core_daemon::SessionLifecycleSourceId("s".into()),
+            sequence: 1,
+        });
+        let mut delivered = 0;
+        for subscriber in 0..2 {
+            let (sender, receiver) = mpsc::sync_channel(256);
+            let mut state = EntitySubscriptionState {
+                sender: EntityFrameSender::Blocking(sender),
+                entity_type: "session".to_string(),
+                cursor: projection.cursor.clone(),
+                entities: BTreeMap::new(),
+                definition_generation: 0,
+                definition_entities: BTreeMap::new(),
+                resync_reason: None,
+                owner_grant_id: None,
+                package_last_applied_seq: None,
+                package_catching_up: false,
+                delivery_after: None,
+                delivery_phase: DeliveryPhase::Rows,
+                next_seq: 0,
+                assembled_items: Vec::new(),
+                assembled_item_bytes: 0,
+                needs_delivery: false,
+            };
+            let mut counters = DaemonLifecycleCounters::default();
+            loop {
+                let started = Instant::now();
+                let (alive, page) = deliver_projection_delta_page(
+                    &format!("sub-{subscriber}"),
+                    &mut state,
+                    &projection,
+                    &mut counters,
+                    SESSION_DELIVERY_MAX_ITEMS,
+                    SESSION_DELIVERY_MAX_BYTES,
+                    SESSION_DELIVERY_MAX_ELAPSED,
+                );
+                assert!(alive);
+                assert!(started.elapsed() < Duration::from_millis(crate::MAX_OWNER_TURN_MS));
+                if !page.more {
+                    break;
+                }
+            }
+            delivered += receiver.try_iter().count();
+        }
+        assert_eq!(delivered, 512);
+    }
+
+    #[test]
+    fn first_session_snapshot_is_complete_and_assembled_in_pages() {
+        let record = |id: String| SessionLifecycleRecord {
+            session: botster_core_daemon::DaemonSession {
+                session_id: SessionId(id),
+                registry_state: RegistrySessionState::Running,
+                size: botster_core::ResizePayload { rows: 24, cols: 80 },
+                process: None,
+                updated_at: 1,
+            },
+            metadata: botster_core::CoreSessionMetadata::new(),
+            lifecycle: Some(SessionLifecycleState::Running),
+        };
+        let mut projection = crate::session_projection::SessionProjection::default();
+        projection.ingest_baseline_rows(
+            1,
+            (0..24).map(|index| record(format!("session-{index:02}"))),
+        );
+        projection.seal_baseline(SessionLifecycleCursor {
+            source_id: botster_core_daemon::SessionLifecycleSourceId("s".into()),
+            sequence: 1,
+        });
+        let (sender, receiver) = mpsc::sync_channel(32);
+        let mut state = EntitySubscriptionState {
+            sender: EntityFrameSender::Blocking(sender),
+            entity_type: "session".to_string(),
+            cursor: projection.cursor.clone(),
+            entities: BTreeMap::new(),
+            definition_generation: 0,
+            definition_entities: BTreeMap::new(),
+            resync_reason: None,
+            owner_grant_id: None,
+            package_last_applied_seq: None,
+            package_catching_up: false,
+            delivery_after: None,
+            delivery_phase: DeliveryPhase::Assembling { source_seq: 1 },
+            next_seq: 1,
+            assembled_items: Vec::new(),
+            assembled_item_bytes: 0,
+            needs_delivery: true,
+        };
+        let mut counters = DaemonLifecycleCounters::default();
+        let mut pages = 0;
+        loop {
+            let started = Instant::now();
+            let SnapshotAssemble::Continue { page } = continue_session_snapshot_assembly(
+                "sub",
+                &mut state,
+                &projection,
+                &mut counters,
+                SESSION_DELIVERY_MAX_ITEMS,
+                SESSION_DELIVERY_MAX_BYTES,
+                SESSION_DELIVERY_MAX_ELAPSED,
+            ) else {
+                panic!("assembly must stay alive");
+            };
+            assert!(started.elapsed() < Duration::from_millis(crate::MAX_OWNER_TURN_MS));
+            pages += 1;
+            if !page.more {
+                break;
+            }
+            assert!(
+                matches!(state.delivery_phase, DeliveryPhase::Assembling { .. }),
+                "must keep assembling until the complete snapshot"
+            );
+            assert!(receiver.try_iter().next().is_none());
+            assert!(pages < 8);
+        }
+        assert!(pages > 1);
+        let frames: Vec<_> = receiver.try_iter().collect();
+        assert_eq!(frames.len(), 1);
+        match &frames[0] {
+            DaemonEntityFrame::Snapshot {
+                items,
+                resync_reason,
+                ..
+            } => {
+                assert_eq!(items.len(), 24);
+                assert_eq!(resync_reason, &None);
+            }
+            other => panic!("expected one complete snapshot, got {other:?}"),
+        }
+        assert_eq!(state.delivery_phase, DeliveryPhase::Removes);
+        assert!(!state.needs_delivery);
+    }
+
+    #[test]
+    fn catch_up_restarts_when_a_prefix_id_changes() {
+        let record = |id: &str, updated_at: u64| SessionLifecycleRecord {
+            session: botster_core_daemon::DaemonSession {
+                session_id: SessionId(id.to_string()),
+                registry_state: RegistrySessionState::Running,
+                size: botster_core::ResizePayload { rows: 24, cols: 80 },
+                process: None,
+                updated_at,
+            },
+            metadata: botster_core::CoreSessionMetadata::new(),
+            lifecycle: Some(SessionLifecycleState::Running),
+        };
+        let mut projection = crate::session_projection::SessionProjection::default();
+        projection.ingest_baseline_rows(
+            1,
+            (0..24).map(|index| record(&format!("session-{index:02}"), 1)),
+        );
+        projection.seal_baseline(SessionLifecycleCursor {
+            source_id: botster_core_daemon::SessionLifecycleSourceId("s".into()),
+            sequence: 1,
+        });
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let mut state = EntitySubscriptionState {
+            sender: EntityFrameSender::Blocking(sender),
+            entity_type: "session".to_string(),
+            cursor: projection.cursor.clone(),
+            entities: BTreeMap::new(),
+            definition_generation: 0,
+            definition_entities: BTreeMap::new(),
+            resync_reason: None,
+            owner_grant_id: None,
+            package_last_applied_seq: None,
+            package_catching_up: false,
+            delivery_after: None,
+            delivery_phase: DeliveryPhase::Assembling { source_seq: 1 },
+            next_seq: 1,
+            assembled_items: Vec::new(),
+            assembled_item_bytes: 0,
+            needs_delivery: true,
+        };
+        let mut counters = DaemonLifecycleCounters::default();
+        let SnapshotAssemble::Continue { page } = continue_session_snapshot_assembly(
+            "sub",
+            &mut state,
+            &projection,
+            &mut counters,
+            SESSION_DELIVERY_MAX_ITEMS,
+            SESSION_DELIVERY_MAX_BYTES,
+            SESSION_DELIVERY_MAX_ELAPSED,
+        ) else {
+            panic!("first page");
+        };
+        assert!(page.more);
+        assert!(receiver.try_iter().next().is_none());
+        projection.ingest_baseline_rows(2, [record("session-00", 9)]);
+        projection.seal_baseline(SessionLifecycleCursor {
+            source_id: botster_core_daemon::SessionLifecycleSourceId("s".into()),
+            sequence: 2,
+        });
+        loop {
+            let SnapshotAssemble::Continue { page } = continue_session_snapshot_assembly(
+                "sub",
+                &mut state,
+                &projection,
+                &mut counters,
+                SESSION_DELIVERY_MAX_ITEMS,
+                SESSION_DELIVERY_MAX_BYTES,
+                SESSION_DELIVERY_MAX_ELAPSED,
+            ) else {
+                panic!("restarted assembly");
+            };
+            if !page.more {
+                break;
+            }
+        }
+        let frames: Vec<_> = receiver.try_iter().collect();
+        assert_eq!(frames.len(), 1);
+        match &frames[0] {
+            DaemonEntityFrame::Snapshot { items, .. } => {
+                let first = items
+                    .iter()
+                    .find(|item| {
+                        item.get("session_uuid").and_then(Value::as_str) == Some("session-00")
+                    })
+                    .expect("prefix row");
+                assert_eq!(first.get("updated_at").and_then(Value::as_u64), Some(9));
+                assert_eq!(items.len(), 24);
+            }
+            other => panic!("expected complete snapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oversized_first_snapshot_closes_the_subscription() {
+        let huge = SessionLifecycleRecord {
+            session: botster_core_daemon::DaemonSession {
+                session_id: SessionId("x".repeat(DAEMON_MAX_FRAME_BYTES)),
+                registry_state: RegistrySessionState::Running,
+                size: botster_core::ResizePayload { rows: 24, cols: 80 },
+                process: None,
+                updated_at: 1,
+            },
+            metadata: botster_core::CoreSessionMetadata::new(),
+            lifecycle: Some(SessionLifecycleState::Running),
+        };
+        let mut projection = crate::session_projection::SessionProjection::default();
+        projection.ingest_baseline_rows(1, [huge]);
+        projection.seal_baseline(SessionLifecycleCursor {
+            source_id: botster_core_daemon::SessionLifecycleSourceId("s".into()),
+            sequence: 1,
+        });
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let mut state = EntitySubscriptionState {
+            sender: EntityFrameSender::Blocking(sender),
+            entity_type: "session".to_string(),
+            cursor: projection.cursor.clone(),
+            entities: BTreeMap::new(),
+            definition_generation: 0,
+            definition_entities: BTreeMap::new(),
+            resync_reason: None,
+            owner_grant_id: None,
+            package_last_applied_seq: None,
+            package_catching_up: false,
+            delivery_after: None,
+            delivery_phase: DeliveryPhase::Assembling { source_seq: 1 },
+            next_seq: 1,
+            assembled_items: Vec::new(),
+            assembled_item_bytes: 0,
+            needs_delivery: true,
+        };
+        let mut counters = DaemonLifecycleCounters::default();
+        let first = continue_session_snapshot_assembly(
+            "sub",
+            &mut state,
+            &projection,
+            &mut counters,
+            SESSION_DELIVERY_MAX_ITEMS,
+            SESSION_DELIVERY_MAX_BYTES,
+            SESSION_DELIVERY_MAX_ELAPSED,
+        );
+        assert!(matches!(
+            first,
+            SnapshotAssemble::Closed {
+                frame_too_large: true
+            }
+        ));
+        let frames: Vec<_> = receiver.try_iter().collect();
+        assert_eq!(frames.len(), 1);
+        assert!(matches!(
+            &frames[0],
+            DaemonEntityFrame::Error { code, .. } if code == "entity_provider_frame_too_large"
+        ));
+        assert!(!state.needs_delivery);
+        assert!(state.resync_reason.is_none());
+    }
+
+    #[test]
+    fn no_removal_scan_stays_within_owner_turn() {
+        let record = |id: String| SessionLifecycleRecord {
+            session: botster_core_daemon::DaemonSession {
+                session_id: SessionId(id),
+                registry_state: RegistrySessionState::Running,
+                size: botster_core::ResizePayload { rows: 24, cols: 80 },
+                process: None,
+                updated_at: 1,
+            },
+            metadata: botster_core::CoreSessionMetadata::new(),
+            lifecycle: Some(SessionLifecycleState::Running),
+        };
+        let mut projection = crate::session_projection::SessionProjection::default();
+        projection.ingest_baseline_rows(
+            1,
+            (0..256).map(|index| record(format!("session-{index:03}"))),
+        );
+        projection.seal_baseline(SessionLifecycleCursor {
+            source_id: botster_core_daemon::SessionLifecycleSourceId("s".into()),
+            sequence: 1,
+        });
+        let (sender, _receiver) = mpsc::sync_channel(16);
+        let mut entities = BTreeMap::new();
+        for (id, row) in &projection.rows {
+            entities.insert(
+                id.clone(),
+                crate::session_projection::SessionProjection::project_entity(&row.record),
+            );
+        }
+        let mut state = EntitySubscriptionState {
+            sender: EntityFrameSender::Blocking(sender),
+            entity_type: "session".to_string(),
+            cursor: projection.cursor.clone(),
+            entities,
+            definition_generation: 0,
+            definition_entities: BTreeMap::new(),
+            resync_reason: None,
+            owner_grant_id: None,
+            package_last_applied_seq: None,
+            package_catching_up: false,
+            delivery_after: None,
+            delivery_phase: DeliveryPhase::Removes,
+            next_seq: 1,
+            assembled_items: Vec::new(),
+            assembled_item_bytes: 0,
+            needs_delivery: true,
+        };
+        let mut counters = DaemonLifecycleCounters::default();
+        let started = Instant::now();
+        let (alive, page) = deliver_projection_delta_page(
+            "sub",
+            &mut state,
+            &projection,
+            &mut counters,
+            SESSION_DELIVERY_MAX_ITEMS,
+            SESSION_DELIVERY_MAX_BYTES,
+            SESSION_DELIVERY_MAX_ELAPSED,
+        );
+        assert!(alive);
+        assert!(started.elapsed() < Duration::from_millis(crate::MAX_OWNER_TURN_MS));
+        assert!(page.more);
+        assert!(state.delivery_after.is_some());
+    }
+
+    #[test]
+    fn near_limit_snapshot_assembly_stays_within_owner_turn() {
+        let record = |id: String| SessionLifecycleRecord {
+            session: botster_core_daemon::DaemonSession {
+                session_id: SessionId(id),
+                registry_state: RegistrySessionState::Running,
+                size: botster_core::ResizePayload { rows: 24, cols: 80 },
+                process: None,
+                updated_at: 1,
+            },
+            metadata: botster_core::CoreSessionMetadata::new(),
+            lifecycle: Some(SessionLifecycleState::Running),
+        };
+        let mut projection = crate::session_projection::SessionProjection::default();
+        projection.ingest_baseline_rows(
+            1,
+            (0..20).map(|index| record(format!("s{index:02}-{}", "x".repeat(40 * 1024)))),
+        );
+        projection.seal_baseline(SessionLifecycleCursor {
+            source_id: botster_core_daemon::SessionLifecycleSourceId("s".into()),
+            sequence: 1,
+        });
+        let (sender, receiver) = mpsc::sync_channel(2);
+        let mut state = EntitySubscriptionState {
+            sender: EntityFrameSender::Blocking(sender),
+            entity_type: "session".to_string(),
+            cursor: projection.cursor.clone(),
+            entities: BTreeMap::new(),
+            definition_generation: 0,
+            definition_entities: BTreeMap::new(),
+            resync_reason: None,
+            owner_grant_id: None,
+            package_last_applied_seq: None,
+            package_catching_up: false,
+            delivery_after: None,
+            delivery_phase: DeliveryPhase::Assembling { source_seq: 1 },
+            next_seq: 1,
+            assembled_items: Vec::new(),
+            assembled_item_bytes: 0,
+            needs_delivery: true,
+        };
+        let mut counters = DaemonLifecycleCounters::default();
+        loop {
+            let started = Instant::now();
+            let SnapshotAssemble::Continue { page } = continue_session_snapshot_assembly(
+                "sub",
+                &mut state,
+                &projection,
+                &mut counters,
+                SESSION_DELIVERY_MAX_ITEMS,
+                SESSION_DELIVERY_MAX_BYTES,
+                SESSION_DELIVERY_MAX_ELAPSED,
+            ) else {
+                panic!("near-limit assembly");
+            };
+            assert!(started.elapsed() < Duration::from_millis(crate::MAX_OWNER_TURN_MS));
+            assert!(started.elapsed() < Duration::from_millis(crate::MAX_READY_OPERATION_WAIT_MS));
+            if page.more {
+                assert_eq!(receiver.try_iter().count(), 0);
+                assert!(!state.assembled_items.is_empty());
+            } else {
+                break;
+            }
+        }
+        assert!(state.assembled_items.is_empty());
+        let frames: Vec<_> = receiver.try_iter().collect();
+        assert_eq!(frames.len(), 1);
+        match &frames[0] {
+            DaemonEntityFrame::Snapshot { items, .. } => {
+                assert_eq!(items.len(), 20);
+                let encoded = serde_json::to_vec(frames.first().expect("frame"))
+                    .expect("encode")
+                    .len();
+                assert!(encoded <= DAEMON_MAX_FRAME_BYTES);
+            }
+            other => panic!("expected complete snapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_size_charges_json_array_separators() {
+        assert_eq!(snapshot_separator_bytes(0, 0), 0);
+        assert_eq!(snapshot_separator_bytes(0, 1), 0);
+        assert_eq!(snapshot_separator_bytes(0, 3), 2);
+        assert_eq!(snapshot_separator_bytes(4, 1), 1);
+        assert_eq!(snapshot_separator_bytes(4, 2), 2);
+    }
+
+    #[test]
+    fn separators_close_when_item_bytes_fit_but_commas_do_not() {
+        let record = |id: String| SessionLifecycleRecord {
+            session: botster_core_daemon::DaemonSession {
+                session_id: SessionId(id),
+                registry_state: RegistrySessionState::Running,
+                size: botster_core::ResizePayload { rows: 24, cols: 80 },
+                process: None,
+                updated_at: 1,
+            },
+            metadata: botster_core::CoreSessionMetadata::new(),
+            lifecycle: Some(SessionLifecycleState::Running),
+        };
+        let probe = serde_json::to_value(
+            crate::session_projection::SessionProjection::project_entity(&record("sep-00".into())),
+        )
+        .expect("probe");
+        let probe_len = serde_json::to_vec(&probe).expect("encode probe").len();
+        let envelope = {
+            let (sender, _receiver) = mpsc::sync_channel(1);
+            snapshot_envelope_bytes(
+                "sub",
+                &EntitySubscriptionState {
+                    sender: EntityFrameSender::Blocking(sender),
+                    entity_type: "session".to_string(),
+                    cursor: None,
+                    entities: BTreeMap::new(),
+                    definition_generation: 0,
+                    definition_entities: BTreeMap::new(),
+                    resync_reason: None,
+                    owner_grant_id: None,
+                    package_last_applied_seq: None,
+                    package_catching_up: false,
+                    delivery_after: None,
+                    delivery_phase: DeliveryPhase::Assembling { source_seq: 1 },
+                    next_seq: 1,
+                    assembled_items: Vec::new(),
+                    assembled_item_bytes: 0,
+                    needs_delivery: true,
+                },
+            )
+        };
+        let mut pad = DAEMON_MAX_FRAME_BYTES
+            .saturating_sub(envelope)
+            .saturating_div(2)
+            .saturating_sub(probe_len)
+            .saturating_add(64);
+        let projection = loop {
+            let mut projection = crate::session_projection::SessionProjection::default();
+            projection.ingest_baseline_rows(
+                1,
+                [
+                    record(format!("sep-00-{}", "y".repeat(pad))),
+                    record(format!("sep-01-{}", "y".repeat(pad))),
+                ],
+            );
+            projection.seal_baseline(SessionLifecycleCursor {
+                source_id: botster_core_daemon::SessionLifecycleSourceId("s".into()),
+                sequence: 1,
+            });
+            let encoded_items: Vec<_> = projection
+                .rows
+                .values()
+                .map(|row| {
+                    serde_json::to_value(
+                        crate::session_projection::SessionProjection::project_entity(&row.record),
+                    )
+                    .expect("item")
+                })
+                .collect();
+            let item_only = encoded_item_bytes(&encoded_items);
+            let without_commas = item_only.saturating_add(envelope);
+            let with_commas =
+                without_commas.saturating_add(snapshot_separator_bytes(0, encoded_items.len()));
+            if without_commas <= DAEMON_MAX_FRAME_BYTES && with_commas > DAEMON_MAX_FRAME_BYTES {
+                break projection;
+            }
+            if without_commas > DAEMON_MAX_FRAME_BYTES {
+                pad = pad.saturating_sub(8);
+            } else {
+                pad = pad.saturating_add(1);
+            }
+            assert!(pad > 32, "failed to find separator boundary pad");
+        };
+        let (sender, receiver) = mpsc::sync_channel(2);
+        let mut state = EntitySubscriptionState {
+            sender: EntityFrameSender::Blocking(sender),
+            entity_type: "session".to_string(),
+            cursor: projection.cursor.clone(),
+            entities: BTreeMap::new(),
+            definition_generation: 0,
+            definition_entities: BTreeMap::new(),
+            resync_reason: None,
+            owner_grant_id: None,
+            package_last_applied_seq: None,
+            package_catching_up: false,
+            delivery_after: None,
+            delivery_phase: DeliveryPhase::Assembling { source_seq: 1 },
+            next_seq: 1,
+            assembled_items: Vec::new(),
+            assembled_item_bytes: 0,
+            needs_delivery: true,
+        };
+        let mut counters = DaemonLifecycleCounters::default();
+        let result = continue_session_snapshot_assembly(
+            "sub",
+            &mut state,
+            &projection,
+            &mut counters,
+            8,
+            DAEMON_MAX_FRAME_BYTES,
+            Duration::from_millis(crate::MAX_OWNER_TURN_MS),
+        );
+        assert!(matches!(
+            result,
+            SnapshotAssemble::Closed {
+                frame_too_large: true
+            }
+        ));
+        let frames: Vec<_> = receiver.try_iter().collect();
+        assert!(matches!(
+            frames.first(),
+            Some(DaemonEntityFrame::Error { code, .. })
+                if code == "entity_provider_frame_too_large"
+        ));
     }
 }

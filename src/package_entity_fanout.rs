@@ -3,7 +3,7 @@
 //! Ownership: HubRuntime admits publish during `invoke_plugin` pumping.
 //! Daemon control fans out admitted frames and drives targeted provider resync.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use botster_core::{EntityFrame, EntityId, EntityKind};
@@ -167,6 +167,14 @@ pub struct PackageEntityPublishResult {
     pub resync_degraded: bool,
 }
 
+/// Exact causal-scope identity for one admitted mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntityMutationLease {
+    pub scope_id: u64,
+    pub family: String,
+    pub seq: u64,
+}
+
 /// Coalesced provider resync schedule for one family.
 #[derive(Debug, Clone)]
 pub struct PackageEntityResyncState {
@@ -176,6 +184,7 @@ pub struct PackageEntityResyncState {
     pub last_attempt_at: Option<Instant>,
     attempt_times: VecDeque<Instant>,
     pub degraded: bool,
+    pub leases: BTreeSet<(u64, String)>,
 }
 
 impl Default for PackageEntityResyncState {
@@ -187,6 +196,7 @@ impl Default for PackageEntityResyncState {
             last_attempt_at: None,
             attempt_times: VecDeque::new(),
             degraded: false,
+            leases: BTreeSet::new(),
         }
     }
 }
@@ -288,7 +298,9 @@ pub struct PackageEntityFamilyState {
     pub last_accepted_seq: u64,
     pub high_water_seq: u64,
     pub pending_by_seq: BTreeMap<u64, PackageEntityMutation>,
+    pub pending_leases: BTreeMap<u64, EntityMutationLease>,
     pub resync: PackageEntityResyncState,
+    pub unloading: bool,
 }
 
 impl PackageEntityFamilyState {
@@ -413,6 +425,65 @@ impl PackageEntityFamilyState {
             resync_needed: self.resync.needed,
             resync_degraded: self.resync.degraded,
         }
+    }
+
+    pub fn store_pending_lease(&mut self, lease: EntityMutationLease) {
+        self.pending_leases.insert(lease.seq, lease);
+    }
+
+    pub fn take_pending_lease(&mut self, seq: u64) -> Option<EntityMutationLease> {
+        self.pending_leases.remove(&seq)
+    }
+
+    /// Leases whose pending row is gone. Call after moving ready leases to fanout.
+    pub fn take_discarded_pending_leases(&mut self) -> Vec<EntityMutationLease> {
+        let seqs: Vec<u64> = self
+            .pending_leases
+            .keys()
+            .copied()
+            .filter(|seq| !self.pending_by_seq.contains_key(seq))
+            .collect();
+        seqs.into_iter()
+            .filter_map(|seq| self.pending_leases.remove(&seq))
+            .collect()
+    }
+
+    pub fn remember_resync_lease(&mut self, scope_id: u64, family: String) -> bool {
+        self.resync.leases.insert((scope_id, family))
+    }
+
+    pub fn forget_resync_lease(&mut self, scope_id: u64, family: &str) {
+        self.resync.leases.remove(&(scope_id, family.to_string()));
+    }
+
+    pub fn take_resync_leases(&mut self) -> BTreeSet<(u64, String)> {
+        std::mem::take(&mut self.resync.leases)
+    }
+
+    #[must_use]
+    pub fn active_scope_ids(&self) -> BTreeSet<u64> {
+        let mut ids: BTreeSet<u64> = self
+            .pending_leases
+            .values()
+            .map(|lease| lease.scope_id)
+            .collect();
+        ids.extend(self.resync.leases.iter().map(|(scope_id, _)| *scope_id));
+        ids
+    }
+
+    #[must_use]
+    pub fn provider_scope_id(&self) -> Option<u64> {
+        self.resync
+            .leases
+            .iter()
+            .map(|(scope_id, _)| *scope_id)
+            .next()
+            .or_else(|| {
+                self.pending_leases
+                    .values()
+                    .map(|lease| lease.scope_id)
+                    .next()
+            })
     }
 }
 
@@ -539,6 +610,48 @@ mod tests {
         assert_eq!(ready[0].snapshot_seq(), 2);
         assert_eq!(ready[1].snapshot_seq(), 3);
         assert_eq!(state.last_accepted_seq, 3);
+    }
+
+    #[test]
+    fn pending_and_resync_rows_keep_distinct_scope_identities() {
+        let mut state = PackageEntityFamilyState::default();
+        let now = Instant::now();
+        let (gap, ready) = state.admit(
+            PackageEntityMutation::Upsert {
+                entity_type: "f".into(),
+                snapshot_seq: 3,
+                id: "c".into(),
+                entity: json!({"id":"c"}),
+            },
+            now,
+        );
+        assert_eq!(gap.status, PackageEntityPublishStatus::PendingGap);
+        assert!(ready.is_empty());
+        state.store_pending_lease(EntityMutationLease {
+            scope_id: 7,
+            family: "f".into(),
+            seq: 3,
+        });
+        assert!(state.remember_resync_lease(7, "f".into()));
+        let (later, _) = state.admit(
+            PackageEntityMutation::Upsert {
+                entity_type: "f".into(),
+                snapshot_seq: 4,
+                id: "d".into(),
+                entity: json!({"id":"d"}),
+            },
+            now,
+        );
+        assert_eq!(later.status, PackageEntityPublishStatus::PendingGap);
+        state.store_pending_lease(EntityMutationLease {
+            scope_id: 8,
+            family: "f".into(),
+            seq: 4,
+        });
+        assert!(state.remember_resync_lease(8, "f".into()));
+        assert_eq!(state.active_scope_ids(), BTreeSet::from([7, 8]));
+        assert_eq!(state.pending_leases.get(&3).map(|lease| lease.seq), Some(3));
+        assert_eq!(state.provider_scope_id(), Some(7));
     }
 
     #[test]

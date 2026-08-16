@@ -6,10 +6,11 @@
 //! through `botster-core-daemon`.
 
 use botster_core::{
-    BotsterEngineObservation, BotsterEngineOutput, BoundaryJson, ClientId, CoreSession,
-    CoreSessionMetadata, EntityContract, EntityFrame, EntityKind, EnvelopeId, EnvelopeTarget,
-    ManagedSessionRuntimeError, ModeFreshnessToken, MultiplexerEngineError,
-    PluginCapabilityRuntime, PluginCleanupResult, PluginHandlerKind, PluginInvocationFailure,
+    BindTerminalAdapterError, BotsterEngineObservation, BotsterEngineOutput, BoundaryJson,
+    ClientId, CoreSession, CoreSessionMetadata, EntityContract, EntityFrame, EntityKind,
+    EnvelopeId, EnvelopeTarget, ManagedSessionRuntimeError, ModeFreshnessToken,
+    MultiplexerEngineError, PluginAdmissionResult, PluginCapabilityRuntime, PluginCleanupResult,
+    PluginCompletionDrain, PluginHandlerKind, PluginInvocationClass, PluginInvocationFailure,
     PluginInvocationFailureKind, PluginInvocationOutcome, PluginInvocationRequest,
     PluginInvocationResult, PluginKey, PluginWorkerDebugSnapshot, RequestId, Rgb, RoutedEnvelope,
     RoutedEnvelopeDrainOutcome, RoutedEnvelopePublishOutcome, SessionId, SessionLifecycleState,
@@ -57,8 +58,13 @@ use crate::managed_git_worktrees::{
     rollback_prepared_worktree,
 };
 use crate::package_entity_fanout::{
-    PackageEntityFamilyState, PackageEntityMutation, PackageEntityPublishResult,
-    coerce_entity_frame_empty_items, parse_publish_mutation,
+    EntityMutationLease, PackageEntityFamilyState, PackageEntityMutation,
+    PackageEntityPublishResult, PackageEntityPublishStatus, coerce_entity_frame_empty_items,
+    parse_publish_mutation,
+};
+use crate::package_event_router::{
+    CAUSAL_FLUSH_MAX, CAUSAL_PENDING_MAX, CausalAdmitResult, CausalOp, EventPlaneStatus,
+    EventSubscription, LeaseIdentity, release_or_retract,
 };
 use crate::packages::{PackageRecord, PackageRegistry, PackageRegistryError, PackageState};
 use crate::persistence::{FileHubStateStore, HubState, HubStateStore, HubStateStoreError};
@@ -95,15 +101,31 @@ pub struct HubRuntime {
     coordination_bridge: HubCoordinationBridge,
     entity_publish_bridge: HubEntityPublishBridge,
     package_entity_families: Arc<Mutex<BTreeMap<String, PackageEntityFamilyState>>>,
-    package_entity_fanout: Arc<Mutex<VecDeque<PackageEntityMutation>>>,
+    package_entity_fanout: Arc<Mutex<VecDeque<LeasedFanoutMutation>>>,
     last_capability_cleanup: Option<PluginCleanupResult>,
     session_contexts: SharedSessionContexts,
+    package_event_router: Arc<crate::package_event_router::PackageEventRouter>,
+    causal_scopes: Arc<crate::package_event_router::CausalScopeTable>,
+    unfinished_finishes: Mutex<VecDeque<CausalOp>>,
+    unfinished_overflow: Mutex<VecDeque<CausalOp>>,
+    unfinished_held: Mutex<VecDeque<CausalOp>>,
+    in_hand: std::cell::RefCell<Option<CausalOp>>,
+    retry_ops: std::cell::RefCell<VecDeque<CausalOp>>,
+    family_causal: std::cell::RefCell<VecDeque<CausalOp>>,
+    family_held: std::cell::RefCell<Option<CausalOp>>,
+    family_source: std::cell::RefCell<Option<CausalOp>>,
+    family_overflow: std::cell::RefCell<Option<CausalOp>>,
+    source_ops: std::cell::RefCell<VecDeque<CausalOp>>,
+    source_held: std::cell::RefCell<VecDeque<CausalOp>>,
+    unsettled_op: std::cell::RefCell<Option<CausalOp>>,
+    event_plane_owner_ops: std::cell::RefCell<crate::package_event_router::EventPlaneOwnerOps>,
 }
 
 type SharedCoreDaemon = Mutex<CoreDaemon>;
 type SharedSessionContexts = Arc<Mutex<BTreeMap<String, HubSessionContext>>>;
 const SESSION_TYPE_SPAWN_TIMEOUT_MS: u64 = 30_000;
 const PLUGIN_EVENT_TIMEOUT_MS: u64 = 1_000;
+const SOURCE_HELD_MAX: usize = 2;
 
 /// Shared hub-owned session-type spawn bridge exposed to Lua plugin workers.
 pub type SharedSessionTypeSpawner = Arc<HubSessionTypeSpawner>;
@@ -229,8 +251,11 @@ impl HubRuntime {
     pub fn new(config: HubConfig) -> Self {
         let state = HubState::from_config(&config);
         let core_config = core_daemon_config(&config);
-        let plugin_worker_config = config.core_engine.plugin_worker_config();
+        let plugin_worker_config = config.plugin_worker_config();
         let core_daemon = Mutex::new(CoreDaemon::new(core_config));
+        let package_event_router = Arc::new(crate::package_event_router::PackageEventRouter::new(
+            config.package_event_plane,
+        ));
         Self {
             capability_runtime: Arc::new(Mutex::new(HubCapabilityRuntime::from_config(&config))),
             spawn_targets: Arc::new(Mutex::new(state.spawn_targets.clone())),
@@ -249,6 +274,23 @@ impl HubRuntime {
             plugin_lifecycle: HubPluginLifecycle::with_config(plugin_worker_config),
             last_capability_cleanup: None,
             session_contexts: Arc::new(Mutex::new(BTreeMap::new())),
+            package_event_router,
+            causal_scopes: Arc::new(crate::package_event_router::CausalScopeTable::new()),
+            unfinished_finishes: Mutex::new(VecDeque::new()),
+            unfinished_overflow: Mutex::new(VecDeque::new()),
+            unfinished_held: Mutex::new(VecDeque::new()),
+            in_hand: std::cell::RefCell::new(None),
+            retry_ops: std::cell::RefCell::new(VecDeque::new()),
+            family_causal: std::cell::RefCell::new(VecDeque::new()),
+            family_held: std::cell::RefCell::new(None),
+            family_source: std::cell::RefCell::new(None),
+            family_overflow: std::cell::RefCell::new(None),
+            source_ops: std::cell::RefCell::new(VecDeque::new()),
+            source_held: std::cell::RefCell::new(VecDeque::new()),
+            unsettled_op: std::cell::RefCell::new(None),
+            event_plane_owner_ops: std::cell::RefCell::new(
+                crate::package_event_router::EventPlaneOwnerOps::default(),
+            ),
         }
     }
 
@@ -304,8 +346,11 @@ impl HubRuntime {
 
     fn from_validated_state(config: HubConfig, state: HubState) -> HubRuntimeResult<Self> {
         let core_config = core_daemon_config(&config);
-        let plugin_worker_config = config.core_engine.plugin_worker_config();
+        let plugin_worker_config = config.plugin_worker_config();
         let core_daemon = Mutex::new(CoreDaemon::new(core_config));
+        let package_event_router = Arc::new(crate::package_event_router::PackageEventRouter::new(
+            config.package_event_plane,
+        ));
         let mut runtime = Self {
             capability_runtime: Arc::new(Mutex::new(HubCapabilityRuntime::from_config(&config))),
             spawn_targets: Arc::new(Mutex::new(state.spawn_targets.clone())),
@@ -324,6 +369,23 @@ impl HubRuntime {
             plugin_lifecycle: HubPluginLifecycle::with_config(plugin_worker_config),
             last_capability_cleanup: None,
             session_contexts: Arc::new(Mutex::new(BTreeMap::new())),
+            package_event_router,
+            causal_scopes: Arc::new(crate::package_event_router::CausalScopeTable::new()),
+            unfinished_finishes: Mutex::new(VecDeque::new()),
+            unfinished_overflow: Mutex::new(VecDeque::new()),
+            unfinished_held: Mutex::new(VecDeque::new()),
+            in_hand: std::cell::RefCell::new(None),
+            retry_ops: std::cell::RefCell::new(VecDeque::new()),
+            family_causal: std::cell::RefCell::new(VecDeque::new()),
+            family_held: std::cell::RefCell::new(None),
+            family_source: std::cell::RefCell::new(None),
+            family_overflow: std::cell::RefCell::new(None),
+            source_ops: std::cell::RefCell::new(VecDeque::new()),
+            source_held: std::cell::RefCell::new(VecDeque::new()),
+            unsettled_op: std::cell::RefCell::new(None),
+            event_plane_owner_ops: std::cell::RefCell::new(
+                crate::package_event_router::EventPlaneOwnerOps::default(),
+            ),
         };
         runtime.reconcile_sessions(0)?;
         Ok(runtime)
@@ -422,7 +484,893 @@ impl HubRuntime {
             session_types: self.session_type_spawner.clone(),
             spawn_targets: self.spawn_targets.clone(),
             worktrees: self.worktrees.clone(),
+            package_event_router: self.package_event_router.clone(),
+            causal_scopes: self.causal_scopes.clone(),
         }
+    }
+
+    #[must_use]
+    pub fn package_event_router(&self) -> &Arc<crate::package_event_router::PackageEventRouter> {
+        &self.package_event_router
+    }
+
+    #[must_use]
+    pub fn causal_scopes(&self) -> &Arc<crate::package_event_router::CausalScopeTable> {
+        &self.causal_scopes
+    }
+
+    pub fn record_event_plane_owner_op(&self, op: crate::package_event_router::OwnerOp) {
+        self.event_plane_owner_ops.borrow_mut().record(op);
+        let _ = self
+            .event_plane_owner_ops
+            .borrow_mut()
+            .apply_ready(&self.package_event_router);
+    }
+
+    #[must_use]
+    pub fn event_plane_owner_ops_pending(&self) -> bool {
+        !self.event_plane_owner_ops.borrow().is_empty()
+            || self.causal_scopes.pending_ops()
+            || self.entity_publish_bridge.has_pending_releases()
+            || self
+                .unfinished_finishes
+                .lock()
+                .map(|pending| !pending.is_empty())
+                .unwrap_or(false)
+            || self
+                .unfinished_overflow
+                .lock()
+                .map(|pending| !pending.is_empty())
+                .unwrap_or(false)
+            || self
+                .unfinished_held
+                .lock()
+                .map(|pending| !pending.is_empty())
+                .unwrap_or(false)
+            || self.has_finish_only_fanout()
+            || self.in_hand.borrow().is_some()
+            || !self.retry_ops.borrow().is_empty()
+            || !self.family_causal.borrow().is_empty()
+            || self.family_held.borrow().is_some()
+            || self.family_source.borrow().is_some()
+            || self.family_overflow.borrow().is_some()
+            || !self.source_ops.borrow().is_empty()
+            || !self.source_held.borrow().is_empty()
+            || self.unsettled_op.borrow().is_some()
+            || self.has_family_leftovers()
+    }
+
+    pub fn apply_event_plane_owner_ops(&self) -> Vec<crate::package_event_router::OwnerOp> {
+        let _ = self.causal_scopes.flush_pending();
+        self.retry_unsettled();
+        self.retry_in_hand();
+        self.retry_owner_ops();
+        self.retry_family_causal();
+        self.retry_unloading_families();
+        self.harvest_publish_releases();
+        self.retry_unfinished_finishes();
+        self.retry_finish_only_fanout();
+        let _ = self.causal_scopes.flush_pending();
+        self.event_plane_owner_ops
+            .borrow_mut()
+            .apply_ready(&self.package_event_router)
+    }
+
+    /// Admit a required causal op. Retry means the caller still owns it.
+    pub fn admit_causal_op(&self, op: CausalOp) -> CausalAdmitResult {
+        self.causal_scopes.try_admit(op)
+    }
+
+    fn harvest_publish_releases(&self) {
+        let started = Instant::now();
+        let mut applied = 0;
+        while applied < CAUSAL_FLUSH_MAX && started.elapsed() < Duration::from_millis(8) {
+            if self.in_hand.borrow().is_some() {
+                break;
+            }
+            let Some(op) = self.entity_publish_bridge.take_release() else {
+                break;
+            };
+            if let CausalAdmitResult::Retry(op) = self.causal_scopes.try_admit(op) {
+                let _ = self.keep_or_park(CausalAdmitResult::Retry(op));
+                break;
+            }
+            applied += 1;
+        }
+    }
+
+    fn retry_unfinished_finishes(&self) {
+        let started = Instant::now();
+        let mut applied = 0;
+        self.drain_unfinished(&self.unfinished_finishes, &mut applied, started);
+        if applied < CAUSAL_FLUSH_MAX && started.elapsed() < Duration::from_millis(8) {
+            self.drain_unfinished(&self.unfinished_overflow, &mut applied, started);
+        }
+        if applied < CAUSAL_FLUSH_MAX && started.elapsed() < Duration::from_millis(8) {
+            self.drain_unfinished(&self.unfinished_held, &mut applied, started);
+        }
+    }
+
+    fn drain_unfinished(
+        &self,
+        queue: &Mutex<VecDeque<CausalOp>>,
+        applied: &mut usize,
+        started: Instant,
+    ) {
+        let Ok(mut pending) = queue.lock() else {
+            return;
+        };
+        let mut leftover = VecDeque::new();
+        while *applied < CAUSAL_FLUSH_MAX && started.elapsed() < Duration::from_millis(8) {
+            let Some(op) = pending.pop_front() else {
+                break;
+            };
+            match self.causal_scopes.try_admit(op) {
+                CausalAdmitResult::Applied => *applied += 1,
+                CausalAdmitResult::Retry(op) => {
+                    leftover.push_front(op);
+                    break;
+                }
+            }
+        }
+        leftover.append(&mut pending);
+        *pending = leftover;
+    }
+
+    fn keep_unfinished_finish(&self, op: CausalOp) -> CausalAdmitResult {
+        if let Ok(mut pending) = self.unfinished_finishes.lock()
+            && pending.len() < CAUSAL_PENDING_MAX
+        {
+            pending.push_back(op);
+            return CausalAdmitResult::Applied;
+        }
+        if let Ok(mut overflow) = self.unfinished_overflow.lock()
+            && overflow.len() < CAUSAL_PENDING_MAX
+        {
+            overflow.push_back(op);
+            return CausalAdmitResult::Applied;
+        }
+        if let Ok(mut held) = self.unfinished_held.lock()
+            && held.len() < CAUSAL_PENDING_MAX
+        {
+            held.push_back(op);
+            return CausalAdmitResult::Applied;
+        }
+        CausalAdmitResult::Retry(op)
+    }
+
+    fn keep_if_retry(&self, result: CausalAdmitResult) -> CausalAdmitResult {
+        match result {
+            CausalAdmitResult::Applied => CausalAdmitResult::Applied,
+            CausalAdmitResult::Retry(op) => self.keep_unfinished_finish(op),
+        }
+    }
+
+    fn keep_or_retract(&self, result: CausalAdmitResult) -> CausalAdmitResult {
+        let CausalAdmitResult::Retry(op) = self.keep_if_retry(result) else {
+            return CausalAdmitResult::Applied;
+        };
+        match op {
+            CausalOp::Release { scope_id, identity } => {
+                if self.causal_scopes.try_retract(scope_id, identity.clone()) {
+                    CausalAdmitResult::Applied
+                } else {
+                    self.keep_unfinished_finish(CausalOp::Release { scope_id, identity })
+                }
+            }
+            op => self.keep_unfinished_finish(op),
+        }
+    }
+
+    fn keep_owned(&self, result: CausalAdmitResult) -> CausalAdmitResult {
+        if let CausalAdmitResult::Retry(op) = self.keep_or_retract(result)
+            && let CausalAdmitResult::Retry(op) = self.entity_publish_bridge.mark_orphan(op)
+        {
+            return self.entity_publish_bridge.leave_source(op);
+        }
+        CausalAdmitResult::Applied
+    }
+
+    fn keep_or_park(&self, result: CausalAdmitResult) -> CausalAdmitResult {
+        if let CausalAdmitResult::Retry(op) = self.keep_owned(result)
+            && let CausalAdmitResult::Retry(op) = self.entity_publish_bridge.park_release(op)
+        {
+            return self.hold_in_hand(op);
+        }
+        CausalAdmitResult::Applied
+    }
+
+    fn hold_in_hand(&self, op: CausalOp) -> CausalAdmitResult {
+        let mut held = self.in_hand.borrow_mut();
+        if held.is_none() {
+            *held = Some(op);
+            CausalAdmitResult::Applied
+        } else {
+            CausalAdmitResult::Retry(op)
+        }
+    }
+
+    fn retry_in_hand(&self) {
+        let Some(op) = self.in_hand.borrow_mut().take() else {
+            return;
+        };
+        if let CausalAdmitResult::Retry(op) = self.keep_owned(CausalAdmitResult::Retry(op))
+            && let CausalAdmitResult::Retry(op) = self.entity_publish_bridge.park_release(op)
+        {
+            let _ = self.hold_in_hand(op);
+        }
+    }
+
+    fn enqueue_retry(&self, result: CausalAdmitResult) -> CausalAdmitResult {
+        if let CausalAdmitResult::Retry(op) = self.keep_or_park(result) {
+            let mut pending = self.retry_ops.borrow_mut();
+            if pending.len() < CAUSAL_PENDING_MAX {
+                pending.push_back(op);
+                return CausalAdmitResult::Applied;
+            }
+            return CausalAdmitResult::Retry(op);
+        }
+        CausalAdmitResult::Applied
+    }
+
+    fn retry_owner_ops(&self) {
+        let started = Instant::now();
+        let mut applied = 0;
+        let mut pending = std::mem::take(&mut *self.retry_ops.borrow_mut());
+        let mut leftover = VecDeque::new();
+        while let Some(op) = pending.pop_front() {
+            if applied >= CAUSAL_FLUSH_MAX || started.elapsed() >= Duration::from_millis(8) {
+                leftover.push_back(op);
+                leftover.append(&mut pending);
+                break;
+            }
+            match self.keep_or_park(CausalAdmitResult::Retry(op)) {
+                CausalAdmitResult::Applied => applied += 1,
+                CausalAdmitResult::Retry(op) => {
+                    leftover.push_back(op);
+                    leftover.append(&mut pending);
+                    break;
+                }
+            }
+        }
+        self.retry_ops.borrow_mut().append(&mut leftover);
+    }
+
+    fn family_has_retry_work(family: &PackageEntityFamilyState) -> bool {
+        family.unloading || (!family.resync.needed && !family.resync.leases.is_empty())
+    }
+
+    fn has_family_leftovers(&self) -> bool {
+        self.package_entity_families
+            .lock()
+            .map(|families| families.values().any(Self::family_has_retry_work))
+            .unwrap_or(false)
+    }
+
+    fn keep_source_op(&self, op: CausalOp) -> CausalAdmitResult {
+        let mut pending = self.source_ops.borrow_mut();
+        if pending.len() < CAUSAL_PENDING_MAX {
+            pending.push_back(op);
+            CausalAdmitResult::Applied
+        } else {
+            CausalAdmitResult::Retry(op)
+        }
+    }
+
+    fn reject_unsent(&self, op: CausalOp) -> CausalAdmitResult {
+        match op {
+            CausalOp::Release { scope_id, identity } => {
+                if self.causal_scopes.try_retract(scope_id, identity.clone()) {
+                    CausalAdmitResult::Applied
+                } else {
+                    CausalAdmitResult::Retry(CausalOp::Release { scope_id, identity })
+                }
+            }
+            op => CausalAdmitResult::Retry(op),
+        }
+    }
+
+    fn hold_source_retry(&self, op: CausalOp) -> CausalAdmitResult {
+        let mut held = self.source_held.borrow_mut();
+        if held.len() < SOURCE_HELD_MAX {
+            held.push_back(op);
+            CausalAdmitResult::Applied
+        } else {
+            CausalAdmitResult::Retry(op)
+        }
+    }
+
+    fn keep_or_reject(&self, op: CausalOp) -> CausalAdmitResult {
+        if let CausalAdmitResult::Retry(op) = self.keep_source_op(op) {
+            if matches!(op, CausalOp::Transfer { .. }) {
+                return self.hold_source_retry(op);
+            }
+            if let CausalAdmitResult::Retry(op) = self.reject_unsent(op) {
+                return self.hold_source_retry(op);
+            }
+        }
+        CausalAdmitResult::Applied
+    }
+
+    fn hold_unsettled(&self, op: CausalOp) -> CausalAdmitResult {
+        let mut held = self.unsettled_op.borrow_mut();
+        if held.is_none() {
+            *held = Some(op);
+            CausalAdmitResult::Applied
+        } else {
+            CausalAdmitResult::Retry(op)
+        }
+    }
+
+    fn park_production(&self, result: CausalAdmitResult) -> CausalAdmitResult {
+        if let CausalAdmitResult::Retry(op) = self.enqueue_or_family(result)
+            && let CausalAdmitResult::Retry(op) = self.keep_or_reject(op)
+        {
+            return self.hold_unsettled(op);
+        }
+        CausalAdmitResult::Applied
+    }
+
+    fn leftover_slot_available(&self) -> bool {
+        self.unsettled_op.borrow().is_none()
+            || self.in_hand.borrow().is_none()
+            || self.family_held.borrow().is_none()
+            || self.family_source.borrow().is_none()
+            || self.family_overflow.borrow().is_none()
+            || self.retry_ops.borrow().len() < CAUSAL_PENDING_MAX
+            || self.family_causal.borrow().len() < CAUSAL_PENDING_MAX
+            || self.source_ops.borrow().len() < CAUSAL_PENDING_MAX
+            || self.source_held.borrow().len() < SOURCE_HELD_MAX
+            || self.unfinished_has_room()
+            || self.entity_publish_bridge.has_release_room()
+    }
+
+    fn unfinished_has_room(&self) -> bool {
+        self.unfinished_finishes
+            .lock()
+            .map(|pending| pending.len() < CAUSAL_PENDING_MAX)
+            .unwrap_or(false)
+            || self
+                .unfinished_overflow
+                .lock()
+                .map(|pending| pending.len() < CAUSAL_PENDING_MAX)
+                .unwrap_or(false)
+            || self
+                .unfinished_held
+                .lock()
+                .map(|pending| pending.len() < CAUSAL_PENDING_MAX)
+                .unwrap_or(false)
+    }
+
+    fn retry_unsettled(&self) {
+        let Some(op) = self.unsettled_op.borrow_mut().take() else {
+            return;
+        };
+        match self.causal_scopes.try_admit(op) {
+            CausalAdmitResult::Applied => {}
+            CausalAdmitResult::Retry(op) => {
+                if let CausalAdmitResult::Retry(op) =
+                    self.enqueue_or_family(CausalAdmitResult::Retry(op))
+                    && let CausalAdmitResult::Retry(op) = self.keep_or_reject(op)
+                {
+                    let _ = self.hold_unsettled(op);
+                }
+            }
+        }
+    }
+
+    fn park_on_family(&self, op: CausalOp) -> CausalAdmitResult {
+        let mut pending = self.family_causal.borrow_mut();
+        if pending.len() < CAUSAL_PENDING_MAX {
+            pending.push_back(op);
+            CausalAdmitResult::Applied
+        } else {
+            CausalAdmitResult::Retry(op)
+        }
+    }
+
+    fn hold_family(&self, op: CausalOp) -> CausalAdmitResult {
+        let mut held = self.family_held.borrow_mut();
+        if held.is_none() {
+            *held = Some(op);
+            CausalAdmitResult::Applied
+        } else {
+            CausalAdmitResult::Retry(op)
+        }
+    }
+
+    fn hold_source(&self, op: CausalOp) -> CausalAdmitResult {
+        let mut source = self.family_source.borrow_mut();
+        if source.is_none() {
+            *source = Some(op);
+            CausalAdmitResult::Applied
+        } else {
+            CausalAdmitResult::Retry(op)
+        }
+    }
+
+    fn hold_overflow(&self, op: CausalOp) -> CausalAdmitResult {
+        let mut overflow = self.family_overflow.borrow_mut();
+        if overflow.is_none() {
+            *overflow = Some(op);
+            CausalAdmitResult::Applied
+        } else {
+            CausalAdmitResult::Retry(op)
+        }
+    }
+
+    fn enqueue_or_family(&self, result: CausalAdmitResult) -> CausalAdmitResult {
+        if let CausalAdmitResult::Retry(op) = self.enqueue_retry(result)
+            && let CausalAdmitResult::Retry(op) = self.park_on_family(op)
+            && let CausalAdmitResult::Retry(op) = self.hold_family(op)
+            && let CausalAdmitResult::Retry(op) = self.hold_source(op)
+        {
+            return self.hold_overflow(op);
+        }
+        CausalAdmitResult::Applied
+    }
+
+    fn retry_one_held(
+        &self,
+        slot: &std::cell::RefCell<Option<CausalOp>>,
+        applied: &mut usize,
+        started: Instant,
+    ) {
+        if *applied >= CAUSAL_FLUSH_MAX || started.elapsed() >= Duration::from_millis(8) {
+            return;
+        }
+        let Some(op) = slot.borrow_mut().take() else {
+            return;
+        };
+        match self.enqueue_retry(CausalAdmitResult::Retry(op)) {
+            CausalAdmitResult::Applied => *applied += 1,
+            CausalAdmitResult::Retry(op) => *slot.borrow_mut() = Some(op),
+        }
+    }
+
+    fn retry_family_causal(&self) {
+        let started = Instant::now();
+        let mut applied = 0;
+        let mut pending = std::mem::take(&mut *self.family_causal.borrow_mut());
+        let mut leftover = VecDeque::new();
+        while let Some(op) = pending.pop_front() {
+            if applied >= CAUSAL_FLUSH_MAX || started.elapsed() >= Duration::from_millis(8) {
+                leftover.push_back(op);
+                leftover.append(&mut pending);
+                break;
+            }
+            match self.enqueue_retry(CausalAdmitResult::Retry(op)) {
+                CausalAdmitResult::Applied => applied += 1,
+                CausalAdmitResult::Retry(op) => {
+                    leftover.push_back(op);
+                    leftover.append(&mut pending);
+                    break;
+                }
+            }
+        }
+        self.family_causal.borrow_mut().append(&mut leftover);
+        self.retry_one_held(&self.family_held, &mut applied, started);
+        self.retry_one_held(&self.family_source, &mut applied, started);
+        self.retry_one_held(&self.family_overflow, &mut applied, started);
+        let mut pending = std::mem::take(&mut *self.source_held.borrow_mut());
+        let mut leftover = VecDeque::new();
+        while let Some(op) = pending.pop_front() {
+            if applied >= CAUSAL_FLUSH_MAX || started.elapsed() >= Duration::from_millis(8) {
+                leftover.push_back(op);
+                leftover.append(&mut pending);
+                break;
+            }
+            match self.enqueue_retry(CausalAdmitResult::Retry(op)) {
+                CausalAdmitResult::Applied => applied += 1,
+                CausalAdmitResult::Retry(op) => {
+                    leftover.push_back(op);
+                    leftover.append(&mut pending);
+                    break;
+                }
+            }
+        }
+        self.source_held.borrow_mut().append(&mut leftover);
+        let mut pending = std::mem::take(&mut *self.source_ops.borrow_mut());
+        let mut leftover = VecDeque::new();
+        while let Some(op) = pending.pop_front() {
+            if applied >= CAUSAL_FLUSH_MAX || started.elapsed() >= Duration::from_millis(8) {
+                leftover.push_back(op);
+                leftover.append(&mut pending);
+                break;
+            }
+            match self.enqueue_retry(CausalAdmitResult::Retry(op)) {
+                CausalAdmitResult::Applied => applied += 1,
+                CausalAdmitResult::Retry(op) => {
+                    leftover.push_back(op);
+                    leftover.append(&mut pending);
+                    break;
+                }
+            }
+        }
+        self.source_ops.borrow_mut().append(&mut leftover);
+    }
+
+    fn retry_unloading_families(&self) {
+        let started = Instant::now();
+        let mut applied = 0;
+        let Ok(mut state) = self.package_entity_families.lock() else {
+            return;
+        };
+        let mut names = Vec::new();
+        for (name, family) in state.iter() {
+            if applied >= CAUSAL_FLUSH_MAX || started.elapsed() >= Duration::from_millis(8) {
+                break;
+            }
+            if !Self::family_has_retry_work(family) {
+                continue;
+            }
+            names.push(name.clone());
+            if names.len() >= CAUSAL_FLUSH_MAX {
+                break;
+            }
+        }
+        let mut remove = Vec::new();
+        for name in names {
+            if applied >= CAUSAL_FLUSH_MAX || started.elapsed() >= Duration::from_millis(8) {
+                break;
+            }
+            let Some(family) = state.get_mut(&name) else {
+                continue;
+            };
+            if family.unloading {
+                let mut pending_leases = std::mem::take(&mut family.pending_leases);
+                let mut leftover = BTreeMap::new();
+                loop {
+                    if applied >= CAUSAL_FLUSH_MAX || started.elapsed() >= Duration::from_millis(8)
+                    {
+                        leftover.append(&mut pending_leases);
+                        break;
+                    }
+                    let Some((seq, lease)) = pending_leases.pop_first() else {
+                        break;
+                    };
+                    applied += 1;
+                    if let CausalAdmitResult::Retry(_) =
+                        self.enqueue_retry(self.admit_causal_op(CausalOp::Release {
+                            scope_id: lease.scope_id,
+                            identity: LeaseIdentity::AdmittedEntityMutation {
+                                family: lease.family.clone(),
+                                seq: lease.seq,
+                            },
+                        }))
+                    {
+                        leftover.insert(seq, lease);
+                    }
+                }
+                family.pending_leases = leftover;
+            }
+            if family.unloading || !family.resync.needed {
+                for (scope_id, family_name) in
+                    self.release_resync_leases(family.take_resync_leases(), &mut applied, started)
+                {
+                    family.remember_resync_lease(scope_id, family_name);
+                }
+            }
+            if family.unloading
+                && family.pending_leases.is_empty()
+                && family.resync.leases.is_empty()
+            {
+                remove.push(name);
+            }
+        }
+        for name in remove {
+            state.remove(&name);
+        }
+    }
+
+    fn has_finish_only_fanout(&self) -> bool {
+        self.package_entity_fanout
+            .lock()
+            .map(|pending| pending.iter().any(|item| item.finish_only))
+            .unwrap_or(false)
+    }
+
+    fn retry_finish_only_fanout(&self) {
+        let items: Vec<TakenPackageEntityMutation> = {
+            let Ok(mut fanout) = self.package_entity_fanout.lock() else {
+                return;
+            };
+            let mut kept = VecDeque::new();
+            let mut retry = Vec::new();
+            while let Some(item) = fanout.pop_front() {
+                if item.finish_only {
+                    retry.push(TakenPackageEntityMutation {
+                        mutation: item.mutation,
+                        lease: item.lease,
+                        finish_only: true,
+                        scheduled_resync: item.scheduled_resync,
+                    });
+                } else {
+                    kept.push_back(item);
+                }
+            }
+            *fanout = kept;
+            retry
+        };
+        for item in items {
+            self.finish_package_entity_mutation_fanout(&item, item.scheduled_resync);
+        }
+    }
+
+    fn restore_fanout_finish(&self, item: &TakenPackageEntityMutation, scheduled_resync: bool) {
+        if let Ok(mut fanout) = self.package_entity_fanout.lock() {
+            fanout.push_back(LeasedFanoutMutation {
+                mutation: item.mutation.clone(),
+                lease: item.lease.clone(),
+                finish_only: true,
+                scheduled_resync,
+            });
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn keep_causal_op(&self, op: CausalOp) -> CausalAdmitResult {
+        self.keep_if_retry(CausalAdmitResult::Retry(op))
+    }
+
+    #[doc(hidden)]
+    pub fn keep_owned_op(&self, op: CausalOp) -> CausalAdmitResult {
+        self.enqueue_retry(CausalAdmitResult::Retry(op))
+    }
+
+    #[doc(hidden)]
+    pub fn test_store_pending_lease(&self, scope_id: u64, family: &str, seq: u64) {
+        self.package_entity_families
+            .lock()
+            .expect("package entity family lock")
+            .entry(family.to_string())
+            .or_default()
+            .store_pending_lease(crate::package_entity_fanout::EntityMutationLease {
+                scope_id,
+                family: family.to_string(),
+                seq,
+            });
+    }
+
+    #[doc(hidden)]
+    pub fn test_family_unloading(&self, family: &str) -> bool {
+        self.package_entity_families
+            .lock()
+            .expect("package entity family lock")
+            .get(family)
+            .is_some_and(|state| state.unloading)
+    }
+
+    #[doc(hidden)]
+    pub fn test_unloading_lease_count(&self, family: &str) -> usize {
+        self.package_entity_families
+            .lock()
+            .expect("package entity family lock")
+            .get(family)
+            .map(|state| state.pending_leases.len())
+            .unwrap_or(0)
+    }
+
+    #[doc(hidden)]
+    pub fn test_retry_ops_len(&self) -> usize {
+        self.retry_ops.borrow().len()
+    }
+
+    #[doc(hidden)]
+    pub fn test_enqueue_or_family(&self, _family: &str, op: CausalOp) -> CausalAdmitResult {
+        if let CausalAdmitResult::Retry(op) = self.enqueue_or_family(CausalAdmitResult::Retry(op)) {
+            return self.keep_or_reject(op);
+        }
+        CausalAdmitResult::Applied
+    }
+
+    #[must_use]
+    #[doc(hidden)]
+    pub fn test_source_ops_len(&self) -> usize {
+        self.source_ops.borrow().len()
+    }
+
+    #[doc(hidden)]
+    pub fn test_keep_source_op(&self, op: CausalOp) -> CausalAdmitResult {
+        self.keep_or_reject(op)
+    }
+
+    #[must_use]
+    #[doc(hidden)]
+    pub fn test_source_held(&self) -> bool {
+        !self.source_held.borrow().is_empty()
+    }
+
+    #[must_use]
+    #[doc(hidden)]
+    pub fn test_source_held_len(&self) -> usize {
+        self.source_held.borrow().len()
+    }
+
+    #[must_use]
+    #[doc(hidden)]
+    pub fn test_unsettled(&self) -> bool {
+        self.unsettled_op.borrow().is_some()
+    }
+
+    #[must_use]
+    #[doc(hidden)]
+    pub fn test_leftover_slot_available(&self) -> bool {
+        self.leftover_slot_available()
+    }
+
+    #[doc(hidden)]
+    pub fn test_fulfill_pending_publishes(&self) {
+        self.fulfill_pending_entity_publish_requests();
+    }
+
+    #[doc(hidden)]
+    pub fn test_admit_publish(
+        &self,
+        plugin_key: &str,
+        frame: serde_json::Value,
+        scope_id: Option<u64>,
+    ) -> Result<PackageEntityPublishResult, String> {
+        self.admit_package_entity_publish(PluginKey(plugin_key.to_string()), frame, scope_id)
+    }
+
+    #[doc(hidden)]
+    pub fn test_settle_publish(
+        &self,
+        family: &str,
+        scope_id: u64,
+        plugin_key: &str,
+        seq: u64,
+        resync_needed: bool,
+    ) {
+        let result = crate::package_entity_fanout::PackageEntityPublishResult {
+            ok: true,
+            status: crate::package_entity_fanout::PackageEntityPublishStatus::Accepted,
+            last_accepted_seq: seq,
+            high_water_seq: seq,
+            resync_needed,
+            resync_degraded: false,
+        };
+        let mut state = self
+            .package_entity_families
+            .lock()
+            .expect("package entity family lock");
+        let entry = state.entry(family.to_string()).or_default();
+        self.settle_entity_publish_lease(entry, scope_id, plugin_key, family, seq, &result);
+    }
+
+    #[doc(hidden)]
+    pub fn test_park_family_causal(&self, op: CausalOp) -> CausalAdmitResult {
+        self.park_on_family(op)
+    }
+
+    #[must_use]
+    #[doc(hidden)]
+    pub fn test_family_causal_len(&self) -> usize {
+        self.family_causal.borrow().len()
+    }
+
+    #[must_use]
+    #[doc(hidden)]
+    pub fn test_family_held(&self) -> bool {
+        self.family_held.borrow().is_some()
+    }
+
+    #[must_use]
+    #[doc(hidden)]
+    pub fn test_family_source(&self) -> bool {
+        self.family_source.borrow().is_some()
+    }
+
+    #[doc(hidden)]
+    pub fn test_hold_family(&self, op: CausalOp) -> CausalAdmitResult {
+        self.hold_family(op)
+    }
+
+    #[doc(hidden)]
+    pub fn test_hold_source(&self, op: CausalOp) -> CausalAdmitResult {
+        self.hold_source(op)
+    }
+
+    #[must_use]
+    #[doc(hidden)]
+    pub fn test_family_overflow(&self) -> bool {
+        self.family_overflow.borrow().is_some()
+    }
+
+    #[doc(hidden)]
+    pub fn test_store_resync_lease(&self, scope_id: u64, family: &str) {
+        self.package_entity_families
+            .lock()
+            .expect("package entity family lock")
+            .entry(family.to_string())
+            .or_default()
+            .remember_resync_lease(scope_id, family.to_string());
+    }
+
+    #[must_use]
+    #[doc(hidden)]
+    pub fn test_resync_lease_count(&self, family: &str) -> usize {
+        self.package_entity_families
+            .lock()
+            .expect("package entity family lock")
+            .get(family)
+            .map(|state| state.resync.leases.len())
+            .unwrap_or(0)
+    }
+
+    #[must_use]
+    #[doc(hidden)]
+    pub fn test_family_seq(&self, family: &str) -> u64 {
+        self.package_entity_families
+            .lock()
+            .expect("package entity family lock")
+            .get(family)
+            .map(|state| state.last_accepted_seq)
+            .unwrap_or(0)
+    }
+
+    #[doc(hidden)]
+    pub fn test_set_family_seq(&self, family: &str, seq: u64) {
+        let mut state = self
+            .package_entity_families
+            .lock()
+            .expect("package entity family lock");
+        let entry = state.entry(family.to_string()).or_default();
+        entry.last_accepted_seq = seq;
+        entry.high_water_seq = seq;
+    }
+
+    #[must_use]
+    #[doc(hidden)]
+    pub fn test_family_exists(&self, family: &str) -> bool {
+        self.package_entity_families
+            .lock()
+            .expect("package entity family lock")
+            .contains_key(family)
+    }
+
+    #[doc(hidden)]
+    pub fn test_mark_unloading(&self, family: &str) {
+        if let Some(family) = self
+            .package_entity_families
+            .lock()
+            .expect("package entity family lock")
+            .get_mut(family)
+        {
+            family.unloading = true;
+        }
+    }
+
+    #[must_use]
+    #[doc(hidden)]
+    pub fn test_unloading_family_count(&self) -> usize {
+        self.package_entity_families
+            .lock()
+            .expect("package entity family lock")
+            .values()
+            .filter(|family| family.unloading)
+            .count()
+    }
+
+    #[must_use]
+    pub fn unfinished_finish_count(&self) -> usize {
+        let queued = self
+            .unfinished_finishes
+            .lock()
+            .map(|pending| pending.len())
+            .unwrap_or(0);
+        let overflow = self
+            .unfinished_overflow
+            .lock()
+            .map(|pending| pending.len())
+            .unwrap_or(0);
+        let held = self
+            .unfinished_held
+            .lock()
+            .map(|pending| pending.len())
+            .unwrap_or(0);
+        queued + overflow + held
     }
 
     /// Return the startup reconciliation decisions made against the core daemon registry.
@@ -462,8 +1410,20 @@ impl HubRuntime {
             registry.packages().into_iter().cloned().collect(),
         )
         .map_err(HubLuaPluginLoadError::Lua)?;
-        self.load_plugin_package(registry, package_name, bundle)
-            .map_err(HubLuaPluginLoadError::Lifecycle)
+        let event_handlers = bundle.event_handlers.clone();
+        let key = self
+            .load_plugin_package(registry, package_name, bundle)
+            .map_err(HubLuaPluginLoadError::Lifecycle)?;
+        if let Err(status) =
+            self.commit_loaded_package_event_plane(package_name, registry, &event_handlers)
+        {
+            let _ = self.unload_plugin_package(
+                RequestId(format!("event-plane-rollback-{package_name}")),
+                package_name,
+            );
+            return Err(HubLuaPluginLoadError::EventPlane(status));
+        }
+        Ok(key)
     }
 
     /// Re-read and replace an enabled local Lua package through the real Lua runtime.
@@ -487,8 +1447,63 @@ impl HubRuntime {
             registry.packages().into_iter().cloned().collect(),
         )
         .map_err(HubLuaPluginLoadError::Lua)?;
+        let event_handlers = bundle.event_handlers.clone();
+        let staged = self
+            .staged_package_event_plane(package_name, registry, &event_handlers)
+            .map_err(HubLuaPluginLoadError::EventPlane)?;
+        self.package_event_router
+            .try_replace_package_generation(package_name, staged.contracts, staged.subscriptions)
+            .map_err(HubLuaPluginLoadError::EventPlane)?;
         self.reload_plugin_package(request_id, registry, package_name, bundle)
             .map_err(HubLuaPluginLoadError::Lifecycle)
+    }
+
+    fn staged_package_event_plane(
+        &self,
+        package_name: &str,
+        registry: &PackageRegistry,
+        event_handlers: &[crate::lifecycle::HubPluginEventHandler],
+    ) -> Result<PendingEventPlaneReplace, EventPlaneStatus> {
+        let contracts = match registry.package(package_name) {
+            Some(record) => record
+                .manifest
+                .compiled_event_contracts()
+                .map_err(|_| EventPlaneStatus::RejectedInvalid)?,
+            None => Vec::new(),
+        };
+        let subscriptions = event_handlers
+            .iter()
+            .filter(|handler| {
+                !(handler.event_owner == crate::package_event_router::HUB_EVENT_OWNER
+                    && handler.event_name == "session_family")
+            })
+            .map(|handler| EventSubscription {
+                plugin_key: package_name.to_string(),
+                owner: handler.event_owner.clone(),
+                name: handler.event_name.clone(),
+                handler_id: handler.handler.handler_id.clone(),
+                generation: self.package_event_router.next_holder_generation(),
+                ..EventSubscription::default()
+            })
+            .collect();
+        Ok(PendingEventPlaneReplace {
+            contracts,
+            subscriptions,
+        })
+    }
+
+    fn commit_loaded_package_event_plane(
+        &self,
+        package_name: &str,
+        registry: &PackageRegistry,
+        event_handlers: &[crate::lifecycle::HubPluginEventHandler],
+    ) -> Result<u64, EventPlaneStatus> {
+        let staged = self.staged_package_event_plane(package_name, registry, event_handlers)?;
+        self.package_event_router.try_commit_package_generation(
+            package_name,
+            staged.contracts,
+            staged.subscriptions,
+        )
     }
 
     /// Invoke a plugin handler through core plugin worker mechanics.
@@ -543,38 +1558,6 @@ impl HubRuntime {
                 }
             }
         }
-    }
-
-    /// Emit a hub lifecycle event to matching plugin event handlers.
-    #[must_use]
-    pub fn emit_plugin_event(
-        &self,
-        event_name: &str,
-        payload: serde_json::Value,
-    ) -> Vec<PluginInvocationOutcome> {
-        self.plugin_lifecycle
-            .event_handlers_for(event_name)
-            .into_iter()
-            .map(|event_handler| {
-                self.invoke_plugin(PluginInvocationRequest {
-                    request_id: RequestId(format!(
-                        "plugin-event-{}-{}",
-                        event_name, event_handler.handler.plugin_key.0
-                    )),
-                    handler: event_handler.handler,
-                    timeout_ms: PLUGIN_EVENT_TIMEOUT_MS,
-                    context: botster_core::PluginInvocationContext {
-                        client_id: None,
-                        session_id: None,
-                        subscription_id: None,
-                        surface_id: None,
-                        origin: Some("hub-worktree-lifecycle".to_string()),
-                        metadata: None,
-                    },
-                    payload: BoundaryJson(payload.clone()),
-                })
-            })
-            .collect()
     }
 
     /// Reload an enabled package through core plugin worker cleanup and replacement.
@@ -1148,8 +2131,29 @@ impl HubRuntime {
     }
 
     fn fulfill_pending_entity_publish_requests(&self) {
-        while let Some(pending) = self.entity_publish_bridge.take_pending() {
-            let result = self.admit_package_entity_publish(pending.plugin_key, pending.frame);
+        self.harvest_publish_releases();
+        while self.leftover_slot_available() {
+            let Some(pending) = self.entity_publish_bridge.take_pending() else {
+                break;
+            };
+            if let Some(scope_id) = pending.scope_id
+                && !self.causal_scopes.acquire(
+                    scope_id,
+                    LeaseIdentity::PendingEntityPublish {
+                        plugin_key: pending.plugin_key.0.clone(),
+                    },
+                )
+            {
+                let _ = pending
+                    .response
+                    .send(Err("causal scope lease could not be acquired".to_string()));
+                continue;
+            }
+            let result = self.admit_package_entity_publish(
+                pending.plugin_key.clone(),
+                pending.frame,
+                pending.scope_id,
+            );
             let _ = pending.response.send(result);
         }
     }
@@ -1158,8 +2162,32 @@ impl HubRuntime {
         &self,
         plugin_key: PluginKey,
         frame: serde_json::Value,
+        scope_id: Option<u64>,
+    ) -> Result<PackageEntityPublishResult, String> {
+        let pending_identity = LeaseIdentity::PendingEntityPublish {
+            plugin_key: plugin_key.0.clone(),
+        };
+        let result = self.admit_package_entity_publish_inner(plugin_key.clone(), frame, scope_id);
+        if let Some(scope_id) = scope_id
+            && result.is_err()
+        {
+            let _ = self.park_production(release_or_retract(
+                &self.causal_scopes,
+                scope_id,
+                pending_identity,
+            ));
+        }
+        result
+    }
+
+    fn admit_package_entity_publish_inner(
+        &self,
+        plugin_key: PluginKey,
+        frame: serde_json::Value,
+        scope_id: Option<u64>,
     ) -> Result<PackageEntityPublishResult, String> {
         let mutation = parse_publish_mutation(frame)?;
+        let mutation_seq = mutation.snapshot_seq();
         let entity_type = mutation.entity_type().to_string();
         let package_name = plugin_key.0.as_str();
         let owned_families = self.plugin_entity_provider_families(package_name);
@@ -1186,15 +2214,48 @@ impl HubRuntime {
             .package_entity_families
             .lock()
             .expect("package entity family lock");
-        let family = families.entry(entity_type).or_default();
+        let family = families.entry(entity_type.clone()).or_default();
         let (result, ready) = family.admit(mutation, now);
+        let incoming_lease = scope_id.map(|scope_id| EntityMutationLease {
+            scope_id,
+            family: entity_type.clone(),
+            seq: mutation_seq,
+        });
+        if matches!(result.status, PackageEntityPublishStatus::PendingGap)
+            && let Some(lease) = incoming_lease.clone()
+        {
+            family.store_pending_lease(lease);
+        }
+        let mut leased_ready = Vec::new();
+        for ready_mutation in ready {
+            let seq = ready_mutation.snapshot_seq();
+            let lease = family
+                .take_pending_lease(seq)
+                .or_else(|| incoming_lease.clone().filter(|lease| lease.seq == seq));
+            leased_ready.push(LeasedFanoutMutation {
+                mutation: ready_mutation,
+                lease,
+                finish_only: false,
+                scheduled_resync: false,
+            });
+        }
+        if let Some(scope_id) = scope_id {
+            self.settle_entity_publish_lease(
+                family,
+                scope_id,
+                &plugin_key.0,
+                &entity_type,
+                mutation_seq,
+                &result,
+            );
+        }
         drop(families);
-        if !ready.is_empty() {
+        if !leased_ready.is_empty() {
             let mut fanout = self
                 .package_entity_fanout
                 .lock()
                 .expect("package entity fanout lock");
-            fanout.extend(ready);
+            fanout.extend(leased_ready);
         }
         Ok(result)
     }
@@ -1202,11 +2263,131 @@ impl HubRuntime {
     /// Drain admitted package entity mutations for control-path fanout.
     #[must_use]
     pub fn take_package_entity_fanout(&self) -> Vec<PackageEntityMutation> {
+        let items = self.take_leased_package_entity_fanout();
+        let mutations = items.iter().map(|item| item.mutation.clone()).collect();
+        for item in &items {
+            self.finish_package_entity_mutation_fanout(item, false);
+        }
+        mutations
+    }
+
+    #[must_use]
+    pub fn take_leased_package_entity_fanout(&self) -> Vec<TakenPackageEntityMutation> {
         let mut fanout = self
             .package_entity_fanout
             .lock()
             .expect("package entity fanout lock");
-        fanout.drain(..).collect()
+        fanout
+            .drain(..)
+            .map(|item| TakenPackageEntityMutation {
+                mutation: item.mutation,
+                lease: item.lease,
+                finish_only: item.finish_only,
+                scheduled_resync: item.scheduled_resync,
+            })
+            .collect()
+    }
+
+    fn settle_entity_publish_lease(
+        &self,
+        family: &mut PackageEntityFamilyState,
+        scope_id: u64,
+        plugin_key: &str,
+        entity_type: &str,
+        mutation_seq: u64,
+        result: &PackageEntityPublishResult,
+    ) {
+        let op = settle_entity_publish_op(
+            family,
+            scope_id,
+            plugin_key,
+            entity_type,
+            mutation_seq,
+            result,
+        );
+        if let CausalAdmitResult::Retry(_) = self.park_production(self.admit_causal_op(op)) {
+            return;
+        }
+        if result.resync_needed {
+            family.remember_resync_lease(scope_id, entity_type.to_string());
+        }
+    }
+
+    fn release_resync_leases(
+        &self,
+        leases: BTreeSet<(u64, String)>,
+        applied: &mut usize,
+        started: Instant,
+    ) -> BTreeSet<(u64, String)> {
+        let mut leftover = BTreeSet::new();
+        let mut pending = leases;
+        loop {
+            if *applied >= CAUSAL_FLUSH_MAX || started.elapsed() >= Duration::from_millis(8) {
+                leftover.extend(pending);
+                break;
+            }
+            let Some((scope_id, family)) = pending.pop_first() else {
+                break;
+            };
+            *applied += 1;
+            if let CausalAdmitResult::Retry(_) =
+                self.enqueue_retry(self.admit_causal_op(CausalOp::Release {
+                    scope_id,
+                    identity: LeaseIdentity::ProviderResyncNeed {
+                        family: family.clone(),
+                    },
+                }))
+            {
+                leftover.insert((scope_id, family));
+            }
+        }
+        leftover
+    }
+
+    /// Release or convert the mutation lease after subscriber decisions finish.
+    pub fn finish_package_entity_mutation_fanout(
+        &self,
+        item: &TakenPackageEntityMutation,
+        scheduled_resync: bool,
+    ) {
+        let Some(lease) = item.lease.clone() else {
+            return;
+        };
+        let op = self.prepare_finish_op(&lease, scheduled_resync);
+        if let CausalAdmitResult::Retry(_) = self.keep_owned(self.admit_causal_op(op)) {
+            self.restore_fanout_finish(item, scheduled_resync);
+        }
+    }
+
+    fn prepare_finish_op(&self, lease: &EntityMutationLease, scheduled_resync: bool) -> CausalOp {
+        let admitted = LeaseIdentity::AdmittedEntityMutation {
+            family: lease.family.clone(),
+            seq: lease.seq,
+        };
+        if scheduled_resync {
+            let now = Instant::now();
+            let mut families = self
+                .package_entity_families
+                .lock()
+                .expect("package entity family lock");
+            let family = families.entry(lease.family.clone()).or_default();
+            family.resync.mark_needed(now);
+            let added = family.remember_resync_lease(lease.scope_id, lease.family.clone());
+            drop(families);
+            if added {
+                return CausalOp::Transfer {
+                    scope_id: lease.scope_id,
+                    from: admitted,
+                    to: vec![LeaseIdentity::ProviderResyncNeed {
+                        family: lease.family.clone(),
+                    }],
+                };
+            }
+        }
+        CausalOp::Release {
+            scope_id: lease.scope_id,
+            identity: admitted,
+        }
     }
 
     /// Snapshot of package entity family admission state for one family.
@@ -1237,14 +2418,50 @@ impl HubRuntime {
             .expect("package entity family lock");
         let family = families.entry(entity_type.to_string()).or_default();
         let ready = family.apply_provider_snapshot_seq(snapshot_seq, now);
-        if !ready.is_empty() {
+        let mut leased_ready = Vec::new();
+        for ready_mutation in ready {
+            let lease = family.take_pending_lease(ready_mutation.snapshot_seq());
+            leased_ready.push(LeasedFanoutMutation {
+                mutation: ready_mutation,
+                lease,
+                finish_only: false,
+                scheduled_resync: false,
+            });
+        }
+        for discarded in family.take_discarded_pending_leases() {
+            if let CausalAdmitResult::Retry(_) =
+                self.enqueue_retry(self.admit_causal_op(CausalOp::Release {
+                    scope_id: discarded.scope_id,
+                    identity: LeaseIdentity::AdmittedEntityMutation {
+                        family: discarded.family.clone(),
+                        seq: discarded.seq,
+                    },
+                }))
+            {
+                family.store_pending_lease(discarded);
+            }
+        }
+        if !family.resync.needed {
+            let started = Instant::now();
+            let mut applied = 0;
+            for (scope_id, family_name) in
+                self.release_resync_leases(family.take_resync_leases(), &mut applied, started)
+            {
+                family.remember_resync_lease(scope_id, family_name);
+            }
+        }
+        let mutations: Vec<PackageEntityMutation> = leased_ready
+            .iter()
+            .map(|item| item.mutation.clone())
+            .collect();
+        if !leased_ready.is_empty() {
             let mut fanout = self
                 .package_entity_fanout
                 .lock()
                 .expect("package entity fanout lock");
-            fanout.extend(ready.iter().cloned());
+            fanout.extend(leased_ready);
         }
-        ready
+        mutations
     }
 
     /// Mark family resync needed (e.g. overflow or residual gap).
@@ -1301,11 +2518,18 @@ impl HubRuntime {
             .package_entity_families
             .lock()
             .expect("package entity family lock");
-        families
-            .entry(entity_type.to_string())
-            .or_default()
-            .resync
-            .record_attempt(now)
+        let family = families.entry(entity_type.to_string()).or_default();
+        let degraded = family.resync.record_attempt(now);
+        if degraded || !family.resync.needed {
+            let started = Instant::now();
+            let mut applied = 0;
+            for (scope_id, family_name) in
+                self.release_resync_leases(family.take_resync_leases(), &mut applied, started)
+            {
+                family.remember_resync_lease(scope_id, family_name);
+            }
+        }
+        degraded
     }
 
     /// Clear resync need after successful convergence when no gap remains.
@@ -1317,24 +2541,93 @@ impl HubRuntime {
             .expect("package entity family lock");
         if let Some(family) = families.get_mut(entity_type) {
             family.recompute_resync_need(now);
+            if !family.resync.needed {
+                let started = Instant::now();
+                let mut applied = 0;
+                for (scope_id, family_name) in
+                    self.release_resync_leases(family.take_resync_leases(), &mut applied, started)
+                {
+                    family.remember_resync_lease(scope_id, family_name);
+                }
+            }
         }
     }
 
     /// Drop all package entity admission state for families owned by a package.
     pub fn drop_package_entity_families_for(&self, package_name: &str) {
-        let families: BTreeSet<String> = self.plugin_entity_provider_families(package_name);
+        let mut families: BTreeSet<String> = self.plugin_entity_provider_families(package_name);
         let mut state = self
             .package_entity_families
             .lock()
             .expect("package entity family lock");
-        for family in &families {
-            state.remove(family);
+        let prefix = format!("{package_name}.");
+        families.extend(
+            state
+                .keys()
+                .filter(|name| *name == package_name || name.starts_with(&prefix))
+                .cloned(),
+        );
+        for family_name in &families {
+            if let Some(mut family) = state.remove(family_name) {
+                let pending_leases = std::mem::take(&mut family.pending_leases);
+                let mut leftover = BTreeMap::new();
+                for lease in pending_leases.into_values() {
+                    if let CausalAdmitResult::Retry(_) =
+                        self.enqueue_retry(self.admit_causal_op(CausalOp::Release {
+                            scope_id: lease.scope_id,
+                            identity: LeaseIdentity::AdmittedEntityMutation {
+                                family: lease.family.clone(),
+                                seq: lease.seq,
+                            },
+                        }))
+                    {
+                        leftover.insert(lease.seq, lease);
+                    }
+                }
+                family.pending_leases = leftover;
+                let started = Instant::now();
+                let mut applied = 0;
+                for (scope_id, name) in
+                    self.release_resync_leases(family.take_resync_leases(), &mut applied, started)
+                {
+                    family.remember_resync_lease(scope_id, name);
+                }
+                if !family.pending_leases.is_empty() || !family.resync.leases.is_empty() {
+                    family.unloading = true;
+                    state.insert(family_name.clone(), family);
+                }
+            }
         }
         let mut fanout = self
             .package_entity_fanout
             .lock()
             .expect("package entity fanout lock");
-        fanout.retain(|mutation| !families.contains(mutation.entity_type()));
+        let mut restore = VecDeque::new();
+        fanout.retain(|item| {
+            if families.contains(item.mutation.entity_type()) {
+                if let Some(lease) = item.lease.clone()
+                    && let CausalAdmitResult::Retry(_) =
+                        self.keep_or_park(self.admit_causal_op(CausalOp::Release {
+                            scope_id: lease.scope_id,
+                            identity: LeaseIdentity::AdmittedEntityMutation {
+                                family: lease.family,
+                                seq: lease.seq,
+                            },
+                        }))
+                {
+                    restore.push_back(LeasedFanoutMutation {
+                        mutation: item.mutation.clone(),
+                        lease: item.lease.clone(),
+                        finish_only: true,
+                        scheduled_resync: item.scheduled_resync,
+                    });
+                }
+                false
+            } else {
+                true
+            }
+        });
+        fanout.append(&mut restore);
     }
 
     /// Resync attempt counter for observability (attempts field across families).
@@ -1346,6 +2639,40 @@ impl HubRuntime {
             .get(entity_type)
             .map(|family| family.resync.attempts)
             .unwrap_or(0)
+    }
+
+    /// True when admitted fanout or a non-degraded resync is waiting.
+    #[must_use]
+    pub fn package_entity_work_pending(&self) -> bool {
+        if self.package_entity_resync_still_needed() {
+            return true;
+        }
+        if self.has_family_leftovers()
+            || !self.family_causal.borrow().is_empty()
+            || self.family_held.borrow().is_some()
+            || self.family_source.borrow().is_some()
+            || self.family_overflow.borrow().is_some()
+            || !self.source_ops.borrow().is_empty()
+            || !self.source_held.borrow().is_empty()
+            || self.unsettled_op.borrow().is_some()
+        {
+            return true;
+        }
+        !self
+            .package_entity_fanout
+            .lock()
+            .expect("package entity fanout lock")
+            .is_empty()
+    }
+
+    /// True when a family still needs resync and has not degraded.
+    #[must_use]
+    pub fn package_entity_resync_still_needed(&self) -> bool {
+        self.package_entity_families
+            .lock()
+            .expect("package entity family lock")
+            .values()
+            .any(|family| family.resync.needed && !family.resync.degraded)
     }
 
     /// Whether the family is currently marked resync_degraded.
@@ -1639,8 +2966,33 @@ impl HubRuntime {
                 format!("entity provider {entity_type} has no handler"),
             )
         })?;
+        let scope_id = self
+            .package_entity_family_state(entity_type)
+            .and_then(|family| family.provider_scope_id());
+        let request_id = RequestId(format!("plugin-entity-provider-{subscription_id}"));
+        if scope_id.is_some() && !self.leftover_slot_available() {
+            return Err(crate::McpToolError::new(
+                "causal_scope_busy",
+                "could not acquire provider causal lease",
+            ));
+        }
+        if let Some(scope_id) = scope_id
+            && !self.causal_scopes.acquire(
+                scope_id,
+                crate::package_event_router::LeaseIdentity::ProviderInFlight {
+                    request_id: request_id.0.clone(),
+                },
+            )
+        {
+            return Err(crate::McpToolError::new(
+                "causal_scope_busy",
+                "could not acquire provider causal lease",
+            ));
+        }
+        let metadata = scope_id
+            .map(|scope_id| BoundaryJson(serde_json::json!({ "causal_scope_id": scope_id })));
         let outcome = self.invoke_plugin(PluginInvocationRequest {
-            request_id: RequestId(format!("plugin-entity-provider-{subscription_id}")),
+            request_id: request_id.clone(),
             handler,
             timeout_ms: PLUGIN_EVENT_TIMEOUT_MS,
             context: botster_core::PluginInvocationContext {
@@ -1649,13 +3001,21 @@ impl HubRuntime {
                 subscription_id: Some(SubscriptionId(subscription_id.to_string())),
                 surface_id: None,
                 origin: Some("local-client-api".to_string()),
-                metadata: None,
+                metadata,
             },
             payload: BoundaryJson(serde_json::json!({
                 "entity_type": entity_type,
                 "subscription_id": subscription_id,
             })),
         });
+        if let Some(scope_id) = scope_id {
+            let _ = self.park_production(self.admit_causal_op(CausalOp::Release {
+                scope_id,
+                identity: crate::package_event_router::LeaseIdentity::ProviderInFlight {
+                    request_id: request_id.0.clone(),
+                },
+            }));
+        }
         let value = completed_plugin_payload(outcome.result, "plugin entity provider")?;
         let value = coerce_entity_frame_empty_items(value);
         let frame: EntityFrame = serde_json::from_value(value).map_err(|error| {
@@ -1789,6 +3149,185 @@ impl HubRuntime {
             .lock()
             .expect("core daemon mutex")
             .lifecycle_changes_page(after, max_changes, max_bytes)
+    }
+
+    /// Take the coalesced Core journal-advanced wake bit.
+    #[must_use]
+    pub fn take_journal_advanced_wake(&self) -> bool {
+        self.core_daemon
+            .lock()
+            .expect("core daemon mutex")
+            .take_journal_advanced_wake()
+    }
+
+    /// Admit ready package-event deliveries and wait for completions.
+    ///
+    /// Production delivery uses the owner-loop `PackageEventDelivery` slice.
+    /// Tests use this helper when they do not own that loop.
+    pub fn drive_package_events_for_test(&self) -> Vec<botster_core::PluginCompletion> {
+        use std::time::{Duration, Instant};
+
+        use botster_core::{
+            PluginAdmissionResult, PluginInvocationClass, PluginInvocationContext,
+            PluginInvocationResult,
+        };
+
+        let batch = self
+            .package_event_router
+            .pull_ready_batch(16, 64 * 1024, Instant::now(), Duration::from_millis(20))
+            .unwrap_or_default();
+        let mut waiting = Vec::new();
+        for delivery in batch {
+            let Some(handler) = self.package_event_handler(
+                &delivery.holder.plugin_key,
+                &delivery.owner,
+                &delivery.name,
+                &delivery.holder.handler_id,
+            ) else {
+                let _ = self.package_event_router.retire_holder(
+                    delivery.envelope_id,
+                    &delivery.holder.plugin_key,
+                    delivery.holder.generation,
+                );
+                continue;
+            };
+            let request_id = RequestId(format!(
+                "package-event-test-{}-{}",
+                delivery.name, delivery.envelope_id
+            ));
+            let _ = self.causal_scopes.mint_with_lease(Some(
+                crate::package_event_router::LeaseIdentity::EventInFlight {
+                    request_id: request_id.0.clone(),
+                },
+            ));
+            match self.try_admit_plugin(
+                PluginInvocationClass::Background,
+                PluginInvocationRequest {
+                    request_id: request_id.clone(),
+                    handler: handler.handler,
+                    timeout_ms: 1_000,
+                    context: PluginInvocationContext {
+                        client_id: None,
+                        session_id: None,
+                        subscription_id: None,
+                        surface_id: None,
+                        origin: Some("package-event-test".to_string()),
+                        metadata: None,
+                    },
+                    payload: BoundaryJson(delivery.payload_json),
+                },
+            ) {
+                PluginAdmissionResult::Queued { .. } => {
+                    let _ = self.package_event_router.note_admitted(
+                        delivery.envelope_id,
+                        &delivery.holder.plugin_key,
+                        delivery.holder.generation,
+                    );
+                    waiting.push((
+                        request_id.0,
+                        delivery.envelope_id,
+                        delivery.holder.plugin_key,
+                        delivery.holder.generation,
+                    ));
+                }
+                _ => {
+                    let _ = self.package_event_router.retire_holder(
+                        delivery.envelope_id,
+                        &delivery.holder.plugin_key,
+                        delivery.holder.generation,
+                    );
+                }
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut outcomes = Vec::new();
+        while !waiting.is_empty() && Instant::now() < deadline {
+            let drain = self.drain_plugin_completions(16, 64 * 1024);
+            for completion in drain.completions {
+                let request_id = match &completion.result {
+                    PluginInvocationResult::Completed(success) => success.request_id.0.clone(),
+                    PluginInvocationResult::Failed(failure) => failure.request_id.0.clone(),
+                };
+                if let Some(index) = waiting
+                    .iter()
+                    .position(|(waiting_id, _, _, _)| waiting_id == &request_id)
+                {
+                    let (_, envelope_id, plugin_key, generation) = waiting.remove(index);
+                    let _ = self.package_event_router.retire_holder(
+                        envelope_id,
+                        &plugin_key,
+                        generation,
+                    );
+                    outcomes.push(completion);
+                }
+            }
+            if !waiting.is_empty() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        outcomes
+    }
+
+    /// Look up one exact package-event handler.
+    #[must_use]
+    pub fn package_event_handler(
+        &self,
+        plugin_key: &str,
+        owner: &str,
+        event_name: &str,
+        handler_id: &str,
+    ) -> Option<crate::lifecycle::HubPluginEventHandler> {
+        self.plugin_lifecycle
+            .event_handler_for(plugin_key, owner, event_name, handler_id)
+    }
+
+    /// Admit one plugin invocation without waiting.
+    #[must_use]
+    pub fn try_admit_plugin(
+        &self,
+        class: PluginInvocationClass,
+        request: PluginInvocationRequest,
+    ) -> PluginAdmissionResult {
+        self.plugin_lifecycle.try_admit(class, request)
+    }
+
+    /// Drain previously published plugin completions without waiting.
+    #[must_use]
+    pub fn drain_plugin_completions(
+        &self,
+        max_items: usize,
+        max_bytes: usize,
+    ) -> PluginCompletionDrain {
+        self.plugin_lifecycle
+            .drain_completions(max_items, max_bytes)
+    }
+
+    /// Event handlers subscribed to the Hub-owned `/session` family.
+    #[must_use]
+    pub fn session_family_event_handlers(&self) -> Vec<crate::lifecycle::HubPluginEventHandler> {
+        self.session_family_event_handlers_page(None, usize::MAX).0
+    }
+
+    /// One bounded page of `/session` family event handlers.
+    #[must_use]
+    pub fn session_family_event_handlers_page(
+        &self,
+        after_plugin_key: Option<&str>,
+        max_items: usize,
+    ) -> (
+        Vec<crate::lifecycle::HubPluginEventHandler>,
+        Option<String>,
+        usize,
+        bool,
+    ) {
+        self.plugin_lifecycle
+            .event_handlers_for_page("session_family", after_plugin_key, max_items)
+    }
+
+    #[cfg(test)]
+    pub fn insert_test_event_handler(&self, plugin_key: &str, event_name: &str) {
+        self.plugin_lifecycle
+            .insert_test_event_handler(plugin_key, event_name);
     }
 
     /// Forget one terminal session through CoreDaemon's lifecycle authority.
@@ -2518,7 +4057,18 @@ fn managed_session_core_error_class(error: &CoreDaemonError) -> &'static str {
         CoreDaemonError::Shutdown => "shutdown",
         CoreDaemonError::MissingScreenResponse(_) => "missing_screen_response",
         CoreDaemonError::MissingModeFlagsResponse(_) => "missing_mode_flags_response",
-        CoreDaemonError::BindTerminalAdapter(_) => "bind_terminal_adapter",
+        CoreDaemonError::BindTerminalAdapter(error) => match error {
+            BindTerminalAdapterError::BindBeforeAttach { .. } => {
+                "bind_terminal_adapter.bind_before_attach"
+            }
+            BindTerminalAdapterError::UnknownSubscription { .. } => {
+                "bind_terminal_adapter.unknown_subscription"
+            }
+            BindTerminalAdapterError::StaleGeneration { .. } => {
+                "bind_terminal_adapter.stale_generation"
+            }
+            BindTerminalAdapterError::AlreadyBound { .. } => "bind_terminal_adapter.already_bound",
+        },
     }
 }
 
@@ -2780,6 +4330,7 @@ pub enum HubLuaPluginLoadError {
     Package(PackageRegistryError),
     Lua(LuaPluginRuntimeError),
     Lifecycle(crate::HubLifecycleError),
+    EventPlane(EventPlaneStatus),
 }
 
 impl fmt::Display for HubLuaPluginLoadError {
@@ -2788,6 +4339,7 @@ impl fmt::Display for HubLuaPluginLoadError {
             Self::Package(error) => write!(formatter, "{error:?}"),
             Self::Lua(error) => write!(formatter, "{error}"),
             Self::Lifecycle(error) => write!(formatter, "{error:?}"),
+            Self::EventPlane(status) => write!(formatter, "{}", status.as_str()),
         }
     }
 }
@@ -2798,6 +4350,73 @@ impl Error for HubLuaPluginLoadError {
             Self::Package(_) => None,
             Self::Lua(error) => Some(error),
             Self::Lifecycle(_) => None,
+            Self::EventPlane(_) => None,
+        }
+    }
+}
+
+struct LeasedFanoutMutation {
+    mutation: PackageEntityMutation,
+    lease: Option<EntityMutationLease>,
+    finish_only: bool,
+    scheduled_resync: bool,
+}
+
+struct PendingEventPlaneReplace {
+    contracts: Vec<crate::package_event_router::EmittedContract>,
+    subscriptions: Vec<EventSubscription>,
+}
+
+/// One drained mutation plus the lease that stays live until fanout finishes.
+pub struct TakenPackageEntityMutation {
+    pub mutation: PackageEntityMutation,
+    lease: Option<EntityMutationLease>,
+    pub finish_only: bool,
+    pub scheduled_resync: bool,
+}
+
+fn settle_entity_publish_op(
+    _family: &mut PackageEntityFamilyState,
+    scope_id: u64,
+    plugin_key: &str,
+    entity_type: &str,
+    mutation_seq: u64,
+    result: &PackageEntityPublishResult,
+) -> CausalOp {
+    let pending = LeaseIdentity::PendingEntityPublish {
+        plugin_key: plugin_key.to_string(),
+    };
+    if !result.ok {
+        return CausalOp::Release {
+            scope_id,
+            identity: pending,
+        };
+    }
+    let mut next = Vec::new();
+    if matches!(
+        result.status,
+        PackageEntityPublishStatus::Accepted | PackageEntityPublishStatus::PendingGap
+    ) {
+        next.push(LeaseIdentity::AdmittedEntityMutation {
+            family: entity_type.to_string(),
+            seq: mutation_seq,
+        });
+    }
+    if result.resync_needed {
+        next.push(LeaseIdentity::ProviderResyncNeed {
+            family: entity_type.to_string(),
+        });
+    }
+    if next.is_empty() {
+        CausalOp::Release {
+            scope_id,
+            identity: pending,
+        }
+    } else {
+        CausalOp::Transfer {
+            scope_id,
+            from: pending,
+            to: next,
         }
     }
 }
@@ -3470,6 +5089,49 @@ mod tests {
             "runtime.spawn_failed"
         );
     }
+
+    #[test]
+    fn bind_terminal_adapter_mapping_is_total_over_published_variants() {
+        let session_id = SessionId("session".to_string());
+        let subscription_id = SubscriptionId("sub".to_string());
+        let mapped = [
+            (
+                BindTerminalAdapterError::BindBeforeAttach {
+                    session_id: session_id.clone(),
+                    subscription_id: subscription_id.clone(),
+                },
+                "bind_terminal_adapter.bind_before_attach",
+            ),
+            (
+                BindTerminalAdapterError::UnknownSubscription {
+                    session_id: session_id.clone(),
+                    subscription_id: subscription_id.clone(),
+                },
+                "bind_terminal_adapter.unknown_subscription",
+            ),
+            (
+                BindTerminalAdapterError::StaleGeneration {
+                    live: None,
+                    requested: TerminalSubscriptionGeneration(1),
+                },
+                "bind_terminal_adapter.stale_generation",
+            ),
+            (
+                BindTerminalAdapterError::AlreadyBound {
+                    session_id,
+                    subscription_id,
+                    generation: TerminalSubscriptionGeneration(1),
+                },
+                "bind_terminal_adapter.already_bound",
+            ),
+        ];
+        for (error, class) in mapped {
+            assert_eq!(
+                managed_session_core_error_class(&CoreDaemonError::BindTerminalAdapter(error)),
+                class
+            );
+        }
+    }
     #[test]
     fn hub_core_daemon_config_always_supplies_worker_path() {
         let config = HubStartupOptions {
@@ -3638,6 +5300,73 @@ mod tests {
                 .success()
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn settle_entity_publish_transfers_exact_seq_and_closes_on_error() {
+        let scopes = crate::package_event_router::CausalScopeTable::new();
+        let mut family = PackageEntityFamilyState::default();
+        let accepted = scopes
+            .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+                plugin_key: "producer".into(),
+            }))
+            .expect("mint");
+        assert_eq!(
+            scopes.try_admit(settle_entity_publish_op(
+                &mut family,
+                accepted,
+                "producer",
+                "producer.item",
+                32,
+                &PackageEntityPublishResult {
+                    ok: true,
+                    status: PackageEntityPublishStatus::PendingGap,
+                    last_accepted_seq: 0,
+                    high_water_seq: 32,
+                    resync_needed: true,
+                    resync_degraded: false,
+                },
+            )),
+            crate::package_event_router::CausalAdmitResult::Applied
+        );
+        assert_eq!(
+            scopes.identities(accepted),
+            Some(BTreeSet::from([
+                LeaseIdentity::AdmittedEntityMutation {
+                    family: "producer.item".into(),
+                    seq: 32,
+                },
+                LeaseIdentity::ProviderResyncNeed {
+                    family: "producer.item".into(),
+                },
+            ]))
+        );
+
+        let errored = scopes
+            .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+                plugin_key: "producer".into(),
+            }))
+            .expect("mint error scope");
+        assert_eq!(
+            scopes.try_admit(settle_entity_publish_op(
+                &mut family,
+                errored,
+                "producer",
+                "producer.item",
+                1,
+                &PackageEntityPublishResult {
+                    ok: false,
+                    status: PackageEntityPublishStatus::StaleSequence,
+                    last_accepted_seq: 5,
+                    high_water_seq: 5,
+                    resync_needed: false,
+                    resync_degraded: false,
+                },
+            )),
+            crate::package_event_router::CausalAdmitResult::Applied
+        );
+        assert!(!scopes.is_live(errored));
+        assert_eq!(scopes.lease_count(errored), None);
     }
 
     fn current_unix_nanos() -> u128 {

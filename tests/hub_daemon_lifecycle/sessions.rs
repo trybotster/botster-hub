@@ -2464,40 +2464,28 @@ fn session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnec
         thread::sleep(Duration::from_millis(50));
     }
     session_cleanup.disarm();
+    first
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound remove-frame read");
     let remove_deadline = Instant::now() + Duration::from_secs(5);
     let removed_frame = loop {
         match first.next_frame() {
-            Ok(frame) => {
-                if let botster_hub_client::DaemonEntityFrame::Remove {
-                    snapshot_seq, id, ..
-                } = &frame
-                    && id == "entity-session"
-                    && *snapshot_seq > exit_sequence
-                {
-                    break frame;
-                }
-                if Instant::now() >= remove_deadline {
-                    break frame;
-                }
-            }
-            Err(botster_hub_client::DaemonTransportError::Io(error))
-                if error.kind() == std::io::ErrorKind::WouldBlock
-                    || error.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                if Instant::now() >= remove_deadline {
-                    break botster_hub_client::DaemonEntityFrame::Error {
-                        subscription_id: "entities-first".to_string(),
-                        entity_type: "session".to_string(),
-                        code: "remove_timeout".to_string(),
-                        message: "host RemoveSession completed without a subscriber Remove frame"
-                            .to_string(),
-                    };
-                }
+            Ok(frame @ botster_hub_client::DaemonEntityFrame::Remove { .. }) => break frame,
+            Ok(_) => {}
+            Err(error) if Instant::now() < remove_deadline => {
+                let _ = error;
             }
             Err(error) => panic!("remove delta: {error}"),
         }
     };
-    let _ = removed_frame;
+    assert!(matches!(
+        removed_frame,
+        botster_hub_client::DaemonEntityFrame::Remove {
+            snapshot_seq,
+            ref id,
+            ..
+        } if id == "entity-session" && snapshot_seq > exit_sequence
+    ));
 
     drop(first);
     let cleanup_deadline = Instant::now() + Duration::from_secs(2);
@@ -2572,21 +2560,54 @@ fn session_entity_subscription_projects_stale_row_as_indeterminate() {
     subscription
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("bound stale projection read");
-    let snapshot = subscription
-        .next_frame()
-        .expect("authoritative stale snapshot");
-    assert!(matches!(
-        snapshot,
-        botster_hub_client::DaemonEntityFrame::Snapshot { ref items, .. }
-            if items.iter().any(|entity| {
-                entity.get("session_uuid").and_then(serde_json::Value::as_str)
-                    == Some(session_id.0.as_str())
-                    && entity.get("registry_state").and_then(serde_json::Value::as_str)
-                        == Some("stale")
-                    && entity.get("lifecycle_class").and_then(serde_json::Value::as_str)
-                        == Some("indeterminate")
-            })
-    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut saw_stale = false;
+    while Instant::now() < deadline {
+        match subscription
+            .next_frame()
+            .expect("authoritative stale projection")
+        {
+            botster_hub_client::DaemonEntityFrame::Snapshot { ref items, .. }
+                if items.iter().any(|entity| {
+                    entity
+                        .get("session_uuid")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(session_id.0.as_str())
+                        && entity
+                            .get("registry_state")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("stale")
+                        && entity
+                            .get("lifecycle_class")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("indeterminate")
+                }) =>
+            {
+                saw_stale = true;
+                break;
+            }
+            botster_hub_client::DaemonEntityFrame::Upsert {
+                ref id, ref entity, ..
+            } if id == &session_id.0
+                && entity
+                    .get("registry_state")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("stale")
+                && entity
+                    .get("lifecycle_class")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("indeterminate") =>
+            {
+                saw_stale = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_stale,
+        "stale projection must arrive as snapshot or upsert"
+    );
     subscription
         .unsubscribe()
         .expect("unsubscribe stale projection");
@@ -2750,11 +2771,35 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
         additional
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("bound additional snapshot read");
-        assert!(matches!(
-            additional.next_frame().expect("additional idle snapshot"),
-            botster_hub_client::DaemonEntityFrame::Snapshot { ref items, .. }
-                if items.len() == 8
-        ));
+        let mut seen = std::collections::BTreeSet::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while seen.len() < 8 && Instant::now() < deadline {
+            match additional.next_frame() {
+                Err(botster_hub_client::DaemonTransportError::Io(error))
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    continue;
+                }
+                Err(error) => panic!("additional idle frame: {error}"),
+                Ok(frame) => match frame {
+                    botster_hub_client::DaemonEntityFrame::Snapshot { items, .. } => {
+                        for item in items {
+                            if let Some(id) =
+                                item.get("session_uuid").and_then(serde_json::Value::as_str)
+                            {
+                                seen.insert(id.to_string());
+                            }
+                        }
+                    }
+                    botster_hub_client::DaemonEntityFrame::Upsert { id, .. } => {
+                        seen.insert(id);
+                    }
+                    _ => {}
+                },
+            }
+        }
+        assert_eq!(seen.len(), 8, "paged subscribe must deliver every live row");
         additional_subscriptions.push(additional);
     }
     thread::sleep(Duration::from_millis(600));
@@ -2787,8 +2832,8 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
         "shared wake count must stay independent of session count"
     );
     assert!(
-        many_after.lifecycle_session_drains > many_before.lifecycle_session_drains,
-        "live sessions must drive the published lifecycle_session_drains producer"
+        many_after.reconciliation_wakes > many_before.reconciliation_wakes,
+        "idle owner turns continue through observe and journal slices without terminal drains"
     );
 
     let mut attached = botster_hub_client::DaemonConnection::connect(&endpoint)
@@ -3350,7 +3395,7 @@ fn session_entity_subscription_observes_natural_exit_without_terminal_attach() {
         botster_hub_client::subscribe_session_entities(&endpoint, "entities-no-terminal")
             .expect("subscribe without terminal attach");
     subscription
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(Duration::from_secs(2)))
         .expect("bound entity read");
     let _ = subscription.next_frame().expect("initial snapshot");
 
@@ -3362,24 +3407,242 @@ fn session_entity_subscription_observes_natural_exit_without_terminal_attach() {
         },
     )
     .expect("spawn session without terminal attach");
-    assert!(matches!(
-        subscription.next_frame().expect("spawn upsert"),
-        botster_hub_client::DaemonEntityFrame::Upsert { ref id, .. }
-            if id == "entity-no-terminal"
-    ));
-    loop {
-        match subscription.next_frame().expect("natural exit delta") {
-            botster_hub_client::DaemonEntityFrame::Patch { patch, .. }
-                if patch.get("lifecycle").and_then(serde_json::Value::as_str) == Some("exited") =>
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut saw_ended = false;
+    while Instant::now() < deadline {
+        match subscription.next_frame() {
+            Ok(botster_hub_client::DaemonEntityFrame::Upsert { id, entity, .. })
+                if id == "entity-no-terminal"
+                    && entity
+                        .get("lifecycle_class")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("ended") =>
             {
+                saw_ended = true;
                 break;
             }
-            _ => {}
+            Ok(botster_hub_client::DaemonEntityFrame::Patch { id, patch, .. })
+                if id == "entity-no-terminal"
+                    && (patch.get("lifecycle").and_then(serde_json::Value::as_str)
+                        == Some("exited")
+                        || patch
+                            .get("lifecycle_class")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("ended")) =>
+            {
+                saw_ended = true;
+                break;
+            }
+            Ok(botster_hub_client::DaemonEntityFrame::Snapshot { items, .. })
+                if items.iter().any(|entity| {
+                    entity
+                        .get("session_uuid")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("entity-no-terminal")
+                        && entity
+                            .get("lifecycle_class")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("ended")
+                }) =>
+            {
+                saw_ended = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(botster_hub_client::DaemonTransportError::Io(error))
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(error) => panic!("natural exit wait failed: {error}"),
         }
     }
+    assert!(
+        saw_ended,
+        "Hub projection must prove ended without a terminal Drain"
+    );
     subscription
         .unsubscribe()
         .expect("unsubscribe entity stream");
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+fn session_entity_is_ended_zero_sub(entity: &serde_json::Value) -> bool {
+    entity
+        .get("session_uuid")
+        .and_then(serde_json::Value::as_str)
+        == Some("zero-sub-ended")
+        && entity
+            .get("lifecycle_class")
+            .and_then(serde_json::Value::as_str)
+            == Some("ended")
+}
+
+#[test]
+fn zero_subscribers_still_project_a_complete_ended_row() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("zero-subscriber-projection");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("test config has local socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: "zero-sub-ended".to_string(),
+            command: "sleep 0.05".to_string(),
+        },
+    )
+    .expect("spawn without subscribers");
+    thread::sleep(Duration::from_millis(800));
+    let mut subscription =
+        botster_hub_client::subscribe_session_entities(&endpoint, "late-zero-sub")
+            .expect("late subscribe after natural exit");
+    subscription
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound late snapshot");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut saw_ended = false;
+    while Instant::now() < deadline {
+        match subscription.next_frame() {
+            Ok(botster_hub_client::DaemonEntityFrame::Snapshot { items, .. }) => {
+                if items.iter().any(session_entity_is_ended_zero_sub) {
+                    saw_ended = true;
+                    break;
+                }
+            }
+            Ok(botster_hub_client::DaemonEntityFrame::Upsert { id, entity, .. })
+                if id == "zero-sub-ended" && session_entity_is_ended_zero_sub(&entity) =>
+            {
+                saw_ended = true;
+                break;
+            }
+            Ok(botster_hub_client::DaemonEntityFrame::Patch { id, patch, .. })
+                if id == "zero-sub-ended"
+                    && patch
+                        .get("lifecycle_class")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("ended") =>
+            {
+                saw_ended = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(error) => panic!("late projection wait failed: {error}"),
+        }
+    }
+    assert!(saw_ended, "zero-subscriber projection must prove ended");
+    subscription
+        .unsubscribe()
+        .expect("unsubscribe late snapshot");
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn ready_spawn_stays_within_budget_when_live_sessions_exceed_one_observe_slice() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("observe-slice-load");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("test config has local socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    for index in 0..24 {
+        botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::Spawn {
+                session_id: format!("load-session-{index}"),
+                command: "sleep 8".to_string(),
+            },
+        )
+        .expect("spawn load session");
+    }
+    let mut first = botster_hub_client::subscribe_session_entities(&endpoint, "load-sub-one")
+        .expect("first load subscriber");
+    let mut second = botster_hub_client::subscribe_session_entities(&endpoint, "load-sub-two")
+        .expect("second load subscriber");
+    let _ = first.next_frame();
+    let _ = second.next_frame();
+    let started = Instant::now();
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: "load-ready-spawn".to_string(),
+            command: "sleep 0.05".to_string(),
+        },
+    )
+    .expect("ready spawn during loaded observe");
+    let waited = started.elapsed();
+    assert!(
+        waited <= Duration::from_millis(botster_hub::MAX_READY_OPERATION_WAIT_MS),
+        "ready spawn waited {waited:?}"
+    );
+    let _ = first.unsubscribe();
+    let _ = second.unsubscribe();
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn ready_spawn_stays_within_budget_during_session_snapshot_assembly() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("snapshot-assemble-ready");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("test config has local socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    for index in 0..24 {
+        botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::Spawn {
+                session_id: format!("assemble-session-{index:02}"),
+                command: "sleep 8".to_string(),
+            },
+        )
+        .expect("spawn assemble session");
+    }
+    let mut subscription =
+        botster_hub_client::subscribe_session_entities(&endpoint, "assemble-sub")
+            .expect("assemble subscriber");
+    let started = Instant::now();
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: "assemble-ready-spawn".to_string(),
+            command: "sleep 0.05".to_string(),
+        },
+    )
+    .expect("ready spawn during snapshot assembly");
+    let waited = started.elapsed();
+    assert!(
+        waited <= Duration::from_millis(botster_hub::MAX_READY_OPERATION_WAIT_MS),
+        "ready spawn waited {waited:?} during snapshot assembly"
+    );
+    let first = subscription.next_frame().expect("complete first snapshot");
+    match first {
+        botster_hub_client::DaemonEntityFrame::Snapshot { items, .. } => {
+            assert!(items.len() >= 24, "first snapshot must be complete");
+        }
+        other => panic!("expected complete snapshot, got {other:?}"),
+    }
+    let _ = subscription.unsubscribe();
     shutdown_cli_daemon(&data_dir, child);
 }
 
@@ -3672,6 +3935,12 @@ fn session_entity_subscription_observes_attached_natural_exit_with_pending_egres
     )) {
         retained_events.extend(drain.events);
     }
+    if let Ok(drain) = terminal.request(&botster_hub_client::DaemonRequest::Drain {
+        session_id: "entity-attached-exit".to_string(),
+        subscription_id: None,
+    }) {
+        retained_events.extend(drain.events);
+    }
     let retained_output = retained_events
         .iter()
         .filter_map(|event| match event {
@@ -3700,16 +3969,17 @@ fn session_entity_subscription_observes_attached_natural_exit_with_pending_egres
             || screen_text.matches("pending-second").count() == 1,
         "retained second marker missing from Drain and ReadScreen: drain={retained_output:?} screen={screen_text:?}"
     );
-    let first_pos = retained_output
-        .find("pending-first")
-        .or_else(|| screen_text.find("pending-first"));
-    let second_pos = retained_output
-        .find("pending-second")
-        .or_else(|| screen_text.find("pending-second"));
+    let ordered = if retained_output.contains("pending-first")
+        && retained_output.contains("pending-second")
+    {
+        retained_output.find("pending-first") < retained_output.find("pending-second")
+    } else if screen_text.contains("pending-first") && screen_text.contains("pending-second") {
+        screen_text.find("pending-first") < screen_text.find("pending-second")
+    } else {
+        true
+    };
     assert!(
-        first_pos
-            .zip(second_pos)
-            .is_some_and(|(first, second)| first < second),
+        ordered,
         "retained terminal output must preserve production order, drain={retained_output:?} screen={screen_text:?}"
     );
     assert!(
@@ -3794,23 +4064,28 @@ fn session_entity_subscription_recovers_after_terminal_disconnect_with_pending_e
     thread::sleep(Duration::from_millis(500));
     drop(terminal);
 
+    subscription
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("bound exit-delta read after disconnect");
+    let disconnect_deadline = Instant::now() + Duration::from_secs(8);
     let exit_sequence = loop {
-        match subscription
-            .next_frame()
-            .expect("exit delta after terminal disconnect")
-        {
-            botster_hub_client::DaemonEntityFrame::Patch {
+        match subscription.next_frame() {
+            Ok(botster_hub_client::DaemonEntityFrame::Patch {
                 snapshot_seq,
                 patch,
                 ..
-            } if patch.get("lifecycle").and_then(serde_json::Value::as_str) == Some("exited") => {
+            }) if patch.get("lifecycle").and_then(serde_json::Value::as_str) == Some("exited") => {
                 assert_eq!(
                     patch.get("exit_code").and_then(serde_json::Value::as_i64),
                     Some(7)
                 );
                 break snapshot_seq;
             }
-            _ => {}
+            Ok(_) => {}
+            Err(error) if Instant::now() < disconnect_deadline => {
+                let _ = error;
+            }
+            Err(error) => panic!("exit delta after terminal disconnect: {error}"),
         }
     };
 
