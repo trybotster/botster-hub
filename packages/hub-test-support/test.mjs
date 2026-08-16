@@ -372,7 +372,7 @@ assert.deepEqual(
 );
 assert.equal(supportMatrix.session_type_authoring.admission_group, "allow_runtime");
 
-assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 41);
+assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 43);
 assert.equal(sessionLifecycleFixture.entity_type, "session");
 assert.deepEqual(
   sessionLifecycleFixture.normalized_frames.map((frame) => frame.type),
@@ -410,7 +410,7 @@ assert.equal(
 assert.equal(sessionLifecycleFixture.overflow.snapshot_precedes_later_deltas, true);
 assert.equal(sessionLifecycleFixture.overflow.failed_snapshot_delivery_closes_subscription, true);
 
-assert.equal(sessionPluginBindingFixture.conformance_fixture_revision, 41);
+assert.equal(sessionPluginBindingFixture.conformance_fixture_revision, 43);
 assert.equal(sessionPluginBindingFixture.binding_family, "/session");
 const sessionPluginMaterialization = materializeSessionPluginBindingScenario(
   sessionPluginBindingFixture,
@@ -727,7 +727,7 @@ assert.equal(
   lateAttachFixture.no_history_then_live.filter((event) => event.type === "snapshot").length,
   2,
 );
-assert.equal(lateAttachFixture.conformance_fixture_revision, 41);
+assert.equal(lateAttachFixture.conformance_fixture_revision, 43);
 
 const verification = verifyPackageAssets();
 assert.deepEqual(verification, { ok: true, failures: [] });
