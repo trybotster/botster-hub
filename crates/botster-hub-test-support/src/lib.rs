@@ -139,6 +139,28 @@ fn session_lifecycle_error(
     }
 }
 
+fn next_session_lifecycle_frame(
+    subscription: &mut botster_hub_client::DaemonEntitySubscription,
+    deadline: Instant,
+    stage: &'static str,
+) -> Result<DaemonEntityFrame, SessionLifecycleSubscriptionConformanceError> {
+    loop {
+        if Instant::now() >= deadline {
+            return Err(session_lifecycle_error(
+                stage,
+                "timed out waiting for entity frame",
+            ));
+        }
+        match subscription.next_frame() {
+            Ok(frame) => return Ok(frame),
+            Err(botster_hub_client::DaemonTransportError::Io(error))
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(error) => return Err(session_lifecycle_error(stage, error.to_string())),
+        }
+    }
+}
+
 /// Prove the published session lifecycle contract against a real isolated Hub topology.
 ///
 /// This runner uses only `botster-hub-client` requests and DTOs. The supplied
@@ -218,9 +240,11 @@ pub fn run_session_lifecycle_subscription_conformance(
         ));
     }
 
-    let first_upsert = first
-        .next_frame()
-        .map_err(|error| session_lifecycle_error("spawn upsert", error.to_string()))?;
+    let first_upsert = next_session_lifecycle_frame(
+        &mut first,
+        Instant::now() + Duration::from_secs(5),
+        "spawn upsert",
+    )?;
     let upsert_sequence = match first_upsert {
         DaemonEntityFrame::Upsert {
             snapshot_seq,
@@ -234,9 +258,11 @@ pub fn run_session_lifecycle_subscription_conformance(
             ));
         }
     };
-    let second_upsert = second
-        .next_frame()
-        .map_err(|error| session_lifecycle_error("concurrent upsert", error.to_string()))?;
+    let second_upsert = next_session_lifecycle_frame(
+        &mut second,
+        Instant::now() + Duration::from_secs(5),
+        "concurrent upsert",
+    )?;
     let concurrent_subscribers_consistent = matches!(
         second_upsert,
         DaemonEntityFrame::Upsert {
@@ -261,11 +287,9 @@ pub fn run_session_lifecycle_subscription_conformance(
         },
     )
     .map_err(|error| session_lifecycle_error("lifecycle patch", error.to_string()))?;
+    let resize_deadline = Instant::now() + Duration::from_secs(5);
     let resize_sequence = loop {
-        match first
-            .next_frame()
-            .map_err(|error| session_lifecycle_error("lifecycle patch", error.to_string()))?
-        {
+        match next_session_lifecycle_frame(&mut first, resize_deadline, "lifecycle patch")? {
             DaemonEntityFrame::Patch {
                 snapshot_seq,
                 patch,
@@ -278,10 +302,9 @@ pub fn run_session_lifecycle_subscription_conformance(
             _ => {}
         }
     };
+    let second_resize_deadline = Instant::now() + Duration::from_secs(5);
     let second_resize_sequence = loop {
-        match second
-            .next_frame()
-            .map_err(|error| session_lifecycle_error("concurrent patch", error.to_string()))?
+        match next_session_lifecycle_frame(&mut second, second_resize_deadline, "concurrent patch")?
         {
             DaemonEntityFrame::Patch {
                 snapshot_seq,
@@ -302,11 +325,9 @@ pub fn run_session_lifecycle_subscription_conformance(
         ));
     }
 
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
     let exit_sequence = loop {
-        match first
-            .next_frame()
-            .map_err(|error| session_lifecycle_error("natural exit", error.to_string()))?
-        {
+        match next_session_lifecycle_frame(&mut first, exit_deadline, "natural exit")? {
             DaemonEntityFrame::Patch {
                 snapshot_seq,
                 patch,
@@ -331,11 +352,9 @@ pub fn run_session_lifecycle_subscription_conformance(
             format!("expected session_removed response, got {:?}", removed.kind),
         ));
     }
+    let remove_deadline = Instant::now() + Duration::from_secs(5);
     let remove_sequence = loop {
-        match first
-            .next_frame()
-            .map_err(|error| session_lifecycle_error("remove delta", error.to_string()))?
-        {
+        match next_session_lifecycle_frame(&mut first, remove_deadline, "remove delta")? {
             DaemonEntityFrame::Remove {
                 snapshot_seq,
                 ref id,
@@ -5922,7 +5941,7 @@ mod tests {
         assert_eq!(provenance.protocol_git, LATE_ATTACH_GHOSTSNP_PROTOCOL_GIT);
         assert_eq!(
             LATE_ATTACH_GHOSTSNP_CORE_PIN,
-            "f4f6bf5babe92dfb9241a760c414187f711c2c42"
+            "aef6516d5809d563961ed7fdd07da29a7b4edddc"
         );
         assert_eq!(provenance.core_pin, LATE_ATTACH_GHOSTSNP_CORE_PIN);
         assert_eq!(

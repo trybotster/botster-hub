@@ -1407,7 +1407,7 @@ Worktree CRUD emits client-visible `worktree_lifecycle` daemon events and
 worker-isolated Lua plugin events:
 
 ```lua
-events.on("worktree_created", function(event)
+events.on("hub", "worktree_created", function(event)
   -- Store workflow-specific associations in plugin state keyed by worktree id.
   return { worktree_id = event.worktree_id, target_id = event.target_id }
 end)

@@ -174,11 +174,19 @@ dispatch, and show the diagnostic in the hub connection state.
 ## Session entity subscriptions
 
 `subscribe_session_entities` opens a dedicated held-open connection for the
-built-in `session` family. The first pushed frame is an authoritative,
-stable-id-ordered `entity_snapshot`; later `entity_upsert`, sparse
-`entity_patch`, and `entity_remove` frames carry strictly increasing sequence
-values from CoreDaemon's lifecycle cursor. Every frame includes the caller's
+built-in `session` family. Hub maintains one canonical session projection
+from Core observe slices and journal pages even when no Web or TUI
+subscriber is connected. The first pushed frame is an authoritative, stable-id-ordered
+`entity_snapshot`. Hub assembles that complete replace-all baseline off the
+control path. Live projection changes during assembly restart the baseline.
+If the encoded frame exceeds the daemon frame limit, Hub sends one
+`entity_provider_frame_too_large` error and closes the subscription.
+`entity_upsert`, sparse `entity_patch`, and
+`entity_remove` frames carry strictly increasing per-connection sequence
+values. An overflow resync snapshot continues that same sequence and does
+not move it backwards. Every frame includes the caller's
 connection-scoped `subscription_id` and `entity_type: "session"`.
+Client session frames stay `entity_snapshot` / upsert / patch / remove.
 
 Package-owned families use the same held-open request and `DaemonEntityFrame`
 wire envelope with generic JSON records. They require the advertised

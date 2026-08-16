@@ -70,6 +70,7 @@ use tokio::net::{UnixListener as TokioUnixListener, UnixStream as TokioUnixStrea
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc as tokio_mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
+use crate::daemon_maintenance::{MaintenanceSliceKind, MaintenanceState, run_maintenance_kind};
 use crate::daemon_projection::{
     app_local_url, apps_from_registry, available_package_action, available_package_actions,
     blocked_action, daemon_operator_error_from_client, daemon_operator_error_from_package,
@@ -133,9 +134,9 @@ use daemon_package_control::{
 mod daemon_entity_subscriptions;
 pub(crate) use daemon_entity_subscriptions::{EntityFrameSender, EntitySubscriptionState};
 use daemon_entity_subscriptions::{
-    EntityReconciliationState, drive_entity_subscriptions, drive_package_entity_fanout,
-    drive_package_entity_resync, entity_subscription_error, register_entity_subscription,
-    seed_lifecycle_reconciliation,
+    drive_entity_subscriptions, drive_package_entity_fanout, drive_package_entity_resync,
+    entity_subscription_error, register_entity_subscription, seed_lifecycle_reconciliation,
+    session_subscribers_need_delivery,
 };
 
 const MESSAGE_CONTENT_TYPE: &str = "application/vnd.botster.coordination.message+text";
@@ -168,8 +169,61 @@ async fn receive_owner_event(
     }
     tokio::select! {
         biased;
-        _ = tokio::time::sleep(reconciliation_wait) => OwnerEvent::Reconcile,
         message = control_rx.recv() => OwnerEvent::Control(Box::new(message)),
+        _ = tokio::time::sleep(reconciliation_wait) => OwnerEvent::Reconcile,
+    }
+}
+
+fn run_one_owner_maintenance_slice(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
+    let started = Instant::now();
+    let kind = state.maintenance.scheduler.take_slice();
+    state.lifecycle_counters.reconciliation_wakes = state
+        .lifecycle_counters
+        .reconciliation_wakes
+        .saturating_add(1);
+    match kind {
+        MaintenanceSliceKind::SubscriberDelivery => {
+            drive_entity_subscriptions(daemon, state);
+        }
+        MaintenanceSliceKind::ProviderResync => {
+            drive_package_entity_fanout(daemon, state);
+            drive_package_entity_resync(daemon, state);
+        }
+        MaintenanceSliceKind::PackageEventDelivery => {
+            if let Some(runtime) = daemon.runtime() {
+                run_maintenance_kind(
+                    runtime,
+                    &mut state.maintenance,
+                    MaintenanceSliceKind::PackageEventDelivery,
+                );
+            }
+        }
+        other => {
+            if let Some(runtime) = daemon.runtime() {
+                let _ = runtime.apply_event_plane_owner_ops();
+                if runtime.package_event_router().peek_delivery_wake()
+                    || runtime.event_plane_owner_ops_pending()
+                {
+                    state.maintenance.try_wake();
+                }
+                run_maintenance_kind(runtime, &mut state.maintenance, other);
+            }
+        }
+    }
+    state.maintenance.last_owner_turn = started.elapsed();
+    state.lifecycle_counters.lifecycle_change_reads = state.maintenance.journal_page_reads;
+    state.lifecycle_counters.lifecycle_baseline_reads = state.maintenance.baseline_page_reads;
+    if state.maintenance.needs_work()
+        || session_subscribers_need_delivery(state)
+        || daemon
+            .runtime()
+            .is_some_and(crate::HubRuntime::package_entity_resync_still_needed)
+        || daemon.runtime().is_some_and(|runtime| {
+            runtime.package_event_router().peek_delivery_wake()
+                || runtime.event_plane_owner_ops_pending()
+        })
+    {
+        state.maintenance.try_wake();
     }
 }
 
@@ -213,17 +267,23 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
         while let Ok(cleanup) = cleanup_rx.try_recv() {
             handle_connection_cleanup(&mut daemon, &mut control_state, control_tx.clone(), cleanup);
         }
+        let slice_due = control_state.maintenance.needs_work()
+            || control_state.next_reconciliation <= Instant::now();
         let event = match control_rx.try_recv() {
-            Ok(message) => OwnerEvent::Control(Box::new(Some(message))),
+            Ok(message) => Some(OwnerEvent::Control(Box::new(Some(message)))),
+            Err(_) if slice_due => None,
             Err(_) => {
                 let wait = control_state
                     .next_reconciliation
                     .saturating_duration_since(Instant::now());
-                transport_runtime.block_on(receive_owner_event(&mut control_rx, wait))
+                match transport_runtime.block_on(receive_owner_event(&mut control_rx, wait)) {
+                    OwnerEvent::Control(message) => Some(OwnerEvent::Control(message)),
+                    OwnerEvent::Reconcile => None,
+                }
             }
         };
-        match event {
-            OwnerEvent::Control(message) => match *message {
+        if let Some(OwnerEvent::Control(message)) = event {
+            match *message {
                 Some(ControlMessage::AcceptedConnection {
                     stream,
                     admission_permit,
@@ -282,18 +342,18 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
                     }
                 }
                 None => return Err(DaemonTransportError::ControlThreadStopped),
-            },
-            OwnerEvent::Reconcile => {
-                if control_state.next_reconciliation <= Instant::now() {
-                    pump_bound_unix_routes(&mut daemon, &mut control_state);
-                    drive_entity_subscriptions(&mut daemon, &mut control_state);
-                    control_state.next_reconciliation =
-                        Instant::now() + ENTITY_RECONCILIATION_INTERVAL;
-                }
-                if !socket_path.exists() {
-                    rebind_missing_socket_path(&socket_path);
-                }
             }
+        }
+        let interval_due = control_state.next_reconciliation <= Instant::now();
+        if control_state.maintenance.needs_work() || interval_due {
+            run_one_owner_maintenance_slice(&mut daemon, &mut control_state);
+        }
+        if interval_due {
+            pump_bound_unix_routes(&mut daemon, &mut control_state);
+            control_state.next_reconciliation = Instant::now() + ENTITY_RECONCILIATION_INTERVAL;
+        }
+        if !socket_path.exists() {
+            rebind_missing_socket_path(&socket_path);
         }
     }
 }
@@ -2233,10 +2293,22 @@ pub(crate) fn handle_control_message(
                 };
                 record_attached_subscription_change(state, change, grant_id.as_deref());
             }
-            if reconcile_after_request {
-                pump_bound_unix_routes(daemon, state);
-                drive_entity_subscriptions(daemon, state);
-                state.next_reconciliation = Instant::now() + ENTITY_RECONCILIATION_INTERVAL;
+            if request_succeeded(response.as_ref()) {
+                if reconcile_after_request {
+                    state.maintenance.note_authoritative_mutation();
+                } else if matches!(request, DaemonRequest::PluginSurfaceAction { .. })
+                    && daemon
+                        .runtime()
+                        .is_some_and(crate::HubRuntime::package_entity_work_pending)
+                {
+                    state.maintenance.try_wake();
+                }
+            }
+            if daemon.runtime().is_some_and(|runtime| {
+                runtime.package_event_router().peek_delivery_wake()
+                    || runtime.event_plane_owner_ops_pending()
+            }) {
+                state.maintenance.try_wake();
             }
             if response
                 .as_ref()
@@ -2258,10 +2330,9 @@ pub(crate) fn handle_control_message(
             }
             // Reply first so surface-action publish can return before fanout delivery.
             // Attach writes `attaching` before Core attach work; Drain advances the stream.
-            let reply_result = send_control_response(reply_tx, response, response_delivery_rx);
-            drive_package_entity_fanout(daemon, state);
-            drive_package_entity_resync(daemon, state);
-            reply_result
+            // Authoritative mutations already set one coalesced wake. Status and
+            // other reads must not force an extra owner-loop slice.
+            send_control_response(reply_tx, response, response_delivery_rx)
         }
         ControlMessage::HubUpdateCheckCompleted { update } => state
             .pending_hub_update_reply
@@ -4788,10 +4859,6 @@ impl std::ops::DerefMut for PendingRuntimeState {
 }
 
 impl PendingRuntimeState {
-    pub(super) fn retain_active_sessions(&mut self, active_session_ids: &BTreeSet<String>) {
-        self.streams.retain_active_sessions(active_session_ids);
-    }
-
     #[cfg(test)]
     pub(crate) fn webrtc_is_admitted(&self, grant_id: &str) -> bool {
         matches!(
@@ -4854,9 +4921,9 @@ pub(crate) struct DaemonControlState {
     drain_cursors: BTreeMap<String, u64>,
     egress_diagnostics: DaemonEgressDiagnostics,
     pub(crate) entity_subscriptions: BTreeMap<String, EntitySubscriptionState>,
-    reconciliation: EntityReconciliationState,
     pub(crate) pending_runtime: PendingRuntimeState,
     pub(crate) lifecycle_counters: DaemonLifecycleCounters,
+    pub(crate) maintenance: MaintenanceState,
     next_reconciliation: Instant,
     released_entity_generations: u64,
     pub(crate) released_attach_generations: u64,
@@ -4872,9 +4939,9 @@ impl Default for DaemonControlState {
             drain_cursors: BTreeMap::new(),
             egress_diagnostics: DaemonEgressDiagnostics::default(),
             entity_subscriptions: BTreeMap::new(),
-            reconciliation: EntityReconciliationState::default(),
             pending_runtime: PendingRuntimeState::default(),
             lifecycle_counters: DaemonLifecycleCounters::default(),
+            maintenance: MaintenanceState::default(),
             next_reconciliation: Instant::now(),
             released_entity_generations: 0,
             released_attach_generations: 0,
@@ -5018,6 +5085,13 @@ fn record_attached_subscription_change(
             state.pending_runtime.attach_owner_grant_ids.remove(&route);
         }
     }
+}
+
+fn request_succeeded(response: Result<&DaemonResponse, &DaemonTransportError>) -> bool {
+    matches!(
+        response,
+        Ok(response) if response.kind != DaemonResponseKind::OperatorError
+    )
 }
 
 fn control_request_operation_label(request: &DaemonRequest) -> &'static str {
@@ -5613,7 +5687,15 @@ fn emit_worktree_lifecycle_event(
     if let Some(runtime) = daemon.runtime()
         && let Ok(payload) = serde_json::to_value(&event)
     {
-        let _ = runtime.emit_plugin_event(&event.event, payload);
+        let _ = runtime.package_event_router().try_ingress(
+            crate::package_event_router::HUB_EVENT_OWNER,
+            &event.event,
+            &payload,
+            std::time::Instant::now(),
+        );
+        if runtime.package_event_router().peek_delivery_wake() {
+            // Delivery is owner-loop work. The mutating response does not wait.
+        }
     }
     response
         .events

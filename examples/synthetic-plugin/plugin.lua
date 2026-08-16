@@ -1,5 +1,5 @@
 -- Local-only synthetic package fixture for the botster-hub runtime proof.
-events.on("worktree_created", function(event)
+events.on("hub", "worktree_created", function(event)
   return {
     observed = "worktree_created",
     worktree_id = event.worktree_id,

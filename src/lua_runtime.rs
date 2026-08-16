@@ -3,6 +3,7 @@
 //! This module intentionally exposes a narrow ABI: plugin registration,
 //! handler invocation by stable id, and selected hub capability helpers.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
@@ -10,7 +11,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use botster_core::{
     BoundaryJson, CapabilityOperation, CapabilityOperationId, CapabilityRuntimeErrorKind,
@@ -29,8 +30,24 @@ use serde_json::json;
 
 use crate::capabilities::{HubCapabilityRuntime, PluginStoreBatchMutation, PluginStoreBatchResult};
 use crate::lifecycle::{HubPluginEventHandler, HubPluginRuntimeBundle, package_entity_owner_token};
+use crate::package_event_router::{
+    CAUSAL_PENDING_MAX, CausalAdmitResult, CausalOp, CausalScopeTable, EventPlaneStatus,
+    PackageEventRouter,
+};
 use crate::packages::{PackageConfigurationView, PackageRecord, PreparedLocalPackage};
 use crate::runtime::{SharedSessionTypeSpawner, SharedSpawnTargets, SharedWorktrees};
+
+thread_local! {
+    static INVOCATION_CAUSAL_SCOPE: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+pub(crate) fn current_causal_scope() -> Option<u64> {
+    INVOCATION_CAUSAL_SCOPE.with(Cell::get)
+}
+
+fn set_current_causal_scope(scope_id: Option<u64>) {
+    INVOCATION_CAUSAL_SCOPE.with(|cell| cell.set(scope_id));
+}
 use crate::session_types::{
     ManagedSessionTypeRequest, SessionTypeContextInput, SessionTypeRequest,
 };
@@ -53,6 +70,13 @@ pub struct HubCoordinationBridge {
 pub struct HubEntityPublishBridge {
     owner_thread: thread::ThreadId,
     pending: Arc<Mutex<VecDeque<PendingEntityPublishRequest>>>,
+    pending_releases: Arc<Mutex<VecDeque<CausalOp>>>,
+    scope_releases: Arc<Mutex<VecDeque<CausalOp>>>,
+    orphan_ops: Arc<Mutex<VecDeque<CausalOp>>>,
+    held_release: Arc<Mutex<Option<CausalOp>>>,
+    source_release: Arc<Mutex<Option<CausalOp>>>,
+    next_token: Arc<AtomicU64>,
+    reject_next: Arc<AtomicBool>,
 }
 
 impl HubEntityPublishBridge {
@@ -60,32 +84,258 @@ impl HubEntityPublishBridge {
         Self {
             owner_thread: thread::current().id(),
             pending: Arc::new(Mutex::new(VecDeque::new())),
+            pending_releases: Arc::new(Mutex::new(VecDeque::new())),
+            scope_releases: Arc::new(Mutex::new(VecDeque::new())),
+            orphan_ops: Arc::new(Mutex::new(VecDeque::new())),
+            held_release: Arc::new(Mutex::new(None)),
+            source_release: Arc::new(Mutex::new(None)),
+            next_token: Arc::new(AtomicU64::new(1)),
+            reject_next: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn mark_orphan(&self, op: CausalOp) -> CausalAdmitResult {
+        if let Ok(mut orphans) = self.orphan_ops.try_lock()
+            && orphans.len() < CAUSAL_PENDING_MAX
+        {
+            orphans.push_back(op);
+            return CausalAdmitResult::Applied;
+        }
+        if let Ok(mut held) = self.held_release.try_lock()
+            && held.is_none()
+        {
+            *held = Some(op);
+            return CausalAdmitResult::Applied;
+        }
+        CausalAdmitResult::Retry(op)
+    }
+
+    pub fn leave_source(&self, op: CausalOp) -> CausalAdmitResult {
+        if let Ok(mut source) = self.source_release.try_lock()
+            && source.is_none()
+        {
+            *source = Some(op);
+            return CausalAdmitResult::Applied;
+        }
+        CausalAdmitResult::Retry(op)
+    }
+
+    pub fn take_source(&self) -> Option<CausalOp> {
+        self.source_release
+            .try_lock()
+            .ok()
+            .and_then(|mut source| source.take())
+    }
+
+    #[doc(hidden)]
+    pub fn test_with_orphan_stores_held<R>(&self, body: impl FnOnce() -> R) -> R {
+        let _orphans = self
+            .orphan_ops
+            .try_lock()
+            .expect("test hold must acquire orphan ops");
+        let _held = self
+            .held_release
+            .try_lock()
+            .expect("test hold must acquire held release");
+        body()
+    }
+
+    pub fn park_release(&self, op: CausalOp) -> CausalAdmitResult {
+        if let Ok(mut pending) = self.pending_releases.try_lock()
+            && pending.len() < CAUSAL_PENDING_MAX
+        {
+            pending.push_back(op);
+            return CausalAdmitResult::Applied;
+        }
+        if let Ok(mut scopes) = self.scope_releases.try_lock()
+            && scopes.len() < CAUSAL_PENDING_MAX
+        {
+            scopes.push_back(op);
+            return CausalAdmitResult::Applied;
+        }
+        CausalAdmitResult::Retry(op)
+    }
+
+    pub fn take_release(&self) -> Option<CausalOp> {
+        if let Ok(mut pending) = self.pending_releases.try_lock()
+            && let Some(op) = pending.pop_front()
+        {
+            return Some(op);
+        }
+        if let Ok(mut scopes) = self.scope_releases.try_lock()
+            && let Some(op) = scopes.pop_front()
+        {
+            return Some(op);
+        }
+        if let Ok(mut orphans) = self.orphan_ops.try_lock()
+            && let Some(op) = orphans.pop_front()
+        {
+            return Some(op);
+        }
+        if let Ok(mut held) = self.held_release.try_lock()
+            && let Some(op) = held.take()
+        {
+            return Some(op);
+        }
+        self.take_source()
+    }
+
+    #[must_use]
+    pub fn release_count(&self) -> usize {
+        let queued = self
+            .pending_releases
+            .try_lock()
+            .map(|pending| pending.len())
+            .unwrap_or(0);
+        let scoped = self
+            .scope_releases
+            .try_lock()
+            .map(|scopes| scopes.len())
+            .unwrap_or(0);
+        let orphans = self
+            .orphan_ops
+            .try_lock()
+            .map(|pending| pending.len())
+            .unwrap_or(0);
+        let held = self
+            .held_release
+            .try_lock()
+            .map(|held| usize::from(held.is_some()))
+            .unwrap_or(0);
+        let source = self
+            .source_release
+            .try_lock()
+            .map(|source| usize::from(source.is_some()))
+            .unwrap_or(0);
+        queued + scoped + orphans + held + source
+    }
+
+    #[must_use]
+    pub fn has_pending_releases(&self) -> bool {
+        self.release_count() > 0
+    }
+
+    #[must_use]
+    pub fn has_release_room(&self) -> bool {
+        self.pending_releases
+            .try_lock()
+            .map(|pending| pending.len() < CAUSAL_PENDING_MAX)
+            .unwrap_or(false)
+            || self
+                .scope_releases
+                .try_lock()
+                .map(|scopes| scopes.len() < CAUSAL_PENDING_MAX)
+                .unwrap_or(false)
+            || self
+                .orphan_ops
+                .try_lock()
+                .map(|orphans| orphans.len() < CAUSAL_PENDING_MAX)
+                .unwrap_or(false)
+            || self
+                .held_release
+                .try_lock()
+                .map(|held| held.is_none())
+                .unwrap_or(false)
+            || self
+                .source_release
+                .try_lock()
+                .map(|source| source.is_none())
+                .unwrap_or(false)
+    }
+
+    #[doc(hidden)]
+    pub fn reject_next_publish(&self) {
+        self.reject_next.store(true, Ordering::SeqCst);
+    }
+
+    #[must_use]
+    #[doc(hidden)]
+    pub fn pending_publish_count(&self) -> usize {
+        self.pending
+            .lock()
+            .map(|pending| pending.len())
+            .unwrap_or(0)
+    }
+
+    #[doc(hidden)]
+    pub fn test_queue_publish(
+        &self,
+        plugin_key: PluginKey,
+        frame: serde_json::Value,
+        scope_id: Option<u64>,
+    ) -> mpsc::Receiver<Result<crate::package_entity_fanout::PackageEntityPublishResult, String>>
+    {
+        let token = self.next_token.fetch_add(1, Ordering::SeqCst);
+        let (response, receiver) = mpsc::channel();
+        self.pending
+            .lock()
+            .expect("entity publish queue lock")
+            .push_back(PendingEntityPublishRequest {
+                token,
+                plugin_key,
+                frame,
+                scope_id,
+                response,
+            });
+        receiver
     }
 
     fn publish(
         &self,
         plugin_key: PluginKey,
         frame: serde_json::Value,
-    ) -> Result<crate::package_entity_fanout::PackageEntityPublishResult, String> {
+        scope_id: Option<u64>,
+    ) -> Result<crate::package_entity_fanout::PackageEntityPublishResult, EntityPublishError> {
+        if self.reject_next.swap(false, Ordering::SeqCst) {
+            return Err(EntityPublishError::NeverQueued(
+                "entity publish rejected before queue".to_string(),
+            ));
+        }
         if thread::current().id() == self.owner_thread {
-            return Err(
+            return Err(EntityPublishError::NeverQueued(
                 "botster.entity_publish is only available during handler invocation, not at plugin load"
                     .to_string(),
-            );
+            ));
         }
+        let token = self.next_token.fetch_add(1, Ordering::SeqCst);
         let (response, receiver) = mpsc::channel();
         self.pending
             .lock()
-            .map_err(|_| "entity publish queue lock poisoned".to_string())?
+            .map_err(|_| {
+                EntityPublishError::NeverQueued("entity publish queue lock poisoned".to_string())
+            })?
             .push_back(PendingEntityPublishRequest {
+                token,
                 plugin_key,
                 frame,
+                scope_id,
                 response,
             });
-        receiver
-            .recv_timeout(Duration::from_millis(ENTITY_PUBLISH_REQUEST_TIMEOUT_MS))
-            .map_err(|_| "entity publish request did not complete before timeout".to_string())?
+        match receiver.recv_timeout(Duration::from_millis(ENTITY_PUBLISH_REQUEST_TIMEOUT_MS)) {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(error)) => Err(EntityPublishError::OwnerFinished(error)),
+            Err(_) => {
+                if self.try_retract(token) {
+                    Err(EntityPublishError::NeverQueued(
+                        "entity publish request did not complete before timeout".to_string(),
+                    ))
+                } else {
+                    Err(EntityPublishError::TimeoutInFlight)
+                }
+            }
+        }
+    }
+
+    fn try_retract(&self, token: u64) -> bool {
+        let Ok(mut pending) = self.pending.lock() else {
+            return false;
+        };
+        if let Some(index) = pending.iter().position(|request| request.token == token) {
+            pending.remove(index);
+            true
+        } else {
+            false
+        }
     }
 
     pub(crate) fn take_pending(&self) -> Option<PendingEntityPublishRequest> {
@@ -96,9 +346,17 @@ impl HubEntityPublishBridge {
     }
 }
 
+enum EntityPublishError {
+    NeverQueued(String),
+    OwnerFinished(String),
+    TimeoutInFlight,
+}
+
 pub(crate) struct PendingEntityPublishRequest {
+    token: u64,
     pub(crate) plugin_key: PluginKey,
     pub(crate) frame: serde_json::Value,
+    pub(crate) scope_id: Option<u64>,
     pub(crate) response:
         mpsc::Sender<Result<crate::package_entity_fanout::PackageEntityPublishResult, String>>,
 }
@@ -218,6 +476,8 @@ struct LuaHostApi {
     spawn_targets: SharedSpawnTargets,
     worktrees: SharedWorktrees,
     package_records: Vec<PackageRecord>,
+    package_event_router: Arc<PackageEventRouter>,
+    causal_scopes: Arc<CausalScopeTable>,
 }
 
 /// Shared hub-owned primitives exposed to one Lua plugin runtime.
@@ -229,6 +489,8 @@ pub struct LuaPluginHostApi {
     pub session_types: SharedSessionTypeSpawner,
     pub spawn_targets: SharedSpawnTargets,
     pub worktrees: SharedWorktrees,
+    pub package_event_router: Arc<PackageEventRouter>,
+    pub causal_scopes: Arc<CausalScopeTable>,
 }
 
 /// Real Lua runtime for one loaded plugin package.
@@ -261,6 +523,8 @@ impl LuaPluginRuntime {
             spawn_targets: api.spawn_targets,
             worktrees: api.worktrees,
             package_records,
+            package_event_router: api.package_event_router,
+            causal_scopes: api.causal_scopes,
         };
         let loaded = LoadedLuaPlugin::load(plugin_key.clone(), selected_entrypoint_path, host_api)?;
         Ok(HubPluginRuntimeBundle {
@@ -385,7 +649,14 @@ impl PluginRuntime for LuaPluginRuntime {
             }
         };
 
-        match function.call::<Value>(payload) {
+        let scope_id = request
+            .context
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.0.get("causal_scope_id"))
+            .and_then(serde_json::Value::as_u64);
+        set_current_causal_scope(scope_id);
+        let outcome = match function.call::<Value>(payload) {
             Ok(Value::Nil) => PluginInvocationResult::Completed(PluginInvocationSuccess {
                 request_id: request.request_id,
                 handler: request.handler,
@@ -408,7 +679,9 @@ impl PluginRuntime for LuaPluginRuntime {
                 PluginInvocationFailureKind::HandlerFailed,
                 sanitize_lua_error(error),
             ),
-        }
+        };
+        set_current_causal_scope(None);
+        outcome
     }
 
     fn stop(&self, _plugin_key: &PluginKey) {
@@ -541,7 +814,14 @@ impl LoadedLuaPlugin {
                         "event handlers require a non-empty event name".to_string(),
                     ));
                 }
+                let event_owner = handler.event_owner.unwrap_or_default();
+                if event_owner.trim().is_empty() {
+                    return Err(LuaPluginRuntimeError::Lua(
+                        EventPlaneStatus::RejectedInvalid.as_str().to_string(),
+                    ));
+                }
                 event_handlers.push(HubPluginEventHandler {
+                    event_owner,
                     event_name,
                     handler: handler_ref.clone(),
                 });
@@ -610,6 +890,7 @@ struct LuaHandlerRegistration {
     id: String,
     kind: PluginHandlerKind,
     descriptor_id: String,
+    event_owner: Option<String>,
     event_name: Option<String>,
     body: serde_json::Value,
 }
@@ -635,30 +916,66 @@ fn install_botster_api(
     let events = lua.create_table()?;
     events.set(
         "on",
-        lua.create_function(|lua, (event_name, handler): (String, Function)| {
-            if event_name.trim().is_empty() {
-                return Err(mlua::Error::RuntimeError(
-                    "events.on requires a non-empty event name".to_string(),
-                ));
-            }
-            let registration = lua.globals().get::<Table>("__botster_registration")?;
-            let handler_table: Table = match registration.get("handlers") {
-                Ok(handler_table) => handler_table,
-                Err(_) => {
-                    let handler_table = lua.create_table()?;
-                    registration.set("handlers", handler_table.clone())?;
-                    handler_table
+        lua.create_function(
+            move |lua, (owner, name, handler): (Value, Value, Option<Value>)| {
+                let (Value::String(owner), Value::String(name), Some(Value::Function(handler))) =
+                    (owner, name, handler)
+                else {
+                    return Err(mlua::Error::RuntimeError(
+                        EventPlaneStatus::RejectedInvalid.as_str().to_string(),
+                    ));
+                };
+                let owner = owner.to_str()?.to_string();
+                let name = name.to_str()?.to_string();
+                if owner.trim().is_empty()
+                    || name.trim().is_empty()
+                    || owner.contains('*')
+                    || name.contains('*')
+                    || owner.contains('?')
+                    || name.contains('?')
+                {
+                    return Err(mlua::Error::RuntimeError(
+                        EventPlaneStatus::RejectedWildcard.as_str().to_string(),
+                    ));
                 }
-            };
-            let handler_id = format!("event:{event_name}:{}", handler_table.raw_len() + 1);
-            let handlers = lua.globals().get::<Table>("__botster_handlers")?;
-            handlers.set(handler_id.clone(), handler)?;
-            let entry = lua.create_table()?;
-            entry.set("id", handler_id)?;
-            entry.set("kind", "event")?;
-            entry.set("event", event_name)?;
-            handler_table.set(handler_table.raw_len() + 1, entry)?;
-            Ok(())
+                let registration = lua.globals().get::<Table>("__botster_registration")?;
+                let handler_table: Table = match registration.get("handlers") {
+                    Ok(handler_table) => handler_table,
+                    Err(_) => {
+                        let handler_table = lua.create_table()?;
+                        registration.set("handlers", handler_table.clone())?;
+                        handler_table
+                    }
+                };
+                let handler_id = format!("event:{owner}:{name}:{}", handler_table.raw_len() + 1);
+                let handlers = lua.globals().get::<Table>("__botster_handlers")?;
+                handlers.set(handler_id.clone(), handler)?;
+                let entry = lua.create_table()?;
+                entry.set("id", handler_id)?;
+                entry.set("kind", "event")?;
+                entry.set("event_owner", owner)?;
+                entry.set("event", name)?;
+                handler_table.set(handler_table.raw_len() + 1, entry)?;
+                Ok(())
+            },
+        )?,
+    )?;
+    let emit_router = host_api.package_event_router.clone();
+    let emit_plugin = plugin_key.clone();
+    let emit_scopes = host_api.causal_scopes.clone();
+    events.set(
+        "emit",
+        lua.create_function(move |lua, (name, payload): (String, Value)| {
+            if let Some(scope_id) = current_causal_scope()
+                && emit_scopes.is_live(scope_id)
+            {
+                return lua.to_value(&json!({
+                    "status": EventPlaneStatus::RejectedCausalScope.as_str(),
+                }));
+            }
+            let payload = lua.from_value::<serde_json::Value>(payload)?;
+            let status = emit_router.try_ingress(&emit_plugin.0, &name, &payload, Instant::now());
+            lua.to_value(&json!({ "status": status.as_str() }))
         })?,
     )?;
     globals.set("__botster_registration", lua.create_table()?)?;
@@ -784,9 +1101,21 @@ fn entity_publish_function(
 ) -> Result<Function, mlua::Error> {
     lua.create_function(move |lua, args: Value| {
         let value = lua.from_value::<serde_json::Value>(args)?;
-        let result = bridge
-            .publish(plugin_key.clone(), value)
-            .map_err(mlua::Error::RuntimeError)?;
+        let scope_id = current_causal_scope();
+        let result = match bridge.publish(plugin_key.clone(), value, scope_id) {
+            Ok(result) => result,
+            Err(EntityPublishError::OwnerFinished(error)) => {
+                return Err(mlua::Error::RuntimeError(error));
+            }
+            Err(EntityPublishError::TimeoutInFlight) => {
+                return Err(mlua::Error::RuntimeError(
+                    "entity publish request did not complete before timeout".to_string(),
+                ));
+            }
+            Err(EntityPublishError::NeverQueued(error)) => {
+                return Err(mlua::Error::RuntimeError(error));
+            }
+        };
         lua.to_value(&json!({
             "ok": result.ok,
             "status": result.status.as_str(),
@@ -1505,6 +1834,10 @@ fn registration_from_value(
                     .get("descriptor_id")
                     .or_else(|_| handler.get("id"))
                     .map_err(LuaPluginRuntimeError::from)?,
+                event_owner: handler
+                    .get::<Option<String>>("event_owner")
+                    .map_err(LuaPluginRuntimeError::from)?
+                    .or_else(|| handler.get::<Option<String>>("owner").ok().flatten()),
                 event_name: handler
                     .get::<Option<String>>("event")
                     .map_err(LuaPluginRuntimeError::from)?

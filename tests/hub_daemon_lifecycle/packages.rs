@@ -3036,6 +3036,270 @@ fn session_type_crud_pushes_authoritative_entity_deltas_without_polling() {
     shutdown_cli_daemon(&data_dir, child);
 }
 
+fn device_session_type_definition(
+    id: &str,
+    label: &str,
+) -> botster_hub_client::DaemonSessionTypeDefinition {
+    botster_hub_client::DaemonSessionTypeDefinition {
+        id: id.to_string(),
+        label: label.to_string(),
+        description: Some(format!("{label} description")),
+        icon: Some("terminal".to_string()),
+        role: "botster.accessory".to_string(),
+        interaction: "interactive".to_string(),
+        traits: vec!["terminal".to_string()],
+        lifecycle: "persistent".to_string(),
+        execution: botster_hub_client::DaemonSessionTypeExecution::RelativeExecutable,
+        command: "bin/accessory.sh".to_string(),
+        args: Vec::new(),
+        working_directory: botster_hub_client::DaemonSessionTypeWorkingDirectory::Relative {
+            path: "nested/dir".to_string(),
+        },
+        environment: BTreeMap::from([("BOTSTER_MODE".to_string(), "authored".to_string())]),
+        allowed_environment_overrides: vec!["BOTSTER_MODE".to_string()],
+        context: Vec::new(),
+        target_id: None,
+    }
+}
+
+fn assert_contiguous_session_type_frames(
+    frames: &[botster_hub_client::DaemonEntityFrame],
+    subscription_id: &str,
+    first_seq: u64,
+) {
+    assert!(
+        !frames.is_empty(),
+        "held session-type subscription must deliver at least one frame"
+    );
+    for (index, frame) in frames.iter().enumerate() {
+        let expected = first_seq + index as u64;
+        match frame {
+            botster_hub_client::DaemonEntityFrame::Snapshot {
+                subscription_id: observed_id,
+                snapshot_seq,
+                ..
+            }
+            | botster_hub_client::DaemonEntityFrame::Upsert {
+                subscription_id: observed_id,
+                snapshot_seq,
+                ..
+            }
+            | botster_hub_client::DaemonEntityFrame::Remove {
+                subscription_id: observed_id,
+                snapshot_seq,
+                ..
+            }
+            | botster_hub_client::DaemonEntityFrame::Patch {
+                subscription_id: observed_id,
+                snapshot_seq,
+                ..
+            } => {
+                assert_eq!(
+                    observed_id, subscription_id,
+                    "frame {index} left the held subscription: {frame:?}"
+                );
+                assert_eq!(
+                    *snapshot_seq, expected,
+                    "frame {index} broke the Web +1 contract: {frame:?}"
+                );
+            }
+            other => panic!("unexpected session-type frame {index}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn session_type_held_subscription_stays_contiguous_through_populated_catalog_crud() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("session-type-held-crud");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("test config has local socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::CreateSessionType {
+            source: botster_hub_client::DaemonSessionTypeMutationSource::Device,
+            definition: device_session_type_definition("seed-accessory", "Seed accessory"),
+        },
+    )
+    .expect("seed a catalog row before subscribe");
+
+    let mut subscription = botster_hub_client::subscribe_entities(
+        &endpoint,
+        "session_type",
+        "held-session-type-crud",
+    )
+    .expect("subscribe one session_type family");
+    subscription
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound held session type entity reads");
+    let snapshot = subscription
+        .next_frame()
+        .expect("initial populated snapshot");
+    let snapshot_seq = match &snapshot {
+        botster_hub_client::DaemonEntityFrame::Snapshot {
+            subscription_id,
+            snapshot_seq,
+            items,
+            ..
+        } => {
+            assert_eq!(subscription_id, "held-session-type-crud");
+            assert!(
+                items.iter().any(|item| item["session_type_id"] == "device/seed-accessory"),
+                "snapshot must include the pre-existing catalog row: {items:?}"
+            );
+            *snapshot_seq
+        }
+        other => panic!("expected populated snapshot, got {other:?}"),
+    };
+
+    let package_dir = unique_test_dir("session-type-held-two-row-package");
+    fs::create_dir_all(&package_dir).expect("create two-row session type package");
+    fs::write(
+        package_dir.join("plugin.lua"),
+        "return botster.register({})\n",
+    )
+    .expect("write two-row session type plugin");
+    fs::write(
+        package_dir.join("botster-package.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "name": "session-type.held-two-row",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "source": { "type": "path", "path": package_dir.canonicalize().expect("package path") },
+            "capabilities": [],
+            "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }],
+            "session_types": [
+                {
+                    "id": "package-one",
+                    "label": "Package one",
+                    "role": "botster.accessory",
+                    "interaction": "service",
+                    "traits": ["background"],
+                    "lifecycle": "persistent",
+                    "command": "bin/one"
+                },
+                {
+                    "id": "package-two",
+                    "label": "Package two",
+                    "role": "botster.accessory",
+                    "interaction": "service",
+                    "traits": ["background"],
+                    "lifecycle": "persistent",
+                    "command": "bin/two"
+                }
+            ]
+        }))
+        .expect("serialize two-row session type package"),
+    )
+    .expect("write two-row session type package manifest");
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::EnablePackageLocalPath { path: package_dir },
+    )
+    .expect("enable package that publishes two session types in one generation");
+
+    let package_one = subscription
+        .next_frame()
+        .expect("first same-generation package upsert");
+    let package_two = subscription
+        .next_frame()
+        .expect("second same-generation package upsert");
+    let package_ids = [
+        match &package_one {
+            botster_hub_client::DaemonEntityFrame::Upsert { id, .. } => id.as_str(),
+            other => panic!("expected first package upsert, got {other:?}"),
+        },
+        match &package_two {
+            botster_hub_client::DaemonEntityFrame::Upsert { id, .. } => id.as_str(),
+            other => panic!("expected second package upsert, got {other:?}"),
+        },
+    ];
+    assert!(
+        package_ids.contains(&"session-type.held-two-row/package-one")
+            && package_ids.contains(&"session-type.held-two-row/package-two"),
+        "package enable must publish both rows: {package_one:?} {package_two:?}"
+    );
+
+    let created = device_session_type_definition("held-accessory", "Held accessory");
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::CreateSessionType {
+            source: botster_hub_client::DaemonSessionTypeMutationSource::Device,
+            definition: created.clone(),
+        },
+    )
+    .expect("create a second device session type on the held subscription");
+    let create_frame = subscription.next_frame().expect("held create upsert");
+    assert!(
+        matches!(
+            &create_frame,
+            botster_hub_client::DaemonEntityFrame::Upsert { id, .. }
+                if id == "device/held-accessory"
+        ),
+        "create must arrive as an upsert on the held subscription: {create_frame:?}"
+    );
+
+    let mut updated = created;
+    updated.label = "Updated held accessory".to_string();
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::UpdateSessionType {
+            source: botster_hub_client::DaemonSessionTypeMutationSource::Device,
+            definition: updated,
+        },
+    )
+    .expect("update the held device session type");
+    let update_frame = subscription.next_frame().expect("held update upsert");
+    assert!(
+        matches!(
+            &update_frame,
+            botster_hub_client::DaemonEntityFrame::Upsert { entity, .. }
+                if entity["label"] == "Updated held accessory"
+        ),
+        "update must arrive as an upsert on the held subscription: {update_frame:?}"
+    );
+
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::DeleteSessionType {
+            source: botster_hub_client::DaemonSessionTypeMutationSource::Device,
+            session_type_id: "held-accessory".to_string(),
+        },
+    )
+    .expect("delete the held device session type");
+    let remove_frame = subscription.next_frame().expect("held delete remove");
+    assert!(
+        matches!(
+            &remove_frame,
+            botster_hub_client::DaemonEntityFrame::Remove { id, .. }
+                if id == "device/held-accessory"
+        ),
+        "delete must arrive as a remove on the held subscription: {remove_frame:?}"
+    );
+
+    let frames = vec![
+        snapshot,
+        package_one,
+        package_two,
+        create_frame,
+        update_frame,
+        remove_frame,
+    ];
+    assert_contiguous_session_type_frames(&frames, "held-session-type-crud", snapshot_seq);
+    drop(subscription);
+    shutdown_cli_daemon(&data_dir, child);
+}
+
 #[test]
 fn spawn_target_admission_pushes_repo_session_type_deltas_without_polling() {
     let _guard = daemon_test_guard();
