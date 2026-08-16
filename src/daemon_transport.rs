@@ -3253,7 +3253,8 @@ fn handle_runtime_control_request(
             let now = tick(logical_clock);
             match classify_shutdown_session(runtime, &session_id, now) {
                 Ok(ShutdownSessionClassification::Cleanup(cleanup)) => {
-                    pending_runtime.close_adapters_for_session(&session_id);
+                    // Keep adapters open. Classify already asked Core to write
+                    // ProcessExited. Host close abandons that in-flight frame.
                     return Ok(daemon_session_cleanup(cleanup));
                 }
                 Ok(ShutdownSessionClassification::Missing) => {
@@ -3262,7 +3263,6 @@ fn handle_runtime_control_request(
                 }
                 Ok(ShutdownSessionClassification::Active) | Err(_) => {}
             }
-            pending_runtime.close_adapters_for_session(&session_id);
             let shutdown_session_id = session_id.clone();
             let response = match api.handle_request(
                 runtime,
@@ -3275,6 +3275,7 @@ fn handle_runtime_control_request(
             ) {
                 Ok(response) => response,
                 Err(error) => {
+                    pending_runtime.close_adapters_for_session(&session_id);
                     let response = recover_after_core_shutdown_error(
                         runtime,
                         &session_id,

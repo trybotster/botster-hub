@@ -971,7 +971,9 @@ fn tui_shaped_hello_status_succeeds_without_host_terminal_tokens() {
         minimum_conformance_fixture_revision: 40,
         client_name: "botster-tui".to_string(),
     };
-    let terminal = botster_terminal_protocol::TerminalCompatibilityRequirement::for_ready_then_history_attach();
+    let terminal =
+        botster_terminal_protocol::TerminalCompatibilityRequirement::for_ready_then_history_attach(
+        );
     let (_stream, ack) = botster_hub_client::connect_and_hello_with_terminal_requirement(
         hub.endpoint(),
         &requirement,
@@ -979,11 +981,9 @@ fn tui_shaped_hello_status_succeeds_without_host_terminal_tokens() {
     )
     .expect("TUI-shaped Hello must succeed");
     assert!(
-        !requirement
-            .required_features
-            .iter()
-            .any(|feature| feature == botster_terminal_protocol::FEATURE_TERMINAL_STREAMING
-                || feature == botster_terminal_protocol::FEATURE_RESIZE),
+        !requirement.required_features.iter().any(|feature| feature
+            == botster_terminal_protocol::FEATURE_TERMINAL_STREAMING
+            || feature == botster_terminal_protocol::FEATURE_RESIZE),
         "TUI-shaped host Hello must not require terminal mechanism tokens"
     );
     assert!(ack.terminal_compatibility.is_some());
@@ -1658,6 +1658,103 @@ fn process_exit_and_shutdown_session_do_not_emit_terminal_subscription_closed() 
             )
         }),
         "process exit and ShutdownSession must stay on lifecycle paths: {events:?}"
+    );
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn unix_shutdown_session_from_another_connection_classifies_attached_exit() {
+    let _guard = daemon_test_guard();
+    let hub = start_isolated_live_output_hub("pse");
+    let endpoint = hub.endpoint().clone();
+    let session_id = "pse-session";
+    let subscription_id = "pse-sub";
+    let (mut stream, mut reader) = unix_adapter_connection(&endpoint);
+    let mut envelopes = Vec::new();
+    let mut events = Vec::new();
+    spawn_and_bind(
+        &mut stream,
+        &mut reader,
+        session_id,
+        subscription_id,
+        "printf 'pse-ready\\n'; exit 0",
+        &mut envelopes,
+        &mut events,
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !unix_envelope_contains_live_bytes(&envelopes, "pse-ready") {
+        stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("read timeout");
+        match botster_hub_client::read_unix_mux_frame_from_reader(&mut reader) {
+            Ok(botster_hub_client::DaemonUnixMuxFrame::Terminal(envelope)) => {
+                envelopes.push(envelope);
+            }
+            Ok(botster_hub_client::DaemonUnixMuxFrame::Event(event)) => events.push(event),
+            Ok(botster_hub_client::DaemonUnixMuxFrame::Response(_)) => {}
+            Err(_) => {
+                let _ = request_collecting_mux(
+                    &mut stream,
+                    &mut reader,
+                    &botster_hub_client::DaemonRequest::ReadScreen {
+                        session_id: session_id.to_string(),
+                    },
+                    &mut envelopes,
+                    &mut events,
+                );
+            }
+        }
+    }
+    stream.set_read_timeout(None).expect("clear read timeout");
+    assert!(
+        unix_envelope_contains_live_bytes(&envelopes, "pse-ready"),
+        "attached adapter must see live output before ShutdownSession: {envelopes:?}"
+    );
+
+    let shutdown = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::ShutdownSession {
+            session_id: session_id.to_string(),
+        },
+    )
+    .expect("shutdown from a separate connection");
+    assert_ne!(
+        shutdown.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError
+    );
+
+    let listed =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::ListSessions)
+            .expect("list after cross-connection shutdown");
+    assert!(
+        listed.sessions.iter().any(|session| {
+            session.session_id == session_id
+                && matches!(session.lifecycle.as_str(), "exited" | "stopping" | "failed")
+        }) || listed
+            .sessions
+            .iter()
+            .all(|session| session.session_id != session_id),
+        "ShutdownSession must leave the host session terminal on the control plane: {:?}",
+        listed.sessions
+    );
+    let drain = request_collecting_mux(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::Drain {
+            session_id: session_id.to_string(),
+            subscription_id: None,
+        },
+        &mut envelopes,
+        &mut events,
+    );
+    assert!(
+        drain.events.iter().all(|event| !matches!(
+            event,
+            botster_hub_client::DaemonEvent::ProcessExit { .. }
+                | botster_hub_client::DaemonEvent::TerminalOutput { .. }
+        )),
+        "host Drain must not translate ProcessExit after ShutdownSession: {:?}",
+        drain.events
     );
     hub.shutdown().expect("shutdown isolated hub");
 }
