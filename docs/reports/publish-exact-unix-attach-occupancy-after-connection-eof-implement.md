@@ -215,3 +215,11 @@ No convention conflict with loaded notes.
 - Including `generation` on the public row is allowed. TUI lookup remains the pair.
 - Empty occupancy without `attach_occupancy` is not proof.
 - Direct merge after Review/Verify. This Implement step commits on the ticket branch and does not open a PR.
+
+## Verify follow-up (`review_1786879940_398509`)
+
+Open finding `finding_1786879940_761494`:
+
+- `support_matrix_serializes_to_stable_json_shape` now expects `FEATURE_ATTACH_OCCUPANCY` in `supported_features`.
+- `required_features` still omits it.
+- After locked worker: `./test.sh -p botster-hub-test-support --lib support_matrix_serializes_to_stable_json_shape` and IsolatedHub `unix_eof_*` occupancy proofs.

@@ -5509,6 +5509,7 @@ mod tests {
                     botster_hub_client::FEATURE_UNIX_TERMINAL_ADAPTER,
                     botster_hub_client::FEATURE_TERMINAL_SUBSCRIPTION_CLOSED,
                     botster_hub_client::FEATURE_WEBRTC_TERMINAL_ADAPTER,
+                    botster_hub_client::FEATURE_ATTACH_OCCUPANCY,
                 ],
                 "diagnostic_kinds": [
                     "connected",
