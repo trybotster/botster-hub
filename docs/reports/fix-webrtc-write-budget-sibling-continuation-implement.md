@@ -3,9 +3,11 @@
 Ticket: `ticket_1786913892_208903`  
 Run: `run_1786914416_283641`  
 Step: `botster_stack_implement`  
-Status: production repair committed; Implement parked on `ticket_1786916741_161067` until a clean `./test.sh --locked` after that merge
+Status: production repair committed; separators blocker integrated; Implement parked on `ticket_1786921010_869253` until a clean `./test.sh --locked`
 
 Human answer `question_1786916746_614820`: commit the focused write-budget repair now; do not waive clean-suite acceptance; park Implement on the separators blocker; after that ticket merges, update from Hub main and run `./test.sh --locked` once; advance to Review only if that suite passes.
+
+Resume `msg_device-2_1786920855_84ce4a`: separators blocker merged at `a55f62d`. Integrated that revision. One `./test.sh --locked` after the worker build failed on a different lib-suite root. Did not retry. Did not advance.
 
 ## Target repository and target_id
 
@@ -14,7 +16,8 @@ Human answer `question_1786916746_614820`: commit the focused write-budget repai
 | `target_id` | `tgt_7e208a0c76a44980a83b63af976b1f22` |
 | `target_repository` | `botster-hub` (`trybotster/botster-hub`) |
 | Worktree | `/Users/jasonconigliari/botster-sessions/trybotster-botster-hub-project-pipelines-ticket_1786913892_208903` |
-| Base SHA | `origin/main` `c72712e2606b8abe77e1b91c2a736791036fadd8` |
+| Base SHA | original `c72712e2606b8abe77e1b91c2a736791036fadd8`; integrated Hub main `a55f62d9ba331c0389bc3a2ec79d5b9ed48c7ea7` |
+| Integrate merge | `6d376f3eef809837c00e39f8b57f1e799a921440` |
 | Locked Core SHA | `fc541a59338d0591ba4fb3fa522a030d212d26d0` |
 | Merge policy | direct into `main` after Review/Verify; no PR |
 | Implement commit | `6d69028bd6ec3a3d36f319c82fca58c01ee2d249` |
@@ -77,12 +80,12 @@ Already registered downstream consumers unchanged:
 - `ticket_1786661010_115885` (north-star)
 - `ticket_1786912570_127968` (snapshot paging)
 
-New same-repo blocker from this Implement visit:
+Same-repo blockers:
 
-- `ticket_1786916741_161067` — flaky `separators_close_when_item_bytes_fit_but_commas_do_not` under default-concurrency lib suite
-- `dependency_1786916742_692599` — this ticket depends on that blocker
+- `ticket_1786916741_161067` / `dependency_1786916742_692599` — separators flake; merged at Hub main `a55f62d`
+- `ticket_1786921010_869253` / `dependency_1786921011_357767` — flaky `near_limit_snapshot_assembly_stays_within_owner_turn` under default-concurrency lib suite
 
-Blocking human question: `question_1786916746_614820` (commit/park vs waive clean-suite for Review).
+Blocking human question: `question_1786916746_614820` (commit/park vs waive clean-suite for Review). Answer applied. Clean-suite gate is not waived.
 
 ## Deviations from plan
 
@@ -108,23 +111,28 @@ cargo clippy --workspace --all-targets --offline --locked -- -D warnings
 
 Ablation: temporarily restored mux-wide `set_would_block` on registered routes. Unit test failed at sibling `Ready` vs `WouldBlock` (not at an earlier assertion). Fix restored from fixed-file backup.
 
-Binding (one run, no retry):
+Binding first visit (one run, no retry) on `c72712e` plus write-budget repair:
 
 ```
 cargo build --locked -p botster-core-daemon --bin botster-session-worker
 ./test.sh --locked
 ```
 
-Result: lib suite `351 passed; 1 failed` on `daemon_transport::daemon_entity_subscriptions::tests::separators_close_when_item_bytes_fit_but_commas_do_not` (`SnapshotAssemble::Closed { frame_too_large: true }` at `src/daemon_entity_subscriptions.rs:3179`). Lifecycle suite did not start.
+Result: lib suite `351 passed; 1 failed` on `daemon_transport::daemon_entity_subscriptions::tests::separators_close_when_item_bytes_fit_but_commas_do_not` (`SnapshotAssemble::Closed { frame_too_large: true }` at `src/daemon_entity_subscriptions.rs:3179`). Lifecycle suite did not start. Isolated that test PASS on branch and base `c72712e`.
 
-Pre-existing / unrelated isolation for that root:
+Binding resume after integrating `a55f62d` (one run, no retry):
 
 ```
-cargo test --offline --locked --lib separators_close_when_item_bytes_fit_but_commas_do_not
+cargo build --locked -p botster-core-daemon --bin botster-session-worker
+./test.sh --locked
 ```
 
-- Branch: PASS  
-- Base `c72712e` (`/Users/jasonconigliari/Projects/botster-hub`): PASS  
+Result: lib suite `351 passed; 1 failed` on `daemon_transport::daemon_entity_subscriptions::tests::near_limit_snapshot_assembly_stays_within_owner_turn` (`started.elapsed() < Duration::from_millis(crate::MAX_OWNER_TURN_MS)` at `src/daemon_entity_subscriptions.rs:3033`). Lifecycle suite did not start.
+
+Isolation for that root (`cargo test --offline --locked --lib near_limit_snapshot_assembly_stays_within_owner_turn`):
+
+- Branch after integrate: PASS
+- Base `a55f62d` (`/Users/jasonconigliari/Projects/botster-hub`): PASS  
 
 Production entry point: `apply_data_channel_event` in `src/local_webrtc.rs` on the live `run_data_channel` path. IsolatedHub keep-reading write-budget proof exercises `flush_webrtc_host_events` / `flush_webrtc_adapter_frames` through production peer delivery.
 
@@ -132,7 +140,7 @@ Downstream north-star / snapshot suites are not claimed here.
 
 ## Unverified behavior or residual risk
 
-- Binding default-concurrency full `./test.sh --locked` is not green on this visit because of the separators root.
+- Binding default-concurrency full `./test.sh --locked` is not green after integrating `a55f62d` because of `near_limit_snapshot_assembly_stays_within_owner_turn`.
 - Lifecycle suite under default concurrency was not reached after the lib failure.
 - Sequential pressured flush of a closed stall handle was not separately changed; residual sibling delay under sustained high water remains possible but was not the confirmed mux-wide WouldBlock class.
 - Authentic browser/TUI same-session proof remains with north-star after merge.
