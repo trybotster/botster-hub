@@ -1721,17 +1721,18 @@ fn apply_data_channel_event(
     stream_key: &AesGcmKey,
     pending_requests: &mut VecDeque<PendingLocalWebrtcRequest>,
     flow_control: &mut LocalWebrtcFlowControl,
-    mux: &WebRtcConnectionMux,
+    _mux: &WebRtcConnectionMux,
 ) -> Result<(), LocalWebrtcTerminalCause> {
     match event {
         DataChannelEvent::OnBufferedAmountHigh => {
+            // Pause only the in-flight DataChannel send path. Do not mark every
+            // mux handle WouldBlock: that silences healthy siblings while one
+            // stalled generation fills the peer send buffer.
             flow_control.pressured = true;
-            mux.set_would_block(true);
             Ok(())
         }
         DataChannelEvent::OnBufferedAmountLow => {
             flow_control.pressured = false;
-            mux.set_would_block(false);
             Ok(())
         }
         DataChannelEvent::OnMessage(message) => {
@@ -3053,6 +3054,59 @@ mod tests {
             .is_ok()
         );
         assert!(!flow_control.pressured);
+    }
+
+    #[test]
+    fn buffered_amount_high_does_not_mark_sibling_handles_would_block() {
+        use botster_core::contract::terminal_adapter::{
+            TerminalAdapter, TerminalAdapterPressure, TerminalAdapterWriteError,
+        };
+        use botster_terminal_protocol::TerminalFrame;
+
+        let mux = WebRtcConnectionMux::new();
+        let (stall, stall_handle) = mux.create_adapter();
+        let (mut sibling, sibling_handle) = mux.create_adapter();
+        mux.register(
+            "wwb-stall".to_string(),
+            "sub-stall".to_string(),
+            1,
+            stall_handle,
+        );
+        mux.register(
+            "wwb-live".to_string(),
+            "sub-live".to_string(),
+            1,
+            sibling_handle,
+        );
+        let key = AesGcmKey::from_slice(&[9; 32]).unwrap();
+        let mut pending = VecDeque::new();
+        let mut flow_control = LocalWebrtcFlowControl::default();
+
+        assert!(
+            apply_data_channel_event(
+                DataChannelEvent::OnBufferedAmountHigh,
+                &key,
+                &mut pending,
+                &mut flow_control,
+                &mux,
+            )
+            .is_ok()
+        );
+        assert!(flow_control.pressured);
+        assert_eq!(stall.pressure(), TerminalAdapterPressure::Ready);
+        assert_eq!(sibling.pressure(), TerminalAdapterPressure::Ready);
+
+        let frame = TerminalFrame::from_bytes(
+            br#"{"type":"terminal_output","marker":"sibling-under-high-water"}"#,
+        )
+        .expect("opaque sibling frame");
+        assert_eq!(sibling.try_write(&frame), Ok(()));
+        assert_eq!(sibling.pressure(), TerminalAdapterPressure::Full);
+        assert_ne!(
+            sibling.try_write(&frame),
+            Err(TerminalAdapterWriteError::WouldBlock),
+            "DataChannel high water must not convert a healthy sibling into WouldBlock"
+        );
     }
 
     fn active_pressure_peer_terminal_case(
