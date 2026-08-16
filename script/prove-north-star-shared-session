@@ -1,0 +1,727 @@
+#!/usr/bin/env python3
+"""Hub-owned authentic same-session coordinator for Web and TUI.
+
+Starts one provenance-pinned Hub, admits botster-web, lists session types for
+an admitted spawn point (Option A), and spawns one caller-owned session. Then
+it attaches the shipped Web and TUI harnesses to that session.
+
+Required environment:
+  BOTSTER_HUB_BIN
+  BOTSTER_SESSION_WORKER_BIN
+  BOTSTER_WEB_CHECKOUT
+  BOTSTER_TUI_CHECKOUT
+  BOTSTER_SHARED_SESSION_ID
+
+Optional:
+  BOTSTER_LIVE_DATA_DIR  reuse this data dir and leave it in place
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import signal
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any, IO
+
+PROTOCOL = "botster-hub-daemon-v1"
+SESSION_TYPE_ID = "north-star-shared"
+SPAWN_TARGET_ID = "tgt_north_star"
+CLIENT_TIMEOUT_S = 900
+OVERALL_TIMEOUT_S = 2700
+HUB_READY_TIMEOUT_S = 30
+HISTORY_TIMEOUT_S = 30
+LIFECYCLE_TIMEOUT_S = 30
+
+REQUIRED_ENV = (
+    "BOTSTER_HUB_BIN",
+    "BOTSTER_SESSION_WORKER_BIN",
+    "BOTSTER_WEB_CHECKOUT",
+    "BOTSTER_TUI_CHECKOUT",
+    "BOTSTER_SHARED_SESSION_ID",
+)
+
+PRODUCER_SCRIPT = """#!/bin/sh
+stty -echo 2>/dev/null || true
+echo NORTH_STAR_HISTORY
+echo botster-web-production-ready
+while IFS= read -r line; do
+  case "$line" in
+    botster-web-production-size) set -- $(stty size); echo botster-web-production-size:${1}x${2} ;;
+    botster-web-production-exit) echo botster-web-production-exiting; exit 0 ;;
+    botster-web-production-bytes-lead) printf '\\342' ;;
+    botster-web-production-bytes-rest) printf '\\202\\254' ;;
+    botster-web-production-bytes-ctrl) printf '\\000\\033[0m\\377' ;;
+    botster-web-production-bytes-hold) printf '\\250\\001\\377' ;;
+    botster-web-production-mouse-on) printf '\\033[?1000h\\033[?1006h' ;;
+    botster-web-production-bytes-ablate) printf '\\375' ;;
+    *botster-web-production-alt-redraw:*) marker=${line#*botster-web-production-alt-redraw:}; marker=$(printf '%s' "$marker" | tr -d '\\r'); printf '\\033[?1000l\\033[?1006l'; set -- $(stty size); rows=$1; printf '\\033[?1049h\\033[2J\\033[H'; row=1; while [ "$row" -le "$rows" ]; do printf '\\033[%s;1H%s-row-%s-of-%s' "$row" "$marker" "$row" "$rows"; row=$((row + 1)); done; printf '\\033[%s;1H%s-final-row-%s' "$rows" "$marker" "$rows" ;;
+    *) echo botster-web-production-echo:$line ;;
+  esac
+done
+"""
+
+
+def log(message: str) -> None:
+    print(message, flush=True)
+
+
+def fail(message: str, code: int = 1) -> None:
+    print(f"north-star-shared-session-failed {message}", file=sys.stderr, flush=True)
+    raise SystemExit(code)
+
+
+def required_path(name: str) -> Path:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        fail(f"missing required env {name}")
+    path = Path(value).expanduser().resolve()
+    if not path.exists():
+        fail(f"{name} does not exist: {path}")
+    return path
+
+
+def require_env(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        fail(f"missing required env {name}")
+    return value
+
+
+def run_hub(hub_bin: Path, args: list[str], cwd: Path | None = None) -> str:
+    completed = subprocess.run(
+        [str(hub_bin), *args],
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        fail(
+            f"botster-hub {' '.join(args)} failed "
+            f"(code={completed.returncode}): {completed.stdout[-4000:]}"
+        )
+    return completed.stdout
+
+
+def wait_for_socket(path: Path, process: subprocess.Popen[str], timeout_s: float) -> None:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if process.poll() is not None:
+            fail(f"Hub exited before socket readiness (code={process.returncode})")
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.settimeout(0.2)
+                client.connect(str(path))
+            return
+        except OSError:
+            time.sleep(0.1)
+    fail(f"timed out waiting for Hub socket {path}")
+
+
+def read_line(client: socket.socket) -> str:
+    buffer = bytearray()
+    while True:
+        chunk = client.recv(4096)
+        if not chunk:
+            fail("daemon socket closed before a complete line")
+        buffer.extend(chunk)
+        newline = buffer.find(b"\n")
+        if newline >= 0:
+            return buffer[:newline].decode("utf-8")
+
+
+def send_daemon_request(socket_path: Path, request: dict[str, Any]) -> dict[str, Any]:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(30)
+        client.connect(str(socket_path))
+        client.sendall(json.dumps({"protocol": PROTOCOL}).encode("utf-8") + b"\n")
+        hello = json.loads(read_line(client))
+        if hello.get("protocol") != PROTOCOL:
+            fail(f"daemon protocol mismatch: {hello!r}")
+        client.sendall(json.dumps(request).encode("utf-8") + b"\n")
+        return json.loads(read_line(client))
+
+
+def wait_for_session_lifecycle(
+    socket_path: Path, session_id: str, accepted: set[str], timeout_s: float
+) -> dict[str, Any]:
+    deadline = time.time() + timeout_s
+    last: list[Any] = []
+    while time.time() < deadline:
+        response = send_daemon_request(socket_path, {"type": "list_sessions"})
+        last = response.get("sessions") or []
+        for row in last:
+            if row.get("session_id") == session_id and row.get("lifecycle") in accepted:
+                return row
+        time.sleep(0.2)
+    fail(
+        f"timed out waiting for {session_id} lifecycle "
+        f"{'|'.join(sorted(accepted))}; observed={json.dumps(last)}"
+    )
+    raise AssertionError("unreachable")
+
+
+def wait_for_history(socket_path: Path, session_id: str) -> None:
+    deadline = time.time() + HISTORY_TIMEOUT_S
+    last = ""
+    while time.time() < deadline:
+        response = send_daemon_request(
+            socket_path, {"type": "read_screen", "session_id": session_id}
+        )
+        if response.get("error"):
+            last = json.dumps(response.get("error"))
+        else:
+            screen = response.get("read_screen") or {}
+            last = screen.get("text") or ""
+            if "NORTH_STAR_HISTORY" in last:
+                return
+        time.sleep(0.2)
+    fail(f"timed out waiting for NORTH_STAR_HISTORY; last_screen={last!r}")
+
+
+def wait_for_package_app_url(socket_path: Path) -> str:
+    deadline = time.time() + HUB_READY_TIMEOUT_S
+    last = None
+    while time.time() < deadline:
+        response = send_daemon_request(socket_path, {"type": "list_apps"})
+        apps = response.get("apps") or []
+        for app in apps:
+            if (
+                app.get("package_name") == "botster-web"
+                and app.get("entrypoint_id") == "web-client"
+            ):
+                last = app
+                url = ((app.get("launch_target") or {}).get("local_url"))
+                if url:
+                    return str(url)
+        time.sleep(0.2)
+    fail(f"timed out waiting for botster-web/web-client local_url; app={json.dumps(last)}")
+    raise AssertionError("unreachable")
+
+
+def wait_for_http_ok(url: str) -> None:
+    import urllib.error
+    import urllib.request
+
+    health = url.rstrip("/") + "/health"
+    deadline = time.time() + HUB_READY_TIMEOUT_S
+    last = "no request"
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(health, timeout=2) as response:
+                if 200 <= response.status < 300:
+                    return
+                last = f"HTTP {response.status}"
+        except (urllib.error.URLError, TimeoutError, OSError) as error:
+            last = str(error)
+        time.sleep(0.2)
+    fail(f"timed out waiting for {health}: {last}")
+
+
+def client_env(data_dir: Path, session_id: str, extra: dict[str, str] | None = None) -> dict[str, str]:
+    env = os.environ.copy()
+    for name in (
+        "BOTSTER_HUB_BIN",
+        "BOTSTER_SESSION_WORKER_BIN",
+        "BOTSTER_LIVE_SHARED_HUB_DRIVER",
+        "BOTSTER_SHARED_SESSION_PROVE_EXIT",
+        "BOTSTER_LIVE_ABLATE_CANCEL_DETACH",
+        "BOTSTER_LIVE_ALLOW_SURFACE_SKIP",
+        "BOTSTER_LIVE_ALLOW_BROWSER_SKIP",
+        "BOTSTER_LIVE_ENTITY_OPTIONS",
+        "BOTSTER_LIVE_CONTRACT_MATRIX",
+        "BOTSTER_LIVE_WORKSPACES_LIFECYCLE",
+        "BOTSTER_LIVE_SURFACE_ONLY",
+        "BOTSTER_LIVE_REQUIRE_WORKSPACES",
+        "BOTSTER_LIVE_DURABLE_STATE",
+    ):
+        env.pop(name, None)
+    env["BOTSTER_LIVE_DATA_DIR"] = str(data_dir)
+    env["BOTSTER_SHARED_SESSION_ID"] = session_id
+    env["BOTSTER_HUB_CONNECTION"] = json.dumps(
+        {"transport": {"type": "unix_socket", "path": str(data_dir / "botster-hub.sock")}}
+    )
+    env["PYTHONUNBUFFERED"] = "1"
+    if extra:
+        env.update(extra)
+    return env
+
+
+def stream_command(
+    args: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    timeout_s: float,
+    ready_line: str | None = None,
+    fail_if: tuple[str, ...] = (),
+    label: str,
+) -> tuple[int, str, bool]:
+    process = subprocess.Popen(
+        args,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    output_parts: list[str] = []
+    ready = ready_line is None
+    deadline = time.time() + timeout_s
+    assert process.stdout is not None
+    stdout: IO[str] = process.stdout
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            process.send_signal(signal.SIGTERM)
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+            fail(f"{label} timed out after {timeout_s}s waiting for {ready_line or 'exit'}")
+        # Bounded line wait so we can enforce the deadline.
+        line = stdout.readline()
+        if line:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            output_parts.append(line)
+            joined_tail = "".join(output_parts[-80:])
+            for needle in fail_if:
+                if needle in line or needle in joined_tail:
+                    process.send_signal(signal.SIGTERM)
+                    fail(f"{label} observed forbidden output {needle!r}")
+            if ready_line is not None and ready_line in line:
+                ready = True
+                if process.poll() is not None:
+                    break
+                return process.returncode if process.returncode is not None else 0, "".join(output_parts), True
+            continue
+        if process.poll() is not None:
+            break
+        time.sleep(0.05)
+    leftover = stdout.read()
+    if leftover:
+        sys.stdout.write(leftover)
+        sys.stdout.flush()
+        output_parts.append(leftover)
+    output = "".join(output_parts)
+    code = process.returncode if process.returncode is not None else 1
+    if ready_line is not None and ready_line not in output:
+        fail(f"{label} exited {code} without {ready_line!r}")
+    return code, output, ready
+
+
+def run_web_driver(
+    web_checkout: Path,
+    data_dir: Path,
+    session_id: str,
+    *,
+    prove_exit: bool,
+    label: str,
+) -> str:
+    extra = {"BOTSTER_SHARED_SESSION_PROVE_EXIT": "1"} if prove_exit else {}
+    env = client_env(data_dir, session_id, extra)
+    marker = "live-shared-session-exit-passed" if prove_exit else "live-shared-session-keep-alive-passed"
+    code, output, _ = stream_command(
+        ["npm", "run", "drive:live-packaged-protocol:shared-session"],
+        cwd=web_checkout,
+        env=env,
+        timeout_s=CLIENT_TIMEOUT_S,
+        ready_line=None,
+        fail_if=('"type":"shutdown_session"',),
+        label=label,
+    )
+    if code != 0:
+        fail(f"{label} failed (code={code})")
+    if "workspaces-shared-hub-browser-summary " in output:
+        fail(f"{label} took the Workspaces early-exit path")
+    if "live packaged protocol harness passed (webrtc)" in output:
+        fail(f"{label} took the IsolatedHub completion path")
+    if f'"session_id":"{session_id}"' in output and "shutdown_session" in output:
+        fail(f"{label} mentioned shutdown_session for {session_id}")
+    if prove_exit:
+        if "live-shared-session-exit-passed" not in output:
+            fail(f"{label} omitted live-shared-session-exit-passed")
+        if "live-shared-session-keep-alive-passed" in output:
+            fail(f"{label} printed keep-alive completion during the exit pass")
+    else:
+        if "live-shared-session-terminal-lane " not in output:
+            fail(f"{label} omitted live-shared-session-terminal-lane")
+        if f'live-shared-session-keep-alive-passed {{"session_id":"{session_id}"' not in output:
+            fail(f"{label} omitted keep-alive marker for {session_id}")
+        if "live-shared-session-cancel-passed " not in output:
+            fail(f"{label} omitted live-shared-session-cancel-passed")
+        if "live-shared-session-exit-passed" in output:
+            fail(f"{label} ran the opt-in exit pass")
+    if marker not in output:
+        fail(f"{label} omitted {marker}")
+    return output
+
+
+def run_tui_shared(tui_checkout: Path, data_dir: Path, session_id: str) -> str:
+    env = client_env(data_dir, session_id)
+    code, output, _ = stream_command(
+        ["script/test-live-hub", "ghostty-shared"],
+        cwd=tui_checkout,
+        env=env,
+        timeout_s=CLIENT_TIMEOUT_S,
+        ready_line=None,
+        fail_if=('"type":"shutdown_session"',),
+        label="tui ghostty-shared",
+    )
+    if code != 0:
+        fail(f"tui ghostty-shared failed (code={code})")
+    if "ghostty-shared-complete" not in output:
+        fail("tui ghostty-shared omitted ghostty-shared-complete")
+    return output
+
+
+class StreamedProcess:
+    def __init__(
+        self,
+        args: list[str],
+        *,
+        cwd: Path,
+        env: dict[str, str],
+        label: str,
+    ) -> None:
+        self.label = label
+        self.output_parts: list[str] = []
+        self.process = subprocess.Popen(
+            args,
+            cwd=cwd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        assert self.process.stdout is not None
+        self.stdout = self.process.stdout
+
+    def wait_for_line(self, marker: str, timeout_s: float) -> str:
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if self.process.poll() is not None:
+                leftover = self.stdout.read()
+                if leftover:
+                    sys.stdout.write(leftover)
+                    sys.stdout.flush()
+                    self.output_parts.append(leftover)
+                fail(
+                    f"{self.label} exited {self.process.returncode} before {marker!r}; "
+                    f"tail={''.join(self.output_parts)[-2000:]!r}"
+                )
+            line = self.stdout.readline()
+            if not line:
+                time.sleep(0.05)
+                continue
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            self.output_parts.append(line)
+            if marker in line:
+                return "".join(self.output_parts)
+        self.terminate()
+        fail(f"{self.label} timed out waiting for {marker!r}")
+        raise AssertionError("unreachable")
+
+    def wait_exit(self, marker: str, timeout_s: float) -> str:
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            line = self.stdout.readline()
+            if line:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                self.output_parts.append(line)
+                continue
+            if self.process.poll() is not None:
+                leftover = self.stdout.read()
+                if leftover:
+                    sys.stdout.write(leftover)
+                    sys.stdout.flush()
+                    self.output_parts.append(leftover)
+                output = "".join(self.output_parts)
+                if self.process.returncode != 0:
+                    fail(f"{self.label} failed (code={self.process.returncode})")
+                if marker not in output:
+                    fail(f"{self.label} omitted {marker}")
+                return output
+            time.sleep(0.05)
+        self.terminate()
+        fail(f"{self.label} timed out waiting for exit after {marker!r}")
+        raise AssertionError("unreachable")
+
+    def terminate(self) -> None:
+        if self.process.poll() is None:
+            self.process.send_signal(signal.SIGTERM)
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+
+
+def write_producer(data_dir: Path) -> None:
+    script_dir = data_dir / "session-types" / "bin"
+    script_dir.mkdir(parents=True, exist_ok=True)
+    script = script_dir / "north-star-producer.sh"
+    script.write_text(PRODUCER_SCRIPT)
+    script.chmod(script.stat().st_mode | stat.S_IEXEC)
+
+
+def create_option_a_type_and_target(socket_path: Path, data_dir: Path) -> None:
+    target_root = data_dir / "north-star-target"
+    target_root.mkdir(parents=True, exist_ok=True)
+    (target_root / ".keep").write_text("")
+    created_target = send_daemon_request(
+        socket_path,
+        {
+            "type": "create_spawn_target",
+            "target_id": SPAWN_TARGET_ID,
+            "label": "North star",
+            "root": str(target_root),
+            "enabled": True,
+            "kind": "directory",
+        },
+    )
+    if created_target.get("error"):
+        fail(f"create_spawn_target failed: {json.dumps(created_target)}")
+    created_type = send_daemon_request(
+        socket_path,
+        {
+            "type": "create_session_type",
+            "source": {"source": "device"},
+            "definition": {
+                "id": SESSION_TYPE_ID,
+                "label": "North star shared",
+                "role": "botster.agent",
+                "interaction": "interactive",
+                "traits": ["terminal"],
+                "lifecycle": "task",
+                "execution": {"mode": "relative_executable"},
+                "command": "bin/north-star-producer.sh",
+                "args": [],
+                "working_directory": {"policy": "package_root"},
+                "environment": {},
+                "allowed_environment_overrides": [],
+                "context": [],
+            },
+        },
+    )
+    if created_type.get("error"):
+        fail(f"create_session_type failed: {json.dumps(created_type)}")
+
+
+def spawn_option_a(socket_path: Path, session_id: str) -> str:
+    listed = send_daemon_request(
+        socket_path,
+        {"type": "list_session_types_for_target", "target_id": SPAWN_TARGET_ID},
+    )
+    if listed.get("error"):
+        fail(f"list_session_types_for_target failed: {json.dumps(listed)}")
+    rows = listed.get("session_types") or []
+    match = None
+    for row in rows:
+        row_id = row.get("session_type_id") or ""
+        if row_id in {SESSION_TYPE_ID, f"device/{SESSION_TYPE_ID}"} and row.get(
+            "target_id"
+        ) == SPAWN_TARGET_ID:
+            match = row
+            break
+    if match is None:
+        fail(
+            "list_session_types_for_target omitted device/north-star-shared "
+            f"for {SPAWN_TARGET_ID}: {json.dumps(rows)}"
+        )
+    qualified_id = match["session_type_id"]
+    spawned = send_daemon_request(
+        socket_path,
+        {
+            "type": "spawn_session_type",
+            "session_type_id": qualified_id,
+            "session_id": session_id,
+            "request": {"target_id": SPAWN_TARGET_ID},
+        },
+    )
+    kind = str(spawned.get("kind") or "").lower()
+    if spawned.get("error") or kind != "spawned":
+        fail(f"spawn_session_type failed: {json.dumps(spawned)}")
+    return qualified_id
+
+
+def session_occupancy(socket_path: Path, session_id: str) -> list[dict[str, Any]]:
+    status = send_daemon_request(socket_path, {"type": "status"})
+    body = status.get("status") or {}
+    features = ((body.get("compatibility") or {}).get("features")) or []
+    if "attach_occupancy" not in features:
+        fail(
+            "Status omitted advertised attach_occupancy; "
+            "empty occupancy is not absence proof"
+        )
+    occupancy = body.get("live_attach_occupancy") or []
+    return [row for row in occupancy if row.get("session_id") == session_id]
+
+
+def wait_for_empty_occupancy(socket_path: Path, session_id: str) -> None:
+    deadline = time.time() + LIFECYCLE_TIMEOUT_S
+    last: list[dict[str, Any]] = []
+    while time.time() < deadline:
+        last = session_occupancy(socket_path, session_id)
+        if not last:
+            return
+        time.sleep(0.1)
+    fail(
+        f"live_attach_occupancy still held pairs for {session_id} after client exit: "
+        f"{json.dumps(last)}"
+    )
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def main() -> None:
+    started = time.time()
+    for name in REQUIRED_ENV:
+        if name.endswith("_ID"):
+            require_env(name)
+        else:
+            required_path(name)
+    hub_bin = required_path("BOTSTER_HUB_BIN")
+    worker_bin = required_path("BOTSTER_SESSION_WORKER_BIN")
+    web_checkout = required_path("BOTSTER_WEB_CHECKOUT")
+    tui_checkout = required_path("BOTSTER_TUI_CHECKOUT")
+    session_id = require_env("BOTSTER_SHARED_SESSION_ID")
+    if not (web_checkout / "package.json").is_file():
+        fail(f"BOTSTER_WEB_CHECKOUT is not a web checkout: {web_checkout}")
+    if not (tui_checkout / "script/test-live-hub").is_file():
+        fail(f"BOTSTER_TUI_CHECKOUT is missing script/test-live-hub: {tui_checkout}")
+    if not os.access(hub_bin, os.X_OK) or not os.access(worker_bin, os.X_OK):
+        fail("BOTSTER_HUB_BIN and BOTSTER_SESSION_WORKER_BIN must be executable")
+
+    supplied_data_dir = os.environ.get("BOTSTER_LIVE_DATA_DIR", "").strip()
+    if supplied_data_dir:
+        data_dir = Path(supplied_data_dir).expanduser().resolve()
+        data_dir.mkdir(parents=True, exist_ok=True)
+        remove_data_dir = False
+    else:
+        data_dir = Path(tempfile.mkdtemp(prefix="botster-north-star-", dir="/tmp"))
+        remove_data_dir = True
+    socket_path = data_dir / "botster-hub.sock"
+    hub: subprocess.Popen[str] | None = None
+    tui_exit: StreamedProcess | None = None
+    try:
+        hub = subprocess.Popen(
+            [
+                str(hub_bin),
+                "start",
+                "--data-dir",
+                str(data_dir),
+                "--session-worker-bin",
+                str(worker_bin),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        wait_for_socket(socket_path, hub, HUB_READY_TIMEOUT_S)
+        run_hub(
+            hub_bin,
+            ["packages", "install", "--data-dir", str(data_dir), "--path", str(web_checkout)],
+            cwd=web_checkout,
+        )
+        run_hub(
+            hub_bin,
+            ["packages", "enable", "--data-dir", str(data_dir), "botster-web"],
+            cwd=web_checkout,
+        )
+        launch = send_daemon_request(
+            socket_path,
+            {
+                "type": "start_package_entrypoint",
+                "package_name": "botster-web",
+                "entrypoint_id": "web-client",
+            },
+        )
+        if launch.get("error"):
+            fail(f"could not launch botster-web/web-client: {json.dumps(launch)}")
+        app_url = wait_for_package_app_url(socket_path)
+        wait_for_http_ok(app_url)
+
+        write_producer(data_dir)
+        create_option_a_type_and_target(socket_path, data_dir)
+        qualified_id = spawn_option_a(socket_path, session_id)
+        wait_for_session_lifecycle(socket_path, session_id, {"running"}, LIFECYCLE_TIMEOUT_S)
+        wait_for_history(socket_path, session_id)
+        log(f"north-star-shared-spawned session_id={session_id} session_type_id={qualified_id}")
+
+        run_web_driver(web_checkout, data_dir, session_id, prove_exit=False, label="web keep-alive 1")
+        wait_for_session_lifecycle(socket_path, session_id, {"running"}, LIFECYCLE_TIMEOUT_S)
+        run_web_driver(web_checkout, data_dir, session_id, prove_exit=False, label="web keep-alive 2")
+        wait_for_session_lifecycle(socket_path, session_id, {"running"}, LIFECYCLE_TIMEOUT_S)
+
+        run_tui_shared(tui_checkout, data_dir, session_id)
+        wait_for_session_lifecycle(socket_path, session_id, {"running"}, LIFECYCLE_TIMEOUT_S)
+        wait_for_empty_occupancy(socket_path, session_id)
+
+        tui_exit = StreamedProcess(
+            ["script/test-live-hub", "ghostty-shared-exit"],
+            cwd=tui_checkout,
+            env=client_env(data_dir, session_id),
+            label="tui ghostty-shared-exit",
+        )
+        tui_exit.wait_for_line("ghostty-shared-exit-attached", CLIENT_TIMEOUT_S)
+        if time.time() - started > OVERALL_TIMEOUT_S:
+            fail(f"overall timeout {OVERALL_TIMEOUT_S}s exceeded before web exit")
+        run_web_driver(
+            web_checkout, data_dir, session_id, prove_exit=True, label="web exit"
+        )
+        tui_exit.wait_exit("ghostty-shared-exit-complete", CLIENT_TIMEOUT_S)
+        tui_exit = None
+        wait_for_session_lifecycle(
+            socket_path, session_id, {"exited", "failed"}, LIFECYCLE_TIMEOUT_S
+        )
+        log("north-star-shared-session-complete")
+    finally:
+        if tui_exit is not None:
+            tui_exit.terminate()
+        if hub is not None:
+            hub_pid = hub.pid
+            try:
+                run_hub(hub_bin, ["shutdown", "--data-dir", str(data_dir)])
+            except SystemExit:
+                if hub.poll() is None:
+                    raise
+            deadline = time.time() + 8
+            while hub.poll() is None and time.time() < deadline:
+                time.sleep(0.1)
+            if hub.poll() is None:
+                hub.send_signal(signal.SIGTERM)
+                try:
+                    hub.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    hub.kill()
+            if pid_alive(hub_pid):
+                fail(f"Hub leftover PID {hub_pid} after stop")
+        if remove_data_dir:
+            shutil.rmtree(data_dir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        fail("interrupted", 130)
