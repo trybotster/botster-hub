@@ -279,6 +279,7 @@ impl AttachStreamRegistry {
             .collect()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn bound_route_keys_for_client(
         &self,
         client_id: &str,
@@ -290,6 +291,7 @@ impl AttachStreamRegistry {
             .collect()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn close_adapters_for_client(&mut self, client_id: &str) {
         let keys = self.bound_route_keys_for_client(client_id);
         for (session_id, subscription_id) in keys {
@@ -356,6 +358,16 @@ impl AttachStreamRegistry {
         }
     }
 
+    pub(crate) fn recorded_generation(
+        &self,
+        session_id: &str,
+        subscription_id: &str,
+    ) -> Option<TerminalSubscriptionGeneration> {
+        self.streams
+            .get(&(session_id.to_string(), subscription_id.to_string()))
+            .and_then(|stream| stream.generation)
+    }
+
     pub(crate) fn record_generation(
         &mut self,
         session_id: &str,
@@ -408,6 +420,7 @@ impl AttachStreamRegistry {
             .unwrap_or_default()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn connection_bound_route_still_owned(
         &self,
         client_id: &str,

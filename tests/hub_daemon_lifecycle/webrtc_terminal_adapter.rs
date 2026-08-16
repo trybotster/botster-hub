@@ -1321,5 +1321,5 @@ fn webrtc_terminal_adapter_close_event_feature_stays_optional_on_protocol_7() {
             .any(|feature| feature == botster_hub_client::FEATURE_TERMINAL_SUBSCRIPTION_CLOSED)
     );
     assert_eq!(botster_hub_client::PROTOCOL_VERSION, 7);
-    assert_eq!(botster_hub_client::CONFORMANCE_FIXTURE_REVISION, 42);
+    assert_eq!(botster_hub_client::CONFORMANCE_FIXTURE_REVISION, 43);
 }

@@ -360,11 +360,22 @@ pub(crate) fn session_ids_from_list(endpoint: &botster_hub_client::DaemonEndpoin
 }
 
 pub(crate) fn start_isolated_live_output_hub(name: &str) -> botster_hub_test_support::IsolatedHub {
-    botster_hub_test_support::IsolatedHubBuilder::new()
+    start_isolated_live_output_hub_with_env(name, &[])
+}
+
+pub(crate) fn start_isolated_live_output_hub_with_env(
+    name: &str,
+    extra_env: &[(&str, &str)],
+) -> botster_hub_test_support::IsolatedHub {
+    let mut builder = botster_hub_test_support::IsolatedHubBuilder::new()
         .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
         .session_worker_bin(session_worker_binary_path())
         .root(unique_short_test_dir(name))
-        .name(name)
+        .name(name);
+    for (key, value) in extra_env {
+        builder = builder.env(*key, *value);
+    }
+    builder
         .start()
         .expect("start isolated hub with explicit worker path")
 }

@@ -88,7 +88,7 @@ Use this exact package spec in npm-based client repos:
 
 `@trybotster/hub-test-support@0.1.37` carries byte-faithful live
 `terminal_output` payloads (`payload_base64`, `payload_encoding`, `bytes`)
-and authentic dual GHOSTSNP late-attach fixtures (conformance revision 42).
+and authentic dual GHOSTSNP late-attach fixtures (conformance revision 43).
 History attach uses incremental READY, PAGE, and FINISH Snapshot frames.
 No-history attach uses READY then FINISH. Import-visible state matches the
 ReadScreen oracles; do not dual-use a history-bearing golden as no-history.
@@ -112,9 +112,10 @@ appended as terminal text. Version 0.1.6 / conformance revision 13 uses
 superseded JSON number arrays, while version 0.1.5 / revision 12 exposes
 lossy string history. Neither is current binary-history contract authority.
 
-Version 0.1.37 carries protocol version 7 / conformance revision 42 with
+Version 0.1.37 carries protocol version 7 / conformance revision 43 with
 advertised optional `unix_terminal_adapter`,
 `terminal_subscription_closed`, `webrtc_terminal_adapter`,
+`attach_occupancy`,
 negotiated WebRTC `daemon_event` close delivery, and
 `snapshot_delivery=ready_then_history` support,
 byte-faithful live `terminal_output` payloads, incremental GHOSTSNP

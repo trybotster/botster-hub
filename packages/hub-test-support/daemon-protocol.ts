@@ -820,7 +820,14 @@ export interface DaemonStatus {
   recovered_sessions: string[];
   stale_sessions: string[];
   lifecycle_counters?: DaemonLifecycleCounters;
+  live_attach_occupancy?: DaemonAttachOccupancy[];
   diagnostics?: DaemonDiagnostic[];
+}
+
+export interface DaemonAttachOccupancy {
+  session_id: string;
+  subscription_id: string;
+  generation: number;
 }
 
 export interface DaemonSoftwareIdentity {

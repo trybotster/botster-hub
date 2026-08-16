@@ -242,6 +242,18 @@ subscription current/high-water values, reconnect registrations, cleanup
 outcomes/reasons, reconciliation wake/change/baseline/resync/drain work,
 entity delivery attempts/outcomes, and stalled writes. It never contains
 connection, session, subscription, path, command, or payload identifiers.
+
+`DaemonStatus.live_attach_occupancy` is the public named occupancy oracle. A
+sibling Unix client reads it with only `botster-hub-client`. Each row is
+`{ session_id, subscription_id, generation }`. A pair is listed when it is in
+Hub `live_attach_routes` or still present in Core `list_terminal_subscriptions()`.
+Absence of a pair is release proof only when `compatibility.features` contains
+`attach_occupancy`. An omitted field on an older daemon is not absence. The
+`generation` field is identity, not the TUI lookup key. The lookup key remains
+the pair. `FEATURE_ATTACH_OCCUPANCY` is advertised support. It is not in
+`DaemonCompatibilityRequirement::current()`. Unix connection EOF releases the
+generation still owned by that `client_id`. It does not `ShutdownSession` and
+does not emit `TerminalSubscriptionClosed` on the dead socket.
 During steady state the daemon reads one shared Core lifecycle journal cursor;
 the filesystem-backed baseline counter advances only for initial seeding or an
 explicit journal resync.

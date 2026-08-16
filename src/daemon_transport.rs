@@ -5,6 +5,7 @@
 //! requests and never hold runtime access while writing to a client.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::env;
 use std::error::Error;
 use std::fmt;
 use std::fs;
@@ -21,27 +22,27 @@ use botster_core::{
     ClientId, EndpointId, EnvelopeCursor, EnvelopeDeliveryState, EnvelopeId, EnvelopeTarget,
     PackageSource, RequestId, RoutedEnvelope, RoutedEnvelopePayload, RunnableEntrypointKind,
     RunnableEntrypointLaunchMode, SessionId, SessionLifecycleState, SubscriptionId,
-    TerminalCapabilitySet,
+    TerminalCapabilitySet, TerminalSubscriptionGeneration, TerminalSubscriptionRecord,
 };
 use botster_core_daemon::{
-    GuardedWriteDecision, GuardedWriteDeliveryState, ReadinessEvidence, RegistrySessionState,
-    SessionLifecycleLookup,
+    DetachTerminalSubscriptionResult, GuardedWriteDecision, GuardedWriteDeliveryState,
+    ReadinessEvidence, RegistrySessionState, SessionLifecycleLookup,
 };
 use botster_hub_client::DaemonTransportError as ClientDaemonTransportError;
 pub use botster_hub_client::{
-    DaemonApp, DaemonAppLaunchTarget, DaemonAvailablePackage, DaemonCapability,
-    DaemonCaptureSnapshot, DaemonCompatibility, DaemonConnection as ClientDaemonConnection,
-    DaemonCoordination, DaemonDiagnostic, DaemonEndpoint, DaemonEntityFrame, DaemonEnvelope,
-    DaemonEnvelopeAck, DaemonEnvelopeDelivery, DaemonEnvelopePublish, DaemonEvent, DaemonHello,
-    DaemonHelloAck, DaemonHubUpdate, DaemonHubUpdateExecution, DaemonHubUpdateExecutionState,
-    DaemonHubUpdateScope, DaemonHubUpdateState, DaemonIdentity, DaemonInstallationDiagnostic,
-    DaemonInstallationIdentity, DaemonInstallationMode, DaemonLifecycleCounters,
-    DaemonLocalWebrtcAnswer, DaemonLocalWebrtcBootstrap, DaemonModeFlags, DaemonNotify,
-    DaemonOperatorError, DaemonPackage, DaemonPackageActionRequest,
-    DaemonPackageActionRequiredReference, DaemonPackageActionState, DaemonPackageActionStatus,
-    DaemonPackageAvailability, DaemonPackageAvailabilityReason, DaemonPackageAvailabilityState,
-    DaemonPackageCompatibility, DaemonPackageConfiguration, DaemonPackageDecision,
-    DaemonPackageDependencyAvailability, DaemonPackageDiagnostic,
+    DaemonApp, DaemonAppLaunchTarget, DaemonAttachOccupancy, DaemonAvailablePackage,
+    DaemonCapability, DaemonCaptureSnapshot, DaemonCompatibility,
+    DaemonConnection as ClientDaemonConnection, DaemonCoordination, DaemonDiagnostic,
+    DaemonEndpoint, DaemonEntityFrame, DaemonEnvelope, DaemonEnvelopeAck, DaemonEnvelopeDelivery,
+    DaemonEnvelopePublish, DaemonEvent, DaemonHello, DaemonHelloAck, DaemonHubUpdate,
+    DaemonHubUpdateExecution, DaemonHubUpdateExecutionState, DaemonHubUpdateScope,
+    DaemonHubUpdateState, DaemonIdentity, DaemonInstallationDiagnostic, DaemonInstallationIdentity,
+    DaemonInstallationMode, DaemonLifecycleCounters, DaemonLocalWebrtcAnswer,
+    DaemonLocalWebrtcBootstrap, DaemonModeFlags, DaemonNotify, DaemonOperatorError, DaemonPackage,
+    DaemonPackageActionRequest, DaemonPackageActionRequiredReference, DaemonPackageActionState,
+    DaemonPackageActionStatus, DaemonPackageAvailability, DaemonPackageAvailabilityReason,
+    DaemonPackageAvailabilityState, DaemonPackageCompatibility, DaemonPackageConfiguration,
+    DaemonPackageDecision, DaemonPackageDependencyAvailability, DaemonPackageDiagnostic,
     DaemonPackageEnvironmentRequirement, DaemonPackageFeatureAvailability,
     DaemonPackageInstallEffect, DaemonPackageInstallPlan, DaemonPackageNavigationEntry,
     DaemonPackageNavigationSource, DaemonPackagePin, DaemonPackageProcess,
@@ -527,13 +528,20 @@ async fn handle_connection_async(
         UnixTerminalAdmission::Admitted { mux, .. } => mux.clone(),
         UnixTerminalAdmission::Rejected { .. } => UnixConnectionMux::new(),
     };
+    let (admission_ack_tx, admission_ack_rx) = oneshot::channel();
     control_tx
         .send(ControlMessage::RegisterUnixAdmission {
             client_id: client_id.clone(),
             admission,
+            reply_tx: admission_ack_tx,
         })
         .await
         .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
+    if unix_eof_cleanup_ablation() != UnixEofAblation::SkipRegisterAck {
+        admission_ack_rx
+            .await
+            .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
+    }
 
     loop {
         let request = tokio::select! {
@@ -1828,75 +1836,38 @@ fn handle_connection_cleanup(
             state.released_entity_generations = state.released_entity_generations.saturating_add(1);
         }
     }
-    if let Some(UnixTerminalAdmission::Admitted { mux, .. }) = state
+    let unix_admission = state
         .pending_runtime
         .unix_admissions
-        .remove(&cleanup.client_id)
+        .remove(&cleanup.client_id);
+    let ablation = unix_eof_cleanup_ablation();
+    let mut candidates = BTreeSet::new();
+    for claim in state
+        .pending_runtime
+        .take_connection_bound_routes(&cleanup.client_id)
     {
-        mux.close_all();
+        candidates.insert((claim.session_id, claim.subscription_id));
     }
-    let bound_claims = state
-        .pending_runtime
-        .take_connection_bound_routes(&cleanup.client_id);
-    state
-        .pending_runtime
-        .close_adapters_for_client(&cleanup.client_id);
-    let mut bound_subscriptions = BTreeSet::new();
-    for claim in bound_claims {
-        if !state.pending_runtime.connection_bound_route_still_owned(
-            &cleanup.client_id,
-            &claim.session_id,
-            &claim.subscription_id,
-            claim.generation,
-        ) {
-            continue;
-        }
-        bound_subscriptions.insert((claim.session_id.clone(), claim.subscription_id.clone()));
-        state
-            .pending_runtime
-            .cancel_stream(&claim.session_id, &claim.subscription_id);
-        state
-            .live_attach_routes
-            .remove(&(claim.session_id, claim.subscription_id));
-    }
-    if !bound_subscriptions.is_empty() {
-        *state
-            .lifecycle_counters
-            .cleanup_by_reason
-            .entry("bound_adapter_close".to_string())
-            .or_insert(0) += bound_subscriptions.len() as u64;
-    }
-    for subscription in cleanup.attached_subscriptions {
-        if state
-            .pending_runtime
-            .stream_owner_client_id(&subscription.session_id, &subscription.subscription_id)
-            .is_some_and(|owner| owner != cleanup.client_id)
-        {
-            continue;
-        }
-        let bound = bound_subscriptions.contains(&(
+    for subscription in &cleanup.attached_subscriptions {
+        candidates.insert((
             subscription.session_id.clone(),
             subscription.subscription_id.clone(),
         ));
-        let result = if bound {
-            state
-                .pending_runtime
-                .close_adapter(&subscription.session_id, &subscription.subscription_id);
-            state
-                .pending_runtime
-                .cancel_stream(&subscription.session_id, &subscription.subscription_id);
-            state.live_attach_routes.remove(&(
-                subscription.session_id.clone(),
-                subscription.subscription_id.clone(),
-            ));
-            Ok(daemon_events(Vec::new()))
-        } else {
+    }
+    let inventory_snapshot = daemon
+        .runtime()
+        .map(crate::HubRuntime::list_terminal_subscriptions)
+        .unwrap_or_default();
+
+    let mut bound_closes = 0u64;
+    for (session_id, subscription_id) in candidates {
+        if ablation == UnixEofAblation::PairOnlyDetach {
             *state
                 .lifecycle_counters
                 .cleanup_by_reason
                 .entry("cleanup_hub_detach".to_string())
                 .or_insert(0) += 1;
-            handle_control_request(
+            let result = handle_control_request(
                 daemon,
                 &mut state.logical_clock,
                 &mut state.drain_cursors,
@@ -1909,17 +1880,124 @@ fn handle_connection_cleanup(
                 },
                 control_tx.clone(),
                 DaemonRequest::Detach {
-                    session_id: subscription.session_id,
-                    subscription_id: subscription.subscription_id,
+                    session_id,
+                    subscription_id,
                 },
-            )
+            );
+            failed |= cleanup_detach_failed(&result);
+            continue;
+        }
+
+        let generation = live_generation_for_route(
+            &inventory_snapshot,
+            &cleanup.client_id,
+            &session_id,
+            &subscription_id,
+        )
+        .or_else(|| {
+            let owner = state
+                .pending_runtime
+                .stream_owner_client_id(&session_id, &subscription_id);
+            owner.as_ref().and_then(|owner| {
+                live_generation_for_route(&inventory_snapshot, owner, &session_id, &subscription_id)
+                    .filter(|_| owner == &cleanup.client_id)
+            })
+        });
+        let foreign_core_owner = inventory_snapshot.iter().any(|row| {
+            row.session_id.0 == session_id
+                && row.subscription_id.0 == subscription_id
+                && row.client_id.0 != cleanup.client_id
+        });
+        let foreign_stream_owner = state
+            .pending_runtime
+            .stream_owner_client_id(&session_id, &subscription_id)
+            .is_some_and(|owner| owner != cleanup.client_id);
+        if generation.is_none() && (foreign_core_owner || foreign_stream_owner) {
+            continue;
+        }
+        let Some(generation) = generation else {
+            record_attached_subscription_change(
+                state,
+                Some(AttachedSubscriptionChange::Detach(AttachedSubscription {
+                    session_id: session_id.clone(),
+                    subscription_id: subscription_id.clone(),
+                })),
+                None,
+            );
+            continue;
         };
-        state.lifecycle_counters.live_attach_subscriptions = state
+
+        if ablation != UnixEofAblation::SkipCoreDetach {
+            let now = tick(&mut state.logical_clock);
+            match daemon.runtime_mut().map(|runtime| {
+                runtime.detach_terminal_subscription(
+                    ClientId(cleanup.client_id.clone()),
+                    SessionId(session_id.clone()),
+                    SubscriptionId(subscription_id.clone()),
+                    generation,
+                    now,
+                )
+            }) {
+                Some(Ok(
+                    DetachTerminalSubscriptionResult::Detached { .. }
+                    | DetachTerminalSubscriptionResult::AlreadyGone
+                    | DetachTerminalSubscriptionResult::GenerationMismatch { .. },
+                )) => {}
+                Some(Err(_)) => {
+                    failed = true;
+                    continue;
+                }
+                None => {}
+            }
+            *state
+                .lifecycle_counters
+                .cleanup_by_reason
+                .entry("cleanup_generation_detach".to_string())
+                .or_insert(0) += 1;
+        }
+
+        let was_bound = state
+            .pending_runtime
+            .is_adapter_bound(&session_id, &subscription_id);
+        state
+            .pending_runtime
+            .close_adapter(&session_id, &subscription_id);
+        state
+            .pending_runtime
+            .cancel_stream(&session_id, &subscription_id);
+        if was_bound {
+            bound_closes += 1;
+        }
+
+        match ablation {
+            UnixEofAblation::LeaveRoute => {}
+            UnixEofAblation::IndependentCounter => {
+                state.lifecycle_counters.live_attach_subscriptions = state
+                    .lifecycle_counters
+                    .live_attach_subscriptions
+                    .saturating_sub(1);
+            }
+            _ => {
+                record_attached_subscription_change(
+                    state,
+                    Some(AttachedSubscriptionChange::Detach(AttachedSubscription {
+                        session_id,
+                        subscription_id,
+                    })),
+                    None,
+                );
+            }
+        }
+    }
+    if let Some(UnixTerminalAdmission::Admitted { mux, .. }) = unix_admission {
+        mux.close_all();
+    }
+    if bound_closes > 0 {
+        *state
             .lifecycle_counters
-            .live_attach_subscriptions
-            .saturating_sub(1);
-        state.released_attach_generations = state.released_attach_generations.saturating_add(1);
-        failed |= cleanup_detach_failed(&result);
+            .cleanup_by_reason
+            .entry("bound_adapter_close".to_string())
+            .or_insert(0) += bound_closes;
     }
     if failed {
         // `connection_cleanup_ignores_only_an_already_removed_session` is the
@@ -1974,11 +2052,13 @@ pub(crate) fn handle_control_message(
         ControlMessage::RegisterUnixAdmission {
             client_id,
             admission,
+            reply_tx,
         } => {
             state
                 .pending_runtime
                 .unix_admissions
                 .insert(client_id, admission);
+            let _ = reply_tx.send(());
             false
         }
         ControlMessage::RegisterWebrtcAdmission {
@@ -2235,7 +2315,7 @@ pub(crate) fn handle_control_message(
                     | DaemonRequest::ShutdownSession { .. }
                     | DaemonRequest::RemoveSession { .. }
             );
-            let response = handle_control_request(
+            let mut response = handle_control_request(
                 daemon,
                 &mut state.logical_clock,
                 &mut state.drain_cursors,
@@ -2292,6 +2372,11 @@ pub(crate) fn handle_control_message(
                     change => change,
                 };
                 record_attached_subscription_change(state, change, grant_id.as_deref());
+            }
+            if let Ok(response) = response.as_mut()
+                && let Some(status) = response.status.as_mut()
+            {
+                overlay_live_attach_occupancy(status, daemon, state);
             }
             if request_succeeded(response.as_ref()) {
                 if reconcile_after_request {
@@ -4796,6 +4881,7 @@ pub(crate) enum ControlMessage {
     RegisterUnixAdmission {
         client_id: String,
         admission: UnixTerminalAdmission,
+        reply_tx: oneshot::Sender<()>,
     },
     RegisterWebrtcAdmission {
         grant_id: String,
@@ -5043,6 +5129,78 @@ struct AttachedSubscription {
 enum AttachedSubscriptionChange {
     Attach(AttachedSubscription),
     Detach(AttachedSubscription),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnixEofAblation {
+    None,
+    LeaveRoute,
+    SkipCoreDetach,
+    PairOnlyDetach,
+    IndependentCounter,
+    SkipRegisterAck,
+}
+
+fn unix_eof_cleanup_ablation() -> UnixEofAblation {
+    if env::var("BOTSTER_ENV").as_deref() != Ok("test") {
+        return UnixEofAblation::None;
+    }
+    match env::var("BOTSTER_HUB_UNIX_EOF_ABLATION").as_deref() {
+        Ok("leave_route") => UnixEofAblation::LeaveRoute,
+        Ok("skip_core_detach") => UnixEofAblation::SkipCoreDetach,
+        Ok("pair_only_detach") => UnixEofAblation::PairOnlyDetach,
+        Ok("independent_counter") => UnixEofAblation::IndependentCounter,
+        Ok("skip_register_ack") => UnixEofAblation::SkipRegisterAck,
+        _ => UnixEofAblation::None,
+    }
+}
+
+fn overlay_live_attach_occupancy(
+    status: &mut DaemonStatus,
+    daemon: &HubDaemon,
+    state: &DaemonControlState,
+) {
+    status.live_attach_occupancy = live_attach_occupancy_rows(
+        &state.live_attach_routes,
+        daemon
+            .runtime()
+            .map(crate::HubRuntime::list_terminal_subscriptions)
+            .unwrap_or_default()
+            .as_slice(),
+        &state.pending_runtime,
+    );
+}
+
+fn live_attach_occupancy_rows(
+    hub_routes: &BTreeSet<(String, String)>,
+    inventory: &[TerminalSubscriptionRecord],
+    pending: &PendingRuntimeState,
+) -> Vec<DaemonAttachOccupancy> {
+    let mut rows = BTreeMap::new();
+    for row in inventory {
+        rows.insert(
+            (row.session_id.0.clone(), row.subscription_id.0.clone()),
+            row.generation.0,
+        );
+    }
+    for (session_id, subscription_id) in hub_routes {
+        rows.entry((session_id.clone(), subscription_id.clone()))
+            .or_insert_with(|| {
+                pending
+                    .recorded_generation(session_id, subscription_id)
+                    .map(|generation: TerminalSubscriptionGeneration| generation.0)
+                    .unwrap_or(0)
+            });
+    }
+    rows.into_iter()
+        .map(
+            |((session_id, subscription_id), generation)| DaemonAttachOccupancy {
+                session_id,
+                subscription_id,
+                generation,
+            },
+        )
+        .collect()
 }
 
 fn record_attached_subscription_change(
@@ -7607,8 +7765,10 @@ fn receive_test_control_request(
 ) -> ControlMessage {
     loop {
         match receive_test_control_message(receiver) {
-            ControlMessage::RegisterUnixAdmission { .. }
-            | ControlMessage::RegisterWebrtcAdmission { .. } => {}
+            ControlMessage::RegisterUnixAdmission { reply_tx, .. } => {
+                let _ = reply_tx.send(());
+            }
+            ControlMessage::RegisterWebrtcAdmission { .. } => {}
             message => return message,
         }
     }
@@ -7647,30 +7807,11 @@ fn handle_connection(stream: UnixStream, control_tx: ControlSender) -> DaemonTra
     };
     let result = runtime.block_on(handle_connection_async(
         stream,
-        control_tx.clone(),
+        control_tx,
         cleanup_tx,
         shutdown_rx,
     ));
-    if let Ok(cleanup) = cleanup_rx.try_recv() {
-        for subscription in cleanup.attached_subscriptions {
-            let (reply_tx, reply_rx) = oneshot::channel();
-            if control_tx
-                .blocking_send(ControlMessage::Request {
-                    request: Box::new(DaemonRequest::Detach {
-                        session_id: subscription.session_id,
-                        subscription_id: subscription.subscription_id,
-                    }),
-                    reply_tx,
-                    response_delivery_rx: None,
-                    grant_id: None,
-                    client_id: Some(cleanup.client_id.clone()),
-                })
-                .is_ok()
-            {
-                let _ = receive_test_control_reply(reply_rx);
-            }
-        }
-    }
+    let _ = cleanup_rx.try_recv();
     result
 }
 
@@ -7935,23 +8076,66 @@ mod tests {
         client
             .shutdown(Shutdown::Both)
             .expect("disconnect daemon client");
+        connection
+            .join()
+            .expect("join daemon connection")
+            .expect("client disconnect is a clean connection close");
+        assert!(
+            control_rx.try_recv().is_err(),
+            "Unix EOF must not enqueue pair-only DaemonRequest::Detach"
+        );
+    }
+
+    #[test]
+    fn register_unix_admission_acks_before_request_loop() {
+        let (server, mut client) = UnixStream::pair().expect("create daemon socket pair");
+        let (control_tx, mut control_rx) = tokio_mpsc::channel(DAEMON_CONTROL_QUEUE_CAPACITY);
+        let connection = thread::spawn(move || handle_connection(server, control_tx));
+
+        write_frame(
+            &mut client,
+            &DaemonHello {
+                protocol: PROTOCOL.to_string(),
+                compatibility: botster_hub_client::DaemonCompatibilityRequirement::current(),
+                terminal_compatibility: None,
+            },
+        )
+        .expect("write daemon hello");
+        let _: DaemonHelloAck = read_frame(&mut client).expect("read daemon hello ack");
+
+        let ControlMessage::RegisterUnixAdmission { reply_tx, .. } =
+            receive_test_control_message(&mut control_rx)
+        else {
+            panic!("expected RegisterUnixAdmission after Hello");
+        };
+        write_frame(&mut client, &DaemonRequest::Status)
+            .expect("write status while admission ack is held");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build admission-wait runtime");
+        let late = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_millis(80), control_rx.recv()).await
+        });
+        assert!(
+            late.is_err(),
+            "the request loop must wait for the admission ack: {late:?}"
+        );
+        reply_tx.send(()).expect("ack unix admission");
         let ControlMessage::Request {
             request, reply_tx, ..
         } = receive_test_control_request(&mut control_rx)
         else {
-            panic!("expected detach control request");
+            panic!("expected Status after admission ack");
         };
-        assert!(matches!(
-            *request,
-            DaemonRequest::Detach {
-                ref session_id,
-                ref subscription_id,
-            } if session_id == "session" && subscription_id == "subscription"
-        ));
+        assert!(matches!(*request, DaemonRequest::Status));
         reply_tx
-            .send(Ok(daemon_events(Vec::new())))
-            .expect("reply to disconnect detach request");
-
+            .send(Ok(daemon_response_base(DaemonResponseKind::Status)))
+            .expect("reply to status");
+        let _: DaemonResponse = read_frame(&mut client).expect("read status response");
+        client
+            .shutdown(Shutdown::Both)
+            .expect("disconnect daemon client");
         connection
             .join()
             .expect("join daemon connection")
@@ -8115,6 +8299,62 @@ mod tests {
         assert_eq!(
             state.lifecycle_counters.live_attach_subscriptions, 0,
             "a second Detach must not decrement another route"
+        );
+        assert!(
+            !state
+                .live_attach_routes
+                .contains(&("session".to_string(), "subscription".to_string()))
+        );
+    }
+
+    #[test]
+    fn occupancy_rows_union_hub_routes_and_core_inventory() {
+        let mut hub_routes = BTreeSet::new();
+        hub_routes.insert(("session".to_string(), "hub-only".to_string()));
+        let inventory = vec![TerminalSubscriptionRecord {
+            client_id: ClientId("client".to_string()),
+            session_id: SessionId("session".to_string()),
+            subscription_id: SubscriptionId("core-only".to_string()),
+            generation: TerminalSubscriptionGeneration(4),
+            adapter_bound: false,
+            capabilities: None,
+        }];
+        let rows =
+            live_attach_occupancy_rows(&hub_routes, &inventory, &PendingRuntimeState::default());
+        assert!(
+            rows.iter()
+                .any(|row| row.session_id == "session" && row.subscription_id == "hub-only"),
+            "Hub-only occupancy must stay visible: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| {
+                row.session_id == "session"
+                    && row.subscription_id == "core-only"
+                    && row.generation == 4
+            }),
+            "Core-only occupancy must stay visible: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn independent_counter_sub_does_not_clear_named_occupancy() {
+        let mut state = DaemonControlState::default();
+        record_attached_subscription_change(
+            &mut state,
+            Some(AttachedSubscriptionChange::Attach(AttachedSubscription {
+                session_id: "session".to_string(),
+                subscription_id: "subscription".to_string(),
+            })),
+            None,
+        );
+        state.lifecycle_counters.live_attach_subscriptions = 0;
+        let rows =
+            live_attach_occupancy_rows(&state.live_attach_routes, &[], &state.pending_runtime);
+        assert!(
+            rows.iter().any(|row| {
+                row.session_id == "session" && row.subscription_id == "subscription"
+            }),
+            "named occupancy is the oracle, not the counter: {rows:?}"
         );
     }
 

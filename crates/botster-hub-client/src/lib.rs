@@ -28,7 +28,7 @@ mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 pub const PROTOCOL_VERSION: u16 = 7;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 42;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 43;
 /// Oldest conformance revision accepted by the default first-party client requirement.
 pub const DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 36;
 /// Version of the local WebRTC delivery chunk framing protocol.
@@ -61,6 +61,8 @@ pub const TERMINAL_SUBSCRIPTION_CLOSED_HOST_ADAPTER: &str = "host_adapter_closed
 pub const TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER: &str = "core_adapter_closed";
 /// Optional Hub WebRTC adapter plane. Bind happens only when DataChannel Hello requires this.
 pub const FEATURE_WEBRTC_TERMINAL_ADAPTER: &str = "webrtc_terminal_adapter";
+/// Optional named attach occupancy on `DaemonStatus`. Empty occupancy without this token is not absence proof.
+pub const FEATURE_ATTACH_OCCUPANCY: &str = "attach_occupancy";
 /// Mux envelope plane tag. Not a Snapshot/READY/PAGE/FINISH field.
 pub const UNIX_TERMINAL_PLANE: &str = "terminal";
 /// Mux envelope kind tag. The payload stays an opaque `TerminalFrame` blob.
@@ -728,6 +730,17 @@ impl DaemonCompatibilityRequirement {
             .push(FEATURE_TERMINAL_SUBSCRIPTION_CLOSED.to_string());
         requirement
     }
+
+    /// Build the requirement for the public attach occupancy Status field.
+    #[must_use]
+    pub fn for_attach_occupancy() -> Self {
+        let mut requirement = Self::current();
+        requirement
+            .required_features
+            .push(FEATURE_ATTACH_OCCUPANCY.to_string());
+        requirement.minimum_conformance_fixture_revision = CONFORMANCE_FIXTURE_REVISION;
+        requirement
+    }
 }
 
 impl Default for DaemonCompatibilityRequirement {
@@ -845,6 +858,7 @@ fn current_feature_list() -> Vec<&'static str> {
     features.push(FEATURE_UNIX_TERMINAL_ADAPTER);
     features.push(FEATURE_TERMINAL_SUBSCRIPTION_CLOSED);
     features.push(FEATURE_WEBRTC_TERMINAL_ADAPTER);
+    features.push(FEATURE_ATTACH_OCCUPANCY);
     features
 }
 
@@ -2202,8 +2216,19 @@ pub struct DaemonStatus {
     pub stale_sessions: Vec<String>,
     #[serde(default, skip_serializing_if = "DaemonLifecycleCounters::is_empty")]
     pub lifecycle_counters: DaemonLifecycleCounters,
+    /// Named Hub∪Core attach occupancy. Absence of a pair is release proof only when `attach_occupancy` is advertised.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub live_attach_occupancy: Vec<DaemonAttachOccupancy>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<DaemonDiagnostic>,
+}
+
+/// One live attach occupancy row visible to a sibling Unix client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonAttachOccupancy {
+    pub session_id: String,
+    pub subscription_id: String,
+    pub generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3340,6 +3365,52 @@ mod tests {
     }
 
     #[test]
+    fn default_requirement_accepts_daemon_before_optional_attach_occupancy() {
+        let mut previous_daemon = DaemonCompatibility::current();
+        previous_daemon.conformance_fixture_revision = DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION;
+        previous_daemon
+            .features
+            .retain(|feature| feature != FEATURE_ATTACH_OCCUPANCY);
+
+        ensure_compatible(&DaemonCompatibilityRequirement::current(), &previous_daemon)
+            .expect("the optional occupancy capability must not break default clients");
+        assert!(
+            !DaemonCompatibilityRequirement::current()
+                .required_features
+                .iter()
+                .any(|feature| feature == FEATURE_ATTACH_OCCUPANCY)
+        );
+    }
+
+    #[test]
+    fn attach_occupancy_requirement_rejects_old_daemon_and_accepts_current_daemon() {
+        let requirement = DaemonCompatibilityRequirement::for_attach_occupancy();
+        let mut previous_daemon = DaemonCompatibility::current();
+        previous_daemon.conformance_fixture_revision = DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION;
+        previous_daemon
+            .features
+            .retain(|feature| feature != FEATURE_ATTACH_OCCUPANCY);
+
+        let error = ensure_compatible(&requirement, &previous_daemon)
+            .expect_err("an occupancy client must reject an old daemon");
+        assert!(error.diagnostic.contains(&format!(
+            "unsupported conformance fixture revision {}; requires at least {CONFORMANCE_FIXTURE_REVISION}",
+            DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION
+        )));
+
+        previous_daemon.conformance_fixture_revision = CONFORMANCE_FIXTURE_REVISION;
+        let error = ensure_compatible(&requirement, &previous_daemon)
+            .expect_err("an occupancy client must require the advertised feature");
+        assert!(
+            error
+                .diagnostic
+                .contains("missing required feature(s): attach_occupancy")
+        );
+        ensure_compatible(&requirement, &DaemonCompatibility::current())
+            .expect("an occupancy client accepts the current daemon");
+    }
+
+    #[test]
     fn unix_mux_helper_is_content_blind() {
         let envelope = DaemonUnixTerminalEnvelope::from_frame_bytes(
             "session",
@@ -3758,7 +3829,7 @@ mod tests {
     #[test]
     fn protocol_seven_rejects_protocol_six_and_accepts_conformance_floor_thirty_five() {
         assert_eq!(PROTOCOL_VERSION, 7);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 42);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 43);
 
         let protocol_six = DaemonCompatibilityRequirement {
             protocol_version: 6,
@@ -4375,6 +4446,8 @@ mod tests {
 
         let generated = daemon_protocol_typescript();
         assert!(generated.contains("lifecycle_counters?: DaemonLifecycleCounters;"));
+        assert!(generated.contains("live_attach_occupancy?: DaemonAttachOccupancy[];"));
+        assert!(generated.contains("export interface DaemonAttachOccupancy"));
         assert!(generated.contains("export interface DaemonLifecycleCounters"));
         assert!(generated.contains("cleanup_by_reason?: Record<string, number>;"));
     }
@@ -5681,6 +5754,7 @@ mod tests {
                 recovered_sessions: vec!["session".to_string()],
                 stale_sessions: Vec::new(),
                 lifecycle_counters: DaemonLifecycleCounters::default(),
+                live_attach_occupancy: Vec::new(),
                 diagnostics: vec![DaemonDiagnostic::connected("status")],
             }),
             sessions: vec![DaemonSession {
@@ -6275,7 +6349,7 @@ mod tests {
     #[test]
     fn protocol_six_and_conformance_thirty_two_define_the_cold_cut_boundary() {
         assert_eq!(PROTOCOL_VERSION, 7);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 42);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 43);
 
         let requirement = DaemonCompatibilityRequirement::current();
         let protocol_error = ensure_compatible(
@@ -6340,7 +6414,7 @@ mod tests {
         // conformance revision: bumping the protocol would break every existing
         // first-party client that never issues this request.
         assert_eq!(PROTOCOL_VERSION, 7);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 42);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 43);
         assert_eq!(DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION, 36);
         assert_eq!(
             current_feature_list(),
@@ -6361,6 +6435,7 @@ mod tests {
                 FEATURE_UNIX_TERMINAL_ADAPTER,
                 FEATURE_TERMINAL_SUBSCRIPTION_CLOSED,
                 FEATURE_WEBRTC_TERMINAL_ADAPTER,
+                FEATURE_ATTACH_OCCUPANCY,
             ],
             "the daemon advertises host-plane capabilities only",
         );

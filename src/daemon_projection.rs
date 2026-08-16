@@ -828,6 +828,7 @@ pub(crate) fn daemon_status_from_status(
             .map(|session_id| session_id.0.clone())
             .collect(),
         lifecycle_counters,
+        live_attach_occupancy: Vec::new(),
         diagnostics,
     }
 }

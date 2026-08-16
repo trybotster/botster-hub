@@ -127,9 +127,9 @@ pub use daemon::{
 };
 pub use daemon_maintenance::{MAX_OWNER_TURN_MS, MAX_READY_OPERATION_WAIT_MS};
 pub use daemon_transport::{
-    DaemonApp, DaemonAppLaunchTarget, DaemonAvailablePackage, DaemonCapability,
-    DaemonCompatibility, DaemonConnection, DaemonCoordination, DaemonEnvelope, DaemonEnvelopeAck,
-    DaemonEnvelopeDelivery, DaemonEnvelopePublish, DaemonEvent, DaemonHubUpdate,
+    DaemonApp, DaemonAppLaunchTarget, DaemonAttachOccupancy, DaemonAvailablePackage,
+    DaemonCapability, DaemonCompatibility, DaemonConnection, DaemonCoordination, DaemonEnvelope,
+    DaemonEnvelopeAck, DaemonEnvelopeDelivery, DaemonEnvelopePublish, DaemonEvent, DaemonHubUpdate,
     DaemonHubUpdateExecution, DaemonHubUpdateExecutionState, DaemonHubUpdateScope,
     DaemonHubUpdateState, DaemonIdentity, DaemonInstallationDiagnostic, DaemonInstallationIdentity,
     DaemonInstallationMode, DaemonModeFlags, DaemonNotify, DaemonOperatorError, DaemonPackage,
