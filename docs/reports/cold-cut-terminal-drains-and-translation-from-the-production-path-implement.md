@@ -14,7 +14,7 @@ Plan: `docs/plans/cold-cut-terminal-drains-and-translation-from-the-production-p
 | Worktree HEAD before edits | `959c58f55726d098299cced8af151d8f496f41e3` |
 | Locked Core SHA | `fc541a59338d0591ba4fb3fa522a030d212d26d0` |
 | Merge policy | direct into `main`; no PR |
-| Review follow-up | `review_1786840394_564198` on `9bd71ef` |
+| Review follow-up | `review_1786840394_564198`; Web `ticket_1786840565_508953` closed at `8c87c35` |
 
 Independent routing matched the approved plan. This run did not infer the repository from the ambient directory.
 
@@ -97,11 +97,7 @@ Closed dependencies used as given:
 
 Core `ticket_1786832517_855001` is closed. This visit pins Hub to `fc541a59338d0591ba4fb3fa522a030d212d26d0` and classifies `ShutdownSession` from `observe_session_lifecycle`. No Core, TUI, or Web source was edited in this Hub worktree.
 
-Open blocking Web follow-up:
-
-- `ticket_1786840565_508953` — Web: restore alternate-screen reattach final-row ReadScreen oracle
-- Dependency `dependency_1786840589_559221`
-- Child run `run_1786840591_550508` on target `tgt_40abcf71ccf049f4ac0c99953a799869`
+Web `ticket_1786840565_508953` is closed at `8c87c35bf6cbe6752b57fff364a98f3a128a6afb`. Dependency `dependency_1786840589_559221` is closed. All cold-cut dependencies are closed.
 
 ## Deviations from plan
 
@@ -121,7 +117,7 @@ This visit integrates Core `fc541a59`:
 Review `review_1786840394_564198` required two blocking results at `9bd71ef`:
 
 1. `finding_1786832385_719224` / `finding_1786812405_392121` — `./test.sh --locked` failed `external_hub_webrtc_live_output_preserves_exact_bytes` with OperatorError. This visit classifies before adapter close so the exact query can reconcile a parked `ProcessExited`.
-2. `finding_1786840394_749331` — two Review live Web runs failed `proveRapidAlternateScreenReattach` cycle 0. The prior Implement report claimed that oracle passed. That claim was wrong. Hub `ReadScreen` is `observe_lifecycle_slice` plus Core `read_screen`. Hub does not inspect terminal bodies. This visit registered Web ticket `ticket_1786840565_508953` and did not weaken the Web oracle.
+2. `finding_1786840394_749331` — two Review live Web runs at `1e57685` failed `proveRapidAlternateScreenReattach` cycle 0. Web `8c87c35` restored the producer match. This visit ran `npm run smoke:live-packaged-protocol` twice against Hub `ef25261` bins and Web `8c87c35`. Both runs printed `rapid_alternate_screen_reattach passed` with `cycle_0_final_row_present:true` and 20 cycles. Run 1 then timed out at `waitForTerminalDetached` after production exit. Run 2 printed `live packaged protocol harness passed (webrtc)`.
 
 `HubRuntime::drain_subscription` / `drain_runtime_once` compile only under `cfg(test)` for in-crate unit tests. Integration tests use observe + ReadScreen. Production owner loop, Drain handler, entity tick, and smoke do not call them.
 
@@ -374,7 +370,7 @@ Passed on this tree:
 - `shutdown_after_observed_exit_returns_session_cleanup` passed isolated
 - Live Web `1e57685` `npm run smoke:live-packaged-protocol` against copied bins from this tree: Hello protocol 7 / rev 42, session spawn, `proveLiveTerminalAfterAttach`, and `assertTerminalAttachChronology` (cycle 0 plus reconnect cycles) completed. The harness then failed twice at the later Web-owned `proveRapidAlternateScreenReattach` cycle 0 ReadScreen oracle (`lost final row marker`). That stage is after attaching, snapshots, attached, and live `daemon_terminal_event` output.
 - This visit after Core `fc541a59`: rustfmt and `cargo clippy --workspace --all-targets --offline --locked -- -D warnings` passed. Mapper tests passed, including `shutdown_stopping_record_is_host_cleanup_not_active`. Isolated parked-exit, exact-bytes, Unix/WebRTC write-budget, Unix/WebRTC failed-RemoveSession, observed-exit cleanup, and idempotent live-exit cleanup passed. After classify-before-close, `./test.sh --locked` passed (lib 279, lifecycle 207/1 ignored, client API 34). `external_hub_webrtc_live_output_preserves_exact_bytes` was green in that wrapper. `tui_shaped_hello_status_succeeds_without_host_terminal_tokens` passed in the wrapper.
-- Review `review_1786840394_564198` independently failed `proveRapidAlternateScreenReattach` twice at Web `1e57685`. This report no longer claims that oracle passed. Web ticket `ticket_1786840565_508953` owns the follow-up.
+- After Web `8c87c35` merged: two live packaged-protocol smokes against this tree's `botster-hub` and `botster-session-worker`. Both passed `proveRapidAlternateScreenReattach` (20 cycles, cycle 0 final row present). Run 1 then timed out at `waitForTerminalDetached`. Run 2 passed the full harness, including attach chronology and in-page reconnect. TUI-shaped IsolatedHub Hello + Status passed again (`tui_shaped_hello_status_succeeds_without_host_terminal_tokens`, 1.70s).
 
 ## Unverified behavior or residual risk
 
@@ -384,7 +380,7 @@ Passed on this tree:
 - CoreDaemon on `aef6516` does not expose `pump_bound_adapters`. Owner-loop observe uses `observe_lifecycle_slice`, which calls Core `drain_runtime_once` internally.
 - Downstream TUI/Web crates that still imported the deleted hub-client `FEATURE_*` constants must import `botster-terminal-protocol` instead. Those consumers are separately routed.
 - Production Hub no longer calls Core `drain`, `lifecycle_baseline()`, or a capped page walk to classify ShutdownSession. Classify uses `observe_session_lifecycle`. A Running row plus `Runtime`/`State` stays OperatorError.
-- Independent Review at `9bd71ef` failed `proveRapidAlternateScreenReattach` cycle 0 twice. That oracle is not claimed passed. Web ticket `ticket_1786840565_508953` owns reproduction and the owning-repository fix. The Web harness still requires the final-row marker.
+- Web `8c87c35` live smoke run 1 passed alternate-screen (20 cycles) and then timed out at `waitForTerminalDetached` after production exit. Run 2 passed the full harness. The detach timeout is not claimed as a Hub cold-cut defect.
 - Core shutdown of a live write-budget `yes` session can stay `Stopping` after the two-second Core deadline. Host policy returns `SessionCleanup` for that Stopping row. A Running row stays OperatorError.
 - The 65-session walk-reset proof is deleted. It classified through capped pages. The exact query does not scan.
 
