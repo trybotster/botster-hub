@@ -3250,17 +3250,19 @@ fn handle_runtime_control_request(
             events_response(response.body)
         }
         DaemonRequest::ShutdownSession { session_id } => {
-            pending_runtime.close_adapters_for_session(&session_id);
             let now = tick(logical_clock);
             match classify_shutdown_session(runtime, &session_id, now) {
                 Ok(ShutdownSessionClassification::Cleanup(cleanup)) => {
+                    pending_runtime.close_adapters_for_session(&session_id);
                     return Ok(daemon_session_cleanup(cleanup));
                 }
                 Ok(ShutdownSessionClassification::Missing) => {
+                    pending_runtime.close_adapters_for_session(&session_id);
                     return Ok(daemon_unknown_session_cleanup(&session_id));
                 }
                 Ok(ShutdownSessionClassification::Active) | Err(_) => {}
             }
+            pending_runtime.close_adapters_for_session(&session_id);
             let shutdown_session_id = session_id.clone();
             let response = match api.handle_request(
                 runtime,
