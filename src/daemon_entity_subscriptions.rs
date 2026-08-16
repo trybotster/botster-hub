@@ -275,6 +275,18 @@ pub(super) fn register_entity_subscription(
         drive_package_entity_fanout(daemon, state);
         return Ok(daemon_response_base(DaemonResponseKind::EntitySubscribed));
     }
+    if let Some(runtime) = daemon.runtime() {
+        crate::daemon_maintenance::run_maintenance_kind(
+            runtime,
+            &mut state.maintenance,
+            crate::daemon_maintenance::MaintenanceSliceKind::JournalPull,
+        );
+        crate::daemon_maintenance::run_maintenance_kind(
+            runtime,
+            &mut state.maintenance,
+            crate::daemon_maintenance::MaintenanceSliceKind::ProjectionApply,
+        );
+    }
     let complete =
         state.maintenance.projection.baseline_complete && !state.maintenance.projection.gap;
     let cursor = state.maintenance.projection.cursor.clone();
