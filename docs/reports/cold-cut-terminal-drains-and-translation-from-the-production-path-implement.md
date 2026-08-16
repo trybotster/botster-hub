@@ -14,7 +14,7 @@ Plan: `docs/plans/cold-cut-terminal-drains-and-translation-from-the-production-p
 | Worktree HEAD before edits | `959c58f55726d098299cced8af151d8f496f41e3` |
 | Locked Core SHA | `fc541a59338d0591ba4fb3fa522a030d212d26d0` |
 | Merge policy | direct into `main`; no PR |
-| Review follow-up | Core `ticket_1786832517_855001` merged at `fc541a59`; this visit replaces Hub walk classify |
+| Review follow-up | `review_1786840394_564198` on `9bd71ef` |
 
 Independent routing matched the approved plan. This run did not infer the repository from the ambient directory.
 
@@ -75,7 +75,7 @@ Not loaded: [[project-pipelines-playbook]] (package/plugin paths out of scope).
 - `README.md`, `docs/client-protocol.md`
 - Tests under `tests/hub_client_api_test.rs`, `tests/hub_local_runtime_test.rs`, `tests/hub_daemon_lifecycle/*`
 - Plan and this report
-- This visit: `Cargo.toml`, `Cargo.lock`, `crates/botster-hub-client/Cargo.toml`, `crates/botster-hub-test-support/Cargo.toml`, `crates/botster-hub-test-support/build.rs`, `src/runtime.rs`, `src/daemon_transport.rs`, `tests/hub_daemon_lifecycle/sessions.rs`, `tests/hub_daemon_lifecycle/common.rs`, `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs`, and this report
+- This visit: `src/daemon_transport.rs` and this report. Prior visit files remain: `Cargo.toml`, `Cargo.lock`, crate pins, `src/runtime.rs`, lifecycle tests.
 
 ## Ownership boundaries preserved
 
@@ -95,7 +95,13 @@ Closed dependencies used as given:
 - TUI planes `ticket_1786661009_551067`
 - TUI Hello repair `ticket_1786756492_156718` at `fc1ff6238ae707c355febbc03eeab5130cccf91c`
 
-Core `ticket_1786832517_855001` is closed. This visit pins Hub to `fc541a59338d0591ba4fb3fa522a030d212d26d0` and classifies `ShutdownSession` from `observe_session_lifecycle`. No Core, TUI, or Web source was edited.
+Core `ticket_1786832517_855001` is closed. This visit pins Hub to `fc541a59338d0591ba4fb3fa522a030d212d26d0` and classifies `ShutdownSession` from `observe_session_lifecycle`. No Core, TUI, or Web source was edited in this Hub worktree.
+
+Open blocking Web follow-up:
+
+- `ticket_1786840565_508953` — Web: restore alternate-screen reattach final-row ReadScreen oracle
+- Dependency `dependency_1786840589_559221`
+- Child run `run_1786840591_550508` on target `tgt_40abcf71ccf049f4ac0c99953a799869`
 
 ## Deviations from plan
 
@@ -106,11 +112,16 @@ Production implementation follows rev 4: Core pin, observe/baseline slices, alwa
 This visit integrates Core `fc541a59`:
 
 - `HubRuntime::observe_session_lifecycle` is the only ShutdownSession classify path. Page walks, walk-reset state, `OwnedSessionRuntime`, and `shutdown_core_for_test` are gone.
-- Host policy still closes that session's adapters, then classifies. Already-terminal rows return `SessionCleanup` without a second Core shutdown. A lookup error still attempts Core shutdown.
+- Host policy classifies through `observe_session_lifecycle` before it closes adapters. Closing first can hide a parked `ProcessExited` from the exact query. Already-terminal rows return `SessionCleanup` without a second Core shutdown. A lookup error still attempts Core shutdown.
 - After a Core shutdown error, one exact-session re-classify decides cleanup vs `OperatorError`.
 - Host `ShutdownSession` maps Found `Stopping` / registry `Stopping` to `SessionCleanup` (`already_exited`). That is host request completion after Core accepted shutdown. Running plus `Runtime`/`State` stays `OperatorError`.
 - Parked-exit no longer spawns 64 pad sessions. The exact query is independent of registry size. Core owns the large-registry no-`load_all` proof.
 - TUI-shaped IsolatedHub Hello + Status uses the TUI host feature list and `terminal_compatibility`. Host Hello does not require `terminal_streaming` or `resize`.
+
+Review `review_1786840394_564198` required two blocking results at `9bd71ef`:
+
+1. `finding_1786832385_719224` / `finding_1786812405_392121` — `./test.sh --locked` failed `external_hub_webrtc_live_output_preserves_exact_bytes` with OperatorError. This visit classifies before adapter close so the exact query can reconcile a parked `ProcessExited`.
+2. `finding_1786840394_749331` — two Review live Web runs failed `proveRapidAlternateScreenReattach` cycle 0. The prior Implement report claimed that oracle passed. That claim was wrong. Hub `ReadScreen` is `observe_lifecycle_slice` plus Core `read_screen`. Hub does not inspect terminal bodies. This visit registered Web ticket `ticket_1786840565_508953` and did not weaken the Web oracle.
 
 `HubRuntime::drain_subscription` / `drain_runtime_once` compile only under `cfg(test)` for in-crate unit tests. Integration tests use observe + ReadScreen. Production owner loop, Drain handler, entity tick, and smoke do not call them.
 
@@ -362,7 +373,8 @@ Passed on this tree:
 - `./test.sh --locked` after the adapter-close fix: lib 288, lifecycle 206/1 ignored, client API 34, no FAILED results. Exact-bytes, parked-exit, Active Runtime/State mapper tests, and the reset proof stayed green.
 - `shutdown_after_observed_exit_returns_session_cleanup` passed isolated
 - Live Web `1e57685` `npm run smoke:live-packaged-protocol` against copied bins from this tree: Hello protocol 7 / rev 42, session spawn, `proveLiveTerminalAfterAttach`, and `assertTerminalAttachChronology` (cycle 0 plus reconnect cycles) completed. The harness then failed twice at the later Web-owned `proveRapidAlternateScreenReattach` cycle 0 ReadScreen oracle (`lost final row marker`). That stage is after attaching, snapshots, attached, and live `daemon_terminal_event` output.
-- This visit after Core `fc541a59`: rustfmt and `cargo clippy --workspace --all-targets --offline --locked -- -D warnings` passed. Mapper tests passed, including `shutdown_stopping_record_is_host_cleanup_not_active`. Isolated parked-exit, exact-bytes, Unix/WebRTC write-budget, Unix/WebRTC failed-RemoveSession, observed-exit cleanup, and idempotent live-exit cleanup passed. `./test.sh --locked` passed (lib 279, lifecycle 206/1 ignored, client API 34), including exact-bytes. `tui_shaped_hello_status_succeeds_without_host_terminal_tokens` passed isolated after that locked run. Live Web `1e57685` smoke against this-tree bins completed production terminal oracles including `proveRapidAlternateScreenReattach`, then timed out at `waitForTerminalDetached` after production exit.
+- This visit after Core `fc541a59`: rustfmt and `cargo clippy --workspace --all-targets --offline --locked -- -D warnings` passed. Mapper tests passed, including `shutdown_stopping_record_is_host_cleanup_not_active`. Isolated parked-exit, exact-bytes, Unix/WebRTC write-budget, Unix/WebRTC failed-RemoveSession, observed-exit cleanup, and idempotent live-exit cleanup passed. After classify-before-close, `./test.sh --locked` passed (lib 279, lifecycle 207/1 ignored, client API 34). `external_hub_webrtc_live_output_preserves_exact_bytes` was green in that wrapper. `tui_shaped_hello_status_succeeds_without_host_terminal_tokens` passed in the wrapper.
+- Review `review_1786840394_564198` independently failed `proveRapidAlternateScreenReattach` twice at Web `1e57685`. This report no longer claims that oracle passed. Web ticket `ticket_1786840565_508953` owns the follow-up.
 
 ## Unverified behavior or residual risk
 
@@ -372,7 +384,7 @@ Passed on this tree:
 - CoreDaemon on `aef6516` does not expose `pump_bound_adapters`. Owner-loop observe uses `observe_lifecycle_slice`, which calls Core `drain_runtime_once` internally.
 - Downstream TUI/Web crates that still imported the deleted hub-client `FEATURE_*` constants must import `botster-terminal-protocol` instead. Those consumers are separately routed.
 - Production Hub no longer calls Core `drain`, `lifecycle_baseline()`, or a capped page walk to classify ShutdownSession. Classify uses `observe_session_lifecycle`. A Running row plus `Runtime`/`State` stays OperatorError.
-- Live Web `1e57685` `npm run smoke:live-packaged-protocol` against this tree's bins completed Hello protocol 7 / rev 42, identity, session-type CRUD, spawn, production terminal oracles including `proveRapidAlternateScreenReattach` and `proveInPageTerminalDataChannelReconnect`. The harness then timed out at `waitForTerminalDetached` after production exit. The Web harness comment says those detach steps fail on main for unrelated reasons.
+- Independent Review at `9bd71ef` failed `proveRapidAlternateScreenReattach` cycle 0 twice. That oracle is not claimed passed. Web ticket `ticket_1786840565_508953` owns reproduction and the owning-repository fix. The Web harness still requires the final-row marker.
 - Core shutdown of a live write-budget `yes` session can stay `Stopping` after the two-second Core deadline. Host policy returns `SessionCleanup` for that Stopping row. A Running row stays OperatorError.
 - The 65-session walk-reset proof is deleted. It classified through capped pages. The exact query does not scan.
 
