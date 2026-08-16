@@ -25,7 +25,7 @@ use botster_core_daemon::{
     ReadModeFlagsRequest, ReadModeFlagsResult, ReadScreenRequest, ReadScreenResult,
     RegistrySessionState, RoutedEnvelopeDeliveryStateResult, SessionAdoptionReport,
     SessionAdoptionState, SessionLifecycleBaselinePage, SessionLifecycleCursor,
-    SessionLifecyclePage, SessionLifecyclePageError, SpawnSessionRequest,
+    SessionLifecycleLookup, SessionLifecyclePage, SessionLifecyclePageError, SpawnSessionRequest,
 };
 use botster_ui_contract::{UiActionRequest, UiActionResult, UiNode};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -1992,149 +1992,20 @@ impl HubRuntime {
     }
 }
 
-/// Result of one bounded engine-lifecycle lookup.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum SessionRuntimeLifecycleLookup {
-    /// The snapshot contained this session and Core reported a lifecycle.
-    Found(SessionLifecycleState),
-    /// The completed snapshot did not contain this session.
-    CompleteAbsent,
-    /// The snapshot walk did not finish. This is not absence.
-    Incomplete,
-    /// A page call failed. This is not absence.
-    Error,
-}
-
-/// Cursor for one ShutdownSession classify walk.
-///
-/// Retries continue this walk. They do not start a new 1 s scan.
-/// After an Active classify, callers must reset before a later classify.
-#[derive(Debug, Default)]
-pub(crate) struct SessionLifecycleWalk {
-    snapshot: Option<SessionLifecycleCursor>,
-    after: Option<SessionId>,
-    resyncs: usize,
-    stalls: usize,
-    #[cfg(test)]
-    page_row_limit: Option<usize>,
-}
-
-impl SessionLifecycleWalk {
-    pub(crate) fn reset(&mut self) {
-        #[cfg(test)]
-        let page_row_limit = self.page_row_limit;
-        *self = Self::default();
-        #[cfg(test)]
-        {
-            self.page_row_limit = page_row_limit;
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn is_holding_snapshot(&self) -> bool {
-        self.snapshot.is_some()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn hold_snapshot_for_test(&mut self) {
-        self.snapshot = Some(SessionLifecycleCursor {
-            source_id: botster_core_daemon::SessionLifecycleSourceId("test".to_string()),
-            sequence: 1,
-        });
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_page_row_limit(&mut self, max_rows: usize) {
-        self.page_row_limit = Some(max_rows);
-    }
-
-    fn page_row_limit(&self) -> usize {
-        #[cfg(test)]
-        {
-            self.page_row_limit.unwrap_or(32)
-        }
-        #[cfg(not(test))]
-        {
-            32
-        }
-    }
-}
-
-pub(crate) fn shutdown_lifecycle_page_budget(
-    remaining: Duration,
-    max_rows: usize,
-) -> Option<LifecycleBaselineBudget> {
-    if remaining.is_zero() {
-        return None;
-    }
-    Some(LifecycleBaselineBudget {
-        max_rows,
-        max_bytes: 64 * 1024,
-        max_elapsed: remaining.min(Duration::from_millis(250)),
-    })
-}
-
 impl HubRuntime {
-    /// Return Core's in-memory engine lifecycle for one session.
+    /// Return one exact-session control-plane lifecycle lookup.
     ///
-    /// Registry state can lag when `read_screen` parks `ProcessExited`.
-    /// Shutdown classify uses this control-plane record, not terminal Drain.
-    /// The walk uses paged baseline calls until the row is found, the
-    /// snapshot is complete, or `deadline` expires. Incomplete scans and
-    /// page errors are not reported as absence.
-    pub(crate) fn session_runtime_lifecycle(
+    /// Shutdown classify uses this typed result. It does not walk baseline
+    /// pages or consume terminal Drain.
+    pub(crate) fn observe_session_lifecycle(
         &self,
         session_id: &SessionId,
-        deadline: Instant,
-        walk: &mut SessionLifecycleWalk,
-    ) -> SessionRuntimeLifecycleLookup {
-        const MAX_RESYNCS: usize = 3;
-        const MAX_STALLS: usize = 8;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let Some(budget) = shutdown_lifecycle_page_budget(remaining, walk.page_row_limit())
-            else {
-                return SessionRuntimeLifecycleLookup::Incomplete;
-            };
-            let page = match self.lifecycle_baseline_page(
-                walk.snapshot.as_ref(),
-                walk.after.as_ref(),
-                budget,
-            ) {
-                Ok(page) => page,
-                Err(_) => return SessionRuntimeLifecycleLookup::Error,
-            };
-            if page.resync_required.is_some() {
-                walk.resyncs += 1;
-                if walk.resyncs > MAX_RESYNCS {
-                    return SessionRuntimeLifecycleLookup::Incomplete;
-                }
-                walk.snapshot = None;
-                walk.after = None;
-                continue;
-            }
-            if let Some(lifecycle) = page.sessions.iter().find_map(|record| {
-                (&record.session.session_id == session_id).then(|| record.lifecycle.clone())
-            }) {
-                return match lifecycle {
-                    Some(state) => SessionRuntimeLifecycleLookup::Found(state),
-                    None => SessionRuntimeLifecycleLookup::Incomplete,
-                };
-            }
-            if page.complete {
-                return SessionRuntimeLifecycleLookup::CompleteAbsent;
-            }
-            walk.snapshot = Some(page.snapshot_sequence);
-            if page.next.is_some() {
-                walk.after = page.next;
-                walk.stalls = 0;
-            } else {
-                walk.stalls += 1;
-                if walk.stalls > MAX_STALLS {
-                    return SessionRuntimeLifecycleLookup::Incomplete;
-                }
-            }
-        }
+        now_seconds: u64,
+    ) -> Result<SessionLifecycleLookup, CoreDaemonError> {
+        self.core_daemon
+            .lock()
+            .expect("core daemon mutex")
+            .observe_session_lifecycle(session_id, now_seconds)
     }
 
     /// Test helper for Core terminal Drain. Production daemon paths must not call this.
@@ -2336,18 +2207,6 @@ impl HubRuntime {
             .lock()
             .expect("core daemon mutex")
             .shutdown(Some(session_id), now_seconds)
-    }
-
-    /// Shut down every Core session and mark the daemon stopped.
-    #[cfg(test)]
-    pub(crate) fn shutdown_core_for_test(
-        &mut self,
-        now_seconds: u64,
-    ) -> Result<(), CoreDaemonError> {
-        self.core_daemon
-            .lock()
-            .expect("core daemon mutex")
-            .shutdown(None, now_seconds)
     }
 
     fn reconcile_sessions(&mut self, now_seconds: u64) -> Result<(), CoreDaemonError> {

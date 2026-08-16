@@ -951,6 +951,58 @@ fn hello_ack_advertises_independent_terminal_compatibility() {
 }
 
 #[test]
+fn tui_shaped_hello_status_succeeds_without_host_terminal_tokens() {
+    let _guard = daemon_test_guard();
+    let hub = start_isolated_live_output_hub("tui-hello");
+    let requirement = botster_hub_client::DaemonCompatibilityRequirement {
+        protocol: botster_hub_client::PROTOCOL.to_string(),
+        protocol_version: botster_hub_client::PROTOCOL_VERSION,
+        required_features: vec![
+            botster_hub_client::FEATURE_SESSIONS.to_string(),
+            botster_hub_client::FEATURE_PACKAGE_NAVIGATION.to_string(),
+            botster_hub_client::FEATURE_PLUGIN_SURFACE_RENDER.to_string(),
+            botster_hub_client::FEATURE_PLUGIN_SURFACE_ACTION.to_string(),
+            botster_hub_client::FEATURE_TERMINAL_READBACK.to_string(),
+            botster_hub_client::FEATURE_SESSION_ENTITY_SUBSCRIPTIONS.to_string(),
+            botster_hub_client::FEATURE_MODE_GATED_INPUT.to_string(),
+            botster_hub_client::FEATURE_UNIX_TERMINAL_ADAPTER.to_string(),
+            botster_hub_client::FEATURE_TERMINAL_SUBSCRIPTION_CLOSED.to_string(),
+        ],
+        minimum_conformance_fixture_revision: 40,
+        client_name: "botster-tui".to_string(),
+    };
+    let terminal = botster_terminal_protocol::TerminalCompatibilityRequirement::for_ready_then_history_attach();
+    let (_stream, ack) = botster_hub_client::connect_and_hello_with_terminal_requirement(
+        hub.endpoint(),
+        &requirement,
+        Some(&terminal),
+    )
+    .expect("TUI-shaped Hello must succeed");
+    assert!(
+        !requirement
+            .required_features
+            .iter()
+            .any(|feature| feature == botster_terminal_protocol::FEATURE_TERMINAL_STREAMING
+                || feature == botster_terminal_protocol::FEATURE_RESIZE),
+        "TUI-shaped host Hello must not require terminal mechanism tokens"
+    );
+    assert!(ack.terminal_compatibility.is_some());
+    let status = botster_hub_client::request_with_requirement(
+        hub.endpoint(),
+        botster_hub_client::DaemonRequest::Status,
+        &requirement,
+    )
+    .expect("TUI-shaped Status after Hello");
+    assert_eq!(
+        status.kind,
+        botster_hub_client::DaemonResponseKind::Status,
+        "TUI-shaped Status must succeed, got {:?}",
+        status.error
+    );
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
 fn mismatched_terminal_hello_rejects_attach_before_core_ownership() {
     let _guard = daemon_test_guard();
     let hub = start_isolated_live_output_hub("htm");
