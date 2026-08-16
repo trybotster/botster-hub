@@ -17,7 +17,7 @@ Resolved from `list_spawn_targets`, not from the ambient session directory.
 | --- | --- |
 | `target_id` | `tgt_7e208a0c76a44980a83b63af976b1f22` |
 | Spawn target name | `botster-hub` |
-| Path | `/Users/jasonconigliari/Projects/botster-hub` |
+| Path | registered botster-hub spawn target |
 | Git remote | `trybotster/botster-hub` |
 | Repository playbook | [[botster-hub-playbook]] |
 

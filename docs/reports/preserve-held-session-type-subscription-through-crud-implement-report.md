@@ -7,7 +7,7 @@
 | Target repository | `botster-hub` (`trybotster/botster-hub`) |
 | Target id | `tgt_7e208a0c76a44980a83b63af976b1f22` |
 | Spawn target name | `botster-hub` |
-| Spawn target path | `/Users/jasonconigliari/Projects/botster-hub` |
+| Spawn target path | registered botster-hub spawn target |
 | Ticket | `ticket_1786841413_921609` |
 | Run | `run_1786841420_839050` |
 | Worktree | pipeline-provided Hub ticket worktree |
@@ -165,3 +165,15 @@ Hub `Cargo.toml` has no `[lints]` table. Strict clippy was not a separate wrappe
 - The `2 -> 3` live count on unfixed Hub is one production `sequence_gap` resubscribe, not a second UI-driven subscribe. The fixed live run stayed at 2, which matches that assumption.
 - Runtime-teardown class does not apply.
 - Direct merge into `main` happens after Review and Verify. This Implement visit commits the ticket branch and does not create a pull request.
+
+## Review return: path-neutral artifacts
+
+Review `review_1786844163_451695` required one artifact-privacy correction (`finding_1786844164_816135`). The plan and this report had named the registered spawn target with a local home path.
+
+Both rows now say `registered botster-hub spawn target`. Runtime code is unchanged.
+
+Loaded for this return visit:
+
+- [[botster review and verify must scan all committed artifacts for pii]]
+- [[pipeline artifacts should use path neutral worktree references]]
+- [[pipeline artifacts should cite vault notes by wikilink not home path]]
