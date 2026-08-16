@@ -201,6 +201,18 @@ async fn receive_owner_event(
     }
 }
 
+fn retry_client_event_cleanups(daemon: &HubDaemon, state: &mut DaemonControlState) {
+    let Some(runtime) = daemon.runtime() else {
+        return;
+    };
+    if state
+        .event_plane
+        .apply_pending_cleanups(runtime.package_event_router())
+    {
+        state.maintenance.try_wake();
+    }
+}
+
 fn owner_maintenance_pending(daemon: &HubDaemon, state: &DaemonControlState) -> bool {
     state.maintenance.needs_work()
         || session_subscribers_need_delivery(state)
@@ -212,6 +224,7 @@ fn owner_maintenance_pending(daemon: &HubDaemon, state: &DaemonControlState) -> 
                 || runtime.event_plane_owner_ops_pending()
                 || runtime.package_entity_work_pending()
         })
+        || state.event_plane.has_pending_cleanup()
 }
 
 fn mark_due_reconciliation(state: &mut DaemonControlState, now: Instant) {
@@ -245,6 +258,7 @@ fn run_one_owner_background_slice(daemon: &mut HubDaemon, state: &mut DaemonCont
 }
 
 fn run_one_owner_maintenance_slice(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
+    retry_client_event_cleanups(daemon, state);
     let started = Instant::now();
     let kind = state.maintenance.scheduler.take_slice();
     match kind {
@@ -625,7 +639,12 @@ async fn handle_connection_async(
             }
             _ = async {
                 if let Some(mailbox) = event_mailbox.as_ref() {
-                    mailbox.notify().notified().await;
+                    let notified = mailbox.notify().notified();
+                    tokio::pin!(notified);
+                    if mailbox.take_wake() || mailbox.has_ready_event() {
+                        return;
+                    }
+                    notified.await;
                 } else {
                     std::future::pending::<()>().await;
                 }

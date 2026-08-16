@@ -7,6 +7,40 @@ fn webrtc_terminal_adapter_hello() -> botster_hub_client::DaemonHello {
     }
 }
 
+fn webrtc_package_event_hello() -> botster_hub_client::DaemonHello {
+    let mut compatibility =
+        botster_hub_client::DaemonCompatibilityRequirement::for_webrtc_terminal_adapter();
+    compatibility
+        .required_features
+        .push(botster_hub_client::FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS.to_string());
+    compatibility.minimum_conformance_fixture_revision =
+        botster_hub_client::CONFORMANCE_FIXTURE_REVISION;
+    botster_hub_client::DaemonHello {
+        protocol: botster_hub_client::PROTOCOL.to_string(),
+        compatibility,
+        terminal_compatibility: None,
+    }
+}
+
+fn enable_event_plane_producer_on_hub(endpoint: &botster_hub_client::DaemonEndpoint, label: &str) {
+    let producer_src =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/event-plane-producer");
+    let producer_dir = unique_test_dir(&format!("event-plane-producer-{label}"));
+    copy_dir_all(&producer_src, &producer_dir);
+    rewrite_package_source_path(&producer_dir);
+    let enabled = botster_hub_client::request(
+        endpoint,
+        botster_hub_client::DaemonRequest::EnablePackageLocalPath {
+            path: producer_dir,
+        },
+    )
+    .expect("enable producer");
+    assert_eq!(
+        enabled.kind,
+        botster_hub_client::DaemonResponseKind::PackageDecision
+    );
+}
+
 fn webrtc_close_event_hello() -> botster_hub_client::DaemonHello {
     botster_hub_client::DaemonHello {
         protocol: botster_hub_client::PROTOCOL.to_string(),
@@ -1506,5 +1540,80 @@ fn one_session_unix_and_webrtc_dual_attach_exposes_hub_occupancy() {
     drop(unix);
     drop(unix_reader);
     shutdown_short_lived_session(&endpoint, session_id);
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn isolated_hub_webrtc_client_receives_unsolicited_package_event() {
+    let _guard = daemon_test_guard();
+    let (hub, endpoint, bootstrap) = start_webrtc_adapter_hub("wev");
+    enable_event_plane_producer_on_hub(&endpoint, "wev");
+    block_on(async {
+        let (mut peer, key) = open_local_webrtc_peer(&endpoint, &bootstrap).await;
+        peer.enable_host_events();
+        let ack = peer
+            .encrypted_hello(&key, &webrtc_package_event_hello())
+            .await
+            .expect("package-event hello");
+        assert!(
+            ack.compatibility
+                .supports_feature(botster_hub_client::FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS)
+        );
+        let subscribed = peer
+            .encrypted_request(
+                &key,
+                &botster_hub_client::DaemonRequest::SubscribeEvents {
+                    subscription_id: "sub-webrtc-live".to_string(),
+                    owner: "event-plane-producer".to_string(),
+                    name: "sample.ready".to_string(),
+                    subjects: Vec::new(),
+                },
+            )
+            .await
+            .expect("subscribe");
+        assert_eq!(
+            subscribed.kind,
+            botster_hub_client::DaemonResponseKind::EventSubscribed
+        );
+        emit_sample_ready(&endpoint, "webrtc-live");
+        let event = timeout(Duration::from_secs(5), peer.next_host_event(&key))
+            .await
+            .expect("package event arrives without later traffic")
+            .expect("host event");
+        match event {
+            botster_hub_client::DaemonEvent::PackageEvent {
+                subscription_id,
+                owner,
+                name,
+                payload,
+            } => {
+                assert_eq!(subscription_id, "sub-webrtc-live");
+                assert_eq!(owner, "event-plane-producer");
+                assert_eq!(name, "sample.ready");
+                assert_eq!(payload["token"], "webrtc-live");
+            }
+            other => panic!("expected PackageEvent, got {other:?}"),
+        }
+        let status = peer
+            .encrypted_request(&key, &botster_hub_client::DaemonRequest::Status)
+            .await
+            .expect("status after event");
+        assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
+        let entities = peer
+            .encrypted_request(
+                &key,
+                &botster_hub_client::DaemonRequest::SubscribeEntities {
+                    entity_type: "session".to_string(),
+                    subscription_id: "entity-under-events".to_string(),
+                },
+            )
+            .await
+            .expect("entity subscribe after event");
+        assert_eq!(
+            entities.kind,
+            botster_hub_client::DaemonResponseKind::EntitySubscribed
+        );
+        peer.peer.close().await.expect("close peer");
+    });
     hub.shutdown().expect("shutdown isolated hub");
 }

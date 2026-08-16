@@ -6,14 +6,13 @@
 - Target id: `tgt_7e208a0c76a44980a83b63af976b1f22`
 - Ticket: `ticket_1786663583_640263`
 - Run: `run_1786867268_135671`
-- Implement step: `run_step_1786869471_633205`
+- Implement step: `run_step_1786873840_503254` (review return)
 - Approved plan: `docs/plans/expose-client-event-subscriptions-on-the-host-control-protocol.md` at `6f1f5cf`
 - `teardown_class_applies`: no
 - Direct-merge pipeline. No pull request.
 
 Independent `list_spawn_targets` maps `tgt_7e208a0c76a44980a83b63af976b1f22` to
-`trybotster/botster-hub` at `/Users/jasonconigliari/Projects/botster-hub`.
-This run used the pipeline worktree for that target.
+`trybotster/botster-hub`. This run used the pipeline worktree for that target.
 
 ## Repository playbook and other playbooks/notes applied
 
@@ -110,6 +109,12 @@ Registered downstream consumers, not implemented here:
 - `ticket_1786663584_427840` (`botster-web`)
 - `ticket_1786663585_944018` (`botster-tui`)
 
+New same-target blocker, not implemented here:
+
+- `ticket_1786875812_242946` (`botster-hub`) default-concurrency
+  `./test.sh --locked` determinism. Registered as
+  `dependency_1786875816_371966`.
+
 No Core pin change. Pin remains
 `fc541a59338d0591ba4fb3fa522a030d212d26d0`.
 
@@ -117,15 +122,20 @@ No Core pin change. Pin remains
 
 - Unpublished support coordinate is `0.1.38`. Registry latest published is
   `0.1.36`. Tree `0.1.37` was already reserved by the prior unpublished
-  cold-cut ticket, so this ticket did not mutate that coordinate.
+  cold-cut ticket. `npm whoami` still returns 401. Blocking human question
+  `question_1786874473_381921` is open.
 - The 4,096-byte subject aggregate is the product of 16 × 256 UTF-8 bytes.
   The admission test proves 4,096 unique bytes are accepted. A 4,097-byte
   case cannot occur without first violating the 16-count or 256-byte rule.
-- WebRTC IsolatedHub emit used the in-process DataChannel harness plus Unix
-  IsolatedHub live emit. A full IsolatedHub WebRTC emit needs `botster-web`
-  bootstrap, which this ticket does not own.
-- `./test.sh --locked` did not produce one clean default-concurrency pass.
-  Rotating load flakes were isolated and passed. See tests below.
+- IsolatedHub Unix EventGap under 129 live emits is not a reliable fill.
+  The live writer drains a 1-slot mailbox between emits. EventGap live
+  proof fills the mailbox on the holder, then the production WebRTC writer
+  emits one gap with no later event.
+- `./test.sh --locked` still has no clean default-concurrency pass. Human
+  answer `question_1786875726_281871` refused a waiver. Blocker ticket
+  `ticket_1786875812_242946` (`run_1786875818_402849`, origin/main) is a
+  registered dependency. This branch will refresh after that merge and
+  then run one clean `./test.sh --locked`.
 
 No accepted product-scope change required a plan rewrite.
 
@@ -139,6 +149,10 @@ Wire and unit:
   outside the mailbox passed.
 - Fair-write ready-set tests passed.
 - Unix partial `PackageEvent` write resume passed.
+- Disconnect cleanup keeps the router holder until `try_cleanup` returns
+  Accepted. A held-lock contention test proves the holder disappears after
+  retry.
+- A missed `notify_waiters` is recovered by consuming `wake_bit`.
 
 Live IsolatedHub, Unix:
 
@@ -151,13 +165,20 @@ Live IsolatedHub, Unix:
 - Reconnect delivered no prior event.
 - Wildcard and undeclared subscribe returned typed operator errors.
 
-Live IsolatedHub / WebRTC harness:
+Live IsolatedHub / WebRTC:
 
 - Unnegotiated WebRTC `SubscribeEvents` returned
   `package_event_subscriptions_not_negotiated`. Status still succeeded.
 - Negotiated WebRTC subscribe with no contract returned
   `rejected_undeclared`. Status still succeeded after rejected terminal
   Hello.
+- IsolatedHub WebRTC through a `botster-web` bootstrap received an
+  unsolicited `PackageEvent` for `event-plane-producer` / `sample.ready`
+  without later traffic. Status and `SubscribeEntities` still succeeded.
+- Live WebRTC DataChannel writer delivered `EventGap` first after a full
+  one-event mailbox, then the queued event, then a live `PackageEvent`
+  after drain. Status and entity subscribe still progressed. Terminal
+  admission stayed rejected.
 
 Repo gates:
 
@@ -168,19 +189,19 @@ Repo gates:
 - `cargo test --workspace --locked --offline --exclude botster-hub`
 - `node packages/hub-test-support/scripts/sync-assets.mjs --check`
 
-`./test.sh --locked` default-concurrency runs hit rotating load flakes.
-Each named failure passed in isolation:
+Three `./test.sh --locked --offline` default-concurrency runs after the
+review fixes did not produce one clean pass. Isolated and base evidence:
 
-| Suite failure | Isolated branch | Isolated HEAD |
+| Suite failure | Isolated branch | Isolated origin/main `60b79b8` |
 | --- | --- | --- |
-| `support_matrix_serializes_to_stable_json_shape` | fixed in this change | n/a |
-| `separators_close_when_item_bytes_fit_but_commas_do_not` | pass | pass |
-| `session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnect` | pass | not re-run; entity path unchanged |
-| `webrtc_terminal_adapter_write_budget_emits_core_adapter_closed_while_peer_stays_readable` | pass | not re-run; isolated pass on branch |
-| `cli_local_runtime_up_starts_reuses_and_down_stops_runtime` | pass | not re-run; CLI runtime path unchanged |
+| `cli_smoke_proves_local_runtime_daemon_package_app_session_and_webrtc` | pass | pass |
+| `ready_spawn_stays_within_budget_when_live_sessions_exceed_one_observe_slice` | pass | pass |
+| `near_limit_snapshot_assembly_stays_within_owner_turn` | pass | fail |
 
-Ticket-specific IsolatedHub tests passed in the same suite that later
-flaked on unrelated tests.
+The owner-turn assert lives in `src/daemon_entity_subscriptions.rs` and
+is not part of this ticket's files. Human answer
+`question_1786875726_281871` refused a waiver and required a separate
+blocker. That ticket is `ticket_1786875812_242946`.
 
 Downstream TUI:
 
@@ -203,10 +224,11 @@ Live IsolatedHub Unix emit recorded:
 ## Unverified behavior or residual risk
 
 - One clean `./test.sh --locked` default-concurrency pass was not obtained.
-  Remaining risk is load flakes in session-entity, WebRTC write-budget, and
-  CLI reuse tests. Isolated reruns passed.
-- WebRTC IsolatedHub live emit of a package event was not run through a
-  `botster-web` bootstrap peer.
+  Human answer refused a waiver. Repair lives on
+  `ticket_1786875812_242946`. This ticket waits for that merge, then
+  refreshes and reruns the suite.
+- `@trybotster/hub-test-support@0.1.38` is packed but not published. Web
+  scratch proof against 0.1.38 is blocked until npm auth or a waiver.
 - Saturated-event load campaign remains `ticket_1786663585_879846`.
 - Web and TUI do not vendor this protocol in this run.
 

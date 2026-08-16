@@ -734,6 +734,20 @@ impl PackageEventRouter {
         body()
     }
 
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn test_client_holder_count(&self, connection_id: &str) -> usize {
+        lock_inner(&self.inner)
+            .map(|inner| {
+                inner
+                    .client_by_id
+                    .keys()
+                    .filter(|(holder_connection, _)| holder_connection == connection_id)
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
     #[doc(hidden)]
     #[must_use]
     pub fn test_subscription_count(&self, plugin_key: &str) -> usize {

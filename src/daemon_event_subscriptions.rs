@@ -4,7 +4,7 @@
 //! the coalesced writer wake. It does not take over a Unix socket and does not
 //! put frames on [`EntityFrameSender`].
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::Instant;
@@ -160,6 +160,11 @@ impl ClientEventMailbox {
         self.wake.notify_waiters();
     }
 
+    #[must_use]
+    pub(crate) fn take_wake(&self) -> bool {
+        self.wake_bit.swap(false, Ordering::SeqCst)
+    }
+
     pub(crate) fn try_push(
         &self,
         subscription_id: &str,
@@ -282,6 +287,7 @@ struct ConnectionEventState {
 #[derive(Default)]
 pub(crate) struct ClientEventPlane {
     connections: Mutex<HashMap<String, ConnectionEventState>>,
+    pending_cleanup: Mutex<HashSet<String>>,
 }
 
 impl std::fmt::Debug for ClientEventPlane {
@@ -373,11 +379,49 @@ impl ClientEventPlane {
     }
 
     pub(crate) fn cleanup_connection(&self, connection_id: &str, router: &PackageEventRouter) {
-        let Ok(mut connections) = lock_plane(&self.connections) else {
-            return;
+        if let Ok(mut pending) = self.pending_cleanup.lock() {
+            pending.insert(connection_id.to_string());
+        }
+        let _ = self.apply_pending_cleanups(router);
+    }
+
+    #[must_use]
+    pub(crate) fn has_pending_cleanup(&self) -> bool {
+        self.pending_cleanup
+            .lock()
+            .map(|pending| !pending.is_empty())
+            .unwrap_or(true)
+    }
+
+    /// Retry no-wait disconnect cleanup until router removal returns Accepted.
+    #[must_use]
+    pub(crate) fn apply_pending_cleanups(&self, router: &PackageEventRouter) -> bool {
+        let ids = match self.pending_cleanup.lock() {
+            Ok(pending) => pending.iter().cloned().collect::<Vec<_>>(),
+            Err(_) => return true,
         };
-        if connections.remove(connection_id).is_some() {
-            let _ = router.try_cleanup_client_connection(connection_id);
+        let mut remaining = Vec::new();
+        for connection_id in ids {
+            let Ok(mut connections) = lock_plane(&self.connections) else {
+                remaining.push(connection_id);
+                continue;
+            };
+            match router.try_cleanup_client_connection(&connection_id) {
+                EventPlaneStatus::Accepted => {
+                    connections.remove(&connection_id);
+                }
+                _ => remaining.push(connection_id),
+            }
+        }
+        match self.pending_cleanup.lock() {
+            Ok(mut pending) => {
+                pending.retain(|connection_id| remaining.iter().any(|id| id == connection_id));
+                for connection_id in remaining {
+                    pending.insert(connection_id);
+                }
+                !pending.is_empty()
+            }
+            Err(_) => true,
         }
     }
 }
@@ -574,6 +618,48 @@ mod tests {
         assert!(plane.mailbox("conn-b").is_none());
         plane.cleanup_connection("conn-a", &router);
         assert!(plane.mailbox("conn-a").is_none());
+    }
+
+    #[test]
+    fn disconnect_cleanup_keeps_holder_until_router_accepts() {
+        let router = admitted_router(EventAudience::Clients);
+        let plane = ClientEventPlane::default();
+        let policy = PackageEventPlanePolicy::default();
+        plane
+            .try_subscribe("conn", "sub", "owner", "ready", Vec::new(), policy, &router)
+            .expect("subscribe");
+        assert_eq!(router.test_client_holder_count("conn"), 1);
+        router.test_with_inner_held(|| {
+            plane.cleanup_connection("conn", &router);
+        });
+        assert!(
+            plane.has_pending_cleanup(),
+            "shed_busy must leave cleanup ownership on the ledger"
+        );
+        assert!(
+            plane.mailbox("conn").is_some(),
+            "plane state stays until router removal is accepted"
+        );
+        assert_eq!(router.test_client_holder_count("conn"), 1);
+        assert!(
+            !plane.apply_pending_cleanups(&router),
+            "retry must finish after the router lock is free"
+        );
+        assert_eq!(router.test_client_holder_count("conn"), 0);
+        assert!(plane.mailbox("conn").is_none());
+        assert!(!plane.has_pending_cleanup());
+    }
+
+    #[test]
+    fn missed_notify_is_recovered_by_wake_bit() {
+        let mailbox = ClientEventMailbox::new(PackageEventPlanePolicy::default());
+        assert!(!mailbox.take_wake());
+        mailbox
+            .try_push("sub", "owner", "ready", json!({ "ok": true }), 8)
+            .expect("push");
+        assert!(mailbox.take_wake());
+        assert!(!mailbox.take_wake());
+        assert!(mailbox.has_ready_event());
     }
 
     #[test]

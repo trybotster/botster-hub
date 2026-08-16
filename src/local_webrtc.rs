@@ -1264,20 +1264,29 @@ where
             request
         } else {
             let mailbox = peer_state.event_plane.mailbox(&peer_state.grant_id);
-            let events_ready = host_event_ready(peer_state);
+            if host_event_ready(peer_state)
+                || mailbox.as_ref().is_some_and(|mailbox| mailbox.take_wake())
+            {
+                continue;
+            }
             let inbound = tokio::select! {
                 biased;
                 channel = poll_data_channel_or_peer_terminal(data_channel, &mut peer_terminal_rx) => {
                     LocalWebrtcInbound::Channel(channel)
                 }
-                frame = entity_frame_rx.recv(), if !events_ready => {
+                frame = entity_frame_rx.recv() => {
                     LocalWebrtcInbound::Entity(
                         frame.expect("local WebRTC peer owns its entity subscription sender")
                     )
                 }
                 _ = async {
                     if let Some(mailbox) = mailbox.as_ref() {
-                        mailbox.notify().notified().await;
+                        let notified = mailbox.notify().notified();
+                        tokio::pin!(notified);
+                        if mailbox.take_wake() || mailbox.has_ready_event() {
+                            return;
+                        }
+                        notified.await;
                     } else {
                         std::future::pending::<()>().await;
                     }
@@ -4149,8 +4158,8 @@ mod tests {
         negotiated_unix_capability_set,
     };
     use crate::{
-        DataDirectoryOption, HostIdentityOptions, HubDaemon, HubStartupOptions, RuntimeEnvironment,
-        SessionDefaults,
+        DataDirectoryOption, HostIdentityOptions, HubDaemon, HubStartupOptions,
+        PackageEventPlaneOptions, RuntimeEnvironment, SessionDefaults,
     };
 
     /// Serializes teardown tests that inject a close hang, so parallel cargo tests
@@ -4199,6 +4208,8 @@ mod tests {
         connected_rx: AsyncReceiver<()>,
         data_channel_open_rx: AsyncReceiver<()>,
         data_channel_message_rx: AsyncReceiver<String>,
+        accept_host_events: bool,
+        pending_host_events: VecDeque<DaemonEvent>,
     }
 
     impl TestOfferPeer {
@@ -4268,6 +4279,8 @@ mod tests {
                     connected_rx,
                     data_channel_open_rx,
                     data_channel_message_rx,
+                    accept_host_events: false,
+                    pending_host_events: VecDeque::new(),
                 },
                 serde_json::to_value(offer).expect("serialize offer"),
             )
@@ -4339,7 +4352,63 @@ mod tests {
                         panic!("unbound peer helper must not receive daemon_terminal_frame");
                     }
                     DaemonLocalWebrtcDeliveryKind::DaemonEvent => {
-                        panic!("unnegotiated peer helper must not receive daemon_event");
+                        self.park_or_reject_host_event(&plaintext);
+                    }
+                }
+            }
+        }
+
+        fn enable_host_events(&mut self) {
+            self.accept_host_events = true;
+        }
+
+        fn park_or_reject_host_event(&mut self, plaintext: &[u8]) {
+            if !self.accept_host_events {
+                panic!("unnegotiated peer helper must not receive daemon_event");
+            }
+            self.pending_host_events
+                .push_back(serde_json::from_slice(plaintext).expect("parse daemon event"));
+        }
+
+        async fn next_host_event(&mut self, key: &AesGcmKey) -> DaemonEvent {
+            if let Some(event) = self.pending_host_events.pop_front() {
+                return event;
+            }
+            loop {
+                let mut encrypted = String::new();
+                let mut next_chunk_index = 0u32;
+                let mut delivery_kind = None;
+                loop {
+                    let response =
+                        timeout(Duration::from_secs(10), self.data_channel_message_rx.recv())
+                            .await
+                            .expect("host event frame timeout")
+                            .expect("data channel remains open for host event");
+                    let chunk: DaemonLocalWebrtcDeliveryChunk =
+                        serde_json::from_str(&response).expect("parse delivery chunk");
+                    if let Some(kind) = delivery_kind {
+                        assert_eq!(kind, chunk.delivery_kind);
+                    } else {
+                        delivery_kind = Some(chunk.delivery_kind);
+                    }
+                    assert_eq!(chunk.chunk_index, next_chunk_index);
+                    encrypted.push_str(&chunk.payload);
+                    next_chunk_index += 1;
+                    if chunk.chunk_index + 1 == chunk.chunk_count {
+                        break;
+                    }
+                }
+                let envelope: AesGcmEnvelope =
+                    serde_json::from_str(&encrypted).expect("parse event envelope");
+                let plaintext = decrypt_aes_gcm(key, &envelope).expect("decrypt event");
+                match delivery_kind.expect("complete delivery declares a kind") {
+                    DaemonLocalWebrtcDeliveryKind::DaemonEvent => {
+                        return serde_json::from_slice(&plaintext).expect("parse daemon event");
+                    }
+                    DaemonLocalWebrtcDeliveryKind::DaemonEntityFrame
+                    | DaemonLocalWebrtcDeliveryKind::DaemonResponse => {}
+                    DaemonLocalWebrtcDeliveryKind::DaemonTerminalFrame => {
+                        panic!("unbound peer helper must not receive daemon_terminal_frame");
                     }
                 }
             }
@@ -4395,7 +4464,14 @@ mod tests {
         ))
     }
 
-    fn start_test_daemon(data_directory: PathBuf) -> HubDaemon {
+    fn start_test_daemon_with_event_queue(
+        data_directory: PathBuf,
+        consumer_queue_max_events: Option<usize>,
+    ) -> HubDaemon {
+        let mut package_event_plane = PackageEventPlaneOptions::default();
+        if let Some(max_events) = consumer_queue_max_events {
+            package_event_plane.consumer_queue_max_events = max_events;
+        }
         let config = HubStartupOptions {
             host: HostIdentityOptions {
                 id: "local-webrtc-teardown-test".to_string(),
@@ -4409,6 +4485,7 @@ mod tests {
                 initial_rows: 24,
                 initial_cols: 80,
             },
+            package_event_plane,
             ..HubStartupOptions::default()
         }
         .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))
@@ -4473,10 +4550,17 @@ mod tests {
 
     impl PeerHarness {
         fn new(label: &str) -> Self {
+            Self::new_with_event_queue(label, None)
+        }
+
+        fn new_with_event_queue(label: &str, consumer_queue_max_events: Option<usize>) -> Self {
             LAST_SESSION_CLEANUP_ERROR.with(|slot| *slot.borrow_mut() = None);
             let data_directory = unique_test_data_dir(label);
             let terminal_path = data_directory.join(LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE);
-            let mut daemon = start_test_daemon(data_directory.clone());
+            let mut daemon = start_test_daemon_with_event_queue(
+                data_directory.clone(),
+                consumer_queue_max_events,
+            );
             let (control_tx, control_rx) = tokio_mpsc::channel(256);
             let transport_runtime = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(1)
@@ -4755,6 +4839,81 @@ mod tests {
             worker.join().expect("request worker joins");
             peer.offer_peer = Some(offer_peer);
             response
+        }
+
+        fn wait_for_host_event(&mut self, peer: &mut LiveSignaledPeer, label: &str) -> DaemonEvent {
+            let key = peer.stream_key.clone();
+            let mut offer_peer = peer
+                .offer_peer
+                .take()
+                .expect("offer peer available for host event");
+            let (response_tx, response_rx) = std::sync::mpsc::channel();
+            let offer_handle = peer.offer_runtime.handle().clone();
+            let worker = thread::spawn(move || {
+                let event = offer_handle.block_on(offer_peer.next_host_event(&key));
+                response_tx
+                    .send((offer_peer, event))
+                    .expect("return host event");
+            });
+
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let (offer_peer, event) = loop {
+                if let Ok(result) = response_rx.try_recv() {
+                    break result;
+                }
+                if Instant::now() >= deadline {
+                    panic!("timed out waiting for {label} host event");
+                }
+                match self.control_rx.try_recv() {
+                    Ok(message) => {
+                        handle_control_message(
+                            &mut self.daemon,
+                            &mut self.state,
+                            &self.terminal_path,
+                            &self.transport_handle,
+                            self.control_tx.clone(),
+                            message,
+                        );
+                    }
+                    Err(tokio_mpsc::error::TryRecvError::Empty) => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(tokio_mpsc::error::TryRecvError::Disconnected) => {
+                        panic!("control channel closed during {label}");
+                    }
+                }
+            };
+            worker.join().expect("host event worker joins");
+            peer.offer_peer = Some(offer_peer);
+            event
+        }
+
+        fn enable_event_plane_producer(&mut self) {
+            let producer_src =
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/event-plane-producer");
+            let producer_dir = self.data_directory.join("event-plane-producer");
+            copy_dir_all(&producer_src, &producer_dir);
+            rewrite_package_source_path(&producer_dir);
+            let enabled = self
+                .control_request(DaemonRequest::EnablePackageLocalPath { path: producer_dir })
+                .expect("enable producer");
+            assert_eq!(
+                enabled.kind,
+                botster_hub_client::DaemonResponseKind::PackageDecision
+            );
+        }
+
+        fn emit_sample_ready(&mut self, token: &str) {
+            let emitted = self
+                .control_request(DaemonRequest::PluginMcpCallTool {
+                    name: "event_plane.emit_ready".to_string(),
+                    arguments: serde_json::json!({ "token": token }),
+                })
+                .expect("emit ready");
+            assert_eq!(
+                emitted.kind,
+                botster_hub_client::DaemonResponseKind::PluginMcpToolResult
+            );
         }
 
         fn ensure_webrtc_adapter_hello(&mut self, peer: &mut LiveSignaledPeer) {
@@ -5268,6 +5427,39 @@ mod tests {
                 let _ = self.offer_runtime.block_on(offer_peer.peer.close());
             }
         }
+
+        fn enable_host_events(&mut self) {
+            self.offer_peer
+                .as_mut()
+                .expect("offer peer available")
+                .enable_host_events();
+        }
+    }
+
+    fn copy_dir_all(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).expect("create dest");
+        for entry in std::fs::read_dir(from).expect("read src") {
+            let entry = entry.expect("entry");
+            let dest = to.join(entry.file_name());
+            if entry.file_type().expect("ty").is_dir() {
+                copy_dir_all(&entry.path(), &dest);
+            } else {
+                std::fs::copy(entry.path(), dest).expect("copy file");
+            }
+        }
+    }
+
+    fn rewrite_package_source_path(package_dir: &Path) {
+        let manifest_path = package_dir.join("botster-package.json");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).expect("read manifest"))
+                .expect("parse manifest");
+        value["source"]["path"] = serde_json::json!(package_dir.display().to_string());
+        std::fs::write(
+            manifest_path,
+            serde_json::to_string_pretty(&value).expect("serialize"),
+        )
+        .expect("write manifest");
     }
 
     fn read_terminal_record(path: &Path) -> LocalWebrtcSenderTerminalRecord {
@@ -5447,6 +5639,128 @@ mod tests {
         assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
         peer.close_offer();
         negotiated.close_offer();
+        harness.cleanup();
+    }
+
+    #[test]
+    fn webrtc_negotiated_peer_receives_package_event_and_gap_without_later_traffic() {
+        let _teardown_guard = teardown_test_lock();
+        let mut harness = PeerHarness::new_with_event_queue("evt-live", Some(1));
+        harness.enable_event_plane_producer();
+        let mut peer = harness.signal_peer("http://127.0.0.1:41911");
+        harness.hello_on_peer(
+            &mut peer,
+            DaemonHello {
+                protocol: PROTOCOL.to_string(),
+                compatibility:
+                    botster_hub_client::DaemonCompatibilityRequirement::for_package_event_subscriptions(),
+                terminal_compatibility: Some(
+                    botster_terminal_protocol::TerminalCompatibilityRequirement {
+                        protocol: "botster-terminal-v1".to_string(),
+                        protocol_version: 99,
+                        required_features: vec!["missing_terminal_feature".to_string()],
+                        minimum_conformance_fixture_revision: 1,
+                        client_name: "webrtc-event-live".to_string(),
+                    },
+                ),
+            },
+        );
+        peer.enable_host_events();
+        let subscribed = harness.request_on_peer(
+            &mut peer,
+            DaemonRequest::SubscribeEvents {
+                subscription_id: "sub-live".to_string(),
+                owner: "event-plane-producer".to_string(),
+                name: "sample.ready".to_string(),
+                subjects: Vec::new(),
+            },
+            "SubscribeEvents",
+        );
+        assert_eq!(
+            subscribed.kind,
+            botster_hub_client::DaemonResponseKind::EventSubscribed
+        );
+        assert!(
+            !harness
+                .state
+                .pending_runtime
+                .webrtc_is_admitted(&peer.grant_id),
+            "package-event Hello must not admit a terminal adapter"
+        );
+        let mailbox = harness
+            .daemon
+            .local_webrtc()
+            .event_plane()
+            .mailbox(&peer.grant_id)
+            .expect("subscribed connection has a mailbox");
+        let mut saw_full = false;
+        for index in 0..8 {
+            match mailbox.try_push(
+                "sub-live",
+                "event-plane-producer",
+                "sample.ready",
+                serde_json::json!({ "ok": true, "token": format!("fill-{index}") }),
+                8,
+            ) {
+                Ok(()) => {}
+                Err(crate::package_event_router::EventPlaneStatus::ShedFull) => {
+                    saw_full = true;
+                    break;
+                }
+                other => panic!("unexpected mailbox fill result: {other:?}"),
+            }
+        }
+        assert!(saw_full, "one-event mailbox must shed and set a gap bit");
+        let first = harness.wait_for_host_event(&mut peer, "event-gap");
+        match first {
+            DaemonEvent::EventGap {
+                subscription_id,
+                owner,
+                name,
+            } => {
+                assert_eq!(subscription_id, "sub-live");
+                assert_eq!(owner, "event-plane-producer");
+                assert_eq!(name, "sample.ready");
+            }
+            other => panic!("full mailbox must emit EventGap first: {other:?}"),
+        }
+        let queued = harness.wait_for_host_event(&mut peer, "queued-package-event");
+        match queued {
+            DaemonEvent::PackageEvent {
+                subscription_id, ..
+            } => {
+                assert_eq!(subscription_id, "sub-live");
+            }
+            other => panic!("queued event remains after gap: {other:?}"),
+        }
+        harness.emit_sample_ready("after-drain");
+        let live = harness.wait_for_host_event(&mut peer, "live-package-event");
+        match live {
+            DaemonEvent::PackageEvent {
+                subscription_id,
+                payload,
+                ..
+            } => {
+                assert_eq!(subscription_id, "sub-live");
+                assert_eq!(payload["token"], "after-drain");
+            }
+            other => panic!("live emit after drain must be PackageEvent: {other:?}"),
+        }
+        let status = harness.request_on_peer(&mut peer, DaemonRequest::Status, "Status");
+        assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
+        let entities = harness.subscribe_entities(&mut peer, "entity-under-event-pressure");
+        assert_eq!(
+            entities.kind,
+            botster_hub_client::DaemonResponseKind::EntitySubscribed
+        );
+        assert!(
+            !harness
+                .state
+                .pending_runtime
+                .webrtc_is_admitted(&peer.grant_id),
+            "event delivery must not create a terminal adapter"
+        );
+        peer.close_offer();
         harness.cleanup();
     }
 
