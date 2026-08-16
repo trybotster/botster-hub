@@ -3261,7 +3261,9 @@ fn handle_runtime_control_request(
                     pending_runtime.close_adapters_for_session(&session_id);
                     return Ok(daemon_unknown_session_cleanup(&session_id));
                 }
-                Ok(ShutdownSessionClassification::Active) | Err(_) => {}
+                Ok(ShutdownSessionClassification::Active)
+                | Ok(ShutdownSessionClassification::Stopping)
+                | Err(_) => {}
             }
             let shutdown_session_id = session_id.clone();
             let response = match api.handle_request(
@@ -4319,6 +4321,7 @@ enum ShutdownSessionClassification {
     Active,
     Cleanup(DaemonSessionCleanup),
     Missing,
+    Stopping,
 }
 
 fn response_after_core_shutdown_error(
@@ -4503,6 +4506,12 @@ fn shutdown_error_response(
     match classification {
         ShutdownSessionClassification::Cleanup(cleanup) => Ok(daemon_session_cleanup(cleanup)),
         ShutdownSessionClassification::Missing => Ok(daemon_unknown_session_cleanup(session_id)),
+        ShutdownSessionClassification::Stopping => {
+            Ok(daemon_session_cleanup(DaemonSessionCleanup {
+                session_id: session_id.to_string(),
+                outcome: "already_exited".to_string(),
+            }))
+        }
         ShutdownSessionClassification::Active if shutdown_error_is_already_gone(&error) => {
             Ok(daemon_session_cleanup(DaemonSessionCleanup {
                 session_id: session_id.to_string(),
@@ -4537,17 +4546,20 @@ fn classify_found_session_lifecycle(
     session_id: &str,
     record: &botster_core_daemon::SessionLifecycleRecord,
 ) -> ShutdownSessionClassification {
-    let terminal_lifecycle = matches!(
+    let complete_lifecycle = matches!(
         record.lifecycle,
-        Some(SessionLifecycleState::Exited { .. })
-            | Some(SessionLifecycleState::Failed { .. })
-            | Some(SessionLifecycleState::Stopping)
+        Some(SessionLifecycleState::Exited { .. }) | Some(SessionLifecycleState::Failed { .. })
     );
-    let terminal_registry = matches!(
+    let complete_registry = matches!(
         record.session.registry_state,
-        RegistrySessionState::Exited | RegistrySessionState::Stale | RegistrySessionState::Stopping
+        RegistrySessionState::Exited | RegistrySessionState::Stale
     );
-    if terminal_lifecycle || terminal_registry {
+    let stopping = matches!(record.lifecycle, Some(SessionLifecycleState::Stopping))
+        || matches!(
+            record.session.registry_state,
+            RegistrySessionState::Stopping
+        );
+    if complete_lifecycle || complete_registry {
         ShutdownSessionClassification::Cleanup(DaemonSessionCleanup {
             session_id: session_id.to_string(),
             outcome: if matches!(record.session.registry_state, RegistrySessionState::Stale)
@@ -4558,6 +4570,8 @@ fn classify_found_session_lifecycle(
                 "already_exited".to_string()
             },
         })
+    } else if stopping {
+        ShutdownSessionClassification::Stopping
     } else {
         ShutdownSessionClassification::Active
     }
