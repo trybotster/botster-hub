@@ -605,8 +605,9 @@ pub(crate) fn shutdown_short_lived_session(
             botster_hub_client::DaemonResponseKind::Events
                 | botster_hub_client::DaemonResponseKind::SessionCleanup
         ),
-        "shutdown should complete {session_id}, got {:?}",
-        shutdown.kind
+        "shutdown should complete {session_id}, got {:?} error={:?}",
+        shutdown.kind,
+        shutdown.error
     );
 }
 

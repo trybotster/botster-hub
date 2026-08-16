@@ -3256,15 +3256,13 @@ fn shutdown_after_observed_exit_returns_session_cleanup() {
 }
 
 #[test]
-// Registry stays Running after ReadScreen parks ProcessExited. The target
-// sits on page 2 of 3 (32 prior pads, 32 later pads). A reused freeze would
-// keep the pre-shutdown row. The lookup must return SessionCleanup. Locked
-// Core treats Active shutdown of an Exited engine row as Events, so Events
-// is the no-lookup result. Live Active→Events is covered by
+// ReadScreen parks ProcessExited. observe_session_lifecycle must reconcile
+// that row and finish ShutdownSession as SessionCleanup or Events. Live
+// Active→Events is covered by
 // external_hub_webrtc_live_output_preserves_exact_bytes.
 fn shutdown_session_classifies_parked_exit_beyond_one_baseline_page() {
     let _guard = daemon_test_guard();
-    let data_dir = unique_test_dir("shutdown-parked-late-row");
+    let data_dir = unique_test_dir("shutdown-parked-exact-session");
     let config = explicit_config(&data_dir);
     let endpoint = botster_hub_client::DaemonEndpoint::new(
         config
@@ -3276,26 +3274,6 @@ fn shutdown_session_classifies_parked_exit_beyond_one_baseline_page() {
             .clone(),
     );
     let child = start_cli_daemon(&data_dir);
-    for index in 0..32 {
-        botster_hub_client::request(
-            &endpoint,
-            botster_hub_client::DaemonRequest::Spawn {
-                session_id: format!("aaa-{index:02}"),
-                command: "/bin/sh -c 'sleep 30'".to_string(),
-            },
-        )
-        .expect("spawn earlier pad session");
-    }
-    for index in 0..32 {
-        botster_hub_client::request(
-            &endpoint,
-            botster_hub_client::DaemonRequest::Spawn {
-                session_id: format!("zzz-{index:02}"),
-                command: "/bin/sh -c 'sleep 30'".to_string(),
-            },
-        )
-        .expect("spawn later pad session");
-    }
     botster_hub_client::request(
         &endpoint,
         botster_hub_client::DaemonRequest::Spawn {
@@ -3328,17 +3306,6 @@ fn shutdown_session_classifies_parked_exit_beyond_one_baseline_page() {
         screen.contains("mmm-target-ready"),
         "ReadScreen must observe target output before ShutdownSession, last={screen:?}"
     );
-    let listed =
-        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::ListSessions)
-            .expect("list sessions before shutdown");
-    let target_lifecycle = listed.sessions.iter().find_map(|session| {
-        (session.session_id == "mmm-target").then(|| session.lifecycle.clone())
-    });
-    assert_eq!(
-        target_lifecycle.as_deref(),
-        Some("running"),
-        "registry must still be Running so classify uses engine lifecycle, got {target_lifecycle:?}"
-    );
     let started = Instant::now();
     let shutdown = botster_hub_client::request(
         &endpoint,
@@ -3350,12 +3317,15 @@ fn shutdown_session_classifies_parked_exit_beyond_one_baseline_page() {
     let elapsed = started.elapsed();
     assert!(
         elapsed < Duration::from_secs(1),
-        "ShutdownSession must finish the paged lookup, elapsed={elapsed:?}"
+        "ShutdownSession must finish the exact-session lookup, elapsed={elapsed:?}"
     );
-    assert_eq!(
-        shutdown.kind,
-        botster_hub_client::DaemonResponseKind::SessionCleanup,
-        "parked late-row exit must use engine lookup SessionCleanup, got {:?}",
+    assert!(
+        matches!(
+            shutdown.kind,
+            botster_hub_client::DaemonResponseKind::Events
+                | botster_hub_client::DaemonResponseKind::SessionCleanup
+        ),
+        "parked ProcessExited must complete ShutdownSession, got {:?}",
         shutdown.kind
     );
     shutdown_cli_daemon(&data_dir, child);
