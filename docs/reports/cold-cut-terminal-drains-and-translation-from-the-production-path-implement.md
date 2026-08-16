@@ -14,7 +14,7 @@ Plan: `docs/plans/cold-cut-terminal-drains-and-translation-from-the-production-p
 | Worktree HEAD before edits | `959c58f55726d098299cced8af151d8f496f41e3` |
 | Locked Core SHA | `fc541a59338d0591ba4fb3fa522a030d212d26d0` |
 | Merge policy | direct into `main`; no PR |
-| Review follow-up | `review_1786847824_730324`; Web detach ticket `ticket_1786848959_308437` |
+| Review follow-up | `review_1786847824_730324`; Web detach `ticket_1786848959_308437` closed at `30d961cd` |
 
 Independent routing matched the approved plan. This run did not infer the repository from the ambient directory.
 
@@ -75,7 +75,7 @@ Not loaded: [[project-pipelines-playbook]] (package/plugin paths out of scope).
 - `README.md`, `docs/client-protocol.md`
 - Tests under `tests/hub_client_api_test.rs`, `tests/hub_local_runtime_test.rs`, `tests/hub_daemon_lifecycle/*`
 - Plan and this report
-- This visit: `src/daemon_transport.rs`, `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs`, and this report. Prior visit files remain: `Cargo.toml`, `Cargo.lock`, crate pins, `src/runtime.rs`, lifecycle tests.
+- This visit: `src/daemon_transport.rs`, `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs`, and this report. Prior visit files remain: `Cargo.toml`, `Cargo.lock`, crate pins, `src/runtime.rs`, lifecycle tests. Latest commits: `bee15e7` keep adapters open after cleanup; `60da688` still drive Core shutdown while Stopping.
 
 ## Ownership boundaries preserved
 
@@ -99,7 +99,7 @@ Core `ticket_1786832517_855001` is closed. This visit pins Hub to `fc541a59338d0
 
 Web `ticket_1786840565_508953` is closed at `8c87c35bf6cbe6752b57fff364a98f3a128a6afb`. Dependency `dependency_1786840589_559221` is closed.
 
-This visit opened Web `ticket_1786848959_308437` (`tgt_40abcf71ccf049f4ac0c99953a799869`) as blocking dependency `dependency_1786848962_964959`. Run `run_1786848964_511286` is active. The live ProcessExited detach is not a Hub production-path invention.
+Web `ticket_1786848959_308437` is closed. Run `run_1786848964_511286` is closed. This visit used Web `30d961cd78154ad95477c46cb9410b4b8edae48f`, which detaches on an exited or failed session entity. Hub does not invent `process_exit`.
 
 ## Deviations from plan
 
@@ -383,7 +383,11 @@ Review `review_1786847824_730324` / `finding_1786847824_563256` required a prove
 
 Owner is Web. Registered blocking ticket `ticket_1786848959_308437` on `tgt_40abcf71ccf049f4ac0c99953a799869` (`dependency_1786848962_964959`, run `run_1786848964_511286`).
 
-Hub production change this visit: do not close adapters on Cleanup or after a successful Core shutdown. Close leftover adapters only after a Core shutdown error, then recover. Isolated proofs this visit: `unix_shutdown_session_from_another_connection_classifies_attached_exit` (4.13s), `external_hub_webrtc_live_output_preserves_exact_bytes` (2.81s), WebRTC write-budget (10.52s), WebRTC failed-RemoveSession (10.88s), Unix failed-RemoveSession (9.67s), parked-exit classify (1.98s). rustfmt `--check` and `cargo clippy --workspace --all-targets --offline --locked -- -D warnings` passed. `./test.sh --locked` passed (lib 279, lifecycle 208/1 ignored, client API 34).
+Hub production change this visit: do not close adapters on Cleanup or after a successful Core shutdown. Close leftover adapters only after a Core shutdown error, then recover. Isolated proofs this visit: `unix_shutdown_session_from_another_connection_classifies_attached_exit` (4.13s), `external_hub_webrtc_live_output_preserves_exact_bytes` (2.81s), WebRTC write-budget (10.52s), WebRTC failed-RemoveSession (10.88s), Unix failed-RemoveSession (9.67s), parked-exit classify (1.98s). rustfmt `--check` and `cargo clippy --workspace --all-targets --offline --locked -- -D warnings` passed. `./test.sh --locked` passed after the Stopping split (lib 279, lifecycle 208/1 ignored, client API 34).
+
+Web `30d961cd` merged. First live smoke at Hub `bee15e7` failed `waitForTerminalDetached` with `web-prod` still `stopping` / `current`. Stopping was host Cleanup, so Core shutdown never finished. `60da688` still drives Core shutdown while Stopping. Recover still maps Stopping to SessionCleanup.
+
+Two later live smokes against Hub `60da688`, Core `fc541a59`, and Web `30d961cd` passed. Both printed `rapid_alternate_screen_reattach passed` (20 cycles, `cycle_0_final_row_present:true`) and `entity-driven production detach isolated` with `lifecycle=exited`, `processExitCausedDetach=false`, then `live packaged protocol harness passed (webrtc)`. `tui_shaped_hello_status_succeeds_without_host_terminal_tokens` passed (2.02s). Mapper tests including `shutdown_stopping_record_is_host_cleanup_not_active` passed.
 
 ## Unverified behavior or residual risk
 
@@ -393,7 +397,7 @@ Hub production change this visit: do not close adapters on Cleanup or after a su
 - CoreDaemon on `aef6516` does not expose `pump_bound_adapters`. Owner-loop observe uses `observe_lifecycle_slice`, which calls Core `drain_runtime_once` internally.
 - Downstream TUI/Web crates that still imported the deleted hub-client `FEATURE_*` constants must import `botster-terminal-protocol` instead. Those consumers are separately routed.
 - Production Hub no longer calls Core `drain`, `lifecycle_baseline()`, or a capped page walk to classify ShutdownSession. Classify uses `observe_session_lifecycle`. A Running row plus `Runtime`/`State` stays OperatorError.
-- Web `8c87c35` live smoke can stay on the session route after production exit and ShutdownSession when `process_exit` does not arrive. That detach is owned by Web ticket `ticket_1786848959_308437`. This Hub visit does not claim a full live detach pass.
+- Web `30d961cd` detaches when the session entity is exited or failed. Two live packaged-protocol smokes against Hub `60da688` and Core `fc541a59` passed `waitForTerminalDetached` through that entity path. `process_exit` did not cause those detaches (`processExitCausedDetach:false`).
 - Core shutdown of a live write-budget `yes` session can stay `Stopping` after the two-second Core deadline. Host policy returns `SessionCleanup` for that Stopping row. A Running row stays OperatorError.
 - The 65-session walk-reset proof is deleted. It classified through capped pages. The exact query does not scan.
 
