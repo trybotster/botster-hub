@@ -270,7 +270,7 @@ fn isolated_hub_event_to_entity_provider_emit_stays_rejected_causal_scope() {
     hub.shutdown().expect("shutdown isolated hub");
 }
 
-fn enable_event_plane_producer(label: &str) -> (
+pub(crate) fn enable_event_plane_producer(label: &str) -> (
     botster_hub_test_support::IsolatedHub,
     PathBuf,
 ) {
@@ -299,7 +299,7 @@ fn enable_event_plane_producer(label: &str) -> (
     (hub, producer_dir)
 }
 
-fn emit_sample_ready(endpoint: &botster_hub_client::DaemonEndpoint, token: &str) {
+pub(crate) fn emit_sample_ready(endpoint: &botster_hub_client::DaemonEndpoint, token: &str) {
     let emitted = botster_hub_client::request(
         endpoint,
         botster_hub_client::DaemonRequest::PluginMcpCallTool {
@@ -512,7 +512,7 @@ fn isolated_hub_subject_and_audience_admission_return_typed_errors() {
     hub.shutdown().expect("shutdown isolated hub");
 }
 
-fn copy_dir_all(from: &Path, to: &Path) {
+pub(crate) fn copy_dir_all(from: &Path, to: &Path) {
     fs::create_dir_all(to).expect("create dest");
     for entry in fs::read_dir(from).expect("read src") {
         let entry = entry.expect("entry");
@@ -525,7 +525,7 @@ fn copy_dir_all(from: &Path, to: &Path) {
     }
 }
 
-fn rewrite_package_source_path(package_dir: &Path) {
+pub(crate) fn rewrite_package_source_path(package_dir: &Path) {
     let manifest_path = package_dir.join("botster-package.json");
     let mut value: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&manifest_path).expect("read manifest"))
