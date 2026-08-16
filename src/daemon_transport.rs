@@ -537,11 +537,9 @@ async fn handle_connection_async(
         })
         .await
         .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
-    if unix_eof_cleanup_ablation() != UnixEofAblation::SkipRegisterAck {
-        admission_ack_rx
-            .await
-            .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
-    }
+    admission_ack_rx
+        .await
+        .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
 
     loop {
         let request = tokio::select! {
@@ -1854,10 +1852,14 @@ fn handle_connection_cleanup(
             subscription.subscription_id.clone(),
         ));
     }
-    let inventory_snapshot = daemon
-        .runtime()
-        .map(crate::HubRuntime::list_terminal_subscriptions)
-        .unwrap_or_default();
+    let inventory_snapshot = if candidates.is_empty() {
+        Vec::new()
+    } else {
+        daemon
+            .runtime()
+            .map(crate::HubRuntime::list_terminal_subscriptions)
+            .unwrap_or_default()
+    };
 
     let mut bound_closes = 0u64;
     for (session_id, subscription_id) in candidates {
@@ -1969,24 +1971,15 @@ fn handle_connection_cleanup(
             bound_closes += 1;
         }
 
-        match ablation {
-            UnixEofAblation::LeaveRoute => {}
-            UnixEofAblation::IndependentCounter => {
-                state.lifecycle_counters.live_attach_subscriptions = state
-                    .lifecycle_counters
-                    .live_attach_subscriptions
-                    .saturating_sub(1);
-            }
-            _ => {
-                record_attached_subscription_change(
-                    state,
-                    Some(AttachedSubscriptionChange::Detach(AttachedSubscription {
-                        session_id,
-                        subscription_id,
-                    })),
-                    None,
-                );
-            }
+        if ablation != UnixEofAblation::LeaveRoute {
+            record_attached_subscription_change(
+                state,
+                Some(AttachedSubscriptionChange::Detach(AttachedSubscription {
+                    session_id,
+                    subscription_id,
+                })),
+                None,
+            );
         }
     }
     if let Some(UnixTerminalAdmission::Admitted { mux, .. }) = unix_admission {
@@ -3407,6 +3400,7 @@ fn handle_runtime_control_request(
         }
         DaemonRequest::ShutdownSession { session_id } => {
             let now = tick(logical_clock);
+            observe_lifecycle_turn(runtime, now);
             match classify_shutdown_session(runtime, &session_id, now) {
                 Ok(ShutdownSessionClassification::Cleanup(cleanup)) => {
                     // Keep adapters open. Classify already asked Core to write
@@ -4494,6 +4488,7 @@ fn recover_after_core_shutdown_error(
     error: crate::HubClientError,
     logical_clock: &mut u64,
 ) -> DaemonTransportResult<DaemonResponse> {
+    observe_lifecycle_turn(runtime, *logical_clock);
     let classification = classify_shutdown_session(runtime, session_id, tick(logical_clock))?;
     response_after_core_shutdown_error(classification, error, session_id)
 }
@@ -5137,8 +5132,6 @@ enum UnixEofAblation {
     LeaveRoute,
     SkipCoreDetach,
     PairOnlyDetach,
-    IndependentCounter,
-    SkipRegisterAck,
 }
 
 fn unix_eof_cleanup_ablation() -> UnixEofAblation {
@@ -5149,8 +5142,6 @@ fn unix_eof_cleanup_ablation() -> UnixEofAblation {
         Ok("leave_route") => UnixEofAblation::LeaveRoute,
         Ok("skip_core_detach") => UnixEofAblation::SkipCoreDetach,
         Ok("pair_only_detach") => UnixEofAblation::PairOnlyDetach,
-        Ok("independent_counter") => UnixEofAblation::IndependentCounter,
-        Ok("skip_register_ack") => UnixEofAblation::SkipRegisterAck,
         _ => UnixEofAblation::None,
     }
 }
