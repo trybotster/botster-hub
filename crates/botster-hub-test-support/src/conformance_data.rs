@@ -39,7 +39,7 @@ pub(crate) const LATE_ATTACH_GHOSTSNP_PROTOCOL_CRATE: &str = "botster-terminal-p
 pub(crate) const LATE_ATTACH_GHOSTSNP_PROTOCOL_GIT: &str =
     "https://github.com/trybotster/botster-core.git";
 /// Core revision that owns the consumed `botster-terminal-protocol` files.
-pub(crate) const LATE_ATTACH_GHOSTSNP_CORE_PIN: &str = "aef6516d5809d563961ed7fdd07da29a7b4edddc";
+pub(crate) const LATE_ATTACH_GHOSTSNP_CORE_PIN: &str = "fc541a59338d0591ba4fb3fa522a030d212d26d0";
 /// Ghostty submodule pin recorded by Core when it generated the files.
 pub(crate) const LATE_ATTACH_GHOSTSNP_GHOSTTY_PIN: &str =
     "5e9ba17a22ba8e40bf8de7d3e7555b8378cb1880";

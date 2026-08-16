@@ -4912,6 +4912,19 @@ fn pump_bound_unix_routes(daemon: &mut HubDaemon, state: &mut DaemonControlState
                 last_visited: slice.last_visited,
             })
         };
+        if runtime.take_journal_advanced_wake() {
+            state.maintenance.note_authoritative_mutation();
+            run_maintenance_kind(
+                runtime,
+                &mut state.maintenance,
+                MaintenanceSliceKind::JournalPull,
+            );
+            run_maintenance_kind(
+                runtime,
+                &mut state.maintenance,
+                MaintenanceSliceKind::ProjectionApply,
+            );
+        }
     }
 }
 

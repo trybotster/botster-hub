@@ -15,6 +15,9 @@ Plan: `docs/plans/cold-cut-terminal-drains-and-translation-from-the-production-p
 | Locked Core SHA | `fc541a59338d0591ba4fb3fa522a030d212d26d0` |
 | Merge policy | direct into `main`; no PR |
 | Review follow-up | `review_1786847824_730324`; Web detach `ticket_1786848959_308437` closed at `30d961cd` |
+| Integration base | `origin/main` `804dde7a679f8c7a1fc0b8ed754d149329f00339` |
+| Approved head merged | `5ebd39936100677957fee0c09369caf2a48c6b0c` |
+| Integration merge | `bd1164a91feaac466147e46d25c3db7166167beb` |
 
 Independent routing matched the approved plan. This run did not infer the repository from the ambient directory.
 
@@ -75,7 +78,7 @@ Not loaded: [[project-pipelines-playbook]] (package/plugin paths out of scope).
 - `README.md`, `docs/client-protocol.md`
 - Tests under `tests/hub_client_api_test.rs`, `tests/hub_local_runtime_test.rs`, `tests/hub_daemon_lifecycle/*`
 - Plan and this report
-- This visit: `src/daemon_transport.rs`, `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs`, and this report. Prior visit files remain: `Cargo.toml`, `Cargo.lock`, crate pins, `src/runtime.rs`, lifecycle tests. Latest commits: `bee15e7` keep adapters open after cleanup; `60da688` still drive Core shutdown while Stopping.
+- This visit: `src/daemon_transport.rs`, `src/daemon_maintenance.rs`, `src/daemon_entity_subscriptions.rs`, `tests/hub_daemon_lifecycle/package_event_plane.rs`, `tests/session_projection_owner_loop.rs`, `crates/botster-hub-test-support/src/conformance_data.rs`, `crates/botster-hub-test-support/src/lib.rs`, and this report. Merge commit `bd1164a` already integrated `5ebd399` onto `804dde7`. Latest commits: `bee15e7` keep adapters open after cleanup; `60da688` still drive Core shutdown while Stopping; `5ebd399` record Web `30d961cd` live detach proof; `bd1164a` integrate onto `origin/main`.
 
 ## Ownership boundaries preserved
 
@@ -389,6 +392,21 @@ Web `30d961cd` merged. First live smoke at Hub `bee15e7` failed `waitForTerminal
 
 Two later live smokes against Hub `60da688`, Core `fc541a59`, and Web `30d961cd` passed. Both printed `rapid_alternate_screen_reattach passed` (20 cycles, `cycle_0_final_row_present:true`) and `entity-driven production detach isolated` with `lifecycle=exited`, `processExitCausedDetach=false`, then `live packaged protocol harness passed (webrtc)`. `tui_shaped_hello_status_succeeds_without_host_terminal_tokens` passed (2.02s). Mapper tests including `shutdown_stopping_record_is_host_cleanup_not_active` passed.
 
+Direct merge of approved `5ebd399` onto fresh `origin/main` `804dde7` blocked. Artifact `artifact_1786861981_490930` sent the ticket back to Implement. This visit merged that head as `bd1164a` and resolved the overlap.
+
+Textual conflicts kept Core `fc541a59`, ShutdownSession classify, and host close policy. They took main owner-loop maintenance, entity delivery, and the stricter session Remove wait. Drain still does not translate `ProcessExit`.
+
+Semantic overlap: interval `pump_bound_unix_routes` still runs bounded `observe_lifecycle_slice`. That observe advances attach and Core list. Main journal apply is a later slice. After observe, Hub now pulls and applies the journal before the next client snapshot. Session subscribe also catches up journal apply before it assembles the first snapshot. Production still does not call `drain_subscription`.
+
+Pin fixtures that still named `aef6516` now name `fc541a59` in `package_event_plane.rs`, `session_projection_owner_loop.rs`, and Hub test-support late-attach provenance.
+
+Proofs on the integrated tree:
+
+- `cargo fmt` and `cargo clippy --locked --all-targets --all-features -- -D warnings` passed.
+- `./test.sh --locked` passed. Lib 348. Lifecycle 214 passed, 1 ignored. Client API 34. `session_projection_observes_exit_without_subscribers_then_later_snapshot_includes_ended_row` passed. `isolated_hub_two_packages_emit_and_consume_exact_event_without_blocking_worktree` passed. `tui_shaped_hello_status_succeeds_without_host_terminal_tokens` passed.
+- Locked builds: `cargo build --locked --bin botster-hub` and `cargo build --locked -p botster-core-daemon --bin botster-session-worker`.
+- Two live Web smokes at Web `30d961cd` with `BOTSTER_HUB_BIN` / `BOTSTER_SESSION_WORKER_BIN` from this tree and a locked-command build receipt. Both printed `rapid_alternate_screen_reattach passed` (20 cycles, `cycle_0_final_row_present:true`) and `entity-driven production detach isolated` with `lifecycle=exited`, `processExitCausedDetach=false`, then `live packaged protocol harness passed (webrtc)`. Run 2 had `processExitEventCount=0`.
+
 ## Unverified behavior or residual risk
 
 - TUI IsolatedHub `wait_for_ready` at `fc1ff623` still uses hub-client `4f30d695` default Hello. That helper is not production TUI `HubConnection`. This visit proved IsolatedHub Status with the TUI host feature list and `terminal_compatibility`. Do not restore host tokens.
@@ -397,7 +415,8 @@ Two later live smokes against Hub `60da688`, Core `fc541a59`, and Web `30d961cd`
 - CoreDaemon on `aef6516` does not expose `pump_bound_adapters`. Owner-loop observe uses `observe_lifecycle_slice`, which calls Core `drain_runtime_once` internally.
 - Downstream TUI/Web crates that still imported the deleted hub-client `FEATURE_*` constants must import `botster-terminal-protocol` instead. Those consumers are separately routed.
 - Production Hub no longer calls Core `drain`, `lifecycle_baseline()`, or a capped page walk to classify ShutdownSession. Classify uses `observe_session_lifecycle`. A Running row plus `Runtime`/`State` stays OperatorError.
-- Web `30d961cd` detaches when the session entity is exited or failed. Two live packaged-protocol smokes against Hub `60da688` and Core `fc541a59` passed `waitForTerminalDetached` through that entity path. `process_exit` did not cause those detaches (`processExitCausedDetach:false`).
+- Web `30d961cd` detaches when the session entity is exited or failed. Two live packaged-protocol smokes against the integrated Hub bins and Core `fc541a59` passed `waitForTerminalDetached` through that entity path. `process_exit` did not cause those detaches (`processExitCausedDetach:false`). Run 2 had no `process_exit` event.
+- Interval observe and owner-loop journal apply remain two production paths. This visit applies the journal after observe and again on session subscribe so a later snapshot cannot stay `running` after Core list is `exited`. Hub still does not call production `drain_subscription`.
 - Core shutdown of a live write-budget `yes` session can stay `Stopping` after the two-second Core deadline. Host policy returns `SessionCleanup` for that Stopping row. A Running row stays OperatorError.
 - The 65-session walk-reset proof is deleted. It classified through capped pages. The exact query does not scan.
 

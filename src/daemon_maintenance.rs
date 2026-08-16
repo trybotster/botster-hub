@@ -577,6 +577,12 @@ fn run_observe_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
                 });
                 state.scheduler.try_wake();
             }
+            // Observe can publish journal rows (natural exit) without a
+            // subscriber. Wake the next JournalPull so the projection does
+            // not lag Core list().
+            if runtime.take_journal_advanced_wake() {
+                state.scheduler.prefer_journal_pull();
+            }
         }
         Err(SessionLifecyclePageError::BudgetTooSmall { .. }) => {
             state.scheduler.try_wake();
