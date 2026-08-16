@@ -17,7 +17,9 @@
 | Session-type eligibility consumer | false |
 | Implement checklist | `checklist_1786918885_659440` (run-scoped; Plan already owned `checklist_1786917253_254009`) |
 
-Independent routing: `project_pipelines_current_context(run_id=run_1786916776_704854)` and the approved plan both map `tgt_7e208a0c76a44980a83b63af976b1f22` to `botster-hub`. Ambient `current_context` without `run_id` first returned closed superseded run `run_1786875818_402849`. This Implement visit used the explicit run id. Work stayed in the ticket worktree.
+Independent routing: `project_pipelines_current_context(run_id=run_1786916776_704854)` and the approved plan both map `tgt_7e208a0c76a44980a83b63af976b1f22` to `botster-hub`. Work stayed in the ticket worktree.
+
+Review return for `finding_1786919736_178031`: the first Implement visit used `Duration::from_secs(5)` plus a post-close `take_snapshot_item_page` probe. That oracle could accept elapsed-empty `Closed`. This visit uses `Duration::MAX` and removes the probe.
 
 ## Repository playbook and other playbooks/notes applied
 
@@ -48,7 +50,7 @@ Independent routing: `project_pipelines_current_context(run_id=run_1786916776_70
 - [[pipeline vault checklists must cite exact resolvable note titles]]
 - [[pipeline artifacts should use path neutral worktree references]]
 - [[project pipelines checklist worker timeouts require artifact evidence fallback]]
-- [[rust repo strict lints must be verified before dismissing warnings]]
+- [[implementation deviations must resync committed plan acceptance checks]]
 
 **Not loaded:** [[project-pipelines-playbook]] — Project Pipelines package/plugin paths and workflow-policy implementation are out of scope. [[botster runtime teardown lenses]] — teardown class does not apply. Other repository charters were not loaded.
 
@@ -66,11 +68,11 @@ Independent routing: `project_pipelines_current_context(run_id=run_1786916776_70
 
 Feature behavior:
 
-- `src/daemon_entity_subscriptions.rs` — repair `separators_close_when_item_bytes_fit_but_commas_do_not` only. Keep the pad search. Drive production `continue_session_snapshot_assembly` with `Duration::from_secs(5)` and a bounded three-page loop. Reject empty-item `Continue` and empty-item immediate `Closed`. Accept only `Closed { frame_too_large: true }` plus `entity_provider_frame_too_large`.
+- `src/daemon_entity_subscriptions.rs` — repair `separators_close_when_item_bytes_fit_but_commas_do_not` only. Keep the pad search. Drive production `continue_session_snapshot_assembly` with `Duration::MAX` and a bounded three-page loop. Reject empty-item `Continue`. Do not probe a later page after `Closed`. Accept only `Closed { frame_too_large: true }` plus `entity_provider_frame_too_large`.
 
 Handoff:
 
-- `docs/plans/fix-flaky-separators-close-under-default-concurrency-lib-suite.md` — Plan commit already on the branch.
+- `docs/plans/fix-flaky-separators-close-under-default-concurrency-lib-suite.md` — resynced to `Duration::MAX` and no post-close probe after Review `finding_1786919736_178031`.
 - `docs/reports/fix-flaky-separators-close-under-default-concurrency-lib-suite-implement.md` — this report.
 
 Merge/rebase cleanup: none.
@@ -92,11 +94,13 @@ No cross-repository prerequisite and no PR. Same-target follow-up tickets regist
 
 ## Deviations from plan
 
-None against product scope. Process additions required by Plan Review or the approved fallback:
+Review `finding_1786919736_178031` required `Duration::MAX` instead of the plan's original 5 s example, and removal of the post-close `take_snapshot_item_page` probe. The committed plan now matches that contract. The 5 s budget could still cut an empty page after `Instant::now()`. A later probe does not prove the closing call took an item.
 
-- Ran `cargo build --locked -p botster-core-daemon --bin botster-session-worker` before the binding `--lib` suite. Plan Review required this setup command. The binary was already present; the build finished in 0.42s.
-- Binding `--lib` failed two named roots that the plan said not to absorb. Registered the two tickets above. Did not retry `./test.sh --locked --lib`.
-- Created run-scoped Implement vault checklist `checklist_1786918885_659440` after listing confirmed no run checklist. The first create call timed out after persist.
+Process additions from the first Implement visit remain:
+
+- Ran `cargo build --locked -p botster-core-daemon --bin botster-session-worker` before the binding `--lib` suite.
+- Binding `--lib` still fails registered `near_limit` `ticket_1786919220_649402`. Did not retry `./test.sh --locked --lib`.
+- Created run-scoped Implement vault checklist `checklist_1786918885_659440`.
 
 ## Tests and downstream proof run
 
@@ -104,18 +108,16 @@ Tracked `.gitignore` is 53 bytes and matches `HEAD`. The ticket worktree path ha
 
 | Command | Result |
 | --- | --- |
-| `./test.sh --locked --lib separators_close_when_item_bytes_fit_but_commas_do_not` | pass (1 passed; 350 filtered) |
-| Ablation: omit `snapshot_separator_bytes` from the production close predicate, then the same focused command | fail, exit 101, panic `completed snapshot without charging separators` |
-| Restore separator charge, then the same focused command | pass |
+| First visit focused `./test.sh --locked --lib separators_close_when_item_bytes_fit_but_commas_do_not` | pass |
+| First visit ablation omitting `snapshot_separator_bytes` | fail, exit 101 |
+| Review return focused wrapper after `Duration::MAX` | pass (1 passed; 350 filtered) |
+| Review return ablation omitting `snapshot_separator_bytes` | fail, exit 101, panic `completed snapshot without charging separators` |
+| Restore then focused wrapper | pass |
 | `cargo build --locked -p botster-core-daemon --bin botster-session-worker` | exit 0 |
-| One default-concurrency `./test.sh --locked --lib` | exit 101. 349 passed; 2 failed. Named test `separators_close_when_item_bytes_fit_but_commas_do_not` was not among the failures. |
-| Isolate `near_limit_snapshot_assembly_stays_within_owner_turn` on this branch | fail, exit 101, same 25 ms assertion |
-| Isolate `near_limit_snapshot_assembly_stays_within_owner_turn` on `origin/main` `c72712e` | fail, exit 101, same assertion |
-| Isolate `local_webrtc_after_last_peer_cleanup_new_signal_recreates_runtime_and_succeeds` on this branch | pass |
-| Isolate the same WebRTC test on `origin/main` `c72712e` | pass |
+| Review return one default-concurrency `./test.sh --locked --lib` | exit 101. 350 passed; 1 failed. Named test not among failures. Only registered `near_limit_snapshot_assembly_stays_within_owner_turn` failed. Did not retry. |
 | `cargo fmt --all -- --check` | exit 0 |
 | `git diff --check` | exit 0 |
-| `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0. Hub `Cargo.toml` has no `[lints]` table. CI uses this deny-warnings command. |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0 |
 
 `-- --test-threads=1` was not used as a suite command.
 
@@ -126,10 +128,10 @@ Downstream consumer proof: none in this run. Write-budget `ticket_1786913892_208
 ## Unverified behavior or residual risk
 
 - Full workspace `./test.sh --locked` (lifecycle suite) was not this ticket's gate. Write-budget owns that surface.
-- `near_limit_snapshot_assembly_stays_within_owner_turn` still fails isolated on this branch and on `origin/main`. Follow-up `ticket_1786919220_649402`.
-- `local_webrtc_after_last_peer_cleanup_new_signal_recreates_runtime_and_succeeds` still fails under default-concurrency `--lib` and passes isolated. Follow-up `ticket_1786919221_923340`.
-- Empty-item first-page `Closed` is rejected by probing `take_snapshot_item_page` after a first-call close with zero accepted items. That probe is test-local. It does not change production assembly.
-- A 5 second page budget does not change production `SESSION_DELIVERY_MAX_ELAPSED` (8 ms).
+- `near_limit_snapshot_assembly_stays_within_owner_turn` still fails the binding `--lib` run. Follow-up `ticket_1786919220_649402`.
+- `local_webrtc_after_last_peer_cleanup_new_signal_recreates_runtime_and_succeeds` did not fail this return `--lib` run. Follow-up `ticket_1786919221_923340` remains for the earlier suite-load observation.
+- `finding_1786919736_178031` is addressed: `Duration::MAX` cannot cut a page, the post-close probe is gone, and empty-item `Continue` still fails the test.
+- `Duration::MAX` does not change production `SESSION_DELIVERY_MAX_ELAPSED` (8 ms).
 
 ## Missing vault guidance discovered
 
