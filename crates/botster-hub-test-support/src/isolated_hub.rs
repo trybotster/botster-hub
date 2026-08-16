@@ -54,6 +54,7 @@ pub struct IsolatedHubBuilder {
     working_directory: Option<PathBuf>,
     name: String,
     ready_timeout: Duration,
+    extra_env: Vec<(String, String)>,
 }
 
 impl Default for IsolatedHubBuilder {
@@ -65,6 +66,7 @@ impl Default for IsolatedHubBuilder {
             working_directory: None,
             name: "external-client".to_string(),
             ready_timeout: READY_TIMEOUT,
+            extra_env: Vec::new(),
         }
     }
 }
@@ -111,6 +113,13 @@ impl IsolatedHubBuilder {
         self
     }
 
+    /// Set an extra environment variable on the spawned daemon process.
+    #[must_use]
+    pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.extra_env.push((key.into(), value.into()));
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn ready_timeout(mut self, timeout: Duration) -> Self {
         self.ready_timeout = timeout;
@@ -151,6 +160,9 @@ impl IsolatedHubBuilder {
             .env("BOTSTER_ENV", "test")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        for (key, value) in &self.extra_env {
+            command.env(key, value);
+        }
         unsafe {
             command.pre_exec(|| {
                 if libc::setpgid(0, 0) == -1 {

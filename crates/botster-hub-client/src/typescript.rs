@@ -1273,7 +1273,17 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("recovered_sessions", "string[]"),
             ("stale_sessions", "string[]"),
             ("lifecycle_counters?", "DaemonLifecycleCounters"),
+            ("live_attach_occupancy?", "DaemonAttachOccupancy[]"),
             ("diagnostics?", "DaemonDiagnostic[]"),
+        ],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonAttachOccupancy",
+        &[
+            ("session_id", "string"),
+            ("subscription_id", "string"),
+            ("generation", "number"),
         ],
     );
     emit_interface(

@@ -615,6 +615,21 @@ fn unix_adapter_stale_disconnect_does_not_cancel_replacement_owner() {
         "B's scoped Drain must stay bound after live echo; terminal bodies mean Hub cancelled B: {:?}",
         confirm.events
     );
+    let occupancy = request_skipping_envelopes(
+        &mut owner_b,
+        &mut reader_b,
+        &botster_hub_client::DaemonRequest::Status,
+        &mut envelopes_b,
+    )
+    .status
+    .expect("status after replacement-owner cleanup")
+    .live_attach_occupancy;
+    assert!(
+        occupancy.iter().any(|row| {
+            row.session_id == session_id && row.subscription_id == subscription_id
+        }),
+        "replacement owner occupancy must keep B's pair: {occupancy:?}"
+    );
 
     drop(owner_b);
     shutdown_short_lived_session(&endpoint, session_id);
@@ -1875,9 +1890,383 @@ fn terminal_subscription_closed_feature_does_not_raise_default_requirement() {
         botster_hub_client::DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION;
     botster_hub_client::ensure_compatible(&requirement, &previous)
         .expect("default clients still accept a daemon without terminal_subscription_closed");
-    assert_eq!(botster_hub_client::CONFORMANCE_FIXTURE_REVISION, 42);
+    assert_eq!(botster_hub_client::CONFORMANCE_FIXTURE_REVISION, 43);
     assert_eq!(
         botster_hub_client::DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION,
         36
     );
+}
+
+fn occupancy_has_pair(
+    occupancy: &[botster_hub_client::DaemonAttachOccupancy],
+    session_id: &str,
+    subscription_id: &str,
+) -> bool {
+    occupancy.iter().any(|row| {
+        row.session_id == session_id && row.subscription_id == subscription_id
+    })
+}
+
+fn sibling_status(
+    stream: &mut std::os::unix::net::UnixStream,
+    reader: &mut std::io::BufReader<std::os::unix::net::UnixStream>,
+    envelopes: &mut Vec<botster_hub_client::DaemonUnixTerminalEnvelope>,
+) -> botster_hub_client::DaemonStatus {
+    request_skipping_envelopes(
+        stream,
+        reader,
+        &botster_hub_client::DaemonRequest::Status,
+        envelopes,
+    )
+    .status
+    .expect("status body")
+}
+
+fn wait_for_cleanup_completed(
+    stream: &mut std::os::unix::net::UnixStream,
+    reader: &mut std::io::BufReader<std::os::unix::net::UnixStream>,
+    envelopes: &mut Vec<botster_hub_client::DaemonUnixTerminalEnvelope>,
+    before: &botster_hub_client::DaemonLifecycleCounters,
+) -> botster_hub_client::DaemonStatus {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut status = sibling_status(stream, reader, envelopes);
+    while Instant::now() < deadline {
+        if status.lifecycle_counters.cleanup_completed > before.cleanup_completed {
+            return status;
+        }
+        thread::sleep(Duration::from_millis(20));
+        status = sibling_status(stream, reader, envelopes);
+    }
+    status
+}
+
+fn attach_two_unix_clients(
+    hub: &botster_hub_test_support::IsolatedHub,
+    session_id: &str,
+    sub_a: &str,
+    sub_b: &str,
+) -> (
+    std::os::unix::net::UnixStream,
+    std::io::BufReader<std::os::unix::net::UnixStream>,
+    std::os::unix::net::UnixStream,
+    std::io::BufReader<std::os::unix::net::UnixStream>,
+    Vec<botster_hub_client::DaemonUnixTerminalEnvelope>,
+    Vec<botster_hub_client::DaemonUnixTerminalEnvelope>,
+) {
+    let endpoint = hub.endpoint();
+    let (mut owner_a, mut reader_a) = unix_adapter_connection(endpoint);
+    let mut envelopes_a = Vec::new();
+    let spawned = request_skipping_envelopes(
+        &mut owner_a,
+        &mut reader_a,
+        &botster_hub_client::DaemonRequest::Spawn {
+            session_id: session_id.to_string(),
+            command: "while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done".to_string(),
+        },
+        &mut envelopes_a,
+    );
+    assert_eq!(
+        spawned.kind,
+        botster_hub_client::DaemonResponseKind::Spawned
+    );
+    let attach_a = request_skipping_envelopes(
+        &mut owner_a,
+        &mut reader_a,
+        &botster_hub_client::DaemonRequest::Attach {
+            session_id: session_id.to_string(),
+            subscription_id: sub_a.to_string(),
+        },
+        &mut envelopes_a,
+    );
+    assert_eq!(
+        attach_a.kind,
+        botster_hub_client::DaemonResponseKind::Events
+    );
+    let (mut owner_b, mut reader_b) = unix_adapter_connection(endpoint);
+    let mut envelopes_b = Vec::new();
+    let attach_b = request_skipping_envelopes(
+        &mut owner_b,
+        &mut reader_b,
+        &botster_hub_client::DaemonRequest::Attach {
+            session_id: session_id.to_string(),
+            subscription_id: sub_b.to_string(),
+        },
+        &mut envelopes_b,
+    );
+    assert_eq!(
+        attach_b.kind,
+        botster_hub_client::DaemonResponseKind::Events
+    );
+    (
+        owner_a, reader_a, owner_b, reader_b, envelopes_a, envelopes_b,
+    )
+}
+
+#[test]
+fn unix_eof_releases_exact_attach_occupancy_on_sibling_status() {
+    let _guard = daemon_test_guard();
+    let hub = start_isolated_live_output_hub("ueo");
+    let session_id = "ueo-session";
+    let sub_a = "ueo-sub-a";
+    let sub_b = "ueo-sub-b";
+    let (owner_a, reader_a, mut owner_b, mut reader_b, _envelopes_a, mut envelopes_b) =
+        attach_two_unix_clients(&hub, session_id, sub_a, sub_b);
+
+    let before = sibling_status(&mut owner_b, &mut reader_b, &mut envelopes_b);
+    assert!(
+        before
+            .compatibility
+            .features
+            .iter()
+            .any(|feature| feature == botster_hub_client::FEATURE_ATTACH_OCCUPANCY),
+        "sibling Status must advertise attach_occupancy: {:?}",
+        before.compatibility.features
+    );
+    assert!(
+        occupancy_has_pair(&before.live_attach_occupancy, session_id, sub_a),
+        "both pairs must be occupied before EOF: {:?}",
+        before.live_attach_occupancy
+    );
+    assert!(
+        occupancy_has_pair(&before.live_attach_occupancy, session_id, sub_b),
+        "both pairs must be occupied before EOF: {:?}",
+        before.live_attach_occupancy
+    );
+
+    drop(owner_a);
+    drop(reader_a);
+    let after = wait_for_cleanup_completed(
+        &mut owner_b,
+        &mut reader_b,
+        &mut envelopes_b,
+        &before.lifecycle_counters,
+    );
+    assert!(
+        !occupancy_has_pair(&after.live_attach_occupancy, session_id, sub_a),
+        "exact-absence: old pair must leave sibling Status occupancy: occupancy={:?} counters={:?}",
+        after.live_attach_occupancy,
+        after.lifecycle_counters
+    );
+    assert!(
+        occupancy_has_pair(&after.live_attach_occupancy, session_id, sub_b),
+        "sibling pair must stay occupied: {:?}",
+        after.live_attach_occupancy
+    );
+
+    let input = request_skipping_envelopes(
+        &mut owner_b,
+        &mut reader_b,
+        &botster_hub_client::DaemonRequest::SendInput {
+            session_id: session_id.to_string(),
+            data: "after-a-eof\r".to_string(),
+        },
+        &mut envelopes_b,
+    );
+    assert_ne!(
+        input.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError,
+        "sibling SendInput must stay accepted after A EOF: {input:?}"
+    );
+    let listed = request_skipping_envelopes(
+        &mut owner_b,
+        &mut reader_b,
+        &botster_hub_client::DaemonRequest::ListSessions,
+        &mut envelopes_b,
+    );
+    assert!(
+        listed
+            .sessions
+            .iter()
+            .any(|session| session.session_id == session_id),
+        "host session must stay listed after A EOF"
+    );
+    eprintln!(
+        "unix eof occupancy provenance hub_bin={} session_worker={}",
+        env!("CARGO_BIN_EXE_botster-hub"),
+        session_worker_binary_path().display()
+    );
+
+    drop(owner_b);
+    shutdown_short_lived_session(hub.endpoint(), session_id);
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn unix_eof_leave_route_ablation_keeps_named_pair_on_status() {
+    let _guard = daemon_test_guard();
+    let hub = start_isolated_live_output_hub_with_env(
+        "uel",
+        &[("BOTSTER_HUB_UNIX_EOF_ABLATION", "leave_route")],
+    );
+    let session_id = "uel-session";
+    let sub_a = "uel-sub-a";
+    let sub_b = "uel-sub-b";
+    let (owner_a, reader_a, mut owner_b, mut reader_b, _envelopes_a, mut envelopes_b) =
+        attach_two_unix_clients(&hub, session_id, sub_a, sub_b);
+    let before = sibling_status(&mut owner_b, &mut reader_b, &mut envelopes_b);
+    drop(owner_a);
+    drop(reader_a);
+    let after = wait_for_cleanup_completed(
+        &mut owner_b,
+        &mut reader_b,
+        &mut envelopes_b,
+        &before.lifecycle_counters,
+    );
+    assert!(
+        occupancy_has_pair(&after.live_attach_occupancy, session_id, sub_a),
+        "leave-route ablation must redden the exact-absence assertion: {:?}",
+        after.live_attach_occupancy
+    );
+    drop(owner_b);
+    shutdown_short_lived_session(hub.endpoint(), session_id);
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn unix_eof_skip_core_detach_ablation_keeps_named_pair_on_status() {
+    let _guard = daemon_test_guard();
+    let hub = start_isolated_live_output_hub_with_env(
+        "ues",
+        &[("BOTSTER_HUB_UNIX_EOF_ABLATION", "skip_core_detach")],
+    );
+    let session_id = "ues-session";
+    let sub_a = "ues-sub-a";
+    let sub_b = "ues-sub-b";
+    let (owner_a, reader_a, mut owner_b, mut reader_b, _envelopes_a, mut envelopes_b) =
+        attach_two_unix_clients(&hub, session_id, sub_a, sub_b);
+    let before = sibling_status(&mut owner_b, &mut reader_b, &mut envelopes_b);
+    drop(owner_a);
+    drop(reader_a);
+    let after = wait_for_cleanup_completed(
+        &mut owner_b,
+        &mut reader_b,
+        &mut envelopes_b,
+        &before.lifecycle_counters,
+    );
+    assert!(
+        occupancy_has_pair(&after.live_attach_occupancy, session_id, sub_a),
+        "skip-core-detach ablation must redden the exact-absence assertion: {:?}",
+        after.live_attach_occupancy
+    );
+    drop(owner_b);
+    shutdown_short_lived_session(hub.endpoint(), session_id);
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn unix_eof_pair_only_detach_ablation_drops_replacement_owner_generation() {
+    let _guard = daemon_test_guard();
+    let hub = start_isolated_live_output_hub_with_env(
+        "uep",
+        &[("BOTSTER_HUB_UNIX_EOF_ABLATION", "pair_only_detach")],
+    );
+    let endpoint = hub.endpoint().clone();
+    let session_id = "uep-session";
+    let subscription_id = "uep-sub";
+    let (mut owner_a, mut reader_a) = unix_adapter_connection(&endpoint);
+    let mut envelopes_a = Vec::new();
+    request_skipping_envelopes(
+        &mut owner_a,
+        &mut reader_a,
+        &botster_hub_client::DaemonRequest::Spawn {
+            session_id: session_id.to_string(),
+            command: "while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done".to_string(),
+        },
+        &mut envelopes_a,
+    );
+    request_skipping_envelopes(
+        &mut owner_a,
+        &mut reader_a,
+        &botster_hub_client::DaemonRequest::Attach {
+            session_id: session_id.to_string(),
+            subscription_id: subscription_id.to_string(),
+        },
+        &mut envelopes_a,
+    );
+    let (mut owner_b, mut reader_b) = unix_adapter_connection(&endpoint);
+    let mut envelopes_b = Vec::new();
+    request_skipping_envelopes(
+        &mut owner_b,
+        &mut reader_b,
+        &botster_hub_client::DaemonRequest::Attach {
+            session_id: session_id.to_string(),
+            subscription_id: subscription_id.to_string(),
+        },
+        &mut envelopes_b,
+    );
+    let before = sibling_status(&mut owner_b, &mut reader_b, &mut envelopes_b);
+    let before_generation = before
+        .live_attach_occupancy
+        .iter()
+        .find(|row| row.session_id == session_id && row.subscription_id == subscription_id)
+        .map(|row| row.generation);
+    drop(owner_a);
+    drop(reader_a);
+    let after = wait_for_cleanup_completed(
+        &mut owner_b,
+        &mut reader_b,
+        &mut envelopes_b,
+        &before.lifecycle_counters,
+    );
+    let after_generation = after
+        .live_attach_occupancy
+        .iter()
+        .find(|row| row.session_id == session_id && row.subscription_id == subscription_id)
+        .map(|row| row.generation);
+    assert!(
+        after_generation != before_generation || after_generation.is_none(),
+        "pair-only Detach ablation must redden at B's generation still occupied: before={before_generation:?} after={after:?}"
+    );
+    drop(owner_b);
+    shutdown_short_lived_session(&endpoint, session_id);
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn unix_spawn_then_eof_keeps_host_session() {
+    let _guard = daemon_test_guard();
+    let hub = start_isolated_live_output_hub("usp");
+    let endpoint = hub.endpoint().clone();
+    let session_id = "usp-session";
+    let (mut owner_a, mut reader_a) = unix_adapter_connection(&endpoint);
+    let mut envelopes_a = Vec::new();
+    let spawned = request_skipping_envelopes(
+        &mut owner_a,
+        &mut reader_a,
+        &botster_hub_client::DaemonRequest::Spawn {
+            session_id: session_id.to_string(),
+            command: "sleep 30".to_string(),
+        },
+        &mut envelopes_a,
+    );
+    assert_eq!(
+        spawned.kind,
+        botster_hub_client::DaemonResponseKind::Spawned
+    );
+    drop(owner_a);
+    drop(reader_a);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut listed = botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::ListSessions)
+        .expect("list after spawn EOF");
+    while Instant::now() < deadline {
+        if listed
+            .sessions
+            .iter()
+            .any(|session| session.session_id == session_id)
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+        listed = botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::ListSessions)
+            .expect("list after spawn EOF");
+    }
+    assert!(
+        listed
+            .sessions
+            .iter()
+            .any(|session| session.session_id == session_id),
+        "Spawn-then-EOF must keep the host session: {listed:?}"
+    );
+    shutdown_short_lived_session(&endpoint, session_id);
+    hub.shutdown().expect("shutdown isolated hub");
 }

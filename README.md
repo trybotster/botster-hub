@@ -187,6 +187,9 @@ daemon shutdown are bounded failure paths. `DaemonStatus.lifecycle_counters`
 reports sanitized accepted/rejected/live/high-water connection and
 subscription counts, cleanup outcomes, journal/baseline reconciliation work,
 and entity delivery pressure without exposing session or subscription ids.
+`DaemonStatus.live_attach_occupancy` names the Hub∪Core attach pairs a sibling
+client can use as exact occupancy proof after Unix EOF. The `attach_occupancy`
+feature token is required; an omitted field is not absence.
 Steady-state entity reconciliation consumes the Core lifecycle journal on one
 shared 500 ms backstop and performs a filesystem-backed baseline only when the
 journal explicitly requires resynchronization.
@@ -644,7 +647,7 @@ data_dir=resolved:$HOME/.botster/hub
 daemon=started
 protocol=botster-hub-daemon-v1
 protocol_version=7
-conformance_fixture_revision=42
+conformance_fixture_revision=43
 package_count=2
 enabled_package_count=2
 app_count=2
