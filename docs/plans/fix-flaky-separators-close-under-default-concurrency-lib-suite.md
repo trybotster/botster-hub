@@ -120,10 +120,10 @@ Required test behavior:
 
 1. Keep the pad search that proves `without_commas <= DAEMON_MAX_FRAME_BYTES` and `with_commas > DAEMON_MAX_FRAME_BYTES`.
 2. Stop requiring both huge items to be taken inside one 25 ms wall-clock page.
-3. Drive production `continue_session_snapshot_assembly` with a non-load-sensitive elapsed budget for this separator case (for example `Duration::from_secs(5)`). This test proves separator accounting, not owner-turn latency.
+3. Drive production `continue_session_snapshot_assembly` with `Duration::MAX`. This test proves separator accounting, not owner-turn latency. A finite budget such as 5 s can still cut an empty page after `Instant::now()` if the scheduler pauses. `Duration::MAX` cannot.
 4. If the first call returns `Continue` after accepting one item (byte-trial pop of the second row), loop at most three pages. Two items cannot need more than two useful pages.
 5. Accept only `Closed { frame_too_large: true }` plus `DaemonEntityFrame::Error` with `entity_provider_frame_too_large`.
-6. Treat an empty-item `Continue` or an empty-item immediate `Closed` as failure. That path is elapsed-empty close, not separator proof.
+6. Treat an empty-item `Continue` as failure (`page.items > 0`). Do not probe a later `take_snapshot_item_page` after `Closed`. Elapsed-empty `Closed` is unreachable because the page elapsed budget cannot fire.
 
 Prefer this repair over quarantine. Use `#[ignore]`, `--test-threads=1`, or a skip only if the repaired test still fails default-concurrency `--lib` after one clean run. That fallback needs an Implement report that names the remaining mechanism. Do not start from quarantine.
 
@@ -161,7 +161,7 @@ Assumption: the observed suite failure is the elapsed-time first-page cut descri
 
 Assumption: one production `continue_session_snapshot_assembly` path is enough. A second helper would hide the production charge.
 
-Assumption: a 5 second elapsed budget on this unit test does not weaken production 8 ms `SESSION_DELIVERY_MAX_ELAPSED`. Production callers keep the 8 ms constant.
+Assumption: `Duration::MAX` on this unit test does not weaken production 8 ms `SESSION_DELIVERY_MAX_ELAPSED`. Production callers keep the 8 ms constant.
 
 Assumption: looping one extra page after a one-item `Continue` still proves comma charge, because `snapshot_separator_bytes(1, 1) == 1` matches `snapshot_separator_bytes(0, 2)`.
 
@@ -180,7 +180,7 @@ Production entry point that already uses the behavior: `continue_session_snapsho
 ## Risks
 
 - A large elapsed budget plus a single call can still `Continue` if `take_snapshot_item_page` pops the second item because its growing-frame trial exceeds `max_bytes`. The bounded loop covers that path.
-- An empty-page `Closed` would be a false green. The test must reject that.
+- An empty-page `Closed` would be a false green. `Duration::MAX` makes elapsed-empty close unreachable. A post-close probe of a fresh page does not prove the closing call took an item. Do not add that probe.
 - Binding `--lib` may expose `near_limit_snapshot_assembly_stays_within_owner_turn`. That is a sibling root, not permission to serialize the suite.
 - Expanding into `take_snapshot_item_page` would duplicate `ticket_1786912570_127968` and reopen the superseded multi-root loop.
 - Promising full `./test.sh --locked` would put the write-budget lifecycle failure back in this ticket's acceptance.
@@ -213,8 +213,8 @@ No convention conflict. The Hub charter, suite-wide acceptance note, and focused
 
 1. Edit only the named test in `src/daemon_entity_subscriptions.rs`.
 2. Keep the pad invariant. Remove the 25 ms single-call coupling.
-3. Use a non-load-sensitive elapsed budget and a bounded production loop as specified in Scope.
-4. Reject empty-item close and empty-item continue.
+3. Use `Duration::MAX` and a bounded production loop as specified in Scope.
+4. Reject empty-item continue. Do not add a fresh page probe after `Closed`.
 5. Run focused then one default-concurrency `--lib`.
 6. Commit the test plus an Implement report under `docs/reports/`.
 7. Do not advance if `--lib` fails this test. Do not retry the same command for luck.
