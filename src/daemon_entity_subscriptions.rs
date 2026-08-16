@@ -181,7 +181,7 @@ pub(super) fn register_entity_subscription(
                 package_catching_up: false,
                 delivery_after: None,
                 delivery_phase: DeliveryPhase::Removes,
-                next_seq: 0,
+                next_seq: snapshot_seq,
                 assembled_items: Vec::new(),
                 assembled_item_bytes: 0,
                 needs_delivery: false,
@@ -367,10 +367,11 @@ fn drive_session_type_subscriptions(
         }
 
         if let Some(reason) = subscription.resync_reason.clone() {
+            let snapshot_seq = subscription.next_seq.saturating_add(1);
             let frame = DaemonEntityFrame::Snapshot {
                 subscription_id: subscription_id.clone(),
                 entity_type: "session_type".to_string(),
-                snapshot_seq: generation,
+                snapshot_seq,
                 items: entities.values().cloned().collect(),
                 resync_reason: Some(reason),
             };
@@ -388,6 +389,7 @@ fn drive_session_type_subscriptions(
             }
             return match subscription.sender.try_send_kind(frame) {
                 Ok(()) => {
+                    subscription.next_seq = snapshot_seq;
                     subscription.definition_generation = generation;
                     subscription.definition_entities = entities.clone();
                     subscription.resync_reason = None;
@@ -409,7 +411,7 @@ fn drive_session_type_subscriptions(
             .map(|id| DaemonEntityFrame::Remove {
                 subscription_id: subscription_id.clone(),
                 entity_type: "session_type".to_string(),
-                snapshot_seq: generation,
+                snapshot_seq: 0,
                 id: id.clone(),
             })
             .collect::<Vec<_>>();
@@ -420,14 +422,18 @@ fn drive_session_type_subscriptions(
                 .map(|(id, entity)| DaemonEntityFrame::Upsert {
                     subscription_id: subscription_id.clone(),
                     entity_type: "session_type".to_string(),
-                    snapshot_seq: generation,
+                    snapshot_seq: 0,
                     id: id.clone(),
                     entity: entity.clone(),
                 }),
         );
         for frame in frames {
+            let snapshot_seq = subscription.next_seq.saturating_add(1);
+            let frame = with_session_type_snapshot_seq(frame, snapshot_seq);
             match subscription.sender.try_send_kind(frame) {
-                Ok(()) => {}
+                Ok(()) => {
+                    subscription.next_seq = snapshot_seq;
+                }
                 Err(EntityFrameTrySendError::Full(_)) => {
                     subscription.resync_reason = Some("subscriber_overflow".to_string());
                     return true;
@@ -439,6 +445,65 @@ fn drive_session_type_subscriptions(
         subscription.definition_entities = entities.clone();
         true
     });
+}
+
+fn with_session_type_snapshot_seq(
+    frame: DaemonEntityFrame,
+    snapshot_seq: u64,
+) -> DaemonEntityFrame {
+    match frame {
+        DaemonEntityFrame::Remove {
+            subscription_id,
+            entity_type,
+            id,
+            ..
+        } => DaemonEntityFrame::Remove {
+            subscription_id,
+            entity_type,
+            snapshot_seq,
+            id,
+        },
+        DaemonEntityFrame::Upsert {
+            subscription_id,
+            entity_type,
+            id,
+            entity,
+            ..
+        } => DaemonEntityFrame::Upsert {
+            subscription_id,
+            entity_type,
+            snapshot_seq,
+            id,
+            entity,
+        },
+        DaemonEntityFrame::Patch {
+            subscription_id,
+            entity_type,
+            id,
+            patch,
+            ..
+        } => DaemonEntityFrame::Patch {
+            subscription_id,
+            entity_type,
+            snapshot_seq,
+            id,
+            patch,
+        },
+        DaemonEntityFrame::Snapshot {
+            subscription_id,
+            entity_type,
+            items,
+            resync_reason,
+            ..
+        } => DaemonEntityFrame::Snapshot {
+            subscription_id,
+            entity_type,
+            snapshot_seq,
+            items,
+            resync_reason,
+        },
+        other => other,
+    }
 }
 
 pub(super) fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
@@ -2019,6 +2084,199 @@ mod tests {
                 && entity_type == "session_type"
                 && code == "entity_provider_frame_too_large"
         ));
+    }
+
+    fn session_type_subscription_state(
+        sender: mpsc::SyncSender<DaemonEntityFrame>,
+        definition_generation: u64,
+        next_seq: u64,
+        definition_entities: BTreeMap<String, Value>,
+        resync_reason: Option<String>,
+    ) -> EntitySubscriptionState {
+        EntitySubscriptionState {
+            sender: EntityFrameSender::Blocking(sender),
+            entity_type: "session_type".to_string(),
+            cursor: None,
+            entities: BTreeMap::new(),
+            definition_generation,
+            definition_entities,
+            resync_reason,
+            owner_grant_id: None,
+            package_last_applied_seq: None,
+            package_catching_up: false,
+            delivery_after: None,
+            delivery_phase: DeliveryPhase::Removes,
+            next_seq,
+            assembled_items: Vec::new(),
+            assembled_item_bytes: 0,
+            needs_delivery: false,
+        }
+    }
+
+    fn session_type_delta_seqs(
+        receiver: &mpsc::Receiver<DaemonEntityFrame>,
+    ) -> Vec<(String, u64, String)> {
+        receiver
+            .try_iter()
+            .filter_map(|frame| match frame {
+                DaemonEntityFrame::Upsert {
+                    subscription_id,
+                    snapshot_seq,
+                    id,
+                    ..
+                }
+                | DaemonEntityFrame::Remove {
+                    subscription_id,
+                    snapshot_seq,
+                    id,
+                    ..
+                } => Some((subscription_id, snapshot_seq, id)),
+                DaemonEntityFrame::Snapshot {
+                    subscription_id,
+                    snapshot_seq,
+                    ..
+                } => Some((subscription_id, snapshot_seq, "snapshot".to_string())),
+                DaemonEntityFrame::Error { .. } | DaemonEntityFrame::Patch { .. } => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn session_type_same_generation_multi_row_uses_contiguous_subscriber_seq() {
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let mut subscriptions = BTreeMap::from([(
+            "held-session-types".to_string(),
+            session_type_subscription_state(
+                sender,
+                1,
+                1,
+                BTreeMap::from([
+                    (
+                        "device/alpha".to_string(),
+                        serde_json::json!({ "label": "Alpha" }),
+                    ),
+                    (
+                        "device/beta".to_string(),
+                        serde_json::json!({ "label": "Beta" }),
+                    ),
+                ]),
+                None,
+            ),
+        )]);
+        let entities = BTreeMap::from([
+            (
+                "device/alpha".to_string(),
+                serde_json::json!({ "label": "Alpha 2" }),
+            ),
+            (
+                "device/beta".to_string(),
+                serde_json::json!({ "label": "Beta 2" }),
+            ),
+        ]);
+
+        drive_session_type_subscriptions(&mut subscriptions, 2, &entities);
+
+        let frames = session_type_delta_seqs(&receiver);
+        assert_eq!(
+            frames,
+            vec![
+                (
+                    "held-session-types".to_string(),
+                    2,
+                    "device/alpha".to_string()
+                ),
+                (
+                    "held-session-types".to_string(),
+                    3,
+                    "device/beta".to_string()
+                ),
+            ],
+            "one generation with two published diffs must deliver N+1 then N+2 on the held subscription"
+        );
+        assert_eq!(
+            subscriptions
+                .get("held-session-types")
+                .map(|subscription| subscription.next_seq),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn session_type_skipped_generation_uses_contiguous_subscriber_seq() {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let mut subscriptions = BTreeMap::from([(
+            "held-session-types".to_string(),
+            session_type_subscription_state(
+                sender,
+                1,
+                1,
+                BTreeMap::from([(
+                    "device/alpha".to_string(),
+                    serde_json::json!({ "label": "Alpha" }),
+                )]),
+                None,
+            ),
+        )]);
+        let entities = BTreeMap::from([(
+            "device/alpha".to_string(),
+            serde_json::json!({ "label": "Alpha 3" }),
+        )]);
+
+        drive_session_type_subscriptions(&mut subscriptions, 3, &entities);
+
+        let frames = session_type_delta_seqs(&receiver);
+        assert_eq!(
+            frames,
+            vec![(
+                "held-session-types".to_string(),
+                2,
+                "device/alpha".to_string()
+            )],
+            "a skipped dirty generation must still deliver the next contiguous subscriber seq, not the generation number"
+        );
+        assert_eq!(
+            subscriptions
+                .get("held-session-types")
+                .map(|subscription| subscription.next_seq),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn session_type_overflow_resync_advances_subscriber_seq_not_generation() {
+        let (sender, receiver) = mpsc::sync_channel(2);
+        let mut subscriptions = BTreeMap::from([(
+            "held-session-types".to_string(),
+            session_type_subscription_state(
+                sender,
+                7,
+                7,
+                BTreeMap::from([(
+                    "device/alpha".to_string(),
+                    serde_json::json!({ "label": "Alpha" }),
+                )]),
+                Some("subscriber_overflow".to_string()),
+            ),
+        )]);
+        let entities = BTreeMap::from([(
+            "device/alpha".to_string(),
+            serde_json::json!({ "label": "Alpha recovered" }),
+        )]);
+
+        drive_session_type_subscriptions(&mut subscriptions, 3, &entities);
+
+        let frames = session_type_delta_seqs(&receiver);
+        assert_eq!(
+            frames,
+            vec![("held-session-types".to_string(), 8, "snapshot".to_string())],
+            "overflow resync must send next_seq+1 and must not move snapshot_seq backwards to the generation"
+        );
+        let subscription = subscriptions
+            .get("held-session-types")
+            .expect("held subscription remains open");
+        assert_eq!(subscription.next_seq, 8);
+        assert_eq!(subscription.definition_generation, 3);
+        assert!(subscription.resync_reason.is_none());
     }
 
     #[test]
