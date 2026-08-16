@@ -1692,7 +1692,7 @@ fn unix_shutdown_session_from_another_connection_classifies_attached_exit() {
         &mut reader,
         session_id,
         subscription_id,
-        "printf 'pse-ready\\n'; exit 0",
+        "printf 'pse-ready\\n'; sleep 30",
         &mut envelopes,
         &mut events,
     );
@@ -1735,7 +1735,8 @@ fn unix_shutdown_session_from_another_connection_classifies_attached_exit() {
     .expect("shutdown from a separate connection");
     assert_ne!(
         shutdown.kind,
-        botster_hub_client::DaemonResponseKind::OperatorError
+        botster_hub_client::DaemonResponseKind::OperatorError,
+        "ShutdownSession from a sibling connection must classify the still-attached session: {shutdown:?}"
     );
 
     let listed =

@@ -162,17 +162,26 @@ fn start_webrtc_adapter_hub(
     )
     .expect("start botster-web entrypoint");
     assert_eq!(start.kind, botster_hub_client::DaemonResponseKind::Packages);
-    let bootstrap = botster_hub_client::request(
+    let web_origin = format!("http://127.0.0.1:{web_listener_port}");
+    let expected_local_url = format!("{web_origin}/");
+    wait_for_botster_web_readiness(
+        &endpoint,
+        &web_origin,
+        &expected_local_url,
+        Instant::now(),
+    );
+    let issued = botster_hub_client::request(
         &endpoint,
         botster_hub_client::DaemonRequest::IssueLocalWebrtcBootstrap {
             package_name: "botster-web".to_string(),
             entrypoint_id: "web-client".to_string(),
-            origin: format!("http://127.0.0.1:{web_listener_port}"),
+            origin: web_origin,
         },
     )
-    .expect("issue local WebRTC bootstrap")
-    .local_webrtc_bootstrap
-    .expect("bootstrap response includes local WebRTC bootstrap");
+    .expect("issue local WebRTC bootstrap");
+    let Some(bootstrap) = issued.local_webrtc_bootstrap else {
+        panic!("bootstrap response includes local WebRTC bootstrap: {issued:?}");
+    };
     (hub, endpoint, bootstrap)
 }
 
@@ -1322,4 +1331,151 @@ fn webrtc_terminal_adapter_close_event_feature_stays_optional_on_protocol_7() {
     );
     assert_eq!(botster_hub_client::PROTOCOL_VERSION, 7);
     assert_eq!(botster_hub_client::CONFORMANCE_FIXTURE_REVISION, 43);
+}
+
+#[test]
+fn one_session_unix_and_webrtc_dual_attach_exposes_hub_occupancy() {
+    let _guard = daemon_test_guard();
+    let (hub, endpoint, bootstrap) = start_webrtc_adapter_hub("nsd");
+    let session_id = "nsd-session";
+    let unix_sub = "nsd-unix";
+    let webrtc_sub = "nsd-webrtc";
+    let (mut unix, mut unix_reader) = unix_adapter_connection(&endpoint);
+    let mut unix_envelopes = Vec::new();
+
+    let spawned = request_skipping_envelopes(
+        &mut unix,
+        &mut unix_reader,
+        &botster_hub_client::DaemonRequest::Spawn {
+            session_id: session_id.to_string(),
+            command: "while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done".to_string(),
+        },
+        &mut unix_envelopes,
+    );
+    assert_eq!(
+        spawned.kind,
+        botster_hub_client::DaemonResponseKind::Spawned
+    );
+    let unix_attach = request_skipping_envelopes(
+        &mut unix,
+        &mut unix_reader,
+        &botster_hub_client::DaemonRequest::Attach {
+            session_id: session_id.to_string(),
+            subscription_id: unix_sub.to_string(),
+        },
+        &mut unix_envelopes,
+    );
+    assert_eq!(
+        unix_attach.kind,
+        botster_hub_client::DaemonResponseKind::Events
+    );
+
+    block_on(async {
+        let (mut peer, key) = open_local_webrtc_peer(&endpoint, &bootstrap).await;
+        peer.encrypted_hello(&key, &webrtc_terminal_adapter_hello())
+            .await
+            .expect("webrtc hello");
+        let webrtc_attach = peer
+            .encrypted_request(
+                &key,
+                &botster_hub_client::DaemonRequest::Attach {
+                    session_id: session_id.to_string(),
+                    subscription_id: webrtc_sub.to_string(),
+                },
+            )
+            .await
+            .expect("webrtc attach");
+        assert_eq!(
+            webrtc_attach.kind,
+            botster_hub_client::DaemonResponseKind::Events
+        );
+        assert!(
+            webrtc_attach.events.is_empty(),
+            "WebRTC Attach must not return terminal bodies: {:?}",
+            webrtc_attach.events
+        );
+
+        let occupied = sibling_status(&mut unix, &mut unix_reader, &mut unix_envelopes);
+        assert!(
+            occupied
+                .compatibility
+                .features
+                .iter()
+                .any(|feature| feature == botster_hub_client::FEATURE_ATTACH_OCCUPANCY),
+            "sibling Status must advertise attach_occupancy: {:?}",
+            occupied.compatibility.features
+        );
+        assert!(
+            occupancy_has_pair(&occupied.live_attach_occupancy, session_id, unix_sub),
+            "Unix pair must occupy the union oracle: {:?}",
+            occupied.live_attach_occupancy
+        );
+        assert!(
+            occupancy_has_pair(&occupied.live_attach_occupancy, session_id, webrtc_sub),
+            "WebRTC pair must occupy the union oracle: {:?}",
+            occupied.live_attach_occupancy
+        );
+
+        peer.peer.close().await.expect("close webrtc peer");
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut after = sibling_status(&mut unix, &mut unix_reader, &mut unix_envelopes);
+    while Instant::now() < deadline {
+        if !occupancy_has_pair(&after.live_attach_occupancy, session_id, webrtc_sub)
+            && occupancy_has_pair(&after.live_attach_occupancy, session_id, unix_sub)
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+        after = sibling_status(&mut unix, &mut unix_reader, &mut unix_envelopes);
+    }
+    assert!(
+        !occupancy_has_pair(&after.live_attach_occupancy, session_id, webrtc_sub),
+        "WebRTC pair must leave occupancy after peer loss: {:?}",
+        after.live_attach_occupancy
+    );
+    assert!(
+        occupancy_has_pair(&after.live_attach_occupancy, session_id, unix_sub),
+        "Unix sibling must stay occupied after WebRTC peer loss: {:?}",
+        after.live_attach_occupancy
+    );
+
+    let input = request_skipping_envelopes(
+        &mut unix,
+        &mut unix_reader,
+        &botster_hub_client::DaemonRequest::SendInput {
+            session_id: session_id.to_string(),
+            data: "after-webrtc-loss\r".to_string(),
+        },
+        &mut unix_envelopes,
+    );
+    assert_ne!(
+        input.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError,
+        "Unix SendInput must stay accepted after WebRTC peer loss: {input:?}"
+    );
+    let listed = request_skipping_envelopes(
+        &mut unix,
+        &mut unix_reader,
+        &botster_hub_client::DaemonRequest::ListSessions,
+        &mut unix_envelopes,
+    );
+    assert!(
+        listed
+            .sessions
+            .iter()
+            .any(|session| session.session_id == session_id),
+        "host session must stay listed after WebRTC peer loss"
+    );
+    eprintln!(
+        "unix+webrtc occupancy provenance hub_bin={} session_worker={}",
+        env!("CARGO_BIN_EXE_botster-hub"),
+        session_worker_binary_path().display()
+    );
+
+    drop(unix);
+    drop(unix_reader);
+    shutdown_short_lived_session(&endpoint, session_id);
+    hub.shutdown().expect("shutdown isolated hub");
 }
