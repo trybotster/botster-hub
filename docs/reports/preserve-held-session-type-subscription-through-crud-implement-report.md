@@ -13,6 +13,7 @@
 | Worktree | pipeline-provided Hub ticket worktree |
 | Branch | `project-pipelines/ticket_1786841413_921609` |
 | Baseline SHA | `d52c3ebc4190286c4b7c3812f8c65251c646ade5` |
+| Implement commit | `2434f90f8536922f30b20de475942ccb5e14155d` |
 | Plan | `docs/plans/preserve-held-session-type-subscription-through-crud.md` |
 | `teardown_class_applies` | false |
 
@@ -129,7 +130,7 @@ Results:
 
 Live packaged Web proof, no Web edits:
 
-- Hub binary: this worktree `target/debug/botster-hub` (working tree includes this fix; commit SHA recorded at commit time).
+- Hub binary: this worktree `target/debug/botster-hub` built from implement commit `2434f90f8536922f30b20de475942ccb5e14155d`.
 - Worker binary: this worktree `target/debug/botster-session-worker`, built with `cargo build --locked -p botster-core-daemon --bin botster-session-worker`.
 - Locked Core SHA from `Cargo.lock`: `aef6516d5809d563961ed7fdd07da29a7b4edddc`.
 - Launched Core SHA: `aef6516d5809d563961ed7fdd07da29a7b4edddc` (same as lockfile).
