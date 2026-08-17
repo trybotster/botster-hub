@@ -162,7 +162,7 @@ enum OwnerEvent {
 }
 
 enum OwnerPollDecision {
-    ServeControl(Box<ControlMessage>),
+    ServeControl(Box<Option<ControlMessage>>),
     RunSlice,
     Block,
 }
@@ -174,7 +174,7 @@ fn classify_owner_poll(
     slice_due: bool,
 ) -> OwnerPollDecision {
     match poll {
-        Ok(message) => OwnerPollDecision::ServeControl(Box::new(message)),
+        Ok(message) => OwnerPollDecision::ServeControl(Box::new(Some(message))),
         Err(_) if slice_due => OwnerPollDecision::RunSlice,
         Err(_) => OwnerPollDecision::Block,
     }
@@ -290,9 +290,7 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
         let slice_due = control_state.maintenance.needs_work()
             || control_state.next_reconciliation <= Instant::now();
         let event = match classify_owner_poll(control_rx.try_recv(), slice_due) {
-            OwnerPollDecision::ServeControl(message) => {
-                Some(OwnerEvent::Control(Box::new(Some(*message))))
-            }
+            OwnerPollDecision::ServeControl(message) => Some(OwnerEvent::Control(message)),
             OwnerPollDecision::RunSlice => None,
             OwnerPollDecision::Block => {
                 let wait = control_state
@@ -7861,7 +7859,7 @@ mod tests {
         assert!(matches!(
             classify_owner_poll(Ok(ControlMessage::RejectedConnection), true),
             OwnerPollDecision::ServeControl(message)
-                if matches!(*message, ControlMessage::RejectedConnection)
+                if matches!(*message, Some(ControlMessage::RejectedConnection))
         ));
     }
 

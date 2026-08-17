@@ -12,13 +12,13 @@
 | Plan commit | `c0f5646` (approved plan v3) |
 | Delivery | direct-merge; no pull request |
 | Class | not runtime-teardown (`teardown_class_applies: false`) |
-| Plan | `docs/plans/fix-flaky-ready-spawn-wall-clock-budget-under-ambient-load.md` revision v3 |
+| Plan | `docs/plans/fix-flaky-ready-spawn-wall-clock-budget-under-ambient-load.md` revision v3.1 |
 | Implement checklist | `checklist_1786943181_130677` (ticket-scoped; no duplicate created) |
-| Run status | focused Implement complete; exact-bytes no longer blocks this repair |
+| Run status | focused Implement complete after Review changes_required |
 
 Independent routing: `project_pipelines_get_project` lists `tgt_7e208a0c76a44980a83b63af976b1f22` as a registered project target. The ticket worktree `origin` remote is `trybotster/botster-hub`. Approved plan v3 used the same `target_id` and repository.
 
-Advisor answer `question_1786977344_650479` first required a blocking sibling and a parked run. Later orchestrator message `msg_device-2_1787003395_86e7b7` flattened that serial edge. Exact-bytes no longer blocks this focused repair. Do not absorb that root. Final integration stays strict and waits for every direct blocker.
+Durable answer `question_1787003911_553236` chooses option 2 and supersedes the parking instruction in `question_1786977344_650479`. This ticket's Implement and Review gate is focused proof plus known-baseline exact-bytes evidence. `ticket_1786977409_499180` does not block this repair. Both tickets directly block final integration. Do not absorb exact-bytes. Do not start an unfiltered lifecycle suite now.
 
 ## Repository playbook and other playbooks/notes applied
 
@@ -70,6 +70,7 @@ Feature behavior:
 
 Handoff:
 
+- `docs/plans/fix-flaky-ready-spawn-wall-clock-budget-under-ambient-load.md` — v3.1 focused-gate acceptance check after `question_1787003911_553236`.
 - `docs/reports/fix-flaky-ready-spawn-wall-clock-budget-under-ambient-load-implement.md` — this report.
 
 Merge/rebase cleanup: none.
@@ -83,7 +84,7 @@ Merge/rebase cleanup: none.
 
 ## Ownership boundaries preserved
 
-Hub owns the daemon transport, the owner loop, and this lifecycle suite. The production diff is a structural extraction of the existing busy-path decision. Scheduling behavior, budgets, and public contracts stay unchanged. Core, hub-client, Web, TUI, and package/plugin paths were not edited.
+Hub owns the daemon transport, the owner loop, and this lifecycle suite. The production diff is a structural extraction of the existing busy-path decision. `ServeControl` carries `Box<Option<ControlMessage>>` and `serve_daemon` moves that box into `OwnerEvent::Control`, so queued control still allocates one box. Scheduling behavior, budgets, and public contracts stay unchanged. Core, hub-client, Web, TUI, and package/plugin paths were not edited.
 
 ## Cross-repo routing
 
@@ -99,15 +100,15 @@ Same-target siblings, not absorbed:
 
 ## Deviations from plan
 
-- `OwnerPollDecision::ServeControl` boxes `ControlMessage`. Plan v3 sketched an unboxed variant. `clippy::large_enum_variant` rejected the 208-byte unboxed form (`-D warnings`). Boxing matches existing `OwnerEvent::Control(Box<Option<ControlMessage>>)`. Classification arms and order stay identical.
+- `OwnerPollDecision::ServeControl` carries `Box<Option<ControlMessage>>`. Plan v3 sketched an unboxed `ControlMessage` variant. `clippy::large_enum_variant` rejected that form. Review `finding_1787003842_417998` then required the same single-allocation box as `OwnerEvent::Control`. Classification arms and order stay identical.
 - Pre-change reproduction on this worktree was not run. The ticket already carries exact base-`547ca38` failure evidence. Plan v3 marked local reproduction as corroborating only.
-- Binding `./test.sh --locked --test hub_daemon_lifecycle_test` is not 5/5 clean. Run 1 failed on the exact-bytes suite-load oracle. Orchestrator message `msg_device-2_1787003395_86e7b7` authorizes focused proof plus explicit known-baseline evidence for this ticket. That is not a product-scope change to the ready-spawn repair.
+- Plan v3.1, authorized by `question_1787003911_553236`, replaces acceptance check 4. This ticket no longer requires five consecutive unfiltered lifecycle suites. The Implement and Review gate is focused proof plus known-baseline exact-bytes evidence. Final integration remains the zero-failure convergence gate.
 
 ## Tests and downstream proof run
 
 Tracked `.gitignore` is 53 bytes and matches `HEAD`. The ticket worktree path has no `:`. No `CARGO_TARGET_DIR` override.
 
-Production entry point: `serve_daemon` in `src/daemon_transport.rs` now calls `classify_owner_poll(control_rx.try_recv(), slice_due)` at the busy-path decision. The helper is the single classification site. The loop call is one match. Scheduling arms are the same as the pre-change `try_recv` match.
+Production entry point: `serve_daemon` in `src/daemon_transport.rs` now calls `classify_owner_poll(control_rx.try_recv(), slice_due)` at the busy-path decision. The helper is the single classification site. A queued control message becomes one `Box<Option<ControlMessage>>` that the loop moves into `OwnerEvent::Control`. Scheduling arms are the same as the pre-change `try_recv` match.
 
 ### Red-proof
 
@@ -115,7 +116,7 @@ Temporary Ablation A inverted helper precedence so `slice_due` won over a ready 
 
 | Control | Command | Exit | First failure |
 | --- | --- | --- | --- |
-| A (precedence inversion) | `./test.sh --locked --lib queued_control_precedes_a_due_maintenance_slice` | 101 | `assertion failed: matches!(classify_owner_poll(Ok(ControlMessage::RejectedConnection), true), OwnerPollDecision::ServeControl(...))` at `src/daemon_transport.rs:7862` |
+| A (precedence inversion) | `./test.sh --locked --lib queued_control_precedes_a_due_maintenance_slice` | 101 | `assertion failed: matches!(classify_owner_poll(Ok(ControlMessage::RejectedConnection), true), OwnerPollDecision::ServeControl(message) if matches!(*message, Some(ControlMessage::RejectedConnection)))` at `src/daemon_transport.rs:7860` |
 
 No timers or trial counts. The v1 nine-second sabotage and the v2 `biased;`-removal ablation were not used.
 
@@ -127,7 +128,7 @@ No timers or trial counts. The v1 nine-second sabotage and the v2 `biased;`-remo
 | `./test.sh --locked --lib queued_control_precedes_a_due_maintenance_slice` × 20 on the final boxed helper | 20/20 PASS |
 | `./test.sh --locked --test hub_daemon_lifecycle_test ready_spawn_completes` × 20 | 20/20 PASS; each run `2 passed; 0 failed; 218 filtered out` |
 | Observation run with `--nocapture` | snapshot assembly 13.346375ms; observe-slice load 51.575042ms |
-| `./test.sh --locked --test hub_daemon_lifecycle_test` × 5 | 4/5 PASS; run 1 FAIL on known-baseline exact-bytes (see below). Focused ready-spawn proof is the Implement gate. |
+| `./test.sh --locked --test hub_daemon_lifecycle_test` × 5 | Historical record only. 4/5 PASS; run 1 FAIL on known-baseline exact-bytes owned by `ticket_1786977409_499180`. Not this ticket's gate after `question_1787003911_553236`. |
 | `cargo fmt --all -- --check` | exit 0 |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0 after boxing `ServeControl` |
 
@@ -135,7 +136,7 @@ Downstream proof: not required. No public surface, DTO, pin, or runtime behavior
 
 Non-binding loaded-daemon workflow dispatch was not run.
 
-### Binding suite record (not waived)
+### Known-baseline suite record
 
 | Run | Result | Detail |
 | --- | --- | --- |
@@ -155,7 +156,7 @@ The exact-bytes failure did not repeat in runs 2-5. It still owns `ticket_178697
 
 - The decision-level unit test proves the busy-path classification, not whole-loop wiring. A future pre-control drain that bypasses the helper would not fail it. The loop call site is one match for Review to check. The existing `due_reconciliation_precedes_an_already_ready_control_message` still pins the blocking path.
 - The two integration tests no longer assert any latency bound. `waited` stays visible as an observation. `tests/session_projection_owner_loop.rs` still const-asserts the budget relations.
-- Binding suite run 1 failed on exact-bytes. That failure is known-baseline evidence for `ticket_1786977409_499180`, not residual risk and not this ticket's repair.
+- Suite run 1 failed on exact-bytes. That failure is known-baseline evidence for `ticket_1786977409_499180`, not residual risk and not this ticket's repair. Review `finding_1787003842_944465` is resolved by durable answer `question_1787003911_553236` plus Plan v3.1.
 - `tests/hub_daemon_lifecycle/package_event_plane.rs` still has a wall-clock ready-operation assertion. It did not fail these runs.
 
 ## Missing vault guidance discovered
