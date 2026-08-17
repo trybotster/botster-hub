@@ -24,6 +24,8 @@ The separators Implement binding (`ticket_1786916741_161067`) hit one lib-suite 
 
 - [[planner-playbook]] -- generic Plan role contract.
 - [[botster-planner-playbook]] -- Botster planning overlay, completion evidence, worktree hygiene, runtime-teardown class trigger.
+- [[botster-architecture]] -- domain map (mandatory Must Load). Confirms Hub owns the local WebRTC transport and daemon control plane; nothing in the map moves this work outside Hub or outside `#[cfg(test)]` scope.
+- [[cli-patterns]] -- Rust CLI/runtime constraints (mandatory Must Load). Directly binding entry: [[conformance harnesses gate on deterministic invariants not timing]] -- test gates prefer deterministic invariants over wall-clock durations. This note drives the timeout decision in Scope item 3.
 - [[botster runtime teardown lenses]] -- the class applies; answers below.
 - [[wall-clock MAX_OWNER_TURN_MS assertions flake under default-concurrency lib load]] -- the sibling flake class: wall-clock and load-sensitive oracles are not valid under default-concurrency lib load. This ticket is the same disease in a different organ: a process-global counter predicate plus a tight wall-clock deadline.
 - [[A separator-boundary unit test flakes when MAX_OWNER_TURN_MS cuts the first half-megabyte page]] -- prior-art repair idiom and one-ticket-per-root discipline.
@@ -55,11 +57,11 @@ The test proves last-peer teardown and runtime recreation: inject `RTCPeerConnec
 Two load-sensitive couplings exist in the waited predicate:
 
 1. **Process-global counter interference.** `LOCAL_WEBRTC_WORKER_THREADS` is one `static AtomicUsize` for the whole test process. Every dedicated local-WebRTC runtime in any concurrently running test increments it. `teardown_test_lock` exists to serialize counter-sharing tests, but only 8 tests take it, while the module has about 37 `signal_peer` harness call sites. Unlocked peer tests that hold a live dedicated runtime during this test's 2-second window keep the global counter above zero, so the `== 0` predicate can never become true regardless of this test's own correct teardown. Examples of unlocked counter mutators: `local_webrtc_late_subscribe_entities_after_peer_closed_does_not_recreate_state` (`:5276`), `local_webrtc_spawned_session_is_cleaned_even_if_attach_proof_panics_after_ready` (`:5581`), `local_webrtc_stale_peer_snapshot_does_not_remove_replacement_subscription_owner` (`:5625`), `local_webrtc_subscribe_before_peer_closed_is_swept_by_owner_grant` (`:5743`), `local_webrtc_late_attach_after_peer_closed_does_not_recreate_state` (`:5841`). Implement must enumerate the complete set mechanically.
-2. **Tight wall-clock deadline under suite load.** Even without interference, the 2-second bound is a wall-clock patience budget for OS worker-thread exit after `runtime.take()`. Under default-concurrency lib load the scheduler can delay thread exit and hook execution past 2 seconds. The sibling waits at `:5163`, `:5553`, and `:6446` carry the same 2-second bound, while the same tests use 10-second bounds for `process_until_peer_closed`.
+2. **Tight wall-clock deadline under suite load (unproven, contingency only).** Even without interference, the 2-second bound is a wall-clock patience budget for OS worker-thread exit after `runtime.take()`. No instance-local evidence shows this daemon's own worker exit ever exceeded 2 seconds; only the interference channel is proven. Per [[conformance harnesses gate on deterministic invariants not timing]], the plan does not raise deadlines speculatively. The deadlines stay at 2 seconds; Scope item 3 defines the evidence bar a future raise must meet.
 
 Isolated runs pass because no other test holds the counter and thread exit is prompt on an unloaded machine. This is a test-oracle coupling defect, not a production teardown regression. Production park, fail-closed drop, and close-bound behavior are correct and stay unchanged.
 
-The mechanism-1 interference channel is proven by code inspection (global static + unlocked mutators + `== 0` predicate); which mechanism fired in the recorded failure is not recoverable from the panic line. The repair below removes both.
+The mechanism-1 interference channel is proven by code inspection (global static + unlocked mutators + `== 0` predicate). The repair removes mechanism 1. Mechanism 2 remains a hypothesis with a defined contingency, not a change in this plan.
 
 ## Runtime-teardown lens answers
 
@@ -67,9 +69,18 @@ The mechanism-1 interference channel is proven by code inspection (global static
 
 `teardown_isolation`: production unchanged -- `remove_peer` removes exactly the closed peer's ownership (`take_remove_result`), parks the runtime only when the peer map is empty, and `fail_closed_drop_dedicated_runtime` names the deliberate sibling-sacrifice path. Test-side: the oracle becomes instance-scoped, so one test's teardown observation cannot be corrupted by another test's live runtime -- the same isolation principle applied to test observation.
 
-`teardown_bounds`: production bounds unchanged -- `LOCAL_WEBRTC_PEER_CLOSE_BOUND` on close, `runtime.take()` as the hard stop for driver loops. Test-side: the worker-join wait stays bounded (raised from 2 s to 10 s, matching the module's `process_until_peer_closed` patience bound). A hang still fails the test at the deadline; the bound is patience for progress, not a production latency claim.
+`teardown_bounds`: production bounds unchanged -- `LOCAL_WEBRTC_PEER_CLOSE_BOUND` on close, `runtime.take()` as the hard stop for driver loops. Test-side: the worker-join wait stays bounded at the existing 2 s deadline. A hang still fails the test at the deadline; the bound is patience for progress, not a production latency claim. Scope item 3 defines the only permitted raise path.
 
-`late_message_matrix`: unchanged. Late `SubscribeEntities` and late `Attach` after `PeerClosed` are owned by the existing dedicated tests (`:5276`, `:5841`) and are not modified. This repair adds no ownership-creating message surface.
+`late_message_matrix`: all rows unchanged by this repair; the repair adds no ownership-creating message surface. The complete peer-originated ownership-mutation matrix on the local WebRTC control plane, with its existing test coverage:
+
+| Message | Ownership effect | Owner tag | Rejection after terminal PeerClosed | Race sweep / replacement protection |
+| --- | --- | --- | --- | --- |
+| `SubscribeEntities` | Creates an entity-subscription row and increments `live_entity_subscriptions` | `grant_id` on the `ControlMessage` | Liveness check against `has_live_peer`; typed `OperatorError` code `local_webrtc_peer_gone`; no row created (`local_webrtc_late_subscribe_entities_after_peer_closed_does_not_recreate_state`, `:5276`, adverse queue order: closed first, message second) | Subscribe-first queue order: `PeerClosed` sweeps the row by owner grant (`local_webrtc_subscribe_before_peer_closed_is_swept_by_owner_grant`, `:5743`); delayed `PeerClosed` snapshot must not remove a replacement owner's reused id (`local_webrtc_stale_peer_snapshot_does_not_remove_replacement_subscription_owner`, `:5625`) |
+| `UnsubscribeEntities` | Deletes a subscription row and decrements counters (ownership mutation) | `grant_id` | Owner-checked cleanup: late Unsubscribe from dead peer A preserves live peer B's row and counters under a reused subscription id (`local_webrtc_late_unsubscribe_does_not_delete_replacement_owner_row`, `:5971`) | Same test covers the reused-id race; sweep for A's own row happens at A's `PeerClosed` (`:5971` asserts the pre-reuse sweep) |
+| `Attach` | Creates terminal attach route ownership and lifecycle counts | `grant_id` | Late Attach after `PeerClosed` does not recreate daemon state (`local_webrtc_late_attach_after_peer_closed_does_not_recreate_state`, `:5841`) | Stale peer attach snapshot must not detach a replacement attach owner (`local_webrtc_stale_peer_attach_snapshot_does_not_detach_replacement_owner`, `:6184`) |
+| `Request` / `DaemonRequest::Spawn` | Creates a durable session worker (survives the peer) | `grant_id` plus derived `client_id` | Typed `OperatorError` code `local_webrtc_peer_gone`; no session lifecycle row created (`local_webrtc_late_spawn_after_peer_closed_does_not_create_session`, `:5916`) | Worker reaping on post-Spawn failure is covered by the panic-safe cleanup harness (`local_webrtc_spawned_session_is_cleaned_even_if_attach_proof_panics_after_ready`, `:5581`) |
+
+No other peer-originated message class on this control plane creates durable ownership. None of these tests is modified beyond the mechanical oracle conversion at their counter read sites.
 
 `production_path_proof`: preserved. The test keeps driving `inject_peer_connection_state_for_test` -> production `LocalWebrtcHandler::on_connection_state_change` -> `LocalWebrtcPeerClosed` -> `remove_peer` -> `park_runtime_if_idle`. The worker-join oracle remains live-thread evidence from the runtime builder's `on_thread_start`/`on_thread_stop` hooks -- not a terminal record, per [[terminal webrtc failure records do not prove peer runtime teardown]]. Instance scoping strengthens the recreation assertions: today the `>= 1` asserts (`:5100`, `:5268`, `:5477`, `:6342`) can be satisfied by another test's runtime; after the repair they can only be satisfied by this daemon's runtime.
 
@@ -79,13 +90,13 @@ The mechanism-1 interference channel is proven by code inspection (global static
 
 ## Scope
 
-Repair the worker-join oracle so default-concurrency `--lib` cannot fail `local_webrtc_after_last_peer_cleanup_new_signal_recreates_runtime_and_succeeds` through cross-test counter interference or tight wall-clock patience, while the test keeps proving that last-peer cleanup joins this daemon's dedicated-runtime workers and that a new signal recreates the runtime.
+Repair the worker-join oracle so default-concurrency `--lib` cannot fail `local_webrtc_after_last_peer_cleanup_new_signal_recreates_runtime_and_succeeds` through cross-test counter interference, while the test keeps proving that last-peer cleanup joins this daemon's dedicated-runtime workers and that a new signal recreates the runtime. Deadline tightness is handled only through the evidence-gated contingency in item 3.
 
 All changes are `#[cfg(test)]`-only. Compiled non-test production code stays byte-identical.
 
 1. Replace the process-global `static LOCAL_WEBRTC_WORKER_THREADS` with an instance-scoped counter on `LocalWebrtcTransport`: a `#[cfg(test)] worker_threads: Arc<AtomicUsize>` field (the struct already derives `Default`; `Arc<AtomicUsize>` satisfies it). The `#[cfg(test)]` `on_thread_start`/`on_thread_stop` hooks in `runtime()` clone that `Arc` instead of touching a global.
 2. Convert `dedicated_runtime_worker_threads()` from an associated fn to an instance method reading the instance counter. Update all 8 read sites mechanically to read through `harness.daemon.local_webrtc()`. The named flake root is the behavioral target; the sibling waits (`:5163`, `:5553`, `:6446`) and `>= 1` asserts take the same mechanical conversion because the shared oracle is one surface -- this is one oracle repair, not four test rewrites.
-3. Raise the four worker-join wait deadlines from 2 s to 10 s, matching the module's existing `process_until_peer_closed` patience bound. A longer patience bound does not weaken the proof: a genuine join failure still fails at the deadline.
+3. Keep the four worker-join wait deadlines at 2 s. The proven flake mechanism is counter interference, which instance scoping removes; no instance-local evidence shows this daemon's own worker exit exceeding 2 s, and [[conformance harnesses gate on deterministic invariants not timing]] forbids speculative timing changes. Contingency, evidence-gated: if a 2 s worker-join wait expires during this ticket's acceptance runs with the instance-scoped counter in place, that failure is instance-local evidence; record the exact run output in the Implement report and raise only the site that failed, to no more than the module's proven 10 s `process_until_peer_closed` bound.
 4. Keep `teardown_test_lock` exactly as is. Its close-hang serialization rationale still stands, and shrinking lock coverage is not this ticket's risk to take. Update only its doc comment sentence that claims the worker counter is process-global.
 5. Keep the test name, the production injection path, the peer-map and `has_dedicated_runtime` assertions, and the recreation assertions unchanged.
 6. Add a short comment on the counter field stating why it is instance-scoped: a process-global counter made `== 0` waits observe other tests' runtimes under default-concurrency lib load.
@@ -118,7 +129,7 @@ Same-target siblings (do not absorb):
 
 ## Assumptions and unknowns
 
-Assumption: the recorded failure came from one or both named mechanisms. The interference channel is proven by inspection; the deadline-tightness channel matches the sibling flake class and the 2 s vs 10 s asymmetry inside the same tests. The repair removes both, so distinguishing which fired is not required for correctness.
+Assumption: the recorded failure came from mechanism 1 (proven interference channel), possibly compounded by mechanism 2 (unproven deadline tightness). The repair removes mechanism 1 and defines an evidence-gated contingency for mechanism 2 in Scope item 3. If the repaired test still times out at 2 s during acceptance runs, that outcome is the missing instance-local evidence and the contingency applies; distinguishing the mechanisms in the original failure record is not required.
 
 Assumption: `Runtime::drop` via `runtime.take()` reliably stops worker threads and fires `on_thread_stop`; only the timing under load is uncertain. The existing green history and the `>= 1`/`== 0` transitions in isolated runs support this.
 
@@ -130,7 +141,7 @@ Unknown: whether an unrelated lib test flakes during acceptance runs. If one doe
 
 ## Affected surfaces/files
 
-- `src/local_webrtc.rs` -- `#[cfg(test)]` items only: the counter static -> instance field, the runtime-builder hooks, `dedicated_runtime_worker_threads`, the 8 read sites, the four wait deadlines, and the `teardown_test_lock` doc comment.
+- `src/local_webrtc.rs` -- `#[cfg(test)]` items only: the counter static -> instance field, the runtime-builder hooks, `dedicated_runtime_worker_threads`, the 8 read sites, and the `teardown_test_lock` doc comment. Wait deadlines change only under the Scope item 3 contingency, with recorded evidence.
 - `docs/plans/fix-flaky-local-webrtc-runtime-recreation-under-default-concurrency-lib-suite.md` -- this plan.
 - `docs/reports/fix-flaky-local-webrtc-runtime-recreation-under-default-concurrency-lib-suite-implement.md` -- Implement report (Implement step).
 
@@ -139,7 +150,7 @@ No compiled production code changes. No dependency or lockfile changes.
 ## Risks
 
 - Instance scoping removes the only oracle that could catch a cross-daemon worker-thread leak (a runtime leaked by an unrelated test would no longer fail this wait). Mitigation: that global property was never this test's contract, it is exactly the coupling that flakes, and each test still fully audits its own daemon's workers.
-- A 10 s patience bound under extreme ambient load could still expire. Mitigation: 10 s matches the module's proven `process_until_peer_closed` bound; a residual expiry would be honest evidence of a real join stall and belongs in a new ticket with its trace.
+- The unchanged 2 s deadline could still expire under extreme load if worker exit is genuinely slow (mechanism 2). Mitigation: Scope item 3's contingency converts any such expiry during acceptance runs into recorded instance-local evidence and a site-limited raise; a post-merge expiry would carry its own trace and belongs in a new ticket.
 - The `Arc` clone into `on_thread_start`/`on_thread_stop` closures must not keep the transport alive; it holds only the counter, so no ownership cycle exists. Clippy `-D warnings` gates the wiring.
 - The lib suite may flake on an unrelated test during acceptance runs. Follow the prior-art rule: exact evidence and a new ticket; do not absorb.
 - Remaining predictable flake inventory for the orchestrator's sweep ticket: the three wall-clock sites in `src/daemon_entity_subscriptions.rs` (already recorded in the vault note); any future `== 0`-style global-state predicates should be caught by the capture below.
@@ -154,8 +165,10 @@ All commands run in the ticket worktree at default concurrency unless stated. Al
 4. Binding default-concurrency gate: `./test.sh --locked --lib` (full workspace lib suites, default test threads) passes 5 consecutive runs with zero failures.
 5. Ablation red-proof, per [[a regression test must be shown to go red with the fix reverted]], both under the targeted wrapper command, both reverted afterward:
    - Control A (join-wait liveness): comment out the `on_thread_stop` decrement. The `== 0` wait must time out and the run must fail with `timed out waiting for first dedicated runtime workers to join`. This proves the wait is a live oracle over the thread hooks.
-   - Control B (interference demonstration / instance isolation): inside the test, temporarily construct a second `PeerHarness` with one signaled live peer before the first harness's cleanup wait. The first daemon's instance counter must still reach 0 (run passes), and a scratch assertion must show the second daemon's instance counter `>= 1` at that moment. Record that under the old global counter this exact configuration holds the summed counter above zero for the whole window -- the deterministic reproduction of mechanism 1. Then revert.
-   Record both outcomes (exit codes, failure text for A) in the Implement report.
+   - Control B (interference red-on-revert): build one temporary two-harness fixture: the first `PeerHarness` runs the last-peer cleanup and its worker-join wait while a second `PeerHarness` holds one signaled live peer through that whole wait window. Run the fixture twice under the targeted wrapper command:
+     - Red row (fix reverted): with the worker-join oracle reading the old process-global counter (revert the instance-scoping change for this run, or point the fixture's wait at a temporarily restored global counter). Required result: nonzero exit with the `timed out waiting for first dedicated runtime workers to join` failure text -- the deterministic reproduction of mechanism 1.
+     - Green row (fix applied): with the instance-scoped oracle. Required result: exit 0, and a scratch assertion shows the second daemon's instance counter is `>= 1` during the first daemon's wait window.
+   Record all exit codes and the red-row failure text for A and B in the Implement report, then revert both fixtures and any temporary global-counter restoration.
 6. Strict Rust gates, exact commands: `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --locked -- -D warnings` both pass (clippy compiles the `cfg(test)` changes).
 7. Non-binding smoke: one full `./test.sh --locked` run may be reported for information. Its lifecycle-suite outcome does not bind this ticket; `ticket_1786937228_425608` owns that root.
 8. Implement report at `docs/reports/fix-flaky-local-webrtc-runtime-recreation-under-default-concurrency-lib-suite-implement.md` records: the enumerated unlocked counter-mutator test list, pre-change reproduction attempts, the oracle change, red-proof output, and acceptance run tallies.
