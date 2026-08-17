@@ -5,6 +5,8 @@ Run: `run_1786926789_708317`
 Pipeline: Botster Stack Delivery (`botster_stack_delivery`)
 Step: Plan (`botster_stack_plan`)
 
+Revision 2. This revision addresses Plan Review `review_1786927857_391209`: acceptance commands now use the Hub `./test.sh` wrapper with the `botster-session-worker` prebuild and exact strict gates, and the plan records the duplicate ticket `ticket_1786919220_649402` disposition and preserves its failure evidence.
+
 The write-budget sibling continuation (`ticket_1786913892_208903`) hit one lib-suite failure after integrating Hub main `a55f62d`. The failed test was `daemon_transport::daemon_entity_subscriptions::tests::near_limit_snapshot_assembly_stays_within_owner_turn`. The panic was `assertion failed: started.elapsed() < Duration::from_millis(crate::MAX_OWNER_TURN_MS)` at `src/daemon_entity_subscriptions.rs:3033`. The same test passed in isolation on the branch and on base `origin/main` `a55f62d`. This ticket repairs or quarantines that default-concurrency root on botster-hub.
 
 ## Target repository and target_id
@@ -38,6 +40,22 @@ The write-budget sibling continuation (`ticket_1786913892_208903`) hit one lib-s
   - `a1c0e5a` + `a55f62d` -- the merged repair idiom: drive the production assembler with `Duration::MAX` so elapsed time cannot cut a page, bound the page loop with a named constant, assert `page.items > 0`, and assert only deterministic outcomes.
   - `docs/reports/fix-flaky-separators-close-under-default-concurrency-lib-suite-implement.md` -- implement-report destination convention.
 - Code read: `near_limit_snapshot_assembly_stays_within_owner_turn` (`src/daemon_entity_subscriptions.rs:2979-3055`), `take_snapshot_item_page` (`:1065`), `continue_session_snapshot_assembly` (`:1117`), constants `SESSION_DELIVERY_MAX_ITEMS = 16`, `SESSION_DELIVERY_MAX_BYTES = 64 KiB`, `SESSION_DELIVERY_MAX_ELAPSED = 8 ms`, `MAX_OWNER_TURN_MS = 25`, `MAX_READY_OPERATION_WAIT_MS = 50`, `DAEMON_MAX_FRAME_BYTES = 1 MiB`.
+- `test.sh` -- the repo test wrapper. It checks hub-test-support asset sync, sets `BOTSTER_ENV=test`, and runs `cargo test --workspace`. Workspace scope is load-bearing; bare `cargo test` runs only the root crate.
+- Duplicate ticket `ticket_1786919220_649402` (closed) and the operator answer to `question_1786927488_804511`; details in the Duplicate ticket disposition section.
+
+## Duplicate ticket disposition
+
+Earlier ticket `ticket_1786919220_649402` ("Hub tests: fix flaky near_limit_snapshot_assembly_stays_within_owner_turn under default-concurrency lib suite") owned the same test and failure class. It was discovered during the separators Implement binding (`ticket_1786916741_161067`).
+
+Operator disposition (`question_1786927488_804511`, answered 2026-08-16): keep `ticket_1786921010_869253` as the authoritative owner because its run is active and `ticket_1786913892_208903` already depends on it. `ticket_1786919220_649402` is closed as a duplicate without merge. This plan and the Implement report must preserve its evidence.
+
+Preserved evidence from `ticket_1786919220_649402`:
+
+- Command: after `cargo build --locked -p botster-core-daemon --bin botster-session-worker`, one default-concurrency `./test.sh --locked --lib` on Hub worktree `project-pipelines/ticket_1786916741_161067`.
+- Suite failure: `near_limit_snapshot_assembly_stays_within_owner_turn`, panic `assertion failed: started.elapsed() < Duration::from_millis(crate::MAX_OWNER_TURN_MS)` at `src/daemon_entity_subscriptions.rs:3033`. Suite result: 349 passed; 2 failed.
+- Isolation of the exact test through the wrapper: `./test.sh --locked --lib near_limit_snapshot_assembly_stays_within_owner_turn` => FAIL (exit 101) on the ticket branch AND on base `origin/main` `c72712e` with the same exact command.
+
+This evidence is stronger than the current ticket's: the failure reproduces even in a filtered single-test wrapper run. Ambient workspace load (concurrent agent builds and tests on the machine), not only intra-suite thread concurrency, can preempt the test thread past the 25 ms wall-clock bound. This confirms the wall-clock assertion is load-sensitive under any load source and cannot be repaired by reducing suite concurrency alone.
 
 ## Failure mechanism
 
@@ -48,7 +66,7 @@ Two load-sensitive couplings exist:
 1. Lines 3033-3034 assert wall-clock `started.elapsed() < 25 ms` and `< 50 ms` around every call. Under default-concurrency `--lib` (352 tests), the scheduler can preempt the test thread inside or after a call. Wall-clock elapsed includes that preemption, so a correct call can exceed 25 ms. This is the observed failure.
 2. The test passes the production 8 ms `SESSION_DELIVERY_MAX_ELAPSED` as the page budget. If the scheduler pauses the thread between `Instant::now()` at `take_snapshot_item_page` entry and the first loop check, the page returns empty with `more = true`. `continue_session_snapshot_assembly` then classifies empty-and-more as `close_oversized_session_snapshot`, and the test's `let else` panics with `near-limit assembly`. This latent path is the same elapsed-empty defect that `a55f62d` removed from the separators test.
 
-Isolated runs pass because an unloaded thread never loses 8 ms or 25 ms to preemption. This is a test coupling defect, not a production regression. Production budgets and paging behavior are correct and stay unchanged.
+Isolated runs pass when the machine is unloaded, because an unloaded thread never loses 8 ms or 25 ms to preemption. The duplicate-ticket evidence shows the converse: under ambient workspace load, even a filtered single-test wrapper run fails on clean `origin/main`. This is a test coupling defect, not a production regression. Production budgets and paging behavior are correct and stay unchanged.
 
 ## Scope
 
@@ -93,6 +111,7 @@ Same-target siblings (do not absorb):
 | `ticket_1786912570_127968` | Production incremental snapshot page accounting | Owns any `take_snapshot_item_page` rewrite. Blocked; do not start here. |
 | `ticket_1786912569_840742` | Bounded fair owner-loop scheduling | Out of scope. |
 | `ticket_1786912572_610381` | Deterministic PTY process lifecycle fixtures | Out of scope. |
+| `ticket_1786919220_649402` | Same test, earlier discovery | Closed as duplicate without merge by operator disposition. Its evidence is preserved in this plan. |
 
 ## Assumptions and unknowns
 
@@ -104,7 +123,7 @@ Assumption: `Duration::MAX` in this unit test does not weaken production. All pr
 
 Assumption: `page.bytes <= SESSION_DELIVERY_MAX_BYTES` holds deterministically, because `take_snapshot_item_page` pops any item whose trial frame encode exceeds `max_bytes`, and `page.bytes` charges item bytes plus separators, which is below the trial encode.
 
-Unknown until Implement: whether default-concurrency `--lib` reproduces the failure on this clean worktree before the change. Reproduction is probabilistic; the Implement report should attempt a bounded number of pre-change runs and must not treat non-reproduction as proof of absence.
+Unknown until Implement: whether the failure reproduces on this worktree before the change. Reproduction is load-dependent and probabilistic; the Implement report should attempt a bounded number of pre-change `./test.sh --locked --lib near_limit_snapshot_assembly_stays_within_owner_turn` runs and must not treat non-reproduction as proof of absence. The duplicate ticket already proved that exact command failed on clean `origin/main` `c72712e` under ambient load, so pre-change reproduction is corroborating, not required.
 
 Unknown: whether the three sibling wall-clock tests flake during the acceptance runs. If one does, register a new ticket for it. Do not expand this repair mid-run.
 
@@ -125,15 +144,15 @@ No production code changes. No dependency or lockfile changes.
 
 ## Acceptance checks/tests
 
-All commands run in the ticket worktree at default concurrency unless stated.
+All commands run in the ticket worktree at default concurrency unless stated. All suite commands use the Hub wrapper `./test.sh`, which checks asset sync, sets `BOTSTER_ENV=test`, and runs workspace scope. Direct `cargo test` invocations do not satisfy these gates.
 
-1. Targeted isolation: `cargo test --offline --locked --lib near_limit_snapshot_assembly_stays_within_owner_turn` passes.
-2. Targeted repetition: the same targeted command passes 20 consecutive runs (shell loop).
-3. Binding default-concurrency gate: `cargo test --locked --lib` (full lib suite, default test threads) passes 5 consecutive runs with zero failures.
-4. Red-proof, per [[a regression test must be shown to go red with the fix reverted]]: temporarily pass `DAEMON_MAX_FRAME_BYTES` as the `max_bytes` argument in the repaired test. The `page.bytes <= SESSION_DELIVERY_MAX_BYTES` (and `page.items` bound) assertions must fail. Revert the sabotage. Record the output in the Implement report.
-5. Strict Rust gates per repository convention (fmt/clippy wrappers as configured by the repo scripts) stay green for the touched file.
-6. Non-binding smoke: one `./test.sh --locked` run may be reported for information. Its lifecycle-suite outcome does not bind this ticket; the write-budget sibling owns that root.
-7. Implement report at `docs/reports/fix-flaky-near-limit-snapshot-assembly-under-default-concurrency-lib-suite-implement.md` records: pre-change reproduction attempts, the repaired assertions, red-proof output, and the acceptance run tallies.
+1. Prebuild precondition (before every suite run set): `cargo build --locked -p botster-core-daemon --bin botster-session-worker`. Review proved the impact: without this build, `./test.sh --locked --lib` produced five worker-missing failures in addition to the target failure; with it, the same suite produced 350 passes and only the target failure.
+2. Targeted repetition: `./test.sh --locked --lib near_limit_snapshot_assembly_stays_within_owner_turn` passes 20 consecutive runs (shell loop). The duplicate ticket proved this exact command failed pre-repair on `origin/main` `c72712e`, so this command is also the preferred pre-change reproduction probe.
+3. Binding default-concurrency gate: `./test.sh --locked --lib` (full workspace lib suites, default test threads) passes 5 consecutive runs with zero failures.
+4. Red-proof, per [[a regression test must be shown to go red with the fix reverted]]: temporarily pass `DAEMON_MAX_FRAME_BYTES` as the `max_bytes` argument in the repaired test. The `page.bytes <= SESSION_DELIVERY_MAX_BYTES` (and `page.items` bound) assertions must fail under `./test.sh --locked --lib near_limit_snapshot_assembly_stays_within_owner_turn`. Revert the sabotage. Record the output in the Implement report.
+5. Strict Rust gates, exact commands: `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --locked -- -D warnings` both pass.
+6. Non-binding smoke: one full `./test.sh --locked` run (no `--lib` filter) may be reported for information. Its lifecycle-suite outcome does not bind this ticket; the write-budget sibling owns that root.
+7. Implement report at `docs/reports/fix-flaky-near-limit-snapshot-assembly-under-default-concurrency-lib-suite-implement.md` records: pre-change reproduction attempts, the repaired assertions, red-proof output, the acceptance run tallies, and the preserved `ticket_1786919220_649402` evidence (filtered wrapper failure on its branch and on `origin/main` `c72712e`).
 
 Downstream proof: not required. No public surface, DTO, pin, or runtime behavior changes; the charter's live-Hub proof classes (admission, supervision, package schema) are untouched.
 
@@ -144,7 +163,9 @@ Downstream proof: not required. No public surface, DTO, pin, or runtime behavior
 
 ## Implement steps
 
-1. Edit the test body per Scope items 1-8. Keep the diff inside the one test function.
-2. Run acceptance checks 1-5. Attempt bounded pre-change reproduction first if cheap (optional, probabilistic).
-3. Write the Implement report with red-proof and run tallies.
-4. Commit test repair and report. Do not create a PR.
+1. Run the prebuild: `cargo build --locked -p botster-core-daemon --bin botster-session-worker`.
+2. Optionally attempt bounded pre-change reproduction with the filtered wrapper command (corroborating only).
+3. Edit the test body per Scope items 1-8. Keep the diff inside the one test function.
+4. Run acceptance checks 2-5.
+5. Write the Implement report with red-proof, run tallies, and the preserved `ticket_1786919220_649402` evidence.
+6. Commit test repair and report. Do not create a PR.
