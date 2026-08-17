@@ -97,8 +97,14 @@ The committed plan now records this binding. No Core `with_test_fail_shutdown_fo
 
 Review submitted `changes_required`. This visit keeps the production Core-error branch that closes victim-session adapters (`src/daemon_transport.rs:3430`). It does not keep adapters open on that path.
 
-1. `finding_1786985857_441627` (high, product): plan `sibling_fail_closed_policy` cited `src/daemon_transport.rs:3406-3408` (Cleanup keep-open) as the Core-error authority. The live test also used one-shot `botster_hub_client::request`, which opens a new Unix connection and cannot prove connection or adapter survival. Fix: state the two-branch policy exactly; reuse one `DaemonConnection` for `ShutdownSession`, `Status`, sibling `SendInput`, sibling `ReadScreen`, and `ListSessions`; `Attach` the sibling before the failing shutdown.
+1. `finding_1786985857_441627` (high, product): plan `sibling_fail_closed_policy` cited `src/daemon_transport.rs:3406-3408` (Cleanup keep-open) as the Core-error authority. The live test also used one-shot `botster_hub_client::request`, which opens a new Unix connection and cannot prove connection or adapter survival. Fix: state the two-branch policy exactly; reuse one `DaemonConnection` for `ShutdownSession`, `Status`, sibling `SendInput`, sibling terminal envelopes, and `ListSessions`; `Attach` the sibling before the failing shutdown.
 2. `finding_1786985857_920982` (medium, process): plan scope intro claimed compiled production code stays byte-identical. That is false because `src/runtime.rs` adds the env-gated drain hook. Fix: replace the claim with default-configuration behavior and budgets unchanged, plus one inert-unless-set test hook.
+
+## Review return (`review_1786986483_508459`)
+
+Review submitted `changes_required` again. `ReadScreen` is a direct host read and does not prove the Attach adapter.
+
+1. `finding_1786986483_906414` (high, product): after the victim `OperatorError`, send a unique sibling marker and assert a terminal envelope for the sibling session and subscription through `connection.take_skipped_terminal`. Drain pre-failure frames first. Keep `ReadScreen` as session-health only. Add a `Detach` ablation that drops occupancy while `ReadScreen` still shows the post-failure marker.
 
 ## Projection-source verification
 
@@ -115,7 +121,7 @@ Review submitted `changes_required`. This visit keeps the production Core-error 
 | Late-message matrix | No new ownership-creating message. Binding stale-peer lib filter (7 passed) keeps the production-handler rejection and sweep proofs. |
 | Production-path proof | The repaired oracle still drives live WebRTC output, owner-loop `exited`, then production `ShutdownSession` -> `classify_shutdown_session` -> `SessionCleanup{already_exited}`. Control A forces `Active` and the test fails with `kind=Events`. The sibling-survival test drives a live `OperatorError` through the production handler. |
 | Ownership identity | Sessions stay keyed by exact `session_id`. The Absent probe uses a never-spawned id. |
-| Sibling / fail-closed | Live proof on one reused `DaemonConnection`: victim Core-error `OperatorError` closes victim adapters (`:3430`) and leaves Status, sibling Attach/`SendInput`/`ReadScreen`, and sibling listing intact. |
+| Sibling / fail-closed | Live proof on one reused unix-adapter `DaemonConnection`: victim Core-error `OperatorError` closes victim adapters (`:3430`) and leaves Status occupancy, sibling `SendInput`, sibling `take_skipped_terminal` envelopes, and sibling listing intact. `ReadScreen` is session-health only. A later `Detach` ablation drops occupancy and the envelope oracle. |
 
 No lens was dropped to informal follow-up.
 
@@ -137,6 +143,7 @@ Tracked `.gitignore` is present and non-empty. The ticket worktree path has no `
 | Check 6 stale-peer: seven named `--lib` tests | 7 passed |
 | Check 6 live failure | 1 passed (compound construction) |
 | Review-return live failure (one `DaemonConnection` + sibling Attach/`ReadScreen`) | 1 passed in 50.52s |
+| Review-return 2 live failure (`take_skipped_terminal` + occupancy + Detach ablation) | 1 passed in 40.77s |
 | Review-return `cargo fmt --all -- --check` | covered by `cargo fmt --all` before the live test |
 | Review-return `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0 |
 | Control A: force `classify_shutdown_session` -> `Active` | exit 101; `got kind=Events error=None` |
