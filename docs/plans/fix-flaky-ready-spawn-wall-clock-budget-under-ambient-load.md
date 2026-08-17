@@ -1,7 +1,7 @@
 # Plan: Fix flaky ready_spawn wall-clock MAX_READY_OPERATION_WAIT_MS budget tests
 
 Ticket: `ticket_1786938984_190098`
-Run: `run_1786939902_746312`
+Run: `run_1786944939_873939` (re-attached; first authored under `run_1786939902_746312`, which was cancelled during Plan Review because its run record carried a corrupted target_id)
 Pipeline: Botster Stack Delivery (`botster_stack_delivery`)
 Step: Plan (`botster_stack_plan`)
 
@@ -16,7 +16,7 @@ Both failures reproduce on clean base `origin/main` `547ca38`, in the suite and 
 
 - Target repository: `botster-hub` (`https://github.com/trybotster/botster-hub.git`, confirmed from the ticket worktree `origin` remote and from the prior botster-hub plan that used the same target).
 - target_id: `tgt_7e208a0c76a44980a83b63af976b1f22` (from the ticket record; it is a registered project target).
-- Discrepancy surfaced to the orchestrator: the run record carries `target_id` `tgt_7e208a0c76a449f4ac0c99953a799869`, which is not any registered project target. It looks like a corrupted merge of the ticket target prefix and the `tgt_40abcf71ccf049f4ac0c99953a799869` suffix. The ticket target is authoritative for this plan.
+- Discrepancy resolved: the cancelled run `run_1786939902_746312` carried a corrupted `target_id` (`tgt_7e208a0c76a449f4ac0c99953a799869`, a merge of the ticket target prefix and the `tgt_40abcf71ccf049f4ac0c99953a799869` suffix). The replacement run `run_1786944939_873939` carries the correct `tgt_7e208a0c76a44980a83b63af976b1f22`, which `list_spawn_targets` resolves to `botster-hub` at `trybotster/botster-hub`.
 - Worktree: the pipeline-provided ticket worktree, branch `project-pipelines/ticket_1786938984_190098`, base `547ca38` (clean).
 - The worktree path contains no colon. `CARGO_TARGET_DIR` override is not required.
 - Tracked `.gitignore` is present and non-empty (53 bytes). No restore is required.
