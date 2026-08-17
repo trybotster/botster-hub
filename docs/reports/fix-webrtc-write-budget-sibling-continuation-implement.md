@@ -1,9 +1,9 @@
 # Implement report: Hub tests: fix WebRTC write-budget sibling continuation failure
 
-Ticket: `ticket_1786913892_208903`  
-Run: `run_1786914416_283641`  
-Step: `botster_stack_implement`  
-Status: production repair committed at `6d69028`; granted-slot suite recorded; orchestrator option 3: advance to Review now
+Ticket: `ticket_1786913892_208903`
+Run: `run_1786914416_283641`
+Step: `botster_stack_implement`
+Status: production repair committed at `6d69028`; granted-slot suite recorded; orchestrator option 3: advance to Review now. Review `review_1787005207_243300` returned Implement for report hygiene only.
 
 Human answer `question_1786916746_614820`: commit the focused write-budget repair now; do not waive clean-suite acceptance; park Implement on the separators blocker; after that ticket merges, update from Hub main and run `./test.sh --locked` once; advance to Review only if that suite passes.
 
@@ -21,7 +21,7 @@ Resume `msg_device-2_1787004353_7ccc54`: orchestrator disposition option 3. Adva
 | --- | --- |
 | `target_id` | `tgt_7e208a0c76a44980a83b63af976b1f22` |
 | `target_repository` | `botster-hub` (`trybotster/botster-hub`) |
-| Worktree | `/Users/jasonconigliari/botster-sessions/trybotster-botster-hub-project-pipelines-ticket_1786913892_208903` |
+| Worktree | the pipeline-provided ticket worktree |
 | Base SHA | original `c72712e`; later integrated `a55f62d` then Hub main `547ca3826a4719d1e448e8ae694cafc4c8591747` |
 | Integrate merge | `6d376f3` (`a55f62d`); `fc655ee9f61b351fc8d5289a10e4c5fe49821717` (`547ca38`) |
 | Locked Core SHA | `fc541a59338d0591ba4fb3fa522a030d212d26d0` |
@@ -45,8 +45,18 @@ Resume `msg_device-2_1787004353_7ccc54`: orchestrator disposition option 3. Adva
 - [[suite wide acceptance criteria make every observed test failure in scope]] (plan-scoped: different root becomes a separate blocker)
 - [[live hub proof records distinct hub and locked core binary provenance]]
 - [[Hub bee15e7 builds the session worker from botster-core-daemon]]
+- [[pipeline artifacts should use path neutral worktree references]]
 
 Did not load [[project-pipelines-playbook]]. No Project Pipelines package/plugin paths changed.
+
+## Review return (`review_1787005207_243300`)
+
+Review approved Hub routing and focused runtime behavior. Review required report hygiene before Review admission.
+
+- Finding `finding_1787005207_131757`: replaced personal absolute worktree and Hub-main-checkout paths with path-neutral wording.
+- Finding `finding_1787005207_117422`: removed markdown hard-break trailing spaces so `git diff --check` is clean.
+
+No production code change in this Implement visit. No new suite run. Orchestrator option 3 still applies.
 
 ## Diagnosis
 
@@ -57,7 +67,7 @@ tests/hub_daemon_lifecycle/webrtc_terminal_adapter.rs:947:9
 sibling daemon_terminal_frame must continue: [<only wwb-stall terminal_output frames>]
 ```
 
-Isolated exact test on this worktree before the repair: PASS (11.21s).  
+Isolated exact test on this worktree before the repair: PASS (11.21s).
 Classification: production Hub path. Mux-wide `WebRtcConnectionMux::set_would_block` on `OnBufferedAmountHigh` / `OnBufferedAmountLow` marks every registered handle `WouldBlock`, which can silence a healthy sibling while one stalled generation fills the DataChannel send buffer. Per-handle `Full` retention remains the write-budget pressure signal.
 
 Sequential pressured `flush_webrtc_adapter_frames` was not separately repaired. Host-first flush, send-first bias, and `LOCAL_WEBRTC_PEER_CLOSE_BOUND` were preserved.
@@ -141,7 +151,7 @@ Result: lib suite `351 passed; 1 failed` on `daemon_transport::daemon_entity_sub
 Isolation for that root (`cargo test --offline --locked --lib near_limit_snapshot_assembly_stays_within_owner_turn`):
 
 - Branch after integrate: PASS
-- Base `a55f62d` (`/Users/jasonconigliari/Projects/botster-hub`): PASS
+- Base `a55f62d` (the Hub main checkout): PASS
 
 Binding resume after integrating `547ca38` (one run, no retry):
 
@@ -155,7 +165,7 @@ Result: lib `352 passed; 0 failed`. Lifecycle `218 passed; 1 failed; 1 ignored`.
 Isolation (`cargo test --offline --locked --test hub_daemon_lifecycle_test -- --exact unix_adapter_unbound_printf_stream_attach_completes`):
 
 - Branch after integrate: PASS (2.88s)
-- Base `547ca38` (`/Users/jasonconigliari/Projects/botster-hub`): PASS (2.67s)
+- Base `547ca38` (the Hub main checkout): PASS (2.67s)
 
 Granted-slot binding on HEAD `921d525` (one run, no retry; slot then released):
 
