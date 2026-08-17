@@ -3,11 +3,13 @@
 Ticket: `ticket_1786913892_208903`  
 Run: `run_1786914416_283641`  
 Step: `botster_stack_implement`  
-Status: production repair committed; separators blocker integrated; Implement parked on `ticket_1786921010_869253` until a clean `./test.sh --locked`
+Status: production repair committed; near-limit blocker integrated; Implement parked on `ticket_1786937228_425608` until a clean `./test.sh --locked`
 
 Human answer `question_1786916746_614820`: commit the focused write-budget repair now; do not waive clean-suite acceptance; park Implement on the separators blocker; after that ticket merges, update from Hub main and run `./test.sh --locked` once; advance to Review only if that suite passes.
 
-Resume `msg_device-2_1786920855_84ce4a`: separators blocker merged at `a55f62d`. Integrated that revision. One `./test.sh --locked` after the worker build failed on a different lib-suite root. Did not retry. Did not advance.
+Resume `msg_device-2_1786920855_84ce4a`: separators blocker merged at `a55f62d`. Integrated that revision. One `./test.sh --locked` failed on `near_limit_snapshot_assembly_stays_within_owner_turn`. Did not retry.
+
+Resume `msg_device-2_1786936526_3c77f6`: near-limit blocker merged at `547ca38`. Integrated that revision. One `./test.sh --locked` after the worker build: lib 352/0; named write-budget test PASSED; lifecycle 218/1/1 on `unix_adapter_unbound_printf_stream_attach_completes`. Did not retry. Did not advance.
 
 ## Target repository and target_id
 
@@ -16,8 +18,8 @@ Resume `msg_device-2_1786920855_84ce4a`: separators blocker merged at `a55f62d`.
 | `target_id` | `tgt_7e208a0c76a44980a83b63af976b1f22` |
 | `target_repository` | `botster-hub` (`trybotster/botster-hub`) |
 | Worktree | `/Users/jasonconigliari/botster-sessions/trybotster-botster-hub-project-pipelines-ticket_1786913892_208903` |
-| Base SHA | original `c72712e2606b8abe77e1b91c2a736791036fadd8`; integrated Hub main `a55f62d9ba331c0389bc3a2ec79d5b9ed48c7ea7` |
-| Integrate merge | `6d376f3eef809837c00e39f8b57f1e799a921440` |
+| Base SHA | original `c72712e`; later integrated `a55f62d` then Hub main `547ca3826a4719d1e448e8ae694cafc4c8591747` |
+| Integrate merge | `6d376f3` (`a55f62d`); `fc655ee9f61b351fc8d5289a10e4c5fe49821717` (`547ca38`) |
 | Locked Core SHA | `fc541a59338d0591ba4fb3fa522a030d212d26d0` |
 | Merge policy | direct into `main` after Review/Verify; no PR |
 | Implement commit | `6d69028bd6ec3a3d36f319c82fca58c01ee2d249` |
@@ -83,7 +85,8 @@ Already registered downstream consumers unchanged:
 Same-repo blockers:
 
 - `ticket_1786916741_161067` / `dependency_1786916742_692599` — separators flake; merged at Hub main `a55f62d`
-- `ticket_1786921010_869253` / `dependency_1786921011_357767` — flaky `near_limit_snapshot_assembly_stays_within_owner_turn` under default-concurrency lib suite
+- `ticket_1786921010_869253` / `dependency_1786921011_357767` — near-limit owner-turn flake; merged at Hub main `547ca38`
+- `ticket_1786937228_425608` / `dependency_1786937228_989504` — `unix_adapter_unbound_printf_stream_attach_completes` default-concurrency lifecycle failure
 
 Blocking human question: `question_1786916746_614820` (commit/park vs waive clean-suite for Review). Answer applied. Clean-suite gate is not waived.
 
@@ -132,7 +135,21 @@ Result: lib suite `351 passed; 1 failed` on `daemon_transport::daemon_entity_sub
 Isolation for that root (`cargo test --offline --locked --lib near_limit_snapshot_assembly_stays_within_owner_turn`):
 
 - Branch after integrate: PASS
-- Base `a55f62d` (`/Users/jasonconigliari/Projects/botster-hub`): PASS  
+- Base `a55f62d` (`/Users/jasonconigliari/Projects/botster-hub`): PASS
+
+Binding resume after integrating `547ca38` (one run, no retry):
+
+```
+cargo build --locked -p botster-core-daemon --bin botster-session-worker
+./test.sh --locked
+```
+
+Result: lib `352 passed; 0 failed`. Lifecycle `218 passed; 1 failed; 1 ignored`. Named write-budget test PASSED. Failure: `unix_adapter_unbound_printf_stream_attach_completes` at `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs:752` (`ProcessExited must not shut down the host session`; `uap-session` lifecycle `exited`).
+
+Isolation (`cargo test --offline --locked --test hub_daemon_lifecycle_test -- --exact unix_adapter_unbound_printf_stream_attach_completes`):
+
+- Branch after integrate: PASS (2.88s)
+- Base `547ca38` (`/Users/jasonconigliari/Projects/botster-hub`): PASS (2.67s)  
 
 Production entry point: `apply_data_channel_event` in `src/local_webrtc.rs` on the live `run_data_channel` path. IsolatedHub keep-reading write-budget proof exercises `flush_webrtc_host_events` / `flush_webrtc_adapter_frames` through production peer delivery.
 
@@ -140,8 +157,8 @@ Downstream north-star / snapshot suites are not claimed here.
 
 ## Unverified behavior or residual risk
 
-- Binding default-concurrency full `./test.sh --locked` is not green after integrating `a55f62d` because of `near_limit_snapshot_assembly_stays_within_owner_turn`.
-- Lifecycle suite under default concurrency was not reached after the lib failure.
+- Binding default-concurrency full `./test.sh --locked` is not green after integrating `547ca38` because of `unix_adapter_unbound_printf_stream_attach_completes`.
+- Named write-budget sibling proof passed in that binding lifecycle run.
 - Sequential pressured flush of a closed stall handle was not separately changed; residual sibling delay under sustained high water remains possible but was not the confirmed mux-wide WouldBlock class.
 - Authentic browser/TUI same-session proof remains with north-star after merge.
 
