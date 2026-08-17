@@ -13,11 +13,13 @@
 | Locked Core | `Cargo.lock` pins `botster-core` / `botster-core-daemon` at `fc541a59338d0591ba4fb3fa522a030d212d26d0` |
 | Delivery | direct-merge; no pull request |
 | Class | not runtime-teardown (`teardown_class_applies: false`) |
-| Plan | `docs/plans/fix-flaky-near-limit-snapshot-assembly-under-default-concurrency-lib-suite.md` revision 3 (`ea3ea01`) |
+| Plan | `docs/plans/fix-flaky-near-limit-snapshot-assembly-under-default-concurrency-lib-suite.md` revision 4 (PII path-neutral worktree line) |
 | Session-type eligibility consumer | false |
 | Implement checklist | `checklist_1786934693_689181` (run-scoped; duplicate `checklist_1786934709_687682` skipped after MCP timeout retry) |
 
-Independent routing: `project_pipelines_current_context(run_id=run_1786926789_708317)` and approved plan revision 3 both map `tgt_7e208a0c76a44980a83b63af976b1f22` to `botster-hub`. Work stayed in the ticket worktree.
+Independent routing: `project_pipelines_current_context(run_id=run_1786926789_708317)` and the plan both map `tgt_7e208a0c76a44980a83b63af976b1f22` to `botster-hub`. Work stayed in the ticket worktree.
+
+Review return `review_1786935491_239495` / `finding_1786935491_150462`: the committed plan leaked a personal absolute worktree path. This visit redacts that line to path-neutral wording and re-runs the raw full-diff PII scan with seeded Users-prefix and home-prefix positive controls.
 
 ## Repository playbook and other playbooks/notes applied
 
@@ -40,6 +42,8 @@ Independent routing: `project_pipelines_current_context(run_id=run_1786926789_70
 - [[implementation steps must persist report artifacts for review]]
 - [[pipeline artifacts should use path neutral worktree references]]
 - [[pipeline vault checklists must cite exact resolvable note titles]]
+- [[botster review and verify must scan all committed artifacts for pii]]
+- [[empty gate output is not success without a valid exit status]]
 
 **Not loaded:** [[project-pipelines-playbook]] — Project Pipelines package/plugin paths and workflow-policy implementation are out of scope. [[botster runtime teardown lenses]] — teardown class does not apply. Other repository charters were not loaded.
 
@@ -61,7 +65,7 @@ Feature behavior:
 
 Handoff:
 
-- `docs/plans/fix-flaky-near-limit-snapshot-assembly-under-default-concurrency-lib-suite.md` — already committed as plan revision 3 (`ea3ea01`).
+- `docs/plans/fix-flaky-near-limit-snapshot-assembly-under-default-concurrency-lib-suite.md` — revision 4 redacts the personal absolute worktree path after `finding_1786935491_150462`.
 - `docs/reports/fix-flaky-near-limit-snapshot-assembly-under-default-concurrency-lib-suite-implement.md` — this report.
 
 Merge/rebase cleanup: none.
@@ -118,6 +122,9 @@ Control A never exceeded the item limit. Control B failed first at the item asse
 | `./test.sh --locked --lib` × 5 | 5/5 PASS; each Hub lib crate `351 passed; 0 failed` |
 | `cargo fmt --all -- --check` | exit 0 |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0 |
+| PII positive control: seeded Users-prefix line | matcher exit 0, one hit |
+| PII positive control: seeded home-prefix line | matcher exit 0, one hit |
+| Raw `git diff a55f62d` of this branch's three files, Users-prefix and home-prefix | matcher exit 1 (no matches) after the path-neutral rewrite |
 
 Downstream proof: not required. No public surface, DTO, pin, or runtime behavior changes.
 

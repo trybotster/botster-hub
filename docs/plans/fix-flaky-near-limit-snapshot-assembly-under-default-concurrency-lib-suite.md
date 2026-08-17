@@ -5,7 +5,7 @@ Run: `run_1786926789_708317`
 Pipeline: Botster Stack Delivery (`botster_stack_delivery`)
 Step: Plan (`botster_stack_plan`)
 
-Revision 3. Revision 2 addressed Plan Review `review_1786927857_391209`: acceptance commands now use the Hub `./test.sh` wrapper with the `botster-session-worker` prebuild and exact strict gates, and the plan records the duplicate ticket `ticket_1786919220_649402` disposition and preserves its failure evidence. Revision 3 addresses `review_1786930516_935692`: the per-call work-bound assertions now cover every page including the final `more = false` page, and the red-proof uses two separate negative controls so the item bound and the byte bound each have a proven first-failure site.
+Revision 4. Revision 2 addressed Plan Review `review_1786927857_391209`: acceptance commands now use the Hub `./test.sh` wrapper with the `botster-session-worker` prebuild and exact strict gates, and the plan records the duplicate ticket `ticket_1786919220_649402` disposition and preserves its failure evidence. Revision 3 addresses `review_1786930516_935692`: the per-call work-bound assertions now cover every page including the final `more = false` page, and the red-proof uses two separate negative controls so the item bound and the byte bound each have a proven first-failure site. Revision 4 addresses Review `finding_1786935491_150462`: the worktree line uses path-neutral wording instead of a personal absolute path.
 
 The write-budget sibling continuation (`ticket_1786913892_208903`) hit one lib-suite failure after integrating Hub main `a55f62d`. The failed test was `daemon_transport::daemon_entity_subscriptions::tests::near_limit_snapshot_assembly_stays_within_owner_turn`. The panic was `assertion failed: started.elapsed() < Duration::from_millis(crate::MAX_OWNER_TURN_MS)` at `src/daemon_entity_subscriptions.rs:3033`. The same test passed in isolation on the branch and on base `origin/main` `a55f62d`. This ticket repairs or quarantines that default-concurrency root on botster-hub.
 
@@ -13,7 +13,7 @@ The write-budget sibling continuation (`ticket_1786913892_208903`) hit one lib-s
 
 - Target repository: `botster-hub` (`https://github.com/trybotster/botster-hub.git`, confirmed from the ticket worktree `origin` remote).
 - target_id: `tgt_7e208a0c76a44980a83b63af976b1f22` (from the ticket record; `list_spawn_targets` timed out twice, so the worktree remote is the confirmation path).
-- Worktree: `/Users/jasonconigliari/botster-sessions/trybotster-botster-hub-project-pipelines-ticket_1786921010_869253`, branch `project-pipelines/ticket_1786921010_869253`, base `a55f62d` (clean).
+- Worktree: the pipeline-provided ticket worktree, branch `project-pipelines/ticket_1786921010_869253`, base `a55f62d` (clean).
 - The worktree path contains no colon. `CARGO_TARGET_DIR` override is not required.
 - Tracked `.gitignore` is present and non-empty (53 bytes). No restore is required.
 
