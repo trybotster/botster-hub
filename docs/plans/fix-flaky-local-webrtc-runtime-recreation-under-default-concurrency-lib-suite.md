@@ -1,7 +1,7 @@
 # Plan: Fix flaky local_webrtc_after_last_peer_cleanup_new_signal_recreates_runtime_and_succeeds
 
 Ticket: `ticket_1786919221_923340`
-Run: `run_1786940212_977356`
+Run: `run_1786944941_256532` (supersedes `run_1786940212_977356`, the prior Plan visit that authored this document)
 Pipeline: Botster Stack Delivery (`botster_stack_delivery`)
 Step: Plan (`botster_stack_plan`)
 
@@ -11,8 +11,8 @@ The separators Implement binding (`ticket_1786916741_161067`) hit one lib-suite 
 
 - Target repository: `botster-hub` (`https://github.com/trybotster/botster-hub.git`).
 - target_id: `tgt_7e208a0c76a44980a83b63af976b1f22`, resolved from the ticket record through `list_spawn_targets` to `trybotster/botster-hub`, and confirmed by the ticket worktree `origin` remote.
-- Routing anomaly, recorded for Plan Review: the run record (`run_1786940212_977356`) carries `target_id` `tgt_7e208a0c76a449f4ac0c99953a799869`, which matches no spawn target. The ticket record is the authoritative routing source per the step prompt, and the ticket target resolves cleanly. Planning proceeds against the ticket target.
-- Worktree: the pipeline-provided ticket worktree, branch `project-pipelines/ticket_1786919221_923340`, clean, at `547ca38` = current `origin/main` (the separators and near-limit flake repairs are already merged beneath it).
+- Routing anomaly, resolved: the prior run record (`run_1786940212_977356`) carried `target_id` `tgt_7e208a0c76a449f4ac0c99953a799869`, which matched no spawn target. The current run record (`run_1786944941_256532`) carries the ticket target `tgt_7e208a0c76a44980a83b63af976b1f22`, which `list_spawn_targets` resolves to `trybotster/botster-hub`. Ticket and run now agree.
+- Worktree: the pipeline-provided ticket worktree, branch `project-pipelines/ticket_1786919221_923340`, clean, at `547ca38` = current `origin/main` plus this plan commit (the separators and near-limit flake repairs are already merged beneath it).
 - The worktree path contains no colon. `CARGO_TARGET_DIR` override is not required.
 - Tracked `.gitignore` is present and non-empty (53 bytes). No restore is required.
 
