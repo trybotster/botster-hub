@@ -1,3 +1,87 @@
+fn terminal_envelope_contains_marker(
+    envelope: &botster_hub_client::DaemonUnixTerminalEnvelope,
+    marker: &str,
+) -> bool {
+    let Ok(bytes) = envelope.payload_bytes() else {
+        return false;
+    };
+    if !marker.is_empty()
+        && bytes
+            .windows(marker.len())
+            .any(|window| window == marker.as_bytes())
+    {
+        return true;
+    }
+    let Ok(event) = serde_json::from_slice::<botster_hub_client::DaemonEvent>(&bytes) else {
+        return false;
+    };
+    match event {
+        botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } => {
+            live_output_contains(&payload, marker)
+        }
+        _ => false,
+    }
+}
+
+fn drain_skipped_terminal(
+    connection: &mut botster_hub_client::DaemonConnection,
+    session_id: &str,
+    subscription_id: &str,
+) {
+    let _ = connection
+        .request(&botster_hub_client::DaemonRequest::drain_subscription(
+            session_id,
+            subscription_id,
+        ))
+        .expect("drain sibling terminal adapter");
+    let _ = connection.take_skipped_terminal();
+}
+
+fn wait_for_sibling_terminal_envelope(
+    connection: &mut botster_hub_client::DaemonConnection,
+    session_id: &str,
+    subscription_id: &str,
+    marker: &str,
+) -> botster_hub_client::DaemonUnixTerminalEnvelope {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut seen = Vec::new();
+    while Instant::now() < deadline {
+        let _ = connection
+            .request(&botster_hub_client::DaemonRequest::drain_subscription(
+                session_id,
+                subscription_id,
+            ))
+            .expect("drain sibling terminal adapter");
+        for envelope in connection.take_skipped_terminal() {
+            let matches_route = envelope.session_id == session_id
+                && envelope.subscription_id == subscription_id;
+            let contains = terminal_envelope_contains_marker(&envelope, marker);
+            seen.push((
+                envelope.session_id.clone(),
+                envelope.subscription_id.clone(),
+                contains,
+            ));
+            if matches_route && contains {
+                return envelope;
+            }
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!(
+        "timed out waiting for sibling terminal envelope marker={marker:?} session={session_id} subscription={subscription_id}; seen={seen:?}"
+    )
+}
+
+fn shutdown_failure_occupancy_has_pair(
+    occupancy: &[botster_hub_client::DaemonAttachOccupancy],
+    session_id: &str,
+    subscription_id: &str,
+) -> bool {
+    occupancy.iter().any(|row| {
+        row.session_id == session_id && row.subscription_id == subscription_id
+    })
+}
+
 fn wait_for_read_screen_contains(
     connection: &mut botster_hub_client::DaemonConnection,
     session_id: &str,
@@ -3307,7 +3391,11 @@ fn shutdown_after_observed_exit_returns_session_cleanup() {
 /// (`daemon_transport.rs:3430`). Cleanup-branch keep-open
 /// (`:3406-3408`) is a different path. This test hits the Core-error
 /// branch and proves the same `DaemonConnection` plus the sibling
-/// Attach still work.
+/// Attach route still deliver terminal envelopes.
+///
+/// ReadScreen is session-health only. It does not prove the Attach
+/// adapter. Sibling adapter survival is `take_skipped_terminal` for
+/// the sibling session and subscription, plus Status occupancy.
 ///
 /// Single constructions at Core pin fc541a5:
 /// (a) SIGKILL-then-shutdown returned SessionCleanup after Core observed
@@ -3367,12 +3455,17 @@ fn external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable() {
     .expect("spawn sibling session");
     let mut sibling_cleanup = SessionCleanupGuard::new(&data_dir, "shutdown-failure-sibling");
 
-    let mut connection = botster_hub_client::DaemonConnection::connect(&endpoint)
-        .expect("open one control connection for failure and sibling proof");
+    let sibling_session = "shutdown-failure-sibling";
+    let sibling_subscription = "shutdown-failure-sibling-sub";
+    let mut connection = botster_hub_client::DaemonConnection::connect_with_requirement(
+        &endpoint,
+        &botster_hub_client::DaemonCompatibilityRequirement::for_unix_terminal_adapter(),
+    )
+    .expect("open one unix-adapter control connection for failure and sibling proof");
     let attach = connection
         .request(&botster_hub_client::DaemonRequest::Attach {
-            session_id: "shutdown-failure-sibling".to_string(),
-            subscription_id: "shutdown-failure-sibling-sub".to_string(),
+            session_id: sibling_session.to_string(),
+            subscription_id: sibling_subscription.to_string(),
         })
         .expect("attach sibling before victim shutdown failure");
     assert_eq!(
@@ -3384,7 +3477,7 @@ fn external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable() {
     );
     let resize = connection
         .request(&botster_hub_client::DaemonRequest::Resize {
-            session_id: "shutdown-failure-sibling".to_string(),
+            session_id: sibling_session.to_string(),
             rows: 24,
             cols: 80,
         })
@@ -3396,14 +3489,14 @@ fn external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable() {
         resize.kind,
         resize.error
     );
-    let ready = wait_for_read_screen_contains(&mut connection, "shutdown-failure-sibling", "ready");
+    let ready = wait_for_read_screen_contains(&mut connection, sibling_session, "ready");
     assert!(
         ready.contains("ready"),
-        "sibling adapter must be live before victim shutdown, got {ready:?}"
+        "sibling session must be live before victim shutdown, got {ready:?}"
     );
     let before_input = connection
         .request(&botster_hub_client::DaemonRequest::SendInput {
-            session_id: "shutdown-failure-sibling".to_string(),
+            session_id: sibling_session.to_string(),
             data: "before\r".to_string(),
         })
         .expect("sibling SendInput before victim shutdown failure");
@@ -3414,15 +3507,15 @@ fn external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable() {
         before_input.kind,
         before_input.error
     );
-    let before = wait_for_read_screen_contains(
+    let before_envelope = wait_for_sibling_terminal_envelope(
         &mut connection,
-        "shutdown-failure-sibling",
+        sibling_session,
+        sibling_subscription,
         "echo:before",
     );
-    assert!(
-        before.contains("echo:before"),
-        "sibling echo must work before victim shutdown, got {before:?}"
-    );
+    assert_eq!(before_envelope.session_id, sibling_session);
+    assert_eq!(before_envelope.subscription_id, sibling_subscription);
+    drain_skipped_terminal(&mut connection, sibling_session, sibling_subscription);
 
     for worker in &victim_workers {
         let result = unsafe { libc::kill(worker.pid as libc::pid_t, libc::SIGKILL) };
@@ -3463,11 +3556,20 @@ fn external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable() {
         "same control connection Status must survive victim ShutdownSession failure, got {:?}",
         status.kind
     );
+    let occupancy = &status
+        .status
+        .as_ref()
+        .expect("status body after victim shutdown failure")
+        .live_attach_occupancy;
+    assert!(
+        shutdown_failure_occupancy_has_pair(occupancy, sibling_session, sibling_subscription),
+        "sibling attach occupancy must survive victim ShutdownSession failure, occupancy={occupancy:?}"
+    );
 
     let sibling_input = connection
         .request(&botster_hub_client::DaemonRequest::SendInput {
-            session_id: "shutdown-failure-sibling".to_string(),
-            data: "ping\r".to_string(),
+            session_id: sibling_session.to_string(),
+            data: "adapter-alive\r".to_string(),
         })
         .expect("sibling SendInput after victim shutdown failure");
     assert_eq!(
@@ -3477,14 +3579,22 @@ fn external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable() {
         sibling_input.kind,
         sibling_input.error
     );
+    let alive_envelope = wait_for_sibling_terminal_envelope(
+        &mut connection,
+        sibling_session,
+        sibling_subscription,
+        "echo:adapter-alive",
+    );
+    assert_eq!(alive_envelope.session_id, sibling_session);
+    assert_eq!(alive_envelope.subscription_id, sibling_subscription);
     let observed = wait_for_read_screen_contains(
         &mut connection,
-        "shutdown-failure-sibling",
-        "echo:ping",
+        sibling_session,
+        "echo:adapter-alive",
     );
     assert!(
-        observed.contains("echo:ping"),
-        "sibling attached ReadScreen must survive victim ShutdownSession failure, got {observed:?}"
+        observed.contains("echo:adapter-alive"),
+        "sibling ReadScreen is session-health only and must still show the marker, got {observed:?}"
     );
 
     let listed = connection
@@ -3492,10 +3602,47 @@ fn external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable() {
         .expect("list sessions after victim shutdown failure");
     assert!(
         listed.sessions.iter().any(|session| {
-            session.session_id == "shutdown-failure-sibling" && session.lifecycle == "running"
+            session.session_id == sibling_session && session.lifecycle == "running"
         }),
         "sibling must remain listed and running, sessions={:?}",
         listed.sessions
+    );
+
+    let detach = connection
+        .request(&botster_hub_client::DaemonRequest::Detach {
+            session_id: sibling_session.to_string(),
+            subscription_id: sibling_subscription.to_string(),
+        })
+        .expect("detach sibling adapter for ablation");
+    assert_eq!(
+        detach.kind,
+        botster_hub_client::DaemonResponseKind::Events,
+        "sibling Detach ablation must succeed, got kind={:?} error={:?}",
+        detach.kind,
+        detach.error
+    );
+    drain_skipped_terminal(&mut connection, sibling_session, sibling_subscription);
+    let after_detach_status = connection
+        .request(&botster_hub_client::DaemonRequest::Status)
+        .expect("status after sibling Detach ablation");
+    let after_detach_occupancy = &after_detach_status
+        .status
+        .as_ref()
+        .expect("status body after sibling Detach")
+        .live_attach_occupancy;
+    assert!(
+        !shutdown_failure_occupancy_has_pair(
+            after_detach_occupancy,
+            sibling_session,
+            sibling_subscription
+        ),
+        "Detach ablation must drop sibling occupancy, occupancy={after_detach_occupancy:?}"
+    );
+    let after_detach_screen =
+        wait_for_read_screen_contains(&mut connection, sibling_session, "echo:adapter-alive");
+    assert!(
+        after_detach_screen.contains("echo:adapter-alive"),
+        "ReadScreen must remain session-health after Detach, got {after_detach_screen:?}"
     );
 
     drop(victim_cleanup);
