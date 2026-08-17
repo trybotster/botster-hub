@@ -3,13 +3,15 @@
 Ticket: `ticket_1786913892_208903`  
 Run: `run_1786914416_283641`  
 Step: `botster_stack_implement`  
-Status: production repair committed; near-limit blocker integrated; Implement parked on `ticket_1786937228_425608` until a clean `./test.sh --locked`
+Status: production repair committed; granted-slot `./test.sh --locked` finished unclean; slot released; Review not requested
 
 Human answer `question_1786916746_614820`: commit the focused write-budget repair now; do not waive clean-suite acceptance; park Implement on the separators blocker; after that ticket merges, update from Hub main and run `./test.sh --locked` once; advance to Review only if that suite passes.
 
 Resume `msg_device-2_1786920855_84ce4a`: separators blocker merged at `a55f62d`. Integrated that revision. One `./test.sh --locked` failed on `near_limit_snapshot_assembly_stays_within_owner_turn`. Did not retry.
 
 Resume `msg_device-2_1786936526_3c77f6`: near-limit blocker merged at `547ca38`. Integrated that revision. One `./test.sh --locked` after the worker build: lib 352/0; named write-budget test PASSED; lifecycle 218/1/1 on `unix_adapter_unbound_printf_stream_attach_completes`. Did not retry. Did not advance.
+
+Resume `msg_device-2_1787003545_653fe5`: orchestrator granted the only default-concurrency full-suite slot. Ran the planned one `./test.sh --locked` on HEAD `921d525` after the worker build. Did not retry. Did not create serial dependencies. Slot released after the command finished.
 
 ## Target repository and target_id
 
@@ -149,7 +151,20 @@ Result: lib `352 passed; 0 failed`. Lifecycle `218 passed; 1 failed; 1 ignored`.
 Isolation (`cargo test --offline --locked --test hub_daemon_lifecycle_test -- --exact unix_adapter_unbound_printf_stream_attach_completes`):
 
 - Branch after integrate: PASS (2.88s)
-- Base `547ca38` (`/Users/jasonconigliari/Projects/botster-hub`): PASS (2.67s)  
+- Base `547ca38` (`/Users/jasonconigliari/Projects/botster-hub`): PASS (2.67s)
+
+Granted-slot binding on HEAD `921d525` (one run, no retry; slot then released):
+
+```
+cargo build --locked -p botster-core-daemon --bin botster-session-worker
+./test.sh --locked
+```
+
+Result: lib `352 passed; 0 failed`. Lifecycle `216 passed; 3 failed; 1 ignored`. `SUITE_EXIT=101`. Named write-budget test PASSED. Failures recorded on existing or new owner tickets, with no serial dependency from this write-budget ticket:
+
+- `ready_spawn_stays_within_budget_during_session_snapshot_assembly` — `sessions.rs:3634` waited 57.421125ms. Owner `ticket_1786938984_190098`.
+- `ready_spawn_stays_within_budget_when_live_sessions_exceed_one_observe_slice` — `sessions.rs:3587` waited 52.535125ms. Owner `ticket_1786938984_190098`.
+- `unix_shutdown_session_from_another_connection_classifies_attached_exit` — `unix_terminal_adapter.rs:1736` `ShutdownSession` kind was `OperatorError`. Owner `ticket_1787004132_469467` (no write-budget dependency).
 
 Production entry point: `apply_data_channel_event` in `src/local_webrtc.rs` on the live `run_data_channel` path. IsolatedHub keep-reading write-budget proof exercises `flush_webrtc_host_events` / `flush_webrtc_adapter_frames` through production peer delivery.
 
@@ -157,8 +172,8 @@ Downstream north-star / snapshot suites are not claimed here.
 
 ## Unverified behavior or residual risk
 
-- Binding default-concurrency full `./test.sh --locked` is not green after integrating `547ca38` because of `unix_adapter_unbound_printf_stream_attach_completes`.
-- Named write-budget sibling proof passed in that binding lifecycle run.
+- Granted-slot `./test.sh --locked` is not green. Named write-budget proof passed. Remaining failures are recorded on other owner tickets, not as serial blockers of this ticket.
+- Final integration remains the zero-failure gate when the orchestrator grants another slot after those owners land.
 - Sequential pressured flush of a closed stall handle was not separately changed; residual sibling delay under sustained high water remains possible but was not the confirmed mux-wide WouldBlock class.
 - Authentic browser/TUI same-session proof remains with north-star after merge.
 
