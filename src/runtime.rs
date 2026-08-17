@@ -4436,6 +4436,16 @@ fn core_daemon_config(config: &HubConfig) -> CoreDaemonConfig {
     {
         core = core.with_test_worker_egress_capacity(Some(capacity));
     }
+    if let Ok(session_id) = std::env::var("BOTSTER_HUB_TEST_FAIL_RUNTIME_DRAIN_FOR")
+        && !session_id.is_empty()
+    {
+        core = core.with_test_fail_runtime_drain_for(Some(SessionId(session_id)));
+        if let Ok(message) = std::env::var("BOTSTER_HUB_TEST_FAIL_RUNTIME_DRAIN_MESSAGE")
+            && !message.is_empty()
+        {
+            core = core.with_test_fail_runtime_drain_message(Some(message));
+        }
+    }
     if std::env::var("BOTSTER_HUB_TEST_FAIL_SNAPSHOT_HISTORY_AFTER_READY").as_deref() == Ok("1") {
         core = core.with_test_fail_snapshot_history_after_ready(true);
     }
