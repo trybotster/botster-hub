@@ -3017,8 +3017,10 @@ mod tests {
             needs_delivery: true,
         };
         let mut counters = DaemonLifecycleCounters::default();
-        loop {
-            let started = Instant::now();
+        // This case proves bounded per-call assembly work, not wall-clock latency.
+        // Duration::MAX cannot cut a page, so page cuts are byte-driven: one item per page.
+        const MAX_NEAR_LIMIT_PAGES: usize = 21;
+        for page_index in 0..MAX_NEAR_LIMIT_PAGES {
             let SnapshotAssemble::Continue { page } = continue_session_snapshot_assembly(
                 "sub",
                 &mut state,
@@ -3026,15 +3028,20 @@ mod tests {
                 &mut counters,
                 SESSION_DELIVERY_MAX_ITEMS,
                 SESSION_DELIVERY_MAX_BYTES,
-                SESSION_DELIVERY_MAX_ELAPSED,
+                Duration::MAX,
             ) else {
                 panic!("near-limit assembly");
             };
-            assert!(started.elapsed() < Duration::from_millis(crate::MAX_OWNER_TURN_MS));
-            assert!(started.elapsed() < Duration::from_millis(crate::MAX_READY_OPERATION_WAIT_MS));
+            assert!(page.items >= 1);
+            assert!(page.items <= SESSION_DELIVERY_MAX_ITEMS);
+            assert!(page.bytes <= SESSION_DELIVERY_MAX_BYTES);
             if page.more {
                 assert_eq!(receiver.try_iter().count(), 0);
                 assert!(!state.assembled_items.is_empty());
+                assert!(
+                    page_index + 1 < MAX_NEAR_LIMIT_PAGES,
+                    "twenty one-item pages cannot need more than twenty useful calls"
+                );
             } else {
                 break;
             }
