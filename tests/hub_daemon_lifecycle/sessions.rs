@@ -3300,6 +3300,141 @@ fn shutdown_after_observed_exit_returns_session_cleanup() {
     shutdown_cli_daemon(&data_dir, child);
 }
 
+/// Live ShutdownSession Runtime/State failure must not sacrifice the daemon,
+/// the control connection, or a sibling session.
+///
+/// Single constructions at Core pin fc541a5:
+/// (a) SIGKILL-then-shutdown returned SessionCleanup after Core observed
+/// ProcessExited. (b) drain injection plus egress capacity 1 returned
+/// Events after Core shutdown completed. Compound: drain injection makes
+/// classify fall through, then SIGKILL makes the live Core shutdown fail.
+#[test]
+fn external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("shutdown-failure-sibling");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("test config has local socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon_with_runtime_drain_failure(
+        &data_dir,
+        "shutdown-failure-victim",
+        None,
+    );
+    let before_pids: std::collections::BTreeSet<u32> = session_worker_process_identities()
+        .expect("baseline worker census must succeed")
+        .into_iter()
+        .map(|worker| worker.pid)
+        .collect();
+
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: "shutdown-failure-victim".to_string(),
+            command: "sleep 3600".to_string(),
+        },
+    )
+    .expect("spawn victim session");
+    let victim_cleanup = SessionCleanupGuard::new(&data_dir, "shutdown-failure-victim");
+    let victim_workers = capture_new_session_workers_for_data_dir(&data_dir, &before_pids)
+        .expect("must capture victim botster-session-worker after Spawn");
+    assert!(
+        !victim_workers.is_empty(),
+        "must capture live victim worker before SIGKILL"
+    );
+
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: "shutdown-failure-sibling".to_string(),
+            command:
+                "printf ready; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done"
+                    .to_string(),
+        },
+    )
+    .expect("spawn sibling session");
+    let mut sibling_cleanup = SessionCleanupGuard::new(&data_dir, "shutdown-failure-sibling");
+
+    for worker in &victim_workers {
+        let result = unsafe { libc::kill(worker.pid as libc::pid_t, libc::SIGKILL) };
+        assert_eq!(
+            result, 0,
+            "SIGKILL victim worker pid={} errno={}",
+            worker.pid,
+            std::io::Error::last_os_error()
+        );
+    }
+
+    let shutdown = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::ShutdownSession {
+            session_id: "shutdown-failure-victim".to_string(),
+        },
+    )
+    .expect("shutdown killed victim through production handler");
+    assert_eq!(
+        shutdown.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError,
+        "compound drain-inject plus SIGKILL ShutdownSession must return OperatorError, got kind={:?} error={:?} cleanup={:?}",
+        shutdown.kind,
+        shutdown.error,
+        shutdown.cleanup
+    );
+    let error = shutdown.error.as_ref().expect("shutdown operator error body");
+    assert!(
+        error.code == "runtime_error" || error.code == "state_error",
+        "live ShutdownSession failure must keep runtime_error or state_error, got {error:?}"
+    );
+    assert_eq!(error.operation, "shutdown");
+
+    let status = botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+        .expect("status after victim shutdown failure");
+    assert_eq!(
+        status.kind,
+        botster_hub_client::DaemonResponseKind::Status,
+        "daemon Status must survive victim ShutdownSession failure, got {:?}",
+        status.kind
+    );
+
+    let sibling_input = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::SendInput {
+            session_id: "shutdown-failure-sibling".to_string(),
+            data: "ping\r".to_string(),
+        },
+    )
+    .expect("sibling SendInput after victim shutdown failure");
+    assert_eq!(
+        sibling_input.kind,
+        botster_hub_client::DaemonResponseKind::Events,
+        "sibling SendInput must succeed after victim ShutdownSession failure, got kind={:?} error={:?}",
+        sibling_input.kind,
+        sibling_input.error
+    );
+
+    let listed =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::ListSessions)
+            .expect("list sessions after victim shutdown failure");
+    assert!(
+        listed.sessions.iter().any(|session| {
+            session.session_id == "shutdown-failure-sibling" && session.lifecycle == "running"
+        }),
+        "sibling must remain listed and running, sessions={:?}",
+        listed.sessions
+    );
+
+    drop(victim_cleanup);
+    sibling_cleanup.disarm();
+    production_shutdown_and_remove_session(&endpoint, "shutdown-failure-sibling");
+    shutdown_cli_daemon(&data_dir, child);
+}
+
 #[test]
 // ReadScreen parks ProcessExited. observe_session_lifecycle must reconcile
 // that row and finish ShutdownSession as SessionCleanup or Events. Live

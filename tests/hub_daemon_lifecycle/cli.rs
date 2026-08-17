@@ -80,6 +80,38 @@ pub(crate) fn start_cli_daemon_with_worker_egress_capacity(
     child
 }
 
+pub(crate) fn start_cli_daemon_with_runtime_drain_failure(
+    data_dir: &Path,
+    session_id: &str,
+    egress_capacity: Option<usize>,
+) -> Child {
+    ensure_session_worker_binary();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    command
+        .arg("start")
+        .arg("--data-dir")
+        .arg(data_dir)
+        .env("BOTSTER_HUB_TEST_FAIL_RUNTIME_DRAIN_FOR", session_id)
+        .env(
+            "BOTSTER_HUB_TEST_FAIL_RUNTIME_DRAIN_MESSAGE",
+            format!("test-injected observe drain failure: {session_id}"),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(capacity) = egress_capacity {
+        command.env(
+            "BOTSTER_HUB_TEST_WORKER_EGRESS_CAPACITY",
+            capacity.to_string(),
+        );
+    }
+    configure_test_process_group(&mut command);
+    let mut child = command
+        .spawn()
+        .expect("spawn botster-hub start with runtime drain failure");
+    wait_for_status(data_dir, &mut child);
+    child
+}
+
 pub(crate) fn start_cli_daemon_with_snapshot_history_failure(data_dir: &Path) -> Child {
     ensure_session_worker_binary();
     let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));

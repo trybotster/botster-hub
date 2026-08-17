@@ -404,9 +404,33 @@ fn external_hub_webrtc_live_output_preserves_exact_bytes() {
         let _ = offer_peer.peer.close().await;
     });
 
-    // Suite-load oracle: after live write(2) output, ShutdownSession must not
-    // report OperatorError. Isolated green is not this proof. ./test.sh --locked
-    // must return Events or SessionCleanup for the exited finite producer.
+    // Suite-load oracle: once ListSessions reports the finite producer exited,
+    // exact-session classification must return SessionCleanup{already_exited}.
+    // Isolated green is not this proof. The blind-call typed-OperatorError
+    // contract is owned by
+    // external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut listed = None;
+    while Instant::now() < deadline {
+        listed =
+            botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::ListSessions)
+                .ok()
+                .and_then(|response| {
+                    response.sessions.iter().find_map(|session| {
+                        (session.session_id == "webrtc-exact-bytes-session")
+                            .then(|| session.lifecycle.clone())
+                    })
+                });
+        if listed.as_deref() == Some("exited") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        listed.as_deref(),
+        Some("exited"),
+        "owner loop must observe natural exit before ShutdownSession, last={listed:?}"
+    );
     let shutdown = botster_hub_client::request(
         &endpoint,
         botster_hub_client::DaemonRequest::ShutdownSession {
@@ -414,15 +438,34 @@ fn external_hub_webrtc_live_output_preserves_exact_bytes() {
         },
     )
     .expect("shutdown webrtc exact-bytes session");
-    assert!(
-        matches!(
-            shutdown.kind,
-            botster_hub_client::DaemonResponseKind::Events
-                | botster_hub_client::DaemonResponseKind::SessionCleanup
-        ),
-        "shutdown should complete the write(2) session, got {:?}",
-        shutdown.kind
+    assert_eq!(
+        shutdown.kind,
+        botster_hub_client::DaemonResponseKind::SessionCleanup,
+        "shutdown after observed exit must return SessionCleanup{{already_exited}}, got kind={:?} error={:?}",
+        shutdown.kind,
+        shutdown.error
     );
+    let cleanup = shutdown.cleanup.expect("cleanup body");
+    assert_eq!(cleanup.session_id, "webrtc-exact-bytes-session");
+    assert_eq!(cleanup.outcome, "already_exited");
+
+    let missing = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::ShutdownSession {
+            session_id: "webrtc-exact-bytes-missing".to_string(),
+        },
+    )
+    .expect("shutdown never-spawned session");
+    assert_eq!(
+        missing.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError,
+        "unknown session must return OperatorError, got kind={:?} error={:?}",
+        missing.kind,
+        missing.error
+    );
+    let error = missing.error.as_ref().expect("unknown_session body");
+    assert_eq!(error.code, "unknown_session");
+    assert_eq!(error.operation, "shutdown");
     hub.shutdown().expect("shutdown isolated hub");
 }
 
