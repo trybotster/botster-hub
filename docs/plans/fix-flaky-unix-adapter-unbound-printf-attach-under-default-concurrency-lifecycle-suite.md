@@ -5,7 +5,7 @@ Run: `run_1786937300_850110`
 Pipeline: Botster Stack Delivery (`botster_stack_delivery`)
 Step: Plan (`botster_stack_plan`)
 
-Revision 2. Revision 2 addresses Plan Review `review_1786938887_392539`: the red base lifecycle gate now has an owner ticket (`ticket_1786938984_190098`) registered as a blocking dependency (`dependency_1786938989_522783`), the acceptance checks sequence the binding suite gate after that dependency lands, and the planning context now records [[botster-architecture]] and [[cli-patterns]].
+Revision 3. Revision 2 addressed Plan Review `review_1786938887_392539`: the red base lifecycle gate received an owner ticket (`ticket_1786938984_190098`) registered as a blocking dependency (`dependency_1786938989_522783`), the acceptance checks sequenced the binding suite gate after that dependency landed, and the planning context added [[botster-architecture]] and [[cli-patterns]]. Revision 3 applies the orchestrator suite-concurrency policy (`msg_device-2_1787003453_936ef9`, 2026-08-17): full lifecycle-suite runs are a serialized command class that needs an explicit orchestrator slot, the ready_spawn failures are known-baseline failures recorded on their owning ticket rather than a serial dependency, and strict zero-failure convergence moves to final integration.
 
 The write-budget sibling continuation (`ticket_1786913892_208903`) hit one lifecycle-suite failure after integrating Hub main `547ca38`. The failed test was `unix_adapter_unbound_printf_stream_attach_completes`. The panic was `ProcessExited must not shut down the host session: [DaemonSession { session_id: "uap-session", lifecycle: "exited" }]` at `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs:752`. The same test passed in isolation on the branch and on base `origin/main` `547ca38`. This ticket repairs that default-concurrency root on botster-hub.
 
@@ -54,7 +54,7 @@ The write-budget sibling continuation (`ticket_1786913892_208903`) hit one lifec
   - Background pump `pump_bound_unix_routes` (`src/daemon_transport.rs:4964+`) also calls `observe_lifecycle_slice`, so observation advances without client requests.
 - `test.sh` -- the repo test wrapper. It checks hub-test-support asset sync, sets `BOTSTER_ENV=test`, and runs workspace scope. Its header comment blesses the targeted form `./test.sh --test hub_daemon_lifecycle_test`. The lifecycle test binary uses `include!`, so the exact test name is the bare function name.
 
-## Blocking dependency: base lifecycle suite is red
+## Known-baseline failures and suite serialization
 
 Plan Review (`review_1786938887_392539`) ran the binding command on fetched base `origin/main` `547ca38` and got exit 101 with 217 passed, 2 failed, 1 ignored. The two failures are unrelated to this ticket's test and reproduce when run alone:
 
@@ -63,14 +63,14 @@ Plan Review (`review_1786938887_392539`) ran the binding command on fetched base
 
 Both assert wall-clock elapsed around one Spawn request `<= MAX_READY_OPERATION_WAIT_MS` (50 ms) through a real CLI daemon child under 24 live sessions. This is the known wall-clock-under-load class ([[wall-clock MAX_OWNER_TURN_MS assertions flake under default-concurrency lib load]]), surfacing under ambient workspace load.
 
-Disposition:
+Disposition (Revision 3, per orchestrator policy `msg_device-2_1787003453_936ef9`):
 
-- Owner ticket created: `ticket_1786938984_190098` ("Hub tests: fix ready_spawn wall-clock MAX_READY_OPERATION_WAIT_MS budget failures under ambient load"), botster-hub target, with the exact base evidence preserved.
-- Blocking dependency registered: `dependency_1786938989_522783` (this ticket depends on `ticket_1786938984_190098`).
-- The five-run binding suite gate stays at full strength. It is not waived and not weakened. It becomes executable after the dependency ticket's repair merges into Hub main and Implement integrates that base into this branch.
-- Engine behavior, observed on this run: `request_step_advance` from Plan returned `status: blocked`, `reason: ticket_dependencies`, with `ticket_1786938984_190098` listed as unmet. The run therefore parks at Plan until the dependency ticket closes; Plan Review sees this revision after the dependency lands and the advance is retried. Because dependency enforcement has differed across engine versions, Implement must still check the dependency ticket status explicitly before running the binding suite gate, and must re-verify the integrated base is green on those two tests first.
-- Resume condition: close `ticket_1786938984_190098` (repair merged into Hub main), then retry the advance of run `run_1786937300_850110` from Plan. Plan work is complete; no plan content change is expected at resume beyond integrating the new base.
-- The targeted acceptance checks (worker prebuild, 20 exact-test runs, red-proof controls, fmt, clippy) do not touch the two red tests and stay executable before the dependency lands.
+- Owner ticket: `ticket_1786938984_190098` ("Hub tests: fix ready_spawn wall-clock MAX_READY_OPERATION_WAIT_MS budget failures under ambient load"), botster-hub target, with the exact base evidence preserved. The two failures are **known-baseline failures** recorded on that owning ticket.
+- The Revision 2 blocking dependency (`dependency_1786938989_522783`) is retired: the orchestrator policy forbids serial ticket dependencies created from suite contamination. The Plan agent's removal call was permission-blocked, so the orchestrator was notified to remove it; the dependency carries no gate meaning in this plan from Revision 3 on.
+- Suite serialization policy: `./test.sh --locked --test hub_daemon_lifecycle_test` without a test filter is a serialized command class. Implement must obtain an explicit orchestrator slot before starting one, must never run one concurrently with another full suite, and must notify the orchestrator if a full suite is already running instead of starting a second.
+- Focused and filtered commands (the exact-test repetition, red-proof controls, fmt, clippy) may run concurrently without a slot.
+- Binding gate accounting: within an orchestrator slot, the suite runs bind on zero failures **excluding** the known-baseline ready_spawn pair. If either ready_spawn test fails during a run, record the occurrence on `ticket_1786938984_190098` and do not count it against this ticket. Any other failure needs exact evidence and a new owner ticket.
+- Strict zero-failure convergence (no exclusions) remains the final-integration gate at the project level, after the ready_spawn owner ticket repairs merge.
 - Do not absorb the ready_spawn repairs into this ticket. One flake ticket per root, per the established project pattern.
 
 ## Failure mechanism
@@ -126,7 +126,7 @@ Same-target siblings (do not absorb):
 | `ticket_1786913892_208903` | WebRTC write-budget sibling continuation | Discovered this flake. Ticket text forbids absorption. |
 | `ticket_1786921010_869253` | near-limit lib-suite flake (merged as `cd5e7a8`) | Same flake class, different suite and test. Prior-art idiom source. |
 | `ticket_1786912572_610381` | Deterministic PTY process lifecycle fixtures | Out of scope; this repair does not change fixtures. |
-| `ticket_1786938984_190098` | ready_spawn wall-clock budget failures on base | Registered blocking dependency (`dependency_1786938989_522783`); gates the binding suite runs. Do not absorb. |
+| `ticket_1786938984_190098` | ready_spawn wall-clock budget failures on base | Owns the known-baseline failures excluded from this ticket's binding suite accounting; the Revision 2 dependency is retired per orchestrator policy. Do not absorb. |
 
 ## Assumptions and unknowns
 
@@ -138,7 +138,7 @@ Assumption: ReadScreen and Drain stay serviceable after exit. The registry row p
 
 Unknown until Implement: whether the failure reproduces on this worktree before the change. Reproduction is load-dependent and probabilistic. The Implement report should attempt a bounded number of pre-change default-concurrency suite runs and must not treat non-reproduction as proof of absence.
 
-Known since Plan Review: the two ready_spawn wall-clock tests fail on base under ambient load. They are owned by dependency `ticket_1786938984_190098`; see the Blocking dependency section. If a further, different lifecycle-suite test flakes during the acceptance runs, register a new ticket with exact evidence. Do not expand this repair mid-run.
+Known since Plan Review: the two ready_spawn wall-clock tests fail on base under ambient load. They are known-baseline failures owned by `ticket_1786938984_190098`; see the Known-baseline failures section. If a further, different lifecycle-suite test flakes during the acceptance runs, register a new ticket with exact evidence. Do not expand this repair mid-run.
 
 ## Affected surfaces/files
 
@@ -152,7 +152,8 @@ No production code changes. No dependency or lockfile changes.
 
 - Requiring eventual `exited` adds a new wait. Mitigation: the poll drives observation itself through ReadScreen on every iteration, so convergence does not depend on background pump timing; the 5-second deadline matches the file's existing waits.
 - The original oracle also guarded against premature teardown while the test believed the session was running. Mitigation: the new poll asserts row presence on every iteration from marker-visibility until `exited`, so retention coverage is continuous and strictly stronger than the old single probe.
-- The lifecycle suite is currently red on base through the two ready_spawn tests; the binding gate waits on dependency `ticket_1786938984_190098`. If the dependency stalls, this ticket stalls with it; escalate through the orchestrator rather than weakening the gate. A further unrelated flake during acceptance runs follows the prior-art rule: exact evidence or a new ticket; do not absorb.
+- The lifecycle suite is red on base through the two known-baseline ready_spawn tests. The binding gate excludes exactly that owned pair and nothing else; the exclusion ends when the ready_spawn repairs merge, and final integration stays strict zero-failure. A further unrelated flake during acceptance runs follows the prior-art rule: exact evidence or a new ticket; do not absorb.
+- Full-suite runs depend on orchestrator slot scheduling; if no slot is available, Implement reports the wait instead of running unslotted suites or weakening the gate.
 - The lib suite retains three known wall-clock assertion sites (`paged_delivery_stays_within_owner_turn_for_a_large_registry`, `first_session_snapshot_is_complete_and_assembled_in_pages`, `no_removal_scan_stays_within_owner_turn` in `src/daemon_entity_subscriptions.rs`). A full `./test.sh --locked` run can flake there. Those roots belong to the sweep recommendation recorded by the near-limit plan, not to this ticket.
 
 ## Acceptance checks/tests
@@ -161,13 +162,13 @@ All commands run in the ticket worktree at default concurrency. All suite comman
 
 1. Prebuild precondition (before every suite run set): `cargo build --locked -p botster-core-daemon --bin botster-session-worker`. The near-limit review proved suite runs without this build produce worker-missing failures.
 2. Targeted repetition: `./test.sh --locked --test hub_daemon_lifecycle_test -- --exact unix_adapter_unbound_printf_stream_attach_completes` passes 20 consecutive runs (shell loop, nonzero exit stops the loop).
-3. Binding default-concurrency gate: `./test.sh --locked --test hub_daemon_lifecycle_test` (full lifecycle binary, default test threads) passes 5 consecutive runs with zero failures. The pre-existing 1 ignored test stays ignored. Preconditions, per the Blocking dependency section: `ticket_1786938984_190098` is closed with its repair merged into Hub main, Implement has integrated that base into this branch, and one base re-verification shows the two ready_spawn tests green before the five binding runs start.
+3. Binding default-concurrency gate: `./test.sh --locked --test hub_daemon_lifecycle_test` (full lifecycle binary, default test threads) passes 5 consecutive runs with zero failures excluding the known-baseline ready_spawn pair owned by `ticket_1786938984_190098`. The pre-existing 1 ignored test stays ignored. Preconditions, per the known-baseline section: an explicit orchestrator slot for each full-suite run set, runs strictly serialized, and any ready_spawn occurrence recorded on the owning ticket. This ticket's target test must pass in all 5 runs. If the ready_spawn repairs have already merged by Implement time, integrate that base and bind on strict zero failures instead.
 4. Red-proof, per [[a regression test must be shown to go red with the fix reverted]], with two separate negative controls, both run under the targeted command from check 2:
    - Control A (retention oracle): temporarily insert `ShutdownSession` plus `RemoveSession` for `uap-session` before the poll. The run must fail at the retention panic (`ProcessExited must not shut down the host session`). This proves the row-presence assertion is live.
    - Control B (eventual-exit oracle): temporarily change the spawn command to `printf 'smoke:<marker>\n'; sleep 30`. The marker still prints, the process stays alive, and the run must fail at the deadline panic (session must reach `exited`). This proves the exit-observation assertion is live and gives a first-failure site distinct from Control A.
    Record both nonzero exit codes and both failure sites in the Implement report, then revert both sabotages.
 5. Strict Rust gates, exact commands: `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --locked -- -D warnings` both pass.
-6. Non-binding smoke: one full `./test.sh --locked` run (the ticket's discovery command) may be reported for information. A failure in a known lib-suite wall-clock root does not bind this ticket; any other failure needs exact evidence and a new ticket.
+6. Non-binding smoke: one full `./test.sh --locked` run (the ticket's discovery command) may be reported for information. It contains the full lifecycle suite, so it needs its own orchestrator slot. A failure in a known lib-suite wall-clock root or the known-baseline ready_spawn pair does not bind this ticket; any other failure needs exact evidence and a new ticket.
 7. Implement report at `docs/reports/fix-flaky-unix-adapter-unbound-printf-attach-under-default-concurrency-lifecycle-suite-implement.md` records: pre-change reproduction attempts, the repaired oracle, red-proof output, and the acceptance run tallies.
 
 Downstream proof: not required. No public surface, DTO, pin, or runtime behavior changes; the charter's live-Hub proof classes (admission, supervision, package schema) are untouched.
@@ -182,6 +183,6 @@ Downstream proof: not required. No public surface, DTO, pin, or runtime behavior
 1. Run the prebuild: `cargo build --locked -p botster-core-daemon --bin botster-session-worker`.
 2. Optionally attempt bounded pre-change reproduction with the check-3 suite command (corroborating only).
 3. Edit the test body per Scope items 1-3. Keep the diff inside the one test function.
-4. Run acceptance checks 2, 4, and 5 immediately. Run check 3 (the binding suite gate) only after the Blocking dependency preconditions hold, and check 6 after check 3.
+4. Run acceptance checks 2, 4, and 5 immediately (focused commands, no slot needed). Run check 3 (the binding suite gate) inside an explicit orchestrator slot with the known-baseline accounting, and check 6 after check 3 in a slot of its own.
 5. Write the Implement report with red-proof output and run tallies.
 6. Commit the test repair and report. Do not create a PR.
