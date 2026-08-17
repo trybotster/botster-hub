@@ -9,12 +9,14 @@
 | `target_id` | `tgt_7e208a0c76a44980a83b63af976b1f22` |
 | Authoritative path | ticket `target_id` plus worktree `origin` remote `https://github.com/trybotster/botster-hub.git` |
 | Pipeline worktree | the ticket worktree on `project-pipelines/ticket_1786938984_190098` |
-| Plan commit | `c0f5646` (approved plan v3) |
+| Original approved plan commit | `c0f5646` (v3 product repair) |
+| First v3.1 plan revision | `c550f1c` (focused-gate amendment for acceptance check 4) |
+| This follow-up | aligns Plan Risks and report provenance with `question_1787003911_553236` after `review_1787004220_658926` |
 | Delivery | direct-merge; no pull request |
 | Class | not runtime-teardown (`teardown_class_applies: false`) |
 | Plan | `docs/plans/fix-flaky-ready-spawn-wall-clock-budget-under-ambient-load.md` revision v3.1 |
 | Implement checklist | `checklist_1786943181_130677` (ticket-scoped; no duplicate created) |
-| Run status | focused Implement complete after Review changes_required |
+| Run status | focused Implement complete after `review_1787004220_658926` process finding |
 
 Independent routing: `project_pipelines_get_project` lists `tgt_7e208a0c76a44980a83b63af976b1f22` as a registered project target. The ticket worktree `origin` remote is `trybotster/botster-hub`. Approved plan v3 used the same `target_id` and repository.
 
@@ -70,7 +72,7 @@ Feature behavior:
 
 Handoff:
 
-- `docs/plans/fix-flaky-ready-spawn-wall-clock-budget-under-ambient-load.md` — v3.1 focused-gate acceptance check after `question_1787003911_553236`.
+- `docs/plans/fix-flaky-ready-spawn-wall-clock-budget-under-ambient-load.md` — v3.1 focused-gate acceptance check after `question_1787003911_553236`. Risks and extraction-gate sentences now use that same contract after `finding_1787004220_908321`.
 - `docs/reports/fix-flaky-ready-spawn-wall-clock-budget-under-ambient-load-implement.md` — this report.
 
 Merge/rebase cleanup: none.
