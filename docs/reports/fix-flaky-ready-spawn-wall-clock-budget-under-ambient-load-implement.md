@@ -14,11 +14,11 @@
 | Class | not runtime-teardown (`teardown_class_applies: false`) |
 | Plan | `docs/plans/fix-flaky-ready-spawn-wall-clock-budget-under-ambient-load.md` revision v3 |
 | Implement checklist | `checklist_1786943181_130677` (ticket-scoped; no duplicate created) |
-| Run status | parked pending `ticket_1786977409_499180` |
+| Run status | focused Implement complete; exact-bytes no longer blocks this repair |
 
 Independent routing: `project_pipelines_get_project` lists `tgt_7e208a0c76a44980a83b63af976b1f22` as a registered project target. The ticket worktree `origin` remote is `trybotster/botster-hub`. Approved plan v3 used the same `target_id` and repository.
 
-Advisor answer `question_1786977344_650479`: do not absorb the exact-bytes suite-load failure; continue remaining suite repetitions; create and start a separate Hub ticket; add it as a blocking dependency; commit the ready-spawn repair; park this run while that dependency stays open; do not waive the failed suite run.
+Advisor answer `question_1786977344_650479` first required a blocking sibling and a parked run. Later orchestrator message `msg_device-2_1787003395_86e7b7` flattened that serial edge. Exact-bytes no longer blocks this focused repair. Do not absorb that root. Final integration stays strict and waits for every direct blocker.
 
 ## Repository playbook and other playbooks/notes applied
 
@@ -93,7 +93,7 @@ Same-target siblings, not absorbed:
 
 | Ticket | Owns | Relation |
 | --- | --- | --- |
-| `ticket_1786977409_499180` | `external_hub_webrtc_live_output_preserves_exact_bytes` suite-load OperatorError | Created and started this Implement visit. Blocking dependency `dependency_1786977415_800462`. Run `run_1786977413_341616`. |
+| `ticket_1786977409_499180` | `external_hub_webrtc_live_output_preserves_exact_bytes` suite-load OperatorError | Created and started this Implement visit. The later orchestrator flatten removed the serial edge onto this ticket. Known-baseline owner. Not absorbed. |
 | `ticket_1786937228_425608` | `unix_adapter_unbound_printf_stream_attach_completes` flake | Passed in every binding suite run this visit. Not absorbed. |
 | `ticket_1786913892_208903` | WebRTC write-budget sibling continuation | Different test. Not absorbed. |
 
@@ -101,7 +101,7 @@ Same-target siblings, not absorbed:
 
 - `OwnerPollDecision::ServeControl` boxes `ControlMessage`. Plan v3 sketched an unboxed variant. `clippy::large_enum_variant` rejected the 208-byte unboxed form (`-D warnings`). Boxing matches existing `OwnerEvent::Control(Box<Option<ControlMessage>>)`. Classification arms and order stay identical.
 - Pre-change reproduction on this worktree was not run. The ticket already carries exact base-`547ca38` failure evidence. Plan v3 marked local reproduction as corroborating only.
-- Binding `./test.sh --locked --test hub_daemon_lifecycle_test` is not 5/5 clean. Run 1 failed on an unrelated test. This run is parked per `question_1786977344_650479`. That is not a plan-scope change to the ready-spawn repair.
+- Binding `./test.sh --locked --test hub_daemon_lifecycle_test` is not 5/5 clean. Run 1 failed on the exact-bytes suite-load oracle. Orchestrator message `msg_device-2_1787003395_86e7b7` authorizes focused proof plus explicit known-baseline evidence for this ticket. That is not a product-scope change to the ready-spawn repair.
 
 ## Tests and downstream proof run
 
@@ -127,7 +127,7 @@ No timers or trial counts. The v1 nine-second sabotage and the v2 `biased;`-remo
 | `./test.sh --locked --lib queued_control_precedes_a_due_maintenance_slice` × 20 on the final boxed helper | 20/20 PASS |
 | `./test.sh --locked --test hub_daemon_lifecycle_test ready_spawn_completes` × 20 | 20/20 PASS; each run `2 passed; 0 failed; 218 filtered out` |
 | Observation run with `--nocapture` | snapshot assembly 13.346375ms; observe-slice load 51.575042ms |
-| `./test.sh --locked --test hub_daemon_lifecycle_test` × 5 | 4/5 PASS; run 1 FAIL (see below). Do not treat this as a clean binding suite. |
+| `./test.sh --locked --test hub_daemon_lifecycle_test` × 5 | 4/5 PASS; run 1 FAIL on known-baseline exact-bytes (see below). Focused ready-spawn proof is the Implement gate. |
 | `cargo fmt --all -- --check` | exit 0 |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0 after boxing `ServeControl` |
 
@@ -149,13 +149,13 @@ Isolated exact-bytes command on this branch: `./test.sh --locked --test hub_daem
 
 Source proof: `tests/hub_daemon_lifecycle/webrtc_proofs.rs` is byte-identical to `origin/main`. Plan Review on this worktree at plan commit `c0f5646` ran the same suite command: 219 passed; 0 failed; 1 ignored.
 
-The exact-bytes failure did not repeat in runs 2-5. It still owns `ticket_1786977409_499180`. This ready-spawn run cannot claim a clean binding suite or merge until that ticket closes and this branch integrates Hub main, then reruns the complete required binding evidence.
+The exact-bytes failure did not repeat in runs 2-5. It still owns `ticket_1786977409_499180`. This focused repair does not absorb it. Final integration cannot resume until that sibling and the other direct blockers close.
 
 ## Unverified behavior or residual risk
 
 - The decision-level unit test proves the busy-path classification, not whole-loop wiring. A future pre-control drain that bypasses the helper would not fail it. The loop call site is one match for Review to check. The existing `due_reconciliation_precedes_an_already_ready_control_message` still pins the blocking path.
 - The two integration tests no longer assert any latency bound. `waited` stays visible as an observation. `tests/session_projection_owner_loop.rs` still const-asserts the budget relations.
-- Binding suite run 1 failed. That failure is not residual risk. It is a blocking sibling ticket and an unmet clean-suite claim.
+- Binding suite run 1 failed on exact-bytes. That failure is known-baseline evidence for `ticket_1786977409_499180`, not residual risk and not this ticket's repair.
 - `tests/hub_daemon_lifecycle/package_event_plane.rs` still has a wall-clock ready-operation assertion. It did not fail these runs.
 
 ## Missing vault guidance discovered
