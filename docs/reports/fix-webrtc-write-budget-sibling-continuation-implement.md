@@ -3,7 +3,7 @@
 Ticket: `ticket_1786913892_208903`  
 Run: `run_1786914416_283641`  
 Step: `botster_stack_implement`  
-Status: production repair committed; granted-slot `./test.sh --locked` finished unclean; slot released; Review not requested
+Status: production repair committed at `6d69028`; granted-slot suite recorded; orchestrator option 3: advance to Review now
 
 Human answer `question_1786916746_614820`: commit the focused write-budget repair now; do not waive clean-suite acceptance; park Implement on the separators blocker; after that ticket merges, update from Hub main and run `./test.sh --locked` once; advance to Review only if that suite passes.
 
@@ -12,6 +12,8 @@ Resume `msg_device-2_1786920855_84ce4a`: separators blocker merged at `a55f62d`.
 Resume `msg_device-2_1786936526_3c77f6`: near-limit blocker merged at `547ca38`. Integrated that revision. One `./test.sh --locked` after the worker build: lib 352/0; named write-budget test PASSED; lifecycle 218/1/1 on `unix_adapter_unbound_printf_stream_attach_completes`. Did not retry. Did not advance.
 
 Resume `msg_device-2_1787003545_653fe5`: orchestrator granted the only default-concurrency full-suite slot. Ran the planned one `./test.sh --locked` on HEAD `921d525` after the worker build. Did not retry. Did not create serial dependencies. Slot released after the command finished.
+
+Resume `msg_device-2_1787004353_7ccc54`: orchestrator disposition option 3. Advance to Review now. Do not run another full suite. Do not wait for unrelated owner tickets. Final integration remains the zero-failure gate on those owner tickets.
 
 ## Target repository and target_id
 
@@ -90,11 +92,13 @@ Same-repo blockers:
 - `ticket_1786921010_869253` / `dependency_1786921011_357767` — near-limit owner-turn flake; merged at Hub main `547ca38`
 - `ticket_1786937228_425608` / `dependency_1786937228_989504` — `unix_adapter_unbound_printf_stream_attach_completes` default-concurrency lifecycle failure
 
-Blocking human question: `question_1786916746_614820` (commit/park vs waive clean-suite for Review). Answer applied. Clean-suite gate is not waived.
+Blocking human question: `question_1786916746_614820` (commit/park vs waive clean-suite for Review). Later orchestrator `msg_device-2_1787004353_7ccc54` directed Review admission on focused write-budget proof plus known-baseline owner tickets. This ticket does not wait on those owners. Final integration still requires a zero-failure suite.
 
 ## Deviations from plan
 
-None that change the committed plan contract. Oracle strengthening matched plan step 6 after production classification. Binding `./test.sh --locked` was not retried after the different root failed.
+Oracle strengthening matched plan step 6 after production classification. Binding `./test.sh --locked` was not retried after a different root failed.
+
+Orchestrator option 3 (`msg_device-2_1787004353_7ccc54`) changes Review admission: this Implement step advances without a clean default-concurrency `./test.sh --locked`. The three granted-slot lifecycle failures stay on their owner tickets. Final integration remains the zero-failure gate and is not claimed here.
 
 ## Tests and downstream proof run
 
@@ -173,7 +177,7 @@ Downstream north-star / snapshot suites are not claimed here.
 ## Unverified behavior or residual risk
 
 - Granted-slot `./test.sh --locked` is not green. Named write-budget proof passed. Remaining failures are recorded on other owner tickets, not as serial blockers of this ticket.
-- Final integration remains the zero-failure gate when the orchestrator grants another slot after those owners land.
+- Final integration remains the zero-failure gate on those owner tickets. This Review request does not claim that gate.
 - Sequential pressured flush of a closed stall handle was not separately changed; residual sibling delay under sustained high water remains possible but was not the confirmed mux-wide WouldBlock class.
 - Authentic browser/TUI same-session proof remains with north-star after merge.
 
