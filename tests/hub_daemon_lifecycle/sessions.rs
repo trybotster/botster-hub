@@ -3598,27 +3598,137 @@ fn assemble_session_id(index: usize) -> String {
     format!("assemble-session-{index:02}")
 }
 
-fn assemble_subscription_frame_is_live(
+fn expected_assemble_session_ids() -> std::collections::BTreeSet<String> {
+    (0..24).map(assemble_session_id).collect()
+}
+
+fn assemble_sessions_are_ready(seen: &std::collections::BTreeSet<String>) -> bool {
+    seen == &expected_assemble_session_ids()
+}
+
+fn session_identities_from_entity_frame(
     frame: &botster_hub_client::DaemonEntityFrame,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     match frame {
         botster_hub_client::DaemonEntityFrame::Error { code, message, .. } => {
             Err(format!("assemble subscription error: {code}: {message}"))
         }
-        _ => Ok(()),
+        botster_hub_client::DaemonEntityFrame::Snapshot { items, .. } => Ok(items
+            .iter()
+            .filter_map(|entity| {
+                entity
+                    .get("session_uuid")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect()),
+        botster_hub_client::DaemonEntityFrame::Upsert { id, .. }
+        | botster_hub_client::DaemonEntityFrame::Patch { id, .. } => Ok(vec![id.clone()]),
+        botster_hub_client::DaemonEntityFrame::Remove { .. } => Ok(Vec::new()),
     }
 }
 
-fn expect_live_assemble_subscription(
-    subscription: &mut botster_hub_client::DaemonEntitySubscription,
+fn record_assemble_identities(
+    frame: &botster_hub_client::DaemonEntityFrame,
+    expected: &std::collections::BTreeSet<String>,
+    seen: &mut std::collections::BTreeSet<String>,
 ) {
-    subscription
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .expect("bound assemble projection read");
-    match subscription.next_frame() {
-        Ok(frame) => assemble_subscription_frame_is_live(&frame)
-            .unwrap_or_else(|error| panic!("{error}")),
-        Err(error) => panic!("assemble subscription must deliver a frame: {error}"),
+    let identities = session_identities_from_entity_frame(frame)
+        .unwrap_or_else(|error| panic!("{error}"));
+    for id in identities {
+        if expected.contains(&id) {
+            seen.insert(id);
+        }
+    }
+}
+
+fn is_entity_read_idle(error: &botster_hub_client::DaemonTransportError) -> bool {
+    let message = error.to_string();
+    message.contains("timed out")
+        || message.contains("WouldBlock")
+        || message.contains("Resource temporarily unavailable")
+        || message.contains("os error 35")
+        || message.contains("os error 11")
+}
+
+fn observe_assemble_sessions(endpoint: &botster_hub_client::DaemonEndpoint) {
+    // ReadScreen is the production exact-session observe path. Subscribe does
+    // not run Observe. One owner Observe slice publishes at most eight live
+    // rows. These 24 control turns observe every load session into the journal
+    // without a wall-clock wait.
+    for index in 0..24 {
+        botster_hub_client::request(
+            endpoint,
+            botster_hub_client::DaemonRequest::ReadScreen {
+                session_id: assemble_session_id(index),
+            },
+        )
+        .expect("ReadScreen observes one assemble session");
+    }
+}
+
+fn drain_until_assemble_sessions_projected(
+    endpoint: &botster_hub_client::DaemonEndpoint,
+    first: botster_hub_client::DaemonEntitySubscription,
+) {
+    let expected = expected_assemble_session_ids();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut subscriptions = vec![first];
+    let mut catchup_subscribes = 0usize;
+    const MAX_CATCHUP_SUBSCRIBES: usize = 8;
+
+    observe_assemble_sessions(endpoint);
+    for subscription in &mut subscriptions {
+        subscription
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("bound assemble projection read");
+    }
+
+    loop {
+        let mut progressed = false;
+        let mut idle = 0usize;
+        for subscription in &mut subscriptions {
+            match subscription.next_frame() {
+                Ok(frame) => {
+                    let before = seen.len();
+                    record_assemble_identities(&frame, &expected, &mut seen);
+                    if seen.len() > before {
+                        progressed = true;
+                    }
+                }
+                Err(error) if is_entity_read_idle(&error) => idle += 1,
+                Err(error) => panic!("assemble projection wait failed: {error}"),
+            }
+        }
+        if assemble_sessions_are_ready(&seen) {
+            for subscription in subscriptions {
+                let _ = subscription.unsubscribe();
+            }
+            return;
+        }
+        if progressed || idle < subscriptions.len() {
+            continue;
+        }
+        // Quiet streams need JournalPull and ProjectionApply. Another
+        // Subscribe is that production catch-up turn. Bound the loop by
+        // those turns, not by wall clock.
+        if catchup_subscribes >= MAX_CATCHUP_SUBSCRIBES {
+            let missing: Vec<String> = expected.difference(&seen).cloned().collect();
+            panic!(
+                "assemble projection must include all 24 load-session identities after ReadScreen observe and {MAX_CATCHUP_SUBSCRIBES} Subscribe catch-up turns; missing={missing:?}; seen={}",
+                seen.len()
+            );
+        }
+        let extra = botster_hub_client::subscribe_session_entities(
+            endpoint,
+            format!("assemble-catchup-{catchup_subscribes}"),
+        )
+        .expect("catch-up subscribe advances journal pull and projection apply");
+        extra
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("bound catch-up projection read");
+        subscriptions.push(extra);
+        catchup_subscribes += 1;
     }
 }
 
@@ -3631,19 +3741,32 @@ fn assemble_subscription_rejects_an_error_frame() {
         message: "typed failure".to_string(),
     };
     assert!(
-        assemble_subscription_frame_is_live(&error).is_err(),
-        "a typed Error frame must not count as a live subscription"
+        session_identities_from_entity_frame(&error).is_err(),
+        "a typed Error frame must not count as projected identities"
     );
-    let snapshot = botster_hub_client::DaemonEntityFrame::Snapshot {
-        subscription_id: "assemble-sub".to_string(),
-        entity_type: "session".to_string(),
-        snapshot_seq: 0,
-        items: Vec::new(),
-        resync_reason: None,
-    };
+}
+
+#[test]
+fn assemble_readiness_rejects_a_partial_identity_set() {
+    let empty = std::collections::BTreeSet::new();
     assert!(
-        assemble_subscription_frame_is_live(&snapshot).is_ok(),
-        "a Snapshot frame is a live subscription"
+        !assemble_sessions_are_ready(&empty),
+        "an empty projected set must not be ready"
+    );
+    let mut seen = std::collections::BTreeSet::new();
+    for index in 0..17 {
+        seen.insert(assemble_session_id(index));
+    }
+    assert!(
+        !assemble_sessions_are_ready(&seen),
+        "a partial projected set must not be ready"
+    );
+    for index in 17..24 {
+        seen.insert(assemble_session_id(index));
+    }
+    assert!(
+        assemble_sessions_are_ready(&seen),
+        "all 24 load-session identities must be ready"
     );
 }
 
@@ -3653,11 +3776,13 @@ fn ready_spawn_completes_during_session_snapshot_assembly() {
     // `queued_control_precedes_a_due_maintenance_slice` in
     // `src/daemon_transport.rs`. End-to-end wall-clock latency through a
     // daemon child measures ambient machine load and is recorded only.
-    // Subscribe does not run Observe. Observe publishes live rows eight at a
-    // time. Waiting for all 24 identities is therefore a loop-tick window,
-    // and extra Subscribe turns starve Observe. This test keeps the 24-session
-    // load fixture and proves the ready Spawn plus a live subscription frame.
-    // Fail immediately on DaemonEntityFrame::Error.
+    // The required oracle is the exact 24 assemble-session identities.
+    // Parked by question_1787007562_222481 option 3 until
+    // ticket_1787007684_566852 lands a deterministic named-session
+    // journal-publication path. ReadScreen plus Subscribe catch-up is the
+    // strongest test-only stimulus tried here and is not sufficient.
+    // Fail immediately on DaemonEntityFrame::Error. Do not use a live-frame
+    // predicate or a wall-clock convergence bound.
     let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("snapshot-assemble-ready");
     let config = explicit_config(&data_dir);
@@ -3681,9 +3806,8 @@ fn ready_spawn_completes_during_session_snapshot_assembly() {
         )
         .expect("spawn assemble session");
     }
-    let mut subscription =
-        botster_hub_client::subscribe_session_entities(&endpoint, "assemble-sub")
-            .expect("assemble subscriber");
+    let subscription = botster_hub_client::subscribe_session_entities(&endpoint, "assemble-sub")
+        .expect("assemble subscriber");
     let started = Instant::now();
     botster_hub_client::request(
         &endpoint,
@@ -3695,8 +3819,7 @@ fn ready_spawn_completes_during_session_snapshot_assembly() {
     .expect("ready spawn during snapshot assembly");
     let waited = started.elapsed();
     eprintln!("ready spawn duration observation (snapshot assembly): {waited:?}");
-    expect_live_assemble_subscription(&mut subscription);
-    let _ = subscription.unsubscribe();
+    drain_until_assemble_sessions_projected(&endpoint, subscription);
     shutdown_cli_daemon(&data_dir, child);
 }
 

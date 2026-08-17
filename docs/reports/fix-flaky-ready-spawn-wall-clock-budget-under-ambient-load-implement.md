@@ -11,16 +11,16 @@
 | Pipeline worktree | the ticket worktree on `project-pipelines/ticket_1786938984_190098` |
 | Original approved plan commit | `c0f5646` (v3 product repair) |
 | First v3.1 plan revision | `c550f1c` (focused-gate amendment for acceptance check 4) |
-| This follow-up | v3.3 live-frame oracle after `review_1787006443_517771` |
+| This follow-up | v3.5 park after `question_1787007562_222481` option 3 |
 | Delivery | direct-merge; no pull request |
 | Class | not runtime-teardown (`teardown_class_applies: false`) |
-| Plan | `docs/plans/fix-flaky-ready-spawn-wall-clock-budget-under-ambient-load.md` revision v3.3 |
+| Plan | `docs/plans/fix-flaky-ready-spawn-wall-clock-budget-under-ambient-load.md` revision v3.5 |
 | Implement checklist | `checklist_1786943181_130677` (ticket-scoped; no duplicate created) |
-| Run status | focused Implement after Review `finding_1787006443_430008` |
+| Run status | parked after `question_1787007562_222481` option 3; blocked on `ticket_1787007684_566852` |
 
 Independent routing: `project_pipelines_get_project` lists `tgt_7e208a0c76a44980a83b63af976b1f22` as a registered project target. The ticket worktree `origin` remote is `trybotster/botster-hub`. Approved plan v3 used the same `target_id` and repository.
 
-Durable answer `question_1787003911_553236` chooses option 2 and supersedes the parking instruction in `question_1786977344_650479`. This ticket's Implement and Review gate is focused proof plus known-baseline exact-bytes evidence. `ticket_1786977409_499180` does not block this repair. Both tickets directly block final integration. Do not absorb exact-bytes. Do not start an unfiltered lifecycle suite now.
+Durable answer `question_1787003911_553236` chooses option 2 for the focused Implement and Review gate after this ticket resumes. Durable answer `question_1787007562_222481` option 3 parks this ticket now. `ticket_1786977409_499180` does not own named-session journal publication. This ticket now depends on `ticket_1787007684_566852`. Do not absorb exact-bytes. Do not start an unfiltered lifecycle suite now.
 
 ## Repository playbook and other playbooks/notes applied
 
@@ -55,7 +55,7 @@ Durable answer `question_1787003911_553236` chooses option 2 and supersedes the 
 ### Constraints applied before edits
 
 - Work only in this `botster-hub` ticket worktree.
-- Follow approved plan v3, then the v3.3 oracle revision authorized by `review_1787006443_517771`.
+- Follow approved plan v3, then park per `question_1787007562_222481` option 3. Keep the 24-identity invariant. Do not weaken the oracle.
 - Extract the busy-path classification with identical arms and order.
 - Do not change `MAX_READY_OPERATION_WAIT_MS`, `MAX_OWNER_TURN_MS`, `OBSERVE_SLICE_BUDGET`, owner-loop scheduling, or Pump/Maintenance fairness.
 - Do not change public DTOs, `botster-hub-client`, hub-test-support, or downstream pins.
@@ -68,11 +68,11 @@ Durable answer `question_1787003911_553236` chooses option 2 and supersedes the 
 Feature behavior:
 
 - `src/daemon_transport.rs` — extract `classify_owner_poll` / `OwnerPollDecision` from the owner-loop busy-path `try_recv` match. Arms and order stay: queued control serves first; `slice_due` runs one maintenance slice; otherwise the loop blocks. Add unit test `queued_control_precedes_a_due_maintenance_slice`.
-- `tests/hub_daemon_lifecycle/sessions.rs` — rename and repair the two flaky tests. Keep fixtures. Delete the wall-clock `MAX_READY_OPERATION_WAIT_MS` assertion. Keep `waited` as an `eprintln!` observation. Keep the functional Spawn, unsubscribe, and shutdown assertions. After `finding_1787006443_430008`, the snapshot-assembly test requires one live subscription frame and fails immediately on `DaemonEntityFrame::Error`. It does not wait for 24 projected identities.
+- `tests/hub_daemon_lifecycle/sessions.rs` — rename and repair the two flaky tests. Keep fixtures. Delete the wall-clock `MAX_READY_OPERATION_WAIT_MS` assertion. Keep `waited` as an `eprintln!` observation. The snapshot-assembly test keeps the exact 24-identity invariant and fails immediately on `DaemonEntityFrame::Error`. An empty Snapshot is not ready. The current ReadScreen-plus-Subscribe stimulus is recorded as insufficient, not as a passing gate.
 
 Handoff:
 
-- `docs/plans/fix-flaky-ready-spawn-wall-clock-budget-under-ambient-load.md` — v3.3 live-frame oracle after `review_1787006443_517771`. Focused-gate contract from `question_1787003911_553236` is unchanged.
+- `docs/plans/fix-flaky-ready-spawn-wall-clock-budget-under-ambient-load.md` — v3.5 parks the ticket behind `ticket_1787007684_566852`. The 24-identity contract stands. Live-frame readiness is not authorized.
 - `docs/reports/fix-flaky-ready-spawn-wall-clock-budget-under-ambient-load-implement.md` — this report.
 
 Merge/rebase cleanup: none.
@@ -96,7 +96,8 @@ Same-target siblings, not absorbed:
 
 | Ticket | Owns | Relation |
 | --- | --- | --- |
-| `ticket_1786977409_499180` | `external_hub_webrtc_live_output_preserves_exact_bytes` suite-load OperatorError | Created and started this Implement visit. The later orchestrator flatten removed the serial edge onto this ticket. Known-baseline owner. Not absorbed. |
+| `ticket_1787007684_566852` | deterministic named-session journal publication | Created and started after `question_1787007562_222481`. This ticket now depends on it. Not absorbed. |
+| `ticket_1786977409_499180` | `external_hub_webrtc_live_output_preserves_exact_bytes` suite-load OperatorError | Compared for the park decision. It does not guarantee named-session journal publication. Known-baseline owner. Not absorbed. |
 | `ticket_1786937228_425608` | `unix_adapter_unbound_printf_stream_attach_completes` flake | Passed in every binding suite run this visit. Not absorbed. |
 | `ticket_1786913892_208903` | WebRTC write-budget sibling continuation | Different test. Not absorbed. |
 
@@ -106,7 +107,9 @@ Same-target siblings, not absorbed:
 - Pre-change reproduction on this worktree was not run. The ticket already carries exact base-`547ca38` failure evidence. Plan v3 marked local reproduction as corroborating only.
 - Plan v3.1, authorized by `question_1787003911_553236`, replaces acceptance check 4. This ticket no longer requires five consecutive unfiltered lifecycle suites. The Implement and Review gate is focused proof plus known-baseline exact-bytes evidence. Final integration remains the zero-failure convergence gate.
 - Plan v3.2, authorized by `question_1787005268_112714` and Verify `review_1787005607_892358`, replaces the first-snapshot count assert. Direct-merge acceptance on `a1cb911` failed repetition 4 of `ready_spawn_completes` at `items.len() >= 24` while Spawn waited 17.794416ms. Production slice budgets stay unchanged.
-- Plan v3.3, authorized by Review `review_1787006443_517771`, replaces both the 30-second quiet drain and the later Subscribe-turn drain. Review's focused gate at `b3432e4` failed repetition 2 with 17 of 24 identities after 30 seconds. A local Subscribe-turn draft then froze at 8 identities because Subscribe does not run Observe and extra Subscribe turns starve Observe. The repaired oracle keeps the 24-session load fixture, asserts ready Spawn plus one live frame, and fails immediately on `DaemonEntityFrame::Error`.
+- Plan v3.3 live-frame was rejected by Review `review_1787007291_616478`. `review_1787006443_517771` did not authorize deleting the 24-identity invariant. Advisor `question_1787005268_112714` still requires that invariant or an equivalent deterministic identity check.
+- Plan v3.4 tried `ReadScreen` plus Subscribe catch-up as a test-only production path. Focused `ready_spawn_completes` failed repetition 2 with `missing=["assemble-session-21", "assemble-session-22", "assemble-session-23"]; seen=21`.
+- Plan v3.5, authorized by `question_1787007562_222481` option 3, parks this ticket. The 24-identity invariant stays. The oracle is not weakened. The snapshot-assembly test is not quarantined. `ticket_1786977409_499180` was compared and does not guarantee named-session journal publication. New dependency: `ticket_1787007684_566852`.
 
 ## Tests and downstream proof run
 
@@ -121,7 +124,7 @@ Temporary Ablation A inverted helper precedence so `slice_due` won over a ready 
 | Control | Command | Exit | First failure |
 | --- | --- | --- | --- |
 | A (precedence inversion) | `./test.sh --locked --lib queued_control_precedes_a_due_maintenance_slice` | 101 | `assertion failed: matches!(classify_owner_poll(Ok(ControlMessage::RejectedConnection), true), OwnerPollDecision::ServeControl(message) if matches!(*message, Some(ControlMessage::RejectedConnection)))` at `src/daemon_transport.rs:7860` |
-| B (Error treated as live) | `./test.sh --locked --test hub_daemon_lifecycle_test assemble_subscription_rejects_an_error_frame` | 101 | `a typed Error frame must not count as a live subscription` after `assemble_subscription_frame_is_live` accepted `DaemonEntityFrame::Error` |
+| B (partial-set readiness) | `./test.sh --locked --test hub_daemon_lifecycle_test assemble_readiness_rejects_a_partial_identity_set` | 101 | `a partial projected set must not be ready` at `tests/hub_daemon_lifecycle/sessions.rs:3760` after `assemble_sessions_are_ready` accepted any nonempty set |
 | C (Subscribe-turn completeness, discarded) | `./test.sh --locked --test hub_daemon_lifecycle_test ready_spawn_completes` | 101 | repetition 3: `assemble projection must include all 24 load-session identities after 8 Subscribe catch-up turns; missing=["assemble-session-08".."assemble-session-23"]; seen=8` |
 
 No timers or trial counts. The v1 nine-second sabotage and the v2 `biased;`-removal ablation were not used.
@@ -132,7 +135,7 @@ No timers or trial counts. The v1 nine-second sabotage and the v2 `biased;`-remo
 | --- | --- |
 | `cargo build --locked -p botster-core-daemon --bin botster-session-worker` | exit 0 |
 | `./test.sh --locked --lib queued_control_precedes_a_due_maintenance_slice` × 20 on the final boxed helper | 20/20 PASS. Repeated 20/20 after the v3.3 live-frame oracle. |
-| `./test.sh --locked --test hub_daemon_lifecycle_test ready_spawn_completes` × 20 | 20/20 PASS on the v3.3 live-frame oracle; each run `2 passed; 0 failed; 219 filtered out`. Defective completeness oracles already failed: first-snapshot count on `a1cb911` rep 4; 30-second drain at `b3432e4` Review rep 2 (17/24); Subscribe-turn draft local rep 3 (8/24). |
+| `./test.sh --locked --test hub_daemon_lifecycle_test ready_spawn_completes` × 20 | Not a passing gate while parked. v3.3 live-frame 20/20 is insufficient because it drops the identity invariant. v3.4 ReadScreen draft failed rep 2 at 21/24. Earlier defective oracles: first-snapshot count on `a1cb911` rep 4; 30-second drain at `b3432e4` Review rep 2 (17/24); Subscribe-turn draft local rep 3 (8/24). |
 | Observation run with `--nocapture` | snapshot assembly 13.346375ms; observe-slice load 51.575042ms |
 | `./test.sh --locked --test hub_daemon_lifecycle_test` × 5 | Historical record only. 4/5 PASS; run 1 FAIL on known-baseline exact-bytes owned by `ticket_1786977409_499180`. Not this ticket's gate after `question_1787003911_553236`. |
 | `cargo fmt --all -- --check` | exit 0 after the v3.3 live-frame oracle |
@@ -162,7 +165,7 @@ The exact-bytes failure did not repeat in runs 2-5. It still owns `ticket_178697
 
 - The decision-level unit test proves the busy-path classification, not whole-loop wiring. A future pre-control drain that bypasses the helper would not fail it. The loop call site is one match for Review to check. The existing `due_reconciliation_precedes_an_already_ready_control_message` still pins the blocking path.
 - The two integration tests no longer assert any latency bound. `waited` stays visible as an observation. `tests/session_projection_owner_loop.rs` still const-asserts the budget relations.
-- The snapshot-assembly test no longer waits for 24 projected identities. That wait is a loop-tick window: Observe publishes eight live rows per slice, Subscribe does not run Observe, and extra Subscribe turns starve Observe. The test keeps the 24-session load fixture and asserts ready Spawn plus one live frame. A typed `DaemonEntityFrame::Error` fails immediately. The 5-second read timeout is single-frame hang protection, the same bound other entity-subscription tests in this file already use.
+- This ticket is parked. The snapshot-assembly test still requires all 24 load-session identities. No current test-only stimulus is deterministic. Resume only after `ticket_1787007684_566852` lands a named-session journal-publication path.
 - Suite run 1 failed on exact-bytes. That failure is known-baseline evidence for `ticket_1786977409_499180`, not residual risk and not this ticket's repair. Review `finding_1787003842_944465` is resolved by durable answer `question_1787003911_553236` plus Plan v3.1.
 - `tests/hub_daemon_lifecycle/package_event_plane.rs` still has a wall-clock ready-operation assertion. It did not fail these runs.
 
