@@ -3301,7 +3301,13 @@ fn shutdown_after_observed_exit_returns_session_cleanup() {
 }
 
 /// Live ShutdownSession Runtime/State failure must not sacrifice the daemon,
-/// the control connection, or a sibling session.
+/// the reused control connection, or a sibling session adapter.
+///
+/// Core-error branch closes victim-session adapters
+/// (`daemon_transport.rs:3430`). Cleanup-branch keep-open
+/// (`:3406-3408`) is a different path. This test hits the Core-error
+/// branch and proves the same `DaemonConnection` plus the sibling
+/// Attach still work.
 ///
 /// Single constructions at Core pin fc541a5:
 /// (a) SIGKILL-then-shutdown returned SessionCleanup after Core observed
@@ -3361,6 +3367,63 @@ fn external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable() {
     .expect("spawn sibling session");
     let mut sibling_cleanup = SessionCleanupGuard::new(&data_dir, "shutdown-failure-sibling");
 
+    let mut connection = botster_hub_client::DaemonConnection::connect(&endpoint)
+        .expect("open one control connection for failure and sibling proof");
+    let attach = connection
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: "shutdown-failure-sibling".to_string(),
+            subscription_id: "shutdown-failure-sibling-sub".to_string(),
+        })
+        .expect("attach sibling before victim shutdown failure");
+    assert_eq!(
+        attach.kind,
+        botster_hub_client::DaemonResponseKind::Events,
+        "sibling Attach must succeed before victim shutdown, got kind={:?} error={:?}",
+        attach.kind,
+        attach.error
+    );
+    let resize = connection
+        .request(&botster_hub_client::DaemonRequest::Resize {
+            session_id: "shutdown-failure-sibling".to_string(),
+            rows: 24,
+            cols: 80,
+        })
+        .expect("resize sibling before victim shutdown failure");
+    assert_eq!(
+        resize.kind,
+        botster_hub_client::DaemonResponseKind::Events,
+        "sibling Resize must succeed before victim shutdown, got kind={:?} error={:?}",
+        resize.kind,
+        resize.error
+    );
+    let ready = wait_for_read_screen_contains(&mut connection, "shutdown-failure-sibling", "ready");
+    assert!(
+        ready.contains("ready"),
+        "sibling adapter must be live before victim shutdown, got {ready:?}"
+    );
+    let before_input = connection
+        .request(&botster_hub_client::DaemonRequest::SendInput {
+            session_id: "shutdown-failure-sibling".to_string(),
+            data: "before\r".to_string(),
+        })
+        .expect("sibling SendInput before victim shutdown failure");
+    assert_eq!(
+        before_input.kind,
+        botster_hub_client::DaemonResponseKind::Events,
+        "sibling SendInput must work before victim shutdown, got kind={:?} error={:?}",
+        before_input.kind,
+        before_input.error
+    );
+    let before = wait_for_read_screen_contains(
+        &mut connection,
+        "shutdown-failure-sibling",
+        "echo:before",
+    );
+    assert!(
+        before.contains("echo:before"),
+        "sibling echo must work before victim shutdown, got {before:?}"
+    );
+
     for worker in &victim_workers {
         let result = unsafe { libc::kill(worker.pid as libc::pid_t, libc::SIGKILL) };
         assert_eq!(
@@ -3371,13 +3434,11 @@ fn external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable() {
         );
     }
 
-    let shutdown = botster_hub_client::request(
-        &endpoint,
-        botster_hub_client::DaemonRequest::ShutdownSession {
+    let shutdown = connection
+        .request(&botster_hub_client::DaemonRequest::ShutdownSession {
             session_id: "shutdown-failure-victim".to_string(),
-        },
-    )
-    .expect("shutdown killed victim through production handler");
+        })
+        .expect("shutdown killed victim through production handler");
     assert_eq!(
         shutdown.kind,
         botster_hub_client::DaemonResponseKind::OperatorError,
@@ -3393,23 +3454,22 @@ fn external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable() {
     );
     assert_eq!(error.operation, "shutdown");
 
-    let status = botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+    let status = connection
+        .request(&botster_hub_client::DaemonRequest::Status)
         .expect("status after victim shutdown failure");
     assert_eq!(
         status.kind,
         botster_hub_client::DaemonResponseKind::Status,
-        "daemon Status must survive victim ShutdownSession failure, got {:?}",
+        "same control connection Status must survive victim ShutdownSession failure, got {:?}",
         status.kind
     );
 
-    let sibling_input = botster_hub_client::request(
-        &endpoint,
-        botster_hub_client::DaemonRequest::SendInput {
+    let sibling_input = connection
+        .request(&botster_hub_client::DaemonRequest::SendInput {
             session_id: "shutdown-failure-sibling".to_string(),
             data: "ping\r".to_string(),
-        },
-    )
-    .expect("sibling SendInput after victim shutdown failure");
+        })
+        .expect("sibling SendInput after victim shutdown failure");
     assert_eq!(
         sibling_input.kind,
         botster_hub_client::DaemonResponseKind::Events,
@@ -3417,10 +3477,19 @@ fn external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable() {
         sibling_input.kind,
         sibling_input.error
     );
+    let observed = wait_for_read_screen_contains(
+        &mut connection,
+        "shutdown-failure-sibling",
+        "echo:ping",
+    );
+    assert!(
+        observed.contains("echo:ping"),
+        "sibling attached ReadScreen must survive victim ShutdownSession failure, got {observed:?}"
+    );
 
-    let listed =
-        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::ListSessions)
-            .expect("list sessions after victim shutdown failure");
+    let listed = connection
+        .request(&botster_hub_client::DaemonRequest::ListSessions)
+        .expect("list sessions after victim shutdown failure");
     assert!(
         listed.sessions.iter().any(|session| {
             session.session_id == "shutdown-failure-sibling" && session.lifecycle == "running"

@@ -64,7 +64,7 @@ Feature behavior:
 
 Handoff:
 
-- `docs/plans/fix-flaky-webrtc-exact-bytes-shutdown-classification-under-lifecycle-suite-load.md` — Implement binding for the compound Scope item 6 construction.
+- `docs/plans/fix-flaky-webrtc-exact-bytes-shutdown-classification-under-lifecycle-suite-load.md` — Implement binding for the compound Scope item 6 construction; Review-return correction of `sibling_fail_closed_policy` and the byte-identical claim.
 - `docs/reports/fix-flaky-webrtc-exact-bytes-shutdown-classification-under-lifecycle-suite-load-implement.md` — this report.
 
 Merge/rebase cleanup: none.
@@ -89,9 +89,16 @@ Scope item 6 construction order was followed, then a compound of the two named s
 
 1. Construction (a) SIGKILL-then-shutdown returned `SessionCleanup{already_exited}`. Core observed `ProcessExited` before the live shutdown path ran.
 2. Construction (b) drain injection plus `BOTSTER_HUB_TEST_WORKER_EGRESS_CAPACITY=1` returned `Events`. Core shutdown completed inside the 2 s window.
-3. Compound of (a) plus the drain-injection half of (b): classify hits `BOTSTER_HUB_TEST_FAIL_RUNTIME_DRAIN_FOR` and falls through; SIGKILL then makes the live Core shutdown return `OperatorError{code=runtime_error, operation=shutdown}`. Status, sibling `SendInput` -> `Events`, and sibling `ListSessions` remain usable. 4/4 isolated runs passed.
+3. Compound of (a) plus the drain-injection half of (b): classify hits `BOTSTER_HUB_TEST_FAIL_RUNTIME_DRAIN_FOR` and falls through; SIGKILL then makes the live Core shutdown return `OperatorError{code=runtime_error, operation=shutdown}`. The same `DaemonConnection` then serves `Status`, sibling `SendInput` -> `Events`, sibling attached `ReadScreen` (`echo:ping`), and sibling `ListSessions`. 4/4 isolated runs passed on the first binding; Review return re-ran the rewritten connection-reuse oracle.
 
 The committed plan now records this binding. No Core `with_test_fail_shutdown_for` ticket. The observed-exit wait was inlined; `session_fixtures.rs` was not extracted.
+
+## Review return (`review_1786985857_694858`)
+
+Review submitted `changes_required`. This visit keeps the production Core-error branch that closes victim-session adapters (`src/daemon_transport.rs:3430`). It does not keep adapters open on that path.
+
+1. `finding_1786985857_441627` (high, product): plan `sibling_fail_closed_policy` cited `src/daemon_transport.rs:3406-3408` (Cleanup keep-open) as the Core-error authority. The live test also used one-shot `botster_hub_client::request`, which opens a new Unix connection and cannot prove connection or adapter survival. Fix: state the two-branch policy exactly; reuse one `DaemonConnection` for `ShutdownSession`, `Status`, sibling `SendInput`, sibling `ReadScreen`, and `ListSessions`; `Attach` the sibling before the failing shutdown.
+2. `finding_1786985857_920982` (medium, process): plan scope intro claimed compiled production code stays byte-identical. That is false because `src/runtime.rs` adds the env-gated drain hook. Fix: replace the claim with default-configuration behavior and budgets unchanged, plus one inert-unless-set test hook.
 
 ## Projection-source verification
 
@@ -108,7 +115,7 @@ The committed plan now records this binding. No Core `with_test_fail_shutdown_fo
 | Late-message matrix | No new ownership-creating message. Binding stale-peer lib filter (7 passed) keeps the production-handler rejection and sweep proofs. |
 | Production-path proof | The repaired oracle still drives live WebRTC output, owner-loop `exited`, then production `ShutdownSession` -> `classify_shutdown_session` -> `SessionCleanup{already_exited}`. Control A forces `Active` and the test fails with `kind=Events`. The sibling-survival test drives a live `OperatorError` through the production handler. |
 | Ownership identity | Sessions stay keyed by exact `session_id`. The Absent probe uses a never-spawned id. |
-| Sibling / fail-closed | Live proof: victim `OperatorError` leaves Status, sibling `SendInput`, and sibling listing intact. |
+| Sibling / fail-closed | Live proof on one reused `DaemonConnection`: victim Core-error `OperatorError` closes victim adapters (`:3430`) and leaves Status, sibling Attach/`SendInput`/`ReadScreen`, and sibling listing intact. |
 
 No lens was dropped to informal follow-up.
 
@@ -129,6 +136,9 @@ Tracked `.gitignore` is present and non-empty. The ticket worktree path has no `
 | Check 5 Err: seven named `--lib` unit tests | 7 passed |
 | Check 6 stale-peer: seven named `--lib` tests | 7 passed |
 | Check 6 live failure | 1 passed (compound construction) |
+| Review-return live failure (one `DaemonConnection` + sibling Attach/`ReadScreen`) | 1 passed in 50.52s |
+| Review-return `cargo fmt --all -- --check` | covered by `cargo fmt --all` before the live test |
+| Review-return `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0 |
 | Control A: force `classify_shutdown_session` -> `Active` | exit 101; `got kind=Events error=None` |
 | Control B: wait on `webrtc-exact-bytes-nonexistent` | exit 101; `last=None` after the 10 s bound |
 | Ablation revert + green re-run | exit 0 |
