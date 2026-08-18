@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use botster_hub::{MAX_OWNER_TURN_MS, MAX_READY_OPERATION_WAIT_MS};
 
-const REQUIRED_CORE_REV: &str = "fc541a59338d0591ba4fb3fa522a030d212d26d0";
+const REQUIRED_CORE_REV: &str = "fd66efdcb4769b2b3a75cbd580a5b98b82825790";
 const REQUIRED_CORE_URL: &str = "https://github.com/trybotster/botster-core.git";
 
 #[test]
