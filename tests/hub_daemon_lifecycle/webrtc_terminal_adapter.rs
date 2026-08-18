@@ -924,6 +924,18 @@ fn webrtc_terminal_adapter_write_budget_emits_core_adapter_closed_while_peer_sta
             .await
             .expect("status after core close");
         assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
+        let listed = peer
+            .encrypted_request(&key, &botster_hub_client::DaemonRequest::ListSessions)
+            .await
+            .expect("list sessions after core close");
+        assert!(
+            listed
+                .sessions
+                .iter()
+                .any(|session| session.session_id == "wwb-live" && session.lifecycle == "running"),
+            "sibling session must stay running after stall write-budget close: {:?}",
+            listed.sessions
+        );
         peer.encrypted_request(
             &key,
             &botster_hub_client::DaemonRequest::SendInput {
@@ -935,8 +947,29 @@ fn webrtc_terminal_adapter_write_budget_emits_core_adapter_closed_while_peer_sta
         .expect("sibling input");
         let sibling_deadline = Instant::now() + Duration::from_secs(8);
         while Instant::now() < sibling_deadline
-            && !webrtc_terminal_contains(&peer.pending_terminal_frames, "wwb-sibling-live")
+            && !webrtc_terminal_contains(&peer.pending_terminal_frames, "echo:wwb-sibling-live")
         {
+            let drain = peer
+                .encrypted_request(
+                    &key,
+                    &botster_hub_client::DaemonRequest::drain_subscription("wwb-live", "sub-live"),
+                )
+                .await
+                .expect("sibling drain");
+            assert_ne!(
+                drain.kind,
+                botster_hub_client::DaemonResponseKind::OperatorError,
+                "sibling scoped Drain must stay owned: {:?}",
+                drain.error
+            );
+            assert!(
+                drain
+                    .events
+                    .iter()
+                    .all(|event| !webrtc_event_is_terminal_body(event)),
+                "content-blind sibling Drain must stay bound: {:?}",
+                drain.events
+            );
             if let Ok(Ok(bytes)) =
                 timeout(Duration::from_millis(200), peer.next_terminal_frame(&key)).await
             {
@@ -945,7 +978,7 @@ fn webrtc_terminal_adapter_write_budget_emits_core_adapter_closed_while_peer_sta
             }
         }
         assert!(
-            webrtc_terminal_contains(&peer.pending_terminal_frames, "wwb-sibling-live"),
+            webrtc_terminal_contains(&peer.pending_terminal_frames, "echo:wwb-sibling-live"),
             "sibling daemon_terminal_frame must continue: {:?}",
             peer.pending_terminal_frames
                 .iter()
@@ -953,7 +986,7 @@ fn webrtc_terminal_adapter_write_budget_emits_core_adapter_closed_while_peer_sta
                 .collect::<Vec<_>>()
         );
         eprintln!(
-            "webrtc write-budget provenance hub_bin={} session_worker={} hub_sha={} locked_core=f4f6bf5babe92dfb9241a760c414187f711c2c42",
+            "webrtc write-budget provenance hub_bin={} session_worker={} hub_sha={} locked_core=fc541a59338d0591ba4fb3fa522a030d212d26d0",
             env!("CARGO_BIN_EXE_botster-hub"),
             session_worker_binary_path().display(),
             option_env!("BOTSTER_HUB_GIT_SHA").unwrap_or("worktree")
