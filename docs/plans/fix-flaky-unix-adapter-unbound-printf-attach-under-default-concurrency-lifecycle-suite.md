@@ -5,7 +5,7 @@ Run: `run_1786937300_850110`
 Pipeline: Botster Stack Delivery (`botster_stack_delivery`)
 Step: Plan (`botster_stack_plan`)
 
-Revision 3. Revision 2 addressed Plan Review `review_1786938887_392539`: the red base lifecycle gate received an owner ticket (`ticket_1786938984_190098`) registered as a blocking dependency (`dependency_1786938989_522783`), the acceptance checks sequenced the binding suite gate after that dependency landed, and the planning context added [[botster-architecture]] and [[cli-patterns]]. Revision 3 applies the orchestrator suite-concurrency policy (`msg_device-2_1787003453_936ef9`, 2026-08-17): full lifecycle-suite runs are a serialized command class that needs an explicit orchestrator slot, the ready_spawn failures are known-baseline failures recorded on their owning ticket rather than a serial dependency, and strict zero-failure convergence moves to final integration.
+Revision 4. Revision 2 addressed Plan Review `review_1786938887_392539`: the red base lifecycle gate received an owner ticket (`ticket_1786938984_190098`) registered as a blocking dependency (`dependency_1786938989_522783`), the acceptance checks sequenced the binding suite gate after that dependency landed, and the planning context added [[botster-architecture]] and [[cli-patterns]]. Revision 3 applies the orchestrator suite-concurrency policy (`msg_device-2_1787003453_936ef9`, 2026-08-17): full lifecycle-suite runs are a serialized command class that needs an explicit orchestrator slot, the ready_spawn failures are known-baseline failures recorded on their owning ticket rather than a serial dependency, and strict zero-failure convergence moves to final integration. Revision 4 applies Implement question `question_1787005265_458413` path D: the exit oracle is the attached terminal subscription's `process_exit` frame, not `ListSessions.lifecycle`. The unused full-suite slot from `question_1787005080_932674` was released. Implement must request a new slot only after focused target and negative-control gates pass.
 
 The write-budget sibling continuation (`ticket_1786913892_208903`) hit one lifecycle-suite failure after integrating Hub main `547ca38`. The failed test was `unix_adapter_unbound_printf_stream_attach_completes`. The panic was `ProcessExited must not shut down the host session: [DaemonSession { session_id: "uap-session", lifecycle: "exited" }]` at `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs:752`. The same test passed in isolation on the branch and on base `origin/main` `547ca38`. This ticket repairs that default-concurrency root on botster-hub.
 
@@ -75,35 +75,26 @@ Disposition (Revision 3, per orchestrator policy `msg_device-2_1787003453_936ef9
 
 ## Failure mechanism
 
-The test spawns `printf 'smoke:<marker>\n'`. The child prints one line and exits almost immediately. The test then polls ReadScreen until the marker is visible, and finally asserts through one `ListSessions` call that the session row still reports `lifecycle == "running"`.
+The test spawned `printf 'smoke:<marker>\n'`, polled ReadScreen until the marker was visible, and then asserted through one `ListSessions` call that the session row still reported `lifecycle == "running"`.
 
-The projected lifecycle of that session lawfully becomes `exited` as soon as an observation turn consumes the ProcessExited journal entry. Observation runs inside every ReadScreen request and inside the background pump. The `running` assertion therefore encodes an observation-timing race, not an invariant:
+`ListSessions.lifecycle` is a separate host projection. Observation can consume ProcessExited into `exited` before or after the marker loop. Both `running` and `exited` are lawful. The `running` equality was an observation-timing race, not an invariant.
 
-- In a fast isolated run, the first ReadScreen shows the marker before any observation turn consumes the exit entry. The loop breaks, `ListSessions` still reports `running`, and the test passes.
-- Under default-concurrency suite load, scheduling delay widens the window between spawn and the marker break. An observation turn consumes the exit entry first, and `ListSessions` correctly reports `exited`. The test panics.
-
-Both orderings are legitimate. The projection is required to reach the ended row without any subscriber ([[Hub session projection continues without subscribers or terminal Drain]]). This is a test-oracle defect, not a production regression. The property the test intends to prove -- ProcessExited must not shut down the host session -- means the session row stays listed and serviceable after exit, not that observation has not happened yet.
+Implement also proved that a ReadScreen-driven wait for `lifecycle == "exited"` does not converge after marker ReadScreen parks ProcessExited. A printf-only child exits before attach, and the bound adapter then receives `attach_state` plus `terminal_output` without a later `process_exit` frame.
 
 ## Scope
 
-Repair `unix_adapter_unbound_printf_stream_attach_completes` so the lifecycle suite at default concurrency cannot fail it through observation timing, while it proves more than before: the exit is observed, the session row is retained, and the host session stays serviceable.
+Repair `unix_adapter_unbound_printf_stream_attach_completes` so default-concurrency load cannot fail it through host-projection timing. The exit oracle is the attached terminal subscription's `process_exit` frame (`TerminalEvent::ProcessExit` / wire tag `process_exit`). Do not use `ListSessions.lifecycle` as the exit oracle.
 
-Keep the spawn, attach, empty-drain, and ReadScreen marker sections (lines 684-748) unchanged. The in-loop `drain.events.is_empty()` assertion is deterministic: a Drain for a known session always returns empty events.
+Revision 4 sequence, per `question_1787005265_458413` path D:
 
-Replace the single `ListSessions` assertion (lines 749-759) with:
+1. Spawn `printf 'smoke:<marker>\n'; sleep 1` so the unix adapter can attach while the child is still alive. A printf-only child exits first, and observation then consumes ProcessExited before the subscription can deliver `process_exit`.
+2. Attach through a unix adapter connection on `uap-sub`. Keep host Drain empty of terminal bodies.
+3. Poll opaque unix envelopes until one payload has `type == "process_exit"` for that session and subscription, or fail at a 5-second deadline.
+4. After `process_exit`, call `ListSessions` on the default host connection. The same `session_id` must remain present. Accept lifecycle `running` or `exited`. Panic immediately if the row is absent (`ProcessExited must not shut down the host session`) or `failed`.
+5. Run the existing ReadScreen marker proof on the default host connection.
+6. Prove the retained host session stays serviceable with host Drain on the owning unix adapter connection: Events, empty events.
 
-1. A bounded retention-and-exit poll (5-second deadline, matching the file convention). Each iteration calls `ListSessions` and finds the session row by `session_id`:
-   - Row absent: panic immediately with the retained intent message `ProcessExited must not shut down the host session` plus the listed sessions.
-   - `lifecycle == "exited"`: break the loop.
-   - `lifecycle == "failed"`: panic; a successful printf exit must not classify as failed.
-   - Any other value (transient `running`): call ReadScreen for the session (each call runs `observe_lifecycle_turn`, so observation advances deterministically), sleep 25 ms, and continue.
-   - Deadline exhausted: panic with a message that the session must reach `exited`.
-2. Post-exit serviceability proofs on the same connection, after the poll observes `exited`:
-   - ReadScreen still returns text that contains `smoke:<marker>` (screen content survives process exit).
-   - `drain_subscription(session_id, subscription_id)` still returns an Events response with empty events (a shut-down or removed session would return `missing_session_drain_error` instead).
-3. A short comment stating the oracle: exit observed, row retained, host session serviceable; observation order is not asserted.
-
-Keep the test name. Keep the final `hub.shutdown()`.
+Keep the test name. Keep the final `hub.shutdown()`. Do not add production exact-session observation to ReadScreen. Do not call ShutdownSession as an observation stimulus.
 
 ## Non-scope
 
@@ -130,11 +121,11 @@ Same-target siblings (do not absorb):
 
 ## Assumptions and unknowns
 
-Assumption: the observed failure is an observation-timing race, not a production regression. The lifecycle value in the panic (`exited`) is the required eventual projection state for a fast-exit command. Isolation passes on the branch and on base `547ca38` with the identical command. The failed assertion is the lifecycle string equality, and only load changes the observation order.
+Assumption: the observed failure is an observation-timing race on `ListSessions.lifecycle`, not a production regression. Isolation passed on the branch and on base `547ca38` with the original printf-only command. The failed assertion was the lifecycle string equality.
 
-Assumption: the retention-and-exit poll converges within the 5-second deadline. Each poll iteration issues a ReadScreen, and each ReadScreen runs `observe_lifecycle_turn`, so the ProcessExited journal entry is consumed after a bounded number of iterations. Prior art (`sessions.rs:2070`, `webrtc_proofs.rs:587`) already relies on the same eventual-exited poll shape.
+Assumption: `process_exit` on the bound unix subscription is the durable exit oracle. Implement focused runs showed a printf-only child never delivered that frame, and `printf ...; sleep 1` did. Host Drain for the same subscription must use the owning unix adapter connection; a second default-hello Drain returns `snapshot_stream_forbidden`.
 
-Assumption: ReadScreen and Drain stay serviceable after exit. The registry row persists until `RemoveSession`, the screen buffer is retained, and the Drain handler answers any known session with empty events.
+Assumption: after `process_exit`, the host row stays listed and ReadScreen still shows the marker. Lifecycle may be `running` or `exited`.
 
 Unknown until Implement: whether the failure reproduces on this worktree before the change. Reproduction is load-dependent and probabilistic. The Implement report should attempt a bounded number of pre-change default-concurrency suite runs and must not treat non-reproduction as proof of absence.
 
@@ -150,8 +141,8 @@ No production code changes. No dependency or lockfile changes.
 
 ## Risks
 
-- Requiring eventual `exited` adds a new wait. Mitigation: the poll drives observation itself through ReadScreen on every iteration, so convergence does not depend on background pump timing; the 5-second deadline matches the file's existing waits.
-- The original oracle also guarded against premature teardown while the test believed the session was running. Mitigation: the new poll asserts row presence on every iteration from marker-visibility until `exited`, so retention coverage is continuous and strictly stronger than the old single probe.
+- A printf-only spawn exits before attach, so the `process_exit` oracle never arms. Mitigation: keep `sleep 1` after the marker printf so the unix adapter attaches first.
+- Host Drain from a second connection is forbidden once the unix adapter owns the subscription. Mitigation: run the serviceability Drain on the owning unix adapter connection.
 - The lifecycle suite is red on base through the two known-baseline ready_spawn tests. The binding gate excludes exactly that owned pair and nothing else; the exclusion ends when the ready_spawn repairs merge, and final integration stays strict zero-failure. A further unrelated flake during acceptance runs follows the prior-art rule: exact evidence or a new ticket; do not absorb.
 - Full-suite runs depend on orchestrator slot scheduling; if no slot is available, Implement reports the wait instead of running unslotted suites or weakening the gate.
 - The lib suite retains three known wall-clock assertion sites (`paged_delivery_stays_within_owner_turn_for_a_large_registry`, `first_session_snapshot_is_complete_and_assembled_in_pages`, `no_removal_scan_stays_within_owner_turn` in `src/daemon_entity_subscriptions.rs`). A full `./test.sh --locked` run can flake there. Those roots belong to the sweep recommendation recorded by the near-limit plan, not to this ticket.
@@ -164,8 +155,8 @@ All commands run in the ticket worktree at default concurrency. All suite comman
 2. Targeted repetition: `./test.sh --locked --test hub_daemon_lifecycle_test -- --exact unix_adapter_unbound_printf_stream_attach_completes` passes 20 consecutive runs (shell loop, nonzero exit stops the loop).
 3. Binding default-concurrency gate: `./test.sh --locked --test hub_daemon_lifecycle_test` (full lifecycle binary, default test threads) passes 5 consecutive runs with zero failures excluding the known-baseline ready_spawn pair owned by `ticket_1786938984_190098`. The pre-existing 1 ignored test stays ignored. Preconditions, per the known-baseline section: an explicit orchestrator slot for each full-suite run set, runs strictly serialized, and any ready_spawn occurrence recorded on the owning ticket. This ticket's target test must pass in all 5 runs. If the ready_spawn repairs have already merged by Implement time, integrate that base and bind on strict zero failures instead.
 4. Red-proof, per [[a regression test must be shown to go red with the fix reverted]], with two separate negative controls, both run under the targeted command from check 2:
-   - Control A (retention oracle): temporarily insert `ShutdownSession` plus `RemoveSession` for `uap-session` before the poll. The run must fail at the retention panic (`ProcessExited must not shut down the host session`). This proves the row-presence assertion is live.
-   - Control B (eventual-exit oracle): temporarily change the spawn command to `printf 'smoke:<marker>\n'; sleep 30`. The marker still prints, the process stays alive, and the run must fail at the deadline panic (session must reach `exited`). This proves the exit-observation assertion is live and gives a first-failure site distinct from Control A.
+   - Control A (retention oracle): after `process_exit`, temporarily insert `ShutdownSession` plus `RemoveSession` for `uap-session` before the `ListSessions` presence check. The run must fail at the retention panic (`ProcessExited must not shut down the host session`).
+   - Control B (`process_exit` oracle): temporarily change the spawn command to `printf 'smoke:<marker>\n'; sleep 30`. The marker still prints, the process stays alive, and the run must fail at the `process_exit` deadline. This first-failure site must be distinct from Control A.
    Record both nonzero exit codes and both failure sites in the Implement report, then revert both sabotages.
 5. Strict Rust gates, exact commands: `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --locked -- -D warnings` both pass.
 6. Non-binding smoke: one full `./test.sh --locked` run (the ticket's discovery command) may be reported for information. It contains the full lifecycle suite, so it needs its own orchestrator slot. A failure in a known lib-suite wall-clock root or the known-baseline ready_spawn pair does not bind this ticket; any other failure needs exact evidence and a new ticket.
@@ -175,14 +166,15 @@ Downstream proof: not required. No public surface, DTO, pin, or runtime behavior
 
 ## Vault gaps worth capturing
 
-- Add a sibling gotcha note to [[wall-clock MAX_OWNER_TURN_MS assertions flake under default-concurrency lib load]]: asserting `lifecycle == "running"` after a fast-exit spawn is an observation-timing oracle, because the projection lawfully reaches `exited` without any subscriber. The durable idiom is a retention-and-exit poll plus post-exit serviceability proofs.
-- Capture the mechanism asymmetry: `ReadScreen` runs `observe_lifecycle_turn` while `ListSessions` does not, so a `ListSessions`-only poll depends on background pump timing while a ReadScreen-driven poll observes deterministically.
+- Add a sibling gotcha note to [[wall-clock MAX_OWNER_TURN_MS assertions flake under default-concurrency lib load]]: asserting `lifecycle == "running"` after process exit is an observation-timing oracle. The durable idiom is `process_exit` on the attached terminal subscription, then host-row retention that accepts `running` or `exited`.
+- Capture that marker `ReadScreen` parks ProcessExited, so a later wait for `ListSessions.lifecycle == "exited"` does not converge. `ReadScreen` is not an exact-session observe.
+- Capture that a printf-only child can exit before attach, after which the bound adapter may never deliver `process_exit`.
 
 ## Implement steps
 
 1. Run the prebuild: `cargo build --locked -p botster-core-daemon --bin botster-session-worker`.
 2. Optionally attempt bounded pre-change reproduction with the check-3 suite command (corroborating only).
-3. Edit the test body per Scope items 1-3. Keep the diff inside the one test function.
-4. Run acceptance checks 2, 4, and 5 immediately (focused commands, no slot needed). Run check 3 (the binding suite gate) inside an explicit orchestrator slot with the known-baseline accounting, and check 6 after check 3 in a slot of its own.
+3. Edit the test body per Revision 4 Scope items 1-6. Keep production code unchanged.
+4. Run acceptance checks 2, 4, and 5 immediately (focused commands, no slot needed). Request a new exclusive lifecycle-suite slot only after those focused gates pass. Then run check 3 inside that slot. Run check 6 after check 3 in a slot of its own.
 5. Write the Implement report with red-proof output and run tallies.
 6. Commit the test repair and report. Do not create a PR.
