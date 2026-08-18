@@ -119,6 +119,7 @@ pub struct HubRuntime {
     source_held: std::cell::RefCell<VecDeque<CausalOp>>,
     unsettled_op: std::cell::RefCell<Option<CausalOp>>,
     event_plane_owner_ops: std::cell::RefCell<crate::package_event_router::EventPlaneOwnerOps>,
+    acknowledged_spawn_ids: Mutex<BTreeSet<String>>,
 }
 
 type SharedCoreDaemon = Mutex<CoreDaemon>;
@@ -291,6 +292,7 @@ impl HubRuntime {
             event_plane_owner_ops: std::cell::RefCell::new(
                 crate::package_event_router::EventPlaneOwnerOps::default(),
             ),
+            acknowledged_spawn_ids: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -386,6 +388,7 @@ impl HubRuntime {
             event_plane_owner_ops: std::cell::RefCell::new(
                 crate::package_event_router::EventPlaneOwnerOps::default(),
             ),
+            acknowledged_spawn_ids: Mutex::new(BTreeSet::new()),
         };
         runtime.reconcile_sessions(0)?;
         Ok(runtime)
@@ -3348,10 +3351,40 @@ impl HubRuntime {
         metadata: CoreSessionMetadata,
         now_seconds: u64,
     ) -> Result<CoreSession, CoreDaemonError> {
-        self.core_daemon
+        let requested_id = request.session_id.0.clone();
+        let session = self
+            .core_daemon
             .lock()
             .expect("core daemon mutex")
-            .spawn(SpawnSessionRequest { request, metadata }, now_seconds)
+            .spawn(SpawnSessionRequest { request, metadata }, now_seconds)?;
+        self.record_acknowledged_spawn(requested_id);
+        self.record_acknowledged_spawn(session.session_id.0.clone());
+        Ok(session)
+    }
+
+    /// Record one session id this process already returned from a successful Spawn.
+    pub fn record_acknowledged_spawn(&self, session_id: impl Into<String>) {
+        self.acknowledged_spawn_ids
+            .lock()
+            .expect("acknowledged spawn ids mutex")
+            .insert(session_id.into());
+    }
+
+    /// Drop one pending Spawn acknowledgement after the projection observed it.
+    pub fn retire_acknowledged_spawn(&self, session_id: &str) {
+        self.acknowledged_spawn_ids
+            .lock()
+            .expect("acknowledged spawn ids mutex")
+            .remove(session_id);
+    }
+
+    /// Session ids this process already returned from a successful Spawn.
+    #[must_use]
+    pub fn acknowledged_spawn_ids(&self) -> BTreeSet<String> {
+        self.acknowledged_spawn_ids
+            .lock()
+            .expect("acknowledged spawn ids mutex")
+            .clone()
     }
 
     /// Store hub-owned context for one spawned template session.
@@ -4425,6 +4458,28 @@ fn json_null() -> serde_json::Value {
     serde_json::Value::Null
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_LIFECYCLE_JOURNAL_CAPACITY: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` with a test-only Core lifecycle journal capacity for this thread.
+#[cfg(test)]
+pub fn with_test_lifecycle_journal_capacity<R>(capacity: usize, f: impl FnOnce() -> R) -> R {
+    TEST_LIFECYCLE_JOURNAL_CAPACITY.with(|slot| {
+        let previous = slot.replace(Some(capacity));
+        struct Reset(Option<usize>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                TEST_LIFECYCLE_JOURNAL_CAPACITY.with(|slot| slot.set(self.0));
+            }
+        }
+        let _reset = Reset(previous);
+        f()
+    })
+}
+
 fn core_daemon_config(config: &HubConfig) -> CoreDaemonConfig {
     // Host profile supplies the initial/reset Ghostty color baseline. After
     // attach, current colors come from data-plane GHOSTSNP only.
@@ -4448,6 +4503,10 @@ fn core_daemon_config(config: &HubConfig) -> CoreDaemonConfig {
     }
     if std::env::var("BOTSTER_HUB_TEST_FAIL_SNAPSHOT_HISTORY_AFTER_READY").as_deref() == Ok("1") {
         core = core.with_test_fail_snapshot_history_after_ready(true);
+    }
+    #[cfg(test)]
+    if let Some(capacity) = TEST_LIFECYCLE_JOURNAL_CAPACITY.with(std::cell::Cell::get) {
+        core = core.with_lifecycle_journal_capacity(capacity);
     }
     core
 }
