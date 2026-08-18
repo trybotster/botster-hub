@@ -1081,6 +1081,15 @@ fn take_snapshot_item_page(
     let mut last_id = after.map(str::to_string);
     let mut page_charge = 0usize;
     let mut cut = SnapshotPageCut::Complete;
+    if envelope_bytes > fresh_page_capacity {
+        return SnapshotItemPage {
+            items,
+            last_id,
+            page_charge,
+            bytes: envelope_bytes,
+            cut: SnapshotPageCut::OversizedRow,
+        };
+    }
     if envelope_bytes > remaining_byte_budget {
         return SnapshotItemPage {
             items,
@@ -4026,5 +4035,41 @@ mod tests {
         }
         assert_eq!(state.delivery_phase, DeliveryPhase::Removes);
         assert!(!state.needs_delivery);
+    }
+
+    #[test]
+    fn empty_oversized_envelope_closes_instead_of_yielding_forever() {
+        let projection = sealed_projection([]);
+        let subscription_id = "e".repeat(SESSION_DELIVERY_MAX_BYTES);
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let mut state = assembling_subscription(sender, 1);
+        let envelope = snapshot_envelope_bytes(&subscription_id, &state);
+        assert!(envelope > SESSION_DELIVERY_MAX_BYTES);
+        let mut counters = DaemonLifecycleCounters::default();
+        let closed = continue_session_snapshot_assembly(
+            &subscription_id,
+            &mut state,
+            &projection,
+            true,
+            &mut counters,
+            SESSION_DELIVERY_MAX_ITEMS,
+            SESSION_DELIVERY_MAX_BYTES,
+            SESSION_DELIVERY_MAX_BYTES,
+            Duration::MAX,
+        );
+        assert!(matches!(
+            closed,
+            SnapshotAssemble::Closed {
+                frame_too_large: true
+            }
+        ));
+        let frames: Vec<_> = receiver.try_iter().collect();
+        assert_eq!(frames.len(), 1);
+        assert!(matches!(
+            &frames[0],
+            DaemonEntityFrame::Error { code, .. } if code == "entity_provider_frame_too_large"
+        ));
+        assert!(!state.needs_delivery);
+        assert!(matches!(state.delivery_phase, DeliveryPhase::Removes));
     }
 }
