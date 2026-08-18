@@ -3628,107 +3628,44 @@ fn session_identities_from_entity_frame(
     }
 }
 
-fn record_assemble_identities(
+fn snapshot_session_identities(
     frame: &botster_hub_client::DaemonEntityFrame,
-    expected: &std::collections::BTreeSet<String>,
-    seen: &mut std::collections::BTreeSet<String>,
-) {
-    let identities = session_identities_from_entity_frame(frame)
-        .unwrap_or_else(|error| panic!("{error}"));
-    for id in identities {
-        if expected.contains(&id) {
-            seen.insert(id);
-        }
-    }
+) -> std::collections::BTreeSet<String> {
+    session_identities_from_entity_frame(frame)
+        .unwrap_or_else(|error| panic!("{error}"))
+        .into_iter()
+        .collect()
 }
 
-fn is_entity_read_idle(error: &botster_hub_client::DaemonTransportError) -> bool {
-    let message = error.to_string();
-    message.contains("timed out")
-        || message.contains("WouldBlock")
-        || message.contains("Resource temporarily unavailable")
-        || message.contains("os error 35")
-        || message.contains("os error 11")
-}
-
-fn observe_assemble_sessions(endpoint: &botster_hub_client::DaemonEndpoint) {
-    // ReadScreen is the production exact-session observe path. Subscribe does
-    // not run Observe. One owner Observe slice publishes at most eight live
-    // rows. These 24 control turns observe every load session into the journal
-    // without a wall-clock wait.
-    for index in 0..24 {
-        botster_hub_client::request(
-            endpoint,
-            botster_hub_client::DaemonRequest::ReadScreen {
-                session_id: assemble_session_id(index),
-            },
-        )
-        .expect("ReadScreen observes one assemble session");
-    }
-}
-
-fn drain_until_assemble_sessions_projected(
-    endpoint: &botster_hub_client::DaemonEndpoint,
-    first: botster_hub_client::DaemonEntitySubscription,
-) {
+fn assert_first_snapshot_contains_assemble_sessions(
+    frame: &botster_hub_client::DaemonEntityFrame,
+) -> std::collections::BTreeSet<String> {
+    let seen = snapshot_session_identities(frame);
     let expected = expected_assemble_session_ids();
-    let mut seen = std::collections::BTreeSet::new();
-    let mut subscriptions = vec![first];
-    let mut catchup_subscribes = 0usize;
-    const MAX_CATCHUP_SUBSCRIBES: usize = 8;
+    let missing: Vec<String> = expected.difference(&seen).cloned().collect();
+    assert!(
+        missing.is_empty(),
+        "first Snapshot must contain all 24 assemble identities; missing={missing:?}; seen={}",
+        seen.len()
+    );
+    seen
+}
 
-    observe_assemble_sessions(endpoint);
-    for subscription in &mut subscriptions {
-        subscription
-            .set_read_timeout(Some(Duration::from_millis(200)))
-            .expect("bound assemble projection read");
-    }
-
+fn read_first_session_snapshot(
+    subscription: &mut botster_hub_client::DaemonEntitySubscription,
+) -> botster_hub_client::DaemonEntityFrame {
+    subscription
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .expect("liveness bound for first session snapshot");
     loop {
-        let mut progressed = false;
-        let mut idle = 0usize;
-        for subscription in &mut subscriptions {
-            match subscription.next_frame() {
-                Ok(frame) => {
-                    let before = seen.len();
-                    record_assemble_identities(&frame, &expected, &mut seen);
-                    if seen.len() > before {
-                        progressed = true;
-                    }
-                }
-                Err(error) if is_entity_read_idle(&error) => idle += 1,
-                Err(error) => panic!("assemble projection wait failed: {error}"),
+        match subscription.next_frame() {
+            Ok(frame @ botster_hub_client::DaemonEntityFrame::Snapshot { .. }) => return frame,
+            Ok(botster_hub_client::DaemonEntityFrame::Error { code, message, .. }) => {
+                panic!("assemble subscription error: {code}: {message}");
             }
+            Ok(_) => {}
+            Err(error) => panic!("first Snapshot liveness wait failed: {error}"),
         }
-        if assemble_sessions_are_ready(&seen) {
-            for subscription in subscriptions {
-                let _ = subscription.unsubscribe();
-            }
-            return;
-        }
-        if progressed || idle < subscriptions.len() {
-            continue;
-        }
-        // Quiet streams need JournalPull and ProjectionApply. Another
-        // Subscribe is that production catch-up turn. Bound the loop by
-        // those turns, not by wall clock.
-        if catchup_subscribes >= MAX_CATCHUP_SUBSCRIBES {
-            let missing: Vec<String> = expected.difference(&seen).cloned().collect();
-            panic!(
-                "assemble projection must include all 24 load-session identities after ReadScreen observe and {MAX_CATCHUP_SUBSCRIBES} Subscribe catch-up turns; missing={missing:?}; seen={}",
-                seen.len()
-            );
-        }
-        let extra = botster_hub_client::subscribe_session_entities(
-            endpoint,
-            format!("assemble-catchup-{catchup_subscribes}"),
-        )
-        .expect("catch-up subscribe advances journal pull and projection apply");
-        extra
-            .set_read_timeout(Some(Duration::from_millis(200)))
-            .expect("bound catch-up projection read");
-        subscriptions.push(extra);
-        catchup_subscribes += 1;
     }
 }
 
@@ -3776,13 +3713,9 @@ fn ready_spawn_completes_during_session_snapshot_assembly() {
     // `queued_control_precedes_a_due_maintenance_slice` in
     // `src/daemon_transport.rs`. End-to-end wall-clock latency through a
     // daemon child measures ambient machine load and is recorded only.
-    // The required oracle is the exact 24 assemble-session identities.
-    // Parked by question_1787007562_222481 option 3 until
-    // ticket_1787007684_566852 lands a deterministic named-session
-    // journal-publication path. ReadScreen plus Subscribe catch-up is the
-    // strongest test-only stimulus tried here and is not sufficient.
-    // Fail immediately on DaemonEntityFrame::Error. Do not use a live-frame
-    // predicate or a wall-clock convergence bound.
+    // The first Snapshot is the production completeness oracle: it must
+    // contain all 24 assemble identities. A later ready-spawn row is a
+    // permitted superset. Fail immediately on DaemonEntityFrame::Error.
     let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("snapshot-assemble-ready");
     let config = explicit_config(&data_dir);
@@ -3797,19 +3730,26 @@ fn ready_spawn_completes_during_session_snapshot_assembly() {
     );
     let child = start_cli_daemon(&data_dir);
     for index in 0..24 {
-        botster_hub_client::request(
+        let session_id = assemble_session_id(index);
+        let spawn = botster_hub_client::request(
             &endpoint,
             botster_hub_client::DaemonRequest::Spawn {
-                session_id: assemble_session_id(index),
+                session_id: session_id.clone(),
                 command: "sleep 8".to_string(),
             },
         )
-        .expect("spawn assemble session");
+        .unwrap_or_else(|error| panic!("spawn {session_id}: {error}"));
+        assert_eq!(
+            spawn.kind,
+            botster_hub_client::DaemonResponseKind::Spawned,
+            "assemble spawn {session_id} must succeed: {spawn:?}"
+        );
     }
-    let subscription = botster_hub_client::subscribe_session_entities(&endpoint, "assemble-sub")
-        .expect("assemble subscriber");
+    let mut subscription =
+        botster_hub_client::subscribe_session_entities(&endpoint, "assemble-sub")
+            .expect("assemble subscriber");
     let started = Instant::now();
-    botster_hub_client::request(
+    let ready = botster_hub_client::request(
         &endpoint,
         botster_hub_client::DaemonRequest::Spawn {
             session_id: "assemble-ready-spawn".to_string(),
@@ -3817,9 +3757,16 @@ fn ready_spawn_completes_during_session_snapshot_assembly() {
         },
     )
     .expect("ready spawn during snapshot assembly");
+    assert_eq!(
+        ready.kind,
+        botster_hub_client::DaemonResponseKind::Spawned,
+        "ready spawn must succeed: {ready:?}"
+    );
     let waited = started.elapsed();
     eprintln!("ready spawn duration observation (snapshot assembly): {waited:?}");
-    drain_until_assemble_sessions_projected(&endpoint, subscription);
+    let first = read_first_session_snapshot(&mut subscription);
+    assert_first_snapshot_contains_assemble_sessions(&first);
+    let _ = subscription.unsubscribe();
     shutdown_cli_daemon(&data_dir, child);
 }
 

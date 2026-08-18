@@ -438,6 +438,16 @@ pub struct MaintenanceState {
     pub observe_resume: Option<ObserveLifecycleCursor>,
     pub pending_changes: VecDeque<SessionLifecycleChange>,
     pub baseline: Option<BaselineRecovery>,
+    /// Latest journal source watermark observed by a successful pull.
+    pub journal_source_watermark: Option<SessionLifecycleCursor>,
+    /// True after a successful pull that returned no changes at the watermark.
+    pub journal_caught_up_confirmed: bool,
+    /// Session ids whose Spawn reply this Hub process already returned.
+    /// The first snapshot waits until the projection contains every id.
+    pub acknowledged_spawn_ids: BTreeSet<String>,
+    /// True after this process has returned at least one successful Spawn.
+    /// An empty acknowledged set must not count as caught-up after that.
+    pub returned_successful_spawn: bool,
     pub session_family: SessionFamilyBridge,
     pub last_owner_turn: Duration,
     pub journal_page_reads: u64,
@@ -465,6 +475,7 @@ impl MaintenanceState {
 
     /// After an authoritative mutation, pull the journal on the next idle turn.
     pub fn note_authoritative_mutation(&mut self) {
+        self.journal_caught_up_confirmed = false;
         self.scheduler.prefer_journal_pull();
     }
 
@@ -476,6 +487,136 @@ impl MaintenanceState {
             || self.session_family.has_work()
             || !self.pending_retirements.is_empty()
     }
+
+    /// True when the canonical session projection has consumed the latest
+    /// observed journal watermark. First session snapshots wait for this.
+    ///
+    /// The comparison uses the latest stored watermark, not a subscribe-time
+    /// snapshot. Pulls observe that watermark and outpace single-row mutations
+    /// 16:1, so a stable fixture set terminates.
+    #[must_use]
+    pub fn projection_caught_up(&self) -> bool {
+        if !self.projection.baseline_complete || self.projection.gap || self.baseline.is_some() {
+            return false;
+        }
+        if !self.pending_changes.is_empty() {
+            return false;
+        }
+        let Some(cursor) = self.projection.cursor.as_ref() else {
+            return false;
+        };
+        let Some(watermark) = self.journal_source_watermark.as_ref() else {
+            return false;
+        };
+        if cursor.source_id != watermark.source_id {
+            return false;
+        }
+        if !self.journal_caught_up_confirmed || cursor.sequence < watermark.sequence {
+            return false;
+        }
+        if self.returned_successful_spawn && self.acknowledged_spawn_ids.is_empty() {
+            return false;
+        }
+        self.acknowledged_spawn_ids
+            .iter()
+            .all(|session_id| self.projection.rows.contains_key(session_id))
+    }
+}
+
+/// Copy process-level Spawn acknowledgements onto owner-loop state.
+///
+/// Union, do not replace. A replace would wipe control-path inserts when the
+/// runtime set is still empty and make an empty set vacuously caught-up.
+pub fn sync_acknowledged_spawns(runtime: &HubRuntime, state: &mut MaintenanceState) {
+    let ids = runtime.acknowledged_spawn_ids();
+    if !ids.is_empty() {
+        state.returned_successful_spawn = true;
+    }
+    state.acknowledged_spawn_ids.extend(ids);
+    if !state.acknowledged_spawn_ids.is_empty() {
+        state.returned_successful_spawn = true;
+    }
+}
+
+fn acknowledged_spawns_missing_from_projection(state: &MaintenanceState) -> bool {
+    if !state.returned_successful_spawn {
+        return false;
+    }
+    state.acknowledged_spawn_ids.is_empty()
+        || state
+            .acknowledged_spawn_ids
+            .iter()
+            .any(|session_id| !state.projection.rows.contains_key(session_id))
+}
+
+fn journal_consume_is_at_watermark(state: &MaintenanceState) -> bool {
+    if state.journal_caught_up_confirmed {
+        return true;
+    }
+    match (
+        state.projection.cursor.as_ref(),
+        state.journal_source_watermark.as_ref(),
+    ) {
+        (Some(cursor), Some(watermark)) => {
+            cursor.source_id == watermark.source_id && cursor.sequence >= watermark.sequence
+        }
+        _ => false,
+    }
+}
+
+fn rewind_journal_cursor(state: &mut MaintenanceState) {
+    if let Some(cursor) = state.projection.cursor.as_mut() {
+        cursor.sequence = 0;
+    }
+    state.journal_caught_up_confirmed = false;
+    state.scheduler.prefer_journal_pull();
+}
+
+/// Hold first-snapshot completion when Core list() is ahead of the projection.
+///
+/// A freeze minted at the current watermark can omit live registry rows whose
+/// journal sequences are already at or below that watermark. Reminting another
+/// freeze at the same watermark repeats the omission. Rewind the journal
+/// cursor so those rows are pulled again. This read does not publish Spawn
+/// identity and does not replace Observe.
+pub fn refresh_projection_if_inventory_ahead(
+    runtime: &HubRuntime,
+    state: &mut MaintenanceState,
+) -> bool {
+    sync_acknowledged_spawns(runtime, state);
+    if acknowledged_spawns_missing_from_projection(state) && journal_consume_is_at_watermark(state)
+    {
+        rewind_journal_cursor(state);
+        return false;
+    }
+    if !state.projection_caught_up() {
+        return false;
+    }
+    let sessions = match runtime.list_sessions() {
+        Ok(sessions) => sessions,
+        Err(_) => {
+            state.journal_caught_up_confirmed = false;
+            state.scheduler.prefer_journal_pull();
+            return false;
+        }
+    };
+    let inventory_ahead = sessions.len() > state.projection.rows.len()
+        || sessions
+            .iter()
+            .any(|session| !state.projection.rows.contains_key(&session.session_id.0));
+    if !inventory_ahead {
+        return true;
+    }
+    rewind_journal_cursor(state);
+    false
+}
+
+fn journal_caught_up_after_pull(
+    received: bool,
+    at_watermark: bool,
+    journal_advanced: bool,
+) -> bool {
+    !received && at_watermark && !journal_advanced
 }
 
 fn session_chunk_frame(sequence: u64, items: &[serde_json::Value]) -> serde_json::Value {
@@ -594,7 +735,7 @@ fn run_observe_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
 fn run_journal_pull_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
     let woke = runtime.take_journal_advanced_wake();
     if state.baseline.is_some() || !state.projection.baseline_complete {
-        if woke && state.baseline.is_none() {
+        if woke && state.baseline.is_none() && !state.session_family.need_gap_pass {
             start_baseline_recovery(state);
         }
         return;
@@ -613,12 +754,19 @@ fn run_journal_pull_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
                 handle_resync_reason(state, reason);
                 return;
             }
+            state.journal_source_watermark = Some(page.source_watermark.clone());
             let received = !page.changes.is_empty();
+            let at_watermark = page.next == page.source_watermark;
+            let journal_advanced = woke || runtime.take_journal_advanced_wake();
+            // An empty page can still be stale when a journal-advanced wake
+            // arrives in the same slice. Confirmation must wait for a later
+            // pull that sees no wake.
+            state.journal_caught_up_confirmed =
+                journal_caught_up_after_pull(received, at_watermark, journal_advanced);
             state.pending_changes.extend(page.changes);
-            if received || page.next != page.source_watermark {
-                state.scheduler.try_wake();
-            }
-            if runtime.take_journal_advanced_wake() {
+            if journal_advanced && !received {
+                state.scheduler.prefer_journal_pull();
+            } else if received || !at_watermark || journal_advanced {
                 state.scheduler.try_wake();
             }
         }
@@ -645,8 +793,8 @@ fn run_projection_apply_slice(state: &mut MaintenanceState) {
     }
     if applied > 0 {
         state.projection_dirty = true;
-    }
-    if applied > 0 || !state.pending_changes.is_empty() {
+        state.scheduler.prefer_subscriber_delivery();
+    } else if !state.pending_changes.is_empty() {
         state.scheduler.try_wake();
     }
 }
@@ -680,6 +828,15 @@ fn run_baseline_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
             if complete {
                 state.baseline = None;
                 state.projection.seal_baseline(snapshot.clone());
+                // The freeze watermark can already equal the current source
+                // watermark while omitted Spawn rows remain only in the
+                // journal. Consume from the origin instead of treating seal
+                // as journal completion.
+                if let Some(cursor) = state.projection.cursor.as_mut() {
+                    cursor.sequence = 0;
+                }
+                state.journal_caught_up_confirmed = false;
+                state.scheduler.prefer_journal_pull();
                 state.projection_dirty = true;
                 begin_family_snapshots(state, snapshot.sequence);
             } else {
@@ -995,6 +1152,8 @@ fn run_completion_drain_slice(runtime: &HubRuntime, state: &mut MaintenanceState
 pub fn start_baseline_recovery(state: &mut MaintenanceState) {
     state.projection.begin_baseline_recovery();
     state.pending_changes.clear();
+    state.journal_source_watermark = None;
+    state.journal_caught_up_confirmed = false;
     state.observe_resume = None;
     state.session_family.need_gap_pass = true;
     state.session_family.gap_after = None;
@@ -2136,5 +2295,370 @@ mod tests {
                 .and_then(|job| job.after.as_deref()),
             Some("plugin.00")
         );
+    }
+
+    fn source_cursor(sequence: u64) -> SessionLifecycleCursor {
+        SessionLifecycleCursor {
+            source_id: botster_core_daemon::SessionLifecycleSourceId("s".into()),
+            sequence,
+        }
+    }
+
+    fn sealed_maintenance(cursor: u64, watermark: Option<u64>) -> MaintenanceState {
+        let mut projection = SessionProjection::default();
+        projection.seal_baseline(source_cursor(cursor));
+        MaintenanceState {
+            projection,
+            journal_source_watermark: watermark.map(source_cursor),
+            journal_caught_up_confirmed: watermark.is_some(),
+            ..MaintenanceState::default()
+        }
+    }
+
+    fn pending_upsert(sequence: u64, id: &str) -> SessionLifecycleChange {
+        SessionLifecycleChange {
+            cursor: source_cursor(sequence),
+            kind: botster_core_daemon::SessionLifecycleChangeKind::Upsert {
+                record: test_record(id),
+            },
+        }
+    }
+
+    #[test]
+    fn projection_caught_up_holds_while_pending_changes_remain() {
+        let mut state = sealed_maintenance(0, Some(1));
+        state
+            .pending_changes
+            .push_back(pending_upsert(1, "pending"));
+        assert!(!state.projection_caught_up());
+    }
+
+    #[test]
+    fn projection_caught_up_holds_while_cursor_is_behind_the_watermark() {
+        let state = sealed_maintenance(4, Some(12));
+        assert!(state.pending_changes.is_empty());
+        assert!(!state.projection_caught_up());
+    }
+
+    #[test]
+    fn projection_caught_up_when_baseline_matches_the_observed_watermark() {
+        let state = sealed_maintenance(12, Some(12));
+        assert!(state.projection_caught_up());
+    }
+
+    #[test]
+    fn projection_caught_up_holds_until_acknowledged_spawns_are_projected() {
+        let mut state = sealed_maintenance(12, Some(12));
+        state.returned_successful_spawn = true;
+        assert!(
+            !state.projection_caught_up(),
+            "an empty acknowledged set must not count as caught-up after a successful Spawn"
+        );
+        state
+            .acknowledged_spawn_ids
+            .insert("assemble-session-00".to_string());
+        assert!(!state.projection_caught_up());
+        state.projection.rows.insert(
+            "assemble-session-00".to_string(),
+            crate::session_projection::SessionProjectionRow {
+                record: test_record("assemble-session-00"),
+                lifecycle_class: "current",
+                live_ended: false,
+                change_seq: 12,
+            },
+        );
+        assert!(state.projection_caught_up());
+    }
+
+    #[test]
+    fn projection_caught_up_rejects_a_mismatched_source_id() {
+        let mut state = sealed_maintenance(12, Some(12));
+        state.journal_source_watermark = Some(SessionLifecycleCursor {
+            source_id: botster_core_daemon::SessionLifecycleSourceId("other".into()),
+            sequence: 12,
+        });
+        assert!(!state.projection_caught_up());
+    }
+
+    #[test]
+    fn empty_journal_pull_does_not_confirm_when_a_journal_wake_arrives() {
+        assert!(journal_caught_up_after_pull(false, true, false));
+        assert!(
+            !journal_caught_up_after_pull(false, true, true),
+            "an empty pull at the watermark is stale when a journal-advanced wake arrives"
+        );
+        assert!(!journal_caught_up_after_pull(true, true, false));
+        assert!(!journal_caught_up_after_pull(false, false, false));
+    }
+
+    #[test]
+    fn authoritative_mutation_clears_journal_catch_up_confirmation() {
+        let mut state = sealed_maintenance(12, Some(12));
+        assert!(state.projection_caught_up());
+        state.note_authoritative_mutation();
+        assert!(!state.journal_caught_up_confirmed);
+        assert!(!state.projection_caught_up());
+    }
+
+    #[test]
+    fn start_baseline_recovery_clears_the_journal_watermark() {
+        let mut state = sealed_maintenance(12, Some(12));
+        assert!(state.projection_caught_up());
+        start_baseline_recovery(&mut state);
+        assert!(state.journal_source_watermark.is_none());
+        assert!(!state.projection_caught_up());
+    }
+
+    #[test]
+    fn inventory_ahead_of_a_caught_up_projection_rewinds_the_journal_cursor() {
+        let data_directory = std::env::temp_dir().join(format!(
+            "hub-inventory-ahead-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let config = crate::HubStartupOptions {
+            host: crate::HostIdentityOptions {
+                id: "inventory-ahead".to_string(),
+                display_name: "Inventory Ahead".to_string(),
+                fingerprint: None,
+            },
+            data_directory: crate::DataDirectoryOption::Explicit(data_directory.clone()),
+            session_defaults: crate::SessionDefaults {
+                shell: "/bin/sh".to_string(),
+                working_directory: Some(".".into()),
+                initial_rows: 24,
+                initial_cols: 80,
+            },
+            transports: crate::TransportBindings::default(),
+            ..crate::HubStartupOptions::default()
+        }
+        .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
+        .expect("config");
+        let mut runtime = HubRuntime::new(config);
+        for index in 0..3 {
+            let id = format!("inventory-session-{index:02}");
+            runtime
+                .spawn_session(
+                    botster_core::SessionSpawnRequest {
+                        request_id: RequestId(format!("inventory-spawn-{id}")),
+                        session_id: SessionId(id),
+                        executable: "/bin/sleep".to_string(),
+                        arguments: vec!["8".to_string()],
+                        working_directory: botster_core::SpawnWorkingDirectory {
+                            path: ".".to_string(),
+                        },
+                        environment: botster_core::SpawnEnvironment::default(),
+                        initial_pty_size: Some(botster_core::ResizePayload { rows: 24, cols: 80 }),
+                    },
+                    botster_core::CoreSessionMetadata::new(),
+                    1,
+                )
+                .expect("spawn inventory session");
+        }
+        let mut state = sealed_maintenance(12, Some(12));
+        assert!(
+            state.projection_caught_up(),
+            "an empty acknowledged set is still vacuously caught-up before any Spawn"
+        );
+        state
+            .acknowledged_spawn_ids
+            .insert("control-path-session".to_string());
+        state.returned_successful_spawn = true;
+        assert!(!state.projection_caught_up());
+        assert!(
+            !refresh_projection_if_inventory_ahead(&runtime, &mut state),
+            "a projection that omits acknowledged Spawn ids must rewind"
+        );
+        assert!(
+            state
+                .acknowledged_spawn_ids
+                .contains("control-path-session"),
+            "sync must union, not replace, control-path acknowledgements"
+        );
+        assert!(state.returned_successful_spawn);
+        assert!(state.acknowledged_spawn_ids.len() >= 4);
+        assert_eq!(
+            state
+                .projection
+                .cursor
+                .as_ref()
+                .map(|cursor| cursor.sequence),
+            Some(0)
+        );
+        assert!(state.projection.baseline_complete);
+        assert!(state.baseline.is_none());
+        assert!(!state.journal_caught_up_confirmed);
+        assert!(!state.projection_caught_up());
+        for index in 0..3 {
+            let _ = runtime.shutdown_session(SessionId(format!("inventory-session-{index:02}")), 2);
+        }
+        let _ = std::fs::remove_dir_all(data_directory);
+    }
+
+    #[test]
+    fn projection_apply_prefers_subscriber_delivery_after_applied_changes() {
+        let mut state = sealed_maintenance(0, Some(1));
+        state.pending_changes.push_back(pending_upsert(1, "new"));
+        run_projection_apply_slice(&mut state);
+        assert_eq!(
+            state.scheduler.take_slice(),
+            MaintenanceSliceKind::SubscriberDelivery
+        );
+    }
+
+    #[test]
+    fn twenty_four_pending_changes_reach_completion_across_unchanged_apply_slices() {
+        assert_eq!(APPLY_MAX_CHANGES, 16);
+        assert_eq!(JOURNAL_PAGE_MAX_CHANGES, 16);
+        let mut state = sealed_maintenance(0, Some(24));
+        state.journal_caught_up_confirmed = false;
+        for index in 0..24 {
+            state
+                .pending_changes
+                .push_back(pending_upsert(index as u64 + 1, &format!("row-{index:02}")));
+        }
+        assert!(!state.projection_caught_up());
+        run_projection_apply_slice(&mut state);
+        assert_eq!(state.pending_changes.len(), 8);
+        assert_eq!(
+            state
+                .projection
+                .cursor
+                .as_ref()
+                .map(|cursor| cursor.sequence),
+            Some(16)
+        );
+        assert!(!state.projection_caught_up());
+        run_projection_apply_slice(&mut state);
+        assert!(state.pending_changes.is_empty());
+        assert_eq!(state.projection.rows.len(), 24);
+        assert!(
+            !state.projection_caught_up(),
+            "apply to the watermark still requires a confirming empty journal pull"
+        );
+        state.journal_caught_up_confirmed = true;
+        assert!(state.projection_caught_up());
+    }
+
+    #[test]
+    fn late_projection_recovers_more_than_one_baseline_page_to_the_watermark() {
+        let data_directory = std::env::temp_dir().join(format!(
+            "hub-late-projection-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let config = crate::HubStartupOptions {
+            host: crate::HostIdentityOptions {
+                id: "late-projection".to_string(),
+                display_name: "Late Projection".to_string(),
+                fingerprint: None,
+            },
+            data_directory: crate::DataDirectoryOption::Explicit(data_directory.clone()),
+            session_defaults: crate::SessionDefaults {
+                shell: "/bin/sh".to_string(),
+                working_directory: Some(".".into()),
+                initial_rows: 24,
+                initial_cols: 80,
+            },
+            transports: crate::TransportBindings::default(),
+            ..crate::HubStartupOptions::default()
+        }
+        .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
+        .expect("config");
+        let mut runtime = HubRuntime::new(config);
+        let expected = (0..20)
+            .map(|index| format!("recover-session-{index:02}"))
+            .collect::<BTreeSet<_>>();
+        for id in &expected {
+            runtime
+                .spawn_session(
+                    botster_core::SessionSpawnRequest {
+                        request_id: RequestId(format!("recover-spawn-{id}")),
+                        session_id: SessionId(id.clone()),
+                        executable: "/bin/sleep".to_string(),
+                        arguments: vec!["8".to_string()],
+                        working_directory: botster_core::SpawnWorkingDirectory {
+                            path: ".".to_string(),
+                        },
+                        environment: botster_core::SpawnEnvironment::default(),
+                        initial_pty_size: Some(botster_core::ResizePayload { rows: 24, cols: 80 }),
+                    },
+                    botster_core::CoreSessionMetadata::new(),
+                    1,
+                )
+                .expect("spawn recovery session");
+        }
+        let mut state = MaintenanceState::default();
+        start_baseline_recovery(&mut state);
+        for _ in 0..8 {
+            run_maintenance_kind(&runtime, &mut state, MaintenanceSliceKind::HostBridge);
+            if state.baseline.is_some() {
+                break;
+            }
+        }
+        assert!(
+            state.baseline.is_some(),
+            "late projection must arm baseline recovery after the gap pass"
+        );
+        for _ in 0..8 {
+            run_maintenance_kind(&runtime, &mut state, MaintenanceSliceKind::Baseline);
+            if state.projection.baseline_complete && state.baseline.is_none() {
+                break;
+            }
+        }
+        assert!(
+            state.projection.baseline_complete,
+            "late projection must seal baseline pages"
+        );
+        assert_eq!(
+            state
+                .projection
+                .cursor
+                .as_ref()
+                .map(|cursor| cursor.sequence),
+            Some(0),
+            "seal must rewind the journal cursor so omitted freeze members are pulled"
+        );
+        assert!(
+            !state.projection_caught_up(),
+            "seal must not complete the journal consume"
+        );
+        assert!(
+            state.projection.rows.len() > BASELINE_PAGE_BUDGET.max_rows,
+            "recovery fixture must exceed one baseline page"
+        );
+        for _ in 0..16 {
+            run_maintenance_kind(&runtime, &mut state, MaintenanceSliceKind::JournalPull);
+            run_maintenance_kind(&runtime, &mut state, MaintenanceSliceKind::ProjectionApply);
+            if state.projection_caught_up() {
+                break;
+            }
+        }
+        assert!(
+            state.projection_caught_up(),
+            "late projection must consume the journal to the source watermark"
+        );
+        let recovered = state
+            .projection
+            .rows
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert!(
+            expected.is_subset(&recovered),
+            "late projection missing {:?}; recovered={}",
+            expected.difference(&recovered).cloned().collect::<Vec<_>>(),
+            recovered.len()
+        );
+        for id in &expected {
+            let _ = runtime.shutdown_session(SessionId(id.clone()), 2);
+        }
+        let _ = std::fs::remove_dir_all(data_directory);
     }
 }

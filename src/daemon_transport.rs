@@ -2391,6 +2391,16 @@ pub(crate) fn handle_control_message(
                 overlay_live_attach_occupancy(status, daemon, state);
             }
             if request_succeeded(response.as_ref()) {
+                if let DaemonRequest::Spawn { session_id, .. } = &request {
+                    state.maintenance.returned_successful_spawn = true;
+                    state
+                        .maintenance
+                        .acknowledged_spawn_ids
+                        .insert(session_id.clone());
+                    if let Some(runtime) = daemon.runtime() {
+                        runtime.record_acknowledged_spawn(session_id.clone());
+                    }
+                }
                 if reconcile_after_request {
                     state.maintenance.note_authoritative_mutation();
                 } else if matches!(request, DaemonRequest::PluginSurfaceAction { .. })
