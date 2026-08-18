@@ -386,7 +386,7 @@ fn daemon_shutdown_during_hub_update_check_is_bounded_and_leak_free() {
 
     let started = Instant::now();
     let shutdown = request_cli_daemon_shutdown(&data_dir).expect("request daemon shutdown");
-    let daemon = wait_for_cli_daemon_shutdown(&shutdown, child);
+    let daemon = wait_for_cli_daemon_shutdown(&shutdown, child.disarm());
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "shutdown exceeded bounded provider timeout: {:?}",
@@ -597,7 +597,7 @@ fn cli_local_runtime_up_starts_reuses_and_down_stops_runtime() {
     write_botster_tui_package(&tui_package_dir);
     write_botster_workspaces_local_package(&workspaces_package_dir, "botster-workspaces");
 
-    let web_listener_port = unused_loopback_port();
+    let web_listener_port = 0;
     let first = run_local_runtime_up(
         &data_dir,
         &project_pipelines_package_dir,
@@ -766,7 +766,7 @@ fn cli_local_runtime_up_starts_reuses_and_down_stops_runtime() {
         &web_package_dir,
         &tui_package_dir,
         &workspaces_package_dir,
-        unused_loopback_port(),
+        0,
     );
     assert!(
         restarted.status.success(),
@@ -898,10 +898,10 @@ fn cli_shutdown_waits_until_metadata_owned_daemon_is_reaped() {
         .local_socket
         .expect("local socket binding")
         .path;
-    let mut daemon = ReapingChild::new(start_cli_daemon_with_session_worker(
+    let mut daemon = start_cli_daemon_with_session_worker(
         &data_dir,
         &session_worker_binary_path(),
-    ));
+    );
     let daemon_pid = daemon.child_mut().id();
     write_local_runtime_daemon_metadata(&data_dir, daemon_pid);
     let before_shutdown = process_snapshot(daemon_pid).expect("ready daemon process snapshot");
@@ -960,7 +960,7 @@ fn cli_shutdown_waits_until_metadata_owned_daemon_is_reaped() {
         thread::sleep(Duration::from_millis(20));
     }
 
-    let daemon_output = daemon.wait_with_output();
+    let daemon_output = daemon.wait_with_output().expect("wait for metadata-owned daemon");
     assert!(
         daemon_output.status.success(),
         "daemon did not exit cleanly before reap: status={} stdout={:?} stderr={:?}",
@@ -1018,7 +1018,7 @@ fn cli_local_runtime_up_reports_missing_installed_checkout_before_launch() {
         &web_package_dir,
         &tui_package_dir,
         &workspaces_package_dir,
-        unused_loopback_port(),
+        0,
     );
     assert!(
         first.status.success(),
@@ -1513,7 +1513,7 @@ fn cli_doctor_reports_healthy_runtime_checks() {
         &web_package_dir,
         &tui_package_dir,
         &workspaces_package_dir,
-        unused_loopback_port(),
+        0,
     );
     assert!(
         up.status.success(),
@@ -2510,7 +2510,7 @@ fn process_ownership_daemon_restart_adopts_then_shuts_down_worker_session() {
     );
     drop(pre_restart);
 
-    shutdown_cli_daemon(&data_dir, child);
+    shutdown_cli_daemon(&data_dir, child.transfer_sessions());
     let restarted_child = start_cli_daemon(&data_dir);
 
     let status = botster_hub::daemon_transport_request(&config, botster_hub::DaemonRequest::Status)

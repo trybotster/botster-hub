@@ -2489,7 +2489,7 @@ fn daemon_spawns_repo_local_session_type_after_state_reload() {
     wait_for_session_type_metadata(&mut first, "repo-session-type", "repo:runtime/init");
     drop(first);
 
-    shutdown_cli_daemon(&data_dir, child);
+    shutdown_cli_daemon(&data_dir, child.transfer_sessions());
     let restarted = start_cli_daemon(&data_dir);
     let mut second =
         botster_hub_client::subscribe_session_entities(&endpoint, "repo-session-type-restarted")

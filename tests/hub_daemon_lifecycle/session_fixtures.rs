@@ -375,6 +375,7 @@ pub(crate) fn start_isolated_live_output_hub_with_worker(
     session_worker_bin: impl Into<PathBuf>,
     extra_env: &[(&str, &str)],
 ) -> botster_hub_test_support::IsolatedHub {
+    check_harness_taint();
     let mut builder = botster_hub_test_support::IsolatedHubBuilder::new()
         .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
         .session_worker_bin(session_worker_bin)
