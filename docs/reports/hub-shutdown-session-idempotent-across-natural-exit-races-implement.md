@@ -11,13 +11,13 @@
 | Plan | `docs/plans/hub-shutdown-session-idempotent-across-natural-exit-races.md` @ `075e9e6` |
 | Decision gate | Rule B, then orchestrator option 3 |
 | Closed Core dependency | `ticket_1787015956_494734` / `dependency_1787015963_708930` closed |
-| Open Core dependency | `ticket_1787034922_646556` / `dependency_1787034941_200828` / run `run_1787034943_217745` |
-| Core pin | `d981bb03f91e2d13428000ac989c50d794f659b2` (kept; current Core origin/main) |
+| Closed Core dependency | `ticket_1787034922_646556` / `dependency_1787034941_200828` closed at `302c7f7` |
+| Core pin | `302c7f7b61f3970a0151b8c6646fc21ae7bd6c67` |
 | Hub main integrated | `bf249af` via merge commit `6cc0c12` |
-| Prior Review return | `review_1787033530_630528` resolved at `57cbeb2` |
-| Current Review return | `review_1787034725_875591` `changes_required` |
+| Prior Review return | `review_1787034725_875591` diagnosed at `9300a22` |
+| Current Review return | `review_1787034725_875591` repaired by Core merge + Hub repin |
 | Merge policy | direct; no pull request |
-| Review requested | no; this leaf is blocked on the new Core dependency |
+| Review requested | yes, after Core `302c7f7` repin and full live-proof table |
 
 Inventory source: `git diff --name-only origin/main...HEAD` after this visit's commit. Do not treat an earlier intra-branch pin inventory as current.
 
@@ -62,15 +62,11 @@ Convention conflicts: none.
 
 ## Review-return repairs this visit
 
-`review_1787034725_875591` accepted the setsid owner and the d981bb03 pin ancestry. It returned one high product finding and one medium process finding.
+`review_1787034725_875591` returned two open findings. The prior visit diagnosed Core-side live-output loss and registered `ticket_1787034922_646556`. That Core ticket is now closed. Core `origin/main` is `302c7f7b61f3970a0151b8c6646fc21ae7bd6c67`. `d981bb03` is an ancestor of `302c7f7`. The pin-moving commit is `968792d` (`Keep bound live bytes visible across ProcessExited writer-barrier rounds`).
 
-`finding_1787034725_966366`: `external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup` loses live bytes after round 0 at Core pin `d981bb03`. Review ran 4/4 red (`got []` at `webrtc_proofs.rs:581`). This visit ran 1 isolated pass, then 3/4 red (rounds 2, 1, 1). Review ran the same command 3/3 green in a clean `bf249af` worktree at Core `fd66efd`. The Hub test function is byte-identical to origin/main. Current Core origin/main is still `d981bb03`, so there is no newer Core merge to pin.
+`finding_1787034725_966366`: Hub now pins Core `302c7f7`. The Hub live-byte oracle is unchanged. `external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup` passed 5/5 at the new pin (15.00s, 5.71s, 8.19s, 8.30s, 6.28s). The pin was not rolled back to `fd66efd`.
 
-Diagnosis: Core-side. Hub ReadScreen and WebRTC forwarding on this path did not change. Core `c23b833` and `dbb4cbc` deliver `ProcessExited` on payload and treat `FRAME_PROCESS_EXITED` as a terminal writer barrier. Later spawn/attach/exit/shutdown rounds on one daemon then fail to deliver already-written live bytes. That is the [[retention without a reachable flush is data loss]] class across process generations. Hub must not roll the pin back to `fd66efd`.
-
-Registered Core ticket `ticket_1787034922_646556` on `tgt_1f7bce66eb304881980f9b4a2a5ae3fe`. Edge `dependency_1787034941_200828` is open. Dependency run `run_1787034943_217745` started at Plan. This Hub step does not request Review.
-
-`finding_1787034725_136720`: this report now includes the idempotent-cleanup row at the current pin. After the Core fix merges, Implement will repin forward and rerun every live proof, including this test, with fresh timings.
+`finding_1787034725_136720`: the test table below has a fresh row for every previously cited live proof plus units at pin `302c7f7`.
 
 Prior `review_1787033530_630528` findings remain resolved at `57cbeb2`. Prior `review_1787032735_498956` findings remain resolved at `e9683de`. Prior `review_1787030054_829721` findings remain resolved at `f4d9f0f`. Prior `review_1787029110_848811` findings remain resolved at `2320ba4`. Prior `review_1787028521_313736` findings remain resolved at `286c1ab`. Prior `review_1787027565_578625` findings remain resolved at `7071f42`.
 
@@ -92,12 +88,13 @@ Prior `review_1787032735_498956` findings remain resolved at `e9683de`. Prior `r
 
 ## Files changed versus `origin/main`
 
-Twenty-three paths differ from current main `bf249af`. This visit changes only the report and the plan note. The Core pin remains `d981bb03`.
+Twenty-three paths differ from current main `bf249af`. This visit moves the locked Core pin from `d981bb03` to `302c7f7`.
 
 ### This Review-return visit
 
+- `Cargo.toml`, `Cargo.lock`, `crates/botster-hub-client/Cargo.toml`, `crates/botster-hub-test-support/{Cargo.toml,build.rs,src/conformance_data.rs,src/lib.rs}`, `tests/session_projection_owner_loop.rs`, `tests/hub_daemon_lifecycle/{package_event_plane.rs,unix_terminal_adapter.rs,webrtc_terminal_adapter.rs}` -- Core pin `302c7f7`.
 - `docs/reports/hub-shutdown-session-idempotent-across-natural-exit-races-implement.md` -- this report.
-- `docs/plans/hub-shutdown-session-idempotent-across-natural-exit-races.md` -- second Core dependency.
+- `docs/plans/hub-shutdown-session-idempotent-across-natural-exit-races.md` -- closed second Core dependency and new pin.
 
 ### Inherited same-ticket changes still on the branch
 
@@ -122,9 +119,9 @@ Hub still owns classification, recover, and host response kinds. Core still owns
 
 - Created `ticket_1787015956_494734` on Core target `tgt_1f7bce66eb304881980f9b4a2a5ae3fe`.
 - Registered `dependency_1787015963_708930`. That Core ticket is closed.
-- Created `ticket_1787034922_646556` on the same Core target. Registered `dependency_1787034941_200828`. Started `run_1787034943_217745`. That ticket is open.
+- Created `ticket_1787034922_646556` on the same Core target. Registered `dependency_1787034941_200828`. Started `run_1787034943_217745`. That ticket is closed. Core main is `302c7f7`.
 - Downstream blocker `dependency_1787014444_456296` remains: `ticket_1786938984_190098` depends on this ticket.
-- Hub now consumes Core pin `d981bb03f91e2d13428000ac989c50d794f659b2`. That pin is a descendant of Hub-main `fd66efd` and contains closed Core `ticket_1787015956_494734`. Cross-repo W1/W2 mechanism proof is the Core tests named below. Do not resolve later pin conflicts by copying Hub main when that rolls the dependency backward.
+- Hub now consumes Core pin `302c7f7b61f3970a0151b8c6646fc21ae7bd6c67`. That pin is a descendant of `d981bb03` and `fd66efd`. It contains closed Core tickets `ticket_1787015956_494734` and `ticket_1787034922_646556`. Do not resolve later pin conflicts by copying Hub main when that rolls a closed dependency backward.
 
 ## Deviations from plan
 
@@ -137,6 +134,7 @@ Hub still owns classification, recover, and host response kinds. Core still owns
 - This visit repins Core to `d981bb03` even though current Hub main still names `fd66efd`. Ancestry, not Hub-main matching, owns the pin.
 - This Review-return visit repairs only `finding_1787033530_256513`. It does not change the ShutdownSession product path.
 - This visit does not change Hub product code. It registers a second Core dependency instead of rolling the pin back or weakening the live-byte oracle.
+- After that Core ticket closed, this visit pin-forwarded to Core main `302c7f7` and reran the full live-proof table. The Hub live-byte oracle stayed strict.
 
 ## Tests and downstream proof run
 
@@ -146,16 +144,14 @@ All test commands used `./test.sh`. Worker prebuild, fmt, and clippy are the doc
 | --- | --- | --- |
 | Recover units | `./test.sh --locked --lib recover_` | 5 passed |
 | Active-error units | `./test.sh --locked --lib shutdown_active_` | 2 passed |
-| WebRTC idempotent cleanup | `./test.sh --locked --test hub_daemon_lifecycle_test external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup -- --exact` | red at pin `d981bb03`: 1 isolated pass, then 3/4 fail (`got []` rounds 2, 1, 1). Review 4/4 red. Base `fd66efd` 3/3 green. |
-| SetSID owner forced-error | `./test.sh --locked --test hub_daemon_lifecycle_test panic_safe_setsid_owner_reaps_group_and_pipe_after_forced_error -- --exact` | pass in 0.12s |
-| SetSID owner forced-error piped | same command piped to `tail` | exit 0 |
-| SetSID negative control | `./test.sh --locked --test hub_daemon_lifecycle_test assert_cli_fixture_absent_fails_when_setsid_child_survives -- --exact` | pass in 7.46s |
-| SetSID piped | same command piped to `tail` | exit 0, no leftover `sleep 3600` |
-| Deliberate panic survivors | `./test.sh --locked --test hub_daemon_lifecycle_test panic_safe_cli_daemon_deliberate_failure_leaves_no_owned_survivors -- --exact` | pass in 7.22s |
-| True-error sibling | `./test.sh --locked --test hub_daemon_lifecycle_test external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable -- --exact` | pass in 16.88s |
-| Unix natural-exit | `./test.sh --locked --test hub_daemon_lifecycle_test unix_shutdown_session_from_another_connection_classifies_attached_exit -- --exact` | pass in 2.56s |
-| Live stuck-Stopping negative | `./test.sh --locked --test hub_daemon_lifecycle_test unix_shutdown_session_stuck_stopping_without_exit_evidence_stays_operator_error -- --exact` | pass in 8.75s |
-| WebRTC exact-bytes | `./test.sh --locked --test hub_daemon_lifecycle_test external_hub_webrtc_live_output_preserves_exact_bytes -- --exact` | pass in 5.22s |
+| WebRTC idempotent cleanup | `./test.sh --locked --test hub_daemon_lifecycle_test external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup -- --exact` | 5/5 pass at `302c7f7` (15.00s, 5.71s, 8.19s, 8.30s, 6.28s) |
+| SetSID owner forced-error | `./test.sh --locked --test hub_daemon_lifecycle_test panic_safe_setsid_owner_reaps_group_and_pipe_after_forced_error -- --exact` | pass in 0.16s |
+| SetSID negative control | `./test.sh --locked --test hub_daemon_lifecycle_test assert_cli_fixture_absent_fails_when_setsid_child_survives -- --exact` | pass in 7.78s |
+| Deliberate panic survivors | `./test.sh --locked --test hub_daemon_lifecycle_test panic_safe_cli_daemon_deliberate_failure_leaves_no_owned_survivors -- --exact` | pass in 7.97s |
+| True-error sibling | `./test.sh --locked --test hub_daemon_lifecycle_test external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable -- --exact` | pass in 17.27s |
+| Unix natural-exit | `./test.sh --locked --test hub_daemon_lifecycle_test unix_shutdown_session_from_another_connection_classifies_attached_exit -- --exact` | pass in 3.07s |
+| Live stuck-Stopping negative | `./test.sh --locked --test hub_daemon_lifecycle_test unix_shutdown_session_stuck_stopping_without_exit_evidence_stays_operator_error -- --exact` | pass in 9.20s |
+| WebRTC exact-bytes | `./test.sh --locked --test hub_daemon_lifecycle_test external_hub_webrtc_live_output_preserves_exact_bytes -- --exact` | pass in 4.90s |
 | Fmt | `cargo fmt --all -- --check` | pass |
 | Clippy | `cargo clippy --workspace --all-targets --locked -- -D warnings` | pass |
 | Diff check | `git diff --check origin/main...HEAD` | pass |
@@ -168,7 +164,7 @@ WebRTC exact-bytes proof: held producer, exact byte receipt, explicit release, b
 
 Live stuck-Stopping negative proof: IsolatedHub drain-inject on the exact session, live `sleep 3600` worker, SIGKILL, then production `ShutdownSession`. The response stays `OperatorError` with `runtime_error` or `state_error` and `operation=shutdown`. It does not become `SessionCleanup`.
 
-Core W1/W2 mechanism proof stays at Core pin `d981bb03` tests:
+Core W1/W2 mechanism proof stays at Core pin `302c7f7` (contains `d981bb03`) tests:
 
 - `drain_output_delivers_process_exited_while_worker_holds_stdout_open`
 - `drain_output_delivers_process_exited_when_worker_exits_nonzero`
@@ -185,8 +181,7 @@ Every lens from the approved plan remains in force. No lens was dropped to infor
 
 - Exact-query `Found(Stopping)` after a Core shutdown error still maps to host `SessionCleanup{already_exited}`. Review required that path only when the exact-session query itself returns Stopping, not when classify `Err` is replaced by a collection row.
 - `ticket_1786938984_190098` is now on Hub main at `bf249af`. This leaf ticket still does not run a full lifecycle suite.
-- Current Hub main still pins Core `fd66efd`. This branch intentionally keeps `d981bb03` so the closed ProcessExited dependency stays in ancestry.
-- `external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup` is red at this pin. Hub waits for Core `ticket_1787034922_646556` and will then repin forward.
+- Current Hub main still pins Core `fd66efd`. This branch intentionally keeps `302c7f7` so both closed Core dependencies stay in ancestry.
 - No full lifecycle suite ran.
 
 ## Missing vault guidance discovered

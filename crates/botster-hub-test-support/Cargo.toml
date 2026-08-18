@@ -14,11 +14,11 @@ include = [
 ]
 
 [dependencies]
-botster-core = { git = "https://github.com/trybotster/botster-core.git", rev = "d981bb03f91e2d13428000ac989c50d794f659b2" }
+botster-core = { git = "https://github.com/trybotster/botster-core.git", rev = "302c7f7b61f3970a0151b8c6646fc21ae7bd6c67" }
 botster-hub-client = { path = "../botster-hub-client" }
 # Fixture bytes live in this Hub-safe crate's source tree. Do not depend on
 # botster-terminal-protocol-client.
-botster-terminal-protocol = { git = "https://github.com/trybotster/botster-core.git", rev = "d981bb03f91e2d13428000ac989c50d794f659b2" }
+botster-terminal-protocol = { git = "https://github.com/trybotster/botster-core.git", rev = "302c7f7b61f3970a0151b8c6646fc21ae7bd6c67" }
 botster-ui-contract = { git = "https://github.com/trybotster/botster-hub.git", tag = "botster-ui-contract-v0.3.2" }
 libc = "0.2.177"
 serde = { version = "1.0.228", features = ["derive"] }
@@ -31,5 +31,5 @@ serde_json = "1.0.150"
 # Import-semantic proof for Core-owned GHOSTSNP late-attach files. Same Core
 # pin as the workspace lockfile. Requires Zig 0.16.0 for libghostty-vt,
 # matching hub session-worker production builds.
-botster-terminal-ghostty = { git = "https://github.com/trybotster/botster-core.git", rev = "d981bb03f91e2d13428000ac989c50d794f659b2", features = ["libghostty-vt"] }
+botster-terminal-ghostty = { git = "https://github.com/trybotster/botster-core.git", rev = "302c7f7b61f3970a0151b8c6646fc21ae7bd6c67", features = ["libghostty-vt"] }
 sha2 = "0.10"
