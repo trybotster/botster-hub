@@ -11,6 +11,8 @@ Revision note (audit ratification corrections, ticket update 1787013609): the ti
 
 Revision note (Plan Review `review_1787014361_115204`): this revision addresses all four findings. `finding_1787014361_663892`: the complete late-message admission matrix is now inline in this plan (lens answers below), not a reference to the superseded plan. `finding_1787014361_336715`: [[project-pipelines-playbook]] is loaded and Rule B now specifies the full dependency workflow that causes progress (create on the Core target, register the blocking edge, start the dependency run, or emit one explicit operator action). `finding_1787014361_760019`: the prior plan's registration claim was false; the downstream blocker is now actually registered as `dependency_1787014444_456296` (ticket_1786938984_190098 depends on this ticket), verified through `project_pipelines_list_ticket_dependencies`, with the downstream-Implement containment stated in the ownership section. `finding_1787014361_739602`: a fresh plan artifact pins this revision's commit.
 
+Revision note (orchestrator option 3, Implement): a Hub parent-wrapper cannot satisfy Core welcome `worker_pid` / readiness identity, so Hub W1/W2 wrapper tests are removed rather than ignored. Cross-repo mechanism proof is Core `d981bb03` tests `drain_output_delivers_process_exited_while_worker_holds_stdout_open` and `drain_output_delivers_process_exited_when_worker_exits_nonzero`. Hub focused contract proof is one held-producer WebRTC exact-bytes path and one Unix cross-connection path with explicit attach, print-release, byte receipt, exit-release, and `process_exit`. Do not require five idempotency rounds or a full lifecycle suite. Gates are focused tests, units, fmt, and clippy.
+
 ## Target repository and target_id
 
 - Target repository: `botster-hub` (`trybotster/botster-hub`).
@@ -126,9 +128,9 @@ Keep from the prior run: the full-error-body assert diagnostics, the Absent-leg 
 
 1. `external_hub_webrtc_live_output_preserves_exact_bytes`: keep the byte-exactness proof; remove the 10-second observed-exit wait and `ReadScreen` pump; restore the blind `ShutdownSession` immediately after the byte proof and peer close; assert `shutdown.kind` is `Events` or `SessionCleanup` with `outcome == "already_exited"` when cleanup, and never `OperatorError`, with the full typed error body in the panic message. Keep the Absent-leg `unknown_session` probe and the worker reap.
 2. `unix_shutdown_session_from_another_connection_classifies_attached_exit`: keep the blind-call strict shape; extend the `assert_ne!` to print the full typed error body on failure.
-3. New deterministic forced-window tests (the primary gate): under W1 and W2 on one transport each (W1 on WebRTC, W2 on Unix, or as Implement finds smaller -- both windows must be covered), blind `ShutdownSession` after natural exit returns `Events` or `SessionCleanup` and never `OperatorError`; under W2, the session must also reach a terminal lifecycle on the control plane (this proves the stuck-`running` divergence is gone). These tests bind the Rule A or Rule B fix.
+3. Cross-repo W1/W2 mechanism proof is owned by Core pin `d981bb03`, not a Hub parent wrapper. Cite `drain_output_delivers_process_exited_while_worker_holds_stdout_open` and `drain_output_delivers_process_exited_when_worker_exits_nonzero` in `crates/botster-core/tests/local_session_worker_process_test.rs`. Do not add ignored Hub wrapper tests.
 4. Unit strict-contract tests in `src/daemon_transport.rs`: recover-fallback legs (recorded `Exited` -> `already_exited`; recorded `Stale` -> `stale_session`; recorded `Stopping` -> `already_exited`; recorded `Running` -> original typed error preserved; fallback failure -> original typed error preserved). Update `shutdown_active_runtime_error_remains_operator_error` and `shutdown_active_state_error_remains_operator_error` in the same strict-contract change so they pin the corrected boundary: `OperatorError` is preserved exactly when exact evidence shows the worker remains truly active or stuck, and never survives provable natural exit. The remaining shutdown unit family stays green.
-5. Tighten `external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup`: the blind branch no longer admits typed `OperatorError`; every round's blind call must return `Events` or `SessionCleanup`.
+5. Do not require five repeated idempotency rounds. The WebRTC held-producer exact-bytes test is the one deterministic blind `ShutdownSession` proof.
 6. Red-on-revert: with the exact-session reconciliation removed (Rule A: revert the Hub reconciliation; Rule B: additionally run the W1 forced-window test against the pre-fix pinned Core), the W1 forced-window test must fail with the transient `OperatorError`, and the recover-fallback unit tests must fail. Revert restored and proven green afterward.
 7. `external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable` stays green unmodified: true errors and sibling survival are preserved.
 
@@ -186,13 +188,13 @@ Downstream blocker (correcting the prior plan's false claim): authoritative read
 All commands run in the ticket worktree with the repo wrapper `./test.sh` (asset-sync check, `BOTSTER_ENV=test`). Direct `cargo test` does not satisfy these gates. Prebuild before daemon suites: `cargo build --locked -p botster-core-daemon --bin botster-session-worker`.
 
 1. Phase 1 captures recorded in the Implement report: W1 and W2 on both transports, each with verbatim `error.code`, `error.operation`, `error.message`, and the recover-path classification. The decision-gate outcome (Rule A or Rule B) is stated with the capture lines that decided it.
-2. Unix strict proof: `./test.sh --locked --test hub_daemon_lifecycle_test unix_shutdown_session_from_another_connection_classifies_attached_exit` -- 10 consecutive passes (shell loop, tallies recorded).
-3. WebRTC strict proof: `./test.sh --locked --test hub_daemon_lifecycle_test external_hub_webrtc_live_output_preserves_exact_bytes` -- 10 consecutive passes with the restored blind oracle.
-4. Forced-window deterministic tests (primary gate): the W1 and W2 tests each pass 10 consecutive targeted runs; the W2 test also proves the session reaches a terminal lifecycle on the control plane.
+2. Unix strict proof: one focused run of `unix_shutdown_session_from_another_connection_classifies_attached_exit` with attach, print-release, live-byte receipt, exit-release, and `process_exit` before blind `ShutdownSession`. Sleep duration is not the oracle.
+3. WebRTC strict proof: one focused run of `external_hub_webrtc_live_output_preserves_exact_bytes` with the held-producer release and restored blind oracle.
+4. Cross-repo W1/W2 mechanism proof: Core `d981bb03` tests `drain_output_delivers_process_exited_while_worker_holds_stdout_open` and `drain_output_delivers_process_exited_when_worker_exits_nonzero`. No Hub wrapper tests.
 5. Unit strict-contract tests: exact `--lib` filter listing the recover-fallback legs (Exited, Stale, Stopping, Running-preserves-error, fallback-failure-preserves-error) plus the existing seven shutdown unit tests -- all pass; filters and counts recorded.
 6. Red-on-revert (ticket-required): with the exact-session reconciliation removed, the W1 forced-window test fails with the transient `OperatorError` and the recover-fallback unit tests fail; the revert is restored and a green re-run recorded. Under Rule B, the W1 red-proof against pre-fix Core is the recorded Phase 1 capture itself.
 7. Charter and teardown binding checks, deterministic: `shutdown_after_observed_exit_returns_session_cleanup`, `shutdown_session_classifies_parked_exit_beyond_one_baseline_page`, the Absent probe inside check 3, the seven-test stale-peer `--lib` filter from the prior plan, and `external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable` (unmodified) -- all pass with recorded filters.
-8. Tightened idempotency sibling: `./test.sh --locked --test hub_daemon_lifecycle_test external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup` -- 5 consecutive passes with the no-OperatorError blind branch.
+8. No five-round idempotency gate. Check 3 is the one held-producer WebRTC proof.
 9. Strict Rust gates: `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --locked -- -D warnings`.
 10. No full lifecycle suite runs as this leaf ticket's gate (audit ratification correction, superseding the earlier "one exclusive full-suite run" line in the ticket body). The harness ticket and final integration own controlled full-suite smoke tests. This ticket's gates are the focused deterministic checks 2-9 only.
 11. Implement report at `docs/reports/hub-shutdown-session-idempotent-across-natural-exit-races-implement.md` records: captures, the decision-gate outcome, the Rule B dependency ticket id and repin delta (if fired), all filters and tallies, red-on-revert output, and any attribution evidence.
@@ -204,15 +206,15 @@ Downstream proof: the production entry points are the Unix and WebRTC `ShutdownS
 - [[a suite-load oracle must not demand more than the host contract another test in the same file already codifies]]: the exact-bytes/idempotency instance in that note is superseded -- the product decision changed the codified host contract itself. The note needs the instance updated and a pointer to the strict natural-exit ShutdownSession contract.
 - [[host ShutdownSession classification must call the exact-session Core query]] still says the convention is not shipped; Hub main ships it. Stale shipped-status (carried over from the prior run, still uncaptured).
 - New capture candidate after the decision gate resolves: "worker ProcessExited delivery must not gate on worker reap timing or worker exit status" (Core contract) and "ShutdownSession strict natural-exit idempotency is Events-or-SessionCleanup on every transport" (Hub contract).
-- New capture candidate: the controlled worker wrapper via `core_engine.session_worker_path` as the reusable deterministic lever for exit-delivery-window tests.
+- New capture candidate: a Hub parent of `botster-session-worker` cannot satisfy Core welcome `worker_pid` / readiness identity, so delayed-reap and nonzero-worker-exit windows stay Core-owned.
 
 ## Implement steps
 
 1. Prebuild the worker binary; confirm hygiene (gitignore, no-colon path).
-2. Build the wrapper-worker fixture (W1, W2) and verify census-helper compatibility.
+2. Do not build a Hub parent-wrapper fixture. Core identity rejects it.
 3. Run Phase 1 captures on both transports; record verbatim; validate the sub-case citations.
 4. Resolve the decision gate. Rule B: register the `botster-core` dependency ticket with the reproduction and required contract, then block until the Core merge and repin. Rule A: proceed directly.
 5. Implement the Hub legs (recover fallback, unit tests). Under Rule B, integrate the repinned Core.
-6. Make the forced-window tests green, then restore the blind exact-bytes oracle, extend the Unix assert diagnosis, and tighten the idempotency sibling.
-7. Run acceptance checks 2-9. Run no full lifecycle suite (check 10); the harness ticket and final integration own controlled smoke runs.
+6. Restore the blind exact-bytes oracle and the Unix attach / print-release / exit-release / `process_exit` path. Cite Core W1/W2 tests. Do not add ignored Hub wrapper tests.
+7. Run focused Unix and WebRTC proofs, recover and Active units, fmt, and clippy. Run no full lifecycle suite.
 8. Write the Implement report; commit; no PR.
