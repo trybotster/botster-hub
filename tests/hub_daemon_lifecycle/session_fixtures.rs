@@ -379,7 +379,7 @@ pub(crate) fn start_isolated_live_output_hub_with_worker(
     let mut builder = botster_hub_test_support::IsolatedHubBuilder::new()
         .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
         .session_worker_bin(session_worker_bin)
-        .root(unique_short_test_dir(name))
+        .root(unique_short_test_dir("ih"))
         .name(name);
     for (key, value) in extra_env {
         builder = builder.env(*key, *value);

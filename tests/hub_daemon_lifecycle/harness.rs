@@ -858,12 +858,3 @@ fn prove_owned_absence(
     }
     Ok(())
 }
-
-pub(crate) fn live_session_workers_for_data_dir(
-    data_dir: &Path,
-) -> Result<Vec<SessionWorkerProcessIdentity>, String> {
-    Ok(session_worker_process_identities()?
-        .into_iter()
-        .filter(|worker| worker_belongs_to_data_dir(worker, data_dir))
-        .collect())
-}

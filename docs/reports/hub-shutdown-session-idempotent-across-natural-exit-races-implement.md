@@ -4,20 +4,20 @@
 | --- | --- |
 | Ticket | `ticket_1786977409_499180` |
 | Run | `run_1787012955_256937` |
-| Run step | `run_step_1787034732_641506` |
+| Run step | `run_step_1787073718_923418` |
 | Step | `botster_stack_implement` |
 | Target repository | `botster-hub` (`trybotster/botster-hub`) |
 | `target_id` | `tgt_7e208a0c76a44980a83b63af976b1f22` |
 | Plan | `docs/plans/hub-shutdown-session-idempotent-across-natural-exit-races.md` @ `075e9e6` |
 | Decision gate | Rule B, then orchestrator option 3 |
-| Closed Core dependency | `ticket_1787015956_494734` / `dependency_1787015963_708930` closed |
-| Closed Core dependency | `ticket_1787034922_646556` / `dependency_1787034941_200828` closed at `302c7f7` |
+| Closed Core ProcessExited-on-payload | `ticket_1787015956_494734` / `dependency_1787015963_708930` closed at `d981bb03` |
+| Closed Core live-output isolation | `ticket_1787034922_646556` / `dependency_1787034941_200828` closed at `302c7f7` |
 | Core pin | `302c7f7b61f3970a0151b8c6646fc21ae7bd6c67` |
-| Hub main integrated | `bf249af` via merge commit `6cc0c12` |
-| Prior Review return | `review_1787034725_875591` diagnosed at `9300a22` |
-| Current Review return | `review_1787034725_875591` repaired by Core merge + Hub repin |
+| Hub main integrated | `952032d` via merge commit `b9033cf` |
+| Prior Review return | `review_1787034725_875591` repaired at `6988d90` |
+| Current Review return | `review_1787073705_186581` repaired by Hub main integrate |
 | Merge policy | direct; no pull request |
-| Review requested | yes, after Core `302c7f7` repin and full live-proof table |
+| Review requested | yes, after Hub main `952032d` integrate and full live-proof table |
 
 Inventory source: `git diff --name-only origin/main...HEAD` after this visit's commit. Do not treat an earlier intra-branch pin inventory as current.
 
@@ -62,13 +62,23 @@ Convention conflicts: none.
 
 ## Review-return repairs this visit
 
-`review_1787034725_875591` returned two open findings. The prior visit diagnosed Core-side live-output loss and registered `ticket_1787034922_646556`. That Core ticket is now closed. Core `origin/main` is `302c7f7b61f3970a0151b8c6646fc21ae7bd6c67`. `d981bb03` is an ancestor of `302c7f7`. The pin-moving commit is `968792d` (`Keep bound live bytes visible across ProcessExited writer-barrier rounds`).
+`review_1787073705_186581` returned one open finding at `6988d90`.
 
-`finding_1787034725_966366`: Hub now pins Core `302c7f7`. The Hub live-byte oracle is unchanged. `external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup` passed 5/5 at the new pin (15.00s, 5.71s, 8.19s, 8.30s, 6.28s). The pin was not rolled back to `fd66efd`.
+`finding_1787073705_221691`: merged current Hub main `952032d` at `b9033cf`. Core pin stayed `302c7f7`. `cli.rs` and `session_fixtures.rs` were resolved semantically:
 
-`finding_1787034725_136720`: the test table below has a fresh row for every previously cited live proof plus units at pin `302c7f7`.
+- Drain-failure spawn now returns `PanicSafeCliDaemon` with `check_harness_taint`, `--session-worker-bin`, and `from_child`.
+- IsolatedHub starter keeps `start_isolated_live_output_hub_with_worker` and `check_harness_taint`.
+- IsolatedHub root uses `unique_short_test_dir("ih")`. IsolatedHub already appends name and nanos. The pid-scoped unique_short plus that nest stays under `SUN_LEN`.
+- `harness.rs` dropped the duplicate `live_session_workers_for_data_dir`. `process.rs` keeps the worktree-filtered census.
 
-Prior `review_1787033530_630528` findings remain resolved at `57cbeb2`. Prior `review_1787032735_498956` findings remain resolved at `e9683de`. Prior `review_1787030054_829721` findings remain resolved at `f4d9f0f`. Prior `review_1787029110_848811` findings remain resolved at `2320ba4`. Prior `review_1787028521_313736` findings remain resolved at `286c1ab`. Prior `review_1787027565_578625` findings remain resolved at `7071f42`.
+Auto-merged overlaps were reviewed. No ticket test function was lost.
+
+- `process.rs`: `PanicSafeSetsidChild` and `reap_captured_pty_children` remain.
+- `sessions.rs`: drain-failure and setsid proofs remain.
+- `webrtc_proofs.rs`: exact-bytes and idempotent-cleanup remain. Main's `daemon_test_guard` is present.
+- `webrtc_terminal_adapter.rs`: locked Core string stays `302c7f7`.
+
+Prior `review_1787034725_875591` findings remain resolved at `6988d90`. Prior `review_1787033530_630528` findings remain resolved at `57cbeb2`. Prior `review_1787032735_498956` findings remain resolved at `e9683de`. Prior `review_1787030054_829721` findings remain resolved at `f4d9f0f`. Prior `review_1787029110_848811` findings remain resolved at `2320ba4`. Prior `review_1787028521_313736` findings remain resolved at `286c1ab`. Prior `review_1787027565_578625` findings remain resolved at `7071f42`.
 
 ## Prior Review-return repairs at `57cbeb2`
 
@@ -88,13 +98,15 @@ Prior `review_1787032735_498956` findings remain resolved at `e9683de`. Prior `r
 
 ## Files changed versus `origin/main`
 
-Twenty-three paths differ from current main `bf249af`. This visit moves the locked Core pin from `d981bb03` to `302c7f7`.
+Current Hub main `952032d` is an ancestor after `b9033cf`. The remaining delta is this ticket plus the integrate repairs.
 
 ### This Review-return visit
 
-- `Cargo.toml`, `Cargo.lock`, `crates/botster-hub-client/Cargo.toml`, `crates/botster-hub-test-support/{Cargo.toml,build.rs,src/conformance_data.rs,src/lib.rs}`, `tests/session_projection_owner_loop.rs`, `tests/hub_daemon_lifecycle/{package_event_plane.rs,unix_terminal_adapter.rs,webrtc_terminal_adapter.rs}` -- Core pin `302c7f7`.
+- `tests/hub_daemon_lifecycle/cli.rs` -- drain-failure spawn on main's `PanicSafeCliDaemon` owner.
+- `tests/hub_daemon_lifecycle/session_fixtures.rs` -- IsolatedHub worker helper, taint check, short root.
+- `tests/hub_daemon_lifecycle/harness.rs` -- one `live_session_workers_for_data_dir` owner.
 - `docs/reports/hub-shutdown-session-idempotent-across-natural-exit-races-implement.md` -- this report.
-- `docs/plans/hub-shutdown-session-idempotent-across-natural-exit-races.md` -- closed second Core dependency and new pin.
+- `docs/plans/hub-shutdown-session-idempotent-across-natural-exit-races.md` -- Hub main `952032d` integrate note.
 
 ### Inherited same-ticket changes still on the branch
 
@@ -135,6 +147,7 @@ Hub still owns classification, recover, and host response kinds. Core still owns
 - This Review-return visit repairs only `finding_1787033530_256513`. It does not change the ShutdownSession product path.
 - This visit does not change Hub product code. It registers a second Core dependency instead of rolling the pin back or weakening the live-byte oracle.
 - After that Core ticket closed, this visit pin-forwarded to Core main `302c7f7` and reran the full live-proof table. The Hub live-byte oracle stayed strict.
+- This visit integrates current Hub main `952032d` and keeps Core pin `302c7f7`. IsolatedHub roots use `unique_short_test_dir("ih")` so pid-scoped unique_short plus IsolatedHub name/nanos nesting stays under `SUN_LEN`. No product ShutdownSession change.
 
 ## Tests and downstream proof run
 
@@ -144,14 +157,14 @@ All test commands used `./test.sh`. Worker prebuild, fmt, and clippy are the doc
 | --- | --- | --- |
 | Recover units | `./test.sh --locked --lib recover_` | 5 passed |
 | Active-error units | `./test.sh --locked --lib shutdown_active_` | 2 passed |
-| WebRTC idempotent cleanup | `./test.sh --locked --test hub_daemon_lifecycle_test external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup -- --exact` | 5/5 pass at `302c7f7` (15.00s, 5.71s, 8.19s, 8.30s, 6.28s) |
-| SetSID owner forced-error | `./test.sh --locked --test hub_daemon_lifecycle_test panic_safe_setsid_owner_reaps_group_and_pipe_after_forced_error -- --exact` | pass in 0.16s |
-| SetSID negative control | `./test.sh --locked --test hub_daemon_lifecycle_test assert_cli_fixture_absent_fails_when_setsid_child_survives -- --exact` | pass in 7.78s |
-| Deliberate panic survivors | `./test.sh --locked --test hub_daemon_lifecycle_test panic_safe_cli_daemon_deliberate_failure_leaves_no_owned_survivors -- --exact` | pass in 7.97s |
-| True-error sibling | `./test.sh --locked --test hub_daemon_lifecycle_test external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable -- --exact` | pass in 17.27s |
-| Unix natural-exit | `./test.sh --locked --test hub_daemon_lifecycle_test unix_shutdown_session_from_another_connection_classifies_attached_exit -- --exact` | pass in 3.07s |
-| Live stuck-Stopping negative | `./test.sh --locked --test hub_daemon_lifecycle_test unix_shutdown_session_stuck_stopping_without_exit_evidence_stays_operator_error -- --exact` | pass in 9.20s |
-| WebRTC exact-bytes | `./test.sh --locked --test hub_daemon_lifecycle_test external_hub_webrtc_live_output_preserves_exact_bytes -- --exact` | pass in 4.90s |
+| WebRTC idempotent cleanup | `./test.sh --locked --test hub_daemon_lifecycle_test external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup -- --exact` | 5/5 pass after `952032d` integrate (12.88s, 8.42s, 8.05s, 10.61s, 5.90s) |
+| SetSID owner forced-error | `./test.sh --locked --test hub_daemon_lifecycle_test panic_safe_setsid_owner_reaps_group_and_pipe_after_forced_error -- --exact` | pass in 0.23s |
+| SetSID negative control | `./test.sh --locked --test hub_daemon_lifecycle_test assert_cli_fixture_absent_fails_when_setsid_child_survives -- --exact` | pass in 5.79s |
+| Deliberate panic survivors | `./test.sh --locked --test hub_daemon_lifecycle_test panic_safe_cli_daemon_deliberate_failure_leaves_no_owned_survivors -- --exact` | pass in 7.02s |
+| True-error sibling | `./test.sh --locked --test hub_daemon_lifecycle_test external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable -- --exact` | pass in 23.31s |
+| Unix natural-exit | `./test.sh --locked --test hub_daemon_lifecycle_test unix_shutdown_session_from_another_connection_classifies_attached_exit -- --exact` | pass in 3.64s |
+| Live stuck-Stopping negative | `./test.sh --locked --test hub_daemon_lifecycle_test unix_shutdown_session_stuck_stopping_without_exit_evidence_stays_operator_error -- --exact` | pass in 7.42s |
+| WebRTC exact-bytes | `./test.sh --locked --test hub_daemon_lifecycle_test external_hub_webrtc_live_output_preserves_exact_bytes -- --exact` | pass in 5.61s |
 | Fmt | `cargo fmt --all -- --check` | pass |
 | Clippy | `cargo clippy --workspace --all-targets --locked -- -D warnings` | pass |
 | Diff check | `git diff --check origin/main...HEAD` | pass |
@@ -180,8 +193,8 @@ Every lens from the approved plan remains in force. No lens was dropped to infor
 ## Unverified behavior or residual risk
 
 - Exact-query `Found(Stopping)` after a Core shutdown error still maps to host `SessionCleanup{already_exited}`. Review required that path only when the exact-session query itself returns Stopping, not when classify `Err` is replaced by a collection row.
-- `ticket_1786938984_190098` is now on Hub main at `bf249af`. This leaf ticket still does not run a full lifecycle suite.
-- Current Hub main still pins Core `fd66efd`. This branch intentionally keeps `302c7f7` so both closed Core dependencies stay in ancestry.
+- `ticket_1786938984_190098` is now on Hub main. This leaf ticket still does not run a full lifecycle suite.
+- Current Hub main `952032d` still pins Core `fd66efd`. This branch intentionally keeps `302c7f7` so both closed Core dependencies stay in ancestry.
 - No full lifecycle suite ran.
 
 ## Missing vault guidance discovered
