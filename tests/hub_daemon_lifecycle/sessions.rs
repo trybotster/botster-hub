@@ -3416,11 +3416,14 @@ fn external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable() {
             .path
             .clone(),
     );
-    let child = start_cli_daemon_with_runtime_drain_failure(
+    let daemon = PanicSafeCliDaemon::start_with_runtime_drain_failure(
         &data_dir,
         "shutdown-failure-victim",
         None,
+        "shutdown-failure-sibling daemon evidence",
     );
+    let hub_pid = daemon.child.as_ref().expect("panic-safe daemon child").id();
+    let socket_path = endpoint.socket_path.clone();
     let before_pids: std::collections::BTreeSet<u32> = session_worker_process_identities()
         .expect("baseline worker census must succeed")
         .into_iter()
@@ -3649,9 +3652,58 @@ fn external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable() {
     sibling_cleanup.disarm();
     production_shutdown_and_remove_session(&endpoint, "shutdown-failure-sibling");
     drop(connection);
-    shutdown_cli_daemon(&data_dir, child);
+    daemon.shutdown();
     reap_session_workers_for_data_dir(&data_dir)
         .expect("sibling SIGKILL fixture must not leave worktree session workers");
+    assert_cli_fixture_absent(&data_dir, hub_pid, &socket_path);
+}
+
+#[test]
+fn panic_safe_cli_daemon_deliberate_failure_leaves_no_owned_survivors() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("shutdown-failure-panic");
+    let config = explicit_config(&data_dir);
+    let socket_path = config
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("test config has local socket")
+        .path
+        .clone();
+    let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path.clone());
+    let hub_pid = std::sync::atomic::AtomicU32::new(0);
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let daemon = PanicSafeCliDaemon::start_with_runtime_drain_failure(
+            &data_dir,
+            "shutdown-failure-panic-victim",
+            None,
+            "deliberate shutdown-failure panic daemon evidence",
+        );
+        hub_pid.store(
+            daemon.child.as_ref().expect("panic-safe daemon child").id(),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::Spawn {
+                session_id: "shutdown-failure-panic-victim".to_string(),
+                command: "sleep 3600".to_string(),
+            },
+        )
+        .expect("spawn panic-path victim");
+        let _session_cleanup =
+            SessionCleanupGuard::new(&data_dir, "shutdown-failure-panic-victim");
+        panic!("deliberate shutdown-failure fixture panic");
+    }));
+    assert!(
+        panicked.is_err(),
+        "panic-path owner proof must take the failure branch"
+    );
+    assert_cli_fixture_absent(
+        &data_dir,
+        hub_pid.load(std::sync::atomic::Ordering::SeqCst),
+        &socket_path,
+    );
 }
 
 #[test]

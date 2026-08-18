@@ -4,7 +4,7 @@
 | --- | --- |
 | Ticket | `ticket_1786977409_499180` |
 | Run | `run_1787012955_256937` |
-| Run step | `run_step_1787027579_128838` |
+| Run step | `run_step_1787028535_908653` |
 | Step | `botster_stack_implement` |
 | Target repository | `botster-hub` (`trybotster/botster-hub`) |
 | `target_id` | `tgt_7e208a0c76a44980a83b63af976b1f22` |
@@ -13,11 +13,12 @@
 | Core dependency | `ticket_1787015956_494734` / `dependency_1787015963_708930` closed |
 | Core pin | `fd66efdcb4769b2b3a75cbd580a5b98b82825790` (current `origin/main`) |
 | Hub main integrated | `e864c3c` via merge commit `7a24b1e` |
-| Review return | `review_1787027565_578625` `changes_required` |
+| Prior Review return | `review_1787027565_578625` resolved at `7071f42` |
+| Current Review return | `review_1787028521_313736` `changes_required` |
 | Merge policy | direct; no pull request |
-| Review requested | yes, after Review-return repairs |
+| Review requested | yes, after panic-safe owner repair |
 
-Inventory source: `git diff --name-only origin/main...HEAD` after the recover commit on this report. Do not treat an earlier intra-branch pin inventory as current.
+Inventory source: `git diff --name-only origin/main...HEAD` after this visit's commit. Do not treat an earlier intra-branch pin inventory as current.
 
 ## Repository playbook and other playbooks/notes applied
 
@@ -40,6 +41,7 @@ Inventory source: `git diff --name-only origin/main...HEAD` after the recover co
 - [[project-pipelines-playbook]] because Rule B changed workflow state
 - [[dependency ticket creation must start its run or emit an operator action]]
 - [[cross repo dependency registration must use dependency repo target]]
+- [[test owned orphan workers consume machine wide pty and cpu capacity]]
 
 Convention conflicts: none.
 
@@ -55,7 +57,15 @@ Convention conflicts: none.
 
 ## Review-return repairs this visit
 
-`review_1787027565_578625` returned three open findings. This visit repairs all three.
+`review_1787028521_313736` accepted the recover and main-integration work. It returned one high test-lifecycle finding.
+
+`finding_1787028521_587419`: `external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable` now wraps the CLI daemon in `PanicSafeCliDaemon` immediately after spawn. Drop cleans owned sessions, requests daemon shutdown, waits, and hard-stops the exact process group when graceful cleanup fails. The happy path asserts that the exact data directory, hub pid, worker set, process group, and socket are absent. `panic_safe_cli_daemon_deliberate_failure_leaves_no_owned_survivors` panics on purpose and proves the same absence.
+
+Prior `review_1787027565_578625` findings remain resolved at `7071f42`.
+
+## Prior Review-return repairs at `7071f42`
+
+`review_1787027565_578625` returned three open findings. That visit repaired all three.
 
 1. `finding_1787027565_879300`: recover no longer reads `runtime.list_sessions()`. `recover_after_core_shutdown_error` reclassifies only through `classify_shutdown_session` (`observe_session_lifecycle`). Classify `Err` preserves the original typed Core error. Cleanup returns only from exact-query `Cleanup` (`Exited` or `Stale`) or `Missing`. Exact-query `Stopping` still uses the existing host `already_exited` map in `shutdown_error_response` because that row comes from the exact-session query, not a collection fallback. Recorded `Stopping` after classify `Err` now preserves `runtime_error`.
 2. `finding_1787027565_484505`: merged `origin/main` `e864c3c`. Every pin conflict kept current-main Core `fd66efdcb4769b2b3a75cbd580a5b98b82825790`. Unix attach/print-release/exit-release/`process_exit` survived the auto-merge.
@@ -67,18 +77,18 @@ Thirteen paths differ from current main. Pin manifests match main after `7a24b1e
 
 ### This Review-return visit
 
-- `src/daemon_transport.rs` -- recover uses only the exact-session classify result. Collection fallback and `classify_recorded_registry_state` are removed.
-- `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs` -- live stuck-Stopping negative test `unix_shutdown_session_stuck_stopping_without_exit_evidence_stays_operator_error`. Same file still owns the Unix natural-exit proof.
+- `tests/hub_daemon_lifecycle/cli.rs` -- `PanicSafeCliDaemon::start_with_runtime_drain_failure` and process-group hard-stop on panic Drop.
+- `tests/hub_daemon_lifecycle/process.rs` -- exact hub/worker/group/socket survivor assertion.
+- `tests/hub_daemon_lifecycle/sessions.rs` -- wrap the true-error sibling daemon immediately; add deliberate-panic survivor proof.
 - `docs/reports/hub-shutdown-session-idempotent-across-natural-exit-races-implement.md` -- this report.
 
 ### Inherited same-ticket changes still on the branch
 
+- `src/daemon_transport.rs` -- exact-session recover only; no `list_sessions` fallback.
 - `src/runtime.rs` -- test inject for observe drain failure.
 - `crates/botster-hub-test-support/src/isolated_hub.rs` -- IsolatedHub extra env used by drain-failure proofs.
-- `tests/hub_daemon_lifecycle/cli.rs` -- `start_cli_daemon_with_runtime_drain_failure`.
-- `tests/hub_daemon_lifecycle/process.rs` -- worker census helpers for SIGKILL proofs.
+- `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs` -- Unix natural-exit and stuck-Stopping proofs.
 - `tests/hub_daemon_lifecycle/session_fixtures.rs` -- `assert_shutdown_strict_natural_exit` and IsolatedHub env helper.
-- `tests/hub_daemon_lifecycle/sessions.rs` -- live sibling-survival OperatorError proof.
 - `tests/hub_daemon_lifecycle/webrtc_proofs.rs` -- blind exact-bytes `ShutdownSession`.
 - `docs/plans/hub-shutdown-session-idempotent-across-natural-exit-races.md` -- approved plan at `075e9e6`.
 - `docs/plans/fix-flaky-webrtc-exact-bytes-shutdown-classification-under-lifecycle-suite-load.md` -- superseded plan kept on the branch.
@@ -109,14 +119,15 @@ All test commands used `./test.sh`. Worker prebuild, fmt, and clippy are the doc
 
 | Check | Command | Result |
 | --- | --- | --- |
-| Worker prebuild after `fd66efd` | `cargo build --locked -p botster-core-daemon --bin botster-session-worker` | pass in 56.77s |
 | Recover units | `./test.sh --locked --lib recover_` | 5 passed |
-| Active OperatorError units | `./test.sh --locked --lib shutdown_active` | 2 passed |
-| Unix natural-exit | `./test.sh --locked --test hub_daemon_lifecycle_test unix_shutdown_session_from_another_connection_classifies_attached_exit -- --exact` | pass in 5.13s |
-| Live stuck-Stopping negative | `./test.sh --locked --test hub_daemon_lifecycle_test unix_shutdown_session_stuck_stopping_without_exit_evidence_stays_operator_error -- --exact` | pass in 18.22s |
-| WebRTC exact-bytes | `./test.sh --locked --test hub_daemon_lifecycle_test external_hub_webrtc_live_output_preserves_exact_bytes -- --exact` | pass in 5.62s |
+| Deliberate panic survivors | `./test.sh --locked --test hub_daemon_lifecycle_test panic_safe_cli_daemon_deliberate_failure_leaves_no_owned_survivors -- --exact` | pass in 7.90s |
+| True-error sibling | `./test.sh --locked --test hub_daemon_lifecycle_test external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable -- --exact` | pass in 17.53s |
+| Unix natural-exit | `./test.sh --locked --test hub_daemon_lifecycle_test unix_shutdown_session_from_another_connection_classifies_attached_exit -- --exact` | pass in 4.29s |
+| Live stuck-Stopping negative | `./test.sh --locked --test hub_daemon_lifecycle_test unix_shutdown_session_stuck_stopping_without_exit_evidence_stays_operator_error -- --exact` | pass in 10.75s |
+| WebRTC exact-bytes | `./test.sh --locked --test hub_daemon_lifecycle_test external_hub_webrtc_live_output_preserves_exact_bytes -- --exact` | pass in 6.72s |
 | Fmt | `cargo fmt --all -- --check` | pass |
 | Clippy | `cargo clippy --workspace --all-targets --locked -- -D warnings` | pass |
+| Leftover census | worktree `botster-hub start` for `shutdown-failure`, `pse`, and `stk` data dirs | none |
 
 Unix natural-exit proof: default Hello spawn, unix-adapter Attach and Drain, print-release, live `pse-ready`, exit-release, `process_exit`, then blind `ShutdownSession`. Sleep duration is not the oracle.
 
@@ -135,7 +146,7 @@ Production entry: `DaemonRequest::ShutdownSession` in `src/daemon_transport.rs` 
 
 ## Runtime-teardown lenses
 
-Every lens from the approved plan remains in force. No lens was dropped to informal follow-up. Closed Core `ticket_1787015956_494734` owns the payload-delivery lens. Hub still owns classify, recover, both transport host-path proofs, and the stuck-Stopping negative proof.
+Every lens from the approved plan remains in force. No lens was dropped to informal follow-up. Closed Core `ticket_1787015956_494734` owns the payload-delivery lens. Hub still owns classify, recover, both transport host-path proofs, and the stuck-Stopping negative proof. The true-error sibling fixture now has panic-safe hard-stop evidence for its owned Hub process group.
 
 ## Unverified behavior or residual risk
 

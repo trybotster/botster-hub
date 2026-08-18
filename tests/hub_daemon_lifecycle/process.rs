@@ -462,6 +462,103 @@ pub(crate) fn capture_new_session_workers_for_data_dir(
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct HubProcessIdentity {
+    pub(crate) pid: u32,
+    pub(crate) command: String,
+}
+
+pub(crate) fn hub_process_identities() -> Result<Vec<HubProcessIdentity>, String> {
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,command="])
+        .output()
+        .map_err(|error| format!("ps hub census failed: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "ps hub census exited with {}: stderr={:?}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let mut hubs = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let line = line.trim();
+        let mut parts = line.split_whitespace();
+        let Some(pid_token) = parts.next() else {
+            continue;
+        };
+        let Ok(pid) = pid_token.parse::<u32>() else {
+            continue;
+        };
+        let Some(argv0) = parts.next() else {
+            continue;
+        };
+        let is_hub = Path::new(argv0)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "botster-hub");
+        if !is_hub {
+            continue;
+        }
+        let rest = parts.collect::<Vec<_>>().join(" ");
+        hubs.push(HubProcessIdentity {
+            pid,
+            command: format!("{argv0} {rest}"),
+        });
+    }
+    Ok(hubs)
+}
+
+pub(crate) fn live_hub_processes_for_data_dir(
+    data_dir: &Path,
+) -> Result<Vec<HubProcessIdentity>, String> {
+    let dir = data_dir.to_string_lossy();
+    let canon = data_dir.canonicalize().ok();
+    Ok(hub_process_identities()?
+        .into_iter()
+        .filter(|hub| {
+            if !dir.is_empty() && hub.command.contains(dir.as_ref()) {
+                return true;
+            }
+            canon
+                .as_ref()
+                .is_some_and(|path| hub.command.contains(path.to_string_lossy().as_ref()))
+        })
+        .collect())
+}
+
+pub(crate) fn assert_cli_fixture_absent(data_dir: &Path, hub_pid: u32, socket_path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let hub_alive = process_is_alive_u32(hub_pid).unwrap_or(true);
+        let hubs = live_hub_processes_for_data_dir(data_dir).expect("hub census");
+        let workers = live_session_workers_for_data_dir(data_dir).expect("worker census");
+        let group_live = process_group_probe(hub_pid as libc::pid_t).unwrap_or(true);
+        let group_rows = process_group_census(hub_pid as libc::pid_t).unwrap_or_default();
+        let socket_live = socket_path.exists();
+        if !hub_alive
+            && hubs.is_empty()
+            && workers.is_empty()
+            && !group_live
+            && group_rows.is_empty()
+            && !socket_live
+        {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "owned CLI fixture survivors remain data_dir={} hub_pid={hub_pid} \
+                 hub_alive={hub_alive} hubs={hubs:?} workers={:?} group_live={group_live} \
+                 group_rows={group_rows:?} socket_live={socket_live} socket={}",
+                data_dir.display(),
+                workers.iter().map(|worker| worker.pid).collect::<Vec<_>>(),
+                socket_path.display()
+            );
+        }
+        thread::sleep(Duration::from_millis(40));
+    }
+}
+
 /// Session workers that still name this data directory after the hub child exits.
 pub(crate) fn live_session_workers_for_data_dir(
     data_dir: &Path,
