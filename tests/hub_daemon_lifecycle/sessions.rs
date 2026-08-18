@@ -3648,7 +3648,10 @@ fn external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable() {
     drop(victim_cleanup);
     sibling_cleanup.disarm();
     production_shutdown_and_remove_session(&endpoint, "shutdown-failure-sibling");
+    drop(connection);
     shutdown_cli_daemon(&data_dir, child);
+    reap_session_workers_for_data_dir(&data_dir)
+        .expect("sibling SIGKILL fixture must not leave worktree session workers");
 }
 
 #[test]

@@ -404,14 +404,21 @@ fn external_hub_webrtc_live_output_preserves_exact_bytes() {
         let _ = offer_peer.peer.close().await;
     });
 
-    // Suite-load oracle: once ListSessions reports the finite producer exited,
-    // exact-session classification must return SessionCleanup{already_exited}.
+    // Suite-load oracle: wait until ListSessions reports exited, then
+    // ShutdownSession must return SessionCleanup{already_exited}.
     // Isolated green is not this proof. The blind-call typed-OperatorError
     // contract is owned by
     // external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup.
+    // Do not widen the 10 s bound.
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut listed = None;
     while Instant::now() < deadline {
+        let _ = botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::ReadScreen {
+                session_id: "webrtc-exact-bytes-session".to_string(),
+            },
+        );
         listed =
             botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::ListSessions)
                 .ok()
@@ -466,7 +473,10 @@ fn external_hub_webrtc_live_output_preserves_exact_bytes() {
     let error = missing.error.as_ref().expect("unknown_session body");
     assert_eq!(error.code, "unknown_session");
     assert_eq!(error.operation, "shutdown");
+    let data_dir = hub.data_dir().clone();
     hub.shutdown().expect("shutdown isolated hub");
+    reap_session_workers_for_data_dir(&data_dir)
+        .expect("exact-bytes hub shutdown must not leave worktree session workers");
 }
 
 #[test]
