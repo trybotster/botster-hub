@@ -6,7 +6,7 @@
 - Target id: `tgt_7e208a0c76a44980a83b63af976b1f22`
 - Base: `origin/main` `c1ce7e525aef080e10eee79a306482d5bfc66860`, merged into the plan branch as `25b7553` (revision 2 declared the prior main `66ca79c`; main then merged the unix-adapter sibling)
 - Date: 2026-08-17
-- Revision 3. Addresses Plan Review `review_1787015591_731805`: finding_1787015591_638358 (stale base), finding_1787015591_733333 (timeout misclassification), finding_1787015591_965278 (cleanup-failure contamination), finding_1787015591_794130 (dead-daemon worker identity), finding_1787015591_418403 (evidence/checklist hygiene). Revision 2 addressed `review_1787014932_417965`.
+- Revision 4. Addresses Plan Review `review_1787026289_143951`: finding_1787026289_192240 (the pre-run dirty check must detect foreign-worktree contamination through a bounded host-wide dev-artifact rule). Revision 3 addressed `review_1787015591_731805`; revision 2 addressed `review_1787014932_417965`.
 
 ## Fresh-base verification (revision 3)
 
@@ -97,8 +97,13 @@ Two layers, with fixed precedence (finding_1787014933_248609, tightened per find
 - **Ambiguous errors are NOT exhaustion evidence**: `EAGAIN`/`EWOULDBLOCK` on a socket read (an ordinary `SO_RCVTIMEO` expiry — the tolerant reader already treats it as retryable) and `ETIMEDOUT` on a readiness socket (the product may simply never have become ready). These classify as `product_failure` **unless** a same-operation causal probe, run at marker-emission time, independently confirms the specific resource limit: for fd-class evidence, the process's open-fd count is at `RLIMIT_NOFILE` minus a fixed small margin; for PTY-class evidence, an immediate PTY allocation probe fails with the same errno. Only `probe=confirmed` upgrades an ambiguous error.
 - Ambient observations (load average, census count, fd totals) are attached as evidence but are **never classification inputs on their own**.
 
+*Host-wide dev-artifact dirty rule (finding_1787026289_192240).* The exact-path interface of `script/process-census assert-no-live-executables` can only see this worktree's binaries, so it cannot detect the foreign-worktree contamination that starves a suite. The pre-run dirty check therefore uses a new, bounded, host-wide predicate added to `script/process-census` as a `dev-artifact-rows` mode. A live process is a **Botster dev artifact** when both hold:
+1. its command matches a botster-role name (`botster-hub`, `botster-session-worker`, or a harness fixture command carrying a harness data root), and
+2. its executable path or argv contains a cargo build-output segment (`/target/debug/`, `/target/managed-install-proof/`) **or** a harness data root (`/tmp/bh-`, `botster-hub-test-data`).
+These segments are harness-and-build-only by construction, in any worktree, so the rule detects other worktrees' leftovers without name-only matching. **Ownership/allowlist inputs, named:** processes whose executable path lacks every dev-artifact segment are valid host services and are never flagged — this exempts installed prefixes (for example `~/.local/share/...` generations) and the legacy `~/Rails/trybotster` runtime that serves the operator's live Hub. The wrapper's own not-yet-started suite tree is excluded by capture order (the scan runs before the suite starts). The wrapper never kills a flagged foreign process; it refuses with a pid/path evidence TSV, and the cross-worktree kill decision stays with the operator/orchestrator. Required census self-tests (positive and negative, across two distinct fake worktree paths): (a) a marker child executed from `<tmpA>/target/debug/botster-session-worker` and another from `<tmpB>/target/debug/botster-session-worker` are both flagged; (b) the same binary executed from an installed-prefix-shaped path with no dev-artifact segment is not flagged; (c) an unrelated process that merely mentions `botster` in its argv without a role name + dev-artifact segment is not flagged.
+
 *Wrapper verdict rule (deterministic, ordered).* `script/run-lifecycle-suite` classifies in this precedence order; the first matching rule wins:
-1. `environment_dirty` — the pre-run census found live botster-role executables from this worktree or a nonempty zombie delta **before** the suite started. Emitted without running the suite (or recorded alongside, if the operator forces a run).
+1. `environment_dirty` — the pre-run check found live Botster dev-artifact processes anywhere on the host (the rule above) or a nonempty botster-role zombie delta **before** the suite started. The wrapper refuses to run and emits the evidence TSV; an explicit operator override records `environment_dirty_forced` alongside whatever result follows.
 2. `product_failure` — any failed test whose panic does **not** carry the `harness_budget_expired` marker, carries a marker with `resource=none`, or carries an ambiguous resource without `probe=confirmed`, or any test that fails a semantic assertion. A product assertion always outranks host pressure: high ambient load never reclassifies a semantic failure.
 3. `host_exhaustion` — every failed test carries the marker with unambiguous resource evidence or `probe=confirmed`.
 4. `clean` — zero failures, exactly one tally, and both post-run census arms empty.
@@ -112,11 +117,11 @@ Also in S4: route the cited single-shot entity reads through the tolerant reader
 
 **S5. One-command / one-tally suite wrapper with survivor proof.**
 Add `script/run-lifecycle-suite` (thin, Darwin+Linux, reusing `script/process-census`):
-1. capture a pre-run zombie baseline and a live-executable paths file (hub, session-worker, node fixture, console binaries from this worktree),
-2. apply the classification rule from S4 (pre-run dirty check first),
+1. run the host-wide dev-artifact scan (S4 rule) and capture a pre-run zombie baseline, plus a live-executable paths file for this worktree's binaries (hub, session-worker, node fixture, console),
+2. apply the classification rule from S4 (pre-run dirty refusal first),
 3. run exactly one `./test.sh --locked --test hub_daemon_lifecycle_test "$@"` after the session-worker prebuild,
 4. assert exactly one result tally in the captured output,
-5. run `assert-no-live-executables` and `assert-no-new-zombies` with a bounded settle window,
+5. post-run: `assert-no-live-executables` on this worktree's exact paths (owned-survivor arm), `assert-no-new-zombies` against the baseline, and a host-wide dev-artifact delta against the pre-run scan (foreign-leak arm) — all with the census's bounded settle window,
 6. emit one structured verdict per the S4 rule (with taint grouping and `survivors_present` annotation).
 No arbitrary sleeps; the settle loop is the census's existing bounded retry.
 
@@ -189,6 +194,7 @@ New focused tests beside the existing prior art (`shutdown.rs:417` proves the ti
 - `tests/hub_daemon_lifecycle/shutdown.rs` (or a new sibling file) — deterministic injected-failure cleanup tests (panic, timeout, console, supervised entrypoint, dead-daemon backstop + foreign-worker control, taint latch, restart-durability control).
 - `tests/support/mod.rs` — shared helpers if guard plumbing needs them.
 - `src/entrypoint_supervisor.rs` — `launch_result_path` uniqueness + unit regression test.
+- `script/process-census` — new `dev-artifact-rows` mode (host-wide dev-artifact predicate) plus its positive/negative self-test arms across two fake worktree paths.
 - `script/run-lifecycle-suite` — new wrapper with the deterministic classifier; reuses `script/process-census`; classifier tests (real EMFILE positive, EAGAIN/ETIMEDOUT negatives, dirty-environment).
 - `README.md` / `docs/` — short harness-contract note for the wrapper and the classification rule (placement per repo prior art).
 
@@ -203,6 +209,7 @@ New focused tests beside the existing prior art (`shutdown.rs:417` proves the ti
 - The launch-result rename touches production supervision. Mitigation: env override unchanged; watcher watches the exact generated path; regression test for two supervisors in one second; full workspace gate.
 - Drop-time logging instead of panicking (S2) could hide a real cleanup failure. Mitigation: unprovable absence sets the taint latch and fails the run fail-closed; the suite wrapper's survivor census fails the command whenever anything survives, so silence cannot pass.
 - Classifier false `host_exhaustion` claims. Mitigation: ambiguous timeout errors (`EAGAIN`/`EWOULDBLOCK` socket reads, `ETIMEDOUT` readiness) classify as `product_failure` unless a same-operation causal probe confirms the limit; only `EMFILE`/`ENFILE`/PTY-allocation errnos stand alone; negative tests lock this in.
+- Host-wide dev-artifact scan could misflag a valid service or miss a leak. Mitigation: the predicate flags only role name **plus** a build-output or harness-data segment, so installed and legacy services are exempt by path shape, and any worktree's test binaries match by construction; the two-worktree positive and installed-prefix negative self-tests prove both directions, and the wrapper refuses-and-lists instead of killing foreign processes.
 
 ## Acceptance checks and tests
 
@@ -210,6 +217,7 @@ Primary (deterministic, focused; no arbitrary sleeps, no repeated full suites):
 1. New injected-failure cleanup tests (S6) pass, proving the four ordered layers separately on the panic path and the timeout path: `ShutdownSession` issued and typed-classified → exact worker PID and PTY group gone → daemon socket absent → Hub child reaped without zombie. Includes the operator-console and supervised-entrypoint cases, the dead-daemon registry-backed backstop with the foreign-worker adoption negative control, the taint-latch test (next daemon start refuses without spawning), the restart-durability `transfer` control, and red-on-revert with the guard disarmed.
 2. `src/entrypoint_supervisor.rs` collision regression test: two same-second launch-result paths are distinct; supervised readiness still works through a real `StartPackageEntrypoint` flow.
 3. Classifier determinism tests through the real error-to-marker path: real `EMFILE` (child with lowered `RLIMIT_NOFILE`) → `host_exhaustion`; `EAGAIN` socket-read stall → `product_failure`; `ETIMEDOUT` readiness stall → `product_failure`; pre-run dirty environment → `environment_dirty` before any suite run.
+3a. Host-wide dev-artifact census self-tests (in `script/process-census`): marker children under two distinct fake worktree `target/debug/` paths are both flagged; the same binary from an installed-prefix-shaped path is not flagged; a `botster`-mentioning process without role name + dev-artifact segment is not flagged.
 4. Repeated focused runs without cooldown, back-to-back, census-clean between repetitions:
    - `./test.sh --locked --test hub_daemon_lifecycle_test process_ownership_` × 5
    - `./test.sh --locked --test hub_daemon_lifecycle_test cli_operator_console_starts_reuses_detaches_handles_ctrl_c_and_stops -- --exact` × 5
@@ -229,9 +237,9 @@ Recorded from the revision 3 baseline run on merge commit `25b7553` (origin/main
 - Prebuild: `cargo build --locked -p botster-core-daemon --bin botster-session-worker` completed (01:15:12Z → 01:17:13Z).
 - Suite: `./test.sh --locked --test hub_daemon_lifecycle_test` started 2026-08-18T01:17:13Z as one suite process and was **stopped at 2026-08-18T04:03:16Z (exit 101) after 2 h 46 m of starved progress**: 9 tests passed, 1 failed (`buffered_child_stdout_wait_observes_backpressure_condition`), and four `cli_local_runtime_*` tests were each pinned past 60 s. Estimated completion at that rate was multiple days.
 - Host evidence captured during the run (04:02:52Z): load average `{22.54 31.30 53.28}` (earlier `{33.50 34.09 55.39}`), and **226 botster-role processes host-wide**, attributed by path: 73 from the ambient `/Users/jasonconigliari/Projects/botster-hub` checkout, 64 from worktree `ticket_1786661010_198387`, 38 from `ticket_1786661008_634435`, 15 from `ticket_1786937228_425608`, 11 from `ticket_1786977409_499180`, 10+8+2+2 from four further ticket worktrees — and only 2–4 from this worktree. One leftover PTY producer shell carried a data-dir nanos stamp from 2026-08-11.
-- Classification under this plan's own S4/S5 rule: **`environment_dirty`** — the pre-run host census would have refused this run before it started. The run is recorded as invalid suite-environment evidence (the same disposition the merged sibling used for its "Run 4"), and it is direct live proof of the ticket's failure class: leftover workers from prior runs across other worktrees starving the current suite.
+- Classification under this plan's own S4/S5 rule: **`environment_dirty`** — every one of the 222-224 foreign leftovers ran from a `<worktree>/target/debug/` or ambient `Projects/botster-hub/target/debug/` binary or carried a `/tmp/bh-` / `botster-hub-test-data` data root, so the host-wide dev-artifact predicate (S4) flags them all, while the 5 installed-prefix processes under `~/.local/share` are exempt as valid services. The pre-run refusal would therefore have stopped this run before it started. The run is recorded as invalid suite-environment evidence (the same disposition the merged sibling used for its "Run 4"), and it is direct live proof of the ticket's failure class: leftover workers from prior runs across other worktrees starving the current suite.
 - Post-stop hygiene: the suite tree (runner → `test.sh` → cargo → test binary) was TERM/KILL-stopped; a census confirmed **no live survivor and no zombie attributable to this worktree's run** afterward.
-- Consequence for acceptance: the exclusive final smoke (acceptance check 7) must run through `script/run-lifecycle-suite`, whose pre-run dirty check makes this contamination a first-class refusal instead of a multi-day starved run. A clean-host exclusive baseline is therefore deliverable evidence of Implement, not a precondition this Plan can obtain on the currently contaminated shared host.
+- Consequence for acceptance: the exclusive final smoke (acceptance check 7) must run through `script/run-lifecycle-suite`, whose host-wide pre-run dirty check makes this contamination a first-class refusal instead of a multi-day starved run. **Clean-lane definition:** the final smoke requires the host-wide dev-artifact scan green before the suite starts; the lane is obtained by the operator/orchestrator stopping the flagged foreign dev-artifact processes (they are build/test artifacts by construction, never valid services) — the wrapper itself only refuses and lists them, it never kills a non-owned process. A clean-host exclusive baseline is therefore deliverable evidence of Implement, not a precondition this Plan can obtain on the currently contaminated shared host.
 
 ## Vault gaps worth capturing
 
