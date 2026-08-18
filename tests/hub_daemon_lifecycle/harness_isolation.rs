@@ -552,6 +552,70 @@ fn dead_command_with_live_unverified_recovery_worker_taints() {
 }
 
 #[test]
+fn dead_command_without_recovery_identity_taints_and_does_not_signal() {
+    reset_harness_taint_after_proof();
+    let data_dir = unique_short_test_dir("gxr");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+    let command_pid = spawn_and_reap_sleep();
+    let mut decoy = ChildCleanup::spawn_non_botster_decoy();
+    let record = RegistryRecord::running(
+        SessionId("missing-recovery".to_string()),
+        Some(ProcessIdentity {
+            pid: Some(command_pid),
+            runtime_id: Some("missing-recovery-runtime".to_string()),
+        }),
+        ResizePayload { rows: 24, cols: 80 },
+        "sleep".to_string(),
+        1,
+    );
+    SessionRegistry::new(data_dir.clone())
+        .save(&record)
+        .expect("save missing-recovery registry fixture");
+    let capture = collect_owned_session_processes(&data_dir).expect("missing-recovery capture");
+    assert!(
+        capture.owned.pids.contains(&command_pid),
+        "dead command pid {command_pid} must be retained: {:?}",
+        capture.owned.pids
+    );
+    assert!(
+        capture.errors.iter().any(|error| {
+            error.contains("no recovery worker pid") && error.contains(&command_pid.to_string())
+        }),
+        "missing recovery identity must be a capture error: {:?}",
+        capture.errors
+    );
+    record_harness_taint(format!(
+        "identity capture incomplete: {}",
+        capture.errors.join("; ")
+    ));
+    assert!(
+        harness_taint().is_some_and(|evidence| evidence.contains("no recovery worker pid")),
+        "missing recovery identity must set the taint latch: {:?}",
+        harness_taint()
+    );
+    let reap = reap_registry_backed_workers(&data_dir).expect("missing-recovery reap");
+    assert!(
+        reap.errors.iter().any(|error| {
+            error.contains("no recovery worker pid") && error.contains(&command_pid.to_string())
+        }),
+        "missing recovery identity must fail closed on reap: {:?}",
+        reap.errors
+    );
+    assert!(
+        reap.retained.contains(&command_pid),
+        "dead command pid {command_pid} must stay retained on reap: {:?}",
+        reap.retained
+    );
+    assert!(
+        !reap.reaped.contains(&command_pid) && !reap.reaped.contains(&decoy.id()),
+        "missing recovery identity must not signal unverified pids: {:?}",
+        reap.reaped
+    );
+    decoy.assert_alive();
+    reset_harness_taint_after_proof();
+}
+
+#[test]
 fn process_group_proof_detects_member_after_leader_exit() {
     let data_dir = unique_short_test_dir("gpg");
     fs::create_dir_all(&data_dir).expect("create data dir");
