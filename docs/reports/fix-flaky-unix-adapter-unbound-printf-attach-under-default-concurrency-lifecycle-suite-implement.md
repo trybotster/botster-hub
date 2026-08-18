@@ -127,7 +127,7 @@ Each control used its own exact-test command. Both sabotages were reverted after
 
 | Control | Command | Sabotage | Exit | First failure |
 | --- | --- | --- | --- | --- |
-| A (unbound retention) | `./test.sh --locked --test hub_daemon_lifecycle_test -- --exact unix_adapter_unbound_printf_stream_attach_completes` | `ShutdownSession` before the host-row check | 101 | `host session lifecycle stopping is not running or exited` at `unix_terminal_adapter.rs:91` |
+| A (unbound retention) | `./test.sh --locked --test hub_daemon_lifecycle_test -- --exact unix_adapter_unbound_printf_stream_attach_completes` | `ShutdownSession` plus `RemoveSession` before the host-row check | 101 | `host session lifecycle stopping is not running or exited` at `unix_terminal_adapter.rs:91` |
 | B (bound `process_exit`) | `./test.sh --locked --test hub_daemon_lifecycle_test -- --exact unix_adapter_bound_printf_stream_attach_delivers_process_exit` | skip writing the bound release file | 101 | `attached terminal subscription must deliver process_exit` at `unix_terminal_adapter.rs:912` |
 
 ### Acceptance tallies
