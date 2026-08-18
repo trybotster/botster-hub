@@ -144,6 +144,7 @@ pub(crate) struct IdentityCapture {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct WorkerReapOutcome {
     pub(crate) reaped: Vec<u32>,
+    pub(crate) retained: Vec<u32>,
     pub(crate) errors: Vec<String>,
 }
 
@@ -624,10 +625,7 @@ pub(crate) fn reap_registry_backed_workers(data_dir: &Path) -> Result<WorkerReap
                     "unresolved worktree session-worker ancestor for command {pid} session {}",
                     identity.session_id
                 ));
-                match signal_worker_group(pid) {
-                    Ok(()) => outcome.reaped.push(pid),
-                    Err(error) => outcome.errors.push(error),
-                }
+                outcome.retained.push(pid);
             }
         }
     }

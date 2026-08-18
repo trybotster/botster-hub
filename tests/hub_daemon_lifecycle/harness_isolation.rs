@@ -203,7 +203,7 @@ fn dead_daemon_backstop_reaps_registry_worker_without_adopting_foreign() {
     let data_dir_b = unique_short_test_dir("gbb");
     fs::create_dir_all(&data_dir_a).expect("create A");
     fs::create_dir_all(&data_dir_b).expect("create B");
-    let mut daemon_a = start_cli_daemon(&data_dir_a);
+    let daemon_a = start_cli_daemon(&data_dir_a);
     let daemon_b = start_cli_daemon(&data_dir_b);
     let endpoint_a = botster_hub_client::DaemonEndpoint::new(daemon_socket_path(&data_dir_a));
     let endpoint_b = botster_hub_client::DaemonEndpoint::new(daemon_socket_path(&data_dir_b));
@@ -229,11 +229,11 @@ fn dead_daemon_backstop_reaps_registry_worker_without_adopting_foreign() {
     wait_for_process_snapshot(worker_a_pid, "own setsid", |snapshot| {
         snapshot.pgid != daemon_a.id() && snapshot.sid != daemon_a.id().to_string()
     });
+    let mut child_a = daemon_a.disarm();
     unsafe {
-        libc::kill(daemon_a.id() as libc::pid_t, libc::SIGKILL);
+        libc::kill(child_a.id() as libc::pid_t, libc::SIGKILL);
     }
-    let _ = daemon_a.child_mut().wait();
-    let _ = daemon_a.disarm();
+    let _ = child_a.wait();
     assert!(
         process_exists(worker_a_pid),
         "durable worker A must survive Hub SIGKILL before backstop"
@@ -443,6 +443,17 @@ fn unresolved_worker_ancestor_taints_and_retains_command_pid() {
         "missing verified worker ancestor must fail closed on reap: {:?}",
         reap.errors
     );
+    assert!(
+        reap.retained.contains(&command_pid),
+        "unverified command pid {command_pid} must stay retained: {:?}",
+        reap.retained
+    );
+    assert!(
+        !reap.reaped.contains(&command_pid),
+        "unverified command pid {command_pid} must not be signaled: {:?}",
+        reap.reaped
+    );
+    decoy.assert_alive();
     reset_harness_taint_after_proof();
 }
 
