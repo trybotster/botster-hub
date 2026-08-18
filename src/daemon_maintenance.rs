@@ -448,8 +448,6 @@ pub struct MaintenanceState {
     pub acknowledged_spawn_ids: BTreeSet<String>,
     /// Latest watermark for which omitted-row recover already ran once.
     omitted_row_recover_at: Option<SessionLifecycleCursor>,
-    /// Oldest retained journal sequence minus one, from CursorExpired.
-    retained_journal_floor: Option<u64>,
     pub session_family: SessionFamilyBridge,
     pub last_owner_turn: Duration,
     pub journal_page_reads: u64,
@@ -568,10 +566,9 @@ fn journal_consume_is_at_watermark(state: &MaintenanceState) -> bool {
     }
 }
 
-fn rewind_to_retained_journal_floor(state: &mut MaintenanceState) {
-    let floor = state.retained_journal_floor.unwrap_or(0);
+fn rewind_journal_cursor_for_omitted_recover(state: &mut MaintenanceState) {
     if let Some(cursor) = state.projection.cursor.as_mut() {
-        cursor.sequence = floor;
+        cursor.sequence = 0;
     }
     state.journal_caught_up_confirmed = false;
     state.scheduler.prefer_journal_pull();
@@ -599,30 +596,17 @@ fn start_omitted_row_recover(state: &mut MaintenanceState) -> bool {
         return false;
     }
     state.omitted_row_recover_at = Some(key);
-    rewind_to_retained_journal_floor(state);
+    rewind_journal_cursor_for_omitted_recover(state);
     true
-}
-
-fn recover_cursor_from_retained_floor(
-    state: &mut MaintenanceState,
-    oldest_available_sequence: u64,
-) {
-    let floor = oldest_available_sequence.saturating_sub(1);
-    state.retained_journal_floor = Some(
-        state
-            .retained_journal_floor
-            .map_or(floor, |previous| previous.max(floor)),
-    );
-    rewind_to_retained_journal_floor(state);
 }
 
 /// Hold first-snapshot completion until pending Spawn ids are projected.
 ///
 /// A freeze minted at the current watermark can omit live registry rows whose
-/// journal sequences are already at or below that watermark. Reminting another
-/// freeze at the same watermark repeats the omission. One bounded recover
-/// consumes the retained journal floor. This path does not call Core `list()`
-/// and does not replace Observe.
+/// journal sequences are already at or below that watermark. One bounded
+/// recover may probe the journal from sequence 0. If that cursor expired,
+/// Core lost prefix history and Hub remints a fresh baseline. This path does
+/// not call Core `list()` and does not replace Observe.
 pub fn refresh_projection_if_inventory_ahead(
     runtime: &HubRuntime,
     state: &mut MaintenanceState,
@@ -859,10 +843,10 @@ fn run_baseline_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
                 state.projection.seal_baseline(snapshot.clone());
                 sync_acknowledged_spawns(runtime, state);
                 retire_projected_spawn_acks(runtime, state);
-                // Keep the sealed snapshot cursor. A rewind to sequence 0
-                // expires after journal retention trims early changes and
-                // remints forever. Omitted Spawn rows use one bounded
-                // recover from the retained journal floor.
+                // Keep the sealed snapshot cursor. A rewind on every seal
+                // expires after journal retention and remints forever.
+                // CursorExpired still remints one fresh baseline because
+                // Core treats an expired cursor as lost history.
                 state.journal_caught_up_confirmed = false;
                 if acknowledged_spawns_missing_from_projection(state) {
                     start_omitted_row_recover(state);
@@ -1187,7 +1171,6 @@ pub fn start_baseline_recovery(state: &mut MaintenanceState) {
     state.journal_source_watermark = None;
     state.journal_caught_up_confirmed = false;
     state.omitted_row_recover_at = None;
-    state.retained_journal_floor = None;
     state.observe_resume = None;
     state.session_family.need_gap_pass = true;
     state.session_family.gap_after = None;
@@ -1282,21 +1265,8 @@ fn continue_family_fanout(state: &mut MaintenanceState, budget: &mut HostBridgeB
     }
 }
 
-fn handle_resync_reason(state: &mut MaintenanceState, reason: SessionLifecycleResyncReason) {
-    match reason {
-        SessionLifecycleResyncReason::CursorExpired {
-            oldest_available_sequence,
-        } => {
-            recover_cursor_from_retained_floor(state, oldest_available_sequence);
-        }
-        SessionLifecycleResyncReason::SnapshotUnavailable
-        | SessionLifecycleResyncReason::ObservePassUnavailable
-        | SessionLifecycleResyncReason::SourceChanged
-        | SessionLifecycleResyncReason::CursorAhead => {
-            start_baseline_recovery(state);
-        }
-        _ => start_baseline_recovery(state),
-    }
+fn handle_resync_reason(state: &mut MaintenanceState, _reason: SessionLifecycleResyncReason) {
+    start_baseline_recovery(state);
 }
 
 fn refresh_session_family_consumers(
@@ -2589,29 +2559,17 @@ mod tests {
     }
 
     #[test]
-    fn cursor_expired_recovers_from_the_retained_floor_without_reminting() {
+    fn cursor_expired_starts_fresh_baseline_recovery() {
         let mut state = sealed_maintenance(0, Some(12));
-        handle_resync_reason(
-            &mut state,
-            SessionLifecycleResyncReason::CursorExpired {
-                oldest_available_sequence: 8,
+        state.projection.rows.insert(
+            "stale-session".to_string(),
+            crate::session_projection::SessionProjectionRow {
+                record: test_record("stale-session"),
+                lifecycle_class: "current",
+                live_ended: false,
+                change_seq: 0,
             },
         );
-        assert!(state.baseline.is_none());
-        assert!(state.projection.baseline_complete);
-        assert!(!state.projection.gap);
-        assert_eq!(
-            state
-                .projection
-                .cursor
-                .as_ref()
-                .map(|cursor| cursor.sequence),
-            Some(7),
-            "CursorExpired must resume at oldest_available_sequence minus one"
-        );
-        assert_eq!(state.retained_journal_floor, Some(7));
-        assert!(state.journal_source_watermark.is_some());
-        assert!(!state.journal_caught_up_confirmed);
         handle_resync_reason(
             &mut state,
             SessionLifecycleResyncReason::CursorExpired {
@@ -2619,17 +2577,172 @@ mod tests {
             },
         );
         assert!(
-            state.baseline.is_none(),
-            "a later CursorExpired must not remint a baseline"
+            state.projection.gap,
+            "CursorExpired must discard the stale projection"
         );
-        assert_eq!(
+        assert!(!state.projection.baseline_complete);
+        assert!(state.projection.rows.is_empty());
+        assert!(state.projection.cursor.is_none());
+        assert!(state.journal_source_watermark.is_none());
+        assert!(state.baseline.is_none());
+        assert!(!state.projection_caught_up());
+    }
+
+    #[test]
+    fn cursor_expired_fresh_baseline_reconstructs_membership_after_discarded_prefix() {
+        crate::runtime::with_test_lifecycle_journal_capacity(2, || {
+            let data_directory = std::env::temp_dir().join(format!(
+                "hub-expired-prefix-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            ));
+            let config = crate::HubStartupOptions {
+                host: crate::HostIdentityOptions {
+                    id: "expired-prefix".to_string(),
+                    display_name: "Expired Prefix".to_string(),
+                    fingerprint: None,
+                },
+                data_directory: crate::DataDirectoryOption::Explicit(data_directory.clone()),
+                session_defaults: crate::SessionDefaults {
+                    shell: "/bin/sh".to_string(),
+                    working_directory: Some(".".into()),
+                    initial_rows: 24,
+                    initial_cols: 80,
+                },
+                transports: crate::TransportBindings::default(),
+                ..crate::HubStartupOptions::default()
+            }
+            .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
+            .expect("config");
+            let mut runtime = HubRuntime::new(config);
+            runtime
+                .spawn_session(
+                    botster_core::SessionSpawnRequest {
+                        request_id: RequestId("expired-gone-spawn".to_string()),
+                        session_id: SessionId("gone-session".to_string()),
+                        executable: "/bin/sleep".to_string(),
+                        arguments: vec!["8".to_string()],
+                        working_directory: botster_core::SpawnWorkingDirectory {
+                            path: ".".to_string(),
+                        },
+                        environment: botster_core::SpawnEnvironment::default(),
+                        initial_pty_size: Some(botster_core::ResizePayload { rows: 24, cols: 80 }),
+                    },
+                    botster_core::CoreSessionMetadata::new(),
+                    1,
+                )
+                .expect("spawn gone session");
+            runtime
+                .shutdown_session(SessionId("gone-session".to_string()), 2)
+                .expect("remove gone session");
+            runtime
+                .spawn_session(
+                    botster_core::SessionSpawnRequest {
+                        request_id: RequestId("expired-keep-spawn".to_string()),
+                        session_id: SessionId("keep-session".to_string()),
+                        executable: "/bin/sleep".to_string(),
+                        arguments: vec!["8".to_string()],
+                        working_directory: botster_core::SpawnWorkingDirectory {
+                            path: ".".to_string(),
+                        },
+                        environment: botster_core::SpawnEnvironment::default(),
+                        initial_pty_size: Some(botster_core::ResizePayload { rows: 24, cols: 80 }),
+                    },
+                    botster_core::CoreSessionMetadata::new(),
+                    3,
+                )
+                .expect("spawn keep session");
+            let mut observe_state = MaintenanceState::default();
+            for _ in 0..16 {
+                run_maintenance_kind(&runtime, &mut observe_state, MaintenanceSliceKind::Observe);
+            }
+            let current = runtime
+                .lifecycle_baseline_page(None, None, BASELINE_PAGE_BUDGET)
+                .expect("current source cursor");
+            let mut projection = SessionProjection::default();
+            projection.seal_baseline(SessionLifecycleCursor {
+                source_id: current.snapshot_sequence.source_id.clone(),
+                sequence: 0,
+            });
+            let mut state = MaintenanceState {
+                projection,
+                journal_source_watermark: Some(current.snapshot_sequence.clone()),
+                journal_caught_up_confirmed: true,
+                ..MaintenanceState::default()
+            };
+            state.projection.rows.insert(
+                "gone-session".to_string(),
+                crate::session_projection::SessionProjectionRow {
+                    record: test_record("gone-session"),
+                    lifecycle_class: "current",
+                    live_ended: false,
+                    change_seq: 0,
+                },
+            );
             state
+                .acknowledged_spawn_ids
+                .insert("keep-session".to_string());
+            assert!(!state.projection_caught_up());
+            run_maintenance_kind(&runtime, &mut state, MaintenanceSliceKind::JournalPull);
+            assert!(
+                state.projection.gap,
+                "a discarded prefix must remint a fresh baseline, not replay the retained suffix"
+            );
+            assert!(!state.projection.rows.contains_key("gone-session"));
+            for _ in 0..8 {
+                run_maintenance_kind(&runtime, &mut state, MaintenanceSliceKind::HostBridge);
+                if state.baseline.is_some() {
+                    break;
+                }
+            }
+            assert!(
+                state.baseline.is_some(),
+                "CursorExpired remint must arm baseline recovery"
+            );
+            for _ in 0..8 {
+                run_maintenance_kind(&runtime, &mut state, MaintenanceSliceKind::Baseline);
+                if state.projection.baseline_complete && state.baseline.is_none() {
+                    break;
+                }
+            }
+            assert!(
+                state.projection.baseline_complete,
+                "fresh baseline must seal"
+            );
+            assert!(
+                state.projection.rows.contains_key("keep-session"),
+                "fresh baseline must reconstruct the live Spawn"
+            );
+            let gone_still_live = state
                 .projection
-                .cursor
-                .as_ref()
-                .map(|cursor| cursor.sequence),
-            Some(7)
-        );
+                .rows
+                .get("gone-session")
+                .is_some_and(|row| !row.live_ended && row.lifecycle_class == "current");
+            assert!(
+                !gone_still_live,
+                "fresh baseline must not keep a discarded removal as a live current row"
+            );
+            assert!(
+                !state.acknowledged_spawn_ids.contains("keep-session"),
+                "projecting the live Spawn must release the pending hold"
+            );
+            for _ in 0..8 {
+                run_maintenance_kind(&runtime, &mut state, MaintenanceSliceKind::JournalPull);
+                run_maintenance_kind(&runtime, &mut state, MaintenanceSliceKind::ProjectionApply);
+                if state.projection_caught_up() {
+                    break;
+                }
+            }
+            assert!(
+                state.projection_caught_up(),
+                "fresh baseline plus journal confirm must release first-snapshot hold"
+            );
+            let _ = runtime.shutdown_session(SessionId("keep-session".to_string()), 4);
+            let _ = std::fs::remove_dir_all(data_directory);
+        });
     }
 
     #[test]

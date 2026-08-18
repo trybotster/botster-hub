@@ -4458,6 +4458,28 @@ fn json_null() -> serde_json::Value {
     serde_json::Value::Null
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_LIFECYCLE_JOURNAL_CAPACITY: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` with a test-only Core lifecycle journal capacity for this thread.
+#[cfg(test)]
+pub fn with_test_lifecycle_journal_capacity<R>(capacity: usize, f: impl FnOnce() -> R) -> R {
+    TEST_LIFECYCLE_JOURNAL_CAPACITY.with(|slot| {
+        let previous = slot.replace(Some(capacity));
+        struct Reset(Option<usize>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                TEST_LIFECYCLE_JOURNAL_CAPACITY.with(|slot| slot.set(self.0));
+            }
+        }
+        let _reset = Reset(previous);
+        f()
+    })
+}
+
 fn core_daemon_config(config: &HubConfig) -> CoreDaemonConfig {
     // Host profile supplies the initial/reset Ghostty color baseline. After
     // attach, current colors come from data-plane GHOSTSNP only.
@@ -4471,6 +4493,15 @@ fn core_daemon_config(config: &HubConfig) -> CoreDaemonConfig {
     }
     if std::env::var("BOTSTER_HUB_TEST_FAIL_SNAPSHOT_HISTORY_AFTER_READY").as_deref() == Ok("1") {
         core = core.with_test_fail_snapshot_history_after_ready(true);
+    }
+    if let Ok(raw) = std::env::var("BOTSTER_HUB_TEST_LIFECYCLE_JOURNAL_CAPACITY")
+        && let Ok(capacity) = raw.parse::<usize>()
+    {
+        core = core.with_lifecycle_journal_capacity(capacity);
+    }
+    #[cfg(test)]
+    if let Some(capacity) = TEST_LIFECYCLE_JOURNAL_CAPACITY.with(std::cell::Cell::get) {
+        core = core.with_lifecycle_journal_capacity(capacity);
     }
     core
 }
