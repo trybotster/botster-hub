@@ -497,6 +497,7 @@ fn save_running_recovery_record(data_dir: &Path, session_id: &str, command_pid: 
 
 #[test]
 fn dead_command_and_dead_recovery_worker_do_not_taint() {
+    let _lock = daemon_test_guard();
     reset_harness_taint_after_proof();
     let data_dir = unique_short_test_dir("gxd");
     fs::create_dir_all(&data_dir).expect("create data dir");
@@ -514,10 +515,12 @@ fn dead_command_and_dead_recovery_worker_do_not_taint() {
         "benign command-exit race must leave the latch clear: {:?}",
         harness_taint()
     );
+    reset_harness_taint_after_proof();
 }
 
 #[test]
 fn dead_command_with_live_unverified_recovery_worker_taints() {
+    let _lock = daemon_test_guard();
     reset_harness_taint_after_proof();
     let data_dir = unique_short_test_dir("gxu");
     fs::create_dir_all(&data_dir).expect("create data dir");
@@ -553,6 +556,7 @@ fn dead_command_with_live_unverified_recovery_worker_taints() {
 
 #[test]
 fn dead_command_without_recovery_identity_taints_and_does_not_signal() {
+    let _lock = daemon_test_guard();
     reset_harness_taint_after_proof();
     let data_dir = unique_short_test_dir("gxr");
     fs::create_dir_all(&data_dir).expect("create data dir");
