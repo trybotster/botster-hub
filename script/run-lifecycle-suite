@@ -20,16 +20,32 @@ parse_failed_count() {
   ' "$1"
 }
 
+failed_test_names() {
+  awk '/^test .+ \.\.\. FAILED$/ { print $2 }' "$1"
+}
+
 count_failed_tests() {
-  grep -cE '^test .+ \.\.\. FAILED$' "$1" || true
+  failed_test_names "$1" | grep -c . || true
 }
 
 count_taint_markers() {
   grep -c 'environment_tainted:' "$1" || true
 }
 
-count_confirmed_host_markers() {
-  grep -cE 'harness_budget_expired kind=.*(resource=(EMFILE|ENFILE|PTY)|probe=confirmed)' "$1" || true
+test_has_confirmed_host_marker() {
+  name=$1
+  log=$2
+  grep -E "harness_budget_expired test=${name} .*(resource=(EMFILE|ENFILE|PTY)|probe=confirmed)" "$log" >/dev/null
+}
+
+all_failed_tests_have_confirmed_host() {
+  log=$1
+  found=0
+  for name in $(failed_test_names "$log"); do
+    found=1
+    test_has_confirmed_host_marker "$name" "$log" || return 1
+  done
+  [ "$found" -eq 1 ]
 }
 
 classify_suite_log() {
@@ -42,14 +58,17 @@ classify_suite_log() {
   fi
   failed_tests=$(count_failed_tests "$log")
   tainted=$(count_taint_markers "$log")
-  confirmed_host=$(count_confirmed_host_markers "$log")
+  confirmed_host=0
+  if all_failed_tests_have_confirmed_host "$log"; then
+    confirmed_host=$failed_tests
+  fi
   if [ "$tally_count" != "1" ]; then
     verdict=product_failure
   elif [ "$failed" = "0" ] && [ "$failed_tests" = "0" ]; then
     verdict=clean
   elif [ "$tainted" -gt 0 ] && [ "$failed_tests" -le "$tainted" ] && [ "$confirmed_host" -eq 0 ]; then
     verdict=environment_tainted
-  elif [ "$failed" -gt 0 ] && [ "$failed_tests" -gt 0 ] && [ "$confirmed_host" -ge "$failed_tests" ]; then
+  elif [ "$failed" -gt 0 ] && [ "$failed_tests" -gt 0 ] && all_failed_tests_have_confirmed_host "$log"; then
     verdict=host_exhaustion
   else
     verdict=product_failure
@@ -77,23 +96,29 @@ self_test_classifier() {
     'test taint_latch_refuses_next_daemon_start_without_spawning ... FAILED' \
     'test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s'
   write_classify_fixture "$fixtures/emfile.log" \
-    'harness_budget_expired kind=child_condition budget_ms=10 resource=EMFILE probe=n/a real child open' \
+    'harness_budget_expired test=real_emfile_child_classifies_as_host_exhaustion kind=child_condition budget_ms=10 resource=EMFILE probe=n/a real child open' \
     'test real_emfile_child_classifies_as_host_exhaustion ... FAILED' \
     'test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s'
   write_classify_fixture "$fixtures/enfile.log" \
-    'harness_budget_expired kind=child_condition budget_ms=10 resource=ENFILE probe=n/a' \
+    'harness_budget_expired test=enfile_child kind=child_condition budget_ms=10 resource=ENFILE probe=n/a' \
     'test enfile_child ... FAILED' \
     'test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s'
   write_classify_fixture "$fixtures/pty.log" \
-    'harness_budget_expired kind=child_condition budget_ms=10 resource=PTY probe=n/a' \
+    'harness_budget_expired test=pty_allocation kind=child_condition budget_ms=10 resource=PTY probe=n/a' \
     'test pty_allocation ... FAILED' \
     'test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s'
   write_classify_fixture "$fixtures/probe.log" \
-    'harness_budget_expired kind=entity_frame budget_ms=5000 resource=EAGAIN probe=confirmed socket stall' \
+    'harness_budget_expired test=ambiguous_probe_confirmed kind=entity_frame budget_ms=5000 resource=EAGAIN probe=confirmed socket stall' \
     'test ambiguous_probe_confirmed ... FAILED' \
     'test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s'
   write_classify_fixture "$fixtures/mixed.log" \
-    'harness_budget_expired kind=child_condition budget_ms=10 resource=EMFILE probe=n/a' \
+    'harness_budget_expired test=host_case kind=child_condition budget_ms=10 resource=EMFILE probe=n/a' \
+    'test host_case ... FAILED' \
+    'test product_case ... FAILED' \
+    'test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s'
+  write_classify_fixture "$fixtures/duplicate_host.log" \
+    'harness_budget_expired test=host_case kind=child_condition budget_ms=10 resource=EMFILE probe=n/a' \
+    'harness_budget_expired test=host_case kind=child_condition budget_ms=10 resource=EMFILE probe=n/a' \
     'test host_case ... FAILED' \
     'test product_case ... FAILED' \
     'test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s'
@@ -117,6 +142,7 @@ self_test_classifier() {
   expect_verdict "$fixtures/pty.log" host_exhaustion
   expect_verdict "$fixtures/probe.log" host_exhaustion
   expect_verdict "$fixtures/mixed.log" product_failure
+  expect_verdict "$fixtures/duplicate_host.log" product_failure
   expect_verdict "$fixtures/two_tally.log" product_failure
   clean_failed=$(parse_failed_count "$fixtures/clean.log")
   [ "$clean_failed" = "0" ] || {

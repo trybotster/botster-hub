@@ -42,6 +42,7 @@ fn harness_budget_marker_classifies_emfile_as_host_exhaustion() {
     );
     assert!(marker.contains("resource=EMFILE"));
     assert!(marker.contains("probe=n/a"));
+    assert!(marker.contains("test=harness_budget_marker_classifies_emfile_as_host_exhaustion"));
 }
 
 #[test]
@@ -167,7 +168,7 @@ fn guard_cleanup_after_panic_reaps_worker_socket_and_hub() {
         "panic cleanup must reap the PTY command pid {command_pid}"
     );
     assert!(
-        !process_exists(command_pgid),
+        !process_group_probe(command_pgid as libc::pid_t).expect("PTY group probe"),
         "panic cleanup must reap the PTY process group {command_pgid}"
     );
 }
@@ -188,6 +189,10 @@ fn guard_timeout_path_emits_budget_marker_and_reaps() {
     assert!(
         error.contains("harness_budget_expired"),
         "timeout must emit structured marker: {error}"
+    );
+    assert!(
+        error.contains("test=guard_timeout_path_emits_budget_marker_and_reaps"),
+        "timeout marker must name this test: {error}"
     );
 }
 
@@ -334,11 +339,16 @@ fn guard_proof_requires_worker_pid_when_argv_omits_data_dir() {
     request_cli_daemon_shutdown(&data_dir).ok();
     let _ = child.wait();
     assert!(
-        prove_owned_children_absent(&data_dir, None, &[]).is_ok(),
+        prove_owned_children_absent(&data_dir, None, &OwnedSessionProcesses::default()).is_ok(),
         "empty known-pid proof must stay green after Hub stop while the worker is live"
     );
     assert!(
-        prove_owned_children_absent(&data_dir, None, &[worker_pid]).is_err(),
+        prove_owned_children_absent(
+            &data_dir,
+            None,
+            &OwnedSessionProcesses::from_pids([worker_pid])
+        )
+        .is_err(),
         "retained worker pid {worker_pid} must fail absence proof while the worker is live"
     );
     let successor = start_cli_daemon(&data_dir);
@@ -347,6 +357,86 @@ fn guard_proof_requires_worker_pid_when_argv_omits_data_dir() {
         !process_exists(worker_pid) && !process_exists(command_pid),
         "successor cleanup must reap worker {worker_pid} and command {command_pid}"
     );
+}
+
+#[test]
+fn identity_capture_error_taints_and_blocks_next_start() {
+    let _lock = daemon_test_guard();
+    let data_dir = unique_short_test_dir("gic");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+    let mut daemon = start_cli_daemon(&data_dir);
+    daemon.test_hooks.force_identity_capture_failure = true;
+    drop(daemon);
+    assert!(
+        harness_taint().is_some_and(|evidence| evidence.contains("identity capture failed")),
+        "identity capture error must set the taint latch"
+    );
+    let next_dir = unique_short_test_dir("gin");
+    fs::create_dir_all(&next_dir).expect("create next data dir");
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = start_cli_daemon(&next_dir);
+    }));
+    assert!(
+        panicked.is_err(),
+        "next daemon start must fail after identity capture taint"
+    );
+    reset_harness_taint_after_proof();
+}
+
+#[test]
+fn process_group_proof_detects_member_after_leader_exit() {
+    let data_dir = unique_short_test_dir("gpg");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+    let mut leader = Command::new("sleep");
+    leader.arg("30").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    unsafe {
+        leader.pre_exec(|| {
+            libc::setpgid(0, 0);
+            Ok(())
+        });
+    }
+    let mut leader = leader.spawn().expect("spawn group leader");
+    let pgid = leader.id();
+    let mut member = Command::new("sleep");
+    member.arg("30").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let leader_pgid = pgid as libc::pid_t;
+    unsafe {
+        member.pre_exec(move || {
+            libc::setpgid(0, leader_pgid);
+            Ok(())
+        });
+    }
+    let mut member = member.spawn().expect("spawn group member");
+    wait_for_process_snapshot(member.id(), "join leader group", |snapshot| {
+        snapshot.pgid == pgid
+    });
+    unsafe {
+        libc::kill(leader.id() as libc::pid_t, libc::SIGKILL);
+    }
+    let _ = leader.wait();
+    assert!(
+        !process_exists(pgid),
+        "group leader pid must be gone so a pid-only oracle would go green"
+    );
+    assert!(
+        process_group_probe(pgid as libc::pid_t).expect("group probe"),
+        "process-group probe must see the remaining member"
+    );
+    assert!(
+        prove_owned_children_absent(&data_dir, None, &OwnedSessionProcesses::from_pids([pgid]))
+            .is_ok(),
+        "pid-only proof is the false-clean hole after the leader exits"
+    );
+    let mut owned = OwnedSessionProcesses::default();
+    owned.push_pgid(pgid);
+    assert!(
+        prove_owned_children_absent(&data_dir, None, &owned).is_err(),
+        "typed process-group proof must fail while a group member remains"
+    );
+    unsafe {
+        libc::kill(member.id() as libc::pid_t, libc::SIGKILL);
+    }
+    let _ = member.wait();
 }
 
 #[test]

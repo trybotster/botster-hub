@@ -95,6 +95,44 @@ impl ResourceProbe {
 #[derive(Debug, Default)]
 pub(crate) struct GuardTestHooks {
     pub(crate) force_absence_unproven: bool,
+    pub(crate) force_identity_capture_failure: bool,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct OwnedSessionProcesses {
+    pub(crate) pids: Vec<u32>,
+    pub(crate) pgids: Vec<u32>,
+}
+
+impl OwnedSessionProcesses {
+    pub(crate) fn from_pids(pids: impl IntoIterator<Item = u32>) -> Self {
+        let mut set = Self::default();
+        for pid in pids {
+            set.push_pid(pid);
+        }
+        set
+    }
+
+    pub(crate) fn push_pid(&mut self, pid: u32) {
+        if pid > 1 && !self.pids.contains(&pid) {
+            self.pids.push(pid);
+        }
+    }
+
+    pub(crate) fn push_pgid(&mut self, pgid: u32) {
+        if pgid > 1 && !self.pgids.contains(&pgid) {
+            self.pgids.push(pgid);
+        }
+    }
+
+    pub(crate) fn extend(&mut self, other: Self) {
+        for pid in other.pids {
+            self.push_pid(pid);
+        }
+        for pgid in other.pgids {
+            self.push_pgid(pgid);
+        }
+    }
 }
 
 pub(crate) fn harness_taint_cell() -> &'static Mutex<Option<String>> {
@@ -136,8 +174,16 @@ pub(crate) fn format_harness_budget_expired(
     probe: ResourceProbe,
     evidence: &str,
 ) -> String {
+    let thread = std::thread::current();
+    let test = thread
+        .name()
+        .unwrap_or("unknown")
+        .rsplit("::")
+        .next()
+        .unwrap_or("unknown")
+        .to_string();
     format!(
-        "harness_budget_expired kind={kind} budget_ms={} resource={} probe={} {evidence}",
+        "harness_budget_expired test={test} kind={kind} budget_ms={} resource={} probe={} {evidence}",
         budget.as_millis(),
         resource.marker_name(),
         probe.marker_name()
@@ -308,29 +354,34 @@ pub(crate) fn try_terminate_and_reap_child(child: &mut Child) -> Result<String, 
     ))
 }
 
-pub(crate) fn collect_owned_session_process_pids(data_dir: &Path) -> Result<Vec<u32>, String> {
-    let mut pids = Vec::new();
+pub(crate) fn collect_owned_session_processes(
+    data_dir: &Path,
+) -> Result<OwnedSessionProcesses, String> {
+    let mut owned = OwnedSessionProcesses::default();
     for identity in registry_backed_worker_identities(data_dir)? {
         let Some(command_pid) = identity.pid else {
             continue;
         };
-        pids.push(command_pid);
+        owned.push_pid(command_pid);
         if let Some(snapshot) = process_snapshot(command_pid) {
-            pids.push(snapshot.pgid);
+            owned.push_pgid(snapshot.pgid);
         }
         if let Some(worker_pid) = worktree_session_worker_ancestor(command_pid) {
-            pids.push(worker_pid);
+            owned.push_pid(worker_pid);
             if let Some(snapshot) = process_snapshot(worker_pid) {
-                pids.push(snapshot.pgid);
+                owned.push_pgid(snapshot.pgid);
             }
             if let Ok(descendants) = worker_owned_descendant_pids(worker_pid) {
-                pids.extend(descendants);
+                for pid in descendants {
+                    owned.push_pid(pid);
+                    if let Some(snapshot) = process_snapshot(pid) {
+                        owned.push_pgid(snapshot.pgid);
+                    }
+                }
             }
         }
     }
-    pids.sort_unstable();
-    pids.dedup();
-    Ok(pids)
+    Ok(owned)
 }
 
 pub(crate) fn registry_backed_worker_identities(
@@ -558,22 +609,22 @@ pub(crate) fn unlink_stale_daemon_socket(data_dir: &Path, hub_pid: Option<u32>) 
 pub(crate) fn prove_owned_children_absent(
     data_dir: &Path,
     hub_pid: Option<u32>,
-    known_worker_pids: &[u32],
+    owned: &OwnedSessionProcesses,
 ) -> Result<(), String> {
-    prove_owned_absence(data_dir, hub_pid, known_worker_pids, true)
+    prove_owned_absence(data_dir, hub_pid, owned, true)
 }
 
 pub(crate) fn prove_hub_and_socket_absent(
     data_dir: &Path,
     hub_pid: Option<u32>,
 ) -> Result<(), String> {
-    prove_owned_absence(data_dir, hub_pid, &[], false)
+    prove_owned_absence(data_dir, hub_pid, &OwnedSessionProcesses::default(), false)
 }
 
 fn prove_owned_absence(
     data_dir: &Path,
     hub_pid: Option<u32>,
-    known_worker_pids: &[u32],
+    owned: &OwnedSessionProcesses,
     expect_workers_gone: bool,
 ) -> Result<(), String> {
     unlink_stale_daemon_socket(data_dir, hub_pid);
@@ -589,7 +640,7 @@ fn prove_owned_absence(
     if !expect_workers_gone {
         return Ok(());
     }
-    for pid in known_worker_pids {
+    for pid in &owned.pids {
         if process_exists(*pid) {
             return Err(format!("owned worker pid {pid} still live"));
         }
@@ -600,6 +651,18 @@ fn prove_owned_absence(
                 "owned worker pid {pid} is a zombie: {}",
                 snapshot.command
             ));
+        }
+    }
+    for pgid in &owned.pgids {
+        match process_group_probe(*pgid as libc::pid_t) {
+            Ok(true) => {
+                return Err(format!(
+                    "owned process group {pgid} still has members: {:?}",
+                    process_group_census(*pgid as libc::pid_t).unwrap_or_default()
+                ));
+            }
+            Ok(false) => {}
+            Err(error) => return Err(error),
         }
     }
     let leftover = session_worker_process_identities()?

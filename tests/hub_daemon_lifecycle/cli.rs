@@ -362,7 +362,7 @@ pub(crate) struct PanicSafeCliDaemon {
     pub(crate) mode: GuardCleanupMode,
     pub(crate) test_hooks: GuardTestHooks,
     pub(crate) shutdown_records: Vec<SessionShutdownRecord>,
-    pub(crate) known_worker_pids: Vec<u32>,
+    pub(crate) owned_sessions: OwnedSessionProcesses,
 }
 
 impl PanicSafeCliDaemon {
@@ -375,7 +375,7 @@ impl PanicSafeCliDaemon {
             mode: GuardCleanupMode::Full,
             test_hooks: GuardTestHooks::default(),
             shutdown_records: Vec::new(),
-            known_worker_pids: Vec::new(),
+            owned_sessions: OwnedSessionProcesses::default(),
         }
     }
 
@@ -430,7 +430,7 @@ impl PanicSafeCliDaemon {
         let proof = if transfer {
             prove_hub_and_socket_absent(data_dir, None)
         } else {
-            prove_owned_children_absent(data_dir, None, &self.known_worker_pids)
+            prove_owned_children_absent(data_dir, None, &self.owned_sessions)
         };
         if let Err(error) = proof {
             record_harness_taint(format!("{}: {error}", self.panic_context));
@@ -450,8 +450,24 @@ impl PanicSafeCliDaemon {
         let socket_present = daemon_socket_path(&self.data_dir).exists();
 
         if !skip_sessions {
-            self.known_worker_pids
-                .extend(collect_owned_session_process_pids(&self.data_dir).unwrap_or_default());
+            let capture = if self.test_hooks.force_identity_capture_failure {
+                Err("injected registry identity capture failure".to_string())
+            } else {
+                collect_owned_session_processes(&self.data_dir)
+            };
+            match capture {
+                Ok(owned) => self.owned_sessions.extend(owned),
+                Err(error) => {
+                    record_harness_taint(format!(
+                        "{}: identity capture failed: {error}",
+                        self.panic_context
+                    ));
+                    eprintln!(
+                        "{}: identity capture failed ({trigger:?}): {error}",
+                        self.panic_context
+                    );
+                }
+            }
             if socket_present {
                 match shutdown_owned_sessions(&self.data_dir) {
                     Ok(records) => {
@@ -463,7 +479,11 @@ impl PanicSafeCliDaemon {
                             self.panic_context
                         );
                         match reap_registry_backed_workers(&self.data_dir) {
-                            Ok(pids) => self.known_worker_pids.extend(pids),
+                            Ok(pids) => {
+                                for pid in pids {
+                                    self.owned_sessions.push_pid(pid);
+                                }
+                            }
                             Err(backstop) => eprintln!(
                                 "{}: registry-backed backstop failed: {backstop}",
                                 self.panic_context
@@ -473,7 +493,11 @@ impl PanicSafeCliDaemon {
                 }
             } else {
                 match reap_registry_backed_workers(&self.data_dir) {
-                    Ok(pids) => self.known_worker_pids.extend(pids),
+                    Ok(pids) => {
+                        for pid in pids {
+                            self.owned_sessions.push_pid(pid);
+                        }
+                    }
                     Err(error) => eprintln!(
                         "{}: dead-daemon backstop failed: {error}",
                         self.panic_context
@@ -512,7 +536,7 @@ impl PanicSafeCliDaemon {
         let proof = if self.test_hooks.force_absence_unproven {
             Err("injected prove-absence failure".to_string())
         } else {
-            prove_owned_children_absent(&self.data_dir, hub_pid, &self.known_worker_pids)
+            prove_owned_children_absent(&self.data_dir, hub_pid, &self.owned_sessions)
         };
         if let Err(error) = proof {
             record_harness_taint(format!("{}: {error}", self.panic_context));
