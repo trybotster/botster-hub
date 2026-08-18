@@ -4,23 +4,23 @@
 | --- | --- |
 | Ticket | `ticket_1786938984_190098` |
 | Run | `run_1787013066_187598` |
-| Step | `botster_stack_implement` (`run_step_1787026708_990835`, Review return) |
+| Step | `botster_stack_implement` (`run_step_1787027665_198339`, second Review return) |
 | Target repository | `botster-hub` (`trybotster/botster-hub`) |
 | `target_id` | `tgt_7e208a0c76a44980a83b63af976b1f22` |
 | Authoritative path | ticket `target_id` plus worktree `origin` remote `https://github.com/trybotster/botster-hub.git` |
 | Pipeline worktree | the ticket worktree on `project-pipelines/ticket_1786938984_190098` |
-| Approved plan | `docs/plans/fix-flaky-ready-spawn-wall-clock-budget-under-ambient-load.md` revision v4.2 |
+| Approved plan | `docs/plans/fix-flaky-ready-spawn-wall-clock-budget-under-ambient-load.md` revision v4.3 |
 | Plan artifacts | `artifact_1787013708_530188` (v4) plus `artifact_1787013854_780740` (v4.1 addendum) |
-| Review bounce | `review_1787026690_762581` `changes_required` |
+| Review bounce | `review_1787027652_739418` `changes_required` after `review_1787026690_762581` |
 | Advisor answer | `question_1787017751_527748` option 1: keep the 24-identity invariant and close the Hub first-snapshot leak |
 | Delivery | direct-merge; no pull request |
 | Class | not runtime-teardown (`teardown_class_applies: false`) |
 | Implement checklist | ticket `checklist_1786943181_130677`; run `checklist_1787015597_621425` |
 | Core pin | `fc541a59338d0591ba4fb3fa522a030d212d26d0` unchanged |
 
-Independent routing: `project_pipelines_current_context` lists `tgt_7e208a0c76a44980a83b63af976b1f22`. The ticket worktree `origin` remote is `trybotster/botster-hub`. Approved plan v4, v4.1, and v4.2 used the same `target_id` and repository.
+Independent routing: `project_pipelines_current_context` lists `tgt_7e208a0c76a44980a83b63af976b1f22`. The ticket worktree `origin` remote is `trybotster/botster-hub`. Approved plan v4 through v4.3 used the same `target_id` and repository.
 
-This visit repairs the five open Review findings. It keeps the first-visit hold at `c5fc988`, the Hub main integrate at `a363a8e`, and the earlier implement gate.
+This visit repairs the two open findings from `review_1787027652_739418`. It keeps pending-ack retire, no subscriber-delivery `list()`, and the earlier implement commits.
 
 ## Repository playbook and other playbooks/notes applied
 
@@ -68,17 +68,14 @@ This visit repairs the five open Review findings. It keeps the first-visit hold 
 
 ## Files changed
 
-Review-return production path:
+Second Review-return production path:
 
-- `src/daemon_maintenance.rs` — pending `acknowledged_spawn_ids` retire after the projection contains the id. Empty pending after retire is caught-up. `CursorExpired` resumes at `oldest_available_sequence - 1` and does not remint. Baseline seal keeps the sealed snapshot cursor. One omitted-row recover uses the retained journal floor. `refresh_projection_if_inventory_ahead` no longer calls `runtime.list_sessions()`.
-- `src/runtime.rs` — `HubRuntime::retire_acknowledged_spawn` removes a pending id so sync cannot re-extend it.
-- `src/daemon_transport.rs` — successful Spawn still records the request id. The empty-after-successful-Spawn latch is gone.
-- `src/daemon_entity_subscriptions.rs` — production `caught_up` guard stays. The inverted helper that forced `caught_up=true` and asserted `8 != 24` is deleted.
-- `tests/hub_daemon_lifecycle/sessions.rs` — observe-slice test asserts `Spawned` and the first Snapshot load identities. New Spawn → project → shutdown → resubscribe regression.
+- `src/daemon_maintenance.rs` — `CursorExpired` starts fresh bounded baseline recovery. Normal seal still keeps the sealed snapshot cursor. One omitted-row recover may probe sequence 0; if that cursor expired, Hub remints. Pending-ack retire from the prior visit stays.
+- `src/runtime.rs` — test-only `with_test_lifecycle_journal_capacity` plus optional `BOTSTER_HUB_TEST_LIFECYCLE_JOURNAL_CAPACITY` so a discarded-prefix test can use journal capacity 2. `retire_acknowledged_spawn` stays.
 
 Handoff:
 
-- `docs/plans/fix-flaky-ready-spawn-wall-clock-budget-under-ambient-load.md` — resynced to v4.2.
+- `docs/plans/fix-flaky-ready-spawn-wall-clock-budget-under-ambient-load.md` — resynced to v4.3.
 - `docs/reports/fix-flaky-ready-spawn-wall-clock-budget-under-ambient-load-implement.md` — this report.
 
 ## Ownership boundaries preserved
@@ -99,14 +96,13 @@ Same-target siblings, not absorbed:
 
 ## Deviations from plan
 
-These deviations are accepted and written back into plan v4.2.
+These deviations are accepted and written back into plan v4.3.
 
-1. Pending Spawn acknowledgements retire after the projection observes the session. Process-lifetime ids blocked later first snapshots after remove (`finding_1787026690_685087`). Empty pending after retire is caught-up. The vacuous empty-set leak is closed by recording on Spawn, not by treating empty-after-retire as incomplete.
-2. Baseline seal keeps the sealed snapshot cursor. Hub does not rewind to sequence 0 (`finding_1787026690_277672`). `CursorExpired` recovers from `oldest_available_sequence - 1` and does not remint. One omitted-row recover at a watermark uses that retained floor. Hub cannot set Core journal capacity, so the capacity-below-sequence contract is the `CursorExpired` unit test with oldest sequence 8 under watermark 12.
-3. Subscriber delivery does not call Core `list()` (`finding_1787026690_295141`). Pending acknowledgements, the bounded journal, and one retained-floor recover are the hold sources.
-4. The inverted helper that forced `caught_up=true` and asserted `8 != 24` is deleted (`finding_1787026690_546772`). Deterministic red-on-revert is a temporary ablation of the production `caught_up` guard plus `first_session_snapshot_holds_until_the_projection_is_caught_up`.
-5. `ready_spawn_completes_when_live_sessions_exceed_one_observe_slice` now asserts `Spawned` and the intended first Snapshot (`finding_1787026690_826635`).
-6. Earlier v4.1 deviations remain: no register-time assembly, confirming empty pull, apply prefers `SubscriberDelivery`, in-process existing-subscriber proof, latest observed watermark, IsolatedHub stderr is unread, `Spawned`-kind oracle, no full suite.
+1. `CursorExpired` remints a fresh baseline (`finding_1787027652_648073`). Replaying the retained suffix cannot reconstruct discarded prefix Upserts or removals. Normal completion still keeps the sealed cursor, so seal does not rewind to 0 and remint forever.
+2. The discarded-prefix proof uses a test-only journal capacity of 2. That knob is not a production Core pin or Hub config change.
+3. This visit ran `ready_spawn_completes` 20/20 on the tree that contains the remint (`finding_1787027652_881975`).
+4. Earlier v4.2 deviations remain: pending-ack retire, no subscriber-delivery `list()`, production-guard ablation red-proof, observe-slice `Spawned` and first-Snapshot asserts.
+5. Earlier v4.1 deviations remain: no register-time assembly, confirming empty pull, apply prefers `SubscriberDelivery`, in-process existing-subscriber proof, latest observed watermark, IsolatedHub stderr is unread, `Spawned`-kind oracle, no full suite.
 
 ## Tests and downstream proof run
 
@@ -124,7 +120,7 @@ Temporary ablation: remove `!caught_up ||` from the production guard in `continu
 | Restored production guard | same command | 0 | hold stays; no snapshot frames |
 | Ablated integration completeness | `./test.sh --locked --test hub_daemon_lifecycle_test ready_spawn_completes_during_session_snapshot_assembly` × 8 | 0 | stays green; registration no longer assembles, so the owner loop can consume the journal before the first Snapshot read |
 | Retired ack after remove | `./test.sh --locked --lib projection_caught_up_after_pending_ack` | 0 | later first snapshots are not held |
-| CursorExpired retained floor | `./test.sh --locked --lib cursor_expired` | 0 | cursor becomes 7; baseline stays `None` |
+| CursorExpired remint | `./test.sh --locked --lib cursor_expired` | 0 | stale rows clear; discarded-prefix test reconstructs `keep-session` and releases the pending hold |
 | Partial-set readiness | `./test.sh --locked --test hub_daemon_lifecycle_test assemble_readiness_rejects_a_partial_identity_set` | 0 | helper rejects empty and 17-of-24 sets |
 | Error-frame helper | `./test.sh --locked --test hub_daemon_lifecycle_test assemble_subscription_rejects_an_error_frame` | 0 | typed Error is not a projected identity set |
 
@@ -136,7 +132,7 @@ Temporary ablation: remove `!caught_up ||` from the production guard in `continu
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0 |
 | `./test.sh --locked --lib projection_caught_up` | 6 passed |
 | `./test.sh --locked --lib missing_pending` | 1 passed; one recover, no loop |
-| `./test.sh --locked --lib cursor_expired` | 1 passed |
+| `./test.sh --locked --lib cursor_expired` | 2 passed; remint plus discarded-prefix reconstruction |
 | `./test.sh --locked --lib late_projection` | 1 passed; seal keeps a snapshot cursor |
 | `./test.sh --locked --lib twenty_four_pending` | 1 passed |
 | `./test.sh --locked --lib first_session_snapshot` | 3 passed |
@@ -146,7 +142,7 @@ Temporary ablation: remove `!caught_up ||` from the production guard in `continu
 | `./test.sh --locked --test hub_daemon_lifecycle_test assemble_subscription_rejects` | 1 passed |
 | `./test.sh --locked --test hub_daemon_lifecycle_test assemble_readiness_rejects` | 1 passed |
 | `./test.sh --locked --test hub_daemon_lifecycle_test first_session_snapshot_arrives_after_projected_spawn_is_removed` | 1 passed |
-| `./test.sh --locked --test hub_daemon_lifecycle_test ready_spawn_completes` × 5 this visit | 5 pass, 0 fail; both ready_spawn tests green. Earlier visit at `c5fc988` was 20/20. |
+| `./test.sh --locked --test hub_daemon_lifecycle_test ready_spawn_completes` × 20 this visit | 20 pass, 0 fail on the remint tree; both ready_spawn tests green |
 
 Downstream proof: not required. No public DTO, pin, or client-contract change.
 
@@ -162,7 +158,7 @@ Non-binding loaded-daemon workflow dispatch was not run. A full lifecycle suite 
 - If journal retention drops a pending Spawn Upsert before recover runs, that pending id stays outstanding and later first snapshots stay held. Default journal capacity is 1024. The 24-session fixture stays inside that window.
 - The in-process existing-subscriber test drives owner-loop slices directly. It does not prove the daemon-child socket path for the post-snapshot Upsert. The ready-spawn integration test covers the first-snapshot identity contract through a real CLI daemon child.
 - Leftover IsolatedHub children from earlier failed loops can exhaust session-worker capacity. The oracle fails at Spawn when a reply is not `Spawned`.
-- This Review-return visit ran `ready_spawn_completes` 5/5, not another 20/20 loop.
+- A trimmed pending Spawn Upsert can still hold later first snapshots until a later remint includes that session. The discarded-prefix test proves the live-session remint path.
 - Capture of the watermark-gated snapshot convention is deferred until after merge, as the plan states.
 
 ## Missing vault guidance discovered
