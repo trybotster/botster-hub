@@ -2224,13 +2224,13 @@ fn session_cleanup_guard_failure_path_reaps_durable_unbounded_session() {
 #[test]
 fn session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnect() {
     let _guard = daemon_test_guard();
-    let conformance_hub = botster_hub_test_support::IsolatedHubBuilder::new()
-        .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
-        .session_worker_bin(session_worker_binary_path())
-        .root(unique_short_test_dir("slc"))
-        .name("published-runner")
-        .start()
-        .expect("start isolated hub for published session lifecycle conformance");
+    let conformance_hub = start_isolated_hub(
+        botster_hub_test_support::IsolatedHubBuilder::new()
+            .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
+            .session_worker_bin(session_worker_binary_path())
+            .root(unique_short_test_dir("slc"))
+            .name("published-runner"),
+    );
     let conformance_report =
         botster_hub_test_support::run_session_lifecycle_subscription_conformance(&conformance_hub)
             .expect("run published session lifecycle conformance against real topology");
@@ -2696,6 +2696,14 @@ fn session_entity_subscription_projects_stale_row_as_indeterminate() {
         .unsubscribe()
         .expect("unsubscribe stale projection");
     shutdown_cli_daemon(&data_dir, child);
+    assert!(
+        harness_taint().is_some_and(|evidence| {
+            evidence.contains("session-entity-stale") && evidence.contains("no recovery worker pid")
+        }),
+        "forged stale command 42 must taint as missing recovery identity: {:?}",
+        harness_taint()
+    );
+    reset_harness_taint_after_proof();
 }
 
 #[test]
@@ -5145,13 +5153,13 @@ fn external_hub_client_reports_compatibility_descriptor_and_mismatch_diagnostics
 #[test]
 fn process_ownership_external_hub_test_support_cleans_up_isolated_daemon() {
     let _guard = daemon_test_guard();
-    let first = botster_hub_test_support::IsolatedHubBuilder::new()
-        .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
-        .session_worker_bin(session_worker_binary_path())
-        .root(PathBuf::from("/tmp/bh-test-support"))
-        .name("downstream-shape")
-        .start()
-        .expect("start isolated hub through public test-support harness");
+    let first = start_isolated_hub(
+        botster_hub_test_support::IsolatedHubBuilder::new()
+            .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
+            .session_worker_bin(session_worker_binary_path())
+            .root(PathBuf::from("/tmp/bh-test-support"))
+            .name("downstream-shape"),
+    );
     assert!(first.data_dir().starts_with("/tmp/bh-test-support"));
     assert!(first.endpoint().socket_path.starts_with(first.data_dir()));
     let support_matrix = botster_hub_test_support::first_party_client_support_matrix();
@@ -5299,13 +5307,13 @@ fn process_ownership_external_hub_test_support_cleans_up_isolated_daemon() {
     assert!(terminal_app_report.stderr.is_empty());
     first.shutdown().expect("shutdown first isolated hub");
 
-    let second = botster_hub_test_support::IsolatedHubBuilder::new()
-        .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
-        .session_worker_bin(session_worker_binary_path())
-        .root(PathBuf::from("/tmp/bh-test-support"))
-        .name("downstream-shape-determinism")
-        .start()
-        .expect("start second isolated hub through public test-support harness");
+    let second = start_isolated_hub(
+        botster_hub_test_support::IsolatedHubBuilder::new()
+            .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
+            .session_worker_bin(session_worker_binary_path())
+            .root(PathBuf::from("/tmp/bh-test-support"))
+            .name("downstream-shape-determinism"),
+    );
     let second_report =
         botster_hub_test_support::run_client_conformance(&second).expect("rerun conformance");
     assert_eq!(second_report, first_report);
@@ -5315,13 +5323,13 @@ fn process_ownership_external_hub_test_support_cleans_up_isolated_daemon() {
 #[test]
 fn external_hub_client_many_pty_adversarial_conformance_ci() {
     let _guard = daemon_test_guard();
-    let hub = botster_hub_test_support::IsolatedHubBuilder::new()
-        .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
-        .session_worker_bin(session_worker_binary_path())
-        .root(PathBuf::from("/tmp/bh-test-support"))
-        .name("many-pty-client-attach-ci")
-        .start()
-        .expect("start isolated hub for CI-safe many-PTY proof");
+    let hub = start_isolated_hub(
+        botster_hub_test_support::IsolatedHubBuilder::new()
+            .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
+            .session_worker_bin(session_worker_binary_path())
+            .root(PathBuf::from("/tmp/bh-test-support"))
+            .name("many-pty-client-attach-ci"),
+    );
 
     let report = botster_hub_test_support::run_many_pty_client_attach_conformance(&hub, 8)
         .expect("run CI-safe many-PTY client attach proof");
@@ -5338,13 +5346,13 @@ fn external_hub_client_many_pty_adversarial_conformance_ci() {
 #[ignore = "larger local adversarial proof; run explicitly with the documented command"]
 fn external_hub_client_many_pty_adversarial_conformance_local() {
     let _guard = daemon_test_guard();
-    let hub = botster_hub_test_support::IsolatedHubBuilder::new()
-        .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
-        .session_worker_bin(session_worker_binary_path())
-        .root(PathBuf::from("/tmp/bh-test-support"))
-        .name("many-pty-client-attach-local")
-        .start()
-        .expect("start isolated hub for larger local many-PTY proof");
+    let hub = start_isolated_hub(
+        botster_hub_test_support::IsolatedHubBuilder::new()
+            .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
+            .session_worker_bin(session_worker_binary_path())
+            .root(PathBuf::from("/tmp/bh-test-support"))
+            .name("many-pty-client-attach-local"),
+    );
 
     let report = botster_hub_test_support::run_many_pty_client_attach_conformance(&hub, 32)
         .expect("run larger local many-PTY client attach proof");

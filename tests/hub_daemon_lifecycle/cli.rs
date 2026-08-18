@@ -60,6 +60,7 @@ pub(crate) fn start_cli_daemon_with_worker_egress_capacity(
     data_dir: &Path,
     egress_capacity: Option<usize>,
 ) -> PanicSafeCliDaemon {
+    let _guard = daemon_test_guard();
     check_harness_taint();
     ensure_session_worker_binary();
     let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
@@ -89,6 +90,7 @@ pub(crate) fn start_cli_daemon_with_runtime_drain_failure(
     session_id: &str,
     egress_capacity: Option<usize>,
 ) -> PanicSafeCliDaemon {
+    let _guard = daemon_test_guard();
     check_harness_taint();
     ensure_session_worker_binary();
     let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
@@ -124,6 +126,7 @@ pub(crate) fn start_cli_daemon_with_runtime_drain_failure(
 pub(crate) fn start_cli_daemon_with_snapshot_history_failure(
     data_dir: &Path,
 ) -> PanicSafeCliDaemon {
+    let _guard = daemon_test_guard();
     check_harness_taint();
     ensure_session_worker_binary();
     let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
@@ -147,6 +150,7 @@ pub(crate) fn start_cli_daemon_with_snapshot_history_failure(
 }
 
 pub(crate) fn start_cli_daemon_with_home(data_dir: &Path, home: &Path) -> PanicSafeCliDaemon {
+    let _guard = daemon_test_guard();
     check_harness_taint();
     ensure_session_worker_binary();
     let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
@@ -315,6 +319,7 @@ pub(crate) fn spawn_timeout_release_metadata_fixture()
 }
 
 pub(crate) fn start_owned_incompatible_local_runtime_daemon(data_dir: &Path) -> PanicSafeCliDaemon {
+    let _guard = daemon_test_guard();
     check_harness_taint();
     ensure_session_worker_binary();
     fs::create_dir_all(data_dir).expect("create data dir");

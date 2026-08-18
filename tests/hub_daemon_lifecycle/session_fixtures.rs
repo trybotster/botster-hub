@@ -370,12 +370,19 @@ pub(crate) fn start_isolated_live_output_hub_with_env(
     start_isolated_live_output_hub_with_worker(name, session_worker_binary_path(), extra_env)
 }
 
+pub(crate) fn start_isolated_hub(
+    builder: botster_hub_test_support::IsolatedHubBuilder,
+) -> botster_hub_test_support::IsolatedHub {
+    let _guard = daemon_test_guard();
+    check_harness_taint();
+    builder.start().expect("start isolated hub")
+}
+
 pub(crate) fn start_isolated_live_output_hub_with_worker(
     name: &str,
     session_worker_bin: impl Into<PathBuf>,
     extra_env: &[(&str, &str)],
 ) -> botster_hub_test_support::IsolatedHub {
-    check_harness_taint();
     let mut builder = botster_hub_test_support::IsolatedHubBuilder::new()
         .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
         .session_worker_bin(session_worker_bin)
@@ -384,9 +391,7 @@ pub(crate) fn start_isolated_live_output_hub_with_worker(
     for (key, value) in extra_env {
         builder = builder.env(*key, *value);
     }
-    builder
-        .start()
-        .expect("start isolated hub with explicit worker path")
+    start_isolated_hub(builder)
 }
 
 pub(crate) fn assert_shutdown_strict_natural_exit(

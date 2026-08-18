@@ -1,5 +1,6 @@
 #![allow(dead_code, unused_imports)]
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -411,9 +412,34 @@ pub(crate) fn daemon_test_lock() -> &'static Mutex<()> {
     REAL_DAEMON_TEST_LOCK.get_or_init(|| Mutex::new(()))
 }
 
-pub(crate) fn daemon_test_guard() -> std::sync::MutexGuard<'static, ()> {
-    check_harness_taint();
-    recovering_mutex_guard(daemon_test_lock())
+thread_local! {
+    static DAEMON_GUARD_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+pub(crate) struct DaemonTestGuard {
+    _inner: Option<std::sync::MutexGuard<'static, ()>>,
+}
+
+impl Drop for DaemonTestGuard {
+    fn drop(&mut self) {
+        DAEMON_GUARD_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+pub(crate) fn daemon_test_guard() -> DaemonTestGuard {
+    DAEMON_GUARD_DEPTH.with(|depth| {
+        if depth.get() == 0 {
+            let inner = recovering_mutex_guard(daemon_test_lock());
+            check_harness_taint();
+            depth.set(1);
+            DaemonTestGuard {
+                _inner: Some(inner),
+            }
+        } else {
+            depth.set(depth.get() + 1);
+            DaemonTestGuard { _inner: None }
+        }
+    })
 }
 
 pub(crate) fn wait_for_incompatible_status(data_dir: &Path, child: &mut Child) {
@@ -882,6 +908,7 @@ pub(crate) fn start_installed_daemon(
     data_dir: &Path,
     entrypoint: &Path,
 ) -> PanicSafeCliDaemon {
+    let _guard = daemon_test_guard();
     check_harness_taint();
     let mut command = Command::new(entrypoint);
     command
