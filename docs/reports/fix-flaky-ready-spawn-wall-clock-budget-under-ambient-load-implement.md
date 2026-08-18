@@ -78,7 +78,7 @@ Handoff:
 - `docs/plans/fix-flaky-ready-spawn-wall-clock-budget-under-ambient-load.md` — resynced to v4.1, including accepted hold-path decisions, process-level Spawn recording, and the `Spawned`-kind oracle.
 - `docs/reports/fix-flaky-ready-spawn-wall-clock-budget-under-ambient-load-implement.md` — this report.
 
-Merge/rebase cleanup: none.
+Merge/rebase cleanup: integrated Hub main `c1ce7e525aef080e10eee79a306482d5bfc66860` (unix unbound-printf lifecycle repair). No file overlap with this ticket's first-snapshot hold. The Unix tests use host `ListSessions` lifecycle after Attach, not session-entity first Snapshot.
 
 ## Ownership boundaries preserved
 
@@ -93,7 +93,7 @@ Same-target siblings, not absorbed:
 | Ticket | Owns | Relation |
 | --- | --- | --- |
 | `ticket_1786977409_499180` | `ShutdownSession` idempotency and exact-bytes suite-load OperatorError | Registered open dependency. Known-baseline owner. Not absorbed. This leaf ticket does not run a full suite. |
-| `ticket_1786937228_425608` | `unix_adapter_unbound_printf_stream_attach_completes` flake | Independent sibling. Not absorbed. |
+| `ticket_1786937228_425608` | `unix_adapter_unbound_printf_stream_attach_completes` flake | Merged to Hub main at `c1ce7e5`. Integrated here. Not absorbed. |
 | `ticket_1787007684_566852` | earlier duplicate production ticket | Closed as duplicate. This ticket owns the repair. |
 
 ## Deviations from plan
