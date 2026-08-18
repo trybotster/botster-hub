@@ -4489,8 +4489,73 @@ fn recover_after_core_shutdown_error(
     logical_clock: &mut u64,
 ) -> DaemonTransportResult<DaemonResponse> {
     observe_lifecycle_turn(runtime, *logical_clock);
-    let classification = classify_shutdown_session(runtime, session_id, tick(logical_clock))?;
-    response_after_core_shutdown_error(classification, error, session_id)
+    let classification = classify_shutdown_session(runtime, session_id, tick(logical_clock));
+    recover_from_classify_or_recorded(
+        classification,
+        recorded_shutdown_classification(runtime, session_id),
+        error,
+        session_id,
+    )
+}
+
+fn recover_from_classify_or_recorded(
+    classification: DaemonTransportResult<ShutdownSessionClassification>,
+    recorded: Option<ShutdownSessionClassification>,
+    error: crate::HubClientError,
+    session_id: &str,
+) -> DaemonTransportResult<DaemonResponse> {
+    match classification {
+        Ok(classification) => response_after_core_shutdown_error(classification, error, session_id),
+        Err(_) => match recorded {
+            Some(ShutdownSessionClassification::Active) | None => {
+                Err(DaemonTransportError::Client(error))
+            }
+            Some(classification) => {
+                response_after_core_shutdown_error(classification, error, session_id)
+            }
+        },
+    }
+}
+
+fn recorded_shutdown_classification(
+    runtime: &crate::HubRuntime,
+    session_id: &str,
+) -> Option<ShutdownSessionClassification> {
+    let sessions = runtime.list_sessions().ok()?;
+    let session = sessions
+        .into_iter()
+        .find(|session| session.session_id.0 == session_id)?;
+    Some(classify_recorded_registry_state(
+        session_id,
+        session.registry_state,
+    ))
+}
+
+fn classify_recorded_registry_state(
+    session_id: &str,
+    state: RegistrySessionState,
+) -> ShutdownSessionClassification {
+    match state {
+        RegistrySessionState::Exited => {
+            ShutdownSessionClassification::Cleanup(DaemonSessionCleanup {
+                session_id: session_id.to_string(),
+                outcome: "already_exited".to_string(),
+            })
+        }
+        RegistrySessionState::Stale => {
+            ShutdownSessionClassification::Cleanup(DaemonSessionCleanup {
+                session_id: session_id.to_string(),
+                outcome: "stale_session".to_string(),
+            })
+        }
+        RegistrySessionState::Stopping => {
+            ShutdownSessionClassification::Cleanup(DaemonSessionCleanup {
+                session_id: session_id.to_string(),
+                outcome: "already_exited".to_string(),
+            })
+        }
+        RegistrySessionState::Running => ShutdownSessionClassification::Active,
+    }
 }
 
 fn daemon_hello_ack(diagnostics: Vec<DaemonDiagnostic>) -> DaemonHelloAck {
@@ -7955,7 +8020,114 @@ mod tests {
     }
 
     #[test]
+    fn recover_recorded_exited_after_classify_err_is_already_exited() {
+        let response = recover_from_classify_or_recorded(
+            Err(DaemonTransportError::Client(shutdown_lookup_error(
+                botster_core_daemon::CoreDaemonError::Shutdown,
+            ))),
+            Some(classify_recorded_registry_state(
+                "exited-session",
+                RegistrySessionState::Exited,
+            )),
+            shutdown_runtime_error(crate::HubClientRuntimeErrorKind::Runtime),
+            "exited-session",
+        )
+        .expect("recorded Exited after classify Err is cleanup");
+        assert_eq!(response.kind, DaemonResponseKind::SessionCleanup);
+        let cleanup = response.cleanup.expect("cleanup body");
+        assert_eq!(cleanup.session_id, "exited-session");
+        assert_eq!(cleanup.outcome, "already_exited");
+    }
+
+    #[test]
+    fn recover_recorded_stale_after_classify_err_is_stale_session() {
+        let response = recover_from_classify_or_recorded(
+            Err(DaemonTransportError::Client(shutdown_lookup_error(
+                botster_core_daemon::CoreDaemonError::Shutdown,
+            ))),
+            Some(classify_recorded_registry_state(
+                "stale-session",
+                RegistrySessionState::Stale,
+            )),
+            shutdown_runtime_error(crate::HubClientRuntimeErrorKind::Runtime),
+            "stale-session",
+        )
+        .expect("recorded Stale after classify Err is cleanup");
+        assert_eq!(response.kind, DaemonResponseKind::SessionCleanup);
+        let cleanup = response.cleanup.expect("cleanup body");
+        assert_eq!(cleanup.session_id, "stale-session");
+        assert_eq!(cleanup.outcome, "stale_session");
+    }
+
+    #[test]
+    fn recover_recorded_stopping_after_classify_err_is_already_exited() {
+        let response = recover_from_classify_or_recorded(
+            Err(DaemonTransportError::Client(shutdown_lookup_error(
+                botster_core_daemon::CoreDaemonError::Shutdown,
+            ))),
+            Some(classify_recorded_registry_state(
+                "stopping-session",
+                RegistrySessionState::Stopping,
+            )),
+            shutdown_runtime_error(crate::HubClientRuntimeErrorKind::Runtime),
+            "stopping-session",
+        )
+        .expect("recorded Stopping after classify Err is cleanup");
+        assert_eq!(response.kind, DaemonResponseKind::SessionCleanup);
+        let cleanup = response.cleanup.expect("cleanup body");
+        assert_eq!(cleanup.session_id, "stopping-session");
+        assert_eq!(cleanup.outcome, "already_exited");
+    }
+
+    #[test]
+    fn recover_recorded_running_after_classify_err_preserves_typed_error() {
+        let error = recover_from_classify_or_recorded(
+            Err(DaemonTransportError::Client(shutdown_lookup_error(
+                botster_core_daemon::CoreDaemonError::Shutdown,
+            ))),
+            Some(classify_recorded_registry_state(
+                "live-session",
+                RegistrySessionState::Running,
+            )),
+            shutdown_runtime_error(crate::HubClientRuntimeErrorKind::Runtime),
+            "live-session",
+        )
+        .expect_err("recorded Running after classify Err keeps the Core error");
+        assert!(matches!(
+            error,
+            DaemonTransportError::Client(crate::HubClientError::Runtime {
+                operation: crate::HubClientOperation::Shutdown,
+                kind: crate::HubClientRuntimeErrorKind::Runtime,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn recover_fallback_failure_after_classify_err_preserves_typed_error() {
+        let error = recover_from_classify_or_recorded(
+            Err(DaemonTransportError::Client(shutdown_lookup_error(
+                botster_core_daemon::CoreDaemonError::Shutdown,
+            ))),
+            None,
+            shutdown_runtime_error(crate::HubClientRuntimeErrorKind::State),
+            "live-session",
+        )
+        .expect_err("fallback failure after classify Err keeps the Core error");
+        assert!(matches!(
+            error,
+            DaemonTransportError::Client(crate::HubClientError::Runtime {
+                operation: crate::HubClientOperation::Shutdown,
+                kind: crate::HubClientRuntimeErrorKind::State,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn shutdown_active_runtime_error_remains_operator_error() {
+        // OperatorError is preserved when exact evidence shows the worker is
+        // still Active. Provable natural exit uses Cleanup, not this path.
         let error = shutdown_error_response(
             ShutdownSessionClassification::Active,
             shutdown_runtime_error(crate::HubClientRuntimeErrorKind::Runtime),
@@ -7982,6 +8154,8 @@ mod tests {
 
     #[test]
     fn shutdown_active_state_error_remains_operator_error() {
+        // OperatorError is preserved when exact evidence shows the worker is
+        // still Active. Provable natural exit uses Cleanup, not this path.
         let error = shutdown_error_response(
             ShutdownSessionClassification::Active,
             shutdown_runtime_error(crate::HubClientRuntimeErrorKind::State),

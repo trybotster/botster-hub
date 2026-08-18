@@ -1735,7 +1735,12 @@ fn unix_shutdown_session_from_another_connection_classifies_attached_exit() {
     .expect("shutdown from a separate connection");
     assert_ne!(
         shutdown.kind,
-        botster_hub_client::DaemonResponseKind::OperatorError
+        botster_hub_client::DaemonResponseKind::OperatorError,
+        "Unix ShutdownSession after attached natural exit must not return OperatorError, got kind={:?} error.code={:?} error.operation={:?} error.message={:?}",
+        shutdown.kind,
+        shutdown.error.as_ref().map(|error| &error.code),
+        shutdown.error.as_ref().map(|error| &error.operation),
+        shutdown.error.as_ref().map(|error| &error.message)
     );
 
     let listed =
@@ -1772,6 +1777,128 @@ fn unix_shutdown_session_from_another_connection_classifies_attached_exit() {
         drain.events
     );
     hub.shutdown().expect("shutdown isolated hub");
+}
+
+fn unix_blind_shutdown_after_finite_printf(
+    hub_name: &str,
+    session_id: &str,
+    wrapper: SessionWorkerWrapperKind,
+) -> (
+    botster_hub_client::DaemonResponse,
+    botster_hub_client::DaemonResponse,
+    botster_hub_test_support::IsolatedHub,
+) {
+    let hub = start_isolated_live_output_hub_with_wrapper(hub_name, wrapper);
+    let endpoint = hub.endpoint().clone();
+    let subscription_id = format!("{session_id}-sub");
+    let (mut stream, mut reader) = unix_adapter_connection(&endpoint);
+    let mut envelopes = Vec::new();
+    let mut events = Vec::new();
+    spawn_and_bind(
+        &mut stream,
+        &mut reader,
+        session_id,
+        &subscription_id,
+        "printf 'wrapper-ready\\n'; exit 0",
+        &mut envelopes,
+        &mut events,
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline
+        && !unix_envelope_contains_live_bytes(&envelopes, "wrapper-ready")
+    {
+        stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("read timeout");
+        match botster_hub_client::read_unix_mux_frame_from_reader(&mut reader) {
+            Ok(botster_hub_client::DaemonUnixMuxFrame::Terminal(envelope)) => {
+                envelopes.push(envelope);
+            }
+            Ok(botster_hub_client::DaemonUnixMuxFrame::Event(event)) => events.push(event),
+            Ok(botster_hub_client::DaemonUnixMuxFrame::Response(_)) => {}
+            Err(_) => {
+                let _ = request_collecting_mux(
+                    &mut stream,
+                    &mut reader,
+                    &botster_hub_client::DaemonRequest::ReadScreen {
+                        session_id: session_id.to_string(),
+                    },
+                    &mut envelopes,
+                    &mut events,
+                );
+            }
+        }
+    }
+    stream.set_read_timeout(None).expect("clear read timeout");
+    assert!(
+        unix_envelope_contains_live_bytes(&envelopes, "wrapper-ready"),
+        "attached adapter must see live output before ShutdownSession: {envelopes:?}"
+    );
+
+    let shutdown = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::ShutdownSession {
+            session_id: session_id.to_string(),
+        },
+    )
+    .expect("blind ShutdownSession from a separate connection");
+    let listed =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::ListSessions)
+            .expect("list after wrapper-window shutdown");
+    (shutdown, listed, hub)
+}
+
+#[test]
+#[ignore = "blocked on ticket_1787015956_494734 Core ProcessExited delivery"]
+fn unix_shutdown_session_after_w1_delayed_worker_reap_is_idempotent() {
+    let _guard = daemon_test_guard();
+    let session_id = "unix-w1-session";
+    let (shutdown, listed, hub) = unix_blind_shutdown_after_finite_printf(
+        "unix-w1",
+        session_id,
+        SessionWorkerWrapperKind::DelayedReap,
+    );
+    eprintln!(
+        "PHASE1 W1 Unix shutdown kind={:?} error={:?} listed={:?}",
+        shutdown.kind, shutdown.error, listed.sessions
+    );
+    assert_shutdown_strict_natural_exit(&shutdown, session_id, "W1 Unix delayed reap");
+    let data_dir = hub.data_dir().clone();
+    hub.shutdown().expect("shutdown isolated hub");
+    reap_session_workers_for_data_dir(&data_dir)
+        .expect("W1 Unix hub shutdown must not leave worktree session workers");
+}
+
+#[test]
+#[ignore = "blocked on ticket_1787015956_494734 Core ProcessExited delivery"]
+fn unix_shutdown_session_after_w2_nonsuccess_worker_reaches_terminal() {
+    let _guard = daemon_test_guard();
+    let session_id = "unix-w2-session";
+    let (shutdown, listed, hub) = unix_blind_shutdown_after_finite_printf(
+        "unix-w2",
+        session_id,
+        SessionWorkerWrapperKind::NonSuccessExit,
+    );
+    eprintln!(
+        "PHASE1 W2 Unix shutdown kind={:?} error={:?} listed={:?}",
+        shutdown.kind, shutdown.error, listed.sessions
+    );
+    assert_shutdown_strict_natural_exit(&shutdown, session_id, "W2 Unix non-success worker");
+    assert!(
+        listed.sessions.iter().any(|session| {
+            session.session_id == session_id
+                && matches!(session.lifecycle.as_str(), "exited" | "stopping" | "failed")
+        }) || listed
+            .sessions
+            .iter()
+            .all(|session| session.session_id != session_id),
+        "W2 Unix must reach a terminal lifecycle on the control plane: {:?}",
+        listed.sessions
+    );
+    let data_dir = hub.data_dir().clone();
+    hub.shutdown().expect("shutdown isolated hub");
+    reap_session_workers_for_data_dir(&data_dir)
+        .expect("W2 Unix hub shutdown must not leave worktree session workers");
 }
 
 #[test]
