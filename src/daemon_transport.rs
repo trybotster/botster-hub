@@ -161,6 +161,25 @@ enum OwnerEvent {
     Reconcile,
 }
 
+enum OwnerPollDecision {
+    ServeControl(Box<Option<ControlMessage>>),
+    RunSlice,
+    Block,
+}
+
+/// Classify one busy-path owner poll. A queued control message precedes a due
+/// maintenance slice so at most one already-running owner turn can precede it.
+fn classify_owner_poll(
+    poll: Result<ControlMessage, tokio_mpsc::error::TryRecvError>,
+    slice_due: bool,
+) -> OwnerPollDecision {
+    match poll {
+        Ok(message) => OwnerPollDecision::ServeControl(Box::new(Some(message))),
+        Err(_) if slice_due => OwnerPollDecision::RunSlice,
+        Err(_) => OwnerPollDecision::Block,
+    }
+}
+
 async fn receive_owner_event(
     control_rx: &mut tokio_mpsc::Receiver<ControlMessage>,
     reconciliation_wait: Duration,
@@ -270,10 +289,10 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
         }
         let slice_due = control_state.maintenance.needs_work()
             || control_state.next_reconciliation <= Instant::now();
-        let event = match control_rx.try_recv() {
-            Ok(message) => Some(OwnerEvent::Control(Box::new(Some(message)))),
-            Err(_) if slice_due => None,
-            Err(_) => {
+        let event = match classify_owner_poll(control_rx.try_recv(), slice_due) {
+            OwnerPollDecision::ServeControl(message) => Some(OwnerEvent::Control(message)),
+            OwnerPollDecision::RunSlice => None,
+            OwnerPollDecision::Block => {
                 let wait = control_state
                     .next_reconciliation
                     .saturating_duration_since(Instant::now());
@@ -2372,6 +2391,15 @@ pub(crate) fn handle_control_message(
                 overlay_live_attach_occupancy(status, daemon, state);
             }
             if request_succeeded(response.as_ref()) {
+                if let DaemonRequest::Spawn { session_id, .. } = &request {
+                    state
+                        .maintenance
+                        .acknowledged_spawn_ids
+                        .insert(session_id.clone());
+                    if let Some(runtime) = daemon.runtime() {
+                        runtime.record_acknowledged_spawn(session_id.clone());
+                    }
+                }
                 if reconcile_after_request {
                     state.maintenance.note_authoritative_mutation();
                 } else if matches!(request, DaemonRequest::PluginSurfaceAction { .. })
@@ -7833,6 +7861,15 @@ mod tests {
             panic!("ready control message must win before a future reconciliation deadline");
         };
         assert!(matches!(*message, Some(ControlMessage::RejectedConnection)));
+    }
+
+    #[test]
+    fn queued_control_precedes_a_due_maintenance_slice() {
+        assert!(matches!(
+            classify_owner_poll(Ok(ControlMessage::RejectedConnection), true),
+            OwnerPollDecision::ServeControl(message)
+                if matches!(*message, Some(ControlMessage::RejectedConnection))
+        ));
     }
 
     #[test]
