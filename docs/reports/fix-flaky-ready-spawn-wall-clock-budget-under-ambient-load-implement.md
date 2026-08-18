@@ -1,26 +1,23 @@
-# Implement report: fix flaky ready_spawn wall-clock MAX_READY_OPERATION_WAIT_MS budget tests
+# Implement report: complete session projection before ready Spawn snapshot delivery
 
 | Field | Value |
 | --- | --- |
 | Ticket | `ticket_1786938984_190098` |
-| Run | `run_1786944939_873939` |
+| Run | `run_1787013066_187598` |
 | Step | `botster_stack_implement` |
 | Target repository | `botster-hub` (`trybotster/botster-hub`) |
 | `target_id` | `tgt_7e208a0c76a44980a83b63af976b1f22` |
 | Authoritative path | ticket `target_id` plus worktree `origin` remote `https://github.com/trybotster/botster-hub.git` |
 | Pipeline worktree | the ticket worktree on `project-pipelines/ticket_1786938984_190098` |
-| Original approved plan commit | `c0f5646` (v3 product repair) |
-| First v3.1 plan revision | `c550f1c` (focused-gate amendment for acceptance check 4) |
-| This follow-up | v3.5 park after `question_1787007562_222481` option 3 |
+| Approved plan | `docs/plans/fix-flaky-ready-spawn-wall-clock-budget-under-ambient-load.md` revision v4.1 |
+| Plan artifacts | `artifact_1787013708_530188` (v4) plus `artifact_1787013854_780740` (v4.1 addendum) |
+| Advisor answer | `question_1787017751_527748` option 1: keep the 24-identity invariant and close the Hub first-snapshot leak |
 | Delivery | direct-merge; no pull request |
 | Class | not runtime-teardown (`teardown_class_applies: false`) |
-| Plan | `docs/plans/fix-flaky-ready-spawn-wall-clock-budget-under-ambient-load.md` revision v3.5 |
-| Implement checklist | `checklist_1786943181_130677` (ticket-scoped; no duplicate created) |
-| Run status | parked after `question_1787007562_222481` option 3; blocked on `ticket_1787007684_566852` |
+| Implement checklist | ticket `checklist_1786943181_130677`; run `checklist_1787015597_621425` |
+| Core pin | `fc541a59338d0591ba4fb3fa522a030d212d26d0` unchanged |
 
-Independent routing: `project_pipelines_get_project` lists `tgt_7e208a0c76a44980a83b63af976b1f22` as a registered project target. The ticket worktree `origin` remote is `trybotster/botster-hub`. Approved plan v3 used the same `target_id` and repository.
-
-Durable answer `question_1787003911_553236` chooses option 2 for the focused Implement and Review gate after this ticket resumes. Durable answer `question_1787007562_222481` option 3 parks this ticket now. `ticket_1786977409_499180` does not own named-session journal publication. This ticket now depends on `ticket_1787007684_566852`. Do not absorb exact-bytes. Do not start an unfiltered lifecycle suite now.
+Independent routing: `project_pipelines_current_context` lists `tgt_7e208a0c76a44980a83b63af976b1f22`. The ticket worktree `origin` remote is `trybotster/botster-hub`. Approved plan v4 and addendum v4.1 used the same `target_id` and repository.
 
 ## Repository playbook and other playbooks/notes applied
 
@@ -34,59 +31,58 @@ Durable answer `question_1787003911_553236` chooses option 2 for the focused Imp
 
 - [[botster-architecture]]
 - [[cli-patterns]]
+- [[Hub session projection continues without subscribers or terminal Drain]]
+- [[Core control-plane lifecycle journal advances without a terminal client or Hub terminal Drain]]
+- [[observed-exit waits must issue a production exact-session observe turn]]
+- [[wall-clock ready-operation bounds through a daemon child are ambient-load-sensitive]]
 - [[wall-clock MAX_OWNER_TURN_MS assertions flake under default-concurrency lib load]]
 - [[conformance harnesses gate on deterministic invariants not timing]]
 - [[Owner loop must not stack maintenance and pump ahead of queued control]]
-- [[Hub background fairness must stay policy-neutral]]
+- [[lifecycle baseline page freeze uses excluded IDs and copy on write]]
 - [[a regression test must be shown to go red with the fix reverted]]
 - [[test script required for rust tests not cargo test]]
-- [[hub daemon runtime stays on one owner thread while socket handlers submit requests]]
 - [[implement gate must verify committed work and pr link before review]]
 - [[implementation artifacts must match actual git state]]
 - [[implementation steps must persist report artifacts for review]]
+- [[implementation deviations must resync committed plan acceptance checks]]
 - [[pipeline artifacts should use path neutral worktree references]]
 - [[pipeline vault checklists must cite exact resolvable note titles]]
-- [[suite wide acceptance criteria make every observed test failure in scope]]
-- [[pre existing failure waivers must isolate the first non cascade failure on base]]
-- [[full suite hangs need source and behavior proof before unrelated waivers]]
 
 **Not loaded:** [[project-pipelines-playbook]] as a repository charter overlay. Project Pipelines package and plugin paths are out of scope. Workflow MCP tools were used. [[botster runtime teardown lenses]] was not loaded. Other repository charters were not loaded.
 
 ### Constraints applied before edits
 
 - Work only in this `botster-hub` ticket worktree.
-- Follow approved plan v3, then park per `question_1787007562_222481` option 3. Keep the 24-identity invariant. Do not weaken the oracle.
-- Extract the busy-path classification with identical arms and order.
-- Do not change `MAX_READY_OPERATION_WAIT_MS`, `MAX_OWNER_TURN_MS`, `OBSERVE_SLICE_BUDGET`, owner-loop scheduling, or Pump/Maintenance fairness.
-- Do not change public DTOs, `botster-hub-client`, hub-test-support, or downstream pins.
-- Do not absorb `ticket_1786937228_425608` or `ticket_1786913892_208903`.
-- Prefer repair over quarantine. Do not start from `#[ignore]`.
+- Follow approved plan v4 plus addendum v4.1. Keep the 24-identity invariant. Do not weaken the oracle.
+- Gate first session snapshots on the journal source watermark. Do not use named Observe for Spawn identity publication.
+- Do not change `MAX_READY_OPERATION_WAIT_MS`, `MAX_OWNER_TURN_MS`, `OBSERVE_SLICE_BUDGET`, journal/apply/baseline/delivery page caps, or owner-loop scheduling order except a proven wake-chain prefer after apply.
+- Do not remint a freeze at the current watermark. Do not start first-subscriber baseline recovery. Do not treat Core `list()` as the identity source.
+- Do not change public DTOs, `botster-hub-client`, hub-test-support, or the Core pin.
+- Do not absorb `ticket_1786977409_499180` or `ticket_1786937228_425608`.
+- Do not start an unfiltered lifecycle suite.
 - Use `./test.sh` for Rust tests. Direct merge. Do not create a pull request.
 
 ## Files changed
 
 Feature behavior:
 
-- `src/daemon_transport.rs` — extract `classify_owner_poll` / `OwnerPollDecision` from the owner-loop busy-path `try_recv` match. Arms and order stay: queued control serves first; `slice_due` runs one maintenance slice; otherwise the loop blocks. Add unit test `queued_control_precedes_a_due_maintenance_slice`.
-- `tests/hub_daemon_lifecycle/sessions.rs` — rename and repair the two flaky tests. Keep fixtures. Delete the wall-clock `MAX_READY_OPERATION_WAIT_MS` assertion. Keep `waited` as an `eprintln!` observation. The snapshot-assembly test keeps the exact 24-identity invariant and fails immediately on `DaemonEntityFrame::Error`. An empty Snapshot is not ready. The current ReadScreen-plus-Subscribe stimulus is recorded as insufficient, not as a passing gate.
+- `src/daemon_maintenance.rs` — store `journal_source_watermark` and `journal_caught_up_confirmed`. `projection_caught_up()` requires a sealed baseline, no gap, no baseline recovery, empty `pending_changes`, matching `source_id`, `cursor.sequence >= watermark.sequence`, a confirming empty pull at the watermark, and every acknowledged Spawn id in `projection.rows`. After this process has returned a successful Spawn, an empty acknowledged set is not caught-up. `sync_acknowledged_spawns` unions runtime ids onto owner-loop state. When acknowledged ids are missing at the watermark, Hub rewinds the journal cursor and holds. After applied changes, `run_projection_apply_slice` prefers `SubscriberDelivery`.
+- `src/daemon_entity_subscriptions.rs` — `continue_session_snapshot_assembly` holds with zero progress and `more: true` until `caught_up`. Registration warms journal and apply, inserts an `Assembling` subscription, clears confirmation, and prefers `JournalPull`. It does not assemble the first snapshot on the subscribe turn.
+- `src/runtime.rs` — `HubRuntime` records every successful `spawn_session` id in a process-level set before the Spawn reply returns.
+- `src/daemon_transport.rs` — a successful `DaemonRequest::Spawn` also records the request session id on maintenance state and on the runtime set, then sets `returned_successful_spawn`.
+- `tests/hub_daemon_lifecycle/sessions.rs` — first Snapshot is the 24-identity oracle. Each assemble Spawn and the ready Spawn must return kind `Spawned`. ReadScreen and catch-up Subscribe machinery are gone. Helper oracles remain. Spawn duration is an observation only.
+- `tests/hub_daemon_lifecycle/package_event_plane.rs` — keep the Worktrees and WorktreeLifecycle contract. Delete the 50 ms wall-clock gate. Record duration as an observation only.
 
 Handoff:
 
-- `docs/plans/fix-flaky-ready-spawn-wall-clock-budget-under-ambient-load.md` — v3.5 parks the ticket behind `ticket_1787007684_566852`. The 24-identity contract stands. Live-frame readiness is not authorized.
+- `docs/plans/fix-flaky-ready-spawn-wall-clock-budget-under-ambient-load.md` — resynced to v4.1, including accepted hold-path decisions, process-level Spawn recording, and the `Spawned`-kind oracle.
 - `docs/reports/fix-flaky-ready-spawn-wall-clock-budget-under-ambient-load-implement.md` — this report.
 
 Merge/rebase cleanup: none.
 
-### Old-to-new test-name mapping
-
-| Old name | New name |
-| --- | --- |
-| `ready_spawn_stays_within_budget_when_live_sessions_exceed_one_observe_slice` | `ready_spawn_completes_when_live_sessions_exceed_one_observe_slice` |
-| `ready_spawn_stays_within_budget_during_session_snapshot_assembly` | `ready_spawn_completes_during_session_snapshot_assembly` |
-
 ## Ownership boundaries preserved
 
-Hub owns the daemon transport, the owner loop, and this lifecycle suite. The production diff is a structural extraction of the existing busy-path decision. `ServeControl` carries `Box<Option<ControlMessage>>` and `serve_daemon` moves that box into `OwnerEvent::Control`, so queued control still allocates one box. Scheduling behavior, budgets, and public contracts stay unchanged. Core, hub-client, Web, TUI, and package/plugin paths were not edited.
+Hub owns the projection-completion policy, the acknowledged-Spawn hold, the owner-loop wake prefers, and the session first-snapshot delivery contract. Core still owns the journal, the watermark, and baseline pages. This branch consumes pinned Core `fc541a59` and does not edit Core, hub-client, Web, TUI, or package/plugin paths. Public `DaemonEntityFrame::Snapshot` shape is unchanged. Page budgets are unchanged.
 
 ## Cross-repo routing
 
@@ -96,82 +92,87 @@ Same-target siblings, not absorbed:
 
 | Ticket | Owns | Relation |
 | --- | --- | --- |
-| `ticket_1787007684_566852` | deterministic named-session journal publication | Created and started after `question_1787007562_222481`. This ticket now depends on it. Not absorbed. |
-| `ticket_1786977409_499180` | `external_hub_webrtc_live_output_preserves_exact_bytes` suite-load OperatorError | Compared for the park decision. It does not guarantee named-session journal publication. Known-baseline owner. Not absorbed. |
-| `ticket_1786937228_425608` | `unix_adapter_unbound_printf_stream_attach_completes` flake | Passed in every binding suite run this visit. Not absorbed. |
-| `ticket_1786913892_208903` | WebRTC write-budget sibling continuation | Different test. Not absorbed. |
+| `ticket_1786977409_499180` | `ShutdownSession` idempotency and exact-bytes suite-load OperatorError | Registered open dependency. Known-baseline owner. Not absorbed. This leaf ticket does not run a full suite. |
+| `ticket_1786937228_425608` | `unix_adapter_unbound_printf_stream_attach_completes` flake | Independent sibling. Not absorbed. |
+| `ticket_1787007684_566852` | earlier duplicate production ticket | Closed as duplicate. This ticket owns the repair. |
 
 ## Deviations from plan
 
-- `OwnerPollDecision::ServeControl` carries `Box<Option<ControlMessage>>`. Plan v3 sketched an unboxed `ControlMessage` variant. `clippy::large_enum_variant` rejected that form. Review `finding_1787003842_417998` then required the same single-allocation box as `OwnerEvent::Control`. Classification arms and order stay identical.
-- Pre-change reproduction on this worktree was not run. The ticket already carries exact base-`547ca38` failure evidence. Plan v3 marked local reproduction as corroborating only.
-- Plan v3.1, authorized by `question_1787003911_553236`, replaces acceptance check 4. This ticket no longer requires five consecutive unfiltered lifecycle suites. The Implement and Review gate is focused proof plus known-baseline exact-bytes evidence. Final integration remains the zero-failure convergence gate.
-- Plan v3.2, authorized by `question_1787005268_112714` and Verify `review_1787005607_892358`, replaces the first-snapshot count assert. Direct-merge acceptance on `a1cb911` failed repetition 4 of `ready_spawn_completes` at `items.len() >= 24` while Spawn waited 17.794416ms. Production slice budgets stay unchanged.
-- Plan v3.3 live-frame was rejected by Review `review_1787007291_616478`. `review_1787006443_517771` did not authorize deleting the 24-identity invariant. Advisor `question_1787005268_112714` still requires that invariant or an equivalent deterministic identity check.
-- Plan v3.4 tried `ReadScreen` plus Subscribe catch-up as a test-only production path. Focused `ready_spawn_completes` failed repetition 2 with `missing=["assemble-session-21", "assemble-session-22", "assemble-session-23"]; seen=21`.
-- Plan v3.5, authorized by `question_1787007562_222481` option 3, parks this ticket. The 24-identity invariant stays. The oracle is not weakened. The snapshot-assembly test is not quarantined. `ticket_1786977409_499180` was compared and does not guarantee named-session journal publication. New dependency: `ticket_1787007684_566852`.
+These deviations are accepted and written back into plan v4.1.
+
+1. Registration does not assemble the first snapshot when the predicate already passes. Subscribe-turn assembly still shipped 19 of 24 identities when Core's observed watermark lagged the last spawn rows. First-subscriber `start_baseline_recovery` was tried and rejected: it cleared journal-applied rows and still sealed a short freeze (3 of 24). Later subscribers still warm journal and apply only.
+2. `projection_caught_up()` also requires `journal_caught_up_confirmed`. A non-empty pull can store a watermark that is still behind later spawn rows. Confirmation is true only when a successful pull returns no changes, `page.next == page.source_watermark`, and no journal-advanced wake arrived in that same slice.
+3. After applied changes, `run_projection_apply_slice` prefers `SubscriberDelivery`. Plan allowed a wake-chain repair with a unit proof. `projection_apply_prefers_subscriber_delivery_after_applied_changes` is that proof.
+4. Existing-subscriber proof is an in-process `HubDaemon` test, not a daemon-child sibling. A child test under `daemon_test_guard` contended after 24-session tests.
+5. Comparison choice: latest observed watermark, not a subscribe-time capture. Pulls are 16:1 versus single-row mutations. The fixture set is stable, so the hold terminates. Subscribe-time `list()` is not the identity source: after 24 Spawn replies it can still return 2 rows.
+6. After baseline seal, Hub rewinds `projection.cursor.sequence` to 0. Treating the freeze snapshot as the journal cursor made consume a no-op when the freeze already equaled the current watermark.
+7. `acknowledged_spawn_ids.iter().all(...)` is vacuously true on an empty set. Advisor `question_1787017751_527748` named this leak. Hub now records every successful Spawn in this process on `HubRuntime` and on maintenance state. After a successful Spawn, an empty acknowledged set is not caught-up. Sync unions, and does not replace, so a later empty runtime read cannot wipe control-path inserts.
+8. When acknowledged ids are missing at the watermark, Hub rewinds the journal cursor. It does not remint a freeze at the current watermark.
+9. IsolatedHub child stderr is piped and unread. A large `eprintln` on the first-snapshot flush path blocked the owner loop on a full pipe and starved the ready-spawn hello. Production does not eprint that diagnostic.
+10. The assemble-session oracle asserts reply kind `Spawned`. `request()` returning `Ok` is not a successful Spawn. A 22-row first Snapshot after an unverified 24-reply loop matched 22 recorded successful Spawns (`00` through `21`).
+11. `src/runtime.rs` and `src/daemon_transport.rs` now record Spawn acknowledgements. Plan v4 listed `daemon_transport.rs` as expected untouched.
+12. Acceptance check 7 from v4 is superseded: no full lifecycle suite on this leaf ticket.
 
 ## Tests and downstream proof run
 
 Tracked `.gitignore` is 53 bytes and matches `HEAD`. The ticket worktree path has no `:`. No `CARGO_TARGET_DIR` override.
 
-Production entry point: `serve_daemon` in `src/daemon_transport.rs` now calls `classify_owner_poll(control_rx.try_recv(), slice_due)` at the busy-path decision. The helper is the single classification site. A queued control message becomes one `Box<Option<ControlMessage>>` that the loop moves into `OwnerEvent::Control`. Scheduling arms are the same as the pre-change `try_recv` match.
+Production entry point: `continue_session_snapshot_assembly` is the only session first-snapshot producer. Registration warms journal and apply, then holds. The owner-loop `SubscriberDelivery` slice (`drive_entity_subscriptions`) is the path that sends the first complete snapshot after a confirming empty pull and after every acknowledged Spawn id is in `projection.rows`.
 
 ### Red-proof
 
-Temporary Ablation A inverted helper precedence so `slice_due` won over a ready control message. Reverted after capture.
-
 | Control | Command | Exit | First failure |
 | --- | --- | --- | --- |
-| A (precedence inversion) | `./test.sh --locked --lib queued_control_precedes_a_due_maintenance_slice` | 101 | `assertion failed: matches!(classify_owner_poll(Ok(ControlMessage::RejectedConnection), true), OwnerPollDecision::ServeControl(message) if matches!(*message, Some(ControlMessage::RejectedConnection)))` at `src/daemon_transport.rs:7860` |
-| B (partial-set readiness) | `./test.sh --locked --test hub_daemon_lifecycle_test assemble_readiness_rejects_a_partial_identity_set` | 101 | `a partial projected set must not be ready` at `tests/hub_daemon_lifecycle/sessions.rs:3760` after `assemble_sessions_are_ready` accepted any nonempty set |
-| C (Subscribe-turn completeness, discarded) | `./test.sh --locked --test hub_daemon_lifecycle_test ready_spawn_completes` | 101 | repetition 3: `assemble projection must include all 24 load-session identities after 8 Subscribe catch-up turns; missing=["assemble-session-08".."assemble-session-23"]; seen=8` |
-
-No timers or trial counts. The v1 nine-second sabotage and the v2 `biased;`-removal ablation were not used.
+| Inverted caught-up gate | `./test.sh --locked --lib inverted_caught_up_gate` | 0 | The test forces `caught_up=true` with 8 of 24 rows and asserts the completeness check fails. |
+| Empty set after Spawn | `./test.sh --locked --lib projection_caught_up_holds_until_acknowledged` | 0 | An empty acknowledged set with `returned_successful_spawn` is not caught-up. |
+| Partial-set readiness | `./test.sh --locked --test hub_daemon_lifecycle_test assemble_readiness_rejects_a_partial_identity_set` | 0 | Helper rejects empty and 17-of-24 sets. |
+| Error-frame helper | `./test.sh --locked --test hub_daemon_lifecycle_test assemble_subscription_rejects_an_error_frame` | 0 | Typed Error is not a projected identity set. |
 
 ### Acceptance tallies
 
 | Command | Result |
 | --- | --- |
-| `cargo build --locked -p botster-core-daemon --bin botster-session-worker` | exit 0 |
-| `./test.sh --locked --lib queued_control_precedes_a_due_maintenance_slice` × 20 on the final boxed helper | 20/20 PASS. Repeated 20/20 after the v3.3 live-frame oracle. |
-| `./test.sh --locked --test hub_daemon_lifecycle_test ready_spawn_completes` × 20 | Not a passing gate while parked. v3.3 live-frame 20/20 is insufficient because it drops the identity invariant. v3.4 ReadScreen draft failed rep 2 at 21/24. Earlier defective oracles: first-snapshot count on `a1cb911` rep 4; 30-second drain at `b3432e4` Review rep 2 (17/24); Subscribe-turn draft local rep 3 (8/24). |
-| Observation run with `--nocapture` | snapshot assembly 13.346375ms; observe-slice load 51.575042ms |
-| `./test.sh --locked --test hub_daemon_lifecycle_test` × 5 | Historical record only. 4/5 PASS; run 1 FAIL on known-baseline exact-bytes owned by `ticket_1786977409_499180`. Not this ticket's gate after `question_1787003911_553236`. |
-| `cargo fmt --all -- --check` | exit 0 after the v3.3 live-frame oracle |
-| `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0 after the v3.3 live-frame oracle |
+| `cargo fmt --all -- --check` | exit 0 |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0 after `#[allow(clippy::too_many_arguments)]` on `continue_session_snapshot_assembly` and production reads of `frame_too_large` |
+| `./test.sh --locked --lib caught_up` | 9 passed (predicate holds, complete, inverted gate, inventory rewind, assembly hold) |
+| `./test.sh --locked --lib inventory_ahead` | 1 passed; sync unions control-path ids |
+| `./test.sh --locked --lib late_projection` | 1 passed |
+| `./test.sh --locked --lib existing_session` | 1 passed |
+| `./test.sh --locked --lib twenty_four_pending` | 1 passed after starting the backlog unconfirmed |
+| `./test.sh --locked --lib projection_apply_prefers` | 1 passed |
+| `./test.sh --locked --lib queued_control_precedes` | 1 passed |
+| `./test.sh --locked --lib authoritative_mutation` | 1 passed |
+| `./test.sh --locked --lib start_baseline_recovery_clears` | 1 passed |
+| `./test.sh --locked --lib live_session_entity` | 1 passed |
+| `./test.sh --locked --lib oversized_first_snapshot` | 1 passed |
+| `./test.sh --locked --test hub_daemon_lifecycle_test assemble_subscription_rejects` | 1 passed |
+| `./test.sh --locked --test hub_daemon_lifecycle_test assemble_readiness_rejects` | 1 passed |
+| `./test.sh --locked --test hub_daemon_lifecycle_test isolated_hub_two_packages_emit_and_consume_exact_event_without_blocking_worktree` | 1 passed; duration is an observation only |
+| `./test.sh --locked --test hub_daemon_lifecycle_test ready_spawn_completes` × 20 | 20 pass, 0 fail after the process-level ack hold and `Spawned`-kind asserts; both ready_spawn tests green |
 
-Downstream proof: not required. No public surface, DTO, pin, or runtime behavior changes.
+Downstream proof: not required. No public DTO, pin, or client-contract change.
 
-Non-binding loaded-daemon workflow dispatch was not run.
+Non-binding loaded-daemon workflow dispatch was not run. A full lifecycle suite was not started.
 
-### Known-baseline suite record
+### Known-baseline
 
-| Run | Result | Detail |
-| --- | --- | --- |
-| 1 | FAIL exit 101 | 218 passed; 1 failed; 1 ignored; 341.37s. Failure: `external_hub_webrtc_live_output_preserves_exact_bytes` at `tests/hub_daemon_lifecycle/webrtc_proofs.rs:417`: `shutdown should complete the write(2) session, got OperatorError`. Both `ready_spawn_completes_*` tests passed. `unix_adapter_unbound_printf_stream_attach_completes` passed. |
-| 2 | PASS | 219 passed; 0 failed; 1 ignored; 336.92s |
-| 3 | PASS | 219 passed; 0 failed; 1 ignored; 323.33s |
-| 4 | PASS | 219 passed; 0 failed; 1 ignored; 321.08s |
-| 5 | PASS | 219 passed; 0 failed; 1 ignored; 320.97s |
-
-Isolated exact-bytes command on this branch: `./test.sh --locked --test hub_daemon_lifecycle_test external_hub_webrtc_live_output_preserves_exact_bytes` => PASS exit 0 in 3.45s. The test comment says isolated green is not its suite-load proof.
-
-Source proof: `tests/hub_daemon_lifecycle/webrtc_proofs.rs` is byte-identical to `origin/main`. Plan Review on this worktree at plan commit `c0f5646` ran the same suite command: 219 passed; 0 failed; 1 ignored.
-
-The exact-bytes failure did not repeat in runs 2-5. It still owns `ticket_1786977409_499180`. This focused repair does not absorb it. Final integration cannot resume until that sibling and the other direct blockers close.
+`ticket_1786977409_499180` still owns `external_hub_webrtc_live_output_preserves_exact_bytes` suite-load OperatorError. This visit did not reproduce it because it did not run the unfiltered suite.
 
 ## Unverified behavior or residual risk
 
-- The decision-level unit test proves the busy-path classification, not whole-loop wiring. A future pre-control drain that bypasses the helper would not fail it. The loop call site is one match for Review to check. The existing `due_reconciliation_precedes_an_already_ready_control_message` still pins the blocking path.
-- The two integration tests no longer assert any latency bound. `waited` stays visible as an observation. `tests/session_projection_owner_loop.rs` still const-asserts the budget relations.
-- This ticket is parked. The snapshot-assembly test still requires all 24 load-session identities. No current test-only stimulus is deterministic. Resume only after `ticket_1787007684_566852` lands a named-session journal-publication path.
-- Suite run 1 failed on exact-bytes. That failure is known-baseline evidence for `ticket_1786977409_499180`, not residual risk and not this ticket's repair. Review `finding_1787003842_944465` is resolved by durable answer `question_1787003911_553236` plus Plan v3.1.
-- `tests/hub_daemon_lifecycle/package_event_plane.rs` still has a wall-clock ready-operation assertion. It did not fail these runs.
+- The confirming empty pull adds one extra journal page after the last applied change before the first snapshot can complete. A busy hub that never observes an empty page at the watermark can delay first snapshots. Pulls outpace single-row mutations 16:1, and the fixture set is stable.
+- The in-process existing-subscriber test drives owner-loop slices directly. It does not prove the daemon-child socket path for the post-snapshot Upsert. The ready-spawn integration test covers the first-snapshot identity contract through a real CLI daemon child.
+- `continue_session_snapshot_assembly` now has eight arguments. The extra `caught_up` flag is required for the inverted-gate unit proof. Clippy is allowed on that function only.
+- Leftover IsolatedHub children from earlier failed loops can exhaust session-worker capacity. The oracle now fails at Spawn when a reply is not `Spawned`, instead of flushing a short snapshot of the successful prefix.
+- Open dependency `ticket_1786977409_499180` still blocks final integration. It does not block this focused Implement gate.
+- Capture of the watermark-gated snapshot convention is deferred until after merge, as the plan states.
 
 ## Missing vault guidance discovered
 
-Captured to the vault inbox:
+None that blocked implementation. Existing notes already reject wall-clock ready-operation oracles and require a deterministic identity invariant.
 
-- Wall-clock ready-operation bounds through a real daemon child are ambient-load-sensitive. Load-window liveness is not an ordering proof. The durable idiom is a decision-level unit oracle plus functional-under-load integration coverage. Remaining site: `tests/hub_daemon_lifecycle/package_event_plane.rs`.
-- A pipeline run `target_id` can be a corrupted merge of two registered targets. Resolve routing from the ticket record first.
+Capture after merge, not this visit:
+
+- Hub first session snapshots complete at the journal source watermark after a confirming empty pull, not at baseline seal.
+- After a successful Spawn in this process, an empty acknowledged-id set must not count as caught-up.
+- Update [[wall-clock ready-operation bounds through a daemon child are ambient-load-sensitive]] to point at this oracle and to drop the `package_event_plane.rs` inventory sentence.

@@ -119,6 +119,7 @@ pub struct HubRuntime {
     source_held: std::cell::RefCell<VecDeque<CausalOp>>,
     unsettled_op: std::cell::RefCell<Option<CausalOp>>,
     event_plane_owner_ops: std::cell::RefCell<crate::package_event_router::EventPlaneOwnerOps>,
+    acknowledged_spawn_ids: Mutex<BTreeSet<String>>,
 }
 
 type SharedCoreDaemon = Mutex<CoreDaemon>;
@@ -291,6 +292,7 @@ impl HubRuntime {
             event_plane_owner_ops: std::cell::RefCell::new(
                 crate::package_event_router::EventPlaneOwnerOps::default(),
             ),
+            acknowledged_spawn_ids: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -386,6 +388,7 @@ impl HubRuntime {
             event_plane_owner_ops: std::cell::RefCell::new(
                 crate::package_event_router::EventPlaneOwnerOps::default(),
             ),
+            acknowledged_spawn_ids: Mutex::new(BTreeSet::new()),
         };
         runtime.reconcile_sessions(0)?;
         Ok(runtime)
@@ -3348,10 +3351,32 @@ impl HubRuntime {
         metadata: CoreSessionMetadata,
         now_seconds: u64,
     ) -> Result<CoreSession, CoreDaemonError> {
-        self.core_daemon
+        let requested_id = request.session_id.0.clone();
+        let session = self
+            .core_daemon
             .lock()
             .expect("core daemon mutex")
-            .spawn(SpawnSessionRequest { request, metadata }, now_seconds)
+            .spawn(SpawnSessionRequest { request, metadata }, now_seconds)?;
+        self.record_acknowledged_spawn(requested_id);
+        self.record_acknowledged_spawn(session.session_id.0.clone());
+        Ok(session)
+    }
+
+    /// Record one session id this process already returned from a successful Spawn.
+    pub fn record_acknowledged_spawn(&self, session_id: impl Into<String>) {
+        self.acknowledged_spawn_ids
+            .lock()
+            .expect("acknowledged spawn ids mutex")
+            .insert(session_id.into());
+    }
+
+    /// Session ids this process already returned from a successful Spawn.
+    #[must_use]
+    pub fn acknowledged_spawn_ids(&self) -> BTreeSet<String> {
+        self.acknowledged_spawn_ids
+            .lock()
+            .expect("acknowledged spawn ids mutex")
+            .clone()
     }
 
     /// Store hub-owned context for one spawned template session.
