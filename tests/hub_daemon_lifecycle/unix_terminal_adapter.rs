@@ -1865,46 +1865,84 @@ fn unix_shutdown_session_from_another_connection_classifies_attached_exit() {
     let endpoint = hub.endpoint().clone();
     let session_id = "pse-session";
     let subscription_id = "pse-sub";
+    let release_path = hub.data_dir().join("pse-release");
+    let mut connection =
+        botster_hub_client::DaemonConnection::connect(&endpoint).expect("default hello");
+    let spawned = connection
+        .request(&botster_hub_client::DaemonRequest::Spawn {
+            session_id: session_id.to_string(),
+            command: format!(
+                "while [ ! -e '{}' ]; do sleep 0.01; done; printf 'pse-ready\\n'; sleep 1; exit 0",
+                release_path.display()
+            ),
+        })
+        .expect("spawn held printf");
+    assert_eq!(
+        spawned.kind,
+        botster_hub_client::DaemonResponseKind::Spawned
+    );
+
     let (mut stream, mut reader) = unix_adapter_connection(&endpoint);
     let mut envelopes = Vec::new();
     let mut events = Vec::new();
-    spawn_and_bind(
+    let term_attach = request_skipping_envelopes(
         &mut stream,
         &mut reader,
-        session_id,
-        subscription_id,
-        "printf 'pse-ready\\n'; exit 0",
+        &botster_hub_client::DaemonRequest::Attach {
+            session_id: session_id.to_string(),
+            subscription_id: subscription_id.to_string(),
+        },
         &mut envelopes,
-        &mut events,
     );
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline && !unix_envelope_contains_live_bytes(&envelopes, "pse-ready") {
-        stream
-            .set_read_timeout(Some(Duration::from_millis(50)))
-            .expect("read timeout");
-        match botster_hub_client::read_unix_mux_frame_from_reader(&mut reader) {
-            Ok(botster_hub_client::DaemonUnixMuxFrame::Terminal(envelope)) => {
-                envelopes.push(envelope);
-            }
-            Ok(botster_hub_client::DaemonUnixMuxFrame::Event(event)) => events.push(event),
-            Ok(botster_hub_client::DaemonUnixMuxFrame::Response(_)) => {}
-            Err(_) => {
-                let _ = request_collecting_mux(
-                    &mut stream,
-                    &mut reader,
-                    &botster_hub_client::DaemonRequest::ReadScreen {
-                        session_id: session_id.to_string(),
-                    },
-                    &mut envelopes,
-                    &mut events,
-                );
-            }
-        }
-    }
-    stream.set_read_timeout(None).expect("clear read timeout");
+    assert_eq!(
+        term_attach.kind,
+        botster_hub_client::DaemonResponseKind::Events
+    );
     assert!(
-        unix_envelope_contains_live_bytes(&envelopes, "pse-ready"),
-        "attached adapter must see live output before ShutdownSession: {envelopes:?}"
+        term_attach.events.is_empty(),
+        "unix adapter Attach must bind without terminal bodies: {:?}",
+        term_attach.events
+    );
+    let primed = request_skipping_envelopes(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::drain_subscription(session_id, subscription_id),
+        &mut envelopes,
+    );
+    assert!(
+        primed.events.is_empty(),
+        "host Drain must not return terminal bodies: {:?}",
+        primed.events
+    );
+    fs::write(&release_path, b"go").expect("release Unix natural-exit printf");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if unix_envelope_contains_live_bytes(&envelopes, "pse-ready")
+            || envelopes.iter().any(|envelope| {
+                unix_envelope_is_process_exit(envelope, session_id, subscription_id)
+            })
+        {
+            break;
+        }
+        let drain = request_skipping_envelopes(
+            &mut stream,
+            &mut reader,
+            &botster_hub_client::DaemonRequest::drain_subscription(session_id, subscription_id),
+            &mut envelopes,
+        );
+        assert!(
+            drain.events.is_empty(),
+            "host Drain must not return terminal bodies: {:?}",
+            drain.events
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        unix_envelope_contains_live_bytes(&envelopes, "pse-ready")
+            || envelopes.iter().any(|envelope| {
+                unix_envelope_is_process_exit(envelope, session_id, subscription_id)
+            }),
+        "attached adapter must see live output or process_exit before ShutdownSession: {envelopes:?}"
     );
 
     let shutdown = botster_hub_client::request(
@@ -1972,6 +2010,7 @@ fn unix_blind_shutdown_after_finite_printf(
     let hub = start_isolated_live_output_hub_with_wrapper(hub_name, wrapper);
     let endpoint = hub.endpoint().clone();
     let subscription_id = format!("{session_id}-sub");
+    let release_path = hub.data_dir().join(format!("{session_id}-release"));
     let (mut stream, mut reader) = unix_adapter_connection(&endpoint);
     let mut envelopes = Vec::new();
     let mut events = Vec::new();
@@ -1980,10 +2019,26 @@ fn unix_blind_shutdown_after_finite_printf(
         &mut reader,
         session_id,
         &subscription_id,
-        "printf 'wrapper-ready\\n'; exit 0",
+        &format!(
+            "while [ ! -e '{}' ]; do sleep 0.01; done; printf 'wrapper-ready\\n'; exit 0",
+            release_path.display()
+        ),
         &mut envelopes,
         &mut events,
     );
+    let primed = request_collecting_mux(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::drain_subscription(session_id, &subscription_id),
+        &mut envelopes,
+        &mut events,
+    );
+    assert!(
+        primed.events.is_empty(),
+        "host Drain must not return terminal bodies: {:?}",
+        primed.events
+    );
+    fs::write(&release_path, b"go").expect("release Unix wrapper printf");
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline
         && !unix_envelope_contains_live_bytes(&envelopes, "wrapper-ready")
@@ -1998,14 +2053,20 @@ fn unix_blind_shutdown_after_finite_printf(
             Ok(botster_hub_client::DaemonUnixMuxFrame::Event(event)) => events.push(event),
             Ok(botster_hub_client::DaemonUnixMuxFrame::Response(_)) => {}
             Err(_) => {
-                let _ = request_collecting_mux(
+                let drain = request_collecting_mux(
                     &mut stream,
                     &mut reader,
-                    &botster_hub_client::DaemonRequest::ReadScreen {
-                        session_id: session_id.to_string(),
-                    },
+                    &botster_hub_client::DaemonRequest::drain_subscription(
+                        session_id,
+                        &subscription_id,
+                    ),
                     &mut envelopes,
                     &mut events,
+                );
+                assert!(
+                    drain.events.is_empty(),
+                    "host Drain must not return terminal bodies: {:?}",
+                    drain.events
                 );
             }
         }

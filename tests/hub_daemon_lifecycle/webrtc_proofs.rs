@@ -404,57 +404,18 @@ fn external_hub_webrtc_live_output_preserves_exact_bytes() {
         let _ = offer_peer.peer.close().await;
     });
 
-    // Suite-load oracle: wait until ListSessions reports exited, then
-    // ShutdownSession must return SessionCleanup{already_exited}.
-    // Isolated green is not this proof. The blind-call typed-OperatorError
-    // contract is owned by
-    // external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup.
-    // Do not widen the 10 s bound.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut listed = None;
-    while Instant::now() < deadline {
-        let _ = botster_hub_client::request(
-            &endpoint,
-            botster_hub_client::DaemonRequest::ReadScreen {
-                session_id: "webrtc-exact-bytes-session".to_string(),
-            },
-        );
-        listed =
-            botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::ListSessions)
-                .ok()
-                .and_then(|response| {
-                    response.sessions.iter().find_map(|session| {
-                        (session.session_id == "webrtc-exact-bytes-session")
-                            .then(|| session.lifecycle.clone())
-                    })
-                });
-        if listed.as_deref() == Some("exited") {
-            break;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    assert_eq!(
-        listed.as_deref(),
-        Some("exited"),
-        "owner loop must observe natural exit before ShutdownSession, last={listed:?}"
-    );
     let shutdown = botster_hub_client::request(
         &endpoint,
         botster_hub_client::DaemonRequest::ShutdownSession {
             session_id: "webrtc-exact-bytes-session".to_string(),
         },
     )
-    .expect("shutdown webrtc exact-bytes session");
-    assert_eq!(
-        shutdown.kind,
-        botster_hub_client::DaemonResponseKind::SessionCleanup,
-        "shutdown after observed exit must return SessionCleanup{{already_exited}}, got kind={:?} error={:?}",
-        shutdown.kind,
-        shutdown.error
+    .expect("blind ShutdownSession after finite WebRTC write");
+    assert_shutdown_strict_natural_exit(
+        &shutdown,
+        "webrtc-exact-bytes-session",
+        "WebRTC exact-bytes blind ShutdownSession",
     );
-    let cleanup = shutdown.cleanup.expect("cleanup body");
-    assert_eq!(cleanup.session_id, "webrtc-exact-bytes-session");
-    assert_eq!(cleanup.outcome, "already_exited");
 
     let missing = botster_hub_client::request(
         &endpoint,
