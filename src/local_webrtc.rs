@@ -4,6 +4,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc;
 use std::sync::{
     Mutex,
@@ -128,6 +130,11 @@ pub struct LocalWebrtcTransport {
     force_close_errors: Mutex<BTreeSet<String>>,
     #[cfg(test)]
     force_close_hangs: Mutex<BTreeSet<String>>,
+    /// Instance-scoped dedicated-runtime worker census.
+    /// A process-global counter made `== 0` waits observe other tests' runtimes
+    /// under default-concurrency lib load.
+    #[cfg(test)]
+    worker_threads: Arc<AtomicUsize>,
 }
 
 enum ClosePeerOutcome {
@@ -141,10 +148,6 @@ pub(crate) struct PeerRemoveResult {
     pub removed_grant_ids: Vec<String>,
     pub attached_subscriptions: Vec<LocalWebrtcAttachedSubscription>,
 }
-
-#[cfg(test)]
-static LOCAL_WEBRTC_WORKER_THREADS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
 
 impl LocalWebrtcTransport {
     /// Mint a local, single-use bootstrap grant bound to an already-running app origin.
@@ -432,12 +435,14 @@ impl LocalWebrtcTransport {
             builder.thread_name("botster-local-webrtc").enable_all();
             #[cfg(test)]
             {
+                let worker_threads_start = Arc::clone(&self.worker_threads);
+                let worker_threads_stop = Arc::clone(&self.worker_threads);
                 builder
-                    .on_thread_start(|| {
-                        LOCAL_WEBRTC_WORKER_THREADS.fetch_add(1, Ordering::SeqCst);
+                    .on_thread_start(move || {
+                        worker_threads_start.fetch_add(1, Ordering::SeqCst);
                     })
-                    .on_thread_stop(|| {
-                        LOCAL_WEBRTC_WORKER_THREADS.fetch_sub(1, Ordering::SeqCst);
+                    .on_thread_stop(move || {
+                        worker_threads_stop.fetch_sub(1, Ordering::SeqCst);
                     });
             }
             self.runtime = Some(
@@ -479,8 +484,8 @@ impl LocalWebrtcTransport {
     }
 
     #[cfg(test)]
-    pub(crate) fn dedicated_runtime_worker_threads() -> usize {
-        LOCAL_WEBRTC_WORKER_THREADS.load(Ordering::SeqCst)
+    pub(crate) fn dedicated_runtime_worker_threads(&self) -> usize {
+        self.worker_threads.load(Ordering::SeqCst)
     }
 
     /// Live peer ownership records remaining in the transport (test oracle).
@@ -1721,17 +1726,18 @@ fn apply_data_channel_event(
     stream_key: &AesGcmKey,
     pending_requests: &mut VecDeque<PendingLocalWebrtcRequest>,
     flow_control: &mut LocalWebrtcFlowControl,
-    mux: &WebRtcConnectionMux,
+    _mux: &WebRtcConnectionMux,
 ) -> Result<(), LocalWebrtcTerminalCause> {
     match event {
         DataChannelEvent::OnBufferedAmountHigh => {
+            // Pause only the in-flight DataChannel send path. Do not mark every
+            // mux handle WouldBlock: that silences healthy siblings while one
+            // stalled generation fills the peer send buffer.
             flow_control.pressured = true;
-            mux.set_would_block(true);
             Ok(())
         }
         DataChannelEvent::OnBufferedAmountLow => {
             flow_control.pressured = false;
-            mux.set_would_block(false);
             Ok(())
         }
         DataChannelEvent::OnMessage(message) => {
@@ -3055,6 +3061,59 @@ mod tests {
         assert!(!flow_control.pressured);
     }
 
+    #[test]
+    fn buffered_amount_high_does_not_mark_sibling_handles_would_block() {
+        use botster_core::contract::terminal_adapter::{
+            TerminalAdapter, TerminalAdapterPressure, TerminalAdapterWriteError,
+        };
+        use botster_terminal_protocol::TerminalFrame;
+
+        let mux = WebRtcConnectionMux::new();
+        let (stall, stall_handle) = mux.create_adapter();
+        let (mut sibling, sibling_handle) = mux.create_adapter();
+        mux.register(
+            "wwb-stall".to_string(),
+            "sub-stall".to_string(),
+            1,
+            stall_handle,
+        );
+        mux.register(
+            "wwb-live".to_string(),
+            "sub-live".to_string(),
+            1,
+            sibling_handle,
+        );
+        let key = AesGcmKey::from_slice(&[9; 32]).unwrap();
+        let mut pending = VecDeque::new();
+        let mut flow_control = LocalWebrtcFlowControl::default();
+
+        assert!(
+            apply_data_channel_event(
+                DataChannelEvent::OnBufferedAmountHigh,
+                &key,
+                &mut pending,
+                &mut flow_control,
+                &mux,
+            )
+            .is_ok()
+        );
+        assert!(flow_control.pressured);
+        assert_eq!(stall.pressure(), TerminalAdapterPressure::Ready);
+        assert_eq!(sibling.pressure(), TerminalAdapterPressure::Ready);
+
+        let frame = TerminalFrame::from_bytes(
+            br#"{"type":"terminal_output","marker":"sibling-under-high-water"}"#,
+        )
+        .expect("opaque sibling frame");
+        assert_eq!(sibling.try_write(&frame), Ok(()));
+        assert_eq!(sibling.pressure(), TerminalAdapterPressure::Full);
+        assert_ne!(
+            sibling.try_write(&frame),
+            Err(TerminalAdapterWriteError::WouldBlock),
+            "DataChannel high water must not convert a healthy sibling into WouldBlock"
+        );
+    }
+
     fn active_pressure_peer_terminal_case(
         cause: LocalWebrtcTerminalCause,
     ) -> (LocalWebrtcSendFailure, LocalWebrtcSenderTerminalRecord) {
@@ -3968,8 +4027,9 @@ mod tests {
         SessionDefaults,
     };
 
-    /// Serializes teardown tests that share the process-global dedicated-runtime worker
-    /// counter or inject a close hang, so parallel cargo tests do not false-fail each other.
+    /// Serializes teardown tests that inject a close hang, so parallel cargo tests
+    /// do not false-fail each other. The dedicated-runtime worker counter is
+    /// instance-scoped on each LocalWebrtcTransport.
     fn teardown_test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -5097,7 +5157,13 @@ mod tests {
 
         assert_eq!(harness.daemon.local_webrtc().active_peer_count(), 1);
         assert!(harness.daemon.local_webrtc().has_dedicated_runtime());
-        assert!(LocalWebrtcTransport::dedicated_runtime_worker_threads() >= 1);
+        assert!(
+            harness
+                .daemon
+                .local_webrtc()
+                .dedicated_runtime_worker_threads()
+                >= 1
+        );
         assert_eq!(
             harness
                 .daemon
@@ -5160,7 +5226,13 @@ mod tests {
 
         wait_until(
             Instant::now() + Duration::from_secs(2),
-            || LocalWebrtcTransport::dedicated_runtime_worker_threads() == 0,
+            || {
+                harness
+                    .daemon
+                    .local_webrtc()
+                    .dedicated_runtime_worker_threads()
+                    == 0
+            },
             "dedicated botster-local-webrtc worker threads to join",
         );
 
@@ -5255,7 +5327,13 @@ mod tests {
         assert!(!harness.daemon.local_webrtc().has_dedicated_runtime());
         wait_until(
             Instant::now() + Duration::from_secs(2),
-            || LocalWebrtcTransport::dedicated_runtime_worker_threads() == 0,
+            || {
+                harness
+                    .daemon
+                    .local_webrtc()
+                    .dedicated_runtime_worker_threads()
+                    == 0
+            },
             "first dedicated runtime workers to join",
         );
 
@@ -5265,7 +5343,13 @@ mod tests {
             harness.daemon.local_webrtc().has_dedicated_runtime(),
             "new signal after last-peer park must recreate the dedicated runtime"
         );
-        assert!(LocalWebrtcTransport::dedicated_runtime_worker_threads() >= 1);
+        assert!(
+            harness
+                .daemon
+                .local_webrtc()
+                .dedicated_runtime_worker_threads()
+                >= 1
+        );
 
         first.close_offer();
         second.close_offer();
@@ -5474,7 +5558,13 @@ mod tests {
         );
         let live_attach_before = harness.state.lifecycle_counters.live_attach_subscriptions;
         assert!(live_attach_before >= 1);
-        assert!(LocalWebrtcTransport::dedicated_runtime_worker_threads() >= 1);
+        assert!(
+            harness
+                .daemon
+                .local_webrtc()
+                .dedicated_runtime_worker_threads()
+                >= 1
+        );
         let owned_workers = harness.owned_workers.clone();
         assert!(
             !owned_workers.is_empty(),
@@ -5550,7 +5640,13 @@ mod tests {
         );
         wait_until(
             Instant::now() + Duration::from_secs(2),
-            || LocalWebrtcTransport::dedicated_runtime_worker_threads() == 0,
+            || {
+                harness
+                    .daemon
+                    .local_webrtc()
+                    .dedicated_runtime_worker_threads()
+                    == 0
+            },
             "dedicated runtime workers must join after fail-closed teardown",
         );
 
@@ -6339,7 +6435,13 @@ mod tests {
             harness.owned_workers.is_empty(),
             "hang hard-stop child must not create durable session workers"
         );
-        assert!(LocalWebrtcTransport::dedicated_runtime_worker_threads() >= 1);
+        assert!(
+            harness
+                .daemon
+                .local_webrtc()
+                .dedicated_runtime_worker_threads()
+                >= 1
+        );
 
         harness
             .daemon
@@ -6443,7 +6545,13 @@ mod tests {
         );
         wait_until(
             Instant::now() + Duration::from_secs(2),
-            || LocalWebrtcTransport::dedicated_runtime_worker_threads() == 0,
+            || {
+                harness
+                    .daemon
+                    .local_webrtc()
+                    .dedicated_runtime_worker_threads()
+                    == 0
+            },
             "dedicated runtime workers must join after hang fail-closed teardown",
         );
 

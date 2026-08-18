@@ -5942,7 +5942,7 @@ mod tests {
         assert_eq!(provenance.protocol_git, LATE_ATTACH_GHOSTSNP_PROTOCOL_GIT);
         assert_eq!(
             LATE_ATTACH_GHOSTSNP_CORE_PIN,
-            "fc541a59338d0591ba4fb3fa522a030d212d26d0"
+            "302c7f7b61f3970a0151b8c6646fc21ae7bd6c67"
         );
         assert_eq!(provenance.core_pin, LATE_ATTACH_GHOSTSNP_CORE_PIN);
         assert_eq!(
@@ -5958,7 +5958,7 @@ mod tests {
         assert_eq!(provenance.fixture_files, LATE_ATTACH_GHOSTSNP_FILES);
         assert_eq!(
             LATE_ATTACH_GHOSTSNP_GHOSTTY_PIN,
-            "5e9ba17a22ba8e40bf8de7d3e7555b8378cb1880"
+            "eb72ec61304ea256be1d86ed8fa961c84e43ecbd"
         );
     }
 

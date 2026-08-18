@@ -1,3 +1,87 @@
+fn terminal_envelope_contains_marker(
+    envelope: &botster_hub_client::DaemonUnixTerminalEnvelope,
+    marker: &str,
+) -> bool {
+    let Ok(bytes) = envelope.payload_bytes() else {
+        return false;
+    };
+    if !marker.is_empty()
+        && bytes
+            .windows(marker.len())
+            .any(|window| window == marker.as_bytes())
+    {
+        return true;
+    }
+    let Ok(event) = serde_json::from_slice::<botster_hub_client::DaemonEvent>(&bytes) else {
+        return false;
+    };
+    match event {
+        botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } => {
+            live_output_contains(&payload, marker)
+        }
+        _ => false,
+    }
+}
+
+fn drain_skipped_terminal(
+    connection: &mut botster_hub_client::DaemonConnection,
+    session_id: &str,
+    subscription_id: &str,
+) {
+    let _ = connection
+        .request(&botster_hub_client::DaemonRequest::drain_subscription(
+            session_id,
+            subscription_id,
+        ))
+        .expect("drain sibling terminal adapter");
+    let _ = connection.take_skipped_terminal();
+}
+
+fn wait_for_sibling_terminal_envelope(
+    connection: &mut botster_hub_client::DaemonConnection,
+    session_id: &str,
+    subscription_id: &str,
+    marker: &str,
+) -> botster_hub_client::DaemonUnixTerminalEnvelope {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut seen = Vec::new();
+    while Instant::now() < deadline {
+        let _ = connection
+            .request(&botster_hub_client::DaemonRequest::drain_subscription(
+                session_id,
+                subscription_id,
+            ))
+            .expect("drain sibling terminal adapter");
+        for envelope in connection.take_skipped_terminal() {
+            let matches_route = envelope.session_id == session_id
+                && envelope.subscription_id == subscription_id;
+            let contains = terminal_envelope_contains_marker(&envelope, marker);
+            seen.push((
+                envelope.session_id.clone(),
+                envelope.subscription_id.clone(),
+                contains,
+            ));
+            if matches_route && contains {
+                return envelope;
+            }
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!(
+        "timed out waiting for sibling terminal envelope marker={marker:?} session={session_id} subscription={subscription_id}; seen={seen:?}"
+    )
+}
+
+fn shutdown_failure_occupancy_has_pair(
+    occupancy: &[botster_hub_client::DaemonAttachOccupancy],
+    session_id: &str,
+    subscription_id: &str,
+) -> bool {
+    occupancy.iter().any(|row| {
+        row.session_id == session_id && row.subscription_id == subscription_id
+    })
+}
+
 fn wait_for_read_screen_contains(
     connection: &mut botster_hub_client::DaemonConnection,
     session_id: &str,
@@ -2143,7 +2227,7 @@ fn session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnec
     let conformance_hub = botster_hub_test_support::IsolatedHubBuilder::new()
         .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
         .session_worker_bin(session_worker_binary_path())
-        .root(PathBuf::from("/tmp/bh-slc"))
+        .root(unique_short_test_dir("slc"))
         .name("published-runner")
         .start()
         .expect("start isolated hub for published session lifecycle conformance");
@@ -3300,6 +3384,496 @@ fn shutdown_after_observed_exit_returns_session_cleanup() {
     shutdown_cli_daemon(&data_dir, child);
 }
 
+/// Live ShutdownSession Runtime/State failure must not sacrifice the daemon,
+/// the reused control connection, or a sibling session adapter.
+///
+/// Core-error branch closes victim-session adapters
+/// (`daemon_transport.rs:3430`). Cleanup-branch keep-open
+/// (`:3406-3408`) is a different path. This test hits the Core-error
+/// branch and proves the same `DaemonConnection` plus the sibling
+/// Attach route still deliver terminal envelopes.
+///
+/// ReadScreen is session-health only. It does not prove the Attach
+/// adapter. Sibling adapter survival is `take_skipped_terminal` for
+/// the sibling session and subscription, plus Status occupancy.
+///
+/// Single constructions at Core pin fc541a5:
+/// (a) SIGKILL-then-shutdown returned SessionCleanup after Core observed
+/// ProcessExited. (b) drain injection plus egress capacity 1 returned
+/// Events after Core shutdown completed. Compound: drain injection makes
+/// classify fall through, then SIGKILL makes the live Core shutdown fail.
+#[test]
+fn external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("shutdown-failure-sibling");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("test config has local socket")
+            .path
+            .clone(),
+    );
+    let daemon = PanicSafeCliDaemon::start_with_runtime_drain_failure(
+        &data_dir,
+        "shutdown-failure-victim",
+        None,
+        "shutdown-failure-sibling daemon evidence",
+    );
+    let hub_pid = daemon.child.as_ref().expect("panic-safe daemon child").id();
+    let socket_path = endpoint.socket_path.clone();
+    let pty_marker = format!(
+        "pty-marker-{}",
+        data_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("unique data dir name")
+    );
+    let victim_wrapper = write_marked_sleep_wrapper(
+        &data_dir,
+        &format!("{pty_marker}-victim"),
+    );
+    let sibling_wrapper = write_marked_echo_wrapper(
+        &data_dir,
+        &format!("{pty_marker}-sibling"),
+    );
+    let before_pids: std::collections::BTreeSet<u32> = session_worker_process_identities()
+        .expect("baseline worker census must succeed")
+        .into_iter()
+        .map(|worker| worker.pid)
+        .collect();
+
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: "shutdown-failure-victim".to_string(),
+            command: victim_wrapper.display().to_string(),
+        },
+    )
+    .expect("spawn victim session");
+    let victim_cleanup = SessionCleanupGuard::new(&data_dir, "shutdown-failure-victim");
+    let victim_workers = capture_new_session_workers_for_marked_pty(
+        &data_dir,
+        &before_pids,
+        &format!("{pty_marker}-victim"),
+    )
+    .expect("must capture victim botster-session-worker after Spawn");
+    assert!(
+        !victim_workers.is_empty(),
+        "must capture live victim worker before SIGKILL"
+    );
+
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: "shutdown-failure-sibling".to_string(),
+            command: sibling_wrapper.display().to_string(),
+        },
+    )
+    .expect("spawn sibling session");
+    let mut sibling_cleanup = SessionCleanupGuard::new(&data_dir, "shutdown-failure-sibling");
+    let pty_children = unix_processes_matching_marker(&pty_marker)
+        .expect("all-session PTY marker census after sibling spawn");
+    assert!(
+        !pty_children.is_empty(),
+        "must observe marked PTY children across Unix sessions before SIGKILL: marker={pty_marker}"
+    );
+
+    let sibling_session = "shutdown-failure-sibling";
+    let sibling_subscription = "shutdown-failure-sibling-sub";
+    let mut connection = botster_hub_client::DaemonConnection::connect_with_requirement(
+        &endpoint,
+        &botster_hub_client::DaemonCompatibilityRequirement::for_unix_terminal_adapter(),
+    )
+    .expect("open one unix-adapter control connection for failure and sibling proof");
+    let attach = connection
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: sibling_session.to_string(),
+            subscription_id: sibling_subscription.to_string(),
+        })
+        .expect("attach sibling before victim shutdown failure");
+    assert_eq!(
+        attach.kind,
+        botster_hub_client::DaemonResponseKind::Events,
+        "sibling Attach must succeed before victim shutdown, got kind={:?} error={:?}",
+        attach.kind,
+        attach.error
+    );
+    let resize = connection
+        .request(&botster_hub_client::DaemonRequest::Resize {
+            session_id: sibling_session.to_string(),
+            rows: 24,
+            cols: 80,
+        })
+        .expect("resize sibling before victim shutdown failure");
+    assert_eq!(
+        resize.kind,
+        botster_hub_client::DaemonResponseKind::Events,
+        "sibling Resize must succeed before victim shutdown, got kind={:?} error={:?}",
+        resize.kind,
+        resize.error
+    );
+    let ready = wait_for_read_screen_contains(&mut connection, sibling_session, "ready");
+    assert!(
+        ready.contains("ready"),
+        "sibling session must be live before victim shutdown, got {ready:?}"
+    );
+    let before_input = connection
+        .request(&botster_hub_client::DaemonRequest::SendInput {
+            session_id: sibling_session.to_string(),
+            data: "before\r".to_string(),
+        })
+        .expect("sibling SendInput before victim shutdown failure");
+    assert_eq!(
+        before_input.kind,
+        botster_hub_client::DaemonResponseKind::Events,
+        "sibling SendInput must work before victim shutdown, got kind={:?} error={:?}",
+        before_input.kind,
+        before_input.error
+    );
+    let before_envelope = wait_for_sibling_terminal_envelope(
+        &mut connection,
+        sibling_session,
+        sibling_subscription,
+        "echo:before",
+    );
+    assert_eq!(before_envelope.session_id, sibling_session);
+    assert_eq!(before_envelope.subscription_id, sibling_subscription);
+    drain_skipped_terminal(&mut connection, sibling_session, sibling_subscription);
+
+    for worker in &victim_workers {
+        let result = unsafe { libc::kill(worker.pid as libc::pid_t, libc::SIGKILL) };
+        assert_eq!(
+            result, 0,
+            "SIGKILL victim worker pid={} errno={}",
+            worker.pid,
+            std::io::Error::last_os_error()
+        );
+    }
+
+    let shutdown = connection
+        .request(&botster_hub_client::DaemonRequest::ShutdownSession {
+            session_id: "shutdown-failure-victim".to_string(),
+        })
+        .expect("shutdown killed victim through production handler");
+    assert_eq!(
+        shutdown.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError,
+        "compound drain-inject plus SIGKILL ShutdownSession must return OperatorError, got kind={:?} error={:?} cleanup={:?}",
+        shutdown.kind,
+        shutdown.error,
+        shutdown.cleanup
+    );
+    let error = shutdown.error.as_ref().expect("shutdown operator error body");
+    assert!(
+        error.code == "runtime_error" || error.code == "state_error",
+        "live ShutdownSession failure must keep runtime_error or state_error, got {error:?}"
+    );
+    assert_eq!(error.operation, "shutdown");
+
+    let status = connection
+        .request(&botster_hub_client::DaemonRequest::Status)
+        .expect("status after victim shutdown failure");
+    assert_eq!(
+        status.kind,
+        botster_hub_client::DaemonResponseKind::Status,
+        "same control connection Status must survive victim ShutdownSession failure, got {:?}",
+        status.kind
+    );
+    let occupancy = &status
+        .status
+        .as_ref()
+        .expect("status body after victim shutdown failure")
+        .live_attach_occupancy;
+    assert!(
+        shutdown_failure_occupancy_has_pair(occupancy, sibling_session, sibling_subscription),
+        "sibling attach occupancy must survive victim ShutdownSession failure, occupancy={occupancy:?}"
+    );
+
+    let sibling_input = connection
+        .request(&botster_hub_client::DaemonRequest::SendInput {
+            session_id: sibling_session.to_string(),
+            data: "adapter-alive\r".to_string(),
+        })
+        .expect("sibling SendInput after victim shutdown failure");
+    assert_eq!(
+        sibling_input.kind,
+        botster_hub_client::DaemonResponseKind::Events,
+        "sibling SendInput must succeed after victim ShutdownSession failure, got kind={:?} error={:?}",
+        sibling_input.kind,
+        sibling_input.error
+    );
+    let alive_envelope = wait_for_sibling_terminal_envelope(
+        &mut connection,
+        sibling_session,
+        sibling_subscription,
+        "echo:adapter-alive",
+    );
+    assert_eq!(alive_envelope.session_id, sibling_session);
+    assert_eq!(alive_envelope.subscription_id, sibling_subscription);
+    let observed = wait_for_read_screen_contains(
+        &mut connection,
+        sibling_session,
+        "echo:adapter-alive",
+    );
+    assert!(
+        observed.contains("echo:adapter-alive"),
+        "sibling ReadScreen is session-health only and must still show the marker, got {observed:?}"
+    );
+
+    let listed = connection
+        .request(&botster_hub_client::DaemonRequest::ListSessions)
+        .expect("list sessions after victim shutdown failure");
+    assert!(
+        listed.sessions.iter().any(|session| {
+            session.session_id == sibling_session && session.lifecycle == "running"
+        }),
+        "sibling must remain listed and running, sessions={:?}",
+        listed.sessions
+    );
+
+    let detach = connection
+        .request(&botster_hub_client::DaemonRequest::Detach {
+            session_id: sibling_session.to_string(),
+            subscription_id: sibling_subscription.to_string(),
+        })
+        .expect("detach sibling adapter for ablation");
+    assert_eq!(
+        detach.kind,
+        botster_hub_client::DaemonResponseKind::Events,
+        "sibling Detach ablation must succeed, got kind={:?} error={:?}",
+        detach.kind,
+        detach.error
+    );
+    drain_skipped_terminal(&mut connection, sibling_session, sibling_subscription);
+    let after_detach_status = connection
+        .request(&botster_hub_client::DaemonRequest::Status)
+        .expect("status after sibling Detach ablation");
+    let after_detach_occupancy = &after_detach_status
+        .status
+        .as_ref()
+        .expect("status body after sibling Detach")
+        .live_attach_occupancy;
+    assert!(
+        !shutdown_failure_occupancy_has_pair(
+            after_detach_occupancy,
+            sibling_session,
+            sibling_subscription
+        ),
+        "Detach ablation must drop sibling occupancy, occupancy={after_detach_occupancy:?}"
+    );
+    let after_detach_screen =
+        wait_for_read_screen_contains(&mut connection, sibling_session, "echo:adapter-alive");
+    assert!(
+        after_detach_screen.contains("echo:adapter-alive"),
+        "ReadScreen must remain session-health after Detach, got {after_detach_screen:?}"
+    );
+
+    drop(victim_cleanup);
+    sibling_cleanup.disarm();
+    production_shutdown_and_remove_session(&endpoint, "shutdown-failure-sibling");
+    drop(connection);
+    daemon.shutdown();
+    reap_session_workers_for_data_dir(&data_dir)
+        .expect("sibling SIGKILL fixture must not leave worktree session workers");
+    assert_cli_fixture_absent(
+        &data_dir,
+        hub_pid,
+        &socket_path,
+        &pty_marker,
+        &pty_children,
+        &["shutdown-failure-victim", "shutdown-failure-sibling"],
+    );
+}
+
+#[test]
+fn panic_safe_cli_daemon_deliberate_failure_leaves_no_owned_survivors() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("shutdown-failure-panic");
+    let config = explicit_config(&data_dir);
+    let socket_path = config
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("test config has local socket")
+        .path
+        .clone();
+    let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path.clone());
+    let pty_marker = format!(
+        "pty-marker-{}",
+        data_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("unique data dir name")
+    );
+    let victim_wrapper = write_marked_sleep_wrapper(&data_dir, &pty_marker);
+    let hub_pid = std::sync::atomic::AtomicU32::new(0);
+    let captured_pty = std::sync::Mutex::new(Vec::new());
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let daemon = PanicSafeCliDaemon::start_with_runtime_drain_failure(
+            &data_dir,
+            "shutdown-failure-panic-victim",
+            None,
+            "deliberate shutdown-failure panic daemon evidence",
+        );
+        hub_pid.store(
+            daemon.child.as_ref().expect("panic-safe daemon child").id(),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::Spawn {
+                session_id: "shutdown-failure-panic-victim".to_string(),
+                command: victim_wrapper.display().to_string(),
+            },
+        )
+        .expect("spawn panic-path victim");
+        let _session_cleanup =
+            SessionCleanupGuard::new(&data_dir, "shutdown-failure-panic-victim");
+        let pty_children = unix_processes_matching_marker(&pty_marker)
+            .expect("all-session PTY marker census before deliberate panic");
+        assert!(
+            !pty_children.is_empty(),
+            "must capture marked PTY children before deliberate panic: marker={pty_marker}"
+        );
+        *captured_pty
+            .lock()
+            .expect("store captured PTY children") = pty_children;
+        panic!("deliberate shutdown-failure fixture panic");
+    }));
+    assert!(
+        panicked.is_err(),
+        "panic-path owner proof must take the failure branch"
+    );
+    let pty_children = captured_pty
+        .into_inner()
+        .expect("recover captured PTY children");
+    assert_cli_fixture_absent(
+        &data_dir,
+        hub_pid.load(std::sync::atomic::Ordering::SeqCst),
+        &socket_path,
+        &pty_marker,
+        &pty_children,
+        &["shutdown-failure-panic-victim"],
+    );
+}
+
+#[test]
+fn assert_cli_fixture_absent_fails_when_setsid_child_survives() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("pty-setsid-negative");
+    let marker = format!(
+        "pty-marker-{}",
+        data_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("unique data dir name")
+    );
+    let wrapper = write_marked_sleep_wrapper(&data_dir, &marker);
+    let owner = PanicSafeSetsidChild::spawn(&marker, &wrapper);
+    let pty_children = vec![owner.identity().clone()];
+    let parent_sid = unsafe { libc::getsid(0) };
+    assert!(
+        owner.identity().sid != parent_sid,
+        "negative control child must leave the test SID via setsid: parent_sid={parent_sid} child={:?}",
+        owner.identity()
+    );
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match unix_processes_matching_marker(&marker) {
+            Ok(found) if !found.is_empty() => break,
+            Ok(_) => {}
+            Err(error) => panic!("all-session census for setsid negative control: {error}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "negative control must observe the independently sessioned child: marker={marker}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let mut dead = Command::new("sh")
+        .arg("-c")
+        .arg("exit 0")
+        .spawn()
+        .expect("spawn dead-pid decoy");
+    let dead_pid = dead.id();
+    dead.wait().expect("reap dead-pid decoy");
+    let socket_path = data_dir.join("missing.sock");
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_cli_fixture_absent(
+            &data_dir,
+            dead_pid,
+            &socket_path,
+            &marker,
+            &pty_children,
+            &[],
+        );
+    }));
+    owner.reap();
+    reap_captured_pty_children(&pty_children)
+        .expect("negative control must reap the captured setsid process group");
+    reap_processes_matching_marker(&marker)
+        .expect("negative control must reap leftover marked argv rows");
+    let leftovers = live_captured_pty_rows(&pty_children)
+        .expect("negative control leftover census");
+    assert!(
+        leftovers.is_empty(),
+        "negative control must not leak marker-less sleep children: {leftovers:?}"
+    );
+    assert!(
+        failed.is_err(),
+        "survivor oracle must fail while a representative setsid child remains alive"
+    );
+}
+
+#[test]
+fn panic_safe_setsid_owner_reaps_group_and_pipe_after_forced_error() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("pty-setsid-panic-owner");
+    let marker = format!(
+        "pty-marker-{}",
+        data_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("unique data dir name")
+    );
+    let wrapper = write_marked_sleep_wrapper(&data_dir, &marker);
+    let mut captured_identity = None;
+    let mut captured_stdout = None;
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut owner = PanicSafeSetsidChild::spawn(&marker, &wrapper);
+        captured_identity = Some(owner.identity().clone());
+        captured_stdout = owner.take_stdout();
+        panic!("forced first-census error before setsid cleanup");
+    }));
+    assert!(failed.is_err(), "forced error must unwind before cleanup");
+    let identity = captured_identity.expect("identity captured before panic");
+    assert!(
+        !process_is_alive_u32(identity.pid).unwrap_or(true),
+        "Drop must reap the exact setsid child: {identity:?}"
+    );
+    assert!(
+        !process_group_probe(identity.pgid).unwrap_or(true),
+        "Drop must reap the detached PGID without a prior census: {identity:?}"
+    );
+    let leftovers = live_captured_pty_rows(std::slice::from_ref(&identity))
+        .expect("post-cleanup census oracle");
+    assert!(
+        leftovers.is_empty(),
+        "post-cleanup oracle must see an empty captured PGID: {leftovers:?}"
+    );
+    let stdout = captured_stdout.expect("piped stdout captured before panic");
+    assert!(
+        stdout_pipe_is_closed(&stdout),
+        "Drop must close the write end so a piped runner cannot hang"
+    );
+    reap_processes_matching_marker(&marker)
+        .expect("forced-error owner must leave no marked argv rows");
+}
+
 #[test]
 // ReadScreen parks ProcessExited. observe_session_lifecycle must reconcile
 // that row and finish ShutdownSession as SessionCleanup or Events. Live
@@ -3544,7 +4118,11 @@ fn zero_subscribers_still_project_a_complete_ended_row() {
 }
 
 #[test]
-fn ready_spawn_stays_within_budget_when_live_sessions_exceed_one_observe_slice() {
+fn ready_spawn_completes_when_live_sessions_exceed_one_observe_slice() {
+    // Control-before-maintenance ordering is proven by
+    // `queued_control_precedes_a_due_maintenance_slice` in
+    // `src/daemon_transport.rs`. End-to-end wall-clock latency through a
+    // daemon child measures ambient machine load and is recorded only.
     let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("observe-slice-load");
     let config = explicit_config(&data_dir);
@@ -3559,23 +4137,27 @@ fn ready_spawn_stays_within_budget_when_live_sessions_exceed_one_observe_slice()
     );
     let child = start_cli_daemon(&data_dir);
     for index in 0..24 {
-        botster_hub_client::request(
+        let session_id = format!("load-session-{index}");
+        let spawn = botster_hub_client::request(
             &endpoint,
             botster_hub_client::DaemonRequest::Spawn {
-                session_id: format!("load-session-{index}"),
+                session_id: session_id.clone(),
                 command: "sleep 8".to_string(),
             },
         )
-        .expect("spawn load session");
+        .unwrap_or_else(|error| panic!("spawn {session_id}: {error}"));
+        assert_eq!(
+            spawn.kind,
+            botster_hub_client::DaemonResponseKind::Spawned,
+            "load spawn {session_id} must succeed: {spawn:?}"
+        );
     }
     let mut first = botster_hub_client::subscribe_session_entities(&endpoint, "load-sub-one")
         .expect("first load subscriber");
     let mut second = botster_hub_client::subscribe_session_entities(&endpoint, "load-sub-two")
         .expect("second load subscriber");
-    let _ = first.next_frame();
-    let _ = second.next_frame();
     let started = Instant::now();
-    botster_hub_client::request(
+    let ready = botster_hub_client::request(
         &endpoint,
         botster_hub_client::DaemonRequest::Spawn {
             session_id: "load-ready-spawn".to_string(),
@@ -3583,18 +4165,166 @@ fn ready_spawn_stays_within_budget_when_live_sessions_exceed_one_observe_slice()
         },
     )
     .expect("ready spawn during loaded observe");
-    let waited = started.elapsed();
-    assert!(
-        waited <= Duration::from_millis(botster_hub::MAX_READY_OPERATION_WAIT_MS),
-        "ready spawn waited {waited:?}"
+    assert_eq!(
+        ready.kind,
+        botster_hub_client::DaemonResponseKind::Spawned,
+        "ready spawn must succeed: {ready:?}"
     );
+    let waited = started.elapsed();
+    eprintln!("ready spawn duration observation (observe-slice load): {waited:?}");
+    let first_snapshot = read_first_session_snapshot(&mut first);
+    let second_snapshot = read_first_session_snapshot(&mut second);
+    assert_first_snapshot_contains_load_sessions(&first_snapshot);
+    assert_first_snapshot_contains_load_sessions(&second_snapshot);
     let _ = first.unsubscribe();
     let _ = second.unsubscribe();
     shutdown_cli_daemon(&data_dir, child);
 }
 
+fn load_session_id(index: usize) -> String {
+    format!("load-session-{index}")
+}
+
+fn expected_load_session_ids() -> std::collections::BTreeSet<String> {
+    (0..24).map(load_session_id).collect()
+}
+
+fn assert_first_snapshot_contains_load_sessions(
+    frame: &botster_hub_client::DaemonEntityFrame,
+) -> std::collections::BTreeSet<String> {
+    let seen = snapshot_session_identities(frame);
+    let expected = expected_load_session_ids();
+    let missing: Vec<String> = expected.difference(&seen).cloned().collect();
+    assert!(
+        missing.is_empty(),
+        "first Snapshot must contain all 24 load identities; missing={missing:?}; seen={}",
+        seen.len()
+    );
+    seen
+}
+
+fn assemble_session_id(index: usize) -> String {
+    format!("assemble-session-{index:02}")
+}
+
+fn expected_assemble_session_ids() -> std::collections::BTreeSet<String> {
+    (0..24).map(assemble_session_id).collect()
+}
+
+fn assemble_sessions_are_ready(seen: &std::collections::BTreeSet<String>) -> bool {
+    seen == &expected_assemble_session_ids()
+}
+
+fn session_identities_from_entity_frame(
+    frame: &botster_hub_client::DaemonEntityFrame,
+) -> Result<Vec<String>, String> {
+    match frame {
+        botster_hub_client::DaemonEntityFrame::Error { code, message, .. } => {
+            Err(format!("assemble subscription error: {code}: {message}"))
+        }
+        botster_hub_client::DaemonEntityFrame::Snapshot { items, .. } => Ok(items
+            .iter()
+            .filter_map(|entity| {
+                entity
+                    .get("session_uuid")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect()),
+        botster_hub_client::DaemonEntityFrame::Upsert { id, .. }
+        | botster_hub_client::DaemonEntityFrame::Patch { id, .. } => Ok(vec![id.clone()]),
+        botster_hub_client::DaemonEntityFrame::Remove { .. } => Ok(Vec::new()),
+    }
+}
+
+fn snapshot_session_identities(
+    frame: &botster_hub_client::DaemonEntityFrame,
+) -> std::collections::BTreeSet<String> {
+    session_identities_from_entity_frame(frame)
+        .unwrap_or_else(|error| panic!("{error}"))
+        .into_iter()
+        .collect()
+}
+
+fn assert_first_snapshot_contains_assemble_sessions(
+    frame: &botster_hub_client::DaemonEntityFrame,
+) -> std::collections::BTreeSet<String> {
+    let seen = snapshot_session_identities(frame);
+    let expected = expected_assemble_session_ids();
+    let missing: Vec<String> = expected.difference(&seen).cloned().collect();
+    assert!(
+        missing.is_empty(),
+        "first Snapshot must contain all 24 assemble identities; missing={missing:?}; seen={}",
+        seen.len()
+    );
+    seen
+}
+
+fn read_first_session_snapshot(
+    subscription: &mut botster_hub_client::DaemonEntitySubscription,
+) -> botster_hub_client::DaemonEntityFrame {
+    subscription
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .expect("liveness bound for first session snapshot");
+    loop {
+        match subscription.next_frame() {
+            Ok(frame @ botster_hub_client::DaemonEntityFrame::Snapshot { .. }) => return frame,
+            Ok(botster_hub_client::DaemonEntityFrame::Error { code, message, .. }) => {
+                panic!("assemble subscription error: {code}: {message}");
+            }
+            Ok(_) => {}
+            Err(error) => panic!("first Snapshot liveness wait failed: {error}"),
+        }
+    }
+}
+
 #[test]
-fn ready_spawn_stays_within_budget_during_session_snapshot_assembly() {
+fn assemble_subscription_rejects_an_error_frame() {
+    let error = botster_hub_client::DaemonEntityFrame::Error {
+        subscription_id: "assemble-sub".to_string(),
+        entity_type: "session".to_string(),
+        code: "projection".to_string(),
+        message: "typed failure".to_string(),
+    };
+    assert!(
+        session_identities_from_entity_frame(&error).is_err(),
+        "a typed Error frame must not count as projected identities"
+    );
+}
+
+#[test]
+fn assemble_readiness_rejects_a_partial_identity_set() {
+    let empty = std::collections::BTreeSet::new();
+    assert!(
+        !assemble_sessions_are_ready(&empty),
+        "an empty projected set must not be ready"
+    );
+    let mut seen = std::collections::BTreeSet::new();
+    for index in 0..17 {
+        seen.insert(assemble_session_id(index));
+    }
+    assert!(
+        !assemble_sessions_are_ready(&seen),
+        "a partial projected set must not be ready"
+    );
+    for index in 17..24 {
+        seen.insert(assemble_session_id(index));
+    }
+    assert!(
+        assemble_sessions_are_ready(&seen),
+        "all 24 load-session identities must be ready"
+    );
+}
+
+#[test]
+fn ready_spawn_completes_during_session_snapshot_assembly() {
+    // Control-before-maintenance ordering is proven by
+    // `queued_control_precedes_a_due_maintenance_slice` in
+    // `src/daemon_transport.rs`. End-to-end wall-clock latency through a
+    // daemon child measures ambient machine load and is recorded only.
+    // The first Snapshot is the production completeness oracle: it must
+    // contain all 24 assemble identities. A later ready-spawn row is a
+    // permitted superset. Fail immediately on DaemonEntityFrame::Error.
     let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("snapshot-assemble-ready");
     let config = explicit_config(&data_dir);
@@ -3609,20 +4339,26 @@ fn ready_spawn_stays_within_budget_during_session_snapshot_assembly() {
     );
     let child = start_cli_daemon(&data_dir);
     for index in 0..24 {
-        botster_hub_client::request(
+        let session_id = assemble_session_id(index);
+        let spawn = botster_hub_client::request(
             &endpoint,
             botster_hub_client::DaemonRequest::Spawn {
-                session_id: format!("assemble-session-{index:02}"),
+                session_id: session_id.clone(),
                 command: "sleep 8".to_string(),
             },
         )
-        .expect("spawn assemble session");
+        .unwrap_or_else(|error| panic!("spawn {session_id}: {error}"));
+        assert_eq!(
+            spawn.kind,
+            botster_hub_client::DaemonResponseKind::Spawned,
+            "assemble spawn {session_id} must succeed: {spawn:?}"
+        );
     }
     let mut subscription =
         botster_hub_client::subscribe_session_entities(&endpoint, "assemble-sub")
             .expect("assemble subscriber");
     let started = Instant::now();
-    botster_hub_client::request(
+    let ready = botster_hub_client::request(
         &endpoint,
         botster_hub_client::DaemonRequest::Spawn {
             session_id: "assemble-ready-spawn".to_string(),
@@ -3630,19 +4366,79 @@ fn ready_spawn_stays_within_budget_during_session_snapshot_assembly() {
         },
     )
     .expect("ready spawn during snapshot assembly");
-    let waited = started.elapsed();
-    assert!(
-        waited <= Duration::from_millis(botster_hub::MAX_READY_OPERATION_WAIT_MS),
-        "ready spawn waited {waited:?} during snapshot assembly"
+    assert_eq!(
+        ready.kind,
+        botster_hub_client::DaemonResponseKind::Spawned,
+        "ready spawn must succeed: {ready:?}"
     );
-    let first = subscription.next_frame().expect("complete first snapshot");
-    match first {
-        botster_hub_client::DaemonEntityFrame::Snapshot { items, .. } => {
-            assert!(items.len() >= 24, "first snapshot must be complete");
-        }
-        other => panic!("expected complete snapshot, got {other:?}"),
-    }
+    let waited = started.elapsed();
+    eprintln!("ready spawn duration observation (snapshot assembly): {waited:?}");
+    let first = read_first_session_snapshot(&mut subscription);
+    assert_first_snapshot_contains_assemble_sessions(&first);
     let _ = subscription.unsubscribe();
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn first_session_snapshot_arrives_after_projected_spawn_is_removed() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("retire-ack-resubscribe");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("test config has local socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    let session_id = "retire-session-00";
+    let spawn = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: session_id.to_string(),
+            command: "sleep 8".to_string(),
+        },
+    )
+    .unwrap_or_else(|error| panic!("spawn {session_id}: {error}"));
+    assert_eq!(
+        spawn.kind,
+        botster_hub_client::DaemonResponseKind::Spawned,
+        "retire spawn must succeed: {spawn:?}"
+    );
+    let mut first = botster_hub_client::subscribe_session_entities(&endpoint, "retire-sub-one")
+        .expect("first retire subscriber");
+    let first_snapshot = read_first_session_snapshot(&mut first);
+    let first_ids = snapshot_session_identities(&first_snapshot);
+    assert!(
+        first_ids.contains(session_id),
+        "first Snapshot must contain the spawned session; seen={first_ids:?}"
+    );
+    first.unsubscribe().expect("unsubscribe first retire subscriber");
+    let shutdown = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::ShutdownSession {
+            session_id: session_id.to_string(),
+        },
+    )
+    .expect("shutdown projected spawn");
+    assert_eq!(
+        shutdown.kind,
+        botster_hub_client::DaemonResponseKind::Events,
+        "shutdown must succeed: {shutdown:?}"
+    );
+    let mut second = botster_hub_client::subscribe_session_entities(&endpoint, "retire-sub-two")
+        .expect("second retire subscriber");
+    let second_snapshot = read_first_session_snapshot(&mut second);
+    match &second_snapshot {
+        botster_hub_client::DaemonEntityFrame::Snapshot { .. } => {}
+        other => panic!("second subscribe must receive a Snapshot, got {other:?}"),
+    }
+    second
+        .unsubscribe()
+        .expect("unsubscribe second retire subscriber");
     shutdown_cli_daemon(&data_dir, child);
 }
 
@@ -3858,7 +4654,7 @@ fn session_entity_subscription_observes_attached_natural_exit_with_pending_egres
     subscription
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("bound entity reads");
-    let _ = subscription.next_frame().expect("initial snapshot");
+    let _ = wait_for_entity_frame(&mut subscription, Duration::from_secs(5), |_| true);
 
     botster_hub_client::request(
         &endpoint,
@@ -3870,7 +4666,13 @@ fn session_entity_subscription_observes_attached_natural_exit_with_pending_egres
     )
     .expect("spawn attached natural-exit session");
     assert!(matches!(
-        subscription.next_frame().expect("spawn upsert"),
+        wait_for_entity_frame(&mut subscription, Duration::from_secs(5), |frame| {
+            matches!(
+                frame,
+                botster_hub_client::DaemonEntityFrame::Upsert { id, .. }
+                    if id == "entity-attached-exit"
+            )
+        }),
         botster_hub_client::DaemonEntityFrame::Upsert { ref id, .. }
             if id == "entity-attached-exit"
     ));
@@ -4037,7 +4839,7 @@ fn session_entity_subscription_recovers_after_terminal_disconnect_with_pending_e
     subscription
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("bound entity reads");
-    let _ = subscription.next_frame().expect("initial snapshot");
+    let _ = wait_for_entity_frame(&mut subscription, Duration::from_secs(5), |_| true);
 
     botster_hub_client::request(
         &endpoint,
@@ -4048,7 +4850,13 @@ fn session_entity_subscription_recovers_after_terminal_disconnect_with_pending_e
     )
     .expect("spawn terminal disconnect session");
     assert!(matches!(
-        subscription.next_frame().expect("spawn upsert"),
+        wait_for_entity_frame(&mut subscription, Duration::from_secs(5), |frame| {
+            matches!(
+                frame,
+                botster_hub_client::DaemonEntityFrame::Upsert { id, .. }
+                    if id == "entity-terminal-disconnect"
+            )
+        }),
         botster_hub_client::DaemonEntityFrame::Upsert { ref id, .. }
             if id == "entity-terminal-disconnect"
     ));

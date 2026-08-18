@@ -404,6 +404,7 @@ The end-to-end local production runtime proofs are:
 ./test.sh --test hub_daemon_lifecycle_test cli_local_runtime_up_starts_reuses_and_down_stops_runtime
 ./test.sh --test hub_local_runtime_test
 ./test.sh --test hub_daemon_lifecycle_test cli_daemon_restart_recovers_worker_backed_session_through_transport
+script/run-lifecycle-suite
 script/test-production-package-runtime \
   --hub-repo /path/to/botster-hub --hub-revision <sha> \
   --core-repo /path/to/botster-core --core-revision <sha> \

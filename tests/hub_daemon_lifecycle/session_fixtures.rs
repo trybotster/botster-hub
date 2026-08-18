@@ -367,10 +367,19 @@ pub(crate) fn start_isolated_live_output_hub_with_env(
     name: &str,
     extra_env: &[(&str, &str)],
 ) -> botster_hub_test_support::IsolatedHub {
+    start_isolated_live_output_hub_with_worker(name, session_worker_binary_path(), extra_env)
+}
+
+pub(crate) fn start_isolated_live_output_hub_with_worker(
+    name: &str,
+    session_worker_bin: impl Into<PathBuf>,
+    extra_env: &[(&str, &str)],
+) -> botster_hub_test_support::IsolatedHub {
+    check_harness_taint();
     let mut builder = botster_hub_test_support::IsolatedHubBuilder::new()
         .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
-        .session_worker_bin(session_worker_binary_path())
-        .root(unique_short_test_dir(name))
+        .session_worker_bin(session_worker_bin)
+        .root(unique_short_test_dir("ih"))
         .name(name);
     for (key, value) in extra_env {
         builder = builder.env(*key, *value);
@@ -378,6 +387,41 @@ pub(crate) fn start_isolated_live_output_hub_with_env(
     builder
         .start()
         .expect("start isolated hub with explicit worker path")
+}
+
+pub(crate) fn assert_shutdown_strict_natural_exit(
+    shutdown: &botster_hub_client::DaemonResponse,
+    session_id: &str,
+    context: &str,
+) {
+    assert_ne!(
+        shutdown.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError,
+        "{context}: ShutdownSession must not return OperatorError after natural exit, got kind={:?} error.code={:?} error.operation={:?} error.message={:?}",
+        shutdown.kind,
+        shutdown.error.as_ref().map(|error| &error.code),
+        shutdown.error.as_ref().map(|error| &error.operation),
+        shutdown.error.as_ref().map(|error| &error.message)
+    );
+    assert!(
+        matches!(
+            shutdown.kind,
+            botster_hub_client::DaemonResponseKind::Events
+                | botster_hub_client::DaemonResponseKind::SessionCleanup
+        ),
+        "{context}: ShutdownSession must return Events or SessionCleanup, got kind={:?} error={:?}",
+        shutdown.kind,
+        shutdown.error
+    );
+    if shutdown.kind == botster_hub_client::DaemonResponseKind::SessionCleanup {
+        let cleanup = shutdown.cleanup.as_ref().expect("SessionCleanup body");
+        assert_eq!(cleanup.session_id, session_id);
+        assert_eq!(
+            cleanup.outcome, "already_exited",
+            "{context}: cleanup outcome must be already_exited, got {:?}",
+            cleanup.outcome
+        );
+    }
 }
 
 pub(crate) fn live_output_decoded_bytes(

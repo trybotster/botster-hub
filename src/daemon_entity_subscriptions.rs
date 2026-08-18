@@ -287,11 +287,9 @@ pub(super) fn register_entity_subscription(
             crate::daemon_maintenance::MaintenanceSliceKind::ProjectionApply,
         );
     }
-    let complete =
-        state.maintenance.projection.baseline_complete && !state.maintenance.projection.gap;
     let cursor = state.maintenance.projection.cursor.clone();
     let snapshot_seq = cursor.as_ref().map(|cursor| cursor.sequence).unwrap_or(0);
-    let mut subscription = EntitySubscriptionState {
+    let subscription = EntitySubscriptionState {
         sender,
         entity_type: "session".to_string(),
         cursor,
@@ -311,31 +309,7 @@ pub(super) fn register_entity_subscription(
         assembled_item_bytes: 0,
         needs_delivery: true,
     };
-    if complete {
-        match continue_session_snapshot_assembly(
-            &subscription_id,
-            &mut subscription,
-            &state.maintenance.projection,
-            &mut state.lifecycle_counters,
-            SESSION_DELIVERY_MAX_ITEMS,
-            SESSION_DELIVERY_MAX_BYTES,
-            SESSION_DELIVERY_MAX_ELAPSED,
-        ) {
-            SnapshotAssemble::Closed {
-                frame_too_large: true,
-            } => {
-                return Ok(entity_subscription_error(
-                    "entity_provider_frame_too_large",
-                    &subscription_id,
-                    "session snapshot exceeds daemon frame limit",
-                ));
-            }
-            SnapshotAssemble::Closed { .. } => {
-                return Err(DaemonTransportError::ControlThreadStopped);
-            }
-            SnapshotAssemble::Continue { .. } => {}
-        }
-    }
+    state.maintenance.journal_caught_up_confirmed = false;
     state
         .entity_subscriptions
         .insert(subscription_id.clone(), subscription);
@@ -354,7 +328,7 @@ pub(super) fn register_entity_subscription(
             .reconnect_registrations
             .saturating_add(1);
     }
-    state.maintenance.scheduler.prefer_subscriber_delivery();
+    state.maintenance.scheduler.prefer_journal_pull();
     Ok(daemon_response_base(DaemonResponseKind::EntitySubscribed))
 }
 
@@ -572,6 +546,10 @@ pub(super) fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut Dae
     let started = Instant::now();
     let mut delivered = 0usize;
     let mut delivered_bytes = 0usize;
+    let caught_up = crate::daemon_maintenance::refresh_projection_if_inventory_ahead(
+        runtime,
+        &mut state.maintenance,
+    );
     let complete =
         state.maintenance.projection.baseline_complete && !state.maintenance.projection.gap;
     if complete {
@@ -604,6 +582,7 @@ pub(super) fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut Dae
                     id,
                     subscription,
                     &state.maintenance.projection,
+                    caught_up,
                     reason.clone(),
                     &mut state.lifecycle_counters,
                 )
@@ -634,13 +613,19 @@ pub(super) fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut Dae
                             subscription_id,
                             subscription,
                             &state.maintenance.projection,
+                            caught_up,
                             &mut state.lifecycle_counters,
                             SESSION_DELIVERY_MAX_ITEMS.saturating_sub(delivered),
                             SESSION_DELIVERY_MAX_BYTES.saturating_sub(delivered_bytes),
                             SESSION_DELIVERY_MAX_ELAPSED.saturating_sub(started.elapsed()),
                         ) {
                             SnapshotAssemble::Continue { page } => (true, page),
-                            SnapshotAssemble::Closed { .. } => (
+                            SnapshotAssemble::Closed {
+                                frame_too_large: true,
+                            }
+                            | SnapshotAssemble::Closed {
+                                frame_too_large: false,
+                            } => (
                                 false,
                                 DeliveryPage {
                                     items: 0,
@@ -1114,16 +1099,19 @@ enum SnapshotAssemble {
     Closed { frame_too_large: bool },
 }
 
+#[allow(clippy::too_many_arguments)]
 fn continue_session_snapshot_assembly(
     subscription_id: &str,
     state: &mut EntitySubscriptionState,
     projection: &crate::session_projection::SessionProjection,
+    caught_up: bool,
     counters: &mut DaemonLifecycleCounters,
     max_items: usize,
     max_bytes: usize,
     max_elapsed: Duration,
 ) -> SnapshotAssemble {
-    if !projection.baseline_complete || projection.gap {
+    if !caught_up || !projection.baseline_complete || projection.gap {
+        state.needs_delivery = true;
         return SnapshotAssemble::Continue {
             page: DeliveryPage {
                 items: 0,
@@ -1326,6 +1314,7 @@ fn try_resync_from_projection(
     subscription_id: &str,
     state: &mut EntitySubscriptionState,
     projection: &crate::session_projection::SessionProjection,
+    caught_up: bool,
     reason: String,
     counters: &mut DaemonLifecycleCounters,
 ) -> bool {
@@ -1345,6 +1334,7 @@ fn try_resync_from_projection(
         subscription_id,
         state,
         projection,
+        caught_up,
         counters,
         SESSION_DELIVERY_MAX_ITEMS,
         SESSION_DELIVERY_MAX_BYTES,
@@ -1356,7 +1346,12 @@ fn try_resync_from_projection(
             }
             true
         }
-        SnapshotAssemble::Closed { .. } => false,
+        SnapshotAssemble::Closed {
+            frame_too_large: true,
+        }
+        | SnapshotAssemble::Closed {
+            frame_too_large: false,
+        } => false,
     }
 }
 
@@ -1948,6 +1943,149 @@ mod tests {
             .expect("runtime initialized")
             .shutdown_session(session_id, 3)
             .expect("stop worker-backed test session");
+        daemon.stop();
+        let _ = fs::remove_dir_all(data_directory);
+    }
+
+    #[test]
+    fn existing_session_subscriber_receives_spawn_upsert_without_another_request() {
+        let data_directory = std::env::temp_dir().join(format!(
+            "botster-hub-existing-sub-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos()
+        ));
+        let config = crate::HubStartupOptions {
+            host: crate::HostIdentityOptions {
+                id: "existing-sub-test".to_string(),
+                display_name: "Existing Subscriber Test".to_string(),
+                fingerprint: None,
+            },
+            data_directory: crate::DataDirectoryOption::Explicit(data_directory.clone()),
+            session_defaults: crate::SessionDefaults {
+                shell: "/bin/sh".to_string(),
+                working_directory: Some(".".into()),
+                initial_rows: 24,
+                initial_cols: 80,
+            },
+            transports: crate::TransportBindings::default(),
+            ..crate::HubStartupOptions::default()
+        }
+        .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
+        .expect("build existing subscriber config");
+        let mut daemon = HubDaemon::start(config).expect("start existing subscriber daemon");
+        let mut state = DaemonControlState::default();
+        seed_lifecycle_reconciliation(&mut daemon, &mut state);
+        for _ in 0..16 {
+            let kind = state.maintenance.scheduler.take_slice();
+            if let Some(runtime) = daemon.runtime() {
+                crate::daemon_maintenance::run_maintenance_kind(
+                    runtime,
+                    &mut state.maintenance,
+                    kind,
+                );
+            }
+        }
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let response = register_entity_subscription(
+            &mut daemon,
+            &mut state,
+            "session".to_string(),
+            "existing-sub".to_string(),
+            EntityFrameSender::Blocking(sender),
+            None,
+        )
+        .expect("register idle session subscription");
+        assert_eq!(response.kind, DaemonResponseKind::EntitySubscribed);
+        let mut first = receiver.try_recv().ok();
+        for _ in 0..32 {
+            if first.is_some() {
+                break;
+            }
+            let kind = state.maintenance.scheduler.take_slice();
+            if kind == crate::daemon_maintenance::MaintenanceSliceKind::SubscriberDelivery {
+                drive_entity_subscriptions(&mut daemon, &mut state);
+            } else if let Some(runtime) = daemon.runtime() {
+                crate::daemon_maintenance::run_maintenance_kind(
+                    runtime,
+                    &mut state.maintenance,
+                    kind,
+                );
+            }
+            first = receiver.try_recv().ok();
+        }
+        match first.expect("first snapshot before spawn") {
+            DaemonEntityFrame::Snapshot { .. } => {}
+            other => panic!("expected first snapshot, got {other:?}"),
+        }
+        let session_id = SessionId("assemble-ready-spawn".to_string());
+        daemon
+            .runtime_mut()
+            .expect("runtime initialized")
+            .spawn_session(
+                botster_core::SessionSpawnRequest {
+                    request_id: RequestId("existing-sub-spawn".to_string()),
+                    session_id: session_id.clone(),
+                    executable: "/bin/sleep".to_string(),
+                    arguments: vec!["8".to_string()],
+                    working_directory: botster_core::SpawnWorkingDirectory {
+                        path: ".".to_string(),
+                    },
+                    environment: botster_core::SpawnEnvironment::default(),
+                    initial_pty_size: Some(botster_core::ResizePayload { rows: 24, cols: 80 }),
+                },
+                botster_core::CoreSessionMetadata::new(),
+                1,
+            )
+            .expect("spawn after first snapshot");
+        state.maintenance.note_authoritative_mutation();
+        let mut saw_ready = false;
+        for _ in 0..16 {
+            let kind = state.maintenance.scheduler.take_slice();
+            if kind == crate::daemon_maintenance::MaintenanceSliceKind::SubscriberDelivery {
+                drive_entity_subscriptions(&mut daemon, &mut state);
+            } else if let Some(runtime) = daemon.runtime() {
+                crate::daemon_maintenance::run_maintenance_kind(
+                    runtime,
+                    &mut state.maintenance,
+                    kind,
+                );
+            }
+            while let Ok(frame) = receiver.try_recv() {
+                match frame {
+                    DaemonEntityFrame::Upsert { id, .. } | DaemonEntityFrame::Patch { id, .. }
+                        if id == session_id.0 =>
+                    {
+                        saw_ready = true;
+                    }
+                    DaemonEntityFrame::Snapshot { items, .. }
+                        if items.iter().any(|entity| {
+                            entity.get("session_uuid").and_then(Value::as_str)
+                                == Some(session_id.0.as_str())
+                        }) =>
+                    {
+                        saw_ready = true;
+                    }
+                    DaemonEntityFrame::Error { code, message, .. } => {
+                        panic!("existing subscriber error: {code}: {message}");
+                    }
+                    _ => {}
+                }
+            }
+            if saw_ready {
+                break;
+            }
+        }
+        assert!(
+            saw_ready,
+            "existing subscriber must receive assemble-ready-spawn without another client request"
+        );
+        let _ = daemon
+            .runtime_mut()
+            .expect("runtime initialized")
+            .shutdown_session(session_id, 2);
         daemon.stop();
         let _ = fs::remove_dir_all(data_directory);
     }
@@ -2581,6 +2719,7 @@ mod tests {
             "sub",
             &mut state,
             &projection,
+            true,
             "subscriber_overflow".to_string(),
             &mut counters,
         ));
@@ -2716,6 +2855,7 @@ mod tests {
                 "sub",
                 &mut state,
                 &projection,
+                true,
                 &mut counters,
                 SESSION_DELIVERY_MAX_ITEMS,
                 SESSION_DELIVERY_MAX_BYTES,
@@ -2799,6 +2939,7 @@ mod tests {
             "sub",
             &mut state,
             &projection,
+            true,
             &mut counters,
             SESSION_DELIVERY_MAX_ITEMS,
             SESSION_DELIVERY_MAX_BYTES,
@@ -2818,6 +2959,7 @@ mod tests {
                 "sub",
                 &mut state,
                 &projection,
+                true,
                 &mut counters,
                 SESSION_DELIVERY_MAX_ITEMS,
                 SESSION_DELIVERY_MAX_BYTES,
@@ -2889,6 +3031,7 @@ mod tests {
             "sub",
             &mut state,
             &projection,
+            true,
             &mut counters,
             SESSION_DELIVERY_MAX_ITEMS,
             SESSION_DELIVERY_MAX_BYTES,
@@ -3017,24 +3160,32 @@ mod tests {
             needs_delivery: true,
         };
         let mut counters = DaemonLifecycleCounters::default();
-        loop {
-            let started = Instant::now();
+        // This case proves bounded per-call assembly work, not wall-clock latency.
+        // Duration::MAX cannot cut a page, so page cuts are byte-driven: one item per page.
+        const MAX_NEAR_LIMIT_PAGES: usize = 21;
+        for page_index in 0..MAX_NEAR_LIMIT_PAGES {
             let SnapshotAssemble::Continue { page } = continue_session_snapshot_assembly(
                 "sub",
                 &mut state,
                 &projection,
+                true,
                 &mut counters,
                 SESSION_DELIVERY_MAX_ITEMS,
                 SESSION_DELIVERY_MAX_BYTES,
-                SESSION_DELIVERY_MAX_ELAPSED,
+                Duration::MAX,
             ) else {
                 panic!("near-limit assembly");
             };
-            assert!(started.elapsed() < Duration::from_millis(crate::MAX_OWNER_TURN_MS));
-            assert!(started.elapsed() < Duration::from_millis(crate::MAX_READY_OPERATION_WAIT_MS));
+            assert!(page.items >= 1);
+            assert!(page.items <= SESSION_DELIVERY_MAX_ITEMS);
+            assert!(page.bytes <= SESSION_DELIVERY_MAX_BYTES);
             if page.more {
                 assert_eq!(receiver.try_iter().count(), 0);
                 assert!(!state.assembled_items.is_empty());
+                assert!(
+                    page_index + 1 < MAX_NEAR_LIMIT_PAGES,
+                    "twenty one-item pages cannot need more than twenty useful calls"
+                );
             } else {
                 break;
             }
@@ -3167,26 +3318,172 @@ mod tests {
             needs_delivery: true,
         };
         let mut counters = DaemonLifecycleCounters::default();
-        let result = continue_session_snapshot_assembly(
-            "sub",
-            &mut state,
-            &projection,
-            &mut counters,
-            8,
-            DAEMON_MAX_FRAME_BYTES,
-            Duration::from_millis(crate::MAX_OWNER_TURN_MS),
-        );
-        assert!(matches!(
-            result,
-            SnapshotAssemble::Closed {
-                frame_too_large: true
+        // This case proves separator accounting, not owner-turn latency.
+        // Duration::MAX cannot cut a page, so Closed cannot be elapsed-empty.
+        const MAX_SEPARATOR_PAGES: usize = 3;
+        let mut closed_too_large = false;
+        for page_index in 0..MAX_SEPARATOR_PAGES {
+            match continue_session_snapshot_assembly(
+                "sub",
+                &mut state,
+                &projection,
+                true,
+                &mut counters,
+                8,
+                DAEMON_MAX_FRAME_BYTES,
+                Duration::MAX,
+            ) {
+                SnapshotAssemble::Closed {
+                    frame_too_large: true,
+                } => {
+                    closed_too_large = true;
+                    break;
+                }
+                SnapshotAssemble::Closed {
+                    frame_too_large: false,
+                } => panic!("closed without frame_too_large"),
+                SnapshotAssemble::Continue { page } => {
+                    assert!(page.items > 0, "empty-item continue is not separator proof");
+                    assert!(page.more, "completed snapshot without charging separators");
+                    assert!(
+                        page_index + 1 < MAX_SEPARATOR_PAGES,
+                        "two items cannot need more than two useful pages"
+                    );
+                }
             }
-        ));
+        }
+        assert!(closed_too_large, "separator close did not fire");
         let frames: Vec<_> = receiver.try_iter().collect();
         assert!(matches!(
             frames.first(),
             Some(DaemonEntityFrame::Error { code, .. })
                 if code == "entity_provider_frame_too_large"
         ));
+    }
+
+    fn assemble_record(id: String) -> SessionLifecycleRecord {
+        SessionLifecycleRecord {
+            session: botster_core_daemon::DaemonSession {
+                session_id: SessionId(id),
+                registry_state: RegistrySessionState::Running,
+                size: botster_core::ResizePayload { rows: 24, cols: 80 },
+                process: None,
+                updated_at: 1,
+            },
+            metadata: botster_core::CoreSessionMetadata::new(),
+            lifecycle: Some(SessionLifecycleState::Running),
+        }
+    }
+
+    fn assembling_subscription(
+        sender: mpsc::SyncSender<DaemonEntityFrame>,
+        source_seq: u64,
+    ) -> EntitySubscriptionState {
+        EntitySubscriptionState {
+            sender: EntityFrameSender::Blocking(sender),
+            entity_type: "session".to_string(),
+            cursor: None,
+            entities: BTreeMap::new(),
+            definition_generation: 0,
+            definition_entities: BTreeMap::new(),
+            resync_reason: None,
+            owner_grant_id: None,
+            package_last_applied_seq: None,
+            package_catching_up: false,
+            delivery_after: None,
+            delivery_phase: DeliveryPhase::Assembling { source_seq },
+            next_seq: source_seq,
+            assembled_items: Vec::new(),
+            assembled_item_bytes: 0,
+            needs_delivery: true,
+        }
+    }
+
+    fn snapshot_item_ids(frame: &DaemonEntityFrame) -> Vec<String> {
+        match frame {
+            DaemonEntityFrame::Snapshot { items, .. } => items
+                .iter()
+                .filter_map(|item| {
+                    item.get("session_uuid")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .collect(),
+            other => panic!("expected snapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn first_session_snapshot_holds_until_the_projection_is_caught_up() {
+        let mut projection = crate::session_projection::SessionProjection::default();
+        projection.ingest_baseline_rows(
+            1,
+            (0..24).map(|index| assemble_record(format!("session-{index:02}"))),
+        );
+        projection.seal_baseline(SessionLifecycleCursor {
+            source_id: botster_core_daemon::SessionLifecycleSourceId("s".into()),
+            sequence: 1,
+        });
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let mut state = assembling_subscription(sender, 1);
+        let mut counters = DaemonLifecycleCounters::default();
+        let SnapshotAssemble::Continue { page } = continue_session_snapshot_assembly(
+            "sub",
+            &mut state,
+            &projection,
+            false,
+            &mut counters,
+            SESSION_DELIVERY_MAX_ITEMS,
+            SESSION_DELIVERY_MAX_BYTES,
+            SESSION_DELIVERY_MAX_ELAPSED,
+        ) else {
+            panic!("hold must stay alive");
+        };
+        assert_eq!(page.items, 0);
+        assert!(page.more);
+        assert!(state.needs_delivery);
+        assert!(matches!(
+            state.delivery_phase,
+            DeliveryPhase::Assembling { .. }
+        ));
+        assert!(receiver.try_iter().next().is_none());
+    }
+
+    #[test]
+    fn first_session_snapshot_completes_when_caught_up() {
+        let mut projection = crate::session_projection::SessionProjection::default();
+        projection.ingest_baseline_rows(
+            1,
+            (0..24).map(|index| assemble_record(format!("session-{index:02}"))),
+        );
+        projection.seal_baseline(SessionLifecycleCursor {
+            source_id: botster_core_daemon::SessionLifecycleSourceId("s".into()),
+            sequence: 1,
+        });
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let mut state = assembling_subscription(sender, 1);
+        let mut counters = DaemonLifecycleCounters::default();
+        loop {
+            let SnapshotAssemble::Continue { page } = continue_session_snapshot_assembly(
+                "sub",
+                &mut state,
+                &projection,
+                true,
+                &mut counters,
+                SESSION_DELIVERY_MAX_ITEMS,
+                SESSION_DELIVERY_MAX_BYTES,
+                SESSION_DELIVERY_MAX_ELAPSED,
+            ) else {
+                panic!("caught-up assembly must stay alive");
+            };
+            if !page.more {
+                break;
+            }
+        }
+        let frames: Vec<_> = receiver.try_iter().collect();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(snapshot_item_ids(&frames[0]).len(), 24);
+        assert_eq!(state.delivery_phase, DeliveryPhase::Removes);
+        assert!(!state.needs_delivery);
     }
 }
