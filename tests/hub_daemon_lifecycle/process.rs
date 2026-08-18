@@ -141,13 +141,13 @@ impl ReapingChild {
 
 impl Drop for ReapingChild {
     fn drop(&mut self) {
-        if let Some(child) = self.child.as_mut() {
-            if let Err(error) = try_terminate_and_reap_child(child) {
-                record_harness_taint(format!(
-                    "ReapingChild drop could not prove absence: {error}"
-                ));
-                eprintln!("ReapingChild drop: {error}");
-            }
+        if let Some(child) = self.child.as_mut()
+            && let Err(error) = try_terminate_and_reap_child(child)
+        {
+            record_harness_taint(format!(
+                "ReapingChild drop could not prove absence: {error}"
+            ));
+            eprintln!("ReapingChild drop: {error}");
         }
     }
 }
@@ -187,11 +187,11 @@ impl ChildCleanup {
 impl Drop for ChildCleanup {
     fn drop(&mut self) {
         let pid = self.child.id();
-        if self.child.try_wait().ok().flatten().is_none() {
-            if let Err(error) = signal_test_group_or_child(pid, libc::SIGKILL) {
-                let _ = self.child.kill();
-                eprintln!("ChildCleanup group kill failed: {error}");
-            }
+        if self.child.try_wait().ok().flatten().is_none()
+            && let Err(error) = signal_test_group_or_child(pid, libc::SIGKILL)
+        {
+            let _ = self.child.kill();
+            eprintln!("ChildCleanup group kill failed: {error}");
         }
         if let Err(error) = self.child.wait() {
             record_harness_taint(format!("ChildCleanup wait failed for pid {pid}: {error}"));
