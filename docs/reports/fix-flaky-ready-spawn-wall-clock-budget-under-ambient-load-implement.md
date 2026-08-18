@@ -4,14 +4,14 @@
 | --- | --- |
 | Ticket | `ticket_1786938984_190098` |
 | Run | `run_1787013066_187598` |
-| Step | `botster_stack_implement` (`run_step_1787027665_198339`, second Review return) |
+| Step | `botster_stack_implement` (`run_step_1787028395_474758`, third Review return) |
 | Target repository | `botster-hub` (`trybotster/botster-hub`) |
 | `target_id` | `tgt_7e208a0c76a44980a83b63af976b1f22` |
 | Authoritative path | ticket `target_id` plus worktree `origin` remote `https://github.com/trybotster/botster-hub.git` |
 | Pipeline worktree | the ticket worktree on `project-pipelines/ticket_1786938984_190098` |
 | Approved plan | `docs/plans/fix-flaky-ready-spawn-wall-clock-budget-under-ambient-load.md` revision v4.3 |
 | Plan artifacts | `artifact_1787013708_530188` (v4) plus `artifact_1787013854_780740` (v4.1 addendum) |
-| Review bounce | `review_1787027652_739418` `changes_required` after `review_1787026690_762581` |
+| Review bounce | `review_1787028380_171923` `changes_required` after `review_1787027652_739418` and `review_1787026690_762581` |
 | Advisor answer | `question_1787017751_527748` option 1: keep the 24-identity invariant and close the Hub first-snapshot leak |
 | Delivery | direct-merge; no pull request |
 | Class | not runtime-teardown (`teardown_class_applies: false`) |
@@ -20,7 +20,7 @@
 
 Independent routing: `project_pipelines_current_context` lists `tgt_7e208a0c76a44980a83b63af976b1f22`. The ticket worktree `origin` remote is `trybotster/botster-hub`. Approved plan v4 through v4.3 used the same `target_id` and repository.
 
-This visit repairs the two open findings from `review_1787027652_739418`. It keeps pending-ack retire, no subscriber-delivery `list()`, and the earlier implement commits.
+This visit repairs the two open findings from `review_1787028380_171923`. It removes the unused production journal-capacity environment option and updates stale retained-floor plan text. Prior remint, pending-ack retire, and no-`list()` behavior stay.
 
 ## Repository playbook and other playbooks/notes applied
 
@@ -71,7 +71,7 @@ This visit repairs the two open findings from `review_1787027652_739418`. It kee
 Second Review-return production path:
 
 - `src/daemon_maintenance.rs` — `CursorExpired` starts fresh bounded baseline recovery. Normal seal still keeps the sealed snapshot cursor. One omitted-row recover may probe sequence 0; if that cursor expired, Hub remints. Pending-ack retire from the prior visit stays.
-- `src/runtime.rs` — test-only `with_test_lifecycle_journal_capacity` plus optional `BOTSTER_HUB_TEST_LIFECYCLE_JOURNAL_CAPACITY` so a discarded-prefix test can use journal capacity 2. `retire_acknowledged_spawn` stays.
+- `src/runtime.rs` — test-only `with_test_lifecycle_journal_capacity` so a discarded-prefix test can use journal capacity 2. `retire_acknowledged_spawn` stays. No production environment option.
 
 Handoff:
 
@@ -80,7 +80,7 @@ Handoff:
 
 ## Ownership boundaries preserved
 
-Hub owns the projection-completion policy, pending-Spawn hold and retire, retained-floor recover, owner-loop wake prefers, and the session first-snapshot delivery contract. Core still owns the journal, the watermark, and baseline pages. This branch consumes pinned Core `fc541a59` and does not edit Core, hub-client, Web, TUI, or package/plugin paths. Public `DaemonEntityFrame::Snapshot` shape is unchanged. Page budgets are unchanged. Subscriber delivery does not call Core `list()`.
+Hub owns the projection-completion policy, pending-Spawn hold and retire, sequence-0 omitted-row probe, `CursorExpired` remint, owner-loop wake prefers, and the session first-snapshot delivery contract. Core still owns the journal, the watermark, and baseline pages. This branch consumes pinned Core `fc541a59` and does not edit Core, hub-client, Web, TUI, or package/plugin paths. Public `DaemonEntityFrame::Snapshot` shape is unchanged. Page budgets are unchanged. Subscriber delivery does not call Core `list()`.
 
 ## Cross-repo routing
 
@@ -99,7 +99,7 @@ Same-target siblings, not absorbed:
 These deviations are accepted and written back into plan v4.3.
 
 1. `CursorExpired` remints a fresh baseline (`finding_1787027652_648073`). Replaying the retained suffix cannot reconstruct discarded prefix Upserts or removals. Normal completion still keeps the sealed cursor, so seal does not rewind to 0 and remint forever.
-2. The discarded-prefix proof uses a test-only journal capacity of 2. That knob is not a production Core pin or Hub config change.
+2. The discarded-prefix proof uses a `cfg(test)` thread-local journal capacity of 2. The unused production `BOTSTER_HUB_TEST_LIFECYCLE_JOURNAL_CAPACITY` branch was removed (`finding_1787028380_382065`).
 3. This visit ran `ready_spawn_completes` 20/20 on the tree that contains the remint (`finding_1787027652_881975`).
 4. Earlier v4.2 deviations remain: pending-ack retire, no subscriber-delivery `list()`, production-guard ablation red-proof, observe-slice `Spawned` and first-Snapshot asserts.
 5. Earlier v4.1 deviations remain: no register-time assembly, confirming empty pull, apply prefers `SubscriberDelivery`, in-process existing-subscriber proof, latest observed watermark, IsolatedHub stderr is unread, `Spawned`-kind oracle, no full suite.
@@ -142,7 +142,7 @@ Temporary ablation: remove `!caught_up ||` from the production guard in `continu
 | `./test.sh --locked --test hub_daemon_lifecycle_test assemble_subscription_rejects` | 1 passed |
 | `./test.sh --locked --test hub_daemon_lifecycle_test assemble_readiness_rejects` | 1 passed |
 | `./test.sh --locked --test hub_daemon_lifecycle_test first_session_snapshot_arrives_after_projected_spawn_is_removed` | 1 passed |
-| `./test.sh --locked --test hub_daemon_lifecycle_test ready_spawn_completes` × 20 this visit | 20 pass, 0 fail on `c27b39c`; both ready_spawn tests green |
+| `./test.sh --locked --test hub_daemon_lifecycle_test ready_spawn_completes` × 20 on `c27b39c` | 20 pass, 0 fail. This cleanup visit did not rerun 20/20 because the production hold path did not change. |
 
 Downstream proof: not required. No public DTO, pin, or client-contract change.
 

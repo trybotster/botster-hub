@@ -4494,11 +4494,6 @@ fn core_daemon_config(config: &HubConfig) -> CoreDaemonConfig {
     if std::env::var("BOTSTER_HUB_TEST_FAIL_SNAPSHOT_HISTORY_AFTER_READY").as_deref() == Ok("1") {
         core = core.with_test_fail_snapshot_history_after_ready(true);
     }
-    if let Ok(raw) = std::env::var("BOTSTER_HUB_TEST_LIFECYCLE_JOURNAL_CAPACITY")
-        && let Ok(capacity) = raw.parse::<usize>()
-    {
-        core = core.with_lifecycle_journal_capacity(capacity);
-    }
     #[cfg(test)]
     if let Some(capacity) = TEST_LIFECYCLE_JOURNAL_CAPACITY.with(std::cell::Cell::get) {
         core = core.with_lifecycle_journal_capacity(capacity);
