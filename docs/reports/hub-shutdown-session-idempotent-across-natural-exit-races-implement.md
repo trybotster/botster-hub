@@ -4,7 +4,7 @@
 | --- | --- |
 | Ticket | `ticket_1786977409_499180` |
 | Run | `run_1787012955_256937` |
-| Run step | `run_step_1787029127_855135` |
+| Run step | `run_step_1787030066_846886` |
 | Step | `botster_stack_implement` |
 | Target repository | `botster-hub` (`trybotster/botster-hub`) |
 | `target_id` | `tgt_7e208a0c76a44980a83b63af976b1f22` |
@@ -12,11 +12,11 @@
 | Decision gate | Rule B, then orchestrator option 3 |
 | Core dependency | `ticket_1787015956_494734` / `dependency_1787015963_708930` closed |
 | Core pin | `fd66efdcb4769b2b3a75cbd580a5b98b82825790` (current `origin/main`) |
-| Hub main integrated | `e864c3c` via merge commit `7a24b1e` |
-| Prior Review return | `review_1787028521_313736` resolved at `286c1ab` |
-| Current Review return | `review_1787029110_848811` `changes_required` |
+| Hub main integrated | `bf249af` via merge commit `6cc0c12` |
+| Prior Review return | `review_1787029110_848811` resolved at `2320ba4` |
+| Current Review return | `review_1787030054_829721` `changes_required` |
 | Merge policy | direct; no pull request |
-| Review requested | yes, after all-session PTY survivor oracle repair |
+| Review requested | yes, after integrating current Hub main |
 
 Inventory source: `git diff --name-only origin/main...HEAD` after this visit's commit. Do not treat an earlier intra-branch pin inventory as current.
 
@@ -58,15 +58,17 @@ Convention conflicts: none.
 
 ## Review-return repairs this visit
 
-`review_1787029110_848811` accepted the panic-safe Hub owner at `286c1ab`. It returned one high test-evidence finding.
+`review_1787030054_829721` accepted the all-session PTY survivor oracle at `2320ba4`. It returned one high product finding.
 
-`finding_1787029110_488041`: `assert_cli_fixture_absent` now takes a unique per-test marker, captured PTY identities, and logical session ids. After unwind it scans all Unix sessions and requires that marker, those pids, and those process groups to be absent. It still checks Hub pid, Hub PGID, worker rows, socket, and listed running sessions. Panic Drop also reaps processes whose argv contains the data-directory marker.
+`finding_1787030054_410421`: this branch now contains current Hub main `bf249af` (`ticket_1786938984_190098` ready-spawn projection merge) through merge commit `6cc0c12`. `bf249af` is an ancestor of HEAD. Core stays at current-main `fd66efdcb4769b2b3a75cbd580a5b98b82825790`.
 
-The live sibling and deliberate-panic fixtures spawn unique wrapper scripts that do not `exec`. The wrapper path stays in argv after portable-pty `setsid()`. Worker capture for SIGKILL waits for that all-session marker instead of a PPID `sh -c` descendant.
+Git reported changed-in-both sections in three files. Auto-merge kept both contracts. Reviewed result:
 
-`assert_cli_fixture_absent_fails_when_setsid_child_survives` leaves a representative `setsid` child alive and proves the survivor assertion fails. The test then reaps that child.
+- `src/daemon_transport.rs`: successful `Spawn` records `acknowledged_spawn_ids` on maintenance state and runtime, then still calls `note_authoritative_mutation()`. This ticket's `ShutdownSession` path is unchanged: classify through `observe_session_lifecycle`, recover only through `classify_shutdown_session`, no `list_sessions` fallback.
+- `src/runtime.rs`: incoming `acknowledged_spawn_ids` plus `record_acknowledged_spawn` / `retire_acknowledged_spawn` sit beside this ticket's `BOTSTER_HUB_TEST_FAIL_RUNTIME_DRAIN_*` Core inject. `spawn_session` records both the requested id and the returned id.
+- `tests/hub_daemon_lifecycle/sessions.rs`: incoming `ready_spawn_completes_*` tests remain. This ticket's true-error sibling, deliberate-panic, and `setsid` negative-control proofs remain, with marked non-exec wrappers.
 
-Prior `review_1787028521_313736` findings remain resolved at `286c1ab`. Prior `review_1787027565_578625` findings remain resolved at `7071f42`.
+Prior `review_1787029110_848811` findings remain resolved at `2320ba4`. Prior `review_1787028521_313736` findings remain resolved at `286c1ab`. Prior `review_1787027565_578625` findings remain resolved at `7071f42`.
 
 ## Prior Review-return repairs at `7071f42`
 
@@ -78,14 +80,12 @@ Prior `review_1787028521_313736` findings remain resolved at `286c1ab`. Prior `r
 
 ## Files changed versus `origin/main`
 
-Thirteen paths differ from current main. Pin manifests match main after `7a24b1e`, so they are not in this inventory.
+Thirteen paths differ from current main `bf249af`. Pin manifests match main, so they are not in this inventory. Ready-spawn production files now live on main and are not unique to this branch.
 
 ### This Review-return visit
 
-- `tests/hub_daemon_lifecycle/cli.rs` -- panic Drop also reaps argv-marked Unix-session processes under the data directory.
-- `tests/hub_daemon_lifecycle/process.rs` -- all-session marker census, captured PTY pid/PGID absence, `setsid` wrapper helpers, and worker capture that waits for the marker instead of a PPID descendant.
-- `tests/hub_daemon_lifecycle/sessions.rs` -- marked non-exec wrappers on sibling and panic paths; negative control that keeps a `setsid` child alive.
-- `docs/reports/hub-shutdown-session-idempotent-across-natural-exit-races-implement.md` -- this report.
+- `docs/reports/hub-shutdown-session-idempotent-across-natural-exit-races-implement.md` -- record `bf249af` integration, overlap resolution, and this visit's proofs.
+- `src/daemon_transport.rs`, `src/runtime.rs`, `tests/hub_daemon_lifecycle/sessions.rs` -- no extra hand-edit after auto-merge; both ticket contracts remain.
 
 ### Inherited same-ticket changes still on the branch
 
@@ -117,6 +117,7 @@ Hub still owns classification, recover, and host response kinds. Core still owns
 - Five-round idempotency is not a gate.
 - Review rejected the planned `list_sessions` recover fallback. Recover now preserves the typed error on classify `Err` and does not read collection APIs.
 - No full lifecycle suite ran, as required by acceptance check 10.
+- This visit integrates current Hub main `bf249af` and does not change the ShutdownSession product path.
 
 ## Tests and downstream proof run
 
@@ -125,14 +126,17 @@ All test commands used `./test.sh`. Worker prebuild, fmt, and clippy are the doc
 | Check | Command | Result |
 | --- | --- | --- |
 | Recover units | `./test.sh --locked --lib recover_` | 5 passed |
-| SetSID negative control | `./test.sh --locked --test hub_daemon_lifecycle_test assert_cli_fixture_absent_fails_when_setsid_child_survives -- --exact` | pass in 6.06s |
-| Deliberate panic survivors | `./test.sh --locked --test hub_daemon_lifecycle_test panic_safe_cli_daemon_deliberate_failure_leaves_no_owned_survivors -- --exact` | pass in 7.17s |
-| True-error sibling | `./test.sh --locked --test hub_daemon_lifecycle_test external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable -- --exact` | pass in 17.58s |
-| Unix natural-exit | `./test.sh --locked --test hub_daemon_lifecycle_test unix_shutdown_session_from_another_connection_classifies_attached_exit -- --exact` | pass in 3.05s |
-| Live stuck-Stopping negative | `./test.sh --locked --test hub_daemon_lifecycle_test unix_shutdown_session_stuck_stopping_without_exit_evidence_stays_operator_error -- --exact` | pass in 8.79s |
-| WebRTC exact-bytes | `./test.sh --locked --test hub_daemon_lifecycle_test external_hub_webrtc_live_output_preserves_exact_bytes -- --exact` | pass in 5.25s |
+| Active-error units | `./test.sh --locked --lib shutdown_active_` | 2 passed |
+| SetSID negative control | `./test.sh --locked --test hub_daemon_lifecycle_test assert_cli_fixture_absent_fails_when_setsid_child_survives -- --exact` | pass in 5.21s |
+| Deliberate panic survivors | `./test.sh --locked --test hub_daemon_lifecycle_test panic_safe_cli_daemon_deliberate_failure_leaves_no_owned_survivors -- --exact` | pass in 6.92s |
+| True-error sibling | `./test.sh --locked --test hub_daemon_lifecycle_test external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable -- --exact` | pass in 18.06s |
+| Unix natural-exit | `./test.sh --locked --test hub_daemon_lifecycle_test unix_shutdown_session_from_another_connection_classifies_attached_exit -- --exact` | pass in 3.07s |
+| Live stuck-Stopping negative | `./test.sh --locked --test hub_daemon_lifecycle_test unix_shutdown_session_stuck_stopping_without_exit_evidence_stays_operator_error -- --exact` | pass in 8.48s |
+| WebRTC exact-bytes | `./test.sh --locked --test hub_daemon_lifecycle_test external_hub_webrtc_live_output_preserves_exact_bytes -- --exact` | pass in 5.64s |
 | Fmt | `cargo fmt --all -- --check` | pass |
 | Clippy | `cargo clippy --workspace --all-targets --locked -- -D warnings` | pass |
+| Diff check | `git diff --check origin/main...HEAD` | pass |
+| PII scan | non-docs `origin/main...HEAD` Users-prefix / name / email | clean |
 | Leftover census | worktree `botster-hub start` for `shutdown-failure`, `pse`, and `stk` data dirs | none |
 
 Unix natural-exit proof: default Hello spawn, unix-adapter Attach and Drain, print-release, live `pse-ready`, exit-release, `process_exit`, then blind `ShutdownSession`. Sleep duration is not the oracle.
@@ -157,9 +161,8 @@ Every lens from the approved plan remains in force. No lens was dropped to infor
 ## Unverified behavior or residual risk
 
 - Exact-query `Found(Stopping)` after a Core shutdown error still maps to host `SessionCleanup{already_exited}`. Review required that path only when the exact-session query itself returns Stopping, not when classify `Err` is replaced by a collection row.
-- Ready-spawn suite co-flake stays owned by `ticket_1786938984_190098`.
+- `ticket_1786938984_190098` is now on Hub main at `bf249af`. This leaf ticket still does not run a full lifecycle suite.
 - No full lifecycle suite ran.
-- Before this visit, this worktree still had stale `observe-slice-load` Hub leftovers from earlier work. This visit reaped them. Focused `shutdown-failure`, `pse`, and `stk` leftovers were absent after the proofs.
 
 ## Missing vault guidance discovered
 
