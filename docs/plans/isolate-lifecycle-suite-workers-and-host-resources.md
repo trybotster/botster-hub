@@ -4,15 +4,24 @@
 - Run: `run_1787013171_779998`, step `botster_stack_plan`
 - Target repository: **botster-hub** (`trybotster/botster-hub`)
 - Target id: `tgt_7e208a0c76a44980a83b63af976b1f22`
-- Base: `origin/main` `c1ce7e525aef080e10eee79a306482d5bfc66860`, merged into the plan branch as `25b7553` (revision 2 declared the prior main `66ca79c`; main then merged the unix-adapter sibling)
+- Base: `origin/main` `e864c3c8bbfb74068de21bd2ae9b843dbf0ccda7`, merged into the plan branch as `2b5c0f4` (base history: revision 2 declared `66ca79c`; revision 3 merged `c1ce7e5` as `25b7553`; revision 5 merged `e864c3c`)
 - Date: 2026-08-17
-- Revision 4. Addresses Plan Review `review_1787026289_143951`: finding_1787026289_192240 (the pre-run dirty check must detect foreign-worktree contamination through a bounded host-wide dev-artifact rule). Revision 3 addressed `review_1787015591_731805`; revision 2 addressed `review_1787014932_417965`.
+- Revision 5. Addresses Plan Review `review_1787026660_890328`: finding_1787026660_168050 (stale Core/Ghostty base) and finding_1787026660_235426 (checklist revision recording). Revision 4 addressed `review_1787026289_143951` (host-wide dev-artifact dirty rule); revision 3 addressed `review_1787015591_731805`; revision 2 addressed `review_1787014932_417965`.
 
 ## Fresh-base verification (revision 3)
 
 - `git fetch origin main` → `origin/main` = `c1ce7e525aef080e10eee79a306482d5bfc66860` ("Merge ticket: Hub tests: fix unix adapter unbound printf lifecycle flake" = sibling `ticket_1786937228_425608`, now **merged**).
 - Merged into the plan branch: commit `25b7553`, clean ort merge. Upstream delta touches only `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs` (+211/−15) plus that sibling's plan/report docs. No file this plan cites for line references changed (`sessions.rs`, `shutdown.rs`, `common.rs`, `cli.rs`, `process.rs`, `webrtc_*`, `package_fixtures.rs`, `src/entrypoint_supervisor.rs` are byte-identical to the revision 2 base), so all cited line references remain valid.
 - Baseline on the new base: after `cargo build --locked -p botster-core-daemon --bin botster-session-worker`, one `./test.sh --locked --test hub_daemon_lifecycle_test` run. Result recorded below (see "Baseline result").
+
+### Revision 5 base advance (origin/main `e864c3c`)
+
+- `git fetch origin main` → `origin/main` = `e864c3c8bbfb74068de21bd2ae9b843dbf0ccda7`; merged into the plan branch as `2b5c0f4` (clean ort merge).
+- The `c1ce7e5..e864c3c` delta is a coordinated pin roll plus one workflow fix, 26 lines total:
+  - Core pin: `botster-core`, `botster-core-daemon`, `botster-terminal-protocol`, `botster-core-test-support`, `botster-terminal-ghostty` roll from rev `fc541a5` to rev **`fd66efd`** (`Cargo.toml`, `Cargo.lock`, `crates/botster-hub-client/Cargo.toml`, `crates/botster-hub-test-support/*`). The Ghostty ABI rides the same Core rev roll.
+  - Provenance strings only in four test files (`webrtc_terminal_adapter.rs:986`, `unix_terminal_adapter.rs`, `package_event_plane.rs`, `session_projection_owner_loop.rs`): the embedded `locked_core=` SHA. **None of the lines this plan cites drifted** (`webrtc_terminal_adapter.rs` `:151`, `:165-175`, `:684`, `webrtc_proofs.rs:905`, and all `sessions.rs`/`shutdown.rs`/`common.rs`/`cli.rs`/`process.rs` citations are untouched).
+  - `.github/workflows/loaded-daemon-lifecycle.yml:157` now prebuilds `-p botster-core-daemon` — the prebuild drift this plan carried as a vault gap is **fixed upstream** and removed from the gap list.
+- Core `fd66efd` API verification for the S1 backstop: recorded under "Baseline result" after the prebuild against the new rev (the harness compiles `SessionRegistry`/`RegistryRecord`/`ProcessIdentity` from the pinned checkout, so a successful `--locked` prebuild plus source check is the verification).
 
 ## Playbooks and notes loaded
 
@@ -148,7 +157,7 @@ New focused tests beside the existing prior art (`shutdown.rs:417` proves the ti
 ## Ownership boundaries and cross-repo dependencies
 
 - All changes live in botster-hub: `tests/hub_daemon_lifecycle/*`, `tests/support/`, `script/`, and one bounded `src/entrypoint_supervisor.rs` naming change. Hub owns its harness and its supervisor policy.
-- `spawn_failed` budgets and worker readiness live in botster-core (pinned rev `fc541a5`); this plan treats them as fixed contracts. The registry-backed backstop only **reads** the on-disk `SessionRegistry` through the existing `botster-core-daemon` API; it does not change Core. If the S6 proofs show `ShutdownSession` success while a worker, PTY group, or socket survives, that is a Core session-lifecycle defect: stop and register a botster-core dependency ticket; do not patch around it here.
+- `spawn_failed` budgets and worker readiness live in botster-core (pinned rev `fd66efd` as of base `e864c3c`); this plan treats them as fixed contracts. The registry-backed backstop only **reads** the on-disk `SessionRegistry` through the existing `botster-core-daemon` API; it does not change Core. If the S6 proofs show `ShutdownSession` success while a worker, PTY group, or socket survives, that is a Core session-lifecycle defect: stop and register a botster-core dependency ticket; do not patch around it here.
 - `hub-test-support` (crate and npm 0.1.37 / conformance revision 43) is consumed read-only; no fixture-byte mutation under a published version.
 
 ## Runtime-teardown lens answers
@@ -239,6 +248,12 @@ Recorded from the revision 3 baseline run on merge commit `25b7553` (origin/main
 - Host evidence captured during the run (04:02:52Z): load average `{22.54 31.30 53.28}` (earlier `{33.50 34.09 55.39}`), and **226 botster-role processes host-wide**, attributed by path: 73 from the ambient `/Users/jasonconigliari/Projects/botster-hub` checkout, 64 from worktree `ticket_1786661010_198387`, 38 from `ticket_1786661008_634435`, 15 from `ticket_1786937228_425608`, 11 from `ticket_1786977409_499180`, 10+8+2+2 from four further ticket worktrees — and only 2–4 from this worktree. One leftover PTY producer shell carried a data-dir nanos stamp from 2026-08-11.
 - Classification under this plan's own S4/S5 rule: **`environment_dirty`** — every one of the 222-224 foreign leftovers ran from a `<worktree>/target/debug/` or ambient `Projects/botster-hub/target/debug/` binary or carried a `/tmp/bh-` / `botster-hub-test-data` data root, so the host-wide dev-artifact predicate (S4) flags them all, while the 5 installed-prefix processes under `~/.local/share` are exempt as valid services. The pre-run refusal would therefore have stopped this run before it started. The run is recorded as invalid suite-environment evidence (the same disposition the merged sibling used for its "Run 4"), and it is direct live proof of the ticket's failure class: leftover workers from prior runs across other worktrees starving the current suite.
 - Post-stop hygiene: the suite tree (runner → `test.sh` → cargo → test binary) was TERM/KILL-stopped; a census confirmed **no live survivor and no zombie attributable to this worktree's run** afterward.
+### Revision 5 addendum (base `e864c3c`, merge `2b5c0f4`)
+
+- Session-worker prebuild rerun on the new base: `cargo build --locked -p botster-core-daemon --bin botster-session-worker` compiled `botster-core-daemon` from rev `fd66efd` and finished cleanly in 1 m 09 s (exit 0 at 2026-08-18T04:20:19Z).
+- Core `fd66efd` API verification for the S1 backstop: the pinned checkout carries `ProcessIdentity` (`crates/botster-core/src/runtime/mod.rs:136`), `RegistryRecord` with the `running` constructor (`crates/botster-core-daemon/src/registry.rs:29,65`), and `SessionRegistry::save` (`registry.rs:130,154`) — the registry-backed identity design is unchanged by the pin roll.
+- Baseline disposition on the new base: **dirty-lane refusal recorded instead of another starved suite run** (per Plan Review's stated alternative). The host-wide dev-artifact scan at 2026-08-18T04:19:16Z flagged **231 dev-artifact rows** under the same foreign worktrees as the revision 3 census (72 ambient `Projects/botster-hub`, 64 `ticket_1786661010_198387`, 38 `ticket_1786661008_634435`, 15 `ticket_1786937228_425608`, 11 `ticket_1786977409_499180`, remainder across further worktrees) and left **26 role-named rows exempt** (no dev-artifact segment: installed/legacy services), at load average `{18.68 26.33 35.23}`. The lane is still dirty, so under this plan's own rule the suite must not run; the earlier starved-run record stands as the load evidence.
+- Capture-method note for Implement: the quick evidence scan matched role names as substrings, which also matched two rows whose argv merely contained this worktree's `...-botster-hub-...` path; the census implementation must match roles by `comm`/basename (as `script/process-census` already does), which removes that noise. The required negative self-test ("`botster` mention without role name + dev-artifact segment") locks this in.
 - Consequence for acceptance: the exclusive final smoke (acceptance check 7) must run through `script/run-lifecycle-suite`, whose host-wide pre-run dirty check makes this contamination a first-class refusal instead of a multi-day starved run. **Clean-lane definition:** the final smoke requires the host-wide dev-artifact scan green before the suite starts; the lane is obtained by the operator/orchestrator stopping the flagged foreign dev-artifact processes (they are build/test artifacts by construction, never valid services) — the wrapper itself only refuses and lists them, it never kills a non-owned process. A clean-host exclusive baseline is therefore deliverable evidence of Implement, not a precondition this Plan can obtain on the currently contaminated shared host.
 
 ## Vault gaps worth capturing
@@ -248,4 +263,5 @@ Recorded from the revision 3 baseline run on merge commit `25b7553` (origin/main
 - Bind-and-drop ephemeral port reservation is a TOCTOU that mimics the product's occupied-port failure (new gotcha).
 - Reaping helpers that panic inside `Drop` convert one test failure into a suite-wide `SIGABRT` (new gotcha).
 - Ambiguous timeout errnos (`EAGAIN`/`ETIMEDOUT`) are not host-exhaustion evidence without a same-operation causal probe (candidate after Implement proves the classifier).
-- `loaded-daemon-lifecycle.yml:157` prebuilds `-p botster-core` while every other site builds `-p botster-core-daemon` (drift; follow-up candidate).
+- Exact-path survivor censuses cannot see foreign-worktree dev artifacts; detection needs a build-output/harness-root path predicate with comm-based role matching (candidate after Implement proves the census mode).
+- ~~loaded-daemon-lifecycle.yml prebuild drift~~ — fixed upstream at base `e864c3c` (workflow now builds `-p botster-core-daemon`); no capture needed.
