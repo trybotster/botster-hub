@@ -13,6 +13,8 @@ Revision note (Plan Review `review_1787014361_115204`): this revision addresses 
 
 Revision note (orchestrator option 3, Implement): a Hub parent-wrapper cannot satisfy Core welcome `worker_pid` / readiness identity, so Hub W1/W2 wrapper tests are removed rather than ignored. Cross-repo mechanism proof is Core `d981bb03` tests `drain_output_delivers_process_exited_while_worker_holds_stdout_open` and `drain_output_delivers_process_exited_when_worker_exits_nonzero`. Hub focused contract proof is one held-producer WebRTC exact-bytes path and one Unix cross-connection path with explicit attach, print-release, byte receipt, exit-release, and `process_exit`. Do not require five idempotency rounds or a full lifecycle suite. Gates are focused tests, units, fmt, and clippy.
 
+Revision note (`review_1787034725_875591`): closed Core `ticket_1787015956_494734` at pin `d981bb03` regresses repeated WebRTC live-output rounds (`external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup`). Hub diagnosed Core-side writer-barrier/ProcessExited isolation, kept the pin, and registered a second Core dependency: `ticket_1787034922_646556` / `dependency_1787034941_200828` / run `run_1787034943_217745`. Do not roll the pin back to `fd66efd`. After that Core ticket closes, this run repins forward to the new Core main merge and reruns every live proof, including the idempotent-cleanup test.
+
 ## Target repository and target_id
 
 - Target repository: `botster-hub` (`trybotster/botster-hub`).
