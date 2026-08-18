@@ -13,7 +13,7 @@
 | Core dependency | `ticket_1787015956_494734` / `dependency_1787015963_708930` closed |
 | Core pin | `d981bb03` (was `fc541a5`); recorded Rule B repin |
 | Hub main integrated | `c1ce7e5` via merge commit `b117d0d` |
-| Review requested | no; pin and focused proofs are in; wrapper W1/W2 still cannot spawn |
+| Review requested | no; pin and focused proofs are in; wrapper W1/W2 still cannot spawn; idempotency tighten is not restored |
 
 ## Repository playbook and other playbooks/notes applied
 
@@ -146,6 +146,8 @@ The Hub parent-wrapper still cannot spawn. After the pin, `unix_shutdown_session
 
 No full lifecycle suite ran after the pin.
 
+After the pin, the WebRTC exact-bytes test calls blind `ShutdownSession` and uses `assert_shutdown_strict_natural_exit`. The Unix cross-connection test now uses the bound attach path from `unix_adapter_bound_printf_stream_attach_delivers_process_exit`: default Hello spawn, unix-adapter Attach and Drain, release file, then a post-printf `sleep 1` so the adapter stays attached while Core emits `process_exit`. That sleep is not a ShutdownSession deadline.
+
 ## Tests and downstream proof run
 
 All commands used `./test.sh` except the documented worker prebuild and the fmt/clippy gates.
@@ -167,6 +169,10 @@ All commands used `./test.sh` except the documented worker prebuild and the fmt/
 | Post-pin recover units | `./test.sh --locked --lib recover_` | 5 passed |
 | Post-pin focused natural-exit | `./test.sh --locked --test hub_daemon_lifecycle_test -- --exact unix_shutdown_session_from_another_connection_classifies_attached_exit external_hub_webrtc_live_output_preserves_exact_bytes` | 2 passed in 8.21s |
 | Post-pin ignored W1 Unix | `./test.sh --locked --test hub_daemon_lifecycle_test -- --ignored --exact unix_shutdown_session_after_w1_delayed_worker_reap_is_idempotent` | fail: Spawn `OperatorError`, not `Spawned` |
+| Post-pin blind exact-bytes | `./test.sh --locked --test hub_daemon_lifecycle_test -- --exact external_hub_webrtc_live_output_preserves_exact_bytes` | pass in 5.25s after restore |
+| Post-pin Unix bound-path | `./test.sh --locked --test hub_daemon_lifecycle_test -- --exact unix_shutdown_session_from_another_connection_classifies_attached_exit` | pass in 2.44s after bound attach + post-printf sleep |
+| Incoming unbound printf on pin | `unix_adapter_unbound_printf_stream_attach_completes` | fail: ReadScreen empty; not absorbed |
+| Tightened idempotency | `external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup` | later rounds missed live bytes; tighten reverted |
 
 Production entry point: Unix/WebRTC `ShutdownSession` still enters `src/daemon_transport.rs` at the `DaemonRequest::ShutdownSession` arm, then `classify_shutdown_session`, Core `shutdown_session`, and `recover_after_core_shutdown_error`. The new recover path is that production recover function. Classify `Ok(Active)` plus a real Core error is unchanged.
 
@@ -177,7 +183,8 @@ Every lens from the approved plan remains in force. No lens was dropped to infor
 ## Unverified behavior or residual risk
 
 - Hub wrapper W1/W2 tests still cannot spawn. Core now owns those mechanism windows.
-- Blind exact-bytes and tightened idempotency oracles are not restored on this pin commit.
+- Blind exact-bytes is restored. The 5-round idempotency tighten is not restored; later rounds missed live bytes before ShutdownSession.
+- Incoming `unix_adapter_unbound_printf_stream_attach_completes` returned empty ReadScreen on this pin. That test is not this ticket.
 - Recover fallback still covers only classify `Err` after a Core shutdown error.
 - Ready-spawn suite co-flake stays owned by `ticket_1786938984_190098`.
 
