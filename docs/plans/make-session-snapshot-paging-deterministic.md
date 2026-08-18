@@ -58,6 +58,17 @@ This revision:
 
 The existing separator-overflow test keeps `DAEMON_MAX_FRAME_BYTES` capacity and remains reachable: each half-megabyte row fits the predicate individually, and the comma overflow is still caught by the cumulative frame-limit check.
 
+## Revision 5 (Review finding_1787095524_314470)
+
+Review `review_1787095524_288549` found that the remaining-byte check ran only inside `rows_after`. An empty sealed projection never entered the loop, so `cut` stayed `Complete` and `bytes` became the envelope. The owner loop can pass any remaining budget below the envelope after earlier subscribers consume the turn. The assembler then sent the empty Snapshot and reported more bytes than the remaining `SESSION_DELIVERY_MAX_BYTES` budget.
+
+This revision:
+
+1. Adds a pre-iteration `ByteBudget` cut when `envelope > remaining_byte_budget`, so the empty-projection send path honors the envelope in the turn budget.
+2. Adds the empty-projection acceptance test: remaining `envelope - 1` yields without sending; a later full-budget call sends exactly one empty Snapshot.
+
+This completes the locked envelope-admission rule. It does not change ownership, budgets, or wire shape.
+
 ## Repository playbook loaded
 
 - [[botster-hub-playbook]]
@@ -229,15 +240,16 @@ where `separator_bytes` follows the existing `snapshot_separator_bytes` semantic
 `take_snapshot_item_page` must:
 
 1. Accept from the caller: the assembled item count, the assembled item bytes, the exact envelope bytes, `max_items`, the remaining turn byte budget, the full fresh-page byte capacity, and `max_elapsed`. The capacity is the byte budget a fresh call receives; production callers pass `SESSION_DELIVERY_MAX_BYTES`, and tests may pass a larger value such as `DAEMON_MAX_FRAME_BYTES`.
-2. Walk `rows_after` in the existing id order.
-3. Encode each candidate item once with `serde_json::to_vec`. Keep the `Value` for the page; keep the length for the charge. No `items.clone()`. No trial `DaemonEntityFrame::Snapshot` encode.
-4. Classify, in this order, per candidate:
+2. Before walking rows, return an empty `ByteBudget` cut when `envelope > remaining_byte_budget`. An empty sealed projection never enters `rows_after`, so this check is the only envelope admission for a complete zero-row snapshot. (Revision 5 / `finding_1787095524_314470`.)
+3. Walk `rows_after` in the existing id order.
+4. Encode each candidate item once with `serde_json::to_vec`. Keep the `Value` for the page; keep the length for the charge. No `items.clone()`. No trial `DaemonEntityFrame::Snapshot` encode.
+5. Classify, in this order, per candidate:
    - `ItemBudget` cut when accepted items reach `max_items`.
    - `Elapsed` cut when `started.elapsed() >= max_elapsed`.
    - `OversizedRow` when the candidate cannot fit even a fresh full-capacity page at its actual frame position: `envelope + encoded_item_len + separator_bytes(assembled_item_count + accepted_count, 1) > capacity`. The separator term is the same one `candidate_charge` uses, so the no-progress predicate charges exactly what acceptance would charge. This predicate uses only the row, the envelope, the candidate's deterministic frame position, and the capacity parameter — never the remaining budget or elapsed time. Callers pass constants, so closure stays a function of data and deterministic assembly state, not scheduling. (Revision 4: the separator term was missing; without it a later-positioned row at the exact `envelope + item == capacity` boundary passes the OversizedRow check but can never pass the ByteBudget check, yielding an empty `ByteBudget` cut every turn forever.)
    - `ByteBudget` cut when `envelope + page_charge + candidate_charge` exceeds the remaining turn byte budget. The cumulative frame-limit check stays at the assembly level — the page loop only enforces the turn budget.
    - Otherwise accept: push the value, add `candidate_charge` to `page_charge`, record `last_id`.
-5. Return the accepted values, the reported page byte total `envelope + page_charge`, the item-and-separator charge `page_charge`, `last_id`, and the typed cut.
+6. Return the accepted values, the reported page byte total `envelope + page_charge`, the item-and-separator charge `page_charge`, `last_id`, and the typed cut.
 
 `continue_session_snapshot_assembly` must:
 
@@ -284,6 +296,7 @@ All focused tests drive the production functions in `src/daemon_entity_subscript
 | --- | --- |
 | Item budget | `max_items = 1` over a two-row projection returns one item and an `ItemBudget` cut; a later call resumes after `last_id` and completes. |
 | Byte budget | With measured `envelope` and first-candidate charge `c1`: a remaining budget of `envelope + c1` accepts one item and cuts `ByteBudget` before the second; a remaining budget of `envelope + c1 - 1` accepts zero items and returns `Continue { more: true }`, not a close; a remaining budget of `c1` alone (no envelope headroom) also accepts zero items. The last case is the envelope-admission boundary: envelope inclusion is what flips the decision. |
+| Empty snapshot envelope (Revision 5) | An empty sealed projection with remaining `envelope - 1` yields `Continue { more: true }`, sets `needs_delivery`, and sends no frame. A later full-budget call sends exactly one empty Snapshot and leaves `DeliveryPhase::Removes`. |
 | Separator | `separators_close_when_item_bytes_fit_but_commas_do_not` stays green against the rewrite. The test passes `DAEMON_MAX_FRAME_BYTES` as both the remaining budget and the fresh-page capacity, so its half-megabyte rows are admitted per page and never classify as `OversizedRow`; the comma overflow is caught by the cumulative frame-limit check and closes oversized. |
 | Envelope | The charge uses the real envelope: with a nonzero `next_seq` and a set `resync_reason`, a page that fits under the stub envelope but not the real one is cut/closed correctly. Assert the envelope value equals `snapshot_envelope_bytes` for the same state. |
 | Oversized row | A row with `envelope + item + positional separator > capacity` closes with one `entity_provider_frame_too_large` error frame and today's state transitions; the same row is accepted when the test passes a larger capacity, proving the predicate uses the capacity parameter. Production capacity is `SESSION_DELIVERY_MAX_BYTES`. `oversized_first_snapshot_closes_the_subscription` converts to `Duration::MAX`. |
