@@ -15,6 +15,8 @@ Revision note (orchestrator option 3, Implement): a Hub parent-wrapper cannot sa
 
 Revision note (`review_1787034725_875591`): closed Core `ticket_1787015956_494734` at pin `d981bb03` regressed repeated WebRTC live-output rounds. Hub kept that pin and registered `ticket_1787034922_646556`. That Core ticket is now closed. Hub pins Core main `302c7f7b61f3970a0151b8c6646fc21ae7bd6c67` and reruns every live proof, including `external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup`. Do not roll the pin back to `fd66efd` or `d981bb03`.
 
+Revision note (`review_1787073705_186581`): integrate current Hub main `952032d` and keep Core pin `302c7f7`. Resolve `cli.rs` and `session_fixtures.rs` onto the lifecycle isolation harness. Do not run the full lifecycle suite.
+
 ## Target repository and target_id
 
 - Target repository: `botster-hub` (`trybotster/botster-hub`).
