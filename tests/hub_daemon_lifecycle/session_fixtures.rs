@@ -370,56 +370,6 @@ pub(crate) fn start_isolated_live_output_hub_with_env(
     start_isolated_live_output_hub_with_worker(name, session_worker_binary_path(), extra_env)
 }
 
-/// Controlled worker wrapper variants for deterministic natural-exit windows.
-///
-/// W1 keeps the worker process unreaped past Core's 2-second shutdown deadline
-/// after the real worker exits successfully. W2 exits non-zero after the real
-/// worker succeeds so `try_wait().success()` permanently suppresses ProcessExited.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum SessionWorkerWrapperKind {
-    DelayedReap,
-    NonSuccessExit,
-}
-
-pub(crate) fn write_session_worker_wrapper(kind: SessionWorkerWrapperKind) -> PathBuf {
-    let real_worker = session_worker_binary_path();
-    assert!(
-        real_worker.is_file(),
-        "real botster-session-worker must exist at {}",
-        real_worker.display()
-    );
-    let label = match kind {
-        SessionWorkerWrapperKind::DelayedReap => "w1-delay",
-        SessionWorkerWrapperKind::NonSuccessExit => "w2-nonsuccess",
-    };
-    let wrapper_dir = unique_test_dir(&format!("session-worker-wrapper-{label}"));
-    fs::create_dir_all(&wrapper_dir).expect("create session worker wrapper dir");
-    let wrapper_path = wrapper_dir.join("botster-session-worker");
-    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/hub_daemon_lifecycle/session_worker_wrapper.py");
-    fs::copy(&source, &wrapper_path).expect("copy session worker wrapper");
-    let mut permissions = fs::metadata(&wrapper_path)
-        .expect("wrapper metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&wrapper_path, permissions).expect("chmod wrapper");
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let canonical = wrapper_path
-        .canonicalize()
-        .unwrap_or_else(|_| wrapper_path.clone());
-    assert!(
-        canonical.starts_with(root),
-        "wrapper must stay under the hub worktree for census helpers: {}",
-        canonical.display()
-    );
-    assert_eq!(
-        canonical.file_name().and_then(|name| name.to_str()),
-        Some("botster-session-worker"),
-        "wrapper argv0 filename must match session-worker census"
-    );
-    canonical
-}
-
 pub(crate) fn start_isolated_live_output_hub_with_worker(
     name: &str,
     session_worker_bin: impl Into<PathBuf>,
@@ -436,30 +386,6 @@ pub(crate) fn start_isolated_live_output_hub_with_worker(
     builder
         .start()
         .expect("start isolated hub with explicit worker path")
-}
-
-pub(crate) fn start_isolated_live_output_hub_with_wrapper(
-    name: &str,
-    kind: SessionWorkerWrapperKind,
-) -> botster_hub_test_support::IsolatedHub {
-    let wrapper = write_session_worker_wrapper(kind);
-    let kind_label = match kind {
-        SessionWorkerWrapperKind::DelayedReap => "w1",
-        SessionWorkerWrapperKind::NonSuccessExit => "w2",
-    };
-    let real_worker = session_worker_binary_path()
-        .into_os_string()
-        .into_string()
-        .expect("real worker path utf8");
-    start_isolated_live_output_hub_with_worker(
-        name,
-        wrapper,
-        &[
-            ("BOTSTER_HUB_TEST_REAL_SESSION_WORKER", real_worker.as_str()),
-            ("BOTSTER_HUB_TEST_WORKER_WRAPPER_KIND", kind_label),
-            ("BOTSTER_HUB_TEST_WORKER_WRAPPER_DELAY_SECS", "3"),
-        ],
-    )
 }
 
 pub(crate) fn assert_shutdown_strict_natural_exit(

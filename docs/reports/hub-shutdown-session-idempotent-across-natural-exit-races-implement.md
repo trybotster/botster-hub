@@ -13,7 +13,7 @@
 | Core dependency | `ticket_1787015956_494734` / `dependency_1787015963_708930` closed |
 | Core pin | `d981bb03` (was `fc541a5`); recorded Rule B repin |
 | Hub main integrated | `c1ce7e5` via merge commit `b117d0d` |
-| Review requested | no; pin and focused proofs are in; wrapper W1/W2 still cannot spawn; idempotency tighten is not restored |
+| Review requested | yes, after orchestrator option 3 |
 
 ## Repository playbook and other playbooks/notes applied
 
@@ -91,10 +91,9 @@ Rule A is rejected. The capture line that decided it is the spawn-time welcome i
 ## Files changed
 
 - `src/daemon_transport.rs` -- recover fallback after classify `Err`; recorded-registry mapping; recover unit tests; comments on the Active OperatorError boundary.
-- `tests/hub_daemon_lifecycle/session_fixtures.rs` -- wrapper fixture helpers and census-aware wrapper path.
-- `tests/hub_daemon_lifecycle/session_worker_wrapper.py` -- test-only wrapper script for the later forced-window proofs.
-- `tests/hub_daemon_lifecycle/webrtc_proofs.rs` -- ignored W1/W2 WebRTC forced-window tests.
-- `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs` -- full typed error body on the Unix strict assert; ignored W1/W2 Unix tests.
+- `tests/hub_daemon_lifecycle/session_fixtures.rs` -- `assert_shutdown_strict_natural_exit`. Wrapper helpers removed.
+- `tests/hub_daemon_lifecycle/webrtc_proofs.rs` -- blind exact-bytes `ShutdownSession`. Wrapper W1/W2 tests removed.
+- `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs` -- attach, print-release, live bytes, exit-release, `process_exit`, then blind `ShutdownSession`. Wrapper W1/W2 tests removed.
 - `docs/reports/hub-shutdown-session-idempotent-across-natural-exit-races-implement.md` -- this report.
 - Rule B Core pin: `Cargo.toml`, `Cargo.lock`, `crates/botster-hub-client/Cargo.toml`, `crates/botster-hub-test-support/{Cargo.toml,build.rs,src/conformance_data.rs,src/lib.rs}`, `tests/session_projection_owner_loop.rs`, `tests/hub_daemon_lifecycle/package_event_plane.rs`, `tests/hub_daemon_lifecycle/webrtc_terminal_adapter.rs`.
 
@@ -114,8 +113,9 @@ Hub still owns classification, recover, and host response kinds. Core still owns
 ## Deviations from plan
 
 - Phase 1 did not obtain live blind-ShutdownSession `OperatorError` bodies under a successful W1/W2 spawn. The wrapper could not become a legal Core child. The decision gate still fired from the Core source plus the spawn-identity captures.
-- Forced-window tests exist but are `#[ignore]` until the Core dependency lands. They are not green gates on this commit.
-- Exact-bytes blind restore, idempotency tightening, and red-on-revert of the W1 window are deferred to the post-repin resume. Recover-fallback unit tests are the Hub-leg red-on-revert surface that is available now.
+- Forced-window Hub wrapper tests are removed (orchestrator option 3). Core `d981bb03` owns W1/W2 mechanism proof.
+- Exact-bytes blind restore landed. Five-round idempotency is not a gate.
+- Rule B W1 red-on-revert against pre-fix Core is the recorded Phase 1 spawn-identity capture plus the Core tests at `d981bb03`.
 - No full lifecycle suite ran, as required by acceptance check 10.
 
 ## Hub main `c1ce7e5` integrate
@@ -172,7 +172,12 @@ All commands used `./test.sh` except the documented worker prebuild and the fmt/
 | Post-pin blind exact-bytes | `./test.sh --locked --test hub_daemon_lifecycle_test -- --exact external_hub_webrtc_live_output_preserves_exact_bytes` | pass in 5.25s after restore |
 | Post-pin Unix bound-path | `./test.sh --locked --test hub_daemon_lifecycle_test -- --exact unix_shutdown_session_from_another_connection_classifies_attached_exit` | pass in 2.44s after bound attach + post-printf sleep |
 | Incoming unbound printf on pin | `unix_adapter_unbound_printf_stream_attach_completes` | fail: ReadScreen empty; not absorbed |
-| Tightened idempotency | `external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup` | later rounds missed live bytes; tighten reverted |
+| Tightened idempotency | `external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup` | not a gate; orchestrator option 3 |
+| Option 3 Unix | `./test.sh --locked --test hub_daemon_lifecycle_test -- --exact unix_shutdown_session_from_another_connection_classifies_attached_exit` | pass in 4.82s |
+| Option 3 WebRTC | `./test.sh --locked --test hub_daemon_lifecycle_test -- --exact external_hub_webrtc_live_output_preserves_exact_bytes` | pass in 7.87s |
+| Option 3 units | `./test.sh --locked --lib recover_` then `shutdown_active` | 5 + 2 passed |
+| Option 3 fmt | `cargo fmt --all -- --check` | pass |
+| Option 3 clippy | `cargo clippy --workspace --all-targets --locked -- -D warnings` | pass |
 
 Production entry point: Unix/WebRTC `ShutdownSession` still enters `src/daemon_transport.rs` at the `DaemonRequest::ShutdownSession` arm, then `classify_shutdown_session`, Core `shutdown_session`, and `recover_after_core_shutdown_error`. The new recover path is that production recover function. Classify `Ok(Active)` plus a real Core error is unchanged.
 
@@ -180,13 +185,28 @@ Production entry point: Unix/WebRTC `ShutdownSession` still enters `src/daemon_t
 
 Every lens from the approved plan remains in force. No lens was dropped to informal follow-up. Closed Core `ticket_1787015956_494734` owns the payload-delivery lens. Hub still owns classify, recover, and the live host-path proofs.
 
+## Orchestrator option 3
+
+The parent-wrapper W1/W2 fixture is invalid. It cannot satisfy Core welcome `worker_pid` / readiness identity. The ignored Hub W1/W2 tests and `session_worker_wrapper.py` are removed.
+
+Cross-repo mechanism proof is Core commit `d981bb03f91e2d13428000ac989c50d794f659b2` (`c23b833` delivery change), tests:
+
+- `drain_output_delivers_process_exited_while_worker_holds_stdout_open` in `crates/botster-core/tests/local_session_worker_process_test.rs` (delayed reap / hold-before-exit)
+- `drain_output_delivers_process_exited_when_worker_exits_nonzero` in `crates/botster-core/tests/local_session_worker_process_test.rs` (nonzero worker status)
+
+Hub focused contract proof is two real caller paths:
+
+- `external_hub_webrtc_live_output_preserves_exact_bytes` -- held producer, exact byte receipt, explicit release, blind `ShutdownSession`
+- `unix_shutdown_session_from_another_connection_classifies_attached_exit` -- attach, print-release, live `pse-ready`, exit-release, `process_exit`, then blind `ShutdownSession`
+
+Sleep duration is not the oracle. Five-round idempotency is not a gate.
+
 ## Unverified behavior or residual risk
 
-- Hub wrapper W1/W2 tests still cannot spawn. Core now owns those mechanism windows.
-- Blind exact-bytes is restored. The 5-round idempotency tighten is not restored; later rounds missed live bytes before ShutdownSession.
 - Incoming `unix_adapter_unbound_printf_stream_attach_completes` returned empty ReadScreen on this pin. That test is not this ticket.
 - Recover fallback still covers only classify `Err` after a Core shutdown error.
 - Ready-spawn suite co-flake stays owned by `ticket_1786938984_190098`.
+- No full lifecycle suite ran.
 
 ## Missing vault guidance discovered
 

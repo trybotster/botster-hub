@@ -1865,15 +1865,17 @@ fn unix_shutdown_session_from_another_connection_classifies_attached_exit() {
     let endpoint = hub.endpoint().clone();
     let session_id = "pse-session";
     let subscription_id = "pse-sub";
-    let release_path = hub.data_dir().join("pse-release");
+    let print_release = hub.data_dir().join("pse-print");
+    let exit_release = hub.data_dir().join("pse-exit");
     let mut connection =
         botster_hub_client::DaemonConnection::connect(&endpoint).expect("default hello");
     let spawned = connection
         .request(&botster_hub_client::DaemonRequest::Spawn {
             session_id: session_id.to_string(),
             command: format!(
-                "while [ ! -e '{}' ]; do sleep 0.01; done; printf 'pse-ready\\n'; sleep 1; exit 0",
-                release_path.display()
+                "while [ ! -e '{}' ]; do sleep 0.01; done; printf 'pse-ready\\n'; while [ ! -e '{}' ]; do sleep 0.01; done; exit 0",
+                print_release.display(),
+                exit_release.display()
             ),
         })
         .expect("spawn held printf");
@@ -1914,16 +1916,11 @@ fn unix_shutdown_session_from_another_connection_classifies_attached_exit() {
         "host Drain must not return terminal bodies: {:?}",
         primed.events
     );
-    fs::write(&release_path, b"go").expect("release Unix natural-exit printf");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if unix_envelope_contains_live_bytes(&envelopes, "pse-ready")
-            || envelopes.iter().any(|envelope| {
-                unix_envelope_is_process_exit(envelope, session_id, subscription_id)
-            })
-        {
-            break;
-        }
+    fs::write(&print_release, b"go").expect("release Unix natural-exit printf");
+    let print_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < print_deadline
+        && !unix_envelope_contains_live_bytes(&envelopes, "pse-ready")
+    {
         let drain = request_skipping_envelopes(
             &mut stream,
             &mut reader,
@@ -1938,11 +1935,34 @@ fn unix_shutdown_session_from_another_connection_classifies_attached_exit() {
         thread::sleep(Duration::from_millis(25));
     }
     assert!(
-        unix_envelope_contains_live_bytes(&envelopes, "pse-ready")
-            || envelopes.iter().any(|envelope| {
-                unix_envelope_is_process_exit(envelope, session_id, subscription_id)
-            }),
-        "attached adapter must see live output or process_exit before ShutdownSession: {envelopes:?}"
+        unix_envelope_contains_live_bytes(&envelopes, "pse-ready"),
+        "attached adapter must see live output before process exit: {envelopes:?}"
+    );
+    fs::write(&exit_release, b"go").expect("release Unix natural-exit process");
+    let exit_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < exit_deadline
+        && !envelopes
+            .iter()
+            .any(|envelope| unix_envelope_is_process_exit(envelope, session_id, subscription_id))
+    {
+        let drain = request_skipping_envelopes(
+            &mut stream,
+            &mut reader,
+            &botster_hub_client::DaemonRequest::drain_subscription(session_id, subscription_id),
+            &mut envelopes,
+        );
+        assert!(
+            drain.events.is_empty(),
+            "host Drain must not return terminal bodies: {:?}",
+            drain.events
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        envelopes
+            .iter()
+            .any(|envelope| unix_envelope_is_process_exit(envelope, session_id, subscription_id)),
+        "attached adapter must see process_exit before ShutdownSession: {envelopes:?}"
     );
 
     let shutdown = botster_hub_client::request(
@@ -1952,14 +1972,10 @@ fn unix_shutdown_session_from_another_connection_classifies_attached_exit() {
         },
     )
     .expect("shutdown from a separate connection");
-    assert_ne!(
-        shutdown.kind,
-        botster_hub_client::DaemonResponseKind::OperatorError,
-        "Unix ShutdownSession after attached natural exit must not return OperatorError, got kind={:?} error.code={:?} error.operation={:?} error.message={:?}",
-        shutdown.kind,
-        shutdown.error.as_ref().map(|error| &error.code),
-        shutdown.error.as_ref().map(|error| &error.operation),
-        shutdown.error.as_ref().map(|error| &error.message)
+    assert_shutdown_strict_natural_exit(
+        &shutdown,
+        session_id,
+        "Unix cross-connection ShutdownSession after attached natural exit",
     );
 
     let listed =
@@ -1996,151 +2012,6 @@ fn unix_shutdown_session_from_another_connection_classifies_attached_exit() {
         drain.events
     );
     hub.shutdown().expect("shutdown isolated hub");
-}
-
-fn unix_blind_shutdown_after_finite_printf(
-    hub_name: &str,
-    session_id: &str,
-    wrapper: SessionWorkerWrapperKind,
-) -> (
-    botster_hub_client::DaemonResponse,
-    botster_hub_client::DaemonResponse,
-    botster_hub_test_support::IsolatedHub,
-) {
-    let hub = start_isolated_live_output_hub_with_wrapper(hub_name, wrapper);
-    let endpoint = hub.endpoint().clone();
-    let subscription_id = format!("{session_id}-sub");
-    let release_path = hub.data_dir().join(format!("{session_id}-release"));
-    let (mut stream, mut reader) = unix_adapter_connection(&endpoint);
-    let mut envelopes = Vec::new();
-    let mut events = Vec::new();
-    spawn_and_bind(
-        &mut stream,
-        &mut reader,
-        session_id,
-        &subscription_id,
-        &format!(
-            "while [ ! -e '{}' ]; do sleep 0.01; done; printf 'wrapper-ready\\n'; exit 0",
-            release_path.display()
-        ),
-        &mut envelopes,
-        &mut events,
-    );
-    let primed = request_collecting_mux(
-        &mut stream,
-        &mut reader,
-        &botster_hub_client::DaemonRequest::drain_subscription(session_id, &subscription_id),
-        &mut envelopes,
-        &mut events,
-    );
-    assert!(
-        primed.events.is_empty(),
-        "host Drain must not return terminal bodies: {:?}",
-        primed.events
-    );
-    fs::write(&release_path, b"go").expect("release Unix wrapper printf");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline
-        && !unix_envelope_contains_live_bytes(&envelopes, "wrapper-ready")
-    {
-        stream
-            .set_read_timeout(Some(Duration::from_millis(50)))
-            .expect("read timeout");
-        match botster_hub_client::read_unix_mux_frame_from_reader(&mut reader) {
-            Ok(botster_hub_client::DaemonUnixMuxFrame::Terminal(envelope)) => {
-                envelopes.push(envelope);
-            }
-            Ok(botster_hub_client::DaemonUnixMuxFrame::Event(event)) => events.push(event),
-            Ok(botster_hub_client::DaemonUnixMuxFrame::Response(_)) => {}
-            Err(_) => {
-                let drain = request_collecting_mux(
-                    &mut stream,
-                    &mut reader,
-                    &botster_hub_client::DaemonRequest::drain_subscription(
-                        session_id,
-                        &subscription_id,
-                    ),
-                    &mut envelopes,
-                    &mut events,
-                );
-                assert!(
-                    drain.events.is_empty(),
-                    "host Drain must not return terminal bodies: {:?}",
-                    drain.events
-                );
-            }
-        }
-    }
-    stream.set_read_timeout(None).expect("clear read timeout");
-    assert!(
-        unix_envelope_contains_live_bytes(&envelopes, "wrapper-ready"),
-        "attached adapter must see live output before ShutdownSession: {envelopes:?}"
-    );
-
-    let shutdown = botster_hub_client::request(
-        &endpoint,
-        botster_hub_client::DaemonRequest::ShutdownSession {
-            session_id: session_id.to_string(),
-        },
-    )
-    .expect("blind ShutdownSession from a separate connection");
-    let listed =
-        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::ListSessions)
-            .expect("list after wrapper-window shutdown");
-    (shutdown, listed, hub)
-}
-
-#[test]
-#[ignore = "blocked on ticket_1787015956_494734 Core ProcessExited delivery"]
-fn unix_shutdown_session_after_w1_delayed_worker_reap_is_idempotent() {
-    let _guard = daemon_test_guard();
-    let session_id = "unix-w1-session";
-    let (shutdown, listed, hub) = unix_blind_shutdown_after_finite_printf(
-        "unix-w1",
-        session_id,
-        SessionWorkerWrapperKind::DelayedReap,
-    );
-    eprintln!(
-        "PHASE1 W1 Unix shutdown kind={:?} error={:?} listed={:?}",
-        shutdown.kind, shutdown.error, listed.sessions
-    );
-    assert_shutdown_strict_natural_exit(&shutdown, session_id, "W1 Unix delayed reap");
-    let data_dir = hub.data_dir().clone();
-    hub.shutdown().expect("shutdown isolated hub");
-    reap_session_workers_for_data_dir(&data_dir)
-        .expect("W1 Unix hub shutdown must not leave worktree session workers");
-}
-
-#[test]
-#[ignore = "blocked on ticket_1787015956_494734 Core ProcessExited delivery"]
-fn unix_shutdown_session_after_w2_nonsuccess_worker_reaches_terminal() {
-    let _guard = daemon_test_guard();
-    let session_id = "unix-w2-session";
-    let (shutdown, listed, hub) = unix_blind_shutdown_after_finite_printf(
-        "unix-w2",
-        session_id,
-        SessionWorkerWrapperKind::NonSuccessExit,
-    );
-    eprintln!(
-        "PHASE1 W2 Unix shutdown kind={:?} error={:?} listed={:?}",
-        shutdown.kind, shutdown.error, listed.sessions
-    );
-    assert_shutdown_strict_natural_exit(&shutdown, session_id, "W2 Unix non-success worker");
-    assert!(
-        listed.sessions.iter().any(|session| {
-            session.session_id == session_id
-                && matches!(session.lifecycle.as_str(), "exited" | "stopping" | "failed")
-        }) || listed
-            .sessions
-            .iter()
-            .all(|session| session.session_id != session_id),
-        "W2 Unix must reach a terminal lifecycle on the control plane: {:?}",
-        listed.sessions
-    );
-    let data_dir = hub.data_dir().clone();
-    hub.shutdown().expect("shutdown isolated hub");
-    reap_session_workers_for_data_dir(&data_dir)
-        .expect("W2 Unix hub shutdown must not leave worktree session workers");
 }
 
 #[test]
