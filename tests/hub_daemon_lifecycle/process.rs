@@ -403,20 +403,31 @@ pub(crate) fn capture_new_session_workers_for_data_dir(
 ) -> Result<Vec<SessionWorkerProcessIdentity>, String> {
     let deadline = Instant::now() + Duration::from_secs(8);
     loop {
-        // Never adopt host-global "any new pid" — require this worktree's worker
-        // binary, then prefer data-dir attribution when present.
-        let live_ours: Vec<SessionWorkerProcessIdentity> = session_worker_process_identities()?
-            .into_iter()
-            .filter(|worker| {
-                !before_pids.contains(&worker.pid) && worker_belongs_to_data_dir(worker, data_dir)
-            })
-            .collect();
-        // Fail closed on kill-probe errors for candidate workers.
-        let mut live = Vec::new();
-        for worker in live_ours {
-            if process_is_alive_u32(worker.pid)? {
-                live.push(worker);
+        let mut live: Vec<SessionWorkerProcessIdentity> = Vec::new();
+        for identity in registry_backed_worker_identities(data_dir)? {
+            let Some(command_pid) = identity.pid else {
+                continue;
+            };
+            let Some(worker_pid) = worktree_session_worker_ancestor(command_pid) else {
+                continue;
+            };
+            if before_pids.contains(&worker_pid) {
+                continue;
             }
+            if live.iter().any(|worker| worker.pid == worker_pid) {
+                continue;
+            }
+            if !process_is_alive_u32(worker_pid)? {
+                continue;
+            }
+            let command = process_snapshot(worker_pid)
+                .map(|snapshot| snapshot.command)
+                .unwrap_or_default();
+            live.push(SessionWorkerProcessIdentity {
+                pid: worker_pid,
+                command,
+                shell_descendant_pids: Vec::new(),
+            });
         }
         if !live.is_empty() {
             // Refresh descendant trees after a short settle so the shell child is included.
@@ -455,7 +466,7 @@ pub(crate) fn capture_new_session_workers_for_data_dir(
         }
         if Instant::now() >= deadline {
             return Err(format!(
-                "timed out waiting for botster-session-worker + live shell descendant owned by data dir {}; worktree-wide adoption is disabled",
+                "timed out waiting for registry-backed botster-session-worker + live shell descendant under {}; argv data-dir matching is not an ownership oracle",
                 data_dir.display()
             ));
         }
