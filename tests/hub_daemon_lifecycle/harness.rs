@@ -368,56 +368,134 @@ pub(crate) fn try_terminate_and_reap_child(child: &mut Child) -> Result<String, 
 }
 
 pub(crate) fn collect_owned_session_processes(data_dir: &Path) -> Result<IdentityCapture, String> {
+    let registry = SessionRegistry::new(data_dir);
+    let records = registry.load_all().map_err(|error| {
+        format!(
+            "load session registry under {}: {error}",
+            data_dir.display()
+        )
+    })?;
     let mut capture = IdentityCapture::default();
-    for identity in registry_backed_worker_identities(data_dir)? {
-        let Some(command_pid) = identity.pid else {
-            capture.errors.push(format!(
-                "registry session {} has no process pid",
-                identity.session_id
-            ));
-            continue;
-        };
-        capture.owned.push_pid(command_pid);
-        match process_snapshot(command_pid) {
-            Some(snapshot) => capture.owned.push_pgid(snapshot.pgid),
-            None => capture.errors.push(format!(
-                "process snapshot missing for registered command {command_pid} session {}",
-                identity.session_id
-            )),
-        }
-        match worktree_session_worker_ancestor(command_pid) {
-            Some(worker_pid) => {
-                capture.owned.push_pid(worker_pid);
-                if let Some(snapshot) = process_snapshot(worker_pid) {
-                    capture.owned.push_pgid(snapshot.pgid);
-                } else {
-                    capture.errors.push(format!(
-                        "process snapshot missing for worker {worker_pid} session {}",
-                        identity.session_id
-                    ));
-                }
-                match worker_owned_descendant_pids(worker_pid) {
-                    Ok(descendants) => {
-                        for pid in descendants {
-                            capture.owned.push_pid(pid);
-                            if let Some(snapshot) = process_snapshot(pid) {
-                                capture.owned.push_pgid(snapshot.pgid);
-                            }
-                        }
-                    }
-                    Err(error) => capture.errors.push(format!(
-                        "descendant census failed for worker {worker_pid} session {}: {error}",
-                        identity.session_id
-                    )),
-                }
-            }
-            None => capture.errors.push(format!(
-                "unresolved worktree session-worker ancestor for command {command_pid} session {}",
-                identity.session_id
-            )),
-        }
+    for record in records {
+        collect_registry_record(&registry, record, &mut capture);
     }
     Ok(capture)
+}
+
+fn collect_registry_record(
+    registry: &SessionRegistry,
+    record: RegistryRecord,
+    capture: &mut IdentityCapture,
+) {
+    if matches!(record.state, RegistrySessionState::Exited) {
+        return;
+    }
+    let session_id = record.session_id.0.clone();
+    let Some(command_pid) = record.process.as_ref().and_then(|process| process.pid) else {
+        capture
+            .errors
+            .push(format!("registry session {session_id} has no process pid"));
+        return;
+    };
+    if let Some(snapshot) = process_snapshot(command_pid) {
+        capture.owned.push_pid(command_pid);
+        capture.owned.push_pgid(snapshot.pgid);
+        match worktree_session_worker_ancestor(command_pid) {
+            Some(worker_pid) => retain_verified_worker(capture, &session_id, worker_pid),
+            None => capture.errors.push(format!(
+                "unresolved worktree session-worker ancestor for command {command_pid} session {session_id}"
+            )),
+        }
+        return;
+    }
+    match reread_until_exited_or_bound(registry, &record.session_id) {
+        Ok(None) => {}
+        Ok(Some(latest)) if matches!(latest.state, RegistrySessionState::Exited) => {}
+        Ok(Some(latest)) => {
+            if let Some(worker_pid) = recovery_worker_pid(&latest) {
+                retain_recovery_worker(capture, &session_id, command_pid, worker_pid);
+            }
+        }
+        Err(error) => capture.errors.push(error),
+    }
+}
+
+fn retain_recovery_worker(
+    capture: &mut IdentityCapture,
+    session_id: &str,
+    command_pid: u32,
+    worker_pid: u32,
+) {
+    capture.owned.push_pid(command_pid);
+    capture.owned.push_pid(worker_pid);
+    if !process_exists(worker_pid) {
+        return;
+    }
+    if !worker_pid_matches_worktree_session_worker(worker_pid) {
+        capture.errors.push(format!(
+            "resolved worker {worker_pid} is live but unverifiable for session {session_id}"
+        ));
+        return;
+    }
+    retain_verified_worker(capture, session_id, worker_pid);
+}
+
+fn retain_verified_worker(capture: &mut IdentityCapture, session_id: &str, worker_pid: u32) {
+    capture.owned.push_pid(worker_pid);
+    if let Some(snapshot) = process_snapshot(worker_pid) {
+        capture.owned.push_pgid(snapshot.pgid);
+    } else if process_exists(worker_pid) {
+        capture.errors.push(format!(
+            "process snapshot missing for worker {worker_pid} session {session_id}"
+        ));
+    }
+    match worker_owned_descendant_pids(worker_pid) {
+        Ok(descendants) => {
+            for pid in descendants {
+                capture.owned.push_pid(pid);
+                if let Some(snapshot) = process_snapshot(pid) {
+                    capture.owned.push_pgid(snapshot.pgid);
+                }
+            }
+        }
+        Err(error) => capture.errors.push(format!(
+            "descendant census failed for worker {worker_pid} session {session_id}: {error}"
+        )),
+    }
+}
+
+fn recovery_worker_pid(record: &RegistryRecord) -> Option<u32> {
+    record
+        .recovery_identity
+        .as_ref()?
+        .get("worker_pid")?
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid > 1)
+}
+
+fn reread_until_exited_or_bound(
+    registry: &SessionRegistry,
+    session_id: &botster_core::SessionId,
+) -> Result<Option<RegistryRecord>, String> {
+    const ATTEMPTS: u32 = 8;
+    let mut last = None;
+    for attempt in 0..ATTEMPTS {
+        let record = registry
+            .load(session_id)
+            .map_err(|error| format!("reload session registry record {}: {error}", session_id.0))?;
+        match &record {
+            None => return Ok(None),
+            Some(current) if matches!(current.state, RegistrySessionState::Exited) => {
+                return Ok(record);
+            }
+            Some(_) => last = record,
+        }
+        if attempt + 1 < ATTEMPTS {
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+    Ok(last)
 }
 
 pub(crate) fn registry_backed_worker_identities(
@@ -620,13 +698,45 @@ pub(crate) fn reap_registry_backed_workers(data_dir: &Path) -> Result<WorkerReap
                     }
                 }
             }
-            None => {
+            None if process_exists(pid) => {
                 outcome.errors.push(format!(
                     "unresolved worktree session-worker ancestor for command {pid} session {}",
                     identity.session_id
                 ));
                 outcome.retained.push(pid);
             }
+            None => match reread_until_exited_or_bound(
+                &SessionRegistry::new(data_dir),
+                &botster_core::SessionId(identity.session_id.clone()),
+            ) {
+                Ok(None) => {}
+                Ok(Some(latest)) if matches!(latest.state, RegistrySessionState::Exited) => {}
+                Ok(Some(latest)) => match recovery_worker_pid(&latest) {
+                    Some(worker_pid)
+                        if process_exists(worker_pid)
+                            && worker_pid_matches_worktree_session_worker(worker_pid) =>
+                    {
+                        match signal_worker_group(worker_pid) {
+                            Ok(()) => outcome.reaped.push(worker_pid),
+                            Err(error) => outcome.errors.push(error),
+                        }
+                    }
+                    Some(worker_pid) if process_exists(worker_pid) => {
+                        outcome.errors.push(format!(
+                            "resolved worker {worker_pid} is live but unverifiable for session {}",
+                            identity.session_id
+                        ));
+                        outcome.retained.push(pid);
+                        outcome.retained.push(worker_pid);
+                    }
+                    Some(worker_pid) => {
+                        outcome.retained.push(pid);
+                        outcome.retained.push(worker_pid);
+                    }
+                    None => {}
+                },
+                Err(error) => outcome.errors.push(error),
+            },
         }
     }
     Ok(outcome)

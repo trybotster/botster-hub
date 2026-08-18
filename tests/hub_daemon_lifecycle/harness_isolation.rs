@@ -457,6 +457,100 @@ fn unresolved_worker_ancestor_taints_and_retains_command_pid() {
     reset_harness_taint_after_proof();
 }
 
+fn spawn_and_reap_sleep() -> u32 {
+    let mut child = Command::new("sleep")
+        .arg("30")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn short-lived sleep");
+    let pid = child.id();
+    let _ = child.kill();
+    let _ = child.wait();
+    wait_for_process_exit(pid);
+    pid
+}
+
+fn save_running_recovery_record(data_dir: &Path, session_id: &str, command_pid: u32, worker_pid: u32) {
+    let mut record = RegistryRecord::running(
+        SessionId(session_id.to_string()),
+        Some(ProcessIdentity {
+            pid: Some(command_pid),
+            runtime_id: Some(format!("{session_id}-runtime")),
+        }),
+        ResizePayload { rows: 24, cols: 80 },
+        "sleep".to_string(),
+        1,
+    );
+    record.observe_restart_contract(
+        serde_json::json!({
+            "worker_pid": worker_pid,
+            "worker_control_socket": format!("/tmp/bh-recovery-{session_id}.sock"),
+        }),
+        2,
+    );
+    SessionRegistry::new(data_dir.to_path_buf())
+        .save(&record)
+        .expect("save recovery registry fixture");
+}
+
+#[test]
+fn dead_command_and_dead_recovery_worker_do_not_taint() {
+    reset_harness_taint_after_proof();
+    let data_dir = unique_short_test_dir("gxd");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+    let command_pid = spawn_and_reap_sleep();
+    let worker_pid = spawn_and_reap_sleep();
+    save_running_recovery_record(&data_dir, "dead-recovery", command_pid, worker_pid);
+    let capture = collect_owned_session_processes(&data_dir).expect("exited-in-transition capture");
+    assert!(
+        capture.errors.is_empty(),
+        "dead command and dead recovery worker must not taint: {:?}",
+        capture.errors
+    );
+    assert!(
+        harness_taint().is_none(),
+        "benign command-exit race must leave the latch clear: {:?}",
+        harness_taint()
+    );
+}
+
+#[test]
+fn dead_command_with_live_unverified_recovery_worker_taints() {
+    reset_harness_taint_after_proof();
+    let data_dir = unique_short_test_dir("gxu");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+    let command_pid = spawn_and_reap_sleep();
+    let mut decoy = ChildCleanup::spawn_non_botster_decoy();
+    let worker_pid = decoy.id();
+    save_running_recovery_record(&data_dir, "live-unverified", command_pid, worker_pid);
+    let capture = collect_owned_session_processes(&data_dir).expect("unverified recovery capture");
+    assert!(
+        capture.owned.pids.contains(&worker_pid),
+        "live unverified recovery worker must be retained: {:?}",
+        capture.owned.pids
+    );
+    assert!(
+        capture.errors.iter().any(|error| {
+            error.contains("live but unverifiable") && error.contains(&worker_pid.to_string())
+        }),
+        "live unverified recovery worker must be a capture error: {:?}",
+        capture.errors
+    );
+    record_harness_taint(format!(
+        "identity capture incomplete: {}",
+        capture.errors.join("; ")
+    ));
+    assert!(
+        harness_taint().is_some_and(|evidence| evidence.contains("live but unverifiable")),
+        "live unverified recovery worker must set the taint latch: {:?}",
+        harness_taint()
+    );
+    decoy.assert_alive();
+    reset_harness_taint_after_proof();
+}
+
 #[test]
 fn process_group_proof_detects_member_after_leader_exit() {
     let data_dir = unique_short_test_dir("gpg");
