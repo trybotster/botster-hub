@@ -158,6 +158,9 @@ impl IsolatedHubBuilder {
             .arg(&session_worker_bin)
             .current_dir(&working_directory)
             .env("BOTSTER_ENV", "test")
+            .env_remove("BOTSTER_HUB_TEST_FAIL_RUNTIME_DRAIN_FOR")
+            .env_remove("BOTSTER_HUB_TEST_FAIL_RUNTIME_DRAIN_MESSAGE")
+            .env_remove("BOTSTER_HUB_TEST_WORKER_EGRESS_CAPACITY")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         for (key, value) in &self.extra_env {

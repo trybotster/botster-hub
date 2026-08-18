@@ -154,7 +154,7 @@ jobs:
           printf '\n' | tee -a "$ARTIFACT_DIR/metadata.txt"
           ./test.sh "${test_args[@]}" 2>&1 \
             | tee "$ARTIFACT_DIR/precompile.log"
-          worker_args=(build --locked -p botster-core --bin botster-session-worker)
+          worker_args=(build --locked -p botster-core-daemon --bin botster-session-worker)
           printf 'worker_precompile_args=cargo ' | tee -a "$ARTIFACT_DIR/metadata.txt"
           printf '%q ' "${worker_args[@]}" | tee -a "$ARTIFACT_DIR/metadata.txt"
           printf '\n' | tee -a "$ARTIFACT_DIR/metadata.txt"

@@ -963,6 +963,100 @@ pub(crate) fn probe_botster_web_health(web_origin: &str) -> Result<serde_json::V
     Ok(health)
 }
 
+pub(crate) fn typed_operator_error_body(response: &botster_hub_client::DaemonResponse) -> String {
+    match &response.error {
+        Some(error) => format!(
+            "kind={:?} code={} operation={} message={}",
+            response.kind, error.code, error.operation, error.message
+        ),
+        None => format!("kind={:?} error=None", response.kind),
+    }
+}
+
+pub(crate) fn assert_daemon_response_ok(
+    response: &botster_hub_client::DaemonResponse,
+    expected: botster_hub_client::DaemonResponseKind,
+    context: &str,
+) {
+    assert_eq!(
+        response.kind,
+        expected,
+        "{context}: {}",
+        typed_operator_error_body(response)
+    );
+}
+
+pub(crate) fn wait_for_published_web_origin(
+    endpoint: &botster_hub_client::DaemonEndpoint,
+) -> String {
+    let deadline = Instant::now() + BOTSTER_WEB_READINESS_LIVENESS_BACKSTOP;
+    let mut last = "ListApps not attempted".to_string();
+    while Instant::now() < deadline {
+        match botster_hub_client::request(endpoint, botster_hub_client::DaemonRequest::ListApps) {
+            Ok(response) => {
+                last = typed_operator_error_body(&response);
+                if let Some(url) = response.apps.iter().find_map(|app| {
+                    (app.package_name == "botster-web" && app.entrypoint_id == "web-client")
+                        .then(|| app.launch_target.local_url.clone())
+                        .flatten()
+                }) {
+                    return url.trim_end_matches('/').to_string();
+                }
+            }
+            Err(error) => last = format!("ListApps error: {error}"),
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("botster-web did not publish local_url after bind: {last}");
+}
+
+pub(crate) fn start_botster_web_and_issue_bootstrap(
+    endpoint: &botster_hub_client::DaemonEndpoint,
+) -> (String, botster_hub_client::DaemonLocalWebrtcBootstrap) {
+    let start = botster_hub_client::request(
+        endpoint,
+        botster_hub_client::DaemonRequest::StartPackageEntrypoint {
+            package_name: "botster-web".to_string(),
+            entrypoint_id: "web-client".to_string(),
+            environment_overrides: BTreeMap::from([(
+                "BOTSTER_WEB_PORT".to_string(),
+                "0".to_string(),
+            )]),
+        },
+    )
+    .expect("start botster-web entrypoint");
+    assert_daemon_response_ok(
+        &start,
+        botster_hub_client::DaemonResponseKind::Packages,
+        "start botster-web entrypoint",
+    );
+    let origin = wait_for_published_web_origin(endpoint);
+    let expected_local_url = format!("{origin}/");
+    wait_for_botster_web_readiness(endpoint, &origin, &expected_local_url, Instant::now());
+    let bootstrap = botster_hub_client::request(
+        endpoint,
+        botster_hub_client::DaemonRequest::IssueLocalWebrtcBootstrap {
+            package_name: "botster-web".to_string(),
+            entrypoint_id: "web-client".to_string(),
+            origin: origin.clone(),
+        },
+    )
+    .unwrap_or_else(|error| panic!("issue local WebRTC bootstrap: {error}"));
+    assert_daemon_response_ok(
+        &bootstrap,
+        botster_hub_client::DaemonResponseKind::LocalWebrtcBootstrap,
+        "issue local WebRTC bootstrap",
+    );
+    let grant = match bootstrap.local_webrtc_bootstrap {
+        Some(grant) => grant,
+        None => panic!(
+            "bootstrap response includes local WebRTC bootstrap: {}",
+            typed_operator_error_body(&bootstrap)
+        ),
+    };
+    (origin, grant)
+}
+
 pub(crate) fn wait_for_botster_web_readiness(
     endpoint: &botster_hub_client::DaemonEndpoint,
     web_origin: &str,

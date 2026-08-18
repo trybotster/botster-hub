@@ -161,6 +161,25 @@ enum OwnerEvent {
     Reconcile,
 }
 
+enum OwnerPollDecision {
+    ServeControl(Box<Option<ControlMessage>>),
+    RunSlice,
+    Block,
+}
+
+/// Classify one busy-path owner poll. A queued control message precedes a due
+/// maintenance slice so at most one already-running owner turn can precede it.
+fn classify_owner_poll(
+    poll: Result<ControlMessage, tokio_mpsc::error::TryRecvError>,
+    slice_due: bool,
+) -> OwnerPollDecision {
+    match poll {
+        Ok(message) => OwnerPollDecision::ServeControl(Box::new(Some(message))),
+        Err(_) if slice_due => OwnerPollDecision::RunSlice,
+        Err(_) => OwnerPollDecision::Block,
+    }
+}
+
 async fn receive_owner_event(
     control_rx: &mut tokio_mpsc::Receiver<ControlMessage>,
     reconciliation_wait: Duration,
@@ -270,10 +289,10 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
         }
         let slice_due = control_state.maintenance.needs_work()
             || control_state.next_reconciliation <= Instant::now();
-        let event = match control_rx.try_recv() {
-            Ok(message) => Some(OwnerEvent::Control(Box::new(Some(message)))),
-            Err(_) if slice_due => None,
-            Err(_) => {
+        let event = match classify_owner_poll(control_rx.try_recv(), slice_due) {
+            OwnerPollDecision::ServeControl(message) => Some(OwnerEvent::Control(message)),
+            OwnerPollDecision::RunSlice => None,
+            OwnerPollDecision::Block => {
                 let wait = control_state
                     .next_reconciliation
                     .saturating_duration_since(Instant::now());
@@ -2372,6 +2391,15 @@ pub(crate) fn handle_control_message(
                 overlay_live_attach_occupancy(status, daemon, state);
             }
             if request_succeeded(response.as_ref()) {
+                if let DaemonRequest::Spawn { session_id, .. } = &request {
+                    state
+                        .maintenance
+                        .acknowledged_spawn_ids
+                        .insert(session_id.clone());
+                    if let Some(runtime) = daemon.runtime() {
+                        runtime.record_acknowledged_spawn(session_id.clone());
+                    }
+                }
                 if reconcile_after_request {
                     state.maintenance.note_authoritative_mutation();
                 } else if matches!(request, DaemonRequest::PluginSurfaceAction { .. })
@@ -4489,8 +4517,22 @@ fn recover_after_core_shutdown_error(
     logical_clock: &mut u64,
 ) -> DaemonTransportResult<DaemonResponse> {
     observe_lifecycle_turn(runtime, *logical_clock);
-    let classification = classify_shutdown_session(runtime, session_id, tick(logical_clock))?;
-    response_after_core_shutdown_error(classification, error, session_id)
+    recover_from_exact_classify(
+        classify_shutdown_session(runtime, session_id, tick(logical_clock)),
+        error,
+        session_id,
+    )
+}
+
+fn recover_from_exact_classify(
+    classification: DaemonTransportResult<ShutdownSessionClassification>,
+    error: crate::HubClientError,
+    session_id: &str,
+) -> DaemonTransportResult<DaemonResponse> {
+    match classification {
+        Ok(classification) => response_after_core_shutdown_error(classification, error, session_id),
+        Err(_) => Err(DaemonTransportError::Client(error)),
+    }
 }
 
 fn daemon_hello_ack(diagnostics: Vec<DaemonDiagnostic>) -> DaemonHelloAck {
@@ -7836,6 +7878,15 @@ mod tests {
     }
 
     #[test]
+    fn queued_control_precedes_a_due_maintenance_slice() {
+        assert!(matches!(
+            classify_owner_poll(Ok(ControlMessage::RejectedConnection), true),
+            OwnerPollDecision::ServeControl(message)
+                if matches!(*message, Some(ControlMessage::RejectedConnection))
+        ));
+    }
+
+    #[test]
     fn read_mode_flags_runtime_failure_projects_operator_error_without_default_body() {
         let response = daemon_operator_error(crate::HubClientError::Runtime {
             request_id: RequestId("mode-flags-backend-failure".to_string()),
@@ -7955,7 +8006,115 @@ mod tests {
     }
 
     #[test]
+    fn recover_classify_err_preserves_typed_runtime_error() {
+        let error = recover_from_exact_classify(
+            Err(DaemonTransportError::Client(shutdown_lookup_error(
+                botster_core_daemon::CoreDaemonError::Shutdown,
+            ))),
+            shutdown_runtime_error(crate::HubClientRuntimeErrorKind::Runtime),
+            "exited-session",
+        )
+        .expect_err("classify Err does not invent cleanup from collection state");
+        assert!(matches!(
+            error,
+            DaemonTransportError::Client(crate::HubClientError::Runtime {
+                operation: crate::HubClientOperation::Shutdown,
+                kind: crate::HubClientRuntimeErrorKind::Runtime,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn recover_recorded_stopping_after_classify_err_preserves_typed_error() {
+        let error = recover_from_exact_classify(
+            Err(DaemonTransportError::Client(shutdown_lookup_error(
+                botster_core_daemon::CoreDaemonError::Shutdown,
+            ))),
+            shutdown_runtime_error(crate::HubClientRuntimeErrorKind::Runtime),
+            "stopping-session",
+        )
+        .expect_err("Stopping after classify Err keeps the typed Core error");
+        assert!(matches!(
+            error,
+            DaemonTransportError::Client(crate::HubClientError::Runtime {
+                operation: crate::HubClientOperation::Shutdown,
+                kind: crate::HubClientRuntimeErrorKind::Runtime,
+                ..
+            })
+        ));
+        let response = daemon_operator_error(match error {
+            DaemonTransportError::Client(error) => error,
+            other => panic!("expected Client error, got {other:?}"),
+        });
+        assert_eq!(response.kind, DaemonResponseKind::OperatorError);
+        let operator = response.error.expect("operator error body");
+        assert_eq!(operator.code, "runtime_error");
+        assert_eq!(operator.operation, "shutdown");
+    }
+
+    #[test]
+    fn recover_classify_err_preserves_typed_state_error() {
+        let error = recover_from_exact_classify(
+            Err(DaemonTransportError::Client(shutdown_lookup_error(
+                botster_core_daemon::CoreDaemonError::Shutdown,
+            ))),
+            shutdown_runtime_error(crate::HubClientRuntimeErrorKind::State),
+            "stale-session",
+        )
+        .expect_err("classify Err keeps the original typed Core error");
+        assert!(matches!(
+            error,
+            DaemonTransportError::Client(crate::HubClientError::Runtime {
+                operation: crate::HubClientOperation::Shutdown,
+                kind: crate::HubClientRuntimeErrorKind::State,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn recover_exact_exited_cleanup_stays_already_exited() {
+        let response = recover_from_exact_classify(
+            Ok(ShutdownSessionClassification::Cleanup(
+                DaemonSessionCleanup {
+                    session_id: "exited-session".to_string(),
+                    outcome: "already_exited".to_string(),
+                },
+            )),
+            shutdown_runtime_error(crate::HubClientRuntimeErrorKind::Runtime),
+            "exited-session",
+        )
+        .expect("exact Exited evidence stays SessionCleanup");
+        assert_eq!(response.kind, DaemonResponseKind::SessionCleanup);
+        let cleanup = response.cleanup.expect("cleanup body");
+        assert_eq!(cleanup.session_id, "exited-session");
+        assert_eq!(cleanup.outcome, "already_exited");
+    }
+
+    #[test]
+    fn recover_exact_stale_cleanup_stays_stale_session() {
+        let response = recover_from_exact_classify(
+            Ok(ShutdownSessionClassification::Cleanup(
+                DaemonSessionCleanup {
+                    session_id: "stale-session".to_string(),
+                    outcome: "stale_session".to_string(),
+                },
+            )),
+            shutdown_runtime_error(crate::HubClientRuntimeErrorKind::Runtime),
+            "stale-session",
+        )
+        .expect("exact Stale evidence stays SessionCleanup");
+        assert_eq!(response.kind, DaemonResponseKind::SessionCleanup);
+        let cleanup = response.cleanup.expect("cleanup body");
+        assert_eq!(cleanup.session_id, "stale-session");
+        assert_eq!(cleanup.outcome, "stale_session");
+    }
+
+    #[test]
     fn shutdown_active_runtime_error_remains_operator_error() {
+        // OperatorError is preserved when exact evidence shows the worker is
+        // still Active. Provable natural exit uses Cleanup, not this path.
         let error = shutdown_error_response(
             ShutdownSessionClassification::Active,
             shutdown_runtime_error(crate::HubClientRuntimeErrorKind::Runtime),
@@ -7982,6 +8141,8 @@ mod tests {
 
     #[test]
     fn shutdown_active_state_error_remains_operator_error() {
+        // OperatorError is preserved when exact evidence shows the worker is
+        // still Active. Provable natural exit uses Cleanup, not this path.
         let error = shutdown_error_response(
             ShutdownSessionClassification::Active,
             shutdown_runtime_error(crate::HubClientRuntimeErrorKind::State),

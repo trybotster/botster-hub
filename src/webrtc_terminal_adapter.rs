@@ -111,6 +111,7 @@ impl WebRtcTerminalAdapterInner {
         self.wake.wake();
     }
 
+    #[cfg(test)]
     fn set_would_block(&self, pressured: bool) {
         self.would_block.store(pressured, Ordering::SeqCst);
         self.wake.wake();
@@ -241,12 +242,12 @@ impl WebRtcTerminalAdapter {
 
     #[cfg(test)]
     fn force_would_block(&self) {
-        self.inner.would_block.store(true, Ordering::SeqCst);
+        self.inner.set_would_block(true);
     }
 
     #[cfg(test)]
     fn clear_would_block(&self) {
-        self.inner.would_block.store(false, Ordering::SeqCst);
+        self.inner.set_would_block(false);
     }
 }
 
@@ -491,15 +492,6 @@ impl WebRtcConnectionMux {
         }
     }
 
-    pub(crate) fn set_would_block(&self, pressured: bool) {
-        if let Ok(routes) = self.inner.routes.lock() {
-            for route in routes.iter() {
-                route.handle.set_would_block(pressured);
-            }
-        }
-        self.inner.wake.wake();
-    }
-
     pub(crate) fn snapshot_writes(
         &self,
     ) -> Vec<(String, String, WebRtcTerminalAdapterHandle, Vec<u8>)> {
@@ -544,10 +536,6 @@ impl WebRtcTerminalAdapterHandle {
 
     pub(crate) fn is_closed(&self) -> bool {
         self.inner.is_closed()
-    }
-
-    pub(crate) fn set_would_block(&self, pressured: bool) {
-        self.inner.set_would_block(pressured);
     }
 
     pub(crate) fn snapshot_active(&self) -> Option<Vec<u8>> {

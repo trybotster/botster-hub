@@ -63,11 +63,12 @@ pub(crate) fn unique_test_dir(name: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("system time after epoch")
         .as_nanos();
+    let mixed = nanos ^ (u128::from(std::process::id()) << 48);
     PathBuf::from("target")
         .join("botster-hub-test-data")
         .join("daemon")
         .join(name)
-        .join(nanos.to_string())
+        .join(mixed.to_string())
 }
 
 pub(crate) fn unique_short_test_dir(name: &str) -> PathBuf {
@@ -75,7 +76,7 @@ pub(crate) fn unique_short_test_dir(name: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("system time after epoch")
         .as_nanos();
-    PathBuf::from("/tmp").join(format!("bh-{name}-{nanos}"))
+    PathBuf::from("/tmp").join(format!("bh-{name}-{}-{nanos}", std::process::id()))
 }
 
 pub(crate) fn explicit_config(data_directory: impl Into<PathBuf>) -> botster_hub::HubConfig {
@@ -323,9 +324,11 @@ pub(crate) fn wait_for_child_condition_with_budget(
 
     let child_status = child.terminate_and_reap();
     let output = child.captured_output();
+    let (resource, probe) = classify_budget_expiry("child_condition", None, Some(&output));
     Err(format!(
-        "{description}: condition not met after {:?} (backstop {budget:?}); child_status={child_status}; {output}",
-        started_at.elapsed()
+        "{description}: condition not met after {:?} (backstop {budget:?}); child_status={child_status}; {output}; {}",
+        started_at.elapsed(),
+        format_harness_budget_expired("child_condition", budget, resource, probe, &output)
     ))
 }
 
@@ -409,6 +412,7 @@ pub(crate) fn daemon_test_lock() -> &'static Mutex<()> {
 }
 
 pub(crate) fn daemon_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    check_harness_taint();
     recovering_mutex_guard(daemon_test_lock())
 }
 
@@ -448,29 +452,7 @@ pub(crate) fn wait_for_incompatible_status(data_dir: &Path, child: &mut Child) {
 }
 
 pub(crate) fn terminate_and_reap_child(child: &mut Child) -> String {
-    if let Some(status) = child.try_wait().expect("check daemon child before cleanup") {
-        return status.to_string();
-    }
-    let pid = child.id();
-    signal_test_group_or_child(pid, libc::SIGTERM)
-        .expect("signal daemon group after readiness failure");
-    let deadline = Instant::now() + Duration::from_millis(500);
-    while Instant::now() < deadline {
-        if let Some(status) = child.try_wait().expect("poll daemon child during cleanup") {
-            return status.to_string();
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    signal_test_group_or_child(pid, libc::SIGKILL)
-        .expect("kill daemon group after readiness failure");
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        if let Some(status) = child.try_wait().expect("poll killed daemon child") {
-            return status.to_string();
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    panic!("daemon child {pid} did not exit within bounded cleanup");
+    try_terminate_and_reap_child(child).unwrap_or_else(|error| panic!("{error}"))
 }
 
 pub(crate) fn signal_test_group_or_child(pid: u32, signal: libc::c_int) -> io::Result<()> {
@@ -895,7 +877,12 @@ pub(crate) fn installer_binary() -> PathBuf {
         .join("botster-hub-installer")
 }
 
-pub(crate) fn start_installed_daemon(prefix: &Path, data_dir: &Path, entrypoint: &Path) -> Child {
+pub(crate) fn start_installed_daemon(
+    prefix: &Path,
+    data_dir: &Path,
+    entrypoint: &Path,
+) -> PanicSafeCliDaemon {
+    check_harness_taint();
     let mut command = Command::new(entrypoint);
     command
         .arg("start")
@@ -905,9 +892,10 @@ pub(crate) fn start_installed_daemon(prefix: &Path, data_dir: &Path, entrypoint:
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     configure_test_process_group(&mut command);
-    let mut child = command.spawn().expect("spawn the installed Hub");
-    wait_for_status(data_dir, &mut child);
-    child
+    let child = command.spawn().expect("spawn the installed Hub");
+    let mut daemon = PanicSafeCliDaemon::from_child(data_dir, child, "installed daemon");
+    wait_for_status(data_dir, daemon.child_mut());
+    daemon
 }
 
 pub(crate) fn wait_for_entity_frame<F>(
@@ -922,7 +910,21 @@ where
     loop {
         let remaining = deadline.saturating_sub(started.elapsed());
         if remaining.is_zero() {
-            panic!("timed out waiting for entity frame");
+            let (resource, probe) = classify_budget_expiry(
+                "entity_frame",
+                None,
+                Some("timed out waiting for entity frame"),
+            );
+            panic!(
+                "{}",
+                format_harness_budget_expired(
+                    "entity_frame",
+                    deadline,
+                    resource,
+                    probe,
+                    "timed out waiting for entity frame"
+                )
+            );
         }
         subscription
             .set_read_timeout(Some(remaining.min(Duration::from_millis(200))))
