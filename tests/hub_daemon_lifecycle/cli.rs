@@ -519,6 +519,7 @@ impl Drop for PanicSafeCliDaemon {
             hard_stop_cli_daemon_group(&mut child);
         }
         let _ = reap_session_workers_for_data_dir(&self.data_dir);
+        let _ = reap_processes_matching_marker(&self.data_dir.display().to_string());
 
         match child.wait_with_output() {
             Ok(daemon) => {
