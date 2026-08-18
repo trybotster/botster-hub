@@ -157,7 +157,7 @@ Downstream proof: not required. No public surface, DTO, pin, or runtime behavior
 
 ## Unverified behavior or residual risk
 
-- Review `review_1787012453_488679` asks for authorized suite gates after the split. This visit has not started an unfiltered suite. A new exclusive slot is required. Final integration remains the strict clean-suite convergence gate.
+- Orchestrator `question_1787013324_423511` forbids five more full lifecycle suites. Leaf tickets now use focused deterministic proof. The shared lifecycle harness is an active repair root under `ticket_1787011770_110683`. This visit records commit `3f5314a`, both 20/20 focused proofs, both red controls, fmt, clippy, and the earlier five-suite evidence in which the target passed 5/5. The exclusive suite slot stays free. One controlled full lifecycle suite runs only after that harness repair merges. Final integration remains the strict clean-suite convergence gate.
 - Run 4 is invalid suite-environment evidence and does not count against this ticket.
 - Plan check 6 (one full `./test.sh --locked`) was not run. It is non-binding and needs its own orchestrator slot.
 - `sleep 1` can still lose the attach-before-exit race under extreme spawn delay. Control B proves the `process_exit` assertion is live when the child stays up.
