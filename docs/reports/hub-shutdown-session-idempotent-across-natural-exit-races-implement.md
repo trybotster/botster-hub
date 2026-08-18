@@ -12,6 +12,7 @@
 | Decision gate | Rule B |
 | Core dependency | `ticket_1787015956_494734` / `dependency_1787015963_708930` / run `run_1787015981_429380` |
 | Core pin | still `fc541a5`; no silent repin |
+| Hub main integrated | `c1ce7e5` via merge commit `b117d0d` |
 | Review requested | no; this leaf is blocked on the Core dependency |
 
 ## Repository playbook and other playbooks/notes applied
@@ -115,6 +116,20 @@ Hub still owns classification, recover, and host response kinds. Core still owns
 - Exact-bytes blind restore, idempotency tightening, and red-on-revert of the W1 window are deferred to the post-repin resume. Recover-fallback unit tests are the Hub-leg red-on-revert surface that is available now.
 - No full lifecycle suite ran, as required by acceptance check 10.
 
+## Hub main `c1ce7e5` integrate
+
+`ticket_1786937228_425608` is already an ancestor of `origin/main` (`0a22c36`). This branch merged `origin/main` at `c1ce7e5` (`b117d0d`). The merge was clean.
+
+Overlap recheck:
+
+- Incoming Unix work lives in `unix_adapter_unbound_printf_stream_attach_completes` and `unix_adapter_bound_printf_stream_attach_delivers_process_exit`. Those tests hold the child on a release file. They do not call `ShutdownSession` as observation.
+- This ticket's Unix work lives in `unix_shutdown_session_from_another_connection_classifies_attached_exit` and the ignored W1/W2 wrappers. Those tests still exist after the merge.
+- Incoming reports name this ticket as not absorbed. They do not change the recover path.
+- Incoming write-budget edits are in `src/local_webrtc.rs` and WebRTC adapter files. They do not touch `recover_after_core_shutdown_error`.
+- Production `src/daemon_transport.rs` did not change on main since the previous merge-base.
+
+No full lifecycle suite ran after the integrate.
+
 ## Tests and downstream proof run
 
 All commands used `./test.sh` except the documented worker prebuild and the fmt/clippy gates.
@@ -128,6 +143,8 @@ All commands used `./test.sh` except the documented worker prebuild and the fmt/
 | Remaining shutdown family | `shutdown_unknown_session`, `shutdown_exited_classification`, `shutdown_stopping_record`, `production_core_shutdown` | 5 passed |
 | Fmt | `cargo fmt --all -- --check` | pass |
 | Clippy | `cargo clippy --workspace --all-targets --locked -- -D warnings` | pass |
+| Post-integrate recover units | `./test.sh --locked --lib recover_` then `shutdown_active` | 5 + 2 passed |
+| Post-integrate focused Unix trio | `./test.sh --locked --test hub_daemon_lifecycle_test -- --exact unix_adapter_unbound_printf_stream_attach_completes unix_adapter_bound_printf_stream_attach_delivers_process_exit unix_shutdown_session_from_another_connection_classifies_attached_exit` | 3 passed in 6.03s |
 
 Production entry point: Unix/WebRTC `ShutdownSession` still enters `src/daemon_transport.rs` at the `DaemonRequest::ShutdownSession` arm, then `classify_shutdown_session`, Core `shutdown_session`, and `recover_after_core_shutdown_error`. The new recover path is that production recover function. Classify `Ok(Active)` plus a real Core error is unchanged.
 
