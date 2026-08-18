@@ -142,7 +142,10 @@ impl ReapingChild {
 impl Drop for ReapingChild {
     fn drop(&mut self) {
         if let Some(child) = self.child.as_mut() {
-            let _ = terminate_and_reap_child(child);
+            if let Err(error) = try_terminate_and_reap_child(child) {
+                record_harness_taint(format!("ReapingChild drop could not prove absence: {error}"));
+                eprintln!("ReapingChild drop: {error}");
+            }
         }
     }
 }
@@ -181,10 +184,16 @@ impl ChildCleanup {
 
 impl Drop for ChildCleanup {
     fn drop(&mut self) {
+        let pid = self.child.id();
         if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
+            if let Err(error) = signal_test_group_or_child(pid, libc::SIGKILL) {
+                let _ = self.child.kill();
+                eprintln!("ChildCleanup group kill failed: {error}");
+            }
         }
-        let _ = self.child.wait();
+        if let Err(error) = self.child.wait() {
+            record_harness_taint(format!("ChildCleanup wait failed for pid {pid}: {error}"));
+        }
     }
 }
 
@@ -397,26 +406,16 @@ pub(crate) fn capture_new_session_workers_for_data_dir(
         let live_ours: Vec<SessionWorkerProcessIdentity> = session_worker_process_identities()?
             .into_iter()
             .filter(|worker| {
-                !before_pids.contains(&worker.pid) && worker_executable_from_this_worktree(worker)
+                !before_pids.contains(&worker.pid) && worker_belongs_to_data_dir(worker, data_dir)
             })
             .collect();
         // Fail closed on kill-probe errors for candidate workers.
-        let mut live_alive = Vec::new();
+        let mut live = Vec::new();
         for worker in live_ours {
             if process_is_alive_u32(worker.pid)? {
-                live_alive.push(worker);
+                live.push(worker);
             }
         }
-        let owned_by_dir: Vec<SessionWorkerProcessIdentity> = live_alive
-            .iter()
-            .filter(|worker| worker_belongs_to_data_dir(worker, data_dir))
-            .cloned()
-            .collect();
-        let live = if !owned_by_dir.is_empty() {
-            owned_by_dir
-        } else {
-            live_alive
-        };
         if !live.is_empty() {
             // Refresh descendant trees after a short settle so the shell child is included.
             thread::sleep(Duration::from_millis(80));
@@ -454,7 +453,7 @@ pub(crate) fn capture_new_session_workers_for_data_dir(
         }
         if Instant::now() >= deadline {
             return Err(format!(
-                "timed out waiting for botster-session-worker + live shell descendant from this worktree; data_dir={}",
+                "timed out waiting for botster-session-worker + live shell descendant owned by data dir {}; worktree-wide adoption is disabled",
                 data_dir.display()
             ));
         }
@@ -513,7 +512,8 @@ pub(crate) fn linux_process_cpu_ticks(pid: u32) -> Option<u64> {
 pub(crate) fn start_cli_daemon_with_session_worker(
     data_dir: &Path,
     session_worker_bin: &Path,
-) -> Child {
+) -> PanicSafeCliDaemon {
+    check_harness_taint();
     let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
     command
         .arg("start")
@@ -524,10 +524,10 @@ pub(crate) fn start_cli_daemon_with_session_worker(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     configure_test_process_group(&mut command);
-    let mut child = command.spawn().expect("spawn botster-hub start");
-
-    wait_for_status(data_dir, &mut child);
-    child
+    let child = command.spawn().expect("spawn botster-hub start");
+    let mut daemon = PanicSafeCliDaemon::from_child(data_dir, child, "session-worker daemon");
+    wait_for_status(data_dir, daemon.child_mut());
+    daemon
 }
 
 pub(crate) fn configure_test_process_group(command: &mut Command) {

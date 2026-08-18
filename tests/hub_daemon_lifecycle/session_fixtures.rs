@@ -367,6 +367,7 @@ pub(crate) fn start_isolated_live_output_hub_with_env(
     name: &str,
     extra_env: &[(&str, &str)],
 ) -> botster_hub_test_support::IsolatedHub {
+    check_harness_taint();
     let mut builder = botster_hub_test_support::IsolatedHubBuilder::new()
         .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
         .session_worker_bin(session_worker_binary_path())

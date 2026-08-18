@@ -7,6 +7,7 @@ use std::io::{BufReader, Read};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -658,10 +659,13 @@ fn entrypoint_declares_launch_result(entrypoint: &PackageRunnableEntrypoint) -> 
 }
 
 fn launch_result_path(package_name: &str, entrypoint_id: &str, started_at: u64) -> PathBuf {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let file_name = format!(
-        "botster-launch-result-{}-{}-{started_at}.json",
+        "botster-launch-result-{}-{}-{started_at}-{}-{sequence}.json",
         sanitized_path_component(package_name),
-        sanitized_path_component(entrypoint_id)
+        sanitized_path_component(entrypoint_id),
+        std::process::id()
     );
     std::env::temp_dir().join(file_name)
 }
@@ -1329,5 +1333,24 @@ mod tests {
 
         assert!(!launch_result_path.exists());
         assert!(process.launch_result_path.is_none());
+    }
+
+    #[test]
+    fn launch_result_paths_stay_distinct_in_the_same_second() {
+        let started_at = now_seconds();
+        let first = launch_result_path("botster-web", "web-client", started_at);
+        let second = launch_result_path("botster-web", "web-client", started_at);
+        assert_ne!(
+            first, second,
+            "same-second supervisors must not share a launch-result path"
+        );
+        assert!(
+            first
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains(&std::process::id().to_string())),
+            "launch-result path must include the supervising process id: {}",
+            first.display()
+        );
     }
 }

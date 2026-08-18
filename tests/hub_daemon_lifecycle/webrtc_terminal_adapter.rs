@@ -148,31 +148,7 @@ fn start_webrtc_adapter_hub(
     write_botster_web_package(&package_dir);
     enable_supervised_package(hub.data_dir(), &package_dir);
     let endpoint = hub.endpoint().clone();
-    let web_listener_port = unused_loopback_port();
-    let start = botster_hub_client::request(
-        &endpoint,
-        botster_hub_client::DaemonRequest::StartPackageEntrypoint {
-            package_name: "botster-web".to_string(),
-            entrypoint_id: "web-client".to_string(),
-            environment_overrides: BTreeMap::from([(
-                "BOTSTER_WEB_PORT".to_string(),
-                web_listener_port.to_string(),
-            )]),
-        },
-    )
-    .expect("start botster-web entrypoint");
-    assert_eq!(start.kind, botster_hub_client::DaemonResponseKind::Packages);
-    let bootstrap = botster_hub_client::request(
-        &endpoint,
-        botster_hub_client::DaemonRequest::IssueLocalWebrtcBootstrap {
-            package_name: "botster-web".to_string(),
-            entrypoint_id: "web-client".to_string(),
-            origin: format!("http://127.0.0.1:{web_listener_port}"),
-        },
-    )
-    .expect("issue local WebRTC bootstrap")
-    .local_webrtc_bootstrap
-    .expect("bootstrap response includes local WebRTC bootstrap");
+    let (_origin, bootstrap) = start_botster_web_and_issue_bootstrap(&endpoint);
     (hub, endpoint, bootstrap)
 }
 

@@ -2143,7 +2143,7 @@ fn session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnec
     let conformance_hub = botster_hub_test_support::IsolatedHubBuilder::new()
         .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
         .session_worker_bin(session_worker_binary_path())
-        .root(PathBuf::from("/tmp/bh-slc"))
+        .root(unique_short_test_dir("slc"))
         .name("published-runner")
         .start()
         .expect("start isolated hub for published session lifecycle conformance");
@@ -3858,7 +3858,7 @@ fn session_entity_subscription_observes_attached_natural_exit_with_pending_egres
     subscription
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("bound entity reads");
-    let _ = subscription.next_frame().expect("initial snapshot");
+    let _ = wait_for_entity_frame(&mut subscription, Duration::from_secs(5), |_| true);
 
     botster_hub_client::request(
         &endpoint,
@@ -3870,7 +3870,13 @@ fn session_entity_subscription_observes_attached_natural_exit_with_pending_egres
     )
     .expect("spawn attached natural-exit session");
     assert!(matches!(
-        subscription.next_frame().expect("spawn upsert"),
+        wait_for_entity_frame(&mut subscription, Duration::from_secs(5), |frame| {
+            matches!(
+                frame,
+                botster_hub_client::DaemonEntityFrame::Upsert { id, .. }
+                    if id == "entity-attached-exit"
+            )
+        }),
         botster_hub_client::DaemonEntityFrame::Upsert { ref id, .. }
             if id == "entity-attached-exit"
     ));
@@ -4037,7 +4043,7 @@ fn session_entity_subscription_recovers_after_terminal_disconnect_with_pending_e
     subscription
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("bound entity reads");
-    let _ = subscription.next_frame().expect("initial snapshot");
+    let _ = wait_for_entity_frame(&mut subscription, Duration::from_secs(5), |_| true);
 
     botster_hub_client::request(
         &endpoint,
@@ -4048,7 +4054,13 @@ fn session_entity_subscription_recovers_after_terminal_disconnect_with_pending_e
     )
     .expect("spawn terminal disconnect session");
     assert!(matches!(
-        subscription.next_frame().expect("spawn upsert"),
+        wait_for_entity_frame(&mut subscription, Duration::from_secs(5), |frame| {
+            matches!(
+                frame,
+                botster_hub_client::DaemonEntityFrame::Upsert { id, .. }
+                    if id == "entity-terminal-disconnect"
+            )
+        }),
         botster_hub_client::DaemonEntityFrame::Upsert { ref id, .. }
             if id == "entity-terminal-disconnect"
     ));

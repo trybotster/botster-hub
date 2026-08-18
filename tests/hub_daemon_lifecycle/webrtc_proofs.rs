@@ -12,21 +12,23 @@ fn botster_web_health_rejects_stale_daemon_socket_file() {
         "stale daemon socket file should remain"
     );
 
-    let listener_port = unused_loopback_port();
     let connection = serde_json::json!({
         "transport": {
             "type": "unix_socket",
             "path": socket_path
         }
     });
-    let child = Command::new("node")
+    let mut command = Command::new("node");
+    command
         .arg("scripts/local-package-server.mjs")
         .current_dir(&package_dir)
         .env("BOTSTER_HUB_CONNECTION", connection.to_string())
         .env("BOTSTER_HUB_DATA_DIR", &data_dir)
-        .env("BOTSTER_WEB_PORT", listener_port.to_string())
+        .env("BOTSTER_WEB_PORT", "0")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_test_process_group(&mut command);
+    let child = command
         .spawn()
         .expect("spawn botster-web package server against stale socket");
     let mut child = ChildCleanup { child };
@@ -40,12 +42,16 @@ fn botster_web_health_rejects_stale_daemon_socket_file() {
     )
     .read_line(&mut listening)
     .expect("read botster-web listening marker");
-    assert_eq!(
-        listening.trim(),
-        format!("web_listening=http://127.0.0.1:{listener_port}")
+    let origin = listening
+        .trim()
+        .strip_prefix("web_listening=")
+        .expect("botster-web listening marker");
+    assert!(
+        origin.starts_with("http://127.0.0.1:"),
+        "unexpected listening marker: {listening}"
     );
 
-    let health = read_json_health(&format!("http://127.0.0.1:{listener_port}"));
+    let health = read_json_health(origin);
     assert_eq!(health["ok"], false, "stale socket health: {health}");
     assert_eq!(health["socketExists"], true);
     assert_eq!(health["daemonReady"], false);
@@ -160,7 +166,7 @@ fn cli_smoke_proves_local_runtime_daemon_package_app_session_and_webrtc() {
         &web_package_dir,
         &tui_package_dir,
         &workspaces_package_dir,
-        unused_loopback_port(),
+        0,
     );
     let text = command_output_text(&output);
     assert_smoke_owned_daemon_gone(&data_dir);
@@ -200,7 +206,7 @@ fn cli_smoke_persists_matching_sender_record_when_webrtc_response_closes() {
         &web_package_dir,
         &tui_package_dir,
         &workspaces_package_dir,
-        unused_loopback_port(),
+        0,
         Some("status"),
     );
     let text = command_output_text(&output);
@@ -266,31 +272,7 @@ fn external_hub_webrtc_live_output_preserves_exact_bytes() {
     write_botster_web_package(&package_dir);
     enable_supervised_package(hub.data_dir(), &package_dir);
     let endpoint = hub.endpoint().clone();
-    let web_listener_port = unused_loopback_port();
-    let start = botster_hub_client::request(
-        &endpoint,
-        botster_hub_client::DaemonRequest::StartPackageEntrypoint {
-            package_name: "botster-web".to_string(),
-            entrypoint_id: "web-client".to_string(),
-            environment_overrides: BTreeMap::from([(
-                "BOTSTER_WEB_PORT".to_string(),
-                web_listener_port.to_string(),
-            )]),
-        },
-    )
-    .expect("start botster-web entrypoint");
-    assert_eq!(start.kind, botster_hub_client::DaemonResponseKind::Packages);
-    let bootstrap = botster_hub_client::request(
-        &endpoint,
-        botster_hub_client::DaemonRequest::IssueLocalWebrtcBootstrap {
-            package_name: "botster-web".to_string(),
-            entrypoint_id: "web-client".to_string(),
-            origin: format!("http://127.0.0.1:{web_listener_port}"),
-        },
-    )
-    .expect("issue local WebRTC bootstrap")
-    .local_webrtc_bootstrap
-    .expect("bootstrap response includes local WebRTC bootstrap");
+    let (_web_origin, bootstrap) = start_botster_web_and_issue_bootstrap(&endpoint);
     let stream_key = local_webrtc_stream_key(&bootstrap.grant_secret);
 
     block_on(async {
@@ -435,7 +417,6 @@ fn external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup() {
     write_botster_web_package(&package_dir);
     enable_supervised_package(hub.data_dir(), &package_dir);
     let endpoint = hub.endpoint().clone();
-    let web_listener_port = unused_loopback_port();
     let start = botster_hub_client::request(
         &endpoint,
         botster_hub_client::DaemonRequest::StartPackageEntrypoint {
@@ -443,12 +424,17 @@ fn external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup() {
             entrypoint_id: "web-client".to_string(),
             environment_overrides: BTreeMap::from([(
                 "BOTSTER_WEB_PORT".to_string(),
-                web_listener_port.to_string(),
+                "0".to_string(),
             )]),
         },
     )
     .expect("start botster-web entrypoint");
-    assert_eq!(start.kind, botster_hub_client::DaemonResponseKind::Packages);
+    assert_daemon_response_ok(
+        &start,
+        botster_hub_client::DaemonResponseKind::Packages,
+        "start botster-web entrypoint",
+    );
+    let web_origin = wait_for_published_web_origin(&endpoint);
 
     for round in 0..5 {
         let session_id = format!("webrtc-sd-exit-{round}");
@@ -458,7 +444,7 @@ fn external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup() {
             botster_hub_client::DaemonRequest::IssueLocalWebrtcBootstrap {
                 package_name: "botster-web".to_string(),
                 entrypoint_id: "web-client".to_string(),
-                origin: format!("http://127.0.0.1:{web_listener_port}"),
+                origin: web_origin.clone(),
             },
         )
         .expect("issue local WebRTC bootstrap")
@@ -654,37 +640,10 @@ fn local_webrtc_chunks_oversized_encrypted_daemon_response() {
     enable_supervised_package(&data_dir, &package_dir);
     enable_supervised_package(&data_dir, &provider_package_dir);
 
-    let web_listener_port = unused_loopback_port();
-    let start = botster_hub_client::request(
-        &endpoint,
-        botster_hub_client::DaemonRequest::StartPackageEntrypoint {
-            package_name: "botster-web".to_string(),
-            entrypoint_id: "web-client".to_string(),
-            environment_overrides: BTreeMap::from([(
-                "BOTSTER_WEB_PORT".to_string(),
-                web_listener_port.to_string(),
-            )]),
-        },
-    )
-    .expect("start botster-web entrypoint");
-    assert_eq!(start.kind, botster_hub_client::DaemonResponseKind::Packages);
-    let bootstrap = botster_hub_client::request(
-        &endpoint,
-        botster_hub_client::DaemonRequest::IssueLocalWebrtcBootstrap {
-            package_name: "botster-web".to_string(),
-            entrypoint_id: "web-client".to_string(),
-            origin: format!("http://127.0.0.1:{web_listener_port}"),
-        },
-    )
-    .expect("issue local WebRTC bootstrap")
-    .local_webrtc_bootstrap
-    .expect("bootstrap response includes local WebRTC bootstrap");
+    let (web_origin, bootstrap) = start_botster_web_and_issue_bootstrap(&endpoint);
     assert_eq!(bootstrap.package_name, "botster-web");
     assert_eq!(bootstrap.entrypoint_id, "web-client");
-    assert_eq!(
-        bootstrap.expected_origin,
-        format!("http://127.0.0.1:{web_listener_port}")
-    );
+    assert_eq!(bootstrap.expected_origin, web_origin);
     assert_eq!(bootstrap.signaling_transport, "daemon_request");
     assert_eq!(bootstrap.data_plane, "webrtc_data_channel");
     assert!(bootstrap.ordered);
@@ -1147,17 +1106,13 @@ fn botster_web_same_url_reload_issues_fresh_local_webrtc_bootstrap() {
     enable_supervised_package(&data_dir, &package_dir);
     log_botster_web_phase(test_started, "package_enabled");
 
-    let web_listener_port = unused_loopback_port();
     let start = botster_hub_client::request(
         &endpoint,
         botster_hub_client::DaemonRequest::StartPackageEntrypoint {
             package_name: "botster-web".to_string(),
             entrypoint_id: "web-client".to_string(),
             environment_overrides: BTreeMap::from([
-                (
-                    "BOTSTER_WEB_PORT".to_string(),
-                    web_listener_port.to_string(),
-                ),
+                ("BOTSTER_WEB_PORT".to_string(), "0".to_string()),
                 (
                     "BOTSTER_WEB_TEST_STARTUP_DELAY_MS".to_string(),
                     BOTSTER_WEB_READINESS_STARTUP_DELAY_MS.to_string(),
@@ -1166,9 +1121,13 @@ fn botster_web_same_url_reload_issues_fresh_local_webrtc_bootstrap() {
         },
     )
     .expect("start botster-web entrypoint");
-    assert_eq!(start.kind, botster_hub_client::DaemonResponseKind::Packages);
+    assert_daemon_response_ok(
+        &start,
+        botster_hub_client::DaemonResponseKind::Packages,
+        "start botster-web entrypoint",
+    );
     log_botster_web_phase(test_started, "entrypoint_start_returned");
-    let web_origin = format!("http://127.0.0.1:{web_listener_port}");
+    let web_origin = wait_for_published_web_origin(&endpoint);
     let expected_local_url = format!("{web_origin}/");
     let apps =
         wait_for_botster_web_readiness(&endpoint, &web_origin, &expected_local_url, test_started);
@@ -1513,31 +1472,7 @@ fn local_webrtc_peer_close_detaches_terminal_subscriptions() {
     let child = start_cli_daemon(&data_dir);
     enable_supervised_package(&data_dir, &package_dir);
 
-    let web_listener_port = unused_loopback_port();
-    let start = botster_hub_client::request(
-        &endpoint,
-        botster_hub_client::DaemonRequest::StartPackageEntrypoint {
-            package_name: "botster-web".to_string(),
-            entrypoint_id: "web-client".to_string(),
-            environment_overrides: BTreeMap::from([(
-                "BOTSTER_WEB_PORT".to_string(),
-                web_listener_port.to_string(),
-            )]),
-        },
-    )
-    .expect("start botster-web entrypoint");
-    assert_eq!(start.kind, botster_hub_client::DaemonResponseKind::Packages);
-    let bootstrap = botster_hub_client::request(
-        &endpoint,
-        botster_hub_client::DaemonRequest::IssueLocalWebrtcBootstrap {
-            package_name: "botster-web".to_string(),
-            entrypoint_id: "web-client".to_string(),
-            origin: format!("http://127.0.0.1:{web_listener_port}"),
-        },
-    )
-    .expect("issue local WebRTC bootstrap")
-    .local_webrtc_bootstrap
-    .expect("bootstrap response includes local WebRTC bootstrap");
+    let (_web_origin, bootstrap) = start_botster_web_and_issue_bootstrap(&endpoint);
     let stream_key = local_webrtc_stream_key(&bootstrap.grant_secret);
 
     block_on(async {
@@ -1881,7 +1816,6 @@ fn daemon_package_entity_held_open_fanout_over_local_webrtc() {
     enable_supervised_package(&data_dir, &web_package_dir);
     enable_mutation_package(&endpoint, package_dir);
 
-    let web_listener_port = unused_loopback_port();
     let start = botster_hub_client::request(
         &endpoint,
         botster_hub_client::DaemonRequest::StartPackageEntrypoint {
@@ -1889,13 +1823,17 @@ fn daemon_package_entity_held_open_fanout_over_local_webrtc() {
             entrypoint_id: "web-client".to_string(),
             environment_overrides: BTreeMap::from([(
                 "BOTSTER_WEB_PORT".to_string(),
-                web_listener_port.to_string(),
+                "0".to_string(),
             )]),
         },
     )
     .expect("start botster-web");
-    assert_eq!(start.kind, botster_hub_client::DaemonResponseKind::Packages);
-    let web_origin = format!("http://127.0.0.1:{web_listener_port}");
+    assert_daemon_response_ok(
+        &start,
+        botster_hub_client::DaemonResponseKind::Packages,
+        "start botster-web",
+    );
+    let web_origin = wait_for_published_web_origin(&endpoint);
     let expected_local_url = format!("{web_origin}/");
     let _apps =
         wait_for_botster_web_readiness(&endpoint, &web_origin, &expected_local_url, Instant::now());
