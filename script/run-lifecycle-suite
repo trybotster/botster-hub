@@ -7,7 +7,126 @@ test_sh="$root/test.sh"
 settle_seconds=${BOTSTER_LIFECYCLE_CENSUS_SETTLE_SECONDS:-2}
 force_dirty=${BOTSTER_LIFECYCLE_SUITE_FORCE_DIRTY:-0}
 
+parse_failed_count() {
+  awk '
+    /^test result:/ {
+      if (match($0, /[0-9]+ failed/)) {
+        token = substr($0, RSTART, RLENGTH)
+        sub(/ failed/, "", token)
+        print token
+        exit
+      }
+    }
+  ' "$1"
+}
+
+count_failed_tests() {
+  grep -cE '^test .+ \.\.\. FAILED$' "$1" || true
+}
+
+count_taint_markers() {
+  grep -c 'environment_tainted:' "$1" || true
+}
+
+count_confirmed_host_markers() {
+  grep -cE 'harness_budget_expired kind=.*(resource=(EMFILE|ENFILE|PTY)|probe=confirmed)' "$1" || true
+}
+
+classify_suite_log() {
+  log=$1
+  tally_count=$(grep -c '^test result:' "$log" || true)
+  failed=$(parse_failed_count "$log")
+  failed=${failed:-}
+  if [ -z "$failed" ]; then
+    failed=0
+  fi
+  failed_tests=$(count_failed_tests "$log")
+  tainted=$(count_taint_markers "$log")
+  confirmed_host=$(count_confirmed_host_markers "$log")
+  if [ "$tally_count" != "1" ]; then
+    verdict=product_failure
+  elif [ "$failed" = "0" ] && [ "$failed_tests" = "0" ]; then
+    verdict=clean
+  elif [ "$tainted" -gt 0 ] && [ "$failed_tests" -le "$tainted" ] && [ "$confirmed_host" -eq 0 ]; then
+    verdict=environment_tainted
+  elif [ "$failed" -gt 0 ] && [ "$failed_tests" -gt 0 ] && [ "$confirmed_host" -ge "$failed_tests" ]; then
+    verdict=host_exhaustion
+  else
+    verdict=product_failure
+  fi
+  printf '%s\n' "verdict=$verdict failed=$failed tally=$tally_count failed_tests=$failed_tests tainted=$tainted confirmed_host=$confirmed_host"
+}
+
+write_classify_fixture() {
+  path=$1
+  shift
+  printf '%s\n' "$@" >"$path"
+}
+
+self_test_classifier() {
+  fixtures=$(mktemp -d /tmp/bh-suite-classify.XXXXXX)
+  trap 'rm -rf "$fixtures"' EXIT INT TERM
+  write_classify_fixture "$fixtures/clean.log" \
+    'test unique_test_dirs_include_process_id ... ok' \
+    'test result: ok. 219 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s'
+  write_classify_fixture "$fixtures/product.log" \
+    'test product_assertion_fails ... FAILED' \
+    'test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s'
+  write_classify_fixture "$fixtures/taint.log" \
+    'environment_tainted: injected prove-absence failure' \
+    'test taint_latch_refuses_next_daemon_start_without_spawning ... FAILED' \
+    'test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s'
+  write_classify_fixture "$fixtures/emfile.log" \
+    'harness_budget_expired kind=child_condition budget_ms=10 resource=EMFILE probe=n/a real child open' \
+    'test real_emfile_child_classifies_as_host_exhaustion ... FAILED' \
+    'test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s'
+  write_classify_fixture "$fixtures/enfile.log" \
+    'harness_budget_expired kind=child_condition budget_ms=10 resource=ENFILE probe=n/a' \
+    'test enfile_child ... FAILED' \
+    'test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s'
+  write_classify_fixture "$fixtures/pty.log" \
+    'harness_budget_expired kind=child_condition budget_ms=10 resource=PTY probe=n/a' \
+    'test pty_allocation ... FAILED' \
+    'test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s'
+  write_classify_fixture "$fixtures/probe.log" \
+    'harness_budget_expired kind=entity_frame budget_ms=5000 resource=EAGAIN probe=confirmed socket stall' \
+    'test ambiguous_probe_confirmed ... FAILED' \
+    'test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s'
+  write_classify_fixture "$fixtures/mixed.log" \
+    'harness_budget_expired kind=child_condition budget_ms=10 resource=EMFILE probe=n/a' \
+    'test host_case ... FAILED' \
+    'test product_case ... FAILED' \
+    'test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s'
+  write_classify_fixture "$fixtures/two_tally.log" \
+    'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out' \
+    'test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out'
+  expect_verdict() {
+    log=$1
+    expected=$2
+    got=$(classify_suite_log "$log")
+    printf '%s\n' "$got" | grep -q "verdict=$expected" || {
+      echo "classifier fixture $log expected verdict=$expected got $got" >&2
+      exit 1
+    }
+  }
+  expect_verdict "$fixtures/clean.log" clean
+  expect_verdict "$fixtures/product.log" product_failure
+  expect_verdict "$fixtures/taint.log" environment_tainted
+  expect_verdict "$fixtures/emfile.log" host_exhaustion
+  expect_verdict "$fixtures/enfile.log" host_exhaustion
+  expect_verdict "$fixtures/pty.log" host_exhaustion
+  expect_verdict "$fixtures/probe.log" host_exhaustion
+  expect_verdict "$fixtures/mixed.log" product_failure
+  expect_verdict "$fixtures/two_tally.log" product_failure
+  clean_failed=$(parse_failed_count "$fixtures/clean.log")
+  [ "$clean_failed" = "0" ] || {
+    echo "clean fixture must parse failed=0, got $clean_failed" >&2
+    exit 1
+  }
+}
+
 self_test() {
+  self_test_classifier
   fixture=$(mktemp -d /tmp/bh-suite-selftest.XXXXXX)
   worker="$fixture/botster-session-worker"
   printf '%s\n' '#!/bin/sh' 'sleep 30' >"$worker"
@@ -52,11 +171,6 @@ self_test() {
     echo "dirty-environment wrapper must not kill the listed fixture" >&2
     exit 1
   }
-  two_tally=$(printf '%s\n' 'test result: ok. 1 passed' 'test result: FAILED. 1 failed' | grep -c '^test result:' || true)
-  [ "$two_tally" = "2" ] || {
-    echo "tally classifier self-evidence must observe two result lines" >&2
-    exit 1
-  }
   echo "lifecycle suite wrapper self-test passed"
 }
 
@@ -66,11 +180,18 @@ if [ "${1-}" = "--self-test" ]; then
   exit 0
 fi
 
+if [ "${1-}" = "--classify-log" ]; then
+  [ "$#" -eq 2 ] || exit 64
+  classify_suite_log "$2"
+  exit 0
+fi
+
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/bh-lifecycle-suite.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
 pre_dev="$tmp/pre-dev-artifacts.tsv"
 pre_zombies="$tmp/pre-zombies.tsv"
+pre_all_zombies="$tmp/pre-all-zombies.tsv"
 paths="$tmp/owned-paths.txt"
 suite_log="$tmp/suite.log"
 post_live="$tmp/post-live.tsv"
@@ -85,11 +206,12 @@ printf '%s\n' \
 
 "$census" dev-artifact-rows >"$pre_dev"
 "$census" botster-zombies >"$pre_zombies"
+"$census" all-zombies >"$pre_all_zombies"
 
 if [ -s "$pre_dev" ] || [ -s "$pre_zombies" ]; then
   if [ "$force_dirty" != "1" ]; then
     printf '%s\n' "verdict=environment_dirty" | tee "$verdict_file"
-    echo "pre-run Botster dev-artifact or zombie evidence:" >&2
+    echo "pre-run Botster dev-artifact or attributable zombie evidence:" >&2
     cat "$pre_dev" "$pre_zombies" >&2 || true
     exit 2
   fi
@@ -106,13 +228,19 @@ set -e
 cat "$suite_log"
 
 tally_count=$(grep -c '^test result:' "$suite_log" || true)
-if [ "$tally_count" != "1" ]; then
-  printf '%s\n' "verdict=product_failure reason=tally_count=$tally_count" | tee "$verdict_file"
-  exit 1
-fi
+classification=$(classify_suite_log "$suite_log")
+failed=$(printf '%s\n' "$classification" | sed -n 's/.*failed=\([0-9][0-9]*\).*/\1/p')
+failed=${failed:-0}
+tainted=$(printf '%s\n' "$classification" | sed -n 's/.*tainted=\([0-9][0-9]*\).*/\1/p')
+tainted=${tainted:-0}
+verdict=$(printf '%s\n' "$classification" | sed -n 's/^verdict=\([^ ]*\).*/\1/p')
 
 "$census" assert-no-live-executables "$paths" "$post_live" "$settle_seconds" || true
-"$census" assert-no-new-zombies "$pre_zombies" "$post_zombies" "$settle_seconds" || true
+"$census" all-zombies >"$tmp/post-all-zombies.tsv"
+awk -F '\t' '
+  FILENAME == ARGV[1] { before[$1]=1; next }
+  !before[$1] { print }
+' "$pre_all_zombies" "$tmp/post-all-zombies.tsv" >"$post_zombies" || true
 "$census" dev-artifact-rows >"$post_dev"
 awk -F '\t' '
   FILENAME == ARGV[1] { before[$1]=1; next }
@@ -124,31 +252,17 @@ if [ -s "$post_live" ] || [ -s "$post_zombies" ] || [ -s "$tmp/dev-delta.tsv" ];
   survivors=1
 fi
 
-failed=$(awk '/^test result:/{print $4; exit}' "$suite_log")
-failed=${failed:-0}
-tainted=$(grep -c 'environment_tainted:' "$suite_log" || true)
-host_markers=$(grep -c 'harness_budget_expired kind=' "$suite_log" || true)
-confirmed_host=$(grep -c 'harness_budget_expired kind=.*resource=\(EMFILE\|ENFILE\|PTY\).*probe=' "$suite_log" || true)
-confirmed_probe=$(grep -c 'harness_budget_expired kind=.*probe=confirmed' "$suite_log" || true)
-product_failures=$(grep -E 'FAILED|panicked at' "$suite_log" | grep -v environment_tainted | grep -v 'harness_budget_expired kind=.*resource=\(EMFILE\|ENFILE\|PTY\)' | grep -v 'probe=confirmed' | wc -l | tr -d ' ')
-
 if [ "$dirty_forced" = "1" ]; then
   verdict="environment_dirty_forced"
-elif [ "$failed" = "0" ]; then
-  verdict="clean"
-elif [ "$tainted" -gt 0 ] && [ "$product_failures" = "0" ]; then
-  verdict="environment_tainted"
-elif [ "$failed" -gt 0 ] && [ "$product_failures" = "0" ] && { [ "$confirmed_host" -gt 0 ] || [ "$confirmed_probe" -gt 0 ]; }; then
-  verdict="host_exhaustion"
-else
-  verdict="product_failure"
 fi
-
 if [ "$survivors" = "1" ]; then
   verdict="${verdict}+survivors_present"
 fi
 
 printf '%s\n' "verdict=$verdict failed=$failed tally=$tally_count survivors=$survivors tainted=$tainted" | tee "$verdict_file"
+if [ "$tally_count" != "1" ]; then
+  echo "tally evidence: tally_count=$tally_count" >&2
+fi
 if [ "$survivors" = "1" ]; then
   echo "survivor evidence:" >&2
   cat "$post_live" "$post_zombies" "$tmp/dev-delta.tsv" >&2 || true

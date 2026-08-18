@@ -84,7 +84,9 @@ pub(crate) fn start_cli_daemon_with_worker_egress_capacity(
     daemon
 }
 
-pub(crate) fn start_cli_daemon_with_snapshot_history_failure(data_dir: &Path) -> PanicSafeCliDaemon {
+pub(crate) fn start_cli_daemon_with_snapshot_history_failure(
+    data_dir: &Path,
+) -> PanicSafeCliDaemon {
     check_harness_taint();
     ensure_session_worker_binary();
     let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
@@ -101,11 +103,8 @@ pub(crate) fn start_cli_daemon_with_snapshot_history_failure(data_dir: &Path) ->
     let child = command
         .spawn()
         .expect("spawn botster-hub start with snapshot history failure");
-    let mut daemon = PanicSafeCliDaemon::from_child(
-        data_dir,
-        child,
-        "snapshot-history-failure daemon",
-    );
+    let mut daemon =
+        PanicSafeCliDaemon::from_child(data_dir, child, "snapshot-history-failure daemon");
     wait_for_status(data_dir, daemon.child_mut());
     daemon
 }
@@ -451,15 +450,11 @@ impl PanicSafeCliDaemon {
         let socket_present = daemon_socket_path(&self.data_dir).exists();
 
         if !skip_sessions {
+            self.known_worker_pids
+                .extend(collect_owned_session_process_pids(&self.data_dir).unwrap_or_default());
             if socket_present {
                 match shutdown_owned_sessions(&self.data_dir) {
                     Ok(records) => {
-                        self.known_worker_pids.extend(
-                            registry_backed_worker_identities(&self.data_dir)
-                                .unwrap_or_default()
-                                .into_iter()
-                                .filter_map(|identity| identity.pid),
-                        );
                         self.shutdown_records = records;
                     }
                     Err(error) => {
