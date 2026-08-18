@@ -3563,23 +3563,27 @@ fn ready_spawn_completes_when_live_sessions_exceed_one_observe_slice() {
     );
     let child = start_cli_daemon(&data_dir);
     for index in 0..24 {
-        botster_hub_client::request(
+        let session_id = format!("load-session-{index}");
+        let spawn = botster_hub_client::request(
             &endpoint,
             botster_hub_client::DaemonRequest::Spawn {
-                session_id: format!("load-session-{index}"),
+                session_id: session_id.clone(),
                 command: "sleep 8".to_string(),
             },
         )
-        .expect("spawn load session");
+        .unwrap_or_else(|error| panic!("spawn {session_id}: {error}"));
+        assert_eq!(
+            spawn.kind,
+            botster_hub_client::DaemonResponseKind::Spawned,
+            "load spawn {session_id} must succeed: {spawn:?}"
+        );
     }
     let mut first = botster_hub_client::subscribe_session_entities(&endpoint, "load-sub-one")
         .expect("first load subscriber");
     let mut second = botster_hub_client::subscribe_session_entities(&endpoint, "load-sub-two")
         .expect("second load subscriber");
-    let _ = first.next_frame();
-    let _ = second.next_frame();
     let started = Instant::now();
-    botster_hub_client::request(
+    let ready = botster_hub_client::request(
         &endpoint,
         botster_hub_client::DaemonRequest::Spawn {
             session_id: "load-ready-spawn".to_string(),
@@ -3587,11 +3591,42 @@ fn ready_spawn_completes_when_live_sessions_exceed_one_observe_slice() {
         },
     )
     .expect("ready spawn during loaded observe");
+    assert_eq!(
+        ready.kind,
+        botster_hub_client::DaemonResponseKind::Spawned,
+        "ready spawn must succeed: {ready:?}"
+    );
     let waited = started.elapsed();
     eprintln!("ready spawn duration observation (observe-slice load): {waited:?}");
+    let first_snapshot = read_first_session_snapshot(&mut first);
+    let second_snapshot = read_first_session_snapshot(&mut second);
+    assert_first_snapshot_contains_load_sessions(&first_snapshot);
+    assert_first_snapshot_contains_load_sessions(&second_snapshot);
     let _ = first.unsubscribe();
     let _ = second.unsubscribe();
     shutdown_cli_daemon(&data_dir, child);
+}
+
+fn load_session_id(index: usize) -> String {
+    format!("load-session-{index}")
+}
+
+fn expected_load_session_ids() -> std::collections::BTreeSet<String> {
+    (0..24).map(load_session_id).collect()
+}
+
+fn assert_first_snapshot_contains_load_sessions(
+    frame: &botster_hub_client::DaemonEntityFrame,
+) -> std::collections::BTreeSet<String> {
+    let seen = snapshot_session_identities(frame);
+    let expected = expected_load_session_ids();
+    let missing: Vec<String> = expected.difference(&seen).cloned().collect();
+    assert!(
+        missing.is_empty(),
+        "first Snapshot must contain all 24 load identities; missing={missing:?}; seen={}",
+        seen.len()
+    );
+    seen
 }
 
 fn assemble_session_id(index: usize) -> String {
@@ -3767,6 +3802,69 @@ fn ready_spawn_completes_during_session_snapshot_assembly() {
     let first = read_first_session_snapshot(&mut subscription);
     assert_first_snapshot_contains_assemble_sessions(&first);
     let _ = subscription.unsubscribe();
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn first_session_snapshot_arrives_after_projected_spawn_is_removed() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("retire-ack-resubscribe");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("test config has local socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    let session_id = "retire-session-00";
+    let spawn = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: session_id.to_string(),
+            command: "sleep 8".to_string(),
+        },
+    )
+    .unwrap_or_else(|error| panic!("spawn {session_id}: {error}"));
+    assert_eq!(
+        spawn.kind,
+        botster_hub_client::DaemonResponseKind::Spawned,
+        "retire spawn must succeed: {spawn:?}"
+    );
+    let mut first = botster_hub_client::subscribe_session_entities(&endpoint, "retire-sub-one")
+        .expect("first retire subscriber");
+    let first_snapshot = read_first_session_snapshot(&mut first);
+    let first_ids = snapshot_session_identities(&first_snapshot);
+    assert!(
+        first_ids.contains(session_id),
+        "first Snapshot must contain the spawned session; seen={first_ids:?}"
+    );
+    first.unsubscribe().expect("unsubscribe first retire subscriber");
+    let shutdown = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::ShutdownSession {
+            session_id: session_id.to_string(),
+        },
+    )
+    .expect("shutdown projected spawn");
+    assert_eq!(
+        shutdown.kind,
+        botster_hub_client::DaemonResponseKind::Events,
+        "shutdown must succeed: {shutdown:?}"
+    );
+    let mut second = botster_hub_client::subscribe_session_entities(&endpoint, "retire-sub-two")
+        .expect("second retire subscriber");
+    let second_snapshot = read_first_session_snapshot(&mut second);
+    match &second_snapshot {
+        botster_hub_client::DaemonEntityFrame::Snapshot { .. } => {}
+        other => panic!("second subscribe must receive a Snapshot, got {other:?}"),
+    }
+    second
+        .unsubscribe()
+        .expect("unsubscribe second retire subscriber");
     shutdown_cli_daemon(&data_dir, child);
 }
 
