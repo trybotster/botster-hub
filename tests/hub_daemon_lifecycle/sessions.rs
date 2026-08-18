@@ -3814,8 +3814,16 @@ fn assert_cli_fixture_absent_fails_when_setsid_child_survives() {
     }));
     let _ = child.kill();
     let _ = child.wait();
+    reap_captured_pty_children(&pty_children)
+        .expect("negative control must reap the captured setsid process group");
     reap_processes_matching_marker(&marker)
-        .expect("negative control must reap its setsid child");
+        .expect("negative control must reap leftover marked argv rows");
+    let leftovers = live_captured_pty_rows(&pty_children)
+        .expect("negative control leftover census");
+    assert!(
+        leftovers.is_empty(),
+        "negative control must not leak marker-less sleep children: {leftovers:?}"
+    );
     assert!(
         failed.is_err(),
         "survivor oracle must fail while a representative setsid child remains alive"

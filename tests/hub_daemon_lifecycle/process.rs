@@ -687,6 +687,67 @@ fn pty_identity_for_pid(pid: u32, command: &str) -> Result<PtyChildIdentity, Str
     })
 }
 
+/// Reap captured PTY identities by exact pid and process group.
+///
+/// A marked wrapper that does not `exec` can leave a marker-less `sleep`
+/// child in the same independently sessioned PGID. Marker census cannot see
+/// that child after the wrapper is already dead.
+pub(crate) fn reap_captured_pty_children(children: &[PtyChildIdentity]) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let live_rows = live_captured_pty_rows(children)?;
+        if live_rows.is_empty() {
+            return Ok(());
+        }
+        let signal = if Instant::now() + Duration::from_millis(400) >= deadline {
+            libc::SIGKILL
+        } else {
+            libc::SIGTERM
+        };
+        let mut pgids = std::collections::BTreeSet::new();
+        for child in children {
+            pgids.insert(child.pgid);
+            let _ = unsafe { libc::kill(child.pid as libc::pid_t, signal) };
+        }
+        for pgid in pgids {
+            if pgid > 1 {
+                let _ = unsafe { libc::killpg(pgid, signal) };
+            }
+        }
+        if Instant::now() >= deadline {
+            let still = live_captured_pty_rows(children)?;
+            if still.is_empty() {
+                return Ok(());
+            }
+            return Err(format!(
+                "leftover captured PTY process groups; rows={still:?}"
+            ));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+pub(crate) fn live_captured_pty_rows(children: &[PtyChildIdentity]) -> Result<Vec<String>, String> {
+    let mut rows = Vec::new();
+    let mut seen_pgids = std::collections::BTreeSet::new();
+    for child in children {
+        if process_is_alive_u32(child.pid).unwrap_or(true) {
+            rows.push(format!(
+                "pid={} pgid={} sid={} command={}",
+                child.pid, child.pgid, child.sid, child.command
+            ));
+        }
+        if child.pgid > 1 && seen_pgids.insert(child.pgid) {
+            for row in process_group_census(child.pgid)? {
+                rows.push(row);
+            }
+        }
+    }
+    rows.sort();
+    rows.dedup();
+    Ok(rows)
+}
+
 pub(crate) fn reap_processes_matching_marker(marker: &str) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
