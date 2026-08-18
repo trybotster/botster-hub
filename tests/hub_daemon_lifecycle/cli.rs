@@ -482,6 +482,9 @@ impl PanicSafeCliDaemon {
                 for pid in outcome.reaped {
                     self.owned_sessions.push_pid(pid);
                 }
+                for pid in outcome.retained {
+                    self.owned_sessions.push_pid(pid);
+                }
                 for error in outcome.errors {
                     record_harness_taint(format!(
                         "{}: {label} incomplete: {error}",
