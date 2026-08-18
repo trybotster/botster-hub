@@ -142,7 +142,7 @@ Temporary ablation: remove `!caught_up ||` from the production guard in `continu
 | `./test.sh --locked --test hub_daemon_lifecycle_test assemble_subscription_rejects` | 1 passed |
 | `./test.sh --locked --test hub_daemon_lifecycle_test assemble_readiness_rejects` | 1 passed |
 | `./test.sh --locked --test hub_daemon_lifecycle_test first_session_snapshot_arrives_after_projected_spawn_is_removed` | 1 passed |
-| `./test.sh --locked --test hub_daemon_lifecycle_test ready_spawn_completes` × 20 this visit | 20 pass, 0 fail on the remint tree; both ready_spawn tests green |
+| `./test.sh --locked --test hub_daemon_lifecycle_test ready_spawn_completes` × 20 this visit | 20 pass, 0 fail on `c27b39c`; both ready_spawn tests green |
 
 Downstream proof: not required. No public DTO, pin, or client-contract change.
 
