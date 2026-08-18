@@ -19,9 +19,12 @@ It does this, in order:
 Verdict order:
 
 1. `environment_dirty` — pre-run leftovers (or `environment_dirty_forced`).
-2. `product_failure` — any failed test without a confirmed host-resource marker.
-3. `host_exhaustion` — every failure carries `harness_budget_expired` with
-   `EMFILE`/`ENFILE`/`PTY` or `probe=confirmed`.
+2. `product_failure` — any failed test without its own matching
+   `harness_budget_expired test=<that rust test name>` marker that confirms
+   host-resource exhaustion.
+3. `host_exhaustion` — every failed test has its own matching named marker
+   with `EMFILE`/`ENFILE`/`PTY` or `probe=confirmed`. Global marker presence
+   is not enough.
 4. `clean` — zero failures, one tally, empty post-run census.
 
 `environment_tainted` failures from the process-wide latch are grouped under

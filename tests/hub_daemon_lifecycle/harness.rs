@@ -135,6 +135,18 @@ impl OwnedSessionProcesses {
     }
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct IdentityCapture {
+    pub(crate) owned: OwnedSessionProcesses,
+    pub(crate) errors: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct WorkerReapOutcome {
+    pub(crate) reaped: Vec<u32>,
+    pub(crate) errors: Vec<String>,
+}
+
 pub(crate) fn harness_taint_cell() -> &'static Mutex<Option<String>> {
     HARNESS_TAINT.get_or_init(|| Mutex::new(None))
 }
@@ -354,34 +366,57 @@ pub(crate) fn try_terminate_and_reap_child(child: &mut Child) -> Result<String, 
     ))
 }
 
-pub(crate) fn collect_owned_session_processes(
-    data_dir: &Path,
-) -> Result<OwnedSessionProcesses, String> {
-    let mut owned = OwnedSessionProcesses::default();
+pub(crate) fn collect_owned_session_processes(data_dir: &Path) -> Result<IdentityCapture, String> {
+    let mut capture = IdentityCapture::default();
     for identity in registry_backed_worker_identities(data_dir)? {
         let Some(command_pid) = identity.pid else {
+            capture.errors.push(format!(
+                "registry session {} has no process pid",
+                identity.session_id
+            ));
             continue;
         };
-        owned.push_pid(command_pid);
-        if let Some(snapshot) = process_snapshot(command_pid) {
-            owned.push_pgid(snapshot.pgid);
+        capture.owned.push_pid(command_pid);
+        match process_snapshot(command_pid) {
+            Some(snapshot) => capture.owned.push_pgid(snapshot.pgid),
+            None => capture.errors.push(format!(
+                "process snapshot missing for registered command {command_pid} session {}",
+                identity.session_id
+            )),
         }
-        if let Some(worker_pid) = worktree_session_worker_ancestor(command_pid) {
-            owned.push_pid(worker_pid);
-            if let Some(snapshot) = process_snapshot(worker_pid) {
-                owned.push_pgid(snapshot.pgid);
-            }
-            if let Ok(descendants) = worker_owned_descendant_pids(worker_pid) {
-                for pid in descendants {
-                    owned.push_pid(pid);
-                    if let Some(snapshot) = process_snapshot(pid) {
-                        owned.push_pgid(snapshot.pgid);
+        match worktree_session_worker_ancestor(command_pid) {
+            Some(worker_pid) => {
+                capture.owned.push_pid(worker_pid);
+                if let Some(snapshot) = process_snapshot(worker_pid) {
+                    capture.owned.push_pgid(snapshot.pgid);
+                } else {
+                    capture.errors.push(format!(
+                        "process snapshot missing for worker {worker_pid} session {}",
+                        identity.session_id
+                    ));
+                }
+                match worker_owned_descendant_pids(worker_pid) {
+                    Ok(descendants) => {
+                        for pid in descendants {
+                            capture.owned.push_pid(pid);
+                            if let Some(snapshot) = process_snapshot(pid) {
+                                capture.owned.push_pgid(snapshot.pgid);
+                            }
+                        }
                     }
+                    Err(error) => capture.errors.push(format!(
+                        "descendant census failed for worker {worker_pid} session {}: {error}",
+                        identity.session_id
+                    )),
                 }
             }
+            None => capture.errors.push(format!(
+                "unresolved worktree session-worker ancestor for command {command_pid} session {}",
+                identity.session_id
+            )),
         }
     }
-    Ok(owned)
+    Ok(capture)
 }
 
 pub(crate) fn registry_backed_worker_identities(
@@ -543,30 +578,60 @@ pub(crate) fn shutdown_owned_sessions(
     Ok(records)
 }
 
-pub(crate) fn reap_registry_backed_workers(data_dir: &Path) -> Result<Vec<u32>, String> {
+pub(crate) fn reap_registry_backed_workers(data_dir: &Path) -> Result<WorkerReapOutcome, String> {
     let identities = registry_backed_worker_identities(data_dir)?;
-    let mut reaped = Vec::new();
+    let mut outcome = WorkerReapOutcome::default();
     for identity in identities {
         let Some(pid) = identity.pid else {
-            for worker in live_session_workers_for_data_dir(data_dir)? {
-                if worker_pid_matches_worktree_session_worker(worker.pid) {
-                    signal_worker_group(worker.pid)?;
-                    reaped.push(worker.pid);
+            match live_session_workers_for_data_dir(data_dir) {
+                Ok(workers) => {
+                    let mut matched = false;
+                    for worker in workers {
+                        if worker_pid_matches_worktree_session_worker(worker.pid) {
+                            match signal_worker_group(worker.pid) {
+                                Ok(()) => outcome.reaped.push(worker.pid),
+                                Err(error) => outcome.errors.push(error),
+                            }
+                            matched = true;
+                        }
+                    }
+                    if !matched {
+                        outcome.errors.push(format!(
+                            "registry session {} has no process pid and no worktree session-worker",
+                            identity.session_id
+                        ));
+                    }
                 }
+                Err(error) => outcome.errors.push(error),
             }
             continue;
         };
-        let worker_pid = worktree_session_worker_ancestor(pid).unwrap_or(pid);
-        if !worker_pid_matches_worktree_session_worker(worker_pid) && worker_pid == pid {
-            continue;
+        match worktree_session_worker_ancestor(pid) {
+            Some(worker_pid) => {
+                match signal_worker_group(worker_pid) {
+                    Ok(()) => outcome.reaped.push(worker_pid),
+                    Err(error) => outcome.errors.push(error),
+                }
+                if worker_pid != pid {
+                    match signal_worker_group(pid) {
+                        Ok(()) => outcome.reaped.push(pid),
+                        Err(error) => outcome.errors.push(error),
+                    }
+                }
+            }
+            None => {
+                outcome.errors.push(format!(
+                    "unresolved worktree session-worker ancestor for command {pid} session {}",
+                    identity.session_id
+                ));
+                match signal_worker_group(pid) {
+                    Ok(()) => outcome.reaped.push(pid),
+                    Err(error) => outcome.errors.push(error),
+                }
+            }
         }
-        signal_worker_group(worker_pid)?;
-        if worker_pid != pid {
-            signal_worker_group(pid)?;
-        }
-        reaped.push(worker_pid);
     }
-    Ok(reaped)
+    Ok(outcome)
 }
 
 fn signal_worker_group(pid: u32) -> Result<(), String> {

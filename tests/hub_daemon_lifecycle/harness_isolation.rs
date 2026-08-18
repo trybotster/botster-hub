@@ -233,12 +233,18 @@ fn dead_daemon_backstop_reaps_registry_worker_without_adopting_foreign() {
         libc::kill(daemon_a.id() as libc::pid_t, libc::SIGKILL);
     }
     let _ = daemon_a.child_mut().wait();
+    let _ = daemon_a.disarm();
     assert!(
         process_exists(worker_a_pid),
         "durable worker A must survive Hub SIGKILL before backstop"
     );
     let reaped = reap_registry_backed_workers(&data_dir_a).expect("A backstop");
-    assert!(!reaped.is_empty(), "A backstop must reap its worker");
+    assert!(
+        reaped.errors.is_empty(),
+        "A backstop must verify worker ancestry: {:?}",
+        reaped.errors
+    );
+    assert!(!reaped.reaped.is_empty(), "A backstop must reap its worker");
     let leftover_a = live_session_workers_for_data_dir(&data_dir_a).expect("A leftover");
     assert!(leftover_a.is_empty(), "A workers must be gone: {leftover_a:?}");
     let leftover_b = live_session_workers_for_data_dir(&data_dir_b).expect("B leftover");
@@ -379,6 +385,63 @@ fn identity_capture_error_taints_and_blocks_next_start() {
     assert!(
         panicked.is_err(),
         "next daemon start must fail after identity capture taint"
+    );
+    reset_harness_taint_after_proof();
+}
+
+#[test]
+fn unresolved_worker_ancestor_taints_and_retains_command_pid() {
+    let _lock = daemon_test_guard();
+    let data_dir = unique_short_test_dir("gua");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+    let mut decoy = ChildCleanup::spawn_non_botster_decoy();
+    let command_pid = decoy.id();
+    let daemon = start_cli_daemon(&data_dir);
+    let registry = SessionRegistry::new(data_dir.clone());
+    let record = RegistryRecord::running(
+        SessionId("unresolved-ancestor".to_string()),
+        Some(ProcessIdentity {
+            pid: Some(command_pid),
+            runtime_id: Some("unresolved-ancestor-runtime".to_string()),
+        }),
+        ResizePayload { rows: 24, cols: 80 },
+        "sleep".to_string(),
+        1,
+    );
+    registry
+        .save(&record)
+        .expect("forged registry fixture should save");
+    let capture = collect_owned_session_processes(&data_dir).expect("partial capture");
+    assert!(
+        capture.owned.pids.contains(&command_pid),
+        "command pid {command_pid} must be retained: {:?}",
+        capture.owned.pids
+    );
+    assert!(
+        capture.errors.iter().any(|error| {
+            error.contains("unresolved worktree session-worker ancestor")
+                && error.contains(&command_pid.to_string())
+        }),
+        "missing verified worker ancestor must be a capture error: {:?}",
+        capture.errors
+    );
+    drop(daemon);
+    assert!(
+        harness_taint().is_some_and(|evidence| {
+            evidence.contains("unresolved worktree session-worker ancestor")
+        }),
+        "unresolved worker ancestor must set the taint latch: {:?}",
+        harness_taint()
+    );
+    decoy.assert_alive();
+    let reap = reap_registry_backed_workers(&data_dir).expect("partial reap");
+    assert!(
+        reap.errors.iter().any(|error| {
+            error.contains("unresolved worktree session-worker ancestor")
+                && error.contains(&command_pid.to_string())
+        }),
+        "missing verified worker ancestor must fail closed on reap: {:?}",
+        reap.errors
     );
     reset_harness_taint_after_proof();
 }

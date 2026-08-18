@@ -439,6 +439,70 @@ impl PanicSafeCliDaemon {
         output
     }
 
+    fn retain_identity_capture(
+        &mut self,
+        trigger: CleanupTrigger,
+        capture: Result<IdentityCapture, String>,
+    ) {
+        match capture {
+            Ok(capture) => {
+                self.owned_sessions.extend(capture.owned);
+                for error in capture.errors {
+                    record_harness_taint(format!(
+                        "{}: identity capture incomplete: {error}",
+                        self.panic_context
+                    ));
+                    eprintln!(
+                        "{}: identity capture incomplete ({trigger:?}): {error}",
+                        self.panic_context
+                    );
+                }
+            }
+            Err(error) => {
+                record_harness_taint(format!(
+                    "{}: identity capture failed: {error}",
+                    self.panic_context
+                ));
+                eprintln!(
+                    "{}: identity capture failed ({trigger:?}): {error}",
+                    self.panic_context
+                );
+            }
+        }
+    }
+
+    fn retain_worker_reap(
+        &mut self,
+        trigger: CleanupTrigger,
+        label: &str,
+        outcome: Result<WorkerReapOutcome, String>,
+    ) {
+        match outcome {
+            Ok(outcome) => {
+                for pid in outcome.reaped {
+                    self.owned_sessions.push_pid(pid);
+                }
+                for error in outcome.errors {
+                    record_harness_taint(format!(
+                        "{}: {label} incomplete: {error}",
+                        self.panic_context
+                    ));
+                    eprintln!(
+                        "{}: {label} incomplete ({trigger:?}): {error}",
+                        self.panic_context
+                    );
+                }
+            }
+            Err(error) => {
+                record_harness_taint(format!("{}: {label} failed: {error}", self.panic_context));
+                eprintln!(
+                    "{}: {label} failed ({trigger:?}): {error}",
+                    self.panic_context
+                );
+            }
+        }
+    }
+
     pub(crate) fn cleanup_owned_resources(
         &mut self,
         trigger: CleanupTrigger,
@@ -455,19 +519,7 @@ impl PanicSafeCliDaemon {
             } else {
                 collect_owned_session_processes(&self.data_dir)
             };
-            match capture {
-                Ok(owned) => self.owned_sessions.extend(owned),
-                Err(error) => {
-                    record_harness_taint(format!(
-                        "{}: identity capture failed: {error}",
-                        self.panic_context
-                    ));
-                    eprintln!(
-                        "{}: identity capture failed ({trigger:?}): {error}",
-                        self.panic_context
-                    );
-                }
-            }
+            self.retain_identity_capture(trigger, capture);
             if socket_present {
                 match shutdown_owned_sessions(&self.data_dir) {
                     Ok(records) => {
@@ -478,31 +530,19 @@ impl PanicSafeCliDaemon {
                             "{}: production session cleanup failed ({trigger:?}): {error}",
                             self.panic_context
                         );
-                        match reap_registry_backed_workers(&self.data_dir) {
-                            Ok(pids) => {
-                                for pid in pids {
-                                    self.owned_sessions.push_pid(pid);
-                                }
-                            }
-                            Err(backstop) => eprintln!(
-                                "{}: registry-backed backstop failed: {backstop}",
-                                self.panic_context
-                            ),
-                        }
+                        self.retain_worker_reap(
+                            trigger,
+                            "registry-backed backstop",
+                            reap_registry_backed_workers(&self.data_dir),
+                        );
                     }
                 }
             } else {
-                match reap_registry_backed_workers(&self.data_dir) {
-                    Ok(pids) => {
-                        for pid in pids {
-                            self.owned_sessions.push_pid(pid);
-                        }
-                    }
-                    Err(error) => eprintln!(
-                        "{}: dead-daemon backstop failed: {error}",
-                        self.panic_context
-                    ),
-                }
+                self.retain_worker_reap(
+                    trigger,
+                    "dead-daemon backstop",
+                    reap_registry_backed_workers(&self.data_dir),
+                );
             }
         }
 
