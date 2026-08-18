@@ -3772,27 +3772,27 @@ fn assert_cli_fixture_absent_fails_when_setsid_child_survives() {
             .expect("unique data dir name")
     );
     let wrapper = write_marked_sleep_wrapper(&data_dir, &marker);
-    let mut child = spawn_setsid_marked_sleep(&marker, &wrapper);
+    let owner = PanicSafeSetsidChild::spawn(&marker, &wrapper);
+    let pty_children = vec![owner.identity().clone()];
+    let parent_sid = unsafe { libc::getsid(0) };
+    assert!(
+        owner.identity().sid != parent_sid,
+        "negative control child must leave the test SID via setsid: parent_sid={parent_sid} child={:?}",
+        owner.identity()
+    );
     let deadline = Instant::now() + Duration::from_secs(3);
-    let pty_children = loop {
-        let found = unix_processes_matching_marker(&marker)
-            .expect("all-session census for setsid negative control");
-        if !found.is_empty() {
-            break found;
+    loop {
+        match unix_processes_matching_marker(&marker) {
+            Ok(found) if !found.is_empty() => break,
+            Ok(_) => {}
+            Err(error) => panic!("all-session census for setsid negative control: {error}"),
         }
         assert!(
             Instant::now() < deadline,
             "negative control must observe the independently sessioned child: marker={marker}"
         );
         thread::sleep(Duration::from_millis(20));
-    };
-    let parent_sid = unsafe { libc::getsid(0) };
-    assert!(
-        pty_children
-            .iter()
-            .any(|child| child.sid != parent_sid),
-        "negative control child must leave the test SID via setsid: parent_sid={parent_sid} children={pty_children:?}"
-    );
+    }
 
     let mut dead = Command::new("sh")
         .arg("-c")
@@ -3812,8 +3812,7 @@ fn assert_cli_fixture_absent_fails_when_setsid_child_survives() {
             &[],
         );
     }));
-    let _ = child.kill();
-    let _ = child.wait();
+    owner.reap();
     reap_captured_pty_children(&pty_children)
         .expect("negative control must reap the captured setsid process group");
     reap_processes_matching_marker(&marker)
@@ -3828,6 +3827,51 @@ fn assert_cli_fixture_absent_fails_when_setsid_child_survives() {
         failed.is_err(),
         "survivor oracle must fail while a representative setsid child remains alive"
     );
+}
+
+#[test]
+fn panic_safe_setsid_owner_reaps_group_and_pipe_after_forced_error() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("pty-setsid-panic-owner");
+    let marker = format!(
+        "pty-marker-{}",
+        data_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("unique data dir name")
+    );
+    let wrapper = write_marked_sleep_wrapper(&data_dir, &marker);
+    let mut captured_identity = None;
+    let mut captured_stdout = None;
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut owner = PanicSafeSetsidChild::spawn(&marker, &wrapper);
+        captured_identity = Some(owner.identity().clone());
+        captured_stdout = owner.take_stdout();
+        panic!("forced first-census error before setsid cleanup");
+    }));
+    assert!(failed.is_err(), "forced error must unwind before cleanup");
+    let identity = captured_identity.expect("identity captured before panic");
+    assert!(
+        !process_is_alive_u32(identity.pid).unwrap_or(true),
+        "Drop must reap the exact setsid child: {identity:?}"
+    );
+    assert!(
+        !process_group_probe(identity.pgid).unwrap_or(true),
+        "Drop must reap the detached PGID without a prior census: {identity:?}"
+    );
+    let leftovers = live_captured_pty_rows(std::slice::from_ref(&identity))
+        .expect("post-cleanup census oracle");
+    assert!(
+        leftovers.is_empty(),
+        "post-cleanup oracle must see an empty captured PGID: {leftovers:?}"
+    );
+    let stdout = captured_stdout.expect("piped stdout captured before panic");
+    assert!(
+        stdout_pipe_is_closed(&stdout),
+        "Drop must close the write end so a piped runner cannot hang"
+    );
+    reap_processes_matching_marker(&marker)
+        .expect("forced-error owner must leave no marked argv rows");
 }
 
 #[test]

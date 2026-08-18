@@ -4,7 +4,7 @@
 | --- | --- |
 | Ticket | `ticket_1786977409_499180` |
 | Run | `run_1787012955_256937` |
-| Run step | `run_step_1787032743_321821` |
+| Run step | `run_step_1787033543_939702` |
 | Step | `botster_stack_implement` |
 | Target repository | `botster-hub` (`trybotster/botster-hub`) |
 | `target_id` | `tgt_7e208a0c76a44980a83b63af976b1f22` |
@@ -13,10 +13,10 @@
 | Core dependency | `ticket_1787015956_494734` / `dependency_1787015963_708930` closed |
 | Core pin | `d981bb03f91e2d13428000ac989c50d794f659b2` |
 | Hub main integrated | `bf249af` via merge commit `6cc0c12` |
-| Prior Review return | `review_1787030054_829721` resolved at `f4d9f0f` |
-| Current Review return | `review_1787032735_498956` `changes_required` |
+| Prior Review return | `review_1787032735_498956` resolved at `e9683de` |
+| Current Review return | `review_1787033530_630528` `changes_required` |
 | Merge policy | direct; no pull request |
-| Review requested | yes, after Core d981bb03 repin and setsid PGID reap |
+| Review requested | yes, after panic-safe setsid owner |
 
 Inventory source: `git diff --name-only origin/main...HEAD` after this visit's commit. Do not treat an earlier intra-branch pin inventory as current.
 
@@ -58,13 +58,11 @@ Convention conflicts: none.
 
 ## Review-return repairs this visit
 
-`review_1787032735_498956` accepted the `bf249af` integrate and focused proofs at `f4d9f0f`. It returned two high findings.
+`review_1787033530_630528` accepted the Core `d981bb03` pin and the happy-path setsid reap at `e9683de`. It returned one high finding.
 
-`finding_1787032735_978877`: Hub now pins Core `d981bb03f91e2d13428000ac989c50d794f659b2` again. That revision is a descendant of `fd66efd` (`git merge-base --is-ancestor fd66efd d981bb03`). It contains ProcessExited commits `c23b833` and `dbb4cbc` (`git merge-base --is-ancestor c23b833 d981bb03`). Those commits are not ancestors of `fd66efd`. The cargo checkout at `d981bb03` contains both W1/W2 tests (count 2). Future pin conflicts must keep the newer Core ancestor, not Hub main's older pin.
+`finding_1787033530_256513`: `assert_cli_fixture_absent_fails_when_setsid_child_survives` now wraps the fixture in `PanicSafeSetsidChild` immediately after spawn. Drop kills the exact child and the stored PGID. It does not run a process census before those signals. `reap_captured_pty_children` also signals known pids and PGIDs first; census stays a post-cleanup oracle. `panic_safe_setsid_owner_reaps_group_and_pipe_after_forced_error` panics before the old cleanup block and proves the exact PGID and stdout pipe are gone.
 
-`finding_1787032735_980244`: `assert_cli_fixture_absent_fails_when_setsid_child_survives` now reaps captured PTY pids and PGIDs after `child.kill()`. Marker census cannot see the wrapper's marker-less `sleep 3600` child once the wrapper is dead. After cleanup, `live_captured_pty_rows` is empty. A piped `./test.sh ... | tail` run exited 0 with no leftover `sleep 3600`.
-
-Prior `review_1787030054_829721` findings remain resolved at `f4d9f0f`. Prior `review_1787029110_848811` findings remain resolved at `2320ba4`. Prior `review_1787028521_313736` findings remain resolved at `286c1ab`. Prior `review_1787027565_578625` findings remain resolved at `7071f42`.
+Prior `review_1787032735_498956` findings remain resolved at `e9683de`. Prior `review_1787030054_829721` findings remain resolved at `f4d9f0f`. Prior `review_1787029110_848811` findings remain resolved at `2320ba4`. Prior `review_1787028521_313736` findings remain resolved at `286c1ab`. Prior `review_1787027565_578625` findings remain resolved at `7071f42`.
 
 ## Prior Review-return repairs at `7071f42`
 
@@ -76,13 +74,12 @@ Prior `review_1787030054_829721` findings remain resolved at `f4d9f0f`. Prior `r
 
 ## Files changed versus `origin/main`
 
-Twenty-three paths differ from current main `bf249af`. This visit reintroduces the Core pin delta that `7a24b1e` had rolled back to Hub main's `fd66efd`.
+Twenty-three paths differ from current main `bf249af`. This visit changes only the setsid owner and this report. The Core pin remains `d981bb03`.
 
 ### This Review-return visit
 
-- `Cargo.toml`, `Cargo.lock`, `crates/botster-hub-client/Cargo.toml`, `crates/botster-hub-test-support/{Cargo.toml,build.rs,src/conformance_data.rs,src/lib.rs}`, `tests/session_projection_owner_loop.rs`, `tests/hub_daemon_lifecycle/{package_event_plane.rs,unix_terminal_adapter.rs,webrtc_terminal_adapter.rs}` -- Core pin `d981bb03`.
-- `tests/hub_daemon_lifecycle/process.rs` -- `reap_captured_pty_children` and live captured-group census.
-- `tests/hub_daemon_lifecycle/sessions.rs` -- setsid negative control reaps captured PGIDs and asserts the group is empty.
+- `tests/hub_daemon_lifecycle/process.rs` -- `PanicSafeSetsidChild` plus signal-before-census reap.
+- `tests/hub_daemon_lifecycle/sessions.rs` -- owner wrap plus forced-error PGID and pipe proof.
 - `docs/reports/hub-shutdown-session-idempotent-across-natural-exit-races-implement.md` -- this report.
 
 ### Inherited same-ticket changes still on the branch
@@ -117,6 +114,7 @@ Hub still owns classification, recover, and host response kinds. Core still owns
 - No full lifecycle suite ran, as required by acceptance check 10.
 - This visit integrates current Hub main `bf249af` and does not change the ShutdownSession product path.
 - This visit repins Core to `d981bb03` even though current Hub main still names `fd66efd`. Ancestry, not Hub-main matching, owns the pin.
+- This Review-return visit repairs only `finding_1787033530_256513`. It does not change the ShutdownSession product path.
 
 ## Tests and downstream proof run
 
@@ -126,7 +124,9 @@ All test commands used `./test.sh`. Worker prebuild, fmt, and clippy are the doc
 | --- | --- | --- |
 | Recover units | `./test.sh --locked --lib recover_` | 5 passed |
 | Active-error units | `./test.sh --locked --lib shutdown_active_` | 2 passed |
-| SetSID negative control | `./test.sh --locked --test hub_daemon_lifecycle_test assert_cli_fixture_absent_fails_when_setsid_child_survives -- --exact` | pass in 5.80s |
+| SetSID owner forced-error | `./test.sh --locked --test hub_daemon_lifecycle_test panic_safe_setsid_owner_reaps_group_and_pipe_after_forced_error -- --exact` | pass in 0.12s |
+| SetSID owner forced-error piped | same command piped to `tail` | exit 0 |
+| SetSID negative control | `./test.sh --locked --test hub_daemon_lifecycle_test assert_cli_fixture_absent_fails_when_setsid_child_survives -- --exact` | pass in 7.46s |
 | SetSID piped | same command piped to `tail` | exit 0, no leftover `sleep 3600` |
 | Deliberate panic survivors | `./test.sh --locked --test hub_daemon_lifecycle_test panic_safe_cli_daemon_deliberate_failure_leaves_no_owned_survivors -- --exact` | pass in 7.22s |
 | True-error sibling | `./test.sh --locked --test hub_daemon_lifecycle_test external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable -- --exact` | pass in 16.88s |
@@ -156,7 +156,7 @@ Production entry: `DaemonRequest::ShutdownSession` in `src/daemon_transport.rs` 
 
 ## Runtime-teardown lenses
 
-Every lens from the approved plan remains in force. No lens was dropped to informal follow-up. Closed Core `ticket_1787015956_494734` owns the payload-delivery lens. Hub still owns classify, recover, both transport host-path proofs, and the stuck-Stopping negative proof. The true-error sibling fixture now has panic-safe hard-stop evidence for its owned Hub process group, plus an all-session marker and captured PTY pid/PGID oracle. A representative `setsid` child makes that oracle fail.
+Every lens from the approved plan remains in force. No lens was dropped to informal follow-up. Closed Core `ticket_1787015956_494734` owns the payload-delivery lens. Hub still owns classify, recover, both transport host-path proofs, and the stuck-Stopping negative proof. The true-error sibling fixture now has panic-safe hard-stop evidence for its owned Hub process group, plus an all-session marker and captured PTY pid/PGID oracle. A representative `setsid` child makes that oracle fail. The setsid fixture itself now has a panic-safe owner that reaps the stored PGID without a prior census.
 
 ## Unverified behavior or residual risk
 

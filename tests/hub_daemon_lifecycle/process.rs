@@ -9,7 +9,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, ChildStdout, Command, Output, Stdio};
 use std::sync::{
     Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
@@ -608,7 +608,7 @@ fn write_marked_wrapper(dir: &Path, marker: &str, body: &str) -> PathBuf {
     path
 }
 
-pub(crate) fn spawn_setsid_marked_sleep(marker: &str, wrapper: &Path) -> Child {
+fn setsid_marked_command(wrapper: &Path) -> Command {
     let mut command = Command::new(wrapper);
     unsafe {
         command.pre_exec(|| {
@@ -619,8 +619,108 @@ pub(crate) fn spawn_setsid_marked_sleep(marker: &str, wrapper: &Path) -> Child {
         });
     }
     command
-        .spawn()
-        .unwrap_or_else(|error| panic!("spawn setsid child for {marker}: {error}"))
+}
+
+/// Owns a `setsid` fixture and its detached process group.
+///
+/// Drop kills the exact child and stored PGID. It does not run a process
+/// census before it sends those signals. Census helpers stay post-cleanup
+/// oracles.
+pub(crate) struct PanicSafeSetsidChild {
+    child: Option<Child>,
+    stdout: Option<ChildStdout>,
+    identity: PtyChildIdentity,
+}
+
+impl PanicSafeSetsidChild {
+    pub(crate) fn spawn(marker: &str, wrapper: &Path) -> Self {
+        let mut child = setsid_marked_command(wrapper)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|error| panic!("spawn setsid child for {marker}: {error}"));
+        let stdout = child.stdout.take();
+        let identity = identity_from_spawned_setsid_child(&child, marker);
+        Self {
+            child: Some(child),
+            stdout,
+            identity,
+        }
+    }
+
+    pub(crate) fn identity(&self) -> &PtyChildIdentity {
+        &self.identity
+    }
+
+    pub(crate) fn take_stdout(&mut self) -> Option<ChildStdout> {
+        self.stdout.take()
+    }
+
+    pub(crate) fn reap(mut self) {
+        self.terminate_owned();
+    }
+
+    fn terminate_owned(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let pid = child.id() as libc::pid_t;
+        let pgid = if self.identity.pgid > 1 {
+            self.identity.pgid
+        } else {
+            pid
+        };
+        let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+        if pgid > 1 {
+            let _ = unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        if pgid > 1 {
+            let _ = unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        }
+        self.stdout.take();
+    }
+}
+
+impl Drop for PanicSafeSetsidChild {
+    fn drop(&mut self) {
+        self.terminate_owned();
+    }
+}
+
+fn identity_from_spawned_setsid_child(child: &Child, command: &str) -> PtyChildIdentity {
+    let pid = child.id();
+    match pty_identity_for_pid(pid, command) {
+        Ok(identity) => identity,
+        Err(_) => PtyChildIdentity {
+            pid,
+            pgid: pid as libc::pid_t,
+            sid: pid as libc::pid_t,
+            command: command.to_string(),
+        },
+    }
+}
+
+pub(crate) fn stdout_pipe_is_closed(stdout: &impl AsRawFd) -> bool {
+    let mut fds = [libc::pollfd {
+        fd: stdout.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    }];
+    let n = unsafe { libc::poll(fds.as_mut_ptr(), 1, 500) };
+    if n <= 0 {
+        return false;
+    }
+    if fds[0].revents & libc::POLLHUP != 0 {
+        return true;
+    }
+    if fds[0].revents & libc::POLLIN != 0 {
+        let mut buf = [0u8; 1];
+        let read = unsafe { libc::read(stdout.as_raw_fd(), buf.as_mut_ptr().cast(), 1) };
+        return read == 0;
+    }
+    fds[0].revents & libc::POLLERR != 0
 }
 
 pub(crate) fn unix_processes_matching_marker(
@@ -695,35 +795,41 @@ fn pty_identity_for_pid(pid: u32, command: &str) -> Result<PtyChildIdentity, Str
 pub(crate) fn reap_captured_pty_children(children: &[PtyChildIdentity]) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let live_rows = live_captured_pty_rows(children)?;
-        if live_rows.is_empty() {
-            return Ok(());
-        }
         let signal = if Instant::now() + Duration::from_millis(400) >= deadline {
             libc::SIGKILL
         } else {
             libc::SIGTERM
         };
-        let mut pgids = std::collections::BTreeSet::new();
-        for child in children {
-            pgids.insert(child.pgid);
-            let _ = unsafe { libc::kill(child.pid as libc::pid_t, signal) };
-        }
-        for pgid in pgids {
-            if pgid > 1 {
-                let _ = unsafe { libc::killpg(pgid, signal) };
+        signal_captured_pty_children(children, signal);
+        match live_captured_pty_rows(children) {
+            Ok(rows) if rows.is_empty() => return Ok(()),
+            Ok(rows) if Instant::now() >= deadline => {
+                return Err(format!(
+                    "leftover captured PTY process groups; rows={rows:?}"
+                ));
             }
-        }
-        if Instant::now() >= deadline {
-            let still = live_captured_pty_rows(children)?;
-            if still.is_empty() {
-                return Ok(());
+            Ok(_) => {}
+            Err(error) if Instant::now() >= deadline => {
+                return Err(format!(
+                    "captured PTY reap census failed after signaling known groups: {error}"
+                ));
             }
-            return Err(format!(
-                "leftover captured PTY process groups; rows={still:?}"
-            ));
+            Err(_) => {}
         }
         thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn signal_captured_pty_children(children: &[PtyChildIdentity], signal: libc::c_int) {
+    let mut pgids = std::collections::BTreeSet::new();
+    for child in children {
+        pgids.insert(child.pgid);
+        let _ = unsafe { libc::kill(child.pid as libc::pid_t, signal) };
+    }
+    for pgid in pgids {
+        if pgid > 1 {
+            let _ = unsafe { libc::killpg(pgid, signal) };
+        }
     }
 }
 
