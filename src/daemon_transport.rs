@@ -2392,7 +2392,6 @@ pub(crate) fn handle_control_message(
             }
             if request_succeeded(response.as_ref()) {
                 if let DaemonRequest::Spawn { session_id, .. } = &request {
-                    state.maintenance.returned_successful_spawn = true;
                     state
                         .maintenance
                         .acknowledged_spawn_ids

@@ -3370,6 +3370,14 @@ impl HubRuntime {
             .insert(session_id.into());
     }
 
+    /// Drop one pending Spawn acknowledgement after the projection observed it.
+    pub fn retire_acknowledged_spawn(&self, session_id: &str) {
+        self.acknowledged_spawn_ids
+            .lock()
+            .expect("acknowledged spawn ids mutex")
+            .remove(session_id);
+    }
+
     /// Session ids this process already returned from a successful Spawn.
     #[must_use]
     pub fn acknowledged_spawn_ids(&self) -> BTreeSet<String> {

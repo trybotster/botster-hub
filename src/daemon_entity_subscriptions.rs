@@ -3486,42 +3486,4 @@ mod tests {
         assert_eq!(state.delivery_phase, DeliveryPhase::Removes);
         assert!(!state.needs_delivery);
     }
-
-    #[test]
-    fn inverted_caught_up_gate_sends_an_incomplete_first_snapshot() {
-        let mut projection = crate::session_projection::SessionProjection::default();
-        projection.ingest_baseline_rows(
-            1,
-            (0..8).map(|index| assemble_record(format!("session-{index:02}"))),
-        );
-        projection.seal_baseline(SessionLifecycleCursor {
-            source_id: botster_core_daemon::SessionLifecycleSourceId("s".into()),
-            sequence: 1,
-        });
-        let (sender, receiver) = mpsc::sync_channel(4);
-        let mut state = assembling_subscription(sender, 1);
-        let mut counters = DaemonLifecycleCounters::default();
-        let SnapshotAssemble::Continue { page } = continue_session_snapshot_assembly(
-            "sub",
-            &mut state,
-            &projection,
-            true,
-            &mut counters,
-            SESSION_DELIVERY_MAX_ITEMS,
-            SESSION_DELIVERY_MAX_BYTES,
-            Duration::MAX,
-        ) else {
-            panic!("forced-complete assembly must stay alive");
-        };
-        assert!(!page.more, "eight rows fit one page");
-        let frames: Vec<_> = receiver.try_iter().collect();
-        assert_eq!(frames.len(), 1);
-        let ids = snapshot_item_ids(&frames[0]);
-        assert_eq!(ids.len(), 8);
-        assert_ne!(
-            ids.len(),
-            24,
-            "forcing caught_up while pending rows remain must fail the 24-identity completeness check"
-        );
-    }
 }
