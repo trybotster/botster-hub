@@ -248,9 +248,9 @@ pub(crate) fn classify_budget_expiry(
 
 fn upgrade_ambiguous(kind: &str, class: HostResourceClass) -> (HostResourceClass, ResourceProbe) {
     match class {
-        HostResourceClass::Emfile | HostResourceClass::Enfile | HostResourceClass::PtyAllocation => {
-            (class, ResourceProbe::NotApplicable)
-        }
+        HostResourceClass::Emfile
+        | HostResourceClass::Enfile
+        | HostResourceClass::PtyAllocation => (class, ResourceProbe::NotApplicable),
         HostResourceClass::AmbiguousSocket if kind.contains("pty") => {
             (class, probe_pty_allocation())
         }
@@ -308,13 +308,41 @@ pub(crate) fn try_terminate_and_reap_child(child: &mut Child) -> Result<String, 
     ))
 }
 
+pub(crate) fn collect_owned_session_process_pids(data_dir: &Path) -> Result<Vec<u32>, String> {
+    let mut pids = Vec::new();
+    for identity in registry_backed_worker_identities(data_dir)? {
+        let Some(command_pid) = identity.pid else {
+            continue;
+        };
+        pids.push(command_pid);
+        if let Some(snapshot) = process_snapshot(command_pid) {
+            pids.push(snapshot.pgid);
+        }
+        if let Some(worker_pid) = worktree_session_worker_ancestor(command_pid) {
+            pids.push(worker_pid);
+            if let Some(snapshot) = process_snapshot(worker_pid) {
+                pids.push(snapshot.pgid);
+            }
+            if let Ok(descendants) = worker_owned_descendant_pids(worker_pid) {
+                pids.extend(descendants);
+            }
+        }
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    Ok(pids)
+}
+
 pub(crate) fn registry_backed_worker_identities(
     data_dir: &Path,
 ) -> Result<Vec<RegistryWorkerIdentity>, String> {
     let registry = SessionRegistry::new(data_dir);
-    let records = registry
-        .load_all()
-        .map_err(|error| format!("load session registry under {}: {error}", data_dir.display()))?;
+    let records = registry.load_all().map_err(|error| {
+        format!(
+            "load session registry under {}: {error}",
+            data_dir.display()
+        )
+    })?;
     Ok(records
         .into_iter()
         .filter(|record| !matches!(record.state, RegistrySessionState::Exited))
@@ -360,10 +388,7 @@ pub(crate) fn worker_pid_matches_worktree_session_worker(pid: u32) -> bool {
     };
     let command = String::from_utf8_lossy(&output.stdout);
     let argv0 = command.split_whitespace().next().unwrap_or("");
-    Path::new(argv0)
-        .file_name()
-        .and_then(|name| name.to_str())
-        == Some("botster-session-worker")
+    Path::new(argv0).file_name().and_then(|name| name.to_str()) == Some("botster-session-worker")
         && worker_executable_from_this_worktree(&SessionWorkerProcessIdentity {
             pid,
             command: command.trim().to_string(),
@@ -438,11 +463,9 @@ pub(crate) fn shutdown_owned_sessions(
     data_dir: &Path,
 ) -> Result<Vec<SessionShutdownRecord>, String> {
     let config = explicit_config(data_dir);
-    let sessions = botster_hub::daemon_transport_request(
-        &config,
-        botster_hub::DaemonRequest::ListSessions,
-    )
-    .map_err(|error| format!("ListSessions failed: {error}"))?;
+    let sessions =
+        botster_hub::daemon_transport_request(&config, botster_hub::DaemonRequest::ListSessions)
+            .map_err(|error| format!("ListSessions failed: {error}"))?;
     if sessions.kind != botster_hub::DaemonResponseKind::Sessions {
         return Err(format!(
             "ListSessions unexpected kind={:?} error={:?}",
@@ -540,7 +563,10 @@ pub(crate) fn prove_owned_children_absent(
     prove_owned_absence(data_dir, hub_pid, known_worker_pids, true)
 }
 
-pub(crate) fn prove_hub_and_socket_absent(data_dir: &Path, hub_pid: Option<u32>) -> Result<(), String> {
+pub(crate) fn prove_hub_and_socket_absent(
+    data_dir: &Path,
+    hub_pid: Option<u32>,
+) -> Result<(), String> {
     prove_owned_absence(data_dir, hub_pid, &[], false)
 }
 
@@ -553,10 +579,7 @@ fn prove_owned_absence(
     unlink_stale_daemon_socket(data_dir, hub_pid);
     let socket = daemon_socket_path(data_dir);
     if socket.exists() {
-        return Err(format!(
-            "daemon socket still present: {}",
-            socket.display()
-        ));
+        return Err(format!("daemon socket still present: {}", socket.display()));
     }
     if let Some(pid) = hub_pid
         && process_exists(pid)
@@ -584,9 +607,7 @@ fn prove_owned_absence(
         .filter(|worker| worker_belongs_to_data_dir(worker, data_dir))
         .collect::<Vec<_>>();
     if !leftover.is_empty() {
-        return Err(format!(
-            "data-dir session workers still live: {leftover:?}"
-        ));
+        return Err(format!("data-dir session workers still live: {leftover:?}"));
     }
     Ok(())
 }

@@ -9,10 +9,40 @@ all_process_rows() {
   esac
 }
 
+is_botster_role_awk='
+  function basename_of(path) {
+    n = path
+    sub(/.*\//, "", n)
+    return n
+  }
+  function is_botster_role() {
+    if ($6 == "botster-hub" || $6 == "botster-session" || $6 == "botster-session-worker") {
+      return 1
+    }
+    for (i = 6; i <= NF; i++) {
+      b = basename_of($i)
+      if (b == "botster-hub" || b == "botster-session-worker") {
+        return 1
+      }
+    }
+    return 0
+  }
+'
+
 filter_botster_zombie_rows() {
-  census_platform=$(uname -s)
-  awk -v platform="$census_platform" '
-    $5 ~ /^Z/ && (platform == "Darwin" || $6 == "botster-hub" || $6 == "botster-session" || $6 == "botster-session-worker") {
+  awk '
+    '"$is_botster_role_awk"'
+    $5 ~ /^Z/ && is_botster_role() {
+      printf "%s\t%s\t%s\t%s\t%s\t%s", $1, $2, $3, $4, $5, $6
+      for (field = 7; field <= NF; field++) printf "\t%s", $field
+      printf "\n"
+    }
+  '
+}
+
+filter_all_zombie_rows() {
+  awk '
+    $5 ~ /^Z/ {
       printf "%s\t%s\t%s\t%s\t%s\t%s", $1, $2, $3, $4, $5, $6
       for (field = 7; field <= NF; field++) printf "\t%s", $field
       printf "\n"
@@ -22,6 +52,10 @@ filter_botster_zombie_rows() {
 
 botster_zombie_rows() {
   all_process_rows | filter_botster_zombie_rows
+}
+
+all_zombie_rows() {
+  all_process_rows | filter_all_zombie_rows
 }
 
 new_rows() {
@@ -146,7 +180,7 @@ self_test() {
   zombie_evidence=$fixture/zombie-evidence
   paths=$fixture/paths
   evidence=$fixture/evidence
-  trap 'kill "${marker_pid:-}" "${zombie_parent_pid:-}" "${worker_a_pid:-}" "${worker_b_pid:-}" "${installed_pid:-}" "${mention_pid:-}" >/dev/null 2>&1 || true; wait "${marker_pid:-}" >/dev/null 2>&1 || true; wait "${zombie_parent_pid:-}" >/dev/null 2>&1 || true; wait "${worker_a_pid:-}" >/dev/null 2>&1 || true; wait "${worker_b_pid:-}" >/dev/null 2>&1 || true; wait "${installed_pid:-}" >/dev/null 2>&1 || true; wait "${mention_pid:-}" >/dev/null 2>&1 || true; rm -rf "$fixture"' EXIT INT TERM
+  trap 'kill "${marker_pid:-}" "${zombie_parent_pid:-}" "${generic_zombie_parent_pid:-}" "${worker_a_pid:-}" "${worker_b_pid:-}" "${installed_pid:-}" "${mention_pid:-}" >/dev/null 2>&1 || true; wait "${marker_pid:-}" >/dev/null 2>&1 || true; wait "${zombie_parent_pid:-}" >/dev/null 2>&1 || true; wait "${generic_zombie_parent_pid:-}" >/dev/null 2>&1 || true; wait "${worker_a_pid:-}" >/dev/null 2>&1 || true; wait "${worker_b_pid:-}" >/dev/null 2>&1 || true; wait "${installed_pid:-}" >/dev/null 2>&1 || true; wait "${mention_pid:-}" >/dev/null 2>&1 || true; rm -rf "$fixture"' EXIT INT TERM
   printf '%s\n' '#!/bin/sh' 'sleep 30' >"$marker"
   chmod +x "$marker"
   printf '%s\n' "$marker" >"$paths"
@@ -194,17 +228,60 @@ self_test() {
     }
     sleep 0.01
   done
-  if assert_no_new_zombies "$zombie_baseline" "$zombie_evidence" 1; then
-    echo "zombie positive control passed unexpectedly" >&2
-    exit 1
+  if botster_zombie_rows | awk -F '\t' -v pid="$zombie_pid" '$1 == pid { found=1 } END { exit !found }'; then
+    if assert_no_new_zombies "$zombie_baseline" "$zombie_evidence" 1; then
+      echo "attributable zombie positive control passed unexpectedly" >&2
+      exit 1
+    fi
+    awk -F '\t' -v pid="$zombie_pid" '$1 == pid { found=1 } END { exit !found }' "$zombie_evidence" || {
+      echo "attributable zombie positive control did not identify the fixture pid" >&2
+      exit 1
+    }
+  else
+    all_zombie_rows | awk -F '\t' -v pid="$zombie_pid" '$1 == pid { found=1 } END { exit !found }' || {
+      echo "name-stripped zombie was missing from the all-zombie census" >&2
+      exit 1
+    }
   fi
-  awk -F '\t' -v pid="$zombie_pid" '$1 == pid { found=1 } END { exit !found }' "$zombie_evidence" || {
-    echo "zombie positive control did not identify the fixture pid" >&2
-    exit 1
-  }
   kill "$zombie_parent_pid"
   wait "$zombie_parent_pid" || true
   zombie_parent_pid=
+  generic_marker=$fixture/plain-sleep
+  generic_pid_file=$fixture/generic-zombie-pid
+  cp /bin/sleep "$generic_marker"
+  chmod +x "$generic_marker"
+  ruby -e '
+    child = fork { exec(ARGV.fetch(1), "0.01") }
+    File.write(ARGV.fetch(0), child.to_s)
+    sleep(30)
+  ' "$generic_pid_file" "$generic_marker" &
+  generic_zombie_parent_pid=$!
+  attempts=0
+  while :; do
+    if [ -s "$generic_pid_file" ]; then
+      generic_zombie_pid=$(cat "$generic_pid_file")
+      if all_process_rows | awk -v pid="$generic_zombie_pid" '$1 == pid && $5 ~ /^Z/ { found=1 } END { exit !found }'; then
+        break
+      fi
+    fi
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 200 ] || {
+      echo "generic zombie control did not reach zombie state" >&2
+      exit 1
+    }
+    sleep 0.01
+  done
+  botster_zombie_rows | awk -F '\t' -v pid="$generic_zombie_pid" '$1 == pid { found=1 } END { exit !found }' && {
+    echo "generic zombie was treated as a Botster zombie" >&2
+    exit 1
+  }
+  all_zombie_rows | awk -F '\t' -v pid="$generic_zombie_pid" '$1 == pid { found=1 } END { exit !found }' || {
+    echo "generic zombie was missing from the all-zombie baseline" >&2
+    exit 1
+  }
+  kill "$generic_zombie_parent_pid"
+  wait "$generic_zombie_parent_pid" || true
+  generic_zombie_parent_pid=
   worktree_a=$fixture/worktree-a/target/debug
   worktree_b=$fixture/worktree-b/target/debug
   installed=$fixture/opt/local/share/botster-hub
@@ -259,6 +336,7 @@ self_test() {
 
 case "${1-}" in
   all) [ "$#" -eq 1 ] || exit 64; all_process_rows ;;
+  all-zombies) [ "$#" -eq 1 ] || exit 64; all_zombie_rows ;;
   botster-zombies) [ "$#" -eq 1 ] || exit 64; botster_zombie_rows ;;
   botster-zombies-from-stdin) [ "$#" -eq 1 ] || exit 64; filter_botster_zombie_rows ;;
   assert-no-new-zombies) [ "$#" -eq 4 ] || exit 64; assert_no_new_zombies "$2" "$3" "$4" ;;
@@ -266,5 +344,5 @@ case "${1-}" in
   --self-test) [ "$#" -eq 1 ] || exit 64; self_test ;;
   dev-artifact-rows) [ "$#" -eq 1 ] || exit 64; dev_artifact_rows ;;
   assert-no-dev-artifacts) [ "$#" -eq 3 ] || exit 64; assert_no_dev_artifacts "$2" "$3" ;;
-  *) echo "usage: script/process-census all|botster-zombies|botster-zombies-from-stdin|assert-no-new-zombies BASELINE EVIDENCE SECONDS|assert-no-live-executables PATHS EVIDENCE SECONDS|dev-artifact-rows|assert-no-dev-artifacts EVIDENCE SECONDS|--self-test" >&2; exit 64 ;;
+  *) echo "usage: script/process-census all|all-zombies|botster-zombies|botster-zombies-from-stdin|assert-no-new-zombies BASELINE EVIDENCE SECONDS|assert-no-live-executables PATHS EVIDENCE SECONDS|dev-artifact-rows|assert-no-dev-artifacts EVIDENCE SECONDS|--self-test" >&2; exit 64 ;;
 esac

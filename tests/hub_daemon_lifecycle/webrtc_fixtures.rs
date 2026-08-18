@@ -979,7 +979,8 @@ pub(crate) fn assert_daemon_response_ok(
     context: &str,
 ) {
     assert_eq!(
-        response.kind, expected,
+        response.kind,
+        expected,
         "{context}: {}",
         typed_operator_error_body(response)
     );
@@ -1017,7 +1018,10 @@ pub(crate) fn start_botster_web_and_issue_bootstrap(
         botster_hub_client::DaemonRequest::StartPackageEntrypoint {
             package_name: "botster-web".to_string(),
             entrypoint_id: "web-client".to_string(),
-            environment_overrides: BTreeMap::from([("BOTSTER_WEB_PORT".to_string(), "0".to_string())]),
+            environment_overrides: BTreeMap::from([(
+                "BOTSTER_WEB_PORT".to_string(),
+                "0".to_string(),
+            )]),
         },
     )
     .expect("start botster-web entrypoint");

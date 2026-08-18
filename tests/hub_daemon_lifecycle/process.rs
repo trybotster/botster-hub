@@ -143,7 +143,9 @@ impl Drop for ReapingChild {
     fn drop(&mut self) {
         if let Some(child) = self.child.as_mut() {
             if let Err(error) = try_terminate_and_reap_child(child) {
-                record_harness_taint(format!("ReapingChild drop could not prove absence: {error}"));
+                record_harness_taint(format!(
+                    "ReapingChild drop could not prove absence: {error}"
+                ));
                 eprintln!("ReapingChild drop: {error}");
             }
         }

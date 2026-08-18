@@ -910,8 +910,11 @@ where
     loop {
         let remaining = deadline.saturating_sub(started.elapsed());
         if remaining.is_zero() {
-            let (resource, probe) =
-                classify_budget_expiry("entity_frame", None, Some("timed out waiting for entity frame"));
+            let (resource, probe) = classify_budget_expiry(
+                "entity_frame",
+                None,
+                Some("timed out waiting for entity frame"),
+            );
             panic!(
                 "{}",
                 format_harness_budget_expired(

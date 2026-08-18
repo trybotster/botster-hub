@@ -143,7 +143,12 @@ fn guard_cleanup_after_panic_reaps_worker_socket_and_hub() {
         "spawn worker-backed session: {}",
         typed_operator_error_body(&spawn)
     );
-    wait_for_registry_worker(&data_dir);
+    let identity = wait_for_registry_worker(&data_dir);
+    let command_pid = identity.pid.expect("panic-test command pid");
+    let worker_pid = worktree_session_worker_ancestor(command_pid).unwrap_or(command_pid);
+    let command_pgid = process_snapshot(command_pid)
+        .map(|snapshot| snapshot.pgid)
+        .unwrap_or(command_pid);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         let _daemon = daemon;
         panic!("injected cleanup panic");
@@ -153,10 +158,17 @@ fn guard_cleanup_after_panic_reaps_worker_socket_and_hub() {
         !daemon_socket_path(&data_dir).exists(),
         "panic cleanup must remove the daemon socket"
     );
-    let leftover = live_session_workers_for_data_dir(&data_dir).expect("post-panic census");
     assert!(
-        leftover.is_empty(),
-        "panic cleanup must reap owned workers: {leftover:?}"
+        !process_exists(worker_pid),
+        "panic cleanup must reap the session worker pid {worker_pid}"
+    );
+    assert!(
+        !process_exists(command_pid),
+        "panic cleanup must reap the PTY command pid {command_pid}"
+    );
+    assert!(
+        !process_exists(command_pgid),
+        "panic cleanup must reap the PTY process group {command_pgid}"
     );
 }
 
@@ -288,6 +300,52 @@ fn transfer_mode_keeps_worker_until_successor_cleans() {
     assert!(
         !process_exists(command_pid) && !process_exists(worker_pid),
         "successor guard must clean transferred workers command={command_pid} worker={worker_pid}"
+    );
+}
+
+#[test]
+fn guard_proof_requires_worker_pid_when_argv_omits_data_dir() {
+    let _lock = daemon_test_guard();
+    let data_dir = unique_short_test_dir("gwa");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+    let daemon = start_cli_daemon(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(daemon_socket_path(&data_dir));
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: "argv-omit-session".to_string(),
+            command: "sh -c 'sleep 30'".to_string(),
+        },
+    )
+    .expect("spawn argv-omit session");
+    let identity = wait_for_registry_worker(&data_dir);
+    let command_pid = identity.pid.expect("argv-omit command pid");
+    let worker_pid = worktree_session_worker_ancestor(command_pid).expect("worktree worker ancestor");
+    wait_for_process_snapshot(command_pid, "own setsid", |snapshot| {
+        snapshot.pgid != daemon.id() && snapshot.sid != daemon.id().to_string()
+    });
+    assert!(
+        live_session_workers_for_data_dir(&data_dir)
+            .expect("data-dir argv census")
+            .is_empty(),
+        "real worker argv must omit the Hub data directory so the argv census is not the oracle"
+    );
+    let mut child = daemon.transfer_sessions().disarm();
+    request_cli_daemon_shutdown(&data_dir).ok();
+    let _ = child.wait();
+    assert!(
+        prove_owned_children_absent(&data_dir, None, &[]).is_ok(),
+        "empty known-pid proof must stay green after Hub stop while the worker is live"
+    );
+    assert!(
+        prove_owned_children_absent(&data_dir, None, &[worker_pid]).is_err(),
+        "retained worker pid {worker_pid} must fail absence proof while the worker is live"
+    );
+    let successor = start_cli_daemon(&data_dir);
+    successor.shutdown();
+    assert!(
+        !process_exists(worker_pid) && !process_exists(command_pid),
+        "successor cleanup must reap worker {worker_pid} and command {command_pid}"
     );
 }
 
