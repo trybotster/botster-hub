@@ -285,13 +285,19 @@ fn injected_taint_cannot_race_an_unguarded_real_daemon_start() {
     record_harness_taint("injected race taint");
     let data_dir = unique_short_test_dir("gxt");
     fs::create_dir_all(&data_dir).expect("create data dir");
-    let (ready_tx, ready_rx) = mpsc::channel();
+    let ready_rx = arm_real_daemon_start_boundary();
     let start_dir = data_dir.clone();
     let handle = thread::spawn(move || {
-        ready_tx.send(()).expect("announce start attempt");
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || start_cli_daemon(&start_dir)))
     });
-    ready_rx.recv().expect("child reached start boundary");
+    ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("child reached the real-daemon start boundary");
+    assert!(
+        harness_taint().is_some_and(|evidence| evidence.contains("injected race taint")),
+        "parent must still hold the injected taint at the start boundary: {:?}",
+        harness_taint()
+    );
     assert!(
         !daemon_socket_path(&data_dir).exists(),
         "concurrent start must wait at the daemon guard, not create a socket under taint"
@@ -299,11 +305,51 @@ fn injected_taint_cannot_race_an_unguarded_real_daemon_start() {
     reset_harness_taint_after_proof();
     drop(lock);
     let started = handle.join().expect("start thread");
+    disarm_real_daemon_start_boundary();
     let daemon = started.unwrap_or_else(|panic| {
         panic!("concurrent real-daemon start raced the injected taint: {panic:?}")
     });
     daemon.shutdown();
     reset_harness_taint_after_proof();
+}
+
+#[test]
+fn injected_taint_race_fails_when_start_guard_is_bypassed() {
+    let lock = daemon_test_guard();
+    reset_harness_taint_after_proof();
+    record_harness_taint("injected race taint");
+    let data_dir = unique_short_test_dir("gxb");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+    let ready_rx = arm_real_daemon_start_boundary();
+    let start_dir = data_dir.clone();
+    let handle = thread::spawn(move || {
+        bypass_real_daemon_start_guard(true);
+        let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            start_cli_daemon(&start_dir)
+        }));
+        bypass_real_daemon_start_guard(false);
+        started
+    });
+    ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("child reached the real-daemon start boundary");
+    assert!(
+        harness_taint().is_some_and(|evidence| evidence.contains("injected race taint")),
+        "ablation must observe taint at the start boundary: {:?}",
+        harness_taint()
+    );
+    let started = handle.join().expect("bypassed start thread");
+    disarm_real_daemon_start_boundary();
+    assert!(
+        started.is_err(),
+        "bypassing the start-path guard must panic on the injected taint"
+    );
+    assert!(
+        !daemon_socket_path(&data_dir).exists(),
+        "bypassed tainted start must not create a daemon socket"
+    );
+    reset_harness_taint_after_proof();
+    drop(lock);
 }
 
 #[test]

@@ -13,6 +13,7 @@
 | Delivery | direct-merge; no pull request |
 | Class | runtime-teardown (`teardown_class_applies: yes`) |
 | Human scope answer | `question_1787080034_752539` option A |
+| Review return | `review_1787082348_199983` / `finding_1787082348_708293` |
 
 Independent routing: `project_pipelines_current_context` and `list_spawn_targets` both map `tgt_7e208a0c76a44980a83b63af976b1f22` to `botster-hub`. The approved plan used the same routing. Work stayed in the ticket worktree.
 
@@ -43,6 +44,8 @@ Independent routing: `project_pipelines_current_context` and `list_spawn_targets
 - [[pipeline artifacts should use path neutral worktree references]]
 - [[implementation artifacts must match actual git state]]
 - [[rust repo strict lints must be verified before dismissing warnings]]
+- [[a regression test must be shown to go red with the fix reverted]]
+- [[narrow ablation at the enforcement point is the cleanest regression negative control]]
 
 **Not loaded:** [[project-pipelines-playbook]] — Project Pipelines package/plugin paths are out of scope.
 
@@ -60,9 +63,9 @@ Independent routing: `project_pipelines_current_context` and `list_spawn_targets
 Feature behavior (harness only):
 
 - `tests/hub_daemon_lifecycle/harness.rs` — `recovery_worker_is_live` treats Darwin `ps` stat `Z` as dead. `retain_recovery_worker` and `reap_registry_backed_workers` use it. Zombie pids stay in the owned/retained set and are not signaled.
-- `tests/hub_daemon_lifecycle/harness_isolation.rs` — `dead_command_with_zombie_recovery_worker_does_not_taint` (red-on-revert for the classifier). `injected_taint_cannot_race_an_unguarded_real_daemon_start` (red-on-revert for the start-path race).
+- `tests/hub_daemon_lifecycle/harness_isolation.rs` — `dead_command_with_zombie_recovery_worker_does_not_taint`. `injected_taint_cannot_race_an_unguarded_real_daemon_start` waits on a start-boundary hook fired immediately before first `daemon_test_guard` lock. `injected_taint_race_fails_when_start_guard_is_bypassed` is the narrow guard-bypass ablation.
 - `tests/hub_daemon_lifecycle/sessions.rs` — after shutdown, assert the forged pid-42 missing-identity taint, then `reset_harness_taint_after_proof`. IsolatedHub starts go through `start_isolated_hub`.
-- `tests/hub_daemon_lifecycle/common.rs` — reentrant `daemon_test_guard`. First acquire checks taint after the lock. `start_installed_daemon` takes the guard.
+- `tests/hub_daemon_lifecycle/common.rs` — reentrant `daemon_test_guard`. First acquire notifies the start-boundary hook, then locks, then checks taint. `bypass_real_daemon_start_guard` skips only the lock for the ablation. `start_installed_daemon` takes the guard.
 - `tests/hub_daemon_lifecycle/cli.rs`, `process.rs`, `session_fixtures.rs` — every `start_cli_daemon*` and IsolatedHub start takes the reentrant guard. IsolatedHub starts share `start_isolated_hub`.
 - `tests/hub_daemon_lifecycle/packages.rs`, `package_event_plane.rs` — IsolatedHub starts use `start_isolated_hub`.
 
@@ -87,6 +90,7 @@ Accepted by `question_1787080034_752539` option A, then written back into the co
 
 1. After the SIGKILL taint disappeared, `session_entity_subscription_projects_stale_row_as_indeterminate` became the next first-writer (`dead command 42` / no recovery worker). The test now asserts that taint and resets the latch under `daemon_test_guard`.
 2. The next first-writer was `taint_latch_refuses_next_daemon_start_without_spawning` racing unguarded `start_cli_daemon` calls. Implement added one reentrant start-path guard covering every `start_cli_daemon*` and IsolatedHub start.
+3. `review_1787082348_199983` / `finding_1787082348_708293`: the first race fixture sent ready before `start_cli_daemon`, so the parent could drop the lock before the child reached the guard. The ready signal now fires inside first-acquire `daemon_test_guard`, immediately before the lock. A committed bypass ablation keeps the taint set and requires the child start to panic.
 
 No other product-scope change.
 
@@ -114,7 +118,7 @@ Red-on-revert:
 
 Targeted after the fixes:
 
-- `./test.sh --locked --test hub_daemon_lifecycle_test -- injected_taint_cannot_race taint_latch dead_command session_entity_subscription_projects_stale identity_capture_error unresolved_worker_ancestor` — 9 passed.
+- `./test.sh --locked --test hub_daemon_lifecycle_test -- injected_taint taint_latch dead_command session_entity_subscription_projects_stale identity_capture_error unresolved_worker_ancestor` — 10 passed, including the start-boundary race test and the guard-bypass ablation.
 - `./test.sh --locked --test hub_daemon_lifecycle_test external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable -- --nocapture --exact` — passed with no `identity capture incomplete` line.
 
 Full suite (required):
@@ -122,6 +126,7 @@ Full suite (required):
 - Pre-run census: botster-zombies 0, dev-artifacts 0.
 - `script/run-lifecycle-suite` run 1: `verdict=clean failed=0 tally=1 survivors=0 tainted=0` (250 passed, 1 ignored).
 - `script/run-lifecycle-suite` run 2: `verdict=clean failed=0 tally=1 survivors=0 tainted=0` (250 passed, 1 ignored).
+- After `finding_1787082348_708293`: `script/run-lifecycle-suite` `verdict=clean failed=0 tally=1 survivors=0 tainted=0` (251 passed, 1 ignored).
 - Post-run census: botster-zombies 0, dev-artifacts 0.
 
 Strict clippy on the lifecycle test target is recorded in the commit message / gate evidence after this report.
