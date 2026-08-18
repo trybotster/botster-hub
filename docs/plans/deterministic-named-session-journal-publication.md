@@ -4,14 +4,21 @@ Ticket: `ticket_1787007684_566852`
 Run: `run_1787007689_823119`
 Target repository: `botster-hub` (`tgt_7e208a0c76a44980a83b63af976b1f22`)
 Pipeline step: Plan (`botster_stack_plan`)
+Revision: 2 — addresses Plan Review `review_1787012075_184614` and durable answer `question_1787011706_241109`.
 
 ## Required guarantee (from the ticket)
 
 After a client issues a production operation for a named `session_id`, Hub must publish that session into the lifecycle journal and into the session entity projection through a deterministic state transition. A later Subscribe `JournalPull` plus `ProjectionApply` turn must be able to deliver that identity on the entity stream. The transition must name the exact session. A bounded global Observe slice of eight sessions is not sufficient.
 
+## Durable ruling (question_1787011706_241109)
+
+The named production operation must make the exact session's current lifecycle state available to a later `JournalPull` and `ProjectionApply` turn **even when the session state is unchanged**. The earlier spawn row is not sufficient. The mechanism must be Core-owned (append or republish an idempotent lifecycle row, or an equivalent Core mechanism with the same deterministic result). Hub must not implement journal internals. If the current Core API cannot provide the guarantee, register a botster-core ticket and dependency. Hub ownership stays limited to invoking the exact-session operation and publishing the resulting Core state.
+
 ## Context loaded
 
-Playbooks: [[planner-playbook]], [[botster-planner-playbook]], [[botster-hub-playbook]] (repository charter).
+Playbooks: [[planner-playbook]], [[botster-planner-playbook]], [[botster-hub-playbook]] (repository charter), [[botster-architecture]], [[cli-patterns]].
+
+Effect of the two map notes: [[botster-architecture]] confirms the lifecycle cluster this plan already applies (journal/observe/owner-loop conventions) and adds the pipeline-context rules used below ([[dependency ticket creation must start its run or emit an operator action]], [[dependency closure must requeue the blocked parent step]]). [[cli-patterns]] is a mixed-generation index; per its own header and [[botster-architecture]], it must not drive current ownership. Neither note changes the product mechanism.
 
 Targeted atomic notes:
 - [[Core control-plane lifecycle journal advances without a terminal client or Hub terminal Drain]]
@@ -28,82 +35,88 @@ Runtime-teardown class: does **not** apply. This ticket changes lifecycle journa
 
 ## Base-code findings (this worktree, branch head 66ca79c)
 
-1. `DaemonRequest::ReadScreen` (`src/daemon_transport.rs:3468`) runs only `observe_lifecycle_turn` — a bounded **global** observe slice (32 sessions, 25 ms, `resume: None`; `src/daemon_transport.rs:4952`). It has no exact-session observe and no journal-to-projection catch-up.
-2. `HubRuntime::observe_session_lifecycle` (`src/runtime.rs:3539`) already exposes the exact-session Core query. Only ShutdownSession classification uses it today (`src/daemon_transport.rs:4681`).
-3. Pinned Core `fc541a5` (Cargo.lock): `spawn` appends a lifecycle journal upsert for the new session (Core `daemon.rs:540`). Observation journals a row only when the registry state **changes** (`reconcile_lifecycle_observations`). Journal capacity is 1024. `observe_session_lifecycle` exact-observes the named session, then returns a typed `Found` / `Absent` / error lookup.
+1. `DaemonRequest::ReadScreen` (`src/daemon_transport.rs:3468`) runs only `observe_lifecycle_turn` — a bounded **global** observe slice (32 sessions, 25 ms, `resume: None`; `src/daemon_transport.rs:4952`). It has no exact-session step and no deterministic journal publication.
+2. `HubRuntime::observe_session_lifecycle` (`src/runtime.rs:3539`) exposes the exact-session Core query. Only ShutdownSession classification uses it today (`src/daemon_transport.rs:4681`).
+3. Pinned Core `fc541a5` (Cargo.lock): `spawn` appends a lifecycle journal upsert (Core `daemon.rs:540`). Observation journals a row **only when the registry state changes** (`reconcile_lifecycle_observations`). No Core API republishes an unchanged named session into the journal — verified by enumerating the public lifecycle/journal APIs at the pin. This is the Core gap the durable ruling anticipated.
 4. Hub projection catch-up: `run_journal_pull_slice` returns with **zero progress** while baseline recovery is in flight (`src/daemon_maintenance.rs:596`). Subscribe entity turns run exactly one `JournalPull` plus one `ProjectionApply` (`src/daemon_entity_subscriptions.rs:278-289`), so a Subscribe catch-up turn during baseline recovery makes no progress. `Baseline` slices run only on owner-loop idle round-robin turns, and every authoritative mutation resets the round-robin pointer to `JournalPull` (`prefer_journal_pull`), which can starve `Baseline` under a spawn burst. Snapshot assembly gates on `baseline_complete && !gap`.
 5. The parent 24-identity oracle is in-tree: `ready_spawn_stays_within_budget_during_session_snapshot_assembly` asserts a complete first snapshot with at least 24 items (`tests/hub_daemon_lifecycle/sessions.rs:3596-3644`).
 
-Interpretation of the ticket evidence against this base: the journal already holds all spawned identities (Core journals at spawn). The nondeterminism lives in Hub catch-up — zero-progress Subscribe turns during baseline recovery, baseline starvation under mutation bursts, and reliance on a bounded global observe slice that can cut before it reaches a named session.
+## Cross-repository dependency (registered)
 
-## Scope
+- Dependency ticket: `ticket_1787012251_733106` — "Core: exact-session lifecycle journal republication for named-session catch-up", target `botster-core` (`tgt_1f7bce66eb304881980f9b4a2a5ae3fe`). Registered as a blocking dependency of this ticket (`dependency_1787012255_438086`), with an active `botster_stack_delivery` run (`run_1787012310_229185`).
+- Contract: a Core-owned exact-session operation publishes the named session's current lifecycle state into the journal even when unchanged; Core owns cursor authorship, idempotency/dedup, capacity policy, and the `journal_advanced` wake. After it returns, `lifecycle_changes_page` from any cursor at or before the operation watermark delivers that session's current state.
+- Consumption seam: botster-hub consumes Core by pinned git revision. This ticket's Implement starts by bumping the Cargo.lock pin to the merged Core revision that carries the primitive.
 
-Smallest change that satisfies the guarantee, in three parts:
+## Scope (revised)
 
-### 1. Named-session publication turn (new helper)
+Two independent Hub changes, both consuming Core-authored journal state only:
 
-Add a helper beside `observe_lifecycle_turn` in `src/daemon_transport.rs` (logic can live in `src/daemon_maintenance.rs`):
+### 1. Named-session publication turn in ReadScreen (scheduling only, no stacked slices)
 
-- Call `runtime.observe_session_lifecycle(&session_id, now)`. This is the exact-session deterministic transition. It journals any pending lifecycle change (for example exit) for exactly this session before the operation returns.
-- On `Found(record)`: publish the record into the shared `state.maintenance.projection` through a new exact-session upsert API on `SessionProjection`. The upsert must **not** advance the projection cursor and must **not** change `baseline_complete` or `gap`. It must mark `projection_dirty`, queue the session family delta (same path `run_projection_apply_slice` uses), and wake the scheduler.
-- If `runtime.take_journal_advanced_wake()`: run one bounded `JournalPull` then one `ProjectionApply` via `run_maintenance_kind` (the existing pattern at `src/daemon_transport.rs:4996-5008`).
+In `DaemonRequest::ReadScreen`, after the existing bounded global slice:
 
-### 2. Wire the helper into the named-session production operation
+- Call the Core exact-session republication operation (via `HubRuntime`) for the request's `session_id`. This is one bounded exact-session unit of request-classified work, the same class as ShutdownSession classification. It appends the Core-authored journal row (idempotent, even when unchanged) and sets the `journal_advanced` wake.
+- Then **schedule only**: call `state.maintenance.note_authoritative_mutation()` so the existing bounded scheduler prefers `JournalPull` on the next maintenance turn. Do **not** run `JournalPull` or `ProjectionApply` synchronously inside the request turn. One owner turn keeps at most one bounded background slice, per [[Owner loop must not stack maintenance and pump ahead of queued control]].
 
-Wire the helper into `DaemonRequest::ReadScreen` after the existing bounded global slice. ReadScreen is the production operation the parent proof issues. The helper stays reusable for other named-session operations, but no other operation is wired in this ticket.
+Delivery path: the row is durable in the Core journal (capacity 1024) the moment the operation returns. Any later Subscribe turn's `JournalPull` + `ProjectionApply` — the production path quoted by the ticket — delivers the identity with Core-authored cursors and ordinary contiguous sequencing. Hub fabricates no sequence and touches no projection row directly. This retires revision 1's cursor-preserving direct upsert entirely.
 
-### 3. No zero-progress Subscribe catch-up turns
+State-corner behavior (per Plan Review finding on sequence contract):
+- Cursor `None` / baseline in flight: the journal row waits in Core; catch-up turns apply it after the baseline seals (the registry-backed baseline also already contains the session). No Hub-side special case.
+- Overwrite: repeated republication flows through `apply_change` upserts keyed by session UUID — last Core-authored change wins, the existing contract.
+- Existing subscribers: `run_projection_apply_slice` queues the family delta from the Core-authored change exactly as for any journal change.
 
-While baseline recovery is in flight, `run_journal_pull_slice` currently returns without progress. Change it to run one bounded `Baseline` page in that case (one bounded slice per turn — either a journal page or a baseline page, never both). This makes every Subscribe catch-up turn advance recovery deterministically, so a bounded number of turns — derived from work size, not wall clock — completes the baseline and delivers the named identity.
+### 2. No zero-progress Subscribe catch-up turns
+
+While baseline recovery is in flight, `run_journal_pull_slice` currently returns without progress. Change it to run one bounded `Baseline` page in that case (one bounded slice per turn — either a journal page or a baseline page, never both). Every Subscribe catch-up turn then advances recovery deterministically, so a bounded number of turns — derived from work size, not wall clock — completes the baseline and unlocks snapshot assembly.
 
 ## Non-scope
 
 - No change to `MAX_READY_OPERATION_WAIT_MS`, `MAX_OWNER_TURN_MS`, `OBSERVE_SLICE_BUDGET`, or `BASELINE_PAGE_BUDGET` values.
 - No wall-clock bounds. No turn-count inflation as proof. No weakening of the 24-identity oracle on `ticket_1786938984_190098`.
-- No Core changes. The required Core primitives (exact-session observe, spawn journal upsert, bounded pages) already exist at the pinned revision `fc541a59`.
-- No wiring of ReadModeFlags, SendInput, Resize, or Attach. Flag for review only if the guarantee class demands them.
+- No Hub-side journal internals, fabricated sequences, or direct projection writes.
+- No wiring of ReadModeFlags, SendInput, Resize, or Attach in this ticket.
 - No absorption of `ticket_1786938984_190098`, `ticket_1786977409_499180`, `ticket_1786937228_425608`, or `ticket_1786913892_208903`.
 
-## Ownership boundaries and cross-repo dependencies
+## Ownership boundaries
 
-- Hub owns the named-session publication turn, projection catch-up policy, and Subscribe delivery — all control plane. This matches [[botster hub is a first party host profile over core]].
-- Core owns journal mechanics, the exact-session query, and bounded page APIs. All required primitives exist at the pinned revision, so **no cross-repository dependency is registered**. If Plan Review reads the ticket as requiring an unconditional journal append per named operation (a Core journal-semantics change), that becomes a `botster-core` dependency ticket — see Unknowns U1.
-- Sibling seam: `ticket_1786977409_499180` touches its own ReadScreen exact-session observe path for the ShutdownSession OperatorError repair. Same handler, different guarantee. Merge-order conflict risk only; whichever lands second rebases.
+- Core owns the journal: republication semantics, cursor authorship, idempotency, capacity, wake. Delivered by dependency ticket `ticket_1787012251_733106`.
+- Hub owns invoking the exact-session operation on the named production path, scheduling catch-up through the existing bounded scheduler, and Subscribe delivery. This matches the durable ruling and [[botster hub is a first party host profile over core]].
+- Sibling seam: `ticket_1786977409_499180` touches the same ReadScreen handler for the ShutdownSession OperatorError repair. Merge-order conflict risk only; whichever lands second rebases.
 
 ## Assumptions and unknowns
 
-- A1: Exact-session observe of a running, unchanged session appends no new journal row. The "publish into the lifecycle journal" half of the guarantee is satisfied by the spawn upsert already in the journal plus exact-session observation of any pending transition. The projection half is satisfied by the direct named upsert plus deterministic catch-up.
-- A2: The direct projection upsert is safe for delivery ordering when it does not advance the cursor. Implement must verify `change_seq` and delivery-phase interaction with unit tests before wiring.
-- A3: The parent failure shape at this base reproduces through the zero-progress / baseline-starvation path. Implement must first reproduce with focused repetition of the in-tree oracle and confirm the mechanism before changing code.
-- U1: If review determines the ticket requires an unconditional journal row per named operation, that is Core-owned journal semantics and needs a dependency ticket against `botster-core`. Ask before broadening; do not silently absorb.
+- A1 (was U1, now resolved by `question_1787011706_241109`): the guarantee requires Core-owned republication even for unchanged sessions; the dependency ticket carries it.
+- A2: the Core primitive's exact API shape (extended `observe_session_lifecycle` versus sibling method) is Core's decision; Hub Implement adapts the `HubRuntime` facade call to whatever the merged Core revision exposes.
+- A3: the parent failure shape at this base reproduces through the zero-progress / baseline-starvation path; Implement reproduces it first with focused repetition of the in-tree oracle before changing code.
 
 ## Affected surfaces and files
 
-- `src/daemon_transport.rs` — ReadScreen handler, new helper call site.
-- `src/daemon_maintenance.rs` — named-session publication logic, baseline-progress change in `run_journal_pull_slice`, unit tests.
-- `src/session_projection.rs` — exact-session upsert API that preserves cursor and baseline flags.
-- `src/daemon_entity_subscriptions.rs` — only if the Subscribe turn needs explicit wiring beyond part 3.
-- `tests/hub_daemon_lifecycle/sessions.rs` — new deterministic named-session catch-up test.
+- `Cargo.toml` / `Cargo.lock` — Core pin bump to the dependency-carrying revision.
+- `src/runtime.rs` — `HubRuntime` facade for the Core republication operation.
+- `src/daemon_transport.rs` — ReadScreen handler: exact-session call plus scheduling.
+- `src/daemon_maintenance.rs` — baseline-progress change in `run_journal_pull_slice`, unit tests.
+- `tests/hub_daemon_lifecycle/sessions.rs` — two new isolated integration tests.
 - `docs/plans/deterministic-named-session-journal-publication.md` — this plan.
 
 ## Risks
 
-1. Cursor-contract corruption from the direct projection upsert (row `change_seq` versus snapshot assembly phases). Mitigation: unit tests for cursor stability, flag stability, and delta queueing before transport wiring.
-2. Ready-operation budget regression from bounded work added to request turns. Mitigation: both `ready_spawn_stays_within_budget_*` tests must pass under focused repetition with unchanged budgets; keep one bounded slice per turn per [[Owner loop must not stack maintenance and pump ahead of queued control]].
-3. Round-robin fairness drift from running a baseline page inside the JournalPull slot. Mitigation: either/or per turn, policy-neutral, per [[Hub background fairness must stay policy-neutral]].
-4. Merge conflict with `ticket_1786977409_499180` in the ReadScreen handler. Mitigation: additive helper, small diff, rebase second-lander.
-5. Flake-oracle discipline: new test must print full typed error bodies and use instance-scoped counters, per the charter's flake notes.
+1. Core dependency latency: this ticket blocks on `ticket_1787012251_733106`; the parent ticket blocks on this one. Mitigation: dependency run already active; [[dependency closure must requeue the blocked parent step]].
+2. Ready-operation budget regression from the exact-session call in request turns. Mitigation: it is one bounded exact-session unit (same class as ShutdownSession classify); both `ready_spawn_stays_within_budget_*` tests must pass under focused repetition with unchanged budgets.
+3. Round-robin fairness drift from paging the baseline in the JournalPull slot. Mitigation: either/or per turn, policy-neutral, per [[Hub background fairness must stay policy-neutral]].
+4. Merge conflict with `ticket_1786977409_499180` in the ReadScreen handler. Mitigation: additive, small diff; second-lander rebases.
+5. Flake-oracle discipline: new tests must print full typed error bodies and use instance-scoped counters, per the charter's flake notes.
 
-## Acceptance checks and tests
+## Acceptance checks and tests (each proof isolated)
 
-1. New integration test in `tests/hub_daemon_lifecycle/sessions.rs`: spawn 24 sessions (more than one observe slice), issue production ReadScreen for a named late session, then drive Subscribe catch-up turns whose count derives from journal/baseline work size. Assert the named identity arrives on the entity stream. No sleeps, no wall-clock bounds. Pass focused repetition (at least 10 runs).
-2. In-tree parent oracle `ready_spawn_stays_within_budget_during_session_snapshot_assembly` (first snapshot >= 24) passes focused repetition at unchanged budgets.
-3. `ready_spawn_stays_within_budget_when_live_sessions_exceed_one_observe_slice` passes unchanged.
-4. Unit tests: the named upsert does not advance the cursor, does not clear `gap` or `baseline_complete`, survives an in-flight baseline recovery, and queues the subscriber delta. `run_journal_pull_slice` makes bounded progress every turn during recovery.
-5. Repo gates: `./test.sh` (workspace-wide; the `--workspace` flag is load-bearing), `cargo fmt --check`, `cargo clippy` strict.
-6. Downstream proof (charter requirement): record the passing 24-identity oracle evidence at this branch as the unblock proof for `ticket_1786938984_190098`. That ticket resumes its own focused Implement and Review gates after this lands; its oracle is not weakened here.
+1. **Named-publication proof (fails if only change 1 or the Core primitive is reverted; independent of change 2).** Integration test: spawn sessions, subscribe, and drain until the subscriber is fully caught up (baseline complete, journal drained, no pending deltas). With the target session unchanged, issue one production ReadScreen for its named `session_id`. Drive Subscribe catch-up turns bounded by the journal delta size and assert the named identity arrives as a Core-authored change on the entity stream. Without the named publication, no new row exists and the assertion fails; change 2 cannot mask it because the baseline is already complete. No sleeps, no wall-clock bounds. At least 10 focused repetitions.
+2. **Baseline-progress proof (fails if only change 2 is reverted; independent of change 1).** Integration test: force in-flight baseline recovery with more sessions than one baseline page (more than 16), then drive only Subscribe catch-up turns — no ReadScreen. Assert each turn makes bounded progress and that a work-size-derived number of turns completes the baseline and delivers the identities. Without change 2 the turns are zero-progress and the test fails deterministically.
+3. In-tree parent oracle `ready_spawn_stays_within_budget_during_session_snapshot_assembly` (first snapshot >= 24) passes focused repetition at unchanged budgets.
+4. `ready_spawn_stays_within_budget_when_live_sessions_exceed_one_observe_slice` passes unchanged.
+5. Unit tests in `daemon_maintenance`: JournalPull slot runs exactly one bounded slice per turn (journal page or baseline page, never both); scheduling after ReadScreen sets the journal-pull preference without running slices in the request turn.
+6. Repo gates: `./test.sh` (workspace-wide; the `--workspace` flag is load-bearing), `cargo fmt --check`, strict clippy.
+7. Downstream proof (charter requirement): record the passing 24-identity oracle evidence at this branch as the unblock proof for `ticket_1786938984_190098`, without weakening that oracle.
 
 ## Vault gaps worth capturing
 
-- A note that Core journals a session at spawn and re-journals only on registry-state change — the journal-publication half of named-session catch-up is spawn-owned, not observe-owned.
-- A note that Subscribe catch-up turns must never be zero-progress turns while baseline recovery is in flight (once implemented and proven).
+- Core journals a session at spawn and re-journals only on registry-state change; named-session catch-up therefore needs a Core-owned republication primitive (capture once the Core ticket lands).
+- Subscribe catch-up turns must never be zero-progress while baseline recovery is in flight (capture after Implement proves it).
