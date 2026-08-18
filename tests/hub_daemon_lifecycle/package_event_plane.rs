@@ -12,13 +12,13 @@ fn isolated_hub_two_packages_emit_and_consume_exact_event_without_blocking_workt
     rewrite_package_source_path(&producer_dir);
     rewrite_package_source_path(&consumer_dir);
 
-    let hub = botster_hub_test_support::IsolatedHubBuilder::new()
-        .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
-        .session_worker_bin(session_worker_binary_path())
-        .root(PathBuf::from("/tmp/bh-event-plane"))
-        .name("package-event-plane")
-        .start()
-        .expect("start isolated hub");
+    let hub = start_isolated_hub(
+        botster_hub_test_support::IsolatedHubBuilder::new()
+            .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
+            .session_worker_bin(session_worker_binary_path())
+            .root(PathBuf::from("/tmp/bh-event-plane"))
+            .name("package-event-plane"),
+    );
 
     let hub_bin = PathBuf::from(env!("CARGO_BIN_EXE_botster-hub"))
         .canonicalize()
@@ -205,13 +205,13 @@ fn isolated_hub_event_to_entity_provider_emit_stays_rejected_causal_scope() {
     rewrite_package_source_path(&producer_dir);
     rewrite_package_source_path(&cycle_dir);
 
-    let hub = botster_hub_test_support::IsolatedHubBuilder::new()
-        .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
-        .session_worker_bin(session_worker_binary_path())
-        .root(PathBuf::from("/tmp/bh-event-plane-cycle"))
-        .name("package-event-cycle")
-        .start()
-        .expect("start isolated hub");
+    let hub = start_isolated_hub(
+        botster_hub_test_support::IsolatedHubBuilder::new()
+            .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
+            .session_worker_bin(session_worker_binary_path())
+            .root(PathBuf::from("/tmp/bh-event-plane-cycle"))
+            .name("package-event-cycle"),
+    );
 
     for path in [producer_dir, cycle_dir] {
         let enabled = botster_hub_client::request(

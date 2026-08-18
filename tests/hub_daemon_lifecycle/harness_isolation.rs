@@ -279,6 +279,34 @@ fn taint_latch_refuses_next_daemon_start_without_spawning() {
 }
 
 #[test]
+fn injected_taint_cannot_race_an_unguarded_real_daemon_start() {
+    let lock = daemon_test_guard();
+    reset_harness_taint_after_proof();
+    record_harness_taint("injected race taint");
+    let data_dir = unique_short_test_dir("gxt");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let start_dir = data_dir.clone();
+    let handle = thread::spawn(move || {
+        ready_tx.send(()).expect("announce start attempt");
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || start_cli_daemon(&start_dir)))
+    });
+    ready_rx.recv().expect("child reached start boundary");
+    assert!(
+        !daemon_socket_path(&data_dir).exists(),
+        "concurrent start must wait at the daemon guard, not create a socket under taint"
+    );
+    reset_harness_taint_after_proof();
+    drop(lock);
+    let started = handle.join().expect("start thread");
+    let daemon = started.unwrap_or_else(|panic| {
+        panic!("concurrent real-daemon start raced the injected taint: {panic:?}")
+    });
+    daemon.shutdown();
+    reset_harness_taint_after_proof();
+}
+
+#[test]
 fn transfer_mode_keeps_worker_until_successor_cleans() {
     let _lock = daemon_test_guard();
     let data_dir = unique_short_test_dir("gtf");
@@ -551,6 +579,62 @@ fn dead_command_with_live_unverified_recovery_worker_taints() {
         harness_taint()
     );
     decoy.assert_alive();
+    reset_harness_taint_after_proof();
+}
+
+#[test]
+fn dead_command_with_zombie_recovery_worker_does_not_taint() {
+    let _lock = daemon_test_guard();
+    reset_harness_taint_after_proof();
+    let data_dir = unique_short_test_dir("gxz");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+    let command_pid = spawn_and_reap_sleep();
+    let mut zombie = Command::new("sleep")
+        .arg("30")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn zombie recovery worker");
+    let worker_pid = zombie.id();
+    let _ = zombie.kill();
+    wait_for_process_snapshot(worker_pid, "zombie recovery worker", |snapshot| {
+        snapshot.stat.contains('Z')
+    });
+    save_running_recovery_record(&data_dir, "zombie-recovery", command_pid, worker_pid);
+    let capture = collect_owned_session_processes(&data_dir).expect("zombie recovery capture");
+    assert!(
+        capture.owned.pids.contains(&worker_pid) && capture.owned.pids.contains(&command_pid),
+        "zombie recovery worker and dead command must stay in the owned set: {:?}",
+        capture.owned.pids
+    );
+    assert!(
+        capture.errors.is_empty(),
+        "zombie recovery worker is dead evidence and must not taint: {:?}",
+        capture.errors
+    );
+    assert!(
+        harness_taint().is_none(),
+        "zombie recovery worker must leave the latch clear: {:?}",
+        harness_taint()
+    );
+    let reap = reap_registry_backed_workers(&data_dir).expect("zombie recovery reap");
+    assert!(
+        reap.errors.is_empty(),
+        "zombie recovery worker must not fail reap: {:?}",
+        reap.errors
+    );
+    assert!(
+        reap.retained.contains(&worker_pid) && reap.retained.contains(&command_pid),
+        "zombie recovery worker must stay retained, not signaled: {:?}",
+        reap.retained
+    );
+    assert!(
+        !reap.reaped.contains(&worker_pid) && !reap.reaped.contains(&command_pid),
+        "zombie recovery worker must not be signaled: {:?}",
+        reap.reaped
+    );
+    let _ = zombie.wait();
     reset_harness_taint_after_proof();
 }
 

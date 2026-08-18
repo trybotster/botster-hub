@@ -58,7 +58,9 @@ A zombie is dead evidence, not a live unverifiable worker. `prove_owned_absence`
    - `retain_recovery_worker`: a zombie recovery worker returns early as dead (exited in transition), with `command_pid` and `worker_pid` still pushed into `capture.owned` so the post-shutdown absence proof still covers them.
    - `reap_registry_backed_workers` recovery-worker match arms: a zombie folds into the existing dead-worker branch (retain both pids, no error, no signal). `signal_worker_group` cannot kill a zombie, so classifying it live would otherwise produce "survived bounded TERM/KILL".
    - If `process_snapshot` returns `None` while `process_exists` is true, keep the live classification (fail-closed falls through to the identity check and taints).
-4. **Proof.** Targeted tests, then two consecutive `script/run-lifecycle-suite` runs with `verdict=clean` (mirroring the two failing runs in the ticket).
+4. **Stale-row latch reset (required after the SIGKILL taint is gone).** `session_entity_subscription_projects_stale_row_as_indeterminate` forges command pid 42 with no recovery worker. Shutdown taints correctly under [[missing recovery worker identity is not worker absence proof]]. The test must keep that taint assertion and reset the latch before releasing `daemon_test_guard`. Without this, the suite-wide gate stays red with a different first-writer after the zombie classifier ships.
+5. **Reentrant start-path guard (question_1787080034_752539, option A).** After the named SIGKILL taint is gone, `taint_latch_refuses_next_daemon_start_without_spawning` can first-write `injected prove-absence failure` while unguarded product tests call `start_cli_daemon`. Make `daemon_test_guard` reentrant. Take that guard at one common real-daemon start boundary used by every `start_cli_daemon*` and IsolatedHub start. Do not add per-test locks. Nested guarded callers stay safe. Tests that do not start a real daemon or touch the latch stay concurrent. Add `injected_taint_cannot_race_an_unguarded_real_daemon_start` as red-on-revert for the race.
+6. **Proof.** Targeted tests, then two consecutive `script/run-lifecycle-suite` runs with `verdict=clean` (mirroring the two failing runs in the ticket).
 
 ## Non-scope
 
@@ -95,8 +97,11 @@ A zombie is dead evidence, not a live unverifiable worker. `prove_owned_absence`
 ## Affected surfaces and files
 
 - `tests/hub_daemon_lifecycle/harness.rs` — `retain_recovery_worker`, `reap_registry_backed_workers`, new liveness helper.
-- `tests/hub_daemon_lifecycle/harness_isolation.rs` — new zombie-recovery fixture.
-- No other files.
+- `tests/hub_daemon_lifecycle/harness_isolation.rs` — zombie-recovery fixture and start-path race fixture.
+- `tests/hub_daemon_lifecycle/common.rs` — reentrant `daemon_test_guard`.
+- `tests/hub_daemon_lifecycle/cli.rs`, `process.rs`, `session_fixtures.rs` — real-daemon start boundary takes the reentrant guard. IsolatedHub starts go through `start_isolated_hub`.
+- `tests/hub_daemon_lifecycle/sessions.rs` — stale-row latch reset; IsolatedHub starts use `start_isolated_hub`.
+- `tests/hub_daemon_lifecycle/packages.rs`, `package_event_plane.rs` — IsolatedHub starts use `start_isolated_hub`.
 
 ## Risks
 
@@ -110,7 +115,9 @@ A zombie is dead evidence, not a live unverifiable worker. `prove_owned_absence`
 
 1. New fixture `dead_command_with_zombie_recovery_worker_does_not_taint` fails before the classifier change and passes after (recorded red-on-revert evidence).
 2. Targeted: `cargo test --test hub_daemon_lifecycle_test -- dead_command taint_latch identity_capture_error unresolved_worker_ancestor` green, including unmodified `dead_command_with_live_unverified_recovery_worker_taints`, `dead_command_and_dead_recovery_worker_do_not_taint`, `dead_command_without_recovery_identity_taints_and_does_not_signal`. (Verified against `cargo test --test hub_daemon_lifecycle_test -- --list`: the harness flattens module paths, so test names carry no `harness_isolation::` prefix; explicit name filters are required. A bare `harness_isolation` filter matches zero tests.)
-3. Targeted: `cargo test --test hub_daemon_lifecycle_test external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable -- --nocapture` passes with **no** `identity capture incomplete` stderr line. (Both corrected commands were executed at Plan time on base 8908a92: command 2 ran 6 tests green in 2.81s; command 3 passed in 9.37s and currently prints the taint line — the post-fix assertion is its disappearance.)
+3. Targeted: `./test.sh --locked --test hub_daemon_lifecycle_test external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable -- --nocapture --exact` passes with **no** `identity capture incomplete` stderr line. (Both corrected commands were executed at Plan time on base 8908a92: command 2 ran 6 tests green in 2.81s; command 3 passed in 9.37s and currently prints the taint line — the post-fix assertion is its disappearance.)
+3b. Targeted: `./test.sh --locked --test hub_daemon_lifecycle_test session_entity_subscription_projects_stale_row_as_indeterminate -- --exact` passes and leaves the latch clear. The test still asserts the expected missing-identity taint immediately after shutdown, then resets under `daemon_test_guard`.
+3c. Targeted: `./test.sh --locked --test hub_daemon_lifecycle_test injected_taint_cannot_race_an_unguarded_real_daemon_start -- --exact` fails before the start-path guard (child panics `environment_tainted: injected race taint`) and passes after.
 4. Full proof: two consecutive `script/run-lifecycle-suite` runs, each `verdict=clean failed=0 tainted=0 tally=1`. Do not waive; do not substitute a filtered run.
 5. Process census 0/0 before and after the suite runs (`script/process-census`).
 6. Strict Rust gates per repo wrappers (`test.sh` / clippy as repo-configured) on the changed files.
