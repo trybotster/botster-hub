@@ -45,6 +45,47 @@ fn harness_budget_marker_classifies_emfile_as_host_exhaustion() {
 }
 
 #[test]
+fn real_emfile_child_classifies_as_host_exhaustion() {
+    let output = Command::new("ruby")
+        .arg("-e")
+        .arg(
+            r#"
+Process.setrlimit(Process::RLIMIT_NOFILE, 16, 16)
+fds = []
+begin
+  loop { fds << File.open("/dev/null") }
+rescue SystemCallError => error
+  STDOUT.write(error.errno.to_s)
+end
+"#,
+        )
+        .output()
+        .expect("run lowered-RLIMIT_NOFILE child");
+    assert!(
+        output.status.success(),
+        "EMFILE child failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let errno: i32 = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("EMFILE child printed non-errno: {:?}", output.stdout));
+    assert_eq!(errno, libc::EMFILE, "lowered RLIMIT_NOFILE child must hit EMFILE");
+    let error = std::io::Error::from_raw_os_error(errno);
+    let (resource, probe) = classify_budget_expiry("child_condition", Some(&error), None);
+    assert_eq!(resource, HostResourceClass::Emfile);
+    let marker = format_harness_budget_expired(
+        "child_condition",
+        Duration::from_millis(10),
+        resource,
+        probe,
+        "real child open",
+    );
+    assert!(marker.contains("resource=EMFILE"));
+    assert!(marker.contains("harness_budget_expired"));
+}
+
+#[test]
 fn harness_budget_marker_keeps_socket_eagain_as_product_failure() {
     let error = std::io::Error::from_raw_os_error(libc::EAGAIN);
     let (resource, probe) = classify_budget_expiry("entity_frame", Some(&error), None);
@@ -225,27 +266,28 @@ fn transfer_mode_keeps_worker_until_successor_cleans() {
         &endpoint,
         botster_hub_client::DaemonRequest::Spawn {
             session_id: "transfer-session".to_string(),
-                command: "sh -c 'sleep 30'".to_string(),
+            command: "sh -c 'sleep 30'".to_string(),
         },
     )
     .expect("spawn transfer session");
-    wait_for_registry_worker(&data_dir);
+    let identity = wait_for_registry_worker(&data_dir);
+    let command_pid = identity.pid.expect("transfer command pid");
+    let worker_pid = worktree_session_worker_ancestor(command_pid).unwrap_or(command_pid);
+    wait_for_process_snapshot(command_pid, "own setsid", |snapshot| {
+        snapshot.pgid != first.id() && snapshot.sid != first.id().to_string()
+    });
     let mut first_child = first.transfer_sessions().disarm();
     request_cli_daemon_shutdown(&data_dir).ok();
     let _ = first_child.wait();
     assert!(
-        !live_session_workers_for_data_dir(&data_dir)
-            .expect("workers after hub stop")
-            .is_empty(),
-        "transfer mode must not reap durable workers on Hub stop"
+        process_exists(command_pid) || process_exists(worker_pid),
+        "transfer mode must not reap durable workers on Hub stop command={command_pid} worker={worker_pid}"
     );
     let successor = start_cli_daemon(&data_dir);
     successor.shutdown();
     assert!(
-        live_session_workers_for_data_dir(&data_dir)
-            .expect("workers after successor")
-            .is_empty(),
-        "successor guard must clean transferred workers"
+        !process_exists(command_pid) && !process_exists(worker_pid),
+        "successor guard must clean transferred workers command={command_pid} worker={worker_pid}"
     );
 }
 
@@ -262,4 +304,48 @@ fn disarmed_guard_leaves_survivor_for_red_on_revert() {
         "disarmed guard must leave the Hub child live for the red-on-revert census"
     );
     let _ = try_terminate_and_reap_child(&mut child);
+}
+
+#[test]
+fn guard_cleanup_after_panic_reaps_supervised_entrypoint() {
+    let _lock = daemon_test_guard();
+    let data_dir = unique_short_test_dir("gse");
+    let package_dir = unique_short_test_dir("gsp");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+    write_supervised_package(
+        &package_dir,
+        "runtime.guard",
+        "sh",
+        &["-c", "while true; do sleep 1; done"],
+    );
+    let daemon = start_cli_daemon(&data_dir);
+    enable_supervised_package(&data_dir, &package_dir);
+    let start = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::StartPackageEntrypoint {
+            package_name: "runtime.guard".to_string(),
+            entrypoint_id: "web".to_string(),
+            environment_overrides: BTreeMap::new(),
+        },
+    )
+    .expect("start supervised entrypoint");
+    let pid = package_entrypoint(&start, "runtime.guard")
+        .process
+        .pid
+        .expect("supervised pid");
+    assert!(process_exists(pid), "supervised entrypoint must be live");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _daemon = daemon;
+        panic!("injected supervised-entrypoint cleanup panic");
+    }));
+    assert!(result.is_err(), "injected panic must unwind");
+    wait_for_process_exit(pid);
+    assert!(
+        !process_exists(pid),
+        "panic cleanup must reap the supervised entrypoint pid {pid}"
+    );
+    assert!(
+        !daemon_socket_path(&data_dir).exists(),
+        "panic cleanup must remove the daemon socket"
+    );
 }

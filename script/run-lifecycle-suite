@@ -7,6 +7,65 @@ test_sh="$root/test.sh"
 settle_seconds=${BOTSTER_LIFECYCLE_CENSUS_SETTLE_SECONDS:-2}
 force_dirty=${BOTSTER_LIFECYCLE_SUITE_FORCE_DIRTY:-0}
 
+self_test() {
+  fixture=$(mktemp -d /tmp/bh-suite-selftest.XXXXXX)
+  worker="$fixture/botster-session-worker"
+  printf '%s\n' '#!/bin/sh' 'sleep 30' >"$worker"
+  chmod +x "$worker"
+  "$worker" &
+  worker_pid=$!
+  trap 'kill "$worker_pid" >/dev/null 2>&1 || true; wait "$worker_pid" >/dev/null 2>&1 || true; rm -rf "$fixture"' EXIT INT TERM
+  attempts=0
+  while :; do
+    if "$census" dev-artifact-rows | awk -v pid="$worker_pid" '$1 == pid { found=1 } END { exit !found }'; then
+      break
+    fi
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 100 ] || {
+      echo "suite self-test fixture was not visible to process-census" >&2
+      exit 1
+    }
+    sleep 0.01
+  done
+  set +e
+  out=$("$root/script/run-lifecycle-suite" 2>&1)
+  status=$?
+  set -e
+  printf '%s\n' "$out"
+  [ "$status" -eq 2 ] || {
+    echo "dirty-environment wrapper must exit 2, got $status" >&2
+    exit 1
+  }
+  printf '%s\n' "$out" | grep -q 'verdict=environment_dirty' || {
+    echo "dirty-environment wrapper must print verdict=environment_dirty" >&2
+    exit 1
+  }
+  printf '%s\n' "$out" | grep -q "$worker_pid" || {
+    echo "dirty-environment wrapper must list the fixture pid $worker_pid" >&2
+    exit 1
+  }
+  printf '%s\n' "$out" | grep -Eq 'Running tests|cargo test' && {
+    echo "dirty-environment wrapper must not start the lifecycle suite" >&2
+    exit 1
+  }
+  kill -0 "$worker_pid" >/dev/null 2>&1 || {
+    echo "dirty-environment wrapper must not kill the listed fixture" >&2
+    exit 1
+  }
+  two_tally=$(printf '%s\n' 'test result: ok. 1 passed' 'test result: FAILED. 1 failed' | grep -c '^test result:' || true)
+  [ "$two_tally" = "2" ] || {
+    echo "tally classifier self-evidence must observe two result lines" >&2
+    exit 1
+  }
+  echo "lifecycle suite wrapper self-test passed"
+}
+
+if [ "${1-}" = "--self-test" ]; then
+  [ "$#" -eq 1 ] || exit 64
+  self_test
+  exit 0
+fi
+
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/bh-lifecycle-suite.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT INT TERM
 

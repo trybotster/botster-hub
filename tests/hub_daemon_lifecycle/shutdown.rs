@@ -2510,7 +2510,7 @@ fn process_ownership_daemon_restart_adopts_then_shuts_down_worker_session() {
     );
     drop(pre_restart);
 
-    shutdown_cli_daemon(&data_dir, child);
+    shutdown_cli_daemon(&data_dir, child.transfer_sessions());
     let restarted_child = start_cli_daemon(&data_dir);
 
     let status = botster_hub::daemon_transport_request(&config, botster_hub::DaemonRequest::Status)
