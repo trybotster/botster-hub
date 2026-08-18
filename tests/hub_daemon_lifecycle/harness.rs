@@ -414,6 +414,11 @@ fn collect_registry_record(
         Ok(Some(latest)) => {
             if let Some(worker_pid) = recovery_worker_pid(&latest) {
                 retain_recovery_worker(capture, &session_id, command_pid, worker_pid);
+            } else {
+                capture.owned.push_pid(command_pid);
+                capture.errors.push(format!(
+                    "nonterminal session {session_id} has dead command {command_pid} and no recovery worker pid"
+                ));
             }
         }
         Err(error) => capture.errors.push(error),
@@ -733,7 +738,13 @@ pub(crate) fn reap_registry_backed_workers(data_dir: &Path) -> Result<WorkerReap
                         outcome.retained.push(pid);
                         outcome.retained.push(worker_pid);
                     }
-                    None => {}
+                    None => {
+                        outcome.errors.push(format!(
+                            "nonterminal session {} has dead command {pid} and no recovery worker pid",
+                            identity.session_id
+                        ));
+                        outcome.retained.push(pid);
+                    }
                 },
                 Err(error) => outcome.errors.push(error),
             },
