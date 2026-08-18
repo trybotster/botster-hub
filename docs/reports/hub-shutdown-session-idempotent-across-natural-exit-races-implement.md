@@ -10,10 +10,10 @@
 | Authoritative path | spawn target `botster-hub` via `list_spawn_targets` |
 | Plan | `docs/plans/hub-shutdown-session-idempotent-across-natural-exit-races.md` @ `075e9e6` |
 | Decision gate | Rule B |
-| Core dependency | `ticket_1787015956_494734` / `dependency_1787015963_708930` / run `run_1787015981_429380` |
-| Core pin | still `fc541a5`; no silent repin |
+| Core dependency | `ticket_1787015956_494734` / `dependency_1787015963_708930` closed |
+| Core pin | `d981bb03` (was `fc541a5`); recorded Rule B repin |
 | Hub main integrated | `c1ce7e5` via merge commit `b117d0d` |
-| Review requested | no; this leaf is blocked on the Core dependency |
+| Review requested | no; pin and focused proofs are in; wrapper W1/W2 still cannot spawn |
 
 ## Repository playbook and other playbooks/notes applied
 
@@ -96,6 +96,7 @@ Rule A is rejected. The capture line that decided it is the spawn-time welcome i
 - `tests/hub_daemon_lifecycle/webrtc_proofs.rs` -- ignored W1/W2 WebRTC forced-window tests.
 - `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs` -- full typed error body on the Unix strict assert; ignored W1/W2 Unix tests.
 - `docs/reports/hub-shutdown-session-idempotent-across-natural-exit-races-implement.md` -- this report.
+- Rule B Core pin: `Cargo.toml`, `Cargo.lock`, `crates/botster-hub-client/Cargo.toml`, `crates/botster-hub-test-support/{Cargo.toml,build.rs,src/conformance_data.rs,src/lib.rs}`, `tests/session_projection_owner_loop.rs`, `tests/hub_daemon_lifecycle/package_event_plane.rs`, `tests/hub_daemon_lifecycle/webrtc_terminal_adapter.rs`.
 
 ## Ownership boundaries preserved
 
@@ -107,7 +108,8 @@ Hub still owns classification, recover, and host response kinds. Core still owns
 - Registered `dependency_1787015963_708930`: this ticket depends on that Core ticket (`depends_on_status=open`).
 - Started Core run `run_1787015981_429380` (`botster_stack_delivery`, Plan queued). Automatic start succeeded, so no `ask_human` operator action was required.
 - Downstream blocker `dependency_1787014444_456296` remains: `ticket_1786938984_190098` depends on this ticket.
-- No Core repin yet. After the Core ticket merges, this run must repin to merged Core main and complete the forced-window proofs.
+- Core ticket `ticket_1787015956_494734` is closed. This run repinned Hub to merged Core main `d981bb03f91e2d13428000ac989c50d794f659b2`.
+- Downstream blocker `dependency_1787014444_456296` remains: `ticket_1786938984_190098` depends on this ticket.
 
 ## Deviations from plan
 
@@ -130,6 +132,20 @@ Overlap recheck:
 
 No full lifecycle suite ran after the integrate.
 
+## Core pin `d981bb03`
+
+Recorded Rule B repin after `ticket_1787015956_494734` merged to Core main.
+
+Pin delta: `fc541a59338d0591ba4fb3fa522a030d212d26d0` -> `d981bb03f91e2d13428000ac989c50d794f659b2`.
+
+Live pin sources updated together: workspace and member `Cargo.toml` files, `Cargo.lock`, test-support `build.rs` / late-attach provenance, and the Git-visible pin fixtures. Historical sibling reports were not rewritten.
+
+Core `c23b833` delivers `ProcessExited` when the worker payload arrives. `drain_output` no longer gates that delivery on `try_wait().success()`. A delayed reap goes to a background reaper.
+
+The Hub parent-wrapper still cannot spawn. After the pin, `unix_shutdown_session_after_w1_delayed_worker_reap_is_idempotent` still failed at `spawn_and_bind` with `kind=OperatorError` instead of `Spawned`. Those four tests stay ignored.
+
+No full lifecycle suite ran after the pin.
+
 ## Tests and downstream proof run
 
 All commands used `./test.sh` except the documented worker prebuild and the fmt/clippy gates.
@@ -145,19 +161,24 @@ All commands used `./test.sh` except the documented worker prebuild and the fmt/
 | Clippy | `cargo clippy --workspace --all-targets --locked -- -D warnings` | pass |
 | Post-integrate recover units | `./test.sh --locked --lib recover_` then `shutdown_active` | 5 + 2 passed |
 | Post-integrate focused Unix trio | `./test.sh --locked --test hub_daemon_lifecycle_test -- --exact unix_adapter_unbound_printf_stream_attach_completes unix_adapter_bound_printf_stream_attach_delivers_process_exit unix_shutdown_session_from_another_connection_classifies_attached_exit` | 3 passed in 6.03s |
+| Post-pin worker | `cargo build --locked -p botster-core-daemon --bin botster-session-worker` | pass in 1m 18s |
+| Post-pin fixture provenance | `./test.sh --locked --lib late_attach_goldens_have_distinct` | 1 passed |
+| Post-pin Git-visible pin | `./test.sh --locked --test session_projection_owner_loop -- --exact git_visible_hub_members_share_one_exact_core_revision` | 1 passed |
+| Post-pin recover units | `./test.sh --locked --lib recover_` | 5 passed |
+| Post-pin focused natural-exit | `./test.sh --locked --test hub_daemon_lifecycle_test -- --exact unix_shutdown_session_from_another_connection_classifies_attached_exit external_hub_webrtc_live_output_preserves_exact_bytes` | 2 passed in 8.21s |
+| Post-pin ignored W1 Unix | `./test.sh --locked --test hub_daemon_lifecycle_test -- --ignored --exact unix_shutdown_session_after_w1_delayed_worker_reap_is_idempotent` | fail: Spawn `OperatorError`, not `Spawned` |
 
 Production entry point: Unix/WebRTC `ShutdownSession` still enters `src/daemon_transport.rs` at the `DaemonRequest::ShutdownSession` arm, then `classify_shutdown_session`, Core `shutdown_session`, and `recover_after_core_shutdown_error`. The new recover path is that production recover function. Classify `Ok(Active)` plus a real Core error is unchanged.
 
 ## Runtime-teardown lenses
 
-Every lens from the approved plan remains in force. No lens was dropped to informal follow-up. The Core dependency ticket is the registered owner of the payload-delivery lens that Hub cannot implement.
+Every lens from the approved plan remains in force. No lens was dropped to informal follow-up. Closed Core `ticket_1787015956_494734` owns the payload-delivery lens. Hub still owns classify, recover, and the live host-path proofs.
 
 ## Unverified behavior or residual risk
 
-- W1/W2 live OperatorError bodies after a successful spawn are unverified.
-- Blind exact-bytes and tightened idempotency oracles are not restored on this commit.
-- Recover fallback fixes only classify `Err` after a Core shutdown error. Sub-cases 4 and 5 stay `Ok(Active)` until Core delivers ProcessExited without the reap/status gate.
-- The ignored wrapper tests may still fail spawn after the Core fix if welcome identity remains strict. Core may expose pending-exit evidence instead; the wrapper is then optional.
+- Hub wrapper W1/W2 tests still cannot spawn. Core now owns those mechanism windows.
+- Blind exact-bytes and tightened idempotency oracles are not restored on this pin commit.
+- Recover fallback still covers only classify `Err` after a Core shutdown error.
 - Ready-spawn suite co-flake stays owned by `ticket_1786938984_190098`.
 
 ## Missing vault guidance discovered
