@@ -5,6 +5,7 @@
 
 pub(crate) mod cli;
 pub(crate) mod common;
+pub(crate) mod harness;
 pub(crate) mod operator_console_fixtures;
 pub(crate) mod package_fixtures;
 pub(crate) mod process;
@@ -13,6 +14,7 @@ pub(crate) mod webrtc_fixtures;
 
 pub(crate) use cli::*;
 pub(crate) use common::*;
+pub(crate) use harness::*;
 pub(crate) use operator_console_fixtures::*;
 pub(crate) use package_fixtures::*;
 pub(crate) use process::*;

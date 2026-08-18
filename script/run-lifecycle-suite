@@ -1,0 +1,101 @@
+#!/bin/sh
+set -eu
+
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+census="$root/script/process-census"
+test_sh="$root/test.sh"
+settle_seconds=${BOTSTER_LIFECYCLE_CENSUS_SETTLE_SECONDS:-2}
+force_dirty=${BOTSTER_LIFECYCLE_SUITE_FORCE_DIRTY:-0}
+
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/bh-lifecycle-suite.XXXXXX")
+trap 'rm -rf "$tmp"' EXIT INT TERM
+
+pre_dev="$tmp/pre-dev-artifacts.tsv"
+pre_zombies="$tmp/pre-zombies.tsv"
+paths="$tmp/owned-paths.txt"
+suite_log="$tmp/suite.log"
+post_live="$tmp/post-live.tsv"
+post_zombies="$tmp/post-zombies.tsv"
+post_dev="$tmp/post-dev-artifacts.tsv"
+verdict_file="$tmp/verdict.txt"
+
+printf '%s\n' \
+  "$root/target/debug/botster-hub" \
+  "$root/target/debug/botster-session-worker" \
+  >"$paths"
+
+"$census" dev-artifact-rows >"$pre_dev"
+"$census" botster-zombies >"$pre_zombies"
+
+if [ -s "$pre_dev" ] || [ -s "$pre_zombies" ]; then
+  if [ "$force_dirty" != "1" ]; then
+    printf '%s\n' "verdict=environment_dirty" | tee "$verdict_file"
+    echo "pre-run Botster dev-artifact or zombie evidence:" >&2
+    cat "$pre_dev" "$pre_zombies" >&2 || true
+    exit 2
+  fi
+  dirty_forced=1
+else
+  dirty_forced=0
+fi
+
+cargo build --locked -p botster-core-daemon --bin botster-session-worker
+set +e
+"$test_sh" --locked --test hub_daemon_lifecycle_test "$@" >"$suite_log" 2>&1
+suite_status=$?
+set -e
+cat "$suite_log"
+
+tally_count=$(grep -c '^test result:' "$suite_log" || true)
+if [ "$tally_count" != "1" ]; then
+  printf '%s\n' "verdict=product_failure reason=tally_count=$tally_count" | tee "$verdict_file"
+  exit 1
+fi
+
+"$census" assert-no-live-executables "$paths" "$post_live" "$settle_seconds" || true
+"$census" assert-no-new-zombies "$pre_zombies" "$post_zombies" "$settle_seconds" || true
+"$census" dev-artifact-rows >"$post_dev"
+awk -F '\t' '
+  FILENAME == ARGV[1] { before[$1]=1; next }
+  !before[$1] { print }
+' "$pre_dev" "$post_dev" >"$tmp/dev-delta.tsv" || true
+
+survivors=0
+if [ -s "$post_live" ] || [ -s "$post_zombies" ] || [ -s "$tmp/dev-delta.tsv" ]; then
+  survivors=1
+fi
+
+failed=$(awk '/^test result:/{print $4; exit}' "$suite_log")
+failed=${failed:-0}
+tainted=$(grep -c 'environment_tainted:' "$suite_log" || true)
+host_markers=$(grep -c 'harness_budget_expired kind=' "$suite_log" || true)
+confirmed_host=$(grep -c 'harness_budget_expired kind=.*resource=\(EMFILE\|ENFILE\|PTY\).*probe=' "$suite_log" || true)
+confirmed_probe=$(grep -c 'harness_budget_expired kind=.*probe=confirmed' "$suite_log" || true)
+product_failures=$(grep -E 'FAILED|panicked at' "$suite_log" | grep -v environment_tainted | grep -v 'harness_budget_expired kind=.*resource=\(EMFILE\|ENFILE\|PTY\)' | grep -v 'probe=confirmed' | wc -l | tr -d ' ')
+
+if [ "$dirty_forced" = "1" ]; then
+  verdict="environment_dirty_forced"
+elif [ "$failed" = "0" ]; then
+  verdict="clean"
+elif [ "$tainted" -gt 0 ] && [ "$product_failures" = "0" ]; then
+  verdict="environment_tainted"
+elif [ "$failed" -gt 0 ] && [ "$product_failures" = "0" ] && { [ "$confirmed_host" -gt 0 ] || [ "$confirmed_probe" -gt 0 ]; }; then
+  verdict="host_exhaustion"
+else
+  verdict="product_failure"
+fi
+
+if [ "$survivors" = "1" ]; then
+  verdict="${verdict}+survivors_present"
+fi
+
+printf '%s\n' "verdict=$verdict failed=$failed tally=$tally_count survivors=$survivors tainted=$tainted" | tee "$verdict_file"
+if [ "$survivors" = "1" ]; then
+  echo "survivor evidence:" >&2
+  cat "$post_live" "$post_zombies" "$tmp/dev-delta.tsv" >&2 || true
+fi
+
+if [ "$verdict" = "clean" ] && [ "$suite_status" -eq 0 ]; then
+  exit 0
+fi
+exit 1

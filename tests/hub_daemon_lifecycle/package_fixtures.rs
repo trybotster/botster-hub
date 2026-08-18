@@ -1529,7 +1529,8 @@ pub(crate) fn install_real_release(
             .expect("run the managed installer");
     assert!(
         installed.status.success(),
-        "{}",
+        "install_real_release failed: status={:?} {}",
+        installed.status,
         command_output_text(&installed)
     );
 

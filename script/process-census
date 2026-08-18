@@ -77,6 +77,53 @@ live_executable_rows() {
   '
 }
 
+dev_artifact_rows() {
+  all_process_rows | awk '
+    function has_dev_segment(line) {
+      return index(line, "/target/debug/") \
+        || index(line, "/target/managed-install-proof/") \
+        || index(line, "/tmp/bh-") \
+        || index(line, "botster-hub-test-data")
+    }
+    function basename_of(path) {
+      n = path
+      sub(/.*\//, "", n)
+      return n
+    }
+    function is_role() {
+      if ($6 == "botster-hub" || $6 == "botster-session" || $6 == "botster-session-worker") {
+        return 1
+      }
+      for (i = 6; i <= NF; i++) {
+        b = basename_of($i)
+        if (b == "botster-hub" || b == "botster-session-worker") {
+          return 1
+        }
+      }
+      return 0
+    }
+    $5 !~ /^Z/ {
+      if (is_role() && has_dev_segment($0)) {
+        printf "%s\t%s\t%s\t%s\t%s\t%s", $1, $2, $3, $4, $5, $6
+        for (field = 7; field <= NF; field++) printf "\t%s", $field
+        printf "\n"
+      }
+    }
+  '
+}
+
+assert_no_dev_artifacts() {
+  evidence=$1
+  settle_seconds=$2
+  deadline=$(( $(date +%s) + settle_seconds ))
+  while :; do
+    dev_artifact_rows >"$evidence"
+    [ ! -s "$evidence" ] && return 0
+    [ "$(date +%s)" -ge "$deadline" ] && return 1
+    sleep 0.1
+  done
+}
+
 assert_no_live_executables() {
   paths_file=$1
   evidence=$2
@@ -99,7 +146,7 @@ self_test() {
   zombie_evidence=$fixture/zombie-evidence
   paths=$fixture/paths
   evidence=$fixture/evidence
-  trap 'kill "${marker_pid:-}" "${zombie_parent_pid:-}" >/dev/null 2>&1 || true; wait "${marker_pid:-}" >/dev/null 2>&1 || true; wait "${zombie_parent_pid:-}" >/dev/null 2>&1 || true; rm -rf "$fixture"' EXIT INT TERM
+  trap 'kill "${marker_pid:-}" "${zombie_parent_pid:-}" "${worker_a_pid:-}" "${worker_b_pid:-}" "${installed_pid:-}" "${mention_pid:-}" >/dev/null 2>&1 || true; wait "${marker_pid:-}" >/dev/null 2>&1 || true; wait "${zombie_parent_pid:-}" >/dev/null 2>&1 || true; wait "${worker_a_pid:-}" >/dev/null 2>&1 || true; wait "${worker_b_pid:-}" >/dev/null 2>&1 || true; wait "${installed_pid:-}" >/dev/null 2>&1 || true; wait "${mention_pid:-}" >/dev/null 2>&1 || true; rm -rf "$fixture"' EXIT INT TERM
   printf '%s\n' '#!/bin/sh' 'sleep 30' >"$marker"
   chmod +x "$marker"
   printf '%s\n' "$marker" >"$paths"
@@ -158,6 +205,55 @@ self_test() {
   kill "$zombie_parent_pid"
   wait "$zombie_parent_pid" || true
   zombie_parent_pid=
+  worktree_a=$fixture/worktree-a/target/debug
+  worktree_b=$fixture/worktree-b/target/debug
+  installed=$fixture/opt/local/share/botster-hub
+  mkdir -p "$worktree_a" "$worktree_b" "$installed"
+  printf '%s\n' '#!/bin/sh' 'sleep 30' >"$worktree_a/botster-session-worker"
+  printf '%s\n' '#!/bin/sh' 'sleep 30' >"$worktree_b/botster-session-worker"
+  printf '%s\n' '#!/bin/sh' 'sleep 30' >"$installed/botster-hub"
+  printf '%s\n' '#!/bin/sh' 'sleep 30' >"$fixture/mention-botster"
+  chmod +x "$worktree_a/botster-session-worker" "$worktree_b/botster-session-worker" "$installed/botster-hub" "$fixture/mention-botster"
+  "$worktree_a/botster-session-worker" &
+  worker_a_pid=$!
+  "$worktree_b/botster-session-worker" &
+  worker_b_pid=$!
+  "$installed/botster-hub" &
+  installed_pid=$!
+  "$fixture/mention-botster" botster leftover &
+  mention_pid=$!
+  attempts=0
+  while :; do
+    rows=$(dev_artifact_rows)
+    echo "$rows" | awk -v a="$worker_a_pid" -v b="$worker_b_pid" '
+      $1 == a { found_a=1 }
+      $1 == b { found_b=1 }
+      END { exit !(found_a && found_b) }
+    ' && break
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 100 ] || {
+      echo "dev-artifact positive control was not observable a=$worker_a_pid b=$worker_b_pid" >&2
+      echo "$rows" >&2
+      ps -p "$worker_a_pid" -o pid=,comm=,args= >&2 || true
+      ps -p "$worker_b_pid" -o pid=,comm=,args= >&2 || true
+      exit 1
+    }
+    sleep 0.01
+  done
+  echo "$rows" | awk -v pid="$installed_pid" '$1 == pid { found=1 } END { exit !found }' && {
+    echo "installed-prefix process was flagged as a dev artifact" >&2
+    exit 1
+  }
+  echo "$rows" | awk -v pid="$mention_pid" '$1 == pid { found=1 } END { exit !found }' && {
+    echo "botster mention without role name was flagged as a dev artifact" >&2
+    exit 1
+  }
+  kill "$worker_a_pid" "$worker_b_pid" "$installed_pid" "$mention_pid" >/dev/null 2>&1 || true
+  wait "$worker_a_pid" >/dev/null 2>&1 || true
+  wait "$worker_b_pid" >/dev/null 2>&1 || true
+  wait "$installed_pid" >/dev/null 2>&1 || true
+  wait "$mention_pid" >/dev/null 2>&1 || true
+
   echo "process census self-test passed"
 }
 
@@ -168,5 +264,7 @@ case "${1-}" in
   assert-no-new-zombies) [ "$#" -eq 4 ] || exit 64; assert_no_new_zombies "$2" "$3" "$4" ;;
   assert-no-live-executables) [ "$#" -eq 4 ] || exit 64; assert_no_live_executables "$2" "$3" "$4" ;;
   --self-test) [ "$#" -eq 1 ] || exit 64; self_test ;;
-  *) echo "usage: script/process-census all|botster-zombies|botster-zombies-from-stdin|assert-no-new-zombies BASELINE EVIDENCE SECONDS|assert-no-live-executables PATHS EVIDENCE SECONDS|--self-test" >&2; exit 64 ;;
+  dev-artifact-rows) [ "$#" -eq 1 ] || exit 64; dev_artifact_rows ;;
+  assert-no-dev-artifacts) [ "$#" -eq 3 ] || exit 64; assert_no_dev_artifacts "$2" "$3" ;;
+  *) echo "usage: script/process-census all|botster-zombies|botster-zombies-from-stdin|assert-no-new-zombies BASELINE EVIDENCE SECONDS|assert-no-live-executables PATHS EVIDENCE SECONDS|dev-artifact-rows|assert-no-dev-artifacts EVIDENCE SECONDS|--self-test" >&2; exit 64 ;;
 esac
