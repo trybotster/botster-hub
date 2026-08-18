@@ -2015,6 +2015,87 @@ fn unix_shutdown_session_from_another_connection_classifies_attached_exit() {
 }
 
 #[test]
+fn unix_shutdown_session_stuck_stopping_without_exit_evidence_stays_operator_error() {
+    let _guard = daemon_test_guard();
+    let session_id = "stk-session";
+    let hub = start_isolated_live_output_hub_with_env(
+        "stk",
+        &[
+            ("BOTSTER_HUB_TEST_FAIL_RUNTIME_DRAIN_FOR", session_id),
+            (
+                "BOTSTER_HUB_TEST_FAIL_RUNTIME_DRAIN_MESSAGE",
+                "test-injected observe drain failure: stk-session",
+            ),
+        ],
+    );
+    let endpoint = hub.endpoint().clone();
+    let data_dir = hub.data_dir().clone();
+    let before_pids: std::collections::BTreeSet<u32> = session_worker_process_identities()
+        .expect("baseline worker census must succeed")
+        .into_iter()
+        .map(|worker| worker.pid)
+        .collect();
+
+    let spawned = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: session_id.to_string(),
+            command: "sleep 3600".to_string(),
+        },
+    )
+    .expect("spawn stuck-Stopping victim");
+    assert_eq!(
+        spawned.kind,
+        botster_hub_client::DaemonResponseKind::Spawned,
+        "stuck-Stopping victim must spawn, got kind={:?} error={:?}",
+        spawned.kind,
+        spawned.error
+    );
+
+    let workers = capture_new_session_workers_for_data_dir(&data_dir, &before_pids)
+        .expect("must capture live victim worker after Spawn");
+    assert!(
+        !workers.is_empty(),
+        "must capture live victim worker before SIGKILL"
+    );
+    for worker in &workers {
+        let result = unsafe { libc::kill(worker.pid as libc::pid_t, libc::SIGKILL) };
+        assert_eq!(
+            result, 0,
+            "SIGKILL victim worker pid={} errno={}",
+            worker.pid,
+            std::io::Error::last_os_error()
+        );
+    }
+
+    let shutdown = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::ShutdownSession {
+            session_id: session_id.to_string(),
+        },
+    )
+    .expect("shutdown after killed worker and exact-query failure");
+    assert_eq!(
+        shutdown.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError,
+        "stuck session without exact exit evidence must stay OperatorError, got kind={:?} error={:?} cleanup={:?}",
+        shutdown.kind,
+        shutdown.error,
+        shutdown.cleanup
+    );
+    let error = shutdown
+        .error
+        .as_ref()
+        .expect("typed operator error body");
+    assert!(
+        error.code == "runtime_error" || error.code == "state_error",
+        "stuck ShutdownSession must keep runtime_error or state_error, got {error:?}"
+    );
+    assert_eq!(error.operation, "shutdown");
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
 fn stale_generation_close_does_not_sweep_replacement_owner() {
     let _guard = daemon_test_guard();
     let hub = start_isolated_live_output_hub("sgo");
