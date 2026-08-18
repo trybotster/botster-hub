@@ -99,7 +99,7 @@ Revision 3 required a ReadScreen-driven wait for `lifecycle == "exited"`. The fi
 Accepted deviations, now in committed plan revision 4:
 
 - Exit oracle is attached-subscription `process_exit`, not `ListSessions.lifecycle`.
-- Spawn keeps `sleep 1` after the marker printf so the unix adapter attaches while the child is alive. A printf-only child never delivered `process_exit` in two focused runs.
+- Revision 4 used `sleep 1` after the marker printf so a unix adapter could attach while the child was alive. Revision 5 superseded that attach window with a release file. The bound test still sleeps 1 after the marker so Core can emit `process_exit`; that sleep is not an attach deadline.
 - Host Drain serviceability uses the owning unix adapter connection. A second default-hello Drain returned `snapshot_stream_forbidden`.
 - The unused full-suite slot from `question_1787005080_932674` was released. A new slot was requested only after focused gates passed.
 - Plan check 3 asked for five consecutive binding-green suite runs. Orchestrator answer `question_1787011724_901513` advances this ticket on the focused proof plus the five target-test passes. It forbids a full-suite rerun now. Final integration stays the strict clean-suite gate.
@@ -123,12 +123,12 @@ Production entry point: unchanged. The ticket is a test-oracle repair. The produ
 
 ### Red-proof
 
-Both controls used `./test.sh --locked --test hub_daemon_lifecycle_test -- --exact unix_adapter_unbound_printf_stream_attach_completes`. Both sabotages were reverted after the runs.
+Each control used its own exact-test command. Both sabotages were reverted after the runs.
 
-| Control | Sabotage | Exit | First failure |
-| --- | --- | --- | --- |
-| A (unbound retention) | `ShutdownSession` before host-row check | 101 | `host session lifecycle stopping is not running or exited` at `unix_terminal_adapter.rs:91` |
-| B (bound `process_exit`) | skip writing the bound release file | 101 | `attached terminal subscription must deliver process_exit` at `unix_terminal_adapter.rs:912` |
+| Control | Command | Sabotage | Exit | First failure |
+| --- | --- | --- | --- | --- |
+| A (unbound retention) | `./test.sh --locked --test hub_daemon_lifecycle_test -- --exact unix_adapter_unbound_printf_stream_attach_completes` | `ShutdownSession` before the host-row check | 101 | `host session lifecycle stopping is not running or exited` at `unix_terminal_adapter.rs:91` |
+| B (bound `process_exit`) | `./test.sh --locked --test hub_daemon_lifecycle_test -- --exact unix_adapter_bound_printf_stream_attach_delivers_process_exit` | skip writing the bound release file | 101 | `attached terminal subscription must deliver process_exit` at `unix_terminal_adapter.rs:912` |
 
 ### Acceptance tallies
 
@@ -160,7 +160,7 @@ Downstream proof: not required. No public surface, DTO, pin, or runtime behavior
 - Orchestrator `question_1787013324_423511` forbids five more full lifecycle suites. Leaf tickets now use focused deterministic proof. The shared lifecycle harness is an active repair root under `ticket_1787011770_110683`. This visit records commit `3f5314a`, both 20/20 focused proofs, both red controls, fmt, clippy, and the earlier five-suite evidence in which the target passed 5/5. The exclusive suite slot stays free. One controlled full lifecycle suite runs only after that harness repair merges. Final integration remains the strict clean-suite convergence gate.
 - Run 4 is invalid suite-environment evidence and does not count against this ticket.
 - Plan check 6 (one full `./test.sh --locked`) was not run. It is non-binding and needs its own orchestrator slot.
-- `sleep 1` can still lose the attach-before-exit race under extreme spawn delay. Control B proves the `process_exit` assertion is live when the child stays up.
+- The release file holds the child until Attach returns, and the bound test also primes one Drain before release. This visit no longer has an attach-before-exit race on `sleep 1`. The remaining bound risk is that Core can omit `process_exit` if the child exits immediately after the marker. Control B proves the `process_exit` assertion is live when the release file is never written.
 - Known-baseline `ready_spawn_*` failures remain owned by `ticket_1786938984_190098`. `spawn_failed` and `openpty` extras remain on `ticket_1787011756_403471`. No serial dependencies.
 
 ## Missing vault guidance discovered
