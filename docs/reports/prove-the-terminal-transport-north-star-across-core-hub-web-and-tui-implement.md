@@ -15,9 +15,12 @@ Approved plan: rev 6 (`docs/plans/prove-the-terminal-transport-north-star-across
 | Branch | `project-pipelines/ticket_1786661010_115885` |
 | Base | `c72712e2606b8abe77e1b91c2a736791036fadd8` |
 | Lockfile Core | `fc541a59338d0591ba4fb3fa522a030d212d26d0` |
-| Merge policy | direct into `main`; **not merged** — authentic same-session proof is blocked |
+| Merge policy | direct into `main` |
 | Session-type eligibility consumer | true |
 | `teardown_class_applies` | yes |
+| Final worktree | `a9e5639` on `project-pipelines/ticket_1786661010_115885` |
+| Consumed Core pin | `302c7f7b61f3970a0151b8c6646fc21ae7bd6c67` |
+| Integrated Hub main floor | `a700916ee9deb0126bb8f3667d1578a598bf0463` |
 
 Independent routing: `project_pipelines_current_context` and `list_spawn_targets` both map `tgt_7e208a0c76a44980a83b63af976b1f22` to `botster-hub`. Implementation stayed in this run worktree.
 
@@ -189,3 +192,32 @@ None that blocked Hub-owned work. The Web cancel detach-count contract lives in 
 - Web `got 2` / `got 0` cancel counts are Web-owned request emission, not Hub forging extra Detach rows.
 - IsolatedHub Unix+WebRTC occupancy plus three consecutive suite passes after the last Hub change satisfy the Hub-owned oracles in this ticket.
 - Merge to `main` waits until the registered Web ticket (and TUI session-types ticket, if Review requires it) close, or a human waives authentic proof.
+
+## Final integration resume (2026-08-18)
+
+All registered parent dependencies are closed. Hub main `a700916` (harness taint repair `ticket_1787076374_645547`) is merged into this worktree at `a9e5639`. Core pin remains `302c7f7`.
+
+Hub-owned delivered and still present:
+
+- `script/prove-north-star-shared-session`
+- IsolatedHub Unix+WebRTC occupancy test `one_session_unix_and_webrtc_dual_attach_exposes_hub_occupancy`
+
+Gates (sequential, not waived, not overlapped):
+
+| Gate | Result |
+| --- | --- |
+| `script/process-census` before controlled suite | 0 dev-artifact rows, 0 botster zombies |
+| `script/run-lifecycle-suite` | `verdict=clean` 253 passed / 0 failed / 1 ignored / tally=1 / survivors=0 / tainted=0 |
+| Occupancy test inside that suite | `ok` |
+| Final-worktree `./test.sh --locked` | `TEST_SH_EXIT:0`; every `test result:` line `ok` with 0 failed (lifecycle 253/0/1 again) |
+
+Architecture audit:
+
+- This is the only remaining open ticket in `project_1786660949_205223`.
+- No pull request for `project-pipelines/ticket_1786661010_115885`. Open Hub PRs #150 and #147 are unrelated older tickets.
+- Production scan in `src/lib.rs` still forbids READY/PAGE/FINISH/GHOSTSNP, two-argument Core drain, and terminal `DaemonEvent` bodies. Unix and WebRTC adapters have matching forbidden-token scans.
+- Host `DaemonCompatibility` and Core `TerminalCompatibility` remain separate structs in `botster-hub-client`.
+- Hub / hub-client / hub-test-support Cargo.toml have no `botster-terminal-protocol-client` dependency.
+- Clients pin protocol versions; this Hub ticket does not add a Hub Git pin for terminal compatibility.
+
+Residual: authentic Web+TUI `script/prove-north-star-shared-session` was not re-executed in this resume. The orchestrator required the two suite gates above, then audit and direct merge. IsolatedHub occupancy plus closed Web/TUI owner tickets are the live-client evidence floor.
