@@ -45,6 +45,19 @@ This revision changes no scope, design, or acceptance content. The Plan agent fo
 - Wall-clock primary asserts remain at `:2799`, `:2866`, `:3116`; assembly test call sites remain at `:2854`, `:2938`, `:2958`, `:3030`, `:3167`, `:3326`, `:3430`, `:3467`.
 - README worker-build prerequisite remains (`README.md:42`); tracked `.gitignore` is 53 bytes and matches HEAD; the worktree path contains no `:`.
 
+## Revision 4 (Plan Review finding_1787093543_426311)
+
+Plan Review `review_1787093543_793312` (run `run_1787092386_910379`) found one product defect in the locked paging rule: the `OversizedRow` predicate checked `envelope + encoded_item_len > capacity` while `candidate_charge` also includes `separator_bytes(assembled_item_count + accepted_count, 1)`. After one or more assembled items, a candidate sized exactly to `envelope + item == capacity` passed the `OversizedRow` check but could never pass the `ByteBudget` check, so every full-capacity turn returned an empty `ByteBudget` cut — an undetected livelock that contradicts the no-livelock assumption and the ticket's by-construction requirement.
+
+This revision:
+
+1. Adds the positional separator term to the `OversizedRow` predicate, so the no-progress predicate charges exactly what acceptance would charge (Locked implementation, classification step 4).
+2. Restates the no-livelock assumption with the invariant that makes it hold: any candidate surviving `OversizedRow` fits a fresh full-capacity page at its position.
+3. Adds the later-page separator boundary acceptance test: assemble one item, place the next row at the exact no-comma capacity boundary, and prove deterministic closure instead of repeated empty `ByteBudget` cuts, with a one-byte-headroom control variant that is accepted.
+4. Notes the consequence: oversized classification is position-dependent — a row admissible as the first item can close as oversized at a later position. This matches the one-frame snapshot contract; the cumulative frame-limit check already behaves this way at the `DAEMON_MAX_FRAME_BYTES` level.
+
+The existing separator-overflow test keeps `DAEMON_MAX_FRAME_BYTES` capacity and remains reachable: each half-megabyte row fits the predicate individually, and the comma overflow is still caught by the cumulative frame-limit check.
+
 ## Repository playbook loaded
 
 - [[botster-hub-playbook]]
@@ -171,7 +184,7 @@ No cross-repository dependency is registered. The one registered dependency (`ti
 
 - The production defects are exactly the four numbered code facts above; all are in `take_snapshot_item_page` and `continue_session_snapshot_assembly` on current main.
 - `state.next_seq` and `state.resync_reason` do not change during one assembly pass, so one envelope charge per assembly call is exact. `reset_snapshot_assembly` starts a new pass when the source sequence moves.
-- Reclassifying empty `ByteBudget`/`Elapsed` cuts as `Continue` cannot livelock: each new owner turn starts with the full `SESSION_DELIVERY_*` budgets, so any row below the `OversizedRow` threshold is eventually accepted.
+- Reclassifying empty `ByteBudget`/`Elapsed` cuts as `Continue` cannot livelock: each new owner turn starts with the full `SESSION_DELIVERY_*` budgets, and the `OversizedRow` predicate charges the candidate's full positional cost (`envelope + item + positional separator`) against the full capacity. Therefore any candidate that survives the `OversizedRow` check fits a fresh full-capacity page at its position, and a full-budget turn accepts it. An empty `ByteBudget` cut can only occur when the remaining budget is below capacity, which a later turn restores. (Revision 4: this argument requires the separator term inside the `OversizedRow` predicate; see finding_1787093543_426311.)
 - Closing rows above the fresh-page threshold (the current behavior for genuinely oversized rows) remains the correct product policy; this plan makes the closure deterministic, it does not remove it.
 - `serde_json` encoding of a fixed `Value` is deterministic, so exact byte equality between the charged total and the sent frame is a valid oracle.
 
@@ -221,7 +234,7 @@ where `separator_bytes` follows the existing `snapshot_separator_bytes` semantic
 4. Classify, in this order, per candidate:
    - `ItemBudget` cut when accepted items reach `max_items`.
    - `Elapsed` cut when `started.elapsed() >= max_elapsed`.
-   - `OversizedRow` when the candidate cannot fit even a fresh page: `envelope + encoded_item_len > capacity`. This predicate uses only the row, the envelope, and the capacity parameter — never the remaining budget or elapsed time. Callers pass constants, so closure stays a function of data and constants.
+   - `OversizedRow` when the candidate cannot fit even a fresh full-capacity page at its actual frame position: `envelope + encoded_item_len + separator_bytes(assembled_item_count + accepted_count, 1) > capacity`. The separator term is the same one `candidate_charge` uses, so the no-progress predicate charges exactly what acceptance would charge. This predicate uses only the row, the envelope, the candidate's deterministic frame position, and the capacity parameter — never the remaining budget or elapsed time. Callers pass constants, so closure stays a function of data and deterministic assembly state, not scheduling. (Revision 4: the separator term was missing; without it a later-positioned row at the exact `envelope + item == capacity` boundary passes the OversizedRow check but can never pass the ByteBudget check, yielding an empty `ByteBudget` cut every turn forever.)
    - `ByteBudget` cut when `envelope + page_charge + candidate_charge` exceeds the remaining turn byte budget. The cumulative frame-limit check stays at the assembly level — the page loop only enforces the turn budget.
    - Otherwise accept: push the value, add `candidate_charge` to `page_charge`, record `last_id`.
 5. Return the accepted values, the reported page byte total `envelope + page_charge`, the item-and-separator charge `page_charge`, `last_id`, and the typed cut.
@@ -273,7 +286,8 @@ All focused tests drive the production functions in `src/daemon_entity_subscript
 | Byte budget | With measured `envelope` and first-candidate charge `c1`: a remaining budget of `envelope + c1` accepts one item and cuts `ByteBudget` before the second; a remaining budget of `envelope + c1 - 1` accepts zero items and returns `Continue { more: true }`, not a close; a remaining budget of `c1` alone (no envelope headroom) also accepts zero items. The last case is the envelope-admission boundary: envelope inclusion is what flips the decision. |
 | Separator | `separators_close_when_item_bytes_fit_but_commas_do_not` stays green against the rewrite. The test passes `DAEMON_MAX_FRAME_BYTES` as both the remaining budget and the fresh-page capacity, so its half-megabyte rows are admitted per page and never classify as `OversizedRow`; the comma overflow is caught by the cumulative frame-limit check and closes oversized. |
 | Envelope | The charge uses the real envelope: with a nonzero `next_seq` and a set `resync_reason`, a page that fits under the stub envelope but not the real one is cut/closed correctly. Assert the envelope value equals `snapshot_envelope_bytes` for the same state. |
-| Oversized row | A row with `envelope + item > capacity` closes with one `entity_provider_frame_too_large` error frame and today's state transitions; the same row is accepted when the test passes a larger capacity, proving the predicate uses the capacity parameter. Production capacity is `SESSION_DELIVERY_MAX_BYTES`. `oversized_first_snapshot_closes_the_subscription` converts to `Duration::MAX`. |
+| Oversized row | A row with `envelope + item + positional separator > capacity` closes with one `entity_provider_frame_too_large` error frame and today's state transitions; the same row is accepted when the test passes a larger capacity, proving the predicate uses the capacity parameter. Production capacity is `SESSION_DELIVERY_MAX_BYTES`. `oversized_first_snapshot_closes_the_subscription` converts to `Duration::MAX`. |
+| Later-page separator boundary (Revision 4) | Assemble at least one item first. Size the next row so `envelope + item == capacity` exactly (no comma headroom): the next full-capacity call classifies `OversizedRow` and closes deterministically with one error frame — it does not return repeated empty `ByteBudget` cuts. A control variant with one byte of comma headroom (`envelope + item + 1 <= capacity`) is accepted at full capacity, proving the boundary sits exactly on the separator term. |
 | Elapsed | With `Duration::ZERO` and normal rows, `take_snapshot_item_page` returns an empty `Elapsed` cut, and `continue_session_snapshot_assembly` returns `Continue { more: true }` with `needs_delivery` set and sends no error frame. A later call with `Duration::MAX` completes the snapshot. This is the regression test for the spurious-close defect. |
 | Multi-page completion | A registry assembles across multiple calls at one source sequence; exactly one Snapshot frame is delivered; items are complete and in id order; the exactness invariant holds: charged total equals the encoded sent frame length. |
 | No clone-and-reserialize | Source scan: no `items.clone()`, no per-candidate frame encode. Ablation red proof per sequence step 6. |
