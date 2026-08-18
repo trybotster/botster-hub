@@ -1081,6 +1081,15 @@ fn take_snapshot_item_page(
     let mut last_id = after.map(str::to_string);
     let mut page_charge = 0usize;
     let mut cut = SnapshotPageCut::Complete;
+    if envelope_bytes > remaining_byte_budget {
+        return SnapshotItemPage {
+            items,
+            last_id,
+            page_charge,
+            bytes: envelope_bytes,
+            cut: SnapshotPageCut::ByteBudget,
+        };
+    }
     for (id, row) in rows_after(&projection.rows, after) {
         if items.len() >= max_items {
             cut = SnapshotPageCut::ItemBudget;
@@ -3960,6 +3969,61 @@ mod tests {
         let frames: Vec<_> = receiver.try_iter().collect();
         assert_eq!(frames.len(), 1);
         assert_eq!(snapshot_item_ids(&frames[0]).len(), 2);
+        assert_eq!(state.delivery_phase, DeliveryPhase::Removes);
+        assert!(!state.needs_delivery);
+    }
+
+    #[test]
+    fn empty_snapshot_yields_when_remaining_budget_is_below_envelope() {
+        let projection = sealed_projection([]);
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let mut state = assembling_subscription(sender, 1);
+        let envelope = snapshot_envelope_bytes("sub", &state);
+        assert!(envelope > 1);
+        let mut counters = DaemonLifecycleCounters::default();
+        let SnapshotAssemble::Continue { page } = continue_session_snapshot_assembly(
+            "sub",
+            &mut state,
+            &projection,
+            true,
+            &mut counters,
+            SESSION_DELIVERY_MAX_ITEMS,
+            envelope.saturating_sub(1),
+            SESSION_DELIVERY_MAX_BYTES,
+            Duration::MAX,
+        ) else {
+            panic!("remaining envelope-1 must yield, not send");
+        };
+        assert_eq!(page.items, 0);
+        assert!(page.more);
+        assert!(state.needs_delivery);
+        assert!(matches!(
+            state.delivery_phase,
+            DeliveryPhase::Assembling { .. }
+        ));
+        assert!(receiver.try_iter().next().is_none());
+
+        let SnapshotAssemble::Continue { page } = continue_session_snapshot_assembly(
+            "sub",
+            &mut state,
+            &projection,
+            true,
+            &mut counters,
+            SESSION_DELIVERY_MAX_ITEMS,
+            SESSION_DELIVERY_MAX_BYTES,
+            SESSION_DELIVERY_MAX_BYTES,
+            Duration::MAX,
+        ) else {
+            panic!("full-budget empty projection must complete");
+        };
+        assert_eq!(page.items, 0);
+        assert!(!page.more);
+        let frames: Vec<_> = receiver.try_iter().collect();
+        assert_eq!(frames.len(), 1);
+        match &frames[0] {
+            DaemonEntityFrame::Snapshot { items, .. } => assert!(items.is_empty()),
+            other => panic!("expected one empty snapshot, got {other:?}"),
+        }
         assert_eq!(state.delivery_phase, DeliveryPhase::Removes);
         assert!(!state.needs_delivery);
     }
