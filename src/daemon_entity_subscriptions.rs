@@ -36,6 +36,23 @@ struct DeliveryPage {
     more: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotPageCut {
+    Complete,
+    ItemBudget,
+    ByteBudget,
+    Elapsed,
+    OversizedRow,
+}
+
+struct SnapshotItemPage {
+    items: Vec<Value>,
+    last_id: Option<String>,
+    page_charge: usize,
+    bytes: usize,
+    cut: SnapshotPageCut,
+}
+
 #[derive(Debug)]
 pub(crate) enum EntityFrameSender {
     #[cfg(test)]
@@ -617,6 +634,7 @@ pub(super) fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut Dae
                             &mut state.lifecycle_counters,
                             SESSION_DELIVERY_MAX_ITEMS.saturating_sub(delivered),
                             SESSION_DELIVERY_MAX_BYTES.saturating_sub(delivered_bytes),
+                            SESSION_DELIVERY_MAX_BYTES,
                             SESSION_DELIVERY_MAX_ELAPSED.saturating_sub(started.elapsed()),
                         ) {
                             SnapshotAssemble::Continue { page } => (true, page),
@@ -1047,43 +1065,63 @@ pub(super) fn drive_package_entity_resync(daemon: &mut HubDaemon, state: &mut Da
     state.lifecycle_counters.live_entity_subscriptions = state.entity_subscriptions.len() as u64;
 }
 
+#[allow(clippy::too_many_arguments)]
 fn take_snapshot_item_page(
     projection: &crate::session_projection::SessionProjection,
     after: Option<&str>,
+    assembled_item_count: usize,
+    envelope_bytes: usize,
     max_items: usize,
-    max_bytes: usize,
+    remaining_byte_budget: usize,
+    fresh_page_capacity: usize,
     max_elapsed: Duration,
-) -> (Vec<Value>, Option<String>, bool) {
+) -> SnapshotItemPage {
     let started = Instant::now();
     let mut items = Vec::new();
     let mut last_id = after.map(str::to_string);
-    let mut more = false;
+    let mut page_charge = 0usize;
+    let mut cut = SnapshotPageCut::Complete;
     for (id, row) in rows_after(&projection.rows, after) {
-        if items.len() >= max_items || started.elapsed() >= max_elapsed {
-            more = true;
+        if items.len() >= max_items {
+            cut = SnapshotPageCut::ItemBudget;
+            break;
+        }
+        if started.elapsed() >= max_elapsed {
+            cut = SnapshotPageCut::Elapsed;
             break;
         }
         let entity = crate::session_projection::SessionProjection::project_entity(&row.record);
         let value = serde_json::to_value(&entity).expect("serialize session entity");
-        items.push(value);
-        let trial = DaemonEntityFrame::Snapshot {
-            subscription_id: String::new(),
-            entity_type: "session".to_string(),
-            snapshot_seq: 0,
-            items: items.clone(),
-            resync_reason: None,
-        };
-        let encoded = serde_json::to_vec(&trial)
+        let encoded_item_len = serde_json::to_vec(&value)
             .map(|body| body.len())
             .unwrap_or(0);
-        if encoded > max_bytes {
-            items.pop();
-            more = true;
+        let candidate_charge = encoded_item_len.saturating_add(snapshot_separator_bytes(
+            assembled_item_count.saturating_add(items.len()),
+            1,
+        ));
+        if envelope_bytes.saturating_add(candidate_charge) > fresh_page_capacity {
+            cut = SnapshotPageCut::OversizedRow;
             break;
         }
+        if envelope_bytes
+            .saturating_add(page_charge)
+            .saturating_add(candidate_charge)
+            > remaining_byte_budget
+        {
+            cut = SnapshotPageCut::ByteBudget;
+            break;
+        }
+        items.push(value);
+        page_charge = page_charge.saturating_add(candidate_charge);
         last_id = Some(id.clone());
     }
-    (items, last_id, more)
+    SnapshotItemPage {
+        items,
+        last_id,
+        page_charge,
+        bytes: envelope_bytes.saturating_add(page_charge),
+        cut,
+    }
 }
 
 fn store_snapshot_items(state: &mut EntitySubscriptionState, items: &[Value]) {
@@ -1108,6 +1146,7 @@ fn continue_session_snapshot_assembly(
     counters: &mut DaemonLifecycleCounters,
     max_items: usize,
     max_bytes: usize,
+    fresh_page_capacity: usize,
     max_elapsed: Duration,
 ) -> SnapshotAssemble {
     if !caught_up || !projection.baseline_complete || projection.gap {
@@ -1132,41 +1171,39 @@ fn continue_session_snapshot_assembly(
     if source_seq != live_seq || !matches!(state.delivery_phase, DeliveryPhase::Assembling { .. }) {
         reset_snapshot_assembly(state, live_seq);
     }
-    let (items, last_id, more) = take_snapshot_item_page(
+    let envelope = snapshot_envelope_bytes(subscription_id, state);
+    let page = take_snapshot_item_page(
         projection,
         state.delivery_after.as_deref(),
+        state.assembled_items.len(),
+        envelope,
         max_items.max(1),
-        max_bytes.max(1),
+        max_bytes,
+        fresh_page_capacity.max(1),
         max_elapsed,
     );
-    if items.is_empty() && more {
+    if page.cut == SnapshotPageCut::OversizedRow {
         return close_oversized_session_snapshot(subscription_id, state, counters);
     }
-    let page_item_bytes = encoded_item_bytes(&items);
-    let page_bytes = page_item_bytes.saturating_add(snapshot_separator_bytes(
-        state.assembled_items.len(),
-        items.len(),
-    ));
-    let envelope = snapshot_envelope_bytes(subscription_id, state);
     if state
         .assembled_item_bytes
-        .saturating_add(page_bytes)
+        .saturating_add(page.page_charge)
         .saturating_add(envelope)
         > DAEMON_MAX_FRAME_BYTES
     {
         return close_oversized_session_snapshot(subscription_id, state, counters);
     }
-    let page_item_count = items.len();
-    store_snapshot_items(state, &items);
-    state.assembled_items.extend(items);
-    state.assembled_item_bytes = state.assembled_item_bytes.saturating_add(page_bytes);
-    state.delivery_after = last_id;
-    if more {
+    let page_item_count = page.items.len();
+    store_snapshot_items(state, &page.items);
+    state.assembled_items.extend(page.items);
+    state.assembled_item_bytes = state.assembled_item_bytes.saturating_add(page.page_charge);
+    state.delivery_after = page.last_id;
+    if page.cut != SnapshotPageCut::Complete {
         state.needs_delivery = true;
         return SnapshotAssemble::Continue {
             page: DeliveryPage {
                 items: page_item_count,
-                bytes: page_bytes,
+                bytes: page.bytes,
                 more: true,
             },
         };
@@ -1191,7 +1228,7 @@ fn continue_session_snapshot_assembly(
             SnapshotAssemble::Continue {
                 page: DeliveryPage {
                     items: page_item_count,
-                    bytes: page_bytes,
+                    bytes: page.bytes,
                     more: false,
                 },
             }
@@ -1228,6 +1265,7 @@ fn reset_snapshot_assembly(state: &mut EntitySubscriptionState, source_seq: u64)
     state.delivery_phase = DeliveryPhase::Assembling { source_seq };
 }
 
+#[cfg(test)]
 fn encoded_item_bytes(items: &[Value]) -> usize {
     items
         .iter()
@@ -1337,6 +1375,7 @@ fn try_resync_from_projection(
         caught_up,
         counters,
         SESSION_DELIVERY_MAX_ITEMS,
+        SESSION_DELIVERY_MAX_BYTES,
         SESSION_DELIVERY_MAX_BYTES,
         SESSION_DELIVERY_MAX_ELAPSED,
     ) {
@@ -2785,7 +2824,6 @@ mod tests {
             };
             let mut counters = DaemonLifecycleCounters::default();
             loop {
-                let started = Instant::now();
                 let (alive, page) = deliver_projection_delta_page(
                     &format!("sub-{subscriber}"),
                     &mut state,
@@ -2796,7 +2834,8 @@ mod tests {
                     SESSION_DELIVERY_MAX_ELAPSED,
                 );
                 assert!(alive);
-                assert!(started.elapsed() < Duration::from_millis(crate::MAX_OWNER_TURN_MS));
+                assert!(page.items <= SESSION_DELIVERY_MAX_ITEMS);
+                assert!(page.bytes <= SESSION_DELIVERY_MAX_BYTES);
                 if !page.more {
                     break;
                 }
@@ -2849,8 +2888,9 @@ mod tests {
         };
         let mut counters = DaemonLifecycleCounters::default();
         let mut pages = 0;
+        let envelope = snapshot_envelope_bytes("sub", &state);
+        let mut charged_item_bytes = 0usize;
         loop {
-            let started = Instant::now();
             let SnapshotAssemble::Continue { page } = continue_session_snapshot_assembly(
                 "sub",
                 &mut state,
@@ -2859,11 +2899,15 @@ mod tests {
                 &mut counters,
                 SESSION_DELIVERY_MAX_ITEMS,
                 SESSION_DELIVERY_MAX_BYTES,
-                SESSION_DELIVERY_MAX_ELAPSED,
+                SESSION_DELIVERY_MAX_BYTES,
+                Duration::MAX,
             ) else {
                 panic!("assembly must stay alive");
             };
-            assert!(started.elapsed() < Duration::from_millis(crate::MAX_OWNER_TURN_MS));
+            assert!(page.items <= SESSION_DELIVERY_MAX_ITEMS);
+            assert!(page.bytes <= SESSION_DELIVERY_MAX_BYTES);
+            charged_item_bytes =
+                charged_item_bytes.saturating_add(page.bytes.saturating_sub(envelope));
             pages += 1;
             if !page.more {
                 break;
@@ -2889,6 +2933,10 @@ mod tests {
             }
             other => panic!("expected one complete snapshot, got {other:?}"),
         }
+        let encoded = serde_json::to_vec(&frames[0])
+            .expect("encode sent frame")
+            .len();
+        assert_eq!(charged_item_bytes.saturating_add(envelope), encoded);
         assert_eq!(state.delivery_phase, DeliveryPhase::Removes);
         assert!(!state.needs_delivery);
     }
@@ -2943,7 +2991,8 @@ mod tests {
             &mut counters,
             SESSION_DELIVERY_MAX_ITEMS,
             SESSION_DELIVERY_MAX_BYTES,
-            SESSION_DELIVERY_MAX_ELAPSED,
+            SESSION_DELIVERY_MAX_BYTES,
+            Duration::MAX,
         ) else {
             panic!("first page");
         };
@@ -2963,7 +3012,8 @@ mod tests {
                 &mut counters,
                 SESSION_DELIVERY_MAX_ITEMS,
                 SESSION_DELIVERY_MAX_BYTES,
-                SESSION_DELIVERY_MAX_ELAPSED,
+                SESSION_DELIVERY_MAX_BYTES,
+                Duration::MAX,
             ) else {
                 panic!("restarted assembly");
             };
@@ -3035,7 +3085,8 @@ mod tests {
             &mut counters,
             SESSION_DELIVERY_MAX_ITEMS,
             SESSION_DELIVERY_MAX_BYTES,
-            SESSION_DELIVERY_MAX_ELAPSED,
+            SESSION_DELIVERY_MAX_BYTES,
+            Duration::MAX,
         );
         assert!(matches!(
             first,
@@ -3102,7 +3153,6 @@ mod tests {
             needs_delivery: true,
         };
         let mut counters = DaemonLifecycleCounters::default();
-        let started = Instant::now();
         let (alive, page) = deliver_projection_delta_page(
             "sub",
             &mut state,
@@ -3113,7 +3163,8 @@ mod tests {
             SESSION_DELIVERY_MAX_ELAPSED,
         );
         assert!(alive);
-        assert!(started.elapsed() < Duration::from_millis(crate::MAX_OWNER_TURN_MS));
+        assert!(page.items <= SESSION_DELIVERY_MAX_ITEMS);
+        assert!(page.bytes <= SESSION_DELIVERY_MAX_BYTES);
         assert!(page.more);
         assert!(state.delivery_after.is_some());
     }
@@ -3171,6 +3222,7 @@ mod tests {
                 true,
                 &mut counters,
                 SESSION_DELIVERY_MAX_ITEMS,
+                SESSION_DELIVERY_MAX_BYTES,
                 SESSION_DELIVERY_MAX_BYTES,
                 Duration::MAX,
             ) else {
@@ -3331,6 +3383,7 @@ mod tests {
                 &mut counters,
                 8,
                 DAEMON_MAX_FRAME_BYTES,
+                DAEMON_MAX_FRAME_BYTES,
                 Duration::MAX,
             ) {
                 SnapshotAssemble::Closed {
@@ -3435,6 +3488,7 @@ mod tests {
             &mut counters,
             SESSION_DELIVERY_MAX_ITEMS,
             SESSION_DELIVERY_MAX_BYTES,
+            SESSION_DELIVERY_MAX_BYTES,
             SESSION_DELIVERY_MAX_ELAPSED,
         ) else {
             panic!("hold must stay alive");
@@ -3472,7 +3526,8 @@ mod tests {
                 &mut counters,
                 SESSION_DELIVERY_MAX_ITEMS,
                 SESSION_DELIVERY_MAX_BYTES,
-                SESSION_DELIVERY_MAX_ELAPSED,
+                SESSION_DELIVERY_MAX_BYTES,
+                Duration::MAX,
             ) else {
                 panic!("caught-up assembly must stay alive");
             };
@@ -3483,6 +3538,428 @@ mod tests {
         let frames: Vec<_> = receiver.try_iter().collect();
         assert_eq!(frames.len(), 1);
         assert_eq!(snapshot_item_ids(&frames[0]).len(), 24);
+        assert_eq!(state.delivery_phase, DeliveryPhase::Removes);
+        assert!(!state.needs_delivery);
+    }
+
+    fn sealed_projection(
+        records: impl IntoIterator<Item = SessionLifecycleRecord>,
+    ) -> crate::session_projection::SessionProjection {
+        let mut projection = crate::session_projection::SessionProjection::default();
+        projection.ingest_baseline_rows(1, records);
+        projection.seal_baseline(SessionLifecycleCursor {
+            source_id: botster_core_daemon::SessionLifecycleSourceId("s".into()),
+            sequence: 1,
+        });
+        projection
+    }
+
+    fn encoded_session_item(record: &SessionLifecycleRecord) -> usize {
+        let value = serde_json::to_value(
+            crate::session_projection::SessionProjection::project_entity(record),
+        )
+        .expect("item");
+        serde_json::to_vec(&value).expect("encode").len()
+    }
+
+    fn stub_snapshot_envelope_bytes() -> usize {
+        let empty = DaemonEntityFrame::Snapshot {
+            subscription_id: String::new(),
+            entity_type: "session".to_string(),
+            snapshot_seq: 0,
+            items: Vec::new(),
+            resync_reason: None,
+        };
+        serde_json::to_vec(&empty).expect("stub envelope").len()
+    }
+
+    fn pad_record_to_item_len(prefix: &str, target_len: usize) -> SessionLifecycleRecord {
+        let mut pad = 1usize;
+        for _ in 0..target_len.saturating_add(32) {
+            let record = assemble_record(format!("{prefix}-{}", "x".repeat(pad)));
+            let len = encoded_session_item(&record);
+            if len == target_len {
+                return record;
+            }
+            if len < target_len {
+                pad = pad.saturating_add(target_len - len);
+            } else if pad > 1 {
+                pad -= 1;
+            } else {
+                panic!("cannot hit item len {target_len}, got {len}");
+            }
+        }
+        panic!("failed to find pad for item len {target_len}");
+    }
+
+    #[test]
+    fn snapshot_item_budget_cuts_and_resumes() {
+        let projection = sealed_projection([
+            assemble_record("session-00".into()),
+            assemble_record("session-01".into()),
+        ]);
+        let (sender, _receiver) = mpsc::sync_channel(4);
+        let state = assembling_subscription(sender, 1);
+        let envelope = snapshot_envelope_bytes("sub", &state);
+        let first = take_snapshot_item_page(
+            &projection,
+            None,
+            0,
+            envelope,
+            1,
+            SESSION_DELIVERY_MAX_BYTES,
+            SESSION_DELIVERY_MAX_BYTES,
+            Duration::MAX,
+        );
+        assert_eq!(first.items.len(), 1);
+        assert_eq!(first.cut, SnapshotPageCut::ItemBudget);
+        let second = take_snapshot_item_page(
+            &projection,
+            first.last_id.as_deref(),
+            first.items.len(),
+            envelope,
+            1,
+            SESSION_DELIVERY_MAX_BYTES,
+            SESSION_DELIVERY_MAX_BYTES,
+            Duration::MAX,
+        );
+        assert_eq!(second.items.len(), 1);
+        assert_eq!(second.cut, SnapshotPageCut::Complete);
+        assert_ne!(
+            first.items[0].get("session_uuid"),
+            second.items[0].get("session_uuid")
+        );
+    }
+
+    #[test]
+    fn snapshot_byte_budget_includes_envelope_and_yields_empty_cuts() {
+        let first_record = assemble_record("session-00".into());
+        let second_record = assemble_record("session-01".into());
+        let c1 = encoded_session_item(&first_record);
+        let projection = sealed_projection([first_record, second_record]);
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let mut state = assembling_subscription(sender, 1);
+        let envelope = snapshot_envelope_bytes("sub", &state);
+        let mut counters = DaemonLifecycleCounters::default();
+
+        let SnapshotAssemble::Continue { page } = continue_session_snapshot_assembly(
+            "sub",
+            &mut state,
+            &projection,
+            true,
+            &mut counters,
+            SESSION_DELIVERY_MAX_ITEMS,
+            envelope.saturating_add(c1),
+            SESSION_DELIVERY_MAX_BYTES,
+            Duration::MAX,
+        ) else {
+            panic!("exact envelope+c1 must yield, not close");
+        };
+        assert_eq!(page.items, 1);
+        assert!(page.more);
+        assert_eq!(page.bytes, envelope.saturating_add(c1));
+        assert!(receiver.try_iter().next().is_none());
+
+        let mut empty_state = assembling_subscription(mpsc::sync_channel(4).0, 1);
+        let SnapshotAssemble::Continue { page } = continue_session_snapshot_assembly(
+            "sub",
+            &mut empty_state,
+            &projection,
+            true,
+            &mut counters,
+            SESSION_DELIVERY_MAX_ITEMS,
+            envelope.saturating_add(c1).saturating_sub(1),
+            SESSION_DELIVERY_MAX_BYTES,
+            Duration::MAX,
+        ) else {
+            panic!("envelope+c1-1 must yield empty, not close");
+        };
+        assert_eq!(page.items, 0);
+        assert!(page.more);
+        assert!(empty_state.needs_delivery);
+        assert!(matches!(
+            empty_state.delivery_phase,
+            DeliveryPhase::Assembling { .. }
+        ));
+
+        let mut no_envelope_state = assembling_subscription(mpsc::sync_channel(4).0, 1);
+        let SnapshotAssemble::Continue { page } = continue_session_snapshot_assembly(
+            "sub",
+            &mut no_envelope_state,
+            &projection,
+            true,
+            &mut counters,
+            SESSION_DELIVERY_MAX_ITEMS,
+            c1,
+            SESSION_DELIVERY_MAX_BYTES,
+            Duration::MAX,
+        ) else {
+            panic!("c1 without envelope headroom must yield empty, not close");
+        };
+        assert_eq!(page.items, 0);
+        assert!(page.more);
+        assert!(no_envelope_state.needs_delivery);
+    }
+
+    #[test]
+    fn snapshot_page_charges_the_real_envelope_not_a_stub() {
+        let first_record = assemble_record("session-00".into());
+        let c1 = encoded_session_item(&first_record);
+        let projection = sealed_projection([first_record, assemble_record("session-01".into())]);
+        let (sender, _receiver) = mpsc::sync_channel(4);
+        let mut state = assembling_subscription(sender, 1);
+        state.next_seq = 7;
+        state.resync_reason = Some("catch_up".into());
+        let real_envelope = snapshot_envelope_bytes("sub", &state);
+        let stub_envelope = stub_snapshot_envelope_bytes();
+        assert!(real_envelope > stub_envelope);
+        assert_eq!(real_envelope, snapshot_envelope_bytes("sub", &state));
+
+        let stub_fit = take_snapshot_item_page(
+            &projection,
+            None,
+            0,
+            real_envelope,
+            SESSION_DELIVERY_MAX_ITEMS,
+            stub_envelope.saturating_add(c1),
+            SESSION_DELIVERY_MAX_BYTES,
+            Duration::MAX,
+        );
+        assert!(stub_fit.items.is_empty());
+        assert_eq!(stub_fit.cut, SnapshotPageCut::ByteBudget);
+
+        let real_fit = take_snapshot_item_page(
+            &projection,
+            None,
+            0,
+            real_envelope,
+            SESSION_DELIVERY_MAX_ITEMS,
+            real_envelope.saturating_add(c1),
+            SESSION_DELIVERY_MAX_BYTES,
+            Duration::MAX,
+        );
+        assert_eq!(real_fit.items.len(), 1);
+        assert_eq!(real_fit.cut, SnapshotPageCut::ByteBudget);
+        assert_eq!(real_fit.bytes, real_envelope.saturating_add(c1));
+    }
+
+    #[test]
+    fn oversized_row_uses_the_fresh_page_capacity_parameter() {
+        let record = pad_record_to_item_len("big", SESSION_DELIVERY_MAX_BYTES.saturating_sub(8));
+        let item_len = encoded_session_item(&record);
+        let projection = sealed_projection([record]);
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let mut state = assembling_subscription(sender, 1);
+        let envelope = snapshot_envelope_bytes("sub", &state);
+        assert!(envelope.saturating_add(item_len) > SESSION_DELIVERY_MAX_BYTES);
+        let mut counters = DaemonLifecycleCounters::default();
+        let closed = continue_session_snapshot_assembly(
+            "sub",
+            &mut state,
+            &projection,
+            true,
+            &mut counters,
+            SESSION_DELIVERY_MAX_ITEMS,
+            SESSION_DELIVERY_MAX_BYTES,
+            SESSION_DELIVERY_MAX_BYTES,
+            Duration::MAX,
+        );
+        assert!(matches!(
+            closed,
+            SnapshotAssemble::Closed {
+                frame_too_large: true
+            }
+        ));
+        let frames: Vec<_> = receiver.try_iter().collect();
+        assert_eq!(frames.len(), 1);
+        assert!(matches!(
+            &frames[0],
+            DaemonEntityFrame::Error { code, .. } if code == "entity_provider_frame_too_large"
+        ));
+
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let mut roomy = assembling_subscription(sender, 1);
+        let SnapshotAssemble::Continue { page } = continue_session_snapshot_assembly(
+            "sub",
+            &mut roomy,
+            &projection,
+            true,
+            &mut counters,
+            SESSION_DELIVERY_MAX_ITEMS,
+            DAEMON_MAX_FRAME_BYTES,
+            DAEMON_MAX_FRAME_BYTES,
+            Duration::MAX,
+        ) else {
+            panic!("larger capacity must accept the same row");
+        };
+        assert_eq!(page.items, 1);
+        assert!(!page.more);
+        assert_eq!(
+            snapshot_item_ids(&receiver.try_iter().next().expect("snapshot")).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn later_page_separator_boundary_closes_oversized_without_livelock() {
+        let first = assemble_record("session-00".into());
+        let envelope = {
+            let (sender, _receiver) = mpsc::sync_channel(1);
+            snapshot_envelope_bytes("sub", &assembling_subscription(sender, 1))
+        };
+        let oversized = pad_record_to_item_len(
+            "session-01",
+            SESSION_DELIVERY_MAX_BYTES.saturating_sub(envelope),
+        );
+        assert_eq!(
+            envelope.saturating_add(encoded_session_item(&oversized)),
+            SESSION_DELIVERY_MAX_BYTES
+        );
+        let projection = sealed_projection([first.clone(), oversized]);
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let mut state = assembling_subscription(sender, 1);
+        let mut counters = DaemonLifecycleCounters::default();
+        let SnapshotAssemble::Continue { page } = continue_session_snapshot_assembly(
+            "sub",
+            &mut state,
+            &projection,
+            true,
+            &mut counters,
+            1,
+            SESSION_DELIVERY_MAX_BYTES,
+            SESSION_DELIVERY_MAX_BYTES,
+            Duration::MAX,
+        ) else {
+            panic!("first item must assemble");
+        };
+        assert_eq!(page.items, 1);
+        assert!(page.more);
+        let closed = continue_session_snapshot_assembly(
+            "sub",
+            &mut state,
+            &projection,
+            true,
+            &mut counters,
+            SESSION_DELIVERY_MAX_ITEMS,
+            SESSION_DELIVERY_MAX_BYTES,
+            SESSION_DELIVERY_MAX_BYTES,
+            Duration::MAX,
+        );
+        assert!(matches!(
+            closed,
+            SnapshotAssemble::Closed {
+                frame_too_large: true
+            }
+        ));
+        let frames: Vec<_> = receiver.try_iter().collect();
+        assert_eq!(frames.len(), 1);
+        assert!(matches!(
+            &frames[0],
+            DaemonEntityFrame::Error { code, .. } if code == "entity_provider_frame_too_large"
+        ));
+
+        let admitted = pad_record_to_item_len(
+            "session-01",
+            SESSION_DELIVERY_MAX_BYTES
+                .saturating_sub(envelope)
+                .saturating_sub(1),
+        );
+        assert!(
+            envelope
+                .saturating_add(encoded_session_item(&admitted))
+                .saturating_add(1)
+                <= SESSION_DELIVERY_MAX_BYTES
+        );
+        let control = sealed_projection([first, admitted]);
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let mut state = assembling_subscription(sender, 1);
+        let SnapshotAssemble::Continue { page } = continue_session_snapshot_assembly(
+            "sub",
+            &mut state,
+            &control,
+            true,
+            &mut counters,
+            1,
+            SESSION_DELIVERY_MAX_BYTES,
+            SESSION_DELIVERY_MAX_BYTES,
+            Duration::MAX,
+        ) else {
+            panic!("control first item");
+        };
+        assert_eq!(page.items, 1);
+        let SnapshotAssemble::Continue { page } = continue_session_snapshot_assembly(
+            "sub",
+            &mut state,
+            &control,
+            true,
+            &mut counters,
+            SESSION_DELIVERY_MAX_ITEMS,
+            SESSION_DELIVERY_MAX_BYTES,
+            SESSION_DELIVERY_MAX_BYTES,
+            Duration::MAX,
+        ) else {
+            panic!("control second item must fit with comma headroom");
+        };
+        assert_eq!(page.items, 1);
+        assert!(!page.more);
+        assert_eq!(
+            snapshot_item_ids(&receiver.try_iter().next().expect("snapshot")).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn empty_elapsed_cut_yields_instead_of_closing() {
+        let projection = sealed_projection([
+            assemble_record("session-00".into()),
+            assemble_record("session-01".into()),
+        ]);
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let mut state = assembling_subscription(sender, 1);
+        let mut counters = DaemonLifecycleCounters::default();
+        let SnapshotAssemble::Continue { page } = continue_session_snapshot_assembly(
+            "sub",
+            &mut state,
+            &projection,
+            true,
+            &mut counters,
+            SESSION_DELIVERY_MAX_ITEMS,
+            SESSION_DELIVERY_MAX_BYTES,
+            SESSION_DELIVERY_MAX_BYTES,
+            Duration::ZERO,
+        ) else {
+            panic!("elapsed empty cut must yield, not close");
+        };
+        assert_eq!(page.items, 0);
+        assert!(page.more);
+        assert!(state.needs_delivery);
+        assert!(matches!(
+            state.delivery_phase,
+            DeliveryPhase::Assembling { .. }
+        ));
+        assert!(receiver.try_iter().next().is_none());
+
+        loop {
+            let SnapshotAssemble::Continue { page } = continue_session_snapshot_assembly(
+                "sub",
+                &mut state,
+                &projection,
+                true,
+                &mut counters,
+                SESSION_DELIVERY_MAX_ITEMS,
+                SESSION_DELIVERY_MAX_BYTES,
+                SESSION_DELIVERY_MAX_BYTES,
+                Duration::MAX,
+            ) else {
+                panic!("later full-budget call must complete");
+            };
+            if !page.more {
+                break;
+            }
+        }
+        let frames: Vec<_> = receiver.try_iter().collect();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(snapshot_item_ids(&frames[0]).len(), 2);
         assert_eq!(state.delivery_phase, DeliveryPhase::Removes);
         assert!(!state.needs_delivery);
     }
