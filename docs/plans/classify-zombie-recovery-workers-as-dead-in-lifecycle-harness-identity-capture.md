@@ -1,9 +1,9 @@
 # Classify zombie recovery workers as dead in lifecycle-harness identity capture
 
 Ticket: ticket_1787076374_645547 — Hub tests: shutdown-failure-sibling identity capture taints default-concurrency lifecycle suite.
-Run: run_1787076383_328340. Plan rev 2.
+Run: run_1787076383_328340. Plan rev 3.
 
-Rev 2 addresses Plan Review review_1787078204_780938: corrected the Cargo test target name (`hub_daemon_lifecycle_test`), corrected the inaccurate `prove_owned_absence` zombie-precedent claims, and ran the corrected focused commands.
+Rev 2 addressed Plan Review review_1787078204_780938: corrected the Cargo test target name (`hub_daemon_lifecycle_test`), corrected the inaccurate `prove_owned_absence` zombie-precedent claims, and ran the corrected focused commands. Rev 3 addresses review_1787078722_567192: removed the last leftover sentence that still called `prove_owned_absence` zombie-aware; the plan now states one contract — `prove_owned_absence` fails closed through `process_exists`, and the classifier rests on the Darwin `ps` state contract plus the deterministic fixture.
 
 ## Target repository and target
 
@@ -48,7 +48,7 @@ This explains both ticket runs producing the same sentence with different PIDs, 
 
 Plan-time repro (rev 2, base 8908a92): `cargo test --test hub_daemon_lifecycle_test external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable -- --nocapture` passed in 9.37s and printed the exact originating taint on stderr — `identity capture incomplete (Explicit): resolved worker 59557 is live but unverifiable for session shutdown-failure-victim` — a third distinct PID. The trigger is deterministic in isolation, not census- or load-dependent. The step-1 probe still confirms the Z-stat state of that pid before the classifier ships.
 
-A zombie is dead evidence, not a live unverifiable worker. The harness already distinguishes zombie state in `prove_owned_absence`; the capture and reap classifiers do not. Per [[benign command exit races do not taint the harness latch]], "a dead command with a dead recovery worker is exited in transition and does not taint" — a zombie recovery worker is a dead recovery worker awaiting parent reap.
+A zombie is dead evidence, not a live unverifiable worker. `prove_owned_absence` fails closed through `process_exists`; the new classifier relies on the Darwin `ps` state contract plus the deterministic fixture. Per [[benign command exit races do not taint the harness latch]], "a dead command with a dead recovery worker is exited in transition and does not taint" — a zombie recovery worker is a dead recovery worker awaiting parent reap.
 
 ## Scope
 
