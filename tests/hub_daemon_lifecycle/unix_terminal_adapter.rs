@@ -43,6 +43,58 @@ fn request_collecting_mux(
     }
 }
 
+fn unix_envelope_is_process_exit(
+    envelope: &botster_hub_client::DaemonUnixTerminalEnvelope,
+    session_id: &str,
+    subscription_id: &str,
+) -> bool {
+    if envelope.session_id != session_id || envelope.subscription_id != subscription_id {
+        return false;
+    }
+    let Ok(bytes) = envelope.payload_bytes() else {
+        return false;
+    };
+    serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .as_deref()
+        == Some("process_exit")
+}
+
+fn assert_host_session_retained(
+    connection: &mut botster_hub_client::DaemonConnection,
+    session_id: &str,
+) {
+    let listed = connection
+        .request(&botster_hub_client::DaemonRequest::ListSessions)
+        .expect("list");
+    match listed
+        .sessions
+        .iter()
+        .find(|session| session.session_id == session_id)
+        .map(|session| session.lifecycle.as_str())
+    {
+        None => panic!(
+            "ProcessExited must not shut down the host session: {:?}",
+            listed.sessions
+        ),
+        Some("failed") => panic!(
+            "successful printf exit must not classify as failed: {:?}",
+            listed.sessions
+        ),
+        Some("running" | "exited") => {}
+        Some(lifecycle) => panic!(
+            "host session lifecycle {lifecycle} is not running or exited: {:?}",
+            listed.sessions
+        ),
+    }
+}
+
 fn unix_envelope_contains_live_bytes(
     envelopes: &[botster_hub_client::DaemonUnixTerminalEnvelope],
     marker: &str,
@@ -688,32 +740,39 @@ fn unix_adapter_unbound_printf_stream_attach_completes() {
     let session_id = "uap-session";
     let subscription_id = "uap-sub";
     let marker = "botster-smoke-terminal-ok";
+    let release_path = hub.data_dir().join("uap-release");
     let mut connection =
         botster_hub_client::DaemonConnection::connect(&endpoint).expect("default hello");
     let spawned = connection
         .request(&botster_hub_client::DaemonRequest::Spawn {
             session_id: session_id.to_string(),
-            command: format!("printf 'smoke:{marker}\\n'"),
+            command: format!(
+                "while [ ! -e '{}' ]; do sleep 0.01; done; printf 'smoke:{marker}\\n'",
+                release_path.display()
+            ),
         })
         .expect("spawn printf");
     assert_eq!(
         spawned.kind,
         botster_hub_client::DaemonResponseKind::Spawned
     );
+    let mut session_cleanup = SessionCleanupGuard::new(hub.data_dir(), session_id);
 
     let attach = connection
         .request(&botster_hub_client::DaemonRequest::Attach {
             session_id: session_id.to_string(),
             subscription_id: subscription_id.to_string(),
         })
-        .expect("attach");
+        .expect("default hello attach");
     assert_eq!(attach.kind, botster_hub_client::DaemonResponseKind::Events);
     assert!(
         attach.events.is_empty(),
-        "default Hello Attach must bind without terminal bodies: {:?}",
+        "default Hello Attach binds without terminal bodies: {:?}",
         attach.events
     );
-    let deadline = Instant::now() + Duration::from_secs(5);
+    fs::write(&release_path, b"go").expect("release unbound printf");
+    let needle = format!("smoke:{marker}");
+    let deadline = Instant::now() + Duration::from_secs(8);
     let mut text = String::new();
     while Instant::now() < deadline {
         let drain = connection
@@ -721,7 +780,7 @@ fn unix_adapter_unbound_printf_stream_attach_completes() {
                 session_id,
                 subscription_id,
             ))
-            .expect("drain");
+            .expect("host drain");
         assert!(
             drain.events.is_empty(),
             "host Drain must not return terminal bodies: {:?}",
@@ -737,27 +796,149 @@ fn unix_adapter_unbound_printf_stream_attach_completes() {
             .as_ref()
             .map(|screen| screen.text.clone())
             .unwrap_or_default();
-        if text.contains(&format!("smoke:{marker}")) {
+        if text.contains(&needle) {
             break;
         }
         thread::sleep(Duration::from_millis(25));
     }
     assert!(
+        text.contains(&needle),
+        "visible text is on ReadScreen: {text:?}"
+    );
+    assert_host_session_retained(&mut connection, session_id);
+    let drain = connection
+        .request(&botster_hub_client::DaemonRequest::drain_subscription(
+            session_id,
+            subscription_id,
+        ))
+        .expect("host drain");
+    assert_eq!(
+        drain.kind,
+        botster_hub_client::DaemonResponseKind::Events,
+        "host Drain must stay serviceable after exit: {drain:?}"
+    );
+    assert!(
+        drain.events.is_empty(),
+        "host Drain must not return terminal bodies: {:?}",
+        drain.events
+    );
+
+    session_cleanup.disarm();
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn unix_adapter_bound_printf_stream_attach_delivers_process_exit() {
+    let _guard = daemon_test_guard();
+    let hub = start_isolated_live_output_hub("uapb");
+    let endpoint = hub.endpoint().clone();
+    let session_id = "uapb-session";
+    let subscription_id = "uapb-sub";
+    let marker = "botster-smoke-terminal-ok";
+    let release_path = hub.data_dir().join("uapb-release");
+    let mut connection =
+        botster_hub_client::DaemonConnection::connect(&endpoint).expect("default hello");
+    // The release file holds the child until Attach and the first Drain
+    // complete. sleep 1 after printf keeps the bound adapter attached while
+    // Core emits process_exit; it is not an attach deadline.
+    let spawned = connection
+        .request(&botster_hub_client::DaemonRequest::Spawn {
+            session_id: session_id.to_string(),
+            command: format!(
+                "while [ ! -e '{}' ]; do sleep 0.01; done; printf 'smoke:{marker}\\n'; sleep 1",
+                release_path.display()
+            ),
+        })
+        .expect("spawn held printf");
+    assert_eq!(
+        spawned.kind,
+        botster_hub_client::DaemonResponseKind::Spawned
+    );
+    let mut session_cleanup = SessionCleanupGuard::new(hub.data_dir(), session_id);
+
+    let (mut term_stream, mut term_reader) = unix_adapter_connection(&endpoint);
+    let mut envelopes = Vec::new();
+    let term_attach = request_skipping_envelopes(
+        &mut term_stream,
+        &mut term_reader,
+        &botster_hub_client::DaemonRequest::Attach {
+            session_id: session_id.to_string(),
+            subscription_id: subscription_id.to_string(),
+        },
+        &mut envelopes,
+    );
+    assert_eq!(
+        term_attach.kind,
+        botster_hub_client::DaemonResponseKind::Events
+    );
+    assert!(
+        term_attach.events.is_empty(),
+        "unix adapter Attach must bind without terminal bodies: {:?}",
+        term_attach.events
+    );
+    let primed = request_skipping_envelopes(
+        &mut term_stream,
+        &mut term_reader,
+        &botster_hub_client::DaemonRequest::drain_subscription(session_id, subscription_id),
+        &mut envelopes,
+    );
+    assert!(
+        primed.events.is_empty(),
+        "host Drain must not return terminal bodies: {:?}",
+        primed.events
+    );
+    fs::write(&release_path, b"go").expect("release held printf");
+    let exit_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < exit_deadline {
+        if envelopes
+            .iter()
+            .any(|envelope| unix_envelope_is_process_exit(envelope, session_id, subscription_id))
+        {
+            break;
+        }
+        let drain = request_skipping_envelopes(
+            &mut term_stream,
+            &mut term_reader,
+            &botster_hub_client::DaemonRequest::drain_subscription(session_id, subscription_id),
+            &mut envelopes,
+        );
+        assert!(
+            drain.events.is_empty(),
+            "host Drain must not return terminal bodies: {:?}",
+            drain.events
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        envelopes
+            .iter()
+            .any(|envelope| unix_envelope_is_process_exit(envelope, session_id, subscription_id)),
+        "attached terminal subscription must deliver process_exit: {envelopes:?}"
+    );
+    assert_host_session_retained(&mut connection, session_id);
+    let text = wait_for_read_screen_contains(&mut connection, session_id, &format!("smoke:{marker}"));
+    assert!(
         text.contains(&format!("smoke:{marker}")),
         "visible text is on ReadScreen: {text:?}"
     );
-    let listed = connection
-        .request(&botster_hub_client::DaemonRequest::ListSessions)
-        .expect("list");
+    let drain = request_skipping_envelopes(
+        &mut term_stream,
+        &mut term_reader,
+        &botster_hub_client::DaemonRequest::drain_subscription(session_id, subscription_id),
+        &mut envelopes,
+    );
+    assert_eq!(
+        drain.kind,
+        botster_hub_client::DaemonResponseKind::Events,
+        "host Drain must stay serviceable after exit: {drain:?}"
+    );
     assert!(
-        listed
-            .sessions
-            .iter()
-            .any(|session| session.session_id == session_id && session.lifecycle == "running"),
-        "ProcessExited must not shut down the host session: {:?}",
-        listed.sessions
+        drain.events.is_empty(),
+        "host Drain must not return terminal bodies: {:?}",
+        drain.events
     );
 
+    session_cleanup.disarm();
     hub.shutdown().expect("shutdown isolated hub");
 }
 
