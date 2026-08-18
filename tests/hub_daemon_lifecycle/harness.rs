@@ -425,6 +425,11 @@ fn collect_registry_record(
     }
 }
 
+fn recovery_worker_is_live(pid: u32) -> bool {
+    process_exists(pid)
+        && !process_snapshot(pid).is_some_and(|snapshot| snapshot.stat.contains('Z'))
+}
+
 fn retain_recovery_worker(
     capture: &mut IdentityCapture,
     session_id: &str,
@@ -433,7 +438,7 @@ fn retain_recovery_worker(
 ) {
     capture.owned.push_pid(command_pid);
     capture.owned.push_pid(worker_pid);
-    if !process_exists(worker_pid) {
+    if !recovery_worker_is_live(worker_pid) {
         return;
     }
     if !worker_pid_matches_worktree_session_worker(worker_pid) {
@@ -718,7 +723,7 @@ pub(crate) fn reap_registry_backed_workers(data_dir: &Path) -> Result<WorkerReap
                 Ok(Some(latest)) if matches!(latest.state, RegistrySessionState::Exited) => {}
                 Ok(Some(latest)) => match recovery_worker_pid(&latest) {
                     Some(worker_pid)
-                        if process_exists(worker_pid)
+                        if recovery_worker_is_live(worker_pid)
                             && worker_pid_matches_worktree_session_worker(worker_pid) =>
                     {
                         match signal_worker_group(worker_pid) {
@@ -726,7 +731,7 @@ pub(crate) fn reap_registry_backed_workers(data_dir: &Path) -> Result<WorkerReap
                             Err(error) => outcome.errors.push(error),
                         }
                     }
-                    Some(worker_pid) if process_exists(worker_pid) => {
+                    Some(worker_pid) if recovery_worker_is_live(worker_pid) => {
                         outcome.errors.push(format!(
                             "resolved worker {worker_pid} is live but unverifiable for session {}",
                             identity.session_id

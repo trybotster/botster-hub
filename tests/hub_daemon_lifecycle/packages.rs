@@ -429,13 +429,13 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
         unique_test_dir("daemon-plugin-contract-matrix-fixture"),
     )
     .expect("copy published plugin contract matrix fixture");
-    let hub = botster_hub_test_support::IsolatedHubBuilder::new()
-        .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
-        .session_worker_bin(session_worker_binary_path())
-        .root(PathBuf::from("/tmp/bh-plugin-contract-matrix"))
-        .name("plugin-contract-matrix")
-        .start()
-        .expect("start isolated hub through public test-support harness");
+    let hub = start_isolated_hub(
+        botster_hub_test_support::IsolatedHubBuilder::new()
+            .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
+            .session_worker_bin(session_worker_binary_path())
+            .root(PathBuf::from("/tmp/bh-plugin-contract-matrix"))
+            .name("plugin-contract-matrix"),
+    );
 
     let report =
         botster_hub_test_support::run_plugin_contract_matrix_conformance(&hub, fixture_dir)
@@ -759,13 +759,13 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
 #[test]
 fn daemon_project_pipelines_example_exercises_published_surface_conformance() {
     let _guard = daemon_test_guard();
-    let hub = botster_hub_test_support::IsolatedHubBuilder::new()
-        .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
-        .session_worker_bin(session_worker_binary_path())
-        .root(PathBuf::from("/tmp/bh-project-pipelines-conformance"))
-        .name("project-pipelines")
-        .start()
-        .expect("start isolated hub through public test-support harness");
+    let hub = start_isolated_hub(
+        botster_hub_test_support::IsolatedHubBuilder::new()
+            .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
+            .session_worker_bin(session_worker_binary_path())
+            .root(PathBuf::from("/tmp/bh-project-pipelines-conformance"))
+            .name("project-pipelines"),
+    );
     let package_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("examples")
         .join("project-pipelines");
@@ -827,14 +827,14 @@ fn occupied_generic_web_port_reports_structured_entrypoint_failure() {
 fn foreground_terminal_app_open_absolutizes_relative_runtime_paths() {
     let _guard = daemon_test_guard();
     let daemon_working_directory = PathBuf::from("/tmp");
-    let hub = botster_hub_test_support::IsolatedHubBuilder::new()
-        .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
-        .session_worker_bin(session_worker_binary_path())
-        .root(PathBuf::from("bh-relative-runtime"))
-        .working_directory(&daemon_working_directory)
-        .name("package-cwd")
-        .start()
-        .expect("start isolated hub with relative runtime root");
+    let hub = start_isolated_hub(
+        botster_hub_test_support::IsolatedHubBuilder::new()
+            .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
+            .session_worker_bin(session_worker_binary_path())
+            .root(PathBuf::from("bh-relative-runtime"))
+            .working_directory(&daemon_working_directory)
+            .name("package-cwd"),
+    );
     assert!(
         hub.data_dir()
             .starts_with(daemon_working_directory.join("bh-relative-runtime"))

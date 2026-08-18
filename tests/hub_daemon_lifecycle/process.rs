@@ -1076,6 +1076,7 @@ pub(crate) fn start_cli_daemon_with_session_worker(
     data_dir: &Path,
     session_worker_bin: &Path,
 ) -> PanicSafeCliDaemon {
+    let _guard = daemon_test_guard();
     check_harness_taint();
     let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
     command
