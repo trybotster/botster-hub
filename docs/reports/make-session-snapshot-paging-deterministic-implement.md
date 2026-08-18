@@ -13,12 +13,14 @@
 | Locked Core | `Cargo.lock` pins `botster-core` / `botster-core-daemon` at `302c7f7` |
 | Delivery | direct-merge; no pull request (`merge_policy: direct`) |
 | Class | not runtime-teardown (`teardown_class_applies: false`) |
-| Plan | `docs/plans/make-session-snapshot-paging-deterministic.md` revision 5 (Review return `finding_1787095524_314470`) |
+| Plan | `docs/plans/make-session-snapshot-paging-deterministic.md` revision 6 (Review return `finding_1787096403_202931`) |
 | Session-type eligibility consumer | false |
 
 Independent routing: `project_pipelines_current_context` and the approved plan both map `tgt_7e208a0c76a44980a83b63af976b1f22` to `botster-hub`. Work stayed in the ticket worktree.
 
-Review return `review_1787095524_288549` / `finding_1787095524_314470`: an empty sealed projection skipped the remaining-byte check because that check lived only inside `rows_after`. This visit adds a pre-iteration `ByteBudget` cut when `envelope > remaining` and a production-function test that yields at `envelope - 1` then sends one empty Snapshot at full budget. The committed plan is revision 5 so the acceptance checks match the shipped contract.
+Review return `review_1787095524_288549` / `finding_1787095524_314470`: an empty sealed projection skipped the remaining-byte check because that check lived only inside `rows_after`. A later visit added a pre-iteration `ByteBudget` cut when `envelope > remaining`.
+
+Review return `review_1787096403_441375` / `finding_1787096403_202931`: that remaining-only preflight livelocks when a valid subscription id makes the empty envelope larger than `SESSION_DELIVERY_MAX_BYTES`. This visit classifies `envelope > fresh_page_capacity` as `OversizedRow` first. Remaining `envelope - 1` still yields. Plan revision 6 records both bounds.
 
 ## Repository playbook and other playbooks/notes applied
 
@@ -60,11 +62,11 @@ Review return `review_1787095524_288549` / `finding_1787095524_314470`: an empty
 
 Feature behavior:
 
-- `src/daemon_entity_subscriptions.rs` — rewrite `take_snapshot_item_page` to exact incremental item charge with typed cuts (`Complete`, `ItemBudget`, `ByteBudget`, `Elapsed`, `OversizedRow`). Pass the real envelope and a caller-supplied fresh-page capacity from `continue_session_snapshot_assembly`. Close only on `OversizedRow` or the cumulative frame-limit check. Report `DeliveryPage.bytes` as `envelope + page_charge`. Delete the clone-and-reserialize trial frame and the second `encoded_item_bytes` production pass. Convert the three remaining wall-clock owner-turn asserts to per-call work bounds. Add construction tests for item, byte, envelope, oversized-capacity, later-page separator, elapsed yield, and empty-projection envelope admission.
+- `src/daemon_entity_subscriptions.rs` — rewrite `take_snapshot_item_page` to exact incremental item charge with typed cuts (`Complete`, `ItemBudget`, `ByteBudget`, `Elapsed`, `OversizedRow`). Pass the real envelope and a caller-supplied fresh-page capacity from `continue_session_snapshot_assembly`. Close only on `OversizedRow` or the cumulative frame-limit check. Before walking rows: `envelope > capacity` is `OversizedRow`; `envelope > remaining` is `ByteBudget`. Report `DeliveryPage.bytes` as `envelope + page_charge`. Delete the clone-and-reserialize trial frame and the second `encoded_item_bytes` production pass. Convert the three remaining wall-clock owner-turn asserts to per-call work bounds. Add construction tests for item, byte, envelope, oversized-capacity, later-page separator, elapsed yield, empty remaining-budget yield, and oversized empty envelope close.
 
 Handoff:
 
-- `docs/plans/make-session-snapshot-paging-deterministic.md` — revision 5 records the empty-projection envelope check.
+- `docs/plans/make-session-snapshot-paging-deterministic.md` — revision 6 records the oversized empty-envelope close.
 - `docs/reports/make-session-snapshot-paging-deterministic-implement.md` — this report.
 
 Merge/rebase cleanup: none.
@@ -79,7 +81,7 @@ No cross-repository prerequisite and no PR. The registered dependency `ticket_17
 
 ## Deviations from plan
 
-None in product behavior. Revision 5 completes the locked envelope-admission rule for the empty-projection path found by Review. Small necessary adaptations:
+None in product behavior. Revision 6 completes the no-livelock envelope rule: an empty envelope above fresh-page capacity closes; an envelope that fits capacity but not the remaining budget still yields. Small necessary adaptations:
 
 - `take_snapshot_item_page` carries `#[allow(clippy::too_many_arguments)]` because the locked parameter list is eight arguments.
 - `encoded_item_bytes` is `#[cfg(test)]` after production stopped re-encoding accepted items. The separator test still uses it.
@@ -92,6 +94,7 @@ Red-when-reverted (restored before commit):
 1. Ablate the `ByteBudget` predicate (accept every candidate). `snapshot_byte_budget_includes_envelope_and_yields_empty_cuts` failed: accepted 2 items where remaining `envelope + c1` must accept 1. Restored.
 2. Restore the old empty-page oversized close (`items.is_empty() && cut != Complete`). `empty_elapsed_cut_yields_instead_of_closing` failed: `Duration::ZERO` closed instead of yielding. Restored.
 3. Ablate the pre-iteration envelope remaining-budget check. `empty_snapshot_yields_when_remaining_budget_is_below_envelope` failed: `page.more` was false because the empty Snapshot sent. Restored.
+4. Ablate the `envelope > fresh_page_capacity` close. `empty_oversized_envelope_closes_instead_of_yielding_forever` failed: the call returned Continue instead of Closed. Restored.
 
 Focused `--exact` lib tests, each reporting `1 passed` / `382 filtered out`:
 
@@ -102,6 +105,7 @@ Focused `--exact` lib tests, each reporting `1 passed` / `382 filtered out`:
 - `daemon_transport::daemon_entity_subscriptions::tests::later_page_separator_boundary_closes_oversized_without_livelock`
 - `daemon_transport::daemon_entity_subscriptions::tests::empty_elapsed_cut_yields_instead_of_closing`
 - `daemon_transport::daemon_entity_subscriptions::tests::empty_snapshot_yields_when_remaining_budget_is_below_envelope`
+- `daemon_transport::daemon_entity_subscriptions::tests::empty_oversized_envelope_closes_instead_of_yielding_forever`
 - `daemon_transport::daemon_entity_subscriptions::tests::first_session_snapshot_is_complete_and_assembled_in_pages`
 - `daemon_transport::daemon_entity_subscriptions::tests::separators_close_when_item_bytes_fit_but_commas_do_not`
 - `daemon_transport::daemon_entity_subscriptions::tests::oversized_first_snapshot_closes_the_subscription`
@@ -118,7 +122,7 @@ Repository gates:
 2. `cargo fmt --all -- --check`
 3. `cargo clippy --workspace --all-targets --locked -- -D warnings`
 4. `cargo test --doc --workspace --locked`
-5. `./test.sh --locked` at Cargo default concurrency: exit 0, no retry. After the Review-return fix, lib `384 passed` (includes `empty_snapshot_yields_when_remaining_budget_is_below_envelope`). Workspace doctests and member crates stayed green.
+5. `./test.sh --locked` at Cargo default concurrency: exit 0, no retry. After the oversized-empty-envelope fix, lib `385 passed` (includes `empty_oversized_envelope_closes_instead_of_yielding_forever`). Workspace doctests and member crates stayed green.
 
 Production-path proof:
 

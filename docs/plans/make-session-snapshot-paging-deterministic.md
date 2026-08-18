@@ -69,6 +69,15 @@ This revision:
 
 This completes the locked envelope-admission rule. It does not change ownership, budgets, or wire shape.
 
+## Revision 6 (Review finding_1787096403_202931)
+
+Review `review_1787096403_441375` found that Revision 5 compared the envelope only with the remaining turn budget. A valid `SubscribeEntities` subscription id can make the empty Snapshot envelope larger than `SESSION_DELIVERY_MAX_BYTES` while still fitting `DAEMON_MAX_FRAME_BYTES`. Every fresh production turn then passed `envelope > remaining` and returned an empty `ByteBudget` cut forever.
+
+This revision:
+
+1. Classifies `envelope > fresh_page_capacity` as `OversizedRow` before the remaining-budget check. The remaining-budget `ByteBudget` yield is only for envelopes that fit a fresh full-capacity page.
+2. Adds an empty-projection test whose subscription id makes the envelope exceed production capacity. The call closes with one `entity_provider_frame_too_large` frame. The Revision 5 `envelope - 1` yield test stays.
+
 ## Repository playbook loaded
 
 - [[botster-hub-playbook]]
@@ -195,7 +204,7 @@ No cross-repository dependency is registered. The one registered dependency (`ti
 
 - The production defects are exactly the four numbered code facts above; all are in `take_snapshot_item_page` and `continue_session_snapshot_assembly` on current main.
 - `state.next_seq` and `state.resync_reason` do not change during one assembly pass, so one envelope charge per assembly call is exact. `reset_snapshot_assembly` starts a new pass when the source sequence moves.
-- Reclassifying empty `ByteBudget`/`Elapsed` cuts as `Continue` cannot livelock: each new owner turn starts with the full `SESSION_DELIVERY_*` budgets, and the `OversizedRow` predicate charges the candidate's full positional cost (`envelope + item + positional separator`) against the full capacity. Therefore any candidate that survives the `OversizedRow` check fits a fresh full-capacity page at its position, and a full-budget turn accepts it. An empty `ByteBudget` cut can only occur when the remaining budget is below capacity, which a later turn restores. (Revision 4: this argument requires the separator term inside the `OversizedRow` predicate; see finding_1787093543_426311.)
+- Reclassifying empty `ByteBudget`/`Elapsed` cuts as `Continue` cannot livelock: each new owner turn starts with the full `SESSION_DELIVERY_*` budgets, and the `OversizedRow` predicate charges the candidate's full positional cost (`envelope + item + positional separator`) against the full capacity. An empty page is oversized when the envelope itself exceeds that capacity. Therefore any candidate or empty envelope that survives the `OversizedRow` check fits a fresh full-capacity page at its position, and a full-budget turn accepts it. An empty `ByteBudget` cut can only occur when the remaining budget is below capacity, which a later turn restores. (Revision 4: this argument requires the separator term inside the `OversizedRow` predicate; see finding_1787093543_426311. Revision 6: the empty envelope must use the same capacity bound; see finding_1787096403_202931.)
 - Closing rows above the fresh-page threshold (the current behavior for genuinely oversized rows) remains the correct product policy; this plan makes the closure deterministic, it does not remove it.
 - `serde_json` encoding of a fixed `Value` is deterministic, so exact byte equality between the charged total and the sent frame is a valid oracle.
 
@@ -240,7 +249,9 @@ where `separator_bytes` follows the existing `snapshot_separator_bytes` semantic
 `take_snapshot_item_page` must:
 
 1. Accept from the caller: the assembled item count, the assembled item bytes, the exact envelope bytes, `max_items`, the remaining turn byte budget, the full fresh-page byte capacity, and `max_elapsed`. The capacity is the byte budget a fresh call receives; production callers pass `SESSION_DELIVERY_MAX_BYTES`, and tests may pass a larger value such as `DAEMON_MAX_FRAME_BYTES`.
-2. Before walking rows, return an empty `ByteBudget` cut when `envelope > remaining_byte_budget`. An empty sealed projection never enters `rows_after`, so this check is the only envelope admission for a complete zero-row snapshot. (Revision 5 / `finding_1787095524_314470`.)
+2. Before walking rows, classify the empty-page envelope:
+   - `OversizedRow` when `envelope > fresh_page_capacity`. A valid subscription id can make the empty Snapshot envelope larger than production `SESSION_DELIVERY_MAX_BYTES`. That condition cannot progress on a later full-budget turn, so it must close. (Revision 6 / `finding_1787096403_202931`.)
+   - `ByteBudget` when `envelope > remaining_byte_budget` but the envelope still fits the capacity. An empty sealed projection never enters `rows_after`, so this check is the remaining-budget admission for a complete zero-row snapshot. (Revision 5 / `finding_1787095524_314470`.)
 3. Walk `rows_after` in the existing id order.
 4. Encode each candidate item once with `serde_json::to_vec`. Keep the `Value` for the page; keep the length for the charge. No `items.clone()`. No trial `DaemonEntityFrame::Snapshot` encode.
 5. Classify, in this order, per candidate:
@@ -297,6 +308,7 @@ All focused tests drive the production functions in `src/daemon_entity_subscript
 | Item budget | `max_items = 1` over a two-row projection returns one item and an `ItemBudget` cut; a later call resumes after `last_id` and completes. |
 | Byte budget | With measured `envelope` and first-candidate charge `c1`: a remaining budget of `envelope + c1` accepts one item and cuts `ByteBudget` before the second; a remaining budget of `envelope + c1 - 1` accepts zero items and returns `Continue { more: true }`, not a close; a remaining budget of `c1` alone (no envelope headroom) also accepts zero items. The last case is the envelope-admission boundary: envelope inclusion is what flips the decision. |
 | Empty snapshot envelope (Revision 5) | An empty sealed projection with remaining `envelope - 1` yields `Continue { more: true }`, sets `needs_delivery`, and sends no frame. A later full-budget call sends exactly one empty Snapshot and leaves `DeliveryPhase::Removes`. |
+| Oversized empty envelope (Revision 6) | An empty sealed projection whose subscription id makes `envelope > SESSION_DELIVERY_MAX_BYTES` closes with one `entity_provider_frame_too_large` error on a full-budget call. It does not return repeated empty `ByteBudget` cuts. The Revision 5 yield test remains green. |
 | Separator | `separators_close_when_item_bytes_fit_but_commas_do_not` stays green against the rewrite. The test passes `DAEMON_MAX_FRAME_BYTES` as both the remaining budget and the fresh-page capacity, so its half-megabyte rows are admitted per page and never classify as `OversizedRow`; the comma overflow is caught by the cumulative frame-limit check and closes oversized. |
 | Envelope | The charge uses the real envelope: with a nonzero `next_seq` and a set `resync_reason`, a page that fits under the stub envelope but not the real one is cut/closed correctly. Assert the envelope value equals `snapshot_envelope_bytes` for the same state. |
 | Oversized row | A row with `envelope + item + positional separator > capacity` closes with one `entity_provider_frame_too_large` error frame and today's state transitions; the same row is accepted when the test passes a larger capacity, proving the predicate uses the capacity parameter. Production capacity is `SESSION_DELIVERY_MAX_BYTES`. `oversized_first_snapshot_closes_the_subscription` converts to `Duration::MAX`. |
