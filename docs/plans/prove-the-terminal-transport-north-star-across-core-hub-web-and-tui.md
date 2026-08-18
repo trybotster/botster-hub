@@ -4,17 +4,50 @@ Ticket: `ticket_1786661010_115885`
 Run: `run_1786867245_870799`
 Step: `botster_stack_plan`
 Pipeline: `botster_stack_delivery` (direct merge, no PR)
-Plan **revision 6** after Plan Review `review_1786907173_666102`.
+Plan **revision 7** after Implement `run_step_1786907374_480353` parked at `7c055f5` and a human request to return to Plan.
 
-Implement status: Hub-owned coordinator and IsolatedHub occupancy oracle are in this worktree. Authentic Web keep-alive is blocked on `ticket_1786912123_916503` (Web cancel detach count). TUI IsolatedHub `session-types` is blocked on `ticket_1786912267_788084`. Do not merge to Hub `main` until those owner tickets close or a human waives authentic proof.
+Implement status: All registered parent dependencies are closed. Hub main `a700916` is merged at worktree `a9e5639`. Core pin is `302c7f7`. Controlled `script/run-lifecycle-suite` is `verdict=clean` (253/0/1). Final-worktree `./test.sh --locked` is `TEST_SH_EXIT:0`. Ready to merge directly to Hub `main`.
+
+Satisfied after rev 7 (do not re-wait):
+
+| Ticket | Status | Evidence |
+| --- | --- | --- |
+| `ticket_1786912123_916503` Web cancel oracle | closed | registered dependency closed |
+| `ticket_1786912267_788084` TUI IsolatedHub session-types | closed | registered dependency closed |
+| `ticket_1786913892_208903` WebRTC write-budget sibling | closed | registered dependency closed |
+| `ticket_1786937228_425608` Unix unbound printf attach lifecycle flake | closed | Hub `origin/main` contains `c1ce7e525aef080e10eee79a306482d5bfc66860` (`Merge ticket: Hub tests: fix unix adapter unbound printf lifecycle flake`). Dependency `dependency_1787003379_762765` is closed. |
+| `ticket_1787015956_494734` Core ProcessExited without worker-reap gate | closed | Core `origin/main` contains `d981bb03f91e2d13428000ac989c50d794f659b2`. Not a direct parent dependency; Hub `ticket_1786977409_499180` owns consume + verify of this revision (`dependency_1787015963_708930` already closed). |
+| `ticket_1786938984_190098` session projection before ready Spawn | closed | Hub `origin/main` contains `bf249af40b7c9462ec5dba1279086590b20af18c` (`Merge ticket: Hub: complete session projection before ready Spawn snapshot delivery`). Dependency `dependency_1787003375_571466` is closed. |
+| `ticket_1787011770_110683` lifecycle-suite harness isolation | closed | Hub `origin/main` contains `952032ddc6b824211f62c077267ff33287565cad` (`Serialize latch fixtures under the daemon test guard.`). Dependency `dependency_1787013165_736482` is closed. Do **not** start the clean-host lifecycle suite from this parent until ShutdownSession and its Core wait merge. |
 
 This is a Hub-owned **final integration proof**. It does not invent a second transport path. It proves the architecture already merged by the closed north-star tickets through production binaries and authentic client harnesses.
 
-## Plan Review corrections (rev 6)
+## Parked Implement (rev 7)
+
+Human requested return to Plan. Do **not** re-author the Hub coordinator or IsolatedHub occupancy work.
+
+| Field | Value |
+| --- | --- |
+| Parked commit | `7c055f57f8f875d4d1cc9437ebb65cec20b7b6a3` |
+| Hub-owned delivered | `script/prove-north-star-shared-session`; IsolatedHub Unix+WebRTC occupancy oracle; bootstrap-wait helper; ShutdownSession hold test |
+| Suite after last Hub change | three consecutive `./test.sh --locked --test hub_daemon_lifecycle_test` at 220 passed / 1 ignored |
+| Merge | **not** on `main` |
+| Authentic same-session | **not done.** Coordinator spawned `north-star-shared` with `session_type_id=device/north-star-shared`. Web keep-alive failed: expected exactly one cancel detach, got 2 (standalone Web smoke later got 0). TUI IsolatedHub `session-types` failed: created agent type missing from entity store. Required coordinator pass lines were not printed. |
+
+Next Implement, after ShutdownSession and its remaining Core dependency merge. Do **not** start the clean-host lifecycle suite yet.
+
+1. Rebase this branch onto current Hub `origin/main` (must contain `7c055f5`, write-budget, `c1ce7e5`, `bf249af`, and `952032d`).
+2. Re-resolve Web and TUI `origin/main` to the closed ticket merges.
+3. Run `script/prove-north-star-shared-session` twice with the shipped Web/TUI entry points. Require every coordinator pass line.
+4. Run TUI `session-types` against the same binaries.
+5. Merge to Hub `main`. No PR.
+
+## Plan Review corrections (rev 7)
 
 | Finding | Class | Fix |
 | --- | --- | --- |
-| `finding_1786907173_388175` every suite fail routed to WebRTC bootstrap repair | product / medium | Split disposition. Named recurrence `webrtc_terminal_adapter_stale_generation_close_does_not_sweep_replacement_owner` requires the production WebRTC bootstrap repair, then three more consecutive suite passes. Any other suite failure still blocks merge, but requires exact diagnosis plus an in-scope repair or a correctly targeted blocking ticket, then three consecutive passes after the last change. Three full-suite runs remain mandatory. |
+| Human return to Plan after Implement | process | Record parked commit `7c055f5`. Authentic proof waits on three registered owner tickets. Do not broaden this Hub run into Web/TUI source. |
+| `finding_1786907173_388175` every suite fail routed to WebRTC bootstrap repair | product / medium | Still resolved. Split disposition kept. Named test did not recur in the three baseline runs. A later sibling bootstrap miss was repaired by waiting for health + `local_url`. |
 | `finding_1786906844_938668` lifecycle flake has no unconditional disposition | product / high | Still locked: three consecutive default-concurrency suite runs. Refined by the split above. |
 | `finding_1786905978_326070` coordinator optional, unnamed, sequential | product / high | Still resolved: `script/prove-north-star-shared-session`. |
 | `finding_1786905978_942337` current-main lifecycle suite fails | product / high | Superseded by `finding_1786906844_938668`. Worktree is on `c72712e`. Review later saw 219/1 ignored on the same SHA. That later pass does not close the flake. |
@@ -139,7 +172,7 @@ Targeted notes:
 
 ## Context loaded
 
-Plan Review `review_1786905978_198868` verdict `changes_required`. Findings `finding_1786905978_326070`, `finding_1786905978_942337`, and `finding_1786905978_910956` are addressed in this revision. `finding_1786868395_783448` stays resolved. Human answer `question_1786867995_904640` is locked.
+Human returned this run to Plan after Implement. Parked Hub commit `7c055f5`. Implement report: `docs/reports/prove-the-terminal-transport-north-star-across-core-hub-web-and-tui-implement.md`. Authentic coordinator failed on Web cancel detach count (2, later 0) and TUI IsolatedHub session-types. Three owner tickets are open and registered. `question_1786867995_904640` stays locked.
 
 This worktree is on Hub `origin/main` `c72712e`. Two Review suite observations on that SHA:
 
@@ -249,21 +282,22 @@ Production Hub already:
 | --- | --- | --- |
 | Host admission, adapters, route registry, owner loop, host Drain, `ShutdownSession` | Hub | audit + proof + any missing Hub oracle |
 | Terminal frames, attach generations, adapter trait, conformance harness, exact-session lifecycle query | Core | consume locked `fc541a59` or newer recorded Core main |
-| Browser Restty decode, packaged-protocol smoke, session-entity detach | Web | **closed** `ticket_1786868596_331812` at `ebb6677`; this run executes `drive:live-packaged-protocol:shared-session` only |
-| Ghostty decode, TUI live attach, session-types live profile | TUI | **closed** `ticket_1786868597_171437` at `8b4df69`; this run executes `ghostty-shared` / `ghostty-shared-exit` only |
+| Browser Restty decode, packaged-protocol smoke, session-entity detach | Web | Caller-owned lane shipped at `ebb6677`. **Open** `ticket_1786912123_916503` must make cancel emit exactly one detach. |
+| Ghostty decode, TUI live attach, session-types live profile | TUI | `ghostty-shared` shipped at `8b4df69`. **Open** `ticket_1786912267_788084` must fix IsolatedHub `session-types` entity-store miss. |
 | Ratatui/Crossterm kit | TUI Kit | pin check only |
 | Host DTOs / generated TS | in-repo `botster-hub-client` | audit only unless a Hub-owned oracle is missing |
 
 Already-closed dependencies stay closed.
 
-Rev 2 blocking dependencies are **closed** and merged:
+Rev 2 caller-owned harness tickets remain **closed**.
 
-| Ticket | Target | Target id | Merge |
+Open blocking dependencies (already registered; do not re-register). Final integration stays parked until this harness taint is repaired. Do **not** waive `script/run-lifecycle-suite`.
+
+| Ticket | Target | Target id | Why |
 | --- | --- | --- | --- |
-| `ticket_1786868597_171437` | botster-tui | `tgt_c3d470bab78549df920a41e8fb0e58d8` | `8b4df69e27b65071aa94b7e5d6b31d0990c041fc` |
-| `ticket_1786868596_331812` | botster-web | `tgt_40abcf71ccf049f4ac0c99953a799869` | `ebb6677902ff5920ebb75685a74bba30b9b81b87` |
+| `ticket_1787076374_645547` | botster-hub | `tgt_7e208a0c76a44980a83b63af976b1f22` | `external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable` identity capture taints the default-concurrency lifecycle suite (`verdict=environment_tainted` twice on a 0/0 census) |
 
-TUI also required closed Hub occupancy `ticket_1786870433_515008`, now on Hub `origin/main` at `c72712e`. Implement rebases this worktree onto that SHA.
+Closed after rev 7, including harness `ticket_1787011770_110683` at Hub `952032d`, projection `ticket_1786938984_190098` at Hub `bf249af`, and Unix-attach `ticket_1786937228_425608` at Hub `c1ce7e5`. This parent Implement fail-closes while ShutdownSession is open. After it closes, rebase onto current Hub `origin/main` (include `7c055f5`, write-budget, `c1ce7e5`, `bf249af`, and `952032d`) and run the coordinator twice.
 
 If Implement finds a further defect owned elsewhere, register a new ticket against that repository's `target_id`:
 
@@ -487,20 +521,15 @@ Downstream proof required by the Hub charter: live Web and live TUI against the 
 
 ## Implement sequence
 
-1. Restore `.gitignore` if wiped. Confirm no `:` in the worktree path.
-2. Check free disk. `errno 28` is failure, not a skip.
-3. Confirm this worktree is `c72712e` or a newer recorded `origin/main`.
-4. Confirm TUI `8b4df69` and Web `ebb6677` remain ancestors of those repos' `origin/main`.
-5. Run `./test.sh --locked --test hub_daemon_lifecycle_test` **three consecutive times** at default concurrency. Record all three results. Isolated reruns and a single pass do not count.
-   - If `webrtc_terminal_adapter_stale_generation_close_does_not_sweep_replacement_owner` fails in any run: repair the production WebRTC bootstrap path in this ticket, then run three more consecutive suite passes.
-   - If a different test fails: diagnose that exact test. Repair it here if Hub-owned and in scope, or register a blocking ticket against the owning repository `target_id`. Then run three more consecutive suite passes.
-   - Do not merge until three consecutive default-concurrency passes exist after the last change.
-6. Audit production sources, trees, and leftover goldens/Drain/translation.
-7. Build provenance-pinned binaries.
-8. Add `script/prove-north-star-shared-session` and run it twice. Require every coordinator pass line above.
-9. Run TUI `session-types` against the same Hub/worker binaries (Option A / qualified ids). That profile may IsolatedHub; it is not the same-session proof.
-10. Write the implement report with SHAs, the shared session id, both client oracles, suite disposition, and coordinator output.
-11. Merge to Hub `main`. Do not create a PR.
+1. If `ticket_1786912123_916503`, `ticket_1786912267_788084`, or `ticket_1786913892_208903` is open, **stop**. Do not edit Web/TUI here. Do not rewrite the parked coordinator.
+2. Restore `.gitignore` if wiped. Confirm no `:` in the worktree path. Check free disk.
+3. Rebase onto Hub `origin/main` that contains `7c055f5` and the closed write-budget ticket.
+4. Re-resolve Web and TUI `origin/main` to the closed cancel-oracle and session-types merges.
+5. Build provenance-pinned binaries from the rebased Hub.
+6. Run `script/prove-north-star-shared-session` twice. Require every coordinator pass line.
+7. Run TUI `session-types` against the same binaries.
+8. If the three-run lifecycle suite is no longer current on the rebased SHA, rerun the split disposition from rev 6.
+9. Write the implement report and merge to Hub `main`. No PR.
 
 ## Review / Verify overlays
 
