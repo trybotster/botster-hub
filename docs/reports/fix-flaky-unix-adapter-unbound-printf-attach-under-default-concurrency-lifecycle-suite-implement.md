@@ -9,7 +9,7 @@
 | `target_id` | `tgt_7e208a0c76a44980a83b63af976b1f22` |
 | Authoritative path | ticket `target_id` plus worktree `origin` remote `https://github.com/trybotster/botster-hub.git` |
 | Pipeline worktree | the ticket worktree on `project-pipelines/ticket_1786937228_425608` |
-| Plan | `docs/plans/fix-flaky-unix-adapter-unbound-printf-attach-under-default-concurrency-lifecycle-suite.md` revision 4 |
+| Plan | `docs/plans/fix-flaky-unix-adapter-unbound-printf-attach-under-default-concurrency-lifecycle-suite.md` revision 5 |
 | Delivery | direct-merge; no pull request |
 | Class | not runtime-teardown (`teardown_class_applies: no`) |
 | Implement checklist | `checklist_1787005013_972813` |
@@ -65,7 +65,7 @@ Independent routing: `project_pipelines_current_context` and the approved plan b
 
 Feature behavior:
 
-- `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs` — add `unix_envelope_is_process_exit`. Repair `unix_adapter_unbound_printf_stream_attach_completes`: attach through the unix adapter, wait for wire `process_exit`, then prove host-row retention (`running` or `exited`) and ReadScreen plus owning-connection Drain serviceability. Spawn is `printf 'smoke:<marker>\n'; sleep 1` so the adapter attaches before the child exits.
+- `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs` — restore `unix_adapter_unbound_printf_stream_attach_completes` to the default-Hello path. Hold the child on a release file until that unbound Attach returns, then print the marker. Accept host-row `running` or `exited`. Add `unix_adapter_bound_printf_stream_attach_delivers_process_exit` for path D `process_exit` proof with a release file, `SessionCleanupGuard`, and a post-printf sleep that is not an attach deadline.
 
 Handoff:
 
@@ -105,6 +105,7 @@ Accepted deviations, now in committed plan revision 4:
 - Plan check 3 asked for five consecutive binding-green suite runs. Orchestrator answer `question_1787011724_901513` advances this ticket on the focused proof plus the five target-test passes. It forbids a full-suite rerun now. Final integration stays the strict clean-suite gate.
 - Run 4 is invalid suite-environment evidence. Leftover workers produced three suite tallies in one log. It does not count against this ticket.
 - Plan check 6 (full `./test.sh --locked`) was not run. It remains non-binding and needs a later slot.
+- Review `review_1787012453_488679` required the named test to stay on the default-Hello unbound path. A printf-only spawn left ReadScreen empty on focused repeats. The named test now holds the child until default-Hello Attach returns. Bound `process_exit` proof lives in a separate test.
 
 ## Tests and downstream proof run
 
@@ -126,15 +127,15 @@ Both controls used `./test.sh --locked --test hub_daemon_lifecycle_test -- --exa
 
 | Control | Sabotage | Exit | First failure |
 | --- | --- | --- | --- |
-| A (retention) | `ShutdownSession` + `RemoveSession` after `process_exit`, before `ListSessions` | 101 | `ProcessExited must not shut down the host session: []` at `unix_terminal_adapter.rs:798` |
-| B (`process_exit`) | spawn `printf 'smoke:<marker>\n'; sleep 30` | 101 | `attached terminal subscription must deliver process_exit` at `unix_terminal_adapter.rs:773` |
+| A (unbound retention) | `ShutdownSession` before host-row check | 101 | `host session lifecycle stopping is not running or exited` at `unix_terminal_adapter.rs:91` |
+| B (bound `process_exit`) | skip writing the bound release file | 101 | `attached terminal subscription must deliver process_exit` at `unix_terminal_adapter.rs:912` |
 
 ### Acceptance tallies
 
 | Command | Result |
 | --- | --- |
 | `cargo build --locked -p botster-core-daemon --bin botster-session-worker` | exit 0 |
-| `./test.sh --locked --test hub_daemon_lifecycle_test -- --exact unix_adapter_unbound_printf_stream_attach_completes` × 20 | 20/20 PASS |
+| `./test.sh --locked --test hub_daemon_lifecycle_test -- --exact unix_adapter_unbound_printf_stream_attach_completes unix_adapter_bound_printf_stream_attach_delivers_process_exit` × 20 | 20/20 PASS after Review split |
 | `cargo fmt --all -- --check` | exit 0 |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0 |
 | `./test.sh --locked --test hub_daemon_lifecycle_test` × 5 | slot `question_1787005950_441740`; see suite table |
@@ -156,7 +157,7 @@ Downstream proof: not required. No public surface, DTO, pin, or runtime behavior
 
 ## Unverified behavior or residual risk
 
-- Orchestrator `question_1787011724_901513` forbids a full-suite rerun now. This ticket advances on focused proof plus five target-test passes. Final integration remains the strict clean-suite convergence gate.
+- Review `review_1787012453_488679` asks for authorized suite gates after the split. This visit has not started an unfiltered suite. A new exclusive slot is required. Final integration remains the strict clean-suite convergence gate.
 - Run 4 is invalid suite-environment evidence and does not count against this ticket.
 - Plan check 6 (one full `./test.sh --locked`) was not run. It is non-binding and needs its own orchestrator slot.
 - `sleep 1` can still lose the attach-before-exit race under extreme spawn delay. Control B proves the `process_exit` assertion is live when the child stays up.

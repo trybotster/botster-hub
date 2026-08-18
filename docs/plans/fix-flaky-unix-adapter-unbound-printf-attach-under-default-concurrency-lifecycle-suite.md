@@ -5,7 +5,7 @@ Run: `run_1786937300_850110`
 Pipeline: Botster Stack Delivery (`botster_stack_delivery`)
 Step: Plan (`botster_stack_plan`)
 
-Revision 4. Revision 2 addressed Plan Review `review_1786938887_392539`: the red base lifecycle gate received an owner ticket (`ticket_1786938984_190098`) registered as a blocking dependency (`dependency_1786938989_522783`), the acceptance checks sequenced the binding suite gate after that dependency landed, and the planning context added [[botster-architecture]] and [[cli-patterns]]. Revision 3 applies the orchestrator suite-concurrency policy (`msg_device-2_1787003453_936ef9`, 2026-08-17): full lifecycle-suite runs are a serialized command class that needs an explicit orchestrator slot, the ready_spawn failures are known-baseline failures recorded on their owning ticket rather than a serial dependency, and strict zero-failure convergence moves to final integration. Revision 4 applies Implement question `question_1787005265_458413` path D: the exit oracle is the attached terminal subscription's `process_exit` frame, not `ListSessions.lifecycle`. The unused full-suite slot from `question_1787005080_932674` was released. Implement must request a new slot only after focused target and negative-control gates pass.
+Revision 5. Revision 2 addressed Plan Review `review_1786938887_392539`: the red base lifecycle gate received an owner ticket (`ticket_1786938984_190098`) registered as a blocking dependency (`dependency_1786938989_522783`), the acceptance checks sequenced the binding suite gate after that dependency landed, and the planning context added [[botster-architecture]] and [[cli-patterns]]. Revision 3 applies the orchestrator suite-concurrency policy (`msg_device-2_1787003453_936ef9`, 2026-08-17): full lifecycle-suite runs are a serialized command class that needs an explicit orchestrator slot, the ready_spawn failures are known-baseline failures recorded on their owning ticket rather than a serial dependency, and strict zero-failure convergence moves to final integration. Revision 4 applies Implement question `question_1787005265_458413` path D: the exit oracle is the attached terminal subscription's `process_exit` frame, not `ListSessions.lifecycle`. Revision 5 applies Review `review_1787012453_488679` / `finding_1787012453_619797`: keep the named test as the default-Hello unbound fast-exit path, accept retained lifecycle `running` or `exited`, and move bound `process_exit` proof to a separate test that holds the child on a release file until Attach completes.
 
 The write-budget sibling continuation (`ticket_1786913892_208903`) hit one lifecycle-suite failure after integrating Hub main `547ca38`. The failed test was `unix_adapter_unbound_printf_stream_attach_completes`. The panic was `ProcessExited must not shut down the host session: [DaemonSession { session_id: "uap-session", lifecycle: "exited" }]` at `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs:752`. The same test passed in isolation on the branch and on base `origin/main` `547ca38`. This ticket repairs that default-concurrency root on botster-hub.
 
@@ -83,18 +83,27 @@ Implement also proved that a ReadScreen-driven wait for `lifecycle == "exited"` 
 
 ## Scope
 
-Repair `unix_adapter_unbound_printf_stream_attach_completes` so default-concurrency load cannot fail it through host-projection timing. The exit oracle is the attached terminal subscription's `process_exit` frame (`TerminalEvent::ProcessExit` / wire tag `process_exit`). Do not use `ListSessions.lifecycle` as the exit oracle.
+Repair `unix_adapter_unbound_printf_stream_attach_completes` so default-concurrency load cannot fail it through host-projection timing. Keep that named test on the default-Hello unbound fast-exit path. Do not convert it into a bound unix-adapter attach.
 
-Revision 4 sequence, per `question_1787005265_458413` path D:
+Revision 5 sequence for the named unbound test, per `review_1787012453_488679`:
 
-1. Spawn `printf 'smoke:<marker>\n'; sleep 1` so the unix adapter can attach while the child is still alive. A printf-only child exits first, and observation then consumes ProcessExited before the subscription can deliver `process_exit`.
-2. Attach through a unix adapter connection on `uap-sub`. Keep host Drain empty of terminal bodies.
-3. Poll opaque unix envelopes until one payload has `type == "process_exit"` for that session and subscription, or fail at a 5-second deadline.
-4. After `process_exit`, call `ListSessions` on the default host connection. The same `session_id` must remain present. Accept lifecycle `running` or `exited`. Panic immediately if the row is absent (`ProcessExited must not shut down the host session`) or `failed`.
-5. Run the existing ReadScreen marker proof on the default host connection.
-6. Prove the retained host session stays serviceable with host Drain on the owning unix adapter connection: Events, empty events.
+1. Spawn a child that waits on a release file, then prints the marker, on the default Hello connection. A printf-only child can exit before ReadScreen has a producer.
+2. Attach on that same default Hello connection. Host Attach and Drain stay empty of terminal bodies. Write the release file after Attach returns.
+3. Call `ListSessions`. The same `session_id` must remain present. Accept lifecycle `running` or `exited`. Panic immediately if the row is absent (`ProcessExited must not shut down the host session`) or `failed`.
+4. Run the existing ReadScreen marker proof on the default host connection.
+5. Prove the retained host session stays serviceable with host Drain on that same connection: Events, empty events.
 
 Keep the test name. Keep the final `hub.shutdown()`. Do not add production exact-session observation to ReadScreen. Do not call ShutdownSession as an observation stimulus.
+
+Add a separate bound test `unix_adapter_bound_printf_stream_attach_delivers_process_exit` for path D `process_exit` proof:
+
+1. Spawn a child that waits on a release file, then prints the marker, then sleeps 1 second so Core can emit `process_exit` after attach. The sleep is not an attach deadline.
+2. Arm `SessionCleanupGuard` immediately after Spawn.
+3. Attach through a unix adapter connection. Prime one host Drain while the child is still held.
+4. Write the release file.
+5. Poll opaque unix envelopes until one payload has `type == "process_exit"` for that session and subscription, or fail at a 5-second deadline.
+6. Assert host-row retention (`running` or `exited`), ReadScreen marker, and owning-connection Drain serviceability.
+7. Disarm the cleanup guard. Shut down the isolated hub.
 
 ## Non-scope
 
@@ -106,7 +115,7 @@ Keep the test name. Keep the final `hub.shutdown()`. Do not add production exact
 
 ## Repository ownership boundaries and cross-repo dependencies
 
-Hub owns the daemon transport, the session lifecycle projection, and this lifecycle test. The work stays in Hub, in one test function in `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs`.
+Hub owns the daemon transport, the session lifecycle projection, and this lifecycle test. The work stays in Hub, in `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs`.
 
 No cross-repository prerequisite exists. Do not register a Core, client, Web, or TUI dependency. The session worker prebuild uses the lockfile-pinned `botster-core-daemon` package target; no repin.
 
@@ -133,7 +142,7 @@ Known since Plan Review: the two ready_spawn wall-clock tests fail on base under
 
 ## Affected surfaces/files
 
-- `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs` -- only the `unix_adapter_unbound_printf_stream_attach_completes` test body.
+- `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs` -- restore `unix_adapter_unbound_printf_stream_attach_completes` and add `unix_adapter_bound_printf_stream_attach_delivers_process_exit`.
 - `docs/plans/fix-flaky-unix-adapter-unbound-printf-attach-under-default-concurrency-lifecycle-suite.md` -- this plan.
 - `docs/reports/fix-flaky-unix-adapter-unbound-printf-attach-under-default-concurrency-lifecycle-suite-implement.md` -- Implement report (Implement step).
 
@@ -152,11 +161,11 @@ No production code changes. No dependency or lockfile changes.
 All commands run in the ticket worktree at default concurrency. All suite commands use the Hub wrapper `./test.sh`, which checks asset sync, sets `BOTSTER_ENV=test`, and runs workspace scope. Direct `cargo test` invocations do not satisfy these gates.
 
 1. Prebuild precondition (before every suite run set): `cargo build --locked -p botster-core-daemon --bin botster-session-worker`. The near-limit review proved suite runs without this build produce worker-missing failures.
-2. Targeted repetition: `./test.sh --locked --test hub_daemon_lifecycle_test -- --exact unix_adapter_unbound_printf_stream_attach_completes` passes 20 consecutive runs (shell loop, nonzero exit stops the loop).
-3. Binding default-concurrency gate: `./test.sh --locked --test hub_daemon_lifecycle_test` (full lifecycle binary, default test threads) passes 5 consecutive runs with zero failures excluding the known-baseline ready_spawn pair owned by `ticket_1786938984_190098`. The pre-existing 1 ignored test stays ignored. Preconditions, per the known-baseline section: an explicit orchestrator slot for each full-suite run set, runs strictly serialized, and any ready_spawn occurrence recorded on the owning ticket. This ticket's target test must pass in all 5 runs. If the ready_spawn repairs have already merged by Implement time, integrate that base and bind on strict zero failures instead.
-4. Red-proof, per [[a regression test must be shown to go red with the fix reverted]], with two separate negative controls, both run under the targeted command from check 2:
-   - Control A (retention oracle): after `process_exit`, temporarily insert `ShutdownSession` plus `RemoveSession` for `uap-session` before the `ListSessions` presence check. The run must fail at the retention panic (`ProcessExited must not shut down the host session`).
-   - Control B (`process_exit` oracle): temporarily change the spawn command to `printf 'smoke:<marker>\n'; sleep 30`. The marker still prints, the process stays alive, and the run must fail at the `process_exit` deadline. This first-failure site must be distinct from Control A.
+2. Targeted repetition: `./test.sh --locked --test hub_daemon_lifecycle_test -- --exact unix_adapter_unbound_printf_stream_attach_completes unix_adapter_bound_printf_stream_attach_delivers_process_exit` passes 20 consecutive runs (shell loop, nonzero exit stops the loop).
+3. Binding default-concurrency gate: `./test.sh --locked --test hub_daemon_lifecycle_test` (full lifecycle binary, default test threads) passes 5 consecutive runs with zero failures excluding the known-baseline ready_spawn pair owned by `ticket_1786938984_190098`. The pre-existing 1 ignored test stays ignored. Preconditions, per the known-baseline section: an explicit orchestrator slot for each full-suite run set, runs strictly serialized, and any ready_spawn occurrence recorded on the owning ticket. Both ticket tests must pass in all 5 runs. If the ready_spawn repairs have already merged by Implement time, integrate that base and bind on strict zero failures instead.
+4. Red-proof, per [[a regression test must be shown to go red with the fix reverted]], with two separate negative controls:
+   - Control A (unbound retention): in `unix_adapter_unbound_printf_stream_attach_completes`, temporarily insert `ShutdownSession` plus `RemoveSession` for `uap-session` before the `ListSessions` presence check. The run must fail at the retention panic (`ProcessExited must not shut down the host session`).
+   - Control B (bound `process_exit`): in `unix_adapter_bound_printf_stream_attach_delivers_process_exit`, skip writing the release file. The run must fail at the `process_exit` deadline. This first-failure site must be distinct from Control A.
    Record both nonzero exit codes and both failure sites in the Implement report, then revert both sabotages.
 5. Strict Rust gates, exact commands: `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --locked -- -D warnings` both pass.
 6. Non-binding smoke: one full `./test.sh --locked` run (the ticket's discovery command) may be reported for information. It contains the full lifecycle suite, so it needs its own orchestrator slot. A failure in a known lib-suite wall-clock root or the known-baseline ready_spawn pair does not bind this ticket; any other failure needs exact evidence and a new ticket.
