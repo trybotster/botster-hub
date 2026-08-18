@@ -421,15 +421,19 @@ impl PanicSafeCliDaemon {
     }
 
     pub(crate) fn shutdown_at(mut self, data_dir: &Path) -> Output {
+        let transfer = matches!(self.mode, GuardCleanupMode::TransferSessions);
         let _ = self.cleanup_owned_resources(CleanupTrigger::Explicit);
         let child = self.child.take().expect("lifecycle daemon child");
         let shutdown = request_cli_daemon_shutdown(data_dir).unwrap_or_else(|error| {
             panic!("run botster-hub shutdown: {error}");
         });
         let output = wait_for_cli_daemon_shutdown(&shutdown, child);
-        if let Err(error) =
+        let proof = if transfer {
+            prove_hub_and_socket_absent(data_dir, None)
+        } else {
             prove_owned_children_absent(data_dir, None, &self.known_worker_pids)
-        {
+        };
+        if let Err(error) = proof {
             record_harness_taint(format!("{}: {error}", self.panic_context));
             panic!("{error}");
         }

@@ -537,6 +537,19 @@ pub(crate) fn prove_owned_children_absent(
     hub_pid: Option<u32>,
     known_worker_pids: &[u32],
 ) -> Result<(), String> {
+    prove_owned_absence(data_dir, hub_pid, known_worker_pids, true)
+}
+
+pub(crate) fn prove_hub_and_socket_absent(data_dir: &Path, hub_pid: Option<u32>) -> Result<(), String> {
+    prove_owned_absence(data_dir, hub_pid, &[], false)
+}
+
+fn prove_owned_absence(
+    data_dir: &Path,
+    hub_pid: Option<u32>,
+    known_worker_pids: &[u32],
+    expect_workers_gone: bool,
+) -> Result<(), String> {
     unlink_stale_daemon_socket(data_dir, hub_pid);
     let socket = daemon_socket_path(data_dir);
     if socket.exists() {
@@ -549,6 +562,9 @@ pub(crate) fn prove_owned_children_absent(
         && process_exists(pid)
     {
         return Err(format!("Hub child pid {pid} still live"));
+    }
+    if !expect_workers_gone {
+        return Ok(());
     }
     for pid in known_worker_pids {
         if process_exists(*pid) {
