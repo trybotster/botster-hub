@@ -369,6 +369,23 @@ pub(crate) fn request_cli_daemon_shutdown(data_dir: &Path) -> io::Result<Output>
         .output()
 }
 
+fn hard_stop_cli_daemon_group(child: &mut Child) {
+    let pid = child.id();
+    if pid > 1 && pid != std::process::id() {
+        let _ = unsafe { libc::killpg(pid as libc::pid_t, libc::SIGTERM) };
+        for _ in 0..25 {
+            if child.try_wait().ok().flatten().is_some() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let _ = unsafe { libc::killpg(pid as libc::pid_t, libc::SIGKILL) };
+    }
+    if child.try_wait().ok().flatten().is_none() {
+        let _ = child.kill();
+    }
+}
+
 pub(crate) struct PanicSafeCliDaemon {
     pub(crate) data_dir: PathBuf,
     pub(crate) child: Option<Child>,
@@ -392,6 +409,24 @@ impl PanicSafeCliDaemon {
             child: Some(start_cli_daemon(data_dir)),
             panic_context: "local WebRTC target sender evidence",
             inspect_local_webrtc_sender: true,
+        }
+    }
+
+    pub(crate) fn start_with_runtime_drain_failure(
+        data_dir: &Path,
+        session_id: &str,
+        egress_capacity: Option<usize>,
+        panic_context: &'static str,
+    ) -> Self {
+        Self {
+            data_dir: data_dir.to_path_buf(),
+            child: Some(start_cli_daemon_with_runtime_drain_failure(
+                data_dir,
+                session_id,
+                egress_capacity,
+            )),
+            panic_context,
+            inspect_local_webrtc_sender: false,
         }
     }
 
@@ -478,8 +513,12 @@ impl Drop for PanicSafeCliDaemon {
                     != "botster-hub shutdown error: client disconnected"
         });
         if shutdown_failed && child.try_wait().ok().flatten().is_none() {
-            let _ = child.kill();
+            hard_stop_cli_daemon_group(&mut child);
         }
+        if child.try_wait().ok().flatten().is_none() {
+            hard_stop_cli_daemon_group(&mut child);
+        }
+        let _ = reap_session_workers_for_data_dir(&self.data_dir);
 
         match child.wait_with_output() {
             Ok(daemon) => {
