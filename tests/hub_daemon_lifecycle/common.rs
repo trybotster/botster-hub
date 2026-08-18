@@ -414,6 +414,42 @@ pub(crate) fn daemon_test_lock() -> &'static Mutex<()> {
 
 thread_local! {
     static DAEMON_GUARD_DEPTH: Cell<u32> = const { Cell::new(0) };
+    static BYPASS_REAL_DAEMON_START_GUARD: Cell<bool> = const { Cell::new(false) };
+}
+
+static REAL_DAEMON_START_BOUNDARY: OnceLock<Mutex<Option<std::sync::mpsc::Sender<()>>>> =
+    OnceLock::new();
+
+fn real_daemon_start_boundary_slot() -> &'static Mutex<Option<std::sync::mpsc::Sender<()>>> {
+    REAL_DAEMON_START_BOUNDARY.get_or_init(|| Mutex::new(None))
+}
+
+pub(crate) fn arm_real_daemon_start_boundary() -> std::sync::mpsc::Receiver<()> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    *real_daemon_start_boundary_slot()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(tx);
+    rx
+}
+
+pub(crate) fn disarm_real_daemon_start_boundary() {
+    *real_daemon_start_boundary_slot()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = None;
+}
+
+fn notify_real_daemon_start_boundary() {
+    if let Some(tx) = real_daemon_start_boundary_slot()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take()
+    {
+        let _ = tx.send(());
+    }
+}
+
+pub(crate) fn bypass_real_daemon_start_guard(bypass: bool) {
+    BYPASS_REAL_DAEMON_START_GUARD.with(|flag| flag.set(bypass));
 }
 
 pub(crate) struct DaemonTestGuard {
@@ -429,6 +465,11 @@ impl Drop for DaemonTestGuard {
 pub(crate) fn daemon_test_guard() -> DaemonTestGuard {
     DAEMON_GUARD_DEPTH.with(|depth| {
         if depth.get() == 0 {
+            notify_real_daemon_start_boundary();
+            if BYPASS_REAL_DAEMON_START_GUARD.with(|flag| flag.get()) {
+                check_harness_taint();
+                return DaemonTestGuard { _inner: None };
+            }
             let inner = recovering_mutex_guard(daemon_test_lock());
             check_harness_taint();
             depth.set(1);
