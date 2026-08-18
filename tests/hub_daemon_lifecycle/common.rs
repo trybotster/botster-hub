@@ -1,5 +1,6 @@
 #![allow(dead_code, unused_imports)]
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -12,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{
     Arc, Mutex, OnceLock,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc,
 };
 use std::thread;
@@ -411,9 +412,114 @@ pub(crate) fn daemon_test_lock() -> &'static Mutex<()> {
     REAL_DAEMON_TEST_LOCK.get_or_init(|| Mutex::new(()))
 }
 
-pub(crate) fn daemon_test_guard() -> std::sync::MutexGuard<'static, ()> {
-    check_harness_taint();
-    recovering_mutex_guard(daemon_test_lock())
+thread_local! {
+    static DAEMON_GUARD_DEPTH: Cell<u32> = const { Cell::new(0) };
+    static BYPASS_REAL_DAEMON_START_GUARD: Cell<bool> = const { Cell::new(false) };
+    static REAL_DAEMON_START_TOKEN: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+struct RealDaemonStartBoundaryArm {
+    expected: u64,
+    matched: std::sync::mpsc::Sender<()>,
+    foreign: std::sync::mpsc::Sender<()>,
+}
+
+static REAL_DAEMON_START_BOUNDARY: OnceLock<Mutex<Option<RealDaemonStartBoundaryArm>>> =
+    OnceLock::new();
+static NEXT_REAL_DAEMON_START_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+fn real_daemon_start_boundary_slot() -> &'static Mutex<Option<RealDaemonStartBoundaryArm>> {
+    REAL_DAEMON_START_BOUNDARY.get_or_init(|| Mutex::new(None))
+}
+
+pub(crate) fn next_real_daemon_start_token() -> u64 {
+    NEXT_REAL_DAEMON_START_TOKEN.fetch_add(1, Ordering::Relaxed)
+}
+
+pub(crate) fn set_real_daemon_start_token(token: u64) {
+    REAL_DAEMON_START_TOKEN.with(|slot| slot.set(Some(token)));
+}
+
+pub(crate) fn clear_real_daemon_start_token() {
+    REAL_DAEMON_START_TOKEN.with(|slot| slot.set(None));
+}
+
+pub(crate) struct RealDaemonStartBoundary {
+    pub(crate) matched: std::sync::mpsc::Receiver<()>,
+    pub(crate) foreign: std::sync::mpsc::Receiver<()>,
+}
+
+pub(crate) fn arm_real_daemon_start_boundary(expected: u64) -> RealDaemonStartBoundary {
+    let (matched_tx, matched_rx) = std::sync::mpsc::channel();
+    let (foreign_tx, foreign_rx) = std::sync::mpsc::channel();
+    *real_daemon_start_boundary_slot()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(RealDaemonStartBoundaryArm {
+        expected,
+        matched: matched_tx,
+        foreign: foreign_tx,
+    });
+    RealDaemonStartBoundary {
+        matched: matched_rx,
+        foreign: foreign_rx,
+    }
+}
+
+pub(crate) fn disarm_real_daemon_start_boundary() {
+    *real_daemon_start_boundary_slot()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = None;
+}
+
+fn notify_real_daemon_start_boundary() {
+    let current = REAL_DAEMON_START_TOKEN.with(|slot| slot.get());
+    let mut slot = real_daemon_start_boundary_slot()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let Some(arm) = slot.as_ref() else {
+        return;
+    };
+    if current == Some(arm.expected) {
+        let _ = arm.matched.send(());
+        *slot = None;
+        return;
+    }
+    let _ = arm.foreign.send(());
+}
+
+pub(crate) fn bypass_real_daemon_start_guard(bypass: bool) {
+    BYPASS_REAL_DAEMON_START_GUARD.with(|flag| flag.set(bypass));
+}
+
+pub(crate) struct DaemonTestGuard {
+    _inner: Option<std::sync::MutexGuard<'static, ()>>,
+}
+
+impl Drop for DaemonTestGuard {
+    fn drop(&mut self) {
+        DAEMON_GUARD_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+pub(crate) fn daemon_test_guard() -> DaemonTestGuard {
+    DAEMON_GUARD_DEPTH.with(|depth| {
+        if depth.get() == 0 {
+            notify_real_daemon_start_boundary();
+            if BYPASS_REAL_DAEMON_START_GUARD.with(|flag| flag.get()) {
+                check_harness_taint();
+                return DaemonTestGuard { _inner: None };
+            }
+            let inner = recovering_mutex_guard(daemon_test_lock());
+            check_harness_taint();
+            depth.set(1);
+            DaemonTestGuard {
+                _inner: Some(inner),
+            }
+        } else {
+            depth.set(depth.get() + 1);
+            DaemonTestGuard { _inner: None }
+        }
+    })
 }
 
 pub(crate) fn wait_for_incompatible_status(data_dir: &Path, child: &mut Child) {
@@ -882,6 +988,7 @@ pub(crate) fn start_installed_daemon(
     data_dir: &Path,
     entrypoint: &Path,
 ) -> PanicSafeCliDaemon {
+    let _guard = daemon_test_guard();
     check_harness_taint();
     let mut command = Command::new(entrypoint);
     command

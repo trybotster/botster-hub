@@ -279,6 +279,153 @@ fn taint_latch_refuses_next_daemon_start_without_spawning() {
 }
 
 #[test]
+fn injected_taint_cannot_race_an_unguarded_real_daemon_start() {
+    let lock = daemon_test_guard();
+    reset_harness_taint_after_proof();
+    record_harness_taint("injected race taint");
+    let data_dir = unique_short_test_dir("gxt");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+    let token = next_real_daemon_start_token();
+    let boundary = arm_real_daemon_start_boundary(token);
+    let start_dir = data_dir.clone();
+    let handle = thread::spawn(move || {
+        set_real_daemon_start_token(token);
+        let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            start_cli_daemon(&start_dir)
+        }));
+        clear_real_daemon_start_token();
+        started
+    });
+    boundary
+        .matched
+        .recv_timeout(Duration::from_secs(5))
+        .expect("intended child reached the real-daemon start boundary");
+    assert!(
+        boundary.foreign.try_recv().is_err(),
+        "intended start must not also count as a foreign start"
+    );
+    assert!(
+        harness_taint().is_some_and(|evidence| evidence.contains("injected race taint")),
+        "parent must still hold the injected taint at the start boundary: {:?}",
+        harness_taint()
+    );
+    assert!(
+        !daemon_socket_path(&data_dir).exists(),
+        "concurrent start must wait at the daemon guard, not create a socket under taint"
+    );
+    reset_harness_taint_after_proof();
+    drop(lock);
+    let started = handle.join().expect("start thread");
+    disarm_real_daemon_start_boundary();
+    let daemon = started.unwrap_or_else(|panic| {
+        panic!("concurrent real-daemon start raced the injected taint: {panic:?}")
+    });
+    daemon.shutdown();
+    reset_harness_taint_after_proof();
+}
+
+#[test]
+fn injected_taint_race_fails_when_start_guard_is_bypassed() {
+    let lock = daemon_test_guard();
+    reset_harness_taint_after_proof();
+    record_harness_taint("injected race taint");
+    let data_dir = unique_short_test_dir("gxb");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+    let token = next_real_daemon_start_token();
+    let boundary = arm_real_daemon_start_boundary(token);
+    let start_dir = data_dir.clone();
+    let handle = thread::spawn(move || {
+        set_real_daemon_start_token(token);
+        bypass_real_daemon_start_guard(true);
+        let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            start_cli_daemon(&start_dir)
+        }));
+        bypass_real_daemon_start_guard(false);
+        clear_real_daemon_start_token();
+        started
+    });
+    boundary
+        .matched
+        .recv_timeout(Duration::from_secs(5))
+        .expect("intended child reached the real-daemon start boundary");
+    assert!(
+        harness_taint().is_some_and(|evidence| evidence.contains("injected race taint")),
+        "ablation must observe taint at the start boundary: {:?}",
+        harness_taint()
+    );
+    let started = handle.join().expect("bypassed start thread");
+    disarm_real_daemon_start_boundary();
+    assert!(
+        started.is_err(),
+        "bypassing the start-path guard must panic on the injected taint"
+    );
+    assert!(
+        !daemon_socket_path(&data_dir).exists(),
+        "bypassed tainted start must not create a daemon socket"
+    );
+    reset_harness_taint_after_proof();
+    drop(lock);
+}
+
+#[test]
+fn sibling_real_daemon_start_cannot_satisfy_intended_boundary_hook() {
+    let lock = daemon_test_guard();
+    reset_harness_taint_after_proof();
+    record_harness_taint("injected race taint");
+    let intended_dir = unique_short_test_dir("gxi");
+    let sibling_dir = unique_short_test_dir("gxs");
+    fs::create_dir_all(&intended_dir).expect("create intended data dir");
+    fs::create_dir_all(&sibling_dir).expect("create sibling data dir");
+    let intended_token = next_real_daemon_start_token();
+    let sibling_token = next_real_daemon_start_token();
+    let boundary = arm_real_daemon_start_boundary(intended_token);
+    let sibling_start = sibling_dir.clone();
+    let sibling = thread::spawn(move || {
+        set_real_daemon_start_token(sibling_token);
+        let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            start_cli_daemon(&sibling_start)
+        }));
+        clear_real_daemon_start_token();
+        started
+    });
+    boundary
+        .foreign
+        .recv_timeout(Duration::from_secs(5))
+        .expect("sibling start reached the boundary without the intended token");
+    assert!(
+        boundary.matched.try_recv().is_err(),
+        "a sibling first-acquire must not satisfy the intended start-boundary hook"
+    );
+    let intended_start = intended_dir.clone();
+    let intended = thread::spawn(move || {
+        set_real_daemon_start_token(intended_token);
+        let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            start_cli_daemon(&intended_start)
+        }));
+        clear_real_daemon_start_token();
+        started
+    });
+    boundary
+        .matched
+        .recv_timeout(Duration::from_secs(5))
+        .expect("intended child reached the real-daemon start boundary after the sibling");
+    reset_harness_taint_after_proof();
+    drop(lock);
+    let sibling_started = sibling.join().expect("sibling start thread");
+    let intended_started = intended.join().expect("intended start thread");
+    disarm_real_daemon_start_boundary();
+    let sibling_daemon = sibling_started.unwrap_or_else(|panic| {
+        panic!("sibling start raced the injected taint: {panic:?}")
+    });
+    let intended_daemon = intended_started.unwrap_or_else(|panic| {
+        panic!("intended start raced the injected taint: {panic:?}")
+    });
+    sibling_daemon.shutdown();
+    intended_daemon.shutdown();
+    reset_harness_taint_after_proof();
+}
+
+#[test]
 fn transfer_mode_keeps_worker_until_successor_cleans() {
     let _lock = daemon_test_guard();
     let data_dir = unique_short_test_dir("gtf");
@@ -551,6 +698,62 @@ fn dead_command_with_live_unverified_recovery_worker_taints() {
         harness_taint()
     );
     decoy.assert_alive();
+    reset_harness_taint_after_proof();
+}
+
+#[test]
+fn dead_command_with_zombie_recovery_worker_does_not_taint() {
+    let _lock = daemon_test_guard();
+    reset_harness_taint_after_proof();
+    let data_dir = unique_short_test_dir("gxz");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+    let command_pid = spawn_and_reap_sleep();
+    let mut zombie = Command::new("sleep")
+        .arg("30")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn zombie recovery worker");
+    let worker_pid = zombie.id();
+    let _ = zombie.kill();
+    wait_for_process_snapshot(worker_pid, "zombie recovery worker", |snapshot| {
+        snapshot.stat.contains('Z')
+    });
+    save_running_recovery_record(&data_dir, "zombie-recovery", command_pid, worker_pid);
+    let capture = collect_owned_session_processes(&data_dir).expect("zombie recovery capture");
+    assert!(
+        capture.owned.pids.contains(&worker_pid) && capture.owned.pids.contains(&command_pid),
+        "zombie recovery worker and dead command must stay in the owned set: {:?}",
+        capture.owned.pids
+    );
+    assert!(
+        capture.errors.is_empty(),
+        "zombie recovery worker is dead evidence and must not taint: {:?}",
+        capture.errors
+    );
+    assert!(
+        harness_taint().is_none(),
+        "zombie recovery worker must leave the latch clear: {:?}",
+        harness_taint()
+    );
+    let reap = reap_registry_backed_workers(&data_dir).expect("zombie recovery reap");
+    assert!(
+        reap.errors.is_empty(),
+        "zombie recovery worker must not fail reap: {:?}",
+        reap.errors
+    );
+    assert!(
+        reap.retained.contains(&worker_pid) && reap.retained.contains(&command_pid),
+        "zombie recovery worker must stay retained, not signaled: {:?}",
+        reap.retained
+    );
+    assert!(
+        !reap.reaped.contains(&worker_pid) && !reap.reaped.contains(&command_pid),
+        "zombie recovery worker must not be signaled: {:?}",
+        reap.reaped
+    );
+    let _ = zombie.wait();
     reset_harness_taint_after_proof();
 }
 
