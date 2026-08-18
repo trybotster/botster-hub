@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{
     Arc, Mutex, OnceLock,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc,
 };
 use std::thread;
@@ -415,21 +415,54 @@ pub(crate) fn daemon_test_lock() -> &'static Mutex<()> {
 thread_local! {
     static DAEMON_GUARD_DEPTH: Cell<u32> = const { Cell::new(0) };
     static BYPASS_REAL_DAEMON_START_GUARD: Cell<bool> = const { Cell::new(false) };
+    static REAL_DAEMON_START_TOKEN: Cell<Option<u64>> = const { Cell::new(None) };
 }
 
-static REAL_DAEMON_START_BOUNDARY: OnceLock<Mutex<Option<std::sync::mpsc::Sender<()>>>> =
-    OnceLock::new();
+struct RealDaemonStartBoundaryArm {
+    expected: u64,
+    matched: std::sync::mpsc::Sender<()>,
+    foreign: std::sync::mpsc::Sender<()>,
+}
 
-fn real_daemon_start_boundary_slot() -> &'static Mutex<Option<std::sync::mpsc::Sender<()>>> {
+static REAL_DAEMON_START_BOUNDARY: OnceLock<Mutex<Option<RealDaemonStartBoundaryArm>>> =
+    OnceLock::new();
+static NEXT_REAL_DAEMON_START_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+fn real_daemon_start_boundary_slot() -> &'static Mutex<Option<RealDaemonStartBoundaryArm>> {
     REAL_DAEMON_START_BOUNDARY.get_or_init(|| Mutex::new(None))
 }
 
-pub(crate) fn arm_real_daemon_start_boundary() -> std::sync::mpsc::Receiver<()> {
-    let (tx, rx) = std::sync::mpsc::channel();
+pub(crate) fn next_real_daemon_start_token() -> u64 {
+    NEXT_REAL_DAEMON_START_TOKEN.fetch_add(1, Ordering::Relaxed)
+}
+
+pub(crate) fn set_real_daemon_start_token(token: u64) {
+    REAL_DAEMON_START_TOKEN.with(|slot| slot.set(Some(token)));
+}
+
+pub(crate) fn clear_real_daemon_start_token() {
+    REAL_DAEMON_START_TOKEN.with(|slot| slot.set(None));
+}
+
+pub(crate) struct RealDaemonStartBoundary {
+    pub(crate) matched: std::sync::mpsc::Receiver<()>,
+    pub(crate) foreign: std::sync::mpsc::Receiver<()>,
+}
+
+pub(crate) fn arm_real_daemon_start_boundary(expected: u64) -> RealDaemonStartBoundary {
+    let (matched_tx, matched_rx) = std::sync::mpsc::channel();
+    let (foreign_tx, foreign_rx) = std::sync::mpsc::channel();
     *real_daemon_start_boundary_slot()
         .lock()
-        .unwrap_or_else(|error| error.into_inner()) = Some(tx);
-    rx
+        .unwrap_or_else(|error| error.into_inner()) = Some(RealDaemonStartBoundaryArm {
+        expected,
+        matched: matched_tx,
+        foreign: foreign_tx,
+    });
+    RealDaemonStartBoundary {
+        matched: matched_rx,
+        foreign: foreign_rx,
+    }
 }
 
 pub(crate) fn disarm_real_daemon_start_boundary() {
@@ -439,13 +472,19 @@ pub(crate) fn disarm_real_daemon_start_boundary() {
 }
 
 fn notify_real_daemon_start_boundary() {
-    if let Some(tx) = real_daemon_start_boundary_slot()
+    let current = REAL_DAEMON_START_TOKEN.with(|slot| slot.get());
+    let mut slot = real_daemon_start_boundary_slot()
         .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .take()
-    {
-        let _ = tx.send(());
+        .unwrap_or_else(|error| error.into_inner());
+    let Some(arm) = slot.as_ref() else {
+        return;
+    };
+    if current == Some(arm.expected) {
+        let _ = arm.matched.send(());
+        *slot = None;
+        return;
     }
+    let _ = arm.foreign.send(());
 }
 
 pub(crate) fn bypass_real_daemon_start_guard(bypass: bool) {
