@@ -3424,6 +3424,21 @@ fn external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable() {
     );
     let hub_pid = daemon.child.as_ref().expect("panic-safe daemon child").id();
     let socket_path = endpoint.socket_path.clone();
+    let pty_marker = format!(
+        "pty-marker-{}",
+        data_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("unique data dir name")
+    );
+    let victim_wrapper = write_marked_sleep_wrapper(
+        &data_dir,
+        &format!("{pty_marker}-victim"),
+    );
+    let sibling_wrapper = write_marked_echo_wrapper(
+        &data_dir,
+        &format!("{pty_marker}-sibling"),
+    );
     let before_pids: std::collections::BTreeSet<u32> = session_worker_process_identities()
         .expect("baseline worker census must succeed")
         .into_iter()
@@ -3434,13 +3449,17 @@ fn external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable() {
         &endpoint,
         botster_hub_client::DaemonRequest::Spawn {
             session_id: "shutdown-failure-victim".to_string(),
-            command: "sleep 3600".to_string(),
+            command: victim_wrapper.display().to_string(),
         },
     )
     .expect("spawn victim session");
     let victim_cleanup = SessionCleanupGuard::new(&data_dir, "shutdown-failure-victim");
-    let victim_workers = capture_new_session_workers_for_data_dir(&data_dir, &before_pids)
-        .expect("must capture victim botster-session-worker after Spawn");
+    let victim_workers = capture_new_session_workers_for_marked_pty(
+        &data_dir,
+        &before_pids,
+        &format!("{pty_marker}-victim"),
+    )
+    .expect("must capture victim botster-session-worker after Spawn");
     assert!(
         !victim_workers.is_empty(),
         "must capture live victim worker before SIGKILL"
@@ -3450,13 +3469,17 @@ fn external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable() {
         &endpoint,
         botster_hub_client::DaemonRequest::Spawn {
             session_id: "shutdown-failure-sibling".to_string(),
-            command:
-                "printf ready; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done"
-                    .to_string(),
+            command: sibling_wrapper.display().to_string(),
         },
     )
     .expect("spawn sibling session");
     let mut sibling_cleanup = SessionCleanupGuard::new(&data_dir, "shutdown-failure-sibling");
+    let pty_children = unix_processes_matching_marker(&pty_marker)
+        .expect("all-session PTY marker census after sibling spawn");
+    assert!(
+        !pty_children.is_empty(),
+        "must observe marked PTY children across Unix sessions before SIGKILL: marker={pty_marker}"
+    );
 
     let sibling_session = "shutdown-failure-sibling";
     let sibling_subscription = "shutdown-failure-sibling-sub";
@@ -3655,7 +3678,14 @@ fn external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable() {
     daemon.shutdown();
     reap_session_workers_for_data_dir(&data_dir)
         .expect("sibling SIGKILL fixture must not leave worktree session workers");
-    assert_cli_fixture_absent(&data_dir, hub_pid, &socket_path);
+    assert_cli_fixture_absent(
+        &data_dir,
+        hub_pid,
+        &socket_path,
+        &pty_marker,
+        &pty_children,
+        &["shutdown-failure-victim", "shutdown-failure-sibling"],
+    );
 }
 
 #[test]
@@ -3671,7 +3701,16 @@ fn panic_safe_cli_daemon_deliberate_failure_leaves_no_owned_survivors() {
         .path
         .clone();
     let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path.clone());
+    let pty_marker = format!(
+        "pty-marker-{}",
+        data_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("unique data dir name")
+    );
+    let victim_wrapper = write_marked_sleep_wrapper(&data_dir, &pty_marker);
     let hub_pid = std::sync::atomic::AtomicU32::new(0);
+    let captured_pty = std::sync::Mutex::new(Vec::new());
     let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let daemon = PanicSafeCliDaemon::start_with_runtime_drain_failure(
             &data_dir,
@@ -3687,22 +3726,99 @@ fn panic_safe_cli_daemon_deliberate_failure_leaves_no_owned_survivors() {
             &endpoint,
             botster_hub_client::DaemonRequest::Spawn {
                 session_id: "shutdown-failure-panic-victim".to_string(),
-                command: "sleep 3600".to_string(),
+                command: victim_wrapper.display().to_string(),
             },
         )
         .expect("spawn panic-path victim");
         let _session_cleanup =
             SessionCleanupGuard::new(&data_dir, "shutdown-failure-panic-victim");
+        let pty_children = unix_processes_matching_marker(&pty_marker)
+            .expect("all-session PTY marker census before deliberate panic");
+        assert!(
+            !pty_children.is_empty(),
+            "must capture marked PTY children before deliberate panic: marker={pty_marker}"
+        );
+        *captured_pty
+            .lock()
+            .expect("store captured PTY children") = pty_children;
         panic!("deliberate shutdown-failure fixture panic");
     }));
     assert!(
         panicked.is_err(),
         "panic-path owner proof must take the failure branch"
     );
+    let pty_children = captured_pty
+        .into_inner()
+        .expect("recover captured PTY children");
     assert_cli_fixture_absent(
         &data_dir,
         hub_pid.load(std::sync::atomic::Ordering::SeqCst),
         &socket_path,
+        &pty_marker,
+        &pty_children,
+        &["shutdown-failure-panic-victim"],
+    );
+}
+
+#[test]
+fn assert_cli_fixture_absent_fails_when_setsid_child_survives() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("pty-setsid-negative");
+    let marker = format!(
+        "pty-marker-{}",
+        data_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("unique data dir name")
+    );
+    let wrapper = write_marked_sleep_wrapper(&data_dir, &marker);
+    let mut child = spawn_setsid_marked_sleep(&marker, &wrapper);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let pty_children = loop {
+        let found = unix_processes_matching_marker(&marker)
+            .expect("all-session census for setsid negative control");
+        if !found.is_empty() {
+            break found;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "negative control must observe the independently sessioned child: marker={marker}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    let parent_sid = unsafe { libc::getsid(0) };
+    assert!(
+        pty_children
+            .iter()
+            .any(|child| child.sid != parent_sid),
+        "negative control child must leave the test SID via setsid: parent_sid={parent_sid} children={pty_children:?}"
+    );
+
+    let mut dead = Command::new("sh")
+        .arg("-c")
+        .arg("exit 0")
+        .spawn()
+        .expect("spawn dead-pid decoy");
+    let dead_pid = dead.id();
+    dead.wait().expect("reap dead-pid decoy");
+    let socket_path = data_dir.join("missing.sock");
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_cli_fixture_absent(
+            &data_dir,
+            dead_pid,
+            &socket_path,
+            &marker,
+            &pty_children,
+            &[],
+        );
+    }));
+    let _ = child.kill();
+    let _ = child.wait();
+    reap_processes_matching_marker(&marker)
+        .expect("negative control must reap its setsid child");
+    assert!(
+        failed.is_err(),
+        "survivor oracle must fail while a representative setsid child remains alive"
     );
 }
 

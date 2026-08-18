@@ -462,6 +462,55 @@ pub(crate) fn capture_new_session_workers_for_data_dir(
     }
 }
 
+/// Wait for a new worktree `botster-session-worker` for this data directory.
+///
+/// Do not require a PPID-visible shell descendant. A marked wrapper spawned
+/// through portable-pty calls `setsid()`, so the real PTY child can leave the
+/// worker PPID tree while remaining alive in another Unix session.
+pub(crate) fn capture_new_session_workers_for_marked_pty(
+    data_dir: &Path,
+    before_pids: &std::collections::BTreeSet<u32>,
+    marker: &str,
+) -> Result<Vec<SessionWorkerProcessIdentity>, String> {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let live_ours: Vec<SessionWorkerProcessIdentity> = session_worker_process_identities()?
+            .into_iter()
+            .filter(|worker| {
+                !before_pids.contains(&worker.pid) && worker_executable_from_this_worktree(worker)
+            })
+            .collect();
+        let mut live_alive = Vec::new();
+        for worker in live_ours {
+            if process_is_alive_u32(worker.pid)? {
+                live_alive.push(worker);
+            }
+        }
+        let owned_by_dir: Vec<SessionWorkerProcessIdentity> = live_alive
+            .iter()
+            .filter(|worker| worker_belongs_to_data_dir(worker, data_dir))
+            .cloned()
+            .collect();
+        let live = if !owned_by_dir.is_empty() {
+            owned_by_dir
+        } else {
+            live_alive
+        };
+        let marked = unix_processes_matching_marker(marker)?;
+        if !live.is_empty() && !marked.is_empty() {
+            return Ok(live);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "timed out waiting for botster-session-worker plus all-session PTY marker; \
+                 data_dir={} marker={marker} workers={live:?} marked={marked:?}",
+                data_dir.display()
+            ));
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct HubProcessIdentity {
     pub(crate) pid: u32,
@@ -527,7 +576,160 @@ pub(crate) fn live_hub_processes_for_data_dir(
         .collect())
 }
 
-pub(crate) fn assert_cli_fixture_absent(data_dir: &Path, hub_pid: u32, socket_path: &Path) {
+#[derive(Debug, Clone)]
+pub(crate) struct PtyChildIdentity {
+    pub(crate) pid: u32,
+    pub(crate) pgid: libc::pid_t,
+    pub(crate) sid: libc::pid_t,
+    pub(crate) command: String,
+}
+
+pub(crate) fn write_marked_sleep_wrapper(dir: &Path, marker: &str) -> PathBuf {
+    write_marked_wrapper(dir, marker, "#!/bin/sh\nsleep 3600\n")
+}
+
+pub(crate) fn write_marked_echo_wrapper(dir: &Path, marker: &str) -> PathBuf {
+    write_marked_wrapper(
+        dir,
+        marker,
+        "#!/bin/sh\nprintf ready; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done\n",
+    )
+}
+
+fn write_marked_wrapper(dir: &Path, marker: &str, body: &str) -> PathBuf {
+    fs::create_dir_all(dir).expect("create marked wrapper directory");
+    let path = dir.join(marker);
+    fs::write(&path, body).expect("write marked wrapper");
+    let mut permissions = fs::metadata(&path)
+        .expect("read marked wrapper metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&path, permissions).expect("chmod marked wrapper");
+    path
+}
+
+pub(crate) fn spawn_setsid_marked_sleep(marker: &str, wrapper: &Path) -> Child {
+    let mut command = Command::new(wrapper);
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command
+        .spawn()
+        .unwrap_or_else(|error| panic!("spawn setsid child for {marker}: {error}"))
+}
+
+pub(crate) fn unix_processes_matching_marker(
+    marker: &str,
+) -> Result<Vec<PtyChildIdentity>, String> {
+    if marker.is_empty() {
+        return Err("PTY survivor marker must be non-empty".to_string());
+    }
+    let self_pid = std::process::id();
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,command="])
+        .output()
+        .map_err(|error| format!("ps all-session census failed: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "ps all-session census exited with {}: stderr={:?}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let mut matches = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let line = line.trim();
+        let mut parts = line.splitn(2, char::is_whitespace);
+        let Some(pid_token) = parts.next() else {
+            continue;
+        };
+        let Ok(pid) = pid_token.parse::<u32>() else {
+            continue;
+        };
+        if pid == self_pid {
+            continue;
+        }
+        let command = parts.next().unwrap_or("").trim();
+        if !command.contains(marker) {
+            continue;
+        }
+        matches.push(pty_identity_for_pid(pid, command)?);
+    }
+    Ok(matches)
+}
+
+fn pty_identity_for_pid(pid: u32, command: &str) -> Result<PtyChildIdentity, String> {
+    let raw_pid = pid as libc::pid_t;
+    let pgid = unsafe { libc::getpgid(raw_pid) };
+    if pgid == -1 {
+        return Err(format!(
+            "getpgid({pid}) failed: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    let sid = unsafe { libc::getsid(raw_pid) };
+    if sid == -1 {
+        return Err(format!(
+            "getsid({pid}) failed: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    Ok(PtyChildIdentity {
+        pid,
+        pgid,
+        sid,
+        command: command.to_string(),
+    })
+}
+
+pub(crate) fn reap_processes_matching_marker(marker: &str) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let live = unix_processes_matching_marker(marker)?;
+        if live.is_empty() {
+            return Ok(());
+        }
+        let signal = if Instant::now() + Duration::from_millis(400) >= deadline {
+            libc::SIGKILL
+        } else {
+            libc::SIGTERM
+        };
+        let mut pgids = std::collections::BTreeSet::new();
+        for child in &live {
+            pgids.insert(child.pgid);
+            let _ = unsafe { libc::kill(child.pid as libc::pid_t, signal) };
+        }
+        for pgid in pgids {
+            if pgid > 1 {
+                let _ = unsafe { libc::killpg(pgid, signal) };
+            }
+        }
+        if Instant::now() >= deadline {
+            let still = unix_processes_matching_marker(marker)?;
+            if still.is_empty() {
+                return Ok(());
+            }
+            return Err(format!(
+                "leftover marked Unix-session processes; marker={marker} rows={still:?}"
+            ));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+pub(crate) fn assert_cli_fixture_absent(
+    data_dir: &Path,
+    hub_pid: u32,
+    socket_path: &Path,
+    marker: &str,
+    pty_children: &[PtyChildIdentity],
+    session_ids: &[&str],
+) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let hub_alive = process_is_alive_u32(hub_pid).unwrap_or(true);
@@ -536,12 +738,28 @@ pub(crate) fn assert_cli_fixture_absent(data_dir: &Path, hub_pid: u32, socket_pa
         let group_live = process_group_probe(hub_pid as libc::pid_t).unwrap_or(true);
         let group_rows = process_group_census(hub_pid as libc::pid_t).unwrap_or_default();
         let socket_live = socket_path.exists();
+        let marked = unix_processes_matching_marker(marker).expect("all-session marker census");
+        let live_pty_pids: Vec<u32> = pty_children
+            .iter()
+            .filter(|child| process_is_alive_u32(child.pid).unwrap_or(true))
+            .map(|child| child.pid)
+            .collect();
+        let live_pty_groups: Vec<libc::pid_t> = pty_children
+            .iter()
+            .filter(|child| process_group_probe(child.pgid).unwrap_or(true))
+            .map(|child| child.pgid)
+            .collect();
+        let listed_sessions = listed_running_sessions(socket_path, session_ids);
         if !hub_alive
             && hubs.is_empty()
             && workers.is_empty()
             && !group_live
             && group_rows.is_empty()
             && !socket_live
+            && marked.is_empty()
+            && live_pty_pids.is_empty()
+            && live_pty_groups.is_empty()
+            && listed_sessions.is_empty()
         {
             return;
         }
@@ -549,13 +767,33 @@ pub(crate) fn assert_cli_fixture_absent(data_dir: &Path, hub_pid: u32, socket_pa
             panic!(
                 "owned CLI fixture survivors remain data_dir={} hub_pid={hub_pid} \
                  hub_alive={hub_alive} hubs={hubs:?} workers={:?} group_live={group_live} \
-                 group_rows={group_rows:?} socket_live={socket_live} socket={}",
+                 group_rows={group_rows:?} socket_live={socket_live} socket={} marker={marker} \
+                 marked={marked:?} live_pty_pids={live_pty_pids:?} live_pty_groups={live_pty_groups:?} \
+                 listed_sessions={listed_sessions:?}",
                 data_dir.display(),
                 workers.iter().map(|worker| worker.pid).collect::<Vec<_>>(),
                 socket_path.display()
             );
         }
         thread::sleep(Duration::from_millis(40));
+    }
+}
+
+fn listed_running_sessions(socket_path: &Path, session_ids: &[&str]) -> Vec<String> {
+    if !socket_path.exists() || session_ids.is_empty() {
+        return Vec::new();
+    }
+    let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
+    match botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::ListSessions) {
+        Ok(response) => response
+            .sessions
+            .into_iter()
+            .filter(|session| {
+                session_ids.contains(&session.session_id.as_str()) && session.lifecycle == "running"
+            })
+            .map(|session| session.session_id)
+            .collect(),
+        Err(_) => Vec::new(),
     }
 }
 
