@@ -462,6 +462,54 @@ pub(crate) fn capture_new_session_workers_for_data_dir(
     }
 }
 
+/// Session workers that still name this data directory after the hub child exits.
+pub(crate) fn live_session_workers_for_data_dir(
+    data_dir: &Path,
+) -> Result<Vec<SessionWorkerProcessIdentity>, String> {
+    Ok(session_worker_process_identities()?
+        .into_iter()
+        .filter(|worker| {
+            worker_executable_from_this_worktree(worker)
+                && worker_belongs_to_data_dir(worker, data_dir)
+        })
+        .collect())
+}
+
+/// Hub process shutdown keeps durable workers. Tests that SIGKILL a victim
+/// must reap leftovers for that data directory before the next IsolatedHub.
+pub(crate) fn reap_session_workers_for_data_dir(data_dir: &Path) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let live = live_session_workers_for_data_dir(data_dir)?;
+        if live.is_empty() {
+            return Ok(());
+        }
+        let signal = if Instant::now() + Duration::from_millis(400) >= deadline {
+            libc::SIGKILL
+        } else {
+            libc::SIGTERM
+        };
+        for worker in &live {
+            let _ = unsafe { libc::kill(worker.pid as libc::pid_t, signal) };
+            for pid in &worker.shell_descendant_pids {
+                let _ = unsafe { libc::kill(*pid as libc::pid_t, signal) };
+            }
+        }
+        if Instant::now() >= deadline {
+            let still = live_session_workers_for_data_dir(data_dir)?;
+            if still.is_empty() {
+                return Ok(());
+            }
+            return Err(format!(
+                "leftover session workers after daemon shutdown; data_dir={} pids={:?}",
+                data_dir.display(),
+                still.iter().map(|worker| worker.pid).collect::<Vec<_>>()
+            ));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 pub(crate) fn process_group_probe(pgid: libc::pid_t) -> Result<bool, String> {
     if unsafe { libc::killpg(pgid, 0) } == 0 {
         return Ok(true);

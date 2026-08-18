@@ -57,10 +57,12 @@ Independent routing: `project_pipelines_current_context` and `list_spawn_targets
 
 Feature behavior:
 
-- `tests/hub_daemon_lifecycle/webrtc_proofs.rs` — observed-exit wait (10 s of 50 ms `ListSessions` polls), sharpened `SessionCleanup{already_exited}` assert with full error-body diagnosis, Absent-leg `unknown_session` probe, rewritten oracle comment.
-- `tests/hub_daemon_lifecycle/sessions.rs` — live `external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable`.
+- `tests/hub_daemon_lifecycle/webrtc_proofs.rs` — observed-exit wait (10 s of 50 ms `ListSessions` polls plus `ReadScreen`), sharpened `SessionCleanup{already_exited}` assert with full error-body diagnosis, Absent-leg `unknown_session` probe, leftover-worker reap after hub shutdown.
+- `tests/hub_daemon_lifecycle/sessions.rs` — live `external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable`; drop the unix connection and reap leftover workers after daemon shutdown.
+- `tests/hub_daemon_lifecycle/process.rs` — `live_session_workers_for_data_dir` and `reap_session_workers_for_data_dir`.
 - `tests/hub_daemon_lifecycle/cli.rs` — `start_cli_daemon_with_runtime_drain_failure`.
 - `src/runtime.rs` — env-gated `with_test_fail_runtime_drain_for` / message plumbing in `core_daemon_config`. Inert unless the env var is set.
+- `crates/botster-hub-test-support/src/isolated_hub.rs` — strip inherited drain-inject and egress-capacity env so IsolatedHub cannot inherit sibling-test injection.
 
 Handoff:
 
@@ -71,7 +73,7 @@ Merge/rebase cleanup: none.
 
 ## Ownership boundaries preserved
 
-Hub owns the daemon control plane, `ShutdownSession` classification, and these lifecycle tests. Default-configuration production classify, recover, miss, and budget paths are unchanged. Core, hub-client, Web, TUI, hub-test-support, packages, pins, and lockfiles were not edited.
+Hub owns the daemon control plane, `ShutdownSession` classification, and these lifecycle tests. Default-configuration production classify, recover, miss, and budget paths are unchanged. Core, hub-client, Web, TUI, packages, pins, and lockfiles were not edited. `botster-hub-test-support` gained IsolatedHub env isolation only.
 
 ## Cross-repo routing
 
@@ -105,6 +107,14 @@ Review submitted `changes_required`. This visit keeps the production Core-error 
 Review submitted `changes_required` again. `ReadScreen` is a direct host read and does not prove the Attach adapter.
 
 1. `finding_1786986483_906414` (high, product): after the victim `OperatorError`, send a unique sibling marker and assert a terminal envelope for the sibling session and subscription through `connection.take_skipped_terminal`. Drain pre-failure frames first. Keep `ReadScreen` as session-health only. Add a `Detach` ablation that drops occupancy while `ReadScreen` still shows the post-failure marker.
+
+## Verify return (`review_1786989262_776285`)
+
+Verify submitted `changes_required` after Review approved `a24ac2e`. Independent repetition of the two ticket tests failed 2 of 28 pair-runs. Round 23 panicked at `webrtc_proofs.rs:429` with `last=Some("running")` after the 10 s bound. The finite producer had exited. The peer was closed. The machine was otherwise idle.
+
+Scope item 7 routing: Hub test isolation, not a Core shutdown-budget defect, and not a classify defect on a clean hub. Isolated exact-bytes passed 30/30. Sibling then exact-bytes in a new process passed 8/8. Same-process pair-runs after isolation reap: 27/30. Pair 21 is the original class (`last=Some("running")`, producer worker already dead). Pairs 24 and 28 failed on a worker-census capture that required a live shell descendant; that capture is removed. Pair 28 also failed sibling Attach with `attach failed before adapter bind` after 27 prior live daemons. Hub process shutdown keeps durable workers. The sibling fixture now drops the unix connection, shuts the daemon, and reaps leftover workers for that data directory. IsolatedHub strips inherited drain-inject env. The exact-bytes wait still requires `ListSessions == "exited"` inside 10 s, then `SessionCleanup{already_exited}`. Production `ReadScreen` exact-observe was tried and reverted. No Core dependency ticket. No unfiltered lifecycle suite was started; the orchestrator reserved that slot.
+
+Deviation: `crates/botster-hub-test-support/src/isolated_hub.rs` now removes `BOTSTER_HUB_TEST_FAIL_RUNTIME_DRAIN_*` and `BOTSTER_HUB_TEST_WORKER_EGRESS_CAPACITY` before extra env. The plan listed hub-test-support as non-scope. The edit is isolation only. Extra env can still set those variables.
 
 ## Projection-source verification
 
