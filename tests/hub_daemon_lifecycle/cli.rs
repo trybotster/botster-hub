@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::ops::{Deref, DerefMut};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -51,20 +52,23 @@ use crate::support::{
 
 use super::*;
 
-pub(crate) fn start_cli_daemon(data_dir: &Path) -> Child {
+pub(crate) fn start_cli_daemon(data_dir: &Path) -> PanicSafeCliDaemon {
     start_cli_daemon_with_worker_egress_capacity(data_dir, None)
 }
 
 pub(crate) fn start_cli_daemon_with_worker_egress_capacity(
     data_dir: &Path,
     egress_capacity: Option<usize>,
-) -> Child {
+) -> PanicSafeCliDaemon {
+    check_harness_taint();
     ensure_session_worker_binary();
     let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
     command
         .arg("start")
         .arg("--data-dir")
         .arg(data_dir)
+        .arg("--session-worker-bin")
+        .arg(session_worker_binary_path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(capacity) = egress_capacity {
@@ -74,23 +78,26 @@ pub(crate) fn start_cli_daemon_with_worker_egress_capacity(
         );
     }
     configure_test_process_group(&mut command);
-    let mut child = command.spawn().expect("spawn botster-hub start");
-
-    wait_for_status(data_dir, &mut child);
-    child
+    let child = command.spawn().expect("spawn botster-hub start");
+    let mut daemon = PanicSafeCliDaemon::from_child(data_dir, child, "lifecycle daemon");
+    wait_for_status(data_dir, daemon.child_mut());
+    daemon
 }
 
 pub(crate) fn start_cli_daemon_with_runtime_drain_failure(
     data_dir: &Path,
     session_id: &str,
     egress_capacity: Option<usize>,
-) -> Child {
+) -> PanicSafeCliDaemon {
+    check_harness_taint();
     ensure_session_worker_binary();
     let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
     command
         .arg("start")
         .arg("--data-dir")
         .arg(data_dir)
+        .arg("--session-worker-bin")
+        .arg(session_worker_binary_path())
         .env("BOTSTER_HUB_TEST_FAIL_RUNTIME_DRAIN_FOR", session_id)
         .env(
             "BOTSTER_HUB_TEST_FAIL_RUNTIME_DRAIN_MESSAGE",
@@ -105,45 +112,58 @@ pub(crate) fn start_cli_daemon_with_runtime_drain_failure(
         );
     }
     configure_test_process_group(&mut command);
-    let mut child = command
+    let child = command
         .spawn()
         .expect("spawn botster-hub start with runtime drain failure");
-    wait_for_status(data_dir, &mut child);
-    child
+    let mut daemon =
+        PanicSafeCliDaemon::from_child(data_dir, child, "runtime-drain-failure daemon");
+    wait_for_status(data_dir, daemon.child_mut());
+    daemon
 }
 
-pub(crate) fn start_cli_daemon_with_snapshot_history_failure(data_dir: &Path) -> Child {
+pub(crate) fn start_cli_daemon_with_snapshot_history_failure(
+    data_dir: &Path,
+) -> PanicSafeCliDaemon {
+    check_harness_taint();
     ensure_session_worker_binary();
     let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
     command
         .arg("start")
         .arg("--data-dir")
         .arg(data_dir)
+        .arg("--session-worker-bin")
+        .arg(session_worker_binary_path())
         .env("BOTSTER_HUB_TEST_FAIL_SNAPSHOT_HISTORY_AFTER_READY", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     configure_test_process_group(&mut command);
-    let mut child = command
+    let child = command
         .spawn()
         .expect("spawn botster-hub start with snapshot history failure");
-    wait_for_status(data_dir, &mut child);
-    child
+    let mut daemon =
+        PanicSafeCliDaemon::from_child(data_dir, child, "snapshot-history-failure daemon");
+    wait_for_status(data_dir, daemon.child_mut());
+    daemon
 }
 
-pub(crate) fn start_cli_daemon_with_home(data_dir: &Path, home: &Path) -> Child {
+pub(crate) fn start_cli_daemon_with_home(data_dir: &Path, home: &Path) -> PanicSafeCliDaemon {
+    check_harness_taint();
     ensure_session_worker_binary();
     let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
     command
         .arg("start")
         .arg("--data-dir")
         .arg(data_dir)
+        .arg("--session-worker-bin")
+        .arg(session_worker_binary_path())
         .env("HOME", home)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     configure_test_process_group(&mut command);
-    let mut child = command.spawn().expect("spawn botster-hub start");
-    wait_for_status(data_dir, &mut child);
-    child
+    let child = command.spawn().expect("spawn botster-hub start");
+    let mut daemon = PanicSafeCliDaemon::from_child(data_dir, child, "home-scoped daemon");
+    wait_for_status(data_dir, daemon.child_mut());
+    daemon
 }
 
 /// A schema-2 managed installation receipt for real-daemon fixtures.
@@ -294,7 +314,8 @@ pub(crate) fn spawn_timeout_release_metadata_fixture()
     )
 }
 
-pub(crate) fn start_owned_incompatible_local_runtime_daemon(data_dir: &Path) -> Child {
+pub(crate) fn start_owned_incompatible_local_runtime_daemon(data_dir: &Path) -> PanicSafeCliDaemon {
+    check_harness_taint();
     ensure_session_worker_binary();
     fs::create_dir_all(data_dir).expect("create data dir");
     let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
@@ -308,12 +329,14 @@ pub(crate) fn start_owned_incompatible_local_runtime_daemon(data_dir: &Path) -> 
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     configure_test_process_group(&mut command);
-    let mut child = command
+    let child = command
         .spawn()
         .expect("spawn incompatible botster-hub start");
-    wait_for_incompatible_status(data_dir, &mut child);
-    write_local_runtime_daemon_metadata(data_dir, child.id());
-    child
+    let mut daemon =
+        PanicSafeCliDaemon::from_child(data_dir, child, "incompatible local-runtime daemon");
+    wait_for_incompatible_status(data_dir, daemon.child_mut());
+    write_local_runtime_daemon_metadata(data_dir, daemon.id());
+    daemon
 }
 
 pub(crate) fn stable_path_string(path: &Path) -> String {
@@ -356,9 +379,8 @@ pub(crate) fn wait_for_status_with_budget(
     })
 }
 
-pub(crate) fn shutdown_cli_daemon(data_dir: &Path, child: Child) -> Output {
-    let shutdown = request_cli_daemon_shutdown(data_dir).expect("run botster-hub shutdown");
-    wait_for_cli_daemon_shutdown(&shutdown, child)
+pub(crate) fn shutdown_cli_daemon(data_dir: &Path, daemon: PanicSafeCliDaemon) -> Output {
+    daemon.shutdown_at(data_dir)
 }
 
 pub(crate) fn request_cli_daemon_shutdown(data_dir: &Path) -> io::Result<Output> {
@@ -369,47 +391,89 @@ pub(crate) fn request_cli_daemon_shutdown(data_dir: &Path) -> io::Result<Output>
         .output()
 }
 
-fn hard_stop_cli_daemon_group(child: &mut Child) {
-    let pid = child.id();
-    if pid > 1 && pid != std::process::id() {
-        let _ = unsafe { libc::killpg(pid as libc::pid_t, libc::SIGTERM) };
-        for _ in 0..25 {
-            if child.try_wait().ok().flatten().is_some() {
-                return;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-        let _ = unsafe { libc::killpg(pid as libc::pid_t, libc::SIGKILL) };
-    }
-    if child.try_wait().ok().flatten().is_none() {
-        let _ = child.kill();
-    }
-}
-
 pub(crate) struct PanicSafeCliDaemon {
     pub(crate) data_dir: PathBuf,
     pub(crate) child: Option<Child>,
     pub(crate) panic_context: &'static str,
     pub(crate) inspect_local_webrtc_sender: bool,
+    pub(crate) mode: GuardCleanupMode,
+    pub(crate) test_hooks: GuardTestHooks,
+    pub(crate) shutdown_records: Vec<SessionShutdownRecord>,
+    pub(crate) owned_sessions: OwnedSessionProcesses,
 }
 
 impl PanicSafeCliDaemon {
-    pub(crate) fn start(data_dir: &Path, panic_context: &'static str) -> Self {
+    pub(crate) fn from_child(data_dir: &Path, child: Child, panic_context: &'static str) -> Self {
         Self {
             data_dir: data_dir.to_path_buf(),
-            child: Some(start_cli_daemon(data_dir)),
+            child: Some(child),
             panic_context,
             inspect_local_webrtc_sender: false,
+            mode: GuardCleanupMode::Full,
+            test_hooks: GuardTestHooks::default(),
+            shutdown_records: Vec::new(),
+            owned_sessions: OwnedSessionProcesses::default(),
         }
     }
 
+    pub(crate) fn start(data_dir: &Path, panic_context: &'static str) -> Self {
+        let mut daemon = start_cli_daemon(data_dir);
+        daemon.panic_context = panic_context;
+        daemon
+    }
+
     pub(crate) fn start_with_local_webrtc_diagnostics(data_dir: &Path) -> Self {
-        Self {
-            data_dir: data_dir.to_path_buf(),
-            child: Some(start_cli_daemon(data_dir)),
-            panic_context: "local WebRTC target sender evidence",
-            inspect_local_webrtc_sender: true,
+        let mut daemon = start_cli_daemon(data_dir);
+        daemon.panic_context = "local WebRTC target sender evidence";
+        daemon.inspect_local_webrtc_sender = true;
+        daemon
+    }
+
+    pub(crate) fn child_mut(&mut self) -> &mut Child {
+        self.child.as_mut().expect("lifecycle daemon child")
+    }
+
+    pub(crate) fn transfer_sessions(mut self) -> Self {
+        self.mode = GuardCleanupMode::TransferSessions;
+        self
+    }
+
+    pub(crate) fn disarm(mut self) -> Child {
+        self.mode = GuardCleanupMode::Disarmed;
+        self.child.take().expect("lifecycle daemon child")
+    }
+
+    pub(crate) fn wait_with_output(mut self) -> io::Result<Output> {
+        self.mode = GuardCleanupMode::Disarmed;
+        self.child
+            .take()
+            .expect("lifecycle daemon child")
+            .wait_with_output()
+    }
+
+    pub(crate) fn shutdown(self) {
+        let data_dir = self.data_dir.clone();
+        let _ = self.shutdown_at(&data_dir);
+    }
+
+    pub(crate) fn shutdown_at(mut self, data_dir: &Path) -> Output {
+        let transfer = matches!(self.mode, GuardCleanupMode::TransferSessions);
+        let _ = self.cleanup_owned_resources(CleanupTrigger::Explicit);
+        let child = self.child.take().expect("lifecycle daemon child");
+        let shutdown = request_cli_daemon_shutdown(data_dir).unwrap_or_else(|error| {
+            panic!("run botster-hub shutdown: {error}");
+        });
+        let output = wait_for_cli_daemon_shutdown(&shutdown, child);
+        let proof = if transfer {
+            prove_hub_and_socket_absent(data_dir, None)
+        } else {
+            prove_owned_children_absent(data_dir, None, &self.owned_sessions)
+        };
+        if let Err(error) = proof {
+            record_harness_taint(format!("{}: {error}", self.panic_context));
+            panic!("{error}");
         }
+        output
     }
 
     pub(crate) fn start_with_runtime_drain_failure(
@@ -418,94 +482,202 @@ impl PanicSafeCliDaemon {
         egress_capacity: Option<usize>,
         panic_context: &'static str,
     ) -> Self {
-        Self {
-            data_dir: data_dir.to_path_buf(),
-            child: Some(start_cli_daemon_with_runtime_drain_failure(
-                data_dir,
-                session_id,
-                egress_capacity,
-            )),
-            panic_context,
-            inspect_local_webrtc_sender: false,
-        }
+        let mut daemon =
+            start_cli_daemon_with_runtime_drain_failure(data_dir, session_id, egress_capacity);
+        daemon.panic_context = panic_context;
+        daemon
     }
 
-    pub(crate) fn shutdown(mut self) {
-        let child = self.child.take().expect("panic-safe daemon child");
-        shutdown_cli_daemon(&self.data_dir, child);
-    }
-
-    pub(crate) fn cleanup_owned_sessions_after_panic(&self) {
-        let config = explicit_config(&self.data_dir);
-        let sessions = match botster_hub::daemon_transport_request(
-            &config,
-            botster_hub::DaemonRequest::ListSessions,
-        ) {
-            Ok(response) if response.kind == botster_hub::DaemonResponseKind::Sessions => response,
-            Ok(response) => {
-                eprintln!(
-                    "{}: panic session cleanup received unexpected ListSessions response: \
-                     {response:?}",
-                    self.panic_context
-                );
-                return;
+    fn retain_identity_capture(
+        &mut self,
+        trigger: CleanupTrigger,
+        capture: Result<IdentityCapture, String>,
+    ) {
+        match capture {
+            Ok(capture) => {
+                self.owned_sessions.extend(capture.owned);
+                for error in capture.errors {
+                    record_harness_taint(format!(
+                        "{}: identity capture incomplete: {error}",
+                        self.panic_context
+                    ));
+                    eprintln!(
+                        "{}: identity capture incomplete ({trigger:?}): {error}",
+                        self.panic_context
+                    );
+                }
             }
             Err(error) => {
+                record_harness_taint(format!(
+                    "{}: identity capture failed: {error}",
+                    self.panic_context
+                ));
                 eprintln!(
-                    "{}: panic session cleanup could not list owned sessions: {error}",
+                    "{}: identity capture failed ({trigger:?}): {error}",
                     self.panic_context
                 );
-                return;
             }
-        };
+        }
+    }
 
-        let mut cleanup_responses = Vec::new();
-        for session in sessions
-            .sessions
-            .iter()
-            .filter(|session| session.lifecycle != "exited")
-        {
-            let cleanup = botster_hub::daemon_transport_request(
-                &config,
-                botster_hub::DaemonRequest::ShutdownSession {
-                    session_id: session.session_id.clone(),
-                },
-            );
-            cleanup_responses.push(format!(
-                "session_id={} lifecycle={} response={cleanup:?}",
-                session.session_id, session.lifecycle
-            ));
+    fn retain_worker_reap(
+        &mut self,
+        trigger: CleanupTrigger,
+        label: &str,
+        outcome: Result<WorkerReapOutcome, String>,
+    ) {
+        match outcome {
+            Ok(outcome) => {
+                for pid in outcome.reaped {
+                    self.owned_sessions.push_pid(pid);
+                }
+                for pid in outcome.retained {
+                    self.owned_sessions.push_pid(pid);
+                }
+                for error in outcome.errors {
+                    record_harness_taint(format!(
+                        "{}: {label} incomplete: {error}",
+                        self.panic_context
+                    ));
+                    eprintln!(
+                        "{}: {label} incomplete ({trigger:?}): {error}",
+                        self.panic_context
+                    );
+                }
+            }
+            Err(error) => {
+                record_harness_taint(format!("{}: {label} failed: {error}", self.panic_context));
+                eprintln!(
+                    "{}: {label} failed ({trigger:?}): {error}",
+                    self.panic_context
+                );
+            }
+        }
+    }
+
+    pub(crate) fn cleanup_owned_resources(
+        &mut self,
+        trigger: CleanupTrigger,
+    ) -> Result<Vec<SessionShutdownRecord>, String> {
+        if matches!(self.mode, GuardCleanupMode::Disarmed) {
+            return Ok(Vec::new());
+        }
+        let skip_sessions = matches!(self.mode, GuardCleanupMode::TransferSessions);
+        let socket_present = daemon_socket_path(&self.data_dir).exists();
+
+        if !skip_sessions {
+            let capture = if self.test_hooks.force_identity_capture_failure {
+                Err("injected registry identity capture failure".to_string())
+            } else {
+                collect_owned_session_processes(&self.data_dir)
+            };
+            self.retain_identity_capture(trigger, capture);
+            if socket_present {
+                match shutdown_owned_sessions(&self.data_dir) {
+                    Ok(records) => {
+                        self.shutdown_records = records;
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "{}: production session cleanup failed ({trigger:?}): {error}",
+                            self.panic_context
+                        );
+                        self.retain_worker_reap(
+                            trigger,
+                            "registry-backed backstop",
+                            reap_registry_backed_workers(&self.data_dir),
+                        );
+                    }
+                }
+            } else {
+                self.retain_worker_reap(
+                    trigger,
+                    "dead-daemon backstop",
+                    reap_registry_backed_workers(&self.data_dir),
+                );
+            }
         }
 
-        let verification = botster_hub::daemon_transport_request(
-            &config,
-            botster_hub::DaemonRequest::ListSessions,
-        );
-        eprintln!(
-            "{}: panic session cleanup initial={:?} shutdowns={cleanup_responses:?} \
-             verification={verification:?}",
-            self.panic_context, sessions.sessions
-        );
+        if self.test_hooks.force_absence_unproven {
+            record_harness_taint(format!(
+                "{}: injected prove-absence failure",
+                self.panic_context
+            ));
+            return Err("injected prove-absence failure".to_string());
+        }
+        if matches!(trigger, CleanupTrigger::Explicit) {
+            return Ok(self.shutdown_records.clone());
+        }
+
+        let hub_pid = self.child.as_ref().map(Child::id);
+        let _ = request_cli_daemon_shutdown(&self.data_dir);
+        if let Some(child) = self.child.as_mut()
+            && child.try_wait().ok().flatten().is_none()
+            && let Err(error) = try_terminate_and_reap_child(child)
+        {
+            record_harness_taint(format!(
+                "{}: Hub child absence unproven: {error}",
+                self.panic_context
+            ));
+            if !std::thread::panicking() {
+                return Err(error);
+            }
+            eprintln!("{}: {error}", self.panic_context);
+        }
+
+        let proof = if self.test_hooks.force_absence_unproven {
+            Err("injected prove-absence failure".to_string())
+        } else {
+            prove_owned_children_absent(&self.data_dir, hub_pid, &self.owned_sessions)
+        };
+        if let Err(error) = proof {
+            record_harness_taint(format!("{}: {error}", self.panic_context));
+            if !matches!(trigger, CleanupTrigger::Panic) && !std::thread::panicking() {
+                return Err(error);
+            }
+            eprintln!("{}: {error}", self.panic_context);
+        }
+        Ok(self.shutdown_records.clone())
+    }
+}
+
+impl Deref for PanicSafeCliDaemon {
+    type Target = Child;
+
+    fn deref(&self) -> &Self::Target {
+        self.child.as_ref().expect("lifecycle daemon child")
+    }
+}
+
+impl DerefMut for PanicSafeCliDaemon {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.child.as_mut().expect("lifecycle daemon child")
     }
 }
 
 impl Drop for PanicSafeCliDaemon {
     fn drop(&mut self) {
-        let Some(mut child) = self.child.take() else {
-            return;
-        };
-
-        if !std::thread::panicking() {
-            shutdown_cli_daemon(&self.data_dir, child);
+        if self.child.is_none() || matches!(self.mode, GuardCleanupMode::Disarmed) {
             return;
         }
-
-        if std::panic::catch_unwind(|| self.cleanup_owned_sessions_after_panic()).is_err() {
+        let trigger = if std::thread::panicking() {
+            CleanupTrigger::Panic
+        } else {
+            CleanupTrigger::Drop
+        };
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = self.cleanup_owned_resources(trigger);
+        }))
+        .is_err()
+        {
             eprintln!(
-                "{}: panic session cleanup itself panicked; continuing daemon reap",
+                "{}: cleanup itself panicked; continuing Hub reap",
                 self.panic_context
             );
         }
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
         let shutdown = request_cli_daemon_shutdown(&self.data_dir);
         let shutdown_failed = shutdown.as_ref().map_or(true, |output| {
             !output.status.success()
@@ -513,34 +685,19 @@ impl Drop for PanicSafeCliDaemon {
                     != "botster-hub shutdown error: client disconnected"
         });
         if shutdown_failed && child.try_wait().ok().flatten().is_none() {
-            hard_stop_cli_daemon_group(&mut child);
-        }
-        if child.try_wait().ok().flatten().is_none() {
-            hard_stop_cli_daemon_group(&mut child);
-        }
-        let _ = reap_session_workers_for_data_dir(&self.data_dir);
-        let _ = reap_processes_matching_marker(&self.data_dir.display().to_string());
-
-        match child.wait_with_output() {
-            Ok(daemon) => {
-                if self.inspect_local_webrtc_sender
-                    && let Some(failure) = local_webrtc_sender_failure(&daemon.stderr)
-                {
-                    eprintln!("{}: {failure}", self.panic_context);
-                    return;
-                }
-                eprintln!(
-                    "{}: unavailable; daemon_status={}; daemon_stderr_tail={:?}",
-                    self.panic_context,
-                    daemon.status,
-                    local_webrtc_bounded_stderr_tail(&daemon.stderr, &self.data_dir)
-                );
+            if let Err(error) = try_terminate_and_reap_child(&mut child) {
+                record_harness_taint(format!(
+                    "{}: drop-time Hub reap failed: {error}",
+                    self.panic_context
+                ));
+                eprintln!("{}: {error}", self.panic_context);
             }
-            Err(error) => eprintln!(
+        } else if let Err(error) = child.wait() {
+            eprintln!(
                 "{}: unavailable; daemon_status=unavailable; daemon_wait_error_kind={:?}",
                 self.panic_context,
                 error.kind()
-            ),
+            );
         }
     }
 }
