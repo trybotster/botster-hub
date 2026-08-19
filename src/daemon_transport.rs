@@ -3493,11 +3493,6 @@ fn handle_runtime_control_request(
                 | Ok(ShutdownSessionClassification::Stopping)
                 | Err(_) => {}
             }
-            // Suppress before Core teardown. CloseEvents can observe a closed
-            // adapter while the registry row is still Running and would emit
-            // TerminalSubscriptionClosed.
-            suppress_unix_session_close_events(pending_runtime, &session_id);
-            suppress_webrtc_session_close_events(pending_runtime, &session_id);
             let shutdown_session_id = session_id.clone();
             let response = match api.handle_request(
                 runtime,
@@ -3517,9 +3512,13 @@ fn handle_runtime_control_request(
                         error,
                         logical_clock,
                     )?;
+                    suppress_unix_session_close_events(pending_runtime, &session_id);
+                    suppress_webrtc_session_close_events(pending_runtime, &session_id);
                     return Ok(response);
                 }
             };
+            suppress_unix_session_close_events(pending_runtime, &session_id);
+            suppress_webrtc_session_close_events(pending_runtime, &session_id);
             events_response(response.body)
         }
         DaemonRequest::Drain {
