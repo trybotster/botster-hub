@@ -66,7 +66,11 @@ const CONSUMER_REFRESH_MAX: usize = 8;
 pub const PUMP_MAX_ADMISSIONS_VISITED: usize = 8;
 /// CloseEvents classifies this many closed-route candidates per Pump slice.
 pub const PUMP_MAX_CANDIDATE_CLASSIFICATIONS: usize = 8;
-/// InventoryReconcile validates this many bound routes per Pump slice.
+/// CloseEvents visits this many mux route entries per Pump slice, including
+/// open and already-reported rows.
+pub const PUMP_MAX_ROUTE_ENTRIES_VISITED: usize = 8;
+/// InventoryReconcile visits this many stream-map entries per Pump slice,
+/// including unbound rows.
 pub const PUMP_MAX_ROUTES_VALIDATED: usize = 8;
 
 fn queued_queue_bytes(frames: &VecDeque<serde_json::Value>) -> usize {
@@ -187,13 +191,22 @@ impl PumpPhase {
 /// Resume cursor over Unix then WebRTC admission maps.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PumpAdmissionCursor {
-    Unix { after: Option<String> },
-    Webrtc { after: Option<String> },
+    Unix {
+        after: Option<String>,
+        after_route: Option<(String, String, u64)>,
+    },
+    Webrtc {
+        after: Option<String>,
+        after_route: Option<(String, String, u64)>,
+    },
 }
 
 impl Default for PumpAdmissionCursor {
     fn default() -> Self {
-        Self::Unix { after: None }
+        Self::Unix {
+            after: None,
+            after_route: None,
+        }
     }
 }
 
@@ -221,6 +234,11 @@ impl PumpScheduler {
         let phase = self.next;
         self.next = phase.next();
         phase
+    }
+
+    /// Run CloseEvents next so a just-closed adapter is classified before Observe.
+    pub fn prefer_close_events(&mut self) {
+        self.next = PumpPhase::CloseEvents;
     }
 }
 
@@ -3157,6 +3175,7 @@ mod tests {
         assert_eq!(pump.take_phase(), PumpPhase::CloseEvents);
         pump.close_cursor = PumpAdmissionCursor::Unix {
             after: Some("client-a".into()),
+            after_route: Some(("s".into(), "sub".into(), 1)),
         };
         pump.reconcile_after = Some(("s".into(), "sub".into()));
         assert_eq!(pump.take_phase(), PumpPhase::InventoryReconcile);
@@ -3164,7 +3183,8 @@ mod tests {
         assert_eq!(
             pump.close_cursor,
             PumpAdmissionCursor::Unix {
-                after: Some("client-a".into())
+                after: Some("client-a".into()),
+                after_route: Some(("s".into(), "sub".into(), 1)),
             }
         );
         assert_eq!(pump.reconcile_after, Some(("s".into(), "sub".into())));

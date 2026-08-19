@@ -4,6 +4,7 @@
 //! Hub authorizes the route and records generation plus adapter-bound flags.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 
 use botster_core::{
     ClientId, SessionId, SubscriptionId, TerminalCapabilitySet, TerminalSubscriptionGeneration,
@@ -369,32 +370,34 @@ impl AttachStreamRegistry {
         }
     }
 
-    /// Validate at most `max_routes` bound streams after `after`, exclusive.
+    /// Visit at most `max_entries` stream-map rows after `after`, exclusive.
+    /// Unbound rows count toward the visit budget and advance the cursor.
     pub(crate) fn reconcile_inventory_slice(
         &mut self,
         mut lookup: impl FnMut(&str, &str) -> Option<TerminalSubscriptionGeneration>,
         after: Option<(String, String)>,
-        max_routes: usize,
+        max_entries: usize,
     ) -> InventoryReconcileProgress {
-        let keys: Vec<(String, String)> = self
-            .streams
-            .iter()
-            .filter(|(key, stream)| {
-                stream.adapter_bound && after.as_ref().is_none_or(|after_key| *key > after_key)
-            })
-            .map(|(key, _)| key.clone())
-            .take(max_routes.saturating_add(1))
-            .collect();
-        let more = keys.len() > max_routes;
-        let visit = if more {
-            keys[..max_routes].to_vec()
-        } else {
-            keys
+        let start = match after.as_ref() {
+            Some(after_key) => Bound::Excluded(after_key.clone()),
+            None => Bound::Unbounded,
         };
+        let mut visit = Vec::new();
+        let mut more = false;
+        for (key, stream) in self.streams.range((start, Bound::Unbounded)) {
+            if visit.len() >= max_entries {
+                more = true;
+                break;
+            }
+            visit.push((key.clone(), stream.adapter_bound));
+        }
         let mut last = after;
         let mut validated = 0;
-        for (session_id, subscription_id) in visit {
+        for ((session_id, subscription_id), adapter_bound) in visit {
             last = Some((session_id.clone(), subscription_id.clone()));
+            if !adapter_bound {
+                continue;
+            }
             validated += 1;
             let stream_generation = self
                 .streams
@@ -989,6 +992,54 @@ mod tests {
             registry.stream_owner_client_id("c", "sub").as_deref(),
             Some("client-a"),
             "a newer live generation must not close against a stale cursor expectation"
+        );
+    }
+
+    #[test]
+    fn reconcile_slice_bounds_unbound_and_pre_cursor_prefixes() {
+        let mut registry = AttachStreamRegistry::default();
+        for index in 0..10 {
+            registry.start_attach(owner(), format!("unbound-{index:02}"), "sub".into());
+        }
+        registry.start_attach(owner(), "z-bound".into(), "sub".into());
+        let (_, handle) = UnixTerminalAdapter::pair();
+        registry.mark_adapter_bound(
+            "z-bound",
+            "sub",
+            TerminalSubscriptionGeneration(1),
+            BoundAdapterHandle::Unix(handle),
+        );
+        let mut lookups = 0;
+        let first = registry.reconcile_inventory_slice(
+            |_, _| {
+                lookups += 1;
+                Some(TerminalSubscriptionGeneration(1))
+            },
+            None,
+            8,
+        );
+        assert_eq!(first.validated, 0);
+        assert_eq!(lookups, 0, "unbound prefix must not call membership lookup");
+        assert!(first.more);
+        assert_eq!(
+            first.after.as_ref().map(|(session, _)| session.as_str()),
+            Some("unbound-07")
+        );
+        let second = registry.reconcile_inventory_slice(
+            |session, _| {
+                lookups += 1;
+                assert_eq!(session, "z-bound");
+                Some(TerminalSubscriptionGeneration(1))
+            },
+            first.after,
+            8,
+        );
+        assert_eq!(second.validated, 1);
+        assert_eq!(lookups, 1);
+        assert!(!second.more);
+        assert_eq!(
+            registry.stream_owner_client_id("z-bound", "sub").as_deref(),
+            Some("client-a")
         );
     }
 
