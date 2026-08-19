@@ -2412,6 +2412,29 @@ pub(crate) fn handle_control_message(
                     .entry("explicit_detach".to_string())
                     .or_insert(0) += 1;
             }
+            if let DaemonRequest::ShutdownSession { session_id } = &request
+                && response
+                    .as_ref()
+                    .is_ok_and(|response| response.kind == DaemonResponseKind::OperatorError)
+            {
+                let host_closed = state
+                    .live_attach_routes
+                    .iter()
+                    .filter(|(bound_session, subscription_id)| {
+                        bound_session == session_id
+                            && !state
+                                .pending_runtime
+                                .is_adapter_bound(bound_session, subscription_id)
+                    })
+                    .count();
+                if host_closed > 0 {
+                    *state
+                        .lifecycle_counters
+                        .cleanup_by_reason
+                        .entry("shutdown_error_host_close".to_string())
+                        .or_insert(0) += host_closed as u64;
+                }
+            }
             if let Ok(response) = response.as_ref() {
                 let change = attached_subscription_change_for_response(&request, response);
                 let change = match change {
@@ -4738,6 +4761,11 @@ fn classify_shutdown_session(
     session_id: &str,
     now_seconds: u64,
 ) -> DaemonTransportResult<ShutdownSessionClassification> {
+    if std::env::var("BOTSTER_HUB_TEST_FORCE_SHUTDOWN_CLASSIFY_STOPPING_FOR")
+        .is_ok_and(|forced| forced == session_id)
+    {
+        return Ok(ShutdownSessionClassification::Stopping);
+    }
     match runtime.observe_session_lifecycle(&SessionId(session_id.to_string()), now_seconds) {
         Ok(SessionLifecycleLookup::Found(record)) => {
             Ok(classify_found_session_lifecycle(session_id, &record))
@@ -8205,6 +8233,13 @@ mod tests {
         let core = arm
             .find("HubClientRequest::Shutdown")
             .expect("Core Shutdown request");
+        let stopping = arm
+            .find("ShutdownSessionClassification::Stopping")
+            .expect("Stopping classification");
+        assert!(
+            stopping < unix_suppress,
+            "Stopping must stay on the suppress fall-through, not a pre-suppress return"
+        );
         assert!(
             unix_suppress < core && webrtc_suppress < core,
             "ShutdownSession must install exact-key suppression before the Core request"

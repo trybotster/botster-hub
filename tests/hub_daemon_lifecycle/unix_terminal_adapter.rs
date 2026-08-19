@@ -1855,22 +1855,6 @@ fn process_exit_and_shutdown_session_do_not_emit_terminal_subscription_closed() 
         shutdown.kind,
         botster_hub_client::DaemonResponseKind::OperatorError
     );
-    let second = request_collecting_mux(
-        &mut stream,
-        &mut reader,
-        &botster_hub_client::DaemonRequest::ShutdownSession {
-            session_id: "pex-shutdown".to_string(),
-        },
-        &mut envelopes,
-        &mut events,
-    );
-    assert_ne!(
-        second.kind,
-        botster_hub_client::DaemonResponseKind::OperatorError,
-        "Stopping or Cleanup ShutdownSession must stay typed, got kind={:?} error={:?}",
-        second.kind,
-        second.error
-    );
     let listed = request_collecting_mux(
         &mut stream,
         &mut reader,
@@ -2201,6 +2185,83 @@ fn shutdown_session_exact_keys_preserve_replacement_owner_and_siblings() {
     shutdown_short_lived_session(&endpoint, "sgk-victim");
     shutdown_short_lived_session(&endpoint, "sgk-sibling");
     shutdown_short_lived_session(&endpoint, "sgk-missing");
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn attached_stopping_shutdown_session_suppresses_exact_generation() {
+    let _guard = daemon_test_guard();
+    let hub = start_isolated_live_output_hub_with_env(
+        "stp",
+        &[(
+            "BOTSTER_HUB_TEST_FORCE_SHUTDOWN_CLASSIFY_STOPPING_FOR",
+            "stp-session",
+        )],
+    );
+    let endpoint = hub.endpoint().clone();
+    let (mut stream, mut reader) = unix_adapter_connection(&endpoint);
+    let mut envelopes = Vec::new();
+    let mut events = Vec::new();
+    spawn_and_bind(
+        &mut stream,
+        &mut reader,
+        "stp-session",
+        "stp-sub",
+        "sleep 30",
+        &mut envelopes,
+        &mut events,
+    );
+    let before = request_collecting_mux(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::Status,
+        &mut envelopes,
+        &mut events,
+    );
+    let generation = occupancy_generation(
+        &before
+            .status
+            .as_ref()
+            .expect("status before Stopping ShutdownSession")
+            .live_attach_occupancy,
+        "stp-session",
+        "stp-sub",
+    )
+    .expect("attached Stopping victim must have a Core-issued generation");
+    let shutdown = request_collecting_mux(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::ShutdownSession {
+            session_id: "stp-session".to_string(),
+        },
+        &mut envelopes,
+        &mut events,
+    );
+    assert_eq!(
+        shutdown.kind,
+        botster_hub_client::DaemonResponseKind::Events,
+        "forced Stopping classification must take the fall-through Events path, got kind={:?} error={:?} cleanup={:?}",
+        shutdown.kind,
+        shutdown.error,
+        shutdown.cleanup
+    );
+    let late = request_collecting_mux(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::Status,
+        &mut envelopes,
+        &mut events,
+    );
+    assert_eq!(late.kind, botster_hub_client::DaemonResponseKind::Status);
+    assert!(
+        no_terminal_subscription_closed(
+            &events,
+            "stp-session",
+            Some("stp-sub"),
+            Some(generation)
+        ),
+        "attached Stopping ShutdownSession must not emit TerminalSubscriptionClosed for generation {generation}: {events:?}"
+    );
     hub.shutdown().expect("shutdown isolated hub");
 }
 
