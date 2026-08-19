@@ -4,6 +4,8 @@
 //! [`TerminalFrame`] and does not inspect snapshot phases or snapshot bodies.
 //! `close` and `Drop` return without waiting on socket I/O or a writer lock.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
 
@@ -35,6 +37,7 @@ struct UnixTerminalAdapterInner {
     deferred: AtomicBool,
     slot: Mutex<Option<Vec<u8>>>,
     notify: Arc<Notify>,
+    close_work: Arc<AtomicBool>,
 }
 
 impl UnixTerminalAdapterInner {
@@ -46,6 +49,7 @@ impl UnixTerminalAdapterInner {
             deferred: AtomicBool::new(false),
             slot: Mutex::new(None),
             notify: Arc::new(Notify::new()),
+            close_work: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -66,6 +70,7 @@ impl UnixTerminalAdapterInner {
 
     fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
+        self.close_work.store(true, Ordering::SeqCst);
         match self.slot.try_lock() {
             Ok(mut slot) => {
                 *slot = None;
@@ -204,8 +209,16 @@ impl UnixTerminalAdapter {
     /// Create an adapter that wakes `notify` on write or close.
     #[must_use]
     pub(crate) fn pair_with_notify(notify: Arc<Notify>) -> (Self, UnixTerminalAdapterHandle) {
+        Self::pair_with_notify_and_close_work(notify, Arc::new(AtomicBool::new(false)))
+    }
+
+    fn pair_with_notify_and_close_work(
+        notify: Arc<Notify>,
+        close_work: Arc<AtomicBool>,
+    ) -> (Self, UnixTerminalAdapterHandle) {
         let mut inner = UnixTerminalAdapterInner::new();
         inner.notify = notify;
+        inner.close_work = close_work;
         let inner = Arc::new(inner);
         (
             Self {
@@ -269,10 +282,11 @@ impl std::fmt::Debug for UnixConnectionMux {
 struct UnixMuxInner {
     notify: Arc<Notify>,
     dying: AtomicBool,
-    routes: Mutex<Vec<UnixMuxRoute>>,
+    routes: Mutex<BTreeMap<(String, String, u64), UnixMuxRoute>>,
     pending_events: Mutex<Vec<DaemonEvent>>,
-    suppress_sessions: Mutex<Vec<String>>,
-    suppress_generations: Mutex<Vec<(String, String, u64)>>,
+    suppress_sessions: Mutex<BTreeSet<String>>,
+    suppress_generations: Mutex<BTreeSet<(String, String, u64)>>,
+    close_work: Mutex<Arc<AtomicBool>>,
 }
 
 struct UnixMuxRoute {
@@ -283,17 +297,31 @@ struct UnixMuxRoute {
     reported: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClosedEventSliceProgress {
+    pub classified: usize,
+    pub more: bool,
+    pub after_route: Option<(String, String, u64)>,
+}
+
 impl UnixConnectionMux {
     pub(crate) fn new() -> Self {
         Self {
             inner: Arc::new(UnixMuxInner {
                 notify: Arc::new(Notify::new()),
                 dying: AtomicBool::new(false),
-                routes: Mutex::new(Vec::new()),
+                routes: Mutex::new(BTreeMap::new()),
                 pending_events: Mutex::new(Vec::new()),
-                suppress_sessions: Mutex::new(Vec::new()),
-                suppress_generations: Mutex::new(Vec::new()),
+                suppress_sessions: Mutex::new(BTreeSet::new()),
+                suppress_generations: Mutex::new(BTreeSet::new()),
+                close_work: Mutex::new(Arc::new(AtomicBool::new(false))),
             }),
+        }
+    }
+
+    pub(crate) fn bind_close_work(&self, flag: Arc<AtomicBool>) {
+        if let Ok(mut slot) = self.inner.close_work.lock() {
+            *slot = flag;
         }
     }
 
@@ -302,7 +330,14 @@ impl UnixConnectionMux {
     }
 
     pub(crate) fn create_adapter(&self) -> (UnixTerminalAdapter, UnixTerminalAdapterHandle) {
-        UnixTerminalAdapter::pair_with_notify(self.notify_arc())
+        let close_work = self
+            .inner
+            .close_work
+            .lock()
+            .ok()
+            .map(|slot| Arc::clone(&*slot))
+            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+        UnixTerminalAdapter::pair_with_notify_and_close_work(self.notify_arc(), close_work)
     }
 
     pub(crate) fn register(
@@ -313,18 +348,17 @@ impl UnixConnectionMux {
         handle: UnixTerminalAdapterHandle,
     ) {
         if let Ok(mut routes) = self.inner.routes.lock() {
-            routes.retain(|route| {
-                !(route.session_id == session_id
-                    && route.subscription_id == subscription_id
-                    && route.generation == generation)
-            });
-            routes.push(UnixMuxRoute {
-                session_id,
-                subscription_id,
-                generation,
-                handle,
-                reported: false,
-            });
+            let key = (session_id.clone(), subscription_id.clone(), generation);
+            routes.insert(
+                key,
+                UnixMuxRoute {
+                    session_id,
+                    subscription_id,
+                    generation,
+                    handle,
+                    reported: false,
+                },
+            );
         }
         self.inner.notify.notify_waiters();
     }
@@ -332,7 +366,7 @@ impl UnixConnectionMux {
     pub(crate) fn close_all(&self) {
         self.inner.dying.store(true, Ordering::SeqCst);
         if let Ok(mut routes) = self.inner.routes.lock() {
-            for route in routes.drain(..) {
+            for (_, route) in std::mem::take(&mut *routes) {
                 route.handle.close_from_host();
             }
         }
@@ -345,10 +379,7 @@ impl UnixConnectionMux {
 
     pub(crate) fn suppress_session(&self, session_id: impl Into<String>) {
         if let Ok(mut sessions) = self.inner.suppress_sessions.lock() {
-            let session_id = session_id.into();
-            if !sessions.iter().any(|existing| existing == &session_id) {
-                sessions.push(session_id);
-            }
+            sessions.insert(session_id.into());
         }
     }
 
@@ -359,55 +390,110 @@ impl UnixConnectionMux {
         generation: u64,
     ) {
         if let Ok(mut generations) = self.inner.suppress_generations.lock() {
-            let key = (session_id.into(), subscription_id.into(), generation);
-            if !generations.iter().any(|existing| existing == &key) {
-                generations.push(key);
-            }
+            generations.insert((session_id.into(), subscription_id.into(), generation));
         }
     }
 
+    fn session_is_suppressed(&self, session_id: &str) -> bool {
+        self.inner
+            .suppress_sessions
+            .lock()
+            .is_ok_and(|sessions| sessions.contains(session_id))
+    }
+
+    fn generation_is_suppressed(
+        &self,
+        session_id: &str,
+        subscription_id: &str,
+        generation: u64,
+    ) -> bool {
+        self.inner
+            .suppress_generations
+            .lock()
+            .is_ok_and(|generations| {
+                generations.contains(&(
+                    session_id.to_string(),
+                    subscription_id.to_string(),
+                    generation,
+                ))
+            })
+    }
+
+    #[cfg(test)]
     pub(crate) fn queue_closed_subscription_events(
         &self,
         session_is_live: impl Fn(&str) -> bool,
     ) -> usize {
+        self.queue_closed_subscription_events_bounded(
+            |session_id| Some(session_is_live(session_id)),
+            usize::MAX,
+            None,
+            usize::MAX,
+        )
+        .classified
+    }
+
+    pub(crate) fn queue_closed_subscription_events_bounded(
+        &self,
+        mut classify: impl FnMut(&str) -> Option<bool>,
+        max_candidates: usize,
+        after_route: Option<&(String, String, u64)>,
+        max_entries_visited: usize,
+    ) -> ClosedEventSliceProgress {
         if self.is_dying() {
             if let Ok(mut routes) = self.inner.routes.lock() {
-                for route in routes.iter_mut() {
+                for route in routes.values_mut() {
                     route.reported = true;
                 }
             }
-            return 0;
+            return ClosedEventSliceProgress {
+                classified: 0,
+                more: false,
+                after_route: None,
+            };
         }
-        let suppressed_sessions = self
-            .inner
-            .suppress_sessions
-            .lock()
-            .map(|sessions| sessions.clone())
-            .unwrap_or_default();
-        let suppressed_generations = self
-            .inner
-            .suppress_generations
-            .lock()
-            .map(|generations| generations.clone())
-            .unwrap_or_default();
         let mut queued = Vec::new();
+        let mut classified = 0;
+        let mut visited = 0;
+        let mut more = false;
+        let mut last_visited = after_route.cloned();
         if let Ok(mut routes) = self.inner.routes.lock() {
-            for route in routes.iter_mut() {
+            let start = match after_route {
+                Some(after) => Bound::Excluded(after.clone()),
+                None => Bound::Unbounded,
+            };
+            for (key, route) in routes.range_mut((start, Bound::Unbounded)) {
+                if visited >= max_entries_visited {
+                    more = true;
+                    break;
+                }
+                if !route.reported && route.handle.is_closed() && classified >= max_candidates {
+                    more = true;
+                    break;
+                }
+                visited += 1;
+                last_visited = Some(key.clone());
                 if route.reported || !route.handle.is_closed() {
                     continue;
                 }
-                route.reported = true;
-                if suppressed_sessions
-                    .iter()
-                    .any(|session| session == &route.session_id)
-                    || suppressed_generations.iter().any(|key| {
-                        key.0 == route.session_id
-                            && key.1 == route.subscription_id
-                            && key.2 == route.generation
-                    })
-                    || !session_is_live(&route.session_id)
+                classified += 1;
+                if self.session_is_suppressed(&route.session_id)
+                    || self.generation_is_suppressed(
+                        &route.session_id,
+                        &route.subscription_id,
+                        route.generation,
+                    )
                 {
+                    route.reported = true;
                     continue;
+                }
+                match classify(&route.session_id) {
+                    None => continue,
+                    Some(false) => {
+                        route.reported = true;
+                        continue;
+                    }
+                    Some(true) => route.reported = true,
                 }
                 let reason = if route.handle.host_closed() {
                     TERMINAL_SUBSCRIPTION_CLOSED_HOST_ADAPTER
@@ -422,14 +508,17 @@ impl UnixConnectionMux {
                 });
             }
         }
-        let count = queued.len();
-        if count > 0 {
+        if !queued.is_empty() {
             if let Ok(mut pending) = self.inner.pending_events.lock() {
                 pending.extend(queued);
             }
             self.inner.notify.notify_waiters();
         }
-        count
+        ClosedEventSliceProgress {
+            classified,
+            more,
+            after_route: last_visited,
+        }
     }
 
     pub(crate) fn pop_pending_event(&self) -> Option<DaemonEvent> {
@@ -460,7 +549,7 @@ impl UnixConnectionMux {
             return false;
         };
         routes
-            .iter()
+            .values()
             .any(|route| route.handle.snapshot_active().is_some())
     }
 
@@ -478,7 +567,7 @@ impl UnixConnectionMux {
             return Vec::new();
         };
         routes
-            .iter()
+            .values()
             .filter_map(|route| {
                 if route.handle.is_flush_deferred() {
                     return None;
@@ -504,7 +593,7 @@ impl UnixConnectionMux {
         let Ok(routes) = self.inner.routes.lock() else {
             return;
         };
-        for route in routes.iter() {
+        for route in routes.values() {
             route.handle.clear_defer_flush();
         }
     }
@@ -657,6 +746,94 @@ mod tests {
         assert!(handle.snapshot_active().is_none());
         assert!(handle.complete_active().is_none());
         assert!(handle.snapshot_active().is_none());
+    }
+
+    #[test]
+    fn close_event_slice_bounds_open_and_reported_prefixes() {
+        let mux = UnixConnectionMux::new();
+        let mut open_adapters = Vec::new();
+        for index in 0..8 {
+            let (adapter, handle) = mux.create_adapter();
+            mux.register(format!("open-{index:02}"), "sub".to_string(), 1, handle);
+            open_adapters.push(adapter);
+        }
+        let mut reported_handles = Vec::new();
+        for index in 0..4 {
+            let (_adapter, handle) = mux.create_adapter();
+            mux.register(
+                format!("reported-{index:02}"),
+                "sub".to_string(),
+                1,
+                handle.clone(),
+            );
+            handle.close();
+            reported_handles.push(handle);
+        }
+        assert_eq!(mux.queue_closed_subscription_events(|_| true), 4);
+        let (_closed_adapter, closed) = mux.create_adapter();
+        mux.register("z-closed".to_string(), "sub".to_string(), 1, closed.clone());
+        closed.close();
+        let first = mux.queue_closed_subscription_events_bounded(|_| Some(true), 8, None, 8);
+        assert_eq!(first.classified, 0);
+        assert!(first.more);
+        assert_eq!(
+            first.after_route.as_ref().map(|key| key.0.as_str()),
+            Some("open-07")
+        );
+        let second = mux.queue_closed_subscription_events_bounded(
+            |_| Some(true),
+            8,
+            first.after_route.as_ref(),
+            8,
+        );
+        assert_eq!(second.classified, 1);
+        assert!(!second.more);
+        assert!(mux.pop_pending_event().is_some());
+        let _ = (open_adapters, reported_handles);
+    }
+
+    #[test]
+    fn close_event_slice_uses_keyed_suppression_without_cloning_the_prefix() {
+        let mux = UnixConnectionMux::new();
+        for index in 0..64 {
+            mux.suppress_session(format!("suppressed-{index:03}"));
+            mux.suppress_generation(format!("suppressed-{index:03}"), "sub", 1);
+        }
+        let mut open_adapters = Vec::new();
+        for index in 0..8 {
+            let (adapter, handle) = mux.create_adapter();
+            mux.register(format!("open-{index:02}"), "sub".to_string(), 1, handle);
+            open_adapters.push(adapter);
+        }
+        let (_suppressed_adapter, suppressed) = mux.create_adapter();
+        mux.register(
+            "suppressed-000".to_string(),
+            "sub".to_string(),
+            1,
+            suppressed.clone(),
+        );
+        suppressed.close();
+        let (_live_adapter, live) = mux.create_adapter();
+        mux.register("z-live".to_string(), "sub".to_string(), 1, live.clone());
+        live.close();
+        let first = mux.queue_closed_subscription_events_bounded(|_| Some(true), 8, None, 8);
+        assert_eq!(first.classified, 0);
+        let second = mux.queue_closed_subscription_events_bounded(
+            |_| Some(true),
+            8,
+            first.after_route.as_ref(),
+            8,
+        );
+        assert_eq!(second.classified, 2);
+        assert_eq!(mux.queue_closed_subscription_events(|_| true), 0);
+        match mux.pop_pending_event() {
+            Some(DaemonEvent::TerminalSubscriptionClosed { session_id, .. }) => {
+                assert_eq!(session_id, "z-live");
+            }
+            other => panic!("expected live close event, got {other:?}"),
+        }
+        assert!(mux.pop_pending_event().is_none());
+        let _ = open_adapters;
     }
 
     #[test]

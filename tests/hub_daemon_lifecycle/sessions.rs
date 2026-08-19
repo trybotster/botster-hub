@@ -23,6 +23,27 @@ fn terminal_envelope_contains_marker(
     }
 }
 
+fn lifecycle_counters(
+    endpoint: &botster_hub_client::DaemonEndpoint,
+    label: &str,
+) -> botster_hub_client::DaemonLifecycleCounters {
+    botster_hub_client::request(endpoint, botster_hub_client::DaemonRequest::Status)
+        .unwrap_or_else(|error| panic!("{label}: {error}"))
+        .status
+        .unwrap_or_else(|| panic!("{label} status body"))
+        .lifecycle_counters
+}
+
+fn wait_for_idle_lifecycle_window(
+    endpoint: &botster_hub_client::DaemonEndpoint,
+) -> botster_hub_client::DaemonLifecycleCounters {
+    // Status opens a new connection, so do not poll it. Sleep past one
+    // interval plus one Maintenance rotation so spawn catch-up cannot
+    // spill into the idle sample.
+    thread::sleep(Duration::from_millis(1_200));
+    lifecycle_counters(endpoint, "status before many-session idle window")
+}
+
 fn drain_skipped_terminal(
     connection: &mut botster_hub_client::DaemonConnection,
     session_id: &str,
@@ -2772,6 +2793,26 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
         "the one shared idle backstop must stay low-frequency"
     );
 
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: "focused-pty-progress".to_string(),
+            command: "sh -c 'i=0; while [ \"$i\" -lt 80 ]; do i=$((i+1)); printf x; sleep 0.05; done'".to_string(),
+        },
+    )
+    .expect("spawn PTY progress producer");
+    thread::sleep(Duration::from_millis(150));
+    let screen_before = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::ReadScreen {
+            session_id: "focused-pty-progress".to_string(),
+        },
+    )
+    .expect("read PTY screen before flood")
+    .read_screen
+    .map(|screen| screen.text)
+    .unwrap_or_default();
+
     const FLOOD_CONNECTIONS: usize = 32;
     const FLOOD_REQUESTS_PER_CONNECTION: usize = 512;
     let mut flood_writers = Vec::new();
@@ -2833,6 +2874,47 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
         flood_after.reconciliation_wakes > flood_before.reconciliation_wakes,
         "a continuously busy control queue must not starve shared entity reconciliation"
     );
+    let screen_after = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::ReadScreen {
+            session_id: "focused-pty-progress".to_string(),
+        },
+    )
+    .expect("read PTY screen during flood")
+    .read_screen
+    .map(|screen| screen.text)
+    .unwrap_or_default();
+    let before_xs = screen_before.matches('x').count();
+    let after_xs = screen_after.matches('x').count();
+    assert!(
+        after_xs > before_xs,
+        "PTY output must progress during the Status flood; before={before_xs} after={after_xs} text={screen_after:?}"
+    );
+    let complete_deadline = Instant::now() + Duration::from_secs(8);
+    let mut complete_text = screen_after.clone();
+    while complete_text.matches('x').count() < 80 && Instant::now() < complete_deadline {
+        complete_text = botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::ReadScreen {
+                session_id: "focused-pty-progress".to_string(),
+            },
+        )
+        .expect("read PTY screen for complete output")
+        .read_screen
+        .map(|screen| screen.text)
+        .unwrap_or_default();
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        complete_text.matches('x').count() >= 80,
+        "the complete producer output must arrive; text={complete_text:?}"
+    );
+    let _ = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::ShutdownSession {
+            session_id: "focused-pty-progress".to_string(),
+        },
+    );
 
     for index in 0..8 {
         botster_hub_client::request(
@@ -2849,6 +2931,7 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
         if let botster_hub_client::DaemonEntityFrame::Upsert { id, .. } = subscription
             .next_frame()
             .expect("session-count fixture upsert")
+            && id.starts_with("focused-idle-session-")
         {
             upserts.insert(id, ());
         }
@@ -2879,13 +2962,16 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
                         for item in items {
                             if let Some(id) =
                                 item.get("session_uuid").and_then(serde_json::Value::as_str)
+                                && id.starts_with("focused-idle-session-")
                             {
                                 seen.insert(id.to_string());
                             }
                         }
                     }
                     botster_hub_client::DaemonEntityFrame::Upsert { id, .. } => {
-                        seen.insert(id);
+                        if id.starts_with("focused-idle-session-") {
+                            seen.insert(id);
+                        }
                     }
                     _ => {}
                 },
@@ -2894,23 +2980,31 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
         assert_eq!(seen.len(), 8, "paged subscribe must deliver every live row");
         additional_subscriptions.push(additional);
     }
-    thread::sleep(Duration::from_millis(600));
-    let many_before =
-        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
-            .expect("status before many-session idle window")
-            .status
-            .expect("many-session status body")
-            .lifecycle_counters;
+    let many_before = wait_for_idle_lifecycle_window(&endpoint);
     thread::sleep(Duration::from_millis(1_100));
-    let many_after =
-        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
-            .expect("status after many-session idle window")
-            .status
-            .expect("many-session status body")
-            .lifecycle_counters;
+    let many_after = lifecycle_counters(&endpoint, "status after many-session idle window");
+    eprintln!(
+        "many-session idle wake_delta={} change_delta={} delivery_delta={} drain_delta={} before_wakes={} after_wakes={}",
+        many_after
+            .reconciliation_wakes
+            .saturating_sub(many_before.reconciliation_wakes),
+        many_after
+            .lifecycle_change_reads
+            .saturating_sub(many_before.lifecycle_change_reads),
+        many_after
+            .entity_delivery_attempts
+            .saturating_sub(many_before.entity_delivery_attempts),
+        many_after
+            .lifecycle_session_drains
+            .saturating_sub(many_before.lifecycle_session_drains),
+        many_before.reconciliation_wakes,
+        many_after.reconciliation_wakes
+    );
     assert_eq!(
         many_after.lifecycle_baseline_reads, many_before.lifecycle_baseline_reads,
-        "session count must not restore filesystem-backed baseline polling"
+        "session count must not restore filesystem-backed baseline polling: before={} after={}",
+        many_before.lifecycle_baseline_reads,
+        many_after.lifecycle_baseline_reads
     );
     assert_eq!(
         many_after.entity_delivery_attempts, many_before.entity_delivery_attempts,
@@ -2921,7 +3015,9 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
             .reconciliation_wakes
             .saturating_sub(many_before.reconciliation_wakes)
             <= 4,
-        "shared wake count must stay independent of session count"
+        "shared wake count must stay independent of session count: before={} after={}",
+        many_before.reconciliation_wakes,
+        many_after.reconciliation_wakes
     );
     assert!(
         many_after.reconciliation_wakes > many_before.reconciliation_wakes,

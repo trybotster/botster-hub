@@ -1,6 +1,13 @@
-//! Bounded owner-loop maintenance slices for Hub session projection.
+//! Bounded owner-loop background scheduling and maintenance slices.
 //!
-//! One owner turn runs at most one slice, then yields. This module does not
+//! The owner loop has two policy-neutral background classes: Maintenance and
+//! Pump. Each class keeps one coalesced pending flag. Marks coalesce; they do
+//! not queue. When both classes are pending, selection is round-robin on the
+//! last-served class. Selection input is only {pending flags, last-served
+//! class}. One owner turn runs at most one selected slice.
+//!
+//! Maintenance keeps [`MaintenanceScheduler`] and [`MaintenanceSliceKind`]
+//! unchanged. Pump is its own three-phase rotation. This module does not
 //! import terminal semantic bodies and does not name package-owned product
 //! policy.
 
@@ -55,6 +62,16 @@ const FANOUT_QUEUE_MAX_ITEMS: usize = 32;
 const FANOUT_QUEUE_MAX_BYTES: usize = 64 * 1024;
 const HOST_BRIDGE_MAX_BYTES: usize = 64 * 1024;
 const CONSUMER_REFRESH_MAX: usize = 8;
+/// CloseEvents visits this many admissions per Pump slice.
+pub const PUMP_MAX_ADMISSIONS_VISITED: usize = 8;
+/// CloseEvents classifies this many closed-route candidates per Pump slice.
+pub const PUMP_MAX_CANDIDATE_CLASSIFICATIONS: usize = 8;
+/// CloseEvents visits this many mux route entries per Pump slice, including
+/// open and already-reported rows.
+pub const PUMP_MAX_ROUTE_ENTRIES_VISITED: usize = 8;
+/// InventoryReconcile visits this many stream-map entries per Pump slice,
+/// including unbound rows.
+pub const PUMP_MAX_ROUTES_VALIDATED: usize = 8;
 
 fn queued_queue_bytes(frames: &VecDeque<serde_json::Value>) -> usize {
     frames
@@ -143,6 +160,156 @@ impl MaintenanceScheduler {
         self.next = kind.next();
         self.wake = false;
         kind
+    }
+}
+
+/// Policy-neutral owner-loop background class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackgroundClass {
+    Maintenance,
+    Pump,
+}
+
+/// One Pump selection runs exactly one of these phases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PumpPhase {
+    Observe,
+    CloseEvents,
+    InventoryReconcile,
+}
+
+impl PumpPhase {
+    fn next(self) -> Self {
+        match self {
+            Self::Observe => Self::CloseEvents,
+            Self::CloseEvents => Self::InventoryReconcile,
+            Self::InventoryReconcile => Self::Observe,
+        }
+    }
+}
+
+/// Resume cursor over Unix then WebRTC admission maps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PumpAdmissionCursor {
+    Unix {
+        after: Option<String>,
+        after_route: Option<(String, String, u64)>,
+    },
+    Webrtc {
+        after: Option<String>,
+        after_route: Option<(String, String, u64)>,
+    },
+}
+
+impl Default for PumpAdmissionCursor {
+    fn default() -> Self {
+        Self::Unix {
+            after: None,
+            after_route: None,
+        }
+    }
+}
+
+/// Continuation state for the Pump class rotation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PumpScheduler {
+    next: PumpPhase,
+    pub close_cursor: PumpAdmissionCursor,
+    pub reconcile_after: Option<(String, String)>,
+}
+
+impl Default for PumpScheduler {
+    fn default() -> Self {
+        Self {
+            next: PumpPhase::Observe,
+            close_cursor: PumpAdmissionCursor::default(),
+            reconcile_after: None,
+        }
+    }
+}
+
+impl PumpScheduler {
+    /// Consume the current phase and advance the rotation.
+    pub fn take_phase(&mut self) -> PumpPhase {
+        let phase = self.next;
+        self.next = phase.next();
+        phase
+    }
+
+    #[cfg(test)]
+    fn force_next(&mut self, phase: PumpPhase) {
+        self.next = phase;
+    }
+}
+
+/// Coalesced Pump pending plus last-served class. Maintenance pending is
+/// derived from [`MaintenanceState::needs_work`] and sibling wake sources.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BackgroundClassScheduler {
+    pump_pending: bool,
+    last_served: Option<BackgroundClass>,
+}
+
+impl BackgroundClassScheduler {
+    /// Coalesce a Pump mark. Repeated marks stay one pending flag.
+    pub fn mark_pump(&mut self) {
+        self.pump_pending = true;
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn pump_pending(&self) -> bool {
+        self.pump_pending
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn last_served(&self) -> Option<BackgroundClass> {
+        self.last_served
+    }
+
+    #[must_use]
+    pub fn has_pending(&self, maintenance_pending: bool) -> bool {
+        maintenance_pending || self.pump_pending
+    }
+
+    /// Select at most one class. Consumes Pump pending only when Pump wins.
+    pub fn select(&mut self, maintenance_pending: bool) -> Option<BackgroundClass> {
+        let selected = match (maintenance_pending, self.pump_pending) {
+            (false, false) => None,
+            (true, false) => Some(BackgroundClass::Maintenance),
+            (false, true) => Some(BackgroundClass::Pump),
+            (true, true) => match self.last_served {
+                Some(BackgroundClass::Maintenance) => Some(BackgroundClass::Pump),
+                _ => Some(BackgroundClass::Maintenance),
+            },
+        };
+        if selected == Some(BackgroundClass::Pump) {
+            self.pump_pending = false;
+        }
+        if selected.is_some() {
+            self.last_served = selected;
+        }
+        selected
+    }
+}
+
+/// One owner turn never returns two background slices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackgroundTurnDecision {
+    None,
+    OneSlice(BackgroundClass),
+}
+
+/// Fair background decision after control is served or skipped.
+#[must_use]
+pub fn decide_background_slice(
+    scheduler: &mut BackgroundClassScheduler,
+    maintenance_pending: bool,
+) -> BackgroundTurnDecision {
+    match scheduler.select(maintenance_pending) {
+        Some(class) => BackgroundTurnDecision::OneSlice(class),
+        None => BackgroundTurnDecision::None,
     }
 }
 
@@ -480,10 +647,11 @@ impl MaintenanceState {
     }
 
     pub fn needs_work(&self) -> bool {
+        // `observe_resume` is continuation state for the next Observe kind.
+        // It must not rearm the whole nine-kind rotation as idle wakes.
         self.scheduler.has_wake()
             || self.baseline.is_some()
             || !self.pending_changes.is_empty()
-            || self.observe_resume.is_some()
             || self.session_family.has_work()
             || !self.pending_retirements.is_empty()
     }
@@ -697,6 +865,31 @@ pub fn run_maintenance_kind(
     }
 }
 
+fn handle_unavailable_observe_pass(state: &mut MaintenanceState) {
+    state.observe_resume = None;
+    if !state.projection.baseline_complete || state.baseline.is_some() {
+        start_baseline_recovery(state);
+    }
+}
+
+/// Apply a successful observe slice to Maintenance scheduling.
+///
+/// An incomplete pass stores [`MaintenanceState::observe_resume`] and leaves
+/// the nine-kind pointer unchanged. A journal-advanced wake prefers
+/// JournalPull. This function is the only incomplete-pass scheduler
+/// transition in production.
+fn apply_observe_pass_result(
+    state: &mut MaintenanceState,
+    complete: bool,
+    journal_advanced: bool,
+    resume: Option<ObserveLifecycleCursor>,
+) {
+    state.observe_resume = if complete { None } else { resume };
+    if journal_advanced {
+        state.scheduler.prefer_journal_pull();
+    }
+}
+
 fn now_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -709,31 +902,27 @@ fn run_observe_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
     match runtime.observe_lifecycle_slice(now_seconds(), resume.as_ref(), OBSERVE_SLICE_BUDGET) {
         Ok(slice) => {
             if let Some(reason) = slice.resync_required {
-                if matches!(
-                    reason,
-                    SessionLifecycleResyncReason::ObservePassUnavailable
-                        | SessionLifecycleResyncReason::SourceChanged
-                ) {
+                if matches!(reason, SessionLifecycleResyncReason::SourceChanged) {
                     state.observe_resume = None;
                     start_baseline_recovery(state);
+                } else if matches!(reason, SessionLifecycleResyncReason::ObservePassUnavailable) {
+                    handle_unavailable_observe_pass(state);
                 }
                 return;
             }
-            if slice.complete {
-                state.observe_resume = None;
-            } else {
-                state.observe_resume = Some(ObserveLifecycleCursor {
-                    pass_id: slice.pass_id,
-                    last_visited: slice.last_visited,
-                });
-                state.scheduler.try_wake();
-            }
-            // Observe can publish journal rows (natural exit) without a
-            // subscriber. Wake the next JournalPull so the projection does
-            // not lag Core list().
-            if runtime.take_journal_advanced_wake() {
-                state.scheduler.prefer_journal_pull();
-            }
+            apply_observe_pass_result(
+                state,
+                slice.complete,
+                runtime.take_journal_advanced_wake(),
+                if slice.complete {
+                    None
+                } else {
+                    Some(ObserveLifecycleCursor {
+                        pass_id: slice.pass_id,
+                        last_visited: slice.last_visited,
+                    })
+                },
+            );
         }
         Err(SessionLifecyclePageError::BudgetTooSmall { .. }) => {
             state.scheduler.try_wake();
@@ -774,7 +963,9 @@ fn run_journal_pull_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
             state.journal_caught_up_confirmed =
                 journal_caught_up_after_pull(received, at_watermark, journal_advanced);
             state.pending_changes.extend(page.changes);
-            if journal_advanced && !received {
+            if state.journal_caught_up_confirmed && state.projection_dirty {
+                state.scheduler.prefer_subscriber_delivery();
+            } else if journal_advanced && !received {
                 state.scheduler.prefer_journal_pull();
             } else if received || !at_watermark || journal_advanced {
                 state.scheduler.try_wake();
@@ -1252,15 +1443,22 @@ fn continue_snapshot_starts(state: &mut MaintenanceState, budget: &mut HostBridg
 }
 
 fn continue_family_fanout(state: &mut MaintenanceState, budget: &mut HostBridgeBudget) {
-    let Some(mut job) = state.session_family.pending_fanout.pop_front() else {
-        return;
-    };
-    state.session_family.fanout_bytes = state.session_family.fanout_bytes.saturating_sub(job.bytes);
-    let more = fanout_family_frame(state, &mut job, budget);
-    if more {
+    while !budget.exhausted() {
+        let Some(mut job) = state.session_family.pending_fanout.pop_front() else {
+            return;
+        };
         state.session_family.fanout_bytes =
-            state.session_family.fanout_bytes.saturating_add(job.bytes);
-        state.session_family.pending_fanout.push_front(job);
+            state.session_family.fanout_bytes.saturating_sub(job.bytes);
+        let more = fanout_family_frame(state, &mut job, budget);
+        if more {
+            state.session_family.fanout_bytes =
+                state.session_family.fanout_bytes.saturating_add(job.bytes);
+            state.session_family.pending_fanout.push_front(job);
+            state.scheduler.try_wake();
+            return;
+        }
+    }
+    if !state.session_family.pending_fanout.is_empty() {
         state.scheduler.try_wake();
     }
 }
@@ -1665,6 +1863,8 @@ pub fn assert_maintenance_source_stays_control_plane(source: &str) {
 mod tests {
     use std::path::Path;
 
+    use botster_core_daemon::ObserveLifecyclePassId;
+
     use super::*;
 
     #[test]
@@ -1910,6 +2110,26 @@ mod tests {
         assert_eq!(scheduler.take_slice(), MaintenanceSliceKind::Observe);
         assert!(!scheduler.has_wake());
         assert_eq!(scheduler.take_slice(), MaintenanceSliceKind::JournalPull);
+    }
+
+    fn incomplete_resume() -> ObserveLifecycleCursor {
+        ObserveLifecycleCursor {
+            pass_id: ObserveLifecyclePassId("incomplete".into()),
+            last_visited: None,
+        }
+    }
+
+    #[test]
+    fn incomplete_observe_keeps_the_nine_kind_rotation() {
+        let mut state = MaintenanceState::default();
+        assert_eq!(state.scheduler.take_slice(), MaintenanceSliceKind::Observe);
+        apply_observe_pass_result(&mut state, false, false, Some(incomplete_resume()));
+        assert!(state.observe_resume.is_some());
+        assert_eq!(
+            state.scheduler.take_slice(),
+            MaintenanceSliceKind::JournalPull,
+            "an incomplete Observe pass must not rewrite next to Observe"
+        );
     }
 
     #[test]
@@ -2902,5 +3122,328 @@ mod tests {
             let _ = runtime.shutdown_session(SessionId(id.clone()), 2);
         }
         let _ = std::fs::remove_dir_all(data_directory);
+    }
+
+    #[test]
+    fn background_selection_alternates_when_both_classes_are_pending() {
+        let mut scheduler = BackgroundClassScheduler::default();
+        scheduler.mark_pump();
+        let first = scheduler.select(true);
+        let second = scheduler.select(true);
+        let third = scheduler.select(true);
+        assert_eq!(first, Some(BackgroundClass::Maintenance));
+        assert_eq!(second, Some(BackgroundClass::Pump));
+        assert_eq!(third, Some(BackgroundClass::Maintenance));
+    }
+
+    #[test]
+    fn one_pending_class_runs_on_consecutive_turns() {
+        let mut scheduler = BackgroundClassScheduler::default();
+        scheduler.mark_pump();
+        assert_eq!(scheduler.select(false), Some(BackgroundClass::Pump));
+        scheduler.mark_pump();
+        assert_eq!(scheduler.select(false), Some(BackgroundClass::Pump));
+        assert_eq!(scheduler.select(true), Some(BackgroundClass::Maintenance));
+        assert_eq!(scheduler.select(true), Some(BackgroundClass::Maintenance));
+    }
+
+    #[test]
+    fn background_marks_coalesce_to_one_pending_flag() {
+        let mut scheduler = BackgroundClassScheduler::default();
+        scheduler.mark_pump();
+        scheduler.mark_pump();
+        scheduler.mark_pump();
+        assert_eq!(scheduler.select(false), Some(BackgroundClass::Pump));
+        assert_eq!(scheduler.select(false), None);
+    }
+
+    #[test]
+    fn one_turn_decision_never_returns_two_slices() {
+        let mut scheduler = BackgroundClassScheduler::default();
+        scheduler.mark_pump();
+        let decision = decide_background_slice(&mut scheduler, true);
+        assert!(matches!(
+            decision,
+            BackgroundTurnDecision::OneSlice(BackgroundClass::Maintenance)
+        ));
+        assert!(scheduler.pump_pending());
+        let second = decide_background_slice(&mut scheduler, true);
+        assert!(matches!(
+            second,
+            BackgroundTurnDecision::OneSlice(BackgroundClass::Pump)
+        ));
+    }
+
+    #[test]
+    fn selected_slice_survives_a_later_control_arrival() {
+        let mut scheduler = BackgroundClassScheduler::default();
+        scheduler.mark_pump();
+        let selected = scheduler.select(true);
+        assert_eq!(selected, Some(BackgroundClass::Maintenance));
+        scheduler.mark_pump();
+        assert_eq!(selected, Some(BackgroundClass::Maintenance));
+        assert_eq!(scheduler.last_served(), Some(BackgroundClass::Maintenance));
+    }
+
+    #[test]
+    fn inverted_reselection_after_control_cancels_the_chosen_slice() {
+        let mut scheduler = BackgroundClassScheduler::default();
+        scheduler.mark_pump();
+        let selected = scheduler.select(true);
+        assert_eq!(selected, Some(BackgroundClass::Maintenance));
+        let inverted = scheduler.select(true);
+        assert_eq!(inverted, Some(BackgroundClass::Pump));
+        assert_ne!(selected, inverted);
+    }
+
+    #[test]
+    fn composed_scheduler_executes_subscriber_delivery_and_host_bridge() {
+        let mut classes = BackgroundClassScheduler::default();
+        let mut maintenance = MaintenanceScheduler::default();
+        let mut subscriber_at = None;
+        let mut host_bridge_at = None;
+        for turn in 0..18 {
+            classes.mark_pump();
+            let class = classes.select(true).expect("both classes stay pending");
+            if class != BackgroundClass::Maintenance {
+                continue;
+            }
+            maintenance.try_wake();
+            let kind = maintenance.take_slice();
+            if kind == MaintenanceSliceKind::HostBridge && host_bridge_at.is_none() {
+                host_bridge_at = Some(turn);
+            }
+            if kind == MaintenanceSliceKind::SubscriberDelivery && subscriber_at.is_none() {
+                subscriber_at = Some(turn);
+            }
+        }
+        assert_eq!(host_bridge_at, Some(8));
+        assert_eq!(subscriber_at, Some(10));
+    }
+
+    fn drive_composed_incomplete_observe(
+        after_observe: fn(&mut MaintenanceState, bool, bool, Option<ObserveLifecycleCursor>),
+    ) -> (Option<usize>, Option<usize>, usize, MaintenanceState) {
+        let mut classes = BackgroundClassScheduler::default();
+        let mut maintenance = MaintenanceState::default();
+        let mut subscriber_at = None;
+        let mut host_bridge_at = None;
+        let mut observe_count = 0usize;
+        for turn in 0..18 {
+            classes.mark_pump();
+            let class = classes.select(true).expect("both classes stay pending");
+            if class != BackgroundClass::Maintenance {
+                continue;
+            }
+            maintenance.try_wake();
+            let kind = maintenance.scheduler.take_slice();
+            if kind == MaintenanceSliceKind::Observe {
+                observe_count = observe_count.saturating_add(1);
+                after_observe(&mut maintenance, false, false, Some(incomplete_resume()));
+            }
+            if kind == MaintenanceSliceKind::HostBridge && host_bridge_at.is_none() {
+                host_bridge_at = Some(turn);
+            }
+            if kind == MaintenanceSliceKind::SubscriberDelivery && subscriber_at.is_none() {
+                subscriber_at = Some(turn);
+            }
+        }
+        (host_bridge_at, subscriber_at, observe_count, maintenance)
+    }
+
+    fn apply_observe_pass_result_starving_later_kinds(
+        state: &mut MaintenanceState,
+        complete: bool,
+        journal_advanced: bool,
+        resume: Option<ObserveLifecycleCursor>,
+    ) {
+        apply_observe_pass_result(state, complete, journal_advanced, resume);
+        if state.observe_resume.is_some() && !journal_advanced {
+            state.scheduler.wake = true;
+            state.scheduler.next = MaintenanceSliceKind::Observe;
+        }
+    }
+
+    #[test]
+    fn composed_incomplete_observe_still_serves_host_bridge_and_subscriber_delivery() {
+        let (host_bridge_at, subscriber_at, observe_count, maintenance) =
+            drive_composed_incomplete_observe(apply_observe_pass_result);
+        assert!(
+            observe_count >= 1,
+            "the sequence must include at least one incomplete Observe pass"
+        );
+        assert!(
+            maintenance.observe_resume.is_some(),
+            "the resume cursor must survive the rotation"
+        );
+        assert!(
+            !maintenance.needs_work(),
+            "observe_resume alone must not keep Maintenance pending"
+        );
+        assert_eq!(host_bridge_at, Some(8));
+        assert_eq!(subscriber_at, Some(10));
+    }
+
+    #[test]
+    fn rewriting_next_to_observe_starves_host_bridge_and_subscriber_delivery() {
+        let (host_bridge_at, subscriber_at, observe_count, _) =
+            drive_composed_incomplete_observe(apply_observe_pass_result_starving_later_kinds);
+        assert!(
+            observe_count >= 1,
+            "the starved sequence still runs Observe"
+        );
+        assert_ne!(
+            host_bridge_at,
+            Some(8),
+            "rewriting next to Observe must miss the HostBridge bound"
+        );
+        assert_ne!(
+            subscriber_at,
+            Some(10),
+            "rewriting next to Observe must miss the SubscriberDelivery bound"
+        );
+        assert!(
+            host_bridge_at.is_none() && subscriber_at.is_none(),
+            "continuous Observe rewrite must starve later kinds"
+        );
+    }
+
+    #[test]
+    fn pump_phases_rotate_and_keep_cursors() {
+        let mut pump = PumpScheduler::default();
+        assert_eq!(pump.take_phase(), PumpPhase::Observe);
+        assert_eq!(pump.take_phase(), PumpPhase::CloseEvents);
+        pump.close_cursor = PumpAdmissionCursor::Unix {
+            after: Some("client-a".into()),
+            after_route: Some(("s".into(), "sub".into(), 1)),
+        };
+        pump.reconcile_after = Some(("s".into(), "sub".into()));
+        assert_eq!(pump.take_phase(), PumpPhase::InventoryReconcile);
+        assert_eq!(pump.take_phase(), PumpPhase::Observe);
+        assert_eq!(
+            pump.close_cursor,
+            PumpAdmissionCursor::Unix {
+                after: Some("client-a".into()),
+                after_route: Some(("s".into(), "sub".into(), 1)),
+            }
+        );
+        assert_eq!(pump.reconcile_after, Some(("s".into(), "sub".into())));
+    }
+
+    #[test]
+    fn continuous_close_work_still_serves_observe_and_inventory_reconcile() {
+        let mut classes = BackgroundClassScheduler::default();
+        let mut pump = PumpScheduler::default();
+        let mut observe_at = None;
+        let mut close_at = None;
+        let mut reconcile_at = None;
+        for turn in 0..6 {
+            classes.mark_pump();
+            assert_eq!(
+                classes.select(false),
+                Some(BackgroundClass::Pump),
+                "close work keeps Pump pending without inventing Maintenance priority"
+            );
+            match pump.take_phase() {
+                PumpPhase::Observe if observe_at.is_none() => observe_at = Some(turn),
+                PumpPhase::CloseEvents if close_at.is_none() => close_at = Some(turn),
+                PumpPhase::InventoryReconcile if reconcile_at.is_none() => {
+                    reconcile_at = Some(turn)
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(observe_at, Some(0));
+        assert_eq!(close_at, Some(1));
+        assert_eq!(reconcile_at, Some(2));
+    }
+
+    #[test]
+    fn inverted_close_phase_rewrite_starves_observe_and_reconcile() {
+        let mut pump = PumpScheduler::default();
+        let mut saw_observe = false;
+        let mut saw_reconcile = false;
+        for _ in 0..6 {
+            pump.force_next(PumpPhase::CloseEvents);
+            match pump.take_phase() {
+                PumpPhase::Observe => saw_observe = true,
+                PumpPhase::InventoryReconcile => saw_reconcile = true,
+                PumpPhase::CloseEvents => {}
+            }
+        }
+        assert!(
+            !saw_observe && !saw_reconcile,
+            "rewriting next to CloseEvents every turn is the starvation this ticket forbids"
+        );
+    }
+
+    #[test]
+    fn projection_dirty_alone_does_not_keep_maintenance_pending() {
+        let mut state = sealed_maintenance(1, Some(1));
+        state.projection_dirty = true;
+        let _ = state.scheduler.take_slice();
+        assert!(
+            !state.needs_work(),
+            "dirty is a delivery hint, not a self-rearming maintenance wake"
+        );
+    }
+
+    #[test]
+    fn observe_resume_alone_does_not_keep_maintenance_pending() {
+        let mut state = sealed_maintenance(1, Some(1));
+        let _ = state.scheduler.take_slice();
+        state.observe_resume = Some(ObserveLifecycleCursor {
+            pass_id: ObserveLifecyclePassId("1".into()),
+            last_visited: None,
+        });
+        assert!(
+            !state.needs_work(),
+            "observe_resume is Observe continuation, not a nine-kind self-wake"
+        );
+    }
+
+    #[test]
+    fn sealed_baseline_unavailable_observe_clears_cursor_without_remint_or_spin() {
+        let mut state = MaintenanceState::default();
+        state
+            .projection
+            .seal_baseline(botster_core_daemon::SessionLifecycleCursor {
+                source_id: botster_core_daemon::SessionLifecycleSourceId("s".into()),
+                sequence: 1,
+            });
+        state.observe_resume = Some(ObserveLifecycleCursor {
+            pass_id: ObserveLifecyclePassId("1".into()),
+            last_visited: None,
+        });
+        state.journal_caught_up_confirmed = true;
+        state.scheduler.try_wake();
+        let _ = state.scheduler.take_slice();
+        handle_unavailable_observe_pass(&mut state);
+        assert!(state.observe_resume.is_none());
+        assert!(state.baseline.is_none());
+        assert_eq!(state.baseline_page_reads, 0);
+        assert!(
+            !state.needs_work(),
+            "sealed unavailable observe must not spin maintenance"
+        );
+    }
+
+    #[test]
+    fn incomplete_baseline_unavailable_observe_starts_recovery() {
+        let mut state = MaintenanceState::default();
+        assert!(!state.projection.baseline_complete);
+        state.observe_resume = Some(ObserveLifecycleCursor {
+            pass_id: ObserveLifecyclePassId("1".into()),
+            last_visited: None,
+        });
+        handle_unavailable_observe_pass(&mut state);
+        assert!(state.observe_resume.is_none());
+        assert!(
+            state.session_family.need_gap_pass,
+            "incomplete baseline must start recovery, which begins with the gap pass"
+        );
+        assert!(!state.journal_caught_up_confirmed);
+        assert_eq!(state.baseline_page_reads, 0);
+        assert!(state.needs_work());
     }
 }

@@ -26,7 +26,8 @@ use botster_core_daemon::{
     ReadModeFlagsRequest, ReadModeFlagsResult, ReadScreenRequest, ReadScreenResult,
     RegistrySessionState, RoutedEnvelopeDeliveryStateResult, SessionAdoptionReport,
     SessionAdoptionState, SessionLifecycleBaselinePage, SessionLifecycleCursor,
-    SessionLifecycleLookup, SessionLifecyclePage, SessionLifecyclePageError, SpawnSessionRequest,
+    SessionLifecycleLookup, SessionLifecyclePage, SessionLifecyclePageError,
+    SessionRegistryStateLookup, SpawnSessionRequest,
 };
 use botster_ui_contract::{UiActionRequest, UiActionResult, UiNode};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -3578,6 +3579,30 @@ impl HubRuntime {
             .lock()
             .expect("core daemon mutex")
             .observe_session_lifecycle(session_id, now_seconds)
+    }
+
+    /// Exact non-mutating registry state for one session.
+    pub(crate) fn session_registry_state(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<SessionRegistryStateLookup, CoreDaemonError> {
+        self.core_daemon
+            .lock()
+            .expect("core daemon mutex")
+            .session_registry_state(session_id)
+    }
+
+    /// Exact live generation for one subscription, or `None`.
+    #[must_use]
+    pub(crate) fn terminal_subscription_generation(
+        &self,
+        session_id: &SessionId,
+        subscription_id: &SubscriptionId,
+    ) -> Option<TerminalSubscriptionGeneration> {
+        self.core_daemon
+            .lock()
+            .expect("core daemon mutex")
+            .terminal_subscription_generation(session_id, subscription_id)
     }
 
     /// Test helper for Core terminal Drain. Production daemon paths must not call this.
