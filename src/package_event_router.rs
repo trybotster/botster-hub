@@ -153,6 +153,13 @@ pub struct ReadyDelivery {
     pull_id: u64,
 }
 
+impl ReadyDelivery {
+    #[must_use]
+    pub(crate) fn pull_id(&self) -> u64 {
+        self.pull_id
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EventPlaneSnapshot {
     pub producer_events: BTreeMap<String, usize>,
@@ -686,6 +693,23 @@ impl PackageEventRouter {
         generation: u64,
     ) -> Result<bool, EventPlaneStatus> {
         let mut inner = lock_inner(&self.inner)?;
+        Ok(retire_holder_locked(
+            &mut inner,
+            envelope_id,
+            plugin_key,
+            generation,
+        ))
+    }
+
+    pub(crate) fn retire_pulled(
+        &self,
+        pull_id: u64,
+        envelope_id: u64,
+        plugin_key: &str,
+        generation: u64,
+    ) -> Result<bool, EventPlaneStatus> {
+        let mut inner = lock_inner(&self.inner)?;
+        inner.outstanding_pulls.remove(&pull_id);
         Ok(retire_holder_locked(
             &mut inner,
             envelope_id,

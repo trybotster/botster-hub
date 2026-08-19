@@ -6,13 +6,14 @@
 - Target id: `tgt_7e208a0c76a44980a83b63af976b1f22`
 - Ticket: `ticket_1786663583_640263`
 - Run: `run_1787158085_722550`
-- Implement step: `run_step_1787170885_485950` (sequence 9, third Review return)
-- Prior Implement steps: `run_step_1787169048_973962`, `run_step_1787165407_410166`, `run_step_1787159472_279191`
+- Implement step: `run_step_1787173421_386472` (sequence 11, fourth Review return)
+- Prior Implement steps: `run_step_1787170885_485950`, `run_step_1787169048_973962`, `run_step_1787165407_410166`, `run_step_1787159472_279191`
 - Approved plan: `docs/plans/expose-client-event-subscriptions-on-the-host-control-protocol.md` at `98ae1f9`
 - Plan Review: `review_1787159455_211294` approved
 - Code Review: `review_1787165393_430946` `changes_required` (7 findings, resolved)
 - Code Review: `review_1787169037_550837` `changes_required` (4 findings, resolved)
-- Code Review: `review_1787170872_296170` `changes_required` (3 findings)
+- Code Review: `review_1787170872_296170` `changes_required` (3 findings, resolved)
+- Code Review: `review_1787173413_659341` `changes_required` (2 findings)
 - `teardown_class_applies`: no
 - Direct-merge pipeline. No pull request.
 
@@ -51,6 +52,13 @@ Third Review return (`review_1787170872_296170`):
 | `finding_1787170872_438008` Invisible gap flag | high | `register_gap_slot` returns `ShedBusy` instead of an unmapped bit. Subscribe does not admit until the mailbox can find the bit. Lock-held admission test plus a real ingress shed proves EventGap with no manual `bit.store`. |
 | `finding_1787170872_469595` Busy cleanup drops pulled copies | high | Requeue and complete return the delivery on busy. The test helper keeps a bounded retry store for deliveries and causal-scope releases. Lock-held tests prove occupancy is unchanged until the retry succeeds. |
 | `finding_1787170872_111770` Public unbounded requeue | medium | `requeue_delivery` is crate-private. `ReadyDelivery` is not `Clone`. Each pull has a one-time `pull_id`. Duplicate requeue is rejected. Consumer queue bounds apply on requeue. |
+
+Fourth Review return (`review_1787173413_659341`):
+
+| Finding | Severity | Fix |
+| --- | --- | --- |
+| `finding_1787173413_130589` Production never consumes pull tokens | high | `EventDeliveryFlight` carries the pull token. Every owner-loop exit calls `retire_pulled`. Tests cover missing handler, admission rejection, causal-mint failure, and queued retirement. Outstanding pulls return to zero. |
+| `finding_1787173413_737265` Helper drops leftover after 64 busy retries | high | Unsettled deliveries stay on the runtime. A later drive restores them. An ablation parks copies, holds the router lock through settle, then recovers occupancy. |
 
 Constraints applied for this return: Hub host-control and in-repo
 `botster-hub-client` only. Core pin unchanged. No Web/TUI edits. No
@@ -105,14 +113,17 @@ Checklist: reused `checklist_1786867714_922206` as required.
 
 ## Files changed
 
-Third Review return (this visit):
+Fourth Review return (this visit):
 
-- `src/daemon_event_subscriptions.rs` — gap-slot registration fails closed
-- `src/package_event_router.rs` — pull tokens, crate-private bounded requeue
-- `src/runtime.rs` — settle pulled deliveries and causal releases through retries
+- `src/package_event_router.rs` — `retire_pulled` consumes the pull token
+- `src/daemon_maintenance.rs` — production flights keep and retire the token
+- `src/runtime.rs` — durable leftover store; never drop after settle-turn limit
+- `tests/hub_lua_runtime_test.rs` — busy-settle occupancy ablation
 - `docs/reports/expose-client-event-subscriptions-on-the-host-control-protocol-implement.md`
 
 Prior Review-return files remain:
+
+- `src/daemon_event_subscriptions.rs` — gap-slot registration fails closed
 
 - `crates/botster-hub-client/src/lib.rs` — `next_event` / `set_read_timeout`
 - `src/daemon_transport.rs` — biased request poll, bounded flush, stall latch
@@ -242,9 +253,10 @@ Repo gates:
 
 - `cargo build --locked -p botster-core-daemon --bin botster-session-worker`
 - `./test.sh --locked` — one clean default-concurrency pass after the
-  third Review-return fixes, 0 failures. Lifecycle 264 passed / 1 ignored.
-  Lua runtime 61 passed, including `events_on` and the backpressure
-  occupancy ablation. Hub lib 446 passed. Hub client 78 passed.
+  fourth Review-return fixes, 0 failures. Lifecycle 264 passed / 1 ignored.
+  Lua runtime 62 passed, including `events_on`, the backpressure occupancy
+  ablation, and the busy-settle leftover ablation. Hub lib 450 passed. Hub
+  client 78 passed.
 - `cargo clippy --workspace --all-targets --locked -- -D warnings` clean.
 - `cargo fmt --all -- --check`
 - `cargo test --doc --workspace`
