@@ -25,8 +25,9 @@ use botster_core::{
     TerminalCapabilitySet, TerminalSubscriptionGeneration, TerminalSubscriptionRecord,
 };
 use botster_core_daemon::{
-    DetachTerminalSubscriptionResult, GuardedWriteDecision, GuardedWriteDeliveryState,
-    ReadinessEvidence, RegistrySessionState, SessionLifecycleLookup,
+    CoreDaemonError, DetachTerminalSubscriptionResult, GuardedWriteDecision,
+    GuardedWriteDeliveryState, ReadinessEvidence, RegistrySessionState, SessionLifecycleLookup,
+    SessionRegistryStateLookup,
 };
 use botster_hub_client::DaemonTransportError as ClientDaemonTransportError;
 pub use botster_hub_client::{
@@ -71,7 +72,12 @@ use tokio::net::{UnixListener as TokioUnixListener, UnixStream as TokioUnixStrea
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc as tokio_mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
-use crate::daemon_maintenance::{MaintenanceSliceKind, MaintenanceState, run_maintenance_kind};
+use crate::daemon_maintenance::{
+    BackgroundClass, BackgroundClassScheduler, BackgroundTurnDecision, MaintenanceSliceKind,
+    MaintenanceState, OBSERVE_SLICE_BUDGET, PUMP_MAX_ADMISSIONS_VISITED,
+    PUMP_MAX_CANDIDATE_CLASSIFICATIONS, PUMP_MAX_ROUTES_VALIDATED, PumpAdmissionCursor, PumpPhase,
+    PumpScheduler, decide_background_slice, run_maintenance_kind,
+};
 use crate::daemon_projection::{
     app_local_url, apps_from_registry, available_package_action, available_package_actions,
     blocked_action, daemon_operator_error_from_client, daemon_operator_error_from_package,
@@ -194,13 +200,48 @@ async fn receive_owner_event(
     }
 }
 
+fn owner_maintenance_pending(daemon: &HubDaemon, state: &DaemonControlState) -> bool {
+    state.maintenance.needs_work()
+        || session_subscribers_need_delivery(state)
+        || daemon
+            .runtime()
+            .is_some_and(crate::HubRuntime::package_entity_resync_still_needed)
+        || daemon.runtime().is_some_and(|runtime| {
+            runtime.package_event_router().peek_delivery_wake()
+                || runtime.event_plane_owner_ops_pending()
+        })
+}
+
+fn mark_due_reconciliation(state: &mut DaemonControlState, now: Instant) {
+    if state.next_reconciliation <= now {
+        state.background.mark_pump();
+        state.maintenance.try_wake();
+        state.next_reconciliation = now + ENTITY_RECONCILIATION_INTERVAL;
+    }
+}
+
+fn run_one_owner_background_slice(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
+    let maintenance_pending = owner_maintenance_pending(daemon, state);
+    let BackgroundTurnDecision::OneSlice(class) =
+        decide_background_slice(&mut state.background, maintenance_pending)
+    else {
+        return;
+    };
+    match class {
+        BackgroundClass::Maintenance => {
+            state.lifecycle_counters.reconciliation_wakes = state
+                .lifecycle_counters
+                .reconciliation_wakes
+                .saturating_add(1);
+            run_one_owner_maintenance_slice(daemon, state);
+        }
+        BackgroundClass::Pump => run_one_pump_phase(daemon, state),
+    }
+}
+
 fn run_one_owner_maintenance_slice(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
     let started = Instant::now();
     let kind = state.maintenance.scheduler.take_slice();
-    state.lifecycle_counters.reconciliation_wakes = state
-        .lifecycle_counters
-        .reconciliation_wakes
-        .saturating_add(1);
     match kind {
         MaintenanceSliceKind::SubscriberDelivery => {
             drive_entity_subscriptions(daemon, state);
@@ -287,8 +328,10 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
         while let Ok(cleanup) = cleanup_rx.try_recv() {
             handle_connection_cleanup(&mut daemon, &mut control_state, control_tx.clone(), cleanup);
         }
-        let slice_due = control_state.maintenance.needs_work()
-            || control_state.next_reconciliation <= Instant::now();
+        mark_due_reconciliation(&mut control_state, Instant::now());
+        let slice_due = control_state
+            .background
+            .has_pending(owner_maintenance_pending(&daemon, &control_state));
         let event = match classify_owner_poll(control_rx.try_recv(), slice_due) {
             OwnerPollDecision::ServeControl(message) => Some(OwnerEvent::Control(message)),
             OwnerPollDecision::RunSlice => None,
@@ -364,13 +407,12 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
                 None => return Err(DaemonTransportError::ControlThreadStopped),
             }
         }
-        let interval_due = control_state.next_reconciliation <= Instant::now();
-        if control_state.maintenance.needs_work() || interval_due {
-            run_one_owner_maintenance_slice(&mut daemon, &mut control_state);
-        }
-        if interval_due {
-            pump_bound_unix_routes(&mut daemon, &mut control_state);
-            control_state.next_reconciliation = Instant::now() + ENTITY_RECONCILIATION_INTERVAL;
+        mark_due_reconciliation(&mut control_state, Instant::now());
+        if control_state
+            .background
+            .has_pending(owner_maintenance_pending(&daemon, &control_state))
+        {
+            run_one_owner_background_slice(&mut daemon, &mut control_state);
         }
         if !socket_path.exists() {
             rebind_missing_socket_path(&socket_path);
@@ -2400,6 +2442,14 @@ pub(crate) fn handle_control_message(
                         runtime.record_acknowledged_spawn(session_id.clone());
                     }
                 }
+                state.background.mark_pump();
+                if matches!(request, DaemonRequest::ReadScreen { .. })
+                    && daemon
+                        .runtime()
+                        .is_some_and(crate::HubRuntime::take_journal_advanced_wake)
+                {
+                    state.maintenance.note_authoritative_mutation();
+                }
                 if reconcile_after_request {
                     state.maintenance.note_authoritative_mutation();
                 } else if matches!(request, DaemonRequest::PluginSurfaceAction { .. })
@@ -2413,6 +2463,8 @@ pub(crate) fn handle_control_message(
             if daemon.runtime().is_some_and(|runtime| {
                 runtime.package_event_router().peek_delivery_wake()
                     || runtime.event_plane_owner_ops_pending()
+                    || runtime.package_entity_work_pending()
+                    || runtime.package_entity_resync_still_needed()
             }) {
                 state.maintenance.try_wake();
             }
@@ -3261,7 +3313,6 @@ fn handle_runtime_control_request(
                                 &bootstrap_egress,
                             );
                         }
-                        observe_lifecycle_turn(runtime, tick(logical_clock));
                         Ok(daemon_events(Vec::new()))
                     }
                     Err(_) => Ok(attach_bind_operator_error(
@@ -3307,7 +3358,6 @@ fn handle_runtime_control_request(
                             &bootstrap_egress,
                         );
                     }
-                    observe_lifecycle_turn(runtime, tick(logical_clock));
                     Ok(daemon_events(Vec::new()))
                 }
                 Err(_) => Ok(attach_bind_operator_error(
@@ -3428,7 +3478,6 @@ fn handle_runtime_control_request(
         }
         DaemonRequest::ShutdownSession { session_id } => {
             let now = tick(logical_clock);
-            observe_lifecycle_turn(runtime, now);
             match classify_shutdown_session(runtime, &session_id, now) {
                 Ok(ShutdownSessionClassification::Cleanup(cleanup)) => {
                     // Keep adapters open. Classify already asked Core to write
@@ -3495,7 +3544,7 @@ fn handle_runtime_control_request(
         }
         DaemonRequest::ReadScreen { session_id } => {
             let now = tick(logical_clock);
-            observe_lifecycle_turn(runtime, now);
+            let _ = runtime.observe_session_lifecycle(&SessionId(session_id.clone()), now);
             let response = api.handle_request(
                 runtime,
                 &packages,
@@ -3512,7 +3561,6 @@ fn handle_runtime_control_request(
         }
         DaemonRequest::ReadModeFlags { session_id } => {
             let now = tick(logical_clock);
-            observe_lifecycle_turn(runtime, now);
             let response = api.handle_request(
                 runtime,
                 &packages,
@@ -4516,7 +4564,6 @@ fn recover_after_core_shutdown_error(
     error: crate::HubClientError,
     logical_clock: &mut u64,
 ) -> DaemonTransportResult<DaemonResponse> {
-    observe_lifecycle_turn(runtime, *logical_clock);
     recover_from_exact_classify(
         classify_shutdown_session(runtime, session_id, tick(logical_clock)),
         error,
@@ -4638,31 +4685,16 @@ fn suppress_webrtc_session_close_events(pending_runtime: &PendingRuntimeState, s
     }
 }
 
-fn session_suppresses_terminal_subscription_closed(
-    runtime: &crate::HubRuntime,
-    session_id: &str,
-) -> bool {
-    let Ok(sessions) = runtime.list_sessions() else {
-        return true;
-    };
-    let Some(session) = sessions
-        .iter()
-        .find(|session| session.session_id.0 == session_id)
-    else {
-        return true;
-    };
-    session.registry_state != RegistrySessionState::Running
-}
-
 fn queue_unix_subscription_closed_events(
     runtime: &crate::HubRuntime,
     pending_runtime: &PendingRuntimeState,
 ) {
     for admission in pending_runtime.unix_admissions.values() {
         if let UnixTerminalAdmission::Admitted { mux, .. } = admission {
-            mux.queue_closed_subscription_events(|session_id| {
-                !session_suppresses_terminal_subscription_closed(runtime, session_id)
-            });
+            mux.queue_closed_subscription_events_bounded(
+                |session_id| session_close_event_decision_for(runtime, session_id),
+                usize::MAX,
+            );
         }
     }
 }
@@ -4673,10 +4705,25 @@ fn queue_webrtc_subscription_closed_events(
 ) {
     for admission in pending_runtime.webrtc_admissions.values() {
         if let WebrtcTerminalAdmission::Admitted { mux, .. } = admission {
-            mux.queue_closed_subscription_events(|session_id| {
-                !session_suppresses_terminal_subscription_closed(runtime, session_id)
-            });
+            mux.queue_closed_subscription_events_bounded(
+                |session_id| session_close_event_decision_for(runtime, session_id),
+                usize::MAX,
+            );
         }
+    }
+}
+
+fn session_close_event_decision_for(runtime: &crate::HubRuntime, session_id: &str) -> Option<bool> {
+    session_close_event_decision(runtime.session_registry_state(&SessionId(session_id.to_string())))
+}
+
+fn session_close_event_decision(
+    lookup: Result<SessionRegistryStateLookup, CoreDaemonError>,
+) -> Option<bool> {
+    match lookup {
+        Ok(SessionRegistryStateLookup::Found(RegistrySessionState::Running)) => Some(true),
+        Ok(SessionRegistryStateLookup::Found(_)) => Some(false),
+        Ok(SessionRegistryStateLookup::Absent) | Ok(_) | Err(_) => None,
     }
 }
 
@@ -4991,37 +5038,128 @@ impl PendingRuntimeState {
     }
 }
 
-fn observe_lifecycle_turn(runtime: &crate::HubRuntime, now: u64) {
-    let _ = runtime.observe_lifecycle_slice(
-        now,
-        None,
-        botster_core_daemon::ObserveLifecycleBudget {
-            max_sessions: 32,
-            max_encoded_result_bytes: 64 * 1024,
-            max_elapsed: Duration::from_millis(25),
-        },
-    );
+fn run_one_pump_phase(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
+    let phase = state.pump.take_phase();
+    let incomplete = match phase {
+        PumpPhase::CloseEvents => run_close_events_phase(daemon, state),
+        PumpPhase::InventoryReconcile => run_inventory_reconcile_phase(daemon, state),
+        PumpPhase::Observe => run_pump_observe_phase(daemon, state),
+    };
+    if incomplete {
+        state.background.mark_pump();
+    }
 }
 
-fn pump_bound_unix_routes(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
-    let Some(runtime) = daemon.runtime_mut() else {
-        return;
+fn run_close_events_phase(daemon: &HubDaemon, state: &mut DaemonControlState) -> bool {
+    let Some(runtime) = daemon.runtime() else {
+        state.pump.close_cursor = PumpAdmissionCursor::default();
+        return false;
     };
-    let inventory = runtime.list_terminal_subscriptions();
-    queue_unix_subscription_closed_events(runtime, &state.pending_runtime);
-    queue_webrtc_subscription_closed_events(runtime, &state.pending_runtime);
-    state.pending_runtime.reconcile_inventory(&inventory);
+    let mut admissions_visited = 0;
+    let mut classified = 0;
+    loop {
+        if admissions_visited >= PUMP_MAX_ADMISSIONS_VISITED
+            || classified >= PUMP_MAX_CANDIDATE_CLASSIFICATIONS
+        {
+            return true;
+        }
+        let remaining = PUMP_MAX_CANDIDATE_CLASSIFICATIONS.saturating_sub(classified);
+        match &state.pump.close_cursor {
+            PumpAdmissionCursor::Unix { after } => {
+                let next_key = state
+                    .pending_runtime
+                    .unix_admissions
+                    .keys()
+                    .find(|key| after.as_ref().is_none_or(|seen| *key > seen))
+                    .cloned();
+                let Some(key) = next_key else {
+                    state.pump.close_cursor = PumpAdmissionCursor::Webrtc { after: None };
+                    continue;
+                };
+                admissions_visited += 1;
+                let progress = match state.pending_runtime.unix_admissions.get(&key) {
+                    Some(UnixTerminalAdmission::Admitted { mux, .. }) => mux
+                        .queue_closed_subscription_events_bounded(
+                            |session_id| session_close_event_decision_for(runtime, session_id),
+                            remaining,
+                        ),
+                    _ => crate::unix_terminal_adapter::ClosedEventSliceProgress {
+                        classified: 0,
+                        more: false,
+                    },
+                };
+                classified = classified.saturating_add(progress.classified);
+                if progress.more {
+                    return true;
+                }
+                state.pump.close_cursor = PumpAdmissionCursor::Unix { after: Some(key) };
+            }
+            PumpAdmissionCursor::Webrtc { after } => {
+                let next_key = state
+                    .pending_runtime
+                    .webrtc_admissions
+                    .keys()
+                    .find(|key| after.as_ref().is_none_or(|seen| *key > seen))
+                    .cloned();
+                let Some(key) = next_key else {
+                    state.pump.close_cursor = PumpAdmissionCursor::default();
+                    return false;
+                };
+                admissions_visited += 1;
+                let progress = match state.pending_runtime.webrtc_admissions.get(&key) {
+                    Some(WebrtcTerminalAdmission::Admitted { mux, .. }) => mux
+                        .queue_closed_subscription_events_bounded(
+                            |session_id| session_close_event_decision_for(runtime, session_id),
+                            remaining,
+                        ),
+                    _ => crate::unix_terminal_adapter::ClosedEventSliceProgress {
+                        classified: 0,
+                        more: false,
+                    },
+                };
+                classified = classified.saturating_add(progress.classified);
+                if progress.more {
+                    return true;
+                }
+                state.pump.close_cursor = PumpAdmissionCursor::Webrtc { after: Some(key) };
+            }
+        }
+    }
+}
+
+fn run_inventory_reconcile_phase(daemon: &HubDaemon, state: &mut DaemonControlState) -> bool {
+    let Some(runtime) = daemon.runtime() else {
+        state.pump.reconcile_after = None;
+        return false;
+    };
+    let lookup = |session_id: &str, subscription_id: &str| {
+        runtime.terminal_subscription_generation(
+            &SessionId(session_id.to_string()),
+            &SubscriptionId(subscription_id.to_string()),
+        )
+    };
+    let progress = state.pending_runtime.reconcile_inventory_slice(
+        lookup,
+        state.pump.reconcile_after.clone(),
+        PUMP_MAX_ROUTES_VALIDATED,
+    );
+    if progress.more {
+        state.pump.reconcile_after = progress.after;
+        true
+    } else {
+        state.pump.reconcile_after = None;
+        false
+    }
+}
+
+fn run_pump_observe_phase(daemon: &HubDaemon, state: &mut DaemonControlState) -> bool {
+    let Some(runtime) = daemon.runtime() else {
+        state.observe_resume = None;
+        return false;
+    };
     let now = tick(&mut state.logical_clock);
     let resume = state.observe_resume.as_ref();
-    let slice = runtime.observe_lifecycle_slice(
-        now,
-        resume,
-        botster_core_daemon::ObserveLifecycleBudget {
-            max_sessions: 32,
-            max_encoded_result_bytes: 64 * 1024,
-            max_elapsed: Duration::from_millis(25),
-        },
-    );
+    let slice = runtime.observe_lifecycle_slice(now, resume, OBSERVE_SLICE_BUDGET);
     if let Ok(slice) = slice {
         state.lifecycle_counters.lifecycle_session_drains = state
             .lifecycle_counters
@@ -5037,17 +5175,10 @@ fn pump_bound_unix_routes(daemon: &mut HubDaemon, state: &mut DaemonControlState
         };
         if runtime.take_journal_advanced_wake() {
             state.maintenance.note_authoritative_mutation();
-            run_maintenance_kind(
-                runtime,
-                &mut state.maintenance,
-                MaintenanceSliceKind::JournalPull,
-            );
-            run_maintenance_kind(
-                runtime,
-                &mut state.maintenance,
-                MaintenanceSliceKind::ProjectionApply,
-            );
         }
+        state.observe_resume.is_some()
+    } else {
+        false
     }
 }
 
@@ -5060,6 +5191,8 @@ pub(crate) struct DaemonControlState {
     pub(crate) pending_runtime: PendingRuntimeState,
     pub(crate) lifecycle_counters: DaemonLifecycleCounters,
     pub(crate) maintenance: MaintenanceState,
+    background: BackgroundClassScheduler,
+    pump: PumpScheduler,
     next_reconciliation: Instant,
     released_entity_generations: u64,
     pub(crate) released_attach_generations: u64,
@@ -5078,6 +5211,8 @@ impl Default for DaemonControlState {
             pending_runtime: PendingRuntimeState::default(),
             lifecycle_counters: DaemonLifecycleCounters::default(),
             maintenance: MaintenanceState::default(),
+            background: BackgroundClassScheduler::default(),
+            pump: PumpScheduler::default(),
             next_reconciliation: Instant::now(),
             released_entity_generations: 0,
             released_attach_generations: 0,
@@ -7884,6 +8019,116 @@ mod tests {
             OwnerPollDecision::ServeControl(message)
                 if matches!(*message, Some(ControlMessage::RejectedConnection))
         ));
+        let mut scheduler = BackgroundClassScheduler::default();
+        scheduler.mark_pump();
+        assert!(matches!(
+            classify_owner_poll(Ok(ControlMessage::RejectedConnection), true),
+            OwnerPollDecision::ServeControl(_)
+        ));
+        assert!(matches!(
+            decide_background_slice(&mut scheduler, true),
+            BackgroundTurnDecision::OneSlice(_)
+        ));
+    }
+
+    #[test]
+    fn read_mode_flags_path_does_not_observe_lifecycle() {
+        const TRANSPORT: &str = include_str!("daemon_transport.rs");
+        let deleted = ["fn observe_", "lifecycle_turn"].concat();
+        assert!(
+            !TRANSPORT.contains(&deleted),
+            "broad operation-path observation must stay deleted"
+        );
+        let read_mode = TRANSPORT
+            .split("DaemonRequest::ReadModeFlags")
+            .nth(1)
+            .expect("ReadModeFlags arm");
+        let arm = read_mode.split("DaemonRequest::").next().expect("arm end");
+        assert!(
+            !arm.contains("observe_session_lifecycle"),
+            "ReadModeFlags must not observe lifecycle"
+        );
+        assert!(
+            !arm.contains("observe_lifecycle"),
+            "ReadModeFlags must not call a lifecycle observe slice"
+        );
+    }
+
+    #[test]
+    fn pump_phases_do_not_list_subscriptions_or_sessions() {
+        const TRANSPORT: &str = include_str!("daemon_transport.rs");
+        let pump = TRANSPORT
+            .split("fn run_one_pump_phase")
+            .nth(1)
+            .expect("pump runner");
+        let pump = pump
+            .split("fn overlay_live_attach_occupancy")
+            .next()
+            .unwrap_or(pump);
+        assert!(
+            !pump.contains("list_terminal_subscriptions"),
+            "Pump must use the exact membership query"
+        );
+        assert!(
+            !pump.contains("list_sessions"),
+            "Pump close classification must not list sessions"
+        );
+        assert!(
+            !pump.contains("observe_session_lifecycle"),
+            "CloseEvents must not mutate lifecycle"
+        );
+    }
+
+    #[test]
+    fn close_event_suppression_matrix_matches_prior_predicate() {
+        assert_eq!(
+            session_close_event_decision(Ok(SessionRegistryStateLookup::Found(
+                RegistrySessionState::Running
+            ))),
+            Some(true)
+        );
+        assert_eq!(
+            session_close_event_decision(Ok(SessionRegistryStateLookup::Found(
+                RegistrySessionState::Exited
+            ))),
+            Some(false)
+        );
+        assert_eq!(
+            session_close_event_decision(Ok(SessionRegistryStateLookup::Found(
+                RegistrySessionState::Stopping
+            ))),
+            Some(false)
+        );
+        assert_eq!(
+            session_close_event_decision(Ok(SessionRegistryStateLookup::Found(
+                RegistrySessionState::Stale
+            ))),
+            Some(false)
+        );
+        assert_eq!(
+            session_close_event_decision(Ok(SessionRegistryStateLookup::Absent)),
+            None
+        );
+        assert_eq!(
+            session_close_event_decision(Err(CoreDaemonError::Shutdown)),
+            None
+        );
+    }
+
+    #[test]
+    fn close_events_phase_source_does_not_take_journal_wake() {
+        const TRANSPORT: &str = include_str!("daemon_transport.rs");
+        let close = TRANSPORT
+            .split("fn run_close_events_phase")
+            .nth(1)
+            .expect("close phase");
+        let close = close
+            .split("fn run_inventory_reconcile_phase")
+            .next()
+            .expect("close end");
+        assert!(!close.contains("take_journal_advanced_wake"));
+        assert!(!close.contains("observe_session_lifecycle"));
+        assert!(!close.contains("observe_lifecycle_slice"));
     }
 
     #[test]

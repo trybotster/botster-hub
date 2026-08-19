@@ -1,6 +1,13 @@
-//! Bounded owner-loop maintenance slices for Hub session projection.
+//! Bounded owner-loop background scheduling and maintenance slices.
 //!
-//! One owner turn runs at most one slice, then yields. This module does not
+//! The owner loop has two policy-neutral background classes: Maintenance and
+//! Pump. Each class keeps one coalesced pending flag. Marks coalesce; they do
+//! not queue. When both classes are pending, selection is round-robin on the
+//! last-served class. Selection input is only {pending flags, last-served
+//! class}. One owner turn runs at most one selected slice.
+//!
+//! Maintenance keeps [`MaintenanceScheduler`] and [`MaintenanceSliceKind`]
+//! unchanged. Pump is its own three-phase rotation. This module does not
 //! import terminal semantic bodies and does not name package-owned product
 //! policy.
 
@@ -55,6 +62,12 @@ const FANOUT_QUEUE_MAX_ITEMS: usize = 32;
 const FANOUT_QUEUE_MAX_BYTES: usize = 64 * 1024;
 const HOST_BRIDGE_MAX_BYTES: usize = 64 * 1024;
 const CONSUMER_REFRESH_MAX: usize = 8;
+/// CloseEvents visits this many admissions per Pump slice.
+pub const PUMP_MAX_ADMISSIONS_VISITED: usize = 8;
+/// CloseEvents classifies this many closed-route candidates per Pump slice.
+pub const PUMP_MAX_CANDIDATE_CLASSIFICATIONS: usize = 8;
+/// InventoryReconcile validates this many bound routes per Pump slice.
+pub const PUMP_MAX_ROUTES_VALIDATED: usize = 8;
 
 fn queued_queue_bytes(frames: &VecDeque<serde_json::Value>) -> usize {
     frames
@@ -143,6 +156,142 @@ impl MaintenanceScheduler {
         self.next = kind.next();
         self.wake = false;
         kind
+    }
+}
+
+/// Policy-neutral owner-loop background class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackgroundClass {
+    Maintenance,
+    Pump,
+}
+
+/// One Pump selection runs exactly one of these phases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PumpPhase {
+    Observe,
+    CloseEvents,
+    InventoryReconcile,
+}
+
+impl PumpPhase {
+    fn next(self) -> Self {
+        match self {
+            Self::Observe => Self::CloseEvents,
+            Self::CloseEvents => Self::InventoryReconcile,
+            Self::InventoryReconcile => Self::Observe,
+        }
+    }
+}
+
+/// Resume cursor over Unix then WebRTC admission maps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PumpAdmissionCursor {
+    Unix { after: Option<String> },
+    Webrtc { after: Option<String> },
+}
+
+impl Default for PumpAdmissionCursor {
+    fn default() -> Self {
+        Self::Unix { after: None }
+    }
+}
+
+/// Continuation state for the Pump class rotation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PumpScheduler {
+    next: PumpPhase,
+    pub close_cursor: PumpAdmissionCursor,
+    pub reconcile_after: Option<(String, String)>,
+}
+
+impl Default for PumpScheduler {
+    fn default() -> Self {
+        Self {
+            next: PumpPhase::Observe,
+            close_cursor: PumpAdmissionCursor::default(),
+            reconcile_after: None,
+        }
+    }
+}
+
+impl PumpScheduler {
+    /// Consume the current phase and advance the rotation.
+    pub fn take_phase(&mut self) -> PumpPhase {
+        let phase = self.next;
+        self.next = phase.next();
+        phase
+    }
+}
+
+/// Coalesced Pump pending plus last-served class. Maintenance pending is
+/// derived from [`MaintenanceState::needs_work`] and sibling wake sources.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BackgroundClassScheduler {
+    pump_pending: bool,
+    last_served: Option<BackgroundClass>,
+}
+
+impl BackgroundClassScheduler {
+    /// Coalesce a Pump mark. Repeated marks stay one pending flag.
+    pub fn mark_pump(&mut self) {
+        self.pump_pending = true;
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn pump_pending(&self) -> bool {
+        self.pump_pending
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn last_served(&self) -> Option<BackgroundClass> {
+        self.last_served
+    }
+
+    #[must_use]
+    pub fn has_pending(&self, maintenance_pending: bool) -> bool {
+        maintenance_pending || self.pump_pending
+    }
+
+    /// Select at most one class. Consumes Pump pending only when Pump wins.
+    pub fn select(&mut self, maintenance_pending: bool) -> Option<BackgroundClass> {
+        let selected = match (maintenance_pending, self.pump_pending) {
+            (false, false) => None,
+            (true, false) => Some(BackgroundClass::Maintenance),
+            (false, true) => Some(BackgroundClass::Pump),
+            (true, true) => match self.last_served {
+                Some(BackgroundClass::Maintenance) => Some(BackgroundClass::Pump),
+                _ => Some(BackgroundClass::Maintenance),
+            },
+        };
+        if selected == Some(BackgroundClass::Pump) {
+            self.pump_pending = false;
+        }
+        if selected.is_some() {
+            self.last_served = selected;
+        }
+        selected
+    }
+}
+
+/// One owner turn never returns two background slices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackgroundTurnDecision {
+    None,
+    OneSlice(BackgroundClass),
+}
+
+/// Fair background decision after control is served or skipped.
+#[must_use]
+pub fn decide_background_slice(
+    scheduler: &mut BackgroundClassScheduler,
+    maintenance_pending: bool,
+) -> BackgroundTurnDecision {
+    match scheduler.select(maintenance_pending) {
+        Some(class) => BackgroundTurnDecision::OneSlice(class),
+        None => BackgroundTurnDecision::None,
     }
 }
 
@@ -2902,5 +3051,122 @@ mod tests {
             let _ = runtime.shutdown_session(SessionId(id.clone()), 2);
         }
         let _ = std::fs::remove_dir_all(data_directory);
+    }
+
+    #[test]
+    fn background_selection_alternates_when_both_classes_are_pending() {
+        let mut scheduler = BackgroundClassScheduler::default();
+        scheduler.mark_pump();
+        let first = scheduler.select(true);
+        let second = scheduler.select(true);
+        let third = scheduler.select(true);
+        assert_eq!(first, Some(BackgroundClass::Maintenance));
+        assert_eq!(second, Some(BackgroundClass::Pump));
+        assert_eq!(third, Some(BackgroundClass::Maintenance));
+    }
+
+    #[test]
+    fn one_pending_class_runs_on_consecutive_turns() {
+        let mut scheduler = BackgroundClassScheduler::default();
+        scheduler.mark_pump();
+        assert_eq!(scheduler.select(false), Some(BackgroundClass::Pump));
+        scheduler.mark_pump();
+        assert_eq!(scheduler.select(false), Some(BackgroundClass::Pump));
+        assert_eq!(scheduler.select(true), Some(BackgroundClass::Maintenance));
+        assert_eq!(scheduler.select(true), Some(BackgroundClass::Maintenance));
+    }
+
+    #[test]
+    fn background_marks_coalesce_to_one_pending_flag() {
+        let mut scheduler = BackgroundClassScheduler::default();
+        scheduler.mark_pump();
+        scheduler.mark_pump();
+        scheduler.mark_pump();
+        assert_eq!(scheduler.select(false), Some(BackgroundClass::Pump));
+        assert_eq!(scheduler.select(false), None);
+    }
+
+    #[test]
+    fn one_turn_decision_never_returns_two_slices() {
+        let mut scheduler = BackgroundClassScheduler::default();
+        scheduler.mark_pump();
+        let decision = decide_background_slice(&mut scheduler, true);
+        assert!(matches!(
+            decision,
+            BackgroundTurnDecision::OneSlice(BackgroundClass::Maintenance)
+        ));
+        assert!(scheduler.pump_pending());
+        let second = decide_background_slice(&mut scheduler, true);
+        assert!(matches!(
+            second,
+            BackgroundTurnDecision::OneSlice(BackgroundClass::Pump)
+        ));
+    }
+
+    #[test]
+    fn selected_slice_survives_a_later_control_arrival() {
+        let mut scheduler = BackgroundClassScheduler::default();
+        scheduler.mark_pump();
+        let selected = scheduler.select(true);
+        assert_eq!(selected, Some(BackgroundClass::Maintenance));
+        scheduler.mark_pump();
+        assert_eq!(selected, Some(BackgroundClass::Maintenance));
+        assert_eq!(scheduler.last_served(), Some(BackgroundClass::Maintenance));
+    }
+
+    #[test]
+    fn inverted_reselection_after_control_cancels_the_chosen_slice() {
+        let mut scheduler = BackgroundClassScheduler::default();
+        scheduler.mark_pump();
+        let selected = scheduler.select(true);
+        assert_eq!(selected, Some(BackgroundClass::Maintenance));
+        let inverted = scheduler.select(true);
+        assert_eq!(inverted, Some(BackgroundClass::Pump));
+        assert_ne!(selected, inverted);
+    }
+
+    #[test]
+    fn composed_scheduler_executes_subscriber_delivery_and_host_bridge() {
+        let mut classes = BackgroundClassScheduler::default();
+        let mut maintenance = MaintenanceScheduler::default();
+        let mut subscriber_at = None;
+        let mut host_bridge_at = None;
+        for turn in 0..18 {
+            classes.mark_pump();
+            let class = classes.select(true).expect("both classes stay pending");
+            if class != BackgroundClass::Maintenance {
+                continue;
+            }
+            maintenance.try_wake();
+            let kind = maintenance.take_slice();
+            if kind == MaintenanceSliceKind::HostBridge && host_bridge_at.is_none() {
+                host_bridge_at = Some(turn);
+            }
+            if kind == MaintenanceSliceKind::SubscriberDelivery && subscriber_at.is_none() {
+                subscriber_at = Some(turn);
+            }
+        }
+        assert_eq!(host_bridge_at, Some(8));
+        assert_eq!(subscriber_at, Some(10));
+    }
+
+    #[test]
+    fn pump_phases_rotate_and_keep_cursors() {
+        let mut pump = PumpScheduler::default();
+        assert_eq!(pump.take_phase(), PumpPhase::Observe);
+        assert_eq!(pump.take_phase(), PumpPhase::CloseEvents);
+        pump.close_cursor = PumpAdmissionCursor::Unix {
+            after: Some("client-a".into()),
+        };
+        pump.reconcile_after = Some(("s".into(), "sub".into()));
+        assert_eq!(pump.take_phase(), PumpPhase::InventoryReconcile);
+        assert_eq!(pump.take_phase(), PumpPhase::Observe);
+        assert_eq!(
+            pump.close_cursor,
+            PumpAdmissionCursor::Unix {
+                after: Some("client-a".into())
+            }
+        );
+        assert_eq!(pump.reconcile_after, Some(("s".into(), "sub".into())));
     }
 }
