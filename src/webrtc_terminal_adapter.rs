@@ -406,17 +406,33 @@ impl WebRtcConnectionMux {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn queue_closed_subscription_events(
         &self,
         session_is_live: impl Fn(&str) -> bool,
     ) -> usize {
+        self.queue_closed_subscription_events_bounded(
+            |session_id| Some(session_is_live(session_id)),
+            usize::MAX,
+        )
+        .classified
+    }
+
+    pub(crate) fn queue_closed_subscription_events_bounded(
+        &self,
+        mut classify: impl FnMut(&str) -> Option<bool>,
+        max_candidates: usize,
+    ) -> crate::unix_terminal_adapter::ClosedEventSliceProgress {
         if self.is_dying() {
             if let Ok(mut routes) = self.inner.routes.lock() {
                 for route in routes.iter_mut() {
                     route.reported = true;
                 }
             }
-            return 0;
+            return crate::unix_terminal_adapter::ClosedEventSliceProgress {
+                classified: 0,
+                more: false,
+            };
         }
         let suppressed_sessions = self
             .inner
@@ -431,12 +447,18 @@ impl WebRtcConnectionMux {
             .map(|generations| generations.clone())
             .unwrap_or_default();
         let mut queued = Vec::new();
+        let mut classified = 0;
+        let mut more = false;
         if let Ok(mut routes) = self.inner.routes.lock() {
             for route in routes.iter_mut() {
                 if route.reported || !route.handle.is_closed() {
                     continue;
                 }
-                route.reported = true;
+                if classified >= max_candidates {
+                    more = true;
+                    break;
+                }
+                classified += 1;
                 if suppressed_sessions
                     .iter()
                     .any(|session| session == &route.session_id)
@@ -445,9 +467,17 @@ impl WebRtcConnectionMux {
                             && key.1 == route.subscription_id
                             && key.2 == route.generation
                     })
-                    || !session_is_live(&route.session_id)
                 {
+                    route.reported = true;
                     continue;
+                }
+                match classify(&route.session_id) {
+                    None => continue,
+                    Some(false) => {
+                        route.reported = true;
+                        continue;
+                    }
+                    Some(true) => route.reported = true,
                 }
                 let reason = if route.handle.host_closed() {
                     TERMINAL_SUBSCRIPTION_CLOSED_HOST_ADAPTER
@@ -462,14 +492,13 @@ impl WebRtcConnectionMux {
                 });
             }
         }
-        let count = queued.len();
-        if count > 0 {
+        if !queued.is_empty() {
             if let Ok(mut pending) = self.inner.pending_events.lock() {
                 pending.extend(queued);
             }
             self.inner.wake.wake();
         }
-        count
+        crate::unix_terminal_adapter::ClosedEventSliceProgress { classified, more }
     }
 
     pub(crate) fn pop_pending_event(&self) -> Option<DaemonEvent> {

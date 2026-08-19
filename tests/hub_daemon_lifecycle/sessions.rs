@@ -2772,6 +2772,26 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
         "the one shared idle backstop must stay low-frequency"
     );
 
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: "focused-pty-progress".to_string(),
+            command: "sh -c 'i=0; while [ \"$i\" -lt 80 ]; do i=$((i+1)); printf x; sleep 0.05; done'".to_string(),
+        },
+    )
+    .expect("spawn PTY progress producer");
+    thread::sleep(Duration::from_millis(150));
+    let screen_before = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::ReadScreen {
+            session_id: "focused-pty-progress".to_string(),
+        },
+    )
+    .expect("read PTY screen before flood")
+    .read_screen
+    .map(|screen| screen.text)
+    .unwrap_or_default();
+
     const FLOOD_CONNECTIONS: usize = 32;
     const FLOOD_REQUESTS_PER_CONNECTION: usize = 512;
     let mut flood_writers = Vec::new();
@@ -2833,6 +2853,47 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
         flood_after.reconciliation_wakes > flood_before.reconciliation_wakes,
         "a continuously busy control queue must not starve shared entity reconciliation"
     );
+    let screen_after = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::ReadScreen {
+            session_id: "focused-pty-progress".to_string(),
+        },
+    )
+    .expect("read PTY screen during flood")
+    .read_screen
+    .map(|screen| screen.text)
+    .unwrap_or_default();
+    let before_xs = screen_before.matches('x').count();
+    let after_xs = screen_after.matches('x').count();
+    assert!(
+        after_xs > before_xs,
+        "PTY output must progress during the Status flood; before={before_xs} after={after_xs} text={screen_after:?}"
+    );
+    let complete_deadline = Instant::now() + Duration::from_secs(8);
+    let mut complete_text = screen_after.clone();
+    while complete_text.matches('x').count() < 80 && Instant::now() < complete_deadline {
+        complete_text = botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::ReadScreen {
+                session_id: "focused-pty-progress".to_string(),
+            },
+        )
+        .expect("read PTY screen for complete output")
+        .read_screen
+        .map(|screen| screen.text)
+        .unwrap_or_default();
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        complete_text.matches('x').count() >= 80,
+        "the complete producer output must arrive; text={complete_text:?}"
+    );
+    let _ = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::ShutdownSession {
+            session_id: "focused-pty-progress".to_string(),
+        },
+    );
 
     for index in 0..8 {
         botster_hub_client::request(
@@ -2849,6 +2910,7 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
         if let botster_hub_client::DaemonEntityFrame::Upsert { id, .. } = subscription
             .next_frame()
             .expect("session-count fixture upsert")
+            && id.starts_with("focused-idle-session-")
         {
             upserts.insert(id, ());
         }
@@ -2879,13 +2941,16 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
                         for item in items {
                             if let Some(id) =
                                 item.get("session_uuid").and_then(serde_json::Value::as_str)
+                                && id.starts_with("focused-idle-session-")
                             {
                                 seen.insert(id.to_string());
                             }
                         }
                     }
                     botster_hub_client::DaemonEntityFrame::Upsert { id, .. } => {
-                        seen.insert(id);
+                        if id.starts_with("focused-idle-session-") {
+                            seen.insert(id);
+                        }
                     }
                     _ => {}
                 },

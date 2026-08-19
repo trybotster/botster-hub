@@ -13,6 +13,12 @@ Revision 3 answers Plan Review `review_1787104175_260710`:
 - `finding_1787104176_752235`: CloseEvents uses the exact **non-mutating** registry-state query instead of `observe_session_lifecycle`, so it cannot advance lifecycle or raise a journal wake; a behavior matrix (running / exited / shutdown / query-error) plus a no-wake proof enters acceptance (sections 3 and Acceptance).
 - `finding_1787104176_111090`: the existing vault checklist items are updated in place with revision context; no new checklist.
 
+Implement notes (revision 3 as shipped):
+- `reconciliation_wakes` still counts Maintenance slices only. Pump progress is the flood PTY oracle and the ready-Spawn observation.
+- After-control close-event queue remains, using the exact registry query.
+- CloseEvents retries Absent and query error instead of marking reported.
+- Successful control remakes Pump pending. Interval due also wakes Maintenance. One turn still runs one class.
+
 ## Target
 
 - Target repository: `botster-hub` (`trybotster/botster-hub`).

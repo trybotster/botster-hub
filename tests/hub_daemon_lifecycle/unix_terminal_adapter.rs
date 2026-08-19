@@ -1592,7 +1592,7 @@ fn core_write_budget_hard_stop_emits_core_adapter_closed() {
     );
 
     eprintln!(
-        "core_write_budget provenance hub_bin={} session_worker={} hub_sha={} locked_core=302c7f7b61f3970a0151b8c6646fc21ae7bd6c67",
+        "core_write_budget provenance hub_bin={} session_worker={} hub_sha={} locked_core=8fce2041b9fe742cb2a6df9e74cb262606672742",
         env!("CARGO_BIN_EXE_botster-hub"),
         session_worker_binary_path().display(),
         option_env!("BOTSTER_HUB_GIT_SHA").unwrap_or("worktree")

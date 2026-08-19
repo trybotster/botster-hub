@@ -8,7 +8,7 @@ license-file = "../../LICENSE"
 
 [dependencies]
 base64 = "0.22.1"
-botster-terminal-protocol = { git = "https://github.com/trybotster/botster-core.git", rev = "302c7f7b61f3970a0151b8c6646fc21ae7bd6c67" }
+botster-terminal-protocol = { git = "https://github.com/trybotster/botster-core.git", rev = "8fce2041b9fe742cb2a6df9e74cb262606672742" }
 botster-ui-contract = { git = "https://github.com/trybotster/botster-hub.git", tag = "botster-ui-contract-v0.3.2" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
