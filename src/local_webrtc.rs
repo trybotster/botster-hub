@@ -112,9 +112,21 @@ where
     }
 }
 /// Ephemeral local WebRTC admission and peer registry.
+#[derive(Clone)]
+struct SharedEventPlane(Arc<crate::daemon_event_subscriptions::ClientEventPlane>);
+
+impl Default for SharedEventPlane {
+    fn default() -> Self {
+        Self(Arc::new(
+            crate::daemon_event_subscriptions::ClientEventPlane::default(),
+        ))
+    }
+}
+
 #[derive(Default)]
 pub struct LocalWebrtcTransport {
     grants: BTreeMap<String, LocalWebrtcGrant>,
+    event_plane: SharedEventPlane,
     peers: BTreeMap<String, Arc<dyn PeerConnection>>,
     /// Live peer ownership records used for fail-closed sibling cleanup.
     peer_states: BTreeMap<String, Arc<LocalWebrtcPeerState>>,
@@ -150,6 +162,11 @@ pub(crate) struct PeerRemoveResult {
 }
 
 impl LocalWebrtcTransport {
+    #[must_use]
+    pub(crate) fn event_plane(&self) -> Arc<crate::daemon_event_subscriptions::ClientEventPlane> {
+        self.event_plane.0.clone()
+    }
+
     /// Mint a local, single-use bootstrap grant bound to an already-running app origin.
     pub fn issue_bootstrap(
         &mut self,
@@ -200,9 +217,10 @@ impl LocalWebrtcTransport {
         grant.redeemed = true;
         let grant_id = grant.grant_id.clone();
 
+        let event_plane = self.event_plane.0.clone();
         let answer = self
             .runtime()?
-            .block_on(answer_offer(request, runtime_tx))?;
+            .block_on(answer_offer(request, runtime_tx, event_plane))?;
         self.peers.insert(grant_id.clone(), answer.peer);
         self.peer_states.insert(grant_id.clone(), answer.peer_state);
         #[cfg(test)]
@@ -622,6 +640,7 @@ impl LocalWebrtcAttachedSubscriptionChange {
 struct LocalWebrtcPeerState {
     grant_id: String,
     runtime_tx: ControlSender,
+    event_plane: Arc<crate::daemon_event_subscriptions::ClientEventPlane>,
     attached_subscriptions: Mutex<Vec<LocalWebrtcAttachedSubscription>>,
     entity_subscription_ids: Mutex<BTreeSet<String>>,
     terminal_state: Mutex<LocalWebrtcTerminalState>,
@@ -645,6 +664,7 @@ enum LocalWebrtcInbound {
     Channel(Result<Option<DataChannelEvent>, LocalWebrtcTerminalCause>),
     Entity(DaemonEntityFrame),
     AdapterReady,
+    HostEventReady,
 }
 
 enum DataChannelPlaintext {
@@ -796,11 +816,25 @@ fn pop_pending_request(
 }
 
 impl LocalWebrtcPeerState {
+    #[allow(dead_code)]
     fn new(grant_id: String, runtime_tx: ControlSender) -> Self {
+        Self::new_with_event_plane(
+            grant_id,
+            runtime_tx,
+            Arc::new(crate::daemon_event_subscriptions::ClientEventPlane::default()),
+        )
+    }
+
+    fn new_with_event_plane(
+        grant_id: String,
+        runtime_tx: ControlSender,
+        event_plane: Arc<crate::daemon_event_subscriptions::ClientEventPlane>,
+    ) -> Self {
         let (peer_terminal_tx, _peer_terminal_rx) = watch::channel(None);
         Self {
             grant_id,
             runtime_tx,
+            event_plane,
             attached_subscriptions: Mutex::new(Vec::new()),
             entity_subscription_ids: Mutex::new(BTreeSet::new()),
             terminal_state: Mutex::new(LocalWebrtcTerminalState::default()),
@@ -1189,14 +1223,19 @@ where
     let mut send_failure = None;
     let mut terminal_cause = LocalWebrtcTerminalCause::PollEnded;
     let mut peer_terminal_rx = peer_state.subscribe_peer_terminal();
+    let mut last_host_class = None;
+    let mut pending_entity = None;
     let mut open = true;
     while open {
-        if let Err(failure) = flush_webrtc_host_events(
+        if let Err(failure) = flush_ready_webrtc_host_control(
             data_channel,
             stream_key,
             peer_state,
             &mut pending_requests,
             &mut flow_control,
+            &mut entity_frame_rx,
+            &mut pending_entity,
+            &mut last_host_class,
         )
         .await
         {
@@ -1205,14 +1244,16 @@ where
             send_failure = Some(failure);
             break;
         }
-        if let Err(failure) = flush_webrtc_adapter_frames(
-            data_channel,
-            stream_key,
-            peer_state,
-            &mut pending_requests,
-            &mut flow_control,
-        )
-        .await
+        if pending_entity.is_none()
+            && !host_event_ready(peer_state)
+            && let Err(failure) = flush_webrtc_adapter_frames(
+                data_channel,
+                stream_key,
+                peer_state,
+                &mut pending_requests,
+                &mut flow_control,
+            )
+            .await
         {
             eprintln!("{failure}");
             terminal_cause = failure.cause;
@@ -1222,16 +1263,25 @@ where
         let pending = if let Some(request) = pop_pending_request(&mut pending_requests) {
             request
         } else {
+            let mailbox = peer_state.event_plane.mailbox(&peer_state.grant_id);
+            let events_ready = host_event_ready(peer_state);
             let inbound = tokio::select! {
                 biased;
                 channel = poll_data_channel_or_peer_terminal(data_channel, &mut peer_terminal_rx) => {
                     LocalWebrtcInbound::Channel(channel)
                 }
-                frame = entity_frame_rx.recv() => {
+                frame = entity_frame_rx.recv(), if !events_ready => {
                     LocalWebrtcInbound::Entity(
                         frame.expect("local WebRTC peer owns its entity subscription sender")
                     )
                 }
+                _ = async {
+                    if let Some(mailbox) = mailbox.as_ref() {
+                        mailbox.notify().notified().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => LocalWebrtcInbound::HostEventReady,
                 _ = peer_state.mux.wait_for_write() => {
                     LocalWebrtcInbound::AdapterReady
                 }
@@ -1247,38 +1297,8 @@ where
                     terminal_cause = cause;
                     break;
                 }
-                LocalWebrtcInbound::AdapterReady => {
-                    if let Err(failure) = flush_webrtc_host_events(
-                        data_channel,
-                        stream_key,
-                        peer_state,
-                        &mut pending_requests,
-                        &mut flow_control,
-                    )
-                    .await
-                    {
-                        eprintln!("{failure}");
-                        terminal_cause = failure.cause;
-                        send_failure = Some(failure);
-                        break;
-                    }
-                    if let Err(failure) = flush_webrtc_adapter_frames(
-                        data_channel,
-                        stream_key,
-                        peer_state,
-                        &mut pending_requests,
-                        &mut flow_control,
-                    )
-                    .await
-                    {
-                        eprintln!("{failure}");
-                        terminal_cause = failure.cause;
-                        send_failure = Some(failure);
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                    continue;
-                }
+                LocalWebrtcInbound::HostEventReady => continue,
+                LocalWebrtcInbound::AdapterReady => continue,
                 LocalWebrtcInbound::Channel(Ok(Some(DataChannelEvent::OnMessage(message)))) => {
                     match decrypt_data_channel_plaintext(stream_key, message.data.as_ref()) {
                         Some(DataChannelPlaintext::Hello(hello)) => {
@@ -1356,6 +1376,7 @@ where
                     .send(ControlMessage::RegisterWebrtcAdmission {
                         grant_id: peer_state.grant_id.clone(),
                         admission,
+                        host_required_features: hello.compatibility.required_features.clone(),
                     })
                     .await;
             }
@@ -1784,14 +1805,16 @@ fn apply_data_channel_event(
 async fn answer_offer(
     request: LocalWebrtcSignalRequest,
     runtime_tx: ControlSender,
+    event_plane: Arc<crate::daemon_event_subscriptions::ClientEventPlane>,
 ) -> LocalWebrtcResult<LocalWebrtcAnswer> {
     let runtime = default_runtime()
         .ok_or_else(|| LocalWebrtcError::Webrtc("no async runtime".to_string()))?;
     let stream_key = secret_stream_key(&request.grant_secret)?;
     let (gather_complete_tx, mut gather_complete_rx) = channel::<()>(1);
-    let peer_state = Arc::new(LocalWebrtcPeerState::new(
+    let peer_state = Arc::new(LocalWebrtcPeerState::new_with_event_plane(
         request.grant_id.clone(),
         runtime_tx,
+        event_plane,
     ));
     let handler = Arc::new(LocalWebrtcHandler {
         stream_key,
@@ -1945,6 +1968,109 @@ fn framed_daemon_event(key: &AesGcmKey, event: &DaemonEvent) -> LocalWebrtcResul
     )
 }
 
+fn host_event_ready(peer_state: &LocalWebrtcPeerState) -> bool {
+    peer_state.mux.has_pending_event()
+        || peer_state
+            .event_plane
+            .mailbox(&peer_state.grant_id)
+            .is_some_and(|mailbox| mailbox.has_ready_event())
+}
+
+fn take_host_event(peer_state: &LocalWebrtcPeerState) -> Option<DaemonEvent> {
+    if let Some(event) = peer_state.mux.pop_pending_event() {
+        return Some(event);
+    }
+    peer_state
+        .event_plane
+        .mailbox(&peer_state.grant_id)
+        .and_then(|mailbox| mailbox.take_ready_event())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn flush_ready_webrtc_host_control<D>(
+    data_channel: &D,
+    stream_key: &AesGcmKey,
+    peer_state: &LocalWebrtcPeerState,
+    pending_requests: &mut VecDeque<PendingLocalWebrtcRequest>,
+    flow_control: &mut LocalWebrtcFlowControl,
+    entity_frame_rx: &mut tokio_mpsc::Receiver<DaemonEntityFrame>,
+    pending_entity: &mut Option<DaemonEntityFrame>,
+    last_host_class: &mut Option<crate::host_control_fair_write::HostControlClass>,
+) -> Result<(), LocalWebrtcSendFailure>
+where
+    D: LocalWebrtcDataChannel + ?Sized,
+{
+    use crate::host_control_fair_write::{HostControlClass, next_ready_host_control_class};
+
+    loop {
+        if pending_entity.is_none()
+            && let Ok(frame) = entity_frame_rx.try_recv()
+        {
+            *pending_entity = Some(frame);
+        }
+        let entity_ready = pending_entity.as_ref().is_some_and(|frame| {
+            peer_state.owns_entity_subscription(entity_frame_subscription_id(frame))
+        });
+        if pending_entity.is_some() && !entity_ready {
+            *pending_entity = None;
+            continue;
+        }
+        match next_ready_host_control_class(
+            *last_host_class,
+            false,
+            entity_ready,
+            host_event_ready(peer_state),
+        ) {
+            Some(HostControlClass::Entity) => {
+                let Some(frame) = pending_entity.take() else {
+                    return Ok(());
+                };
+                *last_host_class = Some(HostControlClass::Entity);
+                let frames = match framed_daemon_entity_frame(stream_key, &frame) {
+                    Ok(frames) => frames,
+                    Err(_) => continue,
+                };
+                send_response_frames(
+                    data_channel,
+                    stream_key,
+                    &frames,
+                    pending_requests,
+                    flow_control,
+                    peer_state,
+                )
+                .await?;
+            }
+            Some(HostControlClass::Event) => {
+                let Some(event) = take_host_event(peer_state) else {
+                    return Ok(());
+                };
+                if matches!(event, DaemonEvent::TerminalSubscriptionClosed { .. })
+                    && !peer_state.mux.close_events_admitted()
+                {
+                    continue;
+                }
+                *last_host_class = Some(HostControlClass::Event);
+                peer_state.begin_operation("host_event_delivery");
+                let frames = match framed_daemon_event(stream_key, &event) {
+                    Ok(frames) => frames,
+                    Err(_) => continue,
+                };
+                send_response_frames(
+                    data_channel,
+                    stream_key,
+                    &frames,
+                    pending_requests,
+                    flow_control,
+                    peer_state,
+                )
+                .await?;
+            }
+            Some(HostControlClass::Control) | None => return Ok(()),
+        }
+    }
+}
+
+#[allow(dead_code)]
 async fn flush_webrtc_host_events<D>(
     data_channel: &D,
     stream_key: &AesGcmKey,
@@ -4350,7 +4476,7 @@ mod tests {
             LAST_SESSION_CLEANUP_ERROR.with(|slot| *slot.borrow_mut() = None);
             let data_directory = unique_test_data_dir(label);
             let terminal_path = data_directory.join(LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE);
-            let daemon = start_test_daemon(data_directory.clone());
+            let mut daemon = start_test_daemon(data_directory.clone());
             let (control_tx, control_rx) = tokio_mpsc::channel(256);
             let transport_runtime = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(1)
@@ -4359,9 +4485,12 @@ mod tests {
                 .build()
                 .expect("control transport runtime");
             let transport_handle = transport_runtime.handle().clone();
+            #[allow(clippy::field_reassign_with_default)]
+            let mut state = DaemonControlState::default();
+            state.event_plane = daemon.local_webrtc().event_plane();
             Self {
                 daemon,
-                state: DaemonControlState::default(),
+                state,
                 terminal_path,
                 control_tx,
                 control_rx,
@@ -5237,6 +5366,87 @@ mod tests {
         );
 
         peer.close_offer();
+        harness.cleanup();
+    }
+
+    #[test]
+    fn webrtc_subscribe_events_requires_host_negotiation() {
+        let _teardown_guard = teardown_test_lock();
+        let mut harness = PeerHarness::new("evt");
+        let mut peer = harness.signal_peer("http://127.0.0.1:41901");
+        harness.hello_on_peer(
+            &mut peer,
+            DaemonHello {
+                protocol: PROTOCOL.to_string(),
+                compatibility: botster_hub_client::DaemonCompatibilityRequirement::current(),
+                terminal_compatibility: Some(
+                    botster_terminal_protocol::TerminalCompatibilityRequirement {
+                        protocol: "botster-terminal-v1".to_string(),
+                        protocol_version: 99,
+                        required_features: vec!["missing_terminal_feature".to_string()],
+                        minimum_conformance_fixture_revision: 1,
+                        client_name: "webrtc-event-reject-terminal".to_string(),
+                    },
+                ),
+            },
+        );
+        let unnegotiated = harness.request_on_peer(
+            &mut peer,
+            DaemonRequest::SubscribeEvents {
+                subscription_id: "sub".to_string(),
+                owner: "event-plane-producer".to_string(),
+                name: "sample.ready".to_string(),
+                subjects: Vec::new(),
+            },
+            "SubscribeEvents",
+        );
+        assert_eq!(
+            unnegotiated.kind,
+            botster_hub_client::DaemonResponseKind::OperatorError
+        );
+        assert_eq!(
+            unnegotiated.error.as_ref().map(|error| error.code.as_str()),
+            Some("package_event_subscriptions_not_negotiated")
+        );
+        let status = harness.request_on_peer(&mut peer, DaemonRequest::Status, "Status");
+        assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
+
+        let mut negotiated = harness.signal_peer("http://127.0.0.1:41902");
+        harness.hello_on_peer(
+            &mut negotiated,
+            DaemonHello {
+                protocol: PROTOCOL.to_string(),
+                compatibility:
+                    botster_hub_client::DaemonCompatibilityRequirement::for_package_event_subscriptions(),
+                terminal_compatibility: Some(
+                    botster_terminal_protocol::TerminalCompatibilityRequirement {
+                        protocol: "botster-terminal-v1".to_string(),
+                        protocol_version: 99,
+                        required_features: vec!["missing_terminal_feature".to_string()],
+                        minimum_conformance_fixture_revision: 1,
+                        client_name: "webrtc-event-reject-terminal".to_string(),
+                    },
+                ),
+            },
+        );
+        let subscribed = harness.request_on_peer(
+            &mut negotiated,
+            DaemonRequest::SubscribeEvents {
+                subscription_id: "sub-neg".to_string(),
+                owner: "event-plane-producer".to_string(),
+                name: "sample.ready".to_string(),
+                subjects: Vec::new(),
+            },
+            "SubscribeEvents",
+        );
+        assert_eq!(
+            subscribed.error.as_ref().map(|error| error.code.as_str()),
+            Some("rejected_undeclared")
+        );
+        let status = harness.request_on_peer(&mut negotiated, DaemonRequest::Status, "Status");
+        assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
+        peer.close_offer();
+        negotiated.close_offer();
         harness.cleanup();
     }
 

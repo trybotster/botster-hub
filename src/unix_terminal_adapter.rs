@@ -521,6 +521,14 @@ impl UnixConnectionMux {
         }
     }
 
+    pub(crate) fn has_pending_event(&self) -> bool {
+        self.inner
+            .pending_events
+            .lock()
+            .ok()
+            .is_some_and(|pending| !pending.is_empty())
+    }
+
     pub(crate) fn pop_pending_event(&self) -> Option<DaemonEvent> {
         self.inner
             .pending_events

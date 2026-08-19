@@ -5510,6 +5510,7 @@ mod tests {
                     botster_hub_client::FEATURE_TERMINAL_SUBSCRIPTION_CLOSED,
                     botster_hub_client::FEATURE_WEBRTC_TERMINAL_ADAPTER,
                     botster_hub_client::FEATURE_ATTACH_OCCUPANCY,
+                    botster_hub_client::FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS,
                 ],
                 "diagnostic_kinds": [
                     "connected",

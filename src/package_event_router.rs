@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::config::PackageEventPlanePolicy;
+use crate::daemon_event_subscriptions::ClientEventMailbox;
 use crate::package_event_schema::{CompiledEventSchema, worktree_lifecycle_schema};
 
 pub const HUB_EVENT_OWNER: &str = "hub";
@@ -122,6 +123,17 @@ pub struct EventSubscription {
     pub plugin_generation: u64,
 }
 
+/// Connection-scoped client holder. Identity is `(connection_id, subscription_id)`.
+#[derive(Clone)]
+pub(crate) struct ClientEventHolder {
+    pub connection_id: String,
+    pub subscription_id: String,
+    pub owner: String,
+    pub name: String,
+    pub subjects: BTreeSet<String>,
+    pub mailbox: Arc<ClientEventMailbox>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct HolderId {
     pub consumer_plugin_key: u64,
@@ -194,6 +206,8 @@ struct RouterInner {
     policy: PackageEventPlanePolicy,
     contracts: HashMap<(String, String), EmittedContract>,
     subscriptions: HashMap<(String, String), Vec<EventSubscription>>,
+    client_holders: HashMap<(String, String), Vec<ClientEventHolder>>,
+    client_by_id: HashMap<(String, String), (String, String)>,
     subscriptions_per_plugin: HashMap<String, usize>,
     producer: HashMap<String, ProducerOccupancy>,
     consumers: HashMap<String, ConsumerQueue>,
@@ -235,6 +249,8 @@ impl PackageEventRouter {
                 policy,
                 contracts,
                 subscriptions: HashMap::new(),
+                client_holders: HashMap::new(),
+                client_by_id: HashMap::new(),
                 subscriptions_per_plugin: HashMap::new(),
                 producer: HashMap::new(),
                 consumers: HashMap::new(),
@@ -349,6 +365,35 @@ impl PackageEventRouter {
         subscribe_locked(&mut inner, subscription)
     }
 
+    pub(crate) fn try_subscribe_client(&self, holder: ClientEventHolder) -> EventPlaneStatus {
+        let mut inner = match lock_inner(&self.inner) {
+            Ok(inner) => inner,
+            Err(status) => return status,
+        };
+        subscribe_client_locked(&mut inner, holder)
+    }
+
+    pub(crate) fn try_unsubscribe_client(
+        &self,
+        connection_id: &str,
+        subscription_id: &str,
+    ) -> EventPlaneStatus {
+        let mut inner = match lock_inner(&self.inner) {
+            Ok(inner) => inner,
+            Err(status) => return status,
+        };
+        unsubscribe_client_locked(&mut inner, connection_id, subscription_id)
+    }
+
+    pub(crate) fn try_cleanup_client_connection(&self, connection_id: &str) -> EventPlaneStatus {
+        let mut inner = match lock_inner(&self.inner) {
+            Ok(inner) => inner,
+            Err(status) => return status,
+        };
+        cleanup_client_connection_locked(&mut inner, connection_id);
+        EventPlaneStatus::Accepted
+    }
+
     pub fn try_ingress(
         &self,
         caller_owner: &str,
@@ -391,6 +436,7 @@ impl PackageEventRouter {
         if !consume_token(&mut inner, caller_owner, now) {
             return EventPlaneStatus::RejectedOverRate;
         }
+        deliver_to_client_holders(&inner, caller_owner, name, payload, encoded.len());
         let selected: Vec<EventSubscription> = inner
             .subscriptions
             .get(&(caller_owner.to_string(), name.to_string()))
@@ -932,6 +978,113 @@ fn subscribe_locked(inner: &mut RouterInner, subscription: EventSubscription) ->
     EventPlaneStatus::Accepted
 }
 
+fn subscribe_client_locked(inner: &mut RouterInner, holder: ClientEventHolder) -> EventPlaneStatus {
+    if is_wildcard(&holder.owner) || is_wildcard(&holder.name) {
+        return EventPlaneStatus::RejectedWildcard;
+    }
+    if holder.owner.trim().is_empty() || holder.name.trim().is_empty() {
+        return EventPlaneStatus::RejectedInvalid;
+    }
+    let key = (holder.owner.clone(), holder.name.clone());
+    let Some(contract) = inner.contracts.get(&key) else {
+        return EventPlaneStatus::RejectedUndeclared;
+    };
+    if !contract.audience.contains(&EventAudience::Clients) {
+        return EventPlaneStatus::RejectedAudience;
+    }
+    let identity = (holder.connection_id.clone(), holder.subscription_id.clone());
+    if inner.client_by_id.contains_key(&identity) {
+        return EventPlaneStatus::RejectedInvalid;
+    }
+    let max_subscribers = inner.policy.subscribers_per_event_max;
+    let holders = inner.client_holders.entry(key).or_default();
+    if holders.len() >= max_subscribers {
+        return EventPlaneStatus::RejectedOverFanout;
+    }
+    inner
+        .client_by_id
+        .insert(identity, (holder.owner.clone(), holder.name.clone()));
+    holders.push(holder);
+    EventPlaneStatus::Accepted
+}
+
+fn unsubscribe_client_locked(
+    inner: &mut RouterInner,
+    connection_id: &str,
+    subscription_id: &str,
+) -> EventPlaneStatus {
+    let identity = (connection_id.to_string(), subscription_id.to_string());
+    let Some(key) = inner.client_by_id.remove(&identity) else {
+        return EventPlaneStatus::RejectedInvalid;
+    };
+    if let Some(holders) = inner.client_holders.get_mut(&key) {
+        holders.retain(|holder| {
+            !(holder.connection_id == connection_id && holder.subscription_id == subscription_id)
+        });
+        if holders.is_empty() {
+            inner.client_holders.remove(&key);
+        }
+    }
+    EventPlaneStatus::Accepted
+}
+
+fn cleanup_client_connection_locked(inner: &mut RouterInner, connection_id: &str) {
+    let identities: Vec<(String, String)> = inner
+        .client_by_id
+        .keys()
+        .filter(|(holder_connection, _)| holder_connection == connection_id)
+        .cloned()
+        .collect();
+    for (holder_connection, subscription_id) in identities {
+        let _ = unsubscribe_client_locked(inner, &holder_connection, &subscription_id);
+    }
+}
+
+fn deliver_to_client_holders(
+    inner: &RouterInner,
+    owner: &str,
+    name: &str,
+    payload: &Value,
+    size: usize,
+) {
+    let Some(holders) = inner
+        .client_holders
+        .get(&(owner.to_string(), name.to_string()))
+    else {
+        return;
+    };
+    for holder in holders {
+        if !client_subject_matches(&holder.subjects, payload) {
+            continue;
+        }
+        if holder
+            .mailbox
+            .try_push(
+                &holder.subscription_id,
+                &holder.owner,
+                &holder.name,
+                payload.clone(),
+                size,
+            )
+            .is_err()
+        {
+            holder
+                .mailbox
+                .set_gap(&holder.subscription_id, &holder.owner, &holder.name);
+        }
+    }
+}
+
+fn client_subject_matches(subjects: &BTreeSet<String>, payload: &Value) -> bool {
+    if subjects.is_empty() {
+        return true;
+    }
+    payload
+        .get("subject")
+        .and_then(Value::as_str)
+        .is_some_and(|subject| subjects.contains(subject))
+}
+
 fn bump_package_generation(inner: &mut RouterInner, owner: &str) -> u64 {
     let next = inner
         .package_generation
@@ -970,6 +1123,23 @@ fn apply_unload(inner: &mut RouterInner, owner: &str, generation: u64) {
     inner
         .subscriptions
         .retain(|_, subscriptions| !subscriptions.is_empty());
+    let mut removed_client_ids = Vec::new();
+    for holders in inner.client_holders.values_mut() {
+        holders.retain(|holder| {
+            let drop_holder = holder.owner == owner;
+            if drop_holder {
+                removed_client_ids
+                    .push((holder.connection_id.clone(), holder.subscription_id.clone()));
+            }
+            !drop_holder
+        });
+    }
+    inner
+        .client_holders
+        .retain(|_, holders| !holders.is_empty());
+    for identity in removed_client_ids {
+        inner.client_by_id.remove(&identity);
+    }
     for (plugin, removed) in removed_counts {
         if let Some(count) = inner.subscriptions_per_plugin.get_mut(&plugin) {
             *count = count.saturating_sub(removed);

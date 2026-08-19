@@ -33,7 +33,8 @@
     "unix_terminal_adapter",
     "terminal_subscription_closed",
     "webrtc_terminal_adapter",
-    "attach_occupancy"
+    "attach_occupancy",
+    "package_event_subscriptions"
   ],
   "diagnostic_kinds": [
     "connected",
