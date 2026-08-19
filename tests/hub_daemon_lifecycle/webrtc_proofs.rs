@@ -275,6 +275,7 @@ fn external_hub_webrtc_live_output_preserves_exact_bytes() {
     let (_web_origin, bootstrap) = start_botster_web_and_issue_bootstrap(&endpoint);
     let stream_key = local_webrtc_stream_key(&bootstrap.grant_secret);
 
+    let mut session_cleanup = None;
     block_on(async {
         let (mut offer_peer, offer) = LocalWebrtcOfferPeer::create_offer()
             .await
@@ -310,6 +311,10 @@ fn external_hub_webrtc_live_output_preserves_exact_bytes() {
             },
         )
         .expect("spawn write(2) producer");
+        session_cleanup = Some(SessionCleanupGuard::new(
+            hub.data_dir(),
+            "webrtc-exact-bytes-session",
+        ));
         offer_peer
             .encrypted_hello(
                 &stream_key,
@@ -386,11 +391,13 @@ fn external_hub_webrtc_live_output_preserves_exact_bytes() {
         let _ = offer_peer.peer.close().await;
     });
 
-    shutdown_after_authoritative_exit(
+    let mut session_cleanup = session_cleanup.expect("armed after Spawn");
+    production_cleanup_after_authoritative_exit(
         &endpoint,
         "webrtc-exact-bytes-session",
         "WebRTC exact-bytes after observed exit",
     );
+    session_cleanup.disarm();
 
     let missing = botster_hub_client::request(
         &endpoint,
@@ -459,6 +466,7 @@ fn external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup() {
         .expect("bootstrap response includes local WebRTC bootstrap");
         let stream_key = local_webrtc_stream_key(&bootstrap.grant_secret);
 
+        let mut session_cleanup = None;
         block_on(async {
             let (mut offer_peer, offer) = LocalWebrtcOfferPeer::create_offer()
                 .await
@@ -494,6 +502,7 @@ fn external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup() {
                 },
             )
             .expect("spawn write(2) producer that exits after output");
+            session_cleanup = Some(SessionCleanupGuard::new(hub.data_dir(), session_id.clone()));
             offer_peer
                 .encrypted_hello(
                     &stream_key,
@@ -566,11 +575,13 @@ fn external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup() {
             let _ = offer_peer.peer.close().await;
         });
 
-        shutdown_after_authoritative_exit(
+        let mut session_cleanup = session_cleanup.expect("armed after Spawn");
+        production_cleanup_after_authoritative_exit(
             &endpoint,
             &session_id,
             &format!("round {round} after observed exit"),
         );
+        session_cleanup.disarm();
     }
 
     hub.shutdown().expect("shutdown isolated hub");
