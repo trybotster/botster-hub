@@ -3695,11 +3695,26 @@ fn external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable() {
 
     let sibling_session = "shutdown-failure-sibling";
     let sibling_subscription = "shutdown-failure-sibling-sub";
+    let victim_session = "shutdown-failure-victim";
+    let victim_subscription = "shutdown-failure-victim-sub";
     let mut connection = botster_hub_client::DaemonConnection::connect_with_requirement(
         &endpoint,
         &botster_hub_client::DaemonCompatibilityRequirement::for_unix_terminal_adapter(),
     )
     .expect("open one unix-adapter control connection for failure and sibling proof");
+    let victim_attach = connection
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: victim_session.to_string(),
+            subscription_id: victim_subscription.to_string(),
+        })
+        .expect("attach victim before failed shutdown");
+    assert_eq!(
+        victim_attach.kind,
+        botster_hub_client::DaemonResponseKind::Events,
+        "victim Attach must succeed before failed shutdown, got kind={:?} error={:?}",
+        victim_attach.kind,
+        victim_attach.error
+    );
     let attach = connection
         .request(&botster_hub_client::DaemonRequest::Attach {
             session_id: sibling_session.to_string(),
@@ -3755,6 +3770,28 @@ fn external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable() {
     assert_eq!(before_envelope.subscription_id, sibling_subscription);
     drain_skipped_terminal(&mut connection, sibling_session, sibling_subscription);
 
+    let status_before = connection
+        .request(&botster_hub_client::DaemonRequest::Status)
+        .expect("status before failed shutdown")
+        .status
+        .expect("status body before failed shutdown");
+    let host_closes_before = status_before
+        .lifecycle_counters
+        .cleanup_by_reason
+        .get("shutdown_error_host_close")
+        .copied()
+        .unwrap_or(0);
+    let occupancy_before = status_before.live_attach_occupancy;
+    let victim_generation = occupancy_before
+        .iter()
+        .find_map(|row| {
+            (row.session_id == victim_session && row.subscription_id == victim_subscription)
+                .then_some(row.generation)
+        })
+        .expect("victim Attach must publish a Core-issued generation");
+    let _ = connection.take_skipped_events();
+    let _ = connection.take_skipped_terminal();
+
     for worker in &victim_workers {
         let result = unsafe { libc::kill(worker.pid as libc::pid_t, libc::SIGKILL) };
         assert_eq!(
@@ -3779,12 +3816,22 @@ fn external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable() {
         shutdown.cleanup
     );
     let error = shutdown.error.as_ref().expect("shutdown operator error body");
-    assert!(
-        error.code == "runtime_error" || error.code == "state_error",
-        "live ShutdownSession failure must keep runtime_error or state_error, got {error:?}"
+    assert_eq!(
+        error.code, "runtime_error",
+        "compound drain-inject plus SIGKILL must return runtime_error, got {error:?}"
     );
+    assert_eq!(error.request_id, "daemon-sessions-shutdown");
     assert_eq!(error.operation, "shutdown");
+    assert_eq!(
+        error.message, "runtime failed while handling Shutdown: Runtime",
+        "exact Core-error OperatorError message, got {error:?}"
+    );
+    assert!(
+        error.diagnostics.is_empty(),
+        "Shutdown Runtime OperatorError has no diagnostics, got {error:?}"
+    );
 
+    let mut close_events = connection.take_skipped_events();
     let status = connection
         .request(&botster_hub_client::DaemonRequest::Status)
         .expect("status after victim shutdown failure");
@@ -3799,9 +3846,43 @@ fn external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable() {
         .as_ref()
         .expect("status body after victim shutdown failure")
         .live_attach_occupancy;
+    close_events.extend(connection.take_skipped_events());
     assert!(
         shutdown_failure_occupancy_has_pair(occupancy, sibling_session, sibling_subscription),
         "sibling attach occupancy must survive victim ShutdownSession failure, occupancy={occupancy:?}"
+    );
+    assert!(
+        shutdown_failure_occupancy_has_pair(occupancy, victim_session, victim_subscription),
+        "failed ShutdownSession keeps the still-Active victim in the occupancy union, occupancy={occupancy:?}"
+    );
+    let host_closes_after = status
+        .status
+        .as_ref()
+        .expect("status body after victim shutdown failure")
+        .lifecycle_counters
+        .cleanup_by_reason
+        .get("shutdown_error_host_close")
+        .copied()
+        .unwrap_or(0);
+    assert!(
+        host_closes_after > host_closes_before,
+        "failed ShutdownSession must host-close the bound victim adapter: before={host_closes_before} after={host_closes_after} occupancy={occupancy:?}"
+    );
+    assert!(
+        close_events.iter().all(|event| {
+            !matches!(
+                event,
+                botster_hub_client::DaemonEvent::TerminalSubscriptionClosed {
+                    session_id,
+                    subscription_id,
+                    generation,
+                    ..
+                } if session_id == victim_session
+                    && subscription_id == victim_subscription
+                    && *generation == victim_generation
+            )
+        }),
+        "failed ShutdownSession must host-close the victim adapter under suppression with no TerminalSubscriptionClosed for generation {victim_generation}: {close_events:?}"
     );
 
     let sibling_input = connection
@@ -3825,6 +3906,23 @@ fn external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable() {
     );
     assert_eq!(alive_envelope.session_id, sibling_session);
     assert_eq!(alive_envelope.subscription_id, sibling_subscription);
+    close_events.extend(connection.take_skipped_events());
+    assert!(
+        close_events.iter().all(|event| {
+            !matches!(
+                event,
+                botster_hub_client::DaemonEvent::TerminalSubscriptionClosed {
+                    session_id,
+                    subscription_id,
+                    generation,
+                    ..
+                } if session_id == victim_session
+                    && subscription_id == victim_subscription
+                    && *generation == victim_generation
+            )
+        }),
+        "keep-reading after failed shutdown must not emit victim generation {victim_generation}: {close_events:?}"
+    );
     let observed = wait_for_read_screen_contains(
         &mut connection,
         sibling_session,
