@@ -3662,12 +3662,18 @@ fn external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable() {
     assert_eq!(before_envelope.subscription_id, sibling_subscription);
     drain_skipped_terminal(&mut connection, sibling_session, sibling_subscription);
 
-    let occupancy_before = connection
+    let status_before = connection
         .request(&botster_hub_client::DaemonRequest::Status)
         .expect("status before failed shutdown")
         .status
-        .expect("status body before failed shutdown")
-        .live_attach_occupancy;
+        .expect("status body before failed shutdown");
+    let host_closes_before = status_before
+        .lifecycle_counters
+        .cleanup_by_reason
+        .get("shutdown_error_host_close")
+        .copied()
+        .unwrap_or(0);
+    let occupancy_before = status_before.live_attach_occupancy;
     let victim_generation = occupancy_before
         .iter()
         .find_map(|row| {
@@ -3702,11 +3708,20 @@ fn external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable() {
         shutdown.cleanup
     );
     let error = shutdown.error.as_ref().expect("shutdown operator error body");
-    assert!(
-        error.code == "runtime_error" || error.code == "state_error",
-        "live ShutdownSession failure must keep runtime_error or state_error, got {error:?}"
+    assert_eq!(
+        error.code, "runtime_error",
+        "compound drain-inject plus SIGKILL must return runtime_error, got {error:?}"
     );
+    assert_eq!(error.request_id, "daemon-sessions-shutdown");
     assert_eq!(error.operation, "shutdown");
+    assert_eq!(
+        error.message, "runtime failed while handling Shutdown: Runtime",
+        "exact Core-error OperatorError message, got {error:?}"
+    );
+    assert!(
+        error.diagnostics.is_empty(),
+        "Shutdown Runtime OperatorError has no diagnostics, got {error:?}"
+    );
 
     let mut close_events = connection.take_skipped_events();
     let status = connection
@@ -3731,6 +3746,19 @@ fn external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable() {
     assert!(
         shutdown_failure_occupancy_has_pair(occupancy, victim_session, victim_subscription),
         "failed ShutdownSession keeps the still-Active victim in the occupancy union, occupancy={occupancy:?}"
+    );
+    let host_closes_after = status
+        .status
+        .as_ref()
+        .expect("status body after victim shutdown failure")
+        .lifecycle_counters
+        .cleanup_by_reason
+        .get("shutdown_error_host_close")
+        .copied()
+        .unwrap_or(0);
+    assert!(
+        host_closes_after > host_closes_before,
+        "failed ShutdownSession must host-close the bound victim adapter: before={host_closes_before} after={host_closes_after} occupancy={occupancy:?}"
     );
     assert!(
         close_events.iter().all(|event| {

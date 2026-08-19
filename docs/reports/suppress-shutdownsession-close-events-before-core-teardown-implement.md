@@ -10,7 +10,7 @@
 | Pipeline worktree | this run worktree |
 | Ticket | `ticket_1787143511_231816` |
 | Run | `run_1787143511_194671` |
-| Step | `botster_stack_implement` (`run_step_1787145549_478989`) |
+| Step | `botster_stack_implement` (`run_step_1787148538_952510`, return from Review) |
 | Approved plan | `docs/plans/suppress-shutdownsession-close-events-before-core-teardown.md` revision 2 |
 | Merge policy | `direct`; no PR required |
 | Integrated base | `origin/main` `0a3458a` |
@@ -62,11 +62,12 @@ Independent routing: ticket, run, `botster context`, and the approved plan all m
 
 | Path | Change |
 | --- | --- |
-| `src/daemon_transport.rs` | Install exact-key suppression before the Core `Shutdown` request on the Active/Stopping/classify-error path. Remove post-request suppress calls. Helpers now call `suppress_session_route_generations`. Add source-order red-on-revert oracle and Missing recover unit test. |
+| `src/daemon_transport.rs` | Install exact-key suppression before the Core `Shutdown` request on the Active/Stopping/classify-error path. Remove post-request suppress calls. Helpers now call `suppress_session_route_generations`. After a ShutdownSession OperatorError, count live Hub routes whose adapters are no longer bound and increment `cleanup_by_reason["shutdown_error_host_close"]`. Add Stopping classify inject and source-order oracle. |
 | `src/unix_terminal_adapter.rs` | Add `suppress_session_route_generations`. Remove session-wide `suppress_sessions` / `suppress_session` / `session_is_suppressed`. Mux unit proofs for Running silence, host-close silence, later-generation emit, and empty snapshot. |
 | `src/webrtc_terminal_adapter.rs` | Same mux change, mirrored. |
-| `tests/hub_daemon_lifecycle/sessions.rs` | Extend the live Core-error production path: attach the victim, record the Core generation, keep reading, prove typed OperatorError, occupancy still Running, no close event, sibling envelopes still flow. |
-| `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs` | Extend the success path with generation, second shutdown, observe progress, and late Status. Add Missing, sibling, replacement-owner, and later-generation emit proof. |
+| `tests/hub_daemon_lifecycle/sessions.rs` | Live Core-error path: exact OperatorError body (`runtime_error`, `daemon-sessions-shutdown`, `shutdown`, exact message, empty diagnostics), `shutdown_error_host_close` counter increment, occupancy still present, zero close events, sibling envelopes. |
+| `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs` | Active success path with generation and late Status. Missing, sibling, replacement-owner proofs. Attached Stopping path through `BOTSTER_HUB_TEST_FORCE_SHUTDOWN_CLASSIFY_STOPPING_FOR`. |
+| `crates/botster-hub-test-support/src/isolated_hub.rs` | Clear the Stopping classify inject unless a test sets it. |
 | `tests/hub_daemon_lifecycle/webrtc_terminal_adapter.rs` | Extend the protocol-7 WebRTC success path with Core generation and late Status. |
 | `docs/reports/suppress-shutdownsession-close-events-before-core-teardown-implement.md` | This report. |
 
@@ -84,7 +85,10 @@ None. The required Core APIs already ship on `main`. Parent ticket `ticket_17869
 
 None that change scope.
 
-Clarification of acceptance check 3(b): after a failed Core `Shutdown` the occupancy union still lists the victim because the session stays Active and mux routes are not retired. That occupancy is the live Running classifier. The adapter is host-closed under suppression; keep-reading proves no `TerminalSubscriptionClosed` for that exact generation. The plan's "adapter closed" requirement is met by the production host-close plus silent CloseEvents, not by occupancy disappearance.
+Review findings from `review_1787148532_135255`:
+
+- `finding_1787148532_899522`: occupancy is not an adapter-close oracle. After a ShutdownSession OperatorError, Hub now counts live attach routes whose adapters are unbound and publishes `cleanup_by_reason["shutdown_error_host_close"]`. Removing `close_adapters_for_session` leaves `adapter_bound` true and the counter does not increment. The live test also pins the exact OperatorError body.
+- `finding_1787148532_501615`: a second ShutdownSession after Active success can be Cleanup. Core waits two seconds for exit and the worker SIGKILLs at 500 ms, so Stopping does not survive a completed Shutdown. The live test forces Stopping classification with `BOTSTER_HUB_TEST_FORCE_SHUTDOWN_CLASSIFY_STOPPING_FOR` and drives the production fall-through. The source-order unit test requires Stopping to sit before suppression.
 
 Red-on-revert uses the deterministic source-order unit test `shutdown_session_arm_installs_exact_suppression_before_core_request` plus mux exact-key tests. No ablation report was needed.
 
@@ -125,6 +129,7 @@ Focused production-path proofs:
 - `shutdown_session_exact_keys_preserve_replacement_owner_and_siblings`
 - `webrtc_terminal_adapter_detach_peer_death_process_exit_and_shutdown_do_not_emit_close_event`
 - `external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable`
+- `attached_stopping_shutdown_session_suppresses_exact_generation`
 
 Production entry point: `handle_runtime_control_request` `DaemonRequest::ShutdownSession` in `src/daemon_transport.rs`.
 
