@@ -23,6 +23,27 @@ fn terminal_envelope_contains_marker(
     }
 }
 
+fn lifecycle_counters(
+    endpoint: &botster_hub_client::DaemonEndpoint,
+    label: &str,
+) -> botster_hub_client::DaemonLifecycleCounters {
+    botster_hub_client::request(endpoint, botster_hub_client::DaemonRequest::Status)
+        .unwrap_or_else(|error| panic!("{label}: {error}"))
+        .status
+        .unwrap_or_else(|| panic!("{label} status body"))
+        .lifecycle_counters
+}
+
+fn wait_for_idle_lifecycle_window(
+    endpoint: &botster_hub_client::DaemonEndpoint,
+) -> botster_hub_client::DaemonLifecycleCounters {
+    // Status opens a new connection, so do not poll it. Sleep past one
+    // interval plus one Maintenance rotation so spawn catch-up cannot
+    // spill into the idle sample.
+    thread::sleep(Duration::from_millis(1_200));
+    lifecycle_counters(endpoint, "status before many-session idle window")
+}
+
 fn drain_skipped_terminal(
     connection: &mut botster_hub_client::DaemonConnection,
     session_id: &str,
@@ -2959,20 +2980,26 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
         assert_eq!(seen.len(), 8, "paged subscribe must deliver every live row");
         additional_subscriptions.push(additional);
     }
-    thread::sleep(Duration::from_millis(600));
-    let many_before =
-        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
-            .expect("status before many-session idle window")
-            .status
-            .expect("many-session status body")
-            .lifecycle_counters;
+    let many_before = wait_for_idle_lifecycle_window(&endpoint);
     thread::sleep(Duration::from_millis(1_100));
-    let many_after =
-        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
-            .expect("status after many-session idle window")
-            .status
-            .expect("many-session status body")
-            .lifecycle_counters;
+    let many_after = lifecycle_counters(&endpoint, "status after many-session idle window");
+    eprintln!(
+        "many-session idle wake_delta={} change_delta={} delivery_delta={} drain_delta={} before_wakes={} after_wakes={}",
+        many_after
+            .reconciliation_wakes
+            .saturating_sub(many_before.reconciliation_wakes),
+        many_after
+            .lifecycle_change_reads
+            .saturating_sub(many_before.lifecycle_change_reads),
+        many_after
+            .entity_delivery_attempts
+            .saturating_sub(many_before.entity_delivery_attempts),
+        many_after
+            .lifecycle_session_drains
+            .saturating_sub(many_before.lifecycle_session_drains),
+        many_before.reconciliation_wakes,
+        many_after.reconciliation_wakes
+    );
     assert_eq!(
         many_after.lifecycle_baseline_reads, many_before.lifecycle_baseline_reads,
         "session count must not restore filesystem-backed baseline polling: before={} after={}",

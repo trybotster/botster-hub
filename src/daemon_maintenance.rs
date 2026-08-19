@@ -148,6 +148,12 @@ impl MaintenanceScheduler {
         self.next = MaintenanceSliceKind::SubscriberDelivery;
     }
 
+    /// Finish an incomplete observe pass before the rest of the rotation.
+    pub fn prefer_observe(&mut self) {
+        self.wake = true;
+        self.next = MaintenanceSliceKind::Observe;
+    }
+
     /// True when an idle owner turn should run one slice.
     #[must_use]
     pub fn has_wake(&self) -> bool {
@@ -864,6 +870,13 @@ pub fn run_maintenance_kind(
     }
 }
 
+fn handle_unavailable_observe_pass(state: &mut MaintenanceState) {
+    state.observe_resume = None;
+    if !state.projection.baseline_complete || state.baseline.is_some() {
+        start_baseline_recovery(state);
+    }
+}
+
 fn now_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -880,10 +893,7 @@ fn run_observe_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
                     state.observe_resume = None;
                     start_baseline_recovery(state);
                 } else if matches!(reason, SessionLifecycleResyncReason::ObservePassUnavailable) {
-                    state.observe_resume = None;
-                    if !state.projection.baseline_complete || state.baseline.is_some() {
-                        start_baseline_recovery(state);
-                    }
+                    handle_unavailable_observe_pass(state);
                 }
                 return;
             }
@@ -894,17 +904,24 @@ fn run_observe_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
                     pass_id: slice.pass_id,
                     last_visited: slice.last_visited,
                 });
-                state.scheduler.try_wake();
             }
             // Observe can publish journal rows (natural exit) without a
             // subscriber. Wake the next JournalPull so the projection does
-            // not lag Core list().
+            // not lag Core list(). An incomplete pass otherwise stays on
+            // Observe so the 9-kind rotation does not count no-op slices
+            // as idle wakes.
             if runtime.take_journal_advanced_wake() {
                 state.scheduler.prefer_journal_pull();
+            } else if state.observe_resume.is_some() {
+                state.scheduler.prefer_observe();
             }
         }
         Err(SessionLifecyclePageError::BudgetTooSmall { .. }) => {
-            state.scheduler.try_wake();
+            if state.observe_resume.is_some() {
+                state.scheduler.prefer_observe();
+            } else {
+                state.scheduler.try_wake();
+            }
         }
         Err(_) => state.scheduler.try_wake(),
     }
@@ -942,7 +959,9 @@ fn run_journal_pull_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
             state.journal_caught_up_confirmed =
                 journal_caught_up_after_pull(received, at_watermark, journal_advanced);
             state.pending_changes.extend(page.changes);
-            if journal_advanced && !received {
+            if state.journal_caught_up_confirmed && state.projection_dirty {
+                state.scheduler.prefer_subscriber_delivery();
+            } else if journal_advanced && !received {
                 state.scheduler.prefer_journal_pull();
             } else if received || !at_watermark || journal_advanced {
                 state.scheduler.try_wake();
@@ -1420,15 +1439,22 @@ fn continue_snapshot_starts(state: &mut MaintenanceState, budget: &mut HostBridg
 }
 
 fn continue_family_fanout(state: &mut MaintenanceState, budget: &mut HostBridgeBudget) {
-    let Some(mut job) = state.session_family.pending_fanout.pop_front() else {
-        return;
-    };
-    state.session_family.fanout_bytes = state.session_family.fanout_bytes.saturating_sub(job.bytes);
-    let more = fanout_family_frame(state, &mut job, budget);
-    if more {
+    while !budget.exhausted() {
+        let Some(mut job) = state.session_family.pending_fanout.pop_front() else {
+            return;
+        };
         state.session_family.fanout_bytes =
-            state.session_family.fanout_bytes.saturating_add(job.bytes);
-        state.session_family.pending_fanout.push_front(job);
+            state.session_family.fanout_bytes.saturating_sub(job.bytes);
+        let more = fanout_family_frame(state, &mut job, budget);
+        if more {
+            state.session_family.fanout_bytes =
+                state.session_family.fanout_bytes.saturating_add(job.bytes);
+            state.session_family.pending_fanout.push_front(job);
+            state.scheduler.try_wake();
+            return;
+        }
+    }
+    if !state.session_family.pending_fanout.is_empty() {
         state.scheduler.try_wake();
     }
 }
@@ -1833,6 +1859,8 @@ pub fn assert_maintenance_source_stays_control_plane(source: &str) {
 mod tests {
     use std::path::Path;
 
+    use botster_core_daemon::ObserveLifecyclePassId;
+
     use super::*;
 
     #[test]
@@ -2078,6 +2106,16 @@ mod tests {
         assert_eq!(scheduler.take_slice(), MaintenanceSliceKind::Observe);
         assert!(!scheduler.has_wake());
         assert_eq!(scheduler.take_slice(), MaintenanceSliceKind::JournalPull);
+    }
+
+    #[test]
+    fn incomplete_observe_prefers_observe_instead_of_the_rest_of_the_rotation() {
+        let mut scheduler = MaintenanceScheduler::default();
+        assert_eq!(scheduler.take_slice(), MaintenanceSliceKind::Observe);
+        scheduler.prefer_observe();
+        assert_eq!(scheduler.take_slice(), MaintenanceSliceKind::Observe);
+        scheduler.prefer_observe();
+        assert_eq!(scheduler.take_slice(), MaintenanceSliceKind::Observe);
     }
 
     #[test]
@@ -3236,5 +3274,61 @@ mod tests {
             !saw_observe && !saw_reconcile,
             "rewriting next to CloseEvents every turn is the starvation this ticket forbids"
         );
+    }
+
+    #[test]
+    fn projection_dirty_alone_does_not_keep_maintenance_pending() {
+        let mut state = sealed_maintenance(1, Some(1));
+        state.projection_dirty = true;
+        let _ = state.scheduler.take_slice();
+        assert!(
+            !state.needs_work(),
+            "dirty is a delivery hint, not a self-rearming maintenance wake"
+        );
+    }
+
+    #[test]
+    fn sealed_baseline_unavailable_observe_clears_cursor_without_remint_or_spin() {
+        let mut state = MaintenanceState::default();
+        state
+            .projection
+            .seal_baseline(botster_core_daemon::SessionLifecycleCursor {
+                source_id: botster_core_daemon::SessionLifecycleSourceId("s".into()),
+                sequence: 1,
+            });
+        state.observe_resume = Some(ObserveLifecycleCursor {
+            pass_id: ObserveLifecyclePassId("1".into()),
+            last_visited: None,
+        });
+        state.journal_caught_up_confirmed = true;
+        state.scheduler.try_wake();
+        let _ = state.scheduler.take_slice();
+        handle_unavailable_observe_pass(&mut state);
+        assert!(state.observe_resume.is_none());
+        assert!(state.baseline.is_none());
+        assert_eq!(state.baseline_page_reads, 0);
+        assert!(
+            !state.needs_work(),
+            "sealed unavailable observe must not spin maintenance"
+        );
+    }
+
+    #[test]
+    fn incomplete_baseline_unavailable_observe_starts_recovery() {
+        let mut state = MaintenanceState::default();
+        assert!(!state.projection.baseline_complete);
+        state.observe_resume = Some(ObserveLifecycleCursor {
+            pass_id: ObserveLifecyclePassId("1".into()),
+            last_visited: None,
+        });
+        handle_unavailable_observe_pass(&mut state);
+        assert!(state.observe_resume.is_none());
+        assert!(
+            state.session_family.need_gap_pass,
+            "incomplete baseline must start recovery, which begins with the gap pass"
+        );
+        assert!(!state.journal_caught_up_confirmed);
+        assert_eq!(state.baseline_page_reads, 0);
+        assert!(state.needs_work());
     }
 }
