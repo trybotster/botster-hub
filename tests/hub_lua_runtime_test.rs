@@ -1303,6 +1303,50 @@ fn events_on_registers_exact_event_subscription_and_invokes_worker_handler() {
     );
 }
 
+#[test]
+fn drive_package_events_requeues_when_admission_stays_backpressured() {
+    let registry = install_event_probe_registry("event-probe-backpressure");
+    let mut hub = explicit_runtime("event-probe-backpressure");
+    hub.load_lua_plugin_package(&registry, "event-probe.plugin")
+        .expect("load event probe plugin");
+    let created = serde_json::json!({
+        "event": "worktree_created",
+        "worktree_id": "wt_1",
+        "target_id": "tgt_1",
+    });
+    assert_eq!(
+        hub.package_event_router()
+            .try_ingress(
+                "hub",
+                "worktree_created",
+                &created,
+                std::time::Instant::now()
+            )
+            .as_str(),
+        "accepted"
+    );
+    let before = hub
+        .package_event_router()
+        .snapshot()
+        .expect("occupancy before drive");
+    assert!(before.queued_holders >= 2, "both handlers must be queued");
+    hub.set_test_plugin_admit_backpressure(true);
+    let started = std::time::Instant::now();
+    let outcomes = hub.drive_package_events_for_test();
+    std::thread::sleep(std::time::Duration::from_secs(2).saturating_sub(started.elapsed()));
+    assert!(
+        outcomes.is_empty(),
+        "backpressured copies must not complete: {outcomes:?}"
+    );
+    let after = hub
+        .package_event_router()
+        .snapshot()
+        .expect("occupancy after deadline");
+    assert_eq!(after.queued_holders, before.queued_holders);
+    assert_eq!(after.global_in_flight_bytes, before.global_in_flight_bytes);
+    assert_eq!(after.admitted_holders, before.admitted_holders);
+}
+
 fn completed_payloads(outcomes: &[botster_core::PluginCompletion]) -> Vec<serde_json::Value> {
     outcomes
         .iter()

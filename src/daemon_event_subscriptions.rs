@@ -123,10 +123,16 @@ struct MailboxInner {
     bytes: usize,
 }
 
+struct ClientGapSlot {
+    owner: String,
+    name: String,
+    bit: Arc<AtomicBool>,
+}
+
 /// Bounded per-connection mailbox plus per-subscription gap bits.
 pub(crate) struct ClientEventMailbox {
     inner: Mutex<MailboxInner>,
-    gap_bits: Mutex<HashMap<String, (String, String)>>,
+    slots: Mutex<HashMap<String, Arc<ClientGapSlot>>>,
     wake: Notify,
     wake_bit: AtomicBool,
     event_max: usize,
@@ -141,7 +147,7 @@ impl ClientEventMailbox {
                 events: VecDeque::new(),
                 bytes: 0,
             }),
-            gap_bits: Mutex::new(HashMap::new()),
+            slots: Mutex::new(HashMap::new()),
             wake: Notify::new(),
             wake_bit: AtomicBool::new(false),
             event_max: test_client_event_queue_max().unwrap_or(policy.consumer_queue_max_events),
@@ -176,7 +182,7 @@ impl ClientEventMailbox {
         let mut inner = lock_mailbox(&self.inner)?;
         if inner.events.len() + 1 > self.event_max || inner.bytes + size > self.byte_max {
             drop(inner);
-            self.set_gap(subscription_id, owner, name);
+            self.mark_gap(subscription_id, owner, name);
             return Err(EventPlaneStatus::ShedFull);
         }
         inner.bytes += size;
@@ -193,20 +199,50 @@ impl ClientEventMailbox {
         Ok(())
     }
 
+    pub(crate) fn register_gap_slot(
+        &self,
+        subscription_id: &str,
+        owner: &str,
+        name: &str,
+    ) -> Arc<AtomicBool> {
+        let bit = Arc::new(AtomicBool::new(false));
+        if let Ok(mut slots) = self.slots.try_lock() {
+            let slot = slots.entry(subscription_id.to_string()).or_insert_with(|| {
+                Arc::new(ClientGapSlot {
+                    owner: owner.to_string(),
+                    name: name.to_string(),
+                    bit: bit.clone(),
+                })
+            });
+            return slot.bit.clone();
+        }
+        bit
+    }
+
     pub(crate) fn set_gap(&self, subscription_id: &str, owner: &str, name: &str) {
-        if let Ok(mut gaps) = self.gap_bits.try_lock() {
-            gaps.insert(
-                subscription_id.to_string(),
-                (owner.to_string(), name.to_string()),
-            );
+        self.mark_gap(subscription_id, owner, name);
+    }
+
+    fn mark_gap(&self, subscription_id: &str, owner: &str, name: &str) {
+        if let Ok(mut slots) = self.slots.try_lock() {
+            let slot = slots.entry(subscription_id.to_string()).or_insert_with(|| {
+                Arc::new(ClientGapSlot {
+                    owner: owner.to_string(),
+                    name: name.to_string(),
+                    bit: Arc::new(AtomicBool::new(false)),
+                })
+            });
+            slot.bit.store(true, Ordering::SeqCst);
         }
         self.signal_wake();
     }
 
     #[must_use]
     pub(crate) fn has_ready_event(&self) -> bool {
-        match self.gap_bits.try_lock() {
-            Ok(gaps) if !gaps.is_empty() => return true,
+        match self.slots.try_lock() {
+            Ok(slots) if slots.values().any(|slot| slot.bit.load(Ordering::SeqCst)) => {
+                return true;
+            }
             Err(_) => return true,
             Ok(_) => {}
         }
@@ -221,30 +257,38 @@ impl ClientEventMailbox {
             return Some(event);
         }
         let mut inner = lock_mailbox(&self.inner).ok()?;
-        loop {
-            let queued = inner.events.pop_front()?;
-            inner.bytes = inner.bytes.saturating_sub(queued.size);
-            if queued.enqueued_at.elapsed() > self.queue_age {
-                drop(inner);
-                self.set_gap(&queued.subscription_id, &queued.owner, &queued.name);
-                return self.take_ready_event();
-            }
-            return Some(DaemonEvent::PackageEvent {
-                subscription_id: queued.subscription_id,
-                owner: queued.owner,
-                name: queued.name,
-                payload: queued.payload,
-            });
+        let queued = inner.events.pop_front()?;
+        inner.bytes = inner.bytes.saturating_sub(queued.size);
+        if queued.enqueued_at.elapsed() > self.queue_age {
+            drop(inner);
+            self.mark_gap(&queued.subscription_id, &queued.owner, &queued.name);
+            return self.take_ready_event();
         }
+        Some(DaemonEvent::PackageEvent {
+            subscription_id: queued.subscription_id,
+            owner: queued.owner,
+            name: queued.name,
+            payload: queued.payload,
+        })
     }
 
     fn take_gap(&self) -> Option<DaemonEvent> {
-        let mut gaps = self.gap_bits.try_lock().ok()?;
-        let (subscription_id, (owner, name)) = gaps
-            .iter()
-            .next()
-            .map(|(subscription_id, identity)| (subscription_id.clone(), identity.clone()))?;
-        gaps.remove(&subscription_id);
+        let slots = match self.slots.try_lock() {
+            Ok(slots) => slots,
+            Err(_) => return None,
+        };
+        let (subscription_id, owner, name) = slots.iter().find_map(|(subscription_id, slot)| {
+            slot.bit.load(Ordering::SeqCst).then(|| {
+                (
+                    subscription_id.clone(),
+                    slot.owner.clone(),
+                    slot.name.clone(),
+                )
+            })
+        })?;
+        if let Some(slot) = slots.get(&subscription_id) {
+            slot.bit.store(false, Ordering::SeqCst);
+        }
         Some(DaemonEvent::EventGap {
             subscription_id,
             owner,
@@ -253,8 +297,8 @@ impl ClientEventMailbox {
     }
 
     fn drop_subscription(&self, subscription_id: &str) {
-        if let Ok(mut gaps) = self.gap_bits.try_lock() {
-            gaps.remove(subscription_id);
+        if let Ok(mut slots) = self.slots.try_lock() {
+            slots.remove(subscription_id);
         }
         if let Ok(mut inner) = lock_mailbox(&self.inner) {
             let mut bytes = inner.bytes;
@@ -276,6 +320,12 @@ impl ClientEventMailbox {
             .inner
             .try_lock()
             .expect("test hold must acquire mailbox");
+        body()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_with_slots_held<R>(&self, body: impl FnOnce() -> R) -> R {
+        let _guard = self.slots.try_lock().expect("test hold must acquire slots");
         body()
     }
 }
@@ -336,6 +386,7 @@ impl ClientEventPlane {
             return Err(ClientEventAdmitError::TooManySubscriptions);
         }
         let mailbox = state.mailbox.clone();
+        let gap = mailbox.register_gap_slot(subscription_id, owner, name);
         let status = router.try_subscribe_client(ClientEventHolder {
             connection_id: connection_id.to_string(),
             subscription_id: subscription_id.to_string(),
@@ -343,6 +394,7 @@ impl ClientEventPlane {
             name: name.to_string(),
             subjects: compiled,
             mailbox,
+            gap,
         });
         if status != EventPlaneStatus::Accepted {
             return Err(ClientEventAdmitError::Router(status));
@@ -487,9 +539,19 @@ fn lock_plane(
 }
 
 fn test_client_event_queue_max() -> Option<usize> {
-    std::env::var("BOTSTER_HUB_TEST_CLIENT_EVENT_QUEUE_MAX")
-        .ok()
-        .and_then(|raw| raw.parse().ok())
+    test_client_event_queue_max_from(
+        std::env::var("BOTSTER_ENV").ok().as_deref(),
+        std::env::var("BOTSTER_HUB_TEST_CLIENT_EVENT_QUEUE_MAX")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn test_client_event_queue_max_from(botster_env: Option<&str>, raw: Option<&str>) -> Option<usize> {
+    if botster_env != Some("test") {
+        return None;
+    }
+    raw.and_then(|value| value.parse().ok())
         .filter(|max| *max > 0)
 }
 
@@ -774,6 +836,45 @@ mod tests {
             mailbox.take_ready_event().is_none(),
             "contention must not replay event history"
         );
+    }
+
+    #[test]
+    fn gap_slot_contention_still_records_event_gap() {
+        let mailbox = ClientEventMailbox::new(PackageEventPlanePolicy::default());
+        let bit = mailbox.register_gap_slot("sub", "owner", "ready");
+        mailbox.test_with_slots_held(|| {
+            mailbox.set_gap("sub", "owner", "ready");
+            bit.store(true, Ordering::SeqCst);
+        });
+        match mailbox.take_ready_event() {
+            Some(DaemonEvent::EventGap {
+                subscription_id,
+                owner,
+                name,
+            }) => {
+                assert_eq!(subscription_id, "sub");
+                assert_eq!(owner, "owner");
+                assert_eq!(name, "ready");
+            }
+            other => panic!("gap bit must survive slot-map contention: {other:?}"),
+        }
+        assert!(
+            mailbox.take_ready_event().is_none(),
+            "slot contention must not replay event history"
+        );
+    }
+
+    #[test]
+    fn client_event_queue_max_override_requires_test_mode() {
+        assert_eq!(
+            test_client_event_queue_max_from(Some("test"), Some("1")),
+            Some(1)
+        );
+        assert_eq!(
+            test_client_event_queue_max_from(Some("production"), Some("1")),
+            None
+        );
+        assert_eq!(test_client_event_queue_max_from(None, Some("1")), None);
     }
 
     #[test]
