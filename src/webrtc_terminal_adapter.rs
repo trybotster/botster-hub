@@ -310,7 +310,6 @@ struct WebRtcMuxInner {
     close_events_admitted: AtomicBool,
     routes: Mutex<BTreeMap<(String, String, u64), WebRtcMuxRoute>>,
     pending_events: Mutex<Vec<DaemonEvent>>,
-    suppress_sessions: Mutex<BTreeSet<String>>,
     suppress_generations: Mutex<BTreeSet<(String, String, u64)>>,
     close_work: Mutex<Arc<AtomicBool>>,
 }
@@ -332,7 +331,6 @@ impl WebRtcConnectionMux {
                 close_events_admitted: AtomicBool::new(false),
                 routes: Mutex::new(BTreeMap::new()),
                 pending_events: Mutex::new(Vec::new()),
-                suppress_sessions: Mutex::new(BTreeSet::new()),
                 suppress_generations: Mutex::new(BTreeSet::new()),
                 close_work: Mutex::new(Arc::new(AtomicBool::new(false))),
             }),
@@ -410,9 +408,20 @@ impl WebRtcConnectionMux {
         self.inner.dying.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn suppress_session(&self, session_id: impl Into<String>) {
-        if let Ok(mut sessions) = self.inner.suppress_sessions.lock() {
-            sessions.insert(session_id.into());
+    pub(crate) fn suppress_session_route_generations(&self, session_id: &str) {
+        let keys = match self.inner.routes.lock() {
+            Ok(routes) => routes
+                .keys()
+                .filter(|(route_session, _, _)| route_session == session_id)
+                .cloned()
+                .collect::<Vec<_>>(),
+            Err(_) => return,
+        };
+        if keys.is_empty() {
+            return;
+        }
+        if let Ok(mut generations) = self.inner.suppress_generations.lock() {
+            generations.extend(keys);
         }
     }
 
@@ -425,13 +434,6 @@ impl WebRtcConnectionMux {
         if let Ok(mut generations) = self.inner.suppress_generations.lock() {
             generations.insert((session_id.into(), subscription_id.into(), generation));
         }
-    }
-
-    fn session_is_suppressed(&self, session_id: &str) -> bool {
-        self.inner
-            .suppress_sessions
-            .lock()
-            .is_ok_and(|sessions| sessions.contains(session_id))
     }
 
     fn generation_is_suppressed(
@@ -510,13 +512,11 @@ impl WebRtcConnectionMux {
                     continue;
                 }
                 classified += 1;
-                if self.session_is_suppressed(&route.session_id)
-                    || self.generation_is_suppressed(
-                        &route.session_id,
-                        &route.subscription_id,
-                        route.generation,
-                    )
-                {
+                if self.generation_is_suppressed(
+                    &route.session_id,
+                    &route.subscription_id,
+                    route.generation,
+                ) {
                     route.reported = true;
                     continue;
                 }
@@ -809,7 +809,7 @@ mod tests {
     fn close_event_slice_uses_keyed_suppression_without_cloning_the_prefix() {
         let mux = WebRtcConnectionMux::new();
         for index in 0..64 {
-            mux.suppress_session(format!("suppressed-{index:03}"));
+            mux.suppress_generation(format!("suppressed-{index:03}"), "sub", 1);
         }
         let mut open_adapters = Vec::new();
         for index in 0..8 {
@@ -844,6 +844,64 @@ mod tests {
             other => panic!("expected live close event, got {other:?}"),
         }
         let _ = open_adapters;
+    }
+
+    #[test]
+    fn exact_generation_suppression_silences_running_close_and_preserves_later_generation() {
+        let mux = WebRtcConnectionMux::new();
+        let (_dying_adapter, dying) = mux.create_adapter();
+        mux.register("s".to_string(), "sub".to_string(), 4, dying.clone());
+        mux.suppress_session_route_generations("s");
+        dying.close();
+        assert_eq!(mux.queue_closed_subscription_events(|_| true), 1);
+        assert!(
+            mux.pop_pending_event().is_none(),
+            "suppressed generation must stay silent while the classifier answers Running"
+        );
+
+        let (_host_adapter, host) = mux.create_adapter();
+        mux.register("s".to_string(), "sub-host".to_string(), 4, host.clone());
+        mux.suppress_session_route_generations("s");
+        host.close_from_host();
+        assert_eq!(mux.queue_closed_subscription_events(|_| true), 1);
+        assert!(
+            mux.pop_pending_event().is_none(),
+            "host-close under exact-key suppression must not emit"
+        );
+
+        let (_later_adapter, later) = mux.create_adapter();
+        mux.register("s".to_string(), "sub".to_string(), 5, later.clone());
+        later.close();
+        assert_eq!(mux.queue_closed_subscription_events(|_| true), 1);
+        match mux.pop_pending_event() {
+            Some(DaemonEvent::TerminalSubscriptionClosed {
+                session_id,
+                subscription_id,
+                generation,
+                reason,
+            }) => {
+                assert_eq!(session_id, "s");
+                assert_eq!(subscription_id, "sub");
+                assert_eq!(generation, 5);
+                assert_eq!(reason, TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER);
+            }
+            other => panic!("later generation must still emit, got {other:?}"),
+        }
+        assert!(mux.pop_pending_event().is_none());
+    }
+
+    #[test]
+    fn empty_session_snapshot_installs_no_suppression_keys() {
+        let mux = WebRtcConnectionMux::new();
+        mux.suppress_session_route_generations("missing");
+        let (_adapter, handle) = mux.create_adapter();
+        mux.register("missing".to_string(), "sub".to_string(), 1, handle.clone());
+        handle.close();
+        assert_eq!(mux.queue_closed_subscription_events(|_| true), 1);
+        assert!(
+            mux.pop_pending_event().is_some(),
+            "a later attach after a missing-session snapshot must still emit"
+        );
     }
 
     #[test]

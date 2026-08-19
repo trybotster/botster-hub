@@ -1825,6 +1825,23 @@ fn process_exit_and_shutdown_session_do_not_emit_terminal_subscription_closed() 
         &mut events,
     );
     thread::sleep(Duration::from_secs(1));
+    let before = request_collecting_mux(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::Status,
+        &mut envelopes,
+        &mut events,
+    );
+    let shutdown_generation = occupancy_generation(
+        &before
+            .status
+            .as_ref()
+            .expect("status before Active ShutdownSession")
+            .live_attach_occupancy,
+        "pex-shutdown",
+        "sub-shutdown",
+    )
+    .expect("Active ShutdownSession victim must have a Core-issued generation");
     let shutdown = request_collecting_mux(
         &mut stream,
         &mut reader,
@@ -1845,7 +1862,30 @@ fn process_exit_and_shutdown_session_do_not_emit_terminal_subscription_closed() 
         &mut envelopes,
         &mut events,
     );
-    let _ = listed;
+    assert!(
+        listed.sessions.iter().any(|session| {
+            session.session_id == "pex-shutdown" && session.lifecycle != "running"
+        }),
+        "production observe path must advance ShutdownSession off running: {:?}",
+        listed.sessions
+    );
+    let late = request_collecting_mux(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::Status,
+        &mut envelopes,
+        &mut events,
+    );
+    assert_eq!(late.kind, botster_hub_client::DaemonResponseKind::Status);
+    assert!(
+        no_terminal_subscription_closed(
+            &events,
+            "pex-shutdown",
+            Some("sub-shutdown"),
+            Some(shutdown_generation)
+        ),
+        "Active ShutdownSession must not emit TerminalSubscriptionClosed for generation {shutdown_generation}: {events:?}"
+    );
     assert!(
         events.iter().all(|event| {
             !matches!(
@@ -1854,6 +1894,373 @@ fn process_exit_and_shutdown_session_do_not_emit_terminal_subscription_closed() 
             )
         }),
         "process exit and ShutdownSession must stay on lifecycle paths: {events:?}"
+    );
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn shutdown_session_exact_keys_preserve_replacement_owner_and_siblings() {
+    let _guard = daemon_test_guard();
+    let hub = start_isolated_live_output_hub("sgk");
+    let endpoint = hub.endpoint().clone();
+    let (mut stream, mut reader) = unix_adapter_connection(&endpoint);
+    let mut envelopes = Vec::new();
+    let mut events = Vec::new();
+
+    let missing = request_collecting_mux(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::ShutdownSession {
+            session_id: "sgk-missing".to_string(),
+        },
+        &mut envelopes,
+        &mut events,
+    );
+    assert_eq!(
+        missing.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError
+    );
+    let missing_error = missing.error.as_ref().expect("unknown_session body");
+    assert_eq!(missing_error.code, "unknown_session");
+    assert_eq!(missing_error.operation, "shutdown");
+    assert_eq!(missing_error.message, "unknown session: sgk-missing");
+
+    spawn_and_bind(
+        &mut stream,
+        &mut reader,
+        "sgk-victim",
+        "sgk-victim-sub",
+        "sleep 30",
+        &mut envelopes,
+        &mut events,
+    );
+    spawn_and_bind(
+        &mut stream,
+        &mut reader,
+        "sgk-sibling",
+        "sgk-sibling-sub",
+        "while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
+        &mut envelopes,
+        &mut events,
+    );
+    let before = request_collecting_mux(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::Status,
+        &mut envelopes,
+        &mut events,
+    );
+    let occupancy = &before
+        .status
+        .as_ref()
+        .expect("status before victim shutdown")
+        .live_attach_occupancy;
+    let victim_generation =
+        occupancy_generation(occupancy, "sgk-victim", "sgk-victim-sub").expect("victim generation");
+    let sibling_generation = occupancy_generation(occupancy, "sgk-sibling", "sgk-sibling-sub")
+        .expect("sibling generation");
+    assert!(victim_generation >= 1);
+    assert!(sibling_generation >= 1);
+
+    let input = request_collecting_mux(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::SendInput {
+            session_id: "sgk-sibling".to_string(),
+            data: "before-shutdown\r".to_string(),
+        },
+        &mut envelopes,
+        &mut events,
+    );
+    assert_eq!(input.kind, botster_hub_client::DaemonResponseKind::Events);
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline
+        && !unix_envelope_contains_live_bytes(&envelopes, "echo:before-shutdown")
+    {
+        let _ = request_collecting_mux(
+            &mut stream,
+            &mut reader,
+            &botster_hub_client::DaemonRequest::drain_subscription(
+                "sgk-sibling",
+                "sgk-sibling-sub",
+            ),
+            &mut envelopes,
+            &mut events,
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        unix_envelope_contains_live_bytes(&envelopes, "echo:before-shutdown"),
+        "sibling must stream before victim shutdown: {envelopes:?}"
+    );
+
+    let shutdown = request_collecting_mux(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::ShutdownSession {
+            session_id: "sgk-victim".to_string(),
+        },
+        &mut envelopes,
+        &mut events,
+    );
+    assert_ne!(
+        shutdown.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError,
+        "Active ShutdownSession must stay typed, got kind={:?} error={:?}",
+        shutdown.kind,
+        shutdown.error
+    );
+    let late = request_collecting_mux(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::Status,
+        &mut envelopes,
+        &mut events,
+    );
+    assert_eq!(late.kind, botster_hub_client::DaemonResponseKind::Status);
+    assert!(
+        no_terminal_subscription_closed(
+            &events,
+            "sgk-victim",
+            Some("sgk-victim-sub"),
+            Some(victim_generation)
+        ),
+        "victim generation {victim_generation} must stay silent: {events:?}"
+    );
+
+    let after_input = request_collecting_mux(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::SendInput {
+            session_id: "sgk-sibling".to_string(),
+            data: "after-shutdown\r".to_string(),
+        },
+        &mut envelopes,
+        &mut events,
+    );
+    assert_eq!(
+        after_input.kind,
+        botster_hub_client::DaemonResponseKind::Events
+    );
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline
+        && !unix_envelope_contains_live_bytes(&envelopes, "echo:after-shutdown")
+    {
+        let _ = request_collecting_mux(
+            &mut stream,
+            &mut reader,
+            &botster_hub_client::DaemonRequest::drain_subscription(
+                "sgk-sibling",
+                "sgk-sibling-sub",
+            ),
+            &mut envelopes,
+            &mut events,
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        unix_envelope_contains_live_bytes(&envelopes, "echo:after-shutdown"),
+        "sibling must keep streaming across victim shutdown: {envelopes:?}"
+    );
+
+    let remove = request_collecting_mux(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::RemoveSession {
+            session_id: "sgk-victim".to_string(),
+        },
+        &mut envelopes,
+        &mut events,
+    );
+    assert_eq!(
+        remove.kind,
+        botster_hub_client::DaemonResponseKind::SessionRemoved,
+        "terminal victim must remove, got kind={:?} error={:?}",
+        remove.kind,
+        remove.error
+    );
+    spawn_and_bind(
+        &mut stream,
+        &mut reader,
+        "sgk-victim",
+        "sgk-victim-sub",
+        "sleep 30",
+        &mut envelopes,
+        &mut events,
+    );
+    let replaced = request_collecting_mux(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::Status,
+        &mut envelopes,
+        &mut events,
+    );
+    let replacement_generation = occupancy_generation(
+        &replaced
+            .status
+            .as_ref()
+            .expect("status after replacement spawn")
+            .live_attach_occupancy,
+        "sgk-victim",
+        "sgk-victim-sub",
+    )
+    .expect("replacement owner Core generation");
+    assert_ne!(
+        replacement_generation, victim_generation,
+        "replacement owner must receive a later Core generation: old={victim_generation} new={replacement_generation}"
+    );
+    let reattach = request_collecting_mux(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::Attach {
+            session_id: "sgk-victim".to_string(),
+            subscription_id: "sgk-victim-sub".to_string(),
+        },
+        &mut envelopes,
+        &mut events,
+    );
+    assert_eq!(
+        reattach.kind,
+        botster_hub_client::DaemonResponseKind::Events
+    );
+    assert!(
+        wait_for_subscription_closed(
+            &mut stream,
+            &mut reader,
+            "sgk-victim",
+            "sgk-victim-sub",
+            &mut envelopes,
+            &mut events,
+        ),
+        "replacement generation must still emit close events: {events:?}"
+    );
+    let closed_generation = events.iter().rev().find_map(|event| match event {
+        botster_hub_client::DaemonEvent::TerminalSubscriptionClosed {
+            session_id,
+            subscription_id,
+            generation,
+            ..
+        } if session_id == "sgk-victim" && subscription_id == "sgk-victim-sub" => {
+            Some(*generation)
+        }
+        _ => None,
+    });
+    assert_eq!(closed_generation, Some(replacement_generation));
+
+    spawn_and_bind(
+        &mut stream,
+        &mut reader,
+        "sgk-missing",
+        "sgk-missing-sub",
+        "sleep 30",
+        &mut envelopes,
+        &mut events,
+    );
+    let missing_reattach = request_collecting_mux(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::Attach {
+            session_id: "sgk-missing".to_string(),
+            subscription_id: "sgk-missing-sub".to_string(),
+        },
+        &mut envelopes,
+        &mut events,
+    );
+    assert_eq!(
+        missing_reattach.kind,
+        botster_hub_client::DaemonResponseKind::Events
+    );
+    assert!(
+        wait_for_subscription_closed(
+            &mut stream,
+            &mut reader,
+            "sgk-missing",
+            "sgk-missing-sub",
+            &mut envelopes,
+            &mut events,
+        ),
+        "Missing ShutdownSession must not suppress a later attach close: {events:?}"
+    );
+
+    shutdown_short_lived_session(&endpoint, "sgk-victim");
+    shutdown_short_lived_session(&endpoint, "sgk-sibling");
+    shutdown_short_lived_session(&endpoint, "sgk-missing");
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn attached_stopping_shutdown_session_suppresses_exact_generation() {
+    let _guard = daemon_test_guard();
+    let hub = start_isolated_live_output_hub_with_env(
+        "stp",
+        &[(
+            "BOTSTER_HUB_TEST_FORCE_SHUTDOWN_CLASSIFY_STOPPING_FOR",
+            "stp-session",
+        )],
+    );
+    let endpoint = hub.endpoint().clone();
+    let (mut stream, mut reader) = unix_adapter_connection(&endpoint);
+    let mut envelopes = Vec::new();
+    let mut events = Vec::new();
+    spawn_and_bind(
+        &mut stream,
+        &mut reader,
+        "stp-session",
+        "stp-sub",
+        "sleep 30",
+        &mut envelopes,
+        &mut events,
+    );
+    let before = request_collecting_mux(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::Status,
+        &mut envelopes,
+        &mut events,
+    );
+    let generation = occupancy_generation(
+        &before
+            .status
+            .as_ref()
+            .expect("status before Stopping ShutdownSession")
+            .live_attach_occupancy,
+        "stp-session",
+        "stp-sub",
+    )
+    .expect("attached Stopping victim must have a Core-issued generation");
+    let shutdown = request_collecting_mux(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::ShutdownSession {
+            session_id: "stp-session".to_string(),
+        },
+        &mut envelopes,
+        &mut events,
+    );
+    assert_eq!(
+        shutdown.kind,
+        botster_hub_client::DaemonResponseKind::Events,
+        "forced Stopping classification must take the fall-through Events path, got kind={:?} error={:?} cleanup={:?}",
+        shutdown.kind,
+        shutdown.error,
+        shutdown.cleanup
+    );
+    let late = request_collecting_mux(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::Status,
+        &mut envelopes,
+        &mut events,
+    );
+    assert_eq!(late.kind, botster_hub_client::DaemonResponseKind::Status);
+    assert!(
+        no_terminal_subscription_closed(
+            &events,
+            "stp-session",
+            Some("stp-sub"),
+            Some(generation)
+        ),
+        "attached Stopping ShutdownSession must not emit TerminalSubscriptionClosed for generation {generation}: {events:?}"
     );
     hub.shutdown().expect("shutdown isolated hub");
 }
@@ -2225,6 +2632,41 @@ fn occupancy_has_pair(
 ) -> bool {
     occupancy.iter().any(|row| {
         row.session_id == session_id && row.subscription_id == subscription_id
+    })
+}
+
+fn occupancy_generation(
+    occupancy: &[botster_hub_client::DaemonAttachOccupancy],
+    session_id: &str,
+    subscription_id: &str,
+) -> Option<u64> {
+    occupancy.iter().find_map(|row| {
+        (row.session_id == session_id && row.subscription_id == subscription_id)
+            .then_some(row.generation)
+    })
+}
+
+fn no_terminal_subscription_closed<'a, I>(
+    events: I,
+    session_id: &str,
+    subscription_id: Option<&str>,
+    generation: Option<u64>,
+) -> bool
+where
+    I: IntoIterator<Item = &'a botster_hub_client::DaemonEvent>,
+{
+    events.into_iter().all(|event| {
+        !matches!(
+            event,
+            botster_hub_client::DaemonEvent::TerminalSubscriptionClosed {
+                session_id: closed_session,
+                subscription_id: closed_subscription,
+                generation: closed_generation,
+                ..
+            } if closed_session == session_id
+                && subscription_id.is_none_or(|expected| closed_subscription == expected)
+                && generation.is_none_or(|expected| *closed_generation == expected)
+        )
     })
 }
 
