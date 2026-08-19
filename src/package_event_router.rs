@@ -844,7 +844,7 @@ impl PackageEventRouter {
         body()
     }
 
-    #[cfg(test)]
+    #[doc(hidden)]
     #[must_use]
     pub fn test_outstanding_pulls(&self) -> usize {
         lock_inner(&self.inner)
