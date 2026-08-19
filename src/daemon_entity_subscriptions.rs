@@ -526,11 +526,6 @@ pub(super) fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut Dae
     });
     state.lifecycle_counters.live_entity_subscriptions = state.entity_subscriptions.len() as u64;
 
-    state.lifecycle_counters.reconciliation_wakes = state
-        .lifecycle_counters
-        .reconciliation_wakes
-        .saturating_add(1);
-
     if state
         .entity_subscriptions
         .values()
@@ -697,15 +692,10 @@ fn note_released_entity_generations(state: &mut DaemonControlState, before: usiz
 }
 
 pub(super) fn session_subscribers_need_delivery(state: &DaemonControlState) -> bool {
-    let has_session_subscriber = state
-        .entity_subscriptions
-        .values()
-        .any(|subscription| subscription.entity_type == "session");
-    (state.maintenance.projection_dirty && has_session_subscriber)
-        || state.entity_subscriptions.values().any(|subscription| {
-            subscription.entity_type == "session"
-                && (subscription.needs_delivery || subscription.resync_reason.is_some())
-        })
+    state.entity_subscriptions.values().any(|subscription| {
+        subscription.entity_type == "session"
+            && (subscription.needs_delivery || subscription.resync_reason.is_some())
+    })
 }
 
 pub(super) fn drive_package_entity_fanout(daemon: &mut HubDaemon, state: &mut DaemonControlState) {

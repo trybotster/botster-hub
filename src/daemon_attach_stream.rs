@@ -4,6 +4,7 @@
 //! Hub authorizes the route and records generation plus adapter-bound flags.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 
 use botster_core::{
     ClientId, SessionId, SubscriptionId, TerminalCapabilitySet, TerminalSubscriptionGeneration,
@@ -125,6 +126,13 @@ impl AttachStream {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InventoryReconcileProgress {
+    pub validated: usize,
+    pub more: bool,
+    pub after: Option<(String, String)>,
+}
+
 #[derive(Default)]
 pub(crate) struct AttachStreamRegistry {
     streams: BTreeMap<(String, String), AttachStream>,
@@ -225,16 +233,30 @@ impl AttachStreamRegistry {
     }
 
     fn forget_connection_bound_route(&mut self, session_id: &str, subscription_id: &str) {
-        let mut empty_clients = Vec::new();
-        for (client_id, routes) in &mut self.connection_bound_routes {
-            routes.retain(|route| {
-                route.session_id != session_id || route.subscription_id != subscription_id
-            });
-            if routes.is_empty() {
-                empty_clients.push(client_id.clone());
+        let key = (session_id.to_string(), subscription_id.to_string());
+        let Some(stream) = self.streams.get(&key) else {
+            return;
+        };
+        let client_id = stream.owner.client_id.clone();
+        let generation = stream.generation;
+        let Some(routes) = self.connection_bound_routes.get_mut(&client_id) else {
+            return;
+        };
+        match generation {
+            Some(generation) => {
+                routes.remove(&ConnectionBoundRoute {
+                    session_id: session_id.to_string(),
+                    subscription_id: subscription_id.to_string(),
+                    generation,
+                });
+            }
+            None => {
+                routes.retain(|route| {
+                    route.session_id != session_id || route.subscription_id != subscription_id
+                });
             }
         }
-        for client_id in empty_clients {
+        if routes.is_empty() {
             self.connection_bound_routes.remove(&client_id);
         }
     }
@@ -336,25 +358,75 @@ impl AttachStreamRegistry {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn reconcile_inventory(&mut self, inventory: &[TerminalSubscriptionRecord]) {
-        let stale: Vec<(String, String)> = self
-            .streams
-            .iter()
-            .filter(|((session_id, subscription_id), stream)| {
-                stream.adapter_bound
-                    && !inventory.iter().any(|row| {
-                        row.session_id.0 == *session_id
-                            && row.subscription_id.0 == *subscription_id
-                            && stream
-                                .generation
-                                .is_none_or(|generation| row.generation == generation)
-                    })
+        let lookup = |session_id: &str, subscription_id: &str| {
+            inventory.iter().find_map(|row| {
+                (row.session_id.0 == session_id && row.subscription_id.0 == subscription_id)
+                    .then_some(row.generation)
             })
-            .map(|(key, _)| key.clone())
-            .collect();
-        for (session_id, subscription_id) in stale {
-            self.close_adapter(&session_id, &subscription_id);
-            self.cancel_stream(&session_id, &subscription_id);
+        };
+        let _ = self.reconcile_inventory_slice(lookup, None, usize::MAX);
+    }
+
+    /// Close a bound route when Core membership is absent or the generation
+    /// mismatches the recorded stream generation.
+    #[must_use]
+    pub(crate) fn route_is_stale_against_live_generation(
+        stream_generation: Option<TerminalSubscriptionGeneration>,
+        live: Option<TerminalSubscriptionGeneration>,
+    ) -> bool {
+        match live {
+            None => true,
+            Some(live_generation) => {
+                stream_generation.is_some_and(|generation| generation != live_generation)
+            }
+        }
+    }
+
+    /// Visit at most `max_entries` stream-map rows after `after`, exclusive.
+    /// Unbound rows count toward the visit budget and advance the cursor.
+    pub(crate) fn reconcile_inventory_slice(
+        &mut self,
+        mut lookup: impl FnMut(&str, &str) -> Option<TerminalSubscriptionGeneration>,
+        after: Option<(String, String)>,
+        max_entries: usize,
+    ) -> InventoryReconcileProgress {
+        let start = match after.as_ref() {
+            Some(after_key) => Bound::Excluded(after_key.clone()),
+            None => Bound::Unbounded,
+        };
+        let mut visit = Vec::new();
+        let mut more = false;
+        for (key, stream) in self.streams.range((start, Bound::Unbounded)) {
+            if visit.len() >= max_entries {
+                more = true;
+                break;
+            }
+            visit.push((key.clone(), stream.adapter_bound));
+        }
+        let mut last = after;
+        let mut validated = 0;
+        for ((session_id, subscription_id), adapter_bound) in visit {
+            last = Some((session_id.clone(), subscription_id.clone()));
+            if !adapter_bound {
+                continue;
+            }
+            validated += 1;
+            let stream_generation = self
+                .streams
+                .get(&(session_id.clone(), subscription_id.clone()))
+                .and_then(|stream| stream.generation);
+            let live = lookup(&session_id, &subscription_id);
+            if Self::route_is_stale_against_live_generation(stream_generation, live) {
+                self.close_adapter(&session_id, &subscription_id);
+                self.cancel_stream(&session_id, &subscription_id);
+            }
+        }
+        InventoryReconcileProgress {
+            validated,
+            more,
+            after: last,
         }
     }
 
@@ -865,6 +937,47 @@ mod tests {
     }
 
     #[test]
+    fn cancel_stream_removes_one_client_route_without_touching_sibling_ledgers() {
+        let mut registry = AttachStreamRegistry::default();
+        for index in 0..32 {
+            let owner = AttachStreamOwner {
+                client_id: format!("client-{index:02}"),
+                grant_id: None,
+            };
+            let session = format!("s-{index:02}");
+            registry.start_attach(owner, session.clone(), "sub".into());
+            let (_, handle) = UnixTerminalAdapter::pair();
+            registry.mark_adapter_bound(
+                &session,
+                "sub",
+                TerminalSubscriptionGeneration(1),
+                BoundAdapterHandle::Unix(handle),
+            );
+        }
+        registry.cancel_stream("s-07", "sub");
+        assert!(
+            registry
+                .take_connection_bound_routes("client-07")
+                .is_empty()
+        );
+        for index in 0..32 {
+            if index == 7 {
+                continue;
+            }
+            let session = format!("s-{index:02}");
+            assert!(
+                registry.connection_bound_route_still_owned(
+                    &format!("client-{index:02}"),
+                    &session,
+                    "sub",
+                    TerminalSubscriptionGeneration(1)
+                ),
+                "removing one stale row must not walk or clear other clients"
+            );
+        }
+    }
+
+    #[test]
     fn reconcile_releases_routes_missing_from_core_inventory() {
         let mut registry = AttachStreamRegistry::default();
         registry.start_attach(owner(), "s".into(), "sub".into());
@@ -885,6 +998,103 @@ mod tests {
             registry.stream_owner_client_id("s", "unbound").as_deref(),
             Some("client-a"),
             "unbound routes stay until session retain or explicit detach"
+        );
+    }
+
+    #[test]
+    fn reconcile_slice_closes_absence_and_generation_mismatch() {
+        let mut registry = AttachStreamRegistry::default();
+        for (session, generation) in [("a", 1), ("b", 2), ("c", 3)] {
+            registry.start_attach(owner(), session.into(), "sub".into());
+            let (_, handle) = UnixTerminalAdapter::pair();
+            registry.mark_adapter_bound(
+                session,
+                "sub",
+                TerminalSubscriptionGeneration(generation),
+                BoundAdapterHandle::Unix(handle),
+            );
+        }
+        let live = |session: &str, _: &str| match session {
+            "a" => Some(TerminalSubscriptionGeneration(1)),
+            "b" => Some(TerminalSubscriptionGeneration(9)),
+            _ => None,
+        };
+        let first = registry.reconcile_inventory_slice(live, None, 2);
+        assert_eq!(first.validated, 2);
+        assert!(first.more);
+        assert_eq!(
+            registry.stream_owner_client_id("a", "sub").as_deref(),
+            Some("client-a")
+        );
+        assert_eq!(registry.stream_owner_client_id("b", "sub"), None);
+        let rebound = owner();
+        registry.start_attach(rebound, "c".into(), "sub".into());
+        let (_, handle) = UnixTerminalAdapter::pair();
+        registry.mark_adapter_bound(
+            "c",
+            "sub",
+            TerminalSubscriptionGeneration(4),
+            BoundAdapterHandle::Unix(handle),
+        );
+        let second = registry.reconcile_inventory_slice(
+            |session, _| (session == "c").then_some(TerminalSubscriptionGeneration(4)),
+            first.after,
+            8,
+        );
+        assert_eq!(second.validated, 1);
+        assert!(!second.more);
+        assert_eq!(
+            registry.stream_owner_client_id("c", "sub").as_deref(),
+            Some("client-a"),
+            "a newer live generation must not close against a stale cursor expectation"
+        );
+    }
+
+    #[test]
+    fn reconcile_slice_bounds_unbound_and_pre_cursor_prefixes() {
+        let mut registry = AttachStreamRegistry::default();
+        for index in 0..10 {
+            registry.start_attach(owner(), format!("unbound-{index:02}"), "sub".into());
+        }
+        registry.start_attach(owner(), "z-bound".into(), "sub".into());
+        let (_, handle) = UnixTerminalAdapter::pair();
+        registry.mark_adapter_bound(
+            "z-bound",
+            "sub",
+            TerminalSubscriptionGeneration(1),
+            BoundAdapterHandle::Unix(handle),
+        );
+        let mut lookups = 0;
+        let first = registry.reconcile_inventory_slice(
+            |_, _| {
+                lookups += 1;
+                Some(TerminalSubscriptionGeneration(1))
+            },
+            None,
+            8,
+        );
+        assert_eq!(first.validated, 0);
+        assert_eq!(lookups, 0, "unbound prefix must not call membership lookup");
+        assert!(first.more);
+        assert_eq!(
+            first.after.as_ref().map(|(session, _)| session.as_str()),
+            Some("unbound-07")
+        );
+        let second = registry.reconcile_inventory_slice(
+            |session, _| {
+                lookups += 1;
+                assert_eq!(session, "z-bound");
+                Some(TerminalSubscriptionGeneration(1))
+            },
+            first.after,
+            8,
+        );
+        assert_eq!(second.validated, 1);
+        assert_eq!(lookups, 1);
+        assert!(!second.more);
+        assert_eq!(
+            registry.stream_owner_client_id("z-bound", "sub").as_deref(),
+            Some("client-a")
         );
     }
 
