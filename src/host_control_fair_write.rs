@@ -11,6 +11,13 @@ pub(crate) enum HostControlClass {
     Event,
 }
 
+/// Host writers emit at most this many already-admitted frames per flush turn.
+///
+/// Three is one visit to each ready class. The bound returns the connection
+/// loop to poll new control input instead of draining a continuous event
+/// ready-set.
+pub(crate) const MAX_HOST_FRAMES_PER_FLUSH_TURN: usize = 3;
+
 const CLASS_ORDER: [HostControlClass; 3] = [
     HostControlClass::Control,
     HostControlClass::Entity,

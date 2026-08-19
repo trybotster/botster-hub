@@ -6,15 +6,36 @@
 - Target id: `tgt_7e208a0c76a44980a83b63af976b1f22`
 - Ticket: `ticket_1786663583_640263`
 - Run: `run_1787158085_722550`
-- Implement step: `run_step_1787159472_279191`
+- Implement step: `run_step_1787165407_410166` (sequence 5, Review return)
+- Prior Implement step: `run_step_1787159472_279191`
 - Approved plan: `docs/plans/expose-client-event-subscriptions-on-the-host-control-protocol.md` at `98ae1f9`
 - Plan Review: `review_1787159455_211294` approved
+- Code Review: `review_1787165393_430946` `changes_required` (7 findings)
 - `teardown_class_applies`: no
 - Direct-merge pipeline. No pull request.
 
 `BOTSTER_TARGET_ID` and spawn-target routing both map
 `tgt_7e208a0c76a44980a83b63af976b1f22` to `trybotster/botster-hub`. This run
 used the pipeline-provided ticket worktree for that target.
+
+## Review-return findings
+
+Review `review_1787165393_430946` returned seven findings. This visit
+addresses all of them. No protocol or npm coordinate change.
+
+| Finding | Severity | Fix |
+| --- | --- | --- |
+| `finding_1787165393_643969` Unix client cannot wait for events | high | `DaemonConnection::next_event` plus `set_read_timeout`. Live Unix PackageEvent now arrives without a Status poll. |
+| `finding_1787165393_273836` Event output starves control | high | Unix select is biased toward readable requests. Each flush turn writes at most three host frames (one visit per class). WebRTC treats queued Request/Hello/Overflow as `control_ready` and continues flushing a held entity frame. |
+| `finding_1787165393_194973` Mailbox contention loses EventGap | high | Gap bits live on a separate mutex from the event queue. Lock-held ablation proves one EventGap and no replay. |
+| `finding_1787165393_965740` Default-concurrency suite failed | high | `drive_package_events_for_test` drained one 20ms pull and reused `package-event-test-{name}-{envelope_id}` for two handlers of one envelope. Request ids now include `handler_id`. The helper loops queued copies and retries `Backpressured`. |
+| `finding_1787165393_413502` Cleanup retain drops new IDs | medium | Commit removes only snapshot IDs that this pass completed. Concurrent-insert test covers the window. |
+| `finding_1787165393_534534` Client delivery before plugin reject | medium | Clients receive only on `Accepted`. Mixed plugins-plus-clients pressure test covers `ShedFull` and `RejectedOverFanout`. |
+| `finding_1787165393_221205` Live Unix EventGap missing | medium | IsolatedHub stall-file latch plus 1-slot mailbox. Proves one EventGap, no later traffic, Status during stall and after. |
+
+Constraints applied for this return: Hub host-control and in-repo
+`botster-hub-client` only. Core pin unchanged. No Web/TUI edits. No
+protocol bump.
 
 ## Repository playbook and other playbooks/notes applied
 
@@ -66,6 +87,20 @@ down in this agent session, so Implement evidence is also in this report and
 gate payload.
 
 ## Files changed
+
+Review-return (this visit):
+
+- `crates/botster-hub-client/src/lib.rs` — `next_event` / `set_read_timeout`
+- `src/daemon_event_subscriptions.rs` — separate gap mutex, cleanup retain
+- `src/daemon_transport.rs` — biased request poll, bounded flush, stall latch
+- `src/host_control_fair_write.rs` — `MAX_HOST_FRAMES_PER_FLUSH_TURN`
+- `src/local_webrtc.rs` — queued-request `control_ready`, held-entity continue
+- `src/package_event_router.rs` — client delivery only on Accepted
+- `src/runtime.rs` — deterministic `drive_package_events_for_test`
+- `tests/hub_daemon_lifecycle/package_event_plane.rs` — next_event + Unix EventGap
+- `docs/client-protocol.md` — next_event
+
+Prior Implement files remain:
 
 Public contract:
 
@@ -187,8 +222,11 @@ Merged-blocker named tests still pass:
 Repo gates:
 
 - `cargo build --locked -p botster-core-daemon --bin botster-session-worker`
-- `./test.sh --locked` — one clean default-concurrency pass, 0 failures
-  (lifecycle 263 passed / 1 ignored)
+- `./test.sh --locked` — one clean default-concurrency pass after the
+  Review-return fixes, 0 failures. Lifecycle 264 passed / 1 ignored.
+  Lua runtime 60 passed, including
+  `events_on_registers_exact_event_subscription_and_invokes_worker_handler`.
+  Hub lib 441 passed. Hub client 78 passed.
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`
 - `cargo test --doc --workspace`
@@ -208,11 +246,15 @@ Live provenance under this checkout:
 
 - `@trybotster/hub-test-support@0.1.39` is published and clean-install
   proven. Web and TUI still need their own site-4 vendor/pin tickets.
-- IsolatedHub Unix EventGap under a live emit flood is not a reliable fill
-  because the writer can drain the 1-slot mailbox between emits. EventGap is
-  proved on the WebRTC harness and in unit tests.
+- Unix EventGap live proof uses a test-only stall file
+  (`BOTSTER_HUB_TEST_STALL_UNIX_EVENT_FLUSH`) and a 1-slot mailbox
+  (`BOTSTER_HUB_TEST_CLIENT_EVENT_QUEUE_MAX`). That is a controlled write
+  stall, not a production config surface.
 - Ready-set order treats WebRTC close events and package events as one Event
   class, as the plan allowed.
+- Flush turns are bounded at three already-admitted host frames. Continuous
+  event ingress can still occupy later turns; the bound exists so control
+  and entity classes get a select/poll between turns.
 
 ## Missing vault guidance discovered
 

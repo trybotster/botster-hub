@@ -436,7 +436,6 @@ impl PackageEventRouter {
         if !consume_token(&mut inner, caller_owner, now) {
             return EventPlaneStatus::RejectedOverRate;
         }
-        deliver_to_client_holders(&inner, caller_owner, name, payload, encoded.len());
         let selected: Vec<EventSubscription> = inner
             .subscriptions
             .get(&(caller_owner.to_string(), name.to_string()))
@@ -492,11 +491,13 @@ impl PackageEventRouter {
                 .get(&(caller_owner.to_string(), name.to_string()))
                 .is_none_or(Vec::is_empty)
             {
+                deliver_to_client_holders(&inner, caller_owner, name, payload, encoded.len());
                 EventPlaneStatus::Accepted
             } else {
                 EventPlaneStatus::ShedFull
             };
         }
+        deliver_to_client_holders(&inner, caller_owner, name, payload, encoded.len());
         let envelope_id = inner.next_envelope;
         inner.next_envelope = inner.next_envelope.saturating_add(1);
         let payload_arc: Arc<[u8]> = encoded.into();
@@ -1589,6 +1590,7 @@ fn lock_causal(mutex: &Mutex<CausalInner>) -> Option<std::sync::MutexGuard<'_, C
 mod tests {
     use super::*;
     use crate::config::PackageEventPlaneOptions;
+    use crate::daemon_event_subscriptions::ClientEventMailbox;
     use std::thread;
     use std::time::Duration as StdDuration;
 
@@ -2601,6 +2603,134 @@ mod tests {
             .pull_ready_batch(8, 64 * 1024, Instant::now(), StdDuration::from_millis(8))
             .expect("batch");
         assert_eq!(batch.len(), 1);
+    }
+
+    #[test]
+    fn mixed_plugin_and_client_ingress_does_not_deliver_before_rejection() {
+        let policy = PackageEventPlanePolicy {
+            consumer_queue_max_events: 1,
+            fanout_per_emit_max: 1,
+            ..PackageEventPlanePolicy::default()
+        };
+        let router = PackageEventRouter::new(policy.clone());
+        let mut contract = sample_contract("producer", "notice");
+        contract.audience = BTreeSet::from([EventAudience::Plugins, EventAudience::Clients]);
+        router
+            .try_register_contracts(vec![contract])
+            .expect("register");
+        subscribe(&router, "consumer", "producer", "notice");
+        assert_eq!(
+            router.try_ingress(
+                "producer",
+                "notice",
+                &serde_json::json!({ "ok": true }),
+                Instant::now()
+            ),
+            EventPlaneStatus::Accepted
+        );
+
+        let mailbox = std::sync::Arc::new(ClientEventMailbox::new(policy.clone()));
+        assert_eq!(
+            router.try_subscribe_client(ClientEventHolder {
+                connection_id: "conn".into(),
+                subscription_id: "sub".into(),
+                owner: "producer".into(),
+                name: "notice".into(),
+                subjects: BTreeSet::new(),
+                mailbox: mailbox.clone(),
+            }),
+            EventPlaneStatus::Accepted
+        );
+        assert_eq!(
+            router.try_ingress(
+                "producer",
+                "notice",
+                &serde_json::json!({ "ok": true }),
+                Instant::now()
+            ),
+            EventPlaneStatus::ShedFull
+        );
+        assert!(
+            mailbox.take_ready_event().is_none(),
+            "ShedFull must not deliver to clients"
+        );
+
+        let fanout_router = PackageEventRouter::new(PackageEventPlanePolicy {
+            fanout_per_emit_max: 1,
+            ..PackageEventPlanePolicy::default()
+        });
+        let mut fanout_contract = sample_contract("producer", "notice");
+        fanout_contract.audience = BTreeSet::from([EventAudience::Plugins, EventAudience::Clients]);
+        fanout_router
+            .try_register_contracts(vec![fanout_contract])
+            .expect("register");
+        subscribe(&fanout_router, "consumer-a", "producer", "notice");
+        subscribe(&fanout_router, "consumer-b", "producer", "notice");
+        let fanout_mailbox =
+            std::sync::Arc::new(ClientEventMailbox::new(PackageEventPlanePolicy::default()));
+        assert_eq!(
+            fanout_router.try_subscribe_client(ClientEventHolder {
+                connection_id: "conn".into(),
+                subscription_id: "sub".into(),
+                owner: "producer".into(),
+                name: "notice".into(),
+                subjects: BTreeSet::new(),
+                mailbox: fanout_mailbox.clone(),
+            }),
+            EventPlaneStatus::Accepted
+        );
+        assert_eq!(
+            fanout_router.try_ingress(
+                "producer",
+                "notice",
+                &serde_json::json!({ "ok": true }),
+                Instant::now()
+            ),
+            EventPlaneStatus::RejectedOverFanout
+        );
+        assert!(
+            fanout_mailbox.take_ready_event().is_none(),
+            "over-fanout must not deliver to clients"
+        );
+
+        let accepted_mailbox =
+            std::sync::Arc::new(ClientEventMailbox::new(PackageEventPlanePolicy::default()));
+        let accepted_router = PackageEventRouter::new(PackageEventPlanePolicy::default());
+        let mut accepted_contract = sample_contract("producer", "notice");
+        accepted_contract.audience =
+            BTreeSet::from([EventAudience::Plugins, EventAudience::Clients]);
+        accepted_router
+            .try_register_contracts(vec![accepted_contract])
+            .expect("register");
+        subscribe(&accepted_router, "consumer", "producer", "notice");
+        assert_eq!(
+            accepted_router.try_subscribe_client(ClientEventHolder {
+                connection_id: "conn".into(),
+                subscription_id: "sub".into(),
+                owner: "producer".into(),
+                name: "notice".into(),
+                subjects: BTreeSet::new(),
+                mailbox: accepted_mailbox.clone(),
+            }),
+            EventPlaneStatus::Accepted
+        );
+        assert_eq!(
+            accepted_router.try_ingress(
+                "producer",
+                "notice",
+                &serde_json::json!({ "ok": true }),
+                Instant::now()
+            ),
+            EventPlaneStatus::Accepted
+        );
+        match accepted_mailbox.take_ready_event() {
+            Some(botster_hub_client::DaemonEvent::PackageEvent {
+                subscription_id, ..
+            }) => {
+                assert_eq!(subscription_id, "sub");
+            }
+            other => panic!("accepted mixed ingress must deliver to clients: {other:?}"),
+        }
     }
 
     #[test]
