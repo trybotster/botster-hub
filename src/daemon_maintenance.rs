@@ -148,12 +148,6 @@ impl MaintenanceScheduler {
         self.next = MaintenanceSliceKind::SubscriberDelivery;
     }
 
-    /// Finish an incomplete observe pass before the rest of the rotation.
-    pub fn prefer_observe(&mut self) {
-        self.wake = true;
-        self.next = MaintenanceSliceKind::Observe;
-    }
-
     /// True when an idle owner turn should run one slice.
     #[must_use]
     pub fn has_wake(&self) -> bool {
@@ -653,10 +647,11 @@ impl MaintenanceState {
     }
 
     pub fn needs_work(&self) -> bool {
+        // `observe_resume` is continuation state for the next Observe kind.
+        // It must not rearm the whole nine-kind rotation as idle wakes.
         self.scheduler.has_wake()
             || self.baseline.is_some()
             || !self.pending_changes.is_empty()
-            || self.observe_resume.is_some()
             || self.session_family.has_work()
             || !self.pending_retirements.is_empty()
     }
@@ -907,21 +902,14 @@ fn run_observe_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
             }
             // Observe can publish journal rows (natural exit) without a
             // subscriber. Wake the next JournalPull so the projection does
-            // not lag Core list(). An incomplete pass otherwise stays on
-            // Observe so the 9-kind rotation does not count no-op slices
-            // as idle wakes.
+            // not lag Core list(). An incomplete pass keeps the resume
+            // cursor and leaves the nine-kind pointer unchanged.
             if runtime.take_journal_advanced_wake() {
                 state.scheduler.prefer_journal_pull();
-            } else if state.observe_resume.is_some() {
-                state.scheduler.prefer_observe();
             }
         }
         Err(SessionLifecyclePageError::BudgetTooSmall { .. }) => {
-            if state.observe_resume.is_some() {
-                state.scheduler.prefer_observe();
-            } else {
-                state.scheduler.try_wake();
-            }
+            state.scheduler.try_wake();
         }
         Err(_) => state.scheduler.try_wake(),
     }
@@ -2109,13 +2097,15 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_observe_prefers_observe_instead_of_the_rest_of_the_rotation() {
+    fn incomplete_observe_keeps_the_nine_kind_rotation() {
         let mut scheduler = MaintenanceScheduler::default();
         assert_eq!(scheduler.take_slice(), MaintenanceSliceKind::Observe);
-        scheduler.prefer_observe();
-        assert_eq!(scheduler.take_slice(), MaintenanceSliceKind::Observe);
-        scheduler.prefer_observe();
-        assert_eq!(scheduler.take_slice(), MaintenanceSliceKind::Observe);
+        scheduler.try_wake();
+        assert_eq!(
+            scheduler.take_slice(),
+            MaintenanceSliceKind::JournalPull,
+            "an incomplete Observe pass must not rewrite next to Observe"
+        );
     }
 
     #[test]
@@ -3208,6 +3198,51 @@ mod tests {
     }
 
     #[test]
+    fn composed_incomplete_observe_still_serves_host_bridge_and_subscriber_delivery() {
+        let mut classes = BackgroundClassScheduler::default();
+        let mut maintenance = MaintenanceState::default();
+        let mut subscriber_at = None;
+        let mut host_bridge_at = None;
+        let mut observe_count = 0usize;
+        for turn in 0..18 {
+            classes.mark_pump();
+            let class = classes.select(true).expect("both classes stay pending");
+            if class != BackgroundClass::Maintenance {
+                continue;
+            }
+            maintenance.try_wake();
+            let kind = maintenance.scheduler.take_slice();
+            if kind == MaintenanceSliceKind::Observe {
+                observe_count = observe_count.saturating_add(1);
+                maintenance.observe_resume = Some(ObserveLifecycleCursor {
+                    pass_id: ObserveLifecyclePassId("incomplete".into()),
+                    last_visited: None,
+                });
+            }
+            if kind == MaintenanceSliceKind::HostBridge && host_bridge_at.is_none() {
+                host_bridge_at = Some(turn);
+            }
+            if kind == MaintenanceSliceKind::SubscriberDelivery && subscriber_at.is_none() {
+                subscriber_at = Some(turn);
+            }
+        }
+        assert!(
+            observe_count >= 1,
+            "the sequence must include at least one incomplete Observe pass"
+        );
+        assert!(
+            maintenance.observe_resume.is_some(),
+            "the resume cursor must survive the rotation"
+        );
+        assert!(
+            !maintenance.needs_work(),
+            "observe_resume alone must not keep Maintenance pending"
+        );
+        assert_eq!(host_bridge_at, Some(8));
+        assert_eq!(subscriber_at, Some(10));
+    }
+
+    #[test]
     fn pump_phases_rotate_and_keep_cursors() {
         let mut pump = PumpScheduler::default();
         assert_eq!(pump.take_phase(), PumpPhase::Observe);
@@ -3284,6 +3319,20 @@ mod tests {
         assert!(
             !state.needs_work(),
             "dirty is a delivery hint, not a self-rearming maintenance wake"
+        );
+    }
+
+    #[test]
+    fn observe_resume_alone_does_not_keep_maintenance_pending() {
+        let mut state = sealed_maintenance(1, Some(1));
+        let _ = state.scheduler.take_slice();
+        state.observe_resume = Some(ObserveLifecycleCursor {
+            pass_id: ObserveLifecyclePassId("1".into()),
+            last_visited: None,
+        });
+        assert!(
+            !state.needs_work(),
+            "observe_resume is Observe continuation, not a nine-kind self-wake"
         );
     }
 

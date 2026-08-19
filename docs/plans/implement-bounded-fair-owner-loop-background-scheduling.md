@@ -20,11 +20,16 @@ Revision 4 answers Implement Review `review_1787118229_406859`:
 - `finding_1787118229_310222`: keep idle `reconciliation_wakes` `<= 4` by not self-rearming Pump from reads.
 - `finding_1787118229_810551`: this plan now matches Maintenance-only wake accounting.
 
-Implement notes (revision 5, answering Review `review_1787126462_489606`):
-- An incomplete Maintenance Observe pass prefers Observe until the pass completes. It does not rotate through the other eight kinds as idle wakes.
-- `projection_dirty` is a delivery hint. It does not keep `owner_maintenance_pending` true by itself. A confirmed journal pull that still has dirty work prefers SubscriberDelivery.
+Implement notes (revision 6, answering Review `review_1787131785_727118`):
+- The nine-kind `MaintenanceSliceKind` rotation is unchanged. An incomplete Observe pass stores `observe_resume` and does not rewrite `next`.
+- `observe_resume` is continuation state for the next Observe kind. It is not a `needs_work` self-wake, so idle accounting does not count the other eight kinds as wakes.
+- `projection_dirty` remains a delivery hint, not a self-wake.
 - HostBridge drains every fanout job that fits the existing visit/byte/elapsed budget in one slice.
-- `reconciliation_wakes` increments once per executed Maintenance class slice. SubscriberDelivery does not add a second increment.
+- A sealed baseline `ObservePassUnavailable` clears the observe cursor and does not remint.
+- Composed fairness with a continuously incomplete Observe pass still executes HostBridge and SubscriberDelivery at the same 18-turn indices.
+
+Implement notes (revision 5, answering Review `review_1787126462_489606`):
+- Idle wake accounting must not rewrite the nine-kind pointer. `projection_dirty` is a delivery hint. HostBridge drains budget-fitting fanout jobs. SubscriberDelivery does not double-count `reconciliation_wakes`.
 - A sealed baseline `ObservePassUnavailable` clears the observe cursor and does not remint. An incomplete baseline still starts recovery.
 - The eight-session idle sample waits 1.2 s so leftover catch-up cannot spill into the `<= 4` window.
 
