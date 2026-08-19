@@ -140,19 +140,21 @@ No new Core, Web, TUI, or Workspaces dependency.
 None in product scope. Replay resolved conflicts by keeping both occupancy
 and package-event behavior.
 
-Release coordinate: registry latest remains orphan `0.1.38`. This run takes
-unpublished `0.1.39` / conformance revision 44 as planned.
+Release coordinate: orphan `0.1.38` stays untouched. This run published
+`@trybotster/hub-test-support@0.1.39` at conformance revision 44.
 
-`npm whoami` is 401 and `npm publish` returns 404/unauthorized. Packed
-tarball `trybotster-hub-test-support-0.1.39.tgz` (shasum
-`03f47f651e272a52ebf2e6a5e2bea2e2fe7b6851`) contains revision 44,
-`package_event_subscriptions` in `supported_features` only, and the new DTO
-tokens. Publication needs restored npm auth, same as prior
-`question_1786874473_381921`.
+Registry `dist.integrity` matches the packed tarball from HEAD `3f3e55d`:
+`sha512-r7gnVD+uiGvoeSzRnrgIM1+ZCjrRZUOlJz7x0bPYMkn3pF1kjJSIVAV1fEiPjqERv4eGtHYV1xgbjGGBVZP2Yg==`
+(`dist.shasum` `03f47f651e272a52ebf2e6a5e2bea2e2fe7b6851`).
+
+A clean install of the published coordinate proved `metadata.package_version
+=== "0.1.39"`, revision 44, protocol 7, `verifyPackageAssets()` empty
+failures, DTO tokens `subscribe_events` / `unsubscribe_events` /
+`package_event` / `event_gap` / `subjects?`, and
+`package_event_subscriptions` in `supported_features` only.
 
 Botster MCP handshake failed in this agent session. Workflow evidence is
-recorded here and will be persisted through Project Pipelines tools when
-available.
+recorded here and in plugin-data.
 
 ## Tests and downstream proof run
 
@@ -192,6 +194,8 @@ Repo gates:
 - `cargo test --doc --workspace`
 - `node packages/hub-test-support/scripts/sync-assets.mjs --check`
 - `node packages/hub-test-support/test.mjs`
+- `npm install @trybotster/hub-test-support@0.1.39` in a clean directory,
+  then `verifyPackageAssets()` plus DTO-token and support-matrix asserts
 
 Live provenance under this checkout:
 
@@ -202,9 +206,8 @@ Live provenance under this checkout:
 
 ## Unverified behavior or residual risk
 
-- `@trybotster/hub-test-support@0.1.39` is packed and locally proven, not
-  published. Web and TUI cannot consume a registry coordinate until npm auth
-  is restored.
+- `@trybotster/hub-test-support@0.1.39` is published and clean-install
+  proven. Web and TUI still need their own site-4 vendor/pin tickets.
 - IsolatedHub Unix EventGap under a live emit flood is not a reliable fill
   because the writer can drain the 1-slot mailbox between emits. EventGap is
   proved on the WebRTC harness and in unit tests.
