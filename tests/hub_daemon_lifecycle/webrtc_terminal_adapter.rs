@@ -1041,6 +1041,20 @@ fn webrtc_terminal_adapter_detach_peer_death_process_exit_and_shutdown_do_not_em
         spawn_and_bind_webrtc(&mut peer, &key, "wnx-detach", "sub-detach", "sleep 30").await;
         spawn_and_bind_webrtc(&mut peer, &key, "wnx-exit", "sub-exit", "printf 'done\\n'").await;
         spawn_and_bind_webrtc(&mut peer, &key, "wnx-shutdown", "sub-shutdown", "sleep 30").await;
+        let before = peer
+            .encrypted_request(&key, &botster_hub_client::DaemonRequest::Status)
+            .await
+            .expect("status before WebRTC ShutdownSession");
+        let shutdown_generation = occupancy_generation(
+            &before
+                .status
+                .as_ref()
+                .expect("status body before WebRTC ShutdownSession")
+                .live_attach_occupancy,
+            "wnx-shutdown",
+            "sub-shutdown",
+        )
+        .expect("Active WebRTC ShutdownSession must have a Core-issued generation");
         let detach = peer
             .encrypted_request(
                 &key,
@@ -1065,10 +1079,25 @@ fn webrtc_terminal_adapter_detach_peer_death_process_exit_and_shutdown_do_not_em
             shutdown.kind,
             botster_hub_client::DaemonResponseKind::OperatorError
         );
+        let late = peer
+            .encrypted_request(&key, &botster_hub_client::DaemonRequest::Status)
+            .await
+            .expect("late Status after WebRTC ShutdownSession");
+        assert_eq!(late.kind, botster_hub_client::DaemonResponseKind::Status);
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {
             let _ = timeout(Duration::from_millis(100), peer.next_host_event(&key)).await;
         }
+        assert!(
+            no_terminal_subscription_closed(
+                peer.pending_host_events.iter(),
+                "wnx-shutdown",
+                Some("sub-shutdown"),
+                Some(shutdown_generation)
+            ),
+            "WebRTC ShutdownSession must not emit TerminalSubscriptionClosed for generation {shutdown_generation}: {:?}",
+            peer.pending_host_events
+        );
         assert!(
             peer.pending_host_events.iter().all(|event| {
                 !matches!(
