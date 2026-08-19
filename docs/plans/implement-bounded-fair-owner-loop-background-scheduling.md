@@ -3,6 +3,11 @@
 Ticket: `ticket_1786912569_840742` — Hub: implement bounded fair owner-loop background scheduling.
 Run: `run_1787102180_185677`. Base: `origin/main` (`8b4aeaf`).
 
+Revision 2. This revision answers Plan Review `review_1787103654_733071`:
+- `finding_1787103654_765870`: ReadModeFlags loses lifecycle observation entirely (section 4).
+- `finding_1787103654_982441`: the Pump class becomes a bounded phase rotation with continuation cursors and per-slice work caps; the one remaining full-set operation is named, bounded to one acquisition per pass, and carries a measured-cost blocker trigger (section 3).
+- `finding_1787103654_131792`: acceptance adds a deterministic composed-fairness proof for SubscriberDelivery and HostBridge, and implementation evidence must record one actual ready-Spawn observation below 50 ms (Acceptance section).
+
 ## Target
 
 - Target repository: `botster-hub` (`trybotster/botster-hub`).
@@ -58,18 +63,33 @@ Implement one explicit bounded scheduler for the two Hub owner-loop background c
 - When the reconciliation interval is due, the loop marks Pump pending and advances `next_reconciliation`. The loop does not run the pump inline after a maintenance slice. This removes the stacked path at `src/daemon_transport.rs:367-374`.
 - `reconciliation_wakes` increments once per executed background slice of either class, so the existing counter-progress oracles keep observing background progress.
 
-### 3. Pump slice content
+### 3. Pump class: a bounded phase rotation
 
-- Rename/adapt `pump_bound_unix_routes` into the Pump-class slice. Keep: `list_terminal_subscriptions` inventory reconcile, `queue_unix_subscription_closed_events`, `queue_webrtc_subscription_closed_events`, `lifecycle_session_drains` counter.
-- The pump observe call uses `OBSERVE_SLICE_BUDGET` (unchanged constant: 8 sessions, 64 KiB, `max_elapsed` 8 ms) with the existing `observe_resume` cursor. An incomplete slice keeps Pump pending.
-- On `take_journal_advanced_wake`, the pump calls `note_authoritative_mutation()` only. It does not run `JournalPull` or `ProjectionApply` inline. The next fairly selected Maintenance slice performs the pull.
-- Pump pending mark sources: reconciliation interval due; successful Attach bind (Unix and WebRTC); successful Spawn/SpawnSessionType acknowledgement; incomplete previous pump slice; subscription-close reconciliation need.
+The current `pump_bound_unix_routes` performs full-set work in one call: a full Core `list_terminal_subscriptions`, a full scan of every Unix and WebRTC admission, one full `runtime.list_sessions()` **per close candidate** inside `session_suppresses_terminal_subscription_closed` (`src/daemon_transport.rs:4641`), and a full `reconcile_inventory` of every bound stream against the full inventory. Reclassifying that call as one slice would not be bounded. Instead the Pump class becomes its own rotation of three bounded phases. One Pump selection runs exactly one phase. Each phase has continuation state and per-slice work caps, mirroring the `MaintenanceSliceKind` pattern.
+
+**PumpPhase::CloseEvents**
+- Visits admissions in key order with a resume cursor over the admission maps (`unix_admissions`, then `webrtc_admissions`).
+- Per-slice caps: `max_admissions_visited` and `max_candidate_classifications` (constants, same order of magnitude as the existing slice caps such as `CONSUMER_REFRESH_MAX = 8`).
+- The suppression predicate stops calling the full `runtime.list_sessions()` per candidate. It classifies each candidate with one exact-session query (`observe_session_lifecycle` / the registry record it returns). This removes the O(admissions × sessions) cost that is the worst offender in the current pump.
+- An incomplete visit keeps Pump pending and resumes after the cursor.
+
+**PumpPhase::InventoryReconcile**
+- Purpose unchanged: close Hub-bound routes whose Core subscription vanished (the backstop behind mux close events).
+- At most **one** `list_terminal_subscriptions` acquisition per reconcile pass. The result is held as a frozen snapshot for the pass. Continuation slices walk the Hub bound-stream keys in order with a resume cursor and compare at most `max_routes_compared` routes per slice against the frozen snapshot. The snapshot is dropped when the pass completes. A generation recorded after the snapshot was taken is treated as live (no close on stale-snapshot evidence).
+- Named residual cost, not hidden: the single acquisition is an O(total-subscriptions) in-memory metadata copy (`CoreDaemon::list_terminal_subscriptions` returns the engine's record list without serialization or storage I/O). Core exposes no exact or paged terminal-subscription query today. This plan does not pre-emptively block on a Core API for a metadata copy; instead the Implementer must add a work-bound test proving one acquisition per pass (no per-slice re-list), and Verify must record the measured acquisition cost at a hundreds-of-sessions fixture. **Blocker trigger:** if that measurement threatens the 8 ms slice class, register a separate botster-core dependency ticket for a bounded/paged subscription inventory API against the Core target (`tgt_1f7bce66eb304881980f9b4a2a5ae3fe`) instead of expanding this ticket — the same route the project took for `lifecycle_baseline_page` budgets.
+
+**PumpPhase::Observe**
+- The observe call uses `OBSERVE_SLICE_BUDGET` (unchanged constant: 8 sessions, 64 KiB, `max_elapsed` 8 ms) with the existing `observe_resume` cursor. An incomplete slice keeps Pump pending.
+- On `take_journal_advanced_wake`, the phase calls `note_authoritative_mutation()` only. It does not run `JournalPull` or `ProjectionApply` inline. The next fairly selected Maintenance slice performs the pull.
+
+Pump pending mark sources: reconciliation interval due; successful Attach bind (Unix and WebRTC); successful Spawn/SpawnSessionType acknowledgement; incomplete previous pump phase; subscription-close reconciliation need.
 
 ### 4. Operation paths lose broad lifecycle observation
 
 - Delete `observe_lifecycle_turn`.
 - Unix and WebRTC Attach bind: replace the broad observe with a Pump pending mark. The same control turn then runs one background slice, so first output pumping stays prompt without stacking.
-- ReadScreen and ReadModeFlags: replace the broad observe with one exact-session `HubRuntime::observe_session_lifecycle(&session_id, now)` call before the read. This preserves the observed-exit wait contract from [[observed-exit waits must issue a production exact-session observe turn]] with a stimulus that targets the named session instead of a 25 ms collection scan. On a resulting journal wake, mark Maintenance pending; do not pull inline.
+- ReadScreen: replace the broad observe with one exact-session `HubRuntime::observe_session_lifecycle(&session_id, now)` call before the read. This preserves the observed-exit wait contract from [[observed-exit waits must issue a production exact-session observe turn]] with a stimulus that targets the named session instead of a 25 ms collection scan. On a resulting journal wake, mark Maintenance pending; do not pull inline. ReadScreen is the only read operation that keeps an observation, because the observed-exit note names it as the wait stimulus.
+- ReadModeFlags: remove lifecycle observation entirely. No note requires ReadModeFlags to observe lifecycle, and the ticket removes lifecycle work from operation paths. Add a check that the ReadModeFlags path performs no lifecycle observation: a behavior test that issues ReadModeFlags and asserts the observe counters (`lifecycle_session_drains`, `reconciliation_wakes`, journal reads) do not move, or an equivalent source-scan assertion beside the existing control-plane architecture checks.
 - ShutdownSession: remove the broad observe before `classify_shutdown_session`. Classification already calls the exact-session Core query per [[host ShutdownSession classification must call the exact-session Core query]]. Keep the typed `Found`/`Absent`/`Err` split unchanged.
 - `recover_after_core_shutdown_error`: remove the broad observe. The exact-session classify inside the recover path supplies the observation.
 - Spawn, SpawnSessionType, Drain, Input, and Resize already perform no lifecycle observation; verify this stays true.
@@ -94,7 +114,7 @@ Implement one explicit bounded scheduler for the two Hub owner-loop background c
 ## Ownership boundaries and cross-repo dependencies
 
 - All changes stay in `botster-hub`. The Hub owns owner-loop policy, budgets, and scheduling (host profile charter).
-- Core stays authoritative for lifecycle facts. The plan consumes only existing pinned Core APIs (`observe_lifecycle_slice`, `observe_session_lifecycle`, `take_journal_advanced_wake`, journal pages). No new Core surface is required, so no cross-repo dependency is registered.
+- Core stays authoritative for lifecycle facts. The plan consumes only existing pinned Core APIs (`observe_lifecycle_slice`, `observe_session_lifecycle`, `take_journal_advanced_wake`, `list_terminal_subscriptions`, journal pages). No new Core surface is required, so no cross-repo dependency is registered now. One named gap exists: Core has no exact or paged terminal-subscription inventory query. Section 3 bounds its use to one in-memory acquisition per reconcile pass and defines the measured-cost trigger that would create a botster-core dependency ticket against `tgt_1f7bce66eb304881980f9b4a2a5ae3fe` as a separate blocker.
 - Terminal bytes stay on the Core SessionIo/ClientWorker data plane. The scheduler selects when the Hub asks Core to pump; it never touches frame content.
 
 ## Assumptions and unknowns
@@ -107,8 +127,9 @@ Implement one explicit bounded scheduler for the two Hub owner-loop background c
 ## Affected surfaces/files
 
 - `src/daemon_maintenance.rs` — new background-class scheduler type plus unit tests; `MaintenanceScheduler` untouched.
-- `src/daemon_transport.rs` — `serve_daemon` turn shape; `run_one_owner_maintenance_slice` becomes the class-dispatched slice runner; pump slice rework; removal of `observe_lifecycle_turn` and its six call sites; exact-session observe on ReadScreen/ReadModeFlags; decision-level tests.
-- `tests/hub_daemon_lifecycle/sessions.rs` — sustained-control-traffic proof extended with PTY progress; ready-Spawn proof.
+- `src/daemon_transport.rs` — `serve_daemon` turn shape; `run_one_owner_maintenance_slice` becomes the class-dispatched slice runner; Pump phase rotation with continuation state; removal of `observe_lifecycle_turn` and its six call sites; exact-session observe on ReadScreen only; bounded close-candidate classification replacing the per-candidate `list_sessions` predicate; decision-level and work-bound tests.
+- `src/daemon_attach_stream.rs` — `reconcile_inventory` gains a bounded, cursor-resumable form over a frozen snapshot.
+- `tests/hub_daemon_lifecycle/sessions.rs` — sustained-control-traffic proof extended with PTY progress; ready-Spawn proof; ReadModeFlags no-observe check.
 - Existing tests touching removed behavior may need stimulus repairs (see unknowns).
 
 ## Risks
@@ -118,6 +139,9 @@ Implement one explicit bounded scheduler for the two Hub owner-loop background c
 3. **Idle-bound counters.** `focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible` asserts idle `lifecycle_change_reads <= 4` and no baseline rescans. Pump-as-class must not add idle work.
 4. **Busy-mark loop.** Marking Pump pending on interval-due must advance the deadline at mark time, or the loop would spin on an always-due interval.
 5. **Wall-clock oracles.** New tests must use work bounds and decision-level oracles, not elapsed time, per the two wall-clock gotcha notes.
+6. **Snapshot staleness in bounded reconcile.** A route bound after the pass snapshot was taken must not be closed on stale evidence; the generation-recorded-after-snapshot guard covers this and needs its own test.
+7. **Close-candidate classification change.** Replacing the per-candidate `list_sessions` with an exact-session query changes the suppression predicate's failure behavior (query error must stay suppress-safe, matching today's `Err -> true` fallback).
+8. **Chunked pump latency.** Splitting the pump into three rotated phases lengthens the interval between observe slices when close-event or reconcile work is pending; the sustained-traffic PTY-progress proof covers this.
 
 ## Acceptance checks/tests
 
@@ -128,10 +152,13 @@ Deterministic scheduler state tests (unit):
 - One turn, one slice: the turn-decision function never returns two background slices for one turn, including when the reconciliation interval is due during a maintenance-pending turn.
 - Control precedence: extend `queued_control_precedes_a_due_maintenance_slice` to cover both classes pending.
 - No cancellation: a selected slice decision survives a control message that arrives after selection (decision-level proof; negative control with the rule inverted must go red).
+- Composed maintenance fairness: with Pump continuously rearmed and Maintenance continuously pending, drive the composed scheduler for a fixed turn sequence and assert that `SubscriberDelivery` and `HostBridge` each execute within an exact finite turn bound. With class round-robin (Maintenance every second background turn) and the 9-kind inner rotation, each kind must execute within 18 background turns; the test asserts the deterministic turn indices, not elapsed time.
+- Pump phase work bounds: each Pump phase test proves its per-slice caps (`max_admissions_visited`, `max_candidate_classifications`, `max_routes_compared`, `OBSERVE_SLICE_BUDGET` items/bytes) and cursor continuation. The InventoryReconcile test proves exactly one `list_terminal_subscriptions` acquisition per pass across multiple continuation slices.
+- ReadModeFlags no-observe check: issuing ReadModeFlags moves no observation counter (or the equivalent source-scan assertion).
 
 Integration proof (`tests/hub_daemon_lifecycle`):
 - Sustained control traffic: pipelined Status flood while a live PTY producer emits output. Assert `reconciliation_wakes` strictly increases **and** PTY output progresses (screen/drain content advances) during the flood. Progress deltas, not elapsed time, are the oracle.
-- Ready Spawn: with a live-session backlog larger than one observe slice, a Spawn completes successfully; the decision-level oracle proves control precedence; the end-to-end elapsed time is recorded as observational evidence with the expectation below 50 ms (per [[wall-clock ready-operation bounds through a daemon child are ambient-load-sensitive]], elapsed time is evidence, not the deterministic gate).
+- Ready Spawn: with a live-session backlog larger than one observe slice, a Spawn completes successfully; the decision-level oracle proves control precedence and is the deterministic gate. In addition, implementation/Verify evidence **must record one actual measured ready-Spawn observation below 50 ms** from a live run — the ticket requires the observation itself, not an expectation. Per [[wall-clock ready-operation bounds through a daemon child are ambient-load-sensitive]], the elapsed measurement does not become a pass/fail test assertion; a measurement at or above 50 ms triggers investigation and re-measurement, never a budget change.
 - No terminal output loss: existing attach output-retention tests stay green; the flood-PTY test asserts the complete expected producer output is eventually received.
 - Observed-exit waits and shutdown classification tests stay green under the exact-session stimulus.
 - `focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible` stays green (idle bounds plus wake progress).
