@@ -3493,6 +3493,8 @@ fn handle_runtime_control_request(
                 | Ok(ShutdownSessionClassification::Stopping)
                 | Err(_) => {}
             }
+            suppress_unix_session_close_events(pending_runtime, &session_id);
+            suppress_webrtc_session_close_events(pending_runtime, &session_id);
             let shutdown_session_id = session_id.clone();
             let response = match api.handle_request(
                 runtime,
@@ -3512,13 +3514,9 @@ fn handle_runtime_control_request(
                         error,
                         logical_clock,
                     )?;
-                    suppress_unix_session_close_events(pending_runtime, &session_id);
-                    suppress_webrtc_session_close_events(pending_runtime, &session_id);
                     return Ok(response);
                 }
             };
-            suppress_unix_session_close_events(pending_runtime, &session_id);
-            suppress_webrtc_session_close_events(pending_runtime, &session_id);
             events_response(response.body)
         }
         DaemonRequest::Drain {
@@ -4673,7 +4671,7 @@ fn missing_session_drain_error(session_id: &str) -> DaemonResponse {
 fn suppress_unix_session_close_events(pending_runtime: &PendingRuntimeState, session_id: &str) {
     for admission in pending_runtime.unix_admissions.values() {
         if let UnixTerminalAdmission::Admitted { mux, .. } = admission {
-            mux.suppress_session(session_id);
+            mux.suppress_session_route_generations(session_id);
         }
     }
 }
@@ -4681,7 +4679,7 @@ fn suppress_unix_session_close_events(pending_runtime: &PendingRuntimeState, ses
 fn suppress_webrtc_session_close_events(pending_runtime: &PendingRuntimeState, session_id: &str) {
     for admission in pending_runtime.webrtc_admissions.values() {
         if let WebrtcTerminalAdmission::Admitted { mux, .. } = admission {
-            mux.suppress_session(session_id);
+            mux.suppress_session_route_generations(session_id);
         }
     }
 }
@@ -8189,6 +8187,42 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_session_arm_installs_exact_suppression_before_core_request() {
+        const TRANSPORT: &str = include_str!("daemon_transport.rs");
+        let arm = TRANSPORT
+            .split("DaemonRequest::ShutdownSession { session_id } => {")
+            .nth(1)
+            .expect("ShutdownSession arm")
+            .split("DaemonRequest::Drain {")
+            .next()
+            .expect("ShutdownSession arm end");
+        let unix_suppress = arm
+            .find("suppress_unix_session_close_events")
+            .expect("unix suppression");
+        let webrtc_suppress = arm
+            .find("suppress_webrtc_session_close_events")
+            .expect("webrtc suppression");
+        let core = arm
+            .find("HubClientRequest::Shutdown")
+            .expect("Core Shutdown request");
+        assert!(
+            unix_suppress < core && webrtc_suppress < core,
+            "ShutdownSession must install exact-key suppression before the Core request"
+        );
+        let after_core = &arm[core..];
+        assert!(
+            !after_core.contains("suppress_unix_session_close_events")
+                && !after_core.contains("suppress_webrtc_session_close_events"),
+            "ShutdownSession must not reinstall suppression after the Core request"
+        );
+        assert!(
+            arm.contains("suppress_unix_session_close_events")
+                && TRANSPORT.contains("suppress_session_route_generations"),
+            "helpers must snapshot exact route generations, not session-wide keys"
+        );
+    }
+
+    #[test]
     fn close_event_suppression_matrix_matches_prior_predicate() {
         assert_eq!(
             session_close_event_decision(Ok(SessionRegistryStateLookup::Found(
@@ -8425,6 +8459,21 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn recover_exact_missing_returns_unknown_session() {
+        let response = recover_from_exact_classify(
+            Ok(ShutdownSessionClassification::Missing),
+            shutdown_runtime_error(crate::HubClientRuntimeErrorKind::Runtime),
+            "missing-session",
+        )
+        .expect("Missing classification stays unknown_session");
+        assert_eq!(response.kind, DaemonResponseKind::OperatorError);
+        let error = response.error.expect("unknown_session body");
+        assert_eq!(error.code, "unknown_session");
+        assert_eq!(error.operation, "shutdown");
+        assert_eq!(error.message, "unknown session: missing-session");
     }
 
     #[test]
