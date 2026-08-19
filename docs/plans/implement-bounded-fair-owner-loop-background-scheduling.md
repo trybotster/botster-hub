@@ -26,7 +26,9 @@ Implement notes (revision 4, answering Review `review_1787118229_406859`):
 - CloseEvents retries Absent and query error instead of marking reported.
 - Pump is marked only at documented sources: interval due, successful Spawn/SpawnSessionType/Attach, Detach/ShutdownSession/RemoveSession (including failed RemoveSession), and an incomplete Pump phase. Status, ReadModeFlags, ReadScreen, and other reads do not remake Pump.
 - CloseEvents and InventoryReconcile resume with `BTreeMap::range` and a per-slice visit budget, so open, reported, unbound, and pre-cursor prefixes cannot make one slice O(total rows).
-- Adapter close sets one coalesced close-work flag. The owner loop marks Pump and prefers CloseEvents. Interval due marks Pump and wakes Maintenance.
+- Adapter close and close-related control only mark Pump. They do not rewrite the Pump phase pointer. CloseEvents stays in the three-phase rotation so Observe and InventoryReconcile still run under continuous close work.
+- CloseEvents suppression uses keyed sets and per-candidate lookup. InventoryReconcile removes one client's route by reverse owner lookup, not a full ledger scan.
+- A sealed baseline does not remint from `ObservePassUnavailable`. Interval still marks Pump and wakes Maintenance.
 - Interval due also wakes Maintenance. One turn still runs one class.
 
 ## Target

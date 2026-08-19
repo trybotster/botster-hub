@@ -233,16 +233,30 @@ impl AttachStreamRegistry {
     }
 
     fn forget_connection_bound_route(&mut self, session_id: &str, subscription_id: &str) {
-        let mut empty_clients = Vec::new();
-        for (client_id, routes) in &mut self.connection_bound_routes {
-            routes.retain(|route| {
-                route.session_id != session_id || route.subscription_id != subscription_id
-            });
-            if routes.is_empty() {
-                empty_clients.push(client_id.clone());
+        let key = (session_id.to_string(), subscription_id.to_string());
+        let Some(stream) = self.streams.get(&key) else {
+            return;
+        };
+        let client_id = stream.owner.client_id.clone();
+        let generation = stream.generation;
+        let Some(routes) = self.connection_bound_routes.get_mut(&client_id) else {
+            return;
+        };
+        match generation {
+            Some(generation) => {
+                routes.remove(&ConnectionBoundRoute {
+                    session_id: session_id.to_string(),
+                    subscription_id: subscription_id.to_string(),
+                    generation,
+                });
+            }
+            None => {
+                routes.retain(|route| {
+                    route.session_id != session_id || route.subscription_id != subscription_id
+                });
             }
         }
-        for client_id in empty_clients {
+        if routes.is_empty() {
             self.connection_bound_routes.remove(&client_id);
         }
     }
@@ -920,6 +934,47 @@ mod tests {
                 && route.subscription_id == "sub"
                 && route.generation == TerminalSubscriptionGeneration(2)
         }));
+    }
+
+    #[test]
+    fn cancel_stream_removes_one_client_route_without_touching_sibling_ledgers() {
+        let mut registry = AttachStreamRegistry::default();
+        for index in 0..32 {
+            let owner = AttachStreamOwner {
+                client_id: format!("client-{index:02}"),
+                grant_id: None,
+            };
+            let session = format!("s-{index:02}");
+            registry.start_attach(owner, session.clone(), "sub".into());
+            let (_, handle) = UnixTerminalAdapter::pair();
+            registry.mark_adapter_bound(
+                &session,
+                "sub",
+                TerminalSubscriptionGeneration(1),
+                BoundAdapterHandle::Unix(handle),
+            );
+        }
+        registry.cancel_stream("s-07", "sub");
+        assert!(
+            registry
+                .take_connection_bound_routes("client-07")
+                .is_empty()
+        );
+        for index in 0..32 {
+            if index == 7 {
+                continue;
+            }
+            let session = format!("s-{index:02}");
+            assert!(
+                registry.connection_bound_route_still_owned(
+                    &format!("client-{index:02}"),
+                    &session,
+                    "sub",
+                    TerminalSubscriptionGeneration(1)
+                ),
+                "removing one stale row must not walk or clear other clients"
+            );
+        }
     }
 
     #[test]
