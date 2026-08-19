@@ -4756,14 +4756,30 @@ fn shutdown_error_response(
     }
 }
 
+fn forced_shutdown_classify_stopping(session_id: &str) -> bool {
+    let botster_env = env::var("BOTSTER_ENV").ok();
+    let forced_for = env::var("BOTSTER_HUB_TEST_FORCE_SHUTDOWN_CLASSIFY_STOPPING_FOR").ok();
+    forced_shutdown_classify_stopping_from(
+        session_id,
+        botster_env.as_deref(),
+        forced_for.as_deref(),
+    )
+}
+
+fn forced_shutdown_classify_stopping_from(
+    session_id: &str,
+    botster_env: Option<&str>,
+    forced_for: Option<&str>,
+) -> bool {
+    botster_env == Some("test") && forced_for == Some(session_id)
+}
+
 fn classify_shutdown_session(
     runtime: &mut crate::HubRuntime,
     session_id: &str,
     now_seconds: u64,
 ) -> DaemonTransportResult<ShutdownSessionClassification> {
-    if std::env::var("BOTSTER_HUB_TEST_FORCE_SHUTDOWN_CLASSIFY_STOPPING_FOR")
-        .is_ok_and(|forced| forced == session_id)
-    {
+    if forced_shutdown_classify_stopping(session_id) {
         return Ok(ShutdownSessionClassification::Stopping);
     }
     match runtime.observe_session_lifecycle(&SessionId(session_id.to_string()), now_seconds) {
@@ -8211,6 +8227,57 @@ mod tests {
         assert!(
             !pump.contains("observe_session_lifecycle"),
             "CloseEvents must not mutate lifecycle"
+        );
+    }
+
+    #[test]
+    fn forced_stopping_classify_inject_requires_test_mode() {
+        assert!(forced_shutdown_classify_stopping_from(
+            "sess",
+            Some("test"),
+            Some("sess")
+        ));
+        assert!(
+            !forced_shutdown_classify_stopping_from("sess", Some("production"), Some("sess")),
+            "non-test BOTSTER_ENV must ignore the Stopping inject"
+        );
+        assert!(
+            !forced_shutdown_classify_stopping_from("sess", None, Some("sess")),
+            "unset BOTSTER_ENV must ignore the Stopping inject"
+        );
+        assert!(!forced_shutdown_classify_stopping_from(
+            "sess",
+            Some("test"),
+            Some("other")
+        ));
+        assert!(!forced_shutdown_classify_stopping_from(
+            "sess",
+            Some("test"),
+            None
+        ));
+
+        const TRANSPORT: &str = include_str!("daemon_transport.rs");
+        let classify = TRANSPORT
+            .split("fn classify_shutdown_session(")
+            .nth(1)
+            .expect("classify_shutdown_session")
+            .split("fn classify_found_session_lifecycle(")
+            .next()
+            .expect("classify body");
+        assert!(
+            classify.contains("forced_shutdown_classify_stopping("),
+            "classify must use the test-gated inject helper"
+        );
+        let helper = TRANSPORT
+            .split("fn forced_shutdown_classify_stopping_from(")
+            .nth(1)
+            .expect("inject helper")
+            .split("fn classify_shutdown_session(")
+            .next()
+            .expect("inject helper body");
+        assert!(
+            helper.contains("botster_env == Some(\"test\")"),
+            "Stopping inject must require BOTSTER_ENV=test"
         );
     }
 
