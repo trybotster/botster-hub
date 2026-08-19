@@ -635,6 +635,16 @@ pub struct EventDeliveryFlight {
     pub pull_id: Option<u64>,
 }
 
+fn package_event_request_id(delivery: &crate::package_event_router::ReadyDelivery) -> RequestId {
+    RequestId(format!(
+        "package-event-{}-{}-{}-{}",
+        delivery.owner,
+        delivery.name,
+        delivery.envelope_id,
+        delivery.pull_id()
+    ))
+}
+
 fn event_flight(
     delivery: &crate::package_event_router::ReadyDelivery,
     scope_id: Option<u64>,
@@ -1229,10 +1239,7 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
         }
     };
     for delivery in batch {
-        let request_id = RequestId(format!(
-            "package-event-{}-{}-{}",
-            delivery.owner, delivery.name, delivery.envelope_id
-        ));
+        let request_id = package_event_request_id(&delivery);
         let Some(handler) = runtime.package_event_handler(
             &delivery.holder.plugin_key,
             &delivery.owner,
@@ -3580,6 +3587,95 @@ mod tests {
         assert!(flight.pull_id.is_none());
         let snapshot = runtime.package_event_router().snapshot().expect("snapshot");
         assert_eq!(snapshot.queued_holders, 0);
+        assert_eq!(snapshot.global_in_flight_bytes, 0);
+        let _ = std::fs::remove_dir_all(data_directory);
+    }
+
+    #[test]
+    fn package_event_fanout_keeps_per_holder_request_ids_and_occupancy() {
+        let (runtime, data_directory) = event_delivery_runtime("fanout");
+        subscribe_worktree_consumer(&runtime, "consumer-a");
+        subscribe_worktree_consumer(&runtime, "consumer-b");
+        runtime.insert_test_event_handler("consumer-a", "worktree_created");
+        runtime.insert_test_event_handler("consumer-b", "worktree_created");
+        ingress_worktree_created(&runtime);
+        let mut batch = runtime
+            .package_event_router()
+            .pull_ready_batch(8, 64 * 1024, Instant::now(), Duration::from_millis(8))
+            .expect("pull");
+        assert_eq!(batch.len(), 2);
+        let mut state = MaintenanceState::default();
+        let mut scopes = Vec::new();
+        let mut request_ids = BTreeSet::new();
+        for delivery in batch.drain(..) {
+            let request_id = package_event_request_id(&delivery);
+            assert!(
+                request_ids.insert(request_id.0.clone()),
+                "each pulled copy must keep a unique request id: {}",
+                request_id.0
+            );
+            runtime
+                .package_event_router()
+                .note_admitted(
+                    delivery.envelope_id,
+                    &delivery.holder.plugin_key,
+                    delivery.holder.generation,
+                )
+                .expect("admit");
+            let identity = crate::package_event_router::LeaseIdentity::EventInFlight {
+                request_id: request_id.0.clone(),
+            };
+            let scope_id = runtime
+                .causal_scopes()
+                .mint_with_lease(Some(identity))
+                .expect("mint");
+            scopes.push(scope_id);
+            state.event_in_flight.insert(
+                request_id.0.clone(),
+                event_flight(&delivery, Some(scope_id), request_id.0),
+            );
+        }
+        assert_eq!(state.event_in_flight.len(), 2);
+        assert_eq!(runtime.package_event_router().test_outstanding_pulls(), 2);
+        let ids: Vec<String> = state.event_in_flight.keys().cloned().collect();
+        for request_id in ids {
+            let mut flight = state
+                .event_in_flight
+                .remove(&request_id)
+                .expect("flight stays until its completion");
+            assert!(retire_event_holder(&runtime, &mut flight));
+        }
+        assert!(state.event_in_flight.is_empty());
+        assert_eq!(runtime.package_event_router().test_outstanding_pulls(), 0);
+        for scope_id in scopes {
+            assert!(
+                !runtime.causal_scopes().is_live(scope_id),
+                "completion must release the holder causal scope"
+            );
+        }
+        let snapshot = runtime.package_event_router().snapshot().expect("snapshot");
+        assert_eq!(snapshot.queued_holders, 0);
+        assert_eq!(snapshot.admitted_holders, 0);
+        assert_eq!(snapshot.global_in_flight_bytes, 0);
+        let _ = std::fs::remove_dir_all(data_directory);
+    }
+
+    #[test]
+    fn package_event_slice_retires_both_fanout_holders() {
+        let (runtime, data_directory) = event_delivery_runtime("fanout-slice");
+        subscribe_worktree_consumer(&runtime, "consumer-a");
+        subscribe_worktree_consumer(&runtime, "consumer-b");
+        runtime.insert_test_event_handler("consumer-a", "worktree_created");
+        runtime.insert_test_event_handler("consumer-b", "worktree_created");
+        ingress_worktree_created(&runtime);
+        let mut state = MaintenanceState::default();
+        run_package_event_delivery_slice(&runtime, &mut state);
+        assert!(state.event_in_flight.is_empty());
+        assert!(state.pending_retirements.is_empty());
+        assert_eq!(runtime.package_event_router().test_outstanding_pulls(), 0);
+        let snapshot = runtime.package_event_router().snapshot().expect("snapshot");
+        assert_eq!(snapshot.queued_holders, 0);
+        assert_eq!(snapshot.admitted_holders, 0);
         assert_eq!(snapshot.global_in_flight_bytes, 0);
         let _ = std::fs::remove_dir_all(data_directory);
     }
