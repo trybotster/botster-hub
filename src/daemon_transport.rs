@@ -2412,6 +2412,29 @@ pub(crate) fn handle_control_message(
                     .entry("explicit_detach".to_string())
                     .or_insert(0) += 1;
             }
+            if let DaemonRequest::ShutdownSession { session_id } = &request
+                && response
+                    .as_ref()
+                    .is_ok_and(|response| response.kind == DaemonResponseKind::OperatorError)
+            {
+                let host_closed = state
+                    .live_attach_routes
+                    .iter()
+                    .filter(|(bound_session, subscription_id)| {
+                        bound_session == session_id
+                            && !state
+                                .pending_runtime
+                                .is_adapter_bound(bound_session, subscription_id)
+                    })
+                    .count();
+                if host_closed > 0 {
+                    *state
+                        .lifecycle_counters
+                        .cleanup_by_reason
+                        .entry("shutdown_error_host_close".to_string())
+                        .or_insert(0) += host_closed as u64;
+                }
+            }
             if let Ok(response) = response.as_ref() {
                 let change = attached_subscription_change_for_response(&request, response);
                 let change = match change {
@@ -3493,6 +3516,8 @@ fn handle_runtime_control_request(
                 | Ok(ShutdownSessionClassification::Stopping)
                 | Err(_) => {}
             }
+            suppress_unix_session_close_events(pending_runtime, &session_id);
+            suppress_webrtc_session_close_events(pending_runtime, &session_id);
             let shutdown_session_id = session_id.clone();
             let response = match api.handle_request(
                 runtime,
@@ -3512,13 +3537,9 @@ fn handle_runtime_control_request(
                         error,
                         logical_clock,
                     )?;
-                    suppress_unix_session_close_events(pending_runtime, &session_id);
-                    suppress_webrtc_session_close_events(pending_runtime, &session_id);
                     return Ok(response);
                 }
             };
-            suppress_unix_session_close_events(pending_runtime, &session_id);
-            suppress_webrtc_session_close_events(pending_runtime, &session_id);
             events_response(response.body)
         }
         DaemonRequest::Drain {
@@ -4673,7 +4694,7 @@ fn missing_session_drain_error(session_id: &str) -> DaemonResponse {
 fn suppress_unix_session_close_events(pending_runtime: &PendingRuntimeState, session_id: &str) {
     for admission in pending_runtime.unix_admissions.values() {
         if let UnixTerminalAdmission::Admitted { mux, .. } = admission {
-            mux.suppress_session(session_id);
+            mux.suppress_session_route_generations(session_id);
         }
     }
 }
@@ -4681,7 +4702,7 @@ fn suppress_unix_session_close_events(pending_runtime: &PendingRuntimeState, ses
 fn suppress_webrtc_session_close_events(pending_runtime: &PendingRuntimeState, session_id: &str) {
     for admission in pending_runtime.webrtc_admissions.values() {
         if let WebrtcTerminalAdmission::Admitted { mux, .. } = admission {
-            mux.suppress_session(session_id);
+            mux.suppress_session_route_generations(session_id);
         }
     }
 }
@@ -4735,11 +4756,32 @@ fn shutdown_error_response(
     }
 }
 
+fn forced_shutdown_classify_stopping(session_id: &str) -> bool {
+    let botster_env = env::var("BOTSTER_ENV").ok();
+    let forced_for = env::var("BOTSTER_HUB_TEST_FORCE_SHUTDOWN_CLASSIFY_STOPPING_FOR").ok();
+    forced_shutdown_classify_stopping_from(
+        session_id,
+        botster_env.as_deref(),
+        forced_for.as_deref(),
+    )
+}
+
+fn forced_shutdown_classify_stopping_from(
+    session_id: &str,
+    botster_env: Option<&str>,
+    forced_for: Option<&str>,
+) -> bool {
+    botster_env == Some("test") && forced_for == Some(session_id)
+}
+
 fn classify_shutdown_session(
     runtime: &mut crate::HubRuntime,
     session_id: &str,
     now_seconds: u64,
 ) -> DaemonTransportResult<ShutdownSessionClassification> {
+    if forced_shutdown_classify_stopping(session_id) {
+        return Ok(ShutdownSessionClassification::Stopping);
+    }
     match runtime.observe_session_lifecycle(&SessionId(session_id.to_string()), now_seconds) {
         Ok(SessionLifecycleLookup::Found(record)) => {
             Ok(classify_found_session_lifecycle(session_id, &record))
@@ -8189,6 +8231,100 @@ mod tests {
     }
 
     #[test]
+    fn forced_stopping_classify_inject_requires_test_mode() {
+        assert!(forced_shutdown_classify_stopping_from(
+            "sess",
+            Some("test"),
+            Some("sess")
+        ));
+        assert!(
+            !forced_shutdown_classify_stopping_from("sess", Some("production"), Some("sess")),
+            "non-test BOTSTER_ENV must ignore the Stopping inject"
+        );
+        assert!(
+            !forced_shutdown_classify_stopping_from("sess", None, Some("sess")),
+            "unset BOTSTER_ENV must ignore the Stopping inject"
+        );
+        assert!(!forced_shutdown_classify_stopping_from(
+            "sess",
+            Some("test"),
+            Some("other")
+        ));
+        assert!(!forced_shutdown_classify_stopping_from(
+            "sess",
+            Some("test"),
+            None
+        ));
+
+        const TRANSPORT: &str = include_str!("daemon_transport.rs");
+        let classify = TRANSPORT
+            .split("fn classify_shutdown_session(")
+            .nth(1)
+            .expect("classify_shutdown_session")
+            .split("fn classify_found_session_lifecycle(")
+            .next()
+            .expect("classify body");
+        assert!(
+            classify.contains("forced_shutdown_classify_stopping("),
+            "classify must use the test-gated inject helper"
+        );
+        let helper = TRANSPORT
+            .split("fn forced_shutdown_classify_stopping_from(")
+            .nth(1)
+            .expect("inject helper")
+            .split("fn classify_shutdown_session(")
+            .next()
+            .expect("inject helper body");
+        assert!(
+            helper.contains("botster_env == Some(\"test\")"),
+            "Stopping inject must require BOTSTER_ENV=test"
+        );
+    }
+
+    #[test]
+    fn shutdown_session_arm_installs_exact_suppression_before_core_request() {
+        const TRANSPORT: &str = include_str!("daemon_transport.rs");
+        let arm = TRANSPORT
+            .split("DaemonRequest::ShutdownSession { session_id } => {")
+            .nth(1)
+            .expect("ShutdownSession arm")
+            .split("DaemonRequest::Drain {")
+            .next()
+            .expect("ShutdownSession arm end");
+        let unix_suppress = arm
+            .find("suppress_unix_session_close_events")
+            .expect("unix suppression");
+        let webrtc_suppress = arm
+            .find("suppress_webrtc_session_close_events")
+            .expect("webrtc suppression");
+        let core = arm
+            .find("HubClientRequest::Shutdown")
+            .expect("Core Shutdown request");
+        let stopping = arm
+            .find("ShutdownSessionClassification::Stopping")
+            .expect("Stopping classification");
+        assert!(
+            stopping < unix_suppress,
+            "Stopping must stay on the suppress fall-through, not a pre-suppress return"
+        );
+        assert!(
+            unix_suppress < core && webrtc_suppress < core,
+            "ShutdownSession must install exact-key suppression before the Core request"
+        );
+        let after_core = &arm[core..];
+        assert!(
+            !after_core.contains("suppress_unix_session_close_events")
+                && !after_core.contains("suppress_webrtc_session_close_events"),
+            "ShutdownSession must not reinstall suppression after the Core request"
+        );
+        assert!(
+            arm.contains("suppress_unix_session_close_events")
+                && TRANSPORT.contains("suppress_session_route_generations"),
+            "helpers must snapshot exact route generations, not session-wide keys"
+        );
+    }
+
+    #[test]
     fn close_event_suppression_matrix_matches_prior_predicate() {
         assert_eq!(
             session_close_event_decision(Ok(SessionRegistryStateLookup::Found(
@@ -8425,6 +8561,21 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn recover_exact_missing_returns_unknown_session() {
+        let response = recover_from_exact_classify(
+            Ok(ShutdownSessionClassification::Missing),
+            shutdown_runtime_error(crate::HubClientRuntimeErrorKind::Runtime),
+            "missing-session",
+        )
+        .expect("Missing classification stays unknown_session");
+        assert_eq!(response.kind, DaemonResponseKind::OperatorError);
+        let error = response.error.expect("unknown_session body");
+        assert_eq!(error.code, "unknown_session");
+        assert_eq!(error.operation, "shutdown");
+        assert_eq!(error.message, "unknown session: missing-session");
     }
 
     #[test]
