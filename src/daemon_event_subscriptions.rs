@@ -204,19 +204,23 @@ impl ClientEventMailbox {
         subscription_id: &str,
         owner: &str,
         name: &str,
-    ) -> Arc<AtomicBool> {
+    ) -> Result<Arc<AtomicBool>, EventPlaneStatus> {
+        let mut slots = match self.slots.try_lock() {
+            Ok(slots) => slots,
+            Err(TryLockError::WouldBlock | TryLockError::Poisoned(_)) => {
+                return Err(EventPlaneStatus::ShedBusy);
+            }
+        };
         let bit = Arc::new(AtomicBool::new(false));
-        if let Ok(mut slots) = self.slots.try_lock() {
-            let slot = slots.entry(subscription_id.to_string()).or_insert_with(|| {
-                Arc::new(ClientGapSlot {
-                    owner: owner.to_string(),
-                    name: name.to_string(),
-                    bit: bit.clone(),
-                })
-            });
-            return slot.bit.clone();
-        }
-        bit
+        slots.insert(
+            subscription_id.to_string(),
+            Arc::new(ClientGapSlot {
+                owner: owner.to_string(),
+                name: name.to_string(),
+                bit: bit.clone(),
+            }),
+        );
+        Ok(bit)
     }
 
     pub(crate) fn set_gap(&self, subscription_id: &str, owner: &str, name: &str) {
@@ -386,17 +390,20 @@ impl ClientEventPlane {
             return Err(ClientEventAdmitError::TooManySubscriptions);
         }
         let mailbox = state.mailbox.clone();
-        let gap = mailbox.register_gap_slot(subscription_id, owner, name);
+        let gap = mailbox
+            .register_gap_slot(subscription_id, owner, name)
+            .map_err(ClientEventAdmitError::Router)?;
         let status = router.try_subscribe_client(ClientEventHolder {
             connection_id: connection_id.to_string(),
             subscription_id: subscription_id.to_string(),
             owner: owner.to_string(),
             name: name.to_string(),
             subjects: compiled,
-            mailbox,
+            mailbox: mailbox.clone(),
             gap,
         });
         if status != EventPlaneStatus::Accepted {
+            mailbox.drop_subscription(subscription_id);
             return Err(ClientEventAdmitError::Router(status));
         }
         state.subscriptions.insert(
@@ -839,12 +846,53 @@ mod tests {
     }
 
     #[test]
-    fn gap_slot_contention_still_records_event_gap() {
-        let mailbox = ClientEventMailbox::new(PackageEventPlanePolicy::default());
-        let bit = mailbox.register_gap_slot("sub", "owner", "ready");
+    fn gap_slot_registration_rejects_busy_and_shed_sets_visible_gap() {
+        let policy = PackageEventPlanePolicy {
+            consumer_queue_max_events: 1,
+            ..PackageEventPlanePolicy::default()
+        };
+        let router = admitted_router(EventAudience::Clients);
+        let plane = ClientEventPlane::default();
+        plane
+            .try_subscribe(
+                "conn",
+                "sub-a",
+                "owner",
+                "ready",
+                Vec::new(),
+                policy,
+                &router,
+            )
+            .expect("first subscribe");
+        let mailbox = plane.mailbox("conn").expect("mailbox");
         mailbox.test_with_slots_held(|| {
-            mailbox.set_gap("sub", "owner", "ready");
-            bit.store(true, Ordering::SeqCst);
+            assert_eq!(
+                plane.try_subscribe(
+                    "conn",
+                    "sub-b",
+                    "owner",
+                    "ready",
+                    Vec::new(),
+                    policy,
+                    &router
+                ),
+                Err(ClientEventAdmitError::Router(EventPlaneStatus::ShedBusy))
+            );
+        });
+        assert_eq!(
+            plane.try_unsubscribe("conn", "sub-b", &router),
+            Err(ClientEventAdmitError::UnknownSubscription)
+        );
+        let payload = json!({ "ok": true });
+        assert_eq!(
+            router.try_ingress("owner", "ready", &payload, Instant::now()),
+            EventPlaneStatus::Accepted
+        );
+        mailbox.test_with_slots_held(|| {
+            assert_eq!(
+                router.try_ingress("owner", "ready", &payload, Instant::now()),
+                EventPlaneStatus::Accepted
+            );
         });
         match mailbox.take_ready_event() {
             Some(DaemonEvent::EventGap {
@@ -852,16 +900,14 @@ mod tests {
                 owner,
                 name,
             }) => {
-                assert_eq!(subscription_id, "sub");
+                assert_eq!(subscription_id, "sub-a");
                 assert_eq!(owner, "owner");
                 assert_eq!(name, "ready");
             }
-            other => panic!("gap bit must survive slot-map contention: {other:?}"),
+            other => {
+                panic!("real shed must surface EventGap without a manual bit store: {other:?}")
+            }
         }
-        assert!(
-            mailbox.take_ready_event().is_none(),
-            "slot contention must not replay event history"
-        );
     }
 
     #[test]

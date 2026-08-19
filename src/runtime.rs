@@ -3172,11 +3172,45 @@ impl HubRuntime {
     /// Production delivery uses the owner-loop `PackageEventDelivery` slice.
     /// Tests use this helper when they do not own that loop. Each pulled copy
     /// keeps one causal scope. On every exit the copy is completed, requeued,
-    /// or retired.
+    /// or retired. Busy no-wait results keep ownership in a bounded retry store.
     pub fn drive_package_events_for_test(&self) -> Vec<botster_core::PluginCompletion> {
         use std::time::{Duration, Instant};
 
         use botster_core::{PluginCompletion, PluginInvocationClass, PluginInvocationContext};
+
+        use crate::package_event_router::{
+            CausalAdmitResult, LeaseIdentity, ReadyDelivery, release_or_retract,
+        };
+
+        enum PendingDelivery {
+            Requeue {
+                delivery: ReadyDelivery,
+                scope: Option<(u64, LeaseIdentity)>,
+            },
+            Complete {
+                delivery: ReadyDelivery,
+                scope: Option<(u64, LeaseIdentity)>,
+            },
+            Release {
+                scope_id: u64,
+                identity: LeaseIdentity,
+            },
+        }
+
+        let push_release = |leftover: &mut Vec<PendingDelivery>,
+                            scope: Option<(u64, LeaseIdentity)>| {
+            let Some((scope_id, identity)) = scope else {
+                return;
+            };
+            match release_or_retract(&self.causal_scopes, scope_id, identity.clone()) {
+                CausalAdmitResult::Applied => {
+                    let _ = self.causal_scopes.flush_pending();
+                }
+                CausalAdmitResult::Retry(_) => {
+                    leftover.push(PendingDelivery::Release { scope_id, identity })
+                }
+            }
+        };
 
         let mut pulled = Vec::new();
         loop {
@@ -3191,6 +3225,7 @@ impl HubRuntime {
         }
 
         let mut outcomes = Vec::new();
+        let mut pending = Vec::new();
         for delivery in pulled {
             let Some(handler) = self.package_event_handler(
                 &delivery.holder.plugin_key,
@@ -3198,11 +3233,10 @@ impl HubRuntime {
                 &delivery.name,
                 &delivery.holder.handler_id,
             ) else {
-                let _ = self.package_event_router.retire_holder(
-                    delivery.envelope_id,
-                    &delivery.holder.plugin_key,
-                    delivery.holder.generation,
-                );
+                pending.push(PendingDelivery::Complete {
+                    delivery,
+                    scope: None,
+                });
                 continue;
             };
             let request_id = RequestId(format!(
@@ -3213,7 +3247,10 @@ impl HubRuntime {
                 request_id: request_id.0.clone(),
             };
             let Some(scope_id) = self.causal_scopes.mint_with_lease(Some(identity.clone())) else {
-                let _ = self.package_event_router.requeue_delivery(delivery);
+                pending.push(PendingDelivery::Requeue {
+                    delivery,
+                    scope: None,
+                });
                 continue;
             };
 
@@ -3222,8 +3259,10 @@ impl HubRuntime {
                     .force_plugin_admit_backpressure
                     .load(std::sync::atomic::Ordering::SeqCst)
             {
-                let _ = self.causal_scopes.release(scope_id, identity);
-                let _ = self.package_event_router.requeue_delivery(delivery);
+                pending.push(PendingDelivery::Requeue {
+                    delivery,
+                    scope: Some((scope_id, identity)),
+                });
                 continue;
             }
 
@@ -3241,22 +3280,62 @@ impl HubRuntime {
                 },
                 payload: BoundaryJson(delivery.payload_json.clone()),
             });
-            let _ = self.package_event_router.note_admitted(
-                delivery.envelope_id,
-                &delivery.holder.plugin_key,
-                delivery.holder.generation,
-            );
-            let _ = self.package_event_router.retire_holder(
-                delivery.envelope_id,
-                &delivery.holder.plugin_key,
-                delivery.holder.generation,
-            );
-            let _ = self.causal_scopes.release(scope_id, identity);
+            pending.push(PendingDelivery::Complete {
+                delivery,
+                scope: Some((scope_id, identity)),
+            });
             outcomes.push(PluginCompletion {
                 class: PluginInvocationClass::Background,
                 result: outcome.result,
             });
         }
+
+        const MAX_SETTLE_TURNS: usize = 64;
+        for _ in 0..MAX_SETTLE_TURNS {
+            if pending.is_empty() {
+                break;
+            }
+            let mut leftover = Vec::new();
+            for item in pending.drain(..) {
+                match item {
+                    PendingDelivery::Requeue { delivery, scope } => {
+                        match self.package_event_router.requeue_delivery(delivery) {
+                            Ok(()) => push_release(&mut leftover, scope),
+                            Err((
+                                delivery,
+                                crate::package_event_router::EventPlaneStatus::ShedBusy,
+                            )) => {
+                                leftover.push(PendingDelivery::Requeue {
+                                    delivery: *delivery,
+                                    scope,
+                                });
+                            }
+                            Err((delivery, _)) => leftover.push(PendingDelivery::Complete {
+                                delivery: *delivery,
+                                scope,
+                            }),
+                        }
+                    }
+                    PendingDelivery::Complete { delivery, scope } => {
+                        match self.package_event_router.complete_pulled_delivery(delivery) {
+                            Ok(()) => push_release(&mut leftover, scope),
+                            Err((delivery, _)) => leftover.push(PendingDelivery::Complete {
+                                delivery: *delivery,
+                                scope,
+                            }),
+                        }
+                    }
+                    PendingDelivery::Release { scope_id, identity } => {
+                        push_release(&mut leftover, Some((scope_id, identity)));
+                    }
+                }
+            }
+            pending = leftover;
+        }
+        debug_assert!(
+            pending.is_empty(),
+            "test event drive must settle every pulled copy"
+        );
         outcomes
     }
 

@@ -6,12 +6,13 @@
 - Target id: `tgt_7e208a0c76a44980a83b63af976b1f22`
 - Ticket: `ticket_1786663583_640263`
 - Run: `run_1787158085_722550`
-- Implement step: `run_step_1787169048_973962` (sequence 7, second Review return)
-- Prior Implement steps: `run_step_1787165407_410166`, `run_step_1787159472_279191`
+- Implement step: `run_step_1787170885_485950` (sequence 9, third Review return)
+- Prior Implement steps: `run_step_1787169048_973962`, `run_step_1787165407_410166`, `run_step_1787159472_279191`
 - Approved plan: `docs/plans/expose-client-event-subscriptions-on-the-host-control-protocol.md` at `98ae1f9`
 - Plan Review: `review_1787159455_211294` approved
 - Code Review: `review_1787165393_430946` `changes_required` (7 findings, resolved)
-- Code Review: `review_1787169037_550837` `changes_required` (4 findings)
+- Code Review: `review_1787169037_550837` `changes_required` (4 findings, resolved)
+- Code Review: `review_1787170872_296170` `changes_required` (3 findings)
 - `teardown_class_applies`: no
 - Direct-merge pipeline. No pull request.
 
@@ -42,6 +43,14 @@ Second Review return (`review_1787169037_550837`):
 | `finding_1787169037_708275` Strict workspace Clippy fails | high | Removed the never-loop and Copy clones. `cargo clippy --workspace --all-targets --locked -- -D warnings` is clean. |
 | `finding_1787169037_872794` Lua helper retries and can orphan | high | Helper now waits via `invoke`, one causal scope per copy, and requeues or retires on every exit. Ablation holds admit backpressure through the old 2s deadline and proves occupancy is unchanged. |
 | `finding_1787169037_962336` Stall latch works outside test mode | medium | Stall file and queue-max override require `BOTSTER_ENV=test`. Negative unit tests cover production and unset env. |
+
+Third Review return (`review_1787170872_296170`):
+
+| Finding | Severity | Fix |
+| --- | --- | --- |
+| `finding_1787170872_438008` Invisible gap flag | high | `register_gap_slot` returns `ShedBusy` instead of an unmapped bit. Subscribe does not admit until the mailbox can find the bit. Lock-held admission test plus a real ingress shed proves EventGap with no manual `bit.store`. |
+| `finding_1787170872_469595` Busy cleanup drops pulled copies | high | Requeue and complete return the delivery on busy. The test helper keeps a bounded retry store for deliveries and causal-scope releases. Lock-held tests prove occupancy is unchanged until the retry succeeds. |
+| `finding_1787170872_111770` Public unbounded requeue | medium | `requeue_delivery` is crate-private. `ReadyDelivery` is not `Clone`. Each pull has a one-time `pull_id`. Duplicate requeue is rejected. Consumer queue bounds apply on requeue. |
 
 Constraints applied for this return: Hub host-control and in-repo
 `botster-hub-client` only. Core pin unchanged. No Web/TUI edits. No
@@ -92,21 +101,23 @@ Vault notes that constrained the change:
 
 Convention conflicts: none.
 
-Checklist: reused `checklist_1786867714_922206` as required. Botster MCP was
-down in this agent session, so Implement evidence is also in this report and
-gate payload.
+Checklist: reused `checklist_1786867714_922206` as required.
 
 ## Files changed
 
-Review-return (this visit):
+Third Review return (this visit):
+
+- `src/daemon_event_subscriptions.rs` — gap-slot registration fails closed
+- `src/package_event_router.rs` — pull tokens, crate-private bounded requeue
+- `src/runtime.rs` — settle pulled deliveries and causal releases through retries
+- `docs/reports/expose-client-event-subscriptions-on-the-host-control-protocol-implement.md`
+
+Prior Review-return files remain:
 
 - `crates/botster-hub-client/src/lib.rs` — `next_event` / `set_read_timeout`
-- `src/daemon_event_subscriptions.rs` — separate gap mutex, cleanup retain
 - `src/daemon_transport.rs` — biased request poll, bounded flush, stall latch
 - `src/host_control_fair_write.rs` — `MAX_HOST_FRAMES_PER_FLUSH_TURN`
 - `src/local_webrtc.rs` — queued-request `control_ready`, held-entity continue
-- `src/package_event_router.rs` — client delivery only on Accepted
-- `src/runtime.rs` — invoke-wait drive helper, one causal scope, requeue/retire
 - `tests/hub_daemon_lifecycle/package_event_plane.rs` — next_event + Unix EventGap
 - `tests/hub_lua_runtime_test.rs` — backpressure occupancy ablation
 - `docs/client-protocol.md` — next_event
@@ -199,9 +210,6 @@ failures, DTO tokens `subscribe_events` / `unsubscribe_events` /
 `package_event` / `event_gap` / `subjects?`, and
 `package_event_subscriptions` in `supported_features` only.
 
-Botster MCP handshake failed in this agent session. Workflow evidence is
-recorded here and in plugin-data.
-
 ## Tests and downstream proof run
 
 Live IsolatedHub production path:
@@ -234,12 +242,11 @@ Repo gates:
 
 - `cargo build --locked -p botster-core-daemon --bin botster-session-worker`
 - `./test.sh --locked` — one clean default-concurrency pass after the
-  second Review-return fixes, 0 failures. Lifecycle 264 passed / 1 ignored.
+  third Review-return fixes, 0 failures. Lifecycle 264 passed / 1 ignored.
   Lua runtime 61 passed, including `events_on` and the backpressure
-  occupancy ablation. Hub lib 444 passed. Hub client 78 passed.
+  occupancy ablation. Hub lib 446 passed. Hub client 78 passed.
 - `cargo clippy --workspace --all-targets --locked -- -D warnings` clean.
 - `cargo fmt --all -- --check`
-- `cargo clippy --workspace --all-targets --locked -- -D warnings`
 - `cargo test --doc --workspace`
 - `node packages/hub-test-support/scripts/sync-assets.mjs --check`
 - `node packages/hub-test-support/test.mjs`
