@@ -632,6 +632,23 @@ pub struct EventDeliveryFlight {
     pub scope_id: Option<u64>,
     pub request_id: String,
     pub holder_retired: bool,
+    pub pull_id: Option<u64>,
+}
+
+fn event_flight(
+    delivery: &crate::package_event_router::ReadyDelivery,
+    scope_id: Option<u64>,
+    request_id: String,
+) -> EventDeliveryFlight {
+    EventDeliveryFlight {
+        envelope_id: delivery.envelope_id,
+        plugin_key: delivery.holder.plugin_key.clone(),
+        generation: delivery.holder.generation,
+        scope_id,
+        request_id,
+        holder_retired: false,
+        pull_id: Some(delivery.pull_id()),
+    }
 }
 
 impl MaintenanceState {
@@ -1145,12 +1162,24 @@ fn flush_pending_event_retirements(runtime: &HubRuntime, state: &mut Maintenance
 
 fn retire_event_holder(runtime: &HubRuntime, flight: &mut EventDeliveryFlight) -> bool {
     if !flight.holder_retired {
-        match runtime.package_event_router().retire_holder(
-            flight.envelope_id,
-            &flight.plugin_key,
-            flight.generation,
-        ) {
-            Ok(_) => flight.holder_retired = true,
+        let result = match flight.pull_id {
+            Some(pull_id) => runtime.package_event_router().retire_pulled(
+                pull_id,
+                flight.envelope_id,
+                &flight.plugin_key,
+                flight.generation,
+            ),
+            None => runtime.package_event_router().retire_holder(
+                flight.envelope_id,
+                &flight.plugin_key,
+                flight.generation,
+            ),
+        };
+        match result {
+            Ok(_) => {
+                flight.holder_retired = true;
+                flight.pull_id = None;
+            }
             Err(_) => return false,
         }
     }
@@ -1210,14 +1239,7 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
             &delivery.name,
             &delivery.holder.handler_id,
         ) else {
-            let mut flight = EventDeliveryFlight {
-                envelope_id: delivery.envelope_id,
-                plugin_key: delivery.holder.plugin_key,
-                generation: delivery.holder.generation,
-                scope_id: None,
-                request_id: request_id.0,
-                holder_retired: false,
-            };
+            let mut flight = event_flight(&delivery, None, request_id.0);
             if !retire_event_holder(runtime, &mut flight) {
                 queue_event_retirement(state, flight);
             }
@@ -1228,14 +1250,7 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
                 request_id: request_id.0.clone(),
             },
         )) else {
-            let mut flight = EventDeliveryFlight {
-                envelope_id: delivery.envelope_id,
-                plugin_key: delivery.holder.plugin_key.clone(),
-                generation: delivery.holder.generation,
-                scope_id: None,
-                request_id: request_id.0.clone(),
-                holder_retired: false,
-            };
+            let mut flight = event_flight(&delivery, None, request_id.0.clone());
             if !retire_event_holder(runtime, &mut flight) {
                 queue_event_retirement(state, flight);
             }
@@ -1258,7 +1273,7 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
                     origin: Some("package-event".to_string()),
                     metadata,
                 },
-                payload: BoundaryJson(delivery.payload_json),
+                payload: BoundaryJson(delivery.payload_json.clone()),
             },
         );
         match admission {
@@ -1276,25 +1291,11 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
                 }
                 state.event_in_flight.insert(
                     request_id.0.clone(),
-                    EventDeliveryFlight {
-                        envelope_id: delivery.envelope_id,
-                        plugin_key: delivery.holder.plugin_key,
-                        generation: delivery.holder.generation,
-                        scope_id: Some(scope_id),
-                        request_id: request_id.0,
-                        holder_retired: false,
-                    },
+                    event_flight(&delivery, Some(scope_id), request_id.0),
                 );
             }
             _ => {
-                let mut flight = EventDeliveryFlight {
-                    envelope_id: delivery.envelope_id,
-                    plugin_key: delivery.holder.plugin_key,
-                    generation: delivery.holder.generation,
-                    scope_id: Some(scope_id),
-                    request_id: request_id.0,
-                    holder_retired: false,
-                };
+                let mut flight = event_flight(&delivery, Some(scope_id), request_id.0);
                 if !retire_event_holder(runtime, &mut flight) {
                     queue_event_retirement(state, flight);
                 }
@@ -3445,5 +3446,141 @@ mod tests {
         assert!(!state.journal_caught_up_confirmed);
         assert_eq!(state.baseline_page_reads, 0);
         assert!(state.needs_work());
+    }
+
+    fn event_delivery_runtime(name: &str) -> (HubRuntime, std::path::PathBuf) {
+        let data_directory = std::env::temp_dir().join(format!(
+            "hub-event-delivery-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let config = crate::HubStartupOptions {
+            host: crate::HostIdentityOptions {
+                id: format!("event-delivery-{name}"),
+                display_name: "Event Delivery".to_string(),
+                fingerprint: None,
+            },
+            data_directory: crate::DataDirectoryOption::Explicit(data_directory.clone()),
+            ..crate::HubStartupOptions::default()
+        }
+        .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
+        .expect("config");
+        (HubRuntime::new(config), data_directory)
+    }
+
+    fn subscribe_worktree_consumer(runtime: &HubRuntime, plugin_key: &str) {
+        assert_eq!(
+            runtime.package_event_router().try_subscribe(
+                crate::package_event_router::EventSubscription {
+                    plugin_key: plugin_key.to_string(),
+                    owner: crate::package_event_router::HUB_EVENT_OWNER.to_string(),
+                    name: "worktree_created".to_string(),
+                    handler_id: "worktree_created".to_string(),
+                    generation: 1,
+                    ..crate::package_event_router::EventSubscription::default()
+                }
+            ),
+            crate::package_event_router::EventPlaneStatus::Accepted
+        );
+    }
+
+    fn ingress_worktree_created(runtime: &HubRuntime) {
+        assert_eq!(
+            runtime.package_event_router().try_ingress(
+                crate::package_event_router::HUB_EVENT_OWNER,
+                "worktree_created",
+                &serde_json::json!({ "event": "worktree_created" }),
+                Instant::now()
+            ),
+            crate::package_event_router::EventPlaneStatus::Accepted
+        );
+    }
+
+    #[test]
+    fn package_event_slice_consumes_pull_token_when_handler_is_missing() {
+        let (runtime, data_directory) = event_delivery_runtime("missing-handler");
+        subscribe_worktree_consumer(&runtime, "consumer");
+        ingress_worktree_created(&runtime);
+        let mut state = MaintenanceState::default();
+        run_package_event_delivery_slice(&runtime, &mut state);
+        assert_eq!(runtime.package_event_router().test_outstanding_pulls(), 0);
+        assert!(state.event_in_flight.is_empty());
+        assert!(state.pending_retirements.is_empty());
+        let snapshot = runtime.package_event_router().snapshot().expect("snapshot");
+        assert_eq!(snapshot.queued_holders, 0);
+        assert_eq!(snapshot.global_in_flight_bytes, 0);
+        let _ = std::fs::remove_dir_all(data_directory);
+    }
+
+    #[test]
+    fn package_event_slice_consumes_pull_token_on_admission_rejection() {
+        let (runtime, data_directory) = event_delivery_runtime("admit-reject");
+        subscribe_worktree_consumer(&runtime, "consumer");
+        runtime.insert_test_event_handler("consumer", "worktree_created");
+        ingress_worktree_created(&runtime);
+        let mut state = MaintenanceState::default();
+        run_package_event_delivery_slice(&runtime, &mut state);
+        assert_eq!(runtime.package_event_router().test_outstanding_pulls(), 0);
+        assert!(state.event_in_flight.is_empty());
+        let snapshot = runtime.package_event_router().snapshot().expect("snapshot");
+        assert_eq!(snapshot.queued_holders, 0);
+        assert_eq!(snapshot.global_in_flight_bytes, 0);
+        let _ = std::fs::remove_dir_all(data_directory);
+    }
+
+    #[test]
+    fn package_event_slice_consumes_pull_token_when_causal_mint_fails() {
+        let (runtime, data_directory) = event_delivery_runtime("causal-mint");
+        subscribe_worktree_consumer(&runtime, "consumer");
+        runtime.insert_test_event_handler("consumer", "worktree_created");
+        ingress_worktree_created(&runtime);
+        let mut state = MaintenanceState::default();
+        runtime.causal_scopes().test_with_inner_held(|| {
+            run_package_event_delivery_slice(&runtime, &mut state);
+        });
+        assert_eq!(runtime.package_event_router().test_outstanding_pulls(), 0);
+        assert!(state.event_in_flight.is_empty());
+        let snapshot = runtime.package_event_router().snapshot().expect("snapshot");
+        assert_eq!(snapshot.queued_holders, 0);
+        assert_eq!(snapshot.global_in_flight_bytes, 0);
+        let _ = std::fs::remove_dir_all(data_directory);
+    }
+
+    #[test]
+    fn queued_event_flight_retirement_consumes_the_pull_token() {
+        let (runtime, data_directory) = event_delivery_runtime("queued-complete");
+        subscribe_worktree_consumer(&runtime, "consumer");
+        ingress_worktree_created(&runtime);
+        let mut batch = runtime
+            .package_event_router()
+            .pull_ready_batch(8, 64 * 1024, Instant::now(), Duration::from_millis(8))
+            .expect("pull");
+        let delivery = batch.pop().expect("one pulled copy");
+        runtime
+            .package_event_router()
+            .note_admitted(
+                delivery.envelope_id,
+                &delivery.holder.plugin_key,
+                delivery.holder.generation,
+            )
+            .expect("admit");
+        assert_eq!(runtime.package_event_router().test_outstanding_pulls(), 1);
+        let mut flight = event_flight(&delivery, Some(1), "package-event-queued".to_string());
+        let busy = runtime
+            .package_event_router()
+            .test_with_inner_held(|| retire_event_holder(&runtime, &mut flight));
+        assert!(!busy);
+        assert_eq!(runtime.package_event_router().test_outstanding_pulls(), 1);
+        assert!(flight.pull_id.is_some());
+        assert!(retire_event_holder(&runtime, &mut flight));
+        assert_eq!(runtime.package_event_router().test_outstanding_pulls(), 0);
+        assert!(flight.pull_id.is_none());
+        let snapshot = runtime.package_event_router().snapshot().expect("snapshot");
+        assert_eq!(snapshot.queued_holders, 0);
+        assert_eq!(snapshot.global_in_flight_bytes, 0);
+        let _ = std::fs::remove_dir_all(data_directory);
     }
 }

@@ -1347,6 +1347,69 @@ fn drive_package_events_requeues_when_admission_stays_backpressured() {
     assert_eq!(after.admitted_holders, before.admitted_holders);
 }
 
+#[test]
+fn drive_package_events_keeps_ownership_when_settle_stays_busy() {
+    let registry = install_event_probe_registry("event-probe-settle-busy");
+    let mut hub = explicit_runtime("event-probe-settle-busy");
+    hub.load_lua_plugin_package(&registry, "event-probe.plugin")
+        .expect("load event probe plugin");
+    let created = serde_json::json!({
+        "event": "worktree_created",
+        "worktree_id": "wt_1",
+        "target_id": "tgt_1",
+    });
+    assert_eq!(
+        hub.package_event_router()
+            .try_ingress(
+                "hub",
+                "worktree_created",
+                &created,
+                std::time::Instant::now()
+            )
+            .as_str(),
+        "accepted"
+    );
+    let before = hub
+        .package_event_router()
+        .snapshot()
+        .expect("occupancy before park");
+    assert!(before.queued_holders >= 2, "both handlers must be queued");
+    hub.set_test_park_package_events(true);
+    let _parked = hub.drive_package_events_for_test();
+    assert!(
+        hub.test_pending_event_settlements() >= 2,
+        "parked drive must keep pulled copies"
+    );
+    let held = hub
+        .package_event_router()
+        .snapshot()
+        .expect("occupancy while parked");
+    assert_eq!(held.queued_holders, 0);
+    assert_eq!(held.global_in_flight_bytes, before.global_in_flight_bytes);
+    hub.set_test_park_package_events(false);
+    hub.package_event_router().test_with_inner_held(|| {
+        let _ = hub.drive_package_events_for_test();
+    });
+    assert!(
+        hub.test_pending_event_settlements() >= 2,
+        "busy settle must keep the parked copies"
+    );
+    let busy = hub
+        .package_event_router()
+        .snapshot()
+        .expect("occupancy after busy settle");
+    assert_eq!(busy.queued_holders, 0);
+    assert_eq!(busy.global_in_flight_bytes, before.global_in_flight_bytes);
+    let _ = hub.drive_package_events_for_test();
+    assert_eq!(hub.test_pending_event_settlements(), 0);
+    let restored = hub
+        .package_event_router()
+        .snapshot()
+        .expect("occupancy after later settle");
+    assert_eq!(restored.queued_holders, 0);
+    assert_eq!(restored.global_in_flight_bytes, 0);
+}
+
 fn completed_payloads(outcomes: &[botster_core::PluginCompletion]) -> Vec<serde_json::Value> {
     outcomes
         .iter()
