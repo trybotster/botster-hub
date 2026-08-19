@@ -13,11 +13,11 @@
 | Locked Core | `Cargo.lock` pins `botster-core` at `8fce2041b9fe742cb2a6df9e74cb262606672742` |
 | Delivery | direct-merge; no pull request (`merge_policy: direct`) |
 | Class | not runtime-teardown |
-| Plan | `docs/plans/implement-bounded-fair-owner-loop-background-scheduling.md` revision 4 |
+| Plan | `docs/plans/implement-bounded-fair-owner-loop-background-scheduling.md` revision 5 |
 
 Independent routing: `project_pipelines_current_context` ticket/run `target_id` and `list_spawn_targets` both map `tgt_7e208a0c76a44980a83b63af976b1f22` to `trybotster/botster-hub`. The approved plan used the same routing. Work stayed in this ticket worktree.
 
-This report answers Review `review_1787124251_499447` (four open findings) after the prior return `review_1787118229_406859`. Plan Review `review_1787112708_321608` approved revision 3. Revision 4 resynchronizes wake, Pump-mark, traversal, close-work, and baseline contracts.
+This report answers Review `review_1787126462_489606` (two open findings) after prior returns `review_1787124251_499447` and `review_1787118229_406859`. Plan Review `review_1787112708_321608` approved revision 3. Revision 5 records the idle-observe and sealed-baseline proofs.
 
 ## Repository playbook and other playbooks/notes applied
 
@@ -58,16 +58,15 @@ This report answers Review `review_1787124251_499447` (four open findings) after
 
 ## Review findings addressed
 
-- `finding_1787124251_448797`: close work only marks Pump. It does not rewrite the phase pointer. Continuous close-work tests prove Observe and InventoryReconcile still run within three Pump turns.
-- `finding_1787124251_317843`: suppression is keyed `BTreeSet` lookup per visited candidate. Slices no longer clone the full suppression lists.
-- `finding_1787124251_627712`: `cancel_stream` removes one client's route by owner+generation key. Sibling connection ledgers stay intact.
-- `finding_1787124251_430554`: a sealed baseline does not remint on `ObservePassUnavailable`. One clean `./test.sh --locked --offline` passed, including `focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible`.
+- `finding_1787126462_326845`: the eight-session idle window ran 12 Maintenance slices because an 8 ms Observe pass left `observe_resume` set and the 9-kind rotation then counted no-op Journal/Apply/Baseline/HostBridge slices as wakes. Incomplete Observe now prefers Observe until the pass completes. `projection_dirty` no longer keeps Maintenance pending by itself. HostBridge drains every fanout job that fits the slice budget. SubscriberDelivery no longer double-counts `reconciliation_wakes`. The idle sample waits 1.2 s. One clean `./test.sh --locked` (no `--offline`, no retry, default concurrency) passed, including `focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible` (253 passed, 0 failed, 1 ignored).
+- `finding_1787126462_827699`: `handle_unavailable_observe_pass` is unit-tested. A sealed complete baseline clears the observe cursor without remint, baseline pages, or `needs_work`. An incomplete baseline starts recovery through the gap pass.
 
 ## Files changed
 
 Feature behavior:
 
-- `src/daemon_maintenance.rs` — policy-neutral `BackgroundClassScheduler`, `PumpScheduler` with route cursors, visit-budget constants, and deterministic scheduler proofs. Close work does not rewrite the phase pointer.
+- `src/daemon_maintenance.rs` — incomplete Observe prefers Observe; sealed `ObservePassUnavailable` does not remint; HostBridge drains budget-fitting fanout jobs; `projection_dirty` is not a self-wake.
+- `src/daemon_entity_subscriptions.rs` — session delivery pending is `needs_delivery` or resync, not `projection_dirty`. SubscriberDelivery does not increment `reconciliation_wakes` (the Maintenance class already counts the slice).
 - `src/daemon_transport.rs` — one control then at most one class slice. Pump phases `Observe` → `CloseEvents` → `InventoryReconcile`. No after-control mux scan. No Status/ReadModeFlags Pump remake. Close work marks Pump only.
 - `src/daemon_attach_stream.rs` — `reconcile_inventory_slice` uses `BTreeMap::range` and counts unbound rows toward the visit budget. One stale cancel removes only that client's keyed route.
 - `src/runtime.rs` — thin wrappers for `session_registry_state` and `terminal_subscription_generation`.
@@ -79,12 +78,13 @@ Pin / fixture identity (unchanged from the first Implement pass):
 
 Proof:
 
-- `tests/hub_daemon_lifecycle/sessions.rs` — Status flood PTY progress; idle wake assertion prints before/after counts.
+- `tests/hub_daemon_lifecycle/sessions.rs` — Status flood PTY progress; eight-session idle sample waits 1.2 s and prints wake/change/delivery/drain deltas.
+- `src/daemon_maintenance.rs` tests — sealed unavailable observe; incomplete unavailable recovery; incomplete observe prefers Observe; `projection_dirty` alone is not `needs_work`.
 - `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs` — Unix Core-close wait matches the WebRTC 20s bound so CloseEvents can run after adapter close without a Status-rearm starvation path.
 
 Handoff:
 
-- `docs/plans/implement-bounded-fair-owner-loop-background-scheduling.md` — revision 4.
+- `docs/plans/implement-bounded-fair-owner-loop-background-scheduling.md` — revision 5.
 - `docs/reports/implement-bounded-fair-owner-loop-background-scheduling.md` — this report.
 
 ## Ownership boundaries preserved
@@ -101,6 +101,7 @@ Registered Core dependency `ticket_1787104273_140454` / `dependency_1787104278_3
 2. CloseEvents retries `Absent` and query error instead of marking the route reported. Found(Running) still emits. Found(non-running) still suppresses.
 3. Adapter close sets one coalesced close-work flag and marks Pump. It does not rewrite the Pump phase pointer.
 4. The Unix Core-close waiter uses a 20s bound, matching WebRTC. The previous 8s bound depended on Status-rearm and an unbounded after-control scan starving drain.
+5. `MaintenanceScheduler::prefer_observe` is additive. `take_slice`, `try_wake`, `prefer_journal_pull`, and `prefer_subscriber_delivery` keep their contracts. An incomplete observe pass must not spend idle wakes on the rest of the 9-kind rotation.
 
 ## Tests and downstream proof
 
@@ -110,8 +111,7 @@ Commands (one clean run, no retry):
 
 - `cargo fmt --all -- --check` — pass
 - `cargo clippy --workspace --all-targets --locked --offline -- -D warnings` — pass
-- `cargo test --doc --workspace --locked --offline` — pass
-- `./test.sh --locked --offline` — pass; `hub_daemon_lifecycle_test` 253 passed, 0 failed, 1 ignored
+- `./test.sh --locked` — pass; `hub_daemon_lifecycle_test` 253 passed, 0 failed, 1 ignored. Command matches Review: no `--offline`, no retry, default concurrency.
 
 Ready Spawn observation from the first Implement pass: `8.206125ms` (below 50 ms). The return gate re-ran the ready-Spawn tests and they stayed green.
 
