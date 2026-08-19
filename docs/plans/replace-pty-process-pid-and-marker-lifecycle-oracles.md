@@ -20,6 +20,8 @@ Revision 4 answers Implement Review `review_1787143211_621764`:
 - `finding_1787143211_492928` (scope, high): this ticket stays test-only. The `src/daemon_transport.rs` ShutdownSession suppress-before-teardown edit is reverted. Production work is registered as `ticket_1787143511_231816` / child run `run_1787143511_194671` / dependency `dependency_1787143530_547584` against `tgt_7e208a0c76a44980a83b63af976b1f22`.
 - `finding_1787143211_159905` (runtime teardown, high): the close-event matrix (success, Active Core-error, Stopping, missing, WebRTC, late close, reused session id plus generation) belongs on that production ticket, not here.
 
+Revision 5 consumes the closed production dependency. `ticket_1787143511_231816` merged to `origin/main` at `78a6f5b` (`f0c001e` suppress-before-teardown; `f86d1c3` source-order ablation). This ticket merged that tip at `25e3972`. Unique `git diff origin/main` remains tests and docs. The pex test keeps production `ReadScreen` wait plus `SessionCleanupGuard`s, and it keeps main's occupancy-generation close-event assertions. [[ShutdownSession suppression live tests are not a red oracle]]: the load-bearing suppression oracles are the merged unit lanes, not the live no-event tests.
+
 ## Target
 
 - Target repository: `botster-hub` (`trybotster/botster-hub`).
@@ -156,8 +158,8 @@ Non-scope:
 ## Ownership boundaries and cross-repo dependencies
 
 - Work is Hub-owned test code. The completion signal consumes two shipped Hub production surfaces: exact-session observe inside `ReadScreen` and exact-session classification inside `ShutdownSession`. Both are Hub control-plane surfaces over the pinned Core (`8fce204`) `observe_session_lifecycle` API.
-- The missing production seam (Active `ShutdownSession` close-event suppression before Core teardown) is registered as `ticket_1787143511_231816`. This ticket does not edit that production path.
-- Cross-repository dependency: none. Same-repository production dependency: `dependency_1787143530_547584` on `ticket_1787143511_231816` (child run `run_1787143511_194671`). This ticket is not a consumer of the Hub session-type eligibility parent; the parent-pin injection rules do not apply.
+- The missing production seam (Active `ShutdownSession` close-event suppression before Core teardown) is registered as `ticket_1787143511_231816`. That ticket is closed and merged. This ticket does not author that production path; it consumes the merge. Unique `git diff origin/main` has no `src/` files.
+- Cross-repository dependency: none. Same-repository production dependency: `dependency_1787143530_547584` on `ticket_1787143511_231816` (child run `run_1787143511_194671`, status closed). This ticket is not a consumer of the Hub session-type eligibility parent; the parent-pin injection rules do not apply.
 
 ## Assumptions and unknowns
 
@@ -203,7 +205,7 @@ Non-scope:
 3. Negative control: with marker bytes already observed, repeated production exact-session observe turns keep reporting `running` until the exit release. This is the red control: any oracle that counted markers, PIDs, or done files as completion fails here.
 4. No sleep as a correctness oracle: sleeps appear only as polling backoff inside deadline-bounded production-signal waits; the negative control counts observation turns.
 5. Fixture startup is explicit and bounded: tests observe `producer-ready` under a deadline before writing the release file.
-6. Diff discipline: `git diff --stat origin/main` shows only `tests/` and `docs/plans/` paths. No PID, descendant-PID, done-file, or pre-exit-marker completion oracle is introduced (reviewable by inspection of the new fixtures).
+6. Diff discipline: `git diff --stat origin/main` shows only `tests/` and `docs/` paths. No PID, descendant-PID, done-file, or pre-exit-marker completion oracle is introduced (reviewable by inspection of the new fixtures). Production `src/` from `ticket_1787143511_231816` matches `origin/main` after the merge.
 7. Repository gates, in order:
    - `cargo fmt --all -- --check`
    - `cargo clippy --workspace --all-targets --locked -- -D warnings`
