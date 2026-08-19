@@ -6,11 +6,12 @@
 - Target id: `tgt_7e208a0c76a44980a83b63af976b1f22`
 - Ticket: `ticket_1786663583_640263`
 - Run: `run_1787158085_722550`
-- Implement step: `run_step_1787165407_410166` (sequence 5, Review return)
-- Prior Implement step: `run_step_1787159472_279191`
+- Implement step: `run_step_1787169048_973962` (sequence 7, second Review return)
+- Prior Implement steps: `run_step_1787165407_410166`, `run_step_1787159472_279191`
 - Approved plan: `docs/plans/expose-client-event-subscriptions-on-the-host-control-protocol.md` at `98ae1f9`
 - Plan Review: `review_1787159455_211294` approved
-- Code Review: `review_1787165393_430946` `changes_required` (7 findings)
+- Code Review: `review_1787165393_430946` `changes_required` (7 findings, resolved)
+- Code Review: `review_1787169037_550837` `changes_required` (4 findings)
 - `teardown_class_applies`: no
 - Direct-merge pipeline. No pull request.
 
@@ -32,6 +33,15 @@ addresses all of them. No protocol or npm coordinate change.
 | `finding_1787165393_413502` Cleanup retain drops new IDs | medium | Commit removes only snapshot IDs that this pass completed. Concurrent-insert test covers the window. |
 | `finding_1787165393_534534` Client delivery before plugin reject | medium | Clients receive only on `Accepted`. Mixed plugins-plus-clients pressure test covers `ShedFull` and `RejectedOverFanout`. |
 | `finding_1787165393_221205` Live Unix EventGap missing | medium | IsolatedHub stall-file latch plus 1-slot mailbox. Proves one EventGap, no later traffic, Status during stall and after. |
+
+Second Review return (`review_1787169037_550837`):
+
+| Finding | Severity | Fix |
+| --- | --- | --- |
+| `finding_1787169037_297118` Gap-lock can still drop EventGap | high | Each subscription owns an `Arc<AtomicBool>` gap flag. Shed sets the bit without the slot-map lock. Slot-held ablation proves one EventGap. |
+| `finding_1787169037_708275` Strict workspace Clippy fails | high | Removed the never-loop and Copy clones. `cargo clippy --workspace --all-targets --locked -- -D warnings` is clean. |
+| `finding_1787169037_872794` Lua helper retries and can orphan | high | Helper now waits via `invoke`, one causal scope per copy, and requeues or retires on every exit. Ablation holds admit backpressure through the old 2s deadline and proves occupancy is unchanged. |
+| `finding_1787169037_962336` Stall latch works outside test mode | medium | Stall file and queue-max override require `BOTSTER_ENV=test`. Negative unit tests cover production and unset env. |
 
 Constraints applied for this return: Hub host-control and in-repo
 `botster-hub-client` only. Core pin unchanged. No Web/TUI edits. No
@@ -96,8 +106,9 @@ Review-return (this visit):
 - `src/host_control_fair_write.rs` — `MAX_HOST_FRAMES_PER_FLUSH_TURN`
 - `src/local_webrtc.rs` — queued-request `control_ready`, held-entity continue
 - `src/package_event_router.rs` — client delivery only on Accepted
-- `src/runtime.rs` — deterministic `drive_package_events_for_test`
+- `src/runtime.rs` — invoke-wait drive helper, one causal scope, requeue/retire
 - `tests/hub_daemon_lifecycle/package_event_plane.rs` — next_event + Unix EventGap
+- `tests/hub_lua_runtime_test.rs` — backpressure occupancy ablation
 - `docs/client-protocol.md` — next_event
 
 Prior Implement files remain:
@@ -223,10 +234,10 @@ Repo gates:
 
 - `cargo build --locked -p botster-core-daemon --bin botster-session-worker`
 - `./test.sh --locked` — one clean default-concurrency pass after the
-  Review-return fixes, 0 failures. Lifecycle 264 passed / 1 ignored.
-  Lua runtime 60 passed, including
-  `events_on_registers_exact_event_subscription_and_invokes_worker_handler`.
-  Hub lib 441 passed. Hub client 78 passed.
+  second Review-return fixes, 0 failures. Lifecycle 264 passed / 1 ignored.
+  Lua runtime 61 passed, including `events_on` and the backpressure
+  occupancy ablation. Hub lib 444 passed. Hub client 78 passed.
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` clean.
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`
 - `cargo test --doc --workspace`

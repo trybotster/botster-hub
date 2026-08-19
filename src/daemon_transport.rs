@@ -917,8 +917,17 @@ async fn flush_pending_responses(
 }
 
 fn unix_event_flush_stalled() -> bool {
-    env::var_os("BOTSTER_HUB_TEST_STALL_UNIX_EVENT_FLUSH")
-        .is_some_and(|path| Path::new(&path).exists())
+    unix_event_flush_stalled_from(
+        env::var("BOTSTER_ENV").ok().as_deref(),
+        env::var_os("BOTSTER_HUB_TEST_STALL_UNIX_EVENT_FLUSH").as_deref(),
+    )
+}
+
+fn unix_event_flush_stalled_from(
+    botster_env: Option<&str>,
+    stall_path: Option<&std::ffi::OsStr>,
+) -> bool {
+    botster_env == Some("test") && stall_path.is_some_and(|path| Path::new(path).exists())
 }
 
 async fn flush_unix_mux_writes(
@@ -1126,7 +1135,8 @@ mod mux_write_resume_tests {
     use super::{
         MuxWrite, MuxWriteState, PendingMuxClass, PendingMuxFrame, daemon_response_base,
         entity_subscription_mux_busy_error, flush_pending_responses, flush_unix_mux_writes,
-        unix_mux_blocks_entity_subscription, write_frame_bytes_resumable,
+        unix_event_flush_stalled_from, unix_mux_blocks_entity_subscription,
+        write_frame_bytes_resumable,
     };
     use crate::unix_terminal_adapter::{UnixConnectionMux, UnixTerminalAdapter};
     use botster_core::contract::terminal_adapter::{TerminalAdapter, TerminalAdapterPressure};
@@ -1465,6 +1475,32 @@ mod mux_write_resume_tests {
             botster_hub_client::DaemonUnixMuxFrame::Response(ref response)
                 if response.kind == DaemonResponseKind::Status
         ));
+    }
+
+    #[test]
+    fn unix_event_stall_latch_requires_test_mode() {
+        let stall = std::env::temp_dir().join(format!(
+            "bh-event-stall-negative-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::write(&stall, b"stall").expect("stall file");
+        assert!(unix_event_flush_stalled_from(
+            Some("test"),
+            Some(stall.as_os_str())
+        ));
+        assert!(
+            !unix_event_flush_stalled_from(Some("production"), Some(stall.as_os_str())),
+            "non-test BOTSTER_ENV must ignore the stall latch"
+        );
+        assert!(
+            !unix_event_flush_stalled_from(None, Some(stall.as_os_str())),
+            "unset BOTSTER_ENV must ignore the stall latch"
+        );
+        let _ = std::fs::remove_file(&stall);
     }
 
     #[tokio::test]

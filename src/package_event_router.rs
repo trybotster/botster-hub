@@ -132,6 +132,7 @@ pub(crate) struct ClientEventHolder {
     pub name: String,
     pub subjects: BTreeSet<String>,
     pub mailbox: Arc<ClientEventMailbox>,
+    pub gap: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -676,6 +677,25 @@ impl PackageEventRouter {
         ))
     }
 
+    pub fn requeue_delivery(&self, delivery: ReadyDelivery) -> Result<(), EventPlaneStatus> {
+        let mut inner = lock_inner(&self.inner)?;
+        if !inner.envelopes.contains_key(&delivery.envelope_id) {
+            return Ok(());
+        }
+        let consumer = inner
+            .consumers
+            .entry(delivery.holder.plugin_key.clone())
+            .or_insert_with(ConsumerQueue::default);
+        consumer.events += 1;
+        consumer.bytes += delivery.size;
+        consumer.copies.push_front(QueuedCopy {
+            envelope_id: delivery.envelope_id,
+            holder: delivery.holder,
+        });
+        self.delivery_wake.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
     pub fn try_apply(&self, op: &OwnerOp) -> OwnerApplyResult {
         let mut inner = match lock_inner(&self.inner) {
             Ok(inner) => inner,
@@ -1083,6 +1103,7 @@ fn deliver_to_client_holders(
             )
             .is_err()
         {
+            holder.gap.store(true, std::sync::atomic::Ordering::SeqCst);
             holder
                 .mailbox
                 .set_gap(&holder.subscription_id, &holder.owner, &holder.name);
@@ -2612,7 +2633,7 @@ mod tests {
             fanout_per_emit_max: 1,
             ..PackageEventPlanePolicy::default()
         };
-        let router = PackageEventRouter::new(policy.clone());
+        let router = PackageEventRouter::new(policy);
         let mut contract = sample_contract("producer", "notice");
         contract.audience = BTreeSet::from([EventAudience::Plugins, EventAudience::Clients]);
         router
@@ -2629,7 +2650,8 @@ mod tests {
             EventPlaneStatus::Accepted
         );
 
-        let mailbox = std::sync::Arc::new(ClientEventMailbox::new(policy.clone()));
+        let mailbox = std::sync::Arc::new(ClientEventMailbox::new(policy));
+        let gap = mailbox.register_gap_slot("sub", "producer", "notice");
         assert_eq!(
             router.try_subscribe_client(ClientEventHolder {
                 connection_id: "conn".into(),
@@ -2638,6 +2660,7 @@ mod tests {
                 name: "notice".into(),
                 subjects: BTreeSet::new(),
                 mailbox: mailbox.clone(),
+                gap,
             }),
             EventPlaneStatus::Accepted
         );
@@ -2668,6 +2691,7 @@ mod tests {
         subscribe(&fanout_router, "consumer-b", "producer", "notice");
         let fanout_mailbox =
             std::sync::Arc::new(ClientEventMailbox::new(PackageEventPlanePolicy::default()));
+        let fanout_gap = fanout_mailbox.register_gap_slot("sub", "producer", "notice");
         assert_eq!(
             fanout_router.try_subscribe_client(ClientEventHolder {
                 connection_id: "conn".into(),
@@ -2676,6 +2700,7 @@ mod tests {
                 name: "notice".into(),
                 subjects: BTreeSet::new(),
                 mailbox: fanout_mailbox.clone(),
+                gap: fanout_gap,
             }),
             EventPlaneStatus::Accepted
         );
@@ -2703,6 +2728,7 @@ mod tests {
             .try_register_contracts(vec![accepted_contract])
             .expect("register");
         subscribe(&accepted_router, "consumer", "producer", "notice");
+        let accepted_gap = accepted_mailbox.register_gap_slot("sub", "producer", "notice");
         assert_eq!(
             accepted_router.try_subscribe_client(ClientEventHolder {
                 connection_id: "conn".into(),
@@ -2711,6 +2737,7 @@ mod tests {
                 name: "notice".into(),
                 subjects: BTreeSet::new(),
                 mailbox: accepted_mailbox.clone(),
+                gap: accepted_gap,
             }),
             EventPlaneStatus::Accepted
         );
