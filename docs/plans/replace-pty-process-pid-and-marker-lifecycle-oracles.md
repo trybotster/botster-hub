@@ -16,11 +16,15 @@ Revision 3 answers Implement Review `review_1787141572_759360`:
 - `finding_1787141572_503373` (test evidence, high): `ShutdownSession` for an Active session must suppress Unix and WebRTC close events before Core teardown. CloseEvents can observe a closed adapter while the registry row is still Running and emit `TerminalSubscriptionClosed`. `process_exit_and_shutdown_session_do_not_emit_terminal_subscription_closed` waits on production exact-session observe for `pex-exit` instead of `sleep 1s`.
 - `finding_1787141573_874007` (test evidence, medium): Implement records an executed red-on-revert ablation of the held-live running-under-observation assert.
 
+Revision 4 answers Implement Review `review_1787143211_621764`:
+- `finding_1787143211_492928` (scope, high): this ticket stays test-only. The `src/daemon_transport.rs` ShutdownSession suppress-before-teardown edit is reverted. Production work is registered as `ticket_1787143511_231816` / child run `run_1787143511_194671` / dependency `dependency_1787143530_547584` against `tgt_7e208a0c76a44980a83b63af976b1f22`.
+- `finding_1787143211_159905` (runtime teardown, high): the close-event matrix (success, Active Core-error, Stopping, missing, WebRTC, late close, reused session id plus generation) belongs on that production ticket, not here.
+
 ## Target
 
 - Target repository: `botster-hub` (`trybotster/botster-hub`).
 - Target id: `tgt_7e208a0c76a44980a83b63af976b1f22`.
-- The ticket remains Hub-owned. Tests stay the primary change. Review required one production seam: `ShutdownSession` suppresses adapter close events before Core teardown. No Core pin change. No `packages/hub-test-support` content change.
+- This ticket is test-only. It changes files under `tests/` and plan/report documents. It changes no file under `src/`, no Core pin, and no `packages/hub-test-support` content. The ShutdownSession close-order defect is a separately registered Hub production ticket.
 
 ## Context loaded
 
@@ -142,8 +146,8 @@ In scope:
 - This plan document.
 
 Non-scope:
-- Lifecycle observation is not added to Spawn, SpawnSessionType, Attach, Drain, Input, Resize, or other operation paths. Terminal Drain does not discover lifecycle.
-- The only permitted production edit is `ShutdownSession` close-event suppression before Core teardown, required by Review finding `finding_1787141572_503373`.
+- Any `src/` change. No lifecycle observation is added to Spawn, SpawnSessionType, Attach, Drain, Input, Resize, or any other operation path. Terminal Drain does not discover lifecycle.
+- ShutdownSession close-event ordering. That belongs to `ticket_1787143511_231816`.
 - Core changes or Core pin bumps.
 - `packages/hub-test-support` changes (no fixture-byte mutation; no version bump).
 - Owner-loop scheduling, snapshot paging, WebRTC teardown behavior (owned by adjacent closed tickets).
@@ -151,9 +155,9 @@ Non-scope:
 
 ## Ownership boundaries and cross-repo dependencies
 
-- Work is Hub-owned. The completion signal consumes two shipped Hub production surfaces: exact-session observe inside `ReadScreen` and exact-session classification inside `ShutdownSession`. Both are Hub control-plane surfaces over the pinned Core (`8fce204`) `observe_session_lifecycle` API.
-- Review found one missing production seam: Active `ShutdownSession` suppressed close events after Core teardown. This revision fixes that order in Hub. No Core dependency ticket is registered.
-- No cross-repository dependency is registered. This ticket is not a consumer of the Hub session-type eligibility parent; the parent-pin injection rules do not apply.
+- Work is Hub-owned test code. The completion signal consumes two shipped Hub production surfaces: exact-session observe inside `ReadScreen` and exact-session classification inside `ShutdownSession`. Both are Hub control-plane surfaces over the pinned Core (`8fce204`) `observe_session_lifecycle` API.
+- The missing production seam (Active `ShutdownSession` close-event suppression before Core teardown) is registered as `ticket_1787143511_231816`. This ticket does not edit that production path.
+- Cross-repository dependency: none. Same-repository production dependency: `dependency_1787143530_547584` on `ticket_1787143511_231816` (child run `run_1787143511_194671`). This ticket is not a consumer of the Hub session-type eligibility parent; the parent-pin injection rules do not apply.
 
 ## Assumptions and unknowns
 
@@ -169,7 +173,6 @@ Non-scope:
 - `tests/hub_daemon_lifecycle/sessions.rs` — two new focused tests; migrations 1, 2, 3, 6 with cleanup guards.
 - `tests/hub_daemon_lifecycle/webrtc_proofs.rs` — migrations 4, 5 with cleanup guards.
 - `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs` — `process_exit_and_shutdown_session_do_not_emit_terminal_subscription_closed` observe wait.
-- `src/daemon_transport.rs` — `ShutdownSession` suppresses close events before Core teardown.
 - `tests/hub_daemon_lifecycle/common.rs` — only if `shutdown_short_lived_session` loses its last caller in the migrated set (it keeps other callers; leave it).
 - `docs/plans/replace-pty-process-pid-and-marker-lifecycle-oracles.md` — this plan.
 
