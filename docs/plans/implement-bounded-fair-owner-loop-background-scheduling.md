@@ -3,10 +3,15 @@
 Ticket: `ticket_1786912569_840742` — Hub: implement bounded fair owner-loop background scheduling.
 Run: `run_1787102180_185677`. Base: `origin/main` (`8b4aeaf`).
 
-Revision 2. This revision answers Plan Review `review_1787103654_733071`:
+Revision 2 answered Plan Review `review_1787103654_733071`:
 - `finding_1787103654_765870`: ReadModeFlags loses lifecycle observation entirely (section 4).
-- `finding_1787103654_982441`: the Pump class becomes a bounded phase rotation with continuation cursors and per-slice work caps; the one remaining full-set operation is named, bounded to one acquisition per pass, and carries a measured-cost blocker trigger (section 3).
+- `finding_1787103654_982441`: the Pump class becomes a bounded phase rotation with continuation cursors and per-slice work caps (section 3).
 - `finding_1787103654_131792`: acceptance adds a deterministic composed-fairness proof for SubscriberDelivery and HostBridge, and implementation evidence must record one actual ready-Spawn observation below 50 ms (Acceptance section).
+
+Revision 3 answers Plan Review `review_1787104175_260710`:
+- `finding_1787104176_184650`: the missing Core API is a registered dependency now, not a measurement-deferred trigger. Core ticket `ticket_1787104273_140454` (target `tgt_1f7bce66eb304881980f9b4a2a5ae3fe`) adds an exact subscription-membership query and an exact non-mutating registry-state query; dependency `dependency_1787104278_385109` blocks this ticket on it. InventoryReconcile drops the full-list frozen snapshot and validates routes with the exact query (section 3).
+- `finding_1787104176_752235`: CloseEvents uses the exact **non-mutating** registry-state query instead of `observe_session_lifecycle`, so it cannot advance lifecycle or raise a journal wake; a behavior matrix (running / exited / shutdown / query-error) plus a no-wake proof enters acceptance (sections 3 and Acceptance).
+- `finding_1787104176_111090`: the existing vault checklist items are updated in place with revision context; no new checklist.
 
 ## Target
 
@@ -67,16 +72,19 @@ Implement one explicit bounded scheduler for the two Hub owner-loop background c
 
 The current `pump_bound_unix_routes` performs full-set work in one call: a full Core `list_terminal_subscriptions`, a full scan of every Unix and WebRTC admission, one full `runtime.list_sessions()` **per close candidate** inside `session_suppresses_terminal_subscription_closed` (`src/daemon_transport.rs:4641`), and a full `reconcile_inventory` of every bound stream against the full inventory. Reclassifying that call as one slice would not be bounded. Instead the Pump class becomes its own rotation of three bounded phases. One Pump selection runs exactly one phase. Each phase has continuation state and per-slice work caps, mirroring the `MaintenanceSliceKind` pattern.
 
+Both non-observe phases consume the two exact queries delivered by registered Core dependency `ticket_1787104273_140454`: an exact terminal-subscription membership query for one `(SessionId, SubscriptionId)`, and an exact **non-mutating** session registry-state query for one `SessionId`. The owner loop stops calling `list_terminal_subscriptions` and stops calling `list_sessions` for close classification.
+
 **PumpPhase::CloseEvents**
 - Visits admissions in key order with a resume cursor over the admission maps (`unix_admissions`, then `webrtc_admissions`).
 - Per-slice caps: `max_admissions_visited` and `max_candidate_classifications` (constants, same order of magnitude as the existing slice caps such as `CONSUMER_REFRESH_MAX = 8`).
-- The suppression predicate stops calling the full `runtime.list_sessions()` per candidate. It classifies each candidate with one exact-session query (`observe_session_lifecycle` / the registry record it returns). This removes the O(admissions × sessions) cost that is the worst offender in the current pump.
+- The suppression predicate stops calling the full `runtime.list_sessions()` per candidate. It classifies each candidate with the exact **non-mutating** registry-state query. Semantics are preserved exactly against today's predicate (`src/daemon_transport.rs:4641`): a `Running` state does not suppress, so the running-session adapter close still emits `TerminalSubscriptionClosed`; any non-running state (stopping, exited, stale) suppresses; an absent session suppresses; a query error suppresses (suppress-safe, matching today's `Err -> true` fallback).
+- Because the query is non-mutating, CloseEvents cannot advance session lifecycle and cannot raise a journal-advanced wake. Wake handling stays in one place: only `PumpPhase::Observe` and the exact-session observes on ReadScreen/ShutdownSession can raise the journal wake, and every site that sees `take_journal_advanced_wake` marks Maintenance pending (`note_authoritative_mutation`) without pulling inline.
 - An incomplete visit keeps Pump pending and resumes after the cursor.
 
 **PumpPhase::InventoryReconcile**
 - Purpose unchanged: close Hub-bound routes whose Core subscription vanished (the backstop behind mux close events).
-- At most **one** `list_terminal_subscriptions` acquisition per reconcile pass. The result is held as a frozen snapshot for the pass. Continuation slices walk the Hub bound-stream keys in order with a resume cursor and compare at most `max_routes_compared` routes per slice against the frozen snapshot. The snapshot is dropped when the pass completes. A generation recorded after the snapshot was taken is treated as live (no close on stale-snapshot evidence).
-- Named residual cost, not hidden: the single acquisition is an O(total-subscriptions) in-memory metadata copy (`CoreDaemon::list_terminal_subscriptions` returns the engine's record list without serialization or storage I/O). Core exposes no exact or paged terminal-subscription query today. This plan does not pre-emptively block on a Core API for a metadata copy; instead the Implementer must add a work-bound test proving one acquisition per pass (no per-slice re-list), and Verify must record the measured acquisition cost at a hundreds-of-sessions fixture. **Blocker trigger:** if that measurement threatens the 8 ms slice class, register a separate botster-core dependency ticket for a bounded/paged subscription inventory API against the Core target (`tgt_1f7bce66eb304881980f9b4a2a5ae3fe`) instead of expanding this ticket — the same route the project took for `lifecycle_baseline_page` budgets.
+- Continuation slices walk the Hub bound-stream keys in order with a resume cursor and validate at most `max_routes_validated` routes per slice. Each route is validated with the exact subscription-membership query: explicit absence, or a generation mismatch under the existing `reconcile_inventory` rule (`src/daemon_attach_stream.rs:339`), closes the adapter and cancels the stream. No full inventory list, no snapshot, no sort.
+- This removes the previous revision's frozen-snapshot design and its O(n log n) `list_terminal_subscriptions` acquisition. The reviewer confirmed at pinned Core `302c7f7` that the full-list call clones and sorts every live row, so it cannot be bounded from the Hub side; the exact query from `ticket_1787104273_140454` is the bounded replacement.
 
 **PumpPhase::Observe**
 - The observe call uses `OBSERVE_SLICE_BUDGET` (unchanged constant: 8 sessions, 64 KiB, `max_elapsed` 8 ms) with the existing `observe_resume` cursor. An incomplete slice keeps Pump pending.
@@ -104,7 +112,7 @@ Pump pending mark sources: reconciliation interval due; successful Attach bind (
 ## Non-scope
 
 - No lifecycle-class client priority of any kind.
-- No changes to Core (`botster-core`) or to the Core pin.
+- No Core code changes inside this ticket. The two exact queries are delivered by the registered Core dependency `ticket_1787104273_140454`; this ticket only bumps the Core pin to consume the merged revision.
 - No `botster-hub-client` DTO changes.
 - No changes to session snapshot paging (owned by merged `ticket_1786912570_127968`).
 - No PTY process-fixture rework (owned by `ticket_1786912572_610381`).
@@ -114,7 +122,8 @@ Pump pending mark sources: reconciliation interval due; successful Attach bind (
 ## Ownership boundaries and cross-repo dependencies
 
 - All changes stay in `botster-hub`. The Hub owns owner-loop policy, budgets, and scheduling (host profile charter).
-- Core stays authoritative for lifecycle facts. The plan consumes only existing pinned Core APIs (`observe_lifecycle_slice`, `observe_session_lifecycle`, `take_journal_advanced_wake`, `list_terminal_subscriptions`, journal pages). No new Core surface is required, so no cross-repo dependency is registered now. One named gap exists: Core has no exact or paged terminal-subscription inventory query. Section 3 bounds its use to one in-memory acquisition per reconcile pass and defines the measured-cost trigger that would create a botster-core dependency ticket against `tgt_1f7bce66eb304881980f9b4a2a5ae3fe` as a separate blocker.
+- Core stays authoritative for lifecycle facts. The Hub scheduler consumes existing pinned Core APIs (`observe_lifecycle_slice`, `observe_session_lifecycle`, `take_journal_advanced_wake`, journal pages) plus the two exact queries from the registered Core dependency.
+- **Registered cross-repo dependency:** Core ticket `ticket_1787104273_140454` (target `tgt_1f7bce66eb304881980f9b4a2a5ae3fe`) adds the exact subscription-membership query and the exact non-mutating registry-state query. Dependency `dependency_1787104278_385109` blocks this Hub ticket on it. The Hub Implement step must bump the Core git pin in `Cargo.toml` (currently `302c7f7`) to a merged Core `main` revision that contains both queries, and must consume them through that pinned artifact. Hub implementation of sections 3's non-observe phases cannot start before that artifact exists.
 - Terminal bytes stay on the Core SessionIo/ClientWorker data plane. The scheduler selects when the Hub asks Core to pump; it never touches frame content.
 
 ## Assumptions and unknowns
@@ -123,12 +132,15 @@ Pump pending mark sources: reconciliation interval due; successful Attach bind (
 - Assumption: replacing the ReadScreen broad slice with the exact-session observe strengthens, not weakens, the observed-exit wait stimulus. The vault note records that the broad 25 ms slice alone failed 4 of 30 targeted runs because it can end before reaching the target session.
 - Unknown: whether any existing test depends on incidental cross-session lifecycle advancement from the removed broad observes on Attach/ReadScreen paths. Mitigation: run the full default-concurrency suite; repair any such test with an exact-session stimulus; if a production seam turns out to be missing, stop and file a blocker instead of widening this ticket.
 - Unknown: exact pump-progress cadence under continuous both-classes-pending load (each class gets every other slice). The sustained-traffic integration proof covers this.
+- Assumption: Core's internal exact membership primitives (named by Plan Review) let `ticket_1787104273_140454` deliver both queries without touching subscription lifecycle or journal semantics; the Core ticket's own gates prove this.
 
 ## Affected surfaces/files
 
 - `src/daemon_maintenance.rs` — new background-class scheduler type plus unit tests; `MaintenanceScheduler` untouched.
 - `src/daemon_transport.rs` — `serve_daemon` turn shape; `run_one_owner_maintenance_slice` becomes the class-dispatched slice runner; Pump phase rotation with continuation state; removal of `observe_lifecycle_turn` and its six call sites; exact-session observe on ReadScreen only; bounded close-candidate classification replacing the per-candidate `list_sessions` predicate; decision-level and work-bound tests.
-- `src/daemon_attach_stream.rs` — `reconcile_inventory` gains a bounded, cursor-resumable form over a frozen snapshot.
+- `src/daemon_attach_stream.rs` — `reconcile_inventory` gains a bounded, cursor-resumable form validating routes with the exact membership query.
+- `src/runtime.rs` — thin `HubRuntime` wrappers for the two new Core queries.
+- `Cargo.toml` — Core git pin bump to the merged dependency revision.
 - `tests/hub_daemon_lifecycle/sessions.rs` — sustained-control-traffic proof extended with PTY progress; ready-Spawn proof; ReadModeFlags no-observe check.
 - Existing tests touching removed behavior may need stimulus repairs (see unknowns).
 
@@ -139,9 +151,10 @@ Pump pending mark sources: reconciliation interval due; successful Attach bind (
 3. **Idle-bound counters.** `focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible` asserts idle `lifecycle_change_reads <= 4` and no baseline rescans. Pump-as-class must not add idle work.
 4. **Busy-mark loop.** Marking Pump pending on interval-due must advance the deadline at mark time, or the loop would spin on an always-due interval.
 5. **Wall-clock oracles.** New tests must use work bounds and decision-level oracles, not elapsed time, per the two wall-clock gotcha notes.
-6. **Snapshot staleness in bounded reconcile.** A route bound after the pass snapshot was taken must not be closed on stale evidence; the generation-recorded-after-snapshot guard covers this and needs its own test.
-7. **Close-candidate classification change.** Replacing the per-candidate `list_sessions` with an exact-session query changes the suppression predicate's failure behavior (query error must stay suppress-safe, matching today's `Err -> true` fallback).
+6. **Dependency timing.** The Core dependency ticket must merge before Hub Implement can build the non-observe Pump phases; the Hub pin bump also pulls any other Core `main` changes merged since `302c7f7`, so the Implement step re-runs the full Hub suite against the new pin.
+7. **Close-candidate classification change.** The suppression predicate must preserve today's behavior exactly: running emits the close event, non-running/absent suppresses, and a query error stays suppress-safe (`Err -> true`). The acceptance matrix covers all four cases.
 8. **Chunked pump latency.** Splitting the pump into three rotated phases lengthens the interval between observe slices when close-event or reconcile work is pending; the sustained-traffic PTY-progress proof covers this.
+9. **Reconcile validation race.** A route re-bound with a new generation between slices must not be closed against stale expectations; the exact query returns the live generation and the existing `reconcile_inventory` generation rule decides, with its own test.
 
 ## Acceptance checks/tests
 
@@ -153,8 +166,11 @@ Deterministic scheduler state tests (unit):
 - Control precedence: extend `queued_control_precedes_a_due_maintenance_slice` to cover both classes pending.
 - No cancellation: a selected slice decision survives a control message that arrives after selection (decision-level proof; negative control with the rule inverted must go red).
 - Composed maintenance fairness: with Pump continuously rearmed and Maintenance continuously pending, drive the composed scheduler for a fixed turn sequence and assert that `SubscriberDelivery` and `HostBridge` each execute within an exact finite turn bound. With class round-robin (Maintenance every second background turn) and the 9-kind inner rotation, each kind must execute within 18 background turns; the test asserts the deterministic turn indices, not elapsed time.
-- Pump phase work bounds: each Pump phase test proves its per-slice caps (`max_admissions_visited`, `max_candidate_classifications`, `max_routes_compared`, `OBSERVE_SLICE_BUDGET` items/bytes) and cursor continuation. The InventoryReconcile test proves exactly one `list_terminal_subscriptions` acquisition per pass across multiple continuation slices.
+- Pump phase work bounds: each Pump phase test proves its per-slice caps (`max_admissions_visited`, `max_candidate_classifications`, `max_routes_validated`, `OBSERVE_SLICE_BUDGET` items/bytes) and cursor continuation. A check (test or source assertion) proves the owner loop makes no `list_terminal_subscriptions` and no close-classification `list_sessions` call.
+- CloseEvents behavior matrix: a running-session adapter close still emits `TerminalSubscriptionClosed`; an exited session stays suppressed; a shut-down (stopping/stale/absent) session stays suppressed; a query error stays suppressed. A negative proof shows CloseEvents raises no journal-advanced wake (the registry-state query is non-mutating).
+- InventoryReconcile exact-query behavior: absence closes the route; a generation mismatch under the existing rule closes the route; a live matching generation survives; a route re-bound with a newer generation is not closed on stale expectations.
 - ReadModeFlags no-observe check: issuing ReadModeFlags moves no observation counter (or the equivalent source-scan assertion).
+- Downstream Core dependency proof: the consumed Core pin revision contains both exact queries (Cargo.toml rev at or after the merged Core ticket_1787104273_140454 revision), and the Core-side non-mutating negative test is green in that revision.
 
 Integration proof (`tests/hub_daemon_lifecycle`):
 - Sustained control traffic: pipelined Status flood while a live PTY producer emits output. Assert `reconciliation_wakes` strictly increases **and** PTY output progresses (screen/drain content advances) during the flood. Progress deltas, not elapsed time, are the oracle.
