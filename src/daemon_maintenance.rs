@@ -872,6 +872,24 @@ fn handle_unavailable_observe_pass(state: &mut MaintenanceState) {
     }
 }
 
+/// Apply a successful observe slice to Maintenance scheduling.
+///
+/// An incomplete pass stores [`MaintenanceState::observe_resume`] and leaves
+/// the nine-kind pointer unchanged. A journal-advanced wake prefers
+/// JournalPull. This function is the only incomplete-pass scheduler
+/// transition in production.
+fn apply_observe_pass_result(
+    state: &mut MaintenanceState,
+    complete: bool,
+    journal_advanced: bool,
+    resume: Option<ObserveLifecycleCursor>,
+) {
+    state.observe_resume = if complete { None } else { resume };
+    if journal_advanced {
+        state.scheduler.prefer_journal_pull();
+    }
+}
+
 fn now_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -892,21 +910,19 @@ fn run_observe_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
                 }
                 return;
             }
-            if slice.complete {
-                state.observe_resume = None;
-            } else {
-                state.observe_resume = Some(ObserveLifecycleCursor {
-                    pass_id: slice.pass_id,
-                    last_visited: slice.last_visited,
-                });
-            }
-            // Observe can publish journal rows (natural exit) without a
-            // subscriber. Wake the next JournalPull so the projection does
-            // not lag Core list(). An incomplete pass keeps the resume
-            // cursor and leaves the nine-kind pointer unchanged.
-            if runtime.take_journal_advanced_wake() {
-                state.scheduler.prefer_journal_pull();
-            }
+            apply_observe_pass_result(
+                state,
+                slice.complete,
+                runtime.take_journal_advanced_wake(),
+                if slice.complete {
+                    None
+                } else {
+                    Some(ObserveLifecycleCursor {
+                        pass_id: slice.pass_id,
+                        last_visited: slice.last_visited,
+                    })
+                },
+            );
         }
         Err(SessionLifecyclePageError::BudgetTooSmall { .. }) => {
             state.scheduler.try_wake();
@@ -2096,13 +2112,21 @@ mod tests {
         assert_eq!(scheduler.take_slice(), MaintenanceSliceKind::JournalPull);
     }
 
+    fn incomplete_resume() -> ObserveLifecycleCursor {
+        ObserveLifecycleCursor {
+            pass_id: ObserveLifecyclePassId("incomplete".into()),
+            last_visited: None,
+        }
+    }
+
     #[test]
     fn incomplete_observe_keeps_the_nine_kind_rotation() {
-        let mut scheduler = MaintenanceScheduler::default();
-        assert_eq!(scheduler.take_slice(), MaintenanceSliceKind::Observe);
-        scheduler.try_wake();
+        let mut state = MaintenanceState::default();
+        assert_eq!(state.scheduler.take_slice(), MaintenanceSliceKind::Observe);
+        apply_observe_pass_result(&mut state, false, false, Some(incomplete_resume()));
+        assert!(state.observe_resume.is_some());
         assert_eq!(
-            scheduler.take_slice(),
+            state.scheduler.take_slice(),
             MaintenanceSliceKind::JournalPull,
             "an incomplete Observe pass must not rewrite next to Observe"
         );
@@ -3197,8 +3221,9 @@ mod tests {
         assert_eq!(subscriber_at, Some(10));
     }
 
-    #[test]
-    fn composed_incomplete_observe_still_serves_host_bridge_and_subscriber_delivery() {
+    fn drive_composed_incomplete_observe(
+        after_observe: fn(&mut MaintenanceState, bool, bool, Option<ObserveLifecycleCursor>),
+    ) -> (Option<usize>, Option<usize>, usize, MaintenanceState) {
         let mut classes = BackgroundClassScheduler::default();
         let mut maintenance = MaintenanceState::default();
         let mut subscriber_at = None;
@@ -3214,10 +3239,7 @@ mod tests {
             let kind = maintenance.scheduler.take_slice();
             if kind == MaintenanceSliceKind::Observe {
                 observe_count = observe_count.saturating_add(1);
-                maintenance.observe_resume = Some(ObserveLifecycleCursor {
-                    pass_id: ObserveLifecyclePassId("incomplete".into()),
-                    last_visited: None,
-                });
+                after_observe(&mut maintenance, false, false, Some(incomplete_resume()));
             }
             if kind == MaintenanceSliceKind::HostBridge && host_bridge_at.is_none() {
                 host_bridge_at = Some(turn);
@@ -3226,6 +3248,26 @@ mod tests {
                 subscriber_at = Some(turn);
             }
         }
+        (host_bridge_at, subscriber_at, observe_count, maintenance)
+    }
+
+    fn apply_observe_pass_result_starving_later_kinds(
+        state: &mut MaintenanceState,
+        complete: bool,
+        journal_advanced: bool,
+        resume: Option<ObserveLifecycleCursor>,
+    ) {
+        apply_observe_pass_result(state, complete, journal_advanced, resume);
+        if state.observe_resume.is_some() && !journal_advanced {
+            state.scheduler.wake = true;
+            state.scheduler.next = MaintenanceSliceKind::Observe;
+        }
+    }
+
+    #[test]
+    fn composed_incomplete_observe_still_serves_host_bridge_and_subscriber_delivery() {
+        let (host_bridge_at, subscriber_at, observe_count, maintenance) =
+            drive_composed_incomplete_observe(apply_observe_pass_result);
         assert!(
             observe_count >= 1,
             "the sequence must include at least one incomplete Observe pass"
@@ -3240,6 +3282,30 @@ mod tests {
         );
         assert_eq!(host_bridge_at, Some(8));
         assert_eq!(subscriber_at, Some(10));
+    }
+
+    #[test]
+    fn rewriting_next_to_observe_starves_host_bridge_and_subscriber_delivery() {
+        let (host_bridge_at, subscriber_at, observe_count, _) =
+            drive_composed_incomplete_observe(apply_observe_pass_result_starving_later_kinds);
+        assert!(
+            observe_count >= 1,
+            "the starved sequence still runs Observe"
+        );
+        assert_ne!(
+            host_bridge_at,
+            Some(8),
+            "rewriting next to Observe must miss the HostBridge bound"
+        );
+        assert_ne!(
+            subscriber_at,
+            Some(10),
+            "rewriting next to Observe must miss the SubscriberDelivery bound"
+        );
+        assert!(
+            host_bridge_at.is_none() && subscriber_at.is_none(),
+            "continuous Observe rewrite must starve later kinds"
+        );
     }
 
     #[test]
