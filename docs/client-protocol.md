@@ -1737,7 +1737,7 @@ does not require it. Clients that want live package events Hello with
 `DaemonCompatibilityRequirement::for_package_event_subscriptions()` or
 `connect_for_package_event_subscriptions()`. `PROTOCOL_VERSION` remains
 7. Advertising this feature advances `CONFORMANCE_FIXTURE_REVISION` to
-43. The default client requirement stays at revision 36.
+44. The default client requirement stays at revision 36.
 
 `SubscribeEvents` and `UnsubscribeEvents` are ordinary one-shot host
 requests. They do not take over a Unix socket. Delivery uses unsolicited

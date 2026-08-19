@@ -5,14 +5,16 @@
 - Target repository: `botster-hub` (`trybotster/botster-hub`)
 - Target id: `tgt_7e208a0c76a44980a83b63af976b1f22`
 - Ticket: `ticket_1786663583_640263`
-- Run: `run_1786867268_135671`
-- Implement step: `run_step_1786873840_503254` (review return)
-- Approved plan: `docs/plans/expose-client-event-subscriptions-on-the-host-control-protocol.md` at `6f1f5cf`
+- Run: `run_1787158085_722550`
+- Implement step: `run_step_1787159472_279191`
+- Approved plan: `docs/plans/expose-client-event-subscriptions-on-the-host-control-protocol.md` at `98ae1f9`
+- Plan Review: `review_1787159455_211294` approved
 - `teardown_class_applies`: no
 - Direct-merge pipeline. No pull request.
 
-Independent `list_spawn_targets` maps `tgt_7e208a0c76a44980a83b63af976b1f22` to
-`trybotster/botster-hub`. This run used the pipeline worktree for that target.
+`BOTSTER_TARGET_ID` and spawn-target routing both map
+`tgt_7e208a0c76a44980a83b63af976b1f22` to `trybotster/botster-hub`. This run
+used the pipeline-provided ticket worktree for that target.
 
 ## Repository playbook and other playbooks/notes applied
 
@@ -28,220 +30,196 @@ Repository charters:
 
 Vault notes that constrained the change:
 
-- [[current botster is a modular repository family not the legacy trybotster monorepo]]
 - [[botster hub is a first party host profile over core]]
 - [[botster data plane bypasses the hub through session and client actors]]
-- [[botster packages should enforce core hub cli plugin provider boundaries]]
+- [[botster local client api lives over hubruntime not raw core routers]]
 - [[exact owner plus name is the only package event subscription key]]
-- [[botster hub events use bounded priority lanes instead of unbounded queue fuses]]
+- [[Package-event subject filters are exact strings compiled at admission]]
+- [[Client event holders are connection-scoped]]
+- [[Client event subscriptions stay on the multiplexed host-control path]]
+- [[Fair host-control writing selects already-admitted frames]]
+- [[Host package-event negotiation survives terminal admission rejection]]
 - [[events.emit is a non-blocking router ingress not an owner-pumped host bridge]]
 - [[Unix Hello can reject terminal admission while host operations remain available]]
+- [[Unix mux host events are unsolicited control frames]]
+- [[WebRTC host events use unsolicited daemon-event delivery]]
+- [[Unix mux host frames flush before new terminal slots]]
 - [[additive daemon capabilities do not raise the default client requirement]]
+- [[daemon event shape changes bump conformance fixture revision not protocol version]]
 - [[hub generated protocol changes are a four site release chain]]
 - [[generated typescript dtos must encode serde field optionality]]
 - [[public dto field additions are source breaking without non exhaustive]]
+- [[scratch cargo patch redirects measure downstream dto breakage]]
 - [[Hub test support capability cutovers use a new unpublished package version]]
 - [[hub test support npm releases need external consumer smoke]]
+- [[Git-consumed Hub members pin Core protocol by exact revision]]
+- [[test script required for rust tests not cargo test]]
+- [[implement gate must verify committed work and pr link before review]]
+- [[implementation steps must persist report artifacts for review]]
+- [[pipeline vault checklists must cite exact resolvable note titles]]
+- [[pipeline artifacts should use path neutral worktree references]]
 
-No loaded convention conflicted with the approved plan.
+Convention conflicts: none.
+
+Checklist: reused `checklist_1786867714_922206` as required. Botster MCP was
+down in this agent session, so Implement evidence is also in this report and
+gate payload.
 
 ## Files changed
 
 Public contract:
 
-- `crates/botster-hub-client/src/lib.rs`
-- `crates/botster-hub-client/src/typescript.rs`
-- `crates/botster-hub-client/generated/daemon-protocol.ts`
+- `crates/botster-hub-client/src/lib.rs` — `SubscribeEvents` /
+  `UnsubscribeEvents`, `EventSubscribed` / `EventUnsubscribed`,
+  `PackageEvent` / `EventGap`, `FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS`,
+  `for_package_event_subscriptions()`, connection helper, mux classification,
+  conformance revision 44
+- `crates/botster-hub-client/src/typescript.rs` — generated DTO emission
+- `crates/botster-hub-client/generated/daemon-protocol.ts` — `subjects?`,
+  `subscribe_events`, `unsubscribe_events`, `package_event`, `event_gap`
+
+Hub host control:
+
+- `src/daemon_event_subscriptions.rs` — connection-scoped holders, subject
+  admission ceilings, mailboxes, gap bits, coalesced wake, cleanup retry
+- `src/host_control_fair_write.rs` — ready-set selection among control,
+  entity, and event
+- `src/package_event_router.rs` — client holders, compiled subject match,
+  non-blocking client fanout
+- `src/daemon_transport.rs` — host compatibility record, Unix mux Subscribe
+  path, fair write, connection cleanup, owner-loop cleanup retry
+- `src/local_webrtc.rs` — multiplexed Subscribe path, fair `try_recv`,
+  EventGap live harness
+- `src/lib.rs`, `src/main.rs` — module wiring and event display
+- `src/unix_terminal_adapter.rs`, `src/webrtc_terminal_adapter.rs` — pending
+  event readiness only; no adapter API calls on the event flood path
+
+Release and proof:
+
+- `packages/hub-test-support/*` — unpublished `0.1.39` at revision 44
+- `examples/event-plane-producer/botster-package.json` — `clients` audience
 - `docs/client-protocol.md`
-- `README.md`
-
-Host control and router:
-
-- `src/daemon_event_subscriptions.rs` (new)
-- `src/host_control_fair_write.rs` (new)
-- `src/package_event_router.rs`
-- `src/daemon_transport.rs`
-- `src/local_webrtc.rs`
-- `src/unix_terminal_adapter.rs`
-- `src/webrtc_terminal_adapter.rs`
-- `src/lib.rs`
-- `src/main.rs`
-
-Support package and fixtures:
-
-- `packages/hub-test-support/*` version `0.1.38`, protocol, matrix, metadata
-- `crates/botster-hub-test-support/src/lib.rs`
-- `examples/event-plane-producer/botster-package.json`
-
-Tests:
-
 - `tests/hub_daemon_lifecycle/package_event_plane.rs`
-- `tests/hub_daemon_lifecycle/sessions.rs`
-- `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs`
 - `tests/hub_daemon_lifecycle/webrtc_terminal_adapter.rs`
 
 ## Ownership boundaries preserved
 
-Hub owns host-control admission, client event mailboxes, fair host-control
-writing, and the in-repo `botster-hub-client` crate.
+Hub owns host-control admission, connection-scoped event egress, and fair
+host-control writing. The in-repo `botster-hub-client` crate owns public DTOs
+and compatibility descriptors.
 
-`botster-hub-client` owns public DTOs, compatibility descriptors, generated
-TypeScript, and conformance revision 43.
+Core pin stays
+`https://github.com/trybotster/botster-core.git`
+rev `8fce2041b9fe742cb2a6df9e74cb262606672742`. This ticket does not change
+Core.
 
-Package events stay on the multiplexed host-control path. They do not take
-over a Unix socket. They do not use `EntityFrameSender`. Terminal adapter
-files gained only `has_pending_event` peeks. Hub does not inspect terminal
-bodies.
+Terminal bytes stay in SessionIo and ClientWorker. Package events do not
+enter the exclusive Unix entity socket. Occupancy, Unix admission acks,
+adapter close-work, owner-loop background scheduling, snapshot paging, and
+ShutdownSession exact-generation suppression remain from merged blockers.
 
-Host `required_features` live on `PendingRuntimeState.host_compatibility`,
-keyed by Unix `client_id` or WebRTC `grant_id`. They are not read from
-`UnixTerminalAdmission` or `WebrtcTerminalAdmission`.
+No Workspaces or Project Pipelines product event names in Hub.
 
 ## Cross-repo dependencies or separately routed work
 
-Closed prerequisites:
+Registered downstream consumers stay separate:
 
-- `ticket_1786663582_483898` (Stage B router)
-- `ticket_1786661010_198387` (terminal drain cold-cut)
+- `ticket_1786663584_427840` botster-web
+- `ticket_1786663585_944018` botster-tui
 
-Registered downstream consumers, not implemented here:
+This run does not vendor into those repositories. TUI scratch cargo-patch
+compile against this `botster-hub-client` succeeded with zero source
+breakage (TUI SHA `dc7d600`). Web scratch install of packed `0.1.39` typechecks.
+`npm test` reports expected vendored-protocol drift; that is the Web ticket's
+site-4 work.
 
-- `ticket_1786663584_427840` (`botster-web`)
-- `ticket_1786663585_944018` (`botster-tui`)
-
-New same-target blocker, not implemented here:
-
-- `ticket_1786875812_242946` (`botster-hub`) default-concurrency
-  `./test.sh --locked` determinism. Registered as
-  `dependency_1786875816_371966`.
-
-No Core pin change. Pin remains
-`fc541a59338d0591ba4fb3fa522a030d212d26d0`.
+No new Core, Web, TUI, or Workspaces dependency.
 
 ## Deviations from plan
 
-- Unpublished support coordinate is `0.1.38`. Registry latest published is
-  `0.1.36`. Tree `0.1.37` was already reserved by the prior unpublished
-  cold-cut ticket. `npm whoami` still returns 401. Blocking human question
-  `question_1786874473_381921` is open.
-- The 4,096-byte subject aggregate is the product of 16 × 256 UTF-8 bytes.
-  The admission test proves 4,096 unique bytes are accepted. A 4,097-byte
-  case cannot occur without first violating the 16-count or 256-byte rule.
-- IsolatedHub Unix EventGap under 129 live emits is not a reliable fill.
-  The live writer drains a 1-slot mailbox between emits. EventGap live
-  proof fills the mailbox on the holder, then the production WebRTC writer
-  emits one gap with no later event.
-- `./test.sh --locked` still has no clean default-concurrency pass. Human
-  answer `question_1786875726_281871` refused a waiver. Blocker ticket
-  `ticket_1786875812_242946` (`run_1786875818_402849`, origin/main) is a
-  registered dependency. This branch will refresh after that merge and
-  then run one clean `./test.sh --locked`.
+None in product scope. Replay resolved conflicts by keeping both occupancy
+and package-event behavior.
 
-No accepted product-scope change required a plan rewrite.
+Release coordinate: registry latest remains orphan `0.1.38`. This run takes
+unpublished `0.1.39` / conformance revision 44 as planned.
+
+`npm whoami` is 401 and `npm publish` returns 404/unauthorized. Packed
+tarball `trybotster-hub-test-support-0.1.39.tgz` (shasum
+`03f47f651e272a52ebf2e6a5e2bea2e2fe7b6851`) contains revision 44,
+`package_event_subscriptions` in `supported_features` only, and the new DTO
+tokens. Publication needs restored npm auth, same as prior
+`question_1786874473_381921`.
+
+Botster MCP handshake failed in this agent session. Workflow evidence is
+recorded here and will be persisted through Project Pipelines tools when
+available.
 
 ## Tests and downstream proof run
 
-Wire and unit:
+Live IsolatedHub production path:
 
-- Hub-client serde, generated TypeScript `subjects?`, and
-  `for_package_event_subscriptions()` compatibility tests passed.
-- Subject ceilings, connection-scoped holders, 64/65 cap, and EventGap
-  outside the mailbox passed.
-- Fair-write ready-set tests passed.
-- Unix partial `PackageEvent` write resume passed.
-- Disconnect cleanup keeps the router holder until `try_cleanup` returns
-  Accepted. A held-lock contention test proves the holder disappears after
-  retry.
-- A missed `notify_waiters` is recovered by consuming `wake_bit`.
+- Unix negotiated `SubscribeEvents` delivers unsolicited `PackageEvent`
+- Unix unnegotiated subscribe is a typed error
+- Unix Hello that fails terminal compatibility still Status + SubscribeEvents
+- Unix reconnect does not replay
+- Unix subject/audience admission returns typed operator errors
+- WebRTC IsolatedHub delivers unsolicited `PackageEvent` on a negotiated
+  DataChannel
 
-Live IsolatedHub, Unix:
+Unit and mux:
 
-- Negotiated `SubscribeEvents` received unsolicited `PackageEvent` for
-  `event-plane-producer` / `sample.ready`.
-- Unnegotiated helper sent no request. One-shot unnegotiated request
-  returned `package_event_subscriptions_not_negotiated`.
-- Rejected terminal Hello still allowed Status, subscribe, and event
-  delivery.
-- Reconnect delivered no prior event.
-- Wildcard and undeclared subscribe returned typed operator errors.
+- subject UTF-8 ceilings, 64/65 cap, connection-scoped holders, gap-first
+  write, missed-notify wake bit, cleanup retry
+- fair ready-set among control/entity/event
+- DTO omit replay/empty subjects; operation-specific requirement
+- WebRTC harness EventGap after a full mailbox
+- Unix partial `PackageEvent` line resumes without interleaving
 
-Live IsolatedHub / WebRTC:
+Merged-blocker named tests still pass:
 
-- Unnegotiated WebRTC `SubscribeEvents` returned
-  `package_event_subscriptions_not_negotiated`. Status still succeeded.
-- Negotiated WebRTC subscribe with no contract returned
-  `rejected_undeclared`. Status still succeeded after rejected terminal
-  Hello.
-- IsolatedHub WebRTC through a `botster-web` bootstrap received an
-  unsolicited `PackageEvent` for `event-plane-producer` / `sample.ready`
-  without later traffic. Status and `SubscribeEntities` still succeeded.
-- Live WebRTC DataChannel writer delivered `EventGap` first after a full
-  one-event mailbox, then the queued event, then a live `PackageEvent`
-  after drain. Status and entity subscribe still progressed. Terminal
-  admission stayed rejected.
+- `near_limit_snapshot_assembly_stays_within_owner_turn`
+- `snapshot_page_charges_the_real_envelope_not_a_stub`
+- `shutdown_session_arm_installs_exact_suppression_before_core_request`
+- `close_event_suppression_matrix_matches_prior_predicate`
 
 Repo gates:
 
 - `cargo build --locked -p botster-core-daemon --bin botster-session-worker`
+- `./test.sh --locked` — one clean default-concurrency pass, 0 failures
+  (lifecycle 263 passed / 1 ignored)
 - `cargo fmt --all -- --check`
-- `cargo clippy --workspace --all-targets --locked --offline -- -D warnings`
-- `cargo test --doc --workspace --offline --locked`
-- `cargo test --workspace --locked --offline --exclude botster-hub`
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`
+- `cargo test --doc --workspace`
 - `node packages/hub-test-support/scripts/sync-assets.mjs --check`
+- `node packages/hub-test-support/test.mjs`
 
-Three `./test.sh --locked --offline` default-concurrency runs after the
-review fixes did not produce one clean pass. Isolated and base evidence:
+Live provenance under this checkout:
 
-| Suite failure | Isolated branch | Isolated origin/main `60b79b8` |
-| --- | --- | --- |
-| `cli_smoke_proves_local_runtime_daemon_package_app_session_and_webrtc` | pass | pass |
-| `ready_spawn_stays_within_budget_when_live_sessions_exceed_one_observe_slice` | pass | pass |
-| `near_limit_snapshot_assembly_stays_within_owner_turn` | pass | fail |
-
-The owner-turn assert lives in `src/daemon_entity_subscriptions.rs` and
-is not part of this ticket's files. Human answer
-`question_1786875726_281871` refused a waiver and required a separate
-blocker. That ticket is `ticket_1786875812_242946`.
-
-Downstream TUI:
-
-- Scratch worktree `/tmp/botster-tui-event-probe` at
-  `fc1ff6238ae707c355febbc03eeab5130cccf91c`
-- Cargo patch onto this worktree's `botster-hub-client`
-- `cargo check -p botster-tui --offline` succeeded in 1m 51s
-- Adding request/event variants did not require TUI source edits
-- Worktree was not committed
-
-Downstream Web and npm publish are recorded after this commit, because
-the publish script requires a clean worktree.
-
-Live IsolatedHub Unix emit recorded:
-
-- Hub SHA at proof time: worktree dirty on top of `6f1f5cf`
-- Locked Core SHA: `fc541a59338d0591ba4fb3fa522a030d212d26d0`
-- Binaries under this checkout `target/debug/`
+- Hub SHA after the product replay commits: `4aeec2f`
+- Version-bump commit follows this report
+- Locked Core SHA `8fce2041b9fe742cb2a6df9e74cb262606672742`
+- Hub binary realpath is the ticket worktree `target/debug/botster-hub`
 
 ## Unverified behavior or residual risk
 
-- One clean `./test.sh --locked` default-concurrency pass was not obtained.
-  Human answer refused a waiver. Repair lives on
-  `ticket_1786875812_242946`. This ticket waits for that merge, then
-  refreshes and reruns the suite.
-- `@trybotster/hub-test-support@0.1.38` is packed but not published. Web
-  scratch proof against 0.1.38 is blocked until npm auth or a waiver.
-- Saturated-event load campaign remains `ticket_1786663585_879846`.
-- Web and TUI do not vendor this protocol in this run.
+- `@trybotster/hub-test-support@0.1.39` is packed and locally proven, not
+  published. Web and TUI cannot consume a registry coordinate until npm auth
+  is restored.
+- IsolatedHub Unix EventGap under a live emit flood is not a reliable fill
+  because the writer can drain the 1-slot mailbox between emits. EventGap is
+  proved on the WebRTC harness and in unit tests.
+- Ready-set order treats WebRTC close events and package events as one Event
+  class, as the plan allowed.
 
 ## Missing vault guidance discovered
 
-None that blocked implementation. After merge, capture:
+Captured after replay proof:
 
-- Client `SubscribeEvents` stays multiplexed and never takes over the socket.
-- Subject filters are exact `payload.subject` strings with 16 / 256 / 4,096 /
-  64 ceilings.
-- Client holders are connection-scoped. Public unsubscribe is
-  `subscription_id` only.
-- Host package-event negotiation lives on a connection host compatibility
-  record and survives terminal admission rejection.
-- Fair host-control writing selects already-admitted control, entity, and
-  event frames, including a gap bit outside the mailbox.
+- An unmerged run that publishes an npm coordinate burns it.
+- A closed run's implement commits can dangle with no branch; recover the
+  tip and protect it with a `keep/<ticket>` tag before replay.
+
+Inbox files:
+
+- `an-unmerged-run-that-publishes-an-npm-coordinate-burns-it.md`
+- `closed-run-implement-commits-can-dangle-without-a-branch.md`
