@@ -127,10 +127,6 @@ pub use credentials::{
 pub use daemon::{
     HubDaemon, HubDaemonError, HubDaemonResult, HubDaemonState, HubDaemonStatus, HubStateLoadSource,
 };
-#[doc(hidden)]
-pub use daemon_maintenance::{
-    EventDeliveryFlight, MaintenanceSliceKind, MaintenanceState, run_maintenance_kind,
-};
 pub use daemon_maintenance::{MAX_OWNER_TURN_MS, MAX_READY_OPERATION_WAIT_MS};
 pub use daemon_transport::{
     DaemonApp, DaemonAppLaunchTarget, DaemonAttachOccupancy, DaemonAvailablePackage,

@@ -20,8 +20,8 @@ use botster_hub::package_event_router::{
 use botster_hub::{
     DataDirectoryOption, HostIdentityOptions, HubClientApi, HubClientRequest,
     HubClientResponseBody, HubRuntime, HubStartupOptions, LuaPluginHostApi, LuaPluginRuntime,
-    MaintenanceSliceKind, MaintenanceState, PackageRegistry, RuntimeEnvironment, SessionDefaults,
-    SpawnTarget, TransportBindings, Worktree, default_package_policy, run_maintenance_kind,
+    PackageRegistry, RuntimeEnvironment, SessionDefaults, SpawnTarget, TransportBindings, Worktree,
+    default_package_policy,
 };
 use botster_ui_contract::{UiActionRequest, UiActionResultState, UiAuthoredNodeId, UiNodeKind};
 
@@ -1408,81 +1408,6 @@ fn drive_package_events_keeps_ownership_when_settle_stays_busy() {
         .expect("occupancy after later settle");
     assert_eq!(restored.queued_holders, 0);
     assert_eq!(restored.global_in_flight_bytes, 0);
-}
-
-#[test]
-fn owner_loop_queues_and_completes_two_fanout_plugin_handlers() {
-    let registry = install_event_probe_registry("event-probe-owner-loop-fanout");
-    let mut hub = explicit_runtime("event-probe-owner-loop-fanout");
-    hub.load_lua_plugin_package(&registry, "event-probe.plugin")
-        .expect("load event probe plugin");
-    let created = serde_json::json!({
-        "event": "worktree_created",
-        "worktree_id": "wt_1",
-        "target_id": "tgt_1",
-    });
-    assert_eq!(
-        hub.package_event_router()
-            .try_ingress(
-                "hub",
-                "worktree_created",
-                &created,
-                std::time::Instant::now()
-            )
-            .as_str(),
-        "accepted"
-    );
-    let mut state = MaintenanceState::default();
-    run_maintenance_kind(&hub, &mut state, MaintenanceSliceKind::PackageEventDelivery);
-    assert_eq!(
-        state.event_in_flight.len(),
-        2,
-        "both plugin handlers must queue through Core: {state:?}"
-    );
-    let request_ids: Vec<String> = state.event_in_flight.keys().cloned().collect();
-    assert_ne!(request_ids[0], request_ids[1]);
-    assert!(
-        request_ids
-            .iter()
-            .all(|id| id.starts_with("package-event-hub-worktree_created-")),
-        "production request ids must stay on the owner-loop format: {request_ids:?}"
-    );
-    let scopes: Vec<u64> = state
-        .event_in_flight
-        .values()
-        .filter_map(|flight| flight.scope_id)
-        .collect();
-    assert_eq!(scopes.len(), 2);
-    assert_eq!(hub.package_event_router().test_outstanding_pulls(), 2);
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline
-        && (!state.event_in_flight.is_empty() || !state.pending_retirements.is_empty())
-    {
-        run_maintenance_kind(&hub, &mut state, MaintenanceSliceKind::CompletionDrain);
-        if !state.event_in_flight.is_empty() || !state.pending_retirements.is_empty() {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-    assert!(
-        state.event_in_flight.is_empty(),
-        "both Core completions must retire their flights: {state:?}"
-    );
-    assert!(state.pending_retirements.is_empty());
-    assert_eq!(hub.package_event_router().test_outstanding_pulls(), 0);
-    let _ = hub.causal_scopes().flush_pending();
-    for scope_id in scopes {
-        assert!(
-            !hub.causal_scopes().is_live(scope_id),
-            "completion must release causal scope {scope_id}"
-        );
-    }
-    let snapshot = hub
-        .package_event_router()
-        .snapshot()
-        .expect("occupancy after owner-loop drain");
-    assert_eq!(snapshot.queued_holders, 0);
-    assert_eq!(snapshot.admitted_holders, 0);
-    assert_eq!(snapshot.global_in_flight_bytes, 0);
 }
 
 fn completed_payloads(outcomes: &[botster_core::PluginCompletion]) -> Vec<serde_json::Value> {

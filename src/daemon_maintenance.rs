@@ -1869,7 +1869,7 @@ pub fn assert_maintenance_source_stays_control_plane(source: &str) {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use botster_core_daemon::ObserveLifecyclePassId;
 
@@ -3677,6 +3677,124 @@ mod tests {
         assert_eq!(snapshot.queued_holders, 0);
         assert_eq!(snapshot.admitted_holders, 0);
         assert_eq!(snapshot.global_in_flight_bytes, 0);
+        let _ = std::fs::remove_dir_all(data_directory);
+    }
+
+    fn install_event_probe_registry(name: &str) -> (crate::packages::PackageRegistry, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "hub-event-probe-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create event probe package root");
+        std::fs::write(
+            root.join("plugin.lua"),
+            r#"
+events.on("hub", "worktree_created", function(event)
+  return {
+    received = event.event,
+    worktree_id = event.worktree_id,
+    target_id = event.target_id,
+  }
+end)
+
+events.on("hub", "worktree_created", function(event)
+  return {
+    received = event.event,
+    observer = "second",
+    worktree_id = event.worktree_id,
+  }
+end)
+
+return botster.register({})
+"#,
+        )
+        .expect("write event probe plugin");
+        std::fs::write(
+            root.join("botster-package.json"),
+            serde_json::json!({
+                "name": "event-probe.plugin",
+                "version": "1.0.0",
+                "kind": "plugin",
+                "botster": ">=0.1.0",
+                "source": { "type": "path", "path": root.display().to_string() },
+                "capabilities": [],
+                "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+            })
+            .to_string(),
+        )
+        .expect("write event probe manifest");
+        let mut policy = crate::default_package_policy();
+        policy
+            .install_local_path(&root, "install event probe lua package")
+            .expect("install event probe package");
+        policy
+            .enable("event-probe.plugin", "enable event probe package")
+            .expect("enable event probe package");
+        (policy.registry().clone(), root)
+    }
+
+    #[test]
+    fn owner_loop_queues_and_completes_two_fanout_plugin_handlers() {
+        let (registry, package_root) = install_event_probe_registry("owner-loop-fanout");
+        let (mut runtime, data_directory) = event_delivery_runtime("owner-loop-fanout");
+        runtime
+            .load_lua_plugin_package(&registry, "event-probe.plugin")
+            .expect("load event probe plugin");
+        ingress_worktree_created(&runtime);
+        let mut state = MaintenanceState::default();
+        run_package_event_delivery_slice(&runtime, &mut state);
+        assert_eq!(
+            state.event_in_flight.len(),
+            2,
+            "both plugin handlers must queue through Core: {state:?}"
+        );
+        let request_ids: Vec<String> = state.event_in_flight.keys().cloned().collect();
+        assert_ne!(request_ids[0], request_ids[1]);
+        assert!(
+            request_ids
+                .iter()
+                .all(|id| id.starts_with("package-event-hub-worktree_created-")),
+            "production request ids must stay on the owner-loop format: {request_ids:?}"
+        );
+        let scopes: Vec<u64> = state
+            .event_in_flight
+            .values()
+            .filter_map(|flight| flight.scope_id)
+            .collect();
+        assert_eq!(scopes.len(), 2);
+        assert_eq!(runtime.package_event_router().test_outstanding_pulls(), 2);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline
+            && (!state.event_in_flight.is_empty() || !state.pending_retirements.is_empty())
+        {
+            run_completion_drain_slice(&runtime, &mut state);
+            if !state.event_in_flight.is_empty() || !state.pending_retirements.is_empty() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert!(
+            state.event_in_flight.is_empty(),
+            "both Core completions must retire their flights: {state:?}"
+        );
+        assert!(state.pending_retirements.is_empty());
+        assert_eq!(runtime.package_event_router().test_outstanding_pulls(), 0);
+        let _ = runtime.causal_scopes().flush_pending();
+        for scope_id in scopes {
+            assert!(
+                !runtime.causal_scopes().is_live(scope_id),
+                "completion must release causal scope {scope_id}"
+            );
+        }
+        let snapshot = runtime.package_event_router().snapshot().expect("snapshot");
+        assert_eq!(snapshot.queued_holders, 0);
+        assert_eq!(snapshot.admitted_holders, 0);
+        assert_eq!(snapshot.global_in_flight_bytes, 0);
+        let _ = std::fs::remove_dir_all(package_root);
         let _ = std::fs::remove_dir_all(data_directory);
     }
 }
