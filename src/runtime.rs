@@ -3167,7 +3167,9 @@ impl HubRuntime {
     /// Admit ready package-event deliveries and wait for completions.
     ///
     /// Production delivery uses the owner-loop `PackageEventDelivery` slice.
-    /// Tests use this helper when they do not own that loop.
+    /// Tests use this helper when they do not own that loop. It drains every
+    /// currently queued copy and retries backpressured admission until the
+    /// deadline; it does not stop after one wall-clock-bounded pull.
     pub fn drive_package_events_for_test(&self) -> Vec<botster_core::PluginCompletion> {
         use std::time::{Duration, Instant};
 
@@ -3176,76 +3178,85 @@ impl HubRuntime {
             PluginInvocationResult,
         };
 
-        let batch = self
-            .package_event_router
-            .pull_ready_batch(16, 64 * 1024, Instant::now(), Duration::from_millis(20))
-            .unwrap_or_default();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut pending = Vec::new();
         let mut waiting = Vec::new();
-        for delivery in batch {
-            let Some(handler) = self.package_event_handler(
-                &delivery.holder.plugin_key,
-                &delivery.owner,
-                &delivery.name,
-                &delivery.holder.handler_id,
-            ) else {
-                let _ = self.package_event_router.retire_holder(
-                    delivery.envelope_id,
+        let mut outcomes = Vec::new();
+        while Instant::now() < deadline {
+            let batch = self
+                .package_event_router
+                .pull_ready_batch(16, 64 * 1024, Instant::now(), Duration::from_secs(5))
+                .unwrap_or_default();
+            pending.extend(batch);
+
+            let mut still_pending = Vec::new();
+            for delivery in pending.drain(..) {
+                let Some(handler) = self.package_event_handler(
                     &delivery.holder.plugin_key,
-                    delivery.holder.generation,
-                );
-                continue;
-            };
-            let request_id = RequestId(format!(
-                "package-event-test-{}-{}",
-                delivery.name, delivery.envelope_id
-            ));
-            let _ = self.causal_scopes.mint_with_lease(Some(
-                crate::package_event_router::LeaseIdentity::EventInFlight {
-                    request_id: request_id.0.clone(),
-                },
-            ));
-            match self.try_admit_plugin(
-                PluginInvocationClass::Background,
-                PluginInvocationRequest {
-                    request_id: request_id.clone(),
-                    handler: handler.handler,
-                    timeout_ms: 1_000,
-                    context: PluginInvocationContext {
-                        client_id: None,
-                        session_id: None,
-                        subscription_id: None,
-                        surface_id: None,
-                        origin: Some("package-event-test".to_string()),
-                        metadata: None,
-                    },
-                    payload: BoundaryJson(delivery.payload_json),
-                },
-            ) {
-                PluginAdmissionResult::Queued { .. } => {
-                    let _ = self.package_event_router.note_admitted(
-                        delivery.envelope_id,
-                        &delivery.holder.plugin_key,
-                        delivery.holder.generation,
-                    );
-                    waiting.push((
-                        request_id.0,
-                        delivery.envelope_id,
-                        delivery.holder.plugin_key,
-                        delivery.holder.generation,
-                    ));
-                }
-                _ => {
+                    &delivery.owner,
+                    &delivery.name,
+                    &delivery.holder.handler_id,
+                ) else {
                     let _ = self.package_event_router.retire_holder(
                         delivery.envelope_id,
                         &delivery.holder.plugin_key,
                         delivery.holder.generation,
                     );
+                    continue;
+                };
+                let request_id = RequestId(format!(
+                    "package-event-test-{}-{}-{}",
+                    delivery.name, delivery.envelope_id, delivery.holder.handler_id
+                ));
+                let _ = self.causal_scopes.mint_with_lease(Some(
+                    crate::package_event_router::LeaseIdentity::EventInFlight {
+                        request_id: request_id.0.clone(),
+                    },
+                ));
+                match self.try_admit_plugin(
+                    PluginInvocationClass::Background,
+                    PluginInvocationRequest {
+                        request_id: request_id.clone(),
+                        handler: handler.handler,
+                        timeout_ms: 1_000,
+                        context: PluginInvocationContext {
+                            client_id: None,
+                            session_id: None,
+                            subscription_id: None,
+                            surface_id: None,
+                            origin: Some("package-event-test".to_string()),
+                            metadata: None,
+                        },
+                        payload: BoundaryJson(delivery.payload_json.clone()),
+                    },
+                ) {
+                    PluginAdmissionResult::Queued { .. } => {
+                        let _ = self.package_event_router.note_admitted(
+                            delivery.envelope_id,
+                            &delivery.holder.plugin_key,
+                            delivery.holder.generation,
+                        );
+                        waiting.push((
+                            request_id.0,
+                            delivery.envelope_id,
+                            delivery.holder.plugin_key,
+                            delivery.holder.generation,
+                        ));
+                    }
+                    PluginAdmissionResult::Backpressured { .. } => {
+                        still_pending.push(delivery);
+                    }
+                    _ => {
+                        let _ = self.package_event_router.retire_holder(
+                            delivery.envelope_id,
+                            &delivery.holder.plugin_key,
+                            delivery.holder.generation,
+                        );
+                    }
                 }
             }
-        }
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let mut outcomes = Vec::new();
-        while !waiting.is_empty() && Instant::now() < deadline {
+            pending = still_pending;
+
             let drain = self.drain_plugin_completions(16, 64 * 1024);
             for completion in drain.completions {
                 let request_id = match &completion.result {
@@ -3265,9 +3276,15 @@ impl HubRuntime {
                     outcomes.push(completion);
                 }
             }
-            if !waiting.is_empty() {
-                std::thread::sleep(Duration::from_millis(5));
+
+            let more_queued = self
+                .package_event_router
+                .snapshot()
+                .is_ok_and(|snapshot| snapshot.queued_holders > 0);
+            if pending.is_empty() && waiting.is_empty() && !more_queued {
+                break;
             }
+            std::thread::sleep(Duration::from_millis(5));
         }
         outcomes
     }

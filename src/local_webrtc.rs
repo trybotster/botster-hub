@@ -1264,7 +1264,8 @@ where
             request
         } else {
             let mailbox = peer_state.event_plane.mailbox(&peer_state.grant_id);
-            if host_event_ready(peer_state)
+            if pending_entity.is_some()
+                || host_event_ready(peer_state)
                 || mailbox.as_ref().is_some_and(|mailbox| mailbox.take_wake())
             {
                 continue;
@@ -2009,8 +2010,11 @@ async fn flush_ready_webrtc_host_control<D>(
 where
     D: LocalWebrtcDataChannel + ?Sized,
 {
-    use crate::host_control_fair_write::{HostControlClass, next_ready_host_control_class};
+    use crate::host_control_fair_write::{
+        HostControlClass, MAX_HOST_FRAMES_PER_FLUSH_TURN, next_ready_host_control_class,
+    };
 
+    let mut host_frames = 0;
     loop {
         if pending_entity.is_none()
             && let Ok(frame) = entity_frame_rx.try_recv()
@@ -2024,13 +2028,18 @@ where
             *pending_entity = None;
             continue;
         }
+        let control_ready = webrtc_control_request_ready(pending_requests);
         match next_ready_host_control_class(
             *last_host_class,
-            false,
+            control_ready,
             entity_ready,
             host_event_ready(peer_state),
         ) {
+            Some(HostControlClass::Control) => return Ok(()),
             Some(HostControlClass::Entity) => {
+                if host_frames >= MAX_HOST_FRAMES_PER_FLUSH_TURN {
+                    return Ok(());
+                }
                 let Some(frame) = pending_entity.take() else {
                     return Ok(());
                 };
@@ -2048,8 +2057,12 @@ where
                     peer_state,
                 )
                 .await?;
+                host_frames += 1;
             }
             Some(HostControlClass::Event) => {
+                if host_frames >= MAX_HOST_FRAMES_PER_FLUSH_TURN {
+                    return Ok(());
+                }
                 let Some(event) = take_host_event(peer_state) else {
                     return Ok(());
                 };
@@ -2073,10 +2086,22 @@ where
                     peer_state,
                 )
                 .await?;
+                host_frames += 1;
             }
-            Some(HostControlClass::Control) | None => return Ok(()),
+            None => return Ok(()),
         }
     }
+}
+
+fn webrtc_control_request_ready(pending_requests: &VecDeque<PendingLocalWebrtcRequest>) -> bool {
+    pending_requests.iter().any(|pending| {
+        matches!(
+            pending,
+            PendingLocalWebrtcRequest::Request(_)
+                | PendingLocalWebrtcRequest::Hello(_)
+                | PendingLocalWebrtcRequest::QueueOverflow(_)
+        )
+    })
 }
 
 #[allow(dead_code)]
@@ -5759,6 +5784,64 @@ mod tests {
                 .pending_runtime
                 .webrtc_is_admitted(&peer.grant_id),
             "event delivery must not create a terminal adapter"
+        );
+        peer.close_offer();
+        harness.cleanup();
+    }
+
+    #[test]
+    fn webrtc_status_and_entity_progress_under_event_flood() {
+        let _teardown_guard = teardown_test_lock();
+        let mut harness = PeerHarness::new_with_event_queue("evt-flood", Some(8));
+        harness.enable_event_plane_producer();
+        let mut peer = harness.signal_peer("http://127.0.0.1:41912");
+        harness.hello_on_peer(
+            &mut peer,
+            DaemonHello {
+                protocol: PROTOCOL.to_string(),
+                compatibility:
+                    botster_hub_client::DaemonCompatibilityRequirement::for_package_event_subscriptions(),
+                terminal_compatibility: None,
+            },
+        );
+        peer.enable_host_events();
+        let subscribed = harness.request_on_peer(
+            &mut peer,
+            DaemonRequest::SubscribeEvents {
+                subscription_id: "sub-flood".to_string(),
+                owner: "event-plane-producer".to_string(),
+                name: "sample.ready".to_string(),
+                subjects: Vec::new(),
+            },
+            "SubscribeEvents",
+        );
+        assert_eq!(
+            subscribed.kind,
+            botster_hub_client::DaemonResponseKind::EventSubscribed
+        );
+        let mailbox = harness
+            .daemon
+            .local_webrtc()
+            .event_plane()
+            .mailbox(&peer.grant_id)
+            .expect("subscribed connection has a mailbox");
+        for index in 0..8 {
+            mailbox
+                .try_push(
+                    "sub-flood",
+                    "event-plane-producer",
+                    "sample.ready",
+                    serde_json::json!({ "ok": true, "token": format!("flood-{index}") }),
+                    8,
+                )
+                .expect("admit flood event");
+        }
+        let status = harness.request_on_peer(&mut peer, DaemonRequest::Status, "Status");
+        assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
+        let entities = harness.subscribe_entities(&mut peer, "entity-under-event-flood");
+        assert_eq!(
+            entities.kind,
+            botster_hub_client::DaemonResponseKind::EntitySubscribed
         );
         peer.close_offer();
         harness.cleanup();

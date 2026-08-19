@@ -121,12 +121,12 @@ struct QueuedClientEvent {
 struct MailboxInner {
     events: VecDeque<QueuedClientEvent>,
     bytes: usize,
-    gap_bits: HashMap<String, (String, String)>,
 }
 
 /// Bounded per-connection mailbox plus per-subscription gap bits.
 pub(crate) struct ClientEventMailbox {
     inner: Mutex<MailboxInner>,
+    gap_bits: Mutex<HashMap<String, (String, String)>>,
     wake: Notify,
     wake_bit: AtomicBool,
     event_max: usize,
@@ -140,11 +140,11 @@ impl ClientEventMailbox {
             inner: Mutex::new(MailboxInner {
                 events: VecDeque::new(),
                 bytes: 0,
-                gap_bits: HashMap::new(),
             }),
+            gap_bits: Mutex::new(HashMap::new()),
             wake: Notify::new(),
             wake_bit: AtomicBool::new(false),
-            event_max: policy.consumer_queue_max_events,
+            event_max: test_client_event_queue_max().unwrap_or(policy.consumer_queue_max_events),
             byte_max: policy.consumer_queue_max_bytes,
             queue_age: policy.queue_age,
         }
@@ -175,12 +175,8 @@ impl ClientEventMailbox {
     ) -> Result<(), EventPlaneStatus> {
         let mut inner = lock_mailbox(&self.inner)?;
         if inner.events.len() + 1 > self.event_max || inner.bytes + size > self.byte_max {
-            inner.gap_bits.insert(
-                subscription_id.to_string(),
-                (owner.to_string(), name.to_string()),
-            );
             drop(inner);
-            self.signal_wake();
+            self.set_gap(subscription_id, owner, name);
             return Err(EventPlaneStatus::ShedFull);
         }
         inner.bytes += size;
@@ -198,8 +194,8 @@ impl ClientEventMailbox {
     }
 
     pub(crate) fn set_gap(&self, subscription_id: &str, owner: &str, name: &str) {
-        if let Ok(mut inner) = lock_mailbox(&self.inner) {
-            inner.gap_bits.insert(
+        if let Ok(mut gaps) = self.gap_bits.try_lock() {
+            gaps.insert(
                 subscription_id.to_string(),
                 (owner.to_string(), name.to_string()),
             );
@@ -209,48 +205,29 @@ impl ClientEventMailbox {
 
     #[must_use]
     pub(crate) fn has_ready_event(&self) -> bool {
+        match self.gap_bits.try_lock() {
+            Ok(gaps) if !gaps.is_empty() => return true,
+            Err(_) => return true,
+            Ok(_) => {}
+        }
         let Ok(inner) = lock_mailbox(&self.inner) else {
             return false;
         };
-        !inner.gap_bits.is_empty() || !inner.events.is_empty()
+        !inner.events.is_empty()
     }
 
     pub(crate) fn take_ready_event(&self) -> Option<DaemonEvent> {
-        let mut inner = lock_mailbox(&self.inner).ok()?;
-        if let Some((subscription_id, (owner, name))) = inner
-            .gap_bits
-            .iter()
-            .next()
-            .map(|(subscription_id, identity)| (subscription_id.clone(), identity.clone()))
-        {
-            inner.gap_bits.remove(&subscription_id);
-            return Some(DaemonEvent::EventGap {
-                subscription_id,
-                owner,
-                name,
-            });
+        if let Some(event) = self.take_gap() {
+            return Some(event);
         }
+        let mut inner = lock_mailbox(&self.inner).ok()?;
         loop {
             let queued = inner.events.pop_front()?;
             inner.bytes = inner.bytes.saturating_sub(queued.size);
             if queued.enqueued_at.elapsed() > self.queue_age {
-                inner
-                    .gap_bits
-                    .insert(queued.subscription_id, (queued.owner, queued.name));
-                if let Some((subscription_id, (owner, name))) = inner
-                    .gap_bits
-                    .iter()
-                    .next()
-                    .map(|(subscription_id, identity)| (subscription_id.clone(), identity.clone()))
-                {
-                    inner.gap_bits.remove(&subscription_id);
-                    return Some(DaemonEvent::EventGap {
-                        subscription_id,
-                        owner,
-                        name,
-                    });
-                }
-                continue;
+                drop(inner);
+                self.set_gap(&queued.subscription_id, &queued.owner, &queued.name);
+                return self.take_ready_event();
             }
             return Some(DaemonEvent::PackageEvent {
                 subscription_id: queued.subscription_id,
@@ -261,9 +238,25 @@ impl ClientEventMailbox {
         }
     }
 
+    fn take_gap(&self) -> Option<DaemonEvent> {
+        let mut gaps = self.gap_bits.try_lock().ok()?;
+        let (subscription_id, (owner, name)) = gaps
+            .iter()
+            .next()
+            .map(|(subscription_id, identity)| (subscription_id.clone(), identity.clone()))?;
+        gaps.remove(&subscription_id);
+        Some(DaemonEvent::EventGap {
+            subscription_id,
+            owner,
+            name,
+        })
+    }
+
     fn drop_subscription(&self, subscription_id: &str) {
+        if let Ok(mut gaps) = self.gap_bits.try_lock() {
+            gaps.remove(subscription_id);
+        }
         if let Ok(mut inner) = lock_mailbox(&self.inner) {
-            inner.gap_bits.remove(subscription_id);
             let mut bytes = inner.bytes;
             inner.events.retain(|queued| {
                 if queued.subscription_id == subscription_id {
@@ -275,6 +268,15 @@ impl ClientEventMailbox {
             });
             inner.bytes = bytes;
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_with_inner_held<R>(&self, body: impl FnOnce() -> R) -> R {
+        let _guard = self
+            .inner
+            .try_lock()
+            .expect("test hold must acquire mailbox");
+        body()
     }
 }
 
@@ -396,32 +398,49 @@ impl ClientEventPlane {
     /// Retry no-wait disconnect cleanup until router removal returns Accepted.
     #[must_use]
     pub(crate) fn apply_pending_cleanups(&self, router: &PackageEventRouter) -> bool {
-        let ids = match self.pending_cleanup.lock() {
-            Ok(pending) => pending.iter().cloned().collect::<Vec<_>>(),
+        self.apply_pending_cleanups_after_snapshot(router, |_| {})
+    }
+
+    fn apply_pending_cleanups_after_snapshot(
+        &self,
+        router: &PackageEventRouter,
+        after_snapshot: impl FnOnce(&Self),
+    ) -> bool {
+        let snapshot = match self.pending_cleanup.lock() {
+            Ok(pending) => pending.iter().cloned().collect::<HashSet<_>>(),
             Err(_) => return true,
         };
-        let mut remaining = Vec::new();
-        for connection_id in ids {
+        after_snapshot(self);
+        let mut remaining = HashSet::new();
+        for connection_id in &snapshot {
             let Ok(mut connections) = lock_plane(&self.connections) else {
-                remaining.push(connection_id);
+                remaining.insert(connection_id.clone());
                 continue;
             };
-            match router.try_cleanup_client_connection(&connection_id) {
+            match router.try_cleanup_client_connection(connection_id) {
                 EventPlaneStatus::Accepted => {
-                    connections.remove(&connection_id);
+                    connections.remove(connection_id);
                 }
-                _ => remaining.push(connection_id),
+                _ => {
+                    remaining.insert(connection_id.clone());
+                }
             }
         }
         match self.pending_cleanup.lock() {
             Ok(mut pending) => {
-                pending.retain(|connection_id| remaining.iter().any(|id| id == connection_id));
-                for connection_id in remaining {
-                    pending.insert(connection_id);
-                }
+                pending.retain(|connection_id| {
+                    !snapshot.contains(connection_id) || remaining.contains(connection_id)
+                });
                 !pending.is_empty()
             }
             Err(_) => true,
+        }
+    }
+
+    #[cfg(test)]
+    fn test_queue_cleanup(&self, connection_id: &str) {
+        if let Ok(mut pending) = self.pending_cleanup.lock() {
+            pending.insert(connection_id.to_string());
         }
     }
 }
@@ -465,6 +484,13 @@ fn lock_plane(
             Err(EventPlaneStatus::ShedBusy)
         }
     }
+}
+
+fn test_client_event_queue_max() -> Option<usize> {
+    std::env::var("BOTSTER_HUB_TEST_CLIENT_EVENT_QUEUE_MAX")
+        .ok()
+        .and_then(|raw| raw.parse().ok())
+        .filter(|max| *max > 0)
 }
 
 fn lock_mailbox(
@@ -720,5 +746,81 @@ mod tests {
             Some(DaemonEvent::PackageEvent { .. }) => {}
             other => panic!("queued event remains after gap: {other:?}"),
         }
+    }
+
+    #[test]
+    fn mailbox_contention_records_gap_without_replaying_events() {
+        let mailbox = ClientEventMailbox::new(PackageEventPlanePolicy::default());
+        mailbox.test_with_inner_held(|| {
+            assert_eq!(
+                mailbox.try_push("sub", "owner", "ready", json!({ "ok": true }), 8),
+                Err(EventPlaneStatus::ShedBusy)
+            );
+            mailbox.set_gap("sub", "owner", "ready");
+        });
+        match mailbox.take_ready_event() {
+            Some(DaemonEvent::EventGap {
+                subscription_id,
+                owner,
+                name,
+            }) => {
+                assert_eq!(subscription_id, "sub");
+                assert_eq!(owner, "owner");
+                assert_eq!(name, "ready");
+            }
+            other => panic!("gap must survive lock contention: {other:?}"),
+        }
+        assert!(
+            mailbox.take_ready_event().is_none(),
+            "contention must not replay event history"
+        );
+    }
+
+    #[test]
+    fn apply_pending_cleanups_preserves_ids_added_after_snapshot() {
+        let router = admitted_router(EventAudience::Clients);
+        let plane = ClientEventPlane::default();
+        let policy = PackageEventPlanePolicy::default();
+        plane
+            .try_subscribe(
+                "conn-a",
+                "sub",
+                "owner",
+                "ready",
+                Vec::new(),
+                policy,
+                &router,
+            )
+            .expect("a");
+        plane
+            .try_subscribe(
+                "conn-b",
+                "sub",
+                "owner",
+                "ready",
+                Vec::new(),
+                policy,
+                &router,
+            )
+            .expect("b");
+        router.test_with_inner_held(|| {
+            plane.cleanup_connection("conn-a", &router);
+        });
+        assert!(plane.has_pending_cleanup());
+        let leftover = plane.apply_pending_cleanups_after_snapshot(&router, |plane| {
+            plane.test_queue_cleanup("conn-b");
+        });
+        assert!(leftover, "conn-b must remain on the cleanup ledger");
+        assert!(
+            plane.mailbox("conn-b").is_some(),
+            "conn-b holders stay until a later apply pass"
+        );
+        assert_eq!(router.test_client_holder_count("conn-b"), 1);
+        assert!(
+            !plane.apply_pending_cleanups(&router),
+            "later apply must finish conn-b"
+        );
+        assert!(plane.mailbox("conn-b").is_none());
+        assert_eq!(router.test_client_holder_count("conn-b"), 0);
     }
 }

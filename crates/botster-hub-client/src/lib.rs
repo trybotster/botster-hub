@@ -250,6 +250,38 @@ impl DaemonConnection {
     pub fn take_skipped_events(&mut self) -> Vec<DaemonEvent> {
         std::mem::take(&mut self.skipped_events)
     }
+
+    /// Bound how long a caller waits for the next unsolicited host event.
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> DaemonTransportResult<()> {
+        self.stream
+            .set_read_timeout(timeout)
+            .map_err(normalize_socket_io_error)
+    }
+
+    /// Receive the next unsolicited host event without sending a control request.
+    ///
+    /// Returns events already skipped while waiting for a response first. Does
+    /// not write to the socket.
+    pub fn next_event(&mut self) -> DaemonTransportResult<DaemonEvent> {
+        if !self.skipped_events.is_empty() {
+            return Ok(self.skipped_events.remove(0));
+        }
+        loop {
+            let value = read_value_frame_from_reader(&mut self.reader)?;
+            if status_missing_compatibility(&value) {
+                return Err(precompatibility_hub_error());
+            }
+            match parse_unix_mux_value(value).map_err(DaemonTransportError::Json)? {
+                DaemonUnixMuxFrame::Event(event) => return Ok(event),
+                DaemonUnixMuxFrame::Terminal(envelope) => self.skipped_terminal.push(envelope),
+                DaemonUnixMuxFrame::Response(_) => {
+                    return Err(DaemonTransportError::Protocol(
+                        "unexpected control response while waiting for a host event",
+                    ));
+                }
+            }
+        }
+    }
 }
 
 /// One held-open, connection-scoped session entity subscription.
@@ -3640,6 +3672,40 @@ mod tests {
             }
             other => panic!("event gap must not parse as {other:?}"),
         }
+    }
+
+    #[test]
+    fn next_event_reads_unsolicited_package_event_without_a_control_request() {
+        let (mut server, client) = UnixStream::pair().expect("pair");
+        let event = DaemonEvent::PackageEvent {
+            subscription_id: "sub".to_string(),
+            owner: "owner".to_string(),
+            name: "ready".to_string(),
+            payload: serde_json::json!({ "ok": true }),
+        };
+        let server_handle = thread::spawn(move || {
+            write_frame(&mut server, &event).expect("write unsolicited event");
+        });
+        let reader = BufReader::new(client.try_clone().expect("clone"));
+        let mut connection = DaemonConnection {
+            stream: client,
+            reader,
+            skipped_terminal: Vec::new(),
+            skipped_events: Vec::new(),
+            required_features: vec![FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS.to_string()],
+        };
+        match connection.next_event().expect("next event") {
+            DaemonEvent::PackageEvent {
+                subscription_id,
+                name,
+                ..
+            } => {
+                assert_eq!(subscription_id, "sub");
+                assert_eq!(name, "ready");
+            }
+            other => panic!("expected PackageEvent, got {other:?}"),
+        }
+        server_handle.join().expect("server writes");
     }
 
     #[test]

@@ -1743,9 +1743,10 @@ does not require it. Clients that want live package events Hello with
 requests. They do not take over a Unix socket. Delivery uses unsolicited
 `DaemonEvent::PackageEvent` and `DaemonEvent::EventGap`. Unix classifies
 those frames as `DaemonUnixMuxFrame::Event`. WebRTC sends them as
-`DaemonLocalWebrtcDeliveryKind::DaemonEvent`. Hub stores host Hello
-`required_features` on a per-connection host record. Terminal admission
-rejection does not clear that record.
+`DaemonLocalWebrtcDeliveryKind::DaemonEvent`. `DaemonConnection::next_event`
+waits for those frames without sending another control request. Hub stores
+host Hello `required_features` on a per-connection host record. Terminal
+admission rejection does not clear that record.
 
 Subject filters are exact `payload.subject` strings compiled at
 subscribe time. Empty `subjects` omits the field and matches every live

@@ -1,10 +1,10 @@
 #[test]
 fn isolated_hub_two_packages_emit_and_consume_exact_event_without_blocking_worktree() {
     let _guard = daemon_test_guard();
-    let producer_src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("examples/event-plane-producer");
-    let consumer_src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("examples/event-plane-consumer");
+    let producer_src =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/event-plane-producer");
+    let consumer_src =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/event-plane-consumer");
     let producer_dir = unique_test_dir("event-plane-producer");
     let consumer_dir = unique_test_dir("event-plane-consumer");
     copy_dir_all(&producer_src, &producer_dir);
@@ -170,10 +170,10 @@ fn isolated_hub_two_packages_emit_and_consume_exact_event_without_blocking_workt
         );
     }
     assert!(
-        created
-            .events
-            .iter()
-            .any(|event| matches!(event, botster_hub_client::DaemonEvent::WorktreeLifecycle { .. })),
+        created.events.iter().any(|event| matches!(
+            event,
+            botster_hub_client::DaemonEvent::WorktreeLifecycle { .. }
+        )),
         "mutating response still carries WorktreeLifecycle"
     );
     eprintln!("worktree create duration observation (package event plane): {elapsed:?}");
@@ -196,7 +196,8 @@ fn isolated_hub_two_packages_emit_and_consume_exact_event_without_blocking_workt
 #[test]
 fn isolated_hub_event_to_entity_provider_emit_stays_rejected_causal_scope() {
     let _guard = daemon_test_guard();
-    let producer_src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/event-plane-producer");
+    let producer_src =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/event-plane-producer");
     let cycle_src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/event-plane-cycle");
     let producer_dir = unique_test_dir("event-plane-producer-cycle");
     let cycle_dir = unique_test_dir("event-plane-cycle");
@@ -270,21 +271,30 @@ fn isolated_hub_event_to_entity_provider_emit_stays_rejected_causal_scope() {
     hub.shutdown().expect("shutdown isolated hub");
 }
 
-pub(crate) fn enable_event_plane_producer(label: &str) -> (
-    botster_hub_test_support::IsolatedHub,
-    PathBuf,
-) {
-    let producer_src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/event-plane-producer");
+pub(crate) fn enable_event_plane_producer(
+    label: &str,
+) -> (botster_hub_test_support::IsolatedHub, PathBuf) {
+    enable_event_plane_producer_with_env(label, &[])
+}
+
+pub(crate) fn enable_event_plane_producer_with_env(
+    label: &str,
+    extra_env: &[(&str, &str)],
+) -> (botster_hub_test_support::IsolatedHub, PathBuf) {
+    let producer_src =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/event-plane-producer");
     let producer_dir = unique_test_dir(&format!("event-plane-producer-{label}"));
     copy_dir_all(&producer_src, &producer_dir);
     rewrite_package_source_path(&producer_dir);
-    let hub = botster_hub_test_support::IsolatedHubBuilder::new()
+    let mut builder = botster_hub_test_support::IsolatedHubBuilder::new()
         .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
         .session_worker_bin(session_worker_binary_path())
         .root(PathBuf::from(format!("/tmp/bh-event-plane-{label}")))
-        .name(format!("package-event-{label}"))
-        .start()
-        .expect("start isolated hub");
+        .name(format!("package-event-{label}"));
+    for (key, value) in extra_env {
+        builder = builder.env(*key, *value);
+    }
+    let hub = builder.start().expect("start isolated hub");
     let enabled = botster_hub_client::request(
         hub.endpoint(),
         botster_hub_client::DaemonRequest::EnablePackageLocalPath {
@@ -318,35 +328,29 @@ pub(crate) fn emit_sample_ready(endpoint: &botster_hub_client::DaemonEndpoint, t
 fn isolated_hub_unix_client_receives_unsolicited_package_event() {
     let _guard = daemon_test_guard();
     let (hub, _) = enable_event_plane_producer("live");
-    let mut connection = botster_hub_client::connect_for_package_event_subscriptions(hub.endpoint())
-        .expect("event hello");
+    let mut connection =
+        botster_hub_client::connect_for_package_event_subscriptions(hub.endpoint())
+            .expect("event hello");
     let subscribed = connection
-        .subscribe_events("sub-live", "event-plane-producer", "sample.ready", Vec::new())
+        .subscribe_events(
+            "sub-live",
+            "event-plane-producer",
+            "sample.ready",
+            Vec::new(),
+        )
         .expect("subscribe");
     assert_eq!(
         subscribed.kind,
         botster_hub_client::DaemonResponseKind::EventSubscribed
     );
     emit_sample_ready(hub.endpoint(), "client-live");
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let mut seen = None;
-    while Instant::now() < deadline {
-        let status = connection
-            .request(&botster_hub_client::DaemonRequest::Status)
-            .expect("status");
-        assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
-        if let Some(event) = connection.take_skipped_events().into_iter().find(|event| {
-            matches!(
-                event,
-                botster_hub_client::DaemonEvent::PackageEvent { name, .. } if name == "sample.ready"
-            )
-        }) {
-            seen = Some(event);
-            break;
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    match seen.expect("client received PackageEvent") {
+    connection
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("event read timeout");
+    let seen = connection
+        .next_event()
+        .expect("next event without a control request");
+    match seen {
         botster_hub_client::DaemonEvent::PackageEvent {
             subscription_id,
             owner,
@@ -368,8 +372,8 @@ fn isolated_hub_unix_client_receives_unsolicited_package_event() {
 fn isolated_hub_unnegotiated_subscribe_events_is_typed_error() {
     let _guard = daemon_test_guard();
     let (hub, _) = enable_event_plane_producer("unnegotiated");
-    let mut connection = botster_hub_client::DaemonConnection::connect(hub.endpoint())
-        .expect("default hello");
+    let mut connection =
+        botster_hub_client::DaemonConnection::connect(hub.endpoint()).expect("default hello");
     let error = connection
         .subscribe_events("sub", "event-plane-producer", "sample.ready", Vec::new())
         .expect_err("unnegotiated helper sends no request");
@@ -435,25 +439,20 @@ fn isolated_hub_rejected_terminal_hello_still_subscribes_to_package_events() {
         botster_hub_client::DaemonResponseKind::EventSubscribed
     );
     emit_sample_ready(hub.endpoint(), "after-reject");
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let mut seen = false;
-    while Instant::now() < deadline {
-        let _ = connection
-            .request(&botster_hub_client::DaemonRequest::Status)
-            .expect("status");
-        if connection.take_skipped_events().iter().any(|event| {
-            matches!(
-                event,
-                botster_hub_client::DaemonEvent::PackageEvent { payload, .. }
-                    if payload["token"] == "after-reject"
-            )
-        }) {
-            seen = true;
-            break;
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    assert!(seen, "package events remain available after terminal rejection");
+    connection
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("event read timeout");
+    let seen = connection
+        .next_event()
+        .expect("event after rejected terminal");
+    assert!(
+        matches!(
+            seen,
+            botster_hub_client::DaemonEvent::PackageEvent { ref payload, .. }
+                if payload["token"] == "after-reject"
+        ),
+        "package events remain available after terminal rejection: {seen:?}"
+    );
     hub.shutdown().expect("shutdown isolated hub");
 }
 
@@ -465,7 +464,12 @@ fn isolated_hub_reconnect_does_not_replay_package_events() {
         let mut first = botster_hub_client::connect_for_package_event_subscriptions(hub.endpoint())
             .expect("first hello");
         first
-            .subscribe_events("sub-old", "event-plane-producer", "sample.ready", Vec::new())
+            .subscribe_events(
+                "sub-old",
+                "event-plane-producer",
+                "sample.ready",
+                Vec::new(),
+            )
             .expect("first subscribe");
         emit_sample_ready(hub.endpoint(), "before-disconnect");
         let _ = first.request(&botster_hub_client::DaemonRequest::Status);
@@ -474,7 +478,12 @@ fn isolated_hub_reconnect_does_not_replay_package_events() {
     let mut second = botster_hub_client::connect_for_package_event_subscriptions(hub.endpoint())
         .expect("second hello");
     second
-        .subscribe_events("sub-new", "event-plane-producer", "sample.ready", Vec::new())
+        .subscribe_events(
+            "sub-new",
+            "event-plane-producer",
+            "sample.ready",
+            Vec::new(),
+        )
         .expect("fresh subscribe");
     let _ = second.request(&botster_hub_client::DaemonRequest::Status);
     assert!(
@@ -488,8 +497,9 @@ fn isolated_hub_reconnect_does_not_replay_package_events() {
 fn isolated_hub_subject_and_audience_admission_return_typed_errors() {
     let _guard = daemon_test_guard();
     let (hub, _) = enable_event_plane_producer("admission");
-    let mut connection = botster_hub_client::connect_for_package_event_subscriptions(hub.endpoint())
-        .expect("event hello");
+    let mut connection =
+        botster_hub_client::connect_for_package_event_subscriptions(hub.endpoint())
+            .expect("event hello");
     let wildcard = connection
         .subscribe_events(
             "sub-wild",
@@ -503,12 +513,111 @@ fn isolated_hub_subject_and_audience_admission_return_typed_errors() {
         Some("rejected_wildcard")
     );
     let undeclared = connection
-        .subscribe_events("sub-miss", "event-plane-producer", "missing.event", Vec::new())
+        .subscribe_events(
+            "sub-miss",
+            "event-plane-producer",
+            "missing.event",
+            Vec::new(),
+        )
         .expect("undeclared stays on the connection");
     assert_eq!(
         undeclared.error.as_ref().map(|error| error.code.as_str()),
         Some("rejected_undeclared")
     );
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn isolated_hub_unix_write_stall_emits_one_event_gap_then_status_progresses() {
+    let _guard = daemon_test_guard();
+    let stall_path = PathBuf::from(format!(
+        "/tmp/bh-event-plane-stall-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let _ = fs::remove_file(&stall_path);
+    let (hub, _) = enable_event_plane_producer_with_env(
+        "gap-stall",
+        &[
+            ("BOTSTER_HUB_TEST_CLIENT_EVENT_QUEUE_MAX", "1"),
+            (
+                "BOTSTER_HUB_TEST_STALL_UNIX_EVENT_FLUSH",
+                stall_path.to_str().expect("utf8 stall path"),
+            ),
+        ],
+    );
+    let mut connection =
+        botster_hub_client::connect_for_package_event_subscriptions(hub.endpoint())
+            .expect("event hello");
+    let subscribed = connection
+        .subscribe_events(
+            "sub-gap",
+            "event-plane-producer",
+            "sample.ready",
+            Vec::new(),
+        )
+        .expect("subscribe");
+    assert_eq!(
+        subscribed.kind,
+        botster_hub_client::DaemonResponseKind::EventSubscribed
+    );
+    fs::write(&stall_path, b"stall").expect("create write stall");
+    emit_sample_ready(hub.endpoint(), "queued");
+    emit_sample_ready(hub.endpoint(), "overflow");
+    let status_during_stall = connection
+        .request(&botster_hub_client::DaemonRequest::Status)
+        .expect("status during stall");
+    assert_eq!(
+        status_during_stall.kind,
+        botster_hub_client::DaemonResponseKind::Status
+    );
+    assert!(
+        connection.take_skipped_events().is_empty(),
+        "stalled writer must not flush events before Status"
+    );
+    fs::remove_file(&stall_path).expect("release write stall");
+    connection
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("event read timeout");
+    let first = connection.next_event().expect("gap after stall");
+    match first {
+        botster_hub_client::DaemonEvent::EventGap {
+            subscription_id,
+            owner,
+            name,
+        } => {
+            assert_eq!(subscription_id, "sub-gap");
+            assert_eq!(owner, "event-plane-producer");
+            assert_eq!(name, "sample.ready");
+        }
+        other => panic!("full mailbox must emit EventGap first: {other:?}"),
+    }
+    let queued = connection.next_event().expect("queued event after gap");
+    match queued {
+        botster_hub_client::DaemonEvent::PackageEvent {
+            subscription_id, ..
+        } => {
+            assert_eq!(subscription_id, "sub-gap");
+        }
+        other => panic!("queued event remains after gap: {other:?}"),
+    }
+    connection
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .expect("short timeout");
+    match connection.next_event() {
+        Err(botster_hub_client::DaemonTransportError::Io(error))
+            if error.kind() == std::io::ErrorKind::TimedOut
+                || error.kind() == std::io::ErrorKind::WouldBlock => {}
+        other => panic!("no later event traffic after the single gap: {other:?}"),
+    }
+    connection.set_read_timeout(None).expect("clear timeout");
+    let status = connection
+        .request(&botster_hub_client::DaemonRequest::Status)
+        .expect("status after gap");
+    assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
     hub.shutdown().expect("shutdown isolated hub");
 }
 
