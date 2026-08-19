@@ -6,15 +6,16 @@
 - Target id: `tgt_7e208a0c76a44980a83b63af976b1f22`
 - Ticket: `ticket_1786663583_640263`
 - Run: `run_1787158085_722550`
-- Implement step: `run_step_1787176520_385387` (sequence 13, fifth Review return)
-- Prior Implement steps: `run_step_1787173421_386472`, `run_step_1787170885_485950`, `run_step_1787169048_973962`, `run_step_1787165407_410166`, `run_step_1787159472_279191`
+- Implement step: `run_step_1787177596_331327` (sequence 15, sixth Review return)
+- Prior Implement steps: `run_step_1787176520_385387`, `run_step_1787173421_386472`, `run_step_1787170885_485950`, `run_step_1787169048_973962`, `run_step_1787165407_410166`, `run_step_1787159472_279191`
 - Approved plan: `docs/plans/expose-client-event-subscriptions-on-the-host-control-protocol.md` at `98ae1f9`
 - Plan Review: `review_1787159455_211294` approved
 - Code Review: `review_1787165393_430946` `changes_required` (7 findings, resolved)
 - Code Review: `review_1787169037_550837` `changes_required` (4 findings, resolved)
 - Code Review: `review_1787170872_296170` `changes_required` (3 findings, resolved)
 - Code Review: `review_1787173413_659341` `changes_required` (2 findings, resolved)
-- Code Review: `review_1787176510_516746` `changes_required` (1 finding)
+- Code Review: `review_1787176510_516746` `changes_required` (1 finding, resolved)
+- Code Review: `review_1787177586_705734` `changes_required` (1 finding)
 - `teardown_class_applies`: no
 - Direct-merge pipeline. No pull request.
 
@@ -66,6 +67,12 @@ Fifth Review return (`review_1787176510_516746`):
 | Finding | Severity | Fix |
 | --- | --- | --- |
 | `finding_1787176510_355069` Fan-out overwrites in-flight ownership | high | Production request IDs include `pull_id`. Two subscribers of one envelope keep two flights. Both completions retire the correct holder, release both causal scopes, and return occupancy to zero. |
+
+Sixth Review return (`review_1787177586_705734`):
+
+| Finding | Severity | Fix |
+| --- | --- | --- |
+| `finding_1787177586_367843` Fan-out tests bypass queued completion | high | Load the real event-probe Lua plugin with two `worktree_created` handlers. The production `PackageEventDelivery` slice queues both Core jobs. `CompletionDrain` retires both flights. Request IDs differ. Occupancy and outstanding pulls return to zero. |
 
 Constraints applied for this return: Hub host-control and in-repo
 `botster-hub-client` only. Core pin unchanged. No Web/TUI edits. No
@@ -120,13 +127,16 @@ Checklist: reused `checklist_1786867714_922206` as required.
 
 ## Files changed
 
-Fifth Review return (this visit):
+Sixth Review return (this visit):
 
-- `src/daemon_maintenance.rs` — per-delivery production request IDs; fan-out occupancy proof
+- `tests/hub_lua_runtime_test.rs` — owner-loop queues and drains two real Core completions
+- `src/lib.rs` — test-only re-export of production maintenance slices
+- `src/package_event_router.rs` — `test_outstanding_pulls` visible to integration tests
 - `docs/reports/expose-client-event-subscriptions-on-the-host-control-protocol-implement.md`
 
 Prior Review-return files remain:
 
+- `src/daemon_maintenance.rs` — per-delivery production request IDs; fan-out occupancy proof
 - `src/package_event_router.rs` — `retire_pulled` consumes the pull token
 - `src/runtime.rs` — durable leftover store; never drop after settle-turn limit
 - `tests/hub_lua_runtime_test.rs` — busy-settle occupancy ablation
@@ -260,10 +270,9 @@ Repo gates:
 
 - `cargo build --locked -p botster-core-daemon --bin botster-session-worker`
 - `./test.sh --locked` — one clean default-concurrency pass after the
-  fifth Review-return fixes, 0 failures. Lifecycle 264 passed / 1 ignored.
-  Lua runtime 62 passed, including `events_on`, the backpressure occupancy
-  ablation, and the busy-settle leftover ablation. Hub lib 452 passed. Hub
-  client 78 passed.
+  sixth Review-return fixes, 0 failures. Lifecycle 264 passed / 1 ignored.
+  Lua runtime 63 passed, including the owner-loop two-handler Core queue
+  and completion drain. Hub lib 452 passed. Hub client 78 passed.
 - `cargo clippy --workspace --all-targets --locked -- -D warnings` clean.
 - `cargo fmt --all -- --check`
 - `cargo test --doc --workspace`
