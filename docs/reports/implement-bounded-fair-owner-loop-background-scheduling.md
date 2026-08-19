@@ -4,7 +4,7 @@
 | --- | --- |
 | Ticket | `ticket_1786912569_840742` |
 | Run | `run_1787102180_185677` |
-| Step | `botster_stack_implement` |
+| Step | `botster_stack_implement` (return from Review) |
 | Target repository | `botster-hub` (`trybotster/botster-hub`) |
 | `target_id` | `tgt_7e208a0c76a44980a83b63af976b1f22` |
 | Authoritative path | ticket `target_id`; worktree `origin` remote `https://github.com/trybotster/botster-hub.git` |
@@ -13,11 +13,11 @@
 | Locked Core | `Cargo.lock` pins `botster-core` at `8fce2041b9fe742cb2a6df9e74cb262606672742` |
 | Delivery | direct-merge; no pull request (`merge_policy: direct`) |
 | Class | not runtime-teardown |
-| Plan | `docs/plans/implement-bounded-fair-owner-loop-background-scheduling.md` revision 3, with Implement notes for wake accounting and close-event retry |
+| Plan | `docs/plans/implement-bounded-fair-owner-loop-background-scheduling.md` revision 4 |
 
-Independent routing: `project_pipelines_current_context` and `botster context` both map `tgt_7e208a0c76a44980a83b63af976b1f22` to `trybotster/botster-hub`. The approved plan uses the same routing. Work stayed in this ticket worktree.
+Independent routing: `project_pipelines_current_context` ticket/run `target_id` and `list_spawn_targets` both map `tgt_7e208a0c76a44980a83b63af976b1f22` to `trybotster/botster-hub`. The approved plan used the same routing. Work stayed in this ticket worktree.
 
-Plan Review `review_1787112708_321608` approved revision 3 and named Core merge `8fce204` as the pin. Dependency `dependency_1787104278_385109` / Core `ticket_1787104273_140454` is closed.
+This report answers Review `review_1787118229_406859` (five open findings). Plan Review `review_1787112708_321608` approved revision 3. Revision 4 resynchronizes the committed plan with the shipped wake, Pump-mark, and traversal contracts.
 
 ## Repository playbook and other playbooks/notes applied
 
@@ -41,6 +41,7 @@ Plan Review `review_1787112708_321608` approved revision 3 and named Core merge 
 - [[test script required for rust tests not cargo test]]
 - [[implement gate must verify committed work and pr link before review]]
 - [[implementation steps must persist report artifacts for review]]
+- [[implementation deviations must resync committed plan acceptance checks]]
 - [[pipeline artifacts should use path neutral worktree references]]
 
 **Not loaded:** [[project-pipelines-playbook]] — this ticket does not change Project Pipelines package or plugin paths. [[botster runtime teardown lenses]] — teardown class does not apply.
@@ -55,27 +56,36 @@ Plan Review `review_1787112708_321608` approved revision 3 and named Core merge 
 - Consume the two exact Core queries through the pinned Core artifact.
 - Bind proof is one default-concurrency `./test.sh --locked` without retry.
 
+## Review findings addressed
+
+- `finding_1787118229_281425`: removed the after-control full-set close-event helpers. CloseEvents runs only as a Pump phase.
+- `finding_1787118229_230218`: admission, mux-route, and stream cursors resume with `BTreeMap::range`. Mux and inventory slices count open, reported, and unbound rows toward a visit budget.
+- `finding_1787118229_191801`: Status, ReadModeFlags, ReadScreen, and other reads do not mark Pump. Mark sources are interval due, successful Spawn/SpawnSessionType/Attach, Detach/ShutdownSession/RemoveSession, incomplete Pump phases, adapter-close work, and a journal-advanced Observe follow-up.
+- `finding_1787118229_310222`: idle `reconciliation_wakes` stays `<= 4` without Status self-rearm. Interval marks Pump and wakes Maintenance. Pump slices do not increment the counter.
+- `finding_1787118229_810551`: the committed plan now matches shipped wake accounting: `reconciliation_wakes` counts Maintenance slices only.
+
 ## Files changed
 
 Feature behavior:
 
-- `src/daemon_maintenance.rs` — add policy-neutral `BackgroundClassScheduler`, `PumpScheduler`, and turn-decision helpers. Add deterministic unit proofs for class round-robin, coalesced marks, one-slice turns, no-cancellation, and composed `SubscriberDelivery` / `HostBridge` turn indices.
-- `src/daemon_transport.rs` — `serve_daemon` serves at most one fairly selected background slice per turn. Pump is a three-phase rotation (`Observe`, `CloseEvents`, `InventoryReconcile`). Delete `observe_lifecycle_turn`. ReadScreen uses exact-session `observe_session_lifecycle`. ReadModeFlags and ShutdownSession do no broad observe. Close classification uses `session_registry_state`. Interval due marks Pump and wakes Maintenance. Successful control remakes Pump pending. After-control close-event queue stays, but uses the exact query.
-- `src/daemon_attach_stream.rs` — add cursor-resumable `reconcile_inventory_slice` that validates routes with an exact membership lookup.
+- `src/daemon_maintenance.rs` — policy-neutral `BackgroundClassScheduler`, `PumpScheduler` with route cursors and `prefer_close_events`, visit-budget constants, and deterministic scheduler proofs.
+- `src/daemon_transport.rs` — one control then at most one class slice. Pump phases `Observe` → `CloseEvents` → `InventoryReconcile`. No after-control mux scan. No Status/ReadModeFlags Pump remake. Adapter-close work marks Pump and prefers CloseEvents.
+- `src/daemon_attach_stream.rs` — `reconcile_inventory_slice` uses `BTreeMap::range` and counts unbound rows toward the visit budget.
 - `src/runtime.rs` — thin wrappers for `session_registry_state` and `terminal_subscription_generation`.
-- `src/unix_terminal_adapter.rs` and `src/webrtc_terminal_adapter.rs` — bounded close-event visits with retry when the registry query is absent or errors.
+- `src/unix_terminal_adapter.rs` and `src/webrtc_terminal_adapter.rs` — mux routes are `BTreeMap`s. Close-event slices resume with an exclusive route cursor and a visited-entry budget. Adapter close sets a coalesced close-work flag.
 
-Pin / fixture identity:
+Pin / fixture identity (unchanged from the first Implement pass):
 
-- `Cargo.toml`, `Cargo.lock`, `crates/botster-hub-client/Cargo.toml`, `crates/botster-hub-test-support/Cargo.toml`, `crates/botster-hub-test-support/build.rs`, `crates/botster-hub-test-support/src/conformance_data.rs`, `crates/botster-hub-test-support/src/lib.rs`, `tests/session_projection_owner_loop.rs`, and locked-core provenance strings — Core pin `8fce2041b9fe742cb2a6df9e74cb262606672742`.
+- Core pin `8fce2041b9fe742cb2a6df9e74cb262606672742`.
 
 Proof:
 
-- `tests/hub_daemon_lifecycle/sessions.rs` — Status flood now also proves PTY output progress and complete producer output.
+- `tests/hub_daemon_lifecycle/sessions.rs` — Status flood PTY progress; idle wake assertion prints before/after counts.
+- `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs` — Unix Core-close wait matches the WebRTC 20s bound so CloseEvents can run after adapter close without a Status-rearm starvation path.
 
 Handoff:
 
-- `docs/plans/implement-bounded-fair-owner-loop-background-scheduling.md` — Implement notes for wake accounting and close-event retry.
+- `docs/plans/implement-bounded-fair-owner-loop-background-scheduling.md` — revision 4.
 - `docs/reports/implement-bounded-fair-owner-loop-background-scheduling.md` — this report.
 
 ## Ownership boundaries preserved
@@ -84,33 +94,31 @@ Hub owns owner-loop policy, budgets, and scheduling. Core remains the authority 
 
 ## Cross-repo routing
 
-Registered Core dependency `ticket_1787104273_140454` / `dependency_1787104278_385109` is closed. This ticket consumes merged Core `8fce204` (`CoreDaemon::terminal_subscription_generation` and `CoreDaemon::session_registry_state`). No other separately routed work.
+Registered Core dependency `ticket_1787104273_140454` / `dependency_1787104278_385109` is closed. This ticket consumes merged Core `8fce204`. No other separately routed work.
 
 ## Deviations from plan
 
-1. `reconciliation_wakes` still increments only on a Maintenance slice. Counting Pump slices broke the idle `<= 4` oracle. Pump progress is proven by PTY output during the Status flood and by the ready-Spawn observation.
-2. After-control close-event queue remains. It no longer calls `list_sessions` or `list_terminal_subscriptions`. It keeps mux flush prompt after control, including Status.
-3. CloseEvents retries `Absent` and query error instead of marking the route reported. A live session that is not yet in the registry still emits `TerminalSubscriptionClosed` when Found(Running). Found(non-running) still suppresses.
-4. A successful control request remakes Pump pending. Status waiters can then drive Observe / CloseEvents without waiting only on the 500 ms interval.
-5. When the reconciliation interval is due, the loop also `try_wake`s Maintenance so package-entity fanout still gets a periodic slice. The turn still runs only one selected class.
+1. `reconciliation_wakes` counts Maintenance slices only. Pump progress is the flood PTY oracle and the ready-Spawn observation. Plan revision 4 records this.
+2. CloseEvents retries `Absent` and query error instead of marking the route reported. Found(Running) still emits. Found(non-running) still suppresses.
+3. Adapter close sets one coalesced close-work flag; the owner loop prefers CloseEvents.
+4. The Unix Core-close waiter uses a 20s bound, matching WebRTC. The previous 8s bound depended on Status-rearm and an unbounded after-control scan starving drain.
 
 ## Tests and downstream proof
 
-Production entry point: `serve_daemon` in `src/daemon_transport.rs` now classifies one control message, then at most one `BackgroundClass` slice. ReadScreen is the only remaining read path that observes lifecycle, and it uses the exact session.
+Production entry point: `serve_daemon` in `src/daemon_transport.rs` serves one control message, then at most one `BackgroundClass` slice. CloseEvents is not invoked from the control path. ReadScreen is the only remaining read path that observes lifecycle, and it uses the exact session.
 
-Commands:
+Commands (one clean run, no retry):
 
 - `cargo fmt --all -- --check` — pass
-- `cargo clippy --workspace --all-targets --locked -- -D warnings` — pass
-- `cargo test --doc --workspace --locked` — pass
-- `./test.sh --locked` — one clean default-concurrency run, 253/0/1 on `hub_daemon_lifecycle_test`, no retry
+- `cargo clippy --workspace --all-targets --locked --offline -- -D warnings` — pass
+- `cargo test --doc --workspace --locked --offline` — pass
+- `./test.sh --locked --offline` — pass; `hub_daemon_lifecycle_test` 253 passed, 0 failed, 1 ignored
 
-Ready Spawn observation (not a pass/fail assert): `8.206125ms` from `ready_spawn_completes_when_live_sessions_exceed_one_observe_slice`. Below `MAX_READY_OPERATION_WAIT_MS` (50 ms).
+Ready Spawn observation from the first Implement pass: `8.206125ms` (below 50 ms). The return gate re-ran the ready-Spawn tests and they stayed green.
 
 ## Unverified behavior or residual risk
 
 - CloseEvents retry on Absent can re-visit a closed route until Found or until InventoryReconcile cancels it.
-- Counting Pump in `reconciliation_wakes` is still the plan text. Changing that counter later needs a new idle oracle.
 - Vault notes still say the replacement ticket owns the repair. Update them after merge.
 
 ## Missing vault guidance

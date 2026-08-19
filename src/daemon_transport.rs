@@ -10,10 +10,11 @@ use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::io::Write;
+use std::ops::Bound;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -75,8 +76,8 @@ use tokio::task::JoinHandle;
 use crate::daemon_maintenance::{
     BackgroundClass, BackgroundClassScheduler, BackgroundTurnDecision, MaintenanceSliceKind,
     MaintenanceState, OBSERVE_SLICE_BUDGET, PUMP_MAX_ADMISSIONS_VISITED,
-    PUMP_MAX_CANDIDATE_CLASSIFICATIONS, PUMP_MAX_ROUTES_VALIDATED, PumpAdmissionCursor, PumpPhase,
-    PumpScheduler, decide_background_slice, run_maintenance_kind,
+    PUMP_MAX_CANDIDATE_CLASSIFICATIONS, PUMP_MAX_ROUTE_ENTRIES_VISITED, PUMP_MAX_ROUTES_VALIDATED,
+    PumpAdmissionCursor, PumpPhase, PumpScheduler, decide_background_slice, run_maintenance_kind,
 };
 use crate::daemon_projection::{
     app_local_url, apps_from_registry, available_package_action, available_package_actions,
@@ -209,6 +210,7 @@ fn owner_maintenance_pending(daemon: &HubDaemon, state: &DaemonControlState) -> 
         || daemon.runtime().is_some_and(|runtime| {
             runtime.package_event_router().peek_delivery_wake()
                 || runtime.event_plane_owner_ops_pending()
+                || runtime.package_entity_work_pending()
         })
 }
 
@@ -217,6 +219,10 @@ fn mark_due_reconciliation(state: &mut DaemonControlState, now: Instant) {
         state.background.mark_pump();
         state.maintenance.try_wake();
         state.next_reconciliation = now + ENTITY_RECONCILIATION_INTERVAL;
+    }
+    if state.pending_runtime.take_close_work() {
+        state.background.mark_pump();
+        state.pump.prefer_close_events();
     }
 }
 
@@ -274,16 +280,7 @@ fn run_one_owner_maintenance_slice(daemon: &mut HubDaemon, state: &mut DaemonCon
     state.maintenance.last_owner_turn = started.elapsed();
     state.lifecycle_counters.lifecycle_change_reads = state.maintenance.journal_page_reads;
     state.lifecycle_counters.lifecycle_baseline_reads = state.maintenance.baseline_page_reads;
-    if state.maintenance.needs_work()
-        || session_subscribers_need_delivery(state)
-        || daemon
-            .runtime()
-            .is_some_and(crate::HubRuntime::package_entity_resync_still_needed)
-        || daemon.runtime().is_some_and(|runtime| {
-            runtime.package_event_router().peek_delivery_wake()
-                || runtime.event_plane_owner_ops_pending()
-        })
-    {
+    if owner_maintenance_pending(daemon, state) {
         state.maintenance.try_wake();
     }
 }
@@ -2108,6 +2105,9 @@ pub(crate) fn handle_control_message(
             admission,
             reply_tx,
         } => {
+            if let UnixTerminalAdmission::Admitted { mux, .. } = &admission {
+                mux.bind_close_work(Arc::clone(&state.pending_runtime.close_work));
+            }
             state
                 .pending_runtime
                 .unix_admissions
@@ -2120,6 +2120,9 @@ pub(crate) fn handle_control_message(
             admission,
         } => {
             if daemon.local_webrtc().has_live_peer(&grant_id) {
+                if let WebrtcTerminalAdmission::Admitted { mux, .. } = &admission {
+                    mux.bind_close_work(Arc::clone(&state.pending_runtime.close_work));
+                }
                 state
                     .pending_runtime
                     .webrtc_admissions
@@ -2410,10 +2413,6 @@ pub(crate) fn handle_control_message(
                     .entry("explicit_detach".to_string())
                     .or_insert(0) += 1;
             }
-            if let Some(runtime) = daemon.runtime() {
-                queue_unix_subscription_closed_events(runtime, &state.pending_runtime);
-                queue_webrtc_subscription_closed_events(runtime, &state.pending_runtime);
-            }
             if let Ok(response) = response.as_ref() {
                 let change = attached_subscription_change_for_response(&request, response);
                 let change = match change {
@@ -2432,7 +2431,8 @@ pub(crate) fn handle_control_message(
             {
                 overlay_live_attach_occupancy(status, daemon, state);
             }
-            if request_succeeded(response.as_ref()) {
+            let succeeded = request_succeeded(response.as_ref());
+            if succeeded {
                 if let DaemonRequest::Spawn { session_id, .. } = &request {
                     state
                         .maintenance
@@ -2442,7 +2442,6 @@ pub(crate) fn handle_control_message(
                         runtime.record_acknowledged_spawn(session_id.clone());
                     }
                 }
-                state.background.mark_pump();
                 if matches!(request, DaemonRequest::ReadScreen { .. })
                     && daemon
                         .runtime()
@@ -2458,6 +2457,17 @@ pub(crate) fn handle_control_message(
                         .is_some_and(crate::HubRuntime::package_entity_work_pending)
                 {
                     state.maintenance.try_wake();
+                }
+            }
+            if should_mark_pump_after_control(&request, succeeded) {
+                state.background.mark_pump();
+                if matches!(
+                    request,
+                    DaemonRequest::Detach { .. }
+                        | DaemonRequest::ShutdownSession { .. }
+                        | DaemonRequest::RemoveSession { .. }
+                ) {
+                    state.pump.prefer_close_events();
                 }
             }
             if daemon.runtime().is_some_and(|runtime| {
@@ -4685,34 +4695,6 @@ fn suppress_webrtc_session_close_events(pending_runtime: &PendingRuntimeState, s
     }
 }
 
-fn queue_unix_subscription_closed_events(
-    runtime: &crate::HubRuntime,
-    pending_runtime: &PendingRuntimeState,
-) {
-    for admission in pending_runtime.unix_admissions.values() {
-        if let UnixTerminalAdmission::Admitted { mux, .. } = admission {
-            mux.queue_closed_subscription_events_bounded(
-                |session_id| session_close_event_decision_for(runtime, session_id),
-                usize::MAX,
-            );
-        }
-    }
-}
-
-fn queue_webrtc_subscription_closed_events(
-    runtime: &crate::HubRuntime,
-    pending_runtime: &PendingRuntimeState,
-) {
-    for admission in pending_runtime.webrtc_admissions.values() {
-        if let WebrtcTerminalAdmission::Admitted { mux, .. } = admission {
-            mux.queue_closed_subscription_events_bounded(
-                |session_id| session_close_event_decision_for(runtime, session_id),
-                usize::MAX,
-            );
-        }
-    }
-}
-
 fn session_close_event_decision_for(runtime: &crate::HubRuntime, session_id: &str) -> Option<bool> {
     session_close_event_decision(runtime.session_registry_state(&SessionId(session_id.to_string())))
 }
@@ -5005,6 +4987,7 @@ pub(crate) struct PendingRuntimeState {
     pub(crate) streams: AttachStreamRegistry,
     unix_admissions: BTreeMap<String, UnixTerminalAdmission>,
     webrtc_admissions: BTreeMap<String, WebrtcTerminalAdmission>,
+    close_work: Arc<AtomicBool>,
 }
 
 impl fmt::Debug for PendingRuntimeState {
@@ -5029,6 +5012,10 @@ impl std::ops::DerefMut for PendingRuntimeState {
 }
 
 impl PendingRuntimeState {
+    fn take_close_work(&self) -> bool {
+        self.close_work.swap(false, Ordering::SeqCst)
+    }
+
     #[cfg(test)]
     pub(crate) fn webrtc_is_admitted(&self, grant_id: &str) -> bool {
         matches!(
@@ -5050,6 +5037,24 @@ fn run_one_pump_phase(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
     }
 }
 
+fn next_admission_key<T>(map: &BTreeMap<String, T>, after: Option<&str>) -> Option<String> {
+    match after {
+        None => map.keys().next().cloned(),
+        Some(seen) => map
+            .range::<str, _>((Bound::Excluded(seen), Bound::Unbounded))
+            .next()
+            .map(|(key, _)| key.clone()),
+    }
+}
+
+fn empty_close_event_progress() -> crate::unix_terminal_adapter::ClosedEventSliceProgress {
+    crate::unix_terminal_adapter::ClosedEventSliceProgress {
+        classified: 0,
+        more: false,
+        after_route: None,
+    }
+}
+
 fn run_close_events_phase(daemon: &HubDaemon, state: &mut DaemonControlState) -> bool {
     let Some(runtime) = daemon.runtime() else {
         state.pump.close_cursor = PumpAdmissionCursor::default();
@@ -5063,17 +5068,16 @@ fn run_close_events_phase(daemon: &HubDaemon, state: &mut DaemonControlState) ->
         {
             return true;
         }
-        let remaining = PUMP_MAX_CANDIDATE_CLASSIFICATIONS.saturating_sub(classified);
-        match &state.pump.close_cursor {
-            PumpAdmissionCursor::Unix { after } => {
-                let next_key = state
-                    .pending_runtime
-                    .unix_admissions
-                    .keys()
-                    .find(|key| after.as_ref().is_none_or(|seen| *key > seen))
-                    .cloned();
+        let remaining_candidates = PUMP_MAX_CANDIDATE_CLASSIFICATIONS.saturating_sub(classified);
+        match state.pump.close_cursor.clone() {
+            PumpAdmissionCursor::Unix { after, after_route } => {
+                let next_key =
+                    next_admission_key(&state.pending_runtime.unix_admissions, after.as_deref());
                 let Some(key) = next_key else {
-                    state.pump.close_cursor = PumpAdmissionCursor::Webrtc { after: None };
+                    state.pump.close_cursor = PumpAdmissionCursor::Webrtc {
+                        after: None,
+                        after_route: None,
+                    };
                     continue;
                 };
                 admissions_visited += 1;
@@ -5081,26 +5085,28 @@ fn run_close_events_phase(daemon: &HubDaemon, state: &mut DaemonControlState) ->
                     Some(UnixTerminalAdmission::Admitted { mux, .. }) => mux
                         .queue_closed_subscription_events_bounded(
                             |session_id| session_close_event_decision_for(runtime, session_id),
-                            remaining,
+                            remaining_candidates,
+                            after_route.as_ref(),
+                            PUMP_MAX_ROUTE_ENTRIES_VISITED,
                         ),
-                    _ => crate::unix_terminal_adapter::ClosedEventSliceProgress {
-                        classified: 0,
-                        more: false,
-                    },
+                    _ => empty_close_event_progress(),
                 };
                 classified = classified.saturating_add(progress.classified);
                 if progress.more {
+                    state.pump.close_cursor = PumpAdmissionCursor::Unix {
+                        after,
+                        after_route: progress.after_route,
+                    };
                     return true;
                 }
-                state.pump.close_cursor = PumpAdmissionCursor::Unix { after: Some(key) };
+                state.pump.close_cursor = PumpAdmissionCursor::Unix {
+                    after: Some(key),
+                    after_route: None,
+                };
             }
-            PumpAdmissionCursor::Webrtc { after } => {
-                let next_key = state
-                    .pending_runtime
-                    .webrtc_admissions
-                    .keys()
-                    .find(|key| after.as_ref().is_none_or(|seen| *key > seen))
-                    .cloned();
+            PumpAdmissionCursor::Webrtc { after, after_route } => {
+                let next_key =
+                    next_admission_key(&state.pending_runtime.webrtc_admissions, after.as_deref());
                 let Some(key) = next_key else {
                     state.pump.close_cursor = PumpAdmissionCursor::default();
                     return false;
@@ -5110,18 +5116,24 @@ fn run_close_events_phase(daemon: &HubDaemon, state: &mut DaemonControlState) ->
                     Some(WebrtcTerminalAdmission::Admitted { mux, .. }) => mux
                         .queue_closed_subscription_events_bounded(
                             |session_id| session_close_event_decision_for(runtime, session_id),
-                            remaining,
+                            remaining_candidates,
+                            after_route.as_ref(),
+                            PUMP_MAX_ROUTE_ENTRIES_VISITED,
                         ),
-                    _ => crate::unix_terminal_adapter::ClosedEventSliceProgress {
-                        classified: 0,
-                        more: false,
-                    },
+                    _ => empty_close_event_progress(),
                 };
                 classified = classified.saturating_add(progress.classified);
                 if progress.more {
+                    state.pump.close_cursor = PumpAdmissionCursor::Webrtc {
+                        after,
+                        after_route: progress.after_route,
+                    };
                     return true;
                 }
-                state.pump.close_cursor = PumpAdmissionCursor::Webrtc { after: Some(key) };
+                state.pump.close_cursor = PumpAdmissionCursor::Webrtc {
+                    after: Some(key),
+                    after_route: None,
+                };
             }
         }
     }
@@ -5175,6 +5187,8 @@ fn run_pump_observe_phase(daemon: &HubDaemon, state: &mut DaemonControlState) ->
         };
         if runtime.take_journal_advanced_wake() {
             state.maintenance.note_authoritative_mutation();
+            state.background.mark_pump();
+            state.pump.prefer_close_events();
         }
         state.observe_resume.is_some()
     } else {
@@ -5431,6 +5445,18 @@ fn request_succeeded(response: Result<&DaemonResponse, &DaemonTransportError>) -
         response,
         Ok(response) if response.kind != DaemonResponseKind::OperatorError
     )
+}
+
+fn should_mark_pump_after_control(request: &DaemonRequest, succeeded: bool) -> bool {
+    match request {
+        DaemonRequest::Spawn { .. }
+        | DaemonRequest::SpawnSessionType { .. }
+        | DaemonRequest::Attach { .. } => succeeded,
+        DaemonRequest::Detach { .. }
+        | DaemonRequest::ShutdownSession { .. }
+        | DaemonRequest::RemoveSession { .. } => true,
+        _ => false,
+    }
 }
 
 fn control_request_operation_label(request: &DaemonRequest) -> &'static str {
@@ -8052,6 +8078,95 @@ mod tests {
             !arm.contains("observe_lifecycle"),
             "ReadModeFlags must not call a lifecycle observe slice"
         );
+    }
+
+    #[test]
+    fn status_and_read_mode_flags_do_not_mark_pump() {
+        assert!(!should_mark_pump_after_control(
+            &DaemonRequest::Status,
+            true
+        ));
+        assert!(!should_mark_pump_after_control(
+            &DaemonRequest::ReadModeFlags {
+                session_id: "s".into(),
+            },
+            true
+        ));
+        assert!(!should_mark_pump_after_control(
+            &DaemonRequest::ReadScreen {
+                session_id: "s".into(),
+            },
+            true
+        ));
+        assert!(!should_mark_pump_after_control(
+            &DaemonRequest::ListSessions,
+            true
+        ));
+        assert!(should_mark_pump_after_control(
+            &DaemonRequest::Attach {
+                session_id: "s".into(),
+                subscription_id: "sub".into(),
+            },
+            true
+        ));
+        assert!(!should_mark_pump_after_control(
+            &DaemonRequest::Attach {
+                session_id: "s".into(),
+                subscription_id: "sub".into(),
+            },
+            false
+        ));
+        assert!(should_mark_pump_after_control(
+            &DaemonRequest::RemoveSession {
+                session_id: "s".into(),
+            },
+            false
+        ));
+        const TRANSPORT: &str = include_str!("daemon_transport.rs");
+        let production = TRANSPORT.split("mod tests").next().expect("production");
+        assert!(
+            !production.contains("queue_unix_subscription_closed_events"),
+            "control must not scan every Unix mux for close events"
+        );
+        assert!(
+            !production.contains("queue_webrtc_subscription_closed_events"),
+            "control must not scan every WebRTC mux for close events"
+        );
+        assert!(
+            production.contains("should_mark_pump_after_control"),
+            "control must mark Pump only through the documented request sources"
+        );
+    }
+
+    #[test]
+    fn admission_cursor_uses_exclusive_range_not_a_prefix_scan() {
+        let mut admissions = BTreeMap::new();
+        for index in 0..20 {
+            admissions.insert(format!("client-{index:02}"), ());
+        }
+        assert_eq!(
+            next_admission_key(&admissions, None).as_deref(),
+            Some("client-00")
+        );
+        assert_eq!(
+            next_admission_key(&admissions, Some("client-09")).as_deref(),
+            Some("client-10")
+        );
+        assert_eq!(next_admission_key(&admissions, Some("client-19")), None);
+        const TRANSPORT: &str = include_str!("daemon_transport.rs");
+        let close = TRANSPORT
+            .split("fn run_close_events_phase")
+            .nth(1)
+            .expect("close phase");
+        let close = close
+            .split("fn run_inventory_reconcile_phase")
+            .next()
+            .unwrap_or(close);
+        assert!(
+            !close.contains("keys().find"),
+            "CloseEvents must resume with BTreeMap::range"
+        );
+        assert!(close.contains("next_admission_key"));
     }
 
     #[test]

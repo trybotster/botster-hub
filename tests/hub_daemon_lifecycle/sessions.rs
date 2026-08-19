@@ -2986,7 +2986,9 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
             .reconciliation_wakes
             .saturating_sub(many_before.reconciliation_wakes)
             <= 4,
-        "shared wake count must stay independent of session count"
+        "shared wake count must stay independent of session count: before={} after={}",
+        many_before.reconciliation_wakes,
+        many_after.reconciliation_wakes
     );
     assert!(
         many_after.reconciliation_wakes > many_before.reconciliation_wakes,

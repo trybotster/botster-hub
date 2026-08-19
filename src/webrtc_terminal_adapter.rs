@@ -4,6 +4,8 @@
 //! [`TerminalFrame`] and does not inspect snapshot phases or snapshot bodies.
 //! `close` and `Drop` return without waiting on DataChannel I/O or a writer lock.
 
+use std::collections::BTreeMap;
+use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
 
@@ -69,6 +71,7 @@ struct WebRtcTerminalAdapterInner {
     would_block: AtomicBool,
     slot: Mutex<Option<Vec<u8>>>,
     wake: AdapterWake,
+    close_work: Arc<AtomicBool>,
 }
 
 impl WebRtcTerminalAdapterInner {
@@ -79,6 +82,7 @@ impl WebRtcTerminalAdapterInner {
             would_block: AtomicBool::new(false),
             slot: Mutex::new(None),
             wake: AdapterWake::new(),
+            close_work: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -99,6 +103,7 @@ impl WebRtcTerminalAdapterInner {
 
     fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
+        self.close_work.store(true, Ordering::SeqCst);
         match self.slot.try_lock() {
             Ok(mut slot) => {
                 *slot = None;
@@ -229,8 +234,16 @@ impl WebRtcTerminalAdapter {
     }
 
     fn pair_with_wake(wake: AdapterWake) -> (Self, WebRtcTerminalAdapterHandle) {
+        Self::pair_with_wake_and_close_work(wake, Arc::new(AtomicBool::new(false)))
+    }
+
+    fn pair_with_wake_and_close_work(
+        wake: AdapterWake,
+        close_work: Arc<AtomicBool>,
+    ) -> (Self, WebRtcTerminalAdapterHandle) {
         let mut inner = WebRtcTerminalAdapterInner::new();
         inner.wake = wake;
+        inner.close_work = close_work;
         let inner = Arc::new(inner);
         (
             Self {
@@ -295,10 +308,11 @@ struct WebRtcMuxInner {
     wake: AdapterWake,
     dying: AtomicBool,
     close_events_admitted: AtomicBool,
-    routes: Mutex<Vec<WebRtcMuxRoute>>,
+    routes: Mutex<BTreeMap<(String, String, u64), WebRtcMuxRoute>>,
     pending_events: Mutex<Vec<DaemonEvent>>,
     suppress_sessions: Mutex<Vec<String>>,
     suppress_generations: Mutex<Vec<(String, String, u64)>>,
+    close_work: Mutex<Arc<AtomicBool>>,
 }
 
 struct WebRtcMuxRoute {
@@ -316,16 +330,30 @@ impl WebRtcConnectionMux {
                 wake: AdapterWake::new(),
                 dying: AtomicBool::new(false),
                 close_events_admitted: AtomicBool::new(false),
-                routes: Mutex::new(Vec::new()),
+                routes: Mutex::new(BTreeMap::new()),
                 pending_events: Mutex::new(Vec::new()),
                 suppress_sessions: Mutex::new(Vec::new()),
                 suppress_generations: Mutex::new(Vec::new()),
+                close_work: Mutex::new(Arc::new(AtomicBool::new(false))),
             }),
         }
     }
 
+    pub(crate) fn bind_close_work(&self, flag: Arc<AtomicBool>) {
+        if let Ok(mut slot) = self.inner.close_work.lock() {
+            *slot = flag;
+        }
+    }
+
     pub(crate) fn create_adapter(&self) -> (WebRtcTerminalAdapter, WebRtcTerminalAdapterHandle) {
-        WebRtcTerminalAdapter::pair_with_wake(self.inner.wake.clone())
+        let close_work = self
+            .inner
+            .close_work
+            .lock()
+            .ok()
+            .map(|slot| Arc::clone(&*slot))
+            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+        WebRtcTerminalAdapter::pair_with_wake_and_close_work(self.inner.wake.clone(), close_work)
     }
 
     pub(crate) fn admit_close_events(&self) {
@@ -346,18 +374,17 @@ impl WebRtcConnectionMux {
         handle: WebRtcTerminalAdapterHandle,
     ) {
         if let Ok(mut routes) = self.inner.routes.lock() {
-            routes.retain(|route| {
-                !(route.session_id == session_id
-                    && route.subscription_id == subscription_id
-                    && route.generation == generation)
-            });
-            routes.push(WebRtcMuxRoute {
-                session_id,
-                subscription_id,
-                generation,
-                handle,
-                reported: false,
-            });
+            let key = (session_id.clone(), subscription_id.clone(), generation);
+            routes.insert(
+                key,
+                WebRtcMuxRoute {
+                    session_id,
+                    subscription_id,
+                    generation,
+                    handle,
+                    reported: false,
+                },
+            );
         }
         self.inner.wake.wake();
     }
@@ -372,7 +399,7 @@ impl WebRtcConnectionMux {
     pub(crate) fn close_all(&self) {
         self.inner.dying.store(true, Ordering::SeqCst);
         if let Ok(mut routes) = self.inner.routes.lock() {
-            for route in routes.drain(..) {
+            for (_, route) in std::mem::take(&mut *routes) {
                 route.handle.close();
             }
         }
@@ -414,6 +441,8 @@ impl WebRtcConnectionMux {
         self.queue_closed_subscription_events_bounded(
             |session_id| Some(session_is_live(session_id)),
             usize::MAX,
+            None,
+            usize::MAX,
         )
         .classified
     }
@@ -422,16 +451,19 @@ impl WebRtcConnectionMux {
         &self,
         mut classify: impl FnMut(&str) -> Option<bool>,
         max_candidates: usize,
+        after_route: Option<&(String, String, u64)>,
+        max_entries_visited: usize,
     ) -> crate::unix_terminal_adapter::ClosedEventSliceProgress {
         if self.is_dying() {
             if let Ok(mut routes) = self.inner.routes.lock() {
-                for route in routes.iter_mut() {
+                for route in routes.values_mut() {
                     route.reported = true;
                 }
             }
             return crate::unix_terminal_adapter::ClosedEventSliceProgress {
                 classified: 0,
                 more: false,
+                after_route: None,
             };
         }
         let suppressed_sessions = self
@@ -448,24 +480,36 @@ impl WebRtcConnectionMux {
             .unwrap_or_default();
         let mut queued = Vec::new();
         let mut classified = 0;
+        let mut visited = 0;
         let mut more = false;
+        let mut last_visited = after_route.cloned();
         if let Ok(mut routes) = self.inner.routes.lock() {
-            for route in routes.iter_mut() {
-                if route.reported || !route.handle.is_closed() {
-                    continue;
-                }
-                if classified >= max_candidates {
+            let start = match after_route {
+                Some(after) => Bound::Excluded(after.clone()),
+                None => Bound::Unbounded,
+            };
+            for (key, route) in routes.range_mut((start, Bound::Unbounded)) {
+                if visited >= max_entries_visited {
                     more = true;
                     break;
+                }
+                if !route.reported && route.handle.is_closed() && classified >= max_candidates {
+                    more = true;
+                    break;
+                }
+                visited += 1;
+                last_visited = Some(key.clone());
+                if route.reported || !route.handle.is_closed() {
+                    continue;
                 }
                 classified += 1;
                 if suppressed_sessions
                     .iter()
                     .any(|session| session == &route.session_id)
-                    || suppressed_generations.iter().any(|key| {
-                        key.0 == route.session_id
-                            && key.1 == route.subscription_id
-                            && key.2 == route.generation
+                    || suppressed_generations.iter().any(|existing| {
+                        existing.0 == route.session_id
+                            && existing.1 == route.subscription_id
+                            && existing.2 == route.generation
                     })
                 {
                     route.reported = true;
@@ -498,7 +542,11 @@ impl WebRtcConnectionMux {
             }
             self.inner.wake.wake();
         }
-        crate::unix_terminal_adapter::ClosedEventSliceProgress { classified, more }
+        crate::unix_terminal_adapter::ClosedEventSliceProgress {
+            classified,
+            more,
+            after_route: last_visited,
+        }
     }
 
     pub(crate) fn pop_pending_event(&self) -> Option<DaemonEvent> {
@@ -528,7 +576,7 @@ impl WebRtcConnectionMux {
             return Vec::new();
         };
         routes
-            .iter()
+            .values()
             .filter_map(|route| {
                 if route.handle.is_closed() {
                     return None;
@@ -724,6 +772,32 @@ mod tests {
         mux.close_all();
         assert_eq!(mux.queue_closed_subscription_events(|_| true), 0);
         assert!(mux.pop_pending_event().is_none());
+    }
+
+    #[test]
+    fn close_event_slice_bounds_open_prefix() {
+        let mux = WebRtcConnectionMux::new();
+        let mut open_adapters = Vec::new();
+        for index in 0..8 {
+            let (adapter, handle) = mux.create_adapter();
+            mux.register(format!("open-{index:02}"), "sub".to_string(), 1, handle);
+            open_adapters.push(adapter);
+        }
+        let (_closed_adapter, closed) = mux.create_adapter();
+        mux.register("z-closed".to_string(), "sub".to_string(), 1, closed.clone());
+        closed.close();
+        let first = mux.queue_closed_subscription_events_bounded(|_| Some(true), 8, None, 8);
+        assert_eq!(first.classified, 0);
+        assert!(first.more);
+        let second = mux.queue_closed_subscription_events_bounded(
+            |_| Some(true),
+            8,
+            first.after_route.as_ref(),
+            8,
+        );
+        assert_eq!(second.classified, 1);
+        assert!(!second.more);
+        let _ = open_adapters;
     }
 
     #[test]

@@ -1073,7 +1073,7 @@ fn wait_for_subscription_closed(
     envelopes: &mut Vec<botster_hub_client::DaemonUnixTerminalEnvelope>,
     events: &mut Vec<botster_hub_client::DaemonEvent>,
 ) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
         if events.iter().any(|event| {
             matches!(

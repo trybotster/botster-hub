@@ -13,11 +13,21 @@ Revision 3 answers Plan Review `review_1787104175_260710`:
 - `finding_1787104176_752235`: CloseEvents uses the exact **non-mutating** registry-state query instead of `observe_session_lifecycle`, so it cannot advance lifecycle or raise a journal wake; a behavior matrix (running / exited / shutdown / query-error) plus a no-wake proof enters acceptance (sections 3 and Acceptance).
 - `finding_1787104176_111090`: the existing vault checklist items are updated in place with revision context; no new checklist.
 
-Implement notes (revision 3 as shipped):
-- `reconciliation_wakes` still counts Maintenance slices only. Pump progress is the flood PTY oracle and the ready-Spawn observation.
-- After-control close-event queue remains, using the exact registry query.
+Revision 4 answers Implement Review `review_1787118229_406859`:
+- `finding_1787118229_281425`: remove the after-control full-set close-event scan. CloseEvents runs only as a Pump phase.
+- `finding_1787118229_230218`: admission, mux-route, and stream cursors resume with `BTreeMap::range` plus a visit budget for open, reported, unbound, and pre-cursor prefixes.
+- `finding_1787118229_191801`: Status and ReadModeFlags no longer remake Pump. Mark sources are the documented Pump work sources only.
+- `finding_1787118229_310222`: keep idle `reconciliation_wakes` `<= 4` by not self-rearming Pump from reads.
+- `finding_1787118229_810551`: this plan now matches Maintenance-only wake accounting.
+
+Implement notes (revision 4, answering Review `review_1787118229_406859`):
+- `reconciliation_wakes` increments once per executed Maintenance slice. Pump progress is the flood PTY oracle and the ready-Spawn observation. Interval due marks Pump and wakes Maintenance. Status and ReadModeFlags do not remake Pump.
+- Control turns do not scan muxes for close events. CloseEvents runs only as a selected Pump phase.
 - CloseEvents retries Absent and query error instead of marking reported.
-- Successful control remakes Pump pending. Interval due also wakes Maintenance. One turn still runs one class.
+- Pump is marked only at documented sources: interval due, successful Spawn/SpawnSessionType/Attach, Detach/ShutdownSession/RemoveSession (including failed RemoveSession), and an incomplete Pump phase. Status, ReadModeFlags, ReadScreen, and other reads do not remake Pump.
+- CloseEvents and InventoryReconcile resume with `BTreeMap::range` and a per-slice visit budget, so open, reported, unbound, and pre-cursor prefixes cannot make one slice O(total rows).
+- Adapter close sets one coalesced close-work flag. The owner loop marks Pump and prefers CloseEvents. Interval due marks Pump and wakes Maintenance.
+- Interval due also wakes Maintenance. One turn still runs one class.
 
 ## Target
 
@@ -72,7 +82,7 @@ Implement one explicit bounded scheduler for the two Hub owner-loop background c
   - Turn with no queued control and a pending class: run one fairly selected background slice.
   - Otherwise block on the control channel with the reconciliation deadline (existing `receive_owner_event`).
 - When the reconciliation interval is due, the loop marks Pump pending and advances `next_reconciliation`. The loop does not run the pump inline after a maintenance slice. This removes the stacked path at `src/daemon_transport.rs:367-374`.
-- `reconciliation_wakes` increments once per executed background slice of either class, so the existing counter-progress oracles keep observing background progress.
+- `reconciliation_wakes` increments once per executed Maintenance slice. Interval due marks Pump and wakes Maintenance so package-entity fanout and the idle/flood oracles share one counter. Pump does not increment it.
 
 ### 3. Pump class: a bounded phase rotation
 
@@ -81,22 +91,22 @@ The current `pump_bound_unix_routes` performs full-set work in one call: a full 
 Both non-observe phases consume the two exact queries delivered by registered Core dependency `ticket_1787104273_140454`: an exact terminal-subscription membership query for one `(SessionId, SubscriptionId)`, and an exact **non-mutating** session registry-state query for one `SessionId`. The owner loop stops calling `list_terminal_subscriptions` and stops calling `list_sessions` for close classification.
 
 **PumpPhase::CloseEvents**
-- Visits admissions in key order with a resume cursor over the admission maps (`unix_admissions`, then `webrtc_admissions`).
-- Per-slice caps: `max_admissions_visited` and `max_candidate_classifications` (constants, same order of magnitude as the existing slice caps such as `CONSUMER_REFRESH_MAX = 8`).
+- Visits admissions in key order with a resume cursor over the admission maps (`unix_admissions`, then `webrtc_admissions`). The next admission is `BTreeMap::range` from the exclusive cursor, not `keys().find` from the map start.
+- Per-slice caps: `max_admissions_visited`, `max_candidate_classifications`, and `max_route_entries_visited` (constants, same order of magnitude as the existing slice caps such as `CONSUMER_REFRESH_MAX = 8`). Mux scans count open and already-reported rows toward the entry budget and resume with a route cursor.
 - The suppression predicate stops calling the full `runtime.list_sessions()` per candidate. It classifies each candidate with the exact **non-mutating** registry-state query. Semantics are preserved exactly against today's predicate (`src/daemon_transport.rs:4641`): a `Running` state does not suppress, so the running-session adapter close still emits `TerminalSubscriptionClosed`; any non-running state (stopping, exited, stale) suppresses; an absent session suppresses; a query error suppresses (suppress-safe, matching today's `Err -> true` fallback).
 - Because the query is non-mutating, CloseEvents cannot advance session lifecycle and cannot raise a journal-advanced wake. Wake handling stays in one place: only `PumpPhase::Observe` and the exact-session observes on ReadScreen/ShutdownSession can raise the journal wake, and every site that sees `take_journal_advanced_wake` marks Maintenance pending (`note_authoritative_mutation`) without pulling inline.
 - An incomplete visit keeps Pump pending and resumes after the cursor.
 
 **PumpPhase::InventoryReconcile**
 - Purpose unchanged: close Hub-bound routes whose Core subscription vanished (the backstop behind mux close events).
-- Continuation slices walk the Hub bound-stream keys in order with a resume cursor and validate at most `max_routes_validated` routes per slice. Each route is validated with the exact subscription-membership query: explicit absence, or a generation mismatch under the existing `reconcile_inventory` rule (`src/daemon_attach_stream.rs:339`), closes the adapter and cancels the stream. No full inventory list, no snapshot, no sort.
+- Continuation slices walk the Hub stream map with `BTreeMap::range` from the exclusive cursor and visit at most `max_routes_validated` map entries per slice, including unbound rows. Bound rows among those entries are validated with the exact subscription-membership query: explicit absence, or a generation mismatch under the existing `reconcile_inventory` rule (`src/daemon_attach_stream.rs:339`), closes the adapter and cancels the stream. No full inventory list, no snapshot, no sort, no prefix rescan.
 - This removes the previous revision's frozen-snapshot design and its O(n log n) `list_terminal_subscriptions` acquisition. The reviewer confirmed at pinned Core `302c7f7` that the full-list call clones and sorts every live row, so it cannot be bounded from the Hub side; the exact query from `ticket_1787104273_140454` is the bounded replacement.
 
 **PumpPhase::Observe**
 - The observe call uses `OBSERVE_SLICE_BUDGET` (unchanged constant: 8 sessions, 64 KiB, `max_elapsed` 8 ms) with the existing `observe_resume` cursor. An incomplete slice keeps Pump pending.
 - On `take_journal_advanced_wake`, the phase calls `note_authoritative_mutation()` only. It does not run `JournalPull` or `ProjectionApply` inline. The next fairly selected Maintenance slice performs the pull.
 
-Pump pending mark sources: reconciliation interval due; successful Attach bind (Unix and WebRTC); successful Spawn/SpawnSessionType acknowledgement; incomplete previous pump phase; subscription-close reconciliation need.
+Pump pending mark sources: reconciliation interval due; successful Attach bind (Unix and WebRTC); successful Spawn/SpawnSessionType acknowledgement; incomplete previous pump phase; Detach, ShutdownSession, and RemoveSession (close or inventory-reconcile need). Status, ReadModeFlags, ReadScreen, ListSessions, and other reads do not mark Pump.
 
 ### 4. Operation paths lose broad lifecycle observation
 
@@ -172,7 +182,8 @@ Deterministic scheduler state tests (unit):
 - Control precedence: extend `queued_control_precedes_a_due_maintenance_slice` to cover both classes pending.
 - No cancellation: a selected slice decision survives a control message that arrives after selection (decision-level proof; negative control with the rule inverted must go red).
 - Composed maintenance fairness: with Pump continuously rearmed and Maintenance continuously pending, drive the composed scheduler for a fixed turn sequence and assert that `SubscriberDelivery` and `HostBridge` each execute within an exact finite turn bound. With class round-robin (Maintenance every second background turn) and the 9-kind inner rotation, each kind must execute within 18 background turns; the test asserts the deterministic turn indices, not elapsed time.
-- Pump phase work bounds: each Pump phase test proves its per-slice caps (`max_admissions_visited`, `max_candidate_classifications`, `max_routes_validated`, `OBSERVE_SLICE_BUDGET` items/bytes) and cursor continuation. A check (test or source assertion) proves the owner loop makes no `list_terminal_subscriptions` and no close-classification `list_sessions` call.
+- Pump phase work bounds: each Pump phase test proves its per-slice caps (`max_admissions_visited`, `max_candidate_classifications`, `max_route_entries_visited`, `max_routes_validated` as a stream-map visit budget, `OBSERVE_SLICE_BUDGET` items/bytes) and cursor continuation. Admission and stream cursors resume with `BTreeMap::range`. Mux close-event visits count open and reported rows toward the entry budget. A check (test or source assertion) proves the owner loop makes no `list_terminal_subscriptions` and no close-classification `list_sessions` call, and that the control path does not call a full-set close-event helper.
+- Status and ReadModeFlags do not mark Pump. A decision-level test covers those reads plus Attach/RemoveSession mark sources.
 - CloseEvents behavior matrix: a running-session adapter close still emits `TerminalSubscriptionClosed`; an exited session stays suppressed; a shut-down (stopping/stale/absent) session stays suppressed; a query error stays suppressed. A negative proof shows CloseEvents raises no journal-advanced wake (the registry-state query is non-mutating).
 - InventoryReconcile exact-query behavior: absence closes the route; a generation mismatch under the existing rule closes the route; a live matching generation survives; a route re-bound with a newer generation is not closed on stale expectations.
 - ReadModeFlags no-observe check: issuing ReadModeFlags moves no observation counter (or the equivalent source-scan assertion).
