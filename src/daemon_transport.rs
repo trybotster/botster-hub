@@ -222,7 +222,6 @@ fn mark_due_reconciliation(state: &mut DaemonControlState, now: Instant) {
     }
     if state.pending_runtime.take_close_work() {
         state.background.mark_pump();
-        state.pump.prefer_close_events();
     }
 }
 
@@ -2461,14 +2460,6 @@ pub(crate) fn handle_control_message(
             }
             if should_mark_pump_after_control(&request, succeeded) {
                 state.background.mark_pump();
-                if matches!(
-                    request,
-                    DaemonRequest::Detach { .. }
-                        | DaemonRequest::ShutdownSession { .. }
-                        | DaemonRequest::RemoveSession { .. }
-                ) {
-                    state.pump.prefer_close_events();
-                }
             }
             if daemon.runtime().is_some_and(|runtime| {
                 runtime.package_event_router().peek_delivery_wake()
@@ -5188,7 +5179,6 @@ fn run_pump_observe_phase(daemon: &HubDaemon, state: &mut DaemonControlState) ->
         if runtime.take_journal_advanced_wake() {
             state.maintenance.note_authoritative_mutation();
             state.background.mark_pump();
-            state.pump.prefer_close_events();
         }
         state.observe_resume.is_some()
     } else {
@@ -8124,6 +8114,10 @@ mod tests {
         ));
         const TRANSPORT: &str = include_str!("daemon_transport.rs");
         let production = TRANSPORT.split("mod tests").next().expect("production");
+        assert!(
+            !production.contains("prefer_close_events"),
+            "close work must not rewrite the Pump phase pointer"
+        );
         assert!(
             !production.contains("queue_unix_subscription_closed_events"),
             "control must not scan every Unix mux for close events"

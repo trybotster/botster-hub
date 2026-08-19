@@ -236,9 +236,9 @@ impl PumpScheduler {
         phase
     }
 
-    /// Run CloseEvents next so a just-closed adapter is classified before Observe.
-    pub fn prefer_close_events(&mut self) {
-        self.next = PumpPhase::CloseEvents;
+    #[cfg(test)]
+    fn force_next(&mut self, phase: PumpPhase) {
+        self.next = phase;
     }
 }
 
@@ -876,13 +876,14 @@ fn run_observe_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
     match runtime.observe_lifecycle_slice(now_seconds(), resume.as_ref(), OBSERVE_SLICE_BUDGET) {
         Ok(slice) => {
             if let Some(reason) = slice.resync_required {
-                if matches!(
-                    reason,
-                    SessionLifecycleResyncReason::ObservePassUnavailable
-                        | SessionLifecycleResyncReason::SourceChanged
-                ) {
+                if matches!(reason, SessionLifecycleResyncReason::SourceChanged) {
                     state.observe_resume = None;
                     start_baseline_recovery(state);
+                } else if matches!(reason, SessionLifecycleResyncReason::ObservePassUnavailable) {
+                    state.observe_resume = None;
+                    if !state.projection.baseline_complete || state.baseline.is_some() {
+                        start_baseline_recovery(state);
+                    }
                 }
                 return;
             }
@@ -3188,5 +3189,52 @@ mod tests {
             }
         );
         assert_eq!(pump.reconcile_after, Some(("s".into(), "sub".into())));
+    }
+
+    #[test]
+    fn continuous_close_work_still_serves_observe_and_inventory_reconcile() {
+        let mut classes = BackgroundClassScheduler::default();
+        let mut pump = PumpScheduler::default();
+        let mut observe_at = None;
+        let mut close_at = None;
+        let mut reconcile_at = None;
+        for turn in 0..6 {
+            classes.mark_pump();
+            assert_eq!(
+                classes.select(false),
+                Some(BackgroundClass::Pump),
+                "close work keeps Pump pending without inventing Maintenance priority"
+            );
+            match pump.take_phase() {
+                PumpPhase::Observe if observe_at.is_none() => observe_at = Some(turn),
+                PumpPhase::CloseEvents if close_at.is_none() => close_at = Some(turn),
+                PumpPhase::InventoryReconcile if reconcile_at.is_none() => {
+                    reconcile_at = Some(turn)
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(observe_at, Some(0));
+        assert_eq!(close_at, Some(1));
+        assert_eq!(reconcile_at, Some(2));
+    }
+
+    #[test]
+    fn inverted_close_phase_rewrite_starves_observe_and_reconcile() {
+        let mut pump = PumpScheduler::default();
+        let mut saw_observe = false;
+        let mut saw_reconcile = false;
+        for _ in 0..6 {
+            pump.force_next(PumpPhase::CloseEvents);
+            match pump.take_phase() {
+                PumpPhase::Observe => saw_observe = true,
+                PumpPhase::InventoryReconcile => saw_reconcile = true,
+                PumpPhase::CloseEvents => {}
+            }
+        }
+        assert!(
+            !saw_observe && !saw_reconcile,
+            "rewriting next to CloseEvents every turn is the starvation this ticket forbids"
+        );
     }
 }

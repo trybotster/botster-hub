@@ -17,7 +17,7 @@
 
 Independent routing: `project_pipelines_current_context` ticket/run `target_id` and `list_spawn_targets` both map `tgt_7e208a0c76a44980a83b63af976b1f22` to `trybotster/botster-hub`. The approved plan used the same routing. Work stayed in this ticket worktree.
 
-This report answers Review `review_1787118229_406859` (five open findings). Plan Review `review_1787112708_321608` approved revision 3. Revision 4 resynchronizes the committed plan with the shipped wake, Pump-mark, and traversal contracts.
+This report answers Review `review_1787124251_499447` (four open findings) after the prior return `review_1787118229_406859`. Plan Review `review_1787112708_321608` approved revision 3. Revision 4 resynchronizes wake, Pump-mark, traversal, close-work, and baseline contracts.
 
 ## Repository playbook and other playbooks/notes applied
 
@@ -58,21 +58,20 @@ This report answers Review `review_1787118229_406859` (five open findings). Plan
 
 ## Review findings addressed
 
-- `finding_1787118229_281425`: removed the after-control full-set close-event helpers. CloseEvents runs only as a Pump phase.
-- `finding_1787118229_230218`: admission, mux-route, and stream cursors resume with `BTreeMap::range`. Mux and inventory slices count open, reported, and unbound rows toward a visit budget.
-- `finding_1787118229_191801`: Status, ReadModeFlags, ReadScreen, and other reads do not mark Pump. Mark sources are interval due, successful Spawn/SpawnSessionType/Attach, Detach/ShutdownSession/RemoveSession, incomplete Pump phases, adapter-close work, and a journal-advanced Observe follow-up.
-- `finding_1787118229_310222`: idle `reconciliation_wakes` stays `<= 4` without Status self-rearm. Interval marks Pump and wakes Maintenance. Pump slices do not increment the counter.
-- `finding_1787118229_810551`: the committed plan now matches shipped wake accounting: `reconciliation_wakes` counts Maintenance slices only.
+- `finding_1787124251_448797`: close work only marks Pump. It does not rewrite the phase pointer. Continuous close-work tests prove Observe and InventoryReconcile still run within three Pump turns.
+- `finding_1787124251_317843`: suppression is keyed `BTreeSet` lookup per visited candidate. Slices no longer clone the full suppression lists.
+- `finding_1787124251_627712`: `cancel_stream` removes one client's route by owner+generation key. Sibling connection ledgers stay intact.
+- `finding_1787124251_430554`: a sealed baseline does not remint on `ObservePassUnavailable`. One clean `./test.sh --locked --offline` passed, including `focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible`.
 
 ## Files changed
 
 Feature behavior:
 
-- `src/daemon_maintenance.rs` — policy-neutral `BackgroundClassScheduler`, `PumpScheduler` with route cursors and `prefer_close_events`, visit-budget constants, and deterministic scheduler proofs.
-- `src/daemon_transport.rs` — one control then at most one class slice. Pump phases `Observe` → `CloseEvents` → `InventoryReconcile`. No after-control mux scan. No Status/ReadModeFlags Pump remake. Adapter-close work marks Pump and prefers CloseEvents.
-- `src/daemon_attach_stream.rs` — `reconcile_inventory_slice` uses `BTreeMap::range` and counts unbound rows toward the visit budget.
+- `src/daemon_maintenance.rs` — policy-neutral `BackgroundClassScheduler`, `PumpScheduler` with route cursors, visit-budget constants, and deterministic scheduler proofs. Close work does not rewrite the phase pointer.
+- `src/daemon_transport.rs` — one control then at most one class slice. Pump phases `Observe` → `CloseEvents` → `InventoryReconcile`. No after-control mux scan. No Status/ReadModeFlags Pump remake. Close work marks Pump only.
+- `src/daemon_attach_stream.rs` — `reconcile_inventory_slice` uses `BTreeMap::range` and counts unbound rows toward the visit budget. One stale cancel removes only that client's keyed route.
 - `src/runtime.rs` — thin wrappers for `session_registry_state` and `terminal_subscription_generation`.
-- `src/unix_terminal_adapter.rs` and `src/webrtc_terminal_adapter.rs` — mux routes are `BTreeMap`s. Close-event slices resume with an exclusive route cursor and a visited-entry budget. Adapter close sets a coalesced close-work flag.
+- `src/unix_terminal_adapter.rs` and `src/webrtc_terminal_adapter.rs` — mux routes are `BTreeMap`s. Close-event slices resume with an exclusive route cursor and a visited-entry budget. Suppression is a keyed set lookup. Adapter close sets a coalesced close-work flag.
 
 Pin / fixture identity (unchanged from the first Implement pass):
 
@@ -100,7 +99,7 @@ Registered Core dependency `ticket_1787104273_140454` / `dependency_1787104278_3
 
 1. `reconciliation_wakes` counts Maintenance slices only. Pump progress is the flood PTY oracle and the ready-Spawn observation. Plan revision 4 records this.
 2. CloseEvents retries `Absent` and query error instead of marking the route reported. Found(Running) still emits. Found(non-running) still suppresses.
-3. Adapter close sets one coalesced close-work flag; the owner loop prefers CloseEvents.
+3. Adapter close sets one coalesced close-work flag and marks Pump. It does not rewrite the Pump phase pointer.
 4. The Unix Core-close waiter uses a 20s bound, matching WebRTC. The previous 8s bound depended on Status-rearm and an unbounded after-control scan starving drain.
 
 ## Tests and downstream proof

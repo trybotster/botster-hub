@@ -4,7 +4,7 @@
 //! [`TerminalFrame`] and does not inspect snapshot phases or snapshot bodies.
 //! `close` and `Drop` return without waiting on socket I/O or a writer lock.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
@@ -284,8 +284,8 @@ struct UnixMuxInner {
     dying: AtomicBool,
     routes: Mutex<BTreeMap<(String, String, u64), UnixMuxRoute>>,
     pending_events: Mutex<Vec<DaemonEvent>>,
-    suppress_sessions: Mutex<Vec<String>>,
-    suppress_generations: Mutex<Vec<(String, String, u64)>>,
+    suppress_sessions: Mutex<BTreeSet<String>>,
+    suppress_generations: Mutex<BTreeSet<(String, String, u64)>>,
     close_work: Mutex<Arc<AtomicBool>>,
 }
 
@@ -312,8 +312,8 @@ impl UnixConnectionMux {
                 dying: AtomicBool::new(false),
                 routes: Mutex::new(BTreeMap::new()),
                 pending_events: Mutex::new(Vec::new()),
-                suppress_sessions: Mutex::new(Vec::new()),
-                suppress_generations: Mutex::new(Vec::new()),
+                suppress_sessions: Mutex::new(BTreeSet::new()),
+                suppress_generations: Mutex::new(BTreeSet::new()),
                 close_work: Mutex::new(Arc::new(AtomicBool::new(false))),
             }),
         }
@@ -379,10 +379,7 @@ impl UnixConnectionMux {
 
     pub(crate) fn suppress_session(&self, session_id: impl Into<String>) {
         if let Ok(mut sessions) = self.inner.suppress_sessions.lock() {
-            let session_id = session_id.into();
-            if !sessions.iter().any(|existing| existing == &session_id) {
-                sessions.push(session_id);
-            }
+            sessions.insert(session_id.into());
         }
     }
 
@@ -393,11 +390,33 @@ impl UnixConnectionMux {
         generation: u64,
     ) {
         if let Ok(mut generations) = self.inner.suppress_generations.lock() {
-            let key = (session_id.into(), subscription_id.into(), generation);
-            if !generations.iter().any(|existing| existing == &key) {
-                generations.push(key);
-            }
+            generations.insert((session_id.into(), subscription_id.into(), generation));
         }
+    }
+
+    fn session_is_suppressed(&self, session_id: &str) -> bool {
+        self.inner
+            .suppress_sessions
+            .lock()
+            .is_ok_and(|sessions| sessions.contains(session_id))
+    }
+
+    fn generation_is_suppressed(
+        &self,
+        session_id: &str,
+        subscription_id: &str,
+        generation: u64,
+    ) -> bool {
+        self.inner
+            .suppress_generations
+            .lock()
+            .is_ok_and(|generations| {
+                generations.contains(&(
+                    session_id.to_string(),
+                    subscription_id.to_string(),
+                    generation,
+                ))
+            })
     }
 
     #[cfg(test)]
@@ -433,18 +452,6 @@ impl UnixConnectionMux {
                 after_route: None,
             };
         }
-        let suppressed_sessions = self
-            .inner
-            .suppress_sessions
-            .lock()
-            .map(|sessions| sessions.clone())
-            .unwrap_or_default();
-        let suppressed_generations = self
-            .inner
-            .suppress_generations
-            .lock()
-            .map(|generations| generations.clone())
-            .unwrap_or_default();
         let mut queued = Vec::new();
         let mut classified = 0;
         let mut visited = 0;
@@ -470,14 +477,12 @@ impl UnixConnectionMux {
                     continue;
                 }
                 classified += 1;
-                if suppressed_sessions
-                    .iter()
-                    .any(|session| session == &route.session_id)
-                    || suppressed_generations.iter().any(|existing| {
-                        existing.0 == route.session_id
-                            && existing.1 == route.subscription_id
-                            && existing.2 == route.generation
-                    })
+                if self.session_is_suppressed(&route.session_id)
+                    || self.generation_is_suppressed(
+                        &route.session_id,
+                        &route.subscription_id,
+                        route.generation,
+                    )
                 {
                     route.reported = true;
                     continue;
@@ -785,6 +790,50 @@ mod tests {
         assert!(!second.more);
         assert!(mux.pop_pending_event().is_some());
         let _ = (open_adapters, reported_handles);
+    }
+
+    #[test]
+    fn close_event_slice_uses_keyed_suppression_without_cloning_the_prefix() {
+        let mux = UnixConnectionMux::new();
+        for index in 0..64 {
+            mux.suppress_session(format!("suppressed-{index:03}"));
+            mux.suppress_generation(format!("suppressed-{index:03}"), "sub", 1);
+        }
+        let mut open_adapters = Vec::new();
+        for index in 0..8 {
+            let (adapter, handle) = mux.create_adapter();
+            mux.register(format!("open-{index:02}"), "sub".to_string(), 1, handle);
+            open_adapters.push(adapter);
+        }
+        let (_suppressed_adapter, suppressed) = mux.create_adapter();
+        mux.register(
+            "suppressed-000".to_string(),
+            "sub".to_string(),
+            1,
+            suppressed.clone(),
+        );
+        suppressed.close();
+        let (_live_adapter, live) = mux.create_adapter();
+        mux.register("z-live".to_string(), "sub".to_string(), 1, live.clone());
+        live.close();
+        let first = mux.queue_closed_subscription_events_bounded(|_| Some(true), 8, None, 8);
+        assert_eq!(first.classified, 0);
+        let second = mux.queue_closed_subscription_events_bounded(
+            |_| Some(true),
+            8,
+            first.after_route.as_ref(),
+            8,
+        );
+        assert_eq!(second.classified, 2);
+        assert_eq!(mux.queue_closed_subscription_events(|_| true), 0);
+        match mux.pop_pending_event() {
+            Some(DaemonEvent::TerminalSubscriptionClosed { session_id, .. }) => {
+                assert_eq!(session_id, "z-live");
+            }
+            other => panic!("expected live close event, got {other:?}"),
+        }
+        assert!(mux.pop_pending_event().is_none());
+        let _ = open_adapters;
     }
 
     #[test]

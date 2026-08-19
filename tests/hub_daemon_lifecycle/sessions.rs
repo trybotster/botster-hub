@@ -2975,7 +2975,9 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
             .lifecycle_counters;
     assert_eq!(
         many_after.lifecycle_baseline_reads, many_before.lifecycle_baseline_reads,
-        "session count must not restore filesystem-backed baseline polling"
+        "session count must not restore filesystem-backed baseline polling: before={} after={}",
+        many_before.lifecycle_baseline_reads,
+        many_after.lifecycle_baseline_reads
     );
     assert_eq!(
         many_after.entity_delivery_attempts, many_before.entity_delivery_attempts,
