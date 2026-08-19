@@ -102,15 +102,15 @@ pub(crate) fn spawn_request(config: &botster_hub::HubConfig) -> SessionSpawnRequ
 
 pub(crate) struct SessionCleanupGuard {
     pub(crate) data_dir: PathBuf,
-    pub(crate) session_id: &'static str,
+    pub(crate) session_id: String,
     pub(crate) armed: bool,
 }
 
 impl SessionCleanupGuard {
-    pub(crate) fn new(data_dir: &Path, session_id: &'static str) -> Self {
+    pub(crate) fn new(data_dir: &Path, session_id: impl Into<String>) -> Self {
         Self {
             data_dir: data_dir.to_path_buf(),
-            session_id,
+            session_id: session_id.into(),
             armed: true,
         }
     }
@@ -128,7 +128,7 @@ impl Drop for SessionCleanupGuard {
                 .arg("shutdown")
                 .arg("--data-dir")
                 .arg(&self.data_dir)
-                .arg(self.session_id)
+                .arg(&self.session_id)
                 .output();
         }
     }
@@ -593,6 +593,30 @@ pub(crate) fn shutdown_after_authoritative_exit(
     )
     .unwrap_or_else(|error| panic!("{context}: ShutdownSession request failed: {error}"));
     assert_session_cleanup_already_exited(&shutdown, session_id, context);
+}
+
+pub(crate) fn production_cleanup_after_authoritative_exit(
+    endpoint: &botster_hub_client::DaemonEndpoint,
+    session_id: &str,
+    context: &str,
+) {
+    shutdown_after_authoritative_exit(endpoint, session_id, context);
+    let remove = botster_hub_client::request(
+        endpoint,
+        botster_hub_client::DaemonRequest::RemoveSession {
+            session_id: session_id.to_string(),
+        },
+    )
+    .unwrap_or_else(|error| panic!("{context}: RemoveSession request failed: {error}"));
+    assert_eq!(
+        remove.kind,
+        botster_hub_client::DaemonResponseKind::SessionRemoved,
+        "{context}: RemoveSession must succeed after already_exited, got kind={:?} error.code={:?} error.operation={:?} error.message={:?}",
+        remove.kind,
+        remove.error.as_ref().map(|error| &error.code),
+        remove.error.as_ref().map(|error| &error.operation),
+        remove.error.as_ref().map(|error| &error.message)
+    );
 }
 
 pub(crate) fn live_output_decoded_bytes(

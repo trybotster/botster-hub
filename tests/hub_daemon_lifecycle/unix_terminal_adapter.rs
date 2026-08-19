@@ -1815,6 +1815,7 @@ fn process_exit_and_shutdown_session_do_not_emit_terminal_subscription_closed() 
         &mut envelopes,
         &mut events,
     );
+    let mut exit_cleanup = SessionCleanupGuard::new(hub.data_dir(), "pex-exit");
     spawn_and_bind(
         &mut stream,
         &mut reader,
@@ -1824,7 +1825,8 @@ fn process_exit_and_shutdown_session_do_not_emit_terminal_subscription_closed() 
         &mut envelopes,
         &mut events,
     );
-    thread::sleep(Duration::from_secs(1));
+    let mut shutdown_cleanup = SessionCleanupGuard::new(hub.data_dir(), "pex-shutdown");
+    wait_for_authoritative_session_exit(hub.endpoint(), "pex-exit");
     let shutdown = request_collecting_mux(
         &mut stream,
         &mut reader,
@@ -1855,6 +1857,8 @@ fn process_exit_and_shutdown_session_do_not_emit_terminal_subscription_closed() 
         }),
         "process exit and ShutdownSession must stay on lifecycle paths: {events:?}"
     );
+    exit_cleanup.disarm();
+    shutdown_cleanup.disarm();
     hub.shutdown().expect("shutdown isolated hub");
 }
 

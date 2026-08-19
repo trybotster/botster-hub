@@ -4,13 +4,13 @@
 | --- | --- |
 | Ticket | `ticket_1786912572_610381` |
 | Run | `run_1787136288_939918` |
-| Step | `botster_stack_implement` (`run_step_1787138637_630555`) |
+| Step | `botster_stack_implement` (`run_step_1787141583_673479`) |
 | Target repository | `botster-hub` (`trybotster/botster-hub`) |
 | `target_id` | `tgt_7e208a0c76a44980a83b63af976b1f22` |
 | Pipeline worktree | the ticket worktree on `project-pipelines/ticket_1786912572_610381` |
-| Plan | `docs/plans/replace-pty-process-pid-and-marker-lifecycle-oracles.md` revision 2 (`d2f507b`), answering `review_1787138618_933815` |
+| Plan | `docs/plans/replace-pty-process-pid-and-marker-lifecycle-oracles.md` revision 3, answering `review_1787141572_759360` |
 | Delivery | `merge_policy: direct`; no pull request |
-| Class | runtime-teardown, narrowly: terminal-state markers versus live-runtime session completion. Test-only. |
+| Class | runtime-teardown, narrowly: terminal-state markers versus live-runtime session completion, plus the Review-found ShutdownSession close-event race |
 | Locked Core | `Cargo.toml` / lockfile pin `8fce2041b9fe742cb2a6df9e74cb262606672742`. Unchanged. |
 
 Independent routing: `project_pipelines_current_context` ticket/run `target_id` is `tgt_7e208a0c76a44980a83b63af976b1f22`. `BOTSTER_TARGET_REPO` and the origin remote are `trybotster/botster-hub`. `list_spawn_targets` maps that id to admitted target `botster-hub`. The approved plan used the same `target_id` and repository. Implementation stayed in this run worktree.
@@ -60,9 +60,9 @@ Not loaded: [[project-pipelines-playbook]]. This ticket does not change Project 
 ### Constraints applied before edits
 
 - Work only in the `botster-hub` ticket worktree.
-- Test-only. No `src/` change. No Core pin change. No `packages/hub-test-support` change.
+- Tests remain the primary change. Review required one production seam: `ShutdownSession` suppresses close events before Core teardown. No Core pin change. No `packages/hub-test-support` change.
 - Completion waits consume production `ReadScreen` exact-session observe and production `ShutdownSession` classification. Terminal Drain does not discover lifecycle.
-- Focused tests arm `SessionCleanupGuard` immediately after Spawn and disarm only after production `ShutdownSession` then `RemoveSession`. Hub-process teardown is not worker cleanup.
+- Every input-gated producer test arms `SessionCleanupGuard` immediately after Spawn and disarms only after production `ShutdownSession` then `RemoveSession`. Hub-process teardown is not worker cleanup.
 - Sleep is polling backoff inside a deadline. It is not a correctness oracle. The held-live negative control counts observe turns.
 - Use repository wrappers: `./test.sh --locked`, plus the documented session-worker prebuild.
 - Direct merge. Do not create a pull request.
@@ -71,33 +71,42 @@ Not loaded: [[project-pipelines-playbook]]. This ticket does not change Project 
 
 Feature behavior:
 
-- `tests/hub_daemon_lifecycle/session_fixtures.rs` — `wait_for_authoritative_session_exit` (production `ReadScreen` then `ListSessions`), `assert_session_stays_running_across_observe_turns`, `wait_for_producer_ready`, deterministic `SessionCleanup { already_exited }` assert with full typed error body, and `shutdown_after_authoritative_exit`.
+- `tests/hub_daemon_lifecycle/session_fixtures.rs` — `wait_for_authoritative_session_exit` (production `ReadScreen` then `ListSessions`), `assert_session_stays_running_across_observe_turns`, `wait_for_producer_ready`, deterministic `SessionCleanup { already_exited }` assert with full typed error body, owned-id `SessionCleanupGuard`, and `production_cleanup_after_authoritative_exit`.
 - `tests/hub_daemon_lifecycle/package_fixtures.rs` — finite producer prints `producer-ready` and flushes before the release gate; new held-live producer waits on a second exit-release file after writing exact bytes.
-- `tests/hub_daemon_lifecycle/sessions.rs` — focused tests `external_hub_finite_producer_completion_uses_production_lifecycle_signal` and `external_hub_held_live_producer_defers_completion_until_exit_release`; migrations of unix exact-bytes, split-UTF-8, ghostsnp-then-bytes, and `shutdown_after_observed_exit_returns_session_cleanup`.
-- `tests/hub_daemon_lifecycle/webrtc_proofs.rs` — WebRTC exact-bytes and round-based shutdown-after-live-exit tests wait for authoritative exit, then assert one `SessionCleanup { already_exited }` branch. Blind-call typed-error siblings stay untouched.
+- `tests/hub_daemon_lifecycle/sessions.rs` — focused tests `external_hub_finite_producer_completion_uses_production_lifecycle_signal` and `external_hub_held_live_producer_defers_completion_until_exit_release`; migrations of unix exact-bytes, split-UTF-8, ghostsnp-then-bytes, and `shutdown_after_observed_exit_returns_session_cleanup`, each with a cleanup guard except the ungated `sleep 0.1` observed-exit test.
+- `tests/hub_daemon_lifecycle/webrtc_proofs.rs` — WebRTC exact-bytes and round-based shutdown-after-live-exit tests wait for authoritative exit, then assert one `SessionCleanup { already_exited }` branch, with guards armed after Spawn. Blind-call typed-error siblings stay untouched.
+- `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs` — `process_exit_and_shutdown_session_do_not_emit_terminal_subscription_closed` waits on production observe for `pex-exit` and arms cleanup guards.
+- `src/daemon_transport.rs` — Active `ShutdownSession` suppresses Unix and WebRTC close events before Core teardown.
 
 Handoff:
 
 - `docs/reports/replace-pty-process-pid-and-marker-lifecycle-oracles-implement.md` — this report.
-- `docs/plans/replace-pty-process-pid-and-marker-lifecycle-oracles.md` — already committed as Plan revision 2. Not edited in Implement.
+- `docs/reports/held-live-red-on-revert-ablation.txt` — executed red-on-revert evidence.
+- `docs/plans/replace-pty-process-pid-and-marker-lifecycle-oracles.md` — revision 3 answering `review_1787141572_759360`.
 
 Merge/rebase cleanup: none.
 
 ## Ownership boundaries preserved
 
-All edits are Hub-owned lifecycle tests and this report. Production Hub code, Core pin, hub-client DTOs, published hub-test-support fixtures, and other repositories were not changed.
+All edits are Hub-owned. Core pin, hub-client DTOs, published hub-test-support fixtures, and other repositories were not changed.
 
-The completion signal uses two shipped Hub production surfaces: exact-session observe inside `ReadScreen` (`src/daemon_transport.rs` ReadScreen arm) and exact-session classification inside `ShutdownSession`. Those paths already call pinned Core `observe_session_lifecycle`. This ticket did not add observation to Spawn, Attach, Drain, Input, Resize, or other operation paths.
+The completion signal uses two shipped Hub production surfaces: exact-session observe inside `ReadScreen` and exact-session classification inside `ShutdownSession`. Review required one additional production seam: Active `ShutdownSession` now suppresses adapter close events before Core teardown so CloseEvents cannot emit `TerminalSubscriptionClosed` while the registry row is still Running. This ticket did not add observation to Spawn, Attach, Drain, Input, Resize, or other operation paths.
 
 ## Cross-repo dependencies or separately routed work
 
-None. No missing production seam was found. No Core, hub-client, Web, TUI, or Project Pipelines ticket was registered.
+None. The missing production seam is Hub-owned and is fixed in this ticket. No Core, hub-client, Web, TUI, or Project Pipelines ticket was registered.
 
 ## Deviations from plan
 
-None that change the committed plan contract.
+Revision 3 records the Review-directed production suppress-before-teardown seam and the migrated-test cleanup guards. That is an accepted scope change from the original test-only non-scope, required by `review_1787141572_759360`. The committed plan contract is resynced in revision 3.
 
-Implementation-only helpers that the plan implied but did not name: `wait_for_producer_ready`, `assert_session_cleanup_already_exited`, and `shutdown_after_authoritative_exit`. They keep the six call-site migrations and the bounded ready wait from duplicating panic text. `shutdown_short_lived_session` still has other callers and was left in place.
+Implementation-only helpers that the plan implied but did not name: `wait_for_producer_ready`, `assert_session_cleanup_already_exited`, `shutdown_after_authoritative_exit`, and `production_cleanup_after_authoritative_exit`. `shutdown_short_lived_session` still has other callers and was left in place.
+
+## Review findings addressed
+
+- `finding_1787141572_169138`: cleanup guards armed after Spawn in the five input-gated migrated producer tests; disarm only after RemoveSession.
+- `finding_1787141572_503373`: `ShutdownSession` suppresses close events before Core teardown; pex test waits on production observe instead of `sleep 1s`.
+- `finding_1787141573_874007`: executed ablation recorded in `docs/reports/held-live-red-on-revert-ablation.txt`. Command `./test.sh --locked --test hub_daemon_lifecycle_test external_hub_held_live_producer_defers_completion_until_exit_release -- --exact`. Ablated `assert_session_stays_running_across_observe_turns` to require `exited`. Exit 101 at `session_fixtures.rs:513`, left `Some("running")`, right `Some("exited")`. Restored. Rerun of the same focused test passed.
 
 ## Tests and downstream proof run
 
@@ -108,6 +117,7 @@ Production path proved by the tests themselves:
 3. `ShutdownSession` returns `SessionCleanup { outcome: "already_exited" }`.
 4. Focused tests then `RemoveSession` and disarm `SessionCleanupGuard`.
 5. Held-live negative control: after exact non-UTF-8 bytes are on the live plane, five production observe turns still report `running` until the exit-release file exists.
+6. Active `ShutdownSession` suppresses close events before Core teardown. `process_exit_and_shutdown_session_do_not_emit_terminal_subscription_closed` waits for `pex-exit` through production observe.
 
 Commands (repository wrappers; no bare `cargo test` for runtime proofs):
 
@@ -125,9 +135,11 @@ Commands (repository wrappers; no bare `cargo test` for runtime proofs):
   - `shutdown_after_observed_exit_returns_session_cleanup`
   - `external_hub_webrtc_live_output_preserves_exact_bytes`
   - `external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup`
-- One clean default-concurrency `./test.sh --locked` without retry — pass. `hub_daemon_lifecycle_test`: 255 passed, 1 ignored (pre-existing `#[ignore]` adversarial proof), 0 failed.
+- `./test.sh --locked --test hub_daemon_lifecycle_test process_exit_and_shutdown_session_do_not_emit_terminal_subscription_closed -- --exact` — pass
+- Red-on-revert ablation of the held-live running assert — fail, exit 101, then restored green
+- One clean default-concurrency `./test.sh --locked` without retry after the Review-return fixes — pass. `hub_daemon_lifecycle_test`: 255 passed, 1 ignored (pre-existing `#[ignore]` adversarial proof), 0 failed.
 
-`git diff --stat origin/main` is `tests/` plus `docs/plans/` and this report. No PID, descendant-PID, done-file, or pre-exit-marker completion oracle was introduced.
+No PID, descendant-PID, done-file, or pre-exit-marker completion oracle was introduced.
 
 ## Runtime-teardown lenses implemented
 
@@ -136,7 +148,7 @@ Commands (repository wrappers; no bare `cargo test` for runtime proofs):
 | Isolation | Each focused and migrated test owns one isolated hub or CLI data directory and `daemon_test_guard`. |
 | Bounds | Exit and ready waits use a 10 s deadline and print last `ReadScreen` kind, typed error body, and listing. Panic-path worker cleanup is `SessionCleanupGuard` driving production `sessions shutdown`. No unbounded `block_on`. |
 | Late-message matrix | Not applicable. No new ownership-creating message surface. Tests consume existing Spawn, Attach, ReadScreen, ShutdownSession, RemoveSession. |
-| Production-path proof | The oracle is the production path: ReadScreen exact-session observe, then ListSessions `exited`, then ShutdownSession `already_exited`. Held-live is the live negative control. |
+| Production-path proof | The oracle is the production path: ReadScreen exact-session observe, then ListSessions `exited`, then ShutdownSession `already_exited`. Held-live is the live negative control with an executed red-on-revert ablation. Active ShutdownSession suppresses close events before Core teardown. |
 | Ownership identity | Per-test `session_id` strings. Guards key on data directory plus session id. |
 | Sibling fail-closed | Isolated hubs. Failure-path worker cleanup is the armed guard, not Hub-process teardown. Residual identity failure remains harness taint. |
 

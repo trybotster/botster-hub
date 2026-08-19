@@ -1205,6 +1205,7 @@ fn external_hub_live_output_preserves_exact_bytes() {
             command: python_script_command(&script_path),
         })
         .expect("spawn write(2) producer");
+    let mut session_cleanup = SessionCleanupGuard::new(hub.data_dir(), "exact-bytes-session");
     connection
         .request(&botster_hub_client::DaemonRequest::Attach {
             session_id: "exact-bytes-session".to_string(),
@@ -1244,11 +1245,12 @@ fn external_hub_live_output_preserves_exact_bytes() {
         "concatenated live bytes must preserve the write(2) sequence, got {concatenated:?}"
     );
 
-    shutdown_after_authoritative_exit(
+    production_cleanup_after_authoritative_exit(
         &endpoint,
         "exact-bytes-session",
         "unix exact-bytes after observed exit",
     );
+    session_cleanup.disarm();
     hub.shutdown().expect("shutdown isolated hub");
 }
 
@@ -1269,6 +1271,7 @@ fn external_hub_live_output_preserves_split_utf8_frames() {
             command: python_script_command(&script_path),
         })
         .expect("spawn split UTF-8 producer");
+    let mut session_cleanup = SessionCleanupGuard::new(hub.data_dir(), "split-utf8-session");
     connection
         .request(&botster_hub_client::DaemonRequest::Attach {
             session_id: "split-utf8-session".to_string(),
@@ -1345,11 +1348,12 @@ fn external_hub_live_output_preserves_split_utf8_frames() {
     assert_eq!(concatenated, [0xE2, 0x82, 0xAC]);
     assert!(!payload_has_utf8_replacement(&concatenated));
 
-    shutdown_after_authoritative_exit(
+    production_cleanup_after_authoritative_exit(
         &endpoint,
         "split-utf8-session",
         "unix split-utf8 after observed exit",
     );
+    session_cleanup.disarm();
     hub.shutdown().expect("shutdown isolated hub");
 }
 
@@ -1368,6 +1372,7 @@ fn external_hub_live_output_keeps_ghostsnp_then_attached_then_bytes() {
             command: python_script_command(&script_path),
         })
         .expect("spawn live producer");
+    let mut session_cleanup = SessionCleanupGuard::new(hub.data_dir(), "order-bytes-session");
     let attach = connection
         .request(&botster_hub_client::DaemonRequest::Attach {
             session_id: "order-bytes-session".to_string(),
@@ -1418,11 +1423,12 @@ fn external_hub_live_output_keeps_ghostsnp_then_attached_then_bytes() {
         }
     }
 
-    shutdown_after_authoritative_exit(
+    production_cleanup_after_authoritative_exit(
         &endpoint,
         "order-bytes-session",
         "unix order-bytes after observed exit",
     );
+    session_cleanup.disarm();
     hub.shutdown().expect("shutdown isolated hub");
 }
 
@@ -1455,38 +1461,6 @@ fn observe_exact_live_byte_window(
             .windows(expected.len())
             .any(|window| window == expected),
         "concatenated live bytes must preserve the write(2) sequence, got {concatenated:?}"
-    );
-}
-
-fn production_cleanup_after_authoritative_exit(
-    endpoint: &botster_hub_client::DaemonEndpoint,
-    session_id: &str,
-    context: &str,
-) {
-    wait_for_authoritative_session_exit(endpoint, session_id);
-    let shutdown = botster_hub_client::request(
-        endpoint,
-        botster_hub_client::DaemonRequest::ShutdownSession {
-            session_id: session_id.to_string(),
-        },
-    )
-    .unwrap_or_else(|error| panic!("{context}: ShutdownSession request failed: {error}"));
-    assert_session_cleanup_already_exited(&shutdown, session_id, context);
-    let remove = botster_hub_client::request(
-        endpoint,
-        botster_hub_client::DaemonRequest::RemoveSession {
-            session_id: session_id.to_string(),
-        },
-    )
-    .unwrap_or_else(|error| panic!("{context}: RemoveSession request failed: {error}"));
-    assert_eq!(
-        remove.kind,
-        botster_hub_client::DaemonResponseKind::SessionRemoved,
-        "{context}: RemoveSession must succeed after already_exited, got kind={:?} error.code={:?} error.operation={:?} error.message={:?}",
-        remove.kind,
-        remove.error.as_ref().map(|error| &error.code),
-        remove.error.as_ref().map(|error| &error.operation),
-        remove.error.as_ref().map(|error| &error.message)
     );
 }
 
