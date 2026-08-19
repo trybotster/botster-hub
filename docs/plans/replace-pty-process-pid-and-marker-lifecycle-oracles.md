@@ -216,6 +216,6 @@ Non-scope:
 
 ## Vault gaps
 
-1. [[host ShutdownSession classification must call the exact-session Core query]] still says "This convention is not shipped behavior yet." The exact-session classification ships at `src/daemon_transport.rs:4743`. The note's status is stale and worth updating.
+1. [[host ShutdownSession classification must call the exact-session Core query]] now records the shipped exact-session classification (`src/daemon_transport.rs:4743`). The earlier staleness this plan reported is resolved; no vault update remains for this item.
 2. Capture candidate after implementation: "finite and held-live PTY producer completion uses the production exact-session observe wait" — the fixture convention this ticket establishes, so later test authors do not reinvent PID or marker oracles.
 3. Capture candidate: "release-file-gated python producers prove startup with a ready marker before release" — the bounded-startup contract.
