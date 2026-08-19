@@ -20,6 +20,10 @@ Revision 4 answers Implement Review `review_1787118229_406859`:
 - `finding_1787118229_310222`: keep idle `reconciliation_wakes` `<= 4` by not self-rearming Pump from reads.
 - `finding_1787118229_810551`: this plan now matches Maintenance-only wake accounting.
 
+Implement notes (revision 7, answering Review `review_1787133525_290421`):
+- The incomplete-Observe scheduler transition lives in `apply_observe_pass_result`. Production `run_observe_slice` and the composed fairness test both call it.
+- An ablation that rewrites `next` to Observe after that helper must miss the HostBridge turn-8 and SubscriberDelivery turn-10 bounds.
+
 Implement notes (revision 6, answering Review `review_1787131785_727118`):
 - The nine-kind `MaintenanceSliceKind` rotation is unchanged. An incomplete Observe pass stores `observe_resume` and does not rewrite `next`.
 - `observe_resume` is continuation state for the next Observe kind. It is not a `needs_work` self-wake, so idle accounting does not count the other eight kinds as wakes.

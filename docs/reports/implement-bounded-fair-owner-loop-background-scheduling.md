@@ -13,11 +13,11 @@
 | Locked Core | `Cargo.lock` pins `botster-core` at `8fce2041b9fe742cb2a6df9e74cb262606672742` |
 | Delivery | direct-merge; no pull request (`merge_policy: direct`) |
 | Class | not runtime-teardown |
-| Plan | `docs/plans/implement-bounded-fair-owner-loop-background-scheduling.md` revision 6 |
+| Plan | `docs/plans/implement-bounded-fair-owner-loop-background-scheduling.md` revision 7 |
 
 Independent routing: `project_pipelines_current_context` ticket/run `target_id` and `list_spawn_targets` both map `tgt_7e208a0c76a44980a83b63af976b1f22` to `trybotster/botster-hub`. The approved plan used the same routing. Work stayed in this ticket worktree.
 
-This report answers Review `review_1787131785_727118` (two open findings) after prior returns `review_1787126462_489606`, `review_1787124251_499447`, and `review_1787118229_406859`. Plan Review `review_1787112708_321608` approved revision 3. Revision 6 restores the unchanged nine-kind rotation.
+This report answers Review `review_1787133525_290421` after prior returns `review_1787131785_727118`, `review_1787126462_489606`, `review_1787124251_499447`, and `review_1787118229_406859`. Plan Review `review_1787112708_321608` approved revision 3. Revision 7 routes the incomplete-Observe transition through one helper.
 
 ## Repository playbook and other playbooks/notes applied
 
@@ -58,8 +58,7 @@ This report answers Review `review_1787131785_727118` (two open findings) after 
 
 ## Review findings addressed
 
-- `finding_1787131785_826374`: `prefer_observe` is removed. An incomplete Observe pass stores `observe_resume` and leaves the nine-kind pointer unchanged. `observe_resume` is not `needs_work`, so it does not rearm the whole rotation as idle wakes. The composed test with a continuously incomplete Observe pass still executes HostBridge at turn 8 and SubscriberDelivery at turn 10.
-- `finding_1787131785_814522`: plan revision 6 restates that the `MaintenanceSliceKind` round-robin is unchanged. The 18-turn composed fairness acceptance check stays in force.
+- `finding_1787133525_734028`: `run_observe_slice` applies an incomplete pass only through `apply_observe_pass_result`. The composed fairness test calls that same helper. An ablation that then rewrites `next` to Observe misses HostBridge at turn 8 and SubscriberDelivery at turn 10.
 
 ## Files changed
 
@@ -79,12 +78,12 @@ Pin / fixture identity (unchanged from the first Implement pass):
 Proof:
 
 - `tests/hub_daemon_lifecycle/sessions.rs` — Status flood PTY progress; eight-session idle sample waits 1.2 s and prints wake/change/delivery/drain deltas.
-- `src/daemon_maintenance.rs` tests — sealed unavailable observe; incomplete unavailable recovery; incomplete Observe keeps the nine-kind rotation; composed incomplete Observe still serves HostBridge and SubscriberDelivery; `observe_resume` and `projection_dirty` alone are not `needs_work`.
+- `src/daemon_maintenance.rs` tests — `apply_observe_pass_result` drives composed fairness; an Observe-rewrite ablation misses HostBridge and SubscriberDelivery; sealed unavailable observe; `observe_resume` is not `needs_work`.
 - `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs` — Unix Core-close wait matches the WebRTC 20s bound so CloseEvents can run after adapter close without a Status-rearm starvation path.
 
 Handoff:
 
-- `docs/plans/implement-bounded-fair-owner-loop-background-scheduling.md` — revision 6.
+- `docs/plans/implement-bounded-fair-owner-loop-background-scheduling.md` — revision 7.
 - `docs/reports/implement-bounded-fair-owner-loop-background-scheduling.md` — this report.
 
 ## Ownership boundaries preserved
