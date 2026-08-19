@@ -6,8 +6,8 @@
 - Target id: `tgt_7e208a0c76a44980a83b63af976b1f22`
 - Ticket: `ticket_1786663583_640263`
 - Run: `run_1787158085_722550`
-- Implement step: `run_step_1787177596_331327` (sequence 15, sixth Review return)
-- Prior Implement steps: `run_step_1787176520_385387`, `run_step_1787173421_386472`, `run_step_1787170885_485950`, `run_step_1787169048_973962`, `run_step_1787165407_410166`, `run_step_1787159472_279191`
+- Implement step: `run_step_1787179103_419699` (sequence 17, seventh Review return)
+- Prior Implement steps: `run_step_1787177596_331327`, `run_step_1787176520_385387`, `run_step_1787173421_386472`, `run_step_1787170885_485950`, `run_step_1787169048_973962`, `run_step_1787165407_410166`, `run_step_1787159472_279191`
 - Approved plan: `docs/plans/expose-client-event-subscriptions-on-the-host-control-protocol.md` at `98ae1f9`
 - Plan Review: `review_1787159455_211294` approved
 - Code Review: `review_1787165393_430946` `changes_required` (7 findings, resolved)
@@ -15,7 +15,8 @@
 - Code Review: `review_1787170872_296170` `changes_required` (3 findings, resolved)
 - Code Review: `review_1787173413_659341` `changes_required` (2 findings, resolved)
 - Code Review: `review_1787176510_516746` `changes_required` (1 finding, resolved)
-- Code Review: `review_1787177586_705734` `changes_required` (1 finding)
+- Code Review: `review_1787177586_705734` `changes_required` (1 finding, resolved)
+- Code Review: `review_1787179092_801191` `changes_required` (1 finding)
 - `teardown_class_applies`: no
 - Direct-merge pipeline. No pull request.
 
@@ -74,6 +75,12 @@ Sixth Review return (`review_1787177586_705734`):
 | --- | --- | --- |
 | `finding_1787177586_367843` Fan-out tests bypass queued completion | high | Load the real event-probe Lua plugin with two `worktree_created` handlers. The production `PackageEventDelivery` slice queues both Core jobs. `CompletionDrain` retires both flights. Request IDs differ. Occupancy and outstanding pulls return to zero. |
 
+Seventh Review return (`review_1787179092_801191`):
+
+| Finding | Severity | Fix |
+| --- | --- | --- |
+| `finding_1787179092_749617` Test proof expands production Rust API | high | Removed the public owner-loop re-exports. Restored `#[cfg(test)]` on `test_outstanding_pulls`. Moved the real two-handler Core queue and drain proof into `daemon_maintenance` unit tests. |
+
 Constraints applied for this return: Hub host-control and in-repo
 `botster-hub-client` only. Core pin unchanged. No Web/TUI edits. No
 protocol bump.
@@ -127,11 +134,12 @@ Checklist: reused `checklist_1786867714_922206` as required.
 
 ## Files changed
 
-Sixth Review return (this visit):
+Seventh Review return (this visit):
 
-- `tests/hub_lua_runtime_test.rs` — owner-loop queues and drains two real Core completions
-- `src/lib.rs` — test-only re-export of production maintenance slices
-- `src/package_event_router.rs` — `test_outstanding_pulls` visible to integration tests
+- `src/lib.rs` — no public owner-loop re-exports
+- `src/package_event_router.rs` — `test_outstanding_pulls` is test-only again
+- `src/daemon_maintenance.rs` — crate-private two-handler Core queue and drain proof
+- `tests/hub_lua_runtime_test.rs` — removed the public-API owner-loop test
 - `docs/reports/expose-client-event-subscriptions-on-the-host-control-protocol-implement.md`
 
 Prior Review-return files remain:
@@ -270,9 +278,10 @@ Repo gates:
 
 - `cargo build --locked -p botster-core-daemon --bin botster-session-worker`
 - `./test.sh --locked` — one clean default-concurrency pass after the
-  sixth Review-return fixes, 0 failures. Lifecycle 264 passed / 1 ignored.
-  Lua runtime 63 passed, including the owner-loop two-handler Core queue
-  and completion drain. Hub lib 452 passed. Hub client 78 passed.
+  seventh Review-return fixes, 0 failures. Lifecycle 264 passed / 1 ignored.
+  Lua runtime 62 passed. Hub lib 453 passed, including the crate-private
+  owner-loop two-handler Core queue and completion drain. Hub client 78
+  passed.
 - `cargo clippy --workspace --all-targets --locked -- -D warnings` clean.
 - `cargo fmt --all -- --check`
 - `cargo test --doc --workspace`
