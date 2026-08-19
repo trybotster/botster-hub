@@ -5,6 +5,12 @@ Run: `run_1787136288_939918`. Base: `origin/main` (`0a3458a`).
 
 This ticket replaces the process-fixture portion of superseded `ticket_1786875812_242946`. Work starts from current `main`. The superseded branch is not cherry-picked.
 
+Revision 2 answers Plan Review `review_1787137814_111496`:
+- `finding_1787137814_295179` (product, high): the held-live producer is guarded by a `SessionCleanupGuard` armed immediately after Spawn and kept armed through the held-live phase. `IsolatedHub` shutdown is no longer named as worker cleanup anywhere in this plan — [[hub shutdown preserves durable session workers]], so Hub-process teardown does not prove worker teardown. Success-path cleanup is production `ShutdownSession` then `RemoveSession`; the guard disarms only after both succeed. Sections 3 and the teardown lens answers are updated.
+- `finding_1787137814_876482` (product, medium): the gate order now prebuilds the session worker with `cargo build --locked -p botster-core-daemon --bin botster-session-worker` before the one clean `./test.sh --locked` (README line 42; [[Hub bee15e7 builds the session worker from botster-core-daemon]]). The no-retry full-suite requirement is unchanged.
+- `finding_1787137815_989928` (process, low): [[botster-architecture]] and [[cli-patterns]] are loaded and recorded in Context loaded and in the Plan checklist evidence. Neither changes the ownership decisions already in this plan; `cli-patterns` self-identifies as a mixed-generation index that defers to [[botster-architecture]] and the repository playbook.
+- `finding_1787137815_770816` (process, low): the next Plan gate submission carries `plan_uri`, `artifact_id`, `checklist_id`, `target_id`, and `target_repository` as structured evidence, and the advance request repeats them.
+
 ## Target
 
 - Target repository: `botster-hub` (`trybotster/botster-hub`).
@@ -15,6 +21,7 @@ This ticket replaces the process-fixture portion of superseded `ticket_178687581
 
 - Repository playbook: [[botster-hub-playbook]].
 - Role playbooks: [[planner-playbook]], [[botster-planner-playbook]].
+- Architecture maps (mandatory per [[botster-planner-playbook]]): [[botster-architecture]]; [[cli-patterns]] (mixed-generation index — loaded for runtime/PTY pattern context, not ownership authority, per its own header).
 - Class overlay: [[botster runtime teardown lenses]] (this ticket exists because terminal-state markers diverge from live-runtime session completion; answers are in the lens section below).
 - Targeted atomic notes:
   - [[observed-exit waits must issue a production exact-session observe turn]]
@@ -32,6 +39,8 @@ This ticket replaces the process-fixture portion of superseded `ticket_178687581
   - [[real daemon start boundaries serialize against process global taint]]
   - [[session registry process pid identifies the pty command not the session worker]]
   - [[hub drain advances non attached session lifecycle]] (historical; Drain-based discovery stays forbidden)
+  - [[hub shutdown preserves durable session workers]]
+  - [[Hub bee15e7 builds the session worker from botster-core-daemon]]
 - Repository code surveyed:
   - `src/daemon_transport.rs:3546-3548` — production `ReadScreen` calls `observe_session_lifecycle` for its exact `session_id`. This is the shipped exact-session observe stimulus.
   - `src/daemon_transport.rs:4738-4743` — production `ShutdownSession` classification calls `observe_session_lifecycle` for its exact `session_id` and returns typed `Cleanup` / `Missing` / `Stopping` / `Active` results.
@@ -89,21 +98,22 @@ Fixture startup becomes explicit and bounded: the test observes `producer-ready`
 
 ### 3. Focused tests (new, in `tests/hub_daemon_lifecycle/sessions.rs` next to the exact-bytes family)
 
+Both focused tests arm a `SessionCleanupGuard` immediately after Spawn. `IsolatedHub::data_dir()` is public (`crates/botster-hub-test-support/src/isolated_hub.rs`), so the guard's `sessions shutdown --data-dir <dir> <session_id>` path works against the isolated harness. [[hub shutdown preserves durable session workers]]: Hub-process teardown does not prove worker teardown, so the guard — not `IsolatedHub` shutdown or Drop — owns panic-path session cleanup.
+
 - `external_hub_finite_producer_completion_uses_production_lifecycle_signal`:
   1. `daemon_test_guard()`; isolated hub (`start_isolated_live_output_hub`).
-  2. Spawn the finite producer with exact non-UTF-8 bytes (reuse the `[0x00, 0x1b, 0x5b, 0x31, 0x6d, 0xff, 0xc0]` family).
+  2. Spawn the finite producer with exact non-UTF-8 bytes (reuse the `[0x00, 0x1b, 0x5b, 0x31, 0x6d, 0xff, 0xc0]` family). Arm `SessionCleanupGuard::new(hub.data_dir(), session_id)` immediately after Spawn.
   3. Wait bounded for `producer-ready`; write the release file.
   4. Observe the exact byte window on the live plane; assert no U+FFFD replacement.
   5. `wait_for_authoritative_session_exit`.
-  6. `ShutdownSession` must return `SessionCleanup { outcome: "already_exited" }` deterministically — a hard assert that prints the full typed error body on failure per [[flake oracles over typed response frames must print the full typed error body]].
-  7. `RemoveSession`; hub shutdown.
+  6. Production `ShutdownSession` must return `SessionCleanup { outcome: "already_exited" }` deterministically — a hard assert that prints the full typed error body on failure per [[flake oracles over typed response frames must print the full typed error body]].
+  7. Production `RemoveSession` succeeds; only then disarm the guard; hub shutdown.
 - `external_hub_held_live_producer_defers_completion_until_exit_release`:
-  1. Same isolation; spawn the held-live producer with the same exact non-UTF-8 bytes.
+  1. Same isolation; spawn the held-live producer with the same exact non-UTF-8 bytes. Arm `SessionCleanupGuard` immediately after Spawn and keep it armed through the entire held-live phase — a panic during the ready wait, the byte wait, the negative control, or the exit-release wait must still reap the held-live Python process, worker, and PTY group through the guard's production `sessions shutdown` path.
   2. Bounded ready wait; release; observe the exact byte window.
   3. Negative control: `assert_session_stays_running_across_observe_turns`. The marker bytes are already on the terminal plane, yet repeated production exact-session observation must keep reporting `running`. This is the in-tree proof that a marker written before process exit cannot prove Core session completion; it also serves as the red control demanded by [[a regression test must be shown to go red with the fix reverted]] — an oracle that treated observed bytes as completion would fail here.
   4. Write the exit release file; `wait_for_authoritative_session_exit` — the same oracle flips only on real Core completion.
-  5. `ShutdownSession` returns `SessionCleanup { already_exited }`; `RemoveSession`; hub shutdown.
-  6. A `SessionCleanupGuard` (or `IsolatedHub` shutdown) stays armed through the held-live phase so a mid-test panic cannot leak the held-live worker tree.
+  5. Production `ShutdownSession` returns `SessionCleanup { already_exited }`; production `RemoveSession` succeeds; only after both succeed, disarm the guard; hub shutdown.
 
 ### 4. Replace the racy completion oracles at the existing finite-producer call sites
 
@@ -159,11 +169,11 @@ Non-scope:
 
 - `teardown_class_applies`: yes, narrowly. The ticket's subject is terminal-state vs live-runtime divergence (marker bytes on the terminal plane vs Core session completion). The ticket is test-only; no production teardown path changes.
 - `teardown_isolation`: each test owns one isolated hub (unique data directory, `daemon_test_guard`). A failed producer or session affects only its own hub instance. Harness taint rules ([[real daemon start boundaries serialize against process global taint]]) already protect sibling tests.
-- `teardown_bounds`: every wait carries an explicit deadline with full diagnostics on expiry. The held-live producer is released (exit release file) or reaped by the armed cleanup guard / `IsolatedHub` shutdown on panic. No unbounded `block_on`; no control-plane hang is introduced.
+- `teardown_bounds`: every wait carries an explicit deadline with full diagnostics on expiry. The held-live producer is released on success (exit release file, then production `ShutdownSession` + `RemoveSession`), or reaped on panic by the armed `SessionCleanupGuard`, which drives the production `sessions shutdown` path against the harness data directory. `IsolatedHub` shutdown is not worker cleanup ([[hub shutdown preserves durable session workers]]) and is not relied on for it. No unbounded `block_on`; no control-plane hang is introduced.
 - `late_message_matrix`: not applicable — no new ownership-creating message surface is added or modified. Tests consume existing Spawn, Attach, ReadScreen, ShutdownSession, RemoveSession contracts unchanged.
 - `production_path_proof`: the completion oracle is itself the production path: `ReadScreen` → `observe_session_lifecycle(exact session)` → registry/journal advance → `ListSessions` shows `exited`; `ShutdownSession` → exact-session classification → `SessionCleanup { already_exited }`. The held-live test is the live negative control proving the signal does not fire before real exit.
 - `ownership_identity`: sessions are identified by unique per-test `session_id` strings; cleanup guards key on data directory plus session id. No reused-id hazard is introduced.
-- `sibling_fail_closed_policy`: isolated hubs mean no sibling sacrifice on success or failure. Ultimate cleanup failure falls into the existing harness taint machinery, which blocks the next daemon start rather than corrupting siblings.
+- `sibling_fail_closed_policy`: isolated hubs mean no sibling sacrifice on success or failure. Worker cleanup on the failure path is owned by the armed `SessionCleanupGuard`, never by Hub-process teardown. Ultimate cleanup failure falls into the existing harness taint machinery, which blocks the next daemon start rather than corrupting siblings.
 
 ## Risks
 
@@ -187,6 +197,7 @@ Non-scope:
    - `cargo fmt --all -- --check`
    - `cargo clippy --workspace --all-targets --locked -- -D warnings`
    - `cargo test --doc --workspace`
+   - `cargo build --locked -p botster-core-daemon --bin botster-session-worker` (required prebuild; worker-backed tests fail from a fresh worktree without it — README line 42, [[Hub bee15e7 builds the session worker from botster-core-daemon]])
    - One clean default-concurrency `./test.sh --locked` without retry. If a distinct unrelated failure appears, register a separate blocker with exact evidence instead of retrying to green.
 8. Focused lifecycle-suite evidence may additionally use `script/run-lifecycle-suite` (the exclusive wrapper for `hub_daemon_lifecycle_test`, with process census hygiene) during development; the required gate remains the clean `./test.sh --locked`.
 
