@@ -1244,7 +1244,11 @@ fn external_hub_live_output_preserves_exact_bytes() {
         "concatenated live bytes must preserve the write(2) sequence, got {concatenated:?}"
     );
 
-    shutdown_short_lived_session(&endpoint, "exact-bytes-session");
+    shutdown_after_authoritative_exit(
+        &endpoint,
+        "exact-bytes-session",
+        "unix exact-bytes after observed exit",
+    );
     hub.shutdown().expect("shutdown isolated hub");
 }
 
@@ -1341,7 +1345,11 @@ fn external_hub_live_output_preserves_split_utf8_frames() {
     assert_eq!(concatenated, [0xE2, 0x82, 0xAC]);
     assert!(!payload_has_utf8_replacement(&concatenated));
 
-    shutdown_short_lived_session(&endpoint, "split-utf8-session");
+    shutdown_after_authoritative_exit(
+        &endpoint,
+        "split-utf8-session",
+        "unix split-utf8 after observed exit",
+    );
     hub.shutdown().expect("shutdown isolated hub");
 }
 
@@ -1410,7 +1418,158 @@ fn external_hub_live_output_keeps_ghostsnp_then_attached_then_bytes() {
         }
     }
 
-    shutdown_short_lived_session(&endpoint, "order-bytes-session");
+    shutdown_after_authoritative_exit(
+        &endpoint,
+        "order-bytes-session",
+        "unix order-bytes after observed exit",
+    );
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+fn observe_exact_live_byte_window(
+    connection: &mut botster_hub_client::DaemonConnection,
+    session_id: &str,
+    expected: &[u8],
+) {
+    let events = drain_until(connection, session_id, |event| match event {
+        botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } => {
+            live_output_decoded_bytes(payload)
+                .windows(expected.len())
+                .any(|window| window == expected)
+        }
+        _ => false,
+    });
+    let mut concatenated = Vec::new();
+    for event in &events {
+        if let botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } = event {
+            let bytes = live_output_decoded_bytes(payload);
+            assert!(
+                !payload_has_utf8_replacement(&bytes),
+                "live payload must not contain U+FFFD: {bytes:?}"
+            );
+            concatenated.extend(bytes);
+        }
+    }
+    assert!(
+        concatenated
+            .windows(expected.len())
+            .any(|window| window == expected),
+        "concatenated live bytes must preserve the write(2) sequence, got {concatenated:?}"
+    );
+}
+
+fn production_cleanup_after_authoritative_exit(
+    endpoint: &botster_hub_client::DaemonEndpoint,
+    session_id: &str,
+    context: &str,
+) {
+    wait_for_authoritative_session_exit(endpoint, session_id);
+    let shutdown = botster_hub_client::request(
+        endpoint,
+        botster_hub_client::DaemonRequest::ShutdownSession {
+            session_id: session_id.to_string(),
+        },
+    )
+    .unwrap_or_else(|error| panic!("{context}: ShutdownSession request failed: {error}"));
+    assert_session_cleanup_already_exited(&shutdown, session_id, context);
+    let remove = botster_hub_client::request(
+        endpoint,
+        botster_hub_client::DaemonRequest::RemoveSession {
+            session_id: session_id.to_string(),
+        },
+    )
+    .unwrap_or_else(|error| panic!("{context}: RemoveSession request failed: {error}"));
+    assert_eq!(
+        remove.kind,
+        botster_hub_client::DaemonResponseKind::SessionRemoved,
+        "{context}: RemoveSession must succeed after already_exited, got kind={:?} error.code={:?} error.operation={:?} error.message={:?}",
+        remove.kind,
+        remove.error.as_ref().map(|error| &error.code),
+        remove.error.as_ref().map(|error| &error.operation),
+        remove.error.as_ref().map(|error| &error.message)
+    );
+}
+
+#[test]
+fn external_hub_finite_producer_completion_uses_production_lifecycle_signal() {
+    let _guard = daemon_test_guard();
+    let expected: &[u8] = &[0x00, 0x1b, 0x5b, 0x31, 0x6d, 0xff, 0xc0];
+    let hub = start_isolated_live_output_hub("finite-producer-exit");
+    let endpoint = hub.endpoint().clone();
+    let release_path = unique_short_test_dir("finite-producer-release").join("go");
+    let script_path = write_python_wait_then_write_script(&release_path, expected);
+    let mut connection = botster_hub_client::DaemonConnection::connect(&endpoint).expect("connect");
+    connection
+        .request(&botster_hub_client::DaemonRequest::Spawn {
+            session_id: "finite-producer-exit".to_string(),
+            command: python_script_command(&script_path),
+        })
+        .expect("spawn finite producer");
+    let mut session_cleanup = SessionCleanupGuard::new(hub.data_dir(), "finite-producer-exit");
+    connection
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: "finite-producer-exit".to_string(),
+            subscription_id: "finite-producer-exit-sub".to_string(),
+        })
+        .expect("attach");
+    wait_for_producer_ready(&endpoint, "finite-producer-exit");
+    fs::create_dir_all(release_path.parent().expect("release parent")).expect("create release dir");
+    fs::write(&release_path, b"go").expect("release finite producer");
+
+    observe_exact_live_byte_window(&mut connection, "finite-producer-exit", expected);
+    production_cleanup_after_authoritative_exit(
+        &endpoint,
+        "finite-producer-exit",
+        "finite producer completion",
+    );
+    session_cleanup.disarm();
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn external_hub_held_live_producer_defers_completion_until_exit_release() {
+    let _guard = daemon_test_guard();
+    let expected: &[u8] = &[0x00, 0x1b, 0x5b, 0x31, 0x6d, 0xff, 0xc0];
+    let hub = start_isolated_live_output_hub("held-live-producer");
+    let endpoint = hub.endpoint().clone();
+    let release_path = unique_short_test_dir("held-live-release").join("go");
+    let exit_release_path = unique_short_test_dir("held-live-exit").join("go");
+    let script_path =
+        write_python_held_live_script(&release_path, &exit_release_path, expected);
+    let mut connection = botster_hub_client::DaemonConnection::connect(&endpoint).expect("connect");
+    connection
+        .request(&botster_hub_client::DaemonRequest::Spawn {
+            session_id: "held-live-producer".to_string(),
+            command: python_script_command(&script_path),
+        })
+        .expect("spawn held-live producer");
+    let mut session_cleanup = SessionCleanupGuard::new(hub.data_dir(), "held-live-producer");
+    connection
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: "held-live-producer".to_string(),
+            subscription_id: "held-live-producer-sub".to_string(),
+        })
+        .expect("attach");
+    wait_for_producer_ready(&endpoint, "held-live-producer");
+    fs::create_dir_all(release_path.parent().expect("release parent")).expect("create release dir");
+    fs::write(&release_path, b"go").expect("release held-live bytes");
+
+    observe_exact_live_byte_window(&mut connection, "held-live-producer", expected);
+    assert_session_stays_running_across_observe_turns(
+        &endpoint,
+        "held-live-producer",
+        HELD_LIVE_OBSERVE_TURNS,
+    );
+    fs::create_dir_all(exit_release_path.parent().expect("exit release parent"))
+        .expect("create exit release dir");
+    fs::write(&exit_release_path, b"go").expect("release held-live exit");
+
+    production_cleanup_after_authoritative_exit(
+        &endpoint,
+        "held-live-producer",
+        "held-live producer completion",
+    );
+    session_cleanup.disarm();
     hub.shutdown().expect("shutdown isolated hub");
 }
 
@@ -3447,28 +3606,7 @@ fn shutdown_after_observed_exit_returns_session_cleanup() {
         },
     )
     .expect("spawn short-lived session");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut listed = None;
-    while Instant::now() < deadline {
-        listed =
-            botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::ListSessions)
-                .ok()
-                .and_then(|response| {
-                    response.sessions.iter().find_map(|session| {
-                        (session.session_id == "observed-exit-shutdown")
-                            .then(|| session.lifecycle.clone())
-                    })
-                });
-        if listed.as_deref() == Some("exited") {
-            break;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    assert_eq!(
-        listed.as_deref(),
-        Some("exited"),
-        "owner loop must observe natural exit before ShutdownSession"
-    );
+    wait_for_authoritative_session_exit(&endpoint, "observed-exit-shutdown");
     let shutdown = botster_hub_client::request(
         &endpoint,
         botster_hub_client::DaemonRequest::ShutdownSession {
@@ -3476,15 +3614,11 @@ fn shutdown_after_observed_exit_returns_session_cleanup() {
         },
     )
     .expect("shutdown after observed exit");
-    assert_eq!(
-        shutdown.kind,
-        botster_hub_client::DaemonResponseKind::SessionCleanup,
-        "ShutdownSession after observed exit must be cleanup, got {:?}",
-        shutdown.kind
+    assert_session_cleanup_already_exited(
+        &shutdown,
+        "observed-exit-shutdown",
+        "unix shutdown after observed exit",
     );
-    let cleanup = shutdown.cleanup.expect("cleanup body");
-    assert_eq!(cleanup.session_id, "observed-exit-shutdown");
-    assert_eq!(cleanup.outcome, "already_exited");
     shutdown_cli_daemon(&data_dir, child);
 }
 

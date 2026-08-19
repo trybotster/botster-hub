@@ -429,6 +429,172 @@ pub(crate) fn assert_shutdown_strict_natural_exit(
     }
 }
 
+pub(crate) const AUTHORITATIVE_SESSION_EXIT_WAIT: Duration = Duration::from_secs(10);
+pub(crate) const AUTHORITATIVE_OBSERVE_BACKOFF: Duration = Duration::from_millis(25);
+pub(crate) const PRODUCER_READY_MARKER: &str = "producer-ready";
+pub(crate) const HELD_LIVE_OBSERVE_TURNS: usize = 5;
+
+fn typed_response_debug(response: &botster_hub_client::DaemonResponse) -> String {
+    format!(
+        "kind={:?} error.code={:?} error.operation={:?} error.message={:?}",
+        response.kind,
+        response.error.as_ref().map(|error| &error.code),
+        response.error.as_ref().map(|error| &error.operation),
+        response.error.as_ref().map(|error| &error.message)
+    )
+}
+
+/// Production exact-session observe (`ReadScreen`) plus `ListSessions` confirmation.
+/// Sleep is polling backoff only; the assertion is `lifecycle == "exited"`.
+pub(crate) fn wait_for_authoritative_session_exit(
+    endpoint: &botster_hub_client::DaemonEndpoint,
+    session_id: &str,
+) {
+    let started_at = Instant::now();
+    let deadline = started_at + AUTHORITATIVE_SESSION_EXIT_WAIT;
+    loop {
+        let elapsed = started_at.elapsed();
+        let last_read_screen = match botster_hub_client::request(
+            endpoint,
+            botster_hub_client::DaemonRequest::ReadScreen {
+                session_id: session_id.to_string(),
+            },
+        ) {
+            Ok(response) => typed_response_debug(&response),
+            Err(error) => format!("request error: {error}"),
+        };
+
+        let last_listing = match botster_hub_client::request(
+            endpoint,
+            botster_hub_client::DaemonRequest::ListSessions,
+        ) {
+            Ok(response) => {
+                if response.sessions.iter().any(|session| {
+                    session.session_id == session_id && session.lifecycle == "exited"
+                }) {
+                    return;
+                }
+                format!("{:?}", response.sessions)
+            }
+            Err(error) => format!("request error: {error}"),
+        };
+
+        assert!(
+            Instant::now() < deadline,
+            "session {session_id} did not reach lifecycle exited under production ReadScreen observation within {:?}; elapsed={elapsed:?} last_read_screen={last_read_screen} last_listing={last_listing}",
+            AUTHORITATIVE_SESSION_EXIT_WAIT
+        );
+        thread::sleep(AUTHORITATIVE_OBSERVE_BACKOFF);
+    }
+}
+
+/// Negative control: counted production observe turns keep reporting `running`.
+pub(crate) fn assert_session_stays_running_across_observe_turns(
+    endpoint: &botster_hub_client::DaemonEndpoint,
+    session_id: &str,
+    turns: usize,
+) {
+    for turn in 1..=turns {
+        let read_screen = botster_hub_client::request(
+            endpoint,
+            botster_hub_client::DaemonRequest::ReadScreen {
+                session_id: session_id.to_string(),
+            },
+        )
+        .unwrap_or_else(|error| panic!("turn {turn}: ReadScreen request failed: {error}"));
+        let listed =
+            botster_hub_client::request(endpoint, botster_hub_client::DaemonRequest::ListSessions)
+                .unwrap_or_else(|error| {
+                    panic!("turn {turn}: ListSessions request failed: {error}")
+                });
+        let lifecycle = listed.sessions.iter().find_map(|session| {
+            (session.session_id == session_id).then(|| session.lifecycle.clone())
+        });
+        assert_eq!(
+            lifecycle.as_deref(),
+            Some("running"),
+            "turn {turn}/{turns}: observed marker bytes must not count as Core session completion; ReadScreen={} listing={:?}",
+            typed_response_debug(&read_screen),
+            listed.sessions
+        );
+    }
+}
+
+pub(crate) fn wait_for_producer_ready(
+    endpoint: &botster_hub_client::DaemonEndpoint,
+    session_id: &str,
+) {
+    let started_at = Instant::now();
+    let deadline = started_at + AUTHORITATIVE_SESSION_EXIT_WAIT;
+    loop {
+        let elapsed = started_at.elapsed();
+        let last_read_screen = match botster_hub_client::request(
+            endpoint,
+            botster_hub_client::DaemonRequest::ReadScreen {
+                session_id: session_id.to_string(),
+            },
+        ) {
+            Ok(response) => {
+                if let Some(screen) = response.read_screen.as_ref() {
+                    if screen.text.contains(PRODUCER_READY_MARKER) {
+                        return;
+                    }
+                    format!("{} text={:?}", typed_response_debug(&response), screen.text)
+                } else {
+                    typed_response_debug(&response)
+                }
+            }
+            Err(error) => format!("request error: {error}"),
+        };
+        assert!(
+            Instant::now() < deadline,
+            "session {session_id} did not emit {PRODUCER_READY_MARKER} within {:?}; elapsed={elapsed:?} last_read_screen={last_read_screen}",
+            AUTHORITATIVE_SESSION_EXIT_WAIT
+        );
+        thread::sleep(AUTHORITATIVE_OBSERVE_BACKOFF);
+    }
+}
+
+pub(crate) fn assert_session_cleanup_already_exited(
+    shutdown: &botster_hub_client::DaemonResponse,
+    session_id: &str,
+    context: &str,
+) {
+    assert_eq!(
+        shutdown.kind,
+        botster_hub_client::DaemonResponseKind::SessionCleanup,
+        "{context}: ShutdownSession after observed exit must return SessionCleanup {{ already_exited }}, got kind={:?} error.code={:?} error.operation={:?} error.message={:?} cleanup={:?}",
+        shutdown.kind,
+        shutdown.error.as_ref().map(|error| &error.code),
+        shutdown.error.as_ref().map(|error| &error.operation),
+        shutdown.error.as_ref().map(|error| &error.message),
+        shutdown.cleanup
+    );
+    let cleanup = shutdown.cleanup.as_ref().expect("SessionCleanup body");
+    assert_eq!(cleanup.session_id, session_id);
+    assert_eq!(
+        cleanup.outcome, "already_exited",
+        "{context}: cleanup outcome must be already_exited, got {:?}",
+        cleanup.outcome
+    );
+}
+
+pub(crate) fn shutdown_after_authoritative_exit(
+    endpoint: &botster_hub_client::DaemonEndpoint,
+    session_id: &str,
+    context: &str,
+) {
+    wait_for_authoritative_session_exit(endpoint, session_id);
+    let shutdown = botster_hub_client::request(
+        endpoint,
+        botster_hub_client::DaemonRequest::ShutdownSession {
+            session_id: session_id.to_string(),
+        },
+    )
+    .unwrap_or_else(|error| panic!("{context}: ShutdownSession request failed: {error}"));
+    assert_session_cleanup_already_exited(&shutdown, session_id, context);
+}
+
 pub(crate) fn live_output_decoded_bytes(
     payload: impl std::borrow::Borrow<botster_hub_client::DaemonLiveOutputPayload>,
 ) -> Vec<u8> {

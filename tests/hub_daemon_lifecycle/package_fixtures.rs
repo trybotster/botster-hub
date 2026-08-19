@@ -1257,12 +1257,34 @@ pub(crate) fn write_python_wait_then_write_script(release_path: &Path, bytes: &[
     fs::write(
         &script_path,
         format!(
-            "import os\nimport time\np = {path:?}\nwhile not os.path.exists(p):\n    time.sleep(0.01)\nos.write(1, bytes([{bytes}]))\n",
+            "import os\nimport time\nprint({ready:?}, flush=True)\np = {path:?}\nwhile not os.path.exists(p):\n    time.sleep(0.01)\nos.write(1, bytes([{bytes}]))\n",
+            ready = PRODUCER_READY_MARKER,
             path = release_path,
             bytes = python_bytes_literal(bytes),
         ),
     )
     .expect("write wait-then-write script");
+    script_path
+}
+
+pub(crate) fn write_python_held_live_script(
+    release_path: &Path,
+    exit_release_path: &Path,
+    bytes: &[u8],
+) -> PathBuf {
+    let script_path = unique_short_test_dir("held-live-script").join("write.py");
+    fs::create_dir_all(script_path.parent().expect("script parent")).expect("create script dir");
+    fs::write(
+        &script_path,
+        format!(
+            "import os\nimport time\nprint({ready:?}, flush=True)\np = {release:?}\nwhile not os.path.exists(p):\n    time.sleep(0.01)\nos.write(1, bytes([{bytes}]))\ne = {exit_release:?}\nwhile not os.path.exists(e):\n    time.sleep(0.01)\n",
+            ready = PRODUCER_READY_MARKER,
+            release = release_path,
+            exit_release = exit_release_path,
+            bytes = python_bytes_literal(bytes),
+        ),
+    )
+    .expect("write held-live script");
     script_path
 }
 

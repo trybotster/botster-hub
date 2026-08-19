@@ -386,17 +386,10 @@ fn external_hub_webrtc_live_output_preserves_exact_bytes() {
         let _ = offer_peer.peer.close().await;
     });
 
-    let shutdown = botster_hub_client::request(
+    shutdown_after_authoritative_exit(
         &endpoint,
-        botster_hub_client::DaemonRequest::ShutdownSession {
-            session_id: "webrtc-exact-bytes-session".to_string(),
-        },
-    )
-    .expect("blind ShutdownSession after finite WebRTC write");
-    assert_shutdown_strict_natural_exit(
-        &shutdown,
         "webrtc-exact-bytes-session",
-        "WebRTC exact-bytes blind ShutdownSession",
+        "WebRTC exact-bytes after observed exit",
     );
 
     let missing = botster_hub_client::request(
@@ -573,61 +566,11 @@ fn external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup() {
             let _ = offer_peer.peer.close().await;
         });
 
-        let observed_exit = (0..40).any(|_| {
-            let listed = botster_hub_client::request(
-                &endpoint,
-                botster_hub_client::DaemonRequest::ListSessions,
-            )
-            .ok()
-            .and_then(|response| {
-                response.sessions.into_iter().find_map(|session| {
-                    (session.session_id == session_id).then_some(session.lifecycle)
-                })
-            });
-            if listed.as_deref() == Some("exited") {
-                true
-            } else {
-                thread::sleep(Duration::from_millis(50));
-                false
-            }
-        });
-        let shutdown = botster_hub_client::request(
+        shutdown_after_authoritative_exit(
             &endpoint,
-            botster_hub_client::DaemonRequest::ShutdownSession {
-                session_id: session_id.clone(),
-            },
-        )
-        .expect("shutdown after live WebRTC exit");
-        if observed_exit {
-            assert_eq!(
-                shutdown.kind,
-                botster_hub_client::DaemonResponseKind::SessionCleanup,
-                "round {round} observed exit must return SessionCleanup, got {:?}",
-                shutdown.kind
-            );
-            let cleanup = shutdown.cleanup.expect("cleanup body");
-            assert_eq!(cleanup.session_id, session_id);
-            assert_eq!(cleanup.outcome, "already_exited");
-        } else {
-            assert!(
-                matches!(
-                    shutdown.kind,
-                    botster_hub_client::DaemonResponseKind::Events
-                        | botster_hub_client::DaemonResponseKind::SessionCleanup
-                        | botster_hub_client::DaemonResponseKind::OperatorError
-                ),
-                "round {round} ShutdownSession must stay on a typed host frame, got {:?}",
-                shutdown.kind
-            );
-            if shutdown.kind == botster_hub_client::DaemonResponseKind::OperatorError {
-                let error = shutdown.error.as_ref().expect("operator error body");
-                assert!(
-                    error.code == "runtime_error" || error.code == "state_error",
-                    "round {round} Active shutdown failure must keep the original error, got {error:?}"
-                );
-                assert_eq!(error.operation, "shutdown");
-            }
-        }
+            &session_id,
+            &format!("round {round} after observed exit"),
+        );
     }
 
     hub.shutdown().expect("shutdown isolated hub");
