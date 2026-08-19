@@ -4,7 +4,7 @@
 //! and transient queues. It must not import HubRuntime, CoreDaemon, mlua, plugin
 //! persistence, or the owner loop.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
@@ -141,7 +141,7 @@ pub struct HolderId {
     pub generation: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ReadyDelivery {
     pub envelope_id: u64,
     pub owner: String,
@@ -150,6 +150,7 @@ pub struct ReadyDelivery {
     pub payload_json: Value,
     pub size: usize,
     pub holder: EventSubscription,
+    pull_id: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -216,6 +217,8 @@ struct RouterInner {
     admitted: HashMap<(u64, String, u64), AdmittedHolder>,
     buckets: HashMap<String, TokenBucket>,
     next_envelope: u64,
+    next_pull: u64,
+    outstanding_pulls: HashSet<u64>,
     package_generation: HashMap<String, u64>,
 }
 
@@ -259,6 +262,8 @@ impl PackageEventRouter {
                 admitted: HashMap::new(),
                 buckets: HashMap::new(),
                 next_envelope: 1,
+                next_pull: 1,
+                outstanding_pulls: HashSet::new(),
                 package_generation: HashMap::new(),
             }),
             delivery_wake: AtomicBool::new(false),
@@ -619,18 +624,30 @@ impl PackageEventRouter {
                     break;
                 }
                 used_bytes += size;
-                let envelope = inner
+                let (owner, name, payload, payload_json) = inner
                     .envelopes
                     .get(&copy.envelope_id)
+                    .map(|envelope| {
+                        (
+                            envelope.owner.clone(),
+                            envelope.name.clone(),
+                            envelope.payload.clone(),
+                            envelope.payload_json.clone(),
+                        )
+                    })
                     .expect("envelope exists");
+                let pull_id = inner.next_pull;
+                inner.next_pull = inner.next_pull.saturating_add(1);
+                inner.outstanding_pulls.insert(pull_id);
                 ready.push(ReadyDelivery {
                     envelope_id: copy.envelope_id,
-                    owner: envelope.owner.clone(),
-                    name: envelope.name.clone(),
-                    payload: envelope.payload.clone(),
-                    payload_json: envelope.payload_json.clone(),
+                    owner,
+                    name,
+                    payload,
+                    payload_json,
                     size,
                     holder: copy.holder,
+                    pull_id,
                 });
             }
         }
@@ -677,15 +694,32 @@ impl PackageEventRouter {
         ))
     }
 
-    pub fn requeue_delivery(&self, delivery: ReadyDelivery) -> Result<(), EventPlaneStatus> {
-        let mut inner = lock_inner(&self.inner)?;
+    pub(crate) fn requeue_delivery(
+        &self,
+        delivery: ReadyDelivery,
+    ) -> Result<(), (Box<ReadyDelivery>, EventPlaneStatus)> {
+        let mut inner = match lock_inner(&self.inner) {
+            Ok(inner) => inner,
+            Err(status) => return Err((Box::new(delivery), status)),
+        };
+        if !inner.outstanding_pulls.remove(&delivery.pull_id) {
+            return Err((Box::new(delivery), EventPlaneStatus::RejectedInvalid));
+        }
         if !inner.envelopes.contains_key(&delivery.envelope_id) {
             return Ok(());
         }
+        let consumer_event_max = inner.policy.consumer_queue_max_events;
+        let consumer_byte_max = inner.policy.consumer_queue_max_bytes;
         let consumer = inner
             .consumers
             .entry(delivery.holder.plugin_key.clone())
             .or_insert_with(ConsumerQueue::default);
+        if consumer.events + 1 > consumer_event_max
+            || consumer.bytes + delivery.size > consumer_byte_max
+        {
+            inner.outstanding_pulls.insert(delivery.pull_id);
+            return Err((Box::new(delivery), EventPlaneStatus::ShedFull));
+        }
         consumer.events += 1;
         consumer.bytes += delivery.size;
         consumer.copies.push_front(QueuedCopy {
@@ -693,6 +727,37 @@ impl PackageEventRouter {
             holder: delivery.holder,
         });
         self.delivery_wake.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub(crate) fn complete_pulled_delivery(
+        &self,
+        delivery: ReadyDelivery,
+    ) -> Result<(), (Box<ReadyDelivery>, EventPlaneStatus)> {
+        let mut inner = match lock_inner(&self.inner) {
+            Ok(inner) => inner,
+            Err(status) => return Err((Box::new(delivery), status)),
+        };
+        if !inner.outstanding_pulls.remove(&delivery.pull_id) {
+            return Err((Box::new(delivery), EventPlaneStatus::RejectedInvalid));
+        }
+        inner.admitted.insert(
+            (
+                delivery.envelope_id,
+                delivery.holder.plugin_key.clone(),
+                delivery.holder.generation,
+            ),
+            AdmittedHolder {
+                envelope_id: delivery.envelope_id,
+                retired: false,
+            },
+        );
+        retire_holder_locked(
+            &mut inner,
+            delivery.envelope_id,
+            &delivery.holder.plugin_key,
+            delivery.holder.generation,
+        );
         Ok(())
     }
 
@@ -753,6 +818,14 @@ impl PackageEventRouter {
     pub fn test_with_inner_held<R>(&self, body: impl FnOnce() -> R) -> R {
         let _guard = self.inner.try_lock().expect("test hold must acquire inner");
         body()
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn test_outstanding_pulls(&self) -> usize {
+        lock_inner(&self.inner)
+            .map(|inner| inner.outstanding_pulls.len())
+            .unwrap_or(usize::MAX)
     }
 
     #[cfg(test)]
@@ -2651,7 +2724,9 @@ mod tests {
         );
 
         let mailbox = std::sync::Arc::new(ClientEventMailbox::new(policy));
-        let gap = mailbox.register_gap_slot("sub", "producer", "notice");
+        let gap = mailbox
+            .register_gap_slot("sub", "producer", "notice")
+            .expect("register gap");
         assert_eq!(
             router.try_subscribe_client(ClientEventHolder {
                 connection_id: "conn".into(),
@@ -2691,7 +2766,9 @@ mod tests {
         subscribe(&fanout_router, "consumer-b", "producer", "notice");
         let fanout_mailbox =
             std::sync::Arc::new(ClientEventMailbox::new(PackageEventPlanePolicy::default()));
-        let fanout_gap = fanout_mailbox.register_gap_slot("sub", "producer", "notice");
+        let fanout_gap = fanout_mailbox
+            .register_gap_slot("sub", "producer", "notice")
+            .expect("register gap");
         assert_eq!(
             fanout_router.try_subscribe_client(ClientEventHolder {
                 connection_id: "conn".into(),
@@ -2728,7 +2805,9 @@ mod tests {
             .try_register_contracts(vec![accepted_contract])
             .expect("register");
         subscribe(&accepted_router, "consumer", "producer", "notice");
-        let accepted_gap = accepted_mailbox.register_gap_slot("sub", "producer", "notice");
+        let accepted_gap = accepted_mailbox
+            .register_gap_slot("sub", "producer", "notice")
+            .expect("register gap");
         assert_eq!(
             accepted_router.try_subscribe_client(ClientEventHolder {
                 connection_id: "conn".into(),
@@ -2779,5 +2858,130 @@ mod tests {
             }),
             EventPlaneStatus::RejectedAudience
         );
+    }
+
+    #[test]
+    fn requeue_and_complete_keep_ownership_when_router_is_busy() {
+        let router = router();
+        router
+            .try_register_contracts(vec![sample_contract("producer", "notice")])
+            .expect("register");
+        subscribe(&router, "consumer", "producer", "notice");
+        assert_eq!(
+            router.try_ingress(
+                "producer",
+                "notice",
+                &serde_json::json!({ "ok": true }),
+                Instant::now()
+            ),
+            EventPlaneStatus::Accepted
+        );
+        let before = router.snapshot().expect("before pull");
+        assert_eq!(before.queued_holders, 1);
+        let mut batch = router
+            .pull_ready_batch(8, 64 * 1024, Instant::now(), StdDuration::from_millis(8))
+            .expect("pull");
+        let delivery = batch.pop().expect("one pulled copy");
+        assert!(batch.is_empty());
+        assert_eq!(router.test_outstanding_pulls(), 1);
+        let pulled = router.snapshot().expect("after pull");
+        assert_eq!(pulled.queued_holders, 0);
+        let returned = router.test_with_inner_held(|| router.requeue_delivery(delivery));
+        let delivery = match returned {
+            Err((delivery, EventPlaneStatus::ShedBusy)) => *delivery,
+            other => panic!("busy requeue must return ownership: {other:?}"),
+        };
+        let busy = router.snapshot().expect("busy requeue");
+        assert_eq!(busy.queued_holders, 0);
+        assert_eq!(busy.global_in_flight_bytes, before.global_in_flight_bytes);
+        assert_eq!(busy.admitted_holders, before.admitted_holders);
+        assert_eq!(router.test_outstanding_pulls(), 1);
+        router
+            .requeue_delivery(delivery)
+            .unwrap_or_else(|_| panic!("requeue after release"));
+        let restored = router.snapshot().expect("restored");
+        assert_eq!(restored.queued_holders, before.queued_holders);
+        assert_eq!(
+            restored.global_in_flight_bytes,
+            before.global_in_flight_bytes
+        );
+        assert_eq!(router.test_outstanding_pulls(), 0);
+
+        let mut batch = router
+            .pull_ready_batch(8, 64 * 1024, Instant::now(), StdDuration::from_millis(8))
+            .expect("pull again");
+        let delivery = batch.pop().expect("one pulled copy");
+        let returned = router.test_with_inner_held(|| router.complete_pulled_delivery(delivery));
+        let delivery = match returned {
+            Err((delivery, EventPlaneStatus::ShedBusy)) => *delivery,
+            other => panic!("busy complete must return ownership: {other:?}"),
+        };
+        assert_eq!(router.test_outstanding_pulls(), 1);
+        router
+            .complete_pulled_delivery(delivery)
+            .unwrap_or_else(|_| panic!("complete after release"));
+        let done = router.snapshot().expect("completed");
+        assert_eq!(done.queued_holders, 0);
+        assert_eq!(done.global_in_flight_bytes, 0);
+        assert_eq!(router.test_outstanding_pulls(), 0);
+    }
+
+    #[test]
+    fn requeue_rejects_duplicate_pull_and_respects_consumer_bounds() {
+        let policy = PackageEventPlanePolicy {
+            consumer_queue_max_events: 1,
+            ..PackageEventPlanePolicy::default()
+        };
+        let router = PackageEventRouter::new(policy);
+        router
+            .try_register_contracts(vec![sample_contract("producer", "notice")])
+            .expect("register");
+        subscribe(&router, "consumer", "producer", "notice");
+        let payload = serde_json::json!({ "ok": true });
+        assert_eq!(
+            router.try_ingress("producer", "notice", &payload, Instant::now()),
+            EventPlaneStatus::Accepted
+        );
+        let mut batch = router
+            .pull_ready_batch(8, 64 * 1024, Instant::now(), StdDuration::from_millis(8))
+            .expect("pull");
+        let delivery = batch.pop().expect("one pulled copy");
+        let forged = ReadyDelivery {
+            envelope_id: delivery.envelope_id,
+            owner: delivery.owner.clone(),
+            name: delivery.name.clone(),
+            payload: delivery.payload.clone(),
+            payload_json: delivery.payload_json.clone(),
+            size: delivery.size,
+            holder: delivery.holder.clone(),
+            pull_id: delivery.pull_id,
+        };
+        router
+            .requeue_delivery(delivery)
+            .unwrap_or_else(|_| panic!("first requeue"));
+        match router.requeue_delivery(forged) {
+            Err((_, EventPlaneStatus::RejectedInvalid)) => {}
+            other => panic!("duplicate requeue must be rejected: {other:?}"),
+        }
+        assert_eq!(router.test_outstanding_pulls(), 0);
+
+        let mut batch = router
+            .pull_ready_batch(8, 64 * 1024, Instant::now(), StdDuration::from_millis(8))
+            .expect("pull again");
+        let first = batch.pop().expect("first copy");
+        assert_eq!(
+            router.try_ingress("producer", "notice", &payload, Instant::now()),
+            EventPlaneStatus::Accepted
+        );
+        match router.requeue_delivery(first) {
+            Err((delivery, EventPlaneStatus::ShedFull)) => {
+                assert_eq!(router.test_outstanding_pulls(), 1);
+                router
+                    .complete_pulled_delivery(*delivery)
+                    .unwrap_or_else(|_| panic!("complete after bound reject"));
+            }
+            other => panic!("full consumer queue must reject requeue: {other:?}"),
+        }
+        assert_eq!(router.test_outstanding_pulls(), 0);
     }
 }
