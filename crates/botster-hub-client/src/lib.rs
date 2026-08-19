@@ -63,6 +63,8 @@ pub const TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER: &str = "core_adapter_closed
 pub const FEATURE_WEBRTC_TERMINAL_ADAPTER: &str = "webrtc_terminal_adapter";
 /// Optional named attach occupancy on `DaemonStatus`. Empty occupancy without this token is not absence proof.
 pub const FEATURE_ATTACH_OCCUPANCY: &str = "attach_occupancy";
+/// Optional host-control package-event subscriptions. Not a terminal feature.
+pub const FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS: &str = "package_event_subscriptions";
 /// Mux envelope plane tag. Not a Snapshot/READY/PAGE/FINISH field.
 pub const UNIX_TERMINAL_PLANE: &str = "terminal";
 /// Mux envelope kind tag. The payload stays an opaque `TerminalFrame` blob.
@@ -150,6 +152,7 @@ pub struct DaemonConnection {
     reader: BufReader<UnixStream>,
     skipped_terminal: Vec<DaemonUnixTerminalEnvelope>,
     skipped_events: Vec<DaemonEvent>,
+    required_features: Vec<String>,
 }
 
 impl DaemonConnection {
@@ -163,13 +166,68 @@ impl DaemonConnection {
         endpoint: &DaemonEndpoint,
         requirement: &DaemonCompatibilityRequirement,
     ) -> DaemonTransportResult<Self> {
-        let stream = connect_and_hello_with_requirement(endpoint, requirement)?;
+        Self::connect_with_terminal_requirement(endpoint, requirement, None)
+    }
+
+    /// Connect with a host requirement and an optional terminal requirement.
+    pub fn connect_with_terminal_requirement(
+        endpoint: &DaemonEndpoint,
+        requirement: &DaemonCompatibilityRequirement,
+        terminal_compatibility: Option<&TerminalCompatibilityRequirement>,
+    ) -> DaemonTransportResult<Self> {
+        let (stream, _ack) = connect_and_hello_with_terminal_requirement(
+            endpoint,
+            requirement,
+            terminal_compatibility,
+        )?;
         let reader = BufReader::new(stream.try_clone().map_err(normalize_socket_io_error)?);
         Ok(Self {
             stream,
             reader,
             skipped_terminal: Vec::new(),
             skipped_events: Vec::new(),
+            required_features: requirement.required_features.clone(),
+        })
+    }
+
+    /// Host Hello `required_features` from the connection handshake.
+    #[must_use]
+    pub fn required_features(&self) -> &[String] {
+        &self.required_features
+    }
+
+    /// Subscribe to package events on this multiplexed host-control connection.
+    ///
+    /// Returns a typed compatibility error and sends no request when Hello did
+    /// not require [`FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS`].
+    pub fn subscribe_events(
+        &mut self,
+        subscription_id: impl Into<String>,
+        owner: impl Into<String>,
+        name: impl Into<String>,
+        subjects: Vec<String>,
+    ) -> DaemonTransportResult<DaemonResponse> {
+        if !hello_requires_package_event_subscriptions(&self.required_features) {
+            return Err(package_event_subscriptions_not_negotiated_error());
+        }
+        self.request(&DaemonRequest::SubscribeEvents {
+            subscription_id: subscription_id.into(),
+            owner: owner.into(),
+            name: name.into(),
+            subjects,
+        })
+    }
+
+    /// Remove one package-event subscription owned by this connection.
+    pub fn unsubscribe_events(
+        &mut self,
+        subscription_id: impl Into<String>,
+    ) -> DaemonTransportResult<DaemonResponse> {
+        if !hello_requires_package_event_subscriptions(&self.required_features) {
+            return Err(package_event_subscriptions_not_negotiated_error());
+        }
+        self.request(&DaemonRequest::UnsubscribeEvents {
+            subscription_id: subscription_id.into(),
         })
     }
 
@@ -741,6 +799,17 @@ impl DaemonCompatibilityRequirement {
         requirement.minimum_conformance_fixture_revision = CONFORMANCE_FIXTURE_REVISION;
         requirement
     }
+
+    /// Build the requirement for host-control package-event subscriptions.
+    #[must_use]
+    pub fn for_package_event_subscriptions() -> Self {
+        let mut requirement = Self::current();
+        requirement
+            .required_features
+            .push(FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS.to_string());
+        requirement.minimum_conformance_fixture_revision = CONFORMANCE_FIXTURE_REVISION;
+        requirement
+    }
 }
 
 impl Default for DaemonCompatibilityRequirement {
@@ -859,7 +928,37 @@ fn current_feature_list() -> Vec<&'static str> {
     features.push(FEATURE_TERMINAL_SUBSCRIPTION_CLOSED);
     features.push(FEATURE_WEBRTC_TERMINAL_ADAPTER);
     features.push(FEATURE_ATTACH_OCCUPANCY);
+    features.push(FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS);
     features
+}
+
+/// True when host Hello `required_features` asked for package-event subscriptions.
+#[must_use]
+pub fn hello_requires_package_event_subscriptions<S: AsRef<str>>(
+    required_features: impl IntoIterator<Item = S>,
+) -> bool {
+    required_features
+        .into_iter()
+        .any(|feature| feature.as_ref() == FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS)
+}
+
+fn package_event_subscriptions_not_negotiated_error() -> DaemonTransportError {
+    DaemonTransportError::Compatibility(DaemonCompatibilityError {
+        diagnostic: "package_event_subscriptions was not negotiated on this host Hello".to_string(),
+        diagnostics: vec![DaemonDiagnostic::unsupported_feature(
+            FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS,
+        )],
+    })
+}
+
+/// Open a multiplexed host-control connection that can subscribe to package events.
+pub fn connect_for_package_event_subscriptions(
+    endpoint: &DaemonEndpoint,
+) -> DaemonTransportResult<DaemonConnection> {
+    DaemonConnection::connect_with_requirement(
+        endpoint,
+        &DaemonCompatibilityRequirement::for_package_event_subscriptions(),
+    )
 }
 
 fn default_required_feature_list() -> Vec<&'static str> {
@@ -895,6 +994,16 @@ pub enum DaemonRequest {
         subscription_id: String,
     },
     UnsubscribeEntities {
+        subscription_id: String,
+    },
+    SubscribeEvents {
+        subscription_id: String,
+        owner: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        subjects: Vec<String>,
+    },
+    UnsubscribeEvents {
         subscription_id: String,
     },
     RemoveSession {
@@ -1299,6 +1408,8 @@ pub enum DaemonResponseKind {
     Sessions,
     EntitySubscribed,
     EntityUnsubscribed,
+    EventSubscribed,
+    EventUnsubscribed,
     SessionRemoved,
     Spawned,
     Events,
@@ -2824,6 +2935,19 @@ pub enum DaemonEvent {
         generation: u64,
         reason: String,
     },
+    /// Unsolicited live package event for one host-control subscription.
+    PackageEvent {
+        subscription_id: String,
+        owner: String,
+        name: String,
+        payload: Value,
+    },
+    /// Coalesced gap after a shed or expired delivery. No replay or history.
+    EventGap {
+        subscription_id: String,
+        owner: String,
+        name: String,
+    },
 }
 
 impl DaemonEvent {
@@ -2889,7 +3013,9 @@ pub fn parse_unix_mux_value(value: Value) -> Result<DaemonUnixMuxFrame, serde_js
     {
         return serde_json::from_value(value).map(DaemonUnixMuxFrame::Terminal);
     }
-    if value.get("type").and_then(Value::as_str) == Some("terminal_subscription_closed") {
+    if let Some("terminal_subscription_closed" | "package_event" | "event_gap") =
+        value.get("type").and_then(Value::as_str)
+    {
         return serde_json::from_value(value).map(DaemonUnixMuxFrame::Event);
     }
     serde_json::from_value(value)
@@ -3462,6 +3588,93 @@ mod tests {
             }
             other => panic!("close event must not parse as {other:?}"),
         }
+    }
+
+    #[test]
+    fn package_event_dtos_omit_replay_and_empty_subjects() {
+        let subscribe = DaemonRequest::SubscribeEvents {
+            subscription_id: "sub".to_string(),
+            owner: "owner".to_string(),
+            name: "ready".to_string(),
+            subjects: Vec::new(),
+        };
+        let subscribe_value = serde_json::to_value(&subscribe).expect("subscribe serializes");
+        assert_eq!(subscribe_value["type"], "subscribe_events");
+        assert!(subscribe_value.get("subjects").is_none());
+        assert!(subscribe_value.get("sequence").is_none());
+        assert!(subscribe_value.get("cursor").is_none());
+        assert!(subscribe_value.get("replay").is_none());
+        assert!(subscribe_value.get("durable").is_none());
+
+        let event = DaemonEvent::PackageEvent {
+            subscription_id: "sub".to_string(),
+            owner: "owner".to_string(),
+            name: "ready".to_string(),
+            payload: serde_json::json!({ "ok": true }),
+        };
+        let event_value = serde_json::to_value(&event).expect("event serializes");
+        assert_eq!(event_value["type"], "package_event");
+        assert!(event_value.get("sequence").is_none());
+        assert!(event_value.get("cursor").is_none());
+        assert!(event_value.get("replay").is_none());
+        match parse_unix_mux_value(event_value).expect("parse package event") {
+            DaemonUnixMuxFrame::Event(DaemonEvent::PackageEvent { name, .. }) => {
+                assert_eq!(name, "ready");
+            }
+            other => panic!("package event must not parse as {other:?}"),
+        }
+
+        let gap = DaemonEvent::EventGap {
+            subscription_id: "sub".to_string(),
+            owner: "owner".to_string(),
+            name: "ready".to_string(),
+        };
+        let gap_value = serde_json::to_value(&gap).expect("gap serializes");
+        assert_eq!(gap_value["type"], "event_gap");
+        assert!(gap_value.get("sequence").is_none());
+        match parse_unix_mux_value(gap_value).expect("parse gap") {
+            DaemonUnixMuxFrame::Event(DaemonEvent::EventGap {
+                subscription_id, ..
+            }) => {
+                assert_eq!(subscription_id, "sub");
+            }
+            other => panic!("event gap must not parse as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn package_event_requirement_is_operation_specific() {
+        let previous = {
+            let mut daemon = DaemonCompatibility::current();
+            daemon.conformance_fixture_revision = DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION;
+            daemon
+                .features
+                .retain(|feature| feature != FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS);
+            daemon
+        };
+        ensure_compatible(&DaemonCompatibilityRequirement::current(), &previous)
+            .expect("default requirement still accepts the previous descriptor");
+        let requirement = DaemonCompatibilityRequirement::for_package_event_subscriptions();
+        let error = ensure_compatible(&requirement, &previous)
+            .expect_err("event requirement rejects the previous descriptor");
+        assert!(
+            error
+                .diagnostic
+                .contains("unsupported conformance fixture revision")
+        );
+        let mut current = previous;
+        current.conformance_fixture_revision = CONFORMANCE_FIXTURE_REVISION;
+        current
+            .features
+            .push(FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS.to_string());
+        ensure_compatible(&requirement, &current)
+            .expect("event requirement accepts the new descriptor");
+        assert!(hello_requires_package_event_subscriptions(
+            &requirement.required_features
+        ));
+        assert!(!hello_requires_package_event_subscriptions(
+            &DaemonCompatibilityRequirement::current().required_features
+        ));
     }
 
     #[test]
@@ -5278,6 +5491,15 @@ mod tests {
             DaemonRequest::UnsubscribeEntities {
                 subscription_id: "entities".to_string(),
             },
+            DaemonRequest::SubscribeEvents {
+                subscription_id: "events".to_string(),
+                owner: "event-plane-producer".to_string(),
+                name: "sample.ready".to_string(),
+                subjects: Vec::new(),
+            },
+            DaemonRequest::UnsubscribeEvents {
+                subscription_id: "events".to_string(),
+            },
             DaemonRequest::RemoveSession {
                 session_id: "session".to_string(),
             },
@@ -5550,6 +5772,8 @@ mod tests {
             DaemonRequest::ListSessions => "list_sessions",
             DaemonRequest::SubscribeEntities { .. } => "subscribe_entities",
             DaemonRequest::UnsubscribeEntities { .. } => "unsubscribe_entities",
+            DaemonRequest::SubscribeEvents { .. } => "subscribe_events",
+            DaemonRequest::UnsubscribeEvents { .. } => "unsubscribe_events",
             DaemonRequest::RemoveSession { .. } => "remove_session",
             DaemonRequest::Whoami { .. } => "whoami",
             DaemonRequest::PostMessage { .. } => "post_message",
@@ -5631,6 +5855,8 @@ mod tests {
             DaemonResponseKind::Sessions,
             DaemonResponseKind::EntitySubscribed,
             DaemonResponseKind::EntityUnsubscribed,
+            DaemonResponseKind::EventSubscribed,
+            DaemonResponseKind::EventUnsubscribed,
             DaemonResponseKind::SessionRemoved,
             DaemonResponseKind::Spawned,
             DaemonResponseKind::Events,
@@ -5680,6 +5906,8 @@ mod tests {
             DaemonResponseKind::Sessions => "sessions",
             DaemonResponseKind::EntitySubscribed => "entity_subscribed",
             DaemonResponseKind::EntityUnsubscribed => "entity_unsubscribed",
+            DaemonResponseKind::EventSubscribed => "event_subscribed",
+            DaemonResponseKind::EventUnsubscribed => "event_unsubscribed",
             DaemonResponseKind::SessionRemoved => "session_removed",
             DaemonResponseKind::Spawned => "spawned",
             DaemonResponseKind::Events => "events",
@@ -6176,6 +6404,17 @@ mod tests {
                     message: None,
                 },
             },
+            DaemonEvent::PackageEvent {
+                subscription_id: "events".to_string(),
+                owner: "event-plane-producer".to_string(),
+                name: "sample.ready".to_string(),
+                payload: serde_json::json!({ "ok": true, "token": "live" }),
+            },
+            DaemonEvent::EventGap {
+                subscription_id: "events".to_string(),
+                owner: "event-plane-producer".to_string(),
+                name: "sample.ready".to_string(),
+            },
         ]
     }
 
@@ -6190,6 +6429,8 @@ mod tests {
             DaemonEvent::RuntimeObservation { .. } => "runtime_observation",
             DaemonEvent::WorktreeLifecycle { .. } => "worktree_lifecycle",
             DaemonEvent::TerminalSubscriptionClosed { .. } => "terminal_subscription_closed",
+            DaemonEvent::PackageEvent { .. } => "package_event",
+            DaemonEvent::EventGap { .. } => "event_gap",
         }
     }
 
@@ -6436,6 +6677,7 @@ mod tests {
                 FEATURE_TERMINAL_SUBSCRIPTION_CLOSED,
                 FEATURE_WEBRTC_TERMINAL_ADAPTER,
                 FEATURE_ATTACH_OCCUPANCY,
+                FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS,
             ],
             "the daemon advertises host-plane capabilities only",
         );

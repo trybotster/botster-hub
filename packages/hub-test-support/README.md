@@ -18,10 +18,10 @@ node packages/hub-test-support/scripts/sync-assets.mjs
 
 ## Usage
 
-Use this command for version 0.1.37:
+Use this command for version 0.1.38:
 
 ```sh
-npm install --save-dev @trybotster/ui-contract@0.3.2 @trybotster/hub-test-support@0.1.37
+npm install --save-dev @trybotster/ui-contract@0.3.2 @trybotster/hub-test-support@0.1.38
 ```
 
 ```js
@@ -81,12 +81,12 @@ Use this exact package spec in npm-based client repos:
 ```json
 {
   "devDependencies": {
-    "@trybotster/hub-test-support": "0.1.37"
+    "@trybotster/hub-test-support": "0.1.38"
   }
 }
 ```
 
-`@trybotster/hub-test-support@0.1.37` carries byte-faithful live
+`@trybotster/hub-test-support@0.1.38` carries byte-faithful live
 `terminal_output` payloads (`payload_base64`, `payload_encoding`, `bytes`)
 and authentic dual GHOSTSNP late-attach fixtures (conformance revision 43).
 History attach uses incremental READY, PAGE, and FINISH Snapshot frames.
@@ -116,6 +116,7 @@ Version 0.1.37 carries protocol version 7 / conformance revision 43 with
 advertised optional `unix_terminal_adapter`,
 `terminal_subscription_closed`, `webrtc_terminal_adapter`,
 `attach_occupancy`,
+`package_event_subscriptions`,
 negotiated WebRTC `daemon_event` close delivery, and
 `snapshot_delivery=ready_then_history` support,
 byte-faithful live `terminal_output` payloads, incremental GHOSTSNP

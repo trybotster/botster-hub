@@ -270,6 +270,248 @@ fn isolated_hub_event_to_entity_provider_emit_stays_rejected_causal_scope() {
     hub.shutdown().expect("shutdown isolated hub");
 }
 
+fn enable_event_plane_producer(label: &str) -> (
+    botster_hub_test_support::IsolatedHub,
+    PathBuf,
+) {
+    let producer_src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/event-plane-producer");
+    let producer_dir = unique_test_dir(&format!("event-plane-producer-{label}"));
+    copy_dir_all(&producer_src, &producer_dir);
+    rewrite_package_source_path(&producer_dir);
+    let hub = botster_hub_test_support::IsolatedHubBuilder::new()
+        .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
+        .session_worker_bin(session_worker_binary_path())
+        .root(PathBuf::from(format!("/tmp/bh-event-plane-{label}")))
+        .name(format!("package-event-{label}"))
+        .start()
+        .expect("start isolated hub");
+    let enabled = botster_hub_client::request(
+        hub.endpoint(),
+        botster_hub_client::DaemonRequest::EnablePackageLocalPath {
+            path: producer_dir.clone(),
+        },
+    )
+    .expect("enable producer");
+    assert_eq!(
+        enabled.kind,
+        botster_hub_client::DaemonResponseKind::PackageDecision
+    );
+    (hub, producer_dir)
+}
+
+fn emit_sample_ready(endpoint: &botster_hub_client::DaemonEndpoint, token: &str) {
+    let emitted = botster_hub_client::request(
+        endpoint,
+        botster_hub_client::DaemonRequest::PluginMcpCallTool {
+            name: "event_plane.emit_ready".to_string(),
+            arguments: serde_json::json!({ "token": token }),
+        },
+    )
+    .expect("emit ready");
+    assert_eq!(
+        emitted.kind,
+        botster_hub_client::DaemonResponseKind::PluginMcpToolResult
+    );
+}
+
+#[test]
+fn isolated_hub_unix_client_receives_unsolicited_package_event() {
+    let _guard = daemon_test_guard();
+    let (hub, _) = enable_event_plane_producer("live");
+    let mut connection = botster_hub_client::connect_for_package_event_subscriptions(hub.endpoint())
+        .expect("event hello");
+    let subscribed = connection
+        .subscribe_events("sub-live", "event-plane-producer", "sample.ready", Vec::new())
+        .expect("subscribe");
+    assert_eq!(
+        subscribed.kind,
+        botster_hub_client::DaemonResponseKind::EventSubscribed
+    );
+    emit_sample_ready(hub.endpoint(), "client-live");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut seen = None;
+    while Instant::now() < deadline {
+        let status = connection
+            .request(&botster_hub_client::DaemonRequest::Status)
+            .expect("status");
+        assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
+        if let Some(event) = connection.take_skipped_events().into_iter().find(|event| {
+            matches!(
+                event,
+                botster_hub_client::DaemonEvent::PackageEvent { name, .. } if name == "sample.ready"
+            )
+        }) {
+            seen = Some(event);
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    match seen.expect("client received PackageEvent") {
+        botster_hub_client::DaemonEvent::PackageEvent {
+            subscription_id,
+            owner,
+            name,
+            payload,
+        } => {
+            assert_eq!(subscription_id, "sub-live");
+            assert_eq!(owner, "event-plane-producer");
+            assert_eq!(name, "sample.ready");
+            assert_eq!(payload["token"], "client-live");
+            assert!(payload.get("sequence").is_none());
+        }
+        other => panic!("expected PackageEvent, got {other:?}"),
+    }
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn isolated_hub_unnegotiated_subscribe_events_is_typed_error() {
+    let _guard = daemon_test_guard();
+    let (hub, _) = enable_event_plane_producer("unnegotiated");
+    let mut connection = botster_hub_client::DaemonConnection::connect(hub.endpoint())
+        .expect("default hello");
+    let error = connection
+        .subscribe_events("sub", "event-plane-producer", "sample.ready", Vec::new())
+        .expect_err("unnegotiated helper sends no request");
+    assert!(
+        error
+            .to_string()
+            .contains("package_event_subscriptions was not negotiated")
+    );
+    let response = botster_hub_client::request(
+        hub.endpoint(),
+        botster_hub_client::DaemonRequest::SubscribeEvents {
+            subscription_id: "sub".to_string(),
+            owner: "event-plane-producer".to_string(),
+            name: "sample.ready".to_string(),
+            subjects: Vec::new(),
+        },
+    )
+    .expect("one-shot unnegotiated request stays on the connection");
+    assert_eq!(
+        response.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError
+    );
+    assert_eq!(
+        response.error.as_ref().map(|error| error.code.as_str()),
+        Some("package_event_subscriptions_not_negotiated")
+    );
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn isolated_hub_rejected_terminal_hello_still_subscribes_to_package_events() {
+    let _guard = daemon_test_guard();
+    let (hub, _) = enable_event_plane_producer("reject-terminal");
+    let requirement =
+        botster_hub_client::DaemonCompatibilityRequirement::for_package_event_subscriptions();
+    let terminal = botster_terminal_protocol::TerminalCompatibilityRequirement {
+        protocol: "botster-terminal-v1".to_string(),
+        protocol_version: 99,
+        required_features: vec!["missing_terminal_feature".to_string()],
+        minimum_conformance_fixture_revision: 1,
+        client_name: "event-plane-terminal-reject".to_string(),
+    };
+    let mut connection = botster_hub_client::DaemonConnection::connect_with_terminal_requirement(
+        hub.endpoint(),
+        &requirement,
+        Some(&terminal),
+    )
+    .expect("host hello succeeds when only terminal compatibility fails");
+    let status = connection
+        .request(&botster_hub_client::DaemonRequest::Status)
+        .expect("status after rejected terminal");
+    assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
+    let subscribed = connection
+        .subscribe_events(
+            "sub-reject-terminal",
+            "event-plane-producer",
+            "sample.ready",
+            Vec::new(),
+        )
+        .expect("subscribe after rejected terminal");
+    assert_eq!(
+        subscribed.kind,
+        botster_hub_client::DaemonResponseKind::EventSubscribed
+    );
+    emit_sample_ready(hub.endpoint(), "after-reject");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut seen = false;
+    while Instant::now() < deadline {
+        let _ = connection
+            .request(&botster_hub_client::DaemonRequest::Status)
+            .expect("status");
+        if connection.take_skipped_events().iter().any(|event| {
+            matches!(
+                event,
+                botster_hub_client::DaemonEvent::PackageEvent { payload, .. }
+                    if payload["token"] == "after-reject"
+            )
+        }) {
+            seen = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(seen, "package events remain available after terminal rejection");
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn isolated_hub_reconnect_does_not_replay_package_events() {
+    let _guard = daemon_test_guard();
+    let (hub, _) = enable_event_plane_producer("reconnect");
+    {
+        let mut first = botster_hub_client::connect_for_package_event_subscriptions(hub.endpoint())
+            .expect("first hello");
+        first
+            .subscribe_events("sub-old", "event-plane-producer", "sample.ready", Vec::new())
+            .expect("first subscribe");
+        emit_sample_ready(hub.endpoint(), "before-disconnect");
+        let _ = first.request(&botster_hub_client::DaemonRequest::Status);
+        drop(first);
+    }
+    let mut second = botster_hub_client::connect_for_package_event_subscriptions(hub.endpoint())
+        .expect("second hello");
+    second
+        .subscribe_events("sub-new", "event-plane-producer", "sample.ready", Vec::new())
+        .expect("fresh subscribe");
+    let _ = second.request(&botster_hub_client::DaemonRequest::Status);
+    assert!(
+        second.take_skipped_events().is_empty(),
+        "reconnect must not replay prior events"
+    );
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn isolated_hub_subject_and_audience_admission_return_typed_errors() {
+    let _guard = daemon_test_guard();
+    let (hub, _) = enable_event_plane_producer("admission");
+    let mut connection = botster_hub_client::connect_for_package_event_subscriptions(hub.endpoint())
+        .expect("event hello");
+    let wildcard = connection
+        .subscribe_events(
+            "sub-wild",
+            "event-plane-producer",
+            "sample.ready",
+            vec!["foo*".to_string()],
+        )
+        .expect("wildcard stays on the connection");
+    assert_eq!(
+        wildcard.error.as_ref().map(|error| error.code.as_str()),
+        Some("rejected_wildcard")
+    );
+    let undeclared = connection
+        .subscribe_events("sub-miss", "event-plane-producer", "missing.event", Vec::new())
+        .expect("undeclared stays on the connection");
+    assert_eq!(
+        undeclared.error.as_ref().map(|error| error.code.as_str()),
+        Some("rejected_undeclared")
+    );
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
 fn copy_dir_all(from: &Path, to: &Path) {
     fs::create_dir_all(to).expect("create dest");
     for entry in fs::read_dir(from).expect("read src") {

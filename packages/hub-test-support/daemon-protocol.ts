@@ -86,6 +86,8 @@ export type DaemonRequest =
   | { type: "list_sessions" }
   | { type: "subscribe_entities"; entity_type: string; subscription_id: string }
   | { type: "unsubscribe_entities"; subscription_id: string }
+  | { type: "subscribe_events"; subscription_id: string; owner: string; name: string; subjects?: string[] }
+  | { type: "unsubscribe_events"; subscription_id: string }
   | { type: "remove_session"; session_id: string }
   | { type: "whoami"; caller_session_id: string | null }
   | { type: "post_message"; caller_session_id: string | null; target_session_id: string; envelope_id: string | null; body: string }
@@ -272,6 +274,8 @@ export type DaemonResponseKind =
   | "sessions"
   | "entity_subscribed"
   | "entity_unsubscribed"
+  | "event_subscribed"
+  | "event_unsubscribed"
   | "session_removed"
   | "spawned"
   | "events"
@@ -982,4 +986,6 @@ export type DaemonEvent =
   | { type: "attach_state"; session_id: string; subscription_id: string; state: string }
   | { type: "runtime_observation"; kind: string }
   | { type: "worktree_lifecycle"; event: DaemonWorktreeLifecycleEvent }
-  | { type: "terminal_subscription_closed"; session_id: string; subscription_id: string; generation: number; reason: string };
+  | { type: "terminal_subscription_closed"; session_id: string; subscription_id: string; generation: number; reason: string }
+  | { type: "package_event"; subscription_id: string; owner: string; name: string; payload: JsonValue }
+  | { type: "event_gap"; subscription_id: string; owner: string; name: string };
