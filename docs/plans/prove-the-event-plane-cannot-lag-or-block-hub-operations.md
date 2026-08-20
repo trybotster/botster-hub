@@ -7,6 +7,22 @@ Pipeline: `botster_stack_delivery` (direct merge, no PR)
 Project: `project_1786663508_823105` Botster Non-Blocking Event Plane, Stage D
 Vault checklist: `checklist_1787266824_449406` (ticket scope, one Plan visit)
 
+## 0. Routing exception, read this before reviewing
+
+Human answer `question_1787267931_572353` on `2026-08-20` grants a **review-only** dependency exception for this run.
+
+The engine blocks every advance while a dependency ticket is open, including the advance to Plan Review, and `override_unmet_gates` does not cover ticket dependencies. To let Plan Review validate the split before anyone implements it, `dependency_1787267572_315049` was removed **only** to route this run into Plan Review.
+
+The answer's exact conditions:
+
+1. Plan Review must validate the surface-versus-consumer split, the scope of `ticket_1787267568_492780`, all twelve required signals, and the four fault seams.
+2. **This run must not advance to Implement while the dependency is absent.**
+3. If Plan Review requires changes, keep `ticket_1787267568_492780` unstarted and revise this plan until Plan Review approves.
+4. **After approval, re-add `ticket_1787267568_492780` as a dependency of `ticket_1786663585_879846` before any Implement advance.** Use `project_pipelines_add_ticket_dependency`.
+5. Then run and merge `ticket_1787267568_492780` first. This integration run stays parked until that dependency closes.
+
+The dependency's absence is a routing mechanism, not a scope decision. Section 6.2 remains the authoritative contract for the dependency.
+
 ## 1. Target repository and target_id
 
 | Field | Value |
