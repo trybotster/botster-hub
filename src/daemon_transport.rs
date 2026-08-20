@@ -201,6 +201,18 @@ async fn receive_owner_event(
     }
 }
 
+fn retry_client_event_cleanups(daemon: &HubDaemon, state: &mut DaemonControlState) {
+    let Some(runtime) = daemon.runtime() else {
+        return;
+    };
+    if state
+        .event_plane
+        .apply_pending_cleanups(runtime.package_event_router())
+    {
+        state.maintenance.try_wake();
+    }
+}
+
 fn owner_maintenance_pending(daemon: &HubDaemon, state: &DaemonControlState) -> bool {
     state.maintenance.needs_work()
         || session_subscribers_need_delivery(state)
@@ -212,6 +224,7 @@ fn owner_maintenance_pending(daemon: &HubDaemon, state: &DaemonControlState) -> 
                 || runtime.event_plane_owner_ops_pending()
                 || runtime.package_entity_work_pending()
         })
+        || state.event_plane.has_pending_cleanup()
 }
 
 fn mark_due_reconciliation(state: &mut DaemonControlState, now: Instant) {
@@ -245,6 +258,7 @@ fn run_one_owner_background_slice(daemon: &mut HubDaemon, state: &mut DaemonCont
 }
 
 fn run_one_owner_maintenance_slice(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
+    retry_client_event_cleanups(daemon, state);
     let started = Instant::now();
     let kind = state.maintenance.scheduler.take_slice();
     match kind {
@@ -301,7 +315,10 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
     let (shutdown_tx, _) = watch::channel(false);
     install_signal_forwarder(control_tx.clone())?;
     let mut daemon = HubDaemon::start(config)?;
-    let mut control_state = DaemonControlState::default();
+    let mut control_state = DaemonControlState {
+        event_plane: daemon.local_webrtc().event_plane(),
+        ..DaemonControlState::default()
+    };
     seed_lifecycle_reconciliation(&mut daemon, &mut control_state);
     let transport_runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -354,6 +371,7 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
                     let tx = control_tx.clone();
                     let cleanup = cleanup_tx.clone();
                     let shutdown = shutdown_tx.subscribe();
+                    let event_plane = control_state.event_plane.clone();
                     control_state.lifecycle_counters.live_connections = control_state
                         .lifecycle_counters
                         .live_connections
@@ -365,7 +383,8 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
                     connection_tasks.push(transport_runtime.spawn(async move {
                         let _admission_permit = admission_permit;
                         if let Err(error) =
-                            handle_connection_async(stream, tx, cleanup, shutdown).await
+                            handle_connection_async(stream, tx, cleanup, shutdown, event_plane)
+                                .await
                         {
                             eprintln!("botster-hub daemon connection error: {error}");
                         }
@@ -549,6 +568,7 @@ async fn handle_connection_async(
     control_tx: ControlSender,
     cleanup_tx: SyncSender<ConnectionCleanup>,
     mut shutdown_rx: watch::Receiver<bool>,
+    event_plane: std::sync::Arc<crate::daemon_event_subscriptions::ClientEventPlane>,
 ) -> DaemonTransportResult<()> {
     let client_id = format!(
         "botster-hub-daemon-socket-{}",
@@ -591,6 +611,7 @@ async fn handle_connection_async(
             client_id: client_id.clone(),
             admission,
             reply_tx: admission_ack_tx,
+            host_required_features: hello.compatibility.required_features.clone(),
         })
         .await
         .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
@@ -599,20 +620,65 @@ async fn handle_connection_async(
         .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
 
     loop {
+        let event_mailbox = event_plane.mailbox(&client_id);
+        let event_output_ready = !unix_event_flush_stalled()
+            && event_mailbox
+                .as_ref()
+                .is_some_and(|mailbox| mailbox.has_ready_event());
         let request = tokio::select! {
+            biased;
             request = read_async_frame::<DaemonRequest, _>(&mut reader, None) => request,
             _ = mux.notify().notified() => {
                 mux.clear_deferred_flushes();
-                if let Err(error) = flush_unix_mux_writes(&mut write_half, &mux, &mut mux_write).await {
+                if let Err(error) = flush_unix_mux_writes(
+                    &mut write_half,
+                    &mux,
+                    &mut mux_write,
+                    event_mailbox.as_deref(),
+                ).await {
                     cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
                     mux.close_all();
                     return Err(error);
                 }
                 continue;
             }
-            _ = tokio::time::sleep(Duration::from_millis(25)), if mux.has_unsent_mux_writes() || mux_write.has_pending() => {
+            _ = async {
+                if unix_event_flush_stalled() {
+                    std::future::pending::<()>().await;
+                    return;
+                }
+                if let Some(mailbox) = event_mailbox.as_ref() {
+                    let notified = mailbox.notify().notified();
+                    tokio::pin!(notified);
+                    if mailbox.take_wake() || mailbox.has_ready_event() {
+                        return;
+                    }
+                    notified.await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
                 mux.clear_deferred_flushes();
-                if let Err(error) = flush_unix_mux_writes(&mut write_half, &mux, &mut mux_write).await {
+                if let Err(error) = flush_unix_mux_writes(
+                    &mut write_half,
+                    &mux,
+                    &mut mux_write,
+                    event_mailbox.as_deref(),
+                ).await {
+                    cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
+                    mux.close_all();
+                    return Err(error);
+                }
+                continue;
+            }
+            _ = tokio::time::sleep(Duration::from_millis(25)), if mux.has_unsent_mux_writes() || mux_write.has_pending() || event_output_ready || (unix_event_flush_stalled() && event_mailbox.as_ref().is_some_and(|mailbox| mailbox.has_ready_event())) => {
+                mux.clear_deferred_flushes();
+                if let Err(error) = flush_unix_mux_writes(
+                    &mut write_half,
+                    &mux,
+                    &mut mux_write,
+                    event_mailbox.as_deref(),
+                ).await {
                     cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
                     mux.close_all();
                     return Err(error);
@@ -643,9 +709,14 @@ async fn handle_connection_async(
         {
             if unix_mux_blocks_entity_subscription(&mux, &mux_write) {
                 mux_write.enqueue_response(&entity_subscription_mux_busy_error(), None, false)?;
-                if let Err(error) =
-                    flush_pending_responses(&mut write_half, &mux, &mut mux_write, Instant::now())
-                        .await
+                if let Err(error) = flush_pending_responses(
+                    &mut write_half,
+                    &mux,
+                    &mut mux_write,
+                    Instant::now(),
+                    event_plane.mailbox(&client_id).as_deref(),
+                )
+                .await
                 {
                     cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
                     mux.close_all();
@@ -692,8 +763,14 @@ async fn handle_connection_async(
         ));
         mux_write.enqueue_response(&response, response_delivery_tx, close_after_response)?;
         debug_assert_eq!(mux_write.pending_response_count(), 1);
-        if let Err(error) =
-            flush_pending_responses(&mut write_half, &mux, &mut mux_write, Instant::now()).await
+        if let Err(error) = flush_pending_responses(
+            &mut write_half,
+            &mux,
+            &mut mux_write,
+            Instant::now(),
+            event_plane.mailbox(&client_id).as_deref(),
+        )
+        .await
         {
             cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
             let _ = control_tx.try_send(ControlMessage::EgressWriteFailed {
@@ -703,7 +780,14 @@ async fn handle_connection_async(
             return Err(error);
         }
         mux.clear_deferred_flushes();
-        if let Err(error) = flush_unix_mux_writes(&mut write_half, &mux, &mut mux_write).await {
+        if let Err(error) = flush_unix_mux_writes(
+            &mut write_half,
+            &mux,
+            &mut mux_write,
+            event_plane.mailbox(&client_id).as_deref(),
+        )
+        .await
+        {
             cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
             mux.close_all();
             return Err(error);
@@ -720,6 +804,7 @@ async fn handle_connection_async(
 struct MuxWriteState {
     pending: Option<PendingMuxFrame>,
     queued_responses: VecDeque<PendingMuxFrame>,
+    last_host_class: Option<crate::host_control_fair_write::HostControlClass>,
 }
 
 impl MuxWriteState {
@@ -815,9 +900,10 @@ async fn flush_pending_responses(
     mux: &UnixConnectionMux,
     write_state: &mut MuxWriteState,
     started: Instant,
+    event_mailbox: Option<&crate::daemon_event_subscriptions::ClientEventMailbox>,
 ) -> DaemonTransportResult<()> {
     loop {
-        flush_unix_mux_writes(writer, mux, write_state).await?;
+        flush_unix_mux_writes(writer, mux, write_state, event_mailbox).await?;
         if !write_state.has_pending_response() {
             return Ok(());
         }
@@ -830,32 +916,95 @@ async fn flush_pending_responses(
     }
 }
 
+fn unix_event_flush_stalled() -> bool {
+    unix_event_flush_stalled_from(
+        env::var("BOTSTER_ENV").ok().as_deref(),
+        env::var_os("BOTSTER_HUB_TEST_STALL_UNIX_EVENT_FLUSH").as_deref(),
+    )
+}
+
+fn unix_event_flush_stalled_from(
+    botster_env: Option<&str>,
+    stall_path: Option<&std::ffi::OsStr>,
+) -> bool {
+    botster_env == Some("test") && stall_path.is_some_and(|path| Path::new(path).exists())
+}
+
 async fn flush_unix_mux_writes(
     writer: &mut (impl tokio::io::AsyncWrite + Unpin),
     mux: &UnixConnectionMux,
     write_state: &mut MuxWriteState,
+    event_mailbox: Option<&crate::daemon_event_subscriptions::ClientEventMailbox>,
 ) -> DaemonTransportResult<()> {
+    use crate::host_control_fair_write::{
+        HostControlClass, MAX_HOST_FRAMES_PER_FLUSH_TURN, next_ready_host_control_class,
+    };
+
     abandon_zero_offset_terminal_for_response(write_state);
     if resume_pending_mux_write(writer, write_state).await? == MuxWrite::Pending {
         return Ok(());
     }
-    while let Some(frame) = write_state.queued_responses.pop_front() {
-        write_state.pending = Some(frame);
-        if resume_pending_mux_write(writer, write_state).await? == MuxWrite::Pending {
-            return Ok(());
+    let mut host_frames = 0;
+    loop {
+        if host_frames >= MAX_HOST_FRAMES_PER_FLUSH_TURN {
+            break;
+        }
+        let control_ready = !write_state.queued_responses.is_empty();
+        let event_ready = !unix_event_flush_stalled()
+            && (mux.has_pending_event()
+                || event_mailbox.is_some_and(
+                    crate::daemon_event_subscriptions::ClientEventMailbox::has_ready_event,
+                ));
+        match next_ready_host_control_class(
+            write_state.last_host_class,
+            control_ready,
+            false,
+            event_ready,
+        ) {
+            Some(HostControlClass::Control) => {
+                let Some(frame) = write_state.queued_responses.pop_front() else {
+                    break;
+                };
+                write_state.last_host_class = Some(HostControlClass::Control);
+                write_state.pending = Some(frame);
+                host_frames += 1;
+                if resume_pending_mux_write(writer, write_state).await? == MuxWrite::Pending {
+                    return Ok(());
+                }
+            }
+            Some(HostControlClass::Event) => {
+                let event = mux.pop_pending_event().or_else(|| {
+                    event_mailbox.and_then(
+                        crate::daemon_event_subscriptions::ClientEventMailbox::take_ready_event,
+                    )
+                });
+                let Some(event) = event else {
+                    break;
+                };
+                write_state.last_host_class = Some(HostControlClass::Event);
+                write_state.pending = Some(serialize_mux_frame(
+                    &event,
+                    None,
+                    PendingMuxClass::Event,
+                    None,
+                    false,
+                )?);
+                host_frames += 1;
+                if resume_pending_mux_write(writer, write_state).await? == MuxWrite::Pending {
+                    return Ok(());
+                }
+            }
+            Some(HostControlClass::Entity) | None => break,
         }
     }
-    while let Some(event) = mux.pop_pending_event() {
-        write_state.pending = Some(serialize_mux_frame(
-            &event,
-            None,
-            PendingMuxClass::Event,
-            None,
-            false,
-        )?);
-        if resume_pending_mux_write(writer, write_state).await? == MuxWrite::Pending {
-            return Ok(());
-        }
+    let more_host = !write_state.queued_responses.is_empty()
+        || (!unix_event_flush_stalled()
+            && (mux.has_pending_event()
+                || event_mailbox.is_some_and(
+                    crate::daemon_event_subscriptions::ClientEventMailbox::has_ready_event,
+                )));
+    if more_host {
+        return Ok(());
     }
     for (session_id, subscription_id, handle, bytes) in mux.snapshot_writes() {
         if handle.is_closed() {
@@ -986,7 +1135,8 @@ mod mux_write_resume_tests {
     use super::{
         MuxWrite, MuxWriteState, PendingMuxClass, PendingMuxFrame, daemon_response_base,
         entity_subscription_mux_busy_error, flush_pending_responses, flush_unix_mux_writes,
-        unix_mux_blocks_entity_subscription, write_frame_bytes_resumable,
+        unix_event_flush_stalled_from, unix_mux_blocks_entity_subscription,
+        write_frame_bytes_resumable,
     };
     use crate::unix_terminal_adapter::{UnixConnectionMux, UnixTerminalAdapter};
     use botster_core::contract::terminal_adapter::{TerminalAdapter, TerminalAdapterPressure};
@@ -1184,7 +1334,7 @@ mod mux_write_resume_tests {
             allow_remainder: false,
         };
         let mut write_state = MuxWriteState::default();
-        flush_unix_mux_writes(&mut writer, &mux, &mut write_state)
+        flush_unix_mux_writes(&mut writer, &mux, &mut write_state, None)
             .await
             .expect("zero-progress terminal start is abandoned");
         assert_eq!(
@@ -1200,7 +1350,7 @@ mod mux_write_resume_tests {
         mux.clear_deferred_flushes();
         writer.allow_remainder = true;
         writer.stall_after = usize::MAX;
-        flush_unix_mux_writes(&mut writer, &mux, &mut write_state)
+        flush_unix_mux_writes(&mut writer, &mux, &mut write_state, None)
             .await
             .expect("retry the original deferred frame");
         let lines = parse_written_mux_lines(&writer.written);
@@ -1224,7 +1374,7 @@ mod mux_write_resume_tests {
             allow_remainder: false,
         };
         let mut write_state = MuxWriteState::default();
-        flush_unix_mux_writes(&mut writer, &mux, &mut write_state)
+        flush_unix_mux_writes(&mut writer, &mux, &mut write_state, None)
             .await
             .expect("first flush");
         assert!(write_state.pending.is_some());
@@ -1238,7 +1388,7 @@ mod mux_write_resume_tests {
             .expect("enqueue status");
         writer.allow_remainder = true;
         writer.stall_after = usize::MAX;
-        flush_unix_mux_writes(&mut writer, &mux, &mut write_state)
+        flush_unix_mux_writes(&mut writer, &mux, &mut write_state, None)
             .await
             .expect("resume flush");
         assert!(!write_state.has_pending());
@@ -1259,6 +1409,165 @@ mod mux_write_resume_tests {
     }
 
     #[tokio::test]
+    async fn partial_package_event_resumes_without_interleaving() {
+        let mux = UnixConnectionMux::new();
+        let mailbox = crate::daemon_event_subscriptions::ClientEventMailbox::new(
+            crate::config::PackageEventPlanePolicy::default(),
+        );
+        mailbox
+            .try_push(
+                "sub",
+                "owner",
+                "ready",
+                serde_json::json!({ "ok": true }),
+                8,
+            )
+            .expect("admit event");
+        let serialized = serde_json::to_vec(&botster_hub_client::DaemonEvent::PackageEvent {
+            subscription_id: "sub".to_string(),
+            owner: "owner".to_string(),
+            name: "ready".to_string(),
+            payload: serde_json::json!({ "ok": true }),
+        })
+        .expect("serialize")
+        .len()
+            + 1;
+        let prefix = 8.min(serialized.saturating_sub(1));
+        let mut writer = PrefixStallWriter {
+            written: Vec::new(),
+            stall_after: prefix,
+            allow_remainder: false,
+        };
+        let mut write_state = MuxWriteState::default();
+        flush_unix_mux_writes(&mut writer, &mux, &mut write_state, Some(&mailbox))
+            .await
+            .expect("partial event write");
+        assert!(write_state.pending.is_some());
+        assert!(write_state.pending.as_ref().is_some_and(|pending| {
+            pending.class == PendingMuxClass::Event && pending.offset == prefix
+        }));
+
+        write_state
+            .enqueue_response(
+                &daemon_response_base(DaemonResponseKind::Status),
+                None,
+                false,
+            )
+            .expect("enqueue status");
+        writer.allow_remainder = true;
+        writer.stall_after = usize::MAX;
+        flush_unix_mux_writes(&mut writer, &mux, &mut write_state, Some(&mailbox))
+            .await
+            .expect("resume event then status");
+        assert!(!write_state.has_pending());
+        let lines = parse_written_mux_lines(&writer.written);
+        assert!(
+            matches!(
+                lines[0],
+                botster_hub_client::DaemonUnixMuxFrame::Event(
+                    botster_hub_client::DaemonEvent::PackageEvent { .. }
+                )
+            ),
+            "partial PackageEvent must finish before a Response: {lines:?}"
+        );
+        assert!(matches!(
+            lines[1],
+            botster_hub_client::DaemonUnixMuxFrame::Response(ref response)
+                if response.kind == DaemonResponseKind::Status
+        ));
+    }
+
+    #[test]
+    fn unix_event_stall_latch_requires_test_mode() {
+        let stall = std::env::temp_dir().join(format!(
+            "bh-event-stall-negative-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::write(&stall, b"stall").expect("stall file");
+        assert!(unix_event_flush_stalled_from(
+            Some("test"),
+            Some(stall.as_os_str())
+        ));
+        assert!(
+            !unix_event_flush_stalled_from(Some("production"), Some(stall.as_os_str())),
+            "non-test BOTSTER_ENV must ignore the stall latch"
+        );
+        assert!(
+            !unix_event_flush_stalled_from(None, Some(stall.as_os_str())),
+            "unset BOTSTER_ENV must ignore the stall latch"
+        );
+        let _ = std::fs::remove_file(&stall);
+    }
+
+    #[tokio::test]
+    async fn one_flush_turn_writes_status_without_draining_the_event_flood() {
+        let mux = UnixConnectionMux::new();
+        let mailbox = crate::daemon_event_subscriptions::ClientEventMailbox::new(
+            crate::config::PackageEventPlanePolicy {
+                consumer_queue_max_events: 8,
+                ..crate::config::PackageEventPlanePolicy::default()
+            },
+        );
+        for index in 0..8 {
+            mailbox
+                .try_push(
+                    "sub",
+                    "owner",
+                    "ready",
+                    serde_json::json!({ "ok": true, "n": index }),
+                    8,
+                )
+                .expect("admit event");
+        }
+        let mut writer = PrefixStallWriter {
+            written: Vec::new(),
+            stall_after: usize::MAX,
+            allow_remainder: true,
+        };
+        let mut write_state = MuxWriteState::default();
+        write_state
+            .enqueue_response(
+                &daemon_response_base(DaemonResponseKind::Status),
+                None,
+                false,
+            )
+            .expect("enqueue status");
+        flush_unix_mux_writes(&mut writer, &mux, &mut write_state, Some(&mailbox))
+            .await
+            .expect("bounded turn");
+        let lines = parse_written_mux_lines(&writer.written);
+        assert!(
+            lines.len() <= crate::host_control_fair_write::MAX_HOST_FRAMES_PER_FLUSH_TURN,
+            "one flush turn must not drain the flood: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| matches!(
+                line,
+                botster_hub_client::DaemonUnixMuxFrame::Response(response)
+                    if response.kind == DaemonResponseKind::Status
+            )),
+            "Status must progress after event draining starts: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| matches!(
+                line,
+                botster_hub_client::DaemonUnixMuxFrame::Event(
+                    botster_hub_client::DaemonEvent::PackageEvent { .. }
+                )
+            )),
+            "an event frame must also progress: {lines:?}"
+        );
+        assert!(
+            mailbox.has_ready_event(),
+            "remaining events stay queued across turns"
+        );
+    }
+
+    #[tokio::test]
     async fn zero_progress_terminal_start_is_abandoned_without_completing_slot() {
         let mux = UnixConnectionMux::new();
         let _stall = occupy_route(&mux, "stall", "sub", "flood");
@@ -1268,7 +1577,7 @@ mod mux_write_resume_tests {
             allow_remainder: false,
         };
         let mut write_state = MuxWriteState::default();
-        flush_unix_mux_writes(&mut writer, &mux, &mut write_state)
+        flush_unix_mux_writes(&mut writer, &mux, &mut write_state, None)
             .await
             .expect("abandon flush");
         assert!(writer.written.is_empty());
@@ -1277,7 +1586,7 @@ mod mux_write_resume_tests {
         let _sibling = occupy_route(&mux, "sibling", "sub-live", "live");
         writer.allow_remainder = true;
         writer.stall_after = usize::MAX;
-        flush_unix_mux_writes(&mut writer, &mux, &mut write_state)
+        flush_unix_mux_writes(&mut writer, &mux, &mut write_state, None)
             .await
             .expect("sibling flush");
         let lines = parse_written_mux_lines(&writer.written);
@@ -1314,7 +1623,7 @@ mod mux_write_resume_tests {
             allow_remainder: true,
         };
         let mut write_state = MuxWriteState::default();
-        flush_unix_mux_writes(&mut writer, &mux, &mut write_state)
+        flush_unix_mux_writes(&mut writer, &mux, &mut write_state, None)
             .await
             .expect("host-first flush");
         let lines = parse_written_mux_lines(&writer.written);
@@ -1339,7 +1648,7 @@ mod mux_write_resume_tests {
             allow_remainder: false,
         };
         let mut write_state = MuxWriteState::default();
-        flush_unix_mux_writes(&mut writer, &mux, &mut write_state)
+        flush_unix_mux_writes(&mut writer, &mux, &mut write_state, None)
             .await
             .expect("partial terminal");
         let (ack_tx, ack_rx) = mpsc::channel();
@@ -1352,14 +1661,14 @@ mod mux_write_resume_tests {
             .expect("enqueue shutdown");
         assert!(ack_rx.try_recv().is_err());
         assert!(write_state.has_close_after_pending());
-        flush_unix_mux_writes(&mut writer, &mux, &mut write_state)
+        flush_unix_mux_writes(&mut writer, &mux, &mut write_state, None)
             .await
             .expect("cannot finish while stalled");
         assert!(ack_rx.try_recv().is_err());
         assert!(write_state.has_close_after_pending());
         writer.allow_remainder = true;
         writer.stall_after = usize::MAX;
-        flush_unix_mux_writes(&mut writer, &mux, &mut write_state)
+        flush_unix_mux_writes(&mut writer, &mux, &mut write_state, None)
             .await
             .expect("finish close-after");
         ack_rx.try_recv().expect("ack after complete shutdown line");
@@ -1387,7 +1696,7 @@ mod mux_write_resume_tests {
             allow_remainder: false,
         };
         let mut write_state = MuxWriteState::default();
-        flush_unix_mux_writes(&mut writer, &mux, &mut write_state)
+        flush_unix_mux_writes(&mut writer, &mux, &mut write_state, None)
             .await
             .expect("partial terminal");
         let (ack_tx, ack_rx) = mpsc::channel();
@@ -1399,13 +1708,13 @@ mod mux_write_resume_tests {
             )
             .expect("enqueue update");
         assert!(ack_rx.try_recv().is_err());
-        flush_unix_mux_writes(&mut writer, &mux, &mut write_state)
+        flush_unix_mux_writes(&mut writer, &mux, &mut write_state, None)
             .await
             .expect("still pending");
         assert!(ack_rx.try_recv().is_err());
         writer.allow_remainder = true;
         writer.stall_after = usize::MAX;
-        flush_unix_mux_writes(&mut writer, &mux, &mut write_state)
+        flush_unix_mux_writes(&mut writer, &mux, &mut write_state, None)
             .await
             .expect("finish update");
         ack_rx.try_recv().expect("ack after complete update line");
@@ -1428,7 +1737,7 @@ mod mux_write_resume_tests {
             allow_remainder: false,
         };
         let mut write_state = MuxWriteState::default();
-        flush_unix_mux_writes(&mut writer, &mux, &mut write_state)
+        flush_unix_mux_writes(&mut writer, &mux, &mut write_state, None)
             .await
             .expect("partial terminal");
         write_state
@@ -1438,7 +1747,7 @@ mod mux_write_resume_tests {
                 false,
             )
             .expect("enqueue status");
-        flush_unix_mux_writes(&mut writer, &mux, &mut write_state)
+        flush_unix_mux_writes(&mut writer, &mux, &mut write_state, None)
             .await
             .expect("response remains pending");
         assert!(write_state.has_pending_response());
@@ -1452,6 +1761,7 @@ mod mux_write_resume_tests {
             &mux,
             &mut write_state,
             Instant::now() - Duration::from_secs(3),
+            None,
         )
         .await;
         assert!(
@@ -1461,7 +1771,7 @@ mod mux_write_resume_tests {
         assert_eq!(write_state.pending_response_count(), 1);
         writer.allow_remainder = true;
         writer.stall_after = usize::MAX;
-        flush_pending_responses(&mut writer, &mux, &mut write_state, Instant::now())
+        flush_pending_responses(&mut writer, &mux, &mut write_state, Instant::now(), None)
             .await
             .expect("finish the one pending Response");
         assert!(!write_state.has_pending_response());
@@ -1514,7 +1824,7 @@ mod mux_write_resume_tests {
         write_state
             .enqueue_response(&entity_subscription_mux_busy_error(), None, false)
             .expect("enqueue reject");
-        flush_pending_responses(&mut writer, &mux, &mut write_state, Instant::now())
+        flush_pending_responses(&mut writer, &mux, &mut write_state, Instant::now(), None)
             .await
             .expect("write reject");
         let lines = parse_written_mux_lines(&writer.written);
@@ -1903,6 +2213,15 @@ fn handle_connection_cleanup(
     {
         candidates.insert((claim.session_id, claim.subscription_id));
     }
+    state
+        .pending_runtime
+        .host_compatibility
+        .remove(&cleanup.client_id);
+    if let Some(runtime) = daemon.runtime() {
+        state
+            .event_plane
+            .cleanup_connection(&cleanup.client_id, runtime.package_event_router());
+    }
     for subscription in &cleanup.attached_subscriptions {
         candidates.insert((
             subscription.session_id.clone(),
@@ -2103,10 +2422,17 @@ pub(crate) fn handle_control_message(
             client_id,
             admission,
             reply_tx,
+            host_required_features,
         } => {
             if let UnixTerminalAdmission::Admitted { mux, .. } = &admission {
                 mux.bind_close_work(Arc::clone(&state.pending_runtime.close_work));
             }
+            state.pending_runtime.host_compatibility.insert(
+                client_id.clone(),
+                HostCompatibilityRecord {
+                    required_features: host_required_features,
+                },
+            );
             state
                 .pending_runtime
                 .unix_admissions
@@ -2117,11 +2443,18 @@ pub(crate) fn handle_control_message(
         ControlMessage::RegisterWebrtcAdmission {
             grant_id,
             admission,
+            host_required_features,
         } => {
             if daemon.local_webrtc().has_live_peer(&grant_id) {
                 if let WebrtcTerminalAdmission::Admitted { mux, .. } = &admission {
                     mux.bind_close_work(Arc::clone(&state.pending_runtime.close_work));
                 }
+                state.pending_runtime.host_compatibility.insert(
+                    grant_id.clone(),
+                    HostCompatibilityRecord {
+                        required_features: host_required_features,
+                    },
+                );
                 state
                     .pending_runtime
                     .webrtc_admissions
@@ -2234,6 +2567,22 @@ pub(crate) fn handle_control_message(
                     Ok(local_webrtc_peer_gone_request_error(operation)),
                     response_delivery_rx,
                 );
+            }
+            if matches!(
+                request.as_ref(),
+                DaemonRequest::SubscribeEvents { .. } | DaemonRequest::UnsubscribeEvents { .. }
+            ) {
+                let connection_id = grant_id
+                    .clone()
+                    .or_else(|| client_id.clone())
+                    .unwrap_or_default();
+                let response = handle_client_event_request(
+                    daemon,
+                    state,
+                    &connection_id,
+                    request.as_ref().clone(),
+                );
+                return send_control_response(reply_tx, Ok(response), response_delivery_rx);
             }
             if matches!(request.as_ref(), DaemonRequest::CheckHubUpdate) {
                 return match plan_hub_update_check() {
@@ -2680,6 +3029,12 @@ pub(crate) fn handle_control_message(
             }
             for grant_id in &removed_grants {
                 state.pending_runtime.webrtc_admissions.remove(grant_id);
+                state.pending_runtime.host_compatibility.remove(grant_id);
+                if let Some(runtime) = daemon.runtime() {
+                    state
+                        .event_plane
+                        .cleanup_connection(grant_id, runtime.package_event_router());
+                }
             }
             // Residual same-grant index rows can survive a no-op Core Detach. Drop them
             // after occupancy release. Preserve replacement owners.
@@ -3152,6 +3507,11 @@ fn handle_runtime_control_request(
         DaemonRequest::SubscribeEntities { .. } | DaemonRequest::UnsubscribeEntities { .. } => {
             Err(DaemonTransportError::Protocol(
                 "entity subscriptions require the held-open stream handler",
+            ))
+        }
+        DaemonRequest::SubscribeEvents { .. } | DaemonRequest::UnsubscribeEvents { .. } => {
+            Err(DaemonTransportError::Protocol(
+                "package event subscriptions require the host event handler",
             ))
         }
         DaemonRequest::RemoveSession { session_id } => {
@@ -4981,10 +5341,12 @@ pub(crate) enum ControlMessage {
         client_id: String,
         admission: UnixTerminalAdmission,
         reply_tx: oneshot::Sender<()>,
+        host_required_features: Vec<String>,
     },
     RegisterWebrtcAdmission {
         grant_id: String,
         admission: WebrtcTerminalAdmission,
+        host_required_features: Vec<String>,
     },
 }
 
@@ -5015,12 +5377,18 @@ pub(crate) enum WebrtcTerminalAdmission {
     },
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct HostCompatibilityRecord {
+    pub required_features: Vec<String>,
+}
+
 #[derive(Default)]
 pub(crate) struct PendingRuntimeState {
     pub(crate) streams: AttachStreamRegistry,
     unix_admissions: BTreeMap<String, UnixTerminalAdmission>,
     webrtc_admissions: BTreeMap<String, WebrtcTerminalAdmission>,
     close_work: Arc<AtomicBool>,
+    host_compatibility: BTreeMap<String, HostCompatibilityRecord>,
 }
 
 impl fmt::Debug for PendingRuntimeState {
@@ -5234,6 +5602,7 @@ pub(crate) struct DaemonControlState {
     drain_cursors: BTreeMap<String, u64>,
     egress_diagnostics: DaemonEgressDiagnostics,
     pub(crate) entity_subscriptions: BTreeMap<String, EntitySubscriptionState>,
+    pub(crate) event_plane: std::sync::Arc<crate::daemon_event_subscriptions::ClientEventPlane>,
     pub(crate) pending_runtime: PendingRuntimeState,
     pub(crate) lifecycle_counters: DaemonLifecycleCounters,
     pub(crate) maintenance: MaintenanceState,
@@ -5254,6 +5623,9 @@ impl Default for DaemonControlState {
             drain_cursors: BTreeMap::new(),
             egress_diagnostics: DaemonEgressDiagnostics::default(),
             entity_subscriptions: BTreeMap::new(),
+            event_plane: std::sync::Arc::new(
+                crate::daemon_event_subscriptions::ClientEventPlane::default(),
+            ),
             pending_runtime: PendingRuntimeState::default(),
             lifecycle_counters: DaemonLifecycleCounters::default(),
             maintenance: MaintenanceState::default(),
@@ -5491,6 +5863,95 @@ fn should_mark_pump_after_control(request: &DaemonRequest, succeeded: bool) -> b
     }
 }
 
+fn handle_client_event_request(
+    daemon: &mut HubDaemon,
+    state: &mut DaemonControlState,
+    connection_id: &str,
+    request: DaemonRequest,
+) -> DaemonResponse {
+    use crate::daemon_event_subscriptions::{
+        ClientEventAdmitError, client_event_operator_error, subscribe_events_response,
+        unsubscribe_events_response,
+    };
+    use botster_hub_client::hello_requires_package_event_subscriptions;
+
+    if connection_id.is_empty() {
+        return client_event_operator_error(
+            ClientEventAdmitError::NotNegotiated,
+            "package-events",
+            "subscribe_events",
+        );
+    }
+    let negotiated = state
+        .pending_runtime
+        .host_compatibility
+        .get(connection_id)
+        .is_some_and(|record| {
+            hello_requires_package_event_subscriptions(&record.required_features)
+        });
+    let Some(runtime) = daemon.runtime() else {
+        return client_event_operator_error(
+            ClientEventAdmitError::Router(crate::package_event_router::EventPlaneStatus::ShedBusy),
+            connection_id,
+            "subscribe_events",
+        );
+    };
+    match request {
+        DaemonRequest::SubscribeEvents {
+            subscription_id,
+            owner,
+            name,
+            subjects,
+        } => {
+            if !negotiated {
+                return client_event_operator_error(
+                    ClientEventAdmitError::NotNegotiated,
+                    &subscription_id,
+                    "subscribe_events",
+                );
+            }
+            match state.event_plane.try_subscribe(
+                connection_id,
+                &subscription_id,
+                &owner,
+                &name,
+                subjects,
+                runtime.package_event_router().policy(),
+                runtime.package_event_router(),
+            ) {
+                Ok(()) => subscribe_events_response(),
+                Err(error) => {
+                    client_event_operator_error(error, &subscription_id, "subscribe_events")
+                }
+            }
+        }
+        DaemonRequest::UnsubscribeEvents { subscription_id } => {
+            if !negotiated {
+                return client_event_operator_error(
+                    ClientEventAdmitError::NotNegotiated,
+                    &subscription_id,
+                    "unsubscribe_events",
+                );
+            }
+            match state.event_plane.try_unsubscribe(
+                connection_id,
+                &subscription_id,
+                runtime.package_event_router(),
+            ) {
+                Ok(()) => unsubscribe_events_response(),
+                Err(error) => {
+                    client_event_operator_error(error, &subscription_id, "unsubscribe_events")
+                }
+            }
+        }
+        _ => client_event_operator_error(
+            ClientEventAdmitError::NotNegotiated,
+            connection_id,
+            "subscribe_events",
+        ),
+    }
+}
+
 fn control_request_operation_label(request: &DaemonRequest) -> &'static str {
     match request {
         DaemonRequest::Status => "status",
@@ -5675,7 +6136,7 @@ fn force_advance_session_type_generation(daemon: &mut HubDaemon) -> DaemonTransp
     Ok(())
 }
 
-fn daemon_response_base(kind: DaemonResponseKind) -> DaemonResponse {
+pub(crate) fn daemon_response_base(kind: DaemonResponseKind) -> DaemonResponse {
     DaemonResponse {
         kind,
         status: None,
@@ -8036,6 +8497,7 @@ fn handle_connection(stream: UnixStream, control_tx: ControlSender) -> DaemonTra
         control_tx,
         cleanup_tx,
         shutdown_rx,
+        std::sync::Arc::new(crate::daemon_event_subscriptions::ClientEventPlane::default()),
     ));
     let _ = cleanup_rx.try_recv();
     result

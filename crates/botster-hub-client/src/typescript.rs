@@ -146,6 +146,16 @@ pub(crate) fn daemon_protocol_typescript() -> String {
                 &[("entity_type", "string"), ("subscription_id", "string")],
             ),
             ("unsubscribe_entities", &[("subscription_id", "string")]),
+            (
+                "subscribe_events",
+                &[
+                    ("subscription_id", "string"),
+                    ("owner", "string"),
+                    ("name", "string"),
+                    ("subjects?", "string[]"),
+                ],
+            ),
+            ("unsubscribe_events", &[("subscription_id", "string")]),
             ("remove_session", &[("session_id", "string")]),
             ("whoami", &[("caller_session_id", "string | null")]),
             (
@@ -567,6 +577,8 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             "sessions",
             "entity_subscribed",
             "entity_unsubscribed",
+            "event_subscribed",
+            "event_unsubscribed",
             "session_removed",
             "spawned",
             "events",
@@ -1569,6 +1581,23 @@ pub(crate) fn daemon_protocol_typescript() -> String {
                     ("subscription_id", "string"),
                     ("generation", "number"),
                     ("reason", "string"),
+                ],
+            ),
+            (
+                "package_event",
+                &[
+                    ("subscription_id", "string"),
+                    ("owner", "string"),
+                    ("name", "string"),
+                    ("payload", "JsonValue"),
+                ],
+            ),
+            (
+                "event_gap",
+                &[
+                    ("subscription_id", "string"),
+                    ("owner", "string"),
+                    ("name", "string"),
                 ],
             ),
         ],

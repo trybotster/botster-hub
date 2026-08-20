@@ -12,7 +12,7 @@
     "emitted": [
       {
         "name": "sample.ready",
-        "audience": ["plugins"],
+        "audience": ["plugins", "clients"],
         "payload_schema": {
           "type": "object",
           "additionalProperties": false,
