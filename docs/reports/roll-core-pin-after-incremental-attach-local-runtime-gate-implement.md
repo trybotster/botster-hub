@@ -16,6 +16,7 @@
 | Base | `origin/main` `7a09292cd518186e0def758c823c0841ee1cacf1` |
 | Pin-roll candidate | `a111248140b14086c1eb4a4dcb0cdd5eb350a88b` |
 | Review-return candidate | `0139335f474f74c67705010887acb45dfcb91e35` |
+| Exact-command return candidate | `4dd67f55a53c6230093776d1a5e142438e13c9e6` |
 | Old Core pin | `8fce2041b9fe742cb2a6df9e74cb262606672742` |
 | New Core pin | `7eafa470a18025895995bbedc20d34b58106a03b` |
 | Session-type eligibility consumer | no |
@@ -136,6 +137,13 @@ Open findings addressed:
 - `finding_1787259246_848243` (product, high): `git_visible_hub_members_share_one_exact_core_revision` now enumerates every expected Core-family git table in each member manifest and requires the exact `.git` URL and `REQUIRED_CORE_REV` on each declaration. `git_visible_hub_members_reject_one_mixed_core_revision` and `git_visible_hub_members_reject_one_mixed_core_url` use fixtures that still contain the approved URL and rev, so a whole-file `contains` check would pass, and they require the per-declaration guard to fail.
 - `finding_1787259246_896862` (process, low): routing prose now distinguishes the failed Grok-native handshake from the later `botster mcp-serve` `list_spawn_targets` call. Duplicate checklist items are skipped.
 
+## Review return (`review_1787259748_300660`)
+
+Open findings addressed:
+
+- `finding_1787259748_439457` (test evidence, high): acceptance check 6 now uses three `--exact` commands, one per full test name. Each command ran `1 passed`. The prefix filter `git_visible_hub_members -- --exact` still runs 0 tests and is no longer the documented gate.
+- `finding_1787259748_121512` (product hygiene, medium): the mixed-rev fixture uses synthetic rev `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`, not retired pin `8fce2041b9fe742cb2a6df9e74cb262606672742`. `rg` of the old pin outside `docs/` and `target/` now returns zero matches.
+
 ## Tests and downstream proof run
 
 Production entry point: Git consumers of `botster-hub-client` resolve `botster-terminal-protocol` from the member manifest. After this change, that manifest names Core `.git` rev `7eafa470a18025895995bbedc20d34b58106a03b`. A contract-only TUI production build (`default-features = false`) can compile against that pin without `local-runtime`.
@@ -149,7 +157,10 @@ Local toolchain: `rustc 1.92.0`, `cargo 1.92.0`. GitHub Hub CI still pins Rust `
 | 3 | `cargo fmt --all -- --check` | exit 0 |
 | 4 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0 on local `1.92.0` |
 | 5 | `./test.sh --locked` | exit 0; one clean default-concurrency run; `packages/hub-test-support` assets current; 1166 passed, 0 failed |
-| 6 | `./test.sh --locked --test session_projection_owner_loop git_visible_hub_members -- --exact` | 3 passed on the Review return (per-declaration guard plus mixed-rev and mixed-URL red tests) |
+| 6a | `./test.sh --locked --test session_projection_owner_loop git_visible_hub_members_share_one_exact_core_revision -- --exact` | 1 passed |
+| 6b | `./test.sh --locked --test session_projection_owner_loop git_visible_hub_members_reject_one_mixed_core_revision -- --exact` | 1 passed |
+| 6c | `./test.sh --locked --test session_projection_owner_loop git_visible_hub_members_reject_one_mixed_core_url -- --exact` | 1 passed |
+| 6-prefix | `./test.sh --locked --test session_projection_owner_loop git_visible_hub_members -- --exact` | 0 tests (documents why the prefix plus `--exact` is not a gate) |
 | 7 | `BOTSTER_ENV=test cargo test --locked -p botster-hub-test-support` | 44 lib tests + 3 doctests passed, including `late_attach_goldens_have_distinct_content_identity_and_pinned_provenance` |
 | 8 | `./test.sh --locked --test hub_daemon_lifecycle_test isolated_hub_two_packages_emit_and_consume_exact_event_without_blocking_worktree -- --exact --nocapture` | 1 passed after candidate commit. Log: `hub_sha=a111248140b14086c1eb4a4dcb0cdd5eb350a88b core_sha=7eafa470a18025895995bbedc20d34b58106a03b`. Both binaries live under this checkout `target/` |
 | 9 | `cargo tree -e normal -i botster-terminal-protocol --locked` | one source `git+https://github.com/trybotster/botster-core.git?rev=7eafa470a18025895995bbedc20d34b58106a03b#7eafa470` |
@@ -201,4 +212,6 @@ Captured to the vault inbox:
 - Hub suite runs require an explicit session-worker prebuild before `./test.sh --locked`, even though `ensure_session_worker_binary` exists.
 - When a consumer ticket branch already carries the pins that failed, downstream proof must target that branch, not the consumer `main`.
 
-This Review return adds no new inbox note. The mixed-pin guard is the charter claim already named by [[Git-consumed Hub members pin Core protocol by exact revision]] and [[Cargo Git URL and selector form are part of crate identity]].
+This Review return captured:
+
+- cargo `--exact` with a name prefix runs zero tests and exits 0.
