@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use botster_hub::{MAX_OWNER_TURN_MS, MAX_READY_OPERATION_WAIT_MS};
 
-const REQUIRED_CORE_REV: &str = "8fce2041b9fe742cb2a6df9e74cb262606672742";
+const REQUIRED_CORE_REV: &str = "7eafa470a18025895995bbedc20d34b58106a03b";
 const REQUIRED_CORE_URL: &str = "https://github.com/trybotster/botster-core.git";
 
 #[test]
@@ -39,6 +39,15 @@ fn git_visible_hub_members_share_one_exact_core_revision() {
     assert!(
         lock.contains(&format!("rev={REQUIRED_CORE_REV}#{REQUIRED_CORE_REV}")),
         "Cargo.lock must pin the exact Core revision"
+    );
+    let readme = fs::read_to_string(root.join("README.md")).expect("read README");
+    assert!(
+        !readme.contains("tracks `botster-core` from the `main` branch"),
+        "README must not say Hub tracks Core from main"
+    );
+    assert!(
+        readme.contains("one exact `rev`"),
+        "README must state the exact rev policy"
     );
 }
 
