@@ -6,7 +6,16 @@ Step: `botster_stack_plan`
 Pipeline: `botster_stack_delivery` (direct merge, no PR)
 Registered dependency: Core `ticket_1787251441_640678` (`dependency_1787251453_570256`), status closed
 Triggering finding: botster-tui `ticket_1786663585_944018` Review `finding_1787251254_962248`
-Vault checklist: `checklist_1787254776_257555` (run scope, one Plan visit)
+Vault checklist: `checklist_1787254776_257555` (run scope, one Plan visit; reused for revision 2)
+Plan **revision 2** after Plan Review `review_1787255972_846280`
+
+## Plan Review corrections (rev 1 → rev 2)
+
+| Finding | Class | Fix |
+| --- | --- | --- |
+| `finding_1787255972_363099` Proof B permitted a failed downstream TUI build | product / high | Proof B now targets the real consumer, TUI ticket branch `project-pipelines/ticket_1786663585_944018` at `b8872811ea088fe445aa262e1d92a1d1fb627417`, not TUI `main`. `cargo build -p botster-tui --locked` must exit 0. A failure is a blocking finding, never residual risk. The TUI ticket already depends on this ticket (`dependency_1787251454_407744`), so no new dependency and no cycle. Plan-time feasibility results for proofs A and B are recorded in section 10. |
+| `finding_1787255972_264809` Hub suite ran before the worker prebuild | product / high | Section 8 procedure and the section 10 gate table now start with `cargo build --locked -p botster-core-daemon --bin botster-session-worker` and `cargo build --locked --bin botster-hub` before any Hub test command. |
+| `finding_1787255972_955306` README dependency policy stayed false | product / medium | README `## Dependency policy` moves into scope with exact replacement text (section 8) and a negative assertion on the retired branch-tracking sentence in `tests/session_projection_owner_loop.rs` (section 10). |
 
 ## 1. Target repository and target_id
 
@@ -95,9 +104,10 @@ Not loaded, with reason: [[botster runtime teardown lenses]] does not apply; thi
 
 1. Replace every `8fce2041b9fe742cb2a6df9e74cb262606672742` Core revision literal in Hub source and manifests with `7eafa470a18025895995bbedc20d34b58106a03b` (inventory in section 8). Keep the `https://github.com/trybotster/botster-core.git` URL form and the `rev =` selector on every Core-family dependency.
 2. Re-resolve `Cargo.lock` so the six Core-family packages (`botster-core`, `botster-core-daemon`, `botster-core-test-support`, `botster-terminal-ghostty`, `botster-terminal-protocol`, `botster-terminal-protocol-client`) point at the new revision. No other lock entry may change.
-3. Prove that a contract-only Core consumer with `default-features = false` builds against the new pin through the Git-visible `botster-hub-client` manifest (section 10, proof A), and run the TUI-shaped lockstep build (section 10, proof B).
-4. Run the Hub charter gates on the rolled worktree.
-5. Commit the implementation report at `docs/reports/roll-core-pin-after-incremental-attach-local-runtime-gate-implement.md` with the Hub commit SHA, locked Core SHA, exact commands, and results.
+3. Prove that a contract-only Core consumer with `default-features = false` builds against the new pin through the Git-visible `botster-hub-client` manifest (section 10, proof A), and prove the real first-party consumer, the TUI ticket branch, builds in lockstep (section 10, proof B). Both must exit 0.
+4. Rewrite the README `## Dependency policy` section so it states the exact `.git` URL plus `rev` policy for Git-visible Hub members and the lockstep Core-family pin (exact text in section 8). Add a negative assertion for the retired branch-tracking sentence to `git_visible_hub_members_share_one_exact_core_revision` in `tests/session_projection_owner_loop.rs`.
+5. Run the Hub charter gates on the rolled worktree, with the session-worker and Hub binary prebuild first.
+6. Commit the implementation report at `docs/reports/roll-core-pin-after-incremental-attach-local-runtime-gate-implement.md` with the Hub commit SHA, locked Core SHA, exact commands, and results.
 
 ### Non-scope
 
@@ -107,15 +117,15 @@ Not loaded, with reason: [[botster runtime teardown lenses]] does not apply; thi
 - No change to the `botster-ui-contract` tag or the root `[patch]` table.
 - No edit to historical `docs/plans/**` and `docs/reports/**` files that mention `8fce204`. Those are dated records.
 - No fix for the pre-existing Hub CI `useless_conversion` lint in `crates/botster-hub-installation/src/safety.rs`. That lint is outside the ticket and outside the changed file set. A separate Hub ticket should own it.
-- No rewrite of the README `Dependency policy` paragraph (README lines near 1113-1121). That paragraph still says Hub tracks Core `main` with the revision only in `Cargo.lock`; it has been stale since `175dd36`. This ticket does not change that behavior, so the paragraph stays out of scope and is recorded as a vault gap and docs follow-up.
-- No TUI or Web pin roll. TUI `ticket_1786663585_944018` consumes the merged Hub commit and Core `7eafa47` in lockstep after this ticket merges.
+- No README edits outside the `## Dependency policy` section. The README names no Core revision literal, so no other README sentence changes.
+- No TUI or Web pin roll. TUI `ticket_1786663585_944018` consumes the merged Hub commit and Core `7eafa47` in lockstep after this ticket merges. Proof B reads that TUI branch in a scratch clone and does not edit it.
 
 ## 6. Repository ownership boundaries and cross-repo dependencies
 
 - `botster-hub` owns its dependency policy, member manifests, lockfile, test-support fixture consumption, and live-proof provenance assertions. All changes stay inside this repository.
 - `botster-core` owns the feature gate fix. It is merged at `7eafa47` under closed dependency `dependency_1787251453_570256` against target `tgt_1f7bce66eb304881980f9b4a2a5ae3fe`. This run adds no Core work.
 - `botster-hub-client` is the Git-consumed external client boundary. Its manifest revision is the contract that downstream TUI and Web resolve. `botster-hub-test-support` must carry the same URL and revision so `TerminalFrame` stays one crate identity.
-- Downstream consumers: botster-tui `ticket_1786663585_944018` (open) triggered this roll and will roll its own pins to the merged Hub commit and Core `7eafa47`. That work stays in the TUI repository. This plan recommends that the TUI run register a dependency on this ticket; this run does not edit TUI tickets.
+- Downstream consumer: botster-tui `ticket_1786663585_944018` (open, run `run_1787197986_912715`, Implement active) triggered this roll through blocker `finding_1787251254_962248`. Its branch `project-pipelines/ticket_1786663585_944018` at `b8872811ea088fe445aa262e1d92a1d1fb627417` already pins Hub `7a09292` and Core `8fce204` with `default-features = false`. That ticket already depends on this ticket (`dependency_1787251454_407744`), so the ordering is TUI waits for Hub; this run registers no dependency on TUI and edits no TUI ticket or branch.
 - No new cross-repository dependency is required for this run.
 
 ## 7. Assumptions and unknowns
@@ -128,8 +138,8 @@ Assumptions:
 
 Unknowns:
 
-- Whether the TUI-shaped lockstep build (proof B) compiles against the candidate `botster-hub-client`. TUI `main` (`dc7d600`) pins Hub `e864c3c`; Hub `main` has since merged client event subscriptions (`7a09292`). A compile error in TUI code against newer Hub client DTOs would be TUI-owned drift, not a Core feature-gate failure. Section 10 defines how Implement classifies and records that outcome.
-- Whether `./test.sh --locked` completes in one clean default-concurrency run on this host. Known flake classes are documented in the Hub charter notes. Any failure requires isolation and a base comparison at `7a09292` with the old pin, with exact evidence.
+- Proof B compile compatibility is no longer an unknown. Plan-time feasibility (section 10) built the TUI ticket branch `b887281` against a scratch-rolled Hub; the recorded result governs. Implement repeats proof B against the real candidate commit.
+- Whether `./test.sh --locked` completes in one clean default-concurrency run on this host. Plan Review ran it green on base `7a09292` after the worker prebuild. Known flake classes are documented in the Hub charter notes. Any failure requires isolation and a base comparison at `7a09292` with the old pin, with exact evidence.
 - GitHub CI for Hub `main` is red before this change for an unrelated lint under Rust `1.97.0`. Local gates run on `1.92.0`. The Implement report must state both toolchains and must not claim GitHub CI green.
 
 ## 8. Affected surfaces and files
@@ -151,20 +161,52 @@ Revision literal sites (all change `8fce2041b9fe742cb2a6df9e74cb262606672742` to
 | `tests/hub_daemon_lifecycle/webrtc_terminal_adapter.rs` | 999 | provenance log literal |
 | `Cargo.lock` | six `source =` lines | Core-family package sources |
 
+Dependency-policy prose and its guard:
+
+| File | Line(s) | Change |
+| --- | --- | --- |
+| `README.md` | `## Dependency policy` section (lines 1111-1121 at base) | Replace the two paragraphs with the text below |
+| `tests/session_projection_owner_loop.rs` | inside `git_visible_hub_members_share_one_exact_core_revision` | Read `README.md`; assert it does not contain ``tracks `botster-core` from the `main` branch``; assert it contains ``one exact `rev` `` |
+
+Replacement README text (exact):
+
+```markdown
+## Dependency policy
+
+Git-visible Hub members (`botster-hub`, `crates/botster-hub-client`, and
+`crates/botster-hub-test-support`) declare every Core-family dependency
+(`botster-core`, `botster-core-daemon`, `botster-terminal-protocol`,
+`botster-core-test-support`, and `botster-terminal-ghostty`) with the
+`https://github.com/trybotster/botster-core.git` URL and one exact `rev`.
+`Cargo.lock` records the same revision. Downstream Git consumers of
+`botster-hub-client` resolve the member manifest, not the Hub lockfile, so the
+manifest pin is the contract and no member may float a Core branch.
+
+A Core pin roll updates every member manifest, `Cargo.lock`,
+`crates/botster-hub-test-support/build.rs`, and the revision literals in the
+provenance tests in one commit. `tests/session_projection_owner_loop.rs`
+rejects a member that uses a different URL form, a different revision, or a
+`branch = "main"` selector. Local `path` overrides stay outside committed
+dependency policy; the only committed override is the root `[patch]` entry for
+`botster-ui-contract`.
+```
+
 New files:
 
 - `docs/plans/roll-core-pin-after-incremental-attach-local-runtime-gate.md` (this plan, committed by the Plan step).
 - `docs/reports/roll-core-pin-after-incremental-attach-local-runtime-gate-implement.md` (Implement report).
 
-Unchanged by design: `LATE_ATTACH_GHOSTSNP_GHOSTTY_PIN`, `packages/hub-test-support/**`, `botster-ui-contract` tag, root `[patch]` table, `.github/workflows/*`, README.
+Unchanged by design: `LATE_ATTACH_GHOSTSNP_GHOSTTY_PIN`, `packages/hub-test-support/**`, `botster-ui-contract` tag, root `[patch]` table, `.github/workflows/*`, README outside `## Dependency policy`.
 
 Implementation procedure:
 
 1. Edit the eleven source and manifest sites above with one exact replacement. Do not change URL strings or selector keywords.
-2. Run `cargo fetch` (or `cargo metadata --format-version 1 >/dev/null`) without `--locked` so Cargo re-resolves only the changed Git sources. Then run `git diff --stat Cargo.lock` and confirm the diff is the six Core-family `source` lines only (twelve changed lines). If any other package moved, restore `Cargo.lock` from HEAD and redo the resolution with `cargo update -p <package> --precise` forms until the diff is exact.
-3. Run `grep -rn 8fce2041b9fe742cb2a6df9e74cb262606672742 --exclude-dir=target --exclude-dir=docs .` and require zero matches (this includes `Cargo.lock`).
-4. Run the gates in section 10.
-5. Commit as one implementation commit (for example `Pin Hub to Core 7eafa47 after the IncrementalAttach local-runtime gate.`), then commit the report.
+2. Run `cargo fetch` without `--locked` so Cargo re-resolves only the changed Git sources. Then run `git diff --stat Cargo.lock` and confirm the diff is the six Core-family `source` lines only (twelve changed lines). Plan-time feasibility confirmed this exact shape. If any other package moved, restore `Cargo.lock` from HEAD and redo the resolution with `cargo update -p <package> --precise` forms until the diff is exact.
+3. Replace the README `## Dependency policy` section with the exact text above. Add the README assertions to `git_visible_hub_members_share_one_exact_core_revision`.
+4. Run `grep -rn 8fce2041b9fe742cb2a6df9e74cb262606672742 --exclude-dir=target --exclude-dir=docs .` and require zero matches (this includes `Cargo.lock`). Run ``grep -n 'from the `main` branch' README.md`` and require zero matches.
+5. Prebuild before any test: `cargo build --locked -p botster-core-daemon --bin botster-session-worker`, then `cargo build --locked --bin botster-hub`. `tests/support/mod.rs::ensure_session_worker_binary` also builds the worker lazily, but Plan Review observed 8 missing-worker failures under `./test.sh --locked` without the explicit prebuild on base `7a09292`, and a clean pass after it. The explicit prebuild is therefore a required precondition, not an optimization.
+6. Run the remaining gates in section 10 in the listed order.
+7. Commit as one implementation commit (for example `Pin Hub to Core 7eafa47 after the IncrementalAttach local-runtime gate.`), then commit the report.
 
 ## 9. Risks
 
@@ -172,53 +214,61 @@ Implementation procedure:
 - Lock drift. A broad `cargo update` would move unrelated crates. Mitigation: exact lock diff check in step 2.
 - Identity split. Changing the URL form or selector on one member would create two `botster-terminal-protocol` identities. Mitigation: `cargo tree -e normal -i botster-terminal-protocol` must show one source.
 - Fixture resolution. `build.rs` panics if `cargo metadata` does not contain `botster-terminal-protocol` at `PROTOCOL_REV`. Mitigation: roll `PROTOCOL_REV` with the manifests; the hub-test-support unit tests prove the copied bytes are unchanged (same lengths and SHA-256 constants).
+- Missing worker. Running the suite before the worker prebuild fails worker-backed tests (Plan Review evidence: 8 failures on base). Mitigation: explicit prebuild step 5 before every test command.
 - Suite flake. `./test.sh --locked` may hit a documented flake under default concurrency. Mitigation: isolate, compare against base `7a09292`, record exact evidence; do not retry silently.
-- TUI-shaped proof drift (section 7). Mitigation: classification rule in section 10.
+- Proof B consumer drift. The TUI branch `b887281` may move while this run is active. Mitigation: Implement records the exact TUI commit used; if the TUI branch has moved, use its current head and record it. A proof B failure blocks this run and becomes a finding; it is never residual risk.
+- README assertion brittleness. The negative README assertion matches one retired sentence. Mitigation: keep the assertion to the one phrase and one positive phrase named in section 8; do not assert a revision literal in README.
 - Toolchain gap. Local clippy `1.92.0` cannot reproduce the CI `1.97.0` lint. Mitigation: report states the local toolchain and the pre-existing CI failure with run id `32329783340`; the changed files do not touch `crates/botster-hub-installation`.
 - Revision moves. If Core `main` advances before Implement, the ticket still names the gated revision. Mitigation: pin exactly `7eafa470a18025895995bbedc20d34b58106a03b` unless a human answer selects a later revision.
 
 ## 10. Acceptance checks and tests
 
-Repository gates (Hub charter and CI), run from the rolled worktree:
+Repository gates (Hub charter and CI), run from the rolled worktree **in this order**. Steps 1 and 2 are preconditions for every later test command.
 
-| Command | Expected |
-| --- | --- |
-| `cargo fmt --all -- --check` | exit 0 |
-| `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0 on local `1.92.0` |
-| `./test.sh --locked` | one clean default-concurrency run; includes `node packages/hub-test-support/scripts/sync-assets.mjs --check` |
-| `./test.sh --locked --test session_projection_owner_loop git_visible_hub_members_share_one_exact_core_revision -- --exact` | 1 passed against the new revision |
-| `BOTSTER_ENV=test cargo test --locked -p botster-hub-test-support` | lib tests pass, including the `late_attach_ghostsnp_provenance` assertions with the new pin and unchanged fixture lengths and SHA-256 values |
-| `./test.sh --locked --test hub_daemon_lifecycle_test package_event_plane -- --nocapture` (or the exact live event-plane test names in that module) | passes; log line shows `core_sha=7eafa470a18025895995bbedc20d34b58106a03b` |
-| `cargo build --locked -p botster-core-daemon --bin botster-session-worker` | exit 0; worker built from locked Core `7eafa47` |
-| `cargo tree -e normal -i botster-terminal-protocol` | exactly one source `git+https://github.com/trybotster/botster-core.git?rev=7eafa470a18025895995bbedc20d34b58106a03b#7eafa470a18025895995bbedc20d34b58106a03b` |
-| `cargo tree -p botster-hub-test-support -e normal --depth 1` | no `botster-terminal-protocol-client` |
-| `git diff --stat origin/main..HEAD -- Cargo.lock` | only the six Core-family `source` lines changed |
-| `grep -rn 8fce2041b9fe742cb2a6df9e74cb262606672742 --exclude-dir=target --exclude-dir=docs .` | zero matches |
-| `git diff --check origin/main...HEAD` and PII grep over the branch diff | clean |
+| # | Command | Expected |
+| --- | --- | --- |
+| 1 | `cargo build --locked -p botster-core-daemon --bin botster-session-worker` | exit 0; `target/debug/botster-session-worker` built from locked Core `7eafa47` |
+| 2 | `cargo build --locked --bin botster-hub` | exit 0; `target/debug/botster-hub` from the candidate commit |
+| 3 | `cargo fmt --all -- --check` | exit 0 |
+| 4 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0 on local `1.92.0` |
+| 5 | `./test.sh --locked` | one clean default-concurrency run; includes `node packages/hub-test-support/scripts/sync-assets.mjs --check` |
+| 6 | `./test.sh --locked --test session_projection_owner_loop git_visible_hub_members_share_one_exact_core_revision -- --exact` | 1 passed: new revision in all three manifests and the lock, no `branch = "main"`, README has no ``tracks `botster-core` from the `main` branch`` sentence and contains ``one exact `rev` `` |
+| 7 | `BOTSTER_ENV=test cargo test --locked -p botster-hub-test-support` | lib tests pass, including the `late_attach_ghostsnp_provenance` assertions with the new pin and unchanged fixture lengths and SHA-256 values |
+| 8 | `./test.sh --locked --test hub_daemon_lifecycle_test package_event_plane -- --nocapture` (or the exact live event-plane test names in that module) | passes; log line shows `core_sha=7eafa470a18025895995bbedc20d34b58106a03b` |
+| 9 | `cargo tree -e normal -i botster-terminal-protocol --locked` | exactly one source `git+https://github.com/trybotster/botster-core.git?rev=7eafa470a18025895995bbedc20d34b58106a03b#7eafa470a18025895995bbedc20d34b58106a03b` |
+| 10 | `cargo tree -p botster-hub-test-support -e normal --depth 1 --locked` | no `botster-terminal-protocol-client` |
+| 11 | `git diff --stat origin/main..HEAD -- Cargo.lock` | only the six Core-family `source` lines changed (6 insertions, 6 deletions) |
+| 12 | `grep -rn 8fce2041b9fe742cb2a6df9e74cb262606672742 --exclude-dir=target --exclude-dir=docs .` | zero matches |
+| 13 | ``grep -n 'from the `main` branch' README.md`` | zero matches |
+| 14 | `git diff --check origin/main...HEAD` and PII grep over the branch diff | clean |
 
-Proof A (required, ticket acceptance "contract-only Core consumer with default-features=false builds against that pin"):
+Proof A (required; ticket acceptance "contract-only Core consumer with default-features=false builds against that pin"; must exit 0):
 
 1. Create a disposable crate outside the Hub workspace in the session scratchpad with an isolated `CARGO_TARGET_DIR`. No `[patch]` table.
 2. Dependencies:
    - `botster-core = { git = "https://github.com/trybotster/botster-core.git", rev = "7eafa470a18025895995bbedc20d34b58106a03b", default-features = false }`
    - `botster-terminal-protocol-client = { git = "https://github.com/trybotster/botster-core.git", rev = "7eafa470a18025895995bbedc20d34b58106a03b" }`
    - `botster-hub-client = { git = "file:///<run worktree>", rev = "<candidate Hub commit>" }` (same shape as the prior Git-consumer smoke in `docs/reports/delete-hub-owned-terminal-goldens-and-consume-core-protocol-fixtures-implement.md`)
-   - `main.rs` references one item from each crate (for example `botster_core::BotsterEngine` as a type path, a `botster_hub_client` request helper, and a protocol-client type) so all three compile into the binary.
+   - `main.rs` constructs `botster_core::contract::session::SessionId` and names `botster_hub_client::DaemonRequest` and `botster_terminal_protocol_client::TerminalEvent` so all three crates compile into the binary. (`botster_core::BotsterEngine` is a generic struct, not a trait; do not reference it as `dyn`.)
 3. Commands and expected results:
-   - `cargo generate-lockfile` then `cargo build --locked` exit 0.
-   - `cargo tree -e features,no-dev -i botster-core` shows zero `local-runtime` and zero `portable-pty`.
-   - `cargo tree -e normal -i botster-terminal-protocol` shows one source at `rev=7eafa470a18025895995bbedc20d34b58106a03b`.
-4. Red oracle: the same crate with every Core `rev` set to `8fce2041b9fe742cb2a6df9e74cb262606672742` (and `botster-hub-client` at base `7a09292`) must fail `cargo build` with `error[E0412]: cannot find type IncrementalAttach`. Record both results.
+   - `cargo generate-lockfile` then `cargo build --locked` exit 0; run the binary.
+   - `cargo tree -e features,no-dev -i botster-core --locked` shows zero `local-runtime` and zero `portable-pty`.
+   - `cargo tree -e normal -i botster-terminal-protocol --locked` shows one source at `rev=7eafa470a18025895995bbedc20d34b58106a03b`.
+4. Red oracle: the same crate with every Core `rev` set to `8fce2041b9fe742cb2a6df9e74cb262606672742` and `botster-hub-client` at base `7a09292` must fail `cargo build` with `error[E0412]: cannot find type IncrementalAttach`. Record both results.
 
-Proof B (required attempt, downstream-shaped TUI lockstep build):
+Proof B (required; the real first-party consumer must build; must exit 0):
 
-1. Scratch clone of `trybotster/botster-tui` `origin/main` (record the SHA; `dc7d600` at plan time) in the scratchpad with an isolated `CARGO_TARGET_DIR`. No `[patch]` table.
-2. In `crates/botster-tui/Cargo.toml` set every Core-family `rev` (`botster-core`, `botster-terminal-ghostty`, `botster-terminal-protocol-client`, `botster-core-test-support`) to `7eafa470a18025895995bbedc20d34b58106a03b`, keep `default-features = false` where present, and set `botster-hub-client` and `botster-hub-test-support` to `git = "file:///<run worktree>"`, `rev = "<candidate Hub commit>"`.
-3. `cargo generate-lockfile`, then `cargo build -p botster-tui --locked`, then `cargo tree -p botster-tui -e features,no-dev -i botster-core` with zero `local-runtime`.
-4. Classification rule:
-   - exit 0: record as downstream proof passed.
-   - failure whose first error is in `botster-core` or mentions `IncrementalAttach` or `local-runtime`: Hub or Core defect; stop and route a finding.
-   - failure whose first error is in `botster-tui` source against `botster-hub-client` or `botster-hub-test-support` API changes: TUI-owned drift. Record the exact first error, file, and line in the report as residual risk; proof A remains the ticket acceptance; Review decides whether to accept. Do not waive silently and do not edit TUI code in this run.
+1. The consumer is the TUI ticket branch `project-pipelines/ticket_1786663585_944018` (TUI `ticket_1786663585_944018`, the ticket whose blocker `finding_1787251254_962248` triggered this roll). Clone it read-only from its local worktree or `origin` into the scratchpad with an isolated `CARGO_TARGET_DIR`; record the TUI commit (`b8872811ea088fe445aa262e1d92a1d1fb627417` at plan time). Do not use TUI `main`; `main` still pins Hub `e864c3c` and is not the consumer that failed. No `[patch]` table.
+2. In `crates/botster-tui/Cargo.toml` set every Core-family `rev` (`botster-core`, `botster-terminal-ghostty`, `botster-terminal-protocol-client`, `botster-core-test-support`) to `7eafa470a18025895995bbedc20d34b58106a03b`, keep `default-features = false` where present, and set `botster-hub-client` and `botster-hub-test-support` to `git = "file:///<run worktree>"`, `rev = "<candidate Hub commit>"`. Leave `botster-ui-contract` on its tag.
+3. `cargo generate-lockfile`, then `cargo build -p botster-tui --locked` must exit 0, then `cargo tree -p botster-tui -e features,no-dev -i botster-core --locked` must show zero `local-runtime` and zero `portable-pty`, and `cargo tree -p botster-tui -e normal -i botster-terminal-protocol --locked` must show one source at `rev=7eafa47`.
+4. Any non-zero exit blocks this run. Implement stops, records the exact first error, and raises a finding. No classification waives the failure and no TUI code is edited in this run. If the failure is Core-owned, register a Core dependency against `tgt_1f7bce66eb304881980f9b4a2a5ae3fe`; if TUI-owned, raise it to the human because the TUI ticket already depends on this one.
+
+Plan-time feasibility (executed during Plan revision 2; Implement must repeat both proofs against the real candidate commit):
+
+- Scratch Hub: clone of the run worktree at `739a2c6`, the eleven literal sites rolled with one `sed`, `cargo fetch` re-resolved `Cargo.lock` with exactly six `source` lines changed (6 insertions, 6 deletions), zero-match grep for the old revision, committed as scratch commit `3d0aff0aee90c34df8fe399c9bda906d0fe2c794` (never pushed). `cargo tree -e normal -i botster-terminal-protocol --locked` showed one source at `7eafa47`.
+- Proof A: consumer crate as specified; `cargo generate-lockfile`; `cargo build --locked` exit 0 (`Finished dev profile`); binary printed `contract-only consumer ok`; `cargo tree -e features,no-dev -i botster-core --locked` had 0 `local-runtime`/`portable-pty` edges; one protocol source at `7eafa47`. Red oracle at `8fce204` with `botster-hub-client` at `7a09292`: `error[E0412]: cannot find type IncrementalAttach in this scope` at `botster.rs:1767`, `could not compile botster-core (lib)`.
+- Proof B: clone of TUI branch at `b8872811ea088fe445aa262e1d92a1d1fb627417`; Core-family revs set to `7eafa47`; `botster-hub-client` and `botster-hub-test-support` set to `file://` scratch Hub at `3d0aff0`; `cargo generate-lockfile`; `cargo build -p botster-tui --locked` exit 0, `Finished dev profile in 55.11s`, binary 18288640 bytes; `cargo tree -p botster-tui -e features,no-dev -i botster-core --locked` had 0 `local-runtime`/`portable-pty` edges; one protocol source at `7eafa47`.
+- Scratch targets lived under the session scratchpad and are not part of the worktree.
 
 Live-proof provenance: every live test log must show Hub SHA equal to the candidate commit and locked Core SHA `7eafa470a18025895995bbedc20d34b58106a03b`, following [[live hub proof records distinct hub and locked core binary provenance]].
 
@@ -226,5 +276,6 @@ Live-proof provenance: every live test log must show Hub SHA equal to the candid
 
 - Hub Core pin-roll site inventory. Three rolls (`175dd36`, `6988d90`, `e864c3c`) and this plan touched the same eleven literal sites plus `Cargo.lock`, and no vault note lists them. Capture candidate: "Hub Core pin rolls update eleven literal sites and six lock sources" with the zero-match grep as the completion check.
 - GitHub CI toolchain drift. Hub CI pins Rust `1.97.0` and Core CI floats `stable`; both `main` branches are red on clippy lints that the local `1.92.0` toolchain does not emit (`useless_conversion`, `drain_collect`). Capture candidate: local strict gates do not reproduce CI lints when the CI toolchain is newer; Review and Verify must record the CI run id and toolchain instead of claiming CI green.
-- README `Dependency policy` prose is stale since `175dd36` (it still describes a `main` branch track). Capture candidate or docs follow-up ticket.
+- Hub suite worker precondition. `ensure_session_worker_binary` exists, yet `./test.sh --locked` on a fresh target failed 8 worker-backed tests until the worker was prebuilt. Capture candidate: "Hub suite runs require an explicit session-worker prebuild before ./test.sh --locked".
 - The Core contract-only CI step at `7eafa47` was skipped on GitHub because Lint failed first; the only executed contract-only evidence is the local Core Verify artifact plus this ticket's proof A. Capture as a gotcha for Core CI ordering if the Core team wants the lane independent of Lint.
+- Downstream proof consumer selection. When a consumer ticket's run branch already carries the pins that failed, proof must target that branch, not the consumer's `main`. Capture candidate for the Hub and TUI playbooks.
