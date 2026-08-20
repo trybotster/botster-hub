@@ -7,6 +7,24 @@ Pipeline: `botster_stack_delivery` (direct merge, no PR)
 Project: `project_1786663508_823105` Botster Non-Blocking Event Plane, Stage D
 Vault checklist: `checklist_1787266824_449406` (ticket scope, one Plan visit)
 
+## Plan revision 2
+
+Revision 2 answers Plan Review `review_1787268374_271226` (`changes_required`) and two human answers.
+
+| Finding | Class | Correction |
+| --- | --- | --- |
+| `finding_1787268374_662300` Runtime sibling policy contradicts the production fail-closed path | **blocker / product** | Revision 1 claimed no sibling is sacrificed. That was wrong. `fail_closed_drop_dedicated_runtime` (`src/local_webrtc.rs:333`) takes every live peer and every stale close peer, sweeps their ownership, and drops the dedicated runtime; the test at `src/local_webrtc.rs:7117-7147` requires exactly that, including the message "timeout fail-closed must sacrifice sibling peers". Section 11.6 now states the real bounded sibling-sacrifice policy, its exact blast radius, and why the tradeoff exists, and forbids the campaign from asserting sibling survival on the ultimate-failure path. |
+| `finding_1787268374_124555` The fresh-runner plan does not wire Project Pipelines, Web, or TUI proof | high / product | Section 5G now specifies exact checkout and pin inputs for Project Pipelines, Web, and TUI, wires them into the workflow and the campaign, and drives the real `question.opened` producer with the shipped Web and TUI consumers on one live session identity, per [[cross-client acceptance uses one live session identity]]. Section 12 names an authoritative production oracle for each acceptance condition, per [[each acceptance condition names its authoritative production oracle]]. |
+| `finding_1787268374_321530` The dependency contract omits the required timeout signal | high / product | Section 4.4 and the section 6.2 dependency contract now define the timeout signal precisely, name its authoritative source, and add its bounded public observation path and test. |
+| `finding_1787268374_932684` Numeric acceptance budgets remain undefined | high / product | Escalated as `question_1787268530_910910`. The human chose A plus E with an ownership limit. Section 5A now fixes the machine profile, workload, session count, warm-up, sample count, percentile method, derivation formulas, literal `R` = 1.25, literal `S` = 8 ms, rounding, outlier policy, invalid-run rules, and failure rules before calibration, and splits calibration from acceptance so acceptance samples can never derive a threshold. |
+| `finding_1787268374_454069` Runtime teardown coverage is not exact | high / product | Section 11.3 replaces the generic peer-request row with explicit rows for `Spawn`, `Attach`, `SubscribeEntities`, `UnsubscribeEntities`, `SubscribeEvents`, `UnsubscribeEvents`, and admitted event holders, each citing its existing production test. Section 11.4 names the exact chain `LocalWebrtcPeerClosed` to `handle_control_message` to `remove_peer`, and replaces the thread ceiling with owner-specific idle oracles including `dedicated_runtime_worker_threads()`. |
+| `finding_1787268374_805714` Required context is not recorded | low / process | Section 3 now records [[botster-architecture]], [[project-pipelines-playbook]], its cross-repository delivery notes, and [[terminal webrtc failure records do not prove peer runtime teardown]]. The vault checklist is updated to match. |
+
+Human answers folded into this revision:
+
+- `question_1787267931_572353` — the review-only dependency exception in section 0.
+- `question_1787268530_910910` — terminal budgets are published as event-plane coexistence regression budgets, never as pre-existing North Star budgets or transport service levels, and thresholds follow the two-phase calibration rule in section 5A.
+
 ## 0. Routing exception, read this before reviewing
 
 Human answer `question_1787267931_572353` on `2026-08-20` grants a **review-only** dependency exception for this run.
@@ -22,6 +40,8 @@ The answer's exact conditions:
 5. Then run and merge `ticket_1787267568_492780` first. This integration run stays parked until that dependency closes.
 
 The dependency's absence is a routing mechanism, not a scope decision. Section 6.2 remains the authoritative contract for the dependency.
+
+**Revision 2 status.** Plan Review `review_1787268374_271226` returned `changes_required`. Under condition 3 above, `ticket_1787267568_492780` stays open and unstarted and the dependency edge stays absent while this plan is revised. Condition 4 still applies the moment Plan Review approves.
 
 ## 1. Target repository and target_id
 
@@ -51,11 +71,21 @@ Role and stack:
 - [[botster-planner-playbook]]
 - [[botster-plan-reviewer-playbook]]
 - [[botster runtime teardown lenses]]
+- [[botster-architecture]]
+- [[project-pipelines-playbook]]
 - [[current botster is a modular repository family not the legacy trybotster monorepo]]
 - [[legacy trybotster notes are not current modular botster contracts]]
 - [[botster hub is a first party host profile over core]]
 - [[botster data plane bypasses the hub through session and client actors]]
 - [[vault example paths are not repository placement conventions]]
+
+`botster-architecture` is the required Botster map for both role overlays. `project-pipelines-playbook` is required because this run changes dependency workflow policy through the review-only exception in section 0, and because its cross-repository delivery notes govern the downstream proof in section 5G.
+
+Cross-repository acceptance, from [[project-pipelines-playbook]]:
+
+- [[authentic integration starts with the first cross-repository delivery wave]]
+- [[cross-client acceptance uses one live session identity]]
+- [[each acceptance condition names its authoritative production oracle]]
 
 Event-plane contract:
 
@@ -103,6 +133,7 @@ Provenance and fixtures:
 
 Teardown class support:
 
+- [[terminal webrtc failure records do not prove peer runtime teardown]] -- current; the reason section 11.4 asserts live peer and runtime oracles instead of a terminal record
 - [[file descriptor exhaustion from stale webrtc connections]] (tagged `botster-legacy`; treated as drift evidence, not a current contract)
 - [[webrtc peer cleanup removes every per peer owner together]] (tagged `botster-legacy`; same treatment)
 
@@ -189,8 +220,24 @@ The ticket requires the campaign to record queue count and bytes, oldest age, ad
 | **gap count** | **absent.** Client gaps are a per-subscription `AtomicBool` (`ClientGapSlot`, `src/daemon_event_subscriptions.rs:122-130`) |
 | **owner-turn duration** | **written but unreachable.** `MaintenanceState.last_owner_turn` (`src/daemon_maintenance.rs:619`) is set at `src/daemon_transport.rs:293`, but `daemon_maintenance` is a private module and the value never enters `DaemonStatus` |
 | **ready-operation wait** | **never measured in production.** It exists only as a test assertion |
+| **timeout** | **absent, and worse than absent.** See 4.4.1 |
 
 `grep -rni "latency"` across `src/` and `crates/` returns three comment hits and no measurement.
+
+#### 4.4.1 The timeout signal, defined
+
+Plan Review `finding_1787268374_321530` is correct that revision 1 omitted timeout. The signal is real and fully typed inside Core, and completely invisible outside it. It has four distinct sources on this plane, and they must not be merged:
+
+| Source | Where it happens | Observable today |
+| --- | --- | --- |
+| **T1 package-event handler invocation timeout** | Core `PluginInvocationFailureKind::TimedOut` (`contract/actor.rs:1233`), produced by the deadline waiter (`engine/plugin_worker.rs:2331-2421`) against the 1000 ms `timeout_ms` Hub sets at `src/daemon_maintenance.rs:1271` | **no, and the outcome is discarded.** `run_completion_drain_slice` (`src/daemon_maintenance.rs:1322-1334`) destructures `completion.result` only to read `request_id`. The `Completed` versus `Failed` discriminant is never inspected on the event path and `failure.kind` is never read. A timed-out handler retires identically to a successful one, with no counter and no log |
+| **T2 router queue-age expiry** | `src/package_event_router.rs:595-623`; an envelope older than `queue_age` is retired and skipped | **no.** Silently dropped before any handler sees it. `EventPlaneSnapshot` has no expiry field |
+| **T3 client-mailbox queue-age expiry** | `src/daemon_event_subscriptions.rs:266-270` | **partially.** It sets a gap bit for that subscription. There is no count, and the gap bit does not distinguish age expiry from queue overflow |
+| **T4 transport write timeout** | `DAEMON_CLIENT_WRITE_TIMEOUT` 2 s (`src/daemon_transport.rs:152`), enforced at `:910` and `:2034` | **conflated.** The failure path bumps `stalled_writes`, which counts every write failure. A timeout is not separable from an I/O error |
+
+Two structural facts make this worse than a missing counter. Hub never references `PluginWorkerEvent` anywhere, so Core's one typed timeout event, `InvocationTimedOut`, is unobservable by construction. And only 6 of the 25 plugin-worker debug-snapshot fields cross the public boundary (`src/client_api.rs:606-613` into `src/daemon_transport.rs:8010-8017`), so no existing public field could carry a timeout even if one were counted.
+
+T1 is also a latent correctness gap, not only an observability gap: today a package-event handler that exceeds its deadline is indistinguishable from one that succeeded.
 
 A second constraint compounds this. `PackageEventRouter::snapshot` takes the router mutex through `try_lock` and returns `ShedBusy` under contention ([[router ingress uses try_lock only and contention is shed_busy]]). Under exactly the saturation this campaign creates, the only existing queue-depth read is the most likely to fail. The observer disappears when it matters most.
 
@@ -206,16 +253,66 @@ Assumption A1 in section 8 records how this plan resolves that.
 
 ### A. Publish the budget contract before acceptance
 
-Add `docs/event-plane-load-proof.md` in the top-level operator-documentation tier, beside `docs/hub-resource-proof.md`, `docs/lifecycle-suite-harness.md`, and `docs/loaded-daemon-lifecycle-runner.md`. Repository prior art, not vault example paths, selects this destination. The document publishes, before any acceptance run:
+Human answer `question_1787268530_910910` fixes both the nature of the budgets and how their numbers are derived. Add `docs/event-plane-load-proof.md` in the top-level operator-documentation tier, beside `docs/hub-resource-proof.md`, `docs/lifecycle-suite-harness.md`, and `docs/loaded-daemon-lifecycle-runner.md`. Repository prior art, not vault example paths, selects this destination.
 
-1. The reference machine profile: fresh GitHub-hosted `ubuntu-24.04`, its CPU count, its `ulimit -n`, and its PTY ceiling, all recorded from `metadata.txt`.
-2. The fleet target: `N = 300` active lightweight sessions, with the FD and PTY precondition that makes that number admissible, and the rule that a shortfall is a `host_exhaustion` verdict rather than a silent reduction.
-3. Every numeric budget, each one named separately so a breach identifies its own limit, following [[web event plane budgets are published numeric host limits]]. Budgets divide into three classes:
-   - **Deterministic work bounds** taken verbatim from section 4.2. These are pass or fail.
-   - **Queue bounds** from `PackageEventPlanePolicy`. These are pass or fail.
-   - **Latency and throughput budgets** published in two forms: an absolute p50, p95, p99, and maximum for the reference profile, and a paired relative bound against the same run's decoupled arm. Both forms are pass or fail. Assumption A2 explains the pairing.
-4. The exact formulas: how each percentile is computed, how the paired ratio is computed, and which sample population each covers.
-5. The recorded-signal list and the verdict rules, reusing the existing vocabulary `clean`, `product_failure`, `host_exhaustion`, `environment_tainted`, and `survivors_present`.
+#### A.1 What the numbers are, and what they are not
+
+The campaign publishes **event-plane coexistence regression budgets**. They state how much an operation may degrade when the event plane runs beside it.
+
+They are **not** pre-existing North Star budgets. They are **not** general terminal transport service levels. The North Star behavioural contract stays exactly as it is: the campaign proves every one of its oracles under saturation, without changing terminal byte ownership or any terminal path. The final report must keep the two apart in its own words, and must never present a coexistence budget as a transport guarantee.
+
+#### A.2 Fixed before calibration, immutable afterwards
+
+Every parameter below is fixed by this reviewed plan. Neither calibration nor acceptance may change any of them.
+
+| Parameter | Fixed value |
+| --- | --- |
+| Machine profile | fresh GitHub-hosted `ubuntu-24.04` runner from `.github/workflows/loaded-daemon-lifecycle.yml`. Recorded fields: runner image, architecture, CPU count, total memory, kernel release, `ulimit -n`, PTY ceiling, Rust 1.97.0, Zig 0.16.0 |
+| Stress profile | `residual-tail`, identical in both phases |
+| Workload | `N` quiet sessions, one attached noisy PTY, one `event-plane-producer` emitting, one `event-plane-consumer` subscribed, one Unix and one WebRTC host-control client each holding an event subscription |
+| Session count `N` | 300, identical in both phases |
+| Warm-up | discard the first 30 seconds of steady state **and** the first 20 samples of each operation, whichever ends later |
+| Minimum sample count | 200 post-warm-up samples per operation per arm |
+| Percentile method | nearest-rank on the ascending sample vector, no interpolation. For `n` samples, `p` is the sample at index `ceil(p * n)`, 1-based |
+| Literal `R` | **1.25** |
+| Literal `S` | **8 ms** |
+| Rounding | every derived millisecond threshold rounds **up** to the next whole millisecond; ratios compute in `f64` and compare at three decimal places |
+| Outlier policy | **none.** No sample is discarded after warm-up. Maximum is reported and gated in its own right |
+
+`S = 8 ms` is not arbitrary. It is exactly `EVENT_DELIVERY_MAX_ELAPSED` (`src/daemon_maintenance.rs:1158`), which equals `OBSERVE_SLICE_BUDGET.max_elapsed` and `BASELINE_PAGE_BUDGET.max_elapsed`. The slack therefore says: the event plane may cost an operation at most one additional bounded background slice. `R = 1.25` allows 25 percent proportional growth on top of that.
+
+#### A.3 Derivation formulas, fixed here
+
+Let `P99cal_e(op)` and `P99cal_d(op)` be the calibration phase p99 for the enabled and decoupled arms.
+
+- Absolute budget: `ABS(op) = ceil_ms( P99cal_e(op) * 1.20 + S )`
+- Absolute maximum budget: `MAX(op) = ceil_ms( P99cal_e(op) * 3.00 + S )`
+- Relative gate: `P99acc_e(op) <= P99acc_d(op) * R + S`
+
+`ceil_ms` rounds up to the next whole millisecond. `p50` and `p95` are recorded in both phases and reported, but only `p99` and `maximum` carry gates.
+
+#### A.4 Two phases, in this order
+
+1. **Calibration dispatch** on the reference runner. Its only outputs are a committed calibration dataset and the thresholds derived from it by the formulas in A.3. It produces no verdict about the product.
+2. **Commit.** The calibration dataset and every derived threshold land in `docs/event-plane-load-proof.md` and `docs/reports/<slug>-calibration.json` as immutable literals. This commit must exist before acceptance starts.
+3. **Acceptance dispatch**, a fresh dispatch on the same profile. Acceptance samples must never enter threshold derivation. Any attempt to re-derive a threshold from acceptance data invalidates the campaign.
+
+#### A.5 Failure rules
+
+Following the human answer, each of these **fails the campaign**. None is a caveat and none is residual risk:
+
+- any recorded machine-profile field differs between calibration and acceptance;
+- any required metric is missing from either phase;
+- calibration is invalid, meaning fewer than `N` sessions reached steady state, fewer than 200 post-warm-up samples for any operation, or a `run-lifecycle-suite` verdict other than `clean`;
+- any absolute, maximum, or relative threshold is breached;
+- acceptance runs without a prior calibration commit, or against a different calibration commit than the one it records.
+
+#### A.6 Also published in the same document
+
+- The `N = 300` fleet target with its file-descriptor and PTY preconditions, and the rule that a shortfall is a `host_exhaustion` verdict plus escalation rather than a silent reduction.
+- Every deterministic bound from section 4.2 and the router policy defaults, each named separately so a breach identifies its own limit ([[web event plane budgets are published numeric host limits]]).
+- The recorded-signal list from section 12.4.
+- The verdict vocabulary, reusing `clean`, `product_failure`, `host_exhaustion`, `environment_tainted`, and `survivors_present`.
 
 ### B. Add the saturation campaign as one new target on the existing runner
 
@@ -265,6 +362,61 @@ The campaign uses production default policy values. It does not shrink `PackageE
 - `docs/reports/prove-the-event-plane-cannot-lag-or-block-hub-operations-implement.md`, the narrative report.
 - `docs/reports/prove-the-event-plane-cannot-lag-or-block-hub-operations-evidence.json`, modelled on `docs/reports/bounded-hub-resources-fresh-campaign-evidence.json`, recording exact revisions for all five repositories, configuration, machine profile, formulas, per-arm results, the fault matrix outcomes, and the verdict.
 
+### G. Downstream proof, wired rather than asserted
+
+Plan Review `finding_1787268374_124555` is correct. Revision 1 claimed the campaign drives Web and TUI "through the existing `script/prove-north-star-shared-session` pattern" while the actual dispatch could not do so. The verified facts:
+
+- `.github/workflows/loaded-daemon-lifecycle.yml` contains exactly two `actions/checkout` steps, at `:65-70` and `:92-98`. Neither sets `repository:`, so both check out `trybotster/botster-hub`. There is no Web, TUI, TUI Kit, Workspaces, Core, or Project Pipelines checkout anywhere in the file.
+- `BOTSTER_WEB_CHECKOUT` and `BOTSTER_TUI_CHECKOUT` appear nowhere under `.github/`.
+- The job installs Zig 0.16.0 (`:111-117`) and Rust 1.97.0 (`:119-122`). It installs **no Node or npm**.
+- `script/run-loaded-daemon-lifecycle` accepts only `--subject-dir --artifact-dir --subject-sha --test-target --repetitions --stress-profile --validate-only --cleanup-only --help` (`:909-921`). It has no downstream-leg surface.
+- **`script/prove-north-star-shared-session` has no Project Pipelines leg at all.** It admits only `botster-web` (`:641-650`) and drives the TUI through `script/test-live-hub`.
+- `question.opened` appears **zero times** in this repository's code, tests, or scripts. Every hit is prose in `docs/plans/**`. The emit is owned entirely by `botster-project-pipelines`.
+- `examples/project-pipelines` is a four-file fixture whose own README calls it a fixture. It is not the shipped package and is not a substitute for it.
+
+#### G.1 Required inputs, exact
+
+The campaign extends the workflow with three pinned inputs, each a full 40-character lowercase SHA, validated the way `script/test-production-package-runtime:300-322` already validates revisions:
+
+| Input | Repository | Consumed as |
+| --- | --- | --- |
+| `web_sha` | `trybotster/botster-web` | source checkout at `$GITHUB_WORKSPACE/web`, exported as `BOTSTER_WEB_CHECKOUT` |
+| `tui_sha` | `trybotster/botster-tui` | source checkout at `$GITHUB_WORKSPACE/tui`, `submodules: recursive` for the vendored Ghostty, exported as `BOTSTER_TUI_CHECKOUT` |
+| `project_pipelines_sha` | `trybotster/botster-project-pipelines` | source checkout at `$GITHUB_WORKSPACE/project-pipelines`, installed into the campaign Hub by path |
+
+`BOTSTER_SHARED_SESSION_ID` is fixed to `north-star-shared`. `BOTSTER_HUB_BIN` and `BOTSTER_SESSION_WORKER_BIN` point at the two binaries the existing precompile step already builds and provenance-checks at `:157-199`.
+
+#### G.2 Required workflow additions
+
+1. Three `actions/checkout` steps with explicit `repository:` and `ref:`.
+2. Node and npm setup, then `npm ci` and `npm run build` inside the Web checkout, because `prove-north-star-shared-session:335-343` runs `npm run drive:live-packaged-protocol:shared-session` and does not install dependencies itself.
+3. A Project Pipelines leg. `prove-north-star-shared-session` gains one: install the checked-out package by path and enable it, exactly as `script/test-production-package-runtime:478-502` does, reading the package name from its `botster-package.json`.
+4. One step invoking the coordinator as a sibling of the loaded runner. Do not thread a downstream leg through `script/run-loaded-daemon-lifecycle`; that script owns bounded stress and ownership cleanup, not multi-repo orchestration.
+
+#### G.3 The production oracle for every acceptance condition
+
+[[each acceptance condition names its authoritative production oracle]] requires the owning repository and the production API for each proof. [[cross-client acceptance uses one live session identity]] requires Web and TUI to share one caller-owned session.
+
+| Acceptance condition | Owning repository | Authoritative production oracle |
+| --- | --- | --- |
+| A live `question.opened` reaches a client | botster-project-pipelines emits; Hub routes | the real package's `project_pipelines_ask_human` mutation, then `DaemonEvent::PackageEvent` on the host-control path. Not the `event-plane-producer` example |
+| The durable question survives a shed notice | botster-project-pipelines | the package's entity plane, read as a `project-pipelines.question` entity record. [[a transient package event cannot be the sole authority for a durable close]] |
+| Web shows one transient notice and keeps durable state | botster-web | the shipped `drive:live-packaged-protocol:shared-session` harness in the Web checkout |
+| TUI shows one transient notice and keeps durable state | botster-tui | the shipped `script/test-live-hub ghostty-shared` harness in the TUI checkout |
+| Web and TUI used the same live session | botster-hub | one caller-owned data directory and `BOTSTER_SHARED_SESSION_ID=north-star-shared`, with the coordinator's `attach_occupancy` barrier at `prove-north-star-shared-session:561-585` |
+| Terminal input and output stay correct under saturation | botster-core owns the bytes; Hub observes only envelopes | the coordinator's marker sequence, plus the three Hub content-blindness architecture tests |
+| Hub cannot inspect terminal bodies | botster-hub | `src/unix_terminal_adapter.rs:905`, `src/webrtc_terminal_adapter.rs:915`, `src/daemon_attach_stream.rs:1133` |
+| Queue, shed, gap, latency, and timeout signals | botster-hub | the public daemon request added by dependency `ticket_1787267568_492780`. No client-side observation substitutes |
+| Peer and session teardown reached idle | botster-hub | the owner-specific oracles in section 11.4, not `DaemonLifecycleCounters` alone |
+
+#### G.4 Evidence shape
+
+The campaign evidence JSON uses the seven-key `revisions` object from `docs/reports/bounded-hub-resources-fresh-campaign-evidence.json`, each value a flat 40-character SHA, plus the `provenance` block shape from `docs/reports/focused-ubuntu-idle-cpu-resource-bound-evidence.json` for the runner profile. The single-repo `inputs`/`provenance` shape alone is not sufficient, because it carries no downstream coordinate.
+
+#### G.5 Operator precondition
+
+Cross-repository checkout of the sibling repositories needs a credential. Today every checkout step sets `persist-credentials: false` and the job declares repo-scoped `permissions: contents: read`, which cannot read another repository. Implement must not invent a secret. If the sibling repositories are not public to this workflow's token, Implement stops and asks the operator for the exact token or App installation to use. This is recorded as unknown U6.
+
 ## 6. Repository ownership boundaries and cross-repo dependencies
 
 ### 6.1 Ownership
@@ -291,16 +443,28 @@ Contract:
 1. Add monotonic, bounded, O(1)-per-event counters for shed by typed reason, client gap, admission attempts, and delivery attempts. Counters must not allocate or scan per event, following [[load diagnostics must not cost work proportional to what they measure]].
 2. Add an oldest-queue-age value for each producer queue, each consumer queue, and each client mailbox. Age is already computed as a predicate; report the value.
 3. Add bounded admission-latency and delivery-latency observations. A fixed-bucket histogram or a reservoir with a fixed cell count is acceptable. An unbounded sample vector is not.
-4. Surface `last_owner_turn` and add a ready-operation wait measurement, then expose both through the existing `DaemonStatus` path rather than a new transport.
-5. **The read path must not contend with `PackageEventRouter`'s mutex.** Counters read during saturation must not return `ShedBusy`. Use atomics beside the router, not a `try_lock` snapshot.
-6. Add the four `BOTSTER_ENV=test` gated seams from section 5E, each as one environment read in `core_daemon_config` (`src/runtime.rs:4612-4641`) in the same style as `BOTSTER_HUB_TEST_WORKER_EGRESS_CAPACITY`:
+4. **Add the timeout signal as four separately named counters, never merged**, matching section 4.4.1:
+   - **T1** package-event handler invocation timeouts. This requires reading the discriminant that `run_completion_drain_slice` currently throws away. At `src/daemon_maintenance.rs:1322-1334`, match `PluginInvocationResult::Failed(failure)` and count by typed `PluginInvocationFailureKind`, so `TimedOut`, `HandlerFailed`, `Cancelled`, `Backpressured`, and `WorkerStopped` are each distinguishable. Retirement behaviour stays exactly as it is; only observation is added. This also closes a latent correctness gap, because a timed-out handler is currently indistinguishable from a successful one.
+   - **T2** router queue-age expiries, counted where the envelope is retired at `src/package_event_router.rs:595-623`.
+   - **T3** client-mailbox queue-age expiries, counted at `src/daemon_event_subscriptions.rs:266-270` and reported separately from queue-overflow gaps, so a gap's cause is identifiable.
+   - **T4** leave `stalled_writes` as it is, and state in the published contract that it conflates write timeout with I/O error. Do not present it as a timeout count.
+   The authoritative source for T1 is Core's typed failure kind; Hub is the authoritative reporter. T2 and T3 are Hub-owned throughout.
+5. Surface `last_owner_turn` and add a ready-operation wait measurement, then expose both through the existing `DaemonStatus` path rather than a new transport.
+6. **The read path must not contend with `PackageEventRouter`'s mutex.** Counters read during saturation must not return `ShedBusy`. Use atomics beside the router, not a `try_lock` snapshot.
+7. Add the four `BOTSTER_ENV=test` gated seams from section 5E, each as one environment read in `core_daemon_config` (`src/runtime.rs:4612-4641`) in the same style as `BOTSTER_HUB_TEST_WORKER_EGRESS_CAPACITY`:
    - drop the next journal-advanced wake a bounded number of times;
    - set the lifecycle journal capacity, promoting the existing `#[cfg(test)]` `with_test_lifecycle_journal_capacity` (`src/runtime.rs:4598`) to an integration-reachable value;
    - set the package-event invocation `timeout_ms` used at `src/daemon_maintenance.rs:1121` and `:1274`;
    - hold a package-event handler for a bounded duration, so a handler can exceed the invocation timeout despite the Lua instruction budget.
-7. Do not change any production budget, queue bound, or scheduling decision.
+8. Do not change any production budget, queue bound, or scheduling decision.
 
-Acceptance for that dependency: every signal in the ticket's recorded-signal list is readable through a public daemon request; a saturation unit lane proves the read path still returns values while the router sheds; and the existing owner-turn and ready-operation invariants stay unchanged.
+Acceptance for that dependency:
+
+- every signal in the ticket's recorded-signal list is readable through a public daemon request, including all four timeout counters named separately;
+- a focused test proves a package-event handler that exceeds `timeout_ms` increments the T1 `TimedOut` counter and no other kind, and that a handler failing without a timeout increments `HandlerFailed` instead. Both paths are indistinguishable today, so this test goes red before the change ([[a regression test must be shown to go red with the fix reverted]]);
+- a saturation unit lane proves the counter read path still returns values while the router sheds;
+- diagnostic cost is O(1) per event, proved by a work-bound test rather than a wall-clock test;
+- the existing owner-turn and ready-operation invariants stay unchanged.
 
 Consumer note for that ticket: this ticket `ticket_1786663585_879846` depends on that surface. Do not implement the campaign there.
 
@@ -318,22 +482,21 @@ Consumer note for that ticket: this ticket `ticket_1786663585_879846` depends on
 
 ### Assumptions
 
-**A1 — "existing North Star budgets" do not exist as numbers.** Section 4.4 Finding 2 establishes that the Terminal Transport North Star publishes behavioural oracles, not numeric input or output budgets, and that `docs/client-protocol.md:1189` explicitly disclaims performance targets. This plan therefore reads that acceptance line in two parts and satisfies both:
+**A1 — "existing North Star budgets" do not exist as numbers.** Settled by human answer `question_1787268530_910910` (option A with an ownership limit). Section 4.4 Finding 2 establishes that the Terminal Transport North Star publishes behavioural oracles, not numeric input or output budgets, and that `docs/client-protocol.md:1189` explicitly disclaims performance targets. The answer's ruling:
 
-1. The campaign proves the North Star **behavioural** oracles still hold on the attached noisy session while the event plane is saturated: identity, ordering, exact bytes including non-UTF-8, late-attach history, resize, input, cancellation, reconnect, and `ProcessExited`.
-2. The campaign **publishes new numeric terminal input and output budgets** in `docs/event-plane-load-proof.md`, labelled as newly published by this campaign rather than pre-existing. Nothing is waived; a missing budget is created rather than skipped.
+1. The campaign publishes new numeric terminal input and output budgets **as event-plane coexistence regression budgets**. They state how much an operation may degrade when the event plane runs beside it.
+2. They must **never** be described as pre-existing North Star budgets or as general terminal transport service levels. The final report must keep the two apart in its own words.
+3. The campaign must also prove **every** North Star behavioural oracle under saturation — identity, ordering, exact bytes including non-UTF-8, late-attach history, resize, input, cancellation, reconnect, and `ProcessExited` — without changing terminal byte ownership or any terminal path.
 
-**A2 — latency budgets are published in absolute and paired-relative form, and both gate.** [[conformance harnesses gate on deterministic invariants not timing]] says wall-clock durations should be observations rather than pass-or-fail assertions. [[wall-clock ready-operation bounds through a daemon child are ambient-load-sensitive]] and [[wall-clock MAX_OWNER_TURN_MS assertions flake under default-concurrency lib load]] say the same for owner-turn and ready-operation claims. The ticket nevertheless requires published latency budgets as acceptance. This plan resolves the tension without weakening either side:
+Nothing is waived. A missing budget is created and correctly labelled rather than skipped.
 
-- **Scheduler and boundedness claims gate on deterministic oracles only.** Owner-turn and ready-operation precedence use decision-level and work-bound oracles, never elapsed time. Queue bounds gate on counts and bytes.
-- **Operation latency gates on a paired ratio.** Both arms run in one dispatch on one machine, so ambient load is common to both. The gate is `p99(plane-enabled) <= p99(plane-decoupled) * R + S` for each operation, with `R` and `S` published before the run.
-- **Absolute p50, p95, p99, and maximum are also published and also gate, but only on the declared reference profile.** On any other machine they are recorded as observations and the report says so.
+**A2 — thresholds are fixed before calibration and cannot be chosen by the acceptance run.** Settled by human answer `question_1787268530_910910` (option E). Revision 1 left every absolute limit and the paired `R` and `S` for Implement, which made the central gate movable: the same run that measured could pick the threshold it passed. Section 5A now fixes the machine profile, workload, session count, warm-up, sample count, percentile method, derivation formulas, literal `R` = 1.25, literal `S` = 8 ms, rounding, outlier policy, invalid-run rules, and failure rules **before** calibration. Calibration and acceptance are separate dispatches; acceptance samples can never enter threshold derivation.
 
-This keeps every published budget as acceptance while keeping the architectural claim on oracles that do not depend on runner speed.
+The vault rule that wall-clock durations are observations rather than gates ([[conformance harnesses gate on deterministic invariants not timing]]) is still respected where it matters. Scheduler and boundedness claims gate only on deterministic work-bound and decision-level oracles. The latency gate is a paired within-run ratio plus a calibrated absolute on one fixed profile, which removes the runner-speed dependence that rule exists to prevent.
 
 **A3 — the reference runner is the existing loaded workflow.** `docs/loaded-daemon-lifecycle-runner.md` establishes a fresh GitHub-hosted `ubuntu-24.04` VM as the isolated campaign home. `script/run-loaded-daemon-lifecycle:141-144` forces `--stress-profile none` on Darwin, and `script/run-lifecycle-suite` refuses a dirty host. A developer machine that hosts a live Botster hub cannot produce this evidence. The declared machine profile is therefore the workflow runner.
 
-**A4 — Web and TUI participate as pinned consumer checkouts, not as source changes.** `script/prove-north-star-shared-session` already establishes that Hub owns a cross-client coordinator driving `BOTSTER_WEB_CHECKOUT` and `BOTSTER_TUI_CHECKOUT`. The campaign records all five repository revisions and drives the Web and TUI legs through that established pattern. No file changes in those repositories. If a change turns out to be required, register a dependency against that repository's target rather than editing it from this run.
+**A4 — Web, TUI, and Project Pipelines participate as pinned source checkouts wired into the workflow, and none of them is modified.** Revision 1 asserted this pattern without wiring it, which Plan Review correctly rejected. Section 5G now specifies the three pinned SHA inputs, the three checkout steps, the Node and npm setup the Web harness needs, the recursive submodule the TUI harness needs, and the new Project Pipelines leg the coordinator lacks today. No file changes in those repositories. If a source change turns out to be required, register a dependency against that repository's target rather than editing it from this run.
 
 **A5 — the baseline arm is projection-decoupled, not event-disabled.** The ticket permits either. Section 5C explains why the decoupled arm is chosen.
 
@@ -347,9 +510,11 @@ This keeps every published budget as acceptance while keeping the architectural 
 
 **U3 — does natural saturation reach lifecycle cursor expiry?** `DEFAULT_LIFECYCLE_JOURNAL_CAPACITY` is 1024. Whether 300 churning sessions can outrun the Hub cursor by more than 1024 changes is unmeasured. The dependency seam removes the uncertainty; Implement should still record whether natural expiry occurred.
 
-**U4 — the reported `EventPlaneSnapshot` read path.** Section 6.2 item 5 requires a read path that does not contend with the router mutex. Implement must confirm the dependency delivered that property before trusting any saturation-time queue reading.
+**U4 — the reported `EventPlaneSnapshot` read path.** Section 6.2 item 6 requires a read path that does not contend with the router mutex. Implement must confirm the dependency delivered that property before trusting any saturation-time queue reading.
 
 **U5 — an existing budget test is nominal.** `published_owner_turn_budgets_fail_if_observe_walks_every_session` (`tests/session_projection_owner_loop.rs:207`) contains only `const` assertions and one discarded comparison. Despite its name it cannot fail if observe walks every session. The campaign must not cite it as owner-turn evidence. Whether to repair or rename it is a separate decision recorded as a vault gap in section 13.
+
+**U6 — cross-repository checkout credentials.** Every checkout step in `.github/workflows/loaded-daemon-lifecycle.yml` sets `persist-credentials: false`, and the job declares repo-scoped `permissions: contents: read`, which cannot read a sibling repository. If `botster-web`, `botster-tui`, and `botster-project-pipelines` are not readable by this workflow's default token, Implement must stop and ask the operator for the exact token or GitHub App installation. Implement must not invent, guess, or widen a secret.
 
 ## 9. Affected surfaces and files
 
@@ -359,16 +524,18 @@ This keeps every published budget as acceptance while keeping the architectural 
 | --- | --- |
 | `docs/event-plane-load-proof.md` | published budget contract, machine profile, formulas, verdict rules |
 | `tests/hub_daemon_lifecycle/event_plane_saturation.rs` | the campaign lanes |
-| `docs/reports/prove-the-event-plane-cannot-lag-or-block-hub-operations-implement.md` | narrative report |
-| `docs/reports/prove-the-event-plane-cannot-lag-or-block-hub-operations-evidence.json` | machine-readable campaign evidence |
+| `docs/reports/prove-the-event-plane-cannot-lag-or-block-hub-operations-calibration.json` | committed calibration dataset and derived immutable thresholds (section 5A phase 1) |
+| `docs/reports/prove-the-event-plane-cannot-lag-or-block-hub-operations-implement.md` | narrative report; must keep coexistence budgets and the North Star behavioural contract distinct |
+| `docs/reports/prove-the-event-plane-cannot-lag-or-block-hub-operations-evidence.json` | machine-readable acceptance evidence, seven-key `revisions` object plus runner `provenance` |
 
 ### Modified
 
 | Path | Change |
 | --- | --- |
 | `tests/hub_daemon_lifecycle/mod.rs` | register the new module |
-| `script/run-loaded-daemon-lifecycle` | one new `--test-target event-plane-saturation` case beside the existing map at `:978-1024` |
-| `.github/workflows/loaded-daemon-lifecycle.yml` | one new `options:` entry in the `test_target` choice list at `:14-30` |
+| `script/run-loaded-daemon-lifecycle` | one new `--test-target event-plane-saturation` case beside the existing map at `:978-1024`. No downstream-leg surface is added here; that stays a sibling step |
+| `.github/workflows/loaded-daemon-lifecycle.yml` | one new `options:` entry in the `test_target` choice list at `:14-30`; three new pinned SHA inputs `web_sha`, `tui_sha`, `project_pipelines_sha`; three new `actions/checkout` steps with explicit `repository:` and `ref:` (TUI with `submodules: recursive`); Node and npm setup plus `npm ci` and `npm run build` in the Web checkout; the coordinator invocation step |
+| `script/prove-north-star-shared-session` | add the missing Project Pipelines leg: install the checked-out package by path and enable it, reading the name from its `botster-package.json`, in the style of `script/test-production-package-runtime:478-502`. Do not change the existing Web or TUI legs or the barrier sequence |
 | `examples/event-plane-producer/plugin.lua` | add a bounded burst emitter for saturation; keep the existing single-emit tool unchanged |
 | `examples/event-plane-consumer/plugin.lua` | add a slow-path handler behind the new bounded hold seam; keep the existing handler unchanged |
 | `README.md` | one pointer to `docs/event-plane-load-proof.md`, matching how `README.md:430` points to `docs/hub-resource-proof.md` |
@@ -391,33 +558,99 @@ This keeps every published budget as acceptance while keeping the architectural 
 | R8 | Legacy vault notes are applied as current contracts | The two `botster-legacy` WebRTC notes are treated as drift evidence. Current behaviour is verified in `src/local_webrtc.rs` per [[legacy trybotster notes are not current modular botster contracts]] |
 | R9 | The campaign claims readiness the evidence does not support | The ticket's own rule applies: do not claim hundreds-of-sessions readiness unless this campaign passes. The report states the exact `N`, profile, and verdict |
 | R10 | Scope creep into production tuning | Section 7 forbids any change to a budget, queue bound, or scheduling decision. A breach is a finding, not a tuning opportunity |
+| R11 | The calibration threshold is chosen to fit the acceptance result | Section 5A fixes every parameter before calibration, splits the two dispatches, and requires the calibration commit to exist first. Acceptance records the calibration commit it gates against and a mismatch fails the campaign |
+| R12 | Multi-repository wiring turns into an open-ended workflow project | Section 5G bounds it to three pinned SHA inputs, three checkouts, one toolchain addition, and one new coordinator leg. The loaded runner keeps its single-repo contract; the downstream leg runs as a sibling step |
+| R13 | A missing credential silently degrades downstream proof to the example fixtures | U6 makes it a stop-and-ask. `examples/project-pipelines` is a four-file fixture and must never stand in for the shipped package, which is the only source of a real `question.opened` |
+| R14 | The campaign asserts sibling survival on the fail-closed path and fails against correct code | Section 11.6 states the shipped policy and explicitly forbids that assertion. The campaign asserts the bounded blast radius instead |
 
 ## 11. Runtime-teardown class
 
-`teardown_class_applies`: **yes.** The campaign drives session and `ClientWorker` teardown at 300 sessions, plugin worker restart, Unix and WebRTC client reconnect, and file-descriptor and PTY pressure. It also compares terminal state against live runtime state. [[botster runtime teardown lenses]] applies. Every required field is answered below.
+`teardown_class_applies`: **yes.** The campaign drives session and `ClientWorker` teardown at fleet scale, plugin worker restart, Unix and WebRTC client reconnect, and file-descriptor and PTY pressure. It also compares terminal state against live runtime state. [[botster runtime teardown lenses]] applies. Every required field is answered below against the current production code, not against an assumed design.
 
-**`teardown_isolation`.** One failed peer or session must kill only its own ownership set. For a WebRTC peer that set is the channel, send task, transport runner, ping task, recovery state, offer state, ICE state, and connection timing state. For a client event holder the set is `(connection_id, subscription_id)` only ([[Client event holders are connection-scoped]]); connection cleanup must not remove a same-named holder on another connection. For a session the set is its terminal subscriptions and attach routes. Healthy siblings must keep working. The campaign asserts sibling survival explicitly after each injected fault, at 300 sessions, so a shared-resource sacrifice cannot hide inside the fleet.
+### 11.1 `teardown_isolation`
 
-**`teardown_bounds`.** No unbounded wait on the control plane. Existing bounds stay authoritative and unchanged: WebRTC close 3 s in production and 200 ms in test with a 2 s handler join (`src/local_webrtc.rs:60`, `:63`, `:67`); `DAEMON_CLIENT_WRITE_TIMEOUT`, `DAEMON_HANDSHAKE_TIMEOUT`, and `DAEMON_INCOMPLETE_FRAME_TIMEOUT` at 2 s each (`src/daemon_transport.rs:152-154`); package-event invocation timeout 1000 ms. The named hard stop when a library close path misbehaves is the existing `BOTSTER_HUB_WEBRTC_HANG_CLOSE_CHILD` subprocess oracle (`src/local_webrtc.rs:7175`), which makes an ablated close timeout finite-red. The campaign runs a close-hang lane so a hang under load is a red repetition rather than a stall.
+Ownership sets that die together:
 
-**`late_message_matrix`.** Every ownership-creating surface reachable under saturation:
+| Failure | Ownership set removed |
+| --- | --- |
+| WebRTC peer close **succeeds** | that peer only: `peer_handlers` entry, `peers` entry, `peer_states`, and its grant-owned entity, event, and attach rows. Siblings are untouched. The runtime parks only when idle (`park_runtime_if_idle`, `src/local_webrtc.rs:264`). |
+| WebRTC peer close **fails ultimately** | **every peer on the dedicated runtime.** See 11.6. |
+| Client event holder | `(connection_id, subscription_id)` only. Connection cleanup must not remove a same-named holder on another connection ([[Client event holders are connection-scoped]]). |
+| Session | its terminal subscriptions and attach routes, keyed `(session_id, subscription_id, generation)`. |
 
-| Message | Owner tag | Rejection after terminal failure | Residual sweep racing close |
-| --- | --- | --- | --- |
-| `Attach` | `(session_id, subscription_id, generation)`, Core-owned | pre-`READY` failure creates no attach ownership | route-aware idempotent cleanup; occupancy uses the live attach route set |
-| `SubscribeEntities` | connection id plus subscription id | connection cleanup drops only that connection's rows | reconciliation sweep; `subscriber_overflow` forces resync, never silent loss |
-| `SubscribeEvents` | `(connection_id, subscription_id)`; Unix `client_id`, WebRTC `grant_id` | `UnsubscribeEvents` applies to the calling connection only | connection cleanup drops only that connection's holders |
-| `UnsubscribeEvents` | same | same | same |
-| Peer-originated request over WebRTC | `grant_id` | closed grant rejects the request | `PeerClosed` removes the whole per-peer owner set together |
-| Admitted event holder | producer plus Core job id | producer unload removes contracts and queued copies | an `AdmittedHolder` survives until `CompletionDrain`; late completion is idempotent and cannot drive bytes below zero |
+### 11.2 `teardown_bounds`
 
-The campaign drives each row under saturation and after each injected fault. A plan that guarded only subscriptions would be incomplete; attach and peer-originated requests are included.
+No unbounded control-plane wait. Existing bounds stay authoritative and unchanged:
 
-**`production_path_proof`.** The exact production path is: terminal or peer signal, then the production handler, then forget or remove, then idle. The campaign proves the live path, not a terminal JSON record. [[terminal webrtc failure records do not prove peer runtime teardown]] rules out a persisted failure record as teardown evidence. The oracles are the existing `DaemonLifecycleCounters` returning to their baseline, the Hub thread census staying at or below 64, `script/probe-hub-resources` converging, and the runner's owned-session, owned-token, and settled-zombie censuses being empty. The idle-CPU observation uses the existing `BOTSTER_ASSERT_IDLE_CPU_BOUND` gate rather than a new one.
+| Bound | Value | Site |
+| --- | --- | --- |
+| `LOCAL_WEBRTC_PEER_CLOSE_BOUND` | 3 s production, 200 ms test | `src/local_webrtc.rs:60`, `:64` |
+| `LOCAL_WEBRTC_PEER_CLOSE_HANDLER_JOIN_DEADLINE` | 2 s (test oracle) | `src/local_webrtc.rs:68` |
+| `DAEMON_CLIENT_WRITE_TIMEOUT`, `DAEMON_HANDSHAKE_TIMEOUT`, `DAEMON_INCOMPLETE_FRAME_TIMEOUT` | 2 s each | `src/daemon_transport.rs:152-154` |
+| package-event invocation timeout | 1000 ms | `src/daemon_maintenance.rs:1121`, `:1274` |
 
-**`ownership_identity`.** Every peer-created durable row carries a stable owner id, listed in the matrix above. A delayed `PeerClosed` snapshot must not delete a row now owned by a different live peer that reused a subscription id. The campaign runs reconnect churn with deliberately reused subscription ids and asserts both queue orders: closed-first and message-first.
+Timeout on `peer.close()` is **treated as ultimate close failure**, not retried. The named hard stop is dropping the dedicated runtime: `fail_closed_drop_dedicated_runtime` (`src/local_webrtc.rs:333`) drops live peers, stale peers, and `self.runtime` without any further close wait. The code comment states the reason directly: sequential re-closes would each wait up to `LOCAL_WEBRTC_PEER_CLOSE_BOUND`, so N peers would make handler latency unbounded.
 
-**`sibling_fail_closed_policy`.** On successful close, siblings keep working; the campaign asserts that at 300 sessions after every fault. On ultimate close failure the blast radius is bounded to the failing peer or session and its own ownership set; no sibling is sacrificed. A sibling loss is a product failure, never accepted residual risk.
+The existing oracle for this is `BOTSTER_HUB_WEBRTC_HANG_CLOSE_CHILD` (`src/local_webrtc.rs:7175`), which re-execs a child so an ablated close timeout is finite-red rather than a stall. The campaign runs a close-hang lane at fleet scale so a hang under load fails a repetition instead of hanging the campaign.
+
+### 11.3 `late_message_matrix`
+
+Every ownership-creating surface, each with the existing production test that owns it. The generic "peer-originated request" row from revision 1 was wrong: the production suite treats **late Spawn** as its own ownership-creating surface.
+
+| Message | Owner tag | Rejection after terminal failure | Residual sweep racing close | Existing production test |
+| --- | --- | --- | --- | --- |
+| `Spawn` | peer `grant_id` | a closed grant creates no session | grant sweep on `PeerClosed` | `local_webrtc_late_spawn_after_peer_closed_does_not_create_session` (`src/local_webrtc.rs:6619`) |
+| `Attach` | `(session_id, subscription_id, generation)`, Core-owned | pre-`READY` failure creates no attach ownership | route-aware idempotent cleanup; occupancy uses the live attach route set | `local_webrtc_late_attach_after_peer_closed_does_not_recreate_state` (`:6544`); `local_webrtc_stale_peer_attach_snapshot_does_not_detach_replacement_owner` (`:6887`) |
+| `SubscribeEntities` | `grant_id` plus subscription id | closed grant does not recreate state | delayed snapshot must not delete a replacement owner's row | `local_webrtc_late_subscribe_entities_after_peer_closed_does_not_recreate_state` (`:5967`); `local_webrtc_stale_peer_snapshot_does_not_remove_replacement_subscription_owner` (`:6328`) |
+| `UnsubscribeEntities` | `grant_id` plus subscription id | applies only to the calling grant | must not delete a replacement owner's row | `local_webrtc_late_unsubscribe_does_not_delete_replacement_owner_row` (`:6674`) |
+| `SubscribeEvents` | `(connection_id, subscription_id)`; Unix `client_id`, WebRTC `grant_id` | closed connection admits no holder | connection cleanup drops only that connection's holders | **campaign adds this lane**; no existing late-message test covers event holders |
+| `UnsubscribeEvents` | same | applies to the calling connection only | same | **campaign adds this lane** |
+| Admitted event holder | producer plus Core job id | producer unload removes contracts and queued copies | `AdmittedHolder` survives until `CompletionDrain`; late completion is idempotent and cannot drive bytes below zero | [[admitted event holders survive producer unload until Core completion]] |
+
+The campaign runs every row at fleet scale, in **both** queue orders (closed-first and message-first), with **deliberately reused subscription and grant ids**. The two event-holder rows are new coverage this campaign contributes; the rest re-run existing production oracles under saturation.
+
+### 11.4 `production_path_proof`
+
+The exact production chain, named rather than described. `src/local_webrtc.rs:5539` documents it verbatim:
+
+> `LocalWebrtcPeerClosed` → `handle_control_message` → `remove_peer` close + map + runtime drop.
+
+- `ControlMessage::LocalWebrtcPeerClosed` is emitted at `src/local_webrtc.rs:1031`.
+- `handle_control_message` dispatches it at `src/daemon_transport.rs:2874` and `:5334`.
+- `remove_peer` (`src/local_webrtc.rs:252`) is documented as "the sole production forget path for `LocalWebrtcPeerClosed`". It calls `close_peer_on_runtime`, then either `take_remove_result` plus `park_runtime_if_idle`, or `fail_closed_drop_dedicated_runtime`.
+
+Owner-specific live idle oracles, not a process-wide thread ceiling:
+
+| Oracle | Site | Proves |
+| --- | --- | --- |
+| `active_peer_count()` | `src/local_webrtc.rs:480` | the live peer map is empty |
+| `has_live_peer(grant_id)` | `:311` | one exact grant is gone |
+| `peer_state_count()` | `:511` | primary and sibling `peer_states` are cleared |
+| `has_dedicated_runtime()` | `:485` | the runtime was dropped, not merely parked |
+| `dedicated_runtime_worker_threads()` | `:505` | **each peer driver is idle.** This counter is instance-local on `LocalWebrtcTransport`, which [[process-global test counters make zero waits observe other tests under default-concurrency lib load]] requires |
+
+A terminal record is not teardown proof. [[terminal webrtc failure records do not prove peer runtime teardown]] records the case where `local-webrtc-sender-terminal.json` showed `peer_failed` with completed cleanup while the process ran at roughly 500% CPU for 23 hours on live `PeerConnectionDriver` timeout loops. The campaign therefore asserts the live oracles above, and uses `BOTSTER_ASSERT_IDLE_CPU_BOUND` only as corroboration.
+
+Hub-wide corroboration stays secondary: `DaemonLifecycleCounters` returning to baseline, `script/probe-hub-resources` converging, and the runner's owned-session, owned-token, and settled-zombie censuses empty.
+
+### 11.5 `ownership_identity`
+
+Every peer-created durable row carries the stable owner id in the 11.3 table. A delayed `PeerClosed` snapshot must not delete a row now owned by a different live peer that reused a subscription id. Two existing tests already own that claim (`:6328`, `:6887`) and the campaign re-runs both under saturation with reused ids in both queue orders.
+
+### 11.6 `sibling_fail_closed_policy`
+
+**Correction to revision 1.** Revision 1 stated that no sibling is sacrificed. That contradicted the shipped production path. The actual policy is a deliberate, bounded sibling sacrifice.
+
+- **On successful close:** siblings keep working. `remove_peer` removes one grant and parks the runtime only when idle. The campaign asserts sibling survival at fleet scale after every non-fatal fault.
+- **On ultimate close failure (error or `LOCAL_WEBRTC_PEER_CLOSE_BOUND` timeout):** Hub **fail-closes and sacrifices every sibling on the dedicated runtime.** `fail_closed_drop_dedicated_runtime` (`src/local_webrtc.rs:333`) takes all of `self.peers` and all of `self.stale_close_peers`, adds the primary grant, sweeps ownership for every one of them, and drops the runtime.
+
+**Blast radius, stated exactly:** every live peer on the dedicated runtime, every stale close peer, the failed primary grant, all of their `peer_states`, all of their grant-owned entity, event, and attach ownership rows, and the dedicated tokio runtime itself. Peers on other transports and all Unix connections are unaffected.
+
+**Why the tradeoff was chosen:** the alternative is sequential per-peer re-close, where each peer can wait up to `LOCAL_WEBRTC_PEER_CLOSE_BOUND`, making `PeerClosed` handler latency scale with peer count. Unbounded control-plane latency is the worse failure, and leaving a failed peer on a runtime kept alive by siblings is what produced the original multi-core timeout storm. This is the documented tradeoff the teardown lens asks a plan to state rather than hide.
+
+**Existing test that owns the policy:** the fail-closed hang path at `src/local_webrtc.rs:7117-7147` asserts `active_peer_count() == 0`, `!has_dedicated_runtime()`, `peer_state_count() == 0`, absence of both `grant_a` and `grant_b` with the message "timeout fail-closed must sacrifice sibling peers", and removal of both sibling entity subscriptions.
+
+**Campaign obligation:** run this exact path at fleet scale and assert the full blast radius above, plus the handler-join bound. The campaign must **not** assert sibling survival on the ultimate-failure path; that assertion would contradict shipped behaviour and fail. Changing this policy to per-peer isolation would require a separate owner ticket that redesigns the shared dedicated runtime, and is out of scope here.
 
 ## 12. Acceptance checks and tests
 
@@ -450,20 +683,24 @@ These do not depend on runner speed and are the load-bearing oracles for the tic
 7. **Transient events shed when stale.** Events older than `queue_age` 1000 ms shed instead of arriving stale.
 8. **Received notices never exceed emitted events.** A gap can reduce notices; it can never create them.
 9. **Hub cannot inspect terminal bodies.** The three existing architecture tests at `src/unix_terminal_adapter.rs:905`, `src/webrtc_terminal_adapter.rs:915`, and `src/daemon_attach_stream.rs:1133` stay green, and the campaign additionally asserts that event traffic causes zero terminal adapter API calls and zero terminal queue growth.
-10. **North Star behavioural oracles hold under saturation** on the attached noisy session: identity, ordering, exact non-UTF-8 bytes, late-attach history, resize, input, cancellation, reconnect, and `ProcessExited`.
+10. **North Star behavioural oracles hold under saturation** on the attached noisy session: identity, ordering, exact non-UTF-8 bytes, late-attach history, resize, input, cancellation, reconnect, and `ProcessExited`. These are the pre-existing behavioural contract, proved unchanged; they are not the new coexistence budgets.
 11. **Teardown matrix.** Every row of section 11's late-message matrix, in both closed-first and message-first orders, with reused subscription ids.
-12. **Sibling survival** after each of the injected faults, at full fleet size.
+12. **Sibling survival after each non-fatal fault**, at full fleet size. On the ultimate WebRTC close-failure path the campaign asserts the **bounded sibling sacrifice** in section 11.6 instead, because asserting survival there would contradict shipped behaviour.
+13. **Downstream production proof**, per section 5G.3: a real `question.opened` from the pinned `botster-project-pipelines` checkout produces exactly one transient notice in the shipped Web harness and one in the shipped TUI harness, both attached to the same `north-star-shared` session; a shed notice never removes the durable question row; and reconnect replays nothing.
 
 ### 12.4 Published budget gates
 
-For each of `Spawn`, `Attach`, `Drain`, `Input`, `Resize`, `Shutdown`, MCP, UI, entity, terminal input, and terminal output, in both arms:
+For each of `Spawn`, `Attach`, `Drain`, `Input`, `Resize`, `Shutdown`, MCP, UI, entity, terminal input, and terminal output, in both arms and in both phases:
 
-- record p50, p95, p99, maximum, and throughput;
-- gate on the paired ratio from A2;
-- gate on the published absolute budget when the run is on the reference profile;
-- record queue count and bytes, oldest age, admission latency, delivery latency, shed by typed reason, gap count, resync count, pressure, timeout, owner-turn duration, and ready-operation wait.
+- record p50, p95, p99, maximum, and throughput under the fixed percentile method in section 5A.2;
+- gate acceptance p99 on the relative rule `P99acc_e(op) <= P99acc_d(op) * 1.25 + 8 ms`;
+- gate acceptance p99 on the calibrated absolute `ABS(op)`;
+- gate acceptance maximum on the calibrated `MAX(op)`;
+- record queue count and bytes, oldest age, admission latency, delivery latency, shed by typed reason, gap count, resync count, pressure, **the four timeout counters T1 through T4 from section 4.4.1, never merged**, owner-turn duration, and ready-operation wait.
 
-The last item requires the section 6.2 dependency. Without it these signals cannot be recorded and the ticket cannot pass.
+The recorded-signal list requires dependency `ticket_1787267568_492780`. Without it these signals have no read path and the ticket cannot pass.
+
+Every failure rule in section 5A.5 applies. A profile mismatch, a missing metric, an invalid calibration, or any threshold breach fails the campaign. None of these is a caveat.
 
 ### 12.5 Fault lanes
 
@@ -480,18 +717,25 @@ Each of the eleven faults in section 5E runs at full fleet size. Each asserts: t
 
 The report names, per claim, which tier detected the defect and which tier was blind, following [[verification reports name the load bearing oracle when cheaper suites are blind]].
 
-### 12.7 Campaign dispatch
+### 12.7 Campaign dispatch, two phases
+
+Phase 1, calibration. Its only outputs are the committed dataset and derived thresholds.
 
 ```sh
 gh workflow run loaded-daemon-lifecycle.yml \
   --ref main \
   -f subject_sha=<exact merged Hub SHA> \
+  -f web_sha=<pinned botster-web SHA> \
+  -f tui_sha=<pinned botster-tui SHA> \
+  -f project_pipelines_sha=<pinned botster-project-pipelines SHA> \
   -f test_target=event-plane-saturation \
   -F repetitions=<published> \
   -f stress_profile=residual-tail
 ```
 
-The runner stops at the first red repetition. Preserve that artifact before any further dispatch. Green repetitions at a bounded budget mean "not reproduced under that budget", never "resolved".
+Phase 2, acceptance. Identical inputs, dispatched only after the calibration commit lands. Acceptance records the calibration commit SHA it gates against; a mismatch fails the campaign.
+
+The runner stops at the first red repetition. Preserve that artifact before any further dispatch. Green repetitions at a bounded budget mean "not reproduced under that budget", never "resolved". Do not use a retry loop that discards a red result.
 
 ## 13. Vault gaps worth capturing
 
@@ -501,14 +745,19 @@ The runner stops at the first red repetition. Preserve that artifact before any 
 4. **`published_owner_turn_budgets_fail_if_observe_walks_every_session` is nominal.** Capture that a test name can assert a claim its body cannot fail on, and that budget claims need a work-bound body.
 5. **Only four of Core's fourteen `with_test_*` builders are plumbed to Hub environment reads.** Capture the inventory so future fault lanes reach for the existing builder before inventing a seam.
 6. **`DAEMON_MAX_CONNECTIONS` 64 is a client bound, not a session bound.** Capture the distinction, because "hundreds of sessions" invites the confusion.
+7. **A timed-out package-event handler is indistinguishable from a successful one.** `run_completion_drain_slice` (`src/daemon_maintenance.rs:1322-1334`) reads `completion.result` only to extract a request id and never inspects the `Completed` versus `Failed` discriminant on the event path. Hub also never references `PluginWorkerEvent` anywhere, so Core's typed `InvocationTimedOut` is unobservable by construction. Capture this as a correctness gap, not only an observability gap.
+8. **The loaded workflow is structurally single-repository.** It has two `actions/checkout` steps, both Hub, and no Node or npm. `script/prove-north-star-shared-session` has no Project Pipelines leg, and `question.opened` appears zero times in this repository's code. Capture that a plan claiming downstream proof through that workflow must wire three checkouts, a toolchain, and a new coordinator leg first.
 
 ## 14. Pipeline gates and artifacts
 
 | Item | Value |
 | --- | --- |
 | Gate | `botster_stack_plan_gate` |
-| Plan artifact | `docs/plans/prove-the-event-plane-cannot-lag-or-block-hub-operations.md`, attached with `project_pipelines_add_artifact` |
+| Plan artifact | `docs/plans/prove-the-event-plane-cannot-lag-or-block-hub-operations.md`, revision 2 |
 | Vault checklist | `checklist_1787266824_449406` |
-| Registered dependency | `ticket_1787267568_492780` (botster-hub), `dependency_1787267572_315049`, status open |
-| Blocking effect | this ticket cannot start Implement until `ticket_1787267568_492780` closes |
+| Plan Review answered | `review_1787268374_271226`, `changes_required`, six findings, all corrected in the revision table above |
+| Human answers folded in | `question_1787267931_572353` (routing exception), `question_1787268530_910910` (budget nature and derivation) |
+| Dependency ticket | `ticket_1787267568_492780`, botster-hub, `tgt_7e208a0c76a44980a83b63af976b1f22`, open and **unstarted** |
+| Dependency edge | **absent by design.** `dependency_1787267572_315049` was removed under the section 0 review-only exception. Plan Review requested changes, so the human answer requires the ticket to stay unstarted and the edge to stay absent until Plan Review approves |
+| On Plan Review approval | re-add `ticket_1787267568_492780` as a dependency with `project_pipelines_add_ticket_dependency` **before any Implement advance**, then run and merge that ticket first while this run stays parked |
 | Delivery | direct merge into `main`; no pull request; no human pull-request sign-off |
