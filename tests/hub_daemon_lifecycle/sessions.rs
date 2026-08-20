@@ -296,6 +296,21 @@ fn fast_exit_attach_diagnostic_records_subscription_event_order() {
                         "terminal_subscription_closed:session={event_session_id}:subscription={event_subscription_id}:generation={generation}:reason={reason}"
                     )
                 }
+                botster_hub_client::DaemonEvent::PackageEvent {
+                    subscription_id,
+                    owner,
+                    name,
+                    ..
+                } => format!(
+                    "package_event:subscription={subscription_id}:owner={owner}:name={name}"
+                ),
+                botster_hub_client::DaemonEvent::EventGap {
+                    subscription_id,
+                    owner,
+                    name,
+                } => format!(
+                    "event_gap:subscription={subscription_id}:owner={owner}:name={name}"
+                ),
             };
             response_observations.push(observation.clone());
             ordered_observations.push(format!(
@@ -444,6 +459,12 @@ fn fast_exit_attach_diagnostic_records_subscription_event_order() {
                         reason,
                     } => println!(
                         "fast_exit_attach_tail_event elapsed_us={elapsed_us} response={response_index} event={event_index} type=terminal_subscription_closed session={event_session_id} subscription={event_subscription_id} generation={generation} reason={reason} bytes=0"
+                    ),
+                    botster_hub_client::DaemonEvent::PackageEvent { .. } => println!(
+                        "fast_exit_attach_tail_event elapsed_us={elapsed_us} response={response_index} event={event_index} type=package_event session=none subscription=none bytes=0"
+                    ),
+                    botster_hub_client::DaemonEvent::EventGap { .. } => println!(
+                        "fast_exit_attach_tail_event elapsed_us={elapsed_us} response={response_index} event={event_index} type=event_gap session=none subscription=none bytes=0"
                     ),
                 }
             }

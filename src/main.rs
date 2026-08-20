@@ -2591,6 +2591,8 @@ fn print_daemon_response(response: DaemonResponse) -> Result<(), OperatorError> 
         }
         DaemonResponseKind::EntitySubscribed => println!("response=entity_subscribed"),
         DaemonResponseKind::EntityUnsubscribed => println!("response=entity_unsubscribed"),
+        DaemonResponseKind::EventSubscribed => println!("response=event_subscribed"),
+        DaemonResponseKind::EventUnsubscribed => println!("response=event_unsubscribed"),
         DaemonResponseKind::SessionRemoved => println!("response=session_removed"),
         DaemonResponseKind::Spawned => {
             println!("response=spawned");
@@ -2960,6 +2962,25 @@ fn print_daemon_events(events: &[DaemonEvent]) {
             } => {
                 println!(
                     "event=terminal_subscription_closed session_id={session_id} subscription_id={subscription_id} generation={generation} reason={reason}"
+                );
+            }
+            DaemonEvent::PackageEvent {
+                subscription_id,
+                owner,
+                name,
+                ..
+            } => {
+                println!(
+                    "event=package_event subscription_id={subscription_id} owner={owner} name={name}"
+                );
+            }
+            DaemonEvent::EventGap {
+                subscription_id,
+                owner,
+                name,
+            } => {
+                println!(
+                    "event=event_gap subscription_id={subscription_id} owner={owner} name={name}"
                 );
             }
             _ => {

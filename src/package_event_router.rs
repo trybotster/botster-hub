@@ -4,7 +4,7 @@
 //! and transient queues. It must not import HubRuntime, CoreDaemon, mlua, plugin
 //! persistence, or the owner loop.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::config::PackageEventPlanePolicy;
+use crate::daemon_event_subscriptions::ClientEventMailbox;
 use crate::package_event_schema::{CompiledEventSchema, worktree_lifecycle_schema};
 
 pub const HUB_EVENT_OWNER: &str = "hub";
@@ -122,13 +123,25 @@ pub struct EventSubscription {
     pub plugin_generation: u64,
 }
 
+/// Connection-scoped client holder. Identity is `(connection_id, subscription_id)`.
+#[derive(Clone)]
+pub(crate) struct ClientEventHolder {
+    pub connection_id: String,
+    pub subscription_id: String,
+    pub owner: String,
+    pub name: String,
+    pub subjects: BTreeSet<String>,
+    pub mailbox: Arc<ClientEventMailbox>,
+    pub gap: Arc<std::sync::atomic::AtomicBool>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct HolderId {
     pub consumer_plugin_key: u64,
     pub generation: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ReadyDelivery {
     pub envelope_id: u64,
     pub owner: String,
@@ -137,6 +150,14 @@ pub struct ReadyDelivery {
     pub payload_json: Value,
     pub size: usize,
     pub holder: EventSubscription,
+    pull_id: u64,
+}
+
+impl ReadyDelivery {
+    #[must_use]
+    pub(crate) fn pull_id(&self) -> u64 {
+        self.pull_id
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -194,6 +215,8 @@ struct RouterInner {
     policy: PackageEventPlanePolicy,
     contracts: HashMap<(String, String), EmittedContract>,
     subscriptions: HashMap<(String, String), Vec<EventSubscription>>,
+    client_holders: HashMap<(String, String), Vec<ClientEventHolder>>,
+    client_by_id: HashMap<(String, String), (String, String)>,
     subscriptions_per_plugin: HashMap<String, usize>,
     producer: HashMap<String, ProducerOccupancy>,
     consumers: HashMap<String, ConsumerQueue>,
@@ -201,6 +224,8 @@ struct RouterInner {
     admitted: HashMap<(u64, String, u64), AdmittedHolder>,
     buckets: HashMap<String, TokenBucket>,
     next_envelope: u64,
+    next_pull: u64,
+    outstanding_pulls: HashSet<u64>,
     package_generation: HashMap<String, u64>,
 }
 
@@ -235,6 +260,8 @@ impl PackageEventRouter {
                 policy,
                 contracts,
                 subscriptions: HashMap::new(),
+                client_holders: HashMap::new(),
+                client_by_id: HashMap::new(),
                 subscriptions_per_plugin: HashMap::new(),
                 producer: HashMap::new(),
                 consumers: HashMap::new(),
@@ -242,6 +269,8 @@ impl PackageEventRouter {
                 admitted: HashMap::new(),
                 buckets: HashMap::new(),
                 next_envelope: 1,
+                next_pull: 1,
+                outstanding_pulls: HashSet::new(),
                 package_generation: HashMap::new(),
             }),
             delivery_wake: AtomicBool::new(false),
@@ -349,6 +378,35 @@ impl PackageEventRouter {
         subscribe_locked(&mut inner, subscription)
     }
 
+    pub(crate) fn try_subscribe_client(&self, holder: ClientEventHolder) -> EventPlaneStatus {
+        let mut inner = match lock_inner(&self.inner) {
+            Ok(inner) => inner,
+            Err(status) => return status,
+        };
+        subscribe_client_locked(&mut inner, holder)
+    }
+
+    pub(crate) fn try_unsubscribe_client(
+        &self,
+        connection_id: &str,
+        subscription_id: &str,
+    ) -> EventPlaneStatus {
+        let mut inner = match lock_inner(&self.inner) {
+            Ok(inner) => inner,
+            Err(status) => return status,
+        };
+        unsubscribe_client_locked(&mut inner, connection_id, subscription_id)
+    }
+
+    pub(crate) fn try_cleanup_client_connection(&self, connection_id: &str) -> EventPlaneStatus {
+        let mut inner = match lock_inner(&self.inner) {
+            Ok(inner) => inner,
+            Err(status) => return status,
+        };
+        cleanup_client_connection_locked(&mut inner, connection_id);
+        EventPlaneStatus::Accepted
+    }
+
     pub fn try_ingress(
         &self,
         caller_owner: &str,
@@ -446,11 +504,13 @@ impl PackageEventRouter {
                 .get(&(caller_owner.to_string(), name.to_string()))
                 .is_none_or(Vec::is_empty)
             {
+                deliver_to_client_holders(&inner, caller_owner, name, payload, encoded.len());
                 EventPlaneStatus::Accepted
             } else {
                 EventPlaneStatus::ShedFull
             };
         }
+        deliver_to_client_holders(&inner, caller_owner, name, payload, encoded.len());
         let envelope_id = inner.next_envelope;
         inner.next_envelope = inner.next_envelope.saturating_add(1);
         let payload_arc: Arc<[u8]> = encoded.into();
@@ -571,18 +631,30 @@ impl PackageEventRouter {
                     break;
                 }
                 used_bytes += size;
-                let envelope = inner
+                let (owner, name, payload, payload_json) = inner
                     .envelopes
                     .get(&copy.envelope_id)
+                    .map(|envelope| {
+                        (
+                            envelope.owner.clone(),
+                            envelope.name.clone(),
+                            envelope.payload.clone(),
+                            envelope.payload_json.clone(),
+                        )
+                    })
                     .expect("envelope exists");
+                let pull_id = inner.next_pull;
+                inner.next_pull = inner.next_pull.saturating_add(1);
+                inner.outstanding_pulls.insert(pull_id);
                 ready.push(ReadyDelivery {
                     envelope_id: copy.envelope_id,
-                    owner: envelope.owner.clone(),
-                    name: envelope.name.clone(),
-                    payload: envelope.payload.clone(),
-                    payload_json: envelope.payload_json.clone(),
+                    owner,
+                    name,
+                    payload,
+                    payload_json,
                     size,
                     holder: copy.holder,
+                    pull_id,
                 });
             }
         }
@@ -627,6 +699,90 @@ impl PackageEventRouter {
             plugin_key,
             generation,
         ))
+    }
+
+    pub(crate) fn retire_pulled(
+        &self,
+        pull_id: u64,
+        envelope_id: u64,
+        plugin_key: &str,
+        generation: u64,
+    ) -> Result<bool, EventPlaneStatus> {
+        let mut inner = lock_inner(&self.inner)?;
+        inner.outstanding_pulls.remove(&pull_id);
+        Ok(retire_holder_locked(
+            &mut inner,
+            envelope_id,
+            plugin_key,
+            generation,
+        ))
+    }
+
+    pub(crate) fn requeue_delivery(
+        &self,
+        delivery: ReadyDelivery,
+    ) -> Result<(), (Box<ReadyDelivery>, EventPlaneStatus)> {
+        let mut inner = match lock_inner(&self.inner) {
+            Ok(inner) => inner,
+            Err(status) => return Err((Box::new(delivery), status)),
+        };
+        if !inner.outstanding_pulls.remove(&delivery.pull_id) {
+            return Err((Box::new(delivery), EventPlaneStatus::RejectedInvalid));
+        }
+        if !inner.envelopes.contains_key(&delivery.envelope_id) {
+            return Ok(());
+        }
+        let consumer_event_max = inner.policy.consumer_queue_max_events;
+        let consumer_byte_max = inner.policy.consumer_queue_max_bytes;
+        let consumer = inner
+            .consumers
+            .entry(delivery.holder.plugin_key.clone())
+            .or_insert_with(ConsumerQueue::default);
+        if consumer.events + 1 > consumer_event_max
+            || consumer.bytes + delivery.size > consumer_byte_max
+        {
+            inner.outstanding_pulls.insert(delivery.pull_id);
+            return Err((Box::new(delivery), EventPlaneStatus::ShedFull));
+        }
+        consumer.events += 1;
+        consumer.bytes += delivery.size;
+        consumer.copies.push_front(QueuedCopy {
+            envelope_id: delivery.envelope_id,
+            holder: delivery.holder,
+        });
+        self.delivery_wake.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub(crate) fn complete_pulled_delivery(
+        &self,
+        delivery: ReadyDelivery,
+    ) -> Result<(), (Box<ReadyDelivery>, EventPlaneStatus)> {
+        let mut inner = match lock_inner(&self.inner) {
+            Ok(inner) => inner,
+            Err(status) => return Err((Box::new(delivery), status)),
+        };
+        if !inner.outstanding_pulls.remove(&delivery.pull_id) {
+            return Err((Box::new(delivery), EventPlaneStatus::RejectedInvalid));
+        }
+        inner.admitted.insert(
+            (
+                delivery.envelope_id,
+                delivery.holder.plugin_key.clone(),
+                delivery.holder.generation,
+            ),
+            AdmittedHolder {
+                envelope_id: delivery.envelope_id,
+                retired: false,
+            },
+        );
+        retire_holder_locked(
+            &mut inner,
+            delivery.envelope_id,
+            &delivery.holder.plugin_key,
+            delivery.holder.generation,
+        );
+        Ok(())
     }
 
     pub fn try_apply(&self, op: &OwnerOp) -> OwnerApplyResult {
@@ -686,6 +842,28 @@ impl PackageEventRouter {
     pub fn test_with_inner_held<R>(&self, body: impl FnOnce() -> R) -> R {
         let _guard = self.inner.try_lock().expect("test hold must acquire inner");
         body()
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn test_outstanding_pulls(&self) -> usize {
+        lock_inner(&self.inner)
+            .map(|inner| inner.outstanding_pulls.len())
+            .unwrap_or(usize::MAX)
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn test_client_holder_count(&self, connection_id: &str) -> usize {
+        lock_inner(&self.inner)
+            .map(|inner| {
+                inner
+                    .client_by_id
+                    .keys()
+                    .filter(|(holder_connection, _)| holder_connection == connection_id)
+                    .count()
+            })
+            .unwrap_or(0)
     }
 
     #[doc(hidden)]
@@ -932,6 +1110,114 @@ fn subscribe_locked(inner: &mut RouterInner, subscription: EventSubscription) ->
     EventPlaneStatus::Accepted
 }
 
+fn subscribe_client_locked(inner: &mut RouterInner, holder: ClientEventHolder) -> EventPlaneStatus {
+    if is_wildcard(&holder.owner) || is_wildcard(&holder.name) {
+        return EventPlaneStatus::RejectedWildcard;
+    }
+    if holder.owner.trim().is_empty() || holder.name.trim().is_empty() {
+        return EventPlaneStatus::RejectedInvalid;
+    }
+    let key = (holder.owner.clone(), holder.name.clone());
+    let Some(contract) = inner.contracts.get(&key) else {
+        return EventPlaneStatus::RejectedUndeclared;
+    };
+    if !contract.audience.contains(&EventAudience::Clients) {
+        return EventPlaneStatus::RejectedAudience;
+    }
+    let identity = (holder.connection_id.clone(), holder.subscription_id.clone());
+    if inner.client_by_id.contains_key(&identity) {
+        return EventPlaneStatus::RejectedInvalid;
+    }
+    let max_subscribers = inner.policy.subscribers_per_event_max;
+    let holders = inner.client_holders.entry(key).or_default();
+    if holders.len() >= max_subscribers {
+        return EventPlaneStatus::RejectedOverFanout;
+    }
+    inner
+        .client_by_id
+        .insert(identity, (holder.owner.clone(), holder.name.clone()));
+    holders.push(holder);
+    EventPlaneStatus::Accepted
+}
+
+fn unsubscribe_client_locked(
+    inner: &mut RouterInner,
+    connection_id: &str,
+    subscription_id: &str,
+) -> EventPlaneStatus {
+    let identity = (connection_id.to_string(), subscription_id.to_string());
+    let Some(key) = inner.client_by_id.remove(&identity) else {
+        return EventPlaneStatus::RejectedInvalid;
+    };
+    if let Some(holders) = inner.client_holders.get_mut(&key) {
+        holders.retain(|holder| {
+            !(holder.connection_id == connection_id && holder.subscription_id == subscription_id)
+        });
+        if holders.is_empty() {
+            inner.client_holders.remove(&key);
+        }
+    }
+    EventPlaneStatus::Accepted
+}
+
+fn cleanup_client_connection_locked(inner: &mut RouterInner, connection_id: &str) {
+    let identities: Vec<(String, String)> = inner
+        .client_by_id
+        .keys()
+        .filter(|(holder_connection, _)| holder_connection == connection_id)
+        .cloned()
+        .collect();
+    for (holder_connection, subscription_id) in identities {
+        let _ = unsubscribe_client_locked(inner, &holder_connection, &subscription_id);
+    }
+}
+
+fn deliver_to_client_holders(
+    inner: &RouterInner,
+    owner: &str,
+    name: &str,
+    payload: &Value,
+    size: usize,
+) {
+    let Some(holders) = inner
+        .client_holders
+        .get(&(owner.to_string(), name.to_string()))
+    else {
+        return;
+    };
+    for holder in holders {
+        if !client_subject_matches(&holder.subjects, payload) {
+            continue;
+        }
+        if holder
+            .mailbox
+            .try_push(
+                &holder.subscription_id,
+                &holder.owner,
+                &holder.name,
+                payload.clone(),
+                size,
+            )
+            .is_err()
+        {
+            holder.gap.store(true, std::sync::atomic::Ordering::SeqCst);
+            holder
+                .mailbox
+                .set_gap(&holder.subscription_id, &holder.owner, &holder.name);
+        }
+    }
+}
+
+fn client_subject_matches(subjects: &BTreeSet<String>, payload: &Value) -> bool {
+    if subjects.is_empty() {
+        return true;
+    }
+    payload
+        .get("subject")
+        .and_then(Value::as_str)
+        .is_some_and(|subject| subjects.contains(subject))
+}
+
 fn bump_package_generation(inner: &mut RouterInner, owner: &str) -> u64 {
     let next = inner
         .package_generation
@@ -970,6 +1256,23 @@ fn apply_unload(inner: &mut RouterInner, owner: &str, generation: u64) {
     inner
         .subscriptions
         .retain(|_, subscriptions| !subscriptions.is_empty());
+    let mut removed_client_ids = Vec::new();
+    for holders in inner.client_holders.values_mut() {
+        holders.retain(|holder| {
+            let drop_holder = holder.owner == owner;
+            if drop_holder {
+                removed_client_ids
+                    .push((holder.connection_id.clone(), holder.subscription_id.clone()));
+            }
+            !drop_holder
+        });
+    }
+    inner
+        .client_holders
+        .retain(|_, holders| !holders.is_empty());
+    for identity in removed_client_ids {
+        inner.client_by_id.remove(&identity);
+    }
     for (plugin, removed) in removed_counts {
         if let Some(count) = inner.subscriptions_per_plugin.get_mut(&plugin) {
             *count = count.saturating_sub(removed);
@@ -1405,6 +1708,7 @@ fn lock_causal(mutex: &Mutex<CausalInner>) -> Option<std::sync::MutexGuard<'_, C
 mod tests {
     use super::*;
     use crate::config::PackageEventPlaneOptions;
+    use crate::daemon_event_subscriptions::ClientEventMailbox;
     use std::thread;
     use std::time::Duration as StdDuration;
 
@@ -2420,6 +2724,146 @@ mod tests {
     }
 
     #[test]
+    fn mixed_plugin_and_client_ingress_does_not_deliver_before_rejection() {
+        let policy = PackageEventPlanePolicy {
+            consumer_queue_max_events: 1,
+            fanout_per_emit_max: 1,
+            ..PackageEventPlanePolicy::default()
+        };
+        let router = PackageEventRouter::new(policy);
+        let mut contract = sample_contract("producer", "notice");
+        contract.audience = BTreeSet::from([EventAudience::Plugins, EventAudience::Clients]);
+        router
+            .try_register_contracts(vec![contract])
+            .expect("register");
+        subscribe(&router, "consumer", "producer", "notice");
+        assert_eq!(
+            router.try_ingress(
+                "producer",
+                "notice",
+                &serde_json::json!({ "ok": true }),
+                Instant::now()
+            ),
+            EventPlaneStatus::Accepted
+        );
+
+        let mailbox = std::sync::Arc::new(ClientEventMailbox::new(policy));
+        let gap = mailbox
+            .register_gap_slot("sub", "producer", "notice")
+            .expect("register gap");
+        assert_eq!(
+            router.try_subscribe_client(ClientEventHolder {
+                connection_id: "conn".into(),
+                subscription_id: "sub".into(),
+                owner: "producer".into(),
+                name: "notice".into(),
+                subjects: BTreeSet::new(),
+                mailbox: mailbox.clone(),
+                gap,
+            }),
+            EventPlaneStatus::Accepted
+        );
+        assert_eq!(
+            router.try_ingress(
+                "producer",
+                "notice",
+                &serde_json::json!({ "ok": true }),
+                Instant::now()
+            ),
+            EventPlaneStatus::ShedFull
+        );
+        assert!(
+            mailbox.take_ready_event().is_none(),
+            "ShedFull must not deliver to clients"
+        );
+
+        let fanout_router = PackageEventRouter::new(PackageEventPlanePolicy {
+            fanout_per_emit_max: 1,
+            ..PackageEventPlanePolicy::default()
+        });
+        let mut fanout_contract = sample_contract("producer", "notice");
+        fanout_contract.audience = BTreeSet::from([EventAudience::Plugins, EventAudience::Clients]);
+        fanout_router
+            .try_register_contracts(vec![fanout_contract])
+            .expect("register");
+        subscribe(&fanout_router, "consumer-a", "producer", "notice");
+        subscribe(&fanout_router, "consumer-b", "producer", "notice");
+        let fanout_mailbox =
+            std::sync::Arc::new(ClientEventMailbox::new(PackageEventPlanePolicy::default()));
+        let fanout_gap = fanout_mailbox
+            .register_gap_slot("sub", "producer", "notice")
+            .expect("register gap");
+        assert_eq!(
+            fanout_router.try_subscribe_client(ClientEventHolder {
+                connection_id: "conn".into(),
+                subscription_id: "sub".into(),
+                owner: "producer".into(),
+                name: "notice".into(),
+                subjects: BTreeSet::new(),
+                mailbox: fanout_mailbox.clone(),
+                gap: fanout_gap,
+            }),
+            EventPlaneStatus::Accepted
+        );
+        assert_eq!(
+            fanout_router.try_ingress(
+                "producer",
+                "notice",
+                &serde_json::json!({ "ok": true }),
+                Instant::now()
+            ),
+            EventPlaneStatus::RejectedOverFanout
+        );
+        assert!(
+            fanout_mailbox.take_ready_event().is_none(),
+            "over-fanout must not deliver to clients"
+        );
+
+        let accepted_mailbox =
+            std::sync::Arc::new(ClientEventMailbox::new(PackageEventPlanePolicy::default()));
+        let accepted_router = PackageEventRouter::new(PackageEventPlanePolicy::default());
+        let mut accepted_contract = sample_contract("producer", "notice");
+        accepted_contract.audience =
+            BTreeSet::from([EventAudience::Plugins, EventAudience::Clients]);
+        accepted_router
+            .try_register_contracts(vec![accepted_contract])
+            .expect("register");
+        subscribe(&accepted_router, "consumer", "producer", "notice");
+        let accepted_gap = accepted_mailbox
+            .register_gap_slot("sub", "producer", "notice")
+            .expect("register gap");
+        assert_eq!(
+            accepted_router.try_subscribe_client(ClientEventHolder {
+                connection_id: "conn".into(),
+                subscription_id: "sub".into(),
+                owner: "producer".into(),
+                name: "notice".into(),
+                subjects: BTreeSet::new(),
+                mailbox: accepted_mailbox.clone(),
+                gap: accepted_gap,
+            }),
+            EventPlaneStatus::Accepted
+        );
+        assert_eq!(
+            accepted_router.try_ingress(
+                "producer",
+                "notice",
+                &serde_json::json!({ "ok": true }),
+                Instant::now()
+            ),
+            EventPlaneStatus::Accepted
+        );
+        match accepted_mailbox.take_ready_event() {
+            Some(botster_hub_client::DaemonEvent::PackageEvent {
+                subscription_id, ..
+            }) => {
+                assert_eq!(subscription_id, "sub");
+            }
+            other => panic!("accepted mixed ingress must deliver to clients: {other:?}"),
+        }
+    }
+
+    #[test]
     fn clients_only_subscription_is_rejected() {
         let router = router();
         let mut contract = sample_contract("producer", "notice");
@@ -2438,5 +2882,130 @@ mod tests {
             }),
             EventPlaneStatus::RejectedAudience
         );
+    }
+
+    #[test]
+    fn requeue_and_complete_keep_ownership_when_router_is_busy() {
+        let router = router();
+        router
+            .try_register_contracts(vec![sample_contract("producer", "notice")])
+            .expect("register");
+        subscribe(&router, "consumer", "producer", "notice");
+        assert_eq!(
+            router.try_ingress(
+                "producer",
+                "notice",
+                &serde_json::json!({ "ok": true }),
+                Instant::now()
+            ),
+            EventPlaneStatus::Accepted
+        );
+        let before = router.snapshot().expect("before pull");
+        assert_eq!(before.queued_holders, 1);
+        let mut batch = router
+            .pull_ready_batch(8, 64 * 1024, Instant::now(), StdDuration::from_millis(8))
+            .expect("pull");
+        let delivery = batch.pop().expect("one pulled copy");
+        assert!(batch.is_empty());
+        assert_eq!(router.test_outstanding_pulls(), 1);
+        let pulled = router.snapshot().expect("after pull");
+        assert_eq!(pulled.queued_holders, 0);
+        let returned = router.test_with_inner_held(|| router.requeue_delivery(delivery));
+        let delivery = match returned {
+            Err((delivery, EventPlaneStatus::ShedBusy)) => *delivery,
+            other => panic!("busy requeue must return ownership: {other:?}"),
+        };
+        let busy = router.snapshot().expect("busy requeue");
+        assert_eq!(busy.queued_holders, 0);
+        assert_eq!(busy.global_in_flight_bytes, before.global_in_flight_bytes);
+        assert_eq!(busy.admitted_holders, before.admitted_holders);
+        assert_eq!(router.test_outstanding_pulls(), 1);
+        router
+            .requeue_delivery(delivery)
+            .unwrap_or_else(|_| panic!("requeue after release"));
+        let restored = router.snapshot().expect("restored");
+        assert_eq!(restored.queued_holders, before.queued_holders);
+        assert_eq!(
+            restored.global_in_flight_bytes,
+            before.global_in_flight_bytes
+        );
+        assert_eq!(router.test_outstanding_pulls(), 0);
+
+        let mut batch = router
+            .pull_ready_batch(8, 64 * 1024, Instant::now(), StdDuration::from_millis(8))
+            .expect("pull again");
+        let delivery = batch.pop().expect("one pulled copy");
+        let returned = router.test_with_inner_held(|| router.complete_pulled_delivery(delivery));
+        let delivery = match returned {
+            Err((delivery, EventPlaneStatus::ShedBusy)) => *delivery,
+            other => panic!("busy complete must return ownership: {other:?}"),
+        };
+        assert_eq!(router.test_outstanding_pulls(), 1);
+        router
+            .complete_pulled_delivery(delivery)
+            .unwrap_or_else(|_| panic!("complete after release"));
+        let done = router.snapshot().expect("completed");
+        assert_eq!(done.queued_holders, 0);
+        assert_eq!(done.global_in_flight_bytes, 0);
+        assert_eq!(router.test_outstanding_pulls(), 0);
+    }
+
+    #[test]
+    fn requeue_rejects_duplicate_pull_and_respects_consumer_bounds() {
+        let policy = PackageEventPlanePolicy {
+            consumer_queue_max_events: 1,
+            ..PackageEventPlanePolicy::default()
+        };
+        let router = PackageEventRouter::new(policy);
+        router
+            .try_register_contracts(vec![sample_contract("producer", "notice")])
+            .expect("register");
+        subscribe(&router, "consumer", "producer", "notice");
+        let payload = serde_json::json!({ "ok": true });
+        assert_eq!(
+            router.try_ingress("producer", "notice", &payload, Instant::now()),
+            EventPlaneStatus::Accepted
+        );
+        let mut batch = router
+            .pull_ready_batch(8, 64 * 1024, Instant::now(), StdDuration::from_millis(8))
+            .expect("pull");
+        let delivery = batch.pop().expect("one pulled copy");
+        let forged = ReadyDelivery {
+            envelope_id: delivery.envelope_id,
+            owner: delivery.owner.clone(),
+            name: delivery.name.clone(),
+            payload: delivery.payload.clone(),
+            payload_json: delivery.payload_json.clone(),
+            size: delivery.size,
+            holder: delivery.holder.clone(),
+            pull_id: delivery.pull_id,
+        };
+        router
+            .requeue_delivery(delivery)
+            .unwrap_or_else(|_| panic!("first requeue"));
+        match router.requeue_delivery(forged) {
+            Err((_, EventPlaneStatus::RejectedInvalid)) => {}
+            other => panic!("duplicate requeue must be rejected: {other:?}"),
+        }
+        assert_eq!(router.test_outstanding_pulls(), 0);
+
+        let mut batch = router
+            .pull_ready_batch(8, 64 * 1024, Instant::now(), StdDuration::from_millis(8))
+            .expect("pull again");
+        let first = batch.pop().expect("first copy");
+        assert_eq!(
+            router.try_ingress("producer", "notice", &payload, Instant::now()),
+            EventPlaneStatus::Accepted
+        );
+        match router.requeue_delivery(first) {
+            Err((delivery, EventPlaneStatus::ShedFull)) => {
+                assert_eq!(router.test_outstanding_pulls(), 1);
+                router
+                    .complete_pulled_delivery(*delivery)
+                    .unwrap_or_else(|_| panic!("complete after bound reject"));
+            }
+            other => panic!("full consumer queue must reject requeue: {other:?}"),
+        }
+        assert_eq!(router.test_outstanding_pulls(), 0);
     }
 }
