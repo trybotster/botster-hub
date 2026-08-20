@@ -8,6 +8,7 @@ use botster_hub::{MAX_OWNER_TURN_MS, MAX_READY_OPERATION_WAIT_MS};
 
 const REQUIRED_CORE_REV: &str = "7eafa470a18025895995bbedc20d34b58106a03b";
 const REQUIRED_CORE_URL: &str = "https://github.com/trybotster/botster-core.git";
+const SYNTHETIC_INVALID_CORE_REV: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 const CORE_FAMILY: &[&str] = &[
     "botster-core",
@@ -128,7 +129,7 @@ fn git_visible_hub_members_share_one_exact_core_revision() {
 #[test]
 fn git_visible_hub_members_reject_one_mixed_core_revision() {
     let mixed = format!(
-        "botster-core = {{ git = \"{REQUIRED_CORE_URL}\", rev = \"8fce2041b9fe742cb2a6df9e74cb262606672742\" }}\n\
+        "botster-core = {{ git = \"{REQUIRED_CORE_URL}\", rev = \"{SYNTHETIC_INVALID_CORE_REV}\" }}\n\
          botster-terminal-protocol = {{ git = \"{REQUIRED_CORE_URL}\", rev = \"{REQUIRED_CORE_REV}\" }}\n"
     );
     assert!(
