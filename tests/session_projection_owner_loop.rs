@@ -9,29 +9,103 @@ use botster_hub::{MAX_OWNER_TURN_MS, MAX_READY_OPERATION_WAIT_MS};
 const REQUIRED_CORE_REV: &str = "7eafa470a18025895995bbedc20d34b58106a03b";
 const REQUIRED_CORE_URL: &str = "https://github.com/trybotster/botster-core.git";
 
+const CORE_FAMILY: &[&str] = &[
+    "botster-core",
+    "botster-core-daemon",
+    "botster-terminal-protocol",
+    "botster-core-test-support",
+    "botster-terminal-ghostty",
+];
+
+const MEMBER_CORE_FAMILY: &[(&str, &[&str])] = &[
+    (
+        "Cargo.toml",
+        &[
+            "botster-core",
+            "botster-core-daemon",
+            "botster-terminal-protocol",
+            "botster-core-test-support",
+            "botster-terminal-ghostty",
+        ],
+    ),
+    (
+        "crates/botster-hub-client/Cargo.toml",
+        &["botster-terminal-protocol"],
+    ),
+    (
+        "crates/botster-hub-test-support/Cargo.toml",
+        &[
+            "botster-core",
+            "botster-terminal-protocol",
+            "botster-terminal-ghostty",
+        ],
+    ),
+];
+
+fn table_quoted(table: &str, key: &str) -> Option<String> {
+    let needle = format!("{key} = \"");
+    let rest = table.split(&needle).nth(1)?;
+    Some(rest.split('"').next()?.to_string())
+}
+
+fn parse_core_family_git_tables(manifest: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in manifest.lines() {
+        let line = line.trim();
+        for name in CORE_FAMILY {
+            let prefix = format!("{name} = {{");
+            let Some(rest) = line.strip_prefix(&prefix) else {
+                continue;
+            };
+            let Some(end) = rest.find('}') else {
+                continue;
+            };
+            out.push(((*name).to_string(), rest[..end].to_string()));
+        }
+    }
+    out
+}
+
+fn core_family_pin_errors(manifest: &str, expected: &[&str]) -> Vec<String> {
+    let decls = parse_core_family_git_tables(manifest);
+    let mut names: Vec<&str> = decls.iter().map(|(name, _)| name.as_str()).collect();
+    names.sort_unstable();
+    let mut expected_sorted = expected.to_vec();
+    expected_sorted.sort_unstable();
+    let mut errors = Vec::new();
+    if names != expected_sorted {
+        errors.push(format!(
+            "Core-family set {names:?} does not match expected {expected_sorted:?}"
+        ));
+    }
+    for (name, table) in &decls {
+        if table.contains("branch") || table.contains("tag") {
+            errors.push(format!("{name} must use rev, not branch or tag: {table}"));
+        }
+        match table_quoted(table, "git") {
+            Some(url) if url == REQUIRED_CORE_URL => {}
+            Some(url) => errors.push(format!("{name} git URL {url} is not {REQUIRED_CORE_URL}")),
+            None => errors.push(format!("{name} has no git URL")),
+        }
+        match table_quoted(table, "rev") {
+            Some(rev) if rev == REQUIRED_CORE_REV => {}
+            Some(rev) => errors.push(format!("{name} rev {rev} is not {REQUIRED_CORE_REV}")),
+            None => errors.push(format!("{name} has no rev")),
+        }
+    }
+    errors
+}
+
 #[test]
 fn git_visible_hub_members_share_one_exact_core_revision() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let manifests = [
-        root.join("Cargo.toml"),
-        root.join("crates/botster-hub-client/Cargo.toml"),
-        root.join("crates/botster-hub-test-support/Cargo.toml"),
-    ];
-    for path in manifests {
+    for (relative, expected) in MEMBER_CORE_FAMILY {
+        let path = root.join(relative);
         let text = fs::read_to_string(&path).expect("read manifest");
+        let errors = core_family_pin_errors(&text, expected);
         assert!(
-            text.contains(REQUIRED_CORE_URL),
-            "{} must use the Core .git URL",
-            path.display()
-        );
-        assert!(
-            text.contains(&format!("rev = \"{REQUIRED_CORE_REV}\"")),
-            "{} must pin Core {REQUIRED_CORE_REV}",
-            path.display()
-        );
-        assert!(
-            !text.contains("branch = \"main\""),
-            "{} must not float Core main",
+            errors.is_empty(),
+            "{} Core-family pin errors: {errors:?}",
             path.display()
         );
     }
@@ -48,6 +122,46 @@ fn git_visible_hub_members_share_one_exact_core_revision() {
     assert!(
         readme.contains("one exact `rev`"),
         "README must state the exact rev policy"
+    );
+}
+
+#[test]
+fn git_visible_hub_members_reject_one_mixed_core_revision() {
+    let mixed = format!(
+        "botster-core = {{ git = \"{REQUIRED_CORE_URL}\", rev = \"8fce2041b9fe742cb2a6df9e74cb262606672742\" }}\n\
+         botster-terminal-protocol = {{ git = \"{REQUIRED_CORE_URL}\", rev = \"{REQUIRED_CORE_REV}\" }}\n"
+    );
+    assert!(
+        mixed.contains(REQUIRED_CORE_URL)
+            && mixed.contains(&format!("rev = \"{REQUIRED_CORE_REV}\"")),
+        "mixed fixture must still contain the approved URL and rev so a whole-file contains check would pass"
+    );
+    let errors = core_family_pin_errors(&mixed, &["botster-core", "botster-terminal-protocol"]);
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("botster-core") && error.contains("rev")),
+        "mixed revision must fail the per-declaration guard: {errors:?}"
+    );
+}
+
+#[test]
+fn git_visible_hub_members_reject_one_mixed_core_url() {
+    let mixed = format!(
+        "botster-core = {{ git = \"https://github.com/trybotster/botster-core\", rev = \"{REQUIRED_CORE_REV}\" }}\n\
+         botster-terminal-protocol = {{ git = \"{REQUIRED_CORE_URL}\", rev = \"{REQUIRED_CORE_REV}\" }}\n"
+    );
+    assert!(
+        mixed.contains(REQUIRED_CORE_URL)
+            && mixed.contains(&format!("rev = \"{REQUIRED_CORE_REV}\"")),
+        "mixed fixture must still contain the approved URL and rev so a whole-file contains check would pass"
+    );
+    let errors = core_family_pin_errors(&mixed, &["botster-core", "botster-terminal-protocol"]);
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("botster-core") && error.contains("git URL")),
+        "mixed URL must fail the per-declaration guard: {errors:?}"
     );
 }
 
