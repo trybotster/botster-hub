@@ -14,13 +14,16 @@
 | Approved plan | `docs/plans/roll-core-pin-after-incremental-attach-local-runtime-gate.md` revision 2 |
 | Merge policy | direct into `main`; do not create a PR |
 | Base | `origin/main` `7a09292cd518186e0def758c823c0841ee1cacf1` |
-| Candidate Hub commit | `a111248140b14086c1eb4a4dcb0cdd5eb350a88b` |
+| Pin-roll candidate | `a111248140b14086c1eb4a4dcb0cdd5eb350a88b` |
+| Review-return candidate | `0139335f474f74c67705010887acb45dfcb91e35` |
 | Old Core pin | `8fce2041b9fe742cb2a6df9e74cb262606672742` |
 | New Core pin | `7eafa470a18025895995bbedc20d34b58106a03b` |
 | Session-type eligibility consumer | no |
 | `teardown_class_applies` | no |
 
-Routing: Botster MCP did not complete handshake in this session, so `project_pipelines_current_context` and `list_spawn_targets` were unavailable. Independent routing used the ticket/run `target_id` from the approved plan, the `origin` remote `https://github.com/trybotster/botster-hub.git`, and the ticket branch `project-pipelines/ticket_1787251447_191212`. Those three sources all name `botster-hub`. The approved plan uses the same `target_id`. Work stayed in this run worktree.
+Routing: `project_pipelines_current_context` ticket/run `target_id` is `tgt_7e208a0c76a44980a83b63af976b1f22`. `list_spawn_targets` maps that id to spawn target `botster-hub` (`trybotster/botster-hub`). The approved plan uses the same routing. Work stayed in this run worktree.
+
+Grok-native Botster MCP handshake failed at session start because the configured env passed a literal `${env:BOTSTER_SESSION_UUID}`. Implement later called `botster mcp-serve` with the real session UUID. `list_spawn_targets` in checklist `check_1787258316_786085` is that later call, not a Grok-native MCP success at the start of the first Implement visit.
 
 `git ls-remote https://github.com/trybotster/botster-core.git refs/heads/main` returned `7eafa470a18025895995bbedc20d34b58106a03b` before the pin edit. Implement pinned that exact revision.
 
@@ -90,7 +93,7 @@ Routing: Botster MCP did not complete handshake in this session, so `project_pip
 | `crates/botster-hub-test-support/build.rs` | `PROTOCOL_REV` |
 | `crates/botster-hub-test-support/src/conformance_data.rs` | `LATE_ATTACH_GHOSTSNP_CORE_PIN` |
 | `crates/botster-hub-test-support/src/lib.rs` | Provenance unit-test literal |
-| `tests/session_projection_owner_loop.rs` | `REQUIRED_CORE_REV` plus README assertions |
+| `tests/session_projection_owner_loop.rs` | `REQUIRED_CORE_REV`, README assertions, per-declaration Core-family guard, mixed-rev and mixed-URL red tests |
 | `tests/hub_daemon_lifecycle/package_event_plane.rs` | Live-proof locked Core assertion |
 | `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs` | Provenance log literal |
 | `tests/hub_daemon_lifecycle/webrtc_terminal_adapter.rs` | Provenance log literal |
@@ -117,13 +120,21 @@ The UI-contract tag is unchanged: `tag = "botster-ui-contract-v0.3.2"`. Ghostty 
 
 ## Deviations from plan
 
-None in product scope.
+None in product scope. Review finding `finding_1787259246_848243` showed the first Implement guard was weaker than the plan and README claim. This return implements that claim: every Core-family declaration is enumerated. Plan section 8 and acceptance check 6 now name the per-declaration tests.
 
 Process notes:
 
-- Botster MCP handshake failed, so Implement could not call `project_pipelines_current_context` or `list_spawn_targets`. Routing used the approved plan `target_id`, the `origin` remote, and the ticket branch. Review should re-resolve through MCP when it is available.
-- `./test.sh --locked --test hub_daemon_lifecycle_test package_event_plane` compiled and ran zero tests because the filter matches function names, not module files. Implement reran `isolated_hub_two_packages_emit_and_consume_exact_event_without_blocking_worktree` with `--exact --nocapture`. That is the plan's allowed exact-name alternative and follows [[cli test sh filters match rust test names not filenames]].
+- Grok-native Botster MCP handshake failed at session start. Later `botster mcp-serve` calls succeeded, including `list_spawn_targets` recorded on `check_1787258316_786085`.
+- Duplicate vault checklist `checklist_1787258333_250297` came from a `create_vault_checklist` timeout retry. All four items are now `skipped` as duplicates of `checklist_1787258316_886631`.
+- `./test.sh --locked --test hub_daemon_lifecycle_test package_event_plane` compiled and ran zero tests because the filter matches function names, not module files. Implement reran `isolated_hub_two_packages_emit_and_consume_exact_event_without_blocking_worktree` with `--exact --nocapture`.
 - The pipeline is Implement → Review → Verify → Merge with `merge_policy: direct`. This visit commits on the ticket branch and does not merge before Review. No PR is created.
+
+## Review return (`review_1787259246_580208`)
+
+Open findings addressed:
+
+- `finding_1787259246_848243` (product, high): `git_visible_hub_members_share_one_exact_core_revision` now enumerates every expected Core-family git table in each member manifest and requires the exact `.git` URL and `REQUIRED_CORE_REV` on each declaration. `git_visible_hub_members_reject_one_mixed_core_revision` and `git_visible_hub_members_reject_one_mixed_core_url` use fixtures that still contain the approved URL and rev, so a whole-file `contains` check would pass, and they require the per-declaration guard to fail.
+- `finding_1787259246_896862` (process, low): routing prose now distinguishes the failed Grok-native handshake from the later `botster mcp-serve` `list_spawn_targets` call. Duplicate checklist items are skipped.
 
 ## Tests and downstream proof run
 
@@ -138,7 +149,7 @@ Local toolchain: `rustc 1.92.0`, `cargo 1.92.0`. GitHub Hub CI still pins Rust `
 | 3 | `cargo fmt --all -- --check` | exit 0 |
 | 4 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0 on local `1.92.0` |
 | 5 | `./test.sh --locked` | exit 0; one clean default-concurrency run; `packages/hub-test-support` assets current; 1166 passed, 0 failed |
-| 6 | `./test.sh --locked --test session_projection_owner_loop git_visible_hub_members_share_one_exact_core_revision -- --exact` | 1 passed |
+| 6 | `./test.sh --locked --test session_projection_owner_loop git_visible_hub_members -- --exact` | 3 passed on the Review return (per-declaration guard plus mixed-rev and mixed-URL red tests) |
 | 7 | `BOTSTER_ENV=test cargo test --locked -p botster-hub-test-support` | 44 lib tests + 3 doctests passed, including `late_attach_goldens_have_distinct_content_identity_and_pinned_provenance` |
 | 8 | `./test.sh --locked --test hub_daemon_lifecycle_test isolated_hub_two_packages_emit_and_consume_exact_event_without_blocking_worktree -- --exact --nocapture` | 1 passed after candidate commit. Log: `hub_sha=a111248140b14086c1eb4a4dcb0cdd5eb350a88b core_sha=7eafa470a18025895995bbedc20d34b58106a03b`. Both binaries live under this checkout `target/` |
 | 9 | `cargo tree -e normal -i botster-terminal-protocol --locked` | one source `git+https://github.com/trybotster/botster-core.git?rev=7eafa470a18025895995bbedc20d34b58106a03b#7eafa470` |
@@ -190,4 +201,4 @@ Captured to the vault inbox:
 - Hub suite runs require an explicit session-worker prebuild before `./test.sh --locked`, even though `ensure_session_worker_binary` exists.
 - When a consumer ticket branch already carries the pins that failed, downstream proof must target that branch, not the consumer `main`.
 
-Local-versus-CI toolchain drift remains a capture candidate. This visit did not add a new note for it because the report already records the CI run id and toolchain.
+This Review return adds no new inbox note. The mixed-pin guard is the charter claim already named by [[Git-consumed Hub members pin Core protocol by exact revision]] and [[Cargo Git URL and selector form are part of crate identity]].
