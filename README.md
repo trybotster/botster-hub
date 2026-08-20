@@ -1110,16 +1110,22 @@ Schema and consistency posture are documented in
 
 ## Dependency policy
 
-During development, this repo tracks `botster-core` from the `main` branch
-declared in `Cargo.toml`, with the resolved git revision committed in
-`Cargo.lock` for reproducibility. Refresh the lockfile intentionally when hub
-work needs current core behavior; stale lock drift is not a separate pinning
-policy.
+Git-visible Hub members (`botster-hub`, `crates/botster-hub-client`, and
+`crates/botster-hub-test-support`) declare every Core-family dependency
+(`botster-core`, `botster-core-daemon`, `botster-terminal-protocol`,
+`botster-core-test-support`, and `botster-terminal-ghostty`) with the
+`https://github.com/trybotster/botster-core.git` URL and one exact `rev`.
+`Cargo.lock` records the same revision. Downstream Git consumers of
+`botster-hub-client` resolve the member manifest, not the Hub lockfile, so the
+manifest pin is the contract and no member may float a Core branch.
 
-Release builds should move to a deliberate `botster-core` tag or revision pin
-before shipping. Local `path` overrides are not the repo default and should stay
-outside committed dependency policy unless the repo grows an explicit override
-workflow.
+A Core pin roll updates every member manifest, `Cargo.lock`,
+`crates/botster-hub-test-support/build.rs`, and the revision literals in the
+provenance tests in one commit. `tests/session_projection_owner_loop.rs`
+rejects a member that uses a different URL form, a different revision, or a
+`branch = "main"` selector. Local `path` overrides stay outside committed
+dependency policy; the only committed override is the root `[patch]` entry for
+`botster-ui-contract`.
 
 The production local session path uses `botster-core-daemon` through typed Rust
 APIs and configures the sibling `botster-session-worker` executable for
