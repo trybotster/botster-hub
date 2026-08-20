@@ -166,7 +166,7 @@ Dependency-policy prose and its guard:
 | File | Line(s) | Change |
 | --- | --- | --- |
 | `README.md` | `## Dependency policy` section (lines 1111-1121 at base) | Replace the two paragraphs with the text below |
-| `tests/session_projection_owner_loop.rs` | inside `git_visible_hub_members_share_one_exact_core_revision` | Read `README.md`; assert it does not contain ``tracks `botster-core` from the `main` branch``; assert it contains ``one exact `rev` `` |
+| `tests/session_projection_owner_loop.rs` | inside `git_visible_hub_members_share_one_exact_core_revision` | Enumerate every Core-family git declaration in each member manifest; require the exact `.git` URL and `REQUIRED_CORE_REV` on each; reject a mixed URL or mixed rev while another declaration stays compliant; read `README.md`; assert it does not contain ``tracks `botster-core` from the `main` branch``; assert it contains ``one exact `rev` `` |
 
 Replacement README text (exact):
 
@@ -232,7 +232,7 @@ Repository gates (Hub charter and CI), run from the rolled worktree **in this or
 | 3 | `cargo fmt --all -- --check` | exit 0 |
 | 4 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0 on local `1.92.0` |
 | 5 | `./test.sh --locked` | one clean default-concurrency run; includes `node packages/hub-test-support/scripts/sync-assets.mjs --check` |
-| 6 | `./test.sh --locked --test session_projection_owner_loop git_visible_hub_members_share_one_exact_core_revision -- --exact` | 1 passed: new revision in all three manifests and the lock, no `branch = "main"`, README has no ``tracks `botster-core` from the `main` branch`` sentence and contains ``one exact `rev` `` |
+| 6 | `./test.sh --locked --test session_projection_owner_loop git_visible_hub_members -- --exact` | 3 passed: every Core-family declaration in the three member manifests uses the exact `.git` URL and `REQUIRED_CORE_REV`; mixed-rev and mixed-URL fixtures fail while a whole-file `contains` check would pass; README has no ``tracks `botster-core` from the `main` branch`` sentence and contains ``one exact `rev` `` |
 | 7 | `BOTSTER_ENV=test cargo test --locked -p botster-hub-test-support` | lib tests pass, including the `late_attach_ghostsnp_provenance` assertions with the new pin and unchanged fixture lengths and SHA-256 values |
 | 8 | `./test.sh --locked --test hub_daemon_lifecycle_test package_event_plane -- --nocapture` (or the exact live event-plane test names in that module) | passes; log line shows `core_sha=7eafa470a18025895995bbedc20d34b58106a03b` |
 | 9 | `cargo tree -e normal -i botster-terminal-protocol --locked` | exactly one source `git+https://github.com/trybotster/botster-core.git?rev=7eafa470a18025895995bbedc20d34b58106a03b#7eafa470a18025895995bbedc20d34b58106a03b` |
