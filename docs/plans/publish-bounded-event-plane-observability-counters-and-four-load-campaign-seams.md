@@ -2,6 +2,9 @@
 
 - Ticket: `ticket_1787267568_492780`
 - Run: `run_1787278338_832165`
+- Revision: **13**. Revision 13 answers the three findings in `review_1787292035_194663`: repeated
+  replacement had no unambiguous gate rule, the public age observation DTO was unspecified, and the loom
+  gate was not executable from the planned change set.
 - Revision: **12**. Revision 12 answers the four findings in `review_1787291409_401120`: the opening RMW
   needed `AcqRel` not `Release`, `Envelope` needed generation-specific list identity, the publication gate
   had to move onto the cell so the lock-free snapshot could read it, and the affected-file table still
@@ -34,6 +37,14 @@
 - Target id: `tgt_7e208a0c76a44980a83b63af976b1f22`
 - Base: `origin/main` at `b3b54f1` ("Merge ticket: Roll Core pin after IncrementalAttach local-runtime gate")
 - Core pin (verified in `Cargo.toml:24-26,43-44`): `7eafa470a18025895995bbedc20d34b58106a03b`
+
+## 0. Response to Plan Review `review_1787292035_194663` (revision 13)
+
+| Finding | Severity | Response |
+| --- | --- | --- |
+| `finding_1787292035_541858` — repeated replacement has no current-gate decrement rule | blocker | **Accepted.** "Decrement the successor" is ambiguous once three generations overlap: with N replaced by N+1 then N+2 before N drains, N+1 is already retired and write-closed, so a late N retirement aimed at its immediate successor would leave N+2's gate permanently open and N+2 would never publish an age. S1c now states the rule exactly: `ProducerOccupancy` carries `outstanding_prior`, a replacement seeds the **new current cell's** gate from the total live envelopes across **all** prior generations, and a retirement whose `envelope.producer_age_ref.generation` differs from the current generation decrements `outstanding_prior` and the **current** cell only. Both are `O(1)`. New AC20b runs N → N+1 → N+2 with interleaved late retirements and is red against the revision 12 rule. |
+| `finding_1787292036_111963` — the public age observation DTO remains undefined | blocker | **Accepted; this was a public client-contract decision the charter assigns to Plan and I had left to Implement.** New section S6a specifies `DaemonQueueAgeObservation`, `DaemonQueueKind`, and `DaemonQueueAgeState` with the three decided states distinct, identity keys, producer generation, microsecond units, `Option` fields so generated TypeScript emits optional properties, and a `#[serde(other)] Unknown` arm for forward tolerance — because `#[non_exhaustive]` alone does **not** make serde accept an unseen variant. AC1 and AC10 gain exact wire cases for all three states, the missing-cell row, and the unknown-state case. |
+| `finding_1787292036_587759` — the loom model check is not wired into repository scope | high | **Accepted.** I named a gate that could not run: `loom` appears in no manifest and no lockfile. AC19 case 0 now specifies a `[target.'cfg(loom)'.dev-dependencies]` entry that leaves the normal build untouched, names the command `RUSTFLAGS="--cfg loom" cargo test --lib queue_age_model`, adds it to AC9 as command 5, and adds `Cargo.toml` and `Cargo.lock` to the affected-file table. **I did not verify the current `loom` version from the registry**, so Implement pins it and records the exact version; if the locked-build policy blocks adding it, Implement must say the ordering claim is unproven rather than dropping case 0 quietly. |
 
 ## 0. Response to Plan Review `review_1787291409_401120` (revision 12)
 
@@ -415,12 +426,27 @@ Revision 11 removes the shared-cell reuse entirely:
   `generation` field is immutable, so a sample can always be attributed to exactly one generation.
 - **The previous generation's cell is marked retired on the same control path** that admits the new one.
   A retired cell reports **no usable age** and is never written again.
-- **The new generation reports `indeterminate` until every old-generation holder has retired.** The count
-  of surviving prior holders lives in `QueueAgeMetric.gate` on the **new** generation's cell, seeded at
-  replacement and decremented in `retire_holder_locked`, both inside the two-phase bracket. While `gate`
-  is above zero the reader reports indeterminate; when it reaches zero the new generation reports its own
-  age normally. It is on the cell rather than on `ProducerOccupancy` precisely so the lock-free snapshot
-  can read it (S1b).
+- **The new generation reports `indeterminate` until every prior-generation holder has retired.** The gate
+  lives in `QueueAgeMetric.gate` on the cell, not on `ProducerOccupancy`, precisely so the lock-free
+  snapshot can read it (S1b). While `gate` is above zero the reader reports indeterminate; at zero the
+  generation reports its own age normally.
+
+  **The gate counts *all* prior generations, and only the current cell is ever decremented** — corrected in
+  revision 13 for `finding_1787292035_541858`. Revision 12 said a retiring prior envelope decrements "the
+  successor" cell, which is ambiguous once three generations overlap. With N replaced by N+1 and then N+2
+  before N drains, N+1 is already retired and write-closed, so decrementing the immediate successor would
+  leave N+2's gate permanently above zero and N+2 would never publish an age. The exact rules:
+
+  - `ProducerOccupancy` carries `outstanding_prior: usize`, the number of live envelopes whose generation
+    is not the current one.
+  - **At replacement**, `outstanding_prior += live(previous_current_list)`, and the **new current cell's**
+    `gate` is seeded to that updated total — every live prior envelope across **all** prior generations,
+    not just the immediately preceding one.
+  - **At retirement**, when `envelope.producer_age_ref.generation != current_generation`, decrement
+    `outstanding_prior` and the **current** cell's `gate`. Never a retired cell: retired cells are
+    write-closed and receive nothing.
+  - Both operations are `O(1)`, and the seed reads a single running total rather than summing over prior
+    lists.
 - **No old timestamp can ever update the new cell**, because old slots belong to the old generation's list
   and the old cell, and the old cell is retired and write-closed.
 
@@ -673,6 +699,73 @@ Charter: `[[botster-hub-client-playbook]]` owns this surface. Decisions made **a
      operation-specific requirement is introduced, because the field is a status projection rather than a
      capability.
 
+**S6a. The public age observation DTO (new in revision 13 for `finding_1787292036_111963`).**
+
+Revision 12 defined only the top-level `DaemonStatus.observability` field. The three states the human
+decision created — usable, no usable age, and explicit indeterminate — had no public shape, so AC10 could
+not prove wire compatibility or generated optionality, and Implement would have had to settle a public
+client-contract question that `[[botster-hub-client-playbook]]` assigns to Plan. Settled here.
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct DaemonQueueAgeObservation {
+    pub kind: DaemonQueueKind,
+    /// Producer owner, consumer plugin key, or client connection id.
+    pub identity: String,
+    /// Present only for `Producer`; identifies which generation the sample belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer_generation: Option<u64>,
+    pub state: DaemonQueueAgeState,
+    /// Present only when `state == Usable`. Microseconds, matching the owner-turn fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_age_us: Option<u64>,
+    /// The queue count observed in the same bracket as the age.
+    pub queue_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum DaemonQueueKind { Producer, Consumer, ClientMailbox }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum DaemonQueueAgeState {
+    /// A sample the reader validated; `oldest_age_us` is present.
+    Usable,
+    /// The queue was observed with `count == 0`. Not a zero age.
+    Empty,
+    /// The bracket was unstable, the cell was latched invalid, the generation gate was open, or the
+    /// cell was missing. Never a value.
+    Indeterminate,
+    /// Forward tolerance: an older client deserializing a newer state lands here.
+    #[serde(other)]
+    Unknown,
+}
+```
+
+`DaemonObservabilityCounters` gains
+`#[serde(default, skip_serializing_if = "Vec::is_empty")] pub queue_ages: Vec<DaemonQueueAgeObservation>`.
+
+**Rules that travel with the contract:**
+
+- **Three states are distinct and none substitutes for another.** `Empty` is not a zero age;
+  `Indeterminate` is not an omitted row. A missing cell is published as an `Indeterminate` row for that
+  identity, per S1f.
+- **`Unknown` is treated exactly as `Indeterminate`** by any consumer. `#[non_exhaustive]` alone does not
+  make serde tolerant of an unseen variant, so the `#[serde(other)]` arm is what actually keeps an older
+  client from failing to deserialize a newer Hub. This is the forward-evolution rule.
+- **Units are microseconds**, matching `last_owner_turn_us` and the ready-wait fields, so no reader has to
+  track two units in one payload.
+- **`oldest_age_us` and `producer_generation` are `Option`**, so generated TypeScript must emit
+  `oldest_age_us?: number` and `producer_generation?: number`, per
+  `[[generated typescript dtos must encode serde field optionality]]`. Generated TypeScript for `state` is
+  the snake_case union plus a permissive arm for unknown values.
+- **Both structs and both enums are `#[non_exhaustive]`**, so later additive fields and variants cost
+  external Rust consumers nothing beyond the one-time boundary already accepted in S6.
+
 **S7. Four `BOTSTER_ENV=test` gated seams (ticket item 7).** One `hub_test_seams()` reader placed beside
 `core_daemon_config` in `src/runtime.rs`, in the `BOTSTER_HUB_TEST_WORKER_EGRESS_CAPACITY` style at
 `:4618`. Each value has a pure `*_from(env, raw)` helper so a negative test can prove inertness in the
@@ -800,6 +893,7 @@ registry and source check before writing either literal.
 | --- | --- |
 | `src/event_plane_counters.rs` (new) | `EventPlaneCounters`, fixed shed-by-reason array, fixed-bucket histograms, `QueueAgeMetric` with the two-phase odd/even `version`, `gate`, immutable `generation`, and `invalid` latch, the bounded consistency read with its `AcqRel` opening RMW and `Acquire` fence, the enumeration-only registry keyed by identity and generation with explicit retirement, and the snapshot type including its indeterminate representation |
 | `src/lib.rs` | register the new module and re-export the snapshot type |
+| `Cargo.toml` and `Cargo.lock` | add the `[target.'cfg(loom)'.dev-dependencies]` `loom` entry for AC19 case 0, pinned by Implement and outside the normal build |
 | `src/package_event_router.rs` | shed by typed reason, admission and delivery attempts, latencies, T2, producer age lists keyed by `(owner, generation)` and created at the S1g admission commit point, `Envelope.producer_age_ref: ProducerAgeRef { generation, slot }` replacing `producer_slot`, a per-list `live` count with cleanup when a non-current generation drains, a **fresh** `Arc<QueueAgeMetric>` per generation on the producer entry and consumer queue with the predecessor **retired and write-closed** (never reset in place), `gate` seeded at replacement and decremented in `retire_holder_locked` inside the two-phase bracket, registry retirement recorded explicitly at `apply_unload`, `unsubscribe`, and connection cleanup with an admission-time prune and rebind, and a diagnostic failure that latches `invalid` without changing acceptance |
 | `src/daemon_event_subscriptions.rs` | overflow gap count, T3 mailbox-expiry count, mailbox age cell, cell removal on connection cleanup |
 | `src/daemon_maintenance.rs` | T1 typed completion counting; seam 3 for the two `timeout_ms` sites |
@@ -854,6 +948,15 @@ registry and source check before writing either literal.
   holders survive unload, so an old head age can be published as the new generation's. S1c gives each
   generation its own immutable-generation cell and reports indeterminate until prior holders drain.
   AC20 is the control.
+- **R23 (new in revision 13).** A relative pointer like "the successor" breaks once more than two instances
+  overlap. The gate rule now names the **current** cell absolutely and counts all prior generations.
+  AC20b is the control.
+- **R24 (new in revision 13).** `#[non_exhaustive]` does not make serde tolerant of an unknown enum
+  variant; only a `#[serde(other)]` arm does. Without it a newer Hub state would fail an older client's
+  deserialization outright. AC10 asserts the unknown-state case.
+- **R25 (new in revision 13).** An acceptance gate that names a tool absent from every manifest is not
+  executable. AC19 case 0 now carries its dependency, its command, and an explicit fallback that reports
+  the ordering claim as unproven rather than dropping it.
 - **R22 (new in revision 11).** A diagnostic failure with no persistent state lets later stable-looking
   samples publish an age computed from an incomplete list. S1f latches `invalid` until the generation ends.
   AC21 is the control.
@@ -901,11 +1004,13 @@ Every ticket acceptance line maps to a check. AC2, AC3, AC4, AC6, and AC11 are r
 record the failing output **before** the change, per
 `[[test names do not prove their bodies can fail on the named claim]]`.
 
-- **AC1 — public readability.** One test drives `DaemonRequest::Status` through the production daemon path
-  and asserts every signal is present and non-absent: queue count and bytes, oldest age per producer queue,
-  per consumer queue, and per client mailbox, admission latency, delivery latency, shed by typed reason,
-  gap, resync, pressure, T1 through T4 as four distinct values, owner-turn duration, and
-  ready-operation wait.
+- **AC1 — public readability (extended in revision 13 for the S6a DTO).** One test drives
+  `DaemonRequest::Status` through the production daemon path and asserts every signal is present and
+  non-absent: queue count and bytes, oldest age per producer queue, per consumer queue, and per client
+  mailbox, admission latency, delivery latency, shed by typed reason, gap, resync, pressure, T1 through T4
+  as four distinct values, owner-turn duration, and ready-operation wait. Beyond presence, assert each age
+  row carries its `kind` and `identity`, that producer rows carry `producer_generation`, and that a
+  producer row under an open generation gate reports `indeterminate` rather than being omitted.
 - **AC2 — T1, red first.** A focused test uses seams 3 and 4 to make a package-event handler exceed
   `timeout_ms`, then asserts the `TimedOut` counter incremented by exactly one and every other
   `PluginInvocationFailureKind` counter stayed at zero. A second case makes a handler fail without a
@@ -953,10 +1058,19 @@ record the failing output **before** the change, per
   3. Prebuild `botster-session-worker` with locked commands, then `./test.sh --locked` with one test result
      tally and zero failures, per `[[Hub suite runs prebuild the session worker before the locked test wrapper]]`.
   4. `script/run-lifecycle-suite` returns `verdict=clean`.
+  5. `RUSTFLAGS="--cfg loom" cargo test --lib queue_age_model` for AC19 case 0. It is a separate command
+     because the `cfg(loom)` dev-dependency is deliberately outside the normal build, so `./test.sh
+     --locked` neither compiles nor runs it.
 - **AC10 — client DTO proof (new in revision 2).** Four separate proofs, per
   `[[botster-hub-client-playbook]]`'s gate to separate serde wire proof from downstream source proof:
   1. **Wire proof.** A serde test shows an old-shaped `DaemonStatus` JSON without the new key still
      deserializes, and that an empty `observability` value is omitted from the serialized frame.
+     **Extended in revision 13 for the S6a DTO**: assert the exact wire form of all three age states — a
+     `usable` row carrying `oldest_age_us` and, for producers, `producer_generation`; an `empty` row with
+     both fields **absent** rather than zero; and an `indeterminate` row with both absent. Assert a
+     missing cell appears as an `indeterminate` row rather than an omitted one. Assert that an unknown
+     future `state` string deserializes to `Unknown` through the `#[serde(other)]` arm rather than
+     failing, which is the forward-evolution rule that `#[non_exhaustive]` alone does not provide.
   2. **Protocol-versus-revision proof.** Assert exact `PROTOCOL_VERSION` equality is unaffected, and that a
      client pinned to minimum revision 36 accepts a Hub reporting 46, per
      `[[daemon event shape changes bump conformance fixture revision not protocol version]]`.
@@ -999,6 +1113,23 @@ record the failing output **before** the change, per
   **deterministic interleavings** rather than timing luck:
   0. A **`loom` model check** of the writer and reader protocol, which is the only way to substantiate an
      ordering claim; deterministic scheduling tests cannot. It must fail against a `Release` opening RMW.
+     **Scope and command, added in revision 13 for `finding_1787292036_587759`** — revision 12 named this
+     gate without making it executable. `loom` is absent from `Cargo.toml`, every crate manifest, and
+     `Cargo.lock`. Implement therefore adds a **cfg-gated dev-dependency** so the normal build and the
+     normal test run are untouched:
+
+     ```toml
+     [target.'cfg(loom)'.dev-dependencies]
+     loom = "<current release, pinned by Implement>"
+     ```
+
+     and runs it as `RUSTFLAGS="--cfg loom" cargo test --lib queue_age_model`, listed under AC9 as a
+     separate command rather than folded into `./test.sh --locked`. `Cargo.toml` and `Cargo.lock` are
+     added to the affected-file table. **I did not verify the current `loom` version number from the
+     registry**, so Implement pins the current release and records the exact version in its report; if
+     `loom` cannot be added under the locked-build policy, Implement must report that and fall back to the
+     deterministic interleavings alone, saying plainly that the ordering claim is then unproven rather
+     than silently dropping case 0.
   1. A stable even version with `count > 0` and `gate == 0` yields a usable age tagged with that cell's
      generation.
   2. `count == 0` yields **no usable age**, never a zero age.
@@ -1011,6 +1142,15 @@ record the failing output **before** the change, per
   7. The reader takes no lock, retries at most once, and allocates nothing per sample.
   Run interleavings **before, during, and after a generation change**. Implement must show AC19 red against
   the revision 10 trailing-only stamp and red against a naive count-only bracket.
+- **AC20b — repeated replacement drains the current gate, red first (new in revision 13).** The control for
+  `finding_1787292035_541858`, which AC20's single replacement could not detect. Admit generation N, emit
+  events Core admits as Background holders, replace with N+1 while N is still live, then replace with N+2
+  **before N drains**. Assert that N+2's `gate` was seeded from the live envelopes of **both** N and N+1,
+  that a late N retirement decrements **N+2's** gate and not retired N+1's, that `outstanding_prior` and
+  the current gate stay equal, and that N+2 begins publishing its own age exactly when the last prior
+  envelope from either generation retires. Interleave the late retirements across the two replacements.
+  Implement must show this red against the revision 12 "decrement the successor" rule, under which N+2's
+  gate never reaches zero and N+2 never publishes an age.
 - **AC20 — no age from a prior generation, red first (new in revision 11).** The control for
   `finding_1787290799_555137`. Admit generation N, emit events Core admits as Background holders, then
   replace with generation N+1 while old holders remain live. Assert that generation N+1 reports
