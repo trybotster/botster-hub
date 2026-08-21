@@ -108,11 +108,7 @@ impl CompiledEventSchema {
             .get("maxLength")
             .and_then(Value::as_u64)
             .unwrap_or(u64::MAX);
-        if min_len > max_len {
-            return false;
-        }
-        self.validate(&Value::String("x".repeat(min_len as usize)))
-            .is_ok()
+        min_len <= max_len
     }
 
     #[must_use]
@@ -446,6 +442,19 @@ mod tests {
             !CompiledEventSchema::compile(&serde_json::json!({ "type": "number" }))
                 .expect("number type")
                 .accepts_some_string()
+        );
+        assert!(
+            CompiledEventSchema::compile(&serde_json::json!({ "minLength": u64::MAX }))
+                .expect("u64::MAX minLength compiles")
+                .accepts_some_string()
+        );
+        assert!(
+            !CompiledEventSchema::compile(&serde_json::json!({
+                "minLength": u64::MAX,
+                "maxLength": u64::MAX - 1
+            }))
+            .expect("contradictory u64::MAX lengths compile")
+            .accepts_some_string()
         );
     }
 }

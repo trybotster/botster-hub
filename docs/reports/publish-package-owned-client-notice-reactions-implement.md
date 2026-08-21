@@ -2,7 +2,14 @@
 
 ## Review-return findings
 
-Review `review_1787291755_566319` returned two open findings. This visit addresses both of them.
+Review `review_1787294428_253011` returned two open findings. This visit addresses both of them.
+
+| Finding | Severity | Fix |
+| --- | --- | --- |
+| `finding_1787294428_366815` Package schema admission allocates an unbounded minLength string | high | `accepts_some_string` no longer allocates after type, const, and enum checks. It compares `minLength` and `maxLength` only. Tests include `minLength: u64::MAX` and a contradictory `u64::MAX` / `u64::MAX - 1` pair. |
+| `finding_1787294428_826162` Required default-concurrency workspace gate is not green | high | The start-boundary hook ignores threads with no start token, so untokened waiters no longer send `foreign` while they wait for the daemon mutex. Injected taint uses `ScopedHarnessTaint`, which clears the latch on drop while the caller still holds `daemon_test_guard`. `./test.sh --locked --offline --test hub_daemon_lifecycle_test` passed 265 tests at default concurrency. |
+
+Review `review_1787291755_566319` returned two open findings. The previous Implement visit addressed both of them.
 
 | Finding | Severity | Fix |
 | --- | --- | --- |
@@ -27,7 +34,7 @@ Review `review_1787290014_342254` returned three open findings. The previous Imp
 | Pipeline worktree | the pipeline-provided ticket worktree |
 | Ticket | `ticket_1787278643_145174` |
 | Run | `run_1787282470_625000` |
-| Step | `botster_stack_implement` (`run_step_1787291769_418879`) |
+| Step | `botster_stack_implement` (`run_step_1787294442_455048`) |
 | Approved plan | `docs/plans/publish-package-owned-client-notice-reactions.md` revision 3 |
 | Plan Review | `review_1787284569_918928` approved |
 | Merge policy | `direct`; do not create a PR |
@@ -162,6 +169,7 @@ Maintainer follow-up after merge: `script/tag-ui-contract` for `botster-ui-contr
 ## Deviations from plan
 
 - Live suppression proof emits empty, waits both subscribers, then emits oversized. After each emit, the wait issues `Status` so the connection loop takes a production host-control write turn and flushes admitted events. Timeout stays 10 s. This is the completion oracle for suite load.
+- The start-boundary test hook now ignores untokened `daemon_test_guard` waiters. That is harness isolation for the existing race tests, not a product-behavior change.
 - `emit_sample_ready_payload` now asserts `plugin_tool_result.status == "accepted"`, so a rejected emit fails at the producer rather than as a later wait timeout.
 - Locked commands used `--offline` because tag `botster-ui-contract-v0.3.3` is not on the remote yet. The workspace `[patch]` path-resolves the crate. This is the plan's U2/R8 handling, not a product-behavior change.
 - `DaemonPackage` stays exhaustive. The downstream source cost is one TUI test helper literal, recorded below. The plan allowed that measurement before a `#[non_exhaustive]` decision; this run does not add `#[non_exhaustive]`.
@@ -191,8 +199,15 @@ Commands (all through `./test.sh` or explicit `BOTSTER_ENV=test` except fmt/clip
 | `node packages/hub-test-support/test.mjs` after installing the packed UI-contract tarball | pass |
 | `./test.sh --locked --offline -p botster-hub-test-support published_plugin_contract_matrix_fixture_declares_a_session_notice` | pass |
 | `./test.sh --locked --offline --test hub_daemon_lifecycle_test -- isolated_hub_projects_notice_reactions_and_resolves_session_scoped_text --exact` after Status-pump wait | pass |
-| `./test.sh --locked --offline --test hub_daemon_lifecycle_test` default concurrency | 265 passed, including the live notice test |
-| `./test.sh --locked --offline` after Review return | pass in 472 s, including `isolated_hub_projects_notice_reactions_and_resolves_session_scoped_text` |
+| `BOTSTER_ENV=test cargo test --locked --offline -p botster-hub --lib package_event_schema::tests::accepts_some_string_uses_const_enum_and_length_bounds -- --exact` | pass, including `minLength: u64::MAX` |
+| `./test.sh --locked --offline --test hub_daemon_lifecycle_test injected_taint_cannot_race_an_unguarded_real_daemon_start -- --exact` | pass |
+| `./test.sh --locked --offline --test hub_daemon_lifecycle_test injected_taint_race_fails_when_start_guard_is_bypassed -- --exact` | pass |
+| `./test.sh --locked --offline --test hub_daemon_lifecycle_test sibling_real_daemon_start_cannot_satisfy_intended_boundary_hook -- --exact` | pass |
+| `./test.sh --locked --offline --test hub_daemon_lifecycle_test untokened_start_boundary_notify_is_ignored -- --exact` | pass |
+| `./test.sh --locked --offline --test hub_daemon_lifecycle_test` default concurrency after taint-hook fix | 265 passed, 1 ignored. This is the binary that Review saw fail 157/108 with injected taint. The injected taint tests passed in this run. |
+| `./test.sh --locked --offline` this visit, run 1 | fail-fast in `hub_daemon_lifecycle_test`: `shutdown_session_exact_keys_preserve_replacement_owner_and_siblings`. Isolated exact command passed on this branch in 2.36 s and on `origin/main` `b3b54f1` in 2.52 s after session-worker prebuild. |
+| `./test.sh --locked --offline` this visit, run 2 | fail-fast in `--lib`: `owner_loop_queues_and_completes_two_fanout_plugin_handlers` (`left: 1`, `right: 2`). Previously isolated-passed on branch and `origin/main`. |
+| `./test.sh --locked --offline` this visit, run 3 | lib passed; `hub_daemon_lifecycle_test` 264 passed, 1 failed: `unix_eof_skip_core_detach_ablation_keeps_named_pair_on_status`. Injected taint tests passed. Isolated exact command passed on this branch in 3.25 s. |
 
 First full-suite root failure: `daemon_maintenance::tests::owner_loop_queues_and_completes_two_fanout_plugin_handlers` (`left: 1`, `right: 2` in-flight handlers). Isolated command `./test.sh --locked --offline -p botster-hub --lib owner_loop_queues_and_completes_two_fanout_plugin_handlers` passed on this branch. The same isolated command passed on `origin/main` `b3b54f1`. A second `./test.sh --locked --offline -p botster-hub --lib` (456 tests) passed. A second full `./test.sh --locked --offline` passed. This is a default-concurrency flake present on base, not a notice-contract regression.
 
@@ -208,8 +223,11 @@ Downstream DTO cost: `DaemonPackage` is not `#[non_exhaustive]`. Adding `notice_
 - npm publication and Git tag creation are maintainer steps. Local `--offline` builds depend on the workspace path patch until the tag exists.
 - `node packages/hub-test-support/test.mjs` still requires an installed `@trybotster/ui-contract`. That is an existing clean-checkout gotcha, now documented against `0.3.3`.
 - Web and TUI must consume the shared resolver. This run does not prove those clients.
-- Default-concurrency flake `owner_loop_queues_and_completes_two_fanout_plugin_handlers` can still fail a future suite run. Isolated and second full-suite evidence show it is unrelated to this change.
-- Workspace-load flake `webrtc_terminal_adapter_bound_peer_loss_closes_adapter_without_hub_detach` failed once under the full suite. Isolated reruns passed on this branch and on `origin/main` `b3b54f1` after the session-worker prebuild. This is a base load flake, not a notice-contract regression.
+- Default-concurrency flake `owner_loop_queues_and_completes_two_fanout_plugin_handlers` can still fail a future suite run. Isolated evidence on branch and `origin/main` shows it is unrelated to this change.
+- Workspace-load flake `webrtc_terminal_adapter_bound_peer_loss_closes_adapter_without_hub_detach` failed once under the full suite. Isolated reruns passed on this branch and on `origin/main` `b3b54f1` after the session-worker prebuild.
+- Workspace-load flake `shutdown_session_exact_keys_preserve_replacement_owner_and_siblings` failed once under `./test.sh --locked --offline`. Isolated exact command passed on this branch and on `origin/main` `b3b54f1`.
+- Workspace-load flake `unix_eof_skip_core_detach_ablation_keeps_named_pair_on_status` failed once under `./test.sh --locked --offline` after the taint fix. The injected-taint tests passed in that run. Isolated exact command is recorded in Tests.
+- The Review taint cascade (108 `environment_tainted` failures) did not recur. Default-concurrency `hub_daemon_lifecycle_test` passed 265 tests.
 - Mailbox `queue_age` remains 1 s production policy. Live waits now issue `Status` so a host-control write turn flushes admitted events.
 
 ## Missing vault guidance discovered

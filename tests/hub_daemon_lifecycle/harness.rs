@@ -180,6 +180,22 @@ pub(crate) fn reset_harness_taint_after_proof() {
         .unwrap_or_else(|error| error.into_inner()) = None;
 }
 
+/// Clears injected taint on drop while the caller still holds `daemon_test_guard`.
+pub(crate) struct ScopedHarnessTaint;
+
+impl ScopedHarnessTaint {
+    pub(crate) fn inject(evidence: impl Into<String>) -> Self {
+        record_harness_taint(evidence);
+        Self
+    }
+}
+
+impl Drop for ScopedHarnessTaint {
+    fn drop(&mut self) {
+        reset_harness_taint_after_proof();
+    }
+}
+
 pub(crate) fn format_harness_budget_expired(
     kind: &str,
     budget: Duration,
