@@ -6,10 +6,11 @@
 | --- | --- |
 | Target repository | `botster-hub` (`trybotster/botster-hub`) |
 | `target_id` | `tgt_7e208a0c76a44980a83b63af976b1f22` |
-| Pipeline worktree | `/Users/jasonconigliari/botster-sessions/trybotster-botster-hub-project-pipelines-ticket_1787267568_492780` |
+| Pipeline worktree | Hub run worktree for `ticket_1787267568_492780` |
 | Ticket | `ticket_1787267568_492780` |
 | Run | `run_1787278338_832165` |
-| Step | `botster_stack_implement` (`run_step_1787324301_257051`) |
+| Step | `botster_stack_implement` (`run_step_1787328774_416743`) |
+| Review return | `review_1787328763_940695` (`changes_required`) |
 | Approved plan | `docs/plans/publish-bounded-event-plane-observability-counters-and-four-load-campaign-seams.md` revision 15 |
 | Merge policy | `direct` into `main`; do not create a PR |
 | Implement commit | `6814d4b2ca6b8ec6e127108faf567c95f0047b7f` |
@@ -110,6 +111,8 @@ Botster MCP was not available in this session (`BOTSTER_SESSION_UUID` was not ex
 - `README.md`
 - `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs`
 - `tests/hub_daemon_lifecycle/webrtc_terminal_adapter.rs`
+- `tests/hub_lua_runtime_test.rs`
+- `docs/plans/publish-bounded-event-plane-observability-counters-and-four-load-campaign-seams.md` (path-neutral scrub only)
 - `docs/reports/publish-bounded-event-plane-observability-counters-and-four-load-campaign-seams-implement.md`
 
 ## Ownership boundaries preserved
@@ -126,13 +129,26 @@ Botster MCP was not available in this session (`BOTSTER_SESSION_UUID` was not ex
 - Consumer saturation campaign `ticket_1786663585_879846` remains separately routed.
 - TUI and Web source upgrades are consumer work. AC10 measured them from this run and did not edit those repositories.
 
+## Review findings addressed
+
+| Finding | Severity | Resolution |
+| --- | --- | --- |
+| `finding_1787328763_312074` mailbox age stale / unbounded | high | `take_ready_event`, expiry, unsubscribe, and connection cleanup now publish or retire mailbox age. Churn test prunes retired rows on the next live subscribe. |
+| `finding_1787328763_424511` consumer oldest age uses `now` | high | `update_consumer_age` reads the front envelope timestamp after enqueue, expiry, pull, byte-limit requeue, and delivery requeue. |
+| `finding_1787328763_203686` per-invocation env reads | high | `HubRuntime` reads the four seams once. `LuaPluginRuntime` stores `event_handler_hold_ms` and does not reread the environment. |
+| `finding_1787328763_554792` missing live T1/T4 proofs | high | `apply_plugin_completion` distinguishes `TimedOut` from `HandlerFailed` on an in-flight package-event. T4 now passes `HubRuntime` and asserts `stalled_write_timeouts == 1` and `stalled_writes == 2`. |
+| `finding_1787328763_519287` TUI/Web compile probe | high | Disposable TUI helper adds `observability`. After that field, remaining TUI errors are `botster-ui-contract` 0.3.2 versus 0.3.3, not a missing status field. Web drift against the new artifact fails as expected. Web `typecheck` and `build` pass after installing local `@trybotster/ui-contract@0.3.3` and copying the new protocol. No consumer repo is edited. |
+| `finding_1787328763_795396` clippy constant asserts | high | Lifecycle pin tests use `const _: () = assert!(CONFORMANCE_FIXTURE_REVISION >= 45)`. `cargo clippy --workspace --all-targets --locked -- -D warnings` passes. |
+| `finding_1787328763_872765` home path / session UUID | high | Plan and report now use path-neutral labels. A scan of added lines found no home paths or session UUIDs. |
+| `finding_1787328763_714973` lifecycle suite dirty | medium | Census leftover workers are all `botster-session-worker` binaries from the primary Hub checkout, not this run worktree. This branch's `hub_daemon_lifecycle_test` ran 265 passed, 1 ignored, 0 failed inside `./test.sh --locked`. |
+
 ## Deviations from plan
 
-1. **Loom AC19 case 0 is unproven.** `RUSTFLAGS="--cfg loom" cargo test -p botster-hub --lib queue_age_model` fails compiling `webrtc` with type-inference errors. The `loom = "0.7.2"` cfg-gated dev-dependency is in the manifest and lockfile. Deterministic seqlock tests remain. This matches the plan fallback: report the ordering claim as unproven rather than drop it silently.
-2. **TUI scratch Cargo patch did not compile.** Cargo could not fetch GitHub tag `botster-ui-contract-v0.3.3` from the TUI worktree. Source inspection of `botster-tui/crates/botster-tui/src/app.rs:26139` still shows the one `cfg(test)` `DaemonStatus` literal that lacks `observability`.
-3. **`script/run-lifecycle-suite` returned `verdict=environment_dirty`.** The census named leftover `botster-session-worker` processes under `/Users/jasonconigliari/Projects/botster-hub`, not this worktree.
-4. **Some plan red-first variants against withdrawn designs were not compiled as alternate implementations.** The landed tests assert the decided contracts (seqlock, intrusive list, lock-free snapshot, inert seams, diagnostic failure does not change acceptance).
-5. **Botster MCP tools were unavailable.** Gate/artifact submission used the plugin SQLite identity of the run after local git durability.
+1. **Loom AC19 case 0 is unproven.** `RUSTFLAGS="--cfg loom"` still fails compiling `webrtc`. Deterministic seqlock tests remain.
+2. **TUI scratch full `cargo check --workspace` does not go green.** After the one required `observability` field, remaining errors are a dual `botster-ui-contract` pin (TUI 0.3.2 versus this Hub 0.3.3), not the status DTO field. No TUI source is committed.
+3. **`script/run-lifecycle-suite` remains `verdict=environment_dirty`.** Leftover workers belong to the primary Hub checkout. This run did not kill those processes.
+4. **A3 is still not a Core waiter live proof.** T1 is proven through the production `apply_plugin_completion` classifier on an in-flight package-event, not through Core timing out a Lua mutex hold.
+5. **Some plan red-first variants against withdrawn designs were not compiled as alternate implementations.**
 
 ## Tests and downstream proof run
 
@@ -141,16 +157,19 @@ Botster MCP was not available in this session (`BOTSTER_SESSION_UUID` was not ex
 | `cargo fmt --all -- --check` | pass |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | pass |
 | Prebuild `botster-session-worker` then `botster-hub` locked | pass |
-| `./test.sh --locked` | pass; zero failures |
+| `./test.sh --locked` | pass; zero failures. Hub lib 482 passed. `hub_daemon_lifecycle_test` 265 passed, 1 ignored, 0 failed |
 | `RUSTFLAGS="--cfg loom" cargo test -p botster-hub --lib queue_age_model` | fail to compile `webrtc`; loom model unproven |
-| `script/run-lifecycle-suite` | `verdict=environment_dirty` (unrelated `Projects/botster-hub` workers) |
+| `script/run-lifecycle-suite` | `verdict=environment_dirty`. Census leftover binaries are all from the primary Hub checkout `target/debug/botster-session-worker`, not this run worktree |
 | Hub-client serde, optionality, unknown-kind/state, generated TypeScript drift | pass |
-| Router snapshot while inner held; diagnostic reserve does not change acceptance; registry lock does not block ingress | pass |
+| Mailbox pop/unsubscribe/expiry/churn age tests | pass |
+| Consumer front-envelope age tests (enqueue, pull, requeue, expiry, byte-limit) | pass |
+| T1 `TimedOut` versus `HandlerFailed` on `apply_plugin_completion` | pass |
+| T4 timeout versus other write with `HubRuntime` | pass |
 | Four seam `*_from` inertness tests | pass |
-| Packed `@trybotster/hub-test-support@0.1.41` + `@trybotster/ui-contract@0.3.3` local install | pass: revision 46, protocol 7, optional `oldest_age_us` / `producer_generation` / `queue_count`, two permissive unions |
-| Web scratch `BOTSTER_HUB_CLIENT_DAEMON_PROTOCOL` `npm test` | expected drift against vendored `daemon-protocol.ts` |
-| Web scratch `npm run typecheck` | pass against current vendored copy |
-| TUI scratch Cargo patch | blocked on unpublished ui-contract tag; source cost is one `observability` field on the test helper |
+| Packed `@trybotster/hub-test-support@0.1.41` + `@trybotster/ui-contract@0.3.3` local install | pass |
+| Web scratch `BOTSTER_HUB_CLIENT_DAEMON_PROTOCOL` `npm test` | expected drift (exit 1) against vendored `daemon-protocol.ts` |
+| Web scratch `npm run typecheck` and `npm run build` | pass after installing local ui-contract 0.3.3 and copying the new protocol |
+| TUI scratch compile | one `cfg(test)` `observability` field is the DTO cost. Remaining errors after that field are ui-contract 0.3.2 versus 0.3.3, not a missing status field |
 
 Production entry point: `DaemonRequest::Status` projects `HubRuntime::event_plane_counters_snapshot()` into `DaemonStatus.observability`. Ingress, delivery, T1–T4, owner-turn, and ready-wait update those atomics on the live daemon paths. Age cells are created after admission commit, not on the event allocator path.
 
@@ -158,7 +177,7 @@ Production entry point: `DaemonRequest::Status` projects `HubRuntime::event_plan
 
 - Loom does not prove the `AcqRel` opening RMW on this compile graph.
 - Lifecycle suite was not a clean verdict in this environment.
-- T1 `TimedOut` while Lua is still inside `invoke` was not live-proven against Core's waiter in this run (assumption A3).
+- T1 `TimedOut` while Lua is still inside `invoke` was not live-proven against Core's waiter (assumption A3). The production classifier is covered.
 - TUI/Web consumer source edits are not in this ticket.
 - Mailbox age cells use generation `0` keyed by connection id; replacement of a live mailbox identity is connection cleanup, not package generation.
 - `#[global_allocator]` counting allocator is `cfg(test)` on the hub lib test binary only.

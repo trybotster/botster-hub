@@ -9535,17 +9535,37 @@ mod tests {
 
         let mut diagnostics = DaemonEgressDiagnostics::default();
         let mut counters = DaemonLifecycleCounters::default();
+        let data_directory = std::env::temp_dir().join(format!(
+            "hub-t4-egress-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let config = crate::HubStartupOptions {
+            host: crate::HostIdentityOptions {
+                id: "t4-egress".to_string(),
+                display_name: "T4 Egress".to_string(),
+                fingerprint: None,
+            },
+            data_directory: crate::DataDirectoryOption::Explicit(data_directory.clone()),
+            ..crate::HubStartupOptions::default()
+        }
+        .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
+        .expect("config");
+        let runtime = crate::HubRuntime::new(config);
         record_egress_write_failure(
             &mut diagnostics,
             &mut counters,
-            None,
+            Some(&runtime),
             DaemonDeliveryKind::Terminal,
             EgressWriteClass::Other,
         );
         record_egress_write_failure(
             &mut diagnostics,
             &mut counters,
-            None,
+            Some(&runtime),
             daemon_delivery_kind(&control),
             EgressWriteClass::Timeout,
         );
@@ -9563,6 +9583,9 @@ mod tests {
         assert!(!debug.contains("session-redacted"));
         assert!(!debug.contains("subscription-redacted"));
         assert_eq!(counters.stalled_writes, 2);
+        let observability = runtime.event_plane_counters_snapshot();
+        assert_eq!(observability.stalled_write_timeouts, 1);
+        let _ = std::fs::remove_dir_all(data_directory);
     }
 
     #[test]

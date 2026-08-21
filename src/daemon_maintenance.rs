@@ -17,7 +17,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use botster_core::SessionId;
 use botster_core::{
-    BoundaryJson, PluginAdmissionResult, PluginHandlerKind, PluginHandlerRef,
+    BoundaryJson, PluginAdmissionResult, PluginCompletion, PluginHandlerKind, PluginHandlerRef,
     PluginInvocationClass, PluginInvocationContext, PluginInvocationFailureKind,
     PluginInvocationRequest, PluginInvocationResult, RequestId,
 };
@@ -1328,73 +1328,81 @@ fn run_completion_drain_slice(runtime: &HubRuntime, state: &mut MaintenanceState
     let drain =
         runtime.drain_plugin_completions(COMPLETION_DRAIN_MAX_ITEMS, COMPLETION_DRAIN_MAX_BYTES);
     for completion in drain.completions {
-        let request_id = match &completion.result {
-            PluginInvocationResult::Completed(success) => success.request_id.clone(),
-            PluginInvocationResult::Failed(failure) => failure.request_id.clone(),
-        };
-        if state.event_in_flight.contains_key(&request_id.0) {
-            match &completion.result {
-                PluginInvocationResult::Completed(_) => {
-                    runtime.event_plane_counters().record_handler_completed_ok();
-                }
-                PluginInvocationResult::Failed(failure) => match failure.kind {
-                    PluginInvocationFailureKind::TimedOut => {
-                        runtime.event_plane_counters().record_handler_timed_out();
-                    }
-                    PluginInvocationFailureKind::HandlerFailed => {
-                        runtime.event_plane_counters().record_handler_failed();
-                    }
-                    PluginInvocationFailureKind::Cancelled => {
-                        runtime.event_plane_counters().record_handler_cancelled();
-                    }
-                    PluginInvocationFailureKind::Backpressured => {
-                        runtime
-                            .event_plane_counters()
-                            .record_handler_backpressured();
-                    }
-                    PluginInvocationFailureKind::WorkerStopped => {
-                        runtime
-                            .event_plane_counters()
-                            .record_handler_worker_stopped();
-                    }
-                },
+        apply_plugin_completion(runtime, state, &completion);
+    }
+}
+
+fn apply_plugin_completion(
+    runtime: &HubRuntime,
+    state: &mut MaintenanceState,
+    completion: &PluginCompletion,
+) {
+    let request_id = match &completion.result {
+        PluginInvocationResult::Completed(success) => success.request_id.clone(),
+        PluginInvocationResult::Failed(failure) => failure.request_id.clone(),
+    };
+    if state.event_in_flight.contains_key(&request_id.0) {
+        match &completion.result {
+            PluginInvocationResult::Completed(_) => {
+                runtime.event_plane_counters().record_handler_completed_ok();
             }
-        }
-        if let Some(mut flight) = state.event_in_flight.remove(&request_id.0) {
-            if !retire_event_holder(runtime, &mut flight) {
-                queue_event_retirement(state, flight);
-            }
-            state.scheduler.try_wake();
-            continue;
-        }
-        let Some(plugin_key) = state
-            .session_family
-            .in_flight_by_request
-            .remove(&request_id.0)
-        else {
-            continue;
-        };
-        let success = matches!(completion.result, PluginInvocationResult::Completed(_));
-        state
-            .session_family
-            .touch_existing_consumer(&plugin_key, |consumer| {
-                let ended_this_snapshot = consumer.in_flight.as_ref().is_some_and(|flight| {
-                    flight.kind == FamilyFrameKind::End
-                        && flight.snapshot_sequence == consumer.snapshot_sequence
-                });
-                consumer.in_flight = None;
-                if ended_this_snapshot && success {
-                    consumer.snapshot_complete = true;
-                    consumer.pending.extend(consumer.held_deltas.drain(..));
+            PluginInvocationResult::Failed(failure) => match failure.kind {
+                PluginInvocationFailureKind::TimedOut => {
+                    runtime.event_plane_counters().record_handler_timed_out();
                 }
-            });
-        if !success {
-            state.session_family.mark_gap(&plugin_key);
-            start_baseline_recovery(state);
-            continue;
+                PluginInvocationFailureKind::HandlerFailed => {
+                    runtime.event_plane_counters().record_handler_failed();
+                }
+                PluginInvocationFailureKind::Cancelled => {
+                    runtime.event_plane_counters().record_handler_cancelled();
+                }
+                PluginInvocationFailureKind::Backpressured => {
+                    runtime
+                        .event_plane_counters()
+                        .record_handler_backpressured();
+                }
+                PluginInvocationFailureKind::WorkerStopped => {
+                    runtime
+                        .event_plane_counters()
+                        .record_handler_worker_stopped();
+                }
+            },
+        }
+    }
+    if let Some(mut flight) = state.event_in_flight.remove(&request_id.0) {
+        if !retire_event_holder(runtime, &mut flight) {
+            queue_event_retirement(state, flight);
         }
         state.scheduler.try_wake();
+        return;
     }
+    let Some(plugin_key) = state
+        .session_family
+        .in_flight_by_request
+        .remove(&request_id.0)
+    else {
+        return;
+    };
+    let success = matches!(completion.result, PluginInvocationResult::Completed(_));
+    state
+        .session_family
+        .touch_existing_consumer(&plugin_key, |consumer| {
+            let ended_this_snapshot = consumer.in_flight.as_ref().is_some_and(|flight| {
+                flight.kind == FamilyFrameKind::End
+                    && flight.snapshot_sequence == consumer.snapshot_sequence
+            });
+            consumer.in_flight = None;
+            if ended_this_snapshot && success {
+                consumer.snapshot_complete = true;
+                consumer.pending.extend(consumer.held_deltas.drain(..));
+            }
+        });
+    if !success {
+        state.session_family.mark_gap(&plugin_key);
+        start_baseline_recovery(state);
+        return;
+    }
+    state.scheduler.try_wake();
 }
 
 /// Start a paged baseline recovery. Incomplete pages are not ended evidence.
@@ -3829,6 +3837,95 @@ return botster.register({})
         assert_eq!(snapshot.admitted_holders, 0);
         assert_eq!(snapshot.global_in_flight_bytes, 0);
         let _ = std::fs::remove_dir_all(package_root);
+        let _ = std::fs::remove_dir_all(data_directory);
+    }
+
+    fn event_failure_completion(
+        request_id: &str,
+        kind: PluginInvocationFailureKind,
+    ) -> botster_core::PluginCompletion {
+        let reason = format!("{kind:?}");
+        botster_core::PluginCompletion {
+            class: PluginInvocationClass::Background,
+            result: PluginInvocationResult::Failed(botster_core::PluginInvocationFailure {
+                request_id: RequestId(request_id.to_string()),
+                handler: PluginHandlerRef {
+                    plugin_key: botster_core::PluginKey("consumer".into()),
+                    kind: PluginHandlerKind::Event,
+                    handler_id: "worktree_created".into(),
+                },
+                kind,
+                timeout_ms: Some(1),
+                reason,
+            }),
+        }
+    }
+
+    #[test]
+    fn t1_timed_out_is_distinct_from_handler_failed() {
+        let (runtime, data_directory) = event_delivery_runtime("t1-kind");
+        subscribe_worktree_consumer(&runtime, "consumer");
+        ingress_worktree_created(&runtime);
+        let mut batch = runtime
+            .package_event_router()
+            .pull_ready_batch(8, 64 * 1024, Instant::now(), Duration::from_millis(8))
+            .expect("pull");
+        let delivery = batch.pop().expect("one pulled copy");
+        runtime
+            .package_event_router()
+            .note_admitted(
+                delivery.envelope_id,
+                &delivery.holder.plugin_key,
+                delivery.holder.generation,
+            )
+            .expect("admit");
+        let request_id = package_event_request_id(&delivery);
+        let mut state = MaintenanceState::default();
+        state.event_in_flight.insert(
+            request_id.0.clone(),
+            event_flight(&delivery, None, request_id.0.clone()),
+        );
+        apply_plugin_completion(
+            &runtime,
+            &mut state,
+            &event_failure_completion(&request_id.0, PluginInvocationFailureKind::TimedOut),
+        );
+        let snap = runtime.event_plane_counters_snapshot();
+        assert_eq!(snap.event_handler_timed_out, 1);
+        assert_eq!(snap.event_handler_failed, 0);
+        assert_eq!(snap.event_handler_cancelled, 0);
+        assert_eq!(snap.event_handler_backpressured, 0);
+        assert_eq!(snap.event_handler_worker_stopped, 0);
+        assert!(state.event_in_flight.is_empty());
+
+        ingress_worktree_created(&runtime);
+        let mut batch = runtime
+            .package_event_router()
+            .pull_ready_batch(8, 64 * 1024, Instant::now(), Duration::from_millis(8))
+            .expect("pull failed case");
+        let delivery = batch.pop().expect("failed-case copy");
+        runtime
+            .package_event_router()
+            .note_admitted(
+                delivery.envelope_id,
+                &delivery.holder.plugin_key,
+                delivery.holder.generation,
+            )
+            .expect("admit failed case");
+        let request_id = package_event_request_id(&delivery);
+        state.event_in_flight.insert(
+            request_id.0.clone(),
+            event_flight(&delivery, None, request_id.0.clone()),
+        );
+        apply_plugin_completion(
+            &runtime,
+            &mut state,
+            &event_failure_completion(&request_id.0, PluginInvocationFailureKind::HandlerFailed),
+        );
+        let snap = runtime.event_plane_counters_snapshot();
+        assert_eq!(snap.event_handler_timed_out, 1);
+        assert_eq!(snap.event_handler_failed, 1);
+        assert_eq!(snap.event_handler_cancelled, 0);
         let _ = std::fs::remove_dir_all(data_directory);
     }
 }

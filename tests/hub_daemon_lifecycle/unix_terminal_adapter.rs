@@ -2616,7 +2616,7 @@ fn terminal_subscription_closed_feature_does_not_raise_default_requirement() {
         botster_hub_client::DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION,
         36
     );
-    assert!(botster_hub_client::CONFORMANCE_FIXTURE_REVISION >= 45);
+    const _: () = assert!(botster_hub_client::CONFORMANCE_FIXTURE_REVISION >= 45);
 }
 
 fn occupancy_has_pair(

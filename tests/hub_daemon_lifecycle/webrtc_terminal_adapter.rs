@@ -1397,7 +1397,7 @@ fn webrtc_terminal_adapter_close_event_feature_stays_optional_on_protocol_7() {
         botster_hub_client::DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION,
         36
     );
-    assert!(botster_hub_client::CONFORMANCE_FIXTURE_REVISION >= 45);
+    const _: () = assert!(botster_hub_client::CONFORMANCE_FIXTURE_REVISION >= 45);
 }
 
 #[test]

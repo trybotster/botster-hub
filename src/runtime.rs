@@ -273,14 +273,14 @@ impl HubRuntime {
     #[must_use]
     pub fn new(config: HubConfig) -> Self {
         let state = HubState::from_config(&config);
-        let core_config = core_daemon_config(&config);
+        let test_seams = hub_test_seams();
+        let core_config = core_daemon_config(&config, &test_seams);
         let plugin_worker_config = config.plugin_worker_config();
         let core_daemon = Mutex::new(CoreDaemon::new(core_config));
         let package_event_router = Arc::new(crate::package_event_router::PackageEventRouter::new(
             config.package_event_plane,
         ));
         let event_plane_counters = Arc::clone(package_event_router.counters());
-        let test_seams = hub_test_seams();
         Self {
             capability_runtime: Arc::new(Mutex::new(HubCapabilityRuntime::from_config(&config))),
             spawn_targets: Arc::new(Mutex::new(state.spawn_targets.clone())),
@@ -379,14 +379,14 @@ impl HubRuntime {
     }
 
     fn from_validated_state(config: HubConfig, state: HubState) -> HubRuntimeResult<Self> {
-        let core_config = core_daemon_config(&config);
+        let test_seams = hub_test_seams();
+        let core_config = core_daemon_config(&config, &test_seams);
         let plugin_worker_config = config.plugin_worker_config();
         let core_daemon = Mutex::new(CoreDaemon::new(core_config));
         let package_event_router = Arc::new(crate::package_event_router::PackageEventRouter::new(
             config.package_event_plane,
         ));
         let event_plane_counters = Arc::clone(package_event_router.counters());
-        let test_seams = hub_test_seams();
         let mut runtime = Self {
             capability_runtime: Arc::new(Mutex::new(HubCapabilityRuntime::from_config(&config))),
             spawn_targets: Arc::new(Mutex::new(state.spawn_targets.clone())),
@@ -531,6 +531,7 @@ impl HubRuntime {
             worktrees: self.worktrees.clone(),
             package_event_router: self.package_event_router.clone(),
             causal_scopes: self.causal_scopes.clone(),
+            event_handler_hold_ms: self.test_seams.event_handler_hold_ms,
         }
     }
 
@@ -4734,7 +4735,7 @@ pub fn event_handler_hold_ms_from(botster_env: Option<&str>, raw: Option<&str>) 
         .map(|ms: u64| ms.min(5_000))
 }
 
-fn core_daemon_config(config: &HubConfig) -> CoreDaemonConfig {
+fn core_daemon_config(config: &HubConfig, test_seams: &HubTestSeams) -> CoreDaemonConfig {
     // Host profile supplies the initial/reset Ghostty color baseline. After
     // attach, current colors come from data-plane GHOSTSNP only.
     let mut core = CoreDaemonConfig::new(&config.data_directory)
@@ -4758,7 +4759,7 @@ fn core_daemon_config(config: &HubConfig) -> CoreDaemonConfig {
     if std::env::var("BOTSTER_HUB_TEST_FAIL_SNAPSHOT_HISTORY_AFTER_READY").as_deref() == Ok("1") {
         core = core.with_test_fail_snapshot_history_after_ready(true);
     }
-    if let Some(capacity) = hub_test_seams().lifecycle_journal_capacity {
+    if let Some(capacity) = test_seams.lifecycle_journal_capacity {
         core = core.with_lifecycle_journal_capacity(capacity);
     }
     #[cfg(test)]
@@ -5481,7 +5482,7 @@ mod tests {
         .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))
         .expect("runtime config should build");
 
-        let core_config = core_daemon_config(&config);
+        let core_config = core_daemon_config(&config, &HubTestSeams::default());
         assert!(
             core_config.worker_path.is_some(),
             "hub CoreDaemonConfig must use worker-backed sessions so in-process durability adoption is unreachable"
