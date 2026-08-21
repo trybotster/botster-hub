@@ -2,6 +2,11 @@
 
 - Ticket: `ticket_1787267568_492780`
 - Run: `run_1787278338_832165`
+- Revision: **11**. Revision 11 answers the five findings in `review_1787290799_177961`. The decided
+  bounded-staleness contract stands; revision 10 did not yet satisfy its no-prior-generation and
+  explicit-indeterminate rules. Three fixes: a two-phase odd/even version, a fresh cell per generation, and
+  a latched invalid state. The artifact for this revision is created **after** the final commit, per the
+  process finding.
 - Revision: **10**. Human decision `question_1787290055_403092` reclassifies oldest age as a bounded
   diagnostic observation. The S1 design is rewritten and roughly halves in size. Revision 10 also corrects
   a false statement in revision 9 gate evidence; see section 0z.
@@ -24,6 +29,21 @@
 - Target id: `tgt_7e208a0c76a44980a83b63af976b1f22`
 - Base: `origin/main` at `b3b54f1` ("Merge ticket: Roll Core pin after IncrementalAttach local-runtime gate")
 - Core pin (verified in `Cargo.toml:24-26,43-44`): `7eafa470a18025895995bbedc20d34b58106a03b`
+
+## 0. Response to Plan Review `review_1787290799_177961` (revision 11)
+
+The human decision stands and is not reopened. Revision 10 adopted its *classification* but did not yet
+satisfy two of its explicit rules: never publish an age from a retired or reused generation, and represent
+an indeterminate sample explicitly. Three of these findings are that gap, and each fix removes a way for
+the design to be wrong rather than adding a feature.
+
+| Finding | Severity | Response |
+| --- | --- | --- |
+| `finding_1787290799_815700` — a trailing-only mutation stamp misses an in-progress reset | blocker | **Accepted; the protocol was unsound.** A reader could load `v1`, read fields while the writer was mid-store, and load an unchanged `v2`, accepting a mixed sample — and across a generation change that pairs a new generation with an old age. S1b replaces the trailing bump with a **two-phase odd/even version** that marks the update in progress *before* any field changes. AC19 case 3 pauses a writer with the version odd and requires indeterminate; it is red against revision 10. |
+| `finding_1787290799_555137` — one producer age list cannot supply a fresh replacement generation | blocker | **Accepted.** Old-generation holders survive unload per `[[admitted event holders survive producer unload until Core completion]]`, so one list holds old and new slots at once, and an old slot at the head would publish a retired generation's age. S1c stops resetting one shared cell: **each generation gets its own cell with an immutable `generation` field**, the previous cell is retired and write-closed on the same control path, and the new generation reports **indeterminate until `prior_generation_holders` reaches zero** — the reviewer's own suggested rule, maintained in `O(1)`. AC20 is the control. |
+| `finding_1787290799_691196` — diagnostic failure has no persistent indeterminate state | blocker | **Accepted.** Revision 10 said "the sample becomes indeterminate" with nowhere to record it, so an accepted envelope with no producer slot left the list permanently incomplete while later samples looked stable. S1f adds `invalid: AtomicBool`, **latched** on any diagnostic failure and checked inside the read bracket, cleared only by the arrival of a new generation with a fresh cell. A missing cell appears in the snapshot as an explicit indeterminate entry, never an omitted row. AC21 is the control. |
+| `finding_1787290799_270331` — admission cannot prune cells that retained queues still reference | high | **Accepted.** "Retired and unreferenced" is unusable: the registry owns an `Arc`, `inner.consumers` entries are never removed and keep theirs, and an empty live queue is indistinguishable from a retired one. S1d makes membership **explicit lifecycle state** recorded only on control paths, keyed by identity **and generation**, and lets admission remove a retired entry even while a container keeps its direct `Arc` to the now write-closed cell. AC11 gains the retained-`ConsumerQueue` case and an assertion that a live-but-empty queue is not pruned. |
+| `finding_1787290799_720688` — the latest artifact does not identify the submitted plan commit | low, process | **Accepted, and it was my own verification pass that caused it.** I created `artifact_1787290486_548537` at `e40e08d`, then found R10 missing, committed `cf58857`, and never re-issued the artifact. Revision 11 creates its artifact **only after the final plan commit**, and the gate evidence names that same commit. |
 
 ## 0z. Correction of false revision 9 gate evidence
 
@@ -276,65 +296,105 @@ the signal and the design collapses accordingly.
   stuck-queue diagnostics**. A single indeterminate or one-event-stale sample **must not be treated as
   authoritative failure evidence**.
 
-**S1b. The metric cell.**
+**S1b. The metric cell and its two-phase version protocol.**
 
 ```rust
 struct QueueAgeMetric {
-    mutations: AtomicU64,     // monotonic version stamp, bumped by every successful queue mutation
-    count: AtomicU64,         // observed queue count at the last mutation
+    version: AtomicU64,       // even = stable, odd = write in progress
+    count: AtomicU64,         // observed queue count at the last completed mutation
     oldest_nanos: AtomicU64,  // u64::MAX = empty
-    generation: AtomicU64,    // producer generation that owns this cell
+    generation: u64,          // immutable: the producer generation this cell belongs to
+    invalid: AtomicBool,      // latched by a diagnostic failure; see S1f
 }
 ```
 
-**One deliberate tightening of the decided protocol.** The decision names a `count`-age-`count` bracket.
-A raw count is not monotonic: it can return to the same value across two mutations, so an ABA over a
-`5 → 6 → 5` sequence would pass a naive bracket while the sample is two mutations stale, exceeding the
-stated one-mutation bound. The bracket therefore compares a **monotonic `mutations` stamp** while the
-sample still carries `count`. This is the same shape the decision describes and it is what makes the
-stated bound actually hold. I am flagging it rather than silently substituting it.
+**Two deliberate tightenings of the decided protocol, both flagged rather than substituted silently.**
+
+1. The decision names a `count`-age-`count` bracket. A raw count is not monotonic: a `5 → 6 → 5` sequence
+   would pass a naive bracket while the sample is two mutations stale, exceeding the stated one-mutation
+   bound. The bracket compares a version stamp instead, while the sample still carries `count`.
+2. Revision 10 used a **trailing-only** stamp — store the fields, then bump once. Plan Review
+   `finding_1787290799_815700` showed that is unsound: a reader can load `v1`, read fields while the
+   writer is mid-store, and load an unchanged `v2`, accepting a **mixed sample**. Across a generation
+   change that pairs a new generation with an old age, which the decision forbids outright. The protocol is
+   therefore **two-phase odd/even**, which marks the update in progress *before* any field changes.
 
 **Writer rule**, executed while the writer already holds the router or mailbox lock it holds today:
-update the queue, then store `count` and `oldest_nanos`, then bump `mutations` last. No new lock, no
-allocation, no additional critical section.
-
-**Reader rule**, holding no lock at all:
 
 ```text
-v1 = mutations.load(Acquire)
-sample = (count, oldest_nanos, generation)     // relaxed loads
-v2 = mutations.load(Acquire)
-if v1 == v2 and count > 0 -> usable age
-if v1 == v2 and count == 0 -> no usable age
-otherwise -> retry once, then report indeterminate
+version.fetch_add(1, Release)      // now odd: update in progress
+store count, oldest_nanos          // relaxed
+version.fetch_add(1, Release)      // now even: update complete
 ```
 
-`mutations` supplies the only ordering the design needs: one release-ordered bump after the value stores,
-one acquire-ordered load on each side of the sample. There is no separate dead flag and no second ordering
-protocol to get wrong.
+**Reader rule**, holding no lock, at most one retry:
 
-**S1c. Retirement and generation reuse.**
+```text
+v1 = version.load(Acquire)
+if v1 is odd            -> retry once, then indeterminate
+if invalid.load(Acquire) -> indeterminate
+sample = (count, oldest_nanos)     // relaxed
+v2 = version.load(Acquire)
+if v1 != v2             -> retry once, then indeterminate
+if count == 0           -> no usable age
+otherwise               -> usable age, tagged with this cell's immutable generation
+```
 
-Retiring a producer identity **resets** its cell: `oldest_nanos` to the empty sentinel, `count` to zero,
-then a `mutations` bump. A retired cell therefore reports **no usable age** by the S1a rule, which is what
-prevents a retired generation from ever publishing an age. Admitting a later producer generation bumps
-`generation` and resets the cell the same way, so a reused cell starts fresh and a reader bracketing
-across the reset sees a version mismatch and reports indeterminate rather than a stale value.
+`generation` is **immutable per cell**, not an atomic that is reset in place. A cell belongs to exactly one
+producer generation for its whole life, which is what makes "never publish an age from a retired or reused
+generation" structural rather than a race to win. See S1c.
 
-This removes the revision 9 machinery entirely: no `dead: AtomicBool`, no list-versus-registry lifetime
-split, and no requirement that retirement remove anything. Retirement writes three values and one bump.
+**S1c. A generation gets its own cell, and reports indeterminate until the previous generation drains.**
 
-**S1d. Registry lifetime is now a memory bound only.**
+Revision 10 reset one shared cell in place and bumped a `generation` atomic. Plan Review
+`finding_1787290799_555137` showed that is unsound. Existing Hub rules keep old-generation holders alive
+across unload and replacement, per
+`[[admitted event holders survive producer unload until Core completion]]`, so one owner age list can hold
+old and new slots at the same time. If an old slot sits at the head, updating the reset cell from that head
+publishes an age from the **retired** generation, which the decision forbids.
 
-Because a retired cell reports no usable age, a lingering registry entry is **harmless for correctness**.
-Pruning is therefore only a memory concern, not a correctness one:
+Revision 11 removes the shared-cell reuse entirely:
 
-- Each `QueueAgeMetric` is shared as `Arc` and held directly by the producer entry, consumer queue, and
-  client mailbox, so **no event path and no retirement path acquires the registry lock**.
-- The registry holds a second `Arc` purely for enumeration, and takes its lock only at admission (write)
-  and status read (read).
-- Admission prunes entries whose cell is retired and unreferenced. Admission is the only path that
-  inserts, so the registry is bounded by live identities plus those retired since the last admission.
+- **A cell is created fresh for each producer generation at admission** and is never reset and reused. Its
+  `generation` field is immutable, so a sample can always be attributed to exactly one generation.
+- **The previous generation's cell is marked retired on the same control path** that admits the new one.
+  A retired cell reports **no usable age** and is never written again.
+- **The new generation reports `indeterminate` until every old-generation holder has retired.** This is
+  the reviewer's own suggested rule and it is `O(1)`: `ProducerOccupancy` carries
+  `prior_generation_holders: usize`, incremented once per surviving old holder at replacement and
+  decremented in `retire_holder_locked`. While it is above zero the new cell publishes indeterminate; when
+  it reaches zero the new generation reports its own age normally.
+- **No old timestamp can ever update the new cell**, because the old slots belong to the old generation's
+  list and the old cell, and the old cell is retired and write-closed.
+
+The age list itself keeps its revision 6 shape and remains valid for old holders through their late
+completions: their `producer_slot` still addresses the list they were admitted into, so retirement
+accounting is unaffected. Only the **publication** of an age is generation-scoped.
+
+**S1d. Registry membership is explicit lifecycle state, not an `Arc` strong count or an empty queue.**
+
+Revision 10 said admission prunes cells that are "retired and unreferenced". Plan Review
+`finding_1787290799_270331` showed that predicate cannot work: the registry itself owns one `Arc`,
+`inner.consumers` entries are never removed and keep their own `Arc`, so a retired consumer cell stays
+referenced forever. Emptiness is no better, because a live queue that happens to be empty is
+indistinguishable from a retired one.
+
+Revision 11 makes membership explicit and independent of both signals:
+
+- The registry stores `{ Arc<QueueAgeMetric>, retired: bool }` keyed by identity **and generation**.
+- `retired` is set **only on a control path** that knows the identity ended: `apply_unload`,
+  `unsubscribe`, connection cleanup, or the admission of a replacing generation. Nothing infers retirement
+  from a strong count or from `count == 0`.
+- **Admission removes retired registry entries regardless of remaining `Arc` holders.** A retained
+  `ConsumerQueue` may keep its direct `Arc` to a removed cell; that cell is write-closed and reports no
+  usable age, so the retained handle is harmless.
+- **A later admission for the same key binds the container to the new generation's cell** and inserts that
+  cell in the registry. The container's stale `Arc` is replaced at that point, not before.
+- No event path and no retirement path touches the registry lock. Admission and status read remain the
+  only holders.
+
+Bound: the registry holds one entry per live identity-generation plus those retired since the last
+admission, and admission is the only insert path, so a sweep always precedes growth.
 
 **S1e. Producer oldest-age source.**
 
@@ -355,21 +415,35 @@ allocator calls. The list is allocated at the S1g admission commit point and nev
 Consumer queues and client mailboxes read their existing `VecDeque` front in `O(1)` and need no new
 structure.
 
-**S1f. A diagnostic failure never changes production behaviour — this reverses revision 7's S1e.**
+**S1f. A diagnostic failure latches a persistent invalid state and never changes production behaviour.**
 
-Revision 7 made a producer slot-reservation failure return a typed non-accepted result, so a diagnostic
-failure could reject an otherwise valid event. That rule existed because the age was then treated as
-required for acceptance. **The human decision reclassifies the age as a non-authoritative diagnostic, so
-that rule is now wrong and is withdrawn.** Recorded explicitly because it reverses the resolution of
-`finding_1787288480_127520`, whose rationale the decision supersedes.
+Two rules, and revision 10 only had the second.
 
-The rule going forward:
+Revision 7 made a diagnostic slot-reservation failure return a typed non-accepted result, so a diagnostic
+failure could reject a valid event. The human decision reclassifies the age as non-authoritative, so that
+rule is wrong and stays withdrawn. This reverses the resolution rationale of
+`finding_1787288480_127520`, which the decision supersedes.
 
-- A slot-reservation failure or a missing cell **does not affect acceptance**. The event is admitted or
-  shed on its existing production criteria alone.
-- The affected sample becomes **indeterminate**, never a false age.
-- Hub increments `age_sample_failures` so the invariant breach is visible rather than silent.
-- The same rule applies to consumers, replacing revision 8's separate per-consumer binding-failure rule.
+But revision 10 then said only "the sample becomes indeterminate", with nowhere to record it. Plan Review
+`finding_1787290799_691196` showed why that fails: the accepted envelope has **no producer slot**, so the
+age list is permanently incomplete, later updates look perfectly stable, and the cell would publish a
+usable age computed from a list that is missing an entry. A counter records the incident but cannot make
+later samples indeterminate.
+
+Revision 11 adds the missing state:
+
+- `QueueAgeMetric.invalid: AtomicBool` is **latched** on any diagnostic failure: a slot-reservation
+  failure, or a write that finds no cell for the identity.
+- **Once latched, every subsequent read of that cell reports indeterminate**, regardless of how stable the
+  version bracket looks. The reader checks `invalid` inside the bracket (S1b).
+- **The latch clears only when that identity-generation ends.** Because a cell is never reset in place
+  (S1c), clearing means the next generation gets a fresh cell with `invalid == false`. There is no
+  in-place un-latch to race against.
+- **A missing cell is represented explicitly in the public snapshot** as an indeterminate entry for that
+  identity, never as an omitted row that a reader could mistake for "no queue".
+- `age_sample_failures` still counts incidents, so the breach is visible as well as safe.
+- Acceptance is untouched in every case: the event is admitted or shed on its existing production criteria
+  alone.
 
 **S1g. Diagnostic state is created only after a whole admission succeeds.**
 
@@ -687,13 +761,24 @@ registry and source check before writing either literal.
   would have let a status read or an admission delay an accepted event. Each `QueueAgeMetric` is shared by
   `Arc`, so event and retirement paths update atomics through a direct handle and **no event path and no
   retirement path acquires the registry lock**. AC4 covers the status read; AC15 is the contention control.
-- **R13 (rewritten in revision 10).** A retired or reused generation can publish an age that belongs to a
-  previous generation. S1c resets the cell at retirement and bumps `generation` plus resets again on
-  reuse, so a reused cell starts fresh and a reader bracketing across the reset reports indeterminate.
-  AC14 and AC18 are the controls.
-- **R18 (new in revision 10).** A non-monotonic version stamp admits ABA: a `5 -> 6 -> 5` count sequence
-  would pass a raw count bracket while the sample is two mutations stale, silently exceeding the decided
-  one-mutation bound. S1b brackets on a monotonic `mutations` stamp, and AC19 includes the ABA case.
+- **R13 (rewritten in revision 11).** A retired or reused generation can publish an age that belongs to a
+  previous generation. Revision 10's reset-in-place did not prevent this while old holders survived unload.
+  S1c gives each generation its own cell with an immutable `generation` field, retires and write-closes the
+  predecessor, and reports indeterminate until `prior_generation_holders` reaches zero. AC14, AC18, and
+  AC20 are the controls.
+- **R18 (rewritten in revision 11).** A non-monotonic version stamp admits ABA: a `5 -> 6 -> 5` count
+  sequence would pass a raw count bracket while the sample is two mutations stale. S1b brackets on the
+  two-phase odd/even `version`, which advances by four across that sequence, and AC19 case 5 is the control.
+- **R20 (new in revision 11).** A trailing-only version stamp accepts a mixed sample, because a reader can
+  bracket a writer that is mid-store. S1b uses a two-phase odd/even version that marks the update in
+  progress before any field changes. AC19 case 3 is the control.
+- **R21 (new in revision 11).** One shared cell reset in place cannot separate generations while old
+  holders survive unload, so an old head age can be published as the new generation's. S1c gives each
+  generation its own immutable-generation cell and reports indeterminate until prior holders drain.
+  AC20 is the control.
+- **R22 (new in revision 11).** A diagnostic failure with no persistent state lets later stable-looking
+  samples publish an age computed from an incomplete list. S1f latches `invalid` until the generation ends.
+  AC21 is the control.
 - **R19 (new in revision 10).** An indeterminate sample could be rendered as a real value by a careless
   status projection, which would be worse than omitting it. S1a requires an explicit indeterminate marker
   and AC19 asserts a false age is never published.
@@ -705,10 +790,10 @@ registry and source check before writing either literal.
   when they live in different sections. Under the decided model a lingering registry entry is harmless,
   because a reset cell reports no usable age, so pruning is a memory bound only. AC11 and AC15 assert the
   design from both directions.
-- **R16 (rewritten in revision 10).** A long-lived container that outlives its identity can retain a stale
-  shared handle. `inner.consumers` entries are never removed, so the cell is **reset** at retirement and
-  its `generation` bumped on reuse, which makes a retained handle report no usable age rather than a stale
-  one. AC18 is the control.
+- **R16 (rewritten in revision 11).** A long-lived container that outlives its identity can retain a stale
+  shared handle. `inner.consumers` entries are never removed, so the predecessor cell is retired and
+  write-closed and the container is rebound to the new generation's cell at the next admission. A retained
+  handle therefore reports no usable age rather than a stale one. AC11 and AC18 are the controls.
 - **R14 (rewritten in revision 10).** A defensive skip degrades observability silently. The decided model
   keeps that concern without letting diagnostics affect production: a failure yields an **explicit
   indeterminate sample** plus a counted `age_sample_failures`, and never a false age, while acceptance is
@@ -817,7 +902,12 @@ record the failing output **before** the change, per
        `[[botster web generated protocol drift checks need explicit hub artifact paths]]`.
      - Remove both scratch worktrees afterwards and commit nothing to either consumer.
 - **AC11 — retired cells report no usable age, and the registry stays bounded, red first (rewritten in
-  revision 10).** Revision 9 claimed this was tightened; it was not, and its body still described
+  revision 10, extended in revision 11 for `finding_1787290799_270331`).** Add a case that retires a
+  consumer identity whose `ConsumerQueue` entry is **never removed** and therefore keeps its own `Arc`, and
+  assert admission still removes that retired registry entry, that the retained handle reports no usable
+  age, and that a later admission binds the container to the new generation's cell. Assert retirement is
+  read from explicit lifecycle state, never inferred from an `Arc` strong count or from `count == 0`; a
+  **live but empty** queue must not be pruned. The remaining assertions are unchanged: Revision 9 claimed this was tightened; it was not, and its body still described
   immediate removal. Rewritten now to match the decided model. Assert three things. First, after package
   unload, client unsubscribe, and connection cleanup, the retired cell reports **no usable age** because
   its `count` is zero, and never a stale value. Second, run a reconnect-churn loop that creates and
@@ -825,14 +915,36 @@ record the failing output **before** the change, per
   `live + retired_since_last_admission`, a number the test computes exactly from `N` rather than an
   approximation. Third, assert that the next successful admission prunes every prior retired entry and the
   registry returns to exactly the live-identity count. The test must fail when the prune site is omitted.
-- **AC19 — bounded consistency read, red first (new in revision 10).** The direct control for the decided
-  protocol. Assert: a queue with `count > 0` and a stable `mutations` bracket yields a usable age; a queue
-  with `count == 0` yields **no usable age**, never a zero age; a mutation forced between the bracket loads
-  yields **indeterminate** after exactly one retry and **never a false age value**; the reader takes no
-  lock, performs no retry beyond one, and allocates nothing per sample. Include an ABA case that mutates
-  the queue twice so a raw `count` returns to its original value, and assert the monotonic `mutations`
-  stamp still reports indeterminate — this is what makes the one-mutation staleness bound hold. Implement
-  must show AC19 red against a naive count-only bracket.
+- **AC19 — two-phase bounded consistency read, red first (new in revision 10, rewritten in revision 11).**
+  The direct control for the decided protocol and for `finding_1787290799_815700`. Assert, with
+  **deterministic interleavings** rather than timing luck:
+  1. A stable even version with `count > 0` yields a usable age tagged with that cell's generation.
+  2. `count == 0` yields **no usable age**, never a zero age.
+  3. A writer **paused mid-update**, with the version left odd, yields **indeterminate** after exactly one
+     retry — never a mixed sample. This is the case revision 10's trailing-only stamp accepted.
+  4. A completed mutation between the bracket loads yields indeterminate after one retry.
+  5. The ABA case: two mutations returning `count` to its original value still reports indeterminate,
+     because the version advanced by four.
+  6. `invalid == true` yields indeterminate regardless of how stable the bracket looks.
+  7. The reader takes no lock, retries at most once, and allocates nothing per sample.
+  Run interleavings **before, during, and after a generation change**. Implement must show AC19 red against
+  the revision 10 trailing-only stamp and red against a naive count-only bracket.
+- **AC20 — no age from a prior generation, red first (new in revision 11).** The control for
+  `finding_1787290799_555137`. Admit generation N, emit events Core admits as Background holders, then
+  replace with generation N+1 while old holders remain live. Assert that generation N+1 reports
+  **indeterminate** while `prior_generation_holders > 0`, that no sample is ever attributed to generation N
+  after its cell is retired, that the old holders' `producer_slot` values still retire correctly against
+  their own list, and that N+1 begins reporting its own age only once the last old holder retires.
+  Implement must show this red against revision 10's reset-in-place cell, which publishes an old-generation
+  head age to the new generation.
+- **AC21 — a diagnostic failure latches indeterminate, red first (new in revision 11).** The control for
+  `finding_1787290799_691196`. Force a slot-reservation failure so an accepted envelope has no producer
+  slot. Assert the accept-or-shed outcome is identical to the uninjected run, that `age_sample_failures`
+  incremented, and then assert **every subsequent sample of that cell reports indeterminate** across later
+  accepted events and later retirements, even though the version bracket is stable. Assert the latch clears
+  only by the arrival of a new generation with a fresh cell, and that a missing cell appears in the public
+  snapshot as an explicit indeterminate entry rather than an omitted row. Implement must show this red
+  against revision 10, which had no field to hold the state.
 - **AC17 — admission rollback leaves no diagnostic residue, red first (new in revision 8, split in
   revision 9).** Run the case **separately for `try_commit_package_generation` and
   `try_replace_package_generation`**, because their failure paths differ: direct commit has no preview and
@@ -856,8 +968,8 @@ record the failing output **before** the change, per
   Hold the snapshot registry lock on one thread. On another thread run an accepted emit, a shed emit, and a
   retirement including a final identity retirement. Assert all three complete without waiting for the
   registry lock and without returning `ShedBusy` for that reason.
-- **AC16 — a diagnostic failure never changes acceptance, red first (rewritten in revision 10, reverses
-  revision 7).** Force a slot-reservation failure and a missing-cell case through a test seam. Assert the
+- **AC16 — a diagnostic failure never changes acceptance, red first (rewritten in revision 10; the
+  persistence half moved to AC21 in revision 11).** Force a slot-reservation failure and a missing-cell case through a test seam. Assert the
   event's accept-or-shed outcome is **identical** to the same event without the injected failure, that the
   affected sample is reported **indeterminate** rather than as a false age, and that `age_sample_failures`
   incremented. Implement must show this red against revision 7's behaviour, which returned a typed
@@ -960,7 +1072,20 @@ integration tests, the repository lifecycle suite, and scratch consumer `cargo c
 20. **A non-monotonic version stamp admits ABA.** Bracketing a sample on a raw queue count passes when the
     count returns to its original value across two mutations. A monotonic mutation stamp is what makes a
     stated staleness bound actually hold.
-21. **Correcting a stale in-repository assumption** — an in-repository workspace member can still be an
+21. **A trailing-only version stamp is not a seqlock.** Marking completion after the writes does not stop
+    a reader from bracketing a writer that is mid-store. The in-progress mark must precede the first field
+    change, which is what odd/even versioning gives.
+22. **Reset-in-place cannot separate generations when old holders outlive the reset.** A cell whose
+    generation field is mutable can be paired with a predecessor's data. An immutable per-generation cell
+    makes the attribution structural instead of a race to win.
+23. **A diagnostic that can fail needs a persistent failure state, not just a counter.** A counter records
+    that something went wrong; only a latch stops later stable-looking samples from publishing a value
+    derived from the broken state.
+24. **Lifecycle membership must be recorded, not inferred.** Neither an `Arc` strong count nor an empty
+    queue distinguishes retired from live, so retirement belongs on the control path that knows.
+25. **Publish the artifact after the final commit.** I created an artifact, then committed a further fix,
+    leaving durable evidence that described bytes the reviewer never saw.
+26. **Correcting a stale in-repository assumption** — an in-repository workspace member can still be an
    external contract surface. Revision 1 used crate location to skip a charter, which the Hub charter's
    "does not own" list already forbids.
 
