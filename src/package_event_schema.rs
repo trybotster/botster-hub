@@ -81,6 +81,36 @@ impl CompiledEventSchema {
         validate_instance(&self.spec, instance)
     }
 
+    /// True when at least one JSON string can satisfy this compiled subset.
+    #[must_use]
+    pub fn accepts_some_string(&self) -> bool {
+        if let Some(type_value) = self.spec.get("type") {
+            match type_value.as_str() {
+                Some("string") => {}
+                _ => return false,
+            }
+        }
+        if let Some(const_value) = self.spec.get("const") {
+            return const_value.is_string() && self.validate(const_value).is_ok();
+        }
+        if let Some(enum_values) = self.spec.get("enum").and_then(Value::as_array) {
+            return enum_values
+                .iter()
+                .any(|value| value.is_string() && self.validate(value).is_ok());
+        }
+        let min_len = self
+            .spec
+            .get("minLength")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let max_len = self
+            .spec
+            .get("maxLength")
+            .and_then(Value::as_u64)
+            .unwrap_or(u64::MAX);
+        min_len <= max_len
+    }
+
     #[must_use]
     pub fn spec(&self) -> &Value {
         &self.spec
@@ -172,6 +202,11 @@ fn validate_schema_node(schema: &Value, depth: usize) -> Result<(), String> {
                 "payload schema exceeds {SCHEMA_MAX_ENUM} enum values"
             ));
         }
+    }
+    if let Some(type_value) = object.get("type")
+        && !type_value.is_string()
+    {
+        return Err("type must be a string".to_string());
     }
     Ok(())
 }
@@ -358,6 +393,68 @@ mod tests {
                     "absolute_path": "/tmp/secret"
                 }))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn accepts_some_string_uses_const_enum_and_length_bounds() {
+        assert!(
+            CompiledEventSchema::compile(&serde_json::json!({ "type": "string" }))
+                .expect("plain string")
+                .accepts_some_string()
+        );
+        assert!(
+            CompiledEventSchema::compile(&serde_json::json!({ "minLength": 2 }))
+                .expect("untyped minLength")
+                .accepts_some_string()
+        );
+        assert!(
+            !CompiledEventSchema::compile(&serde_json::json!({ "type": "string", "const": 1 }))
+                .expect("typed non-string const compiles")
+                .accepts_some_string()
+        );
+        assert!(
+            !CompiledEventSchema::compile(&serde_json::json!({
+                "type": "string",
+                "enum": [1, true]
+            }))
+            .expect("typed non-string enum compiles")
+            .accepts_some_string()
+        );
+        assert!(
+            CompiledEventSchema::compile(&serde_json::json!({
+                "type": "string",
+                "enum": [1, "ok"]
+            }))
+            .expect("mixed enum compiles")
+            .accepts_some_string()
+        );
+        assert!(
+            !CompiledEventSchema::compile(&serde_json::json!({
+                "type": "string",
+                "minLength": 5,
+                "maxLength": 3
+            }))
+            .expect("contradictory lengths compile")
+            .accepts_some_string()
+        );
+        assert!(
+            !CompiledEventSchema::compile(&serde_json::json!({ "type": "number" }))
+                .expect("number type")
+                .accepts_some_string()
+        );
+        assert!(
+            CompiledEventSchema::compile(&serde_json::json!({ "minLength": u64::MAX }))
+                .expect("u64::MAX minLength compiles")
+                .accepts_some_string()
+        );
+        assert!(
+            !CompiledEventSchema::compile(&serde_json::json!({
+                "minLength": u64::MAX,
+                "maxLength": u64::MAX - 1
+            }))
+            .expect("contradictory u64::MAX lengths compile")
+            .accepts_some_string()
         );
     }
 }

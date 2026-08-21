@@ -10,8 +10,8 @@ The renderer-neutral UI contract used by those protocol DTOs lives in:
 - `crates/botster-ui-contract/src/lib.rs`
 - `packages/ui-contract`
 
-Rust clients consume Hub Git tag `botster-ui-contract-v0.3.2`; TypeScript
-clients consume the prepared `@trybotster/ui-contract@0.3.2`. Those packages
+Rust clients consume Hub Git tag `botster-ui-contract-v0.3.3`; TypeScript
+clients consume the prepared `@trybotster/ui-contract@0.3.3`. Those packages
 are one contract version. Do not pin the Rust crate from a Hub commit SHA,
 a `rev`, or crates.io. The generated declarations, schema, and conformance
 fixtures are one contract surface and must not be copied into a client
@@ -41,7 +41,7 @@ Node-based first-party clients can consume the same checked artifact without a
 sibling hub checkout through the public package:
 
 ```sh
-npm install --save-dev @trybotster/ui-contract@0.3.2 @trybotster/hub-test-support@0.1.20
+npm install --save-dev @trybotster/ui-contract@0.3.3 @trybotster/hub-test-support@0.1.40
 ```
 
 ```js
@@ -124,7 +124,14 @@ The current descriptor includes:
 - supported features: sessions, session and plugin entity subscriptions, terminal streaming, resize, terminal readback,
   plugin surface render, plugin surface action dispatch, package navigation
   discovery, and hub-owned spawn targets;
-- conformance fixture revision.
+- conformance fixture revision 45.
+
+`DaemonPackage.notice_reactions` is an additive optional field. Empty vectors
+are omitted on the wire. Each projected descriptor always carries a required
+`owner` equal to the admitted package name. Generic clients must not hardcode
+package event reactions; they read this field and resolve notice text through
+the shared UI-contract helper. Protocol version stays 7 because an unchanged
+client still deserializes the package row.
 
 The hub-owned first-party support matrix lives in
 `botster_hub_test_support::first_party_client_support_matrix`. It is a
@@ -1376,7 +1383,7 @@ coordinate is `@trybotster/hub-test-support@0.1.31`.
 External clients that need a true live-hub integration test should depend on the
 client protocol crate plus the test-support crate, not on the full `botster-hub`
 library. The UI contract is not a Hub commit SHA: depend on tag
-`botster-ui-contract-v0.3.2`. Git `botster-hub-client` and
+`botster-ui-contract-v0.3.3`. Git `botster-hub-client` and
 `botster-hub-test-support` already resolve that tag; do not add a second
 `rev` pin for `botster-ui-contract`.
 
@@ -1388,7 +1395,7 @@ binary so they all come from the same protocol revision:
 
 ```toml
 [dependencies]
-botster-ui-contract = { git = "https://github.com/trybotster/botster-hub.git", tag = "botster-ui-contract-v0.3.2" }
+botster-ui-contract = { git = "https://github.com/trybotster/botster-hub.git", tag = "botster-ui-contract-v0.3.3" }
 
 [dev-dependencies]
 botster-hub-client = { git = "https://github.com/trybotster/botster-hub.git", package = "botster-hub-client", rev = "<hub-rev>" }
@@ -1428,7 +1435,7 @@ Node client tests should use the declared npm dependency instead of a relative
 hub checkout:
 
 ```sh
-npm install --save-dev @trybotster/ui-contract@0.3.2 @trybotster/hub-test-support@0.1.20
+npm install --save-dev @trybotster/ui-contract@0.3.3 @trybotster/hub-test-support@0.1.40
 ```
 
 ```js

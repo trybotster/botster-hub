@@ -18,10 +18,10 @@ node packages/hub-test-support/scripts/sync-assets.mjs
 
 ## Usage
 
-Use this command for version 0.1.39:
+Use this command for version 0.1.40:
 
 ```sh
-npm install --save-dev @trybotster/ui-contract@0.3.2 @trybotster/hub-test-support@0.1.39
+npm install --save-dev @trybotster/ui-contract@0.3.3 @trybotster/hub-test-support@0.1.40
 ```
 
 ```js
@@ -81,14 +81,14 @@ Use this exact package spec in npm-based client repos:
 ```json
 {
   "devDependencies": {
-    "@trybotster/hub-test-support": "0.1.39"
+    "@trybotster/hub-test-support": "0.1.40"
   }
 }
 ```
 
-`@trybotster/hub-test-support@0.1.39` carries byte-faithful live
+`@trybotster/hub-test-support@0.1.40` carries byte-faithful live
 `terminal_output` payloads (`payload_base64`, `payload_encoding`, `bytes`)
-and authentic dual GHOSTSNP late-attach fixtures (conformance revision 44).
+and authentic dual GHOSTSNP late-attach fixtures (conformance revision 45).
 History attach uses incremental READY, PAGE, and FINISH Snapshot frames.
 No-history attach uses READY then FINISH. Import-visible state matches the
 ReadScreen oracles; do not dual-use a history-bearing golden as no-history.
@@ -112,7 +112,7 @@ appended as terminal text. Version 0.1.6 / conformance revision 13 uses
 superseded JSON number arrays, while version 0.1.5 / revision 12 exposes
 lossy string history. Neither is current binary-history contract authority.
 
-Version 0.1.39 carries protocol version 7 / conformance revision 44 with
+Version 0.1.40 carries protocol version 7 / conformance revision 45 with
 advertised optional `unix_terminal_adapter`,
 `terminal_subscription_closed`, `webrtc_terminal_adapter`,
 `attach_occupancy`,
@@ -138,9 +138,10 @@ the `read_only_session_type_source` refusal). It retains the generic
 package-owned entity records and the `plugin_entity_subscriptions`
 compatibility feature, authoritative session-type request/response and entity
 records, and requires the `session_type_entity_subscriptions` feature. It
-depends on `@trybotster/ui-contract@0.3.2` for the canonical UiNode,
-UiActionRequest, UiActionResult, package surface, and package navigation
-declarations and conformance fixtures. It also carries the optional
+depends on `@trybotster/ui-contract@0.3.3` for the canonical UiNode,
+UiActionRequest, UiActionResult, package surface, package navigation,
+and package-owned client notice reaction declarations and conformance
+fixtures. It also carries the optional
 aggregate plugin-worker counters prepared in the unpublished 0.1.15 artifact.
 
 Version 0.1.29 was the prior published coordinate (revision 34) and still

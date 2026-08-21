@@ -5,9 +5,11 @@ import {
   collectEntityOptionFamilies,
   conformanceFixtures,
   entityFamilySubscriptionId,
+  NOTICE_TEXT_MAX_BYTES,
   packageVersion,
   projectEntityOptions,
   realizeBindListDescendantId,
+  resolveNoticeText,
   schema,
 } from "./index.js";
 
@@ -36,7 +38,35 @@ assert.deepEqual(
   conformanceFixtures.fixtures.bound_row_identity.children[0].item_template.id,
   { $bind: "@/session_uuid" },
 );
-assert.equal(conformanceFixtures.contract_version, "0.3.2");
+assert.equal(conformanceFixtures.contract_version, "0.3.3");
+assert.equal(NOTICE_TEXT_MAX_BYTES, 512);
+assert.equal(conformanceFixtures.notice_text_max_bytes, NOTICE_TEXT_MAX_BYTES);
+assert.deepEqual(schema.$defs.PackageNoticeSubjectScope.enum, ["session"]);
+assert.deepEqual(schema.$defs.PackageNoticeSeverity.enum, ["info", "warning", "error"]);
+assert.ok(schema.$defs.PackageNoticeReactionDescriptor.required.includes("owner"));
+assert.equal(
+  schema.$defs.PackageNoticeReactionDeclaration.properties.text_pointer.maxLength,
+  undefined,
+);
+for (const vector of conformanceFixtures.notice_text_resolution_vectors) {
+  if (vector.text !== undefined) {
+    assert.equal(resolveNoticeText(vector.payload, vector.pointer), vector.text);
+    assert.ok(
+      new TextEncoder().encode(vector.text).byteLength <= NOTICE_TEXT_MAX_BYTES,
+    );
+  } else {
+    try {
+      resolveNoticeText(vector.payload, vector.pointer);
+      assert.fail(`vector ${vector.id} should reject`);
+    } catch (error) {
+      assert.equal(error.code, vector.error, `vector ${vector.id}`);
+      if (vector.error === "oversized") {
+        assert.equal(error.bytes, vector.bytes);
+        assert.ok(error.bytes > NOTICE_TEXT_MAX_BYTES);
+      }
+    }
+  }
+}
 assert.equal(
   conformanceFixtures.fixtures.required_bindable_fields.authored.length,
   7,
@@ -236,6 +266,10 @@ for (const token of [
   "UiBindListDescendantId",
   "realizeBindListDescendantId",
   "packageVersion",
+  "NOTICE_TEXT_MAX_BYTES",
+  "resolveNoticeText",
+  "PackageNoticeReactionDescriptor",
+  "PackageNoticeSubjectScope",
   "conformanceFixtures",
   "schema",
   "UiActionRequest",

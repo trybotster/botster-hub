@@ -15,7 +15,10 @@ use std::thread;
 use std::time::Duration;
 
 use base64::Engine as _;
-use botster_ui_contract::{PackageSurfaceDescriptor, UiActionRequest, UiActionResult, UiNode};
+use botster_ui_contract::{
+    PackageNoticeReactionDescriptor, PackageSurfaceDescriptor, UiActionRequest, UiActionResult,
+    UiNode,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -28,7 +31,7 @@ mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 pub const PROTOCOL_VERSION: u16 = 7;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 44;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 45;
 /// Oldest conformance revision accepted by the default first-party client requirement.
 pub const DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 36;
 /// Version of the local WebRTC delivery chunk framing protocol.
@@ -1923,6 +1926,8 @@ pub struct DaemonPackage {
     pub requested_capabilities: Vec<DaemonCapability>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub surfaces: Vec<PackageSurfaceDescriptor>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notice_reactions: Vec<PackageNoticeReactionDescriptor>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub routes: Vec<DaemonPackageRouteDescriptor>,
     #[serde(default)]
@@ -4108,7 +4113,7 @@ mod tests {
     #[test]
     fn protocol_seven_rejects_protocol_six_and_accepts_conformance_floor_thirty_five() {
         assert_eq!(PROTOCOL_VERSION, 7);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 44);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 45);
 
         let protocol_six = DaemonCompatibilityRequirement {
             protocol_version: 6,
@@ -4833,6 +4838,53 @@ mod tests {
     }
 
     #[test]
+    fn daemon_package_notice_reactions_are_optional_on_the_wire_and_imported() {
+        let empty = DaemonPackage {
+            notice_reactions: Vec::new(),
+            ..daemon_response_example(DaemonResponseKind::Packages).packages[0].clone()
+        };
+        let empty_value = serde_json::to_value(&empty).expect("empty package serializes");
+        assert!(
+            empty_value.get("notice_reactions").is_none(),
+            "empty notice_reactions must omit on the wire"
+        );
+
+        let package = DaemonPackage {
+            notice_reactions: vec![PackageNoticeReactionDescriptor {
+                owner: "event-plane-producer".to_string(),
+                name: "sample.ready".to_string(),
+                subject_scope: botster_ui_contract::PackageNoticeSubjectScope::Session,
+                text_pointer: "/notice".to_string(),
+                ttl_ms: 5_000,
+                severity: botster_ui_contract::PackageNoticeSeverity::Info,
+            }],
+            ..daemon_response_example(DaemonResponseKind::Packages).packages[0].clone()
+        };
+        let value = serde_json::to_value(&package).expect("package serializes");
+        assert_eq!(
+            value["notice_reactions"],
+            serde_json::json!([{
+                "owner": "event-plane-producer",
+                "name": "sample.ready",
+                "subject_scope": "session",
+                "text_pointer": "/notice",
+                "ttl_ms": 5000,
+                "severity": "info"
+            }])
+        );
+        let round_trip: DaemonPackage =
+            serde_json::from_value(value).expect("notice reactions round-trip");
+        assert_eq!(round_trip.notice_reactions, package.notice_reactions);
+
+        let generated = daemon_protocol_typescript();
+        assert!(generated.contains(
+            "import type { PackageNoticeReactionDescriptor, PackageSurfaceDescriptor, UiActionRequest, UiActionResult, UiNode } from \"@trybotster/ui-contract\";"
+        ));
+        assert!(generated.contains("notice_reactions?: PackageNoticeReactionDescriptor[];"));
+        assert!(!generated.contains("export interface PackageNoticeReactionDescriptor"));
+    }
+
+    #[test]
     fn generated_typescript_exposes_package_configuration_protocol() {
         let generated = daemon_protocol_typescript();
         let package = generated_interface("DaemonPackage");
@@ -5038,6 +5090,7 @@ mod tests {
             state: "enabled".to_string(),
             requested_capabilities: Vec::new(),
             surfaces: Vec::new(),
+            notice_reactions: Vec::new(),
             routes: Vec::new(),
             runnable_entrypoints: Vec::new(),
             configuration: DaemonPackageConfiguration::default(),
@@ -6212,6 +6265,7 @@ mod tests {
                     scope: Some("localhost".to_string()),
                 }],
                 surfaces: Vec::new(),
+                notice_reactions: Vec::new(),
                 routes: Vec::new(),
                 runnable_entrypoints: Vec::new(),
                 configuration: DaemonPackageConfiguration::default(),
@@ -6656,7 +6710,7 @@ mod tests {
     #[test]
     fn protocol_six_and_conformance_thirty_two_define_the_cold_cut_boundary() {
         assert_eq!(PROTOCOL_VERSION, 7);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 44);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 45);
 
         let requirement = DaemonCompatibilityRequirement::current();
         let protocol_error = ensure_compatible(
@@ -6721,7 +6775,7 @@ mod tests {
         // conformance revision: bumping the protocol would break every existing
         // first-party client that never issues this request.
         assert_eq!(PROTOCOL_VERSION, 7);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 44);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 45);
         assert_eq!(DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION, 36);
         assert_eq!(
             current_feature_list(),

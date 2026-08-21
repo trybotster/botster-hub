@@ -5292,6 +5292,27 @@ mod tests {
     }
 
     #[test]
+    fn published_plugin_contract_matrix_fixture_declares_a_session_notice() {
+        let manifest: serde_json::Value = serde_json::from_slice(
+            plugin_contract_matrix_fixture_asset()
+                .files
+                .iter()
+                .find(|file| file.relative_path == "botster-package.json")
+                .expect("published fixture includes botster-package.json")
+                .contents,
+        )
+        .expect("fixture manifest is JSON");
+        let notices = manifest["events"]["notices"]
+            .as_array()
+            .expect("fixture declares events.notices");
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0]["name"], "contract.ready");
+        assert_eq!(notices[0]["subject_scope"], "session");
+        assert_eq!(notices[0]["text_pointer"], "/notice");
+        assert!(notices[0].get("owner").is_none());
+    }
+
+    #[test]
     fn daemon_protocol_typescript_artifact_matches_checked_generated_file() {
         let artifact = daemon_protocol_typescript_artifact();
         let checked = fs::read_to_string(

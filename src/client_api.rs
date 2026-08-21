@@ -21,8 +21,8 @@ use botster_core_daemon::{
     LifecycleBaselineBudget, ReadinessEvidence, SessionLifecycleBaselinePage,
 };
 use botster_ui_contract::{
-    PackageNavigationTarget, PackageSurfaceDescriptor, PackageSurfaceKind, PackageSurfaceOperation,
-    UiActionRequest, UiActionResult, UiNode,
+    PackageNavigationTarget, PackageNoticeReactionDescriptor, PackageSurfaceDescriptor,
+    PackageSurfaceKind, PackageSurfaceOperation, UiActionRequest, UiActionResult, UiNode,
 };
 
 use crate::lifecycle::HubPluginLifecycleStatus;
@@ -1386,6 +1386,7 @@ pub struct HubClientPackage {
     pub state: HubClientPackageState,
     pub requested_capabilities: Vec<HubClientCapability>,
     pub surfaces: Vec<PackageSurfaceDescriptor>,
+    pub notice_reactions: Vec<PackageNoticeReactionDescriptor>,
     pub navigation: Vec<HubClientPackageNavigationEntry>,
     pub runnable_entrypoints: Vec<HubClientPackageRunnableEntrypoint>,
     pub configuration: HubClientPackageConfiguration,
@@ -1425,6 +1426,7 @@ impl HubClientPackage {
                 })
                 .collect(),
             surfaces: record.manifest.surfaces.clone(),
+            notice_reactions: record.manifest.notice_reaction_descriptors(),
             navigation: record
                 .manifest
                 .navigation

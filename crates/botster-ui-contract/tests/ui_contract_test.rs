@@ -3,9 +3,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use botster_ui_contract::{
-    PackageNavigationEntry, PackageNavigationTarget, PackagePresentationValidationError,
-    PackageSurfaceDescriptor, PackageSurfaceKind, PackageSurfaceOperation, UiAction,
-    UiActionRequestId, UiToolbarOverflow as FlatUiToolbarOverflow,
+    NOTICE_TEXT_MAX_BYTES, NoticeTextError, PackageNavigationEntry, PackageNavigationTarget,
+    PackageNoticeReactionDeclaration, PackageNoticeReactionValidationError, PackageNoticeSeverity,
+    PackageNoticeSubjectScope, PackagePresentationValidationError, PackageSurfaceDescriptor,
+    PackageSurfaceKind, PackageSurfaceOperation, UiAction, UiActionRequestId,
+    UiToolbarOverflow as FlatUiToolbarOverflow, decode_notice_text_pointer, resolve_notice_text,
+    validate_package_notice_reactions,
 };
 use botster_ui_contract::{
     UiActionId, UiActionKind, UiActionRequest, UiActionResult, UiActionResultState,
@@ -3720,4 +3723,156 @@ fn entity_options_timeline_fixture_matches_projector_and_collector() {
             serde_json::from_value(step["expected_projection"].clone()).expect("projection");
         assert_eq!(projection, expected, "projection after {}", step["name"]);
     }
+}
+
+fn sample_notice_declaration() -> PackageNoticeReactionDeclaration {
+    PackageNoticeReactionDeclaration {
+        owner: None,
+        name: "sample.ready".to_string(),
+        subject_scope: PackageNoticeSubjectScope::Session,
+        text_pointer: "/notice".to_string(),
+        ttl_ms: 5_000,
+        severity: PackageNoticeSeverity::Info,
+    }
+}
+
+fn notice_validation_error_code(error: &PackageNoticeReactionValidationError) -> &'static str {
+    match error {
+        PackageNoticeReactionValidationError::InvalidName { .. } => "invalid_name",
+        PackageNoticeReactionValidationError::InvalidOwner { .. } => "invalid_owner",
+        PackageNoticeReactionValidationError::Pointer(
+            botster_ui_contract::NoticePointerError::MissingLeadingSlash { .. },
+        ) => "missing_leading_slash",
+        PackageNoticeReactionValidationError::Pointer(
+            botster_ui_contract::NoticePointerError::MultiSegment { .. },
+        ) => "multi_segment",
+        PackageNoticeReactionValidationError::Pointer(
+            botster_ui_contract::NoticePointerError::TrailingTilde { .. },
+        ) => "trailing_tilde",
+        PackageNoticeReactionValidationError::Pointer(
+            botster_ui_contract::NoticePointerError::UnknownEscape { .. },
+        ) => "unknown_escape",
+        PackageNoticeReactionValidationError::Pointer(
+            botster_ui_contract::NoticePointerError::EmptyPropertyName { .. },
+        ) => "empty_property_name",
+        PackageNoticeReactionValidationError::TtlOutOfRange { .. } => "ttl_out_of_range",
+        PackageNoticeReactionValidationError::DuplicateReaction { .. } => "duplicate_reaction",
+    }
+}
+
+fn notice_text_error_code(error: &NoticeTextError) -> &'static str {
+    match error {
+        NoticeTextError::Pointer(_) => "invalid_pointer",
+        NoticeTextError::Missing { .. } => "missing",
+        NoticeTextError::NotString { .. } => "not_string",
+        NoticeTextError::Empty { .. } => "empty",
+        NoticeTextError::Oversized { .. } => "oversized",
+    }
+}
+
+#[test]
+fn package_notice_subject_scope_has_exactly_one_variant() {
+    match PackageNoticeSubjectScope::Session {
+        PackageNoticeSubjectScope::Session => {}
+    }
+    assert_eq!(
+        serde_json::to_value(PackageNoticeSubjectScope::Session).expect("serialize scope"),
+        json!("session")
+    );
+}
+
+#[test]
+fn package_notice_reaction_validation_matches_conformance_vectors() {
+    let conformance = botster_ui_contract::conformance_fixtures_json();
+    for vector in conformance["notice_reaction_validation_vectors"]
+        .as_array()
+        .expect("validation vectors")
+    {
+        let declarations: Vec<PackageNoticeReactionDeclaration> =
+            serde_json::from_value(vector["declarations"].clone()).expect("declarations");
+        let result = validate_package_notice_reactions(&declarations);
+        if vector["ok"].as_bool().expect("ok") {
+            result.unwrap_or_else(|error| {
+                panic!("vector {} should accept: {error}", vector["id"]);
+            });
+        } else {
+            let error = result.expect_err("vector should reject");
+            assert_eq!(
+                notice_validation_error_code(&error),
+                vector["error"].as_str().expect("error"),
+                "vector {}",
+                vector["id"]
+            );
+        }
+    }
+}
+
+#[test]
+fn package_notice_text_resolution_matches_conformance_vectors() {
+    let conformance = botster_ui_contract::conformance_fixtures_json();
+    assert_eq!(
+        conformance["notice_text_max_bytes"].as_u64().expect("max"),
+        NOTICE_TEXT_MAX_BYTES as u64
+    );
+    for vector in conformance["notice_text_resolution_vectors"]
+        .as_array()
+        .expect("resolution vectors")
+    {
+        let payload = &vector["payload"];
+        let pointer = vector["pointer"].as_str().expect("pointer");
+        let result = resolve_notice_text(payload, pointer);
+        if let Some(text) = vector.get("text").and_then(Value::as_str) {
+            assert_eq!(
+                result.expect("vector should resolve"),
+                text,
+                "vector {}",
+                vector["id"]
+            );
+            assert!(
+                text.len() <= NOTICE_TEXT_MAX_BYTES,
+                "accepted vector {} must not exceed the byte bound",
+                vector["id"]
+            );
+        } else {
+            let error = result.expect_err("vector should reject");
+            assert_eq!(
+                notice_text_error_code(&error),
+                vector["error"].as_str().expect("error"),
+                "vector {}",
+                vector["id"]
+            );
+            if let NoticeTextError::Oversized { bytes, .. } = error {
+                assert_eq!(
+                    bytes,
+                    vector["bytes"].as_u64().expect("bytes") as usize,
+                    "vector {} oversized length",
+                    vector["id"]
+                );
+                assert!(
+                    bytes > NOTICE_TEXT_MAX_BYTES,
+                    "oversized vector {} must keep the original length",
+                    vector["id"]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn package_notice_into_descriptor_always_sets_owner() {
+    let descriptor = sample_notice_declaration().into_descriptor("event-plane-producer");
+    assert_eq!(descriptor.owner, "event-plane-producer");
+    assert_eq!(descriptor.name, "sample.ready");
+    assert_eq!(descriptor.subject_scope, PackageNoticeSubjectScope::Session);
+    assert_eq!(descriptor.text_pointer, "/notice");
+    assert_eq!(descriptor.ttl_ms, 5_000);
+    assert_eq!(descriptor.severity, PackageNoticeSeverity::Info);
+}
+
+#[test]
+fn package_notice_pointer_decoding_counts_raw_separators_before_escapes() {
+    assert_eq!(decode_notice_text_pointer("/a~1b").expect("slash"), "a/b");
+    assert_eq!(decode_notice_text_pointer("/a~0b").expect("tilde"), "a~b");
+    assert!(decode_notice_text_pointer("/a/b").is_err());
+    assert!(decode_notice_text_pointer("notice").is_err());
 }

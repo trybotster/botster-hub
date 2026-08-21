@@ -5,11 +5,19 @@ Renderer-neutral plugin UI contract generated from the authoritative
 
 The package ships serde-accurate TypeScript declarations, a JSON Schema, and
 shared conformance fixtures. Alongside `UiNode` and action contracts it owns
-the renderer-neutral package surface, supported-operation, and navigation
-discoverability vocabulary. Hub manifests own admission and registry policy;
-clients must not copy these descriptors into daemon-specific mirrors. It is a
-normal build/protocol dependency for Botster clients, not an installable
-marketplace package.
+the renderer-neutral package surface, supported-operation, navigation
+discoverability, and package-owned client notice reaction vocabulary. Hub
+manifests own admission and registry policy; clients must not copy these
+descriptors into daemon-specific mirrors. It is a normal build/protocol
+dependency for Botster clients, not an installable marketplace package.
+
+A notice reaction declaration may omit `owner`. The projected descriptor always
+carries the admitted package name. Version one uses `subject_scope: "session"`
+only, severity `info | warning | error`, `ttl_ms` in `1000..=60000`, and one
+top-level RFC 6901 text pointer. `resolveNoticeText` measures the decoded JSON
+string as UTF-8 bytes with a 512-byte ceiling, does not trim or truncate, and
+returns a typed error for missing, non-string, empty, or oversized values. The
+byte bound is not a JSON Schema keyword.
 
 The host scopes presentation keys to the active Hub, package, and surface.
 Clients own the scoped presentation store and renderer policy. Plugin workers
