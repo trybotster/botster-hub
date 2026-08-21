@@ -2,6 +2,9 @@
 
 - Ticket: `ticket_1787267568_492780`
 - Run: `run_1787278338_832165`
+- Revision: **6**. Revision 6 answers the three findings in `review_1787287893_907824`: the tombstone
+  ring lost a live entry after middle retirement, its storage allocated inside the event path, and AC6
+  could not detect either. Section 5 S1a is redesigned and AC6 gains a deterministic allocation control.
 - Revision: **5**. Revision 5 adds the sibling ordering protocol in section 14 under human answer
   `question_1787287315_855051`. No technical content changed between revision 4 and revision 5.
 - Revision: **4**. Revision 1 drew four findings in `review_1787279337_548281`; revision 2 fixed three and parked on the fourth; revision 3 released the park. Revision 4 answers the three findings in `review_1787286846_900081`.
@@ -9,6 +12,14 @@
 - Target id: `tgt_7e208a0c76a44980a83b63af976b1f22`
 - Base: `origin/main` at `b3b54f1` ("Merge ticket: Roll Core pin after IncrementalAttach local-runtime gate")
 - Core pin (verified in `Cargo.toml:24-26,43-44`): `7eafa470a18025895995bbedc20d34b58106a03b`
+
+## 0. Response to Plan Review `review_1787287893_907824` (revision 6)
+
+| Finding | Severity | Response |
+| --- | --- | --- |
+| `finding_1787287893_905201` — the tombstone ring overwrites a live oldest entry after out-of-order retirement | blocker | **Accepted. The design was wrong and I have replaced it.** The reviewer's counterexample is exact: `producer.events` counts live entries while `len` counted the occupied span including tombstones, so after a middle retirement the two diverge, the existing shed check admits another event, and `slot = (head + len) % cap` selects `head` and overwrites the live oldest. My claim that the ring "cannot overflow" was false. Section 5 S1a now uses an intrusive doubly-linked age list over preallocated slots plus a free-slot list, which supports exact O(1) arbitrary removal and hole reuse. AC13 is the required full-capacity, middle-retirement, immediate-reacceptance test. |
+| `finding_1787287893_967012` — producer age storage allocates during the first event path | blocker | **Accepted and fixed.** Verified: `try_ingress` creates `ProducerOccupancy` through `entry(...).or_insert(...)` at `src/package_event_router.rs:473-478`, which runs **before** the shed check at `:481-483`, so a `Box` created there would allocate inside the event path and even a shed event would allocate it. The age list now lives in its own `RouterInner` map, allocated at **contract admission** (`try_register_contracts`, `try_commit_package_generation`, and `PackageEventRouter::new` for the built-in Hub contracts) and retired in `apply_unload`. `try_ingress` performs a lookup only and never inserts. |
+| `finding_1787287893_905133` — AC6 does not prove zero diagnostic allocator calls | high | **Accepted and fixed.** An unchanged pointer and capacity prove only that one buffer did not reallocate, and a self-counted primitive total proves only what the implementation chose to count. AC6 now adds a deterministic allocation control: a `cfg(test)` counting global allocator with a thread-local scope enabled only around the isolated diagnostic update, asserting zero diagnostic allocations for the first accepted event and for a shed event after owner admission. Pre-existing payload and routing allocations stay outside that scope. |
 
 ## 0a. Response to Plan Review `review_1787286846_900081` (revision 4)
 
@@ -157,77 +168,80 @@ and never inside `RouterInner`. Contents:
 - Typed timeout counters T1–T3 (see S3).
 - Oldest-age cells, redesigned in revision 2 (see S1a and S1b).
 
-**S1a. Oldest-age sources (fixes `finding_1787279337_990629`, redesigned in revision 4 for
-`finding_1787286846_827944`).**
-Revision 1 claimed every queue has a head already in hand. That is true for consumer queues
-(`ConsumerQueue.copies: VecDeque`, `src/package_event_router.rs:202-207`) and for client mailboxes
-(`MailboxInner.events: VecDeque`, `src/daemon_event_subscriptions.rs:120-123`). It is **false for
-producers**: `ProducerOccupancy` (`:197-200`) holds only `events` and `bytes`, and `retire_holder_locked`
-(`:1338-1352`) removes envelopes from an unordered `HashMap` in arbitrary order.
+**S1a. Oldest-age sources (redesigned in revision 6 for `finding_1787287893_905201` and
+`finding_1787287893_967012`).**
 
-Revision 2 proposed a `BTreeSet<u64>`. Plan Review rejected that, correctly: B-tree insertion calls the
-allocator and performs variable comparison work on the accepted-event path, which the ticket forbids.
+Consumer queues (`ConsumerQueue.copies: VecDeque`, `src/package_event_router.rs:202-207`) and client
+mailboxes (`MailboxInner.events: VecDeque`, `src/daemon_event_subscriptions.rs:120-123`) already expose a
+head, so their oldest age is an `O(1)` front read with no new structure.
 
-Revision 4 uses a **preallocated fixed-capacity tombstone ring** instead:
+Producers have no ordered structure: `ProducerOccupancy` (`:197-200`) holds only `events` and `bytes`, and
+`retire_holder_locked` (`:1338-1352`) removes envelopes from an unordered `HashMap` in arbitrary order.
+
+Two earlier attempts failed review. Revision 2 used a `BTreeSet`, which allocates and compares on the
+event path. Revision 4 used a tombstone ring, which **loses a live entry**: `producer.events` counts live
+entries while the ring's `len` counted the occupied span including tombstones, so after a middle
+retirement the shed check admits another event and `slot = (head + len) % cap` overwrites the live oldest.
+
+Revision 6 uses an **intrusive doubly-linked age list over preallocated slots, with a free-slot list**:
 
 ```rust
-struct ProducerAgeRing {
-    slots: Box<[u64]>,   // length = policy.producer_queue_max_events (default 256)
-    head: usize,
-    len: usize,
+const NIL: u32 = u32::MAX;
+
+struct ProducerAgeSlot {
+    nanos: u64,   // enqueue time, nanoseconds since the counters base Instant
+    prev: u32,    // NIL at the head
+    next: u32,    // NIL at the tail; also links the free list
 }
 
-struct ProducerOccupancy {
-    events: usize,
-    bytes: usize,
-    oldest: ProducerAgeRing, // added
-}
-```
-
-`Envelope` gains `producer_slot: u32`, so retirement can find its own slot without searching.
-
-**Accepted-event path — strictly constant, zero allocator calls.** Beside `producer.events += 1`
-(`src/package_event_router.rs:538-539`):
-
-```text
-slot = (head + len) % cap
-slots[slot] = enqueued_nanos
-len += 1
-envelope.producer_slot = slot
-```
-
-That is one modulo, one store, one increment, and one field write. No allocation, no comparison, no
-traversal. Ingress already sheds when `producer.events + 1 > producer_queue_max_events`
-(`:481-482`), so the ring can never overflow and never needs to grow.
-
-**Retirement path — out-of-order safe, amortized constant.** Beside the producer decrement
-(`:1348-1351`):
-
-```text
-slots[envelope.producer_slot] = TOMBSTONE          // O(1), any order
-while len > 0 && slots[head] == TOMBSTONE {        // skip cleared slots
-    head = (head + 1) % cap
-    len -= 1
+struct ProducerAgeList {
+    slots: Box<[ProducerAgeSlot]>, // length = policy.producer_queue_max_events (default 256)
+    head: u32,   // oldest live entry, NIL when empty
+    tail: u32,   // newest live entry, NIL when empty
+    free: u32,   // free-list head, singly linked through `next`
 }
 ```
 
-Envelopes retire out of order because `retire_holder_locked` only removes an envelope when
-`remaining_holders` reaches zero. Tombstones handle that directly: the head advances only past cleared
-slots, so the oldest live entry is always at `head`. Each slot is written once, tombstoned once, and
-skipped at most once, so total ring work across `N` events is at most `3N` — **amortized constant, and the
-skip loop is on the retirement path, never on the accepted-event path.**
+`Envelope` gains `producer_slot: u32`, so retirement addresses its own slot directly.
 
-**Allocation, stated precisely.** The ring is allocated exactly once per producer identity, when the
-`ProducerOccupancy` entry is created. At the default bound that is 256 × 8 bytes = 2 KB per admitted
-producer. **No allocator call occurs on any per-event path.** Revision 3 said "no allocation on any
-per-event path" while proposing a `BTreeSet`; that was self-contradictory and is corrected here.
+| Operation | Steps | Cost | Allocator calls |
+| --- | --- | --- | --- |
+| push (accepted event) | pop `free`, write `nanos`, link at `tail` | strict `O(1)` | zero |
+| remove (retirement, any position) | unlink through `prev`/`next`, repair `head`/`tail`, push slot to `free` | strict `O(1)` | zero |
+| oldest age (read) | `slots[head].nanos`, or the empty sentinel when `head == NIL` | strict `O(1)` | zero |
 
-Consumer and mailbox ages read their existing `VecDeque` front in `O(1)` with no added structure.
+There is no scan, no comparison, no amortization argument, and no head-advance loop. Middle retirement is
+exact, because unlinking repairs both neighbours instead of relying on tombstone skipping.
+
+**Capacity invariant.** The push happens beside `producer.events += 1` (`:538-539`), which is **after** the
+shed check at `:481-483`. The live slot count therefore equals `producer.events` at all times, and both
+are bounded by `producer_queue_max_events`. The free list is consequently never empty at push time.
+Defensively, `push` returns `Option<u32>` and the caller skips the age update on `None` rather than
+corrupting the list; AC13 asserts `None` never occurs.
+
+**Allocation lifecycle — moved entirely out of the event path.** Revision 4 put the buffer on
+`ProducerOccupancy`, which `try_ingress` creates lazily through `entry(...).or_insert(...)` at
+`:473-478`, **before** the shed check. That is inside the event path, and a shed event would allocate too.
+Revision 6 stores the lists in their own `RouterInner` map:
+
+- **Allocated at contract admission**, never on an event path: `try_register_contracts` (`:300`),
+  `try_commit_package_generation` (`:333`), and `PackageEventRouter::new` for the built-in
+  `HUB_EVENT_OWNER` worktree contracts.
+- **Retired at unload**, in `apply_unload` (`:1232-1256`), with the owner's contracts.
+- **`try_ingress` performs a lookup only.** It calls `get_mut` on the map and never inserts. If an owner
+  has no list, it skips the age update instead of allocating. This cannot happen for an accepted event,
+  because `try_ingress` returns `RejectedUndeclared` at `:427-436` when no contract exists, so contract
+  admission always precedes any accepted emit.
+
+**Allocation, stated precisely and completely.** One `Box<[ProducerAgeSlot]>` per admitted producer, at
+contract admission. At the default bound that is 256 × 16 bytes = 4 KB per producer. **No allocator call
+occurs on any accepted-event path or any shed path.** AC6 proves this with a deterministic allocation
+control rather than a pointer comparison.
 
 Each published age is stored in an `AgeCell`: one `AtomicU64` holding nanoseconds since a `base: Instant`
 captured at counter construction, with `u64::MAX` as the empty sentinel. Writers update the cell while
-they already hold the router or mailbox lock, on push into an empty ring and after any head advance.
-Readers touch only the atomic.
+they already hold the router or mailbox lock, whenever the list head changes. Readers touch only the
+atomic.
 
 **S1b. Age-cell identity lifetime (fixes the second half of `finding_1787279337_990629`).**
 Revision 1 left the three identity maps with no removal rule. Revision 2 slaves each map to the live
@@ -235,7 +249,7 @@ identity set that already exists, and removes a cell at exactly the site that en
 
 | Map | Key | Insert site | Remove site |
 | --- | --- | --- | --- |
-| producer ages | package owner | first accepted ingress for that owner | `apply_unload` (`src/package_event_router.rs:1236-1256`), and when the age ring empties and the owner has no contract |
+| producer ages | package owner | **contract admission**: `try_register_contracts` (`:300`), `try_commit_package_generation` (`:333`), and `PackageEventRouter::new` for the built-in Hub contracts. Never on an event path. | `apply_unload` (`src/package_event_router.rs:1232-1256`), with the owner's contracts |
 | consumer ages | plugin key | first queued copy for that plugin key | `apply_unload` for that plugin key, and `unsubscribe` when the plugin key retains no subscription |
 | mailbox ages | connection id | mailbox creation | `cleanup_client_connection_locked` and the connection removals at `src/daemon_event_subscriptions.rs:434-437` and `:481` |
 
@@ -486,12 +500,12 @@ describes the symptom; the smaller fix is at the existing write site.
 `CoreDaemonConfig`, so they are stored on Hub state while being read in one place beside
 `core_daemon_config`, in the style the ticket names. Only seam 2 sets a `CoreDaemonConfig` builder.
 
-**A8 — rewritten in revision 4.** The producer age ring is indexed by slot, not by envelope id, so it no
-longer depends on envelope-id monotonicity. The revision 2 concern about id reuse is therefore moot. The
-remaining assumption is narrower: `Envelope.producer_slot` must be written on every accepted ingress and
-read on every retirement, and the ingress shed check at `src/package_event_router.rs:481-482` must remain
-the only path that admits an envelope into producer occupancy. Implement must confirm there is no second
-admission path that increments `producer.events` without pushing into the ring.
+**A8 — rewritten again in revision 6.** The age list is addressed by slot index carried on
+`Envelope.producer_slot`, so envelope-id monotonicity is irrelevant. Two narrower checks remain for
+Implement. First, confirm that `try_ingress` is the only path that increments `producer.events`, so the
+live slot count cannot drift from it; the capacity invariant that keeps the free list non-empty depends on
+that equality. Second, confirm that `retire_holder_locked` is the only path that decrements
+`producer.events`, so every push is matched by exactly one removal.
 
 **A9 — new in revision 4.** Conformance revision and package version allocation depends on sibling
 `ticket_1787278643_145174` merging first. If that sibling changes its own allocation before merge, or if
@@ -505,7 +519,7 @@ registry and source check before writing either literal.
 | --- | --- |
 | `src/event_plane_counters.rs` (new) | `EventPlaneCounters`, fixed histogram, `AgeCell`, identity maps, snapshot type |
 | `src/lib.rs` | register the new module and re-export the snapshot type |
-| `src/package_event_router.rs` | shed by typed reason, admission and delivery attempts, latencies, T2, `ProducerOccupancy.oldest` age ring and `Envelope.producer_slot`, producer and consumer age cells, unload-time cell removal |
+| `src/package_event_router.rs` | shed by typed reason, admission and delivery attempts, latencies, T2, a new `RouterInner` producer age-list map allocated at contract admission, `Envelope.producer_slot`, and age-list removal in `apply_unload`, producer and consumer age cells, unload-time cell removal |
 | `src/daemon_event_subscriptions.rs` | overflow gap count, T3 mailbox-expiry count, mailbox age cell, cell removal on connection cleanup |
 | `src/daemon_maintenance.rs` | T1 typed completion counting; seam 3 for the two `timeout_ms` sites |
 | `src/daemon_transport.rs` | `EgressWriteClass` on `ControlMessage::EgressWriteFailed`, T4 in `record_egress_write_failure`, `enqueued_at` on `ControlMessage::Request` plus its two senders here, the owner-loop serve-site measurement, owner-turn recording, status projection |
@@ -525,8 +539,15 @@ registry and source check before writing either literal.
 ## 9. Risks
 
 - **R1. Observer changes the load class.** Mitigated by fixed arrays, `leading_zeros` bucket selection,
-  a preallocated fixed-capacity tombstone ring with zero allocator calls on any per-event path, and the
-  AC6 hot-path operation-count test.
+  an intrusive age list over preallocated slots with strict `O(1)` push and removal and zero allocator
+  calls on any event path, and the AC6 allocation control plus operation counts.
+- **R11 (new in revision 6).** A diagnostic structure can silently lose a live entry when its own
+  occupancy accounting diverges from `producer.events`. That is exactly how the revision 4 tombstone ring
+  failed review. AC13 is the direct control and must be shown red against that ring.
+- **R12 (new in revision 6).** Diagnostic storage can allocate on the first event for an owner if it is
+  attached to a lazily created map entry. `try_ingress` creates `ProducerOccupancy` before the shed check
+  at `src/package_event_router.rs:473-483`, so the age list is deliberately kept in a separate map that is
+  populated at contract admission. AC6 part 1 is the control.
 - **R2. A second lock replaces the first.** The age maps carry their own `RwLock`. Writers hold it for one
   atomic store, and readers never touch the router mutex. AC4 proves the read path returns values while
   the router lock is held.
@@ -574,23 +595,26 @@ record the failing output **before** the change, per
 - **AC5 — seam inertness.** Four negative tests, one per seam, in the exact style of
   `client_event_queue_max_override_requires_test_mode` (`src/daemon_event_subscriptions.rs:914`): each
   asserts `Some(value)` for `("test", raw)` and `None` for `("production", raw)` and `(None, raw)`.
-- **AC6 — hot-path work bound, red first, operation-count not wall-clock (strengthened in revision 4).**
-  Plan Review noted that a length assertion cannot detect allocation or comparison growth. AC6 now counts
-  the actual hot-path operations through a `#[cfg(test)]` probe counter incremented by each ring and
-  histogram primitive:
-  1. **Constant accepted-event cost.** The recorded operation count for one accepted-event ring push is
-     identical for `N = 1` and `N = 10_000`, and identical at every ring occupancy from empty to the
-     policy bound. A `BTreeSet` or any comparison-based structure fails this assertion, which is what
-     makes it a real control rather than a restatement.
-  2. **No reallocation.** The ring's data pointer and capacity, captured after first producer
-     registration, are unchanged after `N` events. This proves no allocator call grew the structure.
-  3. **Bounded retirement.** Total head-advance skips across `N` accepted-and-retired events is at most
-     `N`, and total ring operations at most `3N`, including a case that retires envelopes in reverse
-     order to exercise tombstones.
-  4. **Constant histogram cost.** The bucket-selection step count is exactly one per observation for every
-     input magnitude, including the minimum, the overflow bucket, and every power-of-two boundary.
-  Implement must first demonstrate AC6 red against a deliberately scanning bucket search and against a
-  comparison-based producer age source.
+- **AC6 — hot-path work bound and zero diagnostic allocation, red first (rewritten in revision 6).**
+  Plan Review noted that an unchanged pointer and capacity prove only that one buffer did not reallocate,
+  and that a self-counted primitive total proves only what the implementation chose to count. AC6 now has
+  a deterministic allocation control plus operation counts:
+  1. **Zero diagnostic allocator calls.** A `#[cfg(test)]` counting global allocator wraps `System` and
+     increments a thread-local counter only while an explicit scope guard is active. The guard wraps the
+     isolated diagnostic update alone. Assert the count is exactly zero for: the **first accepted event**
+     for a newly admitted owner, a **shed event** for an admitted owner, an accepted event at full
+     occupancy, and a retirement from the middle of the list. Pre-existing payload encoding, `to_string`
+     key construction, and routing allocations stay **outside** the guarded scope, per the reviewer's
+     instruction, so the assertion measures only diagnostic cost.
+  2. **Constant accepted-event operation count.** The recorded operation count for one age-list push is
+     identical for `N = 1` and `N = 10_000`, and identical at every occupancy from empty to the policy
+     bound. A `BTreeSet`, a scan, or any comparison-based structure fails this.
+  3. **Constant retirement cost.** Removal from the head, the tail, and the middle each record the same
+     operation count, which is what distinguishes an intrusive list from the rejected tombstone ring.
+  4. **Constant histogram cost.** The bucket-selection step count is exactly one per observation at every
+     magnitude, including the minimum, the overflow bucket, and every power-of-two boundary.
+  Implement must first demonstrate AC6 red against a scanning bucket search, against a comparison-based
+  producer age source, and against a variant that allocates the age list inside `try_ingress`.
 - **AC7 — invariants unchanged.** Existing owner-turn and ready-operation tests stay green, and a diff
   review confirms no constant listed in ticket item 8 changed.
 - **AC8 — content blindness.** The three architecture tests stay green:
@@ -633,6 +657,14 @@ record the failing output **before** the change, per
   returns to the live-identity bound after: package unload, client unsubscribe, connection cleanup, and a
   reconnect-churn loop that creates and destroys many connection ids. The churn case must fail when a
   removal site is omitted, which Implement demonstrates by deleting one removal and recording the red run.
+- **AC13 — producer age-list correctness under out-of-order retirement, red first (new in revision 6).**
+  This is the direct control for `finding_1787287893_905201`. Fill a producer to exactly
+  `producer_queue_max_events`. Retire an entry from the **middle**. Immediately accept another event.
+  Assert that the live oldest entry is unchanged and still readable, that no live slot was overwritten,
+  that the live slot count equals `producer.events`, and that `push` never returned `None`. Repeat for
+  retirement at the head, at the tail, and in reverse order across the whole list. Implement must
+  demonstrate this test **red against the revision 4 tombstone ring**, which overwrites the live oldest
+  entry in exactly this sequence.
 - **AC12 — ready-operation wait covers WebRTC (new in revision 2).** A test proves that a request arriving
   through the local WebRTC sender (`src/local_webrtc.rs:1536`) reaches the same owner-loop measurement as a
   Unix request, and that both produce a non-absent ready-operation-wait observation.
@@ -679,7 +711,14 @@ integration tests, the repository lifecycle suite, and scratch consumer `cargo c
 7. **A downstream consumer's proof commands follow its language, not the provider's.** Revision 3 planned
    `cargo check` against `botster-web`, which is a Node and TypeScript repository. A provider-side DTO
    plan must resolve each consumer's own test commands before naming them.
-8. **Correcting a stale in-repository assumption** — an in-repository workspace member can still be an
+8. **A bounded diagnostic structure needs its own occupancy invariant tied to the value it mirrors.** The
+   rejected tombstone ring counted an occupied span while the admission check counted live entries, so a
+   middle retirement let a later accepted event overwrite the live oldest value. A fixed-capacity claim is
+   not a safety proof unless the structure's own count is the one the capacity check reads.
+9. **Diagnostic storage attached to a lazily created map entry allocates on the first event.** In this
+   router `try_ingress` creates `ProducerOccupancy` before the shed check, so even a shed event would have
+   allocated the buffer. Diagnostic buffers belong on an admission-time lifecycle, not an event-time one.
+10. **Correcting a stale in-repository assumption** — an in-repository workspace member can still be an
    external contract surface. Revision 1 used crate location to skip a charter, which the Hub charter's
    "does not own" list already forbids.
 
