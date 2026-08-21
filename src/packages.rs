@@ -285,38 +285,8 @@ impl HubPackageManifest {
 }
 
 fn schema_accepts_string(schema: &serde_json::Value) -> bool {
-    let Ok(compiled) = crate::package_event_schema::CompiledEventSchema::compile(schema) else {
-        return false;
-    };
-    if schema
-        .get("type")
-        .is_some_and(|type_value| !type_value.is_string())
-    {
-        return false;
-    }
-    match schema.get("type").and_then(serde_json::Value::as_str) {
-        Some("string") => true,
-        Some(_) => false,
-        None => {
-            compiled
-                .validate(&serde_json::Value::String(String::new()))
-                .is_ok()
-                || compiled
-                    .validate(&serde_json::Value::String("x".to_string()))
-                    .is_ok()
-                || schema
-                    .get("const")
-                    .is_some_and(|value| value.is_string() && compiled.validate(value).is_ok())
-                || schema
-                    .get("enum")
-                    .and_then(serde_json::Value::as_array)
-                    .is_some_and(|values| {
-                        values
-                            .iter()
-                            .any(|value| value.is_string() && compiled.validate(value).is_ok())
-                    })
-        }
-    }
+    crate::package_event_schema::CompiledEventSchema::compile(schema)
+        .is_ok_and(|compiled| compiled.accepts_some_string())
 }
 
 /// Hub-owned package admission policy backed by the first-party host profile.
@@ -3840,6 +3810,47 @@ mod tests {
                 .validate_event_contracts()
                 .expect_err("numeric subject")
                 .contains("subject must accept a string")
+        );
+
+        let mut const_conflict = sample_emitted(&["clients"], serde_json::json!({}));
+        const_conflict.payload_schema["properties"]["notice"] =
+            serde_json::json!({ "type": "string", "const": 1 });
+        manifest.events.emitted = vec![const_conflict];
+        manifest.events.notices = vec![sample_notice()];
+        assert!(
+            manifest
+                .validate_event_contracts()
+                .expect_err("non-string const")
+                .contains("must accept a string")
+        );
+
+        let mut enum_conflict = sample_emitted(&["clients"], serde_json::json!({}));
+        enum_conflict.payload_schema["properties"]["subject"] =
+            serde_json::json!({ "type": "string", "enum": [1, true] });
+        manifest.events.emitted = vec![enum_conflict];
+        assert!(
+            manifest
+                .validate_event_contracts()
+                .expect_err("non-string enum subject")
+                .contains("subject must accept a string")
+        );
+
+        let mut min_length = sample_emitted(&["clients"], serde_json::json!({}));
+        min_length.payload_schema["properties"]["notice"] = serde_json::json!({ "minLength": 2 });
+        manifest.events.emitted = vec![min_length];
+        manifest
+            .validate_event_contracts()
+            .expect("untyped minLength 2 still admits a string");
+
+        let mut contradictory = sample_emitted(&["clients"], serde_json::json!({}));
+        contradictory.payload_schema["properties"]["notice"] =
+            serde_json::json!({ "type": "string", "minLength": 5, "maxLength": 3 });
+        manifest.events.emitted = vec![contradictory];
+        assert!(
+            manifest
+                .validate_event_contracts()
+                .expect_err("contradictory lengths")
+                .contains("must accept a string")
         );
     }
 

@@ -332,6 +332,29 @@ fn typescript_and_schema_encode_wire_names_and_optionality() {
             "canonical schema must reject malformed pointer {pointer}"
         );
     }
+    let declaration_schema = json!({
+        "$schema": schema["$schema"],
+        "$ref": "#/$defs/PackageNoticeReactionDeclaration",
+        "$defs": schema["$defs"],
+    });
+    let declaration_validator =
+        jsonschema::validator_for(&declaration_schema).expect("compile declaration definition");
+    assert!(
+        declaration_validator.is_valid(&authored_without_owner),
+        "declaration schema must accept omitted owner"
+    );
+    assert!(
+        declaration_validator.is_valid(&owner_bearing_descriptor),
+        "declaration schema must accept an exact owner"
+    );
+    for owner in [json!(""), json!(" "), json!(1)] {
+        let mut malformed = authored_without_owner.clone();
+        malformed["owner"] = owner.clone();
+        assert!(
+            !declaration_validator.is_valid(&malformed),
+            "declaration schema must reject malformed owner {owner}"
+        );
+    }
 
     let request_fields = interface_fields(&typescript, "UiActionRequest");
     let result_fields = interface_fields(&typescript, "UiActionResult");

@@ -496,6 +496,7 @@ fn wait_for_package_event_tokens(
     tokens: &[&str],
 ) -> Vec<serde_json::Value> {
     let mut found = BTreeMap::new();
+    collect_skipped_package_event_tokens(connection, tokens, &mut found);
     let started = Instant::now();
     let deadline = Duration::from_secs(10);
     while found.len() < tokens.len() {
@@ -507,16 +508,18 @@ fn wait_for_package_event_tokens(
             );
         }
         connection
-            .set_read_timeout(Some(remaining.min(Duration::from_millis(200))))
+            .request(&botster_hub_client::DaemonRequest::Status)
+            .expect("status write-turn flushes admitted package events");
+        collect_skipped_package_event_tokens(connection, tokens, &mut found);
+        if found.len() == tokens.len() {
+            break;
+        }
+        connection
+            .set_read_timeout(Some(remaining.min(Duration::from_millis(50))))
             .expect("set event read timeout");
         match connection.next_event() {
             Ok(botster_hub_client::DaemonEvent::PackageEvent { payload, .. }) => {
-                let token = payload["token"].as_str().unwrap_or("");
-                assert!(
-                    tokens.contains(&token),
-                    "unexpected package event token {token}; wanted {tokens:?}"
-                );
-                found.insert(token.to_string(), payload);
+                record_package_event_token(tokens, &mut found, payload);
             }
             Ok(other) => panic!("expected PackageEvent, got {other:?}"),
             Err(error) if package_event_wait_is_retryable(&error) => continue,
@@ -531,6 +534,34 @@ fn wait_for_package_event_tokens(
                 .unwrap_or_else(|| panic!("missing collected token {token}"))
         })
         .collect()
+}
+
+fn collect_skipped_package_event_tokens(
+    connection: &mut botster_hub_client::DaemonConnection,
+    tokens: &[&str],
+    found: &mut BTreeMap<String, serde_json::Value>,
+) {
+    for event in connection.take_skipped_events() {
+        match event {
+            botster_hub_client::DaemonEvent::PackageEvent { payload, .. } => {
+                record_package_event_token(tokens, found, payload);
+            }
+            other => panic!("expected PackageEvent, got {other:?}"),
+        }
+    }
+}
+
+fn record_package_event_token(
+    tokens: &[&str],
+    found: &mut BTreeMap<String, serde_json::Value>,
+    payload: serde_json::Value,
+) {
+    let token = payload["token"].as_str().unwrap_or("");
+    assert!(
+        tokens.contains(&token),
+        "unexpected package event token {token}; wanted {tokens:?}"
+    );
+    found.insert(token.to_string(), payload);
 }
 
 fn package_event_wait_is_retryable(error: &botster_hub_client::DaemonTransportError) -> bool {
