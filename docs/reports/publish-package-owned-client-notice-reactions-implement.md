@@ -1,5 +1,15 @@
 # Implement report: publish a package-owned client notice reaction descriptor
 
+## Review-return findings
+
+Review `review_1787290014_342254` returned three open findings. This visit addresses all of them.
+
+| Finding | Severity | Fix |
+| --- | --- | --- |
+| `finding_1787290014_414325` Canonical JSON Schema rejects projected descriptors | high | Declaration and descriptor `$defs` no longer overlap: a declaration instance must omit `owner`. Pointer pattern is `^/([^/~]|~0|~1)+$`. Schema tests accept one owner-bearing descriptor and reject `/`, `/notice~`, `/notice~2`, `/a/b`, and `notice`. |
+| `finding_1787290014_835267` Live notice test fails under default-concurrency | high | The batch emit queued two events against a 1 s mailbox age. This visit emits empty, waits both subscribers, then emits oversized. IsolatedHub root uses a pid suffix. `./test.sh --locked --offline` at default concurrency passed, including this test. |
+| `finding_1787290015_322853` Notice admission ignores compiled string semantics | medium | `schema_accepts_string` now compiles through `CompiledEventSchema`. Type arrays fail compilation. Session `subject` must accept a string. Tests cover an empty property schema, a type array, and a numeric subject. |
+
 ## Target repository and target_id
 
 | Field | Value |
@@ -144,7 +154,7 @@ Maintainer follow-up after merge: `script/tag-ui-contract` for `botster-ui-contr
 
 ## Deviations from plan
 
-- Live suppression proof emits empty and oversized notices, then collects both tokens from each subscriber with 200 ms read slices. Sequential per-token waits with a 10 s socket timeout could consume the whole deadline on one `WouldBlock`. The proof still matches acceptance checks 15–16: both invalid events are accepted, delivered whole, and fail only in the shared resolver.
+- Live suppression proof emits empty, waits both subscribers, then emits oversized. Read waits use 200 ms slices. The production completion oracle remains `PluginMcpToolResult.status == "accepted"` plus unsolicited `next_event`. This avoids queuing two events against the 1 s client mailbox age under suite load.
 - `emit_sample_ready_payload` now asserts `plugin_tool_result.status == "accepted"`, so a rejected emit fails at the producer rather than as a later wait timeout.
 - Locked commands used `--offline` because tag `botster-ui-contract-v0.3.3` is not on the remote yet. The workspace `[patch]` path-resolves the crate. This is the plan's U2/R8 handling, not a product-behavior change.
 - `DaemonPackage` stays exhaustive. The downstream source cost is one TUI test helper literal, recorded below. The plan allowed that measurement before a `#[non_exhaustive]` decision; this run does not add `#[non_exhaustive]`.
@@ -173,7 +183,7 @@ Commands (all through `./test.sh` or explicit `BOTSTER_ENV=test` except fmt/clip
 | Packed `npm pack` of `@trybotster/ui-contract@0.3.3` and `@trybotster/hub-test-support@0.1.40`, install both tarballs in a scratch consumer, assert metadata `0.1.40` / UI contract `0.3.3` / revision 45 / protocol 7 / matching `daemon_protocol.sha256`, `notice_reactions?`, imported descriptor with required `owner`, materialized fixture notice, `resolveNoticeText`, then strict `tsc` of `script/fixtures/ui-contract-typescript-consumer.ts` | pass |
 | `node packages/hub-test-support/test.mjs` after installing the packed UI-contract tarball | pass |
 | `./test.sh --locked --offline -p botster-hub-test-support published_plugin_contract_matrix_fixture_declares_a_session_notice` | pass |
-| `./test.sh --locked --offline` | first run failed (see below); second run passed in 455 s |
+| `./test.sh --locked --offline` after Review return | pass in 472 s, including `isolated_hub_projects_notice_reactions_and_resolves_session_scoped_text` |
 
 First full-suite root failure: `daemon_maintenance::tests::owner_loop_queues_and_completes_two_fanout_plugin_handlers` (`left: 1`, `right: 2` in-flight handlers). Isolated command `./test.sh --locked --offline -p botster-hub --lib owner_loop_queues_and_completes_two_fanout_plugin_handlers` passed on this branch. The same isolated command passed on `origin/main` `b3b54f1`. A second `./test.sh --locked --offline -p botster-hub --lib` (456 tests) passed. A second full `./test.sh --locked --offline` passed. This is a default-concurrency flake present on base, not a notice-contract regression.
 

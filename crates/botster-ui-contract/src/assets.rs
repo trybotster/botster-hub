@@ -372,15 +372,20 @@ pub fn json_schema() -> Value {
             "PackageNoticeSeverity": {
                 "enum": wire_names::<PackageNoticeSeverity>()
             },
+            "PackageNoticeTextPointer": {
+                "type": "string",
+                "pattern": "^/([^/~]|~0|~1)+$"
+            },
             "PackageNoticeReactionDeclaration": {
                 "type": "object",
                 "additionalProperties": false,
                 "required": ["name", "subject_scope", "text_pointer", "ttl_ms", "severity"],
+                "not": { "required": ["owner"] },
                 "properties": {
                     "owner": { "type": "string", "pattern": "\\S" },
                     "name": { "type": "string", "pattern": "\\S" },
                     "subject_scope": { "$ref": "#/$defs/PackageNoticeSubjectScope" },
-                    "text_pointer": { "type": "string", "pattern": "^/[^/]*$" },
+                    "text_pointer": { "$ref": "#/$defs/PackageNoticeTextPointer" },
                     "ttl_ms": { "type": "integer", "minimum": 1000, "maximum": 60000 },
                     "severity": { "$ref": "#/$defs/PackageNoticeSeverity" }
                 }
@@ -393,7 +398,7 @@ pub fn json_schema() -> Value {
                     "owner": { "type": "string", "pattern": "\\S" },
                     "name": { "type": "string", "pattern": "\\S" },
                     "subject_scope": { "$ref": "#/$defs/PackageNoticeSubjectScope" },
-                    "text_pointer": { "type": "string", "pattern": "^/[^/]*$" },
+                    "text_pointer": { "$ref": "#/$defs/PackageNoticeTextPointer" },
                     "ttl_ms": { "type": "integer", "minimum": 1000, "maximum": 60000 },
                     "severity": { "$ref": "#/$defs/PackageNoticeSeverity" }
                 }

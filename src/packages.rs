@@ -192,9 +192,15 @@ impl HubPackageManifest {
                     notice.name
                 ));
             };
-            if !properties.contains_key("subject") {
+            let Some(subject_schema) = properties.get("subject") else {
                 return Err(format!(
                     "notice {} matching event payload schema must declare subject",
+                    notice.name
+                ));
+            };
+            if !schema_accepts_string(subject_schema) {
+                return Err(format!(
+                    "notice {} matching event subject must accept a string",
                     notice.name
                 ));
             }
@@ -279,21 +285,37 @@ impl HubPackageManifest {
 }
 
 fn schema_accepts_string(schema: &serde_json::Value) -> bool {
-    match schema.get("type") {
-        Some(serde_json::Value::String(kind)) => kind == "string",
-        Some(serde_json::Value::Array(kinds)) => {
-            kinds.iter().any(|kind| kind.as_str() == Some("string"))
-        }
+    let Ok(compiled) = crate::package_event_schema::CompiledEventSchema::compile(schema) else {
+        return false;
+    };
+    if schema
+        .get("type")
+        .is_some_and(|type_value| !type_value.is_string())
+    {
+        return false;
+    }
+    match schema.get("type").and_then(serde_json::Value::as_str) {
+        Some("string") => true,
+        Some(_) => false,
         None => {
-            schema
-                .get("const")
-                .is_some_and(serde_json::Value::is_string)
+            compiled
+                .validate(&serde_json::Value::String(String::new()))
+                .is_ok()
+                || compiled
+                    .validate(&serde_json::Value::String("x".to_string()))
+                    .is_ok()
+                || schema
+                    .get("const")
+                    .is_some_and(|value| value.is_string() && compiled.validate(value).is_ok())
                 || schema
                     .get("enum")
                     .and_then(serde_json::Value::as_array)
-                    .is_some_and(|values| values.iter().any(serde_json::Value::is_string))
+                    .is_some_and(|values| {
+                        values
+                            .iter()
+                            .any(|value| value.is_string() && compiled.validate(value).is_ok())
+                    })
         }
-        _ => false,
     }
 }
 
@@ -3787,6 +3809,37 @@ mod tests {
                 .validate_event_contracts()
                 .expect_err("non-string pointer property")
                 .contains("must accept a string")
+        );
+
+        let mut empty_notice_schema = sample_emitted(&["clients"], serde_json::json!({}));
+        empty_notice_schema.payload_schema["properties"]["notice"] = serde_json::json!({});
+        manifest.events.emitted = vec![empty_notice_schema];
+        manifest.events.notices = vec![sample_notice()];
+        manifest
+            .validate_event_contracts()
+            .expect("empty property schema still accepts strings");
+
+        let mut type_array_notice = sample_emitted(&["clients"], serde_json::json!({}));
+        type_array_notice.payload_schema["properties"]["notice"] =
+            serde_json::json!({ "type": ["string", "null"] });
+        manifest.events.emitted = vec![type_array_notice];
+        assert!(
+            manifest
+                .validate_event_contracts()
+                .expect_err("type array is unusable")
+                .contains("type must be a string")
+        );
+
+        let mut numeric_subject = sample_emitted(&["clients"], serde_json::json!({}));
+        numeric_subject.payload_schema["properties"]["subject"] =
+            serde_json::json!({ "type": "number" });
+        manifest.events.emitted = vec![numeric_subject];
+        manifest.events.notices = vec![sample_notice()];
+        assert!(
+            manifest
+                .validate_event_contracts()
+                .expect_err("numeric subject")
+                .contains("subject must accept a string")
         );
     }
 

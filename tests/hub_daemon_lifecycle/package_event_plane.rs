@@ -353,7 +353,7 @@ pub(crate) fn emit_sample_ready_payload(
 #[test]
 fn isolated_hub_projects_notice_reactions_and_resolves_session_scoped_text() {
     let _guard = daemon_test_guard();
-    let (hub, _) = enable_event_plane_producer("notice");
+    let (hub, _) = enable_event_plane_producer(&format!("n{}", std::process::id() % 10_000));
     let listed = botster_hub_client::request(
         hub.endpoint(),
         botster_hub_client::DaemonRequest::ListPackages,
@@ -435,20 +435,25 @@ fn isolated_hub_projects_notice_reactions_and_resolves_session_scoped_text() {
         Some("session-notice-1"),
         Some(empty_notice),
     );
+    let empty_payload = wait_for_package_event_token(&mut matching, "notice-empty");
+    let second_empty = wait_for_package_event_token(&mut second, "notice-empty");
     emit_sample_ready_payload(
         hub.endpoint(),
         "notice-oversize",
         Some("session-notice-1"),
         Some(&oversized),
     );
-    let matching_invalid =
-        wait_for_package_event_tokens(&mut matching, &["notice-empty", "notice-oversize"]);
-    let second_invalid =
-        wait_for_package_event_tokens(&mut second, &["notice-empty", "notice-oversize"]);
+    let oversize_payload = wait_for_package_event_token(&mut matching, "notice-oversize");
+    let second_oversize = wait_for_package_event_token(&mut second, "notice-oversize");
     // Ingress kept only payload-schema and total-payload-byte checks: both
     // notice-invalid events were accepted as package events.
 
-    for payload in matching_invalid.iter().chain(second_invalid.iter()) {
+    for payload in [
+        &empty_payload,
+        &second_empty,
+        &oversize_payload,
+        &second_oversize,
+    ] {
         let error = botster_ui_contract::resolve_notice_text(payload, &descriptor.text_pointer)
             .expect_err("invalid notice suppresses only the transient text");
         match payload["token"].as_str() {

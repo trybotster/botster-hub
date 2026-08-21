@@ -47,6 +47,11 @@
     },
     "PackageNoticeReactionDeclaration": {
       "additionalProperties": false,
+      "not": {
+        "required": [
+          "owner"
+        ]
+      },
       "properties": {
         "name": {
           "pattern": "\\S",
@@ -63,8 +68,7 @@
           "$ref": "#/$defs/PackageNoticeSubjectScope"
         },
         "text_pointer": {
-          "pattern": "^/[^/]*$",
-          "type": "string"
+          "$ref": "#/$defs/PackageNoticeTextPointer"
         },
         "ttl_ms": {
           "maximum": 60000,
@@ -99,8 +103,7 @@
           "$ref": "#/$defs/PackageNoticeSubjectScope"
         },
         "text_pointer": {
-          "pattern": "^/[^/]*$",
-          "type": "string"
+          "$ref": "#/$defs/PackageNoticeTextPointer"
         },
         "ttl_ms": {
           "maximum": 60000,
@@ -129,6 +132,10 @@
       "enum": [
         "session"
       ]
+    },
+    "PackageNoticeTextPointer": {
+      "pattern": "^/([^/~]|~0|~1)+$",
+      "type": "string"
     },
     "PackageSurfaceDescriptor": {
       "additionalProperties": false,

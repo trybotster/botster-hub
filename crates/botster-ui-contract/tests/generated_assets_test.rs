@@ -295,6 +295,43 @@ fn typescript_and_schema_encode_wire_names_and_optionality() {
                 .contains_key("maxLength"),
         "JSON Schema must not encode the 512-byte notice bound"
     );
+    assert_eq!(
+        schema["$defs"]["PackageNoticeTextPointer"]["pattern"],
+        json!("^/([^/~]|~0|~1)+$")
+    );
+    let notice_validator =
+        jsonschema::validator_for(&schema).expect("compile generated JSON Schema");
+    let owner_bearing_descriptor = json!({
+        "owner": "event-plane-producer",
+        "name": "sample.ready",
+        "subject_scope": "session",
+        "text_pointer": "/notice",
+        "ttl_ms": 5000,
+        "severity": "info"
+    });
+    assert!(
+        notice_validator.is_valid(&owner_bearing_descriptor),
+        "canonical schema must accept a projected owner-bearing descriptor"
+    );
+    let authored_without_owner = json!({
+        "name": "sample.ready",
+        "subject_scope": "session",
+        "text_pointer": "/a~1b",
+        "ttl_ms": 1000,
+        "severity": "warning"
+    });
+    assert!(
+        notice_validator.is_valid(&authored_without_owner),
+        "canonical schema must accept an authored declaration without owner"
+    );
+    for pointer in ["/", "/notice~", "/notice~2", "/a/b", "notice"] {
+        let mut invalid = owner_bearing_descriptor.clone();
+        invalid["text_pointer"] = json!(pointer);
+        assert!(
+            !notice_validator.is_valid(&invalid),
+            "canonical schema must reject malformed pointer {pointer}"
+        );
+    }
 
     let request_fields = interface_fields(&typescript, "UiActionRequest");
     let result_fields = interface_fields(&typescript, "UiActionResult");
