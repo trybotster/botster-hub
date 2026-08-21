@@ -9589,6 +9589,67 @@ mod tests {
     }
 
     #[test]
+    fn write_deadline_error_increments_t4_while_other_write_failure_does_not() {
+        let timeout_error = DaemonTransportError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "daemon client write deadline elapsed",
+        ));
+        let other_error = DaemonTransportError::Io(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "broken pipe",
+        ));
+        let timeout_class = egress_write_class(&timeout_error);
+        let other_class = egress_write_class(&other_error);
+        assert_eq!(timeout_class, EgressWriteClass::Timeout);
+        assert_eq!(other_class, EgressWriteClass::Other);
+
+        let mut diagnostics = DaemonEgressDiagnostics::default();
+        let mut counters = DaemonLifecycleCounters::default();
+        let data_directory = std::env::temp_dir().join(format!(
+            "hub-t4-class-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let config = crate::HubStartupOptions {
+            host: crate::HostIdentityOptions {
+                id: "t4-class".to_string(),
+                display_name: "T4 Class".to_string(),
+                fingerprint: None,
+            },
+            data_directory: crate::DataDirectoryOption::Explicit(data_directory.clone()),
+            ..crate::HubStartupOptions::default()
+        }
+        .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
+        .expect("config");
+        let runtime = crate::HubRuntime::new(config);
+        record_egress_write_failure(
+            &mut diagnostics,
+            &mut counters,
+            Some(&runtime),
+            DaemonDeliveryKind::Control,
+            other_class,
+        );
+        record_egress_write_failure(
+            &mut diagnostics,
+            &mut counters,
+            Some(&runtime),
+            DaemonDeliveryKind::Control,
+            timeout_class,
+        );
+        assert_eq!(counters.stalled_writes, 2);
+        assert_eq!(
+            runtime
+                .event_plane_counters_snapshot()
+                .stalled_write_timeouts,
+            1
+        );
+        let _ = std::fs::remove_dir_all(data_directory);
+    }
+
+    #[test]
     fn daemon_shutdown_waits_for_response_delivery_before_stopping() {
         let (completed_delivery_tx, completed_delivery_rx) = mpsc::channel();
         completed_delivery_tx
