@@ -2,6 +2,9 @@
 
 - Ticket: `ticket_1787267568_492780`
 - Run: `run_1787278338_832165`
+- Revision: **10**. Human decision `question_1787290055_403092` reclassifies oldest age as a bounded
+  diagnostic observation. The S1 design is rewritten and roughly halves in size. Revision 10 also corrects
+  a false statement in revision 9 gate evidence; see section 0z.
 - Revision: **9**. Revision 9 answers the two findings in `review_1787289501_106968`: producer retirement
   could not both prune the registry and avoid its lock, and S1f attributed `preview_package_replacement`
   to the wrong entry point. The cleanup fix removes a requirement rather than adding one.
@@ -21,6 +24,49 @@
 - Target id: `tgt_7e208a0c76a44980a83b63af976b1f22`
 - Base: `origin/main` at `b3b54f1` ("Merge ticket: Roll Core pin after IncrementalAttach local-runtime gate")
 - Core pin (verified in `Cargo.toml:24-26,43-44`): `7eafa470a18025895995bbedc20d34b58106a03b`
+
+## 0z. Correction of false revision 9 gate evidence
+
+Revision 9 gate evidence (`gate_result_1787289800_918473`) and artifact `artifact_1787289710_974650`
+stated that AC11 was tightened. **That statement was false.** AC11's body had not changed since revision 2;
+`git log -S` on its text confirms the last change was commit `ddc09dc`. Only its header line changed in
+revision 9.
+
+Cause, stated plainly so it is not repeated: my plan edits ran several string replacements in one script
+and wrote the file once at the end. When any anchor failed to match, the script aborted and discarded
+**every** edit in that script, including ones that had already been computed. I then verified by grepping
+for new strings that other, successful scripts had written, so the gaps looked closed. The same mechanism
+produced `finding_1787288993_766590` in review five, where superseded S1a instructions stayed active.
+
+Corrective action, per the human decision: each plan correction in revision 10 is applied as a **separate
+edit, verified immediately after it is applied**, and the final diff is inspected before the gate is
+submitted. Every acceptance item cited in revision 10 gate evidence was re-read in the committed file
+rather than assumed.
+
+## 0. Response to Plan Review `review_1787289951_879587` and human decision `question_1787290055_403092` (revision 10)
+
+The decision reclassifies ticket item 2. Oldest age is a **bounded diagnostic observation**, not
+authoritative queue state, and needs no exact linearizable snapshot. That single change dissolves two of
+the three findings rather than patching them, and the S1 design roughly halves in size.
+
+| Finding | Severity | Response |
+| --- | --- | --- |
+| `finding_1787289951_457652` — S1h does not separate age-list removal from registry pruning | blocker | **Dissolved by the decision, not patched.** The finding is correct about revision 9: I conflated the `RouterInner` age list with the snapshot-registry `Arc`, and a later admission could reuse a list whose cell was still marked dead, so a live producer would report no age. Under the decided model there is no dead flag and no lifetime split. Retirement **resets** the cell, a reset cell reports no usable age by contract, and a reused generation bumps `generation` and resets again, so S1c handles reuse in three stores. Registry pruning becomes a **memory bound only**, because a lingering entry is now harmless for correctness. |
+| `finding_1787289951_243880` — AC11 still requires immediate producer registry removal | high | **Accepted; this was the stale text from my broken edit process, disclosed in section 0z.** AC11 is rewritten against the decided model, with an exact numeric bound the churn test computes from `N` rather than the hand-wavy "roughly twice the peak live count" I wrote in revision 9. |
+| `finding_1787289951_802643` — dead-marker reads have no concurrency ordering rule | high | **Dissolved by the decision.** The finding is correct that revision 9 defined no write order, read order, or memory ordering across two atomics. The decided protocol replaces exactness with a bounded consistency read, so the only ordering needed is one release-ordered `mutations` bump after the value stores and one acquire-ordered load on each side of the sample. There is no second protocol to get wrong. AC19 is the direct control, including the ABA case. |
+
+**One deliberate tightening of the decided protocol, flagged rather than substituted silently.** The
+decision names a `count`-age-`count` bracket. A raw count is not monotonic, so a `5 → 6 → 5` sequence
+would pass that bracket while the sample is two mutations stale, exceeding the stated one-mutation bound.
+S1b therefore brackets on a **monotonic `mutations` stamp** while the sample still carries `count`. Same
+shape, and it is what makes the stated bound hold.
+
+**One reversal of a previously resolved finding, recorded explicitly.** Revision 7's S1e made a
+diagnostic slot-reservation failure return a typed non-accepted result, which let a diagnostic failure
+reject a valid event. That resolved `finding_1787288480_127520`. The decision reclassifies the age as
+non-authoritative, so that rule is now wrong. S1f withdraws it: a diagnostic failure never changes
+acceptance, the sample becomes indeterminate, and `age_sample_failures` counts it. AC16 is rewritten to
+prove the reversal.
 
 ## 0. Response to Plan Review `review_1787289501_106968` (revision 9)
 
@@ -201,259 +247,147 @@ and never inside `RouterInner`. Contents:
   - **delivery latency** is the wall time from `Envelope.enqueued_at` to the moment a queued copy becomes
     a `ReadyDelivery` in the pull loop.
 - Typed timeout counters T1–T3 (see S3).
-- Oldest-age cells, redesigned in revision 2 (see S1a and S1b).
+- Per-queue `QueueAgeMetric` cells, which carry the **bounded diagnostic** oldest age rather than an
+  authoritative value (see S1a through S1d).
 
-**S1a. Oldest-age sources (redesigned in revision 6 for `finding_1787287893_905201` and
-`finding_1787287893_967012`).**
+**S1a. Oldest age is a bounded diagnostic observation, not authoritative queue state.**
 
-Consumer queues (`ConsumerQueue.copies: VecDeque`, `src/package_event_router.rs:202-207`) and client
-mailboxes (`MailboxInner.events: VecDeque`, `src/daemon_event_subscriptions.rs:120-123`) already expose a
-head, so their oldest age is an `O(1)` front read with no new structure.
+Human decision of record: `question_1787290055_403092`. Revisions 2 through 9 assumed the oldest age had
+to be exact and linearizable. That assumption, which I introduced rather than the ticket, forced lock-free
+retirement, deferred registry pruning, cross-atomic ordering, and list-versus-registry lifetime
+separation, and it produced most of the twenty-two findings this plan has drawn. The decision reclassifies
+the signal and the design collapses accordingly.
 
-Producers have no ordered structure: `ProducerOccupancy` (`:197-200`) holds only `events` and `bytes`, and
-`retire_holder_locked` (`:1338-1352`) removes envelopes from an unordered `HashMap` in arbitrary order.
+**The contract, exactly as decided:**
 
-Two earlier attempts failed review. Revision 2 used a `BTreeSet`, which allocates and compares on the
-event path. Revision 4 used a tombstone ring, which **loses a live entry**: `producer.events` counts live
-entries while the ring's `len` counted the occupied span including tombstones, so after a middle
-retirement the shed check admits another event and `slot = (head + len) % cap` overwrites the live oldest.
+- Oldest age is a **bounded diagnostic observation**. It is not authoritative queue state and needs no
+  exact linearizable snapshot.
+- **Staleness bound: at most one successful mutation of that exact queue.**
+- **A queue whose observed count is zero reports no usable age.** Not a zero age, not a stale age.
+- The reader uses a **bounded non-blocking consistency read**: count, then age, then count again, with **at
+  most one retry**. If the count changes across the bracket, the sample is **indeterminate** and must be
+  published as an explicit indeterminate marker. **An indeterminate sample must never become a false age.**
+- The reader must **never lock, wait, spin, or allocate per sample**, and must never publish an age from a
+  **retired or reused producer generation**.
+- A later producer generation **starts with a fresh or explicitly reset metric cell**.
+- **Authoritative signals are unchanged**: queue count, shed, gap, latency, and the four timeout counters
+  keep their existing contracts and are not weakened by this reclassification.
+- Campaign usage, recorded so the consumer ticket inherits it: age is valid for **trend, expiry, and
+  stuck-queue diagnostics**. A single indeterminate or one-event-stale sample **must not be treated as
+  authoritative failure evidence**.
 
-Revision 6 uses an **intrusive doubly-linked age list over preallocated slots, with a free-slot list**:
+**S1b. The metric cell.**
 
 ```rust
-const NIL: u32 = u32::MAX;
-
-struct ProducerAgeSlot {
-    nanos: u64,   // enqueue time, nanoseconds since the counters base Instant
-    prev: u32,    // NIL at the head
-    next: u32,    // NIL at the tail; also links the free list
-}
-
-struct ProducerAgeList {
-    slots: Box<[ProducerAgeSlot]>, // length = policy.producer_queue_max_events (default 256)
-    head: u32,   // oldest live entry, NIL when empty
-    tail: u32,   // newest live entry, NIL when empty
-    free: u32,   // free-list head, singly linked through `next`
+struct QueueAgeMetric {
+    mutations: AtomicU64,     // monotonic version stamp, bumped by every successful queue mutation
+    count: AtomicU64,         // observed queue count at the last mutation
+    oldest_nanos: AtomicU64,  // u64::MAX = empty
+    generation: AtomicU64,    // producer generation that owns this cell
 }
 ```
 
-`Envelope` gains `producer_slot: u32`, so retirement addresses its own slot directly.
+**One deliberate tightening of the decided protocol.** The decision names a `count`-age-`count` bracket.
+A raw count is not monotonic: it can return to the same value across two mutations, so an ABA over a
+`5 → 6 → 5` sequence would pass a naive bracket while the sample is two mutations stale, exceeding the
+stated one-mutation bound. The bracket therefore compares a **monotonic `mutations` stamp** while the
+sample still carries `count`. This is the same shape the decision describes and it is what makes the
+stated bound actually hold. I am flagging it rather than silently substituting it.
 
-| Operation | Steps | Cost | Allocator calls |
-| --- | --- | --- | --- |
-| push (accepted event) | pop `free`, write `nanos`, link at `tail` | strict `O(1)` | zero |
-| remove (retirement, any position) | unlink through `prev`/`next`, repair `head`/`tail`, push slot to `free` | strict `O(1)` | zero |
-| oldest age (read) | `slots[head].nanos`, or the empty sentinel when `head == NIL` | strict `O(1)` | zero |
+**Writer rule**, executed while the writer already holds the router or mailbox lock it holds today:
+update the queue, then store `count` and `oldest_nanos`, then bump `mutations` last. No new lock, no
+allocation, no additional critical section.
 
-There is no scan, no comparison, no amortization argument, and no head-advance loop. Middle retirement is
-exact, because unlinking repairs both neighbours instead of relying on tombstone skipping.
+**Reader rule**, holding no lock at all:
 
-**Capacity invariant.** The push happens beside `producer.events += 1` (`:538-539`), which is **after** the
-shed check at `:481-483`. The live slot count therefore equals `producer.events` at all times, and both
-are bounded by `producer_queue_max_events`. The free list is consequently never empty at push time.
-`push` returns `Option<u32>`, and **a `None` result never degrades silently**: S1e requires the caller to
-return a typed non-accepted result before any mutation and to count the failure. AC13 asserts `None` never
-occurs, and AC16 asserts the fail-closed path when it is forced.
-
-**Allocation lifecycle — moved entirely out of the event path.** Revision 4 put the buffer on
-`ProducerOccupancy`, which `try_ingress` creates lazily through `entry(...).or_insert(...)` at
-`:473-478`, **before** the shed check. That is inside the event path, and a shed event would allocate too.
-The lists therefore live in their own `RouterInner` map. **S1c and S1f are the authoritative lifetime and
-admission rules; the summary here must not be read as permitting removal at unload or a silent skip.**
-
-- **Allocated after a whole admission succeeds** (S1f), never on an event path.
-- **Retained while `contracts_exist(owner) || producer.events > 0`** and removed only when both are false
-  (S1c). Unload alone never removes it.
-- **`try_ingress` performs a lookup only.** It calls `get_mut` and never inserts. A missing list is
-  structurally unreachable for an accepted event, because `try_ingress` returns `RejectedUndeclared` at
-  `:427-436` before producer occupancy. If it ever occurs, S1e fails closed with a typed non-accepted
-  result and a counted failure rather than skipping the age update.
-
-**Allocation, stated precisely and completely.** One `Box<[ProducerAgeSlot]>` per admitted producer, at
-the S1f admission commit point. At the default bound that is 256 × 16 bytes = 4 KB per producer. **No allocator call
-occurs on any accepted-event path or any shed path.** AC6 proves this with a deterministic allocation
-control rather than a pointer comparison.
-
-Each published age is stored in an `AgeCell`: one `AtomicU64` holding nanoseconds since a `base: Instant`
-captured at counter construction, with `u64::MAX` as the empty sentinel. Writers update the cell while
-they already hold the router or mailbox lock, whenever the list head changes. Readers touch only the
-atomic.
-
-**S1c. Age-list lifetime across unload and package replacement (fixes `finding_1787288480_816963`).**
-
-`apply_unload` (`src/package_event_router.rs:1232-1281`) removes contracts, subscriptions, client holders,
-and queued copies. It deliberately leaves `inner.envelopes`, `inner.admitted`, and `inner.producer`
-occupancy intact, because `[[admitted event holders survive producer unload until Core completion]]`
-requires admitted Background jobs to keep occupancy until Core completes them. `retire_holder_locked`
-(`:1338-1352`) then decrements `producer.events` on that late completion.
-
-Revision 6 removed the age list in `apply_unload`, which is wrong twice over. A late completion would
-address a list that no longer exists, and package replacement — unload followed by admitting the next
-generation — would let an old-generation completion unlink a slot now owned by the new generation.
-
-Revision 7 ties the list to the same lifetime as producer occupancy:
-
-- **One list per owner.** It is created at first contract admission and **reused across package
-  replacement**. Replacement never recreates or swaps the list, so `producer_slot` values on live
-  envelopes stay valid across the generation boundary.
-- **Retained while `contracts_exist(owner) || producer.events > 0`.** Unload alone never removes it.
-- **Eligible for removal only when both are false.** Eligibility is detected at `apply_unload`, when
-  `producer.events` is already zero, and at `retire_holder_locked`, when the final admitted holder retires
-  and no contract remains. **Detection is not removal**: per S1h, the retirement path only marks the cell
-  dead through an atomic flag, and the actual registry removal is deferred to the next admission, because
-  retirement must not take the registry lock.
-
-**S1d. Age cells are `Arc`-shared, and no event path takes the registry lock (fixes
-`finding_1787288480_692236`).**
-
-Revision 6 had event writers acquire the snapshot registry's `RwLock` on every update. Ingress already
-spends its one permitted `try_lock` on `RouterInner`; a second blocking lock would let a status read, a
-contract admission, or an unload delay an accepted event while it holds the router lock. That breaks the
-project's no-wait ingress invariant and changes the router's load class, which is the exact failure
-`[[load diagnostics must not cost work proportional to what they measure]]` warns about.
-
-Revision 7 removes the registry from every event path:
-
-- Each `AgeCell` is created **outside** any event path and shared as `Arc<AgeCell>`.
-- The producer age list, the consumer queue, and the client mailbox each hold a **direct**
-  `Arc<AgeCell>` and update its `AtomicU64` through that handle.
-- The snapshot registry holds a **second** `Arc` to the same cell, purely for enumeration.
-- The registry lock is therefore taken only at admission (write) and at status read (read). Retirement
-  marks a cell dead with an atomic flag and **never** takes it (S1h).
-  **No accepted-event, shed, or retirement path acquires it.**
-
-**S1e. No silent acceptance without age observation (fixes `finding_1787288480_127520`).**
-
-The ticket requires every producer queue age to be readable. Revision 6's "skip the age update when the
-list is absent or `push` returns `None`" fallback would have returned `Accepted` with no age, converting
-an invariant breach into missing observability under exactly the saturation the campaign creates.
-
-Revision 7 makes the state structurally unreachable and fails closed if it ever occurs:
-
-- The list exists for every owner that can reach an accepted emit, because `try_ingress` returns
-  `RejectedUndeclared` (`:427-436`) before producer occupancy when no contract exists, and S1c keeps the
-  list alive while occupancy is nonzero.
-- Capacity is guaranteed by the existing shed check (`:481-483`), so the free list is never empty.
-- **Order of operations changes:** the slot is reserved **after** the shed check and **before** any
-  envelope insert or occupancy increment.
-- A reservation failure returns a **typed non-accepted result** (`EventPlaneStatus::ShedFull`) before any
-  mutation, never `Accepted`, and increments a dedicated `producer_age_reservation_failures` counter so an
-  invariant breach is loud in the same status payload rather than silent.
-
-**S1f. Diagnostic admission is committed only after the whole batch succeeds (fixes
-`finding_1787288993_312281`).**
-
-`commit_package_generation_locked` (`src/package_event_router.rs:1041-1066`) takes `snapshot_admission`
-before admitting subscriptions sequentially, and calls `restore_admission` if any later subscription
-fails. `AdmissionSnapshot` (`:946-967`) carries only `contracts`, `subscriptions`,
-`subscriptions_per_plugin`, and `package_generation`. It carries **no** consumer queues, producer age
-lists, or snapshot-registry entries.
-
-So a batch whose first subscription is valid and whose later subscription is invalid would roll back
-contract state while leaving new age lists, consumer cells, and registry entries behind. That breaks the
-documented atomic package-generation commit and the S1b identity bound.
-
-Revision 8 takes the reviewer's preferred option rather than extending rollback: **no diagnostic state is
-created until the entire admission is known to succeed.**
-
-Correcting revision 8's citation: `preview_package_replacement` is called at `:367`, which is inside
-`try_replace_package_generation` (opens at `:352`), **not** inside `try_commit_package_generation`
-(`:333-349`). The three entry points differ, and the same rule holds for each for a different reason:
-
-- **`try_commit_package_generation` (`:333`)** validates contract ownership and then calls
-  `commit_package_generation_locked` directly. It has **no** full-batch preview and relies on sequential
-  `subscribe_locked` with `restore_admission`. The rule holds because the diagnostic commit point sits
-  **after the last fallible step**, so the rollback path has nothing to undo.
-- **`try_replace_package_generation` (`:352`)** does pre-validate through `preview_package_replacement`
-  (`:367`) before `apply_unload` and the same commit call. The rule holds for the same commit-point reason,
-  with preview as an additional earlier guard.
-- **`try_register_contracts` (`:300`)** validates the whole contract batch first, then creates age state
-  once.
-- Rollback therefore needs no extension, and `restore_admission` keeps its exact current shape.
-- If Implement finds any admission path where a partial failure can still occur after diagnostic
-  creation, it must extend rollback to remove **only** state created by that attempt, never disturbing
-  pre-existing queues, cells, lists, or live occupancy — and must report that deviation.
-
-AC17 is the red-first control: a mixed valid-then-invalid batch, comparing every admission map **and**
-every diagnostic map against the exact pre-call state.
-
-**S1g. A retired consumer age handle is cleared, then rebound (fixes `finding_1787288993_721291`).**
-
-S1d puts a direct `Arc<AgeCell>` on `ConsumerQueue`, and S1b removes the registry entry when neither a
-subscription nor a queued copy remains. But `inner.consumers` entries are never removed and this plan
-does not change that, so a retained queue would keep the old `Arc` after the registry dropped its own.
-A later subscription for the same plugin key could then reuse that queue and update a stale cell while
-status reads a newly registered one.
-
-Revision 8 makes the handle explicitly rebindable:
-
-```rust
-struct ConsumerQueue {
-    events: usize,
-    bytes: usize,
-    copies: VecDeque<QueuedCopy>,
-    age: Option<Arc<AgeCell>>, // None once the identity retires
-}
+```text
+v1 = mutations.load(Acquire)
+sample = (count, oldest_nanos, generation)     // relaxed loads
+v2 = mutations.load(Acquire)
+if v1 == v2 and count > 0 -> usable age
+if v1 == v2 and count == 0 -> no usable age
+otherwise -> retry once, then report indeterminate
 ```
 
-- **On retirement** of the consumer identity, the queue's `age` is set to `None` in the same step that
-  removes the registry entry, so the old cell can receive no further updates.
-- **On the next subscription admission**, the queue's `age` is bound to the **new** registry `Arc`, so the
-  event path and the registry reference the same cell.
-- **A `None` handle on the event path is an invariant breach, not a silent skip.** It is structurally
-  unreachable, because a queued copy requires an admitted subscription, which rebinds first. If it ever
-  occurs, Hub counts `consumer_age_binding_failures` and skips **that one consumer**, which matches the
-  existing per-consumer behaviour at `:493-497` where an over-capacity consumer is skipped with
-  `continue`. This deliberately differs from the producer rule in S1e, where a missing age fails the whole
-  emit, because producer age gates acceptance while consumer capacity already has per-consumer semantics.
+`mutations` supplies the only ordering the design needs: one release-ordered bump after the value stores,
+one acquire-ordered load on each side of the sample. There is no separate dead flag and no second ordering
+protocol to get wrong.
 
-AC18 is the red-first control for the unsubscribe-or-unload, re-subscribe, first-copy path.
+**S1c. Retirement and generation reuse.**
 
-**S1h. Registry pruning is deferred to admission, so retirement never takes the registry lock (fixes
-`finding_1787289501_918216`).**
+Retiring a producer identity **resets** its cell: `oldest_nanos` to the empty sentinel, `count` to zero,
+then a `mutations` bump. A retired cell therefore reports **no usable age** by the S1a rule, which is what
+prevents a retired generation from ever publishing an age. Admitting a later producer generation bumps
+`generation` and resets the cell the same way, so a reused cell starts fresh and a reader bracketing
+across the reset sees a version mismatch and reports indeterminate rather than a stale value.
 
-Revisions 7 and 8 contradicted themselves. S1b and S1c required `retire_holder_locked` to remove the
-producer registry entry; S1d required the registry lock at admission and status read only; AC15 required a
-retirement to complete while another thread holds that lock. A retirement cannot remove a registry entry
-without taking the lock it is forbidden to take.
+This removes the revision 9 machinery entirely: no `dead: AtomicBool`, no list-versus-registry lifetime
+split, and no requirement that retirement remove anything. Retirement writes three values and one bump.
 
-Revision 9 resolves this by **removing the retirement-side requirement**, not by adding a cleanup path:
+**S1d. Registry lifetime is now a memory bound only.**
 
-- **Retirement marks, it does not remove.** `AgeCell` gains `dead: AtomicBool`. When `apply_unload` or
-  `retire_holder_locked` observes `contracts_exist(owner) == false && producer.events == 0`, it sets that
-  flag through the direct `Arc`. This is one atomic store, takes no registry lock, and satisfies AC15.
-- **A dead cell reports the empty sentinel.** Status readers observing `dead == true` report the empty age
-  rather than a stale value, so deferred removal never publishes stale observability.
-- **Pruning happens at the next registry write.** Admission already holds the registry write lock and is
-  never on an event path. Every admission sweeps and drops entries whose cell is marked dead.
-- **Status read never prunes** and keeps its read lock only.
+Because a retired cell reports no usable age, a lingering registry entry is **harmless for correctness**.
+Pruning is therefore only a memory concern, not a correctness one:
 
-**Why the bound is real.** A producer identity can enter the registry only through admission, and every
-admission prunes before it inserts. Dead-but-unpruned entries therefore accumulate only between two
-admissions, and creating any new identity forces a sweep first. Registry size is bounded by
-`live_identities + dead_since_last_admission`, and because a new identity cannot appear without an
-admission, that is bounded by roughly twice the peak live identity count rather than growing with churn.
+- Each `QueueAgeMetric` is shared as `Arc` and held directly by the producer entry, consumer queue, and
+  client mailbox, so **no event path and no retirement path acquires the registry lock**.
+- The registry holds a second `Arc` purely for enumeration, and takes its lock only at admission (write)
+  and status read (read).
+- Admission prunes entries whose cell is retired and unreferenced. Admission is the only path that
+  inserts, so the registry is bounded by live identities plus those retired since the last admission.
 
-AC11 is updated to assert this exact bound: after unload, unsubscribe, connection cleanup, and a
-reconnect-churn loop, the registry holds at most `live + dead_since_last_admission` entries, and after one
-further admission it returns to exactly the live-identity count.
+**S1e. Producer oldest-age source.**
 
-**S1b. Age-cell identity lifetime (fixes the second half of `finding_1787279337_990629`).**
-Revision 1 left the three identity maps with no removal rule. Revision 2 slaves each map to the live
-identity set that already exists, and removes a cell at exactly the site that ends that identity:
+Producers have no queue head: `ProducerOccupancy` (`src/package_event_router.rs:197-200`) holds only
+`events` and `bytes`, and `retire_holder_locked` (`:1338-1352`) removes envelopes from an unordered
+`HashMap` in arbitrary order. The intrusive age list from revision 6 remains the cheap way to know the new
+oldest after an out-of-order retirement, and it survived review on its own merits:
 
-| Map | Key | Insert site | Remove site |
-| --- | --- | --- | --- |
-| producer ages | package owner | **contract admission**: `try_register_contracts` (`:300`), `try_commit_package_generation` (`:333`), `try_replace_package_generation` (`:352`), and `PackageEventRouter::new` for the built-in Hub contracts. Never on an event path. Reused across package replacement. | **marked dead** when `contracts_exist(owner) == false` **and** `producer.events == 0`, detected at `apply_unload` or `retire_holder_locked`; **removed from the registry** at the next admission sweep, never on the retirement path (see S1c and S1h) |
-| consumer ages | plugin key | **subscription admission** (`try_subscribe`, `try_commit_package_generation`). Never on an event path. | only when the plugin key retains **no subscription and no queued copy**, checked at `apply_unload` and at `unsubscribe` |
-| mailbox ages | connection id | mailbox creation | `cleanup_client_connection_locked` and the connection removals at `src/daemon_event_subscriptions.rs:434-437` and `:481` |
+```rust
+struct ProducerAgeSlot { nanos: u64, prev: u32, next: u32 }
+struct ProducerAgeList { slots: Box<[ProducerAgeSlot]>, head: u32, tail: u32, free: u32 }
+```
 
-Note for Implement: `inner.consumers` entries are **not** removed today, so the consumer age map must be
-pruned by the rule above rather than by mirroring `inner.consumers`. Implement must not "fix" the router's
-own retention as a side effect; that is out of scope.
+`Envelope` carries `producer_slot: u32`. Push pops the free head and links at tail; remove unlinks through
+`prev`/`next` and returns the slot; oldest reads `slots[head].nanos`. All three are strict `O(1)` with zero
+allocator calls. The list is allocated at the S1g admission commit point and never on an event path.
 
-Bound: each map length must be less than or equal to the count of live identities. AC11 proves the maps
-return to the live bound after unload, unsubscribe, connection cleanup, and reconnect churn.
+Consumer queues and client mailboxes read their existing `VecDeque` front in `O(1)` and need no new
+structure.
+
+**S1f. A diagnostic failure never changes production behaviour — this reverses revision 7's S1e.**
+
+Revision 7 made a producer slot-reservation failure return a typed non-accepted result, so a diagnostic
+failure could reject an otherwise valid event. That rule existed because the age was then treated as
+required for acceptance. **The human decision reclassifies the age as a non-authoritative diagnostic, so
+that rule is now wrong and is withdrawn.** Recorded explicitly because it reverses the resolution of
+`finding_1787288480_127520`, whose rationale the decision supersedes.
+
+The rule going forward:
+
+- A slot-reservation failure or a missing cell **does not affect acceptance**. The event is admitted or
+  shed on its existing production criteria alone.
+- The affected sample becomes **indeterminate**, never a false age.
+- Hub increments `age_sample_failures` so the invariant breach is visible rather than silent.
+- The same rule applies to consumers, replacing revision 8's separate per-consumer binding-failure rule.
+
+**S1g. Diagnostic state is created only after a whole admission succeeds.**
+
+`commit_package_generation_locked` (`:1041-1066`) snapshots through `snapshot_admission` and restores on a
+failed later subscription, and `AdmissionSnapshot` (`:946-967`) carries only `contracts`, `subscriptions`,
+`subscriptions_per_plugin`, and `package_generation`. Creating diagnostic state mid-batch would survive
+that restore. Diagnostic creation therefore happens at a **single commit point after the last fallible
+step**, so rollback has nothing to undo and `AdmissionSnapshot` keeps its exact shape.
+
+Correct per-entry-point inventory, fixing revision 8's misattribution:
+
+- **`try_commit_package_generation` (`:333-349`)** validates contract ownership then calls
+  `commit_package_generation_locked` directly. It has **no** preview and relies on sequential
+  `subscribe_locked` with `restore_admission`.
+- **`try_replace_package_generation` (`:352`)** calls `preview_package_replacement` (`:367`) before
+  `apply_unload` and the same commit. The `:367` call site is inside **this** function, not the direct
+  commit.
+- **`try_register_contracts` (`:300`)** validates the whole contract batch first.
 
 **S2. Saturation-safe read path (ticket item 6).**
 A new `HubRuntime::event_plane_counters_snapshot()` reads only atomics plus short read guards on the
@@ -712,9 +646,9 @@ registry and source check before writing either literal.
 
 | File | Change |
 | --- | --- |
-| `src/event_plane_counters.rs` (new) | `EventPlaneCounters`, fixed histogram, `AgeCell`, identity maps, snapshot type |
+| `src/event_plane_counters.rs` (new) | `EventPlaneCounters`, fixed shed-by-reason array, fixed-bucket histograms, `QueueAgeMetric` with the monotonic `mutations` stamp, the bounded consistency read, the enumeration-only registry with its admission-time prune, and the snapshot type |
 | `src/lib.rs` | register the new module and re-export the snapshot type |
-| `src/package_event_router.rs` | shed by typed reason, admission and delivery attempts, latencies, T2, a new `RouterInner` producer age-list map allocated at contract admission and reused across replacement, `Envelope.producer_slot`, `Arc<AgeCell>` handles on the producer entry and consumer queue, age-list removal gated on no contract and zero occupancy in both `apply_unload` and `retire_holder_locked`, and slot reservation before envelope or occupancy mutation, producer and consumer age cells, unload-time cell removal |
+| `src/package_event_router.rs` | shed by typed reason, admission and delivery attempts, latencies, T2, a `RouterInner` producer age-list map created at the S1g admission commit point, `Envelope.producer_slot`, `Arc<QueueAgeMetric>` handles on the producer entry and consumer queue, cell **reset** (empty age, zero count, `mutations` bump) at identity retirement in `apply_unload` and `retire_holder_locked`, `generation` bump plus reset when a later generation is admitted, opportunistic registry prune at admission only, and a diagnostic failure that never changes acceptance |
 | `src/daemon_event_subscriptions.rs` | overflow gap count, T3 mailbox-expiry count, mailbox age cell, cell removal on connection cleanup |
 | `src/daemon_maintenance.rs` | T1 typed completion counting; seam 3 for the two `timeout_ms` sites |
 | `src/daemon_transport.rs` | `EgressWriteClass` on `ControlMessage::EgressWriteFailed`, T4 in `record_egress_write_failure`, `enqueued_at` on `ControlMessage::Request` plus its two senders here, the owner-loop serve-site measurement, owner-turn recording, status projection |
@@ -744,26 +678,35 @@ registry and source check before writing either literal.
   at `src/package_event_router.rs:473-483`, so the age list is deliberately kept in a separate map that is
   populated at contract admission. AC6 part 1 is the control.
 - **R2. A second lock replaces the first.** Revision 6 had event writers take the registry `RwLock`, which
-  would have let a status read or an admission delay an accepted event. Revision 7 shares each `AgeCell`
-  by `Arc`, so event paths update the atomic through a direct handle and **no event path acquires the
-  registry lock**. AC4 covers the status read; AC15 is the ingress-contention control.
-- **R13 (new in revision 7).** Diagnostic storage whose lifetime is tied to contracts can be freed while
-  admitted holders still reference it, and package replacement can alias a stale slot to a new generation.
-  S1c ties the list to `contracts || producer.events > 0` and reuses one list across replacement. AC14 is
-  the control.
+  would have let a status read or an admission delay an accepted event. Each `QueueAgeMetric` is shared by
+  `Arc`, so event and retirement paths update atomics through a direct handle and **no event path and no
+  retirement path acquires the registry lock**. AC4 covers the status read; AC15 is the contention control.
+- **R13 (rewritten in revision 10).** A retired or reused generation can publish an age that belongs to a
+  previous generation. S1c resets the cell at retirement and bumps `generation` plus resets again on
+  reuse, so a reused cell starts fresh and a reader bracketing across the reset reports indeterminate.
+  AC14 and AC18 are the controls.
+- **R18 (new in revision 10).** A non-monotonic version stamp admits ABA: a `5 -> 6 -> 5` count sequence
+  would pass a raw count bracket while the sample is two mutations stale, silently exceeding the decided
+  one-mutation bound. S1b brackets on a monotonic `mutations` stamp, and AC19 includes the ABA case.
+- **R19 (new in revision 10).** An indeterminate sample could be rendered as a real value by a careless
+  status projection, which would be worse than omitting it. S1a requires an explicit indeterminate marker
+  and AC19 asserts a false age is never published.
 - **R15 (new in revision 8).** New state added at admission is invisible to an existing rollback snapshot.
   `AdmissionSnapshot` covers four maps only, so any diagnostic map created mid-batch would survive a
   restore. S1f avoids this by committing diagnostic state only after the whole batch succeeds. AC17 is the
   control.
-- **R17 (new in revision 9).** A cleanup rule and a no-lock rule can contradict each other silently when
-  they live in different sections. S1h resolves this by removing the retirement-side registry requirement,
-  and AC11 plus AC15 now assert the same design from both directions.
-- **R16 (new in revision 8).** A long-lived container that outlives its identity can retain a stale shared
-  handle. `inner.consumers` entries are never removed, so the queue's age handle must be cleared at
-  retirement and rebound at the next admission. AC18 is the control.
-- **R14 (new in revision 7).** A defensive "skip the diagnostic" fallback silently degrades observability
-  under exactly the load being measured. S1e replaces it with a fail-closed typed result plus a counted
-  failure. AC16 is the control.
+- **R17 (rewritten in revision 10).** A cleanup rule and a no-lock rule can contradict each other silently
+  when they live in different sections. Under the decided model a lingering registry entry is harmless,
+  because a reset cell reports no usable age, so pruning is a memory bound only. AC11 and AC15 assert the
+  design from both directions.
+- **R16 (rewritten in revision 10).** A long-lived container that outlives its identity can retain a stale
+  shared handle. `inner.consumers` entries are never removed, so the cell is **reset** at retirement and
+  its `generation` bumped on reuse, which makes a retained handle report no usable age rather than a stale
+  one. AC18 is the control.
+- **R14 (rewritten in revision 10).** A defensive skip degrades observability silently. The decided model
+  keeps that concern without letting diagnostics affect production: a failure yields an **explicit
+  indeterminate sample** plus a counted `age_sample_failures`, and never a false age, while acceptance is
+  untouched. AC16 and AC19 are the controls.
 - **R3. Public DTO break.** Now measured rather than assumed: one external `cfg(test)` literal. AC10
   converts the estimate into evidence before Implement claims compatibility.
 - **R4. Accidental behavior change.** T1 must keep `run_completion_drain_slice` retirement identical, and
@@ -867,49 +810,52 @@ record the failing output **before** the change, per
        `npm run typecheck`, and `npm run build`, per
        `[[botster web generated protocol drift checks need explicit hub artifact paths]]`.
      - Remove both scratch worktrees afterwards and commit nothing to either consumer.
-- **AC11 — diagnostic identity retirement and registry bound, red first (new in revision 2, tightened in
-  revision 9).** Tests prove each age map
-  returns to the live-identity bound after: package unload, client unsubscribe, connection cleanup, and a
-  reconnect-churn loop that creates and destroys many connection ids. The churn case must fail when a
-  removal site is omitted, which Implement demonstrates by deleting one removal and recording the red run.
+- **AC11 — retired cells report no usable age, and the registry stays bounded, red first (rewritten in
+  revision 10).** Revision 9 claimed this was tightened; it was not, and its body still described
+  immediate removal. Rewritten now to match the decided model. Assert three things. First, after package
+  unload, client unsubscribe, and connection cleanup, the retired cell reports **no usable age** because
+  its `count` is zero, and never a stale value. Second, run a reconnect-churn loop that creates and
+  destroys `N` identities with no intervening admission, and assert the registry holds at most
+  `live + retired_since_last_admission`, a number the test computes exactly from `N` rather than an
+  approximation. Third, assert that the next successful admission prunes every prior retired entry and the
+  registry returns to exactly the live-identity count. The test must fail when the prune site is omitted.
+- **AC19 — bounded consistency read, red first (new in revision 10).** The direct control for the decided
+  protocol. Assert: a queue with `count > 0` and a stable `mutations` bracket yields a usable age; a queue
+  with `count == 0` yields **no usable age**, never a zero age; a mutation forced between the bracket loads
+  yields **indeterminate** after exactly one retry and **never a false age value**; the reader takes no
+  lock, performs no retry beyond one, and allocates nothing per sample. Include an ABA case that mutates
+  the queue twice so a raw `count` returns to its original value, and assert the monotonic `mutations`
+  stamp still reports indeterminate — this is what makes the one-mutation staleness bound hold. Implement
+  must show AC19 red against a naive count-only bracket.
 - **AC17 — admission rollback leaves no diagnostic residue, red first (new in revision 8, split in
   revision 9).** Run the case **separately for `try_commit_package_generation` and
   `try_replace_package_generation`**, because their failure paths differ: direct commit has no preview and
   fails inside sequential subscription admission, while replacement can also fail at
-  `preview_package_replacement` before `apply_unload`. In each case, submit a
-  package generation whose first subscription is valid and whose later subscription is invalid. Capture
-  every admission map and every diagnostic map before the call. Assert that after the failure, `contracts`,
-  `subscriptions`, `subscriptions_per_plugin`, `package_generation`, `consumers`, the producer age-list
-  map, and the snapshot registry each equal their exact pre-call state. Implement must show this red
-  against a variant that creates diagnostic state before the batch completes.
-- **AC18 — consumer age handle is cleared and rebound, red first (new in revision 8).** Subscribe, queue a
-  copy, then unsubscribe or unload so the identity retires. Assert the retained queue's `age` is `None` and
-  the registry entry is gone. Re-subscribe the same plugin key, queue a first copy, and assert the event
-  path and the registry reference the **same new cell**, that the old cell receives no updates, and that
-  the status age reflects the new copy. Implement must show this red against a variant that keeps the
-  original `Arc` on the retained queue.
-- **AC14 — age-list survival across unload and replacement, red first (new in revision 7).** Admit a
-  producer contract, emit an event that Core admits as a Background holder, then unload the producer, then
-  admit the next generation (package replacement), then complete the **old** holder late. Assert that the
-  old holder's `producer_slot` still addresses the same live list, that its retirement decrements the
-  correct occupancy, that it does not unlink a slot owned by the new generation, and that the oldest age
-  stays readable throughout. Assert the list becomes eligible for removal only after the last contract is
-  gone **and** `producer.events` reaches zero, that the final retirement only **marks** the identity dead
-  through the atomic flag, and that the registry entry disappears at the next admission sweep per S1h.
-  Implement must show this red against the revision 6 behaviour that removed the list in `apply_unload`.
-- **AC15 — ingress and retirement never wait on the diagnostic registry, red first (new in revision 7,
-  tightened in revision 9).** Hold the
-  snapshot registry lock on one thread. On another thread run an accepted emit, a shed emit, and a
-  retirement, **including a final retirement that marks a producer identity dead**, which S1h requires to
-  complete through an atomic flag without the registry lock. Assert all three complete without waiting for the registry lock and without returning
-  `ShedBusy` for that reason. Implement must show this red against the revision 6 design that acquired the
-  registry lock on the event path.
-- **AC16 — no accepted event without a live producer slot, red first (new in revision 7).** Assert that
-  every accepted envelope holds exactly one live producer slot from acceptance through retirement, across
-  unload and package replacement, and that the live slot count equals `producer.events` at every step. Force
-  a reservation failure through a test seam and assert the result is a typed non-accepted status, that no
-  envelope or occupancy mutation occurred, and that `producer_age_reservation_failures` incremented.
-  `Accepted` with a missing age must fail this test.
+  `preview_package_replacement` before `apply_unload`. In each case, submit a package generation whose
+  first subscription is valid and whose later subscription is invalid. Capture every admission map and
+  every diagnostic map before the call, and assert each equals its exact pre-call state afterwards.
+  Implement must show this red against a variant that creates diagnostic state before the batch completes.
+- **AC18 — a reused generation starts fresh, red first (rewritten in revision 10).** Subscribe, queue a
+  copy, then retire the identity through unsubscribe or unload. Assert the cell reports no usable age.
+  Admit the **next** generation for the same key, queue a first copy, and assert the reported age belongs
+  to the new generation, that `generation` advanced, and that no sample from the retired generation can be
+  published. Implement must show this red against a variant that reuses the cell without resetting it.
+- **AC14 — late completion after unload and replacement, red first (new in revision 7, rewritten in
+  revision 10).** Admit a producer contract, emit an event that Core admits as a Background holder, unload
+  the producer, admit the next generation, then complete the **old** holder late. Assert the old holder's
+  `producer_slot` still addresses a valid list, that its retirement decrements the correct occupancy, that
+  it does not disturb a slot owned by the new generation, and that **no age from the retired generation is
+  ever published**. Assert the new generation's age is reported from its own fresh cell.
+- **AC15 — no event or retirement path waits on the diagnostic registry, red first (new in revision 7).**
+  Hold the snapshot registry lock on one thread. On another thread run an accepted emit, a shed emit, and a
+  retirement including a final identity retirement. Assert all three complete without waiting for the
+  registry lock and without returning `ShedBusy` for that reason.
+- **AC16 — a diagnostic failure never changes acceptance, red first (rewritten in revision 10, reverses
+  revision 7).** Force a slot-reservation failure and a missing-cell case through a test seam. Assert the
+  event's accept-or-shed outcome is **identical** to the same event without the injected failure, that the
+  affected sample is reported **indeterminate** rather than as a false age, and that `age_sample_failures`
+  incremented. Implement must show this red against revision 7's behaviour, which returned a typed
+  non-accepted result and therefore let a diagnostic failure reject a valid event.
 - **AC13 — producer age-list correctness under out-of-order retirement, red first (new in revision 6).**
   This is the direct control for `finding_1787287893_905201`. Fill a producer to exactly
   `producer_queue_max_events`. Retire an entry from the **middle**. Immediately accept another event.
@@ -977,14 +923,16 @@ integration tests, the repository lifecycle suite, and scratch consumer `cargo c
     can alias a stale index to a new generation.
 11. **A diagnostic registry lock is an ingress lock if any event path touches it.** Sharing the cell by
     `Arc` and keeping the registry for enumeration only is what preserves no-wait ingress.
-12. **A defensive skip is an observability outage under load.** Diagnostics for a saturation campaign must
-    fail closed with a typed result and a counted failure, never degrade quietly.
+12. **A defensive skip is an observability outage under load, but the fix must not let diagnostics change
+    production.** Revision 7 made a diagnostic failure reject a valid event; human decision
+    `question_1787290055_403092` reversed that. The durable rule is an explicit indeterminate sample plus a
+    counted failure, never a false value and never a changed accept-or-shed outcome.
 13. **New admission-time state must be added to the existing rollback snapshot, or created only after the
     batch commits.** `AdmissionSnapshot` covers four maps, so anything else created mid-batch survives a
     restore silently.
 14. **A container that outlives its identity retains stale shared handles.** Because `inner.consumers`
-    entries are never removed, a shared age handle must be cleared at retirement and rebound at the next
-    admission, or the event path and the status read diverge onto different cells.
+    entries are never removed, the shared cell must be reset at retirement and generation-stamped on
+    reuse, so a retained handle reports no usable age instead of a stale one.
 15. **Appending a corrected section does not retract the original.** Revisions 7 left superseded S1a
     instructions active beside their replacements, which is an implementation hazard rather than a
     documentation nit. A revision that changes a rule must rewrite the rule, not only add the new one.
@@ -995,7 +943,18 @@ integration tests, the repository lifecycle suite, and scratch consumer `cargo c
 17. **Cite the exact enclosing function, not the nearest line number.** `preview_package_replacement` at
     `:367` sits inside `try_replace_package_generation`, not the direct commit entry point, and the wrong
     attribution produced a true conclusion from a false premise.
-18. **Correcting a stale in-repository assumption** — an in-repository workspace member can still be an
+18. **A requirement the planner invented can cost more than the requirement the ticket stated.** I assumed
+    oldest age had to be exact and linearizable. The ticket never said so. That assumption produced most of
+    twenty-two findings across seven reviews; reclassifying the signal as a bounded diagnostic observation
+    roughly halved the design. Question the strength of a self-imposed guarantee before engineering around it.
+19. **A verification method that reads the wrong artifact is worse than none.** I verified plan edits by
+    grepping for strings that other, successful edits had written, so silently discarded edits looked
+    applied, and I then asserted in durable gate evidence that an acceptance check had been tightened when
+    it had not. Verify the committed file, item by item, before citing it.
+20. **A non-monotonic version stamp admits ABA.** Bracketing a sample on a raw queue count passes when the
+    count returns to its original value across two mutations. A monotonic mutation stamp is what makes a
+    stated staleness bound actually hold.
+21. **Correcting a stale in-repository assumption** — an in-repository workspace member can still be an
    external contract surface. Revision 1 used crate location to skip a charter, which the Hub charter's
    "does not own" list already forbids.
 
