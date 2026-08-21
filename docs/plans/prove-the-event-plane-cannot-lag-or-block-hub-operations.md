@@ -7,6 +7,20 @@ Pipeline: `botster_stack_delivery` (direct merge, no PR)
 Project: `project_1786663508_823105` Botster Non-Blocking Event Plane, Stage D
 Vault checklist: `checklist_1787266824_449406` (ticket scope, one Plan visit)
 
+## Plan revision 6
+
+Revision 6 answers Plan Review `review_1787278015_433684` (`changes_required`, one blocker). That review supersedes the approval `review_1787272071_523159` because the human rejected the product-specific dependency chain that revisions 3 and 4 built.
+
+| Finding | Class | Correction |
+| --- | --- | --- |
+| `finding_1787278015_548510` Product-specific shared-session proof violates the library boundary | **blocker / product** | Revisions 3 and 4 required the real `botster-project-pipelines` package, a bound product run, one shared `north-star-shared` session, and new product lanes in botster-web and botster-tui. That chain is removed. Section 5G is rewritten around repository-owned generic contract fixtures at public boundaries: `examples/event-plane-producer` and `event-plane-consumer` through the real package ABI and the real `PackageEventRouter`, `examples/event-plane-cycle` for causal scope, `fixtures/plugins/plugin-contract-matrix` for the ABI surface, and `run_client_conformance` (`crates/botster-hub-test-support/src/lib.rs:1440`) for generic Unix and WebRTC client consumption. Section 5G.3 cites the canonical contract proof each owner repository keeps, with `question.opened` staying inside botster-project-pipelines. Section 5G.4 removes the shared-session identity requirement. Section 5G.5 keeps the loaded workflow single-repository, which retires unknown U6 and risks R13, R15, R16, and R17. Section 14.1 reduces the prerequisite set to `ticket_1787267568_492780` alone and records the three superseded tickets. |
+
+**Why the reduction is right, not merely instructed.** Botster components are libraries. A Hub load campaign that could only be proved by installing one first-party product package, binding one product run, and editing two client repositories was proving one product configuration rather than a library boundary. `docs/client-protocol.md:1374` already states the boundary this revision follows: an external client depends on the client protocol crate plus the test-support crate, not on the full `botster-hub` library. Revisions 3 and 4 reached across that line; revision 6 stops at it.
+
+**What survives unchanged**, because the reviewer confirmed it may: the numeric budgets and all five gated metrics (section 5A), the fully fixed saturation workload and the failed-attempt rule (5A.2, 5A.2.1), the observability dependency (6.2), the runtime-teardown answers (section 11), and the failure rules (5A.5).
+
+**What the earlier rounds still bought.** The client-repository evidence gathered in revisions 3 and 4 remains true and is captured in the vault. Neither client can prove a real `question.opened` on a caller-owned shared session today. That no longer blocks this campaign, but it is exactly what whoever owns the cross-client `question.opened` contract will need, and it will not have to be rediscovered.
+
 ## Plan revision 5
 
 Revision 5 answers Plan Review `review_1787271799_830342` (`changes_required`, one finding, no blocker). The finding was correct.
@@ -469,94 +483,52 @@ The campaign uses production default policy values. It does not shrink `PackageE
 - `docs/reports/prove-the-event-plane-cannot-lag-or-block-hub-operations-implement.md`, the narrative report.
 - `docs/reports/prove-the-event-plane-cannot-lag-or-block-hub-operations-evidence.json`, modelled on `docs/reports/bounded-hub-resources-fresh-campaign-evidence.json`, recording exact revisions for all five repositories, configuration, machine profile, formulas, per-arm results, the fault matrix outcomes, and the verdict.
 
-### G. Downstream proof, wired rather than asserted
+### G. Client proof at public boundaries, with generic fixtures
 
-Plan Review `finding_1787268374_124555` is correct. Revision 1 claimed the campaign drives Web and TUI "through the existing `script/prove-north-star-shared-session` pattern" while the actual dispatch could not do so. The verified facts:
+Revisions 3 and 4 built a product-specific chain: the real `botster-project-pipelines` package installed on one caller-owned Hub, a bound Project Pipelines run, one shared `north-star-shared` session, and new product lanes in botster-web and botster-tui. The human rejected that chain after Plan Review had approved revision 5, and Plan Review `finding_1787278015_548510` records the rejection.
 
-- `.github/workflows/loaded-daemon-lifecycle.yml` contains exactly two `actions/checkout` steps, at `:65-70` and `:92-98`. Neither sets `repository:`, so both check out `trybotster/botster-hub`. There is no Web, TUI, TUI Kit, Workspaces, Core, or Project Pipelines checkout anywhere in the file.
-- `BOTSTER_WEB_CHECKOUT` and `BOTSTER_TUI_CHECKOUT` appear nowhere under `.github/`.
-- The job installs Zig 0.16.0 (`:111-117`) and Rust 1.97.0 (`:119-122`). It installs **no Node or npm**.
-- `script/run-loaded-daemon-lifecycle` accepts only `--subject-dir --artifact-dir --subject-sha --test-target --repetitions --stress-profile --validate-only --cleanup-only --help` (`:909-921`). It has no downstream-leg surface.
-- **`script/prove-north-star-shared-session` has no Project Pipelines leg at all.** It admits only `botster-web` (`:641-650`) and drives the TUI through `script/test-live-hub`.
-- `question.opened` appears **zero times** in this repository's code, tests, or scripts. Every hit is prose in `docs/plans/**`. The emit is owned entirely by `botster-project-pipelines`.
-- `examples/project-pipelines` is a four-file fixture whose own README calls it a fixture. It is not the shipped package and is not a substitute for it.
+**The architectural reason is the one that matters, not the process history.** Botster components are libraries. A Hub load campaign that can only be proved by installing one first-party product package, binding one product run, and editing two client repositories is not proving a library boundary; it is proving one product configuration. Final integration proof must use repository-owned generic contract fixtures at public boundaries, and each repository must keep its own canonical contract proof.
 
-#### G.1 The client harnesses cannot run this proof today
+#### G.1 What this campaign proves, and where
 
-Revision 2 said no Web or TUI source change is needed. Plan Review `finding_1787270029_463152` rejected that, and direct verification of both repositories confirms the reviewer. Revision 3 withdraws the claim.
-
-**botster-web** at `main` `71b461c20ccfe187bf2318773d791f168334fd18`, clean tree, in `scripts/live-packaged-protocol-harness.mjs`:
-
-- The package-events lane is guarded at `:261` and calls `process.exit(0)` at `:275`. The shared-session lane only announces at `:299` and runs at `:355-530`. The package-events lane always exits first.
-- `startWebrtcPackageRuntime` (`:8732`) branches at `:8733`; shared-session mode attaches to the caller socket and returns at `:8756`. The producer package is installed only on the isolated path at `:8783-8785`, unreachable from the caller-owned branch.
-- Identity is hardcoded: `:1620` and `:1625` compare against `web-prod`, and the fixture binds `BOUND_SESSION_ID = "web-prod"` (`fixtures/package-events/plugin.lua:11`). The shared session is `north-star-shared`, so the join cannot match.
-- The producer is a **local fixture**, driven through the plugin surface action `project-pipelines.events` (`emitPackageEventFixtureAction`, `:1547-1569`). `project_pipelines_ask_human` appears **zero times** in the repository.
-- `BOTSTER_LIVE_PACKAGE_EVENTS` is absent from `exclusiveSharedSessionModes` (`scripts/live-packaged-protocol-helpers.mjs:473-480`), so setting both flags is not rejected; it silently takes the package-events branch and exits.
-
-**botster-tui** at `main` `0032fe97c76bcaccb09e540247106a9a998c23c6`, clean tree:
-
-- `script/test-live-hub:106-114` maps `ghostty-shared` to `ghostty_shared_attaches_to_caller_owned_hub_session`, and the shared branch at `:234-246` scrubs `BOTSTER_HUB_BIN` and `BOTSTER_SESSION_WORKER_BIN`. `:124-142` maps `package-events` to a test that builds its own `IsolatedHubBuilder` (`crates/botster-tui/src/app.rs:29677-29689`).
-- The shared lane (`app.rs:22901-23146`) asserts only terminal-plane behaviour. It never references `PackageEvent`, `EventGap`, `question.opened`, or `SubscribeEvents`.
-
-Two facts make the TUI gap smaller than the Web gap, and they matter for sequencing:
-
-- The TUI production wire is already open on the shared lane. `try_connect` calls `subscribe_question_opened_events` (`app.rs:2289`) and `sync_entity_options_subscriptions` (`:2290`) unconditionally. Only assertion and producer are missing, not transport.
-- The TUI package-events lane already drives the **real** producer, resolving the `ask_human` tool from the live MCP registry (`app.rs:29744-29748`) and calling `project_pipelines_ask_human` (`app.rs:29988-29996`), gated by `assert_project_pipelines_pin_floor` (`app.rs:29479-29489`) requiring `cd7c2f926fcead78e15e7a9c713ad26dfe883914` to be an ancestor of the supplied package HEAD. Web has no equivalent.
-
-#### G.2 Three registered dependencies, ordered
-
-| Ticket | Repository | target_id | What it adds |
-| --- | --- | --- | --- |
-| `ticket_1787271303_548807` | botster-hub | `tgt_7e208a0c76a44980a83b63af976b1f22` | the Project Pipelines leg, revision validation and pin floor, shared-session run binding, and the optional gap-coverage Hub launch environment on `script/prove-north-star-shared-session`. **Ships before the client tickets and proves itself with a Hub-side subscriber** |
-| `ticket_1787270342_754581` | botster-web | `tgt_40abcf71ccf049f4ac0c99953a799869` | a shared-session package-event lane on the caller-owned Hub, driven by the real Project Pipelines producer, with identity parameterised off `productionSessionId` |
-| `ticket_1787270386_991884` | botster-tui | `tgt_c3d470bab78549df920a41e8fb0e58d8` | package-event assertions on the caller-owned shared lane, plus an endpoint-taking sibling of `call_plugin_tool` |
-
-Each is registered against its own repository target, per [[cross repo dependency registration must use dependency repo target]]. The two client tickets already carry engine edges onto the coordinator ticket, which enforces the ordering that section 14.1 explains and removes the cycle Plan Review found in revision 3. Those edges bind the client tickets, not this one, so they do not block this run's Plan Review. No edge into this ticket is registered yet; section 14.1 records when all four are added.
-
-#### G.3 Campaign inputs and workflow additions
-
-Three pinned inputs, each a full 40-character lowercase SHA, validated the way `script/test-production-package-runtime:300-322` validates revisions:
-
-| Input | Repository | Consumed as |
+| Concern | Proved by | Where |
 | --- | --- | --- |
-| `web_sha` | `trybotster/botster-web` | checkout at `$GITHUB_WORKSPACE/web`, exported as `BOTSTER_WEB_CHECKOUT`; must contain the `ticket_1787270342_754581` lane |
-| `tui_sha` | `trybotster/botster-tui` | checkout at `$GITHUB_WORKSPACE/tui`, `submodules: recursive`, exported as `BOTSTER_TUI_CHECKOUT`; must contain the `ticket_1787270386_991884` lane |
-| `project_pipelines_sha` | `trybotster/botster-project-pipelines` | checkout installed into the campaign Hub by path; **must be at or after `cd7c2f926fcead78e15e7a9c713ad26dfe883914`**, the TUI pin floor |
+| Package event admission, routing, fanout, shed, and bounded queues under saturation | a small fixture plugin driven through the **real** `HubPackageManifest` ABI and the **real** `PackageEventRouter` | this repository, `examples/event-plane-producer` and `examples/event-plane-consumer` |
+| Causal-scope rejection under saturation | the existing cycle fixture | this repository, `examples/event-plane-cycle` |
+| Full plugin ABI surface under saturation | the existing matrix package | this repository, `fixtures/plugins/plugin-contract-matrix` |
+| Generic client event consumption over the host control protocol | Unix and WebRTC host-control clients built from the published client crate, exercised through the canonical conformance entrypoint | this repository, `botster_hub_test_support::run_client_conformance` (`crates/botster-hub-test-support/src/lib.rs:1440`) |
+| Terminal behaviour under saturation | the existing many-PTY conformance shape and the two adapter suites | this repository, `run_many_pty_client_attach_conformance` (`:553`), `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs`, `webrtc_terminal_adapter.rs` |
 
-`BOTSTER_SHARED_SESSION_ID` is fixed to `north-star-shared`. `BOTSTER_HUB_BIN` and `BOTSTER_SESSION_WORKER_BIN` point at the binaries the existing precompile step already builds and provenance-checks at `:157-199`.
+Every row is inside botster-hub, uses an existing repository-owned fixture, and needs no client checkout, no Node toolchain, and no product package.
 
-Workflow and coordinator additions:
+#### G.2 The public boundary is already documented
 
-1. Three `actions/checkout` steps with explicit `repository:` and `ref:`.
-2. Node and npm setup, then `npm ci` and `npm run build` in the Web checkout, because `prove-north-star-shared-session:335-343` runs an npm script and installs nothing itself.
-3. The Project Pipelines leg on `script/prove-north-star-shared-session` is **not built by this ticket**. It is `ticket_1787271303_548807`, which ships first. This campaign consumes the merged coordinator.
-4. Run binding to `BOTSTER_SHARED_SESSION_ID` also belongs to `ticket_1787271303_548807`. The TUI gates notices on `package_event_matches_active_run` (`app.rs:4062`, `:4104-4131`), which needs a `project-pipelines.session_request` record matching the selected session, so the coordinator must export the run ids.
-5. The gap-coverage Hub launch environment is also `ticket_1787271303_548807`. Only the Hub launcher can set `BOTSTER_ENV=test`, `BOTSTER_HUB_TEST_CLIENT_EVENT_QUEUE_MAX`, and `BOTSTER_HUB_TEST_STALL_UNIX_EVENT_FLUSH`, and [[hub client event queue max requires Botster test mode]] requires both values on the Hub child. This campaign sets the coordinator's opt-in flag; without it the shared lane proves notice delivery and entity convergence but **not** `EventGap` shedding.
-6. One step invoking the coordinator as a sibling of the loaded runner. Do not thread a downstream leg through `script/run-loaded-daemon-lifecycle`.
+`docs/client-protocol.md:1374` states the contract this revision follows: an external client that needs a true live-hub integration test depends on the client protocol crate plus the test-support crate, **not on the full `botster-hub` library**, and pins the UI contract by tag rather than by a Hub commit. The campaign proves the Hub side of that boundary with generic fixtures. It does not reach across it.
 
-#### G.4 The production oracle for every acceptance condition
+#### G.3 Canonical contract proof stays in each owner repository
 
-[[each acceptance condition names its authoritative production oracle]] requires the owning repository and the production API for each proof. [[cross-client acceptance uses one live session identity]] requires Web and TUI to share one caller-owned session.
+This campaign cites those proofs; it does not orchestrate, wire, or re-run them.
 
-| Acceptance condition | Owning repository | Authoritative production oracle |
+| Repository | Canonical proof it owns | Status |
 | --- | --- | --- |
-| A live `question.opened` reaches a client | botster-project-pipelines emits; Hub routes | the real package's `project_pipelines_ask_human` mutation, then `DaemonEvent::PackageEvent` on the host-control path. Not the `event-plane-producer` example, and not the Web `fixtures/package-events` stand-in |
-| The durable question survives a shed notice | botster-project-pipelines | the package's entity plane, read as a `project-pipelines.question` entity record. [[a transient package event cannot be the sole authority for a durable close]] |
-| Web shows one transient notice and keeps durable state | botster-web | the shared-session package-event lane added by `ticket_1787270342_754581`, reached through `drive:live-packaged-protocol:shared-session`. The lane does not exist today |
-| TUI shows one transient notice and keeps durable state | botster-tui | the caller-owned shared lane extended by `ticket_1787270386_991884`, reached through `script/test-live-hub`. The assertion does not exist today |
-| Web and TUI used the same live session | botster-hub | one caller-owned data directory and `BOTSTER_SHARED_SESSION_ID=north-star-shared`, with the coordinator's `attach_occupancy` barrier at `prove-north-star-shared-session:561-585` |
-| Terminal input and output stay correct under saturation | botster-core owns the bytes; Hub observes only envelopes | the coordinator's marker sequence, plus the three Hub content-blindness architecture tests |
-| Hub cannot inspect terminal bodies | botster-hub | `src/unix_terminal_adapter.rs:905`, `src/webrtc_terminal_adapter.rs:915`, `src/daemon_attach_stream.rs:1133` |
-| Queue, shed, gap, latency, and timeout signals | botster-hub | the public daemon request added by dependency `ticket_1787267568_492780`. No client-side observation substitutes |
-| Peer and session teardown reached idle | botster-hub | the owner-specific oracles in section 11.4, not `DaemonLifecycleCounters` alone |
+| botster-project-pipelines | the `question.opened` contract: declaration, emit after durable commit, payload schema and size, and shed-without-loss | owned there; **out of scope here** |
+| botster-web | its package-event consumption lane against an isolated Hub, including the forced-gap sub-lane | already exists and passes today |
+| botster-tui | its `package-events` lane against an isolated Hub, driving the real producer behind a pin floor | already exists and passes today |
+| botster-core | terminal byte ownership and the plugin admission classes | unchanged |
 
-#### G.5 Evidence shape
+The verified fact that neither client can today prove a real `question.opened` on a *shared* session remains true and is captured in the vault. Under this revision it is no longer this campaign's problem, because this campaign no longer asserts a shared-session product claim. It remains relevant to whoever owns the `question.opened` cross-client contract, and the capture exists so that work is not rediscovered.
 
-The campaign evidence JSON uses the seven-key `revisions` object from `docs/reports/bounded-hub-resources-fresh-campaign-evidence.json`, each value a flat 40-character SHA, plus the `provenance` block shape from `docs/reports/focused-ubuntu-idle-cpu-resource-bound-evidence.json` for the runner profile. The single-repo `inputs`/`provenance` shape alone is not sufficient, because it carries no downstream coordinate.
+#### G.4 The shared terminal-session identity requirement is removed
 
-#### G.6 Operator precondition
+[[cross-client acceptance uses one live session identity]] governed revisions 3 and 4 and no longer governs this ticket. There is no `north-star-shared` session, no bound run, and no cross-client identity join in this campaign. The North Star behavioural oracles are still proved under saturation, on this repository's own attached noisy PTY, exactly as section 12.3 item 10 states. That is a Hub-owned terminal claim, not a cross-client product claim.
 
-Cross-repository checkout of the sibling repositories needs a credential. Today every checkout step sets `persist-credentials: false` and the job declares repo-scoped `permissions: contents: read`, which cannot read another repository. Implement must not invent a secret. If the sibling repositories are not public to this workflow's token, Implement stops and asks the operator for the exact token or App installation to use. This is recorded as unknown U6.
+#### G.5 Consequences for the workflow
+
+The loaded workflow stays **single-repository**, which is what it already is. No `web_sha`, `tui_sha`, or `project_pipelines_sha` input. No additional `actions/checkout`. No Node or npm setup. No cross-repository credential, which retires the operator precondition that revision 3 raised as unknown U6 and the risks that depended on it. `script/prove-north-star-shared-session` is untouched by this ticket.
+
+#### G.6 Evidence shape
+
+The acceptance evidence JSON records the two revisions this campaign actually consumes — botster-hub and its locked botster-core — in the flat-SHA `revisions` shape of `docs/reports/bounded-hub-resources-fresh-campaign-evidence.json`, plus the runner `provenance` block from `docs/reports/focused-ubuntu-idle-cpu-resource-bound-evidence.json`. It must not record client revisions it did not exercise.
 
 ## 6. Repository ownership boundaries and cross-repo dependencies
 
@@ -568,7 +540,7 @@ Cross-repository checkout of the sibling repositories needs a credential. Today 
 | Event-plane counters and their read path | botster-hub (dependency in 6.2) |
 | Lifecycle journal, wake, pages, plugin admission classes | botster-core, unchanged |
 | `question.opened` contract | botster-project-pipelines, unchanged |
-| Transient-event consumption | botster-web and botster-tui. **Changed by two registered dependencies**, `ticket_1787270342_754581` and `ticket_1787270386_991884`; consumed from pinned checkouts that contain those lanes |
+| Transient-event consumption | botster-web and botster-tui, **unchanged and not exercised by this campaign**. Each keeps its own canonical isolated-Hub lane. Generic client consumption is proved here at the public boundary per section 5G.1 |
 | Terminal bytes | Core `SessionIo` and `ClientWorker`, unchanged |
 
 Hub must not gain terminal body access, Workspaces policy, or package product policy through this campaign. The existing architecture tests at `src/unix_terminal_adapter.rs:905`, `src/webrtc_terminal_adapter.rs:915`, and `src/daemon_attach_stream.rs:1133` stay in the gate list.
@@ -614,8 +586,8 @@ Consumer note for that ticket: this ticket `ticket_1786663585_879846` depends on
 - No change to `MAX_OWNER_TURN_MS`, `MAX_READY_OPERATION_WAIT_MS`, `OBSERVE_SLICE_BUDGET`, `BASELINE_PAGE_BUDGET`, `PUMP_MAX_*`, `EVENT_DELIVERY_*`, `SESSION_DELIVERY_*`, or any `PackageEventPlaneOptions` default.
 - No production event-disable switch.
 - No new transport, request vocabulary change, `PROTOCOL_VERSION` bump, or conformance-fixture revision bump.
-- **This Hub run edits no client repository.** It changes no file in botster-core, botster-web, botster-tui, botster-tui-kit, or botster-project-pipelines. Their revisions are pinned and recorded here.
-- Stated separately so it does not read as a contradiction: botster-web and botster-tui **do** need source changes for this campaign, owned by their own registered tickets `ticket_1787270342_754581` and `ticket_1787270386_991884`, both of which must merge before this run starts Implement. See sections 5G.1, 5G.2, A4, and 14.1. botster-core, botster-tui-kit, and botster-project-pipelines need no change at all.
+- **No client repository is touched or required.** This run changes no file in botster-core, botster-web, botster-tui, botster-tui-kit, or botster-project-pipelines, and it does not check any of them out, install them, or drive their harnesses. Only botster-hub and its locked Core revision are consumed and recorded.
+- No real `botster-project-pipelines` package, no bound product run, no shared `north-star-shared` session, and no cross-client identity join. Those belong to the owner repositories' own contract proofs.
 - No `--test-threads=1`, no `serial_test`, and no nextest. Repository policy forbids serialization as acceptance evidence (`docs/plans/isolate-lifecycle-suite-workers-and-host-resources.md:154`).
 - No retry loop that discards a red repetition.
 - No change to `run_many_pty_client_attach_conformance` or its published session counts.
@@ -638,7 +610,7 @@ The vault rule that wall-clock durations are observations rather than gates ([[c
 
 **A3 — the reference runner is the existing loaded workflow.** `docs/loaded-daemon-lifecycle-runner.md` establishes a fresh GitHub-hosted `ubuntu-24.04` VM as the isolated campaign home. `script/run-loaded-daemon-lifecycle:141-144` forces `--stress-profile none` on Darwin, and `script/run-lifecycle-suite` refuses a dirty host. A developer machine that hosts a live Botster hub cannot produce this evidence. The declared machine profile is therefore the workflow runner.
 
-**A4 — Web and TUI need real source changes; Project Pipelines does not.** Revision 2 claimed no client source change is needed. Direct verification of both repositories, recorded in section 5G.1, shows that claim was wrong, and revision 3 withdraws it. Neither client can today prove one real `question.opened` on a caller-owned shared session: the Web package-events lane exits before the shared lane and drives a local fixture rather than `project_pipelines_ask_human`, and the TUI shared lane carries no package-event assertion at all. Two dependencies are registered against their own repository targets, `ticket_1787270342_754581` for botster-web and `ticket_1787270386_991884` for botster-tui. botster-project-pipelines is consumed unchanged, from a pinned checkout at or after the TUI pin floor `cd7c2f926fcead78e15e7a9c713ad26dfe883914`.
+**A4 — client proof happens at public boundaries with generic fixtures, and no client repository changes.** Revisions 3 and 4 required the real Project Pipelines package, a bound product run, one shared session, and new lanes in botster-web and botster-tui. The human rejected that chain and Plan Review `finding_1787278015_548510` records it. Botster components are libraries, so final integration proof uses repository-owned generic contract fixtures at public boundaries. Section 5G lists exactly which fixture proves what and where. Each owner repository keeps its own canonical contract proof, and `question.opened` stays inside botster-project-pipelines. No client checkout, no Node toolchain, no product package, and no cross-repository credential.
 
 **A5 — the baseline arm is projection-decoupled, not event-disabled.** The ticket permits either. Section 5C explains why the decoupled arm is chosen.
 
@@ -655,8 +627,6 @@ The vault rule that wall-clock durations are observations rather than gates ([[c
 **U4 — the reported `EventPlaneSnapshot` read path.** Section 6.2 item 6 requires a read path that does not contend with the router mutex. Implement must confirm the dependency delivered that property before trusting any saturation-time queue reading.
 
 **U5 — an existing budget test is nominal.** `published_owner_turn_budgets_fail_if_observe_walks_every_session` (`tests/session_projection_owner_loop.rs:207`) contains only `const` assertions and one discarded comparison. Despite its name it cannot fail if observe walks every session. The campaign must not cite it as owner-turn evidence. Whether to repair or rename it is a separate decision recorded as a vault gap in section 13.
-
-**U6 — cross-repository checkout credentials.** Every checkout step in `.github/workflows/loaded-daemon-lifecycle.yml` sets `persist-credentials: false`, and the job declares repo-scoped `permissions: contents: read`, which cannot read a sibling repository. If `botster-web`, `botster-tui`, and `botster-project-pipelines` are not readable by this workflow's default token, Implement must stop and ask the operator for the exact token or GitHub App installation. Implement must not invent, guess, or widen a secret.
 
 ## 9. Affected surfaces and files
 
@@ -676,8 +646,7 @@ The vault rule that wall-clock durations are observations rather than gates ([[c
 | --- | --- |
 | `tests/hub_daemon_lifecycle/mod.rs` | register the new module |
 | `script/run-loaded-daemon-lifecycle` | one new `--test-target event-plane-saturation` case beside the existing map at `:978-1024`. No downstream-leg surface is added here; that stays a sibling step |
-| `.github/workflows/loaded-daemon-lifecycle.yml` | one new `options:` entry in the `test_target` choice list at `:14-30`; three new pinned SHA inputs `web_sha`, `tui_sha`, `project_pipelines_sha`; three new `actions/checkout` steps with explicit `repository:` and `ref:` (TUI with `submodules: recursive`); Node and npm setup plus `npm ci` and `npm run build` in the Web checkout; the coordinator invocation step |
-| `script/prove-north-star-shared-session` | **not changed by this ticket.** The Project Pipelines leg, run binding, and gap-coverage launch environment are `ticket_1787271303_548807`, which ships first. This campaign only invokes the merged coordinator |
+| `.github/workflows/loaded-daemon-lifecycle.yml` | **one line**: a new `options:` entry in the `test_target` choice list at `:14-30`. No new inputs, no new checkouts, no toolchain change. The workflow stays single-repository |
 | `examples/event-plane-producer/plugin.lua` | add a bounded burst emitter for saturation; keep the existing single-emit tool unchanged |
 | `examples/event-plane-consumer/plugin.lua` | add a slow-path handler behind the new bounded hold seam; keep the existing handler unchanged |
 | `README.md` | one pointer to `docs/event-plane-load-proof.md`, matching how `README.md:430` points to `docs/hub-resource-proof.md` |
@@ -701,13 +670,9 @@ The vault rule that wall-clock durations are observations rather than gates ([[c
 | R9 | The campaign claims readiness the evidence does not support | The ticket's own rule applies: do not claim hundreds-of-sessions readiness unless this campaign passes. The report states the exact `N`, profile, and verdict |
 | R10 | Scope creep into production tuning | Section 7 forbids any change to a budget, queue bound, or scheduling decision. A breach is a finding, not a tuning opportunity |
 | R11 | The calibration threshold is chosen to fit the acceptance result | Section 5A fixes every parameter before calibration, splits the two dispatches, and requires the calibration commit to exist first. Acceptance records the calibration commit it gates against and a mismatch fails the campaign |
-| R12 | Multi-repository wiring turns into an open-ended workflow project | Section 5G bounds it to three pinned SHA inputs, three checkouts, one toolchain addition, and one new coordinator leg. The loaded runner keeps its single-repo contract; the downstream leg runs as a sibling step |
-| R13 | A missing credential silently degrades downstream proof to the example fixtures | U6 makes it a stop-and-ask. `examples/project-pipelines` is a four-file fixture and must never stand in for the shipped package, which is the only source of a real `question.opened` |
+| R12 | The campaign is read as proving a product configuration rather than a library boundary | Section 5G names one generic fixture per claim and cites each owner repository's canonical proof. The report must not present a fixture result as a product contract result |
 | R14 | The campaign asserts sibling survival on the fail-closed path and fails against correct code | Section 11.6 states the shipped policy and explicitly forbids that assertion. The campaign asserts the bounded blast radius instead |
-| R15 | The campaign runs against client checkouts that lack the new lanes and silently proves nothing | Section 5G.3 requires `web_sha` and `tui_sha` to contain the two dependency lanes, and section 5G.4 marks both oracles as not existing today. A pinned SHA without the lane is a campaign failure, not a partial pass |
-| R16 | The Project Pipelines pin is older than the TUI pin floor | Section 5G.3 requires `project_pipelines_sha` to be at or after `cd7c2f926fcead78e15e7a9c713ad26dfe883914`. `assert_project_pipelines_pin_floor` (botster-tui `app.rs:29479-29489`) already enforces it and will fail the lane |
 | R18 | A failed Hub operation disappears into the throughput floor | Section 5A.2.1 records every attempt and makes any failure in a measurement arm an immediate product_failure in both phases, so no failure can be absorbed by the `T` = 0.80 tolerance and no calibration can bake its own losses into a low floor |
-| R17 | Shared-session gap coverage is silently dropped | Section 5G.3 item 5 requires the coordinator to launch the shared Hub with `BOTSTER_ENV=test` plus both queue and stall values. If it does not, the report must state that the shared lane covered notice delivery and entity convergence but not `EventGap` |
 
 ## 11. Runtime-teardown class
 
@@ -832,7 +797,7 @@ These do not depend on runner speed and are the load-bearing oracles for the tic
 10. **North Star behavioural oracles hold under saturation** on the attached noisy session: identity, ordering, exact non-UTF-8 bytes, late-attach history, resize, input, cancellation, reconnect, and `ProcessExited`. These are the pre-existing behavioural contract, proved unchanged; they are not the new coexistence budgets.
 11. **Teardown matrix.** Every row of section 11's late-message matrix, in both closed-first and message-first orders, with reused subscription ids.
 12. **Sibling survival after each non-fatal fault**, at full fleet size. On the ultimate WebRTC close-failure path the campaign asserts the **bounded sibling sacrifice** in section 11.6 instead, because asserting survival there would contradict shipped behaviour.
-13. **Downstream production proof**, per section 5G.3: a real `question.opened` from the pinned `botster-project-pipelines` checkout produces exactly one transient notice in the shipped Web harness and one in the shipped TUI harness, both attached to the same `north-star-shared` session; a shed notice never removes the durable question row; and reconnect replays nothing.
+13. **Generic client consumption at the public boundary**, per section 5G.1: Unix and WebRTC host-control clients built from the published client crate receive the same exact event contract under saturation through `run_client_conformance`; a slow event consumer never delays control responses or entity frames; reconnect creates a fresh subscription with no replay; and event pressure returns a gap rather than blocking a Hub operation. No product package and no shared product session take part.
 
 ### 12.4 Published budget gates
 
@@ -880,9 +845,6 @@ Phase 1, calibration. Its only outputs are the committed dataset and derived thr
 gh workflow run loaded-daemon-lifecycle.yml \
   --ref main \
   -f subject_sha=<exact merged Hub SHA> \
-  -f web_sha=<pinned botster-web SHA> \
-  -f tui_sha=<pinned botster-tui SHA> \
-  -f project_pipelines_sha=<pinned botster-project-pipelines SHA> \
   -f test_target=event-plane-saturation \
   -F repetitions=<published> \
   -f stress_profile=residual-tail
@@ -901,43 +863,35 @@ The runner stops at the first red repetition. Preserve that artifact before any 
 5. **Only four of Core's fourteen `with_test_*` builders are plumbed to Hub environment reads.** Capture the inventory so future fault lanes reach for the existing builder before inventing a seam.
 6. **`DAEMON_MAX_CONNECTIONS` 64 is a client bound, not a session bound.** Capture the distinction, because "hundreds of sessions" invites the confusion.
 7. **A timed-out package-event handler is indistinguishable from a successful one.** `run_completion_drain_slice` (`src/daemon_maintenance.rs:1322-1334`) reads `completion.result` only to extract a request id and never inspects the `Completed` versus `Failed` discriminant on the event path. Hub also never references `PluginWorkerEvent` anywhere, so Core's typed `InvocationTimedOut` is unobservable by construction. Capture this as a correctness gap, not only an observability gap.
-8. **The loaded workflow is structurally single-repository.** It has two `actions/checkout` steps, both Hub, and no Node or npm. `script/prove-north-star-shared-session` has no Project Pipelines leg, and `question.opened` appears zero times in this repository's code. Capture that a plan claiming downstream proof through that workflow must wire three checkouts, a toolchain, and a new coordinator leg first.
+8. **The loaded workflow is structurally single-repository**, and under the library boundary that is a feature rather than a gap. It has two `actions/checkout` steps, both Hub, and no Node or npm. Capture that a Hub campaign proving a library boundary needs none of that, and that a plan wanting cross-repository product proof is asking the wrong workflow.
 
 ## 14. Pipeline gates and artifacts
 
 | Item | Value |
 | --- | --- |
 | Gate | `botster_stack_plan_gate` |
-| Plan artifact | `docs/plans/prove-the-event-plane-cannot-lag-or-block-hub-operations.md`, revision 3 |
+| Plan artifact | `docs/plans/prove-the-event-plane-cannot-lag-or-block-hub-operations.md`, revision 6 |
 | Vault checklist | `checklist_1787266824_449406` |
-| Plan Reviews answered | `review_1787268374_271226` (6 findings) and `review_1787270029_776949` (4 findings) |
-| Human answers folded in | `question_1787267931_572353` (routing exception), `question_1787268530_910910` (budget nature and derivation) |
+| Plan Reviews answered | `review_1787268374_271226`, `review_1787270029_776949`, `review_1787271188_552110`, `review_1787271799_830342`, and `review_1787278015_433684` |
+| Human answers folded in | `question_1787267931_572353` (routing exception), `question_1787268530_910910` (budget nature and derivation), and the library-boundary decision recorded in `review_1787278015_433684` |
 | Delivery | direct merge into `main`; no pull request; no human pull-request sign-off |
 
-### 14.1 Four dependency tickets, and the cycle that revision 3 contained
+### 14.1 One prerequisite
 
-Plan Review `finding_1787271188_172074` found a real deadlock in revision 3. The Web and TUI tickets each needed a caller-owned Hub with the real Project Pipelines package installed and a run bound to the shared session, and both deferred that to a coordinator leg planned inside **this** ticket. Section 14.1 then forbade this ticket from starting Implement until those client tickets merged. Neither side could go first.
+| Ticket | Repository | target_id | Status |
+| --- | --- | --- | --- |
+| `ticket_1787267568_492780` | botster-hub | `tgt_7e208a0c76a44980a83b63af976b1f22` | open, unstarted, logically required |
 
-Revision 4 breaks the cycle by making the coordinator leg its own Hub ticket that ships **before** the client tickets. The coordinator is Hub-owned work: `script/prove-north-star-shared-session` is already the Hub-owned cross-client coordinator, and installing a package on a Hub is host policy. The reviewer's alternative, a self-contained driver in each client, was rejected because two drivers each starting their own Hub cannot satisfy [[cross-client acceptance uses one live session identity]], and it would duplicate install logic across two repositories.
+It supplies the bounded event-plane observability counters, the four distinct timeout counters, the saturation-safe read path, and the four `BOTSTER_ENV=test` seams. Section 4.4 shows why the campaign cannot record seven of its twelve required signals without it.
 
-| Ticket | Repository | target_id | Depends on | Status |
-| --- | --- | --- | --- | --- |
-| `ticket_1787267568_492780` | botster-hub | `tgt_7e208a0c76a44980a83b63af976b1f22` | nothing | open, unstarted |
-| `ticket_1787271303_548807` | botster-hub | `tgt_7e208a0c76a44980a83b63af976b1f22` | nothing | open, unstarted |
-| `ticket_1787270342_754581` | botster-web | `tgt_40abcf71ccf049f4ac0c99953a799869` | `ticket_1787271303_548807` (`dependency_1787271311_659291`) | open, unstarted |
-| `ticket_1787270386_991884` | botster-tui | `tgt_c3d470bab78549df920a41e8fb0e58d8` | `ticket_1787271303_548807` (`dependency_1787271318_253833`) | open, unstarted |
+**Closed as superseded by the library-boundary decision**, with their five dependency edges removed:
 
-The graph is now acyclic. The coordinator ticket proves itself with a **Hub-side** event subscriber, so its acceptance depends on neither client.
+| Ticket | Repository | Why it is gone |
+| --- | --- | --- |
+| `ticket_1787271303_548807` | botster-hub | the shared-session coordinator leg existed only to install the real Project Pipelines package and bind a product run |
+| `ticket_1787270342_754581` | botster-web | a product-specific shared-session lane |
+| `ticket_1787270386_991884` | botster-tui | a product-specific shared-session assertion |
 
-**Two edges are already registered**, because they bind the client tickets rather than this one and therefore do not block this run's Plan Review. They enforce the ordering in the engine instead of in prose.
+Their verified findings remain durable: both client repositories were read at exact revisions, and the evidence is captured in the vault for whoever owns the `question.opened` cross-client contract. Nothing learned there is lost by closing them.
 
-**No edge into `ticket_1786663585_879846` is registered.** The engine blocks every advance of this run, including into Plan Review, while any of its own edges is open, and `override_unmet_gates` does not cover ticket dependencies. Human answer `question_1787267931_572353` condition 3 applies while Plan Review requests changes.
-
-**On Plan Review approval, before any Implement advance here:**
-
-1. Add four edges into `ticket_1786663585_879846` with `project_pipelines_add_ticket_dependency`, one per row above.
-2. Run and merge `ticket_1787267568_492780` and `ticket_1787271303_548807`. They are independent of each other and may run in parallel.
-3. Run and merge `ticket_1787270342_754581` and `ticket_1787270386_991884`. Their engine edges already hold them until the coordinator merges; they may then run in parallel with each other.
-4. Only then start Implement here, with `web_sha`, `tui_sha`, and `project_pipelines_sha` pinned to revisions that contain those lanes and satisfy the pin floor in section 5G.3.
-
-This integration run stays parked throughout.
+**Edge handling.** `ticket_1786663585_879846` currently has no open dependency edge, which is what lets this review-only Plan return advance at all. The `ticket_1787267568_492780` edge must be restored with `project_pipelines_add_ticket_dependency` **after this revision passes Plan Review and before any Implement advance**, per human answer `question_1787267931_572353`. Then merge that ticket, then start Implement here. No other edge is added.
