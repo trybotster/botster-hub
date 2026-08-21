@@ -213,7 +213,7 @@ also passes the same fields on the advance call when the park lifts.
 ## 1. Repository routing
 
 I resolved the run `target_id` through `list_spawn_targets`. `tgt_7e208a0c76a44980a83b63af976b1f22` is
-`botster-hub` at `/Users/jasonconigliari/Projects/botster-hub`, repo `trybotster/botster-hub`. I did not
+`botster-hub` at the Hub spawn-target checkout, repo `trybotster/botster-hub`. I did not
 infer the repository from the process working directory.
 
 Repository playbook loaded: `[[botster-hub-playbook]]`.
@@ -1318,8 +1318,7 @@ saturation campaign here. AC1 discharges the campaign-facing obligation: every s
 enumerates is readable through a public daemon request. AC10 discharges the client-crate obligation for
 `botster-tui` and `botster-web`.
 
-**Worktree hygiene.** `.gitignore` is tracked and non-empty (5 lines) at base. The worktree path
-`/Users/jasonconigliari/botster-sessions/trybotster-botster-hub-project-pipelines-ticket_1787267568_492780`
+**Worktree hygiene.** `.gitignore` is tracked and non-empty (5 lines) at base. This run worktree
 contains no `:`, so no `CARGO_TARGET_DIR` override is needed for this repository. AC10's scratch consumer
 worktrees still use their own separate `CARGO_TARGET_DIR`.
 
@@ -1466,7 +1465,7 @@ revision 2 and revision 3; the technical content is identical.
 
 ## 14. Sibling ordering protocol — MANDATORY, do not skip
 
-Human answer `question_1787287315_855051` (`sess-1787091778-0002-0d4e81ae0940d38a6b69bca8c9cfe444`)
+Human answer `question_1787287315_855051`
 directs a **review-only dependency removal**. The engine proved that `override_unmet_gates` does not
 bypass a `ticket_dependencies` block, so an override was rejected as the mechanism.
 

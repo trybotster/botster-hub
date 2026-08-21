@@ -478,6 +478,7 @@ struct LuaHostApi {
     package_records: Vec<PackageRecord>,
     package_event_router: Arc<PackageEventRouter>,
     causal_scopes: Arc<CausalScopeTable>,
+    event_handler_hold_ms: Option<u64>,
 }
 
 /// Shared hub-owned primitives exposed to one Lua plugin runtime.
@@ -491,6 +492,7 @@ pub struct LuaPluginHostApi {
     pub worktrees: SharedWorktrees,
     pub package_event_router: Arc<PackageEventRouter>,
     pub causal_scopes: Arc<CausalScopeTable>,
+    pub event_handler_hold_ms: Option<u64>,
 }
 
 /// Real Lua runtime for one loaded plugin package.
@@ -499,6 +501,7 @@ pub struct LuaPluginRuntime {
     lua: Mutex<Lua>,
     instruction_budget: Arc<AtomicU64>,
     stopped: AtomicBool,
+    event_handler_hold_ms: Option<u64>,
 }
 
 impl LuaPluginRuntime {
@@ -525,6 +528,7 @@ impl LuaPluginRuntime {
             package_records,
             package_event_router: api.package_event_router,
             causal_scopes: api.causal_scopes,
+            event_handler_hold_ms: api.event_handler_hold_ms,
         };
         let loaded = LoadedLuaPlugin::load(plugin_key.clone(), selected_entrypoint_path, host_api)?;
         Ok(HubPluginRuntimeBundle {
@@ -564,6 +568,7 @@ impl LuaPluginRuntime {
                 Ok(VmState::Continue)
             },
         )?;
+        let event_handler_hold_ms = host_api.event_handler_hold_ms;
         install_botster_api(&lua, plugin_key.clone(), host_api)?;
         let source = std::fs::read_to_string(entrypoint).map_err(|error| {
             LuaPluginRuntimeError::Load(format!("failed to read Lua entrypoint: {error}"))
@@ -581,6 +586,7 @@ impl LuaPluginRuntime {
                 lua: Mutex::new(lua),
                 instruction_budget: budget,
                 stopped: AtomicBool::new(false),
+                event_handler_hold_ms,
             },
             registration,
         ))
@@ -616,12 +622,7 @@ impl PluginRuntime for LuaPluginRuntime {
         }
 
         if request.context.origin.as_deref() == Some("package-event")
-            && let Some(hold_ms) = crate::runtime::event_handler_hold_ms_from(
-                std::env::var("BOTSTER_ENV").ok().as_deref(),
-                std::env::var("BOTSTER_HUB_TEST_EVENT_HANDLER_HOLD_MS")
-                    .ok()
-                    .as_deref(),
-            )
+            && let Some(hold_ms) = self.event_handler_hold_ms
             && hold_ms > 0
         {
             thread::sleep(Duration::from_millis(hold_ms));

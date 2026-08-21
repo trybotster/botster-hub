@@ -639,18 +639,20 @@ impl PackageEventRouter {
         let producer = inner.producer.entry(caller_owner.to_string()).or_default();
         producer.events += 1;
         producer.bytes += size;
+        let mut consumer_keys = Vec::new();
         for subscription in accepted {
-            let consumer = inner
-                .consumers
-                .entry(subscription.plugin_key.clone())
-                .or_default();
+            let plugin_key = subscription.plugin_key.clone();
+            let consumer = inner.consumers.entry(plugin_key.clone()).or_default();
             consumer.events += 1;
             consumer.bytes += size;
-            update_consumer_age(consumer, &self.counters, now);
             consumer.copies.push_back(QueuedCopy {
                 envelope_id,
                 holder: subscription,
             });
+            consumer_keys.push(plugin_key);
+        }
+        for plugin_key in consumer_keys {
+            update_consumer_age(&mut inner, &plugin_key, &self.counters);
         }
         drop(inner);
         self.delivery_wake.store(true, Ordering::SeqCst);
@@ -725,6 +727,7 @@ impl PackageEventRouter {
                         &copy.holder.plugin_key,
                         copy.holder.generation,
                     );
+                    update_consumer_age(&mut inner, &plugin_key, &self.counters);
                     continue;
                 }
                 if used_bytes + size > max_bytes && !ready.is_empty() {
@@ -733,6 +736,7 @@ impl PackageEventRouter {
                         queue.bytes += size;
                         queue.copies.push_front(copy);
                     }
+                    update_consumer_age(&mut inner, &plugin_key, &self.counters);
                     break;
                 }
                 used_bytes += size;
@@ -742,29 +746,8 @@ impl PackageEventRouter {
                         u64::try_from(envelope.enqueued_at.elapsed().as_micros())
                             .unwrap_or(u64::MAX),
                     );
-                    if let Some(cell) = inner
-                        .consumers
-                        .get(&plugin_key)
-                        .and_then(|queue| queue.age_cell.as_ref())
-                    {
-                        cell.store(
-                            inner
-                                .consumers
-                                .get(&plugin_key)
-                                .map(|queue| queue.events as u64)
-                                .unwrap_or(0),
-                            inner
-                                .consumers
-                                .get(&plugin_key)
-                                .and_then(|queue| queue.copies.front())
-                                .and_then(|front| inner.envelopes.get(&front.envelope_id))
-                                .map(|envelope| self.counters.nanos_of(envelope.enqueued_at))
-                                .unwrap_or(u64::MAX),
-                            cell.gate(),
-                            false,
-                        );
-                    }
                 }
+                update_consumer_age(&mut inner, &plugin_key, &self.counters);
                 let (owner, name, payload, payload_json) = inner
                     .envelopes
                     .get(&copy.envelope_id)
@@ -882,10 +865,12 @@ impl PackageEventRouter {
         }
         consumer.events += 1;
         consumer.bytes += delivery.size;
+        let plugin_key = delivery.holder.plugin_key.clone();
         consumer.copies.push_front(QueuedCopy {
             envelope_id: delivery.envelope_id,
             holder: delivery.holder,
         });
+        update_consumer_age(&mut inner, &plugin_key, &self.counters);
         self.delivery_wake.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -1559,17 +1544,24 @@ fn reserve_producer_age(
     }
 }
 
-fn update_consumer_age(queue: &mut ConsumerQueue, counters: &EventPlaneCounters, now: Instant) {
-    let Some(cell) = queue.age_cell.as_ref() else {
+fn update_consumer_age(inner: &mut RouterInner, plugin_key: &str, counters: &EventPlaneCounters) {
+    let front_id = inner
+        .consumers
+        .get(plugin_key)
+        .and_then(|queue| queue.copies.front().map(|copy| copy.envelope_id));
+    let oldest = front_id
+        .and_then(|envelope_id| inner.envelopes.get(&envelope_id))
+        .map(|envelope| counters.nanos_of(envelope.enqueued_at))
+        .unwrap_or(u64::MAX);
+    let Some(queue) = inner.consumers.get(plugin_key) else {
+        return;
+    };
+    let count = queue.events as u64;
+    let Some(cell) = queue.age_cell.clone() else {
         counters.record_age_sample_failure();
         return;
     };
-    let oldest = queue
-        .copies
-        .front()
-        .map(|_| counters.nanos_of(now))
-        .unwrap_or(u64::MAX);
-    cell.store(queue.events as u64, oldest, cell.gate(), false);
+    cell.store(count, oldest, cell.gate(), false);
 }
 
 fn retire_producer_age(
@@ -3490,5 +3482,151 @@ mod tests {
                 .complete_pulled_delivery(delivery)
                 .unwrap_or_else(|_| panic!("retire while registry held"));
         });
+    }
+
+    fn consumer_row(
+        router: &PackageEventRouter,
+        identity: &str,
+    ) -> botster_hub_client::DaemonQueueAgeObservation {
+        router
+            .counters()
+            .snapshot()
+            .queue_ages
+            .into_iter()
+            .find(|row| row.kind == DaemonQueueKind::Consumer && row.identity == identity)
+            .expect("consumer row")
+    }
+
+    #[test]
+    fn consumer_oldest_age_tracks_front_envelope_across_mutations() {
+        let router = router();
+        router
+            .try_register_contracts(vec![sample_contract("producer", "sample.ready")])
+            .expect("register");
+        subscribe(&router, "consumer", "producer", "sample.ready");
+        assert_eq!(
+            router.try_ingress(
+                "producer",
+                "sample.ready",
+                &serde_json::json!({ "ok": true }),
+                Instant::now()
+            ),
+            EventPlaneStatus::Accepted
+        );
+        thread::sleep(StdDuration::from_millis(3));
+        assert_eq!(
+            router.try_ingress(
+                "producer",
+                "sample.ready",
+                &serde_json::json!({ "ok": true }),
+                Instant::now()
+            ),
+            EventPlaneStatus::Accepted
+        );
+        let after_second = consumer_row(&router, "consumer");
+        assert_eq!(
+            after_second.state,
+            botster_hub_client::DaemonQueueAgeState::Usable
+        );
+        assert_eq!(after_second.queue_count, Some(2));
+        let oldest_after_second = after_second.oldest_age_us.expect("oldest after second");
+        assert!(
+            oldest_after_second >= 1_000,
+            "second enqueue must keep the first envelope age, got {oldest_after_second}"
+        );
+
+        let mut batch = router
+            .pull_ready_batch(1, 64 * 1024, Instant::now(), StdDuration::from_millis(8))
+            .expect("pull");
+        let delivery = batch.pop().expect("first delivery");
+        let after_pull = consumer_row(&router, "consumer");
+        assert_eq!(after_pull.queue_count, Some(1));
+        let oldest_after_pull = after_pull.oldest_age_us.expect("oldest after pull");
+        assert!(
+            oldest_after_pull < oldest_after_second,
+            "pulling the front must expose the newer remaining envelope"
+        );
+        router
+            .requeue_delivery(delivery)
+            .unwrap_or_else(|_| panic!("requeue"));
+        let after_requeue = consumer_row(&router, "consumer");
+        assert_eq!(after_requeue.queue_count, Some(2));
+        let oldest_after_requeue = after_requeue.oldest_age_us.expect("oldest after requeue");
+        assert!(
+            oldest_after_requeue >= oldest_after_second.saturating_sub(2_000),
+            "requeue to the front must restore the older envelope age"
+        );
+    }
+
+    #[test]
+    fn consumer_expiry_and_byte_limit_requeue_refresh_oldest_age() {
+        let policy = PackageEventPlanePolicy {
+            queue_age: StdDuration::from_millis(1),
+            consumer_queue_max_bytes: 64,
+            ..PackageEventPlanePolicy::default()
+        };
+        let router = PackageEventRouter::new(policy);
+        router
+            .try_register_contracts(vec![sample_contract("producer", "sample.ready")])
+            .expect("register");
+        subscribe(&router, "consumer", "producer", "sample.ready");
+        assert_eq!(
+            router.try_ingress(
+                "producer",
+                "sample.ready",
+                &serde_json::json!({ "ok": true }),
+                Instant::now()
+            ),
+            EventPlaneStatus::Accepted
+        );
+        thread::sleep(StdDuration::from_millis(3));
+        let expired = router
+            .pull_ready_batch(8, 64 * 1024, Instant::now(), StdDuration::from_millis(8))
+            .expect("expire pull");
+        assert!(expired.is_empty(), "expired copies must not be delivered");
+        let after_expiry = consumer_row(&router, "consumer");
+        assert_eq!(
+            after_expiry.state,
+            botster_hub_client::DaemonQueueAgeState::Empty
+        );
+        assert_eq!(after_expiry.queue_count, Some(0));
+
+        let router = PackageEventRouter::new(PackageEventPlanePolicy::default());
+        router
+            .try_register_contracts(vec![sample_contract("producer", "sample.ready")])
+            .expect("register");
+        subscribe(&router, "consumer", "producer", "sample.ready");
+        assert_eq!(
+            router.try_ingress(
+                "producer",
+                "sample.ready",
+                &serde_json::json!({ "ok": true }),
+                Instant::now()
+            ),
+            EventPlaneStatus::Accepted
+        );
+        thread::sleep(StdDuration::from_millis(3));
+        assert_eq!(
+            router.try_ingress(
+                "producer",
+                "sample.ready",
+                &serde_json::json!({ "ok": true }),
+                Instant::now()
+            ),
+            EventPlaneStatus::Accepted
+        );
+        let before = consumer_row(&router, "consumer");
+        let oldest_before = before.oldest_age_us.expect("oldest before byte cut");
+        let batch = router
+            .pull_ready_batch(8, 1, Instant::now(), StdDuration::from_millis(8))
+            .expect("byte-limit pull");
+        assert_eq!(batch.len(), 1, "first copy fills the byte budget");
+        let after_cut = consumer_row(&router, "consumer");
+        assert_eq!(after_cut.queue_count, Some(1));
+        let oldest_after_cut = after_cut.oldest_age_us.expect("oldest after byte cut");
+        assert!(
+            oldest_after_cut < oldest_before,
+            "byte-limit requeue must keep the remaining front envelope, not the pulled one"
+        );
     }
 }
