@@ -173,6 +173,11 @@ fn validate_schema_node(schema: &Value, depth: usize) -> Result<(), String> {
             ));
         }
     }
+    if let Some(type_value) = object.get("type")
+        && !type_value.is_string()
+    {
+        return Err("type must be a string".to_string());
+    }
     Ok(())
 }
 
