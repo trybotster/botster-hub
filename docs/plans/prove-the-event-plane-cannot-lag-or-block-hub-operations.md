@@ -7,6 +7,20 @@ Pipeline: `botster_stack_delivery` (direct merge, no PR)
 Project: `project_1786663508_823105` Botster Non-Blocking Event Plane, Stage D
 Vault checklist: `checklist_1787266824_449406` (ticket scope, one Plan visit)
 
+## Plan revision 7
+
+Revision 7 folds in the operator instruction that followed revision 6: two library-cleanup tickets now exist and are running, and this campaign consumes three repository-owned prerequisites rather than one.
+
+| Change | Detail |
+| --- | --- |
+| Three prerequisites, not one | `ticket_1787267568_492780` (botster-hub observability), `ticket_1787278327_274484` (botster-web), and `ticket_1787278327_199618` (botster-tui). Section 14.1 carries the table, the run ids, and the edge handling. |
+| Why the client tickets are prerequisites | Section 5G.3. Both clients today hardcode the Project Pipelines owner, `question.opened`, its payload, and its workflow entity families in **production** code. Until that is removed, a Hub-side generic boundary proof would be representative of nothing that ships, because the only real consumers would still be product-coupled. The cleanups also produce the client-side mirror of this campaign's Hub-side fixtures: neutral contract fixtures that enter through the public protocol boundary and do not inject after protocol decoding. |
+| Consumed as merged state | The campaign checks out no client repository, installs no product package, and drives no client harness. Section 5G.5 keeps the workflow single-repository. |
+| Superseded tickets stay closed | `ticket_1787271303_548807`, `ticket_1787270342_754581`, and `ticket_1787270386_991884` are not restored. They added product coupling; the two running client tickets remove it. They are opposites, not replacements. |
+| New risk | R19: running the campaign against client revisions that predate the cleanups would assert the boundary claim while the shipped clients are still product-coupled. The evidence must record that the run happened after all three merged. |
+
+Assumption A4 is rewritten accordingly: the clients are made generic by prerequisite tickets rather than assumed generic.
+
 ## Plan revision 6
 
 Revision 6 answers Plan Review `review_1787278015_433684` (`changes_required`, one blocker). That review supersedes the approval `review_1787272071_523159` because the human rejected the product-specific dependency chain that revisions 3 and 4 built.
@@ -505,18 +519,30 @@ Every row is inside botster-hub, uses an existing repository-owned fixture, and 
 
 `docs/client-protocol.md:1374` states the contract this revision follows: an external client that needs a true live-hub integration test depends on the client protocol crate plus the test-support crate, **not on the full `botster-hub` library**, and pins the UI contract by tag rather than by a Hub commit. The campaign proves the Hub side of that boundary with generic fixtures. It does not reach across it.
 
-#### G.3 Canonical contract proof stays in each owner repository
+#### G.3 Three repository-owned prerequisites make the boundary claim true
 
-This campaign cites those proofs; it does not orchestrate, wire, or re-run them.
+The campaign consumes three prerequisites. It consumes them as **merged repository state**, not as artifacts it checks out, installs, or drives. The workflow stays single-repository per section 5G.5.
 
-| Repository | Canonical proof it owns | Status |
-| --- | --- | --- |
-| botster-project-pipelines | the `question.opened` contract: declaration, emit after durable commit, payload schema and size, and shed-without-loss | owned there; **out of scope here** |
-| botster-web | its package-event consumption lane against an isolated Hub, including the forced-gap sub-lane | already exists and passes today |
-| botster-tui | its `package-events` lane against an isolated Hub, driving the real producer behind a pin floor | already exists and passes today |
-| botster-core | terminal byte ownership and the plugin admission classes | unchanged |
+| Ticket | Repository | What it delivers | Why this campaign needs it |
+| --- | --- | --- | --- |
+| `ticket_1787267568_492780` | botster-hub | bounded event-plane observability counters, four distinct timeout counters, a saturation-safe read path, and four `BOTSTER_ENV=test` seams | without it the campaign cannot record seven of its twelve required signals (section 4.4) |
+| `ticket_1787278327_274484` | botster-web | removes the Project Pipelines owner, event name, workflow entity families, and payload knowledge from generic Web production code; keeps the generic subscription, event, `EventGap`, reconnect, and bounded-notice mechanisms; replaces product-specific tests with neutral contract fixtures that enter through the public protocol boundary | see below |
+| `ticket_1787278327_199618` | botster-tui | the same cleanup for botster-tui, keeping botster-tui-kit policy-free | see below |
 
-The verified fact that neither client can today prove a real `question.opened` on a *shared* session remains true and is captured in the vault. Under this revision it is no longer this campaign's problem, because this campaign no longer asserts a shared-session product claim. It remains relevant to whoever owns the `question.opened` cross-client contract, and the capture exists so that work is not rediscovered.
+**Why the two client cleanups are prerequisites and not merely adjacent.** This campaign's central claim is that the Hub event plane is a *library boundary*: a generic host-control contract that any admitted package and any conforming client can use, not one product's wiring. Today both clients hardcode the Project Pipelines owner, the `question.opened` name, its payload shape, and its workflow entity families in **production** code. While that is true, a Hub-side generic proof would be representative of nothing that ships: the only real consumers would still be product-coupled. After the cleanups, the generic Hub contract this campaign saturates is the same contract the shipped clients actually consume, and the boundary claim is true in practice rather than only in the fixture.
+
+Both cleanup tickets also produce the artifact this campaign's argument leans on: **neutral contract fixtures that enter through the public protocol boundary and do not inject after protocol decoding.** That is the client-side mirror of section 5G.1's Hub-side generic fixtures.
+
+#### G.3.1 Canonical contract proof stays in each owner repository
+
+This campaign cites these; it does not orchestrate, wire, or re-run them.
+
+| Repository | Canonical proof it owns |
+| --- | --- |
+| botster-project-pipelines | the `question.opened` contract: declaration, emit after durable commit, payload schema and size, and shed-without-loss. **Out of scope here**, and after the cleanups it is the only place that owner and event name legitimately appear outside a package declaration |
+| botster-web | its generic package-event client behaviour, proved by the neutral fixture from `ticket_1787278327_274484`, plus any optional Project Pipelines conformance test that does not affect production composition |
+| botster-tui | the same, from `ticket_1787278327_199618` |
+| botster-core | terminal byte ownership and the plugin admission classes; unchanged |
 
 #### G.4 The shared terminal-session identity requirement is removed
 
@@ -610,7 +636,7 @@ The vault rule that wall-clock durations are observations rather than gates ([[c
 
 **A3 — the reference runner is the existing loaded workflow.** `docs/loaded-daemon-lifecycle-runner.md` establishes a fresh GitHub-hosted `ubuntu-24.04` VM as the isolated campaign home. `script/run-loaded-daemon-lifecycle:141-144` forces `--stress-profile none` on Darwin, and `script/run-lifecycle-suite` refuses a dirty host. A developer machine that hosts a live Botster hub cannot produce this evidence. The declared machine profile is therefore the workflow runner.
 
-**A4 — client proof happens at public boundaries with generic fixtures, and no client repository changes.** Revisions 3 and 4 required the real Project Pipelines package, a bound product run, one shared session, and new lanes in botster-web and botster-tui. The human rejected that chain and Plan Review `finding_1787278015_548510` records it. Botster components are libraries, so final integration proof uses repository-owned generic contract fixtures at public boundaries. Section 5G lists exactly which fixture proves what and where. Each owner repository keeps its own canonical contract proof, and `question.opened` stays inside botster-project-pipelines. No client checkout, no Node toolchain, no product package, and no cross-repository credential.
+**A4 — client proof happens at public boundaries with generic fixtures, and the clients are made generic by prerequisite tickets rather than assumed generic.** Revisions 3 and 4 required the real Project Pipelines package, a bound product run, one shared session, and new product lanes in the clients. The human rejected that chain, and Plan Review `finding_1787278015_548510` records it. Revision 7 adds the missing half of the correction: both clients today hardcode the Project Pipelines owner, event name, payload, and entity families in production code, so a Hub-side generic proof would be representative of nothing shipped. `ticket_1787278327_274484` and `ticket_1787278327_199618` remove that coupling and deliver neutral contract fixtures at the public protocol boundary. This campaign consumes their merged state. It still checks out no client repository, installs no product package, and drives no client harness.
 
 **A5 — the baseline arm is projection-decoupled, not event-disabled.** The ticket permits either. Section 5C explains why the decoupled arm is chosen.
 
@@ -672,6 +698,7 @@ The vault rule that wall-clock durations are observations rather than gates ([[c
 | R11 | The calibration threshold is chosen to fit the acceptance result | Section 5A fixes every parameter before calibration, splits the two dispatches, and requires the calibration commit to exist first. Acceptance records the calibration commit it gates against and a mismatch fails the campaign |
 | R12 | The campaign is read as proving a product configuration rather than a library boundary | Section 5G names one generic fixture per claim and cites each owner repository's canonical proof. The report must not present a fixture result as a product contract result |
 | R14 | The campaign asserts sibling survival on the fail-closed path and fails against correct code | Section 11.6 states the shipped policy and explicitly forbids that assertion. The campaign asserts the bounded blast radius instead |
+| R19 | The campaign runs against client revisions that predate the cleanups, so the boundary claim is asserted while the shipped clients are still product-coupled | Section 14.1 makes both cleanup tickets prerequisites that merge before Implement. The evidence must record that the campaign ran after both merged, not merely that they exist |
 | R18 | A failed Hub operation disappears into the throughput floor | Section 5A.2.1 records every attempt and makes any failure in a measurement arm an immediate product_failure in both phases, so no failure can be absorbed by the `T` = 0.80 tolerance and no calibration can bake its own losses into a low floor |
 
 ## 11. Runtime-teardown class
@@ -876,22 +903,28 @@ The runner stops at the first red repetition. Preserve that artifact before any 
 | Human answers folded in | `question_1787267931_572353` (routing exception), `question_1787268530_910910` (budget nature and derivation), and the library-boundary decision recorded in `review_1787278015_433684` |
 | Delivery | direct merge into `main`; no pull request; no human pull-request sign-off |
 
-### 14.1 One prerequisite
+### 14.1 Three prerequisites, all running
 
-| Ticket | Repository | target_id | Status |
-| --- | --- | --- | --- |
-| `ticket_1787267568_492780` | botster-hub | `tgt_7e208a0c76a44980a83b63af976b1f22` | open, unstarted, logically required |
+| Ticket | Repository | target_id | Delivers | Run status |
+| --- | --- | --- | --- | --- |
+| `ticket_1787267568_492780` | botster-hub | `tgt_7e208a0c76a44980a83b63af976b1f22` | bounded event-plane observability counters, four distinct timeout counters, a saturation-safe read path, four `BOTSTER_ENV=test` seams | running |
+| `ticket_1787278327_274484` | botster-web | `tgt_40abcf71ccf049f4ac0c99953a799869` | removes Project Pipelines coupling from the generic package-event client; neutral contract fixture at the public protocol boundary | running, `run_1787278334_136543` |
+| `ticket_1787278327_199618` | botster-tui | `tgt_c3d470bab78549df920a41e8fb0e58d8` | the same cleanup, keeping botster-tui-kit policy-free | running, `run_1787278336_152073` |
 
-It supplies the bounded event-plane observability counters, the four distinct timeout counters, the saturation-safe read path, and the four `BOTSTER_ENV=test` seams. Section 4.4 shows why the campaign cannot record seven of its twelve required signals without it.
+Each is registered against its own repository target, per [[cross repo dependency registration must use dependency repo target]]. Section 5G.3 explains why the two client cleanups are prerequisites rather than adjacent work: until they merge, the shipped clients hardcode one product's owner, event, payload, and entity families, so a Hub-side generic boundary proof would be representative of nothing that ships.
 
-**Closed as superseded by the library-boundary decision**, with their five dependency edges removed:
+**Closed as superseded by the library-boundary decision**, and **not to be restored**:
 
 | Ticket | Repository | Why it is gone |
 | --- | --- | --- |
-| `ticket_1787271303_548807` | botster-hub | the shared-session coordinator leg existed only to install the real Project Pipelines package and bind a product run |
+| `ticket_1787271303_548807` | botster-hub | a shared-session coordinator leg that existed only to install the real Project Pipelines package and bind a product run |
 | `ticket_1787270342_754581` | botster-web | a product-specific shared-session lane |
 | `ticket_1787270386_991884` | botster-tui | a product-specific shared-session assertion |
 
-Their verified findings remain durable: both client repositories were read at exact revisions, and the evidence is captured in the vault for whoever owns the `question.opened` cross-client contract. Nothing learned there is lost by closing them.
+Those three added product coupling. The two running client tickets remove it. They are opposites, not replacements, and the superseded three must not come back.
 
-**Edge handling.** `ticket_1786663585_879846` currently has no open dependency edge, which is what lets this review-only Plan return advance at all. The `ticket_1787267568_492780` edge must be restored with `project_pipelines_add_ticket_dependency` **after this revision passes Plan Review and before any Implement advance**, per human answer `question_1787267931_572353`. Then merge that ticket, then start Implement here. No other edge is added.
+The verified client-repository findings that produced the superseded tickets remain durable and are captured in the vault. They no longer bind this campaign, and after the cleanups they bind the owner of the cross-client `question.opened` contract.
+
+**Edge handling.** `ticket_1786663585_879846` currently has no open dependency edge, which is what lets this review-only Plan return advance at all, per human answer `question_1787267931_572353`. After this revision passes Plan Review and **before any Implement advance**, add all three edges above with `project_pipelines_add_ticket_dependency`. Then let all three merge. Then start Implement here. No other edge is added, and no superseded ticket is revived.
+
+Evidence obligation: the campaign report must record that the run happened **after** all three prerequisites merged, with their merged revisions, not merely that the tickets exist. Risk R19 records why.
