@@ -1,11 +1,11 @@
 use crate::{
-    EntityOptionsFrame, EntityRecordItem, PackageSurfaceKind, PackageSurfaceOperation,
-    UiActionKind, UiActionResultState, UiCapabilityFallback, UiColorToken, UiDensity,
-    UiDialogPresentation, UiEntityOptionsExclude, UiEntityOptionsKind, UiEntityOptionsSource,
-    UiFieldKind, UiHeightClass, UiIframePermission, UiIframeSandboxToken, UiMetricTrendDirection,
-    UiNodeKind, UiOrientation, UiPointer, UiSelectionMode, UiSpaceToken, UiTableColumnAlign,
-    UiToolbarOverflow, UiVariant, UiWidthClass, apply_entity_options_frame,
-    project_entity_options_from_store,
+    EntityOptionsFrame, EntityRecordItem, NOTICE_TEXT_MAX_BYTES, PackageNoticeSeverity,
+    PackageNoticeSubjectScope, PackageSurfaceKind, PackageSurfaceOperation, UiActionKind,
+    UiActionResultState, UiCapabilityFallback, UiColorToken, UiDensity, UiDialogPresentation,
+    UiEntityOptionsExclude, UiEntityOptionsKind, UiEntityOptionsSource, UiFieldKind, UiHeightClass,
+    UiIframePermission, UiIframeSandboxToken, UiMetricTrendDirection, UiNodeKind, UiOrientation,
+    UiPointer, UiSelectionMode, UiSpaceToken, UiTableColumnAlign, UiToolbarOverflow, UiVariant,
+    UiWidthClass, apply_entity_options_frame, project_entity_options_from_store,
 };
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -174,6 +174,12 @@ wire_enum!(PackageSurfaceOperation => [
     PackageSurfaceOperation::Render,
     PackageSurfaceOperation::Action,
 ]);
+wire_enum!(PackageNoticeSubjectScope => [PackageNoticeSubjectScope::Session]);
+wire_enum!(PackageNoticeSeverity => [
+    PackageNoticeSeverity::Info,
+    PackageNoticeSeverity::Warning,
+    PackageNoticeSeverity::Error,
+]);
 
 fn wire_names<T: WireEnum>() -> Vec<String> {
     T::variants()
@@ -230,6 +236,8 @@ pub fn typescript_declarations() -> String {
     replace_union!("UiActionResultState", UiActionResultState);
     replace_union!("PackageSurfaceKind", PackageSurfaceKind);
     replace_union!("PackageSurfaceOperation", PackageSurfaceOperation);
+    replace_union!("PackageNoticeSubjectScope", PackageNoticeSubjectScope);
+    replace_union!("PackageNoticeSeverity", PackageNoticeSeverity);
     declarations
 }
 
@@ -238,14 +246,16 @@ pub fn typescript_declarations() -> String {
 pub fn json_schema() -> Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "$id": "https://trybotster.dev/schemas/ui-contract-0.3.2.json",
+        "$id": "https://trybotster.dev/schemas/ui-contract-0.3.3.json",
         "title": "Botster UI Contract",
         "oneOf": [
             { "$ref": "#/$defs/UiNode" },
             { "$ref": "#/$defs/UiActionRequest" },
             { "$ref": "#/$defs/UiActionResult" },
             { "$ref": "#/$defs/PackageSurfaceDescriptor" },
-            { "$ref": "#/$defs/PackageNavigationEntry" }
+            { "$ref": "#/$defs/PackageNavigationEntry" },
+            { "$ref": "#/$defs/PackageNoticeReactionDeclaration" },
+            { "$ref": "#/$defs/PackageNoticeReactionDescriptor" }
         ],
         "$defs": {
             "JsonValue": {},
@@ -354,6 +364,38 @@ pub fn json_schema() -> Value {
                     "icon": { "type": "string" },
                     "description": { "type": "string" },
                     "target": { "$ref": "#/$defs/PackageNavigationTarget" }
+                }
+            },
+            "PackageNoticeSubjectScope": {
+                "enum": wire_names::<PackageNoticeSubjectScope>()
+            },
+            "PackageNoticeSeverity": {
+                "enum": wire_names::<PackageNoticeSeverity>()
+            },
+            "PackageNoticeReactionDeclaration": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["name", "subject_scope", "text_pointer", "ttl_ms", "severity"],
+                "properties": {
+                    "owner": { "type": "string", "pattern": "\\S" },
+                    "name": { "type": "string", "pattern": "\\S" },
+                    "subject_scope": { "$ref": "#/$defs/PackageNoticeSubjectScope" },
+                    "text_pointer": { "type": "string", "pattern": "^/[^/]*$" },
+                    "ttl_ms": { "type": "integer", "minimum": 1000, "maximum": 60000 },
+                    "severity": { "$ref": "#/$defs/PackageNoticeSeverity" }
+                }
+            },
+            "PackageNoticeReactionDescriptor": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["owner", "name", "subject_scope", "text_pointer", "ttl_ms", "severity"],
+                "properties": {
+                    "owner": { "type": "string", "pattern": "\\S" },
+                    "name": { "type": "string", "pattern": "\\S" },
+                    "subject_scope": { "$ref": "#/$defs/PackageNoticeSubjectScope" },
+                    "text_pointer": { "type": "string", "pattern": "^/[^/]*$" },
+                    "ttl_ms": { "type": "integer", "minimum": 1000, "maximum": 60000 },
+                    "severity": { "$ref": "#/$defs/PackageNoticeSeverity" }
                 }
             },
             "UiWidthClass": { "enum": wire_names::<UiWidthClass>() },
@@ -1153,7 +1195,10 @@ fn object_fields(value: Value) -> Map<String, Value> {
 #[must_use]
 pub fn conformance_fixtures_json() -> Value {
     json!({
-        "contract_version": "0.3.2",
+        "contract_version": "0.3.3",
+        "notice_text_max_bytes": NOTICE_TEXT_MAX_BYTES,
+        "notice_reaction_validation_vectors": notice_reaction_validation_vectors(),
+        "notice_text_resolution_vectors": notice_text_resolution_vectors(),
         "bind_list_descendant_identity_vectors": [
             {
                 "row": "session-1",
@@ -1332,6 +1377,240 @@ pub fn conformance_fixtures_json() -> Value {
     })
 }
 
+fn valid_notice_declaration() -> Value {
+    json!({
+        "name": "sample.ready",
+        "subject_scope": "session",
+        "text_pointer": "/notice",
+        "ttl_ms": 5000,
+        "severity": "info"
+    })
+}
+
+fn notice_reaction_validation_vectors() -> Value {
+    json!([
+        {
+            "id": "valid",
+            "declarations": [valid_notice_declaration()],
+            "ok": true
+        },
+        {
+            "id": "escaped_slash_pointer",
+            "declarations": [{
+                "name": "sample.ready",
+                "subject_scope": "session",
+                "text_pointer": "/a~1b",
+                "ttl_ms": 5000,
+                "severity": "info"
+            }],
+            "ok": true
+        },
+        {
+            "id": "escaped_tilde_pointer",
+            "declarations": [{
+                "name": "sample.ready",
+                "subject_scope": "session",
+                "text_pointer": "/a~0b",
+                "ttl_ms": 5000,
+                "severity": "info"
+            }],
+            "ok": true
+        },
+        {
+            "id": "empty_name",
+            "declarations": [{
+                "name": "",
+                "subject_scope": "session",
+                "text_pointer": "/notice",
+                "ttl_ms": 5000,
+                "severity": "info"
+            }],
+            "ok": false,
+            "error": "invalid_name"
+        },
+        {
+            "id": "wildcard_name",
+            "declarations": [{
+                "name": "sample.*",
+                "subject_scope": "session",
+                "text_pointer": "/notice",
+                "ttl_ms": 5000,
+                "severity": "info"
+            }],
+            "ok": false,
+            "error": "invalid_name"
+        },
+        {
+            "id": "wildcard_owner",
+            "declarations": [{
+                "owner": "event-*",
+                "name": "sample.ready",
+                "subject_scope": "session",
+                "text_pointer": "/notice",
+                "ttl_ms": 5000,
+                "severity": "info"
+            }],
+            "ok": false,
+            "error": "invalid_owner"
+        },
+        {
+            "id": "pointer_missing_slash",
+            "declarations": [{
+                "name": "sample.ready",
+                "subject_scope": "session",
+                "text_pointer": "notice",
+                "ttl_ms": 5000,
+                "severity": "info"
+            }],
+            "ok": false,
+            "error": "missing_leading_slash"
+        },
+        {
+            "id": "pointer_two_segment",
+            "declarations": [{
+                "name": "sample.ready",
+                "subject_scope": "session",
+                "text_pointer": "/a/b",
+                "ttl_ms": 5000,
+                "severity": "info"
+            }],
+            "ok": false,
+            "error": "multi_segment"
+        },
+        {
+            "id": "pointer_trailing_tilde",
+            "declarations": [{
+                "name": "sample.ready",
+                "subject_scope": "session",
+                "text_pointer": "/notice~",
+                "ttl_ms": 5000,
+                "severity": "info"
+            }],
+            "ok": false,
+            "error": "trailing_tilde"
+        },
+        {
+            "id": "pointer_unknown_escape",
+            "declarations": [{
+                "name": "sample.ready",
+                "subject_scope": "session",
+                "text_pointer": "/notice~2",
+                "ttl_ms": 5000,
+                "severity": "info"
+            }],
+            "ok": false,
+            "error": "unknown_escape"
+        },
+        {
+            "id": "ttl_below",
+            "declarations": [{
+                "name": "sample.ready",
+                "subject_scope": "session",
+                "text_pointer": "/notice",
+                "ttl_ms": 999,
+                "severity": "info"
+            }],
+            "ok": false,
+            "error": "ttl_out_of_range"
+        },
+        {
+            "id": "ttl_above",
+            "declarations": [{
+                "name": "sample.ready",
+                "subject_scope": "session",
+                "text_pointer": "/notice",
+                "ttl_ms": 60001,
+                "severity": "info"
+            }],
+            "ok": false,
+            "error": "ttl_out_of_range"
+        },
+        {
+            "id": "duplicate_name",
+            "declarations": [valid_notice_declaration(), valid_notice_declaration()],
+            "ok": false,
+            "error": "duplicate_reaction"
+        }
+    ])
+}
+
+fn notice_text_resolution_vectors() -> Value {
+    let ascii_512 = "a".repeat(NOTICE_TEXT_MAX_BYTES);
+    let ascii_513 = "a".repeat(NOTICE_TEXT_MAX_BYTES + 1);
+    let utf8_512 = "é".repeat(NOTICE_TEXT_MAX_BYTES / 2);
+    let utf8_513 = format!("{}a", "é".repeat(NOTICE_TEXT_MAX_BYTES / 2));
+    json!([
+        {
+            "id": "notice",
+            "pointer": "/notice",
+            "payload": { "notice": "ready" },
+            "text": "ready"
+        },
+        {
+            "id": "escaped_slash",
+            "pointer": "/a~1b",
+            "payload": { "a/b": "slash-key" },
+            "text": "slash-key"
+        },
+        {
+            "id": "escaped_tilde",
+            "pointer": "/a~0b",
+            "payload": { "a~b": "tilde-key" },
+            "text": "tilde-key"
+        },
+        {
+            "id": "missing",
+            "pointer": "/notice",
+            "payload": {},
+            "error": "missing"
+        },
+        {
+            "id": "not_string",
+            "pointer": "/notice",
+            "payload": { "notice": 1 },
+            "error": "not_string"
+        },
+        {
+            "id": "empty",
+            "pointer": "/notice",
+            "payload": { "notice": "" },
+            "error": "empty"
+        },
+        {
+            "id": "ascii_512",
+            "pointer": "/notice",
+            "payload": { "notice": ascii_512 },
+            "text": "a".repeat(NOTICE_TEXT_MAX_BYTES)
+        },
+        {
+            "id": "ascii_513",
+            "pointer": "/notice",
+            "payload": { "notice": ascii_513 },
+            "error": "oversized",
+            "bytes": NOTICE_TEXT_MAX_BYTES + 1
+        },
+        {
+            "id": "utf8_512",
+            "pointer": "/notice",
+            "payload": { "notice": utf8_512 },
+            "text": "é".repeat(NOTICE_TEXT_MAX_BYTES / 2)
+        },
+        {
+            "id": "utf8_513",
+            "pointer": "/notice",
+            "payload": { "notice": utf8_513 },
+            "error": "oversized",
+            "bytes": NOTICE_TEXT_MAX_BYTES + 1
+        },
+        {
+            "id": "space",
+            "pointer": "/notice",
+            "payload": { "notice": " " },
+            "text": " "
+        }
+    ])
+}
+
 fn required_non_bindable_props_schema(kind: &str, required_props: &[&str]) -> Value {
     let properties = required_props
         .iter()
@@ -1369,9 +1648,11 @@ export type JsonValue = null | boolean | number | string | JsonValue[] | { [key:
 export type JsonObject = { [key: string]: JsonValue };
 export type UiNodeId = string;
 export declare const packageVersion: string;
+export declare const NOTICE_TEXT_MAX_BYTES: number;
 export declare const schema: JsonObject;
 export declare const conformanceFixtures: JsonObject;
 export declare function realizeBindListDescendantId(rowId: string, key: string): UiNodeId;
+export declare function resolveNoticeText(payload: JsonValue, pointer: string): string;
 export declare function projectEntityOptions(
   descriptor: UiEntityOptionsSource,
   sourceRecords: Record<string, JsonObject>,
@@ -1396,6 +1677,10 @@ export type PackageSurfaceOperation = __PackageSurfaceOperation__;
 export interface PackageSurfaceDescriptor { id: string; kind: PackageSurfaceKind; title: string; description?: string; icon?: string; order?: number; category?: string; supports?: PackageSurfaceOperation[]; }
 export type PackageNavigationTarget = { kind: "surface"; surface_id: string };
 export interface PackageNavigationEntry { id: string; label: string; icon?: string; description?: string; target: PackageNavigationTarget; }
+export type PackageNoticeSubjectScope = __PackageNoticeSubjectScope__;
+export type PackageNoticeSeverity = __PackageNoticeSeverity__;
+export interface PackageNoticeReactionDeclaration { owner?: string; name: string; subject_scope: PackageNoticeSubjectScope; text_pointer: string; ttl_ms: number; severity: PackageNoticeSeverity; }
+export interface PackageNoticeReactionDescriptor { owner: string; name: string; subject_scope: PackageNoticeSubjectScope; text_pointer: string; ttl_ms: number; severity: PackageNoticeSeverity; }
 export type UiNodeKind = __UiNodeKind__;
 export type UiWidthClass = __UiWidthClass__;
 export type UiHeightClass = __UiHeightClass__;

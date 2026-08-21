@@ -310,11 +310,27 @@ pub(crate) fn enable_event_plane_producer_with_env(
 }
 
 pub(crate) fn emit_sample_ready(endpoint: &botster_hub_client::DaemonEndpoint, token: &str) {
+    emit_sample_ready_payload(endpoint, token, None, None);
+}
+
+pub(crate) fn emit_sample_ready_payload(
+    endpoint: &botster_hub_client::DaemonEndpoint,
+    token: &str,
+    subject: Option<&str>,
+    notice: Option<&str>,
+) {
+    let mut arguments = serde_json::json!({ "token": token });
+    if let Some(subject) = subject {
+        arguments["subject"] = serde_json::Value::String(subject.to_string());
+    }
+    if let Some(notice) = notice {
+        arguments["notice"] = serde_json::Value::String(notice.to_string());
+    }
     let emitted = botster_hub_client::request(
         endpoint,
         botster_hub_client::DaemonRequest::PluginMcpCallTool {
             name: "event_plane.emit_ready".to_string(),
-            arguments: serde_json::json!({ "token": token }),
+            arguments,
         },
     )
     .expect("emit ready");
@@ -322,6 +338,203 @@ pub(crate) fn emit_sample_ready(endpoint: &botster_hub_client::DaemonEndpoint, t
         emitted.kind,
         botster_hub_client::DaemonResponseKind::PluginMcpToolResult
     );
+    assert_eq!(
+        emitted
+            .plugin_tool_result
+            .get("status")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "accepted",
+        "emit {token} was not accepted: {}",
+        emitted.plugin_tool_result
+    );
+}
+
+#[test]
+fn isolated_hub_projects_notice_reactions_and_resolves_session_scoped_text() {
+    let _guard = daemon_test_guard();
+    let (hub, _) = enable_event_plane_producer("notice");
+    let listed = botster_hub_client::request(
+        hub.endpoint(),
+        botster_hub_client::DaemonRequest::ListPackages,
+    )
+    .expect("list packages");
+    let package = listed
+        .packages
+        .iter()
+        .find(|package| package.package_name == "event-plane-producer")
+        .expect("producer package is listed");
+    assert_eq!(package.notice_reactions.len(), 1);
+    let descriptor = &package.notice_reactions[0];
+    assert_eq!(descriptor.owner, "event-plane-producer");
+    assert_eq!(descriptor.name, "sample.ready");
+    assert_eq!(
+        descriptor.subject_scope,
+        botster_ui_contract::PackageNoticeSubjectScope::Session
+    );
+    assert_eq!(descriptor.text_pointer, "/notice");
+    assert_eq!(descriptor.ttl_ms, 5_000);
+    assert_eq!(
+        descriptor.severity,
+        botster_ui_contract::PackageNoticeSeverity::Info
+    );
+
+    let mut matching =
+        botster_hub_client::connect_for_package_event_subscriptions(hub.endpoint())
+            .expect("matching hello");
+    matching
+        .subscribe_events(
+            "sub-notice-match",
+            "event-plane-producer",
+            "sample.ready",
+            vec!["session-notice-1".to_string()],
+        )
+        .expect("subscribe matching");
+
+    emit_sample_ready_payload(
+        hub.endpoint(),
+        "notice-ok",
+        Some("session-notice-1"),
+        Some("ready"),
+    );
+    emit_sample_ready_payload(
+        hub.endpoint(),
+        "notice-other",
+        Some("session-notice-other"),
+        Some("ignored"),
+    );
+    let payload = wait_for_package_event_token(&mut matching, "notice-ok");
+    assert_eq!(
+        botster_ui_contract::resolve_notice_text(&payload, &descriptor.text_pointer)
+            .expect("resolve matching notice"),
+        "ready"
+    );
+    let _ = matching.request(&botster_hub_client::DaemonRequest::Status);
+    assert!(
+        matching.take_skipped_events().is_empty(),
+        "non-matching session subject must not deliver"
+    );
+
+    let mut second =
+        botster_hub_client::connect_for_package_event_subscriptions(hub.endpoint())
+            .expect("second hello");
+    second
+        .subscribe_events(
+            "sub-notice-second",
+            "event-plane-producer",
+            "sample.ready",
+            vec!["session-notice-1".to_string()],
+        )
+        .expect("subscribe second");
+
+    let empty_notice = "";
+    let oversized = "a".repeat(botster_ui_contract::NOTICE_TEXT_MAX_BYTES + 1);
+    emit_sample_ready_payload(
+        hub.endpoint(),
+        "notice-empty",
+        Some("session-notice-1"),
+        Some(empty_notice),
+    );
+    emit_sample_ready_payload(
+        hub.endpoint(),
+        "notice-oversize",
+        Some("session-notice-1"),
+        Some(&oversized),
+    );
+    let matching_invalid =
+        wait_for_package_event_tokens(&mut matching, &["notice-empty", "notice-oversize"]);
+    let second_invalid =
+        wait_for_package_event_tokens(&mut second, &["notice-empty", "notice-oversize"]);
+    // Ingress kept only payload-schema and total-payload-byte checks: both
+    // notice-invalid events were accepted as package events.
+
+    for payload in matching_invalid.iter().chain(second_invalid.iter()) {
+        let error = botster_ui_contract::resolve_notice_text(payload, &descriptor.text_pointer)
+            .expect_err("invalid notice suppresses only the transient text");
+        match payload["token"].as_str() {
+            Some("notice-empty") => {
+                assert!(matches!(
+                    error,
+                    botster_ui_contract::NoticeTextError::Empty { .. }
+                ));
+            }
+            Some("notice-oversize") => {
+                assert!(matches!(
+                    error,
+                    botster_ui_contract::NoticeTextError::Oversized { bytes, .. }
+                        if bytes == botster_ui_contract::NOTICE_TEXT_MAX_BYTES + 1
+                ));
+                assert_eq!(
+                    payload["notice"].as_str().expect("oversized notice"),
+                    oversized
+                );
+            }
+            other => panic!("unexpected token {other:?}"),
+        }
+    }
+
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+fn wait_for_package_event_token(
+    connection: &mut botster_hub_client::DaemonConnection,
+    token: &str,
+) -> serde_json::Value {
+    wait_for_package_event_tokens(connection, &[token])
+        .into_iter()
+        .next()
+        .expect("token payload")
+}
+
+fn wait_for_package_event_tokens(
+    connection: &mut botster_hub_client::DaemonConnection,
+    tokens: &[&str],
+) -> Vec<serde_json::Value> {
+    let mut found = BTreeMap::new();
+    let started = Instant::now();
+    let deadline = Duration::from_secs(10);
+    while found.len() < tokens.len() {
+        let remaining = deadline.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            panic!(
+                "timed out waiting for tokens {tokens:?}; received {:?}",
+                found.keys().collect::<Vec<_>>()
+            );
+        }
+        connection
+            .set_read_timeout(Some(remaining.min(Duration::from_millis(200))))
+            .expect("set event read timeout");
+        match connection.next_event() {
+            Ok(botster_hub_client::DaemonEvent::PackageEvent { payload, .. }) => {
+                let token = payload["token"].as_str().unwrap_or("");
+                assert!(
+                    tokens.contains(&token),
+                    "unexpected package event token {token}; wanted {tokens:?}"
+                );
+                found.insert(token.to_string(), payload);
+            }
+            Ok(other) => panic!("expected PackageEvent, got {other:?}"),
+            Err(error) if package_event_wait_is_retryable(&error) => continue,
+            Err(error) => panic!("waiting for tokens {tokens:?}: {error}"),
+        }
+    }
+    tokens
+        .iter()
+        .map(|token| {
+            found
+                .remove(*token)
+                .unwrap_or_else(|| panic!("missing collected token {token}"))
+        })
+        .collect()
+}
+
+fn package_event_wait_is_retryable(error: &botster_hub_client::DaemonTransportError) -> bool {
+    let message = error.to_string();
+    message.contains("timed out")
+        || message.contains("WouldBlock")
+        || message.contains("Resource temporarily unavailable")
+        || message.contains("os error 35")
+        || message.contains("os error 11")
 }
 
 #[test]

@@ -23,7 +23,8 @@ use botster_core::{
     RunnableEntrypointReadiness, admit_host_profile, resolve_package_dependencies,
 };
 use botster_ui_contract::{
-    PackageNavigationEntry, PackagePresentationValidationError, PackageSurfaceDescriptor,
+    PackageNavigationEntry, PackageNoticeReactionDeclaration, PackagePresentationValidationError,
+    PackageSurfaceDescriptor, decode_notice_text_pointer, validate_package_notice_reactions,
     validate_package_presentation,
 };
 use serde::{Deserialize, Serialize};
@@ -88,12 +89,15 @@ pub struct HubPackageEvents {
     /// Events this package may emit.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub emitted: Vec<HubEmittedEvent>,
+    /// Authored transient client notice reactions for admitted emitted events.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<PackageNoticeReactionDeclaration>,
 }
 
 impl HubPackageEvents {
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.emitted.is_empty()
+        self.emitted.is_empty() && self.notices.is_empty()
     }
 }
 
@@ -146,6 +150,69 @@ impl HubPackageManifest {
             }
             crate::package_event_schema::CompiledEventSchema::compile(&event.payload_schema)?;
         }
+        validate_package_notice_reactions(&self.events.notices)
+            .map_err(|error| error.to_string())?;
+        let mut resolved_names = BTreeSet::new();
+        for notice in &self.events.notices {
+            if let Some(owner) = &notice.owner
+                && owner != &self.name
+            {
+                return Err(format!(
+                    "notice {} owner must be the declaring package",
+                    notice.name
+                ));
+            }
+            if !resolved_names.insert(notice.name.clone()) {
+                return Err(format!("duplicate notice reaction {}", notice.name));
+            }
+            let Some(event) = self
+                .events
+                .emitted
+                .iter()
+                .find(|event| event.name == notice.name)
+            else {
+                return Err(format!(
+                    "notice {} does not name an admitted emitted event",
+                    notice.name
+                ));
+            };
+            if !event.audience.iter().any(|audience| audience == "clients") {
+                return Err(format!(
+                    "notice {} requires the matching event to include the clients audience",
+                    notice.name
+                ));
+            }
+            let Some(properties) = event
+                .payload_schema
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+            else {
+                return Err(format!(
+                    "notice {} matching event has no payload properties",
+                    notice.name
+                ));
+            };
+            if !properties.contains_key("subject") {
+                return Err(format!(
+                    "notice {} matching event payload schema must declare subject",
+                    notice.name
+                ));
+            }
+            let property = decode_notice_text_pointer(&notice.text_pointer)
+                .map_err(|error| error.to_string())?;
+            let Some(property_schema) = properties.get(&property) else {
+                return Err(format!(
+                    "notice {} text pointer property `{property}` is absent from the payload schema",
+                    notice.name
+                ));
+            };
+            if !schema_accepts_string(property_schema) {
+                return Err(format!(
+                    "notice {} text pointer property `{property}` must accept a string",
+                    notice.name
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -180,6 +247,19 @@ impl HubPackageManifest {
         Ok(contracts)
     }
 
+    /// Project admitted notice declarations with the package name as owner.
+    #[must_use]
+    pub fn notice_reaction_descriptors(
+        &self,
+    ) -> Vec<botster_ui_contract::PackageNoticeReactionDescriptor> {
+        self.events
+            .notices
+            .iter()
+            .cloned()
+            .map(|declaration| declaration.into_descriptor(&self.name))
+            .collect()
+    }
+
     pub(crate) fn core_execution_manifest(&self) -> CorePackageManifest {
         CorePackageManifest {
             name: self.name.clone(),
@@ -195,6 +275,25 @@ impl HubPackageManifest {
             configuration: self.configuration.clone(),
             runnable_entrypoints: self.runnable_entrypoints.clone(),
         }
+    }
+}
+
+fn schema_accepts_string(schema: &serde_json::Value) -> bool {
+    match schema.get("type") {
+        Some(serde_json::Value::String(kind)) => kind == "string",
+        Some(serde_json::Value::Array(kinds)) => {
+            kinds.iter().any(|kind| kind.as_str() == Some("string"))
+        }
+        None => {
+            schema
+                .get("const")
+                .is_some_and(serde_json::Value::is_string)
+                || schema
+                    .get("enum")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|values| values.iter().any(serde_json::Value::is_string))
+        }
+        _ => false,
     }
 }
 
@@ -3560,6 +3659,151 @@ mod tests {
         assert_eq!(manifest.navigation, navigation);
         assert!(core.get("surfaces").is_none());
         assert!(core.get("navigation").is_none());
+    }
+
+    fn sample_emitted(audience: &[&str], extra_properties: serde_json::Value) -> HubEmittedEvent {
+        let mut properties = serde_json::Map::new();
+        properties.insert("ok".to_string(), serde_json::json!({ "type": "boolean" }));
+        properties.insert(
+            "subject".to_string(),
+            serde_json::json!({ "type": "string" }),
+        );
+        properties.insert(
+            "notice".to_string(),
+            serde_json::json!({ "type": "string" }),
+        );
+        if let serde_json::Value::Object(extra) = extra_properties {
+            properties.extend(extra);
+        }
+        HubEmittedEvent {
+            name: "sample.ready".to_string(),
+            payload_schema: serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": properties,
+                "required": ["ok"]
+            }),
+            audience: audience.iter().map(|value| (*value).to_string()).collect(),
+            owner: None,
+        }
+    }
+
+    fn sample_notice() -> botster_ui_contract::PackageNoticeReactionDeclaration {
+        botster_ui_contract::PackageNoticeReactionDeclaration {
+            owner: None,
+            name: "sample.ready".to_string(),
+            subject_scope: botster_ui_contract::PackageNoticeSubjectScope::Session,
+            text_pointer: "/notice".to_string(),
+            ttl_ms: 5_000,
+            severity: botster_ui_contract::PackageNoticeSeverity::Info,
+        }
+    }
+
+    #[test]
+    fn event_contracts_admit_a_valid_notice_declaration() {
+        let mut manifest = plugin_manifest("event-plane-producer", Vec::new());
+        manifest.events.emitted = vec![sample_emitted(
+            &["plugins", "clients"],
+            serde_json::json!({}),
+        )];
+        manifest.events.notices = vec![sample_notice()];
+        manifest
+            .validate_event_contracts()
+            .expect("valid notice is admitted");
+        let descriptors = manifest.notice_reaction_descriptors();
+        assert_eq!(descriptors.len(), 1);
+        assert_eq!(descriptors[0].owner, "event-plane-producer");
+        assert_eq!(descriptors[0].name, "sample.ready");
+    }
+
+    #[test]
+    fn event_contracts_reject_foreign_unadmitted_and_unusable_notices() {
+        let mut manifest = plugin_manifest("event-plane-producer", Vec::new());
+        manifest.events.emitted = vec![sample_emitted(
+            &["plugins", "clients"],
+            serde_json::json!({}),
+        )];
+        let mut foreign = sample_notice();
+        foreign.owner = Some("other.package".to_string());
+        manifest.events.notices = vec![foreign];
+        assert!(
+            manifest
+                .validate_event_contracts()
+                .expect_err("foreign owner")
+                .contains("owner must be the declaring package")
+        );
+
+        manifest.events.notices = vec![botster_ui_contract::PackageNoticeReactionDeclaration {
+            name: "missing.event".to_string(),
+            ..sample_notice()
+        }];
+        assert!(
+            manifest
+                .validate_event_contracts()
+                .expect_err("unadmitted name")
+                .contains("does not name an admitted emitted event")
+        );
+
+        manifest.events.emitted = vec![sample_emitted(&["plugins"], serde_json::json!({}))];
+        manifest.events.notices = vec![sample_notice()];
+        assert!(
+            manifest
+                .validate_event_contracts()
+                .expect_err("plugins-only audience")
+                .contains("clients audience")
+        );
+
+        let mut no_subject = sample_emitted(&["clients"], serde_json::json!({}));
+        no_subject.payload_schema["properties"]
+            .as_object_mut()
+            .expect("properties")
+            .remove("subject");
+        manifest.events.emitted = vec![no_subject];
+        assert!(
+            manifest
+                .validate_event_contracts()
+                .expect_err("missing subject")
+                .contains("must declare subject")
+        );
+
+        let mut missing_pointer = sample_notice();
+        missing_pointer.text_pointer = "/absent".to_string();
+        manifest.events.emitted = vec![sample_emitted(&["clients"], serde_json::json!({}))];
+        manifest.events.notices = vec![missing_pointer];
+        assert!(
+            manifest
+                .validate_event_contracts()
+                .expect_err("absent pointer property")
+                .contains("absent from the payload schema")
+        );
+
+        let mut number_notice = sample_emitted(&["clients"], serde_json::json!({}));
+        number_notice.payload_schema["properties"]["notice"] =
+            serde_json::json!({ "type": "number" });
+        manifest.events.emitted = vec![number_notice];
+        manifest.events.notices = vec![sample_notice()];
+        assert!(
+            manifest
+                .validate_event_contracts()
+                .expect_err("non-string pointer property")
+                .contains("must accept a string")
+        );
+    }
+
+    #[test]
+    fn event_contracts_do_not_enforce_notice_byte_bound_at_admission() {
+        let mut manifest = plugin_manifest("event-plane-producer", Vec::new());
+        manifest.events.emitted = vec![sample_emitted(&["clients"], serde_json::json!({}))];
+        manifest.events.notices = vec![sample_notice()];
+        manifest
+            .validate_event_contracts()
+            .expect("plain string property is admitted with no length keyword");
+        let encoded = serde_json::to_string(&manifest.events.emitted[0].payload_schema)
+            .expect("schema serializes");
+        assert!(
+            !encoded.contains("contentEncoding") && !encoded.contains("maxLength"),
+            "admission must not introduce a JSON Schema byte keyword"
+        );
     }
 
     #[test]

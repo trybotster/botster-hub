@@ -7336,6 +7336,7 @@ fn daemon_package_from_client(package: HubClientPackage) -> DaemonPackage {
             })
             .collect(),
         surfaces: package.surfaces,
+        notice_reactions: package.notice_reactions,
         routes,
         runnable_entrypoints: package
             .runnable_entrypoints

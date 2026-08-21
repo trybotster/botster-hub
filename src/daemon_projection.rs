@@ -1321,6 +1321,7 @@ mod tests {
             state,
             requested_capabilities: Vec::new(),
             surfaces: Vec::new(),
+            notice_reactions: Vec::new(),
             navigation: Vec::new(),
             runnable_entrypoints: Vec::new(),
             configuration: crate::HubClientPackageConfiguration {

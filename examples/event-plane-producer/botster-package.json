@@ -18,10 +18,21 @@
           "additionalProperties": false,
           "properties": {
             "ok": { "type": "boolean" },
-            "token": { "type": "string" }
+            "token": { "type": "string" },
+            "subject": { "type": "string" },
+            "notice": { "type": "string" }
           },
           "required": ["ok"]
         }
+      }
+    ],
+    "notices": [
+      {
+        "name": "sample.ready",
+        "subject_scope": "session",
+        "text_pointer": "/notice",
+        "ttl_ms": 5000,
+        "severity": "info"
       }
     ]
   }

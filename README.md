@@ -202,7 +202,7 @@ attach/drain data plane. Subscription history still flows through attach/drain
 events rather than through readback responses.
 
 The renderer-neutral plugin UI wire contract is owned by Hub Git tag
-`botster-ui-contract-v0.3.2` and its generated `@trybotster/ui-contract@0.3.2`
+`botster-ui-contract-v0.3.3` and its generated `@trybotster/ui-contract@0.3.3`
 package. Those packages are one contract version. The Hub workspace
 path-resolves the crate for local development only. Create or verify the tag
 with `script/tag-ui-contract`. Hub runtime code validates and routes those
@@ -648,7 +648,7 @@ data_dir=resolved:$HOME/.botster/hub
 daemon=started
 protocol=botster-hub-daemon-v1
 protocol_version=7
-conformance_fixture_revision=44
+conformance_fixture_revision=45
 package_count=2
 enabled_package_count=2
 app_count=2
