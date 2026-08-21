@@ -2,7 +2,7 @@
 
 - Ticket: `ticket_1787267568_492780`
 - Run: `run_1787278338_832165`
-- Revision: **2**. Revision 1 (`review_1787279337_548281`) required changes on four findings.
+- Revision: **3**. Revision 1 drew four findings in `review_1787279337_548281`. Revision 2 fixed three and parked on the fourth. Revision 3 releases the park after the parent plan approval; see section 13.
 - Target repository: `trybotster/botster-hub`
 - Target id: `tgt_7e208a0c76a44980a83b63af976b1f22`
 - Base: `origin/main` at `b3b54f1` ("Merge ticket: Roll Core pin after IncrementalAttach local-runtime gate")
