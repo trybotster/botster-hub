@@ -570,18 +570,28 @@ integration tests, the repository lifecycle suite, and scratch consumer `cargo c
    external contract surface. Revision 1 used crate location to skip a charter, which the Hub charter's
    "does not own" list already forbids.
 
-## 13. Park status
+## 13. Park status — RELEASED
 
-This plan is **complete and parked**, not submitted for advancement.
+This plan was parked at revision 2 and is **released as of revision 3**.
 
 Plan Review finding `finding_1787279337_500928` ruled that human answer `question_1787267931_572353`
 forbids this ticket from starting until Plan Review approves the parent integration plan for
-`ticket_1786663585_879846`. That parent run, `run_1787262311_549251`, is currently back at Plan.
+`ticket_1786663585_879846`.
 
-Release condition, in order:
+That condition is now satisfied. I verified it independently rather than accepting the notification alone:
 
-1. Plan Review approves the parent plan for `ticket_1786663585_879846`.
-2. The parent run restores the dependency edge on `ticket_1787267568_492780`, as the human answer requires.
-3. This run then submits gate evidence and requests advancement to Plan Review with revision 2.
+- Parent run `run_1787262311_549251`, Plan Review visit at step 14 (started `1787279449`), produced
+  `review_1787279657_551348` with verdict **approved** at `1787279657`. It is the newest review on that
+  run by timestamp, and it supersedes `review_1787278903_443047`.
+- The parent dependency edge on this ticket is restored: `dependency_1787279676_288569`, created at
+  `1787279676`, `depends_on_ticket_id = ticket_1787267568_492780`.
+- Parent gate result: `gate_result_1787279666_738333`.
 
-No implementation work starts before step 3 completes and Plan Review approves this plan.
+**Correction to the revision 2 release condition.** Revision 2 listed edge restoration as a second step
+before this run could proceed. The start condition is the parent Plan Review **approval** alone. This run
+does not wait for the parent dependency edges to close, and it does not wait for parent Implement. The
+parent Implement step is itself parked until this ticket and the other four prerequisites close, so this
+ticket is now on the critical path rather than behind it.
+
+Revision 3 therefore requests advancement to Plan Review. Nothing else in this plan changed between
+revision 2 and revision 3; the technical content is identical.
