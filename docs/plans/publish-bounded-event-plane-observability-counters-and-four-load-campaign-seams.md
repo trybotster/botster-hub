@@ -2,6 +2,9 @@
 
 - Ticket: `ticket_1787267568_492780`
 - Run: `run_1787278338_832165`
+- Revision: **9**. Revision 9 answers the two findings in `review_1787289501_106968`: producer retirement
+  could not both prune the registry and avoid its lock, and S1f attributed `preview_package_replacement`
+  to the wrong entry point. The cleanup fix removes a requirement rather than adding one.
 - Revision: **8**. Revision 8 answers the three findings in `review_1787288993_904087`: package admission
   rollback omitted the new diagnostic state, a retained consumer queue could hold a stale `Arc`, and stale
   revision 6 instructions still contradicted the revision 7 rules.
@@ -18,6 +21,13 @@
 - Target id: `tgt_7e208a0c76a44980a83b63af976b1f22`
 - Base: `origin/main` at `b3b54f1` ("Merge ticket: Roll Core pin after IncrementalAttach local-runtime gate")
 - Core pin (verified in `Cargo.toml:24-26,43-44`): `7eafa470a18025895995bbedc20d34b58106a03b`
+
+## 0. Response to Plan Review `review_1787289501_106968` (revision 9)
+
+| Finding | Severity | Response |
+| --- | --- | --- |
+| `finding_1787289501_918216` — producer retirement cannot both prune the registry and avoid its lock | blocker | **Accepted. This was a self-contradiction I introduced in revisions 7 and 8.** S1b and S1c told `retire_holder_locked` to remove the registry entry, while S1d said the registry lock is taken only at admission and status read, and AC15 requires retirement to complete while another thread holds that lock. Those cannot all hold. New section S1h defines one design that satisfies both: **retirement never touches the registry.** It marks the cell dead through an atomic flag, and the next registry write — which is admission, already holding the write lock and never on an event path — prunes dead entries. The bound is real because a new producer identity can only appear through admission, so every new identity forces a prune first. This **removes** the retirement-side registry requirement rather than adding machinery. |
+| `finding_1787289501_304418` — S1f cites replacement preview as direct commit validation | high | **Accepted and fixed.** Verified: `preview_package_replacement` is called at `src/package_event_router.rs:367`, which is inside `try_replace_package_generation` (opens at `:352`), not inside `try_commit_package_generation` (`:333-349`). Direct commit validates contract ownership and then calls `commit_package_generation_locked`, relying on sequential `subscribe_locked` plus `restore_admission`. The S1f **design** still holds, because the commit point sits after the last fallible step, but my stated **reason** was false. S1f now gives the correct per-entry-point justification, and AC17 exercises both entry points separately because their failure paths differ. |
 
 ## 0. Response to Plan Review `review_1787288993_904087` (revision 8)
 
@@ -287,9 +297,11 @@ Revision 7 ties the list to the same lifetime as producer occupancy:
   replacement**. Replacement never recreates or swaps the list, so `producer_slot` values on live
   envelopes stay valid across the generation boundary.
 - **Retained while `contracts_exist(owner) || producer.events > 0`.** Unload alone never removes it.
-- **Removed only when both are false**, checked at exactly two sites: `apply_unload`, when
-  `producer.events` is already zero, and `retire_holder_locked`, when the final admitted holder retires
-  and no contract remains.
+- **Eligible for removal only when both are false.** Eligibility is detected at `apply_unload`, when
+  `producer.events` is already zero, and at `retire_holder_locked`, when the final admitted holder retires
+  and no contract remains. **Detection is not removal**: per S1h, the retirement path only marks the cell
+  dead through an atomic flag, and the actual registry removal is deferred to the next admission, because
+  retirement must not take the registry lock.
 
 **S1d. Age cells are `Arc`-shared, and no event path takes the registry lock (fixes
 `finding_1787288480_692236`).**
@@ -306,7 +318,8 @@ Revision 7 removes the registry from every event path:
 - The producer age list, the consumer queue, and the client mailbox each hold a **direct**
   `Arc<AgeCell>` and update its `AtomicU64` through that handle.
 - The snapshot registry holds a **second** `Arc` to the same cell, purely for enumeration.
-- The registry lock is therefore taken only at admission (write) and at status read (read).
+- The registry lock is therefore taken only at admission (write) and at status read (read). Retirement
+  marks a cell dead with an atomic flag and **never** takes it (S1h).
   **No accepted-event, shed, or retirement path acquires it.**
 
 **S1e. No silent acceptance without age observation (fixes `finding_1787288480_127520`).**
@@ -343,11 +356,19 @@ documented atomic package-generation commit and the S1b identity bound.
 Revision 8 takes the reviewer's preferred option rather than extending rollback: **no diagnostic state is
 created until the entire admission is known to succeed.**
 
-- `try_commit_package_generation` already pre-validates through `preview_package_replacement` (`:367`).
-  Diagnostic admission moves to a **single commit point after every `subscribe_locked` call returns
-  `Accepted`**, so the failure path has nothing to undo and `AdmissionSnapshot` stays untouched.
-- `try_register_contracts` (`:300`) applies the same rule: validate the whole contract batch first, then
-  create age state once.
+Correcting revision 8's citation: `preview_package_replacement` is called at `:367`, which is inside
+`try_replace_package_generation` (opens at `:352`), **not** inside `try_commit_package_generation`
+(`:333-349`). The three entry points differ, and the same rule holds for each for a different reason:
+
+- **`try_commit_package_generation` (`:333`)** validates contract ownership and then calls
+  `commit_package_generation_locked` directly. It has **no** full-batch preview and relies on sequential
+  `subscribe_locked` with `restore_admission`. The rule holds because the diagnostic commit point sits
+  **after the last fallible step**, so the rollback path has nothing to undo.
+- **`try_replace_package_generation` (`:352`)** does pre-validate through `preview_package_replacement`
+  (`:367`) before `apply_unload` and the same commit call. The rule holds for the same commit-point reason,
+  with preview as an additional earlier guard.
+- **`try_register_contracts` (`:300`)** validates the whole contract batch first, then creates age state
+  once.
 - Rollback therefore needs no extension, and `restore_admission` keeps its exact current shape.
 - If Implement finds any admission path where a partial failure can still occur after diagnostic
   creation, it must extend rollback to remove **only** state created by that attempt, never disturbing
@@ -388,13 +409,42 @@ struct ConsumerQueue {
 
 AC18 is the red-first control for the unsubscribe-or-unload, re-subscribe, first-copy path.
 
+**S1h. Registry pruning is deferred to admission, so retirement never takes the registry lock (fixes
+`finding_1787289501_918216`).**
+
+Revisions 7 and 8 contradicted themselves. S1b and S1c required `retire_holder_locked` to remove the
+producer registry entry; S1d required the registry lock at admission and status read only; AC15 required a
+retirement to complete while another thread holds that lock. A retirement cannot remove a registry entry
+without taking the lock it is forbidden to take.
+
+Revision 9 resolves this by **removing the retirement-side requirement**, not by adding a cleanup path:
+
+- **Retirement marks, it does not remove.** `AgeCell` gains `dead: AtomicBool`. When `apply_unload` or
+  `retire_holder_locked` observes `contracts_exist(owner) == false && producer.events == 0`, it sets that
+  flag through the direct `Arc`. This is one atomic store, takes no registry lock, and satisfies AC15.
+- **A dead cell reports the empty sentinel.** Status readers observing `dead == true` report the empty age
+  rather than a stale value, so deferred removal never publishes stale observability.
+- **Pruning happens at the next registry write.** Admission already holds the registry write lock and is
+  never on an event path. Every admission sweeps and drops entries whose cell is marked dead.
+- **Status read never prunes** and keeps its read lock only.
+
+**Why the bound is real.** A producer identity can enter the registry only through admission, and every
+admission prunes before it inserts. Dead-but-unpruned entries therefore accumulate only between two
+admissions, and creating any new identity forces a sweep first. Registry size is bounded by
+`live_identities + dead_since_last_admission`, and because a new identity cannot appear without an
+admission, that is bounded by roughly twice the peak live identity count rather than growing with churn.
+
+AC11 is updated to assert this exact bound: after unload, unsubscribe, connection cleanup, and a
+reconnect-churn loop, the registry holds at most `live + dead_since_last_admission` entries, and after one
+further admission it returns to exactly the live-identity count.
+
 **S1b. Age-cell identity lifetime (fixes the second half of `finding_1787279337_990629`).**
 Revision 1 left the three identity maps with no removal rule. Revision 2 slaves each map to the live
 identity set that already exists, and removes a cell at exactly the site that ends that identity:
 
 | Map | Key | Insert site | Remove site |
 | --- | --- | --- | --- |
-| producer ages | package owner | **contract admission**: `try_register_contracts` (`:300`), `try_commit_package_generation` (`:333`), and `PackageEventRouter::new` for the built-in Hub contracts. Never on an event path. Reused across package replacement. | only when `contracts_exist(owner) == false` **and** `producer.events == 0`, checked in `apply_unload` and in `retire_holder_locked` (see S1c) |
+| producer ages | package owner | **contract admission**: `try_register_contracts` (`:300`), `try_commit_package_generation` (`:333`), `try_replace_package_generation` (`:352`), and `PackageEventRouter::new` for the built-in Hub contracts. Never on an event path. Reused across package replacement. | **marked dead** when `contracts_exist(owner) == false` **and** `producer.events == 0`, detected at `apply_unload` or `retire_holder_locked`; **removed from the registry** at the next admission sweep, never on the retirement path (see S1c and S1h) |
 | consumer ages | plugin key | **subscription admission** (`try_subscribe`, `try_commit_package_generation`). Never on an event path. | only when the plugin key retains **no subscription and no queued copy**, checked at `apply_unload` and at `unsubscribe` |
 | mailbox ages | connection id | mailbox creation | `cleanup_client_connection_locked` and the connection removals at `src/daemon_event_subscriptions.rs:434-437` and `:481` |
 
@@ -705,6 +755,9 @@ registry and source check before writing either literal.
   `AdmissionSnapshot` covers four maps only, so any diagnostic map created mid-batch would survive a
   restore. S1f avoids this by committing diagnostic state only after the whole batch succeeds. AC17 is the
   control.
+- **R17 (new in revision 9).** A cleanup rule and a no-lock rule can contradict each other silently when
+  they live in different sections. S1h resolves this by removing the retirement-side registry requirement,
+  and AC11 plus AC15 now assert the same design from both directions.
 - **R16 (new in revision 8).** A long-lived container that outlives its identity can retain a stale shared
   handle. `inner.consumers` entries are never removed, so the queue's age handle must be cleared at
   retirement and rebound at the next admission. AC18 is the control.
@@ -814,11 +867,16 @@ record the failing output **before** the change, per
        `npm run typecheck`, and `npm run build`, per
        `[[botster web generated protocol drift checks need explicit hub artifact paths]]`.
      - Remove both scratch worktrees afterwards and commit nothing to either consumer.
-- **AC11 — diagnostic identity retirement, red first (new in revision 2).** Tests prove each age map
+- **AC11 — diagnostic identity retirement and registry bound, red first (new in revision 2, tightened in
+  revision 9).** Tests prove each age map
   returns to the live-identity bound after: package unload, client unsubscribe, connection cleanup, and a
   reconnect-churn loop that creates and destroys many connection ids. The churn case must fail when a
   removal site is omitted, which Implement demonstrates by deleting one removal and recording the red run.
-- **AC17 — admission rollback leaves no diagnostic residue, red first (new in revision 8).** Submit a
+- **AC17 — admission rollback leaves no diagnostic residue, red first (new in revision 8, split in
+  revision 9).** Run the case **separately for `try_commit_package_generation` and
+  `try_replace_package_generation`**, because their failure paths differ: direct commit has no preview and
+  fails inside sequential subscription admission, while replacement can also fail at
+  `preview_package_replacement` before `apply_unload`. In each case, submit a
   package generation whose first subscription is valid and whose later subscription is invalid. Capture
   every admission map and every diagnostic map before the call. Assert that after the failure, `contracts`,
   `subscriptions`, `subscriptions_per_plugin`, `package_generation`, `consumers`, the producer age-list
@@ -835,12 +893,15 @@ record the failing output **before** the change, per
   admit the next generation (package replacement), then complete the **old** holder late. Assert that the
   old holder's `producer_slot` still addresses the same live list, that its retirement decrements the
   correct occupancy, that it does not unlink a slot owned by the new generation, and that the oldest age
-  stays readable throughout. Assert the list is removed only after the last contract is gone **and**
-  `producer.events` reaches zero. Implement must show this red against the revision 6 behaviour that
-  removed the list in `apply_unload`.
-- **AC15 — ingress never waits on the diagnostic registry, red first (new in revision 7).** Hold the
+  stays readable throughout. Assert the list becomes eligible for removal only after the last contract is
+  gone **and** `producer.events` reaches zero, that the final retirement only **marks** the identity dead
+  through the atomic flag, and that the registry entry disappears at the next admission sweep per S1h.
+  Implement must show this red against the revision 6 behaviour that removed the list in `apply_unload`.
+- **AC15 — ingress and retirement never wait on the diagnostic registry, red first (new in revision 7,
+  tightened in revision 9).** Hold the
   snapshot registry lock on one thread. On another thread run an accepted emit, a shed emit, and a
-  retirement. Assert all three complete without waiting for the registry lock and without returning
+  retirement, **including a final retirement that marks a producer identity dead**, which S1h requires to
+  complete through an atomic flag without the registry lock. Assert all three complete without waiting for the registry lock and without returning
   `ShedBusy` for that reason. Implement must show this red against the revision 6 design that acquired the
   registry lock on the event path.
 - **AC16 — no accepted event without a live producer slot, red first (new in revision 7).** Assert that
@@ -927,7 +988,14 @@ integration tests, the repository lifecycle suite, and scratch consumer `cargo c
 15. **Appending a corrected section does not retract the original.** Revisions 7 left superseded S1a
     instructions active beside their replacements, which is an implementation hazard rather than a
     documentation nit. A revision that changes a rule must rewrite the rule, not only add the new one.
-16. **Correcting a stale in-repository assumption** — an in-repository workspace member can still be an
+16. **A deferred-cleanup rule must name the site that actually performs the removal.** Writing "remove at
+    retirement" in one section and "never lock at retirement" in another produced a design that could not
+    be implemented. Pruning at the next admission works only because a new identity cannot appear without
+    an admission, which is what makes the bound real rather than asserted.
+17. **Cite the exact enclosing function, not the nearest line number.** `preview_package_replacement` at
+    `:367` sits inside `try_replace_package_generation`, not the direct commit entry point, and the wrong
+    attribution produced a true conclusion from a false premise.
+18. **Correcting a stale in-repository assumption** — an in-repository workspace member can still be an
    external contract surface. Revision 1 used crate location to skip a charter, which the Hub charter's
    "does not own" list already forbids.
 
