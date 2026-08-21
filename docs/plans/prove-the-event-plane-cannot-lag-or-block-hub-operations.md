@@ -7,6 +7,16 @@ Pipeline: `botster_stack_delivery` (direct merge, no PR)
 Project: `project_1786663508_823105` Botster Non-Blocking Event Plane, Stage D
 Vault checklist: `checklist_1787266824_449406` (ticket scope, one Plan visit)
 
+## Plan revision 8
+
+Revision 8 answers Plan Review `review_1787278903_443047` (`changes_required`, three findings). All three were correct.
+
+| Finding | Class | Correction |
+| --- | --- | --- |
+| `finding_1787278903_138982` The named generic client fixture has no event-plane coverage | **blocker / product** | I cited `run_client_conformance` (`crates/botster-hub-test-support/src/lib.rs:1440`) without reading its body. It proves status, sessions, attach, input, resize, drain, and lifecycle, and contains no `SubscribeEvents`, `UnsubscribeEvents`, `PackageEvent`, or `EventGap` path; those symbols appear nowhere in that crate. New section 5G.1.1 names the six Hub-local proofs in `tests/hub_daemon_lifecycle/package_event_plane.rs` that already enter through the public client boundary, and this ticket promotes them into a new repository-owned `run_client_event_conformance` in `crates/botster-hub-test-support/src/lib.rs`, driven under saturation. Section 9 lists the changed file and the published-surface check; section 12.3 item 13 cites the new entrypoint. |
+| `finding_1787278903_125669` The prerequisite graph hides two active public-contract dependencies | high / product | Section 5G.3 now carries the full five-ticket graph with targets, deliverables, and edge ids, including `ticket_1787278643_145174` (Hub package-owned client notice reaction descriptor in `@trybotster/ui-contract`, `HubPackageManifest`, and `DaemonPackage`) and `ticket_1787278658_151737` (Project Pipelines declaration plus `payload.subject`). Both are named as material public-contract changes. It also corrects revisions 6 and 7: Project Pipelines is **not** unchanged; a prerequisite in that repository changes it, while this campaign neither changes nor executes it. New unknown U7 covers whether the descriptor forces a declaration on this campaign's own saturation fixtures. |
+| `finding_1787278903_320205` The consumption and revision evidence rules contradict each other | high / product | Sections 5F, 5G.3, 5G.6, 7, and 14.1 stated four incompatible rules. Section 5G.6 is now the single authority and splits **executed revisions** (Hub and its locked Core, the only code this workflow runs) from **cited prerequisite revisions** (the five prerequisites' merged revisions and gate artifact ids, explicitly not executed). Sections 5F, 6.1, 7, and 14.1 defer to it, and the non-scope wording now scopes "edits and executes" separately from "is a prerequisite" so the two no longer read as a contradiction. |
+
 ## Plan revision 7
 
 Revision 7 folds in the operator instruction that followed revision 6: two library-cleanup tickets now exist and are running, and this campaign consumes three repository-owned prerequisites rather than one.
@@ -143,6 +153,8 @@ Cross-repository acceptance, from [[project-pipelines-playbook]]:
 - [[authentic integration starts with the first cross-repository delivery wave]]
 - [[cross-client acceptance uses one live session identity]]
 - [[each acceptance condition names its authoritative production oracle]]
+- [[event plane client proof uses library contract fixtures]] -- the governing note for the library-boundary shape; Hub owns a fixture plugin over the public package ABI and router, clients own their canonical protocol harnesses, and each product plugin proves its own emitted contract
+- [[question opened clients subscribe with empty subjects]] -- being superseded by `ticket_1787278658_151737`, which replaces client-side workflow filtering with subject targeting
 
 Event-plane contract:
 
@@ -494,8 +506,11 @@ The campaign uses production default policy values. It does not shrink `PackageE
 
 ### F. Evidence
 
-- `docs/reports/prove-the-event-plane-cannot-lag-or-block-hub-operations-implement.md`, the narrative report.
-- `docs/reports/prove-the-event-plane-cannot-lag-or-block-hub-operations-evidence.json`, modelled on `docs/reports/bounded-hub-resources-fresh-campaign-evidence.json`, recording exact revisions for all five repositories, configuration, machine profile, formulas, per-arm results, the fault matrix outcomes, and the verdict.
+Three artifacts, all under `docs/reports/`:
+
+- `<slug>-calibration.json`, the committed calibration dataset and derived immutable thresholds from section 5A.4 phase 1.
+- `<slug>-implement.md`, the narrative report. It must keep the new event-plane coexistence regression budgets distinct from the pre-existing North Star behavioural contract, and must not present a fixture result as a product contract result.
+- `<slug>-evidence.json`, the acceptance evidence. **Section 5G.6 is the single authority on which revisions it records**, split into executed revisions and cited prerequisite revisions. No other section states a competing rule.
 
 ### G. Client proof at public boundaries, with generic fixtures
 
@@ -510,28 +525,61 @@ Revisions 3 and 4 built a product-specific chain: the real `botster-project-pipe
 | Package event admission, routing, fanout, shed, and bounded queues under saturation | a small fixture plugin driven through the **real** `HubPackageManifest` ABI and the **real** `PackageEventRouter` | this repository, `examples/event-plane-producer` and `examples/event-plane-consumer` |
 | Causal-scope rejection under saturation | the existing cycle fixture | this repository, `examples/event-plane-cycle` |
 | Full plugin ABI surface under saturation | the existing matrix package | this repository, `fixtures/plugins/plugin-contract-matrix` |
-| Generic client event consumption over the host control protocol | Unix and WebRTC host-control clients built from the published client crate, exercised through the canonical conformance entrypoint | this repository, `botster_hub_test_support::run_client_conformance` (`crates/botster-hub-test-support/src/lib.rs:1440`) |
+| Generic client event consumption over the host control protocol | a **new** generic event conformance entrypoint, built from the proven Hub-local helpers and driven under saturation. See 5G.1.1 | this repository, added to `crates/botster-hub-test-support/src/lib.rs` |
 | Terminal behaviour under saturation | the existing many-PTY conformance shape and the two adapter suites | this repository, `run_many_pty_client_attach_conformance` (`:553`), `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs`, `webrtc_terminal_adapter.rs` |
 
 Every row is inside botster-hub, uses an existing repository-owned fixture, and needs no client checkout, no Node toolchain, and no product package.
+
+#### G.1.1 The generic event conformance fixture does not exist yet, and this ticket adds it
+
+Revision 7 named `botster_hub_test_support::run_client_conformance` (`crates/botster-hub-test-support/src/lib.rs:1440`) as the authoritative generic proof for client event consumption. Plan Review `finding_1787278903_138982` rejected that, and direct source inspection confirms the rejection: that function proves status, compatibility, sessions, spawn, terminal attach, input, resize, drain, and lifecycle, and contains **no** `SubscribeEvents`, `UnsubscribeEvents`, `PackageEvent`, or `EventGap` path. A repository-wide search finds `SubscribeEvents` and `EventGap` nowhere in that crate. I cited a fixture without reading its body, and it cannot prove the event-plane claim.
+
+The generic event proofs that **do** exist are Hub-local, in `tests/hub_daemon_lifecycle/package_event_plane.rs`, and they already enter through the public client boundary via `botster_hub_client::connect_for_package_event_subscriptions`, `subscribe_events`, `next_event`, and `take_skipped_events`:
+
+| Existing Hub-local proof | What it establishes |
+| --- | --- |
+| `isolated_hub_unix_client_receives_unsolicited_package_event` (`:328`) | exact delivery on the host-control path |
+| `isolated_hub_unnegotiated_subscribe_events_is_typed_error` (`:372`) | negotiation is required |
+| `isolated_hub_rejected_terminal_hello_still_subscribes_to_package_events` (`:407`) | terminal rejection does not remove the host event feature |
+| `isolated_hub_reconnect_does_not_replay_package_events` (`:460`) | reconnect mints a fresh subscription with no replay |
+| `isolated_hub_subject_and_audience_admission_return_typed_errors` (`:497`) | exact subject and audience admission |
+| `isolated_hub_unix_write_stall_emits_one_event_gap_then_status_progresses` (`:531`) | a stalled consumer yields one `event_gap` and control progresses |
+
+This ticket promotes that proven behaviour into one reusable, repository-owned entrypoint and drives it under saturation:
+
+- **File:** `crates/botster-hub-test-support/src/lib.rs`, a new `run_client_event_conformance` beside `run_client_conformance`.
+- **Coverage, all at the public client protocol boundary:** exact owner-plus-name subscribe, event receive, subject filtering, slow-consumer `event_gap`, reconnect without replay, unsubscribe, and continued control-response progress while events flow.
+- **Driven under saturation** by the campaign lane, not only in isolation, because the claim is about behaviour while the plane is saturated.
+- **Published-surface check:** `botster-hub-test-support` is a published crate and npm package. Adding a Rust entrypoint should not change conformance fixture bytes, but Implement must confirm that and, if fixture bytes do change, follow [[Hub test support capability cutovers use a new unpublished package version]] rather than mutating a published version.
+
+Section 9 lists the changed file. Section 12.3 item 13 cites this entrypoint rather than `run_client_conformance`.
 
 #### G.2 The public boundary is already documented
 
 `docs/client-protocol.md:1374` states the contract this revision follows: an external client that needs a true live-hub integration test depends on the client protocol crate plus the test-support crate, **not on the full `botster-hub` library**, and pins the UI contract by tag rather than by a Hub commit. The campaign proves the Hub side of that boundary with generic fixtures. It does not reach across it.
 
-#### G.3 Three repository-owned prerequisites make the boundary claim true
+#### G.3 The full prerequisite graph, including the two public-seam tickets
 
-The campaign consumes three prerequisites. It consumes them as **merged repository state**, not as artifacts it checks out, installs, or drives. The workflow stays single-repository per section 5G.5.
+Revision 7 listed three prerequisites and stopped there. Plan Review `finding_1787278903_125669` found that the two client cleanups themselves depend on two further tickets that change **public contracts**, and that hiding them made the architecture scope look smaller than it is. The full graph:
 
-| Ticket | Repository | What it delivers | Why this campaign needs it |
-| --- | --- | --- | --- |
-| `ticket_1787267568_492780` | botster-hub | bounded event-plane observability counters, four distinct timeout counters, a saturation-safe read path, and four `BOTSTER_ENV=test` seams | without it the campaign cannot record seven of its twelve required signals (section 4.4) |
-| `ticket_1787278327_274484` | botster-web | removes the Project Pipelines owner, event name, workflow entity families, and payload knowledge from generic Web production code; keeps the generic subscription, event, `EventGap`, reconnect, and bounded-notice mechanisms; replaces product-specific tests with neutral contract fixtures that enter through the public protocol boundary | see below |
-| `ticket_1787278327_199618` | botster-tui | the same cleanup for botster-tui, keeping botster-tui-kit policy-free | see below |
+| Ticket | Repository | target_id | Delivers | Depends on |
+| --- | --- | --- | --- | --- |
+| `ticket_1787278643_145174` | botster-hub | `tgt_7e208a0c76a44980a83b63af976b1f22` | a bounded **package-owned client notice reaction descriptor** in the canonical `@trybotster/ui-contract`, admitted on `HubPackageManifest` beside `events.emitted`, projected onto `DaemonPackage`, published through the generated daemon protocol and `@trybotster/hub-test-support` metadata, plus a Hub-owned fixture package exercising the public ABI | nothing |
+| `ticket_1787278658_151737` | botster-project-pipelines | `tgt_a72ca1a83d504385b8648f71409119ab` | declares the `question.opened` notice reaction in its manifest and emits `payload.subject` as the active agent session uuid, replacing client-side workflow filtering with subject targeting | `ticket_1787278643_145174` (`dependency_1787278661_690676`) |
+| `ticket_1787278327_274484` | botster-web | `tgt_40abcf71ccf049f4ac0c99953a799869` | removes Project Pipelines owner, event name, payload, and entity-family knowledge from generic Web production code; neutral contract fixtures at the public protocol boundary | both above (`dependency_1787278671_574148`, `dependency_1787278676_422577`) |
+| `ticket_1787278327_199618` | botster-tui | `tgt_c3d470bab78549df920a41e8fb0e58d8` | the same cleanup, keeping botster-tui-kit policy-free | the same seam tickets |
+| `ticket_1787267568_492780` | botster-hub | `tgt_7e208a0c76a44980a83b63af976b1f22` | bounded event-plane observability counters, four distinct timeout counters, a saturation-safe read path, four `BOTSTER_ENV=test` seams | nothing |
 
-**Why the two client cleanups are prerequisites and not merely adjacent.** This campaign's central claim is that the Hub event plane is a *library boundary*: a generic host-control contract that any admitted package and any conforming client can use, not one product's wiring. Today both clients hardcode the Project Pipelines owner, the `question.opened` name, its payload shape, and its workflow entity families in **production** code. While that is true, a Hub-side generic proof would be representative of nothing that ships: the only real consumers would still be product-coupled. After the cleanups, the generic Hub contract this campaign saturates is the same contract the shipped clients actually consume, and the boundary claim is true in practice rather than only in the fixture.
+Two of these are **material public-contract changes**, and this plan names them rather than letting transitive engine edges hide them:
 
-Both cleanup tickets also produce the artifact this campaign's argument leans on: **neutral contract fixtures that enter through the public protocol boundary and do not inject after protocol decoding.** That is the client-side mirror of section 5G.1's Hub-side generic fixtures.
+- The Hub descriptor ticket adds a new declaration to `HubPackageManifest`, a new projection on `DaemonPackage`, and new DTOs in the generated protocol and in published test-support metadata. That is a change to the very contract this campaign saturates.
+- The Project Pipelines ticket changes an emitted event's payload by adding `payload.subject`.
+
+**Correction to revisions 6 and 7.** Both said Project Pipelines is unchanged and out of scope. That is now false: `ticket_1787278658_151737` changes its manifest declaration and its emitted payload. The accurate statement is that **this campaign does not change Project Pipelines and does not execute it**, while a prerequisite in that repository does change it. Section 6.1, section 7, and section 14.1 are corrected to say exactly that.
+
+**What the client cleanups consume.** Each consumes the merged `@trybotster/ui-contract` descriptor and its `DaemonPackage` projection from `ticket_1787278643_145174`, and the Web cleanup additionally consumes the subject-carrying `question.opened` from `ticket_1787278658_151737`. This campaign consumes none of those directly; it consumes the resulting **generic** client code as merged state.
+
+**Effect on this campaign's own surface.** The descriptor ticket changes `HubPackageManifest` admission and `DaemonPackage`. Implement must confirm whether the saturation fixtures in `examples/event-plane-producer` and `examples/event-plane-consumer` need a notice-reaction declaration once that lands, and whether the new descriptor admission path belongs in the fault matrix as a malformed-declaration rejection lane. Recorded as unknown U7.
 
 #### G.3.1 Canonical contract proof stays in each owner repository
 
@@ -539,8 +587,8 @@ This campaign cites these; it does not orchestrate, wire, or re-run them.
 
 | Repository | Canonical proof it owns |
 | --- | --- |
-| botster-project-pipelines | the `question.opened` contract: declaration, emit after durable commit, payload schema and size, and shed-without-loss. **Out of scope here**, and after the cleanups it is the only place that owner and event name legitimately appear outside a package declaration |
-| botster-web | its generic package-event client behaviour, proved by the neutral fixture from `ticket_1787278327_274484`, plus any optional Project Pipelines conformance test that does not affect production composition |
+| botster-project-pipelines | that its emitted `question.opened` matches its published contract, including the new subject, per `ticket_1787278658_151737` and [[event plane client proof uses library contract fixtures]] |
+| botster-web | its generic package-event client behaviour, proved by the neutral fixture from `ticket_1787278327_274484` |
 | botster-tui | the same, from `ticket_1787278327_199618` |
 | botster-core | terminal byte ownership and the plugin admission classes; unchanged |
 
@@ -552,9 +600,29 @@ This campaign cites these; it does not orchestrate, wire, or re-run them.
 
 The loaded workflow stays **single-repository**, which is what it already is. No `web_sha`, `tui_sha`, or `project_pipelines_sha` input. No additional `actions/checkout`. No Node or npm setup. No cross-repository credential, which retires the operator precondition that revision 3 raised as unknown U6 and the risks that depended on it. `script/prove-north-star-shared-session` is untouched by this ticket.
 
-#### G.6 Evidence shape
+#### G.6 Evidence shape: executed revisions versus cited prerequisite revisions
 
-The acceptance evidence JSON records the two revisions this campaign actually consumes — botster-hub and its locked botster-core — in the flat-SHA `revisions` shape of `docs/reports/bounded-hub-resources-fresh-campaign-evidence.json`, plus the runner `provenance` block from `docs/reports/focused-ubuntu-idle-cpu-resource-bound-evidence.json`. It must not record client revisions it did not exercise.
+Plan Review `finding_1787278903_320205` found that sections 5F, 5G.3, 5G.6, 7, and 14.1 contradicted each other about which revisions the report records. They are now one rule, split by role:
+
+**Executed revisions.** Exactly two, because the campaign runs only Hub code against its locked Core:
+
+| Field | Value |
+| --- | --- |
+| `botster-hub` | the exact merged Hub revision the campaign ran |
+| `botster-core` | the exact revision that Hub's `Cargo.lock` pinned for that run, recorded separately per [[live hub proof records distinct hub and locked core binary provenance]] |
+
+**Cited prerequisite revisions.** Recorded so the boundary claim is checkable, and clearly labelled as **not executed by this workflow**:
+
+| Field | Value |
+| --- | --- |
+| `botster-hub` descriptor and observability prerequisites | merged revisions of `ticket_1787278643_145174` and `ticket_1787267568_492780` |
+| `botster-project-pipelines` | merged revision of `ticket_1787278658_151737`, plus its own gate artifact id for the contract proof it owns |
+| `botster-web` | merged revision of `ticket_1787278327_274484`, plus its gate artifact id |
+| `botster-tui` | merged revision of `ticket_1787278327_199618`, plus its gate artifact id |
+
+The report must state plainly that the Hub workflow executes no client or package code, and that the cited revisions are the merged state that makes the boundary claim true rather than artifacts this campaign ran. That satisfies the ticket's requirement to use all five main revisions without pretending the campaign executed them.
+
+The JSON keeps the flat-SHA `revisions` shape of `docs/reports/bounded-hub-resources-fresh-campaign-evidence.json` for both blocks, under `executed_revisions` and `cited_prerequisite_revisions`, plus the runner `provenance` block from `docs/reports/focused-ubuntu-idle-cpu-resource-bound-evidence.json`.
 
 ## 6. Repository ownership boundaries and cross-repo dependencies
 
@@ -565,7 +633,7 @@ The acceptance evidence JSON records the two revisions this campaign actually co
 | Budget publication, campaign harness, verdict rules, evidence | botster-hub (this ticket) |
 | Event-plane counters and their read path | botster-hub (dependency in 6.2) |
 | Lifecycle journal, wake, pages, plugin admission classes | botster-core, unchanged |
-| `question.opened` contract | botster-project-pipelines, unchanged |
+| `question.opened` contract | botster-project-pipelines. **Changed by prerequisite `ticket_1787278658_151737`**, which adds the notice reaction declaration and `payload.subject`. This campaign neither changes nor executes it |
 | Transient-event consumption | botster-web and botster-tui, **unchanged and not exercised by this campaign**. Each keeps its own canonical isolated-Hub lane. Generic client consumption is proved here at the public boundary per section 5G.1 |
 | Terminal bytes | Core `SessionIo` and `ClientWorker`, unchanged |
 
@@ -612,8 +680,8 @@ Consumer note for that ticket: this ticket `ticket_1786663585_879846` depends on
 - No change to `MAX_OWNER_TURN_MS`, `MAX_READY_OPERATION_WAIT_MS`, `OBSERVE_SLICE_BUDGET`, `BASELINE_PAGE_BUDGET`, `PUMP_MAX_*`, `EVENT_DELIVERY_*`, `SESSION_DELIVERY_*`, or any `PackageEventPlaneOptions` default.
 - No production event-disable switch.
 - No new transport, request vocabulary change, `PROTOCOL_VERSION` bump, or conformance-fixture revision bump.
-- **No client repository is touched or required.** This run changes no file in botster-core, botster-web, botster-tui, botster-tui-kit, or botster-project-pipelines, and it does not check any of them out, install them, or drive their harnesses. Only botster-hub and its locked Core revision are consumed and recorded.
-- No real `botster-project-pipelines` package, no bound product run, no shared `north-star-shared` session, and no cross-client identity join. Those belong to the owner repositories' own contract proofs.
+- **This run edits and executes only botster-hub against its locked Core.** It changes no file in botster-core, botster-web, botster-tui, botster-tui-kit, or botster-project-pipelines, checks none of them out, installs none of them, and drives none of their harnesses. Client and package repositories **are** prerequisites as merged state (section 5G.3), and their merged revisions are cited but not executed (section 5G.6). Those two statements are scoped differently and do not conflict.
+- No real `botster-project-pipelines` package is installed, and no bound product run, shared `north-star-shared` session, or cross-client identity join is created. Note the precise claim: a prerequisite in that repository **does** change it (`ticket_1787278658_151737`); this campaign neither changes nor executes it.
 - No `--test-threads=1`, no `serial_test`, and no nextest. Repository policy forbids serialization as acceptance evidence (`docs/plans/isolate-lifecycle-suite-workers-and-host-resources.md:154`).
 - No retry loop that discards a red repetition.
 - No change to `run_many_pty_client_attach_conformance` or its published session counts.
@@ -652,6 +720,8 @@ The vault rule that wall-clock durations are observations rather than gates ([[c
 
 **U4 — the reported `EventPlaneSnapshot` read path.** Section 6.2 item 6 requires a read path that does not contend with the router mutex. Implement must confirm the dependency delivered that property before trusting any saturation-time queue reading.
 
+**U7 — the descriptor prerequisite may touch this campaign's own fixtures.** `ticket_1787278643_145174` changes `HubPackageManifest` admission and the `DaemonPackage` projection. Implement must confirm whether `examples/event-plane-producer` and `examples/event-plane-consumer` need a notice-reaction declaration once it lands, and whether malformed-descriptor rejection belongs in the section 5E fault matrix.
+
 **U5 — an existing budget test is nominal.** `published_owner_turn_budgets_fail_if_observe_walks_every_session` (`tests/session_projection_owner_loop.rs:207`) contains only `const` assertions and one discarded comparison. Despite its name it cannot fail if observe walks every session. The campaign must not cite it as owner-turn evidence. Whether to repair or rename it is a separate decision recorded as a vault gap in section 13.
 
 ## 9. Affected surfaces and files
@@ -670,6 +740,7 @@ The vault rule that wall-clock durations are observations rather than gates ([[c
 
 | Path | Change |
 | --- | --- |
+| `crates/botster-hub-test-support/src/lib.rs` | add `run_client_event_conformance`, the generic event conformance entrypoint from section 5G.1.1, built from the proven `package_event_plane.rs` helpers. Confirm whether conformance fixture bytes change; if they do, follow the unpublished-version rule |
 | `tests/hub_daemon_lifecycle/mod.rs` | register the new module |
 | `script/run-loaded-daemon-lifecycle` | one new `--test-target event-plane-saturation` case beside the existing map at `:978-1024`. No downstream-leg surface is added here; that stays a sibling step |
 | `.github/workflows/loaded-daemon-lifecycle.yml` | **one line**: a new `options:` entry in the `test_target` choice list at `:14-30`. No new inputs, no new checkouts, no toolchain change. The workflow stays single-repository |
@@ -824,7 +895,7 @@ These do not depend on runner speed and are the load-bearing oracles for the tic
 10. **North Star behavioural oracles hold under saturation** on the attached noisy session: identity, ordering, exact non-UTF-8 bytes, late-attach history, resize, input, cancellation, reconnect, and `ProcessExited`. These are the pre-existing behavioural contract, proved unchanged; they are not the new coexistence budgets.
 11. **Teardown matrix.** Every row of section 11's late-message matrix, in both closed-first and message-first orders, with reused subscription ids.
 12. **Sibling survival after each non-fatal fault**, at full fleet size. On the ultimate WebRTC close-failure path the campaign asserts the **bounded sibling sacrifice** in section 11.6 instead, because asserting survival there would contradict shipped behaviour.
-13. **Generic client consumption at the public boundary**, per section 5G.1: Unix and WebRTC host-control clients built from the published client crate receive the same exact event contract under saturation through `run_client_conformance`; a slow event consumer never delays control responses or entity frames; reconnect creates a fresh subscription with no replay; and event pressure returns a gap rather than blocking a Hub operation. No product package and no shared product session take part.
+13. **Generic client consumption at the public boundary**, through the new `run_client_event_conformance` from section 5G.1.1 and **not** `run_client_conformance`, which has no event path: exact owner-plus-name subscribe, event receive, subject filtering, slow-consumer `event_gap`, reconnect without replay, unsubscribe, and continued control-response progress, all under saturation. No product package and no shared product session take part.
 
 ### 12.4 Published budget gates
 
@@ -903,28 +974,24 @@ The runner stops at the first red repetition. Preserve that artifact before any 
 | Human answers folded in | `question_1787267931_572353` (routing exception), `question_1787268530_910910` (budget nature and derivation), and the library-boundary decision recorded in `review_1787278015_433684` |
 | Delivery | direct merge into `main`; no pull request; no human pull-request sign-off |
 
-### 14.1 Three prerequisites, all running
+### 14.1 Five prerequisites, in dependency order
 
-| Ticket | Repository | target_id | Delivers | Run status |
+Section 5G.3 carries the delivery detail and the reason each is required. This is the ordering and edge handling.
+
+| Order | Ticket | Repository | target_id | Blocked by |
 | --- | --- | --- | --- | --- |
-| `ticket_1787267568_492780` | botster-hub | `tgt_7e208a0c76a44980a83b63af976b1f22` | bounded event-plane observability counters, four distinct timeout counters, a saturation-safe read path, four `BOTSTER_ENV=test` seams | running |
-| `ticket_1787278327_274484` | botster-web | `tgt_40abcf71ccf049f4ac0c99953a799869` | removes Project Pipelines coupling from the generic package-event client; neutral contract fixture at the public protocol boundary | running, `run_1787278334_136543` |
-| `ticket_1787278327_199618` | botster-tui | `tgt_c3d470bab78549df920a41e8fb0e58d8` | the same cleanup, keeping botster-tui-kit policy-free | running, `run_1787278336_152073` |
+| 1 | `ticket_1787278643_145174` | botster-hub | `tgt_7e208a0c76a44980a83b63af976b1f22` | nothing |
+| 1 | `ticket_1787267568_492780` | botster-hub | `tgt_7e208a0c76a44980a83b63af976b1f22` | nothing |
+| 2 | `ticket_1787278658_151737` | botster-project-pipelines | `tgt_a72ca1a83d504385b8648f71409119ab` | `dependency_1787278661_690676` |
+| 3 | `ticket_1787278327_274484` | botster-web | `tgt_40abcf71ccf049f4ac0c99953a799869` | `dependency_1787278671_574148`, `dependency_1787278676_422577` |
+| 3 | `ticket_1787278327_199618` | botster-tui | `tgt_c3d470bab78549df920a41e8fb0e58d8` | the same two seam tickets |
 
-Each is registered against its own repository target, per [[cross repo dependency registration must use dependency repo target]]. Section 5G.3 explains why the two client cleanups are prerequisites rather than adjacent work: until they merge, the shipped clients hardcode one product's owner, event, payload, and entity families, so a Hub-side generic boundary proof would be representative of nothing that ships.
+The two order-1 tickets are independent of each other and of everything else. The engine edges above already enforce the rest, so ordering is enforced rather than described.
 
-**Closed as superseded by the library-boundary decision**, and **not to be restored**:
+Each is registered against its own repository target, per [[cross repo dependency registration must use dependency repo target]]. Two of the five change public contracts, named explicitly in section 5G.3 rather than left implicit.
 
-| Ticket | Repository | Why it is gone |
-| --- | --- | --- |
-| `ticket_1787271303_548807` | botster-hub | a shared-session coordinator leg that existed only to install the real Project Pipelines package and bind a product run |
-| `ticket_1787270342_754581` | botster-web | a product-specific shared-session lane |
-| `ticket_1787270386_991884` | botster-tui | a product-specific shared-session assertion |
+**Closed as superseded, and not to be restored:** `ticket_1787271303_548807`, `ticket_1787270342_754581`, and `ticket_1787270386_991884`. Those added product coupling; the current set removes it. [[event plane client proof uses library contract fixtures]] records that closure and its reason.
 
-Those three added product coupling. The two running client tickets remove it. They are opposites, not replacements, and the superseded three must not come back.
+**Edge handling.** `ticket_1786663585_879846` has no open dependency edge, which is what lets this review-only Plan return advance, per human answer `question_1787267931_572353`. After this revision passes Plan Review and **before any Implement advance**, add all five edges above with `project_pipelines_add_ticket_dependency`. Let them merge in the order the engine enforces. Then start Implement here.
 
-The verified client-repository findings that produced the superseded tickets remain durable and are captured in the vault. They no longer bind this campaign, and after the cleanups they bind the owner of the cross-client `question.opened` contract.
-
-**Edge handling.** `ticket_1786663585_879846` currently has no open dependency edge, which is what lets this review-only Plan return advance at all, per human answer `question_1787267931_572353`. After this revision passes Plan Review and **before any Implement advance**, add all three edges above with `project_pipelines_add_ticket_dependency`. Then let all three merge. Then start Implement here. No other edge is added, and no superseded ticket is revived.
-
-Evidence obligation: the campaign report must record that the run happened **after** all three prerequisites merged, with their merged revisions, not merely that the tickets exist. Risk R19 records why.
+**Evidence obligation.** Section 5G.6 is the single authority on recorded revisions. The report records two **executed** revisions, Hub and its locked Core, and cites the merged revisions plus gate artifact ids of the five prerequisites as state this campaign did not execute. Risk R19 covers running before they merge.
