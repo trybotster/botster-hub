@@ -7,6 +7,16 @@ Pipeline: `botster_stack_delivery` (direct merge, no PR)
 Project: `project_1786663508_823105` Botster Non-Blocking Event Plane, Stage D
 Vault checklist: `checklist_1787266824_449406` (ticket scope, one Plan visit)
 
+## Plan revision 4
+
+Revision 4 answers Plan Review `review_1787271188_552110` (`changes_required`, three findings). All three were correct.
+
+| Finding | Class | Correction |
+| --- | --- | --- |
+| `finding_1787271188_172074` Client dependencies require a coordinator that cannot exist before they merge | **blocker / product** | A real deadlock I created in revision 3. The Web and TUI tickets deferred package installation and run binding to a coordinator leg planned inside this ticket, while section 14.1 forbade this ticket from starting Implement until those clients merged. Revision 4 takes the reviewer's first option and adds `ticket_1787271303_548807`, a botster-hub ticket that ships the coordinator leg first and proves itself with a **Hub-side** subscriber, so its acceptance needs neither client. The two client tickets now carry registered engine edges onto it (`dependency_1787271311_659291`, `dependency_1787271318_253833`). The graph in section 14.1 is acyclic. The reviewer's second option, a self-contained driver per client, was rejected because two drivers each starting their own Hub cannot satisfy [[cross-client acceptance uses one live session identity]] and would duplicate install logic across two repositories. |
+| `finding_1787271189_975860` The calibration workload and throughput measurement are not fixed | high / product | Section 5A.2 now fixes the whole workload, not just the actors and session count: the 10-wave spawn ramp, the steady-state trigger, driver concurrency 4, the exact 9-operation cycle and its order, no think time, the 600-second measurement window, the window-boundary rule, the event schedule at 150 per second in 25-event bursts with a 4 KiB payload, the terminal cadence of 4 KiB every 100 ms out and 64 bytes every 500 ms in, the latency-sample definition, and the throughput numerator and denominator. Section 5A.5's profile-mismatch rule now covers **every** value in 5A.2, not only the machine fields. Section 5C's "at and above configured limits" is replaced by the fixed schedule. |
+| `finding_1787271189_232353` Non-scope still says Web and TUI source do not change | high / product | The non-scope bullet contradicted 5G.2, 6.1, A4, and 14.1. It now states the two facts separately: this Hub run edits no client repository, and botster-web and botster-tui do need source changes owned by their own registered tickets, which must merge before this run starts Implement. |
+
 ## Plan revision 3
 
 Revision 3 answers Plan Review `review_1787270029_776949` (`changes_required`, four findings). All four were correct.
@@ -274,23 +284,73 @@ They are **not** pre-existing North Star budgets. They are **not** general termi
 
 #### A.2 Fixed before calibration, immutable afterwards
 
-Every parameter below is fixed by this reviewed plan. Neither calibration nor acceptance may change any of them.
+Every value below is fixed by this reviewed plan. Neither calibration nor acceptance may change any of them, and **every one is part of the profile-mismatch failure rule in A.5**, not only the machine fields. Two runs whose machine fields match but whose workload differs are a mismatch.
+
+**Machine profile**
 
 | Parameter | Fixed value |
 | --- | --- |
-| Machine profile | fresh GitHub-hosted `ubuntu-24.04` runner from `.github/workflows/loaded-daemon-lifecycle.yml`. Recorded fields: runner image, architecture, CPU count, total memory, kernel release, `ulimit -n`, PTY ceiling, Rust 1.97.0, Zig 0.16.0 |
+| Runner | fresh GitHub-hosted `ubuntu-24.04` from `.github/workflows/loaded-daemon-lifecycle.yml` |
+| Recorded fields | runner image, architecture, CPU count, total memory, kernel release, `ulimit -n`, PTY ceiling, Rust 1.97.0, Zig 0.16.0 |
 | Stress profile | `residual-tail`, identical in both phases |
-| Workload | `N` quiet sessions, one attached noisy PTY, one `event-plane-producer` emitting, one `event-plane-consumer` subscribed, one Unix and one WebRTC host-control client each holding an event subscription |
-| Session count `N` | 300, identical in both phases |
-| Warm-up | discard the first 30 seconds of steady state **and** the first 20 samples of each operation, whichever ends later |
-| Minimum sample count | 200 post-warm-up samples per operation per arm |
-| Percentile method | nearest-rank on the ascending sample vector, no interpolation. For `n` samples, `p` is the sample at index `ceil(p * n)`, 1-based |
+
+**Fleet**
+
+| Parameter | Fixed value |
+| --- | --- |
+| Background sessions `N` | 300 quiet sessions |
+| Spawn ramp | 10 waves of 30, 200 ms between waves |
+| Steady state | declared when all 300 report `running`; the warm-up clock starts then |
+| Attached noisy PTY | exactly 1, held for the whole run |
+
+**Measured operation schedule**
+
+| Parameter | Fixed value |
+| --- | --- |
+| Driver concurrency | 4 workers, closed loop, well below `DAEMON_MAX_CONNECTIONS` 64 |
+| Cycle | each worker repeats one fixed 9-operation cycle in this exact order against its own churn session: `Spawn`, `Attach`, `Drain`, `Input`, `Resize`, MCP, UI, entity read, `Shutdown` |
+| Samples per cycle | exactly one per operation; a cycle that fails any step is recorded as a failed cycle and contributes no latency sample |
+| Think time | none; the next cycle starts when the previous one ends |
+| Measurement window | 600 seconds of steady state after warm-up |
+| Warm-up | the first 30 seconds of steady state **and** the first 20 samples of each operation, whichever ends later |
+| Minimum samples | 200 post-warm-up samples per operation per arm; fewer invalidates the run |
+| Window boundary | an operation counts only if it both starts and finishes inside the window. Operations crossing either edge are excluded from latency and from throughput |
+
+**Event emission, enabled arm only**
+
+| Parameter | Fixed value |
+| --- | --- |
+| Sustained rate | 150 events per second, deliberately above `package_rate_per_sec` 100 so the token bucket rejects and shed is guaranteed rather than incidental |
+| Burst shape | 25 events every 1/6 second, six bursts per second |
+| Payload | fixed 4 KiB, well under the 64 KiB cap, so payload size is never the shed cause |
+| Duration | continuous for warm-up plus the full measurement window |
+| Subscribers | one `event-plane-consumer` plugin, one Unix client, one WebRTC client |
+
+**Terminal cadence, both arms, identical**
+
+| Parameter | Fixed value |
+| --- | --- |
+| Output | the noisy PTY emits one fixed 4 KiB line every 100 ms, so 40 KiB per second |
+| Input | the driver sends one 64-byte line every 500 ms |
+
+**Measurement definitions**
+
+| Term | Fixed definition |
+| --- | --- |
+| Latency sample | wall time from request submission to response receipt, measured by the driver |
+| Percentile method | nearest-rank on the ascending sample vector, no interpolation. For `n` samples, `p` is the sample at 1-based index `ceil(p * n)` |
+| Throughput numerator | completed operations of that kind that both started and finished inside the measurement window |
+| Throughput denominator | the fixed 600-second window, in seconds |
+| Throughput unit | completed operations per second |
 | Literal `R` | **1.25** |
 | Literal `S` | **8 ms** |
-| Rounding | every derived millisecond threshold rounds **up** to the next whole millisecond; ratios compute in `f64` and compare at three decimal places |
-| Outlier policy | **none.** No sample is discarded after warm-up. Maximum is reported and gated in its own right |
+| Literal `T` | **0.80** |
+| Rounding | derived millisecond thresholds round **up**; derived throughput floors round **down**; ratios compute in `f64` and compare at three decimal places |
+| Outlier policy | **none.** No post-warm-up sample is discarded |
 
-`S = 8 ms` is not arbitrary. It is exactly `EVENT_DELIVERY_MAX_ELAPSED` (`src/daemon_maintenance.rs:1158`), which equals `OBSERVE_SLICE_BUDGET.max_elapsed` and `BASELINE_PAGE_BUDGET.max_elapsed`. The slack therefore says: the event plane may cost an operation at most one additional bounded background slice. `R = 1.25` allows 25 percent proportional growth on top of that.
+The decoupled arm is identical in every row above except that no package is admitted, no emitter runs, no plugin subscribes, and no client holds an event subscription. Fleet, ramp, cycle, concurrency, window, warm-up, and terminal cadence are the same values, so the paired ratio compares like with like.
+
+`S = 8 ms` is derived, not chosen. It is exactly `EVENT_DELIVERY_MAX_ELAPSED` (`src/daemon_maintenance.rs:1158`), which equals `OBSERVE_SLICE_BUDGET.max_elapsed` and `BASELINE_PAGE_BUDGET.max_elapsed`. The slack therefore states that the event plane may cost an operation at most one additional bounded background slice. `R = 1.25` allows 25 percent proportional growth, and `T = 0.80` is exactly `1 / R`.
 
 #### A.3 Derivation formulas, fixed here
 
@@ -325,7 +385,7 @@ Throughput is higher-is-better, so its gate is a floor rather than a ceiling. Th
 
 Following the human answer, each of these **fails the campaign**. None is a caveat and none is residual risk:
 
-- any recorded machine-profile field differs between calibration and acceptance;
+- **any fixed value in A.2 differs between calibration and acceptance**, machine profile, fleet, operation schedule, event emission, terminal cadence, or measurement definition. Matching machine fields alone are not enough;
 - any required metric is missing from either phase;
 - calibration is invalid, meaning fewer than `N` sessions reached steady state, fewer than 200 post-warm-up samples for any operation, or a `run-lifecycle-suite` verdict other than `clean`;
 - any absolute, maximum, or relative threshold is breached;
@@ -348,7 +408,7 @@ Following the human answer, each of these **fails the campaign**. None is a cave
 
 | Arm | Composition |
 | --- | --- |
-| `plane-enabled` | `N` lightweight sessions, `examples/event-plane-producer` emitting at and above its configured rate and queue limits, `examples/event-plane-consumer` subscribed, one Unix and one WebRTC host-control client holding event subscriptions, and one attached noisy PTY carrying terminal input and output |
+| `plane-enabled` | `N` lightweight sessions, `examples/event-plane-producer` emitting on the fixed schedule in section 5A.2 — 150 events per second in 25-event bursts with a 4 KiB payload, deliberately above `package_rate_per_sec` 100, `examples/event-plane-consumer` subscribed, one Unix and one WebRTC host-control client holding event subscriptions, and one attached noisy PTY carrying terminal input and output |
 | `plane-decoupled` | the same `N` sessions and the same attached noisy PTY, with no package admitted, no emitter, no plugin subscription, and no client event subscription |
 
 The ticket permits "an event-disabled **or** projection-decoupled baseline." This plan takes the decoupled option deliberately, because the disabled option would require a new production configuration switch that nothing else needs. Adding one would be speculative configurability.
@@ -420,14 +480,15 @@ Two facts make the TUI gap smaller than the Web gap, and they matter for sequenc
 - The TUI production wire is already open on the shared lane. `try_connect` calls `subscribe_question_opened_events` (`app.rs:2289`) and `sync_entity_options_subscriptions` (`:2290`) unconditionally. Only assertion and producer are missing, not transport.
 - The TUI package-events lane already drives the **real** producer, resolving the `ask_human` tool from the live MCP registry (`app.rs:29744-29748`) and calling `project_pipelines_ask_human` (`app.rs:29988-29996`), gated by `assert_project_pipelines_pin_floor` (`app.rs:29479-29489`) requiring `cd7c2f926fcead78e15e7a9c713ad26dfe883914` to be an ancestor of the supplied package HEAD. Web has no equivalent.
 
-#### G.2 Two registered client dependencies
+#### G.2 Three registered dependencies, ordered
 
 | Ticket | Repository | target_id | What it adds |
 | --- | --- | --- | --- |
+| `ticket_1787271303_548807` | botster-hub | `tgt_7e208a0c76a44980a83b63af976b1f22` | the Project Pipelines leg, revision validation and pin floor, shared-session run binding, and the optional gap-coverage Hub launch environment on `script/prove-north-star-shared-session`. **Ships before the client tickets and proves itself with a Hub-side subscriber** |
 | `ticket_1787270342_754581` | botster-web | `tgt_40abcf71ccf049f4ac0c99953a799869` | a shared-session package-event lane on the caller-owned Hub, driven by the real Project Pipelines producer, with identity parameterised off `productionSessionId` |
 | `ticket_1787270386_991884` | botster-tui | `tgt_c3d470bab78549df920a41e8fb0e58d8` | package-event assertions on the caller-owned shared lane, plus an endpoint-taking sibling of `call_plugin_tool` |
 
-Both are registered against their own repository target, per [[cross repo dependency registration must use dependency repo target]]. Neither dependency **edge** is added yet: the engine blocks Plan Review while any edge is open, and human answer `question_1787267931_572353` requires the plan to be approved before dependency work starts. All three edges — these two plus `ticket_1787267568_492780` — are added together on approval, before any Implement advance. Section 14 records that obligation.
+Each is registered against its own repository target, per [[cross repo dependency registration must use dependency repo target]]. The two client tickets already carry engine edges onto the coordinator ticket, which enforces the ordering that section 14.1 explains and removes the cycle Plan Review found in revision 3. Those edges bind the client tickets, not this one, so they do not block this run's Plan Review. No edge into this ticket is registered yet; section 14.1 records when all four are added.
 
 #### G.3 Campaign inputs and workflow additions
 
@@ -445,9 +506,9 @@ Workflow and coordinator additions:
 
 1. Three `actions/checkout` steps with explicit `repository:` and `ref:`.
 2. Node and npm setup, then `npm ci` and `npm run build` in the Web checkout, because `prove-north-star-shared-session:335-343` runs an npm script and installs nothing itself.
-3. A Project Pipelines leg on `script/prove-north-star-shared-session`, which has none today: install the checked-out package by path and enable it, as `script/test-production-package-runtime:478-502` does. The package must be installed **exactly once** on the shared Hub; the client tickets defer to this leg.
-4. The coordinator must bind a run to `BOTSTER_SHARED_SESSION_ID` and export its ids, because the TUI gates notices on `package_event_matches_active_run` (`app.rs:4062`, `:4104-4131`), which needs a `project-pipelines.session_request` record matching the selected session.
-5. To keep gap coverage on the shared session, the coordinator must launch the shared Hub with `BOTSTER_ENV=test`, `BOTSTER_HUB_TEST_CLIENT_EVENT_QUEUE_MAX`, and `BOTSTER_HUB_TEST_STALL_UNIX_EVENT_FLUSH`. Only the Hub launcher can set these, and [[hub client event queue max requires Botster test mode]] requires both values on the Hub child. Without them the shared lane can prove notice delivery and entity convergence but **not** `EventGap` shedding.
+3. The Project Pipelines leg on `script/prove-north-star-shared-session` is **not built by this ticket**. It is `ticket_1787271303_548807`, which ships first. This campaign consumes the merged coordinator.
+4. Run binding to `BOTSTER_SHARED_SESSION_ID` also belongs to `ticket_1787271303_548807`. The TUI gates notices on `package_event_matches_active_run` (`app.rs:4062`, `:4104-4131`), which needs a `project-pipelines.session_request` record matching the selected session, so the coordinator must export the run ids.
+5. The gap-coverage Hub launch environment is also `ticket_1787271303_548807`. Only the Hub launcher can set `BOTSTER_ENV=test`, `BOTSTER_HUB_TEST_CLIENT_EVENT_QUEUE_MAX`, and `BOTSTER_HUB_TEST_STALL_UNIX_EVENT_FLUSH`, and [[hub client event queue max requires Botster test mode]] requires both values on the Hub child. This campaign sets the coordinator's opt-in flag; without it the shared lane proves notice delivery and entity convergence but **not** `EventGap` shedding.
 6. One step invoking the coordinator as a sibling of the loaded runner. Do not thread a downstream leg through `script/run-loaded-daemon-lifecycle`.
 
 #### G.4 The production oracle for every acceptance condition
@@ -530,7 +591,8 @@ Consumer note for that ticket: this ticket `ticket_1786663585_879846` depends on
 - No change to `MAX_OWNER_TURN_MS`, `MAX_READY_OPERATION_WAIT_MS`, `OBSERVE_SLICE_BUDGET`, `BASELINE_PAGE_BUDGET`, `PUMP_MAX_*`, `EVENT_DELIVERY_*`, `SESSION_DELIVERY_*`, or any `PackageEventPlaneOptions` default.
 - No production event-disable switch.
 - No new transport, request vocabulary change, `PROTOCOL_VERSION` bump, or conformance-fixture revision bump.
-- No source change in botster-core, botster-web, botster-tui, botster-tui-kit, or botster-project-pipelines. Their revisions are recorded, not modified.
+- **This Hub run edits no client repository.** It changes no file in botster-core, botster-web, botster-tui, botster-tui-kit, or botster-project-pipelines. Their revisions are pinned and recorded here.
+- Stated separately so it does not read as a contradiction: botster-web and botster-tui **do** need source changes for this campaign, owned by their own registered tickets `ticket_1787270342_754581` and `ticket_1787270386_991884`, both of which must merge before this run starts Implement. See sections 5G.1, 5G.2, A4, and 14.1. botster-core, botster-tui-kit, and botster-project-pipelines need no change at all.
 - No `--test-threads=1`, no `serial_test`, and no nextest. Repository policy forbids serialization as acceptance evidence (`docs/plans/isolate-lifecycle-suite-workers-and-host-resources.md:154`).
 - No retry loop that discards a red repetition.
 - No change to `run_many_pty_client_attach_conformance` or its published session counts.
@@ -592,7 +654,7 @@ The vault rule that wall-clock durations are observations rather than gates ([[c
 | `tests/hub_daemon_lifecycle/mod.rs` | register the new module |
 | `script/run-loaded-daemon-lifecycle` | one new `--test-target event-plane-saturation` case beside the existing map at `:978-1024`. No downstream-leg surface is added here; that stays a sibling step |
 | `.github/workflows/loaded-daemon-lifecycle.yml` | one new `options:` entry in the `test_target` choice list at `:14-30`; three new pinned SHA inputs `web_sha`, `tui_sha`, `project_pipelines_sha`; three new `actions/checkout` steps with explicit `repository:` and `ref:` (TUI with `submodules: recursive`); Node and npm setup plus `npm ci` and `npm run build` in the Web checkout; the coordinator invocation step |
-| `script/prove-north-star-shared-session` | add the missing Project Pipelines leg: install the checked-out package by path and enable it, reading the name from its `botster-package.json`, in the style of `script/test-production-package-runtime:478-502`. Do not change the existing Web or TUI legs or the barrier sequence |
+| `script/prove-north-star-shared-session` | **not changed by this ticket.** The Project Pipelines leg, run binding, and gap-coverage launch environment are `ticket_1787271303_548807`, which ships first. This campaign only invokes the merged coordinator |
 | `examples/event-plane-producer/plugin.lua` | add a bounded burst emitter for saturation; keep the existing single-emit tool unchanged |
 | `examples/event-plane-consumer/plugin.lua` | add a slow-path handler behind the new bounded hold seam; keep the existing handler unchanged |
 | `README.md` | one pointer to `docs/event-plane-load-proof.md`, matching how `README.md:430` points to `docs/hub-resource-proof.md` |
@@ -827,21 +889,30 @@ The runner stops at the first red repetition. Preserve that artifact before any 
 | Human answers folded in | `question_1787267931_572353` (routing exception), `question_1787268530_910910` (budget nature and derivation) |
 | Delivery | direct merge into `main`; no pull request; no human pull-request sign-off |
 
-### 14.1 Three dependency tickets, all edges deferred
+### 14.1 Four dependency tickets, and the cycle that revision 3 contained
 
-| Ticket | Repository | target_id | Status |
-| --- | --- | --- | --- |
-| `ticket_1787267568_492780` | botster-hub | `tgt_7e208a0c76a44980a83b63af976b1f22` | open, unstarted |
-| `ticket_1787270342_754581` | botster-web | `tgt_40abcf71ccf049f4ac0c99953a799869` | open, unstarted |
-| `ticket_1787270386_991884` | botster-tui | `tgt_c3d470bab78549df920a41e8fb0e58d8` | open, unstarted |
+Plan Review `finding_1787271188_172074` found a real deadlock in revision 3. The Web and TUI tickets each needed a caller-owned Hub with the real Project Pipelines package installed and a run bound to the shared session, and both deferred that to a coordinator leg planned inside **this** ticket. Section 14.1 then forbade this ticket from starting Implement until those client tickets merged. Neither side could go first.
 
-**No dependency edge is registered.** The engine blocks every advance while any edge is open, including the advance to Plan Review, and `override_unmet_gates` does not cover ticket dependencies. Human answer `question_1787267931_572353` established the review-only exception for exactly this reason and requires the plan to be approved before dependency work starts. Because both Plan Reviews so far requested changes, its condition 3 applies: the tickets stay unstarted and the edges stay absent.
+Revision 4 breaks the cycle by making the coordinator leg its own Hub ticket that ships **before** the client tickets. The coordinator is Hub-owned work: `script/prove-north-star-shared-session` is already the Hub-owned cross-client coordinator, and installing a package on a Hub is host policy. The reviewer's alternative, a self-contained driver in each client, was rejected because two drivers each starting their own Hub cannot satisfy [[cross-client acceptance uses one live session identity]], and it would duplicate install logic across two repositories.
 
-**On Plan Review approval, before any Implement advance:**
+| Ticket | Repository | target_id | Depends on | Status |
+| --- | --- | --- | --- | --- |
+| `ticket_1787267568_492780` | botster-hub | `tgt_7e208a0c76a44980a83b63af976b1f22` | nothing | open, unstarted |
+| `ticket_1787271303_548807` | botster-hub | `tgt_7e208a0c76a44980a83b63af976b1f22` | nothing | open, unstarted |
+| `ticket_1787270342_754581` | botster-web | `tgt_40abcf71ccf049f4ac0c99953a799869` | `ticket_1787271303_548807` (`dependency_1787271311_659291`) | open, unstarted |
+| `ticket_1787270386_991884` | botster-tui | `tgt_c3d470bab78549df920a41e8fb0e58d8` | `ticket_1787271303_548807` (`dependency_1787271318_253833`) | open, unstarted |
 
-1. Add all three edges with `project_pipelines_add_ticket_dependency` against `ticket_1786663585_879846`.
-2. Run and merge `ticket_1787267568_492780` first; the campaign cannot record seven of its twelve signals without it.
-3. Run and merge `ticket_1787270342_754581` and `ticket_1787270386_991884`; they can proceed in parallel with each other.
+The graph is now acyclic. The coordinator ticket proves itself with a **Hub-side** event subscriber, so its acceptance depends on neither client.
+
+**Two edges are already registered**, because they bind the client tickets rather than this one and therefore do not block this run's Plan Review. They enforce the ordering in the engine instead of in prose.
+
+**No edge into `ticket_1786663585_879846` is registered.** The engine blocks every advance of this run, including into Plan Review, while any of its own edges is open, and `override_unmet_gates` does not cover ticket dependencies. Human answer `question_1787267931_572353` condition 3 applies while Plan Review requests changes.
+
+**On Plan Review approval, before any Implement advance here:**
+
+1. Add four edges into `ticket_1786663585_879846` with `project_pipelines_add_ticket_dependency`, one per row above.
+2. Run and merge `ticket_1787267568_492780` and `ticket_1787271303_548807`. They are independent of each other and may run in parallel.
+3. Run and merge `ticket_1787270342_754581` and `ticket_1787270386_991884`. Their engine edges already hold them until the coordinator merges; they may then run in parallel with each other.
 4. Only then start Implement here, with `web_sha`, `tui_sha`, and `project_pipelines_sha` pinned to revisions that contain those lanes and satisfy the pin floor in section 5G.3.
 
 This integration run stays parked throughout.
