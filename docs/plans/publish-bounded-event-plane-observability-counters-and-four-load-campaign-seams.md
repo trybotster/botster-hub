@@ -2,6 +2,11 @@
 
 - Ticket: `ticket_1787267568_492780`
 - Run: `run_1787278338_832165`
+- Revision: **12**. Revision 12 answers the four findings in `review_1787291409_401120`: the opening RMW
+  needed `AcqRel` not `Release`, `Envelope` needed generation-specific list identity, the publication gate
+  had to move onto the cell so the lock-free snapshot could read it, and the affected-file table still
+  mandated the withdrawn reset-in-place design. Section 0y records that my revision 11 zero-reference
+  sweep claim was false.
 - Revision: **11**. Revision 11 answers the five findings in `review_1787290799_177961`. The decided
   bounded-staleness contract stands; revision 10 did not yet satisfy its no-prior-generation and
   explicit-indeterminate rules. Three fixes: a two-phase odd/even version, a fresh cell per generation, and
@@ -30,6 +35,15 @@
 - Base: `origin/main` at `b3b54f1` ("Merge ticket: Roll Core pin after IncrementalAttach local-runtime gate")
 - Core pin (verified in `Cargo.toml:24-26,43-44`): `7eafa470a18025895995bbedc20d34b58106a03b`
 
+## 0. Response to Plan Review `review_1787291409_401120` (revision 12)
+
+| Finding | Severity | Response |
+| --- | --- | --- |
+| `finding_1787291409_211318` — the opening version update does not order later field stores | blocker | **Accepted; the ordering was wrong.** `Release` on the opening RMW stops earlier accesses moving after it; it does **not** stop later relaxed stores moving before it, so a reader could observe changed fields while still seeing the old even version. S1b now uses **`AcqRel` for the opening RMW** and `Release` for the closing one, and the reader uses the canonical shape: `Acquire` first load, relaxed field loads, `atomic::fence(Acquire)`, then the second load. Every mutable field including `invalid` and `gate` travels inside the same bracket, so AC21 needs no second protocol. AC19 gains a **`loom` model check** as case 0, because deterministic scheduling tests cannot substantiate an ordering claim. |
+| `finding_1787291409_910821` — late retirement has no generation-specific age-list identity | blocker | **Accepted.** Revision 11 asserted old holders "retire against their own list" while `Envelope` carried only a bare `producer_slot: u32` and the router held one age-list map keyed by owner; a slot number alone cannot select the old generation's list after replacement, so AC14 and AC20 demanded behaviour the state shape could not implement. S1c adds `ProducerAgeRef { generation, slot }` on `Envelope`, keys lists by `(owner, generation)`, gives each list a `live` count, and drops a non-current generation's list and retired cell when `live` reaches zero. Every prior list is guaranteed to drain because each of its envelopes retires exactly once. |
+| `finding_1787291409_621659` — the snapshot cannot observe `prior_generation_holders` | blocker | **Accepted.** I put the publication gate on `ProducerOccupancy` inside `RouterInner`, which S2 forbids the saturation snapshot from touching, so the gate the reader depends on was unreadable by that reader. The gate moves onto the cell as `QueueAgeMetric.gate`, seeded at replacement and decremented in `retire_holder_locked`, both **inside the two-phase bracket**, so it is covered by the same consistency protocol as `count` and `oldest_nanos`. AC20 now asserts the indeterminate window **through the public snapshot path**. |
+| `finding_1787291409_639376` — the affected-file table still mandates reset-in-place | high | **Accepted, and the sweep claim attached to it was false.** See section 0y. The `src/package_event_router.rs` row and R17 are rewritten to the current design, and the `src/event_plane_counters.rs` row, S1e, A8, R13, AC14, and AC20 carried the same staleness and are corrected too. Revision 12 gate evidence quotes the **literal sweep command and its literal output** instead of asserting a count. |
+
 ## 0. Response to Plan Review `review_1787290799_177961` (revision 11)
 
 The human decision stands and is not reopened. Revision 10 adopted its *classification* but did not yet
@@ -44,6 +58,27 @@ the design to be wrong rather than adding a feature.
 | `finding_1787290799_691196` — diagnostic failure has no persistent indeterminate state | blocker | **Accepted.** Revision 10 said "the sample becomes indeterminate" with nowhere to record it, so an accepted envelope with no producer slot left the list permanently incomplete while later samples looked stable. S1f adds `invalid: AtomicBool`, **latched** on any diagnostic failure and checked inside the read bracket, cleared only by the arrival of a new generation with a fresh cell. A missing cell appears in the snapshot as an explicit indeterminate entry, never an omitted row. AC21 is the control. |
 | `finding_1787290799_270331` — admission cannot prune cells that retained queues still reference | high | **Accepted.** "Retired and unreferenced" is unusable: the registry owns an `Arc`, `inner.consumers` entries are never removed and keep theirs, and an empty live queue is indistinguishable from a retired one. S1d makes membership **explicit lifecycle state** recorded only on control paths, keyed by identity **and generation**, and lets admission remove a retired entry even while a container keeps its direct `Arc` to the now write-closed cell. AC11 gains the retained-`ConsumerQueue` case and an assertion that a live-but-empty queue is not pruned. |
 | `finding_1787290799_720688` — the latest artifact does not identify the submitted plan commit | low, process | **Accepted, and it was my own verification pass that caused it.** I created `artifact_1787290486_548537` at `e40e08d`, then found R10 missing, committed `cf58857`, and never re-issued the artifact. Revision 11 creates its artifact **only after the final plan commit**, and the gate evidence names that same commit. |
+
+## 0y. Correction of the false revision 11 sweep claim
+
+Revision 11 gate evidence and artifact stated that a scripted sweep found **zero** references to the
+withdrawn design in active text. **That claim was false.** The committed plan still contained
+`QueueAgeMetric.mutations`, "cell **reset** ... at identity retirement", and "`generation` bump plus reset
+when a later generation is admitted" in the `src/package_event_router.rs` affected-file row, plus a reset
+cell justification in R17. Plan Review `finding_1787291409_639376` found them.
+
+Cause: my sweep matched a hand-written list of strings I chose from memory. It contained
+`` `mutations` `` only in the forms `mutations: AtomicU64` and ``bump `mutations` last``, so the row's
+`` `mutations` bump `` never matched. A sweep keyed on what I remember writing cannot find what I forgot to
+change.
+
+**This is the third false verification claim in this run**, after the revision 9 "AC11 tightened" claim and
+the revision 10 R10 citation. The first two I found myself; this one a reviewer found. The pattern is
+consistent: I assert a verification conclusion instead of showing the check.
+
+Method change for revision 12 and after: I do not assert sweep results. Gate evidence carries the **literal
+command and its literal output**, so a reader can see what was matched rather than trusting a summary. Where
+a count is claimed, the command that produced it is quoted next to it.
 
 ## 0z. Correction of false revision 9 gate evidence
 
@@ -303,10 +338,16 @@ struct QueueAgeMetric {
     version: AtomicU64,       // even = stable, odd = write in progress
     count: AtomicU64,         // observed queue count at the last completed mutation
     oldest_nanos: AtomicU64,  // u64::MAX = empty
+    gate: AtomicU64,          // surviving prior-generation holders; > 0 means indeterminate (S1c)
     generation: u64,          // immutable: the producer generation this cell belongs to
     invalid: AtomicBool,      // latched by a diagnostic failure; see S1f
 }
 ```
+
+`gate` lives **on the cell, not on `ProducerOccupancy`**, corrected in revision 12 for
+`finding_1787291409_621659`. Revision 11 put the prior-holder count inside `RouterInner`, which S2 forbids
+the saturation snapshot from touching, so the publication gate was unreadable by the lock-free reader that
+depends on it. It is now a cell field written inside the two-phase bracket like every other.
 
 **Two deliberate tightenings of the decided protocol, both flagged rather than substituted silently.**
 
@@ -319,26 +360,41 @@ struct QueueAgeMetric {
    change that pairs a new generation with an old age, which the decision forbids outright. The protocol is
    therefore **two-phase odd/even**, which marks the update in progress *before* any field changes.
 
-**Writer rule**, executed while the writer already holds the router or mailbox lock it holds today:
+**Writer rule**, executed while the writer already holds the router or mailbox lock it holds today. The
+opening RMW is **`AcqRel`, not `Release`** — corrected in revision 12 for
+`finding_1787291409_211318`. A `Release` RMW stops earlier accesses moving *after* it; it does **not** stop
+later relaxed stores moving *before* it, so a reader could observe changed fields while still seeing the
+old even version. The acquire half of `AcqRel` is what pins the field stores after the odd transition.
 
 ```text
-version.fetch_add(1, Release)      // now odd: update in progress
-store count, oldest_nanos          // relaxed
+version.fetch_add(1, AcqRel)       // now odd: update in progress; field stores cannot move before this
+store count, oldest_nanos, gate    // relaxed
+store invalid                      // relaxed, when this update latches it
 version.fetch_add(1, Release)      // now even: update complete
 ```
+
+**Every mutable field travels inside this bracket**, including `invalid` and the generation gate of S1c.
+Nothing the reader consumes is written outside a bracket, so AC21's requirement that every later sample be
+indeterminate is carried by the same protocol rather than a second one.
 
 **Reader rule**, holding no lock, at most one retry:
 
 ```text
 v1 = version.load(Acquire)
 if v1 is odd            -> retry once, then indeterminate
-if invalid.load(Acquire) -> indeterminate
-sample = (count, oldest_nanos)     // relaxed
-v2 = version.load(Acquire)
+sample = (count, oldest_nanos, gate, invalid)   // relaxed
+atomic::fence(Acquire)                          // pins the field loads before the v2 read
+v2 = version.load(Relaxed)
 if v1 != v2             -> retry once, then indeterminate
+if invalid              -> indeterminate
+if gate > 0             -> indeterminate            // prior generation still draining, S1c
 if count == 0           -> no usable age
 otherwise               -> usable age, tagged with this cell's immutable generation
 ```
+
+This is the canonical seqlock reader shape: an acquiring first load, relaxed field loads, an `Acquire`
+fence, then the second version read. AC19 adds a `loom` model check alongside the deterministic
+interleavings, because scheduling tests alone cannot prove an ordering claim.
 
 `generation` is **immutable per cell**, not an atomic that is reset in place. A cell belongs to exactly one
 producer generation for its whole life, which is what makes "never publish an age from a retired or reused
@@ -359,17 +415,37 @@ Revision 11 removes the shared-cell reuse entirely:
   `generation` field is immutable, so a sample can always be attributed to exactly one generation.
 - **The previous generation's cell is marked retired on the same control path** that admits the new one.
   A retired cell reports **no usable age** and is never written again.
-- **The new generation reports `indeterminate` until every old-generation holder has retired.** This is
-  the reviewer's own suggested rule and it is `O(1)`: `ProducerOccupancy` carries
-  `prior_generation_holders: usize`, incremented once per surviving old holder at replacement and
-  decremented in `retire_holder_locked`. While it is above zero the new cell publishes indeterminate; when
-  it reaches zero the new generation reports its own age normally.
-- **No old timestamp can ever update the new cell**, because the old slots belong to the old generation's
-  list and the old cell, and the old cell is retired and write-closed.
+- **The new generation reports `indeterminate` until every old-generation holder has retired.** The count
+  of surviving prior holders lives in `QueueAgeMetric.gate` on the **new** generation's cell, seeded at
+  replacement and decremented in `retire_holder_locked`, both inside the two-phase bracket. While `gate`
+  is above zero the reader reports indeterminate; when it reaches zero the new generation reports its own
+  age normally. It is on the cell rather than on `ProducerOccupancy` precisely so the lock-free snapshot
+  can read it (S1b).
+- **No old timestamp can ever update the new cell**, because old slots belong to the old generation's list
+  and the old cell, and the old cell is retired and write-closed.
 
-The age list itself keeps its revision 6 shape and remains valid for old holders through their late
-completions: their `producer_slot` still addresses the list they were admitted into, so retirement
-accounting is unaffected. Only the **publication** of an age is generation-scoped.
+**Envelope carries generation-specific list identity**, corrected in revision 12 for
+`finding_1787291409_910821`. Revision 11 claimed old holders "retire against their own list" while
+`Envelope` carried only a bare `producer_slot: u32` and the router held one age-list map keyed by owner. A
+slot number alone cannot select the old generation's list after replacement, so the behaviour AC14 and
+AC20 demanded was not implementable from the state shape. The corrected shape:
+
+```rust
+struct ProducerAgeRef { generation: u64, slot: u32 }   // on Envelope, replaces producer_slot
+```
+
+- Producer age lists are keyed by **`(owner, generation)`**, not by owner alone.
+- Each list carries a `live: usize` count of envelopes still referencing it.
+- `retire_holder_locked` resolves `(generation, slot)` to the exact list that admitted the envelope,
+  unlinks the slot, decrements that list's `live`, and decrements the successor cell's `gate` when the
+  retiring envelope belonged to a prior generation.
+- **Bounded cleanup**: when a non-current generation's `live` reaches zero, its list and its retired cell
+  are dropped at that point. The current generation's list is never dropped while it is current.
+- The number of live lists per owner is therefore bounded by one current generation plus those prior
+  generations that still have unretired envelopes, and every prior list is guaranteed to drain because
+  each of its envelopes retires exactly once.
+
+Only the **publication** of an age is generation-scoped; occupancy and retirement accounting are unchanged.
 
 **S1d. Registry membership is explicit lifecycle state, not an `Arc` strong count or an empty queue.**
 
@@ -408,7 +484,8 @@ struct ProducerAgeSlot { nanos: u64, prev: u32, next: u32 }
 struct ProducerAgeList { slots: Box<[ProducerAgeSlot]>, head: u32, tail: u32, free: u32 }
 ```
 
-`Envelope` carries `producer_slot: u32`. Push pops the free head and links at tail; remove unlinks through
+`Envelope` carries `producer_age_ref: ProducerAgeRef { generation, slot }` (S1c). Push pops the free head
+and links at tail; remove unlinks through
 `prev`/`next` and returns the slot; oldest reads `slots[head].nanos`. All three are strict `O(1)` with zero
 allocator calls. The list is allocated at the S1g admission commit point and never on an event path.
 
@@ -703,8 +780,9 @@ describes the symptom; the smaller fix is at the existing write site.
 `CoreDaemonConfig`, so they are stored on Hub state while being read in one place beside
 `core_daemon_config`, in the style the ticket names. Only seam 2 sets a `CoreDaemonConfig` builder.
 
-**A8 — rewritten again in revision 6.** The age list is addressed by slot index carried on
-`Envelope.producer_slot`, so envelope-id monotonicity is irrelevant. Two narrower checks remain for
+**A8 — rewritten again in revision 12.** The age list is addressed by the `(generation, slot)` pair carried
+on `Envelope.producer_age_ref`, so envelope-id monotonicity is irrelevant and a late retirement resolves
+its own generation's list. Two narrower checks remain for
 Implement. First, confirm that `try_ingress` is the only path that increments `producer.events`, so the
 live slot count cannot drift from it; the capacity invariant that keeps the free list non-empty depends on
 that equality. Second, confirm that `retire_holder_locked` is the only path that decrements
@@ -720,9 +798,9 @@ registry and source check before writing either literal.
 
 | File | Change |
 | --- | --- |
-| `src/event_plane_counters.rs` (new) | `EventPlaneCounters`, fixed shed-by-reason array, fixed-bucket histograms, `QueueAgeMetric` with the monotonic `mutations` stamp, the bounded consistency read, the enumeration-only registry with its admission-time prune, and the snapshot type |
+| `src/event_plane_counters.rs` (new) | `EventPlaneCounters`, fixed shed-by-reason array, fixed-bucket histograms, `QueueAgeMetric` with the two-phase odd/even `version`, `gate`, immutable `generation`, and `invalid` latch, the bounded consistency read with its `AcqRel` opening RMW and `Acquire` fence, the enumeration-only registry keyed by identity and generation with explicit retirement, and the snapshot type including its indeterminate representation |
 | `src/lib.rs` | register the new module and re-export the snapshot type |
-| `src/package_event_router.rs` | shed by typed reason, admission and delivery attempts, latencies, T2, a `RouterInner` producer age-list map created at the S1g admission commit point, `Envelope.producer_slot`, `Arc<QueueAgeMetric>` handles on the producer entry and consumer queue, cell **reset** (empty age, zero count, `mutations` bump) at identity retirement in `apply_unload` and `retire_holder_locked`, `generation` bump plus reset when a later generation is admitted, opportunistic registry prune at admission only, and a diagnostic failure that never changes acceptance |
+| `src/package_event_router.rs` | shed by typed reason, admission and delivery attempts, latencies, T2, producer age lists keyed by `(owner, generation)` and created at the S1g admission commit point, `Envelope.producer_age_ref: ProducerAgeRef { generation, slot }` replacing `producer_slot`, a per-list `live` count with cleanup when a non-current generation drains, a **fresh** `Arc<QueueAgeMetric>` per generation on the producer entry and consumer queue with the predecessor **retired and write-closed** (never reset in place), `gate` seeded at replacement and decremented in `retire_holder_locked` inside the two-phase bracket, registry retirement recorded explicitly at `apply_unload`, `unsubscribe`, and connection cleanup with an admission-time prune and rebind, and a diagnostic failure that latches `invalid` without changing acceptance |
 | `src/daemon_event_subscriptions.rs` | overflow gap count, T3 mailbox-expiry count, mailbox age cell, cell removal on connection cleanup |
 | `src/daemon_maintenance.rs` | T1 typed completion counting; seam 3 for the two `timeout_ms` sites |
 | `src/daemon_transport.rs` | `EgressWriteClass` on `ControlMessage::EgressWriteFailed`, T4 in `record_egress_write_failure`, `enqueued_at` on `ControlMessage::Request` plus its two senders here, the owner-loop serve-site measurement, owner-turn recording, status projection |
@@ -764,8 +842,8 @@ registry and source check before writing either literal.
 - **R13 (rewritten in revision 11).** A retired or reused generation can publish an age that belongs to a
   previous generation. Revision 10's reset-in-place did not prevent this while old holders survived unload.
   S1c gives each generation its own cell with an immutable `generation` field, retires and write-closes the
-  predecessor, and reports indeterminate until `prior_generation_holders` reaches zero. AC14, AC18, and
-  AC20 are the controls.
+  predecessor, keys age lists by `(owner, generation)` so a late retirement resolves its own list, and
+  reports indeterminate until the cell's `gate` reaches zero. AC14, AC18, and AC20 are the controls.
 - **R18 (rewritten in revision 11).** A non-monotonic version stamp admits ABA: a `5 -> 6 -> 5` count
   sequence would pass a raw count bracket while the sample is two mutations stale. S1b brackets on the
   two-phase odd/even `version`, which advances by four across that sequence, and AC19 case 5 is the control.
@@ -786,10 +864,11 @@ registry and source check before writing either literal.
   `AdmissionSnapshot` covers four maps only, so any diagnostic map created mid-batch would survive a
   restore. S1f avoids this by committing diagnostic state only after the whole batch succeeds. AC17 is the
   control.
-- **R17 (rewritten in revision 10).** A cleanup rule and a no-lock rule can contradict each other silently
-  when they live in different sections. Under the decided model a lingering registry entry is harmless,
-  because a reset cell reports no usable age, so pruning is a memory bound only. AC11 and AC15 assert the
-  design from both directions.
+- **R17 (rewritten in revision 12).** A cleanup rule and a no-lock rule can contradict each other silently
+  when they live in different sections. Under the current design a lingering registry entry is harmless
+  because a **retired, write-closed** cell reports no usable age, so pruning is a memory bound only.
+  Retirement is explicit lifecycle state per S1d, never inferred. AC11 and AC15 assert it from both
+  directions.
 - **R16 (rewritten in revision 11).** A long-lived container that outlives its identity can retain a stale
   shared handle. `inner.consumers` entries are never removed, so the predecessor cell is retired and
   write-closed and the container is rebound to the new generation's cell at the next admission. A retained
@@ -918,7 +997,10 @@ record the failing output **before** the change, per
 - **AC19 — two-phase bounded consistency read, red first (new in revision 10, rewritten in revision 11).**
   The direct control for the decided protocol and for `finding_1787290799_815700`. Assert, with
   **deterministic interleavings** rather than timing luck:
-  1. A stable even version with `count > 0` yields a usable age tagged with that cell's generation.
+  0. A **`loom` model check** of the writer and reader protocol, which is the only way to substantiate an
+     ordering claim; deterministic scheduling tests cannot. It must fail against a `Release` opening RMW.
+  1. A stable even version with `count > 0` and `gate == 0` yields a usable age tagged with that cell's
+     generation.
   2. `count == 0` yields **no usable age**, never a zero age.
   3. A writer **paused mid-update**, with the version left odd, yields **indeterminate** after exactly one
      retry — never a mixed sample. This is the case revision 10's trailing-only stamp accepted.
@@ -932,9 +1014,11 @@ record the failing output **before** the change, per
 - **AC20 — no age from a prior generation, red first (new in revision 11).** The control for
   `finding_1787290799_555137`. Admit generation N, emit events Core admits as Background holders, then
   replace with generation N+1 while old holders remain live. Assert that generation N+1 reports
-  **indeterminate** while `prior_generation_holders > 0`, that no sample is ever attributed to generation N
-  after its cell is retired, that the old holders' `producer_slot` values still retire correctly against
-  their own list, and that N+1 begins reporting its own age only once the last old holder retires.
+  **indeterminate** while its cell's `gate > 0`, **observed through the public snapshot path** rather than
+  through `RouterInner`, that no sample is ever attributed to generation N after its cell is retired, that
+  the old holders' `producer_age_ref` values resolve to generation N's own list and retire correctly
+  against it, that generation N's list is dropped when its `live` count reaches zero, and that N+1 begins
+  reporting its own age only once the last old holder retires.
   Implement must show this red against revision 10's reset-in-place cell, which publishes an old-generation
   head age to the new generation.
 - **AC21 — a diagnostic failure latches indeterminate, red first (new in revision 11).** The control for
@@ -961,7 +1045,8 @@ record the failing output **before** the change, per
 - **AC14 — late completion after unload and replacement, red first (new in revision 7, rewritten in
   revision 10).** Admit a producer contract, emit an event that Core admits as a Background holder, unload
   the producer, admit the next generation, then complete the **old** holder late. Assert the old holder's
-  `producer_slot` still addresses a valid list, that its retirement decrements the correct occupancy, that
+  `producer_age_ref` still resolves to the generation-N list that admitted it, that its retirement
+  decrements the correct occupancy and that generation's `gate`, that
   it does not disturb a slot owned by the new generation, and that **no age from the retired generation is
   ever published**. Assert the new generation's age is reported from its own fresh cell.
 - **AC15 — no event or retirement path waits on the diagnostic registry, red first (new in revision 7).**
@@ -1085,7 +1170,17 @@ integration tests, the repository lifecycle suite, and scratch consumer `cargo c
     queue distinguishes retired from live, so retirement belongs on the control path that knows.
 25. **Publish the artifact after the final commit.** I created an artifact, then committed a further fix,
     leaving durable evidence that described bytes the reviewer never saw.
-26. **Correcting a stale in-repository assumption** — an in-repository workspace member can still be an
+26. **`Release` on an opening RMW does not fence what follows it.** A seqlock's in-progress mark needs
+    acquire semantics too, or later relaxed stores can float above it and a reader can see changed fields
+    under an unchanged version.
+27. **A published gate must live where its reader can reach it.** Putting a publication condition inside a
+    structure the lock-free reader is forbidden to touch makes the condition unenforceable.
+28. **Prose cannot grant a capability the state shape lacks.** "Old holders retire against their own list"
+    was false while the envelope carried only a slot number; the sentence described behaviour no field
+    could support.
+29. **A sweep keyed on remembered strings finds only what you remember.** Report the literal command and
+    its literal output; a summarised count is an assertion, not a verification.
+30. **Correcting a stale in-repository assumption** — an in-repository workspace member can still be an
    external contract surface. Revision 1 used crate location to skip a charter, which the Hub charter's
    "does not own" list already forbids.
 
