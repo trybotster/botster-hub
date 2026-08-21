@@ -47,11 +47,6 @@
     },
     "PackageNoticeReactionDeclaration": {
       "additionalProperties": false,
-      "not": {
-        "required": [
-          "owner"
-        ]
-      },
       "properties": {
         "name": {
           "pattern": "\\S",
@@ -1715,10 +1710,14 @@
       "$ref": "#/$defs/PackageNavigationEntry"
     },
     {
-      "$ref": "#/$defs/PackageNoticeReactionDeclaration"
-    },
-    {
-      "$ref": "#/$defs/PackageNoticeReactionDescriptor"
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PackageNoticeReactionDeclaration"
+        },
+        {
+          "$ref": "#/$defs/PackageNoticeReactionDescriptor"
+        }
+      ]
     }
   ],
   "title": "Botster UI Contract"

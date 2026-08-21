@@ -2,11 +2,18 @@
 
 ## Review-return findings
 
-Review `review_1787290014_342254` returned three open findings. This visit addresses all of them.
+Review `review_1787291755_566319` returned two open findings. This visit addresses both of them.
 
 | Finding | Severity | Fix |
 | --- | --- | --- |
-| `finding_1787290014_414325` Canonical JSON Schema rejects projected descriptors | high | Declaration and descriptor `$defs` no longer overlap: a declaration instance must omit `owner`. Pointer pattern is `^/([^/~]|~0|~1)+$`. Schema tests accept one owner-bearing descriptor and reject `/`, `/notice~`, `/notice~2`, `/a/b`, and `notice`. |
+| `finding_1787291755_539295` Declaration schema rejects optional owner | high | Removed `not: { required: ["owner"] }`. Root `oneOf` now has one nested `anyOf` of declaration and descriptor. Direct `$defs/PackageNoticeReactionDeclaration` tests cover omitted owner, exact owner, and malformed owner. |
+| `finding_1787291755_872245` String admission is not satisfiability | medium | `CompiledEventSchema::accepts_some_string` is the shared query. It honors `const`, `enum`, `minLength`, and `maxLength`. Hub admission uses it for subject and notice. |
+
+Review `review_1787290014_342254` returned three open findings. The previous Implement visit addressed all of them.
+
+| Finding | Severity | Fix |
+| --- | --- | --- |
+| `finding_1787290014_414325` Canonical JSON Schema rejects projected descriptors | high | Pointer pattern is `^/([^/~]|~0|~1)+$`. Schema tests accept one owner-bearing descriptor and reject `/`, `/notice~`, `/notice~2`, `/a/b`, and `notice`. The later visit replaced exclusive `oneOf` plus `not required owner` with nested `anyOf` so an authored owner remains valid on the declaration definition. |
 | `finding_1787290014_835267` Live notice test fails under default-concurrency | high | The batch emit queued two events against a 1 s mailbox age. This visit emits empty, waits both subscribers, then emits oversized. IsolatedHub root uses a pid suffix. `./test.sh --locked --offline` at default concurrency passed, including this test. |
 | `finding_1787290015_322853` Notice admission ignores compiled string semantics | medium | `schema_accepts_string` now compiles through `CompiledEventSchema`. Type arrays fail compilation. Session `subject` must accept a string. Tests cover an empty property schema, a type array, and a numeric subject. |
 
@@ -20,7 +27,7 @@ Review `review_1787290014_342254` returned three open findings. This visit addre
 | Pipeline worktree | the pipeline-provided ticket worktree |
 | Ticket | `ticket_1787278643_145174` |
 | Run | `run_1787282470_625000` |
-| Step | `botster_stack_implement` (`run_step_1787284582_430818`) |
+| Step | `botster_stack_implement` (`run_step_1787291769_418879`) |
 | Approved plan | `docs/plans/publish-package-owned-client-notice-reactions.md` revision 3 |
 | Plan Review | `review_1787284569_918928` approved |
 | Merge policy | `direct`; do not create a PR |
@@ -154,7 +161,7 @@ Maintainer follow-up after merge: `script/tag-ui-contract` for `botster-ui-contr
 
 ## Deviations from plan
 
-- Live suppression proof emits empty, waits both subscribers, then emits oversized. Read waits use 200 ms slices. The production completion oracle remains `PluginMcpToolResult.status == "accepted"` plus unsolicited `next_event`. This avoids queuing two events against the 1 s client mailbox age under suite load.
+- Live suppression proof emits empty, waits both subscribers, then emits oversized. After each emit, the wait issues `Status` so the connection loop takes a production host-control write turn and flushes admitted events. Timeout stays 10 s. This is the completion oracle for suite load.
 - `emit_sample_ready_payload` now asserts `plugin_tool_result.status == "accepted"`, so a rejected emit fails at the producer rather than as a later wait timeout.
 - Locked commands used `--offline` because tag `botster-ui-contract-v0.3.3` is not on the remote yet. The workspace `[patch]` path-resolves the crate. This is the plan's U2/R8 handling, not a product-behavior change.
 - `DaemonPackage` stays exhaustive. The downstream source cost is one TUI test helper literal, recorded below. The plan allowed that measurement before a `#[non_exhaustive]` decision; this run does not add `#[non_exhaustive]`.
@@ -183,6 +190,8 @@ Commands (all through `./test.sh` or explicit `BOTSTER_ENV=test` except fmt/clip
 | Packed `npm pack` of `@trybotster/ui-contract@0.3.3` and `@trybotster/hub-test-support@0.1.40`, install both tarballs in a scratch consumer, assert metadata `0.1.40` / UI contract `0.3.3` / revision 45 / protocol 7 / matching `daemon_protocol.sha256`, `notice_reactions?`, imported descriptor with required `owner`, materialized fixture notice, `resolveNoticeText`, then strict `tsc` of `script/fixtures/ui-contract-typescript-consumer.ts` | pass |
 | `node packages/hub-test-support/test.mjs` after installing the packed UI-contract tarball | pass |
 | `./test.sh --locked --offline -p botster-hub-test-support published_plugin_contract_matrix_fixture_declares_a_session_notice` | pass |
+| `./test.sh --locked --offline --test hub_daemon_lifecycle_test -- isolated_hub_projects_notice_reactions_and_resolves_session_scoped_text --exact` after Status-pump wait | pass |
+| `./test.sh --locked --offline --test hub_daemon_lifecycle_test` default concurrency | 265 passed, including the live notice test |
 | `./test.sh --locked --offline` after Review return | pass in 472 s, including `isolated_hub_projects_notice_reactions_and_resolves_session_scoped_text` |
 
 First full-suite root failure: `daemon_maintenance::tests::owner_loop_queues_and_completes_two_fanout_plugin_handlers` (`left: 1`, `right: 2` in-flight handlers). Isolated command `./test.sh --locked --offline -p botster-hub --lib owner_loop_queues_and_completes_two_fanout_plugin_handlers` passed on this branch. The same isolated command passed on `origin/main` `b3b54f1`. A second `./test.sh --locked --offline -p botster-hub --lib` (456 tests) passed. A second full `./test.sh --locked --offline` passed. This is a default-concurrency flake present on base, not a notice-contract regression.
@@ -200,6 +209,8 @@ Downstream DTO cost: `DaemonPackage` is not `#[non_exhaustive]`. Adding `notice_
 - `node packages/hub-test-support/test.mjs` still requires an installed `@trybotster/ui-contract`. That is an existing clean-checkout gotcha, now documented against `0.3.3`.
 - Web and TUI must consume the shared resolver. This run does not prove those clients.
 - Default-concurrency flake `owner_loop_queues_and_completes_two_fanout_plugin_handlers` can still fail a future suite run. Isolated and second full-suite evidence show it is unrelated to this change.
+- Workspace-load flake `webrtc_terminal_adapter_bound_peer_loss_closes_adapter_without_hub_detach` failed once under the full suite. Isolated reruns passed on this branch and on `origin/main` `b3b54f1` after the session-worker prebuild. This is a base load flake, not a notice-contract regression.
+- Mailbox `queue_age` remains 1 s production policy. Live waits now issue `Status` so a host-control write turn flushes admitted events.
 
 ## Missing vault guidance discovered
 

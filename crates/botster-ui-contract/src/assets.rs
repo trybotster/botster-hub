@@ -254,8 +254,12 @@ pub fn json_schema() -> Value {
             { "$ref": "#/$defs/UiActionResult" },
             { "$ref": "#/$defs/PackageSurfaceDescriptor" },
             { "$ref": "#/$defs/PackageNavigationEntry" },
-            { "$ref": "#/$defs/PackageNoticeReactionDeclaration" },
-            { "$ref": "#/$defs/PackageNoticeReactionDescriptor" }
+            {
+                "anyOf": [
+                    { "$ref": "#/$defs/PackageNoticeReactionDeclaration" },
+                    { "$ref": "#/$defs/PackageNoticeReactionDescriptor" }
+                ]
+            }
         ],
         "$defs": {
             "JsonValue": {},
@@ -380,7 +384,6 @@ pub fn json_schema() -> Value {
                 "type": "object",
                 "additionalProperties": false,
                 "required": ["name", "subject_scope", "text_pointer", "ttl_ms", "severity"],
-                "not": { "required": ["owner"] },
                 "properties": {
                     "owner": { "type": "string", "pattern": "\\S" },
                     "name": { "type": "string", "pattern": "\\S" },
