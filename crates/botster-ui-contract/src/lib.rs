@@ -31,6 +31,7 @@ use thiserror::Error;
 
 mod assets;
 mod entity_options;
+mod notices;
 
 pub use assets::{conformance_fixtures_json, json_schema, typescript_declarations};
 pub use entity_options::{
@@ -38,6 +39,12 @@ pub use entity_options::{
     UiEntityOptionsExclude, UiEntityOptionsKind, UiEntityOptionsSource, apply_entity_options_frame,
     apply_entity_options_frames, collect_entity_option_families, entity_family_subscription_id,
     project_entity_options, project_entity_options_from_store, validate_entity_options_source,
+};
+pub use notices::{
+    NOTICE_TEXT_MAX_BYTES, NOTICE_TTL_MAX_MS, NOTICE_TTL_MIN_MS, NoticePointerError,
+    NoticeTextError, PackageNoticeReactionDeclaration, PackageNoticeReactionDescriptor,
+    PackageNoticeReactionValidationError, PackageNoticeSeverity, PackageNoticeSubjectScope,
+    decode_notice_text_pointer, resolve_notice_text, validate_package_notice_reactions,
 };
 
 /// Transport-neutral UI surface metadata carried by a package manifest.

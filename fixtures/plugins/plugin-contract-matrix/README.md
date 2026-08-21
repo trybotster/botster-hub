@@ -93,6 +93,7 @@ paths.
 - `contract.action`: `plugin_surface_action` handler consuming the canonical request envelope. Rendered payload metadata selects open, toggle, or submit behavior; negative conformance probes select a generic error, deliberately mismatched identity, or malformed replacement. Submitted form data comes from `values`. Every valid result echoes the request's complete identity, including the presence or absence of `node_id`. Field-error responses are keyed by the rendered `contract-app-message` input id. For this fixture, an accepted `replacement` replaces the whole rendered surface tree; it is not inserted beneath the submitting `node_id`.
 - Package route descriptors: manifest `surfaces` should project to `surface:<id>` routes under `/packages/botster.plugin-contract-matrix/surfaces/<id>`.
 - Package lifecycle compatibility: hub conformance should prove install, enable, list, show, route descriptors, and action-state projection through the daemon package DTOs. The installed `DaemonPackage` row currently does not expose a separate protocol compatibility descriptor; that remains covered by package admission and lifecycle state.
+- Client notice reactions: the package declares one session-scoped notice on `contract.ready`. The emitted payload has exact `subject` and `notice` string properties. Generic clients read that declaration from this fixture instead of hardcoding a product event name.
 
 Successful render responses should expose the validated UI payload through
 `plugin_surface.ui_tree_snapshot`. The compatibility `plugin_surface.body` field

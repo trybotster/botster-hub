@@ -5,9 +5,11 @@ export type JsonValue = null | boolean | number | string | JsonValue[] | { [key:
 export type JsonObject = { [key: string]: JsonValue };
 export type UiNodeId = string;
 export declare const packageVersion: string;
+export declare const NOTICE_TEXT_MAX_BYTES: number;
 export declare const schema: JsonObject;
 export declare const conformanceFixtures: JsonObject;
 export declare function realizeBindListDescendantId(rowId: string, key: string): UiNodeId;
+export declare function resolveNoticeText(payload: JsonValue, pointer: string): string;
 export declare function projectEntityOptions(
   descriptor: UiEntityOptionsSource,
   sourceRecords: Record<string, JsonObject>,
@@ -32,6 +34,10 @@ export type PackageSurfaceOperation = "render" | "action";
 export interface PackageSurfaceDescriptor { id: string; kind: PackageSurfaceKind; title: string; description?: string; icon?: string; order?: number; category?: string; supports?: PackageSurfaceOperation[]; }
 export type PackageNavigationTarget = { kind: "surface"; surface_id: string };
 export interface PackageNavigationEntry { id: string; label: string; icon?: string; description?: string; target: PackageNavigationTarget; }
+export type PackageNoticeSubjectScope = "session";
+export type PackageNoticeSeverity = "info" | "warning" | "error";
+export interface PackageNoticeReactionDeclaration { owner?: string; name: string; subject_scope: PackageNoticeSubjectScope; text_pointer: string; ttl_ms: number; severity: PackageNoticeSeverity; }
+export interface PackageNoticeReactionDescriptor { owner: string; name: string; subject_scope: PackageNoticeSubjectScope; text_pointer: string; ttl_ms: number; severity: PackageNoticeSeverity; }
 export type UiNodeKind = "stack" | "inline" | "form" | "form_section" | "form_field" | "panel" | "metric" | "metric_grid" | "toolbar" | "status_badge" | "section" | "scroll_area" | "text" | "icon" | "badge" | "status_dot" | "empty_state" | "list" | "list_item" | "tree" | "tree_item" | "table" | "button" | "icon_button" | "menu" | "menu_item" | "dialog" | "text_input" | "textarea" | "checkbox" | "select" | "select_option" | "terminal_view" | "connection_code_view" | "iframe" | "custom";
 export type UiWidthClass = "compact" | "regular" | "expanded";
 export type UiHeightClass = "short" | "regular" | "tall";
