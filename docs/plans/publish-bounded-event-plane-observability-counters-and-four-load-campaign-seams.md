@@ -2,6 +2,9 @@
 
 - Ticket: `ticket_1787267568_492780`
 - Run: `run_1787278338_832165`
+- Revision: **7**. Revision 7 answers the four findings in `review_1787288480_333564`: the age list was
+  removed while admitted holders were still live, the registry lock could block ingress, the consumer age
+  cell still allocated on the event path, and a silent fallback allowed `Accepted` with no age.
 - Revision: **6**. Revision 6 answers the three findings in `review_1787287893_907824`: the tombstone
   ring lost a live entry after middle retirement, its storage allocated inside the event path, and AC6
   could not detect either. Section 5 S1a is redesigned and AC6 gains a deterministic allocation control.
@@ -12,6 +15,15 @@
 - Target id: `tgt_7e208a0c76a44980a83b63af976b1f22`
 - Base: `origin/main` at `b3b54f1` ("Merge ticket: Roll Core pin after IncrementalAttach local-runtime gate")
 - Core pin (verified in `Cargo.toml:24-26,43-44`): `7eafa470a18025895995bbedc20d34b58106a03b`
+
+## 0. Response to Plan Review `review_1787288480_333564` (revision 7)
+
+| Finding | Severity | Response |
+| --- | --- | --- |
+| `finding_1787288480_816963` — unload removes producer age storage before admitted holders retire | blocker | **Accepted and fixed.** Verified: `apply_unload` (`src/package_event_router.rs:1232-1281`) removes contracts, subscriptions, client holders, and queued copies, but leaves `inner.envelopes`, `inner.admitted`, and `inner.producer` occupancy live, exactly as `[[admitted event holders survive producer unload until Core completion]]` requires. Removing the age list there would strand `producer_slot` on live envelopes, and package replacement would let an old-generation late completion unlink a slot owned by the new generation. Section 5 S1c now keeps **one owner age list** while contracts exist **or** `producer.events > 0`, reuses it across replacement, and removes it only after the last contract is gone and the final admitted holder retires. AC14 is the red-first control. |
+| `finding_1787288480_692236` — diagnostic `RwLock` acquisition can block event ingress | blocker | **Accepted and fixed.** Revision 6 had event writers take the registry `RwLock` for each update, which lets a status read, an admission, or an unload delay an accepted event while it holds the router lock. That breaks the project no-wait ingress invariant and changes the router's load class, and AC4 did not cover it. Section 5 S1d now shares each `AgeCell` by `Arc`: the router entry, consumer queue, and mailbox each hold a **direct** `Arc<AgeCell>` and update the atomic through it, while the snapshot registry holds a second `Arc`. **No event path acquires the registry lock.** AC15 is the contention control. |
+| `finding_1787288480_967458` — consumer age registration still allocates on the event path | high | **Accepted and fixed.** I fixed this class for producers in revision 6 and missed the identical case for consumers: `try_ingress` inserts the consumer queue at `src/package_event_router.rs:490-492`, so a first-queued-copy cell insertion is new diagnostic allocation during an event. The consumer `AgeCell` is now created at **subscription admission**, retained while a subscription or a queued copy exists, and removed only when both are absent. AC6 part 1 now covers the first queued copy and the consumer shed path. |
+| `finding_1787288480_127520` — the plan silently accepts events without producer-age observation | high | **Accepted and fixed.** The revision 6 "skip the age update" fallback converted an invariant breach into missing observability under exactly the load the campaign creates. Section 5 S1e removes it: the slot is reserved **before** any envelope or occupancy mutation, a reservation failure returns a typed non-accepted result rather than `Accepted`, and the failure is counted rather than silent. AC16 asserts every accepted envelope holds exactly one live producer slot through retirement, unload, and replacement. |
 
 ## 0. Response to Plan Review `review_1787287893_907824` (revision 6)
 
@@ -72,6 +84,8 @@ Targeted atomic notes:
 - `[[hub client event queue max requires Botster test mode]]`
 - `[[test names do not prove their bodies can fail on the named claim]]`
 - `[[router ingress uses try_lock only and contention is shed_busy]]`
+- `[[admitted event holders survive producer unload until Core completion]]`
+- `[[events.emit is a non-blocking router ingress not an owner-pumped host bridge]]`
 - `[[botster hub events use bounded priority lanes instead of unbounded queue fuses]]`
 - `[[botster hub is a first party host profile over core]]`
 - `[[botster data plane bypasses the hub through session and client actors]]`
@@ -243,14 +257,72 @@ captured at counter construction, with `u64::MAX` as the empty sentinel. Writers
 they already hold the router or mailbox lock, whenever the list head changes. Readers touch only the
 atomic.
 
+**S1c. Age-list lifetime across unload and package replacement (fixes `finding_1787288480_816963`).**
+
+`apply_unload` (`src/package_event_router.rs:1232-1281`) removes contracts, subscriptions, client holders,
+and queued copies. It deliberately leaves `inner.envelopes`, `inner.admitted`, and `inner.producer`
+occupancy intact, because `[[admitted event holders survive producer unload until Core completion]]`
+requires admitted Background jobs to keep occupancy until Core completes them. `retire_holder_locked`
+(`:1338-1352`) then decrements `producer.events` on that late completion.
+
+Revision 6 removed the age list in `apply_unload`, which is wrong twice over. A late completion would
+address a list that no longer exists, and package replacement — unload followed by admitting the next
+generation — would let an old-generation completion unlink a slot now owned by the new generation.
+
+Revision 7 ties the list to the same lifetime as producer occupancy:
+
+- **One list per owner.** It is created at first contract admission and **reused across package
+  replacement**. Replacement never recreates or swaps the list, so `producer_slot` values on live
+  envelopes stay valid across the generation boundary.
+- **Retained while `contracts_exist(owner) || producer.events > 0`.** Unload alone never removes it.
+- **Removed only when both are false**, checked at exactly two sites: `apply_unload`, when
+  `producer.events` is already zero, and `retire_holder_locked`, when the final admitted holder retires
+  and no contract remains.
+
+**S1d. Age cells are `Arc`-shared, and no event path takes the registry lock (fixes
+`finding_1787288480_692236`).**
+
+Revision 6 had event writers acquire the snapshot registry's `RwLock` on every update. Ingress already
+spends its one permitted `try_lock` on `RouterInner`; a second blocking lock would let a status read, a
+contract admission, or an unload delay an accepted event while it holds the router lock. That breaks the
+project's no-wait ingress invariant and changes the router's load class, which is the exact failure
+`[[load diagnostics must not cost work proportional to what they measure]]` warns about.
+
+Revision 7 removes the registry from every event path:
+
+- Each `AgeCell` is created **outside** any event path and shared as `Arc<AgeCell>`.
+- The producer age list, the consumer queue, and the client mailbox each hold a **direct**
+  `Arc<AgeCell>` and update its `AtomicU64` through that handle.
+- The snapshot registry holds a **second** `Arc` to the same cell, purely for enumeration.
+- The registry lock is therefore taken only at admission (write) and at status read (read).
+  **No accepted-event, shed, or retirement path acquires it.**
+
+**S1e. No silent acceptance without age observation (fixes `finding_1787288480_127520`).**
+
+The ticket requires every producer queue age to be readable. Revision 6's "skip the age update when the
+list is absent or `push` returns `None`" fallback would have returned `Accepted` with no age, converting
+an invariant breach into missing observability under exactly the saturation the campaign creates.
+
+Revision 7 makes the state structurally unreachable and fails closed if it ever occurs:
+
+- The list exists for every owner that can reach an accepted emit, because `try_ingress` returns
+  `RejectedUndeclared` (`:427-436`) before producer occupancy when no contract exists, and S1c keeps the
+  list alive while occupancy is nonzero.
+- Capacity is guaranteed by the existing shed check (`:481-483`), so the free list is never empty.
+- **Order of operations changes:** the slot is reserved **after** the shed check and **before** any
+  envelope insert or occupancy increment.
+- A reservation failure returns a **typed non-accepted result** (`EventPlaneStatus::ShedFull`) before any
+  mutation, never `Accepted`, and increments a dedicated `producer_age_reservation_failures` counter so an
+  invariant breach is loud in the same status payload rather than silent.
+
 **S1b. Age-cell identity lifetime (fixes the second half of `finding_1787279337_990629`).**
 Revision 1 left the three identity maps with no removal rule. Revision 2 slaves each map to the live
 identity set that already exists, and removes a cell at exactly the site that ends that identity:
 
 | Map | Key | Insert site | Remove site |
 | --- | --- | --- | --- |
-| producer ages | package owner | **contract admission**: `try_register_contracts` (`:300`), `try_commit_package_generation` (`:333`), and `PackageEventRouter::new` for the built-in Hub contracts. Never on an event path. | `apply_unload` (`src/package_event_router.rs:1232-1256`), with the owner's contracts |
-| consumer ages | plugin key | first queued copy for that plugin key | `apply_unload` for that plugin key, and `unsubscribe` when the plugin key retains no subscription |
+| producer ages | package owner | **contract admission**: `try_register_contracts` (`:300`), `try_commit_package_generation` (`:333`), and `PackageEventRouter::new` for the built-in Hub contracts. Never on an event path. Reused across package replacement. | only when `contracts_exist(owner) == false` **and** `producer.events == 0`, checked in `apply_unload` and in `retire_holder_locked` (see S1c) |
+| consumer ages | plugin key | **subscription admission** (`try_subscribe`, `try_commit_package_generation`). Never on an event path. | only when the plugin key retains **no subscription and no queued copy**, checked at `apply_unload` and at `unsubscribe` |
 | mailbox ages | connection id | mailbox creation | `cleanup_client_connection_locked` and the connection removals at `src/daemon_event_subscriptions.rs:434-437` and `:481` |
 
 Note for Implement: `inner.consumers` entries are **not** removed today, so the consumer age map must be
@@ -519,7 +591,7 @@ registry and source check before writing either literal.
 | --- | --- |
 | `src/event_plane_counters.rs` (new) | `EventPlaneCounters`, fixed histogram, `AgeCell`, identity maps, snapshot type |
 | `src/lib.rs` | register the new module and re-export the snapshot type |
-| `src/package_event_router.rs` | shed by typed reason, admission and delivery attempts, latencies, T2, a new `RouterInner` producer age-list map allocated at contract admission, `Envelope.producer_slot`, and age-list removal in `apply_unload`, producer and consumer age cells, unload-time cell removal |
+| `src/package_event_router.rs` | shed by typed reason, admission and delivery attempts, latencies, T2, a new `RouterInner` producer age-list map allocated at contract admission and reused across replacement, `Envelope.producer_slot`, `Arc<AgeCell>` handles on the producer entry and consumer queue, age-list removal gated on no contract and zero occupancy in both `apply_unload` and `retire_holder_locked`, and slot reservation before envelope or occupancy mutation, producer and consumer age cells, unload-time cell removal |
 | `src/daemon_event_subscriptions.rs` | overflow gap count, T3 mailbox-expiry count, mailbox age cell, cell removal on connection cleanup |
 | `src/daemon_maintenance.rs` | T1 typed completion counting; seam 3 for the two `timeout_ms` sites |
 | `src/daemon_transport.rs` | `EgressWriteClass` on `ControlMessage::EgressWriteFailed`, T4 in `record_egress_write_failure`, `enqueued_at` on `ControlMessage::Request` plus its two senders here, the owner-loop serve-site measurement, owner-turn recording, status projection |
@@ -548,9 +620,17 @@ registry and source check before writing either literal.
   attached to a lazily created map entry. `try_ingress` creates `ProducerOccupancy` before the shed check
   at `src/package_event_router.rs:473-483`, so the age list is deliberately kept in a separate map that is
   populated at contract admission. AC6 part 1 is the control.
-- **R2. A second lock replaces the first.** The age maps carry their own `RwLock`. Writers hold it for one
-  atomic store, and readers never touch the router mutex. AC4 proves the read path returns values while
-  the router lock is held.
+- **R2. A second lock replaces the first.** Revision 6 had event writers take the registry `RwLock`, which
+  would have let a status read or an admission delay an accepted event. Revision 7 shares each `AgeCell`
+  by `Arc`, so event paths update the atomic through a direct handle and **no event path acquires the
+  registry lock**. AC4 covers the status read; AC15 is the ingress-contention control.
+- **R13 (new in revision 7).** Diagnostic storage whose lifetime is tied to contracts can be freed while
+  admitted holders still reference it, and package replacement can alias a stale slot to a new generation.
+  S1c ties the list to `contracts || producer.events > 0` and reuses one list across replacement. AC14 is
+  the control.
+- **R14 (new in revision 7).** A defensive "skip the diagnostic" fallback silently degrades observability
+  under exactly the load being measured. S1e replaces it with a fail-closed typed result plus a counted
+  failure. AC16 is the control.
 - **R3. Public DTO break.** Now measured rather than assumed: one external `cfg(test)` literal. AC10
   converts the estimate into evidence before Implement claims compatibility.
 - **R4. Accidental behavior change.** T1 must keep `run_completion_drain_slice` retirement identical, and
@@ -603,7 +683,8 @@ record the failing output **before** the change, per
      increments a thread-local counter only while an explicit scope guard is active. The guard wraps the
      isolated diagnostic update alone. Assert the count is exactly zero for: the **first accepted event**
      for a newly admitted owner, a **shed event** for an admitted owner, an accepted event at full
-     occupancy, and a retirement from the middle of the list. Pre-existing payload encoding, `to_string`
+     occupancy, a retirement from the middle of the list, the **first queued copy for a consumer**, and a
+     **consumer shed path**. Pre-existing payload encoding, `to_string`
      key construction, and routing allocations stay **outside** the guarded scope, per the reviewer's
      instruction, so the assertion measures only diagnostic cost.
   2. **Constant accepted-event operation count.** The recorded operation count for one age-list push is
@@ -657,6 +738,25 @@ record the failing output **before** the change, per
   returns to the live-identity bound after: package unload, client unsubscribe, connection cleanup, and a
   reconnect-churn loop that creates and destroys many connection ids. The churn case must fail when a
   removal site is omitted, which Implement demonstrates by deleting one removal and recording the red run.
+- **AC14 — age-list survival across unload and replacement, red first (new in revision 7).** Admit a
+  producer contract, emit an event that Core admits as a Background holder, then unload the producer, then
+  admit the next generation (package replacement), then complete the **old** holder late. Assert that the
+  old holder's `producer_slot` still addresses the same live list, that its retirement decrements the
+  correct occupancy, that it does not unlink a slot owned by the new generation, and that the oldest age
+  stays readable throughout. Assert the list is removed only after the last contract is gone **and**
+  `producer.events` reaches zero. Implement must show this red against the revision 6 behaviour that
+  removed the list in `apply_unload`.
+- **AC15 — ingress never waits on the diagnostic registry, red first (new in revision 7).** Hold the
+  snapshot registry lock on one thread. On another thread run an accepted emit, a shed emit, and a
+  retirement. Assert all three complete without waiting for the registry lock and without returning
+  `ShedBusy` for that reason. Implement must show this red against the revision 6 design that acquired the
+  registry lock on the event path.
+- **AC16 — no accepted event without a live producer slot, red first (new in revision 7).** Assert that
+  every accepted envelope holds exactly one live producer slot from acceptance through retirement, across
+  unload and package replacement, and that the live slot count equals `producer.events` at every step. Force
+  a reservation failure through a test seam and assert the result is a typed non-accepted status, that no
+  envelope or occupancy mutation occurred, and that `producer_age_reservation_failures` incremented.
+  `Accepted` with a missing age must fail this test.
 - **AC13 — producer age-list correctness under out-of-order retirement, red first (new in revision 6).**
   This is the direct control for `finding_1787287893_905201`. Fill a producer to exactly
   `producer_queue_max_events`. Retire an entry from the **middle**. Immediately accept another event.
@@ -718,7 +818,15 @@ integration tests, the repository lifecycle suite, and scratch consumer `cargo c
 9. **Diagnostic storage attached to a lazily created map entry allocates on the first event.** In this
    router `try_ingress` creates `ProducerOccupancy` before the shed check, so even a shed event would have
    allocated the buffer. Diagnostic buffers belong on an admission-time lifecycle, not an event-time one.
-10. **Correcting a stale in-repository assumption** — an in-repository workspace member can still be an
+10. **Diagnostic storage tied to contract lifetime outlives its own removal condition.** Admitted holders
+    survive producer unload until Core completion, so anything a live envelope references must survive with
+    occupancy, not with contracts. Package replacement makes this sharper, because a recreated structure
+    can alias a stale index to a new generation.
+11. **A diagnostic registry lock is an ingress lock if any event path touches it.** Sharing the cell by
+    `Arc` and keeping the registry for enumeration only is what preserves no-wait ingress.
+12. **A defensive skip is an observability outage under load.** Diagnostics for a saturation campaign must
+    fail closed with a typed result and a counted failure, never degrade quietly.
+13. **Correcting a stale in-repository assumption** — an in-repository workspace member can still be an
    external contract surface. Revision 1 used crate location to skip a charter, which the Hub charter's
    "does not own" list already forbids.
 
