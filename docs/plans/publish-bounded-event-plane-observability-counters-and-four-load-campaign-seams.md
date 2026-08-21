@@ -1023,15 +1023,15 @@ registry and source check before writing either literal.
 - **R26 (new in revision 14).** Applying a forward-tolerance rule to one enum and not its sibling leaves a
   wire break in the half nobody re-read. `DaemonQueueKind` now carries `#[serde(other)]` like
   `DaemonQueueAgeState`, and AC10 asserts both.
+- **R27 (new in revision 14).** A mandatory field on a row that has no validated value forces a defaulted
+  number into a public contract, quietly weakening the authoritative counter it mirrors. `queue_count` is
+  `Option`, and the S6a presence table fixes every row's exact shape.
 - **R28 (new in revision 15).** Appending a corrected rule beside the sentence it supersedes leaves both
   active, and Implement cannot satisfy both. This is vault gap 15 recurring inside AC10; the fix is always
   to rewrite the original in place. AC10 now carries one table for every row.
 - **R29 (new in revision 15).** Changing a Rust field to `Option` does not by itself make the generated
   TypeScript property optional, and a generated required property passes every Rust wire test while
   breaking the client contract. Each optional field is now asserted individually in the drift proof.
-- **R27 (new in revision 14).** A mandatory field on a row that has no validated value forces a defaulted
-  number into a public contract, quietly weakening the authoritative counter it mirrors. `queue_count` is
-  `Option`, and the S6a presence table fixes every row's exact shape.
 - **R25 (new in revision 13).** An acceptance gate that names a tool absent from every manifest is not
   executable. AC19 case 0 now carries its dependency, its command, and an explicit fallback that reports
   the ordering claim as unproven rather than dropping it.
