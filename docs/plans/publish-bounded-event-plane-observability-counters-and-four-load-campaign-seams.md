@@ -2,6 +2,10 @@
 
 - Ticket: `ticket_1787267568_492780`
 - Run: `run_1787278338_832165`
+- Revision: **15**. Revision 15 answers the two findings in `review_1787293155_249181`: AC10 carried two
+  incompatible field-presence rules because revision 14 appended beside a revision 13 sentence instead of
+  rewriting it, and `queue_count` was made `Option` in Rust without being added to the generated-TypeScript
+  optionality rule.
 - Revision: **14**. Revision 14 answers the three findings in `review_1787292601_501751`: `DaemonQueueKind`
   needed the same `serde(other)` wire tolerance I gave only to the state enum, `queue_count` must be absent
   rather than defaulted on an indeterminate row, and the `loom` version is pinned to the registry-verified
@@ -41,6 +45,13 @@
 - Target id: `tgt_7e208a0c76a44980a83b63af976b1f22`
 - Base: `origin/main` at `b3b54f1` ("Merge ticket: Roll Core pin after IncrementalAttach local-runtime gate")
 - Core pin (verified in `Cargo.toml:24-26,43-44`): `7eafa470a18025895995bbedc20d34b58106a03b`
+
+## 0. Response to Plan Review `review_1787293155_249181` (revision 15)
+
+| Finding | Severity | Response |
+| --- | --- | --- |
+| `finding_1787293155_277487` — AC10 contains conflicting field-presence requirements | high | **Accepted, and this is my own recorded lesson repeated.** Vault gap 15 says appending a corrected section does not retract the original, and revision 14 did exactly that: it appended a table-driven rule beside a revision 13 sentence stating that an `empty` row has `producer_generation` absent, leaving two active and incompatible requirements Implement could not both satisfy. The revision 13 sentence is now **rewritten in place**, not supplemented. AC10 carries one table stating all four fields for every row, including consumer and mailbox rows, and makes the corrected rule explicit: `producer_generation` is present on every producer row **except** the missing-cell row. |
+| `finding_1787293155_321121` — generated TypeScript proof omits `queue_count` optionality | high | **Accepted.** Revision 14 changed `queue_count` to `Option<u64>` in the Rust struct but left it out of the contract's Option-field list, so AC10 never required `queue_count?: number`. A generated **required** property would have passed every Rust wire case while breaking the client contract, which is the precise failure `[[generated typescript dtos must encode serde field optionality]]` exists to prevent. `queue_count` is added to the rule, and AC10 proof 3 now asserts optionality **per field** rather than through a single "the new property is optional" claim, per `[[generated dto drift tests need symmetric field and type checks]]`. Permissive generated unions are now required for **both** `state` and `kind`. |
 
 ## 0. Response to Plan Review `review_1787292601_501751` (revision 14)
 
@@ -784,10 +795,14 @@ pub enum DaemonQueueAgeState {
   client from failing to deserialize a newer Hub. This is the forward-evolution rule.
 - **Units are microseconds**, matching `last_owner_turn_us` and the ready-wait fields, so no reader has to
   track two units in one payload.
-- **`oldest_age_us` and `producer_generation` are `Option`**, so generated TypeScript must emit
-  `oldest_age_us?: number` and `producer_generation?: number`, per
-  `[[generated typescript dtos must encode serde field optionality]]`. Generated TypeScript for `state` is
-  the snake_case union plus a permissive arm for unknown values.
+- **`oldest_age_us`, `producer_generation`, and `queue_count` are all `Option`**, so generated TypeScript
+  must emit `oldest_age_us?: number`, `producer_generation?: number`, **and `queue_count?: number`**, per
+  `[[generated typescript dtos must encode serde field optionality]]`. `queue_count` was added to this
+  rule in revision 15 for `finding_1787293155_321121`: revision 14 made it `Option` in Rust but left it off
+  this list, so a generated **required** `queue_count` property would have passed every Rust wire case
+  while breaking the client contract. Generated TypeScript for **both** `state` and `kind` is the
+  snake_case union plus a permissive arm for unknown values, so an older generated client tolerates a
+  newer variant rather than narrowing it away.
 - **`#[non_exhaustive]` and `#[serde(other)]` do different jobs, and revision 13 wrongly conflated them.**
   `#[non_exhaustive]` protects **Rust source** matching; it does **not** let an older client deserialize
   an unknown string. Both enums therefore carry a `#[serde(other)] Unknown` arm for **wire** tolerance,
@@ -1008,6 +1023,12 @@ registry and source check before writing either literal.
 - **R26 (new in revision 14).** Applying a forward-tolerance rule to one enum and not its sibling leaves a
   wire break in the half nobody re-read. `DaemonQueueKind` now carries `#[serde(other)]` like
   `DaemonQueueAgeState`, and AC10 asserts both.
+- **R28 (new in revision 15).** Appending a corrected rule beside the sentence it supersedes leaves both
+  active, and Implement cannot satisfy both. This is vault gap 15 recurring inside AC10; the fix is always
+  to rewrite the original in place. AC10 now carries one table for every row.
+- **R29 (new in revision 15).** Changing a Rust field to `Option` does not by itself make the generated
+  TypeScript property optional, and a generated required property passes every Rust wire test while
+  breaking the client contract. Each optional field is now asserted individually in the drift proof.
 - **R27 (new in revision 14).** A mandatory field on a row that has no validated value forces a defaulted
   number into a public contract, quietly weakening the authoritative counter it mirrors. `queue_count` is
   `Option`, and the S6a presence table fixes every row's exact shape.
@@ -1122,23 +1143,38 @@ record the failing output **before** the change, per
   `[[botster-hub-client-playbook]]`'s gate to separate serde wire proof from downstream source proof:
   1. **Wire proof.** A serde test shows an old-shaped `DaemonStatus` JSON without the new key still
      deserializes, and that an empty `observability` value is omitted from the serialized frame.
-     **Extended in revision 13 for the S6a DTO**: assert the exact wire form of all three age states — a
-     `usable` row carrying `oldest_age_us` and, for producers, `producer_generation`; an `empty` row with
-     both fields **absent** rather than zero; and an `indeterminate` row with both absent. Assert a
-     missing cell appears as an `indeterminate` row rather than an omitted one. Assert that an unknown
-     future `state` string deserializes to `Unknown` through the `#[serde(other)]` arm rather than
-     failing, which is the forward-evolution rule that `#[non_exhaustive]` alone does not provide.
-     **Extended in revision 14**: assert the same forward tolerance for an unknown **`kind`** string in
-     both Rust and the generated TypeScript, since revision 13 protected only `state`. Assert the S6a
-     field-presence table row by row: `queue_count` present on `usable`, present and exactly `0` on
-     `empty`, and **absent** on each of the four indeterminate causes — unstable bracket, latched
-     `invalid`, open generation gate, and missing cell — with `producer_generation` absent only on the
-     missing-cell row. A defaulted `0` on any indeterminate row must fail this test.
+     **S6a wire cases, rewritten in place in revision 15** for `finding_1787293155_277487`. Revision 14
+     appended a table-driven rule beside a revision 13 sentence it contradicted, leaving two active and
+     incompatible requirements for the `empty` and `indeterminate` rows. Only the table governs. Assert
+     **all four fields for every row**, matching the S6a table exactly:
+
+     | Row | `state` | `oldest_age_us` | `queue_count` | `producer_generation` |
+     | --- | --- | --- | --- | --- |
+     | producer, validated, `count > 0`, gate closed | `usable` | present | present | **present** |
+     | producer, validated, `count == 0` | `empty` | absent | present, exactly `0` | **present** |
+     | producer, unstable bracket after one retry | `indeterminate` | absent | absent | **present** |
+     | producer, `invalid` latched | `indeterminate` | absent | absent | **present** |
+     | producer, generation gate open | `indeterminate` | absent | absent | **present** |
+     | any kind, cell missing | `indeterminate` | absent | absent | **absent** |
+     | consumer or mailbox, validated, `count > 0` | `usable` | present | present | absent |
+     | consumer or mailbox, validated, `count == 0` | `empty` | absent | present, exactly `0` | absent |
+     | consumer or mailbox, unstable or invalid | `indeterminate` | absent | absent | absent |
+
+     `producer_generation` is therefore present on **every** producer row except the missing-cell row,
+     which is the rule the revision 13 sentence got wrong. A defaulted `0` on any indeterminate row must
+     fail this test, and so must an omitted row where the table requires an `indeterminate` one.
+     Assert also that an unknown future `state` **and** an unknown future `kind` each deserialize to
+     `Unknown` through their `#[serde(other)]` arms rather than failing, in Rust and in the generated
+     TypeScript. `#[non_exhaustive]` does not provide that; only the `serde(other)` arms do.
   2. **Protocol-versus-revision proof.** Assert exact `PROTOCOL_VERSION` equality is unaffected, and that a
      client pinned to minimum revision 36 accepts a Hub reporting 46, per
      `[[daemon event shape changes bump conformance fixture revision not protocol version]]`.
   3. **Generated-artifact proof.** The generated TypeScript drift check
-     (`crates/botster-hub-client/src/lib.rs:4392`) passes, the new property is typed **optional**, and the
+     (`crates/botster-hub-client/src/lib.rs:4392`) passes; **each of `oldest_age_us`,
+     `producer_generation`, and `queue_count` is declared optional** as `?: number`, asserted per field
+     rather than by a single "the new property is optional" claim, per
+     `[[generated dto drift tests need symmetric field and type checks]]`; **both `state` and `kind`
+     generate a permissive union** that accepts an unknown value; and the
      `packages/hub-test-support` mirror plus `package.json` version `0.1.41` match the generated bytes.
      Include an installed-artifact smoke against the locally packed tarball, per
      `[[hub test support npm releases need external consumer smoke]]`. No npm publish occurs.
