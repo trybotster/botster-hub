@@ -2,13 +2,21 @@
 
 - Ticket: `ticket_1787267568_492780`
 - Run: `run_1787278338_832165`
-- Revision: **3**. Revision 1 drew four findings in `review_1787279337_548281`. Revision 2 fixed three and parked on the fourth. Revision 3 releases the park after the parent plan approval; see section 13.
+- Revision: **4**. Revision 1 drew four findings in `review_1787279337_548281`; revision 2 fixed three and parked on the fourth; revision 3 released the park. Revision 4 answers the three findings in `review_1787286846_900081`.
 - Target repository: `trybotster/botster-hub`
 - Target id: `tgt_7e208a0c76a44980a83b63af976b1f22`
 - Base: `origin/main` at `b3b54f1` ("Merge ticket: Roll Core pin after IncrementalAttach local-runtime gate")
 - Core pin (verified in `Cargo.toml:24-26,43-44`): `7eafa470a18025895995bbedc20d34b58106a03b`
 
-## 0. Response to Plan Review `review_1787279337_548281`
+## 0a. Response to Plan Review `review_1787286846_900081` (revision 4)
+
+| Finding | Severity | Response |
+| --- | --- | --- |
+| `finding_1787286846_451794` — sibling already owns conformance 45 and package 0.1.40 | blocker | **Accepted and fixed.** Verified: `ticket_1787278643_145174` is in Implement (`run_1787282470_625000`, step `run_step_1787284582_430818`) on an approved plan that changes the same DTO, generated protocol, npm mirror, and support metadata. Dependency `dependency_1787286958_412779` is registered. Section 5 S6 point 5 now allocates **revision 46 and package 0.1.41 after that sibling merges**, subject to fresh registry and source checks. |
+| `finding_1787286846_827944` — `BTreeSet` violates the no-allocation event-path contract | blocker | **Accepted and fixed.** The reviewer is right: B-tree insertion calls the allocator and does variable comparison work on the accepted-event path, and revision 3 contradicted itself by claiming no per-event allocation. Section 5 S1a replaces it with a preallocated fixed-capacity tombstone ring whose accepted-event update is strictly constant with zero allocator calls. AC6 now counts real hot-path operations. |
+| `finding_1787286846_430720` — Web downstream proof invokes Cargo in a Node repository | high | **Accepted and fixed.** Verified: `botster-web` has no `Cargo.toml`; its `package.json` defines `test` as `check-daemon-protocol-drift.mjs` then `App.test.mjs`, plus `typecheck` and `build`. AC10 proof 4 now splits: scratch Cargo patch for `botster-tui` only, and repository-owned npm commands with `BOTSTER_HUB_CLIENT_DAEMON_PROTOCOL` for `botster-web`. |
+
+## 0b. Response to Plan Review `review_1787279337_548281` (revisions 2 and 3)
 
 | Finding | Severity | Response |
 | --- | --- | --- |
@@ -134,7 +142,7 @@ and never inside `RouterInner`. Contents:
 
 - `shed_by_reason`: a fixed `[AtomicU64; 12]` array indexed by an `EventPlaneStatus::index()` `const fn`.
   Every non-`Accepted` ingress status is counted, including `ShedFull` and `ShedBusy`. Fixed array, so no
-  map growth and no allocation per event.
+  map growth and no allocator call per event.
 - `admission_attempts`, `delivery_attempts`: `AtomicU64`.
 - `admission_latency`, `delivery_latency`: fixed-bucket histograms. Each is
   `{ buckets: [AtomicU64; 13], count: AtomicU64, sum_us: AtomicU64, max_us: AtomicU64 }`. The bucket index
@@ -147,40 +155,77 @@ and never inside `RouterInner`. Contents:
 - Typed timeout counters T1–T3 (see S3).
 - Oldest-age cells, redesigned in revision 2 (see S1a and S1b).
 
-**S1a. Oldest-age sources (fixes `finding_1787279337_990629`).**
+**S1a. Oldest-age sources (fixes `finding_1787279337_990629`, redesigned in revision 4 for
+`finding_1787286846_827944`).**
 Revision 1 claimed every queue has a head already in hand. That is true for consumer queues
 (`ConsumerQueue.copies: VecDeque`, `src/package_event_router.rs:202-207`) and for client mailboxes
 (`MailboxInner.events: VecDeque`, `src/daemon_event_subscriptions.rs:120-123`). It is **false for
 producers**: `ProducerOccupancy` (`:197-200`) holds only `events` and `bytes`, and `retire_holder_locked`
 (`:1338-1352`) removes envelopes from an unordered `HashMap` in arbitrary order.
 
-The fix adds one ordered field to the existing struct:
+Revision 2 proposed a `BTreeSet<u64>`. Plan Review rejected that, correctly: B-tree insertion calls the
+allocator and performs variable comparison work on the accepted-event path, which the ticket forbids.
+
+Revision 4 uses a **preallocated fixed-capacity tombstone ring** instead:
 
 ```rust
+struct ProducerAgeRing {
+    slots: Box<[u64]>,   // length = policy.producer_queue_max_events (default 256)
+    head: usize,
+    len: usize,
+}
+
 struct ProducerOccupancy {
     events: usize,
     bytes: usize,
-    live_envelope_ids: BTreeSet<u64>, // added
+    oldest: ProducerAgeRing, // added
 }
 ```
 
-`next_envelope` increases monotonically (`src/package_event_router.rs:227`, `:1348` region), so envelope-id
-order is enqueue order. The oldest live producer envelope is therefore
-`live_envelope_ids.first()`, and its age is `now - inner.envelopes[&id].enqueued_at`.
+`Envelope` gains `producer_slot: u32`, so retirement can find its own slot without searching.
 
-- Insert on the accepted-ingress path beside `producer.events += 1` (`:538-539`).
-- Remove in `retire_holder_locked` beside the existing producer decrement (`:1348-1351`).
-- Both operations are `O(log C)` where `C` is the fixed policy bound `producer_queue_max_events`. `C` does
-  not grow with load, so the per-event cost is constant with respect to what is being measured, which is
-  what `[[load diagnostics must not cost work proportional to what they measure]]` requires. **The plan
-  claims bounded `O(log C)`, not strict `O(1)`, for this one operation.** No lazy pruning loop and no scan
-  is introduced.
+**Accepted-event path — strictly constant, zero allocator calls.** Beside `producer.events += 1`
+(`src/package_event_router.rs:538-539`):
 
-Consumer and mailbox ages read their existing `VecDeque` front in `O(1)`.
+```text
+slot = (head + len) % cap
+slots[slot] = enqueued_nanos
+len += 1
+envelope.producer_slot = slot
+```
+
+That is one modulo, one store, one increment, and one field write. No allocation, no comparison, no
+traversal. Ingress already sheds when `producer.events + 1 > producer_queue_max_events`
+(`:481-482`), so the ring can never overflow and never needs to grow.
+
+**Retirement path — out-of-order safe, amortized constant.** Beside the producer decrement
+(`:1348-1351`):
+
+```text
+slots[envelope.producer_slot] = TOMBSTONE          // O(1), any order
+while len > 0 && slots[head] == TOMBSTONE {        // skip cleared slots
+    head = (head + 1) % cap
+    len -= 1
+}
+```
+
+Envelopes retire out of order because `retire_holder_locked` only removes an envelope when
+`remaining_holders` reaches zero. Tombstones handle that directly: the head advances only past cleared
+slots, so the oldest live entry is always at `head`. Each slot is written once, tombstoned once, and
+skipped at most once, so total ring work across `N` events is at most `3N` — **amortized constant, and the
+skip loop is on the retirement path, never on the accepted-event path.**
+
+**Allocation, stated precisely.** The ring is allocated exactly once per producer identity, when the
+`ProducerOccupancy` entry is created. At the default bound that is 256 × 8 bytes = 2 KB per admitted
+producer. **No allocator call occurs on any per-event path.** Revision 3 said "no allocation on any
+per-event path" while proposing a `BTreeSet`; that was self-contradictory and is corrected here.
+
+Consumer and mailbox ages read their existing `VecDeque` front in `O(1)` with no added structure.
 
 Each published age is stored in an `AgeCell`: one `AtomicU64` holding nanoseconds since a `base: Instant`
 captured at counter construction, with `u64::MAX` as the empty sentinel. Writers update the cell while
-they already hold the router or mailbox lock. Readers touch only the atomic.
+they already hold the router or mailbox lock, on push into an empty ring and after any head advance.
+Readers touch only the atomic.
 
 **S1b. Age-cell identity lifetime (fixes the second half of `finding_1787279337_990629`).**
 Revision 1 left the three identity maps with no removal rule. Revision 2 slaves each map to the live
@@ -188,7 +233,7 @@ identity set that already exists, and removes a cell at exactly the site that en
 
 | Map | Key | Insert site | Remove site |
 | --- | --- | --- | --- |
-| producer ages | package owner | first accepted ingress for that owner | `apply_unload` (`src/package_event_router.rs:1236-1256`), and when `live_envelope_ids` empties and the owner has no contract |
+| producer ages | package owner | first accepted ingress for that owner | `apply_unload` (`src/package_event_router.rs:1236-1256`), and when the age ring empties and the owner has no contract |
 | consumer ages | plugin key | first queued copy for that plugin key | `apply_unload` for that plugin key, and `unsubscribe` when the plugin key retains no subscription |
 | mailbox ages | connection id | mailbox creation | `cleanup_client_connection_locked` and the connection removals at `src/daemon_event_subscriptions.rs:434-437` and `:481` |
 
@@ -287,7 +332,7 @@ Charter: `[[botster-hub-client-playbook]]` owns this surface. Decisions made **a
    - `crates/botster-hub-client/generated/daemon-protocol.ts` (authoritative generated file, drift-checked
      at `crates/botster-hub-client/src/lib.rs:4392`)
    - `packages/hub-test-support/daemon-protocol.ts` and `packages/hub-test-support/index.d.ts` (npm mirror)
-   - `packages/hub-test-support/package.json` version, `0.1.39` → `0.1.40`, per
+   - `packages/hub-test-support/package.json` version, `0.1.39` → **`0.1.41`** (see point 5), per
      `[[Hub test support capability cutovers use a new unpublished package version]]`
    - `crates/botster-hub-test-support/src/lib.rs` asset and matrix paths (`:5302`, `:5324`)
    - `docs/client-protocol.md` — explicit client protocol documentation for the new field and revision
@@ -295,27 +340,42 @@ Charter: `[[botster-hub-client-playbook]]` owns this surface. Decisions made **a
    Rust field uses `skip_serializing_if`, per `[[generated typescript dtos must encode serde field optionality]]`,
    and the drift check must assert optionality per field, per
    `[[generated dto drift tests need symmetric field and type checks]]`.
-5. **Compatibility adjudication, settled from actual content.**
-   - `PROTOCOL_VERSION` stays **7**. Framing, request vocabulary, and response semantics are unchanged, and
-     an old client deserializes the response unchanged because the field is skipped when empty.
-   - `CONFORMANCE_FIXTURE_REVISION` moves **44 → 45**. Per
-     `[[daemon event shape changes bump conformance fixture revision not protocol version]]`, an additive
-     shape change that alters first-party fixture JSON and downstream deserialization expectations bumps
-     the revision. The generated TypeScript, the npm mirror, and the support matrix all change, so
-     downstream must notice. `ensure_compatible` treats the revision as a floor, so this is not a flag day.
-   - `DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION` stays **36**, per
-     `[[additive daemon capabilities do not raise the default client requirement]]`. No new operation-specific
-     requirement is introduced, because the field is a status projection rather than a capability.
-   - Revision allocation must be checked against published content before Implement commits `45`, per
-     `[[conformance fixture revisions must be unique per published content]]`.
+5. **Compatibility adjudication — human decision of record, plus sibling collision (revised in revision 4).**
 
-   **Stated conflict with the ticket.** Ticket item 5 says not to add a "conformance fixture revision bump
-   if the existing status path can carry them". The existing status path does carry the values, and no new
-   transport or request vocabulary is added, which is what that clause protects. The revision bump is a
-   separate downstream-drift signal that the repository convention requires whenever generated client
-   artifacts change. Plan chooses the convention and states the conflict rather than resolving it silently.
-   If Plan Review prefers the literal ticket clause, the alternative is to leave the values out of the
-   public DTO entirely, which would fail acceptance line 1.
+   **Human answer `question_1787286737_531685` settles the ticket-versus-convention conflict.** It reads:
+   authorize a conformance revision bump; the `botster-hub-client` convention controls because the ticket
+   changes the public `DaemonStatus` shape and generated client artifacts; do **not** hide the new fields
+   in an opaque map or alternate representation to preserve revision 44; update the Rust DTO, serialized
+   fixture, generated TypeScript, hub-test-support conformance data, documentation, and every revision
+   assertion together; and **publish no npm package without separate explicit authorization**. Ticket
+   item 5's prohibition is therefore overridden by an explicit human decision, not by planner judgement.
+
+   **Sibling collision, found by Plan Review `finding_1787286846_451794`.** The human answer named
+   revision 45 before the collision was known. Sibling Hub `ticket_1787278643_145174` is already in
+   Implement (run `run_1787282470_625000`, step `run_step_1787284582_430818`) on an approved plan that
+   cuts `CONFORMANCE_FIXTURE_REVISION` 45 and `@trybotster/hub-test-support` 0.1.40 for package notice
+   reactions, and it changes the same Hub client DTO, generated daemon protocol, npm mirror, support
+   metadata, and client documentation. Two active branches cannot claim the same immutable identity for
+   different bytes, per `[[conformance fixture revisions must be unique per published content]]`.
+
+   Resolution, applied here:
+   - **Dependency registered:** `dependency_1787286958_412779` makes this ticket depend on
+     `ticket_1787278643_145174`. This ticket rebases after that sibling merges.
+   - **Allocation moves above the sibling's merged identities:** `CONFORMANCE_FIXTURE_REVISION` **46** and
+     `@trybotster/hub-test-support` **0.1.41**. This preserves the human decision's substance — the client
+     convention controls and the bump happens — while honouring uniqueness. Implement records revision 46
+     as the first fixture containing the event-plane observability fields.
+   - **Fresh checks before writing either literal**, per assumption A9. If the sibling's merged numbers
+     differ, Implement recomputes rather than trusting these values.
+   - **No npm publication.** This ticket cuts the package version in-tree and performs no publish. The
+     human answer prohibits publication without separate explicit authorization, and
+     `script/publish-npm-packages` is not part of any acceptance check here.
+   - `PROTOCOL_VERSION` stays **7**. Framing, request vocabulary, and response semantics are unchanged,
+     and an old client deserializes the response unchanged because the field is skipped when empty.
+   - `DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION` stays **36**, per
+     `[[additive daemon capabilities do not raise the default client requirement]]`. No new
+     operation-specific requirement is introduced, because the field is a status projection rather than a
+     capability.
 
 **S7. Four `BOTSTER_ENV=test` gated seams (ticket item 7).** One `hub_test_seams()` reader placed beside
 `core_daemon_config` in `src/runtime.rs`, in the `BOTSTER_HUB_TEST_WORKER_EGRESS_CAPACITY` style at
@@ -350,6 +410,8 @@ Seam 2 removes the `#[cfg(test)]` unreachability recorded in
 - Repairing the router's own `inner.consumers` retention. The consumer age map is pruned independently.
 - Any change to retirement, gap delivery, shed decisions, or completion semantics. Observation only.
 - Committing anything to `botster-tui` or `botster-web`. AC10 uses scratch worktrees and removes them.
+- Publishing any npm package. Human answer `question_1787286737_531685` prohibits publication without
+  separate explicit authorization. This ticket cuts the in-tree version only.
 
 ## 6. Repository ownership boundaries and cross-repository dependencies
 
@@ -376,6 +438,11 @@ Seam 2 removes the `#[cfg(test)]` unreachability recorded in
 - **Data plane untouched.** No terminal bytes, scrollback, or per-client egress payload is inspected, per
   `[[botster data plane bypasses the hub through session and client actors]]`. T4 classifies an
   `io::ErrorKind` only; it never reads the frame body.
+- **Sibling dependency, registered in revision 4.** `dependency_1787286958_412779` makes this ticket
+  depend on Hub `ticket_1787278643_145174`, which is already in Implement and changes the same client DTO,
+  generated daemon protocol, npm mirror, support metadata, and client documentation. Both tickets target
+  the same repository, so this is an ordering edge inside `botster-hub`, not a cross-repository
+  prerequisite. This ticket rebases onto that sibling's merge and allocates above its identities.
 - **Consumer dependency edge.** `ticket_1786663585_879846` consumes this surface. The parent Plan Review
   states that this ticket's dependency edge must be restored before that ticket's Implement step.
   Restoring that edge is the parent run's action, so this plan adds and removes no dependency edge.
@@ -398,10 +465,11 @@ counter.
 
 **A4 — resolved in revision 2, no longer deferred.** The client contract decision is settled in S6:
 one new `#[non_exhaustive]` struct, one new `DaemonStatus` field, `PROTOCOL_VERSION` stays 7,
-`CONFORMANCE_FIXTURE_REVISION` moves to 45, `DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION` stays 36, npm
-package `0.1.39` → `0.1.40`. The remaining execution-time check is narrow: Implement must confirm that no
-published content already claims revision 45 before committing it, per
-`[[conformance fixture revisions must be unique per published content]]`.
+`CONFORMANCE_FIXTURE_REVISION` moves to **46**, `DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION` stays 36,
+npm package `0.1.39` → **`0.1.41`**, and no npm publication occurs. Revision 4 raised the numbers above
+sibling `ticket_1787278643_145174`, which already owns 45 and 0.1.40. The remaining execution-time check
+is in assumption A9: Implement rechecks the registry and the sibling's merged source before writing either
+literal, per `[[conformance fixture revisions must be unique per published content]]`.
 
 **A5.** Seam 4 holds the per-plugin Lua mutex for its bounded duration, so it serializes other invocations
 of the same plugin while held. That is acceptable for a test-only, clamped, `BOTSTER_ENV=test` seam, and it
@@ -416,10 +484,18 @@ describes the symptom; the smaller fix is at the existing write site.
 `CoreDaemonConfig`, so they are stored on Hub state while being read in one place beside
 `core_daemon_config`, in the style the ticket names. Only seam 2 sets a `CoreDaemonConfig` builder.
 
-**A8 — new in revision 2.** The producer age uses `BTreeSet<u64>` keyed by envelope id and relies on
-`next_envelope` being monotonic per router instance. Implement must confirm that no path reuses or resets
-an envelope id within one router lifetime. If ids can repeat, the age source must key on
-`(enqueued_nanos, envelope_id)` instead, at the same bounded cost.
+**A8 — rewritten in revision 4.** The producer age ring is indexed by slot, not by envelope id, so it no
+longer depends on envelope-id monotonicity. The revision 2 concern about id reuse is therefore moot. The
+remaining assumption is narrower: `Envelope.producer_slot` must be written on every accepted ingress and
+read on every retirement, and the ingress shed check at `src/package_event_router.rs:481-482` must remain
+the only path that admits an envelope into producer occupancy. Implement must confirm there is no second
+admission path that increments `producer.events` without pushing into the ring.
+
+**A9 — new in revision 4.** Conformance revision and package version allocation depends on sibling
+`ticket_1787278643_145174` merging first. If that sibling changes its own allocation before merge, or if
+`npm view @trybotster/hub-test-support versions` shows anything above `0.1.39` at Implement time, the
+numbers in S6 point 5 must be recomputed rather than taken from this plan. Implement performs a fresh
+registry and source check before writing either literal.
 
 ## 8. Affected surfaces and files
 
@@ -427,7 +503,7 @@ an envelope id within one router lifetime. If ids can repeat, the age source mus
 | --- | --- |
 | `src/event_plane_counters.rs` (new) | `EventPlaneCounters`, fixed histogram, `AgeCell`, identity maps, snapshot type |
 | `src/lib.rs` | register the new module and re-export the snapshot type |
-| `src/package_event_router.rs` | shed by typed reason, admission and delivery attempts, latencies, T2, `ProducerOccupancy.live_envelope_ids`, producer and consumer age cells, unload-time cell removal |
+| `src/package_event_router.rs` | shed by typed reason, admission and delivery attempts, latencies, T2, `ProducerOccupancy.oldest` age ring and `Envelope.producer_slot`, producer and consumer age cells, unload-time cell removal |
 | `src/daemon_event_subscriptions.rs` | overflow gap count, T3 mailbox-expiry count, mailbox age cell, cell removal on connection cleanup |
 | `src/daemon_maintenance.rs` | T1 typed completion counting; seam 3 for the two `timeout_ms` sites |
 | `src/daemon_transport.rs` | `EgressWriteClass` on `ControlMessage::EgressWriteFailed`, T4 in `record_egress_write_failure`, `enqueued_at` on `ControlMessage::Request` plus its two senders here, the owner-loop serve-site measurement, owner-turn recording, status projection |
@@ -435,10 +511,10 @@ an envelope id within one router lifetime. If ids can repeat, the age source mus
 | `src/runtime.rs` | `hub_test_seams()` and the four gated reads; seam 1 in `take_journal_advanced_wake`; counters accessor |
 | `src/lua_runtime.rs` | seam 4 hold before handler invocation |
 | `src/client_api.rs` | carry counters from `HubRuntime` to the client-API status body |
-| `crates/botster-hub-client/src/lib.rs` | `#[non_exhaustive] DaemonObservabilityCounters`, one new `DaemonStatus` field, `CONFORMANCE_FIXTURE_REVISION` 44 → 45 |
+| `crates/botster-hub-client/src/lib.rs` | `#[non_exhaustive] DaemonObservabilityCounters`, one new `DaemonStatus` field, `CONFORMANCE_FIXTURE_REVISION` 44 → 46 |
 | `crates/botster-hub-client/examples/generate_typescript.rs` | emit the new interface with optional property typing |
 | `crates/botster-hub-client/generated/daemon-protocol.ts` | regenerated authoritative artifact |
-| `packages/hub-test-support/daemon-protocol.ts`, `index.d.ts`, `package.json` | mirrored artifact and version `0.1.39` → `0.1.40` |
+| `packages/hub-test-support/daemon-protocol.ts`, `index.d.ts`, `package.json` | mirrored artifact and version `0.1.39` → `0.1.41`, cut in-tree with no publish |
 | `crates/botster-hub-test-support/src/lib.rs` | support-matrix and asset expectations for the new revision |
 | `docs/client-protocol.md` | document the new status field and the revision bump |
 | `README.md` | status-surface documentation, if that surface is documented there |
@@ -447,7 +523,8 @@ an envelope id within one router lifetime. If ids can repeat, the age source mus
 ## 9. Risks
 
 - **R1. Observer changes the load class.** Mitigated by fixed arrays, `leading_zeros` bucket selection,
-  no allocation on any per-event path, a policy-bounded `BTreeSet`, and the AC6 work-bound test.
+  a preallocated fixed-capacity tombstone ring with zero allocator calls on any per-event path, and the
+  AC6 hot-path operation-count test.
 - **R2. A second lock replaces the first.** The age maps carry their own `RwLock`. Writers hold it for one
   atomic store, and readers never touch the router mutex. AC4 proves the read path returns values while
   the router lock is held.
@@ -462,7 +539,10 @@ an envelope id within one router lifetime. If ids can repeat, the age source mus
   visibility.
 - **R7 (new).** Diagnostic identity maps could still grow under churn if a removal site is missed. AC11 is
   the direct control, and it must be shown red against a deliberately omitted removal.
-- **R8 (new).** `enqueued_at` becomes a required field on an internal enum variant with three production
+- **R9 (new in revision 4).** The sibling `ticket_1787278643_145174` could change its own conformance or
+  package allocation before merging, which would invalidate 46 and 0.1.41. Assumption A9 requires a fresh
+  check at Implement rather than trusting these literals.
+- **R8.** `enqueued_at` becomes a required field on an internal enum variant with three production
   senders and six test constructions. A missed site is a compile error rather than a silent default, which
   is deliberate: the field must not have a `Default`.
 
@@ -492,11 +572,23 @@ record the failing output **before** the change, per
 - **AC5 — seam inertness.** Four negative tests, one per seam, in the exact style of
   `client_event_queue_max_override_requires_test_mode` (`src/daemon_event_subscriptions.rs:914`): each
   asserts `Some(value)` for `("test", raw)` and `None` for `("production", raw)` and `(None, raw)`.
-- **AC6 — bounded diagnostic cost, red first, work-bound not wall-clock.** A test asserts that recording
-  `N = 1` and `N = 10_000` observations performs the same bounded work per observation: the histogram
-  bucket-selection step count stays exactly one per observation for every input magnitude, and the
-  producer `live_envelope_ids` length never exceeds the fixed `producer_queue_max_events` policy bound.
-  Implement must first demonstrate it red against a deliberately scanning bucket search.
+- **AC6 — hot-path work bound, red first, operation-count not wall-clock (strengthened in revision 4).**
+  Plan Review noted that a length assertion cannot detect allocation or comparison growth. AC6 now counts
+  the actual hot-path operations through a `#[cfg(test)]` probe counter incremented by each ring and
+  histogram primitive:
+  1. **Constant accepted-event cost.** The recorded operation count for one accepted-event ring push is
+     identical for `N = 1` and `N = 10_000`, and identical at every ring occupancy from empty to the
+     policy bound. A `BTreeSet` or any comparison-based structure fails this assertion, which is what
+     makes it a real control rather than a restatement.
+  2. **No reallocation.** The ring's data pointer and capacity, captured after first producer
+     registration, are unchanged after `N` events. This proves no allocator call grew the structure.
+  3. **Bounded retirement.** Total head-advance skips across `N` accepted-and-retired events is at most
+     `N`, and total ring operations at most `3N`, including a case that retires envelopes in reverse
+     order to exercise tombstones.
+  4. **Constant histogram cost.** The bucket-selection step count is exactly one per observation for every
+     input magnitude, including the minimum, the overflow bucket, and every power-of-two boundary.
+  Implement must first demonstrate AC6 red against a deliberately scanning bucket search and against a
+  comparison-based producer age source.
 - **AC7 — invariants unchanged.** Existing owner-turn and ready-operation tests stay green, and a diff
   review confirms no constant listed in ticket item 8 changed.
 - **AC8 — content blindness.** The three architecture tests stay green:
@@ -513,18 +605,28 @@ record the failing output **before** the change, per
   1. **Wire proof.** A serde test shows an old-shaped `DaemonStatus` JSON without the new key still
      deserializes, and that an empty `observability` value is omitted from the serialized frame.
   2. **Protocol-versus-revision proof.** Assert exact `PROTOCOL_VERSION` equality is unaffected, and that a
-     client pinned to minimum revision 36 accepts a Hub reporting 45, per
+     client pinned to minimum revision 36 accepts a Hub reporting 46, per
      `[[daemon event shape changes bump conformance fixture revision not protocol version]]`.
   3. **Generated-artifact proof.** The generated TypeScript drift check
      (`crates/botster-hub-client/src/lib.rs:4392`) passes, the new property is typed **optional**, and the
-     `packages/hub-test-support` mirror plus `package.json` version `0.1.40` match the generated bytes.
-     Include an installed-artifact smoke, per `[[hub test support npm releases need external consumer smoke]]`.
-  4. **Downstream source proof.** Scratch Cargo patch redirect against `botster-tui` and `botster-web`
-     worktrees with a separate `CARGO_TARGET_DIR`, running `cargo check --workspace` and
-     `cargo check --workspace --all-targets`, per
-     `[[scratch cargo patch redirects measure downstream dto breakage]]`. Record the exact failure list.
-     Expected: one `cfg(test)` helper in `botster-tui`. Remove the scratch worktrees afterwards and commit
-     nothing to either consumer.
+     `packages/hub-test-support` mirror plus `package.json` version `0.1.41` match the generated bytes.
+     Include an installed-artifact smoke against the locally packed tarball, per
+     `[[hub test support npm releases need external consumer smoke]]`. No npm publish occurs.
+  4. **Downstream source proof, split by repository language (corrected in revision 4).** Revision 3 ran
+     Cargo in both consumers. `botster-web` has no `Cargo.toml`; it is a Node and TypeScript repository.
+     - **`botster-tui` (Rust).** Scratch worktree with a temporary `[patch."<git url>"]` redirect to this
+       candidate checkout and a separate `CARGO_TARGET_DIR`, running `cargo check --workspace` and
+       `cargo check --workspace --all-targets`, per
+       `[[scratch cargo patch redirects measure downstream dto breakage]]`. Record the exact failure list.
+       Expected: one `cfg(test)` helper at `crates/botster-tui/src/app.rs:26139`.
+     - **`botster-web` (Node and TypeScript).** Scratch worktree pointed at the candidate generated file
+       through `BOTSTER_HUB_CLIENT_DAEMON_PROTOCOL`, which
+       `scripts/check-daemon-protocol-drift.mjs:8` accepts as a local override, or through the locally
+       packed `@trybotster/hub-test-support` tarball. Then run the repository-owned commands
+       `npm test` (which runs `check-daemon-protocol-drift.mjs` and then `src/App.test.mjs`),
+       `npm run typecheck`, and `npm run build`, per
+       `[[botster web generated protocol drift checks need explicit hub artifact paths]]`.
+     - Remove both scratch worktrees afterwards and commit nothing to either consumer.
 - **AC11 — diagnostic identity retirement, red first (new in revision 2).** Tests prove each age map
   returns to the live-identity bound after: package unload, client unsubscribe, connection cleanup, and a
   reconnect-churn loop that creates and destroys many connection ids. The churn case must fail when a
@@ -566,7 +668,16 @@ integration tests, the repository lifecycle suite, and scratch consumer `cargo c
    repeated-observation tests cannot detect.
 5. **The observation-versus-behavior split** used for T1: reading a discriminant that was previously
    discarded closes a correctness gap without changing retirement. That pattern is likely to recur.
-6. **Correcting a stale in-repository assumption** — an in-repository workspace member can still be an
+6. **Concurrent branches can collide on an immutable published identity.** Two active Hub tickets each
+   selected conformance revision 45 and package 0.1.40 for different bytes, and neither registry history
+   nor a source grep would have caught it, because both were unmerged. The durable lesson is that
+   conformance and package allocation must check active sibling *runs*, not only published history.
+   `[[conformance fixture revisions must be unique per published content]]` covers merged branches; this
+   is the in-flight case.
+7. **A downstream consumer's proof commands follow its language, not the provider's.** Revision 3 planned
+   `cargo check` against `botster-web`, which is a Node and TypeScript repository. A provider-side DTO
+   plan must resolve each consumer's own test commands before naming them.
+8. **Correcting a stale in-repository assumption** — an in-repository workspace member can still be an
    external contract surface. Revision 1 used crate location to skip a charter, which the Hub charter's
    "does not own" list already forbids.
 
