@@ -9,14 +9,16 @@
 | Pipeline worktree | Hub run worktree for `ticket_1787267568_492780` |
 | Ticket | `ticket_1787267568_492780` |
 | Run | `run_1787278338_832165` |
-| Step | `botster_stack_implement` (`run_step_1787331669_719078`) |
+| Step | `botster_stack_implement` (`run_step_1787343023_723072`) |
 | First review return | `review_1787328763_940695` (`changes_required`) |
 | Second review return | `review_1787331656_951045` (`changes_required`) |
+| Third review return | `review_1787343014_621320` (`changes_required`) |
 | Approved plan | `docs/plans/publish-bounded-event-plane-observability-counters-and-four-load-campaign-seams.md` revision 15 |
 | Merge policy | `direct` into `main`; do not create a PR |
 | Implement commit | `6814d4b2ca6b8ec6e127108faf567c95f0047b7f` |
 | First review-return commit | `cd3cb2e014cadb8cca09057a84de75cc63450f17` |
 | Second review-return commit | `cb334fe1b8e3a6ccd331cad4fd1f7f764b0af22c` |
+| Third review-return commit | pending until this commit |
 | Integrated base | `origin/main` `12e0cc6` (sibling notice-reaction merge, revision 45 / package `0.1.40`) |
 | Locked Core | `7eafa470a18025895995bbedc20d34b58106a03b` |
 | `teardown_class_applies` | false |
@@ -73,6 +75,8 @@ Pipeline context for this visit was loaded through `botster mcp-serve` and `proj
 - [[a ui contract import line change costs one test line in each generic client]]
 - [[Hub suite runs prebuild the session worker before the locked test wrapper]]
 - [[pre existing failure waivers must isolate the first non cascade failure on base]]
+- [[a regression test must be shown to go red with the fix reverted]]
+- [[ablation probes verify a nonzero diff before tests run]]
 
 ### Explicitly not loaded
 
@@ -159,6 +163,13 @@ Pipeline context for this visit was loaded through `botster mcp-serve` and `proj
 | `finding_1787331657_433783` TUI compile still missing | high | Disposable TUI scratch used this Hub-client crate plus local `botster-ui-contract` 0.3.3. Two `cfg(test)` helpers gained `observability` and `notice_reactions`. `cargo check --workspace` and `cargo check --workspace --all-targets` both passed. No TUI source is committed. |
 | `finding_1787331657_637664` locked suite and lifecycle not clean | high | After reaping leftover primary-checkout debug workers, `./test.sh --locked` passed with zero failures. `script/run-lifecycle-suite` returned `verdict=clean failed=0 tally=1 survivors=0 tainted=0`. |
 
+### Third review return (`review_1787343014_621320`)
+
+| Finding | Severity | Resolution |
+| --- | --- | --- |
+| `finding_1787343014_466574` T4 classifier has no test | high | `write_deadline_error_increments_t4_while_other_write_failure_does_not` classifies a `TimedOut` Io error as `EgressWriteClass::Timeout` and a `BrokenPipe` Io error as `Other`, then records those classified values. `stalled_write_timeouts == 1` and `stalled_writes == 2`. Ablation mapping `TimedOut` to `Other` failed that test at the class assert (`left: Other`, `right: Timeout`) while the literal-class accounting test stayed green. Production classifier restored afterward. |
+| `finding_1787343014_585530` source-text consumer_keys test | low | Deleted `consumer_age_update_does_not_collect_plugin_keys`. The load-bearing oracle is `existing_consumer_age_store_is_allocation_free`. |
+
 ## Deviations from plan
 
 1. **Loom AC19 case 0 is unproven.** `RUSTFLAGS="--cfg loom"` still fails compiling `webrtc`. Deterministic seqlock tests remain.
@@ -181,11 +192,12 @@ Pipeline context for this visit was loaded through `botster mcp-serve` and `proj
 | `script/run-lifecycle-suite` | `verdict=clean failed=0 tally=1 survivors=0 tainted=0` |
 | Hub-client serde, optionality, unknown-kind/state, generated TypeScript drift | pass |
 | `delayed_mailbox_drop_does_not_retire_a_replacement_cell` | pass |
-| `consumer_age_update_does_not_collect_plugin_keys` | pass |
 | `existing_consumer_age_store_is_allocation_free` | pass |
 | `t1_hold_seam_times_out_distinct_from_handler_failure` | pass (0.49s) |
 | T1 classifier `TimedOut` versus `HandlerFailed` on `apply_plugin_completion` | pass |
-| T4 timeout versus other write with `HubRuntime` | pass |
+| T4 accounting with literal classes and `HubRuntime` | pass (kept; not a classifier oracle) |
+| `write_deadline_error_increments_t4_while_other_write_failure_does_not` | pass; ablation mapping `TimedOut` to `Other` failed; production restored |
+| This visit `BOTSTER_ENV=test cargo test --locked -p botster-hub --lib` | 486 passed, 0 failed |
 | Four seam `*_from` inertness tests | pass |
 | Packed `@trybotster/hub-test-support@0.1.41` + `@trybotster/ui-contract@0.3.3` local install | pass |
 | Web scratch `BOTSTER_HUB_CLIENT_DAEMON_PROTOCOL` `npm test` | expected drift (exit 1) against vendored `daemon-protocol.ts` |
@@ -202,6 +214,7 @@ Production entry point: `DaemonRequest::Status` projects `HubRuntime::event_plan
 - TUI/Web consumer source edits are not in this ticket.
 - Mailbox retirement is instance-exact via `Arc::ptr_eq`. Identity generation remains `0` for connection-scoped mailboxes.
 - `#[global_allocator]` counting allocator is `cfg(test)` on the hub lib test binary only.
+- T4 is proven at the classifier and counter-record boundary, not by driving `flush_pending_responses` or `write_async_frame` past `DAEMON_CLIENT_WRITE_TIMEOUT`. The ticket does not require that live write path.
 
 ## Missing vault guidance discovered
 

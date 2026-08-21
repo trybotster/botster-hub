@@ -3537,24 +3537,6 @@ mod tests {
     }
 
     #[test]
-    fn consumer_age_update_does_not_collect_plugin_keys() {
-        let source = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/package_event_router.rs"
-        ));
-        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
-        let ingress = production
-            .split("fn try_ingress_now")
-            .nth(1)
-            .and_then(|rest| rest.split("fn take_delivery_wake").next())
-            .unwrap_or(production);
-        assert!(
-            !ingress.contains("consumer_keys"),
-            "try_ingress_now must not allocate a plugin-key vec for age updates"
-        );
-    }
-
-    #[test]
     fn existing_consumer_age_store_is_allocation_free() {
         let router = router();
         router
