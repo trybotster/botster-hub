@@ -18,8 +18,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use botster_core::SessionId;
 use botster_core::{
     BoundaryJson, PluginAdmissionResult, PluginHandlerKind, PluginHandlerRef,
-    PluginInvocationClass, PluginInvocationContext, PluginInvocationRequest,
-    PluginInvocationResult, RequestId,
+    PluginInvocationClass, PluginInvocationContext, PluginInvocationFailureKind,
+    PluginInvocationRequest, PluginInvocationResult, RequestId,
 };
 use botster_core_daemon::{
     LifecycleBaselineBudget, ObserveLifecycleBudget, ObserveLifecycleCursor,
@@ -1118,7 +1118,10 @@ fn run_host_bridge_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
         PluginInvocationRequest {
             request_id: request_id.clone(),
             handler,
-            timeout_ms: 1_000,
+            timeout_ms: runtime
+                .test_seams()
+                .event_invocation_timeout_ms
+                .unwrap_or(1_000),
             context: PluginInvocationContext {
                 client_id: None,
                 session_id: None,
@@ -1271,7 +1274,10 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
             PluginInvocationRequest {
                 request_id: request_id.clone(),
                 handler: handler.handler,
-                timeout_ms: 1_000,
+                timeout_ms: runtime
+                    .test_seams()
+                    .event_invocation_timeout_ms
+                    .unwrap_or(1_000),
                 context: PluginInvocationContext {
                     client_id: None,
                     session_id: None,
@@ -1326,6 +1332,34 @@ fn run_completion_drain_slice(runtime: &HubRuntime, state: &mut MaintenanceState
             PluginInvocationResult::Completed(success) => success.request_id.clone(),
             PluginInvocationResult::Failed(failure) => failure.request_id.clone(),
         };
+        if state.event_in_flight.contains_key(&request_id.0) {
+            match &completion.result {
+                PluginInvocationResult::Completed(_) => {
+                    runtime.event_plane_counters().record_handler_completed_ok();
+                }
+                PluginInvocationResult::Failed(failure) => match failure.kind {
+                    PluginInvocationFailureKind::TimedOut => {
+                        runtime.event_plane_counters().record_handler_timed_out();
+                    }
+                    PluginInvocationFailureKind::HandlerFailed => {
+                        runtime.event_plane_counters().record_handler_failed();
+                    }
+                    PluginInvocationFailureKind::Cancelled => {
+                        runtime.event_plane_counters().record_handler_cancelled();
+                    }
+                    PluginInvocationFailureKind::Backpressured => {
+                        runtime
+                            .event_plane_counters()
+                            .record_handler_backpressured();
+                    }
+                    PluginInvocationFailureKind::WorkerStopped => {
+                        runtime
+                            .event_plane_counters()
+                            .record_handler_worker_stopped();
+                    }
+                },
+            }
+        }
         if let Some(mut flight) = state.event_in_flight.remove(&request_id.0) {
             if !retire_event_holder(runtime, &mut flight) {
                 queue_event_retirement(state, flight);

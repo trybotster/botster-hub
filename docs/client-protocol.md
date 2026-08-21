@@ -41,7 +41,7 @@ Node-based first-party clients can consume the same checked artifact without a
 sibling hub checkout through the public package:
 
 ```sh
-npm install --save-dev @trybotster/ui-contract@0.3.3 @trybotster/hub-test-support@0.1.40
+npm install --save-dev @trybotster/ui-contract@0.3.3 @trybotster/hub-test-support@0.1.41
 ```
 
 ```js
@@ -124,7 +124,7 @@ The current descriptor includes:
 - supported features: sessions, session and plugin entity subscriptions, terminal streaming, resize, terminal readback,
   plugin surface render, plugin surface action dispatch, package navigation
   discovery, and hub-owned spawn targets;
-- conformance fixture revision 45.
+- conformance fixture revision 46.
 
 `DaemonPackage.notice_reactions` is an additive optional field. Empty vectors
 are omitted on the wire. Each projected descriptor always carries a required
@@ -249,6 +249,16 @@ subscription current/high-water values, reconnect registrations, cleanup
 outcomes/reasons, reconciliation wake/change/baseline/resync/drain work,
 entity delivery attempts/outcomes, and stalled writes. It never contains
 connection, session, subscription, path, command, or payload identifiers.
+
+`DaemonStatus.observability` is optional and omitted when empty. Conformance
+fixture revision 46 adds this field. Protocol version stays 7. The object
+carries event-plane shed/gap/latency/timeout counters, owner-turn and
+ready-operation-wait durations, `stalled_write_timeouts` as the timeout subset
+of `lifecycle_counters.stalled_writes`, and `queue_ages` rows. Each age row is
+a bounded diagnostic observation with distinct `usable`, `empty`, and
+`indeterminate` states. `queue_count` is present only on a validated bracket.
+`oldest_age_us`, `producer_generation`, and `queue_count` are optional on the
+wire. Unknown future `kind` and `state` values deserialize as `unknown`.
 
 `DaemonStatus.live_attach_occupancy` is the public named occupancy oracle. A
 sibling Unix client reads it with only `botster-hub-client`. Each row is
@@ -1435,7 +1445,7 @@ Node client tests should use the declared npm dependency instead of a relative
 hub checkout:
 
 ```sh
-npm install --save-dev @trybotster/ui-contract@0.3.3 @trybotster/hub-test-support@0.1.40
+npm install --save-dev @trybotster/ui-contract@0.3.3 @trybotster/hub-test-support@0.1.41
 ```
 
 ```js
