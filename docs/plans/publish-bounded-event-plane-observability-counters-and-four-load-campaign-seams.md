@@ -670,6 +670,12 @@ registry and source check before writing either literal.
 - **R1. Observer changes the load class.** Mitigated by fixed arrays, `leading_zeros` bucket selection,
   an intrusive age list over preallocated slots with strict `O(1)` push and removal and zero allocator
   calls on any event path, and the AC6 allocation control plus operation counts.
+- **R10 (added to the plan in revision 10).** The sibling dependency re-registration required before
+  Implement could be forgotten, which would let this ticket write conformance revision 46 and package
+  0.1.41 against an unmerged sibling that still owns 45 and 0.1.40. Section 14 names the exact call, and
+  gate evidence repeats it. **I cited R10 in revision 8 and revision 9 gate evidence while it was absent
+  from the plan file; this verification pass caught that, and it is the same class of error as the AC11
+  claim recorded in section 0z.**
 - **R11 (new in revision 6).** A diagnostic structure can silently lose a live entry when its own
   occupancy accounting diverges from `producer.events`. That is exactly how the revision 4 tombstone ring
   failed review. AC13 is the direct control and must be shown red against that ring.
