@@ -546,6 +546,26 @@ impl EventPlaneCounters {
         }
     }
 
+    /// Retire only this cell instance. A delayed drop of an older mailbox Arc
+    /// must not close a replacement cell registered under the same identity.
+    pub fn retire_cell(&self, identity: &AgeIdentity, cell: &Arc<QueueAgeMetric>) {
+        let Ok(mut registry) = self.registry.write() else {
+            return;
+        };
+        let Some(entry) = registry.get_mut(identity) else {
+            return;
+        };
+        let Some(registered) = &entry.cell else {
+            return;
+        };
+        if !Arc::ptr_eq(registered, cell) {
+            return;
+        }
+        entry.retired = true;
+        registered.store(0, EMPTY_OLDEST, 0, false);
+        registered.close_writes();
+    }
+
     pub fn prune_retired(&self) {
         let Ok(mut registry) = self.registry.write() else {
             return;

@@ -555,6 +555,11 @@ impl HubRuntime {
         &self.test_seams
     }
 
+    #[cfg(test)]
+    pub fn test_set_seams(&mut self, seams: HubTestSeams) {
+        self.test_seams = seams;
+    }
+
     #[must_use]
     pub fn causal_scopes(&self) -> &Arc<crate::package_event_router::CausalScopeTable> {
         &self.causal_scopes

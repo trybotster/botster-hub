@@ -639,20 +639,8 @@ impl PackageEventRouter {
         let producer = inner.producer.entry(caller_owner.to_string()).or_default();
         producer.events += 1;
         producer.bytes += size;
-        let mut consumer_keys = Vec::new();
         for subscription in accepted {
-            let plugin_key = subscription.plugin_key.clone();
-            let consumer = inner.consumers.entry(plugin_key.clone()).or_default();
-            consumer.events += 1;
-            consumer.bytes += size;
-            consumer.copies.push_back(QueuedCopy {
-                envelope_id,
-                holder: subscription,
-            });
-            consumer_keys.push(plugin_key);
-        }
-        for plugin_key in consumer_keys {
-            update_consumer_age(&mut inner, &plugin_key, &self.counters);
+            enqueue_consumer_copy(&mut inner, &self.counters, envelope_id, size, subscription);
         }
         drop(inner);
         self.delivery_wake.store(true, Ordering::SeqCst);
@@ -974,6 +962,12 @@ impl PackageEventRouter {
         lock_inner(&self.inner)
             .map(|inner| inner.outstanding_pulls.len())
             .unwrap_or(usize::MAX)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_refresh_consumer_age(&self, plugin_key: &str) {
+        let mut inner = lock_inner(&self.inner).expect("test refresh must lock");
+        update_consumer_age(&mut inner, plugin_key, &self.counters);
     }
 
     #[cfg(test)]
@@ -1541,6 +1535,51 @@ fn reserve_producer_age(
             counters.record_age_sample_failure();
             None
         }
+    }
+}
+
+fn enqueue_consumer_copy(
+    inner: &mut RouterInner,
+    counters: &EventPlaneCounters,
+    envelope_id: u64,
+    size: usize,
+    subscription: EventSubscription,
+) {
+    if !inner.consumers.contains_key(&subscription.plugin_key) {
+        inner
+            .consumers
+            .insert(subscription.plugin_key.clone(), ConsumerQueue::default());
+    }
+    let (front_id, count, cell, gate) = {
+        let consumer = inner
+            .consumers
+            .get_mut(&subscription.plugin_key)
+            .expect("consumer queue exists");
+        consumer.events += 1;
+        consumer.bytes += size;
+        consumer.copies.push_back(QueuedCopy {
+            envelope_id,
+            holder: subscription,
+        });
+        (
+            consumer.copies.front().map(|copy| copy.envelope_id),
+            consumer.events as u64,
+            consumer.age_cell.clone(),
+            consumer
+                .age_cell
+                .as_ref()
+                .map(|cell| cell.gate())
+                .unwrap_or(0),
+        )
+    };
+    let oldest = front_id
+        .and_then(|envelope_id| inner.envelopes.get(&envelope_id))
+        .map(|envelope| counters.nanos_of(envelope.enqueued_at))
+        .unwrap_or(u64::MAX);
+    if let Some(cell) = cell {
+        cell.store(count, oldest, gate, false);
+    } else {
+        counters.record_age_sample_failure();
     }
 }
 
@@ -3495,6 +3534,49 @@ mod tests {
             .into_iter()
             .find(|row| row.kind == DaemonQueueKind::Consumer && row.identity == identity)
             .expect("consumer row")
+    }
+
+    #[test]
+    fn consumer_age_update_does_not_collect_plugin_keys() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/package_event_router.rs"
+        ));
+        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let ingress = production
+            .split("fn try_ingress_now")
+            .nth(1)
+            .and_then(|rest| rest.split("fn take_delivery_wake").next())
+            .unwrap_or(production);
+        assert!(
+            !ingress.contains("consumer_keys"),
+            "try_ingress_now must not allocate a plugin-key vec for age updates"
+        );
+    }
+
+    #[test]
+    fn existing_consumer_age_store_is_allocation_free() {
+        let router = router();
+        router
+            .try_register_contracts(vec![sample_contract("producer", "sample.ready")])
+            .expect("register");
+        subscribe(&router, "consumer", "producer", "sample.ready");
+        assert_eq!(
+            router.try_ingress(
+                "producer",
+                "sample.ready",
+                &serde_json::json!({ "ok": true }),
+                Instant::now()
+            ),
+            EventPlaneStatus::Accepted
+        );
+        let guard = crate::event_plane_counters::alloc_scope::AllocGuard::enter();
+        router.test_refresh_consumer_age("consumer");
+        assert_eq!(
+            guard.count(),
+            0,
+            "refreshing an existing consumer age cell must not allocate"
+        );
     }
 
     #[test]

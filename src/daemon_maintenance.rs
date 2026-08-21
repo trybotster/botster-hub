@@ -3840,6 +3840,121 @@ return botster.register({})
         let _ = std::fs::remove_dir_all(data_directory);
     }
 
+    fn install_lua_event_plugin(
+        name: &str,
+        lua: &str,
+    ) -> (crate::packages::PackageRegistry, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "hub-event-lua-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create lua event plugin root");
+        std::fs::write(root.join("plugin.lua"), lua).expect("write lua event plugin");
+        std::fs::write(
+            root.join("botster-package.json"),
+            serde_json::json!({
+                "name": "event-probe.plugin",
+                "version": "1.0.0",
+                "kind": "plugin",
+                "botster": ">=0.1.0",
+                "source": { "type": "path", "path": root.display().to_string() },
+                "capabilities": [],
+                "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+            })
+            .to_string(),
+        )
+        .expect("write lua event manifest");
+        let mut policy = crate::default_package_policy();
+        policy
+            .install_local_path(&root, "install lua event package")
+            .expect("install lua event package");
+        policy
+            .enable("event-probe.plugin", "enable lua event package")
+            .expect("enable lua event package");
+        (policy.registry().clone(), root)
+    }
+
+    fn drain_event_flights(runtime: &HubRuntime, state: &mut MaintenanceState) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline
+            && (!state.event_in_flight.is_empty() || !state.pending_retirements.is_empty())
+        {
+            run_completion_drain_slice(runtime, state);
+            if !state.event_in_flight.is_empty() || !state.pending_retirements.is_empty() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    #[test]
+    fn t1_hold_seam_times_out_distinct_from_handler_failure() {
+        let hold_lua = r#"
+events.on("hub", "worktree_created", function(event)
+  return { received = event.event }
+end)
+return botster.register({})
+"#;
+        let fail_lua = r#"
+events.on("hub", "worktree_created", function(event)
+  error("handler boom")
+end)
+return botster.register({})
+"#;
+
+        let (timeout_registry, timeout_root) = install_lua_event_plugin("t1-hold", hold_lua);
+        let (mut timeout_runtime, timeout_dir) = event_delivery_runtime("t1-hold");
+        timeout_runtime.test_set_seams(crate::runtime::HubTestSeams {
+            event_invocation_timeout_ms: crate::runtime::event_invocation_timeout_ms_from(
+                Some("test"),
+                Some("30"),
+            ),
+            event_handler_hold_ms: crate::runtime::event_handler_hold_ms_from(
+                Some("test"),
+                Some("250"),
+            ),
+            ..crate::runtime::HubTestSeams::default()
+        });
+        timeout_runtime
+            .load_lua_plugin_package(&timeout_registry, "event-probe.plugin")
+            .expect("load hold plugin");
+        ingress_worktree_created(&timeout_runtime);
+        let mut timeout_state = MaintenanceState::default();
+        run_package_event_delivery_slice(&timeout_runtime, &mut timeout_state);
+        assert_eq!(timeout_state.event_in_flight.len(), 1);
+        drain_event_flights(&timeout_runtime, &mut timeout_state);
+        let timeout_snap = timeout_runtime.event_plane_counters_snapshot();
+        assert_eq!(timeout_snap.event_handler_timed_out, 1);
+        assert_eq!(timeout_snap.event_handler_failed, 0);
+        assert_eq!(timeout_snap.event_handler_cancelled, 0);
+        assert_eq!(timeout_snap.event_handler_backpressured, 0);
+        assert_eq!(timeout_snap.event_handler_worker_stopped, 0);
+
+        let (fail_registry, fail_root) = install_lua_event_plugin("t1-fail", fail_lua);
+        let (mut fail_runtime, fail_dir) = event_delivery_runtime("t1-fail");
+        fail_runtime
+            .load_lua_plugin_package(&fail_registry, "event-probe.plugin")
+            .expect("load fail plugin");
+        ingress_worktree_created(&fail_runtime);
+        let mut fail_state = MaintenanceState::default();
+        run_package_event_delivery_slice(&fail_runtime, &mut fail_state);
+        assert_eq!(fail_state.event_in_flight.len(), 1);
+        drain_event_flights(&fail_runtime, &mut fail_state);
+        let fail_snap = fail_runtime.event_plane_counters_snapshot();
+        assert_eq!(fail_snap.event_handler_timed_out, 0);
+        assert_eq!(fail_snap.event_handler_failed, 1);
+        assert_eq!(fail_snap.event_handler_cancelled, 0);
+
+        let _ = std::fs::remove_dir_all(timeout_root);
+        let _ = std::fs::remove_dir_all(timeout_dir);
+        let _ = std::fs::remove_dir_all(fail_root);
+        let _ = std::fs::remove_dir_all(fail_dir);
+    }
+
     fn event_failure_completion(
         request_id: &str,
         kind: PluginInvocationFailureKind,
