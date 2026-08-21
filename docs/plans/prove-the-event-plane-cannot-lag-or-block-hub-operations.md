@@ -7,6 +7,14 @@ Pipeline: `botster_stack_delivery` (direct merge, no PR)
 Project: `project_1786663508_823105` Botster Non-Blocking Event Plane, Stage D
 Vault checklist: `checklist_1787266824_449406` (ticket scope, one Plan visit)
 
+## Plan revision 5
+
+Revision 5 answers Plan Review `review_1787271799_830342` (`changes_required`, one finding, no blocker). The finding was correct.
+
+| Finding | Class | Correction |
+| --- | --- | --- |
+| `finding_1787271799_979271` Failed operation cycles can be omitted without failing acceptance | high / product | Revision 4 said a failed cycle contributes no latency sample and stopped there. That let a failed `Spawn`, `Attach`, `Drain`, `Input`, `Resize`, MCP, UI, entity, or `Shutdown` vanish from latency and only reduce throughput, where the `T` = 0.80 floor could absorb up to a fifth of the work, and a calibration run could bake its own failures into a low floor. New section 5A.2.1 records every attempted operation with its outcome, reports attempts, successes, and failures per operation, and makes any unexpected error, request timeout, disconnect, incomplete response, or incomplete cycle an **immediate `product_failure` in calibration and acceptance alike**. Percentiles still use successful samples only, which is now safe because one failure already fails the run. Section 5A.5 and section 12.4 carry the rule, and R18 records the trap. Measurement arms run no fault injection, so typed shed and gap results remain expected only inside the section 12.5 fault lanes, never on the nine measured operations. |
+
 ## Plan revision 4
 
 Revision 4 answers Plan Review `review_1787271188_552110` (`changes_required`, three findings). All three were correct.
@@ -309,7 +317,7 @@ Every value below is fixed by this reviewed plan. Neither calibration nor accept
 | --- | --- |
 | Driver concurrency | 4 workers, closed loop, well below `DAEMON_MAX_CONNECTIONS` 64 |
 | Cycle | each worker repeats one fixed 9-operation cycle in this exact order against its own churn session: `Spawn`, `Attach`, `Drain`, `Input`, `Resize`, MCP, UI, entity read, `Shutdown` |
-| Samples per cycle | exactly one per operation; a cycle that fails any step is recorded as a failed cycle and contributes no latency sample |
+| Samples per cycle | exactly one per operation. Every attempt is recorded with its outcome. A latency sample is kept only for a successful operation, but a failure is never merely dropped: see A.2.1 |
 | Think time | none; the next cycle starts when the previous one ends |
 | Measurement window | 600 seconds of steady state after warm-up |
 | Warm-up | the first 30 seconds of steady state **and** the first 20 samples of each operation, whichever ends later |
@@ -352,6 +360,20 @@ The decoupled arm is identical in every row above except that no package is admi
 
 `S = 8 ms` is derived, not chosen. It is exactly `EVENT_DELIVERY_MAX_ELAPSED` (`src/daemon_maintenance.rs:1158`), which equals `OBSERVE_SLICE_BUDGET.max_elapsed` and `BASELINE_PAGE_BUDGET.max_elapsed`. The slack therefore states that the event plane may cost an operation at most one additional bounded background slice. `R = 1.25` allows 25 percent proportional growth, and `T = 0.80` is exactly `1 / R`.
 
+#### A.2.1 Every attempted operation is recorded, and any failure fails the campaign
+
+Revision 4 said a failed cycle contributes no latency sample and stopped there. Plan Review `finding_1787271799_979271` showed the hole: a failed `Spawn`, `Attach`, `Drain`, `Input`, `Resize`, MCP, UI, entity, or `Shutdown` would vanish from the latency data and only reduce throughput. With a throughput floor at `T` = 0.80, up to a fifth of operations could fail and the campaign could still pass, and a calibration run could bake its own failures into a low floor. That contradicts the ticket, which requires Hub operations to stay within every budget and not block.
+
+Revision 5 closes it:
+
+1. **Record every attempt.** For each of the nine operations, both arms, both phases, record attempts, successes, and failures, and report all three counts per operation. Counts are part of the campaign evidence, not a debug aid.
+2. **The measurement arms expect zero failures.** Calibration and acceptance run **no fault injection** — the eleven faults are separate lanes in section 12.5. The expected outcome of every attempted operation in a measurement arm is therefore success.
+3. **Any other outcome is an immediate `product_failure`**, in calibration and in acceptance alike: an unexpected operation error, a request timeout, a client disconnect, an incomplete or truncated response, or a cycle that does not complete every step. The run stops; it is not downgraded to a lower score.
+4. **Percentiles use successful samples only**, as before. That is now safe because a single failure has already failed the campaign, so no failure can silently shift a percentile by leaving the population.
+5. **A failed calibration cannot set a threshold.** Calibration that records any failure is invalid under A.5 and produces no dataset and no thresholds. A depressed throughput floor derived from lost work is impossible by construction.
+
+Typed results that a *fault lane* declares as expected — `shed_full`, `shed_busy`, `rejected_over_rate`, `event_gap`, and the rest of section 12.5 — are expected outcomes **in those lanes only**. They are never expected in a measurement arm, and they never appear on the nine measured operations, which the event plane must not be able to disturb at all. That is the whole claim of this ticket.
+
 #### A.3 Derivation formulas, fixed here
 
 The ticket requires published p50, p95, p99, maximum, and throughput budgets. **Every one of them gates.** A recorded metric is not a budget.
@@ -385,6 +407,7 @@ Throughput is higher-is-better, so its gate is a floor rather than a ceiling. Th
 
 Following the human answer, each of these **fails the campaign**. None is a caveat and none is residual risk:
 
+- **any attempted operation in a measurement arm fails**, per A.2.1: an unexpected error, request timeout, disconnect, incomplete response, or an incomplete cycle. This applies to calibration and acceptance equally;
 - **any fixed value in A.2 differs between calibration and acceptance**, machine profile, fleet, operation schedule, event emission, terminal cadence, or measurement definition. Matching machine fields alone are not enough;
 - any required metric is missing from either phase;
 - calibration is invalid, meaning fewer than `N` sessions reached steady state, fewer than 200 post-warm-up samples for any operation, or a `run-lifecycle-suite` verdict other than `clean`;
@@ -683,6 +706,7 @@ The vault rule that wall-clock durations are observations rather than gates ([[c
 | R14 | The campaign asserts sibling survival on the fail-closed path and fails against correct code | Section 11.6 states the shipped policy and explicitly forbids that assertion. The campaign asserts the bounded blast radius instead |
 | R15 | The campaign runs against client checkouts that lack the new lanes and silently proves nothing | Section 5G.3 requires `web_sha` and `tui_sha` to contain the two dependency lanes, and section 5G.4 marks both oracles as not existing today. A pinned SHA without the lane is a campaign failure, not a partial pass |
 | R16 | The Project Pipelines pin is older than the TUI pin floor | Section 5G.3 requires `project_pipelines_sha` to be at or after `cd7c2f926fcead78e15e7a9c713ad26dfe883914`. `assert_project_pipelines_pin_floor` (botster-tui `app.rs:29479-29489`) already enforces it and will fail the lane |
+| R18 | A failed Hub operation disappears into the throughput floor | Section 5A.2.1 records every attempt and makes any failure in a measurement arm an immediate product_failure in both phases, so no failure can be absorbed by the `T` = 0.80 tolerance and no calibration can bake its own losses into a low floor |
 | R17 | Shared-session gap coverage is silently dropped | Section 5G.3 item 5 requires the coordinator to launch the shared Hub with `BOTSTER_ENV=test` plus both queue and stall values. If it does not, the report must state that the shared lane covered notice delivery and entity convergence but not `EventGap` |
 
 ## 11. Runtime-teardown class
@@ -816,11 +840,12 @@ For each of `Spawn`, `Attach`, `Drain`, `Input`, `Resize`, `Shutdown`, MCP, UI, 
 
 - record p50, p95, p99, maximum, and throughput under the fixed nearest-rank method in section 5A.2;
 - **gate every one of the five metrics**, absolute and relative, exactly as section 5A.3 defines. p50, p95, p99, and maximum gate as ceilings; throughput gates as a floor at `T` = 0.80. None of the five is recorded-only;
+- **record attempts, successes, and failures per operation**, per section 5A.2.1. Any failure in a measurement arm is an immediate `product_failure` in both phases;
 - record queue count and bytes, oldest age, admission latency, delivery latency, shed by typed reason, gap count, resync count, pressure, **the four timeout counters T1 through T4 from section 4.4.1, each a distinct counter**, owner-turn duration, and ready-operation wait.
 
 The recorded-signal list requires dependency `ticket_1787267568_492780`. Without it these signals have no read path and the ticket cannot pass.
 
-Every failure rule in section 5A.5 applies. A profile mismatch, a missing metric, an invalid calibration, or any threshold breach on any of the five metrics fails the campaign. None of these is a caveat.
+Every failure rule in section 5A.5 applies. A failed operation attempt, a profile or workload mismatch, a missing metric, an invalid calibration, or any threshold breach on any of the five metrics fails the campaign. None of these is a caveat, and none is absorbed by the throughput floor.
 
 ### 12.5 Fault lanes
 
