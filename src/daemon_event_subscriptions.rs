@@ -17,7 +17,9 @@ use tokio::sync::Notify;
 
 use crate::config::PackageEventPlanePolicy;
 use crate::daemon_transport::daemon_response_base;
+use crate::event_plane_counters::{AgeIdentity, EventPlaneCounters, QueueAgeMetric};
 use crate::package_event_router::{ClientEventHolder, EventPlaneStatus, PackageEventRouter};
+use botster_hub_client::DaemonQueueKind;
 
 pub const MAX_SUBJECTS_PER_SUBSCRIPTION: usize = 16;
 pub const MAX_SUBJECT_UTF8_BYTES: usize = 256;
@@ -138,10 +140,32 @@ pub(crate) struct ClientEventMailbox {
     event_max: usize,
     byte_max: usize,
     queue_age: std::time::Duration,
+    counters: Option<Arc<EventPlaneCounters>>,
+    age_cell: Arc<QueueAgeMetric>,
 }
 
 impl ClientEventMailbox {
+    #[cfg(test)]
     pub(crate) fn new(policy: PackageEventPlanePolicy) -> Self {
+        Self::new_with_counters(policy, None, "mailbox")
+    }
+
+    pub(crate) fn new_with_counters(
+        policy: PackageEventPlanePolicy,
+        counters: Option<Arc<EventPlaneCounters>>,
+        identity: &str,
+    ) -> Self {
+        let age_cell = Arc::new(QueueAgeMetric::new(0));
+        if let Some(counters) = counters.as_ref() {
+            counters.register_cell(
+                AgeIdentity {
+                    kind: DaemonQueueKind::ClientMailbox,
+                    identity: identity.to_string(),
+                    generation: Some(0),
+                },
+                Arc::clone(&age_cell),
+            );
+        }
         Self {
             inner: Mutex::new(MailboxInner {
                 events: VecDeque::new(),
@@ -153,6 +177,8 @@ impl ClientEventMailbox {
             event_max: test_client_event_queue_max().unwrap_or(policy.consumer_queue_max_events),
             byte_max: policy.consumer_queue_max_bytes,
             queue_age: policy.queue_age,
+            counters,
+            age_cell,
         }
     }
 
@@ -182,6 +208,9 @@ impl ClientEventMailbox {
         let mut inner = lock_mailbox(&self.inner)?;
         if inner.events.len() + 1 > self.event_max || inner.bytes + size > self.byte_max {
             drop(inner);
+            if let Some(counters) = &self.counters {
+                counters.record_mailbox_overflow_gap();
+            }
             self.mark_gap(subscription_id, owner, name);
             return Err(EventPlaneStatus::ShedFull);
         }
@@ -194,7 +223,18 @@ impl ClientEventMailbox {
             enqueued_at: Instant::now(),
             size,
         });
+        let count = inner.events.len() as u64;
+        let oldest = inner
+            .events
+            .front()
+            .and_then(|event| {
+                self.counters
+                    .as_ref()
+                    .map(|counters| counters.nanos_of(event.enqueued_at))
+            })
+            .unwrap_or(u64::MAX);
         drop(inner);
+        self.age_cell.store(count, oldest, 0, false);
         self.signal_wake();
         Ok(())
     }
@@ -265,6 +305,10 @@ impl ClientEventMailbox {
         inner.bytes = inner.bytes.saturating_sub(queued.size);
         if queued.enqueued_at.elapsed() > self.queue_age {
             drop(inner);
+            if let Some(counters) = &self.counters {
+                counters.record_mailbox_queue_age_expiry();
+                counters.record_event_gap();
+            }
             self.mark_gap(&queued.subscription_id, &queued.owner, &queued.name);
             return self.take_ready_event();
         }
@@ -380,7 +424,11 @@ impl ClientEventPlane {
         let state = connections
             .entry(connection_id.to_string())
             .or_insert_with(|| ConnectionEventState {
-                mailbox: Arc::new(ClientEventMailbox::new(policy)),
+                mailbox: Arc::new(ClientEventMailbox::new_with_counters(
+                    policy,
+                    Some(Arc::clone(router.counters())),
+                    connection_id,
+                )),
                 subscriptions: HashMap::new(),
             });
         if state.subscriptions.contains_key(subscription_id) {

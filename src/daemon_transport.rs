@@ -291,6 +291,11 @@ fn run_one_owner_maintenance_slice(daemon: &mut HubDaemon, state: &mut DaemonCon
         }
     }
     state.maintenance.last_owner_turn = started.elapsed();
+    if let Some(runtime) = daemon.runtime() {
+        runtime.event_plane_counters().record_owner_turn(
+            u64::try_from(state.maintenance.last_owner_turn.as_micros()).unwrap_or(u64::MAX),
+        );
+    }
     state.lifecycle_counters.lifecycle_change_reads = state.maintenance.journal_page_reads;
     state.lifecycle_counters.lifecycle_baseline_reads = state.maintenance.baseline_page_reads;
     if owner_maintenance_pending(daemon, state) {
@@ -753,6 +758,7 @@ async fn handle_connection_async(
                 response_delivery_rx,
                 grant_id: None,
                 client_id: Some(client_id.clone()),
+                enqueued_at: Instant::now(),
             })
             .await
             .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
@@ -775,6 +781,7 @@ async fn handle_connection_async(
             cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
             let _ = control_tx.try_send(ControlMessage::EgressWriteFailed {
                 delivery_kind: daemon_delivery_kind(&response),
+                write_class: egress_write_class(&error),
             });
             mux.close_all();
             return Err(error);
@@ -1895,6 +1902,7 @@ async fn handle_entity_subscription_async(
                     cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
                     let _ = control_tx.try_send(ControlMessage::EgressWriteFailed {
                         delivery_kind: DaemonDeliveryKind::Control,
+                        write_class: egress_write_class(&error),
                     });
                     return Err(error);
                 }
@@ -2555,7 +2563,13 @@ pub(crate) fn handle_control_message(
             response_delivery_rx,
             grant_id,
             client_id,
+            enqueued_at,
         } => {
+            if let Some(runtime) = daemon.runtime() {
+                runtime.event_plane_counters().record_ready_operation_wait(
+                    u64::try_from(enqueued_at.elapsed().as_micros()).unwrap_or(u64::MAX),
+                );
+            }
             // Late WebRTC Requests after PeerClosed must not create durable ownership or run
             // stale control against a gone peer. Socket path leaves grant_id = None.
             if let Some(grant_id) = grant_id.as_deref()
@@ -3058,11 +3072,16 @@ pub(crate) fn handle_control_message(
             );
             false
         }
-        ControlMessage::EgressWriteFailed { delivery_kind } => {
+        ControlMessage::EgressWriteFailed {
+            delivery_kind,
+            write_class,
+        } => {
             record_egress_write_failure(
                 &mut state.egress_diagnostics,
                 &mut state.lifecycle_counters,
+                daemon.runtime(),
                 delivery_kind,
+                write_class,
             );
             false
         }
@@ -3072,10 +3091,19 @@ pub(crate) fn handle_control_message(
 fn record_egress_write_failure(
     diagnostics: &mut DaemonEgressDiagnostics,
     counters: &mut DaemonLifecycleCounters,
+    runtime: Option<&crate::HubRuntime>,
     delivery_kind: DaemonDeliveryKind,
+    write_class: EgressWriteClass,
 ) {
     diagnostics.record_write_failure(delivery_kind);
     counters.stalled_writes = counters.stalled_writes.saturating_add(1);
+    if write_class == EgressWriteClass::Timeout
+        && let Some(runtime) = runtime
+    {
+        runtime
+            .event_plane_counters()
+            .record_stalled_write_timeout();
+    }
 }
 
 fn send_control_response(
@@ -3553,6 +3581,7 @@ fn handle_runtime_control_request(
                 client_status.session_count,
                 observability.egress.diagnostics(),
                 observability.lifecycle.clone(),
+                runtime.event_plane_counters_snapshot(),
             ))
         }
         DaemonRequest::ListSessions => {
@@ -4326,6 +4355,7 @@ fn handle_runtime_control_request(
                 observability.lifecycle.clone(),
                 software_identity(),
                 installation_identity(),
+                runtime.event_plane_counters_snapshot(),
             )),
             sessions: Vec::new(),
             session_types: Vec::new(),
@@ -5239,6 +5269,7 @@ fn install_signal_forwarder(control_tx: ControlSender) -> DaemonTransportResult<
                 response_delivery_rx: None,
                 grant_id: None,
                 client_id: None,
+                enqueued_at: Instant::now(),
             });
         }
     });
@@ -5293,6 +5324,21 @@ fn events_from_client(events: Vec<HubClientEvent>) -> Vec<DaemonEvent> {
     events.into_iter().map(daemon_event_from_client).collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EgressWriteClass {
+    Timeout,
+    Other,
+}
+
+fn egress_write_class(error: &DaemonTransportError) -> EgressWriteClass {
+    match error {
+        DaemonTransportError::Io(io) if io.kind() == std::io::ErrorKind::TimedOut => {
+            EgressWriteClass::Timeout
+        }
+        _ => EgressWriteClass::Other,
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum ControlMessage {
     AcceptedConnection {
@@ -5324,12 +5370,14 @@ pub(crate) enum ControlMessage {
         grant_id: Option<String>,
         /// Stable Core client identity for one transport connection.
         client_id: Option<String>,
+        enqueued_at: Instant,
     },
     HubUpdateCheckCompleted {
         update: DaemonHubUpdate,
     },
     EgressWriteFailed {
         delivery_kind: DaemonDeliveryKind,
+        write_class: EgressWriteClass,
     },
     LocalWebrtcPeerClosed {
         grant_id: String,
@@ -6185,6 +6233,7 @@ fn daemon_status(
     session_count: usize,
     mut egress_diagnostics: Vec<DaemonDiagnostic>,
     lifecycle_counters: DaemonLifecycleCounters,
+    observability_counters: botster_hub_client::DaemonObservabilityCounters,
 ) -> DaemonResponse {
     let mut response = daemon_response_base(DaemonResponseKind::Status);
     response.status = Some(daemon_status_from_status(
@@ -6194,6 +6243,7 @@ fn daemon_status(
         lifecycle_counters,
         software_identity(),
         installation_identity(),
+        observability_counters,
     ));
     response.diagnostics = vec![DaemonDiagnostic::connected("status")];
     response.diagnostics.append(&mut egress_diagnostics);
@@ -9488,12 +9538,16 @@ mod tests {
         record_egress_write_failure(
             &mut diagnostics,
             &mut counters,
+            None,
             DaemonDeliveryKind::Terminal,
+            EgressWriteClass::Other,
         );
         record_egress_write_failure(
             &mut diagnostics,
             &mut counters,
+            None,
             daemon_delivery_kind(&control),
+            EgressWriteClass::Timeout,
         );
         let rows = diagnostics.diagnostics();
 

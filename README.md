@@ -190,6 +190,9 @@ and entity delivery pressure without exposing session or subscription ids.
 `DaemonStatus.live_attach_occupancy` names the Hub∪Core attach pairs a sibling
 client can use as exact occupancy proof after Unix EOF. The `attach_occupancy`
 feature token is required; an omitted field is not absence.
+`DaemonStatus.observability` publishes bounded event-plane counters, oldest-age
+observations, owner-turn duration, and ready-operation wait. Empty payloads omit
+the field. Saturation-time reads do not take the event-router lock.
 Steady-state entity reconciliation consumes the Core lifecycle journal on one
 shared 500 ms backstop and performs a filesystem-backed baseline only when the
 journal explicitly requires resynchronization.
@@ -648,7 +651,7 @@ data_dir=resolved:$HOME/.botster/hub
 daemon=started
 protocol=botster-hub-daemon-v1
 protocol_version=7
-conformance_fixture_revision=45
+conformance_fixture_revision=46
 package_count=2
 enabled_package_count=2
 app_count=2

@@ -11,9 +11,7 @@ use std::sync::{
     Mutex,
     atomic::{AtomicBool, Ordering},
 };
-#[cfg(test)]
-use std::time::Instant;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use botster_core::{AesGcmEnvelope, AesGcmKey, decrypt_aes_gcm, encrypt_aes_gcm};
@@ -1539,6 +1537,7 @@ where
                         response_delivery_rx,
                         grant_id: Some(peer_state.grant_id.clone()),
                         client_id: Some(format!("botster-hub-webrtc-{}", peer_state.grant_id)),
+                        enqueued_at: Instant::now(),
                     })
                     .await
             }
@@ -4626,6 +4625,7 @@ mod tests {
                     response_delivery_rx: None,
                     grant_id: None,
                     client_id: None,
+                    enqueued_at: Instant::now(),
                 },
             );
             reply_rx.blocking_recv().ok().and_then(|result| result.ok())
@@ -6574,6 +6574,7 @@ mod tests {
                 response_delivery_rx: None,
                 grant_id: Some(grant_id.clone()),
                 client_id: Some(format!("botster-hub-webrtc-{grant_id}")),
+                enqueued_at: Instant::now(),
             },
         );
 
@@ -6646,6 +6647,7 @@ mod tests {
                 response_delivery_rx: None,
                 grant_id: Some(grant_id.clone()),
                 client_id: Some(format!("botster-hub-webrtc-{grant_id}")),
+                enqueued_at: Instant::now(),
             },
         );
 

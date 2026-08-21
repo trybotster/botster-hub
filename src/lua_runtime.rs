@@ -615,6 +615,17 @@ impl PluginRuntime for LuaPluginRuntime {
             );
         }
 
+        if request.context.origin.as_deref() == Some("package-event")
+            && let Some(hold_ms) = crate::runtime::event_handler_hold_ms_from(
+                std::env::var("BOTSTER_ENV").ok().as_deref(),
+                std::env::var("BOTSTER_HUB_TEST_EVENT_HANDLER_HOLD_MS")
+                    .ok()
+                    .as_deref(),
+            )
+            && hold_ms > 0
+        {
+            thread::sleep(Duration::from_millis(hold_ms));
+        }
         let lua = self.lua.lock().expect("lua runtime mutex");
         self.instruction_budget
             .store(DEFAULT_INSTRUCTION_BUDGET, Ordering::Relaxed);

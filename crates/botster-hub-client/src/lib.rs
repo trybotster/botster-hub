@@ -31,7 +31,7 @@ mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 pub const PROTOCOL_VERSION: u16 = 7;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 45;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 46;
 /// Oldest conformance revision accepted by the default first-party client requirement.
 pub const DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 36;
 /// Version of the local WebRTC delivery chunk framing protocol.
@@ -2367,6 +2367,9 @@ pub struct DaemonStatus {
     /// Named Hub∪Core attach occupancy. Absence of a pair is release proof only when `attach_occupancy` is advertised.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub live_attach_occupancy: Vec<DaemonAttachOccupancy>,
+    /// Bounded event-plane and owner-loop observations. Omitted when empty.
+    #[serde(default, skip_serializing_if = "DaemonObservabilityCounters::is_empty")]
+    pub observability: DaemonObservabilityCounters,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<DaemonDiagnostic>,
 }
@@ -2513,6 +2516,177 @@ impl DaemonLifecycleCounters {
     fn is_empty(&self) -> bool {
         self == &Self::default()
     }
+}
+
+/// Bounded event-plane, owner-turn, and ready-wait observations.
+///
+/// Marked non-exhaustive so additive counters remain source-compatible for
+/// external Rust consumers that construct this DTO.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct DaemonObservabilityCounters {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub event_shed_by_reason: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub event_admission_attempts: u64,
+    #[serde(default)]
+    pub event_delivery_attempts: u64,
+    #[serde(default, skip_serializing_if = "DaemonLatencyHistogram::is_empty")]
+    pub event_admission_latency: DaemonLatencyHistogram,
+    #[serde(default, skip_serializing_if = "DaemonLatencyHistogram::is_empty")]
+    pub event_delivery_latency: DaemonLatencyHistogram,
+    #[serde(default)]
+    pub event_handler_timed_out: u64,
+    #[serde(default)]
+    pub event_handler_failed: u64,
+    #[serde(default)]
+    pub event_handler_cancelled: u64,
+    #[serde(default)]
+    pub event_handler_backpressured: u64,
+    #[serde(default)]
+    pub event_handler_worker_stopped: u64,
+    #[serde(default)]
+    pub event_handler_completed_ok: u64,
+    #[serde(default)]
+    pub event_router_queue_age_expiries: u64,
+    #[serde(default)]
+    pub event_mailbox_queue_age_expiries: u64,
+    #[serde(default)]
+    pub event_mailbox_overflow_gaps: u64,
+    #[serde(default)]
+    pub event_gaps: u64,
+    #[serde(default)]
+    pub event_age_sample_failures: u64,
+    #[serde(default)]
+    pub last_owner_turn_us: u64,
+    #[serde(default)]
+    pub max_owner_turn_us: u64,
+    #[serde(default)]
+    pub last_ready_operation_wait_us: u64,
+    #[serde(default)]
+    pub max_ready_operation_wait_us: u64,
+    /// Timeout subset of [`DaemonLifecycleCounters::stalled_writes`].
+    #[serde(default)]
+    pub stalled_write_timeouts: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queue_ages: Vec<DaemonQueueAgeObservation>,
+}
+
+impl DaemonObservabilityCounters {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+/// Fixed-bucket latency histogram. Bucket index is `leading_zeros` of microseconds.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct DaemonLatencyHistogram {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub buckets: Vec<u64>,
+    #[serde(default)]
+    pub count: u64,
+    #[serde(default)]
+    pub sum_us: u64,
+    #[serde(default)]
+    pub max_us: u64,
+}
+
+impl DaemonLatencyHistogram {
+    fn is_empty(&self) -> bool {
+        self.count == 0 && self.sum_us == 0 && self.max_us == 0 && self.buckets.is_empty()
+    }
+
+    #[must_use]
+    pub fn new(buckets: Vec<u64>, count: u64, sum_us: u64, max_us: u64) -> Self {
+        Self {
+            buckets,
+            count,
+            sum_us,
+            max_us,
+        }
+    }
+}
+
+/// One producer, consumer, or client-mailbox oldest-age observation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct DaemonQueueAgeObservation {
+    pub kind: DaemonQueueKind,
+    /// Producer owner, consumer plugin key, or client connection id.
+    pub identity: String,
+    /// Present only for `Producer`; identifies which generation the sample belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer_generation: Option<u64>,
+    pub state: DaemonQueueAgeState,
+    /// Present only when `state == Usable`. Microseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_age_us: Option<u64>,
+    /// Queue count from the same validated bracket. Absent on indeterminate rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_count: Option<u64>,
+}
+
+impl DaemonQueueAgeObservation {
+    #[must_use]
+    pub fn new(
+        kind: DaemonQueueKind,
+        identity: impl Into<String>,
+        producer_generation: Option<u64>,
+        state: DaemonQueueAgeState,
+        oldest_age_us: Option<u64>,
+        queue_count: Option<u64>,
+    ) -> Self {
+        Self {
+            kind,
+            identity: identity.into(),
+            producer_generation,
+            state,
+            oldest_age_us,
+            queue_count,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum DaemonQueueKind {
+    #[default]
+    Producer,
+    Consumer,
+    ClientMailbox,
+    #[serde(other)]
+    Unknown,
+}
+
+impl DaemonQueueKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Producer => "producer",
+            Self::Consumer => "consumer",
+            Self::ClientMailbox => "client_mailbox",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum DaemonQueueAgeState {
+    /// A sample the reader validated; `oldest_age_us` is present.
+    Usable,
+    /// The queue was observed with `count == 0`. Not a zero age.
+    Empty,
+    /// The bracket was unstable, the cell was latched invalid, the generation
+    /// gate was open, or the cell was missing. Never a value.
+    #[default]
+    Indeterminate,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4113,7 +4287,7 @@ mod tests {
     #[test]
     fn protocol_seven_rejects_protocol_six_and_accepts_conformance_floor_thirty_five() {
         assert_eq!(PROTOCOL_VERSION, 7);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 45);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 46);
 
         let protocol_six = DaemonCompatibilityRequirement {
             protocol_version: 6,
@@ -4734,6 +4908,134 @@ mod tests {
         assert!(generated.contains("export interface DaemonAttachOccupancy"));
         assert!(generated.contains("export interface DaemonLifecycleCounters"));
         assert!(generated.contains("cleanup_by_reason?: Record<string, number>;"));
+    }
+
+    #[test]
+    fn observability_counters_are_optional_omitted_when_empty_and_forward_tolerant() {
+        let status = daemon_response_example(DaemonResponseKind::Status)
+            .status
+            .expect("status example");
+        let value = serde_json::to_value(&status).expect("status serializes");
+        assert!(
+            value.get("observability").is_none(),
+            "empty observability must be omitted from the wire"
+        );
+
+        let old: DaemonStatus = serde_json::from_value(serde_json::json!({
+            "lifecycle_state": "running",
+            "compatibility": DaemonCompatibility::current(),
+            "software": status.software,
+            "installation": status.installation,
+            "host_id": "hub",
+            "host_display_name": "Hub",
+            "schema_version": 1,
+            "data_dir_configured": true,
+            "core_initialized": true,
+            "state_source": "initialized",
+            "package_count": 0,
+            "enabled_package_count": 0,
+            "provider_count": 0,
+            "enabled_provider_count": 0,
+            "session_count": 0,
+            "recovered_sessions": [],
+            "stale_sessions": []
+        }))
+        .expect("old shaped status deserializes without observability");
+        assert!(old.observability.is_empty());
+
+        let unknown_state: DaemonQueueAgeState =
+            serde_json::from_value(serde_json::json!("future_state"))
+                .expect("unknown state is other");
+        assert_eq!(unknown_state, DaemonQueueAgeState::Unknown);
+        let unknown_kind: DaemonQueueKind =
+            serde_json::from_value(serde_json::json!("future_kind"))
+                .expect("unknown kind is other");
+        assert_eq!(unknown_kind, DaemonQueueKind::Unknown);
+
+        let generated = daemon_protocol_typescript();
+        assert!(generated.contains("observability?: DaemonObservabilityCounters;"));
+        assert!(generated.contains("oldest_age_us?: number;"));
+        assert!(generated.contains("producer_generation?: number;"));
+        assert!(generated.contains("queue_count?: number;"));
+        assert!(generated.contains("export type DaemonQueueKind ="));
+        assert!(generated.contains("export type DaemonQueueAgeState ="));
+        assert!(generated.contains("| (string & {});"));
+        assert_eq!(PROTOCOL_VERSION, 7);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 46);
+        assert_eq!(DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION, 36);
+    }
+
+    #[test]
+    fn queue_age_observation_field_presence_matches_s6a_table() {
+        fn round_trip(row: DaemonQueueAgeObservation) -> serde_json::Value {
+            serde_json::to_value(&row).expect("serialize observation")
+        }
+
+        let usable = round_trip(DaemonQueueAgeObservation {
+            kind: DaemonQueueKind::Producer,
+            identity: "owner".to_string(),
+            producer_generation: Some(3),
+            state: DaemonQueueAgeState::Usable,
+            oldest_age_us: Some(12),
+            queue_count: Some(4),
+            ..DaemonQueueAgeObservation::default()
+        });
+        assert_eq!(usable["state"], "usable");
+        assert_eq!(usable["oldest_age_us"], 12);
+        assert_eq!(usable["queue_count"], 4);
+        assert_eq!(usable["producer_generation"], 3);
+
+        let empty = round_trip(DaemonQueueAgeObservation {
+            kind: DaemonQueueKind::Producer,
+            identity: "owner".to_string(),
+            producer_generation: Some(3),
+            state: DaemonQueueAgeState::Empty,
+            oldest_age_us: None,
+            queue_count: Some(0),
+            ..DaemonQueueAgeObservation::default()
+        });
+        assert_eq!(empty["state"], "empty");
+        assert!(empty.get("oldest_age_us").is_none());
+        assert_eq!(empty["queue_count"], 0);
+        assert_eq!(empty["producer_generation"], 3);
+
+        let indeterminate = round_trip(DaemonQueueAgeObservation {
+            kind: DaemonQueueKind::Producer,
+            identity: "owner".to_string(),
+            producer_generation: Some(3),
+            state: DaemonQueueAgeState::Indeterminate,
+            oldest_age_us: None,
+            queue_count: None,
+            ..DaemonQueueAgeObservation::default()
+        });
+        assert_eq!(indeterminate["state"], "indeterminate");
+        assert!(indeterminate.get("oldest_age_us").is_none());
+        assert!(indeterminate.get("queue_count").is_none());
+        assert_eq!(indeterminate["producer_generation"], 3);
+
+        let missing = round_trip(DaemonQueueAgeObservation {
+            kind: DaemonQueueKind::Producer,
+            identity: "owner".to_string(),
+            producer_generation: None,
+            state: DaemonQueueAgeState::Indeterminate,
+            oldest_age_us: None,
+            queue_count: None,
+            ..DaemonQueueAgeObservation::default()
+        });
+        assert!(missing.get("producer_generation").is_none());
+        assert!(missing.get("queue_count").is_none());
+
+        let consumer = round_trip(DaemonQueueAgeObservation {
+            kind: DaemonQueueKind::Consumer,
+            identity: "plugin".to_string(),
+            producer_generation: None,
+            state: DaemonQueueAgeState::Usable,
+            oldest_age_us: Some(8),
+            queue_count: Some(1),
+            ..DaemonQueueAgeObservation::default()
+        });
+        assert!(consumer.get("producer_generation").is_none());
+        assert_eq!(consumer["queue_count"], 1);
     }
 
     #[test]
@@ -6102,6 +6404,7 @@ mod tests {
                 stale_sessions: Vec::new(),
                 lifecycle_counters: DaemonLifecycleCounters::default(),
                 live_attach_occupancy: Vec::new(),
+                observability: DaemonObservabilityCounters::default(),
                 diagnostics: vec![DaemonDiagnostic::connected("status")],
             }),
             sessions: vec![DaemonSession {
@@ -6710,7 +7013,7 @@ mod tests {
     #[test]
     fn protocol_six_and_conformance_thirty_two_define_the_cold_cut_boundary() {
         assert_eq!(PROTOCOL_VERSION, 7);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 45);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 46);
 
         let requirement = DaemonCompatibilityRequirement::current();
         let protocol_error = ensure_compatible(
@@ -6775,7 +7078,7 @@ mod tests {
         // conformance revision: bumping the protocol would break every existing
         // first-party client that never issues this request.
         assert_eq!(PROTOCOL_VERSION, 7);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 45);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 46);
         assert_eq!(DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION, 36);
         assert_eq!(
             current_feature_list(),
