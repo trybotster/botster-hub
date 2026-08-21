@@ -2,6 +2,8 @@
 
 - Ticket: `ticket_1787267568_492780`
 - Run: `run_1787278338_832165`
+- Revision: **5**. Revision 5 adds the sibling ordering protocol in section 14 under human answer
+  `question_1787287315_855051`. No technical content changed between revision 4 and revision 5.
 - Revision: **4**. Revision 1 drew four findings in `review_1787279337_548281`; revision 2 fixed three and parked on the fourth; revision 3 released the park. Revision 4 answers the three findings in `review_1787286846_900081`.
 - Target repository: `trybotster/botster-hub`
 - Target id: `tgt_7e208a0c76a44980a83b63af976b1f22`
@@ -706,3 +708,37 @@ ticket is now on the critical path rather than behind it.
 
 Revision 3 therefore requests advancement to Plan Review. Nothing else in this plan changed between
 revision 2 and revision 3; the technical content is identical.
+
+## 14. Sibling ordering protocol — MANDATORY, do not skip
+
+Human answer `question_1787287315_855051` (`sess-1787091778-0002-0d4e81ae0940d38a6b69bca8c9cfe444`)
+directs a **review-only dependency removal**. The engine proved that `override_unmet_gates` does not
+bypass a `ticket_dependencies` block, so an override was rejected as the mechanism.
+
+Recorded verbatim in substance: temporarily remove `dependency_1787286958_412779` only to route this run
+into Plan Review; keep the sibling rebase, registry, source-check, and identity-allocation requirements in
+the plan; if Plan Review requires changes, revise and re-review before starting Implement; after Plan
+Review approves, re-add `ticket_1787278643_145174` as a registered dependency **before any Implement
+advance**; the observability run then remains parked until the sibling merges; and **do not rely on plan
+text alone for implementation ordering**.
+
+### Required sequence
+
+1. **Now.** Remove `dependency_1787286958_412779`. Reason: routing to Plan Review only.
+2. **Now.** Request advancement to Plan Review with revision 5.
+3. **If Plan Review requires changes.** Revise and re-review. Do not start Implement.
+4. **After Plan Review approves, and before any Implement advance.** Re-register the dependency:
+   `project_pipelines_add_ticket_dependency(ticket_id="ticket_1787267568_492780", depends_on_ticket_id="ticket_1787278643_145174")`.
+   **This step is not optional and is not satisfied by this document.** The human answer states explicitly
+   that plan text alone must not carry implementation ordering.
+5. **Then park** until `ticket_1787278643_145174` closes. Rebase onto its merge.
+6. **Then, at Implement**, run the assumption A9 checks before writing `CONFORMANCE_FIXTURE_REVISION` 46 or
+   `@trybotster/hub-test-support` 0.1.41: recheck npm registry history and the sibling's merged source, and
+   recompute both literals if the sibling's allocation differs from 45 and 0.1.40.
+
+### Why the edge is removed rather than overridden
+
+The dependency expresses a rebase and identity-allocation constraint that binds **Implement**, not Plan
+Review. Reviewing the plan while the sibling is still in Implement costs nothing and surfaces any residual
+product defect earlier. The edge is removed for exactly one transition and then restored; it is not
+weakened, retired, or replaced by prose.
