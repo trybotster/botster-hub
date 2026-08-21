@@ -463,8 +463,9 @@ struct ProducerAgeRef { generation: u64, slot: u32 }   // on Envelope, replaces 
 - Producer age lists are keyed by **`(owner, generation)`**, not by owner alone.
 - Each list carries a `live: usize` count of envelopes still referencing it.
 - `retire_holder_locked` resolves `(generation, slot)` to the exact list that admitted the envelope,
-  unlinks the slot, decrements that list's `live`, and decrements the successor cell's `gate` when the
-  retiring envelope belonged to a prior generation.
+  unlinks the slot, decrements that list's `live`, and — when the retiring envelope belonged to a prior
+  generation — decrements `outstanding_prior` and the **current** cell's `gate`, never a retired
+  predecessor's. See the gate rules above.
 - **Bounded cleanup**: when a non-current generation's `live` reaches zero, its list and its retired cell
   are dropped at that point. The current generation's list is never dropped while it is current.
 - The number of live lists per owner is therefore bounded by one current generation plus those prior
