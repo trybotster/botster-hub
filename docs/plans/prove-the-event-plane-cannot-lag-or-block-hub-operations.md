@@ -968,9 +968,9 @@ The runner stops at the first red repetition. Preserve that artifact before any 
 | Item | Value |
 | --- | --- |
 | Gate | `botster_stack_plan_gate` |
-| Plan artifact | `docs/plans/prove-the-event-plane-cannot-lag-or-block-hub-operations.md`, revision 6 |
+| Plan artifact | `docs/plans/prove-the-event-plane-cannot-lag-or-block-hub-operations.md`, revision 8 |
 | Vault checklist | `checklist_1787266824_449406` |
-| Plan Reviews answered | `review_1787268374_271226`, `review_1787270029_776949`, `review_1787271188_552110`, `review_1787271799_830342`, and `review_1787278015_433684` |
+| Plan Reviews answered | `review_1787268374_271226` (6), `review_1787270029_776949` (4), `review_1787271188_552110` (3), `review_1787271799_830342` (1), `review_1787278015_433684` (1 blocker, superseding approval `review_1787272071_523159`), and `review_1787278903_443047` (3) |
 | Human answers folded in | `question_1787267931_572353` (routing exception), `question_1787268530_910910` (budget nature and derivation), and the library-boundary decision recorded in `review_1787278015_433684` |
 | Delivery | direct merge into `main`; no pull request; no human pull-request sign-off |
 
