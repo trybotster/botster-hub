@@ -60,6 +60,7 @@ mod daemon_maintenance;
 mod daemon_projection;
 pub mod daemon_transport;
 pub mod entrypoint_supervisor;
+pub(crate) mod event_plane_counters;
 mod host_control_fair_write;
 pub mod lifecycle;
 pub(crate) mod local_webrtc;

@@ -407,6 +407,7 @@ fn start_daemon(args: Vec<String>) -> Result<(), StartError> {
             .collect(),
         lifecycle_counters: Default::default(),
         live_attach_occupancy: Vec::new(),
+        observability: Default::default(),
         diagnostics: Vec::new(),
     };
     print_daemon_transport_status("stopped", &status);

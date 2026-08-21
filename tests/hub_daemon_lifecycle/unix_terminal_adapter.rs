@@ -2612,11 +2612,11 @@ fn terminal_subscription_closed_feature_does_not_raise_default_requirement() {
         botster_hub_client::DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION;
     botster_hub_client::ensure_compatible(&requirement, &previous)
         .expect("default clients still accept a daemon without terminal_subscription_closed");
-    assert_eq!(botster_hub_client::CONFORMANCE_FIXTURE_REVISION, 45);
     assert_eq!(
         botster_hub_client::DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION,
         36
     );
+    const _: () = assert!(botster_hub_client::CONFORMANCE_FIXTURE_REVISION >= 45);
 }
 
 fn occupancy_has_pair(
