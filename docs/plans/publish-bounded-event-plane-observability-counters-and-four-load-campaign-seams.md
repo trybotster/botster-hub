@@ -2,6 +2,10 @@
 
 - Ticket: `ticket_1787267568_492780`
 - Run: `run_1787278338_832165`
+- Revision: **14**. Revision 14 answers the three findings in `review_1787292601_501751`: `DaemonQueueKind`
+  needed the same `serde(other)` wire tolerance I gave only to the state enum, `queue_count` must be absent
+  rather than defaulted on an indeterminate row, and the `loom` version is pinned to the registry-verified
+  `0.7.2`.
 - Revision: **13**. Revision 13 answers the three findings in `review_1787292035_194663`: repeated
   replacement had no unambiguous gate rule, the public age observation DTO was unspecified, and the loom
   gate was not executable from the planned change set.
@@ -37,6 +41,14 @@
 - Target id: `tgt_7e208a0c76a44980a83b63af976b1f22`
 - Base: `origin/main` at `b3b54f1` ("Merge ticket: Roll Core pin after IncrementalAttach local-runtime gate")
 - Core pin (verified in `Cargo.toml:24-26,43-44`): `7eafa470a18025895995bbedc20d34b58106a03b`
+
+## 0. Response to Plan Review `review_1787292601_501751` (revision 14)
+
+| Finding | Severity | Response |
+| --- | --- | --- |
+| `finding_1787292601_486963` — `DaemonQueueKind` is not forward tolerant on the wire | high | **Accepted.** I applied the `#[serde(other)]` rule to `DaemonQueueAgeState` and not to `DaemonQueueKind`, then wrote a sentence claiming **both** enums made later variants free for consumers. That sentence was false: `#[non_exhaustive]` protects Rust source matching, not deserialization of an unknown string, so a later additive kind would break exactly the older readers a public DTO cannot reach to repair. `DaemonQueueKind` gains `#[serde(other)] Unknown`, the conflation is corrected in place, and the consumer rule is stated: an unknown kind is ignored or reported indeterminate, never guessed. AC10 gains Rust and generated-TypeScript wire cases for an unknown kind. |
+| `finding_1787292601_772563` — indeterminate observations require an unvalidated queue count | high | **Accepted.** `queue_count: u64` was mandatory while the reader has no validated bracket on an unstable sample and no count at all on a missing cell, and I never said what to serialize. Any default would have quietly weakened the rule that queue count stays authoritative. `queue_count` becomes `Option<u64>`, present only when a validated bracket produced it. S6a adds a field-presence table covering all six row causes — usable, empty, unstable bracket, latched invalid, open gate, and missing cell — so an `empty` row carries a real validated `0` while every indeterminate row carries no count. AC10 gains each exact wire form. |
+| `finding_1787292601_481646` — the Loom dependency version remains a placeholder | low, process | **Accepted, and the reviewer did the check I had deferred.** The plan now pins `loom = "0.7.2"` in the manifest snippet, the affected-file row, and AC19 case 0, crediting the review's registry verification. I confirmed the `rust-version` floor of 1.65 is satisfied: this repository is edition 2024 on a 1.92 toolchain. Assumption A14 is resolved rather than carried, leaving only the locked-build-policy residual. |
 
 ## 0. Response to Plan Review `review_1787292035_194663` (revision 13)
 
@@ -721,14 +733,26 @@ pub struct DaemonQueueAgeObservation {
     /// Present only when `state == Usable`. Microseconds, matching the owner-turn fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oldest_age_us: Option<u64>,
-    /// The queue count observed in the same bracket as the age.
-    pub queue_count: u64,
+    /// The queue count observed in the **same validated bracket** as the age. `None` whenever no
+    /// validated sample exists, so an indeterminate row never carries an unvalidated or defaulted
+    /// number. Corrected in revision 14 for `finding_1787292601_772563`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_count: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
-pub enum DaemonQueueKind { Producer, Consumer, ClientMailbox }
+pub enum DaemonQueueKind {
+    Producer,
+    Consumer,
+    ClientMailbox,
+    /// Forward tolerance, added in revision 14 for `finding_1787292601_486963`. Without this arm an
+    /// older client cannot deserialize a later additive kind, and a public DTO cannot reach its
+    /// existing readers to repair them.
+    #[serde(other)]
+    Unknown,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -764,8 +788,28 @@ pub enum DaemonQueueAgeState {
   `oldest_age_us?: number` and `producer_generation?: number`, per
   `[[generated typescript dtos must encode serde field optionality]]`. Generated TypeScript for `state` is
   the snake_case union plus a permissive arm for unknown values.
-- **Both structs and both enums are `#[non_exhaustive]`**, so later additive fields and variants cost
-  external Rust consumers nothing beyond the one-time boundary already accepted in S6.
+- **`#[non_exhaustive]` and `#[serde(other)]` do different jobs, and revision 13 wrongly conflated them.**
+  `#[non_exhaustive]` protects **Rust source** matching; it does **not** let an older client deserialize
+  an unknown string. Both enums therefore carry a `#[serde(other)] Unknown` arm for **wire** tolerance,
+  and all four types carry `#[non_exhaustive]` for **source** tolerance. An unknown `kind` is treated the
+  same way as an unknown `state`: the consumer ignores the row or reports it indeterminate, and never
+  guesses a kind.
+
+**Field presence by row, so the wire contract is unambiguous** (added in revision 14 for
+`finding_1787292601_772563`):
+
+| Row cause | `state` | `oldest_age_us` | `queue_count` | `producer_generation` |
+| --- | --- | --- | --- | --- |
+| validated bracket, `count > 0`, gate closed | `usable` | present | present | present for producers |
+| validated bracket, `count == 0` | `empty` | absent | present, `0` | present for producers |
+| bracket unstable after one retry | `indeterminate` | absent | **absent** | present for producers |
+| `invalid` latched | `indeterminate` | absent | **absent** | present for producers |
+| generation gate open | `indeterminate` | absent | **absent** | present for producers |
+| cell missing | `indeterminate` | absent | **absent** | absent |
+
+`queue_count` is present only when a validated bracket produced it. An `empty` row carries a real,
+validated `0`; an `indeterminate` row carries **no** count rather than a defaulted one, which keeps the
+rule that queue count stays authoritative from being quietly weakened by this diagnostic surface.
 
 **S7. Four `BOTSTER_ENV=test` gated seams (ticket item 7).** One `hub_test_seams()` reader placed beside
 `core_daemon_config` in `src/runtime.rs`, in the `BOTSTER_HUB_TEST_WORKER_EGRESS_CAPACITY` style at
@@ -882,6 +926,12 @@ live slot count cannot drift from it; the capacity invariant that keeps the free
 that equality. Second, confirm that `retire_holder_locked` is the only path that decrements
 `producer.events`, so every push is matched by exactly one removal.
 
+**A14 — resolved in revision 14, no longer deferred.** Revision 13 left the `loom` version to Implement.
+Plan Review verified `loom 0.7.2` from the registry with a `rust-version` floor of 1.65; this repository is
+edition 2024 on a 1.92 toolchain, so there is no MSRV conflict and the plan pins the exact version. The
+only residual is the locked-build policy: if `loom` cannot be added, Implement reports the ordering claim
+as unproven rather than dropping AC19 case 0.
+
 **A9 — new in revision 4.** Conformance revision and package version allocation depends on sibling
 `ticket_1787278643_145174` merging first. If that sibling changes its own allocation before merge, or if
 `npm view @trybotster/hub-test-support versions` shows anything above `0.1.39` at Implement time, the
@@ -894,7 +944,7 @@ registry and source check before writing either literal.
 | --- | --- |
 | `src/event_plane_counters.rs` (new) | `EventPlaneCounters`, fixed shed-by-reason array, fixed-bucket histograms, `QueueAgeMetric` with the two-phase odd/even `version`, `gate`, immutable `generation`, and `invalid` latch, the bounded consistency read with its `AcqRel` opening RMW and `Acquire` fence, the enumeration-only registry keyed by identity and generation with explicit retirement, and the snapshot type including its indeterminate representation |
 | `src/lib.rs` | register the new module and re-export the snapshot type |
-| `Cargo.toml` and `Cargo.lock` | add the `[target.'cfg(loom)'.dev-dependencies]` `loom` entry for AC19 case 0, pinned by Implement and outside the normal build |
+| `Cargo.toml` and `Cargo.lock` | add `[target.'cfg(loom)'.dev-dependencies] loom = "0.7.2"` for AC19 case 0, outside the normal build |
 | `src/package_event_router.rs` | shed by typed reason, admission and delivery attempts, latencies, T2, producer age lists keyed by `(owner, generation)` and created at the S1g admission commit point, `Envelope.producer_age_ref: ProducerAgeRef { generation, slot }` replacing `producer_slot`, a per-list `live` count with cleanup when a non-current generation drains, a **fresh** `Arc<QueueAgeMetric>` per generation on the producer entry and consumer queue with the predecessor **retired and write-closed** (never reset in place), `gate` seeded at replacement and decremented in `retire_holder_locked` inside the two-phase bracket, registry retirement recorded explicitly at `apply_unload`, `unsubscribe`, and connection cleanup with an admission-time prune and rebind, and a diagnostic failure that latches `invalid` without changing acceptance |
 | `src/daemon_event_subscriptions.rs` | overflow gap count, T3 mailbox-expiry count, mailbox age cell, cell removal on connection cleanup |
 | `src/daemon_maintenance.rs` | T1 typed completion counting; seam 3 for the two `timeout_ms` sites |
@@ -955,6 +1005,12 @@ registry and source check before writing either literal.
 - **R24 (new in revision 13).** `#[non_exhaustive]` does not make serde tolerant of an unknown enum
   variant; only a `#[serde(other)]` arm does. Without it a newer Hub state would fail an older client's
   deserialization outright. AC10 asserts the unknown-state case.
+- **R26 (new in revision 14).** Applying a forward-tolerance rule to one enum and not its sibling leaves a
+  wire break in the half nobody re-read. `DaemonQueueKind` now carries `#[serde(other)]` like
+  `DaemonQueueAgeState`, and AC10 asserts both.
+- **R27 (new in revision 14).** A mandatory field on a row that has no validated value forces a defaulted
+  number into a public contract, quietly weakening the authoritative counter it mirrors. `queue_count` is
+  `Option`, and the S6a presence table fixes every row's exact shape.
 - **R25 (new in revision 13).** An acceptance gate that names a tool absent from every manifest is not
   executable. AC19 case 0 now carries its dependency, its command, and an explicit fallback that reports
   the ordering claim as unproven rather than dropping it.
@@ -1121,16 +1177,17 @@ record the failing output **before** the change, per
 
      ```toml
      [target.'cfg(loom)'.dev-dependencies]
-     loom = "<current release, pinned by Implement>"
+     loom = "0.7.2"
      ```
 
      and runs it as `RUSTFLAGS="--cfg loom" cargo test --lib queue_age_model`, listed under AC9 as a
      separate command rather than folded into `./test.sh --locked`. `Cargo.toml` and `Cargo.lock` are
-     added to the affected-file table. **I did not verify the current `loom` version number from the
-     registry**, so Implement pins the current release and records the exact version in its report; if
-     `loom` cannot be added under the locked-build policy, Implement must report that and fall back to the
-     deterministic interleavings alone, saying plainly that the ordering claim is then unproven rather
-     than silently dropping case 0.
+     added to the affected-file table. **The version is `0.7.2`**, verified from the registry by Plan
+     Review `finding_1787292601_481646` after revision 13 left it a placeholder; its `rust-version` floor
+     is 1.65, comfortably under this repository's edition-2024 requirement and the 1.92 toolchain, so
+     there is no MSRV conflict. If `loom` still cannot be added under the locked-build policy, Implement
+     must report that and fall back to the deterministic interleavings alone, saying plainly that the
+     ordering claim is then unproven rather than silently dropping case 0.
   1. A stable even version with `count > 0` and `gate == 0` yields a usable age tagged with that cell's
      generation.
   2. `count == 0` yields **no usable age**, never a zero age.
@@ -1321,7 +1378,12 @@ integration tests, the repository lifecycle suite, and scratch consumer `cargo c
     could support.
 29. **A sweep keyed on remembered strings finds only what you remember.** Report the literal command and
     its literal output; a summarised count is an assertion, not a verification.
-30. **Correcting a stale in-repository assumption** — an in-repository workspace member can still be an
+30. **`#[non_exhaustive]` and `#[serde(other)]` solve different problems.** The first keeps external Rust
+    source compiling; only the second lets an older client deserialize a value it has never seen. A public
+    DTO that adds variants needs both, on every enum, not just the one you happened to think about.
+31. **A mandatory field is a claim that a value always exists.** If any row can lack one, the field is
+    `Option` and the plan owes a presence table; a defaulted number in a public contract is a silent lie.
+32. **Correcting a stale in-repository assumption** — an in-repository workspace member can still be an
    external contract surface. Revision 1 used crate location to skip a charter, which the Hub charter's
    "does not own" list already forbids.
 
