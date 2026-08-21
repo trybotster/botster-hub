@@ -18,7 +18,7 @@
 | Implement commit | `6814d4b2ca6b8ec6e127108faf567c95f0047b7f` |
 | First review-return commit | `cd3cb2e014cadb8cca09057a84de75cc63450f17` |
 | Second review-return commit | `cb334fe1b8e3a6ccd331cad4fd1f7f764b0af22c` |
-| Third review-return commit | pending until this commit |
+| Third review-return commit | `0dec4ebc6732fe4ce0b20c9d0b21abd28064289e` |
 | Integrated base | `origin/main` `12e0cc6` (sibling notice-reaction merge, revision 45 / package `0.1.40`) |
 | Locked Core | `7eafa470a18025895995bbedc20d34b58106a03b` |
 | `teardown_class_applies` | false |
