@@ -1128,6 +1128,12 @@ record the failing output **before** the change, per
      missing cell appears as an `indeterminate` row rather than an omitted one. Assert that an unknown
      future `state` string deserializes to `Unknown` through the `#[serde(other)]` arm rather than
      failing, which is the forward-evolution rule that `#[non_exhaustive]` alone does not provide.
+     **Extended in revision 14**: assert the same forward tolerance for an unknown **`kind`** string in
+     both Rust and the generated TypeScript, since revision 13 protected only `state`. Assert the S6a
+     field-presence table row by row: `queue_count` present on `usable`, present and exactly `0` on
+     `empty`, and **absent** on each of the four indeterminate causes — unstable bracket, latched
+     `invalid`, open generation gate, and missing cell — with `producer_generation` absent only on the
+     missing-cell row. A defaulted `0` on any indeterminate row must fail this test.
   2. **Protocol-versus-revision proof.** Assert exact `PROTOCOL_VERSION` equality is unaffected, and that a
      client pinned to minimum revision 36 accepts a Hub reporting 46, per
      `[[daemon event shape changes bump conformance fixture revision not protocol version]]`.
