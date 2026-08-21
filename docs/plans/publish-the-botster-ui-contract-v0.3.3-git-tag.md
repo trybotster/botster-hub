@@ -14,6 +14,7 @@
 | Consumer proof Hub rev (decided) | `12e0cc6994be18024e4bdfffb22947526a652204` |
 | Repository ownership charter | [[botster-hub-playbook]] |
 | Human answer | `question_1787349702_525447` — option A, local tag only, no push without new authorization |
+| Plan Review return | `review_1787350835_469845` — findings `finding_1787350835_436188` and `finding_1787350835_992535`, both fixed in this revision |
 
 Routing came from spawn-target state. `tgt_7e208a0c76a44980a83b63af976b1f22` maps to
 admitted name `botster-hub`, repository `trybotster/botster-hub`. The process working
@@ -59,6 +60,10 @@ Targeted atomic notes:
 - [[botster hub is a first party host profile over core]]
 - [[kit UI contract pin proof uses an already split TUI consumer]] — downstream proof shape
   that detects split Cargo identities.
+- [[Hub suite runs prebuild the session worker before the locked test wrapper]] — the locked
+  worker build is a required precondition of `./test.sh --locked` on a fresh target.
+- [[Hub bee15e7 builds the session worker from botster-core-daemon]] — the current package
+  target that emits `botster-session-worker`.
 - [[colon worktree paths break cargo dyld library paths]] — worktree hygiene.
 - [[hearth gate runs require restoring a pipeline wiped gitignore before attribution]] — worktree hygiene.
 - [[pipeline vault checklists must cite exact resolvable note titles]]
@@ -102,6 +107,13 @@ Verified repository facts, all read in this Plan step:
     `botster-ui-contract-v0.3.2`. `botster-tui-kit` also still pins `botster-ui-contract-v0.3.2`.
 11. Worktree hygiene: tracked `.gitignore` is present and non-empty (53 bytes); the worktree
     path contains no `:`, so no `CARGO_TARGET_DIR` override is required.
+12. `git ls-remote --tags origin botster-ui-contract-v0.3.2` returns the tag-object line only.
+    `git ls-remote --tags origin 'botster-ui-contract-v0.3.2*'` returns the tag-object line and
+    the `^{}` dereference line. Verified in this Plan step against the published tag.
+13. Plan Review return `review_1787350835_469845` raised two product findings:
+    `finding_1787350835_436188` (the suite gate omitted the locked binary prebuilds) and
+    `finding_1787350835_992535` (the exact `ls-remote` pattern cannot produce the dereference
+    line). This revision fixes both.
 
 ## Scope
 
@@ -119,8 +131,9 @@ Verified repository facts, all read in this Plan step:
 5. After that authorization only: push the tag with
    `git push origin botster-ui-contract-v0.3.3`.
 6. After the push only: verify the remote ref with
-   `git ls-remote --tags origin botster-ui-contract-v0.3.3` and confirm the dereferenced
-   commit is `12e0cc6`.
+   `git ls-remote --tags origin 'botster-ui-contract-v0.3.3*'` and confirm the dereferenced
+   commit is `12e0cc6`. The wildcard pattern is required. An exact pattern returns the tag
+   object line only, and never the `^{}` dereference line.
 7. After the push only: run the external `botster-tui`-shaped consumer proof described under
    acceptance checks, outside the Hub workspace and without any `[patch]` section.
 8. Write `docs/plans/publish-the-botster-ui-contract-v0.3.3-git-tag.md` (this plan) and
@@ -185,7 +198,7 @@ Assumptions, all traceable to evidence or to answer `question_1787349702_525447`
 Unknowns that stop Implement:
 
 1. **The remote tag appears with a different commit.** If
-   `git ls-remote --tags origin botster-ui-contract-v0.3.3` returns any commit other than
+   `git ls-remote --tags origin 'botster-ui-contract-v0.3.3*'` returns any commit other than
    `12e0cc6`, stop, do not force, and ask a human.
 2. **Push authorization is refused or absent.** Then Implement stops after the verified local
    tag and the recorded pre-push baseline, and reports the remaining acceptance checks as
@@ -242,7 +255,7 @@ Tag identity, before the push:
 - `git rev-parse botster-ui-contract-v0.3.3^{commit}` prints `12e0cc6994be18024e4bdfffb22947526a652204`.
 - `git cat-file -t botster-ui-contract-v0.3.3` prints `tag`, which proves an annotated tag.
 - `script/tag-ui-contract --verify` reports crate version `0.3.3` for that tag.
-- `git ls-remote --tags origin botster-ui-contract-v0.3.3` prints nothing, which proves that
+- `git ls-remote --tags origin 'botster-ui-contract-v0.3.3*'` prints nothing, which proves that
   the push creates a new ref and moves no existing ref.
 
 Pre-push baseline, recorded as evidence:
@@ -259,8 +272,12 @@ Push authorization:
 Remote publication, after authorization:
 
 - `git push origin botster-ui-contract-v0.3.3` succeeds.
-- `git ls-remote --tags origin botster-ui-contract-v0.3.3` returns both the tag object and the
-  dereferenced `^{}` line, and that dereferenced commit is `12e0cc6`.
+- `git ls-remote --tags origin 'botster-ui-contract-v0.3.3*'` returns exactly two lines: the
+  tag-object line `refs/tags/botster-ui-contract-v0.3.3`, and the dereference line
+  `refs/tags/botster-ui-contract-v0.3.3^{}` whose commit is
+  `12e0cc6994be18024e4bdfffb22947526a652204`. The wildcard pattern is required, because an
+  exact pattern returns the tag-object line only. Verified against the published
+  `botster-ui-contract-v0.3.2` tag in this Plan step.
 - `script/tag-ui-contract --verify` passes from a clean fetch.
 
 External consumer proof, after publication, outside the Hub workspace and with no `[patch]`:
@@ -280,9 +297,20 @@ External consumer proof, after publication, outside the Hub workspace and with n
 Hub workspace regression check:
 
 - `cargo fmt --all -- --check`
+- `cargo build --locked -p botster-core-daemon --bin botster-session-worker`
+- `cargo build --locked -p botster-hub --bin botster-hub`
 - `./test.sh --locked` for the workspace wrapper, which must stay green after the tag exists.
-  The Hub workspace resolves the contract through the root `[patch]`, so this check guards
-  against regression only. It is not identity evidence.
+
+Run the two locked builds **before** the suite wrapper, and record that order in the
+acceptance evidence. The prebuild is a required suite precondition, not a build
+optimization: lazy worker discovery in `tests/support/mod.rs::ensure_session_worker_binary`
+leaves a fresh target without the worker binary, and Plan Review reproduced eight
+missing-worker failures on this exact plan. See
+[[Hub suite runs prebuild the session worker before the locked test wrapper]] and
+[[Hub bee15e7 builds the session worker from botster-core-daemon]] for the package target.
+
+The Hub workspace resolves the contract through the root `[patch]`, so this suite guards
+against regression only. It is not identity evidence.
 
 Documentation:
 
