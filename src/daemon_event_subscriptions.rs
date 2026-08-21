@@ -208,7 +208,7 @@ impl ClientEventMailbox {
 
     pub(crate) fn retire_from_registry(&self) {
         if let Some(counters) = &self.counters {
-            counters.retire_identity(&self.mailbox_identity());
+            counters.retire_cell(&self.mailbox_identity(), &self.age_cell);
         }
     }
 
@@ -1193,5 +1193,52 @@ mod tests {
             "next admission must prune retired mailbox rows: {live_mailboxes:?}"
         );
         assert_eq!(live_mailboxes[0].identity, "conn-live");
+    }
+
+    #[test]
+    fn delayed_mailbox_drop_does_not_retire_a_replacement_cell() {
+        let router = admitted_router(EventAudience::Clients);
+        let plane = ClientEventPlane::default();
+        let policy = PackageEventPlanePolicy::default();
+        plane
+            .try_subscribe(
+                "conn",
+                "sub-old",
+                "owner",
+                "ready",
+                Vec::new(),
+                policy,
+                &router,
+            )
+            .expect("old subscribe");
+        let old = plane.mailbox("conn").expect("old mailbox");
+        old.try_push("sub-old", "owner", "ready", json!({ "ok": true }), 8)
+            .expect("old push");
+        plane.cleanup_connection("conn", &router);
+        plane
+            .try_subscribe(
+                "conn",
+                "sub-new",
+                "owner",
+                "ready",
+                Vec::new(),
+                policy,
+                &router,
+            )
+            .expect("replacement subscribe");
+        let new = plane.mailbox("conn").expect("new mailbox");
+        new.try_push("sub-new", "owner", "ready", json!({ "ok": true }), 8)
+            .expect("new push");
+        drop(old);
+        let row = mailbox_row(router.counters(), "conn");
+        assert_eq!(row.state, botster_hub_client::DaemonQueueAgeState::Usable);
+        assert_eq!(row.queue_count, Some(1));
+        assert!(row.oldest_age_us.is_some());
+        match new.take_ready_event() {
+            Some(DaemonEvent::PackageEvent {
+                subscription_id, ..
+            }) => assert_eq!(subscription_id, "sub-new"),
+            other => panic!("replacement mailbox must stay readable: {other:?}"),
+        }
     }
 }
