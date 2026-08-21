@@ -1087,7 +1087,8 @@ record the failing output **before** the change, per
   non-absent: queue count and bytes, oldest age per producer queue, per consumer queue, and per client
   mailbox, admission latency, delivery latency, shed by typed reason, gap, resync, pressure, T1 through T4
   as four distinct values, owner-turn duration, and ready-operation wait. Beyond presence, assert each age
-  row carries its `kind` and `identity`, that producer rows carry `producer_generation`, and that a
+  row carries its `kind` and `identity`, that every producer row except a missing-cell row carries
+  `producer_generation` exactly as the AC10 table states, and that a
   producer row under an open generation gate reports `indeterminate` rather than being omitted.
 - **AC2 — T1, red first.** A focused test uses seams 3 and 4 to make a package-event handler exceed
   `timeout_ms`, then asserts the `TimedOut` counter incremented by exactly one and every other
@@ -1428,6 +1429,14 @@ integration tests, the repository lifecycle suite, and scratch consumer `cargo c
 32. **Correcting a stale in-repository assumption** — an in-repository workspace member can still be an
    external contract surface. Revision 1 used crate location to skip a charter, which the Hub charter's
    "does not own" list already forbids.
+33. **A recorded lesson repeats until the fix is mechanical.** Gap 15 already said that appending a
+   corrected rule does not retract the original, and revision 14 repeated the same failure inside AC10.
+   The durable rule: when a review changes a stated requirement, edit the sentence that states it, then
+   grep for every other sentence that states the same requirement before committing.
+34. **A field becoming `Option` in Rust does not make the generated property optional.** The generated
+   TypeScript declaration is a separate artifact with its own contract, so every `Option` field needs an
+   explicit per-field optionality assertion. A generated required property passes all Rust wire tests and
+   still breaks the client.
 
 ## 13. Park status — RELEASED
 
