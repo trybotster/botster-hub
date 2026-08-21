@@ -259,6 +259,28 @@ fn dead_daemon_backstop_reaps_registry_worker_without_adopting_foreign() {
 }
 
 #[test]
+fn untokened_start_boundary_notify_is_ignored() {
+    let _lock = daemon_test_guard();
+    let token = next_real_daemon_start_token();
+    let boundary = arm_real_daemon_start_boundary(token);
+    notify_real_daemon_start_boundary();
+    assert!(
+        boundary.matched.try_recv().is_err(),
+        "a thread without a start token must not match the armed boundary"
+    );
+    assert!(
+        boundary.foreign.try_recv().is_err(),
+        "a thread without a start token must not count as a foreign start"
+    );
+    set_real_daemon_start_token(token);
+    notify_real_daemon_start_boundary();
+    boundary
+        .matched
+        .recv_timeout(Duration::from_secs(1))
+        .expect("tokened notify matches the armed boundary");
+    clear_real_daemon_start_token();
+}
+
 fn taint_latch_refuses_next_daemon_start_without_spawning() {
     let _lock = daemon_test_guard();
     record_harness_taint("injected prove-absence failure");
@@ -282,38 +304,40 @@ fn taint_latch_refuses_next_daemon_start_without_spawning() {
 fn injected_taint_cannot_race_an_unguarded_real_daemon_start() {
     let lock = daemon_test_guard();
     reset_harness_taint_after_proof();
-    record_harness_taint("injected race taint");
     let data_dir = unique_short_test_dir("gxt");
     fs::create_dir_all(&data_dir).expect("create data dir");
     let token = next_real_daemon_start_token();
-    let boundary = arm_real_daemon_start_boundary(token);
-    let start_dir = data_dir.clone();
-    let handle = thread::spawn(move || {
-        set_real_daemon_start_token(token);
-        let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            start_cli_daemon(&start_dir)
-        }));
-        clear_real_daemon_start_token();
-        started
-    });
-    boundary
-        .matched
-        .recv_timeout(Duration::from_secs(5))
-        .expect("intended child reached the real-daemon start boundary");
-    assert!(
-        boundary.foreign.try_recv().is_err(),
-        "intended start must not also count as a foreign start"
-    );
-    assert!(
-        harness_taint().is_some_and(|evidence| evidence.contains("injected race taint")),
-        "parent must still hold the injected taint at the start boundary: {:?}",
-        harness_taint()
-    );
-    assert!(
-        !daemon_socket_path(&data_dir).exists(),
-        "concurrent start must wait at the daemon guard, not create a socket under taint"
-    );
-    reset_harness_taint_after_proof();
+    let handle = {
+        let _taint = ScopedHarnessTaint::inject("injected race taint");
+        let boundary = arm_real_daemon_start_boundary(token);
+        let start_dir = data_dir.clone();
+        let handle = thread::spawn(move || {
+            set_real_daemon_start_token(token);
+            let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                start_cli_daemon(&start_dir)
+            }));
+            clear_real_daemon_start_token();
+            started
+        });
+        boundary
+            .matched
+            .recv_timeout(Duration::from_secs(5))
+            .expect("intended child reached the real-daemon start boundary");
+        assert!(
+            boundary.foreign.try_recv().is_err(),
+            "intended start must not also count as a foreign start"
+        );
+        assert!(
+            harness_taint().is_some_and(|evidence| evidence.contains("injected race taint")),
+            "parent must still hold the injected taint at the start boundary: {:?}",
+            harness_taint()
+        );
+        assert!(
+            !daemon_socket_path(&data_dir).exists(),
+            "concurrent start must wait at the daemon guard, not create a socket under taint"
+        );
+        handle
+    };
     drop(lock);
     let started = handle.join().expect("start thread");
     disarm_real_daemon_start_boundary();
@@ -321,14 +345,13 @@ fn injected_taint_cannot_race_an_unguarded_real_daemon_start() {
         panic!("concurrent real-daemon start raced the injected taint: {panic:?}")
     });
     daemon.shutdown();
-    reset_harness_taint_after_proof();
 }
 
 #[test]
 fn injected_taint_race_fails_when_start_guard_is_bypassed() {
     let lock = daemon_test_guard();
     reset_harness_taint_after_proof();
-    record_harness_taint("injected race taint");
+    let _taint = ScopedHarnessTaint::inject("injected race taint");
     let data_dir = unique_short_test_dir("gxb");
     fs::create_dir_all(&data_dir).expect("create data dir");
     let token = next_real_daemon_start_token();
@@ -363,7 +386,7 @@ fn injected_taint_race_fails_when_start_guard_is_bypassed() {
         !daemon_socket_path(&data_dir).exists(),
         "bypassed tainted start must not create a daemon socket"
     );
-    reset_harness_taint_after_proof();
+    drop(_taint);
     drop(lock);
 }
 
@@ -371,45 +394,47 @@ fn injected_taint_race_fails_when_start_guard_is_bypassed() {
 fn sibling_real_daemon_start_cannot_satisfy_intended_boundary_hook() {
     let lock = daemon_test_guard();
     reset_harness_taint_after_proof();
-    record_harness_taint("injected race taint");
     let intended_dir = unique_short_test_dir("gxi");
     let sibling_dir = unique_short_test_dir("gxs");
     fs::create_dir_all(&intended_dir).expect("create intended data dir");
     fs::create_dir_all(&sibling_dir).expect("create sibling data dir");
     let intended_token = next_real_daemon_start_token();
     let sibling_token = next_real_daemon_start_token();
-    let boundary = arm_real_daemon_start_boundary(intended_token);
-    let sibling_start = sibling_dir.clone();
-    let sibling = thread::spawn(move || {
-        set_real_daemon_start_token(sibling_token);
-        let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            start_cli_daemon(&sibling_start)
-        }));
-        clear_real_daemon_start_token();
-        started
-    });
-    boundary
-        .foreign
-        .recv_timeout(Duration::from_secs(5))
-        .expect("sibling start reached the boundary without the intended token");
-    assert!(
-        boundary.matched.try_recv().is_err(),
-        "a sibling first-acquire must not satisfy the intended start-boundary hook"
-    );
-    let intended_start = intended_dir.clone();
-    let intended = thread::spawn(move || {
-        set_real_daemon_start_token(intended_token);
-        let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            start_cli_daemon(&intended_start)
-        }));
-        clear_real_daemon_start_token();
-        started
-    });
-    boundary
-        .matched
-        .recv_timeout(Duration::from_secs(5))
-        .expect("intended child reached the real-daemon start boundary after the sibling");
-    reset_harness_taint_after_proof();
+    let (sibling, intended) = {
+        let _taint = ScopedHarnessTaint::inject("injected race taint");
+        let boundary = arm_real_daemon_start_boundary(intended_token);
+        let sibling_start = sibling_dir.clone();
+        let sibling = thread::spawn(move || {
+            set_real_daemon_start_token(sibling_token);
+            let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                start_cli_daemon(&sibling_start)
+            }));
+            clear_real_daemon_start_token();
+            started
+        });
+        boundary
+            .foreign
+            .recv_timeout(Duration::from_secs(5))
+            .expect("sibling start reached the boundary without the intended token");
+        assert!(
+            boundary.matched.try_recv().is_err(),
+            "a sibling first-acquire must not satisfy the intended start-boundary hook"
+        );
+        let intended_start = intended_dir.clone();
+        let intended = thread::spawn(move || {
+            set_real_daemon_start_token(intended_token);
+            let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                start_cli_daemon(&intended_start)
+            }));
+            clear_real_daemon_start_token();
+            started
+        });
+        boundary
+            .matched
+            .recv_timeout(Duration::from_secs(5))
+            .expect("intended child reached the real-daemon start boundary after the sibling");
+        (sibling, intended)
+    };
     drop(lock);
     let sibling_started = sibling.join().expect("sibling start thread");
     let intended_started = intended.join().expect("intended start thread");
@@ -422,7 +447,6 @@ fn sibling_real_daemon_start_cannot_satisfy_intended_boundary_hook() {
     });
     sibling_daemon.shutdown();
     intended_daemon.shutdown();
-    reset_harness_taint_after_proof();
 }
 
 #[test]

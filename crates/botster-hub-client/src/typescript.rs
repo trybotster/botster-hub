@@ -10,7 +10,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
     );
     line(
         &mut output,
-        "import type { PackageSurfaceDescriptor, UiActionRequest, UiActionResult, UiNode } from \"@trybotster/ui-contract\";",
+        "import type { PackageNoticeReactionDescriptor, PackageSurfaceDescriptor, UiActionRequest, UiActionResult, UiNode } from \"@trybotster/ui-contract\";",
     );
     line(&mut output, "");
     line(
@@ -999,6 +999,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("state", "string"),
             ("requested_capabilities", "DaemonCapability[]"),
             ("surfaces?", "PackageSurfaceDescriptor[]"),
+            ("notice_reactions?", "PackageNoticeReactionDescriptor[]"),
             ("routes?", "DaemonPackageRouteDescriptor[]"),
             ("runnable_entrypoints", "DaemonPackageRunnableEntrypoint[]"),
             ("configuration", "DaemonPackageConfiguration"),

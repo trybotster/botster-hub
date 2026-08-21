@@ -2,7 +2,8 @@ import schema from "./schema.json" with { type: "json" };
 import conformanceFixtures from "./conformance-fixtures.json" with { type: "json" };
 
 export { schema, conformanceFixtures };
-export const packageVersion = "0.3.2";
+export const packageVersion = "0.3.3";
+export const NOTICE_TEXT_MAX_BYTES = 512;
 
 const utf8Encoder = new TextEncoder();
 
@@ -55,6 +56,94 @@ function matchesWhere(record, where) {
     }
   }
   return true;
+}
+
+function decodeNoticeTextPointer(pointer) {
+  if (typeof pointer !== "string" || !pointer.startsWith("/")) {
+    throw Object.assign(
+      new Error(`notice text pointer \`${pointer}\` must start with \`/\``),
+      { code: "missing_leading_slash" },
+    );
+  }
+  const raw = pointer.slice(1);
+  if (raw.includes("/")) {
+    throw Object.assign(
+      new Error(`notice text pointer \`${pointer}\` must be one top-level segment`),
+      { code: "multi_segment" },
+    );
+  }
+  let decoded = "";
+  for (let index = 0; index < raw.length; index += 1) {
+    const ch = raw[index];
+    if (ch !== "~") {
+      decoded += ch;
+      continue;
+    }
+    const escape = raw[index + 1];
+    if (escape === undefined) {
+      throw Object.assign(
+        new Error(`notice text pointer \`${pointer}\` has a trailing \`~\``),
+        { code: "trailing_tilde" },
+      );
+    }
+    if (escape === "0") {
+      decoded += "~";
+    } else if (escape === "1") {
+      decoded += "/";
+    } else {
+      throw Object.assign(
+        new Error(`notice text pointer \`${pointer}\` has an unknown \`~\` escape`),
+        { code: "unknown_escape" },
+      );
+    }
+    index += 1;
+  }
+  if (decoded === "") {
+    throw Object.assign(
+      new Error(`notice text pointer \`${pointer}\` decodes to an empty property name`),
+      { code: "empty_property_name" },
+    );
+  }
+  return decoded;
+}
+
+/**
+ * Resolve notice text from a payload using one top-level RFC 6901 pointer.
+ * Measures the decoded JSON string as UTF-8 bytes. Does not trim or truncate.
+ */
+export function resolveNoticeText(payload, pointer) {
+  const property = decodeNoticeTextPointer(pointer);
+  if (
+    payload == null ||
+    typeof payload !== "object" ||
+    Array.isArray(payload) ||
+    !Object.hasOwn(payload, property)
+  ) {
+    throw Object.assign(new Error(`notice text property \`${property}\` is missing`), {
+      code: "missing",
+    });
+  }
+  const value = payload[property];
+  if (typeof value !== "string") {
+    throw Object.assign(new Error(`notice text property \`${property}\` is not a string`), {
+      code: "not_string",
+    });
+  }
+  const bytes = utf8Bytes(value).byteLength;
+  if (bytes === 0) {
+    throw Object.assign(new Error(`notice text property \`${property}\` is empty`), {
+      code: "empty",
+    });
+  }
+  if (bytes > NOTICE_TEXT_MAX_BYTES) {
+    throw Object.assign(
+      new Error(
+        `notice text property \`${property}\` is ${bytes} bytes; maximum is ${NOTICE_TEXT_MAX_BYTES}`,
+      ),
+      { code: "oversized", bytes },
+    );
+  }
+  return value;
 }
 
 /**

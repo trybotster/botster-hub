@@ -1,6 +1,6 @@
 // Generated from crates/botster-hub-client Rust serde DTOs.
 // Regenerate/check with: ./test.sh -p botster-hub-client
-import type { PackageSurfaceDescriptor, UiActionRequest, UiActionResult, UiNode } from "@trybotster/ui-contract";
+import type { PackageNoticeReactionDescriptor, PackageSurfaceDescriptor, UiActionRequest, UiActionResult, UiNode } from "@trybotster/ui-contract";
 
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 export type JsonObject = { [key: string]: JsonValue };
@@ -606,6 +606,7 @@ export interface DaemonPackage {
   state: string;
   requested_capabilities: DaemonCapability[];
   surfaces?: PackageSurfaceDescriptor[];
+  notice_reactions?: PackageNoticeReactionDescriptor[];
   routes?: DaemonPackageRouteDescriptor[];
   runnable_entrypoints: DaemonPackageRunnableEntrypoint[];
   configuration: DaemonPackageConfiguration;
