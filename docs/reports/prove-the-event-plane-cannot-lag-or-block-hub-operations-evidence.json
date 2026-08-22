@@ -6,7 +6,7 @@
   "target_id": "tgt_7e208a0c76a44980a83b63af976b1f22",
   "target_repository": "botster-hub",
   "executed_revisions": {
-    "botster-hub": "d249fe7722295e52159ac055f75a28bfb6a1b5b7",
+    "botster-hub": "761c79adb61ac7e845fee8842db71b609575196a",
     "botster-core": "7eafa470a18025895995bbedc20d34b58106a03b"
   },
   "cited_prerequisite_revisions": {
@@ -39,7 +39,7 @@
     }
   },
   "provenance": {
-    "note": "This Review-return implement visit ran on Darwin at d249fe7. Calibration and acceptance require the loaded-daemon-lifecycle ubuntu-24.04 residual-tail runner.",
+    "note": "This Review-return implement visit ran on Darwin at 761c79a. Calibration and acceptance require the loaded-daemon-lifecycle ubuntu-24.04 residual-tail runner.",
     "stress_profile_required": "residual-tail",
     "test_target": "event-plane-saturation"
   },
