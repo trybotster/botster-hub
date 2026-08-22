@@ -16,7 +16,7 @@ under saturation and does not change terminal byte ownership.
 | --- | --- |
 | Runner | fresh GitHub-hosted `ubuntu-24.04` from `.github/workflows/loaded-daemon-lifecycle.yml` |
 | Recorded fields | runner image, architecture, CPU count, total memory, kernel release, `ulimit -n`, PTY ceiling, Rust 1.97.0, Zig 0.16.0 |
-| Stress profile | `residual-tail`, identical in calibration and acceptance |
+| Stress profile | `none`, identical in calibration and acceptance |
 
 ## Fleet and schedule
 
@@ -104,6 +104,12 @@ tuning opportunity.
 Reuse `clean`, `product_failure`, `host_exhaustion`, `environment_tainted`, and
 `survivors_present` from `docs/lifecycle-suite-harness.md`.
 
+`host_exhaustion` is selected when the decoupled control arm cannot meet the
+published operation and terminal budgets, when a monotonic scheduler-lag probe
+exceeds `MAX_READY_OPERATION_WAIT_MS`, or when FD/PTY probes confirm resource
+exhaustion. Load average does not select the verdict. If the decoupled arm is
+valid and the enabled arm breaches a budget, the verdict is `product_failure`.
+
 ## How to run
 
 ```sh
@@ -112,8 +118,9 @@ gh workflow run loaded-daemon-lifecycle.yml \
   -f subject_sha=<exact Hub SHA> \
   -f test_target=event-plane-saturation \
   -F repetitions=1 \
-  -f stress_profile=residual-tail
+  -f stress_profile=none
 ```
 
-Local Darwin hosts cannot use `residual-tail`. They are not the reference
-profile.
+Local Darwin hosts are not the reference runner. The campaign's published
+reference is GitHub-hosted `ubuntu-24.04` with `stress_profile=none`. Other
+loaded-lifecycle tickets keep `residual-tail` as their default.

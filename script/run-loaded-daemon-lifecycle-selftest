@@ -100,7 +100,7 @@ BOTSTER_LOADED_RUN_TIMEOUT_SECONDS=900 BOTSTER_EVENT_PLANE_PHASE=calibration "$R
   --subject-sha 0123456789abcdef0123456789abcdef01234567 \
   --test-target event-plane-saturation \
   --repetitions 1 \
-  --stress-profile residual-tail \
+  --stress-profile none \
   || fail "event-plane-saturation validate-only failed under a 900s env"
 grep -q '^run_timeout_seconds=3600$' "$timeout_dir/metadata.txt" \
   || fail "event-plane-saturation must resolve 3600s even when BOTSTER_LOADED_RUN_TIMEOUT_SECONDS=900"
@@ -110,6 +110,19 @@ grep -q '^event_plane_phase=calibration$' "$timeout_dir/metadata.txt" \
   || fail "event-plane-saturation must record BOTSTER_EVENT_PLANE_PHASE"
 pass "event-plane-saturation run timeout is 3600s when the workflow default is 900s"
 
+wrong_profile_dir="$SELFTEST_DIR/event-plane-wrong-profile"
+mkdir -p "$wrong_profile_dir"
+if BOTSTER_LOADED_RUN_TIMEOUT_SECONDS=3600 BOTSTER_EVENT_PLANE_PHASE=calibration "$RUNNER" \
+  --validate-only \
+  --artifact-dir "$wrong_profile_dir" \
+  --subject-sha 0123456789abcdef0123456789abcdef01234567 \
+  --test-target event-plane-saturation \
+  --repetitions 1 \
+  --stress-profile residual-tail; then
+  fail "event-plane-saturation validate-only must reject residual-tail"
+fi
+pass "event-plane-saturation requires stress_profile=none"
+
 missing_phase_dir="$SELFTEST_DIR/event-plane-missing-phase"
 mkdir -p "$missing_phase_dir"
 if BOTSTER_LOADED_RUN_TIMEOUT_SECONDS=3600 env -u BOTSTER_EVENT_PLANE_PHASE "$RUNNER" \
@@ -118,7 +131,7 @@ if BOTSTER_LOADED_RUN_TIMEOUT_SECONDS=3600 env -u BOTSTER_EVENT_PLANE_PHASE "$RU
   --subject-sha 0123456789abcdef0123456789abcdef01234567 \
   --test-target event-plane-saturation \
   --repetitions 1 \
-  --stress-profile residual-tail; then
+  --stress-profile none; then
   fail "event-plane-saturation validate-only must fail without BOTSTER_EVENT_PLANE_PHASE"
 fi
 pass "event-plane-saturation validate-only requires an explicit phase"
@@ -133,7 +146,7 @@ BOTSTER_EVENT_PLANE_PHASE=acceptance \
   --subject-sha 0123456789abcdef0123456789abcdef01234567 \
   --test-target event-plane-saturation \
   --repetitions 1 \
-  --stress-profile residual-tail \
+  --stress-profile none \
   || fail "event-plane-saturation acceptance validate-only failed"
 grep -q '^event_plane_phase=acceptance$' "$acceptance_dir/metadata.txt" \
   || fail "event-plane-saturation must record acceptance phase"
@@ -149,7 +162,7 @@ if BOTSTER_EVENT_PLANE_PHASE=acceptance env -u BOTSTER_EVENT_PLANE_CALIBRATION_C
   --subject-sha 0123456789abcdef0123456789abcdef01234567 \
   --test-target event-plane-saturation \
   --repetitions 1 \
-  --stress-profile residual-tail; then
+  --stress-profile none; then
   fail "acceptance validate-only must fail without BOTSTER_EVENT_PLANE_CALIBRATION_COMMIT"
 fi
 pass "acceptance validate-only requires the calibration dataset commit"

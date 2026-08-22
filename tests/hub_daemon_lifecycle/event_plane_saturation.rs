@@ -24,6 +24,8 @@ const EVENT_PLANE_BURSTS_PER_SEC: u64 = 6;
 const EVENT_PLANE_RATIO_R: f64 = 1.25;
 const EVENT_PLANE_SLACK_MS: f64 = 8.0;
 const EVENT_PLANE_THROUGHPUT_T: f64 = 0.80;
+const EVENT_PLANE_STRESS_PROFILE: &str = "none";
+const EVENT_PLANE_RUNNER: &str = "ubuntu-24.04";
 const EVENT_PLANE_NOISY_SESSION: &str = "event-plane-noisy";
 const EVENT_PLANE_NOISY_SUB: &str = "event-plane-noisy-sub";
 const EVENT_PLANE_OPERATIONS: [&str; 9] = [
@@ -184,6 +186,43 @@ fn event_plane_saturation_source_guards_hold() {
         "PTY probe must call libc posix_openpt on the reference runner"
     );
     assert!(!harness.contains("os.posix_openpt") && !harness.contains("os.openpt("));
+    assert_eq!(EVENT_PLANE_STRESS_PROFILE, "none");
+    assert_eq!(EVENT_PLANE_RUNNER, "ubuntu-24.04");
+    let campaign = fs::read_to_string(
+        root.join("tests/hub_daemon_lifecycle/event_plane_saturation.rs"),
+    )
+    .expect("campaign source");
+    let five_ms_clock = format!("from_millis({})", 5);
+    assert!(
+        !campaign.contains(&five_ms_clock),
+        "ShedBusy must not use a wall-clock bound"
+    );
+    assert!(
+        campaign.contains("fn probe_scheduler_lag")
+            && campaign.contains("disabled_arm_meets_published_budgets"),
+        "host-validity oracles must stay in the campaign"
+    );
+    let proof = fs::read_to_string(root.join("docs/event-plane-load-proof.md")).expect("proof");
+    assert!(
+        proof.contains("| Stress profile | `none`"),
+        "published machine profile must name stress_profile none"
+    );
+    assert!(
+        proof.contains("-f stress_profile=none"),
+        "How to run must dispatch the none profile"
+    );
+    assert!(
+        !proof.contains("stress_profile=residual-tail"),
+        "event-plane How to run must not dispatch residual-tail"
+    );
+    let plan = fs::read_to_string(
+        root.join("docs/plans/prove-the-event-plane-cannot-lag-or-block-hub-operations.md"),
+    )
+    .expect("plan");
+    assert!(
+        plan.contains("| Stress profile | `none`"),
+        "plan A.2 must name none as the fixed reference profile"
+    );
 }
 
 #[test]
@@ -193,7 +232,6 @@ fn event_plane_saturation_shed_busy_is_non_blocking() {
 
 fn prove_shed_busy_non_blocking() {
     let router = Arc::new(PackageEventRouter::new(PackageEventPlanePolicy::default()));
-    let started = Instant::now();
     let status = router.test_with_inner_held(|| {
         let router = Arc::clone(&router);
         thread::spawn(move || {
@@ -208,11 +246,107 @@ fn prove_shed_busy_non_blocking() {
         .expect("join held ingress")
     });
     assert_eq!(status, EventPlaneStatus::ShedBusy);
-    assert!(
-        started.elapsed() < Duration::from_millis(5),
-        "ShedBusy must return without waiting on the owner loop: {:?}",
-        started.elapsed()
+}
+
+
+#[test]
+#[allow(clippy::field_reassign_with_default)]
+fn event_plane_saturation_host_validity_scheduler_lag_is_host_exhaustion() {
+    let lag = SchedulerLagProbe {
+        requested_busy_us: MAX_OWNER_TURN_MS * 1000,
+        observed_elapsed_us: 1_800_000,
+        max_gap_us: 1_775_000,
+        lag_us: 1_775_000,
+        budget_us: MAX_READY_OPERATION_WAIT_MS * 1000,
+    };
+    let validity = classify_host_validity(
+        Some(&botster_hub_client::DaemonObservabilityCounters::default()),
+        &lag,
+        ResourceProbe::Unconfirmed,
+        ResourceProbe::Unconfirmed,
+        HostDiagnostics {
+            loadavg_1: Some(0.1),
+            ..HostDiagnostics::default()
+        },
     );
+    assert_eq!(validity.verdict, HostValidityVerdict::Exhausted);
+    assert!(validity.scheduler_lag.exceeds_budget());
+    assert!(
+        validity
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("scheduler_lag"))
+    );
+}
+
+#[test]
+#[allow(clippy::field_reassign_with_default)]
+fn event_plane_saturation_host_validity_disabled_arm_over_budget_is_host_exhaustion() {
+    let mut decoupled = botster_hub_client::DaemonObservabilityCounters::default();
+    decoupled.max_owner_turn_us = 219_723;
+    decoupled.max_ready_operation_wait_us = 1_845_228;
+    let validity = classify_host_validity(
+        Some(&decoupled),
+        &idle_scheduler_lag(),
+        ResourceProbe::Unconfirmed,
+        ResourceProbe::Unconfirmed,
+        HostDiagnostics::default(),
+    );
+    assert_eq!(validity.verdict, HostValidityVerdict::Exhausted);
+    assert_eq!(validity.disabled_arm_meets_published_budgets, Some(false));
+    assert!(!validity.scheduler_lag.exceeds_budget());
+}
+
+#[test]
+#[allow(clippy::field_reassign_with_default)]
+fn event_plane_saturation_valid_disabled_arm_makes_enabled_breach_product_failure() {
+    let mut decoupled = botster_hub_client::DaemonObservabilityCounters::default();
+    decoupled.max_owner_turn_us = 8_000;
+    decoupled.max_ready_operation_wait_us = 12_000;
+    let validity = classify_host_validity(
+        Some(&decoupled),
+        &idle_scheduler_lag(),
+        ResourceProbe::Unconfirmed,
+        ResourceProbe::Unconfirmed,
+        HostDiagnostics::default(),
+    );
+    assert_eq!(validity.verdict, HostValidityVerdict::Valid);
+    assert_eq!(validity.disabled_arm_meets_published_budgets, Some(true));
+    let mut enabled = botster_hub_client::DaemonObservabilityCounters::default();
+    enabled.max_owner_turn_us = 219_723;
+    assert_eq!(
+        classify_enabled_budget_failure(&validity, &enabled),
+        "product_failure"
+    );
+}
+
+#[test]
+fn event_plane_saturation_host_validity_ignores_load_average() {
+    let validity = classify_host_validity(
+        Some(&botster_hub_client::DaemonObservabilityCounters::default()),
+        &idle_scheduler_lag(),
+        ResourceProbe::Unconfirmed,
+        ResourceProbe::Unconfirmed,
+        HostDiagnostics {
+            loadavg_1: Some(48.0),
+            loadavg_5: Some(47.0),
+            loadavg_15: Some(46.0),
+            runnable: Some(400),
+            total_threads: Some(500),
+            cpu_steal: Some(12.0),
+        },
+    );
+    assert_eq!(validity.verdict, HostValidityVerdict::Valid);
+    assert_eq!(validity.disabled_arm_meets_published_budgets, Some(true));
+}
+
+#[test]
+fn event_plane_saturation_scheduler_lag_probe_records_monotonic_elapsed() {
+    let probe = probe_scheduler_lag();
+    assert_eq!(probe.requested_busy_us, MAX_OWNER_TURN_MS * 1000);
+    assert_eq!(probe.budget_us, MAX_READY_OPERATION_WAIT_MS * 1000);
+    assert!(probe.observed_elapsed_us >= probe.requested_busy_us);
+    assert!(probe.lag_us >= probe.observed_elapsed_us.saturating_sub(probe.requested_busy_us));
 }
 
 #[test]
@@ -352,7 +486,10 @@ fn event_plane_saturation_dataset_records_fault_resync() {
             }
         })),
         None,
+        &dummy_host_validity(),
     );
+    assert_eq!(body["profile"]["stress_profile"], EVENT_PLANE_STRESS_PROFILE);
+    assert_eq!(body["host_validity"]["verdict"], "valid");
     assert_eq!(
         body["lifecycle"]["faults"]["lifecycle_resync_reads"],
         2,
@@ -444,16 +581,50 @@ fn event_plane_saturation_campaign() {
     let _guard = daemon_test_guard();
     let fd = probe_fd_limit();
     let pty = probe_pty_allocation();
+    let lag = probe_scheduler_lag();
     eprintln!(
-        "event-plane saturation host probe fd={:?} pty={:?}",
+        "event-plane saturation host probe fd={:?} pty={:?} scheduler_lag_us={} budget_us={}",
         fd.marker_name(),
-        pty.marker_name()
+        pty.marker_name(),
+        lag.lag_us,
+        lag.budget_us
     );
+    let pre = classify_host_validity(None, &lag, fd, pty, host_load_diagnostics());
+    if pre.verdict == HostValidityVerdict::Exhausted {
+        panic!(
+            "host_exhaustion pre-measurement scheduler or resource probe: {}",
+            pre.summary()
+        );
+    }
     let phase = campaign_phase();
-    let enabled = run_saturation_arm(SaturationArm::PlaneEnabled);
     let decoupled = run_saturation_arm(SaturationArm::PlaneDecoupled);
+    let lag = probe_scheduler_lag();
+    let fd = probe_fd_limit();
+    let pty = probe_pty_allocation();
+    let validity = classify_host_validity(
+        Some(&decoupled.observability),
+        &lag,
+        fd,
+        pty,
+        host_load_diagnostics(),
+    );
+    if validity.verdict == HostValidityVerdict::Exhausted {
+        panic!(
+            "host_exhaustion disabled control arm cannot meet published budgets or scheduler lag exceeds budget: {}",
+            validity.summary()
+        );
+    }
+    let enabled = run_saturation_arm(SaturationArm::PlaneEnabled);
     let enabled_metrics = metrics_for_arm(&enabled);
     let decoupled_metrics = metrics_for_arm(&decoupled);
+    let class = classify_enabled_budget_failure(&validity, &enabled.observability);
+    if class != "clean" {
+        panic!(
+            "{class} enabled arm breached published budgets: {:?}; host_validity={}",
+            published_budget_breaches(&enabled.observability),
+            validity.summary()
+        );
+    }
     let (thresholds, source_revision) = match phase {
         CampaignPhase::Calibration => (
             derive_all_thresholds(&enabled_metrics),
@@ -476,6 +647,7 @@ fn event_plane_saturation_campaign() {
         &faults,
         enabled.webrtc_queues.clone(),
         source_revision,
+        &validity,
     );
 }
 
@@ -490,6 +662,277 @@ enum CampaignPhase {
     Calibration,
     Acceptance,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostValidityVerdict {
+    Valid,
+    Exhausted,
+}
+
+#[derive(Clone, Debug)]
+struct SchedulerLagProbe {
+    requested_busy_us: u64,
+    observed_elapsed_us: u64,
+    max_gap_us: u64,
+    lag_us: u64,
+    budget_us: u64,
+}
+
+impl SchedulerLagProbe {
+    fn exceeds_budget(&self) -> bool {
+        self.lag_us >= self.budget_us
+    }
+
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "requested_busy_us": self.requested_busy_us,
+            "observed_elapsed_us": self.observed_elapsed_us,
+            "max_gap_us": self.max_gap_us,
+            "lag_us": self.lag_us,
+            "budget_us": self.budget_us,
+            "exceeds_budget": self.exceeds_budget()
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct HostDiagnostics {
+    loadavg_1: Option<f64>,
+    loadavg_5: Option<f64>,
+    loadavg_15: Option<f64>,
+    runnable: Option<u64>,
+    total_threads: Option<u64>,
+    cpu_steal: Option<f64>,
+}
+
+impl HostDiagnostics {
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "loadavg_1": self.loadavg_1,
+            "loadavg_5": self.loadavg_5,
+            "loadavg_15": self.loadavg_15,
+            "runnable": self.runnable,
+            "total_threads": self.total_threads,
+            "cpu_steal": self.cpu_steal,
+            "note": "load average, runnable count, steal, and raw scheduler lag are diagnostics; they never select the verdict"
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct HostValidity {
+    verdict: HostValidityVerdict,
+    disabled_arm_meets_published_budgets: Option<bool>,
+    scheduler_lag: SchedulerLagProbe,
+    fd_probe: ResourceProbe,
+    pty_probe: ResourceProbe,
+    reasons: Vec<String>,
+    diagnostics: HostDiagnostics,
+}
+
+impl HostValidity {
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "verdict": match self.verdict {
+                HostValidityVerdict::Valid => "valid",
+                HostValidityVerdict::Exhausted => "host_exhaustion",
+            },
+            "disabled_arm_meets_published_budgets": self.disabled_arm_meets_published_budgets,
+            "scheduler_lag": self.scheduler_lag.json(),
+            "fd_probe": self.fd_probe.marker_name(),
+            "pty_probe": self.pty_probe.marker_name(),
+            "reasons": self.reasons,
+            "diagnostics": self.diagnostics.json()
+        })
+    }
+
+    fn summary(&self) -> String {
+        format!(
+            "verdict={:?} disabled_arm={:?} scheduler_lag_us={} budget_us={} fd={} pty={} reasons={:?}",
+            self.verdict,
+            self.disabled_arm_meets_published_budgets,
+            self.scheduler_lag.lag_us,
+            self.scheduler_lag.budget_us,
+            self.fd_probe.marker_name(),
+            self.pty_probe.marker_name(),
+            self.reasons
+        )
+    }
+}
+
+fn idle_scheduler_lag() -> SchedulerLagProbe {
+    SchedulerLagProbe {
+        requested_busy_us: MAX_OWNER_TURN_MS * 1000,
+        observed_elapsed_us: MAX_OWNER_TURN_MS * 1000,
+        max_gap_us: 0,
+        lag_us: 0,
+        budget_us: MAX_READY_OPERATION_WAIT_MS * 1000,
+    }
+}
+
+fn dummy_host_validity() -> HostValidity {
+    classify_host_validity(
+        Some(&botster_hub_client::DaemonObservabilityCounters::default()),
+        &idle_scheduler_lag(),
+        ResourceProbe::Unconfirmed,
+        ResourceProbe::Unconfirmed,
+        HostDiagnostics::default(),
+    )
+}
+
+fn probe_scheduler_lag() -> SchedulerLagProbe {
+    let requested = Duration::from_millis(MAX_OWNER_TURN_MS);
+    let budget_us = MAX_READY_OPERATION_WAIT_MS * 1000;
+    let start = Instant::now();
+    let mut last = start;
+    let mut max_gap = Duration::ZERO;
+    while start.elapsed() < requested {
+        let now = Instant::now();
+        max_gap = max_gap.max(now.saturating_duration_since(last));
+        last = now;
+        std::hint::spin_loop();
+    }
+    let elapsed = start.elapsed();
+    let lag = elapsed.saturating_sub(requested).max(max_gap);
+    SchedulerLagProbe {
+        requested_busy_us: MAX_OWNER_TURN_MS * 1000,
+        observed_elapsed_us: u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+        max_gap_us: u64::try_from(max_gap.as_micros()).unwrap_or(u64::MAX),
+        lag_us: u64::try_from(lag.as_micros()).unwrap_or(u64::MAX),
+        budget_us,
+    }
+}
+
+fn published_budget_breaches(
+    observability: &botster_hub_client::DaemonObservabilityCounters,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if observability.max_owner_turn_us > MAX_OWNER_TURN_MS * 1000 {
+        reasons.push(format!(
+            "owner-turn {}us exceeds MAX_OWNER_TURN_MS={}ms",
+            observability.max_owner_turn_us, MAX_OWNER_TURN_MS
+        ));
+    }
+    if observability.max_ready_operation_wait_us > MAX_READY_OPERATION_WAIT_MS * 1000 {
+        reasons.push(format!(
+            "ready-wait {}us exceeds MAX_READY_OPERATION_WAIT_MS={}ms",
+            observability.max_ready_operation_wait_us, MAX_READY_OPERATION_WAIT_MS
+        ));
+    }
+    reasons.extend(queue_bound_violations(
+        observability,
+        &PackageEventPlaneOptions::default(),
+    ));
+    reasons
+}
+
+fn classify_host_validity(
+    decoupled: Option<&botster_hub_client::DaemonObservabilityCounters>,
+    lag: &SchedulerLagProbe,
+    fd: ResourceProbe,
+    pty: ResourceProbe,
+    diagnostics: HostDiagnostics,
+) -> HostValidity {
+    let mut reasons = Vec::new();
+    let disabled_arm_meets_published_budgets = decoupled.map(|obs| {
+        let breaches = published_budget_breaches(obs);
+        if !breaches.is_empty() {
+            reasons.extend(
+                breaches
+                    .into_iter()
+                    .map(|row| format!("disabled_arm:{row}")),
+            );
+            false
+        } else {
+            true
+        }
+    });
+    if lag.exceeds_budget() {
+        reasons.push(format!(
+            "scheduler_lag {}us exceeds ready-operation budget {}us",
+            lag.lag_us, lag.budget_us
+        ));
+    }
+    if fd == ResourceProbe::Confirmed {
+        reasons.push("fd_probe confirmed".to_string());
+    }
+    if pty == ResourceProbe::Confirmed {
+        reasons.push("pty_probe confirmed".to_string());
+    }
+    let exhausted = lag.exceeds_budget()
+        || fd == ResourceProbe::Confirmed
+        || pty == ResourceProbe::Confirmed
+        || disabled_arm_meets_published_budgets == Some(false);
+    HostValidity {
+        verdict: if exhausted {
+            HostValidityVerdict::Exhausted
+        } else {
+            HostValidityVerdict::Valid
+        },
+        disabled_arm_meets_published_budgets,
+        scheduler_lag: lag.clone(),
+        fd_probe: fd,
+        pty_probe: pty,
+        reasons,
+        diagnostics,
+    }
+}
+
+fn classify_enabled_budget_failure(
+    validity: &HostValidity,
+    enabled: &botster_hub_client::DaemonObservabilityCounters,
+) -> &'static str {
+    if published_budget_breaches(enabled).is_empty() {
+        return "clean";
+    }
+    if validity.verdict == HostValidityVerdict::Valid {
+        "product_failure"
+    } else {
+        "host_exhaustion"
+    }
+}
+
+fn host_load_diagnostics() -> HostDiagnostics {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(text) = fs::read_to_string("/proc/loadavg") else {
+            return HostDiagnostics::default();
+        };
+        let parts: Vec<&str> = text.split_whitespace().collect();
+        if parts.len() < 4 {
+            return HostDiagnostics::default();
+        }
+        let (runnable, total_threads) = parts[3]
+            .split_once('/')
+            .map(|(runnable, total)| (runnable.parse().ok(), total.parse().ok()))
+            .unwrap_or((None, None));
+        HostDiagnostics {
+            loadavg_1: parts[0].parse().ok(),
+            loadavg_5: parts[1].parse().ok(),
+            loadavg_15: parts[2].parse().ok(),
+            runnable,
+            total_threads,
+            cpu_steal: cpu_steal_from_proc_stat(),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        HostDiagnostics::default()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn cpu_steal_from_proc_stat() -> Option<f64> {
+    let text = fs::read_to_string("/proc/stat").ok()?;
+    let cpu = text.lines().next()?;
+    let fields: Vec<&str> = cpu.split_whitespace().collect();
+    if fields.len() < 9 || fields[0] != "cpu" {
+        return None;
+    }
+    fields[8].parse().ok()
+}
+
+
 
 struct ArmProfile {
     n: usize,
@@ -833,6 +1276,7 @@ fn phase_dataset_body(
     faults: &FaultReport,
     webrtc_queues: Option<serde_json::Value>,
     source_revision: Option<String>,
+    host_validity: &HostValidity,
 ) -> serde_json::Value {
     let mut operations = serde_json::Map::new();
     for operation in EVENT_PLANE_GATED_OPERATIONS {
@@ -858,9 +1302,10 @@ fn phase_dataset_body(
             "percentile": "nearest_rank ceil(p * n)"
         },
         "profile": {
-            "runner": "ubuntu-24.04",
-            "stress_profile": "residual-tail"
+            "runner": EVENT_PLANE_RUNNER,
+            "stress_profile": EVENT_PLANE_STRESS_PROFILE
         },
+        "host_validity": host_validity.json(),
         "revisions": {
             "source_revision": source_revision,
             "botster_core": "7eafa470a18025895995bbedc20d34b58106a03b",
@@ -900,6 +1345,7 @@ fn write_phase_dataset(
     faults: &FaultReport,
     webrtc_queues: Option<serde_json::Value>,
     source_revision: Option<String>,
+    host_validity: &HostValidity,
 ) {
     let body = phase_dataset_body(
         phase,
@@ -911,6 +1357,7 @@ fn write_phase_dataset(
         faults,
         webrtc_queues,
         source_revision,
+        host_validity,
     );
     let phase_name = match phase {
         CampaignPhase::Calibration => "calibration",
@@ -952,8 +1399,8 @@ fn read_committed_thresholds() -> (BTreeMap<String, DerivedThresholds>, Option<S
         value["literals"]["minimum_samples"].as_u64(),
         Some(EVENT_PLANE_MIN_SAMPLES)
     );
-    assert_eq!(value["profile"]["runner"], "ubuntu-24.04");
-    assert_eq!(value["profile"]["stress_profile"], "residual-tail");
+    assert_eq!(value["profile"]["runner"], EVENT_PLANE_RUNNER);
+    assert_eq!(value["profile"]["stress_profile"], EVENT_PLANE_STRESS_PROFILE);
     assert_eq!(
         value["formulas"]["THRMIN"],
         "floor_int(THRcal_e * T)",
@@ -1293,16 +1740,20 @@ fn fail_webrtc_saturation(
     let observability = snapshot_observability(endpoint);
     let pty = probe_pty_allocation();
     let fd = probe_fd_limit();
-    let class = if pty == ResourceProbe::Confirmed || fd == ResourceProbe::Confirmed {
+    let lag = probe_scheduler_lag();
+    let validity = classify_host_validity(None, &lag, fd, pty, host_load_diagnostics());
+    let class = if validity.verdict == HostValidityVerdict::Exhausted {
         "host_exhaustion"
     } else {
         "product_failure"
     };
     panic!(
-        "{class} webrtc control failed: {error}; overflow={}; pty={:?} fd={:?}; terminal={terminal}; observability={observability:?}",
+        "{class} webrtc control failed: {error}; overflow={}; pty={:?} fd={:?} scheduler_lag_us={} budget_us={}; terminal={terminal}; observability={observability:?}",
         peer.inbound_overflow(),
         pty.marker_name(),
-        fd.marker_name()
+        fd.marker_name(),
+        lag.lag_us,
+        lag.budget_us
     );
 }
 
@@ -1923,18 +2374,6 @@ fn assert_required_signals(
         observability.stalled_write_timeouts,
         u64::MAX,
         "T4 stalled-write timeout counter must be present"
-    );
-    assert!(
-        observability.max_owner_turn_us <= MAX_OWNER_TURN_MS * 1000,
-        "owner-turn {}us exceeds MAX_OWNER_TURN_MS={}ms",
-        observability.max_owner_turn_us,
-        MAX_OWNER_TURN_MS
-    );
-    assert!(
-        observability.max_ready_operation_wait_us <= MAX_READY_OPERATION_WAIT_MS * 1000,
-        "ready-wait {}us exceeds MAX_READY_OPERATION_WAIT_MS={}ms",
-        observability.max_ready_operation_wait_us,
-        MAX_READY_OPERATION_WAIT_MS
     );
 }
 

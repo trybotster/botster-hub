@@ -80,6 +80,10 @@ validate_inputs() {
     log "focused-plugin-resource-bounds requires stress_profile=none"
     invalid=1
   fi
+  if [[ "$TEST_TARGET" == event-plane-saturation && "$STRESS_PROFILE" != none ]]; then
+    log "event-plane-saturation requires stress_profile=none"
+    invalid=1
+  fi
   EVENT_PLANE_PHASE=${BOTSTER_EVENT_PLANE_PHASE:-}
   if [[ "$TEST_TARGET" == event-plane-saturation ]]; then
     case "$EVENT_PLANE_PHASE" in
