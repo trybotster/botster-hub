@@ -120,7 +120,7 @@ async fn wait_for_webrtc_subscription_closed(
 ) -> Option<botster_hub_client::DaemonEvent> {
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
-        if let Some(index) = peer.pending_host_events.iter().position(|event| {
+        if let Some(index) = peer.pending_host_events().iter().position(|event| {
             matches!(
                 event,
                 botster_hub_client::DaemonEvent::TerminalSubscriptionClosed {
@@ -130,7 +130,7 @@ async fn wait_for_webrtc_subscription_closed(
                 } if closed_session == session_id && closed_subscription == subscription_id
             )
         }) {
-            return peer.pending_host_events.remove(index);
+            return peer.take_pending_host_event_at(index);
         }
         match timeout(Duration::from_millis(200), peer.next_host_event(key)).await {
             Ok(Ok(event)) => {
@@ -823,7 +823,7 @@ fn webrtc_terminal_adapter_host_close_emits_negotiated_terminal_subscription_clo
             other => panic!("unexpected host event: {other:?}"),
         }
         assert_eq!(
-            peer.pending_host_events
+            peer.pending_host_events()
                 .iter()
                 .filter(|event| matches!(
                     event,
@@ -914,7 +914,7 @@ fn webrtc_terminal_adapter_write_budget_emits_core_adapter_closed_while_peer_sta
             other => panic!("unexpected host event: {other:?}"),
         }
         assert!(
-            peer.pending_host_events.iter().all(|event| {
+            peer.pending_host_events().iter().all(|event| {
                 !matches!(
                     event,
                     botster_hub_client::DaemonEvent::TerminalSubscriptionClosed {
@@ -926,7 +926,7 @@ fn webrtc_terminal_adapter_write_budget_emits_core_adapter_closed_while_peer_sta
                 )
             }),
             "host_adapter_closed is not the Core write-budget oracle: {:?}",
-            peer.pending_host_events
+            peer.pending_host_events()
         );
 
         let status = peer
@@ -1053,7 +1053,7 @@ fn webrtc_terminal_adapter_unnegotiated_adapter_never_receives_or_decodes_daemon
             saw_sibling || !peer.pending_terminal_frames.is_empty(),
             "unnegotiated sibling terminal frames must still arrive"
         );
-        assert!(peer.pending_host_events.is_empty());
+        assert!(peer.pending_host_events().is_empty());
         peer.peer.close().await.expect("close offer peer");
     });
     shutdown_short_lived_session(&endpoint, "wun-a");
@@ -1124,23 +1124,23 @@ fn webrtc_terminal_adapter_detach_peer_death_process_exit_and_shutdown_do_not_em
         }
         assert!(
             no_terminal_subscription_closed(
-                peer.pending_host_events.iter(),
+                peer.pending_host_events().iter(),
                 "wnx-shutdown",
                 Some("sub-shutdown"),
                 Some(shutdown_generation)
             ),
             "WebRTC ShutdownSession must not emit TerminalSubscriptionClosed for generation {shutdown_generation}: {:?}",
-            peer.pending_host_events
+            peer.pending_host_events()
         );
         assert!(
-            peer.pending_host_events.iter().all(|event| {
+            peer.pending_host_events().iter().all(|event| {
                 !matches!(
                     event,
                     botster_hub_client::DaemonEvent::TerminalSubscriptionClosed { .. }
                 )
             }),
             "Detach, process exit, and ShutdownSession must not emit TerminalSubscriptionClosed: {:?}",
-            peer.pending_host_events
+            peer.pending_host_events()
         );
 
         let (mut death_peer, death_key) = open_local_webrtc_peer(&endpoint, &death_bootstrap).await;

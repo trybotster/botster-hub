@@ -60,6 +60,7 @@ pub(crate) const LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_MAX_BYTES: usize = 4096;
 pub(crate) const WEBRTC_INBOUND_MAX_FRAMES: usize = 128;
 pub(crate) const WEBRTC_INBOUND_MAX_BYTES: usize = 512 * 1024;
 pub(crate) const WEBRTC_PENDING_HOST_EVENTS_MAX: usize = 128;
+pub(crate) const WEBRTC_PENDING_HOST_EVENTS_MAX_BYTES: usize = 512 * 1024;
 pub(crate) const TEST_CLOSE_LOCAL_WEBRTC_OPERATION_ENV: &str =
     "BOTSTER_HUB_TEST_CLOSE_LOCAL_WEBRTC_OPERATION";
 pub(crate) struct LocalWebrtcOffererHandler {
@@ -107,10 +108,55 @@ struct FixtureQueueOccupancy {
     bytes: AtomicU64,
     high_water_count: AtomicU64,
     high_water_bytes: AtomicU64,
-    oldest_ns: AtomicU64,
     overflow: AtomicU64,
     max_count: u64,
     max_bytes: u64,
+    enqueue_ns: Mutex<VecDeque<u64>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InboundAdmitError {
+    CountLimit,
+    ByteLimit,
+    ChannelFull,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingHostEventAdmitError {
+    CountLimit,
+    ByteLimit,
+}
+
+impl std::fmt::Display for PendingHostEventAdmitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CountLimit => {
+                write!(
+                    f,
+                    "product_failure webrtc pending_host_events overflow count"
+                )
+            }
+            Self::ByteLimit => {
+                write!(
+                    f,
+                    "product_failure webrtc pending_host_events overflow bytes"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for PendingHostEventAdmitError {}
+
+fn saturating_sub_u64(cell: &AtomicU64, amount: u64) {
+    let mut current = cell.load(Ordering::Relaxed);
+    while current > 0 {
+        let next = current.saturating_sub(amount);
+        match cell.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(actual) => current = actual,
+        }
+    }
 }
 
 impl FixtureQueueOccupancy {
@@ -120,40 +166,45 @@ impl FixtureQueueOccupancy {
             bytes: AtomicU64::new(0),
             high_water_count: AtomicU64::new(0),
             high_water_bytes: AtomicU64::new(0),
-            oldest_ns: AtomicU64::new(0),
             overflow: AtomicU64::new(0),
             max_count: max_count as u64,
             max_bytes: max_bytes as u64,
+            enqueue_ns: Mutex::new(VecDeque::new()),
         }
     }
 
-    fn would_exceed(&self, add_bytes: u64) -> bool {
-        self.count.load(Ordering::Relaxed) + 1 > self.max_count
-            || self.bytes.load(Ordering::Relaxed) + add_bytes > self.max_bytes
+    fn lock_enqueue_ns(&self) -> std::sync::MutexGuard<'_, VecDeque<u64>> {
+        self.enqueue_ns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn record_push(&self, add_bytes: u64) {
+    fn would_exceed_count(&self) -> bool {
+        self.count.load(Ordering::Relaxed) + 1 > self.max_count
+    }
+
+    fn would_exceed_bytes(&self, add_bytes: u64) -> bool {
+        self.bytes.load(Ordering::Relaxed) + add_bytes > self.max_bytes
+    }
+
+    fn reserve(&self, add_bytes: u64) {
         let count = self.count.fetch_add(1, Ordering::Relaxed) + 1;
         let bytes = self.bytes.fetch_add(add_bytes, Ordering::Relaxed) + add_bytes;
         self.high_water_count.fetch_max(count, Ordering::Relaxed);
         self.high_water_bytes.fetch_max(bytes, Ordering::Relaxed);
-        let _ = self.oldest_ns.compare_exchange(
-            0,
-            monotonic_now_ns(),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
+        self.lock_enqueue_ns().push_back(monotonic_now_ns());
+    }
+
+    fn rollback_reserve(&self, add_bytes: u64) {
+        saturating_sub_u64(&self.count, 1);
+        saturating_sub_u64(&self.bytes, add_bytes);
+        let _ = self.lock_enqueue_ns().pop_back();
     }
 
     fn record_pop(&self, sub_bytes: u64) {
-        let count = self.count.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
-        self.bytes.fetch_sub(
-            sub_bytes.min(self.bytes.load(Ordering::Relaxed)),
-            Ordering::Relaxed,
-        );
-        if count == 0 {
-            self.oldest_ns.store(0, Ordering::Relaxed);
-        }
+        saturating_sub_u64(&self.count, 1);
+        saturating_sub_u64(&self.bytes, sub_bytes);
+        let _ = self.lock_enqueue_ns().pop_front();
     }
 
     fn record_overflow(&self) {
@@ -161,12 +212,11 @@ impl FixtureQueueOccupancy {
     }
 
     fn snapshot(&self) -> FixtureQueueSnapshot {
-        let oldest_ns = self.oldest_ns.load(Ordering::Relaxed);
-        let oldest_age_us = if oldest_ns == 0 {
-            None
-        } else {
-            Some(monotonic_now_ns().saturating_sub(oldest_ns) / 1_000)
-        };
+        let oldest_age_us = self
+            .lock_enqueue_ns()
+            .front()
+            .copied()
+            .map(|oldest_ns| monotonic_now_ns().saturating_sub(oldest_ns) / 1_000);
         FixtureQueueSnapshot {
             count: self.count.load(Ordering::Relaxed),
             bytes: self.bytes.load(Ordering::Relaxed),
@@ -177,6 +227,199 @@ impl FixtureQueueOccupancy {
             max_count: self.max_count,
             max_bytes: self.max_bytes,
         }
+    }
+}
+
+fn admit_inbound_frame_with_send<F>(
+    occupancy: &FixtureQueueOccupancy,
+    add_bytes: u64,
+    send: F,
+) -> Result<(), InboundAdmitError>
+where
+    F: FnOnce() -> Result<(), InboundAdmitError>,
+{
+    if occupancy.would_exceed_count() {
+        occupancy.record_overflow();
+        return Err(InboundAdmitError::CountLimit);
+    }
+    if occupancy.would_exceed_bytes(add_bytes) {
+        occupancy.record_overflow();
+        return Err(InboundAdmitError::ByteLimit);
+    }
+    occupancy.reserve(add_bytes);
+    match send() {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            occupancy.rollback_reserve(add_bytes);
+            occupancy.record_overflow();
+            Err(error)
+        }
+    }
+}
+
+fn admit_inbound_frame(
+    occupancy: &FixtureQueueOccupancy,
+    tx: &AsyncSender<String>,
+    text: String,
+) -> Result<(), InboundAdmitError> {
+    let add_bytes = text.len() as u64;
+    admit_inbound_frame_with_send(occupancy, add_bytes, || {
+        tx.try_send(text)
+            .map_err(|_| InboundAdmitError::ChannelFull)
+    })
+}
+
+struct WebrtcInboundMailbox {
+    rx: AsyncReceiver<String>,
+    occupancy: Arc<FixtureQueueOccupancy>,
+    reassembly: Option<InboundReassembly>,
+}
+
+impl WebrtcInboundMailbox {
+    fn bounded(max_count: usize, max_bytes: usize) -> (AsyncSender<String>, Self) {
+        let (tx, rx) = channel::<String>(max_count);
+        (
+            tx,
+            Self {
+                rx,
+                occupancy: Arc::new(FixtureQueueOccupancy::new(max_count, max_bytes)),
+                reassembly: None,
+            },
+        )
+    }
+
+    async fn receive_delivery(
+        &mut self,
+        key: &AesGcmKey,
+    ) -> Result<
+        (
+            botster_hub_client::DaemonLocalWebrtcDeliveryKind,
+            Vec<u8>,
+            LocalWebrtcResponseMetrics,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        loop {
+            let response = match timeout(Duration::from_secs(10), self.rx.recv()).await {
+                Ok(Some(response)) => {
+                    self.occupancy.record_pop(response.len() as u64);
+                    response
+                }
+                Ok(None) => {
+                    let progress = self.reassembly.take();
+                    return Err(local_webrtc_response_progress_error(
+                        "channel_closed",
+                        progress.as_ref().and_then(|row| row.message_id.as_deref()),
+                        progress
+                            .as_ref()
+                            .map(|row| row.next_chunk_index)
+                            .unwrap_or(0),
+                        progress.as_ref().and_then(|row| row.expected_chunk_count),
+                    )
+                    .into());
+                }
+                Err(_) => {
+                    let progress = self.reassembly.take();
+                    return Err(local_webrtc_response_progress_error(
+                        "response_timeout",
+                        progress.as_ref().and_then(|row| row.message_id.as_deref()),
+                        progress
+                            .as_ref()
+                            .map(|row| row.next_chunk_index)
+                            .unwrap_or(0),
+                        progress.as_ref().and_then(|row| row.expected_chunk_count),
+                    )
+                    .into());
+                }
+            };
+            if let Some(finished) = apply_inbound_chunk(&mut self.reassembly, &response)? {
+                let envelope_bytes = finished.encrypted.len();
+                let chunk_count = finished.expected_chunk_count.unwrap_or(0) as usize;
+                let envelope = serde_json::from_str::<AesGcmEnvelope>(&finished.encrypted)?;
+                let plaintext = decrypt_aes_gcm(key, &envelope)?;
+                return Ok((
+                    finished
+                        .delivery_kind
+                        .expect("complete delivery declares a kind"),
+                    plaintext,
+                    LocalWebrtcResponseMetrics {
+                        envelope_bytes,
+                        chunk_count,
+                        maximum_frame_bytes: finished.maximum_frame_bytes,
+                    },
+                ));
+            }
+        }
+    }
+}
+
+struct PendingHostEventState {
+    events: VecDeque<botster_hub_client::DaemonEvent>,
+    sizes: VecDeque<u64>,
+    enqueued_ns: VecDeque<u64>,
+    bytes: u64,
+    overflow: u64,
+    high_water_count: u64,
+    high_water_bytes: u64,
+}
+
+impl PendingHostEventState {
+    fn new() -> Self {
+        Self {
+            events: VecDeque::new(),
+            sizes: VecDeque::new(),
+            enqueued_ns: VecDeque::new(),
+            bytes: 0,
+            overflow: 0,
+            high_water_count: 0,
+            high_water_bytes: 0,
+        }
+    }
+
+    fn oldest_age_us(&self) -> Option<u64> {
+        self.enqueued_ns
+            .front()
+            .copied()
+            .map(|oldest_ns| monotonic_now_ns().saturating_sub(oldest_ns) / 1_000)
+    }
+
+    fn try_park(&mut self, plaintext: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+        let bytes = plaintext.len() as u64;
+        if self.events.len() >= WEBRTC_PENDING_HOST_EVENTS_MAX {
+            self.overflow += 1;
+            return Err(PendingHostEventAdmitError::CountLimit.into());
+        }
+        if self.bytes + bytes > WEBRTC_PENDING_HOST_EVENTS_MAX_BYTES as u64 {
+            self.overflow += 1;
+            return Err(PendingHostEventAdmitError::ByteLimit.into());
+        }
+        let event = serde_json::from_slice::<botster_hub_client::DaemonEvent>(plaintext)?;
+        self.events.push_back(event);
+        self.sizes.push_back(bytes);
+        self.enqueued_ns.push_back(monotonic_now_ns());
+        self.bytes += bytes;
+        self.high_water_count = self.high_water_count.max(self.events.len() as u64);
+        self.high_water_bytes = self.high_water_bytes.max(self.bytes);
+        Ok(())
+    }
+
+    fn pop_front(&mut self) -> Option<botster_hub_client::DaemonEvent> {
+        let event = self.events.pop_front()?;
+        let bytes = self.sizes.pop_front().unwrap_or(0);
+        let _ = self.enqueued_ns.pop_front();
+        self.bytes = self.bytes.saturating_sub(bytes);
+        Some(event)
+    }
+
+    fn take_at(&mut self, index: usize) -> Option<botster_hub_client::DaemonEvent> {
+        if index >= self.events.len() {
+            return None;
+        }
+        let event = self.events.remove(index)?;
+        let bytes = self.sizes.remove(index).unwrap_or(0);
+        let _ = self.enqueued_ns.remove(index);
+        self.bytes = self.bytes.saturating_sub(bytes);
+        Some(event)
     }
 }
 
@@ -236,18 +479,11 @@ pub(crate) struct LocalWebrtcOfferPeer {
     pub(crate) data_channel: Arc<dyn DataChannel>,
     pub(crate) connected_rx: AsyncReceiver<()>,
     pub(crate) data_channel_open_rx: AsyncReceiver<()>,
-    pub(crate) data_channel_message_rx: AsyncReceiver<String>,
     pub(crate) pending_entity_frames: VecDeque<botster_hub_client::DaemonEntityFrame>,
     pub(crate) pending_terminal_frames: VecDeque<(String, Vec<u8>)>,
-    pub(crate) pending_host_events: VecDeque<botster_hub_client::DaemonEvent>,
-    pending_event_sizes: VecDeque<u64>,
+    pending_host: PendingHostEventState,
     pub(crate) accept_host_events: bool,
-    inbound: Arc<FixtureQueueOccupancy>,
-    pending_overflow: u64,
-    pending_bytes: u64,
-    pending_high_water_count: u64,
-    pending_high_water_bytes: u64,
-    reassembly: Option<InboundReassembly>,
+    inbound: WebrtcInboundMailbox,
 }
 
 pub(crate) struct ExtraWebrtcDataChannel {
@@ -262,12 +498,9 @@ impl LocalWebrtcOfferPeer {
         let (gather_complete_tx, mut gather_complete_rx) = channel::<()>(1);
         let (connected_tx, connected_rx) = channel::<()>(1);
         let (data_channel_open_tx, data_channel_open_rx) = channel::<()>(1);
-        let (data_channel_message_tx, data_channel_message_rx) =
-            channel::<String>(WEBRTC_INBOUND_MAX_FRAMES);
-        let inbound = Arc::new(FixtureQueueOccupancy::new(
-            WEBRTC_INBOUND_MAX_FRAMES,
-            WEBRTC_INBOUND_MAX_BYTES,
-        ));
+        let (data_channel_message_tx, inbound) =
+            WebrtcInboundMailbox::bounded(WEBRTC_INBOUND_MAX_FRAMES, WEBRTC_INBOUND_MAX_BYTES);
+        let occupancy = Arc::clone(&inbound.occupancy);
         let handler = Arc::new(LocalWebrtcOffererHandler {
             gather_complete_tx,
             connected_tx,
@@ -297,7 +530,7 @@ impl LocalWebrtcOfferPeer {
             let data_channel = data_channel.clone();
             let open_tx = data_channel_open_tx.clone();
             let message_tx = data_channel_message_tx.clone();
-            let inbound = Arc::clone(&inbound);
+            let occupancy = Arc::clone(&occupancy);
             runtime.spawn(Box::pin(async move {
                 while let Some(event) = data_channel.poll().await {
                     match event {
@@ -306,14 +539,7 @@ impl LocalWebrtcOfferPeer {
                         }
                         DataChannelEvent::OnMessage(message) => {
                             if let Ok(text) = String::from_utf8(message.data.to_vec()) {
-                                let add_bytes = text.len() as u64;
-                                if inbound.would_exceed(add_bytes)
-                                    || message_tx.try_send(text).is_err()
-                                {
-                                    inbound.record_overflow();
-                                } else {
-                                    inbound.record_push(add_bytes);
-                                }
+                                let _ = admit_inbound_frame(&occupancy, &message_tx, text);
                             }
                         }
                         DataChannelEvent::OnClose => break,
@@ -338,18 +564,11 @@ impl LocalWebrtcOfferPeer {
                 data_channel,
                 connected_rx,
                 data_channel_open_rx,
-                data_channel_message_rx,
                 pending_entity_frames: VecDeque::new(),
                 pending_terminal_frames: VecDeque::new(),
-                pending_host_events: VecDeque::new(),
-                pending_event_sizes: VecDeque::new(),
+                pending_host: PendingHostEventState::new(),
                 accept_host_events: false,
                 inbound,
-                pending_overflow: 0,
-                pending_bytes: 0,
-                pending_high_water_count: 0,
-                pending_high_water_bytes: 0,
-                reassembly: None,
             },
             offer,
         ))
@@ -501,12 +720,24 @@ impl LocalWebrtcOfferPeer {
 
     #[must_use]
     pub(crate) fn inbound_overflow(&self) -> u64 {
-        self.inbound.overflow.load(Ordering::Relaxed)
+        self.inbound.occupancy.overflow.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub(crate) fn pending_host_events(&self) -> &VecDeque<botster_hub_client::DaemonEvent> {
+        &self.pending_host.events
+    }
+
+    pub(crate) fn take_pending_host_event_at(
+        &mut self,
+        index: usize,
+    ) -> Option<botster_hub_client::DaemonEvent> {
+        self.pending_host.take_at(index)
     }
 
     #[must_use]
     pub(crate) fn fixture_queue_snapshot(&self) -> serde_json::Value {
-        let inbound = self.inbound.snapshot();
+        let inbound = self.inbound.occupancy.snapshot();
         serde_json::json!({
             "inbound_frames": {
                 "count": inbound.count,
@@ -519,12 +750,14 @@ impl LocalWebrtcOfferPeer {
                 "max_bytes": inbound.max_bytes
             },
             "pending_host_events": {
-                "count": self.pending_host_events.len() as u64,
-                "bytes": self.pending_bytes,
-                "high_water_count": self.pending_high_water_count,
-                "high_water_bytes": self.pending_high_water_bytes,
-                "overflow": self.pending_overflow,
-                "max_count": WEBRTC_PENDING_HOST_EVENTS_MAX as u64
+                "count": self.pending_host.events.len() as u64,
+                "bytes": self.pending_host.bytes,
+                "high_water_count": self.pending_host.high_water_count,
+                "high_water_bytes": self.pending_host.high_water_bytes,
+                "oldest_age_us": self.pending_host.oldest_age_us(),
+                "overflow": self.pending_host.overflow,
+                "max_count": WEBRTC_PENDING_HOST_EVENTS_MAX as u64,
+                "max_bytes": WEBRTC_PENDING_HOST_EVENTS_MAX_BYTES as u64
             }
         })
     }
@@ -539,32 +772,14 @@ impl LocalWebrtcOfferPeer {
             )
             .into());
         }
-        let bytes = plaintext.len() as u64;
-        if self.pending_host_events.len() >= WEBRTC_PENDING_HOST_EVENTS_MAX {
-            self.pending_overflow += 1;
-            return Err(std::io::Error::other(
-                "product_failure webrtc pending_host_events overflow",
-            )
-            .into());
-        }
-        self.pending_host_events
-            .push_back(serde_json::from_slice(plaintext)?);
-        self.pending_event_sizes.push_back(bytes);
-        self.pending_bytes += bytes;
-        self.pending_high_water_count = self
-            .pending_high_water_count
-            .max(self.pending_host_events.len() as u64);
-        self.pending_high_water_bytes = self.pending_high_water_bytes.max(self.pending_bytes);
-        Ok(())
+        self.pending_host.try_park(plaintext)
     }
 
     pub(crate) async fn next_host_event(
         &mut self,
         key: &AesGcmKey,
     ) -> Result<botster_hub_client::DaemonEvent, Box<dyn std::error::Error>> {
-        if let Some(event) = self.pending_host_events.pop_front() {
-            let bytes = self.pending_event_sizes.pop_front().unwrap_or(0);
-            self.pending_bytes = self.pending_bytes.saturating_sub(bytes);
+        if let Some(event) = self.pending_host.pop_front() {
             return Ok(event);
         }
         loop {
@@ -602,58 +817,7 @@ impl LocalWebrtcOfferPeer {
         ),
         Box<dyn std::error::Error>,
     > {
-        loop {
-            let response =
-                match timeout(Duration::from_secs(10), self.data_channel_message_rx.recv()).await {
-                    Ok(Some(response)) => {
-                        self.inbound.record_pop(response.len() as u64);
-                        response
-                    }
-                    Ok(None) => {
-                        let progress = self.reassembly.take();
-                        return Err(local_webrtc_response_progress_error(
-                            "channel_closed",
-                            progress.as_ref().and_then(|row| row.message_id.as_deref()),
-                            progress
-                                .as_ref()
-                                .map(|row| row.next_chunk_index)
-                                .unwrap_or(0),
-                            progress.as_ref().and_then(|row| row.expected_chunk_count),
-                        )
-                        .into());
-                    }
-                    Err(_) => {
-                        let progress = self.reassembly.take();
-                        return Err(local_webrtc_response_progress_error(
-                            "response_timeout",
-                            progress.as_ref().and_then(|row| row.message_id.as_deref()),
-                            progress
-                                .as_ref()
-                                .map(|row| row.next_chunk_index)
-                                .unwrap_or(0),
-                            progress.as_ref().and_then(|row| row.expected_chunk_count),
-                        )
-                        .into());
-                    }
-                };
-            if let Some(finished) = apply_inbound_chunk(&mut self.reassembly, &response)? {
-                let envelope_bytes = finished.encrypted.len();
-                let chunk_count = finished.expected_chunk_count.unwrap_or(0) as usize;
-                let envelope = serde_json::from_str::<AesGcmEnvelope>(&finished.encrypted)?;
-                let plaintext = decrypt_aes_gcm(key, &envelope)?;
-                return Ok((
-                    finished
-                        .delivery_kind
-                        .expect("complete delivery declares a kind"),
-                    plaintext,
-                    LocalWebrtcResponseMetrics {
-                        envelope_bytes,
-                        chunk_count,
-                        maximum_frame_bytes: finished.maximum_frame_bytes,
-                    },
-                ));
-            }
-        }
+        self.inbound.receive_delivery(key).await
     }
 
     pub(crate) async fn create_extra_data_channel(
@@ -1549,51 +1713,156 @@ pub(crate) fn local_webrtc_bounded_stderr_tail(stderr: &[u8], data_dir: &Path) -
     }
 }
 
-fn test_chunk(index: u32, count: u32, payload: &str) -> String {
+fn test_chunk(index: u32, count: u32, payload: &str, total_bytes: usize) -> String {
     serde_json::json!({
         "version": botster_hub_client::LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION,
-        "delivery_kind": "daemon_event",
+        "delivery_kind": "daemon_response",
         "message_id": "reassembly-test",
         "chunk_index": index,
         "chunk_count": count,
-        "total_bytes": 4,
+        "total_bytes": total_bytes,
         "payload": payload
     })
     .to_string()
 }
 
+fn session_lifecycle_event(session_id: &str) -> Vec<u8> {
+    serde_json::to_vec(&botster_hub_client::DaemonEvent::SessionLifecycle {
+        session_id: session_id.to_string(),
+        state: "running".to_string(),
+    })
+    .expect("session lifecycle event")
+}
+
 #[test]
 fn inbound_chunk_reassembly_survives_cancelled_read() {
-    let mut assembly = None;
-    let first = apply_inbound_chunk(&mut assembly, &test_chunk(0, 2, "ab")).expect("first chunk");
-    assert!(first.is_none(), "first chunk must stay incomplete");
+    let _runtime = default_runtime().expect("async runtime");
+    let key = AesGcmKey::from_slice(&[9; 32]).expect("test AES key");
+    let envelope = encrypt_aes_gcm(&key, b"delivery-ok", 1).expect("encrypt delivery");
+    let encrypted = serde_json::to_string(&envelope).expect("envelope json");
+    let mid = encrypted.len() / 2;
+    let first_chunk = test_chunk(0, 2, &encrypted[..mid], encrypted.len());
+    let second_chunk = test_chunk(1, 2, &encrypted[mid..], encrypted.len());
+
+    let (tx, mut inbound) = WebrtcInboundMailbox::bounded(8, 64 * 1024);
+    admit_inbound_frame(&inbound.occupancy, &tx, first_chunk).expect("admit first chunk");
+
+    let cancelled = block_on(async {
+        timeout(Duration::from_millis(50), inbound.receive_delivery(&key)).await
+    });
     assert!(
-        assembly.is_some(),
-        "cancelled read must leave reassembly state"
+        cancelled.is_err(),
+        "first chunk must leave receive_delivery waiting for the remainder"
     );
-    let finished = apply_inbound_chunk(&mut assembly, &test_chunk(1, 2, "cd"))
-        .expect("second chunk")
-        .expect("complete delivery");
-    assert_eq!(finished.encrypted, "abcd");
-    assert!(assembly.is_none());
+    assert!(
+        inbound.reassembly.is_some(),
+        "cancelled receive_delivery must keep reassembly state"
+    );
+
+    admit_inbound_frame(&inbound.occupancy, &tx, second_chunk).expect("admit second chunk");
+    let (kind, plaintext, metrics) =
+        block_on(inbound.receive_delivery(&key)).expect("resume delivery");
     assert_eq!(
-        finished.delivery_kind,
-        Some(botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonEvent)
+        kind,
+        botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonResponse
     );
+    assert_eq!(plaintext, b"delivery-ok");
+    assert_eq!(metrics.chunk_count, 2);
+    assert!(inbound.reassembly.is_none());
+    let snap = inbound.occupancy.snapshot();
+    assert_eq!(snap.count, 0);
+    assert_eq!(snap.bytes, 0);
+    assert_eq!(snap.overflow, 0);
 }
 
 #[test]
 fn inbound_occupancy_overflows_at_explicit_count_and_byte_limits() {
-    let occupancy = FixtureQueueOccupancy::new(1, 8);
-    assert!(!occupancy.would_exceed(4));
-    occupancy.record_push(4);
+    let _runtime = default_runtime().expect("async runtime");
+    let (tx, inbound) = WebrtcInboundMailbox::bounded(1, 8);
+    admit_inbound_frame(&inbound.occupancy, &tx, "abcd".to_string()).expect("first frame");
+    let count_err = admit_inbound_frame(&inbound.occupancy, &tx, "efgh".to_string())
+        .expect_err("count overflow");
+    assert_eq!(count_err, InboundAdmitError::CountLimit);
+    let count_snap = inbound.occupancy.snapshot();
+    assert_eq!(count_snap.count, 1);
+    assert_eq!(count_snap.bytes, 4);
+    assert_eq!(count_snap.overflow, 1);
+    assert_eq!(count_snap.max_count, 1);
+    assert_eq!(count_snap.max_bytes, 8);
+
+    let (tx, inbound) = WebrtcInboundMailbox::bounded(8, 8);
+    let byte_err = admit_inbound_frame(&inbound.occupancy, &tx, "ninebytes".to_string())
+        .expect_err("byte overflow");
+    assert_eq!(byte_err, InboundAdmitError::ByteLimit);
+    let byte_snap = inbound.occupancy.snapshot();
+    assert_eq!(byte_snap.count, 0);
+    assert_eq!(byte_snap.bytes, 0);
+    assert_eq!(byte_snap.overflow, 1);
+}
+
+#[test]
+fn inbound_occupancy_reserves_before_send_so_consumer_cannot_underflow() {
+    let _runtime = default_runtime().expect("async runtime");
+    let occupancy = FixtureQueueOccupancy::new(8, 1024);
+    admit_inbound_frame_with_send(&occupancy, 4, || {
+        occupancy.record_pop(4);
+        Ok(())
+    })
+    .expect("reentrant consumer after reserve");
+    let snap = occupancy.snapshot();
+    assert_eq!(
+        snap.count, 0,
+        "consumer pop after reserve must land at zero"
+    );
+    assert_eq!(snap.bytes, 0);
+    assert!(snap.oldest_age_us.is_none());
+    assert_eq!(snap.overflow, 0);
+
+    let occupancy = FixtureQueueOccupancy::new(8, 1024);
+    let (narrow_tx, _narrow_rx) = channel::<String>(1);
+    admit_inbound_frame(&occupancy, &narrow_tx, "full".to_string()).expect("fill channel");
+    let full_err =
+        admit_inbound_frame(&occupancy, &narrow_tx, "drop".to_string()).expect_err("channel full");
+    assert_eq!(full_err, InboundAdmitError::ChannelFull);
     let snap = occupancy.snapshot();
     assert_eq!(snap.count, 1);
     assert_eq!(snap.bytes, 4);
-    assert_eq!(snap.high_water_count, 1);
-    assert_eq!(snap.max_count, 1);
-    assert_eq!(snap.max_bytes, 8);
-    assert!(occupancy.would_exceed(1));
-    occupancy.record_overflow();
-    assert_eq!(occupancy.snapshot().overflow, 1);
+    assert_eq!(snap.overflow, 1);
+}
+
+#[test]
+fn pending_host_events_reject_count_and_byte_limits_and_publish_age() {
+    let mut pending = PendingHostEventState::new();
+    let event = session_lifecycle_event("s0");
+    pending.try_park(&event).expect("park first");
+    assert_eq!(pending.events.len(), 1);
+    assert_eq!(pending.bytes, event.len() as u64);
+    assert!(pending.oldest_age_us().is_some());
+
+    for index in 1..WEBRTC_PENDING_HOST_EVENTS_MAX {
+        pending
+            .try_park(&session_lifecycle_event(&format!("s{index}")))
+            .expect("park up to count bound");
+    }
+    let count_err = pending
+        .try_park(&session_lifecycle_event("overflow"))
+        .expect_err("count overflow");
+    assert_eq!(
+        count_err.downcast_ref::<PendingHostEventAdmitError>(),
+        Some(&PendingHostEventAdmitError::CountLimit)
+    );
+    assert_eq!(pending.events.len(), WEBRTC_PENDING_HOST_EVENTS_MAX);
+    assert_eq!(pending.overflow, 1);
+
+    let mut pending = PendingHostEventState::new();
+    let oversized = vec![b'x'; WEBRTC_PENDING_HOST_EVENTS_MAX_BYTES + 1];
+    let byte_err = pending.try_park(&oversized).expect_err("byte overflow");
+    assert_eq!(
+        byte_err.downcast_ref::<PendingHostEventAdmitError>(),
+        Some(&PendingHostEventAdmitError::ByteLimit)
+    );
+    assert!(pending.events.is_empty());
+    assert_eq!(pending.bytes, 0);
+    assert_eq!(pending.overflow, 1);
+    assert!(pending.oldest_age_us().is_none());
 }
