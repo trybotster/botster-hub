@@ -12,6 +12,7 @@
 | Merge policy | `direct` into `main`; no PR |
 | Returned from | Review `review_1787439371_225335` plus human answer `question_1787439231_161941` restated as `question_1787439421_445099` |
 | Locked Core | `7eafa470a18025895995bbedc20d34b58106a03b` |
+| Implement commit | `1e2736f917c1e26b07cb67ba2363c77e5abe2363` |
 | `teardown_class_applies` | **yes** |
 
 Independent routing: ticket and run `target_id` resolve to `botster-hub`. Work is in the ticket worktree. This visit does not rebuild the campaign and does not retune production budgets.
