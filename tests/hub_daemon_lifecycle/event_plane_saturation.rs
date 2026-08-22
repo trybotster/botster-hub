@@ -278,12 +278,15 @@ fn event_plane_saturation_campaign() {
     let decoupled = run_saturation_arm(SaturationArm::PlaneDecoupled);
     let enabled_metrics = metrics_for_arm(&enabled);
     let decoupled_metrics = metrics_for_arm(&decoupled);
-    let thresholds = match phase {
-        CampaignPhase::Calibration => derive_all_thresholds(&enabled_metrics),
+    let (thresholds, source_revision) = match phase {
+        CampaignPhase::Calibration => (
+            derive_all_thresholds(&enabled_metrics),
+            std::env::var("SUBJECT_SHA").ok(),
+        ),
         CampaignPhase::Acceptance => {
-            let thresholds = read_committed_thresholds();
+            let (thresholds, source_revision) = read_committed_thresholds();
             gate_all(&enabled_metrics, &decoupled_metrics, &thresholds);
-            thresholds
+            (thresholds, source_revision)
         }
     };
     let fault_observability = run_fault_campaign();
@@ -295,6 +298,7 @@ fn event_plane_saturation_campaign() {
         &enabled.observability,
         &decoupled.observability,
         &fault_observability,
+        source_revision,
     );
 }
 
@@ -572,35 +576,47 @@ fn write_json_destinations(body: &serde_json::Value, phase: &str) {
     }
 }
 
+fn latency_json(histogram: &botster_hub_client::DaemonLatencyHistogram) -> serde_json::Value {
+    serde_json::json!({
+        "buckets": histogram.buckets,
+        "count": histogram.count,
+        "sum_us": histogram.sum_us,
+        "max_us": histogram.max_us
+    })
+}
+
 fn observability_json(
     observability: &botster_hub_client::DaemonObservabilityCounters,
 ) -> serde_json::Value {
     serde_json::json!({
         "event_admission_attempts": observability.event_admission_attempts,
         "event_delivery_attempts": observability.event_delivery_attempts,
-        "event_admission_latency_count": observability.event_admission_latency.count,
-        "event_delivery_latency_count": observability.event_delivery_latency.count,
+        "event_admission_latency": latency_json(&observability.event_admission_latency),
+        "event_delivery_latency": latency_json(&observability.event_delivery_latency),
         "event_shed_by_reason": observability.event_shed_by_reason,
         "event_gaps": observability.event_gaps,
         "event_mailbox_overflow_gaps": observability.event_mailbox_overflow_gaps,
         "event_handler_timed_out": observability.event_handler_timed_out,
+        "event_handler_backpressured": observability.event_handler_backpressured,
+        "event_handler_worker_stopped": observability.event_handler_worker_stopped,
+        "event_handler_failed": observability.event_handler_failed,
         "event_router_queue_age_expiries": observability.event_router_queue_age_expiries,
         "event_mailbox_queue_age_expiries": observability.event_mailbox_queue_age_expiries,
         "stalled_write_timeouts": observability.stalled_write_timeouts,
         "max_owner_turn_us": observability.max_owner_turn_us,
         "max_ready_operation_wait_us": observability.max_ready_operation_wait_us,
+        "global_in_flight_bytes": observability.global_in_flight_bytes,
         "queue_ages": observability.queue_ages.iter().map(|age| serde_json::json!({
             "kind": age.kind.as_str(),
             "identity": age.identity,
             "queue_count": age.queue_count,
-            "oldest_age_us": age.oldest_age_us,
-            "queue_bytes": serde_json::Value::Null
-        })).collect::<Vec<_>>(),
-        "queue_bytes_available": false,
-        "global_in_flight_bytes_available": false
+            "queue_bytes": age.queue_bytes,
+            "oldest_age_us": age.oldest_age_us
+        })).collect::<Vec<_>>()
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_phase_dataset(
     phase: CampaignPhase,
     enabled: &BTreeMap<String, OpMetrics>,
@@ -609,6 +625,7 @@ fn write_phase_dataset(
     enabled_obs: &botster_hub_client::DaemonObservabilityCounters,
     decoupled_obs: &botster_hub_client::DaemonObservabilityCounters,
     fault_obs: &botster_hub_client::DaemonObservabilityCounters,
+    source_revision: Option<String>,
 ) {
     let mut operations = serde_json::Map::new();
     for operation in EVENT_PLANE_GATED_OPERATIONS {
@@ -638,7 +655,7 @@ fn write_phase_dataset(
             "stress_profile": "residual-tail"
         },
         "revisions": {
-            "source_revision": std::env::var("SUBJECT_SHA").ok(),
+            "source_revision": source_revision,
             "botster_core": "7eafa470a18025895995bbedc20d34b58106a03b",
             "calibration_dataset_commit": git_path_commit(&calibration_path()),
             "acceptance_revision": match phase {
@@ -672,7 +689,7 @@ fn git_path_commit(path: &Path) -> Option<String> {
     (sha.len() == 40).then_some(sha)
 }
 
-fn read_committed_thresholds() -> BTreeMap<String, DerivedThresholds> {
+fn read_committed_thresholds() -> (BTreeMap<String, DerivedThresholds>, Option<String>) {
     let path = calibration_path();
     let value: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&path).expect("read calibration"))
@@ -710,13 +727,18 @@ fn read_committed_thresholds() -> BTreeMap<String, DerivedThresholds> {
             "calibration source_revision must be a 40-character SHA"
         );
     }
-    if let Some(dataset_commit) = git_path_commit(&path) {
-        assert_eq!(
-            dataset_commit.len(),
-            40,
-            "acceptance must run a commit that contains the calibration dataset"
-        );
-    }
+    let dataset_commit = git_path_commit(&path).expect("calibration dataset must be in git history");
+    let expected = std::env::var("BOTSTER_EVENT_PLANE_CALIBRATION_COMMIT")
+        .expect("acceptance requires BOTSTER_EVENT_PLANE_CALIBRATION_COMMIT");
+    assert_eq!(
+        expected.len(),
+        40,
+        "BOTSTER_EVENT_PLANE_CALIBRATION_COMMIT must be a 40-character SHA"
+    );
+    assert_eq!(
+        dataset_commit, expected,
+        "acceptance checkout must be the selected calibration dataset commit"
+    );
     let mut out = BTreeMap::new();
     for operation in EVENT_PLANE_GATED_OPERATIONS {
         let row = &value["thresholds"][operation];
@@ -734,7 +756,7 @@ fn read_committed_thresholds() -> BTreeMap<String, DerivedThresholds> {
             },
         );
     }
-    out
+    (out, source.map(str::to_string))
 }
 
 fn run_saturation_arm(arm: SaturationArm) -> ArmReport {
@@ -1018,7 +1040,7 @@ fn spawn_noisy_session(endpoint: &botster_hub_client::DaemonEndpoint) -> NoisySe
         endpoint,
         botster_hub_client::DaemonRequest::Spawn {
             session_id: EVENT_PLANE_NOISY_SESSION.to_string(),
-            command: "printf 'ns-ready\\n'; printf '\\200\\377\\n'; ( while true; do printf 'N%.4095s\\n' ''; sleep 0.1; done ) & while IFS= read -r line; do printf 'ns-echo:%s\\n' \"$line\"; done".to_string(),
+            command: "printf 'ns-ready\\n'; printf '\\200\\377\\n'; i=0; while true; do printf 'N%08d%.4087s\\n' \"$i\" ''; i=$((i+1)); sleep 0.1; done & while IFS= read -r line; do printf 'ns-echo:%s\\n' \"$line\"; done".to_string(),
         },
     )
     .expect("spawn noisy");
@@ -1089,6 +1111,7 @@ fn run_measurement_workers(
     let mut saw_webrtc_gap = false;
     let mut next_input_at = start_at;
     let mut input_seq: u64 = 0;
+    let mut next_output_seq: Option<u64> = None;
     while Instant::now() < end_at {
         if let Some(connection) = unix.as_mut() {
             let status = connection
@@ -1181,36 +1204,43 @@ fn run_measurement_workers(
                 EVENT_PLANE_NOISY_SESSION,
                 EVENT_PLANE_NOISY_SUB,
             ));
-        let drained = collect_attach_events(
-            &mut noisy.connection,
-            EVENT_PLANE_NOISY_SESSION,
-            EVENT_PLANE_NOISY_SUB,
-            None,
-        );
-        let saw_output = drain.is_ok()
-            && drained.iter().any(|event| {
-                matches!(
-                    event,
-                    botster_hub_client::DaemonEvent::TerminalOutput { payload, .. }
-                        if payload.decoded_bytes().ok().is_some_and(|bytes| bytes.len() >= 64)
-                )
-            });
-        let finished = Instant::now();
-        if output_start >= start_at && finished <= end_at {
-            if drain.is_err() {
-                tx.send((
-                    "terminal_output".to_string(),
-                    false,
-                    output_start.elapsed().as_millis() as u64,
-                ))
-                .expect("send terminal output failure");
-            } else if saw_output {
-                tx.send((
-                    "terminal_output".to_string(),
-                    true,
-                    output_start.elapsed().as_millis() as u64,
-                ))
-                .expect("send terminal output sample");
+        let in_window = output_start >= start_at && Instant::now() <= end_at;
+        if drain.is_err() && in_window {
+            tx.send((
+                "terminal_output".to_string(),
+                false,
+                output_start.elapsed().as_millis() as u64,
+            ))
+            .expect("send terminal output failure");
+        } else if drain.is_ok() {
+            let drained = collect_attach_events(
+                &mut noisy.connection,
+                EVENT_PLANE_NOISY_SESSION,
+                EVENT_PLANE_NOISY_SUB,
+                None,
+            );
+            let seqs = output_sequence_ids(&drained);
+            if in_window {
+                for seq in seqs {
+                    if next_output_seq.is_some_and(|expected| seq != expected) {
+                        tx.send((
+                            "terminal_output".to_string(),
+                            false,
+                            output_start.elapsed().as_millis() as u64,
+                        ))
+                        .expect("send terminal output sequence failure");
+                        break;
+                    }
+                    next_output_seq = Some(seq.saturating_add(1));
+                    tx.send((
+                        "terminal_output".to_string(),
+                        true,
+                        output_start.elapsed().as_millis() as u64,
+                    ))
+                    .expect("send terminal output sample");
+                }
+            } else if let Some(&seq) = seqs.last() {
+                next_output_seq = Some(seq.saturating_add(1));
             }
         }
         thread::sleep(Duration::from_millis(20));
@@ -1352,6 +1382,33 @@ fn expect_kind(
     Ok(())
 }
 
+fn output_sequence_ids(events: &[botster_hub_client::DaemonEvent]) -> Vec<u64> {
+    let mut seqs = Vec::new();
+    for event in events {
+        let botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } = event else {
+            continue;
+        };
+        let Ok(bytes) = payload.decoded_bytes() else {
+            continue;
+        };
+        let mut index = 0;
+        while index + 9 <= bytes.len() {
+            if bytes[index] == b'N'
+                && bytes[index + 1..index + 9]
+                    .iter()
+                    .all(|byte| byte.is_ascii_digit())
+            {
+                let digits = std::str::from_utf8(&bytes[index + 1..index + 9]).expect("digits");
+                seqs.push(digits.parse::<u64>().expect("seq"));
+                index += 9;
+            } else {
+                index += 1;
+            }
+        }
+    }
+    seqs
+}
+
 fn snapshot_observability(
     endpoint: &botster_hub_client::DaemonEndpoint,
 ) -> botster_hub_client::DaemonObservabilityCounters {
@@ -1453,13 +1510,41 @@ fn assert_queue_bounds(
         );
         if let Some(age_us) = age.oldest_age_us {
             assert!(
-                age_us <= EVENT_PLANE_QUEUE_AGE_US * 4,
-                "queue {:?} identity={} oldest_age_us={age_us} exceeds 4x queue_age",
+                age_us <= EVENT_PLANE_QUEUE_AGE_US,
+                "queue {:?} identity={} oldest_age_us={age_us} exceeds queue_age 1000ms",
                 age.kind,
                 age.identity
             );
         }
+        let Some(bytes) = age.queue_bytes else {
+            panic!(
+                "queue {:?} identity={} missing queue_bytes",
+                age.kind, age.identity
+            );
+        };
+        let max_bytes = match age.kind {
+            botster_hub_client::DaemonQueueKind::Producer => {
+                defaults.producer_queue_max_bytes as u64
+            }
+            botster_hub_client::DaemonQueueKind::Consumer
+            | botster_hub_client::DaemonQueueKind::ClientMailbox => {
+                defaults.consumer_queue_max_bytes as u64
+            }
+            _ => u64::MAX,
+        };
+        assert!(
+            bytes <= max_bytes,
+            "queue {:?} identity={} queue_bytes={bytes} exceeds bound {max_bytes}",
+            age.kind,
+            age.identity
+        );
     }
+    assert!(
+        observability.global_in_flight_bytes <= defaults.global_in_flight_bytes as u64,
+        "global_in_flight_bytes {} exceeds {}",
+        observability.global_in_flight_bytes,
+        defaults.global_in_flight_bytes
+    );
 }
 
 fn shutdown_owned_sessions(endpoint: &botster_hub_client::DaemonEndpoint) {
@@ -2253,18 +2338,13 @@ fn fault_shed_full_or_over_rate(endpoint: &botster_hub_client::DaemonEndpoint) {
 
 fn fault_plugin_mailbox_pressure(endpoint: &botster_hub_client::DaemonEndpoint) {
     let snap = snapshot_observability(endpoint);
-    let consumer_pressure = snap.queue_ages.iter().any(|age| {
+    let consumer_occupied = snap.queue_ages.iter().any(|age| {
         matches!(age.kind, botster_hub_client::DaemonQueueKind::Consumer)
             && age.queue_count.unwrap_or(0) > 0
-    }) || snap
-        .event_shed_by_reason
-        .values()
-        .any(|count| *count > 0)
-        || snap.event_handler_timed_out > 0
-        || snap.event_handler_backpressured > 0;
+    });
     assert!(
-        consumer_pressure,
-        "plugin-side mailbox pressure must appear under hold/timeout: {snap:?}"
+        consumer_occupied || snap.event_handler_backpressured > 0,
+        "plugin mailbox lane must show consumer occupancy or handler backpressure: {snap:?}"
     );
 }
 
@@ -2366,15 +2446,31 @@ fn fault_dropped_lifecycle_wake(
 }
 
 fn fault_lifecycle_cursor_expiry(endpoint: &botster_hub_client::DaemonEndpoint) {
+    for index in 0..20 {
+        let session_id = format!("cursor-{index}");
+        let _ = botster_hub_client::request(
+            endpoint,
+            botster_hub_client::DaemonRequest::Spawn {
+                session_id: session_id.clone(),
+                command: "exec sleep 1".to_string(),
+            },
+        );
+        let _ = botster_hub_client::request(
+            endpoint,
+            botster_hub_client::DaemonRequest::ShutdownSession { session_id },
+        );
+    }
     let listed = botster_hub_client::request(endpoint, botster_hub_client::DaemonRequest::ListSessions)
-        .expect("list under journal capacity 16");
-    assert_eq!(listed.kind, botster_hub_client::DaemonResponseKind::Sessions);
+        .expect("list after journal wrap");
     assert!(
         listed
             .sessions
             .iter()
-            .any(|session| session.session_id.starts_with("quiet-")),
-        "cursor expiry must not drop the quiet fleet"
+            .filter(|session| session.session_id.starts_with("quiet-")
+                && session.lifecycle == "running")
+            .count()
+            >= EVENT_PLANE_FLEET_N,
+        "after 16-row journal wrap, quiet fleet must resync from baseline"
     );
 }
 
@@ -2405,6 +2501,33 @@ fn fault_plugin_worker_restart(
         .request(&botster_hub_client::DaemonRequest::Status)
         .expect("status after reload");
     assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
+    let before = snapshot_observability(endpoint).event_admission_attempts;
+    let _ = botster_hub_client::request(
+        endpoint,
+        botster_hub_client::DaemonRequest::PluginMcpCallTool {
+            name: "event_plane.emit_burst".to_string(),
+            arguments: serde_json::json!({ "count": 25, "prefix": "reload" }),
+        },
+    );
+    unix.set_read_timeout(Some(Duration::from_secs(3))).ok();
+    let mut delivered = false;
+    for _ in 0..8 {
+        match unix.next_event() {
+            Ok(botster_hub_client::DaemonEvent::PackageEvent { .. })
+            | Ok(botster_hub_client::DaemonEvent::EventGap { .. }) => {
+                delivered = true;
+                break;
+            }
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    unix.set_read_timeout(None).ok();
+    let after = snapshot_observability(endpoint).event_admission_attempts;
+    assert!(
+        delivered || after > before,
+        "producer reload must still admit or deliver events"
+    );
 }
 
 fn fault_unix_reconnect(
@@ -2417,6 +2540,24 @@ fn fault_unix_reconnect(
         .request(&botster_hub_client::DaemonRequest::Status)
         .expect("status after unix reconnect");
     assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
+    unix.set_read_timeout(Some(Duration::from_secs(3))).ok();
+    let mut delivered = false;
+    for _ in 0..8 {
+        match unix.next_event() {
+            Ok(botster_hub_client::DaemonEvent::PackageEvent { .. })
+            | Ok(botster_hub_client::DaemonEvent::EventGap { .. }) => {
+                delivered = true;
+                break;
+            }
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    unix.set_read_timeout(None).ok();
+    assert!(
+        delivered,
+        "Unix reconnect must observe PackageEvent or EventGap"
+    );
     unix
 }
 
@@ -2425,13 +2566,19 @@ fn fault_webrtc_reconnect_unix_survives(
     data_dir: &Path,
 ) {
     let (_bootstrap, peer, key) = subscribe_webrtc_events(endpoint, data_dir);
-    block_on(async {
+    let response = block_on(async {
         let mut peer = peer;
-        let _ = peer
+        let response = peer
             .encrypted_request(&key, &botster_hub_client::DaemonRequest::Status)
             .await;
         drop(peer);
-    });
+        response
+    })
+    .expect("webrtc status during reconnect lane");
+    assert_eq!(
+        response.kind,
+        botster_hub_client::DaemonResponseKind::Status
+    );
     assert_quiet_fleet_survives(endpoint);
 }
 

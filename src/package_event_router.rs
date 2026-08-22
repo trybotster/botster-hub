@@ -636,9 +636,34 @@ impl PackageEventRouter {
                 producer_age_ref,
             },
         );
-        let producer = inner.producer.entry(caller_owner.to_string()).or_default();
-        producer.events += 1;
-        producer.bytes += size;
+        let (producer_cell, producer_events, producer_bytes, producer_generation, producer_prior) = {
+            let producer = inner.producer.entry(caller_owner.to_string()).or_default();
+            producer.events += 1;
+            producer.bytes += size;
+            (
+                producer.current_cell.clone(),
+                producer.events as u64,
+                producer.bytes as u64,
+                producer.current_generation,
+                producer.outstanding_prior as u64,
+            )
+        };
+        if let Some(cell) = producer_cell {
+            let oldest = inner
+                .producer_age_lists
+                .get(&(caller_owner.to_string(), producer_generation))
+                .map(ProducerAgeList::oldest_nanos)
+                .unwrap_or(u64::MAX);
+            cell.store(
+                producer_events,
+                oldest,
+                producer_prior,
+                false,
+                producer_bytes,
+            );
+        }
+        self.counters
+            .set_global_in_flight_bytes(inner.global_bytes() as u64);
         for subscription in accepted {
             enqueue_consumer_copy(&mut inner, &self.counters, envelope_id, size, subscription);
         }
@@ -1479,6 +1504,7 @@ fn retire_holder_locked(
         producer.bytes = producer.bytes.saturating_sub(size);
     }
     retire_producer_age(inner, counters, &owner, age_ref);
+    counters.set_global_in_flight_bytes(inner.global_bytes() as u64);
     true
 }
 
@@ -1550,7 +1576,7 @@ fn enqueue_consumer_copy(
             .consumers
             .insert(subscription.plugin_key.clone(), ConsumerQueue::default());
     }
-    let (front_id, count, cell, gate) = {
+    let (front_id, count, bytes, cell, gate) = {
         let consumer = inner
             .consumers
             .get_mut(&subscription.plugin_key)
@@ -1564,6 +1590,7 @@ fn enqueue_consumer_copy(
         (
             consumer.copies.front().map(|copy| copy.envelope_id),
             consumer.events as u64,
+            consumer.bytes as u64,
             consumer.age_cell.clone(),
             consumer
                 .age_cell
@@ -1577,7 +1604,7 @@ fn enqueue_consumer_copy(
         .map(|envelope| counters.nanos_of(envelope.enqueued_at))
         .unwrap_or(u64::MAX);
     if let Some(cell) = cell {
-        cell.store(count, oldest, gate, false);
+        cell.store(count, oldest, gate, false, bytes);
     } else {
         counters.record_age_sample_failure();
     }
@@ -1596,11 +1623,12 @@ fn update_consumer_age(inner: &mut RouterInner, plugin_key: &str, counters: &Eve
         return;
     };
     let count = queue.events as u64;
+    let bytes = queue.bytes as u64;
     let Some(cell) = queue.age_cell.clone() else {
         counters.record_age_sample_failure();
         return;
     };
-    cell.store(count, oldest, cell.gate(), false);
+    cell.store(count, oldest, cell.gate(), false, bytes);
 }
 
 fn retire_producer_age(
@@ -1639,6 +1667,7 @@ fn retire_producer_age(
                     .unwrap_or(u64::MAX),
                 occupancy.outstanding_prior as u64,
                 false,
+                occupancy.bytes as u64,
             );
         }
     }
@@ -1680,7 +1709,7 @@ fn commit_diagnostic_state(
         .get(owner)
         .map(|occupancy| occupancy.outstanding_prior)
         .unwrap_or(0);
-    cell.store(0, u64::MAX, prior as u64, false);
+    cell.store(0, u64::MAX, prior as u64, false, 0);
     let list = ProducerAgeList::new(
         inner.policy.producer_queue_max_events,
         generation,
@@ -1753,7 +1782,7 @@ fn bind_consumer_cell(inner: &mut RouterInner, counters: &EventPlaneCounters, pl
         });
     }
     queue.generation = generation;
-    consumer_cell.store(queue.events as u64, u64::MAX, 0, false);
+    consumer_cell.store(queue.events as u64, u64::MAX, 0, false, queue.bytes as u64);
 }
 
 fn retire_owner_diagnostics(
@@ -1775,7 +1804,7 @@ fn retire_owner_diagnostics(
     if let Some(queue) = inner.consumers.get_mut(owner)
         && let Some(cell) = queue.age_cell.as_ref()
     {
-        cell.store(queue.events as u64, u64::MAX, 0, false);
+        cell.store(queue.events as u64, u64::MAX, 0, false, queue.bytes as u64);
         if queue.copies.is_empty() {
             cell.close_writes();
         }

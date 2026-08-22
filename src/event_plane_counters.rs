@@ -23,6 +23,7 @@ const EMPTY_OLDEST: u64 = u64::MAX;
 pub struct QueueAgeMetric {
     version: AtomicU64,
     count: AtomicU64,
+    bytes: AtomicU64,
     oldest_nanos: AtomicU64,
     gate: AtomicU64,
     generation: u64,
@@ -36,6 +37,7 @@ impl QueueAgeMetric {
         Self {
             version: AtomicU64::new(0),
             count: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
             oldest_nanos: AtomicU64::new(EMPTY_OLDEST),
             gate: AtomicU64::new(0),
             generation,
@@ -63,13 +65,19 @@ impl QueueAgeMetric {
         self.write_closed.store(true, Ordering::Release);
     }
 
+    #[must_use]
+    pub fn occupied_bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+
     /// Two-phase odd/even write. No-op after the cell is write-closed.
-    pub fn store(&self, count: u64, oldest_nanos: u64, gate: u64, latch_invalid: bool) {
+    pub fn store(&self, count: u64, oldest_nanos: u64, gate: u64, latch_invalid: bool, bytes: u64) {
         if self.write_closed.load(Ordering::Relaxed) {
             return;
         }
         self.version.fetch_add(1, Ordering::AcqRel);
         self.count.store(count, Ordering::Relaxed);
+        self.bytes.store(bytes, Ordering::Relaxed);
         self.oldest_nanos.store(oldest_nanos, Ordering::Relaxed);
         self.gate.store(gate, Ordering::Relaxed);
         if latch_invalid {
@@ -102,6 +110,7 @@ impl QueueAgeMetric {
             return None;
         }
         let count = self.count.load(Ordering::Relaxed);
+        let bytes = self.bytes.load(Ordering::Relaxed);
         let oldest_nanos = self.oldest_nanos.load(Ordering::Relaxed);
         let gate = self.gate.load(Ordering::Relaxed);
         let invalid = self.invalid.load(Ordering::Relaxed);
@@ -114,10 +123,11 @@ impl QueueAgeMetric {
             return Some(AgeSample::Indeterminate);
         }
         if count == 0 {
-            return Some(AgeSample::Empty { count: 0 });
+            return Some(AgeSample::Empty { count: 0, bytes });
         }
         Some(AgeSample::Usable {
             count,
+            bytes,
             oldest_nanos,
         })
     }
@@ -125,8 +135,15 @@ impl QueueAgeMetric {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgeSample {
-    Usable { count: u64, oldest_nanos: u64 },
-    Empty { count: u64 },
+    Usable {
+        count: u64,
+        bytes: u64,
+        oldest_nanos: u64,
+    },
+    Empty {
+        count: u64,
+        bytes: u64,
+    },
     Indeterminate,
 }
 
@@ -323,6 +340,7 @@ impl ProducerAgeList {
             self.oldest_nanos(),
             self.cell.gate(),
             false,
+            self.cell.occupied_bytes(),
         );
     }
 }
@@ -357,6 +375,7 @@ pub struct EventPlaneCounters {
     last_ready_operation_wait_us: AtomicU64,
     max_ready_operation_wait_us: AtomicU64,
     stalled_write_timeouts: AtomicU64,
+    global_in_flight_bytes: AtomicU64,
     registry: RwLock<HashMap<AgeIdentity, AgeRegistryEntry>>,
 }
 
@@ -392,6 +411,7 @@ impl EventPlaneCounters {
             last_ready_operation_wait_us: AtomicU64::new(0),
             max_ready_operation_wait_us: AtomicU64::new(0),
             stalled_write_timeouts: AtomicU64::new(0),
+            global_in_flight_bytes: AtomicU64::new(0),
             registry: RwLock::new(HashMap::new()),
         }
     }
@@ -540,7 +560,7 @@ impl EventPlaneCounters {
         if let Some(entry) = registry.get_mut(identity) {
             entry.retired = true;
             if let Some(cell) = &entry.cell {
-                cell.store(0, EMPTY_OLDEST, 0, false);
+                cell.store(0, EMPTY_OLDEST, 0, false, 0);
                 cell.close_writes();
             }
         }
@@ -562,7 +582,7 @@ impl EventPlaneCounters {
             return;
         }
         entry.retired = true;
-        registered.store(0, EMPTY_OLDEST, 0, false);
+        registered.store(0, EMPTY_OLDEST, 0, false, 0);
         registered.close_writes();
     }
 
@@ -627,7 +647,12 @@ impl EventPlaneCounters {
             self.max_ready_operation_wait_us.load(Ordering::Relaxed);
         snapshot.stalled_write_timeouts = self.stalled_write_timeouts.load(Ordering::Relaxed);
         snapshot.queue_ages = queue_ages;
+        snapshot.global_in_flight_bytes = self.global_in_flight_bytes.load(Ordering::Relaxed);
         snapshot
+    }
+
+    pub fn set_global_in_flight_bytes(&self, bytes: u64) {
+        self.global_in_flight_bytes.store(bytes, Ordering::Relaxed);
     }
 
     fn snapshot_queue_ages(&self) -> Vec<DaemonQueueAgeObservation> {
@@ -670,23 +695,32 @@ impl EventPlaneCounters {
         match cell.sample() {
             AgeSample::Usable {
                 count,
+                bytes,
                 oldest_nanos,
-            } => DaemonQueueAgeObservation::new(
-                identity.kind,
-                identity.identity.clone(),
-                producer_generation,
-                DaemonQueueAgeState::Usable,
-                self.age_us(oldest_nanos),
-                Some(count),
-            ),
-            AgeSample::Empty { count } => DaemonQueueAgeObservation::new(
-                identity.kind,
-                identity.identity.clone(),
-                producer_generation,
-                DaemonQueueAgeState::Empty,
-                None,
-                Some(count),
-            ),
+            } => {
+                let mut row = DaemonQueueAgeObservation::new(
+                    identity.kind,
+                    identity.identity.clone(),
+                    producer_generation,
+                    DaemonQueueAgeState::Usable,
+                    self.age_us(oldest_nanos),
+                    Some(count),
+                );
+                row.queue_bytes = Some(bytes);
+                row
+            }
+            AgeSample::Empty { count, bytes } => {
+                let mut row = DaemonQueueAgeObservation::new(
+                    identity.kind,
+                    identity.identity.clone(),
+                    producer_generation,
+                    DaemonQueueAgeState::Empty,
+                    None,
+                    Some(count),
+                );
+                row.queue_bytes = Some(bytes);
+                row
+            }
             AgeSample::Indeterminate => DaemonQueueAgeObservation::new(
                 identity.kind,
                 identity.identity.clone(),
@@ -811,11 +845,12 @@ mod tests {
     #[test]
     fn stable_even_version_yields_usable_age() {
         let cell = QueueAgeMetric::new(7);
-        cell.store(3, 1_000, 0, false);
+        cell.store(3, 1_000, 0, false, 0);
         match cell.sample() {
             AgeSample::Usable {
                 count,
                 oldest_nanos,
+                ..
             } => {
                 assert_eq!(count, 3);
                 assert_eq!(oldest_nanos, 1_000);
@@ -828,14 +863,14 @@ mod tests {
     #[test]
     fn zero_count_yields_empty_not_zero_age() {
         let cell = QueueAgeMetric::new(1);
-        cell.store(0, EMPTY_OLDEST, 0, false);
-        assert_eq!(cell.sample(), AgeSample::Empty { count: 0 });
+        cell.store(0, EMPTY_OLDEST, 0, false, 0);
+        assert_eq!(cell.sample(), AgeSample::Empty { count: 0, bytes: 0 });
     }
 
     #[test]
     fn odd_version_is_indeterminate_after_one_retry() {
         let cell = QueueAgeMetric::new(1);
-        cell.store(4, 50, 0, false);
+        cell.store(4, 50, 0, false, 0);
         cell.version.fetch_add(1, Ordering::AcqRel);
         assert_eq!(cell.sample(), AgeSample::Indeterminate);
     }
@@ -843,7 +878,7 @@ mod tests {
     #[test]
     fn mutation_between_bracket_loads_is_indeterminate() {
         let cell = Arc::new(QueueAgeMetric::new(1));
-        cell.store(2, 10, 0, false);
+        cell.store(2, 10, 0, false, 0);
         let reader = {
             let cell = Arc::clone(&cell);
             thread::spawn(move || {
@@ -851,16 +886,16 @@ mod tests {
                 cell.sample()
             })
         };
-        cell.store(3, 20, 0, false);
+        cell.store(3, 20, 0, false, 0);
         let _ = reader.join().expect("join reader");
-        cell.store(4, 30, 0, false);
+        cell.store(4, 30, 0, false, 0);
         let v1 = cell.version.load(Ordering::Acquire);
         cell.count.store(99, Ordering::Relaxed);
         fence(Ordering::Acquire);
         let v2 = cell.version.load(Ordering::Relaxed);
         assert_eq!(v1, v2);
         assert_ne!(cell.count.load(Ordering::Relaxed), 4);
-        cell.store(4, 30, 0, false);
+        cell.store(4, 30, 0, false, 0);
         match cell.sample() {
             AgeSample::Usable { count, .. } => assert_eq!(count, 4),
             other => panic!("expected usable after completed write, got {other:?}"),
@@ -870,10 +905,10 @@ mod tests {
     #[test]
     fn aba_count_sequence_advances_version_by_four() {
         let cell = QueueAgeMetric::new(1);
-        cell.store(5, 1, 0, false);
+        cell.store(5, 1, 0, false, 0);
         let before = cell.version.load(Ordering::Relaxed);
-        cell.store(6, 2, 0, false);
-        cell.store(5, 3, 0, false);
+        cell.store(6, 2, 0, false, 0);
+        cell.store(5, 3, 0, false, 0);
         let after = cell.version.load(Ordering::Relaxed);
         assert_eq!(after.saturating_sub(before), 4);
         match cell.sample() {
@@ -885,32 +920,33 @@ mod tests {
     #[test]
     fn invalid_latch_makes_every_later_sample_indeterminate() {
         let cell = QueueAgeMetric::new(2);
-        cell.store(3, 9, 0, false);
+        cell.store(3, 9, 0, false, 0);
         cell.latch_invalid();
         assert_eq!(cell.sample(), AgeSample::Indeterminate);
-        cell.store(4, 10, 0, false);
+        cell.store(4, 10, 0, false, 0);
         assert_eq!(cell.sample(), AgeSample::Indeterminate);
     }
 
     #[test]
     fn open_gate_is_indeterminate() {
         let cell = QueueAgeMetric::new(3);
-        cell.store(2, 8, 4, false);
+        cell.store(2, 8, 4, false, 0);
         assert_eq!(cell.sample(), AgeSample::Indeterminate);
-        cell.store(2, 8, 0, false);
+        cell.store(2, 8, 0, false, 0);
         assert!(matches!(cell.sample(), AgeSample::Usable { .. }));
     }
 
     #[test]
     fn write_closed_cell_ignores_later_stores() {
         let cell = QueueAgeMetric::new(1);
-        cell.store(2, 4, 0, false);
+        cell.store(2, 4, 0, false, 0);
         cell.close_writes();
-        cell.store(9, 99, 0, false);
+        cell.store(9, 99, 0, false, 0);
         match cell.sample() {
             AgeSample::Usable {
                 count,
                 oldest_nanos,
+                ..
             } => {
                 assert_eq!(count, 2);
                 assert_eq!(oldest_nanos, 4);
@@ -978,7 +1014,7 @@ mod tests {
     fn retired_registry_entry_reports_empty_and_prune_drops_it() {
         let counters = EventPlaneCounters::new();
         let cell = Arc::new(QueueAgeMetric::new(4));
-        cell.store(2, 10, 0, false);
+        cell.store(2, 10, 0, false, 0);
         let identity = AgeIdentity {
             kind: DaemonQueueKind::Consumer,
             identity: "plugin".to_string(),
@@ -993,14 +1029,14 @@ mod tests {
         assert_eq!(counters.registry_len(), 1);
         counters.prune_retired();
         assert_eq!(counters.registry_len(), 0);
-        assert_eq!(cell.sample(), AgeSample::Empty { count: 0 });
+        assert_eq!(cell.sample(), AgeSample::Empty { count: 0, bytes: 0 });
     }
 
     #[test]
     fn live_empty_queue_is_not_pruned() {
         let counters = EventPlaneCounters::new();
         let cell = Arc::new(QueueAgeMetric::new(1));
-        cell.store(0, EMPTY_OLDEST, 0, false);
+        cell.store(0, EMPTY_OLDEST, 0, false, 0);
         counters.register_cell(
             AgeIdentity {
                 kind: DaemonQueueKind::Consumer,

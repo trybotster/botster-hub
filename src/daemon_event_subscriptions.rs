@@ -203,7 +203,13 @@ impl ClientEventMailbox {
                     .map(|counters| counters.nanos_of(event.enqueued_at))
             })
             .unwrap_or(u64::MAX);
-        self.age_cell.store(count, oldest, 0, false);
+        let bytes = inner
+            .events
+            .iter()
+            .filter_map(|event| serde_json::to_vec(&event.payload).ok())
+            .map(|encoded| encoded.len() as u64)
+            .sum();
+        self.age_cell.store(count, oldest, 0, false, bytes);
     }
 
     pub(crate) fn retire_from_registry(&self) {
