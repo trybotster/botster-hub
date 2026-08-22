@@ -2,7 +2,8 @@
 
 Ticket: `ticket_1787351279_697528`
 Run: `run_1787351732_490500`
-Plan revision: 4. This run is now post-publication verification.
+Plan revision: 5. Review-return artifact corrections after
+`review_1787362097_377433`. This run remains post-publication verification.
 Verification artifact: `artifact_1787357846_301112`.
 
 ## Target and charter
@@ -52,7 +53,8 @@ unpublished, as the amended ticket requires.
 In scope:
 1. Prove the published bytes equal the intended merged source at `e950f4f`.
 2. Prove a clean registry install satisfies every ticket acceptance criterion.
-3. Record that proof as the durable run artifact.
+3. Record that proof as the durable run artifacts: this plan, the Implement
+   report, and the evidence JSON.
 
 Out of scope:
 - Any publish command. Both coordinates exist and are immutable. Do not
@@ -68,8 +70,9 @@ guarded is complete.
 ## Repository ownership boundaries and cross-repo dependencies
 
 `botster-hub` owns both npm packages, their generated assets, and their
-publication. Site 3 of the four-site release chain in [[hub generated protocol
-changes are a four site release chain]] is now complete.
+publication. Site 3 of the four-site release chain in
+[[hub generated protocol changes are a four site release chain]]
+is now complete.
 
 Cross-repository seams:
 - `botster-web` (`tgt_40abcf71ccf049f4ac0c99953a799869`) owns site 4 in
@@ -98,7 +101,12 @@ Unknowns: none material to this ticket. The release is complete and verified.
 
 ## Affected surfaces and files
 
-No repository file changes. This run produces verification evidence only.
+No package or product source files change. This run adds only the plan and
+verification artifacts:
+
+- `docs/plans/verify-published-ui-contract-0-3-3-and-hub-test-support-0-1-41.md`
+- `docs/reports/verify-published-ui-contract-0-3-3-and-hub-test-support-0-1-41-implement.md`
+- `docs/reports/verify-published-ui-contract-0-3-3-and-hub-test-support-0-1-41-evidence.json`
 
 Surfaces read:
 - The installed `@trybotster/ui-contract@0.3.3` package root.
@@ -111,9 +119,10 @@ Botster layers touched: packages and npm distribution only.
 ## Risks
 
 1. A stale-tree publish, where the registry carries pre-change bytes under a
-   correct-looking version. [[hub generated protocol changes are a four site
-   release chain]] records that exact incident for `0.1.17`. Retired by the
-   integrity comparison below, which matched both coordinates exactly.
+   correct-looking version.
+   [[hub generated protocol changes are a four site release chain]]
+   records that exact incident for `0.1.17`. Retired by the integrity
+   comparison below, which matched both coordinates exactly.
 2. A false proof from a workspace link, a `file:` dependency, or a local
    tarball. Retired by installing the registry coordinates into an empty
    directory with no link and no local artifact.
@@ -124,10 +133,10 @@ Botster layers touched: packages and npm distribution only.
 4. Resolving `./package.json`, which neither `exports` map exposes. Retired by
    resolving each exported root entrypoint with
    `path.dirname(require_.resolve(name))`.
-5. Revision reuse across concurrent branches, per [[conformance fixture
-   revisions must be unique per published content]]. Retired because published
-   revision 46 is strictly above published revision 44 in `0.1.39`, and no
-   other published coordinate claims 46.
+5. Revision reuse across concurrent branches, per
+   [[conformance fixture revisions must be unique per published content]].
+   Retired because published revision 46 is strictly above published revision
+   44 in `0.1.39`, and no other published coordinate claims 46.
 
 ## Acceptance checks and tests, all executed
 
@@ -265,8 +274,8 @@ path rather than against `destination`.
 1. A note recording `@trybotster/ui-contract@0.3.3` and
    `@trybotster/hub-test-support@0.1.41` at conformance revision 46 as the
    published package-owned notice-reaction cutover, and recording that `0.1.40`
-   at revision 45 was allocated and then skipped, mirroring [[hub test support
-   0 1 39 revision 44 is the web package event dto cutover]].
+   at revision 45 was allocated and then skipped, mirroring
+   [[hub test support 0 1 39 revision 44 is the web package event dto cutover]].
 2. A note stating that comparing registry `dist.integrity` against a tarball
    packed from the intended commit is the direct retirement of the stale-tree
    publish risk, stronger than trusting self-consistent published metadata.
