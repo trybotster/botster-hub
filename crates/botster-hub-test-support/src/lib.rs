@@ -29,6 +29,24 @@ use serde::{Deserialize, Serialize};
 
 mod isolated_hub;
 pub use isolated_hub::{IsolatedHub, IsolatedHubBuilder, IsolatedHubError};
+
+/// Shared OS monotonic clock for campaign emission-to-receipt samples.
+#[must_use]
+pub fn monotonic_now_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    #[cfg(target_os = "macos")]
+    let clock = libc::CLOCK_UPTIME_RAW;
+    #[cfg(not(target_os = "macos"))]
+    let clock = libc::CLOCK_MONOTONIC;
+    let rc = unsafe { libc::clock_gettime(clock, &mut ts) };
+    assert_eq!(rc, 0, "clock_gettime monotonic");
+    (ts.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(ts.tv_nsec as u64)
+}
 mod conformance_data;
 #[allow(unused_imports)]
 pub(crate) use conformance_data::{

@@ -961,7 +961,7 @@ fn run_observe_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
 }
 
 fn run_journal_pull_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
-    if crate::runtime::journal_pull_held() {
+    if runtime.journal_pull_held() {
         return;
     }
     let woke = runtime.take_journal_advanced_wake();

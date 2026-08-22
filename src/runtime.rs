@@ -34,7 +34,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::ffi::OsStr;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -554,6 +554,15 @@ impl HubRuntime {
     #[must_use]
     pub fn test_seams(&self) -> &HubTestSeams {
         &self.test_seams
+    }
+
+    /// True while the startup-parsed hold path exists. Production stays on `None`.
+    #[must_use]
+    pub fn journal_pull_held(&self) -> bool {
+        self.test_seams
+            .hold_journal_pull
+            .as_ref()
+            .is_some_and(|path| path.exists())
     }
 
     #[cfg(test)]
@@ -4666,6 +4675,7 @@ pub struct HubTestSeams {
     pub lifecycle_journal_capacity: Option<usize>,
     pub event_invocation_timeout_ms: Option<u64>,
     pub event_handler_hold_ms: Option<u64>,
+    pub hold_journal_pull: Option<PathBuf>,
 }
 
 fn hub_test_seams() -> HubTestSeams {
@@ -4694,6 +4704,10 @@ fn hub_test_seams() -> HubTestSeams {
             std::env::var("BOTSTER_HUB_TEST_EVENT_HANDLER_HOLD_MS")
                 .ok()
                 .as_deref(),
+        ),
+        hold_journal_pull: hold_journal_pull_from(
+            env.as_deref(),
+            std::env::var_os("BOTSTER_HUB_TEST_HOLD_JOURNAL_PULL").as_deref(),
         ),
     }
 }
@@ -4741,19 +4755,13 @@ pub fn event_handler_hold_ms_from(botster_env: Option<&str>, raw: Option<&str>) 
         .map(|ms: u64| ms.min(5_000))
 }
 
-/// True while the test hold file exists. Production ignores the path.
+/// Parse the optional journal-pull hold path. Production returns `None`.
 #[must_use]
-pub fn journal_pull_held_from(botster_env: Option<&str>, path: Option<&OsStr>) -> bool {
-    botster_env == Some("test") && path.is_some_and(|path| Path::new(path).exists())
-}
-
-/// Skip journal consumption while the campaign hold file exists.
-#[must_use]
-pub fn journal_pull_held() -> bool {
-    journal_pull_held_from(
-        std::env::var("BOTSTER_ENV").ok().as_deref(),
-        std::env::var_os("BOTSTER_HUB_TEST_HOLD_JOURNAL_PULL").as_deref(),
-    )
+pub fn hold_journal_pull_from(botster_env: Option<&str>, path: Option<&OsStr>) -> Option<PathBuf> {
+    if botster_env != Some("test") {
+        return None;
+    }
+    path.filter(|value| !value.is_empty()).map(PathBuf::from)
 }
 
 fn core_daemon_config(config: &HubConfig, test_seams: &HubTestSeams) -> CoreDaemonConfig {
@@ -5755,17 +5763,20 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::write(&hold, b"hold").expect("write hold file");
-        assert!(journal_pull_held_from(Some("test"), Some(hold.as_os_str())));
-        assert!(!journal_pull_held_from(
-            Some("production"),
-            Some(hold.as_os_str())
-        ));
-        assert!(!journal_pull_held_from(None, Some(hold.as_os_str())));
+        assert_eq!(
+            hold_journal_pull_from(Some("test"), Some(hold.as_os_str())),
+            Some(hold.clone())
+        );
+        assert_eq!(
+            hold_journal_pull_from(Some("production"), Some(hold.as_os_str())),
+            None
+        );
+        assert_eq!(hold_journal_pull_from(None, Some(hold.as_os_str())), None);
         std::fs::remove_file(&hold).expect("remove hold file");
-        assert!(!journal_pull_held_from(
-            Some("test"),
-            Some(hold.as_os_str())
-        ));
+        assert_eq!(
+            hold_journal_pull_from(Some("test"), Some(hold.as_os_str())),
+            Some(hold)
+        );
 
         assert_eq!(
             lifecycle_journal_capacity_from(Some("test"), Some("8")),
