@@ -7,6 +7,21 @@ Pipeline: `botster_stack_delivery` (direct merge, no PR)
 Project: `project_1786663508_823105` Botster Non-Blocking Event Plane, Stage D
 Vault checklist: `checklist_1787266824_449406` (ticket scope, one Plan visit)
 
+## Plan revision 9
+
+Revision 9 records the Verify-return amendment from `question_1787428441_900918` / `question_1787437854_708832`. Residual-tail calibration dispatches `32591282234` and `32591872269` at `ef77621`, and `32594580606` at `8ee0d7a`, are **inconclusive `host_exhaustion` observations**, not product pass/fail. Captured counters from `32594580606` (`max_owner_turn_us` 219723, `max_ready_operation_wait_us` 1845228) must not be cited as product results.
+
+The published reference for this campaign is now `stress_profile=none` on the same GitHub-hosted `ubuntu-24.04` four-CPU runner. `N=300`, 300 quiet PTYs, the noisy 4 KiB / 100 ms producer, four drivers, 150 events per second, and enabled-versus-disabled comparisons stay fixed. Residual-tail remains the default for other loaded-lifecycle tickets.
+
+The campaign classifies host validity from:
+
+- a disabled/decoupled arm that cannot meet the published operation and terminal budgets, and
+- a monotonic scheduler-lag probe that proves the runner cannot schedule campaign work within those budgets.
+
+Load average, runnable-task count, CPU steal, and raw scheduler lag are diagnostics only. If the disabled arm is valid and the enabled arm fails, the verdict is a product defect. File-descriptor and PTY probes remain additional evidence.
+
+The ShedBusy fault lane asserts the typed `EventPlaneStatus::ShedBusy` result. It does not use a wall-clock bound.
+
 ## Plan revision 8
 
 Revision 8 answers Plan Review `review_1787278903_443047` (`changes_required`, three findings). All three were correct.
@@ -340,7 +355,7 @@ Every value below is fixed by this reviewed plan. Neither calibration nor accept
 | --- | --- |
 | Runner | fresh GitHub-hosted `ubuntu-24.04` from `.github/workflows/loaded-daemon-lifecycle.yml` |
 | Recorded fields | runner image, architecture, CPU count, total memory, kernel release, `ulimit -n`, PTY ceiling, Rust 1.97.0, Zig 0.16.0 |
-| Stress profile | `residual-tail`, identical in both phases |
+| Stress profile | `none`, identical in both phases |
 
 **Fleet**
 
@@ -945,7 +960,7 @@ gh workflow run loaded-daemon-lifecycle.yml \
   -f subject_sha=<exact merged Hub SHA> \
   -f test_target=event-plane-saturation \
   -F repetitions=<published> \
-  -f stress_profile=residual-tail
+  -f stress_profile=none
 ```
 
 Phase 2, acceptance. Identical inputs, dispatched only after the calibration commit lands. Acceptance records the calibration commit SHA it gates against; a mismatch fails the campaign.

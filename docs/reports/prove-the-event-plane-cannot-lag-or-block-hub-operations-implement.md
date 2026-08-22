@@ -8,14 +8,13 @@
 | `target_id` | `tgt_7e208a0c76a44980a83b63af976b1f22` |
 | Ticket | `ticket_1786663585_879846` |
 | Run | `run_1787262311_549251` |
-| Step | `botster_stack_implement` (`run_step_1787426636_597511`) |
+| Step | `botster_stack_implement` (`run_step_1787428646_897571`) |
 | Merge policy | `direct` into `main`; no PR |
-| This implement commit | `5ca341f75be9260e10058da5c0575c5622ac9941` |
-| Returned from | `review_1787426623_901468` (`changes_required`, three findings) |
+| Returned from | Verify `review_1787428576_249460` plus human answer `question_1787437854_708832` restating `question_1787428441_900918` |
 | Locked Core | `7eafa470a18025895995bbedc20d34b58106a03b` |
 | `teardown_class_applies` | **yes** |
 
-Independent routing: ticket and run `target_id` resolve to `botster-hub`. Work is in the ticket worktree.
+Independent routing: ticket and run `target_id` resolve to `botster-hub`. Work is in the ticket worktree. This visit replaces a prior Implement agent and does not rebuild the campaign.
 
 ## Playbooks and notes applied
 
@@ -23,36 +22,51 @@ Independent routing: ticket and run `target_id` resolve to `botster-hub`. Work i
 - [[botster-implementer-playbook]]
 - [[botster-hub-playbook]]
 - [[botster runtime teardown lenses]]
-- [[saturation counters do not acquire the contended lock they report]]
-- [[events.emit is a non-blocking router ingress not an owner-pumped host bridge]]
-- [[event plane client proof uses library contract fixtures]]
-- [[Hub ultimate WebRTC close failure sacrifices every peer on the dedicated runtime]]
+- [[load campaigns need a host validity oracle not fd and pty probes]]
+- [[wall clock bounds in campaign fault lanes waste whole runner dispatches]]
+- [[conformance harnesses gate on deterministic invariants not timing]]
+- [[router ingress uses try_lock only and contention is shed_busy]]
+- [[host exhaustion markers identify each failed test]]
 - [[test script required for rust tests not cargo test]]
-- [[implement gate must verify committed work and pr link before review]]
+- [[event plane terminal budgets are new coexistence regression budgets]]
 - [[implementation steps must persist report artifacts for review]]
-- [[implementation artifacts must match actual git state]]
-- [[pipeline artifacts should use path neutral worktree references]]
-- [[pipeline vault checklists must cite exact resolvable note titles]]
 
 ## Review findings addressed
 
 | Finding | Severity | Fix |
 | --- | --- | --- |
-| `finding_1787426623_667584` inbound occupancy underflow race | high | The DataChannel callback reserves count, bytes, and enqueue time before `try_send`. A failed send rolls the reservation back from the newest frame. Occupancy keeps a per-frame enqueue deque so pop selects the next oldest. A reentrant producer-consumer test pops inside the send callback after reserve. |
-| `finding_1787426623_264297` pending host events lack byte and age bounds | high | Pending events reject before count 128 or 512 KiB is exceeded. Each parked event stores enqueue time. The snapshot publishes `max_bytes` and `oldest_age_us`. The campaign gates overflow, missing `max_bytes`, byte overshoot, and age above 1000 ms. |
-| `finding_1787426623_519544` tests skip async cancel and overflow | high | `inbound_chunk_reassembly_survives_cancelled_read` admits the first encrypted chunk, cancels `receive_delivery`, resumes with the second chunk, and asserts the exact plaintext. Count and byte overflows drive the real bounded channel and assert typed `CountLimit` / `ByteLimit` plus unchanged occupancy. |
+| `finding_1787428577_251857` Host-validity oracle | **blocker** | Campaign classifier uses disabled-arm published-budget validity and a monotonic scheduler-lag probe. FD/PTY probes remain additional evidence. Load average is diagnostic only. A valid disabled arm plus an enabled-arm budget breach is `product_failure`. Both oracles are in the dataset JSON. |
+| `finding_1787428577_944142` ShedBusy 5 ms clock | **blocker** | Deleted the wall-clock assertion. `prove_shed_busy_non_blocking` keeps `assert_eq!(status, EventPlaneStatus::ShedBusy)`. |
+| `finding_1787428576_764875` Reference profile | **blocker** | Published reference is `stress_profile=none`. Runner, N=300, noisy producer, four drivers, and 150 events/s stay fixed. Dataset writer, calibration JSON, budgets doc, plan A.2 / 12.7, and the event-plane script guard now require `none`. |
+| `finding_1787428577_920664` Provenance | medium | Residual-tail runs `32591282234` and `32591872269` at `ef77621`, and `32594580606` at `8ee0d7a`, are recorded as inconclusive `host_exhaustion` observations. Counters from `32594580606` are not product results. |
+| `finding_1787428577_842008` Moderate-stress lane | info | Not added. Non-gating and only after the `none` reference campaign passes. |
+
+## Provenance of residual-tail dispatches
+
+These three GitHub `ubuntu-24.04` residual-tail calibration runs are **not** product pass/fail:
+
+| Run | Commit | Classification |
+| --- | --- | --- |
+| `32591282234` | `ef77621` | inconclusive `host_exhaustion` |
+| `32591872269` | `ef77621` | inconclusive `host_exhaustion` |
+| `32594580606` | `8ee0d7a` | inconclusive `host_exhaustion` |
+
+`32594580606` reported `max_owner_turn_us` 219723 and `max_ready_operation_wait_us` 1845228 while FD and PTY probes were `Unconfirmed`. Those counters must not be cited as product results. The amended `none` profile supersedes them.
 
 ## Files changed
 
-- `tests/hub_daemon_lifecycle/webrtc_fixtures.rs`
 - `tests/hub_daemon_lifecycle/event_plane_saturation.rs`
-- `tests/hub_daemon_lifecycle/webrtc_terminal_adapter.rs`
-
-Report path: `docs/reports/prove-the-event-plane-cannot-lag-or-block-hub-operations-implement.md`
+- `script/run-loaded-daemon-lifecycle`
+- `script/run-loaded-daemon-lifecycle-selftest`
+- `docs/event-plane-load-proof.md`
+- `docs/plans/prove-the-event-plane-cannot-lag-or-block-hub-operations.md`
+- `docs/reports/prove-the-event-plane-cannot-lag-or-block-hub-operations-calibration.json`
+- `docs/reports/prove-the-event-plane-cannot-lag-or-block-hub-operations-evidence.json`
+- `docs/reports/prove-the-event-plane-cannot-lag-or-block-hub-operations-implement.md`
 
 ## Ownership
 
-Hub owns IsolatedHub campaign fixtures. Direct merge; no PR. No public contract change. No cross-repo routing.
+Hub owns IsolatedHub campaign fixtures and the loaded-lifecycle runner. Direct merge; no PR. No production budget retune. No public protocol change. No cross-repo routing.
 
 ## Teardown lenses
 
@@ -60,22 +74,26 @@ Unchanged. Hang-close remains the live fail-closed oracle. This visit does not a
 
 ## Deviations
 
-None from N=300, 600 s, or 150 events/s. This Darwin worktree did not re-dispatch ubuntu-24.04 calibration.
+- Plan revision 8 named `residual-tail` as the reference. Human answer `question_1787437854_708832` amends **only** that field to `none`. N=300 and the rest of A.2 stay fixed.
+- Measurement arms now run decoupled first so a disabled-arm sample exists before enabled-arm classification.
+- This Darwin worktree does not re-dispatch ubuntu-24.04 calibration. Verify must dispatch calibration on `stress_profile=none`.
+- Workflow default for other loaded-lifecycle tickets remains `residual-tail`.
 
 ## Tests
 
-- `cargo fmt --all`
-- `cargo clippy --workspace --all-targets --locked -- -D warnings` (exit 0)
-- `./test.sh --locked --test hub_daemon_lifecycle_test inbound_` — 3 passed
-- `./test.sh --locked --test hub_daemon_lifecycle_test pending_host_events` — 1 passed
-- `./test.sh --locked --test hub_daemon_lifecycle_test event_plane_saturation_` — 8 passed, 1 ignored
+| Command | Result |
+| --- | --- |
+| `cargo fmt --all` | pass |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | pass |
+| `./test.sh --locked --test hub_daemon_lifecycle_test event_plane_saturation_` | 13 passed, 0 failed, 1 ignored (`event_plane_saturation_campaign`) |
+| `script/run-loaded-daemon-lifecycle-selftest` | pass, including `stress_profile=none` validate-only and residual-tail rejection |
 
-One parallel run of `event_plane_saturation_shed_busy_is_non_blocking` exceeded the 5 ms bound (8.9 ms). The isolated rerun passed in 0.00 s. The test body is unchanged.
+This Darwin worktree cannot execute the ignored N=300 ubuntu-24.04 campaign.
 
 ## Unverified
 
-N=300 ubuntu-24.04 residual-tail calibration and acceptance have not been re-run after this commit. Verify must dispatch calibration on the reference runner.
+N=300 ubuntu-24.04 `none` calibration and acceptance have not run after this commit. Verify must dispatch calibration on the reference runner with `-f stress_profile=none`.
 
 ## Missing vault guidance
 
-None.
+None. The host-validity and ShedBusy wall-clock notes already cover this return.

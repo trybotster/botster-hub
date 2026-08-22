@@ -16,8 +16,8 @@
   },
   "profile": {
     "runner": "ubuntu-24.04",
-    "stress_profile": "residual-tail"
+    "stress_profile": "none"
   },
   "thresholds": null,
-  "note": "Acceptance must not run until this file contains immutable ABS* and THRMIN literals derived from a residual-tail calibration dispatch on the loaded-daemon-lifecycle runner."
+  "note": "Acceptance must not run until this file contains immutable ABS* and THRMIN literals derived from a none-profile calibration dispatch on the loaded-daemon-lifecycle ubuntu-24.04 runner. Residual-tail dispatches 32591282234, 32591872269, and 32594580606 are inconclusive host_exhaustion observations, not product results."
 }

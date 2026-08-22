@@ -2,11 +2,11 @@
   "campaign": "event-plane-saturation",
   "ticket_id": "ticket_1786663585_879846",
   "run_id": "run_1787262311_549251",
-  "result": "review_return_queue_bytes_and_calibration_commit_binding_pending_runner",
+  "result": "verify_return_host_validity_oracle_and_none_profile_pending_runner",
   "target_id": "tgt_7e208a0c76a44980a83b63af976b1f22",
   "target_repository": "botster-hub",
   "executed_revisions": {
-    "botster-hub": "032104bcea002b31915e7c5d50a82668d31feb45",
+    "botster-hub": "pending_this_implement_commit",
     "botster-core": "7eafa470a18025895995bbedc20d34b58106a03b"
   },
   "cited_prerequisite_revisions": {
@@ -39,30 +39,60 @@
     }
   },
   "provenance": {
-    "note": "This Review-return implement visit ran on Darwin at 032104b. Calibration and acceptance require the loaded-daemon-lifecycle ubuntu-24.04 residual-tail runner.",
-    "stress_profile_required": "residual-tail",
-    "test_target": "event-plane-saturation"
+    "note": "This Verify-return implement visit amends the published reference to stress_profile=none and adds host-validity oracles. Calibration and acceptance still require the loaded-daemon-lifecycle ubuntu-24.04 runner.",
+    "stress_profile_required": "none",
+    "test_target": "event-plane-saturation",
+    "inconclusive_residual_tail_dispatches": [
+      {
+        "github_run_id": "32591282234",
+        "commit": "ef77621",
+        "classification": "inconclusive host_exhaustion",
+        "product_result": false
+      },
+      {
+        "github_run_id": "32591872269",
+        "commit": "ef77621",
+        "classification": "inconclusive host_exhaustion",
+        "product_result": false
+      },
+      {
+        "github_run_id": "32594580606",
+        "commit": "8ee0d7a",
+        "classification": "inconclusive host_exhaustion",
+        "product_result": false,
+        "captured_counters_not_product_results": {
+          "max_owner_turn_us": 219723,
+          "max_ready_operation_wait_us": 1845228
+        }
+      }
+    ]
   },
   "always_on_proof": {
-    "event_plane_saturation_source_guards_hold": "pass",
-    "event_plane_saturation_percentile_and_budget_formulas": "pass",
-    "event_plane_saturation_throughput_keeps_fractional_ops_per_second": "pass",
-    "event_plane_saturation_shed_busy_is_non_blocking": "pass",
-    "event_plane_saturation_isolated_client_event_conformance": "pass",
+    "event_plane_saturation_source_guards_hold": "passed",
+    "event_plane_saturation_percentile_and_budget_formulas": "passed",
+    "event_plane_saturation_throughput_keeps_fractional_ops_per_second": "passed",
+    "event_plane_saturation_shed_busy_is_non_blocking": "passed",
+    "event_plane_saturation_host_validity_scheduler_lag_is_host_exhaustion": "passed",
+    "event_plane_saturation_host_validity_disabled_arm_over_budget_is_host_exhaustion": "passed",
+    "event_plane_saturation_valid_disabled_arm_makes_enabled_breach_product_failure": "passed",
+    "event_plane_saturation_host_validity_ignores_load_average": "passed",
+    "event_plane_saturation_isolated_client_event_conformance": "passed",
     "event_plane_saturation_campaign": "ignored",
-    "clippy_deny_warnings": "pass",
-    "loaded_daemon_lifecycle_selftest_timeout": "pass",
-    "loaded_daemon_lifecycle_selftest_event_plane_phase": "pass"
+    "clippy_deny_warnings": "passed",
+    "loaded_daemon_lifecycle_selftest_timeout": "passed",
+    "loaded_daemon_lifecycle_selftest_event_plane_phase": "passed",
+    "loaded_daemon_lifecycle_selftest_event_plane_none_profile": "passed"
   },
   "assumptions": [
     "Coexistence regression budgets are not North Star transport service levels.",
     "The decoupled arm admits no event packages, so measurement MCP and UI use PluginMcpListTools and ListApps on both arms.",
-    "Published hub-test-support npm fixture bytes did not change."
+    "Published hub-test-support npm fixture bytes did not change.",
+    "Load average never selects the campaign verdict."
   ],
   "residual_risk": [
-    "Calibration thresholds are unpublished.",
-    "The ignored 300-session campaign has not run on the reference runner.",
-    "Acceptance cannot execute until a linux residual-tail calibration commit exists.",
+    "Calibration thresholds are unpublished pending a none-profile ubuntu-24.04 dispatch.",
+    "The ignored 300-session campaign has not run on the amended reference profile.",
+    "Acceptance cannot execute until a linux none-profile calibration commit exists.",
     "WebRTC fail-closed blast radius remains the production hang-close child oracle."
   ]
 }
