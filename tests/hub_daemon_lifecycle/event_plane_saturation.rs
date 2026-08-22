@@ -53,6 +53,8 @@ const EVENT_PLANE_GATED_OPERATIONS: [&str; 11] = [
     "terminal_output",
 ];
 const EVENT_PLANE_QUEUE_AGE_US: u64 = 1_000 * 1_000;
+const EVENT_PLANE_SCHEDULER_LAG_BUDGET_US: u64 = 50_000;
+const EVENT_PLANE_SCHEDULER_WATCHDOG_PERIOD: Duration = Duration::from_millis(1);
 const EVENT_PLANE_MAX_AGE_SAMPLE_FAILURES: u64 = 0;
 const EVENT_PLANE_OUTPUT_RECORD_BYTES: usize = 4096;
 const EVENT_PLANE_OUTPUT_HEADER_BYTES: usize = 30;
@@ -197,10 +199,13 @@ fn event_plane_saturation_source_guards_hold() {
         !campaign.contains(&five_ms_clock),
         "ShedBusy must not use a wall-clock bound"
     );
+    assert_eq!(EVENT_PLANE_SCHEDULER_LAG_BUDGET_US, 50_000);
     assert!(
-        campaign.contains("fn probe_scheduler_lag")
-            && campaign.contains("disabled_arm_meets_published_budgets"),
-        "host-validity oracles must stay in the campaign"
+        campaign.contains("fn start_scheduler_watchdog")
+            && campaign.contains("fn persist_host_validity_artifact")
+            && campaign.contains("disabled_arm_meets_immutable_gates")
+            && campaign.contains("fn evaluate_pre_calibration_gates"),
+        "immutable pre-calibration gates, watchdog, and host-validity artifact must stay in the campaign"
     );
     let proof = fs::read_to_string(root.join("docs/event-plane-load-proof.md")).expect("proof");
     assert!(
@@ -253,11 +258,12 @@ fn prove_shed_busy_non_blocking() {
 #[allow(clippy::field_reassign_with_default)]
 fn event_plane_saturation_host_validity_scheduler_lag_is_host_exhaustion() {
     let lag = SchedulerLagProbe {
-        requested_busy_us: MAX_OWNER_TURN_MS * 1000,
+        requested_busy_us: 0,
         observed_elapsed_us: 1_800_000,
         max_gap_us: 1_775_000,
         lag_us: 1_775_000,
-        budget_us: MAX_READY_OPERATION_WAIT_MS * 1000,
+        budget_us: EVENT_PLANE_SCHEDULER_LAG_BUDGET_US,
+        samples: 12,
     };
     let validity = classify_host_validity(
         Some(&botster_hub_client::DaemonObservabilityCounters::default()),
@@ -273,15 +279,15 @@ fn event_plane_saturation_host_validity_scheduler_lag_is_host_exhaustion() {
     assert!(validity.scheduler_lag.exceeds_budget());
     assert!(
         validity
-            .reasons
+            .gates
             .iter()
-            .any(|reason| reason.contains("scheduler_lag"))
+            .any(|gate| gate.id == 8 && gate.status == "fail")
     );
 }
 
 #[test]
 #[allow(clippy::field_reassign_with_default)]
-fn event_plane_saturation_host_validity_disabled_arm_over_budget_is_host_exhaustion() {
+fn event_plane_saturation_host_validity_disabled_arm_over_budget_is_product_failure() {
     let mut decoupled = botster_hub_client::DaemonObservabilityCounters::default();
     decoupled.max_owner_turn_us = 219_723;
     decoupled.max_ready_operation_wait_us = 1_845_228;
@@ -292,9 +298,21 @@ fn event_plane_saturation_host_validity_disabled_arm_over_budget_is_host_exhaust
         ResourceProbe::Unconfirmed,
         HostDiagnostics::default(),
     );
-    assert_eq!(validity.verdict, HostValidityVerdict::Exhausted);
-    assert_eq!(validity.disabled_arm_meets_published_budgets, Some(false));
+    assert_eq!(validity.verdict, HostValidityVerdict::ProductFailure);
+    assert_eq!(validity.disabled_arm_meets_immutable_gates, Some(false));
     assert!(!validity.scheduler_lag.exceeds_budget());
+    assert!(
+        validity
+            .gates
+            .iter()
+            .any(|gate| gate.id == 6 && gate.status == "fail")
+    );
+    assert!(
+        validity
+            .gates
+            .iter()
+            .any(|gate| gate.id == 7 && gate.status == "fail")
+    );
 }
 
 #[test]
@@ -311,7 +329,7 @@ fn event_plane_saturation_valid_disabled_arm_makes_enabled_breach_product_failur
         HostDiagnostics::default(),
     );
     assert_eq!(validity.verdict, HostValidityVerdict::Valid);
-    assert_eq!(validity.disabled_arm_meets_published_budgets, Some(true));
+    assert_eq!(validity.disabled_arm_meets_immutable_gates, Some(true));
     let mut enabled = botster_hub_client::DaemonObservabilityCounters::default();
     enabled.max_owner_turn_us = 219_723;
     assert_eq!(
@@ -337,14 +355,142 @@ fn event_plane_saturation_host_validity_ignores_load_average() {
         },
     );
     assert_eq!(validity.verdict, HostValidityVerdict::Valid);
-    assert_eq!(validity.disabled_arm_meets_published_budgets, Some(true));
+    assert_eq!(validity.disabled_arm_meets_immutable_gates, Some(true));
+}
+
+#[test]
+fn event_plane_saturation_scheduler_watchdog_records_injected_delayed_sample() {
+    let max_lag_us = AtomicU64::new(0);
+    record_scheduler_sample(&max_lag_us, 1_000);
+    record_scheduler_sample(&max_lag_us, 75_000);
+    record_scheduler_sample(&max_lag_us, 2_000);
+    assert_eq!(max_lag_us.load(Ordering::SeqCst), 75_000);
+    let probe = SchedulerLagProbe {
+        requested_busy_us: 0,
+        observed_elapsed_us: 0,
+        max_gap_us: 76_000,
+        lag_us: max_lag_us.load(Ordering::SeqCst),
+        budget_us: EVENT_PLANE_SCHEDULER_LAG_BUDGET_US,
+        samples: 3,
+    };
+    assert!(probe.exceeds_budget());
+    let watchdog = start_scheduler_watchdog();
+    thread::sleep(Duration::from_millis(15));
+    let stopped = stop_scheduler_watchdog(watchdog);
+    assert!(stopped.samples >= 1, "watchdog must join with at least one sample: {stopped:?}");
+    assert_eq!(stopped.budget_us, EVENT_PLANE_SCHEDULER_LAG_BUDGET_US);
+}
+
+#[test]
+fn event_plane_saturation_persists_host_validity_artifact_before_failure_exit() {
+    let dir = unique_test_dir("event-plane-host-validity-artifact");
+    let mut decoupled = botster_hub_client::DaemonObservabilityCounters::default();
+    decoupled.max_owner_turn_us = 219_723;
+    let validity = classify_host_validity(
+        Some(&decoupled),
+        &idle_scheduler_lag(),
+        ResourceProbe::Unconfirmed,
+        ResourceProbe::Unconfirmed,
+        HostDiagnostics {
+            loadavg_1: Some(1.25),
+            loadavg_5: Some(1.10),
+            loadavg_15: Some(0.90),
+            runnable: Some(8),
+            total_threads: Some(120),
+            cpu_steal: Some(42.0),
+        },
+    );
+    assert_eq!(validity.verdict, HostValidityVerdict::ProductFailure);
+    let path = persist_host_validity_artifact_to(&dir.join("event-plane-host-validity.json"), &validity);
+    let body: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).expect("read host-validity artifact"))
+            .expect("parse host-validity artifact");
+    assert_eq!(body["verdict"], "product_failure");
+    let gates = body["gates"].as_array().expect("gates array");
+    assert_eq!(gates.len(), 11, "artifact must record every immutable gate");
+    assert_eq!(body["diagnostics"]["cpu_steal"], 42.0);
+    assert_eq!(
+        body["diagnostics"]["cpu_steal_unit"],
+        "linux_proc_stat_steal_ticks"
+    );
+    assert_eq!(body["diagnostics"]["loadavg_1"], 1.25);
+    assert_eq!(body["diagnostics"]["runnable"], 8);
+    assert_eq!(body["diagnostics"]["total_threads"], 120);
+    assert!(
+        gates.iter().any(|gate| gate["id"] == 6 && gate["status"] == "fail"),
+        "gate 6 must fail in the artifact: {body}"
+    );
+}
+
+#[test]
+fn event_plane_saturation_host_validity_fleet_shortfall_is_product_failure() {
+    let mut evidence = passing_validity_evidence();
+    evidence.n_running = 12;
+    let validity = classify_pre_calibration_validity(evidence);
+    assert_eq!(validity.verdict, HostValidityVerdict::ProductFailure);
+    assert!(
+        validity
+            .gates
+            .iter()
+            .any(|gate| gate.id == 1 && gate.status == "fail")
+    );
+}
+
+#[test]
+fn event_plane_saturation_host_validity_sample_shortfall_is_product_failure() {
+    let mut evidence = passing_validity_evidence();
+    evidence.operations.get_mut("spawn").expect("spawn stats").successes = 12;
+    let validity = classify_pre_calibration_validity(evidence);
+    assert_eq!(validity.verdict, HostValidityVerdict::ProductFailure);
+    assert!(
+        validity
+            .gates
+            .iter()
+            .any(|gate| gate.id == 3 && gate.status == "fail")
+    );
+}
+
+#[test]
+fn event_plane_saturation_host_validity_survivors_are_survivors_present() {
+    let mut evidence = passing_validity_evidence();
+    evidence.survivors.push(("quiet-0-1".into(), "running".into()));
+    let validity = classify_pre_calibration_validity(evidence);
+    assert_eq!(validity.verdict, HostValidityVerdict::SurvivorsPresent);
+}
+
+#[test]
+fn event_plane_saturation_host_validity_taint_is_environment_tainted() {
+    let _guard = daemon_test_guard();
+    let _taint = ScopedHarnessTaint::inject("injected event-plane taint");
+    let validity = classify_host_validity(
+        Some(&botster_hub_client::DaemonObservabilityCounters::default()),
+        &idle_scheduler_lag(),
+        ResourceProbe::Unconfirmed,
+        ResourceProbe::Unconfirmed,
+        HostDiagnostics::default(),
+    );
+    assert_eq!(validity.verdict, HostValidityVerdict::EnvironmentTainted);
+}
+
+#[test]
+fn event_plane_saturation_host_validity_fd_controls_host_exhaustion() {
+    let mut decoupled = botster_hub_client::DaemonObservabilityCounters::default();
+    decoupled.max_owner_turn_us = 219_723;
+    let validity = classify_host_validity(
+        Some(&decoupled),
+        &idle_scheduler_lag(),
+        ResourceProbe::Confirmed,
+        ResourceProbe::Unconfirmed,
+        HostDiagnostics::default(),
+    );
+    assert_eq!(validity.verdict, HostValidityVerdict::Exhausted);
 }
 
 #[test]
 fn event_plane_saturation_scheduler_lag_probe_records_monotonic_elapsed() {
     let probe = probe_scheduler_lag();
     assert_eq!(probe.requested_busy_us, MAX_OWNER_TURN_MS * 1000);
-    assert_eq!(probe.budget_us, MAX_READY_OPERATION_WAIT_MS * 1000);
+    assert_eq!(probe.budget_us, EVENT_PLANE_SCHEDULER_LAG_BUDGET_US);
     assert!(probe.observed_elapsed_us >= probe.requested_busy_us);
     assert!(probe.lag_us >= probe.observed_elapsed_us.saturating_sub(probe.requested_busy_us));
 }
@@ -581,49 +727,52 @@ fn event_plane_saturation_campaign() {
     let _guard = daemon_test_guard();
     let fd = probe_fd_limit();
     let pty = probe_pty_allocation();
-    let lag = probe_scheduler_lag();
     eprintln!(
-        "event-plane saturation host probe fd={:?} pty={:?} scheduler_lag_us={} budget_us={}",
+        "event-plane saturation host probe fd={:?} pty={:?}",
         fd.marker_name(),
-        pty.marker_name(),
-        lag.lag_us,
-        lag.budget_us
+        pty.marker_name()
     );
-    let pre = classify_host_validity(None, &lag, fd, pty, host_load_diagnostics());
-    if pre.verdict == HostValidityVerdict::Exhausted {
-        panic!(
-            "host_exhaustion pre-measurement scheduler or resource probe: {}",
-            pre.summary()
-        );
-    }
-    let phase = campaign_phase();
-    let decoupled = run_saturation_arm(SaturationArm::PlaneDecoupled);
-    let lag = probe_scheduler_lag();
-    let fd = probe_fd_limit();
-    let pty = probe_pty_allocation();
-    let validity = classify_host_validity(
-        Some(&decoupled.observability),
-        &lag,
+    let pre = classify_host_validity(
+        None,
+        &unevaluated_scheduler_lag(),
         fd,
         pty,
         host_load_diagnostics(),
     );
-    if validity.verdict == HostValidityVerdict::Exhausted {
-        panic!(
-            "host_exhaustion disabled control arm cannot meet published budgets or scheduler lag exceeds budget: {}",
-            validity.summary()
-        );
+    persist_host_validity_artifact(&pre);
+    if pre.verdict != HostValidityVerdict::Valid {
+        fail_classified(&pre);
     }
-    let enabled = run_saturation_arm(SaturationArm::PlaneEnabled);
-    let enabled_metrics = metrics_for_arm(&enabled);
-    let decoupled_metrics = metrics_for_arm(&decoupled);
-    let class = classify_enabled_budget_failure(&validity, &enabled.observability);
+    let phase = campaign_phase();
+    let decoupled = run_saturation_arm(SaturationArm::PlaneDecoupled);
+    let fd = probe_fd_limit();
+    let pty = probe_pty_allocation();
+    let validity = classify_from_arm(&decoupled, fd, pty);
+    persist_host_validity_artifact(&validity);
+    if validity.verdict != HostValidityVerdict::Valid {
+        fail_classified(&validity);
+    }
+    let enabled_run = run_saturation_arm(SaturationArm::PlaneEnabled);
+    let enabled_validity = classify_from_arm(&enabled_run, probe_fd_limit(), probe_pty_allocation());
+    persist_host_validity_artifact(&enabled_validity);
+    if enabled_validity.verdict != HostValidityVerdict::Valid {
+        fail_classified(&enabled_validity);
+    }
+    let enabled_metrics = metrics_for_arm(&enabled_run.report);
+    let decoupled_metrics = metrics_for_arm(&decoupled.report);
+    let class = classify_enabled_budget_failure(&validity, &enabled_run.report.observability);
     if class != "clean" {
-        panic!(
-            "{class} enabled arm breached published budgets: {:?}; host_validity={}",
-            published_budget_breaches(&enabled.observability),
-            validity.summary()
-        );
+        let mut failed = enabled_validity.clone();
+        if failed.verdict == HostValidityVerdict::Valid {
+            failed.verdict = HostValidityVerdict::ProductFailure;
+            failed.disabled_arm_meets_immutable_gates = Some(false);
+            failed.reasons.extend(
+                published_budget_breaches(&enabled_run.report.observability)
+                    .into_iter()
+                    .map(|row| format!("enabled_arm:{row}")),
+            );
+        }
+        fail_classified(&failed);
     }
     let (thresholds, source_revision) = match phase {
         CampaignPhase::Calibration => (
@@ -642,10 +791,10 @@ fn event_plane_saturation_campaign() {
         &enabled_metrics,
         &decoupled_metrics,
         &thresholds,
-        &enabled.observability,
-        &decoupled.observability,
+        &enabled_run.report.observability,
+        &decoupled.report.observability,
         &faults,
-        enabled.webrtc_queues.clone(),
+        enabled_run.report.webrtc_queues.clone(),
         source_revision,
         &validity,
     );
@@ -667,6 +816,21 @@ enum CampaignPhase {
 enum HostValidityVerdict {
     Valid,
     Exhausted,
+    ProductFailure,
+    EnvironmentTainted,
+    SurvivorsPresent,
+}
+
+impl HostValidityVerdict {
+    fn name(self) -> &'static str {
+        match self {
+            HostValidityVerdict::Valid => "valid",
+            HostValidityVerdict::Exhausted => "host_exhaustion",
+            HostValidityVerdict::ProductFailure => "product_failure",
+            HostValidityVerdict::EnvironmentTainted => "environment_tainted",
+            HostValidityVerdict::SurvivorsPresent => "survivors_present",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -676,6 +840,7 @@ struct SchedulerLagProbe {
     max_gap_us: u64,
     lag_us: u64,
     budget_us: u64,
+    samples: u64,
 }
 
 impl SchedulerLagProbe {
@@ -690,6 +855,7 @@ impl SchedulerLagProbe {
             "max_gap_us": self.max_gap_us,
             "lag_us": self.lag_us,
             "budget_us": self.budget_us,
+            "samples": self.samples,
             "exceeds_budget": self.exceeds_budget()
         })
     }
@@ -714,59 +880,231 @@ impl HostDiagnostics {
             "runnable": self.runnable,
             "total_threads": self.total_threads,
             "cpu_steal": self.cpu_steal,
+            "cpu_steal_unit": "linux_proc_stat_steal_ticks",
             "note": "load average, runnable count, steal, and raw scheduler lag are diagnostics; they never select the verdict"
         })
     }
 }
 
 #[derive(Clone, Debug)]
+struct ValidityGate {
+    id: u8,
+    name: &'static str,
+    status: &'static str,
+    detail: String,
+}
+
+impl ValidityGate {
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id,
+            "name": self.name,
+            "status": self.status,
+            "detail": self.detail
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ValidityEvidence {
+    arm_evaluated: bool,
+    n_running: usize,
+    window_completed: bool,
+    operations: BTreeMap<String, OperationStats>,
+    worker_errors: Vec<String>,
+    terminal_passed: bool,
+    observability: Option<botster_hub_client::DaemonObservabilityCounters>,
+    scheduler_lag: SchedulerLagProbe,
+    fd_probe: ResourceProbe,
+    pty_probe: ResourceProbe,
+    diagnostics: HostDiagnostics,
+    environment_tainted: bool,
+    taint_evidence: Option<String>,
+    survivors: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug)]
 struct HostValidity {
     verdict: HostValidityVerdict,
-    disabled_arm_meets_published_budgets: Option<bool>,
+    disabled_arm_meets_immutable_gates: Option<bool>,
     scheduler_lag: SchedulerLagProbe,
     fd_probe: ResourceProbe,
     pty_probe: ResourceProbe,
     reasons: Vec<String>,
+    gates: Vec<ValidityGate>,
     diagnostics: HostDiagnostics,
 }
 
 impl HostValidity {
     fn json(&self) -> serde_json::Value {
         serde_json::json!({
-            "verdict": match self.verdict {
-                HostValidityVerdict::Valid => "valid",
-                HostValidityVerdict::Exhausted => "host_exhaustion",
-            },
-            "disabled_arm_meets_published_budgets": self.disabled_arm_meets_published_budgets,
+            "verdict": self.verdict.name(),
+            "disabled_arm_meets_immutable_gates": self.disabled_arm_meets_immutable_gates,
             "scheduler_lag": self.scheduler_lag.json(),
             "fd_probe": self.fd_probe.marker_name(),
             "pty_probe": self.pty_probe.marker_name(),
             "reasons": self.reasons,
+            "gates": self.gates.iter().map(ValidityGate::json).collect::<Vec<_>>(),
             "diagnostics": self.diagnostics.json()
         })
     }
 
     fn summary(&self) -> String {
         format!(
-            "verdict={:?} disabled_arm={:?} scheduler_lag_us={} budget_us={} fd={} pty={} reasons={:?}",
-            self.verdict,
-            self.disabled_arm_meets_published_budgets,
+            "verdict={} disabled_arm={:?} scheduler_lag_us={} budget_us={} samples={} fd={} pty={} loadavg={}/{}/{} runnable={:?} total_threads={:?} cpu_steal={:?} {} reasons={:?} gates={:?}",
+            self.verdict.name(),
+            self.disabled_arm_meets_immutable_gates,
             self.scheduler_lag.lag_us,
             self.scheduler_lag.budget_us,
+            self.scheduler_lag.samples,
             self.fd_probe.marker_name(),
             self.pty_probe.marker_name(),
-            self.reasons
+            self.diagnostics.loadavg_1.unwrap_or(f64::NAN),
+            self.diagnostics.loadavg_5.unwrap_or(f64::NAN),
+            self.diagnostics.loadavg_15.unwrap_or(f64::NAN),
+            self.diagnostics.runnable,
+            self.diagnostics.total_threads,
+            self.diagnostics.cpu_steal,
+            "cpu_steal_unit=linux_proc_stat_steal_ticks",
+            self.reasons,
+            self.gates
+                .iter()
+                .map(|gate| format!("{}:{}", gate.id, gate.status))
+                .collect::<Vec<_>>()
         )
+    }
+}
+
+struct SchedulerWatchdog {
+    stop: std::sync::Arc<AtomicBool>,
+    max_lag_us: std::sync::Arc<AtomicU64>,
+    samples: std::sync::Arc<AtomicU64>,
+    join: Option<thread::JoinHandle<()>>,
+}
+
+fn record_scheduler_sample(max_lag_us: &AtomicU64, lag_us: u64) {
+    loop {
+        let current = max_lag_us.load(Ordering::SeqCst);
+        if lag_us <= current {
+            return;
+        }
+        if max_lag_us
+            .compare_exchange(current, lag_us, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return;
+        }
+    }
+}
+
+fn start_scheduler_watchdog() -> SchedulerWatchdog {
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let max_lag_us = std::sync::Arc::new(AtomicU64::new(0));
+    let samples = std::sync::Arc::new(AtomicU64::new(0));
+    let join = thread::Builder::new()
+        .name("event-plane-scheduler-watchdog".into())
+        .spawn({
+            let stop = stop.clone();
+            let max_lag_us = max_lag_us.clone();
+            let samples = samples.clone();
+            move || {
+                let period = EVENT_PLANE_SCHEDULER_WATCHDOG_PERIOD;
+                let period_us = u64::try_from(period.as_micros()).unwrap_or(1_000);
+                let mut last = Instant::now();
+                while !stop.load(Ordering::SeqCst) {
+                    thread::sleep(period);
+                    let now = Instant::now();
+                    let gap_us =
+                        u64::try_from(now.saturating_duration_since(last).as_micros()).unwrap_or(u64::MAX);
+                    last = now;
+                    record_scheduler_sample(&max_lag_us, gap_us.saturating_sub(period_us));
+                    samples.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        })
+        .expect("spawn scheduler watchdog");
+    SchedulerWatchdog {
+        stop,
+        max_lag_us,
+        samples,
+        join: Some(join),
+    }
+}
+
+fn stop_scheduler_watchdog(mut watchdog: SchedulerWatchdog) -> SchedulerLagProbe {
+    watchdog.stop.store(true, Ordering::SeqCst);
+    if let Some(join) = watchdog.join.take() {
+        join.join().expect("join scheduler watchdog");
+    }
+    let lag_us = watchdog.max_lag_us.load(Ordering::SeqCst);
+    let samples = watchdog.samples.load(Ordering::SeqCst);
+    SchedulerLagProbe {
+        requested_busy_us: 0,
+        observed_elapsed_us: 0,
+        max_gap_us: lag_us.saturating_add(
+            u64::try_from(EVENT_PLANE_SCHEDULER_WATCHDOG_PERIOD.as_micros()).unwrap_or(1_000),
+        ),
+        lag_us,
+        budget_us: EVENT_PLANE_SCHEDULER_LAG_BUDGET_US,
+        samples,
+    }
+}
+
+fn passing_operation_stats() -> BTreeMap<String, OperationStats> {
+    EVENT_PLANE_GATED_OPERATIONS
+        .iter()
+        .map(|name| {
+            (
+                (*name).to_string(),
+                OperationStats {
+                    attempts: EVENT_PLANE_MIN_SAMPLES,
+                    successes: EVENT_PLANE_MIN_SAMPLES,
+                    failures: 0,
+                    samples_ms: vec![1; EVENT_PLANE_MIN_SAMPLES as usize],
+                },
+            )
+        })
+        .collect()
+}
+
+fn passing_validity_evidence() -> ValidityEvidence {
+    ValidityEvidence {
+        arm_evaluated: true,
+        n_running: EVENT_PLANE_FLEET_N,
+        window_completed: true,
+        operations: passing_operation_stats(),
+        worker_errors: Vec::new(),
+        terminal_passed: true,
+        observability: Some(botster_hub_client::DaemonObservabilityCounters::default()),
+        scheduler_lag: idle_scheduler_lag(),
+        fd_probe: ResourceProbe::Unconfirmed,
+        pty_probe: ResourceProbe::Unconfirmed,
+        diagnostics: HostDiagnostics::default(),
+        environment_tainted: false,
+        taint_evidence: None,
+        survivors: Vec::new(),
+    }
+}
+
+fn unevaluated_scheduler_lag() -> SchedulerLagProbe {
+    SchedulerLagProbe {
+        requested_busy_us: 0,
+        observed_elapsed_us: 0,
+        max_gap_us: 0,
+        lag_us: 0,
+        budget_us: EVENT_PLANE_SCHEDULER_LAG_BUDGET_US,
+        samples: 0,
     }
 }
 
 fn idle_scheduler_lag() -> SchedulerLagProbe {
     SchedulerLagProbe {
-        requested_busy_us: MAX_OWNER_TURN_MS * 1000,
-        observed_elapsed_us: MAX_OWNER_TURN_MS * 1000,
+        requested_busy_us: 0,
+        observed_elapsed_us: 0,
         max_gap_us: 0,
         lag_us: 0,
-        budget_us: MAX_READY_OPERATION_WAIT_MS * 1000,
+        budget_us: EVENT_PLANE_SCHEDULER_LAG_BUDGET_US,
+        samples: 1,
     }
 }
 
@@ -782,14 +1120,16 @@ fn dummy_host_validity() -> HostValidity {
 
 fn probe_scheduler_lag() -> SchedulerLagProbe {
     let requested = Duration::from_millis(MAX_OWNER_TURN_MS);
-    let budget_us = MAX_READY_OPERATION_WAIT_MS * 1000;
+    let budget_us = EVENT_PLANE_SCHEDULER_LAG_BUDGET_US;
     let start = Instant::now();
     let mut last = start;
     let mut max_gap = Duration::ZERO;
+    let mut samples = 0_u64;
     while start.elapsed() < requested {
         let now = Instant::now();
         max_gap = max_gap.max(now.saturating_duration_since(last));
         last = now;
+        samples = samples.saturating_add(1);
         std::hint::spin_loop();
     }
     let elapsed = start.elapsed();
@@ -800,7 +1140,41 @@ fn probe_scheduler_lag() -> SchedulerLagProbe {
         max_gap_us: u64::try_from(max_gap.as_micros()).unwrap_or(u64::MAX),
         lag_us: u64::try_from(lag.as_micros()).unwrap_or(u64::MAX),
         budget_us,
+        samples,
     }
+}
+
+fn host_validity_artifact_path() -> PathBuf {
+    artifact_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("event-plane-host-validity.json")
+}
+
+fn persist_host_validity_artifact(validity: &HostValidity) -> PathBuf {
+    persist_host_validity_artifact_to(&host_validity_artifact_path(), validity)
+}
+
+fn persist_host_validity_artifact_to(path: &Path, validity: &HostValidity) -> PathBuf {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("create host-validity artifact dir");
+    }
+    fs::write(
+        path,
+        serde_json::to_string_pretty(&validity.json()).expect("encode host-validity artifact"),
+    )
+    .expect("write host-validity artifact");
+    eprintln!("event-plane host-validity artifact written to {}", path.display());
+    path.to_path_buf()
+}
+
+fn fail_classified(validity: &HostValidity) -> ! {
+    let path = persist_host_validity_artifact(validity);
+    panic!(
+        "{} host-validity artifact={}: {}",
+        validity.verdict.name(),
+        path.display(),
+        validity.summary()
+    );
 }
 
 fn published_budget_breaches(
@@ -826,6 +1200,219 @@ fn published_budget_breaches(
     reasons
 }
 
+fn applicable_queue_age_breaches(
+    observability: &botster_hub_client::DaemonObservabilityCounters,
+) -> Vec<String> {
+    queue_bound_violations(observability, &PackageEventPlaneOptions::default())
+        .into_iter()
+        .filter(|row| row.contains("oldest_age_us"))
+        .collect()
+}
+
+fn gate_result(id: u8, name: &'static str, passed: bool, detail: String) -> ValidityGate {
+    ValidityGate {
+        id,
+        name,
+        status: if passed { "pass" } else { "fail" },
+        detail,
+    }
+}
+
+fn gate_not_evaluated(id: u8, name: &'static str) -> ValidityGate {
+    ValidityGate {
+        id,
+        name,
+        status: "not_evaluated",
+        detail: "arm has not produced this measurement".to_string(),
+    }
+}
+
+fn evaluate_pre_calibration_gates(evidence: &ValidityEvidence) -> (Vec<ValidityGate>, HostValidityVerdict) {
+    let mut gates = Vec::with_capacity(11);
+
+    if evidence.arm_evaluated {
+        gates.push(gate_result(
+            1,
+            "steady_state_n",
+            evidence.n_running >= EVENT_PLANE_FLEET_N,
+            format!("n_running={} want={}", evidence.n_running, EVENT_PLANE_FLEET_N),
+        ));
+        gates.push(gate_result(
+            2,
+            "measurement_window",
+            evidence.window_completed && evidence.worker_errors.is_empty(),
+            format!(
+                "window_completed={} worker_errors={:?}",
+                evidence.window_completed, evidence.worker_errors
+            ),
+        ));
+        let sample_failures: Vec<String> = EVENT_PLANE_GATED_OPERATIONS
+            .iter()
+            .filter_map(|name| {
+                let stats = evidence.operations.get(*name)?;
+                if stats.successes < EVENT_PLANE_MIN_SAMPLES {
+                    Some(format!("{name} samples={}", stats.successes))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        gates.push(gate_result(
+            3,
+            "minimum_samples",
+            sample_failures.is_empty()
+                && EVENT_PLANE_GATED_OPERATIONS
+                    .iter()
+                    .all(|name| evidence.operations.contains_key(*name)),
+            format!("shortfalls={sample_failures:?}"),
+        ));
+        let operation_failures: Vec<String> = evidence
+            .operations
+            .iter()
+            .filter(|(_, stats)| stats.failures != 0)
+            .map(|(name, stats)| format!("{name} failures={}", stats.failures))
+            .collect();
+        gates.push(gate_result(
+            4,
+            "zero_operation_failures",
+            operation_failures.is_empty(),
+            format!("failures={operation_failures:?}"),
+        ));
+        gates.push(gate_result(
+            5,
+            "terminal_oracles",
+            evidence.terminal_passed,
+            format!("terminal_passed={}", evidence.terminal_passed),
+        ));
+        match evidence.observability.as_ref() {
+            Some(obs) => {
+                gates.push(gate_result(
+                    6,
+                    "owner_turn",
+                    obs.max_owner_turn_us <= MAX_OWNER_TURN_MS * 1000,
+                    format!(
+                        "max_owner_turn_us={} budget_us={}",
+                        obs.max_owner_turn_us,
+                        MAX_OWNER_TURN_MS * 1000
+                    ),
+                ));
+                gates.push(gate_result(
+                    7,
+                    "ready_operation_wait",
+                    obs.max_ready_operation_wait_us <= MAX_READY_OPERATION_WAIT_MS * 1000,
+                    format!(
+                        "max_ready_operation_wait_us={} budget_us={}",
+                        obs.max_ready_operation_wait_us,
+                        MAX_READY_OPERATION_WAIT_MS * 1000
+                    ),
+                ));
+                let age = applicable_queue_age_breaches(obs);
+                gates.push(gate_result(
+                    9,
+                    "queue_age",
+                    age.is_empty(),
+                    format!("breaches={age:?} budget_us={EVENT_PLANE_QUEUE_AGE_US}"),
+                ));
+            }
+            None => {
+                gates.push(gate_not_evaluated(6, "owner_turn"));
+                gates.push(gate_not_evaluated(7, "ready_operation_wait"));
+                gates.push(gate_not_evaluated(9, "queue_age"));
+            }
+        }
+    } else {
+        gates.push(gate_not_evaluated(1, "steady_state_n"));
+        gates.push(gate_not_evaluated(2, "measurement_window"));
+        gates.push(gate_not_evaluated(3, "minimum_samples"));
+        gates.push(gate_not_evaluated(4, "zero_operation_failures"));
+        gates.push(gate_not_evaluated(5, "terminal_oracles"));
+        gates.push(gate_not_evaluated(6, "owner_turn"));
+        gates.push(gate_not_evaluated(7, "ready_operation_wait"));
+        gates.push(gate_not_evaluated(9, "queue_age"));
+    }
+
+    if evidence.scheduler_lag.samples > 0 {
+        gates.push(gate_result(
+            8,
+            "scheduler_lag_max",
+            !evidence.scheduler_lag.exceeds_budget(),
+            format!(
+                "lag_us={} budget_us={} samples={}",
+                evidence.scheduler_lag.lag_us,
+                evidence.scheduler_lag.budget_us,
+                evidence.scheduler_lag.samples
+            ),
+        ));
+    } else {
+        gates.push(gate_not_evaluated(8, "scheduler_lag_max"));
+    }
+    gates.push(gate_result(
+        10,
+        "fd_pty_exhaustion",
+        evidence.fd_probe != ResourceProbe::Confirmed
+            && evidence.pty_probe != ResourceProbe::Confirmed,
+        format!(
+            "fd={} pty={}",
+            evidence.fd_probe.marker_name(),
+            evidence.pty_probe.marker_name()
+        ),
+    ));
+    if evidence.arm_evaluated || evidence.environment_tainted {
+        let survivors_ok = evidence.survivors.is_empty();
+        let taint_ok = !evidence.environment_tainted;
+        gates.push(gate_result(
+            11,
+            "environment_taint_or_survivors",
+            survivors_ok && taint_ok,
+            format!(
+                "tainted={} taint_evidence={:?} survivors={:?}",
+                evidence.environment_tainted, evidence.taint_evidence, evidence.survivors
+            ),
+        ));
+    } else {
+        gates.push(gate_not_evaluated(11, "environment_taint_or_survivors"));
+    }
+
+    gates.sort_by_key(|gate| gate.id);
+    let failed: Vec<&ValidityGate> = gates.iter().filter(|gate| gate.status == "fail").collect();
+    let verdict = if failed.iter().any(|gate| gate.id == 8 || gate.id == 10) {
+        HostValidityVerdict::Exhausted
+    } else if failed.iter().any(|gate| gate.id == 11) && !evidence.survivors.is_empty() {
+        HostValidityVerdict::SurvivorsPresent
+    } else if failed.iter().any(|gate| gate.id == 11) {
+        HostValidityVerdict::EnvironmentTainted
+    } else if !failed.is_empty() {
+        HostValidityVerdict::ProductFailure
+    } else {
+        HostValidityVerdict::Valid
+    };
+    (gates, verdict)
+}
+
+fn classify_pre_calibration_validity(evidence: ValidityEvidence) -> HostValidity {
+    let (gates, verdict) = evaluate_pre_calibration_gates(&evidence);
+    let reasons: Vec<String> = gates
+        .iter()
+        .filter(|gate| gate.status == "fail")
+        .map(|gate| format!("gate {}:{} {}", gate.id, gate.name, gate.detail))
+        .collect();
+    let disabled_arm_meets_immutable_gates = if evidence.arm_evaluated {
+        Some(gates.iter().all(|gate| gate.status == "pass"))
+    } else {
+        None
+    };
+    HostValidity {
+        verdict,
+        disabled_arm_meets_immutable_gates,
+        scheduler_lag: evidence.scheduler_lag,
+        fd_probe: evidence.fd_probe,
+        pty_probe: evidence.pty_probe,
+        reasons,
+        gates,
+        diagnostics: evidence.diagnostics,
+    }
+}
+
 fn classify_host_validity(
     decoupled: Option<&botster_hub_client::DaemonObservabilityCounters>,
     lag: &SchedulerLagProbe,
@@ -833,49 +1420,46 @@ fn classify_host_validity(
     pty: ResourceProbe,
     diagnostics: HostDiagnostics,
 ) -> HostValidity {
-    let mut reasons = Vec::new();
-    let disabled_arm_meets_published_budgets = decoupled.map(|obs| {
-        let breaches = published_budget_breaches(obs);
-        if !breaches.is_empty() {
-            reasons.extend(
-                breaches
-                    .into_iter()
-                    .map(|row| format!("disabled_arm:{row}")),
-            );
-            false
+    let arm_evaluated = decoupled.is_some();
+    classify_pre_calibration_validity(ValidityEvidence {
+        arm_evaluated,
+        n_running: if arm_evaluated { EVENT_PLANE_FLEET_N } else { 0 },
+        window_completed: arm_evaluated,
+        operations: if arm_evaluated {
+            passing_operation_stats()
         } else {
-            true
-        }
-    });
-    if lag.exceeds_budget() {
-        reasons.push(format!(
-            "scheduler_lag {}us exceeds ready-operation budget {}us",
-            lag.lag_us, lag.budget_us
-        ));
-    }
-    if fd == ResourceProbe::Confirmed {
-        reasons.push("fd_probe confirmed".to_string());
-    }
-    if pty == ResourceProbe::Confirmed {
-        reasons.push("pty_probe confirmed".to_string());
-    }
-    let exhausted = lag.exceeds_budget()
-        || fd == ResourceProbe::Confirmed
-        || pty == ResourceProbe::Confirmed
-        || disabled_arm_meets_published_budgets == Some(false);
-    HostValidity {
-        verdict: if exhausted {
-            HostValidityVerdict::Exhausted
-        } else {
-            HostValidityVerdict::Valid
+            BTreeMap::new()
         },
-        disabled_arm_meets_published_budgets,
+        worker_errors: Vec::new(),
+        terminal_passed: arm_evaluated,
+        observability: decoupled.cloned(),
         scheduler_lag: lag.clone(),
         fd_probe: fd,
         pty_probe: pty,
-        reasons,
         diagnostics,
-    }
+        environment_tainted: harness_taint().is_some(),
+        taint_evidence: harness_taint(),
+        survivors: Vec::new(),
+    })
+}
+
+fn classify_from_arm(run: &ArmRun, fd: ResourceProbe, pty: ResourceProbe) -> HostValidity {
+    classify_pre_calibration_validity(ValidityEvidence {
+        arm_evaluated: true,
+        n_running: run.n_running,
+        window_completed: run.window_completed,
+        operations: run.report.operations.clone(),
+        worker_errors: run.worker_errors.clone(),
+        terminal_passed: run.terminal_passed,
+        observability: Some(run.report.observability.clone()),
+        scheduler_lag: run.scheduler_lag.clone(),
+        fd_probe: fd,
+        pty_probe: pty,
+        diagnostics: host_load_diagnostics(),
+        environment_tainted: harness_taint().is_some(),
+        taint_evidence: harness_taint(),
+        survivors: run.survivors.clone(),
+    })
 }
 
 fn classify_enabled_budget_failure(
@@ -888,7 +1472,7 @@ fn classify_enabled_budget_failure(
     if validity.verdict == HostValidityVerdict::Valid {
         "product_failure"
     } else {
-        "host_exhaustion"
+        validity.verdict.name()
     }
 }
 
@@ -939,6 +1523,7 @@ struct ArmProfile {
     window_secs: u64,
 }
 
+#[derive(Clone, Debug)]
 struct OperationStats {
     attempts: u64,
     successes: u64,
@@ -971,6 +1556,16 @@ struct ArmReport {
     operations: BTreeMap<String, OperationStats>,
     observability: botster_hub_client::DaemonObservabilityCounters,
     webrtc_queues: Option<serde_json::Value>,
+}
+
+struct ArmRun {
+    n_running: usize,
+    window_completed: bool,
+    worker_errors: Vec<String>,
+    terminal_passed: bool,
+    survivors: Vec<(String, String)>,
+    scheduler_lag: SchedulerLagProbe,
+    report: ArmReport,
 }
 
 struct FaultReport {
@@ -1448,7 +2043,30 @@ fn read_committed_thresholds() -> (BTreeMap<String, DerivedThresholds>, Option<S
     (out, source.map(str::to_string))
 }
 
-fn run_saturation_arm(arm: SaturationArm) -> ArmReport {
+fn run_saturation_arm(arm: SaturationArm) -> ArmRun {
+    let watchdog = start_scheduler_watchdog();
+    let inner = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_saturation_arm_inner(arm)));
+    let scheduler_lag = stop_scheduler_watchdog(watchdog);
+    match inner {
+        Ok(mut run) => {
+            run.scheduler_lag = scheduler_lag;
+            run
+        }
+        Err(payload) => {
+            let validity = classify_host_validity(
+                None,
+                &scheduler_lag,
+                probe_fd_limit(),
+                probe_pty_allocation(),
+                host_load_diagnostics(),
+            );
+            persist_host_validity_artifact(&validity);
+            std::panic::resume_unwind(payload)
+        }
+    }
+}
+
+fn run_saturation_arm_inner(arm: SaturationArm) -> ArmRun {
     let label = match arm {
         SaturationArm::PlaneEnabled => "enabled",
         SaturationArm::PlaneDecoupled => "decoupled",
@@ -1465,7 +2083,7 @@ fn run_saturation_arm(arm: SaturationArm) -> ArmReport {
         webrtc = Some(subscribe_webrtc_events(&endpoint, hub.data_dir()));
         emitter = Some(spawn_event_emitter(&endpoint, stop.clone()));
     }
-    spawn_quiet_fleet(&endpoint);
+    let n_running = spawn_quiet_fleet(&endpoint);
     let mut noisy = spawn_noisy_session(&endpoint);
     let (operations, worker_errors) = run_measurement_workers(
         &endpoint,
@@ -1474,16 +2092,18 @@ fn run_saturation_arm(arm: SaturationArm) -> ArmReport {
         &mut webrtc,
         &mut noisy,
     );
-    assert!(
-        worker_errors.is_empty(),
-        "measurement worker failed: {worker_errors:?}"
-    );
-    if let Some(connection) = unix.as_mut() {
+    let window_completed = worker_errors.is_empty();
+    if let Some(connection) = unix.as_mut()
+        && window_completed
+    {
         prove_client_contract_under_saturation(connection, &endpoint);
     }
-    prove_north_star(&endpoint, &mut noisy);
+    let terminal_passed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        prove_north_star(&endpoint, &mut noisy);
+    }))
+    .is_ok();
     let observability = snapshot_observability(&endpoint);
-    if matches!(arm, SaturationArm::PlaneEnabled) {
+    if matches!(arm, SaturationArm::PlaneEnabled) && window_completed && terminal_passed {
         assert_required_signals(&observability, true);
         run_late_event_holder_matrix(&endpoint);
         late_webrtc_event_orders(&endpoint, hub.data_dir());
@@ -1494,23 +2114,36 @@ fn run_saturation_arm(arm: SaturationArm) -> ArmReport {
     }
     let webrtc_queues = webrtc.as_ref().map(|(_, peer, _)| {
         let snap = peer.fixture_queue_snapshot();
-        assert_webrtc_queue_snapshot_within_budget(&snap);
+        if window_completed && terminal_passed {
+            assert_webrtc_queue_snapshot_within_budget(&snap);
+        }
         snap
     });
-    if let Some((_, peer, key)) = webrtc {
+    if let Some((_, peer, key)) = webrtc
+        && window_completed
+        && terminal_passed
+    {
         prove_webrtc_close_unix_survives(&endpoint, peer, &key);
     }
-    shutdown_owned_sessions(&endpoint);
-    assert_no_live_sessions(&endpoint);
+    let mut survivors = shutdown_owned_sessions(&endpoint);
+    survivors.extend(list_live_sessions(&endpoint));
     hub.shutdown().expect("shutdown saturation hub");
-    ArmReport {
-        profile: ArmProfile {
-            n: EVENT_PLANE_FLEET_N,
-            window_secs: EVENT_PLANE_MEASUREMENT_WINDOW.as_secs(),
+    ArmRun {
+        n_running,
+        window_completed,
+        worker_errors,
+        terminal_passed,
+        survivors,
+        scheduler_lag: unevaluated_scheduler_lag(),
+        report: ArmReport {
+            profile: ArmProfile {
+                n: n_running,
+                window_secs: EVENT_PLANE_MEASUREMENT_WINDOW.as_secs(),
+            },
+            operations,
+            observability,
+            webrtc_queues,
         },
-        operations,
-        observability,
-        webrtc_queues,
     }
 }
 
@@ -1740,20 +2373,25 @@ fn fail_webrtc_saturation(
     let observability = snapshot_observability(endpoint);
     let pty = probe_pty_allocation();
     let fd = probe_fd_limit();
-    let lag = probe_scheduler_lag();
-    let validity = classify_host_validity(None, &lag, fd, pty, host_load_diagnostics());
-    let class = if validity.verdict == HostValidityVerdict::Exhausted {
-        "host_exhaustion"
-    } else {
+    let validity = classify_host_validity(
+        None,
+        &unevaluated_scheduler_lag(),
+        fd,
+        pty,
+        host_load_diagnostics(),
+    );
+    persist_host_validity_artifact(&validity);
+    let class = if validity.verdict == HostValidityVerdict::Valid {
         "product_failure"
+    } else {
+        validity.verdict.name()
     };
     panic!(
-        "{class} webrtc control failed: {error}; overflow={}; pty={:?} fd={:?} scheduler_lag_us={} budget_us={}; terminal={terminal}; observability={observability:?}",
+        "{class} webrtc control failed: {error}; overflow={}; pty={:?} fd={:?}; host-validity={}; terminal={terminal}; observability={observability:?}",
         peer.inbound_overflow(),
         pty.marker_name(),
         fd.marker_name(),
-        lag.lag_us,
-        lag.budget_us
+        validity.summary()
     );
 }
 
@@ -1850,7 +2488,7 @@ fn spawn_event_emitter(
     })
 }
 
-fn spawn_quiet_fleet(endpoint: &botster_hub_client::DaemonEndpoint) {
+fn spawn_quiet_fleet(endpoint: &botster_hub_client::DaemonEndpoint) -> usize {
     for wave in 0..(EVENT_PLANE_FLEET_N / EVENT_PLANE_SPAWN_WAVE) {
         for index in 0..EVENT_PLANE_SPAWN_WAVE {
             let session_id = format!("quiet-{wave}-{index}");
@@ -1902,10 +2540,11 @@ fn spawn_quiet_fleet(endpoint: &botster_hub_client::DaemonEndpoint) {
                     &format!("quiet running={running} want={EVENT_PLANE_FLEET_N}")
                 )
             );
-            panic!("quiet fleet did not reach {EVENT_PLANE_FLEET_N}: running={running}");
+            return running;
         }
         thread::sleep(Duration::from_millis(50));
     }
+    EVENT_PLANE_FLEET_N
 }
 
 struct NoisySession {
@@ -2482,7 +3121,7 @@ fn queue_bound_violations(
     violations
 }
 
-fn shutdown_owned_sessions(endpoint: &botster_hub_client::DaemonEndpoint) {
+fn shutdown_owned_sessions(endpoint: &botster_hub_client::DaemonEndpoint) -> Vec<(String, String)> {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let listed = botster_hub_client::request(endpoint, botster_hub_client::DaemonRequest::ListSessions)
@@ -2497,7 +3136,12 @@ fn shutdown_owned_sessions(endpoint: &botster_hub_client::DaemonEndpoint) {
             break;
         }
         if Instant::now() >= deadline {
-            panic!("sessions still live after ShutdownSession: {live:?}");
+            return listed
+                .sessions
+                .iter()
+                .filter(|session| session.lifecycle != "exited")
+                .map(|session| (session.session_id.clone(), session.lifecycle.clone()))
+                .collect();
         }
         for session_id in live {
             let _ = botster_hub_client::request(
@@ -2507,17 +3151,22 @@ fn shutdown_owned_sessions(endpoint: &botster_hub_client::DaemonEndpoint) {
         }
         thread::sleep(Duration::from_millis(50));
     }
+    Vec::new()
 }
 
-fn assert_no_live_sessions(endpoint: &botster_hub_client::DaemonEndpoint) {
+fn list_live_sessions(endpoint: &botster_hub_client::DaemonEndpoint) -> Vec<(String, String)> {
     let listed = botster_hub_client::request(endpoint, botster_hub_client::DaemonRequest::ListSessions)
         .expect("no-survivor list");
-    let live: Vec<_> = listed
+    listed
         .sessions
         .iter()
         .filter(|session| session.lifecycle != "exited")
         .map(|session| (session.session_id.clone(), session.lifecycle.clone()))
-        .collect();
+        .collect()
+}
+
+fn assert_no_live_sessions(endpoint: &botster_hub_client::DaemonEndpoint) {
+    let live = list_live_sessions(endpoint);
     assert!(
         live.is_empty(),
         "no-survivor oracle failed: {live:?}"

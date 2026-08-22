@@ -8,14 +8,13 @@
 | `target_id` | `tgt_7e208a0c76a44980a83b63af976b1f22` |
 | Ticket | `ticket_1786663585_879846` |
 | Run | `run_1787262311_549251` |
-| Step | `botster_stack_implement` (`run_step_1787428646_897571`) |
+| Step | `botster_stack_implement` (`run_step_1787439385_415615`) |
 | Merge policy | `direct` into `main`; no PR |
-| Returned from | Verify `review_1787428576_249460` plus human answer `question_1787437854_708832` restating `question_1787428441_900918` |
+| Returned from | Review `review_1787439371_225335` plus human answer `question_1787439231_161941` restated as `question_1787439421_445099` |
 | Locked Core | `7eafa470a18025895995bbedc20d34b58106a03b` |
-| Implement commit | `471123722ba4a5b4b0fb7391233d679b4b19e237` |
 | `teardown_class_applies` | **yes** |
 
-Independent routing: ticket and run `target_id` resolve to `botster-hub`. Work is in the ticket worktree. This visit replaces a prior Implement agent and does not rebuild the campaign.
+Independent routing: ticket and run `target_id` resolve to `botster-hub`. Work is in the ticket worktree. This visit does not rebuild the campaign and does not retune production budgets.
 
 ## Playbooks and notes applied
 
@@ -36,32 +35,18 @@ Independent routing: ticket and run `target_id` resolve to `botster-hub`. Work i
 
 | Finding | Severity | Fix |
 | --- | --- | --- |
-| `finding_1787428577_251857` Host-validity oracle | **blocker** | Campaign classifier uses disabled-arm published-budget validity and a monotonic scheduler-lag probe. FD/PTY probes remain additional evidence. Load average is diagnostic only. A valid disabled arm plus an enabled-arm budget breach is `product_failure`. Both oracles are in the dataset JSON. |
-| `finding_1787428577_944142` ShedBusy 5 ms clock | **blocker** | Deleted the wall-clock assertion. `prove_shed_busy_non_blocking` keeps `assert_eq!(status, EventPlaneStatus::ShedBusy)`. |
-| `finding_1787428576_764875` Reference profile | **blocker** | Published reference is `stress_profile=none`. Runner, N=300, noisy producer, four drivers, and 150 events/s stay fixed. Dataset writer, calibration JSON, budgets doc, plan A.2 / 12.7, and the event-plane script guard now require `none`. |
-| `finding_1787428577_920664` Provenance | medium | Residual-tail runs `32591282234` and `32591872269` at `ef77621`, and `32594580606` at `8ee0d7a`, are recorded as inconclusive `host_exhaustion` observations. Counters from `32594580606` are not product results. |
-| `finding_1787428577_842008` Moderate-stress lane | info | Not added. Non-gating and only after the `none` reference campaign passes. |
+| `finding_1787439371_929304` Eleven immutable pre-calibration gates | **blocker** | Disabled-arm validity now evaluates all eleven gates from `question_1787439231_161941`. Host-exhaustion is only scheduler-lag maximum or confirmed FD/PTY. Owner-turn / ready-wait / queue-age / sample / terminal failures without that evidence are `product_failure`. Gate 11 is `environment_tainted` or `survivors_present`. No pre-calibration `ABS*` / `THRMIN`. |
+| `finding_1787439371_679197` Persist host-validity before early exit | **blocker** | Pre-measurement, disabled-arm invalid, enabled-arm invalid, WebRTC fail, and inner-arm unwind paths write `event-plane-host-validity.json` with lag, load averages, runnable, total threads, CPU steal plus `linux_proc_stat_steal_ticks`, FD/PTY, every gate result, and the class. `event_plane_saturation_persists_host_validity_artifact_before_failure_exit` writes, classifies, and reads the file back. |
+| `finding_1787439371_328634` Full-arm scheduler watchdog | **high** | A 1 ms watchdog records the monotonic lag maximum across the disabled-arm interval, then stops and joins on teardown. Gate 8 uses 50,000 µs. `event_plane_saturation_scheduler_watchdog_records_injected_delayed_sample` injects 75,000 µs deterministically and also proves stop+join. |
 
-## Provenance of residual-tail dispatches
-
-These three GitHub `ubuntu-24.04` residual-tail calibration runs are **not** product pass/fail:
-
-| Run | Commit | Classification |
-| --- | --- | --- |
-| `32591282234` | `ef77621` | inconclusive `host_exhaustion` |
-| `32591872269` | `ef77621` | inconclusive `host_exhaustion` |
-| `32594580606` | `8ee0d7a` | inconclusive `host_exhaustion` |
-
-`32594580606` reported `max_owner_turn_us` 219723 and `max_ready_operation_wait_us` 1845228 while FD and PTY probes were `Unconfirmed`. Those counters must not be cited as product results. The amended `none` profile supersedes them.
+Previous Verify findings about ShedBusy, `stress_profile=none`, residual-tail provenance, and no moderate-stress lane remain in force and were not reopened.
 
 ## Files changed
 
 - `tests/hub_daemon_lifecycle/event_plane_saturation.rs`
-- `script/run-loaded-daemon-lifecycle`
-- `script/run-loaded-daemon-lifecycle-selftest`
+- `tests/hub_daemon_lifecycle_test.rs` (`AtomicU64` import)
 - `docs/event-plane-load-proof.md`
-- `docs/plans/prove-the-event-plane-cannot-lag-or-block-hub-operations.md`
-- `docs/reports/prove-the-event-plane-cannot-lag-or-block-hub-operations-calibration.json`
+- `docs/plans/prove-the-event-plane-cannot-lag-or-block-hub-operations.md` (revision 10)
 - `docs/reports/prove-the-event-plane-cannot-lag-or-block-hub-operations-evidence.json`
 - `docs/reports/prove-the-event-plane-cannot-lag-or-block-hub-operations-implement.md`
 
@@ -75,10 +60,9 @@ Unchanged. Hang-close remains the live fail-closed oracle. This visit does not a
 
 ## Deviations
 
-- Plan revision 8 named `residual-tail` as the reference. Human answer `question_1787437854_708832` amends **only** that field to `none`. N=300 and the rest of A.2 stay fixed.
-- Measurement arms now run decoupled first so a disabled-arm sample exists before enabled-arm classification.
-- This Darwin worktree does not re-dispatch ubuntu-24.04 calibration. Verify must dispatch calibration on `stress_profile=none`.
-- Workflow default for other loaded-lifecycle tickets remains `residual-tail`.
+- Project Pipelines vault-checklist create timed out; this report and the gate evidence are the checklist fallback.
+- Local Darwin cannot run ignored N=300 ubuntu-24.04 calibration. Gates are proved with classifier, artifact, and watchdog injection tests plus the existing campaign unit tests.
+- Workflow default for other loaded-lifecycle tickets remains `residual-tail`. This campaign's published reference stays `stress_profile=none`.
 
 ## Tests
 
@@ -86,7 +70,7 @@ Unchanged. Hang-close remains the live fail-closed oracle. This visit does not a
 | --- | --- |
 | `cargo fmt --all` | pass |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | pass |
-| `./test.sh --locked --test hub_daemon_lifecycle_test event_plane_saturation_` | 13 passed, 0 failed, 1 ignored (`event_plane_saturation_campaign`) |
+| `./test.sh --locked --test hub_daemon_lifecycle_test event_plane_saturation_` | 20 passed, 0 failed, 1 ignored (`event_plane_saturation_campaign`) |
 | `script/run-loaded-daemon-lifecycle-selftest` | pass, including `stress_profile=none` validate-only and residual-tail rejection |
 
 This Darwin worktree cannot execute the ignored N=300 ubuntu-24.04 campaign.
@@ -97,4 +81,4 @@ N=300 ubuntu-24.04 `none` calibration and acceptance have not run after this com
 
 ## Missing vault guidance
 
-None. The host-validity and ShedBusy wall-clock notes already cover this return.
+None. The eleven-gate answer and host-validity notes already cover this return.
