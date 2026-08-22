@@ -36,8 +36,9 @@ under saturation and does not change terminal byte ownership.
 | Terminal output | 4 KiB every 100 ms |
 | Terminal input | 64 bytes every 500 ms |
 
-A shortfall against `N = 300` is a `host_exhaustion` verdict. The campaign does
-not silently reduce `N`.
+A shortfall against `N = 300` fails Gate 1 as `product_failure` unless
+scheduler-lag or confirmed FD/PTY evidence selects `host_exhaustion`. The
+campaign does not silently reduce `N`.
 
 ## Literals
 
@@ -105,14 +106,24 @@ Reuse `clean`, `product_failure`, `host_exhaustion`, `environment_tainted`, and
 `survivors_present` from `docs/lifecycle-suite-harness.md`.
 
 The disabled/decoupled arm is host-valid only when all eleven immutable
-pre-calibration gates pass: N=300 at steady state, the 600-second window,
-≥200 post-warm-up samples per operation, zero operation failures, terminal
-oracles (exact bytes and ordering, continuous sequence, zero I/O failure,
-zero unexpected gap, no peer loss), `max_owner_turn_us` ≤ 25,000 µs,
+pre-calibration gates pass: N=300 at steady state, the 600-second window
+(`window_completed` only; worker errors do not fail Gate 2), ≥200
+post-warm-up samples per operation, zero operation failures (attempts
+recorded at start, completions recorded even after the window, so incomplete
+cycles, timeouts, disconnects, incomplete responses, and attempts≠successes
+fail Gate 4), terminal oracles stored as structured evidence (exact bytes
+and ordering, continuous sequence, zero I/O failure, zero unexpected
+terminal gap, no peer loss), `max_owner_turn_us` ≤ 25,000 µs,
 `max_ready_operation_wait_us` ≤ 50,000 µs, monotonic scheduler-lag maximum
-≤ 50,000 µs across the full disabled-arm interval, applicable queue age
-≤ 1,000,000 µs, no confirmed FD or PTY exhaustion, and no environment taint
-or survivors.
+at most 50,000 µs (50,000 passes; only a strictly greater lag fails) across
+the full disabled-arm interval, applicable queue age ≤ 1,000,000 µs, no
+confirmed FD or PTY exhaustion, and no environment taint or survivors.
+PackageEvent or EventGap on Unix/WebRTC event subscriptions are valid
+event-plane observations and are not Gate 5 unexpected-gap or peer-loss
+failures. An arm panic keeps partial evidence, stops workers and the
+watchdog, classifies available gates, and persists the host-validity
+artifact before exit. Gates 1–5 are `fail` rather than `not_evaluated` on
+that path.
 
 `host_exhaustion` is selected only from scheduler-lag maximum or confirmed
 FD/PTY evidence. Owner-turn, ready-wait, queue-age, sample, and terminal

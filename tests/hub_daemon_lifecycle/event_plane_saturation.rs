@@ -257,6 +257,7 @@ fn prove_shed_busy_non_blocking() {
 #[test]
 #[allow(clippy::field_reassign_with_default)]
 fn event_plane_saturation_host_validity_scheduler_lag_is_host_exhaustion() {
+    let _guard = daemon_test_guard();
     let lag = SchedulerLagProbe {
         requested_busy_us: 0,
         observed_elapsed_us: 1_800_000,
@@ -288,6 +289,7 @@ fn event_plane_saturation_host_validity_scheduler_lag_is_host_exhaustion() {
 #[test]
 #[allow(clippy::field_reassign_with_default)]
 fn event_plane_saturation_host_validity_disabled_arm_over_budget_is_product_failure() {
+    let _guard = daemon_test_guard();
     let mut decoupled = botster_hub_client::DaemonObservabilityCounters::default();
     decoupled.max_owner_turn_us = 219_723;
     decoupled.max_ready_operation_wait_us = 1_845_228;
@@ -318,6 +320,7 @@ fn event_plane_saturation_host_validity_disabled_arm_over_budget_is_product_fail
 #[test]
 #[allow(clippy::field_reassign_with_default)]
 fn event_plane_saturation_valid_disabled_arm_makes_enabled_breach_product_failure() {
+    let _guard = daemon_test_guard();
     let mut decoupled = botster_hub_client::DaemonObservabilityCounters::default();
     decoupled.max_owner_turn_us = 8_000;
     decoupled.max_ready_operation_wait_us = 12_000;
@@ -340,6 +343,7 @@ fn event_plane_saturation_valid_disabled_arm_makes_enabled_breach_product_failur
 
 #[test]
 fn event_plane_saturation_host_validity_ignores_load_average() {
+    let _guard = daemon_test_guard();
     let validity = classify_host_validity(
         Some(&botster_hub_client::DaemonObservabilityCounters::default()),
         &idle_scheduler_lag(),
@@ -381,8 +385,250 @@ fn event_plane_saturation_scheduler_watchdog_records_injected_delayed_sample() {
     assert_eq!(stopped.budget_us, EVENT_PLANE_SCHEDULER_LAG_BUDGET_US);
 }
 
+fn gate_status(validity: &HostValidity, id: u8) -> &'static str {
+    validity
+        .gates
+        .iter()
+        .find(|gate| gate.id == id)
+        .map(|gate| gate.status)
+        .expect("gate id")
+}
+
+#[test]
+fn event_plane_saturation_scheduler_budget_is_strictly_greater_than_50000us() {
+    for (lag_us, exceeds) in [(49_999, false), (50_000, false), (50_001, true)] {
+        let probe = SchedulerLagProbe {
+            requested_busy_us: 0,
+            observed_elapsed_us: 0,
+            max_gap_us: lag_us,
+            lag_us,
+            budget_us: EVENT_PLANE_SCHEDULER_LAG_BUDGET_US,
+            samples: 1,
+        };
+        assert_eq!(
+            probe.exceeds_budget(),
+            exceeds,
+            "lag_us={lag_us} must treat 50,000 as in budget"
+        );
+        let mut evidence = passing_validity_evidence();
+        evidence.scheduler_lag = probe;
+        let validity = classify_pre_calibration_validity(evidence);
+        assert_eq!(
+            gate_status(&validity, 8),
+            if exceeds { "fail" } else { "pass" },
+            "gate 8 lag_us={lag_us}"
+        );
+    }
+}
+
+#[test]
+fn event_plane_saturation_late_completion_counts_as_attempt() {
+    let (tx, rx) = mpsc::channel();
+    record_attempt(&tx, "spawn", true, 12);
+    drop(tx);
+    let mut operations = zero_gated_operations();
+    fold_measurement_samples(&mut operations, rx);
+    let spawn = operations.get("spawn").expect("spawn");
+    assert_eq!(spawn.attempts, 1);
+    assert_eq!(spawn.successes, 1);
+    assert_eq!(spawn.failures, 0);
+    assert_eq!(spawn.incomplete_cycles, 0);
+    let mut evidence = passing_validity_evidence();
+    let spawn = evidence.operations.get_mut("spawn").expect("spawn stats");
+    spawn.attempts = spawn.attempts.saturating_add(1);
+    spawn.successes = spawn.successes.saturating_add(1);
+    spawn.samples_ms.push(12);
+    let validity = classify_pre_calibration_validity(evidence);
+    assert_eq!(gate_status(&validity, 4), "pass");
+    assert_eq!(validity.verdict, HostValidityVerdict::Valid);
+}
+
+#[test]
+fn event_plane_saturation_incomplete_cycle_fails_gate_4_not_gate_2() {
+    let (tx, rx) = mpsc::channel();
+    tx.send(MeasurementSample::Start("spawn".to_string()))
+        .expect("start without finish");
+    drop(tx);
+    let mut operations = zero_gated_operations();
+    fold_measurement_samples(&mut operations, rx);
+    let spawn = operations.get("spawn").expect("spawn");
+    assert_eq!(spawn.attempts, 1);
+    assert_eq!(spawn.successes, 0);
+    assert_eq!(spawn.failures, 0);
+    assert_eq!(spawn.incomplete_cycles, 1);
+
+    let mut evidence = passing_validity_evidence();
+    evidence.window_completed = true;
+    evidence.worker_errors.clear();
+    let spawn = evidence.operations.get_mut("spawn").expect("spawn stats");
+    spawn.attempts = EVENT_PLANE_MIN_SAMPLES + 1;
+    spawn.successes = EVENT_PLANE_MIN_SAMPLES;
+    spawn.incomplete_cycles = 1;
+    let validity = classify_pre_calibration_validity(evidence);
+    assert_eq!(gate_status(&validity, 2), "pass");
+    assert_eq!(gate_status(&validity, 4), "fail");
+    assert_eq!(validity.verdict, HostValidityVerdict::ProductFailure);
+}
+
+#[test]
+fn event_plane_saturation_attempts_successes_mismatch_fails_gate_4() {
+    let mut evidence = passing_validity_evidence();
+    evidence.window_completed = true;
+    let spawn = evidence.operations.get_mut("spawn").expect("spawn stats");
+    spawn.attempts = EVENT_PLANE_MIN_SAMPLES + 1;
+    spawn.successes = EVENT_PLANE_MIN_SAMPLES;
+    spawn.failures = 1;
+    spawn.incomplete_cycles = 0;
+    let validity = classify_pre_calibration_validity(evidence);
+    assert_eq!(gate_status(&validity, 2), "pass");
+    assert_eq!(gate_status(&validity, 4), "fail");
+    assert_eq!(validity.verdict, HostValidityVerdict::ProductFailure);
+}
+
+#[test]
+fn event_plane_saturation_worker_errors_do_not_fail_gate_2() {
+    let mut evidence = passing_validity_evidence();
+    evidence.window_completed = true;
+    evidence.worker_errors.push("spawn: typed error".to_string());
+    let validity = classify_pre_calibration_validity(evidence);
+    assert_eq!(gate_status(&validity, 2), "pass");
+    assert_eq!(gate_status(&validity, 4), "fail");
+}
+
+fn assert_gate5_failure(name: &str, evidence: ValidityEvidence) {
+    let validity = classify_pre_calibration_validity(evidence);
+    assert_eq!(gate_status(&validity, 5), "fail", "gate 5 must fail on {name}");
+    assert_eq!(
+        validity.verdict,
+        HostValidityVerdict::ProductFailure,
+        "{name} is product_failure"
+    );
+    assert_ne!(gate_status(&validity, 5), "not_evaluated", "{name} must evaluate gate 5");
+}
+
+#[test]
+fn event_plane_saturation_terminal_oracle_failures_fail_gate_5() {
+    let mut malformed = passing_validity_evidence();
+    malformed.terminal.apply_malformed(1);
+    assert_gate5_failure("malformed", malformed);
+
+    let mut sequence = passing_validity_evidence();
+    sequence.terminal.apply_sequence_break();
+    assert_gate5_failure("sequence", sequence);
+
+    let mut input = passing_validity_evidence();
+    input.terminal.apply_input_failure();
+    assert_gate5_failure("io", input);
+
+    let mut output = passing_validity_evidence();
+    output.terminal.apply_output_failure();
+    assert_gate5_failure("output_io", output);
+
+    let mut gap = passing_validity_evidence();
+    gap.terminal.apply_unexpected_gap();
+    assert_gate5_failure("unexpected_gap", gap);
+
+    let mut peer = passing_validity_evidence();
+    peer.terminal.apply_peer_loss();
+    assert_gate5_failure("peer_loss", peer);
+}
+
+#[test]
+fn event_plane_saturation_parse_output_records_counts_malformed_bytes() {
+    let mut valid = b"N00000007T00000001234567890123".to_vec();
+    valid.extend(std::iter::repeat_n(
+        b'x',
+        EVENT_PLANE_OUTPUT_RECORD_BYTES - EVENT_PLANE_OUTPUT_HEADER_BYTES - 1,
+    ));
+    valid.push(b'\n');
+    let identity = botster_hub_client::DaemonEvent::TerminalOutput {
+        session_id: EVENT_PLANE_NOISY_SESSION.to_string(),
+        subscription_id: EVENT_PLANE_NOISY_SUB.to_string(),
+        payload: botster_hub_client::DaemonLiveOutputPayload::from_bytes(&[0x80, 0xff, b'\n']),
+    };
+    let parsed_identity = parse_output_records(&[identity]);
+    assert_eq!(parsed_identity.records.len(), 0);
+    assert_eq!(parsed_identity.malformed, 0);
+
+    let valid_event = botster_hub_client::DaemonEvent::TerminalOutput {
+        session_id: EVENT_PLANE_NOISY_SESSION.to_string(),
+        subscription_id: EVENT_PLANE_NOISY_SUB.to_string(),
+        payload: botster_hub_client::DaemonLiveOutputPayload::from_bytes(&valid),
+    };
+    let parsed_valid = parse_output_records(&[valid_event]);
+    assert_eq!(parsed_valid.records.len(), 1);
+    assert_eq!(parsed_valid.malformed, 0);
+
+    let mut invalid = vec![b'N'; EVENT_PLANE_OUTPUT_RECORD_BYTES];
+    invalid[9] = b'X';
+    let invalid_event = botster_hub_client::DaemonEvent::TerminalOutput {
+        session_id: EVENT_PLANE_NOISY_SESSION.to_string(),
+        subscription_id: EVENT_PLANE_NOISY_SUB.to_string(),
+        payload: botster_hub_client::DaemonLiveOutputPayload::from_bytes(&invalid),
+    };
+    let parsed_invalid = parse_output_records(&[invalid_event]);
+    assert!(parsed_invalid.malformed > 0);
+    assert!(parsed_invalid.records.is_empty());
+
+    let mut mismatched = botster_hub_client::DaemonLiveOutputPayload::from_bytes(b"hello");
+    mismatched.bytes = 99;
+    let decode_event = botster_hub_client::DaemonEvent::TerminalOutput {
+        session_id: EVENT_PLANE_NOISY_SESSION.to_string(),
+        subscription_id: EVENT_PLANE_NOISY_SUB.to_string(),
+        payload: mismatched,
+    };
+    let parsed_decode = parse_output_records(&[decode_event]);
+    assert_eq!(parsed_decode.malformed, 1);
+    assert!(parsed_decode.records.is_empty());
+}
+
+#[test]
+fn event_plane_saturation_early_arm_failure_persists_classified_gates() {
+    let _guard = daemon_test_guard();
+    let mut builder = ArmRunBuilder::new();
+    builder.n_running = 0;
+    builder.window_completed = false;
+    builder.worker_errors.push("spawn error: injected early failure".to_string());
+    builder.terminal = TerminalOracles::unproven();
+    builder.operations = zero_gated_operations();
+    let validity = classify_failed_arm(
+        &builder,
+        idle_scheduler_lag(),
+        Some("spawn error: injected early failure".to_string()),
+    );
+    assert_eq!(validity.verdict, HostValidityVerdict::ProductFailure);
+    for id in 1..=5 {
+        assert_eq!(
+            gate_status(&validity, id),
+            "fail",
+            "early failure must evaluate gate {id} as fail, not not_evaluated"
+        );
+    }
+    let dir = unique_test_dir("event-plane-early-arm-failure");
+    let path = persist_host_validity_artifact_to(
+        &dir.join("event-plane-host-validity.json"),
+        &validity,
+    );
+    let body: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).expect("read early-failure artifact"))
+            .expect("parse early-failure artifact");
+    assert_eq!(body["verdict"], "product_failure");
+    let gates = body["gates"].as_array().expect("gates");
+    for id in 1..=5 {
+        let gate = gates
+            .iter()
+            .find(|gate| gate["id"] == id)
+            .expect("gate present");
+        assert_eq!(
+            gate["status"], "fail",
+            "artifact gate {id} must be fail: {body}"
+        );
+    }
+}
+
 #[test]
 fn event_plane_saturation_persists_host_validity_artifact_before_failure_exit() {
+    let _guard = daemon_test_guard();
     let dir = unique_test_dir("event-plane-host-validity-artifact");
     let mut decoupled = botster_hub_client::DaemonObservabilityCounters::default();
     decoupled.max_owner_turn_us = 219_723;
@@ -474,6 +720,7 @@ fn event_plane_saturation_host_validity_taint_is_environment_tainted() {
 
 #[test]
 fn event_plane_saturation_host_validity_fd_controls_host_exhaustion() {
+    let _guard = daemon_test_guard();
     let mut decoupled = botster_hub_client::DaemonObservabilityCounters::default();
     decoupled.max_owner_turn_us = 219_723;
     let validity = classify_host_validity(
@@ -587,6 +834,7 @@ fn event_plane_saturation_output_records_carry_emission_time() {
 #[test]
 #[allow(clippy::field_reassign_with_default)]
 fn event_plane_saturation_dataset_records_fault_resync() {
+    let _guard = daemon_test_guard();
     let metrics = dummy_op_metrics();
     let mut operations = BTreeMap::new();
     let mut thresholds = BTreeMap::new();
@@ -671,6 +919,7 @@ fn event_plane_saturation_throughput_keeps_fractional_ops_per_second() {
         attempts: 200,
         successes: 200,
         failures: 0,
+        incomplete_cycles: 0,
         samples_ms: vec![10; 200],
     };
     let metrics = metrics_from_stats(&stats, 600);
@@ -845,7 +1094,7 @@ struct SchedulerLagProbe {
 
 impl SchedulerLagProbe {
     fn exceeds_budget(&self) -> bool {
-        self.lag_us >= self.budget_us
+        self.lag_us > self.budget_us
     }
 
     fn json(&self) -> serde_json::Value {
@@ -906,13 +1155,137 @@ impl ValidityGate {
 }
 
 #[derive(Clone, Debug)]
+struct TerminalOracles {
+    exact_bytes_and_ordering: bool,
+    continuous_sequence: bool,
+    zero_io_failure: bool,
+    zero_unexpected_gap: bool,
+    no_peer_loss: bool,
+    malformed_or_unparsed: u64,
+    sequence_breaks: u64,
+    input_failures: u64,
+    output_failures: u64,
+    unexpected_gaps: u64,
+    peer_loss: bool,
+}
+
+impl TerminalOracles {
+    fn passing() -> Self {
+        Self {
+            exact_bytes_and_ordering: true,
+            continuous_sequence: true,
+            zero_io_failure: true,
+            zero_unexpected_gap: true,
+            no_peer_loss: true,
+            malformed_or_unparsed: 0,
+            sequence_breaks: 0,
+            input_failures: 0,
+            output_failures: 0,
+            unexpected_gaps: 0,
+            peer_loss: false,
+        }
+    }
+
+    fn unproven() -> Self {
+        Self {
+            exact_bytes_and_ordering: false,
+            continuous_sequence: false,
+            zero_io_failure: false,
+            zero_unexpected_gap: false,
+            no_peer_loss: false,
+            malformed_or_unparsed: 0,
+            sequence_breaks: 0,
+            input_failures: 0,
+            output_failures: 0,
+            unexpected_gaps: 0,
+            peer_loss: false,
+        }
+    }
+
+    fn passed(&self) -> bool {
+        self.exact_bytes_and_ordering
+            && self.continuous_sequence
+            && self.zero_io_failure
+            && self.zero_unexpected_gap
+            && self.no_peer_loss
+    }
+
+    fn apply_malformed(&mut self, count: u64) {
+        self.malformed_or_unparsed = self.malformed_or_unparsed.saturating_add(count);
+        if count > 0 {
+            self.exact_bytes_and_ordering = false;
+        }
+    }
+
+    fn apply_sequence_break(&mut self) {
+        self.sequence_breaks = self.sequence_breaks.saturating_add(1);
+        self.continuous_sequence = false;
+        self.exact_bytes_and_ordering = false;
+    }
+
+    fn apply_input_failure(&mut self) {
+        self.input_failures = self.input_failures.saturating_add(1);
+        self.zero_io_failure = false;
+    }
+
+    fn apply_output_failure(&mut self) {
+        self.output_failures = self.output_failures.saturating_add(1);
+        self.zero_io_failure = false;
+    }
+
+    fn apply_unexpected_gap(&mut self) {
+        self.unexpected_gaps = self.unexpected_gaps.saturating_add(1);
+        self.zero_unexpected_gap = false;
+    }
+
+    fn apply_peer_loss(&mut self) {
+        self.peer_loss = true;
+        self.no_peer_loss = false;
+    }
+
+    fn merge(&mut self, other: &TerminalOracles) {
+        self.exact_bytes_and_ordering &= other.exact_bytes_and_ordering;
+        self.continuous_sequence &= other.continuous_sequence;
+        self.zero_io_failure &= other.zero_io_failure;
+        self.zero_unexpected_gap &= other.zero_unexpected_gap;
+        self.no_peer_loss &= other.no_peer_loss;
+        self.malformed_or_unparsed = self.malformed_or_unparsed.saturating_add(other.malformed_or_unparsed);
+        self.sequence_breaks = self.sequence_breaks.saturating_add(other.sequence_breaks);
+        self.input_failures = self.input_failures.saturating_add(other.input_failures);
+        self.output_failures = self.output_failures.saturating_add(other.output_failures);
+        self.unexpected_gaps = self.unexpected_gaps.saturating_add(other.unexpected_gaps);
+        self.peer_loss |= other.peer_loss;
+        if self.peer_loss {
+            self.no_peer_loss = false;
+        }
+    }
+
+    fn detail(&self) -> String {
+        format!(
+            "exact_bytes_and_ordering={} continuous_sequence={} zero_io_failure={} zero_unexpected_gap={} no_peer_loss={} malformed_or_unparsed={} sequence_breaks={} input_failures={} output_failures={} unexpected_gaps={} peer_loss={}",
+            self.exact_bytes_and_ordering,
+            self.continuous_sequence,
+            self.zero_io_failure,
+            self.zero_unexpected_gap,
+            self.no_peer_loss,
+            self.malformed_or_unparsed,
+            self.sequence_breaks,
+            self.input_failures,
+            self.output_failures,
+            self.unexpected_gaps,
+            self.peer_loss
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
 struct ValidityEvidence {
     arm_evaluated: bool,
     n_running: usize,
     window_completed: bool,
     operations: BTreeMap<String, OperationStats>,
     worker_errors: Vec<String>,
-    terminal_passed: bool,
+    terminal: TerminalOracles,
     observability: Option<botster_hub_client::DaemonObservabilityCounters>,
     scheduler_lag: SchedulerLagProbe,
     fd_probe: ResourceProbe,
@@ -1050,6 +1423,117 @@ fn stop_scheduler_watchdog(mut watchdog: SchedulerWatchdog) -> SchedulerLagProbe
     }
 }
 
+fn zero_gated_operations() -> BTreeMap<String, OperationStats> {
+    EVENT_PLANE_GATED_OPERATIONS
+        .iter()
+        .map(|name| {
+            (
+                (*name).to_string(),
+                empty_operation_stats(),
+            )
+        })
+        .collect()
+}
+
+fn operation_failure_reasons(name: &str, stats: &OperationStats) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if stats.failures != 0 {
+        reasons.push(format!("{name} failures={}", stats.failures));
+    }
+    if stats.incomplete_cycles != 0 {
+        reasons.push(format!("{name} incomplete_cycles={}", stats.incomplete_cycles));
+    }
+    if stats.attempts != stats.successes {
+        reasons.push(format!(
+            "{name} attempts-successes mismatch attempts={} successes={}",
+            stats.attempts, stats.successes
+        ));
+    }
+    reasons
+}
+
+fn empty_operation_stats() -> OperationStats {
+    OperationStats {
+        attempts: 0,
+        successes: 0,
+        failures: 0,
+        incomplete_cycles: 0,
+        samples_ms: Vec::new(),
+    }
+}
+
+fn apply_measurement_sample(
+    operations: &mut BTreeMap<String, OperationStats>,
+    sample: MeasurementSample,
+) {
+    match sample {
+        MeasurementSample::Start(operation) => {
+            let stats = operations
+                .entry(operation)
+                .or_insert_with(empty_operation_stats);
+            stats.attempts = stats.attempts.saturating_add(1);
+        }
+        MeasurementSample::Finish { operation, ok, ms } => {
+            let stats = operations
+                .entry(operation)
+                .or_insert_with(empty_operation_stats);
+            if ok {
+                stats.successes = stats.successes.saturating_add(1);
+                stats.samples_ms.push(ms);
+            } else {
+                stats.failures = stats.failures.saturating_add(1);
+            }
+        }
+    }
+}
+
+fn finalize_incomplete_cycles(operations: &mut BTreeMap<String, OperationStats>) {
+    for stats in operations.values_mut() {
+        let finished = stats.successes.saturating_add(stats.failures);
+        if stats.attempts > finished {
+            stats.incomplete_cycles = stats.attempts.saturating_sub(finished);
+        } else {
+            stats.incomplete_cycles = 0;
+        }
+    }
+}
+
+fn fold_measurement_samples(
+    operations: &mut BTreeMap<String, OperationStats>,
+    rx: mpsc::Receiver<MeasurementSample>,
+) {
+    while let Ok(sample) = rx.recv() {
+        apply_measurement_sample(operations, sample);
+    }
+    finalize_incomplete_cycles(operations);
+}
+
+fn record_attempt(
+    tx: &mpsc::Sender<MeasurementSample>,
+    operation: &str,
+    ok: bool,
+    ms: u64,
+) {
+    tx.send(MeasurementSample::Start(operation.to_string()))
+        .expect("send start");
+    tx.send(MeasurementSample::Finish {
+        operation: operation.to_string(),
+        ok,
+        ms,
+    })
+    .expect("send finish");
+}
+
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "arm panicked before classified evidence was published".to_string()
+}
+
 fn passing_operation_stats() -> BTreeMap<String, OperationStats> {
     EVENT_PLANE_GATED_OPERATIONS
         .iter()
@@ -1060,6 +1544,7 @@ fn passing_operation_stats() -> BTreeMap<String, OperationStats> {
                     attempts: EVENT_PLANE_MIN_SAMPLES,
                     successes: EVENT_PLANE_MIN_SAMPLES,
                     failures: 0,
+                    incomplete_cycles: 0,
                     samples_ms: vec![1; EVENT_PLANE_MIN_SAMPLES as usize],
                 },
             )
@@ -1074,7 +1559,7 @@ fn passing_validity_evidence() -> ValidityEvidence {
         window_completed: true,
         operations: passing_operation_stats(),
         worker_errors: Vec::new(),
-        terminal_passed: true,
+        terminal: TerminalOracles::passing(),
         observability: Some(botster_hub_client::DaemonObservabilityCounters::default()),
         scheduler_lag: idle_scheduler_lag(),
         fd_probe: ResourceProbe::Unconfirmed,
@@ -1240,7 +1725,7 @@ fn evaluate_pre_calibration_gates(evidence: &ValidityEvidence) -> (Vec<ValidityG
         gates.push(gate_result(
             2,
             "measurement_window",
-            evidence.window_completed && evidence.worker_errors.is_empty(),
+            evidence.window_completed,
             format!(
                 "window_completed={} worker_errors={:?}",
                 evidence.window_completed, evidence.worker_errors
@@ -1266,12 +1751,19 @@ fn evaluate_pre_calibration_gates(evidence: &ValidityEvidence) -> (Vec<ValidityG
                     .all(|name| evidence.operations.contains_key(*name)),
             format!("shortfalls={sample_failures:?}"),
         ));
-        let operation_failures: Vec<String> = evidence
+        let mut operation_failures: Vec<String> = evidence
             .operations
             .iter()
-            .filter(|(_, stats)| stats.failures != 0)
-            .map(|(name, stats)| format!("{name} failures={}", stats.failures))
+            .flat_map(|(name, stats)| operation_failure_reasons(name, stats))
             .collect();
+        if !evidence.worker_errors.is_empty() {
+            operation_failures.extend(
+                evidence
+                    .worker_errors
+                    .iter()
+                    .map(|error| format!("worker_error={error}")),
+            );
+        }
         gates.push(gate_result(
             4,
             "zero_operation_failures",
@@ -1281,8 +1773,8 @@ fn evaluate_pre_calibration_gates(evidence: &ValidityEvidence) -> (Vec<ValidityG
         gates.push(gate_result(
             5,
             "terminal_oracles",
-            evidence.terminal_passed,
-            format!("terminal_passed={}", evidence.terminal_passed),
+            evidence.terminal.passed(),
+            evidence.terminal.detail(),
         ));
         match evidence.observability.as_ref() {
             Some(obs) => {
@@ -1431,7 +1923,11 @@ fn classify_host_validity(
             BTreeMap::new()
         },
         worker_errors: Vec::new(),
-        terminal_passed: arm_evaluated,
+        terminal: if arm_evaluated {
+            TerminalOracles::passing()
+        } else {
+            TerminalOracles::unproven()
+        },
         observability: decoupled.cloned(),
         scheduler_lag: lag.clone(),
         fd_probe: fd,
@@ -1450,7 +1946,7 @@ fn classify_from_arm(run: &ArmRun, fd: ResourceProbe, pty: ResourceProbe) -> Hos
         window_completed: run.window_completed,
         operations: run.report.operations.clone(),
         worker_errors: run.worker_errors.clone(),
-        terminal_passed: run.terminal_passed,
+        terminal: run.terminal.clone(),
         observability: Some(run.report.observability.clone()),
         scheduler_lag: run.scheduler_lag.clone(),
         fd_probe: fd,
@@ -1528,6 +2024,7 @@ struct OperationStats {
     attempts: u64,
     successes: u64,
     failures: u64,
+    incomplete_cycles: u64,
     samples_ms: Vec<u64>,
 }
 
@@ -1562,10 +2059,67 @@ struct ArmRun {
     n_running: usize,
     window_completed: bool,
     worker_errors: Vec<String>,
-    terminal_passed: bool,
+    terminal: TerminalOracles,
     survivors: Vec<(String, String)>,
     scheduler_lag: SchedulerLagProbe,
     report: ArmReport,
+}
+
+#[derive(Clone, Debug)]
+struct ArmRunBuilder {
+    n_running: usize,
+    window_completed: bool,
+    worker_errors: Vec<String>,
+    terminal: TerminalOracles,
+    survivors: Vec<(String, String)>,
+    operations: BTreeMap<String, OperationStats>,
+    observability: Option<botster_hub_client::DaemonObservabilityCounters>,
+    webrtc_queues: Option<serde_json::Value>,
+}
+
+impl ArmRunBuilder {
+    fn new() -> Self {
+        Self {
+            n_running: 0,
+            window_completed: false,
+            worker_errors: Vec::new(),
+            terminal: TerminalOracles::unproven(),
+            survivors: Vec::new(),
+            operations: zero_gated_operations(),
+            observability: None,
+            webrtc_queues: None,
+        }
+    }
+
+    fn into_arm_run(self, scheduler_lag: SchedulerLagProbe) -> ArmRun {
+        let n_running = self.n_running;
+        ArmRun {
+            n_running,
+            window_completed: self.window_completed,
+            worker_errors: self.worker_errors,
+            terminal: self.terminal,
+            survivors: self.survivors,
+            scheduler_lag,
+            report: ArmReport {
+                profile: ArmProfile {
+                    n: n_running,
+                    window_secs: EVENT_PLANE_MEASUREMENT_WINDOW.as_secs(),
+                },
+                operations: self.operations,
+                observability: self.observability.unwrap_or_default(),
+                webrtc_queues: self.webrtc_queues,
+            },
+        }
+    }
+}
+
+enum MeasurementSample {
+    Start(String),
+    Finish {
+        operation: String,
+        ok: bool,
+        ms: u64,
+    },
 }
 
 struct FaultReport {
@@ -2043,9 +2597,42 @@ fn read_committed_thresholds() -> (BTreeMap<String, DerivedThresholds>, Option<S
     (out, source.map(str::to_string))
 }
 
+fn classify_failed_arm(
+    builder: &ArmRunBuilder,
+    scheduler_lag: SchedulerLagProbe,
+    panic_text: Option<String>,
+) -> HostValidity {
+    let mut builder = builder.clone();
+    if let Some(panic_text) = panic_text {
+        if panic_text.contains("event-plane-peer-loss") {
+            builder.terminal.apply_peer_loss();
+        }
+        if !builder.worker_errors.iter().any(|row| row == &panic_text) {
+            builder.worker_errors.push(panic_text);
+        }
+    }
+    classify_from_arm(
+        &builder.into_arm_run(scheduler_lag),
+        probe_fd_limit(),
+        probe_pty_allocation(),
+    )
+}
+
+fn persist_failed_arm_and_panic(
+    builder: &ArmRunBuilder,
+    scheduler_lag: SchedulerLagProbe,
+    panic_text: Option<String>,
+) -> ! {
+    let validity = classify_failed_arm(builder, scheduler_lag, panic_text);
+    fail_classified(&validity)
+}
+
 fn run_saturation_arm(arm: SaturationArm) -> ArmRun {
     let watchdog = start_scheduler_watchdog();
-    let inner = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_saturation_arm_inner(arm)));
+    let builder = Arc::new(Mutex::new(ArmRunBuilder::new()));
+    let inner = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_saturation_arm_inner(arm, Arc::clone(&builder))
+    }));
     let scheduler_lag = stop_scheduler_watchdog(watchdog);
     match inner {
         Ok(mut run) => {
@@ -2053,86 +2640,145 @@ fn run_saturation_arm(arm: SaturationArm) -> ArmRun {
             run
         }
         Err(payload) => {
-            let validity = classify_host_validity(
-                None,
-                &scheduler_lag,
-                probe_fd_limit(),
-                probe_pty_allocation(),
-                host_load_diagnostics(),
-            );
-            persist_host_validity_artifact(&validity);
-            std::panic::resume_unwind(payload)
+            let snapshot = builder
+                .lock()
+                .map(|guard| guard.clone())
+                .unwrap_or_else(|_| ArmRunBuilder::new());
+            persist_failed_arm_and_panic(&snapshot, scheduler_lag, Some(panic_message(&payload)))
         }
     }
 }
 
-fn run_saturation_arm_inner(arm: SaturationArm) -> ArmRun {
+struct EmitterGuard {
+    stop: Arc<AtomicBool>,
+    join: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for EmitterGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+struct WorkerStopGuard {
+    stop: Arc<AtomicBool>,
+    joins: Vec<thread::JoinHandle<()>>,
+}
+
+impl Drop for WorkerStopGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        for join in self.joins.drain(..) {
+            let _ = join.join();
+        }
+    }
+}
+
+fn publish_builder(builder: &Mutex<ArmRunBuilder>, update: impl FnOnce(&mut ArmRunBuilder)) {
+    if let Ok(mut guard) = builder.lock() {
+        update(&mut guard);
+    }
+}
+
+fn run_saturation_arm_inner(arm: SaturationArm, builder: Arc<Mutex<ArmRunBuilder>>) -> ArmRun {
     let label = match arm {
         SaturationArm::PlaneEnabled => "enabled",
         SaturationArm::PlaneDecoupled => "decoupled",
     };
     let hub = start_campaign_hub(label, &[]);
     let endpoint = hub.endpoint().clone();
+    publish_builder(&builder, |state| {
+        state.observability = Some(snapshot_observability(&endpoint));
+    });
     let stop = Arc::new(AtomicBool::new(false));
     let mut unix = None;
     let mut webrtc = None;
-    let mut emitter = None;
+    let mut emitter = EmitterGuard {
+        stop: stop.clone(),
+        join: None,
+    };
     if matches!(arm, SaturationArm::PlaneEnabled) {
         enable_saturation_packages(&endpoint, hub.data_dir());
         unix = Some(subscribe_unix_events(&endpoint));
         webrtc = Some(subscribe_webrtc_events(&endpoint, hub.data_dir()));
-        emitter = Some(spawn_event_emitter(&endpoint, stop.clone()));
+        emitter.join = Some(spawn_event_emitter(&endpoint, stop.clone()));
     }
     let n_running = spawn_quiet_fleet(&endpoint);
+    publish_builder(&builder, |state| {
+        state.n_running = n_running;
+        state.observability = Some(snapshot_observability(&endpoint));
+    });
     let mut noisy = spawn_noisy_session(&endpoint);
-    let (operations, worker_errors) = run_measurement_workers(
+    let (operations, worker_errors, mut terminal, window_completed) = run_measurement_workers(
         &endpoint,
         hub.data_dir(),
         &mut unix,
         &mut webrtc,
         &mut noisy,
+        Arc::clone(&builder),
     );
-    let window_completed = worker_errors.is_empty();
+    publish_builder(&builder, |state| {
+        state.operations = operations.clone();
+        state.worker_errors = worker_errors.clone();
+        state.window_completed = window_completed;
+        state.terminal = terminal.clone();
+        state.observability = Some(snapshot_observability(&endpoint));
+    });
     if let Some(connection) = unix.as_mut()
         && window_completed
+        && terminal.passed()
     {
         prove_client_contract_under_saturation(connection, &endpoint);
     }
-    let terminal_passed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        prove_north_star(&endpoint, &mut noisy);
-    }))
-    .is_ok();
+    let north_star = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        prove_north_star(&endpoint, &mut noisy)
+    }));
+    match north_star {
+        Ok(oracles) => terminal.merge(&oracles),
+        Err(_) => {
+            terminal.exact_bytes_and_ordering = false;
+            terminal.zero_io_failure = false;
+        }
+    }
     let observability = snapshot_observability(&endpoint);
-    if matches!(arm, SaturationArm::PlaneEnabled) && window_completed && terminal_passed {
+    publish_builder(&builder, |state| {
+        state.terminal = terminal.clone();
+        state.observability = Some(observability.clone());
+    });
+    if matches!(arm, SaturationArm::PlaneEnabled) && window_completed && terminal.passed() {
         assert_required_signals(&observability, true);
         run_late_event_holder_matrix(&endpoint);
         late_webrtc_event_orders(&endpoint, hub.data_dir());
     }
-    stop.store(true, Ordering::SeqCst);
-    if let Some(join) = emitter {
-        join.join().expect("join emitter");
-    }
+    drop(emitter);
     let webrtc_queues = webrtc.as_ref().map(|(_, peer, _)| {
         let snap = peer.fixture_queue_snapshot();
-        if window_completed && terminal_passed {
+        if window_completed && terminal.passed() {
             assert_webrtc_queue_snapshot_within_budget(&snap);
         }
         snap
     });
     if let Some((_, peer, key)) = webrtc
         && window_completed
-        && terminal_passed
+        && terminal.passed()
     {
         prove_webrtc_close_unix_survives(&endpoint, peer, &key);
     }
     let mut survivors = shutdown_owned_sessions(&endpoint);
     survivors.extend(list_live_sessions(&endpoint));
+    publish_builder(&builder, |state| {
+        state.survivors = survivors.clone();
+        state.webrtc_queues = webrtc_queues.clone();
+    });
     hub.shutdown().expect("shutdown saturation hub");
     ArmRun {
         n_running,
         window_completed,
         worker_errors,
-        terminal_passed,
+        terminal,
         survivors,
         scheduler_lag: unevaluated_scheduler_lag(),
         report: ArmReport {
@@ -2339,8 +2985,11 @@ fn assert_webrtc_queue_snapshot_within_budget(snap: &serde_json::Value) {
 }
 
 fn drain_webrtc_host_events(
+    endpoint: &botster_hub_client::DaemonEndpoint,
+    data_dir: &Path,
     peer: &mut LocalWebrtcOfferPeer,
     key: &botster_core::AesGcmKey,
+    builder: &Mutex<ArmRunBuilder>,
     saw_event: &mut bool,
     saw_gap: &mut bool,
 ) {
@@ -2353,7 +3002,13 @@ fn drain_webrtc_host_events(
             Ok(Ok(botster_hub_client::DaemonEvent::PackageEvent { .. })) => *saw_event = true,
             Ok(Ok(botster_hub_client::DaemonEvent::EventGap { .. })) => *saw_gap = true,
             Ok(Ok(_)) => {}
-            Ok(Err(error)) => panic!("product_failure webrtc host event: {error}"),
+            Ok(Err(error)) => fail_webrtc_saturation(
+                endpoint,
+                data_dir,
+                peer,
+                builder,
+                &format!("host event: {error}"),
+            ),
             Err(_) => break,
         }
         if Instant::now() >= slice_end {
@@ -2366,32 +3021,21 @@ fn fail_webrtc_saturation(
     endpoint: &botster_hub_client::DaemonEndpoint,
     data_dir: &Path,
     peer: &LocalWebrtcOfferPeer,
+    builder: &Mutex<ArmRunBuilder>,
     error: &str,
 ) -> ! {
     let record_path = data_dir.join(LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE);
     let terminal = fs::read_to_string(&record_path).unwrap_or_else(|_| "missing".to_string());
-    let observability = snapshot_observability(endpoint);
-    let pty = probe_pty_allocation();
-    let fd = probe_fd_limit();
-    let validity = classify_host_validity(
-        None,
-        &unevaluated_scheduler_lag(),
-        fd,
-        pty,
-        host_load_diagnostics(),
-    );
-    persist_host_validity_artifact(&validity);
-    let class = if validity.verdict == HostValidityVerdict::Valid {
-        "product_failure"
-    } else {
-        validity.verdict.name()
-    };
+    publish_builder(builder, |state| {
+        state.terminal.apply_peer_loss();
+        state.observability = Some(snapshot_observability(endpoint));
+        state.worker_errors.push(format!("event-plane-peer-loss: {error}"));
+    });
     panic!(
-        "{class} webrtc control failed: {error}; overflow={}; pty={:?} fd={:?}; host-validity={}; terminal={terminal}; observability={observability:?}",
+        "event-plane-peer-loss: {error}; overflow={}; pty={:?} fd={:?}; terminal={terminal}",
         peer.inbound_overflow(),
-        pty.marker_name(),
-        fd.marker_name(),
-        validity.summary()
+        probe_pty_allocation().marker_name(),
+        probe_fd_limit().marker_name()
     );
 }
 
@@ -2579,6 +3223,40 @@ fn spawn_noisy_session(endpoint: &botster_hub_client::DaemonEndpoint) -> NoisySe
     NoisySession { connection }
 }
 
+fn collect_noisy_attach(
+    noisy: &mut NoisySession,
+    until_live_marker: Option<&str>,
+) -> Result<Vec<botster_hub_client::DaemonEvent>, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        collect_attach_events(
+            &mut noisy.connection,
+            EVENT_PLANE_NOISY_SESSION,
+            EVENT_PLANE_NOISY_SUB,
+            until_live_marker,
+        )
+    }))
+    .map_err(|_| "noisy attach collect panicked".to_string())
+}
+
+fn noisy_events_have_gap(events: &[botster_hub_client::DaemonEvent]) -> bool {
+    events
+        .iter()
+        .any(|event| event_gap_for_subscription(event, EVENT_PLANE_NOISY_SUB))
+}
+
+fn publish_partial_measurement(
+    builder: &Mutex<ArmRunBuilder>,
+    operations: &BTreeMap<String, OperationStats>,
+    terminal: &TerminalOracles,
+    worker_errors: &[String],
+) {
+    publish_builder(builder, |state| {
+        state.operations = operations.clone();
+        state.terminal = terminal.clone();
+        state.worker_errors = worker_errors.to_vec();
+    });
+}
+
 fn run_measurement_workers(
     endpoint: &botster_hub_client::DaemonEndpoint,
     data_dir: &Path,
@@ -2589,39 +3267,58 @@ fn run_measurement_workers(
         botster_core::AesGcmKey,
     )>,
     noisy: &mut NoisySession,
-) -> (BTreeMap<String, OperationStats>, Vec<String>) {
+    builder: Arc<Mutex<ArmRunBuilder>>,
+) -> (
+    BTreeMap<String, OperationStats>,
+    Vec<String>,
+    TerminalOracles,
+    bool,
+) {
     let start_at = Instant::now() + EVENT_PLANE_WARMUP;
     let end_at = start_at + EVENT_PLANE_MEASUREMENT_WINDOW;
     let (tx, rx) = mpsc::channel();
-    let mut joins = Vec::new();
+    let worker_stop = Arc::new(AtomicBool::new(false));
+    let mut worker_guard = WorkerStopGuard {
+        stop: worker_stop.clone(),
+        joins: Vec::new(),
+    };
     for worker in 0..EVENT_PLANE_DRIVER_CONCURRENCY {
         let tx = tx.clone();
         let endpoint = endpoint.clone();
-        joins.push(thread::spawn(move || {
+        let stop = worker_stop.clone();
+        worker_guard.joins.push(thread::spawn(move || {
             let mut cycle: u64 = 0;
-            while Instant::now() < end_at {
+            while Instant::now() < end_at && !stop.load(Ordering::SeqCst) {
                 cycle += 1;
                 let session_id = format!("churn-{worker}-{cycle}");
                 let sub_id = format!("churn-sub-{worker}-{cycle}");
                 for operation in EVENT_PLANE_OPERATIONS {
+                    if Instant::now() >= end_at || stop.load(Ordering::SeqCst) {
+                        break;
+                    }
                     let op_start = Instant::now();
-                    let in_window = op_start >= start_at && Instant::now() < end_at;
+                    let record = op_start >= start_at;
+                    if record {
+                        tx.send(MeasurementSample::Start(operation.to_string()))
+                            .expect("send start");
+                    }
                     let result =
                         perform_cycle_operation(&endpoint, operation, &session_id, &sub_id);
-                    let elapsed = op_start.elapsed();
-                    let finished_in_window = Instant::now() <= end_at;
-                    if in_window && finished_in_window {
-                        tx.send((operation.to_string(), result.is_ok(), elapsed.as_millis() as u64))
-                            .expect("send sample");
-                    }
-                    if let Err(error) = result {
-                        return Err(format!("{operation}: {error}"));
+                    if record {
+                        tx.send(MeasurementSample::Finish {
+                            operation: operation.to_string(),
+                            ok: result.is_ok(),
+                            ms: op_start.elapsed().as_millis() as u64,
+                        })
+                        .expect("send finish");
                     }
                 }
             }
-            Ok(())
         }));
     }
+    let mut operations = zero_gated_operations();
+    let mut terminal = TerminalOracles::passing();
+    let mut worker_errors = Vec::new();
     let mut saw_unix_event = false;
     let mut saw_unix_gap = false;
     let mut saw_webrtc_event = false;
@@ -2630,6 +3327,10 @@ fn run_measurement_workers(
     let mut input_seq: u64 = 0;
     let mut next_output_seq: Option<u64> = None;
     while Instant::now() < end_at {
+        while let Ok(sample) = rx.try_recv() {
+            apply_measurement_sample(&mut operations, sample);
+        }
+        publish_partial_measurement(&builder, &operations, &terminal, &worker_errors);
         if let Some(connection) = unix.as_mut() {
             let status = connection
                 .request(&botster_hub_client::DaemonRequest::Status)
@@ -2660,17 +3361,32 @@ fn run_measurement_workers(
             });
             let response = match response {
                 Ok(response) => response,
-                Err(error) => fail_webrtc_saturation(endpoint, data_dir, peer, &error.to_string()),
+                Err(error) => fail_webrtc_saturation(
+                    endpoint,
+                    data_dir,
+                    peer,
+                    &builder,
+                    &error.to_string(),
+                ),
             };
             if response.kind != botster_hub_client::DaemonResponseKind::Status {
                 fail_webrtc_saturation(
                     endpoint,
                     data_dir,
                     peer,
+                    &builder,
                     &format!("unexpected status kind {response:?}"),
                 );
             }
-            drain_webrtc_host_events(peer, key, &mut saw_webrtc_event, &mut saw_webrtc_gap);
+            drain_webrtc_host_events(
+                endpoint,
+                data_dir,
+                peer,
+                key,
+                &builder,
+                &mut saw_webrtc_event,
+                &mut saw_webrtc_gap,
+            );
         }
         let now = Instant::now();
         if now >= next_input_at && now < end_at {
@@ -2678,7 +3394,10 @@ fn run_measurement_workers(
             let token = format!("ti-{input_seq}");
             let payload = format!("{token}{}\r", "x".repeat(64_usize.saturating_sub(token.len())));
             let input_start = Instant::now();
-            let in_window = input_start >= start_at;
+            if input_start >= start_at {
+                tx.send(MeasurementSample::Start("terminal_input".to_string()))
+                    .expect("send terminal input start");
+            }
             let sent = noisy
                 .connection
                 .request(&botster_hub_client::DaemonRequest::SendInput {
@@ -2686,121 +3405,161 @@ fn run_measurement_workers(
                     data: payload,
                 });
             let echo_marker = format!("ns-echo:{token}");
-            let echoed = collect_attach_events(
-                &mut noisy.connection,
-                EVENT_PLANE_NOISY_SESSION,
-                EVENT_PLANE_NOISY_SUB,
-                Some(&echo_marker),
-            );
-            let finished = Instant::now();
-            if in_window && finished <= end_at {
-                tx.send((
-                    "terminal_input".to_string(),
-                    sent.is_ok()
-                        && echoed.iter().any(|event| {
-                            matches!(
-                                event,
-                                botster_hub_client::DaemonEvent::TerminalOutput { payload, .. }
-                                    if live_output_contains(payload, &echo_marker)
-                            )
-                        }),
-                    input_start.elapsed().as_millis() as u64,
-                ))
-                .expect("send terminal input sample");
+            let echoed = collect_noisy_attach(noisy, Some(&echo_marker));
+            let ok = match echoed {
+                Ok(events) => {
+                    if noisy_events_have_gap(&events) {
+                        terminal.apply_unexpected_gap();
+                    }
+                    let echoed_ok = events.iter().any(|event| {
+                        matches!(
+                            event,
+                            botster_hub_client::DaemonEvent::TerminalOutput { payload, .. }
+                                if live_output_contains(payload, &echo_marker)
+                        )
+                    });
+                    sent.is_ok() && echoed_ok
+                }
+                Err(_) => false,
+            };
+            if sent.is_err() || !ok {
+                terminal.apply_input_failure();
+            }
+            if input_start >= start_at {
+                tx.send(MeasurementSample::Finish {
+                    operation: "terminal_input".to_string(),
+                    ok,
+                    ms: input_start.elapsed().as_millis() as u64,
+                })
+                .expect("send terminal input finish");
             }
             next_input_at += Duration::from_millis(500);
         }
         let output_start = Instant::now();
+        let started_output = output_start >= start_at;
+        if started_output {
+            tx.send(MeasurementSample::Start("terminal_output".to_string()))
+                .expect("send terminal output start");
+        }
         let drain = noisy
             .connection
             .request(&botster_hub_client::DaemonRequest::drain_subscription(
                 EVENT_PLANE_NOISY_SESSION,
                 EVENT_PLANE_NOISY_SUB,
             ));
-        let in_window = output_start >= start_at && Instant::now() <= end_at;
-        if drain.is_err() && in_window {
-            tx.send((
-                "terminal_output".to_string(),
-                false,
-                output_start.elapsed().as_millis() as u64,
-            ))
-            .expect("send terminal output failure");
-        } else if drain.is_ok() {
-            let drained = collect_attach_events(
-                &mut noisy.connection,
-                EVENT_PLANE_NOISY_SESSION,
-                EVENT_PLANE_NOISY_SUB,
-                None,
-            );
-            let records = output_records(&drained);
-            let receipt_ns = monotonic_now_ns();
-            if in_window {
-                for record in records {
-                    if next_output_seq.is_some_and(|expected| record.seq != expected) {
-                        tx.send((
-                            "terminal_output".to_string(),
-                            false,
-                            output_start.elapsed().as_millis() as u64,
-                        ))
-                        .expect("send terminal output sequence failure");
-                        break;
+        if drain.is_err() {
+            terminal.apply_output_failure();
+            if started_output {
+                tx.send(MeasurementSample::Finish {
+                    operation: "terminal_output".to_string(),
+                    ok: false,
+                    ms: output_start.elapsed().as_millis() as u64,
+                })
+                .expect("send terminal output failure");
+            }
+        } else {
+            match collect_noisy_attach(noisy, None) {
+                Ok(drained) => {
+                    if noisy_events_have_gap(&drained) {
+                        terminal.apply_unexpected_gap();
                     }
-                    next_output_seq = Some(record.seq.saturating_add(1));
-                    let latency_ms = receipt_ns.saturating_sub(record.emit_ns) / 1_000_000;
-                    tx.send(("terminal_output".to_string(), true, latency_ms))
-                        .expect("send terminal output sample");
+                    let parsed = parse_output_records(&drained);
+                    terminal.apply_malformed(parsed.malformed);
+                    let receipt_ns = monotonic_now_ns();
+                    if parsed.records.is_empty() {
+                        let ok = parsed.malformed == 0;
+                        if !ok {
+                            terminal.apply_output_failure();
+                        }
+                        if started_output {
+                            tx.send(MeasurementSample::Finish {
+                                operation: "terminal_output".to_string(),
+                                ok,
+                                ms: output_start.elapsed().as_millis() as u64,
+                            })
+                            .expect("send terminal output empty finish");
+                        }
+                    } else {
+                        for (index, record) in parsed.records.iter().enumerate() {
+                            let sequential = match next_output_seq {
+                                Some(expected) if record.seq != expected => {
+                                    terminal.apply_sequence_break();
+                                    false
+                                }
+                                _ => {
+                                    next_output_seq = Some(record.seq.saturating_add(1));
+                                    true
+                                }
+                            };
+                            let ok = sequential && parsed.malformed == 0;
+                            if !ok {
+                                terminal.apply_output_failure();
+                            }
+                            if started_output {
+                                if index > 0 {
+                                    tx.send(MeasurementSample::Start(
+                                        "terminal_output".to_string(),
+                                    ))
+                                    .expect("send terminal output record start");
+                                }
+                                let latency_ms =
+                                    receipt_ns.saturating_sub(record.emit_ns) / 1_000_000;
+                                tx.send(MeasurementSample::Finish {
+                                    operation: "terminal_output".to_string(),
+                                    ok,
+                                    ms: latency_ms,
+                                })
+                                .expect("send terminal output sample");
+                            }
+                        }
+                    }
                 }
-            } else if let Some(record) = records.last() {
-                next_output_seq = Some(record.seq.saturating_add(1));
+                Err(_) => {
+                    terminal.apply_output_failure();
+                    if started_output {
+                        tx.send(MeasurementSample::Finish {
+                            operation: "terminal_output".to_string(),
+                            ok: false,
+                            ms: output_start.elapsed().as_millis() as u64,
+                        })
+                        .expect("send terminal output collect failure");
+                    }
+                }
             }
         }
         thread::sleep(Duration::from_millis(20));
     }
     if let Some(connection) = unix.as_mut() {
         connection.set_read_timeout(None).ok();
-        assert!(
-            saw_unix_event || saw_unix_gap,
-            "Unix event subscription must observe PackageEvent or EventGap during the measurement window"
+        if !(saw_unix_event || saw_unix_gap) {
+            worker_errors.push(
+                "Unix event subscription observed neither PackageEvent nor EventGap".to_string(),
+            );
+        }
+    }
+    if webrtc.is_some() && !(saw_webrtc_event || saw_webrtc_gap) {
+        worker_errors.push(
+            "WebRTC event subscription observed neither PackageEvent nor EventGap".to_string(),
         );
     }
-    if webrtc.is_some() {
-        assert!(
-            saw_webrtc_event || saw_webrtc_gap,
-            "WebRTC event subscription must observe PackageEvent or EventGap during the measurement window"
-        );
-    }
+    worker_guard.stop.store(true, Ordering::SeqCst);
     drop(tx);
-    let mut operations = BTreeMap::new();
-    for name in EVENT_PLANE_GATED_OPERATIONS {
-        operations.insert(
-            name.to_string(),
-            OperationStats {
-                attempts: 0,
-                successes: 0,
-                failures: 0,
-                samples_ms: Vec::new(),
-            },
-        );
+    while let Ok(sample) = rx.recv() {
+        apply_measurement_sample(&mut operations, sample);
     }
-    while let Ok((operation, ok, ms)) = rx.recv() {
-        let stats = operations.get_mut(&operation).expect("known operation");
-        stats.attempts += 1;
-        if ok {
-            stats.successes += 1;
-            stats.samples_ms.push(ms);
-        } else {
-            stats.failures += 1;
+    let mut window_completed = true;
+    for join in worker_guard.joins.drain(..) {
+        if join.join().is_err() {
+            worker_errors.push("measurement worker panicked".to_string());
+            window_completed = false;
         }
     }
-    let mut errors = Vec::new();
-    for join in joins {
-        match join.join() {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => errors.push(error),
-            Err(_) => errors.push("measurement worker panicked".to_string()),
-        }
-    }
-    (operations, errors)
+    finalize_incomplete_cycles(&mut operations);
+    publish_partial_measurement(&builder, &operations, &terminal, &worker_errors);
+    publish_builder(&builder, |state| {
+        state.window_completed = window_completed;
+    });
+    (operations, worker_errors, terminal, window_completed)
 }
 
 fn perform_cycle_operation(
@@ -2906,21 +3665,37 @@ fn unix_now_ns() -> u64 {
         .as_nanos() as u64
 }
 
-fn output_records(events: &[botster_hub_client::DaemonEvent]) -> Vec<OutputRecord> {
+struct ParsedOutputRecords {
+    records: Vec<OutputRecord>,
+    malformed: u64,
+}
+
+fn parse_output_records(events: &[botster_hub_client::DaemonEvent]) -> ParsedOutputRecords {
     let mut records = Vec::new();
+    let mut malformed = 0_u64;
     for event in events {
         let botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } = event else {
             continue;
         };
-        let Ok(bytes) = payload.decoded_bytes() else {
-            continue;
+        let bytes = match payload.decoded_bytes() {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                malformed = malformed.saturating_add(1);
+                continue;
+            }
         };
         let mut index = 0;
-        while index + EVENT_PLANE_OUTPUT_RECORD_BYTES <= bytes.len() {
-            let seq_ok = bytes[index] == b'N'
-                && bytes[index + 1..index + 9]
-                    .iter()
-                    .all(|byte| byte.is_ascii_digit());
+        while index < bytes.len() {
+            if bytes[index] != b'N' {
+                index += 1;
+                continue;
+            }
+            if index + EVENT_PLANE_OUTPUT_RECORD_BYTES > bytes.len() {
+                break;
+            }
+            let seq_ok = bytes[index + 1..index + 9]
+                .iter()
+                .all(|byte| byte.is_ascii_digit());
             let time_ok = bytes[index + 9] == b'T'
                 && bytes[index + 10..index + EVENT_PLANE_OUTPUT_HEADER_BYTES]
                     .iter()
@@ -2946,11 +3721,16 @@ fn output_records(events: &[botster_hub_client::DaemonEvent]) -> Vec<OutputRecor
                 });
                 index += EVENT_PLANE_OUTPUT_RECORD_BYTES;
             } else {
+                malformed = malformed.saturating_add(1);
                 index += 1;
             }
         }
     }
-    records
+    ParsedOutputRecords { records, malformed }
+}
+
+fn output_records(events: &[botster_hub_client::DaemonEvent]) -> Vec<OutputRecord> {
+    parse_output_records(events).records
 }
 
 fn snapshot_observability(
@@ -3258,7 +4038,7 @@ fn prove_client_contract_under_saturation(
     );
 }
 
-fn prove_north_star(endpoint: &botster_hub_client::DaemonEndpoint, noisy: &mut NoisySession) {
+fn prove_north_star(endpoint: &botster_hub_client::DaemonEndpoint, noisy: &mut NoisySession) -> TerminalOracles {
     let identity = collect_attach_events(
         &mut noisy.connection,
         EVENT_PLANE_NOISY_SESSION,
@@ -3391,6 +4171,7 @@ fn prove_north_star(endpoint: &botster_hub_client::DaemonEndpoint, noisy: &mut N
         thread::sleep(Duration::from_millis(30));
     }
     assert!(saw_exit, "shutdown must surface ProcessExit");
+    TerminalOracles::passing()
 }
 
 fn prove_webrtc_close_unix_survives(

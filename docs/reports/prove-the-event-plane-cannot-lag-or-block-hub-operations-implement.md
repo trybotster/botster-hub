@@ -8,11 +8,11 @@
 | `target_id` | `tgt_7e208a0c76a44980a83b63af976b1f22` |
 | Ticket | `ticket_1786663585_879846` |
 | Run | `run_1787262311_549251` |
-| Step | `botster_stack_implement` (`run_step_1787439385_415615`) |
+| Step | `botster_stack_implement` (`run_step_1787440727_917843`) |
 | Merge policy | `direct` into `main`; no PR |
-| Returned from | Review `review_1787439371_225335` plus human answer `question_1787439231_161941` restated as `question_1787439421_445099` |
+| Returned from | Review `review_1787440703_182294` |
 | Locked Core | `7eafa470a18025895995bbedc20d34b58106a03b` |
-| Implement commit | `1e2736f917c1e26b07cb67ba2363c77e5abe2363` |
+| Implement commit | pending first commit SHA |
 | `teardown_class_applies` | **yes** |
 
 Independent routing: ticket and run `target_id` resolve to `botster-hub`. Work is in the ticket worktree. This visit does not rebuild the campaign and does not retune production budgets.
@@ -24,30 +24,26 @@ Independent routing: ticket and run `target_id` resolve to `botster-hub`. Work i
 - [[botster-hub-playbook]]
 - [[botster runtime teardown lenses]]
 - [[load campaigns need a host validity oracle not fd and pty probes]]
-- [[wall clock bounds in campaign fault lanes waste whole runner dispatches]]
 - [[conformance harnesses gate on deterministic invariants not timing]]
-- [[router ingress uses try_lock only and contention is shed_busy]]
-- [[host exhaustion markers identify each failed test]]
 - [[test script required for rust tests not cargo test]]
-- [[event plane terminal budgets are new coexistence regression budgets]]
 - [[implementation steps must persist report artifacts for review]]
 
 ## Review findings addressed
 
 | Finding | Severity | Fix |
 | --- | --- | --- |
-| `finding_1787439371_929304` Eleven immutable pre-calibration gates | **blocker** | Disabled-arm validity now evaluates all eleven gates from `question_1787439231_161941`. Host-exhaustion is only scheduler-lag maximum or confirmed FD/PTY. Owner-turn / ready-wait / queue-age / sample / terminal failures without that evidence are `product_failure`. Gate 11 is `environment_tainted` or `survivors_present`. No pre-calibration `ABS*` / `THRMIN`. |
-| `finding_1787439371_679197` Persist host-validity before early exit | **blocker** | Pre-measurement, disabled-arm invalid, enabled-arm invalid, WebRTC fail, and inner-arm unwind paths write `event-plane-host-validity.json` with lag, load averages, runnable, total threads, CPU steal plus `linux_proc_stat_steal_ticks`, FD/PTY, every gate result, and the class. `event_plane_saturation_persists_host_validity_artifact_before_failure_exit` writes, classifies, and reads the file back. |
-| `finding_1787439371_328634` Full-arm scheduler watchdog | **high** | A 1 ms watchdog records the monotonic lag maximum across the disabled-arm interval, then stops and joins on teardown. Gate 8 uses 50,000 µs. `event_plane_saturation_scheduler_watchdog_records_injected_delayed_sample` injects 75,000 µs deterministically and also proves stop+join. |
+| `finding_1787440704_750397` Gate 4 drops late completions | **blocker** | Workers send `MeasurementSample::Start` for every post-warm-up attempt and always send `Finish`, including after `end_at`. Op errors no longer abort the window. Gate 4 fails on failures, incomplete cycles, attempts≠successes, or worker errors. Gate 2 uses only `window_completed`. Tests cover late completion, incomplete cycle, mismatch, and worker-error isolation. |
+| `finding_1787440704_332477` Gate 5 one boolean | **blocker** | `TerminalOracles` records exact bytes/ordering, continuous sequence, zero I/O failure, zero unexpected **terminal** gap, and no peer loss. `parse_output_records` counts decode failures and invalid `N` headers; identity / echo / `0x80 0xff` bytes are not malformed. Unix/WebRTC PackageEvent or EventGap stay event-plane observations. Negative tests per oracle. |
+| `finding_1787440704_480919` scheduler `>=` vs at most | medium | `exceeds_budget` is `lag_us > 50_000`. Boundary test: 49,999 pass, 50,000 pass, 50,001 fail. |
+| `finding_1787440703_272480` panic wipes gates | **blocker** | `ArmRunBuilder` publishes partial ops, terminal, and errors during the window. `WorkerStopGuard` and `EmitterGuard` stop work on unwind. `catch_unwind` classifies from the builder, persists the artifact, then fails. Injected early-failure test reads gates 1–5 as `fail`, not `not_evaluated`. WebRTC peer loss records `event-plane-peer-loss` instead of classifying `None`. |
 
-Previous Verify findings about ShedBusy, `stress_profile=none`, residual-tail provenance, and no moderate-stress lane remain in force and were not reopened.
+Older open findings (`finding_1787439371_929304`, `679197`, `finding_1787428577_251857`) stay satisfied.
 
 ## Files changed
 
 - `tests/hub_daemon_lifecycle/event_plane_saturation.rs`
-- `tests/hub_daemon_lifecycle_test.rs` (`AtomicU64` import)
 - `docs/event-plane-load-proof.md`
-- `docs/plans/prove-the-event-plane-cannot-lag-or-block-hub-operations.md` (revision 10)
+- `docs/plans/prove-the-event-plane-cannot-lag-or-block-hub-operations.md` (revision 11)
 - `docs/reports/prove-the-event-plane-cannot-lag-or-block-hub-operations-evidence.json`
 - `docs/reports/prove-the-event-plane-cannot-lag-or-block-hub-operations-implement.md`
 
@@ -61,8 +57,8 @@ Unchanged. Hang-close remains the live fail-closed oracle. This visit does not a
 
 ## Deviations
 
-- Project Pipelines vault-checklist create timed out; this report and the gate evidence are the checklist fallback.
-- Local Darwin cannot run ignored N=300 ubuntu-24.04 calibration. Gates are proved with classifier, artifact, and watchdog injection tests plus the existing campaign unit tests.
+- Project Pipelines vault-checklist create timed out previously; this report and the gate evidence are the checklist fallback.
+- Local Darwin cannot run ignored N=300 ubuntu-24.04 calibration. Gates are proved with classifier, artifact, watchdog, measurement-fold, and oracle injection tests plus the existing campaign unit tests.
 - Workflow default for other loaded-lifecycle tickets remains `residual-tail`. This campaign's published reference stays `stress_profile=none`.
 
 ## Tests
@@ -71,7 +67,7 @@ Unchanged. Hang-close remains the live fail-closed oracle. This visit does not a
 | --- | --- |
 | `cargo fmt --all` | pass |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | pass |
-| `./test.sh --locked --test hub_daemon_lifecycle_test event_plane_saturation_` | 20 passed, 0 failed, 1 ignored (`event_plane_saturation_campaign`) |
+| `./test.sh --locked --test hub_daemon_lifecycle_test event_plane_saturation_` | 28 passed, 0 failed, 1 ignored (`event_plane_saturation_campaign`) |
 | `script/run-loaded-daemon-lifecycle-selftest` | pass, including `stress_profile=none` validate-only and residual-tail rejection |
 
 This Darwin worktree cannot execute the ignored N=300 ubuntu-24.04 campaign.
@@ -82,4 +78,4 @@ N=300 ubuntu-24.04 `none` calibration and acceptance have not run after this com
 
 ## Missing vault guidance
 
-None. The eleven-gate answer and host-validity notes already cover this return.
+None. The eleven-gate answer already covers host validity; this return tightens attempt recording, terminal evidence, the scheduler boundary, and panic classification.
