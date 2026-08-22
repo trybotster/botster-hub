@@ -272,22 +272,25 @@ pub(crate) fn probe_fd_limit() -> ResourceProbe {
 }
 
 pub(crate) fn probe_pty_allocation() -> ResourceProbe {
-    let result = Command::new("python3")
-        .args([
-            "-c",
-            "import os, sys\ntry:\n    fd = os.posix_openpt(os.O_RDWR | os.O_NOCTTY)\n    os.close(fd)\n    sys.exit(0)\nexcept OSError as error:\n    sys.exit(error.errno)",
-        ])
-        .status();
+    probe_pty_allocation_from_open_result(posix_openpt_result())
+}
+
+fn posix_openpt_result() -> Result<(), i32> {
+    let fd = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
+    if fd >= 0 {
+        unsafe { libc::close(fd) };
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO))
+    }
+}
+
+pub(crate) fn probe_pty_allocation_from_open_result(result: Result<(), i32>) -> ResourceProbe {
     match result {
-        Ok(status) if status.success() => ResourceProbe::Unconfirmed,
-        Ok(status) => {
-            let code = status.code().unwrap_or_default();
-            if pty_allocation_errnos().contains(&code) {
-                ResourceProbe::Confirmed
-            } else {
-                ResourceProbe::Unconfirmed
-            }
-        }
+        Ok(()) => ResourceProbe::Unconfirmed,
+        Err(code) if pty_allocation_errnos().contains(&code) => ResourceProbe::Confirmed,
         Err(_) => ResourceProbe::Unconfirmed,
     }
 }
@@ -878,4 +881,32 @@ fn prove_owned_absence(
         return Err(format!("data-dir session workers still live: {leftover:?}"));
     }
     Ok(())
+}
+
+#[test]
+fn pty_probe_succeeds_with_libc_posix_openpt() {
+    assert_eq!(
+        probe_pty_allocation(),
+        ResourceProbe::Unconfirmed,
+        "a free PTY must not be classified as exhaustion"
+    );
+}
+
+#[test]
+fn pty_probe_confirms_typed_allocation_errnos() {
+    for code in pty_allocation_errnos() {
+        assert_eq!(
+            probe_pty_allocation_from_open_result(Err(*code)),
+            ResourceProbe::Confirmed,
+            "errno {code} must confirm PTY exhaustion"
+        );
+    }
+    assert_eq!(
+        probe_pty_allocation_from_open_result(Err(libc::EINVAL)),
+        ResourceProbe::Unconfirmed
+    );
+    assert_eq!(
+        probe_pty_allocation_from_open_result(Ok(())),
+        ResourceProbe::Unconfirmed
+    );
 }
