@@ -2,7 +2,7 @@
   "campaign": "event-plane-saturation",
   "ticket_id": "ticket_1786663585_879846",
   "run_id": "run_1787262311_549251",
-  "result": "review_return_workflow_phase_and_oracles_calibration_pending",
+  "result": "review_return_sha_split_and_output_sampler_calibration_pending",
   "target_id": "tgt_7e208a0c76a44980a83b63af976b1f22",
   "target_repository": "botster-hub",
   "executed_revisions": {
