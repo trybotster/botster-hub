@@ -619,6 +619,8 @@ pub struct MaintenanceState {
     pub last_owner_turn: Duration,
     pub journal_page_reads: u64,
     pub baseline_page_reads: u64,
+    /// Times Core returned `resync_required` and Hub reminted a baseline.
+    pub resync_reads: u64,
     pub projection_dirty: bool,
     pub event_in_flight: BTreeMap<String, EventDeliveryFlight>,
     pub pending_retirements: VecDeque<EventDeliveryFlight>,
@@ -1514,6 +1516,7 @@ fn continue_family_fanout(state: &mut MaintenanceState, budget: &mut HostBridgeB
 }
 
 fn handle_resync_reason(state: &mut MaintenanceState, _reason: SessionLifecycleResyncReason) {
+    state.resync_reads = state.resync_reads.saturating_add(1);
     start_baseline_recovery(state);
 }
 
@@ -2845,6 +2848,10 @@ mod tests {
             SessionLifecycleResyncReason::CursorExpired {
                 oldest_available_sequence: 8,
             },
+        );
+        assert_eq!(
+            state.resync_reads, 1,
+            "CursorExpired must increment lifecycle resync reads"
         );
         assert!(
             state.projection.gap,
