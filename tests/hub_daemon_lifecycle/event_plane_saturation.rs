@@ -343,8 +343,12 @@ fn event_plane_saturation_dataset_records_fault_resync() {
             "pending_host_events": {
                 "count": 0,
                 "bytes": 0,
+                "high_water_count": 0,
+                "high_water_bytes": 0,
+                "oldest_age_us": null,
                 "overflow": 0,
-                "max_count": WEBRTC_PENDING_HOST_EVENTS_MAX
+                "max_count": WEBRTC_PENDING_HOST_EVENTS_MAX,
+                "max_bytes": WEBRTC_PENDING_HOST_EVENTS_MAX_BYTES
             }
         })),
         None,
@@ -368,6 +372,13 @@ fn event_plane_saturation_dataset_records_fault_resync() {
     assert_eq!(
         body["client_fixture_queues"]["webrtc"]["inbound_frames"]["overflow"],
         0
+    );
+    assert_eq!(
+        body["client_fixture_queues"]["webrtc"]["pending_host_events"]["max_bytes"],
+        WEBRTC_PENDING_HOST_EVENTS_MAX_BYTES as u64
+    );
+    assert!(
+        body["client_fixture_queues"]["webrtc"]["pending_host_events"]["oldest_age_us"].is_null()
     );
 }
 
@@ -1036,17 +1047,7 @@ fn run_saturation_arm(arm: SaturationArm) -> ArmReport {
     }
     let webrtc_queues = webrtc.as_ref().map(|(_, peer, _)| {
         let snap = peer.fixture_queue_snapshot();
-        if snap["inbound_frames"]["overflow"].as_u64().unwrap_or(0) > 0
-            || snap["pending_host_events"]["overflow"].as_u64().unwrap_or(0) > 0
-        {
-            panic!("product_failure webrtc fixture overflow: {snap}");
-        }
-        if snap["inbound_frames"]["oldest_age_us"]
-            .as_u64()
-            .is_some_and(|age| age > EVENT_PLANE_QUEUE_AGE_US)
-        {
-            panic!("product_failure webrtc inbound oldest_age_us exceeds queue_age: {snap}");
-        }
+        assert_webrtc_queue_snapshot_within_budget(&snap);
         snap
     });
     if let Some((_, peer, key)) = webrtc {
@@ -1224,13 +1225,7 @@ fn wait_unix_marker_or_gap(
     );
 }
 
-fn drain_webrtc_host_events(
-    peer: &mut LocalWebrtcOfferPeer,
-    key: &botster_core::AesGcmKey,
-    saw_event: &mut bool,
-    saw_gap: &mut bool,
-) {
-    let snap = peer.fixture_queue_snapshot();
+fn assert_webrtc_queue_snapshot_within_budget(snap: &serde_json::Value) {
     if snap["inbound_frames"]["overflow"].as_u64().unwrap_or(0) > 0
         || snap["pending_host_events"]["overflow"].as_u64().unwrap_or(0) > 0
     {
@@ -1242,6 +1237,35 @@ fn drain_webrtc_host_events(
     {
         panic!("product_failure webrtc inbound oldest_age_us exceeds queue_age: {snap}");
     }
+    if snap["pending_host_events"]["oldest_age_us"]
+        .as_u64()
+        .is_some_and(|age| age > EVENT_PLANE_QUEUE_AGE_US)
+    {
+        panic!("product_failure webrtc pending_host_events oldest_age_us exceeds queue_age: {snap}");
+    }
+    let inbound_bytes = snap["inbound_frames"]["bytes"].as_u64().unwrap_or(0);
+    let inbound_max = snap["inbound_frames"]["max_bytes"].as_u64().unwrap_or(0);
+    if inbound_max > 0 && inbound_bytes > inbound_max {
+        panic!("product_failure webrtc inbound bytes exceed max_bytes: {snap}");
+    }
+    let pending_bytes = snap["pending_host_events"]["bytes"].as_u64().unwrap_or(0);
+    let pending_max = snap["pending_host_events"]["max_bytes"].as_u64().unwrap_or(0);
+    if pending_max == 0 {
+        panic!("product_failure webrtc pending_host_events max_bytes missing: {snap}");
+    }
+    if pending_bytes > pending_max {
+        panic!("product_failure webrtc pending_host_events bytes exceed max_bytes: {snap}");
+    }
+}
+
+fn drain_webrtc_host_events(
+    peer: &mut LocalWebrtcOfferPeer,
+    key: &botster_core::AesGcmKey,
+    saw_event: &mut bool,
+    saw_gap: &mut bool,
+) {
+    let snap = peer.fixture_queue_snapshot();
+    assert_webrtc_queue_snapshot_within_budget(&snap);
     let slice_end = Instant::now() + Duration::from_millis(100);
     loop {
         match block_on(async { timeout(Duration::from_millis(10), peer.next_host_event(key)).await })
