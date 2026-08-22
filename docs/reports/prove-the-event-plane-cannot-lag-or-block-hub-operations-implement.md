@@ -12,6 +12,7 @@
 | Approved plan | `docs/plans/prove-the-event-plane-cannot-lag-or-block-hub-operations.md` revision 8 |
 | Merge policy | `direct` into `main`; do not create a PR |
 | Prior implement commits | `b1413884f7b8af67e3fb9b7ac51798c302a3706b`, `0b2448478be940b5e83df31c07111999c84a1c5d` |
+| This implement commit | `db148edc86e1b983f26444e101a56add721ad24b` |
 | Returned from | `review_1787417409_162846` (`changes_required`, six findings) |
 | Locked Core | `7eafa470a18025895995bbedc20d34b58106a03b` |
 | `teardown_class_applies` | **yes** |
