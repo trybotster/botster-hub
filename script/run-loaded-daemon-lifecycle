@@ -65,7 +65,7 @@ validate_inputs() {
     invalid=1
   fi
   case "$TEST_TARGET" in
-    lifecycle-suite|focused-metadata-owned-shutdown|focused-occupied-web-port|focused-session-entity-resize|focused-process-ownership|focused-connection-lifecycle|focused-plugin-resource-bounds|focused-stalled-attach|focused-fast-exit-attach-diagnostic|focused-oversized-webrtc|focused-cli-smoke|focused-operator-console|focused-lua-worker-suite|focused-lua-session-worker-callers|full-suite-contention) ;;
+    lifecycle-suite|focused-metadata-owned-shutdown|focused-occupied-web-port|focused-session-entity-resize|focused-process-ownership|focused-connection-lifecycle|focused-plugin-resource-bounds|focused-stalled-attach|focused-fast-exit-attach-diagnostic|focused-oversized-webrtc|focused-cli-smoke|focused-operator-console|focused-lua-worker-suite|focused-lua-session-worker-callers|event-plane-saturation|full-suite-contention) ;;
     *) log "invalid test_target: $TEST_TARGET"; invalid=1 ;;
   esac
   if [[ ! "$REPETITIONS" =~ ^[0-9]+$ ]] || ((10#$REPETITIONS < 1 || 10#$REPETITIONS > 100)); then
@@ -966,8 +966,13 @@ main() {
 
   RUN_TIMEOUT_SECONDS=${BOTSTER_LOADED_RUN_TIMEOUT_SECONDS:-$DEFAULT_RUN_TIMEOUT_SECONDS}
   CAMPAIGN_TIMEOUT_SECONDS=${BOTSTER_LOADED_CAMPAIGN_TIMEOUT_SECONDS:-$DEFAULT_CAMPAIGN_TIMEOUT_SECONDS}
-  if [[ ! "$RUN_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || ((RUN_TIMEOUT_SECONDS < 5 || RUN_TIMEOUT_SECONDS > 1800)); then
-    log "invalid BOTSTER_LOADED_RUN_TIMEOUT_SECONDS: expected 5-1800"
+  local run_timeout_max=1800
+  if [[ "$TEST_TARGET" == event-plane-saturation ]]; then
+    run_timeout_max=3600
+    RUN_TIMEOUT_SECONDS=${BOTSTER_LOADED_RUN_TIMEOUT_SECONDS:-3600}
+  fi
+  if [[ ! "$RUN_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || ((RUN_TIMEOUT_SECONDS < 5 || RUN_TIMEOUT_SECONDS > run_timeout_max)); then
+    log "invalid BOTSTER_LOADED_RUN_TIMEOUT_SECONDS: expected 5-${run_timeout_max}"
     return 2
   fi
   if [[ ! "$CAMPAIGN_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || ((CAMPAIGN_TIMEOUT_SECONDS < RUN_TIMEOUT_SECONDS || CAMPAIGN_TIMEOUT_SECONDS > 20400)); then
@@ -1017,6 +1022,9 @@ main() {
       ;;
     focused-lua-session-worker-callers)
       test_command=(./test.sh --test hub_lua_runtime_test session_type -- --nocapture)
+      ;;
+    event-plane-saturation)
+      test_command=(./test.sh --test hub_daemon_lifecycle_test event_plane_saturation_campaign -- --exact --ignored --nocapture)
       ;;
     full-suite-contention)
       test_command=(./test.sh)

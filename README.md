@@ -431,6 +431,9 @@ prints an installation/version remediation when the prerequisite is missing.
 The committed counter, thread, idle, reload, disable, and post-down invariants
 and their macOS/Linux diagnostic recipes are documented in
 [`docs/hub-resource-proof.md`](docs/hub-resource-proof.md).
+Event-plane coexistence regression budgets, the paired enabled/decoupled
+saturation campaign, and the calibration-before-acceptance rule are documented
+in [`docs/event-plane-load-proof.md`](docs/event-plane-load-proof.md).
 
 The first test proves the persisted-package CLI path. The explicit-coordinate
 script rejects dirty or revision-mismatched repositories before starting a

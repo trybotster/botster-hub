@@ -20,7 +20,8 @@
             "ok": { "type": "boolean" },
             "token": { "type": "string" },
             "subject": { "type": "string" },
-            "notice": { "type": "string" }
+            "notice": { "type": "string" },
+            "pad": { "type": "string" }
           },
           "required": ["ok"]
         }

@@ -57,6 +57,7 @@ use support::{
 include!("hub_daemon_lifecycle/shutdown.rs");
 include!("hub_daemon_lifecycle/packages.rs");
 include!("hub_daemon_lifecycle/package_event_plane.rs");
+include!("hub_daemon_lifecycle/event_plane_saturation.rs");
 include!("hub_daemon_lifecycle/sessions.rs");
 include!("hub_daemon_lifecycle/webrtc_proofs.rs");
 include!("hub_daemon_lifecycle/unix_terminal_adapter.rs");

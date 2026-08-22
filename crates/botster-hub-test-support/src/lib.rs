@@ -18,7 +18,8 @@ use botster_core::{RunnableEntrypointHubConnection, RunnableEntrypointHubConnect
 use botster_hub_client::{
     DaemonCompatibilityRequirement, DaemonConnection, DaemonDiagnosticKind, DaemonEndpoint,
     DaemonEntityFrame, DaemonEvent, DaemonLiveOutputPayload, DaemonOperatorError, DaemonRequest,
-    DaemonResponse, DaemonResponseKind, DaemonTransportError, ensure_compatible,
+    DaemonResponse, DaemonResponseKind, DaemonTransportError, FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS,
+    connect_for_package_event_subscriptions, ensure_compatible,
 };
 use botster_ui_contract::{
     UiActionId, UiActionKind, UiActionRequest, UiActionRequestId, UiActionResult,
@@ -1674,6 +1675,444 @@ pub fn run_client_conformance(
         validation_error_operation: validation_error.operation.clone(),
         validation_diagnostic_kind,
     })
+}
+
+const EVENT_CONFORMANCE_PRODUCER: &str = "event-plane-producer";
+const EVENT_CONFORMANCE_NAME: &str = "sample.ready";
+
+/// Stable observations from [`run_client_event_conformance`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientEventConformanceReport {
+    pub negotiated_package_event_subscriptions: bool,
+    pub exact_subscribe: bool,
+    pub event_received: bool,
+    pub subject_filter_dropped_non_matching: bool,
+    pub reconnect_without_replay: bool,
+    pub unsubscribed: bool,
+    pub control_progressed_during_events: bool,
+    pub event_gap: bool,
+}
+
+/// Prove generic client package-event consumption at the public Unix host-control boundary.
+///
+/// The caller supplies the Hub-owned `examples/event-plane-producer` checkout
+/// (or a copy). This helper enables that package through the public daemon API
+/// and drives exact owner-plus-name subscribe, receive, subject filtering,
+/// reconnect without replay, unsubscribe, and continued Status progress.
+///
+/// Slow-consumer `event_gap` runs only when `stall_path` is `Some` and the
+/// IsolatedHub child was started with `BOTSTER_HUB_TEST_CLIENT_EVENT_QUEUE_MAX=1`
+/// and `BOTSTER_HUB_TEST_STALL_UNIX_EVENT_FLUSH` equal to that path.
+///
+/// This entrypoint does not change published npm fixture bytes.
+pub fn run_client_event_conformance(
+    hub: &IsolatedHub,
+    producer_path: impl AsRef<Path>,
+    stall_path: Option<&Path>,
+) -> Result<ClientEventConformanceReport, ConformanceError> {
+    let producer_dir = materialize_event_producer(hub, producer_path.as_ref())?;
+    let enabled = request(
+        hub.endpoint(),
+        DaemonRequest::EnablePackageLocalPath { path: producer_dir },
+        "enable_event_producer",
+    )?;
+    expect_kind(
+        &enabled,
+        DaemonResponseKind::PackageDecision,
+        "enable_event_producer",
+    )?;
+
+    let mut matching =
+        connect_for_package_event_subscriptions(hub.endpoint()).map_err(|source| {
+            ConformanceError::Client {
+                operation: "connect_events",
+                source,
+            }
+        })?;
+    let negotiated = matching
+        .required_features()
+        .iter()
+        .any(|feature| feature == FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS);
+    if !negotiated {
+        return Err(ConformanceError::UnexpectedValue {
+            operation: "connect_events",
+            field: "required_features",
+            expected: FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS.to_string(),
+            actual: matching.required_features().join(","),
+        });
+    }
+    let subscribed = matching
+        .subscribe_events(
+            "sub-event-conformance",
+            EVENT_CONFORMANCE_PRODUCER,
+            EVENT_CONFORMANCE_NAME,
+            vec!["session-match".to_string()],
+        )
+        .map_err(|source| ConformanceError::Client {
+            operation: "subscribe_events",
+            source,
+        })?;
+    expect_kind(
+        &subscribed,
+        DaemonResponseKind::EventSubscribed,
+        "subscribe_events",
+    )?;
+
+    emit_event_ready(
+        hub.endpoint(),
+        "event-ok",
+        Some("session-match"),
+        Some("ready"),
+        None,
+    )?;
+    emit_event_ready(
+        hub.endpoint(),
+        "event-other",
+        Some("session-other"),
+        Some("ignored"),
+        None,
+    )?;
+    wait_for_event_token(&mut matching, "event-ok")?;
+    let status_during =
+        matching
+            .request(&DaemonRequest::Status)
+            .map_err(|source| ConformanceError::Client {
+                operation: "status_during_events",
+                source,
+            })?;
+    expect_kind(
+        &status_during,
+        DaemonResponseKind::Status,
+        "status_during_events",
+    )?;
+    let skipped_after_filter = matching.take_skipped_events();
+    if skipped_after_filter.iter().any(|event| match event {
+        DaemonEvent::PackageEvent { payload, .. } => payload["token"] == "event-other",
+        _ => false,
+    }) {
+        return Err(ConformanceError::UnexpectedValue {
+            operation: "subject_filter",
+            field: "skipped_events",
+            expected: "no non-matching token".to_string(),
+            actual: format!("{skipped_after_filter:?}"),
+        });
+    }
+
+    drop(matching);
+    let mut reconnect =
+        connect_for_package_event_subscriptions(hub.endpoint()).map_err(|source| {
+            ConformanceError::Client {
+                operation: "reconnect_events",
+                source,
+            }
+        })?;
+    let resubscribed = reconnect
+        .subscribe_events(
+            "sub-event-reconnect",
+            EVENT_CONFORMANCE_PRODUCER,
+            EVENT_CONFORMANCE_NAME,
+            Vec::new(),
+        )
+        .map_err(|source| ConformanceError::Client {
+            operation: "resubscribe_events",
+            source,
+        })?;
+    expect_kind(
+        &resubscribed,
+        DaemonResponseKind::EventSubscribed,
+        "resubscribe_events",
+    )?;
+    let _ = reconnect
+        .request(&DaemonRequest::Status)
+        .map_err(|source| ConformanceError::Client {
+            operation: "status_after_reconnect",
+            source,
+        })?;
+    if !reconnect.take_skipped_events().is_empty() {
+        return Err(ConformanceError::UnexpectedValue {
+            operation: "reconnect_replay",
+            field: "skipped_events",
+            expected: "empty".to_string(),
+            actual: "replayed events".to_string(),
+        });
+    }
+
+    emit_event_ready(hub.endpoint(), "after-reconnect", None, None, None)?;
+    wait_for_event_token(&mut reconnect, "after-reconnect")?;
+    let unsubscribed = reconnect
+        .unsubscribe_events("sub-event-reconnect")
+        .map_err(|source| ConformanceError::Client {
+            operation: "unsubscribe_events",
+            source,
+        })?;
+    expect_kind(
+        &unsubscribed,
+        DaemonResponseKind::EventUnsubscribed,
+        "unsubscribe_events",
+    )?;
+    let status_after = reconnect
+        .request(&DaemonRequest::Status)
+        .map_err(|source| ConformanceError::Client {
+            operation: "status_after_unsubscribe",
+            source,
+        })?;
+    expect_kind(
+        &status_after,
+        DaemonResponseKind::Status,
+        "status_after_unsubscribe",
+    )?;
+
+    let mut event_gap = false;
+    if let Some(stall_path) = stall_path {
+        let mut gap_client =
+            connect_for_package_event_subscriptions(hub.endpoint()).map_err(|source| {
+                ConformanceError::Client {
+                    operation: "gap_connect",
+                    source,
+                }
+            })?;
+        let gap_sub = gap_client
+            .subscribe_events(
+                "sub-event-gap",
+                EVENT_CONFORMANCE_PRODUCER,
+                EVENT_CONFORMANCE_NAME,
+                Vec::new(),
+            )
+            .map_err(|source| ConformanceError::Client {
+                operation: "gap_subscribe",
+                source,
+            })?;
+        expect_kind(
+            &gap_sub,
+            DaemonResponseKind::EventSubscribed,
+            "gap_subscribe",
+        )?;
+        fs::write(stall_path, b"stall").map_err(|source| ConformanceError::Io {
+            operation: "create_event_stall",
+            source,
+        })?;
+        emit_event_ready(hub.endpoint(), "queued", None, None, None)?;
+        emit_event_ready(hub.endpoint(), "overflow", None, None, None)?;
+        let status_stalled = gap_client
+            .request(&DaemonRequest::Status)
+            .map_err(|source| ConformanceError::Client {
+                operation: "status_during_stall",
+                source,
+            })?;
+        expect_kind(
+            &status_stalled,
+            DaemonResponseKind::Status,
+            "status_during_stall",
+        )?;
+        let _ = fs::remove_file(stall_path);
+        gap_client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .map_err(|source| ConformanceError::Client {
+                operation: "gap_timeout",
+                source,
+            })?;
+        match gap_client.next_event() {
+            Ok(DaemonEvent::EventGap { .. }) => event_gap = true,
+            Ok(other) => {
+                return Err(ConformanceError::UnexpectedValue {
+                    operation: "event_gap",
+                    field: "next_event",
+                    expected: "EventGap".to_string(),
+                    actual: format!("{other:?}"),
+                });
+            }
+            Err(source) => {
+                return Err(ConformanceError::Client {
+                    operation: "event_gap",
+                    source,
+                });
+            }
+        }
+        let status_after_gap = gap_client
+            .request(&DaemonRequest::Status)
+            .map_err(|source| ConformanceError::Client {
+                operation: "status_after_gap",
+                source,
+            })?;
+        expect_kind(
+            &status_after_gap,
+            DaemonResponseKind::Status,
+            "status_after_gap",
+        )?;
+    }
+
+    Ok(ClientEventConformanceReport {
+        negotiated_package_event_subscriptions: negotiated,
+        exact_subscribe: true,
+        event_received: true,
+        subject_filter_dropped_non_matching: true,
+        reconnect_without_replay: true,
+        unsubscribed: true,
+        control_progressed_during_events: true,
+        event_gap,
+    })
+}
+
+fn materialize_event_producer(
+    hub: &IsolatedHub,
+    producer_path: &Path,
+) -> Result<PathBuf, ConformanceError> {
+    let dest = hub
+        .data_dir()
+        .join("packages")
+        .join("event-plane-producer-conformance");
+    copy_dir_recursive(producer_path, &dest).map_err(|source| ConformanceError::Io {
+        operation: "copy_event_producer",
+        source,
+    })?;
+    let manifest_path = dest.join("botster-package.json");
+    let mut value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest_path).map_err(|source| {
+            ConformanceError::Io {
+                operation: "read_event_producer_manifest",
+                source,
+            }
+        })?)
+        .map_err(ConformanceError::Json)?;
+    value["source"]["path"] = serde_json::json!(dest.display().to_string());
+    fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&value).map_err(ConformanceError::Json)?,
+    )
+    .map_err(|source| ConformanceError::Io {
+        operation: "write_event_producer_manifest",
+        source,
+    })?;
+    Ok(dest)
+}
+
+fn copy_dir_recursive(from: &Path, to: &Path) -> Result<(), std::io::Error> {
+    fs::create_dir_all(to)?;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let dest = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive(&entry.path(), &dest)?;
+        } else {
+            fs::copy(entry.path(), dest)?;
+        }
+    }
+    Ok(())
+}
+
+fn emit_event_ready(
+    endpoint: &DaemonEndpoint,
+    token: &str,
+    subject: Option<&str>,
+    notice: Option<&str>,
+    pad: Option<&str>,
+) -> Result<(), ConformanceError> {
+    let mut arguments = serde_json::json!({ "token": token });
+    if let Some(subject) = subject {
+        arguments["subject"] = serde_json::Value::String(subject.to_string());
+    }
+    if let Some(notice) = notice {
+        arguments["notice"] = serde_json::Value::String(notice.to_string());
+    }
+    if let Some(pad) = pad {
+        arguments["pad"] = serde_json::Value::String(pad.to_string());
+    }
+    let emitted = request(
+        endpoint,
+        DaemonRequest::PluginMcpCallTool {
+            name: "event_plane.emit_ready".to_string(),
+            arguments,
+        },
+        "emit_ready",
+    )?;
+    expect_kind(
+        &emitted,
+        DaemonResponseKind::PluginMcpToolResult,
+        "emit_ready",
+    )?;
+    let status = emitted
+        .plugin_tool_result
+        .get("status")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    if status != "accepted" {
+        return Err(ConformanceError::UnexpectedValue {
+            operation: "emit_ready",
+            field: "status",
+            expected: "accepted".to_string(),
+            actual: status.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn wait_for_event_token(
+    connection: &mut DaemonConnection,
+    token: &str,
+) -> Result<serde_json::Value, ConformanceError> {
+    let started = Instant::now();
+    let deadline = Duration::from_secs(10);
+    loop {
+        for event in connection.take_skipped_events() {
+            if let DaemonEvent::PackageEvent { payload, .. } = event
+                && payload["token"] == token
+            {
+                return Ok(payload);
+            }
+        }
+        if started.elapsed() >= deadline {
+            return Err(ConformanceError::MissingOutput {
+                needle: "package event token",
+                output: token.to_string(),
+            });
+        }
+        let remaining = deadline.saturating_sub(started.elapsed());
+        let _ = connection
+            .request(&DaemonRequest::Status)
+            .map_err(|source| ConformanceError::Client {
+                operation: "status_flush_events",
+                source,
+            })?;
+        for event in connection.take_skipped_events() {
+            if let DaemonEvent::PackageEvent { payload, .. } = event
+                && payload["token"] == token
+            {
+                return Ok(payload);
+            }
+        }
+        connection
+            .set_read_timeout(Some(remaining.min(Duration::from_millis(50))))
+            .map_err(|source| ConformanceError::Client {
+                operation: "event_read_timeout",
+                source,
+            })?;
+        match connection.next_event() {
+            Ok(DaemonEvent::PackageEvent { payload, .. }) if payload["token"] == token => {
+                return Ok(payload);
+            }
+            Ok(DaemonEvent::PackageEvent { .. }) | Ok(DaemonEvent::EventGap { .. }) => continue,
+            Ok(other) => {
+                return Err(ConformanceError::UnexpectedValue {
+                    operation: "wait_event",
+                    field: "event",
+                    expected: "PackageEvent".to_string(),
+                    actual: format!("{other:?}"),
+                });
+            }
+            Err(DaemonTransportError::Io(error))
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(source) => {
+                return Err(ConformanceError::Client {
+                    operation: "wait_event",
+                    source,
+                });
+            }
+        }
+    }
 }
 
 /// Run the public Project Pipelines surface/action validation subflow.
