@@ -116,7 +116,7 @@ The dependency's absence is a routing mechanism, not a scope decision. Section 6
 | --- | --- |
 | Target repository | `botster-hub` (`trybotster/botster-hub`) |
 | Target id | `tgt_7e208a0c76a44980a83b63af976b1f22` |
-| Spawn-target name | `botster-hub`, path `/Users/jasonconigliari/Projects/botster-hub` |
+| Spawn-target name | `botster-hub` (authoritative spawn-target path; path-neutral) |
 | Run worktree | `project-pipelines/ticket_1786663585_879846` at `b3b54f1f87e29867da4eb371e9b7f3b18160996a` |
 | Base | `origin/main` = `b3b54f1f87e29867da4eb371e9b7f3b18160996a` after `git fetch origin --prune`; `git rev-list --count origin/main..HEAD` = 0 |
 | Core pin | `7eafa470a18025895995bbedc20d34b58106a03b` |

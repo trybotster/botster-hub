@@ -2,7 +2,7 @@
   "campaign": "event-plane-saturation",
   "ticket_id": "ticket_1786663585_879846",
   "run_id": "run_1787262311_549251",
-  "result": "implement_landed_calibration_pending",
+  "result": "review_findings_addressed_calibration_pending",
   "target_id": "tgt_7e208a0c76a44980a83b63af976b1f22",
   "target_repository": "botster-hub",
   "executed_revisions": {
@@ -45,10 +45,12 @@
   },
   "always_on_proof": {
     "event_plane_saturation_source_guards_hold": "pass",
+    "event_plane_saturation_percentile_and_budget_formulas": "pass",
+    "event_plane_saturation_shed_busy_is_non_blocking": "pass",
     "event_plane_saturation_isolated_client_event_conformance": "pass",
-    "isolated_hub_package_event_plane": "pass",
+    "event_plane_saturation_campaign": "ignored",
     "clippy_deny_warnings": "pass",
-    "workspace_test_sh_locked": "pass"
+    "loaded_daemon_lifecycle_selftest_timeout": "pass"
   },
   "assumptions": [
     "Coexistence regression budgets are not North Star transport service levels.",
@@ -57,6 +59,7 @@
   ],
   "residual_risk": [
     "Calibration thresholds are unpublished.",
-    "The ignored 300-session campaign has not run on the reference runner."
+    "The ignored 300-session campaign has not run on the reference runner.",
+    "WebRTC fail-closed blast radius remains the production hang-close child oracle."
   ]
 }
