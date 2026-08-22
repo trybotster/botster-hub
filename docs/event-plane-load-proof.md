@@ -104,11 +104,27 @@ tuning opportunity.
 Reuse `clean`, `product_failure`, `host_exhaustion`, `environment_tainted`, and
 `survivors_present` from `docs/lifecycle-suite-harness.md`.
 
-`host_exhaustion` is selected when the decoupled control arm cannot meet the
-published operation and terminal budgets, when a monotonic scheduler-lag probe
-exceeds `MAX_READY_OPERATION_WAIT_MS`, or when FD/PTY probes confirm resource
-exhaustion. Load average does not select the verdict. If the decoupled arm is
-valid and the enabled arm breaches a budget, the verdict is `product_failure`.
+The disabled/decoupled arm is host-valid only when all eleven immutable
+pre-calibration gates pass: N=300 at steady state, the 600-second window,
+≥200 post-warm-up samples per operation, zero operation failures, terminal
+oracles (exact bytes and ordering, continuous sequence, zero I/O failure,
+zero unexpected gap, no peer loss), `max_owner_turn_us` ≤ 25,000 µs,
+`max_ready_operation_wait_us` ≤ 50,000 µs, monotonic scheduler-lag maximum
+≤ 50,000 µs across the full disabled-arm interval, applicable queue age
+≤ 1,000,000 µs, no confirmed FD or PTY exhaustion, and no environment taint
+or survivors.
+
+`host_exhaustion` is selected only from scheduler-lag maximum or confirmed
+FD/PTY evidence. Owner-turn, ready-wait, queue-age, sample, and terminal
+failures without that evidence are `product_failure`. Gate 11 selects
+`environment_tainted` or `survivors_present`. Load average, runnable count,
+CPU steal (`linux_proc_stat_steal_ticks`), and raw lag are diagnostics and
+never select the verdict. Calibration records operation latency and
+throughput without gating those numeric values until a valid calibration
+exists; it does not invent pre-calibration `ABS*` or `THRMIN`. If the
+disabled arm is valid and the enabled arm fails, the verdict is
+`product_failure`. Every classification path persists
+`event-plane-host-validity.json` with all eleven gate results before exit.
 
 ## How to run
 

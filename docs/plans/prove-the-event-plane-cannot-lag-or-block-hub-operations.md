@@ -7,18 +7,43 @@ Pipeline: `botster_stack_delivery` (direct merge, no PR)
 Project: `project_1786663508_823105` Botster Non-Blocking Event Plane, Stage D
 Vault checklist: `checklist_1787266824_449406` (ticket scope, one Plan visit)
 
+## Plan revision 10
+
+Revision 10 records Review `review_1787439371_225335` plus human answer
+`question_1787439231_161941` (restated as `question_1787439421_445099`).
+Replace “published operation and terminal budgets” as the disabled-arm
+validity rule with eleven immutable pre-calibration gates. Do not invent
+pre-calibration `ABS*` or `THRMIN`. Do not derive a disabled-arm latency
+threshold from the same calibration run.
+
+Disabled-arm host validity requires all of: N=300 at steady state; the full
+600-second window; ≥200 post-warm-up samples per operation; zero operation
+failures; terminal behavioural oracles; `max_owner_turn_us` ≤ 25,000 µs;
+`max_ready_operation_wait_us` ≤ 50,000 µs; monotonic scheduler-lag maximum
+≤ 50,000 µs measured by a watchdog across the disabled-arm interval;
+applicable queue age ≤ 1,000,000 µs; no confirmed FD or PTY exhaustion; no
+environment taint or survivors.
+
+Host-exhaustion evidence is scheduler-lag maximum and confirmed FD/PTY.
+Owner-turn, ready-wait, queue-age, sample, and terminal failures without
+that evidence are `product_failure`. Gate 11 is `environment_tainted` or
+`survivors_present`. Load average never selects the verdict. Every
+host-validity classification, including pre-measurement and early exits,
+persists a bounded artifact with lag, load averages, runnable count, total
+threads, CPU steal with units, FD/PTY, every gate result, and the final
+class.
+
 ## Plan revision 9
 
 Revision 9 records the Verify-return amendment from `question_1787428441_900918` / `question_1787437854_708832`. Residual-tail calibration dispatches `32591282234` and `32591872269` at `ef77621`, and `32594580606` at `8ee0d7a`, are **inconclusive `host_exhaustion` observations**, not product pass/fail. Captured counters from `32594580606` (`max_owner_turn_us` 219723, `max_ready_operation_wait_us` 1845228) must not be cited as product results.
 
 The published reference for this campaign is now `stress_profile=none` on the same GitHub-hosted `ubuntu-24.04` four-CPU runner. `N=300`, 300 quiet PTYs, the noisy 4 KiB / 100 ms producer, four drivers, 150 events per second, and enabled-versus-disabled comparisons stay fixed. Residual-tail remains the default for other loaded-lifecycle tickets.
 
-The campaign classifies host validity from:
-
-- a disabled/decoupled arm that cannot meet the published operation and terminal budgets, and
-- a monotonic scheduler-lag probe that proves the runner cannot schedule campaign work within those budgets.
-
-Load average, runnable-task count, CPU steal, and raw scheduler lag are diagnostics only. If the disabled arm is valid and the enabled arm fails, the verdict is a product defect. File-descriptor and PTY probes remain additional evidence.
+The campaign classifies host validity from the eleven immutable
+pre-calibration gates in revision 10. A 25 ms busy-spin is not the
+disabled-arm scheduler-lag measurement; the watchdog records the monotonic
+maximum across the full disabled-arm interval and is stopped and joined on
+teardown.
 
 The ShedBusy fault lane asserts the typed `EventPlaneStatus::ShedBusy` result. It does not use a wall-clock bound.
 
@@ -983,7 +1008,7 @@ The runner stops at the first red repetition. Preserve that artifact before any 
 | Item | Value |
 | --- | --- |
 | Gate | `botster_stack_plan_gate` |
-| Plan artifact | `docs/plans/prove-the-event-plane-cannot-lag-or-block-hub-operations.md`, revision 8 |
+| Plan artifact | `docs/plans/prove-the-event-plane-cannot-lag-or-block-hub-operations.md`, revision 10 |
 | Vault checklist | `checklist_1787266824_449406` |
 | Plan Reviews answered | `review_1787268374_271226` (6), `review_1787270029_776949` (4), `review_1787271188_552110` (3), `review_1787271799_830342` (1), `review_1787278015_433684` (1 blocker, superseding approval `review_1787272071_523159`), and `review_1787278903_443047` (3) |
 | Human answers folded in | `question_1787267931_572353` (routing exception), `question_1787268530_910910` (budget nature and derivation), and the library-boundary decision recorded in `review_1787278015_433684` |
