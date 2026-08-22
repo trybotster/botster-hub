@@ -1419,6 +1419,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("max_ready_operation_wait_us", "number"),
             ("stalled_write_timeouts", "number"),
             ("queue_ages?", "DaemonQueueAgeObservation[]"),
+            ("global_in_flight_bytes?", "number"),
         ],
     );
     emit_interface(
@@ -1441,6 +1442,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("state", "DaemonQueueAgeState"),
             ("oldest_age_us?", "number"),
             ("queue_count?", "number"),
+            ("queue_bytes?", "number"),
         ],
     );
     emit_permissive_string_union(

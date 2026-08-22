@@ -125,7 +125,9 @@ pass "event-plane-saturation validate-only requires an explicit phase"
 
 acceptance_dir="$SELFTEST_DIR/event-plane-acceptance-phase"
 mkdir -p "$acceptance_dir"
-BOTSTER_EVENT_PLANE_PHASE=acceptance "$RUNNER" \
+BOTSTER_EVENT_PLANE_PHASE=acceptance \
+  BOTSTER_EVENT_PLANE_CALIBRATION_COMMIT=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  "$RUNNER" \
   --validate-only \
   --artifact-dir "$acceptance_dir" \
   --subject-sha 0123456789abcdef0123456789abcdef01234567 \
@@ -135,7 +137,22 @@ BOTSTER_EVENT_PLANE_PHASE=acceptance "$RUNNER" \
   || fail "event-plane-saturation acceptance validate-only failed"
 grep -q '^event_plane_phase=acceptance$' "$acceptance_dir/metadata.txt" \
   || fail "event-plane-saturation must record acceptance phase"
+grep -q '^event_plane_calibration_commit=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa$' "$acceptance_dir/metadata.txt" \
+  || fail "acceptance must record the selected calibration commit"
 pass "event-plane-saturation acceptance phase is a validated workflow input"
+
+missing_commit_dir="$SELFTEST_DIR/event-plane-missing-calibration-commit"
+mkdir -p "$missing_commit_dir"
+if BOTSTER_EVENT_PLANE_PHASE=acceptance env -u BOTSTER_EVENT_PLANE_CALIBRATION_COMMIT "$RUNNER" \
+  --validate-only \
+  --artifact-dir "$missing_commit_dir" \
+  --subject-sha 0123456789abcdef0123456789abcdef01234567 \
+  --test-target event-plane-saturation \
+  --repetitions 1 \
+  --stress-profile residual-tail; then
+  fail "acceptance validate-only must fail without BOTSTER_EVENT_PLANE_CALIBRATION_COMMIT"
+fi
+pass "acceptance validate-only requires the calibration dataset commit"
 
 command -v python3 >/dev/null 2>&1 \
   || fail "missing required self-test command: python3"

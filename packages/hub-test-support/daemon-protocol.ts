@@ -941,6 +941,7 @@ export interface DaemonObservabilityCounters {
   max_ready_operation_wait_us: number;
   stalled_write_timeouts: number;
   queue_ages?: DaemonQueueAgeObservation[];
+  global_in_flight_bytes?: number;
 }
 
 export interface DaemonLatencyHistogram {
@@ -957,6 +958,7 @@ export interface DaemonQueueAgeObservation {
   state: DaemonQueueAgeState;
   oldest_age_us?: number;
   queue_count?: number;
+  queue_bytes?: number;
 }
 
 export type DaemonQueueKind =

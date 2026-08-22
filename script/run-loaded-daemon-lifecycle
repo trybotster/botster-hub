@@ -89,6 +89,12 @@ validate_inputs() {
         invalid=1
         ;;
     esac
+    if [[ "$EVENT_PLANE_PHASE" == acceptance ]]; then
+      if [[ ! "${BOTSTER_EVENT_PLANE_CALIBRATION_COMMIT:-}" =~ ^[0-9a-f]{40}$ ]]; then
+        log "acceptance requires BOTSTER_EVENT_PLANE_CALIBRATION_COMMIT as a lowercase 40-character SHA"
+        invalid=1
+      fi
+    fi
   fi
 
   resolve_run_timeout
@@ -102,6 +108,9 @@ validate_inputs() {
     printf 'run_timeout_max=%s\n' "$RUN_TIMEOUT_MAX"
     if [[ "$TEST_TARGET" == event-plane-saturation ]]; then
       printf 'event_plane_phase=%s\n' "$EVENT_PLANE_PHASE"
+      if [[ -n "${BOTSTER_EVENT_PLANE_CALIBRATION_COMMIT:-}" ]]; then
+        printf 'event_plane_calibration_commit=%s\n' "$BOTSTER_EVENT_PLANE_CALIBRATION_COMMIT"
+      fi
     fi
   } >> "$ARTIFACT_DIR/metadata.txt"
 

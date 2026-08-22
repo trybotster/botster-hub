@@ -2570,6 +2570,9 @@ pub struct DaemonObservabilityCounters {
     pub stalled_write_timeouts: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queue_ages: Vec<DaemonQueueAgeObservation>,
+    /// Occupied envelope bytes across all producer queues. Saturation-safe.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub global_in_flight_bytes: u64,
 }
 
 impl DaemonObservabilityCounters {
@@ -2577,6 +2580,10 @@ impl DaemonObservabilityCounters {
     pub fn is_empty(&self) -> bool {
         self == &Self::default()
     }
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 /// Fixed-bucket latency histogram. Bucket index is `leading_zeros` of microseconds.
@@ -2626,6 +2633,9 @@ pub struct DaemonQueueAgeObservation {
     /// Queue count from the same validated bracket. Absent on indeterminate rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_count: Option<u64>,
+    /// Occupied bytes from the same validated bracket. Absent on indeterminate rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_bytes: Option<u64>,
 }
 
 impl DaemonQueueAgeObservation {
@@ -2645,6 +2655,7 @@ impl DaemonQueueAgeObservation {
             state,
             oldest_age_us,
             queue_count,
+            queue_bytes: None,
         }
     }
 }
@@ -4957,6 +4968,8 @@ mod tests {
         assert!(generated.contains("oldest_age_us?: number;"));
         assert!(generated.contains("producer_generation?: number;"));
         assert!(generated.contains("queue_count?: number;"));
+        assert!(generated.contains("queue_bytes?: number;"));
+        assert!(generated.contains("global_in_flight_bytes?: number;"));
         assert!(generated.contains("export type DaemonQueueKind ="));
         assert!(generated.contains("export type DaemonQueueAgeState ="));
         assert!(generated.contains("| (string & {});"));
