@@ -7,6 +7,28 @@ Pipeline: `botster_stack_delivery` (direct merge, no PR)
 Project: `project_1786663508_823105` Botster Non-Blocking Event Plane, Stage D
 Vault checklist: `checklist_1787266824_449406` (ticket scope, one Plan visit)
 
+## Plan revision 11
+
+Revision 11 records Review `review_1787440703_182294`. Gate 4 records every
+post-warm-up attempt at start and still records the completion if it finishes
+after the window. Late successful completions keep Gate 4 passing when
+attempts equal successes. An incomplete cycle, attempts≠successes, timeout,
+disconnect, incomplete response, or worker error fails Gate 4. Gate 2 uses
+only `window_completed` and does not treat worker errors as the window proxy.
+
+Gate 5 stores structured terminal oracles: exact bytes and ordering,
+continuous sequence, zero I/O failure, zero unexpected terminal gap, and no
+peer loss. PackageEvent or EventGap on Unix/WebRTC event subscriptions remain
+valid event-plane observations, not Gate 5 failures. Each oracle has a
+negative test.
+
+The scheduler-lag budget is **at most** 50,000 µs: 50,000 passes and only
+values strictly greater fail. An arm panic or early failure keeps partial
+`ArmRun` evidence, stops workers and the watchdog, classifies available
+gates, persists `event-plane-host-validity.json`, and fails with that class.
+Gates 1–5 are `fail` rather than `not_evaluated` when the arm started and
+then aborted.
+
 ## Plan revision 10
 
 Revision 10 records Review `review_1787439371_225335` plus human answer
@@ -427,7 +449,7 @@ Every value below is fixed by this reviewed plan. Neither calibration nor accept
 | --- | --- |
 | Latency sample | wall time from request submission to response receipt, measured by the driver |
 | Percentile method | nearest-rank on the ascending sample vector, no interpolation. For `n` samples, `p` is the sample at 1-based index `ceil(p * n)` |
-| Throughput numerator | completed operations of that kind that both started and finished inside the measurement window |
+| Throughput numerator | post-warm-up successes, including completions that finish after the window closes |
 | Throughput denominator | the fixed 600-second window, in seconds |
 | Throughput unit | completed operations per second |
 | Literal `R` | **1.25** |
@@ -446,7 +468,7 @@ Revision 4 said a failed cycle contributes no latency sample and stopped there. 
 
 Revision 5 closes it:
 
-1. **Record every attempt.** For each of the nine operations, both arms, both phases, record attempts, successes, and failures, and report all three counts per operation. Counts are part of the campaign evidence, not a debug aid.
+1. **Record every attempt at start.** For each of the nine operations plus terminal input/output, both arms, both phases, record the attempt when the operation starts after warm-up, then record the completion even if it finishes after the window. Report attempts, successes, failures, and incomplete cycles per operation. Counts are part of the campaign evidence, not a debug aid. A late successful completion is a counted attempt and a success.
 2. **The measurement arms expect zero failures.** Calibration and acceptance run **no fault injection** — the eleven faults are separate lanes in section 12.5. The expected outcome of every attempted operation in a measurement arm is therefore success.
 3. **Any other outcome is an immediate `product_failure`**, in calibration and in acceptance alike: an unexpected operation error, a request timeout, a client disconnect, an incomplete or truncated response, or a cycle that does not complete every step. The run stops; it is not downgraded to a lower score.
 4. **Percentiles use successful samples only**, as before. That is now safe because a single failure has already failed the campaign, so no failure can silently shift a percentile by leaving the population.
