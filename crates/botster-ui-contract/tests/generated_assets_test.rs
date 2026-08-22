@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use botster_ui_contract::{
-    EntityOptionsFrame, PackageNavigationEntry, PackageSurfaceDescriptor, PackageSurfaceKind,
+    EntityOptionsFrame, PackageNavigationEntry, PackageNoticeReactionDeclaration,
+    PackageNoticeReactionDescriptor, PackageSurfaceDescriptor, PackageSurfaceKind,
     PackageSurfaceOperation, UiActionKind, UiActionRequest, UiActionResult, UiActionResultState,
     UiBindIf, UiCapabilityFallback, UiColorToken, UiDensity, UiDialogPresentation, UiFieldKind,
     UiHeightClass, UiIframePermission, UiIframeSandboxToken, UiMetricTrendDirection, UiNode,
@@ -9,7 +10,7 @@ use botster_ui_contract::{
     UiToolbarOverflow, UiVariant, UiWidthClass, apply_entity_options_frame,
     collect_entity_option_families, conformance_fixtures_json, entity_family_subscription_id,
     json_schema, project_entity_options_from_store, realize_bind_list_descendant_id,
-    typescript_declarations,
+    resolve_notice_text, typescript_declarations, validate_package_notice_reactions,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -64,6 +65,35 @@ fn generated_fixtures_deserialize_and_validate_through_rust_authority() {
             .expect("package navigation");
     botster_ui_contract::validate_package_presentation(&surfaces, &navigation)
         .expect("package presentation fixture validates");
+
+    for vector in conformance["notice_reaction_validation_vectors"]
+        .as_array()
+        .expect("notice validation vectors")
+    {
+        let declarations: Vec<PackageNoticeReactionDeclaration> =
+            serde_json::from_value(vector["declarations"].clone())
+                .expect("notice declarations deserialize");
+        let _ = validate_package_notice_reactions(&declarations);
+    }
+    for vector in conformance["notice_text_resolution_vectors"]
+        .as_array()
+        .expect("notice resolution vectors")
+    {
+        let _ = resolve_notice_text(
+            &vector["payload"],
+            vector["pointer"].as_str().expect("pointer"),
+        );
+    }
+    let descriptor: PackageNoticeReactionDescriptor = serde_json::from_value(json!({
+        "owner": "event-plane-producer",
+        "name": "sample.ready",
+        "subject_scope": "session",
+        "text_pointer": "/notice",
+        "ttl_ms": 5000,
+        "severity": "info"
+    }))
+    .expect("descriptor deserializes");
+    assert_eq!(descriptor.owner, "event-plane-producer");
 
     let dialog: UiBindIf =
         serde_json::from_value(fixtures["dialog_presence"].clone()).expect("dialog binding");
@@ -206,6 +236,21 @@ fn generated_schema_validates_required_binding_instances() {
 #[test]
 fn typescript_and_schema_encode_wire_names_and_optionality() {
     let typescript = typescript_declarations();
+    assert!(typescript.contains("export type PackageNoticeSubjectScope = \"session\";"));
+    assert!(
+        typescript
+            .contains("export type PackageNoticeSeverity = \"info\" | \"warning\" | \"error\";")
+    );
+    assert!(typescript.contains(
+        "export interface PackageNoticeReactionDescriptor { owner: string; name: string; subject_scope: PackageNoticeSubjectScope; text_pointer: string; ttl_ms: number; severity: PackageNoticeSeverity; }"
+    ));
+    assert!(
+        typescript
+            .contains("owner?: string; name: string; subject_scope: PackageNoticeSubjectScope")
+    );
+    assert!(typescript.contains(
+        "export declare function resolveNoticeText(payload: JsonValue, pointer: string): string;"
+    ));
     assert!(
         typescript
             .contains("export type UiAuthoredNodeId = UiNodeId | UiBind | UiBindListDescendantId;")
@@ -226,6 +271,91 @@ fn typescript_and_schema_encode_wire_names_and_optionality() {
     assert!(typescript.contains("src: UiBindableString; title: UiBindableString"));
     assert!(typescript.contains("name: UiNonBindableValue; label: UiNonBindableValue"));
     assert!(typescript.contains("value: UiNonBindableValue; label: UiNonBindableValue"));
+    let schema = json_schema();
+    assert_eq!(
+        schema["$defs"]["PackageNoticeSubjectScope"]["enum"],
+        json!(["session"])
+    );
+    assert_eq!(
+        schema["$defs"]["PackageNoticeSeverity"]["enum"],
+        json!(["info", "warning", "error"])
+    );
+    assert!(
+        schema["$defs"]["PackageNoticeReactionDescriptor"]["required"]
+            .as_array()
+            .expect("required")
+            .iter()
+            .any(|value| value == "owner")
+    );
+    assert!(
+        !schema.to_string().contains("contentEncoding")
+            && !schema["$defs"]["PackageNoticeReactionDeclaration"]["properties"]["text_pointer"]
+                .as_object()
+                .expect("pointer schema")
+                .contains_key("maxLength"),
+        "JSON Schema must not encode the 512-byte notice bound"
+    );
+    assert_eq!(
+        schema["$defs"]["PackageNoticeTextPointer"]["pattern"],
+        json!("^/([^/~]|~0|~1)+$")
+    );
+    let notice_validator =
+        jsonschema::validator_for(&schema).expect("compile generated JSON Schema");
+    let owner_bearing_descriptor = json!({
+        "owner": "event-plane-producer",
+        "name": "sample.ready",
+        "subject_scope": "session",
+        "text_pointer": "/notice",
+        "ttl_ms": 5000,
+        "severity": "info"
+    });
+    assert!(
+        notice_validator.is_valid(&owner_bearing_descriptor),
+        "canonical schema must accept a projected owner-bearing descriptor"
+    );
+    let authored_without_owner = json!({
+        "name": "sample.ready",
+        "subject_scope": "session",
+        "text_pointer": "/a~1b",
+        "ttl_ms": 1000,
+        "severity": "warning"
+    });
+    assert!(
+        notice_validator.is_valid(&authored_without_owner),
+        "canonical schema must accept an authored declaration without owner"
+    );
+    for pointer in ["/", "/notice~", "/notice~2", "/a/b", "notice"] {
+        let mut invalid = owner_bearing_descriptor.clone();
+        invalid["text_pointer"] = json!(pointer);
+        assert!(
+            !notice_validator.is_valid(&invalid),
+            "canonical schema must reject malformed pointer {pointer}"
+        );
+    }
+    let declaration_schema = json!({
+        "$schema": schema["$schema"],
+        "$ref": "#/$defs/PackageNoticeReactionDeclaration",
+        "$defs": schema["$defs"],
+    });
+    let declaration_validator =
+        jsonschema::validator_for(&declaration_schema).expect("compile declaration definition");
+    assert!(
+        declaration_validator.is_valid(&authored_without_owner),
+        "declaration schema must accept omitted owner"
+    );
+    assert!(
+        declaration_validator.is_valid(&owner_bearing_descriptor),
+        "declaration schema must accept an exact owner"
+    );
+    for owner in [json!(""), json!(" "), json!(1)] {
+        let mut malformed = authored_without_owner.clone();
+        malformed["owner"] = owner.clone();
+        assert!(
+            !declaration_validator.is_valid(&malformed),
+            "declaration schema must reject malformed owner {owner}"
+        );
+    }
+
     let request_fields = interface_fields(&typescript, "UiActionRequest");
     let result_fields = interface_fields(&typescript, "UiActionResult");
     assert_eq!(

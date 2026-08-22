@@ -132,10 +132,10 @@ function assertDialogFormComposition(source) {
 }
 
 assert.equal(metadata.package_name, "@trybotster/hub-test-support");
-assert.equal(metadata.package_version, "0.1.39");
+assert.equal(metadata.package_version, "0.1.41");
 assert.equal(metadata.protocol, "botster-hub-daemon-v1");
 assert.equal(metadata.protocol_version, 7);
-assert.equal(metadata.conformance_fixture_revision, 44);
+assert.equal(metadata.conformance_fixture_revision, 46);
 
 // Package README ships in the npm tarball; keep install pin sites tied to package.json.
 {
@@ -148,7 +148,7 @@ assert.equal(metadata.conformance_fixture_revision, 44);
   assert.match(
     readme,
     new RegExp(
-      String.raw`npm install --save-dev @trybotster/ui-contract@0\.3\.2 @trybotster/hub-test-support@${version.replaceAll(".", String.raw`\.`)}`,
+      String.raw`npm install --save-dev @trybotster/ui-contract@0\.3\.3 @trybotster/hub-test-support@${version.replaceAll(".", String.raw`\.`)}`,
     ),
     "README install command must pin the package.json version",
   );
@@ -178,7 +178,7 @@ assert.equal(metadata.conformance_fixture_revision, 44);
 assert.deepEqual(metadata.ui_contract, {
   conformance_fixture_export: "@trybotster/ui-contract/conformance-fixtures",
   package_name: "@trybotster/ui-contract",
-  package_version: "0.3.2",
+  package_version: "0.3.3",
 });
 assert.deepEqual(metadata.application_primitives, {
   fixture_package_name: "botster.plugin-contract-matrix",
@@ -207,6 +207,11 @@ assert.deepEqual(metadata.application_primitives, {
 const protocol = readDaemonProtocolTypescript();
 assert.equal(protocol, readFileSync(daemonProtocolTypescriptPath(), "utf8"));
 assert.match(protocol, /export type DaemonRequest/);
+assert.match(protocol, /notice_reactions\?: PackageNoticeReactionDescriptor\[\]/);
+assert.match(
+  protocol,
+  /import type \{ PackageNoticeReactionDescriptor, PackageSurfaceDescriptor/,
+);
 assert.match(protocol, /export type DaemonSessionTypeExecution/);
 assert.match(protocol, /mode: "relative_executable"/);
 assert.match(protocol, /mode: "shell_command"/);
@@ -372,7 +377,7 @@ assert.deepEqual(
 );
 assert.equal(supportMatrix.session_type_authoring.admission_group, "allow_runtime");
 
-assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 44);
+assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 46);
 assert.equal(sessionLifecycleFixture.entity_type, "session");
 assert.deepEqual(
   sessionLifecycleFixture.normalized_frames.map((frame) => frame.type),
@@ -387,7 +392,7 @@ assert.match(
   /node_modules[\\/]@trybotster[\\/]ui-contract[\\/]/,
 );
 const uiContractFixtures = await readUiContractConformanceFixtures();
-assert.equal(uiContractFixtures.contract_version, "0.3.2");
+assert.equal(uiContractFixtures.contract_version, "0.3.3");
 assert.equal(
   uiContractFixtures.fixtures.dialog_presence.predicate.key,
   "create-ticket-dialog",
@@ -410,7 +415,7 @@ assert.equal(
 assert.equal(sessionLifecycleFixture.overflow.snapshot_precedes_later_deltas, true);
 assert.equal(sessionLifecycleFixture.overflow.failed_snapshot_delivery_closes_subscription, true);
 
-assert.equal(sessionPluginBindingFixture.conformance_fixture_revision, 44);
+assert.equal(sessionPluginBindingFixture.conformance_fixture_revision, 46);
 assert.equal(sessionPluginBindingFixture.binding_family, "/session");
 const sessionPluginMaterialization = materializeSessionPluginBindingScenario(
   sessionPluginBindingFixture,
@@ -727,7 +732,7 @@ assert.equal(
   lateAttachFixture.no_history_then_live.filter((event) => event.type === "snapshot").length,
   2,
 );
-assert.equal(lateAttachFixture.conformance_fixture_revision, 44);
+assert.equal(lateAttachFixture.conformance_fixture_revision, 46);
 
 const verification = verifyPackageAssets();
 assert.deepEqual(verification, { ok: true, failures: [] });
@@ -740,6 +745,14 @@ try {
   assert.match(
     readFileSync(join(fixturePath, "botster-package.json"), "utf8"),
     /botster\.plugin-contract-matrix/,
+  );
+  assert.match(
+    readFileSync(join(fixturePath, "botster-package.json"), "utf8"),
+    /"notices"/,
+  );
+  assert.match(
+    readFileSync(join(fixturePath, "botster-package.json"), "utf8"),
+    /"subject_scope": "session"/,
   );
   const fixtureSource = readFileSync(join(fixturePath, "plugin.lua"), "utf8");
   assert.match(fixtureSource, /contract\.app/);

@@ -31,7 +31,7 @@
       "row": "botster-ui-descendant-v1:1:x"
     }
   ],
-  "contract_version": "0.3.2",
+  "contract_version": "0.3.3",
   "entity_options_reactive_timeline": {
     "collector_from_sample_node": [
       "project-pipelines.run",
@@ -1214,5 +1214,285 @@
         "value": "workspace-alpha"
       }
     }
-  }
+  },
+  "notice_reaction_validation_vectors": [
+    {
+      "declarations": [
+        {
+          "name": "sample.ready",
+          "severity": "info",
+          "subject_scope": "session",
+          "text_pointer": "/notice",
+          "ttl_ms": 5000
+        }
+      ],
+      "id": "valid",
+      "ok": true
+    },
+    {
+      "declarations": [
+        {
+          "name": "sample.ready",
+          "severity": "info",
+          "subject_scope": "session",
+          "text_pointer": "/a~1b",
+          "ttl_ms": 5000
+        }
+      ],
+      "id": "escaped_slash_pointer",
+      "ok": true
+    },
+    {
+      "declarations": [
+        {
+          "name": "sample.ready",
+          "severity": "info",
+          "subject_scope": "session",
+          "text_pointer": "/a~0b",
+          "ttl_ms": 5000
+        }
+      ],
+      "id": "escaped_tilde_pointer",
+      "ok": true
+    },
+    {
+      "declarations": [
+        {
+          "name": "",
+          "severity": "info",
+          "subject_scope": "session",
+          "text_pointer": "/notice",
+          "ttl_ms": 5000
+        }
+      ],
+      "error": "invalid_name",
+      "id": "empty_name",
+      "ok": false
+    },
+    {
+      "declarations": [
+        {
+          "name": "sample.*",
+          "severity": "info",
+          "subject_scope": "session",
+          "text_pointer": "/notice",
+          "ttl_ms": 5000
+        }
+      ],
+      "error": "invalid_name",
+      "id": "wildcard_name",
+      "ok": false
+    },
+    {
+      "declarations": [
+        {
+          "name": "sample.ready",
+          "owner": "event-*",
+          "severity": "info",
+          "subject_scope": "session",
+          "text_pointer": "/notice",
+          "ttl_ms": 5000
+        }
+      ],
+      "error": "invalid_owner",
+      "id": "wildcard_owner",
+      "ok": false
+    },
+    {
+      "declarations": [
+        {
+          "name": "sample.ready",
+          "severity": "info",
+          "subject_scope": "session",
+          "text_pointer": "notice",
+          "ttl_ms": 5000
+        }
+      ],
+      "error": "missing_leading_slash",
+      "id": "pointer_missing_slash",
+      "ok": false
+    },
+    {
+      "declarations": [
+        {
+          "name": "sample.ready",
+          "severity": "info",
+          "subject_scope": "session",
+          "text_pointer": "/a/b",
+          "ttl_ms": 5000
+        }
+      ],
+      "error": "multi_segment",
+      "id": "pointer_two_segment",
+      "ok": false
+    },
+    {
+      "declarations": [
+        {
+          "name": "sample.ready",
+          "severity": "info",
+          "subject_scope": "session",
+          "text_pointer": "/notice~",
+          "ttl_ms": 5000
+        }
+      ],
+      "error": "trailing_tilde",
+      "id": "pointer_trailing_tilde",
+      "ok": false
+    },
+    {
+      "declarations": [
+        {
+          "name": "sample.ready",
+          "severity": "info",
+          "subject_scope": "session",
+          "text_pointer": "/notice~2",
+          "ttl_ms": 5000
+        }
+      ],
+      "error": "unknown_escape",
+      "id": "pointer_unknown_escape",
+      "ok": false
+    },
+    {
+      "declarations": [
+        {
+          "name": "sample.ready",
+          "severity": "info",
+          "subject_scope": "session",
+          "text_pointer": "/notice",
+          "ttl_ms": 999
+        }
+      ],
+      "error": "ttl_out_of_range",
+      "id": "ttl_below",
+      "ok": false
+    },
+    {
+      "declarations": [
+        {
+          "name": "sample.ready",
+          "severity": "info",
+          "subject_scope": "session",
+          "text_pointer": "/notice",
+          "ttl_ms": 60001
+        }
+      ],
+      "error": "ttl_out_of_range",
+      "id": "ttl_above",
+      "ok": false
+    },
+    {
+      "declarations": [
+        {
+          "name": "sample.ready",
+          "severity": "info",
+          "subject_scope": "session",
+          "text_pointer": "/notice",
+          "ttl_ms": 5000
+        },
+        {
+          "name": "sample.ready",
+          "severity": "info",
+          "subject_scope": "session",
+          "text_pointer": "/notice",
+          "ttl_ms": 5000
+        }
+      ],
+      "error": "duplicate_reaction",
+      "id": "duplicate_name",
+      "ok": false
+    }
+  ],
+  "notice_text_max_bytes": 512,
+  "notice_text_resolution_vectors": [
+    {
+      "id": "notice",
+      "payload": {
+        "notice": "ready"
+      },
+      "pointer": "/notice",
+      "text": "ready"
+    },
+    {
+      "id": "escaped_slash",
+      "payload": {
+        "a/b": "slash-key"
+      },
+      "pointer": "/a~1b",
+      "text": "slash-key"
+    },
+    {
+      "id": "escaped_tilde",
+      "payload": {
+        "a~b": "tilde-key"
+      },
+      "pointer": "/a~0b",
+      "text": "tilde-key"
+    },
+    {
+      "error": "missing",
+      "id": "missing",
+      "payload": {},
+      "pointer": "/notice"
+    },
+    {
+      "error": "not_string",
+      "id": "not_string",
+      "payload": {
+        "notice": 1
+      },
+      "pointer": "/notice"
+    },
+    {
+      "error": "empty",
+      "id": "empty",
+      "payload": {
+        "notice": ""
+      },
+      "pointer": "/notice"
+    },
+    {
+      "id": "ascii_512",
+      "payload": {
+        "notice": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "pointer": "/notice",
+      "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "bytes": 513,
+      "error": "oversized",
+      "id": "ascii_513",
+      "payload": {
+        "notice": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "pointer": "/notice"
+    },
+    {
+      "id": "utf8_512",
+      "payload": {
+        "notice": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+      },
+      "pointer": "/notice",
+      "text": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+    },
+    {
+      "bytes": 513,
+      "error": "oversized",
+      "id": "utf8_513",
+      "payload": {
+        "notice": "ééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééa"
+      },
+      "pointer": "/notice"
+    },
+    {
+      "id": "space",
+      "payload": {
+        "notice": " "
+      },
+      "pointer": "/notice",
+      "text": " "
+    }
+  ]
 }

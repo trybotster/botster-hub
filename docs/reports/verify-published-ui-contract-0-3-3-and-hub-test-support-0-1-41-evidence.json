@@ -1,0 +1,77 @@
+{
+  "ticket_id": "ticket_1787351279_697528",
+  "run_id": "run_1787351732_490500",
+  "target_id": "tgt_7e208a0c76a44980a83b63af976b1f22",
+  "target_repository": "trybotster/botster-hub",
+  "posture": "post-publication verification",
+  "publish_commands_run": false,
+  "source_commit_packed": "e950f4f0d5d1d7953eb5d9f378330ea044b0be1c",
+  "origin_main_at_verification": "08298d9d2e631e962b00e2578e1840783dc18010",
+  "shipped_file_diff_e950f4f_to_origin_main": [
+    "packages/hub-test-support/test.mjs"
+  ],
+  "unpublished_by_design": "@trybotster/hub-test-support@0.1.40",
+  "published_coordinates": [
+    "@trybotster/ui-contract@0.3.3",
+    "@trybotster/hub-test-support@0.1.41"
+  ],
+  "registry_versions_ui_contract_tail": [
+    "0.1.0",
+    "0.1.1",
+    "0.2.0",
+    "0.3.1",
+    "0.3.2",
+    "0.3.3"
+  ],
+  "registry_versions_hub_test_support_tail": [
+    "0.1.31",
+    "0.1.32",
+    "0.1.33",
+    "0.1.35",
+    "0.1.36",
+    "0.1.38",
+    "0.1.39",
+    "0.1.41"
+  ],
+  "hub_test_support_0_1_40": {
+    "status": "404",
+    "npm_code": "E404"
+  },
+  "integrity_match": {
+    "@trybotster/ui-contract@0.3.3": {
+      "registry": "sha512-+c34Bd5pnELt/HYaKEK5nI1oF1GeRgTejOCIAeAcSF8FCg2wkmJsIac5DLBGgOlWebfyLPQYAmtNAQWbe73eEw==",
+      "local_pack_from_e950f4f": "sha512-+c34Bd5pnELt/HYaKEK5nI1oF1GeRgTejOCIAeAcSF8FCg2wkmJsIac5DLBGgOlWebfyLPQYAmtNAQWbe73eEw==",
+      "equal": true
+    },
+    "@trybotster/hub-test-support@0.1.41": {
+      "registry": "sha512-LXH9DscSoDvNytbkmhUsiwGXwcAYb93d6/hu2L/PViuQ5Xg8UelWFS8TVItl/KwRGZt90Qyy868Xb7C0zEuC5w==",
+      "local_pack_from_e950f4f": "sha512-LXH9DscSoDvNytbkmhUsiwGXwcAYb93d6/hu2L/PViuQ5Xg8UelWFS8TVItl/KwRGZt90Qyy868Xb7C0zEuC5w==",
+      "equal": true,
+      "entry_count": 16,
+      "includes_test_mjs": false
+    }
+  },
+  "clean_install_proof": {
+    "method": "empty directory, npm init -y, npm install of registry coordinates, no workspace link and no file: dependency",
+    "direct_install_versions": {
+      "@trybotster/ui-contract": "0.3.3",
+      "@trybotster/hub-test-support": "0.1.41"
+    },
+    "transitive_ui_contract_resolution": "0.3.3 from the registry",
+    "script_result": "clean consumer smoke passed, exit 0",
+    "assertions_executed": [
+      "resolveNoticeText is a function",
+      "NOTICE_TEXT_MAX_BYTES equals 512",
+      "installed index.d.ts declares PackageNoticeReactionDescriptor and PackageNoticeReactionDeclaration",
+      "metadata.package_version equals 0.1.41",
+      "metadata.ui_contract.package_version equals 0.3.3",
+      "metadata.protocol_version equals 7",
+      "metadata.conformance_fixture_revision equals 46",
+      "verifyPackageAssets() passes",
+      "readDaemonProtocolTypescript() matches notice_reactions?: PackageNoticeReactionDescriptor[] and export interface DaemonPackage",
+      "sha256 of the installed daemon-protocol.ts equals metadata.daemon_protocol.sha256 and equals 14121c4b1aa15f0728040b7ab3cc0189bf7720dc3159d994926d54e0251c5996",
+      "materializePluginContractMatrixFixture returns a directory containing botster-package.json and plugin.lua",
+      "LICENSE exists inside each installed package root"
+    ]
+  }
+}

@@ -106,6 +106,9 @@ pub struct HubRuntime {
     last_capability_cleanup: Option<PluginCleanupResult>,
     session_contexts: SharedSessionContexts,
     package_event_router: Arc<crate::package_event_router::PackageEventRouter>,
+    event_plane_counters: Arc<crate::event_plane_counters::EventPlaneCounters>,
+    test_seams: HubTestSeams,
+    drop_journal_wakes_remaining: std::sync::atomic::AtomicU32,
     causal_scopes: Arc<crate::package_event_router::CausalScopeTable>,
     unfinished_finishes: Mutex<VecDeque<CausalOp>>,
     unfinished_overflow: Mutex<VecDeque<CausalOp>>,
@@ -270,12 +273,14 @@ impl HubRuntime {
     #[must_use]
     pub fn new(config: HubConfig) -> Self {
         let state = HubState::from_config(&config);
-        let core_config = core_daemon_config(&config);
+        let test_seams = hub_test_seams();
+        let core_config = core_daemon_config(&config, &test_seams);
         let plugin_worker_config = config.plugin_worker_config();
         let core_daemon = Mutex::new(CoreDaemon::new(core_config));
         let package_event_router = Arc::new(crate::package_event_router::PackageEventRouter::new(
             config.package_event_plane,
         ));
+        let event_plane_counters = Arc::clone(package_event_router.counters());
         Self {
             capability_runtime: Arc::new(Mutex::new(HubCapabilityRuntime::from_config(&config))),
             spawn_targets: Arc::new(Mutex::new(state.spawn_targets.clone())),
@@ -295,6 +300,11 @@ impl HubRuntime {
             last_capability_cleanup: None,
             session_contexts: Arc::new(Mutex::new(BTreeMap::new())),
             package_event_router,
+            event_plane_counters,
+            drop_journal_wakes_remaining: std::sync::atomic::AtomicU32::new(
+                test_seams.drop_journal_wakes.unwrap_or(0),
+            ),
+            test_seams,
             causal_scopes: Arc::new(crate::package_event_router::CausalScopeTable::new()),
             unfinished_finishes: Mutex::new(VecDeque::new()),
             unfinished_overflow: Mutex::new(VecDeque::new()),
@@ -369,12 +379,14 @@ impl HubRuntime {
     }
 
     fn from_validated_state(config: HubConfig, state: HubState) -> HubRuntimeResult<Self> {
-        let core_config = core_daemon_config(&config);
+        let test_seams = hub_test_seams();
+        let core_config = core_daemon_config(&config, &test_seams);
         let plugin_worker_config = config.plugin_worker_config();
         let core_daemon = Mutex::new(CoreDaemon::new(core_config));
         let package_event_router = Arc::new(crate::package_event_router::PackageEventRouter::new(
             config.package_event_plane,
         ));
+        let event_plane_counters = Arc::clone(package_event_router.counters());
         let mut runtime = Self {
             capability_runtime: Arc::new(Mutex::new(HubCapabilityRuntime::from_config(&config))),
             spawn_targets: Arc::new(Mutex::new(state.spawn_targets.clone())),
@@ -394,6 +406,11 @@ impl HubRuntime {
             last_capability_cleanup: None,
             session_contexts: Arc::new(Mutex::new(BTreeMap::new())),
             package_event_router,
+            event_plane_counters,
+            drop_journal_wakes_remaining: std::sync::atomic::AtomicU32::new(
+                test_seams.drop_journal_wakes.unwrap_or(0),
+            ),
+            test_seams,
             causal_scopes: Arc::new(crate::package_event_router::CausalScopeTable::new()),
             unfinished_finishes: Mutex::new(VecDeque::new()),
             unfinished_overflow: Mutex::new(VecDeque::new()),
@@ -514,12 +531,33 @@ impl HubRuntime {
             worktrees: self.worktrees.clone(),
             package_event_router: self.package_event_router.clone(),
             causal_scopes: self.causal_scopes.clone(),
+            event_handler_hold_ms: self.test_seams.event_handler_hold_ms,
         }
     }
 
     #[must_use]
     pub fn package_event_router(&self) -> &Arc<crate::package_event_router::PackageEventRouter> {
         &self.package_event_router
+    }
+
+    #[must_use]
+    pub fn event_plane_counters(&self) -> &Arc<crate::event_plane_counters::EventPlaneCounters> {
+        &self.event_plane_counters
+    }
+
+    #[must_use]
+    pub fn event_plane_counters_snapshot(&self) -> botster_hub_client::DaemonObservabilityCounters {
+        self.event_plane_counters.snapshot()
+    }
+
+    #[must_use]
+    pub fn test_seams(&self) -> &HubTestSeams {
+        &self.test_seams
+    }
+
+    #[cfg(test)]
+    pub fn test_set_seams(&mut self, seams: HubTestSeams) {
+        self.test_seams = seams;
     }
 
     #[must_use]
@@ -3182,10 +3220,22 @@ impl HubRuntime {
     /// Take the coalesced Core journal-advanced wake bit.
     #[must_use]
     pub fn take_journal_advanced_wake(&self) -> bool {
-        self.core_daemon
+        let woke = self
+            .core_daemon
             .lock()
             .expect("core daemon mutex")
-            .take_journal_advanced_wake()
+            .take_journal_advanced_wake();
+        if woke
+            && self
+                .drop_journal_wakes_remaining
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0
+        {
+            self.drop_journal_wakes_remaining
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            return false;
+        }
+        woke
     }
 
     /// Admit ready package-event deliveries and wait for completions.
@@ -4609,7 +4659,88 @@ pub fn with_test_lifecycle_journal_capacity<R>(capacity: usize, f: impl FnOnce()
     })
 }
 
-fn core_daemon_config(config: &HubConfig) -> CoreDaemonConfig {
+#[derive(Debug, Clone, Default)]
+pub struct HubTestSeams {
+    pub drop_journal_wakes: Option<u32>,
+    pub lifecycle_journal_capacity: Option<usize>,
+    pub event_invocation_timeout_ms: Option<u64>,
+    pub event_handler_hold_ms: Option<u64>,
+}
+
+fn hub_test_seams() -> HubTestSeams {
+    let env = std::env::var("BOTSTER_ENV").ok();
+    HubTestSeams {
+        drop_journal_wakes: drop_journal_wakes_from(
+            env.as_deref(),
+            std::env::var("BOTSTER_HUB_TEST_DROP_JOURNAL_WAKES")
+                .ok()
+                .as_deref(),
+        ),
+        lifecycle_journal_capacity: lifecycle_journal_capacity_from(
+            env.as_deref(),
+            std::env::var("BOTSTER_HUB_TEST_LIFECYCLE_JOURNAL_CAPACITY")
+                .ok()
+                .as_deref(),
+        ),
+        event_invocation_timeout_ms: event_invocation_timeout_ms_from(
+            env.as_deref(),
+            std::env::var("BOTSTER_HUB_TEST_EVENT_INVOCATION_TIMEOUT_MS")
+                .ok()
+                .as_deref(),
+        ),
+        event_handler_hold_ms: event_handler_hold_ms_from(
+            env.as_deref(),
+            std::env::var("BOTSTER_HUB_TEST_EVENT_HANDLER_HOLD_MS")
+                .ok()
+                .as_deref(),
+        ),
+    }
+}
+
+#[must_use]
+pub fn drop_journal_wakes_from(botster_env: Option<&str>, raw: Option<&str>) -> Option<u32> {
+    if botster_env != Some("test") {
+        return None;
+    }
+    raw.and_then(|value| value.parse().ok())
+        .filter(|count| *count > 0)
+        .map(|count: u32| count.min(64))
+}
+
+#[must_use]
+pub fn lifecycle_journal_capacity_from(
+    botster_env: Option<&str>,
+    raw: Option<&str>,
+) -> Option<usize> {
+    if botster_env != Some("test") {
+        return None;
+    }
+    raw.and_then(|value| value.parse().ok())
+        .filter(|cap| *cap > 0)
+}
+
+#[must_use]
+pub fn event_invocation_timeout_ms_from(
+    botster_env: Option<&str>,
+    raw: Option<&str>,
+) -> Option<u64> {
+    if botster_env != Some("test") {
+        return None;
+    }
+    raw.and_then(|value| value.parse().ok())
+        .map(|ms: u64| ms.clamp(1, 10_000))
+}
+
+#[must_use]
+pub fn event_handler_hold_ms_from(botster_env: Option<&str>, raw: Option<&str>) -> Option<u64> {
+    if botster_env != Some("test") {
+        return None;
+    }
+    raw.and_then(|value| value.parse().ok())
+        .map(|ms: u64| ms.min(5_000))
+}
+
+fn core_daemon_config(config: &HubConfig, test_seams: &HubTestSeams) -> CoreDaemonConfig {
     // Host profile supplies the initial/reset Ghostty color baseline. After
     // attach, current colors come from data-plane GHOSTSNP only.
     let mut core = CoreDaemonConfig::new(&config.data_directory)
@@ -4632,6 +4763,9 @@ fn core_daemon_config(config: &HubConfig) -> CoreDaemonConfig {
     }
     if std::env::var("BOTSTER_HUB_TEST_FAIL_SNAPSHOT_HISTORY_AFTER_READY").as_deref() == Ok("1") {
         core = core.with_test_fail_snapshot_history_after_ready(true);
+    }
+    if let Some(capacity) = test_seams.lifecycle_journal_capacity {
+        core = core.with_lifecycle_journal_capacity(capacity);
     }
     #[cfg(test)]
     if let Some(capacity) = TEST_LIFECYCLE_JOURNAL_CAPACITY.with(std::cell::Cell::get) {
@@ -5353,7 +5487,7 @@ mod tests {
         .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))
         .expect("runtime config should build");
 
-        let core_config = core_daemon_config(&config);
+        let core_config = core_daemon_config(&config, &HubTestSeams::default());
         assert!(
             core_config.worker_path.is_some(),
             "hub CoreDaemonConfig must use worker-backed sessions so in-process durability adoption is unreachable"
@@ -5587,5 +5721,43 @@ mod tests {
             command.args(args).status().expect("run git").success(),
             "git command failed: {args:?}"
         );
+    }
+
+    #[test]
+    fn hub_test_seams_require_test_mode() {
+        assert_eq!(drop_journal_wakes_from(Some("test"), Some("3")), Some(3));
+        assert_eq!(drop_journal_wakes_from(Some("production"), Some("3")), None);
+        assert_eq!(drop_journal_wakes_from(None, Some("3")), None);
+        assert_eq!(drop_journal_wakes_from(Some("test"), Some("100")), Some(64));
+
+        assert_eq!(
+            lifecycle_journal_capacity_from(Some("test"), Some("8")),
+            Some(8)
+        );
+        assert_eq!(
+            lifecycle_journal_capacity_from(Some("production"), Some("8")),
+            None
+        );
+        assert_eq!(lifecycle_journal_capacity_from(None, Some("8")), None);
+
+        assert_eq!(
+            event_invocation_timeout_ms_from(Some("test"), Some("50")),
+            Some(50)
+        );
+        assert_eq!(
+            event_invocation_timeout_ms_from(Some("production"), Some("50")),
+            None
+        );
+        assert_eq!(event_invocation_timeout_ms_from(None, Some("50")), None);
+
+        assert_eq!(
+            event_handler_hold_ms_from(Some("test"), Some("25")),
+            Some(25)
+        );
+        assert_eq!(
+            event_handler_hold_ms_from(Some("production"), Some("25")),
+            None
+        );
+        assert_eq!(event_handler_hold_ms_from(None, Some("25")), None);
     }
 }

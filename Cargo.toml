@@ -16,6 +16,9 @@ description = "Botster first-party host profile over botster-core"
 repository = "https://github.com/trybotster/botster-hub"
 license-file = "LICENSE"
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
+
 [dependencies]
 botster-hub-client = { path = "crates/botster-hub-client" }
 botster-hub-installation = { path = "crates/botster-hub-installation" }
@@ -45,7 +48,10 @@ botster-terminal-ghostty = { git = "https://github.com/trybotster/botster-core.g
 botster-hub-test-support = { path = "crates/botster-hub-test-support" }
 portable-pty = "0.9.0"
 
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7.2"
+
 # Local development only. Git consumers of hub-client / hub-test-support do not
-# inherit this patch; they resolve tag botster-ui-contract-v0.3.2.
+# inherit this patch; they resolve tag botster-ui-contract-v0.3.3.
 [patch."https://github.com/trybotster/botster-hub.git"]
 botster-ui-contract = { path = "crates/botster-ui-contract" }

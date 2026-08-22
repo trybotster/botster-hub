@@ -3098,6 +3098,7 @@ fn reload_replaces_lua_tool_descriptors_and_removes_stale_handlers() {
             worktrees: hub.worktrees(),
             package_event_router: hub.package_event_router().clone(),
             causal_scopes: hub.causal_scopes().clone(),
+            event_handler_hold_ms: None,
         },
         registry.packages().into_iter().cloned().collect(),
     )
