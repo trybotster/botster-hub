@@ -2,9 +2,23 @@
 
 Ticket: `ticket_1787351279_697528`
 Run: `run_1787351732_490500`
-Step: `botster_stack_implement` / `run_step_1787361034_162894`
-Plan: revision 4, `docs/plans/verify-published-ui-contract-0-3-3-and-hub-test-support-0-1-41.md`
+Step: `botster_stack_implement` / `run_step_1787362110_315500`
+Plan: revision 5, `docs/plans/verify-published-ui-contract-0-3-3-and-hub-test-support-0-1-41.md`
+Prior Implement commit: `affb85b`
+Review return: `review_1787362097_377433` (`changes_required`)
 `teardown_class_applies`: no
+
+## Review-return corrections
+
+`review_1787362097_377433` approved the product proof and returned two artifact
+findings. This pass changes only committed pipeline documents.
+
+| Finding | Fix |
+|---|---|
+| `finding_1787362097_868213` | Four wiki-links in the plan spanned a newline. Each wiki-link now sits on one line. A resolver then checked every committed wiki-link title against the matching vault note filename. Zero remaining multiline titles. Zero missing files. |
+| `finding_1787362097_665686` | The plan said "No repository file changes." Plan revision 5 now says "No package or product source files change. This run adds only the plan and verification artifacts." and lists the three paths. |
+
+No package source, version, metadata, or publish command changed.
 
 ## Target repository and target_id
 
@@ -50,9 +64,11 @@ Targeted atomic notes:
 - [[pipeline artifacts should use path neutral worktree references]]
 - [[botster review and verify must scan all committed artifacts for pii]]
 - [[implementation reports separate merge cleanup from feature behavior]]
+- [[implementation deviations must resync committed plan acceptance checks]]
 - [[plan steps need reviewable plan artifacts]]
 - [[zero diff already delivered pipeline runs need terminal disposition]]
 - [[test script required for rust tests not cargo test]]
+- [[verify must recheck resolved findings against the live worktree]]
 
 Not loaded, with reasons:
 
@@ -94,9 +110,9 @@ I fast-forwarded the ticket branch to `origin/main` at `08298d9` so this run doe
 
 Pipeline handoff only:
 
-- `docs/plans/verify-published-ui-contract-0-3-3-and-hub-test-support-0-1-41.md` — approved Plan revision 4. Plan left this file untracked. This commit makes the plan reviewable in git.
-- `docs/reports/verify-published-ui-contract-0-3-3-and-hub-test-support-0-1-41-implement.md` — this report
-- `docs/reports/verify-published-ui-contract-0-3-3-and-hub-test-support-0-1-41-evidence.json` — registry, integrity, and smoke evidence
+- `docs/plans/verify-published-ui-contract-0-3-3-and-hub-test-support-0-1-41.md` — Plan revision 5. Unwrapped four wiki-links. Replaced the false "No repository file changes" sentence. Listed the three committed artifact paths.
+- `docs/reports/verify-published-ui-contract-0-3-3-and-hub-test-support-0-1-41-implement.md` — this report, including the Review-return corrections
+- `docs/reports/verify-published-ui-contract-0-3-3-and-hub-test-support-0-1-41-evidence.json` — registry, integrity, and smoke evidence; product bytes unchanged
 
 Not changed: package source, `package.json` versions, `metadata.json`, generated protocol, Rust, or publish scripts.
 
@@ -121,7 +137,9 @@ Not changed: package source, `package.json` versions, `metadata.json`, generated
 
 None in product scope.
 
-Git hygiene only: the ticket branch fast-forwarded from `12e0cc6` to `origin/main` `08298d9` so the verification documents land on current main rather than on the pre-publish `0.1.40` tree.
+Git hygiene from the first Implement pass: the ticket branch fast-forwarded from `12e0cc6` to `origin/main` `08298d9` so the verification documents land on current main rather than on the pre-publish `0.1.40` tree.
+
+Review-return plan resync: Plan revision 5 now names the three committed artifact paths. That matches `origin/main...HEAD`. This follows [[implementation deviations must resync committed plan acceptance checks]].
 
 No publish command ran. No source, version, or metadata edit ran.
 
@@ -157,7 +175,7 @@ That transitive resolution is the production path this ticket exists to deliver.
 
 ### 4. Public package API
 
-The Plan revision 4 ESM script ran against the transitive registry install.
+The Plan revision 4 ESM script ran against the transitive registry install during the first Implement pass. Review independently confirmed that product proof. This Review-return pass did not rerun npm, because no package file changed.
 
 Result: `clean consumer smoke passed`, exit 0.
 
@@ -192,7 +210,9 @@ The script resolved each exported root entrypoint with `path.dirname(require_.re
 
 `./test.sh` was not run. No Rust or daemon path changed.
 
-Repository `npm test` for `packages/hub-test-support` was not run. That surface belongs to closed `ticket_1787353310_106098` and does not enter the published tarball.
+Repository `npm test` for `packages/hub-test-support` was not run in this Review-return pass. Review already reported both package tests green. This pass changes only pipeline documents.
+
+Wiki-link resolver: every wiki-link in the three committed artifacts was extracted with a multiline matcher. A title that contains a newline fails. Each remaining title must exist as a vault note file whose name equals that title. Result after the Plan revision 5 edits: zero newline-broken titles, zero missing files. The sentence "No repository file changes" is absent from the plan.
 
 ## Unverified behavior or residual risk
 
