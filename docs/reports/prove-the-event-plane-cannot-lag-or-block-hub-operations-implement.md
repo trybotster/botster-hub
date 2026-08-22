@@ -8,10 +8,10 @@
 | `target_id` | `tgt_7e208a0c76a44980a83b63af976b1f22` |
 | Ticket | `ticket_1786663585_879846` |
 | Run | `run_1787262311_549251` |
-| Step | `botster_stack_implement` (`run_step_1787422528_557286`) |
+| Step | `botster_stack_implement` (`run_step_1787423257_503379`) |
 | Merge policy | `direct` into `main`; no PR |
-| This implement commit | `8b971e46e0fcebcbd7e7c5a9fc25175cfea5b3c5` |
-| Returned from | `review_1787422514_495972` (`changes_required`, two findings) |
+| This implement commit | `bd280def27265df068f726832e59bf30a4752270` |
+| Returned from | `review_1787423243_916770` (`changes_required`, three findings) |
 | Locked Core | `7eafa470a18025895995bbedc20d34b58106a03b` |
 | `teardown_class_applies` | **yes** |
 
@@ -36,19 +36,21 @@ Independent routing: ticket and run `target_id` resolve to `botster-hub`.
 
 | Finding | Severity | Fix |
 | --- | --- | --- |
-| `finding_1787422514_600046` 4 KiB workload and unsafe clock | high | One long-lived Python process emits 4096-byte records (`N%08dT%020d` plus pad plus newline) using `time.monotonic_ns()`. The sampler reads the matching OS monotonic clock. The record-length parser test checks 4096 bytes. |
-| `finding_1787422514_577746` cursor expiry not deterministic | high | `BOTSTER_HUB_TEST_HOLD_JOURNAL_PULL` skips journal pull while the file exists. The lane writes the hold, spawns `cursor-changed`, wraps 20 rows past capacity 16, then removes the hold. Acceptance requires a new `lifecycle_resync_reads` increment and a running `cursor-changed`. |
+| `finding_1787423243_120556` dataset omits resync | high | `FaultReport` carries observability and lifecycle counters. Calibration and acceptance JSON now include `lifecycle.faults.lifecycle_baseline_reads` and `lifecycle_resync_reads`. A dataset-shape test fails when those fields are absent. |
+| `finding_1787423243_652235` env lookup in owner loop | medium | `hold_journal_pull` is parsed once into `HubTestSeams`. `HubRuntime::journal_pull_held` checks the stored path. Production stays on `None` with no environment read. |
+| `finding_1787423244_611055` duplicate libc | low | Removed the extra `[dev-dependencies]` `libc` entry. The campaign uses `botster_hub_test_support::monotonic_now_ns`. |
 
 ## Files changed
 
-- `src/runtime.rs` — `journal_pull_held` file seam, `BOTSTER_ENV=test` only.
-- `src/daemon_maintenance.rs` — skip journal pull while the hold file exists.
-- `tests/hub_daemon_lifecycle/event_plane_saturation.rs` — 4 KiB monotonic producer and held cursor-expiry lane.
-- `Cargo.toml` — `libc` dev-dependency for the monotonic clock in the campaign test.
+- `src/runtime.rs` — startup-parsed hold path on `HubTestSeams`.
+- `src/daemon_maintenance.rs` — uses `runtime.journal_pull_held()`.
+- `tests/hub_daemon_lifecycle/event_plane_saturation.rs` — fault lifecycle dataset fields.
+- `crates/botster-hub-test-support/src/lib.rs` — shared monotonic clock.
+- `Cargo.toml` — removed duplicate libc.
 
 ## Ownership
 
-Hub owns the test-only journal-pull hold and the campaign. Direct merge; no PR.
+Hub owns Status lifecycle counters, the test-only hold seam, and the campaign. Direct merge; no PR.
 
 ## Teardown lenses
 
@@ -56,20 +58,20 @@ Isolation, bounds, late-message matrix, production-path hard-stop, ownership ide
 
 ## Deviations
 
-None from the approved 4 KiB / 100 ms terminal workload. Calibration and acceptance still have not executed on ubuntu-24.04. Package 0.1.42 is unpublished.
+None. Calibration and acceptance still have not executed on ubuntu-24.04. Package 0.1.42 is unpublished.
 
 ## Tests
 
 - `cargo fmt --all`
 - `cargo clippy --workspace --all-targets --locked -- -D warnings` (exit 0)
-- `./test.sh --locked --test hub_daemon_lifecycle_test event_plane_saturation_` — 7 passed, 1 ignored
+- `./test.sh --locked --test hub_daemon_lifecycle_test event_plane_saturation_` — 8 passed, 1 ignored
 - `./test.sh --locked --lib hub_test_seams_require_test_mode` — passed
 
 The ignored N=300 campaign was not run on this Darwin worktree.
 
 ## Unverified
 
-N=300 ubuntu-24.04 residual-tail calibration and acceptance have not run. The ignored campaign contains the live 4 KiB producer and the held cursor-expiry lane.
+N=300 ubuntu-24.04 residual-tail calibration and acceptance have not run.
 
 ## Missing vault guidance
 
