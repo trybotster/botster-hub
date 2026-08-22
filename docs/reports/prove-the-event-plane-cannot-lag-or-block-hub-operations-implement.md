@@ -12,6 +12,7 @@
 | Merge policy | `direct` into `main`; no PR |
 | Returned from | Verify `review_1787428576_249460` plus human answer `question_1787437854_708832` restating `question_1787428441_900918` |
 | Locked Core | `7eafa470a18025895995bbedc20d34b58106a03b` |
+| Implement commit | `471123722ba4a5b4b0fb7391233d679b4b19e237` |
 | `teardown_class_applies` | **yes** |
 
 Independent routing: ticket and run `target_id` resolve to `botster-hub`. Work is in the ticket worktree. This visit replaces a prior Implement agent and does not rebuild the campaign.
