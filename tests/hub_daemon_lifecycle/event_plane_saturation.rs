@@ -180,16 +180,10 @@ fn event_plane_saturation_source_guards_hold() {
     let harness = fs::read_to_string(root.join("tests/hub_daemon_lifecycle/harness.rs"))
         .expect("harness");
     assert!(
-        harness.contains("os.posix_openpt"),
-        "PTY probe must call os.posix_openpt"
+        harness.contains("libc::posix_openpt"),
+        "PTY probe must call libc posix_openpt on the reference runner"
     );
-    let fixtures =
-        fs::read_to_string(root.join("tests/hub_daemon_lifecycle/webrtc_fixtures.rs"))
-            .expect("webrtc fixtures");
-    assert!(
-        fixtures.contains("inbound_overflow") && fixtures.contains("reassembly"),
-        "WebRTC fixture must persist reassembly and record inbound overflow"
-    );
+    assert!(!harness.contains("os.posix_openpt") && !harness.contains("os.openpt("));
 }
 
 #[test]
@@ -335,6 +329,24 @@ fn event_plane_saturation_dataset_records_fault_resync() {
         &botster_hub_client::DaemonObservabilityCounters::default(),
         &botster_hub_client::DaemonObservabilityCounters::default(),
         &faults,
+        Some(serde_json::json!({
+            "inbound_frames": {
+                "count": 0,
+                "bytes": 0,
+                "high_water_count": 2,
+                "high_water_bytes": 64,
+                "oldest_age_us": null,
+                "overflow": 0,
+                "max_count": WEBRTC_INBOUND_MAX_FRAMES,
+                "max_bytes": WEBRTC_INBOUND_MAX_BYTES
+            },
+            "pending_host_events": {
+                "count": 0,
+                "bytes": 0,
+                "overflow": 0,
+                "max_count": WEBRTC_PENDING_HOST_EVENTS_MAX
+            }
+        })),
         None,
     );
     assert_eq!(
@@ -348,6 +360,14 @@ fn event_plane_saturation_dataset_records_fault_resync() {
             .as_u64()
             .is_some(),
         "resync evidence must not be absent"
+    );
+    assert_eq!(
+        body["client_fixture_queues"]["webrtc"]["inbound_frames"]["max_count"],
+        WEBRTC_INBOUND_MAX_FRAMES as u64
+    );
+    assert_eq!(
+        body["client_fixture_queues"]["webrtc"]["inbound_frames"]["overflow"],
+        0
     );
 }
 
@@ -443,6 +463,7 @@ fn event_plane_saturation_campaign() {
         &enabled.observability,
         &decoupled.observability,
         &faults,
+        enabled.webrtc_queues.clone(),
         source_revision,
     );
 }
@@ -495,6 +516,7 @@ struct ArmReport {
     profile: ArmProfile,
     operations: BTreeMap<String, OperationStats>,
     observability: botster_hub_client::DaemonObservabilityCounters,
+    webrtc_queues: Option<serde_json::Value>,
 }
 
 struct FaultReport {
@@ -798,6 +820,7 @@ fn phase_dataset_body(
     enabled_obs: &botster_hub_client::DaemonObservabilityCounters,
     decoupled_obs: &botster_hub_client::DaemonObservabilityCounters,
     faults: &FaultReport,
+    webrtc_queues: Option<serde_json::Value>,
     source_revision: Option<String>,
 ) -> serde_json::Value {
     let mut operations = serde_json::Map::new();
@@ -844,6 +867,9 @@ fn phase_dataset_body(
         "lifecycle": {
             "faults": lifecycle_json(&faults.lifecycle)
         },
+        "client_fixture_queues": {
+            "webrtc": webrtc_queues
+        },
         "gated_against": match phase {
             CampaignPhase::Acceptance => Some(calibration_path().display().to_string()),
             CampaignPhase::Calibration => None,
@@ -861,6 +887,7 @@ fn write_phase_dataset(
     enabled_obs: &botster_hub_client::DaemonObservabilityCounters,
     decoupled_obs: &botster_hub_client::DaemonObservabilityCounters,
     faults: &FaultReport,
+    webrtc_queues: Option<serde_json::Value>,
     source_revision: Option<String>,
 ) {
     let body = phase_dataset_body(
@@ -871,6 +898,7 @@ fn write_phase_dataset(
         enabled_obs,
         decoupled_obs,
         faults,
+        webrtc_queues,
         source_revision,
     );
     let phase_name = match phase {
@@ -1006,6 +1034,21 @@ fn run_saturation_arm(arm: SaturationArm) -> ArmReport {
     if let Some(join) = emitter {
         join.join().expect("join emitter");
     }
+    let webrtc_queues = webrtc.as_ref().map(|(_, peer, _)| {
+        let snap = peer.fixture_queue_snapshot();
+        if snap["inbound_frames"]["overflow"].as_u64().unwrap_or(0) > 0
+            || snap["pending_host_events"]["overflow"].as_u64().unwrap_or(0) > 0
+        {
+            panic!("product_failure webrtc fixture overflow: {snap}");
+        }
+        if snap["inbound_frames"]["oldest_age_us"]
+            .as_u64()
+            .is_some_and(|age| age > EVENT_PLANE_QUEUE_AGE_US)
+        {
+            panic!("product_failure webrtc inbound oldest_age_us exceeds queue_age: {snap}");
+        }
+        snap
+    });
     if let Some((_, peer, key)) = webrtc {
         prove_webrtc_close_unix_survives(&endpoint, peer, &key);
     }
@@ -1019,6 +1062,7 @@ fn run_saturation_arm(arm: SaturationArm) -> ArmReport {
         },
         operations,
         observability,
+        webrtc_queues,
     }
 }
 
@@ -1186,11 +1230,17 @@ fn drain_webrtc_host_events(
     saw_event: &mut bool,
     saw_gap: &mut bool,
 ) {
-    if peer.inbound_overflow() > 0 {
-        panic!(
-            "product_failure webrtc inbound overflow={} — fixture must not drop subscribed frames",
-            peer.inbound_overflow()
-        );
+    let snap = peer.fixture_queue_snapshot();
+    if snap["inbound_frames"]["overflow"].as_u64().unwrap_or(0) > 0
+        || snap["pending_host_events"]["overflow"].as_u64().unwrap_or(0) > 0
+    {
+        panic!("product_failure webrtc fixture overflow: {snap}");
+    }
+    if snap["inbound_frames"]["oldest_age_us"]
+        .as_u64()
+        .is_some_and(|age| age > EVENT_PLANE_QUEUE_AGE_US)
+    {
+        panic!("product_failure webrtc inbound oldest_age_us exceeds queue_age: {snap}");
     }
     let slice_end = Instant::now() + Duration::from_millis(100);
     loop {

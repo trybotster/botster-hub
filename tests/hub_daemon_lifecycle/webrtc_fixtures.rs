@@ -49,11 +49,17 @@ use crate::support::{
     wait_for_cli_daemon_shutdown,
 };
 
+use botster_hub_test_support::monotonic_now_ns;
+
 use super::*;
 
 pub(crate) const LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE: &str =
     "local-webrtc-sender-terminal.json";
 pub(crate) const LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_MAX_BYTES: usize = 4096;
+/// Match shipped client mailbox event bound so this fixture cannot hide lag.
+pub(crate) const WEBRTC_INBOUND_MAX_FRAMES: usize = 128;
+pub(crate) const WEBRTC_INBOUND_MAX_BYTES: usize = 512 * 1024;
+pub(crate) const WEBRTC_PENDING_HOST_EVENTS_MAX: usize = 128;
 pub(crate) const TEST_CLOSE_LOCAL_WEBRTC_OPERATION_ENV: &str =
     "BOTSTER_HUB_TEST_CLOSE_LOCAL_WEBRTC_OPERATION";
 pub(crate) struct LocalWebrtcOffererHandler {
@@ -85,6 +91,146 @@ struct InboundReassembly {
     next_chunk_index: u32,
 }
 
+pub(crate) struct FixtureQueueSnapshot {
+    pub count: u64,
+    pub bytes: u64,
+    pub high_water_count: u64,
+    pub high_water_bytes: u64,
+    pub oldest_age_us: Option<u64>,
+    pub overflow: u64,
+    pub max_count: u64,
+    pub max_bytes: u64,
+}
+
+struct FixtureQueueOccupancy {
+    count: AtomicU64,
+    bytes: AtomicU64,
+    high_water_count: AtomicU64,
+    high_water_bytes: AtomicU64,
+    oldest_ns: AtomicU64,
+    overflow: AtomicU64,
+    max_count: u64,
+    max_bytes: u64,
+}
+
+impl FixtureQueueOccupancy {
+    fn new(max_count: usize, max_bytes: usize) -> Self {
+        Self {
+            count: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            high_water_count: AtomicU64::new(0),
+            high_water_bytes: AtomicU64::new(0),
+            oldest_ns: AtomicU64::new(0),
+            overflow: AtomicU64::new(0),
+            max_count: max_count as u64,
+            max_bytes: max_bytes as u64,
+        }
+    }
+
+    fn would_exceed(&self, add_bytes: u64) -> bool {
+        self.count.load(Ordering::Relaxed) + 1 > self.max_count
+            || self.bytes.load(Ordering::Relaxed) + add_bytes > self.max_bytes
+    }
+
+    fn record_push(&self, add_bytes: u64) {
+        let count = self.count.fetch_add(1, Ordering::Relaxed) + 1;
+        let bytes = self.bytes.fetch_add(add_bytes, Ordering::Relaxed) + add_bytes;
+        self.high_water_count.fetch_max(count, Ordering::Relaxed);
+        self.high_water_bytes.fetch_max(bytes, Ordering::Relaxed);
+        let _ = self.oldest_ns.compare_exchange(
+            0,
+            monotonic_now_ns(),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+
+    fn record_pop(&self, sub_bytes: u64) {
+        let count = self.count.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
+        self.bytes.fetch_sub(
+            sub_bytes.min(self.bytes.load(Ordering::Relaxed)),
+            Ordering::Relaxed,
+        );
+        if count == 0 {
+            self.oldest_ns.store(0, Ordering::Relaxed);
+        }
+    }
+
+    fn record_overflow(&self) {
+        self.overflow.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> FixtureQueueSnapshot {
+        let oldest_ns = self.oldest_ns.load(Ordering::Relaxed);
+        let oldest_age_us = if oldest_ns == 0 {
+            None
+        } else {
+            Some(monotonic_now_ns().saturating_sub(oldest_ns) / 1_000)
+        };
+        FixtureQueueSnapshot {
+            count: self.count.load(Ordering::Relaxed),
+            bytes: self.bytes.load(Ordering::Relaxed),
+            high_water_count: self.high_water_count.load(Ordering::Relaxed),
+            high_water_bytes: self.high_water_bytes.load(Ordering::Relaxed),
+            oldest_age_us,
+            overflow: self.overflow.load(Ordering::Relaxed),
+            max_count: self.max_count,
+            max_bytes: self.max_bytes,
+        }
+    }
+}
+
+fn apply_inbound_chunk(
+    assembly: &mut Option<InboundReassembly>,
+    response: &str,
+) -> Result<Option<InboundReassembly>, Box<dyn std::error::Error>> {
+    assert!(
+        response.len() < botster_hub_client::LOCAL_WEBRTC_MAX_FRAME_BYTES,
+        "response frame exceeded 64 KiB"
+    );
+    let chunk =
+        serde_json::from_str::<botster_hub_client::DaemonLocalWebrtcDeliveryChunk>(response)?;
+    assert_eq!(
+        chunk.version,
+        botster_hub_client::LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION
+    );
+    let complete = chunk.chunk_index + 1 == chunk.chunk_count;
+    {
+        let row = assembly.get_or_insert_with(|| InboundReassembly {
+            encrypted: String::new(),
+            delivery_kind: None,
+            message_id: None,
+            expected_chunk_count: None,
+            maximum_frame_bytes: 0,
+            next_chunk_index: 0,
+        });
+        row.maximum_frame_bytes = row.maximum_frame_bytes.max(response.len());
+        if let Some(delivery_kind) = row.delivery_kind {
+            assert_eq!(delivery_kind, chunk.delivery_kind);
+        } else {
+            row.delivery_kind = Some(chunk.delivery_kind);
+        }
+        assert_eq!(chunk.chunk_index, row.next_chunk_index);
+        if let Some(message_id) = &row.message_id {
+            assert_eq!(message_id, &chunk.message_id);
+        } else {
+            row.message_id = Some(chunk.message_id.clone());
+            row.expected_chunk_count = Some(chunk.chunk_count);
+        }
+        assert_eq!(row.expected_chunk_count, Some(chunk.chunk_count));
+        row.encrypted.push_str(&chunk.payload);
+        row.next_chunk_index += 1;
+        if complete {
+            assert_eq!(row.encrypted.len(), chunk.total_bytes as usize);
+        }
+    }
+    if complete {
+        Ok(assembly.take())
+    } else {
+        Ok(None)
+    }
+}
+
 pub(crate) struct LocalWebrtcOfferPeer {
     pub(crate) peer: Box<dyn PeerConnection>,
     pub(crate) data_channel: Arc<dyn DataChannel>,
@@ -94,8 +240,13 @@ pub(crate) struct LocalWebrtcOfferPeer {
     pub(crate) pending_entity_frames: VecDeque<botster_hub_client::DaemonEntityFrame>,
     pub(crate) pending_terminal_frames: VecDeque<(String, Vec<u8>)>,
     pub(crate) pending_host_events: VecDeque<botster_hub_client::DaemonEvent>,
+    pending_event_sizes: VecDeque<u64>,
     pub(crate) accept_host_events: bool,
-    inbound_overflow: Arc<AtomicU64>,
+    inbound: Arc<FixtureQueueOccupancy>,
+    pending_overflow: u64,
+    pending_bytes: u64,
+    pending_high_water_count: u64,
+    pending_high_water_bytes: u64,
     reassembly: Option<InboundReassembly>,
 }
 
@@ -111,8 +262,12 @@ impl LocalWebrtcOfferPeer {
         let (gather_complete_tx, mut gather_complete_rx) = channel::<()>(1);
         let (connected_tx, connected_rx) = channel::<()>(1);
         let (data_channel_open_tx, data_channel_open_rx) = channel::<()>(1);
-        let (data_channel_message_tx, data_channel_message_rx) = channel::<String>(8192);
-        let inbound_overflow = Arc::new(AtomicU64::new(0));
+        let (data_channel_message_tx, data_channel_message_rx) =
+            channel::<String>(WEBRTC_INBOUND_MAX_FRAMES);
+        let inbound = Arc::new(FixtureQueueOccupancy::new(
+            WEBRTC_INBOUND_MAX_FRAMES,
+            WEBRTC_INBOUND_MAX_BYTES,
+        ));
         let handler = Arc::new(LocalWebrtcOffererHandler {
             gather_complete_tx,
             connected_tx,
@@ -142,7 +297,7 @@ impl LocalWebrtcOfferPeer {
             let data_channel = data_channel.clone();
             let open_tx = data_channel_open_tx.clone();
             let message_tx = data_channel_message_tx.clone();
-            let inbound_overflow = Arc::clone(&inbound_overflow);
+            let inbound = Arc::clone(&inbound);
             runtime.spawn(Box::pin(async move {
                 while let Some(event) = data_channel.poll().await {
                     match event {
@@ -150,10 +305,15 @@ impl LocalWebrtcOfferPeer {
                             let _ = open_tx.try_send(());
                         }
                         DataChannelEvent::OnMessage(message) => {
-                            if let Ok(text) = String::from_utf8(message.data.to_vec())
-                                && message_tx.try_send(text).is_err()
-                            {
-                                inbound_overflow.fetch_add(1, Ordering::Relaxed);
+                            if let Ok(text) = String::from_utf8(message.data.to_vec()) {
+                                let add_bytes = text.len() as u64;
+                                if inbound.would_exceed(add_bytes)
+                                    || message_tx.try_send(text).is_err()
+                                {
+                                    inbound.record_overflow();
+                                } else {
+                                    inbound.record_push(add_bytes);
+                                }
                             }
                         }
                         DataChannelEvent::OnClose => break,
@@ -182,8 +342,13 @@ impl LocalWebrtcOfferPeer {
                 pending_entity_frames: VecDeque::new(),
                 pending_terminal_frames: VecDeque::new(),
                 pending_host_events: VecDeque::new(),
+                pending_event_sizes: VecDeque::new(),
                 accept_host_events: false,
-                inbound_overflow,
+                inbound,
+                pending_overflow: 0,
+                pending_bytes: 0,
+                pending_high_water_count: 0,
+                pending_high_water_bytes: 0,
                 reassembly: None,
             },
             offer,
@@ -336,7 +501,32 @@ impl LocalWebrtcOfferPeer {
 
     #[must_use]
     pub(crate) fn inbound_overflow(&self) -> u64 {
-        self.inbound_overflow.load(Ordering::Relaxed)
+        self.inbound.overflow.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub(crate) fn fixture_queue_snapshot(&self) -> serde_json::Value {
+        let inbound = self.inbound.snapshot();
+        serde_json::json!({
+            "inbound_frames": {
+                "count": inbound.count,
+                "bytes": inbound.bytes,
+                "high_water_count": inbound.high_water_count,
+                "high_water_bytes": inbound.high_water_bytes,
+                "oldest_age_us": inbound.oldest_age_us,
+                "overflow": inbound.overflow,
+                "max_count": inbound.max_count,
+                "max_bytes": inbound.max_bytes
+            },
+            "pending_host_events": {
+                "count": self.pending_host_events.len() as u64,
+                "bytes": self.pending_bytes,
+                "high_water_count": self.pending_high_water_count,
+                "high_water_bytes": self.pending_high_water_bytes,
+                "overflow": self.pending_overflow,
+                "max_count": WEBRTC_PENDING_HOST_EVENTS_MAX as u64
+            }
+        })
     }
 
     fn park_or_reject_host_event(
@@ -349,8 +539,22 @@ impl LocalWebrtcOfferPeer {
             )
             .into());
         }
+        let bytes = plaintext.len() as u64;
+        if self.pending_host_events.len() >= WEBRTC_PENDING_HOST_EVENTS_MAX {
+            self.pending_overflow += 1;
+            return Err(std::io::Error::other(
+                "product_failure webrtc pending_host_events overflow",
+            )
+            .into());
+        }
         self.pending_host_events
             .push_back(serde_json::from_slice(plaintext)?);
+        self.pending_event_sizes.push_back(bytes);
+        self.pending_bytes += bytes;
+        self.pending_high_water_count = self
+            .pending_high_water_count
+            .max(self.pending_host_events.len() as u64);
+        self.pending_high_water_bytes = self.pending_high_water_bytes.max(self.pending_bytes);
         Ok(())
     }
 
@@ -359,6 +563,8 @@ impl LocalWebrtcOfferPeer {
         key: &AesGcmKey,
     ) -> Result<botster_hub_client::DaemonEvent, Box<dyn std::error::Error>> {
         if let Some(event) = self.pending_host_events.pop_front() {
+            let bytes = self.pending_event_sizes.pop_front().unwrap_or(0);
+            self.pending_bytes = self.pending_bytes.saturating_sub(bytes);
             return Ok(event);
         }
         loop {
@@ -399,7 +605,10 @@ impl LocalWebrtcOfferPeer {
         loop {
             let response =
                 match timeout(Duration::from_secs(10), self.data_channel_message_rx.recv()).await {
-                    Ok(Some(response)) => response,
+                    Ok(Some(response)) => {
+                        self.inbound.record_pop(response.len() as u64);
+                        response
+                    }
                     Ok(None) => {
                         let progress = self.reassembly.take();
                         return Err(local_webrtc_response_progress_error(
@@ -427,44 +636,7 @@ impl LocalWebrtcOfferPeer {
                         .into());
                     }
                 };
-            let assembly = self.reassembly.get_or_insert_with(|| InboundReassembly {
-                encrypted: String::new(),
-                delivery_kind: None,
-                message_id: None,
-                expected_chunk_count: None,
-                maximum_frame_bytes: 0,
-                next_chunk_index: 0,
-            });
-            assembly.maximum_frame_bytes = assembly.maximum_frame_bytes.max(response.len());
-            assert!(
-                response.len() < botster_hub_client::LOCAL_WEBRTC_MAX_FRAME_BYTES,
-                "response frame exceeded 64 KiB"
-            );
-            let chunk = serde_json::from_str::<botster_hub_client::DaemonLocalWebrtcDeliveryChunk>(
-                &response,
-            )?;
-            assert_eq!(
-                chunk.version,
-                botster_hub_client::LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION
-            );
-            if let Some(delivery_kind) = assembly.delivery_kind {
-                assert_eq!(delivery_kind, chunk.delivery_kind);
-            } else {
-                assembly.delivery_kind = Some(chunk.delivery_kind);
-            }
-            assert_eq!(chunk.chunk_index, assembly.next_chunk_index);
-            if let Some(message_id) = &assembly.message_id {
-                assert_eq!(message_id, &chunk.message_id);
-            } else {
-                assembly.message_id = Some(chunk.message_id.clone());
-                assembly.expected_chunk_count = Some(chunk.chunk_count);
-            }
-            assert_eq!(assembly.expected_chunk_count, Some(chunk.chunk_count));
-            assembly.encrypted.push_str(&chunk.payload);
-            assembly.next_chunk_index += 1;
-            if chunk.chunk_index + 1 == chunk.chunk_count {
-                assert_eq!(assembly.encrypted.len(), chunk.total_bytes as usize);
-                let finished = self.reassembly.take().expect("complete reassembly");
+            if let Some(finished) = apply_inbound_chunk(&mut self.reassembly, &response)? {
                 let envelope_bytes = finished.encrypted.len();
                 let chunk_count = finished.expected_chunk_count.unwrap_or(0) as usize;
                 let envelope = serde_json::from_str::<AesGcmEnvelope>(&finished.encrypted)?;
@@ -1375,4 +1547,53 @@ pub(crate) fn local_webrtc_bounded_stderr_tail(stderr: &[u8], data_dir: &Path) -
     } else {
         tail
     }
+}
+
+fn test_chunk(index: u32, count: u32, payload: &str) -> String {
+    serde_json::json!({
+        "version": botster_hub_client::LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION,
+        "delivery_kind": "daemon_event",
+        "message_id": "reassembly-test",
+        "chunk_index": index,
+        "chunk_count": count,
+        "total_bytes": 4,
+        "payload": payload
+    })
+    .to_string()
+}
+
+#[test]
+fn inbound_chunk_reassembly_survives_cancelled_read() {
+    let mut assembly = None;
+    let first = apply_inbound_chunk(&mut assembly, &test_chunk(0, 2, "ab")).expect("first chunk");
+    assert!(first.is_none(), "first chunk must stay incomplete");
+    assert!(
+        assembly.is_some(),
+        "cancelled read must leave reassembly state"
+    );
+    let finished = apply_inbound_chunk(&mut assembly, &test_chunk(1, 2, "cd"))
+        .expect("second chunk")
+        .expect("complete delivery");
+    assert_eq!(finished.encrypted, "abcd");
+    assert!(assembly.is_none());
+    assert_eq!(
+        finished.delivery_kind,
+        Some(botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonEvent)
+    );
+}
+
+#[test]
+fn inbound_occupancy_overflows_at_explicit_count_and_byte_limits() {
+    let occupancy = FixtureQueueOccupancy::new(1, 8);
+    assert!(!occupancy.would_exceed(4));
+    occupancy.record_push(4);
+    let snap = occupancy.snapshot();
+    assert_eq!(snap.count, 1);
+    assert_eq!(snap.bytes, 4);
+    assert_eq!(snap.high_water_count, 1);
+    assert_eq!(snap.max_count, 1);
+    assert_eq!(snap.max_bytes, 8);
+    assert!(occupancy.would_exceed(1));
+    occupancy.record_overflow();
+    assert_eq!(occupancy.snapshot().overflow, 1);
 }
