@@ -32,8 +32,9 @@ use botster_core_daemon::{
 use botster_ui_contract::{UiActionRequest, UiActionResult, UiNode};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
+use std::ffi::OsStr;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -4740,6 +4741,21 @@ pub fn event_handler_hold_ms_from(botster_env: Option<&str>, raw: Option<&str>) 
         .map(|ms: u64| ms.min(5_000))
 }
 
+/// True while the test hold file exists. Production ignores the path.
+#[must_use]
+pub fn journal_pull_held_from(botster_env: Option<&str>, path: Option<&OsStr>) -> bool {
+    botster_env == Some("test") && path.is_some_and(|path| Path::new(path).exists())
+}
+
+/// Skip journal consumption while the campaign hold file exists.
+#[must_use]
+pub fn journal_pull_held() -> bool {
+    journal_pull_held_from(
+        std::env::var("BOTSTER_ENV").ok().as_deref(),
+        std::env::var_os("BOTSTER_HUB_TEST_HOLD_JOURNAL_PULL").as_deref(),
+    )
+}
+
 fn core_daemon_config(config: &HubConfig, test_seams: &HubTestSeams) -> CoreDaemonConfig {
     // Host profile supplies the initial/reset Ghostty color baseline. After
     // attach, current colors come from data-plane GHOSTSNP only.
@@ -5729,6 +5745,27 @@ mod tests {
         assert_eq!(drop_journal_wakes_from(Some("production"), Some("3")), None);
         assert_eq!(drop_journal_wakes_from(None, Some("3")), None);
         assert_eq!(drop_journal_wakes_from(Some("test"), Some("100")), Some(64));
+
+        let hold = std::env::temp_dir().join(format!(
+            "hub-hold-journal-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::write(&hold, b"hold").expect("write hold file");
+        assert!(journal_pull_held_from(Some("test"), Some(hold.as_os_str())));
+        assert!(!journal_pull_held_from(
+            Some("production"),
+            Some(hold.as_os_str())
+        ));
+        assert!(!journal_pull_held_from(None, Some(hold.as_os_str())));
+        std::fs::remove_file(&hold).expect("remove hold file");
+        assert!(!journal_pull_held_from(
+            Some("test"),
+            Some(hold.as_os_str())
+        ));
 
         assert_eq!(
             lifecycle_journal_capacity_from(Some("test"), Some("8")),

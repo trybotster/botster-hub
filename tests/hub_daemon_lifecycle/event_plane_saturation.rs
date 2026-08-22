@@ -52,6 +52,29 @@ const EVENT_PLANE_GATED_OPERATIONS: [&str; 11] = [
 ];
 const EVENT_PLANE_QUEUE_AGE_US: u64 = 1_000 * 1_000;
 const EVENT_PLANE_MAX_AGE_SAMPLE_FAILURES: u64 = 0;
+const EVENT_PLANE_OUTPUT_RECORD_BYTES: usize = 4096;
+const EVENT_PLANE_OUTPUT_HEADER_BYTES: usize = 30;
+const EVENT_PLANE_NOISY_COMMAND: &str = concat!(
+    "python3 -u -c \"",
+    "import sys,time,threading\n",
+    "sys.stdout.buffer.write(b'ns-ready\\n')\n",
+    "sys.stdout.buffer.write(bytes([0x80,0xff,10]))\n",
+    "sys.stdout.buffer.flush()\n",
+    "def echo():\n",
+    "    while True:\n",
+    "        line=sys.stdin.buffer.readline()\n",
+    "        if not line: break\n",
+    "        sys.stdout.buffer.write(b'ns-echo:'+line)\n",
+    "        sys.stdout.buffer.flush()\n",
+    "threading.Thread(target=echo,daemon=True).start()\n",
+    "pad=b'x'*4065\n",
+    "i=0\n",
+    "while True:\n",
+    "    sys.stdout.buffer.write(('N%08dT%020d'%(i,time.monotonic_ns())).encode()+pad+b'\\n')\n",
+    "    sys.stdout.buffer.flush()\n",
+    "    i+=1\n",
+    "    time.sleep(0.1)\"",
+);
 
 #[test]
 fn event_plane_saturation_source_guards_hold() {
@@ -101,10 +124,25 @@ fn event_plane_saturation_source_guards_hold() {
         fs::read_to_string(root.join("src/daemon_maintenance.rs")).expect("maintenance");
     assert!(maintenance.contains("max_sessions: 8"));
     assert!(maintenance.contains("max_rows: 16"));
+    assert!(
+        maintenance.contains("journal_pull_held"),
+        "cursor-expiry hold must skip journal pull"
+    );
     assert_eq!(EVENT_PLANE_RATIO_R, 1.25);
     assert_eq!(EVENT_PLANE_SLACK_MS, 8.0);
     assert_eq!(EVENT_PLANE_THROUGHPUT_T, 0.80);
     assert_eq!(EVENT_PLANE_MAX_AGE_SAMPLE_FAILURES, 0);
+    assert_eq!(EVENT_PLANE_OUTPUT_RECORD_BYTES, 4096);
+    assert_eq!(
+        EVENT_PLANE_OUTPUT_HEADER_BYTES + 4065 + 1,
+        EVENT_PLANE_OUTPUT_RECORD_BYTES
+    );
+    assert!(EVENT_PLANE_NOISY_COMMAND.contains("time.monotonic_ns"));
+    assert!(EVENT_PLANE_NOISY_COMMAND.contains("pad=b'x'*4065"));
+    assert!(
+        !EVENT_PLANE_NOISY_COMMAND.contains("python3 -c 'import time"),
+        "noisy producer must be one process, not one Python process per line"
+    );
 
     let unix = fs::read_to_string(root.join("src/unix_terminal_adapter.rs")).expect("unix adapter");
     let webrtc =
@@ -239,9 +277,14 @@ fn event_plane_saturation_queue_bounds_reject_indeterminate_rows() {
 
 #[test]
 fn event_plane_saturation_output_records_carry_emission_time() {
-    let payload = botster_hub_client::DaemonLiveOutputPayload::from_bytes(
-        b"N00000007T00000001234567890123xxxx\n",
-    );
+    let mut line = b"N00000007T00000001234567890123".to_vec();
+    line.extend(std::iter::repeat_n(
+        b'x',
+        EVENT_PLANE_OUTPUT_RECORD_BYTES - EVENT_PLANE_OUTPUT_HEADER_BYTES - 1,
+    ));
+    line.push(b'\n');
+    assert_eq!(line.len(), EVENT_PLANE_OUTPUT_RECORD_BYTES);
+    let payload = botster_hub_client::DaemonLiveOutputPayload::from_bytes(&line);
     let events = [botster_hub_client::DaemonEvent::TerminalOutput {
         session_id: EVENT_PLANE_NOISY_SESSION.to_string(),
         subscription_id: EVENT_PLANE_NOISY_SUB.to_string(),
@@ -251,6 +294,7 @@ fn event_plane_saturation_output_records_carry_emission_time() {
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].seq, 7);
     assert_eq!(records[0].emit_ns, 1_234_567_890_123);
+    assert_eq!(records[0].bytes, EVENT_PLANE_OUTPUT_RECORD_BYTES);
 }
 
 #[test]
@@ -1179,7 +1223,7 @@ fn spawn_noisy_session(endpoint: &botster_hub_client::DaemonEndpoint) -> NoisySe
         endpoint,
         botster_hub_client::DaemonRequest::Spawn {
             session_id: EVENT_PLANE_NOISY_SESSION.to_string(),
-            command: "printf 'ns-ready\\n'; printf '\\200\\377\\n'; i=0; while true; do ts=$(python3 -c 'import time; print(time.time_ns())'); printf 'N%08dT%020d\\n' \"$i\" \"$ts\"; i=$((i+1)); sleep 0.1; done & while IFS= read -r line; do printf 'ns-echo:%s\\n' \"$line\"; done".to_string(),
+            command: EVENT_PLANE_NOISY_COMMAND.to_string(),
         },
     )
     .expect("spawn noisy");
@@ -1359,7 +1403,7 @@ fn run_measurement_workers(
                 None,
             );
             let records = output_records(&drained);
-            let receipt_ns = unix_now_ns();
+            let receipt_ns = monotonic_now_ns();
             if in_window {
                 for record in records {
                     if next_output_seq.is_some_and(|expected| record.seq != expected) {
@@ -1522,6 +1566,7 @@ fn expect_kind(
 struct OutputRecord {
     seq: u64,
     emit_ns: u64,
+    bytes: usize,
 }
 
 fn unix_now_ns() -> u64 {
@@ -1529,6 +1574,22 @@ fn unix_now_ns() -> u64 {
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_nanos() as u64
+}
+
+fn monotonic_now_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    #[cfg(target_os = "macos")]
+    let clock = libc::CLOCK_UPTIME_RAW;
+    #[cfg(not(target_os = "macos"))]
+    let clock = libc::CLOCK_MONOTONIC;
+    let rc = unsafe { libc::clock_gettime(clock, &mut ts) };
+    assert_eq!(rc, 0, "clock_gettime monotonic");
+    (ts.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(ts.tv_nsec as u64)
 }
 
 fn output_records(events: &[botster_hub_client::DaemonEvent]) -> Vec<OutputRecord> {
@@ -1541,26 +1602,35 @@ fn output_records(events: &[botster_hub_client::DaemonEvent]) -> Vec<OutputRecor
             continue;
         };
         let mut index = 0;
-        while index + 30 <= bytes.len() {
+        while index + EVENT_PLANE_OUTPUT_RECORD_BYTES <= bytes.len() {
             let seq_ok = bytes[index] == b'N'
                 && bytes[index + 1..index + 9]
                     .iter()
                     .all(|byte| byte.is_ascii_digit());
             let time_ok = bytes[index + 9] == b'T'
-                && bytes[index + 10..index + 30]
+                && bytes[index + 10..index + EVENT_PLANE_OUTPUT_HEADER_BYTES]
                     .iter()
                     .all(|byte| byte.is_ascii_digit());
-            if seq_ok && time_ok {
+            let record_ok = seq_ok
+                && time_ok
+                && bytes[index + EVENT_PLANE_OUTPUT_RECORD_BYTES - 1] == b'\n';
+            if record_ok {
                 let seq = std::str::from_utf8(&bytes[index + 1..index + 9])
                     .expect("seq digits")
                     .parse::<u64>()
                     .expect("seq");
-                let emit_ns = std::str::from_utf8(&bytes[index + 10..index + 30])
-                    .expect("emit digits")
-                    .parse::<u64>()
-                    .expect("emit_ns");
-                records.push(OutputRecord { seq, emit_ns });
-                index += 30;
+                let emit_ns = std::str::from_utf8(
+                    &bytes[index + 10..index + EVENT_PLANE_OUTPUT_HEADER_BYTES],
+                )
+                .expect("emit digits")
+                .parse::<u64>()
+                .expect("emit_ns");
+                records.push(OutputRecord {
+                    seq,
+                    emit_ns,
+                    bytes: EVENT_PLANE_OUTPUT_RECORD_BYTES,
+                });
+                index += EVENT_PLANE_OUTPUT_RECORD_BYTES;
             } else {
                 index += 1;
             }
@@ -2482,6 +2552,14 @@ fn run_fault_campaign() -> botster_hub_client::DaemonObservabilityCounters {
             .expect("clock")
             .as_nanos()
     ));
+    let hold_path = PathBuf::from(format!(
+        "/tmp/bh-event-sat-hold-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
     let hub = start_campaign_hub(
         "faults",
         &[
@@ -2489,6 +2567,10 @@ fn run_fault_campaign() -> botster_hub_client::DaemonObservabilityCounters {
             (
                 "BOTSTER_HUB_TEST_STALL_UNIX_EVENT_FLUSH",
                 stall_path.to_str().expect("utf8"),
+            ),
+            (
+                "BOTSTER_HUB_TEST_HOLD_JOURNAL_PULL",
+                hold_path.to_str().expect("utf8 hold"),
             ),
             ("BOTSTER_HUB_TEST_DROP_JOURNAL_WAKES", "1"),
             ("BOTSTER_HUB_TEST_LIFECYCLE_JOURNAL_CAPACITY", "16"),
@@ -2507,7 +2589,7 @@ fn run_fault_campaign() -> botster_hub_client::DaemonObservabilityCounters {
     fault_plugin_mailbox_pressure(&endpoint);
     fault_client_mailbox_gap(&endpoint, &mut unix, &stall_path);
     fault_dropped_lifecycle_wake(&endpoint, &mut unix);
-    fault_lifecycle_cursor_expiry(&endpoint);
+    fault_lifecycle_cursor_expiry(&endpoint, &hold_path);
     fault_handler_timeout(&endpoint);
     fault_plugin_worker_restart(&endpoint, &mut unix);
     unix = fault_unix_reconnect(&endpoint, unix);
@@ -2658,8 +2740,13 @@ fn snapshot_lifecycle(
     status.status.expect("status body").lifecycle_counters
 }
 
-fn fault_lifecycle_cursor_expiry(endpoint: &botster_hub_client::DaemonEndpoint) {
+fn fault_lifecycle_cursor_expiry(
+    endpoint: &botster_hub_client::DaemonEndpoint,
+    hold_path: &Path,
+) {
     let before = snapshot_lifecycle(endpoint).lifecycle_resync_reads;
+    fs::write(hold_path, b"hold").expect("hold journal pull");
+    thread::sleep(Duration::from_millis(50));
     expect_kind(
         endpoint,
         botster_hub_client::DaemonRequest::Spawn {
@@ -2668,7 +2755,7 @@ fn fault_lifecycle_cursor_expiry(endpoint: &botster_hub_client::DaemonEndpoint) 
         },
         botster_hub_client::DaemonResponseKind::Spawned,
     )
-    .expect("spawn cursor-changed");
+    .expect("spawn cursor-changed during hold");
     for index in 0..20 {
         let session_id = format!("cursor-{index}");
         let _ = botster_hub_client::request(
@@ -2683,6 +2770,7 @@ fn fault_lifecycle_cursor_expiry(endpoint: &botster_hub_client::DaemonEndpoint) 
             botster_hub_client::DaemonRequest::ShutdownSession { session_id },
         );
     }
+    fs::remove_file(hold_path).expect("release journal pull");
     let deadline = Instant::now() + Duration::from_secs(8);
     loop {
         let listed =
@@ -2704,7 +2792,7 @@ fn fault_lifecycle_cursor_expiry(endpoint: &botster_hub_client::DaemonEndpoint) 
         }
         if Instant::now() >= deadline {
             panic!(
-                "cursor expiry must increment lifecycle_resync_reads (before={before}, after={}) and reconstruct cursor-changed: {after:?} changed_running={changed_running} quiet={quiet}",
+                "cursor expiry must increment lifecycle_resync_reads (before={before}, after={}) and reconstruct cursor-changed spawned during the hold: {after:?} changed_running={changed_running} quiet={quiet}",
                 after.lifecycle_resync_reads
             );
         }

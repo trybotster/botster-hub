@@ -961,6 +961,9 @@ fn run_observe_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
 }
 
 fn run_journal_pull_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
+    if crate::runtime::journal_pull_held() {
+        return;
+    }
     let woke = runtime.take_journal_advanced_wake();
     if state.baseline.is_some() || !state.projection.baseline_complete {
         if woke && state.baseline.is_none() && !state.session_family.need_gap_pass {
