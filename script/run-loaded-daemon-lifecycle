@@ -80,6 +80,16 @@ validate_inputs() {
     log "focused-plugin-resource-bounds requires stress_profile=none"
     invalid=1
   fi
+  EVENT_PLANE_PHASE=${BOTSTER_EVENT_PLANE_PHASE:-}
+  if [[ "$TEST_TARGET" == event-plane-saturation ]]; then
+    case "$EVENT_PLANE_PHASE" in
+      calibration|acceptance) ;;
+      *)
+        log "event-plane-saturation requires BOTSTER_EVENT_PLANE_PHASE=calibration or acceptance"
+        invalid=1
+        ;;
+    esac
+  fi
 
   resolve_run_timeout
   {
@@ -90,6 +100,9 @@ validate_inputs() {
     printf 'stress_profile=%s\n' "$STRESS_PROFILE"
     printf 'run_timeout_seconds=%s\n' "$RUN_TIMEOUT_SECONDS"
     printf 'run_timeout_max=%s\n' "$RUN_TIMEOUT_MAX"
+    if [[ "$TEST_TARGET" == event-plane-saturation ]]; then
+      printf 'event_plane_phase=%s\n' "$EVENT_PLANE_PHASE"
+    fi
   } >> "$ARTIFACT_DIR/metadata.txt"
 
   if ((invalid != 0)); then
@@ -1038,6 +1051,9 @@ main() {
       test_command=(./test.sh --test hub_lua_runtime_test session_type -- --nocapture)
       ;;
     event-plane-saturation)
+      export BOTSTER_EVENT_PLANE_PHASE="${BOTSTER_EVENT_PLANE_PHASE:?event-plane-saturation requires BOTSTER_EVENT_PLANE_PHASE}"
+      export BOTSTER_EVENT_PLANE_ARTIFACT_DIR="${BOTSTER_EVENT_PLANE_ARTIFACT_DIR:-$ARTIFACT_DIR}"
+      export SUBJECT_SHA="$SUBJECT_SHA"
       test_command=(./test.sh --test hub_daemon_lifecycle_test event_plane_saturation_campaign -- --exact --ignored --nocapture)
       ;;
     full-suite-contention)

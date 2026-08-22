@@ -43,6 +43,14 @@ on:
           - residual-tail
           - moderate
           - none
+      event_plane_phase:
+        description: Event-plane saturation phase. Ignored for other test targets. Calibration writes the dataset; acceptance gates against the committed dataset.
+        required: true
+        default: calibration
+        type: choice
+        options:
+          - calibration
+          - acceptance
 
 permissions:
   contents: read
@@ -76,7 +84,11 @@ jobs:
           REPETITIONS: ${{ inputs.repetitions }}
           TEST_TARGET: ${{ inputs.test_target }}
           STRESS_PROFILE: ${{ inputs.stress_profile }}
+          EVENT_PLANE_PHASE: ${{ inputs.event_plane_phase }}
         run: |
+          if [[ "$TEST_TARGET" == event-plane-saturation ]]; then
+            export BOTSTER_EVENT_PLANE_PHASE="$EVENT_PLANE_PHASE"
+          fi
           workflow-harness/script/run-loaded-daemon-lifecycle \
             --validate-only \
             --artifact-dir "$ARTIFACT_DIR" \
@@ -205,9 +217,16 @@ jobs:
           REPETITIONS: ${{ inputs.repetitions }}
           TEST_TARGET: ${{ inputs.test_target }}
           STRESS_PROFILE: ${{ inputs.stress_profile }}
+          EVENT_PLANE_PHASE: ${{ inputs.event_plane_phase }}
         run: |
           if [[ "$TEST_TARGET" == event-plane-saturation ]]; then
             export BOTSTER_LOADED_RUN_TIMEOUT_SECONDS=3600
+            export BOTSTER_EVENT_PLANE_PHASE="$EVENT_PLANE_PHASE"
+            export BOTSTER_EVENT_PLANE_ARTIFACT_DIR="$ARTIFACT_DIR"
+            export SUBJECT_SHA="$SUBJECT_SHA"
+            if [[ "$EVENT_PLANE_PHASE" == calibration ]]; then
+              export BOTSTER_EVENT_PLANE_COMMIT_CALIBRATION=1
+            fi
           fi
           workflow-harness/script/run-loaded-daemon-lifecycle \
             --subject-dir "$GITHUB_WORKSPACE/subject" \
@@ -216,6 +235,26 @@ jobs:
             --test-target "$TEST_TARGET" \
             --repetitions "$REPETITIONS" \
             --stress-profile "$STRESS_PROFILE"
+
+      - name: Retain event-plane calibration or acceptance dataset
+        if: ${{ always() && inputs.test_target == 'event-plane-saturation' }}
+        run: |
+          dataset="$ARTIFACT_DIR/event-plane-saturation-${{ inputs.event_plane_phase }}.json"
+          if [[ ! -s "$dataset" ]]; then
+            printf 'missing event-plane %s dataset: %s\n' \
+              "${{ inputs.event_plane_phase }}" "$dataset" \
+              | tee -a "$ARTIFACT_DIR/metadata.txt"
+            exit 1
+          fi
+          {
+            printf 'event_plane_phase=%s\n' "${{ inputs.event_plane_phase }}"
+            printf 'event_plane_dataset=%s\n' "$dataset"
+            printf 'event_plane_dataset_bytes=%s\n' "$(wc -c < "$dataset")"
+          } | tee -a "$ARTIFACT_DIR/metadata.txt"
+          if [[ "${{ inputs.event_plane_phase }}" == calibration ]]; then
+            printf 'event_plane_reference_commit=download this artifact and commit docs/reports/prove-the-event-plane-cannot-lag-or-block-hub-operations-calibration.json before acceptance\n' \
+              | tee -a "$ARTIFACT_DIR/metadata.txt"
+          fi
 
       - name: Enforce owned-process teardown
         if: ${{ always() }}
