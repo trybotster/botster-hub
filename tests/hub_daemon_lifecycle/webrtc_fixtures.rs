@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{
     Arc, Mutex, OnceLock,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc,
 };
 use std::thread;
@@ -76,6 +76,15 @@ impl PeerConnectionEventHandler for LocalWebrtcOffererHandler {
     }
 }
 
+struct InboundReassembly {
+    encrypted: String,
+    delivery_kind: Option<botster_hub_client::DaemonLocalWebrtcDeliveryKind>,
+    message_id: Option<String>,
+    expected_chunk_count: Option<u32>,
+    maximum_frame_bytes: usize,
+    next_chunk_index: u32,
+}
+
 pub(crate) struct LocalWebrtcOfferPeer {
     pub(crate) peer: Box<dyn PeerConnection>,
     pub(crate) data_channel: Arc<dyn DataChannel>,
@@ -86,6 +95,8 @@ pub(crate) struct LocalWebrtcOfferPeer {
     pub(crate) pending_terminal_frames: VecDeque<(String, Vec<u8>)>,
     pub(crate) pending_host_events: VecDeque<botster_hub_client::DaemonEvent>,
     pub(crate) accept_host_events: bool,
+    inbound_overflow: Arc<AtomicU64>,
+    reassembly: Option<InboundReassembly>,
 }
 
 pub(crate) struct ExtraWebrtcDataChannel {
@@ -100,7 +111,8 @@ impl LocalWebrtcOfferPeer {
         let (gather_complete_tx, mut gather_complete_rx) = channel::<()>(1);
         let (connected_tx, connected_rx) = channel::<()>(1);
         let (data_channel_open_tx, data_channel_open_rx) = channel::<()>(1);
-        let (data_channel_message_tx, data_channel_message_rx) = channel::<String>(256);
+        let (data_channel_message_tx, data_channel_message_rx) = channel::<String>(8192);
+        let inbound_overflow = Arc::new(AtomicU64::new(0));
         let handler = Arc::new(LocalWebrtcOffererHandler {
             gather_complete_tx,
             connected_tx,
@@ -130,6 +142,7 @@ impl LocalWebrtcOfferPeer {
             let data_channel = data_channel.clone();
             let open_tx = data_channel_open_tx.clone();
             let message_tx = data_channel_message_tx.clone();
+            let inbound_overflow = Arc::clone(&inbound_overflow);
             runtime.spawn(Box::pin(async move {
                 while let Some(event) = data_channel.poll().await {
                     match event {
@@ -137,8 +150,10 @@ impl LocalWebrtcOfferPeer {
                             let _ = open_tx.try_send(());
                         }
                         DataChannelEvent::OnMessage(message) => {
-                            if let Ok(text) = String::from_utf8(message.data.to_vec()) {
-                                let _ = message_tx.try_send(text);
+                            if let Ok(text) = String::from_utf8(message.data.to_vec())
+                                && message_tx.try_send(text).is_err()
+                            {
+                                inbound_overflow.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                         DataChannelEvent::OnClose => break,
@@ -168,6 +183,8 @@ impl LocalWebrtcOfferPeer {
                 pending_terminal_frames: VecDeque::new(),
                 pending_host_events: VecDeque::new(),
                 accept_host_events: false,
+                inbound_overflow,
+                reassembly: None,
             },
             offer,
         ))
@@ -317,6 +334,11 @@ impl LocalWebrtcOfferPeer {
         self.accept_host_events = true;
     }
 
+    #[must_use]
+    pub(crate) fn inbound_overflow(&self) -> u64 {
+        self.inbound_overflow.load(Ordering::Relaxed)
+    }
+
     fn park_or_reject_host_event(
         &mut self,
         plaintext: &[u8],
@@ -374,36 +396,46 @@ impl LocalWebrtcOfferPeer {
         ),
         Box<dyn std::error::Error>,
     > {
-        let mut encrypted = String::new();
-        let mut delivery_kind = None;
-        let mut message_id = None;
-        let mut expected_chunk_count = None;
-        let mut maximum_frame_bytes = 0;
-        let mut next_chunk_index = 0;
         loop {
             let response =
                 match timeout(Duration::from_secs(10), self.data_channel_message_rx.recv()).await {
                     Ok(Some(response)) => response,
                     Ok(None) => {
+                        let progress = self.reassembly.take();
                         return Err(local_webrtc_response_progress_error(
                             "channel_closed",
-                            message_id.as_deref(),
-                            next_chunk_index,
-                            expected_chunk_count,
+                            progress.as_ref().and_then(|row| row.message_id.as_deref()),
+                            progress
+                                .as_ref()
+                                .map(|row| row.next_chunk_index)
+                                .unwrap_or(0),
+                            progress.as_ref().and_then(|row| row.expected_chunk_count),
                         )
                         .into());
                     }
                     Err(_) => {
+                        let progress = self.reassembly.take();
                         return Err(local_webrtc_response_progress_error(
                             "response_timeout",
-                            message_id.as_deref(),
-                            next_chunk_index,
-                            expected_chunk_count,
+                            progress.as_ref().and_then(|row| row.message_id.as_deref()),
+                            progress
+                                .as_ref()
+                                .map(|row| row.next_chunk_index)
+                                .unwrap_or(0),
+                            progress.as_ref().and_then(|row| row.expected_chunk_count),
                         )
                         .into());
                     }
                 };
-            maximum_frame_bytes = maximum_frame_bytes.max(response.len());
+            let assembly = self.reassembly.get_or_insert_with(|| InboundReassembly {
+                encrypted: String::new(),
+                delivery_kind: None,
+                message_id: None,
+                expected_chunk_count: None,
+                maximum_frame_bytes: 0,
+                next_chunk_index: 0,
+            });
+            assembly.maximum_frame_bytes = assembly.maximum_frame_bytes.max(response.len());
             assert!(
                 response.len() < botster_hub_client::LOCAL_WEBRTC_MAX_FRAME_BYTES,
                 "response frame exceeded 64 KiB"
@@ -415,39 +447,41 @@ impl LocalWebrtcOfferPeer {
                 chunk.version,
                 botster_hub_client::LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION
             );
-            if let Some(delivery_kind) = delivery_kind {
+            if let Some(delivery_kind) = assembly.delivery_kind {
                 assert_eq!(delivery_kind, chunk.delivery_kind);
             } else {
-                delivery_kind = Some(chunk.delivery_kind);
+                assembly.delivery_kind = Some(chunk.delivery_kind);
             }
-            assert_eq!(chunk.chunk_index, next_chunk_index);
-            if let Some(message_id) = &message_id {
+            assert_eq!(chunk.chunk_index, assembly.next_chunk_index);
+            if let Some(message_id) = &assembly.message_id {
                 assert_eq!(message_id, &chunk.message_id);
             } else {
-                message_id = Some(chunk.message_id.clone());
-                expected_chunk_count = Some(chunk.chunk_count);
+                assembly.message_id = Some(chunk.message_id.clone());
+                assembly.expected_chunk_count = Some(chunk.chunk_count);
             }
-            assert_eq!(expected_chunk_count, Some(chunk.chunk_count));
-            encrypted.push_str(&chunk.payload);
-            next_chunk_index += 1;
+            assert_eq!(assembly.expected_chunk_count, Some(chunk.chunk_count));
+            assembly.encrypted.push_str(&chunk.payload);
+            assembly.next_chunk_index += 1;
             if chunk.chunk_index + 1 == chunk.chunk_count {
-                assert_eq!(encrypted.len(), chunk.total_bytes as usize);
-                break;
+                assert_eq!(assembly.encrypted.len(), chunk.total_bytes as usize);
+                let finished = self.reassembly.take().expect("complete reassembly");
+                let envelope_bytes = finished.encrypted.len();
+                let chunk_count = finished.expected_chunk_count.unwrap_or(0) as usize;
+                let envelope = serde_json::from_str::<AesGcmEnvelope>(&finished.encrypted)?;
+                let plaintext = decrypt_aes_gcm(key, &envelope)?;
+                return Ok((
+                    finished
+                        .delivery_kind
+                        .expect("complete delivery declares a kind"),
+                    plaintext,
+                    LocalWebrtcResponseMetrics {
+                        envelope_bytes,
+                        chunk_count,
+                        maximum_frame_bytes: finished.maximum_frame_bytes,
+                    },
+                ));
             }
         }
-        let envelope_bytes = encrypted.len();
-        let chunk_count = expected_chunk_count.unwrap_or(0) as usize;
-        let envelope = serde_json::from_str::<AesGcmEnvelope>(&encrypted)?;
-        let plaintext = decrypt_aes_gcm(key, &envelope)?;
-        Ok((
-            delivery_kind.expect("complete delivery declares a kind"),
-            plaintext,
-            LocalWebrtcResponseMetrics {
-                envelope_bytes,
-                chunk_count,
-                maximum_frame_bytes,
-            },
-        ))
     }
 
     pub(crate) async fn create_extra_data_channel(

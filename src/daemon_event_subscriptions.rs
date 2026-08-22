@@ -203,12 +203,7 @@ impl ClientEventMailbox {
                     .map(|counters| counters.nanos_of(event.enqueued_at))
             })
             .unwrap_or(u64::MAX);
-        let bytes = inner
-            .events
-            .iter()
-            .filter_map(|event| serde_json::to_vec(&event.payload).ok())
-            .map(|encoded| encoded.len() as u64)
-            .sum();
+        let bytes = inner.bytes as u64;
         self.age_cell.store(count, oldest, 0, false, bytes);
     }
 

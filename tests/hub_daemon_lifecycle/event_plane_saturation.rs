@@ -177,6 +177,19 @@ fn event_plane_saturation_source_guards_hold() {
             ),
         "IsolatedHub cannot observe dedicated_runtime_worker_threads(); the hang-close child remains the live blast-radius oracle"
     );
+    let harness = fs::read_to_string(root.join("tests/hub_daemon_lifecycle/harness.rs"))
+        .expect("harness");
+    assert!(
+        harness.contains("os.posix_openpt"),
+        "PTY probe must call os.posix_openpt"
+    );
+    let fixtures =
+        fs::read_to_string(root.join("tests/hub_daemon_lifecycle/webrtc_fixtures.rs"))
+            .expect("webrtc fixtures");
+    assert!(
+        fixtures.contains("inbound_overflow") && fixtures.contains("reassembly"),
+        "WebRTC fixture must persist reassembly and record inbound overflow"
+    );
 }
 
 #[test]
@@ -968,8 +981,13 @@ fn run_saturation_arm(arm: SaturationArm) -> ArmReport {
     }
     spawn_quiet_fleet(&endpoint);
     let mut noisy = spawn_noisy_session(&endpoint);
-    let (operations, worker_errors) =
-        run_measurement_workers(&endpoint, &mut unix, &mut webrtc, &mut noisy);
+    let (operations, worker_errors) = run_measurement_workers(
+        &endpoint,
+        hub.data_dir(),
+        &mut unix,
+        &mut webrtc,
+        &mut noisy,
+    );
     assert!(
         worker_errors.is_empty(),
         "measurement worker failed: {worker_errors:?}"
@@ -1162,6 +1180,58 @@ fn wait_unix_marker_or_gap(
     );
 }
 
+fn drain_webrtc_host_events(
+    peer: &mut LocalWebrtcOfferPeer,
+    key: &botster_core::AesGcmKey,
+    saw_event: &mut bool,
+    saw_gap: &mut bool,
+) {
+    if peer.inbound_overflow() > 0 {
+        panic!(
+            "product_failure webrtc inbound overflow={} — fixture must not drop subscribed frames",
+            peer.inbound_overflow()
+        );
+    }
+    let slice_end = Instant::now() + Duration::from_millis(100);
+    loop {
+        match block_on(async { timeout(Duration::from_millis(10), peer.next_host_event(key)).await })
+        {
+            Ok(Ok(botster_hub_client::DaemonEvent::PackageEvent { .. })) => *saw_event = true,
+            Ok(Ok(botster_hub_client::DaemonEvent::EventGap { .. })) => *saw_gap = true,
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => panic!("product_failure webrtc host event: {error}"),
+            Err(_) => break,
+        }
+        if Instant::now() >= slice_end {
+            break;
+        }
+    }
+}
+
+fn fail_webrtc_saturation(
+    endpoint: &botster_hub_client::DaemonEndpoint,
+    data_dir: &Path,
+    peer: &LocalWebrtcOfferPeer,
+    error: &str,
+) -> ! {
+    let record_path = data_dir.join(LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE);
+    let terminal = fs::read_to_string(&record_path).unwrap_or_else(|_| "missing".to_string());
+    let observability = snapshot_observability(endpoint);
+    let pty = probe_pty_allocation();
+    let fd = probe_fd_limit();
+    let class = if pty == ResourceProbe::Confirmed || fd == ResourceProbe::Confirmed {
+        "host_exhaustion"
+    } else {
+        "product_failure"
+    };
+    panic!(
+        "{class} webrtc control failed: {error}; overflow={}; pty={:?} fd={:?}; terminal={terminal}; observability={observability:?}",
+        peer.inbound_overflow(),
+        pty.marker_name(),
+        fd.marker_name()
+    );
+}
+
 fn wait_webrtc_marker_or_gap(
     peer: &mut LocalWebrtcOfferPeer,
     key: &botster_core::AesGcmKey,
@@ -1347,6 +1417,7 @@ fn spawn_noisy_session(endpoint: &botster_hub_client::DaemonEndpoint) -> NoisySe
 
 fn run_measurement_workers(
     endpoint: &botster_hub_client::DaemonEndpoint,
+    data_dir: &Path,
     unix: &mut Option<botster_hub_client::DaemonConnection>,
     webrtc: &mut Option<(
         botster_hub_client::DaemonLocalWebrtcBootstrap,
@@ -1422,24 +1493,20 @@ fn run_measurement_workers(
             let response = block_on(async {
                 peer.encrypted_request(key, &botster_hub_client::DaemonRequest::Status)
                     .await
-            })
-            .expect("webrtc status during saturation");
-            assert_eq!(
-                response.kind,
-                botster_hub_client::DaemonResponseKind::Status,
-                "control must progress on the subscribed WebRTC connection under saturation: {response:?}"
-            );
-            match block_on(async {
-                timeout(Duration::from_millis(20), peer.next_host_event(key)).await
-            }) {
-                Ok(Ok(botster_hub_client::DaemonEvent::PackageEvent { .. })) => {
-                    saw_webrtc_event = true;
-                }
-                Ok(Ok(botster_hub_client::DaemonEvent::EventGap { .. })) => {
-                    saw_webrtc_gap = true;
-                }
-                _ => {}
+            });
+            let response = match response {
+                Ok(response) => response,
+                Err(error) => fail_webrtc_saturation(endpoint, data_dir, peer, &error.to_string()),
+            };
+            if response.kind != botster_hub_client::DaemonResponseKind::Status {
+                fail_webrtc_saturation(
+                    endpoint,
+                    data_dir,
+                    peer,
+                    &format!("unexpected status kind {response:?}"),
+                );
             }
+            drain_webrtc_host_events(peer, key, &mut saw_webrtc_event, &mut saw_webrtc_gap);
         }
         let now = Instant::now();
         if now >= next_input_at && now < end_at {
