@@ -11,6 +11,7 @@
 | Step | `botster_stack_implement` (`run_step_1787377118_173762`) |
 | Approved plan | `docs/plans/prove-the-event-plane-cannot-lag-or-block-hub-operations.md` revision 8 |
 | Merge policy | `direct` into `main`; do not create a PR |
+| Implement commit | `b1413884f7b8af67e3fb9b7ac51798c302a3706b` |
 | Integrated base | `origin/main` `baeb04d` after merge into this ticket branch |
 | Locked Core | `7eafa470a18025895995bbedc20d34b58106a03b` |
 | `teardown_class_applies` | **yes** |
