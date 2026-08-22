@@ -92,6 +92,22 @@ pass "runner sources without CLI or campaign side effects"
 "$PROCESS_CENSUS" --self-test || fail "process census positive control failed"
 pass "process census observes executable-provenance survivors"
 
+timeout_dir="$SELFTEST_DIR/event-plane-timeout"
+mkdir -p "$timeout_dir"
+BOTSTER_LOADED_RUN_TIMEOUT_SECONDS=900 "$RUNNER" \
+  --validate-only \
+  --artifact-dir "$timeout_dir" \
+  --subject-sha 0123456789abcdef0123456789abcdef01234567 \
+  --test-target event-plane-saturation \
+  --repetitions 1 \
+  --stress-profile residual-tail \
+  || fail "event-plane-saturation validate-only failed under a 900s env"
+grep -q '^run_timeout_seconds=3600$' "$timeout_dir/metadata.txt" \
+  || fail "event-plane-saturation must resolve 3600s even when BOTSTER_LOADED_RUN_TIMEOUT_SECONDS=900"
+grep -q '^run_timeout_max=3600$' "$timeout_dir/metadata.txt" \
+  || fail "event-plane-saturation must advertise run_timeout_max=3600"
+pass "event-plane-saturation run timeout is 3600s when the workflow default is 900s"
+
 command -v python3 >/dev/null 2>&1 \
   || fail "missing required self-test command: python3"
 

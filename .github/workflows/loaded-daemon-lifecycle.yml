@@ -206,6 +206,9 @@ jobs:
           TEST_TARGET: ${{ inputs.test_target }}
           STRESS_PROFILE: ${{ inputs.stress_profile }}
         run: |
+          if [[ "$TEST_TARGET" == event-plane-saturation ]]; then
+            export BOTSTER_LOADED_RUN_TIMEOUT_SECONDS=3600
+          fi
           workflow-harness/script/run-loaded-daemon-lifecycle \
             --subject-dir "$GITHUB_WORKSPACE/subject" \
             --artifact-dir "$ARTIFACT_DIR" \

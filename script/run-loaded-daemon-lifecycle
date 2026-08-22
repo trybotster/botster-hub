@@ -81,12 +81,15 @@ validate_inputs() {
     invalid=1
   fi
 
+  resolve_run_timeout
   {
     printf 'validated_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     printf 'subject_sha=%s\n' "$SUBJECT_SHA"
     printf 'test_target=%s\n' "$TEST_TARGET"
     printf 'repetitions=%s\n' "$REPETITIONS"
     printf 'stress_profile=%s\n' "$STRESS_PROFILE"
+    printf 'run_timeout_seconds=%s\n' "$RUN_TIMEOUT_SECONDS"
+    printf 'run_timeout_max=%s\n' "$RUN_TIMEOUT_MAX"
   } >> "$ARTIFACT_DIR/metadata.txt"
 
   if ((invalid != 0)); then
@@ -94,6 +97,22 @@ validate_inputs() {
     return 2
   fi
   printf 'validation_status=valid\n' >> "$ARTIFACT_DIR/metadata.txt"
+}
+
+# Event-plane saturation needs 2 * (30s warm-up + 600s window) plus fleet
+# setup. The workflow default of 900 seconds must not win for that target.
+resolve_run_timeout() {
+  RUN_TIMEOUT_SECONDS=${BOTSTER_LOADED_RUN_TIMEOUT_SECONDS:-$DEFAULT_RUN_TIMEOUT_SECONDS}
+  RUN_TIMEOUT_MAX=1800
+  if [[ "$TEST_TARGET" == event-plane-saturation ]]; then
+    RUN_TIMEOUT_MAX=3600
+    if [[ -z "${BOTSTER_LOADED_RUN_TIMEOUT_SECONDS:-}" ]] \
+      || ((10#$BOTSTER_LOADED_RUN_TIMEOUT_SECONDS < 3600)); then
+      RUN_TIMEOUT_SECONDS=3600
+    else
+      RUN_TIMEOUT_SECONDS=$BOTSTER_LOADED_RUN_TIMEOUT_SECONDS
+    fi
+  fi
 }
 
 validate_linux_runner() {
@@ -964,15 +983,10 @@ main() {
   validate_runner || return 2
   SUBJECT_DIR=$(cd "$SUBJECT_DIR" && pwd)
 
-  RUN_TIMEOUT_SECONDS=${BOTSTER_LOADED_RUN_TIMEOUT_SECONDS:-$DEFAULT_RUN_TIMEOUT_SECONDS}
+  resolve_run_timeout
   CAMPAIGN_TIMEOUT_SECONDS=${BOTSTER_LOADED_CAMPAIGN_TIMEOUT_SECONDS:-$DEFAULT_CAMPAIGN_TIMEOUT_SECONDS}
-  local run_timeout_max=1800
-  if [[ "$TEST_TARGET" == event-plane-saturation ]]; then
-    run_timeout_max=3600
-    RUN_TIMEOUT_SECONDS=${BOTSTER_LOADED_RUN_TIMEOUT_SECONDS:-3600}
-  fi
-  if [[ ! "$RUN_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || ((RUN_TIMEOUT_SECONDS < 5 || RUN_TIMEOUT_SECONDS > run_timeout_max)); then
-    log "invalid BOTSTER_LOADED_RUN_TIMEOUT_SECONDS: expected 5-${run_timeout_max}"
+  if [[ ! "$RUN_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || ((RUN_TIMEOUT_SECONDS < 5 || RUN_TIMEOUT_SECONDS > RUN_TIMEOUT_MAX)); then
+    log "invalid BOTSTER_LOADED_RUN_TIMEOUT_SECONDS: expected 5-${RUN_TIMEOUT_MAX}"
     return 2
   fi
   if [[ ! "$CAMPAIGN_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || ((CAMPAIGN_TIMEOUT_SECONDS < RUN_TIMEOUT_SECONDS || CAMPAIGN_TIMEOUT_SECONDS > 20400)); then
