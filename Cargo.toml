@@ -46,7 +46,6 @@ notify = "8.2.0"
 botster-core-test-support = { git = "https://github.com/trybotster/botster-core.git", rev = "7eafa470a18025895995bbedc20d34b58106a03b" }
 botster-terminal-ghostty = { git = "https://github.com/trybotster/botster-core.git", rev = "7eafa470a18025895995bbedc20d34b58106a03b", features = ["libghostty-vt"] }
 botster-hub-test-support = { path = "crates/botster-hub-test-support" }
-libc = "0.2.177"
 portable-pty = "0.9.0"
 
 [target.'cfg(loom)'.dev-dependencies]

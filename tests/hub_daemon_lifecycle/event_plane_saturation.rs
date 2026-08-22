@@ -9,7 +9,7 @@ use botster_hub::{
     PackageEventPlanePolicy, PackageEventRouter,
 };
 use botster_hub_test_support::{
-    copy_plugin_contract_matrix_fixture, run_client_event_conformance,
+    copy_plugin_contract_matrix_fixture, monotonic_now_ns, run_client_event_conformance,
 };
 
 const EVENT_PLANE_FLEET_N: usize = 300;
@@ -298,6 +298,47 @@ fn event_plane_saturation_output_records_carry_emission_time() {
 }
 
 #[test]
+#[allow(clippy::field_reassign_with_default)]
+fn event_plane_saturation_dataset_records_fault_resync() {
+    let metrics = dummy_op_metrics();
+    let mut operations = BTreeMap::new();
+    let mut thresholds = BTreeMap::new();
+    for operation in EVENT_PLANE_GATED_OPERATIONS {
+        operations.insert(operation.to_string(), metrics.clone());
+        thresholds.insert(operation.to_string(), derive_thresholds(&metrics));
+    }
+    let mut lifecycle = botster_hub_client::DaemonLifecycleCounters::default();
+    lifecycle.lifecycle_baseline_reads = 4;
+    lifecycle.lifecycle_resync_reads = 2;
+    let faults = FaultReport {
+        observability: botster_hub_client::DaemonObservabilityCounters::default(),
+        lifecycle,
+    };
+    let body = phase_dataset_body(
+        CampaignPhase::Calibration,
+        &operations,
+        &operations,
+        &thresholds,
+        &botster_hub_client::DaemonObservabilityCounters::default(),
+        &botster_hub_client::DaemonObservabilityCounters::default(),
+        &faults,
+        None,
+    );
+    assert_eq!(
+        body["lifecycle"]["faults"]["lifecycle_resync_reads"],
+        2,
+        "calibration and acceptance artifacts must record fault resync counts"
+    );
+    assert_eq!(body["lifecycle"]["faults"]["lifecycle_baseline_reads"], 4);
+    assert!(
+        body["lifecycle"]["faults"]["lifecycle_resync_reads"]
+            .as_u64()
+            .is_some(),
+        "resync evidence must not be absent"
+    );
+}
+
+#[test]
 fn event_plane_saturation_throughput_keeps_fractional_ops_per_second() {
     let stats = OperationStats {
         attempts: 200,
@@ -380,7 +421,7 @@ fn event_plane_saturation_campaign() {
             (thresholds, source_revision)
         }
     };
-    let fault_observability = run_fault_campaign();
+    let faults = run_fault_campaign();
     write_phase_dataset(
         phase,
         &enabled_metrics,
@@ -388,7 +429,7 @@ fn event_plane_saturation_campaign() {
         &thresholds,
         &enabled.observability,
         &decoupled.observability,
-        &fault_observability,
+        &faults,
         source_revision,
     );
 }
@@ -441,6 +482,11 @@ struct ArmReport {
     profile: ArmProfile,
     operations: BTreeMap<String, OperationStats>,
     observability: botster_hub_client::DaemonObservabilityCounters,
+}
+
+struct FaultReport {
+    observability: botster_hub_client::DaemonObservabilityCounters,
+    lifecycle: botster_hub_client::DaemonLifecycleCounters,
 }
 
 fn campaign_phase() -> CampaignPhase {
@@ -676,6 +722,19 @@ fn latency_json(histogram: &botster_hub_client::DaemonLatencyHistogram) -> serde
     })
 }
 
+fn dummy_op_metrics() -> OpMetrics {
+    OpMetrics {
+        attempts: 200,
+        successes: 200,
+        failures: 0,
+        p50: 40,
+        p95: 80,
+        p99: 90,
+        max: 100,
+        throughput: 10.0,
+    }
+}
+
 fn observability_json(
     observability: &botster_hub_client::DaemonObservabilityCounters,
 ) -> serde_json::Value {
@@ -707,17 +766,27 @@ fn observability_json(
     })
 }
 
+fn lifecycle_json(
+    lifecycle: &botster_hub_client::DaemonLifecycleCounters,
+) -> serde_json::Value {
+    serde_json::json!({
+        "lifecycle_change_reads": lifecycle.lifecycle_change_reads,
+        "lifecycle_baseline_reads": lifecycle.lifecycle_baseline_reads,
+        "lifecycle_resync_reads": lifecycle.lifecycle_resync_reads
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
-fn write_phase_dataset(
+fn phase_dataset_body(
     phase: CampaignPhase,
     enabled: &BTreeMap<String, OpMetrics>,
     decoupled: &BTreeMap<String, OpMetrics>,
     thresholds: &BTreeMap<String, DerivedThresholds>,
     enabled_obs: &botster_hub_client::DaemonObservabilityCounters,
     decoupled_obs: &botster_hub_client::DaemonObservabilityCounters,
-    fault_obs: &botster_hub_client::DaemonObservabilityCounters,
+    faults: &FaultReport,
     source_revision: Option<String>,
-) {
+) -> serde_json::Value {
     let mut operations = serde_json::Map::new();
     for operation in EVENT_PLANE_GATED_OPERATIONS {
         operations.insert(
@@ -725,11 +794,11 @@ fn write_phase_dataset(
             operation_row(&enabled[operation], &decoupled[operation], &thresholds[operation]),
         );
     }
-    let (status, phase_name) = match phase {
-        CampaignPhase::Calibration => ("calibrated", "calibration"),
-        CampaignPhase::Acceptance => ("accepted", "acceptance"),
+    let status = match phase {
+        CampaignPhase::Calibration => "calibrated",
+        CampaignPhase::Acceptance => "accepted",
     };
-    let body = serde_json::json!({
+    serde_json::json!({
         "campaign": "event-plane-saturation",
         "status": status,
         "literals": campaign_literals(),
@@ -757,14 +826,44 @@ fn write_phase_dataset(
         "observability": {
             "enabled": observability_json(enabled_obs),
             "decoupled": observability_json(decoupled_obs),
-            "faults": observability_json(fault_obs)
+            "faults": observability_json(&faults.observability)
+        },
+        "lifecycle": {
+            "faults": lifecycle_json(&faults.lifecycle)
         },
         "gated_against": match phase {
             CampaignPhase::Acceptance => Some(calibration_path().display().to_string()),
             CampaignPhase::Calibration => None,
         },
         "thresholds": operations,
-    });
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_phase_dataset(
+    phase: CampaignPhase,
+    enabled: &BTreeMap<String, OpMetrics>,
+    decoupled: &BTreeMap<String, OpMetrics>,
+    thresholds: &BTreeMap<String, DerivedThresholds>,
+    enabled_obs: &botster_hub_client::DaemonObservabilityCounters,
+    decoupled_obs: &botster_hub_client::DaemonObservabilityCounters,
+    faults: &FaultReport,
+    source_revision: Option<String>,
+) {
+    let body = phase_dataset_body(
+        phase,
+        enabled,
+        decoupled,
+        thresholds,
+        enabled_obs,
+        decoupled_obs,
+        faults,
+        source_revision,
+    );
+    let phase_name = match phase {
+        CampaignPhase::Calibration => "calibration",
+        CampaignPhase::Acceptance => "acceptance",
+    };
     write_json_destinations(&body, phase_name);
 }
 
@@ -1574,22 +1673,6 @@ fn unix_now_ns() -> u64 {
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_nanos() as u64
-}
-
-fn monotonic_now_ns() -> u64 {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    #[cfg(target_os = "macos")]
-    let clock = libc::CLOCK_UPTIME_RAW;
-    #[cfg(not(target_os = "macos"))]
-    let clock = libc::CLOCK_MONOTONIC;
-    let rc = unsafe { libc::clock_gettime(clock, &mut ts) };
-    assert_eq!(rc, 0, "clock_gettime monotonic");
-    (ts.tv_sec as u64)
-        .saturating_mul(1_000_000_000)
-        .saturating_add(ts.tv_nsec as u64)
 }
 
 fn output_records(events: &[botster_hub_client::DaemonEvent]) -> Vec<OutputRecord> {
@@ -2542,7 +2625,7 @@ fn late_admitted_holder_survives_reload(endpoint: &botster_hub_client::DaemonEnd
         .expect("unsubscribe holder");
 }
 
-fn run_fault_campaign() -> botster_hub_client::DaemonObservabilityCounters {
+fn run_fault_campaign() -> FaultReport {
     prove_shed_busy_non_blocking();
     let stall_path = PathBuf::from(format!(
         "/tmp/bh-event-sat-fault-{}-{}",
@@ -2598,12 +2681,16 @@ fn run_fault_campaign() -> botster_hub_client::DaemonObservabilityCounters {
     run_late_event_holder_matrix(&endpoint);
     stop.store(true, Ordering::SeqCst);
     emitter.join().expect("join fault emitter");
-    let fault_observability = snapshot_observability(&endpoint);
+    let observability = snapshot_observability(&endpoint);
+    let lifecycle = snapshot_lifecycle(&endpoint);
     drop(unix);
     shutdown_owned_sessions(&endpoint);
     assert_no_live_sessions(&endpoint);
     hub.shutdown().expect("shutdown fault hub");
-    fault_observability
+    FaultReport {
+        observability,
+        lifecycle,
+    }
 }
 
 fn fault_shed_full_or_over_rate(endpoint: &botster_hub_client::DaemonEndpoint) {
