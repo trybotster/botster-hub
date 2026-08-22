@@ -791,6 +791,7 @@ pub(crate) fn daemon_status_from_status(
     lifecycle_counters: DaemonLifecycleCounters,
     software: DaemonSoftwareIdentity,
     installation: DaemonInstallationIdentity,
+    observability: botster_hub_client::DaemonObservabilityCounters,
 ) -> DaemonStatus {
     DaemonStatus {
         lifecycle_state: match status.lifecycle_state {
@@ -829,6 +830,7 @@ pub(crate) fn daemon_status_from_status(
             .collect(),
         lifecycle_counters,
         live_attach_occupancy: Vec::new(),
+        observability,
         diagnostics,
     }
 }
@@ -1321,6 +1323,7 @@ mod tests {
             state,
             requested_capabilities: Vec::new(),
             surfaces: Vec::new(),
+            notice_reactions: Vec::new(),
             navigation: Vec::new(),
             runnable_entrypoints: Vec::new(),
             configuration: crate::HubClientPackageConfiguration {
@@ -1753,6 +1756,7 @@ mod tests {
             counters,
             software.clone(),
             installation.clone(),
+            botster_hub_client::DaemonObservabilityCounters::default(),
         );
         assert_eq!(projected.lifecycle_state, "running");
         assert_eq!(projected.compatibility, DaemonCompatibility::current());

@@ -471,15 +471,17 @@ pub(crate) fn disarm_real_daemon_start_boundary() {
         .unwrap_or_else(|error| error.into_inner()) = None;
 }
 
-fn notify_real_daemon_start_boundary() {
-    let current = REAL_DAEMON_START_TOKEN.with(|slot| slot.get());
+pub(crate) fn notify_real_daemon_start_boundary() {
+    let Some(current) = REAL_DAEMON_START_TOKEN.with(|slot| slot.get()) else {
+        return;
+    };
     let mut slot = real_daemon_start_boundary_slot()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     let Some(arm) = slot.as_ref() else {
         return;
     };
-    if current == Some(arm.expected) {
+    if current == arm.expected {
         let _ = arm.matched.send(());
         *slot = None;
         return;

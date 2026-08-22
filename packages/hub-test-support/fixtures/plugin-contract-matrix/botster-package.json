@@ -123,5 +123,31 @@
         "default": { "type": "secret", "state": "unset" }
       }
     ]
+  },
+  "events": {
+    "emitted": [
+      {
+        "name": "contract.ready",
+        "audience": ["clients"],
+        "payload_schema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "subject": { "type": "string" },
+            "notice": { "type": "string" }
+          },
+          "required": ["subject", "notice"]
+        }
+      }
+    ],
+    "notices": [
+      {
+        "name": "contract.ready",
+        "subject_scope": "session",
+        "text_pointer": "/notice",
+        "ttl_ms": 5000,
+        "severity": "info"
+      }
+    ]
   }
 }

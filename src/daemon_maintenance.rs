@@ -17,9 +17,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use botster_core::SessionId;
 use botster_core::{
-    BoundaryJson, PluginAdmissionResult, PluginHandlerKind, PluginHandlerRef,
-    PluginInvocationClass, PluginInvocationContext, PluginInvocationRequest,
-    PluginInvocationResult, RequestId,
+    BoundaryJson, PluginAdmissionResult, PluginCompletion, PluginHandlerKind, PluginHandlerRef,
+    PluginInvocationClass, PluginInvocationContext, PluginInvocationFailureKind,
+    PluginInvocationRequest, PluginInvocationResult, RequestId,
 };
 use botster_core_daemon::{
     LifecycleBaselineBudget, ObserveLifecycleBudget, ObserveLifecycleCursor,
@@ -1118,7 +1118,10 @@ fn run_host_bridge_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
         PluginInvocationRequest {
             request_id: request_id.clone(),
             handler,
-            timeout_ms: 1_000,
+            timeout_ms: runtime
+                .test_seams()
+                .event_invocation_timeout_ms
+                .unwrap_or(1_000),
             context: PluginInvocationContext {
                 client_id: None,
                 session_id: None,
@@ -1271,7 +1274,10 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
             PluginInvocationRequest {
                 request_id: request_id.clone(),
                 handler: handler.handler,
-                timeout_ms: 1_000,
+                timeout_ms: runtime
+                    .test_seams()
+                    .event_invocation_timeout_ms
+                    .unwrap_or(1_000),
                 context: PluginInvocationContext {
                     client_id: None,
                     session_id: None,
@@ -1322,45 +1328,81 @@ fn run_completion_drain_slice(runtime: &HubRuntime, state: &mut MaintenanceState
     let drain =
         runtime.drain_plugin_completions(COMPLETION_DRAIN_MAX_ITEMS, COMPLETION_DRAIN_MAX_BYTES);
     for completion in drain.completions {
-        let request_id = match &completion.result {
-            PluginInvocationResult::Completed(success) => success.request_id.clone(),
-            PluginInvocationResult::Failed(failure) => failure.request_id.clone(),
-        };
-        if let Some(mut flight) = state.event_in_flight.remove(&request_id.0) {
-            if !retire_event_holder(runtime, &mut flight) {
-                queue_event_retirement(state, flight);
+        apply_plugin_completion(runtime, state, &completion);
+    }
+}
+
+fn apply_plugin_completion(
+    runtime: &HubRuntime,
+    state: &mut MaintenanceState,
+    completion: &PluginCompletion,
+) {
+    let request_id = match &completion.result {
+        PluginInvocationResult::Completed(success) => success.request_id.clone(),
+        PluginInvocationResult::Failed(failure) => failure.request_id.clone(),
+    };
+    if state.event_in_flight.contains_key(&request_id.0) {
+        match &completion.result {
+            PluginInvocationResult::Completed(_) => {
+                runtime.event_plane_counters().record_handler_completed_ok();
             }
-            state.scheduler.try_wake();
-            continue;
-        }
-        let Some(plugin_key) = state
-            .session_family
-            .in_flight_by_request
-            .remove(&request_id.0)
-        else {
-            continue;
-        };
-        let success = matches!(completion.result, PluginInvocationResult::Completed(_));
-        state
-            .session_family
-            .touch_existing_consumer(&plugin_key, |consumer| {
-                let ended_this_snapshot = consumer.in_flight.as_ref().is_some_and(|flight| {
-                    flight.kind == FamilyFrameKind::End
-                        && flight.snapshot_sequence == consumer.snapshot_sequence
-                });
-                consumer.in_flight = None;
-                if ended_this_snapshot && success {
-                    consumer.snapshot_complete = true;
-                    consumer.pending.extend(consumer.held_deltas.drain(..));
+            PluginInvocationResult::Failed(failure) => match failure.kind {
+                PluginInvocationFailureKind::TimedOut => {
+                    runtime.event_plane_counters().record_handler_timed_out();
                 }
-            });
-        if !success {
-            state.session_family.mark_gap(&plugin_key);
-            start_baseline_recovery(state);
-            continue;
+                PluginInvocationFailureKind::HandlerFailed => {
+                    runtime.event_plane_counters().record_handler_failed();
+                }
+                PluginInvocationFailureKind::Cancelled => {
+                    runtime.event_plane_counters().record_handler_cancelled();
+                }
+                PluginInvocationFailureKind::Backpressured => {
+                    runtime
+                        .event_plane_counters()
+                        .record_handler_backpressured();
+                }
+                PluginInvocationFailureKind::WorkerStopped => {
+                    runtime
+                        .event_plane_counters()
+                        .record_handler_worker_stopped();
+                }
+            },
+        }
+    }
+    if let Some(mut flight) = state.event_in_flight.remove(&request_id.0) {
+        if !retire_event_holder(runtime, &mut flight) {
+            queue_event_retirement(state, flight);
         }
         state.scheduler.try_wake();
+        return;
     }
+    let Some(plugin_key) = state
+        .session_family
+        .in_flight_by_request
+        .remove(&request_id.0)
+    else {
+        return;
+    };
+    let success = matches!(completion.result, PluginInvocationResult::Completed(_));
+    state
+        .session_family
+        .touch_existing_consumer(&plugin_key, |consumer| {
+            let ended_this_snapshot = consumer.in_flight.as_ref().is_some_and(|flight| {
+                flight.kind == FamilyFrameKind::End
+                    && flight.snapshot_sequence == consumer.snapshot_sequence
+            });
+            consumer.in_flight = None;
+            if ended_this_snapshot && success {
+                consumer.snapshot_complete = true;
+                consumer.pending.extend(consumer.held_deltas.drain(..));
+            }
+        });
+    if !success {
+        state.session_family.mark_gap(&plugin_key);
+        start_baseline_recovery(state);
+        return;
+    }
+    state.scheduler.try_wake();
 }
 
 /// Start a paged baseline recovery. Incomplete pages are not ended evidence.
@@ -3795,6 +3837,210 @@ return botster.register({})
         assert_eq!(snapshot.admitted_holders, 0);
         assert_eq!(snapshot.global_in_flight_bytes, 0);
         let _ = std::fs::remove_dir_all(package_root);
+        let _ = std::fs::remove_dir_all(data_directory);
+    }
+
+    fn install_lua_event_plugin(
+        name: &str,
+        lua: &str,
+    ) -> (crate::packages::PackageRegistry, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "hub-event-lua-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create lua event plugin root");
+        std::fs::write(root.join("plugin.lua"), lua).expect("write lua event plugin");
+        std::fs::write(
+            root.join("botster-package.json"),
+            serde_json::json!({
+                "name": "event-probe.plugin",
+                "version": "1.0.0",
+                "kind": "plugin",
+                "botster": ">=0.1.0",
+                "source": { "type": "path", "path": root.display().to_string() },
+                "capabilities": [],
+                "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+            })
+            .to_string(),
+        )
+        .expect("write lua event manifest");
+        let mut policy = crate::default_package_policy();
+        policy
+            .install_local_path(&root, "install lua event package")
+            .expect("install lua event package");
+        policy
+            .enable("event-probe.plugin", "enable lua event package")
+            .expect("enable lua event package");
+        (policy.registry().clone(), root)
+    }
+
+    fn drain_event_flights(runtime: &HubRuntime, state: &mut MaintenanceState) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline
+            && (!state.event_in_flight.is_empty() || !state.pending_retirements.is_empty())
+        {
+            run_completion_drain_slice(runtime, state);
+            if !state.event_in_flight.is_empty() || !state.pending_retirements.is_empty() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    #[test]
+    fn t1_hold_seam_times_out_distinct_from_handler_failure() {
+        let hold_lua = r#"
+events.on("hub", "worktree_created", function(event)
+  return { received = event.event }
+end)
+return botster.register({})
+"#;
+        let fail_lua = r#"
+events.on("hub", "worktree_created", function(event)
+  error("handler boom")
+end)
+return botster.register({})
+"#;
+
+        let (timeout_registry, timeout_root) = install_lua_event_plugin("t1-hold", hold_lua);
+        let (mut timeout_runtime, timeout_dir) = event_delivery_runtime("t1-hold");
+        timeout_runtime.test_set_seams(crate::runtime::HubTestSeams {
+            event_invocation_timeout_ms: crate::runtime::event_invocation_timeout_ms_from(
+                Some("test"),
+                Some("30"),
+            ),
+            event_handler_hold_ms: crate::runtime::event_handler_hold_ms_from(
+                Some("test"),
+                Some("250"),
+            ),
+            ..crate::runtime::HubTestSeams::default()
+        });
+        timeout_runtime
+            .load_lua_plugin_package(&timeout_registry, "event-probe.plugin")
+            .expect("load hold plugin");
+        ingress_worktree_created(&timeout_runtime);
+        let mut timeout_state = MaintenanceState::default();
+        run_package_event_delivery_slice(&timeout_runtime, &mut timeout_state);
+        assert_eq!(timeout_state.event_in_flight.len(), 1);
+        drain_event_flights(&timeout_runtime, &mut timeout_state);
+        let timeout_snap = timeout_runtime.event_plane_counters_snapshot();
+        assert_eq!(timeout_snap.event_handler_timed_out, 1);
+        assert_eq!(timeout_snap.event_handler_failed, 0);
+        assert_eq!(timeout_snap.event_handler_cancelled, 0);
+        assert_eq!(timeout_snap.event_handler_backpressured, 0);
+        assert_eq!(timeout_snap.event_handler_worker_stopped, 0);
+
+        let (fail_registry, fail_root) = install_lua_event_plugin("t1-fail", fail_lua);
+        let (mut fail_runtime, fail_dir) = event_delivery_runtime("t1-fail");
+        fail_runtime
+            .load_lua_plugin_package(&fail_registry, "event-probe.plugin")
+            .expect("load fail plugin");
+        ingress_worktree_created(&fail_runtime);
+        let mut fail_state = MaintenanceState::default();
+        run_package_event_delivery_slice(&fail_runtime, &mut fail_state);
+        assert_eq!(fail_state.event_in_flight.len(), 1);
+        drain_event_flights(&fail_runtime, &mut fail_state);
+        let fail_snap = fail_runtime.event_plane_counters_snapshot();
+        assert_eq!(fail_snap.event_handler_timed_out, 0);
+        assert_eq!(fail_snap.event_handler_failed, 1);
+        assert_eq!(fail_snap.event_handler_cancelled, 0);
+
+        let _ = std::fs::remove_dir_all(timeout_root);
+        let _ = std::fs::remove_dir_all(timeout_dir);
+        let _ = std::fs::remove_dir_all(fail_root);
+        let _ = std::fs::remove_dir_all(fail_dir);
+    }
+
+    fn event_failure_completion(
+        request_id: &str,
+        kind: PluginInvocationFailureKind,
+    ) -> botster_core::PluginCompletion {
+        let reason = format!("{kind:?}");
+        botster_core::PluginCompletion {
+            class: PluginInvocationClass::Background,
+            result: PluginInvocationResult::Failed(botster_core::PluginInvocationFailure {
+                request_id: RequestId(request_id.to_string()),
+                handler: PluginHandlerRef {
+                    plugin_key: botster_core::PluginKey("consumer".into()),
+                    kind: PluginHandlerKind::Event,
+                    handler_id: "worktree_created".into(),
+                },
+                kind,
+                timeout_ms: Some(1),
+                reason,
+            }),
+        }
+    }
+
+    #[test]
+    fn t1_timed_out_is_distinct_from_handler_failed() {
+        let (runtime, data_directory) = event_delivery_runtime("t1-kind");
+        subscribe_worktree_consumer(&runtime, "consumer");
+        ingress_worktree_created(&runtime);
+        let mut batch = runtime
+            .package_event_router()
+            .pull_ready_batch(8, 64 * 1024, Instant::now(), Duration::from_millis(8))
+            .expect("pull");
+        let delivery = batch.pop().expect("one pulled copy");
+        runtime
+            .package_event_router()
+            .note_admitted(
+                delivery.envelope_id,
+                &delivery.holder.plugin_key,
+                delivery.holder.generation,
+            )
+            .expect("admit");
+        let request_id = package_event_request_id(&delivery);
+        let mut state = MaintenanceState::default();
+        state.event_in_flight.insert(
+            request_id.0.clone(),
+            event_flight(&delivery, None, request_id.0.clone()),
+        );
+        apply_plugin_completion(
+            &runtime,
+            &mut state,
+            &event_failure_completion(&request_id.0, PluginInvocationFailureKind::TimedOut),
+        );
+        let snap = runtime.event_plane_counters_snapshot();
+        assert_eq!(snap.event_handler_timed_out, 1);
+        assert_eq!(snap.event_handler_failed, 0);
+        assert_eq!(snap.event_handler_cancelled, 0);
+        assert_eq!(snap.event_handler_backpressured, 0);
+        assert_eq!(snap.event_handler_worker_stopped, 0);
+        assert!(state.event_in_flight.is_empty());
+
+        ingress_worktree_created(&runtime);
+        let mut batch = runtime
+            .package_event_router()
+            .pull_ready_batch(8, 64 * 1024, Instant::now(), Duration::from_millis(8))
+            .expect("pull failed case");
+        let delivery = batch.pop().expect("failed-case copy");
+        runtime
+            .package_event_router()
+            .note_admitted(
+                delivery.envelope_id,
+                &delivery.holder.plugin_key,
+                delivery.holder.generation,
+            )
+            .expect("admit failed case");
+        let request_id = package_event_request_id(&delivery);
+        state.event_in_flight.insert(
+            request_id.0.clone(),
+            event_flight(&delivery, None, request_id.0.clone()),
+        );
+        apply_plugin_completion(
+            &runtime,
+            &mut state,
+            &event_failure_completion(&request_id.0, PluginInvocationFailureKind::HandlerFailed),
+        );
+        let snap = runtime.event_plane_counters_snapshot();
+        assert_eq!(snap.event_handler_timed_out, 1);
+        assert_eq!(snap.event_handler_failed, 1);
+        assert_eq!(snap.event_handler_cancelled, 0);
         let _ = std::fs::remove_dir_all(data_directory);
     }
 }

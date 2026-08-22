@@ -45,6 +45,93 @@
       ],
       "type": "object"
     },
+    "PackageNoticeReactionDeclaration": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "pattern": "\\S",
+          "type": "string"
+        },
+        "owner": {
+          "pattern": "\\S",
+          "type": "string"
+        },
+        "severity": {
+          "$ref": "#/$defs/PackageNoticeSeverity"
+        },
+        "subject_scope": {
+          "$ref": "#/$defs/PackageNoticeSubjectScope"
+        },
+        "text_pointer": {
+          "$ref": "#/$defs/PackageNoticeTextPointer"
+        },
+        "ttl_ms": {
+          "maximum": 60000,
+          "minimum": 1000,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "name",
+        "subject_scope",
+        "text_pointer",
+        "ttl_ms",
+        "severity"
+      ],
+      "type": "object"
+    },
+    "PackageNoticeReactionDescriptor": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "pattern": "\\S",
+          "type": "string"
+        },
+        "owner": {
+          "pattern": "\\S",
+          "type": "string"
+        },
+        "severity": {
+          "$ref": "#/$defs/PackageNoticeSeverity"
+        },
+        "subject_scope": {
+          "$ref": "#/$defs/PackageNoticeSubjectScope"
+        },
+        "text_pointer": {
+          "$ref": "#/$defs/PackageNoticeTextPointer"
+        },
+        "ttl_ms": {
+          "maximum": 60000,
+          "minimum": 1000,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "owner",
+        "name",
+        "subject_scope",
+        "text_pointer",
+        "ttl_ms",
+        "severity"
+      ],
+      "type": "object"
+    },
+    "PackageNoticeSeverity": {
+      "enum": [
+        "info",
+        "warning",
+        "error"
+      ]
+    },
+    "PackageNoticeSubjectScope": {
+      "enum": [
+        "session"
+      ]
+    },
+    "PackageNoticeTextPointer": {
+      "pattern": "^/([^/~]|~0|~1)+$",
+      "type": "string"
+    },
     "PackageSurfaceDescriptor": {
       "additionalProperties": false,
       "properties": {
@@ -1604,7 +1691,7 @@
       ]
     }
   },
-  "$id": "https://trybotster.dev/schemas/ui-contract-0.3.2.json",
+  "$id": "https://trybotster.dev/schemas/ui-contract-0.3.3.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "oneOf": [
     {
@@ -1621,6 +1708,16 @@
     },
     {
       "$ref": "#/$defs/PackageNavigationEntry"
+    },
+    {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PackageNoticeReactionDeclaration"
+        },
+        {
+          "$ref": "#/$defs/PackageNoticeReactionDescriptor"
+        }
+      ]
     }
   ],
   "title": "Botster UI Contract"
