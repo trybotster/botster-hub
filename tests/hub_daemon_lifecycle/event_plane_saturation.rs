@@ -190,7 +190,7 @@ fn event_plane_saturation_percentile_and_budget_formulas() {
     assert_eq!(thresholds.abs95, ((80.0_f64 * 1.20) + 8.0).ceil() as u64);
     assert_eq!(thresholds.abs99, ((90.0_f64 * 1.20) + 8.0).ceil() as u64);
     assert_eq!(thresholds.absmax, ((90.0_f64 * 3.00) + 8.0).ceil() as u64);
-    assert_eq!(thresholds.thrmin, floor3(10.0_f64 * 0.80));
+    assert_eq!(thresholds.thrmin, (10.0_f64 * 0.80).floor() as u64);
     let decoupled = OpMetrics {
         attempts: 200,
         successes: 200,
@@ -202,6 +202,8 @@ fn event_plane_saturation_percentile_and_budget_formulas() {
         throughput: 10.0,
     };
     gate_relative(&enabled, &decoupled, &thresholds).expect("relative gates pass on equal arms");
+    assert_eq!(floor_int((200.0_f64 / 600.0) * 0.80), 0);
+    assert_eq!(floor_int(10.0_f64 * 0.80), 8);
 }
 
 #[test]
@@ -276,18 +278,24 @@ fn event_plane_saturation_campaign() {
     let decoupled = run_saturation_arm(SaturationArm::PlaneDecoupled);
     let enabled_metrics = metrics_for_arm(&enabled);
     let decoupled_metrics = metrics_for_arm(&decoupled);
-    match phase {
-        CampaignPhase::Calibration => {
-            let thresholds = derive_all_thresholds(&enabled_metrics);
-            write_calibration_dataset(&enabled_metrics, &decoupled_metrics, &thresholds);
-        }
+    let thresholds = match phase {
+        CampaignPhase::Calibration => derive_all_thresholds(&enabled_metrics),
         CampaignPhase::Acceptance => {
             let thresholds = read_committed_thresholds();
             gate_all(&enabled_metrics, &decoupled_metrics, &thresholds);
-            write_acceptance_dataset(&enabled_metrics, &decoupled_metrics, &thresholds);
+            thresholds
         }
-    }
-    run_fault_campaign();
+    };
+    let fault_observability = run_fault_campaign();
+    write_phase_dataset(
+        phase,
+        &enabled_metrics,
+        &decoupled_metrics,
+        &thresholds,
+        &enabled.observability,
+        &decoupled.observability,
+        &fault_observability,
+    );
 }
 
 #[derive(Clone, Copy)]
@@ -331,7 +339,7 @@ struct DerivedThresholds {
     abs95: u64,
     abs99: u64,
     absmax: u64,
-    thrmin: f64,
+    thrmin: u64,
 }
 
 struct ArmReport {
@@ -349,12 +357,12 @@ fn campaign_phase() -> CampaignPhase {
     }
 }
 
-fn floor3(value: f64) -> f64 {
-    (value * 1000.0).floor() / 1000.0
-}
-
 fn round3(value: f64) -> f64 {
     (value * 1000.0).round() / 1000.0
+}
+
+fn floor_int(value: f64) -> u64 {
+    value.floor() as u64
 }
 
 fn nearest_rank(samples: &[u64], p: f64) -> u64 {
@@ -376,7 +384,7 @@ fn derive_thresholds(enabled: &OpMetrics) -> DerivedThresholds {
         abs95: ((enabled.p95 as f64) * 1.20 + EVENT_PLANE_SLACK_MS).ceil() as u64,
         abs99: ((enabled.p99 as f64) * 1.20 + EVENT_PLANE_SLACK_MS).ceil() as u64,
         absmax: ((enabled.p99 as f64) * 3.00 + EVENT_PLANE_SLACK_MS).ceil() as u64,
-        thrmin: floor3(enabled.throughput * EVENT_PLANE_THROUGHPUT_T),
+        thrmin: floor_int(enabled.throughput * EVENT_PLANE_THROUGHPUT_T),
     }
 }
 
@@ -414,7 +422,7 @@ fn gate_relative(
         || enabled.p95 > thresholds.abs95
         || enabled.p99 > thresholds.abs99
         || enabled.max > thresholds.absmax
-        || round3(enabled.throughput) < round3(thresholds.thrmin)
+        || round3(enabled.throughput) < thresholds.thrmin as f64
     {
         return Err("absolute".into());
     }
@@ -564,10 +572,43 @@ fn write_json_destinations(body: &serde_json::Value, phase: &str) {
     }
 }
 
-fn write_calibration_dataset(
+fn observability_json(
+    observability: &botster_hub_client::DaemonObservabilityCounters,
+) -> serde_json::Value {
+    serde_json::json!({
+        "event_admission_attempts": observability.event_admission_attempts,
+        "event_delivery_attempts": observability.event_delivery_attempts,
+        "event_admission_latency_count": observability.event_admission_latency.count,
+        "event_delivery_latency_count": observability.event_delivery_latency.count,
+        "event_shed_by_reason": observability.event_shed_by_reason,
+        "event_gaps": observability.event_gaps,
+        "event_mailbox_overflow_gaps": observability.event_mailbox_overflow_gaps,
+        "event_handler_timed_out": observability.event_handler_timed_out,
+        "event_router_queue_age_expiries": observability.event_router_queue_age_expiries,
+        "event_mailbox_queue_age_expiries": observability.event_mailbox_queue_age_expiries,
+        "stalled_write_timeouts": observability.stalled_write_timeouts,
+        "max_owner_turn_us": observability.max_owner_turn_us,
+        "max_ready_operation_wait_us": observability.max_ready_operation_wait_us,
+        "queue_ages": observability.queue_ages.iter().map(|age| serde_json::json!({
+            "kind": age.kind.as_str(),
+            "identity": age.identity,
+            "queue_count": age.queue_count,
+            "oldest_age_us": age.oldest_age_us,
+            "queue_bytes": serde_json::Value::Null
+        })).collect::<Vec<_>>(),
+        "queue_bytes_available": false,
+        "global_in_flight_bytes_available": false
+    })
+}
+
+fn write_phase_dataset(
+    phase: CampaignPhase,
     enabled: &BTreeMap<String, OpMetrics>,
     decoupled: &BTreeMap<String, OpMetrics>,
     thresholds: &BTreeMap<String, DerivedThresholds>,
+    enabled_obs: &botster_hub_client::DaemonObservabilityCounters,
+    decoupled_obs: &botster_hub_client::DaemonObservabilityCounters,
+    fault_obs: &botster_hub_client::DaemonObservabilityCounters,
 ) {
     let mut operations = serde_json::Map::new();
     for operation in EVENT_PLANE_GATED_OPERATIONS {
@@ -576,55 +617,59 @@ fn write_calibration_dataset(
             operation_row(&enabled[operation], &decoupled[operation], &thresholds[operation]),
         );
     }
+    let (status, phase_name) = match phase {
+        CampaignPhase::Calibration => ("calibrated", "calibration"),
+        CampaignPhase::Acceptance => ("accepted", "acceptance"),
+    };
     let body = serde_json::json!({
         "campaign": "event-plane-saturation",
-        "status": "calibrated",
+        "status": status,
         "literals": campaign_literals(),
         "formulas": {
-            "ABS50": "ceil(p50_enabled * 1.20 + S_ms)",
-            "ABS95": "ceil(p95_enabled * 1.20 + S_ms)",
-            "ABS99": "ceil(p99_enabled * 1.20 + S_ms)",
-            "ABSMAX": "ceil(p99_enabled * 3.00 + S_ms)",
-            "THRMIN": "floor3(throughput_enabled * T)",
+            "ABS50": "ceil_ms(P50cal_e * 1.20 + S)",
+            "ABS95": "ceil_ms(P95cal_e * 1.20 + S)",
+            "ABS99": "ceil_ms(P99cal_e * 1.20 + S)",
+            "ABSMAX": "ceil_ms(P99cal_e * 3.00 + S)",
+            "THRMIN": "floor_int(THRcal_e * T)",
             "percentile": "nearest_rank ceil(p * n)"
         },
         "profile": {
             "runner": "ubuntu-24.04",
             "stress_profile": "residual-tail"
         },
-        "executed_revisions": {
-            "botster-hub": std::env::var("SUBJECT_SHA").ok(),
-            "botster-core": "7eafa470a18025895995bbedc20d34b58106a03b"
+        "revisions": {
+            "source_revision": std::env::var("SUBJECT_SHA").ok(),
+            "botster_core": "7eafa470a18025895995bbedc20d34b58106a03b",
+            "calibration_dataset_commit": git_path_commit(&calibration_path()),
+            "acceptance_revision": match phase {
+                CampaignPhase::Acceptance => std::env::var("SUBJECT_SHA").ok(),
+                CampaignPhase::Calibration => None,
+            }
+        },
+        "observability": {
+            "enabled": observability_json(enabled_obs),
+            "decoupled": observability_json(decoupled_obs),
+            "faults": observability_json(fault_obs)
+        },
+        "gated_against": match phase {
+            CampaignPhase::Acceptance => Some(calibration_path().display().to_string()),
+            CampaignPhase::Calibration => None,
         },
         "thresholds": operations,
     });
-    write_json_destinations(&body, "calibration");
+    write_json_destinations(&body, phase_name);
 }
 
-fn write_acceptance_dataset(
-    enabled: &BTreeMap<String, OpMetrics>,
-    decoupled: &BTreeMap<String, OpMetrics>,
-    thresholds: &BTreeMap<String, DerivedThresholds>,
-) {
-    let mut operations = serde_json::Map::new();
-    for operation in EVENT_PLANE_GATED_OPERATIONS {
-        operations.insert(
-            operation.to_string(),
-            operation_row(&enabled[operation], &decoupled[operation], &thresholds[operation]),
-        );
+fn git_path_commit(path: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args(["log", "-1", "--format=%H", "--", &path.display().to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
     }
-    let body = serde_json::json!({
-        "campaign": "event-plane-saturation",
-        "status": "accepted",
-        "literals": campaign_literals(),
-        "profile": {
-            "runner": "ubuntu-24.04",
-            "stress_profile": "residual-tail"
-        },
-        "gated_against": calibration_path().display().to_string(),
-        "thresholds": operations,
-    });
-    write_json_destinations(&body, "acceptance");
+    let sha = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    (sha.len() == 40).then_some(sha)
 }
 
 fn read_committed_thresholds() -> BTreeMap<String, DerivedThresholds> {
@@ -652,15 +697,24 @@ fn read_committed_thresholds() -> BTreeMap<String, DerivedThresholds> {
     assert_eq!(value["profile"]["stress_profile"], "residual-tail");
     assert_eq!(
         value["formulas"]["THRMIN"],
-        "floor3(throughput_enabled * T)",
+        "floor_int(THRcal_e * T)",
         "acceptance refuses a calibration record with a different throughput formula"
     );
-    if let Ok(subject) = std::env::var("SUBJECT_SHA")
-        && let Some(recorded) = value["executed_revisions"]["botster-hub"].as_str()
-    {
+    let source = value["revisions"]["source_revision"]
+        .as_str()
+        .or_else(|| value["executed_revisions"]["botster-hub"].as_str());
+    if let Some(source) = source {
         assert_eq!(
-            recorded, subject,
-            "acceptance subject SHA must match the calibration record"
+            source.len(),
+            40,
+            "calibration source_revision must be a 40-character SHA"
+        );
+    }
+    if let Some(dataset_commit) = git_path_commit(&path) {
+        assert_eq!(
+            dataset_commit.len(),
+            40,
+            "acceptance must run a commit that contains the calibration dataset"
         );
     }
     let mut out = BTreeMap::new();
@@ -673,7 +727,10 @@ fn read_committed_thresholds() -> BTreeMap<String, DerivedThresholds> {
                 abs95: row["thresholds"]["ABS95"].as_u64().expect("ABS95"),
                 abs99: row["thresholds"]["ABS99"].as_u64().expect("ABS99"),
                 absmax: row["thresholds"]["ABSMAX"].as_u64().expect("ABSMAX"),
-                thrmin: row["thresholds"]["THRMIN"].as_f64().expect("THRMIN"),
+                thrmin: row["thresholds"]["THRMIN"]
+                    .as_u64()
+                    .or_else(|| row["thresholds"]["THRMIN"].as_f64().map(floor_int))
+                    .expect("THRMIN"),
             },
         );
     }
@@ -1057,17 +1114,16 @@ fn run_measurement_workers(
             }
         }
         if let Some((_, peer, key)) = webrtc.as_mut() {
-            let control = block_on(async {
+            let response = block_on(async {
                 peer.encrypted_request(key, &botster_hub_client::DaemonRequest::Status)
                     .await
-            });
-            if let Ok(response) = control {
-                assert_eq!(
-                    response.kind,
-                    botster_hub_client::DaemonResponseKind::Status,
-                    "control must progress on the subscribed WebRTC connection under saturation"
-                );
-            }
+            })
+            .expect("webrtc status during saturation");
+            assert_eq!(
+                response.kind,
+                botster_hub_client::DaemonResponseKind::Status,
+                "control must progress on the subscribed WebRTC connection under saturation: {response:?}"
+            );
             match block_on(async {
                 timeout(Duration::from_millis(20), peer.next_host_event(key)).await
             }) {
@@ -1141,12 +1197,21 @@ fn run_measurement_workers(
             });
         let finished = Instant::now();
         if output_start >= start_at && finished <= end_at {
-            tx.send((
-                "terminal_output".to_string(),
-                saw_output,
-                output_start.elapsed().as_millis() as u64,
-            ))
-            .expect("send terminal output sample");
+            if drain.is_err() {
+                tx.send((
+                    "terminal_output".to_string(),
+                    false,
+                    output_start.elapsed().as_millis() as u64,
+                ))
+                .expect("send terminal output failure");
+            } else if saw_output {
+                tx.send((
+                    "terminal_output".to_string(),
+                    true,
+                    output_start.elapsed().as_millis() as u64,
+                ))
+                .expect("send terminal output sample");
+            }
         }
         thread::sleep(Duration::from_millis(20));
     }
@@ -1348,8 +1413,18 @@ fn assert_required_signals(
         u64::MAX,
         "T4 stalled-write timeout counter must be present"
     );
-    let _ = observability.max_owner_turn_us;
-    let _ = observability.max_ready_operation_wait_us;
+    assert!(
+        observability.max_owner_turn_us <= MAX_OWNER_TURN_MS * 1000,
+        "owner-turn {}us exceeds MAX_OWNER_TURN_MS={}ms",
+        observability.max_owner_turn_us,
+        MAX_OWNER_TURN_MS
+    );
+    assert!(
+        observability.max_ready_operation_wait_us <= MAX_READY_OPERATION_WAIT_MS * 1000,
+        "ready-wait {}us exceeds MAX_READY_OPERATION_WAIT_MS={}ms",
+        observability.max_ready_operation_wait_us,
+        MAX_READY_OPERATION_WAIT_MS
+    );
 }
 
 fn assert_queue_bounds(
@@ -1993,29 +2068,88 @@ fn late_unsubscribe_events_does_not_drop_sibling(endpoint: &botster_hub_client::
 }
 
 fn late_webrtc_event_orders(endpoint: &botster_hub_client::DaemonEndpoint, data_dir: &Path) {
-    let (_bootstrap, first, key) = subscribe_webrtc_events(endpoint, data_dir);
-    drop(first);
-    let (_bootstrap, mut second, key2) = subscribe_webrtc_events(endpoint, data_dir);
-    let reused = block_on(async {
-        second
+    late_webrtc_closed_first(endpoint, data_dir);
+    late_webrtc_message_first(endpoint, data_dir);
+}
+
+fn webrtc_subscribe(
+    endpoint: &botster_hub_client::DaemonEndpoint,
+    data_dir: &Path,
+    subscription_id: &str,
+) -> (
+    botster_hub_client::DaemonLocalWebrtcBootstrap,
+    LocalWebrtcOfferPeer,
+    botster_core::AesGcmKey,
+) {
+    let package_dir = unique_test_dir(&format!("event-sat-web-{subscription_id}"));
+    write_botster_web_package(&package_dir);
+    enable_supervised_package(data_dir, &package_dir);
+    let (_origin, bootstrap) = start_botster_web_and_issue_bootstrap(endpoint);
+    let (peer, key) = block_on(async {
+        let (mut peer, key) = open_local_webrtc_peer(endpoint, &bootstrap).await;
+        peer.enable_host_events();
+        let ack = peer
+            .encrypted_hello(&key, &webrtc_package_event_hello())
+            .await
+            .expect("package-event hello");
+        assert!(
+            ack.compatibility
+                .supports_feature(botster_hub_client::FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS)
+        );
+        let subscribed = peer
             .encrypted_request(
-                &key2,
+                &key,
                 &botster_hub_client::DaemonRequest::SubscribeEvents {
-                    subscription_id: "sub-sat-webrtc".to_string(),
+                    subscription_id: subscription_id.to_string(),
                     owner: "event-plane-producer".to_string(),
                     name: "sample.ready".to_string(),
                     subjects: Vec::new(),
                 },
             )
             .await
+            .expect("subscribe webrtc");
+        assert_eq!(
+            subscribed.kind,
+            botster_hub_client::DaemonResponseKind::EventSubscribed
+        );
+        (peer, key)
+    });
+    (bootstrap, peer, key)
+}
+
+fn webrtc_status(peer: &mut LocalWebrtcOfferPeer, key: &botster_core::AesGcmKey) {
+    let response = block_on(async {
+        peer.encrypted_request(key, &botster_hub_client::DaemonRequest::Status)
+            .await
     })
-    .expect("webrtc closed-first reuse");
+    .expect("webrtc holder status");
     assert_eq!(
-        reused.kind,
-        botster_hub_client::DaemonResponseKind::EventSubscribed
+        response.kind,
+        botster_hub_client::DaemonResponseKind::Status
     );
-    let _ = key;
-    drop(second);
+}
+
+fn late_webrtc_closed_first(endpoint: &botster_hub_client::DaemonEndpoint, data_dir: &Path) {
+    let (_bootstrap, first, _first_key) =
+        webrtc_subscribe(endpoint, data_dir, "sub-late-webrtc-closed");
+    drop(first);
+    let (_bootstrap, mut replacement, replacement_key) =
+        webrtc_subscribe(endpoint, data_dir, "sub-late-webrtc-closed");
+    webrtc_status(&mut replacement, &replacement_key);
+    assert_quiet_fleet_survives(endpoint);
+    drop(replacement);
+}
+
+fn late_webrtc_message_first(endpoint: &botster_hub_client::DaemonEndpoint, data_dir: &Path) {
+    let (_a, mut live, live_key) = webrtc_subscribe(endpoint, data_dir, "sub-late-webrtc-both");
+    let (_b, mut sibling, sibling_key) =
+        webrtc_subscribe(endpoint, data_dir, "sub-late-webrtc-both");
+    webrtc_status(&mut live, &live_key);
+    webrtc_status(&mut sibling, &sibling_key);
+    drop(live);
+    webrtc_status(&mut sibling, &sibling_key);
+    assert_quiet_fleet_survives(endpoint);
+    drop(sibling);
 }
 
 fn late_admitted_holder_survives_reload(endpoint: &botster_hub_client::DaemonEndpoint) {
@@ -2049,7 +2183,7 @@ fn late_admitted_holder_survives_reload(endpoint: &botster_hub_client::DaemonEnd
         .expect("unsubscribe holder");
 }
 
-fn run_fault_campaign() {
+fn run_fault_campaign() -> botster_hub_client::DaemonObservabilityCounters {
     prove_shed_busy_non_blocking();
     let stall_path = PathBuf::from(format!(
         "/tmp/bh-event-sat-fault-{}-{}",
@@ -2093,10 +2227,12 @@ fn run_fault_campaign() {
     run_late_event_holder_matrix(&endpoint);
     stop.store(true, Ordering::SeqCst);
     emitter.join().expect("join fault emitter");
+    let fault_observability = snapshot_observability(&endpoint);
     drop(unix);
     shutdown_owned_sessions(&endpoint);
     assert_no_live_sessions(&endpoint);
     hub.shutdown().expect("shutdown fault hub");
+    fault_observability
 }
 
 fn fault_shed_full_or_over_rate(endpoint: &botster_hub_client::DaemonEndpoint) {
