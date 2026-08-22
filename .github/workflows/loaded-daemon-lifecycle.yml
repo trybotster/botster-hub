@@ -27,6 +27,7 @@ on:
           - focused-operator-console
           - focused-lua-worker-suite
           - focused-lua-session-worker-callers
+          - event-plane-saturation
           - full-suite-contention
       repetitions:
         description: Number of repetitions (1-100)

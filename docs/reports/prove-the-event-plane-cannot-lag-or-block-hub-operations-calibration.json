@@ -1,0 +1,23 @@
+{
+  "campaign": "event-plane-saturation",
+  "status": "pending_reference_runner_calibration",
+  "literals": {
+    "R": 1.25,
+    "S_ms": 8,
+    "T": 0.8,
+    "N": 300,
+    "window_seconds": 600,
+    "warmup_seconds": 30,
+    "minimum_samples": 200,
+    "driver_concurrency": 4,
+    "events_per_second": 150,
+    "burst_count": 25,
+    "payload_bytes": 4096
+  },
+  "profile": {
+    "runner": "ubuntu-24.04",
+    "stress_profile": "residual-tail"
+  },
+  "thresholds": null,
+  "note": "Acceptance must not run until this file contains immutable ABS* and THRMIN literals derived from a residual-tail calibration dispatch on the loaded-daemon-lifecycle runner."
+}
