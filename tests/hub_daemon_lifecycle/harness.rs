@@ -275,7 +275,7 @@ pub(crate) fn probe_pty_allocation() -> ResourceProbe {
     let result = Command::new("python3")
         .args([
             "-c",
-            "import os, sys\ntry:\n    fd = os.openpt(os.O_RDWR | os.O_NOCTTY)\n    os.close(fd)\n    sys.exit(0)\nexcept OSError as error:\n    sys.exit(error.errno)",
+            "import os, sys\ntry:\n    fd = os.posix_openpt(os.O_RDWR | os.O_NOCTTY)\n    os.close(fd)\n    sys.exit(0)\nexcept OSError as error:\n    sys.exit(error.errno)",
         ])
         .status();
     match result {
