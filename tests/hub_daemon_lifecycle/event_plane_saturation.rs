@@ -51,6 +51,7 @@ const EVENT_PLANE_GATED_OPERATIONS: [&str; 11] = [
     "terminal_output",
 ];
 const EVENT_PLANE_QUEUE_AGE_US: u64 = 1_000 * 1_000;
+const EVENT_PLANE_MAX_AGE_SAMPLE_FAILURES: u64 = 0;
 
 #[test]
 fn event_plane_saturation_source_guards_hold() {
@@ -103,6 +104,7 @@ fn event_plane_saturation_source_guards_hold() {
     assert_eq!(EVENT_PLANE_RATIO_R, 1.25);
     assert_eq!(EVENT_PLANE_SLACK_MS, 8.0);
     assert_eq!(EVENT_PLANE_THROUGHPUT_T, 0.80);
+    assert_eq!(EVENT_PLANE_MAX_AGE_SAMPLE_FAILURES, 0);
 
     let unix = fs::read_to_string(root.join("src/unix_terminal_adapter.rs")).expect("unix adapter");
     let webrtc =
@@ -204,6 +206,51 @@ fn event_plane_saturation_percentile_and_budget_formulas() {
     gate_relative(&enabled, &decoupled, &thresholds).expect("relative gates pass on equal arms");
     assert_eq!(floor_int((200.0_f64 / 600.0) * 0.80), 0);
     assert_eq!(floor_int(10.0_f64 * 0.80), 8);
+}
+
+#[test]
+fn event_plane_saturation_queue_bounds_reject_indeterminate_rows() {
+    let defaults = PackageEventPlaneOptions::default();
+    let mut observability = botster_hub_client::DaemonObservabilityCounters::default();
+    observability.queue_ages.push(botster_hub_client::DaemonQueueAgeObservation::new(
+        botster_hub_client::DaemonQueueKind::Producer,
+        "event-plane-producer",
+        Some(1),
+        botster_hub_client::DaemonQueueAgeState::Indeterminate,
+        None,
+        None,
+    ));
+    let violations = queue_bound_violations(&observability, &defaults);
+    assert!(
+        violations.iter().any(|row| row.contains("indeterminate")),
+        "active indeterminate rows must fail: {violations:?}"
+    );
+
+    observability.event_age_sample_failures = 1;
+    observability.queue_ages.clear();
+    let failures = queue_bound_violations(&observability, &defaults);
+    assert!(
+        failures
+            .iter()
+            .any(|row| row.contains("event_age_sample_failures")),
+        "sample-failure budget must fail: {failures:?}"
+    );
+}
+
+#[test]
+fn event_plane_saturation_output_records_carry_emission_time() {
+    let payload = botster_hub_client::DaemonLiveOutputPayload::from_bytes(
+        b"N00000007T00000001234567890123xxxx\n",
+    );
+    let events = [botster_hub_client::DaemonEvent::TerminalOutput {
+        session_id: EVENT_PLANE_NOISY_SESSION.to_string(),
+        subscription_id: EVENT_PLANE_NOISY_SUB.to_string(),
+        payload,
+    }];
+    let records = output_records(&events);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].seq, 7);
+    assert_eq!(records[0].emit_ns, 1_234_567_890_123);
 }
 
 #[test]
@@ -883,14 +930,22 @@ fn enable_saturation_packages(endpoint: &botster_hub_client::DaemonEndpoint, dat
 fn subscribe_unix_events(
     endpoint: &botster_hub_client::DaemonEndpoint,
 ) -> botster_hub_client::DaemonConnection {
+    subscribe_unix_events_filtered(endpoint, "sub-sat-unix", Vec::new())
+}
+
+fn subscribe_unix_events_filtered(
+    endpoint: &botster_hub_client::DaemonEndpoint,
+    subscription_id: &str,
+    subjects: Vec<String>,
+) -> botster_hub_client::DaemonConnection {
     let mut connection =
         botster_hub_client::connect_for_package_event_subscriptions(endpoint).expect("unix events");
     let subscribed = connection
         .subscribe_events(
-            "sub-sat-unix",
+            subscription_id,
             "event-plane-producer",
             "sample.ready",
-            Vec::new(),
+            subjects,
         )
         .expect("subscribe unix");
     assert_eq!(
@@ -898,6 +953,90 @@ fn subscribe_unix_events(
         botster_hub_client::DaemonResponseKind::EventSubscribed
     );
     connection
+}
+
+fn unique_event_marker(kind: &str) -> String {
+    format!("{kind}-{}", unix_now_ns())
+}
+
+fn emit_unique_event(endpoint: &botster_hub_client::DaemonEndpoint, token: &str) {
+    let emitted = botster_hub_client::request(
+        endpoint,
+        botster_hub_client::DaemonRequest::PluginMcpCallTool {
+            name: "event_plane.emit_ready".to_string(),
+            arguments: serde_json::json!({ "token": token, "subject": token }),
+        },
+    )
+    .expect("emit unique event");
+    assert_ne!(
+        emitted.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError,
+        "unique event emit failed: {emitted:?}"
+    );
+}
+
+fn package_event_has_token(event: &botster_hub_client::DaemonEvent, token: &str) -> bool {
+    matches!(
+        event,
+        botster_hub_client::DaemonEvent::PackageEvent { payload, .. }
+            if payload.get("token").and_then(|value| value.as_str()) == Some(token)
+    )
+}
+
+fn event_gap_for_subscription(event: &botster_hub_client::DaemonEvent, subscription_id: &str) -> bool {
+    matches!(
+        event,
+        botster_hub_client::DaemonEvent::EventGap { subscription_id: sid, .. }
+            if sid == subscription_id
+    )
+}
+
+fn wait_unix_marker_or_gap(
+    connection: &mut botster_hub_client::DaemonConnection,
+    token: &str,
+    subscription_id: &str,
+) {
+    connection
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .ok();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        match connection.next_event() {
+            Ok(event) if package_event_has_token(&event, token) => {
+                connection.set_read_timeout(None).ok();
+                return;
+            }
+            Ok(event) if event_gap_for_subscription(&event, subscription_id) => {
+                connection.set_read_timeout(None).ok();
+                return;
+            }
+            Ok(_) | Err(_) => {}
+        }
+    }
+    connection.set_read_timeout(None).ok();
+    panic!(
+        "subscribed client must receive unique marker {token} or EventGap for {subscription_id}"
+    );
+}
+
+fn wait_webrtc_marker_or_gap(
+    peer: &mut LocalWebrtcOfferPeer,
+    key: &botster_core::AesGcmKey,
+    token: &str,
+    subscription_id: &str,
+) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        match block_on(async { timeout(Duration::from_millis(250), peer.next_host_event(key)).await })
+        {
+            Ok(Ok(event)) if package_event_has_token(&event, token) => return,
+            Ok(Ok(event)) if event_gap_for_subscription(&event, subscription_id) => return,
+            _ => {}
+        }
+    }
+    panic!(
+        "replacement WebRTC peer must receive unique marker {token} or EventGap for {subscription_id}"
+    );
 }
 
 fn subscribe_webrtc_events(
@@ -1040,7 +1179,7 @@ fn spawn_noisy_session(endpoint: &botster_hub_client::DaemonEndpoint) -> NoisySe
         endpoint,
         botster_hub_client::DaemonRequest::Spawn {
             session_id: EVENT_PLANE_NOISY_SESSION.to_string(),
-            command: "printf 'ns-ready\\n'; printf '\\200\\377\\n'; i=0; while true; do printf 'N%08d%.4087s\\n' \"$i\" ''; i=$((i+1)); sleep 0.1; done & while IFS= read -r line; do printf 'ns-echo:%s\\n' \"$line\"; done".to_string(),
+            command: "printf 'ns-ready\\n'; printf '\\200\\377\\n'; i=0; while true; do ts=$(python3 -c 'import time; print(time.time_ns())'); printf 'N%08dT%020d\\n' \"$i\" \"$ts\"; i=$((i+1)); sleep 0.1; done & while IFS= read -r line; do printf 'ns-echo:%s\\n' \"$line\"; done".to_string(),
         },
     )
     .expect("spawn noisy");
@@ -1219,10 +1358,11 @@ fn run_measurement_workers(
                 EVENT_PLANE_NOISY_SUB,
                 None,
             );
-            let seqs = output_sequence_ids(&drained);
+            let records = output_records(&drained);
+            let receipt_ns = unix_now_ns();
             if in_window {
-                for seq in seqs {
-                    if next_output_seq.is_some_and(|expected| seq != expected) {
+                for record in records {
+                    if next_output_seq.is_some_and(|expected| record.seq != expected) {
                         tx.send((
                             "terminal_output".to_string(),
                             false,
@@ -1231,16 +1371,13 @@ fn run_measurement_workers(
                         .expect("send terminal output sequence failure");
                         break;
                     }
-                    next_output_seq = Some(seq.saturating_add(1));
-                    tx.send((
-                        "terminal_output".to_string(),
-                        true,
-                        output_start.elapsed().as_millis() as u64,
-                    ))
-                    .expect("send terminal output sample");
+                    next_output_seq = Some(record.seq.saturating_add(1));
+                    let latency_ms = receipt_ns.saturating_sub(record.emit_ns) / 1_000_000;
+                    tx.send(("terminal_output".to_string(), true, latency_ms))
+                        .expect("send terminal output sample");
                 }
-            } else if let Some(&seq) = seqs.last() {
-                next_output_seq = Some(seq.saturating_add(1));
+            } else if let Some(record) = records.last() {
+                next_output_seq = Some(record.seq.saturating_add(1));
             }
         }
         thread::sleep(Duration::from_millis(20));
@@ -1382,8 +1519,20 @@ fn expect_kind(
     Ok(())
 }
 
-fn output_sequence_ids(events: &[botster_hub_client::DaemonEvent]) -> Vec<u64> {
-    let mut seqs = Vec::new();
+struct OutputRecord {
+    seq: u64,
+    emit_ns: u64,
+}
+
+fn unix_now_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos() as u64
+}
+
+fn output_records(events: &[botster_hub_client::DaemonEvent]) -> Vec<OutputRecord> {
+    let mut records = Vec::new();
     for event in events {
         let botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } = event else {
             continue;
@@ -1392,21 +1541,32 @@ fn output_sequence_ids(events: &[botster_hub_client::DaemonEvent]) -> Vec<u64> {
             continue;
         };
         let mut index = 0;
-        while index + 9 <= bytes.len() {
-            if bytes[index] == b'N'
+        while index + 30 <= bytes.len() {
+            let seq_ok = bytes[index] == b'N'
                 && bytes[index + 1..index + 9]
                     .iter()
-                    .all(|byte| byte.is_ascii_digit())
-            {
-                let digits = std::str::from_utf8(&bytes[index + 1..index + 9]).expect("digits");
-                seqs.push(digits.parse::<u64>().expect("seq"));
-                index += 9;
+                    .all(|byte| byte.is_ascii_digit());
+            let time_ok = bytes[index + 9] == b'T'
+                && bytes[index + 10..index + 30]
+                    .iter()
+                    .all(|byte| byte.is_ascii_digit());
+            if seq_ok && time_ok {
+                let seq = std::str::from_utf8(&bytes[index + 1..index + 9])
+                    .expect("seq digits")
+                    .parse::<u64>()
+                    .expect("seq");
+                let emit_ns = std::str::from_utf8(&bytes[index + 10..index + 30])
+                    .expect("emit digits")
+                    .parse::<u64>()
+                    .expect("emit_ns");
+                records.push(OutputRecord { seq, emit_ns });
+                index += 30;
             } else {
                 index += 1;
             }
         }
     }
-    seqs
+    records
 }
 
 fn snapshot_observability(
@@ -1488,63 +1648,105 @@ fn assert_queue_bounds(
     observability: &botster_hub_client::DaemonObservabilityCounters,
     defaults: &PackageEventPlaneOptions,
 ) {
-    for age in &observability.queue_ages {
-        let Some(count) = age.queue_count else {
-            continue;
-        };
-        let max = match age.kind {
-            botster_hub_client::DaemonQueueKind::Producer => {
-                defaults.producer_queue_max_events as u64
-            }
-            botster_hub_client::DaemonQueueKind::Consumer
-            | botster_hub_client::DaemonQueueKind::ClientMailbox => {
-                defaults.consumer_queue_max_events as u64
-            }
-            _ => u64::MAX,
-        };
-        assert!(
-            count <= max,
-            "queue {:?} identity={} count={count} exceeds bound {max}",
-            age.kind,
-            age.identity
-        );
-        if let Some(age_us) = age.oldest_age_us {
-            assert!(
-                age_us <= EVENT_PLANE_QUEUE_AGE_US,
-                "queue {:?} identity={} oldest_age_us={age_us} exceeds queue_age 1000ms",
-                age.kind,
-                age.identity
-            );
-        }
-        let Some(bytes) = age.queue_bytes else {
-            panic!(
-                "queue {:?} identity={} missing queue_bytes",
-                age.kind, age.identity
-            );
-        };
-        let max_bytes = match age.kind {
-            botster_hub_client::DaemonQueueKind::Producer => {
-                defaults.producer_queue_max_bytes as u64
-            }
-            botster_hub_client::DaemonQueueKind::Consumer
-            | botster_hub_client::DaemonQueueKind::ClientMailbox => {
-                defaults.consumer_queue_max_bytes as u64
-            }
-            _ => u64::MAX,
-        };
-        assert!(
-            bytes <= max_bytes,
-            "queue {:?} identity={} queue_bytes={bytes} exceeds bound {max_bytes}",
-            age.kind,
-            age.identity
-        );
-    }
+    let violations = queue_bound_violations(observability, defaults);
     assert!(
-        observability.global_in_flight_bytes <= defaults.global_in_flight_bytes as u64,
-        "global_in_flight_bytes {} exceeds {}",
-        observability.global_in_flight_bytes,
-        defaults.global_in_flight_bytes
+        violations.is_empty(),
+        "queue bound violations: {violations:?}"
     );
+}
+
+fn queue_bound_violations(
+    observability: &botster_hub_client::DaemonObservabilityCounters,
+    defaults: &PackageEventPlaneOptions,
+) -> Vec<String> {
+    let mut violations = Vec::new();
+    for age in &observability.queue_ages {
+        match age.state {
+            botster_hub_client::DaemonQueueAgeState::Empty => {
+                if age.queue_count != Some(0) || age.queue_bytes != Some(0) {
+                    violations.push(format!(
+                        "retired queue {:?} identity={} must prove count=0 bytes=0, got count={:?} bytes={:?}",
+                        age.kind, age.identity, age.queue_count, age.queue_bytes
+                    ));
+                }
+            }
+            botster_hub_client::DaemonQueueAgeState::Usable => {
+                let Some(count) = age.queue_count else {
+                    violations.push(format!(
+                        "usable queue {:?} identity={} missing queue_count",
+                        age.kind, age.identity
+                    ));
+                    continue;
+                };
+                let Some(bytes) = age.queue_bytes else {
+                    violations.push(format!(
+                        "usable queue {:?} identity={} missing queue_bytes",
+                        age.kind, age.identity
+                    ));
+                    continue;
+                };
+                let max = match age.kind {
+                    botster_hub_client::DaemonQueueKind::Producer => {
+                        defaults.producer_queue_max_events as u64
+                    }
+                    botster_hub_client::DaemonQueueKind::Consumer
+                    | botster_hub_client::DaemonQueueKind::ClientMailbox => {
+                        defaults.consumer_queue_max_events as u64
+                    }
+                    _ => u64::MAX,
+                };
+                if count > max {
+                    violations.push(format!(
+                        "queue {:?} identity={} count={count} exceeds bound {max}",
+                        age.kind, age.identity
+                    ));
+                }
+                if let Some(age_us) = age.oldest_age_us
+                    && age_us > EVENT_PLANE_QUEUE_AGE_US
+                {
+                    violations.push(format!(
+                        "queue {:?} identity={} oldest_age_us={age_us} exceeds queue_age 1000ms",
+                        age.kind, age.identity
+                    ));
+                }
+                let max_bytes = match age.kind {
+                    botster_hub_client::DaemonQueueKind::Producer => {
+                        defaults.producer_queue_max_bytes as u64
+                    }
+                    botster_hub_client::DaemonQueueKind::Consumer
+                    | botster_hub_client::DaemonQueueKind::ClientMailbox => {
+                        defaults.consumer_queue_max_bytes as u64
+                    }
+                    _ => u64::MAX,
+                };
+                if bytes > max_bytes {
+                    violations.push(format!(
+                        "queue {:?} identity={} queue_bytes={bytes} exceeds bound {max_bytes}",
+                        age.kind, age.identity
+                    ));
+                }
+            }
+            _ => {
+                violations.push(format!(
+                    "active queue {:?} identity={} is indeterminate without count and byte bounds",
+                    age.kind, age.identity
+                ));
+            }
+        }
+    }
+    if observability.global_in_flight_bytes > defaults.global_in_flight_bytes as u64 {
+        violations.push(format!(
+            "global_in_flight_bytes {} exceeds {}",
+            observability.global_in_flight_bytes, defaults.global_in_flight_bytes
+        ));
+    }
+    if observability.event_age_sample_failures > EVENT_PLANE_MAX_AGE_SAMPLE_FAILURES {
+        violations.push(format!(
+            "event_age_sample_failures {} exceeds EVENT_PLANE_MAX_AGE_SAMPLE_FAILURES={EVENT_PLANE_MAX_AGE_SAMPLE_FAILURES}",
+            observability.event_age_sample_failures
+        ));
+    }
+    violations
 }
 
 fn shutdown_owned_sessions(endpoint: &botster_hub_client::DaemonEndpoint) {
@@ -2161,6 +2363,7 @@ fn webrtc_subscribe(
     endpoint: &botster_hub_client::DaemonEndpoint,
     data_dir: &Path,
     subscription_id: &str,
+    subjects: Vec<String>,
 ) -> (
     botster_hub_client::DaemonLocalWebrtcBootstrap,
     LocalWebrtcOfferPeer,
@@ -2188,7 +2391,7 @@ fn webrtc_subscribe(
                     subscription_id: subscription_id.to_string(),
                     owner: "event-plane-producer".to_string(),
                     name: "sample.ready".to_string(),
-                    subjects: Vec::new(),
+                    subjects,
                 },
             )
             .await
@@ -2216,19 +2419,20 @@ fn webrtc_status(peer: &mut LocalWebrtcOfferPeer, key: &botster_core::AesGcmKey)
 
 fn late_webrtc_closed_first(endpoint: &botster_hub_client::DaemonEndpoint, data_dir: &Path) {
     let (_bootstrap, first, _first_key) =
-        webrtc_subscribe(endpoint, data_dir, "sub-late-webrtc-closed");
+        webrtc_subscribe(endpoint, data_dir, "sub-late-webrtc-closed", Vec::new());
     drop(first);
     let (_bootstrap, mut replacement, replacement_key) =
-        webrtc_subscribe(endpoint, data_dir, "sub-late-webrtc-closed");
+        webrtc_subscribe(endpoint, data_dir, "sub-late-webrtc-closed", Vec::new());
     webrtc_status(&mut replacement, &replacement_key);
     assert_quiet_fleet_survives(endpoint);
     drop(replacement);
 }
 
 fn late_webrtc_message_first(endpoint: &botster_hub_client::DaemonEndpoint, data_dir: &Path) {
-    let (_a, mut live, live_key) = webrtc_subscribe(endpoint, data_dir, "sub-late-webrtc-both");
+    let (_a, mut live, live_key) =
+        webrtc_subscribe(endpoint, data_dir, "sub-late-webrtc-both", Vec::new());
     let (_b, mut sibling, sibling_key) =
-        webrtc_subscribe(endpoint, data_dir, "sub-late-webrtc-both");
+        webrtc_subscribe(endpoint, data_dir, "sub-late-webrtc-both", Vec::new());
     webrtc_status(&mut live, &live_key);
     webrtc_status(&mut sibling, &sibling_key);
     drop(live);
@@ -2445,7 +2649,26 @@ fn fault_dropped_lifecycle_wake(
     );
 }
 
+fn snapshot_lifecycle(
+    endpoint: &botster_hub_client::DaemonEndpoint,
+) -> botster_hub_client::DaemonLifecycleCounters {
+    let status = botster_hub_client::request(endpoint, botster_hub_client::DaemonRequest::Status)
+        .expect("status lifecycle snapshot");
+    assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
+    status.status.expect("status body").lifecycle_counters
+}
+
 fn fault_lifecycle_cursor_expiry(endpoint: &botster_hub_client::DaemonEndpoint) {
+    let before = snapshot_lifecycle(endpoint).lifecycle_resync_reads;
+    expect_kind(
+        endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: "cursor-changed".to_string(),
+            command: "exec sleep 7200".to_string(),
+        },
+        botster_hub_client::DaemonResponseKind::Spawned,
+    )
+    .expect("spawn cursor-changed");
     for index in 0..20 {
         let session_id = format!("cursor-{index}");
         let _ = botster_hub_client::request(
@@ -2460,18 +2683,33 @@ fn fault_lifecycle_cursor_expiry(endpoint: &botster_hub_client::DaemonEndpoint) 
             botster_hub_client::DaemonRequest::ShutdownSession { session_id },
         );
     }
-    let listed = botster_hub_client::request(endpoint, botster_hub_client::DaemonRequest::ListSessions)
-        .expect("list after journal wrap");
-    assert!(
-        listed
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let listed =
+            botster_hub_client::request(endpoint, botster_hub_client::DaemonRequest::ListSessions)
+                .expect("list after journal wrap");
+        let after = snapshot_lifecycle(endpoint);
+        let changed_running = listed.sessions.iter().any(|session| {
+            session.session_id == "cursor-changed" && session.lifecycle == "running"
+        });
+        let quiet = listed
             .sessions
             .iter()
-            .filter(|session| session.session_id.starts_with("quiet-")
-                && session.lifecycle == "running")
-            .count()
-            >= EVENT_PLANE_FLEET_N,
-        "after 16-row journal wrap, quiet fleet must resync from baseline"
-    );
+            .filter(|session| {
+                session.session_id.starts_with("quiet-") && session.lifecycle == "running"
+            })
+            .count();
+        if after.lifecycle_resync_reads > before && changed_running && quiet >= EVENT_PLANE_FLEET_N {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "cursor expiry must increment lifecycle_resync_reads (before={before}, after={}) and reconstruct cursor-changed: {after:?} changed_running={changed_running} quiet={quiet}",
+                after.lifecycle_resync_reads
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn fault_handler_timeout(endpoint: &botster_hub_client::DaemonEndpoint) {
@@ -2501,33 +2739,12 @@ fn fault_plugin_worker_restart(
         .request(&botster_hub_client::DaemonRequest::Status)
         .expect("status after reload");
     assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
-    let before = snapshot_observability(endpoint).event_admission_attempts;
-    let _ = botster_hub_client::request(
-        endpoint,
-        botster_hub_client::DaemonRequest::PluginMcpCallTool {
-            name: "event_plane.emit_burst".to_string(),
-            arguments: serde_json::json!({ "count": 25, "prefix": "reload" }),
-        },
-    );
-    unix.set_read_timeout(Some(Duration::from_secs(3))).ok();
-    let mut delivered = false;
-    for _ in 0..8 {
-        match unix.next_event() {
-            Ok(botster_hub_client::DaemonEvent::PackageEvent { .. })
-            | Ok(botster_hub_client::DaemonEvent::EventGap { .. }) => {
-                delivered = true;
-                break;
-            }
-            Ok(_) => continue,
-            Err(_) => break,
-        }
-    }
-    unix.set_read_timeout(None).ok();
-    let after = snapshot_observability(endpoint).event_admission_attempts;
-    assert!(
-        delivered || after > before,
-        "producer reload must still admit or deliver events"
-    );
+    let token = unique_event_marker("reload");
+    let subscription_id = "sub-sat-reload";
+    let mut holder =
+        subscribe_unix_events_filtered(endpoint, subscription_id, vec![token.clone()]);
+    emit_unique_event(endpoint, &token);
+    wait_unix_marker_or_gap(&mut holder, &token, subscription_id);
 }
 
 fn fault_unix_reconnect(
@@ -2565,20 +2782,39 @@ fn fault_webrtc_reconnect_unix_survives(
     endpoint: &botster_hub_client::DaemonEndpoint,
     data_dir: &Path,
 ) {
-    let (_bootstrap, peer, key) = subscribe_webrtc_events(endpoint, data_dir);
-    let response = block_on(async {
-        let mut peer = peer;
+    let (_bootstrap, first, first_key) = subscribe_webrtc_events(endpoint, data_dir);
+    let first_status = block_on(async {
+        let mut peer = first;
         let response = peer
-            .encrypted_request(&key, &botster_hub_client::DaemonRequest::Status)
+            .encrypted_request(&first_key, &botster_hub_client::DaemonRequest::Status)
             .await;
         drop(peer);
         response
     })
-    .expect("webrtc status during reconnect lane");
+    .expect("initial subscribed WebRTC peer status");
     assert_eq!(
-        response.kind,
+        first_status.kind,
         botster_hub_client::DaemonResponseKind::Status
     );
+    let token = unique_event_marker("webrtc-re");
+    let subscription_id = "sub-sat-webrtc-re";
+    let (_bootstrap, mut replacement, replacement_key) =
+        webrtc_subscribe(endpoint, data_dir, subscription_id, vec![token.clone()]);
+    emit_unique_event(endpoint, &token);
+    wait_webrtc_marker_or_gap(
+        &mut replacement,
+        &replacement_key,
+        &token,
+        subscription_id,
+    );
+    let unix_status =
+        botster_hub_client::request(endpoint, botster_hub_client::DaemonRequest::Status)
+            .expect("unix status after webrtc reconnect");
+    assert_eq!(
+        unix_status.kind,
+        botster_hub_client::DaemonResponseKind::Status
+    );
+    drop(replacement);
     assert_quiet_fleet_survives(endpoint);
 }
 

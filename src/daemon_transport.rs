@@ -298,6 +298,7 @@ fn run_one_owner_maintenance_slice(daemon: &mut HubDaemon, state: &mut DaemonCon
     }
     state.lifecycle_counters.lifecycle_change_reads = state.maintenance.journal_page_reads;
     state.lifecycle_counters.lifecycle_baseline_reads = state.maintenance.baseline_page_reads;
+    state.lifecycle_counters.lifecycle_resync_reads = state.maintenance.resync_reads;
     if owner_maintenance_pending(daemon, state) {
         state.maintenance.try_wake();
     }
