@@ -14,8 +14,8 @@ under saturation and does not change terminal byte ownership.
 
 | Parameter | Fixed value |
 | --- | --- |
-| Runner | fresh GitHub-hosted `ubuntu-24.04` from `.github/workflows/loaded-daemon-lifecycle.yml` |
-| Recorded fields | runner image, architecture, CPU count, total memory, kernel release, `ulimit -n`, PTY ceiling, Rust 1.97.0, Zig 0.16.0 |
+| Runner | self-hosted `botster-ubuntu-24.04-16core` (Linux x64 Ubuntu 24.04, exactly 16 logical CPUs) from `.github/workflows/loaded-daemon-lifecycle.yml` |
+| Recorded fields | runner label, runner image, architecture, logical CPU count, total memory, kernel release, `ulimit -n`, PTY ceiling, Rust 1.97.0, Zig 0.16.0 |
 | Stress profile | `none`, identical in calibration and acceptance |
 
 ## Fleet and schedule
@@ -166,5 +166,8 @@ gh workflow run loaded-daemon-lifecycle.yml \
 ```
 
 Local Darwin hosts are not the reference runner. The campaign's published
-reference is GitHub-hosted `ubuntu-24.04` with `stress_profile=none`. Other
-loaded-lifecycle tickets keep `residual-tail` as their default.
+reference is the self-hosted `botster-ubuntu-24.04-16core` runner (Linux x64,
+Ubuntu 24.04, exactly 16 logical CPUs) with `stress_profile=none`. Other
+loaded-lifecycle tickets keep GitHub-hosted `ubuntu-24.04` and `residual-tail`
+as their default. Calibration and acceptance stay blocked until a runner
+registers with that label.
