@@ -262,6 +262,18 @@ fn event_plane_saturation_source_guards_hold() {
             && runner.contains("admit_event_plane_runner"),
         "runner must admit only Linux x64 Ubuntu 24.04 with 16 logical CPUs"
     );
+    let selftest = fs::read_to_string(root.join("script/run-loaded-daemon-lifecycle-selftest"))
+        .expect("loaded selftest");
+    assert!(
+        selftest.contains("residual-tail rejection must pass runner admission first")
+            && selftest.contains("missing-phase rejection must pass runner admission first")
+            && selftest.contains("missing-commit rejection must pass runner admission first")
+            && selftest.contains("with_authorized_event_plane_runner env -u BOTSTER_EVENT_PLANE_PHASE")
+            && selftest.contains(
+                "with_authorized_event_plane_runner env -u BOTSTER_EVENT_PLANE_CALIBRATION_COMMIT"
+            ),
+        "event-plane negative controls must pass runner admission before asserting their own guards"
+    );
     assert!(
         !proof.contains("stress_profile=residual-tail"),
         "event-plane How to run must not dispatch residual-tail"

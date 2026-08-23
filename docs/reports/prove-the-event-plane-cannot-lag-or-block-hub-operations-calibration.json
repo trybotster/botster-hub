@@ -21,5 +21,5 @@
     "logical_cpus": 16
   },
   "thresholds": null,
-  "note": "Acceptance must not run until this file contains immutable ABS* and THRMIN literals derived from a none-profile calibration dispatch on the loaded-daemon-lifecycle ubuntu-24.04 runner. Residual-tail dispatches 32591282234, 32591872269, and 32594580606 are inconclusive host_exhaustion observations, not product results."
+  "note": "Acceptance must not run until this file contains immutable ABS* and THRMIN literals derived from a none-profile calibration dispatch on botster-ubuntu-24.04-16core. That runner is not registered yet (question_1787447435_428566). Residual-tail dispatches 32591282234, 32591872269, and 32594580606, and none-profile dispatch 32608460536, are inconclusive host_exhaustion observations, not product results."
 }

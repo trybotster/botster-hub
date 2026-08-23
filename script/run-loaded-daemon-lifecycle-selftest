@@ -144,7 +144,8 @@ pass "event-plane-saturation run timeout is 3600s when the workflow default is 9
 
 wrong_profile_dir="$SELFTEST_DIR/event-plane-wrong-profile"
 mkdir -p "$wrong_profile_dir"
-if BOTSTER_LOADED_RUN_TIMEOUT_SECONDS=3600 BOTSTER_EVENT_PLANE_PHASE=calibration "$RUNNER" \
+if BOTSTER_LOADED_RUN_TIMEOUT_SECONDS=3600 BOTSTER_EVENT_PLANE_PHASE=calibration \
+  with_authorized_event_plane_runner "$RUNNER" \
   --validate-only \
   --artifact-dir "$wrong_profile_dir" \
   --subject-sha 0123456789abcdef0123456789abcdef01234567 \
@@ -153,11 +154,16 @@ if BOTSTER_LOADED_RUN_TIMEOUT_SECONDS=3600 BOTSTER_EVENT_PLANE_PHASE=calibration
   --stress-profile residual-tail; then
   fail "event-plane-saturation validate-only must reject residual-tail"
 fi
+grep -q '^event_plane_runner_admission=pass$' "$wrong_profile_dir/metadata.txt" \
+  || fail "residual-tail rejection must pass runner admission first"
+grep -q 'event-plane-saturation requires stress_profile=none' "$wrong_profile_dir/harness.log" \
+  || fail "residual-tail rejection must name the stress_profile=none rule"
 pass "event-plane-saturation requires stress_profile=none"
 
 missing_phase_dir="$SELFTEST_DIR/event-plane-missing-phase"
 mkdir -p "$missing_phase_dir"
-if BOTSTER_LOADED_RUN_TIMEOUT_SECONDS=3600 env -u BOTSTER_EVENT_PLANE_PHASE "$RUNNER" \
+if BOTSTER_LOADED_RUN_TIMEOUT_SECONDS=3600 \
+  with_authorized_event_plane_runner env -u BOTSTER_EVENT_PLANE_PHASE "$RUNNER" \
   --validate-only \
   --artifact-dir "$missing_phase_dir" \
   --subject-sha 0123456789abcdef0123456789abcdef01234567 \
@@ -166,6 +172,10 @@ if BOTSTER_LOADED_RUN_TIMEOUT_SECONDS=3600 env -u BOTSTER_EVENT_PLANE_PHASE "$RU
   --stress-profile none; then
   fail "event-plane-saturation validate-only must fail without BOTSTER_EVENT_PLANE_PHASE"
 fi
+grep -q '^event_plane_runner_admission=pass$' "$missing_phase_dir/metadata.txt" \
+  || fail "missing-phase rejection must pass runner admission first"
+grep -q 'event-plane-saturation requires BOTSTER_EVENT_PLANE_PHASE=calibration or acceptance' "$missing_phase_dir/harness.log" \
+  || fail "missing-phase rejection must name the phase rule"
 pass "event-plane-saturation validate-only requires an explicit phase"
 
 acceptance_dir="$SELFTEST_DIR/event-plane-acceptance-phase"
@@ -188,7 +198,8 @@ pass "event-plane-saturation acceptance phase is a validated workflow input"
 
 missing_commit_dir="$SELFTEST_DIR/event-plane-missing-calibration-commit"
 mkdir -p "$missing_commit_dir"
-if BOTSTER_EVENT_PLANE_PHASE=acceptance env -u BOTSTER_EVENT_PLANE_CALIBRATION_COMMIT "$RUNNER" \
+if BOTSTER_EVENT_PLANE_PHASE=acceptance \
+  with_authorized_event_plane_runner env -u BOTSTER_EVENT_PLANE_CALIBRATION_COMMIT "$RUNNER" \
   --validate-only \
   --artifact-dir "$missing_commit_dir" \
   --subject-sha 0123456789abcdef0123456789abcdef01234567 \
@@ -197,6 +208,10 @@ if BOTSTER_EVENT_PLANE_PHASE=acceptance env -u BOTSTER_EVENT_PLANE_CALIBRATION_C
   --stress-profile none; then
   fail "acceptance validate-only must fail without BOTSTER_EVENT_PLANE_CALIBRATION_COMMIT"
 fi
+grep -q '^event_plane_runner_admission=pass$' "$missing_commit_dir/metadata.txt" \
+  || fail "missing-commit rejection must pass runner admission first"
+grep -q 'acceptance requires BOTSTER_EVENT_PLANE_CALIBRATION_COMMIT as a lowercase 40-character SHA' "$missing_commit_dir/harness.log" \
+  || fail "missing-commit rejection must name the calibration-commit rule"
 pass "acceptance validate-only requires the calibration dataset commit"
 
 four_cpu_dir="$SELFTEST_DIR/event-plane-four-cpu"

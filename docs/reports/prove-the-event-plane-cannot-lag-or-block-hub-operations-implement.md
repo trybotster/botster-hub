@@ -8,11 +8,11 @@
 | `target_id` | `tgt_7e208a0c76a44980a83b63af976b1f22` |
 | Ticket | `ticket_1786663585_879846` |
 | Run | `run_1787262311_549251` |
-| Step | `botster_stack_implement` (`run_step_1787446999_422743`) |
+| Step | `botster_stack_implement` (`run_step_1787448019_881307`) |
 | Merge policy | `direct` into `main`; no PR |
-| Returned from | Verify `review_1787446925_877158` |
+| Returned from | Verify `review_1787447963_920277` (Review `review_1787447898_566588`) |
 | Locked Core | `7eafa470a18025895995bbedc20d34b58106a03b` |
-| Feature commit | `f8342c5e518561b73a4036d8709f9bab15e69c25` |
+| Feature commit | this feature commit (artifact records the SHA) |
 | SHA-record commit | this report commit (artifact records the SHA) |
 | `teardown_class_applies` | **yes** |
 
@@ -28,27 +28,22 @@ Independent routing: ticket and run `target_id` resolve to `botster-hub`. Work i
 - [[conformance harnesses gate on deterministic invariants not timing]]
 - [[test script required for rust tests not cargo test]]
 - [[implementation steps must persist report artifacts for review]]
+- [[a regression test must be shown to go red with the fix reverted]]
 
 ## Review findings addressed
 
 | Finding | Severity | Fix |
 | --- | --- | --- |
-| `finding_1787446925_942023` Move the reference runner to the authorized self-hosted 16-vCPU label | **blocker** | Event-plane saturation selects `runs-on: botster-ubuntu-24.04-16core`. Other loaded-lifecycle targets keep GitHub-hosted `ubuntu-24.04`. N=300, `stress_profile=none`, and every other workload literal stay unchanged (`question_1787446719_111838`). |
-| `finding_1787446925_170078` Add a runner admission check for Linux x64, Ubuntu 24.04, and exactly 16 logical CPUs | **blocker** | `admit_event_plane_runner` in `validate_inputs` rejects a mismatch before load starts, records `uname`, OS id/version, and logical CPU count in `metadata.txt`, and the selftest proves a 4-CPU Ubuntu 24.04 stub is refused. |
-| `finding_1787446925_490225` Record the 16-vCPU runner as the fixed reference in the plan and the budgets document | **blocker** | Plan revision 15 and A.2, plus `docs/event-plane-load-proof.md`, name the label and 16 logical CPUs. Source guards assert the label, CPU count, workflow selection, and admission helper. |
-| `finding_1787446925_410834` Dispatch stays blocked until the runner label exists | **blocker** | This report states calibration and acceptance remain blocked until a runner registers with `botster-ubuntu-24.04-16core`. Implement does not dispatch. Runner provisioning is routed to a human. |
-| `finding_1787446925_739787` Record run 32608460536 as host_exhaustion and exclude its measurements | **medium** | Evidence JSON records run `32608460536` at `15aa80d` as inconclusive `host_exhaustion` (gate 8 lag 71428 µs / 50000 µs, 523114 samples). Gate 6 `203974` µs and gate 7 `1964694` µs are not product results. |
+| `finding_1787447963_363990` / `finding_1787447898_928539` Runner admission makes three selftest negative controls tautological | **blocker** | The missing-phase, missing-calibration-commit, and residual-tail cases now run under `with_authorized_event_plane_runner`. Each asserts `event_plane_runner_admission=pass` and its own harness message. Ablating the intended guard now fails the selftest instead of being masked by 4-CPU admission. |
+| `finding_1787447963_454843` / `finding_1787447898_210188` Calibration and acceptance remain blocked until the authorized runner exists | **blocker** | No dispatch. Workflow, admission check, and documentation stay. Human answer `question_1787447435_428566` already records that Jason or an org admin must register `botster-ubuntu-24.04-16core`. This report restates the campaign is pending that runner. |
 
-Older open findings stay satisfied by prior visits (eleven-gate classifier, Gate 4 attempt accounting, stream parser, tail close, full echo validation, fixed 600-second cutoff).
+Older findings stay satisfied by prior visits (16-vCPU routing, eleven-gate classifier, Gate 4, stream parser, tail close, full echo validation, fixed 600-second cutoff).
 
 ## Files changed
 
-- `.github/workflows/loaded-daemon-lifecycle.yml`
-- `script/run-loaded-daemon-lifecycle`
 - `script/run-loaded-daemon-lifecycle-selftest`
-- `tests/hub_daemon_lifecycle/event_plane_saturation.rs`
-- `docs/event-plane-load-proof.md`
-- `docs/plans/prove-the-event-plane-cannot-lag-or-block-hub-operations.md` (revision 15)
+- `tests/hub_daemon_lifecycle/event_plane_saturation.rs` (source guards)
+- `docs/plans/prove-the-event-plane-cannot-lag-or-block-hub-operations.md` (revision 16, section 12.6)
 - `docs/reports/prove-the-event-plane-cannot-lag-or-block-hub-operations-evidence.json`
 - `docs/reports/prove-the-event-plane-cannot-lag-or-block-hub-operations-calibration.json`
 - `docs/reports/prove-the-event-plane-cannot-lag-or-block-hub-operations-implement.md`
@@ -64,9 +59,8 @@ Unchanged. Hang-close remains the live fail-closed oracle. This visit does not a
 ## Deviations
 
 - Project Pipelines vault-checklist create timed out previously; this report and the gate evidence are the checklist fallback.
-- Local Darwin cannot run ignored N=300 calibration. Gates are proved with classifier, artifact, watchdog, measurement-fold, stream-parser, tail-close, echo-suffix, fixed-cutoff, runner-admission, poison, and injected-panic tests plus the existing campaign unit tests.
-- Workflow default for other loaded-lifecycle tickets remains `residual-tail` on GitHub-hosted `ubuntu-24.04`. This campaign's published reference is `botster-ubuntu-24.04-16core` with `stress_profile=none`.
-- Calibration and acceptance are not dispatched from this visit. No self-hosted runner with label `botster-ubuntu-24.04-16core` is registered yet.
+- Local Darwin cannot run ignored N=300 calibration.
+- Calibration and acceptance are not dispatched. No self-hosted runner with label `botster-ubuntu-24.04-16core` is registered yet (`question_1787447435_428566`).
 
 ## Tests
 
@@ -75,9 +69,9 @@ Unchanged. Hang-close remains the live fail-closed oracle. This visit does not a
 | `cargo fmt --all` | pass |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | pass |
 | `./test.sh --locked --test hub_daemon_lifecycle_test event_plane_saturation_` | 35 passed, 0 failed, 1 ignored (`event_plane_saturation_campaign`) |
-| `script/run-loaded-daemon-lifecycle-selftest` | pass, including `stress_profile=none`, 16-CPU admission stubs, and 4-CPU rejection |
+| `script/run-loaded-daemon-lifecycle-selftest` | pass; residual-tail, missing-phase, and missing-commit now fail on their own harness messages after `event_plane_runner_admission=pass` |
 
-This Darwin worktree cannot execute the ignored N=300 ubuntu-24.04 campaign.
+This Darwin worktree cannot execute the ignored N=300 campaign.
 
 ## Unverified
 
@@ -85,4 +79,4 @@ N=300 calibration and acceptance have not run after this commit. They remain blo
 
 ## Missing vault guidance
 
-None. `question_1787446719_111838` authorizes the 16-vCPU self-hosted runner. The eleven-gate answer still covers host validity.
+None. `question_1787447435_428566` already routes runner registration to a human. The eleven-gate answer still covers host validity.
