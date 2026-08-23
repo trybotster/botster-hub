@@ -99,6 +99,7 @@ validate_inputs() {
         invalid=1
       fi
     fi
+    admit_event_plane_runner || invalid=1
   fi
 
   resolve_run_timeout
@@ -123,6 +124,60 @@ validate_inputs() {
     return 2
   fi
   printf 'validation_status=valid\n' >> "$ARTIFACT_DIR/metadata.txt"
+}
+
+event_plane_os_release_file() {
+  printf '%s\n' "${BOTSTER_EVENT_PLANE_OS_RELEASE_FILE:-/etc/os-release}"
+}
+
+event_plane_os_field() {
+  local key=$1
+  local file
+  file=$(event_plane_os_release_file)
+  if [[ ! -r "$file" ]]; then
+    printf 'unknown\n'
+    return
+  fi
+  awk -F= -v key="$key" '
+    $1 == key {
+      value = $2
+      gsub(/\r/, "", value)
+      gsub(/^"/, "", value)
+      gsub(/"$/, "", value)
+      print value
+      exit
+    }
+  ' "$file"
+  if [[ $? -ne 0 ]]; then
+    printf 'unknown\n'
+  fi
+}
+
+admit_event_plane_runner() {
+  local uname_s uname_m os_id os_version cpus
+  uname_s=$(runner_platform)
+  uname_m=$(uname -m 2>/dev/null || printf 'unknown')
+  os_id=$(event_plane_os_field ID)
+  os_version=$(event_plane_os_field VERSION_ID)
+  cpus=$(runner_cpu_count | tr -d '[:space:]')
+  [[ -n "$os_id" ]] || os_id=unknown
+  [[ -n "$os_version" ]] || os_version=unknown
+  [[ -n "$cpus" ]] || cpus=unknown
+  {
+    printf 'runner_uname_s=%s\n' "$uname_s"
+    printf 'runner_uname_m=%s\n' "$uname_m"
+    printf 'runner_os_id=%s\n' "$os_id"
+    printf 'runner_os_version_id=%s\n' "$os_version"
+    printf 'runner_logical_cpus=%s\n' "$cpus"
+    printf 'event_plane_runner_label=%s\n' "botster-ubuntu-24.04-16core"
+  } >> "$ARTIFACT_DIR/metadata.txt"
+  if [[ "$uname_s" != Linux || "$uname_m" != x86_64 || "$os_id" != ubuntu || "$os_version" != 24.04 || "$cpus" != 16 ]]; then
+    log "event-plane-saturation requires Linux x64 Ubuntu 24.04 with exactly 16 logical CPUs (observed uname_s=$uname_s uname_m=$uname_m os_id=$os_id os_version_id=$os_version logical_cpus=$cpus)"
+    printf 'event_plane_runner_admission=fail\n' >> "$ARTIFACT_DIR/metadata.txt"
+    return 1
+  fi
+  printf 'event_plane_runner_admission=pass\n' >> "$ARTIFACT_DIR/metadata.txt"
+  return 0
 }
 
 # Event-plane saturation needs 2 * (30s warm-up + 600s window) plus fleet

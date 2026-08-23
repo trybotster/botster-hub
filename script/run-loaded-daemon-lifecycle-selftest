@@ -92,9 +92,41 @@ pass "runner sources without CLI or campaign side effects"
 "$PROCESS_CENSUS" --self-test || fail "process census positive control failed"
 pass "process census observes executable-provenance survivors"
 
+install_event_plane_runner_stub() {
+  local root=$1
+  local cpus=$2
+  mkdir -p "$root"
+  cat > "$root/uname" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  -s) printf 'Linux\n' ;;
+  -m) printf 'x86_64\n' ;;
+  *) printf 'Linux\n' ;;
+esac
+EOF
+  cat > "$root/nproc" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "$cpus"
+EOF
+  cat > "$root/os-release" <<'EOF'
+ID=ubuntu
+VERSION_ID="24.04"
+EOF
+  chmod +x "$root/uname" "$root/nproc"
+}
+
+install_event_plane_runner_stub "$SELFTEST_DIR/event-plane-16cpu" 16
+install_event_plane_runner_stub "$SELFTEST_DIR/event-plane-4cpu" 4
+with_authorized_event_plane_runner() {
+  PATH="$SELFTEST_DIR/event-plane-16cpu:$PATH" \
+    BOTSTER_EVENT_PLANE_OS_RELEASE_FILE="$SELFTEST_DIR/event-plane-16cpu/os-release" \
+    "$@"
+}
+
 timeout_dir="$SELFTEST_DIR/event-plane-timeout"
 mkdir -p "$timeout_dir"
-BOTSTER_LOADED_RUN_TIMEOUT_SECONDS=900 BOTSTER_EVENT_PLANE_PHASE=calibration "$RUNNER" \
+BOTSTER_LOADED_RUN_TIMEOUT_SECONDS=900 BOTSTER_EVENT_PLANE_PHASE=calibration \
+  with_authorized_event_plane_runner "$RUNNER" \
   --validate-only \
   --artifact-dir "$timeout_dir" \
   --subject-sha 0123456789abcdef0123456789abcdef01234567 \
@@ -140,7 +172,7 @@ acceptance_dir="$SELFTEST_DIR/event-plane-acceptance-phase"
 mkdir -p "$acceptance_dir"
 BOTSTER_EVENT_PLANE_PHASE=acceptance \
   BOTSTER_EVENT_PLANE_CALIBRATION_COMMIT=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-  "$RUNNER" \
+  with_authorized_event_plane_runner "$RUNNER" \
   --validate-only \
   --artifact-dir "$acceptance_dir" \
   --subject-sha 0123456789abcdef0123456789abcdef01234567 \
@@ -166,6 +198,28 @@ if BOTSTER_EVENT_PLANE_PHASE=acceptance env -u BOTSTER_EVENT_PLANE_CALIBRATION_C
   fail "acceptance validate-only must fail without BOTSTER_EVENT_PLANE_CALIBRATION_COMMIT"
 fi
 pass "acceptance validate-only requires the calibration dataset commit"
+
+four_cpu_dir="$SELFTEST_DIR/event-plane-four-cpu"
+mkdir -p "$four_cpu_dir"
+if PATH="$SELFTEST_DIR/event-plane-4cpu:$PATH" \
+  BOTSTER_EVENT_PLANE_OS_RELEASE_FILE="$SELFTEST_DIR/event-plane-4cpu/os-release" \
+  BOTSTER_EVENT_PLANE_PHASE=calibration \
+  "$RUNNER" \
+  --validate-only \
+  --artifact-dir "$four_cpu_dir" \
+  --subject-sha 0123456789abcdef0123456789abcdef01234567 \
+  --test-target event-plane-saturation \
+  --repetitions 1 \
+  --stress-profile none; then
+  fail "event-plane-saturation validate-only must reject a 4-CPU runner"
+fi
+grep -q '^event_plane_runner_admission=fail$' "$four_cpu_dir/metadata.txt" \
+  || fail "4-CPU rejection must record event_plane_runner_admission=fail"
+grep -q '^runner_logical_cpus=4$' "$four_cpu_dir/metadata.txt" \
+  || fail "4-CPU rejection must record the observed logical CPU count"
+grep -q 'exactly 16 logical CPUs' "$four_cpu_dir/harness.log" \
+  || fail "4-CPU rejection must name the 16-CPU admission rule"
+pass "event-plane-saturation rejects a 4-CPU Ubuntu 24.04 runner"
 
 command -v python3 >/dev/null 2>&1 \
   || fail "missing required self-test command: python3"

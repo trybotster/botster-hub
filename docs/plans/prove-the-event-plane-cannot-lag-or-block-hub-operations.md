@@ -7,6 +7,22 @@ Pipeline: `botster_stack_delivery` (direct merge, no PR)
 Project: `project_1786663508_823105` Botster Non-Blocking Event Plane, Stage D
 Vault checklist: `checklist_1787266824_449406` (ticket scope, one Plan visit)
 
+## Plan revision 15
+
+Revision 15 records Verify `review_1787446925_877158` and human answer
+`question_1787446719_111838`. The reference runner is no longer GitHub-hosted
+`ubuntu-24.04` (4 CPU). The authorized profile is the self-hosted label
+`botster-ubuntu-24.04-16core`: Linux x64, Ubuntu 24.04, exactly 16 logical
+CPUs. `N=300`, `stress_profile=none`, and every other workload literal stay
+unchanged. The event-plane workflow job selects that label; other loaded-lifecycle
+targets keep `ubuntu-24.04`. `script/run-loaded-daemon-lifecycle` admits the
+event-plane campaign only when the runner reports that platform, distribution,
+and CPU count, and it records the observed values in `metadata.txt`. GitHub
+run `32608460536` at `15aa80d` is an inconclusive `host_exhaustion` result
+(gate 8 scheduler lag 71428 µs / 50000 µs across 523114 samples) and must not
+feed calibration thresholds or product claims. Calibration remains blocked
+until a runner registers with the label.
+
 ## Plan revision 14
 
 Revision 14 records Review `review_1787445038_849246`. Gate 5 computes one
@@ -107,7 +123,7 @@ class.
 
 Revision 9 records the Verify-return amendment from `question_1787428441_900918` / `question_1787437854_708832`. Residual-tail calibration dispatches `32591282234` and `32591872269` at `ef77621`, and `32594580606` at `8ee0d7a`, are **inconclusive `host_exhaustion` observations**, not product pass/fail. Captured counters from `32594580606` (`max_owner_turn_us` 219723, `max_ready_operation_wait_us` 1845228) must not be cited as product results.
 
-The published reference for this campaign is now `stress_profile=none` on the same GitHub-hosted `ubuntu-24.04` four-CPU runner. `N=300`, 300 quiet PTYs, the noisy 4 KiB / 100 ms producer, four drivers, 150 events per second, and enabled-versus-disabled comparisons stay fixed. Residual-tail remains the default for other loaded-lifecycle tickets.
+The published reference for this campaign is now `stress_profile=none` on the self-hosted `botster-ubuntu-24.04-16core` runner (Linux x64, Ubuntu 24.04, exactly 16 logical CPUs). `N=300`, 300 quiet PTYs, the noisy 4 KiB / 100 ms producer, four drivers, 150 events per second, and enabled-versus-disabled comparisons stay fixed. Residual-tail remains the default for other loaded-lifecycle tickets, which keep GitHub-hosted `ubuntu-24.04`.
 
 The campaign classifies host validity from the eleven immutable
 pre-calibration gates in revision 10. A 25 ms busy-spin is not the
@@ -448,8 +464,8 @@ Every value below is fixed by this reviewed plan. Neither calibration nor accept
 
 | Parameter | Fixed value |
 | --- | --- |
-| Runner | fresh GitHub-hosted `ubuntu-24.04` from `.github/workflows/loaded-daemon-lifecycle.yml` |
-| Recorded fields | runner image, architecture, CPU count, total memory, kernel release, `ulimit -n`, PTY ceiling, Rust 1.97.0, Zig 0.16.0 |
+| Runner | self-hosted `botster-ubuntu-24.04-16core` (Linux x64 Ubuntu 24.04, exactly 16 logical CPUs) from `.github/workflows/loaded-daemon-lifecycle.yml` |
+| Recorded fields | runner label, runner image, architecture, logical CPU count, total memory, kernel release, `ulimit -n`, PTY ceiling, Rust 1.97.0, Zig 0.16.0 |
 | Stress profile | `none`, identical in both phases |
 
 **Fleet**
@@ -812,7 +828,7 @@ Nothing is waived. A missing budget is created and correctly labelled rather tha
 
 The vault rule that wall-clock durations are observations rather than gates ([[conformance harnesses gate on deterministic invariants not timing]]) is still respected where it matters. Scheduler and boundedness claims gate only on deterministic work-bound and decision-level oracles. The latency gate is a paired within-run ratio plus a calibrated absolute on one fixed profile, which removes the runner-speed dependence that rule exists to prevent.
 
-**A3 — the reference runner is the existing loaded workflow.** `docs/loaded-daemon-lifecycle-runner.md` establishes a fresh GitHub-hosted `ubuntu-24.04` VM as the isolated campaign home. `script/run-loaded-daemon-lifecycle:141-144` forces `--stress-profile none` on Darwin, and `script/run-lifecycle-suite` refuses a dirty host. A developer machine that hosts a live Botster hub cannot produce this evidence. The declared machine profile is therefore the workflow runner.
+**A3 — the reference runner is the existing loaded workflow.** Event-plane saturation uses the self-hosted `botster-ubuntu-24.04-16core` label on that workflow (Linux x64, Ubuntu 24.04, exactly 16 logical CPUs). Other loaded-lifecycle targets keep GitHub-hosted `ubuntu-24.04`. `script/run-loaded-daemon-lifecycle:141-144` forces `--stress-profile none` on Darwin, and `script/run-lifecycle-suite` refuses a dirty host. A developer machine that hosts a live Botster hub cannot produce this evidence. The declared machine profile is therefore the workflow runner.
 
 **A4 — client proof happens at public boundaries with generic fixtures, and the clients are made generic by prerequisite tickets rather than assumed generic.** Revisions 3 and 4 required the real Project Pipelines package, a bound product run, one shared session, and new product lanes in the clients. The human rejected that chain, and Plan Review `finding_1787278015_548510` records it. Revision 7 adds the missing half of the correction: both clients today hardcode the Project Pipelines owner, event name, payload, and entity families in production code, so a Hub-side generic proof would be representative of nothing shipped. `ticket_1787278327_274484` and `ticket_1787278327_199618` remove that coupling and deliver neutral contract fixtures at the public protocol boundary. This campaign consumes their merged state. It still checks out no client repository, installs no product package, and drives no client harness.
 

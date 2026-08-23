@@ -2,12 +2,12 @@
   "campaign": "event-plane-saturation",
   "ticket_id": "ticket_1786663585_879846",
   "run_id": "run_1787262311_549251",
-  "result": "review_return_fixed_600s_window_cutoff_pending_runner",
+  "result": "verify_return_16vcpu_self_hosted_runner_pending_registration",
   "target_id": "tgt_7e208a0c76a44980a83b63af976b1f22",
   "target_repository": "botster-hub",
   "executed_revisions": {
-    "botster-hub_feature": "5dcf052161ff6b41d5103ba7084384b190365c57",
-    "botster-hub_sha_record": "this_report_commit",
+    "botster-hub_feature": "FEATURE_COMMIT_PLACEHOLDER",
+    "botster-hub_sha_record": "SHA_RECORD_COMMIT_PLACEHOLDER",
     "botster-core": "7eafa470a18025895995bbedc20d34b58106a03b"
   },
   "cited_prerequisite_revisions": {
@@ -40,7 +40,7 @@
     }
   },
   "provenance": {
-    "note": "This Review-return implement visit pins Gate 5 terminal samples to a fixed monotonic 600-second cutoff captured with start_at/end_at. Calibration and acceptance still require the loaded-daemon-lifecycle ubuntu-24.04 runner.",
+    "note": "This Verify-return implement visit selects the authorized self-hosted botster-ubuntu-24.04-16core runner (Linux x64 Ubuntu 24.04, exactly 16 logical CPUs) and admits that profile before load starts. Calibration and acceptance remain blocked until a runner registers with that label. GitHub run 32608460536 at 15aa80d is inconclusive host_exhaustion and must not feed product claims.",
     "stress_profile_required": "none",
     "test_target": "event-plane-saturation",
     "inconclusive_residual_tail_dispatches": [
@@ -64,6 +64,27 @@
         "captured_counters_not_product_results": {
           "max_owner_turn_us": 219723,
           "max_ready_operation_wait_us": 1845228
+        }
+      }
+    ],
+    "inconclusive_none_profile_dispatches": [
+      {
+        "github_run_id": "32608460536",
+        "commit": "15aa80d",
+        "stress_profile": "none",
+        "classification": "inconclusive host_exhaustion",
+        "product_result": false,
+        "completed_full_disabled_arm_window": true,
+        "persisted_host_validity_artifact": true,
+        "gate_8": {
+          "scheduler_lag_us": 71428,
+          "budget_us": 50000,
+          "samples": 523114,
+          "selects_host_exhaustion": true
+        },
+        "captured_counters_not_product_results": {
+          "max_owner_turn_us": 203974,
+          "max_ready_operation_wait_us": 1964694
         }
       }
     ]
@@ -97,7 +118,8 @@
     "clippy_deny_warnings": "passed",
     "loaded_daemon_lifecycle_selftest_timeout": "passed",
     "loaded_daemon_lifecycle_selftest_event_plane_phase": "passed",
-    "loaded_daemon_lifecycle_selftest_event_plane_none_profile": "passed"
+    "loaded_daemon_lifecycle_selftest_event_plane_none_profile": "passed",
+    "loaded_daemon_lifecycle_selftest_event_plane_16cpu_admission": "passed"
   },
   "assumptions": [
     "Coexistence regression budgets are not North Star transport service levels.",

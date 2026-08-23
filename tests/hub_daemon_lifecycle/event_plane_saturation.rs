@@ -26,6 +26,8 @@ const EVENT_PLANE_SLACK_MS: f64 = 8.0;
 const EVENT_PLANE_THROUGHPUT_T: f64 = 0.80;
 const EVENT_PLANE_STRESS_PROFILE: &str = "none";
 const EVENT_PLANE_RUNNER: &str = "ubuntu-24.04";
+const EVENT_PLANE_RUNNER_LABEL: &str = "botster-ubuntu-24.04-16core";
+const EVENT_PLANE_RUNNER_LOGICAL_CPUS: u32 = 16;
 const EVENT_PLANE_NOISY_SESSION: &str = "event-plane-noisy";
 const EVENT_PLANE_NOISY_SUB: &str = "event-plane-noisy-sub";
 const EVENT_PLANE_OPERATIONS: [&str; 9] = [
@@ -210,6 +212,8 @@ fn event_plane_saturation_source_guards_hold() {
     assert!(!harness.contains("os.posix_openpt") && !harness.contains("os.openpt("));
     assert_eq!(EVENT_PLANE_STRESS_PROFILE, "none");
     assert_eq!(EVENT_PLANE_RUNNER, "ubuntu-24.04");
+    assert_eq!(EVENT_PLANE_RUNNER_LABEL, "botster-ubuntu-24.04-16core");
+    assert_eq!(EVENT_PLANE_RUNNER_LOGICAL_CPUS, 16);
     let campaign = fs::read_to_string(
         root.join("tests/hub_daemon_lifecycle/event_plane_saturation.rs"),
     )
@@ -237,6 +241,28 @@ fn event_plane_saturation_source_guards_hold() {
         "How to run must dispatch the none profile"
     );
     assert!(
+        proof.contains("`botster-ubuntu-24.04-16core`")
+            && proof.contains("exactly 16 logical CPUs"),
+        "published machine profile must name the 16-vCPU self-hosted runner"
+    );
+    let workflow = fs::read_to_string(
+        root.join(".github/workflows/loaded-daemon-lifecycle.yml"),
+    )
+    .expect("loaded workflow");
+    assert!(
+        workflow.contains("botster-ubuntu-24.04-16core")
+            && workflow.contains("event-plane-saturation")
+            && workflow.contains("ubuntu-24.04"),
+        "event-plane job must use the 16-vCPU label; other targets keep ubuntu-24.04"
+    );
+    let runner = fs::read_to_string(root.join("script/run-loaded-daemon-lifecycle"))
+        .expect("loaded runner");
+    assert!(
+        runner.contains("exactly 16 logical CPUs")
+            && runner.contains("admit_event_plane_runner"),
+        "runner must admit only Linux x64 Ubuntu 24.04 with 16 logical CPUs"
+    );
+    assert!(
         !proof.contains("stress_profile=residual-tail"),
         "event-plane How to run must not dispatch residual-tail"
     );
@@ -247,6 +273,11 @@ fn event_plane_saturation_source_guards_hold() {
     assert!(
         plan.contains("| Stress profile | `none`"),
         "plan A.2 must name none as the fixed reference profile"
+    );
+    assert!(
+        plan.contains("`botster-ubuntu-24.04-16core`")
+            && plan.contains("exactly 16 logical CPUs"),
+        "plan A.2 must name the 16-vCPU self-hosted runner"
     );
 }
 
@@ -2788,6 +2819,8 @@ fn phase_dataset_body(
         },
         "profile": {
             "runner": EVENT_PLANE_RUNNER,
+            "runner_label": EVENT_PLANE_RUNNER_LABEL,
+            "logical_cpus": EVENT_PLANE_RUNNER_LOGICAL_CPUS,
             "stress_profile": EVENT_PLANE_STRESS_PROFILE
         },
         "host_validity": host_validity.json(),
@@ -2885,6 +2918,14 @@ fn read_committed_thresholds() -> (BTreeMap<String, DerivedThresholds>, Option<S
         Some(EVENT_PLANE_MIN_SAMPLES)
     );
     assert_eq!(value["profile"]["runner"], EVENT_PLANE_RUNNER);
+    assert_eq!(
+        value["profile"]["runner_label"],
+        EVENT_PLANE_RUNNER_LABEL
+    );
+    assert_eq!(
+        value["profile"]["logical_cpus"],
+        EVENT_PLANE_RUNNER_LOGICAL_CPUS
+    );
     assert_eq!(value["profile"]["stress_profile"], EVENT_PLANE_STRESS_PROFILE);
     assert_eq!(
         value["formulas"]["THRMIN"],
