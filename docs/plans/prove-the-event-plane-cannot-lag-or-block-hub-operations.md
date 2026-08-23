@@ -7,6 +7,20 @@ Pipeline: `botster_stack_delivery` (direct merge, no PR)
 Project: `project_1786663508_823105` Botster Non-Blocking Event Plane, Stage D
 Vault checklist: `checklist_1787266824_449406` (ticket scope, one Plan visit)
 
+## Plan revision 16
+
+Revision 16 records Verify `review_1787447963_920277` and Review
+`review_1787447898_566588`. Three event-plane selftest negative controls
+(missing phase, missing calibration commit, residual-tail stress profile)
+ran without the 16-CPU admission stub, so `admit_event_plane_runner`
+supplied the nonzero exit and the intended guard was never exercised.
+Those cases now run under `with_authorized_event_plane_runner`, assert
+`event_plane_runner_admission=pass`, and assert each case's own harness
+message. Calibration and acceptance remain blocked until a runner
+registers with `botster-ubuntu-24.04-16core`
+(`question_1787447435_428566`). N=300 and `stress_profile=none` stay
+unchanged.
+
 ## Plan revision 15
 
 Revision 15 records Verify `review_1787446925_877158` and human answer
@@ -1057,7 +1071,8 @@ A blanket "siblings survive" rule across all eleven faults would contradict ship
 - the non-blocking ingress claim, ablated by making `events.emit` wait;
 - the queue-bound claim, ablated by removing one bound;
 - the gap-plus-baseline convergence claim, ablated by dropping the resync;
-- the terminal content-blindness claim, ablated by naming a snapshot phase in an adapter.
+- the terminal content-blindness claim, ablated by naming a snapshot phase in an adapter;
+- the event-plane validate-only guards (explicit phase, acceptance calibration commit, `stress_profile=none`), ablated by deleting each requirement while runner admission still passes.
 
 The report names, per claim, which tier detected the defect and which tier was blind, following [[verification reports name the load bearing oracle when cheaper suites are blind]].
 
