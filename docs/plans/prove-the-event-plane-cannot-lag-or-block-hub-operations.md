@@ -7,6 +7,27 @@ Pipeline: `botster_stack_delivery` (direct merge, no PR)
 Project: `project_1786663508_823105` Botster Non-Blocking Event Plane, Stage D
 Vault checklist: `checklist_1787266824_449406` (ticket scope, one Plan visit)
 
+## Plan revision 12
+
+Revision 12 records Review `review_1787442149_174868`. Gate 5 uses a
+stateful `OutputStreamParser` across `TerminalOutput` events. Every
+generated record is `N%08dT%020d` plus 4065 `x` bytes plus `\n` (4096
+bytes). The parser validates every header, body, and newline byte, carries
+partial records between drains, and treats an unresolved tail or missing
+expected output as a failure. An empty drain with no malformed bytes is no
+sample. Identity bytes `0x80 0xff \n` and `ns-echo:` lines are framing, not
+malformed event-plane records. Negative tests cover fragmentation, body
+corruption, dropped final output, and empty drains.
+
+The panic path computes fallible observability before locking. A poisoned
+`ArmRunBuilder` mutex keeps the last snapshot (`into_inner`) and never
+replaces it with a blank builder. An outer `ArmExitGuard` stops workers and
+the emitter, then collects survivors on every exit including panic.
+`survivors_collected` starts false. Gate 11 fails when the arm started and
+collection did not complete, and is `not_evaluated` only when the arm never
+started. A real injected arm panic test preserves measurements, stops
+workers, and persists the survivor result.
+
 ## Plan revision 11
 
 Revision 11 records Review `review_1787440703_182294`. Gate 4 records every

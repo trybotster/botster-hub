@@ -58,6 +58,12 @@ const EVENT_PLANE_SCHEDULER_WATCHDOG_PERIOD: Duration = Duration::from_millis(1)
 const EVENT_PLANE_MAX_AGE_SAMPLE_FAILURES: u64 = 0;
 const EVENT_PLANE_OUTPUT_RECORD_BYTES: usize = 4096;
 const EVENT_PLANE_OUTPUT_HEADER_BYTES: usize = 30;
+const EVENT_PLANE_OUTPUT_BODY_BYTES: usize =
+    EVENT_PLANE_OUTPUT_RECORD_BYTES - EVENT_PLANE_OUTPUT_HEADER_BYTES - 1;
+const EVENT_PLANE_OUTPUT_BODY_BYTE: u8 = b'x';
+const EVENT_PLANE_OUTPUT_NS_READY: &[u8] = b"ns-ready\n";
+const EVENT_PLANE_OUTPUT_IDENTITY: &[u8] = &[0x80, 0xff, b'\n'];
+const EVENT_PLANE_OUTPUT_ECHO_PREFIX: &[u8] = b"ns-echo:";
 const EVENT_PLANE_NOISY_COMMAND: &str = concat!(
     "python3 -u -c \"",
     "import sys,time,threading\n",
@@ -138,9 +144,10 @@ fn event_plane_saturation_source_guards_hold() {
     assert_eq!(EVENT_PLANE_MAX_AGE_SAMPLE_FAILURES, 0);
     assert_eq!(EVENT_PLANE_OUTPUT_RECORD_BYTES, 4096);
     assert_eq!(
-        EVENT_PLANE_OUTPUT_HEADER_BYTES + 4065 + 1,
+        EVENT_PLANE_OUTPUT_HEADER_BYTES + EVENT_PLANE_OUTPUT_BODY_BYTES + 1,
         EVENT_PLANE_OUTPUT_RECORD_BYTES
     );
+    assert_eq!(EVENT_PLANE_OUTPUT_BODY_BYTES, 4065);
     assert!(EVENT_PLANE_NOISY_COMMAND.contains("time.monotonic_ns"));
     assert!(EVENT_PLANE_NOISY_COMMAND.contains("pad=b'x'*4065"));
     assert!(
@@ -583,6 +590,73 @@ fn event_plane_saturation_parse_output_records_counts_malformed_bytes() {
 }
 
 #[test]
+fn event_plane_saturation_output_stream_parser_rejects_fragment_corruption_and_empty_drains() {
+    let record = noisy_output_record(3, 42);
+    let mut parser = OutputStreamParser::new();
+    let first = parser.feed(&[terminal_output_event(&record[..128])]);
+    assert!(first.records.is_empty(), "partial record must wait");
+    assert_eq!(first.malformed, 0);
+    let second = parser.feed(&[terminal_output_event(&record[128..])]);
+    assert_eq!(second.records.len(), 1);
+    assert_eq!(second.records[0].seq, 3);
+    assert_eq!(second.malformed, 0);
+    let finished = parser.finish();
+    assert!(!finished.unresolved_tail);
+    assert_eq!(finished.malformed, 0);
+
+    let mut corrupted = noisy_output_record(4, 7);
+    corrupted[EVENT_PLANE_OUTPUT_HEADER_BYTES + 10] = b'y';
+    let parsed_body = parse_output_records(&[terminal_output_event(&corrupted)]);
+    assert!(parsed_body.records.is_empty());
+    assert!(parsed_body.malformed > 0);
+
+    let dropped = parse_output_records(&[terminal_output_event(&record[..200])]);
+    assert!(dropped.records.is_empty());
+    assert!(dropped.unresolved_tail);
+    assert!(dropped.malformed > 0);
+
+    let mut empty_parser = OutputStreamParser::new();
+    let empty = empty_parser.feed(&[]);
+    assert!(empty.records.is_empty());
+    assert_eq!(empty.malformed, 0);
+    assert!(!empty.unresolved_tail);
+
+    let mut framed = EVENT_PLANE_OUTPUT_NS_READY.to_vec();
+    framed.extend_from_slice(EVENT_PLANE_OUTPUT_IDENTITY);
+    framed.extend(noisy_output_record(0, 1));
+    framed.extend(b"ns-echo:ti-1xxxxxxxx\r\n");
+    framed.extend(noisy_output_record(1, 2));
+    let parsed_framed = parse_output_records(&[terminal_output_event(&framed)]);
+    assert_eq!(parsed_framed.records.len(), 2);
+    assert_eq!(parsed_framed.malformed, 0);
+    assert!(!parsed_framed.unresolved_tail);
+}
+
+#[test]
+fn event_plane_saturation_missing_survivor_collection_fails_gate_11() {
+    let mut evidence = passing_validity_evidence();
+    evidence.survivors_collected = false;
+    let validity = classify_pre_calibration_validity(evidence);
+    assert_eq!(gate_status(&validity, 11), "fail");
+    assert_ne!(validity.verdict, HostValidityVerdict::Valid);
+}
+
+#[test]
+fn event_plane_saturation_poisoned_builder_keeps_last_snapshot() {
+    let builder = Mutex::new(ArmRunBuilder::new());
+    publish_builder(&builder, |state| {
+        state.n_running = 7;
+    });
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        publish_builder(&builder, |_| panic!("poison lock"));
+    }));
+    assert!(panicked.is_err());
+    let snapshot = snapshot_builder(&builder);
+    assert_eq!(snapshot.n_running, 7);
+    assert!(!snapshot.survivors_collected);
+}
+
+#[test]
 fn event_plane_saturation_early_arm_failure_persists_classified_gates() {
     let _guard = daemon_test_guard();
     let mut builder = ArmRunBuilder::new();
@@ -624,6 +698,98 @@ fn event_plane_saturation_early_arm_failure_persists_classified_gates() {
             "artifact gate {id} must be fail: {body}"
         );
     }
+}
+
+#[test]
+fn event_plane_saturation_injected_arm_panic_preserves_measurements_and_collects_survivors() {
+    let _guard = daemon_test_guard();
+    let builder = Arc::new(Mutex::new(ArmRunBuilder::new()));
+    let worker_stop = Arc::new(AtomicBool::new(false));
+    let inner = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_injected_arm_panic(Arc::clone(&builder), Arc::clone(&worker_stop));
+    }));
+    assert!(inner.is_err(), "injected arm must panic");
+    assert!(
+        worker_stop.load(Ordering::SeqCst),
+        "outer arm guard must stop workers on panic"
+    );
+    let snapshot = snapshot_builder(&builder);
+    assert_eq!(snapshot.n_running, 1, "panic must keep published measurements");
+    assert!(
+        snapshot
+            .operations
+            .get("spawn")
+            .is_some_and(|stats| stats.attempts == 1 && stats.successes == 1),
+        "spawn sample must survive panic: {:?}",
+        snapshot.operations.get("spawn")
+    );
+    assert!(
+        snapshot.survivors_collected,
+        "panic path must collect survivors before hub drop: {:?}",
+        snapshot.worker_errors
+    );
+    let validity = classify_failed_arm(
+        &snapshot,
+        idle_scheduler_lag(),
+        Some("injected arm panic after measurement".to_string()),
+    );
+    assert_ne!(gate_status(&validity, 11), "not_evaluated");
+    let dir = unique_test_dir("event-plane-injected-arm-panic");
+    let path = persist_host_validity_artifact_to(
+        &dir.join("event-plane-host-validity.json"),
+        &validity,
+    );
+    let body: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).expect("read injected-panic artifact"))
+            .expect("parse injected-panic artifact");
+    let gates = body["gates"].as_array().expect("gates");
+    let gate11 = gates
+        .iter()
+        .find(|gate| gate["id"] == 11)
+        .expect("gate 11 present");
+    assert_ne!(gate11["status"], "not_evaluated", "{body}");
+}
+
+fn run_injected_arm_panic(
+    builder: Arc<Mutex<ArmRunBuilder>>,
+    worker_stop: Arc<AtomicBool>,
+) {
+    let hub = start_campaign_hub("ipanic", &[]);
+    let endpoint = hub.endpoint().clone();
+    let emitter_stop = Arc::new(AtomicBool::new(false));
+    let exit_guard = ArmExitGuard {
+        builder: Arc::clone(&builder),
+        endpoint: Some(endpoint.clone()),
+        emitter_stop,
+        worker_stop,
+        finished: false,
+    };
+    let spawned = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: "inject-panic-session".to_string(),
+            command: "sleep 60".to_string(),
+        },
+    )
+    .expect("spawn injected panic session");
+    assert_eq!(
+        spawned.kind,
+        botster_hub_client::DaemonResponseKind::Spawned
+    );
+    let mut operations = zero_gated_operations();
+    if let Some(stats) = operations.get_mut("spawn") {
+        stats.attempts = 1;
+        stats.successes = 1;
+        stats.samples_ms.push(1);
+    }
+    let observability = snapshot_observability(&endpoint);
+    publish_builder(&builder, |state| {
+        state.n_running = 1;
+        state.operations = operations;
+        state.observability = Some(observability);
+    });
+    let _exit_guard = exit_guard;
+    panic!("injected arm panic after measurement");
 }
 
 #[test]
@@ -1294,6 +1460,7 @@ struct ValidityEvidence {
     environment_tainted: bool,
     taint_evidence: Option<String>,
     survivors: Vec<(String, String)>,
+    survivors_collected: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1568,6 +1735,7 @@ fn passing_validity_evidence() -> ValidityEvidence {
         environment_tainted: false,
         taint_evidence: None,
         survivors: Vec::new(),
+        survivors_collected: true,
     }
 }
 
@@ -1850,17 +2018,29 @@ fn evaluate_pre_calibration_gates(evidence: &ValidityEvidence) -> (Vec<ValidityG
         ),
     ));
     if evidence.arm_evaluated || evidence.environment_tainted {
-        let survivors_ok = evidence.survivors.is_empty();
-        let taint_ok = !evidence.environment_tainted;
-        gates.push(gate_result(
-            11,
-            "environment_taint_or_survivors",
-            survivors_ok && taint_ok,
-            format!(
-                "tainted={} taint_evidence={:?} survivors={:?}",
-                evidence.environment_tainted, evidence.taint_evidence, evidence.survivors
-            ),
-        ));
+        let arm_started = evidence.n_running > 0
+            || evidence
+                .operations
+                .values()
+                .any(|stats| stats.attempts > 0);
+        if !evidence.survivors_collected && !arm_started {
+            gates.push(gate_not_evaluated(11, "environment_taint_or_survivors"));
+        } else {
+            let survivors_ok = evidence.survivors_collected && evidence.survivors.is_empty();
+            let taint_ok = !evidence.environment_tainted;
+            gates.push(gate_result(
+                11,
+                "environment_taint_or_survivors",
+                survivors_ok && taint_ok,
+                format!(
+                    "survivors_collected={} tainted={} taint_evidence={:?} survivors={:?}",
+                    evidence.survivors_collected,
+                    evidence.environment_tainted,
+                    evidence.taint_evidence,
+                    evidence.survivors
+                ),
+            ));
+        }
     } else {
         gates.push(gate_not_evaluated(11, "environment_taint_or_survivors"));
     }
@@ -1936,6 +2116,7 @@ fn classify_host_validity(
         environment_tainted: harness_taint().is_some(),
         taint_evidence: harness_taint(),
         survivors: Vec::new(),
+        survivors_collected: arm_evaluated,
     })
 }
 
@@ -1955,6 +2136,7 @@ fn classify_from_arm(run: &ArmRun, fd: ResourceProbe, pty: ResourceProbe) -> Hos
         environment_tainted: harness_taint().is_some(),
         taint_evidence: harness_taint(),
         survivors: run.survivors.clone(),
+        survivors_collected: run.survivors_collected,
     })
 }
 
@@ -2061,6 +2243,7 @@ struct ArmRun {
     worker_errors: Vec<String>,
     terminal: TerminalOracles,
     survivors: Vec<(String, String)>,
+    survivors_collected: bool,
     scheduler_lag: SchedulerLagProbe,
     report: ArmReport,
 }
@@ -2072,6 +2255,7 @@ struct ArmRunBuilder {
     worker_errors: Vec<String>,
     terminal: TerminalOracles,
     survivors: Vec<(String, String)>,
+    survivors_collected: bool,
     operations: BTreeMap<String, OperationStats>,
     observability: Option<botster_hub_client::DaemonObservabilityCounters>,
     webrtc_queues: Option<serde_json::Value>,
@@ -2085,6 +2269,7 @@ impl ArmRunBuilder {
             worker_errors: Vec::new(),
             terminal: TerminalOracles::unproven(),
             survivors: Vec::new(),
+            survivors_collected: false,
             operations: zero_gated_operations(),
             observability: None,
             webrtc_queues: None,
@@ -2099,6 +2284,7 @@ impl ArmRunBuilder {
             worker_errors: self.worker_errors,
             terminal: self.terminal,
             survivors: self.survivors,
+            survivors_collected: self.survivors_collected,
             scheduler_lag,
             report: ArmReport {
                 profile: ArmProfile {
@@ -2640,10 +2826,7 @@ fn run_saturation_arm(arm: SaturationArm) -> ArmRun {
             run
         }
         Err(payload) => {
-            let snapshot = builder
-                .lock()
-                .map(|guard| guard.clone())
-                .unwrap_or_else(|_| ArmRunBuilder::new());
+            let snapshot = snapshot_builder(&builder);
             persist_failed_arm_and_panic(&snapshot, scheduler_lag, Some(panic_message(&payload)))
         }
     }
@@ -2678,8 +2861,102 @@ impl Drop for WorkerStopGuard {
 }
 
 fn publish_builder(builder: &Mutex<ArmRunBuilder>, update: impl FnOnce(&mut ArmRunBuilder)) {
-    if let Ok(mut guard) = builder.lock() {
-        update(&mut guard);
+    let mut guard = match builder.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    update(&mut guard);
+}
+
+fn snapshot_builder(builder: &Mutex<ArmRunBuilder>) -> ArmRunBuilder {
+    match builder.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+fn publish_observability(
+    builder: &Mutex<ArmRunBuilder>,
+    endpoint: &botster_hub_client::DaemonEndpoint,
+) {
+    let observability = snapshot_observability(endpoint);
+    publish_builder(builder, |state| {
+        state.observability = Some(observability);
+    });
+}
+
+struct ArmExitGuard {
+    builder: Arc<Mutex<ArmRunBuilder>>,
+    endpoint: Option<botster_hub_client::DaemonEndpoint>,
+    emitter_stop: Arc<AtomicBool>,
+    worker_stop: Arc<AtomicBool>,
+    finished: bool,
+}
+
+impl ArmExitGuard {
+    fn record_survivors(
+        &mut self,
+        survivors: Vec<(String, String)>,
+        webrtc_queues: Option<serde_json::Value>,
+    ) {
+        publish_builder(&self.builder, |state| {
+            state.survivors = survivors;
+            state.survivors_collected = true;
+            state.webrtc_queues = webrtc_queues;
+        });
+        self.finished = true;
+    }
+}
+
+impl Drop for ArmExitGuard {
+    fn drop(&mut self) {
+        self.emitter_stop.store(true, Ordering::SeqCst);
+        self.worker_stop.store(true, Ordering::SeqCst);
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        let endpoint = self.endpoint.clone();
+        let collection = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            endpoint
+                .as_ref()
+                .map(collect_arm_survivors)
+        }));
+        match collection {
+            Ok(Some(Ok(survivors))) => {
+                publish_builder(&self.builder, |state| {
+                    state.survivors = survivors;
+                    state.survivors_collected = true;
+                });
+            }
+            Ok(Some(Err(error))) => {
+                publish_builder(&self.builder, |state| {
+                    state.survivors_collected = false;
+                    let row = format!("survivor_collection_failed={error}");
+                    if !state.worker_errors.iter().any(|existing| existing == &row) {
+                        state.worker_errors.push(row);
+                    }
+                });
+            }
+            Ok(None) => {
+                publish_builder(&self.builder, |state| {
+                    state.survivors_collected = false;
+                    let row = "survivor_collection_skipped_no_endpoint".to_string();
+                    if !state.worker_errors.iter().any(|existing| existing == &row) {
+                        state.worker_errors.push(row);
+                    }
+                });
+            }
+            Err(_) => {
+                publish_builder(&self.builder, |state| {
+                    state.survivors_collected = false;
+                    let row = "survivor_collection_panicked".to_string();
+                    if !state.worker_errors.iter().any(|existing| existing == &row) {
+                        state.worker_errors.push(row);
+                    }
+                });
+            }
+        }
     }
 }
 
@@ -2690,26 +2967,33 @@ fn run_saturation_arm_inner(arm: SaturationArm, builder: Arc<Mutex<ArmRunBuilder
     };
     let hub = start_campaign_hub(label, &[]);
     let endpoint = hub.endpoint().clone();
-    publish_builder(&builder, |state| {
-        state.observability = Some(snapshot_observability(&endpoint));
-    });
-    let stop = Arc::new(AtomicBool::new(false));
+    let emitter_stop = Arc::new(AtomicBool::new(false));
+    let worker_stop = Arc::new(AtomicBool::new(false));
+    let mut exit_guard = ArmExitGuard {
+        builder: Arc::clone(&builder),
+        endpoint: Some(endpoint.clone()),
+        emitter_stop: Arc::clone(&emitter_stop),
+        worker_stop: Arc::clone(&worker_stop),
+        finished: false,
+    };
+    publish_observability(&builder, &endpoint);
     let mut unix = None;
     let mut webrtc = None;
     let mut emitter = EmitterGuard {
-        stop: stop.clone(),
+        stop: emitter_stop.clone(),
         join: None,
     };
     if matches!(arm, SaturationArm::PlaneEnabled) {
         enable_saturation_packages(&endpoint, hub.data_dir());
         unix = Some(subscribe_unix_events(&endpoint));
         webrtc = Some(subscribe_webrtc_events(&endpoint, hub.data_dir()));
-        emitter.join = Some(spawn_event_emitter(&endpoint, stop.clone()));
+        emitter.join = Some(spawn_event_emitter(&endpoint, emitter_stop.clone()));
     }
     let n_running = spawn_quiet_fleet(&endpoint);
+    let fleet_obs = snapshot_observability(&endpoint);
     publish_builder(&builder, |state| {
         state.n_running = n_running;
-        state.observability = Some(snapshot_observability(&endpoint));
+        state.observability = Some(fleet_obs);
     });
     let mut noisy = spawn_noisy_session(&endpoint);
     let (operations, worker_errors, mut terminal, window_completed) = run_measurement_workers(
@@ -2719,13 +3003,15 @@ fn run_saturation_arm_inner(arm: SaturationArm, builder: Arc<Mutex<ArmRunBuilder
         &mut webrtc,
         &mut noisy,
         Arc::clone(&builder),
+        Arc::clone(&worker_stop),
     );
+    let measured_obs = snapshot_observability(&endpoint);
     publish_builder(&builder, |state| {
         state.operations = operations.clone();
         state.worker_errors = worker_errors.clone();
         state.window_completed = window_completed;
         state.terminal = terminal.clone();
-        state.observability = Some(snapshot_observability(&endpoint));
+        state.observability = Some(measured_obs);
     });
     if let Some(connection) = unix.as_mut()
         && window_completed
@@ -2767,12 +3053,9 @@ fn run_saturation_arm_inner(arm: SaturationArm, builder: Arc<Mutex<ArmRunBuilder
     {
         prove_webrtc_close_unix_survives(&endpoint, peer, &key);
     }
-    let mut survivors = shutdown_owned_sessions(&endpoint);
-    survivors.extend(list_live_sessions(&endpoint));
-    publish_builder(&builder, |state| {
-        state.survivors = survivors.clone();
-        state.webrtc_queues = webrtc_queues.clone();
-    });
+    let survivors = collect_arm_survivors(&endpoint).expect("collect saturation survivors");
+    exit_guard.record_survivors(survivors.clone(), webrtc_queues.clone());
+    drop(exit_guard);
     hub.shutdown().expect("shutdown saturation hub");
     ArmRun {
         n_running,
@@ -2780,6 +3063,7 @@ fn run_saturation_arm_inner(arm: SaturationArm, builder: Arc<Mutex<ArmRunBuilder
         worker_errors,
         terminal,
         survivors,
+        survivors_collected: true,
         scheduler_lag: unevaluated_scheduler_lag(),
         report: ArmReport {
             profile: ArmProfile {
@@ -3026,9 +3310,10 @@ fn fail_webrtc_saturation(
 ) -> ! {
     let record_path = data_dir.join(LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE);
     let terminal = fs::read_to_string(&record_path).unwrap_or_else(|_| "missing".to_string());
+    let observability = snapshot_observability(endpoint);
     publish_builder(builder, |state| {
         state.terminal.apply_peer_loss();
-        state.observability = Some(snapshot_observability(endpoint));
+        state.observability = Some(observability);
         state.worker_errors.push(format!("event-plane-peer-loss: {error}"));
     });
     panic!(
@@ -3268,6 +3553,7 @@ fn run_measurement_workers(
     )>,
     noisy: &mut NoisySession,
     builder: Arc<Mutex<ArmRunBuilder>>,
+    worker_stop: Arc<AtomicBool>,
 ) -> (
     BTreeMap<String, OperationStats>,
     Vec<String>,
@@ -3277,7 +3563,6 @@ fn run_measurement_workers(
     let start_at = Instant::now() + EVENT_PLANE_WARMUP;
     let end_at = start_at + EVENT_PLANE_MEASUREMENT_WINDOW;
     let (tx, rx) = mpsc::channel();
-    let worker_stop = Arc::new(AtomicBool::new(false));
     let mut worker_guard = WorkerStopGuard {
         stop: worker_stop.clone(),
         joins: Vec::new(),
@@ -3326,6 +3611,7 @@ fn run_measurement_workers(
     let mut next_input_at = start_at;
     let mut input_seq: u64 = 0;
     let mut next_output_seq: Option<u64> = None;
+    let mut output_parser = OutputStreamParser::new();
     while Instant::now() < end_at {
         while let Ok(sample) = rx.try_recv() {
             apply_measurement_sample(&mut operations, sample);
@@ -3437,10 +3723,6 @@ fn run_measurement_workers(
         }
         let output_start = Instant::now();
         let started_output = output_start >= start_at;
-        if started_output {
-            tx.send(MeasurementSample::Start("terminal_output".to_string()))
-                .expect("send terminal output start");
-        }
         let drain = noisy
             .connection
             .request(&botster_hub_client::DaemonRequest::drain_subscription(
@@ -3450,6 +3732,8 @@ fn run_measurement_workers(
         if drain.is_err() {
             terminal.apply_output_failure();
             if started_output {
+                tx.send(MeasurementSample::Start("terminal_output".to_string()))
+                    .expect("send terminal output start");
                 tx.send(MeasurementSample::Finish {
                     operation: "terminal_output".to_string(),
                     ok: false,
@@ -3463,23 +3747,24 @@ fn run_measurement_workers(
                     if noisy_events_have_gap(&drained) {
                         terminal.apply_unexpected_gap();
                     }
-                    let parsed = parse_output_records(&drained);
+                    let parsed = output_parser.feed(&drained);
                     terminal.apply_malformed(parsed.malformed);
                     let receipt_ns = monotonic_now_ns();
                     if parsed.records.is_empty() {
-                        let ok = parsed.malformed == 0;
-                        if !ok {
+                        if parsed.malformed > 0 {
                             terminal.apply_output_failure();
+                            if started_output {
+                                tx.send(MeasurementSample::Start("terminal_output".to_string()))
+                                    .expect("send terminal output start");
+                                tx.send(MeasurementSample::Finish {
+                                    operation: "terminal_output".to_string(),
+                                    ok: false,
+                                    ms: output_start.elapsed().as_millis() as u64,
+                                })
+                                .expect("send terminal output malformed empty");
+                            }
                         }
-                        if started_output {
-                            tx.send(MeasurementSample::Finish {
-                                operation: "terminal_output".to_string(),
-                                ok,
-                                ms: output_start.elapsed().as_millis() as u64,
-                            })
-                            .expect("send terminal output empty finish");
-                        }
-                    } else {
+                    } else if started_output {
                         for (index, record) in parsed.records.iter().enumerate() {
                             let sequential = match next_output_seq {
                                 Some(expected) if record.seq != expected => {
@@ -3495,28 +3780,29 @@ fn run_measurement_workers(
                             if !ok {
                                 terminal.apply_output_failure();
                             }
-                            if started_output {
-                                if index > 0 {
-                                    tx.send(MeasurementSample::Start(
-                                        "terminal_output".to_string(),
-                                    ))
+                            if index > 0 {
+                                tx.send(MeasurementSample::Start("terminal_output".to_string()))
                                     .expect("send terminal output record start");
-                                }
-                                let latency_ms =
-                                    receipt_ns.saturating_sub(record.emit_ns) / 1_000_000;
-                                tx.send(MeasurementSample::Finish {
-                                    operation: "terminal_output".to_string(),
-                                    ok,
-                                    ms: latency_ms,
-                                })
-                                .expect("send terminal output sample");
+                            } else {
+                                tx.send(MeasurementSample::Start("terminal_output".to_string()))
+                                    .expect("send terminal output start");
                             }
+                            let latency_ms =
+                                receipt_ns.saturating_sub(record.emit_ns) / 1_000_000;
+                            tx.send(MeasurementSample::Finish {
+                                operation: "terminal_output".to_string(),
+                                ok,
+                                ms: latency_ms,
+                            })
+                            .expect("send terminal output sample");
                         }
                     }
                 }
                 Err(_) => {
                     terminal.apply_output_failure();
                     if started_output {
+                        tx.send(MeasurementSample::Start("terminal_output".to_string()))
+                            .expect("send terminal output start");
                         tx.send(MeasurementSample::Finish {
                             operation: "terminal_output".to_string(),
                             ok: false,
@@ -3528,6 +3814,11 @@ fn run_measurement_workers(
             }
         }
         thread::sleep(Duration::from_millis(20));
+    }
+    let finished_output = output_parser.finish();
+    terminal.apply_malformed(finished_output.malformed);
+    if finished_output.unresolved_tail {
+        terminal.apply_output_failure();
     }
     if let Some(connection) = unix.as_mut() {
         connection.set_read_timeout(None).ok();
@@ -3652,6 +3943,7 @@ fn expect_kind(
     Ok(())
 }
 
+#[derive(Clone, Debug)]
 struct OutputRecord {
     seq: u64,
     emit_ns: u64,
@@ -3668,65 +3960,204 @@ fn unix_now_ns() -> u64 {
 struct ParsedOutputRecords {
     records: Vec<OutputRecord>,
     malformed: u64,
+    unresolved_tail: bool,
+}
+
+struct OutputStreamParser {
+    pending: Vec<u8>,
+    records: Vec<OutputRecord>,
+    malformed: u64,
+    unresolved_tail: bool,
+}
+
+impl OutputStreamParser {
+    fn new() -> Self {
+        Self {
+            pending: Vec::new(),
+            records: Vec::new(),
+            malformed: 0,
+            unresolved_tail: false,
+        }
+    }
+
+    fn feed(&mut self, events: &[botster_hub_client::DaemonEvent]) -> ParsedOutputRecords {
+        let start_records = self.records.len();
+        let start_malformed = self.malformed;
+        for event in events {
+            let botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } = event else {
+                continue;
+            };
+            match payload.decoded_bytes() {
+                Ok(bytes) => self.pending.extend_from_slice(&bytes),
+                Err(_) => {
+                    self.malformed = self.malformed.saturating_add(1);
+                }
+            }
+        }
+        self.consume(false);
+        self.snapshot_since(start_records, start_malformed)
+    }
+
+    fn finish(&mut self) -> ParsedOutputRecords {
+        let start_records = self.records.len();
+        let start_malformed = self.malformed;
+        self.consume(true);
+        if !self.pending.is_empty() {
+            self.unresolved_tail = true;
+            self.malformed = self.malformed.saturating_add(1);
+            self.pending.clear();
+        }
+        self.snapshot_since(start_records, start_malformed)
+    }
+
+    fn snapshot_since(&self, start_records: usize, start_malformed: u64) -> ParsedOutputRecords {
+        ParsedOutputRecords {
+            records: self.records[start_records..].to_vec(),
+            malformed: self.malformed.saturating_sub(start_malformed),
+            unresolved_tail: self.unresolved_tail,
+        }
+    }
+
+    fn consume(&mut self, finishing: bool) {
+        loop {
+            if self.pending.is_empty() {
+                return;
+            }
+            if self.strip_exact(EVENT_PLANE_OUTPUT_NS_READY) {
+                continue;
+            }
+            if self.wait_prefix(EVENT_PLANE_OUTPUT_NS_READY, finishing) {
+                return;
+            }
+            if self.strip_exact(EVENT_PLANE_OUTPUT_IDENTITY) {
+                continue;
+            }
+            if self.wait_prefix(EVENT_PLANE_OUTPUT_IDENTITY, finishing) {
+                return;
+            }
+            if self.strip_echo_line() {
+                continue;
+            }
+            if self.wait_echo(finishing) {
+                return;
+            }
+            if self.pending[0] == b'N' {
+                if self.pending.len() < EVENT_PLANE_OUTPUT_RECORD_BYTES {
+                    return;
+                }
+                if self.take_valid_record() {
+                    continue;
+                }
+                self.malformed = self.malformed.saturating_add(1);
+                self.pending.drain(..1);
+                continue;
+            }
+            self.malformed = self.malformed.saturating_add(1);
+            self.pending.drain(..1);
+        }
+    }
+
+    fn strip_exact(&mut self, token: &[u8]) -> bool {
+        if self.pending.starts_with(token) {
+            self.pending.drain(..token.len());
+            true
+        } else {
+            false
+        }
+    }
+
+    fn wait_prefix(&self, token: &[u8], finishing: bool) -> bool {
+        if finishing || self.pending.is_empty() || self.pending.len() >= token.len() {
+            return false;
+        }
+        self.pending == token[..self.pending.len()]
+    }
+
+    fn strip_echo_line(&mut self) -> bool {
+        if !self.pending.starts_with(EVENT_PLANE_OUTPUT_ECHO_PREFIX) {
+            return false;
+        }
+        let Some(end) = self.pending.iter().position(|byte| *byte == b'\n') else {
+            return false;
+        };
+        self.pending.drain(..=end);
+        true
+    }
+
+    fn wait_echo(&self, finishing: bool) -> bool {
+        if finishing {
+            return false;
+        }
+        if self.pending.starts_with(EVENT_PLANE_OUTPUT_ECHO_PREFIX) {
+            return !self.pending.contains(&b'\n');
+        }
+        let n = self.pending.len().min(EVENT_PLANE_OUTPUT_ECHO_PREFIX.len());
+        n > 0 && self.pending[..n] == EVENT_PLANE_OUTPUT_ECHO_PREFIX[..n]
+    }
+
+    fn take_valid_record(&mut self) -> bool {
+        if !valid_output_record(&self.pending[..EVENT_PLANE_OUTPUT_RECORD_BYTES]) {
+            return false;
+        }
+        let seq = std::str::from_utf8(&self.pending[1..9])
+            .expect("seq digits")
+            .parse::<u64>()
+            .expect("seq");
+        let emit_ns = std::str::from_utf8(&self.pending[10..EVENT_PLANE_OUTPUT_HEADER_BYTES])
+            .expect("emit digits")
+            .parse::<u64>()
+            .expect("emit_ns");
+        self.records.push(OutputRecord {
+            seq,
+            emit_ns,
+            bytes: EVENT_PLANE_OUTPUT_RECORD_BYTES,
+        });
+        self.pending.drain(..EVENT_PLANE_OUTPUT_RECORD_BYTES);
+        true
+    }
+}
+
+fn valid_output_record(bytes: &[u8]) -> bool {
+    bytes.len() == EVENT_PLANE_OUTPUT_RECORD_BYTES
+        && bytes[0] == b'N'
+        && bytes[1..9].iter().all(|byte| byte.is_ascii_digit())
+        && bytes[9] == b'T'
+        && bytes[10..EVENT_PLANE_OUTPUT_HEADER_BYTES]
+            .iter()
+            .all(|byte| byte.is_ascii_digit())
+        && bytes[EVENT_PLANE_OUTPUT_HEADER_BYTES..EVENT_PLANE_OUTPUT_RECORD_BYTES - 1]
+            .iter()
+            .all(|byte| *byte == EVENT_PLANE_OUTPUT_BODY_BYTE)
+        && bytes[EVENT_PLANE_OUTPUT_RECORD_BYTES - 1] == b'\n'
+}
+
+fn noisy_output_record(seq: u64, emit_ns: u64) -> Vec<u8> {
+    let mut record = format!("N{seq:08}T{emit_ns:020}").into_bytes();
+    record.extend(std::iter::repeat_n(
+        EVENT_PLANE_OUTPUT_BODY_BYTE,
+        EVENT_PLANE_OUTPUT_BODY_BYTES,
+    ));
+    record.push(b'\n');
+    record
+}
+
+fn terminal_output_event(bytes: &[u8]) -> botster_hub_client::DaemonEvent {
+    botster_hub_client::DaemonEvent::TerminalOutput {
+        session_id: EVENT_PLANE_NOISY_SESSION.to_string(),
+        subscription_id: EVENT_PLANE_NOISY_SUB.to_string(),
+        payload: botster_hub_client::DaemonLiveOutputPayload::from_bytes(bytes),
+    }
 }
 
 fn parse_output_records(events: &[botster_hub_client::DaemonEvent]) -> ParsedOutputRecords {
-    let mut records = Vec::new();
-    let mut malformed = 0_u64;
-    for event in events {
-        let botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } = event else {
-            continue;
-        };
-        let bytes = match payload.decoded_bytes() {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                malformed = malformed.saturating_add(1);
-                continue;
-            }
-        };
-        let mut index = 0;
-        while index < bytes.len() {
-            if bytes[index] != b'N' {
-                index += 1;
-                continue;
-            }
-            if index + EVENT_PLANE_OUTPUT_RECORD_BYTES > bytes.len() {
-                break;
-            }
-            let seq_ok = bytes[index + 1..index + 9]
-                .iter()
-                .all(|byte| byte.is_ascii_digit());
-            let time_ok = bytes[index + 9] == b'T'
-                && bytes[index + 10..index + EVENT_PLANE_OUTPUT_HEADER_BYTES]
-                    .iter()
-                    .all(|byte| byte.is_ascii_digit());
-            let record_ok = seq_ok
-                && time_ok
-                && bytes[index + EVENT_PLANE_OUTPUT_RECORD_BYTES - 1] == b'\n';
-            if record_ok {
-                let seq = std::str::from_utf8(&bytes[index + 1..index + 9])
-                    .expect("seq digits")
-                    .parse::<u64>()
-                    .expect("seq");
-                let emit_ns = std::str::from_utf8(
-                    &bytes[index + 10..index + EVENT_PLANE_OUTPUT_HEADER_BYTES],
-                )
-                .expect("emit digits")
-                .parse::<u64>()
-                .expect("emit_ns");
-                records.push(OutputRecord {
-                    seq,
-                    emit_ns,
-                    bytes: EVENT_PLANE_OUTPUT_RECORD_BYTES,
-                });
-                index += EVENT_PLANE_OUTPUT_RECORD_BYTES;
-            } else {
-                malformed = malformed.saturating_add(1);
-                index += 1;
-            }
-        }
+    let mut parser = OutputStreamParser::new();
+    parser.feed(events);
+    parser.finish();
+    ParsedOutputRecords {
+        records: parser.records,
+        malformed: parser.malformed,
+        unresolved_tail: parser.unresolved_tail,
     }
-    ParsedOutputRecords { records, malformed }
 }
 
 fn output_records(events: &[botster_hub_client::DaemonEvent]) -> Vec<OutputRecord> {
@@ -3901,11 +4332,25 @@ fn queue_bound_violations(
     violations
 }
 
+fn collect_arm_survivors(
+    endpoint: &botster_hub_client::DaemonEndpoint,
+) -> Result<Vec<(String, String)>, String> {
+    let mut survivors = try_shutdown_owned_sessions(endpoint)?;
+    survivors.extend(try_list_live_sessions(endpoint)?);
+    Ok(survivors)
+}
+
 fn shutdown_owned_sessions(endpoint: &botster_hub_client::DaemonEndpoint) -> Vec<(String, String)> {
+    try_shutdown_owned_sessions(endpoint).expect("list sessions for teardown")
+}
+
+fn try_shutdown_owned_sessions(
+    endpoint: &botster_hub_client::DaemonEndpoint,
+) -> Result<Vec<(String, String)>, String> {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let listed = botster_hub_client::request(endpoint, botster_hub_client::DaemonRequest::ListSessions)
-            .expect("list sessions for teardown");
+            .map_err(|error| error.to_string())?;
         let live: Vec<String> = listed
             .sessions
             .iter()
@@ -3916,12 +4361,12 @@ fn shutdown_owned_sessions(endpoint: &botster_hub_client::DaemonEndpoint) -> Vec
             break;
         }
         if Instant::now() >= deadline {
-            return listed
+            return Ok(listed
                 .sessions
                 .iter()
                 .filter(|session| session.lifecycle != "exited")
                 .map(|session| (session.session_id.clone(), session.lifecycle.clone()))
-                .collect();
+                .collect());
         }
         for session_id in live {
             let _ = botster_hub_client::request(
@@ -3931,18 +4376,24 @@ fn shutdown_owned_sessions(endpoint: &botster_hub_client::DaemonEndpoint) -> Vec
         }
         thread::sleep(Duration::from_millis(50));
     }
-    Vec::new()
+    Ok(Vec::new())
 }
 
 fn list_live_sessions(endpoint: &botster_hub_client::DaemonEndpoint) -> Vec<(String, String)> {
+    try_list_live_sessions(endpoint).expect("no-survivor list")
+}
+
+fn try_list_live_sessions(
+    endpoint: &botster_hub_client::DaemonEndpoint,
+) -> Result<Vec<(String, String)>, String> {
     let listed = botster_hub_client::request(endpoint, botster_hub_client::DaemonRequest::ListSessions)
-        .expect("no-survivor list");
-    listed
+        .map_err(|error| error.to_string())?;
+    Ok(listed
         .sessions
         .iter()
         .filter(|session| session.lifecycle != "exited")
         .map(|session| (session.session_id.clone(), session.lifecycle.clone()))
-        .collect()
+        .collect())
 }
 
 fn assert_no_live_sessions(endpoint: &botster_hub_client::DaemonEndpoint) {

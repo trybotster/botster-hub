@@ -118,12 +118,21 @@ terminal gap, no peer loss), `max_owner_turn_us` ≤ 25,000 µs,
 at most 50,000 µs (50,000 passes; only a strictly greater lag fails) across
 the full disabled-arm interval, applicable queue age ≤ 1,000,000 µs, no
 confirmed FD or PTY exhaustion, and no environment taint or survivors.
-PackageEvent or EventGap on Unix/WebRTC event subscriptions are valid
-event-plane observations and are not Gate 5 unexpected-gap or peer-loss
-failures. An arm panic keeps partial evidence, stops workers and the
-watchdog, classifies available gates, and persists the host-validity
-artifact before exit. Gates 1–5 are `fail` rather than `not_evaluated` on
-that path.
+Gate 5 parses noisy producer output as a stream: every generated record is
+`N%08dT%020d` plus 4065 `x` bytes plus `\n`. Partial records carry across
+`TerminalOutput` events. An unresolved tail or missing expected output
+fails Gate 5. An empty drain with no malformed bytes is no sample.
+Identity bytes `0x80 0xff \n` and `ns-echo:` lines are framing, not
+malformed records. PackageEvent or EventGap on Unix/WebRTC event
+subscriptions are valid event-plane observations and are not Gate 5
+unexpected-gap or peer-loss failures. An arm panic keeps the last
+`ArmRunBuilder` snapshot (poison recovery never replaces it with a blank
+builder), stops workers and the watchdog from an outer exit guard,
+collects survivors, classifies available gates, and persists the
+host-validity artifact before exit. Gates 1–5 are `fail` rather than
+`not_evaluated` when the arm started and then aborted. Gate 11 fails when
+the arm started and survivor collection did not complete, and is
+`not_evaluated` only when the arm never started.
 
 `host_exhaustion` is selected only from scheduler-lag maximum or confirmed
 FD/PTY evidence. Owner-turn, ready-wait, queue-age, sample, and terminal
