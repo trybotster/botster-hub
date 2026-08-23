@@ -12,7 +12,7 @@
 | Merge policy | `direct` into `main`; no PR |
 | Returned from | Verify `review_1787447963_920277` (Review `review_1787447898_566588`) |
 | Locked Core | `7eafa470a18025895995bbedc20d34b58106a03b` |
-| Feature commit | this feature commit (artifact records the SHA) |
+| Feature commit | `c55bbdccbd78b5e2d917e8c20d4302fc89cb9985` |
 | SHA-record commit | this report commit (artifact records the SHA) |
 | `teardown_class_applies` | **yes** |
 
