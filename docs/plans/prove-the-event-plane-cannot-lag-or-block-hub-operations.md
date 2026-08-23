@@ -7,6 +7,21 @@ Pipeline: `botster_stack_delivery` (direct merge, no PR)
 Project: `project_1786663508_823105` Botster Non-Blocking Event Plane, Stage D
 Vault checklist: `checklist_1787266824_449406` (ticket scope, one Plan visit)
 
+## Plan revision 13
+
+Revision 13 records Review `review_1787443515_507854`. After the 600-second
+window closes, Gate 5 performs a bounded final subscription drain and parses
+every record whose emission timestamp is inside the window. The in-window
+sequence is closed only when the next observed record is the immediate
+successor after the window (`last + 1`). A complete record that remains
+queued at the end of the loop is a missing tail. Input echoes are validated
+against the complete expected payload: `ns-echo:` plus the 64-byte padded
+token plus a line ending. `OutputStreamParser` no longer treats every
+`ns-echo:` line as framing; a corrupted suffix is malformed and fails
+exact bytes. Negative tests cover a queued final in-window record and a
+corrupted echo suffix. The implementation artifact records both the feature
+commit and the SHA-record commit.
+
 ## Plan revision 12
 
 Revision 12 records Review `review_1787442149_174868`. Gate 5 uses a

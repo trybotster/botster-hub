@@ -122,10 +122,14 @@ Gate 5 parses noisy producer output as a stream: every generated record is
 `N%08dT%020d` plus 4065 `x` bytes plus `\n`. Partial records carry across
 `TerminalOutput` events. An unresolved tail or missing expected output
 fails Gate 5. An empty drain with no malformed bytes is no sample.
-Identity bytes `0x80 0xff \n` and `ns-echo:` lines are framing, not
-malformed records. PackageEvent or EventGap on Unix/WebRTC event
-subscriptions are valid event-plane observations and are not Gate 5
-unexpected-gap or peer-loss failures. An arm panic keeps the last
+Identity bytes `0x80 0xff \n` and valid `ns-echo:` lines are framing, not
+malformed records. After the window closes, a bounded final drain parses
+in-window emission timestamps and requires the next record to be the
+immediate successor; a queued final in-window record is a missing tail.
+Each input echo must match the complete 64-byte padded payload and line
+ending. A corrupted echo suffix is malformed. PackageEvent or EventGap on
+Unix/WebRTC event subscriptions are valid event-plane observations and are
+not Gate 5 unexpected-gap or peer-loss failures. An arm panic keeps the last
 `ArmRunBuilder` snapshot (poison recovery never replaces it with a blank
 builder), stops workers and the watchdog from an outer exit guard,
 collects survivors, classifies available gates, and persists the
