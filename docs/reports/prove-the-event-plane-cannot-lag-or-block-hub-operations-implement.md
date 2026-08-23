@@ -12,8 +12,8 @@
 | Merge policy | `direct` into `main`; no PR |
 | Returned from | Verify `review_1787446925_877158` |
 | Locked Core | `7eafa470a18025895995bbedc20d34b58106a03b` |
-| Feature commit | `FEATURE_COMMIT_PLACEHOLDER` |
-| SHA-record commit | `SHA_RECORD_COMMIT_PLACEHOLDER` |
+| Feature commit | `f8342c5e518561b73a4036d8709f9bab15e69c25` |
+| SHA-record commit | this report commit (artifact records the SHA) |
 | `teardown_class_applies` | **yes** |
 
 Independent routing: ticket and run `target_id` resolve to `botster-hub`. Work is in the ticket worktree. This visit does not rebuild the campaign, does not retune production budgets, and does not dispatch N=300.
