@@ -66,6 +66,17 @@ const EVENT_PLANE_OUTPUT_IDENTITY: &[u8] = &[0x80, 0xff, b'\n'];
 const EVENT_PLANE_OUTPUT_ECHO_PREFIX: &[u8] = b"ns-echo:";
 const EVENT_PLANE_INPUT_ECHO_WIDTH: usize = 64;
 const EVENT_PLANE_FINAL_DRAIN_BOUND: Duration = Duration::from_millis(400);
+
+fn duration_as_ns(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn measurement_window_end_ns(origin_ns: u64) -> u64 {
+    origin_ns.saturating_add(duration_as_ns(
+        EVENT_PLANE_WARMUP + EVENT_PLANE_MEASUREMENT_WINDOW,
+    ))
+}
+
 const EVENT_PLANE_NOISY_COMMAND: &str = concat!(
     "python3 -u -c \"",
     "import sys,time,threading\n",
@@ -697,6 +708,56 @@ fn event_plane_saturation_queued_final_in_window_record_is_a_missing_tail() {
         drained.first_post_window_seq
     ));
     assert!(drained_terminal.continuous_sequence);
+}
+
+#[test]
+fn event_plane_saturation_late_iteration_post_cutoff_record_is_not_sampled() {
+    let origin_ns = 1_000_000_000;
+    let cutoff = measurement_window_end_ns(origin_ns);
+    assert_eq!(
+        cutoff,
+        origin_ns
+            + u64::try_from((EVENT_PLANE_WARMUP + EVENT_PLANE_MEASUREMENT_WINDOW).as_nanos())
+                .expect("window duration fits u64")
+    );
+
+    let (tx, rx) = mpsc::channel();
+    let mut fold = OutputStreamFold::new();
+    let mut terminal = TerminalOracles::passing();
+    let mut operations = zero_gated_operations();
+    fold.ingest(
+        &[terminal_output_event(&noisy_output_record(0, cutoff))],
+        &mut terminal,
+        Some(&tx),
+        true,
+        cutoff,
+    );
+    // Late loop iteration: sampling is still requested because Instant
+    // started the iteration before end_at, but the producer emitted after
+    // the fixed 600-second cutoff. That record must not become a sample.
+    fold.ingest(
+        &[terminal_output_event(&noisy_output_record(
+            1,
+            cutoff.saturating_add(1),
+        ))],
+        &mut terminal,
+        Some(&tx),
+        true,
+        cutoff,
+    );
+    drop(tx);
+    while let Ok(sample) = rx.try_recv() {
+        apply_measurement_sample(&mut operations, sample);
+    }
+    let stats = operations
+        .get("terminal_output")
+        .expect("terminal_output stats");
+    assert_eq!(stats.attempts, 1);
+    assert_eq!(stats.successes, 1);
+    assert_eq!(stats.failures, 0);
+    assert_eq!(fold.last_in_window_seq, Some(0));
+    assert_eq!(fold.first_post_window_seq, Some(1));
+    assert!(terminal.continuous_sequence);
 }
 
 #[test]
@@ -3649,8 +3710,11 @@ fn run_measurement_workers(
     TerminalOracles,
     bool,
 ) {
-    let start_at = Instant::now() + EVENT_PLANE_WARMUP;
+    let origin = Instant::now();
+    let origin_ns = monotonic_now_ns();
+    let start_at = origin + EVENT_PLANE_WARMUP;
     let end_at = start_at + EVENT_PLANE_MEASUREMENT_WINDOW;
+    let window_end_ns = measurement_window_end_ns(origin_ns);
     let (tx, rx) = mpsc::channel();
     let mut worker_guard = WorkerStopGuard {
         stop: worker_stop.clone(),
@@ -3790,7 +3854,7 @@ fn run_measurement_workers(
                         &mut terminal,
                         Some(&tx),
                         input_start >= start_at,
-                        u64::MAX,
+                        window_end_ns,
                     );
                     let echoed_ok = events.iter().any(|event| {
                         matches!(
@@ -3850,7 +3914,7 @@ fn run_measurement_workers(
                         &mut terminal,
                         Some(&tx),
                         started_output,
-                        u64::MAX,
+                        window_end_ns,
                     );
                 }
                 Err(_) => {
@@ -3870,7 +3934,6 @@ fn run_measurement_workers(
         }
         thread::sleep(Duration::from_millis(20));
     }
-    let window_end_ns = monotonic_now_ns();
     output_fold.close_window(&mut terminal, noisy, &tx, window_end_ns);
     if let Some(connection) = unix.as_mut() {
         connection.set_read_timeout(None).ok();

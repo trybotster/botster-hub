@@ -127,7 +127,11 @@ malformed records. After the window closes, a bounded final drain parses
 in-window emission timestamps and requires the next record to be the
 immediate successor; a queued final in-window record is a missing tail.
 Each input echo must match the complete 64-byte padded payload and line
-ending. A corrupted echo suffix is malformed. PackageEvent or EventGap on
+ending. A corrupted echo suffix is malformed. The in-window cutoff is the
+fixed monotonic instant `origin_ns + warmup + 600s` captured with
+`start_at`/`end_at`. Late loop iterations that cross Instant `end_at` still
+use that cutoff, so a record emitted after the 600-second boundary is not a
+`terminal_output` sample. PackageEvent or EventGap on
 Unix/WebRTC event subscriptions are valid event-plane observations and are
 not Gate 5 unexpected-gap or peer-loss failures. An arm panic keeps the last
 `ArmRunBuilder` snapshot (poison recovery never replaces it with a blank
