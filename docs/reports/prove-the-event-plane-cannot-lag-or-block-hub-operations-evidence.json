@@ -2,11 +2,12 @@
   "campaign": "event-plane-saturation",
   "ticket_id": "ticket_1786663585_879846",
   "run_id": "run_1787262311_549251",
-  "result": "review_return_stateful_output_parser_and_panic_survivor_collection_pending_runner",
+  "result": "review_return_final_drain_and_full_echo_validation_pending_runner",
   "target_id": "tgt_7e208a0c76a44980a83b63af976b1f22",
   "target_repository": "botster-hub",
   "executed_revisions": {
-    "botster-hub": "cb5945b3b3ff4c25e4626562c6a98509829dcd36",
+    "botster-hub_feature": "FEATURE_COMMIT_PLACEHOLDER",
+    "botster-hub_sha_record": "SHA_RECORD_COMMIT_PLACEHOLDER",
     "botster-core": "7eafa470a18025895995bbedc20d34b58106a03b"
   },
   "cited_prerequisite_revisions": {
@@ -39,7 +40,7 @@
     }
   },
   "provenance": {
-    "note": "This Review-return implement visit adds a stateful Gate 5 output-stream parser that validates every generated record byte and an outer arm-exit guard that keeps ArmRunBuilder evidence and collects survivors on panic. Calibration and acceptance still require the loaded-daemon-lifecycle ubuntu-24.04 runner.",
+    "note": "This Review-return implement visit closes Gate 5 with a bounded final in-window drain and full echo-payload validation. Calibration and acceptance still require the loaded-daemon-lifecycle ubuntu-24.04 runner.",
     "stress_profile_required": "none",
     "test_target": "event-plane-saturation",
     "inconclusive_residual_tail_dispatches": [
@@ -84,6 +85,8 @@
     "event_plane_saturation_terminal_oracle_failures_fail_gate_5": "passed",
     "event_plane_saturation_parse_output_records_counts_malformed_bytes": "passed",
     "event_plane_saturation_output_stream_parser_rejects_fragment_corruption_and_empty_drains": "passed",
+    "event_plane_saturation_queued_final_in_window_record_is_a_missing_tail": "passed",
+    "event_plane_saturation_corrupted_echo_suffix_fails_exact_bytes": "passed",
     "event_plane_saturation_missing_survivor_collection_fails_gate_11": "passed",
     "event_plane_saturation_poisoned_builder_keeps_last_snapshot": "passed",
     "event_plane_saturation_injected_arm_panic_preserves_measurements_and_collects_survivors": "passed",

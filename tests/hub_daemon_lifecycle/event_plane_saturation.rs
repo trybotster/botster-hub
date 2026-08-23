@@ -64,6 +64,8 @@ const EVENT_PLANE_OUTPUT_BODY_BYTE: u8 = b'x';
 const EVENT_PLANE_OUTPUT_NS_READY: &[u8] = b"ns-ready\n";
 const EVENT_PLANE_OUTPUT_IDENTITY: &[u8] = &[0x80, 0xff, b'\n'];
 const EVENT_PLANE_OUTPUT_ECHO_PREFIX: &[u8] = b"ns-echo:";
+const EVENT_PLANE_INPUT_ECHO_WIDTH: usize = 64;
+const EVENT_PLANE_FINAL_DRAIN_BOUND: Duration = Duration::from_millis(400);
 const EVENT_PLANE_NOISY_COMMAND: &str = concat!(
     "python3 -u -c \"",
     "import sys,time,threading\n",
@@ -624,12 +626,99 @@ fn event_plane_saturation_output_stream_parser_rejects_fragment_corruption_and_e
     let mut framed = EVENT_PLANE_OUTPUT_NS_READY.to_vec();
     framed.extend_from_slice(EVENT_PLANE_OUTPUT_IDENTITY);
     framed.extend(noisy_output_record(0, 1));
-    framed.extend(b"ns-echo:ti-1xxxxxxxx\r\n");
+    framed.extend(&echo_line_bytes("ti-1", b"\r\n"));
     framed.extend(noisy_output_record(1, 2));
     let parsed_framed = parse_output_records(&[terminal_output_event(&framed)]);
     assert_eq!(parsed_framed.records.len(), 2);
     assert_eq!(parsed_framed.malformed, 0);
     assert!(!parsed_framed.unresolved_tail);
+}
+
+#[test]
+fn event_plane_saturation_queued_final_in_window_record_is_a_missing_tail() {
+    assert!(in_window_tail_closed(Some(7), Some(8)));
+    assert!(!in_window_tail_closed(Some(7), Some(9)));
+    assert!(!in_window_tail_closed(Some(7), None));
+    assert!(in_window_tail_closed(None, None));
+
+    let rec0 = noisy_output_record(0, 10);
+    let rec1 = noisy_output_record(1, 20);
+    let rec2 = noisy_output_record(2, 50);
+    let mut queued = OutputStreamFold::new();
+    let mut queued_terminal = TerminalOracles::passing();
+    queued.ingest(
+        &[terminal_output_event(&rec0)],
+        &mut queued_terminal,
+        None,
+        true,
+        30,
+    );
+    queued.ingest(
+        &[terminal_output_event(&rec2)],
+        &mut queued_terminal,
+        None,
+        true,
+        30,
+    );
+    assert_eq!(queued.last_in_window_seq, Some(0));
+    assert_eq!(queued.first_post_window_seq, Some(2));
+    assert!(
+        !in_window_tail_closed(queued.last_in_window_seq, queued.first_post_window_seq),
+        "a complete in-window record that stays queued must fail the tail"
+    );
+
+    let mut drained = OutputStreamFold::new();
+    let mut drained_terminal = TerminalOracles::passing();
+    drained.ingest(
+        &[terminal_output_event(&rec0)],
+        &mut drained_terminal,
+        None,
+        true,
+        30,
+    );
+    drained.ingest(
+        &[terminal_output_event(&rec1)],
+        &mut drained_terminal,
+        None,
+        true,
+        30,
+    );
+    drained.ingest(
+        &[terminal_output_event(&rec2)],
+        &mut drained_terminal,
+        None,
+        true,
+        30,
+    );
+    assert_eq!(drained.last_in_window_seq, Some(1));
+    assert_eq!(drained.first_post_window_seq, Some(2));
+    assert!(in_window_tail_closed(
+        drained.last_in_window_seq,
+        drained.first_post_window_seq
+    ));
+    assert!(drained_terminal.continuous_sequence);
+}
+
+#[test]
+fn event_plane_saturation_corrupted_echo_suffix_fails_exact_bytes() {
+    let token = "ti-1";
+    let mut corrupt = measurement_echo_body(token);
+    corrupt.extend(b"CORRUPT\n");
+    assert!(
+        String::from_utf8_lossy(&corrupt).contains(&format!("ns-echo:{token}")),
+        "prefix-only search would still match"
+    );
+    assert!(!payload_contains_exact_echo(&corrupt, token));
+    let parsed_corrupt = parse_output_records(&[terminal_output_event(&corrupt)]);
+    assert!(parsed_corrupt.records.is_empty());
+    assert!(parsed_corrupt.malformed > 0);
+
+    let good = echo_line_bytes(token, b"\r\n");
+    assert!(payload_contains_exact_echo(&good, token));
+    let parsed_good = parse_output_records(&[terminal_output_event(&good)]);
+    assert_eq!(parsed_good.malformed, 0);
+    assert!(parsed_good.records.is_empty());
+    assert!(!parsed_good.unresolved_tail);
 }
 
 #[test]
@@ -3610,8 +3699,7 @@ fn run_measurement_workers(
     let mut saw_webrtc_gap = false;
     let mut next_input_at = start_at;
     let mut input_seq: u64 = 0;
-    let mut next_output_seq: Option<u64> = None;
-    let mut output_parser = OutputStreamParser::new();
+    let mut output_fold = OutputStreamFold::new();
     while Instant::now() < end_at {
         while let Ok(sample) = rx.try_recv() {
             apply_measurement_sample(&mut operations, sample);
@@ -3678,7 +3766,7 @@ fn run_measurement_workers(
         if now >= next_input_at && now < end_at {
             input_seq += 1;
             let token = format!("ti-{input_seq}");
-            let payload = format!("{token}{}\r", "x".repeat(64_usize.saturating_sub(token.len())));
+            let payload = terminal_input_payload(&token);
             let input_start = Instant::now();
             if input_start >= start_at {
                 tx.send(MeasurementSample::Start("terminal_input".to_string()))
@@ -3697,11 +3785,21 @@ fn run_measurement_workers(
                     if noisy_events_have_gap(&events) {
                         terminal.apply_unexpected_gap();
                     }
+                    output_fold.ingest(
+                        &events,
+                        &mut terminal,
+                        Some(&tx),
+                        input_start >= start_at,
+                        u64::MAX,
+                    );
                     let echoed_ok = events.iter().any(|event| {
                         matches!(
                             event,
                             botster_hub_client::DaemonEvent::TerminalOutput { payload, .. }
-                                if live_output_contains(payload, &echo_marker)
+                                if payload
+                                    .decoded_bytes()
+                                    .ok()
+                                    .is_some_and(|bytes| payload_contains_exact_echo(&bytes, &token))
                         )
                     });
                     sent.is_ok() && echoed_ok
@@ -3747,56 +3845,13 @@ fn run_measurement_workers(
                     if noisy_events_have_gap(&drained) {
                         terminal.apply_unexpected_gap();
                     }
-                    let parsed = output_parser.feed(&drained);
-                    terminal.apply_malformed(parsed.malformed);
-                    let receipt_ns = monotonic_now_ns();
-                    if parsed.records.is_empty() {
-                        if parsed.malformed > 0 {
-                            terminal.apply_output_failure();
-                            if started_output {
-                                tx.send(MeasurementSample::Start("terminal_output".to_string()))
-                                    .expect("send terminal output start");
-                                tx.send(MeasurementSample::Finish {
-                                    operation: "terminal_output".to_string(),
-                                    ok: false,
-                                    ms: output_start.elapsed().as_millis() as u64,
-                                })
-                                .expect("send terminal output malformed empty");
-                            }
-                        }
-                    } else if started_output {
-                        for (index, record) in parsed.records.iter().enumerate() {
-                            let sequential = match next_output_seq {
-                                Some(expected) if record.seq != expected => {
-                                    terminal.apply_sequence_break();
-                                    false
-                                }
-                                _ => {
-                                    next_output_seq = Some(record.seq.saturating_add(1));
-                                    true
-                                }
-                            };
-                            let ok = sequential && parsed.malformed == 0;
-                            if !ok {
-                                terminal.apply_output_failure();
-                            }
-                            if index > 0 {
-                                tx.send(MeasurementSample::Start("terminal_output".to_string()))
-                                    .expect("send terminal output record start");
-                            } else {
-                                tx.send(MeasurementSample::Start("terminal_output".to_string()))
-                                    .expect("send terminal output start");
-                            }
-                            let latency_ms =
-                                receipt_ns.saturating_sub(record.emit_ns) / 1_000_000;
-                            tx.send(MeasurementSample::Finish {
-                                operation: "terminal_output".to_string(),
-                                ok,
-                                ms: latency_ms,
-                            })
-                            .expect("send terminal output sample");
-                        }
-                    }
+                    output_fold.ingest(
+                        &drained,
+                        &mut terminal,
+                        Some(&tx),
+                        started_output,
+                        u64::MAX,
+                    );
                 }
                 Err(_) => {
                     terminal.apply_output_failure();
@@ -3815,11 +3870,8 @@ fn run_measurement_workers(
         }
         thread::sleep(Duration::from_millis(20));
     }
-    let finished_output = output_parser.finish();
-    terminal.apply_malformed(finished_output.malformed);
-    if finished_output.unresolved_tail {
-        terminal.apply_output_failure();
-    }
+    let window_end_ns = monotonic_now_ns();
+    output_fold.close_window(&mut terminal, noisy, &tx, window_end_ns);
     if let Some(connection) = unix.as_mut() {
         connection.set_read_timeout(None).ok();
         if !(saw_unix_event || saw_unix_gap) {
@@ -4010,6 +4062,13 @@ impl OutputStreamParser {
         self.snapshot_since(start_records, start_malformed)
     }
 
+    fn finish_allowing_partial(&mut self) -> ParsedOutputRecords {
+        let start_records = self.records.len();
+        let start_malformed = self.malformed;
+        self.consume(false);
+        self.snapshot_since(start_records, start_malformed)
+    }
+
     fn snapshot_since(&self, start_records: usize, start_malformed: u64) -> ParsedOutputRecords {
         ParsedOutputRecords {
             records: self.records[start_records..].to_vec(),
@@ -4080,6 +4139,10 @@ impl OutputStreamParser {
         let Some(end) = self.pending.iter().position(|byte| *byte == b'\n') else {
             return false;
         };
+        let line: Vec<u8> = self.pending[..=end].to_vec();
+        if !valid_echo_line(&line) {
+            self.malformed = self.malformed.saturating_add(1);
+        }
         self.pending.drain(..=end);
         true
     }
@@ -4129,6 +4192,251 @@ fn valid_output_record(bytes: &[u8]) -> bool {
             .iter()
             .all(|byte| *byte == EVENT_PLANE_OUTPUT_BODY_BYTE)
         && bytes[EVENT_PLANE_OUTPUT_RECORD_BYTES - 1] == b'\n'
+}
+
+
+fn terminal_input_payload(token: &str) -> String {
+    format!(
+        "{token}{}\r",
+        "x".repeat(EVENT_PLANE_INPUT_ECHO_WIDTH.saturating_sub(token.len()))
+    )
+}
+
+fn measurement_echo_body(token: &str) -> Vec<u8> {
+    let mut body = EVENT_PLANE_OUTPUT_ECHO_PREFIX.to_vec();
+    body.extend(token.as_bytes());
+    body.extend(std::iter::repeat_n(
+        b'x',
+        EVENT_PLANE_INPUT_ECHO_WIDTH.saturating_sub(token.len()),
+    ));
+    body
+}
+
+fn echo_line_bytes(token: &str, ending: &[u8]) -> Vec<u8> {
+    let mut line = measurement_echo_body(token);
+    line.extend(ending);
+    line
+}
+
+fn echo_line_body_and_ending(line: &[u8]) -> Option<(&[u8], &[u8])> {
+    let rest = line.strip_prefix(EVENT_PLANE_OUTPUT_ECHO_PREFIX)?;
+    if rest.ends_with(b"\r\n") {
+        Some((&rest[..rest.len() - 2], &rest[rest.len() - 2..]))
+    } else if rest.ends_with(b"\n") {
+        let without_lf = &rest[..rest.len() - 1];
+        if without_lf.ends_with(b"\r") {
+            Some((&without_lf[..without_lf.len() - 1], &rest[rest.len() - 2..]))
+        } else {
+            Some((without_lf, &rest[rest.len() - 1..]))
+        }
+    } else if rest.ends_with(b"\r") {
+        Some((&rest[..rest.len() - 1], &rest[rest.len() - 1..]))
+    } else {
+        None
+    }
+}
+
+fn valid_padded_echo_body(body: &[u8]) -> bool {
+    if body.len() != EVENT_PLANE_INPUT_ECHO_WIDTH || !body.starts_with(b"ti-") {
+        return false;
+    }
+    let digits = body[3..]
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if digits == 0 {
+        return false;
+    }
+    let token_len = 3 + digits;
+    body[token_len..].iter().all(|byte| *byte == b'x')
+}
+
+fn valid_echo_line(line: &[u8]) -> bool {
+    let Some((body, ending)) = echo_line_body_and_ending(line) else {
+        return false;
+    };
+    if ending != b"\n" && ending != b"\r\n" && ending != b"\r" {
+        return false;
+    }
+    body == b"ns-probe" || valid_padded_echo_body(body)
+}
+
+fn payload_contains_exact_echo(bytes: &[u8], token: &str) -> bool {
+    let needle = measurement_echo_body(token);
+    if bytes.len() < needle.len() {
+        return false;
+    }
+    bytes
+        .windows(needle.len())
+        .enumerate()
+        .any(|(index, window)| {
+            if window != needle.as_slice() {
+                return false;
+            }
+            let rest = &bytes[index..];
+            let Some(end) = rest
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map(|offset| offset + 1)
+                .or_else(|| rest.ends_with(b"\r").then_some(rest.len()))
+            else {
+                return false;
+            };
+            valid_echo_line(&rest[..end])
+        })
+}
+
+fn in_window_tail_closed(last_in_window_seq: Option<u64>, first_post_window_seq: Option<u64>) -> bool {
+    match (last_in_window_seq, first_post_window_seq) {
+        (None, _) => true,
+        (Some(last), Some(post)) => post == last.saturating_add(1),
+        (Some(_), None) => false,
+    }
+}
+
+struct OutputStreamFold {
+    parser: OutputStreamParser,
+    next_seq: Option<u64>,
+    last_in_window_seq: Option<u64>,
+    first_post_window_seq: Option<u64>,
+}
+
+impl OutputStreamFold {
+    fn new() -> Self {
+        Self {
+            parser: OutputStreamParser::new(),
+            next_seq: None,
+            last_in_window_seq: None,
+            first_post_window_seq: None,
+        }
+    }
+
+    fn ingest(
+        &mut self,
+        events: &[botster_hub_client::DaemonEvent],
+        terminal: &mut TerminalOracles,
+        tx: Option<&mpsc::Sender<MeasurementSample>>,
+        sample: bool,
+        window_end_ns: u64,
+    ) {
+        let parsed = self.parser.feed(events);
+        self.apply_parsed(parsed, terminal, tx, sample, window_end_ns);
+    }
+
+    fn apply_parsed(
+        &mut self,
+        parsed: ParsedOutputRecords,
+        terminal: &mut TerminalOracles,
+        tx: Option<&mpsc::Sender<MeasurementSample>>,
+        sample: bool,
+        window_end_ns: u64,
+    ) {
+        terminal.apply_malformed(parsed.malformed);
+        if parsed.records.is_empty() {
+            if parsed.malformed > 0 {
+                terminal.apply_output_failure();
+                if sample && let Some(tx) = tx {
+                    tx.send(MeasurementSample::Start("terminal_output".to_string()))
+                        .expect("send terminal output start");
+                    tx.send(MeasurementSample::Finish {
+                        operation: "terminal_output".to_string(),
+                        ok: false,
+                        ms: 0,
+                    })
+                    .expect("send terminal output malformed empty");
+                }
+            }
+            return;
+        }
+        let receipt_ns = monotonic_now_ns();
+        for (index, record) in parsed.records.iter().enumerate() {
+            let sequential = match self.next_seq {
+                Some(expected) if record.seq != expected => {
+                    terminal.apply_sequence_break();
+                    false
+                }
+                _ => {
+                    self.next_seq = Some(record.seq.saturating_add(1));
+                    true
+                }
+            };
+            let in_window = record.emit_ns <= window_end_ns;
+            if in_window {
+                self.last_in_window_seq = Some(record.seq);
+            } else if self.first_post_window_seq.is_none() {
+                self.first_post_window_seq = Some(record.seq);
+            }
+            let ok = sequential && parsed.malformed == 0;
+            if !ok {
+                terminal.apply_output_failure();
+            }
+            if sample && in_window && let Some(tx) = tx {
+                let start_label = if index > 0 {
+                    "send terminal output record start"
+                } else {
+                    "send terminal output start"
+                };
+                tx.send(MeasurementSample::Start("terminal_output".to_string()))
+                    .expect(start_label);
+                let latency_ms = receipt_ns.saturating_sub(record.emit_ns) / 1_000_000;
+                tx.send(MeasurementSample::Finish {
+                    operation: "terminal_output".to_string(),
+                    ok,
+                    ms: latency_ms,
+                })
+                .expect("send terminal output sample");
+            }
+        }
+    }
+
+    fn close_window(
+        &mut self,
+        terminal: &mut TerminalOracles,
+        noisy: &mut NoisySession,
+        tx: &mpsc::Sender<MeasurementSample>,
+        window_end_ns: u64,
+    ) {
+        let deadline = Instant::now() + EVENT_PLANE_FINAL_DRAIN_BOUND;
+        while Instant::now() < deadline && self.first_post_window_seq.is_none() {
+            let drain = noisy
+                .connection
+                .request(&botster_hub_client::DaemonRequest::drain_subscription(
+                    EVENT_PLANE_NOISY_SESSION,
+                    EVENT_PLANE_NOISY_SUB,
+                ));
+            if drain.is_err() {
+                terminal.apply_output_failure();
+                break;
+            }
+            match collect_noisy_attach(noisy, None) {
+                Ok(drained) => {
+                    if noisy_events_have_gap(&drained) {
+                        terminal.apply_unexpected_gap();
+                    }
+                    self.ingest(&drained, terminal, Some(tx), true, window_end_ns);
+                }
+                Err(_) => {
+                    terminal.apply_output_failure();
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let allow_partial = self.first_post_window_seq.is_some();
+        let finished = if allow_partial {
+            self.parser.finish_allowing_partial()
+        } else {
+            self.parser.finish()
+        };
+        let unresolved_tail = finished.unresolved_tail;
+        self.apply_parsed(finished, terminal, Some(tx), true, window_end_ns);
+        if unresolved_tail {
+            terminal.apply_output_failure();
+        }
+        if !in_window_tail_closed(self.last_in_window_seq, self.first_post_window_seq) {
+            terminal.apply_sequence_break();
+        }
+    }
 }
 
 fn noisy_output_record(seq: u64, emit_ns: u64) -> Vec<u8> {
