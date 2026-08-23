@@ -7,6 +7,18 @@ Pipeline: `botster_stack_delivery` (direct merge, no PR)
 Project: `project_1786663508_823105` Botster Non-Blocking Event Plane, Stage D
 Vault checklist: `checklist_1787266824_449406` (ticket scope, one Plan visit)
 
+## Plan revision 14
+
+Revision 14 records Review `review_1787445038_849246`. Gate 5 computes one
+monotonic `window_end_ns` from the same origin as `start_at` and `end_at`
+(`origin_ns + warmup + 600s`). Every `OutputStreamFold` ingest and
+`close_window` call uses that fixed cutoff. A late loop iteration that
+starts before Instant `end_at` but receives a record emitted after the
+cutoff does not add a `terminal_output` sample. The previous moving cutoff
+(`u64::MAX` during the loop, then `monotonic_now_ns()` after the late
+iteration) is gone. A unit test drives the production `measurement_window_end_ns`
+helper and proves the post-cutoff record is not sampled.
+
 ## Plan revision 13
 
 Revision 13 records Review `review_1787443515_507854`. After the 600-second
