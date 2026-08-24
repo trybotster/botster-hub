@@ -13,6 +13,7 @@
 | Step | `botster_stack_implement` (`run_step_1787613456_330395`) |
 | Approved plan | `docs/plans/freeze-subscription-ownership-and-capture-the-regression-baseline.md` |
 | Plan commit | `dfbf934` |
+| Implement commit | `ca77a33e5edb482078b61fe7f452fa8f0e8a9bdd` |
 | Base commit | `85a0434` (`origin/main`) |
 | Merge policy | direct (no PR required) |
 | Locked Core SHA | `7eafa470a18025895995bbedc20d34b58106a03b` |
