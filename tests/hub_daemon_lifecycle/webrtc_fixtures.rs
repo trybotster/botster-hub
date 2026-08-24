@@ -488,6 +488,7 @@ pub(crate) struct LocalWebrtcOfferPeer {
 
 pub(crate) struct ExtraWebrtcDataChannel {
     pub(crate) messages: AsyncReceiver<String>,
+    pub(crate) closed: AsyncReceiver<()>,
 }
 
 impl LocalWebrtcOfferPeer {
@@ -827,6 +828,7 @@ impl LocalWebrtcOfferPeer {
             default_runtime().ok_or_else(|| std::io::Error::other("no async runtime found"))?;
         let (open_tx, mut open_rx) = channel::<()>(1);
         let (message_tx, message_rx) = channel::<String>(256);
+        let (closed_tx, closed_rx) = channel::<()>(1);
         let extra = self
             .peer
             .create_data_channel(
@@ -852,7 +854,10 @@ impl LocalWebrtcOfferPeer {
                                 let _ = message_tx.try_send(text);
                             }
                         }
-                        DataChannelEvent::OnClose => break,
+                        DataChannelEvent::OnClose => {
+                            let _ = closed_tx.try_send(());
+                            break;
+                        }
                         _ => {}
                     }
                 }
@@ -861,6 +866,7 @@ impl LocalWebrtcOfferPeer {
         let _ = timeout(Duration::from_secs(5), open_rx.recv()).await;
         Ok(ExtraWebrtcDataChannel {
             messages: message_rx,
+            closed: closed_rx,
         })
     }
 }

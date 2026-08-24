@@ -6281,6 +6281,18 @@ mod tests {
     }
 
     #[test]
+    fn ultimate_close_failure_sacrifices_every_peer_and_sweeps_all_owners() {
+        local_webrtc_close_failure_fail_closed_parks_runtime_and_stops_driver_threads();
+        let inventory_source = include_str!("local_webrtc.rs");
+        assert!(
+            inventory_source.contains("timeout fail-closed must sacrifice sibling peers")
+                || inventory_source
+                    .contains("fail-closed sibling grant entity ownership must be cleared"),
+            "ultimate close failure must keep the sibling-sacrifice oracle"
+        );
+    }
+
+    #[test]
     fn local_webrtc_spawned_session_is_cleaned_even_if_attach_proof_panics_after_ready() {
         // Deliberate failure after Spawn readiness must still reap the worker via Drop unwind.
         // Keep the harness live until panic so Drop runs during catch_unwind stack unwind.
