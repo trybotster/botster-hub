@@ -210,7 +210,7 @@ fn webrtc_peer_rejects_a_second_data_channel() {
             &key,
             session_id,
             subscription_id,
-            "printf 'so-2ch-ready\\n'; sleep 30",
+            "sleep 1; printf 'so-2ch-ready\\n'; sleep 30",
         )
         .await;
         wait_for_webrtc_marker(&mut peer, &key, session_id, subscription_id, "so-2ch-ready")
@@ -465,7 +465,7 @@ fn terminal_input_travels_as_a_json_control_request() {
             &key,
             session_id,
             subscription_id,
-            "printf 'so-json-ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
+            "while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
         )
         .await;
         wait_for_webrtc_marker(
@@ -473,7 +473,7 @@ fn terminal_input_travels_as_a_json_control_request() {
             &key,
             session_id,
             subscription_id,
-            "so-json-ready",
+            "\"state\":\"attaching\"",
         )
         .await;
         let sent = peer
@@ -629,7 +629,7 @@ fn attach_ready_precedes_history_finish() {
         &mut reader,
         "so-rth-session",
         "so-rth-sub",
-        "printf 'so-rth-ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
+        "sleep 1; printf 'so-rth-ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
         &mut envelopes,
         &mut events,
     );

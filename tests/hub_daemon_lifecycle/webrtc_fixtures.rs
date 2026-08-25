@@ -525,6 +525,7 @@ pub(crate) struct ExtraWebrtcDataChannel {
     pub(crate) messages: AsyncReceiver<String>,
     pub(crate) closed: AsyncReceiver<()>,
     open_rx: AsyncReceiver<()>,
+    pause_inbound: Arc<AtomicBool>,
 }
 
 impl ExtraWebrtcDataChannel {
@@ -572,6 +573,7 @@ fn subscription_label_matches(
     parts.len() >= 6 && parts[3] == session_id && parts[4] == subscription_id
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_offerer_channel_poll(
     runtime: std::sync::Arc<dyn webrtc::runtime::Runtime>,
     data_channel: Arc<dyn DataChannel>,
@@ -580,9 +582,17 @@ fn spawn_offerer_channel_poll(
     occupancy: Arc<FixtureQueueOccupancy>,
     messages_tx: Option<AsyncSender<String>>,
     closed_tx: Option<AsyncSender<()>>,
+    pause_inbound: Arc<AtomicBool>,
 ) {
     runtime.spawn(Box::pin(async move {
-        while let Some(event) = data_channel.poll().await {
+        loop {
+            if pause_inbound.load(Ordering::SeqCst) {
+                webrtc_runtime().sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+            let Some(event) = data_channel.poll().await else {
+                break;
+            };
             match event {
                 DataChannelEvent::OnOpen => {
                     let _ = open_tx.try_send(());
@@ -670,6 +680,7 @@ impl LocalWebrtcOfferPeer {
             Arc::clone(&occupancy),
             None,
             None,
+            Arc::new(AtomicBool::new(false)),
         );
 
         let extra_channel = if with_extra {
@@ -689,6 +700,7 @@ impl LocalWebrtcOfferPeer {
                     }),
                 )
                 .await?;
+            let pause_inbound = Arc::new(AtomicBool::new(false));
             spawn_offerer_channel_poll(
                 runtime.clone(),
                 extra.clone(),
@@ -697,6 +709,7 @@ impl LocalWebrtcOfferPeer {
                 Arc::clone(&inbound.occupancy),
                 Some(message_tx),
                 Some(closed_tx),
+                Arc::clone(&pause_inbound),
             );
             Some(ExtraWebrtcDataChannel {
                 label: "botster-extra".to_string(),
@@ -705,6 +718,7 @@ impl LocalWebrtcOfferPeer {
                 messages: message_rx,
                 closed: closed_rx,
                 open_rx,
+                pause_inbound,
             })
         } else {
             None
@@ -827,6 +841,7 @@ impl LocalWebrtcOfferPeer {
             messages: unused_messages,
             closed: unused_closed,
             open_rx: unused_open,
+            pause_inbound: Arc::new(AtomicBool::new(false)),
         };
         self.control_label = incoming.label;
         rejected
@@ -979,12 +994,17 @@ impl LocalWebrtcOfferPeer {
         if let Some(bytes) = self.take_pending_subscription_frame(session_id, subscription_id) {
             return Ok(bytes);
         }
-        if let Some((_message_id, bytes)) = self.pending_terminal_frames.pop_front() {
+        if session_id.is_none()
+            && subscription_id.is_none()
+            && let Some((_message_id, bytes)) = self.pending_terminal_frames.pop_front()
+        {
             return Ok(bytes);
         }
         if !self.subscription_channels.is_empty() {
             loop {
-                let (label, bytes) = self.next_subscription_terminal_frame().await?;
+                let (label, bytes) = self
+                    .next_subscription_terminal_frame(session_id, subscription_id)
+                    .await?;
                 if subscription_label_matches(&label, session_id, subscription_id) {
                     return Ok(bytes);
                 }
@@ -1030,10 +1050,17 @@ impl LocalWebrtcOfferPeer {
 
     async fn next_subscription_terminal_frame(
         &mut self,
+        session_id: Option<&str>,
+        subscription_id: Option<&str>,
     ) -> Result<(String, Vec<u8>), Box<dyn std::error::Error>> {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_millis(250);
         while Instant::now() < deadline {
-            let labels: Vec<String> = self.subscription_channels.keys().cloned().collect();
+            let labels: Vec<String> = self
+                .subscription_channels
+                .keys()
+                .filter(|label| subscription_label_matches(label, session_id, subscription_id))
+                .cloned()
+                .collect();
             for label in &labels {
                 let Some(key) = self.subscription_keys.get(label).cloned() else {
                     continue;
@@ -1096,6 +1123,7 @@ impl LocalWebrtcOfferPeer {
                 }),
             )
             .await?;
+        let pause_inbound = Arc::new(AtomicBool::new(false));
         spawn_offerer_channel_poll(
             runtime,
             data_channel.clone(),
@@ -1104,6 +1132,7 @@ impl LocalWebrtcOfferPeer {
             Arc::clone(&inbound.occupancy),
             Some(message_tx),
             Some(closed_tx),
+            Arc::clone(&pause_inbound),
         );
         let mut channel = ExtraWebrtcDataChannel {
             label: label.to_string(),
@@ -1112,6 +1141,7 @@ impl LocalWebrtcOfferPeer {
             messages: message_rx,
             closed: closed_rx,
             open_rx,
+            pause_inbound,
         };
         timeout(
             webrtc_runtime().as_ref(),
@@ -1128,6 +1158,27 @@ impl LocalWebrtcOfferPeer {
         self.subscription_channels
             .insert(label.to_string(), channel);
         Ok(())
+    }
+
+    pub(crate) async fn bind_reserved_from_attach(
+        &mut self,
+        attach: &botster_hub_client::DaemonResponse,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let label = attach
+            .subscription_channel_label
+            .as_deref()
+            .ok_or_else(|| {
+                std::io::Error::other("Attach missing reserved subscription channel label")
+            })?;
+        self.open_reserved_subscription_channel(label).await
+    }
+
+    pub(crate) fn pause_subscription_inbound(&self, session_id: &str, subscription_id: &str) {
+        for (label, channel) in &self.subscription_channels {
+            if subscription_label_matches(label, Some(session_id), Some(subscription_id)) {
+                channel.pause_inbound.store(true, Ordering::SeqCst);
+            }
+        }
     }
 
     pub(crate) fn enable_host_events(&mut self) {
@@ -1265,6 +1316,7 @@ impl LocalWebrtcOfferPeer {
                 }),
             )
             .await?;
+        let pause_inbound = Arc::new(AtomicBool::new(false));
         spawn_offerer_channel_poll(
             runtime,
             extra.clone(),
@@ -1273,6 +1325,7 @@ impl LocalWebrtcOfferPeer {
             Arc::clone(&inbound.occupancy),
             Some(message_tx),
             Some(closed_tx),
+            Arc::clone(&pause_inbound),
         );
         let mut extra_channel = ExtraWebrtcDataChannel {
             label: label.to_string(),
@@ -1281,6 +1334,7 @@ impl LocalWebrtcOfferPeer {
             messages: message_rx,
             closed: closed_rx,
             open_rx,
+            pause_inbound,
         };
         timeout(
             webrtc_runtime().as_ref(),

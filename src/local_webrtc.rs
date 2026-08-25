@@ -2121,6 +2121,7 @@ async fn answer_offer(
         .with_handler(handler.clone())
         .with_runtime(runtime.clone())
         .with_udp_addrs(vec!["127.0.0.1:0"])
+        .with_data_channel_send_buffer_limit(LOCAL_WEBRTC_MAX_FRAME_BYTES.saturating_mul(4))
         .build()
         .await
         .map_err(|error| LocalWebrtcError::Webrtc(error.to_string()))?;
@@ -2355,8 +2356,11 @@ where
                 let Some(event) = take_host_event(peer_state) else {
                     return Ok(());
                 };
-                if matches!(event, DaemonEvent::TerminalSubscriptionClosed { .. })
-                    && !peer_state.mux.close_events_admitted()
+                if matches!(
+                    event,
+                    DaemonEvent::TerminalSubscriptionClosed { .. }
+                        | DaemonEvent::SubscriptionChannelOpenTimeout { .. }
+                ) && !peer_state.mux.close_events_admitted()
                 {
                     continue;
                 }

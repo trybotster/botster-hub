@@ -300,6 +300,7 @@ fn external_hub_webrtc_live_output_preserves_exact_bytes() {
             .accept_answer(answer)
             .await
             .expect("offer peer accepts answer");
+        offer_peer.grant_secret = Some(bootstrap.grant_secret.clone());
 
         let release_path = unique_short_test_dir("webrtc-exact-release").join("go");
         let script_path = write_python_wait_then_write_script(&release_path, expected);
@@ -341,6 +342,10 @@ fn external_hub_webrtc_live_output_preserves_exact_bytes() {
             "WebRTC Attach must not return terminal bodies: {:?}",
             attach.events
         );
+        offer_peer
+            .bind_reserved_from_attach(&attach)
+            .await
+            .expect("browser creates the reserved terminal DataChannel");
         fs::create_dir_all(release_path.parent().expect("release parent"))
             .expect("create webrtc release dir");
         fs::write(&release_path, b"go").expect("release webrtc write(2) producer");
@@ -355,7 +360,12 @@ fn external_hub_webrtc_live_output_preserves_exact_bytes() {
                     },
                 )
                 .await;
-            while let Some((_, bytes)) = offer_peer.pending_terminal_frames.pop_front() {
+            if let Ok(Ok(bytes)) = timeout(
+                Duration::from_millis(250),
+                offer_peer.next_terminal_frame(&stream_key),
+            )
+            .await
+            {
                 if let Ok(event) = serde_json::from_slice::<botster_hub_client::DaemonEvent>(&bytes)
                 {
                     if let botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } = event {
@@ -380,7 +390,6 @@ fn external_hub_webrtc_live_output_preserves_exact_bytes() {
             {
                 break;
             }
-            sleep(Duration::from_millis(30)).await;
         }
         assert!(
             concatenated
@@ -491,6 +500,7 @@ fn external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup() {
                 .accept_answer(answer)
                 .await
                 .expect("offer peer accepts answer");
+            offer_peer.grant_secret = Some(bootstrap.grant_secret.clone());
 
             let release_path = unique_short_test_dir(&format!("webrtc-sd-rel-{round}")).join("go");
             let script_path = write_python_wait_then_write_script(&release_path, expected);
@@ -531,6 +541,10 @@ fn external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup() {
                 "WebRTC Attach must not return terminal bodies: {:?}",
                 attach.events
             );
+            offer_peer
+                .bind_reserved_from_attach(&attach)
+                .await
+                .expect("browser creates the reserved terminal DataChannel");
             fs::create_dir_all(release_path.parent().expect("release parent"))
                 .expect("create webrtc release dir");
             fs::write(&release_path, b"go").expect("release webrtc write(2) producer");
@@ -545,7 +559,12 @@ fn external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup() {
                         },
                     )
                     .await;
-                while let Some((_, bytes)) = offer_peer.pending_terminal_frames.pop_front() {
+                if let Ok(Ok(bytes)) = timeout(
+                    Duration::from_millis(250),
+                    offer_peer.next_terminal_frame(&stream_key),
+                )
+                .await
+                {
                     if let Ok(event) =
                         serde_json::from_slice::<botster_hub_client::DaemonEvent>(&bytes)
                     {
@@ -564,7 +583,6 @@ fn external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup() {
                 {
                     break;
                 }
-                sleep(Duration::from_millis(30)).await;
             }
             assert!(
                 concatenated
