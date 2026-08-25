@@ -3,11 +3,12 @@
 Ticket: `ticket_1787667162_566252` — "Hub: restore the strict Rust gate baseline"
 Run: `run_1787667183_365249`
 Pipeline: Botster Stack Delivery (`botster_stack_delivery`)
-Revision: 4. Revision 1 was returned by Plan Review `review_1787668688_184116`
+Revision: 5. Revision 1 was returned by Plan Review `review_1787668688_184116`
 (`changes_required`). Revision 2 was approved by Plan Review
 `review_1787669695_148343`. Revision 3 recorded the rule-3 `sessions.rs` admission.
-Review `review_1787672293_964824` returned Implement for a committed absolute target
-path. This revision replaces that path with path-neutral wording.
+Revision 4 replaced a committed absolute target-checkout path with path-neutral
+wording. Verify `review_1787675552_340800` returned Implement for one plan defect:
+official gates must not set `CARGO_TARGET_DIR`.
 
 ## Target repository and target_id
 
@@ -321,16 +322,27 @@ Preconditions:
 1. `git status --short` is empty for tracked files before gate runs.
 2. Tracked `.gitignore` is non-empty and matches HEAD. Verified during Plan: 53 bytes,
    clean.
-3. The worktree path contains no `:`. Verified during Plan, so no `CARGO_TARGET_DIR`
-   override is required for correctness. A separate target directory is still permitted to
-   keep the 1.92.0 and 1.97.0 artifact sets apart, but it **must stay under the worktree**.
-   `executable_from_this_worktree` accepts only a `botster-session-worker` whose argv0
-   starts with `CARGO_MANIFEST_DIR`. An out-of-worktree directory such as `/tmp/...`
-   makes spawn census tests panic with
-   `timed out waiting for live this-worktree session-worker after Spawn`. Implement
-   measured that failure under `/tmp/botster-hub-ticket-1787667162-1970` and reran gates
-   with `<worktree>/target/1.97.0`, which stays under the worktree and under ignored
-   `/target`.
+3. Do **not** set `CARGO_TARGET_DIR` for official gates. CI
+   (`.github/workflows/ci.yml`) and the command block below use the default
+   worktree `target/` directory. Keep 1.92.0 and 1.97.0 artifact sets apart by
+   setting `RUSTUP_TOOLCHAIN=1.97.0` only. Two override classes fail
+   `./test.sh --locked` for reasons this ticket must not teach:
+
+   - An out-of-worktree directory such as `/tmp/...` fails spawn census.
+     `executable_from_this_worktree` accepts only a `botster-session-worker`
+     whose argv0 starts with `CARGO_MANIFEST_DIR`. The panic text is
+     `timed out waiting for live this-worktree session-worker after Spawn`.
+   - A non-default in-worktree directory such as `target/1.97.0` fails
+     `update_replaces_the_daemon_before_a_verification_failure`.
+     `src/update.rs` honors `CARGO_TARGET_DIR`, while
+     `tests/update_command_test.rs` hard-codes
+     `target/debug/botster-session-worker`. Verify reproduced exit `101` with
+     `CARGO_TARGET_DIR=target/1.97.0`. That is wrong guidance, not a source
+     regression: `src/update.rs` is outside this ticket's change-admission
+     rule.
+
+   Prebuild the worker and Hub into the default `target/` directory before
+   `./test.sh --locked`.
 4. `git fetch origin --prune`, then confirm `origin/main` still equals `55f620d`. If it
    has moved, use the refreshed `origin/main` as the diff base and say so in the evidence.
 5. `rustc --version` prints `1.97.0` and `zig version` prints `0.16.0`, captured in the
@@ -498,6 +510,15 @@ the repairs and does not change source behavior.
    exited `0`. `./test.sh --locked` exited `0`, including
    `local_webrtc::tests::webrtc_status_and_entity_progress_under_event_flood`.
 
+## Implement resync (revision 4 → revision 5)
+
+Verify `review_1787675552_340800` (superseding `review_1787675498_829073`)
+verified every source line and returned one medium plan defect. Precondition 3
+had permitted a worktree `CARGO_TARGET_DIR` override. That override invalidates
+the same `./test.sh --locked` gate this plan requires. Revision 5 forbids
+`CARGO_TARGET_DIR` on official gates and records both failure classes. No
+source change.
+
 ## Vault gaps worth capturing
 
 1. **`RUSTUP_TOOLCHAIN=1.92.0` in pipeline agent shells produces false-green Rust gates in
@@ -523,3 +544,11 @@ the repairs and does not change source behavior.
    behind the first compile failure".
 4. **Strict-gate baseline repairs belong in their own ticket.** The owner's rule is
    recorded in project memory but has no vault note. This ticket is the worked example.
+5. **`CARGO_TARGET_DIR` is not a safe isolation knob for `botster-hub` official
+   gates.** An out-of-worktree value fails session-worker census. A non-default
+   in-worktree value fails `update_command_test` because that test hard-codes
+   `target/debug` while `src/update.rs` honors the override. Official gates must
+   unset `CARGO_TARGET_DIR` and prebuild into the default `target/` directory.
+   Candidate note: "Hub official gates must not set CARGO_TARGET_DIR". This
+   sharpens [[Hub session worker census requires the worker binary under the
+   worktree]], which today covers only the out-of-worktree class.
