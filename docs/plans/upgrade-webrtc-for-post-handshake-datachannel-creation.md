@@ -5,6 +5,26 @@ Run: `run_1787654940_337274`
 Pipeline: Botster Stack Delivery (`botster_stack_delivery`)
 Plan base commit: `f66d459` (clean tracked worktree)
 
+## Plan Review response (review_1787658868_570327, changes_required) — rev5
+
+One finding, high severity, and it was correct. The reviewer checked whether the test body I
+described would actually compile. It would not.
+
+| Finding | Severity | Resolution |
+|---------|----------|------------|
+| The planned Hello sweep test cannot access both private admission maps | high | Accepted. Verified: `DaemonControlState.pending_runtime` is `pub(crate)`, but `PendingRuntimeState.webrtc_admissions` and `host_compatibility` are **private** fields of `src/daemon_transport.rs` (only `streams` is `pub(crate)`). `src/local_webrtc.rs` is a sibling module, so the rev4 test body could not compile. A9 now specifies two narrow `#[cfg(test)]` accessors — `has_webrtc_admission_row` and `has_host_compatibility_row`, both `contains_key` — plus the exact five-step assertion sequence. `src/daemon_transport.rs` is added to the affected-files table, and non-scope forbids widening the maps' visibility. |
+
+The reviewer also flagged the trap I would have walked into: the existing `#[cfg(test)]
+webrtc_is_admitted` looks like a ready-made oracle, but it matches only
+`Some(WebrtcTerminalAdmission::Admitted { .. })`. A row surviving under a different variant would
+read as swept. That is the same false-negative class as the A7 defect this plan already fixes, which
+is why A9 now requires `contains_key` and a positive control before the removal assertion. Recorded
+as risk R10.
+
+`PeerHarness` remains the right home: it signals a real peer, so the handler's
+`has_live_peer(&grant_id)` guard is satisfied and the admission actually inserts. Only the oracle was
+missing.
+
 ## Plan Review response (review_1787658403_670109, changes_required) — rev4
 
 One finding, medium severity, and it was correct. The reviewer did not just read the plan — they ran
@@ -163,7 +183,10 @@ capability the ticket needs and the exact behavior the new regression test must 
    observation oracle.
 7. Require the post-handshake open before the existing zero-terminal-frame isolation assertion,
    which today can pass because the channel never opened.
-8. Record exact dependency versions and migration evidence in the implement report.
+8. Add two `#[cfg(test)]` membership accessors on `PendingRuntimeState` in `src/daemon_transport.rs`
+   so the A9 sweep test can assert exact row membership. The maps stay private; no production code
+   changes there.
+9. Record exact dependency versions and migration evidence in the implement report.
 
 ### Non-scope
 
@@ -177,6 +200,9 @@ capability the ticket needs and the exact behavior the new regression test must 
   DataChannel from a browser stays rejected in this ticket.
 - Any change to signaling, ICE, AES-GCM application encryption, chunking, close bounds, reconnect,
   or peer lifecycle semantics.
+- Widening the visibility of `PendingRuntimeState.webrtc_admissions` or
+  `PendingRuntimeState.host_compatibility`. The A9 oracle is two `#[cfg(test)]` accessors, not a
+  `pub(crate)` field change, and it must not be reused to expose the maps to production code.
 
 ## Migration surface, derived from the crate diff
 
@@ -259,6 +285,7 @@ wire behavior is unchanged.
 | `Cargo.toml` | `webrtc = "0.21.0-beta.2"` |
 | `Cargo.lock` | `webrtc`, `rtc`, and every `rtc-*` member to `0.21.0-beta.2`, plus the new `rtc-crypto` and transitive entries |
 | `src/local_webrtc.rs` | `timeout` call sites gain the runtime argument; the `RTCPeerConnectionState` match at line 1109 gains a fail-safe arm; two library tests are added to the existing in-file harnesses — `post_handshake_data_channel_opens_and_delivers_bytes` (A4) and `peer_closed_removes_webrtc_admission_and_host_compatibility` (A9, using `PeerHarness`) |
+| `src/daemon_transport.rs` | two `#[cfg(test)]` accessors on `PendingRuntimeState` — `has_webrtc_admission_row` and `has_host_compatibility_row` — so the A9 sweep test can assert exact membership without widening field visibility. No production code changes here. |
 | `src/local_webrtc_smoke.rs` | import list; one `block_on`, one `sleep`, and the `timeout` call sites |
 | `tests/hub_daemon_lifecycle/webrtc_fixtures.rs` | import list; two `block_on` sites and the `timeout` call sites |
 | `tests/hub_daemon_lifecycle/subscription_ownership_baseline.rs` | the new live Hub post-handshake arrival test `webrtc_peer_post_handshake_data_channel_reaches_production_reject` (A4-live), reusing `start_webrtc_adapter_hub_with_env` and the existing observation oracle |
@@ -439,6 +466,10 @@ Unknowns for Implement to resolve, each with a named resolution:
 - R7. **Fresh-target suite failures mistaken for regressions.** The `Cargo.lock` change forces a
   fresh target, where missing-worker failures look like real breakage. Mitigation: the two prebuild
   commands are a stated precondition, not an optimization.
+- R10. **Using `webrtc_is_admitted` as the sweep oracle.** It matches only
+  `Some(WebrtcTerminalAdmission::Admitted { .. })`, so a row surviving under another variant reads as
+  swept. A9 requires `contains_key`-based accessors and a positive control before the removal
+  assertion. This is the same false-negative class as A7.
 - R8. **Behavior change from `async_channel`-backed primitives.** `0.21` channels are MPMC
   (`async_channel`) where `0.20` used tokio mpsc. Hub uses single-consumer patterns throughout, so
   semantics hold; Implement confirms no site clones a `Receiver`.
@@ -546,24 +577,54 @@ realpaths for both binaries.
 - A8. **Preserved lifecycle proof.** Pre-handshake channel creation, signaling, ICE, AES-GCM
   encryption, chunking, close bounds, reconnect, and peer lifecycle tests all pass with no test
   weakened, no assertion deleted, and no production bound widened.
-- A9. **Hello admission sweep proof, by exact selector and stable name.** The corrected matrix row
-  claims that `LocalWebrtcPeerClosed` removes both `pending_runtime.webrtc_admissions` and
-  `pending_runtime.host_compatibility` for the closed `grant_id`. Plan Review ran the broad
-  `peer_close` filter against `hub_daemon_lifecycle_test` on a refreshed base: it selects **three**
-  tests (`peer_close_leaves_sibling_peers_working`,
+- A9. **Hello admission sweep proof, by exact selector, stable name, and a narrow test oracle.**
+  The corrected matrix row claims that `LocalWebrtcPeerClosed` removes both
+  `pending_runtime.webrtc_admissions` and `pending_runtime.host_compatibility` for the closed
+  `grant_id`. Plan Review ran the broad `peer_close` filter against `hub_daemon_lifecycle_test` on a
+  refreshed base: it selects **three** tests (`peer_close_leaves_sibling_peers_working`,
   `webrtc_terminal_adapter_late_attach_after_peer_close_does_not_recreate_route`, and
   `local_webrtc_peer_close_detaches_terminal_subscriptions`) and **none** asserts either removal.
   That broad command is therefore removed as sweep proof.
 
   The sweep cannot be proven from the lifecycle suite, because `pending_runtime` is internal state
-  with no live oracle. It belongs in a library unit test, where the existing `PeerHarness` in
-  `src/local_webrtc.rs` tests owns `harness.state` and calls the real `handle_control_message`.
-  Implement adds one test with this stable name:
+  with no live oracle. It belongs in a library unit test using the existing `PeerHarness` in
+  `src/local_webrtc.rs` tests, which owns `harness.state` and calls the real
+  `handle_control_message`. `PeerHarness` signals a real peer, so the handler's
+  `has_live_peer(&grant_id)` guard is satisfied and the admission actually inserts.
 
-  `local_webrtc::tests::peer_closed_removes_webrtc_admission_and_host_compatibility`
+  **A narrow test oracle is required first.** `DaemonControlState.pending_runtime` is `pub(crate)`,
+  but `PendingRuntimeState.webrtc_admissions` and `PendingRuntimeState.host_compatibility` are
+  **private** fields of `src/daemon_transport.rs`. `src/local_webrtc.rs` is a sibling module and
+  cannot read them, so a test body that touches those maps directly does not compile. Implement adds
+  two `#[cfg(test)]` accessors on `PendingRuntimeState`, and nothing wider — the maps stay private:
 
-  It drives `RegisterWebrtcAdmission` for a live grant, asserts both rows are present, then drives
-  `LocalWebrtcPeerClosed` for that grant and asserts both rows are gone.
+  ```rust
+  #[cfg(test)]
+  pub(crate) fn has_webrtc_admission_row(&self, grant_id: &str) -> bool {
+      self.webrtc_admissions.contains_key(grant_id)
+  }
+
+  #[cfg(test)]
+  pub(crate) fn has_host_compatibility_row(&self, grant_id: &str) -> bool {
+      self.host_compatibility.contains_key(grant_id)
+  }
+  ```
+
+  These must use `contains_key`, and the test must not substitute the existing
+  `PendingRuntimeState::webrtc_is_admitted`. That helper matches only
+  `Some(WebrtcTerminalAdmission::Admitted { .. })`, so it returns `false` for a row that is still
+  present under a different variant. Using it as the sweep oracle would report a surviving row as
+  swept — the same class of false negative as A7.
+
+  Assertion sequence for
+  `local_webrtc::tests::peer_closed_removes_webrtc_admission_and_host_compatibility`:
+  1. build a `PeerHarness` and signal a peer, capturing its `grant_id`;
+  2. drive `ControlMessage::RegisterWebrtcAdmission` for that `grant_id` through
+     `handle_control_message`;
+  3. assert `has_webrtc_admission_row(&grant_id)` and `has_host_compatibility_row(&grant_id)` are
+     both `true` — this is the positive control, without which step 5 could pass vacuously;
+  4. drive `ControlMessage::LocalWebrtcPeerClosed` for that `grant_id`;
+  5. assert both accessors are now `false`.
 
   ```bash
   # expect: running 1 test, 1 passed
