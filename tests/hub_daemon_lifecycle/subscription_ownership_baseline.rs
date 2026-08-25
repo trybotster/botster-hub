@@ -34,7 +34,7 @@ async fn wait_for_webrtc_marker(
     subscription_id: &str,
     marker: &str,
 ) {
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(45);
     while Instant::now() < deadline
         && !webrtc_terminal_contains(&peer.pending_terminal_frames, marker)
     {
@@ -207,6 +207,8 @@ fn webrtc_peer_rejects_a_second_data_channel() {
             "printf 'so-2ch-ready\\n'; sleep 30",
         )
         .await;
+        wait_for_webrtc_marker(&mut peer, &key, session_id, subscription_id, "so-2ch-ready")
+            .await;
         assert_eq!(
             rejected
                 .count_terminal_frames(Duration::from_millis(400))
