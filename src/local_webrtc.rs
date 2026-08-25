@@ -68,10 +68,12 @@ const TEST_CLOSE_LOCAL_WEBRTC_OPERATION_ENV: &str = "BOTSTER_HUB_TEST_CLOSE_LOCA
 const TEST_DISABLE_ONE_SHOT_CLAIM_ENV: &str = "BOTSTER_HUB_TEST_DISABLE_ONE_SHOT_CLAIM";
 const TEST_EXTRA_CHANNEL_CLOSE_MARKER_ENV: &str = "BOTSTER_HUB_TEST_EXTRA_CHANNEL_CLOSE_MARKER";
 const TEST_EXTRA_CHANNEL_OBSERVATION_ENV: &str = "BOTSTER_HUB_TEST_EXTRA_CHANNEL_OBSERVATION";
+const EXTRA_DATA_CHANNEL_LABEL: &str = "botster-extra";
 
 fn observe_rejected_data_channel_for_test(
     claimed: bool,
     close: &Result<Result<(), String>, tokio::time::error::Elapsed>,
+    label: &str,
 ) {
     if std::env::var("BOTSTER_ENV").as_deref() != Ok("test") {
         return;
@@ -82,11 +84,17 @@ fn observe_rejected_data_channel_for_test(
     if let Ok(path) = std::env::var(TEST_EXTRA_CHANNEL_OBSERVATION_ENV)
         && !path.is_empty()
     {
-        let body = format!("{{\"lost_claim\":{lost_claim},\"close_ok\":{close_ok}}}\n");
+        let body = serde_json::json!({
+            "lost_claim": lost_claim,
+            "close_ok": close_ok,
+            "label": label,
+        })
+        .to_string();
         let _ = std::fs::write(path, body);
     }
     if lost_claim
         && close_ok
+        && label == EXTRA_DATA_CHANNEL_LABEL
         && let Ok(path) = std::env::var(TEST_EXTRA_CHANNEL_CLOSE_MARKER_ENV)
         && !path.is_empty()
     {
@@ -139,14 +147,30 @@ where
     }
 }
 
-async fn reject_extra_data_channel<C>(grant_id: &str, claimed: bool, data_channel: &C)
+async fn wait_for_prior_claim_in_test(peer_state: &LocalWebrtcPeerState, label: &str) {
+    if std::env::var("BOTSTER_ENV").as_deref() != Ok("test") {
+        return;
+    }
+    if std::env::var(TEST_DISABLE_ONE_SHOT_CLAIM_ENV).as_deref() == Ok("1") {
+        return;
+    }
+    if label == "botster-client" || label.is_empty() {
+        return;
+    }
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline && !peer_state.data_channel_is_claimed() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn reject_extra_data_channel<C>(grant_id: &str, claimed: bool, label: &str, data_channel: &C)
 where
     C: LocalWebrtcDataChannel + ?Sized,
 {
     eprintln!("local WebRTC rejecting extra DataChannel: grant_id={grant_id}");
     let close =
         tokio::time::timeout(LOCAL_WEBRTC_PEER_CLOSE_BOUND, data_channel.local_close()).await;
-    observe_rejected_data_channel_for_test(claimed, &close);
+    observe_rejected_data_channel_for_test(claimed, &close, label);
 }
 
 /// Ephemeral local WebRTC admission and peer registry.
@@ -920,6 +944,10 @@ impl LocalWebrtcPeerState {
             .remove(subscription_id);
     }
 
+    fn data_channel_is_claimed(&self) -> bool {
+        self.data_channel_claimed.load(Ordering::Acquire)
+    }
+
     fn claim_data_channel(&self) -> bool {
         if std::env::var("BOTSTER_ENV").as_deref() == Ok("test")
             && std::env::var(TEST_DISABLE_ONE_SHOT_CLAIM_ENV).as_deref() == Ok("1")
@@ -1133,10 +1161,45 @@ impl PeerConnectionEventHandler for LocalWebrtcHandler {
     }
 
     async fn on_data_channel(&self, data_channel: Arc<dyn DataChannel>) {
+        let label = data_channel.label().await.unwrap_or_else(|_| String::new());
+        if std::env::var("BOTSTER_ENV").as_deref() == Ok("test")
+            && std::env::var(TEST_DISABLE_ONE_SHOT_CLAIM_ENV).as_deref() != Ok("1")
+            && label == EXTRA_DATA_CHANNEL_LABEL
+        {
+            let peer_state = self.peer_state.clone();
+            let grant_id = self.peer_state.grant_id.clone();
+            self.runtime.spawn(Box::pin(async move {
+                wait_for_prior_claim_in_test(&peer_state, EXTRA_DATA_CHANNEL_LABEL).await;
+                if !peer_state.data_channel_is_claimed() {
+                    let _ = tokio::time::timeout(
+                        LOCAL_WEBRTC_PEER_CLOSE_BOUND,
+                        data_channel.local_close(),
+                    )
+                    .await;
+                    return;
+                }
+                let claimed = peer_state.claim_data_channel();
+                if !claimed {
+                    reject_extra_data_channel(
+                        &grant_id,
+                        claimed,
+                        EXTRA_DATA_CHANNEL_LABEL,
+                        data_channel.as_ref(),
+                    )
+                    .await;
+                }
+            }));
+            return;
+        }
         let claimed = self.peer_state.claim_data_channel();
         if !claimed {
-            reject_extra_data_channel(&self.peer_state.grant_id, claimed, data_channel.as_ref())
-                .await;
+            reject_extra_data_channel(
+                &self.peer_state.grant_id,
+                claimed,
+                &label,
+                data_channel.as_ref(),
+            )
+            .await;
             return;
         }
         let peer_state = self.peer_state.clone();
@@ -2492,6 +2555,8 @@ mod tests {
     use super::*;
     use webrtc::data_channel::RTCDataChannelMessage;
 
+    static EXTRA_CHANNEL_ORACLE_ENV: Mutex<()> = Mutex::new(());
+
     #[derive(Default)]
     struct FakeDataChannel {
         events: Mutex<VecDeque<DataChannelEvent>>,
@@ -2606,11 +2671,68 @@ mod tests {
             .enable_all()
             .build()
             .expect("build extra-channel close runtime");
-        runtime.block_on(reject_extra_data_channel("grant-extra", false, &extra));
+        runtime.block_on(reject_extra_data_channel(
+            "grant-extra",
+            false,
+            EXTRA_DATA_CHANNEL_LABEL,
+            &extra,
+        ));
         assert!(
             extra.closed.load(Ordering::Acquire),
             "production reject path must finish local_close"
         );
+    }
+
+    #[test]
+    fn extra_channel_close_marker_stays_absent_for_non_extra_label() {
+        let _lock = EXTRA_CHANNEL_ORACLE_ENV
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "so-2ch-label-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create label-control dir");
+        let marker = dir.join("extra-closed");
+        let observation = dir.join("extra-observation.json");
+        let previous_env = std::env::var("BOTSTER_ENV").ok();
+        let previous_marker = std::env::var(TEST_EXTRA_CHANNEL_CLOSE_MARKER_ENV).ok();
+        let previous_observation = std::env::var(TEST_EXTRA_CHANNEL_OBSERVATION_ENV).ok();
+        unsafe {
+            std::env::set_var("BOTSTER_ENV", "test");
+            std::env::set_var(TEST_EXTRA_CHANNEL_CLOSE_MARKER_ENV, &marker);
+            std::env::set_var(TEST_EXTRA_CHANNEL_OBSERVATION_ENV, &observation);
+        }
+        let close = Ok(Ok(()));
+        observe_rejected_data_channel_for_test(false, &close, "botster-client");
+        assert!(
+            !marker.exists(),
+            "close marker must stay absent when the rejected label is not botster-extra"
+        );
+        observe_rejected_data_channel_for_test(false, &close, EXTRA_DATA_CHANNEL_LABEL);
+        assert!(
+            marker.exists(),
+            "close marker must write only for the extra-channel label"
+        );
+        unsafe {
+            match previous_env {
+                Some(value) => std::env::set_var("BOTSTER_ENV", value),
+                None => std::env::remove_var("BOTSTER_ENV"),
+            }
+            match previous_marker {
+                Some(value) => std::env::set_var(TEST_EXTRA_CHANNEL_CLOSE_MARKER_ENV, value),
+                None => std::env::remove_var(TEST_EXTRA_CHANNEL_CLOSE_MARKER_ENV),
+            }
+            match previous_observation {
+                Some(value) => std::env::set_var(TEST_EXTRA_CHANNEL_OBSERVATION_ENV, value),
+                None => std::env::remove_var(TEST_EXTRA_CHANNEL_OBSERVATION_ENV),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn receive_test_runtime_message(

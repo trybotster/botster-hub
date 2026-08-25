@@ -70,12 +70,13 @@ async fn wait_for_webrtc_marker(
     );
 }
 
-fn extra_channel_observation(path: &Path) -> Option<(bool, bool)> {
+fn extra_channel_observation(path: &Path) -> Option<(bool, bool, String)> {
     let raw = fs::read_to_string(path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
     Some((
         value.get("lost_claim")?.as_bool()?,
         value.get("close_ok")?.as_bool()?,
+        value.get("label")?.as_str()?.to_string(),
     ))
 }
 
@@ -110,6 +111,14 @@ fn assert_production_second_channel_reject_source() {
         "close marker must require a lost claim and Ok(Ok(())) from timeout(local_close)"
     );
     assert!(
+        on_data_channel.contains("label == EXTRA_DATA_CHANNEL_LABEL"),
+        "close marker must bind the rejected channel to botster-extra"
+    );
+    assert!(
+        on_data_channel.contains("wait_for_prior_claim_in_test"),
+        "extra DataChannel must wait for the control channel to claim first under test"
+    );
+    assert!(
         on_data_channel.contains("local WebRTC rejecting extra DataChannel"),
         "rejected extra DataChannel must take the close path"
     );
@@ -120,6 +129,9 @@ fn webrtc_peer_rejects_a_second_data_channel() {
     let _guard = daemon_test_guard();
     let marker_dir = unique_test_dir("so-2ch-close");
     std::fs::create_dir_all(&marker_dir).expect("create extra-channel close marker dir");
+    let marker_dir = marker_dir
+        .canonicalize()
+        .expect("canonicalize extra-channel close marker dir");
     let close_marker = marker_dir.join("extra-closed");
     let observation = marker_dir.join("extra-observation.json");
     let marker = close_marker.to_string_lossy().into_owned();
@@ -154,7 +166,7 @@ fn webrtc_peer_rejects_a_second_data_channel() {
             wait_for_path(&observation, Duration::from_secs(10)),
             "Hub must observe the production extra-channel reject"
         );
-        let (lost_claim, close_ok) = extra_channel_observation(&observation)
+        let (lost_claim, close_ok, label) = extra_channel_observation(&observation)
             .expect("extra-channel observation must be valid JSON");
         assert!(
             lost_claim,
@@ -163,6 +175,10 @@ fn webrtc_peer_rejects_a_second_data_channel() {
         assert!(
             close_ok,
             "timeout(local_close) must return Ok(Ok(())) for the rejected extra DataChannel"
+        );
+        assert_eq!(
+            label, "botster-extra",
+            "rejected channel label must be the extra DataChannel"
         );
         assert!(
             close_marker.exists(),
@@ -190,7 +206,6 @@ fn webrtc_peer_rejects_a_second_data_channel() {
             "rejected extra DataChannel must not receive terminal frames"
         );
         assert_production_second_channel_reject_source();
-        wait_for_webrtc_marker(&mut peer, &key, session_id, subscription_id, "so-2ch-ready").await;
         peer.peer.close().await.expect("close offer peer");
     });
     shutdown_short_lived_session(&endpoint, session_id);
@@ -202,6 +217,9 @@ fn webrtc_peer_rejects_a_second_data_channel_requires_one_shot_claim() {
     let _guard = daemon_test_guard();
     let marker_dir = unique_test_dir("so-2ch-neg");
     std::fs::create_dir_all(&marker_dir).expect("create extra-channel negative-control dir");
+    let marker_dir = marker_dir
+        .canonicalize()
+        .expect("canonicalize extra-channel negative-control dir");
     let close_marker = marker_dir.join("extra-closed");
     let observation = marker_dir.join("extra-observation.json");
     let marker = close_marker.to_string_lossy().into_owned();

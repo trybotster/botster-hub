@@ -10,12 +10,13 @@
 | Pipeline worktree | the pipeline-provided ticket worktree |
 | Ticket | `ticket_1787600670_129312` |
 | Run | `run_1787605830_934897` |
-| Step | `botster_stack_implement` (`run_step_1787618535_927413`) |
+| Step | `botster_stack_implement` (`run_step_1787621751_523042`) |
 | Approved plan | `docs/plans/freeze-subscription-ownership-and-capture-the-regression-baseline.md` |
 | Plan commit | `dfbf934` |
 | Implement commit | `ca77a33e5edb482078b61fe7f452fa8f0e8a9bdd` |
 | Review-return Implement commit | `3f4e0e36f287312d8a111e34342c4a5ba8bd3461` |
 | Second Review-return Implement commit | `1e588c38ed8e870c1510e5abfeadf9c8bb0b8beb` |
+| Verify-return Implement commit | pending |
 | Base commit | `85a0434` (`origin/main`) |
 | Merge policy | direct (no PR required) |
 | Locked Core SHA | `7eafa470a18025895995bbedc20d34b58106a03b` |
@@ -114,7 +115,7 @@ No scope change. Implementation notes, not waived requirements:
 
 1. `webrtc_ready_entity_frame_defers_terminal_output` pins the production gate text in `run_data_channel`. A race-free live deferral oracle would need a new flush seam; the plan forbids transport changes.
 2. `attach_ready_precedes_history_finish` decodes Ghostty READY then FINISH from the Unix terminal stream, sends input after READY, and keeps host-plane `FINISH` absent.
-3. `webrtc_peer_rejects_a_second_data_channel` completes hello on `botster-client` first, then asserts the production one-shot claim returned false and `timeout(..., local_close()).await` returned `Ok(Ok(()))`. The close marker is written only for that pair. A sibling negative control disables the one-shot claim and confirms the lost-claim oracle stays empty. Offerer `OnClose` is not the oracle. There is no label-based reject override.
+3. IsolatedHub does not deliver a post-connect extra DataChannel, and a second `LocalWebrtcSignal` cannot renegotiate a redeemed grant. The extra channel therefore remains in the initial offer. Under `BOTSTER_ENV=test`, a non-`botster-client` channel waits until the one-shot claim is taken, then runs `claim_data_channel()`. The observation records `label`, and the close marker writes only for `botster-extra` after `lost_claim` and `Ok(Ok(()))`. A lib control keeps the marker absent for `botster-client`. The one-shot negative control stays.
 4. `ultimate_close_failure_sacrifices_every_peer_and_sweeps_all_owners` runs the bound-exceeded hang fail-closed path, then the attach fail-closed path, and asserts zero Core inventory rows and zero Hub attach routes before session shutdown.
 5. `wait_for_webrtc_marker` uses a 20 s deadline so suite load cannot hide terminal bytes that already followed attach-state frames.
 
@@ -173,6 +174,12 @@ Locked-suite evidence on this Implement tree:
 | Second Review-return isolated extra-channel tests after source-pin comment | both passed |
 | Second Review-return isolated `peer_close_leaves_sibling_peers_working` | pass in 3.37 s |
 | Second Review-return `./test.sh --locked` | pass. Hub lib 489. Lifecycle 317 passed, 2 ignored. Exit 0 in 386 s. |
+| Verify-return isolated extra-channel test | pass |
+| Verify-return extra-channel test under 14 `yes` workers | 3 of 3 passed |
+| Verify-return one-shot negative control | pass |
+| Verify-return lib label control | pass |
+| Verify-return first `./test.sh --locked` | Hub lib 490. Lifecycle 316 passed, 1 failed: `external_hub_live_output_preserves_split_utf8_frames` missed `exited` in 10 s. Isolation later passed in 2.07 s. That file is unchanged on this branch. |
+| Verify-return `./test.sh --locked` | pass. Hub lib 490. Lifecycle 317 passed, 2 ignored. Exit 0 in 366 s. |
 
 Live Hub pin for this worktree:
 
