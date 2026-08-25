@@ -68,6 +68,7 @@ const TEST_CLOSE_LOCAL_WEBRTC_OPERATION_ENV: &str = "BOTSTER_HUB_TEST_CLOSE_LOCA
 const TEST_DISABLE_ONE_SHOT_CLAIM_ENV: &str = "BOTSTER_HUB_TEST_DISABLE_ONE_SHOT_CLAIM";
 const TEST_EXTRA_CHANNEL_CLOSE_MARKER_ENV: &str = "BOTSTER_HUB_TEST_EXTRA_CHANNEL_CLOSE_MARKER";
 const TEST_EXTRA_CHANNEL_OBSERVATION_ENV: &str = "BOTSTER_HUB_TEST_EXTRA_CHANNEL_OBSERVATION";
+#[cfg(test)]
 const EXTRA_DATA_CHANNEL_LABEL: &str = "botster-extra";
 
 fn observe_rejected_data_channel_for_test(
@@ -94,7 +95,6 @@ fn observe_rejected_data_channel_for_test(
     }
     if lost_claim
         && close_ok
-        && label == EXTRA_DATA_CHANNEL_LABEL
         && let Ok(path) = std::env::var(TEST_EXTRA_CHANNEL_CLOSE_MARKER_ENV)
         && !path.is_empty()
     {
@@ -144,22 +144,6 @@ where
 
     async fn local_close(&self) -> Result<(), String> {
         self.close().await.map_err(|error| error.to_string())
-    }
-}
-
-async fn wait_for_prior_claim_in_test(peer_state: &LocalWebrtcPeerState, label: &str) {
-    if std::env::var("BOTSTER_ENV").as_deref() != Ok("test") {
-        return;
-    }
-    if std::env::var(TEST_DISABLE_ONE_SHOT_CLAIM_ENV).as_deref() == Ok("1") {
-        return;
-    }
-    if label == "botster-client" || label.is_empty() {
-        return;
-    }
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while Instant::now() < deadline && !peer_state.data_channel_is_claimed() {
-        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -944,10 +928,6 @@ impl LocalWebrtcPeerState {
             .remove(subscription_id);
     }
 
-    fn data_channel_is_claimed(&self) -> bool {
-        self.data_channel_claimed.load(Ordering::Acquire)
-    }
-
     fn claim_data_channel(&self) -> bool {
         if std::env::var("BOTSTER_ENV").as_deref() == Ok("test")
             && std::env::var(TEST_DISABLE_ONE_SHOT_CLAIM_ENV).as_deref() == Ok("1")
@@ -1162,35 +1142,6 @@ impl PeerConnectionEventHandler for LocalWebrtcHandler {
 
     async fn on_data_channel(&self, data_channel: Arc<dyn DataChannel>) {
         let label = data_channel.label().await.unwrap_or_else(|_| String::new());
-        if std::env::var("BOTSTER_ENV").as_deref() == Ok("test")
-            && std::env::var(TEST_DISABLE_ONE_SHOT_CLAIM_ENV).as_deref() != Ok("1")
-            && label == EXTRA_DATA_CHANNEL_LABEL
-        {
-            let peer_state = self.peer_state.clone();
-            let grant_id = self.peer_state.grant_id.clone();
-            self.runtime.spawn(Box::pin(async move {
-                wait_for_prior_claim_in_test(&peer_state, EXTRA_DATA_CHANNEL_LABEL).await;
-                if !peer_state.data_channel_is_claimed() {
-                    let _ = tokio::time::timeout(
-                        LOCAL_WEBRTC_PEER_CLOSE_BOUND,
-                        data_channel.local_close(),
-                    )
-                    .await;
-                    return;
-                }
-                let claimed = peer_state.claim_data_channel();
-                if !claimed {
-                    reject_extra_data_channel(
-                        &grant_id,
-                        claimed,
-                        EXTRA_DATA_CHANNEL_LABEL,
-                        data_channel.as_ref(),
-                    )
-                    .await;
-                }
-            }));
-            return;
-        }
         let claimed = self.peer_state.claim_data_channel();
         if !claimed {
             reject_extra_data_channel(
@@ -2684,7 +2635,7 @@ mod tests {
     }
 
     #[test]
-    fn extra_channel_close_marker_stays_absent_for_non_extra_label() {
+    fn extra_channel_close_marker_requires_lost_claim_and_close_ok() {
         let _lock = EXTRA_CHANNEL_ORACLE_ENV
             .lock()
             .unwrap_or_else(|error| error.into_inner());
@@ -2708,15 +2659,21 @@ mod tests {
             std::env::set_var(TEST_EXTRA_CHANNEL_OBSERVATION_ENV, &observation);
         }
         let close = Ok(Ok(()));
-        observe_rejected_data_channel_for_test(false, &close, "botster-client");
+        observe_rejected_data_channel_for_test(true, &close, "botster-client");
         assert!(
             !marker.exists(),
-            "close marker must stay absent when the rejected label is not botster-extra"
+            "close marker must stay absent when the channel kept the claim"
         );
+        observe_rejected_data_channel_for_test(false, &close, "botster-client");
+        assert!(
+            marker.exists(),
+            "close marker must write for any rejected label after lost_claim and Ok(Ok(()))"
+        );
+        std::fs::remove_file(&marker).expect("reset close marker");
         observe_rejected_data_channel_for_test(false, &close, EXTRA_DATA_CHANNEL_LABEL);
         assert!(
             marker.exists(),
-            "close marker must write only for the extra-channel label"
+            "close marker must write for botster-extra after lost_claim and Ok(Ok(()))"
         );
         unsafe {
             match previous_env {

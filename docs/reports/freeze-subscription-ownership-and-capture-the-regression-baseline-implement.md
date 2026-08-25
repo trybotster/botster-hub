@@ -10,13 +10,14 @@
 | Pipeline worktree | the pipeline-provided ticket worktree |
 | Ticket | `ticket_1787600670_129312` |
 | Run | `run_1787605830_934897` |
-| Step | `botster_stack_implement` (`run_step_1787621751_523042`) |
+| Step | `botster_stack_implement` (`run_step_1787624123_605386`) |
 | Approved plan | `docs/plans/freeze-subscription-ownership-and-capture-the-regression-baseline.md` |
 | Plan commit | `dfbf934` |
 | Implement commit | `ca77a33e5edb482078b61fe7f452fa8f0e8a9bdd` |
 | Review-return Implement commit | `3f4e0e36f287312d8a111e34342c4a5ba8bd3461` |
 | Second Review-return Implement commit | `1e588c38ed8e870c1510e5abfeadf9c8bb0b8beb` |
 | Verify-return Implement commit | `d8aa2b96fb8fd1e056231b43c99d6d2d2c226219` |
+| Third Review-return Implement commit | pending until this commit |
 | Base commit | `85a0434` (`origin/main`) |
 | Merge policy | direct (no PR required) |
 | Locked Core SHA | `7eafa470a18025895995bbedc20d34b58106a03b` |
@@ -63,6 +64,9 @@ Required charter/context notes:
 - [[implement gate must verify committed work and pr link before review]]
 - [[implementation steps must persist report artifacts for review]]
 - [[pipeline vault checklists must cite exact resolvable note titles]]
+- [[source regex guards can mask behavioral ablations]]
+- [[test names do not prove their bodies can fail on the named claim]]
+- [[pipeline artifacts should use path neutral worktree references]]
 
 ### Explicitly not loaded
 
@@ -115,7 +119,7 @@ No scope change. Implementation notes, not waived requirements:
 
 1. `webrtc_ready_entity_frame_defers_terminal_output` pins the production gate text in `run_data_channel`. A race-free live deferral oracle would need a new flush seam; the plan forbids transport changes.
 2. `attach_ready_precedes_history_finish` decodes Ghostty READY then FINISH from the Unix terminal stream, sends input after READY, and keeps host-plane `FINISH` absent.
-3. IsolatedHub does not deliver a post-connect extra DataChannel, and a second `LocalWebrtcSignal` cannot renegotiate a redeemed grant. The extra channel therefore remains in the initial offer. Under `BOTSTER_ENV=test`, a non-`botster-client` channel waits until the one-shot claim is taken, then runs `claim_data_channel()`. The observation records `label`, and the close marker writes only for `botster-extra` after `lost_claim` and `Ok(Ok(()))`. A lib control keeps the marker absent for `botster-client`. The one-shot negative control stays.
+3. IsolatedHub does not deliver a post-connect extra DataChannel, and a second `LocalWebrtcSignal` cannot renegotiate a redeemed grant. Question `question_1787624446_986511` chose option C: keep both channels in the initial offer and identify the survivor by encrypted Hello. The test does not assume callback order or which label loses. Observation and close-marker instrumentation stay test-only and do not change claim order. The marker writes for any rejected label after `lost_claim` and `Ok(Ok(()))`. The one-shot negative control stays.
 4. `ultimate_close_failure_sacrifices_every_peer_and_sweeps_all_owners` runs the bound-exceeded hang fail-closed path, then the attach fail-closed path, and asserts zero Core inventory rows and zero Hub attach routes before session shutdown.
 5. `wait_for_webrtc_marker` uses a 20 s deadline so suite load cannot hide terminal bytes that already followed attach-state frames.
 
@@ -180,6 +184,13 @@ Locked-suite evidence on this Implement tree:
 | Verify-return lib label control | pass |
 | Verify-return first `./test.sh --locked` | Hub lib 490. Lifecycle 316 passed, 1 failed: `external_hub_live_output_preserves_split_utf8_frames` missed `exited` in 10 s. Isolation later passed in 2.07 s. That file is unchanged on this branch. |
 | Verify-return `./test.sh --locked` | pass. Hub lib 490. Lifecycle 317 passed, 2 ignored. Exit 0 in 366 s. |
+| Third Review-return isolated extra-channel test | pass in 4.11 s after dual-offer Hello admission |
+| Third Review-return extra-channel test under 14 `yes` workers | 3 of 3 passed |
+| Third Review-return one-shot negative control | pass in 2.86 s |
+| Third Review-return lib marker control | pass |
+| Third Review-return `cargo fmt --all -- --check` | pass |
+| Third Review-return `cargo clippy --workspace --all-targets --locked -- -D warnings` | pass |
+| Third Review-return `./test.sh --locked` | pass. Hub lib 490. Lifecycle 317 passed, 2 ignored. Exit 0 in 420 s. |
 
 Live Hub pin for this worktree:
 
@@ -193,6 +204,7 @@ No Web or TUI consumer artifact was required. This ticket does not change DTOs.
 
 - Workspace-load flake `unix_eof_skip_core_detach_ablation_keeps_named_pair_on_status` failed once on the second locked suite. Isolation passed in 1.91 s. The first and third locked suites passed that test. Prior Hub implement reports already record this flake. This change does not edit Unix EOF ablation.
 - Offerer-side `OnClose` after Hub rejects a second DataChannel remains unreliable. The close oracle is the observation file plus the test-only marker written only after a lost claim and `Ok(Ok(()))` from `timeout(local_close)`.
+- Current production ownership is arrival-order. The dual-offer IsolatedHub test now accepts either `botster-client` or `botster-extra` as the rejected label. Downstream tickets must replace that with subscription and generation binding.
 - The entity-defer gate is pinned by source, not by a live flush-order race.
 - New §8.2 Reserved-route late-`open` surfaces do not exist yet. Ticket `ticket_1787600674_500120` owns them.
 - A27b Core `WRITE_ATTEMPT_BUDGET` hard-stop through Hub is owned by `ticket_1787600674_500120`.

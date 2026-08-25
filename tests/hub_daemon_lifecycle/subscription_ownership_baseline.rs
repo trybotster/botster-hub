@@ -111,12 +111,12 @@ fn assert_production_second_channel_reject_source() {
         "close marker must require a lost claim and Ok(Ok(())) from timeout(local_close)"
     );
     assert!(
-        on_data_channel.contains("label == EXTRA_DATA_CHANNEL_LABEL"),
-        "close marker must bind the rejected channel to botster-extra"
+        !on_data_channel.contains("label == EXTRA_DATA_CHANNEL_LABEL"),
+        "close marker must not require botster-extra to lose the claim"
     );
     assert!(
-        on_data_channel.contains("wait_for_prior_claim_in_test"),
-        "extra DataChannel must wait for the control channel to claim first under test"
+        !on_data_channel.contains("wait_for_prior_claim_in_test"),
+        "extra DataChannel must not wait in the Hub handler"
     );
     assert!(
         on_data_channel.contains("local WebRTC rejecting extra DataChannel"),
@@ -149,19 +149,12 @@ fn webrtc_peer_rejects_a_second_data_channel() {
     let session_id = "so-2ch-session";
     let subscription_id = "so-2ch-sub";
     block_on(async {
-        let (mut peer, mut extra, key) =
+        let (mut peer, extra, key) =
             open_local_webrtc_peer_with_extra_channel(&endpoint, &bootstrap).await;
-        peer.encrypted_hello(&key, &webrtc_terminal_adapter_hello())
+        let mut rejected = peer
+            .admit_surviving_dual_channel(extra, &key, &webrtc_terminal_adapter_hello())
             .await
-            .expect("hello on the claimed botster-client channel");
-        spawn_and_bind_webrtc(
-            &mut peer,
-            &key,
-            session_id,
-            subscription_id,
-            "printf 'so-2ch-ready\\n'; sleep 30",
-        )
-        .await;
+            .expect("exactly one initial DataChannel completes encrypted Hello");
         assert!(
             wait_for_path(&observation, Duration::from_secs(10)),
             "Hub must observe the production extra-channel reject"
@@ -174,36 +167,38 @@ fn webrtc_peer_rejects_a_second_data_channel() {
         );
         assert!(
             close_ok,
-            "timeout(local_close) must return Ok(Ok(())) for the rejected extra DataChannel"
+            "timeout(local_close) must return Ok(Ok(())) for the rejected DataChannel"
+        );
+        assert!(
+            label == "botster-client" || label == "botster-extra",
+            "rejected label must be one of the initial-offer channels: {label}"
         );
         assert_eq!(
-            label, "botster-extra",
-            "rejected channel label must be the extra DataChannel"
+            label, rejected.label,
+            "observation label must match the channel that failed Hello"
+        );
+        assert_ne!(
+            label, peer.control_label,
+            "exactly one initial-offer channel survives the one-shot claim"
         );
         assert!(
             close_marker.exists(),
-            "Hub must finish local_close on the rejected extra DataChannel"
+            "Hub must finish local_close on the rejected DataChannel"
         );
-        let extra_deadline = Instant::now() + Duration::from_millis(400);
-        let mut extra_terminal_frames = 0;
-        while Instant::now() < extra_deadline {
-            match timeout(Duration::from_millis(50), extra.messages.recv()).await {
-                Ok(Some(message)) => {
-                    if let Ok(chunk) = serde_json::from_str::<
-                        botster_hub_client::DaemonLocalWebrtcDeliveryChunk,
-                    >(&message)
-                        && chunk.delivery_kind
-                            == botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonTerminalFrame
-                    {
-                        extra_terminal_frames += 1;
-                    }
-                }
-                Ok(None) | Err(_) => break,
-            }
-        }
+        spawn_and_bind_webrtc(
+            &mut peer,
+            &key,
+            session_id,
+            subscription_id,
+            "printf 'so-2ch-ready\\n'; sleep 30",
+        )
+        .await;
         assert_eq!(
-            extra_terminal_frames, 0,
-            "rejected extra DataChannel must not receive terminal frames"
+            rejected
+                .count_terminal_frames(Duration::from_millis(400))
+                .await,
+            0,
+            "rejected DataChannel must not receive terminal frames"
         );
         assert_production_second_channel_reject_source();
         peer.peer.close().await.expect("close offer peer");
