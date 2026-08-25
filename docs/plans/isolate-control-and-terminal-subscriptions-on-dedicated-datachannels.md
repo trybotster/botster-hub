@@ -21,6 +21,12 @@ Registered dependencies, both closed:
 |---|---|---|
 | `dependency_1787600712_947298` | `ticket_1787600672_342292` — Core: make terminal subscriptions duplex and pressure-isolated | closed |
 | `dependency_1787654923_752279` | `ticket_1787654915_646236` — Hub: upgrade WebRTC for post-handshake DataChannel creation | closed |
+| registered 2026-08-25 | `ticket_1787667162_566252` — Hub: restore the strict Rust gate baseline | open, blocks this ticket |
+
+`ticket_1787667162_566252` was registered during this Plan step, after the strict
+Rust gates were measured red on `main`. See section 11.2. Run
+`run_1787664777_379002` was cancelled without advancing feature work, and this
+ticket restarts from current `main` after the prerequisite merges.
 
 Open sibling tickets on this target: `ticket_1787600682_233928` (entity and
 event channels), `ticket_1787603671_590198` (Unix duplex bind),
@@ -352,9 +358,12 @@ Changed:
 - `crates/botster-hub-client/src/lib.rs` — reservation label and generation on
   the admission response, the typed `subscription_channel_open_timeout` host
   event, and the Hub daemon protocol revision bump.
-- `crates/botster-hub-test-support/**` and `packages/hub-test-support/**` — new
-  unpublished package version with regenerated fixtures and updated Node mirror
-  test literals.
+- `crates/botster-hub-client/src/typescript.rs` and
+  `crates/botster-hub-client/generated/daemon-protocol.ts` — release-chain site 1.
+- `crates/botster-hub-test-support/**` and `packages/hub-test-support/**` —
+  release-chain site 2: new unpublished package version, regenerated
+  `daemon-protocol.ts` and `metadata.json`, and updated `test.mjs` Node mirror
+  literals.
 - `Cargo.toml`, `crates/botster-hub-client/Cargo.toml`,
   `crates/botster-hub-test-support/Cargo.toml`,
   `crates/botster-hub-test-support/build.rs`,
@@ -544,23 +553,142 @@ Live Hub proof, per `[[live hub proof records distinct hub and locked core binar
 6. Record the Hub SHA, the locked Core SHA, both build commands, and both
    resolved paths in the verification artifact.
 
+### 11.1 Repository gate commands
+
+The strict Rust gates are the repository's own CI gates
+(`.github/workflows/ci.yml`), and the charter requires them. They run under the
+**pinned toolchain**, Rust `1.97.0` with `rustfmt` and `clippy`, plus Zig
+`0.16.0` for `botster-terminal-ghostty`'s `libghostty-vt` build. A different
+local default toolchain is not the gate.
+
 Commands, in this order, per
 `[[Hub suite runs prebuild the session worker before the locked test wrapper]]`:
 
 ```sh
+rustup toolchain install 1.97.0 --profile minimal --component rustfmt,clippy
+zig version                                   # must report 0.16.0
 cargo build --locked -p botster-core-daemon --bin botster-session-worker
 cargo build --locked --bin botster-hub
-cargo check --workspace --all-targets
+cargo fmt --all -- --check                    # strict gate
+cargo clippy --workspace --all-targets --locked -- -D warnings   # strict gate
 node packages/hub-test-support/scripts/sync-assets.mjs --check
 ./test.sh --locked
-(cd packages/hub-test-support && npm test)
+(cd packages/hub-test-support && npm install --no-save && npm test)
 ```
 
-Do **not** use `./test.sh --workspace`. `test.sh` already passes `--workspace`, so
-the flag arrives twice and Cargo aborts before any test runs.
+Two commands in that list need their exact form justified, because the obvious
+form of each does not work.
 
-Every test result must be recorded against a stable commit with a clean tracked
-worktree. Review is renewed after any semantic rebase.
+`./test.sh --workspace` is wrong. `test.sh` already passes `--workspace`, so the
+flag arrives twice and Cargo aborts before any test runs.
+
+`npm test` on its own is wrong. `packages/hub-test-support/package.json` declares
+a runtime dependency on `@trybotster/ui-contract@0.3.3`, and `node_modules` is
+gitignored and absent from a fresh checkout. Measured at base `55f620d`:
+`npm test` aborts with `ERR_MODULE_NOT_FOUND: Cannot find package
+'@trybotster/ui-contract'` before a single assertion runs, so it can never fail
+on a contract regression — it fails on resolution first. With
+`npm install --no-save` in front, the same command reports `hub test-support
+package import and fixture materialization passed`. `--no-save` is load-bearing:
+plain `npm install` writes an untracked `package-lock.json`, and no
+`package-lock.json` is tracked anywhere in this repository, so `npm ci` is not
+available either.
+
+`cargo check --workspace --all-targets` stays useful during development but is
+**not** a substitute for the two strict gates, and the plan no longer lists it as
+the strict Rust gate.
+
+### 11.2 Pre-existing baseline failures, owned by a prerequisite ticket
+
+The strict gates are **both red on `main`** before this ticket changes anything.
+Measured at base `55f620d` under the CI-pinned toolchain `rustc 1.97.0
+(2d8144b78 2026-07-07)` with Zig `0.16.0`:
+
+| Gate | Result | Location |
+|---|---|---|
+| `cargo fmt --all -- --check` | exit 1, one file | `src/local_webrtc.rs:7710`, inside `post_handshake_data_channel_opens_and_delivers_bytes`, the test added by the merged prerequisite `ticket_1787654915_646236` |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 101, one distinct error | `src/package_entity_fanout.rs:515`, `clippy::collapsible_match` |
+
+**Neither repair belongs in this ticket.** Blocking question
+`question_1787667127_613797` resolved this: `ticket_1787667162_566252`, "Hub:
+restore the strict Rust gate baseline", owns both. It formats only the merged
+post-handshake WebRTC test, fixes only the `package_entity_fanout`
+collapsible-match warning, forbids behavior changes, adjacent cleanup, and module
+extraction, and must pass `cargo fmt`, strict clippy, and `./test.sh --locked`.
+
+The first draft of this plan proposed fixing the `fmt` failure here, on the
+grounds that `src/local_webrtc.rs` is a file this ticket rewrites. That was
+overruled, and the instruction is explicit: **do not carry either baseline repair
+in the feature diff.** Implement starts from a `main` on which both gates are
+already green, so any strict-gate failure it sees is its own.
+
+This is why the clippy failure mattered enough to stop for. It sits in
+`src/package_entity_fanout.rs`, a file this ticket lists as untouched by design,
+so a waiver would have left this ticket unable to distinguish an inherited
+failure from a regression in its own new module.
+
+### 11.3 Downstream consumer proof for the public DTO change
+
+Scope item 11 changes public `botster-hub-client` DTOs — the reservation label and
+generation on the admission response, and the typed
+`subscription_channel_open_timeout` host event. Those reach the generated
+TypeScript, so `[[hub generated protocol changes are a four site release chain]]`
+applies in full. The four sites, in order:
+
+1. `crates/botster-hub-client/src/typescript.rs` and its checked-in
+   `crates/botster-hub-client/generated/daemon-protocol.ts`.
+2. `npm run sync` in `packages/hub-test-support`, updating the mirrored
+   `daemon-protocol.ts` and `metadata.json` and bumping `package.json`.
+   `node scripts/sync-assets.mjs --check` detects stale assets, and
+   `[[Hub test support version bumps must update the Node mirror test literals]]`
+   requires the separate `test.mjs` literals plus `npm test`.
+3. Publishing a new `@trybotster/hub-test-support` coordinate.
+4. The consumer's vendored copy and exact pin.
+
+Measured current values at base `55f620d`: `packages/hub-test-support` is
+`0.1.42`, `metadata.json` reports `protocol_version` 7 and
+`conformance_fixture_revision` 46, and `ui_contract.package_version` is `0.3.3`.
+This ticket moves the test-support package to the next unpublished version and
+bumps the conformance fixture revision. The UI contract is unchanged, because
+this ticket adds no new UI types.
+
+**Sites 1 and 2 only are in this ticket's scope.** Site 3 is a separate human
+publish action, so this ticket produces an **unpublished** coordinate per
+`[[Hub test support capability cutovers use a new unpublished package version]]`,
+and neither Implement nor Verify may claim a release. Site 4 belongs to the
+downstream consumer tickets. Per
+`[[closed dependency tickets signal merged source not a consumable release]]`,
+merging this ticket does not make the coordinate consumable; the downstream Web
+ticket stays blocked until the coordinate is published and inspected.
+
+Both downstream shapes must still be measured here, because
+`[[a ui contract import line change costs one test line in each generic client]]`
+shows production builds staying green while each generic client breaks on exactly
+one test line:
+
+**TUI-shaped Cargo proof.** Per
+`[[tui shaped Hub consumer proofs must include hub test support]]`, a scratch
+consumer declares all three Hub dependencies — `botster-hub-client` and
+`botster-ui-contract` as normal dependencies and `botster-hub-test-support` as a
+dev-dependency — and builds with `cargo build --tests`, so Cargo compiles the
+dev edge. Inspect it with
+`cargo tree -i botster-ui-contract -e normal,dev`; without `-e normal,dev` a
+second contract identity reachable only through the test-support crate stays
+invisible. A client-only probe is not TUI-shaped and is rejected. The DTO
+additions are source-breaking for any complete struct literal in a consumer test
+helper, which is the `E0063` cost that only `--all-targets` exposes.
+
+**Web-shaped npm proof.** Pack the new coordinate and install the tarball into a
+clean scratch consumer, then resolve through exported roots rather than
+`package.json`, per
+`[[clean consumer smokes resolve exported root entrypoints not package json]]`,
+and assert the new protocol tokens in the installed tree. Assert the exact
+generated import line, which is the pinned assertion that moves when the emitter
+output changes.
+
+**Ablation.** Per `[[a Cargo source identity proof needs a wrong tag ablation]]`,
+the Cargo identity claim needs a matching-rev green arm and a wrong-rev arm that
+fails to compile. An identity oracle that cannot go red proves nothing.
 
 ## 12. Risks
 
@@ -576,7 +704,28 @@ worktree. Review is renewed after any semantic rebase.
 | Sustained aggregate saturation tears down a terminal route after 512 consecutive `WouldBlock` results | backpressure silently becomes route teardown | the implementer accepts this deliberately; A27b proves the documented end state; section 9.1 excluding control from the budget keeps the teardown notice sendable |
 | Semantic rebase against `ticket_1787603671_590198` and `ticket_1787600682_233928` | completed review goes stale | disjoint new modules; this ticket merges first; review is renewed after any semantic rebase |
 | Wall-clock assertions flake under suite load | false failures | deterministic gates only; timing recorded as evidence |
+| Both strict gates are already red on `main` (`fmt` at `src/local_webrtc.rs:7710`, `clippy` at `src/package_entity_fanout.rs:515`) | an inherited failure is mistaken for one this ticket caused, or a strict gate is skipped as "known broken" | `ticket_1787667162_566252` owns both repairs and blocks this ticket; neither repair may appear in this feature diff; Implement starts from a green baseline |
+| The strict gates are omitted or run under the wrong toolchain | `clippy -D warnings` and `rustfmt` differ across Rust versions, so a local pass is not a CI pass | section 11.1 pins Rust `1.97.0` and Zig `0.16.0` and lists both strict gates explicitly |
+| `npm test` is listed without `npm install --no-save` | the Node acceptance command aborts on module resolution and can never fail on a contract regression, so it reads as passing coverage that does not exist | section 11.1 records the measured `ERR_MODULE_NOT_FOUND` and the working form |
+| The public DTO change ships without downstream-shaped proof | production builds stay green while each generic client breaks on one test line | section 11.3 requires the TUI-shaped three-dependency `cargo build --tests` probe with a wrong-rev ablation and the Web-shaped packed-tarball probe |
+| Site 3 publication is claimed rather than performed | a downstream ticket consumes a coordinate that does not exist or carries stale bytes | section 11.3 scopes this ticket to sites 1 and 2 and forbids any release claim |
 | The rejected-channel test stays tautological | isolation is asserted, not measured | the surviving-channel positive control and the channel-`Open` proof are both required, per `[[rejected channel isolation needs a surviving channel positive control]]` |
+
+## 12.1 Plan Review return, review_1787666788_871227
+
+Verdict was `changes_required` with four findings. Each was re-measured at base
+`55f620d` before it was accepted, per the role rule that a reported failure needs
+exact evidence rather than agreement.
+
+| Finding | Verdict after independent check | Resolution |
+|---|---|---|
+| `finding_1787666789_283053` — strict Rust gates omitted, touched-file baseline failure missed | **Correct, and worse than reported.** `.github/workflows/ci.yml` runs `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --locked -- -D warnings` under Rust `1.97.0` and Zig `0.16.0`, and the plan listed neither. Re-measuring under the pinned toolchain found **two** baseline failures, not one: `fmt` at `src/local_webrtc.rs:7710` and `clippy::collapsible_match` at `src/package_entity_fanout.rs:515` | Section 11.1 adds the pinned toolchain and both strict gates. Section 11.2 records both failures and assigns both repairs to the new prerequisite `ticket_1787667162_566252`, per the answer to `question_1787667127_613797` |
+| `finding_1787666789_115871` — the Node acceptance command cannot reach test execution | **Correct.** `npm test` aborts with `ERR_MODULE_NOT_FOUND: Cannot find package '@trybotster/ui-contract'` before any assertion, so it could never fail on a contract regression | Section 11.1 requires `npm install --no-save && npm test`, measured green, and `--no-save` keeps `git status --porcelain` empty because no `package-lock.json` is tracked |
+| `finding_1787666789_589917` — public DTO and test-support changes lack downstream proof | **Correct.** The reservation label, generation, and open-timeout event reach the generated TypeScript, so the four-site release chain applies in full | Section 11.3 adds the chain, the TUI-shaped three-dependency `cargo build --tests` probe with `cargo tree -i botster-ui-contract -e normal,dev`, the wrong-rev ablation, the Web-shaped packed-tarball probe, and the rule that this ticket owns sites 1 and 2 only |
+| `finding_1787666789_591438` — plan completion evidence empty, checklist items pending | **Half correct.** "Checklist items pending" is true and is fixed. "Completion evidence is empty" is a visibility artifact, not a missing submission: `gate.submitted` for `botster_stack_plan_gate` recorded `status: passed` with the full evidence object, but `request_step_advance` was called without `evidence`, so `step.completed` recorded `evidence: {}` — the record a reviewer reads. The reviewer classified it process-only, which is right | Checklist items are completed with evidence, and the evidence object is passed to `request_step_advance` as well as `submit_gate` |
+
+The reviewer's routing, charter, ownership, dependency, and runtime-teardown
+conclusions matched this plan, so nothing in sections 1 to 10 changed.
 
 ## 13. Vault gaps worth capturing
 
@@ -597,3 +746,14 @@ worktree. Review is renewed after any semantic rebase.
    does not say so.
 6. **Reserve at admission, bind at open.** The two-phase split is what makes the
    late-open guard reachable at all. Capture after this ticket proves it.
+7. **A Node package gate can abort before its first assertion.**
+   `packages/hub-test-support` declares a runtime dependency and gitignores
+   `node_modules`, so a bare `npm test` fails on module resolution and reads as a
+   real gate while proving nothing. `npm install --no-save` is the form that both
+   runs the assertions and leaves the tracked worktree clean. Worth an atomic
+   note, because a plan listing `npm test` alone looks correct.
+8. **The Hub strict Rust gates are the CI gates, under a pinned toolchain.**
+   `[[botster-hub-playbook]]` says "strict Rust gates" without naming
+   `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked
+   -- -D warnings`, Rust `1.97.0`, or Zig `0.16.0`. Naming them in the charter
+   would have prevented this Plan return.
