@@ -4527,6 +4527,7 @@ mod tests {
         data_channel_message_rx: AsyncReceiver<String>,
         accept_host_events: bool,
         pending_host_events: VecDeque<DaemonEvent>,
+        subscription_channels: Vec<Arc<dyn DataChannel>>,
     }
 
     impl TestOfferPeer {
@@ -4603,6 +4604,7 @@ mod tests {
                     data_channel_message_rx,
                     accept_host_events: false,
                     pending_host_events: VecDeque::new(),
+                    subscription_channels: Vec::new(),
                 },
                 serde_json::to_value(offer).expect("serialize offer"),
             )
@@ -4631,6 +4633,47 @@ mod tests {
             .await
             .expect("timed out waiting for data channel open")
             .expect("open signal");
+        }
+
+        async fn open_reserved_subscription_channel(&mut self, label: &str) {
+            let runtime = default_runtime().expect("webrtc default runtime for reserved channel");
+            let (open_tx, mut open_rx) = webrtc_channel::<()>(1);
+            let data_channel = self
+                .peer
+                .create_data_channel(
+                    label,
+                    Some(RTCDataChannelInit {
+                        ordered: true,
+                        max_retransmits: None,
+                        max_packet_life_time: None,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .expect("create reserved subscription DataChannel");
+            {
+                let data_channel = data_channel.clone();
+                runtime.spawn(Box::pin(async move {
+                    while let Some(event) = data_channel.poll().await {
+                        match event {
+                            DataChannelEvent::OnOpen => {
+                                let _ = open_tx.try_send(());
+                            }
+                            DataChannelEvent::OnClose => break,
+                            _ => {}
+                        }
+                    }
+                }));
+            }
+            timeout(
+                webrtc_runtime().as_ref(),
+                Duration::from_secs(5),
+                open_rx.recv(),
+            )
+            .await
+            .expect("timed out waiting for reserved DataChannel open")
+            .expect("reserved DataChannel open signal");
+            self.subscription_channels.push(data_channel);
         }
 
         async fn encrypted_request(
@@ -5487,6 +5530,87 @@ mod tests {
                 self.list_session_lifecycle(session_id).is_some(),
                 "spawned session must be listed after attach readiness"
             );
+            let label = attach
+                .subscription_channel_label
+                .as_deref()
+                .expect("Attach returns the reserved subscription channel label")
+                .to_string();
+            self.open_reserved_on_peer(peer, &label);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline
+                && !self
+                    .state
+                    .pending_runtime
+                    .is_adapter_bound(session_id, subscription_id)
+            {
+                match self.control_rx.try_recv() {
+                    Ok(message) => {
+                        handle_control_message(
+                            &mut self.daemon,
+                            &mut self.state,
+                            &self.terminal_path,
+                            &self.transport_handle,
+                            self.control_tx.clone(),
+                            message,
+                        );
+                    }
+                    Err(tokio_mpsc::error::TryRecvError::Empty) => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(tokio_mpsc::error::TryRecvError::Disconnected) => break,
+                }
+            }
+            assert!(
+                self.state
+                    .pending_runtime
+                    .is_adapter_bound(session_id, subscription_id),
+                "browser-created reserved DataChannel must bind the Core adapter"
+            );
+        }
+
+        fn open_reserved_on_peer(&mut self, peer: &mut LiveSignaledPeer, label: &str) {
+            let mut offer_peer = peer
+                .offer_peer
+                .take()
+                .expect("offer peer available for reserved channel");
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let offer_handle = peer.offer_runtime.handle().clone();
+            let label = label.to_string();
+            let worker = thread::spawn(move || {
+                offer_handle.block_on(offer_peer.open_reserved_subscription_channel(&label));
+                done_tx
+                    .send(offer_peer)
+                    .expect("return offer peer after reserved open");
+            });
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let offer_peer = loop {
+                if let Ok(offer_peer) = done_rx.try_recv() {
+                    break offer_peer;
+                }
+                if Instant::now() >= deadline {
+                    panic!("timed out opening reserved subscription DataChannel");
+                }
+                match self.control_rx.try_recv() {
+                    Ok(message) => {
+                        handle_control_message(
+                            &mut self.daemon,
+                            &mut self.state,
+                            &self.terminal_path,
+                            &self.transport_handle,
+                            self.control_tx.clone(),
+                            message,
+                        );
+                    }
+                    Err(tokio_mpsc::error::TryRecvError::Empty) => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(tokio_mpsc::error::TryRecvError::Disconnected) => {
+                        panic!("control channel closed while opening reserved DataChannel");
+                    }
+                }
+            };
+            worker.join().expect("reserved-open worker joins");
+            peer.offer_peer = Some(offer_peer);
         }
 
         fn cleanup(mut self) {
