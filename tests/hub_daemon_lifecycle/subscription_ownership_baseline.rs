@@ -98,6 +98,20 @@ fn assert_production_second_channel_reject_source() {
         on_data_channel.contains("let claimed = self.peer_state.claim_data_channel();"),
         "second DataChannel must hit the production one-shot claim"
     );
+    let handler = on_data_channel
+        .split("async fn on_data_channel")
+        .nth(1)
+        .expect("on_data_channel handler");
+    let claim_at = handler
+        .find("let claimed = self.peer_state.claim_data_channel();")
+        .expect("claim in on_data_channel");
+    let label_at = handler
+        .find("data_channel.label()")
+        .expect("label read in on_data_channel");
+    assert!(
+        claim_at < label_at,
+        "claim_data_channel must run before any label await"
+    );
     assert!(
         on_data_channel.contains("if !claimed"),
         "second DataChannel must take the reject path only after claim_data_channel returns false"
