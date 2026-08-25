@@ -65,6 +65,43 @@ pub(crate) const LOCAL_WEBRTC_PEER_CLOSE_BOUND: Duration = Duration::from_millis
 #[cfg(test)]
 pub(crate) const LOCAL_WEBRTC_PEER_CLOSE_HANDLER_JOIN_DEADLINE: Duration = Duration::from_secs(2);
 const TEST_CLOSE_LOCAL_WEBRTC_OPERATION_ENV: &str = "BOTSTER_HUB_TEST_CLOSE_LOCAL_WEBRTC_OPERATION";
+const TEST_DISABLE_ONE_SHOT_CLAIM_ENV: &str = "BOTSTER_HUB_TEST_DISABLE_ONE_SHOT_CLAIM";
+const TEST_EXTRA_CHANNEL_CLOSE_MARKER_ENV: &str = "BOTSTER_HUB_TEST_EXTRA_CHANNEL_CLOSE_MARKER";
+const TEST_EXTRA_CHANNEL_OBSERVATION_ENV: &str = "BOTSTER_HUB_TEST_EXTRA_CHANNEL_OBSERVATION";
+#[cfg(test)]
+const EXTRA_DATA_CHANNEL_LABEL: &str = "botster-extra";
+
+fn observe_rejected_data_channel_for_test(
+    claimed: bool,
+    close: &Result<Result<(), String>, tokio::time::error::Elapsed>,
+    label: &str,
+) {
+    if std::env::var("BOTSTER_ENV").as_deref() != Ok("test") {
+        return;
+    }
+    let lost_claim = !claimed;
+    let close_ok = matches!(close, Ok(Ok(())));
+    // extra-channel close marker requires lost_claim && close_ok
+    if let Ok(path) = std::env::var(TEST_EXTRA_CHANNEL_OBSERVATION_ENV)
+        && !path.is_empty()
+    {
+        let body = serde_json::json!({
+            "lost_claim": lost_claim,
+            "close_ok": close_ok,
+            "label": label,
+        })
+        .to_string();
+        let _ = std::fs::write(path, body);
+    }
+    if lost_claim
+        && close_ok
+        && let Ok(path) = std::env::var(TEST_EXTRA_CHANNEL_CLOSE_MARKER_ENV)
+        && !path.is_empty()
+    {
+        let _ = std::fs::write(path, "closed\n");
+    }
+}
+
 pub(crate) const LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE: &str =
     "local-webrtc-sender-terminal.json";
 pub(crate) const LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_MAX_BYTES: usize = 4096;
@@ -109,6 +146,17 @@ where
         self.close().await.map_err(|error| error.to_string())
     }
 }
+
+async fn reject_extra_data_channel<C>(grant_id: &str, claimed: bool, label: &str, data_channel: &C)
+where
+    C: LocalWebrtcDataChannel + ?Sized,
+{
+    eprintln!("local WebRTC rejecting extra DataChannel: grant_id={grant_id}");
+    let close =
+        tokio::time::timeout(LOCAL_WEBRTC_PEER_CLOSE_BOUND, data_channel.local_close()).await;
+    observe_rejected_data_channel_for_test(claimed, &close, label);
+}
+
 /// Ephemeral local WebRTC admission and peer registry.
 #[derive(Clone)]
 struct SharedEventPlane(Arc<crate::daemon_event_subscriptions::ClientEventPlane>);
@@ -881,6 +929,11 @@ impl LocalWebrtcPeerState {
     }
 
     fn claim_data_channel(&self) -> bool {
+        if std::env::var("BOTSTER_ENV").as_deref() == Ok("test")
+            && std::env::var(TEST_DISABLE_ONE_SHOT_CLAIM_ENV).as_deref() == Ok("1")
+        {
+            return true;
+        }
         self.data_channel_claimed
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
@@ -1088,13 +1141,16 @@ impl PeerConnectionEventHandler for LocalWebrtcHandler {
     }
 
     async fn on_data_channel(&self, data_channel: Arc<dyn DataChannel>) {
-        if !self.peer_state.claim_data_channel() {
-            eprintln!(
-                "local WebRTC rejecting extra DataChannel: grant_id={}",
-                self.peer_state.grant_id
-            );
-            let _ = tokio::time::timeout(LOCAL_WEBRTC_PEER_CLOSE_BOUND, data_channel.local_close())
-                .await;
+        let claimed = self.peer_state.claim_data_channel();
+        if !claimed {
+            let label = data_channel.label().await.unwrap_or_else(|_| String::new());
+            reject_extra_data_channel(
+                &self.peer_state.grant_id,
+                claimed,
+                &label,
+                data_channel.as_ref(),
+            )
+            .await;
             return;
         }
         let peer_state = self.peer_state.clone();
@@ -2450,6 +2506,8 @@ mod tests {
     use super::*;
     use webrtc::data_channel::RTCDataChannelMessage;
 
+    static EXTRA_CHANNEL_ORACLE_ENV: Mutex<()> = Mutex::new(());
+
     #[derive(Default)]
     struct FakeDataChannel {
         events: Mutex<VecDeque<DataChannelEvent>>,
@@ -2555,6 +2613,83 @@ mod tests {
         let peer_state = test_peer_state("grant-one-channel");
         assert!(peer_state.claim_data_channel());
         assert!(!peer_state.claim_data_channel());
+    }
+
+    #[test]
+    fn reject_extra_data_channel_closes_the_unclaimed_channel() {
+        let extra = FakeDataChannel::default();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build extra-channel close runtime");
+        runtime.block_on(reject_extra_data_channel(
+            "grant-extra",
+            false,
+            EXTRA_DATA_CHANNEL_LABEL,
+            &extra,
+        ));
+        assert!(
+            extra.closed.load(Ordering::Acquire),
+            "production reject path must finish local_close"
+        );
+    }
+
+    #[test]
+    fn extra_channel_close_marker_requires_lost_claim_and_close_ok() {
+        let _lock = EXTRA_CHANNEL_ORACLE_ENV
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "so-2ch-label-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create label-control dir");
+        let marker = dir.join("extra-closed");
+        let observation = dir.join("extra-observation.json");
+        let previous_env = std::env::var("BOTSTER_ENV").ok();
+        let previous_marker = std::env::var(TEST_EXTRA_CHANNEL_CLOSE_MARKER_ENV).ok();
+        let previous_observation = std::env::var(TEST_EXTRA_CHANNEL_OBSERVATION_ENV).ok();
+        unsafe {
+            std::env::set_var("BOTSTER_ENV", "test");
+            std::env::set_var(TEST_EXTRA_CHANNEL_CLOSE_MARKER_ENV, &marker);
+            std::env::set_var(TEST_EXTRA_CHANNEL_OBSERVATION_ENV, &observation);
+        }
+        let close = Ok(Ok(()));
+        observe_rejected_data_channel_for_test(true, &close, "botster-client");
+        assert!(
+            !marker.exists(),
+            "close marker must stay absent when the channel kept the claim"
+        );
+        observe_rejected_data_channel_for_test(false, &close, "botster-client");
+        assert!(
+            marker.exists(),
+            "close marker must write for any rejected label after lost_claim and Ok(Ok(()))"
+        );
+        std::fs::remove_file(&marker).expect("reset close marker");
+        observe_rejected_data_channel_for_test(false, &close, EXTRA_DATA_CHANNEL_LABEL);
+        assert!(
+            marker.exists(),
+            "close marker must write for botster-extra after lost_claim and Ok(Ok(()))"
+        );
+        unsafe {
+            match previous_env {
+                Some(value) => std::env::set_var("BOTSTER_ENV", value),
+                None => std::env::remove_var("BOTSTER_ENV"),
+            }
+            match previous_marker {
+                Some(value) => std::env::set_var(TEST_EXTRA_CHANNEL_CLOSE_MARKER_ENV, value),
+                None => std::env::remove_var(TEST_EXTRA_CHANNEL_CLOSE_MARKER_ENV),
+            }
+            match previous_observation {
+                Some(value) => std::env::set_var(TEST_EXTRA_CHANNEL_OBSERVATION_ENV, value),
+                None => std::env::remove_var(TEST_EXTRA_CHANNEL_OBSERVATION_ENV),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn receive_test_runtime_message(
@@ -6257,6 +6392,34 @@ mod tests {
             "dedicated runtime workers must join after fail-closed teardown",
         );
 
+        let _ = harness
+            .daemon
+            .runtime_mut()
+            .expect("runtime")
+            .observe_lifecycle_slice(
+                1,
+                None,
+                botster_core_daemon::ObserveLifecycleBudget {
+                    max_sessions: 32,
+                    max_encoded_result_bytes: 64 * 1024,
+                    max_elapsed: Duration::from_millis(25),
+                },
+            );
+        let inventory = harness
+            .daemon
+            .runtime_mut()
+            .expect("runtime")
+            .list_terminal_subscriptions();
+        assert!(
+            inventory.is_empty(),
+            "fail-closed must leave zero Core inventory rows before session shutdown: {inventory:?}"
+        );
+        assert!(
+            harness.state.live_attach_routes.is_empty(),
+            "fail-closed must leave zero Hub attach routes before session shutdown: {:?}",
+            harness.state.live_attach_routes
+        );
+
         peer_a.close_offer();
         peer_b.close_offer();
         harness
@@ -6278,6 +6441,23 @@ mod tests {
             );
         }
         harness.cleanup();
+    }
+
+    #[test]
+    fn ultimate_close_failure_sacrifices_every_peer_and_sweeps_all_owners() {
+        run_close_hang_fail_closed_body();
+        local_webrtc_close_failure_fail_closed_parks_runtime_and_stops_driver_threads();
+        let inventory_source = include_str!("local_webrtc.rs");
+        assert!(
+            inventory_source.contains("timeout fail-closed must sacrifice sibling peers"),
+            "ultimate close failure must keep the bound-exceeded sibling-sacrifice oracle"
+        );
+        assert!(
+            inventory_source.contains(
+                "fail-closed must leave zero Core inventory rows before session shutdown"
+            ),
+            "ultimate close failure must keep the Core inventory sweep"
+        );
     }
 
     #[test]
@@ -7162,6 +7342,20 @@ mod tests {
                     == 0
             },
             "dedicated runtime workers must join after hang fail-closed teardown",
+        );
+        let inventory = harness
+            .daemon
+            .runtime_mut()
+            .expect("runtime")
+            .list_terminal_subscriptions();
+        assert!(
+            inventory.is_empty(),
+            "timeout fail-closed must leave zero Core inventory rows: {inventory:?}"
+        );
+        assert!(
+            harness.state.live_attach_routes.is_empty(),
+            "timeout fail-closed must leave zero Hub attach routes: {:?}",
+            harness.state.live_attach_routes
         );
 
         peer_a.close_offer();
