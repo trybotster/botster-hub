@@ -177,7 +177,18 @@ fn start_webrtc_adapter_hub(
     botster_hub_client::DaemonEndpoint,
     botster_hub_client::DaemonLocalWebrtcBootstrap,
 ) {
-    let hub = start_isolated_live_output_hub(name);
+    start_webrtc_adapter_hub_with_env(name, &[])
+}
+
+fn start_webrtc_adapter_hub_with_env(
+    name: &str,
+    extra_env: &[(&str, &str)],
+) -> (
+    botster_hub_test_support::IsolatedHub,
+    botster_hub_client::DaemonEndpoint,
+    botster_hub_client::DaemonLocalWebrtcBootstrap,
+) {
+    let hub = start_isolated_live_output_hub_with_env(name, extra_env);
     let package_dir = unique_test_dir(&format!("{name}-web"));
     write_botster_web_package(&package_dir);
     enable_supervised_package(hub.data_dir(), &package_dir);

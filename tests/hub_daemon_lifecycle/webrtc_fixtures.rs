@@ -40,8 +40,8 @@ use webrtc::peer_connection::{
     RTCPeerConnectionState, RTCSessionDescription,
 };
 use webrtc::runtime::{
-    Receiver as AsyncReceiver, Sender as AsyncSender, block_on, channel, default_runtime, sleep,
-    timeout,
+    Receiver as AsyncReceiver, Runtime, Sender as AsyncSender, block_on, channel, default_runtime,
+    sleep, timeout,
 };
 
 use crate::support::{
@@ -288,6 +288,16 @@ impl WebrtcInboundMailbox {
         )
     }
 
+    async fn recv_raw(&mut self, bound: Duration) -> Option<String> {
+        match timeout(bound, self.rx.recv()).await {
+            Ok(Some(text)) => {
+                self.occupancy.record_pop(text.len() as u64);
+                Some(text)
+            }
+            _ => None,
+        }
+    }
+
     async fn receive_delivery(
         &mut self,
         key: &AesGcmKey,
@@ -477,6 +487,7 @@ fn apply_inbound_chunk(
 pub(crate) struct LocalWebrtcOfferPeer {
     pub(crate) peer: Box<dyn PeerConnection>,
     pub(crate) data_channel: Arc<dyn DataChannel>,
+    pub(crate) control_label: String,
     pub(crate) connected_rx: AsyncReceiver<()>,
     pub(crate) data_channel_open_rx: AsyncReceiver<()>,
     pub(crate) pending_entity_frames: VecDeque<botster_hub_client::DaemonEntityFrame>,
@@ -487,12 +498,95 @@ pub(crate) struct LocalWebrtcOfferPeer {
 }
 
 pub(crate) struct ExtraWebrtcDataChannel {
+    pub(crate) label: String,
+    pub(crate) data_channel: Arc<dyn DataChannel>,
+    inbound: WebrtcInboundMailbox,
     pub(crate) messages: AsyncReceiver<String>,
+    pub(crate) closed: AsyncReceiver<()>,
+    open_rx: AsyncReceiver<()>,
+}
+
+impl ExtraWebrtcDataChannel {
+    pub(crate) async fn count_terminal_frames(&mut self, bound: Duration) -> usize {
+        let deadline = Instant::now() + bound;
+        let mut extra_terminal_frames = 0;
+        while Instant::now() < deadline {
+            let message = match timeout(Duration::from_millis(50), self.messages.recv()).await {
+                Ok(Some(message)) => Some(message),
+                _ => self.inbound.recv_raw(Duration::from_millis(50)).await,
+            };
+            let Some(message) = message else {
+                continue;
+            };
+            if let Ok(chunk) =
+                serde_json::from_str::<botster_hub_client::DaemonLocalWebrtcDeliveryChunk>(&message)
+                && chunk.delivery_kind
+                    == botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonTerminalFrame
+            {
+                extra_terminal_frames += 1;
+            }
+        }
+        extra_terminal_frames
+    }
+}
+
+fn spawn_offerer_channel_poll(
+    runtime: std::sync::Arc<dyn webrtc::runtime::Runtime>,
+    data_channel: Arc<dyn DataChannel>,
+    open_tx: AsyncSender<()>,
+    inbound_tx: AsyncSender<String>,
+    occupancy: Arc<FixtureQueueOccupancy>,
+    messages_tx: Option<AsyncSender<String>>,
+    closed_tx: Option<AsyncSender<()>>,
+) {
+    runtime.spawn(Box::pin(async move {
+        while let Some(event) = data_channel.poll().await {
+            match event {
+                DataChannelEvent::OnOpen => {
+                    let _ = open_tx.try_send(());
+                }
+                DataChannelEvent::OnMessage(message) => {
+                    if let Ok(text) = String::from_utf8(message.data.to_vec()) {
+                        if let Some(messages_tx) = &messages_tx {
+                            let _ = messages_tx.try_send(text.clone());
+                        }
+                        let _ = admit_inbound_frame(&occupancy, &inbound_tx, text);
+                    }
+                }
+                DataChannelEvent::OnClose => {
+                    if let Some(closed_tx) = &closed_tx {
+                        let _ = closed_tx.try_send(());
+                    }
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }));
 }
 
 impl LocalWebrtcOfferPeer {
     pub(crate) async fn create_offer()
     -> Result<(Self, serde_json::Value), Box<dyn std::error::Error>> {
+        let (peer, extra, offer) = Self::create_offer_inner(false).await?;
+        assert!(extra.is_none());
+        Ok((peer, offer))
+    }
+
+    pub(crate) async fn create_offer_with_extra_data_channel()
+    -> Result<(Self, ExtraWebrtcDataChannel, serde_json::Value), Box<dyn std::error::Error>> {
+        let (peer, extra, offer) = Self::create_offer_inner(true).await?;
+        Ok((
+            peer,
+            extra.expect("extra DataChannel requested in the initial offer"),
+            offer,
+        ))
+    }
+
+    async fn create_offer_inner(
+        with_extra: bool,
+    ) -> Result<(Self, Option<ExtraWebrtcDataChannel>, serde_json::Value), Box<dyn std::error::Error>>
+    {
         let runtime =
             default_runtime().ok_or_else(|| std::io::Error::other("no async runtime found"))?;
         let (gather_complete_tx, mut gather_complete_rx) = channel::<()>(1);
@@ -526,28 +620,53 @@ impl LocalWebrtcOfferPeer {
         assert_eq!(data_channel.max_retransmits().await?, None);
         assert_eq!(data_channel.max_packet_life_time().await?, None);
 
-        {
-            let data_channel = data_channel.clone();
-            let open_tx = data_channel_open_tx.clone();
-            let message_tx = data_channel_message_tx.clone();
-            let occupancy = Arc::clone(&occupancy);
-            runtime.spawn(Box::pin(async move {
-                while let Some(event) = data_channel.poll().await {
-                    match event {
-                        DataChannelEvent::OnOpen => {
-                            let _ = open_tx.try_send(());
-                        }
-                        DataChannelEvent::OnMessage(message) => {
-                            if let Ok(text) = String::from_utf8(message.data.to_vec()) {
-                                let _ = admit_inbound_frame(&occupancy, &message_tx, text);
-                            }
-                        }
-                        DataChannelEvent::OnClose => break,
-                        _ => {}
-                    }
-                }
-            }));
-        }
+        spawn_offerer_channel_poll(
+            runtime.clone(),
+            data_channel.clone(),
+            data_channel_open_tx.clone(),
+            data_channel_message_tx,
+            Arc::clone(&occupancy),
+            None,
+            None,
+        );
+
+        let extra_channel = if with_extra {
+            let (open_tx, open_rx) = channel::<()>(1);
+            let (message_tx, message_rx) = channel::<String>(256);
+            let (closed_tx, closed_rx) = channel::<()>(1);
+            let (inbound_tx, inbound) =
+                WebrtcInboundMailbox::bounded(WEBRTC_INBOUND_MAX_FRAMES, WEBRTC_INBOUND_MAX_BYTES);
+            let extra = peer
+                .create_data_channel(
+                    "botster-extra",
+                    Some(RTCDataChannelInit {
+                        ordered: true,
+                        max_retransmits: None,
+                        max_packet_life_time: None,
+                        ..Default::default()
+                    }),
+                )
+                .await?;
+            spawn_offerer_channel_poll(
+                runtime.clone(),
+                extra.clone(),
+                open_tx,
+                inbound_tx,
+                Arc::clone(&inbound.occupancy),
+                Some(message_tx),
+                Some(closed_tx),
+            );
+            Some(ExtraWebrtcDataChannel {
+                label: "botster-extra".to_string(),
+                data_channel: extra,
+                inbound,
+                messages: message_rx,
+                closed: closed_rx,
+                open_rx,
+            })
+        } else {
+            None
+        };
 
         let offer = peer.create_offer(None).await?;
         peer.set_local_description(offer).await?;
@@ -562,6 +681,7 @@ impl LocalWebrtcOfferPeer {
             Self {
                 peer: Box::new(peer),
                 data_channel,
+                control_label: "botster-client".to_string(),
                 connected_rx,
                 data_channel_open_rx,
                 pending_entity_frames: VecDeque::new(),
@@ -570,6 +690,7 @@ impl LocalWebrtcOfferPeer {
                 accept_host_events: false,
                 inbound,
             },
+            extra_channel,
             offer,
         ))
     }
@@ -578,15 +699,90 @@ impl LocalWebrtcOfferPeer {
         &mut self,
         answer: serde_json::Value,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        self.accept_answer_inner(answer, None).await
+    }
+
+    pub(crate) async fn accept_answer_with_extra_open(
+        &mut self,
+        answer: serde_json::Value,
+        extra: &mut ExtraWebrtcDataChannel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.accept_answer_inner(answer, Some(&mut extra.open_rx))
+            .await
+    }
+
+    async fn accept_answer_inner(
+        &mut self,
+        answer: serde_json::Value,
+        extra_open_rx: Option<&mut AsyncReceiver<()>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let answer = serde_json::from_value::<RTCSessionDescription>(answer)?;
         self.peer.set_remote_description(answer).await?;
         timeout(Duration::from_secs(15), self.connected_rx.recv())
             .await
             .map_err(|_| std::io::Error::other("timed out waiting for WebRTC connection"))?;
-        timeout(Duration::from_secs(10), self.data_channel_open_rx.recv())
-            .await
-            .map_err(|_| std::io::Error::other("timed out waiting for data channel open"))?;
+        if let Some(extra_open_rx) = extra_open_rx {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut opened = false;
+            while Instant::now() < deadline && !opened {
+                opened = timeout(Duration::from_millis(50), self.data_channel_open_rx.recv())
+                    .await
+                    .is_ok()
+                    || timeout(Duration::from_millis(50), extra_open_rx.recv())
+                        .await
+                        .is_ok();
+            }
+            if !opened {
+                return Err(std::io::Error::other(
+                    "timed out waiting for either offerer DataChannel to open",
+                )
+                .into());
+            }
+        } else {
+            timeout(Duration::from_secs(10), self.data_channel_open_rx.recv())
+                .await
+                .map_err(|_| std::io::Error::other("timed out waiting for data channel open"))?;
+        }
         Ok(())
+    }
+
+    pub(crate) fn swap_offerer_channel(
+        &mut self,
+        incoming: ExtraWebrtcDataChannel,
+    ) -> ExtraWebrtcDataChannel {
+        let (_unused_messages_tx, unused_messages) = channel::<String>(1);
+        let (_unused_closed_tx, unused_closed) = channel::<()>(1);
+        let (_unused_open_tx, unused_open) = channel::<()>(1);
+        let rejected = ExtraWebrtcDataChannel {
+            label: self.control_label.clone(),
+            data_channel: std::mem::replace(&mut self.data_channel, incoming.data_channel),
+            inbound: std::mem::replace(&mut self.inbound, incoming.inbound),
+            messages: unused_messages,
+            closed: unused_closed,
+            open_rx: unused_open,
+        };
+        self.control_label = incoming.label;
+        rejected
+    }
+
+    pub(crate) async fn admit_surviving_dual_channel(
+        &mut self,
+        extra: ExtraWebrtcDataChannel,
+        key: &AesGcmKey,
+        hello: &botster_hub_client::DaemonHello,
+    ) -> Result<ExtraWebrtcDataChannel, Box<dyn std::error::Error>> {
+        match timeout(Duration::from_secs(3), self.encrypted_hello(key, hello)).await {
+            Ok(Ok(_)) => Ok(extra),
+            Ok(Err(_)) | Err(_) => {
+                let rejected = self.swap_offerer_channel(extra);
+                self.encrypted_hello(key, hello).await.map_err(|error| {
+                    std::io::Error::other(format!(
+                        "neither offerer DataChannel completed encrypted Hello: {error}"
+                    ))
+                })?;
+                Ok(rejected)
+            }
+        }
     }
 
     pub(crate) async fn encrypted_request(
@@ -825,8 +1021,11 @@ impl LocalWebrtcOfferPeer {
     ) -> Result<ExtraWebrtcDataChannel, Box<dyn std::error::Error>> {
         let runtime =
             default_runtime().ok_or_else(|| std::io::Error::other("no async runtime found"))?;
-        let (open_tx, mut open_rx) = channel::<()>(1);
+        let (open_tx, open_rx) = channel::<()>(1);
         let (message_tx, message_rx) = channel::<String>(256);
+        let (closed_tx, closed_rx) = channel::<()>(1);
+        let (inbound_tx, inbound) =
+            WebrtcInboundMailbox::bounded(WEBRTC_INBOUND_MAX_FRAMES, WEBRTC_INBOUND_MAX_BYTES);
         let extra = self
             .peer
             .create_data_channel(
@@ -839,29 +1038,25 @@ impl LocalWebrtcOfferPeer {
                 }),
             )
             .await?;
-        {
-            let extra = extra.clone();
-            runtime.spawn(Box::pin(async move {
-                while let Some(event) = extra.poll().await {
-                    match event {
-                        DataChannelEvent::OnOpen => {
-                            let _ = open_tx.try_send(());
-                        }
-                        DataChannelEvent::OnMessage(message) => {
-                            if let Ok(text) = String::from_utf8(message.data.to_vec()) {
-                                let _ = message_tx.try_send(text);
-                            }
-                        }
-                        DataChannelEvent::OnClose => break,
-                        _ => {}
-                    }
-                }
-            }));
-        }
-        let _ = timeout(Duration::from_secs(5), open_rx.recv()).await;
-        Ok(ExtraWebrtcDataChannel {
+        spawn_offerer_channel_poll(
+            runtime,
+            extra.clone(),
+            open_tx,
+            inbound_tx,
+            Arc::clone(&inbound.occupancy),
+            Some(message_tx),
+            Some(closed_tx),
+        );
+        let mut extra_channel = ExtraWebrtcDataChannel {
+            label: "botster-extra".to_string(),
+            data_channel: extra,
+            inbound,
             messages: message_rx,
-        })
+            closed: closed_rx,
+            open_rx,
+        };
+        let _ = timeout(Duration::from_secs(5), extra_channel.open_rx.recv()).await;
+        Ok(extra_channel)
     }
 }
 
@@ -927,6 +1122,42 @@ pub(crate) async fn open_local_webrtc_peer(
         .await
         .expect("offer peer accepts answer and opens channel");
     (offer_peer, stream_key)
+}
+
+pub(crate) async fn open_local_webrtc_peer_with_extra_channel(
+    endpoint: &botster_hub_client::DaemonEndpoint,
+    bootstrap: &botster_hub_client::DaemonLocalWebrtcBootstrap,
+) -> (LocalWebrtcOfferPeer, ExtraWebrtcDataChannel, AesGcmKey) {
+    let stream_key = local_webrtc_stream_key(&bootstrap.grant_secret);
+    let (mut offer_peer, mut extra, offer) =
+        LocalWebrtcOfferPeer::create_offer_with_extra_data_channel()
+            .await
+            .expect("create WebRTC offer peer with extra DataChannel");
+    let signal = botster_hub_client::request(
+        endpoint,
+        botster_hub_client::DaemonRequest::LocalWebrtcSignal {
+            grant_id: bootstrap.grant_id.clone(),
+            grant_secret: bootstrap.grant_secret.clone(),
+            origin: bootstrap.expected_origin.clone(),
+            offer,
+        },
+    )
+    .expect("signal local WebRTC offer");
+    assert_eq!(
+        signal.kind,
+        botster_hub_client::DaemonResponseKind::LocalWebrtcAnswer
+    );
+    let answer = signal
+        .local_webrtc_answer
+        .as_ref()
+        .expect("signal response includes WebRTC answer")
+        .answer
+        .clone();
+    offer_peer
+        .accept_answer_with_extra_open(answer, &mut extra)
+        .await
+        .expect("offer peer accepts answer and opens a DataChannel");
+    (offer_peer, extra, stream_key)
 }
 
 pub(crate) fn write_botster_web_package(root: &Path) {

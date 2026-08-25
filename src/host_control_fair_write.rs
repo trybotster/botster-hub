@@ -127,4 +127,43 @@ mod tests {
             Some(HostControlClass::Control)
         );
     }
+
+    #[test]
+    fn fair_write_class_coverage_per_transport() {
+        assert_eq!(
+            next_ready_host_control_class(Some(HostControlClass::Control), true, true, true),
+            Some(HostControlClass::Entity),
+            "WebRTC rotates Control, Entity, Event"
+        );
+        assert_eq!(
+            next_ready_host_control_class(Some(HostControlClass::Entity), true, true, true),
+            Some(HostControlClass::Event),
+            "WebRTC rotates Control, Entity, Event"
+        );
+        assert_eq!(
+            next_ready_host_control_class(Some(HostControlClass::Event), true, true, true),
+            Some(HostControlClass::Control),
+            "WebRTC rotates Control, Entity, Event"
+        );
+        assert_eq!(
+            next_ready_host_control_class(Some(HostControlClass::Control), true, false, true),
+            Some(HostControlClass::Event),
+            "Unix rotates Control and Event with Entity inactive"
+        );
+        assert_eq!(
+            next_ready_host_control_class(Some(HostControlClass::Event), true, false, true),
+            Some(HostControlClass::Control),
+            "Unix rotates Control and Event with Entity inactive"
+        );
+        let unix = include_str!("daemon_transport.rs");
+        assert!(
+            unix.contains("            false,\n            event_ready,"),
+            "Unix call site must pass entity_ready=false"
+        );
+        let webrtc = include_str!("local_webrtc.rs");
+        assert!(
+            webrtc.contains("            entity_ready,\n            host_event_ready(peer_state),"),
+            "WebRTC call site must pass live entity_ready"
+        );
+    }
 }

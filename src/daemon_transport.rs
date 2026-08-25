@@ -5660,7 +5660,7 @@ pub(crate) struct DaemonControlState {
     next_reconciliation: Instant,
     released_entity_generations: u64,
     pub(crate) released_attach_generations: u64,
-    live_attach_routes: BTreeSet<(String, String)>,
+    pub(crate) live_attach_routes: BTreeSet<(String, String)>,
     pending_hub_update_reply: Option<ControlReplySender>,
     observe_resume: Option<botster_core_daemon::ObserveLifecycleCursor>,
 }
