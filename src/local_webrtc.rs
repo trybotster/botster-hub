@@ -48,8 +48,11 @@ use crate::daemon_transport::{
 use crate::webrtc_terminal_adapter::WebRtcConnectionMux;
 
 #[path = "webrtc_subscription_channel.rs"]
-mod webrtc_subscription_channel;
-use webrtc_subscription_channel::flush_webrtc_adapter_frames;
+pub(crate) mod webrtc_subscription_channel;
+use webrtc_subscription_channel::{
+    CONTROL_CHANNEL_LABEL, LOCAL_WEBRTC_CHANNEL_OPEN_BOUND, flush_one_adapter_handle,
+    subscription_channel_key,
+};
 
 const GRANT_TTL_SECONDS: u64 = 120;
 const WEBRTC_SIGNAL_OPERATION: &str = "local_webrtc_signal";
@@ -163,6 +166,28 @@ where
     let close =
         tokio::time::timeout(LOCAL_WEBRTC_PEER_CLOSE_BOUND, data_channel.local_close()).await;
     observe_rejected_data_channel_for_test(claimed, &close, label);
+}
+
+async fn reject_opened_data_channel<C>(grant_id: &str, claimed: bool, label: &str, data_channel: &C)
+where
+    C: LocalWebrtcDataChannel + ?Sized,
+{
+    let deadline = tokio::time::Instant::now() + LOCAL_WEBRTC_PEER_CLOSE_BOUND;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, data_channel.local_poll()).await {
+            Ok(Some(DataChannelEvent::OnOpen)) => break,
+            Ok(Some(DataChannelEvent::OnClose | DataChannelEvent::OnClosing)) | Ok(None) => {
+                observe_rejected_data_channel_for_test(claimed, &Ok(Ok(())), label);
+                return;
+            }
+            Ok(Some(_)) | Err(_) => continue,
+        }
+    }
+    reject_extra_data_channel(grant_id, claimed, label, data_channel).await;
 }
 
 /// Ephemeral local WebRTC admission and peer registry.
@@ -1129,6 +1154,7 @@ fn local_webrtc_peer_connection_state(state: RTCPeerConnectionState) -> &'static
 #[derive(Clone)]
 struct LocalWebrtcHandler {
     stream_key: AesGcmKey,
+    grant_secret: String,
     runtime: Arc<dyn Runtime>,
     peer_state: Arc<LocalWebrtcPeerState>,
     gather_complete_tx: AsyncSender<()>,
@@ -1150,18 +1176,34 @@ impl PeerConnectionEventHandler for LocalWebrtcHandler {
     }
 
     async fn on_data_channel(&self, data_channel: Arc<dyn DataChannel>) {
-        let claimed = self.peer_state.claim_data_channel();
-        if !claimed {
-            let label = data_channel.label().await.unwrap_or_else(|_| String::new());
-            reject_extra_data_channel(
-                &self.peer_state.grant_id,
-                claimed,
-                &label,
-                data_channel.as_ref(),
-            )
-            .await;
+        let label = data_channel.label().await.unwrap_or_default();
+        if label == CONTROL_CHANNEL_LABEL {
+            if !self.peer_state.claim_data_channel() {
+                reject_extra_data_channel(
+                    &self.peer_state.grant_id,
+                    false,
+                    &label,
+                    data_channel.as_ref(),
+                )
+                .await;
+                return;
+            }
+            self.spawn_control_channel(data_channel).await;
             return;
         }
+        if let Some(parsed) = webrtc_subscription_channel::SubscriptionChannelLabel::parse(&label) {
+            self.handle_subscription_open(data_channel, parsed).await;
+            return;
+        }
+        let grant_id = self.peer_state.grant_id.clone();
+        self.runtime.spawn(Box::pin(async move {
+            reject_opened_data_channel(&grant_id, false, &label, data_channel.as_ref()).await;
+        }));
+    }
+}
+
+impl LocalWebrtcHandler {
+    async fn spawn_control_channel(&self, data_channel: Arc<dyn DataChannel>) {
         let peer_state = self.peer_state.clone();
         let runtime_tx = peer_state.runtime_tx.clone();
         let stream_key = self.stream_key.clone();
@@ -1198,6 +1240,114 @@ impl PeerConnectionEventHandler for LocalWebrtcHandler {
                 &runtime_tx,
                 entity_frame_tx,
                 entity_frame_rx,
+            )
+            .await;
+        }));
+    }
+
+    async fn handle_subscription_open(
+        &self,
+        data_channel: Arc<dyn DataChannel>,
+        label: webrtc_subscription_channel::SubscriptionChannelLabel,
+    ) {
+        let formatted = label.format();
+        let view = self.peer_state.mux.open_event_view(&label);
+        match webrtc_subscription_channel::decide_open_event(&view) {
+            webrtc_subscription_channel::OpenEventDecision::Bind => {}
+            webrtc_subscription_channel::OpenEventDecision::Reject(_) => {
+                reject_opened_data_channel(
+                    &self.peer_state.grant_id,
+                    true,
+                    &formatted,
+                    data_channel.as_ref(),
+                )
+                .await;
+                return;
+            }
+        }
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .peer_state
+            .runtime_tx
+            .send(ControlMessage::BindReservedWebrtcChannel {
+                grant_id: self.peer_state.grant_id.clone(),
+                session_id: label.session_id.clone(),
+                subscription_id: label.subscription_id.clone(),
+                generation: label.generation,
+                reply_tx,
+            })
+            .await
+            .is_err()
+        {
+            reject_opened_data_channel(
+                &self.peer_state.grant_id,
+                true,
+                &formatted,
+                data_channel.as_ref(),
+            )
+            .await;
+            return;
+        }
+        if !matches!(
+            tokio::time::timeout(Duration::from_secs(5), reply_rx).await,
+            Ok(Ok(Ok(())))
+        ) {
+            reject_opened_data_channel(
+                &self.peer_state.grant_id,
+                true,
+                &formatted,
+                data_channel.as_ref(),
+            )
+            .await;
+            return;
+        }
+        let Some(handle) = self.peer_state.mux.bound_handle(&label) else {
+            reject_opened_data_channel(
+                &self.peer_state.grant_id,
+                true,
+                &formatted,
+                data_channel.as_ref(),
+            )
+            .await;
+            return;
+        };
+        let Ok(stream_key) = subscription_channel_key(&self.grant_secret, &formatted) else {
+            handle.close();
+            reject_opened_data_channel(
+                &self.peer_state.grant_id,
+                true,
+                &formatted,
+                data_channel.as_ref(),
+            )
+            .await;
+            return;
+        };
+        let peer_state = self.peer_state.clone();
+        self.runtime.spawn(Box::pin(async move {
+            if let Err(error) = data_channel
+                .local_set_buffered_amount_low_threshold(LOCAL_WEBRTC_BUFFERED_AMOUNT_LOW)
+                .await
+            {
+                eprintln!("local WebRTC subscription low-water threshold setup failed: {error}");
+                let _ = data_channel.local_close().await;
+                handle.close();
+                return;
+            }
+            if let Err(error) = data_channel
+                .local_set_buffered_amount_high_threshold(LOCAL_WEBRTC_BUFFERED_AMOUNT_HIGH)
+                .await
+            {
+                eprintln!("local WebRTC subscription high-water threshold setup failed: {error}");
+                let _ = data_channel.local_close().await;
+                handle.close();
+                return;
+            }
+            let _ = run_subscription_channel(
+                data_channel.as_ref(),
+                &stream_key,
+                peer_state.as_ref(),
+                handle,
+                label,
             )
             .await;
         }));
@@ -1270,6 +1420,82 @@ where
     }
 }
 
+async fn run_subscription_channel<D>(
+    data_channel: &D,
+    stream_key: &AesGcmKey,
+    peer_state: &LocalWebrtcPeerState,
+    handle: crate::webrtc_terminal_adapter::WebRtcTerminalAdapterHandle,
+    label: webrtc_subscription_channel::SubscriptionChannelLabel,
+) -> Option<LocalWebrtcSendFailure>
+where
+    D: LocalWebrtcDataChannel + ?Sized,
+{
+    let mut pending_requests = VecDeque::new();
+    let mut flow_control = LocalWebrtcFlowControl::default();
+    let mut peer_terminal_rx = peer_state.subscribe_peer_terminal();
+    loop {
+        if peer_terminal_rx.borrow_and_update().is_some() {
+            handle.close();
+            return None;
+        }
+        if let Err(failure) = flush_one_adapter_handle(
+            data_channel,
+            stream_key,
+            peer_state,
+            &label,
+            &mut pending_requests,
+            &mut flow_control,
+        )
+        .await
+        {
+            handle.close();
+            return Some(failure);
+        }
+        if handle.is_closed() {
+            let _ = tokio::time::timeout(LOCAL_WEBRTC_PEER_CLOSE_BOUND, data_channel.local_close())
+                .await;
+            return None;
+        }
+        tokio::select! {
+            biased;
+            event = poll_data_channel_or_peer_terminal(data_channel, &mut peer_terminal_rx) => {
+                match event {
+                    Ok(Some(DataChannelEvent::OnMessage(message))) => {
+                        if let Some(bytes) = decrypt_subscription_ingress(stream_key, message.data.as_ref()) {
+                            handle.push_ingress_frame(bytes);
+                        }
+                    }
+                    Ok(Some(DataChannelEvent::OnClose | DataChannelEvent::OnClosing))
+                    | Ok(None) => {
+                        handle.close();
+                        return None;
+                    }
+                    Ok(Some(DataChannelEvent::OnError)) => {
+                        handle.close();
+                        return None;
+                    }
+                    Ok(Some(_)) => {}
+                    Err(_) => {
+                        handle.close();
+                        return None;
+                    }
+                }
+            }
+            () = peer_state.mux.wait_for_write() => {}
+        }
+    }
+}
+
+fn decrypt_subscription_ingress(key: &AesGcmKey, bytes: &[u8]) -> Option<Vec<u8>> {
+    let envelope = serde_json::from_slice::<AesGcmEnvelope>(bytes)
+        .ok()
+        .or_else(|| {
+            let text = std::str::from_utf8(bytes).ok()?;
+            serde_json::from_str::<AesGcmEnvelope>(text).ok()
+        })?;
+    decrypt_aes_gcm(key, &envelope).ok()
+}
+
 async fn run_data_channel<D>(
     data_channel: &D,
     stream_key: &AesGcmKey,
@@ -1307,22 +1533,9 @@ where
             send_failure = Some(failure);
             break;
         }
-        if pending_entity.is_none()
-            && !host_event_ready(peer_state)
-            && let Err(failure) = flush_webrtc_adapter_frames(
-                data_channel,
-                stream_key,
-                peer_state,
-                &mut pending_requests,
-                &mut flow_control,
-            )
-            .await
-        {
-            eprintln!("{failure}");
-            terminal_cause = failure.cause;
-            send_failure = Some(failure);
-            break;
-        }
+        peer_state
+            .mux
+            .expire_reserved_opens(Instant::now(), LOCAL_WEBRTC_CHANNEL_OPEN_BOUND);
         let pending = if let Some(request) = pop_pending_request(&mut pending_requests) {
             request
         } else {
@@ -1898,6 +2111,7 @@ async fn answer_offer(
     ));
     let handler = Arc::new(LocalWebrtcHandler {
         stream_key,
+        grant_secret: request.grant_secret.clone(),
         runtime: runtime.clone(),
         peer_state: peer_state.clone(),
         gather_complete_tx,
@@ -2353,6 +2567,8 @@ fn response_with_diagnostic(diagnostic: DaemonDiagnostic) -> DaemonResponse {
         plugin_action_result: None,
         local_webrtc_bootstrap: None,
         local_webrtc_answer: None,
+        subscription_channel_label: None,
+        subscription_channel_generation: None,
         events: Vec::new(),
         cleanup: None,
         coordination: None,
