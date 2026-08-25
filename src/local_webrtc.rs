@@ -7710,21 +7710,17 @@ mod tests {
                 }
             }));
 
-            let remote = timeout(
-                runtime.as_ref(),
-                Duration::from_secs(10),
-                async {
-                    loop {
-                        let channel = incoming_rx
-                            .recv()
-                            .await
-                            .expect("remote late on_data_channel");
-                        if channel.label().await.expect("incoming label") == "botster-late" {
-                            break channel;
-                        }
+            let remote = timeout(runtime.as_ref(), Duration::from_secs(10), async {
+                loop {
+                    let channel = incoming_rx
+                        .recv()
+                        .await
+                        .expect("remote late on_data_channel");
+                    if channel.label().await.expect("incoming label") == "botster-late" {
+                        break channel;
                     }
-                },
-            )
+                }
+            })
             .await
             .expect("remote late channel by label");
             assert_eq!(remote.label().await.expect("remote label"), "botster-late");
