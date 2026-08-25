@@ -582,8 +582,9 @@ reference-runner evidence on `botster-ubuntu-24.04-16core`, never asserted.
 | A8d | an unreserved label binds nothing | the browser opens a well-formed label with no `Reserved` route; assert immediate close, no adapter, no charge |
 | A8e | a duplicate open on a `Bound` route binds nothing | assert the second channel closes and the first route keeps delivering |
 | A8f | a **partially** matching label cannot claim a reservation | hold exactly one `Reserved` route, then open one channel per mismatch axis of the section 8.3 label: wrong channel kind, wrong `session_id`, wrong `subscription_id`, and wrong `generation`, each with every other field correct. For each arm assert the channel reaches `Open`, Hub closes it, no Core adapter is bound, section 9 accounting is unchanged, and the one `Reserved` route is **still** `Reserved` and still bindable by its exact label afterwards. A single all-fields-wrong label is not a substitute: it cannot distinguish a per-field comparison from a whole-string comparison that happens to reject |
-| A8g | **externally visible outcome only.** A full connection rejects an extra opened channel and no sibling suffers | fill the connection to `MAX_TOTAL_CHANNELS` = 33, one control channel plus 32 `Bound` subscription channels. The browser opens one extra reliable ordered channel. Assert it reaches `Open`, binds no adapter, is closed by Hub, leaves the section 9 counts at 33 and the aggregate unchanged, and does not disturb a surviving `Bound` channel, proved by a known terminal marker delivered byte-exact on that sibling over the same window per `[[rejected channel isolation needs a surviving channel positive control]]`. **Assert the typed rejection reason equals the unreserved reason, not the limit reason.** This row does **not** prove the limit guard, and section 11.4 says why. A7 does not cover it either: A7 rejects the 33rd **admission** before any channel exists |
-| A8h | **the open-time limit guard is load-bearing.** A reserved, identity-matching open event is still refused when the connection is over its charged limit | a focused state-construction unit lane, not a production browser flow. Build mux state directly: one `Reserved` route whose section 8.3 label, session, subscription, and generation all match, while the connection's charged subscription count is already at `MAX_SUBSCRIPTION_CHANNELS` = 32. Drive the **production** open-event decision function against that state. Assert it refuses, binds no Core adapter, emits the typed **limit** reason distinct from the unreserved reason, and leaves the counts unchanged. **Red-on-revert, and it must be assertion-specific:** delete only the open-time limit predicate, leaving every other guard in place, and assert A8h becomes the **first** failure, per `[[a regression test must be shown to go red with the fix reverted]]`. Identity, generation, route state, duplicate, and unreserved guards all pass on this input by construction, so the limit predicate is the only check that can refuse it |
+| A8g | **externally visible outcome only.** A full connection rejects an extra opened channel and no sibling suffers | fill the connection to `MAX_TOTAL_CHANNELS` = 33, one control channel plus 32 `Bound` subscription channels. The browser opens one extra reliable ordered channel. Assert it reaches `Open`, binds no adapter, is closed by Hub, leaves the section 9 counts at 33 and the aggregate unchanged, and does not disturb a surviving `Bound` channel, proved by a known terminal marker delivered byte-exact on that sibling over the same window per `[[rejected channel isolation needs a surviving channel positive control]]`. **Assert the typed rejection reason equals the unreserved reason, not the limit reason.** This row does **not** prove the limit guard, and section 11.0 says why. A7 does not cover it either: A7 rejects the 33rd **admission** before any channel exists |
+| A8h | **the open-time limit guard is load-bearing.** A reserved, identity-matching open event is refused when the connection is **over** its charged limit | a focused state-construction unit lane, not a production browser flow. Build mux state directly: **32 `Bound` subscription routes plus one matching `Reserved` route, so the charged subscription count is 33.** The count **includes** the matching `Reserved` route, because section 9 charges the slot at `Reserved`, and 33 is strictly greater than `MAX_SUBSCRIPTION_CHANNELS` = 32. The `Reserved` route's section 8.3 label, session, subscription, and generation all match the open event. Drive the **production** open-event decision function against that state. Assert it refuses, binds no Core adapter, emits the typed **limit** reason distinct from the unreserved reason, and leaves the counts unchanged. **Red-on-revert, and it must be assertion-specific:** delete only the greater-than-maximum predicate, leaving every other guard in place, and assert A8h becomes the **first** failure, per `[[a regression test must be shown to go red with the fix reverted]]`. Identity, generation, route state, duplicate, and unreserved guards all pass on this input by construction, so the limit predicate is the only check that can refuse it |
+| A8i | **positive boundary.** At exactly the maximum, a matching reservation still binds | the same state-construction lane, one route lower: **31 `Bound` subscription routes plus one matching `Reserved` route, so the charged subscription count is exactly 32**, again counting the matching `Reserved` route. Drive the same production decision function and assert it **binds** the Core adapter and moves the route to `Bound`. This row is the reason A8h cannot be written at count 32: `MAX_SUBSCRIPTION_CHANNELS` = 32 **permits** 32 charged subscription routes, so the 32nd subscription is valid and must succeed. A8i fails if the implementation writes the predicate as `>=` instead of `>`, which is the exact defect an at-limit A8h would have taught |
 | A26 | the aggregate does not drift | saturate, drain fully, assert `aggregate_buffered()` returns to 0 and held classes resume. A stored counter fails this; the derived sum of section 9.2 passes |
 | A27 | a refused terminal send is backpressure, not loss | the architecture section 14.3 A27 sequence T1 to T7, at most 8 attempts before the drain. Assert `WouldBlock` from `try_write`, `WouldBlock` from `pressure()`, Core retains the frame while the adapter does not, the aggregate stays at 2,097,152 B, and after draining below 1,048,576 B the same frame is delivered byte-exact with no duplicate |
 | A27b | sustained aggregate pressure hits Core's hard stop | hold pressure through 512 consecutive unsuccessful attempts; assert Core `hard_stop`s the route, emits `ClientWorkerTeardown`, and Hub retires the route |
@@ -642,8 +643,22 @@ revision of this plan claimed A8g proved open-time limit rejection. It did not,
 and Plan Review `review_1787681114_793607` was right to reject that claim.
 
 The open-time limit check is therefore **defensive**: it refuses a reserved,
-identity-matching open event whose connection is over its charged limit, a state
-production admission should never produce. The ticket requires the check —
+identity-matching open event whose connection is **over** its charged limit, a
+state production admission should never produce.
+
+**The boundary is strict, and the plan states it once here.** Section 9 charges
+the subscription slot when the route becomes `Reserved`, and
+`MAX_SUBSCRIPTION_CHANNELS` = 32 **permits** 32 charged subscription routes. A
+charged count of 32 is therefore **at** the limit and must bind; only a count
+strictly greater than 32 is over it. The predicate is `> 32`, never `>= 32`. Any
+constructed over-limit state must say whether its count includes the matching
+`Reserved` route; A8h and A8i both include it.
+
+Revision 3 of this plan got that boundary wrong. A8h constructed a charged count
+of 32 and expected a refusal, which would have driven an implementation that
+rejects the valid 32nd subscription. Plan Review
+`review_1787681637_806331` caught it. A8i now pins the other side of the
+boundary so the error cannot return. The ticket requires the check —
 "Reject late, stale, mismatched, duplicate, unreserved, **or over-limit** open
 events" — so the check ships, and a defensive check still needs a test that goes
 red when it is removed. A8h is that test, and it must construct the state
@@ -654,7 +669,8 @@ The two rows carry different burdens, and neither substitutes for the other:
 | Row | Proof role | Path | Red-on-revert target |
 |---|---|---|---|
 | A8g | the externally visible rejection and sibling isolation at a full connection | production browser flow | none; it is deliberately not the limit guard's proof |
-| A8h | the open-time limit predicate itself | state-construction unit lane against the production decision function | delete only the limit predicate; A8h must fail first |
+| A8h | the open-time limit predicate itself, above the maximum | state-construction unit lane, 32 `Bound` plus 1 matching `Reserved` = 33 charged | delete only the greater-than-maximum predicate; A8h must fail first |
+| A8i | the boundary below it: at exactly the maximum a matching reservation binds | same lane, 31 `Bound` plus 1 matching `Reserved` = 32 charged | none; it is the positive control that forbids `>=` |
 
 This split requires the rejection reasons to be **distinguishable typed values**,
 not one generic close. A8g asserts the unreserved reason and A8h asserts the
@@ -868,7 +884,8 @@ fails to compile. An identity oracle that cannot go red proves nothing.
 | Ticket size. Core roll, a new module, adapter ingress, a protocol cutover, and fifteen-plus acceptance rows in one Implement step | review fatigue; partial delivery | the six-commit sequence in section 9 keeps each commit reviewable; the move-only commit is separate by project rule |
 | A channel opens after its subscription retired | a resurrected route leaks a Core adapter | A8 with a red-on-revert control, plus A8c for both race orders |
 | An unreserved or duplicate label binds an adapter | fail-open admission | A8d and A8e; a label with no `Reserved` route closes immediately and charges nothing |
-| A guard is proved by a test that an earlier guard already satisfies | the check can be deleted with every test still green, so it is dead in practice | section 11.0 splits A8g from A8h, requires distinguishable typed rejection reasons, and gives A8h an assertion-specific red-on-revert that removes only the limit predicate |
+| A guard is proved by a test that an earlier guard already satisfies | the check can be deleted with every test still green, so it is dead in practice | section 11.0 splits A8g from A8h, requires distinguishable typed rejection reasons, and gives A8h an assertion-specific red-on-revert that removes only the greater-than-maximum predicate |
+| An over-limit acceptance row is constructed at the limit instead of above it | the row drives the implementation to reject the last **valid** subscription, turning a defensive check into a live product defect | section 11.0 states the strict boundary once: the slot is charged at `Reserved`, 32 charged routes are permitted, the predicate is `> 32` and never `>= 32`. A8h constructs 33 and A8i pins 32 as a binding case |
 | Extraction becomes a file-only split | `[[Hub extraction must reduce ownership rather than only split files]]` fails at review | architecture section 12.1 assigns responsibilities, not line counts; no forwarding wrapper is left in `src/local_webrtc.rs` |
 | 33 channels per peer exceed a browser or `webrtc-rs` limit | admission fails late instead of at the table | A7 tests the boundary; unknown 1 measures it early |
 | Per-channel AES-GCM adds a copy per terminal frame | throughput regression on large history | reference-runner comparison against the post-Restty baseline; recorded as evidence, never asserted |
@@ -1078,3 +1095,56 @@ Acceptance now carries **twenty-one** deterministic rows. Section 12 gains one
 risk row for the general failure mode: a guard proved by a test that an earlier
 guard already satisfies is dead in practice, because it can be deleted with every
 test still green.
+
+### 14.3 Plan Review return, review_1787681637_806331
+
+Verdict `changes_required` with two findings. The reviewer approved architecture,
+ownership boundaries, registered dependencies, risks, assumptions,
+runtime-teardown answers, live Hub proof, downstream package proof, the
+open-timeout correction, A8f, the note inventory, and the two-lane proof concept
+itself. Both findings are correct. Both are resolved.
+
+`finding_1787681637_178709`, high, product — A8h treated the allowed count as
+over-limit.
+
+**Correct, and it was a real product defect, not a wording problem.** Section 9
+charges the subscription slot when the route becomes `Reserved`, and
+`MAX_SUBSCRIPTION_CHANNELS` = 32 **permits** 32 charged subscription routes.
+Revision 3's A8h constructed a charged count of 32 and required a refusal. That
+count is **at** the limit, not above it. Either the matching `Reserved` route was
+included in the 32, in which case the route must bind and the row demanded the
+wrong verdict, or it was excluded, in which case the constructed state silently
+violated the charge invariant the same row relied on.
+
+The consequence was concrete: an implementer following revision 3 would have
+written the predicate as `>= 32` and rejected the valid 32nd subscription. The
+row would have turned a defensive check into a live product defect. This is the
+worst of the four findings across the three returns, because the previous three
+weakened proofs while this one would have produced wrong behavior.
+
+Resolution, adopting the suggested fix in full including its final clause:
+
+- **A8h** now constructs 32 `Bound` routes plus one matching `Reserved` route,
+  for 33 charged subscription routes, and **states that the count includes the
+  matching `Reserved` route**. Its ablation removes only the
+  greater-than-maximum predicate.
+- **A8i** is added as the positive boundary control: 31 `Bound` plus one matching
+  `Reserved`, for exactly 32 charged, which must **bind**. A8i fails if the
+  predicate is written `>=` instead of `>`, which is precisely the defect an
+  at-limit A8h would have taught.
+- Section 11.0 states the boundary once, in one place: the slot is charged at
+  `Reserved`, 32 charged routes are permitted, the predicate is `> 32` and never
+  `>= 32`, and any constructed over-limit state must say whether its count
+  includes the matching `Reserved` route.
+- Section 12 gains a risk row for the general form: an over-limit acceptance row
+  constructed at the limit instead of above it drives the implementation to
+  reject the last valid item.
+
+`finding_1787681637_408089`, low, process — A8g cited section 11.4 for an
+explanation that lives in section 11.0.
+
+**Correct.** Revision 3 wrote the explanation as section 11.0 and left the
+cross-reference pointing at 11.4, which does not exist. Fixed. The reviewer
+correctly classified this as process and said it does not need its own Plan loop.
+
+Acceptance now carries **twenty-two** deterministic rows. Nothing else changed.
