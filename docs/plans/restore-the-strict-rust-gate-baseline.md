@@ -3,19 +3,19 @@
 Ticket: `ticket_1787667162_566252` — "Hub: restore the strict Rust gate baseline"
 Run: `run_1787667183_365249`
 Pipeline: Botster Stack Delivery (`botster_stack_delivery`)
-Revision: 3. Revision 1 was returned by Plan Review `review_1787668688_184116`
+Revision: 4. Revision 1 was returned by Plan Review `review_1787668688_184116`
 (`changes_required`). Revision 2 was approved by Plan Review
-`review_1787669695_148343`. Implement resynced this artifact after change-admission
-rule 3 admitted one additional clippy repair. The "Implement resync" section records
-that admission.
+`review_1787669695_148343`. Revision 3 recorded the rule-3 `sessions.rs` admission.
+Review `review_1787672293_964824` returned Implement for a committed absolute target
+path. This revision replaces that path with path-neutral wording.
 
 ## Target repository and target_id
 
 - Target repository: `botster-hub` (`trybotster/botster-hub`)
 - `target_id`: `tgt_7e208a0c76a44980a83b63af976b1f22`
 - Repository path resolved from `list_spawn_targets`, not from the process working
-  directory: `/Users/jasonconigliari/Projects/botster-hub`.
-- Run worktree: `.../botster-sessions/trybotster-botster-hub-project-pipelines-ticket_1787667162_566252`
+  directory: the registered botster-hub target checkout.
+- Run worktree: the pipeline-provided ticket worktree
 - Branch: `project-pipelines/ticket_1787667162_566252`
 - Base commit: `55f620d`. Verified after `git fetch origin --prune`:
   `origin/main` and `55f620d` both resolve to `55f620dfd3f07cbdf889ba6abd3c3e75e1ef117e`.
@@ -477,6 +477,26 @@ admits the identical match-guard transformation. Hard invariants are unchanged: 
 runtime behavior, API, module, dependency, Core pin, protocol, DTO, or `#[allow]`
 change. Criterion 8 now names the admitted file set instead of a closed three-file
 list.
+
+## Implement resync (revision 3 → revision 4)
+
+Review `review_1787672293_964824` returned three findings. This revision records
+the repairs and does not change source behavior.
+
+1. The absolute personal target-checkout path is replaced with
+   `the registered botster-hub target checkout`. The run worktree line now says
+   `the pipeline-provided ticket worktree`.
+2. The new `Remove` test has a recorded red control. Implement inverted the
+   match-guard condition in the worktree only, proved a nonzero source diff,
+   ran the focused test to the expected failure, restored
+   `if id.0.is_empty()`, and reran the focused test green. The inversion is not
+   committed.
+3. After this artifact repair, Implement prebuilt
+   `botster-session-worker` and `botster-hub` under the worktree target
+   directory, then reran the official 1.97.0 wrapper. `cargo fmt --all -- --check`
+   exited `0`. `cargo clippy --workspace --all-targets --locked -- -D warnings`
+   exited `0`. `./test.sh --locked` exited `0`, including
+   `local_webrtc::tests::webrtc_status_and_entity_progress_under_event_flood`.
 
 ## Vault gaps worth capturing
 
