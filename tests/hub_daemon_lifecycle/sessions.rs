@@ -3122,10 +3122,10 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
                             }
                         }
                     }
-                    botster_hub_client::DaemonEntityFrame::Upsert { id, .. } => {
-                        if id.starts_with("focused-idle-session-") {
-                            seen.insert(id);
-                        }
+                    botster_hub_client::DaemonEntityFrame::Upsert { id, .. }
+                        if id.starts_with("focused-idle-session-") =>
+                    {
+                        seen.insert(id);
                     }
                     _ => {}
                 },
