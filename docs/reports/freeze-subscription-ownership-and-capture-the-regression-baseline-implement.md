@@ -17,7 +17,7 @@
 | Review-return Implement commit | `3f4e0e36f287312d8a111e34342c4a5ba8bd3461` |
 | Second Review-return Implement commit | `1e588c38ed8e870c1510e5abfeadf9c8bb0b8beb` |
 | Verify-return Implement commit | `d8aa2b96fb8fd1e056231b43c99d6d2d2c226219` |
-| Third Review-return Implement commit | pending until this commit |
+| Third Review-return Implement commit | `a9863ade179944dd3df0c8f26cb3e292b1e6e829` |
 | Base commit | `85a0434` (`origin/main`) |
 | Merge policy | direct (no PR required) |
 | Locked Core SHA | `7eafa470a18025895995bbedc20d34b58106a03b` |
