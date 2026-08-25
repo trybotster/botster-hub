@@ -5,6 +5,23 @@ Run: `run_1787654940_337274`
 Pipeline: Botster Stack Delivery (`botster_stack_delivery`)
 Plan base commit: `f66d459` (clean tracked worktree)
 
+## Plan Review response (review_1787656724_548895, changes_required)
+
+This revision answers all five findings. The findings carried no `details` or `suggested_fix`, so
+each was re-derived from the repository and the vault.
+
+| Finding | Severity | Resolution |
+|---------|----------|------------|
+| The live Hub proof does not prove post-handshake DataChannel arrival | high | Accepted. Added acceptance check **A4-live**: a live isolated Hub daemon, a channel created after the encrypted `Hello`, and the existing Hub-side observation oracle (`lost_claim`, `close_ok`, `label`) plus close marker. This proves DCEP reaches the production `LocalWebrtcHandler::on_data_channel` post-handshake, with no reservation or routing work. See *production_path_proof*. |
+| The late-message admission matrix omits ownership-creating request surfaces | high | Accepted. The matrix now covers `Hello`, `Attach`, `Detach`, `SubscribeEntities`, `UnsubscribeEntities`, `SubscribeEvents`, `UnsubscribeEvents`, `Spawn`/`ShutdownSession`, and `PeerClosed`, each with owner tag, rejection, and sweep, grounded in the `LocalWebrtcPeerState` owner set. |
+| The acceptance sequence omits required fresh-target prebuild gates | high | Accepted. Added the *Fresh-target prebuild preconditions* block: `cargo build --locked -p botster-core-daemon --bin botster-session-worker`, then `cargo build --locked --bin botster-hub`, then `./test.sh --locked`. A `Cargo.lock` change forces a fresh target, so this applies. |
+| The plan does not record required Botster architecture and runtime guidance | medium | Accepted. Loaded and recorded [[botster-architecture]], [[cli-patterns]], [[botster-runtime-reviewer-playbook]], and [[botster-runtime-verifier-playbook]], plus the atomic notes now cited in the matrix and acceptance checks. |
+| Plan completion evidence and the vault checklist are missing | medium | Partly a reporting defect on my side. The gate result `gate_result_1787655633_511297` did carry every required field, and checklist `checklist_1787655432_135912` exists — but the vault checklist was created with `scope: "ticket"` under a run `owner_id`, so it appears in neither `run_checklists` nor `ticket_checklists`, and the `step.completed` event recorded `evidence: {}`. This revision passes the same evidence to `request_step_advance` so it lands on the step record, and states the checklist id and its scope quirk explicitly. No second checklist was created. |
+
+One finding is worth flagging back rather than silently absorbing: chasing A4-live exposed a latent
+defect in an existing test. See the note under *production_path_proof* about the discarded open
+signal in `webrtc_terminal_adapter_second_data_channel_does_not_receive_terminal_frames`.
+
 ## Target repository and target_id
 
 - Target repository: `botster-hub` (`trybotster/botster-hub`)
@@ -23,6 +40,15 @@ Role playbooks:
 - [[planner-playbook]]
 - [[botster-planner-playbook]]
 
+Required Botster architecture and runtime guidance (added after Plan Review finding 4):
+
+- [[botster-architecture]] -- Botster domain map and source of architectural truth.
+- [[cli-patterns]] -- Rust CLI, TUI, PTY, and terminal-layer constraints.
+- [[botster-runtime-reviewer-playbook]] -- the review overlay this daemon and transport diff will be
+  checked against, loaded at Plan so the acceptance checks match what Review will demand.
+- [[botster-runtime-verifier-playbook]] -- the Verify overlay, loaded at Plan so the live-proof
+  obligations are designed in rather than retrofitted.
+
 Class overlay (runtime-teardown class applies):
 
 - [[botster runtime teardown lenses]]
@@ -40,6 +66,11 @@ Atomic notes:
 - [[WebRTC terminal admission requires an encrypted DataChannel Hello]]
 - [[terminal webrtc failure records do not prove peer runtime teardown]]
 - [[express scope limits as invariants not closed enumerations]]
+- [[webrtc peer cleanup removes every per peer owner together]]
+- [[Client event holders are connection-scoped]]
+- [[Hub suite runs prebuild the session worker before the locked test wrapper]]
+- [[a regression test must be shown to go red with the fix reverted]]
+- [[live hub proof records distinct hub and locked core binary provenance]]
 
 [[project-pipelines-playbook]] is not loaded. This ticket changes no Project Pipelines package
 or plugin path.
@@ -88,7 +119,12 @@ capability the ticket needs and the exact behavior the new regression test must 
 4. Add explicit fail-safe arms to every `match` that `0.21` makes non-exhaustive.
 5. Add one two-peer regression test that creates a reliable ordered DataChannel after both peers
    reach `Connected`, and proves the late channel opens remotely and delivers bytes.
-6. Record exact dependency versions and migration evidence in the implement report.
+6. Add one live Hub test that proves a post-handshake DataChannel reaches the production
+   `LocalWebrtcHandler::on_data_channel` and is rejected fail-closed, using the existing Hub-visible
+   observation oracle.
+7. Require the post-handshake open before the existing zero-terminal-frame isolation assertion,
+   which today can pass because the channel never opened.
+8. Record exact dependency versions and migration evidence in the implement report.
 
 ### Non-scope
 
@@ -186,7 +222,9 @@ wire behavior is unchanged.
 | `src/local_webrtc.rs` | `timeout` call sites gain the runtime argument; the `RTCPeerConnectionState` match at line 1109 gains a fail-safe arm; the new regression test is added to the existing in-file two-peer harness |
 | `src/local_webrtc_smoke.rs` | import list; one `block_on`, one `sleep`, and the `timeout` call sites |
 | `tests/hub_daemon_lifecycle/webrtc_fixtures.rs` | import list; two `block_on` sites and the `timeout` call sites |
-| `docs/reports/upgrade-webrtc-for-post-handshake-datachannel-creation-implement.md` | migration evidence and exact versions |
+| `tests/hub_daemon_lifecycle/subscription_ownership_baseline.rs` | the new live Hub post-handshake arrival test (A4-live), reusing `start_webrtc_adapter_hub_with_env` and the existing observation oracle |
+| `tests/hub_daemon_lifecycle/webrtc_terminal_adapter.rs` | require the post-handshake open before the zero-terminal-frame assertion (A7) |
+| `docs/reports/upgrade-webrtc-for-post-handshake-datachannel-creation-implement.md` | migration evidence, exact versions, and separate Hub / locked-Core provenance |
 
 No other file is expected to change. If `cargo check --workspace --all-targets` reports a break
 outside this set, Implement records it in the report rather than widening scope silently.
@@ -229,37 +267,66 @@ unchanged: the peer-close bound followed by cleanup regardless of the library cl
 [[WebRTC DataChannel local close uses the peer close bound before cleanup]] and
 [[Hub ultimate WebRTC close failure sacrifices every peer on the dedicated runtime]].
 
-`late_message_matrix`: This ticket creates no new ownership-creating message type. The one arrival
-class the upgrade newly makes reachable is a post-handshake DataChannel open.
+`late_message_matrix`: Every control-plane surface that creates durable per-peer ownership is
+listed, not only the DataChannel open. The per-peer owner set is explicit in
+`LocalWebrtcPeerState`: `attached_subscriptions`, `entity_subscription_ids`, the connection-scoped
+event-plane holders, the `WebRtcConnectionMux` routes, and the `data_channel_claimed` one-shot.
 
-| Message / event | Owner tag | Rejection after terminal failure | Residual sweep |
-|-----------------|-----------|----------------------------------|----------------|
-| `on_data_channel` (first channel) | `peer_state.claim_data_channel()` under `grant_id` | peer terminal cause published; poller exits | existing peer cleanup removes every per-peer owner |
-| `on_data_channel` (post-handshake / extra) — newly reachable | claim already taken, so `claimed == false` | `reject_extra_data_channel` closes it under the peer close bound and creates no route | no residual: no adapter is bound, no route inserted |
-| Encrypted `Hello` / `Request` on the claimed channel | `grant_id` + stream key | unchanged | unchanged |
-| `PeerClosed` | `grant_id` | unchanged | unchanged |
+| Surface | Owner tag | Rejection after terminal failure | Residual sweep |
+|---------|-----------|----------------------------------|----------------|
+| `on_data_channel` (first channel) | `data_channel_claimed` one-shot under `grant_id` | peer terminal cause published; poller exits | peer cleanup removes every per-peer owner together |
+| `on_data_channel` (post-handshake / extra) — newly reachable | claim already taken, so `claimed == false` | `reject_extra_data_channel` closes it under the peer close bound; no route, no adapter bound | none: nothing was inserted |
+| `Hello` (terminal admission) | `grant_id` + stream key + terminal compatibility | rejected once the peer terminal cause is published | admission never becomes a route |
+| `Attach` | `grant_id` + `(session_id, subscription_id, generation)` in `attached_subscriptions` | rejected after terminal failure; pre-READY failure creates no ownership | peer cleanup drains `attached_subscriptions` and releases route occupancy |
+| `Detach` | same attach identity | idempotent after terminal failure | route-aware and idempotent cleanup |
+| `SubscribeEntities` | `grant_id` + subscription id in `entity_subscription_ids` | rejected after terminal failure | peer cleanup clears `entity_subscription_ids` |
+| `UnsubscribeEntities` | same subscription id | idempotent | no residual |
+| `SubscribeEvents` / `UnsubscribeEvents` | connection-scoped event holder under the WebRTC grant owner | rejected after terminal failure | event-plane holders retire with the connection |
+| `Spawn` / `ShutdownSession` | session-owned, not peer-owned | unchanged | session lifecycle owns teardown |
+| `PeerClosed` | `grant_id` | terminal | sweeps the whole owner set in one cleanup, per [[webrtc peer cleanup removes every per peer owner together]] |
 
-No matrix row gains a new durable owner in this ticket. The reservation-tagged rows arrive with
-`ticket_1787600674_500120`.
+Invariant this ticket must preserve: **no row in this table changes.** The upgrade adds no owner
+tag, no rejection rule, and no sweep. The only row whose *arrival timing* changes is the
+post-handshake `on_data_channel` row, and it stays fail-closed. The reservation-tagged rows arrive
+with `ticket_1787600674_500120`.
 
 `production_path_proof`: The production path is
-`browser creates DataChannel after Connected → driver flushes DCEP OPEN (the 0.21 wake_writes fix)
-→ LocalWebrtcHandler::on_data_channel → claim_data_channel() returns false → reject_extra_data_channel
-→ bounded local_close → peer keeps serving its first channel`.
+`browser creates a DataChannel after Connected -> the driver flushes DCEP OPEN (the 0.21
+wake_writes fix) -> LocalWebrtcHandler::on_data_channel -> claim_data_channel() returns false ->
+reject_extra_data_channel -> bounded local_close -> the peer keeps serving its first channel`.
 
-This ticket is **intentionally a dependency-capability upgrade with a preserved fail-closed
-production path**. The Hub production answerer accepts exactly one DataChannel today and this
-ticket does not change that. Two proofs follow from that, and Implement must produce both:
+This path is provable live today, through the real Hub daemon, without any reservation or routing
+work. Two pieces already exist in the repository and this plan composes them:
 
-1. *Positive capability proof, library level*: a two-peer regression test with two test-owned
-   peers, proving a channel created after both peers reach `Connected` opens on the remote side and
-   delivers bytes. This is the honest oracle for what the upgrade actually buys.
-2. *Preserved fail-closed proof, production level*: the existing rejection tests still pass through
-   `LocalWebrtcHandler::on_data_channel`, including the surviving-channel positive control required
-   by [[rejected channel isolation needs a surviving channel positive control]].
+1. `webrtc_fixtures.rs::create_extra_data_channel` creates a DataChannel on an already-connected
+   peer. `webrtc_terminal_adapter.rs` already calls it against a live isolated Hub.
+2. `local_webrtc.rs::observe_rejected_data_channel_for_test` writes a Hub-side observation file
+   (`lost_claim`, `close_ok`, `label`) plus a close marker from the **production**
+   `on_data_channel` -> `reject_extra_data_channel` path, gated on `BOTSTER_ENV=test` and the
+   `BOTSTER_HUB_TEST_EXTRA_CHANNEL_OBSERVATION` / `..._CLOSE_MARKER` environment values, which
+   `start_webrtc_adapter_hub_with_env` sets on the Hub child. The existing
+   `webrtc_peer_rejects_a_second_data_channel` test proves this oracle works — but it creates both
+   channels in the initial offer, so it proves only the **pre-handshake** case.
 
-The positive production path — a browser-created subscription channel that Hub *admits* — is the
-deliverable of `ticket_1787600674_500120`, and this plan names it rather than claiming it.
+Acceptance check A4-live below closes the gap: the same Hub-visible oracle, driven by a channel
+created **after** the handshake. The observation file can only appear if the DCEP OPEN actually
+reached the production Hub handler post-handshake, which is precisely the behavior `wake_writes()`
+enables. That is a live Hub production-path proof, not a terminal record and not a helper call, as
+[[terminal webrtc failure records do not prove peer runtime teardown]] requires.
+
+A latent defect this exposes, recorded because the upgrade causes it: today
+`webrtc_terminal_adapter_second_data_channel_does_not_receive_terminal_frames` discards the open
+signal (`let _ = timeout(5s, extra_channel.open_rx.recv())`) and then asserts the extra channel
+received zero terminal frames. On `0.20` a channel that never opens satisfies that negative
+assertion for the wrong reason. Once the channel really opens, the assertion becomes meaningful for
+the first time, so acceptance check A7 requires the open before counting zero frames. This is
+cleanup made necessary by this change, not adjacent cleanup, and it is exactly the surviving-channel
+positive control [[rejected channel isolation needs a surviving channel positive control]] demands.
+
+Scope boundary that still holds: Hub continues to **reject** the post-handshake channel. Positive
+live proof of an *admitted* browser-created subscription channel remains the deliverable of
+`ticket_1787600674_500120`. This plan proves arrival and fail-closed handling, and names the
+admission proof rather than claiming it.
 
 `ownership_identity`: Unchanged. `grant_id` plus the peer state remains the owner identity for
 every per-peer row. No reused-id policy changes, because this ticket inserts no row.
@@ -314,7 +381,15 @@ Unknowns for Implement to resolve, each with a named resolution:
   assert on delivered bytes rather than on elapsed time.
 - R5. **Silent scope creep into channel routing.** Mitigation: the non-scope list above, and the
   invariant that the single-claim rejection policy is unchanged in this ticket.
-- R6. **Behavior change from `async_channel`-backed primitives.** `0.21` channels are MPMC
+- R6. **A4-live could pass on 0.20 and falsify assumption A2.** If the Hub's own control traffic
+  already wakes the driver, the post-handshake DCEP may flush on `0.20` too. Mitigation: A5 runs the
+  ablation explicitly and Implement reports a green-on-0.20 result rather than suppressing it. The
+  plan's value does not collapse if this happens — the migration is still required — but the
+  ticket's stated rationale would need correcting.
+- R7. **Fresh-target suite failures mistaken for regressions.** The `Cargo.lock` change forces a
+  fresh target, where missing-worker failures look like real breakage. Mitigation: the two prebuild
+  commands are a stated precondition, not an optimization.
+- R8. **Behavior change from `async_channel`-backed primitives.** `0.21` channels are MPMC
   (`async_channel`) where `0.20` used tokio mpsc. Hub uses single-consumer patterns throughout, so
   semantics hold; Implement confirms no site clones a `Receiver`.
 
@@ -322,33 +397,73 @@ Unknowns for Implement to resolve, each with a named resolution:
 
 Recorded against a stable commit with a clean tracked worktree.
 
-- A1. `cargo check --workspace --all-targets` passes with zero warnings introduced by this change.
-- A2. `./test.sh` (the repository wrapper, `BOTSTER_ENV=test cargo test --workspace`) passes.
-- A3. Focused WebRTC lifecycle tests pass:
-  `./test.sh --test hub_daemon_lifecycle_test` and the `local_webrtc` module tests, including
-  `local_webrtc_close_hang_fail_closed_returns_handler_within_deadline`.
-- A4. **New two-peer regression test.** Both peers reach `RTCPeerConnectionState::Connected`. Only
-  then does one peer call `create_data_channel` with `ordered: true`, `max_retransmits: None`, and
-  `max_packet_life_time: None`. The test asserts, in order:
+### Fresh-target prebuild preconditions (required before the wrapper)
+
+Per [[Hub suite runs prebuild the session worker before the locked test wrapper]] and the charter
+rule "Before `./test.sh --locked` on a fresh target, build `botster-session-worker` and then build
+`botster-hub` with locked commands", this run changes `Cargo.lock` and therefore forces a fresh
+target. Lazy worker discovery is not sufficient; the prebuild is a suite precondition, not an
+optimization. Run in this order:
+
+```bash
+cargo build --locked -p botster-core-daemon --bin botster-session-worker
+cargo build --locked --bin botster-hub
+./test.sh --locked
+```
+
+Per [[live hub proof records distinct hub and locked core binary provenance]], the implement report
+records the Hub commit and the lockfile-pinned Core revision separately, and resolves fresh-target
+realpaths for both binaries.
+
+### Checks
+
+- A1. `cargo check --workspace --all-targets` passes with no warnings introduced by this change.
+- A2. `./test.sh --locked` passes, after the two prebuild commands above.
+- A3. Focused WebRTC lifecycle tests pass, including
+  `local_webrtc_close_hang_fail_closed_returns_handler_within_deadline` and the existing
+  `webrtc_peer_rejects_a_second_data_channel` pre-handshake rejection proof with its
+  `..._requires_one_shot_claim` negative control.
+- A4. **Two-peer library regression test.** Both peers reach `RTCPeerConnectionState::Connected`.
+  Only then does one peer call `create_data_channel` with `ordered: true`, `max_retransmits: None`,
+  and `max_packet_life_time: None`. The test asserts, in order:
   1. the remote peer receives `on_data_channel` for that label;
   2. the creating side observes `DataChannelEvent::OnOpen` on the late channel;
   3. a payload sent on the late channel arrives byte-identical on the remote side.
-  Assertion 3 is the load-bearing one: an open event alone does not prove delivery.
-- A5. **Red-on-revert ablation.** With `webrtc` pinned back to `0.20.0-beta.2`, the A4 test must
-  fail (the late channel does not open within the bound). Implement records the ablation output in
-  the report. This is the control that proves the test measures the upgrade and not the harness.
-- A6. **Detach-on-drop assertion.** A test proves a task spawned through `Runtime::spawn` whose
-  `Box<dyn JoinHandle>` is dropped still runs to completion. This closes the teardown risk that a
-  silently cancelled poller would create.
-- A7. **Preserved fail-closed production proof.** The existing extra-DataChannel rejection tests
-  pass unchanged through `LocalWebrtcHandler::on_data_channel`, and the surviving-channel positive
-  control still observes expected payload traffic on the surviving channel before asserting zero
-  frames on the rejected channel.
-- A8. **Preserved lifecycle proof.** Pre-handshake channel creation, signaling, ICE gathering,
-  AES-GCM encryption, chunking, close bounds, reconnect, and peer lifecycle tests all pass with no
-  test weakened, no assertion deleted, and no bound widened in production code.
-- A9. **Exact version evidence.** The implement report records the resolved `webrtc`, `rtc`, and
-  `rtc-*` versions from `Cargo.lock`, the base commit, and the `Cargo.lock` diff summary.
+  Assertion 3 is load-bearing: an open event alone does not prove delivery.
+- A4-live. **Live Hub post-handshake arrival proof.** Through a real isolated Hub daemon started by
+  `start_webrtc_adapter_hub_with_env` with `BOTSTER_HUB_TEST_EXTRA_CHANNEL_OBSERVATION` and
+  `BOTSTER_HUB_TEST_EXTRA_CHANNEL_CLOSE_MARKER`: connect, complete the encrypted `Hello` so the
+  one-shot claim is taken, and only then call `create_extra_data_channel()`. Require all of:
+  1. the offerer observes `OnOpen` on the post-handshake channel (the open result must be asserted,
+     not discarded);
+  2. the Hub writes the observation file with `lost_claim == true`, `close_ok == true`, and
+     `label == "botster-extra"`, proving the DCEP OPEN reached the **production**
+     `LocalWebrtcHandler::on_data_channel` after the handshake;
+  3. the close marker exists, proving the bounded `local_close` completed.
+  This is the live Hub production-path proof. It uses the existing Hub-visible oracle rather than a
+  helper call, and it requires no reservation or routing work.
+- A5. **Red-on-revert ablation**, per [[a regression test must be shown to go red with the fix
+  reverted]]. With `webrtc` pinned back to `0.20.0-beta.2`, both A4 and A4-live must fail: no
+  `OnOpen` on the late channel and no observation file. Implement records both ablation outputs.
+  A green A4-live on `0.20` would falsify assumption A2 and must be reported, not explained away.
+- A6. **Detach-on-drop assertion.** A task spawned through `Runtime::spawn` whose
+  `Box<dyn JoinHandle>` is dropped still runs to completion, closing the risk that a silently
+  cancelled poller changes teardown behavior.
+- A7. **Surviving-channel positive control, now meaningful.** In
+  `webrtc_terminal_adapter_second_data_channel_does_not_receive_terminal_frames`, require the
+  post-handshake channel to open before asserting it received zero terminal frames, and keep the
+  existing proof that the surviving admitted channel does receive `DaemonTerminalFrame` chunks in
+  the same window. Today the open result is discarded, so on `0.20` the zero-frame assertion can
+  pass because the channel never opened. This ordering is required by
+  [[rejected channel isolation needs a surviving channel positive control]].
+- A8. **Preserved lifecycle proof.** Pre-handshake channel creation, signaling, ICE, AES-GCM
+  encryption, chunking, close bounds, reconnect, and peer lifecycle tests all pass with no test
+  weakened, no assertion deleted, and no production bound widened.
+- A9. **Preserved teardown proof.** The ultimate-close sibling-sacrifice suite and the full per-peer
+  cleanup suite stay green, covering every owner in the `late_message_matrix` table.
+- A10. **Exact version evidence.** The implement report records the resolved `webrtc`, `rtc`, and
+  `rtc-*` versions from `Cargo.lock`, the base commit, the separate Hub and locked-Core provenance,
+  and the `Cargo.lock` diff summary.
 
 ### Downstream proof
 
