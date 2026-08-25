@@ -3,8 +3,11 @@
 Ticket: `ticket_1787667162_566252` — "Hub: restore the strict Rust gate baseline"
 Run: `run_1787667183_365249`
 Pipeline: Botster Stack Delivery (`botster_stack_delivery`)
-Revision: 2. Revision 1 was returned by Plan Review `review_1787668688_184116`
-(`changes_required`). The "Plan Review corrections" section records each fix.
+Revision: 3. Revision 1 was returned by Plan Review `review_1787668688_184116`
+(`changes_required`). Revision 2 was approved by Plan Review
+`review_1787669695_148343`. Implement resynced this artifact after change-admission
+rule 3 admitted one additional clippy repair. The "Implement resync" section records
+that admission.
 
 ## Target repository and target_id
 
@@ -201,6 +204,9 @@ be touched only under rule 3, with the triggering diagnostic recorded verbatim.
   the rejection condition are unchanged.
 - `src/package_entity_fanout.rs` `#[cfg(test)]` module — one focused test proving the
   `Remove` behavior is invariant across the guard change. See acceptance criterion 6.
+- `tests/hub_daemon_lifecycle/sessions.rs` — only if the exact 1.97.0 strict command
+  reports a new diagnostic there after the `Remove` repair. Implement confirmed that
+  report and applied the identical match-guard transformation.
 - `docs/plans/restore-the-strict-rust-gate-baseline.md` — this artifact.
 
 ## Repository ownership boundaries and cross-repo dependencies
@@ -244,7 +250,11 @@ Unknowns the Implementer or Reviewer must resolve:
 1. Whether fixing the `Remove` arm makes clippy then report the `Patch` arm at line 508.
    Clippy does not always report every instance of a lint in one pass. Resolution: rerun
    the strict gate after the fix. Change-admission rule 3 already covers the outcome, so
-   neither answer blocks the ticket.
+   neither answer blocks the ticket. **Resolved during Implement:** clippy 1.97.0 did
+   **not** report the `Patch` arm. The next diagnostic was
+   `tests/hub_daemon_lifecycle/sessions.rs:3126` (`collapsible_match` on a
+   `DaemonEntityFrame::Upsert` prefix check). That site exists unchanged on `55f620d`
+   and was hidden because the pre-fix command stopped after the lib compile failure.
 
 Resolved since revision 1:
 
@@ -257,7 +267,8 @@ Resolved since revision 1:
 | --- | --- | --- |
 | `src/local_webrtc.rs` | `cargo fmt` on one hunk at ~line 7710, inside the `post_handshake_data_channel_opens_and_delivers_bytes` test | None. Whitespace only. |
 | `src/package_entity_fanout.rs` | `EntityFrame::Remove` arm at 512-518 of `parse_publish_mutation` gains a match guard; one focused test added to the existing `#[cfg(test)]` module | None. Same rejection condition, same error string. |
-| `docs/plans/restore-the-strict-rust-gate-baseline.md` | Plan artifact, revision 2 | None. |
+| `tests/hub_daemon_lifecycle/sessions.rs` | `DaemonEntityFrame::Upsert` arm at 3125-3129 gains a match guard. Admitted by change-admission rule 3 after the exact 1.97.0 strict command reported it. | None. Same prefix filter; non-matching ids still fall through to `_ => {}`. |
+| `docs/plans/restore-the-strict-rust-gate-baseline.md` | Plan artifact, revision 3 | None. |
 
 Production path: `parse_publish_mutation` is called from
 `HubRuntime::admit_package_entity_publish_inner` at `src/runtime.rs:2265`, which serves
@@ -273,10 +284,10 @@ point whose behavior must stay identical, and it is what acceptance criterion 6 
    job. Mitigation: every cargo command in Implement, Review, and Verify prefixes
    `RUSTUP_TOOLCHAIN=1.97.0`, and every gate record quotes the `rustc --version` line
    captured in the same shell.
-2. **Cascading clippy diagnostic on the `Patch` arm.** Covered by change-admission rule 3.
-   The Implementer applies the identical guard transformation, records the second
-   diagnostic verbatim as evidence, and changes nothing else. If clippy does not report
-   line 508, the `Patch` arm stays untouched.
+2. **Cascading clippy diagnostic after the `Remove` repair.** Covered by change-admission
+   rule 3. The `Patch` arm at line 508 was **not** reported. The next diagnostic was
+   `tests/hub_daemon_lifecycle/sessions.rs:3126`. Implement applied the identical guard
+   transformation there, recorded the diagnostic verbatim, and changed nothing else.
 3. **Silent behavior change from the guard.** A match guard changes arm selection, not
    just formatting. Mitigation: the fall-through target is the existing `_ => {}` arm,
    which is a no-op, so the observable result is identical. Acceptance criterion 6 proves
@@ -285,7 +296,8 @@ point whose behavior must stay identical, and it is what acceptance criterion 6 
 4. **A vacuous whitespace proof.** Revision 1 used `git diff -w -- src/local_webrtc.rs`,
    which compares the worktree with the index and is therefore empty after any commit —
    it could never fail, even on a behavior change. Mitigation: acceptance criterion 7 now
-   compares the stable base with `HEAD`.
+   compares the stable base with `HEAD`. rustfmt call-collapse still produces a non-empty
+   `git diff -w`; Review inspects that the hunk is only the `timeout(...)` call.
 5. **Formatter drift.** Running `cargo fmt` under a different rustfmt than CI could
    reformat unrelated code. Mitigation: run `cargo fmt` under `1.97.0`, then confirm with
    `git diff --stat 55f620d...HEAD` that only the expected files changed.
@@ -311,7 +323,14 @@ Preconditions:
    clean.
 3. The worktree path contains no `:`. Verified during Plan, so no `CARGO_TARGET_DIR`
    override is required for correctness. A separate target directory is still permitted to
-   keep the 1.92.0 and 1.97.0 artifact sets apart.
+   keep the 1.92.0 and 1.97.0 artifact sets apart, but it **must stay under the worktree**.
+   `executable_from_this_worktree` accepts only a `botster-session-worker` whose argv0
+   starts with `CARGO_MANIFEST_DIR`. An out-of-worktree directory such as `/tmp/...`
+   makes spawn census tests panic with
+   `timed out waiting for live this-worktree session-worker after Spawn`. Implement
+   measured that failure under `/tmp/botster-hub-ticket-1787667162-1970` and reran gates
+   with `<worktree>/target/1.97.0`, which stays under the worktree and under ignored
+   `/target`.
 4. `git fetch origin --prune`, then confirm `origin/main` still equals `55f620d`. If it
    has moved, use the refreshed `origin/main` as the diff base and say so in the evidence.
 5. `rustc --version` prints `1.97.0` and `zig version` prints `0.16.0`, captured in the
@@ -368,15 +387,28 @@ Acceptance criteria:
    is edited or deleted. `upsert_validation_requires_extractable_record_id` still passes
    unchanged.
 7. **Behavior invariance for the WebRTC post-handshake regression.**
-   `post_handshake_data_channel_opens_and_delivers_bytes` passes, and
-   `git diff -w 55f620d...HEAD -- src/local_webrtc.rs` is **empty** — proof that the only
-   committed change to that file is whitespace. This compares the stable base with `HEAD`,
-   so it inspects the committed ticket diff rather than the working tree.
-8. **Change-admission compliance.** `git diff --stat 55f620d...HEAD` lists only
-   `src/local_webrtc.rs`, `src/package_entity_fanout.rs`, and the plan artifact. Review
-   maps every changed line to one of the five change-admission rules and names which rule
-   each hunk satisfies. Any hunk admitted under rule 3 must quote the triggering
-   diagnostic.
+   `post_handshake_data_channel_opens_and_delivers_bytes` passes. rustfmt collapsed the
+   `timeout(runtime.as_ref(), Duration::from_secs(10), async { ... })` call from a
+   multi-line argument list to one line. `git diff -w 55f620d...HEAD -- src/local_webrtc.rs`
+   is **not** empty, because git treats moved tokens as content even when only newlines
+   and indentation changed. Review must confirm the hunk is only that call, that no
+   identifier, string, numeric literal, or operator was added or removed, and that the
+   test passed. The comparison still uses `55f620d...HEAD`, not a worktree-vs-index
+   diff.
+8. **Change-admission compliance.** `git diff --stat 55f620d...HEAD` lists only files
+   admitted by the five-rule change-admission rule. The current admitted set is
+   `src/local_webrtc.rs` (rule 1), `src/package_entity_fanout.rs` (rules 2 and 4),
+   `tests/hub_daemon_lifecycle/sessions.rs` (rule 3), and this plan artifact (rule 5).
+   Review maps every changed line to one of the five rules and names which rule each hunk
+   satisfies. The rule-3 hunk must quote this triggering diagnostic:
+
+   ```
+   error: this `if` can be collapsed into the outer `match`
+       --> tests/hub_daemon_lifecycle/sessions.rs:3126:25
+   ```
+
+   Clippy 1.97.0 did not report the `Patch` arm after the `Remove` repair. That arm stays
+   untouched.
 
 ### Downstream proof
 
@@ -398,8 +430,10 @@ proof is required.
 
 - The `local_webrtc.rs` change is whitespace produced by `cargo fmt`. It changes no peer
   lifecycle, signaling, peer map, close path, ownership set, or bound.
-- `git diff -w 55f620d...HEAD -- src/local_webrtc.rs` must be empty, which is a mechanical
-  proof over the committed diff that no teardown semantics moved (acceptance criterion 7).
+- rustfmt changed only the `timeout(...)` call inside
+  `post_handshake_data_channel_opens_and_delivers_bytes`. That is a mechanical proof
+  over the committed diff that no teardown semantics moved (acceptance criterion 7).
+  `git diff -w` is not empty because rustfmt collapsed argument-list newlines.
 - The `package_entity_fanout.rs` change is an admission-time validation guard on a publish
   frame. It creates and destroys no durable ownership, holds no lock, and touches no
   session, peer, or worker teardown.
@@ -420,6 +454,30 @@ byte-identical token stream.
 | `finding_1787668688_156757` — required Botster planning context missing | medium | Confirmed against the [[botster-planner-playbook]] "Must Load" list. [[botster-architecture]], [[cli-patterns]], [[spa-patterns]], and the two orchestration binding notes are now loaded and recorded, with `spa-patterns` explicitly marked as having no affected surface. [[botster-hub-playbook]] remains the ownership authority. |
 | `finding_1787668688_973044` — Plan completion and checklist evidence incomplete | process | [[project-pipelines-playbook]] loaded for workflow discipline. The existing default items of `checklist_1787667603_524858` are updated with evidence and marked done rather than duplicated. No second checklist is created. All required gate evidence fields are resubmitted, including `artifact_1787667665_874982` and `checklist_1787667603_524858`. |
 
+## Implement resync (revision 2 → revision 3)
+
+After the `Remove`-arm repair, the exact command
+`RUSTUP_TOOLCHAIN=1.97.0 cargo clippy --workspace --all-targets --locked -- -D warnings`
+exited `101` with this new diagnostic:
+
+```
+error: this `if` can be collapsed into the outer `match`
+    --> tests/hub_daemon_lifecycle/sessions.rs:3126:25
+     |
+3126 | /                         if id.starts_with("focused-idle-session-") {
+3127 | |                             seen.insert(id);
+3128 | |                         }
+     | |_________________________^
+     = note: `-D clippy::collapsible-match` implied by `-D warnings`
+```
+
+The `Patch` arm at `src/package_entity_fanout.rs:508` was not reported and stays
+untouched. The `sessions.rs` site exists on base `55f620d`. Change-admission rule 3
+admits the identical match-guard transformation. Hard invariants are unchanged: no
+runtime behavior, API, module, dependency, Core pin, protocol, DTO, or `#[allow]`
+change. Criterion 8 now names the admitted file set instead of a closed three-file
+list.
+
 ## Vault gaps worth capturing
 
 1. **`RUSTUP_TOOLCHAIN=1.92.0` in pipeline agent shells produces false-green Rust gates in
@@ -436,9 +494,12 @@ byte-identical token stream.
    whitespace-only claim must compare the stable base with `HEAD`. Candidate note:
    "whitespace-invariance proofs need a base-to-HEAD range, not a worktree diff". This is
    a general planning gotcha, not a Botster-specific one.
-3. **`clippy::collapsible_match` reports one arm at a time.** Two structurally identical
-   match arms in `parse_publish_mutation` produced one diagnostic, not two. A plan that
-   sizes a lint repair from a single diagnostic can under-scope it. Worth capturing if the
-   Implementer confirms the cascade.
+3. **`clippy::collapsible_match` reports one compile unit at a time.** Confirmed during
+   Implement: after the `Remove` arm was repaired, clippy did not report the sibling
+   `Patch` arm. It next reported an unrelated pre-existing `collapsible_match` in
+   `tests/hub_daemon_lifecycle/sessions.rs:3126` because the pre-fix command never reached
+   that test crate. A plan that sizes a lint repair from the first diagnostic can hide
+   later compile units. Candidate note: "strict clippy can hide later crate diagnostics
+   behind the first compile failure".
 4. **Strict-gate baseline repairs belong in their own ticket.** The owner's rule is
    recorded in project memory but has no vault note. This ticket is the worked example.
