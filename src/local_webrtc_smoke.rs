@@ -21,9 +21,20 @@ use webrtc::peer_connection::{
     RTCPeerConnectionState, RTCSessionDescription,
 };
 use webrtc::runtime::{
-    Receiver as AsyncReceiver, Sender as AsyncSender, block_on, channel, default_runtime, sleep,
-    timeout,
+    Receiver as AsyncReceiver, Runtime, Sender as AsyncSender, channel, default_runtime, timeout,
 };
+
+fn webrtc_runtime() -> std::sync::Arc<dyn Runtime> {
+    default_runtime().expect("webrtc default runtime")
+}
+
+fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime for local WebRTC smoke")
+        .block_on(fut)
+}
 
 use super::SmokeError;
 
@@ -116,7 +127,7 @@ pub(crate) fn smoke_local_webrtc_round_trip(
             {
                 break;
             }
-            sleep(Duration::from_millis(30)).await;
+            webrtc_runtime().sleep(Duration::from_millis(30)).await;
         }
         let _ = offer_peer
             .encrypted_request(
@@ -264,7 +275,12 @@ impl LocalWebrtcOfferPeer {
         peer.set_local_description(offer)
             .await
             .map_err(|error| SmokeError::Webrtc(error.to_string()))?;
-        let _ = timeout(Duration::from_secs(5), gather_complete_rx.recv()).await;
+        let _ = timeout(
+            runtime.as_ref(),
+            Duration::from_secs(5),
+            gather_complete_rx.recv(),
+        )
+        .await;
         let offer = peer
             .local_description()
             .await
@@ -291,16 +307,20 @@ impl LocalWebrtcOfferPeer {
             .set_remote_description(answer)
             .await
             .map_err(|error| SmokeError::Webrtc(error.to_string()))?;
-        timeout(Duration::from_secs(15), self.connected_rx.recv())
-            .await
-            .map_err(|_| {
-                SmokeError::Webrtc("timed out waiting for WebRTC connection".to_string())
-            })?;
-        timeout(Duration::from_secs(10), self.data_channel_open_rx.recv())
-            .await
-            .map_err(|_| {
-                SmokeError::Webrtc("timed out waiting for data channel open".to_string())
-            })?;
+        timeout(
+            webrtc_runtime().as_ref(),
+            Duration::from_secs(15),
+            self.connected_rx.recv(),
+        )
+        .await
+        .map_err(|_| SmokeError::Webrtc("timed out waiting for WebRTC connection".to_string()))?;
+        timeout(
+            webrtc_runtime().as_ref(),
+            Duration::from_secs(10),
+            self.data_channel_open_rx.recv(),
+        )
+        .await
+        .map_err(|_| SmokeError::Webrtc("timed out waiting for data channel open".to_string()))?;
         Ok(())
     }
 
@@ -322,10 +342,14 @@ impl LocalWebrtcOfferPeer {
             .map_err(|error| SmokeError::Webrtc(error.to_string()))?;
         let mut encrypted = String::new();
         loop {
-            let response = timeout(Duration::from_secs(10), self.data_channel_message_rx.recv())
-                .await
-                .map_err(|_| SmokeError::Webrtc("hello ack timeout".to_string()))?
-                .ok_or_else(|| SmokeError::Webrtc("channel closed during hello".to_string()))?;
+            let response = timeout(
+                webrtc_runtime().as_ref(),
+                Duration::from_secs(10),
+                self.data_channel_message_rx.recv(),
+            )
+            .await
+            .map_err(|_| SmokeError::Webrtc("hello ack timeout".to_string()))?
+            .ok_or_else(|| SmokeError::Webrtc("channel closed during hello".to_string()))?;
             let chunk = serde_json::from_str::<DaemonLocalWebrtcDeliveryChunk>(&response)
                 .map_err(|error| SmokeError::Webrtc(error.to_string()))?;
             if chunk.delivery_kind != DaemonLocalWebrtcDeliveryKind::DaemonResponse {
@@ -365,26 +389,30 @@ impl LocalWebrtcOfferPeer {
         let mut chunk_count = None;
         let mut next_chunk_index = 0;
         loop {
-            let response = timeout(Duration::from_secs(10), self.data_channel_message_rx.recv())
-                .await
-                .map_err(|_| {
-                    SmokeError::Webrtc(local_webrtc_response_progress_error(
-                        operation,
-                        "response_timeout",
-                        message_id.as_deref(),
-                        next_chunk_index,
-                        chunk_count,
-                    ))
-                })?
-                .ok_or_else(|| {
-                    SmokeError::Webrtc(local_webrtc_response_progress_error(
-                        operation,
-                        "channel_closed",
-                        message_id.as_deref(),
-                        next_chunk_index,
-                        chunk_count,
-                    ))
-                })?;
+            let response = timeout(
+                webrtc_runtime().as_ref(),
+                Duration::from_secs(10),
+                self.data_channel_message_rx.recv(),
+            )
+            .await
+            .map_err(|_| {
+                SmokeError::Webrtc(local_webrtc_response_progress_error(
+                    operation,
+                    "response_timeout",
+                    message_id.as_deref(),
+                    next_chunk_index,
+                    chunk_count,
+                ))
+            })?
+            .ok_or_else(|| {
+                SmokeError::Webrtc(local_webrtc_response_progress_error(
+                    operation,
+                    "channel_closed",
+                    message_id.as_deref(),
+                    next_chunk_index,
+                    chunk_count,
+                ))
+            })?;
             if response.len() >= LOCAL_WEBRTC_MAX_FRAME_BYTES {
                 return Err(SmokeError::Webrtc(
                     "local WebRTC response chunk exceeded frame bound".to_string(),

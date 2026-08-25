@@ -32,6 +32,10 @@ use webrtc::peer_connection::{
 };
 use webrtc::runtime::{Runtime, Sender as AsyncSender, channel, default_runtime, timeout};
 
+fn webrtc_runtime() -> Arc<dyn Runtime> {
+    default_runtime().expect("webrtc default runtime")
+}
+
 use botster_terminal_protocol::{
     TerminalCompatibility, ensure_compatible as ensure_terminal_compatible,
 };
@@ -1114,6 +1118,7 @@ fn local_webrtc_peer_connection_state(state: RTCPeerConnectionState) -> &'static
         RTCPeerConnectionState::Disconnected => "disconnected",
         RTCPeerConnectionState::Failed => "failed",
         RTCPeerConnectionState::Closed => "closed",
+        _ => "unknown",
     }
 }
 
@@ -1783,7 +1788,13 @@ where
         }
         peer_state.record_response_progress(chunk_index + 1, flow_control.pressured);
 
-        match timeout(LOCAL_WEBRTC_EVENT_PROBE, data_channel.local_poll()).await {
+        match timeout(
+            webrtc_runtime().as_ref(),
+            LOCAL_WEBRTC_EVENT_PROBE,
+            data_channel.local_poll(),
+        )
+        .await
+        {
             Ok(Some(event)) => {
                 apply_data_channel_event(
                     event,
@@ -1890,7 +1901,7 @@ async fn answer_offer(
 
     let peer_connection = PeerConnectionBuilder::new()
         .with_handler(handler.clone())
-        .with_runtime(runtime)
+        .with_runtime(runtime.clone())
         .with_udp_addrs(vec!["127.0.0.1:0"])
         .build()
         .await
@@ -1908,7 +1919,12 @@ async fn answer_offer(
     peer.set_local_description(answer)
         .await
         .map_err(|error| LocalWebrtcError::Webrtc(error.to_string()))?;
-    let _ = timeout(Duration::from_secs(5), gather_complete_rx.recv()).await;
+    let _ = timeout(
+        runtime.as_ref(),
+        Duration::from_secs(5),
+        gather_complete_rx.recv(),
+    )
+    .await;
     let answer = peer
         .local_description()
         .await
@@ -2764,16 +2780,24 @@ mod tests {
             tokio::pin!(delivery);
             if let Some(cause) = terminal_cause {
                 assert!(
-                    timeout(Duration::from_millis(20), delivery.as_mut())
-                        .await
-                        .is_err(),
+                    timeout(
+                        webrtc_runtime().as_ref(),
+                        Duration::from_millis(20),
+                        delivery.as_mut(),
+                    )
+                    .await
+                    .is_err(),
                     "scheduler time alone must not close a live pressured peer"
                 );
                 peer_state.publish_peer_terminal(cause);
             }
-            timeout(Duration::from_millis(250), delivery.as_mut())
-                .await
-                .expect("outer data-channel loop must finish on low water, close, or peer terminal")
+            timeout(
+                webrtc_runtime().as_ref(),
+                Duration::from_millis(250),
+                delivery.as_mut(),
+            )
+            .await
+            .expect("outer data-channel loop must finish on low water, close, or peer terminal")
         });
         responder.join().unwrap();
         (data_channel, failure)
@@ -3444,16 +3468,24 @@ mod tests {
             );
             tokio::pin!(delivery);
             assert!(
-                timeout(Duration::from_millis(20), delivery.as_mut())
-                    .await
-                    .is_err(),
+                timeout(
+                    webrtc_runtime().as_ref(),
+                    Duration::from_millis(20),
+                    delivery.as_mut(),
+                )
+                .await
+                .is_err(),
                 "elapsed scheduler time must not close a live pressured peer"
             );
             peer_state.publish_peer_terminal(cause);
-            timeout(Duration::from_millis(250), delivery.as_mut())
-                .await
-                .expect("peer terminal state must wake active pressure")
-                .expect_err("peer terminal state must fail pending delivery")
+            timeout(
+                webrtc_runtime().as_ref(),
+                Duration::from_millis(250),
+                delivery.as_mut(),
+            )
+            .await
+            .expect("peer terminal state must wake active pressure")
+            .expect_err("peer terminal state must fail pending delivery")
         });
         assert_eq!(failure.cause, cause);
         assert_eq!(failure.next_chunk_index, 1);
@@ -3539,9 +3571,13 @@ mod tests {
             );
             tokio::pin!(delivery);
             assert!(
-                timeout(Duration::from_millis(20), delivery.as_mut())
-                    .await
-                    .is_err()
+                timeout(
+                    webrtc_runtime().as_ref(),
+                    Duration::from_millis(20),
+                    delivery.as_mut(),
+                )
+                .await
+                .is_err()
             );
             peer_state.publish_peer_terminal(LocalWebrtcTerminalCause::PeerDisconnected);
             delivery
@@ -4313,7 +4349,7 @@ mod tests {
     };
 
     use crate::daemon_transport::{
-        DaemonControlState, EntityFrameSender, handle_control_message,
+        DaemonControlState, EntityFrameSender, WebrtcTerminalAdmission, handle_control_message,
         negotiated_unix_capability_set,
     };
     use crate::{
@@ -4426,7 +4462,12 @@ mod tests {
             peer.set_local_description(offer)
                 .await
                 .expect("set local offer");
-            let _ = timeout(Duration::from_secs(5), gather_complete_rx.recv()).await;
+            let _ = timeout(
+                runtime.as_ref(),
+                Duration::from_secs(5),
+                gather_complete_rx.recv(),
+            )
+            .await;
             let offer = peer
                 .local_description()
                 .await
@@ -4452,14 +4493,22 @@ mod tests {
                 .set_remote_description(answer)
                 .await
                 .expect("set remote answer");
-            timeout(Duration::from_secs(15), self.connected_rx.recv())
-                .await
-                .expect("timed out waiting for offer peer connected")
-                .expect("connected signal");
-            timeout(Duration::from_secs(10), self.data_channel_open_rx.recv())
-                .await
-                .expect("timed out waiting for data channel open")
-                .expect("open signal");
+            timeout(
+                webrtc_runtime().as_ref(),
+                Duration::from_secs(15),
+                self.connected_rx.recv(),
+            )
+            .await
+            .expect("timed out waiting for offer peer connected")
+            .expect("connected signal");
+            timeout(
+                webrtc_runtime().as_ref(),
+                Duration::from_secs(10),
+                self.data_channel_open_rx.recv(),
+            )
+            .await
+            .expect("timed out waiting for data channel open")
+            .expect("open signal");
         }
 
         async fn encrypted_request(
@@ -4478,11 +4527,14 @@ mod tests {
                 let mut next_chunk_index = 0u32;
                 let mut delivery_kind = None;
                 loop {
-                    let response =
-                        timeout(Duration::from_secs(10), self.data_channel_message_rx.recv())
-                            .await
-                            .expect("response frame timeout")
-                            .expect("data channel remains open for response");
+                    let response = timeout(
+                        webrtc_runtime().as_ref(),
+                        Duration::from_secs(10),
+                        self.data_channel_message_rx.recv(),
+                    )
+                    .await
+                    .expect("response frame timeout")
+                    .expect("data channel remains open for response");
                     let chunk: DaemonLocalWebrtcDeliveryChunk =
                         serde_json::from_str(&response).expect("parse delivery chunk");
                     if let Some(kind) = delivery_kind {
@@ -4538,11 +4590,14 @@ mod tests {
                 let mut next_chunk_index = 0u32;
                 let mut delivery_kind = None;
                 loop {
-                    let response =
-                        timeout(Duration::from_secs(10), self.data_channel_message_rx.recv())
-                            .await
-                            .expect("host event frame timeout")
-                            .expect("data channel remains open for host event");
+                    let response = timeout(
+                        webrtc_runtime().as_ref(),
+                        Duration::from_secs(10),
+                        self.data_channel_message_rx.recv(),
+                    )
+                    .await
+                    .expect("host event frame timeout")
+                    .expect("data channel remains open for host event");
                     let chunk: DaemonLocalWebrtcDeliveryChunk =
                         serde_json::from_str(&response).expect("parse delivery chunk");
                     if let Some(kind) = delivery_kind {
@@ -4587,11 +4642,14 @@ mod tests {
             let mut encrypted = String::new();
             let mut next_chunk_index = 0u32;
             loop {
-                let response =
-                    timeout(Duration::from_secs(10), self.data_channel_message_rx.recv())
-                        .await
-                        .expect("hello ack timeout")
-                        .expect("data channel remains open for hello ack");
+                let response = timeout(
+                    webrtc_runtime().as_ref(),
+                    Duration::from_secs(10),
+                    self.data_channel_message_rx.recv(),
+                )
+                .await
+                .expect("hello ack timeout")
+                .expect("data channel remains open for hello ack");
                 let chunk: DaemonLocalWebrtcDeliveryChunk =
                     serde_json::from_str(&response).expect("parse hello ack chunk");
                 assert_eq!(
@@ -7409,5 +7467,409 @@ mod tests {
                 Err(error) => panic!("hang-close child wait failed: {error}"),
             }
         }
+    }
+
+    #[test]
+    fn runtime_spawn_detach_on_drop_runs_to_completion() {
+        let tokio_rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime for spawn detach proof");
+        tokio_rt.block_on(async {
+            let runtime = default_runtime().expect("webrtc default runtime");
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            {
+                let _handle = runtime.spawn(Box::pin(async move {
+                    let _ = started_tx.send(());
+                    tokio::task::yield_now().await;
+                    let _ = done_tx.send(());
+                }));
+                started_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("spawned task must start");
+            }
+            done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("Runtime::spawn must run to completion after JoinHandle drop");
+        });
+    }
+
+    struct LateChannelHandler {
+        gather_complete_tx: AsyncSender<()>,
+        connected_tx: AsyncSender<()>,
+        incoming_tx: AsyncSender<Arc<dyn DataChannel>>,
+    }
+
+    #[async_trait]
+    impl PeerConnectionEventHandler for LateChannelHandler {
+        async fn on_ice_gathering_state_change(&self, state: RTCIceGatheringState) {
+            if state == RTCIceGatheringState::Complete {
+                let _ = self.gather_complete_tx.try_send(());
+            }
+        }
+
+        async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
+            if state == RTCPeerConnectionState::Connected {
+                let _ = self.connected_tx.try_send(());
+            }
+        }
+
+        async fn on_data_channel(&self, data_channel: Arc<dyn DataChannel>) {
+            let _ = self.incoming_tx.try_send(data_channel);
+        }
+    }
+
+    #[test]
+    fn post_handshake_data_channel_opens_and_delivers_bytes() {
+        let tokio_rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_name("botster-webrtc-late-channel")
+            .build()
+            .expect("late-channel tokio runtime");
+        tokio_rt.block_on(async {
+            let runtime = default_runtime().expect("webrtc default runtime");
+            let (offerer_gather_tx, mut offerer_gather_rx) = webrtc_channel::<()>(1);
+            let (answerer_gather_tx, mut answerer_gather_rx) = webrtc_channel::<()>(1);
+            let (offerer_connected_tx, mut offerer_connected_rx) = webrtc_channel::<()>(1);
+            let (answerer_connected_tx, mut answerer_connected_rx) = webrtc_channel::<()>(1);
+            let (incoming_tx, mut incoming_rx) = webrtc_channel::<Arc<dyn DataChannel>>(4);
+
+            let offerer = PeerConnectionBuilder::new()
+                .with_handler(Arc::new(LateChannelHandler {
+                    gather_complete_tx: offerer_gather_tx,
+                    connected_tx: offerer_connected_tx,
+                    incoming_tx: incoming_tx.clone(),
+                }))
+                .with_runtime(runtime.clone())
+                .with_udp_addrs(vec!["127.0.0.1:0".to_string()])
+                .build()
+                .await
+                .expect("build offerer");
+            let answerer = PeerConnectionBuilder::new()
+                .with_handler(Arc::new(LateChannelHandler {
+                    gather_complete_tx: answerer_gather_tx,
+                    connected_tx: answerer_connected_tx,
+                    incoming_tx,
+                }))
+                .with_runtime(runtime.clone())
+                .with_udp_addrs(vec!["127.0.0.1:0".to_string()])
+                .build()
+                .await
+                .expect("build answerer");
+
+            let setup = offerer
+                .create_data_channel(
+                    "botster-client",
+                    Some(RTCDataChannelInit {
+                        ordered: true,
+                        max_retransmits: None,
+                        max_packet_life_time: None,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .expect("create pre-handshake setup DataChannel");
+            let (setup_open_tx, mut setup_open_rx) = webrtc_channel::<()>(1);
+            runtime.spawn(Box::pin({
+                let setup = setup.clone();
+                async move {
+                    while let Some(event) = setup.poll().await {
+                        match event {
+                            DataChannelEvent::OnOpen => {
+                                let _ = setup_open_tx.try_send(());
+                            }
+                            DataChannelEvent::OnClose => break,
+                            _ => {}
+                        }
+                    }
+                }
+            }));
+
+            let offer = offerer.create_offer(None).await.expect("create offer");
+            offerer
+                .set_local_description(offer)
+                .await
+                .expect("set local offer");
+            timeout(
+                runtime.as_ref(),
+                Duration::from_secs(5),
+                offerer_gather_rx.recv(),
+            )
+            .await
+            .expect("offerer ICE gather")
+            .expect("offerer gather signal");
+            let offer = offerer
+                .local_description()
+                .await
+                .expect("offerer local description");
+            answerer
+                .set_remote_description(offer)
+                .await
+                .expect("answerer set remote offer");
+            let answer = answerer.create_answer(None).await.expect("create answer");
+            answerer
+                .set_local_description(answer)
+                .await
+                .expect("set local answer");
+            timeout(
+                runtime.as_ref(),
+                Duration::from_secs(5),
+                answerer_gather_rx.recv(),
+            )
+            .await
+            .expect("answerer ICE gather")
+            .expect("answerer gather signal");
+            let answer = answerer
+                .local_description()
+                .await
+                .expect("answerer local description");
+            offerer
+                .set_remote_description(answer)
+                .await
+                .expect("offerer set remote answer");
+
+            timeout(
+                runtime.as_ref(),
+                Duration::from_secs(15),
+                offerer_connected_rx.recv(),
+            )
+            .await
+            .expect("offerer Connected")
+            .expect("offerer connected signal");
+            timeout(
+                runtime.as_ref(),
+                Duration::from_secs(15),
+                answerer_connected_rx.recv(),
+            )
+            .await
+            .expect("answerer Connected")
+            .expect("answerer connected signal");
+            timeout(
+                runtime.as_ref(),
+                Duration::from_secs(10),
+                setup_open_rx.recv(),
+            )
+            .await
+            .expect("pre-handshake setup channel open")
+            .expect("setup open signal");
+            let setup_remote = timeout(
+                runtime.as_ref(),
+                Duration::from_secs(10),
+                incoming_rx.recv(),
+            )
+            .await
+            .expect("remote setup on_data_channel")
+            .expect("remote setup channel");
+            assert_eq!(
+                setup_remote.label().await.expect("setup remote label"),
+                "botster-client"
+            );
+
+            let late = offerer
+                .create_data_channel(
+                    "botster-late",
+                    Some(RTCDataChannelInit {
+                        ordered: true,
+                        max_retransmits: None,
+                        max_packet_life_time: None,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .expect("create post-handshake DataChannel");
+            assert!(late.ordered().await.expect("late ordered"));
+            assert_eq!(
+                late.max_retransmits().await.expect("late retransmits"),
+                None
+            );
+            assert_eq!(
+                late.max_packet_life_time().await.expect("late lifetime"),
+                None
+            );
+
+            let (late_open_tx, mut late_open_rx) = webrtc_channel::<()>(1);
+            let (late_message_tx, late_message_rx) = webrtc_channel::<String>(8);
+            runtime.spawn(Box::pin({
+                let late = late.clone();
+                async move {
+                    while let Some(event) = late.poll().await {
+                        match event {
+                            DataChannelEvent::OnOpen => {
+                                let _ = late_open_tx.try_send(());
+                            }
+                            DataChannelEvent::OnMessage(message) => {
+                                if let Ok(text) = String::from_utf8(message.data.to_vec()) {
+                                    let _ = late_message_tx.try_send(text);
+                                }
+                            }
+                            DataChannelEvent::OnClose => break,
+                            _ => {}
+                        }
+                    }
+                }
+            }));
+
+            let remote = timeout(
+                runtime.as_ref(),
+                Duration::from_secs(10),
+                async {
+                    loop {
+                        let channel = incoming_rx
+                            .recv()
+                            .await
+                            .expect("remote late on_data_channel");
+                        if channel.label().await.expect("incoming label") == "botster-late" {
+                            break channel;
+                        }
+                    }
+                },
+            )
+            .await
+            .expect("remote late channel by label");
+            assert_eq!(remote.label().await.expect("remote label"), "botster-late");
+
+            let (remote_open_tx, mut remote_open_rx) = webrtc_channel::<()>(1);
+            let (remote_message_tx, mut remote_message_rx) = webrtc_channel::<String>(8);
+            runtime.spawn(Box::pin({
+                let remote = remote.clone();
+                async move {
+                    while let Some(event) = remote.poll().await {
+                        match event {
+                            DataChannelEvent::OnOpen => {
+                                let _ = remote_open_tx.try_send(());
+                            }
+                            DataChannelEvent::OnMessage(message) => {
+                                if let Ok(text) = String::from_utf8(message.data.to_vec()) {
+                                    let _ = remote_message_tx.try_send(text);
+                                }
+                            }
+                            DataChannelEvent::OnClose => break,
+                            _ => {}
+                        }
+                    }
+                }
+            }));
+
+            timeout(
+                runtime.as_ref(),
+                Duration::from_secs(10),
+                late_open_rx.recv(),
+            )
+            .await
+            .expect("creating side OnOpen")
+            .expect("late open signal");
+            timeout(
+                runtime.as_ref(),
+                Duration::from_secs(10),
+                remote_open_rx.recv(),
+            )
+            .await
+            .expect("remote OnOpen")
+            .expect("remote open signal");
+
+            const PAYLOAD: &str = "post-handshake-bytes";
+            late.send_text(PAYLOAD)
+                .await
+                .expect("send on late DataChannel");
+            let received = timeout(
+                runtime.as_ref(),
+                Duration::from_secs(10),
+                remote_message_rx.recv(),
+            )
+            .await
+            .expect("remote delivery")
+            .expect("remote payload");
+            assert_eq!(received, PAYLOAD);
+            let _ = late_message_rx;
+            let _ = offerer.close().await;
+            let _ = answerer.close().await;
+        });
+    }
+
+    #[test]
+    fn peer_closed_removes_webrtc_admission_and_host_compatibility() {
+        let mut harness = PeerHarness::new("hello-sweep");
+        let origin = "http://127.0.0.1:41821";
+        let peer = harness.signal_peer(origin);
+        let grant_id = peer.grant_id.clone();
+
+        handle_control_message(
+            &mut harness.daemon,
+            &mut harness.state,
+            &harness.terminal_path,
+            &harness.transport_handle,
+            harness.control_tx.clone(),
+            ControlMessage::RegisterWebrtcAdmission {
+                grant_id: grant_id.clone(),
+                admission: WebrtcTerminalAdmission::Rejected {
+                    code: "test_admission_row",
+                    diagnostic: DaemonDiagnostic::connected("hello"),
+                },
+                host_required_features: vec!["host-feature".to_string()],
+            },
+        );
+        assert!(
+            harness
+                .state
+                .pending_runtime
+                .has_webrtc_admission_row(&grant_id),
+            "positive control: RegisterWebrtcAdmission must insert the admission row"
+        );
+        assert!(
+            harness
+                .state
+                .pending_runtime
+                .has_host_compatibility_row(&grant_id),
+            "positive control: RegisterWebrtcAdmission must insert the host compatibility row"
+        );
+        assert!(
+            !harness.state.pending_runtime.webrtc_is_admitted(&grant_id),
+            "Rejected rows must not satisfy webrtc_is_admitted; the sweep uses contains_key"
+        );
+
+        handle_control_message(
+            &mut harness.daemon,
+            &mut harness.state,
+            &harness.terminal_path,
+            &harness.transport_handle,
+            harness.control_tx.clone(),
+            ControlMessage::LocalWebrtcPeerClosed {
+                grant_id: grant_id.clone(),
+                attached_subscriptions: Vec::new(),
+                entity_subscription_ids: Vec::new(),
+                terminal_record: LocalWebrtcSenderTerminalRecord {
+                    schema_version: 1,
+                    grant_id: grant_id.clone(),
+                    request_operation: "hello".to_string(),
+                    message_id: None,
+                    next_chunk_index: 0,
+                    last_sent_chunk_index: None,
+                    total_chunks: 0,
+                    pressured: false,
+                    peer_connection_state: "closed".to_string(),
+                    channel_terminal_signal: LocalWebrtcChannelTerminalSignal::None,
+                    cause: LocalWebrtcTerminalCause::PeerClosed,
+                    cleanup_disposition: LocalWebrtcCleanupDisposition::NewlySent,
+                },
+            },
+        );
+        assert!(
+            !harness
+                .state
+                .pending_runtime
+                .has_webrtc_admission_row(&grant_id),
+            "PeerClosed must remove the webrtc admission row"
+        );
+        assert!(
+            !harness
+                .state
+                .pending_runtime
+                .has_host_compatibility_row(&grant_id),
+            "PeerClosed must remove the host compatibility row"
+        );
+
+        peer.close_offer();
+        harness.cleanup();
     }
 }
