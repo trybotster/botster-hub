@@ -4,13 +4,14 @@
 //! [`TerminalFrame`] and does not inspect snapshot phases or snapshot bodies.
 //! `close` and `Drop` return without waiting on DataChannel I/O or a writer lock.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
 
 use botster_core::contract::terminal_adapter::{
-    TerminalAdapter, TerminalAdapterPressure, TerminalAdapterWriteError,
+    MIN_ADAPTER_INGRESS_BUFFER_FRAMES, TerminalAdapter, TerminalAdapterPressure,
+    TerminalAdapterWriteError, TerminalIngress,
 };
 use botster_hub_client::{
     DaemonEvent, TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER,
@@ -65,11 +66,54 @@ pub(crate) struct WebRtcTerminalAdapterHandle {
     inner: Arc<WebRtcTerminalAdapterInner>,
 }
 
+struct AdapterIngress {
+    frames: VecDeque<Vec<u8>>,
+    partial: Option<Vec<u8>>,
+    lost_pending: bool,
+}
+
+impl AdapterIngress {
+    fn new() -> Self {
+        Self {
+            frames: VecDeque::with_capacity(MIN_ADAPTER_INGRESS_BUFFER_FRAMES),
+            partial: None,
+            lost_pending: false,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.frames.clear();
+        self.partial = None;
+        self.lost_pending = false;
+    }
+
+    fn take(&mut self) -> TerminalIngress {
+        if self.lost_pending {
+            self.lost_pending = false;
+            return TerminalIngress::Lost;
+        }
+        match self.frames.pop_front() {
+            Some(frame) => TerminalIngress::Frame(frame),
+            None => TerminalIngress::Empty,
+        }
+    }
+
+    #[cfg(test)]
+    fn push_frame(&mut self, bytes: Vec<u8>) {
+        if self.frames.len() >= MIN_ADAPTER_INGRESS_BUFFER_FRAMES {
+            self.lost_pending = true;
+            return;
+        }
+        self.frames.push_back(bytes);
+    }
+}
+
 struct WebRtcTerminalAdapterInner {
     closed: AtomicBool,
     host_closed: AtomicBool,
     would_block: AtomicBool,
     slot: Mutex<Option<Vec<u8>>>,
+    ingress: Mutex<AdapterIngress>,
     wake: AdapterWake,
     close_work: Arc<AtomicBool>,
 }
@@ -81,6 +125,7 @@ impl WebRtcTerminalAdapterInner {
             host_closed: AtomicBool::new(false),
             would_block: AtomicBool::new(false),
             slot: Mutex::new(None),
+            ingress: Mutex::new(AdapterIngress::new()),
             wake: AdapterWake::new(),
             close_work: Arc::new(AtomicBool::new(false)),
         }
@@ -113,7 +158,88 @@ impl WebRtcTerminalAdapterInner {
                 *poisoned.into_inner() = None;
             }
         }
+        match self.ingress.try_lock() {
+            Ok(mut ingress) => ingress.clear(),
+            Err(TryLockError::WouldBlock) => {}
+            Err(TryLockError::Poisoned(poisoned)) => {
+                poisoned.into_inner().clear();
+            }
+        }
         self.wake.wake();
+    }
+
+    fn try_read(&self) -> TerminalIngress {
+        if self.is_closed() {
+            return TerminalIngress::Closed;
+        }
+        match self.ingress.try_lock() {
+            Ok(mut ingress) => {
+                if self.is_closed() {
+                    ingress.clear();
+                    TerminalIngress::Closed
+                } else {
+                    ingress.take()
+                }
+            }
+            Err(TryLockError::WouldBlock) => TerminalIngress::Empty,
+            Err(TryLockError::Poisoned(_)) => TerminalIngress::Closed,
+        }
+    }
+
+    #[cfg(test)]
+    fn push_ingress_frame(&self, bytes: Vec<u8>) {
+        if self.is_closed() {
+            return;
+        }
+        match self.ingress.try_lock() {
+            Ok(mut ingress) => {
+                if !self.is_closed() {
+                    ingress.push_frame(bytes);
+                }
+            }
+            Err(TryLockError::WouldBlock) => {}
+            Err(TryLockError::Poisoned(poisoned)) => {
+                poisoned.into_inner().clear();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn push_ingress_partial(&self, bytes: Vec<u8>) {
+        if self.is_closed() {
+            return;
+        }
+        if let Ok(mut ingress) = self.ingress.try_lock()
+            && !self.is_closed()
+        {
+            ingress.partial = Some(bytes);
+        }
+    }
+
+    #[cfg(test)]
+    fn complete_ingress_partial(&self) {
+        if self.is_closed() {
+            return;
+        }
+        if let Ok(mut ingress) = self.ingress.try_lock()
+            && !self.is_closed()
+            && let Some(bytes) = ingress.partial.take()
+        {
+            ingress.push_frame(bytes);
+        }
+    }
+
+    #[cfg(test)]
+    fn drop_buffered_ingress_frame(&self) {
+        if self.is_closed() {
+            return;
+        }
+        if let Ok(mut ingress) = self.ingress.try_lock()
+            && !self.is_closed()
+            && ingress.frames.pop_back().is_some()
+        {
+            ingress.lost_pending = true;
+        }
     }
 
     #[cfg(test)]
@@ -262,6 +388,26 @@ impl WebRtcTerminalAdapter {
     fn clear_would_block(&self) {
         self.inner.set_would_block(false);
     }
+
+    #[cfg(test)]
+    pub(crate) fn push_ingress_frame(&self, bytes: Vec<u8>) {
+        self.inner.push_ingress_frame(bytes);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn push_ingress_partial(&self, bytes: Vec<u8>) {
+        self.inner.push_ingress_partial(bytes);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn complete_ingress_partial(&self) {
+        self.inner.complete_ingress_partial();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn drop_buffered_ingress_frame(&self) {
+        self.inner.drop_buffered_ingress_frame();
+    }
 }
 
 impl Default for WebRtcTerminalAdapter {
@@ -287,6 +433,10 @@ impl TerminalAdapter for WebRtcTerminalAdapter {
 
     fn pressure(&self) -> TerminalAdapterPressure {
         self.inner.pressure()
+    }
+
+    fn try_read(&mut self) -> TerminalIngress {
+        self.inner.try_read()
     }
 }
 
@@ -694,6 +844,22 @@ mod tests {
 
         fn delivered_frame_bytes(&self) -> &[Vec<u8>] {
             &self.delivered
+        }
+
+        fn inject_ingress_frame(&mut self, bytes: Vec<u8>) {
+            self.adapter.push_ingress_frame(bytes);
+        }
+
+        fn inject_ingress_partial(&mut self, bytes: Vec<u8>) {
+            self.adapter.push_ingress_partial(bytes);
+        }
+
+        fn complete_ingress_partial(&mut self) {
+            self.adapter.complete_ingress_partial();
+        }
+
+        fn drop_buffered_ingress_frame(&mut self) {
+            self.adapter.drop_buffered_ingress_frame();
         }
     }
 

@@ -2,7 +2,7 @@
 // These pin current Hub behavior so later tickets show an intentional change.
 // They must not change transport behavior.
 
-const LOCKED_CORE_REV: &str = "7eafa470a18025895995bbedc20d34b58106a03b";
+const LOCKED_CORE_REV: &str = "358ef1a6bf0f792f6da10d60890be39cb16779d0";
 
 fn hub_source(relative: &str) -> String {
     std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative))
@@ -508,32 +508,13 @@ fn terminal_input_travels_as_a_json_control_request() {
 }
 
 #[test]
-fn terminal_adapter_contract_is_egress_only_at_the_locked_core_pin() {
-    let cargo_toml = hub_source("Cargo.toml");
+fn locked_core_rev_is_the_rolled_duplex_pin() {
     assert!(
-        cargo_toml.contains(LOCKED_CORE_REV),
+        hub_source("Cargo.toml").contains(LOCKED_CORE_REV),
         "Hub must stay pinned to Core {LOCKED_CORE_REV}"
     );
-    struct EgressOnly;
-    impl botster_core::contract::terminal_adapter::TerminalAdapter for EgressOnly {
-        fn try_write(
-            &mut self,
-            _frame: &botster_terminal_protocol::TerminalFrame,
-        ) -> Result<(), botster_core::contract::terminal_adapter::TerminalAdapterWriteError>
-        {
-            Ok(())
-        }
-
-        fn close(&mut self) {}
-
-        fn pressure(&self) -> botster_core::contract::terminal_adapter::TerminalAdapterPressure {
-            botster_core::contract::terminal_adapter::TerminalAdapterPressure::Ready
-        }
-    }
-    let _adapter = EgressOnly;
-    let lock = hub_source("Cargo.lock");
     assert!(
-        lock.contains(LOCKED_CORE_REV),
+        hub_source("Cargo.lock").contains(LOCKED_CORE_REV),
         "Cargo.lock must pin Core {LOCKED_CORE_REV}"
     );
 }
