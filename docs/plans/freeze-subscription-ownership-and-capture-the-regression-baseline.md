@@ -291,23 +291,23 @@ deleted with no single-class remnant.
 
 ### 8.2 Channel creator
 
-**Hub creates every subscription DataChannel. The browser creates only the
-control channel.**
+**The browser creates each subscription DataChannel after Hub reserves its
+label. The browser also creates the one control channel.**
 
-Rationale: the subscription generation is assigned by Hub at admission and by
-Core at bind. A browser cannot know the generation before admission, so a
-browser-created subscription channel would have to be renamed or re-bound after
-the fact. Hub-created channels also make the limit table fail-closed: an
-unadmitted peer cannot allocate a channel at all.
+Rationale: the subscription generation is assigned by Hub at admission. Hub
+returns the exact label, and only then can the browser create a post-handshake
+DataChannel that carries that label. Hub does not create subscription channels
+and does not keep a pre-created channel pool.
 
-**Creation and bind are two separate steps.** Hub creates the channel at
-admission but binds the Core adapter only on the channel's `open` event. Binding
-at creation would make the late-open guard of §11.4 unreachable, because the
-adapter would already exist before Hub could observe a retirement race.
+**Reservation and bind are two separate steps.** Admission inserts a `Reserved`
+route and returns the label. Hub binds the Core adapter only on the browser
+channel's `open` event. Binding at admission would make the late-open guard of
+§11.4 unreachable, because the adapter would already exist before Hub could
+observe a retirement race.
 
 Route states: `Reserved` → `Bound` → `Retired`. A route is charged against the
-§9 limit table from `Reserved`, not from `Bound`, so an unopened channel cannot
-be used to exceed the table.
+§9 limit table from `Reserved`, not from `Bound`, so an unopened reservation
+cannot be used to exceed the table.
 
 Exact order:
 
@@ -316,32 +316,35 @@ Exact order:
 2. Hub admits or rejects. Rejection returns a typed operator error on the control
    channel, creates no channel, and charges nothing.
 3. On admission Hub inserts a `Reserved` route keyed
-   `(session_id, subscription_id, generation)` and creates the labeled
-   DataChannel. **Hub binds no Core adapter here.**
-4. Hub returns the label in the control response immediately. It does not wait
-   for `open`, so a slow channel cannot stall the control plane.
-5. On the channel's `open` event Hub re-checks three conditions: the route is
-   still `Reserved`, its generation is absent from
-   `WebRtcMuxInner::suppress_generations`, and the peer is not dying. Only when
-   all three hold does Hub bind the Core adapter and move the route to `Bound`.
-6. If any check in step 5 fails, Hub closes the channel under the §11.3 bound,
-   releases the `Reserved` slot, and binds nothing. No Core detach is needed,
-   because no bind occurred.
-7. If `open` does not arrive within `LOCAL_WEBRTC_CHANNEL_OPEN_BOUND`
-   (5 s production, 200 ms test), Hub closes the channel, releases the
-   `Reserved` slot, and emits a typed `subscription_channel_open_timeout` host
-   event on the control channel. The browser retries by re-subscribing; Hub does
-   not retry on its own.
+   `(session_id, subscription_id, generation)`. **Hub creates no DataChannel and
+   binds no Core adapter here.**
+4. Hub returns the exact label in the control response immediately. It does not
+   wait for `open`, so a slow channel cannot stall the control plane.
+5. The browser creates a reliable ordered DataChannel with that exact label.
+6. On the channel's `open` event Hub re-checks route identity, generation
+   suppression, peer liveness, duplicate state, and the §9 limit. Only a
+   matching `Reserved` route that is not over the charged limit binds the Core
+   adapter and moves the route to `Bound`.
+7. If any check in step 6 fails, Hub waits until the channel reaches `Open`,
+   then closes it under the §11.3 bound, and binds nothing. No Core detach is
+   needed, because no bind occurred.
+8. If the browser never creates the channel before
+   `LOCAL_WEBRTC_CHANNEL_OPEN_BOUND` (5 s production, 200 ms test), Hub retires
+   the `Reserved` route, releases the §9 slot, and emits a typed
+   `subscription_channel_open_timeout` host event on the control channel. **No
+   channel exists, so Hub issues no `DataChannel::local_close()`.** The browser
+   retries by re-subscribing; Hub does not retry on its own.
 
 Both race orders are defined:
 
 | Order | Sequence | Result |
 |-------|----------|--------|
 | A, open before retire | `open` → bind → later retirement | Normal teardown: suppress generation, bounded channel close, Core detach, route `Retired`. |
-| B, retire before open | retirement → `open` arrives late | Step 5 finds the generation suppressed or the route already `Retired`. Hub closes the channel and binds nothing. No Core route is created. |
+| B, retire before open | retirement → `open` arrives late | Step 6 finds the generation suppressed or the route already `Retired`. Hub closes the channel and binds nothing. No Core route is created. |
 
-`LocalWebrtcPeerState::claim_data_channel` becomes "claim the one browser-created
-control channel". Additional browser-created channels stay rejected.
+`LocalWebrtcPeerState::claim_data_channel` means "claim the one browser-created
+control channel". Every other browser-created channel is matched against a
+`Reserved` route or rejected.
 
 ### 8.3 Label scheme
 
