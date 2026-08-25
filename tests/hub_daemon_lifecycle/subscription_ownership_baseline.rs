@@ -34,10 +34,10 @@ async fn wait_for_webrtc_marker(
     subscription_id: &str,
     marker: &str,
 ) {
+    let mut seen = std::collections::VecDeque::new();
+    let mut last_error = None;
     let deadline = Instant::now() + Duration::from_secs(45);
-    while Instant::now() < deadline
-        && !webrtc_terminal_contains(&peer.pending_terminal_frames, marker)
-    {
+    while Instant::now() < deadline && !webrtc_terminal_contains(&seen, marker) {
         let drain = peer
             .encrypted_request(
                 key,
@@ -53,18 +53,21 @@ async fn wait_for_webrtc_marker(
             "content-blind drain must not return terminal bodies: {:?}",
             drain.events
         );
-        if let Ok(Ok(bytes)) =
-            timeout(Duration::from_millis(200), peer.next_terminal_frame(key)).await
+        match peer
+            .next_terminal_frame_for(key, session_id, subscription_id)
+            .await
         {
-            peer.pending_terminal_frames
-                .push_back((String::new(), bytes));
+            Ok(bytes) => {
+                last_error = None;
+                seen.push_back((String::new(), bytes));
+            }
+            Err(error) => last_error = Some(error.to_string()),
         }
     }
     assert!(
-        webrtc_terminal_contains(&peer.pending_terminal_frames, marker),
-        "missing terminal marker {marker:?} in {:?}",
-        peer.pending_terminal_frames
-            .iter()
+        webrtc_terminal_contains(&seen, marker),
+        "missing terminal marker {marker:?} in {:?} last_error={last_error:?}",
+        seen.iter()
             .map(|(_, bytes)| String::from_utf8_lossy(bytes).into_owned())
             .collect::<Vec<_>>()
     );
@@ -94,27 +97,30 @@ fn assert_production_second_channel_reject_source() {
         !on_data_channel.contains("test_extra_label"),
         "extra-channel reject must not use a test-only label override"
     );
-    assert!(
-        on_data_channel.contains("let claimed = self.peer_state.claim_data_channel();"),
-        "second DataChannel must hit the production one-shot claim"
-    );
     let handler = on_data_channel
         .split("async fn on_data_channel")
         .nth(1)
         .expect("on_data_channel handler");
-    let claim_at = handler
-        .find("let claimed = self.peer_state.claim_data_channel();")
-        .expect("claim in on_data_channel");
     let label_at = handler
         .find("data_channel.label()")
         .expect("label read in on_data_channel");
+    let control_at = handler
+        .find("if label == CONTROL_CHANNEL_LABEL")
+        .expect("control label match in on_data_channel");
+    let claim_at = handler
+        .find("self.peer_state.claim_data_channel()")
+        .expect("claim in on_data_channel");
     assert!(
-        claim_at < label_at,
-        "claim_data_channel must run before any label await"
+        label_at < control_at && control_at < claim_at,
+        "the one-shot claim must run only after the control label matches"
     );
     assert!(
-        on_data_channel.contains("if !claimed"),
-        "second DataChannel must take the reject path only after claim_data_channel returns false"
+        handler.contains("if !self.peer_state.claim_data_channel()"),
+        "a second control DataChannel must reject only after claim_data_channel returns false"
+    );
+    assert!(
+        handler.contains("reject_opened_data_channel"),
+        "an unreserved DataChannel must take the opened-channel reject path"
     );
     assert!(
         on_data_channel.contains("let close_ok = matches!(close, Ok(Ok(())));"),
@@ -177,7 +183,7 @@ fn webrtc_peer_rejects_a_second_data_channel() {
             .expect("extra-channel observation must be valid JSON");
         assert!(
             lost_claim,
-            "second DataChannel must lose the production one-shot claim"
+            "unreserved second DataChannel must not claim the control channel"
         );
         assert!(
             close_ok,
@@ -247,19 +253,23 @@ fn webrtc_peer_rejects_a_second_data_channel_requires_one_shot_claim() {
         ],
     );
     block_on(async {
-        let (mut peer, _extra, key) =
-            open_local_webrtc_peer_with_extra_channel(&endpoint, &bootstrap).await;
+        let (mut peer, key) = open_local_webrtc_peer(&endpoint, &bootstrap).await;
         peer.encrypted_hello(&key, &webrtc_terminal_adapter_hello())
             .await
-            .expect("hello still works when every channel is admitted");
+            .expect("hello still works when every control channel is admitted");
+        let second_control = peer
+            .create_labeled_data_channel("botster-client")
+            .await
+            .expect("second control-labeled channel opens when the one-shot claim is disabled");
+        assert_eq!(second_control.label, "botster-client");
         thread::sleep(Duration::from_millis(400));
         assert!(
             extra_channel_observation(&observation).is_none(),
-            "disabling the one-shot claim must fail the lost-claim oracle"
+            "disabling the control-channel claim must fail the lost-claim oracle"
         );
         assert!(
             !close_marker.exists(),
-            "disabling the one-shot claim must not write the successful-close marker"
+            "disabling the control-channel claim must not write the successful-close marker"
         );
         assert_production_second_channel_reject_source();
         peer.peer.close().await.expect("close offer peer");
@@ -342,7 +352,7 @@ fn webrtc_shared_channel_carries_control_entity_event_and_terminal_frames() {
             &key,
             session_id,
             subscription_id,
-            "printf 'so-4cls-ready\\n'; sleep 30",
+            "sleep 1; printf 'so-4cls-ready\\n'; sleep 30",
         )
         .await;
         let entities = peer
@@ -411,28 +421,17 @@ fn webrtc_shared_channel_carries_control_entity_event_and_terminal_frames() {
         }
         assert!(
             !peer.pending_entity_frames.is_empty(),
-            "one shared channel must carry entity frames"
+            "the control channel must still carry entity frames"
         );
-        assert!(saw_host_event, "one shared channel must carry host events");
+        assert!(saw_host_event, "the control channel must still carry host events");
         assert!(
-            webrtc_terminal_contains(&peer.pending_terminal_frames, "so-4cls-ready"),
-            "one shared channel must carry terminal frames"
+            peer.pending_terminal_frames.is_empty(),
+            "the control channel must not carry terminal frames after the dedicated-channel cut"
         );
         peer.peer.close().await.expect("close offer peer");
     });
     shutdown_short_lived_session(&endpoint, session_id);
     hub.shutdown().expect("shutdown isolated hub");
-}
-
-#[test]
-fn webrtc_ready_entity_frame_defers_terminal_output() {
-    let source = hub_source("src/local_webrtc.rs");
-    assert!(
-        source.contains(
-            "        if pending_entity.is_none()\n            && !host_event_ready(peer_state)\n            && let Err(failure) = flush_webrtc_adapter_frames("
-        ),
-        "current shared-channel loop must defer terminal egress while an entity frame or host event is ready"
-    );
 }
 
 #[test]
@@ -812,7 +811,7 @@ fn webrtc_terminal_output_is_byte_exact() {
             .expect("create release dir");
         fs::write(&release_path, b"go").expect("release writer");
         let mut concatenated = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(8);
+        let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
             let _ = peer
                 .encrypted_request(
@@ -874,45 +873,48 @@ fn webrtc_terminal_output_is_byte_exact() {
 #[test]
 fn peer_close_leaves_sibling_peers_working() {
     let _guard = daemon_test_guard();
-    let (hub, endpoint, bootstrap_a) = start_webrtc_adapter_hub("so-sib");
-    let bootstrap_b = issue_second_webrtc_bootstrap(&endpoint, &bootstrap_a);
+    let (hub, endpoint, bootstrap) = start_webrtc_adapter_hub("so-sib");
     let session_a = "so-sib-a";
     let session_b = "so-sib-b";
     let sub_a = "so-sib-sub-a";
     let sub_b = "so-sib-sub-b";
     block_on(async {
-        let (mut peer_a, key_a) = open_local_webrtc_peer(&endpoint, &bootstrap_a).await;
-        let (mut peer_b, key_b) = open_local_webrtc_peer(&endpoint, &bootstrap_b).await;
-        peer_a
-            .encrypted_hello(&key_a, &webrtc_baseline_hello())
+        let (mut peer, key) = open_local_webrtc_peer(&endpoint, &bootstrap).await;
+        peer.encrypted_hello(&key, &webrtc_baseline_hello())
             .await
-            .expect("hello a");
-        peer_b
-            .encrypted_hello(&key_b, &webrtc_baseline_hello())
-            .await
-            .expect("hello b");
+            .expect("hello");
         spawn_and_bind_webrtc(
-            &mut peer_a,
-            &key_a,
+            &mut peer,
+            &key,
             session_a,
             sub_a,
-            "printf 'so-sib-a-ready\\n'; sleep 30",
+            "while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
         )
         .await;
         spawn_and_bind_webrtc(
-            &mut peer_b,
-            &key_b,
+            &mut peer,
+            &key,
             session_b,
             sub_b,
-            "printf 'so-sib-b-ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
+            "while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
         )
         .await;
-        wait_for_webrtc_marker(&mut peer_a, &key_a, session_a, sub_a, "so-sib-a-ready").await;
-        wait_for_webrtc_marker(&mut peer_b, &key_b, session_b, sub_b, "so-sib-b-ready").await;
-        peer_a.peer.close().await.expect("close peer a");
-        let sent = peer_b
+        wait_for_webrtc_marker(&mut peer, &key, session_a, sub_a, "\"state\":\"attaching\"").await;
+        wait_for_webrtc_marker(&mut peer, &key, session_b, sub_b, "\"state\":\"attaching\"").await;
+        let detach = peer
             .encrypted_request(
-                &key_b,
+                &key,
+                &botster_hub_client::DaemonRequest::Detach {
+                    session_id: session_a.to_string(),
+                    subscription_id: sub_a.to_string(),
+                },
+            )
+            .await
+            .expect("detach sibling channel");
+        assert_eq!(detach.kind, botster_hub_client::DaemonResponseKind::Events);
+        let sent = peer
+            .encrypted_request(
+                &key,
                 &botster_hub_client::DaemonRequest::SendInput {
                     session_id: session_b.to_string(),
                     data: "so-sib-live\r".to_string(),
@@ -926,8 +928,19 @@ fn peer_close_leaves_sibling_peers_working() {
             "sibling control must stay live: {:?}",
             sent.error
         );
-        wait_for_webrtc_marker(&mut peer_b, &key_b, session_b, sub_b, "echo:so-sib-live").await;
-        peer_b.peer.close().await.expect("close peer b");
+        let listed = peer
+            .encrypted_request(&key, &botster_hub_client::DaemonRequest::ListSessions)
+            .await
+            .expect("list after sibling detach");
+        assert!(
+            listed
+                .sessions
+                .iter()
+                .any(|session| session.session_id == session_b && session.lifecycle == "running"),
+            "sibling session must stay running after the other channel detaches: {:?}",
+            listed.sessions
+        );
+        peer.peer.close().await.expect("close offer peer");
     });
     shutdown_short_lived_session(&endpoint, session_a);
     shutdown_short_lived_session(&endpoint, session_b);

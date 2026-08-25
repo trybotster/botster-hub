@@ -512,6 +512,10 @@ pub(crate) struct LocalWebrtcOfferPeer {
     pending_host: PendingHostEventState,
     pub(crate) accept_host_events: bool,
     inbound: WebrtcInboundMailbox,
+    pub(crate) grant_secret: Option<String>,
+    subscription_channels: BTreeMap<String, ExtraWebrtcDataChannel>,
+    subscription_keys: BTreeMap<String, AesGcmKey>,
+    pending_subscription_frames: VecDeque<(String, Vec<u8>)>,
 }
 
 pub(crate) struct ExtraWebrtcDataChannel {
@@ -551,6 +555,21 @@ impl ExtraWebrtcDataChannel {
         }
         extra_terminal_frames
     }
+}
+
+fn subscription_label_matches(
+    label: &str,
+    session_id: Option<&str>,
+    subscription_id: Option<&str>,
+) -> bool {
+    let Some(session_id) = session_id else {
+        return true;
+    };
+    let Some(subscription_id) = subscription_id else {
+        return true;
+    };
+    let parts: Vec<&str> = label.split('/').collect();
+    parts.len() >= 6 && parts[3] == session_id && parts[4] == subscription_id
 }
 
 fn spawn_offerer_channel_poll(
@@ -717,6 +736,10 @@ impl LocalWebrtcOfferPeer {
                 pending_host: PendingHostEventState::new(),
                 accept_host_events: false,
                 inbound,
+                grant_secret: None,
+                subscription_channels: BTreeMap::new(),
+                subscription_keys: BTreeMap::new(),
+                pending_subscription_frames: VecDeque::new(),
             },
             extra_channel,
             offer,
@@ -934,8 +957,39 @@ impl LocalWebrtcOfferPeer {
         &mut self,
         key: &AesGcmKey,
     ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        self.next_terminal_frame_matching(key, None, None).await
+    }
+
+    pub(crate) async fn next_terminal_frame_for(
+        &mut self,
+        key: &AesGcmKey,
+        session_id: &str,
+        subscription_id: &str,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        self.next_terminal_frame_matching(key, Some(session_id), Some(subscription_id))
+            .await
+    }
+
+    async fn next_terminal_frame_matching(
+        &mut self,
+        key: &AesGcmKey,
+        session_id: Option<&str>,
+        subscription_id: Option<&str>,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        if let Some(bytes) = self.take_pending_subscription_frame(session_id, subscription_id) {
+            return Ok(bytes);
+        }
         if let Some((_message_id, bytes)) = self.pending_terminal_frames.pop_front() {
             return Ok(bytes);
+        }
+        if !self.subscription_channels.is_empty() {
+            loop {
+                let (label, bytes) = self.next_subscription_terminal_frame().await?;
+                if subscription_label_matches(&label, session_id, subscription_id) {
+                    return Ok(bytes);
+                }
+                self.pending_subscription_frames.push_back((label, bytes));
+            }
         }
         loop {
             let (delivery_kind, plaintext, _) = self.receive_delivery(key).await?;
@@ -958,6 +1012,122 @@ impl LocalWebrtcOfferPeer {
                 }
             }
         }
+    }
+
+    fn take_pending_subscription_frame(
+        &mut self,
+        session_id: Option<&str>,
+        subscription_id: Option<&str>,
+    ) -> Option<Vec<u8>> {
+        let index = self
+            .pending_subscription_frames
+            .iter()
+            .position(|(label, _)| {
+                subscription_label_matches(label, session_id, subscription_id)
+            })?;
+        Some(self.pending_subscription_frames.remove(index)?.1)
+    }
+
+    async fn next_subscription_terminal_frame(
+        &mut self,
+    ) -> Result<(String, Vec<u8>), Box<dyn std::error::Error>> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            let labels: Vec<String> = self.subscription_channels.keys().cloned().collect();
+            for label in &labels {
+                let Some(key) = self.subscription_keys.get(label).cloned() else {
+                    continue;
+                };
+                let Some(channel) = self.subscription_channels.get_mut(label) else {
+                    continue;
+                };
+                match timeout(
+                    webrtc_runtime().as_ref(),
+                    Duration::from_millis(100),
+                    channel.inbound.receive_delivery(&key),
+                )
+                .await
+                {
+                    Ok(Ok((
+                        botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonTerminalFrame,
+                        plaintext,
+                        _,
+                    ))) => return Ok((label.clone(), plaintext)),
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        let message = error.to_string();
+                        if !message.contains("channel_closed")
+                            && !message.contains("response_timeout")
+                        {
+                            return Err(error);
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+        Err(std::io::Error::other("timed out waiting for subscription terminal frame").into())
+    }
+
+    pub(crate) async fn open_reserved_subscription_channel(
+        &mut self,
+        label: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let grant_secret = self
+            .grant_secret
+            .clone()
+            .ok_or_else(|| std::io::Error::other("offer peer is missing the grant secret"))?;
+        let runtime =
+            default_runtime().ok_or_else(|| std::io::Error::other("no async runtime found"))?;
+        let (open_tx, open_rx) = channel::<()>(1);
+        let (message_tx, message_rx) = channel::<String>(256);
+        let (closed_tx, closed_rx) = channel::<()>(1);
+        let (inbound_tx, inbound) =
+            WebrtcInboundMailbox::bounded(WEBRTC_INBOUND_MAX_FRAMES, WEBRTC_INBOUND_MAX_BYTES);
+        let data_channel = self
+            .peer
+            .create_data_channel(
+                label,
+                Some(RTCDataChannelInit {
+                    ordered: true,
+                    max_retransmits: None,
+                    max_packet_life_time: None,
+                    ..Default::default()
+                }),
+            )
+            .await?;
+        spawn_offerer_channel_poll(
+            runtime,
+            data_channel.clone(),
+            open_tx,
+            inbound_tx,
+            Arc::clone(&inbound.occupancy),
+            Some(message_tx),
+            Some(closed_tx),
+        );
+        let mut channel = ExtraWebrtcDataChannel {
+            label: label.to_string(),
+            data_channel,
+            inbound,
+            messages: message_rx,
+            closed: closed_rx,
+            open_rx,
+        };
+        timeout(
+            webrtc_runtime().as_ref(),
+            Duration::from_secs(5),
+            channel.open_rx.recv(),
+        )
+        .await
+        .map_err(|_| std::io::Error::other("timed out waiting for reserved DataChannel open"))?
+        .ok_or_else(|| std::io::Error::other("reserved DataChannel closed before open"))?;
+        self.subscription_keys.insert(
+            label.to_string(),
+            local_webrtc_subscription_key(&grant_secret, label),
+        );
+        self.subscription_channels
+            .insert(label.to_string(), channel);
+        Ok(())
     }
 
     pub(crate) fn enable_host_events(&mut self) {
@@ -1069,6 +1239,13 @@ impl LocalWebrtcOfferPeer {
     pub(crate) async fn create_extra_data_channel(
         &mut self,
     ) -> Result<ExtraWebrtcDataChannel, Box<dyn std::error::Error>> {
+        self.create_labeled_data_channel("botster-extra").await
+    }
+
+    pub(crate) async fn create_labeled_data_channel(
+        &mut self,
+        label: &str,
+    ) -> Result<ExtraWebrtcDataChannel, Box<dyn std::error::Error>> {
         let runtime =
             default_runtime().ok_or_else(|| std::io::Error::other("no async runtime found"))?;
         let (open_tx, open_rx) = channel::<()>(1);
@@ -1079,7 +1256,7 @@ impl LocalWebrtcOfferPeer {
         let extra = self
             .peer
             .create_data_channel(
-                "botster-extra",
+                label,
                 Some(RTCDataChannelInit {
                     ordered: true,
                     max_retransmits: None,
@@ -1098,7 +1275,7 @@ impl LocalWebrtcOfferPeer {
             Some(closed_tx),
         );
         let mut extra_channel = ExtraWebrtcDataChannel {
-            label: "botster-extra".to_string(),
+            label: label.to_string(),
             data_channel: extra,
             inbound,
             messages: message_rx,
@@ -1146,6 +1323,18 @@ pub(crate) fn local_webrtc_stream_key(secret: &str) -> AesGcmKey {
     AesGcmKey::from_slice(&bytes).expect("local WebRTC secret is an AES-GCM key")
 }
 
+pub(crate) fn local_webrtc_subscription_key(secret: &str, label: &str) -> AesGcmKey {
+    let hex = secret
+        .strip_prefix("secret-")
+        .expect("local WebRTC secret prefix");
+    let mut bytes = decode_hex_bytes(hex).expect("local WebRTC secret hex");
+    assert_eq!(bytes.len(), 32);
+    for (index, byte) in label.as_bytes().iter().enumerate() {
+        bytes[index % 32] ^= byte.wrapping_add((index % 251) as u8);
+    }
+    AesGcmKey::from_slice(&bytes).expect("subscription channel key is AES-GCM")
+}
+
 pub(crate) async fn open_local_webrtc_peer(
     endpoint: &botster_hub_client::DaemonEndpoint,
     bootstrap: &botster_hub_client::DaemonLocalWebrtcBootstrap,
@@ -1178,6 +1367,7 @@ pub(crate) async fn open_local_webrtc_peer(
         .accept_answer(answer)
         .await
         .expect("offer peer accepts answer and opens channel");
+    offer_peer.grant_secret = Some(bootstrap.grant_secret.clone());
     (offer_peer, stream_key)
 }
 
@@ -1214,6 +1404,7 @@ pub(crate) async fn open_local_webrtc_peer_with_extra_channel(
         .accept_answer_with_extra_open(answer, &mut extra)
         .await
         .expect("offer peer accepts answer and opens a DataChannel");
+    offer_peer.grant_secret = Some(bootstrap.grant_secret.clone());
     (offer_peer, extra, stream_key)
 }
 
