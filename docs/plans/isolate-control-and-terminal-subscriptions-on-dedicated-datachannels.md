@@ -1,9 +1,12 @@
 # Isolate control and terminal subscriptions on dedicated DataChannels
 
 Ticket: `ticket_1787600674_500120`
-Run: `run_1787664777_379002`
+Run: `run_1787678814_340532`. It replaces the cancelled runs
+`run_1787653825_278029` and `run_1787664777_379002`.
 Pipeline: Botster Stack Delivery (`botster_stack_delivery`)
-Base commit: `55f620d` on `main` (contains the merged `webrtc 0.21.0-beta.2` roll)
+Base commit: `a0c7141` on `main`. It is the merge of
+`ticket_1787667162_566252`, "Hub: restore the strict Rust gate baseline", and it
+contains the merged `webrtc 0.21.0-beta.2` roll from `55f620d`.
 
 ## 1. Target
 
@@ -15,18 +18,22 @@ The target id was resolved through `project_pipelines_get_project`. Every Hub
 ticket in this project carries the same target id. The ambient worktree was not
 used to choose the repository.
 
-Registered dependencies, both closed:
+Registered dependencies, all three closed:
 
 | Dependency | Ticket | Status |
 |---|---|---|
 | `dependency_1787600712_947298` | `ticket_1787600672_342292` — Core: make terminal subscriptions duplex and pressure-isolated | closed |
 | `dependency_1787654923_752279` | `ticket_1787654915_646236` — Hub: upgrade WebRTC for post-handshake DataChannel creation | closed |
-| registered 2026-08-25 | `ticket_1787667162_566252` — Hub: restore the strict Rust gate baseline | open, blocks this ticket |
+| `dependency_1787667169_738534` | `ticket_1787667162_566252` — Hub: restore the strict Rust gate baseline | closed, merged as `a0c7141` |
 
-`ticket_1787667162_566252` was registered during this Plan step, after the strict
-Rust gates were measured red on `main`. See section 11.2. Run
-`run_1787664777_379002` was cancelled without advancing feature work, and this
-ticket restarts from current `main` after the prerequisite merges.
+No blocking dependency remains. `project_pipelines_current_context` reports
+`blocking_dependencies` empty for this run.
+
+The third dependency was registered during the previous Plan visit, after the
+strict Rust gates were measured red on `main`. That prerequisite is now merged.
+Section 11.2 records the re-measured, now green, baseline. This plan carries no
+part of either baseline repair, exactly as the answer to
+`question_1787667127_613797` required.
 
 Open sibling tickets on this target: `ticket_1787600682_233928` (entity and
 event channels), `ticket_1787603671_590198` (Unix duplex bind),
@@ -79,19 +86,32 @@ Targeted atomic notes:
 - `[[Fault-injected WebRTC close requires a daemon started with the inject env]]`
 - `[[public protocol versions host control and Core terminal planes independently]]`
 
+Gate-hygiene notes added during this Plan visit, all published by the merged
+prerequisite:
+
+- `[[Hub official gates must not set CARGO TARGET DIR]]`
+- `[[botster Hub pipeline shells can override RUSTUP TOOLCHAIN below the CI pin]]`
+- `[[strict clippy can hide later crate diagnostics behind the first compile failure]]`
+- `[[test script required for rust tests not cargo test]]`
+- `[[botster pipeline reviewers must bypass rtk summaries for cargo gate evidence]]`
+
 `[[project-pipelines-playbook]]` is not loaded. No Project Pipelines package or
 plugin path is in scope.
 
 ## 3. Context loaded
 
-Repository sources read at base `55f620d`:
+Repository sources read at base `a0c7141`:
 
 - `docs/plans/freeze-subscription-ownership-and-capture-the-regression-baseline.md`
   — the frozen architecture contract, sections 8 to 18.
-- `src/local_webrtc.rs` (7875 lines) — `on_data_channel` at `:1148`,
+- `src/local_webrtc.rs` (7871 lines at `a0c7141`) — `on_data_channel` at `:1148`,
   `run_data_channel`, `send_text_or_peer_terminal` at `:1203`, constants at
   `:50-70`, `ultimate_close_failure_sacrifices_every_peer_and_sweeps_all_owners`
-  at `:6505`.
+  at `:6505`, `claim_data_channel` at `:935`,
+  `LOCAL_WEBRTC_CHUNK_PAYLOAD_BYTES` at `:54`, `run_data_channel` at `:1269`.
+  Every one of these line numbers was re-measured at `a0c7141`. The
+  prerequisite's rustfmt repair removed four lines, all after `:7710`, so no
+  reference above `:7710` moved.
 - `src/webrtc_terminal_adapter.rs` (926 lines) — `WebRtcTerminalAdapter`,
   `WebRtcConnectionMux`, `WebRtcMuxRoute`, `suppress_generations`.
 - `src/daemon_transport.rs` (10573 lines) — terminal JSON handlers at
@@ -126,7 +146,14 @@ Answered blocking questions carried forward from the cancelled run
   separate ticket, now merged. This ticket restarts from current `main` and keeps
   the rejected-channel test correction.
 
-Blocking question for this run: `question_1787665047_404406`.
+- `question_1787665047_404406` — options 1A and 2A confirmed. The owner recorded
+  the same split on both owning ticket descriptions. Section 10 carries both.
+- `question_1787667127_613797` — option A confirmed with one adjustment. One
+  prerequisite ticket owned **both** strict-gate failures, not the clippy one
+  alone, because `main` also failed `cargo fmt`. That ticket is merged.
+
+No blocking question is open for this run. This plan asks none, because every
+ambiguity the previous visits found is now answered and recorded above.
 
 ## 4. Scope
 
@@ -391,8 +418,22 @@ Untouched by design: `src/host_control_fair_write.rs`,
 Target revision: `358ef1a6bf0f792f6da10d60890be39cb16779d0`.
 
 `[[Hub Core pin rolls update eleven literal sites and six lock sources]]` records
-eleven literal sites. The count measured at this base is **eighteen**, so the
-implementer must use the measured set and not the note's count:
+eleven literal sites. The count re-measured at `a0c7141` is **eighteen active
+sites**, so the implementer must use the measured set and not the note's count.
+
+The discovery command is authoritative, not the count:
+
+```sh
+grep -rn '7eafa470a18025895995bbedc20d34b58106a03b' \
+  --include='*.rs' --include='*.toml' --include='*.json' --include='*.mjs' . \
+  | grep -v '^./target/' | grep -v '^./docs/'
+```
+
+At `a0c7141` that command returns nineteen lines. Eighteen are active sites.
+The nineteenth is
+`docs/reports/prove-the-event-plane-cannot-lag-or-block-hub-operations-evidence.json`,
+a historical evidence record that must **not** be rolled. The `--include='*.json'`
+filter is why it appears at all; keep the filter and exclude the file by name.
 
 | Site | Count |
 |---|---|
@@ -412,6 +453,11 @@ implementer must use the measured set and not the note's count:
 Plus six `source` lines in `Cargo.lock`: `botster-core`, `botster-core-daemon`,
 `botster-core-test-support`, `botster-terminal-ghostty`,
 `botster-terminal-protocol`, `botster-terminal-protocol-client`.
+
+`botster-core` `origin/main` was re-resolved during this Plan visit with
+`git ls-remote https://github.com/trybotster/botster-core.git refs/heads/main`.
+It still reports `358ef1a6bf0f792f6da10d60890be39cb16779d0`, unchanged from the
+previous visit, so the roll target is confirmed rather than assumed stale.
 
 Every dependency keeps the URL `https://github.com/trybotster/botster-core.git`
 and the `rev =` selector. Historical `docs/plans/**` and `docs/reports/**` keep
@@ -561,71 +607,129 @@ The strict Rust gates are the repository's own CI gates
 `0.16.0` for `botster-terminal-ghostty`'s `libghostty-vt` build. A different
 local default toolchain is not the gate.
 
-Commands, in this order, per
+The merged prerequisite `ticket_1787667162_566252` published the exact official
+gate block for this repository. This plan adopts it verbatim and does not invent
+a second form. Commands, in this order, per
 `[[Hub suite runs prebuild the session worker before the locked test wrapper]]`:
 
 ```sh
-rustup toolchain install 1.97.0 --profile minimal --component rustfmt,clippy
-zig version                                   # must report 0.16.0
+export RUSTUP_TOOLCHAIN=1.97.0
+unset CARGO_TARGET_DIR
+rustc --version                     # must print 1.97.0
+zig version                         # must print 0.16.0
 cargo build --locked -p botster-core-daemon --bin botster-session-worker
 cargo build --locked --bin botster-hub
-cargo fmt --all -- --check                    # strict gate
+cargo fmt --all -- --check                                       # strict gate
 cargo clippy --workspace --all-targets --locked -- -D warnings   # strict gate
 node packages/hub-test-support/scripts/sync-assets.mjs --check
 ./test.sh --locked
 (cd packages/hub-test-support && npm install --no-save && npm test)
+git diff --check a0c7141...HEAD
 ```
 
-Two commands in that list need their exact form justified, because the obvious
+Four lines in that block need their exact form justified, because the obvious
 form of each does not work.
+
+`export RUSTUP_TOOLCHAIN=1.97.0` is load-bearing. Per
+`[[botster Hub pipeline shells can override RUSTUP TOOLCHAIN below the CI pin]]`,
+a pipeline agent shell can select Rust `1.92.0` while CI pins `1.97.0`. A bare
+strict clippy then exits `0` on code that CI rejects. The Implementer must print
+`rustc --version` from the same shell as the gates and attach that line.
+
+`unset CARGO_TARGET_DIR` is load-bearing and it **overrides** the generic
+pipeline hygiene advice to redirect the Cargo target directory. Per
+`[[Hub official gates must not set CARGO TARGET DIR]]`, official locked gates
+must use the default worktree `target/` directory, because two override classes
+break `./test.sh --locked` for reasons unrelated to this ticket:
+
+- An out-of-worktree directory fails the spawn census.
+  `executable_from_this_worktree` accepts only a `botster-session-worker` whose
+  argv0 starts with `CARGO_MANIFEST_DIR`.
+- A non-default in-worktree directory fails
+  `update_replaces_the_daemon_before_a_verification_failure`, because
+  `src/update.rs` honors `CARGO_TARGET_DIR` while `tests/update_command_test.rs`
+  hard-codes `target/debug/botster-session-worker`.
+
+The generic hygiene rule that motivates a redirect applies only to a worktree
+path that contains `:`. This run's worktree path is
+`.../trybotster-botster-hub-project-pipelines-ticket_1787600674_500120`, which
+contains no colon, so the two rules do not actually conflict here. If a future
+run of this ticket lands on a colon path, the repository rule wins and the run
+must relocate the worktree rather than set `CARGO_TARGET_DIR`.
+
+Also, after every strict clippy repair the Implementer must rerun the whole
+clippy gate, per
+`[[strict clippy can hide later crate diagnostics behind the first compile failure]]`.
+A single failing compile unit hides diagnostics in later crates, so one green
+rerun is not evidence until it follows the last repair.
 
 `./test.sh --workspace` is wrong. `test.sh` already passes `--workspace`, so the
 flag arrives twice and Cargo aborts before any test runs.
 
 `npm test` on its own is wrong. `packages/hub-test-support/package.json` declares
 a runtime dependency on `@trybotster/ui-contract@0.3.3`, and `node_modules` is
-gitignored and absent from a fresh checkout. Measured at base `55f620d`:
-`npm test` aborts with `ERR_MODULE_NOT_FOUND: Cannot find package
-'@trybotster/ui-contract'` before a single assertion runs, so it can never fail
-on a contract regression — it fails on resolution first. With
-`npm install --no-save` in front, the same command reports `hub test-support
-package import and fixture materialization passed`. `--no-save` is load-bearing:
+gitignored and absent from a fresh checkout. Re-measured at base `a0c7141` under
+Node `v22.21.1`: `npm test` aborts with `ERR_MODULE_NOT_FOUND: Cannot find
+package '@trybotster/ui-contract'` before a single assertion runs, so it can
+never fail on a contract regression — it fails on resolution first. With
+`npm install --no-save` in front, the same command exits `0` and reports
+`hub test-support package import and fixture materialization passed`.
+`git status --porcelain` stayed empty afterwards, which is the tracked-worktree
+requirement. `--no-save` is load-bearing:
 plain `npm install` writes an untracked `package-lock.json`, and no
 `package-lock.json` is tracked anywhere in this repository, so `npm ci` is not
 available either.
+
+`./test.sh --locked` is the Rust test gate. A bare `cargo test` is not a
+substitute, per `[[test script required for rust tests not cargo test]]`, because
+`test.sh` first runs
+`node packages/hub-test-support/scripts/sync-assets.mjs --check` and then passes
+`--workspace` itself.
 
 `cargo check --workspace --all-targets` stays useful during development but is
 **not** a substitute for the two strict gates, and the plan no longer lists it as
 the strict Rust gate.
 
-### 11.2 Pre-existing baseline failures, owned by a prerequisite ticket
+Reviewers must read raw Cargo output for gate evidence, not an `rtk` summary, per
+`[[botster pipeline reviewers must bypass rtk summaries for cargo gate evidence]]`.
 
-The strict gates are **both red on `main`** before this ticket changes anything.
-Measured at base `55f620d` under the CI-pinned toolchain `rustc 1.97.0
-(2d8144b78 2026-07-07)` with Zig `0.16.0`:
+### 11.2 Baseline re-verification at `a0c7141`, independently measured
 
-| Gate | Result | Location |
+The previous Plan visit measured **both** strict gates red on `main` at base
+`55f620d`. `ticket_1787667162_566252` owned both repairs and merged as `a0c7141`.
+
+This Plan visit re-measured the baseline itself rather than trusting the
+prerequisite's own report. Measurements were taken in this run's worktree with
+`RUSTUP_TOOLCHAIN=1.97.0` exported and `CARGO_TARGET_DIR` unset, on the branch
+rebased onto `a0c7141`:
+
+| Check | Command | Result at `a0c7141` |
 |---|---|---|
-| `cargo fmt --all -- --check` | exit 1, one file | `src/local_webrtc.rs:7710`, inside `post_handshake_data_channel_opens_and_delivers_bytes`, the test added by the merged prerequisite `ticket_1787654915_646236` |
-| `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 101, one distinct error | `src/package_entity_fanout.rs:515`, `clippy::collapsible_match` |
+| toolchain | `rustc --version` | `rustc 1.97.0 (2d8144b78 2026-07-07)` |
+| Zig | `zig version` | `0.16.0` |
+| format | `cargo fmt --all -- --check` | exit `0` |
+| lint | `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit `0`, zero warning or error lines |
+| worktree | `git status --porcelain` | empty |
+| tracked `.gitignore` | `wc -c .gitignore` | 53 bytes, matches `HEAD` |
+| Core roll target | `git ls-remote .../botster-core.git refs/heads/main` | `358ef1a6bf0f792f6da10d60890be39cb16779d0`, unchanged |
 
-**Neither repair belongs in this ticket.** Blocking question
-`question_1787667127_613797` resolved this: `ticket_1787667162_566252`, "Hub:
-restore the strict Rust gate baseline", owns both. It formats only the merged
-post-handshake WebRTC test, fixes only the `package_entity_fanout`
-collapsible-match warning, forbids behavior changes, adjacent cleanup, and module
-extraction, and must pass `cargo fmt`, strict clippy, and `./test.sh --locked`.
+Both strict gates are therefore green before this ticket changes anything.
+**Any strict-gate failure the Implement step sees is its own regression**, and it
+may not be attributed to an inherited baseline.
 
-The first draft of this plan proposed fixing the `fmt` failure here, on the
-grounds that `src/local_webrtc.rs` is a file this ticket rewrites. That was
-overruled, and the instruction is explicit: **do not carry either baseline repair
-in the feature diff.** Implement starts from a `main` on which both gates are
-already green, so any strict-gate failure it sees is its own.
+Two consequences follow, and both are binding:
 
-This is why the clippy failure mattered enough to stop for. It sits in
-`src/package_entity_fanout.rs`, a file this ticket lists as untouched by design,
-so a waiver would have left this ticket unable to distinguish an inherited
-failure from a regression in its own new module.
+1. Neither baseline repair may appear in this ticket's diff. The rustfmt repair
+   inside `post_handshake_data_channel_opens_and_delivers_bytes` and the
+   `clippy::collapsible_match` repairs in `src/package_entity_fanout.rs` and
+   `tests/hub_daemon_lifecycle/sessions.rs` are already on `main`. This is the
+   explicit instruction from the answer to `question_1787667127_613797`.
+2. `src/package_entity_fanout.rs` stays on this ticket's untouched list. The
+   earlier reason for touching it is gone.
+
+This is why the earlier clippy failure was worth stopping for. It sat in a file
+this ticket lists as untouched, so a waiver would have left this ticket unable to
+tell an inherited failure from a regression in its own new module.
 
 ### 11.3 Downstream consumer proof for the public DTO change
 
@@ -645,9 +749,12 @@ applies in full. The four sites, in order:
 3. Publishing a new `@trybotster/hub-test-support` coordinate.
 4. The consumer's vendored copy and exact pin.
 
-Measured current values at base `55f620d`: `packages/hub-test-support` is
-`0.1.42`, `metadata.json` reports `protocol_version` 7 and
-`conformance_fixture_revision` 46, and `ui_contract.package_version` is `0.3.3`.
+Re-measured at base `a0c7141`, all unchanged from the previous visit:
+`packages/hub-test-support/package.json` is `0.1.42`, `metadata.json` reports
+`package_version` `0.1.42`, `protocol_version` 7 and
+`conformance_fixture_revision` 46, `ui_contract.package_version` is `0.3.3`, and
+`crates/botster-hub-client/src/lib.rs` declares `PROTOCOL_VERSION = 7` at `:33`
+and `CONFORMANCE_FIXTURE_REVISION = 46` at `:34`.
 This ticket moves the test-support package to the next unpublished version and
 bumps the conformance fixture revision. The UI contract is unchanged, because
 this ticket adds no new UI types.
@@ -704,14 +811,21 @@ fails to compile. An identity oracle that cannot go red proves nothing.
 | Sustained aggregate saturation tears down a terminal route after 512 consecutive `WouldBlock` results | backpressure silently becomes route teardown | the implementer accepts this deliberately; A27b proves the documented end state; section 9.1 excluding control from the budget keeps the teardown notice sendable |
 | Semantic rebase against `ticket_1787603671_590198` and `ticket_1787600682_233928` | completed review goes stale | disjoint new modules; this ticket merges first; review is renewed after any semantic rebase |
 | Wall-clock assertions flake under suite load | false failures | deterministic gates only; timing recorded as evidence |
-| Both strict gates are already red on `main` (`fmt` at `src/local_webrtc.rs:7710`, `clippy` at `src/package_entity_fanout.rs:515`) | an inherited failure is mistaken for one this ticket caused, or a strict gate is skipped as "known broken" | `ticket_1787667162_566252` owns both repairs and blocks this ticket; neither repair may appear in this feature diff; Implement starts from a green baseline |
+| A baseline repair is re-carried into this feature diff | the review surface widens and the diff contains work `main` already has | `ticket_1787667162_566252` merged as `a0c7141`; section 11.2 re-measures both strict gates green; `src/package_entity_fanout.rs` returns to the untouched list |
+| A strict gate runs under a pipeline shell toolchain below the CI pin | a bare clippy exits `0` on code CI rejects | the gate block exports `RUSTUP_TOOLCHAIN=1.97.0` and requires the `rustc --version` line captured in the same shell |
+| A gate run sets `CARGO_TARGET_DIR` | `./test.sh --locked` fails the spawn census or the update test, and the failure teaches the wrong lesson | the gate block unsets it; section 11.1 records why the generic hygiene rule does not apply on this colon-free worktree path |
+| One clippy repair hides diagnostics in later crates | a partial green reads as a full green | the whole clippy gate reruns after the last repair |
 | The strict gates are omitted or run under the wrong toolchain | `clippy -D warnings` and `rustfmt` differ across Rust versions, so a local pass is not a CI pass | section 11.1 pins Rust `1.97.0` and Zig `0.16.0` and lists both strict gates explicitly |
 | `npm test` is listed without `npm install --no-save` | the Node acceptance command aborts on module resolution and can never fail on a contract regression, so it reads as passing coverage that does not exist | section 11.1 records the measured `ERR_MODULE_NOT_FOUND` and the working form |
 | The public DTO change ships without downstream-shaped proof | production builds stay green while each generic client breaks on one test line | section 11.3 requires the TUI-shaped three-dependency `cargo build --tests` probe with a wrong-rev ablation and the Web-shaped packed-tarball probe |
 | Site 3 publication is claimed rather than performed | a downstream ticket consumes a coordinate that does not exist or carries stale bytes | section 11.3 scopes this ticket to sites 1 and 2 and forbids any release claim |
 | The rejected-channel test stays tautological | isolation is asserted, not measured | the surviving-channel positive control and the channel-`Open` proof are both required, per `[[rejected channel isolation needs a surviving channel positive control]]` |
 
-## 12.1 Plan Review return, review_1787666788_871227
+## 12.1 Plan Review return from the previous visit, review_1787666788_871227
+
+This section is history. It records the four findings the previous Plan visit
+received on run `run_1787664777_379002`, and how each was resolved. Every
+resolution survives into this revision.
 
 Verdict was `changes_required` with four findings. Each was re-measured at base
 `55f620d` before it was accepted, per the role rule that a reported failure needs
@@ -729,14 +843,23 @@ conclusions matched this plan, so nothing in sections 1 to 10 changed.
 
 ## 13. Vault gaps worth capturing
 
-1. **The `botster-hub-playbook` required gate still says "While Hub pins
-   `webrtc 0.20`, reject Hub-created post-handshake channels".** That pin is
-   merged away at base `55f620d`. The gate line needs the 0.21 wording. This is
-   the highest-value gap, because a future planner reading the charter would
-   plan against a limitation that no longer exists.
+Two gaps from the previous visit are now partly closed. This revision re-checked
+the charter rather than repeating the earlier claim.
+
+1. **`[[botster-hub-playbook]]` line 180 still says "While Hub pins `webrtc
+   0.20`, reject Hub-created post-handshake channels and require every isolation
+   test channel to prove `Open`".** That pin is merged away. **Partly closed:**
+   line 179 was already corrected to "reserve the label in Hub and let the
+   browser create the channel", which is this ticket's contract. Line 180's
+   `0.20` clause is the remaining stale half. The `Open` proof requirement is
+   still correct and must survive any rewrite. This stays the highest-value gap,
+   because a planner reading line 180 alone would plan against a limitation that
+   no longer exists.
 2. **`[[Hub Core pin rolls update eleven literal sites and six lock sources]]`
-   undercounts.** The measured active literal count at this base is eighteen.
-   The note should state the discovery command rather than a fixed count.
+   undercounts.** The re-measured active literal count at `a0c7141` is eighteen,
+   plus one historical `docs/reports/**` match that must not be rolled. The note
+   should state the discovery command and the `docs/` exclusion rather than a
+   fixed count.
 3. **A subscription channel label binds identity and generation.** The
    architecture section 8.3 scheme deserves an atomic note once implemented.
 4. **Per-channel AES-GCM binds a frame to its subscription.** The section 8.4
@@ -753,7 +876,69 @@ conclusions matched this plan, so nothing in sections 1 to 10 changed.
    runs the assertions and leaves the tracked worktree clean. Worth an atomic
    note, because a plan listing `npm test` alone looks correct.
 8. **The Hub strict Rust gates are the CI gates, under a pinned toolchain.**
-   `[[botster-hub-playbook]]` says "strict Rust gates" without naming
-   `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked
-   -- -D warnings`, Rust `1.97.0`, or Zig `0.16.0`. Naming them in the charter
-   would have prevented this Plan return.
+   **Partly closed.** `[[botster-hub-playbook]]` now carries
+   `[[botster Hub pipeline shells can override RUSTUP TOOLCHAIN below the CI pin]]`
+   at line 43 and the `RUSTUP_TOOLCHAIN=1.97.0` rule at line 207, and
+   `[[Hub official gates must not set CARGO TARGET DIR]]` exists. The charter
+   still never writes the two gate command strings themselves, so a planner must
+   read `.github/workflows/ci.yml` to learn them. One line naming
+   `cargo fmt --all -- --check` and
+   `cargo clippy --workspace --all-targets --locked -- -D warnings` would close
+   it.
+9. **A repository-owned official gate block outranks generic pipeline worktree
+   hygiene.** The Botster Stack Delivery step prompt tells a planner to set
+   `CARGO_TARGET_DIR` on a colon-bearing worktree path, while this repository
+   forbids setting it on official gates at all. The two rules are compatible only
+   because the colon case is rare. A note stating that the repository rule wins,
+   and that a colon path must be relocated instead, would remove the ambiguity
+   before it produces a wrong gate run.
+
+## 14. Revision record for this Plan visit, run `run_1787678814_340532`
+
+The previous run `run_1787664777_379002` was cancelled without advancing feature
+work, after the strict Rust gates were measured red on `main` and one
+prerequisite ticket was registered to own both repairs. That prerequisite merged
+as `a0c7141`. This visit restarts the plan from current `main`, exactly as the
+answer to `question_1787667127_613797` instructed.
+
+This visit did not re-derive the product plan. Sections 4 to 10 and 11.3 hold
+unchanged, because the answered questions that produced them are still answered
+and the underlying code did not move. What this visit changed:
+
+| Change | Reason |
+|---|---|
+| Base commit `55f620d` → `a0c7141`; the branch was rebased onto `a0c7141` | the prerequisite merged |
+| Section 1 dependency table: all three dependencies closed, no blocking dependency remains | `project_pipelines_current_context` reports `blocking_dependencies` empty |
+| Section 11.2 rewritten: from "both strict gates red, owned by a prerequisite" to an independently re-measured green baseline | the prerequisite's report is not accepted on its own; both gates were re-run here |
+| Section 11.1 gate block replaced with the repository's own official block | the prerequisite published it, together with `export RUSTUP_TOOLCHAIN=1.97.0` and `unset CARGO_TARGET_DIR` |
+| Section 2 adds five gate-hygiene notes | all five were published by the prerequisite and none existed at the previous visit |
+| Section 8 states the discovery command and the one historical `docs/reports/**` match | a fixed count is what made the note wrong in the first place |
+| Section 12 risks: the "both gates red" row is replaced by four gate-execution rows | the inherited-failure risk is gone; the wrong-toolchain, `CARGO_TARGET_DIR`, and partial-clippy risks are the live ones |
+| Section 13 marks gaps 1 and 8 partly closed and adds gap 9 | the charter moved between visits |
+| `src/package_entity_fanout.rs` returns to the untouched-by-design list with no exception | its clippy repair is already on `main` |
+
+Independent base re-verification performed by this visit, not carried forward
+from the previous plan text:
+
+1. `git fetch origin main`, `git rebase origin/main`. The branch carried only the
+   two plan-document commits and rebased cleanly onto `a0c7141`.
+2. `rustc --version` → `rustc 1.97.0 (2d8144b78 2026-07-07)`; `zig version` →
+   `0.16.0`, both from the gate shell.
+3. `cargo fmt --all -- --check` → exit `0`.
+4. `cargo clippy --workspace --all-targets --locked -- -D warnings` → exit `0`,
+   zero warning or error lines.
+5. `git ls-remote` on `botster-core` → `358ef1a`, the roll target, unchanged.
+6. The Core pin discovery grep → nineteen matches, eighteen active.
+7. `packages/hub-test-support` version, `metadata.json` revisions, and the
+   `botster-hub-client` constants → all unchanged.
+8. Bare `npm test` → `ERR_MODULE_NOT_FOUND` before any assertion.
+   `npm install --no-save && npm test` → exit `0`, then
+   `git status --porcelain` empty.
+9. Every symbol line number cited in sections 3 and 7 → re-measured at
+   `a0c7141`. `src/local_webrtc.rs` is now 7871 lines; the four removed lines are
+   all after `:7710`, so no cited reference moved.
+10. `docs/plans/freeze-subscription-ownership-...md` §8.2 → still reads "Hub
+    creates every subscription DataChannel", so the correction in scope item 10
+    is still owed and has not been made by another ticket.
+
+No blocking question is open for this run, and this visit asks none.
