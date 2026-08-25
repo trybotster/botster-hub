@@ -70,16 +70,69 @@ async fn wait_for_webrtc_marker(
     );
 }
 
+fn extra_channel_observation(path: &Path) -> Option<(bool, bool)> {
+    let raw = fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    Some((
+        value.get("lost_claim")?.as_bool()?,
+        value.get("close_ok")?.as_bool()?,
+    ))
+}
+
+fn wait_for_path(path: &Path, bound: Duration) -> bool {
+    let deadline = Instant::now() + bound;
+    while Instant::now() < deadline && !path.exists() {
+        thread::sleep(Duration::from_millis(50));
+    }
+    path.exists()
+}
+
+fn assert_production_second_channel_reject_source() {
+    let on_data_channel = hub_source("src/local_webrtc.rs");
+    assert!(
+        !on_data_channel.contains("test_extra_label"),
+        "extra-channel reject must not use a test-only label override"
+    );
+    assert!(
+        on_data_channel.contains("let claimed = self.peer_state.claim_data_channel();"),
+        "second DataChannel must hit the production one-shot claim"
+    );
+    assert!(
+        on_data_channel.contains("if !claimed"),
+        "second DataChannel must take the reject path only after claim_data_channel returns false"
+    );
+    assert!(
+        on_data_channel.contains("let close_ok = matches!(close, Ok(Ok(())));"),
+        "close observation must require timeout(local_close) to return Ok(Ok(()))"
+    );
+    assert!(
+        on_data_channel.contains("extra-channel close marker requires lost_claim && close_ok"),
+        "close marker must require a lost claim and Ok(Ok(())) from timeout(local_close)"
+    );
+    assert!(
+        on_data_channel.contains("local WebRTC rejecting extra DataChannel"),
+        "rejected extra DataChannel must take the close path"
+    );
+}
+
 #[test]
 fn webrtc_peer_rejects_a_second_data_channel() {
     let _guard = daemon_test_guard();
     let marker_dir = unique_test_dir("so-2ch-close");
     std::fs::create_dir_all(&marker_dir).expect("create extra-channel close marker dir");
     let close_marker = marker_dir.join("extra-closed");
+    let observation = marker_dir.join("extra-observation.json");
     let marker = close_marker.to_string_lossy().into_owned();
+    let observation_path = observation.to_string_lossy().into_owned();
     let (hub, endpoint, bootstrap) = start_webrtc_adapter_hub_with_env(
         "so-2ch",
-        &[("BOTSTER_HUB_TEST_EXTRA_CHANNEL_CLOSE_MARKER", marker.as_str())],
+        &[
+            ("BOTSTER_HUB_TEST_EXTRA_CHANNEL_CLOSE_MARKER", marker.as_str()),
+            (
+                "BOTSTER_HUB_TEST_EXTRA_CHANNEL_OBSERVATION",
+                observation_path.as_str(),
+            ),
+        ],
     );
     let session_id = "so-2ch-session";
     let subscription_id = "so-2ch-sub";
@@ -88,7 +141,7 @@ fn webrtc_peer_rejects_a_second_data_channel() {
             open_local_webrtc_peer_with_extra_channel(&endpoint, &bootstrap).await;
         peer.encrypted_hello(&key, &webrtc_terminal_adapter_hello())
             .await
-            .expect("hello");
+            .expect("hello on the claimed botster-client channel");
         spawn_and_bind_webrtc(
             &mut peer,
             &key,
@@ -97,10 +150,20 @@ fn webrtc_peer_rejects_a_second_data_channel() {
             "printf 'so-2ch-ready\\n'; sleep 30",
         )
         .await;
-        let close_deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < close_deadline && !close_marker.exists() {
-            thread::sleep(Duration::from_millis(50));
-        }
+        assert!(
+            wait_for_path(&observation, Duration::from_secs(10)),
+            "Hub must observe the production extra-channel reject"
+        );
+        let (lost_claim, close_ok) = extra_channel_observation(&observation)
+            .expect("extra-channel observation must be valid JSON");
+        assert!(
+            lost_claim,
+            "second DataChannel must lose the production one-shot claim"
+        );
+        assert!(
+            close_ok,
+            "timeout(local_close) must return Ok(Ok(())) for the rejected extra DataChannel"
+        );
         assert!(
             close_marker.exists(),
             "Hub must finish local_close on the rejected extra DataChannel"
@@ -126,19 +189,52 @@ fn webrtc_peer_rejects_a_second_data_channel() {
             extra_terminal_frames, 0,
             "rejected extra DataChannel must not receive terminal frames"
         );
-        let on_data_channel = hub_source("src/local_webrtc.rs");
-        assert!(
-            on_data_channel.contains("test_extra_label || !self.peer_state.claim_data_channel()"),
-            "second DataChannel must hit the one-shot claim or the labeled extra-reject path"
-        );
-        assert!(
-            on_data_channel.contains("local WebRTC rejecting extra DataChannel"),
-            "rejected extra DataChannel must take the close path"
-        );
+        assert_production_second_channel_reject_source();
         wait_for_webrtc_marker(&mut peer, &key, session_id, subscription_id, "so-2ch-ready").await;
         peer.peer.close().await.expect("close offer peer");
     });
     shutdown_short_lived_session(&endpoint, session_id);
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn webrtc_peer_rejects_a_second_data_channel_requires_one_shot_claim() {
+    let _guard = daemon_test_guard();
+    let marker_dir = unique_test_dir("so-2ch-neg");
+    std::fs::create_dir_all(&marker_dir).expect("create extra-channel negative-control dir");
+    let close_marker = marker_dir.join("extra-closed");
+    let observation = marker_dir.join("extra-observation.json");
+    let marker = close_marker.to_string_lossy().into_owned();
+    let observation_path = observation.to_string_lossy().into_owned();
+    let (hub, endpoint, bootstrap) = start_webrtc_adapter_hub_with_env(
+        "so-2ch-neg",
+        &[
+            ("BOTSTER_HUB_TEST_DISABLE_ONE_SHOT_CLAIM", "1"),
+            ("BOTSTER_HUB_TEST_EXTRA_CHANNEL_CLOSE_MARKER", marker.as_str()),
+            (
+                "BOTSTER_HUB_TEST_EXTRA_CHANNEL_OBSERVATION",
+                observation_path.as_str(),
+            ),
+        ],
+    );
+    block_on(async {
+        let (mut peer, _extra, key) =
+            open_local_webrtc_peer_with_extra_channel(&endpoint, &bootstrap).await;
+        peer.encrypted_hello(&key, &webrtc_terminal_adapter_hello())
+            .await
+            .expect("hello still works when every channel is admitted");
+        thread::sleep(Duration::from_millis(400));
+        assert!(
+            extra_channel_observation(&observation).is_none(),
+            "disabling the one-shot claim must fail the lost-claim oracle"
+        );
+        assert!(
+            !close_marker.exists(),
+            "disabling the one-shot claim must not write the successful-close marker"
+        );
+        assert_production_second_channel_reject_source();
+        peer.peer.close().await.expect("close offer peer");
+    });
     hub.shutdown().expect("shutdown isolated hub");
 }
 
