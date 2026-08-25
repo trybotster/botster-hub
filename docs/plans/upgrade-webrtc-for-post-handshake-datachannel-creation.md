@@ -5,7 +5,20 @@ Run: `run_1787654940_337274`
 Pipeline: Botster Stack Delivery (`botster_stack_delivery`)
 Plan base commit: `f66d459` (clean tracked worktree)
 
-## Plan Review response (review_1787656724_548895, changes_required)
+## Plan Review response (review_1787657378_172980, changes_required) — rev3
+
+Second review. All three findings carried concrete `details` and `suggested_fix`, and all three were
+correct. Each was verified against the code before the fix.
+
+| Finding | Severity | Resolution |
+|---------|----------|------------|
+| The `Hello` row omits live admission ownership and its cleanup | high | Accepted; my rev2 row was factually wrong. Verified in code: `local_webrtc.rs:1440` sends `RegisterWebrtcAdmission`, `daemon_transport.rs:2452` inserts a `HostCompatibilityRecord` and a `WebrtcTerminalAdmission` keyed by `grant_id`, an `Admitted` entry carries the terminal-route `WebRtcConnectionMux` and binds `close_work`, the insert is guarded by `has_live_peer` at `:2457`, and `LocalWebrtcPeerClosed` removes both rows at `:3046-3047`. The matrix row now states all of that, and A9 proves the sweep. |
+| The red-on-revert rule conflicts with the stated live Hub risk | high | Accepted. Rev2 required both A4 and A4-live to go red on `0.20` while R6 said A4-live might legitimately stay green — those cannot both be one pass gate. A5 now makes **A4 the causality gate** (the library test carries no unrelated traffic, so nothing else can wake the driver), treats the **A4-live `0.20` result as diagnostic**, and adds an explicit escalation: if A4 stays green on `0.20`, assumption A2 is false and Implement must call `project_pipelines_ask_human` rather than decide alone. |
+| Focused WebRTC acceptance lacks exact selectors and nonzero counts | medium | Accepted. A3 now lists six exact commands, A9 adds the Hello-sweep selector, and A9b covers the three new or hardened tests. Every command must be recorded with its `running N tests` line and **N nonzero**, because a filter that selects zero tests passes vacuously. The `webrtc_peer_rejects_a_second_data_channel` prefix must report two tests, since a count of one means its one-shot-claim negative control never ran. |
+
+No finding was disputed in this round.
+
+## Plan Review response (review_1787656724_548895, changes_required) — rev2
 
 This revision answers all five findings. The findings carried no `details` or `suggested_fix`, so
 each was re-derived from the repository and the vault.
@@ -276,7 +289,7 @@ event-plane holders, the `WebRtcConnectionMux` routes, and the `data_channel_cla
 |---------|-----------|----------------------------------|----------------|
 | `on_data_channel` (first channel) | `data_channel_claimed` one-shot under `grant_id` | peer terminal cause published; poller exits | peer cleanup removes every per-peer owner together |
 | `on_data_channel` (post-handshake / extra) — newly reachable | claim already taken, so `claimed == false` | `reject_extra_data_channel` closes it under the peer close bound; no route, no adapter bound | none: nothing was inserted |
-| `Hello` (terminal admission) | `grant_id` + stream key + terminal compatibility | rejected once the peer terminal cause is published | admission never becomes a route |
+| `Hello` (terminal admission) | `grant_id`. `local_webrtc.rs:1440` sends `ControlMessage::RegisterWebrtcAdmission`; `daemon_transport.rs:2452` inserts a `HostCompatibilityRecord` into `pending_runtime.host_compatibility` and a `WebrtcTerminalAdmission` into `pending_runtime.webrtc_admissions`, both keyed by `grant_id`. An `Admitted` admission carries the `WebRtcConnectionMux` used for terminal routes and binds `close_work` into it. | the handler inserts only `if daemon.local_webrtc().has_live_peer(&grant_id)` (`daemon_transport.rs:2457`), so an admission racing `PeerClosed` is dropped rather than resurrected | `LocalWebrtcPeerClosed` removes both rows for every entry in `removed_grants` (`daemon_transport.rs:3046-3047`), and the admitted mux closes with the peer as part of the single peer cleanup |
 | `Attach` | `grant_id` + `(session_id, subscription_id, generation)` in `attached_subscriptions` | rejected after terminal failure; pre-READY failure creates no ownership | peer cleanup drains `attached_subscriptions` and releases route occupancy |
 | `Detach` | same attach identity | idempotent after terminal failure | route-aware and idempotent cleanup |
 | `SubscribeEntities` | `grant_id` + subscription id in `entity_subscription_ids` | rejected after terminal failure | peer cleanup clears `entity_subscription_ids` |
@@ -284,6 +297,12 @@ event-plane holders, the `WebRtcConnectionMux` routes, and the `data_channel_cla
 | `SubscribeEvents` / `UnsubscribeEvents` | connection-scoped event holder under the WebRTC grant owner | rejected after terminal failure | event-plane holders retire with the connection |
 | `Spawn` / `ShutdownSession` | session-owned, not peer-owned | unchanged | session lifecycle owns teardown |
 | `PeerClosed` | `grant_id` | terminal | sweeps the whole owner set in one cleanup, per [[webrtc peer cleanup removes every per peer owner together]] |
+
+Correction from Plan Review (finding_1787657378_238601): revision 2 of this plan claimed the
+`Hello` row "never becomes a route" and listed no sweep. That was wrong. Hello admission creates two
+durable rows keyed by `grant_id`, and the admitted entry carries the terminal-route mux. The row
+above now names both rows, the live-peer guard that rejects a late admission, and the `PeerClosed`
+sweep that removes them. Acceptance check A9 proves the sweep.
 
 Invariant this ticket must preserve: **no row in this table changes.** The upgrade adds no owner
 tag, no rejection rule, and no sweep. The only row whose *arrival timing* changes is the
@@ -381,11 +400,11 @@ Unknowns for Implement to resolve, each with a named resolution:
   assert on delivered bytes rather than on elapsed time.
 - R5. **Silent scope creep into channel routing.** Mitigation: the non-scope list above, and the
   invariant that the single-claim rejection policy is unchanged in this ticket.
-- R6. **A4-live could pass on 0.20 and falsify assumption A2.** If the Hub's own control traffic
-  already wakes the driver, the post-handshake DCEP may flush on `0.20` too. Mitigation: A5 runs the
-  ablation explicitly and Implement reports a green-on-0.20 result rather than suppressing it. The
-  plan's value does not collapse if this happens — the migration is still required — but the
-  ticket's stated rationale would need correcting.
+- R6. **Live Hub traffic can mask the dependency change.** The Hub's own `Hello`, `Spawn`, and
+  `Attach` traffic can wake the driver, so A4-live may pass on `0.20` for reasons unrelated to
+  `wake_writes()`. This is why A5 makes A4, not A4-live, the causality gate, and treats the A4-live
+  `0.20` result as diagnostic. If A4 itself stays green on `0.20`, assumption A2 is false and the
+  escalation rule in A5 applies: stop and ask a human.
 - R7. **Fresh-target suite failures mistaken for regressions.** The `Cargo.lock` change forces a
   fresh target, where missing-worker failures look like real breakage. Mitigation: the two prebuild
   commands are a stated precondition, not an optimization.
@@ -419,10 +438,32 @@ realpaths for both binaries.
 
 - A1. `cargo check --workspace --all-targets` passes with no warnings introduced by this change.
 - A2. `./test.sh --locked` passes, after the two prebuild commands above.
-- A3. Focused WebRTC lifecycle tests pass, including
-  `local_webrtc_close_hang_fail_closed_returns_handler_within_deadline` and the existing
-  `webrtc_peer_rejects_a_second_data_channel` pre-handshake rejection proof with its
-  `..._requires_one_shot_claim` negative control.
+- A3. **Focused WebRTC lifecycle proofs, by exact selector.** Every command below must be recorded
+  in the implement report with its `running N tests` line, and **N must be nonzero**. A filter that
+  selects zero tests passes vacuously and is not evidence.
+
+  ```bash
+  # Close bound and fail-closed handler deadline
+  BOTSTER_ENV=test cargo test --locked --lib \
+    local_webrtc::tests::local_webrtc_close_hang_fail_closed_returns_handler_within_deadline
+  # Ultimate-close sibling sacrifice and full owner sweep
+  BOTSTER_ENV=test cargo test --locked --lib \
+    local_webrtc::tests::ultimate_close_failure_sacrifices_every_peer_and_sweeps_all_owners
+  # Single-peer failure preserves siblings and the runtime
+  BOTSTER_ENV=test cargo test --locked --lib \
+    local_webrtc::tests::local_webrtc_single_peer_failed_cleanup_preserves_sibling_peer_and_runtime
+  # Pre-handshake rejection proof and its one-shot-claim negative control
+  ./test.sh --locked --test hub_daemon_lifecycle_test webrtc_peer_rejects_a_second_data_channel
+  # Live sibling survival across peer close
+  ./test.sh --locked --test hub_daemon_lifecycle_test peer_close_leaves_sibling_peers_working
+  # Post-handshake isolation, with the open now required (A7)
+  ./test.sh --locked --test hub_daemon_lifecycle_test \
+    webrtc_terminal_adapter_second_data_channel_does_not_receive_terminal_frames
+  ```
+
+  The `webrtc_peer_rejects_a_second_data_channel` selector is a prefix match and must report **two**
+  tests: the proof and its `..._requires_one_shot_claim` negative control. If it reports one, the
+  negative control did not run and the evidence is incomplete.
 - A4. **Two-peer library regression test.** Both peers reach `RTCPeerConnectionState::Connected`.
   Only then does one peer call `create_data_channel` with `ordered: true`, `max_retransmits: None`,
   and `max_packet_life_time: None`. The test asserts, in order:
@@ -443,9 +484,19 @@ realpaths for both binaries.
   This is the live Hub production-path proof. It uses the existing Hub-visible oracle rather than a
   helper call, and it requires no reservation or routing work.
 - A5. **Red-on-revert ablation**, per [[a regression test must be shown to go red with the fix
-  reverted]]. With `webrtc` pinned back to `0.20.0-beta.2`, both A4 and A4-live must fail: no
-  `OnOpen` on the late channel and no observation file. Implement records both ablation outputs.
-  A green A4-live on `0.20` would falsify assumption A2 and must be reported, not explained away.
+  reverted]]. Revision 2 required both A4 and A4-live to fail on `0.20`, which contradicted risk R6.
+  Plan Review was right that those cannot both define one pass gate. The rule is now split by what
+  each test can actually isolate:
+  - **A4 is the required dependency-causality ablation.** The two-peer library test carries no
+    unrelated traffic, so nothing else can wake the driver. With `webrtc` pinned to `0.20.0-beta.2`
+    it **must** fail. This is the gate.
+  - **A4-live is the required production-path proof on `0.21` only.** A live Hub necessarily carries
+    `Hello`, `Spawn`, and `Attach` traffic that can wake the driver on its own, so its `0.20` result
+    is **diagnostic, not a gate**, unless the test is built to isolate unrelated driver wakes.
+    Implement records the `0.20` A4-live result either way.
+  - **Escalation rule.** If A4 also stays green on `0.20`, the ticket's stated dependency rationale
+    is false. Implement must stop and call `project_pipelines_ask_human` rather than proceed. The
+    migration may still be worth doing, but that is a human decision, not a planner's.
 - A6. **Detach-on-drop assertion.** A task spawned through `Runtime::spawn` whose
   `Box<dyn JoinHandle>` is dropped still runs to completion, closing the risk that a silently
   cancelled poller changes teardown behavior.
@@ -459,8 +510,21 @@ realpaths for both binaries.
 - A8. **Preserved lifecycle proof.** Pre-handshake channel creation, signaling, ICE, AES-GCM
   encryption, chunking, close bounds, reconnect, and peer lifecycle tests all pass with no test
   weakened, no assertion deleted, and no production bound widened.
-- A9. **Preserved teardown proof.** The ultimate-close sibling-sacrifice suite and the full per-peer
-  cleanup suite stay green, covering every owner in the `late_message_matrix` table.
+- A9. **Preserved teardown proof, including the corrected Hello row.** The selectors in A3 cover
+  ultimate-close sibling sacrifice, single-peer cleanup, and live sibling survival. In addition,
+  prove the Hello admission sweep that the corrected matrix row names: after `PeerClosed`, both
+  `pending_runtime.webrtc_admissions` and `pending_runtime.host_compatibility` no longer hold a row
+  for the closed `grant_id`. Name the exact selector that covers this in the implement report with
+  its nonzero test count; if no existing test asserts both removals, add one, since the plan now
+  claims that sweep as an invariant.
+
+  ```bash
+  ./test.sh --locked --test hub_daemon_lifecycle_test peer_close
+  ```
+- A9b. **New-test selectors.** The three tests this ticket adds or hardens must each be run by exact
+  selector with a nonzero count recorded: the A4 two-peer library test (`--lib`, under
+  `local_webrtc::tests::`), the A4-live test (`--test hub_daemon_lifecycle_test`), and the A7
+  hardening (`--test hub_daemon_lifecycle_test`). Implement records the final chosen test names.
 - A10. **Exact version evidence.** The implement report records the resolved `webrtc`, `rtc`, and
   `rtc-*` versions from `Cargo.lock`, the base commit, the separate Hub and locked-Core provenance,
   and the `Cargo.lock` diff summary.
