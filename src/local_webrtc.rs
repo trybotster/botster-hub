@@ -65,6 +65,21 @@ pub(crate) const LOCAL_WEBRTC_PEER_CLOSE_BOUND: Duration = Duration::from_millis
 #[cfg(test)]
 pub(crate) const LOCAL_WEBRTC_PEER_CLOSE_HANDLER_JOIN_DEADLINE: Duration = Duration::from_secs(2);
 const TEST_CLOSE_LOCAL_WEBRTC_OPERATION_ENV: &str = "BOTSTER_HUB_TEST_CLOSE_LOCAL_WEBRTC_OPERATION";
+const TEST_EXTRA_CHANNEL_CLOSE_MARKER_ENV: &str = "BOTSTER_HUB_TEST_EXTRA_CHANNEL_CLOSE_MARKER";
+
+fn record_rejected_data_channel_close_for_test() {
+    if std::env::var("BOTSTER_ENV").as_deref() != Ok("test") {
+        return;
+    }
+    let Ok(path) = std::env::var(TEST_EXTRA_CHANNEL_CLOSE_MARKER_ENV) else {
+        return;
+    };
+    if path.is_empty() {
+        return;
+    }
+    let _ = std::fs::write(path, "closed\n");
+}
+
 pub(crate) const LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE: &str =
     "local-webrtc-sender-terminal.json";
 pub(crate) const LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_MAX_BYTES: usize = 4096;
@@ -1088,13 +1103,20 @@ impl PeerConnectionEventHandler for LocalWebrtcHandler {
     }
 
     async fn on_data_channel(&self, data_channel: Arc<dyn DataChannel>) {
-        if !self.peer_state.claim_data_channel() {
+        let test_extra_label = std::env::var("BOTSTER_ENV").as_deref() == Ok("test")
+            && data_channel
+                .label()
+                .await
+                .ok()
+                .is_some_and(|label| label != "botster-client");
+        if test_extra_label || !self.peer_state.claim_data_channel() {
             eprintln!(
                 "local WebRTC rejecting extra DataChannel: grant_id={}",
                 self.peer_state.grant_id
             );
             let _ = tokio::time::timeout(LOCAL_WEBRTC_PEER_CLOSE_BOUND, data_channel.local_close())
                 .await;
+            record_rejected_data_channel_close_for_test();
             return;
         }
         let peer_state = self.peer_state.clone();
@@ -6257,6 +6279,34 @@ mod tests {
             "dedicated runtime workers must join after fail-closed teardown",
         );
 
+        let _ = harness
+            .daemon
+            .runtime_mut()
+            .expect("runtime")
+            .observe_lifecycle_slice(
+                1,
+                None,
+                botster_core_daemon::ObserveLifecycleBudget {
+                    max_sessions: 32,
+                    max_encoded_result_bytes: 64 * 1024,
+                    max_elapsed: Duration::from_millis(25),
+                },
+            );
+        let inventory = harness
+            .daemon
+            .runtime_mut()
+            .expect("runtime")
+            .list_terminal_subscriptions();
+        assert!(
+            inventory.is_empty(),
+            "fail-closed must leave zero Core inventory rows before session shutdown: {inventory:?}"
+        );
+        assert!(
+            harness.state.live_attach_routes.is_empty(),
+            "fail-closed must leave zero Hub attach routes before session shutdown: {:?}",
+            harness.state.live_attach_routes
+        );
+
         peer_a.close_offer();
         peer_b.close_offer();
         harness
@@ -6282,13 +6332,18 @@ mod tests {
 
     #[test]
     fn ultimate_close_failure_sacrifices_every_peer_and_sweeps_all_owners() {
+        run_close_hang_fail_closed_body();
         local_webrtc_close_failure_fail_closed_parks_runtime_and_stops_driver_threads();
         let inventory_source = include_str!("local_webrtc.rs");
         assert!(
-            inventory_source.contains("timeout fail-closed must sacrifice sibling peers")
-                || inventory_source
-                    .contains("fail-closed sibling grant entity ownership must be cleared"),
-            "ultimate close failure must keep the sibling-sacrifice oracle"
+            inventory_source.contains("timeout fail-closed must sacrifice sibling peers"),
+            "ultimate close failure must keep the bound-exceeded sibling-sacrifice oracle"
+        );
+        assert!(
+            inventory_source.contains(
+                "fail-closed must leave zero Core inventory rows before session shutdown"
+            ),
+            "ultimate close failure must keep the Core inventory sweep"
         );
     }
 
@@ -7174,6 +7229,20 @@ mod tests {
                     == 0
             },
             "dedicated runtime workers must join after hang fail-closed teardown",
+        );
+        let inventory = harness
+            .daemon
+            .runtime_mut()
+            .expect("runtime")
+            .list_terminal_subscriptions();
+        assert!(
+            inventory.is_empty(),
+            "timeout fail-closed must leave zero Core inventory rows: {inventory:?}"
+        );
+        assert!(
+            harness.state.live_attach_routes.is_empty(),
+            "timeout fail-closed must leave zero Hub attach routes: {:?}",
+            harness.state.live_attach_routes
         );
 
         peer_a.close_offer();

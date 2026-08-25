@@ -494,6 +494,25 @@ pub(crate) struct ExtraWebrtcDataChannel {
 impl LocalWebrtcOfferPeer {
     pub(crate) async fn create_offer()
     -> Result<(Self, serde_json::Value), Box<dyn std::error::Error>> {
+        let (peer, extra, offer) = Self::create_offer_inner(false).await?;
+        assert!(extra.is_none());
+        Ok((peer, offer))
+    }
+
+    pub(crate) async fn create_offer_with_extra_data_channel()
+    -> Result<(Self, ExtraWebrtcDataChannel, serde_json::Value), Box<dyn std::error::Error>> {
+        let (peer, extra, offer) = Self::create_offer_inner(true).await?;
+        Ok((
+            peer,
+            extra.expect("extra DataChannel requested in the initial offer"),
+            offer,
+        ))
+    }
+
+    async fn create_offer_inner(
+        with_extra: bool,
+    ) -> Result<(Self, Option<ExtraWebrtcDataChannel>, serde_json::Value), Box<dyn std::error::Error>>
+    {
         let runtime =
             default_runtime().ok_or_else(|| std::io::Error::other("no async runtime found"))?;
         let (gather_complete_tx, mut gather_complete_rx) = channel::<()>(1);
@@ -550,6 +569,52 @@ impl LocalWebrtcOfferPeer {
             }));
         }
 
+        let extra_channel = if with_extra {
+            let (open_tx, mut open_rx) = channel::<()>(1);
+            let (message_tx, message_rx) = channel::<String>(256);
+            let (closed_tx, closed_rx) = channel::<()>(1);
+            let extra = peer
+                .create_data_channel(
+                    "botster-extra",
+                    Some(RTCDataChannelInit {
+                        ordered: true,
+                        max_retransmits: None,
+                        max_packet_life_time: None,
+                        ..Default::default()
+                    }),
+                )
+                .await?;
+            {
+                let extra = extra.clone();
+                runtime.spawn(Box::pin(async move {
+                    while let Some(event) = extra.poll().await {
+                        match event {
+                            DataChannelEvent::OnOpen => {
+                                let _ = open_tx.try_send(());
+                            }
+                            DataChannelEvent::OnMessage(message) => {
+                                if let Ok(text) = String::from_utf8(message.data.to_vec()) {
+                                    let _ = message_tx.try_send(text);
+                                }
+                            }
+                            DataChannelEvent::OnClose => {
+                                let _ = closed_tx.try_send(());
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                }));
+            }
+            let _ = timeout(Duration::from_secs(1), open_rx.recv()).await;
+            Some(ExtraWebrtcDataChannel {
+                messages: message_rx,
+                closed: closed_rx,
+            })
+        } else {
+            None
+        };
+
         let offer = peer.create_offer(None).await?;
         peer.set_local_description(offer).await?;
         let _ = timeout(Duration::from_secs(5), gather_complete_rx.recv()).await;
@@ -571,6 +636,7 @@ impl LocalWebrtcOfferPeer {
                 accept_host_events: false,
                 inbound,
             },
+            extra_channel,
             offer,
         ))
     }
@@ -904,10 +970,44 @@ pub(crate) async fn open_local_webrtc_peer(
     endpoint: &botster_hub_client::DaemonEndpoint,
     bootstrap: &botster_hub_client::DaemonLocalWebrtcBootstrap,
 ) -> (LocalWebrtcOfferPeer, AesGcmKey) {
+    let (peer, extra, key) = open_local_webrtc_peer_inner(endpoint, bootstrap, false).await;
+    assert!(extra.is_none());
+    (peer, key)
+}
+
+pub(crate) async fn open_local_webrtc_peer_with_extra_channel(
+    endpoint: &botster_hub_client::DaemonEndpoint,
+    bootstrap: &botster_hub_client::DaemonLocalWebrtcBootstrap,
+) -> (LocalWebrtcOfferPeer, ExtraWebrtcDataChannel, AesGcmKey) {
+    let (peer, extra, key) = open_local_webrtc_peer_inner(endpoint, bootstrap, true).await;
+    (
+        peer,
+        extra.expect("extra DataChannel requested in the initial offer"),
+        key,
+    )
+}
+
+async fn open_local_webrtc_peer_inner(
+    endpoint: &botster_hub_client::DaemonEndpoint,
+    bootstrap: &botster_hub_client::DaemonLocalWebrtcBootstrap,
+    with_extra: bool,
+) -> (
+    LocalWebrtcOfferPeer,
+    Option<ExtraWebrtcDataChannel>,
+    AesGcmKey,
+) {
     let stream_key = local_webrtc_stream_key(&bootstrap.grant_secret);
-    let (mut offer_peer, offer) = LocalWebrtcOfferPeer::create_offer()
-        .await
-        .expect("create WebRTC offer peer");
+    let (mut offer_peer, extra, offer) = if with_extra {
+        let (peer, extra, offer) = LocalWebrtcOfferPeer::create_offer_with_extra_data_channel()
+            .await
+            .expect("create WebRTC offer peer with extra DataChannel");
+        (peer, Some(extra), offer)
+    } else {
+        let (peer, offer) = LocalWebrtcOfferPeer::create_offer()
+            .await
+            .expect("create WebRTC offer peer");
+        (peer, None, offer)
+    };
     let signal = botster_hub_client::request(
         endpoint,
         botster_hub_client::DaemonRequest::LocalWebrtcSignal {
@@ -932,7 +1032,7 @@ pub(crate) async fn open_local_webrtc_peer(
         .accept_answer(answer)
         .await
         .expect("offer peer accepts answer and opens channel");
-    (offer_peer, stream_key)
+    (offer_peer, extra, stream_key)
 }
 
 pub(crate) fn write_botster_web_package(root: &Path) {

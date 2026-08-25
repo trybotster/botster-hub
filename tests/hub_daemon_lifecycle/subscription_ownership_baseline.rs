@@ -73,11 +73,19 @@ async fn wait_for_webrtc_marker(
 #[test]
 fn webrtc_peer_rejects_a_second_data_channel() {
     let _guard = daemon_test_guard();
-    let (hub, endpoint, bootstrap) = start_webrtc_adapter_hub("so-2ch");
+    let marker_dir = unique_test_dir("so-2ch-close");
+    std::fs::create_dir_all(&marker_dir).expect("create extra-channel close marker dir");
+    let close_marker = marker_dir.join("extra-closed");
+    let marker = close_marker.to_string_lossy().into_owned();
+    let (hub, endpoint, bootstrap) = start_webrtc_adapter_hub_with_env(
+        "so-2ch",
+        &[("BOTSTER_HUB_TEST_EXTRA_CHANNEL_CLOSE_MARKER", marker.as_str())],
+    );
     let session_id = "so-2ch-session";
     let subscription_id = "so-2ch-sub";
     block_on(async {
-        let (mut peer, key) = open_local_webrtc_peer(&endpoint, &bootstrap).await;
+        let (mut peer, mut extra, key) =
+            open_local_webrtc_peer_with_extra_channel(&endpoint, &bootstrap).await;
         peer.encrypted_hello(&key, &webrtc_terminal_adapter_hello())
             .await
             .expect("hello");
@@ -89,18 +97,14 @@ fn webrtc_peer_rejects_a_second_data_channel() {
             "printf 'so-2ch-ready\\n'; sleep 30",
         )
         .await;
-        let mut extra = peer
-            .create_extra_data_channel()
-            .await
-            .expect("create extra DataChannel");
-        let close_deadline = Instant::now() + Duration::from_secs(5);
-        let mut closed = false;
-        while Instant::now() < close_deadline && !closed {
-            match timeout(Duration::from_millis(100), extra.closed.recv()).await {
-                Ok(Some(())) | Ok(None) => closed = true,
-                Err(_) => {}
-            }
+        let close_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < close_deadline && !close_marker.exists() {
+            thread::sleep(Duration::from_millis(50));
         }
+        assert!(
+            close_marker.exists(),
+            "Hub must finish local_close on the rejected extra DataChannel"
+        );
         let extra_deadline = Instant::now() + Duration::from_millis(400);
         let mut extra_terminal_frames = 0;
         while Instant::now() < extra_deadline {
@@ -124,8 +128,8 @@ fn webrtc_peer_rejects_a_second_data_channel() {
         );
         let on_data_channel = hub_source("src/local_webrtc.rs");
         assert!(
-            on_data_channel.contains("if !self.peer_state.claim_data_channel()"),
-            "second DataChannel must hit the one-shot claim"
+            on_data_channel.contains("test_extra_label || !self.peer_state.claim_data_channel()"),
+            "second DataChannel must hit the one-shot claim or the labeled extra-reject path"
         );
         assert!(
             on_data_channel.contains("local WebRTC rejecting extra DataChannel"),
@@ -205,9 +209,9 @@ fn webrtc_shared_channel_carries_control_entity_event_and_terminal_frames() {
         emit_sample_ready(&endpoint, "so-4cls");
         let entity_deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < entity_deadline && peer.pending_entity_frames.is_empty() {
-            match timeout(Duration::from_millis(250), peer.next_entity_frame(&key)).await {
-                Ok(Ok(frame)) => peer.pending_entity_frames.push_back(frame),
-                Ok(Err(_)) | Err(_) => {}
+            if let Ok(Ok(frame)) = timeout(Duration::from_millis(250), peer.next_entity_frame(&key)).await
+            {
+                peer.pending_entity_frames.push_back(frame);
             }
         }
         let mut saw_host_event = !peer.pending_host_events().is_empty();
@@ -219,9 +223,8 @@ fn webrtc_shared_channel_carries_control_entity_event_and_terminal_frames() {
                 emit_sample_ready(&endpoint, "so-4cls-retry");
                 reemitted = true;
             }
-            match timeout(Duration::from_millis(250), peer.next_host_event(&key)).await {
-                Ok(Ok(_)) => saw_host_event = true,
-                Ok(Err(_)) | Err(_) => {}
+            if let Ok(Ok(_)) = timeout(Duration::from_millis(250), peer.next_host_event(&key)).await {
+                saw_host_event = true;
             }
         }
         assert!(
@@ -405,6 +408,37 @@ fn no_lua_dispatch_in_terminal_input_or_output() {
     );
 }
 
+fn unix_envelope_snapshot_bytes(
+    envelope: &botster_hub_client::DaemonUnixTerminalEnvelope,
+) -> Option<Vec<u8>> {
+    let bytes = envelope.payload_bytes().ok()?;
+    if bytes.starts_with(GHOSTSNP_MAGIC) {
+        return Some(bytes);
+    }
+    match serde_json::from_slice::<botster_hub_client::DaemonEvent>(&bytes) {
+        Ok(botster_hub_client::DaemonEvent::Snapshot { history, .. }) => {
+            history.decoded_bytes().ok().map(|decoded| decoded.to_vec())
+        }
+        _ => None,
+    }
+}
+
+fn apply_ready_then_history_progress(
+    projection: &mut botster_terminal_ghostty::GhosttyClientProjection,
+    bytes: Vec<u8>,
+    saw_ready: bool,
+) -> botster_terminal_ghostty::GhosttySnapshotDecodeProgress {
+    if !saw_ready {
+        projection
+            .install_ghostsnp_ready(bytes)
+            .expect("READY snapshot")
+    } else {
+        projection
+            .apply_ghostsnp_history(bytes)
+            .expect("PAGE or FINISH snapshot")
+    }
+}
+
 #[test]
 fn attach_ready_precedes_history_finish() {
     let _guard = daemon_test_guard();
@@ -437,25 +471,72 @@ fn attach_ready_precedes_history_finish() {
         &mut envelopes,
         &mut events,
     );
+    let mut projection = botster_terminal_ghostty::GhosttyClientProjection::new(
+        botster_core::TerminalScreenSize::new(24, 80),
+    )
+    .expect("client projection");
+    let mut saw_ready = false;
+    let mut saw_finish = false;
+    let mut cursor = 0;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline && !saw_finish {
+        while cursor < envelopes.len() {
+            let Some(bytes) = unix_envelope_snapshot_bytes(&envelopes[cursor]) else {
+                cursor += 1;
+                continue;
+            };
+            cursor += 1;
+            let progress = apply_ready_then_history_progress(&mut projection, bytes, saw_ready);
+            if progress == botster_terminal_ghostty::GhosttySnapshotDecodeProgress::Ready {
+                assert!(!saw_finish, "READY must precede FINISH");
+                saw_ready = true;
+                let input = request_collecting_mux(
+                    &mut stream,
+                    &mut reader,
+                    &botster_hub_client::DaemonRequest::SendInput {
+                        session_id: "so-rth-session".to_string(),
+                        data: "so-rth-input\r".to_string(),
+                    },
+                    &mut envelopes,
+                    &mut events,
+                );
+                assert_ne!(
+                    input.kind,
+                    botster_hub_client::DaemonResponseKind::OperatorError,
+                    "input must be permitted at READY: {:?}",
+                    input.error
+                );
+            }
+            if progress == botster_terminal_ghostty::GhosttySnapshotDecodeProgress::Finish {
+                assert!(saw_ready, "FINISH must follow READY");
+                saw_finish = true;
+                break;
+            }
+        }
+        if saw_finish {
+            break;
+        }
+        let drain = request_collecting_mux(
+            &mut stream,
+            &mut reader,
+            &botster_hub_client::DaemonRequest::drain_subscription("so-rth-session", "so-rth-sub"),
+            &mut envelopes,
+            &mut events,
+        );
+        assert!(
+            drain
+                .events
+                .iter()
+                .all(|event| !matches!(event, botster_hub_client::DaemonEvent::Snapshot { .. })),
+            "bound drain must not return snapshot bodies on the host plane: {:?}",
+            drain.events
+        );
+    }
+    assert!(saw_ready, "terminal stream must emit READY");
+    assert!(saw_finish, "terminal stream must emit FINISH after READY");
     assert!(
-        !format!("{events:?}{envelopes:?}").contains("FINISH"),
+        !format!("{events:?}").contains("FINISH"),
         "Hub must not invent FINISH on the host plane: events={events:?}"
-    );
-    let input = request_collecting_mux(
-        &mut stream,
-        &mut reader,
-        &botster_hub_client::DaemonRequest::SendInput {
-            session_id: "so-rth-session".to_string(),
-            data: "so-rth-input\r".to_string(),
-        },
-        &mut envelopes,
-        &mut events,
-    );
-    assert_ne!(
-        input.kind,
-        botster_hub_client::DaemonResponseKind::OperatorError,
-        "input must be permitted at READY: {:?}",
-        input.error
     );
     shutdown_short_lived_session(&endpoint, "so-rth-session");
     hub.shutdown().expect("shutdown isolated hub");

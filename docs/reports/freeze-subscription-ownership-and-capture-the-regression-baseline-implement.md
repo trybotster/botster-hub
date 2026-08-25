@@ -6,11 +6,11 @@
 | --- | --- |
 | Target repository | `botster-hub` (`trybotster/botster-hub`) |
 | `target_id` | `tgt_7e208a0c76a44980a83b63af976b1f22` |
-| Authoritative spawn target | `botster-hub` at `/Users/jasonconigliari/Projects/botster-hub` |
-| Pipeline worktree | this run's Hub worktree |
+| Authoritative spawn target | the authoritative botster-hub spawn target |
+| Pipeline worktree | the pipeline-provided ticket worktree |
 | Ticket | `ticket_1787600670_129312` |
 | Run | `run_1787605830_934897` |
-| Step | `botster_stack_implement` (`run_step_1787613456_330395`) |
+| Step | `botster_stack_implement` (`run_step_1787616395_134999`) |
 | Approved plan | `docs/plans/freeze-subscription-ownership-and-capture-the-regression-baseline.md` |
 | Plan commit | `dfbf934` |
 | Implement commit | `ca77a33e5edb482078b61fe7f452fa8f0e8a9bdd` |
@@ -83,7 +83,10 @@ Required charter/context notes:
 | `tests/hub_daemon_lifecycle_test.rs` | `include!` of the new file |
 | `tests/hub_daemon_lifecycle/webrtc_fixtures.rs` | Extra DataChannel close oracle |
 | `src/host_control_fair_write.rs` | `fair_write_class_coverage_per_transport` |
-| `src/local_webrtc.rs` | `ultimate_close_failure_sacrifices_every_peer_and_sweeps_all_owners` |
+| `src/local_webrtc.rs` | Ultimate-close timeout plus Core inventory sweep; test-only extra-channel close marker |
+| `src/daemon_transport.rs` | `live_attach_routes` visible for the occupancy-union oracle |
+| `tests/hub_daemon_lifecycle/webrtc_fixtures.rs` | Extra DataChannel in the initial offer |
+| `tests/hub_daemon_lifecycle/webrtc_terminal_adapter.rs` | IsolatedHub extra-env helper |
 | `docs/reports/freeze-subscription-ownership-and-capture-the-regression-baseline-implement.md` | This report |
 
 ## Ownership boundaries preserved
@@ -108,9 +111,9 @@ None in this commit. The plan's registered graph stays unchanged:
 No scope change. Implementation notes, not waived requirements:
 
 1. `webrtc_ready_entity_frame_defers_terminal_output` pins the production gate text in `run_data_channel`. A race-free live deferral oracle would need a new flush seam; the plan forbids transport changes.
-2. `attach_ready_precedes_history_finish` proves Hello advertisement, post-bind `SendInput`, and no host-plane `FINISH`. Bound adapters keep READY in the terminal plane, so host events do not carry `AttachState { attached }`.
-3. `webrtc_peer_rejects_a_second_data_channel` proves the extra channel receives no terminal frames and that `claim_data_channel` plus `local_close` remain on the production path. Offerer `OnClose` is not a reliable webrtc-rs oracle.
-4. `ultimate_close_failure_sacrifices_every_peer_and_sweeps_all_owners` drives the existing production handler (`inject_peer_connection_state_for_test(Failed)` plus `force_next_close_error_for_test`). That is the peer-close fail-closed seam. `BOTSTER_HUB_TEST_CLOSE_LOCAL_WEBRTC_OPERATION` injects DataChannel `local_close` after Status and does not exercise dedicated-runtime sacrifice.
+2. `attach_ready_precedes_history_finish` decodes Ghostty READY then FINISH from the Unix terminal stream, sends input after READY, and keeps host-plane `FINISH` absent.
+3. `webrtc_peer_rejects_a_second_data_channel` asserts Hub finished `local_close` via a `BOTSTER_ENV=test` marker written after the production reject path, plus no terminal frames and the reject source strings. Offerer `OnClose` is not the oracle.
+4. `ultimate_close_failure_sacrifices_every_peer_and_sweeps_all_owners` runs the bound-exceeded hang fail-closed path, then the attach fail-closed path, and asserts zero Core inventory rows and zero Hub attach routes before session shutdown.
 5. `wait_for_webrtc_marker` uses a 20 s deadline so suite load cannot hide terminal bytes that already followed attach-state frames.
 
 The committed plan's acceptance checks were not rewritten. These notes do not change §14 or §15 ownership.
@@ -153,6 +156,12 @@ Locked-suite evidence on this Implement tree:
 | Second `./test.sh --locked` (20 s wait) | Hub lib 488 passed. Lifecycle 315 passed, 1 failed: `unix_eof_skip_core_detach_ablation_keeps_named_pair_on_status`. All 12 named §15 tests passed. |
 | Isolated `unix_eof_skip_core_detach_ablation_keeps_named_pair_on_status` | pass in 1.91 s. This is a documented workspace-load flake on `origin/main` (see `docs/reports/publish-package-owned-client-notice-reactions-implement.md`). This Implement change does not edit Unix EOF ablation. |
 | Third `./test.sh --locked` | pass. Hub lib 488 passed. Lifecycle 316 passed, 2 ignored. Remaining workspace crates and doctests passed. Exit 0 in 392 s. |
+| Review-return isolated `webrtc_peer_rejects_a_second_data_channel` | pass in 4.01 s after Hub close-marker oracle |
+| Review-return isolated `attach_ready_precedes_history_finish` | pass in 1.63 s after terminal-plane READY then FINISH |
+| Review-return isolated `ultimate_close_failure_sacrifices_every_peer_and_sweeps_all_owners` | pass in 3.51 s after timeout hang plus Core inventory sweep |
+| Review-return `cargo clippy --workspace --all-targets --locked -- -D warnings` | pass |
+| Review-return `cargo fmt --all -- --check` | pass |
+| Review-return `./test.sh --locked` | pass. Exit 0 in 394 s. |
 
 Live Hub pin for this worktree:
 
@@ -165,7 +174,7 @@ No Web or TUI consumer artifact was required. This ticket does not change DTOs.
 ## Unverified behavior or residual risk
 
 - Workspace-load flake `unix_eof_skip_core_detach_ablation_keeps_named_pair_on_status` failed once on the second locked suite. Isolation passed in 1.91 s. The first and third locked suites passed that test. Prior Hub implement reports already record this flake. This change does not edit Unix EOF ablation.
-- Offerer-side `OnClose` after Hub rejects a second DataChannel is not a stable oracle.
+- Offerer-side `OnClose` after Hub rejects a second DataChannel remains unreliable. The close oracle is the test-only marker written after production `local_close`.
 - The entity-defer gate is pinned by source, not by a live flush-order race.
 - New §8.2 Reserved-route late-`open` surfaces do not exist yet. Ticket `ticket_1787600674_500120` owns them.
 - A27b Core `WRITE_ATTEMPT_BUDGET` hard-stop through Hub is owned by `ticket_1787600674_500120`.
