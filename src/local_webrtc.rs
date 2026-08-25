@@ -7653,18 +7653,18 @@ mod tests {
             .await
             .expect("pre-handshake setup channel open")
             .expect("setup open signal");
-            if let Ok(Some(setup_remote)) = timeout(
+            let setup_remote = timeout(
                 runtime.as_ref(),
-                Duration::from_millis(200),
+                Duration::from_secs(10),
                 incoming_rx.recv(),
             )
             .await
-            {
-                assert_eq!(
-                    setup_remote.label().await.expect("setup remote label"),
-                    "botster-client"
-                );
-            }
+            .expect("remote setup on_data_channel")
+            .expect("remote setup channel");
+            assert_eq!(
+                setup_remote.label().await.expect("setup remote label"),
+                "botster-client"
+            );
 
             let late = offerer
                 .create_data_channel(
@@ -7713,11 +7713,20 @@ mod tests {
             let remote = timeout(
                 runtime.as_ref(),
                 Duration::from_secs(10),
-                incoming_rx.recv(),
+                async {
+                    loop {
+                        let channel = incoming_rx
+                            .recv()
+                            .await
+                            .expect("remote late on_data_channel");
+                        if channel.label().await.expect("incoming label") == "botster-late" {
+                            break channel;
+                        }
+                    }
+                },
             )
             .await
-            .expect("remote on_data_channel")
-            .expect("remote late channel");
+            .expect("remote late channel by label");
             assert_eq!(remote.label().await.expect("remote label"), "botster-late");
 
             let (remote_open_tx, mut remote_open_rx) = webrtc_channel::<()>(1);
@@ -7756,7 +7765,8 @@ mod tests {
                 remote_open_rx.recv(),
             )
             .await
-            .ok();
+            .expect("remote OnOpen")
+            .expect("remote open signal");
 
             const PAYLOAD: &str = "post-handshake-bytes";
             late.send_text(PAYLOAD)
