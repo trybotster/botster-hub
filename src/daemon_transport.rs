@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use botster_core::{
     ClientId, EndpointId, EnvelopeCursor, EnvelopeDeliveryState, EnvelopeId, EnvelopeTarget,
@@ -123,7 +123,7 @@ use crate::{Worktree, WorktreeCreate, WorktreeError};
 mod daemon_attach_stream;
 use daemon_attach_stream::{
     AttachStreamOwner, AttachStreamRegistry, BoundAdapterHandle, UnixBindRequest,
-    WebrtcBindRequest, bind_unix_adapter_after_attaching, bind_webrtc_adapter_after_attaching,
+    WebrtcBindRequest, bind_reserved_webrtc_adapter, bind_unix_adapter_after_attaching,
     fail_closed_pre_bind_attach, forward_attach_bootstrap, live_generation_for_route,
 };
 pub(crate) use daemon_attach_stream::{
@@ -2471,6 +2471,83 @@ pub(crate) fn handle_control_message(
             }
             false
         }
+        ControlMessage::BindReservedWebrtcChannel {
+            grant_id,
+            session_id,
+            subscription_id,
+            generation,
+            reply_tx,
+        } => {
+            if !daemon.local_webrtc().has_live_peer(&grant_id) {
+                let _ = reply_tx.send(Err("peer_gone"));
+                return false;
+            }
+            let Some(WebrtcTerminalAdmission::Admitted {
+                required_features: admitted_features,
+                mux,
+                terminal_requirement: admitted_requirement,
+            }) = state
+                .pending_runtime
+                .webrtc_admissions
+                .get(&grant_id)
+                .cloned()
+            else {
+                let _ = reply_tx.send(Err("not_admitted"));
+                return false;
+            };
+            let label = crate::local_webrtc::webrtc_subscription_channel::SubscriptionChannelLabel::terminal(
+                session_id.clone(),
+                subscription_id.clone(),
+                generation,
+            );
+            let view = mux.open_event_view(&label);
+            if crate::local_webrtc::webrtc_subscription_channel::decide_open_event(&view)
+                != crate::local_webrtc::webrtc_subscription_channel::OpenEventDecision::Bind
+            {
+                let _ = reply_tx.send(Err("open_rejected"));
+                return false;
+            }
+            let Some(reservation) = state.pending_runtime.take_webrtc_reservation(
+                &session_id,
+                &subscription_id,
+                generation,
+            ) else {
+                let _ = reply_tx.send(Err("no_reservation"));
+                return false;
+            };
+            let _ = (admitted_features, admitted_requirement);
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_secs())
+                .unwrap_or(0);
+            let Some(runtime) = daemon.runtime_mut() else {
+                let _ = reply_tx.send(Err("runtime_gone"));
+                return false;
+            };
+            match bind_reserved_webrtc_adapter(
+                &mut state.pending_runtime.streams,
+                runtime,
+                WebrtcBindRequest {
+                    client_id: &reservation.client_id,
+                    session_id: &session_id,
+                    subscription_id: &subscription_id,
+                    required_features: &reservation.required_features,
+                    terminal_requirement: reservation.terminal_requirement.as_ref(),
+                    now_seconds: now,
+                    mux: Some(&mux),
+                },
+                TerminalSubscriptionGeneration(generation),
+                &reservation.bootstrap_egress,
+            ) {
+                Ok(_) => {
+                    let _ = reply_tx.send(Ok(()));
+                }
+                Err(()) => {
+                    let _ = reply_tx.send(Err("bind_failed"));
+                }
+            }
+            false
+        }
         ControlMessage::SubscribeEntities {
             entity_type,
             subscription_id,
@@ -3707,32 +3784,62 @@ fn handle_runtime_control_request(
                         "Attach requires an admitted WebRTC adapter",
                     ));
                 };
-                return match bind_webrtc_adapter_after_attaching(
-                    pending_runtime,
-                    runtime,
-                    WebrtcBindRequest {
-                        client_id: &client_id,
-                        session_id: &session_id,
-                        subscription_id: &subscription_id,
-                        required_features,
-                        terminal_requirement: terminal_requirement.as_ref(),
-                        now_seconds: now,
-                        mux: Some(mux),
-                    },
-                ) {
-                    Ok(handle) => {
-                        if let Some(handle) = handle {
-                            forward_attach_bootstrap(
-                                &BoundAdapterHandle::WebRtc(handle),
-                                &bootstrap_egress,
-                            );
-                        }
-                        Ok(daemon_events(Vec::new()))
-                    }
-                    Err(_) => Ok(attach_bind_operator_error(
+                let Some(generation) = live_generation_for_route(
+                    &runtime.list_terminal_subscriptions(),
+                    &client_id,
+                    &session_id,
+                    &subscription_id,
+                ) else {
+                    fail_closed_pre_bind_attach(
+                        pending_runtime,
+                        runtime,
+                        &client_id,
+                        &session_id,
+                        &subscription_id,
+                        now,
+                        None,
+                    );
+                    return Ok(attach_bind_operator_error(
                         "invalid_request",
-                        "Attach failed to bind a WebRTC adapter",
-                    )),
+                        "Attach failed to reserve a WebRTC channel",
+                    ));
+                };
+                pending_runtime.record_generation(&session_id, &subscription_id, generation);
+                return match mux.reserve_terminal(
+                    session_id.clone(),
+                    subscription_id.clone(),
+                    generation.0,
+                ) {
+                    Ok(label) => {
+                        pending_runtime.store_webrtc_reservation(
+                            (session_id.clone(), subscription_id.clone(), generation.0),
+                            WebrtcReservedAttach {
+                                client_id: client_id.clone(),
+                                required_features: required_features.clone(),
+                                terminal_requirement: terminal_requirement.clone(),
+                                bootstrap_egress,
+                            },
+                        );
+                        let mut response = daemon_events(Vec::new());
+                        response.subscription_channel_label = Some(label.format());
+                        response.subscription_channel_generation = Some(label.generation);
+                        Ok(response)
+                    }
+                    Err(_) => {
+                        fail_closed_pre_bind_attach(
+                            pending_runtime,
+                            runtime,
+                            &client_id,
+                            &session_id,
+                            &subscription_id,
+                            now,
+                            None,
+                        );
+                        Ok(attach_bind_operator_error(
+                            "invalid_request",
+                            "Attach failed to reserve a WebRTC channel",
+                        ))
+                    }
                 };
             }
             let Some(UnixTerminalAdmission::Admitted {
@@ -4390,6 +4497,8 @@ fn handle_runtime_control_request(
             plugin_action_result: None,
             local_webrtc_bootstrap: None,
             local_webrtc_answer: None,
+            subscription_channel_label: None,
+            subscription_channel_generation: None,
             events: Vec::new(),
             cleanup: None,
             coordination: None,
@@ -5397,6 +5506,13 @@ pub(crate) enum ControlMessage {
         admission: WebrtcTerminalAdmission,
         host_required_features: Vec<String>,
     },
+    BindReservedWebrtcChannel {
+        grant_id: String,
+        session_id: String,
+        subscription_id: String,
+        generation: u64,
+        reply_tx: oneshot::Sender<Result<(), &'static str>>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -5431,11 +5547,19 @@ pub(crate) struct HostCompatibilityRecord {
     pub required_features: Vec<String>,
 }
 
+struct WebrtcReservedAttach {
+    client_id: String,
+    required_features: Vec<String>,
+    terminal_requirement: Option<botster_terminal_protocol::TerminalCompatibilityRequirement>,
+    bootstrap_egress: Vec<botster_core::TransportEgress>,
+}
+
 #[derive(Default)]
 pub(crate) struct PendingRuntimeState {
     pub(crate) streams: AttachStreamRegistry,
     unix_admissions: BTreeMap<String, UnixTerminalAdmission>,
     webrtc_admissions: BTreeMap<String, WebrtcTerminalAdmission>,
+    webrtc_reservations: BTreeMap<(String, String, u64), WebrtcReservedAttach>,
     close_work: Arc<AtomicBool>,
     host_compatibility: BTreeMap<String, HostCompatibilityRecord>,
 }
@@ -5464,6 +5588,27 @@ impl std::ops::DerefMut for PendingRuntimeState {
 impl PendingRuntimeState {
     fn take_close_work(&self) -> bool {
         self.close_work.swap(false, Ordering::SeqCst)
+    }
+
+    fn store_webrtc_reservation(
+        &mut self,
+        key: (String, String, u64),
+        reservation: WebrtcReservedAttach,
+    ) {
+        self.webrtc_reservations.insert(key, reservation);
+    }
+
+    fn take_webrtc_reservation(
+        &mut self,
+        session_id: &str,
+        subscription_id: &str,
+        generation: u64,
+    ) -> Option<WebrtcReservedAttach> {
+        self.webrtc_reservations.remove(&(
+            session_id.to_string(),
+            subscription_id.to_string(),
+            generation,
+        ))
     }
 
     #[cfg(test)]
@@ -6231,6 +6376,8 @@ pub(crate) fn daemon_response_base(kind: DaemonResponseKind) -> DaemonResponse {
         plugin_action_result: None,
         local_webrtc_bootstrap: None,
         local_webrtc_answer: None,
+        subscription_channel_label: None,
+        subscription_channel_generation: None,
         events: Vec::new(),
         cleanup: None,
         coordination: None,

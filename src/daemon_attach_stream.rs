@@ -689,6 +689,7 @@ pub(crate) struct WebrtcBindRequest<'a> {
     pub mux: Option<&'a WebRtcConnectionMux>,
 }
 
+#[allow(dead_code)]
 pub(crate) fn bind_webrtc_adapter_after_attaching(
     registry: &mut AttachStreamRegistry,
     runtime: &mut HubRuntime,
@@ -772,6 +773,97 @@ pub(crate) fn bind_webrtc_adapter_after_attaching(
         );
     }
     Ok(Some(handle))
+}
+
+pub(crate) fn bind_reserved_webrtc_adapter(
+    registry: &mut AttachStreamRegistry,
+    runtime: &mut HubRuntime,
+    request: WebrtcBindRequest<'_>,
+    generation: TerminalSubscriptionGeneration,
+    bootstrap_egress: &[botster_core::TransportEgress],
+) -> Result<WebRtcTerminalAdapterHandle, ()> {
+    let capabilities = match negotiated_unix_capability_set(
+        request.required_features,
+        request.terminal_requirement,
+    ) {
+        Ok(capabilities) => capabilities,
+        Err(_) => {
+            fail_closed_pre_bind_attach(
+                registry,
+                runtime,
+                request.client_id,
+                request.session_id,
+                request.subscription_id,
+                request.now_seconds,
+                None,
+            );
+            return Err(());
+        }
+    };
+    let Some(mux) = request.mux else {
+        fail_closed_pre_bind_attach(
+            registry,
+            runtime,
+            request.client_id,
+            request.session_id,
+            request.subscription_id,
+            request.now_seconds,
+            None,
+        );
+        return Err(());
+    };
+    let label =
+        crate::local_webrtc::webrtc_subscription_channel::SubscriptionChannelLabel::terminal(
+            request.session_id.to_string(),
+            request.subscription_id.to_string(),
+            generation.0,
+        );
+    let (adapter, handle) = mux.create_adapter();
+    if runtime
+        .bind_terminal_adapter(
+            ClientId(request.client_id.to_string()),
+            SessionId(request.session_id.to_string()),
+            SubscriptionId(request.subscription_id.to_string()),
+            generation,
+            capabilities,
+            Box::new(adapter),
+        )
+        .is_err()
+    {
+        fail_closed_pre_bind_attach(
+            registry,
+            runtime,
+            request.client_id,
+            request.session_id,
+            request.subscription_id,
+            request.now_seconds,
+            Some(BoundAdapterHandle::WebRtc(handle)),
+        );
+        return Err(());
+    }
+    registry.mark_adapter_bound(
+        request.session_id,
+        request.subscription_id,
+        generation,
+        BoundAdapterHandle::WebRtc(handle.clone()),
+    );
+    if !mux.bind_reserved(&label, handle.clone()) {
+        fail_closed_pre_bind_attach(
+            registry,
+            runtime,
+            request.client_id,
+            request.session_id,
+            request.subscription_id,
+            request.now_seconds,
+            Some(BoundAdapterHandle::WebRtc(handle)),
+        );
+        return Err(());
+    }
+    forward_attach_bootstrap(
+        &BoundAdapterHandle::WebRtc(handle.clone()),
+        bootstrap_egress,
+    );
+    Ok(handle)
 }
 
 #[cfg(test)]
