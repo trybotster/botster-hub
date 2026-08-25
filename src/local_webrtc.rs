@@ -65,19 +65,33 @@ pub(crate) const LOCAL_WEBRTC_PEER_CLOSE_BOUND: Duration = Duration::from_millis
 #[cfg(test)]
 pub(crate) const LOCAL_WEBRTC_PEER_CLOSE_HANDLER_JOIN_DEADLINE: Duration = Duration::from_secs(2);
 const TEST_CLOSE_LOCAL_WEBRTC_OPERATION_ENV: &str = "BOTSTER_HUB_TEST_CLOSE_LOCAL_WEBRTC_OPERATION";
+const TEST_DISABLE_ONE_SHOT_CLAIM_ENV: &str = "BOTSTER_HUB_TEST_DISABLE_ONE_SHOT_CLAIM";
 const TEST_EXTRA_CHANNEL_CLOSE_MARKER_ENV: &str = "BOTSTER_HUB_TEST_EXTRA_CHANNEL_CLOSE_MARKER";
+const TEST_EXTRA_CHANNEL_OBSERVATION_ENV: &str = "BOTSTER_HUB_TEST_EXTRA_CHANNEL_OBSERVATION";
 
-fn record_rejected_data_channel_close_for_test() {
+fn observe_rejected_data_channel_for_test(
+    claimed: bool,
+    close: &Result<Result<(), String>, tokio::time::error::Elapsed>,
+) {
     if std::env::var("BOTSTER_ENV").as_deref() != Ok("test") {
         return;
     }
-    let Ok(path) = std::env::var(TEST_EXTRA_CHANNEL_CLOSE_MARKER_ENV) else {
-        return;
-    };
-    if path.is_empty() {
-        return;
+    let lost_claim = !claimed;
+    let close_ok = matches!(close, Ok(Ok(())));
+    // extra-channel close marker requires lost_claim && close_ok
+    if let Ok(path) = std::env::var(TEST_EXTRA_CHANNEL_OBSERVATION_ENV)
+        && !path.is_empty()
+    {
+        let body = format!("{{\"lost_claim\":{lost_claim},\"close_ok\":{close_ok}}}\n");
+        let _ = std::fs::write(path, body);
     }
-    let _ = std::fs::write(path, "closed\n");
+    if lost_claim
+        && close_ok
+        && let Ok(path) = std::env::var(TEST_EXTRA_CHANNEL_CLOSE_MARKER_ENV)
+        && !path.is_empty()
+    {
+        let _ = std::fs::write(path, "closed\n");
+    }
 }
 
 pub(crate) const LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE: &str =
@@ -124,6 +138,17 @@ where
         self.close().await.map_err(|error| error.to_string())
     }
 }
+
+async fn reject_extra_data_channel<C>(grant_id: &str, claimed: bool, data_channel: &C)
+where
+    C: LocalWebrtcDataChannel + ?Sized,
+{
+    eprintln!("local WebRTC rejecting extra DataChannel: grant_id={grant_id}");
+    let close =
+        tokio::time::timeout(LOCAL_WEBRTC_PEER_CLOSE_BOUND, data_channel.local_close()).await;
+    observe_rejected_data_channel_for_test(claimed, &close);
+}
+
 /// Ephemeral local WebRTC admission and peer registry.
 #[derive(Clone)]
 struct SharedEventPlane(Arc<crate::daemon_event_subscriptions::ClientEventPlane>);
@@ -896,6 +921,11 @@ impl LocalWebrtcPeerState {
     }
 
     fn claim_data_channel(&self) -> bool {
+        if std::env::var("BOTSTER_ENV").as_deref() == Ok("test")
+            && std::env::var(TEST_DISABLE_ONE_SHOT_CLAIM_ENV).as_deref() == Ok("1")
+        {
+            return true;
+        }
         self.data_channel_claimed
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
@@ -1103,20 +1133,10 @@ impl PeerConnectionEventHandler for LocalWebrtcHandler {
     }
 
     async fn on_data_channel(&self, data_channel: Arc<dyn DataChannel>) {
-        let test_extra_label = std::env::var("BOTSTER_ENV").as_deref() == Ok("test")
-            && data_channel
-                .label()
-                .await
-                .ok()
-                .is_some_and(|label| label != "botster-client");
-        if test_extra_label || !self.peer_state.claim_data_channel() {
-            eprintln!(
-                "local WebRTC rejecting extra DataChannel: grant_id={}",
-                self.peer_state.grant_id
-            );
-            let _ = tokio::time::timeout(LOCAL_WEBRTC_PEER_CLOSE_BOUND, data_channel.local_close())
+        let claimed = self.peer_state.claim_data_channel();
+        if !claimed {
+            reject_extra_data_channel(&self.peer_state.grant_id, claimed, data_channel.as_ref())
                 .await;
-            record_rejected_data_channel_close_for_test();
             return;
         }
         let peer_state = self.peer_state.clone();
@@ -2577,6 +2597,20 @@ mod tests {
         let peer_state = test_peer_state("grant-one-channel");
         assert!(peer_state.claim_data_channel());
         assert!(!peer_state.claim_data_channel());
+    }
+
+    #[test]
+    fn reject_extra_data_channel_closes_the_unclaimed_channel() {
+        let extra = FakeDataChannel::default();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build extra-channel close runtime");
+        runtime.block_on(reject_extra_data_channel("grant-extra", false, &extra));
+        assert!(
+            extra.closed.load(Ordering::Acquire),
+            "production reject path must finish local_close"
+        );
     }
 
     fn receive_test_runtime_message(

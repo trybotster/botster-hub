@@ -10,11 +10,12 @@
 | Pipeline worktree | the pipeline-provided ticket worktree |
 | Ticket | `ticket_1787600670_129312` |
 | Run | `run_1787605830_934897` |
-| Step | `botster_stack_implement` (`run_step_1787616395_134999`) |
+| Step | `botster_stack_implement` (`run_step_1787618535_927413`) |
 | Approved plan | `docs/plans/freeze-subscription-ownership-and-capture-the-regression-baseline.md` |
 | Plan commit | `dfbf934` |
 | Implement commit | `ca77a33e5edb482078b61fe7f452fa8f0e8a9bdd` |
 | Review-return Implement commit | `3f4e0e36f287312d8a111e34342c4a5ba8bd3461` |
+| Second Review-return Implement commit | pending |
 | Base commit | `85a0434` (`origin/main`) |
 | Merge policy | direct (no PR required) |
 | Locked Core SHA | `7eafa470a18025895995bbedc20d34b58106a03b` |
@@ -113,7 +114,7 @@ No scope change. Implementation notes, not waived requirements:
 
 1. `webrtc_ready_entity_frame_defers_terminal_output` pins the production gate text in `run_data_channel`. A race-free live deferral oracle would need a new flush seam; the plan forbids transport changes.
 2. `attach_ready_precedes_history_finish` decodes Ghostty READY then FINISH from the Unix terminal stream, sends input after READY, and keeps host-plane `FINISH` absent.
-3. `webrtc_peer_rejects_a_second_data_channel` asserts Hub finished `local_close` via a `BOTSTER_ENV=test` marker written after the production reject path, plus no terminal frames and the reject source strings. Offerer `OnClose` is not the oracle.
+3. `webrtc_peer_rejects_a_second_data_channel` completes hello on `botster-client` first, then asserts the production one-shot claim returned false and `timeout(..., local_close()).await` returned `Ok(Ok(()))`. The close marker is written only for that pair. A sibling negative control disables the one-shot claim and confirms the lost-claim oracle stays empty. Offerer `OnClose` is not the oracle. There is no label-based reject override.
 4. `ultimate_close_failure_sacrifices_every_peer_and_sweeps_all_owners` runs the bound-exceeded hang fail-closed path, then the attach fail-closed path, and asserts zero Core inventory rows and zero Hub attach routes before session shutdown.
 5. `wait_for_webrtc_marker` uses a 20 s deadline so suite load cannot hide terminal bytes that already followed attach-state frames.
 
@@ -158,11 +159,20 @@ Locked-suite evidence on this Implement tree:
 | Isolated `unix_eof_skip_core_detach_ablation_keeps_named_pair_on_status` | pass in 1.91 s. This is a documented workspace-load flake on `origin/main` (see `docs/reports/publish-package-owned-client-notice-reactions-implement.md`). This Implement change does not edit Unix EOF ablation. |
 | Third `./test.sh --locked` | pass. Hub lib 488 passed. Lifecycle 316 passed, 2 ignored. Remaining workspace crates and doctests passed. Exit 0 in 392 s. |
 | Review-return isolated `webrtc_peer_rejects_a_second_data_channel` | pass in 4.01 s after Hub close-marker oracle |
+| Second Review-return isolated `webrtc_peer_rejects_a_second_data_channel` | pass in 4.18 s after production claim-lost plus successful close |
+| Second Review-return isolated `webrtc_peer_rejects_a_second_data_channel_requires_one_shot_claim` | pass in 3.75 s; lost-claim oracle stays empty when one-shot is disabled |
+| Second Review-return lib `reject_extra_data_channel_closes_the_unclaimed_channel` | pass |
 | Review-return isolated `attach_ready_precedes_history_finish` | pass in 1.63 s after terminal-plane READY then FINISH |
 | Review-return isolated `ultimate_close_failure_sacrifices_every_peer_and_sweeps_all_owners` | pass in 3.51 s after timeout hang plus Core inventory sweep |
 | Review-return `cargo clippy --workspace --all-targets --locked -- -D warnings` | pass |
 | Review-return `cargo fmt --all -- --check` | pass |
 | Review-return `./test.sh --locked` | pass. Exit 0 in 394 s. |
+| Second Review-return `cargo fmt --all -- --check` | pass |
+| Second Review-return `cargo clippy --workspace --all-targets --locked -- -D warnings` | pass |
+| Second Review-return first `./test.sh --locked` | Hub lib 489 passed. Lifecycle 314 passed, 3 failed: extra-channel source pin looked for `lost_claim && close_ok` after rustfmt split the condition; `peer_close_leaves_sibling_peers_working` missed `so-sib-a-ready` after attach-state frames. Isolation of the sibling test later passed in 3.37 s. |
+| Second Review-return isolated extra-channel tests after source-pin comment | both passed |
+| Second Review-return isolated `peer_close_leaves_sibling_peers_working` | pass in 3.37 s |
+| Second Review-return `./test.sh --locked` | pass. Hub lib 489. Lifecycle 317 passed, 2 ignored. Exit 0 in 386 s. |
 
 Live Hub pin for this worktree:
 
@@ -175,7 +185,7 @@ No Web or TUI consumer artifact was required. This ticket does not change DTOs.
 ## Unverified behavior or residual risk
 
 - Workspace-load flake `unix_eof_skip_core_detach_ablation_keeps_named_pair_on_status` failed once on the second locked suite. Isolation passed in 1.91 s. The first and third locked suites passed that test. Prior Hub implement reports already record this flake. This change does not edit Unix EOF ablation.
-- Offerer-side `OnClose` after Hub rejects a second DataChannel remains unreliable. The close oracle is the test-only marker written after production `local_close`.
+- Offerer-side `OnClose` after Hub rejects a second DataChannel remains unreliable. The close oracle is the observation file plus the test-only marker written only after a lost claim and `Ok(Ok(()))` from `timeout(local_close)`.
 - The entity-defer gate is pinned by source, not by a live flush-order race.
 - New §8.2 Reserved-route late-`open` surfaces do not exist yet. Ticket `ticket_1787600674_500120` owns them.
 - A27b Core `WRITE_ATTEMPT_BUDGET` hard-stop through Hub is owned by `ticket_1787600674_500120`.
