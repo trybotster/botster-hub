@@ -582,7 +582,8 @@ reference-runner evidence on `botster-ubuntu-24.04-16core`, never asserted.
 | A8d | an unreserved label binds nothing | the browser opens a well-formed label with no `Reserved` route; assert immediate close, no adapter, no charge |
 | A8e | a duplicate open on a `Bound` route binds nothing | assert the second channel closes and the first route keeps delivering |
 | A8f | a **partially** matching label cannot claim a reservation | hold exactly one `Reserved` route, then open one channel per mismatch axis of the section 8.3 label: wrong channel kind, wrong `session_id`, wrong `subscription_id`, and wrong `generation`, each with every other field correct. For each arm assert the channel reaches `Open`, Hub closes it, no Core adapter is bound, section 9 accounting is unchanged, and the one `Reserved` route is **still** `Reserved` and still bindable by its exact label afterwards. A single all-fields-wrong label is not a substitute: it cannot distinguish a per-field comparison from a whole-string comparison that happens to reject |
-| A8g | an open event is rejected on the limit table, not only admission | fill the connection to `MAX_TOTAL_CHANNELS` = 33, one control channel plus 32 `Bound` subscription channels, so no slot remains. The browser then opens one extra reliable ordered channel. Assert it reaches `Open`, binds no adapter, is closed by Hub, leaves the section 9 counts at 33 and the aggregate unchanged, and does not disturb a surviving `Bound` channel, proved by a known terminal marker delivered byte-exact on that sibling over the same window per `[[rejected channel isolation needs a surviving channel positive control]]`. A7 does **not** cover this: A7 rejects the 33rd **admission** before any channel exists, so it exercises the reservation path, not the open path |
+| A8g | **externally visible outcome only.** A full connection rejects an extra opened channel and no sibling suffers | fill the connection to `MAX_TOTAL_CHANNELS` = 33, one control channel plus 32 `Bound` subscription channels. The browser opens one extra reliable ordered channel. Assert it reaches `Open`, binds no adapter, is closed by Hub, leaves the section 9 counts at 33 and the aggregate unchanged, and does not disturb a surviving `Bound` channel, proved by a known terminal marker delivered byte-exact on that sibling over the same window per `[[rejected channel isolation needs a surviving channel positive control]]`. **Assert the typed rejection reason equals the unreserved reason, not the limit reason.** This row does **not** prove the limit guard, and section 11.4 says why. A7 does not cover it either: A7 rejects the 33rd **admission** before any channel exists |
+| A8h | **the open-time limit guard is load-bearing.** A reserved, identity-matching open event is still refused when the connection is over its charged limit | a focused state-construction unit lane, not a production browser flow. Build mux state directly: one `Reserved` route whose section 8.3 label, session, subscription, and generation all match, while the connection's charged subscription count is already at `MAX_SUBSCRIPTION_CHANNELS` = 32. Drive the **production** open-event decision function against that state. Assert it refuses, binds no Core adapter, emits the typed **limit** reason distinct from the unreserved reason, and leaves the counts unchanged. **Red-on-revert, and it must be assertion-specific:** delete only the open-time limit predicate, leaving every other guard in place, and assert A8h becomes the **first** failure, per `[[a regression test must be shown to go red with the fix reverted]]`. Identity, generation, route state, duplicate, and unreserved guards all pass on this input by construction, so the limit predicate is the only check that can refuse it |
 | A26 | the aggregate does not drift | saturate, drain fully, assert `aggregate_buffered()` returns to 0 and held classes resume. A stored counter fails this; the derived sum of section 9.2 passes |
 | A27 | a refused terminal send is backpressure, not loss | the architecture section 14.3 A27 sequence T1 to T7, at most 8 attempts before the drain. Assert `WouldBlock` from `try_write`, `WouldBlock` from `pressure()`, Core retains the frame while the adapter does not, the aggregate stays at 2,097,152 B, and after draining below 1,048,576 B the same frame is delivered byte-exact with no duplicate |
 | A27b | sustained aggregate pressure hits Core's hard stop | hold pressure through 512 consecutive unsuccessful attempts; assert Core `hard_stop`s the route, emits `ClientWorkerTeardown`, and Hub retires the route |
@@ -622,6 +623,44 @@ Live Hub proof, per `[[live hub proof records distinct hub and locked core binar
    target directory.
 6. Record the Hub SHA, the locked Core SHA, both build commands, and both
    resolved paths in the verification artifact.
+
+### 11.0 Why the open-time limit check needs two rows
+
+Admission charges the section 9 limit table and only then inserts a `Reserved`
+route. A `Reserved` route therefore implies its charge already succeeded. Two
+consequences follow, and they are the reason A8g and A8h are separate rows with
+separate stated proof roles.
+
+**On the production path, an over-limit open event carrying a valid reservation
+is unreachable.** At a full connection the extra channel the browser opens has no
+reservation at all, so the unreserved guard refuses it before any limit predicate
+runs. That is correct fail-closed behavior, and it is what A8g measures.
+
+**So A8g cannot prove the limit guard.** Delete the open-time limit check and A8g
+still passes, because the unreserved guard was doing the work. The previous
+revision of this plan claimed A8g proved open-time limit rejection. It did not,
+and Plan Review `review_1787681114_793607` was right to reject that claim.
+
+The open-time limit check is therefore **defensive**: it refuses a reserved,
+identity-matching open event whose connection is over its charged limit, a state
+production admission should never produce. The ticket requires the check —
+"Reject late, stale, mismatched, duplicate, unreserved, **or over-limit** open
+events" — so the check ships, and a defensive check still needs a test that goes
+red when it is removed. A8h is that test, and it must construct the state
+directly, because no production sequence reaches it.
+
+The two rows carry different burdens, and neither substitutes for the other:
+
+| Row | Proof role | Path | Red-on-revert target |
+|---|---|---|---|
+| A8g | the externally visible rejection and sibling isolation at a full connection | production browser flow | none; it is deliberately not the limit guard's proof |
+| A8h | the open-time limit predicate itself | state-construction unit lane against the production decision function | delete only the limit predicate; A8h must fail first |
+
+This split requires the rejection reasons to be **distinguishable typed values**,
+not one generic close. A8g asserts the unreserved reason and A8h asserts the
+limit reason. Without distinct reasons neither row can name which guard refused
+the channel, and A8g would silently reacquire the false claim this section
+removes.
 
 ### 11.1 Repository gate commands
 
@@ -829,6 +868,7 @@ fails to compile. An identity oracle that cannot go red proves nothing.
 | Ticket size. Core roll, a new module, adapter ingress, a protocol cutover, and fifteen-plus acceptance rows in one Implement step | review fatigue; partial delivery | the six-commit sequence in section 9 keeps each commit reviewable; the move-only commit is separate by project rule |
 | A channel opens after its subscription retired | a resurrected route leaks a Core adapter | A8 with a red-on-revert control, plus A8c for both race orders |
 | An unreserved or duplicate label binds an adapter | fail-open admission | A8d and A8e; a label with no `Reserved` route closes immediately and charges nothing |
+| A guard is proved by a test that an earlier guard already satisfies | the check can be deleted with every test still green, so it is dead in practice | section 11.0 splits A8g from A8h, requires distinguishable typed rejection reasons, and gives A8h an assertion-specific red-on-revert that removes only the limit predicate |
 | Extraction becomes a file-only split | `[[Hub extraction must reduce ownership rather than only split files]]` fails at review | architecture section 12.1 assigns responsibilities, not line counts; no forwarding wrapper is left in `src/local_webrtc.rs` |
 | 33 channels per peer exceed a browser or `webrtc-rs` limit | admission fails late instead of at the table | A7 tests the boundary; unknown 1 measures it early |
 | Per-channel AES-GCM adds a copy per terminal frame | throughput regression on large history | reference-runner comparison against the post-Restty baseline; recorded as evidence, never asserted |
@@ -990,3 +1030,51 @@ step itself did not run.
 
 Acceptance now carries **twenty** deterministic rows. Nothing in sections 1, 3 to
 5, 7 to 10, or 11.3 changed.
+
+### 14.2 Plan Review return, review_1787681114_793607
+
+Verdict `changes_required` with one finding. The reviewer approved the
+architecture, ownership split, registered dependencies, risks, assumptions,
+runtime-teardown answers, live Hub proof, downstream package proof, the
+open-timeout correction, A8f, and the corrected 34-note inventory. One row was
+rejected.
+
+`finding_1787681114_577880`, high, product — A8g did not make the open-time limit
+guard load-bearing.
+
+**Correct, and re-derived from the plan's own text before acceptance.** Section 4
+item 3 and the section 6 production path both state that admission charges the
+section 9 table and only then inserts a `Reserved` route. A `Reserved` route
+therefore implies a successful charge. At a full connection the extra channel the
+browser opens has no reservation, so the unreserved guard from A8d refuses it
+first. Removing only the open-time limit predicate leaves A8g green. The row
+proved the outcome, not the guard.
+
+The plan already carried
+`[[a regression test must be shown to go red with the fix reverted]]` and applied
+it to A8. It was not applied to A8g. That is the actual defect: a known rule was
+listed and then not used on a row that needed it.
+
+The reviewer's suggested resolution is adopted in full, including its conditional
+half. Production admission does make an isolated over-limit valid reservation
+unreachable, so:
+
+- New section 11.0 states why the check is defensive, and records that the
+  previous revision's claim was false.
+- **A8g** is rewritten to state its proof role explicitly — the externally
+  visible rejection and sibling isolation only — and now asserts the typed
+  **unreserved** reason, so it cannot silently reacquire the limit claim.
+- **A8h** is added as a focused state-construction unit lane that drives the
+  production open-event decision function against one `Reserved`,
+  identity-matching, generation-matching route on a connection already at
+  `MAX_SUBSCRIPTION_CHANNELS` = 32. Every other guard passes on that input by
+  construction, so the limit predicate is the only check that can refuse it.
+- A8h carries an **assertion-specific** red-on-revert: delete only the limit
+  predicate, leave every other guard in place, and A8h must be the first failure.
+- Both rows require **distinguishable typed rejection reasons**. A generic close
+  would leave neither row able to name which guard refused the channel.
+
+Acceptance now carries **twenty-one** deterministic rows. Section 12 gains one
+risk row for the general failure mode: a guard proved by a test that an earlier
+guard already satisfies is dead in practice, because it can be deleted with every
+test still green.
