@@ -40,10 +40,7 @@ use webrtc::peer_connection::{
     PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCIceGatheringState,
     RTCPeerConnectionState, RTCSessionDescription,
 };
-use webrtc::runtime::{
-    Receiver as AsyncReceiver, Sender as AsyncSender, block_on, channel, default_runtime, sleep,
-    timeout,
-};
+use webrtc::runtime::{Receiver as AsyncReceiver, Sender as AsyncSender, channel, default_runtime};
 
 use crate::support::{
     ensure_session_worker_binary, recovering_mutex_guard, validate_cli_daemon_shutdown,

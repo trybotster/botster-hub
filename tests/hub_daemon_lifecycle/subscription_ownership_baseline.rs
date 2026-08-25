@@ -268,6 +268,63 @@ fn webrtc_peer_rejects_a_second_data_channel_requires_one_shot_claim() {
 }
 
 #[test]
+fn webrtc_peer_post_handshake_data_channel_reaches_production_reject() {
+    let _guard = daemon_test_guard();
+    let marker_dir = unique_test_dir("so-post-hs-close");
+    std::fs::create_dir_all(&marker_dir).expect("create extra-channel close marker dir");
+    let marker_dir = marker_dir
+        .canonicalize()
+        .expect("canonicalize extra-channel close marker dir");
+    let close_marker = marker_dir.join("extra-closed");
+    let observation = marker_dir.join("extra-observation.json");
+    let marker = close_marker.to_string_lossy().into_owned();
+    let observation_path = observation.to_string_lossy().into_owned();
+    let (hub, endpoint, bootstrap) = start_webrtc_adapter_hub_with_env(
+        "so-post-hs",
+        &[
+            ("BOTSTER_HUB_TEST_EXTRA_CHANNEL_CLOSE_MARKER", marker.as_str()),
+            (
+                "BOTSTER_HUB_TEST_EXTRA_CHANNEL_OBSERVATION",
+                observation_path.as_str(),
+            ),
+        ],
+    );
+    block_on(async {
+        let (mut peer, key) = open_local_webrtc_peer(&endpoint, &bootstrap).await;
+        peer.encrypted_hello(&key, &webrtc_terminal_adapter_hello())
+            .await
+            .expect("encrypted Hello takes the one-shot claim before the late channel");
+        let extra = peer
+            .create_extra_data_channel()
+            .await
+            .expect("post-handshake extra DataChannel must open on the offerer");
+        assert_eq!(extra.label, "botster-extra");
+        assert!(
+            wait_for_path(&observation, Duration::from_secs(10)),
+            "Hub must observe the production extra-channel reject after handshake"
+        );
+        let (lost_claim, close_ok, label) = extra_channel_observation(&observation)
+            .expect("extra-channel observation must be valid JSON");
+        assert!(
+            lost_claim,
+            "post-handshake DataChannel must lose the production one-shot claim"
+        );
+        assert!(
+            close_ok,
+            "timeout(local_close) must return Ok(Ok(())) for the rejected DataChannel"
+        );
+        assert_eq!(label, "botster-extra");
+        assert!(
+            close_marker.exists(),
+            "Hub must finish bounded local_close on the post-handshake DataChannel"
+        );
+        assert_production_second_channel_reject_source();
+        peer.peer.close().await.expect("close offer peer");
+    });
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
 fn webrtc_shared_channel_carries_control_entity_event_and_terminal_frames() {
     let _guard = daemon_test_guard();
     let (hub, endpoint, bootstrap) = start_webrtc_adapter_hub("so-4cls");

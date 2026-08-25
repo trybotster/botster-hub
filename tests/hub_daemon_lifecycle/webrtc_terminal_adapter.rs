@@ -398,7 +398,7 @@ fn webrtc_terminal_adapter_second_data_channel_does_not_receive_terminal_frames(
         let mut extra = peer
             .create_extra_data_channel()
             .await
-            .expect("create extra DataChannel");
+            .expect("post-handshake extra DataChannel must open before isolation is measured");
         let deadline = Instant::now() + Duration::from_secs(8);
         let mut saw_terminal_frame = false;
         while Instant::now() < deadline && !saw_terminal_frame {
