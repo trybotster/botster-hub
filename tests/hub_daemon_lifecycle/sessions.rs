@@ -311,6 +311,13 @@ fn fast_exit_attach_diagnostic_records_subscription_event_order() {
                 } => format!(
                     "event_gap:subscription={subscription_id}:owner={owner}:name={name}"
                 ),
+                botster_hub_client::DaemonEvent::SubscriptionChannelOpenTimeout {
+                    session_id: event_session_id,
+                    subscription_id: event_subscription_id,
+                    generation,
+                } => format!(
+                    "subscription_channel_open_timeout:session={event_session_id}:subscription={event_subscription_id}:generation={generation}"
+                ),
             };
             response_observations.push(observation.clone());
             ordered_observations.push(format!(
@@ -465,6 +472,13 @@ fn fast_exit_attach_diagnostic_records_subscription_event_order() {
                     ),
                     botster_hub_client::DaemonEvent::EventGap { .. } => println!(
                         "fast_exit_attach_tail_event elapsed_us={elapsed_us} response={response_index} event={event_index} type=event_gap session=none subscription=none bytes=0"
+                    ),
+                    botster_hub_client::DaemonEvent::SubscriptionChannelOpenTimeout {
+                        session_id: event_session_id,
+                        subscription_id: event_subscription_id,
+                        generation,
+                    } => println!(
+                        "fast_exit_attach_tail_event elapsed_us={elapsed_us} response={response_index} event={event_index} type=subscription_channel_open_timeout session={event_session_id} subscription={event_subscription_id} generation={generation} bytes=0"
                     ),
                 }
             }

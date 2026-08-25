@@ -84,9 +84,26 @@ async fn spawn_and_bind_webrtc(
     assert_eq!(attach.kind, botster_hub_client::DaemonResponseKind::Events);
     assert!(
         attach.events.is_empty(),
-        "WebRTC bind must return empty Attach bodies: {:?}",
+        "WebRTC reserve must return empty Attach bodies: {:?}",
         attach.events
     );
+    let label = attach
+        .subscription_channel_label
+        .as_deref()
+        .expect("Attach returns the reserved subscription channel label");
+    assert_eq!(
+        attach.subscription_channel_generation,
+        Some(
+            label
+                .rsplit('/')
+                .next()
+                .and_then(|generation| generation.parse().ok())
+                .expect("reserved label carries generation")
+        )
+    );
+    peer.open_reserved_subscription_channel(label)
+        .await
+        .expect("browser creates the reserved terminal DataChannel");
 }
 
 fn webrtc_terminal_contains(
@@ -269,6 +286,13 @@ fn webrtc_terminal_adapter_bind_returns_only_attaching_then_terminal_frames() {
             "WebRTC Attach must not return terminal bodies: {:?}",
             attach.events
         );
+        let label = attach
+            .subscription_channel_label
+            .as_deref()
+            .expect("Attach returns the reserved subscription channel label");
+        peer.open_reserved_subscription_channel(label)
+            .await
+            .expect("browser creates the reserved terminal DataChannel");
 
         let deadline = Instant::now() + Duration::from_secs(8);
         let mut saw_terminal_frame = false;
@@ -377,24 +401,14 @@ fn webrtc_terminal_adapter_second_data_channel_does_not_receive_terminal_frames(
         peer.encrypted_hello(&key, &webrtc_terminal_adapter_hello())
             .await
             .expect("hello");
-        peer.encrypted_request(
+        spawn_and_bind_webrtc(
+            &mut peer,
             &key,
-            &botster_hub_client::DaemonRequest::Spawn {
-                session_id: session_id.to_string(),
-                command: "printf 'webrtc-two-channel-ready\\n'; sleep 30".to_string(),
-            },
+            session_id,
+            subscription_id,
+            "printf 'webrtc-two-channel-ready\\n'; sleep 30",
         )
-        .await
-        .expect("spawn");
-        peer.encrypted_request(
-            &key,
-            &botster_hub_client::DaemonRequest::Attach {
-                session_id: session_id.to_string(),
-                subscription_id: subscription_id.to_string(),
-            },
-        )
-        .await
-        .expect("attach");
+        .await;
         let mut extra = peer
             .create_extra_data_channel()
             .await
@@ -560,24 +574,7 @@ fn webrtc_terminal_adapter_bound_peer_loss_closes_adapter_without_hub_detach() {
         peer.encrypted_hello(&key, &webrtc_terminal_adapter_hello())
             .await
             .expect("hello");
-        peer.encrypted_request(
-            &key,
-            &botster_hub_client::DaemonRequest::Spawn {
-                session_id: session_id.to_string(),
-                command: "sleep 30".to_string(),
-            },
-        )
-        .await
-        .expect("spawn");
-        peer.encrypted_request(
-            &key,
-            &botster_hub_client::DaemonRequest::Attach {
-                session_id: session_id.to_string(),
-                subscription_id: subscription_id.to_string(),
-            },
-        )
-        .await
-        .expect("attach");
+        spawn_and_bind_webrtc(&mut peer, &key, session_id, subscription_id, "sleep 30").await;
         let attached =
             botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
                 .expect("status after attach")
