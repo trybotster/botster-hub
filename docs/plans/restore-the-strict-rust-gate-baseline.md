@@ -3,12 +3,13 @@
 Ticket: `ticket_1787667162_566252` — "Hub: restore the strict Rust gate baseline"
 Run: `run_1787667183_365249`
 Pipeline: Botster Stack Delivery (`botster_stack_delivery`)
-Revision: 5. Revision 1 was returned by Plan Review `review_1787668688_184116`
+Revision: 6. Revision 1 was returned by Plan Review `review_1787668688_184116`
 (`changes_required`). Revision 2 was approved by Plan Review
 `review_1787669695_148343`. Revision 3 recorded the rule-3 `sessions.rs` admission.
 Revision 4 replaced a committed absolute target-checkout path with path-neutral
-wording. Verify `review_1787675552_340800` returned Implement for one plan defect:
-official gates must not set `CARGO_TARGET_DIR`.
+wording. Revision 5 forbade `CARGO_TARGET_DIR` on official gates. Review
+`review_1787676418_726178` returned Implement because the command block did not
+unset an inherited override.
 
 ## Target repository and target_id
 
@@ -65,6 +66,8 @@ Targeted atomic notes:
 - [[the pinned Rust WebRTC peer cannot open a DataChannel created after the SCTP handshake]]
 - [[botster runtime teardown lenses]] — loaded to classify the ticket. See
   "Runtime-teardown class" below. The class does **not** apply.
+- [[Hub official gates must not set CARGO TARGET DIR]] — official locked gates
+  must unset `CARGO_TARGET_DIR` and use the default worktree `target/` directory.
 
 Not loaded, with reason: other repository charters, because the ticket target is a single
 repository and the charter for it is loaded above.
@@ -352,6 +355,7 @@ Gate commands, in order:
 
 ```sh
 export RUSTUP_TOOLCHAIN=1.97.0
+unset CARGO_TARGET_DIR
 rustc --version                     # must print 1.97.0
 zig version                         # must print 0.16.0
 cargo build --locked -p botster-core-daemon --bin botster-session-worker
@@ -519,6 +523,13 @@ the same `./test.sh --locked` gate this plan requires. Revision 5 forbids
 `CARGO_TARGET_DIR` on official gates and records both failure classes. No
 source change.
 
+## Implement resync (revision 5 → revision 6)
+
+Review `review_1787676418_726178` found that the official command block never
+unsets an inherited `CARGO_TARGET_DIR`. Revision 6 adds `unset CARGO_TARGET_DIR`
+before the prebuilds and replaces the candidate-note text with
+[[Hub official gates must not set CARGO TARGET DIR]]. No source change.
+
 ## Vault gaps worth capturing
 
 1. **`RUSTUP_TOOLCHAIN=1.92.0` in pipeline agent shells produces false-green Rust gates in
@@ -545,10 +556,9 @@ source change.
 4. **Strict-gate baseline repairs belong in their own ticket.** The owner's rule is
    recorded in project memory but has no vault note. This ticket is the worked example.
 5. **`CARGO_TARGET_DIR` is not a safe isolation knob for `botster-hub` official
-   gates.** An out-of-worktree value fails session-worker census. A non-default
-   in-worktree value fails `update_command_test` because that test hard-codes
-   `target/debug` while `src/update.rs` honors the override. Official gates must
+   gates.** This gap is now captured as
+   [[Hub official gates must not set CARGO TARGET DIR]]. Official gates must
    unset `CARGO_TARGET_DIR` and prebuild into the default `target/` directory.
-   Candidate note: "Hub official gates must not set CARGO_TARGET_DIR". This
-   sharpens [[Hub session worker census requires the worker binary under the
-   worktree]], which today covers only the out-of-worktree class.
+   That note also sharpens
+   [[Hub session worker census requires the worker binary under the worktree]],
+   which covers only the out-of-worktree class.
