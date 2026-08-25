@@ -14,6 +14,7 @@
 | Approved plan | `docs/plans/freeze-subscription-ownership-and-capture-the-regression-baseline.md` |
 | Plan commit | `dfbf934` |
 | Implement commit | `ca77a33e5edb482078b61fe7f452fa8f0e8a9bdd` |
+| Review-return Implement commit | `3f4e0e36f287312d8a111e34342c4a5ba8bd3461` |
 | Base commit | `85a0434` (`origin/main`) |
 | Merge policy | direct (no PR required) |
 | Locked Core SHA | `7eafa470a18025895995bbedc20d34b58106a03b` |
