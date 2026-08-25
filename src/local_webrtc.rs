@@ -1141,9 +1141,9 @@ impl PeerConnectionEventHandler for LocalWebrtcHandler {
     }
 
     async fn on_data_channel(&self, data_channel: Arc<dyn DataChannel>) {
-        let label = data_channel.label().await.unwrap_or_else(|_| String::new());
         let claimed = self.peer_state.claim_data_channel();
         if !claimed {
+            let label = data_channel.label().await.unwrap_or_else(|_| String::new());
             reject_extra_data_channel(
                 &self.peer_state.grant_id,
                 claimed,

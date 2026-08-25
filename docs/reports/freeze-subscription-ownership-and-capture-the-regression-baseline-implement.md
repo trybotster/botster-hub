@@ -10,7 +10,7 @@
 | Pipeline worktree | the pipeline-provided ticket worktree |
 | Ticket | `ticket_1787600670_129312` |
 | Run | `run_1787605830_934897` |
-| Step | `botster_stack_implement` (`run_step_1787624123_605386`) |
+| Step | `botster_stack_implement` (`run_step_1787626624_952000`) |
 | Approved plan | `docs/plans/freeze-subscription-ownership-and-capture-the-regression-baseline.md` |
 | Plan commit | `dfbf934` |
 | Implement commit | `ca77a33e5edb482078b61fe7f452fa8f0e8a9bdd` |
@@ -18,6 +18,7 @@
 | Second Review-return Implement commit | `1e588c38ed8e870c1510e5abfeadf9c8bb0b8beb` |
 | Verify-return Implement commit | `d8aa2b96fb8fd1e056231b43c99d6d2d2c226219` |
 | Third Review-return Implement commit | `a9863ade179944dd3df0c8f26cb3e292b1e6e829` |
+| Fourth Review-return Implement commit | pending until this commit |
 | Base commit | `85a0434` (`origin/main`) |
 | Merge policy | direct (no PR required) |
 | Locked Core SHA | `7eafa470a18025895995bbedc20d34b58106a03b` |
@@ -119,7 +120,7 @@ No scope change. Implementation notes, not waived requirements:
 
 1. `webrtc_ready_entity_frame_defers_terminal_output` pins the production gate text in `run_data_channel`. A race-free live deferral oracle would need a new flush seam; the plan forbids transport changes.
 2. `attach_ready_precedes_history_finish` decodes Ghostty READY then FINISH from the Unix terminal stream, sends input after READY, and keeps host-plane `FINISH` absent.
-3. IsolatedHub does not deliver a post-connect extra DataChannel, and a second `LocalWebrtcSignal` cannot renegotiate a redeemed grant. Question `question_1787624446_986511` chose option C: keep both channels in the initial offer and identify the survivor by encrypted Hello. The test does not assume callback order or which label loses. Observation and close-marker instrumentation stay test-only and do not change claim order. The marker writes for any rejected label after `lost_claim` and `Ok(Ok(()))`. The one-shot negative control stays.
+3. IsolatedHub does not deliver a post-connect extra DataChannel, and a second `LocalWebrtcSignal` cannot renegotiate a redeemed grant. Question `question_1787624446_986511` chose option C: keep both channels in the initial offer and identify the survivor by encrypted Hello. The test does not assume callback order or which label loses. `on_data_channel` calls `claim_data_channel()` before any label await. The label is read only after a lost claim. Observation and close-marker instrumentation stay test-only and do not change claim order. The marker writes for any rejected label after `lost_claim` and `Ok(Ok(()))`. The one-shot negative control stays.
 4. `ultimate_close_failure_sacrifices_every_peer_and_sweeps_all_owners` runs the bound-exceeded hang fail-closed path, then the attach fail-closed path, and asserts zero Core inventory rows and zero Hub attach routes before session shutdown.
 5. `wait_for_webrtc_marker` uses a 20 s deadline so suite load cannot hide terminal bytes that already followed attach-state frames.
 
@@ -191,6 +192,13 @@ Locked-suite evidence on this Implement tree:
 | Third Review-return `cargo fmt --all -- --check` | pass |
 | Third Review-return `cargo clippy --workspace --all-targets --locked -- -D warnings` | pass |
 | Third Review-return `./test.sh --locked` | pass. Hub lib 490. Lifecycle 317 passed, 2 ignored. Exit 0 in 420 s. |
+| Fourth Review-return isolated extra-channel test | pass in 3.62 s after claim-before-label |
+| Fourth Review-return extra-channel test under 14 `yes` workers | 3 of 3 passed |
+| Fourth Review-return one-shot negative control | pass in 2.79 s |
+| Fourth Review-return lib marker control | pass |
+| Fourth Review-return `cargo fmt --all -- --check` | pass |
+| Fourth Review-return `cargo clippy --workspace --all-targets --locked -- -D warnings` | pass |
+| Fourth Review-return `./test.sh --locked` | pass. Hub lib 490. Lifecycle 317 passed, 2 ignored. Exit 0 in 382 s. |
 
 Live Hub pin for this worktree:
 
