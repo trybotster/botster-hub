@@ -86,6 +86,20 @@ Targeted atomic notes:
 - `[[Fault-injected WebRTC close requires a daemon started with the inject env]]`
 - `[[public protocol versions host control and Core terminal planes independently]]`
 
+Release-chain and downstream-proof notes. Section 11.3 applies all six. They were
+cited there but omitted from this inventory in the previous revision:
+
+- `[[hub generated protocol changes are a four site release chain]]`
+- `[[closed dependency tickets signal merged source not a consumable release]]`
+- `[[a ui contract import line change costs one test line in each generic client]]`
+- `[[tui shaped Hub consumer proofs must include hub test support]]`
+- `[[clean consumer smokes resolve exported root entrypoints not package json]]`
+- `[[a Cargo source identity proof needs a wrong tag ablation]]`
+
+That makes **34** targeted atomic notes: 28 above plus these 6. The previous
+revision's artifact and checklist evidence said 29, which was wrong in both
+directions — it overcounted the first list and omitted the second.
+
 Gate-hygiene notes added during this Plan visit, all published by the merged
 prerequisite:
 
@@ -280,9 +294,17 @@ still resolves before a queued close on the same channel, per
 | `Detach` | same triple | idempotent; an unknown triple is a no-op | none needed |
 | `SubscribeEntities` / `SubscribePackageEvents` | `(grant_id, subscription_id, generation)` | unchanged in this ticket; still control-channel only | unchanged |
 | **Browser-created `DataChannel` open (new surface)** | the section 8.3 label triple, held as a `Reserved` route | the open handler re-checks route state, subscription identity, generation suppression, and peer liveness. Any failure closes the channel and **binds no Core adapter** | `suppress_generations` is the sweep. A late open finds it, self-closes, and releases the reserved slot |
-| **`Reserved` route that never opens (new surface)** | the same triple | `LOCAL_WEBRTC_CHANNEL_OPEN_BOUND` expires | Hub closes the channel, releases the slot, and emits `subscription_channel_open_timeout`. Without this the slot leaks against the section 9 channel count |
+| **`Reserved` route that never opens (new surface)** | the same triple | `LOCAL_WEBRTC_CHANNEL_OPEN_BOUND` expires | **No channel exists, so Hub closes nothing.** Hub retires the `Reserved` route, releases its section 9 slot, and emits `subscription_channel_open_timeout` on the control channel. Without the release the slot leaks against the channel count |
 | **Unreserved browser-created channel (new surface)** | none — no route matches its label | closed immediately, fail closed. A label with no `Reserved` route binds nothing and charges nothing | none needed; nothing was created |
 | Any peer-originated `DaemonRequest` on the control channel | `grant_id` | `local_webrtc_peer_gone_request_error` | none needed |
+
+Bounded `DataChannel` close applies only where a channel actually exists: a late,
+stale, unreserved, duplicate, mismatched, or over-limit **open event**, and peer
+teardown. The open-timeout path has no channel to close, because admission
+creates none and the browser never created one. The previous revision said Hub
+closes the channel on timeout. That was a residue of the superseded
+Hub-creates-every-channel contract in architecture section 8.2, and it is
+corrected here and in row A8b.
 
 The two genuinely new ownership surfaces are the browser-created channel open and
 the reservation that never opens. Binding a Core adapter on a channel that opens
@@ -555,10 +577,12 @@ reference-runner evidence on `botster-ubuntu-24.04-16core`, never asserted.
 | A6 | a slow subscription does not block a sibling | hold one terminal channel at `bufferedAmount` high, assert a sibling terminal subscription still delivers byte-exact |
 | A7 | section 9 limits are enforced from one table | the 33rd subscription is rejected with the typed error; no channel is created; the reserved count is unchanged |
 | A8 | a late open on a suppressed generation binds no adapter | drive the production failure handler to retire the route, then fire the open. Assert Core terminal inventory holds zero routes for the grant. Red-on-revert: move the bind back into admission and assert this becomes the **first** failure |
-| A8b | a `Reserved` route that never opens releases its slot | withhold the open past `LOCAL_WEBRTC_CHANNEL_OPEN_BOUND`; assert the typed `subscription_channel_open_timeout` event and that the section 9 channel count returns to its pre-request value |
+| A8b | a `Reserved` route that never opens releases its slot | withhold the open past `LOCAL_WEBRTC_CHANNEL_OPEN_BOUND`; assert the typed `subscription_channel_open_timeout` event and that the section 9 channel count returns to its pre-request value. Assert Hub issues **no** `DataChannel::local_close()` on this path, because no channel exists to close |
 | A8c | both race orders are covered | run A8 in retire-then-open and open-then-retire order |
 | A8d | an unreserved label binds nothing | the browser opens a well-formed label with no `Reserved` route; assert immediate close, no adapter, no charge |
 | A8e | a duplicate open on a `Bound` route binds nothing | assert the second channel closes and the first route keeps delivering |
+| A8f | a **partially** matching label cannot claim a reservation | hold exactly one `Reserved` route, then open one channel per mismatch axis of the section 8.3 label: wrong channel kind, wrong `session_id`, wrong `subscription_id`, and wrong `generation`, each with every other field correct. For each arm assert the channel reaches `Open`, Hub closes it, no Core adapter is bound, section 9 accounting is unchanged, and the one `Reserved` route is **still** `Reserved` and still bindable by its exact label afterwards. A single all-fields-wrong label is not a substitute: it cannot distinguish a per-field comparison from a whole-string comparison that happens to reject |
+| A8g | an open event is rejected on the limit table, not only admission | fill the connection to `MAX_TOTAL_CHANNELS` = 33, one control channel plus 32 `Bound` subscription channels, so no slot remains. The browser then opens one extra reliable ordered channel. Assert it reaches `Open`, binds no adapter, is closed by Hub, leaves the section 9 counts at 33 and the aggregate unchanged, and does not disturb a surviving `Bound` channel, proved by a known terminal marker delivered byte-exact on that sibling over the same window per `[[rejected channel isolation needs a surviving channel positive control]]`. A7 does **not** cover this: A7 rejects the 33rd **admission** before any channel exists, so it exercises the reservation path, not the open path |
 | A26 | the aggregate does not drift | saturate, drain fully, assert `aggregate_buffered()` returns to 0 and held classes resume. A stored counter fails this; the derived sum of section 9.2 passes |
 | A27 | a refused terminal send is backpressure, not loss | the architecture section 14.3 A27 sequence T1 to T7, at most 8 attempts before the drain. Assert `WouldBlock` from `try_write`, `WouldBlock` from `pressure()`, Core retains the frame while the adapter does not, the aggregate stays at 2,097,152 B, and after draining below 1,048,576 B the same frame is delivered byte-exact with no duplicate |
 | A27b | sustained aggregate pressure hits Core's hard stop | hold pressure through 512 consecutive unsuccessful attempts; assert Core `hard_stop`s the route, emits `ClientWorkerTeardown`, and Hub retires the route |
@@ -942,3 +966,27 @@ from the previous plan text:
     is still owed and has not been made by another ticket.
 
 No blocking question is open for this run, and this visit asks none.
+
+### 14.1 Plan Review return, review_1787680632_501854
+
+Verdict `changes_required` with three findings. Each was re-measured against the
+plan and the repository before it was accepted, per the role rule that a reported
+failure needs exact evidence rather than agreement. All three are correct.
+
+| Finding | Severity | Verdict after independent check | Resolution |
+|---|---|---|---|
+| `finding_1787680632_725415` — the open-timeout path tries to close a channel that does not exist | high, product | **Correct.** The late-message matrix row for a `Reserved` route that never opens read "Hub closes the channel, releases the slot, and emits `subscription_channel_open_timeout`". Admission creates no channel and the browser never created one, so there is no channel to close. This was a residue of the superseded architecture section 8.2 contract, carried into the corrected browser-created design | The matrix row now states that Hub closes nothing, retires the route, releases the slot, and emits the typed event. Section 6 adds an explicit statement of where bounded close does and does not apply. Row A8b now asserts that Hub issues **no** `local_close()` on this path |
+| `finding_1787680632_224126` — acceptance does not prove mismatched identity or open-time over-limit rejection | high, product | **Correct.** The ticket requires validation of route identity, subscription identity, generation, and limits on every open event, and rejection of "mismatched" and "over-limit" opens. A8d opened only a label with **no** reservation, and A7 rejected the 33rd **admission** before any channel existed. Neither exercises a partial match against a live `Reserved` route, and neither exercises the open path with the table full | Two rows added. **A8f** opens one channel per mismatch axis of the section 8.3 label — wrong kind, wrong `session_id`, wrong `subscription_id`, wrong `generation` — each with every other field correct, and asserts the surviving `Reserved` route stays `Reserved` and bindable. A single all-fields-wrong label is rejected as a substitute, because it cannot distinguish a per-field comparison from a whole-string comparison. **A8g** fills the connection to `MAX_TOTAL_CHANNELS` = 33 and opens one extra channel, asserting `Open`, no adapter, unchanged accounting, and an undisturbed sibling proved by a delivered terminal marker |
+| `finding_1787680632_446785` — the targeted-note inventory is incomplete | low, process | **Correct, and the count was wrong in both directions.** Section 2 listed 28 notes while the artifact and checklist evidence claimed 29. Six further notes are applied in section 11.3 and were not listed anywhere | Section 2 now carries a release-chain and downstream-proof group with all six notes, and states the corrected total of **34**. The artifact and gate evidence are corrected. No second checklist was created; `checklist_1787679234_157339` is reused, as the finding requires |
+
+The reviewer's routing, charter, ownership, dependency, base, gate, and
+runtime-teardown conclusions matched this plan. The reviewer independently
+resolved `tgt_7e208a0c76a44980a83b63af976b1f22` to `botster-hub` through the
+admitted spawn-target registry, confirmed base `a0c7141`, and reported that
+format, strict Clippy, and the full locked wrapper pass under Rust `1.97.0` and
+Zig `0.16.0`. That is an independent second measurement of the green baseline
+recorded in section 11.2, and it also covers `./test.sh --locked`, which the Plan
+step itself did not run.
+
+Acceptance now carries **twenty** deterministic rows. Nothing in sections 1, 3 to
+5, 7 to 10, or 11.3 changed.
