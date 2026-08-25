@@ -10,13 +10,14 @@
 | Plan | `docs/plans/upgrade-webrtc-for-post-handshake-datachannel-creation.md` (rev5, commit `d9ff12c`) |
 | Class | runtime-teardown (`teardown_class_applies: yes`) |
 | Base | `f66d459` |
+| Review return | `review_1787662081_974365` (`changes_required`) |
 
 ## Target repository and target_id
 
 - Target repository: `botster-hub` (`trybotster/botster-hub`)
 - `target_id`: `tgt_7e208a0c76a44980a83b63af976b1f22`
 - Resolved from `list_spawn_targets`, not from the ambient working directory.
-- Worktree: `/Users/jasonconigliari/botster-sessions/trybotster-botster-hub-project-pipelines-ticket_1787654915_646236`
+- Worktree: the pipeline-provided ticket worktree
 - Branch: `project-pipelines/ticket_1787654915_646236`
 
 ## Repository playbook and other playbooks/notes applied
@@ -106,9 +107,9 @@ Assumption A1 holds: no newer `0.21.0-rc` was published. Cargo resolved exactly 
 
 | Identity | Value |
 | --- | --- |
-| Hub worktree | `/Users/jasonconigliari/botster-sessions/trybotster-botster-hub-project-pipelines-ticket_1787654915_646236` |
-| Hub binary realpath | `/Users/jasonconigliari/botster-sessions/trybotster-botster-hub-project-pipelines-ticket_1787654915_646236/target/debug/botster-hub` |
-| Session worker realpath | `/Users/jasonconigliari/botster-sessions/trybotster-botster-hub-project-pipelines-ticket_1787654915_646236/target/debug/botster-session-worker` |
+| Hub worktree | the pipeline-provided ticket worktree |
+| Hub binary | `target/debug/botster-hub` in the ticket worktree |
+| Session worker | `target/debug/botster-session-worker` in the ticket worktree |
 | Locked Core revision | `7eafa470a18025895995bbedc20d34b58106a03b` |
 
 ## Deviations from plan
@@ -117,9 +118,17 @@ Assumption A1 holds: no newer `0.21.0-rc` was published. Cargo resolved exactly 
 2. **`webrtc_runtime()` helper.** `send_response_frames` has no `Runtime` in scope. The helper returns `default_runtime()` so timeout sites can pass `&dyn Runtime` without threading a runtime through the send loop.
 3. **A4 creates a pre-handshake `botster-client` channel.** `create_offer` without a channel produced `ErrSessionDescriptionMissingIceUfrag`. The late channel is still created only after both peers reach `Connected` and the setup channel is open.
 4. **`create_extra_data_channel` requires `OnOpen`.** The helper used to discard the open wait. A7 and A4-live need that open to be load-bearing.
-5. **A5 ran on a detached `d9ff12c` worktree**, not by pinning this branch to `0.20`. This branch's 3-arg `timeout` API cannot compile against `webrtc 0.20.0-rc.1`. The A4 body was copied onto `d9ff12c` with 0.20 2-arg `timeout`. That run failed: remote `on_data_channel` stayed on `botster-client` and never delivered `botster-late`. A2 holds. Escalation was not required.
+5. **A5 ran on a detached worktree at plan commit `d9ff12c`**, not by pinning this branch to `0.20`. This branch's 3-arg `timeout` API cannot compile against `webrtc 0.20.0-rc.1`. The first ablation used the original optional setup-channel drain and failed on the leftover `botster-client` label. Review `review_1787662081_974365` correctly rejected that as a pre-late-channel failure. The review-return ablation uses the consume-first A4 body on `d9ff12c` with 0.20 2-arg `timeout`. It failed at `remote late channel by label` after `botster-client` was consumed. A2 holds. Escalation was not required.
 6. **A4-live `0.20` result is not runnable on this branch** for the same API reason. Recorded as diagnostic, not a gate, per A5/R6.
 7. **A9 uses `WebrtcTerminalAdmission::Rejected`.** A `Rejected` row still inserts both maps. `webrtc_is_admitted` stays false, so the positive control cannot pass through the false-negative helper (R10).
+
+## Review return (`review_1787662081_974365`)
+
+| Finding | Fix |
+| --- | --- |
+| `finding_1787662081_291539` (high) | A4 now requires and consumes remote `botster-client` before `create_data_channel("botster-late")`. It then waits for the late channel by exact label. |
+| `finding_1787662081_738710` (medium) | Remote `OnOpen` uses `expect` for the timeout and the receive result. Payload assertion stays a separate proof. |
+| `finding_1787662081_406911` (medium) | Report provenance uses path-neutral worktree wording. Hub SHA, locked Core SHA, and relative binary names remain. |
 
 ## Tests and downstream proof
 
@@ -137,7 +146,7 @@ Both completed. Then:
 | A1 | `cargo check --workspace --all-targets --locked` | pass |
 | A6 | `BOTSTER_ENV=test cargo test --locked --lib local_webrtc::tests::runtime_spawn_detach_on_drop_runs_to_completion -- --exact` | running 1 test, 1 passed |
 | A9 | `BOTSTER_ENV=test cargo test --locked --lib local_webrtc::tests::peer_closed_removes_webrtc_admission_and_host_compatibility -- --exact` | running 1 test, 1 passed |
-| A4 | `BOTSTER_ENV=test cargo test --locked --lib local_webrtc::tests::post_handshake_data_channel_opens_and_delivers_bytes -- --exact` | running 1 test, 1 passed (0.22s) |
+| A4 | `BOTSTER_ENV=test cargo test --locked --lib local_webrtc::tests::post_handshake_data_channel_opens_and_delivers_bytes -- --exact` | running 1 test, 1 passed. Review-return consume-first body: 1 passed (0.48s) |
 | A3 close hang | lib exact `local_webrtc_close_hang_fail_closed_returns_handler_within_deadline` | running 1 test, 1 passed |
 | A3 ultimate close | lib exact `ultimate_close_failure_sacrifices_every_peer_and_sweeps_all_owners` | running 1 test, 1 passed |
 | A3 sibling preserve | lib exact `local_webrtc_single_peer_failed_cleanup_preserves_sibling_peer_and_runtime` | running 1 test, 1 passed |
@@ -145,7 +154,7 @@ Both completed. Then:
 | A7 | `./test.sh --locked --test hub_daemon_lifecycle_test webrtc_terminal_adapter_second_data_channel_does_not_receive_terminal_frames -- --exact` | running 1 test, 1 passed |
 | A4-live | `./test.sh --locked --test hub_daemon_lifecycle_test webrtc_peer_post_handshake_data_channel_reaches_production_reject -- --exact` | running 1 test, 1 passed |
 | A3 reject prefix | `./test.sh --locked --test hub_daemon_lifecycle_test webrtc_peer_rejects_a_second_data_channel` | running 2 tests, 2 passed |
-| A5 | A4 body on `/tmp/hub-a5-020` at `d9ff12c` / `webrtc 0.20.0-rc.1` | **red**: `left: "botster-client" right: "botster-late"` |
+| A5 | consume-first A4 body on detached `d9ff12c` / `webrtc 0.20.0-rc.1` | **red** at late-channel oracle: `remote late channel by label` after setup `botster-client` was consumed |
 | A2 | `./test.sh --locked` after prebuild | exit 0; every crate 0 failed. `hub_daemon_lifecycle_test`: 318 passed, 2 ignored |
 
 U4: `smoke_local_webrtc_round_trip` is called from `src/main.rs` smoke CLI on a plain thread, not from inside an existing tokio runtime. Nested-runtime hazard is preserved, not new.
