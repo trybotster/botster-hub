@@ -1081,7 +1081,9 @@ impl WebRtcConnectionMux {
                 .collect::<Vec<_>>()
         };
         for (session_id, subscription_id, generation) in expired {
-            if self.retire_reserved(&session_id, &subscription_id, generation) {
+            if self.retire_reserved(&session_id, &subscription_id, generation)
+                && self.close_events_admitted()
+            {
                 self.queue_host_event(DaemonEvent::SubscriptionChannelOpenTimeout {
                     session_id,
                     subscription_id,
