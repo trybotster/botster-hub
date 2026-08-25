@@ -5,6 +5,32 @@ Run: `run_1787654940_337274`
 Pipeline: Botster Stack Delivery (`botster_stack_delivery`)
 Plan base commit: `f66d459` (clean tracked worktree)
 
+## Plan Review response (review_1787658403_670109, changes_required) — rev4
+
+One finding, medium severity, and it was correct. The reviewer did not just read the plan — they ran
+the broad `peer_close` command against `hub_daemon_lifecycle_test` on a refreshed base and reported
+what it actually selected. That is the right way to test an acceptance claim.
+
+| Finding | Severity | Resolution |
+|---------|----------|------------|
+| The new and Hello-sweep proofs still lack exact selectors | medium | Accepted in full. Rev3 deferred the A4, A4-live, and Hello-sweep test names to Implement, which left three of the plan's own claims without a checkable command. Stable names are now chosen in the plan, every command is complete with `-- --exact`, and each states its expected `running N tests` / `N passed` count. The broad `peer_close` command is removed as sweep proof. |
+
+Two things the finding surfaced that go beyond renaming:
+
+1. **The broad filter was not merely imprecise, it was empty of the claimed proof.** `peer_close`
+   selects `peer_close_leaves_sibling_peers_working`,
+   `webrtc_terminal_adapter_late_attach_after_peer_close_does_not_recreate_route`, and
+   `local_webrtc_peer_close_detaches_terminal_subscriptions`. None asserts removal from
+   `pending_runtime.webrtc_admissions` or `pending_runtime.host_compatibility`. Rev3 would have let
+   a reviewer accept three passing tests as proof of an invariant none of them checks.
+2. **The sweep cannot be proven from the lifecycle suite at all.** `pending_runtime` is internal
+   state with no live oracle, so no integration test can assert it. A9 now places the proof in a
+   library unit test using the existing `PeerHarness`, which owns `harness.state` and calls the real
+   `handle_control_message`. Naming the right home was the substantive part of this fix; renaming
+   was the easy part.
+
+Unknown U5 is resolved at plan time rather than deferred, since Plan Review's run answered it.
+
 ## Plan Review response (review_1787657378_172980, changes_required) — rev3
 
 Second review. All three findings carried concrete `details` and `suggested_fix`, and all three were
@@ -232,10 +258,10 @@ wire behavior is unchanged.
 |------|--------|
 | `Cargo.toml` | `webrtc = "0.21.0-beta.2"` |
 | `Cargo.lock` | `webrtc`, `rtc`, and every `rtc-*` member to `0.21.0-beta.2`, plus the new `rtc-crypto` and transitive entries |
-| `src/local_webrtc.rs` | `timeout` call sites gain the runtime argument; the `RTCPeerConnectionState` match at line 1109 gains a fail-safe arm; the new regression test is added to the existing in-file two-peer harness |
+| `src/local_webrtc.rs` | `timeout` call sites gain the runtime argument; the `RTCPeerConnectionState` match at line 1109 gains a fail-safe arm; two library tests are added to the existing in-file harnesses — `post_handshake_data_channel_opens_and_delivers_bytes` (A4) and `peer_closed_removes_webrtc_admission_and_host_compatibility` (A9, using `PeerHarness`) |
 | `src/local_webrtc_smoke.rs` | import list; one `block_on`, one `sleep`, and the `timeout` call sites |
 | `tests/hub_daemon_lifecycle/webrtc_fixtures.rs` | import list; two `block_on` sites and the `timeout` call sites |
-| `tests/hub_daemon_lifecycle/subscription_ownership_baseline.rs` | the new live Hub post-handshake arrival test (A4-live), reusing `start_webrtc_adapter_hub_with_env` and the existing observation oracle |
+| `tests/hub_daemon_lifecycle/subscription_ownership_baseline.rs` | the new live Hub post-handshake arrival test `webrtc_peer_post_handshake_data_channel_reaches_production_reject` (A4-live), reusing `start_webrtc_adapter_hub_with_env` and the existing observation oracle |
 | `tests/hub_daemon_lifecycle/webrtc_terminal_adapter.rs` | require the post-handshake open before the zero-terminal-frame assertion (A7) |
 | `docs/reports/upgrade-webrtc-for-post-handshake-datachannel-creation-implement.md` | migration evidence, exact versions, and separate Hub / locked-Core provenance |
 
@@ -383,6 +409,11 @@ Unknowns for Implement to resolve, each with a named resolution:
   runtime, which would panic. Resolution: `0.20` had the identical nested-runtime hazard, so this is
   a preserved property, not a new one; Implement confirms the call site is reached from a plain
   thread.
+- U5. RESOLVED at plan time, not deferred to Implement. Whether any existing test asserts that both
+  `pending_runtime.webrtc_admissions` and `pending_runtime.host_compatibility` rows are removed on
+  `PeerClosed`: Plan Review ran the broad `peer_close` filter on a refreshed base and it selected
+  three tests, none of which asserts either removal. No existing test covers the sweep, so
+  acceptance check A9 names the new library test that must be added and gives its exact command.
 
 ## Risks
 
@@ -439,31 +470,36 @@ realpaths for both binaries.
 - A1. `cargo check --workspace --all-targets` passes with no warnings introduced by this change.
 - A2. `./test.sh --locked` passes, after the two prebuild commands above.
 - A3. **Focused WebRTC lifecycle proofs, by exact selector.** Every command below must be recorded
-  in the implement report with its `running N tests` line, and **N must be nonzero**. A filter that
-  selects zero tests passes vacuously and is not evidence.
+  in the implement report with its `running N tests` and `N passed` lines, and **N must match the
+  stated expectation**. A filter that selects zero tests passes vacuously and is not evidence.
 
   ```bash
-  # Close bound and fail-closed handler deadline
+  # Close bound and fail-closed handler deadline — expect: running 1 test, 1 passed
   BOTSTER_ENV=test cargo test --locked --lib \
-    local_webrtc::tests::local_webrtc_close_hang_fail_closed_returns_handler_within_deadline
-  # Ultimate-close sibling sacrifice and full owner sweep
+    local_webrtc::tests::local_webrtc_close_hang_fail_closed_returns_handler_within_deadline \
+    -- --exact
+  # Ultimate-close sibling sacrifice and full owner sweep — expect: running 1 test, 1 passed
   BOTSTER_ENV=test cargo test --locked --lib \
-    local_webrtc::tests::ultimate_close_failure_sacrifices_every_peer_and_sweeps_all_owners
-  # Single-peer failure preserves siblings and the runtime
+    local_webrtc::tests::ultimate_close_failure_sacrifices_every_peer_and_sweeps_all_owners \
+    -- --exact
+  # Single-peer failure preserves siblings and the runtime — expect: running 1 test, 1 passed
   BOTSTER_ENV=test cargo test --locked --lib \
-    local_webrtc::tests::local_webrtc_single_peer_failed_cleanup_preserves_sibling_peer_and_runtime
-  # Pre-handshake rejection proof and its one-shot-claim negative control
-  ./test.sh --locked --test hub_daemon_lifecycle_test webrtc_peer_rejects_a_second_data_channel
-  # Live sibling survival across peer close
-  ./test.sh --locked --test hub_daemon_lifecycle_test peer_close_leaves_sibling_peers_working
-  # Post-handshake isolation, with the open now required (A7)
+    local_webrtc::tests::local_webrtc_single_peer_failed_cleanup_preserves_sibling_peer_and_runtime \
+    -- --exact
+  # Live sibling survival across peer close — expect: running 1 test, 1 passed
   ./test.sh --locked --test hub_daemon_lifecycle_test \
-    webrtc_terminal_adapter_second_data_channel_does_not_receive_terminal_frames
+    peer_close_leaves_sibling_peers_working -- --exact
+  # Post-handshake isolation, with the open now required (A7) — expect: running 1 test, 1 passed
+  ./test.sh --locked --test hub_daemon_lifecycle_test \
+    webrtc_terminal_adapter_second_data_channel_does_not_receive_terminal_frames -- --exact
+  # Pre-handshake rejection proof AND its negative control — expect: running 2 tests, 2 passed
+  ./test.sh --locked --test hub_daemon_lifecycle_test webrtc_peer_rejects_a_second_data_channel
   ```
 
-  The `webrtc_peer_rejects_a_second_data_channel` selector is a prefix match and must report **two**
-  tests: the proof and its `..._requires_one_shot_claim` negative control. If it reports one, the
-  negative control did not run and the evidence is incomplete.
+  The last command is deliberately **not** `--exact`: it is a prefix match that must select both
+  `webrtc_peer_rejects_a_second_data_channel` and its `..._requires_one_shot_claim` negative
+  control. A count of one means the negative control did not run and the evidence is incomplete.
+
 - A4. **Two-peer library regression test.** Both peers reach `RTCPeerConnectionState::Connected`.
   Only then does one peer call `create_data_channel` with `ordered: true`, `max_retransmits: None`,
   and `max_packet_life_time: None`. The test asserts, in order:
@@ -510,21 +546,47 @@ realpaths for both binaries.
 - A8. **Preserved lifecycle proof.** Pre-handshake channel creation, signaling, ICE, AES-GCM
   encryption, chunking, close bounds, reconnect, and peer lifecycle tests all pass with no test
   weakened, no assertion deleted, and no production bound widened.
-- A9. **Preserved teardown proof, including the corrected Hello row.** The selectors in A3 cover
-  ultimate-close sibling sacrifice, single-peer cleanup, and live sibling survival. In addition,
-  prove the Hello admission sweep that the corrected matrix row names: after `PeerClosed`, both
-  `pending_runtime.webrtc_admissions` and `pending_runtime.host_compatibility` no longer hold a row
-  for the closed `grant_id`. Name the exact selector that covers this in the implement report with
-  its nonzero test count; if no existing test asserts both removals, add one, since the plan now
-  claims that sweep as an invariant.
+- A9. **Hello admission sweep proof, by exact selector and stable name.** The corrected matrix row
+  claims that `LocalWebrtcPeerClosed` removes both `pending_runtime.webrtc_admissions` and
+  `pending_runtime.host_compatibility` for the closed `grant_id`. Plan Review ran the broad
+  `peer_close` filter against `hub_daemon_lifecycle_test` on a refreshed base: it selects **three**
+  tests (`peer_close_leaves_sibling_peers_working`,
+  `webrtc_terminal_adapter_late_attach_after_peer_close_does_not_recreate_route`, and
+  `local_webrtc_peer_close_detaches_terminal_subscriptions`) and **none** asserts either removal.
+  That broad command is therefore removed as sweep proof.
+
+  The sweep cannot be proven from the lifecycle suite, because `pending_runtime` is internal state
+  with no live oracle. It belongs in a library unit test, where the existing `PeerHarness` in
+  `src/local_webrtc.rs` tests owns `harness.state` and calls the real `handle_control_message`.
+  Implement adds one test with this stable name:
+
+  `local_webrtc::tests::peer_closed_removes_webrtc_admission_and_host_compatibility`
+
+  It drives `RegisterWebrtcAdmission` for a live grant, asserts both rows are present, then drives
+  `LocalWebrtcPeerClosed` for that grant and asserts both rows are gone.
 
   ```bash
-  ./test.sh --locked --test hub_daemon_lifecycle_test peer_close
+  # expect: running 1 test, 1 passed
+  BOTSTER_ENV=test cargo test --locked --lib \
+    local_webrtc::tests::peer_closed_removes_webrtc_admission_and_host_compatibility -- --exact
   ```
-- A9b. **New-test selectors.** The three tests this ticket adds or hardens must each be run by exact
-  selector with a nonzero count recorded: the A4 two-peer library test (`--lib`, under
-  `local_webrtc::tests::`), the A4-live test (`--test hub_daemon_lifecycle_test`), and the A7
-  hardening (`--test hub_daemon_lifecycle_test`). Implement records the final chosen test names.
+
+- A9b. **Stable names and exact selectors for the two new tests.** Implement uses these names; they
+  are chosen here, not deferred, so Review can check the selector against the diff.
+
+  ```bash
+  # A4 two-peer library regression test — expect: running 1 test, 1 passed
+  BOTSTER_ENV=test cargo test --locked --lib \
+    local_webrtc::tests::post_handshake_data_channel_opens_and_delivers_bytes -- --exact
+  # A4-live production arrival proof (new, in subscription_ownership_baseline.rs)
+  # expect: running 1 test, 1 passed
+  ./test.sh --locked --test hub_daemon_lifecycle_test \
+    webrtc_peer_post_handshake_data_channel_reaches_production_reject -- --exact
+  ```
+
+  If Implement must rename either test, it records the final name and the exact command it ran, and
+  says why the planned name did not fit. Renaming is allowed; omitting the exact command is not.
+
 - A10. **Exact version evidence.** The implement report records the resolved `webrtc`, `rtc`, and
   `rtc-*` versions from `Cargo.lock`, the base commit, the separate Hub and locked-Core provenance,
   and the `Cargo.lock` diff summary.
