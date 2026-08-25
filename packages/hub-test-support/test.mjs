@@ -132,10 +132,10 @@ function assertDialogFormComposition(source) {
 }
 
 assert.equal(metadata.package_name, "@trybotster/hub-test-support");
-assert.equal(metadata.package_version, "0.1.42");
+assert.equal(metadata.package_version, "0.1.43");
 assert.equal(metadata.protocol, "botster-hub-daemon-v1");
 assert.equal(metadata.protocol_version, 7);
-assert.equal(metadata.conformance_fixture_revision, 46);
+assert.equal(metadata.conformance_fixture_revision, 47);
 
 // Package README ships in the npm tarball; keep install pin sites tied to package.json.
 {

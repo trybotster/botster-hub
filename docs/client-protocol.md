@@ -124,7 +124,7 @@ The current descriptor includes:
 - supported features: sessions, session and plugin entity subscriptions, terminal streaming, resize, terminal readback,
   plugin surface render, plugin surface action dispatch, package navigation
   discovery, and hub-owned spawn targets;
-- conformance fixture revision 46.
+- conformance fixture revision 47.
 
 `DaemonPackage.notice_reactions` is an additive optional field. Empty vectors
 are omitted on the wire. Each projected descriptor always carries a required
