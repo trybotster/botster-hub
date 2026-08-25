@@ -476,6 +476,8 @@ pub(crate) fn daemon_protocol_typescript() -> String {
                 "DaemonLocalWebrtcBootstrap | null",
             ),
             ("local_webrtc_answer?", "DaemonLocalWebrtcAnswer | null"),
+            ("subscription_channel_label?", "string | null"),
+            ("subscription_channel_generation?", "number | null"),
             ("events", "DaemonEvent[]"),
             ("cleanup", "DaemonSessionCleanup | null"),
             ("coordination", "DaemonCoordination | null"),
@@ -1662,6 +1664,14 @@ pub(crate) fn daemon_protocol_typescript() -> String {
                     ("subscription_id", "string"),
                     ("owner", "string"),
                     ("name", "string"),
+                ],
+            ),
+            (
+                "subscription_channel_open_timeout",
+                &[
+                    ("session_id", "string"),
+                    ("subscription_id", "string"),
+                    ("generation", "number"),
                 ],
             ),
         ],

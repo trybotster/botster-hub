@@ -194,6 +194,8 @@ export interface DaemonResponse {
   plugin_action_result?: UiActionResult;
   local_webrtc_bootstrap?: DaemonLocalWebrtcBootstrap | null;
   local_webrtc_answer?: DaemonLocalWebrtcAnswer | null;
+  subscription_channel_label?: string | null;
+  subscription_channel_generation?: number | null;
   events: DaemonEvent[];
   cleanup: DaemonSessionCleanup | null;
   coordination: DaemonCoordination | null;
@@ -1047,4 +1049,5 @@ export type DaemonEvent =
   | { type: "worktree_lifecycle"; event: DaemonWorktreeLifecycleEvent }
   | { type: "terminal_subscription_closed"; session_id: string; subscription_id: string; generation: number; reason: string }
   | { type: "package_event"; subscription_id: string; owner: string; name: string; payload: JsonValue }
-  | { type: "event_gap"; subscription_id: string; owner: string; name: string };
+  | { type: "event_gap"; subscription_id: string; owner: string; name: string }
+  | { type: "subscription_channel_open_timeout"; session_id: string; subscription_id: string; generation: number };

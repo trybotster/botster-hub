@@ -31,7 +31,7 @@ mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 pub const PROTOCOL_VERSION: u16 = 7;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 46;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 47;
 /// Oldest conformance revision accepted by the default first-party client requirement.
 pub const DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 36;
 /// Version of the local WebRTC delivery chunk framing protocol.
@@ -1410,6 +1410,10 @@ pub struct DaemonResponse {
     pub local_webrtc_bootstrap: Option<DaemonLocalWebrtcBootstrap>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_webrtc_answer: Option<DaemonLocalWebrtcAnswer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_channel_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_channel_generation: Option<u64>,
     pub events: Vec<DaemonEvent>,
     pub cleanup: Option<DaemonSessionCleanup>,
     pub coordination: Option<DaemonCoordination>,
@@ -3170,6 +3174,12 @@ pub enum DaemonEvent {
         owner: String,
         name: String,
     },
+    /// A Reserved subscription channel never opened before the open bound expired.
+    SubscriptionChannelOpenTimeout {
+        session_id: String,
+        subscription_id: String,
+        generation: u64,
+    },
 }
 
 impl DaemonEvent {
@@ -4298,7 +4308,7 @@ mod tests {
     #[test]
     fn protocol_seven_rejects_protocol_six_and_accepts_conformance_floor_thirty_five() {
         assert_eq!(PROTOCOL_VERSION, 7);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 46);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 47);
 
         let protocol_six = DaemonCompatibilityRequirement {
             protocol_version: 6,
@@ -4974,7 +4984,7 @@ mod tests {
         assert!(generated.contains("export type DaemonQueueAgeState ="));
         assert!(generated.contains("| (string & {});"));
         assert_eq!(PROTOCOL_VERSION, 7);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 46);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 47);
         assert_eq!(DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION, 36);
     }
 
@@ -6740,6 +6750,8 @@ mod tests {
                 }),
                 diagnostics: vec![DaemonDiagnostic::connected("local_webrtc_signal")],
             }),
+            subscription_channel_label: None,
+            subscription_channel_generation: None,
             events: daemon_event_examples(),
             cleanup: Some(DaemonSessionCleanup {
                 session_id: "session".to_string(),
@@ -6867,6 +6879,9 @@ mod tests {
             DaemonEvent::TerminalSubscriptionClosed { .. } => "terminal_subscription_closed",
             DaemonEvent::PackageEvent { .. } => "package_event",
             DaemonEvent::EventGap { .. } => "event_gap",
+            DaemonEvent::SubscriptionChannelOpenTimeout { .. } => {
+                "subscription_channel_open_timeout"
+            }
         }
     }
 
@@ -7026,7 +7041,7 @@ mod tests {
     #[test]
     fn protocol_six_and_conformance_thirty_two_define_the_cold_cut_boundary() {
         assert_eq!(PROTOCOL_VERSION, 7);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 46);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 47);
 
         let requirement = DaemonCompatibilityRequirement::current();
         let protocol_error = ensure_compatible(
@@ -7091,7 +7106,7 @@ mod tests {
         // conformance revision: bumping the protocol would break every existing
         // first-party client that never issues this request.
         assert_eq!(PROTOCOL_VERSION, 7);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 46);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 47);
         assert_eq!(DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION, 36);
         assert_eq!(
             current_feature_list(),
