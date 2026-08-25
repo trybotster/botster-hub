@@ -511,10 +511,8 @@ pub fn parse_publish_mutation(value: Value) -> Result<PackageEntityMutation, Str
         }
         EntityFrame::Remove {
             entity_type: _, id, ..
-        } => {
-            if id.0.is_empty() {
-                return Err("entity_publish remove requires non-empty id".to_string());
-            }
+        } if id.0.is_empty() => {
+            return Err("entity_publish remove requires non-empty id".to_string());
         }
         _ => {}
     }
@@ -761,6 +759,32 @@ mod tests {
                 "entity": { "id": "run-1", "status": "ok" }
             }))
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn remove_validation_requires_non_empty_id() {
+        assert_eq!(
+            parse_publish_mutation(json!({
+                "type": "entity_remove",
+                "entity_type": "project-pipelines.run",
+                "snapshot_seq": 1,
+                "id": ""
+            })),
+            Err("entity_publish remove requires non-empty id".to_string())
+        );
+        assert_eq!(
+            parse_publish_mutation(json!({
+                "type": "entity_remove",
+                "entity_type": "project-pipelines.run",
+                "snapshot_seq": 1,
+                "id": "run-1"
+            })),
+            Ok(PackageEntityMutation::Remove {
+                entity_type: "project-pipelines.run".into(),
+                snapshot_seq: 1,
+                id: "run-1".into(),
+            })
         );
     }
 
