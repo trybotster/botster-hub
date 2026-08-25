@@ -4290,7 +4290,11 @@ fn managed_session_core_error_class(error: &CoreDaemonError) -> &'static str {
                 "bind_terminal_adapter.stale_generation"
             }
             BindTerminalAdapterError::AlreadyBound { .. } => "bind_terminal_adapter.already_bound",
+            BindTerminalAdapterError::ControlPlaneFailed { .. } => {
+                "bind_terminal_adapter.control_plane_failed"
+            }
         },
+        CoreDaemonError::ControlPlaneFailed(_) => "control_plane_failed",
     }
 }
 
@@ -5474,11 +5478,15 @@ mod tests {
             ),
             (
                 BindTerminalAdapterError::AlreadyBound {
-                    session_id,
+                    session_id: session_id.clone(),
                     subscription_id,
                     generation: TerminalSubscriptionGeneration(1),
                 },
                 "bind_terminal_adapter.already_bound",
+            ),
+            (
+                BindTerminalAdapterError::ControlPlaneFailed { session_id },
+                "bind_terminal_adapter.control_plane_failed",
             ),
         ];
         for (error, class) in mapped {
