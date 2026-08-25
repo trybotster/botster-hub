@@ -41,9 +41,31 @@ use webrtc::peer_connection::{
     RTCPeerConnectionState, RTCSessionDescription,
 };
 use webrtc::runtime::{
-    Receiver as AsyncReceiver, Sender as AsyncSender, block_on, channel, default_runtime, sleep,
-    timeout,
+    Receiver as AsyncReceiver, Runtime, Sender as AsyncSender, channel, default_runtime,
 };
+
+fn webrtc_runtime() -> std::sync::Arc<dyn Runtime> {
+    default_runtime().expect("webrtc default runtime")
+}
+
+fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime for hub daemon lifecycle tests")
+        .block_on(fut)
+}
+
+async fn timeout<T>(
+    duration: Duration,
+    future: impl std::future::Future<Output = T>,
+) -> Result<T, webrtc::runtime::Elapsed> {
+    webrtc::runtime::timeout(webrtc_runtime().as_ref(), duration, future).await
+}
+
+async fn sleep(duration: Duration) {
+    webrtc_runtime().sleep(duration).await
+}
 
 mod hub_daemon_lifecycle;
 mod support;

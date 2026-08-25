@@ -5473,6 +5473,16 @@ impl PendingRuntimeState {
             Some(WebrtcTerminalAdmission::Admitted { .. })
         )
     }
+
+    #[cfg(test)]
+    pub(crate) fn has_webrtc_admission_row(&self, grant_id: &str) -> bool {
+        self.webrtc_admissions.contains_key(grant_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_host_compatibility_row(&self, grant_id: &str) -> bool {
+        self.host_compatibility.contains_key(grant_id)
+    }
 }
 
 fn run_one_pump_phase(daemon: &mut HubDaemon, state: &mut DaemonControlState) {

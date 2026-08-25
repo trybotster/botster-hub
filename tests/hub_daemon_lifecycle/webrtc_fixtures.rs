@@ -40,9 +40,20 @@ use webrtc::peer_connection::{
     RTCPeerConnectionState, RTCSessionDescription,
 };
 use webrtc::runtime::{
-    Receiver as AsyncReceiver, Runtime, Sender as AsyncSender, block_on, channel, default_runtime,
-    sleep, timeout,
+    Receiver as AsyncReceiver, Runtime, Sender as AsyncSender, channel, default_runtime, timeout,
 };
+
+fn webrtc_runtime() -> Arc<dyn Runtime> {
+    default_runtime().expect("webrtc default runtime")
+}
+
+fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime for WebRTC fixture block_on")
+        .block_on(fut)
+}
 
 use crate::support::{
     ensure_session_worker_binary, recovering_mutex_guard, validate_cli_daemon_shutdown,
@@ -289,7 +300,7 @@ impl WebrtcInboundMailbox {
     }
 
     async fn recv_raw(&mut self, bound: Duration) -> Option<String> {
-        match timeout(bound, self.rx.recv()).await {
+        match timeout(webrtc_runtime().as_ref(), bound, self.rx.recv()).await {
             Ok(Some(text)) => {
                 self.occupancy.record_pop(text.len() as u64);
                 Some(text)
@@ -310,7 +321,13 @@ impl WebrtcInboundMailbox {
         Box<dyn std::error::Error>,
     > {
         loop {
-            let response = match timeout(Duration::from_secs(10), self.rx.recv()).await {
+            let response = match timeout(
+                webrtc_runtime().as_ref(),
+                Duration::from_secs(10),
+                self.rx.recv(),
+            )
+            .await
+            {
                 Ok(Some(response)) => {
                     self.occupancy.record_pop(response.len() as u64);
                     response
@@ -511,7 +528,13 @@ impl ExtraWebrtcDataChannel {
         let deadline = Instant::now() + bound;
         let mut extra_terminal_frames = 0;
         while Instant::now() < deadline {
-            let message = match timeout(Duration::from_millis(50), self.messages.recv()).await {
+            let message = match timeout(
+                webrtc_runtime().as_ref(),
+                Duration::from_millis(50),
+                self.messages.recv(),
+            )
+            .await
+            {
                 Ok(Some(message)) => Some(message),
                 _ => self.inbound.recv_raw(Duration::from_millis(50)).await,
             };
@@ -670,7 +693,12 @@ impl LocalWebrtcOfferPeer {
 
         let offer = peer.create_offer(None).await?;
         peer.set_local_description(offer).await?;
-        let _ = timeout(Duration::from_secs(5), gather_complete_rx.recv()).await;
+        let _ = timeout(
+            runtime.as_ref(),
+            Duration::from_secs(5),
+            gather_complete_rx.recv(),
+        )
+        .await;
         let offer = peer
             .local_description()
             .await
@@ -718,19 +746,31 @@ impl LocalWebrtcOfferPeer {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let answer = serde_json::from_value::<RTCSessionDescription>(answer)?;
         self.peer.set_remote_description(answer).await?;
-        timeout(Duration::from_secs(15), self.connected_rx.recv())
-            .await
-            .map_err(|_| std::io::Error::other("timed out waiting for WebRTC connection"))?;
+        timeout(
+            webrtc_runtime().as_ref(),
+            Duration::from_secs(15),
+            self.connected_rx.recv(),
+        )
+        .await
+        .map_err(|_| std::io::Error::other("timed out waiting for WebRTC connection"))?;
         if let Some(extra_open_rx) = extra_open_rx {
             let deadline = Instant::now() + Duration::from_secs(10);
             let mut opened = false;
             while Instant::now() < deadline && !opened {
-                opened = timeout(Duration::from_millis(50), self.data_channel_open_rx.recv())
+                opened = timeout(
+                    webrtc_runtime().as_ref(),
+                    Duration::from_millis(50),
+                    self.data_channel_open_rx.recv(),
+                )
+                .await
+                .is_ok()
+                    || timeout(
+                        webrtc_runtime().as_ref(),
+                        Duration::from_millis(50),
+                        extra_open_rx.recv(),
+                    )
                     .await
-                    .is_ok()
-                    || timeout(Duration::from_millis(50), extra_open_rx.recv())
-                        .await
-                        .is_ok();
+                    .is_ok();
             }
             if !opened {
                 return Err(std::io::Error::other(
@@ -739,9 +779,13 @@ impl LocalWebrtcOfferPeer {
                 .into());
             }
         } else {
-            timeout(Duration::from_secs(10), self.data_channel_open_rx.recv())
-                .await
-                .map_err(|_| std::io::Error::other("timed out waiting for data channel open"))?;
+            timeout(
+                webrtc_runtime().as_ref(),
+                Duration::from_secs(10),
+                self.data_channel_open_rx.recv(),
+            )
+            .await
+            .map_err(|_| std::io::Error::other("timed out waiting for data channel open"))?;
         }
         Ok(())
     }
@@ -771,7 +815,13 @@ impl LocalWebrtcOfferPeer {
         key: &AesGcmKey,
         hello: &botster_hub_client::DaemonHello,
     ) -> Result<ExtraWebrtcDataChannel, Box<dyn std::error::Error>> {
-        match timeout(Duration::from_secs(3), self.encrypted_hello(key, hello)).await {
+        match timeout(
+            webrtc_runtime().as_ref(),
+            Duration::from_secs(3),
+            self.encrypted_hello(key, hello),
+        )
+        .await
+        {
             Ok(Ok(_)) => Ok(extra),
             Ok(Err(_)) | Err(_) => {
                 let rejected = self.swap_offerer_channel(extra);
@@ -1055,7 +1105,14 @@ impl LocalWebrtcOfferPeer {
             closed: closed_rx,
             open_rx,
         };
-        let _ = timeout(Duration::from_secs(5), extra_channel.open_rx.recv()).await;
+        timeout(
+            webrtc_runtime().as_ref(),
+            Duration::from_secs(5),
+            extra_channel.open_rx.recv(),
+        )
+        .await
+        .map_err(|_| std::io::Error::other("timed out waiting for extra DataChannel open"))?
+        .ok_or_else(|| std::io::Error::other("extra DataChannel closed before open"))?;
         Ok(extra_channel)
     }
 }
@@ -1979,7 +2036,12 @@ fn inbound_chunk_reassembly_survives_cancelled_read() {
     admit_inbound_frame(&inbound.occupancy, &tx, first_chunk).expect("admit first chunk");
 
     let cancelled = block_on(async {
-        timeout(Duration::from_millis(50), inbound.receive_delivery(&key)).await
+        timeout(
+            webrtc_runtime().as_ref(),
+            Duration::from_millis(50),
+            inbound.receive_delivery(&key),
+        )
+        .await
     });
     assert!(
         cancelled.is_err(),
