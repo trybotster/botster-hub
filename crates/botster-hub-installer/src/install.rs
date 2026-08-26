@@ -25,7 +25,9 @@ use botster_hub_installation::layout::{
     BIN_DIRECTORY, BIN_HUB_SYMLINK_TARGET, CURRENT_POINTER, GENERATIONS_DIRECTORY, HUB_BINARY_NAME,
     STAGING_PREFIX, WORKER_BINARY_NAME, generation_name,
 };
-use botster_hub_installation::safety::{DirectoryHandle, effective_uid, random_suffix};
+use botster_hub_installation::safety::{
+    DirectoryHandle, effective_uid, file_mode_bits, random_suffix,
+};
 use botster_hub_installation::{
     InstallationReceipt, InstallationsDirectory, KNOWN_ARTIFACT_NAMES, LeaseMode, LeaseOutcome,
     MAX_RELEASE_BYTES, MINIMUM_RELEASE_SCHEMA_VERSION, ManifestArtifact, PRODUCT_ID,
@@ -501,7 +503,7 @@ fn verify_generation_contents(
                 )
             })?;
         let facts = file.facts("artifact")?;
-        if facts.uid != effective_uid() || facts.mode != u32::from(ARTIFACT_MODE) {
+        if facts.uid != effective_uid() || facts.mode != file_mode_bits(ARTIFACT_MODE) {
             return Err(InstallerError::new(
                 "artifact_unsafe_ownership",
                 format!(

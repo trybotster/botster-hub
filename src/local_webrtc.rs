@@ -1450,8 +1450,44 @@ async fn close_subscription_channel<D>(
 ) where
     D: LocalWebrtcDataChannel + ?Sized,
 {
+    handle.set_buffered_bytes(0);
     handle.close();
     let _ = tokio::time::timeout(LOCAL_WEBRTC_PEER_CLOSE_BOUND, data_channel.local_close()).await;
+}
+
+async fn refresh_subscription_outstanding<D>(
+    data_channel: &D,
+    handle: &crate::webrtc_terminal_adapter::WebRtcTerminalAdapterHandle,
+) where
+    D: LocalWebrtcDataChannel + ?Sized,
+{
+    if let Ok(outstanding) = data_channel.local_outstanding_bytes().await {
+        handle.set_buffered_bytes(outstanding);
+    }
+}
+
+async fn apply_subscription_channel_event<D>(
+    event: DataChannelEvent,
+    stream_key: &AesGcmKey,
+    pending_requests: &mut VecDeque<PendingLocalWebrtcRequest>,
+    flow_control: &mut LocalWebrtcFlowControl,
+    mux: &WebRtcConnectionMux,
+    data_channel: &D,
+    handle: &crate::webrtc_terminal_adapter::WebRtcTerminalAdapterHandle,
+) -> Result<(), LocalWebrtcTerminalCause>
+where
+    D: LocalWebrtcDataChannel + ?Sized,
+{
+    apply_data_channel_event(
+        event,
+        stream_key,
+        pending_requests,
+        flow_control,
+        mux,
+        Some(handle),
+    )?;
+    refresh_subscription_outstanding(data_channel, handle).await;
+    Ok(())
 }
 
 async fn run_subscription_channel<D>(
@@ -1498,6 +1534,20 @@ where
                         if let Some(bytes) = decrypt_subscription_ingress(stream_key, message.data.as_ref()) {
                             handle.push_ingress_frame(bytes);
                         }
+                    }
+                    Ok(Some(event @ (DataChannelEvent::OnBufferedAmountHigh
+                    | DataChannelEvent::OnBufferedAmountLow))) => {
+                        apply_subscription_channel_event(
+                            event,
+                            stream_key,
+                            &mut pending_requests,
+                            &mut flow_control,
+                            &peer_state.mux,
+                            data_channel,
+                            &handle,
+                        )
+                        .await
+                        .ok();
                     }
                     Ok(Some(DataChannelEvent::OnClose | DataChannelEvent::OnClosing))
                     | Ok(None) => {
@@ -2074,15 +2124,20 @@ where
         peer_state.record_response_progress(chunk_index, flow_control.pressured);
         while flow_control.pressured {
             match poll_data_channel_or_peer_terminal(data_channel, &mut peer_terminal_rx).await {
-                Ok(Some(event)) => apply_data_channel_event(
-                    event,
-                    stream_key,
-                    pending_requests,
-                    flow_control,
-                    &peer_state.mux,
-                    subscription_handle,
-                )
-                .map_err(|cause| failure(chunk_index, cause, flow_control))?,
+                Ok(Some(event)) => {
+                    apply_data_channel_event(
+                        event,
+                        stream_key,
+                        pending_requests,
+                        flow_control,
+                        &peer_state.mux,
+                        subscription_handle,
+                    )
+                    .map_err(|cause| failure(chunk_index, cause, flow_control))?;
+                    if let Some(handle) = subscription_handle {
+                        refresh_subscription_outstanding(data_channel, handle).await;
+                    }
+                }
                 Ok(None) => {
                     return Err(failure(
                         chunk_index,
@@ -2110,10 +2165,8 @@ where
         {
             return Err(failure(chunk_index, cause, flow_control));
         }
-        if let Some(handle) = subscription_handle
-            && let Ok(outstanding) = data_channel.local_outstanding_bytes().await
-        {
-            handle.set_buffered_bytes(outstanding);
+        if let Some(handle) = subscription_handle {
+            refresh_subscription_outstanding(data_channel, handle).await;
         }
         peer_state.record_response_progress(chunk_index + 1, flow_control.pressured);
 
@@ -2134,6 +2187,9 @@ where
                     subscription_handle,
                 )
                 .map_err(|cause| failure(chunk_index + 1, cause, flow_control))?;
+                if let Some(handle) = subscription_handle {
+                    refresh_subscription_outstanding(data_channel, handle).await;
+                }
             }
             Ok(None) => {
                 return Err(failure(
@@ -2808,6 +2864,7 @@ impl Error for LocalWebrtcError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use botster_core::contract::terminal_adapter::TerminalAdapter;
     use webrtc::data_channel::RTCDataChannelMessage;
 
     static EXTRA_CHANNEL_ORACLE_ENV: Mutex<()> = Mutex::new(());
@@ -2920,6 +2977,36 @@ mod tests {
         fn release_hung_send(&self) {
             self.send_hangs.store(false, Ordering::Release);
             self.send_notify.notify_waiters();
+        }
+
+        fn set_outstanding(&self, bytes: u32) {
+            self.outstanding.store(bytes, Ordering::SeqCst);
+        }
+    }
+
+    fn encrypted_subscription_event(key: &AesGcmKey, plaintext: &[u8]) -> DataChannelEvent {
+        let envelope = encrypt_aes_gcm(key, plaintext, 1).unwrap();
+        let data = serde_json::to_vec(&envelope).unwrap();
+        DataChannelEvent::OnMessage(RTCDataChannelMessage {
+            is_string: false,
+            data: data.as_slice().into(),
+        })
+    }
+
+    fn peer_closed_record(grant_id: &str) -> LocalWebrtcSenderTerminalRecord {
+        LocalWebrtcSenderTerminalRecord {
+            schema_version: 1,
+            grant_id: grant_id.to_string(),
+            request_operation: "reservation_sweep".to_string(),
+            message_id: None,
+            next_chunk_index: 0,
+            last_sent_chunk_index: None,
+            total_chunks: 0,
+            pressured: false,
+            peer_connection_state: "closed".to_string(),
+            channel_terminal_signal: LocalWebrtcChannelTerminalSignal::None,
+            cause: LocalWebrtcTerminalCause::PeerClosed,
+            cleanup_disposition: LocalWebrtcCleanupDisposition::NewlySent,
         }
     }
 
@@ -4336,22 +4423,24 @@ mod tests {
             "send failure must still run bounded local_close"
         );
         assert!(handle.is_closed());
+        assert_eq!(
+            handle.buffered_bytes(),
+            0,
+            "close must reset live outstanding bytes"
+        );
     }
 
     #[test]
     fn subscription_flush_keeps_terminal_input_off_the_control_parser() {
         let data_channel = FakeDataChannel::default();
-        data_channel.push_event(DataChannelEvent::OnMessage(RTCDataChannelMessage {
-            is_string: false,
-            data: b"core-terminal-input".as_slice().into(),
-        }));
         let key = AesGcmKey::from_slice(&[16; 32]).unwrap();
+        let plaintext = b"core-terminal-input";
         let peer_state = test_peer_state("grant-sub-ingress");
         let label = peer_state
             .mux
             .reserve_terminal("grant-sub-ingress".into(), "s".into(), "sub".into(), 1)
             .expect("reserve");
-        let (_adapter, handle) = peer_state.mux.create_adapter();
+        let (mut adapter, handle) = peer_state.mux.create_adapter();
         assert!(peer_state.mux.bind_reserved(&label, handle.clone()));
         handle.write_opaque_frame(
             &botster_terminal_protocol::TerminalFrame::from_bytes(
@@ -4361,6 +4450,24 @@ mod tests {
         );
         let mut pending = VecDeque::new();
         let mut flow_control = LocalWebrtcFlowControl::default();
+        apply_data_channel_event(
+            encrypted_subscription_event(&key, plaintext),
+            &key,
+            &mut pending,
+            &mut flow_control,
+            &peer_state.mux,
+            Some(&handle),
+        )
+        .expect("encrypted subscription input stays on the subscription path");
+        assert!(
+            pending.is_empty(),
+            "subscription OnMessage must not enter the control request parser"
+        );
+        assert_eq!(
+            adapter.try_read(),
+            botster_core::contract::terminal_adapter::TerminalIngress::Frame(plaintext.to_vec()),
+            "encrypted subscription input must become TerminalIngress::Frame"
+        );
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -4376,10 +4483,96 @@ mod tests {
                 &mut flow_control,
             ))
             .expect("terminal input during output must not close the subscription");
-        assert!(
-            pending.is_empty(),
-            "subscription OnMessage must not enter the control request parser"
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn subscription_ingress_reports_lost_after_sixty_four_frames() {
+        let key = AesGcmKey::from_slice(&[17; 32]).unwrap();
+        let peer_state = test_peer_state("grant-sub-ingress-cap");
+        let (mut adapter, handle) = peer_state.mux.create_adapter();
+        let mut pending = VecDeque::new();
+        let mut flow_control = LocalWebrtcFlowControl::default();
+        let capacity = botster_core::contract::terminal_adapter::MIN_ADAPTER_INGRESS_BUFFER_FRAMES;
+        for index in 0..=capacity {
+            apply_data_channel_event(
+                encrypted_subscription_event(&key, format!("frame-{index}").as_bytes()),
+                &key,
+                &mut pending,
+                &mut flow_control,
+                &peer_state.mux,
+                Some(&handle),
+            )
+            .expect("encrypted ingress stays on the subscription path");
+        }
+        assert!(pending.is_empty());
+        assert_eq!(
+            adapter.try_read(),
+            botster_core::contract::terminal_adapter::TerminalIngress::Lost
         );
+        assert_eq!(
+            adapter.try_read(),
+            botster_core::contract::terminal_adapter::TerminalIngress::Frame(b"frame-0".to_vec())
+        );
+    }
+
+    #[test]
+    fn live_outstanding_bytes_drain_to_zero_on_low_water() {
+        use crate::local_webrtc::webrtc_subscription_channel::{
+            AGGREGATE_BUFFERED_HIGH, AGGREGATE_BUFFERED_LOW,
+        };
+
+        let data_channel = FakeDataChannel::default();
+        let key = AesGcmKey::from_slice(&[18; 32]).unwrap();
+        let peer_state = test_peer_state("grant-sub-drain");
+        let label = peer_state
+            .mux
+            .reserve_terminal("grant-sub-drain".into(), "s".into(), "sub".into(), 1)
+            .expect("reserve");
+        let (_adapter, handle) = peer_state.mux.create_adapter();
+        assert!(peer_state.mux.bind_reserved(&label, handle.clone()));
+        data_channel.set_outstanding(AGGREGATE_BUFFERED_HIGH);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(refresh_subscription_outstanding(&data_channel, &handle));
+        assert_eq!(peer_state.mux.aggregate_buffered(), AGGREGATE_BUFFERED_HIGH);
+
+        data_channel.set_outstanding(AGGREGATE_BUFFERED_LOW - 1);
+        let mut pending = VecDeque::new();
+        let mut flow_control = LocalWebrtcFlowControl::default();
+        runtime
+            .block_on(apply_subscription_channel_event(
+                DataChannelEvent::OnBufferedAmountLow,
+                &key,
+                &mut pending,
+                &mut flow_control,
+                &peer_state.mux,
+                &data_channel,
+                &handle,
+            ))
+            .expect("low-water must refresh live outstanding bytes");
+        assert!(!flow_control.pressured);
+        assert_eq!(
+            peer_state.mux.aggregate_buffered(),
+            AGGREGATE_BUFFERED_LOW - 1
+        );
+
+        data_channel.set_outstanding(0);
+        runtime
+            .block_on(apply_subscription_channel_event(
+                DataChannelEvent::OnBufferedAmountLow,
+                &key,
+                &mut pending,
+                &mut flow_control,
+                &peer_state.mux,
+                &data_channel,
+                &handle,
+            ))
+            .expect("full drain must return the aggregate to zero");
+        assert_eq!(peer_state.mux.aggregate_buffered(), 0);
+        let _ = label;
     }
 
     #[test]
@@ -8403,6 +8596,233 @@ mod tests {
         );
 
         peer.close_offer();
+        harness.cleanup();
+    }
+
+    #[test]
+    fn reserved_open_deadline_wakes_the_control_loop_and_sweeps() {
+        let mut harness = PeerHarness::new("reserved-timeout-wake");
+        let grant_id = "grant-timeout-wake";
+        harness
+            .state
+            .pending_runtime
+            .test_store_webrtc_reservation(grant_id, "s", "sub", 1);
+        let data_channel = FakeDataChannel::default();
+        let key = AesGcmKey::from_slice(&[22; 32]).unwrap();
+        let (runtime_tx, mut runtime_rx) = tokio_mpsc::channel(64);
+        let peer_state = LocalWebrtcPeerState::new(grant_id.to_string(), runtime_tx.clone());
+        peer_state.mux.admit_close_events();
+        peer_state
+            .mux
+            .reserve_terminal(grant_id.into(), "s".into(), "sub".into(), 1)
+            .expect("reserve");
+        assert_eq!(peer_state.mux.charged_subscription_count(), 1);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (sweep, timeout_event) = runtime.block_on(async {
+            let (entity_frame_tx, entity_frame_rx) =
+                tokio_mpsc::channel(ENTITY_SUBSCRIPTION_QUEUE_CAPACITY);
+            let loop_fut = run_data_channel(
+                &data_channel,
+                &key,
+                &peer_state,
+                &runtime_tx,
+                entity_frame_tx,
+                entity_frame_rx,
+            );
+            tokio::pin!(loop_fut);
+            let (sweep, timeout_event) = tokio::select! {
+                sweep = tokio::time::timeout(
+                    LOCAL_WEBRTC_CHANNEL_OPEN_BOUND + Duration::from_secs(2),
+                    runtime_rx.recv(),
+                ) => {
+                    let sweep = sweep
+                        .expect("deadline wake must send SweepWebrtcReservation")
+                        .expect("control sender stays live");
+                    let timeout_event = peer_state.mux.pop_pending_event();
+                    assert!(
+                        !data_channel.closed.load(Ordering::Acquire),
+                        "an idle Reserved route must not local_close a DataChannel"
+                    );
+                    (sweep, timeout_event)
+                }
+                _ = &mut loop_fut => panic!("control loop ended before the reserved-open sweep"),
+            };
+            data_channel.poll_ends.store(true, Ordering::Release);
+            data_channel.event_notify.notify_waiters();
+            let _ = tokio::time::timeout(Duration::from_secs(1), loop_fut).await;
+            (sweep, timeout_event)
+        });
+        assert!(
+            matches!(
+                &sweep,
+                ControlMessage::SweepWebrtcReservation {
+                    grant_id: closed,
+                    session_id,
+                    subscription_id,
+                    generation
+                } if closed == grant_id
+                    && session_id == "s"
+                    && subscription_id == "sub"
+                    && *generation == 1
+            ),
+            "control loop must emit the production sweep: {sweep:?}"
+        );
+        handle_control_message(
+            &mut harness.daemon,
+            &mut harness.state,
+            &harness.terminal_path,
+            &harness.transport_handle,
+            harness.control_tx.clone(),
+            sweep,
+        );
+        assert!(
+            !harness
+                .state
+                .pending_runtime
+                .has_webrtc_reservation(grant_id, "s", "sub", 1),
+            "SweepWebrtcReservation must remove the daemon reservation"
+        );
+        assert_eq!(peer_state.mux.charged_subscription_count(), 0);
+        let flushed = data_channel.sent.lock().unwrap().clone();
+        assert!(
+            matches!(
+                timeout_event,
+                Some(DaemonEvent::SubscriptionChannelOpenTimeout { .. })
+            ) || !flushed.is_empty(),
+            "typed timeout event must stay queued or flush onto the control channel: event={timeout_event:?} flushed={flushed:?}"
+        );
+        harness.cleanup();
+    }
+
+    #[test]
+    fn webrtc_reservation_control_messages_keep_foreign_grants() {
+        let mut harness = PeerHarness::new("two-grant-reservations");
+        let origin_a = "http://127.0.0.1:41831";
+        let origin_b = "http://127.0.0.1:41832";
+        let peer_a = harness.signal_peer(origin_a);
+        let peer_b = harness.signal_peer(origin_b);
+        let grant_a = peer_a.grant_id.clone();
+        let grant_b = peer_b.grant_id.clone();
+
+        let store_both = |state: &mut DaemonControlState| {
+            state
+                .pending_runtime
+                .test_store_webrtc_reservation(&grant_a, "s", "sub", 1);
+            state
+                .pending_runtime
+                .test_store_webrtc_reservation(&grant_b, "s", "sub", 1);
+        };
+        let assert_only_b = |state: &DaemonControlState, label: &str| {
+            assert!(
+                !state
+                    .pending_runtime
+                    .has_webrtc_reservation(&grant_a, "s", "sub", 1),
+                "{label}: grant A must be gone"
+            );
+            assert!(
+                state
+                    .pending_runtime
+                    .has_webrtc_reservation(&grant_b, "s", "sub", 1),
+                "{label}: grant B must remain"
+            );
+        };
+
+        store_both(&mut harness.state);
+        let mux_a = WebRtcConnectionMux::new();
+        mux_a
+            .reserve_terminal(grant_a.clone(), "s".into(), "sub".into(), 1)
+            .expect("reserve A");
+        handle_control_message(
+            &mut harness.daemon,
+            &mut harness.state,
+            &harness.terminal_path,
+            &harness.transport_handle,
+            harness.control_tx.clone(),
+            ControlMessage::RegisterWebrtcAdmission {
+                grant_id: grant_a.clone(),
+                admission: WebrtcTerminalAdmission::Admitted {
+                    required_features: Vec::new(),
+                    mux: mux_a,
+                    terminal_requirement: None,
+                },
+                host_required_features: Vec::new(),
+            },
+        );
+        let (reply_tx, reply_rx) = oneshot::channel();
+        handle_control_message(
+            &mut harness.daemon,
+            &mut harness.state,
+            &harness.terminal_path,
+            &harness.transport_handle,
+            harness.control_tx.clone(),
+            ControlMessage::BindReservedWebrtcChannel {
+                grant_id: grant_a.clone(),
+                session_id: "s".into(),
+                subscription_id: "sub".into(),
+                generation: 1,
+                reply_tx,
+            },
+        );
+        let _ = reply_rx.blocking_recv();
+        assert_only_b(&harness.state, "bind-first");
+
+        store_both(&mut harness.state);
+        handle_control_message(
+            &mut harness.daemon,
+            &mut harness.state,
+            &harness.terminal_path,
+            &harness.transport_handle,
+            harness.control_tx.clone(),
+            ControlMessage::SweepWebrtcReservation {
+                grant_id: grant_a.clone(),
+                session_id: "s".into(),
+                subscription_id: "sub".into(),
+                generation: 1,
+            },
+        );
+        assert_only_b(&harness.state, "timeout-first");
+
+        store_both(&mut harness.state);
+        handle_control_message(
+            &mut harness.daemon,
+            &mut harness.state,
+            &harness.terminal_path,
+            &harness.transport_handle,
+            harness.control_tx.clone(),
+            ControlMessage::LocalWebrtcPeerClosed {
+                grant_id: grant_a.clone(),
+                attached_subscriptions: Vec::new(),
+                entity_subscription_ids: Vec::new(),
+                terminal_record: peer_closed_record(&grant_a),
+            },
+        );
+        assert_only_b(&harness.state, "PeerClosed-first");
+
+        harness
+            .state
+            .pending_runtime
+            .test_store_webrtc_reservation(&grant_a, "s", "sub", 1);
+        handle_control_message(
+            &mut harness.daemon,
+            &mut harness.state,
+            &harness.terminal_path,
+            &harness.transport_handle,
+            harness.control_tx.clone(),
+            ControlMessage::SweepWebrtcReservation {
+                grant_id: grant_a.clone(),
+                session_id: "s".into(),
+                subscription_id: "sub".into(),
+                generation: 1,
+            },
+        );
+        assert_only_b(&harness.state, "close-first then timeout sweep");
+
+        peer_a.close_offer();
+        peer_b.close_offer();
         harness.cleanup();
     }
 }

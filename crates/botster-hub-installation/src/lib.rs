@@ -32,7 +32,7 @@ pub use release::{
     MAX_RELEASE_BYTES, MINIMUM_RELEASE_SCHEMA_VERSION, ManifestArtifact, ManifestSourceRevisions,
     RELEASE_SCHEMA_VERSION, ReleaseDocument, ReleaseManifest, ReleaseSignature,
 };
-pub use safety::{DirectoryHandle, FileFacts, FileHandle, InstallationProblem};
+pub use safety::{DirectoryHandle, FileFacts, FileHandle, InstallationProblem, file_mode_bits};
 pub use source::validate_release_source;
 
 #[cfg(test)]
