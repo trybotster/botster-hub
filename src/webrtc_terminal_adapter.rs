@@ -115,7 +115,7 @@ struct WebRtcTerminalAdapterInner {
     buffered_bytes: AtomicU32,
     mux: Weak<WebRtcMuxInner>,
     slot: Mutex<Option<Vec<u8>>>,
-    host_out: Mutex<VecDeque<Vec<u8>>>,
+    bootstrap_pending: Mutex<VecDeque<Vec<u8>>>,
     ingress: Mutex<AdapterIngress>,
     wake: AdapterWake,
     close_work: Arc<AtomicBool>,
@@ -130,7 +130,7 @@ impl WebRtcTerminalAdapterInner {
             buffered_bytes: AtomicU32::new(0),
             mux: Weak::new(),
             slot: Mutex::new(None),
-            host_out: Mutex::new(VecDeque::new()),
+            bootstrap_pending: Mutex::new(VecDeque::new()),
             ingress: Mutex::new(AdapterIngress::new()),
             wake: AdapterWake::new(),
             close_work: Arc::new(AtomicBool::new(false)),
@@ -183,7 +183,7 @@ impl WebRtcTerminalAdapterInner {
                 poisoned.into_inner().clear();
             }
         }
-        match self.host_out.try_lock() {
+        match self.bootstrap_pending.try_lock() {
             Ok(mut pending) => pending.clear(),
             Err(TryLockError::WouldBlock) => {}
             Err(TryLockError::Poisoned(poisoned)) => {
@@ -205,7 +205,7 @@ impl WebRtcTerminalAdapterInner {
                 }
                 if slot.is_none() {
                     *slot = Some(bytes);
-                } else if let Ok(mut pending) = self.host_out.lock() {
+                } else if let Ok(mut pending) = self.bootstrap_pending.lock() {
                     pending.push_back(bytes);
                 }
             }
@@ -392,7 +392,7 @@ impl WebRtcTerminalAdapterInner {
                     None
                 } else {
                     let taken = slot.take();
-                    if let Ok(mut pending) = self.host_out.lock() {
+                    if let Ok(mut pending) = self.bootstrap_pending.lock() {
                         *slot = pending.pop_front();
                     }
                     taken
@@ -544,6 +544,7 @@ enum MuxRouteState {
 }
 
 struct WebRtcMuxRoute {
+    grant_id: String,
     session_id: String,
     subscription_id: String,
     generation: u64,
@@ -624,6 +625,7 @@ impl WebRtcConnectionMux {
             routes.insert(
                 key,
                 WebRtcMuxRoute {
+                    grant_id: String::new(),
                     session_id,
                     subscription_id,
                     generation,
@@ -662,6 +664,7 @@ impl WebRtcConnectionMux {
 
     pub(crate) fn reserve_terminal(
         &self,
+        grant_id: String,
         session_id: String,
         subscription_id: String,
         generation: u64,
@@ -686,6 +689,17 @@ impl WebRtcConnectionMux {
         let Ok(mut routes) = self.inner.routes.lock() else {
             return Err("subscription_channel_limit");
         };
+        for route in routes.values_mut() {
+            if route.grant_id == grant_id
+                && route.session_id == session_id
+                && route.subscription_id == subscription_id
+                && route.generation != generation
+                && route.state == MuxRouteState::Reserved
+            {
+                route.state = MuxRouteState::Retired;
+                route.handle = None;
+            }
+        }
         let key = (session_id.clone(), subscription_id.clone(), generation);
         if routes.contains_key(&key) {
             return Err("subscription_channel_duplicate");
@@ -693,6 +707,7 @@ impl WebRtcConnectionMux {
         routes.insert(
             key,
             WebRtcMuxRoute {
+                grant_id,
                 session_id,
                 subscription_id,
                 generation,
@@ -702,6 +717,8 @@ impl WebRtcConnectionMux {
                 reserved_at: Some(Instant::now()),
             },
         );
+        drop(routes);
+        self.inner.wake.wake();
         Ok(label)
     }
 
@@ -1058,10 +1075,26 @@ impl WebRtcConnectionMux {
         self.inner.wake.wake();
     }
 
-    pub(crate) fn expire_reserved_opens(&self, now: Instant, bound: Duration) {
+    pub(crate) fn next_reserved_deadline(&self, now: Instant, bound: Duration) -> Option<Instant> {
+        let Ok(routes) = self.inner.routes.lock() else {
+            return None;
+        };
+        routes
+            .values()
+            .filter(|route| route.state == MuxRouteState::Reserved)
+            .filter_map(|route| route.reserved_at.map(|reserved_at| reserved_at + bound))
+            .min()
+            .map(|deadline| deadline.min(now + bound))
+    }
+
+    pub(crate) fn expire_reserved_opens(
+        &self,
+        now: Instant,
+        bound: Duration,
+    ) -> Vec<(String, String, String, u64)> {
         let expired = {
             let Ok(routes) = self.inner.routes.lock() else {
-                return;
+                return Vec::new();
             };
             routes
                 .values()
@@ -1073,6 +1106,7 @@ impl WebRtcConnectionMux {
                 })
                 .map(|route| {
                     (
+                        route.grant_id.clone(),
                         route.session_id.clone(),
                         route.subscription_id.clone(),
                         route.generation,
@@ -1080,17 +1114,20 @@ impl WebRtcConnectionMux {
                 })
                 .collect::<Vec<_>>()
         };
-        for (session_id, subscription_id, generation) in expired {
-            if self.retire_reserved(&session_id, &subscription_id, generation)
-                && self.close_events_admitted()
-            {
-                self.queue_host_event(DaemonEvent::SubscriptionChannelOpenTimeout {
-                    session_id,
-                    subscription_id,
-                    generation,
-                });
+        let mut retired = Vec::new();
+        for (grant_id, session_id, subscription_id, generation) in expired {
+            if self.retire_reserved(&session_id, &subscription_id, generation) {
+                if self.close_events_admitted() {
+                    self.queue_host_event(DaemonEvent::SubscriptionChannelOpenTimeout {
+                        session_id: session_id.clone(),
+                        subscription_id: subscription_id.clone(),
+                        generation,
+                    });
+                }
+                retired.push((grant_id, session_id, subscription_id, generation));
             }
         }
+        retired
     }
 
     pub(crate) async fn wait_for_write(&self) {
@@ -1138,7 +1175,6 @@ impl WebRtcTerminalAdapterHandle {
         self.inner.buffered_bytes.load(Ordering::SeqCst)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn set_buffered_bytes(&self, bytes: u32) {
         self.inner.buffered_bytes.store(bytes, Ordering::SeqCst);
         if bytes < crate::local_webrtc::webrtc_subscription_channel::AGGREGATE_BUFFERED_LOW {
@@ -1447,7 +1483,7 @@ mod tests {
         for index in 0..31 {
             let (adapter, handle) = mux.create_adapter();
             let label = mux
-                .reserve_terminal(format!("s{index:02}"), "sub".into(), 1)
+                .reserve_terminal("grant".into(), format!("s{index:02}"), "sub".into(), 1)
                 .expect("admit 31 channels while the aggregate is 0");
             assert!(mux.bind_reserved(&label, handle.clone()));
             adapters.push((adapter, handle));
@@ -1460,7 +1496,7 @@ mod tests {
         }
         assert_eq!(mux.aggregate_buffered(), AGGREGATE_BUFFERED_HIGH);
         assert_eq!(
-            mux.reserve_terminal("s31".into(), "sub".into(), 1),
+            mux.reserve_terminal("grant".into(), "s31".into(), "sub".into(), 1),
             Err("subscription_channel_aggregate")
         );
         assert_eq!(mux.aggregate_buffered(), AGGREGATE_BUFFERED_HIGH);
@@ -1517,7 +1553,7 @@ mod tests {
         for index in 0..31 {
             let (adapter, handle) = mux.create_adapter();
             let label = mux
-                .reserve_terminal(format!("s{index:02}"), "sub".into(), 1)
+                .reserve_terminal("grant".into(), format!("s{index:02}"), "sub".into(), 1)
                 .expect("admit while aggregate is 0");
             assert!(mux.bind_reserved(&label, handle.clone()));
             adapters.push((adapter, handle));
@@ -1540,6 +1576,87 @@ mod tests {
         assert_eq!(cross.pressure(), TerminalAdapterPressure::WouldBlock);
         assert!(handle.snapshot_active().is_none());
         assert_eq!(mux.aggregate_buffered(), AGGREGATE_BUFFERED_HIGH);
+    }
+
+    #[test]
+    fn reserved_open_deadline_retires_idle_route_without_a_channel() {
+        let mux = WebRtcConnectionMux::new();
+        mux.admit_close_events();
+        let reserved_at = Instant::now();
+        mux.reserve_terminal("grant-a".into(), "s".into(), "sub".into(), 1)
+            .expect("reserve");
+        assert_eq!(mux.charged_subscription_count(), 1);
+        assert!(
+            mux.next_reserved_deadline(reserved_at, Duration::from_millis(20))
+                .is_some()
+        );
+        let expired = mux.expire_reserved_opens(
+            reserved_at + Duration::from_millis(21),
+            Duration::from_millis(20),
+        );
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].0, "grant-a");
+        assert_eq!(mux.charged_subscription_count(), 0);
+        assert!(matches!(
+            mux.pop_pending_event(),
+            Some(DaemonEvent::SubscriptionChannelOpenTimeout { .. })
+        ));
+    }
+
+    #[test]
+    fn live_try_write_does_not_grow_a_hub_history_queue() {
+        let (mut adapter, handle) = WebRtcTerminalAdapter::pair();
+        let first =
+            TerminalFrame::from_bytes(br#"{"type":"terminal_output","marker":"first"}"#).unwrap();
+        let second =
+            TerminalFrame::from_bytes(br#"{"type":"terminal_output","marker":"second"}"#).unwrap();
+        assert_eq!(adapter.try_write(&first), Ok(()));
+        assert_eq!(
+            adapter.try_write(&second),
+            Err(TerminalAdapterWriteError::Full)
+        );
+        let first_bytes = handle.complete_active().expect("first slot");
+        assert!(String::from_utf8_lossy(&first_bytes).contains("first"));
+        assert!(
+            handle.complete_active().is_none(),
+            "a refused live write must not become Hub-owned terminal history"
+        );
+        assert_eq!(adapter.pressure(), TerminalAdapterPressure::Ready);
+    }
+
+    #[test]
+    fn live_outstanding_bytes_drive_thirty_one_channel_aggregate() {
+        use crate::local_webrtc::webrtc_subscription_channel::AGGREGATE_BUFFERED_HIGH;
+
+        let mux = WebRtcConnectionMux::new();
+        let mut adapters = Vec::new();
+        for index in 0..31 {
+            let (adapter, handle) = mux.create_adapter();
+            let label = mux
+                .reserve_terminal("grant".into(), format!("s{index:02}"), "sub".into(), 1)
+                .expect("admit 31 channels");
+            assert!(mux.bind_reserved(&label, handle.clone()));
+            adapters.push((adapter, handle));
+        }
+        for (index, (_adapter, handle)) in adapters.iter().enumerate() {
+            handle.set_buffered_bytes(if index < 29 { 65_536 } else { 98_304 });
+        }
+        assert_eq!(mux.aggregate_buffered(), AGGREGATE_BUFFERED_HIGH);
+        assert_eq!(
+            mux.reserve_terminal("grant".into(), "s31".into(), "sub".into(), 1),
+            Err("subscription_channel_aggregate")
+        );
+    }
+
+    #[test]
+    fn reserve_replacement_retires_prior_generation_for_same_grant_route() {
+        let mux = WebRtcConnectionMux::new();
+        mux.reserve_terminal("g".into(), "s".into(), "sub".into(), 1)
+            .expect("first reserve");
+        assert_eq!(mux.charged_subscription_count(), 1);
+        mux.reserve_terminal("g".into(), "s".into(), "sub".into(), 2)
+            .expect("replacement reserve");
+        assert_eq!(mux.charged_subscription_count(), 1);
     }
 
     #[test]

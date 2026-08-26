@@ -438,6 +438,7 @@ dependencies = [
  "botster-terminal-ghostty",
  "botster-terminal-protocol",
  "botster-ui-contract",
+ "bytes",
  "getrandom 0.3.4",
  "keyring",
  "libc",
