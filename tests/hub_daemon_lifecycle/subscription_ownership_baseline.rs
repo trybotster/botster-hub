@@ -2,7 +2,7 @@
 // These pin current Hub behavior so later tickets show an intentional change.
 // They must not change transport behavior.
 
-const LOCKED_CORE_REV: &str = "358ef1a6bf0f792f6da10d60890be39cb16779d0";
+const LOCKED_CORE_REV: &str = "9cabdfd0588b6c7ed2e121e7b50086ce2a250ec6";
 
 fn hub_source(relative: &str) -> String {
     std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative))
@@ -325,7 +325,7 @@ fn webrtc_peer_post_handshake_data_channel_reaches_production_reject() {
         );
         assert_eq!(label, "botster-extra");
         assert!(
-            close_marker.exists(),
+            wait_for_path(&close_marker, Duration::from_secs(10)),
             "Hub must finish bounded local_close on the post-handshake DataChannel"
         );
         assert_production_second_channel_reject_source();

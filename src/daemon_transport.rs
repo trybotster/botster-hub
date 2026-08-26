@@ -125,7 +125,7 @@ use daemon_attach_stream::{
     AttachStreamOwner, AttachStreamRegistry, BoundAdapterHandle, UnixBindRequest,
     WebrtcBindRequest, bind_reserved_webrtc_adapter, bind_unix_adapter_after_attaching,
     fail_closed_pre_bind_attach, forward_attach_bootstrap, live_generation_for_route,
-    next_webrtc_reservation_generation, write_first_webrtc_attach_frame,
+    next_webrtc_reservation_generation,
 };
 pub(crate) use daemon_attach_stream::{
     hello_requires_terminal_subscription_closed, negotiated_unix_capability_set,
@@ -159,6 +159,9 @@ const DAEMON_MAX_REJECTION_TASKS: usize = 8;
 const DAEMON_CONTROL_QUEUE_CAPACITY: usize = 256;
 pub(crate) const ENTITY_SUBSCRIPTION_QUEUE_CAPACITY: usize = 64;
 const ENTITY_RECONCILIATION_INTERVAL: Duration = Duration::from_millis(500);
+const WEBRTC_BIND_OBSERVE_TICK: Duration = Duration::from_millis(50);
+const WEBRTC_SLOT_READY_OBSERVE_BOUND: Duration = Duration::from_secs(20);
+const WEBRTC_SLOT_READY_OBSERVE_ATTEMPTS: usize = 8;
 static NEXT_SOCKET_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) type ControlSender = tokio_mpsc::Sender<ControlMessage>;
@@ -229,6 +232,12 @@ fn owner_maintenance_pending(daemon: &HubDaemon, state: &DaemonControlState) -> 
 }
 
 fn mark_due_reconciliation(state: &mut DaemonControlState, now: Instant) {
+    if webrtc_recent_bind_needs_observe(state) {
+        let soon = now + WEBRTC_BIND_OBSERVE_TICK;
+        if state.next_reconciliation > soon {
+            state.next_reconciliation = soon;
+        }
+    }
     if state.next_reconciliation <= now {
         state.background.mark_pump();
         state.maintenance.try_wake();
@@ -2480,7 +2489,7 @@ pub(crate) fn handle_control_message(
             reply_tx,
         } => {
             if !daemon.local_webrtc().has_live_peer(&grant_id) {
-                let _ = reply_tx.send(Err("peer_gone"));
+                reply_reserved_bind(daemon, reply_tx, Err("peer_gone"));
                 return false;
             }
             let Some(WebrtcTerminalAdmission::Admitted {
@@ -2493,7 +2502,7 @@ pub(crate) fn handle_control_message(
                 .get(&grant_id)
                 .cloned()
             else {
-                let _ = reply_tx.send(Err("not_admitted"));
+                reply_reserved_bind(daemon, reply_tx, Err("not_admitted"));
                 return false;
             };
             let label = crate::local_webrtc::webrtc_subscription_channel::SubscriptionChannelLabel::terminal(
@@ -2505,7 +2514,7 @@ pub(crate) fn handle_control_message(
             if crate::local_webrtc::webrtc_subscription_channel::decide_open_event(&view)
                 != crate::local_webrtc::webrtc_subscription_channel::OpenEventDecision::Bind
             {
-                let _ = reply_tx.send(Err("open_rejected"));
+                reply_reserved_bind(daemon, reply_tx, Err("open_rejected"));
                 return false;
             }
             let Some(reservation) = state.pending_runtime.take_webrtc_reservation(
@@ -2514,7 +2523,7 @@ pub(crate) fn handle_control_message(
                 &subscription_id,
                 generation,
             ) else {
-                let _ = reply_tx.send(Err("no_reservation"));
+                reply_reserved_bind(daemon, reply_tx, Err("no_reservation"));
                 return false;
             };
             if reservation.grant_id != grant_id {
@@ -2527,46 +2536,40 @@ pub(crate) fn handle_control_message(
                     ),
                     reservation,
                 );
-                let _ = reply_tx.send(Err("no_reservation"));
+                reply_reserved_bind(daemon, reply_tx, Err("no_reservation"));
                 return false;
             }
             let Some(client_id) = state
                 .pending_runtime
                 .stream_owner_client_id(&session_id, &subscription_id)
             else {
-                let _ = reply_tx.send(Ok(()));
+                reply_reserved_bind(daemon, reply_tx, Err("no_stream"));
                 return false;
             };
             let Some(runtime) = daemon.runtime_mut() else {
-                let _ = reply_tx.send(Err("bind_failed"));
+                reply_reserved_bind(daemon, reply_tx, Err("no_runtime"));
                 return false;
             };
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|elapsed| elapsed.as_secs())
                 .unwrap_or(0);
-            let bootstrap_egress = match state.pending_runtime.begin_core_attach(
-                runtime,
-                &session_id,
-                &subscription_id,
-                now,
-            ) {
-                Ok(egress) => egress,
-                Err(_) => {
-                    let _ = reply_tx.send(Err("bind_failed"));
-                    return false;
-                }
-            };
-            let Some(live_generation) = live_generation_for_route(
-                &runtime.list_terminal_subscriptions(),
-                &client_id,
-                &session_id,
-                &subscription_id,
-            ) else {
-                let _ = reply_tx.send(Err("bind_failed"));
+            if runtime
+                .expect_terminal_adapter(
+                    ClientId(client_id.clone()),
+                    SessionId(session_id.clone()),
+                    SubscriptionId(subscription_id.clone()),
+                )
+                .is_err()
+            {
+                reply_reserved_bind(daemon, reply_tx, Err("expect_failed"));
                 return false;
-            };
-            if live_generation.0 != generation {
+            }
+            if state
+                .pending_runtime
+                .begin_core_attach(runtime, &session_id, &subscription_id, now)
+                .is_err()
+            {
                 fail_closed_pre_bind_attach(
                     &mut state.pending_runtime,
                     runtime,
@@ -2576,7 +2579,41 @@ pub(crate) fn handle_control_message(
                     now,
                     None,
                 );
-                let _ = reply_tx.send(Err("bind_failed"));
+                reply_reserved_bind(daemon, reply_tx, Err("attach_failed"));
+                return false;
+            }
+            let Some(live_generation) = live_generation_for_route(
+                &runtime.list_terminal_subscriptions(),
+                &client_id,
+                &session_id,
+                &subscription_id,
+            ) else {
+                reply_reserved_bind(daemon, reply_tx, Err("no_live_generation"));
+                return false;
+            };
+            if live_generation.0 != generation {
+                if std::env::var("BOTSTER_ENV").ok().as_deref() == Some("test") {
+                    let _ = std::fs::write(
+                        runtime
+                            .config()
+                            .data_directory
+                            .join("last-webrtc-bind-error"),
+                        format!(
+                            "generation_mismatch:live={}:requested={generation}",
+                            live_generation.0
+                        ),
+                    );
+                }
+                fail_closed_pre_bind_attach(
+                    &mut state.pending_runtime,
+                    runtime,
+                    &client_id,
+                    &session_id,
+                    &subscription_id,
+                    now,
+                    None,
+                );
+                let _ = reply_tx.send(Err("generation_mismatch"));
                 return false;
             }
             match bind_reserved_webrtc_adapter(
@@ -2593,19 +2630,22 @@ pub(crate) fn handle_control_message(
                 },
                 live_generation,
             ) {
-                Ok(handle) => {
-                    write_first_webrtc_attach_frame(&handle, &bootstrap_egress);
+                Ok(_handle) => {
                     state.pending_runtime.remember_webrtc_generation(
                         &session_id,
                         &subscription_id,
                         live_generation.0,
                     );
+                    let _ = runtime.observe_session_lifecycle(&SessionId(session_id.clone()), now);
+                    state
+                        .pending_runtime
+                        .extend_webrtc_bind_observe(&session_id);
                     state.background.mark_pump();
                     let _ = (reservation, label);
-                    let _ = reply_tx.send(Ok(()));
+                    reply_reserved_bind(daemon, reply_tx, Ok(()));
                 }
                 Err(()) => {
-                    let _ = reply_tx.send(Err("bind_failed"));
+                    reply_reserved_bind(daemon, reply_tx, Err("adapter_bind_failed"));
                 }
             }
             false
@@ -2622,6 +2662,14 @@ pub(crate) fn handle_control_message(
                 &subscription_id,
                 generation,
             );
+            false
+        }
+        ControlMessage::ReservedWebrtcSlotReady { session_id } => {
+            state
+                .pending_runtime
+                .extend_webrtc_bind_observe(&session_id);
+            observe_reserved_session_until_slot_full(daemon, state, &session_id);
+            state.background.mark_pump();
             false
         }
         ControlMessage::SubscribeEntities {
@@ -5590,6 +5638,9 @@ pub(crate) enum ControlMessage {
         subscription_id: String,
         generation: u64,
     },
+    ReservedWebrtcSlotReady {
+        session_id: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -5635,6 +5686,7 @@ pub(crate) struct PendingRuntimeState {
     webrtc_admissions: BTreeMap<String, WebrtcTerminalAdmission>,
     webrtc_reservations: BTreeMap<(String, String, String, u64), WebrtcReservedAttach>,
     webrtc_last_generation: BTreeMap<(String, String), u64>,
+    webrtc_bind_observe_deadline: BTreeMap<String, Instant>,
     close_work: Arc<AtomicBool>,
     host_compatibility: BTreeMap<String, HostCompatibilityRecord>,
 }
@@ -5681,6 +5733,23 @@ impl PendingRuntimeState {
             (session_id.to_string(), subscription_id.to_string()),
             generation,
         );
+    }
+
+    fn extend_webrtc_bind_observe(&mut self, session_id: &str) {
+        self.webrtc_bind_observe_deadline.insert(
+            session_id.to_string(),
+            Instant::now() + WEBRTC_SLOT_READY_OBSERVE_BOUND,
+        );
+    }
+
+    fn webrtc_session_slot_occupied(&self, session_id: &str) -> bool {
+        self.webrtc_admissions.values().any(|admission| {
+            matches!(
+                admission,
+                WebrtcTerminalAdmission::Admitted { mux, .. }
+                    if mux.session_bound_slot_occupied(session_id)
+            )
+        })
     }
 
     fn store_webrtc_reservation(
@@ -5798,7 +5867,12 @@ fn run_one_pump_phase(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
         PumpPhase::InventoryReconcile => run_inventory_reconcile_phase(daemon, state),
         PumpPhase::Observe => run_pump_observe_phase(daemon, state),
     };
-    if incomplete {
+    // CloseEvents and Inventory still remake. Observe remakes while any
+    // bound slot is ready. Remake while every live bound slot is Full
+    // counts toward Core WRITE_ATTEMPT_BUDGET before SlotReady flushes.
+    let block_observe_remake =
+        matches!(phase, PumpPhase::Observe) && webrtc_bound_slots_block_journal_pump(state);
+    if incomplete && !block_observe_remake {
         state.background.mark_pump();
     }
 }
@@ -5930,6 +6004,124 @@ fn run_inventory_reconcile_phase(daemon: &HubDaemon, state: &mut DaemonControlSt
     }
 }
 
+fn record_test_webrtc_bind_error(daemon: &HubDaemon, code: &str) {
+    if std::env::var("BOTSTER_ENV").ok().as_deref() != Some("test") {
+        return;
+    }
+    let Some(runtime) = daemon.runtime() else {
+        return;
+    };
+    let _ = std::fs::write(
+        runtime
+            .config()
+            .data_directory
+            .join("last-webrtc-bind-error"),
+        code,
+    );
+}
+
+fn reply_reserved_bind(
+    daemon: &HubDaemon,
+    reply_tx: oneshot::Sender<Result<(), &'static str>>,
+    result: Result<(), &'static str>,
+) {
+    if let Err(code) = result {
+        record_test_webrtc_bind_error(daemon, code);
+        let _ = reply_tx.send(Err(code));
+    } else {
+        record_test_webrtc_bind_error(daemon, "ok");
+        let _ = reply_tx.send(Ok(()));
+    }
+}
+
+fn webrtc_bound_slots_block_journal_pump(state: &DaemonControlState) -> bool {
+    let mut saw_live = false;
+    let mut saw_ready = false;
+    for admission in state.pending_runtime.webrtc_admissions.values() {
+        let WebrtcTerminalAdmission::Admitted { mux, .. } = admission else {
+            continue;
+        };
+        for handle in mux.live_bound_handles() {
+            saw_live = true;
+            if !handle.slot_is_occupied() {
+                saw_ready = true;
+            }
+        }
+    }
+    saw_live && !saw_ready
+}
+
+fn webrtc_recent_bind_needs_observe(state: &mut DaemonControlState) -> bool {
+    let now = Instant::now();
+    state
+        .pending_runtime
+        .webrtc_bind_observe_deadline
+        .retain(|_, deadline| *deadline > now);
+    state
+        .pending_runtime
+        .webrtc_bind_observe_deadline
+        .keys()
+        .any(|session_id| {
+            !state
+                .pending_runtime
+                .webrtc_session_slot_occupied(session_id)
+        })
+}
+
+fn observe_reserved_session_until_slot_full(
+    daemon: &HubDaemon,
+    state: &DaemonControlState,
+    session_id: &str,
+) {
+    let Some(runtime) = daemon.runtime() else {
+        return;
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    for _ in 0..WEBRTC_SLOT_READY_OBSERVE_ATTEMPTS {
+        if state
+            .pending_runtime
+            .webrtc_session_slot_occupied(session_id)
+        {
+            return;
+        }
+        let _ = runtime.observe_session_lifecycle(&SessionId(session_id.to_string()), now);
+    }
+}
+
+fn observe_recent_webrtc_binds(
+    daemon: &HubDaemon,
+    state: &mut DaemonControlState,
+    now_seconds: u64,
+) {
+    let Some(runtime) = daemon.runtime() else {
+        return;
+    };
+    let sessions: Vec<String> = {
+        let now = Instant::now();
+        state
+            .pending_runtime
+            .webrtc_bind_observe_deadline
+            .retain(|_, deadline| *deadline > now);
+        state
+            .pending_runtime
+            .webrtc_bind_observe_deadline
+            .keys()
+            .filter(|session_id| {
+                !state
+                    .pending_runtime
+                    .webrtc_session_slot_occupied(session_id)
+            })
+            .cloned()
+            .collect()
+    };
+    for session_id in sessions {
+        let _ = runtime.observe_session_lifecycle(&SessionId(session_id), now_seconds);
+    }
+}
+
 fn run_pump_observe_phase(daemon: &HubDaemon, state: &mut DaemonControlState) -> bool {
     let Some(runtime) = daemon.runtime() else {
         state.observe_resume = None;
@@ -5951,7 +6143,8 @@ fn run_pump_observe_phase(daemon: &HubDaemon, state: &mut DaemonControlState) ->
                 last_visited: slice.last_visited,
             })
         };
-        if runtime.take_journal_advanced_wake() {
+        observe_recent_webrtc_binds(daemon, state, now);
+        if !webrtc_bound_slots_block_journal_pump(state) && runtime.take_journal_advanced_wake() {
             state.maintenance.note_authoritative_mutation();
             state.background.mark_pump();
         }
@@ -9004,6 +9197,47 @@ mod tests {
             production.contains("should_mark_pump_after_control"),
             "control must mark Pump only through the documented request sources"
         );
+        let bind = production
+            .split("ControlMessage::BindReservedWebrtcChannel")
+            .nth(1)
+            .expect("reserved bind arm");
+        let bind = bind
+            .split("ControlMessage::SweepWebrtcReservation")
+            .next()
+            .unwrap_or(bind);
+        assert!(
+            bind.contains("expect_terminal_adapter"),
+            "reserved bind must declare the Core adapter before attach"
+        );
+        assert!(
+            !bind.contains("write_first_webrtc_attach_frame"),
+            "reserved bind must not write extracted attach residue"
+        );
+        let observe = production
+            .split("fn run_pump_observe_phase")
+            .nth(1)
+            .expect("observe phase");
+        let observe = observe
+            .split("pub(crate) struct DaemonControlState")
+            .next()
+            .unwrap_or(observe);
+        assert!(
+            observe.contains("webrtc_bound_slots_block_journal_pump"),
+            "journal remakes must not pump while every live bound WebRTC slot is full"
+        );
+        assert!(
+            bind.contains("observe_session_lifecycle"),
+            "reserved bind must observe the bound session so attach dump starts before SlotReady"
+        );
+        let pump = production
+            .split("fn run_one_pump_phase")
+            .nth(1)
+            .expect("pump runner");
+        let pump = pump.split("fn next_admission_key").next().unwrap_or(pump);
+        assert!(
+            pump.contains("block_observe_remake"),
+            "incomplete Observe remakes must not pump while every live bound WebRTC slot is full"
+        );
     }
 
     #[test]
@@ -9056,9 +9290,29 @@ mod tests {
             !pump.contains("list_sessions"),
             "Pump close classification must not list sessions"
         );
+        let close = TRANSPORT
+            .split("fn run_close_events_phase")
+            .nth(1)
+            .expect("close phase");
+        let close = close
+            .split("fn run_inventory_reconcile_phase")
+            .next()
+            .unwrap_or(close);
         assert!(
-            !pump.contains("observe_session_lifecycle"),
+            !close.contains("observe_session_lifecycle"),
             "CloseEvents must not mutate lifecycle"
+        );
+        let reconcile = TRANSPORT
+            .split("fn run_inventory_reconcile_phase")
+            .nth(1)
+            .expect("reconcile phase");
+        let reconcile = reconcile
+            .split("fn record_test_webrtc_bind_error")
+            .next()
+            .unwrap_or(reconcile);
+        assert!(
+            !reconcile.contains("observe_session_lifecycle"),
+            "InventoryReconcile must not mutate lifecycle"
         );
     }
 

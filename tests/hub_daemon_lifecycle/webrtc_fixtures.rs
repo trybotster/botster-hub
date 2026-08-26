@@ -573,6 +573,25 @@ fn subscription_label_matches(
     parts.len() >= 6 && parts[3] == session_id && parts[4] == subscription_id
 }
 
+fn reserved_frame_kind(bytes: &[u8]) -> Option<String> {
+    let value = serde_json::from_slice::<serde_json::Value>(bytes).ok()?;
+    let kind = value.get("type")?.as_str()?.to_string();
+    match value.get("state").and_then(serde_json::Value::as_str) {
+        Some(state) => Some(format!("{kind}:{state}")),
+        None => match value.get("phase").and_then(serde_json::Value::as_str) {
+            Some(phase) => Some(format!("{kind}:{phase}")),
+            None => Some(kind),
+        },
+    }
+}
+
+fn reserved_frame_is_attached(bytes: &[u8]) -> bool {
+    matches!(
+        reserved_frame_kind(bytes).as_deref(),
+        Some("attach_state:attached")
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_offerer_channel_poll(
     runtime: std::sync::Arc<dyn webrtc::runtime::Runtime>,
@@ -1171,6 +1190,57 @@ impl LocalWebrtcOfferPeer {
                 std::io::Error::other("Attach missing reserved subscription channel label")
             })?;
         self.open_reserved_subscription_channel(label).await
+    }
+
+    /// Drain reserved attach dump until Core publishes Attached.
+    ///
+    /// DataChannel open is not bind. Bytes written before Attached are HISTORY,
+    /// not live `TerminalOutput`.
+    pub(crate) async fn wait_until_attach_started(
+        &mut self,
+        key: &AesGcmKey,
+        _endpoint: &botster_hub_client::DaemonEndpoint,
+        _session_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut seen = Vec::new();
+        while Instant::now() < deadline {
+            match timeout(
+                webrtc_runtime().as_ref(),
+                Duration::from_millis(250),
+                self.next_terminal_frame(key),
+            )
+            .await
+            {
+                Ok(Ok(bytes)) => {
+                    if let Some(kind) = reserved_frame_kind(&bytes) {
+                        seen.push(kind);
+                    } else {
+                        seen.push(format!("raw:{}", bytes.len()));
+                    }
+                    if reserved_frame_is_attached(&bytes) {
+                        return Ok(());
+                    }
+                }
+                Ok(Err(error)) => {
+                    let message = error.to_string();
+                    if message.contains("channel_closed") {
+                        return Err(std::io::Error::other(format!(
+                            "reserved channel closed before Attached; seen={seen:?}"
+                        ))
+                        .into());
+                    }
+                    if !message.contains("timed out") {
+                        return Err(error);
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        Err(std::io::Error::other(format!(
+            "reserved channel did not reach Attached after bind; seen={seen:?}"
+        ))
+        .into())
     }
 
     pub(crate) fn pause_subscription_inbound(&self, session_id: &str, subscription_id: &str) {

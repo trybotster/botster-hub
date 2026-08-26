@@ -52,8 +52,8 @@ use crate::webrtc_terminal_adapter::WebRtcConnectionMux;
 #[path = "webrtc_subscription_channel.rs"]
 pub(crate) mod webrtc_subscription_channel;
 use webrtc_subscription_channel::{
-    CONTROL_CHANNEL_LABEL, LOCAL_WEBRTC_CHANNEL_OPEN_BOUND, flush_one_adapter_handle,
-    subscription_channel_key,
+    CONTROL_CHANNEL_LABEL, LOCAL_WEBRTC_CHANNEL_OPEN_BOUND, LOCAL_WEBRTC_RESERVED_BIND_REPLY_BOUND,
+    flush_one_adapter_handle, subscription_channel_key,
 };
 
 const GRANT_TTL_SECONDS: u64 = 120;
@@ -1282,6 +1282,16 @@ impl LocalWebrtcHandler {
                 return;
             }
         }
+        if !self.peer_state.mux.mark_reserved_open_in_flight(&label) {
+            reject_opened_data_channel(
+                &self.peer_state.grant_id,
+                true,
+                &formatted,
+                data_channel.as_ref(),
+            )
+            .await;
+            return;
+        }
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
             .peer_state
@@ -1306,7 +1316,7 @@ impl LocalWebrtcHandler {
             return;
         }
         if !matches!(
-            tokio::time::timeout(Duration::from_secs(5), reply_rx).await,
+            tokio::time::timeout(LOCAL_WEBRTC_RESERVED_BIND_REPLY_BOUND, reply_rx).await,
             Ok(Ok(Ok(())))
         ) {
             reject_opened_data_channel(
@@ -1508,7 +1518,7 @@ where
             close_subscription_channel(data_channel, &handle).await;
             return None;
         }
-        if let Err(failure) = flush_one_adapter_handle(
+        match flush_one_adapter_handle(
             data_channel,
             stream_key,
             peer_state,
@@ -1519,8 +1529,24 @@ where
         )
         .await
         {
-            close_subscription_channel(data_channel, &handle).await;
-            return Some(failure);
+            Ok(true) => {
+                if peer_state
+                    .runtime_tx
+                    .send(ControlMessage::ReservedWebrtcSlotReady {
+                        session_id: label.session_id.clone(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    close_subscription_channel(data_channel, &handle).await;
+                    return None;
+                }
+            }
+            Ok(false) => {}
+            Err(failure) => {
+                close_subscription_channel(data_channel, &handle).await;
+                return Some(failure);
+            }
         }
         if handle.is_closed() {
             close_subscription_channel(data_channel, &handle).await;

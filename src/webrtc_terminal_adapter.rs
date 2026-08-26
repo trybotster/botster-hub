@@ -267,18 +267,17 @@ impl WebRtcTerminalAdapterInner {
         if self.is_closed() {
             return TerminalAdapterPressure::Closed;
         }
-        match self.slot.try_lock() {
-            Ok(slot) => {
-                if slot.is_some() {
-                    TerminalAdapterPressure::Full
-                } else if self.aggregate_would_block() {
-                    TerminalAdapterPressure::WouldBlock
-                } else {
-                    TerminalAdapterPressure::Ready
-                }
-            }
-            Err(TryLockError::WouldBlock) => TerminalAdapterPressure::Full,
-            Err(TryLockError::Poisoned(_)) => TerminalAdapterPressure::Closed,
+        let occupied = match self.slot.try_lock() {
+            Ok(slot) => slot.is_some(),
+            Err(TryLockError::WouldBlock) => return TerminalAdapterPressure::Full,
+            Err(TryLockError::Poisoned(_)) => return TerminalAdapterPressure::Closed,
+        };
+        if occupied {
+            TerminalAdapterPressure::Full
+        } else if self.aggregate_would_block() {
+            TerminalAdapterPressure::WouldBlock
+        } else {
+            TerminalAdapterPressure::Ready
         }
     }
 
@@ -353,17 +352,17 @@ impl WebRtcTerminalAdapterInner {
         if self.is_closed() {
             return None;
         }
-        let taken = match self.slot.try_lock() {
-            Ok(mut slot) => {
-                if self.is_closed() {
-                    *slot = None;
-                    None
-                } else {
-                    slot.take()
-                }
-            }
-            Err(_) => None,
+        let mut slot = match self.slot.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
         };
+        let taken = if self.is_closed() {
+            *slot = None;
+            None
+        } else {
+            slot.take()
+        };
+        drop(slot);
         self.wake.wake();
         taken
     }
@@ -810,6 +809,27 @@ impl WebRtcConnectionMux {
         true
     }
 
+    pub(crate) fn mark_reserved_open_in_flight(
+        &self,
+        label: &crate::local_webrtc::webrtc_subscription_channel::SubscriptionChannelLabel,
+    ) -> bool {
+        let Ok(mut routes) = self.inner.routes.lock() else {
+            return false;
+        };
+        let Some(route) = routes.get_mut(&(
+            label.session_id.clone(),
+            label.subscription_id.clone(),
+            label.generation,
+        )) else {
+            return false;
+        };
+        if route.state != MuxRouteState::Reserved {
+            return false;
+        }
+        route.reserved_at = None;
+        true
+    }
+
     pub(crate) fn retire_reserved(
         &self,
         session_id: &str,
@@ -1066,19 +1086,51 @@ impl WebRtcConnectionMux {
         subscription_id: &str,
         generation: u64,
     ) -> Option<(WebRtcTerminalAdapterHandle, Vec<u8>)> {
-        let routes = self.inner.routes.lock().ok()?;
-        let route = routes.get(&(
-            session_id.to_string(),
-            subscription_id.to_string(),
-            generation,
-        ))?;
-        let handle = route.handle.as_ref()?;
-        if handle.is_closed() {
-            return None;
-        }
-        handle
-            .snapshot_active()
-            .map(|bytes| (handle.clone(), bytes))
+        let handle = {
+            let routes = self.inner.routes.lock().ok()?;
+            let route = routes.get(&(
+                session_id.to_string(),
+                subscription_id.to_string(),
+                generation,
+            ))?;
+            let handle = route.handle.as_ref()?.clone();
+            if handle.is_closed() {
+                return None;
+            }
+            handle
+        };
+        handle.snapshot_active().map(|bytes| (handle, bytes))
+    }
+
+    pub(crate) fn live_bound_handles(&self) -> Vec<WebRtcTerminalAdapterHandle> {
+        let Ok(routes) = self.inner.routes.lock() else {
+            return Vec::new();
+        };
+        routes
+            .values()
+            .filter(|route| route.state == MuxRouteState::Bound)
+            .filter_map(|route| route.handle.clone())
+            .filter(|handle| !handle.is_closed())
+            .collect()
+    }
+
+    pub(crate) fn session_bound_slot_occupied(&self, session_id: &str) -> bool {
+        let handles = {
+            let Ok(routes) = self.inner.routes.lock() else {
+                return false;
+            };
+            routes
+                .values()
+                .filter(|route| {
+                    route.state == MuxRouteState::Bound && route.session_id == session_id
+                })
+                .filter_map(|route| route.handle.clone())
+                .filter(|handle| !handle.is_closed())
+                .collect::<Vec<_>>()
+        };
+        handles
+            .iter()
+            .any(WebRtcTerminalAdapterHandle::slot_is_occupied)
     }
 
     pub(crate) fn queue_host_event(&self, event: DaemonEvent) {
@@ -1167,6 +1219,17 @@ impl WebRtcTerminalAdapterHandle {
 
     pub(crate) fn snapshot_active(&self) -> Option<Vec<u8>> {
         self.inner.snapshot_active()
+    }
+
+    pub(crate) fn slot_is_occupied(&self) -> bool {
+        if self.is_closed() {
+            return false;
+        }
+        match self.inner.slot.try_lock() {
+            Ok(slot) => slot.is_some(),
+            Err(TryLockError::WouldBlock) => true,
+            Err(TryLockError::Poisoned(_)) => false,
+        }
     }
 
     pub(crate) fn complete_active(&self) -> Option<Vec<u8>> {
@@ -1614,6 +1677,27 @@ mod tests {
     }
 
     #[test]
+    fn reserved_open_in_flight_is_not_retired_by_the_never_open_sweep() {
+        let mux = WebRtcConnectionMux::new();
+        mux.admit_close_events();
+        let reserved_at = Instant::now();
+        let label = mux
+            .reserve_terminal("grant-a".into(), "s".into(), "sub".into(), 1)
+            .expect("reserve");
+        assert!(mux.mark_reserved_open_in_flight(&label));
+        assert_eq!(
+            mux.expire_reserved_opens(
+                reserved_at + Duration::from_secs(6),
+                Duration::from_secs(5),
+            )
+            .len(),
+            0
+        );
+        assert_eq!(mux.charged_subscription_count(), 1);
+        assert!(mux.pop_pending_event().is_none());
+    }
+
+    #[test]
     fn live_try_write_does_not_grow_a_hub_history_queue() {
         let (mut adapter, handle) = WebRtcTerminalAdapter::pair();
         let first =
@@ -1632,6 +1716,72 @@ mod tests {
             "a refused live write must not become Hub-owned terminal history"
         );
         assert_eq!(adapter.pressure(), TerminalAdapterPressure::Ready);
+    }
+
+    #[test]
+    fn snapshot_write_for_drops_the_route_lock_before_reading_the_slot() {
+        let source = include_str!("webrtc_terminal_adapter.rs");
+        let func = source
+            .split("fn snapshot_write_for")
+            .nth(1)
+            .expect("snapshot_write_for");
+        let func = func
+            .split("pub(crate) fn queue_host_event")
+            .next()
+            .expect("function body");
+        assert!(
+            func.contains("let handle = {"),
+            "clone the bound handle before reading the one slot"
+        );
+        assert!(
+            func.contains("handle.snapshot_active()"),
+            "read the slot only after the route lock is dropped"
+        );
+    }
+
+    #[test]
+    fn live_bound_handles_drop_the_route_lock_before_callers_read_slots() {
+        let source = include_str!("webrtc_terminal_adapter.rs");
+        let func = source
+            .split("fn live_bound_handles")
+            .nth(1)
+            .expect("live_bound_handles");
+        let func = func
+            .split("pub(crate) fn queue_host_event")
+            .next()
+            .expect("function body");
+        assert!(
+            func.contains("filter(|handle| !handle.is_closed())"),
+            "closed leftover handles must not block later journal remakes"
+        );
+    }
+
+    #[test]
+    fn bound_slot_occupancy_is_visible_after_the_route_lock_drops() {
+        let mux = WebRtcConnectionMux::new();
+        let (mut adapter, handle) = mux.create_adapter();
+        let label = mux
+            .reserve_terminal("g".into(), "s".into(), "sub".into(), 1)
+            .expect("reserve");
+        assert!(mux.bind_reserved(&label, handle.clone()));
+        assert!(
+            mux.live_bound_handles()
+                .iter()
+                .all(|bound| !bound.slot_is_occupied())
+        );
+        let frame = TerminalFrame::from_bytes(br#"{"type":"snapshot","phase":"ready"}"#).unwrap();
+        assert_eq!(adapter.try_write(&frame), Ok(()));
+        assert!(
+            mux.live_bound_handles()
+                .iter()
+                .any(WebRtcTerminalAdapterHandle::slot_is_occupied)
+        );
+        assert!(handle.complete_active().is_some());
+        assert!(
+            mux.live_bound_handles()
+                .iter()
+                .all(|bound| !bound.slot_is_occupied())
+        );
     }
 
     #[test]

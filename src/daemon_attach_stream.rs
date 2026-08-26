@@ -49,24 +49,6 @@ pub(crate) fn forward_attach_bootstrap(
     }
 }
 
-/// Write at most one already-extracted attach residue into the one-slot adapter.
-/// Later incremental and live frames stay in Core.
-pub(crate) fn write_first_webrtc_attach_frame(
-    handle: &WebRtcTerminalAdapterHandle,
-    egress: &[botster_core::TransportEgress],
-) {
-    let Some(frame) = egress.first() else {
-        return;
-    };
-    let Ok(bytes) = serde_json::to_vec(frame) else {
-        return;
-    };
-    let Ok(opaque) = botster_terminal_protocol::TerminalFrame::from_bytes(&bytes) else {
-        return;
-    };
-    handle.write_opaque_frame(&opaque);
-}
-
 impl BoundAdapterHandle {
     pub(crate) fn write_opaque_frame(&self, frame: &botster_terminal_protocol::TerminalFrame) {
         match self {
@@ -635,6 +617,11 @@ pub(crate) fn fail_closed_pre_bind_attach(
         adapter.close();
     }
     registry.close_adapter(session_id, subscription_id);
+    let _ = runtime.cancel_expected_terminal_adapter(
+        &ClientId(client_id.to_string()),
+        SessionId(session_id.to_string()),
+        SubscriptionId(subscription_id.to_string()),
+    );
     let generation = live_generation_for_route(
         &runtime.list_terminal_subscriptions(),
         client_id,
@@ -1277,7 +1264,13 @@ mod tests {
     fn attach_stream_source_does_not_branch_on_snapshot_phases() {
         let source = include_str!("daemon_attach_stream.rs");
         let production = source.split("mod tests").next().expect("production source");
-        for forbidden in [r#""READY""#, r#""PAGE""#, r#""FINISH""#, "GHOSTSNP"] {
+        for forbidden in [
+            r#""READY""#,
+            r#""PAGE""#,
+            r#""FINISH""#,
+            "GHOSTSNP",
+            "write_first_webrtc_attach_frame",
+        ] {
             assert!(
                 !production.contains(forbidden),
                 "attach stream must stay content-blind: found {forbidden}"
