@@ -124,8 +124,8 @@ mod daemon_attach_stream;
 use daemon_attach_stream::{
     AttachStreamOwner, AttachStreamRegistry, BoundAdapterHandle, UnixBindRequest,
     WebrtcBindRequest, bind_reserved_webrtc_adapter, bind_unix_adapter_after_attaching,
-    fail_closed_pre_bind_attach, forward_attach_bootstrap, handoff_webrtc_attach_dump,
-    live_generation_for_route, next_webrtc_reservation_generation,
+    fail_closed_pre_bind_attach, forward_attach_bootstrap, live_generation_for_route,
+    next_webrtc_reservation_generation, write_first_webrtc_attach_frame,
 };
 pub(crate) use daemon_attach_stream::{
     hello_requires_terminal_subscription_closed, negotiated_unix_capability_set,
@@ -2594,12 +2594,13 @@ pub(crate) fn handle_control_message(
                 live_generation,
             ) {
                 Ok(handle) => {
-                    handoff_webrtc_attach_dump(&handle, &bootstrap_egress);
+                    write_first_webrtc_attach_frame(&handle, &bootstrap_egress);
                     state.pending_runtime.remember_webrtc_generation(
                         &session_id,
                         &subscription_id,
                         live_generation.0,
                     );
+                    state.background.mark_pump();
                     let _ = (reservation, label);
                     let _ = reply_tx.send(Ok(()));
                 }

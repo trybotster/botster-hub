@@ -115,7 +115,6 @@ struct WebRtcTerminalAdapterInner {
     buffered_bytes: AtomicU32,
     mux: Weak<WebRtcMuxInner>,
     slot: Mutex<Option<Vec<u8>>>,
-    attach_handoff: Mutex<VecDeque<Vec<u8>>>,
     ingress: Mutex<AdapterIngress>,
     wake: AdapterWake,
     close_work: Arc<AtomicBool>,
@@ -130,7 +129,6 @@ impl WebRtcTerminalAdapterInner {
             buffered_bytes: AtomicU32::new(0),
             mux: Weak::new(),
             slot: Mutex::new(None),
-            attach_handoff: Mutex::new(VecDeque::new()),
             ingress: Mutex::new(AdapterIngress::new()),
             wake: AdapterWake::new(),
             close_work: Arc::new(AtomicBool::new(false)),
@@ -183,53 +181,7 @@ impl WebRtcTerminalAdapterInner {
                 poisoned.into_inner().clear();
             }
         }
-        match self.attach_handoff.try_lock() {
-            Ok(mut handoff) => handoff.clear(),
-            Err(TryLockError::WouldBlock) => {}
-            Err(TryLockError::Poisoned(poisoned)) => {
-                poisoned.into_inner().clear();
-            }
-        }
         self.wake.wake();
-    }
-
-    fn attach_handoff_pending(&self) -> bool {
-        match self.attach_handoff.try_lock() {
-            Ok(handoff) => !handoff.is_empty(),
-            Err(TryLockError::WouldBlock) => true,
-            Err(TryLockError::Poisoned(_)) => false,
-        }
-    }
-
-    fn enqueue_attach_handoff(&self, bytes: Vec<u8>) {
-        if self.is_closed() {
-            return;
-        }
-        if let Ok(mut handoff) = self.attach_handoff.lock() {
-            handoff.push_back(bytes);
-        }
-        self.wake.wake();
-    }
-
-    fn prime_attach_handoff(&self) {
-        if self.is_closed() {
-            return;
-        }
-        let mut slot = match self.slot.try_lock() {
-            Ok(slot) => slot,
-            Err(_) => return,
-        };
-        if slot.is_some() {
-            return;
-        }
-        let next = match self.attach_handoff.try_lock() {
-            Ok(mut handoff) => handoff.pop_front(),
-            Err(_) => return,
-        };
-        if let Some(bytes) = next {
-            *slot = Some(bytes);
-            self.wake.wake();
-        }
     }
 
     fn try_read(&self) -> TerminalIngress {
@@ -317,7 +269,7 @@ impl WebRtcTerminalAdapterInner {
         }
         match self.slot.try_lock() {
             Ok(slot) => {
-                if slot.is_some() || self.attach_handoff_pending() {
+                if slot.is_some() {
                     TerminalAdapterPressure::Full
                 } else if self.aggregate_would_block() {
                     TerminalAdapterPressure::WouldBlock
@@ -336,9 +288,6 @@ impl WebRtcTerminalAdapterInner {
         }
         if self.would_block.load(Ordering::SeqCst) {
             return Err(TerminalAdapterWriteError::WouldBlock);
-        }
-        if self.attach_handoff_pending() {
-            return Err(TerminalAdapterWriteError::Full);
         }
         let bytes = match frame.to_bytes() {
             Ok(bytes) => bytes,
@@ -415,7 +364,6 @@ impl WebRtcTerminalAdapterInner {
             }
             Err(_) => None,
         };
-        self.prime_attach_handoff();
         self.wake.wake();
         taken
     }
@@ -1229,14 +1177,6 @@ impl WebRtcTerminalAdapterHandle {
         let _ = self.inner.try_write(frame);
     }
 
-    pub(crate) fn enqueue_attach_handoff(&self, bytes: Vec<u8>) {
-        self.inner.enqueue_attach_handoff(bytes);
-    }
-
-    pub(crate) fn prime_attach_handoff(&self) {
-        self.inner.prime_attach_handoff();
-    }
-
     pub(crate) fn push_ingress_frame(&self, bytes: Vec<u8>) {
         self.inner.push_ingress_frame(bytes);
     }
@@ -1711,26 +1651,6 @@ mod tests {
         );
         assert_eq!(adapter.try_read(), TerminalIngress::Empty);
         assert_eq!(adapter.pressure(), TerminalAdapterPressure::Ready);
-    }
-
-    #[test]
-    fn attach_handoff_delivers_the_second_frame_after_the_slot_clears() {
-        let (_adapter, handle) = WebRtcTerminalAdapter::pair();
-        let first =
-            TerminalFrame::from_bytes(br#"{"type":"terminal_output","marker":"first"}"#).unwrap();
-        let second =
-            TerminalFrame::from_bytes(br#"{"type":"terminal_output","marker":"second"}"#).unwrap();
-        handle.enqueue_attach_handoff(first.to_bytes().expect("first"));
-        handle.enqueue_attach_handoff(second.to_bytes().expect("second"));
-        handle.prime_attach_handoff();
-        let first_bytes = handle.complete_active().expect("first handoff frame");
-        assert!(String::from_utf8_lossy(&first_bytes).contains("first"));
-        let second_bytes = handle.complete_active().expect("second handoff frame");
-        assert!(
-            String::from_utf8_lossy(&second_bytes).contains("second"),
-            "the second attach frame must survive until the one slot clears"
-        );
-        assert!(handle.complete_active().is_none());
     }
 
     #[test]
