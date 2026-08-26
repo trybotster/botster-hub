@@ -124,8 +124,8 @@ mod daemon_attach_stream;
 use daemon_attach_stream::{
     AttachStreamOwner, AttachStreamRegistry, BoundAdapterHandle, UnixBindRequest,
     WebrtcBindRequest, bind_reserved_webrtc_adapter, bind_unix_adapter_after_attaching,
-    fail_closed_pre_bind_attach, forward_attach_bootstrap, live_generation_for_route,
-    next_webrtc_reservation_generation,
+    fail_closed_pre_bind_attach, forward_attach_bootstrap, handoff_webrtc_attach_dump,
+    live_generation_for_route, next_webrtc_reservation_generation,
 };
 pub(crate) use daemon_attach_stream::{
     hello_requires_terminal_subscription_closed, negotiated_unix_capability_set,
@@ -2530,16 +2530,82 @@ pub(crate) fn handle_control_message(
                 let _ = reply_tx.send(Err("no_reservation"));
                 return false;
             }
-            let _ = (admitted_features, admitted_requirement);
+            let Some(client_id) = state
+                .pending_runtime
+                .stream_owner_client_id(&session_id, &subscription_id)
+            else {
+                let _ = reply_tx.send(Ok(()));
+                return false;
+            };
+            let Some(runtime) = daemon.runtime_mut() else {
+                let _ = reply_tx.send(Err("bind_failed"));
+                return false;
+            };
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|elapsed| elapsed.as_secs())
                 .unwrap_or(0);
-            let _ = (reservation, now, daemon.runtime_mut());
-            if mux.activate_reserved(&label) {
-                let _ = reply_tx.send(Ok(()));
-            } else {
+            let bootstrap_egress = match state.pending_runtime.begin_core_attach(
+                runtime,
+                &session_id,
+                &subscription_id,
+                now,
+            ) {
+                Ok(egress) => egress,
+                Err(_) => {
+                    let _ = reply_tx.send(Err("bind_failed"));
+                    return false;
+                }
+            };
+            let Some(live_generation) = live_generation_for_route(
+                &runtime.list_terminal_subscriptions(),
+                &client_id,
+                &session_id,
+                &subscription_id,
+            ) else {
                 let _ = reply_tx.send(Err("bind_failed"));
+                return false;
+            };
+            if live_generation.0 != generation {
+                fail_closed_pre_bind_attach(
+                    &mut state.pending_runtime,
+                    runtime,
+                    &client_id,
+                    &session_id,
+                    &subscription_id,
+                    now,
+                    None,
+                );
+                let _ = reply_tx.send(Err("bind_failed"));
+                return false;
+            }
+            match bind_reserved_webrtc_adapter(
+                &mut state.pending_runtime,
+                runtime,
+                WebrtcBindRequest {
+                    client_id: &client_id,
+                    session_id: &session_id,
+                    subscription_id: &subscription_id,
+                    required_features: &admitted_features,
+                    terminal_requirement: admitted_requirement.as_ref(),
+                    now_seconds: now,
+                    mux: Some(&mux),
+                },
+                live_generation,
+            ) {
+                Ok(handle) => {
+                    handoff_webrtc_attach_dump(&handle, &bootstrap_egress);
+                    state.pending_runtime.remember_webrtc_generation(
+                        &session_id,
+                        &subscription_id,
+                        live_generation.0,
+                    );
+                    let _ = (reservation, label);
+                    let _ = reply_tx.send(Ok(()));
+                }
+                Err(()) => {
+                    let _ = reply_tx.send(Err("bind_failed"));
+                }
             }
             false
         }
@@ -3743,14 +3809,20 @@ fn handle_runtime_control_request(
                 grant_id: observability.grant_id.map(str::to_string),
             };
             let inventory = runtime.list_terminal_subscriptions();
-            let (detach_owner, _webrtc_generation) = next_webrtc_reservation_generation(
+            let last_known = pending_runtime.webrtc_last_generation(&session_id, &subscription_id);
+            let (detach_owner, webrtc_generation) = next_webrtc_reservation_generation(
                 &inventory,
-                &client_id,
+                last_known,
                 &session_id,
                 &subscription_id,
             );
             pending_runtime.start_attach(owner, session_id.clone(), subscription_id.clone());
             if let Some((owner_client_id, generation)) = detach_owner {
+                pending_runtime.remember_webrtc_generation(
+                    &session_id,
+                    &subscription_id,
+                    generation.0,
+                );
                 let _ = runtime.detach_terminal_subscription(
                     ClientId(owner_client_id),
                     SessionId(session_id.clone()),
@@ -3784,83 +3856,22 @@ fn handle_runtime_control_request(
                         "Attach requires an admitted WebRTC adapter",
                     ));
                 };
-                let bootstrap_egress = match pending_runtime.begin_core_attach(
-                    runtime,
-                    &session_id,
-                    &subscription_id,
-                    now,
-                ) {
-                    Ok(egress) => egress,
-                    Err(_) => {
-                        pending_runtime.cancel_stream(&session_id, &subscription_id);
-                        return Ok(attach_bind_operator_error(
-                            "invalid_request",
-                            "attach failed before adapter bind",
-                        ));
-                    }
-                };
-                let Some(generation) = live_generation_for_route(
-                    &runtime.list_terminal_subscriptions(),
-                    &client_id,
-                    &session_id,
-                    &subscription_id,
-                ) else {
-                    fail_closed_pre_bind_attach(
-                        pending_runtime,
-                        runtime,
-                        &client_id,
-                        &session_id,
-                        &subscription_id,
-                        now,
-                        None,
-                    );
-                    return Ok(attach_bind_operator_error(
-                        "invalid_request",
-                        "Attach failed to reserve a WebRTC channel",
-                    ));
-                };
-                pending_runtime.record_generation(&session_id, &subscription_id, generation);
+                let _ = (required_features, terminal_requirement);
+                pending_runtime.record_generation(&session_id, &subscription_id, webrtc_generation);
                 let grant_id = grant_id.to_string();
                 return match mux.reserve_terminal(
                     grant_id.clone(),
                     session_id.clone(),
                     subscription_id.clone(),
-                    generation.0,
+                    webrtc_generation.0,
                 ) {
                     Ok(label) => {
-                        match bind_reserved_webrtc_adapter(
-                            pending_runtime,
-                            runtime,
-                            WebrtcBindRequest {
-                                client_id: &client_id,
-                                session_id: &session_id,
-                                subscription_id: &subscription_id,
-                                required_features,
-                                terminal_requirement: terminal_requirement.as_ref(),
-                                now_seconds: now,
-                                mux: Some(mux),
-                            },
-                            generation,
-                        ) {
-                            Ok(handle) => {
-                                forward_attach_bootstrap(
-                                    &BoundAdapterHandle::WebRtc(handle),
-                                    &bootstrap_egress,
-                                );
-                            }
-                            Err(()) => {
-                                return Ok(attach_bind_operator_error(
-                                    "invalid_request",
-                                    "Attach failed to reserve a WebRTC channel",
-                                ));
-                            }
-                        }
                         pending_runtime.store_webrtc_reservation(
                             (
                                 grant_id.clone(),
                                 session_id.clone(),
                                 subscription_id.clone(),
-                                generation.0,
+                                webrtc_generation.0,
                             ),
                             WebrtcReservedAttach { grant_id },
                         );
@@ -5622,6 +5633,7 @@ pub(crate) struct PendingRuntimeState {
     unix_admissions: BTreeMap<String, UnixTerminalAdmission>,
     webrtc_admissions: BTreeMap<String, WebrtcTerminalAdmission>,
     webrtc_reservations: BTreeMap<(String, String, String, u64), WebrtcReservedAttach>,
+    webrtc_last_generation: BTreeMap<(String, String), u64>,
     close_work: Arc<AtomicBool>,
     host_compatibility: BTreeMap<String, HostCompatibilityRecord>,
 }
@@ -5650,6 +5662,24 @@ impl std::ops::DerefMut for PendingRuntimeState {
 impl PendingRuntimeState {
     fn take_close_work(&self) -> bool {
         self.close_work.swap(false, Ordering::SeqCst)
+    }
+
+    fn webrtc_last_generation(&self, session_id: &str, subscription_id: &str) -> Option<u64> {
+        self.webrtc_last_generation
+            .get(&(session_id.to_string(), subscription_id.to_string()))
+            .copied()
+    }
+
+    fn remember_webrtc_generation(
+        &mut self,
+        session_id: &str,
+        subscription_id: &str,
+        generation: u64,
+    ) {
+        self.webrtc_last_generation.insert(
+            (session_id.to_string(), subscription_id.to_string()),
+            generation,
+        );
     }
 
     fn store_webrtc_reservation(

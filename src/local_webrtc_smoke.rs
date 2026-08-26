@@ -89,7 +89,7 @@ pub(crate) fn smoke_local_webrtc_round_trip(
                 },
             )
             .await?;
-        offer_peer
+        let attach = offer_peer
             .encrypted_request(
                 &stream_key,
                 &DaemonRequest::Attach {
@@ -97,6 +97,12 @@ pub(crate) fn smoke_local_webrtc_round_trip(
                     subscription_id,
                 },
             )
+            .await?;
+        let label = attach.subscription_channel_label.ok_or_else(|| {
+            SmokeError::Webrtc("Attach missing reserved subscription channel label".to_string())
+        })?;
+        offer_peer
+            .open_reserved_subscription_channel(&label)
             .await?;
         offer_peer
             .encrypted_request(
@@ -321,6 +327,47 @@ impl LocalWebrtcOfferPeer {
         )
         .await
         .map_err(|_| SmokeError::Webrtc("timed out waiting for data channel open".to_string()))?;
+        Ok(())
+    }
+
+    async fn open_reserved_subscription_channel(&mut self, label: &str) -> Result<(), SmokeError> {
+        let runtime = default_runtime()
+            .ok_or_else(|| SmokeError::Webrtc("no async runtime found".to_string()))?;
+        let (open_tx, mut open_rx) = channel::<()>(1);
+        let data_channel = self
+            .peer
+            .create_data_channel(
+                label,
+                Some(RTCDataChannelInit {
+                    ordered: true,
+                    max_retransmits: None,
+                    max_packet_life_time: None,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map_err(|error| SmokeError::Webrtc(error.to_string()))?;
+        runtime.spawn(Box::pin(async move {
+            while let Some(event) = data_channel.poll().await {
+                match event {
+                    DataChannelEvent::OnOpen => {
+                        let _ = open_tx.try_send(());
+                    }
+                    DataChannelEvent::OnClose => break,
+                    _ => {}
+                }
+            }
+        }));
+        timeout(
+            webrtc_runtime().as_ref(),
+            Duration::from_secs(5),
+            open_rx.recv(),
+        )
+        .await
+        .map_err(|_| {
+            SmokeError::Webrtc("timed out waiting for reserved DataChannel open".to_string())
+        })?
+        .ok_or_else(|| SmokeError::Webrtc("reserved DataChannel closed before open".to_string()))?;
         Ok(())
     }
 

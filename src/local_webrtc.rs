@@ -6019,6 +6019,24 @@ mod tests {
                 .as_deref()
                 .expect("Attach returns the reserved subscription channel label")
                 .to_string();
+            assert!(
+                !self
+                    .state
+                    .pending_runtime
+                    .is_adapter_bound(session_id, subscription_id),
+                "admission must leave the Core adapter unbound"
+            );
+            let inventory = self
+                .daemon
+                .runtime()
+                .expect("hub runtime")
+                .list_terminal_subscriptions();
+            assert!(
+                inventory.iter().all(|row| {
+                    row.session_id.0 != session_id || row.subscription_id.0 != subscription_id
+                }),
+                "Core inventory must have no owner before the reserved channel opens: {inventory:?}"
+            );
             self.open_reserved_on_peer(peer, &label);
             let deadline = Instant::now() + Duration::from_secs(10);
             while Instant::now() < deadline

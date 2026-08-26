@@ -712,6 +712,7 @@ fn local_webrtc_chunks_oversized_encrypted_daemon_response() {
             .accept_answer(answer)
             .await
             .expect("offer peer accepts answer and opens channel");
+        offer_peer.grant_secret = Some(bootstrap.grant_secret.clone());
         offer_peer
             .encrypted_hello(
                 &stream_key,
@@ -863,6 +864,10 @@ fn local_webrtc_chunks_oversized_encrypted_daemon_response() {
             .await
             .expect("attach over encrypted WebRTC data channel");
         assert_eq!(attach.kind, botster_hub_client::DaemonResponseKind::Events);
+        offer_peer
+            .bind_reserved_from_attach(&attach)
+            .await
+            .expect("browser creates the reserved terminal DataChannel");
 
         let resize = offer_peer
             .encrypted_request(

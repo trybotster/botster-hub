@@ -49,6 +49,25 @@ pub(crate) fn forward_attach_bootstrap(
     }
 }
 
+pub(crate) fn handoff_webrtc_attach_dump(
+    handle: &WebRtcTerminalAdapterHandle,
+    egress: &[botster_core::TransportEgress],
+) {
+    for frame in egress {
+        let Ok(bytes) = serde_json::to_vec(frame) else {
+            continue;
+        };
+        let Ok(opaque) = botster_terminal_protocol::TerminalFrame::from_bytes(&bytes) else {
+            continue;
+        };
+        let Ok(encoded) = opaque.to_bytes() else {
+            continue;
+        };
+        handle.enqueue_attach_handoff(encoded);
+    }
+    handle.prime_attach_handoff();
+}
+
 impl BoundAdapterHandle {
     pub(crate) fn write_opaque_frame(&self, frame: &botster_terminal_protocol::TerminalFrame) {
         match self {
@@ -572,7 +591,7 @@ pub(crate) fn live_generation_for_route(
 
 pub(crate) fn next_webrtc_reservation_generation(
     inventory: &[TerminalSubscriptionRecord],
-    _client_id: &str,
+    last_known: Option<u64>,
     session_id: &str,
     subscription_id: &str,
 ) -> (
@@ -585,9 +604,22 @@ pub(crate) fn next_webrtc_reservation_generation(
     {
         Some(row) => (
             Some((row.client_id.0.clone(), row.generation)),
-            TerminalSubscriptionGeneration(row.generation.0 + 1),
+            TerminalSubscriptionGeneration(
+                row.generation.0.saturating_add(1).max(
+                    last_known
+                        .map(|generation| generation.saturating_add(1))
+                        .unwrap_or(1),
+                ),
+            ),
         ),
-        None => (None, TerminalSubscriptionGeneration(1)),
+        None => (
+            None,
+            TerminalSubscriptionGeneration(
+                last_known
+                    .map(|generation| generation.saturating_add(1))
+                    .unwrap_or(1),
+            ),
+        ),
     }
 }
 
@@ -867,7 +899,7 @@ pub(crate) fn bind_reserved_webrtc_adapter(
         generation,
         BoundAdapterHandle::WebRtc(handle.clone()),
     );
-    if !mux.arm_reserved(&label, handle.clone()) {
+    if !mux.bind_reserved(&label, handle.clone()) {
         fail_closed_pre_bind_attach(
             registry,
             runtime,
@@ -907,6 +939,16 @@ mod tests {
                 .authorize_drain("s", "sub", Some("client-a"), None)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn next_webrtc_reservation_generation_uses_last_known_when_inventory_is_empty() {
+        let (detach, generation) = next_webrtc_reservation_generation(&[], Some(3), "s", "sub");
+        assert!(detach.is_none());
+        assert_eq!(generation, TerminalSubscriptionGeneration(4));
+        let (detach, generation) = next_webrtc_reservation_generation(&[], None, "s", "sub");
+        assert!(detach.is_none());
+        assert_eq!(generation, TerminalSubscriptionGeneration(1));
     }
 
     #[test]

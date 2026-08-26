@@ -73,7 +73,7 @@ The approved plan section 2 lists 34 targeted notes plus the five gate-hygiene n
 
 ## What landed
 
-One RTCPeerConnection still owns one reliable ordered control DataChannel (`botster-client`). Attach authorizes, assigns a generation, charges section 9, inserts a `Reserved` route, and returns the exact label. Hub also starts Core attach at reserve and arms the content-blind adapter on that `Reserved` route so control `SendInput` and `Resize` stay live before the browser opens the channel. The browser creates that labeled terminal DataChannel after admission. Open validates identity, generation, peer, and route, then activates the armed route to `Bound`. Late, stale, mismatched, duplicate, unreserved, and over-limit opens close without bind. A `Reserved` route that never opens retires with `subscription_channel_open_timeout`, closes the armed handle, and does not call DataChannel `local_close`. Terminal output no longer shares the control write path.
+One RTCPeerConnection still owns one reliable ordered control DataChannel (`botster-client`). Attach authorizes, assigns a generation, charges section 9, inserts a `Reserved` route, and returns the exact label. Admission does not call Core `attach` or `bind_terminal_adapter`. The browser creates that labeled terminal DataChannel after admission. Open validates identity, generation, peer, and route, then Core-attaches and binds the content-blind adapter. Late, stale, mismatched, duplicate, unreserved, and over-limit opens close without bind. A `Reserved` route that never opens retires with `subscription_channel_open_timeout` and does not create a Core owner. Terminal output no longer shares the control write path.
 
 ## Review-return repairs (`review_1787700610_987769`)
 
@@ -100,13 +100,17 @@ This visit repaired the seven open Review findings without changing ticket inten
 - `finding_1787706019_286286`: installer `install.rs` compares `facts.mode` to exported `file_mode_bits(ARTIFACT_MODE)` instead of `u32::from(ARTIFACT_MODE)`. Full workspace Clippy `-D warnings` passed after that repair.
 - `finding_1787706019_555946`: this report and PR 210 record the new head, the 517/317 counts, and the Clippy repair.
 
-A delayed-attach-until-open experiment failed. Control `SendInput` and `Resize` require Core attach at reserve. The stable design is:
-
-1. Attach detaches any live same-session and same-subscription owner, starts Core attach, reserves the label, Core-binds the adapter, and arms the handle on a `Reserved` route.
-2. Browser open only calls `mux.activate_reserved`. It does not attach a second time.
-3. Reserved timeout calls `close_from_host()` on the armed handle, then retires the route. It still does not call DataChannel `local_close`.
-
 Same-client re-attach and cross-client steal both detach the live row and reserve `generation + 1`. Reuse of generation 1 returned `OperatorError` on host-close Attach.
+
+## Review-return repairs (`review_1787719554_794236`)
+
+This visit repaired the three open Review findings without changing ticket intent.
+
+- `finding_1787719554_916665`: Attach only reserves. `BindReservedWebrtcChannel` calls `begin_core_attach` and `bind_terminal_adapter` after identity, generation, peer, and route checks. `spawn_and_attach_on_peer` asserts Core inventory has no owner before open.
+- `finding_1787719554_607050`: Core `attach()` extracts dump only after open validation. Hub delivers that finite dump through `attach_handoff`, one frame after each slot clear. Live `try_write` stays one slot. `attach_handoff_delivers_the_second_frame_after_the_slot_clears` goes red if the second frame drops.
+- `finding_1787719554_253516`: GitHub `verify` now runs `cargo build --locked -p botster-core-daemon --bin botster-session-worker` and `cargo build --locked --bin botster-hub` before `./test.sh --locked`.
+
+Clients that still send input after Attach must open the reserved label first. The local WebRTC smoke offerer and the oversized encrypted-response proof now do that.
 
 `LOCAL_WEBRTC_CHANNEL_OPEN_BOUND` is 5 s in tests and production. A 200 ms test timer retired reserved routes before the browser opened the channel.
 
@@ -136,7 +140,7 @@ First Implement visit, same shell, `RUSTUP_TOOLCHAIN=1.97.0`, `CARGO_TARGET_DIR`
 | `cargo fmt --all -- --check` | pass |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | pass after the installer `file_mode_bits` repair |
 | `node packages/hub-test-support/scripts/sync-assets.mjs --check` | `hub test-support package assets are current` |
-| `./test.sh --locked` | first visit: exit 0. Hub lib 504 passed. Lifecycle 317 passed, 2 ignored. Elapsed 480616 ms. First Review return: exit 0. Hub lib 512 passed. Lifecycle 317 passed, 2 ignored. Elapsed 450573 ms. Second Review return: exit 0. Hub lib 517 passed. Lifecycle 317 passed, 2 ignored. Elapsed 437289 ms |
+| `./test.sh --locked` | first visit: exit 0. Hub lib 504 passed. Lifecycle 317 passed, 2 ignored. Elapsed 480616 ms. First Review return: exit 0. Hub lib 512 passed. Lifecycle 317 passed, 2 ignored. Elapsed 450573 ms. Second Review return: exit 0. Hub lib 517 passed. Lifecycle 317 passed, 2 ignored. Elapsed 437289 ms. Third Review return: exit 0. Hub lib 519 passed. Lifecycle 317 passed, 2 ignored. Elapsed 397602 ms |
 | `cd packages/hub-test-support && npm install --no-save && npm test` | `hub test-support package import and fixture materialization passed` |
 | `git diff --check a0c7141...HEAD` | pass |
 
@@ -192,16 +196,18 @@ Branch paths relative to `a0c7141`, including this report:
 - `docs/plans/isolate-control-and-terminal-subscriptions-on-dedicated-datachannels.md` — approved plan
 - `docs/reports/isolate-control-and-terminal-subscriptions-on-dedicated-datachannels-implement.md` — this report
 - `packages/hub-test-support/*` — unpublished `0.1.43`, revision 47, Node mirror literals
-- `src/daemon_attach_stream.rs` — Core-bind at reserve, `arm_reserved`, generation increment across any live owner
-- `src/daemon_transport.rs` — Attach reserve plus arm, grant-owned reservation with only `grant_id`, open-time `activate_reserved`
-- `src/local_webrtc.rs` — open-event activate, outstanding-byte refresh, encrypted ingress proofs, production timeout wake, grant-owned sweep order
+- `src/daemon_attach_stream.rs` — predicted reservation generation, Core-bind only after open, finite attach handoff
+- `src/daemon_transport.rs` — Attach reserves only. Open validates, then Core-attaches and binds
+- `src/local_webrtc.rs` — production Attach asserts no Core owner before open
+- `.github/workflows/ci.yml` — locked session-worker and Hub prebuild before `./test.sh --locked`
+- `src/local_webrtc_smoke.rs` — smoke offerer opens the reserved label after Attach
 - `crates/botster-hub-installation/src/lib.rs` — export `file_mode_bits`
 - `crates/botster-hub-installation/src/safety.rs` — Linux Clippy mode-bit conversion
 - `crates/botster-hub-installer/src/install.rs` — compare artifact mode with `file_mode_bits`
 - `src/runtime.rs`
 - `src/unix_terminal_adapter.rs`
 - `src/webrtc_subscription_channel.rs` — new module: labels, predicates, framing, flush
-- `src/webrtc_terminal_adapter.rs` — reserve, arm, activate, expire with host-close, one-slot write, aggregate
+- `src/webrtc_terminal_adapter.rs` — reserve, bind at open, finite attach handoff, one-slot live write, aggregate
 - `tests/hub_daemon_lifecycle/event_plane_saturation.rs`
 - `tests/hub_daemon_lifecycle/package_event_plane.rs`
 - `tests/hub_daemon_lifecycle/sessions.rs`
@@ -220,9 +226,7 @@ JSON input handlers remain, as answered earlier. Entity/event channels and Unix 
 
 The plan named a 200 ms test open bound. This return uses 5 s in tests and production. A 200 ms timer retired reserved routes before the browser opened the channel.
 
-The plan text says bind happens at open. Core attach and adapter arm happen at reserve so control `SendInput` and `Resize` stay live. The DataChannel route stays `Reserved` until open. Open only activates the armed handle.
-
-Hub no longer keeps a bootstrap remainder. Attach dump uses one-slot `try_write`. Extra attach frames drop with `Full`.
+Core `attach()` extracts dump before `bind_terminal_adapter` is legal. After open validation, Hub delivers that finite extracted dump through `attach_handoff`, one frame after each slot clear. Live `try_write` does not use that handoff. JSON `SendInput` and `Resize` stay, and clients must open the reserved channel before those handlers can use a Core owner.
 
 A25, A26, and A27 live 31-channel fill to exactly 2,097,152 B is proved at the mux unit layer (`a25_a26_a27_exact_aggregate_ceiling_refuses_before_write_and_drains_to_zero` and `live_outstanding_bytes_drive_thirty_one_channel_aggregate`). This visit did not add a live IsolatedHub 31-channel byte fill.
 
@@ -232,8 +236,9 @@ A27b Core `WRITE_ATTEMPT_BUDGET` hard-stop is proved by the live write-budget te
 
 - Site 3 is unpublished. Downstream Web/TUI tickets cannot consume `0.1.43` until a human publishes it and inspects the coordinate.
 - Live A25/A26/A27 31-channel IsolatedHub fill is not in this suite. Mux-level predicates and the live write-budget sibling test are.
-- Attach dump uses one slot at reserve. Extra attach frames drop. They do not wait in a Hub queue.
-- Core attach still starts at reserve. The DataChannel is not `Bound` until open.
+- Core attach and adapter bind start only after the reserved channel opens. `SendInput` before that open has no Core owner.
+- Attach dump after open uses a finite adapter handoff. Live writes stay one slot.
+- This visit did not wait for a new green GitHub Actions run after the CI prebuild edit.
 - Binary send still wraps JSON `DaemonLocalWebrtcDeliveryChunk`. This ticket did not add a new encrypted-binary framing DTO.
 - Official `./test.sh --locked` on this visit first failed `external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup` under load, then failed `owner_loop_queues_and_completes_two_fanout_plugin_handlers` under default lib concurrency. Isolated reruns passed. The later official suite passed once.
 - Browser and TUI channel-creation clients remain owned by their downstream tickets.
