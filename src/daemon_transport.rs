@@ -2508,6 +2508,7 @@ pub(crate) fn handle_control_message(
                 return false;
             }
             let Some(reservation) = state.pending_runtime.take_webrtc_reservation(
+                &grant_id,
                 &session_id,
                 &subscription_id,
                 generation,
@@ -2515,6 +2516,19 @@ pub(crate) fn handle_control_message(
                 let _ = reply_tx.send(Err("no_reservation"));
                 return false;
             };
+            if reservation.grant_id != grant_id {
+                state.pending_runtime.store_webrtc_reservation(
+                    (
+                        reservation.grant_id.clone(),
+                        session_id.clone(),
+                        subscription_id.clone(),
+                        generation,
+                    ),
+                    reservation,
+                );
+                let _ = reply_tx.send(Err("no_reservation"));
+                return false;
+            }
             let _ = (admitted_features, admitted_requirement);
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -2546,6 +2560,20 @@ pub(crate) fn handle_control_message(
                     let _ = reply_tx.send(Err("bind_failed"));
                 }
             }
+            false
+        }
+        ControlMessage::SweepWebrtcReservation {
+            grant_id,
+            session_id,
+            subscription_id,
+            generation,
+        } => {
+            state.pending_runtime.sweep_webrtc_reservation(
+                &grant_id,
+                &session_id,
+                &subscription_id,
+                generation,
+            );
             false
         }
         ControlMessage::SubscribeEntities {
@@ -2992,6 +3020,11 @@ pub(crate) fn handle_control_message(
             // Always include the closing grant so entity/attach sweep runs even if the peer
             // map entry was already gone (idempotent PeerClosed).
             removed_grants.insert(grant_id.clone());
+            for removed in &removed_grants {
+                state
+                    .pending_runtime
+                    .sweep_webrtc_reservations_for_grant(removed);
+            }
 
             // Snapshot IDs are only removed when the current row is unowned or still owned by a
             // removed grant. A reused subscription_id owned by a different live peer is preserved.
@@ -3763,7 +3796,7 @@ fn handle_runtime_control_request(
             let webrtc_admission = observability
                 .grant_id
                 .and_then(|grant_id| pending_runtime.webrtc_admissions.get(grant_id).cloned());
-            if observability.grant_id.is_some() {
+            if let Some(grant_id) = observability.grant_id {
                 let Some(WebrtcTerminalAdmission::Admitted {
                     required_features,
                     mux,
@@ -3805,15 +3838,23 @@ fn handle_runtime_control_request(
                     ));
                 };
                 pending_runtime.record_generation(&session_id, &subscription_id, generation);
+                let grant_id = grant_id.to_string();
                 return match mux.reserve_terminal(
+                    grant_id.clone(),
                     session_id.clone(),
                     subscription_id.clone(),
                     generation.0,
                 ) {
                     Ok(label) => {
                         pending_runtime.store_webrtc_reservation(
-                            (session_id.clone(), subscription_id.clone(), generation.0),
+                            (
+                                grant_id.clone(),
+                                session_id.clone(),
+                                subscription_id.clone(),
+                                generation.0,
+                            ),
                             WebrtcReservedAttach {
+                                grant_id,
                                 client_id: client_id.clone(),
                                 required_features: required_features.clone(),
                                 terminal_requirement: terminal_requirement.clone(),
@@ -5513,6 +5554,12 @@ pub(crate) enum ControlMessage {
         generation: u64,
         reply_tx: oneshot::Sender<Result<(), &'static str>>,
     },
+    SweepWebrtcReservation {
+        grant_id: String,
+        session_id: String,
+        subscription_id: String,
+        generation: u64,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -5548,6 +5595,7 @@ pub(crate) struct HostCompatibilityRecord {
 }
 
 struct WebrtcReservedAttach {
+    grant_id: String,
     client_id: String,
     required_features: Vec<String>,
     terminal_requirement: Option<botster_terminal_protocol::TerminalCompatibilityRequirement>,
@@ -5559,7 +5607,7 @@ pub(crate) struct PendingRuntimeState {
     pub(crate) streams: AttachStreamRegistry,
     unix_admissions: BTreeMap<String, UnixTerminalAdmission>,
     webrtc_admissions: BTreeMap<String, WebrtcTerminalAdmission>,
-    webrtc_reservations: BTreeMap<(String, String, u64), WebrtcReservedAttach>,
+    webrtc_reservations: BTreeMap<(String, String, String, u64), WebrtcReservedAttach>,
     close_work: Arc<AtomicBool>,
     host_compatibility: BTreeMap<String, HostCompatibilityRecord>,
 }
@@ -5592,23 +5640,49 @@ impl PendingRuntimeState {
 
     fn store_webrtc_reservation(
         &mut self,
-        key: (String, String, u64),
+        key: (String, String, String, u64),
         reservation: WebrtcReservedAttach,
     ) {
+        self.webrtc_reservations
+            .retain(|(grant_id, session_id, subscription_id, _), _| {
+                !(grant_id == &key.0 && session_id == &key.1 && subscription_id == &key.2)
+            });
         self.webrtc_reservations.insert(key, reservation);
     }
 
     fn take_webrtc_reservation(
         &mut self,
+        grant_id: &str,
         session_id: &str,
         subscription_id: &str,
         generation: u64,
     ) -> Option<WebrtcReservedAttach> {
         self.webrtc_reservations.remove(&(
+            grant_id.to_string(),
             session_id.to_string(),
             subscription_id.to_string(),
             generation,
         ))
+    }
+
+    fn sweep_webrtc_reservation(
+        &mut self,
+        grant_id: &str,
+        session_id: &str,
+        subscription_id: &str,
+        generation: u64,
+    ) {
+        self.webrtc_reservations.remove(&(
+            grant_id.to_string(),
+            session_id.to_string(),
+            subscription_id.to_string(),
+            generation,
+        ));
+    }
+
+    fn sweep_webrtc_reservations_for_grant(&mut self, grant_id: &str) {
+        self.webrtc_reservations
+            .retain(|(reserved_grant, _, _, _), _| reserved_grant != grant_id);
     }
 
     #[cfg(test)]
@@ -5627,6 +5701,27 @@ impl PendingRuntimeState {
     #[cfg(test)]
     pub(crate) fn has_host_compatibility_row(&self, grant_id: &str) -> bool {
         self.host_compatibility.contains_key(grant_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn webrtc_reservation_count(&self) -> usize {
+        self.webrtc_reservations.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_webrtc_reservation(
+        &self,
+        grant_id: &str,
+        session_id: &str,
+        subscription_id: &str,
+        generation: u64,
+    ) -> bool {
+        self.webrtc_reservations.contains_key(&(
+            grant_id.to_string(),
+            session_id.to_string(),
+            subscription_id.to_string(),
+            generation,
+        ))
     }
 }
 
@@ -10716,5 +10811,48 @@ mod tests {
             "successful enable must advance session-type generation after commit"
         );
         daemon.stop();
+    }
+
+    #[test]
+    fn webrtc_reservations_are_owned_by_grant_and_swept() {
+        let mut state = PendingRuntimeState::default();
+        let reservation = |grant: &str| WebrtcReservedAttach {
+            grant_id: grant.to_string(),
+            client_id: "c".into(),
+            required_features: vec![],
+            terminal_requirement: None,
+            bootstrap_egress: vec![],
+        };
+        state.store_webrtc_reservation(
+            ("g1".into(), "s".into(), "sub".into(), 1),
+            reservation("g1"),
+        );
+        state.store_webrtc_reservation(
+            ("g2".into(), "s".into(), "sub".into(), 1),
+            reservation("g2"),
+        );
+        assert_eq!(state.webrtc_reservation_count(), 2);
+        assert!(
+            state
+                .take_webrtc_reservation("g-wrong", "s", "sub", 1)
+                .is_none()
+        );
+        assert_eq!(state.webrtc_reservation_count(), 2);
+        assert!(state.take_webrtc_reservation("g1", "s", "sub", 1).is_some());
+        assert!(state.has_webrtc_reservation("g2", "s", "sub", 1));
+        state.sweep_webrtc_reservations_for_grant("g2");
+        assert_eq!(state.webrtc_reservation_count(), 0);
+
+        state.store_webrtc_reservation(
+            ("g1".into(), "s".into(), "sub".into(), 1),
+            reservation("g1"),
+        );
+        state.store_webrtc_reservation(
+            ("g1".into(), "s".into(), "sub".into(), 2),
+            reservation("g1"),
+        );
+        assert_eq!(state.webrtc_reservation_count(), 1);
+        assert!(state.has_webrtc_reservation("g1", "s", "sub", 2));
+        assert!(!state.has_webrtc_reservation("g1", "s", "sub", 1));
     }
 }

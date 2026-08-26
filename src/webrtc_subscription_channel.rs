@@ -17,10 +17,7 @@ pub(crate) const MAX_TOTAL_CHANNELS: usize = MAX_CONTROL_CHANNELS + MAX_SUBSCRIP
 pub(crate) const AGGREGATE_BUFFERED_HIGH: u32 = 2_097_152;
 pub(crate) const AGGREGATE_BUFFERED_LOW: u32 = 1_048_576;
 
-#[cfg(not(test))]
 pub(crate) const LOCAL_WEBRTC_CHANNEL_OPEN_BOUND: Duration = Duration::from_secs(5);
-#[cfg(test)]
-pub(crate) const LOCAL_WEBRTC_CHANNEL_OPEN_BOUND: Duration = Duration::from_millis(200);
 
 const LABEL_SCHEME: &str = "bs";
 const LABEL_VERSION: &str = "1";
@@ -248,7 +245,7 @@ fn hex_value(byte: u8) -> Option<u8> {
 use super::{
     LocalWebrtcDataChannel, LocalWebrtcError, LocalWebrtcFlowControl, LocalWebrtcPeerState,
     LocalWebrtcResult, LocalWebrtcSendFailure, PendingLocalWebrtcRequest,
-    frame_encrypted_daemon_delivery, random_token, send_response_frames,
+    frame_encrypted_daemon_delivery, random_token, send_subscription_frames,
 };
 
 pub(super) fn framed_daemon_terminal_frame(
@@ -277,6 +274,7 @@ pub(super) async fn flush_one_adapter_handle<D>(
     stream_key: &AesGcmKey,
     peer_state: &LocalWebrtcPeerState,
     label: &SubscriptionChannelLabel,
+    subscription_handle: &crate::webrtc_terminal_adapter::WebRtcTerminalAdapterHandle,
     pending_requests: &mut VecDeque<PendingLocalWebrtcRequest>,
     flow_control: &mut LocalWebrtcFlowControl,
 ) -> Result<(), LocalWebrtcSendFailure>
@@ -298,13 +296,14 @@ where
             return Ok(());
         }
     };
-    send_response_frames(
+    send_subscription_frames(
         data_channel,
         stream_key,
         &frames,
         pending_requests,
         flow_control,
         peer_state,
+        subscription_handle,
     )
     .await?;
     if !handle.is_closed() {

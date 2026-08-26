@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
+use std::future::Future;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
@@ -22,6 +23,7 @@ use botster_hub_client::{
     LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION, LOCAL_WEBRTC_MAX_DELIVERY_BYTES,
     LOCAL_WEBRTC_MAX_FRAME_BYTES, PROTOCOL,
 };
+use bytes::BytesMut;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot, watch};
@@ -122,6 +124,8 @@ trait LocalWebrtcDataChannel: Send + Sync {
     async fn local_set_buffered_amount_low_threshold(&self, threshold: u32) -> Result<(), String>;
     async fn local_set_buffered_amount_high_threshold(&self, threshold: u32) -> Result<(), String>;
     async fn local_send_text(&self, text: &str) -> Result<(), String>;
+    async fn local_send(&self, bytes: &[u8]) -> Result<(), String>;
+    async fn local_outstanding_bytes(&self) -> Result<u32, String>;
     async fn local_poll(&self) -> Option<DataChannelEvent>;
     async fn local_close(&self) -> Result<(), String>;
 }
@@ -146,6 +150,19 @@ where
     async fn local_send_text(&self, text: &str) -> Result<(), String> {
         self.send_text(text)
             .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn local_send(&self, bytes: &[u8]) -> Result<(), String> {
+        self.send(BytesMut::from(bytes))
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn local_outstanding_bytes(&self) -> Result<u32, String> {
+        self.outstanding_bytes()
+            .await
+            .map(|count| u32::try_from(count).unwrap_or(u32::MAX))
             .map_err(|error| error.to_string())
     }
 
@@ -1354,6 +1371,7 @@ impl LocalWebrtcHandler {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_text_or_peer_terminal<D>(
     data_channel: &D,
     stream_key: &AesGcmKey,
@@ -1362,6 +1380,7 @@ async fn send_text_or_peer_terminal<D>(
     flow_control: &mut LocalWebrtcFlowControl,
     mux: &WebRtcConnectionMux,
     peer_terminal_rx: &mut watch::Receiver<Option<LocalWebrtcTerminalCause>>,
+    subscription_handle: Option<&crate::webrtc_terminal_adapter::WebRtcTerminalAdapterHandle>,
 ) -> Result<(), LocalWebrtcTerminalCause>
 where
     D: LocalWebrtcDataChannel + ?Sized,
@@ -1369,8 +1388,12 @@ where
     if let Some(cause) = *peer_terminal_rx.borrow_and_update() {
         return Err(cause);
     }
-    let send = data_channel.local_send_text(frame);
-    tokio::pin!(send);
+    let mut send: std::pin::Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> =
+        if subscription_handle.is_some() {
+            Box::pin(data_channel.local_send(frame.as_bytes()))
+        } else {
+            Box::pin(data_channel.local_send_text(frame))
+        };
     let deadline = tokio::time::sleep(LOCAL_WEBRTC_PEER_CLOSE_BOUND);
     tokio::pin!(deadline);
     loop {
@@ -1387,6 +1410,7 @@ where
                         pending_requests,
                         flow_control,
                         mux,
+                        subscription_handle,
                     )?,
                     Ok(None) => return Err(LocalWebrtcTerminalCause::PollEnded),
                     Err(cause) => return Err(cause),
@@ -1420,6 +1444,16 @@ where
     }
 }
 
+async fn close_subscription_channel<D>(
+    data_channel: &D,
+    handle: &crate::webrtc_terminal_adapter::WebRtcTerminalAdapterHandle,
+) where
+    D: LocalWebrtcDataChannel + ?Sized,
+{
+    handle.close();
+    let _ = tokio::time::timeout(LOCAL_WEBRTC_PEER_CLOSE_BOUND, data_channel.local_close()).await;
+}
+
 async fn run_subscription_channel<D>(
     data_channel: &D,
     stream_key: &AesGcmKey,
@@ -1435,7 +1469,7 @@ where
     let mut peer_terminal_rx = peer_state.subscribe_peer_terminal();
     loop {
         if peer_terminal_rx.borrow_and_update().is_some() {
-            handle.close();
+            close_subscription_channel(data_channel, &handle).await;
             return None;
         }
         if let Err(failure) = flush_one_adapter_handle(
@@ -1443,17 +1477,17 @@ where
             stream_key,
             peer_state,
             &label,
+            &handle,
             &mut pending_requests,
             &mut flow_control,
         )
         .await
         {
-            handle.close();
+            close_subscription_channel(data_channel, &handle).await;
             return Some(failure);
         }
         if handle.is_closed() {
-            let _ = tokio::time::timeout(LOCAL_WEBRTC_PEER_CLOSE_BOUND, data_channel.local_close())
-                .await;
+            close_subscription_channel(data_channel, &handle).await;
             return None;
         }
         tokio::select! {
@@ -1467,22 +1501,31 @@ where
                     }
                     Ok(Some(DataChannelEvent::OnClose | DataChannelEvent::OnClosing))
                     | Ok(None) => {
-                        handle.close();
+                        close_subscription_channel(data_channel, &handle).await;
                         return None;
                     }
                     Ok(Some(DataChannelEvent::OnError)) => {
-                        handle.close();
+                        close_subscription_channel(data_channel, &handle).await;
                         return None;
                     }
                     Ok(Some(_)) => {}
                     Err(_) => {
-                        handle.close();
+                        close_subscription_channel(data_channel, &handle).await;
                         return None;
                     }
                 }
             }
             () = peer_state.mux.wait_for_write() => {}
         }
+    }
+}
+
+async fn sleep_until_reserved_open_deadline(mux: &WebRtcConnectionMux) {
+    match mux.next_reserved_deadline(Instant::now(), LOCAL_WEBRTC_CHANNEL_OPEN_BOUND) {
+        Some(deadline) => {
+            tokio::time::sleep(deadline.saturating_duration_since(Instant::now())).await;
+        }
+        None => std::future::pending::<()>().await,
     }
 }
 
@@ -1533,9 +1576,19 @@ where
             send_failure = Some(failure);
             break;
         }
-        peer_state
+        for (grant_id, session_id, subscription_id, generation) in peer_state
             .mux
-            .expire_reserved_opens(Instant::now(), LOCAL_WEBRTC_CHANNEL_OPEN_BOUND);
+            .expire_reserved_opens(Instant::now(), LOCAL_WEBRTC_CHANNEL_OPEN_BOUND)
+        {
+            let _ = runtime_tx
+                .send(ControlMessage::SweepWebrtcReservation {
+                    grant_id,
+                    session_id,
+                    subscription_id,
+                    generation,
+                })
+                .await;
+        }
         let pending = if let Some(request) = pop_pending_request(&mut pending_requests) {
             request
         } else {
@@ -1569,6 +1622,9 @@ where
                     }
                 } => LocalWebrtcInbound::HostEventReady,
                 _ = peer_state.mux.wait_for_write() => {
+                    LocalWebrtcInbound::AdapterReady
+                }
+                _ = sleep_until_reserved_open_deadline(&peer_state.mux) => {
                     LocalWebrtcInbound::AdapterReady
                 }
             };
@@ -1623,6 +1679,7 @@ where
                         &mut pending_requests,
                         &mut flow_control,
                         &peer_state.mux,
+                        None,
                     );
                     continue;
                 }
@@ -1944,6 +2001,54 @@ async fn send_response_frames<D>(
 where
     D: LocalWebrtcDataChannel + ?Sized,
 {
+    send_response_frames_inner(
+        data_channel,
+        stream_key,
+        frames,
+        pending_requests,
+        flow_control,
+        peer_state,
+        None,
+    )
+    .await
+}
+
+async fn send_subscription_frames<D>(
+    data_channel: &D,
+    stream_key: &AesGcmKey,
+    frames: &[String],
+    pending_requests: &mut VecDeque<PendingLocalWebrtcRequest>,
+    flow_control: &mut LocalWebrtcFlowControl,
+    peer_state: &LocalWebrtcPeerState,
+    subscription_handle: &crate::webrtc_terminal_adapter::WebRtcTerminalAdapterHandle,
+) -> Result<(), LocalWebrtcSendFailure>
+where
+    D: LocalWebrtcDataChannel + ?Sized,
+{
+    send_response_frames_inner(
+        data_channel,
+        stream_key,
+        frames,
+        pending_requests,
+        flow_control,
+        peer_state,
+        Some(subscription_handle),
+    )
+    .await
+}
+
+async fn send_response_frames_inner<D>(
+    data_channel: &D,
+    stream_key: &AesGcmKey,
+    frames: &[String],
+    pending_requests: &mut VecDeque<PendingLocalWebrtcRequest>,
+    flow_control: &mut LocalWebrtcFlowControl,
+    peer_state: &LocalWebrtcPeerState,
+    subscription_handle: Option<&crate::webrtc_terminal_adapter::WebRtcTerminalAdapterHandle>,
+) -> Result<(), LocalWebrtcSendFailure>
+where
+    D: LocalWebrtcDataChannel + ?Sized,
+{
     let mut peer_terminal_rx = peer_state.subscribe_peer_terminal();
     let total_chunks = frames.len();
     let message_id = frames.first().and_then(|frame| {
@@ -1975,6 +2080,7 @@ where
                     pending_requests,
                     flow_control,
                     &peer_state.mux,
+                    subscription_handle,
                 )
                 .map_err(|cause| failure(chunk_index, cause, flow_control))?,
                 Ok(None) => {
@@ -1998,10 +2104,16 @@ where
             flow_control,
             &peer_state.mux,
             &mut peer_terminal_rx,
+            subscription_handle,
         )
         .await
         {
             return Err(failure(chunk_index, cause, flow_control));
+        }
+        if let Some(handle) = subscription_handle
+            && let Ok(outstanding) = data_channel.local_outstanding_bytes().await
+        {
+            handle.set_buffered_bytes(outstanding);
         }
         peer_state.record_response_progress(chunk_index + 1, flow_control.pressured);
 
@@ -2019,6 +2131,7 @@ where
                     pending_requests,
                     flow_control,
                     &peer_state.mux,
+                    subscription_handle,
                 )
                 .map_err(|cause| failure(chunk_index + 1, cause, flow_control))?;
             }
@@ -2041,6 +2154,7 @@ fn apply_data_channel_event(
     pending_requests: &mut VecDeque<PendingLocalWebrtcRequest>,
     flow_control: &mut LocalWebrtcFlowControl,
     _mux: &WebRtcConnectionMux,
+    subscription_handle: Option<&crate::webrtc_terminal_adapter::WebRtcTerminalAdapterHandle>,
 ) -> Result<(), LocalWebrtcTerminalCause> {
     match event {
         DataChannelEvent::OnBufferedAmountHigh => {
@@ -2055,6 +2169,13 @@ fn apply_data_channel_event(
             Ok(())
         }
         DataChannelEvent::OnMessage(message) => {
+            if let Some(handle) = subscription_handle {
+                if let Some(bytes) = decrypt_subscription_ingress(stream_key, message.data.as_ref())
+                {
+                    handle.push_ingress_frame(bytes);
+                }
+                return Ok(());
+            }
             let pending = match decrypt_data_channel_plaintext(stream_key, message.data.as_ref()) {
                 Some(DataChannelPlaintext::Hello(hello)) => PendingLocalWebrtcRequest::Hello(hello),
                 Some(DataChannelPlaintext::Request(request)) => {
@@ -2695,6 +2816,8 @@ mod tests {
     struct FakeDataChannel {
         events: Mutex<VecDeque<DataChannelEvent>>,
         sent: Mutex<Vec<String>>,
+        sent_binary: Mutex<Vec<Vec<u8>>>,
+        outstanding: std::sync::atomic::AtomicU32,
         closed: AtomicBool,
         send_fails: AtomicBool,
         send_hangs: AtomicBool,
@@ -2721,28 +2844,15 @@ mod tests {
         }
 
         async fn local_send_text(&self, text: &str) -> Result<(), String> {
-            while self.send_hangs.load(Ordering::Acquire) {
-                let notified = self.send_notify.notified();
-                tokio::pin!(notified);
-                if !self.send_hangs.load(Ordering::Acquire) {
-                    break;
-                }
-                notified.await;
-            }
-            if self.send_fails.load(Ordering::Acquire) {
-                return Err("fixture send failure".to_string());
-            }
-            if self
-                .events
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|event| matches!(event, DataChannelEvent::OnBufferedAmountLow))
-            {
-                self.sent_before_low_water.store(true, Ordering::Release);
-            }
-            self.sent.lock().unwrap().push(text.to_string());
-            Ok(())
+            self.record_send(text.as_bytes(), true).await
+        }
+
+        async fn local_send(&self, bytes: &[u8]) -> Result<(), String> {
+            self.record_send(bytes, false).await
+        }
+
+        async fn local_outstanding_bytes(&self) -> Result<u32, String> {
+            Ok(self.outstanding.load(Ordering::SeqCst))
         }
 
         async fn local_poll(&self) -> Option<DataChannelEvent> {
@@ -2765,6 +2875,43 @@ mod tests {
     }
 
     impl FakeDataChannel {
+        async fn record_send(&self, bytes: &[u8], as_text: bool) -> Result<(), String> {
+            while self.send_hangs.load(Ordering::Acquire) {
+                let notified = self.send_notify.notified();
+                tokio::pin!(notified);
+                if !self.send_hangs.load(Ordering::Acquire) {
+                    break;
+                }
+                notified.await;
+            }
+            if self.send_fails.load(Ordering::Acquire) {
+                return Err("fixture send failure".to_string());
+            }
+            if self
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, DataChannelEvent::OnBufferedAmountLow))
+            {
+                self.sent_before_low_water.store(true, Ordering::Release);
+            }
+            self.outstanding
+                .fetch_add(bytes.len() as u32, Ordering::SeqCst);
+            if as_text {
+                self.sent
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(bytes).into_owned());
+            } else {
+                self.sent_binary.lock().unwrap().push(bytes.to_vec());
+                if let Ok(text) = std::str::from_utf8(bytes) {
+                    self.sent.lock().unwrap().push(text.to_string());
+                }
+            }
+            Ok(())
+        }
+
         fn push_event(&self, event: DataChannelEvent) {
             self.events.lock().unwrap().push_back(event);
             self.event_notify.notify_waiters();
@@ -3516,6 +3663,7 @@ mod tests {
                 &mut pending,
                 &mut flow_control,
                 &WebRtcConnectionMux::new(),
+                None,
             )
             .is_ok()
         );
@@ -3528,6 +3676,7 @@ mod tests {
                 &mut pending,
                 &mut flow_control,
                 &WebRtcConnectionMux::new(),
+                None,
             )
             .is_ok()
         );
@@ -3540,6 +3689,7 @@ mod tests {
                 &mut pending,
                 &mut flow_control,
                 &WebRtcConnectionMux::new(),
+                None,
             )
             .is_ok()
         );
@@ -3579,6 +3729,7 @@ mod tests {
                 &mut pending,
                 &mut flow_control,
                 &mux,
+                None,
             )
             .is_ok()
         );
@@ -3947,6 +4098,7 @@ mod tests {
                 &mut pending,
                 &mut flow_control,
                 &WebRtcConnectionMux::new(),
+                None,
             )
             .is_ok()
         );
@@ -4097,6 +4249,137 @@ mod tests {
         assert_eq!(send.cause, LocalWebrtcTerminalCause::SendText);
         assert_eq!(send.next_chunk_index, 0);
         assert_eq!(send.last_sent_chunk_index, None);
+    }
+
+    #[test]
+    fn subscription_flush_sends_binary_and_records_outstanding() {
+        let data_channel = FakeDataChannel::default();
+        let key = AesGcmKey::from_slice(&[16; 32]).unwrap();
+        let peer_state = test_peer_state("grant-binary-flush");
+        let label = peer_state
+            .mux
+            .reserve_terminal("grant-binary-flush".into(), "s".into(), "sub".into(), 1)
+            .expect("reserve");
+        let (_adapter, handle) = peer_state.mux.create_adapter();
+        assert!(peer_state.mux.bind_reserved(&label, handle.clone()));
+        let frame = botster_terminal_protocol::TerminalFrame::from_bytes(
+            br#"{"type":"terminal_output","marker":"bin"}"#,
+        )
+        .expect("frame");
+        handle.write_opaque_frame(&frame);
+        let mut pending = VecDeque::new();
+        let mut flow_control = LocalWebrtcFlowControl::default();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime
+            .block_on(flush_one_adapter_handle(
+                &data_channel,
+                &key,
+                &peer_state,
+                &label,
+                &handle,
+                &mut pending,
+                &mut flow_control,
+            ))
+            .expect("flush");
+        assert!(
+            !data_channel.sent_binary.lock().unwrap().is_empty(),
+            "subscription output must use binary DataChannel messages"
+        );
+        assert!(
+            handle.buffered_bytes() > 0,
+            "flush must copy live outstanding bytes into the aggregate"
+        );
+        let chunk: DaemonLocalWebrtcDeliveryChunk =
+            serde_json::from_slice(&data_channel.sent_binary.lock().unwrap()[0])
+                .expect("binary payload stays a delivery chunk");
+        assert_eq!(
+            chunk.delivery_kind,
+            DaemonLocalWebrtcDeliveryKind::DaemonTerminalFrame
+        );
+    }
+
+    #[test]
+    fn subscription_send_failure_closes_the_channel() {
+        let data_channel = FakeDataChannel::default();
+        data_channel.send_fails.store(true, Ordering::Release);
+        data_channel.poll_ends.store(true, Ordering::Release);
+        let key = AesGcmKey::from_slice(&[16; 32]).unwrap();
+        let peer_state = test_peer_state("grant-sub-close");
+        let label = peer_state
+            .mux
+            .reserve_terminal("grant-sub-close".into(), "s".into(), "sub".into(), 1)
+            .expect("reserve");
+        let (_adapter, handle) = peer_state.mux.create_adapter();
+        assert!(peer_state.mux.bind_reserved(&label, handle.clone()));
+        let frame = botster_terminal_protocol::TerminalFrame::from_bytes(
+            br#"{"type":"terminal_output","marker":"fail"}"#,
+        )
+        .expect("frame");
+        handle.write_opaque_frame(&frame);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let failure = runtime.block_on(run_subscription_channel(
+            &data_channel,
+            &key,
+            &peer_state,
+            handle.clone(),
+            label,
+        ));
+        assert!(failure.is_some(), "send failure must surface");
+        assert!(
+            data_channel.closed.load(Ordering::Acquire),
+            "send failure must still run bounded local_close"
+        );
+        assert!(handle.is_closed());
+    }
+
+    #[test]
+    fn subscription_flush_keeps_terminal_input_off_the_control_parser() {
+        let data_channel = FakeDataChannel::default();
+        data_channel.push_event(DataChannelEvent::OnMessage(RTCDataChannelMessage {
+            is_string: false,
+            data: b"core-terminal-input".as_slice().into(),
+        }));
+        let key = AesGcmKey::from_slice(&[16; 32]).unwrap();
+        let peer_state = test_peer_state("grant-sub-ingress");
+        let label = peer_state
+            .mux
+            .reserve_terminal("grant-sub-ingress".into(), "s".into(), "sub".into(), 1)
+            .expect("reserve");
+        let (_adapter, handle) = peer_state.mux.create_adapter();
+        assert!(peer_state.mux.bind_reserved(&label, handle.clone()));
+        handle.write_opaque_frame(
+            &botster_terminal_protocol::TerminalFrame::from_bytes(
+                br#"{"type":"terminal_output","marker":"out"}"#,
+            )
+            .expect("frame"),
+        );
+        let mut pending = VecDeque::new();
+        let mut flow_control = LocalWebrtcFlowControl::default();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime
+            .block_on(flush_one_adapter_handle(
+                &data_channel,
+                &key,
+                &peer_state,
+                &label,
+                &handle,
+                &mut pending,
+                &mut flow_control,
+            ))
+            .expect("terminal input during output must not close the subscription");
+        assert!(
+            pending.is_empty(),
+            "subscription OnMessage must not enter the control request parser"
+        );
     }
 
     #[test]
@@ -4334,6 +4617,7 @@ mod tests {
                     &mut pending,
                     &mut flow_control,
                     &WebRtcConnectionMux::new(),
+                    None,
                 )
                 .is_ok()
             );
@@ -4376,6 +4660,7 @@ mod tests {
                     &mut pending,
                     &mut flow_control,
                     &WebRtcConnectionMux::new(),
+                    None,
                 )
             };
 
@@ -4396,6 +4681,7 @@ mod tests {
                 &mut pending,
                 &mut flow_control,
                 &WebRtcConnectionMux::new(),
+                None,
             )
             .is_ok()
         );
@@ -4406,6 +4692,7 @@ mod tests {
                 &mut pending,
                 &mut flow_control,
                 &WebRtcConnectionMux::new(),
+                None,
             )
             .is_ok()
         );

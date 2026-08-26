@@ -504,7 +504,7 @@ impl FileHandle {
         let status = fstat(self.as_raw_fd(), subject)?;
         Ok(FileFacts {
             uid: status.st_uid,
-            mode: u32::from(status.st_mode) & 0o7777,
+            mode: file_mode_bits(status.st_mode),
             size: u64::try_from(status.st_size).unwrap_or(0),
         })
     }
@@ -567,6 +567,12 @@ pub fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
+#[allow(clippy::unnecessary_cast, clippy::useless_conversion)]
+fn file_mode_bits(mode: libc::mode_t) -> u32 {
+    // `mode_t` is `u16` on macOS and `u32` on Linux.
+    u32::from(mode) & 0o7777
+}
+
 fn validate_owned_private_status(
     status: &libc::stat,
     subject: &'static str,
@@ -577,7 +583,7 @@ fn validate_owned_private_status(
             format!("installation {subject} is not owned by the current user"),
         ));
     }
-    if u32::from(status.st_mode) & 0o002 != 0 {
+    if file_mode_bits(status.st_mode) & 0o002 != 0 {
         return Err(InstallationProblem::new(
             "receipt_world_writable",
             format!("installation {subject} must not be world-writable"),
