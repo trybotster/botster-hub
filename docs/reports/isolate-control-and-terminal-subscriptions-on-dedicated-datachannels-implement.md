@@ -110,6 +110,46 @@ This visit repaired the three open Review findings without changing ticket inten
 - `finding_1787719554_607050`: Core `attach()` extracts dump only after open validation. Hub delivers that finite dump through `attach_handoff`, one frame after each slot clear. Live `try_write` stays one slot. `attach_handoff_delivers_the_second_frame_after_the_slot_clears` goes red if the second frame drops.
 - `finding_1787719554_253516`: GitHub `verify` now runs `cargo build --locked -p botster-core-daemon --bin botster-session-worker` and `cargo build --locked --bin botster-hub` before `./test.sh --locked`.
 
+## Review-return parking (`review_1787763686_531984`)
+
+Question `question_1787768250_921634` required this Hub visit to wait for Core. This visit must not continue to Review with the attach-dump gap as residual.
+
+Registered Core work:
+
+| Field | Value |
+| --- | --- |
+| Core ticket | `ticket_1787768219_768283` |
+| Core target | `tgt_1f7bce66eb304881980f9b4a2a5ae3fe` (`botster-core`) |
+| Core run | `run_1787768249_446859` (`botster_stack_delivery`, Plan) |
+| Dependency | `dependency_1787768226_190452` |
+| Parent Hub run | `run_1787678814_340532` |
+| Hub head while parked | this commit on `project-pipelines/ticket_1787600674_500120` |
+| Locked Core SHA | `358ef1a6bf0f792f6da10d60890be39cb16779d0` |
+
+Ownership rule kept on this Hub branch:
+
+- Core owns READY, HISTORY, FINISH, Attached, ordering, pressure, and lossless attach delivery.
+- Hub must not add an attach-frame queue.
+- Hub must not retain a hidden dump or tail.
+- Hub must not drop extracted attach frames.
+- Hub must bind only through the corrected Core contract.
+
+`finding_1787763686_257426` stays open. Pinned Core `358ef1a` extracts matching attach frames in `attach()` and rejects `bind_terminal_adapter` before that attach. Hub cannot keep the extracted tail without a queue.
+
+`finding_1787763686_945566` stays open. Isolated `external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup` still fails on some IsolatedHub rounds with `got []`. A Hub-only bind-time pump gate (skip `mark_pump` while the one slot is Full) made the first round fail. That repair depends on the missing Core retain contract, so it was not kept.
+
+This visit did not submit `botster_stack_implement_gate`. This visit did not request Review.
+
+After `ticket_1787768219_768283` merges:
+
+- Update the Hub Core pin to the Core merge commit.
+- Rebase or refresh this branch against current Hub main.
+- Remove temporary Hub attach retention (`write_first_webrtc_attach_frame`).
+- Prove READY, HISTORY, FINISH, and Attached reach the bound adapter in order.
+- Prove live output follows without a Hub queue.
+- Rerun every strict Hub gate.
+- Request a new Review. Do not waive `review_1787763686_531984`.
+
 ## Review-return repairs (`review_1787760007_932950`)
 
 This visit repaired the two open Review findings without changing ticket intent.
@@ -244,7 +284,8 @@ A27b Core `WRITE_ATTEMPT_BUDGET` hard-stop is proved by the live write-budget te
 - Site 3 is unpublished. Downstream Web/TUI tickets cannot consume `0.1.43` until a human publishes it and inspects the coordinate.
 - Live A25/A26/A27 31-channel IsolatedHub fill is not in this suite. Mux-level predicates and the live write-budget sibling test are.
 - Core attach and adapter bind start only after the reserved channel opens. `SendInput` before that open has no Core owner.
-- Core `attach()` may still extract a pre-bind residue. Hub writes at most that first frame into the one slot. Extra extracted frames are not stored.
+- Core `attach()` may still extract a pre-bind residue. Hub writes at most that first frame into the one slot. Extra extracted frames are not stored. This is blocked on `ticket_1787768219_768283`, not residual risk.
+- Isolated `external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup` still flakes with empty live bytes on some rounds. A Hub-only Full-pump skip was not kept.
 - This visit will record the new GitHub Verify result after the push. Isolated live-output proofs passed after the queue removal.
 - Binary send still wraps JSON `DaemonLocalWebrtcDeliveryChunk`. This ticket did not add a new encrypted-binary framing DTO.
 - Official `./test.sh --locked` on this visit first failed `external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup` under load, then failed `owner_loop_queues_and_completes_two_fanout_plugin_handlers` under default lib concurrency. Isolated reruns passed. The later official suite passed once.
