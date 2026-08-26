@@ -49,23 +49,22 @@ pub(crate) fn forward_attach_bootstrap(
     }
 }
 
-pub(crate) fn handoff_webrtc_attach_dump(
+/// Write at most one already-extracted attach residue into the one-slot adapter.
+/// Later incremental and live frames stay in Core.
+pub(crate) fn write_first_webrtc_attach_frame(
     handle: &WebRtcTerminalAdapterHandle,
     egress: &[botster_core::TransportEgress],
 ) {
-    for frame in egress {
-        let Ok(bytes) = serde_json::to_vec(frame) else {
-            continue;
-        };
-        let Ok(opaque) = botster_terminal_protocol::TerminalFrame::from_bytes(&bytes) else {
-            continue;
-        };
-        let Ok(encoded) = opaque.to_bytes() else {
-            continue;
-        };
-        handle.enqueue_attach_handoff(encoded);
-    }
-    handle.prime_attach_handoff();
+    let Some(frame) = egress.first() else {
+        return;
+    };
+    let Ok(bytes) = serde_json::to_vec(frame) else {
+        return;
+    };
+    let Ok(opaque) = botster_terminal_protocol::TerminalFrame::from_bytes(&bytes) else {
+        return;
+    };
+    handle.write_opaque_frame(&opaque);
 }
 
 impl BoundAdapterHandle {
