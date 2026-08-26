@@ -2838,7 +2838,7 @@ fn phase_dataset_body(
         "host_validity": host_validity.json(),
         "revisions": {
             "source_revision": source_revision,
-            "botster_core": "358ef1a6bf0f792f6da10d60890be39cb16779d0",
+            "botster_core": "9cabdfd0588b6c7ed2e121e7b50086ce2a250ec6",
             "calibration_dataset_commit": git_path_commit(&calibration_path()),
             "acceptance_revision": match phase {
                 CampaignPhase::Acceptance => std::env::var("SUBJECT_SHA").ok(),

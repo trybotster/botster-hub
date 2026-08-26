@@ -3582,6 +3582,32 @@ impl HubRuntime {
             .cloned()
     }
 
+    /// Record that the next attach for this identity will bind an adapter.
+    pub fn expect_terminal_adapter(
+        &self,
+        client_id: ClientId,
+        session_id: SessionId,
+        subscription_id: SubscriptionId,
+    ) -> Result<(), CoreDaemonError> {
+        self.core_daemon
+            .lock()
+            .expect("core daemon mutex")
+            .expect_terminal_adapter(client_id, session_id, subscription_id)
+    }
+
+    /// Retire an unconsumed pre-attach adapter declaration.
+    pub fn cancel_expected_terminal_adapter(
+        &self,
+        client_id: &ClientId,
+        session_id: SessionId,
+        subscription_id: SubscriptionId,
+    ) -> Result<(), CoreDaemonError> {
+        self.core_daemon
+            .lock()
+            .expect("core daemon mutex")
+            .cancel_expected_terminal_adapter(client_id, session_id, subscription_id)
+    }
+
     /// Attach a client subscription to a session through the core daemon.
     pub fn attach_client(
         &mut self,

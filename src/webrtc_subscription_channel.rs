@@ -18,6 +18,8 @@ pub(crate) const AGGREGATE_BUFFERED_HIGH: u32 = 2_097_152;
 pub(crate) const AGGREGATE_BUFFERED_LOW: u32 = 1_048_576;
 
 pub(crate) const LOCAL_WEBRTC_CHANNEL_OPEN_BOUND: Duration = Duration::from_secs(5);
+/// Owner bind after a reserved channel opens. This is not the never-open sweep.
+pub(crate) const LOCAL_WEBRTC_RESERVED_BIND_REPLY_BOUND: Duration = Duration::from_secs(30);
 
 const LABEL_SCHEME: &str = "bs";
 const LABEL_VERSION: &str = "1";
@@ -277,7 +279,7 @@ pub(super) async fn flush_one_adapter_handle<D>(
     subscription_handle: &crate::webrtc_terminal_adapter::WebRtcTerminalAdapterHandle,
     pending_requests: &mut VecDeque<PendingLocalWebrtcRequest>,
     flow_control: &mut LocalWebrtcFlowControl,
-) -> Result<(), LocalWebrtcSendFailure>
+) -> Result<bool, LocalWebrtcSendFailure>
 where
     D: LocalWebrtcDataChannel + ?Sized,
 {
@@ -286,14 +288,14 @@ where
         &label.subscription_id,
         label.generation,
     ) else {
-        return Ok(());
+        return Ok(false);
     };
     peer_state.begin_operation("terminal_delivery");
     let frames = match framed_daemon_terminal_frame(stream_key, &bytes) {
         Ok(frames) => frames,
         Err(_) => {
             handle.close();
-            return Ok(());
+            return Ok(false);
         }
     };
     send_subscription_frames(
@@ -306,10 +308,10 @@ where
         subscription_handle,
     )
     .await?;
-    if !handle.is_closed() {
-        let _ = handle.complete_active();
+    if handle.is_closed() {
+        return Ok(false);
     }
-    Ok(())
+    Ok(handle.complete_active().is_some())
 }
 
 #[cfg(test)]
@@ -323,6 +325,27 @@ mod tests {
     use botster_core::AesGcmKey;
     use botster_core::contract::terminal_adapter::TerminalAdapter;
     use botster_hub_client::{DaemonLocalWebrtcDeliveryChunk, DaemonLocalWebrtcDeliveryKind};
+
+    #[test]
+    fn reserved_open_stops_the_never_open_sweep_before_bind() {
+        let source = include_str!("local_webrtc.rs");
+        let func = source
+            .split("async fn handle_subscription_open")
+            .nth(1)
+            .expect("handle_subscription_open");
+        let func = func
+            .split("async fn send_text_or_peer_terminal")
+            .next()
+            .expect("function body");
+        assert!(
+            func.contains("mark_reserved_open_in_flight"),
+            "open must stop the never-open sweep before Bind is queued"
+        );
+        assert!(
+            func.contains("LOCAL_WEBRTC_RESERVED_BIND_REPLY_BOUND"),
+            "bind reply wait is not the never-open sweep"
+        );
+    }
 
     #[test]
     fn terminal_frame_chunks_are_one_delivery_and_complete_once() {

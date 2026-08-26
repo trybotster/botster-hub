@@ -301,6 +301,20 @@ fn external_hub_webrtc_live_output_preserves_exact_bytes() {
             .await
             .expect("offer peer accepts answer");
         offer_peer.grant_secret = Some(bootstrap.grant_secret.clone());
+        offer_peer
+            .encrypted_hello(
+                &stream_key,
+                &botster_hub_client::DaemonHello {
+                    protocol: botster_hub_client::PROTOCOL.to_string(),
+                    compatibility: botster_hub_client::DaemonCompatibilityRequirement::for_webrtc_terminal_adapter(),
+                    terminal_compatibility: Some(
+                        botster_terminal_protocol::TerminalCompatibilityRequirement::for_ready_then_history_attach(
+                        ),
+                    ),
+                },
+            )
+            .await
+            .expect("webrtc adapter hello");
 
         let release_path = unique_short_test_dir("webrtc-exact-release").join("go");
         let script_path = write_python_wait_then_write_script(&release_path, expected);
@@ -316,17 +330,6 @@ fn external_hub_webrtc_live_output_preserves_exact_bytes() {
             hub.data_dir(),
             "webrtc-exact-bytes-session",
         ));
-        offer_peer
-            .encrypted_hello(
-                &stream_key,
-                &botster_hub_client::DaemonHello {
-                    protocol: botster_hub_client::PROTOCOL.to_string(),
-                    compatibility: botster_hub_client::DaemonCompatibilityRequirement::for_webrtc_terminal_adapter(),
-                    terminal_compatibility: None,
-                },
-            )
-            .await
-            .expect("webrtc adapter hello");
         let attach = offer_peer
             .encrypted_request(
                 &stream_key,
@@ -346,20 +349,21 @@ fn external_hub_webrtc_live_output_preserves_exact_bytes() {
             .bind_reserved_from_attach(&attach)
             .await
             .expect("browser creates the reserved terminal DataChannel");
+        let _ = botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status);
+        offer_peer
+            .wait_until_attach_started(
+                &stream_key,
+                &endpoint,
+                "webrtc-exact-bytes-session",
+            )
+            .await
+            .expect("Core attach reaches the reserved channel before live output");
         fs::create_dir_all(release_path.parent().expect("release parent"))
             .expect("create webrtc release dir");
         fs::write(&release_path, b"go").expect("release webrtc write(2) producer");
 
         let mut concatenated = Vec::new();
         for _ in 0..120 {
-            let _ = offer_peer
-                .encrypted_request(
-                    &stream_key,
-                    &botster_hub_client::DaemonRequest::ReadScreen {
-                        session_id: "webrtc-exact-bytes-session".to_string(),
-                    },
-                )
-                .await;
             if let Ok(Ok(bytes)) = timeout(
                 Duration::from_millis(250),
                 offer_peer.next_terminal_frame(&stream_key),
@@ -501,6 +505,22 @@ fn external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup() {
                 .await
                 .expect("offer peer accepts answer");
             offer_peer.grant_secret = Some(bootstrap.grant_secret.clone());
+            offer_peer
+                .encrypted_hello(
+                    &stream_key,
+                    &botster_hub_client::DaemonHello {
+                        protocol: botster_hub_client::PROTOCOL.to_string(),
+                        compatibility:
+                            botster_hub_client::DaemonCompatibilityRequirement::for_webrtc_terminal_adapter(
+                            ),
+                        terminal_compatibility: Some(
+                            botster_terminal_protocol::TerminalCompatibilityRequirement::for_ready_then_history_attach(
+                            ),
+                        ),
+                    },
+                )
+                .await
+                .expect("webrtc adapter hello");
 
             let release_path = unique_short_test_dir(&format!("webrtc-sd-rel-{round}")).join("go");
             let script_path = write_python_wait_then_write_script(&release_path, expected);
@@ -513,19 +533,6 @@ fn external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup() {
             )
             .expect("spawn write(2) producer that exits after output");
             session_cleanup = Some(SessionCleanupGuard::new(hub.data_dir(), session_id.clone()));
-            offer_peer
-                .encrypted_hello(
-                    &stream_key,
-                    &botster_hub_client::DaemonHello {
-                        protocol: botster_hub_client::PROTOCOL.to_string(),
-                        compatibility:
-                            botster_hub_client::DaemonCompatibilityRequirement::for_webrtc_terminal_adapter(
-                            ),
-                        terminal_compatibility: None,
-                    },
-                )
-                .await
-                .expect("webrtc adapter hello");
             let attach = offer_peer
                 .encrypted_request(
                     &stream_key,
@@ -545,37 +552,45 @@ fn external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup() {
                 .bind_reserved_from_attach(&attach)
                 .await
                 .expect("browser creates the reserved terminal DataChannel");
+            let _ = botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status);
+            if let Err(error) = offer_peer
+                .wait_until_attach_started(&stream_key, &endpoint, &session_id)
+                .await
+            {
+                let bind = fs::read_to_string(hub.data_dir().join("last-webrtc-bind-error"))
+                    .unwrap_or_else(|_| "missing".to_string());
+                panic!(
+                    "Core attach reaches the reserved channel before live output: {error}; bind={bind}"
+                );
+            }
             fs::create_dir_all(release_path.parent().expect("release parent"))
                 .expect("create webrtc release dir");
             fs::write(&release_path, b"go").expect("release webrtc write(2) producer");
 
             let mut concatenated = Vec::new();
             for _ in 0..120 {
-                let _ = offer_peer
-                    .encrypted_request(
-                        &stream_key,
-                        &botster_hub_client::DaemonRequest::ReadScreen {
-                            session_id: session_id.clone(),
-                        },
-                    )
-                    .await;
-                if let Ok(Ok(bytes)) = timeout(
+                match timeout(
                     Duration::from_millis(250),
                     offer_peer.next_terminal_frame(&stream_key),
                 )
                 .await
                 {
-                    if let Ok(event) =
-                        serde_json::from_slice::<botster_hub_client::DaemonEvent>(&bytes)
-                    {
-                        if let botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } =
-                            event
+                    Ok(Ok(bytes)) => {
+                        if let Ok(event) =
+                            serde_json::from_slice::<botster_hub_client::DaemonEvent>(&bytes)
                         {
-                            concatenated.extend(live_output_decoded_bytes(payload));
+                            if let botster_hub_client::DaemonEvent::TerminalOutput {
+                                payload, ..
+                            } = event
+                            {
+                                concatenated.extend(live_output_decoded_bytes(payload));
+                            }
+                        } else {
+                            concatenated.extend(bytes);
                         }
-                    } else {
-                        concatenated.extend(bytes);
                     }
+                    Ok(Err(error)) if error.to_string().contains("channel_closed") => break,
+                    _ => {}
                 }
                 if concatenated
                     .windows(expected.len())
@@ -590,6 +605,7 @@ fn external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup() {
                     .any(|window| window == expected),
                 "round {round} must observe live bytes before shutdown, got {concatenated:?}"
             );
+            wait_for_authoritative_session_exit(&endpoint, &session_id);
             let _ = offer_peer.peer.close().await;
         });
 

@@ -7,6 +7,34 @@ fn webrtc_terminal_adapter_hello() -> botster_hub_client::DaemonHello {
     }
 }
 
+fn webrtc_ready_then_history_hello() -> botster_hub_client::DaemonHello {
+    botster_hub_client::DaemonHello {
+        protocol: botster_hub_client::PROTOCOL.to_string(),
+        compatibility:
+            botster_hub_client::DaemonCompatibilityRequirement::for_webrtc_terminal_adapter(),
+        terminal_compatibility: Some(
+            botster_terminal_protocol::TerminalCompatibilityRequirement::for_ready_then_history_attach(
+            ),
+        ),
+    }
+}
+
+fn snapshot_phase(bytes: &[u8]) -> Option<String> {
+    let value = serde_json::from_slice::<serde_json::Value>(bytes).ok()?;
+    match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("snapshot") => value
+            .get("phase")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        Some("attach_state")
+            if value.get("state").and_then(serde_json::Value::as_str) == Some("attached") =>
+        {
+            Some("attached".to_string())
+        }
+        _ => None,
+    }
+}
+
 fn webrtc_package_event_hello() -> botster_hub_client::DaemonHello {
     let mut compatibility =
         botster_hub_client::DaemonCompatibilityRequirement::for_webrtc_terminal_adapter();
@@ -386,6 +414,65 @@ fn webrtc_terminal_adapter_attach_emits_a_nonempty_frame_without_host_drain() {
         assert!(
             saw_terminal_frame,
             "Attach must emit a nonempty adapter frame without a later host Drain or ReadScreen"
+        );
+        peer.peer.close().await.expect("close offer peer");
+    });
+    shutdown_short_lived_session(&endpoint, session_id);
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn webrtc_reserved_bind_delivers_ready_history_finish_attached_in_order() {
+    let _guard = daemon_test_guard();
+    let (hub, endpoint, bootstrap) = start_webrtc_adapter_hub("wrh");
+    let session_id = "wrh-session";
+    let subscription_id = "wrh-sub";
+    block_on(async {
+        let (mut peer, key) = open_local_webrtc_peer(&endpoint, &bootstrap).await;
+        peer.encrypted_hello(&key, &webrtc_ready_then_history_hello())
+            .await
+            .expect("ready-then-history hello");
+        spawn_and_bind_webrtc(
+            &mut peer,
+            &key,
+            session_id,
+            subscription_id,
+            "printf 'ready-history-live\\n'; sleep 30",
+        )
+        .await;
+
+        let deadline = Instant::now() + Duration::from_secs(12);
+        let mut phases = Vec::new();
+        while Instant::now() < deadline {
+            if let Ok(Ok(bytes)) =
+                timeout(Duration::from_millis(250), peer.next_terminal_frame(&key)).await
+                && let Some(phase) = snapshot_phase(&bytes)
+            {
+                phases.push(phase);
+            }
+            let ready = phases.iter().position(|phase| phase == "ready");
+            let finish = phases.iter().position(|phase| phase == "finish");
+            let attached = phases.iter().position(|phase| phase == "attached");
+            if ready.is_some() && finish.is_some() && attached.is_some() {
+                break;
+            }
+        }
+        let ready = phases.iter().position(|phase| phase == "ready");
+        let finish = phases.iter().position(|phase| phase == "finish");
+        let attached = phases.iter().position(|phase| phase == "attached");
+        assert!(
+            ready.is_some() && finish.is_some() && attached.is_some(),
+            "bound adapter must receive READY, FINISH, and Attached without a Hub queue: {phases:?}"
+        );
+        let ready = ready.expect("ready");
+        let finish = finish.expect("finish");
+        let attached = attached.expect("attached");
+        assert!(ready < finish && finish < attached, "{phases:?}");
+        assert!(
+            phases[ready + 1..finish]
+                .iter()
+                .all(|phase| phase == "history"),
+            "HISTORY pages must sit between READY and FINISH: {phases:?}"
         );
         peer.peer.close().await.expect("close offer peer");
     });
@@ -1046,7 +1133,7 @@ fn webrtc_terminal_adapter_write_budget_emits_core_adapter_closed_while_peer_sta
                 .collect::<Vec<_>>()
         );
         eprintln!(
-            "webrtc write-budget provenance hub_bin={} session_worker={} hub_sha={} locked_core=358ef1a6bf0f792f6da10d60890be39cb16779d0",
+            "webrtc write-budget provenance hub_bin={} session_worker={} hub_sha={} locked_core=9cabdfd0588b6c7ed2e121e7b50086ce2a250ec6",
             env!("CARGO_BIN_EXE_botster-hub"),
             session_worker_binary_path().display(),
             option_env!("BOTSTER_HUB_GIT_SHA").unwrap_or("worktree")
