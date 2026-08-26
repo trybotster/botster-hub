@@ -570,6 +570,27 @@ pub(crate) fn live_generation_for_route(
     })
 }
 
+pub(crate) fn next_webrtc_reservation_generation(
+    inventory: &[TerminalSubscriptionRecord],
+    _client_id: &str,
+    session_id: &str,
+    subscription_id: &str,
+) -> (
+    Option<(String, TerminalSubscriptionGeneration)>,
+    TerminalSubscriptionGeneration,
+) {
+    match inventory
+        .iter()
+        .find(|row| row.session_id.0 == session_id && row.subscription_id.0 == subscription_id)
+    {
+        Some(row) => (
+            Some((row.client_id.0.clone(), row.generation)),
+            TerminalSubscriptionGeneration(row.generation.0 + 1),
+        ),
+        None => (None, TerminalSubscriptionGeneration(1)),
+    }
+}
+
 pub(crate) fn fail_closed_pre_bind_attach(
     registry: &mut AttachStreamRegistry,
     runtime: &mut HubRuntime,
@@ -780,7 +801,6 @@ pub(crate) fn bind_reserved_webrtc_adapter(
     runtime: &mut HubRuntime,
     request: WebrtcBindRequest<'_>,
     generation: TerminalSubscriptionGeneration,
-    bootstrap_egress: &[botster_core::TransportEgress],
 ) -> Result<WebRtcTerminalAdapterHandle, ()> {
     let capabilities = match negotiated_unix_capability_set(
         request.required_features,
@@ -847,7 +867,7 @@ pub(crate) fn bind_reserved_webrtc_adapter(
         generation,
         BoundAdapterHandle::WebRtc(handle.clone()),
     );
-    if !mux.bind_reserved(&label, handle.clone()) {
+    if !mux.arm_reserved(&label, handle.clone()) {
         fail_closed_pre_bind_attach(
             registry,
             runtime,
@@ -859,10 +879,6 @@ pub(crate) fn bind_reserved_webrtc_adapter(
         );
         return Err(());
     }
-    forward_attach_bootstrap(
-        &BoundAdapterHandle::WebRtc(handle.clone()),
-        bootstrap_egress,
-    );
     Ok(handle)
 }
 

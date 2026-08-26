@@ -115,7 +115,6 @@ struct WebRtcTerminalAdapterInner {
     buffered_bytes: AtomicU32,
     mux: Weak<WebRtcMuxInner>,
     slot: Mutex<Option<Vec<u8>>>,
-    bootstrap_pending: Mutex<VecDeque<Vec<u8>>>,
     ingress: Mutex<AdapterIngress>,
     wake: AdapterWake,
     close_work: Arc<AtomicBool>,
@@ -130,7 +129,6 @@ impl WebRtcTerminalAdapterInner {
             buffered_bytes: AtomicU32::new(0),
             mux: Weak::new(),
             slot: Mutex::new(None),
-            bootstrap_pending: Mutex::new(VecDeque::new()),
             ingress: Mutex::new(AdapterIngress::new()),
             wake: AdapterWake::new(),
             close_work: Arc::new(AtomicBool::new(false)),
@@ -181,36 +179,6 @@ impl WebRtcTerminalAdapterInner {
             Err(TryLockError::WouldBlock) => {}
             Err(TryLockError::Poisoned(poisoned)) => {
                 poisoned.into_inner().clear();
-            }
-        }
-        match self.bootstrap_pending.try_lock() {
-            Ok(mut pending) => pending.clear(),
-            Err(TryLockError::WouldBlock) => {}
-            Err(TryLockError::Poisoned(poisoned)) => {
-                poisoned.into_inner().clear();
-            }
-        }
-        self.wake.wake();
-    }
-
-    fn enqueue_host_frame(&self, bytes: Vec<u8>) {
-        if self.is_closed() {
-            return;
-        }
-        match self.slot.lock() {
-            Ok(mut slot) => {
-                if self.is_closed() {
-                    *slot = None;
-                    return;
-                }
-                if slot.is_none() {
-                    *slot = Some(bytes);
-                } else if let Ok(mut pending) = self.bootstrap_pending.lock() {
-                    pending.push_back(bytes);
-                }
-            }
-            Err(poisoned) => {
-                *poisoned.into_inner() = None;
             }
         }
         self.wake.wake();
@@ -391,11 +359,7 @@ impl WebRtcTerminalAdapterInner {
                     *slot = None;
                     None
                 } else {
-                    let taken = slot.take();
-                    if let Ok(mut pending) = self.bootstrap_pending.lock() {
-                        *slot = pending.pop_front();
-                    }
-                    taken
+                    slot.take()
                 }
             }
             Err(_) => None,
@@ -775,6 +739,7 @@ impl WebRtcConnectionMux {
             })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn bind_reserved(
         &self,
         label: &crate::local_webrtc::webrtc_subscription_channel::SubscriptionChannelLabel,
@@ -799,6 +764,51 @@ impl WebRtcConnectionMux {
         true
     }
 
+    pub(crate) fn arm_reserved(
+        &self,
+        label: &crate::local_webrtc::webrtc_subscription_channel::SubscriptionChannelLabel,
+        handle: WebRtcTerminalAdapterHandle,
+    ) -> bool {
+        let Ok(mut routes) = self.inner.routes.lock() else {
+            return false;
+        };
+        let Some(route) = routes.get_mut(&(
+            label.session_id.clone(),
+            label.subscription_id.clone(),
+            label.generation,
+        )) else {
+            return false;
+        };
+        if route.state != MuxRouteState::Reserved {
+            return false;
+        }
+        route.handle = Some(handle);
+        self.inner.wake.wake();
+        true
+    }
+
+    pub(crate) fn activate_reserved(
+        &self,
+        label: &crate::local_webrtc::webrtc_subscription_channel::SubscriptionChannelLabel,
+    ) -> bool {
+        let Ok(mut routes) = self.inner.routes.lock() else {
+            return false;
+        };
+        let Some(route) = routes.get_mut(&(
+            label.session_id.clone(),
+            label.subscription_id.clone(),
+            label.generation,
+        )) else {
+            return false;
+        };
+        if route.state != MuxRouteState::Reserved || route.handle.is_none() {
+            return false;
+        }
+        route.state = MuxRouteState::Bound;
+        self.inner.wake.wake();
+        true
+    }
+
     pub(crate) fn retire_reserved(
         &self,
         session_id: &str,
@@ -818,8 +828,10 @@ impl WebRtcConnectionMux {
         if route.state != MuxRouteState::Reserved {
             return false;
         }
+        if let Some(handle) = route.handle.take() {
+            handle.close_from_host();
+        }
         route.state = MuxRouteState::Retired;
-        route.handle = None;
         true
     }
 
@@ -1161,10 +1173,7 @@ impl WebRtcTerminalAdapterHandle {
     }
 
     pub(crate) fn write_opaque_frame(&self, frame: &TerminalFrame) {
-        let Ok(bytes) = frame.to_bytes() else {
-            return;
-        };
-        self.inner.enqueue_host_frame(bytes);
+        let _ = self.inner.try_write(frame);
     }
 
     pub(crate) fn push_ingress_frame(&self, bytes: Vec<u8>) {
@@ -1621,6 +1630,25 @@ mod tests {
             handle.complete_active().is_none(),
             "a refused live write must not become Hub-owned terminal history"
         );
+        assert_eq!(adapter.pressure(), TerminalAdapterPressure::Ready);
+    }
+
+    #[test]
+    fn write_opaque_frame_keeps_the_one_slot_contract() {
+        let (mut adapter, handle) = WebRtcTerminalAdapter::pair();
+        let first =
+            TerminalFrame::from_bytes(br#"{"type":"terminal_output","marker":"first"}"#).unwrap();
+        let second =
+            TerminalFrame::from_bytes(br#"{"type":"terminal_output","marker":"second"}"#).unwrap();
+        handle.write_opaque_frame(&first);
+        handle.write_opaque_frame(&second);
+        let first_bytes = handle.complete_active().expect("one slot");
+        assert!(String::from_utf8_lossy(&first_bytes).contains("first"));
+        assert!(
+            handle.complete_active().is_none(),
+            "bootstrap write must not grow a Hub terminal queue"
+        );
+        assert_eq!(adapter.try_read(), TerminalIngress::Empty);
         assert_eq!(adapter.pressure(), TerminalAdapterPressure::Ready);
     }
 

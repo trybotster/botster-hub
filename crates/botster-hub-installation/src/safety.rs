@@ -567,9 +567,13 @@ pub fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
+/// Portable permission bits from `mode_t`.
+///
+/// `mode_t` is `u16` on macOS and `u32` on Linux. Callers compare the `u32`
+/// result so Linux Clippy does not see a platform-only `u32::from`.
+#[must_use]
 #[allow(clippy::unnecessary_cast, clippy::useless_conversion)]
-fn file_mode_bits(mode: libc::mode_t) -> u32 {
-    // `mode_t` is `u16` on macOS and `u32` on Linux.
+pub fn file_mode_bits(mode: libc::mode_t) -> u32 {
     u32::from(mode) & 0o7777
 }
 
