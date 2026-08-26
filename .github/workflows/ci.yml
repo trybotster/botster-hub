@@ -70,4 +70,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Test workspace
-        run: ./test.sh --locked
+        run: |
+          cargo build --locked -p botster-core-daemon --bin botster-session-worker
+          cargo build --locked --bin botster-hub
+          ./test.sh --locked
