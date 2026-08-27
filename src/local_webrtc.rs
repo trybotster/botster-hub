@@ -1530,17 +1530,12 @@ where
         .await
         {
             Ok(true) => {
-                if peer_state
+                peer_state.mux.note_slot_ready(&label.session_id);
+                let _ = peer_state
                     .runtime_tx
-                    .send(ControlMessage::ReservedWebrtcSlotReady {
+                    .try_send(ControlMessage::ReservedWebrtcSlotReady {
                         session_id: label.session_id.clone(),
-                    })
-                    .await
-                    .is_err()
-                {
-                    close_subscription_channel(data_channel, &handle).await;
-                    return None;
-                }
+                    });
             }
             Ok(false) => {}
             Err(failure) => {

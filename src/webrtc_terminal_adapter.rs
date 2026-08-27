@@ -489,6 +489,39 @@ impl std::fmt::Debug for WebRtcConnectionMux {
     }
 }
 
+/// Coalesced SlotReady wake shared with the owner loop.
+///
+/// Duplicate notes for one session stay one pending key. A failed
+/// `try_send(ReservedWebrtcSlotReady)` must not drop this mark.
+#[derive(Default)]
+pub(crate) struct WebrtcSlotReadyWake {
+    pending: AtomicBool,
+    sessions: Mutex<BTreeSet<String>>,
+}
+
+impl WebrtcSlotReadyWake {
+    pub(crate) fn note(&self, session_id: &str) {
+        if let Ok(mut sessions) = self.sessions.lock() {
+            sessions.insert(session_id.to_string());
+        }
+        self.pending.store(true, Ordering::SeqCst);
+    }
+
+    #[must_use]
+    pub(crate) fn has_pending(&self) -> bool {
+        self.pending.load(Ordering::SeqCst)
+    }
+
+    #[must_use]
+    pub(crate) fn take_sessions(&self) -> Vec<String> {
+        self.pending.store(false, Ordering::SeqCst);
+        self.sessions
+            .lock()
+            .map(|mut sessions| std::mem::take(&mut *sessions).into_iter().collect())
+            .unwrap_or_default()
+    }
+}
+
 struct WebRtcMuxInner {
     wake: AdapterWake,
     dying: AtomicBool,
@@ -497,6 +530,7 @@ struct WebRtcMuxInner {
     pending_events: Mutex<Vec<DaemonEvent>>,
     suppress_generations: Mutex<BTreeSet<(String, String, u64)>>,
     close_work: Mutex<Arc<AtomicBool>>,
+    slot_ready: Mutex<Arc<WebrtcSlotReadyWake>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -540,6 +574,7 @@ impl WebRtcConnectionMux {
                 pending_events: Mutex::new(Vec::new()),
                 suppress_generations: Mutex::new(BTreeSet::new()),
                 close_work: Mutex::new(Arc::new(AtomicBool::new(false))),
+                slot_ready: Mutex::new(Arc::new(WebrtcSlotReadyWake::default())),
             }),
         }
     }
@@ -547,6 +582,18 @@ impl WebRtcConnectionMux {
     pub(crate) fn bind_close_work(&self, flag: Arc<AtomicBool>) {
         if let Ok(mut slot) = self.inner.close_work.lock() {
             *slot = flag;
+        }
+    }
+
+    pub(crate) fn bind_slot_ready(&self, wake: Arc<WebrtcSlotReadyWake>) {
+        if let Ok(mut slot) = self.inner.slot_ready.lock() {
+            *slot = wake;
+        }
+    }
+
+    pub(crate) fn note_slot_ready(&self, session_id: &str) {
+        if let Ok(slot) = self.inner.slot_ready.lock() {
+            slot.note(session_id);
         }
     }
 
@@ -1695,6 +1742,25 @@ mod tests {
         );
         assert_eq!(mux.charged_subscription_count(), 1);
         assert!(mux.pop_pending_event().is_none());
+    }
+
+    #[test]
+    fn slot_ready_wake_coalesces_duplicate_notes_without_dropping_the_mark() {
+        let wake = WebrtcSlotReadyWake::default();
+        wake.note("sess");
+        wake.note("sess");
+        assert!(wake.has_pending());
+        assert_eq!(wake.take_sessions(), vec!["sess".to_string()]);
+        assert!(!wake.has_pending());
+        wake.note("later");
+        assert!(wake.has_pending(), "a note after take must not be lost");
+        assert_eq!(wake.take_sessions(), vec!["later".to_string()]);
+        let mux = WebRtcConnectionMux::new();
+        let shared = std::sync::Arc::new(WebrtcSlotReadyWake::default());
+        mux.bind_slot_ready(std::sync::Arc::clone(&shared));
+        mux.note_slot_ready("bound");
+        mux.note_slot_ready("bound");
+        assert_eq!(shared.take_sessions(), vec!["bound".to_string()]);
     }
 
     #[test]

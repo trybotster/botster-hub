@@ -349,7 +349,7 @@ fn external_hub_webrtc_live_output_preserves_exact_bytes() {
             .bind_reserved_from_attach(&attach)
             .await
             .expect("browser creates the reserved terminal DataChannel");
-        let _ = botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status);
+        let _flood = GenericControlFlood::start(endpoint.clone());
         offer_peer
             .wait_until_attach_started(
                 &stream_key,
@@ -361,16 +361,9 @@ fn external_hub_webrtc_live_output_preserves_exact_bytes() {
         fs::create_dir_all(release_path.parent().expect("release parent"))
             .expect("create webrtc release dir");
         fs::write(&release_path, b"go").expect("release webrtc write(2) producer");
-        let _ = botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status);
 
         let mut concatenated = Vec::new();
-        for round in 0..120 {
-            if concatenated.is_empty() && round == 8 {
-                let _ = botster_hub_client::request(
-                    &endpoint,
-                    botster_hub_client::DaemonRequest::Status,
-                );
-            }
+        for _round in 0..120 {
             if let Ok(Ok(bytes)) = timeout(
                 Duration::from_millis(250),
                 offer_peer.next_terminal_frame(&stream_key),
@@ -559,7 +552,7 @@ fn external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup() {
                 .bind_reserved_from_attach(&attach)
                 .await
                 .expect("browser creates the reserved terminal DataChannel");
-            let _ = botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status);
+            let _flood = GenericControlFlood::start(endpoint.clone());
             if let Err(error) = offer_peer
                 .wait_until_attach_started(&stream_key, &endpoint, &session_id)
                 .await

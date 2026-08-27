@@ -190,6 +190,33 @@ Test repairs:
 - Write-budget sibling collection no longer drains the stalled channel.
 - Node mirror literals now assert conformance revision 47.
 
+## Review-return repairs (`review_1787801253_862883`)
+
+Question `question_1787803324_624838` chose option 2: keep iterating Hub owner-loop scheduling. Do not restore exact observation on Status, ListSessions, or generic control. Do not park for Core. Do not only lengthen waits.
+
+`finding_1787801254_356028` stays accepted: generic control does not exact-observe in-flight WebRTC binds. `scheduled_webrtc_bind_observe_is_not_driven_by_generic_control` still forbids `observe_session_lifecycle` in Status/ListSessions and in the generic control arm.
+
+The remaining official defect was SlotReady starvation under load, not Core attach retain. After the first attach frame fills the one-slot adapter, the 50 ms empty-slot tick stops and journal remakes stop. The next Core write needs a SlotReady wake. That wake used `runtime_tx.send().await` on the same FIFO as Status/ListSessions. Continuous generic control delayed the wake; a full control queue could park the DataChannel loop.
+
+This visit:
+
+- Coalesces SlotReady onto a shared `WebrtcSlotReadyWake`. Duplicate notes for one session stay one key. A failed `try_send` does not drop the mark.
+- The DataChannel loop `try_send`s `ReservedWebrtcSlotReady` and never awaits enqueue.
+- `mark_due_reconciliation` marks Pump when a coalesced SlotReady is pending.
+- Every owner turn drains coalesced SlotReady after control, outside generic request arms. Pump still drains it.
+- A SlotReady taken while the one-slot is Full is restored, not dropped.
+- SlotReady remains the route-specific observe opportunity.
+
+Deterministic red controls:
+
+- `coalesced_webrtc_slot_ready_marks_pump_and_coalesces_without_lost_wakeup`
+- `ready_webrtc_route_progresses_within_two_background_slices_under_queued_control`
+- `slot_ready_wake_coalesces_duplicate_notes_without_dropping_the_mark`
+- `slot_ready_does_not_block_the_datachannel_loop_on_control_send`
+- IsolatedHub `GenericControlFlood` of Status and ListSessions around reserved bind for HISTORY, Attached-without-host-Status, exact-bytes, shutdown, and stale-generation replacement. Those proofs do not use Status, ListSessions, or ReadScreen as the attach observe path.
+
+Official `./test.sh --locked` on this head: exit 0. Hub lib 528 passed. Lifecycle 320 passed, 2 ignored. Lifecycle 301.80 s. `external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup` and `webrtc_terminal_adapter_stale_generation_close_does_not_sweep_replacement_owner` passed in that full-suite order.
+
 ## Official gates
 
 First Implement visit, same shell, `RUSTUP_TOOLCHAIN=1.97.0`, `CARGO_TARGET_DIR` unset:
@@ -203,7 +230,7 @@ First Implement visit, same shell, `RUSTUP_TOOLCHAIN=1.97.0`, `CARGO_TARGET_DIR`
 | `cargo fmt --all -- --check` | pass |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | pass after the installer `file_mode_bits` repair |
 | `node packages/hub-test-support/scripts/sync-assets.mjs --check` | `hub test-support package assets are current` |
-| `./test.sh --locked` | first visit: exit 0. Hub lib 504 passed. Lifecycle 317 passed, 2 ignored. Elapsed 480616 ms. First Review return: exit 0. Hub lib 512 passed. Lifecycle 317 passed, 2 ignored. Elapsed 450573 ms. Second Review return: exit 0. Hub lib 517 passed. Lifecycle 317 passed, 2 ignored. Elapsed 437289 ms. Third Review return: exit 0. Hub lib 519 passed. Lifecycle 317 passed, 2 ignored. Elapsed 397602 ms. Fourth Review return: exit 0. Hub lib 518 passed. Lifecycle 317 passed, 2 ignored. Elapsed 403168 ms. Core consume: exit 0. Hub lib 523 passed. Lifecycle 318 passed, 2 ignored. Elapsed 392450 ms. HISTORY IsolatedHub oracle: exit 0. Hub lib 523 passed. Lifecycle 319 passed, 2 ignored. Lifecycle 340160 ms. Wrapper elapsed 434720 ms. In-flight bind observe: exit 0. Hub lib 524 passed. Lifecycle 319 passed, 2 ignored. Lifecycle 304380 ms. Wrapper elapsed 384770 ms |
+| `./test.sh --locked` | first visit: exit 0. Hub lib 504 passed. Lifecycle 317 passed, 2 ignored. Elapsed 480616 ms. First Review return: exit 0. Hub lib 512 passed. Lifecycle 317 passed, 2 ignored. Elapsed 450573 ms. Second Review return: exit 0. Hub lib 517 passed. Lifecycle 317 passed, 2 ignored. Elapsed 437289 ms. Third Review return: exit 0. Hub lib 519 passed. Lifecycle 317 passed, 2 ignored. Elapsed 397602 ms. Fourth Review return: exit 0. Hub lib 518 passed. Lifecycle 317 passed, 2 ignored. Elapsed 403168 ms. Core consume: exit 0. Hub lib 523 passed. Lifecycle 318 passed, 2 ignored. Elapsed 392450 ms. HISTORY IsolatedHub oracle: exit 0. Hub lib 523 passed. Lifecycle 319 passed, 2 ignored. Lifecycle 340160 ms. Wrapper elapsed 434720 ms. In-flight bind observe: exit 0. Hub lib 524 passed. Lifecycle 319 passed, 2 ignored. Lifecycle 304380 ms. Wrapper elapsed 384770 ms. Owner-loop SlotReady coalescing: exit 0. Hub lib 528 passed. Lifecycle 320 passed, 2 ignored. Lifecycle 301800 ms |
 | `cd packages/hub-test-support && npm install --no-save && npm test` | `hub test-support package import and fixture materialization passed` |
 | `git diff --check a0c7141...HEAD` | pass |
 
@@ -260,7 +287,7 @@ Branch paths relative to `a0c7141`, including this report:
 - `docs/reports/isolate-control-and-terminal-subscriptions-on-dedicated-datachannels-implement.md` — this report
 - `packages/hub-test-support/*` — unpublished `0.1.43`, revision 47, Node mirror literals
 - `src/daemon_attach_stream.rs` — predicted reservation generation, Core-bind only after open. `write_first_webrtc_attach_frame` removed
-- `src/daemon_transport.rs` — Attach reserves only. Open validates, calls `expect_terminal_adapter`, then Core-attaches, binds, and observes. SlotReady and 50 ms bind-observe ticks keep the dump moving without a Hub queue. Queued control exact-observes an empty just-bound WebRTC slot
+- `src/daemon_transport.rs` — Attach reserves only. Open validates, calls `expect_terminal_adapter`, then Core-attaches, binds, and observes. SlotReady stays route-specific. Coalesced SlotReady wakes mark Pump and drain after every owner turn. Generic control does not exact-observe. Empty just-bound slots keep the 50 ms tick
 - `src/local_webrtc.rs` — production Attach asserts no Core owner before open
 - `.github/workflows/ci.yml` — locked session-worker and Hub prebuild before `./test.sh --locked`
 - `src/local_webrtc_smoke.rs` — smoke offerer opens the reserved label after Attach
@@ -301,8 +328,8 @@ A27b Core `WRITE_ATTEMPT_BUDGET` hard-stop is proved by the live write-budget te
 - Live A25/A26/A27 31-channel IsolatedHub fill is not in this suite. Mux-level predicates and the live write-budget sibling test are.
 - Core attach and adapter bind start only after the reserved channel opens. `SendInput` before that open has no Core owner.
 - Unix attach still does not call `expect_terminal_adapter`. Unix duplex bind is out of scope.
-- Isolated `unix_eof_skip_core_detach_ablation_keeps_named_pair_on_status` failed once under official parallel load on an earlier visit, then passed isolated. This visit did not change Unix detach. The HISTORY IsolatedHub official run passed that proof.
-- `owner_loop_queues_and_completes_two_fanout_plugin_handlers` can flake under default lib concurrency (1 vs 2 handlers). Isolated reruns pass. The official consume suite passed.
+- Isolated `unix_eof_skip_core_detach_ablation_keeps_named_pair_on_status` failed once under official parallel load on an earlier visit, then passed isolated. This visit did not change Unix detach. The latest official run passed that proof.
+- `owner_loop_queues_and_completes_two_fanout_plugin_handlers` can flake under default lib concurrency (1 vs 2 handlers). Isolated reruns pass. The latest official suite passed.
 - This visit will record the new GitHub Verify result after the push.
 - Binary send still wraps JSON `DaemonLocalWebrtcDeliveryChunk`. This ticket did not add a new encrypted-binary framing DTO.
 - Browser and TUI channel-creation clients remain owned by their downstream tickets.

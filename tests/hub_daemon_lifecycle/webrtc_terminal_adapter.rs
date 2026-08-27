@@ -533,7 +533,7 @@ fn webrtc_reserved_bind_delivers_ready_history_finish_attached_in_order() {
         .await;
         wait_for_history_ready_file(&ready_path);
         bind_reserved_webrtc(&mut peer, &key, session_id, subscription_id).await;
-        let _ = botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status);
+        let _flood = GenericControlFlood::start(endpoint.clone());
 
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut phases = Vec::new();
@@ -582,6 +582,7 @@ fn webrtc_reserved_bind_reaches_attached_without_host_status() {
             "printf 'wra-ready\\n'; sleep 30",
         )
         .await;
+        let _flood = GenericControlFlood::start(endpoint.clone());
         peer.wait_until_attach_started(&key, &endpoint, session_id)
             .await
             .expect("Attached must arrive without Status, ListSessions, or ReadScreen after bind");
@@ -1561,6 +1562,7 @@ fn webrtc_terminal_adapter_stale_generation_close_does_not_sweep_replacement_own
             occupancy_after_b >= 1,
             "Hub-visible occupancy must keep B live: after_a={occupancy_after_a} after_b={occupancy_after_b}"
         );
+        let _flood = GenericControlFlood::start(endpoint.clone());
         let drain = owner_b
             .encrypted_request(
                 &key_b,
@@ -1596,14 +1598,6 @@ fn webrtc_terminal_adapter_stale_generation_close_does_not_sweep_replacement_own
                 seen.push_back((String::new(), bytes));
             }
         }
-        let _ = owner_b
-            .encrypted_request(
-                &key_b,
-                &botster_hub_client::DaemonRequest::ReadScreen {
-                    session_id: "wsg-session".to_string(),
-                },
-            )
-            .await;
         let sent = owner_b
             .encrypted_request(
                 &key_b,
@@ -1622,14 +1616,6 @@ fn webrtc_terminal_adapter_stale_generation_close_does_not_sweep_replacement_own
         );
         let deadline = Instant::now() + Duration::from_secs(12);
         while Instant::now() < deadline && !webrtc_terminal_contains(&seen, "echo:after-replace") {
-            let _ = owner_b
-                .encrypted_request(
-                    &key_b,
-                    &botster_hub_client::DaemonRequest::ReadScreen {
-                        session_id: "wsg-session".to_string(),
-                    },
-                )
-                .await;
             if let Ok(Ok(bytes)) = timeout(
                 Duration::from_millis(200),
                 owner_b.next_terminal_frame_for(&key_b, "wsg-session", "wsg-sub"),
