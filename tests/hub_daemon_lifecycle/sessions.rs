@@ -2798,14 +2798,17 @@ fn session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnec
 #[test]
 fn session_entity_subscription_projects_stale_row_as_indeterminate() {
     let _guard = daemon_test_guard();
+    let _clear_taint = ResetHarnessTaintOnDrop;
     let data_dir = unique_test_dir("session-entity-stale");
     let config = explicit_config(&data_dir);
     let session_id = SessionId("session-entity-stale".to_string());
     let registry = SessionRegistry::new(config.data_directory.clone());
+    // PID 42 can be live on Linux CI. Use a pid that cannot exist so identity
+    // capture takes the dead-command / no-recovery-worker path.
     let mut stale_record = RegistryRecord::running(
         session_id.clone(),
         Some(ProcessIdentity {
-            pid: Some(42),
+            pid: Some(2_000_000_000),
             runtime_id: Some("stale-runtime".to_string()),
         }),
         ResizePayload { rows: 24, cols: 80 },
@@ -2889,7 +2892,7 @@ fn session_entity_subscription_projects_stale_row_as_indeterminate() {
         harness_taint().is_some_and(|evidence| {
             evidence.contains("session-entity-stale") && evidence.contains("no recovery worker pid")
         }),
-        "forged stale command 42 must taint as missing recovery identity: {:?}",
+        "forged stale command must taint as missing recovery identity: {:?}",
         harness_taint()
     );
     reset_harness_taint_after_proof();
