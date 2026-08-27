@@ -489,8 +489,6 @@ impl std::fmt::Debug for WebRtcConnectionMux {
     }
 }
 
-type EmptySlotDrain = Arc<dyn Fn(&str) + Send + Sync>;
-
 /// Coalesced SlotReady wake shared with the owner loop.
 ///
 /// Duplicate notes for one session stay one pending key. A failed
@@ -541,7 +539,6 @@ struct WebRtcMuxInner {
     suppress_generations: Mutex<BTreeSet<(String, String, u64)>>,
     close_work: Mutex<Arc<AtomicBool>>,
     slot_ready: Mutex<Arc<WebrtcSlotReadyWake>>,
-    empty_slot_drain: Mutex<Option<EmptySlotDrain>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -586,7 +583,6 @@ impl WebRtcConnectionMux {
                 suppress_generations: Mutex::new(BTreeSet::new()),
                 close_work: Mutex::new(Arc::new(AtomicBool::new(false))),
                 slot_ready: Mutex::new(Arc::new(WebrtcSlotReadyWake::default())),
-                empty_slot_drain: Mutex::new(None),
             }),
         }
     }
@@ -603,32 +599,10 @@ impl WebRtcConnectionMux {
         }
     }
 
-    pub(crate) fn bind_empty_slot_drain(&self, drain: EmptySlotDrain) {
-        if let Ok(mut slot) = self.inner.empty_slot_drain.lock() {
-            *slot = Some(drain);
-        }
-    }
-
     pub(crate) fn note_slot_ready(&self, session_id: &str) {
         if let Ok(slot) = self.inner.slot_ready.lock() {
             slot.note(session_id);
         }
-    }
-
-    /// Pump Core for this session after the one-slot adapter is empty and ready.
-    ///
-    /// Drops the drain lock before the callback so `try_write` can lock the mux.
-    pub(crate) fn drain_empty_slot(&self, session_id: &str) {
-        let Some(drain) = self
-            .inner
-            .empty_slot_drain
-            .lock()
-            .ok()
-            .and_then(|slot| slot.clone())
-        else {
-            return;
-        };
-        drain(session_id);
     }
 
     pub(crate) fn create_adapter(&self) -> (WebRtcTerminalAdapter, WebRtcTerminalAdapterHandle) {
@@ -1316,10 +1290,6 @@ impl WebRtcTerminalAdapterHandle {
         }
     }
 
-    pub(crate) fn ready_for_host_pump(&self) -> bool {
-        matches!(self.inner.pressure(), TerminalAdapterPressure::Ready)
-    }
-
     pub(crate) fn complete_active(&self) -> Option<Vec<u8>> {
         self.inner.complete_active()
     }
@@ -1802,47 +1772,6 @@ mod tests {
         mux.note_slot_ready("bound");
         mux.note_slot_ready("bound");
         assert_eq!(shared.take_sessions(), vec!["bound".to_string()]);
-    }
-
-    #[test]
-    fn empty_slot_drain_drops_its_lock_before_the_callback() {
-        let mux = WebRtcConnectionMux::new();
-        let (mut adapter, handle) = mux.create_adapter();
-        let label = mux
-            .reserve_terminal("g".into(), "s".into(), "sub".into(), 1)
-            .expect("reserve");
-        assert!(mux.bind_reserved(&label, handle.clone()));
-        let saw = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let drain_mux = mux.clone();
-        let flag = std::sync::Arc::clone(&saw);
-        mux.bind_empty_slot_drain(std::sync::Arc::new(move |session_id: &str| {
-            assert_eq!(session_id, "s");
-            assert!(
-                !drain_mux.session_bound_slot_occupied(session_id),
-                "drain must run after the slot is empty"
-            );
-            flag.store(true, Ordering::SeqCst);
-        }));
-        let frame =
-            TerminalFrame::from_bytes(br#"{"type":"terminal_output","marker":"first"}"#).unwrap();
-        assert_eq!(adapter.try_write(&frame), Ok(()));
-        assert!(handle.complete_active().is_some());
-        assert!(handle.ready_for_host_pump());
-        mux.drain_empty_slot("s");
-        assert!(saw.load(Ordering::SeqCst));
-        let source = include_str!("webrtc_terminal_adapter.rs");
-        let func = source
-            .split("pub(crate) fn drain_empty_slot")
-            .nth(1)
-            .expect("drain_empty_slot");
-        let func = func
-            .split("pub(crate) fn create_adapter")
-            .next()
-            .expect("function body");
-        assert!(
-            func.contains("slot.clone()") && func.contains("drain(session_id)"),
-            "clone the callback and drop the drain lock before Core observe"
-        );
     }
 
     #[test]
