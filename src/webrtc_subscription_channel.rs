@@ -311,11 +311,7 @@ where
     if handle.is_closed() {
         return Ok(false);
     }
-    let emptied = handle.complete_active().is_some();
-    if emptied && handle.ready_for_host_pump() {
-        peer_state.mux.drain_empty_slot(&label.session_id);
-    }
-    Ok(emptied)
+    Ok(handle.complete_active().is_some())
 }
 
 #[cfg(test)]
@@ -352,15 +348,6 @@ mod tests {
         assert!(
             !func.contains(".send(ControlMessage::ReservedWebrtcSlotReady"),
             "awaiting SlotReady enqueue can stall a ready route behind generic control"
-        );
-        let flush = include_str!("webrtc_subscription_channel.rs")
-            .split("async fn flush_one_adapter_handle")
-            .nth(1)
-            .expect("flush_one_adapter_handle");
-        let flush = flush.split("mod tests").next().unwrap_or(flush);
-        assert!(
-            flush.contains("drain_empty_slot") && flush.contains("ready_for_host_pump"),
-            "after a consumer flush, the mux pumps Core on the empty ready slot"
         );
     }
 
