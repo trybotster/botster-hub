@@ -314,6 +314,7 @@ fn remove_data_dir_path(data_dir: &Path) -> Result<(), IsolatedHubError> {
 impl Drop for IsolatedHub {
     fn drop(&mut self) {
         if !thread::panicking() && self.shutdown_inner().is_ok() {
+            reap_session_workers_for_data_dir(&self.data_dir);
             return;
         }
         let mut child_cleaned = true;
@@ -321,6 +322,7 @@ impl Drop for IsolatedHub {
             child_cleaned = cleanup_child(child).is_ok();
         }
         self.child = None;
+        reap_session_workers_for_data_dir(&self.data_dir);
         if child_cleaned && !thread::panicking() {
             let _ = self.remove_data_dir();
         }
@@ -550,6 +552,60 @@ fn wait_for_ready(
         stdout: String::new(),
         stderr: String::new(),
     })
+}
+
+fn session_worker_pids_for_data_dir(data_dir: &Path) -> Vec<u32> {
+    let dir = data_dir.to_string_lossy();
+    if dir.is_empty() {
+        return Vec::new();
+    }
+    let Ok(output) = Command::new("ps").args(["-axo", "pid=,command="]).output() else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let mut pids = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let line = line.trim();
+        let mut parts = line.split_whitespace();
+        let Some(pid_token) = parts.next() else {
+            continue;
+        };
+        let Ok(pid) = pid_token.parse::<u32>() else {
+            continue;
+        };
+        let Some(argv0) = parts.next() else {
+            continue;
+        };
+        let is_worker = Path::new(argv0)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "botster-session-worker");
+        if !is_worker {
+            continue;
+        }
+        let rest: Vec<&str> = parts.collect();
+        let command = format!("{argv0} {}", rest.join(" "));
+        if command.contains(dir.as_ref()) {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
+fn reap_session_workers_for_data_dir(data_dir: &Path) {
+    let pids = session_worker_pids_for_data_dir(data_dir);
+    if pids.is_empty() {
+        return;
+    }
+    for pid in pids {
+        let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    }
+    thread::sleep(Duration::from_millis(50));
+    for pid in session_worker_pids_for_data_dir(data_dir) {
+        let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+    }
 }
 
 pub(crate) fn cleanup_child(child: &mut Child) -> Result<(), IsolatedHubError> {
