@@ -1169,21 +1169,24 @@ impl WebRtcConnectionMux {
             .collect()
     }
 
-    pub(crate) fn session_bound_slot_occupied(&self, session_id: &str) -> bool {
-        let handles = {
-            let Ok(routes) = self.inner.routes.lock() else {
-                return false;
-            };
-            routes
-                .values()
-                .filter(|route| {
-                    route.state == MuxRouteState::Bound && route.session_id == session_id
-                })
-                .filter_map(|route| route.handle.clone())
-                .filter(|handle| !handle.is_closed())
-                .collect::<Vec<_>>()
+    fn live_bound_handles_for_session(&self, session_id: &str) -> Vec<WebRtcTerminalAdapterHandle> {
+        let Ok(routes) = self.inner.routes.lock() else {
+            return Vec::new();
         };
-        handles
+        routes
+            .values()
+            .filter(|route| route.state == MuxRouteState::Bound && route.session_id == session_id)
+            .filter_map(|route| route.handle.clone())
+            .filter(|handle| !handle.is_closed())
+            .collect()
+    }
+
+    pub(crate) fn session_has_live_bound_handle(&self, session_id: &str) -> bool {
+        !self.live_bound_handles_for_session(session_id).is_empty()
+    }
+
+    pub(crate) fn session_bound_slot_occupied(&self, session_id: &str) -> bool {
+        self.live_bound_handles_for_session(session_id)
             .iter()
             .any(WebRtcTerminalAdapterHandle::slot_is_occupied)
     }
