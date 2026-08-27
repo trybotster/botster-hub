@@ -149,7 +149,13 @@ Ownership rule kept on this Hub branch:
 
 Unix attach still does not call `expect_terminal_adapter`. Unix duplex bind is out of scope.
 
-`review_1787763686_531984` stays closed. This visit does not waive `review_1787786109_244719`. It requests a new Review after official green.
+`review_1787763686_531984` stays closed. This visit does not waive `review_1787786109_244719` or `review_1787799293_532860`. It requests a new Review after official green.
+
+## Review-return repairs (`review_1787799293_532860`)
+
+This visit repaired the open Review finding without changing ticket intent.
+
+- `finding_1787799293_644143`: GitHub Verify stalled `external_hub_webrtc_live_output_preserves_exact_bytes` and `external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup` after READY because queued host/web control won every owner turn and skipped the 50 ms bind-observe tick. The owner loop now exact-observes an empty just-bound WebRTC slot when that queued control wins. That is not a tight Observe remake on every turn. `owner_loop_observes_in_flight_webrtc_binds_when_queued_control_wins` pins the control-arm placement. HISTORY IsolatedHub and its negative control stay.
 
 ## Review-return repairs (`review_1787786109_244719`)
 
@@ -197,7 +203,7 @@ First Implement visit, same shell, `RUSTUP_TOOLCHAIN=1.97.0`, `CARGO_TARGET_DIR`
 | `cargo fmt --all -- --check` | pass |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | pass after the installer `file_mode_bits` repair |
 | `node packages/hub-test-support/scripts/sync-assets.mjs --check` | `hub test-support package assets are current` |
-| `./test.sh --locked` | first visit: exit 0. Hub lib 504 passed. Lifecycle 317 passed, 2 ignored. Elapsed 480616 ms. First Review return: exit 0. Hub lib 512 passed. Lifecycle 317 passed, 2 ignored. Elapsed 450573 ms. Second Review return: exit 0. Hub lib 517 passed. Lifecycle 317 passed, 2 ignored. Elapsed 437289 ms. Third Review return: exit 0. Hub lib 519 passed. Lifecycle 317 passed, 2 ignored. Elapsed 397602 ms. Fourth Review return: exit 0. Hub lib 518 passed. Lifecycle 317 passed, 2 ignored. Elapsed 403168 ms. Core consume: exit 0. Hub lib 523 passed. Lifecycle 318 passed, 2 ignored. Elapsed 392450 ms. HISTORY IsolatedHub oracle: exit 0. Hub lib 523 passed. Lifecycle 319 passed, 2 ignored. Lifecycle 340160 ms. Wrapper elapsed 434720 ms |
+| `./test.sh --locked` | first visit: exit 0. Hub lib 504 passed. Lifecycle 317 passed, 2 ignored. Elapsed 480616 ms. First Review return: exit 0. Hub lib 512 passed. Lifecycle 317 passed, 2 ignored. Elapsed 450573 ms. Second Review return: exit 0. Hub lib 517 passed. Lifecycle 317 passed, 2 ignored. Elapsed 437289 ms. Third Review return: exit 0. Hub lib 519 passed. Lifecycle 317 passed, 2 ignored. Elapsed 397602 ms. Fourth Review return: exit 0. Hub lib 518 passed. Lifecycle 317 passed, 2 ignored. Elapsed 403168 ms. Core consume: exit 0. Hub lib 523 passed. Lifecycle 318 passed, 2 ignored. Elapsed 392450 ms. HISTORY IsolatedHub oracle: exit 0. Hub lib 523 passed. Lifecycle 319 passed, 2 ignored. Lifecycle 340160 ms. Wrapper elapsed 434720 ms. In-flight bind observe: exit 0. Hub lib 524 passed. Lifecycle 319 passed, 2 ignored. Lifecycle 304380 ms. Wrapper elapsed 384770 ms |
 | `cd packages/hub-test-support && npm install --no-save && npm test` | `hub test-support package import and fixture materialization passed` |
 | `git diff --check a0c7141...HEAD` | pass |
 
@@ -254,7 +260,7 @@ Branch paths relative to `a0c7141`, including this report:
 - `docs/reports/isolate-control-and-terminal-subscriptions-on-dedicated-datachannels-implement.md` — this report
 - `packages/hub-test-support/*` — unpublished `0.1.43`, revision 47, Node mirror literals
 - `src/daemon_attach_stream.rs` — predicted reservation generation, Core-bind only after open. `write_first_webrtc_attach_frame` removed
-- `src/daemon_transport.rs` — Attach reserves only. Open validates, calls `expect_terminal_adapter`, then Core-attaches, binds, and observes. SlotReady and 50 ms bind-observe ticks keep the dump moving without a Hub queue
+- `src/daemon_transport.rs` — Attach reserves only. Open validates, calls `expect_terminal_adapter`, then Core-attaches, binds, and observes. SlotReady and 50 ms bind-observe ticks keep the dump moving without a Hub queue. Queued control exact-observes an empty just-bound WebRTC slot
 - `src/local_webrtc.rs` — production Attach asserts no Core owner before open
 - `.github/workflows/ci.yml` — locked session-worker and Hub prebuild before `./test.sh --locked`
 - `src/local_webrtc_smoke.rs` — smoke offerer opens the reserved label after Attach
