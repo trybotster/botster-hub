@@ -3799,7 +3799,13 @@ return botster.register({})
             .expect("load event probe plugin");
         ingress_worktree_created(&runtime);
         let mut state = MaintenanceState::default();
-        run_package_event_delivery_slice(&runtime, &mut state);
+        let queue_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < queue_deadline && state.event_in_flight.len() < 2 {
+            run_package_event_delivery_slice(&runtime, &mut state);
+            if state.event_in_flight.len() < 2 {
+                runtime.package_event_router().set_delivery_wake();
+            }
+        }
         assert_eq!(
             state.event_in_flight.len(),
             2,
