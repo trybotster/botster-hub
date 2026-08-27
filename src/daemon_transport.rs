@@ -461,6 +461,11 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
             }
         }
         observe_coalesced_webrtc_slot_ready(&daemon, &mut control_state);
+        let now_seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0);
+        observe_recent_webrtc_binds(&daemon, &mut control_state, now_seconds);
         mark_due_reconciliation(&mut control_state, Instant::now());
         if control_state
             .background
@@ -9240,8 +9245,9 @@ mod tests {
             "generic control must not exact-observe in-flight WebRTC binds"
         );
         assert!(
-            owner_loop.contains("observe_coalesced_webrtc_slot_ready(&daemon"),
-            "every owner turn drains coalesced SlotReady after control, not inside generic request arms"
+            owner_loop.contains("observe_coalesced_webrtc_slot_ready(&daemon")
+                && owner_loop.contains("observe_recent_webrtc_binds(&daemon"),
+            "every owner turn drains SlotReady and empty live binds after control, not inside generic request arms"
         );
         assert!(
             production.contains("WEBRTC_BIND_OBSERVE_TICK"),

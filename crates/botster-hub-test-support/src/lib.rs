@@ -7052,6 +7052,29 @@ done
         assert_process_exits(wait_for_fake_pid(&pid_file));
     }
 
+    #[test]
+    fn isolated_hub_drop_reaps_session_workers_for_the_owned_data_dir() {
+        let source = include_str!("isolated_hub.rs");
+        let drop_impl = source
+            .split("impl Drop for IsolatedHub")
+            .nth(1)
+            .expect("IsolatedHub Drop");
+        let drop_impl = drop_impl
+            .split("/// Errors returned")
+            .next()
+            .unwrap_or(drop_impl);
+        assert!(
+            drop_impl.contains("reap_session_workers_for_data_dir"),
+            "IsolatedHub Drop must reap leftover session-workers for its data dir"
+        );
+        assert!(
+            source.contains("file_name()")
+                && source.contains("botster-session-worker")
+                && source.contains("command.contains(dir.as_ref())"),
+            "reap must match argv0 botster-session-worker and the owned data dir, not pkill -f"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn cleanup_child_falls_back_when_child_is_not_a_process_group_leader() {
