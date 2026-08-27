@@ -149,7 +149,16 @@ Ownership rule kept on this Hub branch:
 
 Unix attach still does not call `expect_terminal_adapter`. Unix duplex bind is out of scope.
 
-This visit requests a new Review. It does not waive `review_1787763686_531984`.
+`review_1787763686_531984` stays closed. This visit does not waive `review_1787786109_244719`. It requests a new Review after official green.
+
+## Review-return repairs (`review_1787786109_244719`)
+
+This visit repaired the two open Review findings without changing ticket intent.
+
+- `finding_1787786109_679721`: `reserved_bind_history_pages_hold` requires at least one HISTORY page between READY and FINISH. `reserved_bind_attach_order_holds` also requires Attached after FINISH. The IsolatedHub producer uses Core's 2000-line default 24x80 recipe and waits for that dump to finish before Attach. It does not shrink to 2x80. A 2-row viewport multiplied Ghostty HISTORY pages through the one-slot adapter and stalled sibling IsolatedHub proofs under official load. `webrtc_reserved_bind_delivers_ready_history_finish_attached_in_order` waits until READY, HISTORY, FINISH, and Attached all hold. `webrtc_reserved_bind_history_assertion_fails_when_only_history_is_dropped` keeps READY, FINISH, and Attached, drops only HISTORY, and fails at the HISTORY assertion.
+- `finding_1787786109_913378`: PR 210 records the new official local suite counts for this head and keeps GitHub Verify separate from that local result.
+
+A 2x80 / 1000-line IsolatedHub producer was attempted first. Isolated HISTORY often finished in about 3 s, but official `./test.sh --locked` then lost live bytes or Attached on sibling IsolatedHub proofs. Two leaked worktree `botster-hub` processes were also spinning at ~100% CPU from earlier overlapping suites. Those were killed before the green official run. Live-output now issues a production Status observe after the go-file release so post-Attached bytes do not wait on a stale bind-observe window.
 
 ## Review-return repairs (`review_1787760007_932950`)
 
@@ -188,7 +197,7 @@ First Implement visit, same shell, `RUSTUP_TOOLCHAIN=1.97.0`, `CARGO_TARGET_DIR`
 | `cargo fmt --all -- --check` | pass |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | pass after the installer `file_mode_bits` repair |
 | `node packages/hub-test-support/scripts/sync-assets.mjs --check` | `hub test-support package assets are current` |
-| `./test.sh --locked` | first visit: exit 0. Hub lib 504 passed. Lifecycle 317 passed, 2 ignored. Elapsed 480616 ms. First Review return: exit 0. Hub lib 512 passed. Lifecycle 317 passed, 2 ignored. Elapsed 450573 ms. Second Review return: exit 0. Hub lib 517 passed. Lifecycle 317 passed, 2 ignored. Elapsed 437289 ms. Third Review return: exit 0. Hub lib 519 passed. Lifecycle 317 passed, 2 ignored. Elapsed 397602 ms. Fourth Review return: exit 0. Hub lib 518 passed. Lifecycle 317 passed, 2 ignored. Elapsed 403168 ms. Core consume: exit 0. Hub lib 523 passed. Lifecycle 318 passed, 2 ignored. Elapsed 392450 ms |
+| `./test.sh --locked` | first visit: exit 0. Hub lib 504 passed. Lifecycle 317 passed, 2 ignored. Elapsed 480616 ms. First Review return: exit 0. Hub lib 512 passed. Lifecycle 317 passed, 2 ignored. Elapsed 450573 ms. Second Review return: exit 0. Hub lib 517 passed. Lifecycle 317 passed, 2 ignored. Elapsed 437289 ms. Third Review return: exit 0. Hub lib 519 passed. Lifecycle 317 passed, 2 ignored. Elapsed 397602 ms. Fourth Review return: exit 0. Hub lib 518 passed. Lifecycle 317 passed, 2 ignored. Elapsed 403168 ms. Core consume: exit 0. Hub lib 523 passed. Lifecycle 318 passed, 2 ignored. Elapsed 392450 ms. HISTORY IsolatedHub oracle: exit 0. Hub lib 523 passed. Lifecycle 319 passed, 2 ignored. Lifecycle 340160 ms. Wrapper elapsed 434720 ms |
 | `cd packages/hub-test-support && npm install --no-save && npm test` | `hub test-support package import and fixture materialization passed` |
 | `git diff --check a0c7141...HEAD` | pass |
 
@@ -286,7 +295,7 @@ A27b Core `WRITE_ATTEMPT_BUDGET` hard-stop is proved by the live write-budget te
 - Live A25/A26/A27 31-channel IsolatedHub fill is not in this suite. Mux-level predicates and the live write-budget sibling test are.
 - Core attach and adapter bind start only after the reserved channel opens. `SendInput` before that open has no Core owner.
 - Unix attach still does not call `expect_terminal_adapter`. Unix duplex bind is out of scope.
-- Isolated `unix_eof_skip_core_detach_ablation_keeps_named_pair_on_status` failed once under official parallel load, then passed isolated. This visit did not change Unix detach.
+- Isolated `unix_eof_skip_core_detach_ablation_keeps_named_pair_on_status` failed once under official parallel load on an earlier visit, then passed isolated. This visit did not change Unix detach. The HISTORY IsolatedHub official run passed that proof.
 - `owner_loop_queues_and_completes_two_fanout_plugin_handlers` can flake under default lib concurrency (1 vs 2 handlers). Isolated reruns pass. The official consume suite passed.
 - This visit will record the new GitHub Verify result after the push.
 - Binary send still wraps JSON `DaemonLocalWebrtcDeliveryChunk`. This ticket did not add a new encrypted-binary framing DTO.

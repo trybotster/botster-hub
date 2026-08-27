@@ -361,9 +361,16 @@ fn external_hub_webrtc_live_output_preserves_exact_bytes() {
         fs::create_dir_all(release_path.parent().expect("release parent"))
             .expect("create webrtc release dir");
         fs::write(&release_path, b"go").expect("release webrtc write(2) producer");
+        let _ = botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status);
 
         let mut concatenated = Vec::new();
-        for _ in 0..120 {
+        for round in 0..120 {
+            if concatenated.is_empty() && round == 8 {
+                let _ = botster_hub_client::request(
+                    &endpoint,
+                    botster_hub_client::DaemonRequest::Status,
+                );
+            }
             if let Ok(Ok(bytes)) = timeout(
                 Duration::from_millis(250),
                 offer_peer.next_terminal_frame(&stream_key),

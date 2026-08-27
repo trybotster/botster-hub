@@ -19,6 +19,20 @@ fn webrtc_ready_then_history_hello() -> botster_hub_client::DaemonHello {
     }
 }
 
+fn attach_frame_summary(bytes: &[u8]) -> String {
+    if let Some(phase) = snapshot_phase(bytes) {
+        return phase;
+    }
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) {
+        let kind = value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?");
+        return format!("json:{kind}:{}", bytes.len());
+    }
+    format!("opaque:{}", bytes.len())
+}
+
 fn snapshot_phase(bytes: &[u8]) -> Option<String> {
     let value = serde_json::from_slice::<serde_json::Value>(bytes).ok()?;
     match value.get("type").and_then(serde_json::Value::as_str) {
@@ -33,6 +47,45 @@ fn snapshot_phase(bytes: &[u8]) -> Option<String> {
         }
         _ => None,
     }
+}
+
+fn reserved_bind_history_pages_hold<S: AsRef<str>>(phases: &[S]) -> Result<(), String> {
+    let phases: Vec<&str> = phases.iter().map(AsRef::as_ref).collect();
+    let ready = phases.iter().position(|phase| *phase == "ready");
+    let finish = phases.iter().position(|phase| *phase == "finish");
+    if ready.is_none() || finish.is_none() {
+        return Err(format!(
+            "bound adapter must receive READY and FINISH without a Hub queue: {phases:?}"
+        ));
+    }
+    let ready = ready.expect("ready");
+    let finish = finish.expect("finish");
+    if !(ready < finish) {
+        return Err(format!("READY must precede FINISH: {phases:?}"));
+    }
+    let history = &phases[ready + 1..finish];
+    if history.is_empty() || !history.iter().all(|phase| *phase == "history") {
+        return Err(format!(
+            "HISTORY pages must sit between READY and FINISH: {phases:?}"
+        ));
+    }
+    if let Some(attached) = phases.iter().position(|phase| *phase == "attached")
+        && !(finish < attached)
+    {
+        return Err(format!("Attached must follow FINISH: {phases:?}"));
+    }
+    Ok(())
+}
+
+fn reserved_bind_attach_order_holds<S: AsRef<str>>(phases: &[S]) -> Result<(), String> {
+    reserved_bind_history_pages_hold(phases)?;
+    if !phases.iter().any(|phase| phase.as_ref() == "attached") {
+        return Err(format!(
+            "bound adapter must receive READY, FINISH, and Attached without a Hub queue: {:?}",
+            phases.iter().map(AsRef::as_ref).collect::<Vec<_>>()
+        ));
+    }
+    Ok(())
 }
 
 fn webrtc_package_event_hello() -> botster_hub_client::DaemonHello {
@@ -78,11 +131,10 @@ fn webrtc_close_event_hello() -> botster_hub_client::DaemonHello {
     }
 }
 
-async fn spawn_and_bind_webrtc(
+async fn spawn_webrtc_session(
     peer: &mut LocalWebrtcOfferPeer,
     key: &botster_core::AesGcmKey,
     session_id: &str,
-    subscription_id: &str,
     command: &str,
 ) {
     let spawned = peer
@@ -99,6 +151,14 @@ async fn spawn_and_bind_webrtc(
         spawned.kind,
         botster_hub_client::DaemonResponseKind::Spawned
     );
+}
+
+async fn bind_reserved_webrtc(
+    peer: &mut LocalWebrtcOfferPeer,
+    key: &botster_core::AesGcmKey,
+    session_id: &str,
+    subscription_id: &str,
+) {
     let attach = peer
         .encrypted_request(
             key,
@@ -132,6 +192,28 @@ async fn spawn_and_bind_webrtc(
     peer.open_reserved_subscription_channel(label)
         .await
         .expect("browser creates the reserved terminal DataChannel");
+}
+
+async fn spawn_and_bind_webrtc(
+    peer: &mut LocalWebrtcOfferPeer,
+    key: &botster_core::AesGcmKey,
+    session_id: &str,
+    subscription_id: &str,
+    command: &str,
+) {
+    spawn_webrtc_session(peer, key, session_id, command).await;
+    bind_reserved_webrtc(peer, key, session_id, subscription_id).await;
+}
+
+fn wait_for_history_ready_file(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if path.exists() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("history producer did not publish {path:?}");
 }
 
 fn webrtc_terminal_contains(
@@ -432,52 +514,75 @@ fn webrtc_reserved_bind_delivers_ready_history_finish_attached_in_order() {
         peer.encrypted_hello(&key, &webrtc_ready_then_history_hello())
             .await
             .expect("ready-then-history hello");
-        spawn_and_bind_webrtc(
+        let marker_dir = unique_short_test_dir("wrh-history");
+        fs::create_dir_all(&marker_dir).expect("create history-ready dir");
+        let ready_path = marker_dir.join("ready");
+        spawn_webrtc_session(
             &mut peer,
             &key,
             session_id,
-            subscription_id,
-            "printf 'ready-history-live\\n'; sleep 30",
+            &format!(
+                concat!(
+                    "stty -echo 2>/dev/null; ",
+                    "i=0; while [ $i -lt 2000 ]; do printf 'wrh-history-%04d\\n' \"$i\"; i=$((i+1)); done; ",
+                    "printf 'ready-history-live\\n'; : > '{}'; sleep 30"
+                ),
+                ready_path.display()
+            ),
         )
         .await;
+        wait_for_history_ready_file(&ready_path);
+        bind_reserved_webrtc(&mut peer, &key, session_id, subscription_id).await;
+        let _ = botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status);
 
-        let deadline = Instant::now() + Duration::from_secs(12);
+        let deadline = Instant::now() + Duration::from_secs(20);
         let mut phases = Vec::new();
+        let mut raw = Vec::new();
+        let mut poked_after_finish = false;
         while Instant::now() < deadline {
             if let Ok(Ok(bytes)) =
-                timeout(Duration::from_millis(250), peer.next_terminal_frame(&key)).await
-                && let Some(phase) = snapshot_phase(&bytes)
+                timeout(Duration::from_millis(20), peer.next_terminal_frame(&key)).await
             {
-                phases.push(phase);
+                raw.push(attach_frame_summary(&bytes));
+                if let Some(phase) = snapshot_phase(&bytes) {
+                    phases.push(phase);
+                }
             }
-            let ready = phases.iter().position(|phase| phase == "ready");
-            let finish = phases.iter().position(|phase| phase == "finish");
-            let attached = phases.iter().position(|phase| phase == "attached");
-            if ready.is_some() && finish.is_some() && attached.is_some() {
+            if reserved_bind_attach_order_holds(&phases).is_ok() {
                 break;
             }
+            if !poked_after_finish
+                && phases.iter().any(|phase| phase == "finish")
+                && !phases.iter().any(|phase| phase == "attached")
+            {
+                let _ =
+                    botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status);
+                poked_after_finish = true;
+            }
         }
-        let ready = phases.iter().position(|phase| phase == "ready");
-        let finish = phases.iter().position(|phase| phase == "finish");
-        let attached = phases.iter().position(|phase| phase == "attached");
-        assert!(
-            ready.is_some() && finish.is_some() && attached.is_some(),
-            "bound adapter must receive READY, FINISH, and Attached without a Hub queue: {phases:?}"
-        );
-        let ready = ready.expect("ready");
-        let finish = finish.expect("finish");
-        let attached = attached.expect("attached");
-        assert!(ready < finish && finish < attached, "{phases:?}");
-        assert!(
-            phases[ready + 1..finish]
-                .iter()
-                .all(|phase| phase == "history"),
-            "HISTORY pages must sit between READY and FINISH: {phases:?}"
-        );
+        reserved_bind_attach_order_holds(&phases).unwrap_or_else(|error| {
+            panic!(
+                "{error}; raw={raw:?}; overflow={}",
+                peer.inbound_overflow()
+            )
+        });
         peer.peer.close().await.expect("close offer peer");
     });
     shutdown_short_lived_session(&endpoint, session_id);
     hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn webrtc_reserved_bind_history_assertion_fails_when_only_history_is_dropped() {
+    reserved_bind_attach_order_holds(&["ready", "history", "finish", "attached"])
+        .expect("complete attach order must hold");
+    let err = reserved_bind_attach_order_holds(&["ready", "finish", "attached"]).expect_err(
+        "dropping only HISTORY must fail after READY, FINISH, and Attached still hold",
+    );
+    assert!(
+        err.contains("HISTORY pages must sit between READY and FINISH"),
+        "negative control must fail at the HISTORY assertion, not earlier: {err}"
+    );
 }
 
 #[test]
