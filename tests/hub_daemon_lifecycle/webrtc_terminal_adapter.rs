@@ -538,7 +538,6 @@ fn webrtc_reserved_bind_delivers_ready_history_finish_attached_in_order() {
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut phases = Vec::new();
         let mut raw = Vec::new();
-        let mut poked_after_finish = false;
         while Instant::now() < deadline {
             if let Ok(Ok(bytes)) =
                 timeout(Duration::from_millis(20), peer.next_terminal_frame(&key)).await
@@ -551,14 +550,6 @@ fn webrtc_reserved_bind_delivers_ready_history_finish_attached_in_order() {
             if reserved_bind_attach_order_holds(&phases).is_ok() {
                 break;
             }
-            if !poked_after_finish
-                && phases.iter().any(|phase| phase == "finish")
-                && !phases.iter().any(|phase| phase == "attached")
-            {
-                let _ =
-                    botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status);
-                poked_after_finish = true;
-            }
         }
         reserved_bind_attach_order_holds(&phases).unwrap_or_else(|error| {
             panic!(
@@ -566,6 +557,34 @@ fn webrtc_reserved_bind_delivers_ready_history_finish_attached_in_order() {
                 peer.inbound_overflow()
             )
         });
+        peer.peer.close().await.expect("close offer peer");
+    });
+    shutdown_short_lived_session(&endpoint, session_id);
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn webrtc_reserved_bind_reaches_attached_without_host_status() {
+    let _guard = daemon_test_guard();
+    let (hub, endpoint, bootstrap) = start_webrtc_adapter_hub("wra");
+    let session_id = "wra-session";
+    let subscription_id = "wra-sub";
+    block_on(async {
+        let (mut peer, key) = open_local_webrtc_peer(&endpoint, &bootstrap).await;
+        peer.encrypted_hello(&key, &webrtc_ready_then_history_hello())
+            .await
+            .expect("ready-then-history hello");
+        spawn_and_bind_webrtc(
+            &mut peer,
+            &key,
+            session_id,
+            subscription_id,
+            "printf 'wra-ready\\n'; sleep 30",
+        )
+        .await;
+        peer.wait_until_attach_started(&key, &endpoint, session_id)
+            .await
+            .expect("Attached must arrive without Status, ListSessions, or ReadScreen after bind");
         peer.peer.close().await.expect("close offer peer");
     });
     shutdown_short_lived_session(&endpoint, session_id);
