@@ -616,7 +616,10 @@ fn external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup() {
         session_cleanup.disarm();
     }
 
+    let data_dir = hub.data_dir().clone();
     hub.shutdown().expect("shutdown isolated hub");
+    reap_session_workers_for_data_dir(&data_dir)
+        .expect("shutdown-after-live-exit must not leave worktree session workers");
 }
 
 #[test]

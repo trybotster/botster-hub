@@ -586,24 +586,49 @@ fn session_worker_pids_for_data_dir(data_dir: &Path) -> Vec<u32> {
             continue;
         }
         let args: Vec<&str> = parts.collect();
-        if args.iter().any(|arg| *arg == dir.as_ref()) {
+        if args.iter().any(|arg| *arg == dir.as_ref())
+            || args.iter().any(|arg| data_dir_arg_matches(arg, data_dir))
+        {
             pids.push(pid);
         }
     }
     pids
 }
 
+fn data_dir_arg_matches(arg: &str, data_dir: &Path) -> bool {
+    let arg_path = Path::new(arg);
+    if arg_path == data_dir {
+        return true;
+    }
+    if !arg_path.is_absolute() && arg_path.components().count() > 1 && data_dir.ends_with(arg_path)
+    {
+        return true;
+    }
+    match (fs::canonicalize(arg_path), fs::canonicalize(data_dir)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
 fn reap_session_workers_for_data_dir(data_dir: &Path) {
-    let pids = session_worker_pids_for_data_dir(data_dir);
-    if pids.is_empty() {
-        return;
-    }
-    for pid in pids {
-        let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-    }
-    thread::sleep(Duration::from_millis(50));
-    for pid in session_worker_pids_for_data_dir(data_dir) {
-        let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let pids = session_worker_pids_for_data_dir(data_dir);
+        if pids.is_empty() {
+            return;
+        }
+        let signal = if Instant::now() + Duration::from_millis(400) >= deadline {
+            libc::SIGKILL
+        } else {
+            libc::SIGTERM
+        };
+        for pid in pids {
+            let _ = unsafe { libc::kill(pid as libc::pid_t, signal) };
+        }
+        if Instant::now() >= deadline {
+            return;
+        }
+        thread::sleep(Duration::from_millis(50));
     }
 }
 
