@@ -285,7 +285,7 @@ impl WebRtcTerminalAdapterInner {
         if self.is_closed() {
             return Err(TerminalAdapterWriteError::Closed);
         }
-        if self.would_block.load(Ordering::SeqCst) {
+        if self.aggregate_would_block() {
             return Err(TerminalAdapterWriteError::WouldBlock);
         }
         let bytes = match frame.to_bytes() {

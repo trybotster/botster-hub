@@ -161,7 +161,10 @@ pub(crate) const ENTITY_SUBSCRIPTION_QUEUE_CAPACITY: usize = 64;
 const ENTITY_RECONCILIATION_INTERVAL: Duration = Duration::from_millis(500);
 const WEBRTC_BIND_OBSERVE_TICK: Duration = Duration::from_millis(50);
 const WEBRTC_SLOT_READY_OBSERVE_BOUND: Duration = Duration::from_secs(20);
-const WEBRTC_SLOT_READY_OBSERVE_ATTEMPTS: usize = 8;
+// One Core ClientWorker tick per drain. The adapter holds one frame. Extra
+// observe calls in the same turn see WouldBlock or Full and count toward
+// Core WRITE_ATTEMPT_BUDGET (512), which hard-stops before Attached.
+const WEBRTC_SLOT_READY_OBSERVE_ATTEMPTS: usize = 1;
 static NEXT_SOCKET_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) type ControlSender = tokio_mpsc::Sender<ControlMessage>;
@@ -9288,6 +9291,10 @@ mod tests {
             pump.contains("observe_coalesced_webrtc_slot_ready")
                 && pump.contains("observe_recent_webrtc_binds"),
             "Pump must drain coalesced SlotReady and empty live bind observes so CloseEvents cannot skip Attached"
+        );
+        assert_eq!(
+            WEBRTC_SLOT_READY_OBSERVE_ATTEMPTS, 1,
+            "one Core pump tick per SlotReady drain; extra ticks burn WRITE_ATTEMPT_BUDGET"
         );
         let coalesced = production
             .split("fn observe_coalesced_webrtc_slot_ready")

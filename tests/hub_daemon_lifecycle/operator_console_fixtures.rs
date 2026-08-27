@@ -49,7 +49,7 @@ use crate::support::{
 use super::*;
 
 pub(crate) const OPERATOR_CONSOLE_READINESS_LIVENESS_BACKSTOP: Duration = Duration::from_secs(60);
-pub(crate) const OPERATOR_CONSOLE_READER_DRAIN_BACKSTOP: Duration = Duration::from_secs(2);
+pub(crate) const OPERATOR_CONSOLE_READER_DRAIN_BACKSTOP: Duration = Duration::from_secs(5);
 pub(crate) const OPERATOR_CONSOLE_OUTPUT_PROGRESS_BACKSTOP: Duration =
     LOCAL_RUNTIME_DAEMON_READINESS_BUDGET;
 pub(crate) const DETERMINISTIC_FOREGROUND_INTERRUPT_SCRIPT: &str = "trap '' INT; node -e 'process.on(\"SIGINT\", () => process.exit(130)); console.log(\"foreground-forward-ready\"); setInterval(() => {}, 1000)' & child=$!; wait \"$child\"";
@@ -610,6 +610,7 @@ impl OperatorConsolePty {
                 .expect("poll operator console")
                 .is_some()
             {
+                self.writer.take();
                 self.finish_reader_after_exit(OPERATOR_CONSOLE_READER_DRAIN_BACKSTOP)
                     .unwrap_or_else(|error| panic!("{error}"));
                 return;

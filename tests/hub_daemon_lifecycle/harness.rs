@@ -196,6 +196,15 @@ impl Drop for ScopedHarnessTaint {
     }
 }
 
+/// Clears harness taint on drop so a failed proof cannot poison later tests.
+pub(crate) struct ResetHarnessTaintOnDrop;
+
+impl Drop for ResetHarnessTaintOnDrop {
+    fn drop(&mut self) {
+        reset_harness_taint_after_proof();
+    }
+}
+
 pub(crate) fn format_harness_budget_expired(
     kind: &str,
     budget: Duration,
