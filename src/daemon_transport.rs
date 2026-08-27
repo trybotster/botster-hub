@@ -161,9 +161,10 @@ pub(crate) const ENTITY_SUBSCRIPTION_QUEUE_CAPACITY: usize = 64;
 const ENTITY_RECONCILIATION_INTERVAL: Duration = Duration::from_millis(500);
 const WEBRTC_BIND_OBSERVE_TICK: Duration = Duration::from_millis(50);
 const WEBRTC_SLOT_READY_OBSERVE_BOUND: Duration = Duration::from_secs(20);
-// One Core ClientWorker tick per coalesced SlotReady drain. Extra observes
-// against a Full slot count toward WRITE_ATTEMPT_BUDGET (512).
-const WEBRTC_SLOT_READY_OBSERVE_ATTEMPTS: usize = 1;
+// Empty persist ticks per coalesced SlotReady drain. GitHub IsolatedHub+web
+// needs several empty ticks after bind and after FINISH flush. Stop early
+// when the one-slot adapter fills so extra ticks do not burn WRITE_ATTEMPT_BUDGET.
+const WEBRTC_SLOT_READY_OBSERVE_ATTEMPTS: usize = 8;
 // After the mux flushes a frame the slot is empty. Core may need several
 // pump ticks on that empty slot before Attached is offered (FINISH accepted
 // first). This bound is only for mux-flushed drains, not persist ticks.
@@ -2674,6 +2675,11 @@ pub(crate) fn handle_control_message(
                     state
                         .pending_runtime
                         .extend_webrtc_bind_observe(&session_id);
+                    // Persist starts before the first flush. Mux-flush drain only
+                    // posts after complete_active, so an empty bind would otherwise
+                    // stay attaching until due observe.
+                    state.pending_runtime.note_webrtc_slot_ready(&session_id);
+                    let _ = state.empty_slot_drain_tx.try_send(session_id.clone());
                     state.background.mark_pump();
                     let _ = (reservation, label);
                     reply_reserved_bind(daemon, reply_tx, Ok(()));
@@ -6213,6 +6219,12 @@ fn observe_flushed_webrtc_slots(daemon: &HubDaemon, state: &mut DaemonControlSta
             }
             let _ = runtime.observe_session_lifecycle(&SessionId(session_id.clone()), now);
         }
+        if state
+            .pending_runtime
+            .webrtc_session_ready_to_observe(&session_id)
+        {
+            state.pending_runtime.note_webrtc_slot_ready(&session_id);
+        }
     }
 }
 
@@ -9373,9 +9385,22 @@ mod tests {
                 && pump.contains("observe_recent_webrtc_binds"),
             "Pump must drain coalesced SlotReady and empty live bind observes so CloseEvents cannot skip Attached"
         );
+        let bind = production
+            .split("ControlMessage::BindReservedWebrtcChannel")
+            .nth(1)
+            .expect("BindReservedWebrtcChannel");
+        let bind = bind
+            .split("ControlMessage::SweepWebrtcReservation")
+            .next()
+            .unwrap_or(bind);
+        assert!(
+            bind.contains("note_webrtc_slot_ready")
+                && bind.contains("empty_slot_drain_tx.try_send"),
+            "reserved bind starts empty-slot persist before the first mux flush"
+        );
         assert_eq!(
-            WEBRTC_SLOT_READY_OBSERVE_ATTEMPTS, 1,
-            "one Core pump tick per SlotReady drain; extra ticks burn WRITE_ATTEMPT_BUDGET"
+            WEBRTC_SLOT_READY_OBSERVE_ATTEMPTS, 8,
+            "persist drain may take several empty ticks so READY through Attached can complete after bind"
         );
         let due = production
             .split("fn observe_due_webrtc_binds")
