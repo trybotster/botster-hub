@@ -161,9 +161,10 @@ pub(crate) const ENTITY_SUBSCRIPTION_QUEUE_CAPACITY: usize = 64;
 const ENTITY_RECONCILIATION_INTERVAL: Duration = Duration::from_millis(500);
 const WEBRTC_BIND_OBSERVE_TICK: Duration = Duration::from_millis(50);
 const WEBRTC_SLOT_READY_OBSERVE_BOUND: Duration = Duration::from_secs(20);
-// Empty persist ticks per coalesced SlotReady drain. GitHub IsolatedHub+web
-// needs several empty ticks after bind and after FINISH flush. Stop early
-// when the one-slot adapter fills so extra ticks do not burn WRITE_ATTEMPT_BUDGET.
+// Empty persist ticks after SlotReady. Stop when the one-slot adapter fills.
+// Mux-flush drain also pumps after complete_active; persist is the fallback
+// when that post is delayed. Do not 8-tick from bind itself (that burns
+// WRITE_ATTEMPT_BUDGET before the first flush).
 const WEBRTC_SLOT_READY_OBSERVE_ATTEMPTS: usize = 8;
 // After the mux flushes a frame the slot is empty. Core may need several
 // pump ticks on that empty slot before Attached is offered (FINISH accepted
@@ -2679,7 +2680,6 @@ pub(crate) fn handle_control_message(
                     // posts after complete_active, so an empty bind would otherwise
                     // stay attaching until due observe.
                     state.pending_runtime.note_webrtc_slot_ready(&session_id);
-                    let _ = state.empty_slot_drain_tx.try_send(session_id.clone());
                     state.background.mark_pump();
                     let _ = (reservation, label);
                     reply_reserved_bind(daemon, reply_tx, Ok(()));
@@ -9395,12 +9395,12 @@ mod tests {
             .unwrap_or(bind);
         assert!(
             bind.contains("note_webrtc_slot_ready")
-                && bind.contains("empty_slot_drain_tx.try_send"),
-            "reserved bind starts empty-slot persist before the first mux flush"
+                && !bind.contains("empty_slot_drain_tx.try_send"),
+            "reserved bind starts coalesced persist before the first mux flush without an 8-tick bind pump"
         );
         assert_eq!(
             WEBRTC_SLOT_READY_OBSERVE_ATTEMPTS, 8,
-            "persist drain may take several empty ticks so READY through Attached can complete after bind"
+            "coalesced persist may take several empty ticks after a flush; bind does not 8-tick itself"
         );
         let due = production
             .split("fn observe_due_webrtc_binds")
