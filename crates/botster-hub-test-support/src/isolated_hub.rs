@@ -585,9 +585,8 @@ fn session_worker_pids_for_data_dir(data_dir: &Path) -> Vec<u32> {
         if !is_worker {
             continue;
         }
-        let rest: Vec<&str> = parts.collect();
-        let command = format!("{argv0} {}", rest.join(" "));
-        if command.contains(dir.as_ref()) {
+        let args: Vec<&str> = parts.collect();
+        if args.iter().any(|arg| *arg == dir.as_ref()) {
             pids.push(pid);
         }
     }
