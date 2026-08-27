@@ -5775,6 +5775,21 @@ impl PendingRuntimeState {
         })
     }
 
+    fn webrtc_session_has_live_bound_route(&self, session_id: &str) -> bool {
+        self.webrtc_admissions.values().any(|admission| {
+            matches!(
+                admission,
+                WebrtcTerminalAdmission::Admitted { mux, .. }
+                    if mux.session_has_live_bound_handle(session_id)
+            )
+        })
+    }
+
+    fn webrtc_session_ready_to_observe(&self, session_id: &str) -> bool {
+        self.webrtc_session_has_live_bound_route(session_id)
+            && !self.webrtc_session_slot_occupied(session_id)
+    }
+
     fn store_webrtc_reservation(
         &mut self,
         key: (String, String, String, u64),
@@ -5885,6 +5900,11 @@ impl PendingRuntimeState {
 
 fn run_one_pump_phase(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
     observe_coalesced_webrtc_slot_ready(daemon, state);
+    let now_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    observe_recent_webrtc_binds(daemon, state, now_seconds);
     let phase = state.pump.take_phase();
     let incomplete = match phase {
         PumpPhase::CloseEvents => run_close_events_phase(daemon, state),
@@ -6075,20 +6095,38 @@ fn webrtc_bound_slots_block_journal_pump(state: &DaemonControlState) -> bool {
     saw_live && !saw_ready
 }
 
-fn webrtc_recent_bind_needs_observe(state: &mut DaemonControlState) -> bool {
+fn prune_webrtc_bind_observe_deadlines(state: &mut DaemonControlState) {
     let now = Instant::now();
-    state
+    let stale: Vec<String> = state
         .pending_runtime
         .webrtc_bind_observe_deadline
-        .retain(|_, deadline| *deadline > now);
+        .iter()
+        .filter(|(session_id, deadline)| {
+            **deadline <= now
+                || !state
+                    .pending_runtime
+                    .webrtc_session_has_live_bound_route(session_id)
+        })
+        .map(|(session_id, _)| session_id.clone())
+        .collect();
+    for session_id in stale {
+        state
+            .pending_runtime
+            .webrtc_bind_observe_deadline
+            .remove(&session_id);
+    }
+}
+
+fn webrtc_recent_bind_needs_observe(state: &mut DaemonControlState) -> bool {
+    prune_webrtc_bind_observe_deadlines(state);
     state
         .pending_runtime
         .webrtc_bind_observe_deadline
         .keys()
         .any(|session_id| {
-            !state
+            state
                 .pending_runtime
-                .webrtc_session_slot_occupied(session_id)
+                .webrtc_session_ready_to_observe(session_id)
         })
 }
 
@@ -6099,15 +6137,21 @@ fn webrtc_slot_ready_has_empty_session(state: &DaemonControlState) -> bool {
         .session_ids()
         .into_iter()
         .any(|session_id| {
-            !state
+            state
                 .pending_runtime
-                .webrtc_session_slot_occupied(&session_id)
+                .webrtc_session_ready_to_observe(&session_id)
         })
 }
 
 fn take_unoccupied_webrtc_slot_ready(state: &mut DaemonControlState) -> Vec<String> {
     let mut ready = Vec::new();
     for session_id in state.pending_runtime.take_webrtc_slot_ready() {
+        if !state
+            .pending_runtime
+            .webrtc_session_has_live_bound_route(&session_id)
+        {
+            continue;
+        }
         if state
             .pending_runtime
             .webrtc_session_slot_occupied(&session_id)
@@ -6160,24 +6204,18 @@ fn observe_recent_webrtc_binds(
     let Some(runtime) = daemon.runtime() else {
         return;
     };
-    let sessions: Vec<String> = {
-        let now = Instant::now();
-        state
-            .pending_runtime
-            .webrtc_bind_observe_deadline
-            .retain(|_, deadline| *deadline > now);
-        state
-            .pending_runtime
-            .webrtc_bind_observe_deadline
-            .keys()
-            .filter(|session_id| {
-                !state
-                    .pending_runtime
-                    .webrtc_session_slot_occupied(session_id)
-            })
-            .cloned()
-            .collect()
-    };
+    let _ = webrtc_recent_bind_needs_observe(state);
+    let sessions: Vec<String> = state
+        .pending_runtime
+        .webrtc_bind_observe_deadline
+        .keys()
+        .filter(|session_id| {
+            state
+                .pending_runtime
+                .webrtc_session_ready_to_observe(session_id)
+        })
+        .cloned()
+        .collect();
     for session_id in sessions {
         let _ = runtime.observe_session_lifecycle(&SessionId(session_id), now_seconds);
     }
@@ -9228,8 +9266,9 @@ mod tests {
             .expect("pump runner");
         let pump = pump.split("fn next_admission_key").next().unwrap_or(pump);
         assert!(
-            pump.contains("observe_coalesced_webrtc_slot_ready"),
-            "Pump must drain coalesced SlotReady so generic control cannot starve a ready route"
+            pump.contains("observe_coalesced_webrtc_slot_ready")
+                && pump.contains("observe_recent_webrtc_binds"),
+            "Pump must drain coalesced SlotReady and empty live bind observes so CloseEvents cannot skip Attached"
         );
         let coalesced = production
             .split("fn observe_coalesced_webrtc_slot_ready")
@@ -9254,8 +9293,9 @@ mod tests {
             .unwrap_or(occupied_filter);
         assert!(
             occupied_filter.contains("webrtc_session_slot_occupied")
+                && occupied_filter.contains("webrtc_session_has_live_bound_route")
                 && occupied_filter.contains("note_webrtc_slot_ready"),
-            "a full adapter slot keeps the coalesced session key and waits for an empty slot"
+            "a full live adapter slot keeps the coalesced session key; closed routes drop it"
         );
         let due = production
             .split("fn mark_due_reconciliation")
@@ -9277,10 +9317,24 @@ mod tests {
 
     #[test]
     fn coalesced_webrtc_slot_ready_marks_pump_and_coalesces_without_lost_wakeup() {
+        let mux = WebRtcConnectionMux::new();
+        let label = mux
+            .reserve_terminal("grant".into(), "sess".into(), "sub".into(), 1)
+            .expect("reserve");
+        let (_adapter, handle) = mux.create_adapter();
+        assert!(mux.bind_reserved(&label, handle));
         let mut state = DaemonControlState {
             next_reconciliation: Instant::now() + Duration::from_secs(30),
             ..DaemonControlState::default()
         };
+        state.pending_runtime.webrtc_admissions.insert(
+            "grant".into(),
+            WebrtcTerminalAdmission::Admitted {
+                required_features: Vec::new(),
+                mux,
+                terminal_requirement: None,
+            },
+        );
         state.pending_runtime.note_webrtc_slot_ready("sess");
         state.pending_runtime.note_webrtc_slot_ready("sess");
         mark_due_reconciliation(&mut state, Instant::now());
@@ -9361,10 +9415,24 @@ mod tests {
 
     #[test]
     fn ready_webrtc_route_progresses_within_two_background_slices_under_queued_control() {
+        let mux = WebRtcConnectionMux::new();
+        let label = mux
+            .reserve_terminal("grant".into(), "sess".into(), "sub".into(), 1)
+            .expect("reserve");
+        let (_adapter, handle) = mux.create_adapter();
+        assert!(mux.bind_reserved(&label, handle));
         let mut state = DaemonControlState {
             next_reconciliation: Instant::now() + Duration::from_secs(30),
             ..DaemonControlState::default()
         };
+        state.pending_runtime.webrtc_admissions.insert(
+            "grant".into(),
+            WebrtcTerminalAdmission::Admitted {
+                required_features: Vec::new(),
+                mux,
+                terminal_requirement: None,
+            },
+        );
         state.pending_runtime.note_webrtc_slot_ready("sess");
         mark_due_reconciliation(&mut state, Instant::now());
         assert!(matches!(
