@@ -248,6 +248,14 @@ fn mark_due_reconciliation(state: &mut DaemonControlState, now: Instant) {
     }
 }
 
+fn observe_in_flight_webrtc_binds(daemon: &HubDaemon, state: &mut DaemonControlState) {
+    if !webrtc_recent_bind_needs_observe(state) {
+        return;
+    }
+    let now = tick(&mut state.logical_clock);
+    observe_recent_webrtc_binds(daemon, state, now);
+}
+
 fn run_one_owner_background_slice(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
     let maintenance_pending = owner_maintenance_pending(daemon, state);
     let BackgroundTurnDecision::OneSlice(class) =
@@ -375,6 +383,7 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
             }
         };
         if let Some(OwnerEvent::Control(message)) = event {
+            observe_in_flight_webrtc_binds(&daemon, &mut control_state);
             match *message {
                 Some(ControlMessage::AcceptedConnection {
                     stream,
@@ -9093,6 +9102,36 @@ mod tests {
             panic!("ready control message must win before a future reconciliation deadline");
         };
         assert!(matches!(*message, Some(ControlMessage::RejectedConnection)));
+    }
+
+    #[test]
+    fn owner_loop_observes_in_flight_webrtc_binds_when_queued_control_wins() {
+        const TRANSPORT: &str = include_str!("daemon_transport.rs");
+        let production = TRANSPORT.split("mod tests").next().expect("production");
+        let owner_loop = production
+            .split("reap_finished_connection_tasks")
+            .nth(1)
+            .expect("owner loop");
+        let control_arm = owner_loop
+            .split("if let Some(OwnerEvent::Control(message))")
+            .nth(1)
+            .expect("control arm");
+        let control_arm = control_arm.split("} else {").next().unwrap_or(control_arm);
+        assert!(
+            control_arm.contains("observe_in_flight_webrtc_binds"),
+            "queued web/control work must exact-observe an empty just-bound WebRTC slot"
+        );
+        assert!(
+            !production
+                .split("loop {")
+                .nth(1)
+                .expect("owner loop")
+                .split("let slice_due")
+                .next()
+                .unwrap_or("")
+                .contains("observe_in_flight_webrtc_binds"),
+            "in-flight bind observe must not be a tight remake on every owner turn"
+        );
     }
 
     #[test]
