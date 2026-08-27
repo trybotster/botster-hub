@@ -513,6 +513,14 @@ impl WebrtcSlotReadyWake {
     }
 
     #[must_use]
+    pub(crate) fn session_ids(&self) -> Vec<String> {
+        self.sessions
+            .lock()
+            .map(|sessions| sessions.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    #[must_use]
     pub(crate) fn take_sessions(&self) -> Vec<String> {
         self.pending.store(false, Ordering::SeqCst);
         self.sessions

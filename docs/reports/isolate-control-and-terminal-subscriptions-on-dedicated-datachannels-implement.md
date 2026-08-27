@@ -217,6 +217,15 @@ Deterministic red controls:
 
 Official `./test.sh --locked` on this head: exit 0. Hub lib 528 passed. Lifecycle 320 passed, 2 ignored. Lifecycle 301.80 s. `external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup` and `webrtc_terminal_adapter_stale_generation_close_does_not_sweep_replacement_owner` passed in that full-suite order.
 
+## Review-return repairs (`review_1787807102_632470`)
+
+This visit repaired the two open Review findings without changing ticket intent.
+
+- `finding_1787807102_177084`: `ReservedWebrtcSlotReady` is a doorbell only. Coalesced drain observes empty slots. A full slot keeps the session key but `mark_due_reconciliation` does not mark Pump until a slot is empty. The owner loop Blocks and may schedule a 50 ms recheck. `full_webrtc_slot_does_not_keep_the_owner_loop_runnable` holds a live bound slot Full and proves Pump is not forced.
+- `finding_1787807102_232658`: `webrtc_reserved_bind_reaches_attached_without_host_status` no longer starts `GenericControlFlood`. It binds and waits for Attached with no Status, ListSessions, or ReadScreen after bind. Continuous generic control remains a separate IsolatedHub load on the stale-generation replacement proof.
+
+`finding_1787801254_356028` stays accepted: generic control still does not exact-observe. The no-control IsolatedHub proof now matches that claim.
+
 ## Official gates
 
 First Implement visit, same shell, `RUSTUP_TOOLCHAIN=1.97.0`, `CARGO_TARGET_DIR` unset:
@@ -230,7 +239,7 @@ First Implement visit, same shell, `RUSTUP_TOOLCHAIN=1.97.0`, `CARGO_TARGET_DIR`
 | `cargo fmt --all -- --check` | pass |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | pass after the installer `file_mode_bits` repair |
 | `node packages/hub-test-support/scripts/sync-assets.mjs --check` | `hub test-support package assets are current` |
-| `./test.sh --locked` | first visit: exit 0. Hub lib 504 passed. Lifecycle 317 passed, 2 ignored. Elapsed 480616 ms. First Review return: exit 0. Hub lib 512 passed. Lifecycle 317 passed, 2 ignored. Elapsed 450573 ms. Second Review return: exit 0. Hub lib 517 passed. Lifecycle 317 passed, 2 ignored. Elapsed 437289 ms. Third Review return: exit 0. Hub lib 519 passed. Lifecycle 317 passed, 2 ignored. Elapsed 397602 ms. Fourth Review return: exit 0. Hub lib 518 passed. Lifecycle 317 passed, 2 ignored. Elapsed 403168 ms. Core consume: exit 0. Hub lib 523 passed. Lifecycle 318 passed, 2 ignored. Elapsed 392450 ms. HISTORY IsolatedHub oracle: exit 0. Hub lib 523 passed. Lifecycle 319 passed, 2 ignored. Lifecycle 340160 ms. Wrapper elapsed 434720 ms. In-flight bind observe: exit 0. Hub lib 524 passed. Lifecycle 319 passed, 2 ignored. Lifecycle 304380 ms. Wrapper elapsed 384770 ms. Owner-loop SlotReady coalescing: exit 0. Hub lib 528 passed. Lifecycle 320 passed, 2 ignored. Lifecycle 301800 ms |
+| `./test.sh --locked` | first visit: exit 0. Hub lib 504 passed. Lifecycle 317 passed, 2 ignored. Elapsed 480616 ms. First Review return: exit 0. Hub lib 512 passed. Lifecycle 317 passed, 2 ignored. Elapsed 450573 ms. Second Review return: exit 0. Hub lib 517 passed. Lifecycle 317 passed, 2 ignored. Elapsed 437289 ms. Third Review return: exit 0. Hub lib 519 passed. Lifecycle 317 passed, 2 ignored. Elapsed 397602 ms. Fourth Review return: exit 0. Hub lib 518 passed. Lifecycle 317 passed, 2 ignored. Elapsed 403168 ms. Core consume: exit 0. Hub lib 523 passed. Lifecycle 318 passed, 2 ignored. Elapsed 392450 ms. HISTORY IsolatedHub oracle: exit 0. Hub lib 523 passed. Lifecycle 319 passed, 2 ignored. Lifecycle 340160 ms. Wrapper elapsed 434720 ms. In-flight bind observe: exit 0. Hub lib 524 passed. Lifecycle 319 passed, 2 ignored. Lifecycle 304380 ms. Wrapper elapsed 384770 ms. Owner-loop SlotReady coalescing: exit 0. Hub lib 528 passed. Lifecycle 320 passed, 2 ignored. Lifecycle 301800 ms. Full-slot Pump gating: exit 0. Hub lib 529 passed. Lifecycle 320 passed, 2 ignored. Lifecycle 308860 ms |
 | `cd packages/hub-test-support && npm install --no-save && npm test` | `hub test-support package import and fixture materialization passed` |
 | `git diff --check a0c7141...HEAD` | pass |
 
