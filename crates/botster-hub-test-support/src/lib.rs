@@ -7070,8 +7070,8 @@ done
         assert!(
             source.contains("file_name()")
                 && source.contains("botster-session-worker")
-                && source.contains("command.contains(dir.as_ref())"),
-            "reap must match argv0 botster-session-worker and the owned data dir, not pkill -f"
+                && source.contains("args.iter().any(|arg| *arg == dir.as_ref())"),
+            "reap must match argv0 botster-session-worker and an exact data-dir argument, not pkill -f"
         );
     }
 
