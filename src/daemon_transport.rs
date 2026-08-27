@@ -2665,7 +2665,6 @@ pub(crate) fn handle_control_message(
                     state
                         .pending_runtime
                         .extend_webrtc_bind_observe(&session_id);
-                    state.pending_runtime.note_webrtc_slot_ready(&session_id);
                     state.background.mark_pump();
                     let _ = (reservation, label);
                     reply_reserved_bind(daemon, reply_tx, Ok(()));
@@ -6219,6 +6218,9 @@ fn observe_reserved_session_until_slot_full(
 }
 
 fn observe_due_webrtc_binds(daemon: &HubDaemon, state: &mut DaemonControlState) {
+    if state.pending_runtime.webrtc_slot_ready_pending() {
+        return;
+    }
     if !webrtc_recent_bind_needs_observe(state) {
         return;
     }
@@ -9323,6 +9325,30 @@ mod tests {
         assert_eq!(
             WEBRTC_SLOT_READY_OBSERVE_ATTEMPTS, 1,
             "one Core pump tick per SlotReady drain; extra ticks burn WRITE_ATTEMPT_BUDGET"
+        );
+        let due = production
+            .split("fn observe_due_webrtc_binds")
+            .nth(1)
+            .expect("due bind observe");
+        let due = due
+            .split("fn observe_recent_webrtc_binds")
+            .next()
+            .unwrap_or(due);
+        assert!(
+            due.contains("webrtc_slot_ready_pending"),
+            "due bind observe must not double-pump a SlotReady persist drain"
+        );
+        let prune = production
+            .split("fn prune_webrtc_bind_observe_deadlines")
+            .nth(1)
+            .expect("prune bind deadlines");
+        let prune = prune
+            .split("fn webrtc_recent_bind_needs_observe")
+            .next()
+            .unwrap_or(prune);
+        assert!(
+            !prune.contains("webrtc_session_ready_to_observe"),
+            "deadline prune stays closed-peer or expired; persist SlotReady covers live after Attached"
         );
         let coalesced = production
             .split("fn observe_coalesced_webrtc_slot_ready")
