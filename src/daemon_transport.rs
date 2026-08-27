@@ -238,8 +238,13 @@ fn mark_due_reconciliation(state: &mut DaemonControlState, now: Instant) {
             state.next_reconciliation = soon;
         }
     }
-    if state.pending_runtime.webrtc_slot_ready_pending() {
+    if webrtc_slot_ready_has_empty_session(state) {
         state.background.mark_pump();
+    } else if state.pending_runtime.webrtc_slot_ready_pending() {
+        let soon = now + WEBRTC_BIND_OBSERVE_TICK;
+        if state.next_reconciliation > soon {
+            state.next_reconciliation = soon;
+        }
     }
     if state.next_reconciliation <= now {
         state.background.mark_pump();
@@ -2670,10 +2675,10 @@ pub(crate) fn handle_control_message(
             false
         }
         ControlMessage::ReservedWebrtcSlotReady { session_id } => {
+            state.pending_runtime.note_webrtc_slot_ready(&session_id);
             state
                 .pending_runtime
                 .extend_webrtc_bind_observe(&session_id);
-            observe_reserved_session_until_slot_full(daemon, state, &session_id);
             state.background.mark_pump();
             false
         }
@@ -6087,16 +6092,36 @@ fn webrtc_recent_bind_needs_observe(state: &mut DaemonControlState) -> bool {
         })
 }
 
-fn observe_coalesced_webrtc_slot_ready(daemon: &HubDaemon, state: &mut DaemonControlState) {
-    let sessions = state.pending_runtime.take_webrtc_slot_ready();
-    for session_id in sessions {
+fn webrtc_slot_ready_has_empty_session(state: &DaemonControlState) -> bool {
+    state
+        .pending_runtime
+        .slot_ready
+        .session_ids()
+        .into_iter()
+        .any(|session_id| {
+            !state
+                .pending_runtime
+                .webrtc_session_slot_occupied(&session_id)
+        })
+}
+
+fn take_unoccupied_webrtc_slot_ready(state: &mut DaemonControlState) -> Vec<String> {
+    let mut ready = Vec::new();
+    for session_id in state.pending_runtime.take_webrtc_slot_ready() {
         if state
             .pending_runtime
             .webrtc_session_slot_occupied(&session_id)
         {
             state.pending_runtime.note_webrtc_slot_ready(&session_id);
-            continue;
+        } else {
+            ready.push(session_id);
         }
+    }
+    ready
+}
+
+fn observe_coalesced_webrtc_slot_ready(daemon: &HubDaemon, state: &mut DaemonControlState) {
+    for session_id in take_unoccupied_webrtc_slot_ready(state) {
         state
             .pending_runtime
             .extend_webrtc_bind_observe(&session_id);
@@ -9171,8 +9196,10 @@ mod tests {
             .next()
             .unwrap_or(slot_ready);
         assert!(
-            slot_ready.contains("observe_reserved_session_until_slot_full"),
-            "SlotReady remains the route-specific observe opportunity"
+            slot_ready.contains("note_webrtc_slot_ready")
+                && slot_ready.contains("mark_pump")
+                && !slot_ready.contains("observe_reserved_session_until_slot_full"),
+            "SlotReady is a doorbell: coalesce and mark Pump, do not observe in the control arm"
         );
         for request in ["DaemonRequest::Status", "DaemonRequest::ListSessions"] {
             let arm = production
@@ -9213,9 +9240,34 @@ mod tests {
             .next()
             .unwrap_or(coalesced);
         assert!(
-            coalesced.contains("webrtc_session_slot_occupied")
-                && coalesced.contains("note_webrtc_slot_ready"),
-            "a SlotReady taken while the one-slot is Full must be restored, not dropped"
+            coalesced.contains("take_unoccupied_webrtc_slot_ready")
+                || production.contains("fn take_unoccupied_webrtc_slot_ready"),
+            "coalesced drain observes only empty slots"
+        );
+        let occupied_filter = production
+            .split("fn take_unoccupied_webrtc_slot_ready")
+            .nth(1)
+            .expect("unoccupied take");
+        let occupied_filter = occupied_filter
+            .split("fn observe_coalesced_webrtc_slot_ready")
+            .next()
+            .unwrap_or(occupied_filter);
+        assert!(
+            occupied_filter.contains("webrtc_session_slot_occupied")
+                && occupied_filter.contains("note_webrtc_slot_ready"),
+            "a full adapter slot keeps the coalesced session key and waits for an empty slot"
+        );
+        let due = production
+            .split("fn mark_due_reconciliation")
+            .nth(1)
+            .expect("mark_due");
+        let due = due
+            .split("fn run_one_owner_background_slice")
+            .next()
+            .unwrap_or(due);
+        assert!(
+            due.contains("webrtc_slot_ready_has_empty_session"),
+            "Pump is marked only when a coalesced SlotReady session has an empty slot"
         );
         assert!(
             !control_arm.contains("observe_coalesced_webrtc_slot_ready"),
@@ -9251,6 +9303,60 @@ mod tests {
             vec!["sess-a".to_string(), "sess-b".to_string()],
             "distinct ready sessions stay distinct keys"
         );
+    }
+
+    #[test]
+    fn full_webrtc_slot_does_not_keep_the_owner_loop_runnable() {
+        use botster_core::contract::terminal_adapter::TerminalAdapter;
+        use botster_terminal_protocol::TerminalFrame;
+
+        let mux = WebRtcConnectionMux::new();
+        let label = mux
+            .reserve_terminal("grant".into(), "sess".into(), "sub".into(), 1)
+            .expect("reserve");
+        let (mut adapter, handle) = mux.create_adapter();
+        assert!(mux.bind_reserved(&label, handle));
+        let frame = TerminalFrame::from_bytes(br#"{"type":"terminal_output"}"#).expect("frame");
+        assert_eq!(adapter.try_write(&frame), Ok(()));
+        assert!(mux.session_bound_slot_occupied("sess"));
+
+        let mut state = DaemonControlState {
+            next_reconciliation: Instant::now() + Duration::from_secs(30),
+            ..DaemonControlState::default()
+        };
+        state.pending_runtime.webrtc_admissions.insert(
+            "grant".into(),
+            WebrtcTerminalAdmission::Admitted {
+                required_features: Vec::new(),
+                mux,
+                terminal_requirement: None,
+            },
+        );
+        state.pending_runtime.note_webrtc_slot_ready("sess");
+        let ready = take_unoccupied_webrtc_slot_ready(&mut state);
+        assert!(
+            ready.is_empty(),
+            "a full adapter slot must not be observed: {ready:?}"
+        );
+        assert!(
+            state.pending_runtime.webrtc_slot_ready_pending(),
+            "a full adapter slot keeps the coalesced session until the slot is empty"
+        );
+        let now = Instant::now();
+        mark_due_reconciliation(&mut state, now);
+        assert!(
+            !state.background.pump_pending(),
+            "a full adapter slot must not force Pump turns"
+        );
+        assert!(
+            state.next_reconciliation <= now + WEBRTC_BIND_OBSERVE_TICK,
+            "a full adapter slot may schedule a bounded recheck, not a tight spin"
+        );
+        assert!(matches!(
+            classify_owner_poll(Err(tokio_mpsc::error::TryRecvError::Empty), false),
+            OwnerPollDecision::Block
+        ));
+        let _keep_slot_full = adapter;
     }
 
     #[test]

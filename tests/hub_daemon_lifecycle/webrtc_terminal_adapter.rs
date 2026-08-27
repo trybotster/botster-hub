@@ -533,7 +533,6 @@ fn webrtc_reserved_bind_delivers_ready_history_finish_attached_in_order() {
         .await;
         wait_for_history_ready_file(&ready_path);
         bind_reserved_webrtc(&mut peer, &key, session_id, subscription_id).await;
-        let _flood = GenericControlFlood::start(endpoint.clone());
 
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut phases = Vec::new();
@@ -582,7 +581,6 @@ fn webrtc_reserved_bind_reaches_attached_without_host_status() {
             "printf 'wra-ready\\n'; sleep 30",
         )
         .await;
-        let _flood = GenericControlFlood::start(endpoint.clone());
         peer.wait_until_attach_started(&key, &endpoint, session_id)
             .await
             .expect("Attached must arrive without Status, ListSessions, or ReadScreen after bind");

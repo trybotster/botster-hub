@@ -349,7 +349,6 @@ fn external_hub_webrtc_live_output_preserves_exact_bytes() {
             .bind_reserved_from_attach(&attach)
             .await
             .expect("browser creates the reserved terminal DataChannel");
-        let _flood = GenericControlFlood::start(endpoint.clone());
         offer_peer
             .wait_until_attach_started(
                 &stream_key,
@@ -552,7 +551,6 @@ fn external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup() {
                 .bind_reserved_from_attach(&attach)
                 .await
                 .expect("browser creates the reserved terminal DataChannel");
-            let _flood = GenericControlFlood::start(endpoint.clone());
             if let Err(error) = offer_peer
                 .wait_until_attach_started(&stream_key, &endpoint, &session_id)
                 .await
