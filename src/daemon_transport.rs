@@ -239,7 +239,18 @@ fn mark_due_reconciliation(state: &mut DaemonControlState, now: Instant) {
         }
     }
     if webrtc_slot_ready_has_empty_session(state) {
-        state.background.mark_pump();
+        let due = state
+            .last_webrtc_empty_pump
+            .is_none_or(|last| now.saturating_duration_since(last) >= WEBRTC_BIND_OBSERVE_TICK);
+        if due {
+            state.last_webrtc_empty_pump = Some(now);
+            state.background.mark_pump();
+        } else {
+            let soon = now + WEBRTC_BIND_OBSERVE_TICK;
+            if state.next_reconciliation > soon {
+                state.next_reconciliation = soon;
+            }
+        }
     } else if state.pending_runtime.webrtc_slot_ready_pending() {
         let soon = now + WEBRTC_BIND_OBSERVE_TICK;
         if state.next_reconciliation > soon {
@@ -6170,6 +6181,12 @@ fn observe_coalesced_webrtc_slot_ready(daemon: &HubDaemon, state: &mut DaemonCon
             .pending_runtime
             .extend_webrtc_bind_observe(&session_id);
         observe_reserved_session_until_slot_full(daemon, state, &session_id);
+        if state
+            .pending_runtime
+            .webrtc_session_ready_to_observe(&session_id)
+        {
+            state.pending_runtime.note_webrtc_slot_ready(&session_id);
+        }
     }
 }
 
@@ -6271,6 +6288,7 @@ pub(crate) struct DaemonControlState {
     pub(crate) live_attach_routes: BTreeSet<(String, String)>,
     pending_hub_update_reply: Option<ControlReplySender>,
     observe_resume: Option<botster_core_daemon::ObserveLifecycleCursor>,
+    last_webrtc_empty_pump: Option<Instant>,
 }
 
 impl Default for DaemonControlState {
@@ -6294,6 +6312,7 @@ impl Default for DaemonControlState {
             live_attach_routes: BTreeSet::new(),
             pending_hub_update_reply: None,
             observe_resume: None,
+            last_webrtc_empty_pump: None,
         }
     }
 }
