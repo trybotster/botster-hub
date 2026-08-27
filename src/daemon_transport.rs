@@ -248,14 +248,6 @@ fn mark_due_reconciliation(state: &mut DaemonControlState, now: Instant) {
     }
 }
 
-fn observe_in_flight_webrtc_binds(daemon: &HubDaemon, state: &mut DaemonControlState) {
-    if !webrtc_recent_bind_needs_observe(state) {
-        return;
-    }
-    let now = tick(&mut state.logical_clock);
-    observe_recent_webrtc_binds(daemon, state, now);
-}
-
 fn run_one_owner_background_slice(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
     let maintenance_pending = owner_maintenance_pending(daemon, state);
     let BackgroundTurnDecision::OneSlice(class) =
@@ -383,7 +375,6 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
             }
         };
         if let Some(OwnerEvent::Control(message)) = event {
-            observe_in_flight_webrtc_binds(&daemon, &mut control_state);
             match *message {
                 Some(ControlMessage::AcceptedConnection {
                     stream,
@@ -9105,7 +9096,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_loop_observes_in_flight_webrtc_binds_when_queued_control_wins() {
+    fn scheduled_webrtc_bind_observe_is_not_driven_by_generic_control() {
         const TRANSPORT: &str = include_str!("daemon_transport.rs");
         let production = TRANSPORT.split("mod tests").next().expect("production");
         let owner_loop = production
@@ -9118,20 +9109,48 @@ mod tests {
             .expect("control arm");
         let control_arm = control_arm.split("} else {").next().unwrap_or(control_arm);
         assert!(
-            control_arm.contains("observe_in_flight_webrtc_binds"),
-            "queued web/control work must exact-observe an empty just-bound WebRTC slot"
+            !control_arm.contains("observe_recent_webrtc_binds")
+                && !control_arm.contains("observe_session_lifecycle")
+                && !control_arm.contains("observe_in_flight_webrtc_binds"),
+            "generic control must not exact-observe in-flight WebRTC binds"
         );
         assert!(
-            !production
-                .split("loop {")
-                .nth(1)
-                .expect("owner loop")
-                .split("let slice_due")
-                .next()
-                .unwrap_or("")
-                .contains("observe_in_flight_webrtc_binds"),
-            "in-flight bind observe must not be a tight remake on every owner turn"
+            production.contains("WEBRTC_BIND_OBSERVE_TICK"),
+            "empty just-bound slots keep a scheduled bind-observe tick"
         );
+        let slot_ready = production
+            .split("ControlMessage::ReservedWebrtcSlotReady")
+            .nth(1)
+            .expect("SlotReady arm");
+        let slot_ready = slot_ready
+            .split("ControlMessage::")
+            .next()
+            .unwrap_or(slot_ready);
+        assert!(
+            slot_ready.contains("observe_reserved_session_until_slot_full"),
+            "SlotReady remains the route-specific observe opportunity"
+        );
+        for request in ["DaemonRequest::Status", "DaemonRequest::ListSessions"] {
+            let arm = production
+                .split(request)
+                .nth(1)
+                .unwrap_or("")
+                .split("DaemonRequest::")
+                .next()
+                .unwrap_or("");
+            assert!(
+                !arm.contains("observe_session_lifecycle") && !arm.contains("observe_lifecycle"),
+                "{request} must not observe terminal lifecycle"
+            );
+        }
+        assert!(!should_mark_pump_after_control(
+            &DaemonRequest::Status,
+            true
+        ));
+        assert!(!should_mark_pump_after_control(
+            &DaemonRequest::ListSessions,
+            true
+        ));
     }
 
     #[test]
