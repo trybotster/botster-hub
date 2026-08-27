@@ -230,7 +230,8 @@ This visit repaired the two open Review findings without changing ticket intent.
 
 This visit repaired the open verification finding without changing ticket intent. Product findings `finding_1787807102_177084` and `finding_1787807102_232658` stay as Review accepted them: SlotReady remains a doorbell (no exact observe in the control arm), and the no-control IsolatedHub proof still does not flood Status/ListSessions.
 
-- `finding_1787810573_921565`: GitHub Verify `33043967950` failed `owner_loop_queues_and_completes_two_fanout_plugin_handlers` with one queued handler instead of two. `EVENT_DELIVERY_MAX_ELAPSED` is 8 ms, so one owner slice can return one ready handler under default-concurrency lib load. The test now repeats production delivery slices, re-arms the delivery wake, and asserts both handlers queue before it drains completions. Isolated reruns are not the gate. Official `./test.sh --locked` and GitHub Verify at default workspace concurrency are.
+- `finding_1787810573_921565`: GitHub Verify `33043967950` failed `owner_loop_queues_and_completes_two_fanout_plugin_handlers` with one queued handler instead of two. `EVENT_DELIVERY_MAX_ELAPSED` is 8 ms, so one owner slice can return one ready handler under default-concurrency lib load. The test now repeats production delivery slices, re-arms the delivery wake, and asserts both handlers queue before it drains completions. Isolated reruns are not the gate.
+- GitHub Verify `33046831838` on head `e2f1995` passed hub lib 529, including the repaired fanout test, on both attempts. Both attempts then failed `external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup` (attempt 2: READY with no Attached). A follow-up that drained the 50 ms bind observe after every owner turn reddened local official on that same shutdown proof and on `webrtc_reserved_bind_reaches_attached_without_host_status`. That drain was reverted. SlotReady stays a doorbell. Generic Status/ListSessions still do not exact-observe. Implement gate is not submitted while GitHub Verify is red.
 
 ## Official gates
 
@@ -344,8 +345,8 @@ A27b Core `WRITE_ATTEMPT_BUDGET` hard-stop is proved by the live write-budget te
 - Core attach and adapter bind start only after the reserved channel opens. `SendInput` before that open has no Core owner.
 - Unix attach still does not call `expect_terminal_adapter`. Unix duplex bind is out of scope.
 - Isolated `unix_eof_skip_core_detach_ablation_keeps_named_pair_on_status` failed once under official parallel load on an earlier visit, then passed isolated. This visit did not change Unix detach. The latest official run passed that proof.
-- `owner_loop_queues_and_completes_two_fanout_plugin_handlers` can flake under default lib concurrency (1 vs 2 handlers). Isolated reruns pass. The latest official suite passed.
-- This visit will record the new GitHub Verify result after the push.
+- `owner_loop_queues_and_completes_two_fanout_plugin_handlers` passed GitHub Verify `33046831838` hub lib 529 on head `e2f1995`. That does not make the Verify run green.
+- GitHub Verify `33046831838` remains red on `external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup` after READY without Attached. Local official `./test.sh --locked` on `e2f1995` was exit 0. Implement gate is held.
 - Binary send still wraps JSON `DaemonLocalWebrtcDeliveryChunk`. This ticket did not add a new encrypted-binary framing DTO.
 - Browser and TUI channel-creation clients remain owned by their downstream tickets.
 
