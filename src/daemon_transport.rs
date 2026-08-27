@@ -161,10 +161,13 @@ pub(crate) const ENTITY_SUBSCRIPTION_QUEUE_CAPACITY: usize = 64;
 const ENTITY_RECONCILIATION_INTERVAL: Duration = Duration::from_millis(500);
 const WEBRTC_BIND_OBSERVE_TICK: Duration = Duration::from_millis(50);
 const WEBRTC_SLOT_READY_OBSERVE_BOUND: Duration = Duration::from_secs(20);
-// One Core ClientWorker tick per drain. The adapter holds one frame. Extra
-// observe calls in the same turn see WouldBlock or Full and count toward
-// Core WRITE_ATTEMPT_BUDGET (512), which hard-stops before Attached.
+// One Core ClientWorker tick per coalesced SlotReady drain. Extra observes
+// against a Full slot count toward WRITE_ATTEMPT_BUDGET (512).
 const WEBRTC_SLOT_READY_OBSERVE_ATTEMPTS: usize = 1;
+// After the mux flushes a frame the slot is empty. Core may need several
+// pump ticks on that empty slot before Attached is offered (FINISH accepted
+// first). This bound is only for mux-flushed drains, not persist ticks.
+const WEBRTC_FLUSHED_SLOT_OBSERVE_ATTEMPTS: usize = 8;
 static NEXT_SOCKET_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) type ControlSender = tokio_mpsc::Sender<ControlMessage>;
@@ -379,6 +382,7 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
         while let Ok(cleanup) = cleanup_rx.try_recv() {
             handle_connection_cleanup(&mut daemon, &mut control_state, control_tx.clone(), cleanup);
         }
+        observe_flushed_webrtc_slots(&daemon, &mut control_state);
         mark_due_reconciliation(&mut control_state, Instant::now());
         let slice_due = control_state
             .background
@@ -460,6 +464,7 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
                 None => return Err(DaemonTransportError::ControlThreadStopped),
             }
         }
+        observe_flushed_webrtc_slots(&daemon, &mut control_state);
         observe_coalesced_webrtc_slot_ready(&daemon, &mut control_state);
         observe_due_webrtc_binds(&daemon, &mut control_state);
         mark_due_reconciliation(&mut control_state, Instant::now());
@@ -2492,6 +2497,10 @@ pub(crate) fn handle_control_message(
                 if let WebrtcTerminalAdmission::Admitted { mux, .. } = &admission {
                     mux.bind_close_work(Arc::clone(&state.pending_runtime.close_work));
                     mux.bind_slot_ready(Arc::clone(&state.pending_runtime.slot_ready));
+                    let drain_tx = state.empty_slot_drain_tx.clone();
+                    mux.bind_empty_slot_drain(Arc::new(move |session_id: &str| {
+                        let _ = drain_tx.try_send(session_id.to_string());
+                    }));
                 }
                 state.pending_runtime.host_compatibility.insert(
                     grant_id.clone(),
@@ -6179,6 +6188,34 @@ fn take_unoccupied_webrtc_slot_ready(state: &mut DaemonControlState) -> Vec<Stri
     ready
 }
 
+fn observe_flushed_webrtc_slots(daemon: &HubDaemon, state: &mut DaemonControlState) {
+    let Some(runtime) = daemon.runtime() else {
+        while state.empty_slot_drain_rx.try_recv().is_ok() {}
+        return;
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    while let Ok(session_id) = state.empty_slot_drain_rx.try_recv() {
+        if !state
+            .pending_runtime
+            .webrtc_session_ready_to_observe(&session_id)
+        {
+            continue;
+        }
+        for _ in 0..WEBRTC_FLUSHED_SLOT_OBSERVE_ATTEMPTS {
+            if state
+                .pending_runtime
+                .webrtc_session_slot_occupied(&session_id)
+            {
+                break;
+            }
+            let _ = runtime.observe_session_lifecycle(&SessionId(session_id.clone()), now);
+        }
+    }
+}
+
 fn observe_coalesced_webrtc_slot_ready(daemon: &HubDaemon, state: &mut DaemonControlState) {
     for session_id in take_unoccupied_webrtc_slot_ready(state) {
         state
@@ -6316,10 +6353,13 @@ pub(crate) struct DaemonControlState {
     observe_resume: Option<botster_core_daemon::ObserveLifecycleCursor>,
     last_webrtc_empty_pump: Option<Instant>,
     last_webrtc_bind_observe: Option<Instant>,
+    empty_slot_drain_tx: std::sync::mpsc::SyncSender<String>,
+    empty_slot_drain_rx: std::sync::mpsc::Receiver<String>,
 }
 
 impl Default for DaemonControlState {
     fn default() -> Self {
+        let (empty_slot_drain_tx, empty_slot_drain_rx) = std::sync::mpsc::sync_channel(64);
         Self {
             logical_clock: 1,
             drain_cursors: BTreeMap::new(),
@@ -6341,6 +6381,8 @@ impl Default for DaemonControlState {
             observe_resume: None,
             last_webrtc_empty_pump: None,
             last_webrtc_bind_observe: None,
+            empty_slot_drain_tx,
+            empty_slot_drain_rx,
         }
     }
 }
@@ -9249,19 +9291,28 @@ mod tests {
             .split("reap_finished_connection_tasks")
             .nth(1)
             .expect("owner loop");
+        let before_control = owner_loop
+            .split("if let Some(OwnerEvent::Control(message))")
+            .next()
+            .expect("before control");
+        assert!(
+            before_control.contains("observe_flushed_webrtc_slots(&daemon"),
+            "mux-flushed empty slots drain on the owner thread before queued generic control"
+        );
         let control_arm = owner_loop
             .split("if let Some(OwnerEvent::Control(message))")
             .nth(1)
             .expect("control arm");
         let control_arm = control_arm
-            .split("observe_coalesced_webrtc_slot_ready(&daemon")
+            .split("observe_flushed_webrtc_slots(&daemon")
             .next()
-            .expect("control arm ends before coalesced SlotReady drain");
+            .expect("control arm ends before mux-flushed empty-slot drain");
         assert!(
             !control_arm.contains("observe_recent_webrtc_binds")
                 && !control_arm.contains("observe_session_lifecycle")
                 && !control_arm.contains("observe_in_flight_webrtc_binds")
-                && !control_arm.contains("observe_coalesced_webrtc_slot_ready"),
+                && !control_arm.contains("observe_coalesced_webrtc_slot_ready")
+                && !control_arm.contains("observe_flushed_webrtc_slots"),
             "generic control must not exact-observe in-flight WebRTC binds"
         );
         assert!(
@@ -9392,6 +9443,39 @@ mod tests {
         assert!(
             !control_arm.contains("observe_coalesced_webrtc_slot_ready"),
             "generic control must not drain SlotReady observation"
+        );
+        let admission = production
+            .split("ControlMessage::RegisterWebrtcAdmission")
+            .nth(1)
+            .expect("RegisterWebrtcAdmission");
+        let admission = admission
+            .split("ControlMessage::BindReservedWebrtcChannel")
+            .next()
+            .unwrap_or(admission);
+        assert!(
+            admission.contains("bind_empty_slot_drain")
+                && admission.contains("empty_slot_drain_tx")
+                && admission.contains("try_send"),
+            "admission wires mux empty-slot drain onto an owner-thread channel, not Core from the DataChannel task"
+        );
+        let flushed = production
+            .split("fn observe_flushed_webrtc_slots")
+            .nth(1)
+            .expect("flushed drain");
+        let flushed = flushed
+            .split("fn observe_coalesced_webrtc_slot_ready")
+            .next()
+            .unwrap_or(flushed);
+        assert!(
+            flushed.contains("empty_slot_drain_rx.try_recv")
+                && flushed.contains("webrtc_session_ready_to_observe")
+                && flushed.contains("WEBRTC_FLUSHED_SLOT_OBSERVE_ATTEMPTS")
+                && flushed.contains("observe_session_lifecycle"),
+            "owner pumps a flushed empty slot until it fills, without occupying a full adapter"
+        );
+        assert_eq!(
+            WEBRTC_FLUSHED_SLOT_OBSERVE_ATTEMPTS, 8,
+            "mux flush drain may take several empty ticks so Attached can follow FINISH"
         );
     }
 
