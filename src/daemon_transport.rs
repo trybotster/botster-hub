@@ -238,6 +238,9 @@ fn mark_due_reconciliation(state: &mut DaemonControlState, now: Instant) {
             state.next_reconciliation = soon;
         }
     }
+    if state.pending_runtime.webrtc_slot_ready_pending() {
+        state.background.mark_pump();
+    }
     if state.next_reconciliation <= now {
         state.background.mark_pump();
         state.maintenance.try_wake();
@@ -438,6 +441,7 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
                 None => return Err(DaemonTransportError::ControlThreadStopped),
             }
         }
+        observe_coalesced_webrtc_slot_ready(&daemon, &mut control_state);
         mark_due_reconciliation(&mut control_state, Instant::now());
         if control_state
             .background
@@ -2467,6 +2471,7 @@ pub(crate) fn handle_control_message(
             if daemon.local_webrtc().has_live_peer(&grant_id) {
                 if let WebrtcTerminalAdmission::Admitted { mux, .. } = &admission {
                     mux.bind_close_work(Arc::clone(&state.pending_runtime.close_work));
+                    mux.bind_slot_ready(Arc::clone(&state.pending_runtime.slot_ready));
                 }
                 state.pending_runtime.host_compatibility.insert(
                     grant_id.clone(),
@@ -5688,6 +5693,7 @@ pub(crate) struct PendingRuntimeState {
     webrtc_last_generation: BTreeMap<(String, String), u64>,
     webrtc_bind_observe_deadline: BTreeMap<String, Instant>,
     close_work: Arc<AtomicBool>,
+    slot_ready: Arc<crate::webrtc_terminal_adapter::WebrtcSlotReadyWake>,
     host_compatibility: BTreeMap<String, HostCompatibilityRecord>,
 }
 
@@ -5715,6 +5721,18 @@ impl std::ops::DerefMut for PendingRuntimeState {
 impl PendingRuntimeState {
     fn take_close_work(&self) -> bool {
         self.close_work.swap(false, Ordering::SeqCst)
+    }
+
+    fn webrtc_slot_ready_pending(&self) -> bool {
+        self.slot_ready.has_pending()
+    }
+
+    fn note_webrtc_slot_ready(&self, session_id: &str) {
+        self.slot_ready.note(session_id);
+    }
+
+    fn take_webrtc_slot_ready(&self) -> Vec<String> {
+        self.slot_ready.take_sessions()
     }
 
     fn webrtc_last_generation(&self, session_id: &str, subscription_id: &str) -> Option<u64> {
@@ -5861,6 +5879,7 @@ impl PendingRuntimeState {
 }
 
 fn run_one_pump_phase(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
+    observe_coalesced_webrtc_slot_ready(daemon, state);
     let phase = state.pump.take_phase();
     let incomplete = match phase {
         PumpPhase::CloseEvents => run_close_events_phase(daemon, state),
@@ -6066,6 +6085,23 @@ fn webrtc_recent_bind_needs_observe(state: &mut DaemonControlState) -> bool {
                 .pending_runtime
                 .webrtc_session_slot_occupied(session_id)
         })
+}
+
+fn observe_coalesced_webrtc_slot_ready(daemon: &HubDaemon, state: &mut DaemonControlState) {
+    let sessions = state.pending_runtime.take_webrtc_slot_ready();
+    for session_id in sessions {
+        if state
+            .pending_runtime
+            .webrtc_session_slot_occupied(&session_id)
+        {
+            state.pending_runtime.note_webrtc_slot_ready(&session_id);
+            continue;
+        }
+        state
+            .pending_runtime
+            .extend_webrtc_bind_observe(&session_id);
+        observe_reserved_session_until_slot_full(daemon, state, &session_id);
+    }
 }
 
 fn observe_reserved_session_until_slot_full(
@@ -9107,12 +9143,20 @@ mod tests {
             .split("if let Some(OwnerEvent::Control(message))")
             .nth(1)
             .expect("control arm");
-        let control_arm = control_arm.split("} else {").next().unwrap_or(control_arm);
+        let control_arm = control_arm
+            .split("observe_coalesced_webrtc_slot_ready(&daemon")
+            .next()
+            .expect("control arm ends before coalesced SlotReady drain");
         assert!(
             !control_arm.contains("observe_recent_webrtc_binds")
                 && !control_arm.contains("observe_session_lifecycle")
-                && !control_arm.contains("observe_in_flight_webrtc_binds"),
+                && !control_arm.contains("observe_in_flight_webrtc_binds")
+                && !control_arm.contains("observe_coalesced_webrtc_slot_ready"),
             "generic control must not exact-observe in-flight WebRTC binds"
+        );
+        assert!(
+            owner_loop.contains("observe_coalesced_webrtc_slot_ready(&daemon"),
+            "every owner turn drains coalesced SlotReady after control, not inside generic request arms"
         );
         assert!(
             production.contains("WEBRTC_BIND_OBSERVE_TICK"),
@@ -9151,6 +9195,89 @@ mod tests {
             &DaemonRequest::ListSessions,
             true
         ));
+        let pump = production
+            .split("fn run_one_pump_phase")
+            .nth(1)
+            .expect("pump runner");
+        let pump = pump.split("fn next_admission_key").next().unwrap_or(pump);
+        assert!(
+            pump.contains("observe_coalesced_webrtc_slot_ready"),
+            "Pump must drain coalesced SlotReady so generic control cannot starve a ready route"
+        );
+        let coalesced = production
+            .split("fn observe_coalesced_webrtc_slot_ready")
+            .nth(1)
+            .expect("coalesced drain");
+        let coalesced = coalesced
+            .split("fn observe_reserved_session_until_slot_full")
+            .next()
+            .unwrap_or(coalesced);
+        assert!(
+            coalesced.contains("webrtc_session_slot_occupied")
+                && coalesced.contains("note_webrtc_slot_ready"),
+            "a SlotReady taken while the one-slot is Full must be restored, not dropped"
+        );
+        assert!(
+            !control_arm.contains("observe_coalesced_webrtc_slot_ready"),
+            "generic control must not drain SlotReady observation"
+        );
+    }
+
+    #[test]
+    fn coalesced_webrtc_slot_ready_marks_pump_and_coalesces_without_lost_wakeup() {
+        let mut state = DaemonControlState {
+            next_reconciliation: Instant::now() + Duration::from_secs(30),
+            ..DaemonControlState::default()
+        };
+        state.pending_runtime.note_webrtc_slot_ready("sess");
+        state.pending_runtime.note_webrtc_slot_ready("sess");
+        mark_due_reconciliation(&mut state, Instant::now());
+        assert!(
+            state.background.pump_pending(),
+            "a coalesced SlotReady must mark Pump without Status, ListSessions, or ReadScreen"
+        );
+        let taken = state.pending_runtime.take_webrtc_slot_ready();
+        assert_eq!(taken, vec!["sess".to_string()]);
+        assert!(
+            !state.pending_runtime.webrtc_slot_ready_pending(),
+            "take must clear the coalesced wake"
+        );
+        state.pending_runtime.note_webrtc_slot_ready("sess-a");
+        state.pending_runtime.note_webrtc_slot_ready("sess-b");
+        let mut taken = state.pending_runtime.take_webrtc_slot_ready();
+        taken.sort();
+        assert_eq!(
+            taken,
+            vec!["sess-a".to_string(), "sess-b".to_string()],
+            "distinct ready sessions stay distinct keys"
+        );
+    }
+
+    #[test]
+    fn ready_webrtc_route_progresses_within_two_background_slices_under_queued_control() {
+        let mut state = DaemonControlState {
+            next_reconciliation: Instant::now() + Duration::from_secs(30),
+            ..DaemonControlState::default()
+        };
+        state.pending_runtime.note_webrtc_slot_ready("sess");
+        mark_due_reconciliation(&mut state, Instant::now());
+        assert!(matches!(
+            classify_owner_poll(Ok(ControlMessage::RejectedConnection), true),
+            OwnerPollDecision::ServeControl(_)
+        ));
+        let mut saw_pump = false;
+        for _ in 0..2 {
+            if matches!(
+                decide_background_slice(&mut state.background, true),
+                BackgroundTurnDecision::OneSlice(BackgroundClass::Pump)
+            ) {
+                saw_pump = true;
+            }
+        }
+        assert!(
+            saw_pump,
+            "queued generic control may precede a due slice, but Pump must still win within two background turns"
+        );
     }
 
     #[test]

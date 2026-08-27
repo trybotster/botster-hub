@@ -1983,6 +1983,45 @@ pub(crate) fn wait_for_published_web_origin(
     panic!("botster-web did not publish local_url after bind: {last}");
 }
 
+/// Continuous Status/ListSessions traffic. Tests use this as load, not as an
+/// attach-observe stimulus. Drop stops the flood.
+pub(crate) struct GenericControlFlood {
+    stop: Arc<AtomicBool>,
+    join: Option<thread::JoinHandle<()>>,
+}
+
+impl GenericControlFlood {
+    pub(crate) fn start(endpoint: botster_hub_client::DaemonEndpoint) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let join = thread::spawn(move || {
+            while !flag.load(Ordering::Relaxed) {
+                let _ = botster_hub_client::request(
+                    &endpoint,
+                    botster_hub_client::DaemonRequest::Status,
+                );
+                let _ = botster_hub_client::request(
+                    &endpoint,
+                    botster_hub_client::DaemonRequest::ListSessions,
+                );
+            }
+        });
+        Self {
+            stop,
+            join: Some(join),
+        }
+    }
+}
+
+impl Drop for GenericControlFlood {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
 pub(crate) fn start_botster_web_and_issue_bootstrap(
     endpoint: &botster_hub_client::DaemonEndpoint,
 ) -> (String, botster_hub_client::DaemonLocalWebrtcBootstrap) {

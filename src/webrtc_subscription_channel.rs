@@ -327,6 +327,31 @@ mod tests {
     use botster_hub_client::{DaemonLocalWebrtcDeliveryChunk, DaemonLocalWebrtcDeliveryKind};
 
     #[test]
+    fn slot_ready_does_not_block_the_datachannel_loop_on_control_send() {
+        let source = include_str!("local_webrtc.rs");
+        let func = source
+            .split("async fn run_subscription_channel")
+            .nth(1)
+            .expect("run_subscription_channel");
+        let func = func
+            .split("async fn sleep_until_reserved_open_deadline")
+            .next()
+            .expect("function body");
+        assert!(
+            func.contains("note_slot_ready"),
+            "flush must coalesce SlotReady on the mux before any control send"
+        );
+        assert!(
+            func.contains("try_send"),
+            "SlotReady control send must not park the DataChannel loop"
+        );
+        assert!(
+            !func.contains(".send(ControlMessage::ReservedWebrtcSlotReady"),
+            "awaiting SlotReady enqueue can stall a ready route behind generic control"
+        );
+    }
+
+    #[test]
     fn reserved_open_stops_the_never_open_sweep_before_bind() {
         let source = include_str!("local_webrtc.rs");
         let func = source
