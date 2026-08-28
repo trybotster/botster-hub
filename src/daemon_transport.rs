@@ -9770,6 +9770,52 @@ mod tests {
     }
 
     #[test]
+    fn stalled_channel_high_water_does_not_pressure_a_sibling_session() {
+        let mux = WebRtcConnectionMux::new();
+        let stall_label = mux
+            .reserve_terminal("grant".into(), "wwb-stall".into(), "sub-stall".into(), 1)
+            .expect("reserve stall");
+        let live_label = mux
+            .reserve_terminal("grant".into(), "wwb-live".into(), "sub-live".into(), 1)
+            .expect("reserve live");
+        let (_stall_adapter, stall_handle) = mux.create_adapter();
+        stall_handle.set_buffered_bytes(
+            crate::local_webrtc::webrtc_subscription_channel::AGGREGATE_BUFFERED_HIGH,
+        );
+        stall_handle.force_would_block();
+        assert!(mux.bind_reserved(&stall_label, stall_handle));
+        let (_live_adapter, live_handle) = mux.create_adapter();
+        assert!(mux.bind_reserved(&live_label, live_handle));
+        let mut state = DaemonControlState::default();
+        state.pending_runtime.webrtc_admissions.insert(
+            "grant".into(),
+            WebrtcTerminalAdmission::Admitted {
+                required_features: Vec::new(),
+                mux,
+                terminal_requirement: None,
+            },
+        );
+        assert!(
+            state
+                .pending_runtime
+                .webrtc_session_pressured_to_observe("wwb-stall"),
+            "the stalled handle's own high water must be pressured"
+        );
+        assert!(
+            !state
+                .pending_runtime
+                .webrtc_session_ready_to_observe("wwb-live"),
+            "mux-high aggregate must not starved-observe a zero-buffer sibling"
+        );
+        assert!(
+            !state
+                .pending_runtime
+                .webrtc_session_pressured_to_observe("wwb-live"),
+            "mux-wide WouldBlock must not mark a sibling empty slot pressured"
+        );
+    }
+
+    #[test]
     fn ready_webrtc_route_progresses_within_two_background_slices_under_queued_control() {
         let mux = WebRtcConnectionMux::new();
         let label = mux

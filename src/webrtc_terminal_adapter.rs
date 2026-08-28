@@ -1311,7 +1311,19 @@ impl WebRtcTerminalAdapterHandle {
     }
 
     pub(crate) fn write_slot_is_ready(&self) -> bool {
-        matches!(self.inner.pressure(), TerminalAdapterPressure::Ready)
+        if !matches!(self.inner.pressure(), TerminalAdapterPressure::Ready) {
+            return false;
+        }
+        let Some(mux) = self.inner.mux.upgrade() else {
+            return true;
+        };
+        let aggregate = aggregate_buffered_from(&mux);
+        if crate::local_webrtc::webrtc_subscription_channel::refuse_send_on_aggregate(aggregate, 1)
+            && self.buffered_bytes() == 0
+        {
+            return false;
+        }
+        true
     }
 
     pub(crate) fn write_slot_is_pressured(&self) -> bool {
