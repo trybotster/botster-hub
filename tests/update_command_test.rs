@@ -618,14 +618,14 @@ fn git_output(root: &Path, args: &[&str]) -> String {
 fn create_clean_update_source(root: &Path, builds_succeed: bool) -> PathBuf {
     let remote = root.join("remote.git");
     let status = Command::new("git")
-        .args(["init", "--bare"])
+        .args(["init", "--bare", "-b", "main"])
         .arg(&remote)
         .status()
         .unwrap();
     assert!(status.success());
     let source = root.join("source");
     fs::create_dir_all(source.join("fake-bin")).unwrap();
-    git(&source, &["init"]);
+    git(&source, &["init", "-b", "main"]);
     git(
         &source,
         &["config", "user.email", "update-test@example.invalid"],
@@ -669,7 +669,7 @@ fn create_real_build_update_source(root: &Path) -> PathBuf {
     let remote = root.join("real-build-remote.git");
     assert!(
         Command::new("git")
-            .args(["init", "--bare"])
+            .args(["init", "--bare", "-b", "main"])
             .arg(&remote)
             .status()
             .unwrap()
@@ -677,7 +677,7 @@ fn create_real_build_update_source(root: &Path) -> PathBuf {
     );
     let source = root.join("real-build-source");
     fs::create_dir_all(source.join("fake-bin")).unwrap();
-    git(&source, &["init"]);
+    git(&source, &["init", "-b", "main"]);
     git(
         &source,
         &["config", "user.email", "update-test@example.invalid"],
