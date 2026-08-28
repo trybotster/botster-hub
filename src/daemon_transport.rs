@@ -6226,7 +6226,11 @@ fn observe_coalesced_webrtc_slot_ready(daemon: &HubDaemon, state: &mut DaemonCon
         state
             .pending_runtime
             .extend_webrtc_bind_observe(&session_id);
-        observe_reserved_session_until_slot_full(daemon, state, &session_id);
+        if webrtc_slot_ready_persist_bursts(state, &session_id) == 0 {
+            observe_one_webrtc_bind(daemon, &session_id);
+        } else {
+            observe_reserved_session_until_slot_full(daemon, state, &session_id);
+        }
         if state
             .pending_runtime
             .webrtc_session_slot_occupied(&session_id)
@@ -6255,6 +6259,17 @@ fn observe_starved_empty_webrtc_binds(daemon: &HubDaemon, state: &mut DaemonCont
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or(0);
     observe_recent_webrtc_binds(daemon, state, now_seconds);
+}
+
+fn observe_one_webrtc_bind(daemon: &HubDaemon, session_id: &str) {
+    let Some(runtime) = daemon.runtime() else {
+        return;
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let _ = runtime.observe_session_lifecycle(&SessionId(session_id.to_string()), now);
 }
 
 fn observe_reserved_session_until_slot_full(
@@ -9424,6 +9439,11 @@ mod tests {
                 && coalesced.contains("note_webrtc_slot_ready")
                 && coalesced.contains("webrtc_session_pump_cooled"),
             "empty persist re-notes until a slot fills; cooldown is per session so web Status cannot starve IsolatedHub binds"
+        );
+        assert!(
+            coalesced.contains("observe_one_webrtc_bind")
+                && coalesced.contains("observe_reserved_session_until_slot_full"),
+            "first SlotReady persist is one Core tick; eight-tick persist starts only after a slot has been occupied"
         );
         let starved = production
             .split("fn observe_starved_empty_webrtc_binds")
