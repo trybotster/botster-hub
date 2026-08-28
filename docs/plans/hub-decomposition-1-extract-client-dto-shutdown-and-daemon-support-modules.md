@@ -4,8 +4,9 @@
 
 - Target repository: `botster-hub` (`trybotster/botster-hub`, `/Users/jasonconigliari/Projects/botster-hub`).
 - Target id: `tgt_7e208a0c76a44980a83b63af976b1f22`.
-- Ticket: `ticket_1787894414_324976`. Run: `run_1787956038_959297`. Step: `botster_stack_plan`, run step `run_step_1787957497_881798` (second Plan visit, after `changes_required`).
+- Ticket: `ticket_1787894414_324976`. Run: `run_1787956038_959297`. Step: `botster_stack_plan`, run step `run_step_1787960403_555931` (sixth Plan visit; the five earlier visits each returned `changes_required`).
 - Base commit: `8137d16` (`origin/main` after the round-2 rebase). The first Plan visit used the stale base `a0c7141`.
+- This section names the current run step only. Per visit, the authoritative enumeration of plan commits and run step lives in that visit's gate evidence, not in this document, so the prose cannot go stale between rounds.
 - The pipeline resolved the target id through `list_spawn_targets`. The plan does not infer the repository from the working directory.
 - Blocking dependency `ticket_1787894962_603665` (fanout owner-loop flake and IsolatedHub worker reaping) is `closed`. No open blocking dependency remains.
 
@@ -70,7 +71,9 @@ Plan Review round 1 returned `changes_required` with a high finding titled "The 
 
 The real defect was base staleness. The run created its worktree at `a0c7141`, but `origin/main` had advanced fifteen commits to `8137d16`. Those fifteen commits are the merge of the closed blocking dependency `ticket_1787894962_603665`. The plan had never been verified against them.
 
-Correction applied: this branch is rebased onto `origin/main` at `8137d16`. The rebase was clean and carried the two documentation commits that existed at that moment, `c14bf70` and `f6db523`. Commit `14129c2` recorded this baseline section after the rebase, and round 3 adds `one more`. The branch therefore holds four documentation commits above `8137d16` and still holds zero code commits. The move-only code commit does not exist yet; the Implementer writes it.
+Correction applied: this branch is rebased onto `origin/main` at `8137d16`. The rebase was clean and carried the two documentation commits that existed at that moment, `c14bf70` and `f6db523`.
+
+Commit accounting is stated as an invariant rather than a count, because a fixed count goes stale on every review round and did so twice: **every commit on this branch above `8137d16` is a documentation commit, and zero code commits exist yet.** The move-only code commit does not exist; the Implementer writes it. Each visit's gate evidence carries the exact commit list for that visit, and `git rev-list 8137d16..HEAD` is the live answer.
 
 The fifteen new commits touch `crates/botster-hub-test-support/src/{isolated_hub.rs,lib.rs}`, `src/daemon_maintenance.rs`, `src/package_event_router.rs`, `src/runtime.rs`, `tests/hub_daemon_lifecycle/shutdown.rs`, and two plan documents. They touch none of the files this ticket moves code out of or into. Every line anchor cited in this plan survives the rebase unchanged: `src/daemon_transport.rs` is still 10,573 lines, `ShutdownSessionClassification` is still at line 4959, `DaemonTransportError` at 8314, `DaemonTransportResult` at 8493, and the `ShutdownSession` dispatch arm at 3893.
 
@@ -106,7 +109,13 @@ In scope:
 2. Create `src/daemon/shutdown.rs` and move the eleven shutdown-classification items listed under Context Loaded, together with their tests.
 3. Create `src/daemon/error.rs` and move `DaemonTransportError`, `PackageRollbackFailure`, `DaemonTransportResult`, the `Display` and `Error` implementations, the twelve `From` implementations, and the error-to-`DaemonResponse` mapping functions: `daemon_operator_error`, `daemon_package_error`, `daemon_spawn_target_error`, `daemon_worktree_error`, `daemon_state_error`, `daemon_entrypoint_error`, `daemon_local_webrtc_error`, `daemon_snapshot_stream_forbidden_error`, `daemon_package_compensation_error`, `bound_compensation_message`, `hub_update_execution_error`, `local_webrtc_bootstrap_issue_error`, `daemon_app_launch_error`, `daemon_package_route_error`, `daemon_plugin_tool_error`, `daemon_operator_error_from_state`, `daemon_operator_error_from_entrypoint`, and `daemon_operator_error_from_local_webrtc`.
 4. Move each test with the responsibility it proves. The shutdown tests are `forced_stopping_classify_inject_requires_test_mode`, `production_core_shutdown_error_keeps_active_runtime_as_operator_error`, `production_core_shutdown_error_keeps_active_state_as_operator_error`, `shutdown_unknown_session_error_while_active_is_already_exited_cleanup`, `shutdown_exited_classification_returns_cleanup_for_any_shutdown_error`, `shutdown_stopping_record_is_host_cleanup_not_active`, `recover_classify_err_preserves_typed_runtime_error`, `recover_recorded_stopping_after_classify_err_preserves_typed_error`, `recover_classify_err_preserves_typed_state_error`, `recover_exact_missing_returns_unknown_session`, `recover_exact_exited_cleanup_stays_already_exited`, `recover_exact_stale_cleanup_stays_stale_session`, `shutdown_active_runtime_error_remains_operator_error`, `shutdown_active_state_error_remains_operator_error`, and the local helper `shutdown_runtime_error`. The error test is `package_compensation_projects_every_rollback_to_socket_diagnostics`.
-5. Re-export the moved names from `src/lib.rs` or keep the existing `crate::daemon_transport::` call sites compiling through direct `use` paths, whichever preserves the current public surface exactly. `pub use botster_hub_client::{...}` in `daemon_transport.rs` stays where it is; those are client-crate re-exports, not Hub mappers.
+5. Preserve the public path set with **one** design, not a choice between two. `src/daemon_transport.rs` keeps exactly this line:
+
+   ```rust
+   pub use crate::daemon::error::{DaemonTransportError, DaemonTransportResult, PackageRollbackFailure};
+   ```
+
+   `src/lib.rs` is **not** an acceptable substitute. Its `pub use daemon_transport::{...}` block at lines 132-153 can only restore `botster_hub::DaemonTransportError` and `botster_hub::DaemonTransportResult`; it cannot restore `botster_hub::daemon_transport::PackageRollbackFailure`, which is that type's only public path. Round 1 wrote this item as an either/or and round 5 left the stale wording in place; the `src/lib.rs` arm is now struck. `src/lib.rs` keeps the crate-root block untouched. The separate `pub use botster_hub_client::{...}` block at `daemon_transport.rs:34` also stays where it is; those are client-crate re-exports, not Hub mappers.
 6. Widen moved private items to `pub(crate)` only where the move requires it. This is the one visibility change the move forces and it adds no new public API.
 7. Update `src/lib.rs` with one added line, `pub(crate) mod client_api_dto;`, and update `src/daemon.rs` with `pub(crate) mod error;` and `pub(crate) mod shutdown;`. Every new module is crate-private, so the ticket adds **no** new public path. Keep every existing public path by leaving one `pub use crate::daemon::error::{DaemonTransportError, DaemonTransportResult, PackageRollbackFailure};` line in `src/daemon_transport.rs`, so the ticket removes **no** public path either.
 
@@ -180,7 +189,11 @@ Unknowns for the Implementer or Plan Review to resolve:
 
 ## Affected Surfaces And Files
 
-Created:
+Created before the move, in its own commit:
+
+- `tests/public_path_guard.rs` -- the external-crate public path guard from acceptance check 24. It is green at the base and must stay green and unmodified through the move.
+
+Created by the move-only commit:
 
 - `src/client_api_dto.rs`
 - `src/client_api_dto/response.rs`
@@ -273,7 +286,30 @@ Provenance:
 23. Public surface loses nothing, and the surviving alias is a path alias rather than a wrapper. Both arms must hold:
     - `src/daemon_transport.rs` contains `pub use crate::daemon::error::{DaemonTransportError, DaemonTransportResult, PackageRollbackFailure};`, so `botster_hub::daemon_transport::DaemonTransportError`, `::DaemonTransportResult`, and `::PackageRollbackFailure` all still resolve. `PackageRollbackFailure` matters most: it has no crate-root alias, so this line is its only surviving public path.
     - `grep -nE "^(pub )?(fn|impl|enum|struct|type) " src/daemon_transport.rs` shows **zero** definitions of any moved item. The file may name a moved item only on a `use` or `pub use` line. This is the mechanical line between a permitted path alias and the forwarding wrapper the ticket forbids.
-24. Compile-time proof that the three public paths survive: a throwaway check that `botster_hub::daemon_transport::PackageRollbackFailure` resolves, run before and after the move. If preferred, `cargo doc -p botster-hub --no-deps` before and after the move must list the same items under the `daemon_transport` module.
+24. **External-crate compile proof for every existing public path.** Round 5 offered a throwaway check or a `cargo doc` comparison; neither is exact and neither is reproducible by a reviewer. Replace both with one committed integration test. Files under `tests/` compile as separate crates that consume `botster_hub` as an external dependency, so this is a genuine external-crate resolution check rather than an intra-crate one.
+
+    Add `tests/public_path_guard.rs`:
+
+    ```rust
+    //! Guards the exact public paths the decomposition must preserve.
+    //! Each alias fails to compile if its path stops resolving.
+    type _TransportError = botster_hub::daemon_transport::DaemonTransportError;
+    type _TransportResult = botster_hub::daemon_transport::DaemonTransportResult<()>;
+    type _RollbackFailure = botster_hub::daemon_transport::PackageRollbackFailure;
+    type _RootError = botster_hub::DaemonTransportError;
+    type _RootResult = botster_hub::DaemonTransportResult<()>;
+
+    #[test]
+    fn hub_public_paths_resolve() {}
+    ```
+
+    That covers all five existing public paths: the three through `pub mod daemon_transport` and the two crate-root aliases. Run it with the exact command:
+
+    ```
+    RUSTUP_TOOLCHAIN=1.97.0 cargo test --locked --test public_path_guard
+    ```
+
+    **Commit it before the move, in its own commit.** The test must be green at the base `8137d16` first, which establishes the control: the paths resolve today. The move-only commit must then leave it green with the file unmodified. A guard written after the move would only restate whatever the move produced and would prove nothing. Modifying this file to accommodate the move is a failure, exactly as check 19 forbids for the `hub_source()` guards.
 
 ## Runtime-Teardown Class
 
