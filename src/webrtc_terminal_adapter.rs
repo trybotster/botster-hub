@@ -1226,6 +1226,21 @@ impl WebRtcConnectionMux {
             .any(WebRtcTerminalAdapterHandle::write_slot_is_pressured)
     }
 
+    pub(crate) fn session_has_would_block_live_bound_slot(&self, session_id: &str) -> bool {
+        self.live_bound_handles_for_session(session_id)
+            .iter()
+            .any(WebRtcTerminalAdapterHandle::write_slot_is_would_block)
+    }
+
+    pub(crate) fn session_has_high_buffered_live_bound_slot(&self, session_id: &str) -> bool {
+        self.live_bound_handles_for_session(session_id)
+            .iter()
+            .any(|handle| {
+                handle.buffered_bytes()
+                    >= crate::local_webrtc::webrtc_subscription_channel::AGGREGATE_BUFFERED_HIGH
+            })
+    }
+
     pub(crate) fn queue_host_event(&self, event: DaemonEvent) {
         if let Ok(mut pending) = self.inner.pending_events.lock() {
             pending.push(event);
@@ -1347,6 +1362,10 @@ impl WebRtcTerminalAdapterHandle {
             self.inner.pressure(),
             TerminalAdapterPressure::Full | TerminalAdapterPressure::WouldBlock
         )
+    }
+
+    pub(crate) fn write_slot_is_would_block(&self) -> bool {
+        matches!(self.inner.pressure(), TerminalAdapterPressure::WouldBlock)
     }
 
     #[cfg(test)]
