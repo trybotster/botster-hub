@@ -96,7 +96,7 @@ This measurement does not reproduce a dirty refreshed baseline. Two explanations
 
 ## Scope
 
-This ticket produces **one move-only code commit** that compiles. The plan itself lands in separate documentation commits, which are not part of the move-only commit and are excluded from every move-only proof.
+This ticket produces **exactly one code commit**, and that commit is move-only. The plan lands in separate documentation commits, which touch no code and are excluded from every move-only proof. No other code commit is permitted: the public path proof in acceptance check 24 runs from a temporary probe that is created, run, and deleted, never staged and never committed.
 
 In scope:
 
@@ -189,11 +189,7 @@ Unknowns for the Implementer or Plan Review to resolve:
 
 ## Affected Surfaces And Files
 
-Created before the move, in its own commit:
-
-- `tests/public_path_guard.rs` -- the external-crate public path guard from acceptance check 24. It is green at the base and must stay green and unmodified through the move.
-
-Created by the move-only commit:
+Created by the move-only commit (the ticket's single code commit):
 
 - `src/client_api_dto.rs`
 - `src/client_api_dto/response.rs`
@@ -220,6 +216,7 @@ Correction from round 2: `src/main.rs`, `src/update.rs`, and `src/local_runtime_
 Unchanged, and required to stay unchanged:
 
 - `src/main.rs`, `src/update.rs`, `src/local_runtime_process.rs` -- they consume the preserved crate-root re-export.
+- No new tracked test file. The public path proof in check 24 runs from a temporary `tests/public_path_probe.rs` that is created, run, and deleted, so this ticket still produces exactly one code commit.
 - `src/daemon_event_subscriptions.rs` beyond its single `use` line, and every ownership registry listed in the late-message matrix.
 - `crates/botster-hub-client/generated/daemon-protocol.ts`
 - `crates/botster-hub-client/src/lib.rs` and `crates/botster-hub-client/src/typescript.rs`
@@ -286,13 +283,14 @@ Provenance:
 23. Public surface loses nothing, and the surviving alias is a path alias rather than a wrapper. Both arms must hold:
     - `src/daemon_transport.rs` contains `pub use crate::daemon::error::{DaemonTransportError, DaemonTransportResult, PackageRollbackFailure};`, so `botster_hub::daemon_transport::DaemonTransportError`, `::DaemonTransportResult`, and `::PackageRollbackFailure` all still resolve. `PackageRollbackFailure` matters most: it has no crate-root alias, so this line is its only surviving public path.
     - `grep -nE "^(pub )?(fn|impl|enum|struct|type) " src/daemon_transport.rs` shows **zero** definitions of any moved item. The file may name a moved item only on a `use` or `pub use` line. This is the mechanical line between a permitted path alias and the forwarding wrapper the ticket forbids.
-24. **External-crate compile proof for every existing public path.** Round 5 offered a throwaway check or a `cargo doc` comparison; neither is exact and neither is reproducible by a reviewer. Replace both with one committed integration test. Files under `tests/` compile as separate crates that consume `botster_hub` as an external dependency, so this is a genuine external-crate resolution check rather than an intra-crate one.
+24. **External-crate compile proof for every existing public path, from a temporary probe that is never committed.**
 
-    Add `tests/public_path_guard.rs`:
+    Round 6 planned a committed `tests/public_path_guard.rs`. Plan Review round 7 rejected that correctly: a tracked guard file is a second code commit, and the ticket allows exactly one move-only code commit. The proof below keeps the same five-path compiler check but leaves no tracked file, so the one-code-commit rule holds.
+
+    Create `tests/public_path_probe.rs`, run it, then delete it. A file under `tests/` compiles as its **own crate** that links `botster_hub` as an external dependency, which is the external-crate resolution semantic this check needs.
 
     ```rust
-    //! Guards the exact public paths the decomposition must preserve.
-    //! Each alias fails to compile if its path stops resolving.
+    //! TEMPORARY probe. Never committed.
     type _TransportError = botster_hub::daemon_transport::DaemonTransportError;
     type _TransportResult = botster_hub::daemon_transport::DaemonTransportResult<()>;
     type _RollbackFailure = botster_hub::daemon_transport::PackageRollbackFailure;
@@ -303,22 +301,35 @@ Provenance:
     fn hub_public_paths_resolve() {}
     ```
 
-    That covers all five existing public paths: the three through `pub mod daemon_transport` and the two crate-root aliases. Run it with the exact command:
+    Exact command, run with the **same probe source** at the base and again after the move:
 
     ```
-    RUSTUP_TOOLCHAIN=1.97.0 cargo test --locked --test public_path_guard
+    RUSTUP_TOOLCHAIN=1.97.0 cargo test --locked --test public_path_probe
     ```
 
-    **Verified during Plan, both arms.** Green arm: the file above compiles and passes at the base `8137d16` under `RUSTUP_TOOLCHAIN=1.97.0`, so all five paths resolve today. Red arm: rewriting the third alias to `botster_hub::PackageRollbackFailure` fails compilation with
+    Then `rm -f tests/public_path_probe.rs` and confirm `git status --porcelain` is empty before committing anything. The probe must never be staged; check 5 and the move-only diff must not contain it.
+
+    **Why not an out-of-repo crate.** The obvious reading of "temporary external crate" is a standalone crate outside the repository that depends on `botster-hub` by path. That design was built and tried, and it **cannot compile `botster-hub` at the base at all**:
 
     ```
-    error[E0425]: cannot find type `PackageRollbackFailure` in crate `botster_hub`
-     --> tests/public_path_guard.rs:5:38
+    error[E0308]: mismatched types
+      expected `UiActionRequest`, found `botster_ui_contract::UiActionRequest`
+      note: there are multiple different versions of crate `botster_ui_contract` in the dependency graph
     ```
 
-    That ablation earns the guard twice over. It proves the check can fail rather than passing vacuously, and it is compiler evidence — not a grep inference — that `botster_hub::daemon_transport::PackageRollbackFailure` really is that type's only public path. The scratch file was removed and the worktree left clean; the Implementer commits the real one.
+    Six such errors appear. An out-of-repo crate resolves its own lockfile, so `botster-ui-contract` enters the graph twice: once through Hub's path dependency and once through `botster-hub-client`'s pinned dependency. The workspace lockfile unifies them; a fresh external lock does not. This matches [[git-visible Hub member manifests must use the UI contract tag]] and [[a ui contract git tag is unusable by external Cargo until pushed]]. Such a probe fails for reasons unrelated to public paths, so it is not a valid oracle and would report red whatever the move did. The `tests/` probe uses the workspace lock, so `botster_ui_contract` is unified and the check measures only what it claims to measure.
 
-    **Commit it before the move, in its own commit.** The test must be green at the base `8137d16` first, which establishes the control: the paths resolve today. The move-only commit must then leave it green with the file unmodified. A guard written after the move would only restate whatever the move produced and would prove nothing. Modifying this file to accommodate the move is a failure, exactly as check 19 forbids for the `hub_source()` guards.
+    **Verified during Plan, both arms, at base `8137d16`:**
+
+    - Green arm: `RUSTUP_TOOLCHAIN=1.97.0 cargo test --locked --test public_path_probe` passes, `1 passed; 0 failed`. All five public paths resolve today.
+    - Red arm ablation: rewriting the third alias to `botster_hub::PackageRollbackFailure` fails with
+
+      ```
+      error[E0425]: cannot find type `PackageRollbackFailure` in crate `botster_hub`
+       --> tests/public_path_probe.rs:5:38
+      ```
+
+    The ablation earns the check twice. It proves the probe can fail rather than passing vacuously, and it is compiler evidence, not a grep inference, that `botster_hub::daemon_transport::PackageRollbackFailure` is that type's only public path. After both arms the probe was deleted and `git status --porcelain` was empty, with no tracked or untracked residue.
 
 ## Runtime-Teardown Class
 
