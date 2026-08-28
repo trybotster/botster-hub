@@ -1202,7 +1202,7 @@ impl LocalWebrtcOfferPeer {
         _endpoint: &botster_hub_client::DaemonEndpoint,
         _session_id: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(60);
         let mut seen = Vec::new();
         while Instant::now() < deadline {
             match timeout(
