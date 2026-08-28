@@ -161,7 +161,7 @@ pub(crate) const ENTITY_SUBSCRIPTION_QUEUE_CAPACITY: usize = 64;
 const ENTITY_RECONCILIATION_INTERVAL: Duration = Duration::from_millis(500);
 const WEBRTC_BIND_OBSERVE_TICK: Duration = Duration::from_millis(50);
 const WEBRTC_SLOT_READY_OBSERVE_BOUND: Duration = Duration::from_secs(20);
-const WEBRTC_SLOT_READY_OBSERVE_ATTEMPTS: usize = 8;
+const WEBRTC_SLOT_READY_OBSERVE_ATTEMPTS: usize = 32;
 static NEXT_SOCKET_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) type ControlSender = tokio_mpsc::Sender<ControlMessage>;
@@ -9333,8 +9333,8 @@ mod tests {
             "reserved bind does not start SlotReady persist; persist starts after mux flush"
         );
         assert_eq!(
-            WEBRTC_SLOT_READY_OBSERVE_ATTEMPTS, 8,
-            "coalesced SlotReady persist may take several empty ticks after a flush"
+            WEBRTC_SLOT_READY_OBSERVE_ATTEMPTS, 32,
+            "coalesced SlotReady persist may take several empty ticks after a flush so Attached can follow FINISH"
         );
 
         let prune = production
