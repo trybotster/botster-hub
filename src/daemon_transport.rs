@@ -161,6 +161,7 @@ pub(crate) const ENTITY_SUBSCRIPTION_QUEUE_CAPACITY: usize = 64;
 const ENTITY_RECONCILIATION_INTERVAL: Duration = Duration::from_millis(500);
 const WEBRTC_BIND_OBSERVE_TICK: Duration = Duration::from_millis(50);
 const WEBRTC_SLOT_READY_OBSERVE_BOUND: Duration = Duration::from_secs(60);
+const WEBRTC_PRESSURED_OBSERVE_BURST: usize = 32;
 static NEXT_SOCKET_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) type ControlSender = tokio_mpsc::Sender<ControlMessage>;
@@ -232,14 +233,20 @@ fn owner_maintenance_pending(daemon: &HubDaemon, state: &DaemonControlState) -> 
 
 fn mark_due_reconciliation(state: &mut DaemonControlState, now: Instant) {
     if state.next_reconciliation <= now {
-        // Entity cadence only. A due timer must not remake Pump: while an
-        // empty bind is live the 50ms wait expires every turn, and Pump
-        // runs observe_lifecycle_slice on every session, which burns Core
-        // WRITE_ATTEMPT_BUDGET before Attached when no Status is queued.
+        // Unix and entity work still remake Pump on the 500ms cadence.
+        // A live WebRTC bind wait is 50ms and must not remake Pump: that
+        // observe_lifecycle_slice burns WRITE_ATTEMPT_BUDGET before Attached
+        // when no Status is queued. Persist, starved, and pressured ticks
+        // drain those sessions without a global slice.
         state.maintenance.try_wake();
+        if !webrtc_bind_observe_wait_pending(state)
+            && !state.pending_runtime.webrtc_slot_ready_pending()
+        {
+            state.background.mark_pump();
+        }
         state.next_reconciliation = now + ENTITY_RECONCILIATION_INTERVAL;
     }
-    if webrtc_recent_bind_needs_observe(state) {
+    if webrtc_bind_observe_wait_pending(state) {
         let soon = now + WEBRTC_BIND_OBSERVE_TICK;
         if state.next_reconciliation > soon {
             state.next_reconciliation = soon;
@@ -468,6 +475,7 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
         }
         observe_coalesced_webrtc_slot_ready(&daemon, &mut control_state);
         observe_starved_empty_webrtc_binds(&daemon, &mut control_state);
+        observe_pressured_webrtc_binds(&daemon, &mut control_state);
         mark_due_reconciliation(&mut control_state, Instant::now());
         if control_state
             .background
@@ -5818,6 +5826,16 @@ impl PendingRuntimeState {
         })
     }
 
+    fn webrtc_session_pressured_to_observe(&self, session_id: &str) -> bool {
+        self.webrtc_admissions.values().any(|admission| {
+            matches!(
+                admission,
+                WebrtcTerminalAdmission::Admitted { mux, .. }
+                    if mux.session_has_pressured_live_bound_slot(session_id)
+            )
+        })
+    }
+
     fn store_webrtc_reservation(
         &mut self,
         key: (String, String, String, u64),
@@ -6158,6 +6176,22 @@ fn webrtc_recent_bind_needs_observe(state: &mut DaemonControlState) -> bool {
         })
 }
 
+fn webrtc_bind_observe_wait_pending(state: &mut DaemonControlState) -> bool {
+    prune_webrtc_bind_observe_deadlines(state);
+    state
+        .pending_runtime
+        .webrtc_bind_observe_deadline
+        .keys()
+        .any(|session_id| {
+            state
+                .pending_runtime
+                .webrtc_session_ready_to_observe(session_id)
+                || state
+                    .pending_runtime
+                    .webrtc_session_pressured_to_observe(session_id)
+        })
+}
+
 fn webrtc_slot_ready_has_empty_session(state: &DaemonControlState) -> bool {
     state
         .pending_runtime
@@ -6233,6 +6267,42 @@ fn observe_starved_empty_webrtc_binds(daemon: &HubDaemon, state: &mut DaemonCont
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or(0);
     observe_recent_webrtc_binds(daemon, state, now_seconds);
+}
+
+fn observe_pressured_webrtc_binds(daemon: &HubDaemon, state: &mut DaemonControlState) {
+    prune_webrtc_bind_observe_deadlines(state);
+    let Some(runtime) = daemon.runtime() else {
+        return;
+    };
+    let now_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let now = Instant::now();
+    let sessions: Vec<String> = state
+        .pending_runtime
+        .webrtc_bind_observe_deadline
+        .keys()
+        .filter(|session_id| {
+            state
+                .pending_runtime
+                .webrtc_session_pressured_to_observe(session_id)
+                && webrtc_session_pump_cooled(state, session_id, now)
+        })
+        .cloned()
+        .collect();
+    for session_id in sessions {
+        for _ in 0..WEBRTC_PRESSURED_OBSERVE_BURST {
+            if !state
+                .pending_runtime
+                .webrtc_session_pressured_to_observe(&session_id)
+            {
+                break;
+            }
+            let _ = runtime.observe_session_lifecycle(&SessionId(session_id.clone()), now_seconds);
+        }
+        note_webrtc_session_pumped(state, &session_id, now);
+    }
 }
 
 fn observe_one_webrtc_bind(daemon: &HubDaemon, session_id: &str) {
@@ -9279,10 +9349,11 @@ mod tests {
         assert!(
             owner_loop.contains("observe_coalesced_webrtc_slot_ready(&daemon")
                 && owner_loop.contains("observe_starved_empty_webrtc_binds")
+                && owner_loop.contains("observe_pressured_webrtc_binds")
                 && !owner_loop.contains("if !persisted")
                 && !owner_loop.contains("observe_due_webrtc_binds(&daemon")
                 && !owner_loop.contains("observe_flushed_webrtc_slots(&daemon"),
-            "every owner turn drains coalesced SlotReady then starved empty binds; per-session cooldown prevents a second Core tick"
+            "every owner turn drains coalesced SlotReady, starved empty Ready binds, then pressured Full/WouldBlock binds"
         );
         assert!(
             production.contains("WEBRTC_BIND_OBSERVE_TICK"),
@@ -9407,6 +9478,20 @@ mod tests {
                 && !starved.contains("WEBRTC_SLOT_READY_OBSERVE_ATTEMPTS"),
             "starved empty binds observe one Core tick per bind-observe tick, never eight before first SlotReady"
         );
+        let pressured = production
+            .split("fn observe_pressured_webrtc_binds")
+            .nth(1)
+            .expect("pressured bind observe");
+        let pressured = pressured
+            .split("fn observe_one_webrtc_bind")
+            .next()
+            .unwrap_or(pressured);
+        assert!(
+            pressured.contains("WEBRTC_PRESSURED_OBSERVE_BURST")
+                && pressured.contains("webrtc_session_pressured_to_observe")
+                && !pressured.contains("webrtc_session_ready_to_observe"),
+            "pressured binds burst Core ticks only while Full or WouldBlock"
+        );
         let recent = production
             .split("fn observe_recent_webrtc_binds")
             .nth(1)
@@ -9451,13 +9536,9 @@ mod tests {
             .split("if state.next_reconciliation <= now")
             .nth(1)
             .expect("expired reconciliation arm");
-        let expired = expired
-            .split("webrtc_recent_bind_needs_observe")
-            .next()
-            .unwrap_or(expired);
         assert!(
-            !expired.contains("mark_pump"),
-            "a due bind-observe timer must not remake Pump; persist and starved drain empty Ready slots"
+            expired.contains("webrtc_bind_observe_wait_pending") && expired.contains("mark_pump"),
+            "entity cadence remakes Pump only when no WebRTC bind wait is live"
         );
         assert!(
             !control_arm.contains("observe_coalesced_webrtc_slot_ready"),
