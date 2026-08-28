@@ -5783,6 +5783,7 @@ impl PendingRuntimeState {
         );
     }
 
+    #[cfg(test)]
     fn webrtc_session_slot_occupied(&self, session_id: &str) -> bool {
         self.webrtc_admissions.values().any(|admission| {
             matches!(
@@ -5804,8 +5805,13 @@ impl PendingRuntimeState {
     }
 
     fn webrtc_session_ready_to_observe(&self, session_id: &str) -> bool {
-        self.webrtc_session_has_live_bound_route(session_id)
-            && !self.webrtc_session_slot_occupied(session_id)
+        self.webrtc_admissions.values().any(|admission| {
+            matches!(
+                admission,
+                WebrtcTerminalAdmission::Admitted { mux, .. }
+                    if mux.session_has_empty_live_bound_slot(session_id)
+            )
+        })
     }
 
     fn store_webrtc_reservation(
@@ -6185,11 +6191,11 @@ fn take_unoccupied_webrtc_slot_ready(state: &mut DaemonControlState) -> Vec<Stri
         }
         if state
             .pending_runtime
-            .webrtc_session_slot_occupied(&session_id)
+            .webrtc_session_ready_to_observe(&session_id)
         {
-            state.pending_runtime.note_webrtc_slot_ready(&session_id);
-        } else {
             ready.push(session_id);
+        } else {
+            state.pending_runtime.note_webrtc_slot_ready(&session_id);
         }
     }
     ready
@@ -6557,7 +6563,9 @@ fn should_mark_pump_after_control(request: &DaemonRequest, succeeded: bool) -> b
     match request {
         DaemonRequest::Spawn { .. }
         | DaemonRequest::SpawnSessionType { .. }
-        | DaemonRequest::Attach { .. } => succeeded,
+        | DaemonRequest::Attach { .. }
+        | DaemonRequest::SendInput { .. }
+        | DaemonRequest::ModeGatedInput { .. } => succeeded,
         DaemonRequest::Detach { .. }
         | DaemonRequest::ShutdownSession { .. }
         | DaemonRequest::RemoveSession { .. } => true,
@@ -9312,6 +9320,13 @@ mod tests {
             &DaemonRequest::ListSessions,
             true
         ));
+        assert!(should_mark_pump_after_control(
+            &DaemonRequest::SendInput {
+                session_id: "sess".to_string(),
+                data: "x".to_string(),
+            },
+            true
+        ));
         let pump = production
             .split("fn run_one_pump_phase")
             .nth(1)
@@ -9408,11 +9423,11 @@ mod tests {
             .next()
             .unwrap_or(occupied_filter);
         assert!(
-            occupied_filter.contains("webrtc_session_slot_occupied")
+            occupied_filter.contains("webrtc_session_ready_to_observe")
                 && occupied_filter.contains("webrtc_session_has_live_bound_route")
                 && occupied_filter.contains("note_webrtc_slot_ready")
                 && !occupied_filter.contains("WEBRTC_SLOT_READY_PERSIST_BURST_LIMIT"),
-            "a full live adapter slot keeps the coalesced session key; closed routes drop it"
+            "persist a session when any live bound slot is empty; a stale full sibling slot must not skip it"
         );
         let due = production
             .split("fn mark_due_reconciliation")
@@ -9473,6 +9488,68 @@ mod tests {
             taken,
             vec!["sess-a".to_string(), "sess-b".to_string()],
             "distinct ready sessions stay distinct keys"
+        );
+    }
+
+    #[test]
+    fn replacement_owner_empty_slot_is_observed_while_stale_owner_slot_is_full() {
+        use botster_core::contract::terminal_adapter::TerminalAdapter;
+        use botster_terminal_protocol::TerminalFrame;
+
+        let mux_a = WebRtcConnectionMux::new();
+        let label_a = mux_a
+            .reserve_terminal("grant-a".into(), "sess".into(), "sub".into(), 1)
+            .expect("reserve A");
+        let (mut adapter_a, handle_a) = mux_a.create_adapter();
+        assert!(mux_a.bind_reserved(&label_a, handle_a));
+        let frame = TerminalFrame::from_bytes(br#"{"type":"terminal_output"}"#).expect("frame");
+        assert_eq!(adapter_a.try_write(&frame), Ok(()));
+        assert!(mux_a.session_bound_slot_occupied("sess"));
+
+        let mux_b = WebRtcConnectionMux::new();
+        let label_b = mux_b
+            .reserve_terminal("grant-b".into(), "sess".into(), "sub".into(), 2)
+            .expect("reserve B");
+        let (_adapter_b, handle_b) = mux_b.create_adapter();
+        assert!(mux_b.bind_reserved(&label_b, handle_b));
+        assert!(mux_b.session_has_empty_live_bound_slot("sess"));
+
+        let mut state = DaemonControlState {
+            next_reconciliation: Instant::now() + Duration::from_secs(30),
+            ..DaemonControlState::default()
+        };
+        state.pending_runtime.webrtc_admissions.insert(
+            "grant-a".into(),
+            WebrtcTerminalAdmission::Admitted {
+                required_features: Vec::new(),
+                mux: mux_a,
+                terminal_requirement: None,
+            },
+        );
+        state.pending_runtime.webrtc_admissions.insert(
+            "grant-b".into(),
+            WebrtcTerminalAdmission::Admitted {
+                required_features: Vec::new(),
+                mux: mux_b,
+                terminal_requirement: None,
+            },
+        );
+        assert!(
+            state.pending_runtime.webrtc_session_slot_occupied("sess"),
+            "stale owner A still occupies a slot"
+        );
+        assert!(
+            state
+                .pending_runtime
+                .webrtc_session_ready_to_observe("sess"),
+            "replacement owner B's empty slot must still be observed"
+        );
+        state.pending_runtime.note_webrtc_slot_ready("sess");
+        let ready = take_unoccupied_webrtc_slot_ready(&mut state);
+        assert_eq!(
+            ready,
+            vec!["sess".to_string()],
+            "a full stale-owner slot must not skip the replacement owner's empty persist: {ready:?}"
         );
     }
 

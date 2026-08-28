@@ -1185,10 +1185,17 @@ impl WebRtcConnectionMux {
         !self.live_bound_handles_for_session(session_id).is_empty()
     }
 
+    #[cfg(test)]
     pub(crate) fn session_bound_slot_occupied(&self, session_id: &str) -> bool {
         self.live_bound_handles_for_session(session_id)
             .iter()
             .any(WebRtcTerminalAdapterHandle::slot_is_occupied)
+    }
+
+    pub(crate) fn session_has_empty_live_bound_slot(&self, session_id: &str) -> bool {
+        self.live_bound_handles_for_session(session_id)
+            .iter()
+            .any(|handle| !handle.slot_is_occupied())
     }
 
     pub(crate) fn queue_host_event(&self, event: DaemonEvent) {
