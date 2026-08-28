@@ -13,6 +13,11 @@ use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::Sender;
+#[cfg(test)]
+use std::sync::mpsc::{self, Receiver};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -229,6 +234,8 @@ impl IsolatedHubBuilder {
             teardown_started: None,
             unconfirmed_deadline: None,
             stop_polls: Cell::new(0),
+            drop_retry_ran_cleanup: Cell::new(false),
+            drop_retry_used_fresh_budget: Cell::new(false),
         })
     }
 
@@ -265,6 +272,7 @@ struct IsolatedHubSeams {
     fail_census: bool,
     skip_captured_reap: bool,
     panic_after_freeze: bool,
+    expire_reap: bool,
     remembered_set: Option<OwnedSet>,
 }
 
@@ -286,6 +294,8 @@ pub struct IsolatedHub {
     teardown_started: Option<Instant>,
     unconfirmed_deadline: Option<Instant>,
     stop_polls: Cell<u32>,
+    drop_retry_ran_cleanup: Cell<bool>,
+    drop_retry_used_fresh_budget: Cell<bool>,
 }
 
 impl IsolatedHub {
@@ -388,8 +398,28 @@ impl IsolatedHub {
     }
 
     #[cfg(test)]
+    pub(crate) fn expire_reap(&mut self) {
+        self.seams.expire_reap = true;
+    }
+
+    #[cfg(test)]
     pub(crate) fn stop_polls(&self) -> u32 {
         self.stop_polls.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn drop_retry_ran_cleanup(&self) -> bool {
+        self.drop_retry_ran_cleanup.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn drop_retry_used_fresh_budget(&self) -> bool {
+        self.drop_retry_used_fresh_budget.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_unconfirmed_drop_retry(&mut self) -> bool {
+        self.try_unconfirmed_drop_retry()
     }
 
     /// Stop the daemon, wait for its process, then remove its owned data directory.
@@ -418,6 +448,8 @@ impl IsolatedHub {
             teardown_started: None,
             unconfirmed_deadline: None,
             stop_polls: Cell::new(0),
+            drop_retry_ran_cleanup: Cell::new(false),
+            drop_retry_used_fresh_budget: Cell::new(false),
         }
     }
 
@@ -520,9 +552,7 @@ impl IsolatedHub {
                         &budget,
                         &self.seams,
                     ) {
-                        record_taint(hub_pid as i32, self.data_dir.clone());
-                        self.lifecycle = IsolatedHubLifecycle::QuiescenceUnconfirmed;
-                        return Err(error);
+                        return self.fail_unconfirmed(budget, error);
                     }
                     self.lifecycle = IsolatedHubLifecycle::Completed;
                     if shutdown_outcome.succeeded {
@@ -539,9 +569,7 @@ impl IsolatedHub {
                         &budget,
                         &self.seams,
                     ) {
-                        record_taint(hub_pid as i32, self.data_dir.clone());
-                        self.lifecycle = IsolatedHubLifecycle::QuiescenceUnconfirmed;
-                        return Err(error);
+                        return self.fail_unconfirmed(budget, error);
                     }
                     self.lifecycle = IsolatedHubLifecycle::Completed;
                     Err(IsolatedHubError::DaemonExited {
@@ -596,9 +624,7 @@ impl IsolatedHub {
                 if let Err(error) =
                     reap_owned_session_workers(hub_pid, Some(&confirmed), &budget, &self.seams)
                 {
-                    record_taint(hub_pid as i32, self.data_dir.clone());
-                    self.lifecycle = IsolatedHubLifecycle::QuiescenceUnconfirmed;
-                    return Err(error);
+                    return self.fail_unconfirmed(budget, error);
                 }
                 self.lifecycle = IsolatedHubLifecycle::Completed;
                 let _ = (stdout, stderr, shutdown_outcome, live_snapshot);
@@ -637,6 +663,24 @@ impl IsolatedHub {
         record_taint(self.hub_pid as i32, self.data_dir.clone());
         self.unconfirmed_deadline = Some(budget.deadline);
         self.lifecycle = IsolatedHubLifecycle::QuiescenceUnconfirmed;
+        self.error_from_unconfirmed_cause(cause)
+    }
+
+    fn fail_unconfirmed(
+        &mut self,
+        budget: TeardownBudget,
+        cause: IsolatedHubError,
+    ) -> Result<(), IsolatedHubError> {
+        record_taint(self.hub_pid as i32, self.data_dir.clone());
+        self.unconfirmed_deadline = Some(budget.deadline);
+        self.lifecycle = IsolatedHubLifecycle::QuiescenceUnconfirmed;
+        self.error_from_unconfirmed_cause(cause)
+    }
+
+    fn error_from_unconfirmed_cause(
+        &self,
+        cause: IsolatedHubError,
+    ) -> Result<(), IsolatedHubError> {
         match cause {
             IsolatedHubError::QuiescenceUnconfirmed { .. } => {
                 Err(IsolatedHubError::QuiescenceUnconfirmed {
@@ -648,17 +692,42 @@ impl IsolatedHub {
         }
     }
 
+    fn try_unconfirmed_drop_retry(&mut self) -> bool {
+        if self.drop_retry_used {
+            return false;
+        }
+        self.drop_retry_used = true;
+        let original_deadline = self.unconfirmed_deadline;
+        let deadline = if self.seams.restart_budget_on_drop_retry {
+            Instant::now() + WHOLE_PATH_BUDGET
+        } else {
+            original_deadline.unwrap_or_else(|| Instant::now() + WHOLE_PATH_BUDGET)
+        };
+        self.drop_retry_used_fresh_budget
+            .set(match original_deadline {
+                Some(original) => deadline > original,
+                None => true,
+            });
+        if Instant::now() >= deadline {
+            return false;
+        }
+        self.drop_retry_confirmed_cleanup(TeardownBudget { deadline });
+        true
+    }
+
     fn drop_retry_confirmed_cleanup(&mut self, budget: TeardownBudget) {
         let hub_pid = self.hub_pid;
-        let mut seams = if self.seams.reuse_remembered_set_on_drop_retry {
-            self.seams.clone()
-        } else {
-            IsolatedHubSeams {
-                remembered_set: None,
-                reuse_remembered_set_on_drop_retry: false,
-                ..self.seams.clone()
-            }
+        let mut seams = IsolatedHubSeams {
+            force_quiescence_unconfirmed: false,
+            remembered_set: if self.seams.reuse_remembered_set_on_drop_retry {
+                self.seams.remembered_set.clone()
+            } else {
+                None
+            },
+            reuse_remembered_set_on_drop_retry: self.seams.reuse_remembered_set_on_drop_retry,
+            ..self.seams.clone()
         };
+        self.drop_retry_ran_cleanup.set(true);
         if let Ok(confirmed) =
             freeze_confirm_snapshot(hub_pid, &budget, &mut seams, &self.stop_polls)
         {
@@ -690,20 +759,7 @@ impl Drop for IsolatedHub {
         match self.lifecycle {
             IsolatedHubLifecycle::Completed => {}
             IsolatedHubLifecycle::QuiescenceUnconfirmed => {
-                if self.drop_retry_used {
-                    return;
-                }
-                self.drop_retry_used = true;
-                let deadline = if self.seams.restart_budget_on_drop_retry {
-                    Instant::now() + WHOLE_PATH_BUDGET
-                } else {
-                    self.unconfirmed_deadline
-                        .unwrap_or_else(|| Instant::now() + WHOLE_PATH_BUDGET)
-                };
-                if Instant::now() >= deadline {
-                    return;
-                }
-                self.drop_retry_confirmed_cleanup(TeardownBudget { deadline });
+                let _ = self.try_unconfirmed_drop_retry();
             }
             IsolatedHubLifecycle::Pending => {
                 if thread::panicking() {
@@ -1167,14 +1223,16 @@ struct IsolatedHubTaint {
 
 static ISOLATED_HUB_TAINT: Mutex<Option<IsolatedHubTaint>> = Mutex::new(None);
 static ISOLATED_HUB_START_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-static AFTER_TAINT_CHECK_HOOK: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
+#[cfg(test)]
+static NEXT_ISOLATED_HUB_START_TOKEN: AtomicU64 = AtomicU64::new(1);
+static ISOLATED_HUB_START_BOUNDARY: OnceLock<Mutex<Option<IsolatedHubStartBoundaryArm>>> =
+    OnceLock::new();
 
 thread_local! {
     static START_GUARD_DEPTH: Cell<u32> = const { Cell::new(0) };
+    static BYPASS_START_GUARD: Cell<bool> = const { Cell::new(false) };
+    static START_TOKEN: Cell<Option<u64>> = const { Cell::new(None) };
 }
-
-static BYPASS_START_GUARD: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
 
 fn isolated_hub_start_lock() -> &'static Mutex<()> {
     ISOLATED_HUB_START_LOCK.get_or_init(|| Mutex::new(()))
@@ -1197,7 +1255,7 @@ impl Drop for IsolatedHubStartGuard {
 pub fn isolated_hub_start_guard() -> IsolatedHubStartGuard {
     START_GUARD_DEPTH.with(|depth| {
         if depth.get() == 0 {
-            if BYPASS_START_GUARD.load(std::sync::atomic::Ordering::SeqCst) {
+            if BYPASS_START_GUARD.with(Cell::get) {
                 return IsolatedHubStartGuard { _inner: None };
             }
             let inner = isolated_hub_start_lock()
@@ -1216,7 +1274,7 @@ pub fn isolated_hub_start_guard() -> IsolatedHubStartGuard {
 
 #[cfg(test)]
 pub(crate) fn bypass_isolated_hub_start_guard(bypass: bool) {
-    BYPASS_START_GUARD.store(bypass, std::sync::atomic::Ordering::SeqCst);
+    BYPASS_START_GUARD.with(|slot| slot.set(bypass));
 }
 
 #[cfg(test)]
@@ -1225,19 +1283,78 @@ pub(crate) fn inject_isolated_hub_taint(pgid: i32, data_dir: PathBuf) {
 }
 
 #[cfg(test)]
-pub(crate) fn set_after_taint_check_hook(hook: Box<dyn FnOnce() + Send>) {
-    *AFTER_TAINT_CHECK_HOOK
+pub(crate) fn next_isolated_hub_start_token() -> u64 {
+    NEXT_ISOLATED_HUB_START_TOKEN.fetch_add(1, Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) fn set_isolated_hub_start_token(token: u64) {
+    START_TOKEN.with(|slot| slot.set(Some(token)));
+}
+
+#[cfg(test)]
+pub(crate) fn clear_isolated_hub_start_token() {
+    START_TOKEN.with(|slot| slot.set(None));
+}
+
+struct IsolatedHubStartBoundaryArm {
+    expected: u64,
+    matched: Sender<()>,
+    foreign: Sender<()>,
+}
+
+#[cfg(test)]
+pub(crate) struct IsolatedHubStartBoundary {
+    pub(crate) matched: Receiver<()>,
+    pub(crate) foreign: Receiver<()>,
+}
+
+#[cfg(test)]
+pub(crate) fn arm_isolated_hub_start_boundary(expected: u64) -> IsolatedHubStartBoundary {
+    let (matched_tx, matched_rx) = mpsc::channel();
+    let (foreign_tx, foreign_rx) = mpsc::channel();
+    *isolated_hub_start_boundary_slot()
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(IsolatedHubStartBoundaryArm {
+        expected,
+        matched: matched_tx,
+        foreign: foreign_tx,
+    });
+    IsolatedHubStartBoundary {
+        matched: matched_rx,
+        foreign: foreign_rx,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn disarm_isolated_hub_start_boundary() {
+    *isolated_hub_start_boundary_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+}
+
+fn isolated_hub_start_boundary_slot() -> &'static Mutex<Option<IsolatedHubStartBoundaryArm>> {
+    ISOLATED_HUB_START_BOUNDARY.get_or_init(|| Mutex::new(None))
 }
 
 fn run_after_taint_check_hook() {
-    let hook = AFTER_TAINT_CHECK_HOOK
+    let token = START_TOKEN.with(Cell::get);
+    let slot = isolated_hub_start_boundary_slot()
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take();
-    if let Some(hook) = hook {
-        hook();
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(arm) = slot.as_ref() else {
+        return;
+    };
+    match token {
+        Some(current) if current == arm.expected => {
+            let _ = arm.matched.send(());
+            drop(slot);
+            thread::sleep(Duration::from_millis(50));
+        }
+        Some(_) => {
+            let _ = arm.foreign.send(());
+        }
+        None => {}
     }
 }
 
@@ -1507,11 +1624,7 @@ fn freeze_confirm_snapshot(
         });
     }
     if seams.skip_freeze {
-        let set = if let Some(remembered) = seams.remembered_set.clone() {
-            remembered
-        } else {
-            owned_set_from_sample(&census_sample()?, hub_pid)
-        };
+        let set = seams.remembered_set.clone().unwrap_or_default();
         signal_owned_hub_group(hub_pid, libc::SIGKILL)?;
         return Ok(set);
     }
@@ -1569,7 +1682,11 @@ fn reap_owned_session_workers(
         });
     }
     let started = Instant::now();
-    let reap_deadline = budget.phase_deadline(REAP_CEILING);
+    let reap_deadline = if seams.expire_reap {
+        Instant::now()
+    } else {
+        budget.phase_deadline(REAP_CEILING)
+    };
     loop {
         let sample = census_sample()?;
         let current = owned_set_from_sample(&sample, hub_pid);
@@ -1598,7 +1715,9 @@ fn reap_owned_session_workers(
             signal_matched_pid(pid, signal);
         }
         if Instant::now() >= reap_deadline {
-            return Ok(());
+            return Err(IsolatedHubError::TeardownTimeout {
+                phase: TeardownPhase::Reap,
+            });
         }
         thread::sleep(REAP_POLL);
     }

@@ -3,10 +3,11 @@
 Ticket: `ticket_1787894962_603665`
 Run: `run_1787895426_736357`
 Pipeline: Botster Stack Delivery (`botster_stack_delivery`)
-Step: Implement (`botster_stack_implement`) — review-fix visit after `review_1787909065_326772` (`changes_required`)
+Step: Implement (`botster_stack_implement`) — second review-fix visit after `review_1787911411_664315` (`changes_required`)
 
 First Implement commit: `ddd9d3f`
-Review-fix commit: recorded after this report is committed.
+First review-fix commit: `b3ecb50`
+Second review-fix commit: recorded after this report is committed.
 
 ## Target repository and target_id
 
@@ -154,7 +155,12 @@ Focused proofs (this review-fix visit, IsolatedHub crate tests, 17 passed):
 - `teardown_isolates_sibling_hub_process_group`
 - `drop_retry_does_not_restart_whole_path_budget`
 
-Official wrapper (this review-fix visit):
+Official wrapper (second review-fix visit after `review_1787911411_664315`):
+
+- First `./test.sh --locked`: failed `unix_eof_skip_core_detach_ablation_keeps_named_pair_on_status` under default concurrency. Isolation on this branch passed in 2.19 s. Same occupancy-ablation flake as the first Implement visit.
+- Second `./test.sh --locked`: exit 0. Hub lib 496. Lifecycle 319 passed, 2 ignored, in 282.44 s. Test-support 66 passed in 60.09 s.
+
+Official wrapper (first review-fix visit):
 
 - `RUSTUP_TOOLCHAIN=1.97.0 rustc --version` → `rustc 1.97.0 (2d8144b78 2026-07-07)`
 - `CARGO_TARGET_DIR` unset
@@ -195,9 +201,17 @@ The plan already listed the vault-gap candidates. Implement confirms these are s
 
 No further gap was required to finish this review-fix visit. Capture remains a later vault-pipeline action unless the owner wants inbox notes from this report.
 
-## Review findings addressed this visit
+## Review findings addressed
+
+From `review_1787909065_326772` (commit `b3ecb50`):
 
 - `finding_1787909065_162654` (blocking): descendant fixture now forks inside the worker, calls `os.setpgid(0, 0)`, asserts pgid != Hub pgid, and has a red control that skips captured-set reap.
 - `finding_1787909065_141528` (blocking): `census_sample` and reap return `Result`. Empty live-group samples and injected census failure take the unconfirmed child-only path.
-- `finding_1787909065_294461` (major): `isolated_hub_start_guard` is reentrant and held across taint check and spawn. Taint mutations take the same guard. Bypass race test exists.
+- `finding_1787909065_294461` (major): `isolated_hub_start_guard` is reentrant and held across taint check and spawn. Taint mutations take the same guard.
 - `finding_1787909065_482451` (major): freeze, stop-confirmation, remembered-set, residual-budget, census-fail, captured-reap, and freeze-panic seams now have callers. Setters are `pub(crate)` and `#[cfg(test)]`.
+
+From `review_1787911411_664315` (this visit):
+
+- `finding_1787911411_889492` (blocking): reap budget expiry now returns `TeardownTimeout { Reap }`, taints, and does not mark `Completed` while descendants remain.
+- `finding_1787911411_798490` (major): Drop-retry, residual-budget, skip-freeze, and freeze-guard tests now fail on the named claims. Production Drop retry takes a new stop census and reuses the original deadline.
+- `finding_1787911411_781343` (major): start-guard bypass is thread-local. The after-taint hook is token-scoped. A sibling start with a different token cannot satisfy the intended boundary hook.
