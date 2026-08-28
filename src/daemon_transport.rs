@@ -9490,7 +9490,7 @@ mod tests {
             pressured.contains("WEBRTC_PRESSURED_OBSERVE_BURST")
                 && pressured.contains("webrtc_session_pressured_to_observe")
                 && !pressured.contains("webrtc_session_ready_to_observe"),
-            "pressured binds burst Core ticks only while this handle is Full or its DataChannel is above low water"
+            "pressured binds burst Core ticks only while Full or WouldBlock"
         );
         let recent = production
             .split("fn observe_recent_webrtc_binds")
