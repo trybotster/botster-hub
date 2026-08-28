@@ -29,8 +29,8 @@ use serde::{Deserialize, Serialize};
 
 mod isolated_hub;
 pub use isolated_hub::{
-    IsolatedHub, IsolatedHubBuilder, IsolatedHubError, TeardownPhase, clear_isolated_hub_taint,
-    isolated_hub_taint,
+    IsolatedHub, IsolatedHubBuilder, IsolatedHubError, IsolatedHubStartGuard, TeardownPhase,
+    clear_isolated_hub_taint, isolated_hub_start_guard, isolated_hub_taint,
 };
 
 /// Shared OS monotonic clock for campaign emission-to-receipt samples.
@@ -5263,7 +5263,10 @@ impl From<serde_json::Error> for ConformanceError {
 
 #[cfg(test)]
 mod tests {
-    use super::isolated_hub::{IsolatedHub, cleanup_child, explicit_path};
+    use super::isolated_hub::{
+        IsolatedHub, bypass_isolated_hub_start_guard, cleanup_child, explicit_path,
+        inject_isolated_hub_taint, process_pgid, set_after_taint_check_hook,
+    };
     use super::*;
     use botster_hub_client::DaemonCompatibility;
     use std::env;
@@ -7209,9 +7212,39 @@ done
             SESSION_WORKER_NAME,
             &format!(
                 r#"#!/bin/sh
-sleep 60 &
-printf '%s\n' "$!" > '{}'
-wait
+python3 -c 'import os,sys,time
+path=sys.argv[1]
+pid=os.fork()
+if pid==0:
+    os.setpgid(0,0)
+    open(path,"w").write("%d\n"%os.getpid())
+    time.sleep(60)
+    os._exit(0)
+os.wait()
+' '{}'
+"#,
+                descendant_pid_file.display()
+            ),
+        )
+    }
+
+    fn worker_script_delayed_descendant(root: &Path, descendant_pid_file: &Path) -> PathBuf {
+        executable_script(
+            root,
+            SESSION_WORKER_NAME,
+            &format!(
+                r#"#!/bin/sh
+python3 -c 'import os,sys,time
+path=sys.argv[1]
+time.sleep(2)
+pid=os.fork()
+if pid==0:
+    os.setpgid(0,0)
+    open(path,"w").write("%d\n"%os.getpid())
+    time.sleep(60)
+    os._exit(0)
+os.wait()
+' '{}'
 "#,
                 descendant_pid_file.display()
             ),
@@ -7253,10 +7286,14 @@ wait
         let worker_bin = worker_script_with_descendant(&root, &descendant_pid_file);
         let leader = spawn_leader_with_worker_script(&worker_bin, &descendant_pid_file);
         let descendant_pid = wait_for_fake_pid_within(&descendant_pid_file, Duration::from_secs(5));
-        unsafe {
-            let _ = libc::setpgid(descendant_pid as libc::pid_t, descendant_pid as libc::pid_t);
-        }
         let hub = isolated_hub(shutdown_script(&root, "exit 0"), root.clone(), leader);
+        let descendant_pgid =
+            process_pgid(descendant_pid).expect("descendant pgid before teardown");
+        assert_ne!(
+            descendant_pgid,
+            hub.hub_child_pid(),
+            "descendant must sit in its own process group"
+        );
         let started = Instant::now();
         while Instant::now() < started + Duration::from_secs(2)
             && hub.owned_session_worker_pids().is_empty()
@@ -7360,10 +7397,14 @@ wait
         let worker_bin = worker_script_with_descendant(&root, &descendant_pid_file);
         let leader = spawn_leader_with_worker_script(&worker_bin, &descendant_pid_file);
         let descendant_pid = wait_for_fake_pid_within(&descendant_pid_file, Duration::from_secs(5));
-        unsafe {
-            let _ = libc::setpgid(descendant_pid as libc::pid_t, descendant_pid as libc::pid_t);
-        }
         let hub = isolated_hub(shutdown_script(&root, "exit 0"), root.clone(), leader);
+        let descendant_pgid =
+            process_pgid(descendant_pid).expect("descendant pgid before teardown");
+        assert_ne!(
+            descendant_pgid,
+            hub.hub_child_pid(),
+            "descendant must sit in its own process group"
+        );
         let started = Instant::now();
         let error = hub
             .shutdown()
@@ -7384,7 +7425,33 @@ wait
 
     #[cfg(unix)]
     #[test]
+    fn captured_reap_removed_leaves_separate_group_descendant() {
+        let root = unique_root("skip-captured-reap");
+        let descendant_pid_file = root.join("descendant.pid");
+        let worker_bin = worker_script_with_descendant(&root, &descendant_pid_file);
+        let leader = spawn_leader_with_worker_script(&worker_bin, &descendant_pid_file);
+        let descendant_pid = wait_for_fake_pid_within(&descendant_pid_file, Duration::from_secs(5));
+        let mut hub = isolated_hub(shutdown_script(&root, "exit 0"), root.clone(), leader);
+        assert_ne!(
+            process_pgid(descendant_pid).expect("descendant pgid"),
+            hub.hub_child_pid()
+        );
+        hub.skip_captured_reap();
+        let _ = hub.shutdown();
+        assert!(
+            process_exists(descendant_pid),
+            "without the captured-set reap a separate-group descendant must survive the Hub-group kill"
+        );
+        unsafe {
+            libc::kill(descendant_pid as libc::pid_t, libc::SIGKILL);
+        }
+        fs::remove_dir_all(root).expect("remove skip-captured-reap fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn unconfirmed_quiescence_kills_only_the_hub_child_and_taints() {
+        let _guard = isolated_hub_start_guard();
         clear_isolated_hub_taint();
         let root = unique_root("unconfirmed");
         let descendant_pid_file = root.join("descendant.pid");
@@ -7440,6 +7507,7 @@ wait
     #[cfg(unix)]
     #[test]
     fn taint_blocks_the_next_isolated_hub_start_without_spawning() {
+        let _guard = isolated_hub_start_guard();
         clear_isolated_hub_taint();
         record_test_taint();
         let root = unique_root("taint-block");
@@ -7460,6 +7528,7 @@ wait
 
     #[cfg(unix)]
     fn record_test_taint() {
+        let _guard = isolated_hub_start_guard();
         let root = unique_root("taint-cell");
         let leader = spawn_group_leader("sleep 60");
         let mut hub = isolated_hub(shutdown_script(&root, "exit 0"), root.clone(), leader);
@@ -7472,11 +7541,13 @@ wait
     #[cfg(unix)]
     #[test]
     fn drop_retry_does_not_restart_whole_path_budget() {
+        let _guard = isolated_hub_start_guard();
         clear_isolated_hub_taint();
         let root = unique_root("drop-budget");
         let leader = spawn_group_leader("sleep 60");
         let mut hub = isolated_hub(shutdown_script(&root, "exit 0"), root.clone(), leader);
         hub.force_quiescence_unconfirmed();
+        hub.restart_budget_on_drop_retry();
         let started = Instant::now();
         let error = hub.shutdown().expect_err("forced unconfirmed shutdown");
         assert!(matches!(
@@ -7489,6 +7560,229 @@ wait
         );
         clear_isolated_hub_taint();
         fs::remove_dir_all(root).expect("remove drop-budget fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn census_failure_is_unconfirmed_and_leaves_separate_group_descendant() {
+        let _guard = isolated_hub_start_guard();
+        clear_isolated_hub_taint();
+        let root = unique_root("census-fail");
+        let descendant_pid_file = root.join("descendant.pid");
+        let worker_bin = worker_script_with_descendant(&root, &descendant_pid_file);
+        let leader = spawn_leader_with_worker_script(&worker_bin, &descendant_pid_file);
+        let hub_pid = leader.id();
+        let descendant_pid = wait_for_fake_pid_within(&descendant_pid_file, Duration::from_secs(5));
+        let mut hub = isolated_hub(shutdown_script(&root, "exit 0"), root.clone(), leader);
+        assert_ne!(
+            process_pgid(descendant_pid).expect("descendant pgid"),
+            hub.hub_child_pid()
+        );
+        hub.fail_census();
+        let error = hub.shutdown().expect_err("failed census must not succeed");
+        assert!(
+            matches!(error, IsolatedHubError::CensusFailed { .. }),
+            "got {error:?}"
+        );
+        assert_process_exits(hub_pid);
+        assert!(
+            process_exists(descendant_pid),
+            "unconfirmed census must not kill a separate-group descendant"
+        );
+        assert!(isolated_hub_taint().is_some());
+        clear_isolated_hub_taint();
+        unsafe {
+            libc::kill(descendant_pid as libc::pid_t, libc::SIGKILL);
+        }
+        fs::remove_dir_all(root).expect("remove census-fail fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skip_freeze_misses_late_separate_group_descendant() {
+        let root = unique_root("skip-freeze");
+        let descendant_pid_file = root.join("descendant.pid");
+        let worker_bin = worker_script_delayed_descendant(&root, &descendant_pid_file);
+        let leader = spawn_leader_with_worker_script(&worker_bin, &descendant_pid_file);
+        let mut hub = isolated_hub(shutdown_script(&root, "exit 0"), root.clone(), leader);
+        hub.skip_freeze();
+        hub.skip_captured_reap();
+        let _ = hub.shutdown();
+        let descendant_pid = wait_for_fake_pid_within(&descendant_pid_file, Duration::from_secs(5));
+        assert!(
+            process_exists(descendant_pid),
+            "without freeze, a descendant created after the early snapshot must survive Hub-group kill"
+        );
+        unsafe {
+            libc::kill(descendant_pid as libc::pid_t, libc::SIGKILL);
+        }
+        fs::remove_dir_all(root).expect("remove skip-freeze fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_confirmation_polls_and_skip_does_not() {
+        let root = unique_root("stop-polls");
+        let child = spawn_group_leader("sleep 60");
+        let mut hub = isolated_hub(shutdown_script(&root, "exit 0"), root.clone(), child);
+        let _ = hub.shutdown_inner();
+        assert!(
+            hub.stop_polls() >= 1,
+            "confirmed freeze must poll stopped state, polls={}",
+            hub.stop_polls()
+        );
+        fs::remove_dir_all(&root).expect("remove stop-polls fixture");
+        let root = unique_root("stop-polls-skip");
+        let child = spawn_group_leader("sleep 60");
+        let mut hub = isolated_hub(shutdown_script(&root, "exit 0"), root.clone(), child);
+        hub.skip_stop_confirmation();
+        let _ = hub.shutdown_inner();
+        assert_eq!(
+            hub.stop_polls(),
+            0,
+            "skip_stop_confirmation must not run the stopped-state census"
+        );
+        fs::remove_dir_all(root).expect("remove stop-polls-skip fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn freeze_guard_resume_on_panic_leaves_no_stopped_process() {
+        let root = unique_root("freeze-panic");
+        let child = spawn_group_leader("sleep 60");
+        let pid = child.id();
+        let mut hub = isolated_hub(shutdown_script(&root, "exit 0"), root.clone(), child);
+        hub.panic_after_freeze();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = hub.shutdown();
+        }));
+        assert!(result.is_err());
+        if process_exists(pid) {
+            let output = Command::new("ps")
+                .args(["-p", &pid.to_string(), "-o", "stat="])
+                .output()
+                .expect("ps stat");
+            assert!(
+                !String::from_utf8_lossy(&output.stdout)
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .starts_with('T'),
+                "freeze-guard Drop must resume a panicked freeze"
+            );
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+        fs::remove_dir_all(root).expect("remove freeze-panic fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_drop_unconfirmed_taints_without_stopped_processes() {
+        let _guard = isolated_hub_start_guard();
+        clear_isolated_hub_taint();
+        let root = unique_root("direct-drop");
+        let child = spawn_group_leader("sleep 60");
+        let pid = child.id();
+        let mut hub = isolated_hub(shutdown_script(&root, "exit 0"), root.clone(), child);
+        hub.force_quiescence_unconfirmed();
+        drop(hub);
+        assert!(isolated_hub_taint().is_some());
+        if process_exists(pid) {
+            let output = Command::new("ps")
+                .args(["-p", &pid.to_string(), "-o", "stat="])
+                .output()
+                .expect("ps stat");
+            assert!(!String::from_utf8_lossy(&output.stdout).contains('T') || zombie_only(pid));
+        }
+        clear_isolated_hub_taint();
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drop_retry_reuse_remembered_set_skips_fresh_stop_census() {
+        let _guard = isolated_hub_start_guard();
+        clear_isolated_hub_taint();
+        let root = unique_root("reuse-set");
+        let child = spawn_group_leader("sleep 60");
+        let mut hub = isolated_hub(shutdown_script(&root, "exit 0"), root.clone(), child);
+        hub.force_quiescence_unconfirmed();
+        hub.reuse_remembered_set_on_drop_retry();
+        let _ = hub.shutdown();
+        clear_isolated_hub_taint();
+        fs::remove_dir_all(root).expect("remove reuse-set fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zero_residual_drop_makes_no_retry_attempt() {
+        let root = unique_root("zero-residual");
+        let child = spawn_group_leader("sleep 60");
+        let pid = child.id();
+        let mut hub = isolated_hub(shutdown_script(&root, "exit 0"), root.clone(), child);
+        hub.force_quiescence_unconfirmed();
+        hub.expire_residual_deadline();
+        drop(hub);
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        }
+        fs::remove_dir_all(root).expect("remove zero-residual fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn isolated_hub_start_guard_bypass_lets_taint_race_spawn() {
+        let _guard = isolated_hub_start_guard();
+        clear_isolated_hub_taint();
+        let root = unique_root("taint-race");
+        let hub_bin = executable_script(
+            &root,
+            "botster-hub",
+            "#!/bin/sh\nprintf '%s\\n' $$ > spawned.pid\nsleep 60\n",
+        );
+        let worker = existing_file(&root, "botster-session-worker");
+        let (tx, rx) = std::sync::mpsc::channel();
+        set_after_taint_check_hook(Box::new(move || {
+            let _ = tx.send(());
+            thread::sleep(Duration::from_millis(50));
+        }));
+        bypass_isolated_hub_start_guard(true);
+        let start_root = root.clone();
+        let handle = thread::spawn(move || {
+            IsolatedHubBuilder::new()
+                .hub_bin(hub_bin)
+                .session_worker_bin(worker)
+                .root(&start_root)
+                .working_directory(&start_root)
+                .ready_timeout(Duration::from_millis(200))
+                .start()
+        });
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("start reached the post-check hook");
+        inject_isolated_hub_taint(1, root.clone());
+        let started = handle.join().expect("join start");
+        bypass_isolated_hub_start_guard(false);
+        let spawned = started.is_ok()
+            || matches!(
+                started.as_ref(),
+                Err(IsolatedHubError::ReadyTimeout { .. }
+                    | IsolatedHubError::DaemonExited { .. }
+                    | IsolatedHubError::Spawn { .. })
+            );
+        assert!(
+            spawned,
+            "bypassed start can spawn after a racing taint write"
+        );
+        if let Ok(hub) = started {
+            drop(hub);
+        }
+        clear_isolated_hub_taint();
+        fs::remove_dir_all(root).expect("remove taint-race fixture");
     }
 
     #[cfg(unix)]
