@@ -231,6 +231,14 @@ fn owner_maintenance_pending(daemon: &HubDaemon, state: &DaemonControlState) -> 
 }
 
 fn mark_due_reconciliation(state: &mut DaemonControlState, now: Instant) {
+    if state.next_reconciliation <= now {
+        // Entity cadence only. A due timer must not remake Pump: while an
+        // empty bind is live the 50ms wait expires every turn, and Pump
+        // runs observe_lifecycle_slice on every session, which burns Core
+        // WRITE_ATTEMPT_BUDGET before Attached when no Status is queued.
+        state.maintenance.try_wake();
+        state.next_reconciliation = now + ENTITY_RECONCILIATION_INTERVAL;
+    }
     if webrtc_recent_bind_needs_observe(state) {
         let soon = now + WEBRTC_BIND_OBSERVE_TICK;
         if state.next_reconciliation > soon {
@@ -262,11 +270,6 @@ fn mark_due_reconciliation(state: &mut DaemonControlState, now: Instant) {
         if state.next_reconciliation > soon {
             state.next_reconciliation = soon;
         }
-    }
-    if state.next_reconciliation <= now {
-        state.background.mark_pump();
-        state.maintenance.try_wake();
-        state.next_reconciliation = now + ENTITY_RECONCILIATION_INTERVAL;
     }
     if state.pending_runtime.take_close_work() {
         state.background.mark_pump();
@@ -5810,7 +5813,7 @@ impl PendingRuntimeState {
             matches!(
                 admission,
                 WebrtcTerminalAdmission::Admitted { mux, .. }
-                    if mux.session_has_empty_live_bound_slot(session_id)
+                    if mux.session_has_ready_live_bound_slot(session_id)
             )
         })
     }
@@ -6112,7 +6115,7 @@ fn webrtc_bound_slots_block_journal_pump(state: &DaemonControlState) -> bool {
         };
         for handle in mux.live_bound_handles() {
             saw_live = true;
-            if !handle.slot_is_occupied() {
+            if handle.write_slot_is_ready() {
                 saw_ready = true;
             }
         }
@@ -9444,6 +9447,18 @@ mod tests {
             due.contains("webrtc_slot_ready_has_empty_session"),
             "Pump is marked only when a coalesced SlotReady session has an empty slot"
         );
+        let expired = due
+            .split("if state.next_reconciliation <= now")
+            .nth(1)
+            .expect("expired reconciliation arm");
+        let expired = expired
+            .split("webrtc_recent_bind_needs_observe")
+            .next()
+            .unwrap_or(expired);
+        assert!(
+            !expired.contains("mark_pump"),
+            "a due bind-observe timer must not remake Pump; persist and starved drain empty Ready slots"
+        );
         assert!(
             !control_arm.contains("observe_coalesced_webrtc_slot_ready"),
             "generic control must not drain SlotReady observation"
@@ -9608,6 +9623,69 @@ mod tests {
             OwnerPollDecision::Block
         ));
         let _keep_slot_full = adapter;
+    }
+
+    #[test]
+    fn expired_bind_observe_tick_does_not_mark_pump() {
+        let mux = WebRtcConnectionMux::new();
+        let label = mux
+            .reserve_terminal("grant".into(), "sess".into(), "sub".into(), 1)
+            .expect("reserve");
+        let (_adapter, handle) = mux.create_adapter();
+        assert!(mux.bind_reserved(&label, handle));
+        let mut state = DaemonControlState {
+            next_reconciliation: Instant::now() - Duration::from_millis(1),
+            ..DaemonControlState::default()
+        };
+        state.pending_runtime.webrtc_admissions.insert(
+            "grant".into(),
+            WebrtcTerminalAdmission::Admitted {
+                required_features: Vec::new(),
+                mux,
+                terminal_requirement: None,
+            },
+        );
+        state.pending_runtime.extend_webrtc_bind_observe("sess");
+        let now = Instant::now();
+        mark_due_reconciliation(&mut state, now);
+        assert!(
+            !state.background.pump_pending(),
+            "an expired empty-bind tick must wait and persist/starved-observe, not remake Pump"
+        );
+        assert!(
+            state.next_reconciliation <= now + WEBRTC_BIND_OBSERVE_TICK,
+            "empty Ready binds still schedule the 50ms observe wait: {:?}",
+            state.next_reconciliation.saturating_duration_since(now)
+        );
+    }
+
+    #[test]
+    fn would_block_slot_is_not_ready_to_observe() {
+        let mux = WebRtcConnectionMux::new();
+        let label = mux
+            .reserve_terminal("grant".into(), "sess".into(), "sub".into(), 1)
+            .expect("reserve");
+        let (_adapter, handle) = mux.create_adapter();
+        handle.set_buffered_bytes(
+            crate::local_webrtc::webrtc_subscription_channel::AGGREGATE_BUFFERED_LOW,
+        );
+        handle.force_would_block();
+        assert!(mux.bind_reserved(&label, handle));
+        let mut state = DaemonControlState::default();
+        state.pending_runtime.webrtc_admissions.insert(
+            "grant".into(),
+            WebrtcTerminalAdmission::Admitted {
+                required_features: Vec::new(),
+                mux,
+                terminal_requirement: None,
+            },
+        );
+        assert!(
+            !state
+                .pending_runtime
+                .webrtc_session_ready_to_observe("sess"),
+            "aggregate WouldBlock must not count as a Ready write slot"
+        );
     }
 
     #[test]

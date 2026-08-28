@@ -1558,6 +1558,7 @@ where
                     }
                     Ok(Some(event @ (DataChannelEvent::OnBufferedAmountHigh
                     | DataChannelEvent::OnBufferedAmountLow))) => {
+                        let writable = matches!(event, DataChannelEvent::OnBufferedAmountLow);
                         apply_subscription_channel_event(
                             event,
                             stream_key,
@@ -1569,6 +1570,14 @@ where
                         )
                         .await
                         .ok();
+                        if writable {
+                            peer_state.mux.note_slot_ready(&label.session_id);
+                            let _ = peer_state.runtime_tx.try_send(
+                                ControlMessage::ReservedWebrtcSlotReady {
+                                    session_id: label.session_id.clone(),
+                                },
+                            );
+                        }
                     }
                     Ok(Some(DataChannelEvent::OnClose | DataChannelEvent::OnClosing))
                     | Ok(None) => {
