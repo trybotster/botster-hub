@@ -273,8 +273,69 @@ pub(crate) struct SessionWorkerProcessIdentity {
 /// Portable census of true `botster-session-worker` binaries (not hub argv mentions).
 pub(crate) fn session_worker_process_identities()
 -> Result<Vec<SessionWorkerProcessIdentity>, String> {
+    #[cfg(target_os = "linux")]
+    if let Ok(Some(workers)) = linux_proc_session_worker_identities() {
+        return Ok(workers);
+    }
+    ps_axww_session_worker_identities()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_proc_session_worker_identities()
+-> Result<Option<Vec<SessionWorkerProcessIdentity>>, String> {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Ok(None);
+    };
+    let mut workers = Vec::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(bytes) = fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        if bytes.is_empty() {
+            continue;
+        }
+        let args: Vec<String> = bytes
+            .split(|byte| *byte == 0)
+            .filter(|chunk| !chunk.is_empty())
+            .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+            .collect();
+        let Some(argv0) = args.first() else {
+            continue;
+        };
+        let is_worker = Path::new(argv0)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "botster-session-worker");
+        if !is_worker {
+            continue;
+        }
+        let command = args.join(" ");
+        let descendant_pids = worker_owned_descendant_pids(pid)?;
+        let shell_descendant_pids: Vec<u32> = descendant_pids
+            .iter()
+            .copied()
+            .filter(|candidate| *candidate != pid)
+            .collect();
+        workers.push(SessionWorkerProcessIdentity {
+            pid,
+            command,
+            shell_descendant_pids,
+        });
+    }
+    Ok(Some(workers))
+}
+
+fn ps_axww_session_worker_identities() -> Result<Vec<SessionWorkerProcessIdentity>, String> {
     let output = Command::new("ps")
-        .args(["-axo", "pid=,command="])
+        .env("COLUMNS", "65535")
+        .args(["-axww", "-o", "pid=,command="])
         .output()
         .map_err(|error| format!("ps worker census failed: {error}"))?;
     if !output.status.success() {
