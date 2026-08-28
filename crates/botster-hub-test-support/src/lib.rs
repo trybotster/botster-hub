@@ -7200,7 +7200,8 @@ done
         IsolatedHub {
             hub_bin,
             endpoint: DaemonEndpoint::new(data_dir.join(default_socket_name())),
-            data_dir,
+            data_dir: data_dir.clone(),
+            data_dir_arg: data_dir,
             working_directory: std::env::current_dir().expect("read test working directory"),
             child: Some(child),
         }

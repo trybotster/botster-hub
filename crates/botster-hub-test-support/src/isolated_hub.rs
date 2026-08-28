@@ -184,7 +184,7 @@ impl IsolatedHubBuilder {
 
         if let Err(error) = wait_for_ready(&endpoint, &mut child, self.ready_timeout) {
             cleanup_child(&mut child)?;
-            reap_session_workers_for_data_dir(&data_dir);
+            reap_session_workers_for_data_dir(&data_dir, &selected_data_dir);
             remove_data_dir_path(&data_dir)?;
             return Err(error);
         }
@@ -192,6 +192,7 @@ impl IsolatedHubBuilder {
         Ok(IsolatedHub {
             hub_bin,
             data_dir,
+            data_dir_arg: selected_data_dir,
             working_directory,
             endpoint,
             child: Some(child),
@@ -222,6 +223,7 @@ impl IsolatedHubBuilder {
 pub struct IsolatedHub {
     pub(crate) hub_bin: PathBuf,
     pub(crate) data_dir: PathBuf,
+    pub(crate) data_dir_arg: PathBuf,
     pub(crate) working_directory: PathBuf,
     pub(crate) endpoint: DaemonEndpoint,
     pub(crate) child: Option<Child>,
@@ -279,7 +281,7 @@ impl IsolatedHub {
         let daemon_output = child
             .wait_with_output()
             .map_err(|source| IsolatedHubError::Wait { source })?;
-        reap_session_workers_for_data_dir(&self.data_dir);
+        self.reap_owned_session_workers();
         if daemon_output.status.success() {
             if shutdown_succeeded {
                 self.remove_data_dir()
@@ -300,6 +302,10 @@ impl IsolatedHub {
     fn remove_data_dir(&self) -> Result<(), IsolatedHubError> {
         remove_data_dir_path(&self.data_dir)
     }
+
+    fn reap_owned_session_workers(&self) {
+        reap_session_workers_for_data_dir(&self.data_dir, &self.data_dir_arg);
+    }
 }
 
 fn remove_data_dir_path(data_dir: &Path) -> Result<(), IsolatedHubError> {
@@ -315,9 +321,9 @@ fn remove_data_dir_path(data_dir: &Path) -> Result<(), IsolatedHubError> {
 
 impl Drop for IsolatedHub {
     fn drop(&mut self) {
-        reap_session_workers_for_data_dir(&self.data_dir);
+        reap_session_workers_for_data_dir(&self.data_dir, &self.data_dir_arg);
         if !thread::panicking() && self.shutdown_inner().is_ok() {
-            reap_session_workers_for_data_dir(&self.data_dir);
+            reap_session_workers_for_data_dir(&self.data_dir, &self.data_dir_arg);
             return;
         }
         let mut child_cleaned = true;
@@ -325,7 +331,7 @@ impl Drop for IsolatedHub {
             child_cleaned = cleanup_child(child).is_ok();
         }
         self.child = None;
-        reap_session_workers_for_data_dir(&self.data_dir);
+        reap_session_workers_for_data_dir(&self.data_dir, &self.data_dir_arg);
         if child_cleaned && !thread::panicking() {
             let _ = self.remove_data_dir();
         }
@@ -557,9 +563,10 @@ fn wait_for_ready(
     })
 }
 
-fn session_worker_pids_for_data_dir(data_dir: &Path) -> Vec<u32> {
+fn session_worker_pids_for_data_dir(data_dir: &Path, data_dir_arg: &Path) -> Vec<u32> {
     let dir = data_dir.to_string_lossy();
-    if dir.is_empty() {
+    let arg_token = data_dir_arg.to_string_lossy();
+    if dir.is_empty() && arg_token.is_empty() {
         return Vec::new();
     }
     let Ok(output) = Command::new("ps").args(["-axo", "pid=,command="]).output() else {
@@ -589,16 +596,11 @@ fn session_worker_pids_for_data_dir(data_dir: &Path) -> Vec<u32> {
             continue;
         }
         let args: Vec<&str> = parts.collect();
-        let unique = data_dir
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("");
-        let command = args.join(" ");
         if args.iter().any(|arg| *arg == dir.as_ref())
-            || args.iter().any(|arg| data_dir_arg_matches(arg, data_dir))
-            || args.iter().any(|arg| arg.contains(dir.as_ref()))
-            || (!unique.is_empty()
-                && (args.iter().any(|arg| arg.contains(unique)) || command.contains(unique)))
+            || (!arg_token.is_empty() && args.iter().any(|arg| *arg == arg_token.as_ref()))
+            || args.iter().any(|arg| {
+                exact_data_dir_path(arg, data_dir) || exact_data_dir_path(arg, data_dir_arg)
+            })
         {
             pids.push(pid);
         }
@@ -606,13 +608,9 @@ fn session_worker_pids_for_data_dir(data_dir: &Path) -> Vec<u32> {
     pids
 }
 
-fn data_dir_arg_matches(arg: &str, data_dir: &Path) -> bool {
+fn exact_data_dir_path(arg: &str, data_dir: &Path) -> bool {
     let arg_path = Path::new(arg);
     if arg_path == data_dir {
-        return true;
-    }
-    if !arg_path.is_absolute() && arg_path.components().count() > 1 && data_dir.ends_with(arg_path)
-    {
         return true;
     }
     match (fs::canonicalize(arg_path), fs::canonicalize(data_dir)) {
@@ -653,14 +651,28 @@ fn descendant_pids(root: u32) -> Vec<u32> {
     owned
 }
 
-fn reap_session_workers_for_data_dir(data_dir: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+fn signal_matched_pid(pid: u32, signal: libc::c_int) {
+    if pid <= 1 {
+        return;
+    }
+    let raw = pid as libc::pid_t;
+    let our_pgid = unsafe { libc::getpgid(0) };
+    let pgid = unsafe { libc::getpgid(raw) };
+    if pgid == raw && pgid > 1 && pgid != our_pgid {
+        let _ = unsafe { libc::killpg(raw, signal) };
+        return;
+    }
+    let _ = unsafe { libc::kill(raw, signal) };
+}
+
+fn reap_session_workers_for_data_dir(data_dir: &Path, data_dir_arg: &Path) {
+    let started = Instant::now();
     loop {
-        let pids = session_worker_pids_for_data_dir(data_dir);
+        let pids = session_worker_pids_for_data_dir(data_dir, data_dir_arg);
         if pids.is_empty() {
             return;
         }
-        let signal = if Instant::now() + Duration::from_millis(400) >= deadline {
+        let signal = if started.elapsed() >= Duration::from_millis(400) {
             libc::SIGKILL
         } else {
             libc::SIGTERM
@@ -672,12 +684,9 @@ fn reap_session_workers_for_data_dir(data_dir: &Path) {
         targets.sort_unstable();
         targets.dedup();
         for pid in targets {
-            let raw = pid as libc::pid_t;
-            if unsafe { libc::killpg(raw, signal) } != 0 {
-                let _ = unsafe { libc::kill(raw, signal) };
-            }
+            signal_matched_pid(pid, signal);
         }
-        if Instant::now() >= deadline {
+        if started.elapsed() >= Duration::from_secs(15) {
             return;
         }
         thread::sleep(Duration::from_millis(50));

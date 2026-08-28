@@ -2690,7 +2690,6 @@ pub(crate) fn handle_control_message(
         }
         ControlMessage::ReservedWebrtcSlotReady { session_id } => {
             state.pending_runtime.note_webrtc_slot_ready(&session_id);
-            state.webrtc_slot_ready_seen.insert(session_id.clone());
             state
                 .pending_runtime
                 .extend_webrtc_bind_observe(&session_id);
@@ -6214,27 +6213,7 @@ fn observe_starved_empty_webrtc_binds(daemon: &HubDaemon, state: &mut DaemonCont
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or(0);
-    let sessions: Vec<String> = state
-        .pending_runtime
-        .webrtc_bind_observe_deadline
-        .keys()
-        .filter(|session_id| {
-            state
-                .pending_runtime
-                .webrtc_session_ready_to_observe(session_id)
-        })
-        .cloned()
-        .collect();
-    let Some(runtime) = daemon.runtime() else {
-        return;
-    };
-    for session_id in sessions {
-        if state.webrtc_slot_ready_seen.contains(&session_id) {
-            let _ = runtime.observe_session_lifecycle(&SessionId(session_id), now_seconds);
-        } else {
-            observe_reserved_session_until_slot_full(daemon, state, &session_id);
-        }
-    }
+    observe_recent_webrtc_binds(daemon, state, now_seconds);
     state.last_webrtc_empty_pump = Some(now);
 }
 
@@ -6337,7 +6316,6 @@ pub(crate) struct DaemonControlState {
     pending_hub_update_reply: Option<ControlReplySender>,
     observe_resume: Option<botster_core_daemon::ObserveLifecycleCursor>,
     last_webrtc_empty_pump: Option<Instant>,
-    webrtc_slot_ready_seen: BTreeSet<String>,
 }
 
 impl Default for DaemonControlState {
@@ -6362,7 +6340,6 @@ impl Default for DaemonControlState {
             pending_hub_update_reply: None,
             observe_resume: None,
             last_webrtc_empty_pump: None,
-            webrtc_slot_ready_seen: BTreeSet::new(),
         }
     }
 }
@@ -9309,10 +9286,9 @@ mod tests {
             .unwrap_or(slot_ready);
         assert!(
             slot_ready.contains("note_webrtc_slot_ready")
-                && slot_ready.contains("webrtc_slot_ready_seen")
                 && slot_ready.contains("mark_pump")
                 && !slot_ready.contains("observe_reserved_session_until_slot_full"),
-            "SlotReady is a doorbell: coalesce, grant a bounded persist burst, and mark Pump; do not observe in the control arm"
+            "SlotReady is a doorbell: coalesce and mark Pump, do not observe in the control arm"
         );
         for request in ["DaemonRequest::Status", "DaemonRequest::ListSessions"] {
             let arm = production
@@ -9398,9 +9374,9 @@ mod tests {
         assert!(
             starved.contains("WEBRTC_BIND_OBSERVE_TICK")
                 && starved.contains("last_webrtc_empty_pump")
-                && starved.contains("webrtc_slot_ready_seen")
-                && starved.contains("observe_reserved_session_until_slot_full"),
-            "starved empty binds poll eight ticks before the first SlotReady and one tick after, at most once per bind-observe tick"
+                && starved.contains("observe_recent_webrtc_binds")
+                && !starved.contains("observe_reserved_session_until_slot_full"),
+            "starved empty binds observe one Core tick per bind-observe tick, never eight before first SlotReady"
         );
         let occupied_filter = production
             .split("fn take_unoccupied_webrtc_slot_ready")
