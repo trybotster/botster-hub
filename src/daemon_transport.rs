@@ -6200,19 +6200,21 @@ fn observe_coalesced_webrtc_slot_ready(daemon: &HubDaemon, state: &mut DaemonCon
         state
             .pending_runtime
             .extend_webrtc_bind_observe(&session_id);
-        let bursts = webrtc_slot_ready_persist_bursts(state, &session_id).saturating_add(1);
-        state
-            .webrtc_slot_ready_persist_bursts
-            .insert(session_id.clone(), bursts);
         observe_reserved_session_until_slot_full(daemon, state, &session_id);
         if state
+            .pending_runtime
+            .webrtc_session_slot_occupied(&session_id)
+        {
+            let bursts = webrtc_slot_ready_persist_bursts(state, &session_id).saturating_add(1);
+            state
+                .webrtc_slot_ready_persist_bursts
+                .insert(session_id.clone(), bursts);
+        } else if state
             .pending_runtime
             .webrtc_session_ready_to_observe(&session_id)
         {
             state.last_webrtc_empty_pump = Some(now);
-            if bursts < WEBRTC_SLOT_READY_PERSIST_BURST_LIMIT {
-                state.pending_runtime.note_webrtc_slot_ready(&session_id);
-            }
+            state.pending_runtime.note_webrtc_slot_ready(&session_id);
         }
     }
     persisted
@@ -9361,7 +9363,7 @@ mod tests {
         );
         assert_eq!(
             WEBRTC_SLOT_READY_PERSIST_BURST_LIMIT, 8,
-            "eight SlotReady persist bursts cover attaching through Attached; later live drains are starved one-tick"
+            "eight occupied persist bursts cover attaching through Attached; empty persist still re-notes until a slot fills"
         );
         assert_eq!(
             WEBRTC_SLOT_READY_OBSERVE_BOUND,
@@ -9395,10 +9397,10 @@ mod tests {
             "coalesced drain observes only empty slots"
         );
         assert!(
-            coalesced.contains("WEBRTC_SLOT_READY_PERSIST_BURST_LIMIT")
-                && coalesced.contains("webrtc_slot_ready_persist_bursts")
+            coalesced.contains("webrtc_slot_ready_persist_bursts")
+                && coalesced.contains("webrtc_session_slot_occupied")
                 && coalesced.contains("note_webrtc_slot_ready"),
-            "empty persist re-notes only while the session is under the persist-burst limit"
+            "empty persist re-notes until a slot fills; occupied persist counts toward the burst limit"
         );
         let starved = production
             .split("fn observe_starved_empty_webrtc_binds")
