@@ -7064,8 +7064,10 @@ done
             .next()
             .unwrap_or(drop_impl);
         assert!(
-            drop_impl.contains("reap_owned_session_workers"),
-            "IsolatedHub Drop must reap leftover session-workers for its data dir"
+            drop_impl.contains("reap_owned_session_workers")
+                && drop_impl.contains("thread::panicking()")
+                && drop_impl.contains("cleanup_child"),
+            "IsolatedHub panic Drop must kill the hub child before reaping leftover session-workers"
         );
         assert!(
             source.contains("file_name()")

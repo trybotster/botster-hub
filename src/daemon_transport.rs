@@ -241,10 +241,17 @@ fn mark_due_reconciliation(state: &mut DaemonControlState, now: Instant) {
     }
     if webrtc_slot_ready_has_empty_session(state) {
         let due = state
-            .last_webrtc_empty_pump
-            .is_none_or(|last| now.saturating_duration_since(last) >= WEBRTC_BIND_OBSERVE_TICK);
+            .pending_runtime
+            .slot_ready
+            .session_ids()
+            .into_iter()
+            .any(|session_id| {
+                state
+                    .pending_runtime
+                    .webrtc_session_ready_to_observe(&session_id)
+                    && webrtc_session_pump_cooled(state, &session_id, now)
+            });
         if due {
-            state.last_webrtc_empty_pump = Some(now);
             state.background.mark_pump();
         } else {
             let soon = now + WEBRTC_BIND_OBSERVE_TICK;
@@ -458,10 +465,8 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
                 None => return Err(DaemonTransportError::ControlThreadStopped),
             }
         }
-        let persisted = observe_coalesced_webrtc_slot_ready(&daemon, &mut control_state);
-        if !persisted {
-            observe_starved_empty_webrtc_binds(&daemon, &mut control_state);
-        }
+        observe_coalesced_webrtc_slot_ready(&daemon, &mut control_state);
+        observe_starved_empty_webrtc_binds(&daemon, &mut control_state);
         mark_due_reconciliation(&mut control_state, Instant::now());
         if control_state
             .background
@@ -6166,6 +6171,19 @@ fn webrtc_slot_ready_persist_bursts(state: &DaemonControlState, session_id: &str
         .unwrap_or(0)
 }
 
+fn webrtc_session_pump_cooled(state: &DaemonControlState, session_id: &str, now: Instant) -> bool {
+    state
+        .last_webrtc_empty_pump
+        .get(session_id)
+        .is_none_or(|last| now.saturating_duration_since(*last) >= WEBRTC_BIND_OBSERVE_TICK)
+}
+
+fn note_webrtc_session_pumped(state: &mut DaemonControlState, session_id: &str, now: Instant) {
+    state
+        .last_webrtc_empty_pump
+        .insert(session_id.to_string(), now);
+}
+
 fn take_unoccupied_webrtc_slot_ready(state: &mut DaemonControlState) -> Vec<String> {
     let mut ready = Vec::new();
     for session_id in state.pending_runtime.take_webrtc_slot_ready() {
@@ -6198,16 +6216,13 @@ fn observe_coalesced_webrtc_slot_ready(daemon: &HubDaemon, state: &mut DaemonCon
     if sessions.is_empty() {
         return false;
     }
-    let cooled = state
-        .last_webrtc_empty_pump
-        .is_none_or(|last| now.saturating_duration_since(last) >= WEBRTC_BIND_OBSERVE_TICK);
-    if !cooled {
-        for session_id in &sessions {
-            state.pending_runtime.note_webrtc_slot_ready(session_id);
-        }
-        return true;
-    }
+    let mut persisted = false;
     for session_id in sessions {
+        if !webrtc_session_pump_cooled(state, &session_id, now) {
+            state.pending_runtime.note_webrtc_slot_ready(&session_id);
+            continue;
+        }
+        persisted = true;
         state
             .pending_runtime
             .extend_webrtc_bind_observe(&session_id);
@@ -6226,20 +6241,13 @@ fn observe_coalesced_webrtc_slot_ready(daemon: &HubDaemon, state: &mut DaemonCon
         {
             state.pending_runtime.note_webrtc_slot_ready(&session_id);
         }
-        state.last_webrtc_empty_pump = Some(now);
+        note_webrtc_session_pumped(state, &session_id, now);
     }
-    true
+    persisted
 }
 
 fn observe_starved_empty_webrtc_binds(daemon: &HubDaemon, state: &mut DaemonControlState) {
     if !webrtc_recent_bind_needs_observe(state) {
-        return;
-    }
-    let now = Instant::now();
-    let cooled = state
-        .last_webrtc_empty_pump
-        .is_none_or(|last| now.saturating_duration_since(last) >= WEBRTC_BIND_OBSERVE_TICK);
-    if !cooled {
         return;
     }
     let now_seconds = SystemTime::now()
@@ -6247,7 +6255,6 @@ fn observe_starved_empty_webrtc_binds(daemon: &HubDaemon, state: &mut DaemonCont
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or(0);
     observe_recent_webrtc_binds(daemon, state, now_seconds);
-    state.last_webrtc_empty_pump = Some(now);
 }
 
 fn observe_reserved_session_until_slot_full(
@@ -6282,6 +6289,7 @@ fn observe_recent_webrtc_binds(
         return;
     };
     let _ = webrtc_recent_bind_needs_observe(state);
+    let now = Instant::now();
     let sessions: Vec<String> = state
         .pending_runtime
         .webrtc_bind_observe_deadline
@@ -6290,11 +6298,13 @@ fn observe_recent_webrtc_binds(
             state
                 .pending_runtime
                 .webrtc_session_ready_to_observe(session_id)
+                && webrtc_session_pump_cooled(state, session_id, now)
         })
         .cloned()
         .collect();
     for session_id in sessions {
-        let _ = runtime.observe_session_lifecycle(&SessionId(session_id), now_seconds);
+        let _ = runtime.observe_session_lifecycle(&SessionId(session_id.clone()), now_seconds);
+        note_webrtc_session_pumped(state, &session_id, now);
     }
 }
 
@@ -6348,7 +6358,7 @@ pub(crate) struct DaemonControlState {
     pub(crate) live_attach_routes: BTreeSet<(String, String)>,
     pending_hub_update_reply: Option<ControlReplySender>,
     observe_resume: Option<botster_core_daemon::ObserveLifecycleCursor>,
-    last_webrtc_empty_pump: Option<Instant>,
+    last_webrtc_empty_pump: BTreeMap<String, Instant>,
     webrtc_slot_ready_persist_bursts: BTreeMap<String, usize>,
 }
 
@@ -6373,7 +6383,7 @@ impl Default for DaemonControlState {
             live_attach_routes: BTreeSet::new(),
             pending_hub_update_reply: None,
             observe_resume: None,
-            last_webrtc_empty_pump: None,
+            last_webrtc_empty_pump: BTreeMap::new(),
             webrtc_slot_ready_persist_bursts: BTreeMap::new(),
         }
     }
@@ -9303,9 +9313,10 @@ mod tests {
         assert!(
             owner_loop.contains("observe_coalesced_webrtc_slot_ready(&daemon")
                 && owner_loop.contains("observe_starved_empty_webrtc_binds")
+                && !owner_loop.contains("if !persisted")
                 && !owner_loop.contains("observe_due_webrtc_binds(&daemon")
                 && !owner_loop.contains("observe_flushed_webrtc_slots(&daemon"),
-            "every owner turn drains coalesced SlotReady after control; starved empty binds get one tick only when persist did not run"
+            "every owner turn drains coalesced SlotReady then starved empty binds; per-session cooldown prevents a second Core tick"
         );
         assert!(
             production.contains("WEBRTC_BIND_OBSERVE_TICK"),
@@ -9411,8 +9422,8 @@ mod tests {
             coalesced.contains("webrtc_slot_ready_persist_bursts")
                 && coalesced.contains("webrtc_session_slot_occupied")
                 && coalesced.contains("note_webrtc_slot_ready")
-                && coalesced.contains("WEBRTC_BIND_OBSERVE_TICK"),
-            "empty persist re-notes until a slot fills, at most one persist burst per bind-observe tick"
+                && coalesced.contains("webrtc_session_pump_cooled"),
+            "empty persist re-notes until a slot fills; cooldown is per session so web Status cannot starve IsolatedHub binds"
         );
         let starved = production
             .split("fn observe_starved_empty_webrtc_binds")
@@ -9423,11 +9434,22 @@ mod tests {
             .next()
             .unwrap_or(starved);
         assert!(
-            starved.contains("WEBRTC_BIND_OBSERVE_TICK")
-                && starved.contains("last_webrtc_empty_pump")
-                && starved.contains("observe_recent_webrtc_binds")
+            starved.contains("observe_recent_webrtc_binds")
                 && !starved.contains("observe_reserved_session_until_slot_full"),
             "starved empty binds observe one Core tick per bind-observe tick, never eight before first SlotReady"
+        );
+        let recent = production
+            .split("fn observe_recent_webrtc_binds")
+            .nth(1)
+            .expect("recent bind observe");
+        let recent = recent
+            .split("fn run_pump_observe_phase")
+            .next()
+            .unwrap_or(recent);
+        assert!(
+            recent.contains("webrtc_session_pump_cooled")
+                && recent.contains("note_webrtc_session_pumped"),
+            "empty bind observe cooldown is per session"
         );
         let occupied_filter = production
             .split("fn take_unoccupied_webrtc_slot_ready")
