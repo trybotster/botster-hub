@@ -559,6 +559,21 @@ struct WebRtcMuxRoute {
     reserved_at: Option<Instant>,
 }
 
+fn sibling_handle_holds_buffered(
+    inner: &WebRtcMuxInner,
+    this: &Arc<WebRtcTerminalAdapterInner>,
+) -> bool {
+    let Ok(routes) = inner.routes.lock() else {
+        return false;
+    };
+    routes.values().any(|route| {
+        route
+            .handle
+            .as_ref()
+            .is_some_and(|handle| !Arc::ptr_eq(&handle.inner, this) && handle.buffered_bytes() > 0)
+    })
+}
+
 fn aggregate_buffered_from(inner: &WebRtcMuxInner) -> u32 {
     let Ok(routes) = inner.routes.lock() else {
         return 0;
@@ -1320,6 +1335,7 @@ impl WebRtcTerminalAdapterHandle {
         let aggregate = aggregate_buffered_from(&mux);
         if crate::local_webrtc::webrtc_subscription_channel::refuse_send_on_aggregate(aggregate, 1)
             && self.buffered_bytes() == 0
+            && sibling_handle_holds_buffered(&mux, &self.inner)
         {
             return false;
         }
