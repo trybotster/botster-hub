@@ -32,7 +32,7 @@ fn update_rejects_a_dirty_source_repository_through_the_production_cli() {
     let data_dir = root.join("data");
     let source = root.join("source");
     fs::create_dir_all(&source).expect("create source fixture");
-    git(&source, &["init"]);
+    git(&source, &["init", "-b", "main"]);
     git(
         &source,
         &["config", "user.email", "update-test@example.invalid"],
@@ -67,7 +67,7 @@ fn daemon_api_starts_and_reports_a_failed_source_update() {
     let data_dir = root.join("data");
     let source = root.join("source");
     fs::create_dir_all(&source).unwrap();
-    git(&source, &["init"]);
+    git(&source, &["init", "-b", "main"]);
     git(
         &source,
         &["config", "user.email", "update-test@example.invalid"],
@@ -782,7 +782,7 @@ fn create_direct_local_package(root: &Path) -> PathBuf {
     let remote = root.join("package-remote.git");
     assert!(
         Command::new("git")
-            .args(["init", "--bare"])
+            .args(["init", "--bare", "-b", "main"])
             .arg(&remote)
             .status()
             .unwrap()
@@ -801,7 +801,7 @@ fn create_direct_local_package(root: &Path) -> PathBuf {
         package.join("plugin.lua"),
     )
     .unwrap();
-    git(&package, &["init"]);
+    git(&package, &["init", "-b", "main"]);
     git(
         &package,
         &["config", "user.email", "update-test@example.invalid"],
