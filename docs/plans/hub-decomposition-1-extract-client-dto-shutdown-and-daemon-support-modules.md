@@ -108,7 +108,7 @@ In scope:
 4. Move each test with the responsibility it proves. The shutdown tests are `forced_stopping_classify_inject_requires_test_mode`, `production_core_shutdown_error_keeps_active_runtime_as_operator_error`, `production_core_shutdown_error_keeps_active_state_as_operator_error`, `shutdown_unknown_session_error_while_active_is_already_exited_cleanup`, `shutdown_exited_classification_returns_cleanup_for_any_shutdown_error`, `shutdown_stopping_record_is_host_cleanup_not_active`, `recover_classify_err_preserves_typed_runtime_error`, `recover_recorded_stopping_after_classify_err_preserves_typed_error`, `recover_classify_err_preserves_typed_state_error`, `recover_exact_missing_returns_unknown_session`, `recover_exact_exited_cleanup_stays_already_exited`, `recover_exact_stale_cleanup_stays_stale_session`, `shutdown_active_runtime_error_remains_operator_error`, `shutdown_active_state_error_remains_operator_error`, and the local helper `shutdown_runtime_error`. The error test is `package_compensation_projects_every_rollback_to_socket_diagnostics`.
 5. Re-export the moved names from `src/lib.rs` or keep the existing `crate::daemon_transport::` call sites compiling through direct `use` paths, whichever preserves the current public surface exactly. `pub use botster_hub_client::{...}` in `daemon_transport.rs` stays where it is; those are client-crate re-exports, not Hub mappers.
 6. Widen moved private items to `pub(crate)` only where the move requires it. This is the one visibility change the move forces and it adds no new public API.
-7. Update `src/lib.rs` with `pub(crate) mod client_api_dto;`, and update `src/daemon.rs` with `pub(crate) mod error;` and `pub(crate) mod shutdown;`. Every new module is crate-private. This ticket adds **no** new public path.
+7. Update `src/lib.rs` with one added line, `pub(crate) mod client_api_dto;`, and update `src/daemon.rs` with `pub(crate) mod error;` and `pub(crate) mod shutdown;`. Every new module is crate-private, so the ticket adds **no** new public path. Keep every existing public path by leaving one `pub use crate::daemon::error::{DaemonTransportError, DaemonTransportResult, PackageRollbackFailure};` line in `src/daemon_transport.rs`, so the ticket removes **no** public path either.
 
 ### Public surface invariant
 
@@ -118,7 +118,29 @@ Round 3 wrote `pub mod client_api_dto;` while also claiming the commit adds no p
 - No mapper is referenced outside the library crate. `src/main.rs` uses none of them, and no integration test under `tests/` calls one. The only `tests/` hit for a mapper name is the unrelated test function `daemon_worktree_crud_scopes_paths_to_spawn_targets_without_requiring_git`.
 - The four `pub(super) fn` mappers must become `pub(crate) fn` on the move. Inside `daemon_transport`, `super` is the crate root, so `pub(super)` already meant crate-visible; inside `client_api_dto`, `super` would mean the `client_api_dto` module and would narrow visibility. Rewriting them to `pub(crate)` preserves the exact reach they have today rather than widening it.
 
-`src/daemon/error.rs` is also `pub(crate)`, while `DaemonTransportError`, `PackageRollbackFailure`, and `DaemonTransportResult` stay `pub` **inside** it and reach the outside world only through the existing crate-root `pub use`. A `pub` item inside a crate-private module re-exported at the root is the standard facade pattern: it keeps `botster_hub::DaemonTransportError` resolving to the same type and creates no second public path. Because those types stay `pub`, the `pub fn` signatures in `daemon_transport` that return `DaemonTransportResult<T>` — `serve_daemon`, `request`, and `stream_attach` — keep a public type in a public signature and cannot trip the `private_interfaces` lint.
+`src/daemon/error.rs` is also `pub(crate)`, while `DaemonTransportError`, `PackageRollbackFailure`, and `DaemonTransportResult` stay `pub` **inside** it. A `pub` item inside a crate-private module, re-exported elsewhere, is the standard facade pattern. Because those types stay `pub`, the `pub fn` signatures in `daemon_transport` that return `DaemonTransportResult<T>` — `serve_daemon`, `request`, and `stream_attach` — keep a public type in a public signature and cannot trip the `private_interfaces` lint.
+
+#### Existing public paths that must survive the error move
+
+`src/lib.rs:61` declares `pub mod daemon_transport;`. Three moved items are `pub` inside that public module, so each already has a public path that this ticket must not delete:
+
+| Existing public path | Also reachable at the crate root? |
+|---|---|
+| `botster_hub::daemon_transport::DaemonTransportError` | Yes, `botster_hub::DaemonTransportError` |
+| `botster_hub::daemon_transport::DaemonTransportResult` | Yes, `botster_hub::DaemonTransportResult` |
+| `botster_hub::daemon_transport::PackageRollbackFailure` | **No.** This is its only public path |
+
+Round 4 would have deleted all three. `PackageRollbackFailure` is the sharpest case, because it is absent from the crate-root `pub use` list at `src/lib.rs:132-153`, so repointing that list would not have replaced it. Round 5 fixes this: `src/daemon_transport.rs` keeps
+
+```rust
+pub use crate::daemon::error::{DaemonTransportError, DaemonTransportResult, PackageRollbackFailure};
+```
+
+so all three `daemon_transport::` paths resolve exactly as before. The crate-root `pub use daemon_transport::{...}` block then needs **no edit at all**: it keeps re-exporting through `daemon_transport`, and its name set and source path are both byte-identical. The only `src/lib.rs` change in the whole ticket becomes the single added `pub(crate) mod client_api_dto;` line.
+
+**A type re-export is not a forwarding wrapper.** The ticket forbids a wrapper that *retains implementation* in `daemon_transport.rs`, and [[daemon transport extraction moves ownership before deleting the facade]] requires implementation, state, policy, and tests to move. A `pub use` line moves all four and keeps only a path alias, which carries no body, no state, and no policy. `daemon_transport.rs` already uses this exact pattern at line 34, where it re-exports roughly ninety `Daemon*` types it does not define from `botster_hub_client`. Acceptance check 23 draws the line mechanically: `daemon_transport.rs` may name a moved item only on a `pub use` line and must contain zero `fn`, `impl`, `enum`, `struct`, or `type` definitions of it.
+
+The other two moved sets need no such alias, and the repository confirms it: every client DTO mapper is `pub(crate)`, `pub(super)`, or private, and `ShutdownSessionClassification` is declared without `pub`. Neither set has a public path to preserve.
 
 Out of scope (explicit non-scope):
 
@@ -171,7 +193,7 @@ Created:
 Modified, with the exact reason each file changes:
 
 - `src/daemon_transport.rs` -- loses the three responsibilities and their tests; keeps transport, owner loop, control dispatch, close-event suppression, and `PendingRuntimeState`.
-- `src/lib.rs` -- adds `pub(crate) mod client_api_dto;` (crate-private, so no new public path), and repoints the existing `pub use daemon_transport::{...}` list at `src/lib.rs:132-153` so `DaemonTransportError` and `DaemonTransportResult` re-export from `crate::daemon::error`. The re-exported name set is unchanged; only the source path inside the crate changes. The crate-root public surface is therefore identical: `botster_hub::DaemonTransportError` still resolves to the same type.
+- `src/lib.rs` -- adds exactly one line, `pub(crate) mod client_api_dto;`. The existing `pub use daemon_transport::{...}` block at lines 132-153 is **not** touched, because `daemon_transport` keeps re-exporting the three error types (see Existing Public Paths above). Round 4 planned to repoint that block; round 5 does not need to, which makes the crate-root surface byte-identical rather than merely name-identical.
 - `src/daemon.rs` -- adds the `error` and `shutdown` module declarations.
 - `src/daemon_attach_stream.rs` -- one `use` line. This file is a **submodule of `daemon_transport`** (declared at `src/daemon_transport.rs:123`), so its `use super::{DaemonTransportError, DaemonTransportResult};` at line 22 must become a `crate::daemon::error` path.
 - `src/daemon_entity_subscriptions.rs` -- one `use` block. Also a `daemon_transport` submodule (declared at `src/daemon_transport.rs:142`); its `use super::{...}` list at line 25 splits so the two error names come from `crate::daemon::error`.
@@ -245,8 +267,12 @@ Provenance:
 18. Run the named production-path set directly, not only through the wrapper: `BOTSTER_ENV=test cargo test --locked --test hub_daemon_lifecycle_test -- shutdown_session_classifies_parked_exit_beyond_one_baseline_page external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable unix_shutdown_session_stuck_stopping_without_exit_evidence_stays_operator_error unix_shutdown_session_from_another_connection_classifies_attached_exit shutdown_session_exact_keys_preserve_replacement_owner_and_siblings attached_stopping_shutdown_session_suppresses_exact_generation process_exit_and_shutdown_session_do_not_emit_terminal_subscription_closed shutdown_suppresses_exact_route_generations_before_core_teardown`. All eight must pass with unmodified bodies. These drive a real `DaemonRequest::ShutdownSession` through a live daemon socket into the moved classifier, which is the production-path proof the runtime-teardown lens requires.
 19. `grep -rn "hub_source(" tests/` enumerates every source-scanning guard, and each scanned string still lives in the file that guard names. No guard is edited to accommodate the move.
 20. `git diff --exit-code` reports no change in `src/main.rs`, `src/update.rs`, and `src/local_runtime_process.rs`. A change in any of the three means the crate-root re-export surface moved, and the commit is wrong.
-21. Public surface is byte-identical in name set. `git diff src/lib.rs` shows **no new `pub mod`, no new `pub use`, and no added name** in the existing `pub use` list at `src/lib.rs:132-153`; the only permitted `src/lib.rs` edits are one added `pub(crate) mod client_api_dto;` line and the changed module path on the existing re-export. Every new module (`client_api_dto`, `daemon::error`, `daemon::shutdown`) is declared `pub(crate)`.
-22. `grep -nE "^pub (fn|enum|struct|type) " src/client_api_dto*.rs src/client_api_dto/*.rs` returns nothing. No moved mapper is declared bare `pub`; each is `pub(crate)`, which matches the reach it had before the move. The four former `pub(super) fn` mappers are `pub(crate) fn` after the move for the reason given in the Public Surface Invariant.
+21. Public surface adds nothing. `git diff src/lib.rs` shows exactly one added line, `pub(crate) mod client_api_dto;`, and **no other change**. The `pub use daemon_transport::{...}` block at lines 132-153 is untouched. Every new module (`client_api_dto`, `daemon::error`, `daemon::shutdown`) is declared `pub(crate)`.
+22. `grep -nE "^pub (fn|enum|struct|type) " src/client_api_dto.rs src/client_api_dto/*.rs` returns nothing. No moved mapper is declared bare `pub`; each is `pub(crate)`, which matches the reach it had before the move. The four former `pub(super) fn` mappers are `pub(crate) fn` after the move for the reason given in the Public Surface Invariant.
+23. Public surface loses nothing, and the surviving alias is a path alias rather than a wrapper. Both arms must hold:
+    - `src/daemon_transport.rs` contains `pub use crate::daemon::error::{DaemonTransportError, DaemonTransportResult, PackageRollbackFailure};`, so `botster_hub::daemon_transport::DaemonTransportError`, `::DaemonTransportResult`, and `::PackageRollbackFailure` all still resolve. `PackageRollbackFailure` matters most: it has no crate-root alias, so this line is its only surviving public path.
+    - `grep -nE "^(pub )?(fn|impl|enum|struct|type) " src/daemon_transport.rs` shows **zero** definitions of any moved item. The file may name a moved item only on a `use` or `pub use` line. This is the mechanical line between a permitted path alias and the forwarding wrapper the ticket forbids.
+24. Compile-time proof that the three public paths survive: a throwaway check that `botster_hub::daemon_transport::PackageRollbackFailure` resolves, run before and after the move. If preferred, `cargo doc -p botster-hub --no-deps` before and after the move must list the same items under the `daemon_transport` module.
 
 ## Runtime-Teardown Class
 
