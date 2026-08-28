@@ -409,6 +409,7 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
                 }
             }
         };
+        let served_control = event.is_some();
         if let Some(OwnerEvent::Control(message)) = event {
             match *message {
                 Some(ControlMessage::AcceptedConnection {
@@ -475,7 +476,7 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
         }
         observe_coalesced_webrtc_slot_ready(&daemon, &mut control_state);
         observe_starved_empty_webrtc_binds(&daemon, &mut control_state);
-        observe_pressured_webrtc_binds(&daemon, &mut control_state);
+        observe_pressured_webrtc_binds(&daemon, &mut control_state, served_control);
         mark_due_reconciliation(&mut control_state, Instant::now());
         if control_state
             .background
@@ -6289,7 +6290,11 @@ fn observe_starved_empty_webrtc_binds(daemon: &HubDaemon, state: &mut DaemonCont
     observe_recent_webrtc_binds(daemon, state, now_seconds);
 }
 
-fn observe_pressured_webrtc_binds(daemon: &HubDaemon, state: &mut DaemonControlState) {
+fn observe_pressured_webrtc_binds(
+    daemon: &HubDaemon,
+    state: &mut DaemonControlState,
+    control_turn: bool,
+) {
     prune_webrtc_bind_observe_deadlines(state);
     let Some(runtime) = daemon.runtime() else {
         return;
@@ -6304,19 +6309,26 @@ fn observe_pressured_webrtc_binds(daemon: &HubDaemon, state: &mut DaemonControlS
         .webrtc_bind_observe_deadline
         .keys()
         .filter(|session_id| {
-            state
+            let stalled = state
                 .pending_runtime
-                .webrtc_session_pressured_to_observe(session_id)
-                && webrtc_session_pump_cooled(state, session_id, now)
+                .webrtc_session_would_block_to_observe(session_id)
+                || state
+                    .pending_runtime
+                    .webrtc_session_high_buffered_to_observe(session_id);
+            let idle_full = !control_turn
+                && state
+                    .pending_runtime
+                    .webrtc_session_pressured_to_observe(session_id);
+            (stalled || idle_full) && webrtc_session_pump_cooled(state, session_id, now)
         })
         .cloned()
         .collect();
     for session_id in sessions {
-        // Full with no buffered bytes is a HISTORY page waiting for mux flush:
-        // one Core tick, then SlotReady persist takes the next page. Bursting
-        // Full here burns WRITE_ATTEMPT_BUDGET before Attached. WouldBlock or
-        // this handle at AGGREGATE_BUFFERED_HIGH is a stalled flush: burst so
-        // Core can hard-stop without starving a live sibling.
+        // Control turns (Status/Drain) must not observe a Full page waiting
+        // for mux flush: that burns WRITE_ATTEMPT_BUDGET before Attached.
+        // Idle Reconcile still one-ticks Full so no-Status attach can drain.
+        // WouldBlock or this handle at AGGREGATE_BUFFERED_HIGH bursts so a
+        // paused sibling can hard-stop.
         let burst = if state
             .pending_runtime
             .webrtc_session_would_block_to_observe(&session_id)
@@ -9527,10 +9539,12 @@ mod tests {
                 && pressured.contains("webrtc_session_pressured_to_observe")
                 && pressured.contains("webrtc_session_would_block_to_observe")
                 && pressured.contains("webrtc_session_high_buffered_to_observe")
+                && pressured.contains("control_turn")
+                && pressured.contains("idle_full")
                 && pressured.contains("AGGREGATE_BUFFERED_HIGH")
                 && !pressured.contains("webrtc_session_ready_to_observe")
                 && !pressured.contains("from_secs(5)"),
-            "pressured binds burst only on WouldBlock or high buffered; young Full HISTORY is one tick"
+            "pressured binds burst stalled flushes; idle Full is one tick; control turns skip young Full"
         );
         let recent = production
             .split("fn observe_recent_webrtc_binds")
