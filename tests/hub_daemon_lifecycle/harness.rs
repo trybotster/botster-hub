@@ -623,9 +623,9 @@ fn linux_proc_worker_command(pid: u32) -> Option<String> {
         if !from_cmdline.is_empty() {
             return Some(from_cmdline);
         }
-        return fs::read_link(format!("/proc/{pid}/exe"))
+        fs::read_link(format!("/proc/{pid}/exe"))
             .ok()
-            .map(|exe| exe.to_string_lossy().into_owned());
+            .map(|exe| exe.to_string_lossy().into_owned())
     }
     #[cfg(not(target_os = "linux"))]
     {
