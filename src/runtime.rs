@@ -3456,6 +3456,18 @@ impl HubRuntime {
         class: PluginInvocationClass,
         request: PluginInvocationRequest,
     ) -> PluginAdmissionResult {
+        if std::env::var("BOTSTER_ENV").as_deref() == Ok("test")
+            && self
+                .force_plugin_admit_backpressure
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return PluginAdmissionResult::Backpressured {
+                request_id: request.request_id,
+                class,
+                reason: "test-forced plugin admission backpressure".to_string(),
+                backpressure: None,
+            };
+        }
         self.plugin_lifecycle.try_admit(class, request)
     }
 

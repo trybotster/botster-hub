@@ -990,6 +990,14 @@ impl PackageEventRouter {
     }
 
     #[cfg(test)]
+    #[must_use]
+    pub(crate) fn test_observability_snapshot(
+        &self,
+    ) -> botster_hub_client::DaemonObservabilityCounters {
+        self.counters.snapshot()
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_refresh_consumer_age(&self, plugin_key: &str) {
         let mut inner = lock_inner(&self.inner).expect("test refresh must lock");
         update_consumer_age(&mut inner, plugin_key, &self.counters);
@@ -3720,6 +3728,102 @@ mod tests {
         assert!(
             oldest_after_cut < oldest_before,
             "byte-limit requeue must keep the remaining front envelope, not the pulled one"
+        );
+    }
+
+    #[test]
+    fn repeated_requeue_occupancy_stays_net_zero_until_queue_age_expires() {
+        let policy = PackageEventPlanePolicy {
+            queue_age: StdDuration::from_millis(40),
+            ..PackageEventPlanePolicy::default()
+        };
+        let router = PackageEventRouter::new(policy);
+        router
+            .try_register_contracts(vec![sample_contract("producer", "sample.ready")])
+            .expect("register");
+        subscribe(&router, "consumer", "producer", "sample.ready");
+        assert_eq!(
+            router.try_ingress(
+                "producer",
+                "sample.ready",
+                &serde_json::json!({ "ok": true }),
+                Instant::now()
+            ),
+            EventPlaneStatus::Accepted
+        );
+        let baseline = router.snapshot().expect("baseline");
+        let baseline_events = *baseline
+            .consumer_events
+            .get("consumer")
+            .expect("consumer occupancy");
+        let baseline_bytes = *baseline
+            .consumer_bytes
+            .get("consumer")
+            .expect("consumer bytes");
+        let mut cycles = 0_u32;
+        let deadline = Instant::now() + StdDuration::from_millis(200);
+        loop {
+            let before = router.snapshot().expect("before pull");
+            let before_events = *before.consumer_events.get("consumer").unwrap_or(&0);
+            let mut batch = router
+                .pull_ready_batch(1, 64 * 1024, Instant::now(), StdDuration::from_millis(8))
+                .expect("pull");
+            if batch.is_empty() {
+                break;
+            }
+            cycles += 1;
+            let after_pull = router.snapshot().expect("after pull");
+            let after_events = *after_pull.consumer_events.get("consumer").unwrap_or(&0);
+            assert_eq!(
+                after_events,
+                before_events.saturating_sub(1),
+                "pull decrements occupancy before admission"
+            );
+            let delivery = batch.pop().expect("delivery");
+            router
+                .requeue_delivery(delivery)
+                .unwrap_or_else(|_| panic!("requeue"));
+            let after_requeue = router.snapshot().expect("after requeue");
+            assert_eq!(
+                *after_requeue
+                    .consumer_events
+                    .get("consumer")
+                    .expect("requeue occupancy"),
+                before_events,
+                "requeue restores occupancy, so capacity cannot bound the cycle"
+            );
+            assert_eq!(
+                *after_requeue
+                    .consumer_bytes
+                    .get("consumer")
+                    .expect("requeue bytes"),
+                baseline_bytes
+            );
+            assert!(
+                Instant::now() < deadline,
+                "queue_age must retire the holder before the test deadline; cycles={cycles}"
+            );
+        }
+        assert!(
+            cycles >= 1,
+            "the cycle must pull and requeue at least once before expiry"
+        );
+        let final_snapshot = router.snapshot().expect("final");
+        assert_eq!(
+            *final_snapshot.consumer_events.get("consumer").unwrap_or(&0),
+            0
+        );
+        assert_eq!(final_snapshot.queued_holders, 0);
+        assert_eq!(final_snapshot.admitted_holders, 0);
+        assert_eq!(
+            baseline_events, 1,
+            "one delivery is the occupancy that must stay net-zero across cycles"
+        );
+        let observ = router.test_observability_snapshot();
+        assert!(
+            observ.event_router_queue_age_expiries >= 1,
+            "pull_ready_batch must record router queue-age expiry when the preserved enqueued_at expires, got {}",
+            observ.event_router_queue_age_expiries
         );
     }
 }

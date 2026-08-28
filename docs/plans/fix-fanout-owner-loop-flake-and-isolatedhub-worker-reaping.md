@@ -317,6 +317,7 @@ Unknowns for Implement or Review to resolve:
 
 | File | Change | Kind |
 |------|--------|------|
+| `src/runtime.rs` | Route the existing `force_plugin_admit_backpressure` test seam through production `try_admit_plugin` so the Backpressured requeue proof is deterministic. | Test seam |
 | `src/daemon_maintenance.rs` | Add the `PluginAdmissionResult::Backpressured { .. }` arm in `run_package_event_delivery_slice` before the catch-all. | Production |
 | `src/daemon_maintenance.rs` | Re-author the bounded retry loop and yield in `owner_loop_queues_and_completes_two_fanout_plugin_handlers`. | Test |
 | `src/daemon_maintenance.rs` | Add the focused red-on-revert `Backpressured` requeue unit test. | Test |

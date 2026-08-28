@@ -3,6 +3,7 @@
 //! Owns IsolatedHubBuilder, IsolatedHub, IsolatedHubError, readiness, cleanup,
 //! socket paths, and child-process helpers. Root re-exports stay stable.
 
+use std::collections::HashSet;
 use std::env;
 use std::error::Error;
 use std::fmt;
@@ -10,8 +11,9 @@ use std::fs;
 use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::thread;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::Mutex;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use botster_hub_client::{DaemonDiagnostic, DaemonEndpoint, DaemonRequest, DaemonResponseKind};
@@ -20,6 +22,16 @@ use crate::ConformanceFailureClass;
 
 const DEFAULT_SOCKET_NAME: &str = "botster-hub.sock";
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
+const SHUTDOWN_COMMAND_BUDGET: Duration = Duration::from_secs(5);
+const HUB_CHILD_WAIT_BUDGET: Duration = Duration::from_secs(5);
+const FREEZE_CONFIRM_BUDGET: Duration = Duration::from_millis(2_500);
+const REAP_CEILING: Duration = Duration::from_secs(10);
+const WHOLE_PATH_BUDGET: Duration = Duration::from_millis(22_500);
+const REAP_SIGKILL_AFTER: Duration = Duration::from_millis(400);
+const REAP_POLL: Duration = Duration::from_millis(50);
+const WAIT_POLL: Duration = Duration::from_millis(20);
+const DRAIN_CAP: usize = 64 * 1024;
+const SESSION_WORKER_BASENAME: &str = "botster-session-worker";
 
 /// Builder for one isolated local hub daemon test instance.
 ///
@@ -128,6 +140,12 @@ impl IsolatedHubBuilder {
 
     /// Start the isolated daemon and wait for the real socket protocol to respond.
     pub fn start(self) -> Result<IsolatedHub, IsolatedHubError> {
+        if let Some(taint) = current_taint() {
+            return Err(IsolatedHubError::Tainted {
+                pgid: taint.pgid,
+                data_dir: taint.data_dir,
+            });
+        }
         let selected_data_dir = self.data_dir()?;
         let working_directory = self
             .working_directory
@@ -181,9 +199,11 @@ impl IsolatedHubBuilder {
             path: hub_bin.clone(),
             source,
         })?;
+        let hub_pid = child.id();
 
         if let Err(error) = wait_for_ready(&endpoint, &mut child, self.ready_timeout) {
-            cleanup_child(&mut child)?;
+            let _ = cleanup_child(&mut child);
+            reap_owned_session_workers(hub_pid, None, &TeardownBudget::new());
             remove_data_dir_path(&data_dir)?;
             return Err(error);
         }
@@ -194,6 +214,12 @@ impl IsolatedHubBuilder {
             working_directory,
             endpoint,
             child: Some(child),
+            hub_pid,
+            lifecycle: IsolatedHubLifecycle::Pending,
+            seams: IsolatedHubSeams::default(),
+            drop_retry_used: false,
+            teardown_started: None,
+            unconfirmed_deadline: None,
         })
     }
 
@@ -213,6 +239,23 @@ impl IsolatedHubBuilder {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IsolatedHubLifecycle {
+    Pending,
+    Completed,
+    QuiescenceUnconfirmed,
+}
+
+#[derive(Debug, Clone, Default)]
+struct IsolatedHubSeams {
+    force_quiescence_unconfirmed: bool,
+    skip_freeze: bool,
+    skip_stop_confirmation: bool,
+    reuse_remembered_set_on_drop_retry: bool,
+    restart_budget_on_drop_retry: bool,
+    remembered_set: Option<OwnedSet>,
+}
+
 /// Running isolated hub daemon. Drop attempts shutdown, then kills on failure.
 ///
 /// Successful explicit shutdown removes the harness-owned data directory. Drop
@@ -224,6 +267,12 @@ pub struct IsolatedHub {
     pub(crate) working_directory: PathBuf,
     pub(crate) endpoint: DaemonEndpoint,
     pub(crate) child: Option<Child>,
+    pub(crate) hub_pid: u32,
+    lifecycle: IsolatedHubLifecycle,
+    seams: IsolatedHubSeams,
+    drop_retry_used: bool,
+    teardown_started: Option<Instant>,
+    unconfirmed_deadline: Option<Instant>,
 }
 
 impl IsolatedHub {
@@ -248,50 +297,290 @@ impl IsolatedHub {
         &self.working_directory
     }
 
+    /// Hub-child pid captured at spawn. Equals the owned process-group id.
+    #[must_use]
+    pub const fn hub_child_pid(&self) -> u32 {
+        self.hub_pid
+    }
+
+    /// Live session workers in this instance's Hub-child process group.
+    #[must_use]
+    pub fn owned_session_worker_pids(&self) -> Vec<u32> {
+        census_sample()
+            .into_iter()
+            .filter(|row| row.is_owned_worker(self.hub_pid) && !row.is_zombie())
+            .map(|row| row.pid)
+            .collect()
+    }
+
+    /// Live descendants of owned session workers, including the workers.
+    #[must_use]
+    pub fn owned_live_descendant_pids(&self) -> Vec<u32> {
+        let sample = census_sample();
+        owned_set_from_sample(&sample, self.hub_pid)
+            .live_signal_targets(&sample)
+            .into_iter()
+            .collect()
+    }
+
+    /// Force the next freeze path to treat quiescence as unconfirmed.
+    pub fn force_quiescence_unconfirmed(&mut self) {
+        self.seams.force_quiescence_unconfirmed = true;
+    }
+
+    /// Skip `SIGSTOP` so a fork-and-reparent race can be reproduced.
+    pub fn skip_freeze(&mut self) {
+        self.seams.skip_freeze = true;
+    }
+
+    /// Snapshot immediately after `SIGSTOP` without waiting for stopped state.
+    pub fn skip_stop_confirmation(&mut self) {
+        self.seams.skip_stop_confirmation = true;
+    }
+
+    /// Force a Drop retry to reuse a remembered set instead of a fresh sample.
+    pub fn reuse_remembered_set_on_drop_retry(&mut self) {
+        self.seams.reuse_remembered_set_on_drop_retry = true;
+    }
+
+    /// Force a Drop retry to start a fresh whole-path budget.
+    pub fn restart_budget_on_drop_retry(&mut self) {
+        self.seams.restart_budget_on_drop_retry = true;
+    }
+
     /// Stop the daemon, wait for its process, then remove its owned data directory.
     pub fn shutdown(mut self) -> Result<(), IsolatedHubError> {
         self.shutdown_inner()
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_running_child(
+        hub_bin: PathBuf,
+        data_dir: PathBuf,
+        working_directory: PathBuf,
+        child: Child,
+    ) -> Self {
+        let hub_pid = child.id();
+        Self {
+            hub_bin,
+            endpoint: DaemonEndpoint::new(data_dir.join(default_socket_name())),
+            data_dir,
+            working_directory,
+            child: Some(child),
+            hub_pid,
+            lifecycle: IsolatedHubLifecycle::Pending,
+            seams: IsolatedHubSeams::default(),
+            drop_retry_used: false,
+            teardown_started: None,
+            unconfirmed_deadline: None,
+        }
+    }
+
     pub(crate) fn shutdown_inner(&mut self) -> Result<(), IsolatedHubError> {
+        match self.lifecycle {
+            IsolatedHubLifecycle::Completed => return self.remove_data_dir(),
+            IsolatedHubLifecycle::QuiescenceUnconfirmed => {
+                return Err(IsolatedHubError::QuiescenceUnconfirmed {
+                    pgid: self.hub_pid as i32,
+                    data_dir: self.data_dir.clone(),
+                });
+            }
+            IsolatedHubLifecycle::Pending => {}
+        }
+        let started = Instant::now();
+        self.teardown_started = Some(started);
+        let budget = TeardownBudget {
+            deadline: started + WHOLE_PATH_BUDGET,
+        };
+        self.shutdown_inner_with_budget(budget)
+    }
+
+    fn shutdown_inner_with_budget(
+        &mut self,
+        budget: TeardownBudget,
+    ) -> Result<(), IsolatedHubError> {
         if self.child.is_none() {
+            self.lifecycle = IsolatedHubLifecycle::Completed;
             return self.remove_data_dir();
         }
-        let output = Command::new(&self.hub_bin)
-            .arg("shutdown")
-            .arg("--data-dir")
-            .arg(&self.data_dir)
-            .env("BOTSTER_ENV", "test")
-            .output()
-            .map_err(|source| IsolatedHubError::ShutdownCommand { source })?;
-        let shutdown_stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let shutdown_succeeded = output.status.success();
-        let disconnected_during_shutdown =
-            shutdown_stderr.trim() == "botster-hub shutdown error: client disconnected";
-        if !shutdown_succeeded && !disconnected_during_shutdown {
+
+        let hub_pid = self.hub_pid;
+        let live_snapshot = owned_set_from_sample(&census_sample(), hub_pid);
+        self.seams.remembered_set = Some(live_snapshot.clone());
+
+        let mut hub_child = self.child.take().expect("child exists after shutdown");
+
+        let shutdown_deadline = budget.phase_deadline(SHUTDOWN_COMMAND_BUDGET);
+        let shutdown = run_shutdown_command(
+            &self.hub_bin,
+            &self.data_dir,
+            &self.working_directory,
+            shutdown_deadline,
+        );
+
+        let shutdown_outcome = match shutdown {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.child = Some(hub_child);
+                return Err(error);
+            }
+        };
+
+        if shutdown_outcome.timed_out {
+            let hub_stdout = take_drain(hub_child.stdout.take());
+            let hub_stderr = take_drain(hub_child.stderr.take());
+            return self.timeout_teardown(
+                hub_child,
+                hub_stdout,
+                hub_stderr,
+                live_snapshot,
+                TeardownPhase::ShutdownCommand,
+                budget,
+                shutdown_outcome,
+            );
+        }
+
+        if !shutdown_outcome.succeeded && !shutdown_outcome.disconnected_during_shutdown {
+            self.child = Some(hub_child);
             return Err(IsolatedHubError::ShutdownFailed {
-                stderr: shutdown_stderr,
+                stderr: shutdown_outcome.stderr,
             });
         }
 
-        let child = self.child.take().expect("child exists after shutdown");
-        let daemon_output = child
-            .wait_with_output()
-            .map_err(|source| IsolatedHubError::Wait { source })?;
-        if daemon_output.status.success() {
-            if shutdown_succeeded {
-                self.remove_data_dir()
-            } else {
-                Err(IsolatedHubError::ShutdownFailed {
-                    stderr: shutdown_stderr,
+        let hub_stdout = take_drain(hub_child.stdout.take());
+        let hub_stderr = take_drain(hub_child.stderr.take());
+
+        let hub_deadline = budget.phase_deadline(HUB_CHILD_WAIT_BUDGET);
+        match wait_child_bounded(&mut hub_child, hub_deadline) {
+            Ok(Some(status)) => {
+                let stdout = join_drain(hub_stdout);
+                let stderr = join_drain(hub_stderr);
+                if status.success() {
+                    reap_owned_session_workers(hub_pid, Some(&live_snapshot), &budget);
+                    self.lifecycle = IsolatedHubLifecycle::Completed;
+                    if shutdown_outcome.succeeded {
+                        self.remove_data_dir()
+                    } else {
+                        Err(IsolatedHubError::ShutdownFailed {
+                            stderr: shutdown_outcome.stderr,
+                        })
+                    }
+                } else {
+                    reap_owned_session_workers(hub_pid, Some(&live_snapshot), &budget);
+                    self.lifecycle = IsolatedHubLifecycle::Completed;
+                    Err(IsolatedHubError::DaemonExited {
+                        status: status.to_string(),
+                        stdout,
+                        stderr,
+                    })
+                }
+            }
+            Ok(None) => self.timeout_teardown(
+                hub_child,
+                hub_stdout,
+                hub_stderr,
+                live_snapshot,
+                TeardownPhase::HubChildWait,
+                budget,
+                shutdown_outcome,
+            ),
+            Err(source) => {
+                self.child = Some(hub_child);
+                let _ = join_drain(hub_stdout);
+                let _ = join_drain(hub_stderr);
+                Err(IsolatedHubError::Wait { source })
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn timeout_teardown(
+        &mut self,
+        mut hub_child: Child,
+        hub_stdout: Option<JoinHandle<Vec<u8>>>,
+        hub_stderr: Option<JoinHandle<Vec<u8>>>,
+        live_snapshot: OwnedSet,
+        phase: TeardownPhase,
+        budget: TeardownBudget,
+        shutdown_outcome: ShutdownOutcome,
+    ) -> Result<(), IsolatedHubError> {
+        let hub_pid = self.hub_pid;
+        match freeze_confirm_snapshot(hub_pid, &budget, &self.seams) {
+            Ok(confirmed) => {
+                let _ = signal_owned_hub_group(hub_pid, libc::SIGKILL);
+                let reap_deadline = Instant::now() + Duration::from_secs(1);
+                let reap_deadline = if reap_deadline < budget.deadline {
+                    reap_deadline
+                } else {
+                    budget.deadline
+                };
+                let _ = wait_child_bounded(&mut hub_child, reap_deadline);
+                let stdout = join_drain(hub_stdout);
+                let stderr = join_drain(hub_stderr);
+                reap_owned_session_workers(hub_pid, Some(&confirmed), &budget);
+                self.lifecycle = IsolatedHubLifecycle::Completed;
+                let _ = (stdout, stderr, shutdown_outcome, live_snapshot);
+                Err(IsolatedHubError::TeardownTimeout { phase })
+            }
+            Err(error) => self.unconfirmed_child_handoff(
+                hub_child,
+                hub_stdout,
+                hub_stderr,
+                budget,
+                error,
+                live_snapshot,
+            ),
+        }
+    }
+
+    fn unconfirmed_child_handoff(
+        &mut self,
+        mut hub_child: Child,
+        hub_stdout: Option<JoinHandle<Vec<u8>>>,
+        hub_stderr: Option<JoinHandle<Vec<u8>>>,
+        budget: TeardownBudget,
+        cause: IsolatedHubError,
+        _live_snapshot: OwnedSet,
+    ) -> Result<(), IsolatedHubError> {
+        let _ = hub_child.kill();
+        let reap_deadline = Instant::now() + Duration::from_secs(1);
+        let reap_deadline = if reap_deadline < budget.deadline {
+            reap_deadline
+        } else {
+            budget.deadline
+        };
+        let _ = wait_child_bounded(&mut hub_child, reap_deadline);
+        let _ = join_drain(hub_stdout);
+        let _ = join_drain(hub_stderr);
+        record_taint(self.hub_pid as i32, self.data_dir.clone());
+        self.unconfirmed_deadline = Some(budget.deadline);
+        self.lifecycle = IsolatedHubLifecycle::QuiescenceUnconfirmed;
+        match cause {
+            IsolatedHubError::QuiescenceUnconfirmed { .. } => {
+                Err(IsolatedHubError::QuiescenceUnconfirmed {
+                    pgid: self.hub_pid as i32,
+                    data_dir: self.data_dir.clone(),
                 })
             }
+            other => Err(other),
+        }
+    }
+
+    fn drop_retry_confirmed_cleanup(&mut self, budget: TeardownBudget) {
+        let hub_pid = self.hub_pid;
+        let seams = if self.seams.reuse_remembered_set_on_drop_retry {
+            self.seams.clone()
         } else {
-            Err(IsolatedHubError::DaemonExited {
-                status: daemon_output.status.to_string(),
-                stdout: String::from_utf8_lossy(&daemon_output.stdout).to_string(),
-                stderr: String::from_utf8_lossy(&daemon_output.stderr).to_string(),
-            })
+            IsolatedHubSeams {
+                remembered_set: None,
+                reuse_remembered_set_on_drop_retry: false,
+                ..self.seams.clone()
+            }
+        };
+        if let Ok(confirmed) = freeze_confirm_snapshot(hub_pid, &budget, &seams) {
+            let _ = signal_owned_hub_group(hub_pid, libc::SIGKILL);
+            reap_owned_session_workers(hub_pid, Some(&confirmed), &budget);
+            self.lifecycle = IsolatedHubLifecycle::Completed;
         }
     }
 
@@ -313,18 +602,60 @@ fn remove_data_dir_path(data_dir: &Path) -> Result<(), IsolatedHubError> {
 
 impl Drop for IsolatedHub {
     fn drop(&mut self) {
-        if !thread::panicking() && self.shutdown_inner().is_ok() {
-            return;
-        }
-        let mut child_cleaned = true;
-        if let Some(child) = self.child.as_mut() {
-            child_cleaned = cleanup_child(child).is_ok();
-        }
-        self.child = None;
-        if child_cleaned && !thread::panicking() {
-            let _ = self.remove_data_dir();
+        match self.lifecycle {
+            IsolatedHubLifecycle::Completed => {}
+            IsolatedHubLifecycle::QuiescenceUnconfirmed => {
+                if self.drop_retry_used {
+                    return;
+                }
+                self.drop_retry_used = true;
+                let deadline = if self.seams.restart_budget_on_drop_retry {
+                    Instant::now() + WHOLE_PATH_BUDGET
+                } else {
+                    self.unconfirmed_deadline
+                        .unwrap_or_else(|| Instant::now() + WHOLE_PATH_BUDGET)
+                };
+                if Instant::now() >= deadline {
+                    return;
+                }
+                self.drop_retry_confirmed_cleanup(TeardownBudget { deadline });
+            }
+            IsolatedHubLifecycle::Pending => {
+                if thread::panicking() {
+                    let mut child_cleaned = true;
+                    if let Some(child) = self.child.as_mut() {
+                        child_cleaned = cleanup_child(child).is_ok();
+                    }
+                    self.child = None;
+                    if child_cleaned {
+                        reap_owned_session_workers(self.hub_pid, None, &TeardownBudget::new());
+                    }
+                    return;
+                }
+                if self.shutdown_inner().is_ok() {
+                    return;
+                }
+                let mut child_cleaned = true;
+                if let Some(child) = self.child.as_mut() {
+                    child_cleaned = cleanup_child(child).is_ok();
+                }
+                self.child = None;
+                if child_cleaned {
+                    reap_owned_session_workers(self.hub_pid, None, &TeardownBudget::new());
+                    let _ = self.remove_data_dir();
+                }
+            }
         }
     }
+}
+
+/// Phase of IsolatedHub teardown that exhausted its budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeardownPhase {
+    ShutdownCommand,
+    HubChildWait,
+    FreezeConfirm,
+    Reap,
 }
 
 /// Errors returned by the isolated daemon harness.
@@ -376,6 +707,17 @@ pub enum IsolatedHubError {
         source: std::io::Error,
     },
     Clock(std::time::SystemTimeError),
+    TeardownTimeout {
+        phase: TeardownPhase,
+    },
+    QuiescenceUnconfirmed {
+        pgid: i32,
+        data_dir: PathBuf,
+    },
+    Tainted {
+        pgid: i32,
+        data_dir: PathBuf,
+    },
 }
 
 impl fmt::Display for IsolatedHubError {
@@ -438,6 +780,24 @@ impl fmt::Display for IsolatedHubError {
             Self::ShutdownFailed { stderr } => write!(formatter, "shutdown failed: {stderr}"),
             Self::Wait { source } => write!(formatter, "failed to wait for daemon: {source}"),
             Self::Clock(source) => write!(formatter, "system clock error: {source}"),
+            Self::TeardownTimeout { phase } => {
+                write!(
+                    formatter,
+                    "isolated hub teardown timed out during {phase:?}"
+                )
+            }
+            Self::QuiescenceUnconfirmed { pgid, .. } => {
+                write!(
+                    formatter,
+                    "isolated hub quiescence was not confirmed for pgid {pgid}; descendants may remain"
+                )
+            }
+            Self::Tainted { pgid, .. } => {
+                write!(
+                    formatter,
+                    "isolated hub start refused because fixture pgid {pgid} is tainted"
+                )
+            }
         }
     }
 }
@@ -471,6 +831,13 @@ impl IsolatedHubError {
             Self::ShutdownFailed { .. } => "hub daemon shutdown command failed",
             Self::Wait { .. } => "failed to wait for hub daemon process",
             Self::Clock(_) => "system clock error while preparing isolated daemon",
+            Self::TeardownTimeout { .. } => "isolated hub teardown exceeded its budget",
+            Self::QuiescenceUnconfirmed { .. } => {
+                "isolated hub teardown could not confirm owned-group quiescence"
+            }
+            Self::Tainted { .. } => {
+                "isolated hub start refused because a previous teardown left the fixture tainted"
+            }
         };
 
         DaemonDiagnostic::daemon_startup_failure(message)
@@ -492,7 +859,10 @@ impl Error for IsolatedHubError {
             | Self::CleanupTimeout { .. }
             | Self::ReadyTimeout { .. }
             | Self::DaemonExited { .. }
-            | Self::ShutdownFailed { .. } => None,
+            | Self::ShutdownFailed { .. }
+            | Self::TeardownTimeout { .. }
+            | Self::QuiescenceUnconfirmed { .. }
+            | Self::Tainted { .. } => None,
         }
     }
 }
@@ -648,4 +1018,472 @@ fn sanitize_segment(value: &str) -> String {
 
 pub(crate) fn default_socket_name() -> &'static str {
     DEFAULT_SOCKET_NAME
+}
+
+struct TeardownBudget {
+    deadline: Instant,
+}
+
+impl TeardownBudget {
+    fn new() -> Self {
+        Self {
+            deadline: Instant::now() + WHOLE_PATH_BUDGET,
+        }
+    }
+
+    fn phase_deadline(&self, cap: Duration) -> Instant {
+        let phase = Instant::now() + cap;
+        if phase < self.deadline {
+            phase
+        } else {
+            self.deadline
+        }
+    }
+}
+
+struct IsolatedHubTaint {
+    pgid: i32,
+    data_dir: PathBuf,
+}
+
+static ISOLATED_HUB_TAINT: Mutex<Option<IsolatedHubTaint>> = Mutex::new(None);
+
+fn current_taint() -> Option<IsolatedHubTaint> {
+    match ISOLATED_HUB_TAINT.lock() {
+        Ok(guard) => guard.as_ref().map(|taint| IsolatedHubTaint {
+            pgid: taint.pgid,
+            data_dir: taint.data_dir.clone(),
+        }),
+        Err(poisoned) => poisoned
+            .into_inner()
+            .as_ref()
+            .map(|taint| IsolatedHubTaint {
+                pgid: taint.pgid,
+                data_dir: taint.data_dir.clone(),
+            }),
+    }
+}
+
+fn record_taint(pgid: i32, data_dir: PathBuf) {
+    let mut guard = ISOLATED_HUB_TAINT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = Some(IsolatedHubTaint { pgid, data_dir });
+}
+
+/// Current IsolatedHub fixture taint, if any.
+#[must_use]
+pub fn isolated_hub_taint() -> Option<(i32, PathBuf)> {
+    current_taint().map(|taint| (taint.pgid, taint.data_dir))
+}
+
+/// Clear IsolatedHub fixture taint. Tests must call this after asserting taint.
+pub fn clear_isolated_hub_taint() {
+    let mut guard = ISOLATED_HUB_TAINT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = None;
+}
+
+#[derive(Debug, Clone)]
+struct ProcessRow {
+    pid: u32,
+    ppid: u32,
+    pgid: u32,
+    stat: String,
+    command: String,
+}
+
+fn path_basename(token: &str) -> Option<&str> {
+    Path::new(token).file_name().and_then(|name| name.to_str())
+}
+
+fn command_names_session_worker(command: &str) -> bool {
+    let mut tokens = command.split_whitespace();
+    let Some(argv0) = tokens.next() else {
+        return false;
+    };
+    if path_basename(argv0) == Some(SESSION_WORKER_BASENAME) {
+        return true;
+    }
+    matches!(path_basename(argv0), Some("sh" | "bash" | "dash"))
+        && tokens
+            .next()
+            .is_some_and(|argv1| path_basename(argv1) == Some(SESSION_WORKER_BASENAME))
+}
+
+impl ProcessRow {
+    fn is_owned_worker(&self, hub_pid: u32) -> bool {
+        self.pgid == hub_pid && command_names_session_worker(&self.command)
+    }
+
+    fn is_zombie(&self) -> bool {
+        self.stat.contains('Z')
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.stat.starts_with('T')
+    }
+
+    fn in_group(&self, hub_pid: u32) -> bool {
+        self.pgid == hub_pid
+    }
+}
+
+fn census_sample() -> Vec<ProcessRow> {
+    let Ok(output) = Command::new("ps")
+        .args(["-axo", "pid=,ppid=,pgid=,stat=,command="])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let mut rows = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let line = line.trim();
+        let mut parts = line.split_whitespace();
+        let Some(pid) = parts.next().and_then(|value| value.parse().ok()) else {
+            continue;
+        };
+        let Some(ppid) = parts.next().and_then(|value| value.parse().ok()) else {
+            continue;
+        };
+        let Some(pgid) = parts.next().and_then(|value| value.parse().ok()) else {
+            continue;
+        };
+        let Some(stat) = parts.next() else {
+            continue;
+        };
+        let command = parts.collect::<Vec<_>>().join(" ");
+        rows.push(ProcessRow {
+            pid,
+            ppid,
+            pgid,
+            stat: stat.to_string(),
+            command,
+        });
+    }
+    rows
+}
+
+#[derive(Debug, Clone, Default)]
+struct OwnedSet {
+    workers: Vec<u32>,
+    descendants: Vec<u32>,
+}
+
+impl OwnedSet {
+    fn live_signal_targets(&self, sample: &[ProcessRow]) -> HashSet<u32> {
+        let allowed: HashSet<u32> = self
+            .workers
+            .iter()
+            .chain(self.descendants.iter())
+            .copied()
+            .collect();
+        sample
+            .iter()
+            .filter(|row| allowed.contains(&row.pid) && !row.is_zombie())
+            .map(|row| row.pid)
+            .collect()
+    }
+}
+
+fn owned_set_from_sample(sample: &[ProcessRow], hub_pid: u32) -> OwnedSet {
+    let workers: Vec<u32> = sample
+        .iter()
+        .filter(|row| row.is_owned_worker(hub_pid))
+        .map(|row| row.pid)
+        .collect();
+    let mut descendants = workers.clone();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for row in sample {
+            if descendants.contains(&row.ppid) && !descendants.contains(&row.pid) {
+                descendants.push(row.pid);
+                changed = true;
+            }
+        }
+    }
+    OwnedSet {
+        workers,
+        descendants,
+    }
+}
+
+fn group_quiescent(sample: &[ProcessRow], hub_pid: u32) -> bool {
+    sample
+        .iter()
+        .filter(|row| row.in_group(hub_pid) && !row.is_zombie())
+        .all(ProcessRow::is_stopped)
+}
+
+struct FreezeGuard {
+    pgid: u32,
+    discharged: bool,
+}
+
+impl FreezeGuard {
+    fn arm(pgid: u32) -> Result<Self, IsolatedHubError> {
+        signal_owned_hub_group(pgid, libc::SIGSTOP)?;
+        Ok(Self {
+            pgid,
+            discharged: false,
+        })
+    }
+
+    fn discharge(&mut self) {
+        self.discharged = true;
+    }
+}
+
+impl Drop for FreezeGuard {
+    fn drop(&mut self) {
+        if !self.discharged {
+            let _ = signal_owned_hub_group(self.pgid, libc::SIGCONT);
+            self.discharged = true;
+        }
+    }
+}
+
+fn signal_owned_hub_group(pgid: u32, signal: libc::c_int) -> Result<(), IsolatedHubError> {
+    if pgid <= 1 {
+        return Ok(());
+    }
+    let raw = pgid as libc::pid_t;
+    let our_pgid = unsafe { libc::getpgid(0) };
+    if raw == our_pgid {
+        return Err(IsolatedHubError::CleanupChild {
+            pid: pgid,
+            source: std::io::Error::other("refusing to signal the test harness process group"),
+        });
+    }
+    if unsafe { libc::killpg(raw, signal) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(IsolatedHubError::CleanupChild {
+            pid: pgid,
+            source: error,
+        })
+    }
+}
+
+fn signal_matched_pid(pid: u32, signal: libc::c_int) {
+    if pid <= 1 {
+        return;
+    }
+    let raw = pid as libc::pid_t;
+    let our_pgid = unsafe { libc::getpgid(0) };
+    let pgid = unsafe { libc::getpgid(raw) };
+    if pgid == raw && pgid > 1 && pgid != our_pgid {
+        let _ = unsafe { libc::killpg(raw, signal) };
+        return;
+    }
+    let _ = unsafe { libc::kill(raw, signal) };
+}
+
+fn freeze_confirm_snapshot(
+    hub_pid: u32,
+    budget: &TeardownBudget,
+    seams: &IsolatedHubSeams,
+) -> Result<OwnedSet, IsolatedHubError> {
+    if seams.skip_freeze {
+        return Ok(owned_set_from_sample(&census_sample(), hub_pid));
+    }
+    if seams.reuse_remembered_set_on_drop_retry
+        && let Some(remembered) = seams.remembered_set.clone()
+    {
+        return Ok(remembered);
+    }
+    let mut guard = FreezeGuard::arm(hub_pid)?;
+    if seams.force_quiescence_unconfirmed {
+        return Err(IsolatedHubError::QuiescenceUnconfirmed {
+            pgid: hub_pid as i32,
+            data_dir: PathBuf::new(),
+        });
+    }
+    let confirm_deadline = budget.phase_deadline(FREEZE_CONFIRM_BUDGET);
+    if seams.skip_stop_confirmation {
+        let sample = census_sample();
+        let owned = owned_set_from_sample(&sample, hub_pid);
+        signal_owned_hub_group(hub_pid, libc::SIGKILL)?;
+        guard.discharge();
+        return Ok(owned);
+    }
+    loop {
+        let sample = census_sample();
+        if group_quiescent(&sample, hub_pid) {
+            let owned = owned_set_from_sample(&sample, hub_pid);
+            signal_owned_hub_group(hub_pid, libc::SIGKILL)?;
+            guard.discharge();
+            return Ok(owned);
+        }
+        if Instant::now() >= confirm_deadline {
+            return Err(IsolatedHubError::QuiescenceUnconfirmed {
+                pgid: hub_pid as i32,
+                data_dir: PathBuf::new(),
+            });
+        }
+        thread::sleep(WAIT_POLL);
+    }
+}
+
+fn reap_owned_session_workers(hub_pid: u32, captured: Option<&OwnedSet>, budget: &TeardownBudget) {
+    let started = Instant::now();
+    let reap_deadline = budget.phase_deadline(REAP_CEILING);
+    loop {
+        let sample = census_sample();
+        let current = owned_set_from_sample(&sample, hub_pid);
+        let mut allowed: HashSet<u32> = current
+            .workers
+            .iter()
+            .chain(current.descendants.iter())
+            .copied()
+            .collect();
+        if let Some(captured) = captured {
+            allowed.extend(captured.workers.iter().copied());
+            allowed.extend(captured.descendants.iter().copied());
+        }
+        let live: Vec<u32> = sample
+            .iter()
+            .filter(|row| allowed.contains(&row.pid) && !row.is_zombie())
+            .map(|row| row.pid)
+            .collect();
+        if live.is_empty() {
+            return;
+        }
+        let signal = if started.elapsed() >= REAP_SIGKILL_AFTER {
+            libc::SIGKILL
+        } else {
+            libc::SIGTERM
+        };
+        for pid in live {
+            signal_matched_pid(pid, signal);
+        }
+        if Instant::now() >= reap_deadline {
+            return;
+        }
+        thread::sleep(REAP_POLL);
+    }
+}
+
+fn take_drain(pipe: Option<impl Read + Send + 'static>) -> Option<JoinHandle<Vec<u8>>> {
+    pipe.map(|mut reader| {
+        thread::spawn(move || {
+            let mut stored = Vec::new();
+            let mut buf = [0_u8; 4096];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let room = DRAIN_CAP.saturating_sub(stored.len());
+                        stored.extend_from_slice(&buf[..n.min(room)]);
+                    }
+                    Err(_) => break,
+                }
+            }
+            stored
+        })
+    })
+}
+
+fn join_drain(handle: Option<JoinHandle<Vec<u8>>>) -> String {
+    handle
+        .and_then(|handle| handle.join().ok())
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default()
+}
+
+fn wait_child_bounded(
+    child: &mut Child,
+    deadline: Instant,
+) -> Result<Option<ExitStatus>, std::io::Error> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        thread::sleep(WAIT_POLL);
+    }
+}
+
+struct ShutdownOutcome {
+    succeeded: bool,
+    disconnected_during_shutdown: bool,
+    timed_out: bool,
+    stderr: String,
+}
+
+fn run_shutdown_command(
+    hub_bin: &Path,
+    data_dir: &Path,
+    working_directory: &Path,
+    deadline: Instant,
+) -> Result<ShutdownOutcome, IsolatedHubError> {
+    let mut command = Command::new(hub_bin);
+    command
+        .arg("shutdown")
+        .arg("--data-dir")
+        .arg(data_dir)
+        .current_dir(working_directory)
+        .env("BOTSTER_ENV", "test")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|source| IsolatedHubError::ShutdownCommand { source })?;
+    let stdout = take_drain(child.stdout.take());
+    let stderr = take_drain(child.stderr.take());
+    match wait_child_bounded(&mut child, deadline) {
+        Ok(Some(status)) => {
+            let _stdout = join_drain(stdout);
+            let stderr = join_drain(stderr);
+            let disconnected_during_shutdown =
+                stderr.trim() == "botster-hub shutdown error: client disconnected";
+            Ok(ShutdownOutcome {
+                succeeded: status.success(),
+                disconnected_during_shutdown,
+                timed_out: false,
+                stderr,
+            })
+        }
+        Ok(None) => {
+            let pid = child.id();
+            let _ = signal_owned_hub_group(pid, libc::SIGKILL);
+            let _ = child.kill();
+            let _ = wait_child_bounded(&mut child, Instant::now() + Duration::from_secs(1));
+            let _stdout = join_drain(stdout);
+            let stderr = join_drain(stderr);
+            Ok(ShutdownOutcome {
+                succeeded: false,
+                disconnected_during_shutdown: false,
+                timed_out: true,
+                stderr,
+            })
+        }
+        Err(source) => {
+            let pid = child.id();
+            let _ = signal_owned_hub_group(pid, libc::SIGKILL);
+            let _ = child.kill();
+            let _ = join_drain(stdout);
+            let _ = join_drain(stderr);
+            Err(IsolatedHubError::ShutdownCommand { source })
+        }
+    }
 }

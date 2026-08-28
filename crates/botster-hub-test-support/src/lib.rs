@@ -28,7 +28,10 @@ use botster_ui_contract::{
 use serde::{Deserialize, Serialize};
 
 mod isolated_hub;
-pub use isolated_hub::{IsolatedHub, IsolatedHubBuilder, IsolatedHubError};
+pub use isolated_hub::{
+    IsolatedHub, IsolatedHubBuilder, IsolatedHubError, TeardownPhase, clear_isolated_hub_taint,
+    isolated_hub_taint,
+};
 
 /// Shared OS monotonic clock for campaign emission-to-receipt samples.
 #[must_use]
@@ -5260,7 +5263,7 @@ impl From<serde_json::Error> for ConformanceError {
 
 #[cfg(test)]
 mod tests {
-    use super::isolated_hub::{cleanup_child, default_socket_name, explicit_path};
+    use super::isolated_hub::{IsolatedHub, cleanup_child, explicit_path};
     use super::*;
     use botster_hub_client::DaemonCompatibility;
     use std::env;
@@ -5269,8 +5272,9 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::CommandExt;
-    use std::process::Child;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::process::{Child, Command, Stdio};
+    use std::thread;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     fn node_package_asset(path: &str) -> String {
         fs::read_to_string(
@@ -7108,7 +7112,7 @@ done
         let child = command.spawn().expect("spawn owned descendant fixture");
         let child_pid = child.id();
         let child_guard = CleanupChildGuard::new(child);
-        let descendant_pid = wait_for_fake_pid(&descendant_pid_file);
+        let descendant_pid = wait_for_fake_pid_within(&descendant_pid_file, Duration::from_secs(5));
         let _descendant_guard = DescendantGuard(descendant_pid as libc::pid_t);
         let mut child = child_guard.into_child();
 
@@ -7151,6 +7155,351 @@ done
         fs::remove_dir_all(root).expect("remove missing-publication fixture");
     }
 
+    #[cfg(unix)]
+    fn spawn_group_leader(command: &str) -> Child {
+        let mut spawned = Command::new("sh");
+        spawned
+            .args(["-c", command])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            spawned.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        spawned.spawn().expect("spawn group leader")
+    }
+
+    #[cfg(unix)]
+    fn worker_sleep_binary(root: &Path) -> PathBuf {
+        executable_script(
+            root,
+            SESSION_WORKER_NAME,
+            "#!/bin/sh\nexec /bin/sleep \"$@\"\n",
+        )
+    }
+
+    const SESSION_WORKER_NAME: &str = "botster-session-worker";
+
+    #[cfg(unix)]
+    fn spawn_leader_with_worker(worker_bin: &Path, worker_pid_file: &Path) -> Child {
+        spawn_group_leader(&format!(
+            "\"{}\" 60 & printf '%s\\n' \"$!\" > '{}'; wait",
+            worker_bin.display(),
+            worker_pid_file.display()
+        ))
+    }
+
+    #[cfg(unix)]
+    fn spawn_leader_with_worker_script(worker_bin: &Path, descendant_pid_file: &Path) -> Child {
+        spawn_group_leader(&format!(
+            "\"{}\" '{}' & wait",
+            worker_bin.display(),
+            descendant_pid_file.display()
+        ))
+    }
+
+    #[cfg(unix)]
+    fn worker_script_with_descendant(root: &Path, descendant_pid_file: &Path) -> PathBuf {
+        executable_script(
+            root,
+            SESSION_WORKER_NAME,
+            &format!(
+                r#"#!/bin/sh
+sleep 60 &
+printf '%s\n' "$!" > '{}'
+wait
+"#,
+                descendant_pid_file.display()
+            ),
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_worker_census_is_non_empty_before_absence_assertions() {
+        let root = unique_root("census-positive");
+        let worker_bin = worker_sleep_binary(&root);
+        let worker_pid_file = root.join("worker.pid");
+        let leader = spawn_leader_with_worker(&worker_bin, &worker_pid_file);
+        let worker_pid = wait_for_fake_pid_within(&worker_pid_file, Duration::from_secs(5));
+        let hub = isolated_hub(shutdown_script(&root, "exit 0"), root.clone(), leader);
+        let started = Instant::now();
+        while Instant::now() < started + Duration::from_secs(2)
+            && hub.owned_session_worker_pids().is_empty()
+        {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !hub.owned_session_worker_pids().is_empty(),
+            "census must observe the live worker before any absence assertion"
+        );
+        let _ = hub.shutdown();
+        assert!(
+            !process_exists(worker_pid) || zombie_only(worker_pid),
+            "reap must remove the owned worker"
+        );
+        fs::remove_dir_all(root).expect("remove census fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repeated_shutdown_reaps_worker_and_own_group_descendant() {
+        let root = unique_root("repeated-reap");
+        let descendant_pid_file = root.join("descendant.pid");
+        let worker_bin = worker_script_with_descendant(&root, &descendant_pid_file);
+        let leader = spawn_leader_with_worker_script(&worker_bin, &descendant_pid_file);
+        let descendant_pid = wait_for_fake_pid_within(&descendant_pid_file, Duration::from_secs(5));
+        unsafe {
+            let _ = libc::setpgid(descendant_pid as libc::pid_t, descendant_pid as libc::pid_t);
+        }
+        let hub = isolated_hub(shutdown_script(&root, "exit 0"), root.clone(), leader);
+        let started = Instant::now();
+        while Instant::now() < started + Duration::from_secs(2)
+            && hub.owned_session_worker_pids().is_empty()
+        {
+            thread::sleep(Duration::from_millis(20));
+        }
+        let workers = hub.owned_session_worker_pids();
+        assert!(!workers.is_empty());
+        let worker_pid = workers[0];
+        let _ = hub.shutdown();
+        assert_process_exits(worker_pid);
+        assert_process_exits(descendant_pid);
+
+        let descendant_pid_file = root.join("descendant-2.pid");
+        let worker_bin = worker_script_with_descendant(&root, &descendant_pid_file);
+        let leader = spawn_leader_with_worker_script(&worker_bin, &descendant_pid_file);
+        let _ = wait_for_fake_pid_within(&descendant_pid_file, Duration::from_secs(5));
+        let hub = isolated_hub(shutdown_script(&root, "exit 0"), root.clone(), leader);
+        let workers = hub.owned_session_worker_pids();
+        let worker_pid = *workers.first().unwrap_or(&0);
+        let _ = hub.shutdown();
+        if worker_pid != 0 {
+            assert_process_exits(worker_pid);
+        }
+        fs::remove_dir_all(root).expect("remove repeated-reap fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn teardown_isolates_sibling_hub_process_group() {
+        let root = unique_root("isolation");
+        let worker_bin = worker_sleep_binary(&root);
+        let first_pid_file = root.join("first-worker.pid");
+        let second_pid_file = root.join("second-worker.pid");
+        let first_leader = spawn_leader_with_worker(&worker_bin, &first_pid_file);
+        let second_leader = spawn_leader_with_worker(&worker_bin, &second_pid_file);
+        let first_pid = first_leader.id();
+        let second_pid = second_leader.id();
+        let _ = wait_for_fake_pid_within(&first_pid_file, Duration::from_secs(5));
+        let second_worker_pid = wait_for_fake_pid_within(&second_pid_file, Duration::from_secs(5));
+        let first = isolated_hub(
+            shutdown_script(&root, "exit 0"),
+            root.join("first"),
+            first_leader,
+        );
+        let second = isolated_hub(
+            shutdown_script(&root, "exit 0"),
+            root.join("second"),
+            second_leader,
+        );
+        let _ = first.shutdown();
+        assert!(
+            process_exists(second_worker_pid),
+            "sibling workers must survive the first instance teardown"
+        );
+        assert!(
+            process_exists(second_pid),
+            "sibling hub child must survive the first instance teardown"
+        );
+        assert!(
+            !process_exists(first_pid) || zombie_only(first_pid),
+            "first hub child must be reaped"
+        );
+        drop(second);
+        assert_process_exits(second_worker_pid);
+        fs::remove_dir_all(root).expect("remove isolation fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stalled_shutdown_command_returns_typed_timeout_within_whole_path_bound() {
+        let root = unique_root("stalled-shutdown");
+        let hub_bin = shutdown_script(
+            &root,
+            "dd if=/dev/zero bs=1024 count=200 2>/dev/null; sleep 60",
+        );
+        let child = spawn_group_leader("sleep 60");
+        let hub = isolated_hub(hub_bin, root.clone(), child);
+        let started = Instant::now();
+        let error = hub
+            .shutdown()
+            .expect_err("stalled shutdown command must time out");
+        assert!(started.elapsed() < Duration::from_millis(22_500));
+        assert!(
+            matches!(
+                error,
+                IsolatedHubError::TeardownTimeout {
+                    phase: TeardownPhase::ShutdownCommand
+                }
+            ),
+            "stalled shutdown must record TeardownTimeout {{ ShutdownCommand }}, got {error:?}"
+        );
+        fs::remove_dir_all(root).expect("remove stalled-shutdown fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hub_child_wait_timeout_reaps_separate_group_descendant() {
+        let root = unique_root("hub-wait-timeout");
+        let descendant_pid_file = root.join("descendant.pid");
+        let worker_bin = worker_script_with_descendant(&root, &descendant_pid_file);
+        let leader = spawn_leader_with_worker_script(&worker_bin, &descendant_pid_file);
+        let descendant_pid = wait_for_fake_pid_within(&descendant_pid_file, Duration::from_secs(5));
+        unsafe {
+            let _ = libc::setpgid(descendant_pid as libc::pid_t, descendant_pid as libc::pid_t);
+        }
+        let hub = isolated_hub(shutdown_script(&root, "exit 0"), root.clone(), leader);
+        let started = Instant::now();
+        let error = hub
+            .shutdown()
+            .expect_err("non-exiting hub child must time out");
+        assert!(started.elapsed() < Duration::from_millis(22_500));
+        assert!(
+            matches!(
+                error,
+                IsolatedHubError::TeardownTimeout {
+                    phase: TeardownPhase::HubChildWait
+                }
+            ),
+            "hub-child wait must record TeardownTimeout {{ HubChildWait }}, got {error:?}"
+        );
+        assert_process_exits(descendant_pid);
+        fs::remove_dir_all(root).expect("remove hub-wait fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unconfirmed_quiescence_kills_only_the_hub_child_and_taints() {
+        clear_isolated_hub_taint();
+        let root = unique_root("unconfirmed");
+        let descendant_pid_file = root.join("descendant.pid");
+        let worker_bin = worker_script_with_descendant(&root, &descendant_pid_file);
+        let leader = spawn_leader_with_worker_script(&worker_bin, &descendant_pid_file);
+        let hub_pid = leader.id();
+        let descendant_pid = wait_for_fake_pid_within(&descendant_pid_file, Duration::from_secs(5));
+        let mut hub = isolated_hub(shutdown_script(&root, "exit 0"), root.clone(), leader);
+        hub.force_quiescence_unconfirmed();
+        let started = Instant::now();
+        let error = hub
+            .shutdown()
+            .expect_err("forced unconfirmed quiescence must fail");
+        assert!(started.elapsed() < Duration::from_millis(22_500));
+        assert!(
+            matches!(error, IsolatedHubError::QuiescenceUnconfirmed { .. }),
+            "typed quiescence error must reach the caller, got {error:?}"
+        );
+        assert_process_exits(hub_pid);
+        assert!(
+            isolated_hub_taint().is_some(),
+            "unconfirmed path must taint the fixture"
+        );
+        let sample = Command::new("ps")
+            .args(["-axo", "pid=,stat="])
+            .output()
+            .expect("ps");
+        let stopped = String::from_utf8_lossy(&sample.stdout)
+            .lines()
+            .filter(|line| {
+                let mut parts = line.split_whitespace();
+                let Some(pid) = parts.next() else {
+                    return false;
+                };
+                let Some(stat) = parts.next() else {
+                    return false;
+                };
+                (pid == hub_pid.to_string() || pid == descendant_pid.to_string())
+                    && stat.starts_with('T')
+            })
+            .count();
+        assert_eq!(
+            stopped, 0,
+            "unconfirmed path must not leave processes stopped"
+        );
+        clear_isolated_hub_taint();
+        unsafe {
+            libc::kill(descendant_pid as libc::pid_t, libc::SIGKILL);
+        }
+        fs::remove_dir_all(root).expect("remove unconfirmed fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn taint_blocks_the_next_isolated_hub_start_without_spawning() {
+        clear_isolated_hub_taint();
+        record_test_taint();
+        let root = unique_root("taint-block");
+        let worker = existing_file(&root, "botster-session-worker");
+        let hub = existing_file(&root, "botster-hub");
+        let error = IsolatedHubBuilder::new()
+            .hub_bin(hub)
+            .session_worker_bin(worker)
+            .root(&root)
+            .start_error();
+        assert!(
+            matches!(error, IsolatedHubError::Tainted { .. }),
+            "taint must refuse start before spawn, got {error:?}"
+        );
+        clear_isolated_hub_taint();
+        fs::remove_dir_all(root).expect("remove taint-block fixture");
+    }
+
+    #[cfg(unix)]
+    fn record_test_taint() {
+        let root = unique_root("taint-cell");
+        let leader = spawn_group_leader("sleep 60");
+        let mut hub = isolated_hub(shutdown_script(&root, "exit 0"), root.clone(), leader);
+        hub.force_quiescence_unconfirmed();
+        let _ = hub.shutdown();
+        assert!(isolated_hub_taint().is_some());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drop_retry_does_not_restart_whole_path_budget() {
+        clear_isolated_hub_taint();
+        let root = unique_root("drop-budget");
+        let leader = spawn_group_leader("sleep 60");
+        let mut hub = isolated_hub(shutdown_script(&root, "exit 0"), root.clone(), leader);
+        hub.force_quiescence_unconfirmed();
+        let started = Instant::now();
+        let error = hub.shutdown().expect_err("forced unconfirmed shutdown");
+        assert!(matches!(
+            error,
+            IsolatedHubError::QuiescenceUnconfirmed { .. }
+        ));
+        assert!(
+            started.elapsed() < Duration::from_millis(22_500),
+            "explicit shutdown plus consuming Drop retry must stay within one whole-path bound"
+        );
+        clear_isolated_hub_taint();
+        fs::remove_dir_all(root).expect("remove drop-budget fixture");
+    }
+
+    #[cfg(unix)]
+    fn zombie_only(pid: u32) -> bool {
+        let output = Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "stat="])
+            .output()
+            .expect("ps stat");
+        String::from_utf8_lossy(&output.stdout).contains('Z')
+    }
+
     fn unique_root(name: &str) -> PathBuf {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -7174,13 +7523,12 @@ done
 
     #[cfg(unix)]
     fn isolated_hub(hub_bin: PathBuf, data_dir: PathBuf, child: Child) -> IsolatedHub {
-        IsolatedHub {
+        IsolatedHub::from_running_child(
             hub_bin,
-            endpoint: DaemonEndpoint::new(data_dir.join(default_socket_name())),
             data_dir,
-            working_directory: std::env::current_dir().expect("read test working directory"),
-            child: Some(child),
-        }
+            std::env::current_dir().expect("read test working directory"),
+            child,
+        )
     }
 
     trait StartErrorExt {
@@ -7245,7 +7593,12 @@ done
 
     #[cfg(unix)]
     fn wait_for_fake_pid(pid_file: &Path) -> u32 {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        wait_for_fake_pid_within(pid_file, Duration::from_secs(2))
+    }
+
+    #[cfg(unix)]
+    fn wait_for_fake_pid_within(pid_file: &Path, timeout: Duration) -> u32 {
+        let deadline = Instant::now() + timeout;
         loop {
             if let Some(pid) = fs::read_to_string(pid_file)
                 .ok()

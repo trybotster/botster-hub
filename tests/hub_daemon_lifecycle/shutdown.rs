@@ -3188,3 +3188,64 @@ fn real_daemons_on_custom_data_directories_hold_the_installation_lease() {
     let _ = fs::remove_dir_all(&prefix);
 }
 
+#[test]
+fn isolated_hub_shutdown_reaps_live_session_workers() {
+    let _guard = daemon_test_guard();
+    botster_hub_test_support::clear_isolated_hub_taint();
+    let hub = start_isolated_hub(
+        botster_hub_test_support::IsolatedHubBuilder::new()
+            .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
+            .session_worker_bin(session_worker_binary_path())
+            .root(unique_short_test_dir("ih-reap"))
+            .name("owned-worker-reap"),
+    );
+    let spawn = botster_hub_client::request(
+        hub.endpoint(),
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: "isolated-reap-session".to_string(),
+            command: "sleep 120".to_string(),
+        },
+    )
+    .expect("spawn durable session through IsolatedHub");
+    assert_eq!(
+        spawn.kind,
+        botster_hub_client::DaemonResponseKind::Spawned,
+        "spawn must succeed: {spawn:?}"
+    );
+    let started = Instant::now();
+    while Instant::now() < started + Duration::from_secs(5)
+        && hub.owned_session_worker_pids().is_empty()
+    {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !hub.owned_session_worker_pids().is_empty(),
+        "positive control: IsolatedHub census must observe the live session worker before shutdown"
+    );
+    let hub_pid = hub.hub_child_pid();
+    hub.shutdown()
+        .expect("IsolatedHub shutdown after spawning a durable session");
+    let leftover: Vec<u32> = Command::new("ps")
+        .args(["-axo", "pid=,pgid=,command="])
+        .output()
+        .expect("census after IsolatedHub shutdown")
+        .stdout
+        .split(|&byte| byte == b'\n')
+        .filter_map(|line| {
+            let line = String::from_utf8_lossy(line);
+            let mut parts = line.split_whitespace();
+            let pid = parts.next()?.parse().ok()?;
+            let pgid: u32 = parts.next()?.parse().ok()?;
+            let command = parts.collect::<Vec<_>>().join(" ");
+            let basename = Path::new(command.split_whitespace().next()?)
+                .file_name()
+                .and_then(|name| name.to_str())?;
+            (pgid == hub_pid && basename == "botster-session-worker").then_some(pid)
+        })
+        .collect();
+    assert!(
+        leftover.is_empty(),
+        "IsolatedHub shutdown must reap owned session workers, leftover={leftover:?}"
+    );
+}
+

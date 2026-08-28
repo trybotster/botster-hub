@@ -1312,6 +1312,25 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
                     event_flight(&delivery, Some(scope_id), request_id.0),
                 );
             }
+            PluginAdmissionResult::Backpressured { .. } => {
+                let _ = runtime.admit_causal_op(crate::package_event_router::CausalOp::Release {
+                    scope_id,
+                    identity: crate::package_event_router::LeaseIdentity::EventInFlight {
+                        request_id: request_id.0.clone(),
+                    },
+                });
+                match runtime.package_event_router().requeue_delivery(delivery) {
+                    Ok(()) => {
+                        state.scheduler.try_wake();
+                    }
+                    Err((delivery, _)) => {
+                        let mut flight = event_flight(&delivery, None, request_id.0);
+                        if !retire_event_holder(runtime, &mut flight) {
+                            queue_event_retirement(state, flight);
+                        }
+                    }
+                }
+            }
             _ => {
                 let mut flight = event_flight(&delivery, Some(scope_id), request_id.0);
                 if !retire_event_holder(runtime, &mut flight) {
@@ -3799,7 +3818,14 @@ return botster.register({})
             .expect("load event probe plugin");
         ingress_worktree_created(&runtime);
         let mut state = MaintenanceState::default();
-        run_package_event_delivery_slice(&runtime, &mut state);
+        let queue_deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < queue_deadline && state.event_in_flight.len() < 2 {
+            run_package_event_delivery_slice(&runtime, &mut state);
+            if state.event_in_flight.len() < 2 {
+                runtime.package_event_router().set_delivery_wake();
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
         assert_eq!(
             state.event_in_flight.len(),
             2,
@@ -3847,6 +3873,41 @@ return botster.register({})
         assert_eq!(snapshot.admitted_holders, 0);
         assert_eq!(snapshot.global_in_flight_bytes, 0);
         let _ = std::fs::remove_dir_all(package_root);
+        let _ = std::fs::remove_dir_all(data_directory);
+    }
+
+    #[test]
+    fn backpressured_admission_requeues_holder_instead_of_retiring() {
+        let (runtime, data_directory) = event_delivery_runtime("backpressure-requeue");
+        subscribe_worktree_consumer(&runtime, "consumer");
+        runtime.insert_test_event_handler("consumer", "worktree_created");
+        ingress_worktree_created(&runtime);
+        runtime.set_test_plugin_admit_backpressure(true);
+        let mut state = MaintenanceState::default();
+        run_package_event_delivery_slice(&runtime, &mut state);
+        assert!(
+            state.event_in_flight.is_empty(),
+            "Backpressured admission must not mark the delivery in-flight: {state:?}"
+        );
+        assert_eq!(runtime.package_event_router().test_outstanding_pulls(), 0);
+        let snapshot = runtime.package_event_router().snapshot().expect("snapshot");
+        assert_eq!(
+            snapshot.queued_holders, 1,
+            "transient Backpressured must requeue the holder; retiring it (the catch-all arm) makes this 0"
+        );
+        assert_eq!(snapshot.admitted_holders, 0);
+        assert!(
+            snapshot.global_in_flight_bytes > 0,
+            "requeued occupancy must remain until a later slice admits or expires the copy"
+        );
+        runtime.set_test_plugin_admit_backpressure(false);
+        runtime.package_event_router().set_delivery_wake();
+        run_package_event_delivery_slice(&runtime, &mut state);
+        let after = runtime.package_event_router().snapshot().expect("after");
+        assert_eq!(
+            after.queued_holders, 0,
+            "a later slice must consume the requeued holder rather than lose it"
+        );
         let _ = std::fs::remove_dir_all(data_directory);
     }
 
