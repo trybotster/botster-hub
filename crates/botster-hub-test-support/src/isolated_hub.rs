@@ -580,11 +580,7 @@ fn session_worker_pids_for_data_dir(data_dir: &Path, data_dir_arg: &Path) -> Vec
         .into_iter()
         .filter_map(|(pid, args)| {
             let argv0 = args.first()?;
-            let is_worker = Path::new(argv0)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name == "botster-session-worker");
-            if !is_worker {
+            if !argv0_is_session_worker(argv0) {
                 return None;
             }
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -609,11 +605,7 @@ fn session_worker_pids_orphaned() -> Vec<u32> {
         .into_iter()
         .filter_map(|(pid, args)| {
             let argv0 = args.first()?;
-            let is_worker = Path::new(argv0)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name == "botster-session-worker");
-            if !is_worker {
+            if !argv0_is_session_worker(argv0) {
                 return None;
             }
             let ppid = process_ppid(pid)?;
@@ -712,18 +704,22 @@ fn linux_proc_session_worker_argvs() -> Option<Vec<(u32, Vec<String>)>> {
         else {
             continue;
         };
-        let Ok(bytes) = fs::read(format!("/proc/{pid}/cmdline")) else {
-            continue;
-        };
-        if bytes.is_empty() {
-            continue;
-        }
-        let args: Vec<String> = bytes
+        let bytes = fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+        let mut args: Vec<String> = bytes
             .split(|byte| *byte == 0)
             .filter(|chunk| !chunk.is_empty())
             .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
             .collect();
         if args.is_empty() {
+            if let Ok(exe) = fs::read_link(format!("/proc/{pid}/exe")) {
+                args.push(exe.to_string_lossy().into_owned());
+            } else {
+                continue;
+            }
+        }
+        if !argv0_is_session_worker(args.first().map(String::as_str).unwrap_or(""))
+            && !linux_exe_is_session_worker(pid)
+        {
             continue;
         }
         argvs.push((pid, args));
@@ -759,6 +755,22 @@ fn ps_axww_session_worker_argvs() -> Vec<(u32, Vec<String>)> {
         argvs.push((pid, args));
     }
     argvs
+}
+
+fn argv0_is_session_worker(argv0: &str) -> bool {
+    Path::new(argv0)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name == "botster-session-worker" || name.starts_with("botster-session-worker")
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_exe_is_session_worker(pid: u32) -> bool {
+    fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .is_some_and(|exe| argv0_is_session_worker(&exe.to_string_lossy()))
 }
 
 fn exact_data_dir_path(arg: &str, data_dir: &Path) -> bool {
@@ -831,11 +843,7 @@ fn session_worker_pids_named() -> Vec<u32> {
         .into_iter()
         .filter_map(|(pid, args)| {
             let argv0 = args.first()?;
-            let is_worker = Path::new(argv0)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name == "botster-session-worker");
-            is_worker.then_some(pid)
+            argv0_is_session_worker(argv0).then_some(pid)
         })
         .collect()
 }
@@ -851,11 +859,7 @@ fn reap_session_worker_pids(census: impl Fn() -> Vec<u32>) {
         if pids.is_empty() {
             return;
         }
-        let signal = if started.elapsed() >= Duration::from_millis(400) {
-            libc::SIGKILL
-        } else {
-            libc::SIGTERM
-        };
+        let signal = libc::SIGKILL;
         let mut targets = pids;
         for pid in targets.clone() {
             targets.extend(descendant_pids(pid));
