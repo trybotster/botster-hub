@@ -147,12 +147,6 @@ impl WebRtcTerminalAdapterInner {
         self.would_block.load(Ordering::SeqCst)
     }
 
-    fn channel_would_block(&self) -> bool {
-        let buffered = self.buffered_bytes.load(Ordering::SeqCst);
-        buffered >= crate::local_webrtc::webrtc_subscription_channel::AGGREGATE_BUFFERED_LOW
-            && self.would_block.load(Ordering::SeqCst)
-    }
-
     fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
     }
@@ -1321,8 +1315,10 @@ impl WebRtcTerminalAdapterHandle {
     }
 
     pub(crate) fn write_slot_is_pressured(&self) -> bool {
-        matches!(self.inner.pressure(), TerminalAdapterPressure::Full)
-            || self.inner.channel_would_block()
+        matches!(
+            self.inner.pressure(),
+            TerminalAdapterPressure::Full | TerminalAdapterPressure::WouldBlock
+        )
     }
 
     #[cfg(test)]
