@@ -162,7 +162,7 @@ const ENTITY_RECONCILIATION_INTERVAL: Duration = Duration::from_millis(500);
 const WEBRTC_BIND_OBSERVE_TICK: Duration = Duration::from_millis(50);
 const WEBRTC_SLOT_READY_OBSERVE_BOUND: Duration = Duration::from_secs(20);
 const WEBRTC_SLOT_READY_OBSERVE_ATTEMPTS: usize = 8;
-const WEBRTC_SLOT_READY_POLL_ATTEMPTS: usize = 1;
+const WEBRTC_SLOT_READY_POLL_ATTEMPTS: usize = 8;
 static NEXT_SOCKET_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) type ControlSender = tokio_mpsc::Sender<ControlMessage>;
@@ -9336,8 +9336,8 @@ mod tests {
             "coalesced SlotReady persist may take several empty ticks after a flush"
         );
         assert_eq!(
-            WEBRTC_SLOT_READY_POLL_ATTEMPTS, 1,
-            "empty SlotReady self-poll after a burst is one Core tick per bind-observe tick"
+            WEBRTC_SLOT_READY_POLL_ATTEMPTS, 8,
+            "empty SlotReady self-poll after a burst still uses eight ticks, at most once per bind-observe tick"
         );
         let prune = production
             .split("fn prune_webrtc_bind_observe_deadlines")
