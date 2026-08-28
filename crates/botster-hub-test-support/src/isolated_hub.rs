@@ -611,7 +611,7 @@ fn data_dir_arg_matches(arg: &str, data_dir: &Path) -> bool {
 }
 
 fn reap_session_workers_for_data_dir(data_dir: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let pids = session_worker_pids_for_data_dir(data_dir);
         if pids.is_empty() {
