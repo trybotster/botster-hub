@@ -6170,7 +6170,6 @@ fn take_unoccupied_webrtc_slot_ready(state: &mut DaemonControlState) -> Vec<Stri
             .pending_runtime
             .webrtc_session_slot_occupied(&session_id)
         {
-            state.webrtc_slot_ever_occupied.insert(session_id.clone());
             state.pending_runtime.note_webrtc_slot_ready(&session_id);
         } else {
             ready.push(session_id);
@@ -6190,17 +6189,10 @@ fn observe_coalesced_webrtc_slot_ready(daemon: &HubDaemon, state: &mut DaemonCon
         observe_reserved_session_until_slot_full(daemon, state, &session_id);
         if state
             .pending_runtime
-            .webrtc_session_slot_occupied(&session_id)
-        {
-            state.webrtc_slot_ever_occupied.insert(session_id.clone());
-        } else if state
-            .pending_runtime
             .webrtc_session_ready_to_observe(&session_id)
         {
             state.last_webrtc_empty_pump = Some(now);
-            if !state.webrtc_slot_ever_occupied.contains(&session_id) {
-                state.pending_runtime.note_webrtc_slot_ready(&session_id);
-            }
+            state.pending_runtime.note_webrtc_slot_ready(&session_id);
         }
     }
     persisted
@@ -6324,7 +6316,6 @@ pub(crate) struct DaemonControlState {
     pending_hub_update_reply: Option<ControlReplySender>,
     observe_resume: Option<botster_core_daemon::ObserveLifecycleCursor>,
     last_webrtc_empty_pump: Option<Instant>,
-    webrtc_slot_ever_occupied: BTreeSet<String>,
 }
 
 impl Default for DaemonControlState {
@@ -6349,7 +6340,6 @@ impl Default for DaemonControlState {
             pending_hub_update_reply: None,
             observe_resume: None,
             last_webrtc_empty_pump: None,
-            webrtc_slot_ever_occupied: BTreeSet::new(),
         }
     }
 }
@@ -9378,11 +9368,6 @@ mod tests {
                 || production.contains("fn take_unoccupied_webrtc_slot_ready"),
             "coalesced drain observes only empty slots"
         );
-        assert!(
-            coalesced.contains("webrtc_slot_ever_occupied")
-                && coalesced.contains("note_webrtc_slot_ready"),
-            "empty persist re-notes only until the adapter slot has been occupied"
-        );
         let starved = production
             .split("fn observe_starved_empty_webrtc_binds")
             .nth(1)
@@ -9409,9 +9394,8 @@ mod tests {
         assert!(
             occupied_filter.contains("webrtc_session_slot_occupied")
                 && occupied_filter.contains("webrtc_session_has_live_bound_route")
-                && occupied_filter.contains("note_webrtc_slot_ready")
-                && occupied_filter.contains("webrtc_slot_ever_occupied"),
-            "a full live adapter slot keeps the coalesced session key and records occupancy"
+                && occupied_filter.contains("note_webrtc_slot_ready"),
+            "a full live adapter slot keeps the coalesced session key; closed routes drop it"
         );
         let due = production
             .split("fn mark_due_reconciliation")
