@@ -1192,10 +1192,17 @@ impl WebRtcConnectionMux {
             .any(WebRtcTerminalAdapterHandle::slot_is_occupied)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn session_has_empty_live_bound_slot(&self, session_id: &str) -> bool {
         self.live_bound_handles_for_session(session_id)
             .iter()
             .any(|handle| !handle.slot_is_occupied())
+    }
+
+    pub(crate) fn session_has_ready_live_bound_slot(&self, session_id: &str) -> bool {
+        self.live_bound_handles_for_session(session_id)
+            .iter()
+            .any(WebRtcTerminalAdapterHandle::write_slot_is_ready)
     }
 
     pub(crate) fn queue_host_event(&self, event: DaemonEvent) {
@@ -1295,6 +1302,15 @@ impl WebRtcTerminalAdapterHandle {
             Err(TryLockError::WouldBlock) => true,
             Err(TryLockError::Poisoned(_)) => false,
         }
+    }
+
+    pub(crate) fn write_slot_is_ready(&self) -> bool {
+        matches!(self.inner.pressure(), TerminalAdapterPressure::Ready)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_would_block(&self) {
+        self.inner.set_would_block(true);
     }
 
     pub(crate) fn complete_active(&self) -> Option<Vec<u8>> {
