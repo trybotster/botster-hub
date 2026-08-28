@@ -307,6 +307,7 @@ impl IsolatedHub {
     fn reap_owned_session_workers(&self) {
         reap_session_workers_for_data_dir(&self.data_dir, &self.data_dir_arg);
         reap_orphaned_session_workers();
+        reap_named_session_workers();
     }
 }
 
@@ -819,6 +820,24 @@ fn signal_matched_pid(pid: u32, signal: libc::c_int) {
 
 fn reap_orphaned_session_workers() {
     reap_session_worker_pids(session_worker_pids_orphaned);
+}
+
+fn reap_named_session_workers() {
+    reap_session_worker_pids(session_worker_pids_named);
+}
+
+fn session_worker_pids_named() -> Vec<u32> {
+    session_worker_argvs()
+        .into_iter()
+        .filter_map(|(pid, args)| {
+            let argv0 = args.first()?;
+            let is_worker = Path::new(argv0)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == "botster-session-worker");
+            is_worker.then_some(pid)
+        })
+        .collect()
 }
 
 fn reap_session_workers_for_data_dir(data_dir: &Path, data_dir_arg: &Path) {
