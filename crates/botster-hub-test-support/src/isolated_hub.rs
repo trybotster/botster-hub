@@ -588,6 +588,7 @@ fn session_worker_pids_for_data_dir(data_dir: &Path) -> Vec<u32> {
         let args: Vec<&str> = parts.collect();
         if args.iter().any(|arg| *arg == dir.as_ref())
             || args.iter().any(|arg| data_dir_arg_matches(arg, data_dir))
+            || args.iter().any(|arg| arg.contains(dir.as_ref()))
         {
             pids.push(pid);
         }
@@ -623,7 +624,10 @@ fn reap_session_workers_for_data_dir(data_dir: &Path) {
             libc::SIGTERM
         };
         for pid in pids {
-            let _ = unsafe { libc::kill(pid as libc::pid_t, signal) };
+            let raw = pid as libc::pid_t;
+            if unsafe { libc::killpg(raw, signal) } != 0 {
+                let _ = unsafe { libc::kill(raw, signal) };
+            }
         }
         if Instant::now() >= deadline {
             return;
