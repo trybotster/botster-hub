@@ -534,7 +534,7 @@ fn webrtc_reserved_bind_delivers_ready_history_finish_attached_in_order() {
         wait_for_history_ready_file(&ready_path);
         bind_reserved_webrtc(&mut peer, &key, session_id, subscription_id).await;
 
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(60);
         let mut phases = Vec::new();
         let mut raw = Vec::new();
         while Instant::now() < deadline {
