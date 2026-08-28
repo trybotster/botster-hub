@@ -7064,7 +7064,7 @@ done
             .next()
             .unwrap_or(drop_impl);
         assert!(
-            drop_impl.contains("reap_session_workers_for_data_dir"),
+            drop_impl.contains("reap_owned_session_workers"),
             "IsolatedHub Drop must reap leftover session-workers for its data dir"
         );
         assert!(
@@ -7072,8 +7072,10 @@ done
                 && source.contains("botster-session-worker")
                 && source.contains("args.iter().any(|arg| *arg == dir.as_ref())")
                 && source.contains("/proc/{pid}/cmdline")
-                && source.contains("-axww"),
-            "reap must match argv0 botster-session-worker and an exact data-dir argument from /proc cmdline or wide ps, not pkill -f"
+                && source.contains("-axww")
+                && source.contains("reap_orphaned_session_workers")
+                && source.contains("/proc/{pid}/environ"),
+            "reap must match argv0 botster-session-worker and an exact data-dir argument from /proc cmdline, cwd, or environ, and reap orphaned workers, not pkill -f"
         );
     }
 

@@ -185,6 +185,7 @@ impl IsolatedHubBuilder {
         if let Err(error) = wait_for_ready(&endpoint, &mut child, self.ready_timeout) {
             cleanup_child(&mut child)?;
             reap_session_workers_for_data_dir(&data_dir, &selected_data_dir);
+            reap_orphaned_session_workers();
             remove_data_dir_path(&data_dir)?;
             return Err(error);
         }
@@ -305,6 +306,7 @@ impl IsolatedHub {
 
     fn reap_owned_session_workers(&self) {
         reap_session_workers_for_data_dir(&self.data_dir, &self.data_dir_arg);
+        reap_orphaned_session_workers();
     }
 }
 
@@ -321,9 +323,9 @@ fn remove_data_dir_path(data_dir: &Path) -> Result<(), IsolatedHubError> {
 
 impl Drop for IsolatedHub {
     fn drop(&mut self) {
-        reap_session_workers_for_data_dir(&self.data_dir, &self.data_dir_arg);
+        self.reap_owned_session_workers();
         if !thread::panicking() && self.shutdown_inner().is_ok() {
-            reap_session_workers_for_data_dir(&self.data_dir, &self.data_dir_arg);
+            self.reap_owned_session_workers();
             return;
         }
         let mut child_cleaned = true;
@@ -331,7 +333,7 @@ impl Drop for IsolatedHub {
             child_cleaned = cleanup_child(child).is_ok();
         }
         self.child = None;
-        reap_session_workers_for_data_dir(&self.data_dir, &self.data_dir_arg);
+        self.reap_owned_session_workers();
         if child_cleaned && !thread::panicking() {
             let _ = self.remove_data_dir();
         }
@@ -586,6 +588,8 @@ fn session_worker_pids_for_data_dir(data_dir: &Path, data_dir_arg: &Path) -> Vec
                 || args.iter().any(|arg| {
                     exact_data_dir_path(arg, data_dir) || exact_data_dir_path(arg, data_dir_arg)
                 })
+                || proc_cwd_matches_data_dir(pid, data_dir, data_dir_arg)
+                || proc_environ_matches_data_dir(pid, data_dir, data_dir_arg)
             {
                 Some(pid)
             } else {
@@ -593,6 +597,92 @@ fn session_worker_pids_for_data_dir(data_dir: &Path, data_dir_arg: &Path) -> Vec
             }
         })
         .collect()
+}
+
+fn session_worker_pids_orphaned() -> Vec<u32> {
+    session_worker_argvs()
+        .into_iter()
+        .filter_map(|(pid, args)| {
+            let argv0 = args.first()?;
+            let is_worker = Path::new(argv0)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == "botster-session-worker");
+            if !is_worker {
+                return None;
+            }
+            let ppid = process_ppid(pid)?;
+            if ppid <= 1 || !process_pid_exists(ppid) {
+                Some(pid)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn process_ppid(pid: u32) -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) {
+            for line in status.lines() {
+                if let Some(rest) = line.strip_prefix("PPid:") {
+                    return rest.trim().parse().ok();
+                }
+            }
+        }
+    }
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "ppid="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
+fn process_pid_exists(pid: u32) -> bool {
+    if pid <= 1 {
+        return true;
+    }
+    let alive = unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
+    alive || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+fn proc_cwd_matches_data_dir(pid: u32, data_dir: &Path, data_dir_arg: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(cwd) = fs::read_link(format!("/proc/{pid}/cwd")) {
+            return exact_data_dir_path(cwd.to_string_lossy().as_ref(), data_dir)
+                || exact_data_dir_path(cwd.to_string_lossy().as_ref(), data_dir_arg);
+        }
+    }
+    let _ = pid;
+    let _ = data_dir;
+    let _ = data_dir_arg;
+    false
+}
+
+fn proc_environ_matches_data_dir(pid: u32, data_dir: &Path, data_dir_arg: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(bytes) = fs::read(format!("/proc/{pid}/environ")) {
+            return bytes.split(|byte| *byte == 0).any(|chunk| {
+                let Ok(entry) = std::str::from_utf8(chunk) else {
+                    return false;
+                };
+                let Some((_, value)) = entry.split_once('=') else {
+                    return false;
+                };
+                exact_data_dir_path(value, data_dir) || exact_data_dir_path(value, data_dir_arg)
+            });
+        }
+    }
+    let _ = pid;
+    let _ = data_dir;
+    let _ = data_dir_arg;
+    false
 }
 
 fn session_worker_argvs() -> Vec<(u32, Vec<String>)> {
@@ -723,10 +813,18 @@ fn signal_matched_pid(pid: u32, signal: libc::c_int) {
     let _ = unsafe { libc::kill(raw, signal) };
 }
 
+fn reap_orphaned_session_workers() {
+    reap_session_worker_pids(session_worker_pids_orphaned);
+}
+
 fn reap_session_workers_for_data_dir(data_dir: &Path, data_dir_arg: &Path) {
+    reap_session_worker_pids(|| session_worker_pids_for_data_dir(data_dir, data_dir_arg));
+}
+
+fn reap_session_worker_pids(census: impl Fn() -> Vec<u32>) {
     let started = Instant::now();
     loop {
-        let pids = session_worker_pids_for_data_dir(data_dir, data_dir_arg);
+        let pids = census();
         if pids.is_empty() {
             return;
         }

@@ -433,10 +433,49 @@ pub(crate) fn worker_belongs_to_data_dir(
     if worker.command.contains(dir.as_ref()) {
         return true;
     }
-    data_dir
+    if data_dir
         .canonicalize()
         .ok()
         .is_some_and(|canon| worker.command.contains(canon.to_string_lossy().as_ref()))
+    {
+        return true;
+    }
+    linux_proc_matches_data_dir(worker.pid, data_dir)
+}
+
+fn linux_proc_matches_data_dir(pid: u32, data_dir: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(cwd) = fs::read_link(format!("/proc/{pid}/cwd")) {
+            if cwd == data_dir
+                || data_dir
+                    .canonicalize()
+                    .ok()
+                    .is_some_and(|canon| cwd == canon)
+            {
+                return true;
+            }
+        }
+        if let Ok(bytes) = fs::read(format!("/proc/{pid}/environ")) {
+            return bytes.split(|byte| *byte == 0).any(|chunk| {
+                let Ok(entry) = std::str::from_utf8(chunk) else {
+                    return false;
+                };
+                let Some((_, value)) = entry.split_once('=') else {
+                    return false;
+                };
+                Path::new(value) == data_dir
+                    || data_dir
+                        .canonicalize()
+                        .ok()
+                        .zip(fs::canonicalize(value).ok())
+                        .is_some_and(|(left, right)| left == right)
+            });
+        }
+    }
+    let _ = pid;
+    let _ = data_dir;
+    false
 }
 
 pub(crate) fn worker_executable_from_this_worktree(worker: &SessionWorkerProcessIdentity) -> bool {
