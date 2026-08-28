@@ -3,11 +3,12 @@
 Ticket: `ticket_1787894962_603665`
 Run: `run_1787895426_736357`
 Pipeline: Botster Stack Delivery (`botster_stack_delivery`)
-Step: Implement (`botster_stack_implement`) — second review-fix visit after `review_1787911411_664315` (`changes_required`)
+Step: Implement (`botster_stack_implement`) — Verify coverage visit after `review_1787938583_228484` / `review_1787938476_505409` (`changes_required`)
 
 First Implement commit: `ddd9d3f`
 First review-fix commit: `b3ecb50`
-Second review-fix commit: recorded after this report is committed.
+Second review-fix commit: `8124234`
+Verify-coverage commit: recorded after this report is committed.
 
 ## Target repository and target_id
 
@@ -174,7 +175,7 @@ Downstream client proof: none required and none claimed. No DTO, protocol, fixtu
 
 - Unconfirmed quiescence can leave descendants. Tests assert typed error, taint, bounded return, no stopped processes, and no leaked drain threads. They do not assert zero owned descendants on that path.
 - Drop retry under residual time can still freeze remaining group members if confirmation later succeeds. That is the one fresh-sample retry. Residual zero skips the retry.
-- Public inspection helpers `owned_session_worker_pids` and `owned_live_descendant_pids` still return empty on census failure. Teardown does not. A caller that treats those helpers as ownership proof can still misread a failed census.
+- Public inspection helper `owned_session_worker_pids` still returns empty on census failure. Teardown does not. A caller that treats that helper as ownership proof can still misread a failed census. Tests that use it now poll until non-empty before absence assertions.
 - Residual default-concurrency flake risk remains for `unix_eof_skip_core_detach_ablation_keeps_named_pair_on_status`. This review-fix wrapper run passed it.
 - Host still had unrelated leftover `botster-session-worker` processes from other worktrees during census debugging. This change cannot reap those foreign groups.
 
@@ -210,8 +211,13 @@ From `review_1787909065_326772` (commit `b3ecb50`):
 - `finding_1787909065_294461` (major): `isolated_hub_start_guard` is reentrant and held across taint check and spawn. Taint mutations take the same guard.
 - `finding_1787909065_482451` (major): freeze, stop-confirmation, remembered-set, residual-budget, census-fail, captured-reap, and freeze-panic seams now have callers. Setters are `pub(crate)` and `#[cfg(test)]`.
 
-From `review_1787911411_664315` (this visit):
+From `review_1787911411_664315` (commit `8124234`):
 
 - `finding_1787911411_889492` (blocking): reap budget expiry now returns `TeardownTimeout { Reap }`, taints, and does not mark `Completed` while descendants remain.
 - `finding_1787911411_798490` (major): Drop-retry, residual-budget, skip-freeze, and freeze-guard tests now fail on the named claims. Production Drop retry takes a new stop census and reuses the original deadline.
 - `finding_1787911411_781343` (major): start-guard bypass is thread-local. The after-taint hook is token-scoped. A sibling start with a different token cannot satisfy the intended boundary hook.
+
+From Verify `review_1787938476_505409` / `artifact_1787938614_318912` (this visit):
+
+- Repeated shutdown round 2 now polls the census, asserts it is non-empty, asserts the round-2 worker and separate-group descendant exit, and asserts the descendant PGID differs from the Hub PGID. Empty census no longer skips the round.
+- Deleted unused public `owned_live_descendant_pids`. Narrowed `force_quiescence_unconfirmed` to `pub(crate)` `#[cfg(test)]`. Removed the unused `OwnedSet::live_signal_targets` helper.

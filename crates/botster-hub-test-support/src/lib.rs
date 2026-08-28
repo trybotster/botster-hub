@@ -7336,14 +7336,28 @@ os.wait()
         let descendant_pid_file = root.join("descendant-2.pid");
         let worker_bin = worker_script_with_descendant(&root, &descendant_pid_file);
         let leader = spawn_leader_with_worker_script(&worker_bin, &descendant_pid_file);
-        let _ = wait_for_fake_pid_within(&descendant_pid_file, Duration::from_secs(5));
+        let descendant_pid = wait_for_fake_pid_within(&descendant_pid_file, Duration::from_secs(5));
         let hub = isolated_hub(shutdown_script(&root, "exit 0"), root.clone(), leader);
-        let workers = hub.owned_session_worker_pids();
-        let worker_pid = *workers.first().unwrap_or(&0);
-        let _ = hub.shutdown();
-        if worker_pid != 0 {
-            assert_process_exits(worker_pid);
+        assert_ne!(
+            process_pgid(descendant_pid).expect("round-2 descendant pgid"),
+            hub.hub_child_pid(),
+            "round-2 descendant must sit in its own process group"
+        );
+        let started = Instant::now();
+        while Instant::now() < started + Duration::from_secs(2)
+            && hub.owned_session_worker_pids().is_empty()
+        {
+            thread::sleep(Duration::from_millis(20));
         }
+        let workers = hub.owned_session_worker_pids();
+        assert!(
+            !workers.is_empty(),
+            "round-2 census must observe the live worker before absence assertions"
+        );
+        let worker_pid = workers[0];
+        let _ = hub.shutdown();
+        assert_process_exits(worker_pid);
+        assert_process_exits(descendant_pid);
         fs::remove_dir_all(root).expect("remove repeated-reap fixture");
     }
 

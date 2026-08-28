@@ -337,20 +337,9 @@ impl IsolatedHub {
             .collect()
     }
 
-    /// Live descendants of owned session workers, including the workers.
-    #[must_use]
-    pub fn owned_live_descendant_pids(&self) -> Vec<u32> {
-        let Ok(sample) = census_sample() else {
-            return Vec::new();
-        };
-        owned_set_from_sample(&sample, self.hub_pid)
-            .live_signal_targets(&sample)
-            .into_iter()
-            .collect()
-    }
-
     /// Force the next freeze path to treat quiescence as unconfirmed.
-    pub fn force_quiescence_unconfirmed(&mut self) {
+    #[cfg(test)]
+    pub(crate) fn force_quiescence_unconfirmed(&mut self) {
         self.seams.force_quiescence_unconfirmed = true;
     }
 
@@ -1486,22 +1475,6 @@ fn census_sample() -> Result<Vec<ProcessRow>, IsolatedHubError> {
 struct OwnedSet {
     workers: Vec<u32>,
     descendants: Vec<u32>,
-}
-
-impl OwnedSet {
-    fn live_signal_targets(&self, sample: &[ProcessRow]) -> HashSet<u32> {
-        let allowed: HashSet<u32> = self
-            .workers
-            .iter()
-            .chain(self.descendants.iter())
-            .copied()
-            .collect();
-        sample
-            .iter()
-            .filter(|row| allowed.contains(&row.pid) && !row.is_zombie())
-            .map(|row| row.pid)
-            .collect()
-    }
 }
 
 fn owned_set_from_sample(sample: &[ProcessRow], hub_pid: u32) -> OwnedSet {
