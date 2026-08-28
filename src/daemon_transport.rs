@@ -162,7 +162,7 @@ const ENTITY_RECONCILIATION_INTERVAL: Duration = Duration::from_millis(500);
 const WEBRTC_BIND_OBSERVE_TICK: Duration = Duration::from_millis(50);
 const WEBRTC_SLOT_READY_OBSERVE_BOUND: Duration = Duration::from_secs(20);
 const WEBRTC_SLOT_READY_OBSERVE_ATTEMPTS: usize = 8;
-const WEBRTC_SLOT_READY_BURST_TURNS: u8 = 8;
+const WEBRTC_SLOT_READY_BURST_TURNS: u8 = 16;
 static NEXT_SOCKET_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) type ControlSender = tokio_mpsc::Sender<ControlMessage>;
@@ -2694,6 +2694,7 @@ pub(crate) fn handle_control_message(
             state
                 .webrtc_slot_ready_burst
                 .insert(session_id.clone(), WEBRTC_SLOT_READY_BURST_TURNS);
+            state.webrtc_slot_ready_seen.insert(session_id.clone());
             state
                 .pending_runtime
                 .extend_webrtc_bind_observe(&session_id);
@@ -6226,7 +6227,27 @@ fn observe_starved_empty_webrtc_binds(daemon: &HubDaemon, state: &mut DaemonCont
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or(0);
-    observe_recent_webrtc_binds(daemon, state, now_seconds);
+    let sessions: Vec<String> = state
+        .pending_runtime
+        .webrtc_bind_observe_deadline
+        .keys()
+        .filter(|session_id| {
+            state
+                .pending_runtime
+                .webrtc_session_ready_to_observe(session_id)
+        })
+        .cloned()
+        .collect();
+    let Some(runtime) = daemon.runtime() else {
+        return;
+    };
+    for session_id in sessions {
+        if state.webrtc_slot_ready_seen.contains(&session_id) {
+            let _ = runtime.observe_session_lifecycle(&SessionId(session_id), now_seconds);
+        } else {
+            observe_reserved_session_until_slot_full(daemon, state, &session_id);
+        }
+    }
     state.last_webrtc_empty_pump = Some(now);
 }
 
@@ -6330,6 +6351,7 @@ pub(crate) struct DaemonControlState {
     observe_resume: Option<botster_core_daemon::ObserveLifecycleCursor>,
     last_webrtc_empty_pump: Option<Instant>,
     webrtc_slot_ready_burst: BTreeMap<String, u8>,
+    webrtc_slot_ready_seen: BTreeSet<String>,
 }
 
 impl Default for DaemonControlState {
@@ -6355,6 +6377,7 @@ impl Default for DaemonControlState {
             observe_resume: None,
             last_webrtc_empty_pump: None,
             webrtc_slot_ready_burst: BTreeMap::new(),
+            webrtc_slot_ready_seen: BTreeSet::new(),
         }
     }
 }
@@ -9302,6 +9325,7 @@ mod tests {
         assert!(
             slot_ready.contains("note_webrtc_slot_ready")
                 && slot_ready.contains("webrtc_slot_ready_burst")
+                && slot_ready.contains("webrtc_slot_ready_seen")
                 && slot_ready.contains("mark_pump")
                 && !slot_ready.contains("observe_reserved_session_until_slot_full"),
             "SlotReady is a doorbell: coalesce, grant a bounded persist burst, and mark Pump; do not observe in the control arm"
@@ -9354,7 +9378,7 @@ mod tests {
             "coalesced SlotReady persist may take several empty ticks after a flush"
         );
         assert_eq!(
-            WEBRTC_SLOT_READY_BURST_TURNS, 8,
+            WEBRTC_SLOT_READY_BURST_TURNS, 16,
             "a SlotReady doorbell may persist for a bounded number of owner turns, not forever"
         );
         let prune = production
@@ -9395,8 +9419,9 @@ mod tests {
         assert!(
             starved.contains("WEBRTC_BIND_OBSERVE_TICK")
                 && starved.contains("last_webrtc_empty_pump")
-                && starved.contains("observe_recent_webrtc_binds"),
-            "starved empty binds observe at most once per bind-observe tick, and not in Status or ListSessions"
+                && starved.contains("webrtc_slot_ready_seen")
+                && starved.contains("observe_reserved_session_until_slot_full"),
+            "starved empty binds poll eight ticks before the first SlotReady and one tick after, at most once per bind-observe tick"
         );
         let occupied_filter = production
             .split("fn take_unoccupied_webrtc_slot_ready")
