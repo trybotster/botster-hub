@@ -2668,6 +2668,7 @@ pub(crate) fn handle_control_message(
                     state
                         .pending_runtime
                         .extend_webrtc_bind_observe(&session_id);
+                    note_webrtc_session_pumped(state, &session_id, Instant::now());
                     state.background.mark_pump();
                     let _ = (reservation, label);
                     reply_reserved_bind(daemon, reply_tx, Ok(()));
@@ -9346,13 +9347,15 @@ mod tests {
             .next()
             .unwrap_or(bind);
         assert!(
-            !bind.contains("note_webrtc_slot_ready"),
-            "reserved bind does not start SlotReady persist; persist starts after mux flush"
+            !bind.contains("note_webrtc_slot_ready")
+                && bind.contains("note_webrtc_session_pumped")
+                && bind.contains("observe_session_lifecycle"),
+            "reserved bind observes once and cools the session; SlotReady persist starts after mux flush"
         );
         assert_eq!(
             WEBRTC_SLOT_READY_OBSERVE_BOUND,
             Duration::from_secs(60),
-            "empty live bind observe deadlines outlive the 20s IsolatedHub attach wait"
+            "empty live bind observe deadlines match the IsolatedHub attach wait"
         );
 
         let prune = production
