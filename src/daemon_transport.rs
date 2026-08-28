@@ -6195,7 +6195,18 @@ fn take_unoccupied_webrtc_slot_ready(state: &mut DaemonControlState) -> Vec<Stri
 fn observe_coalesced_webrtc_slot_ready(daemon: &HubDaemon, state: &mut DaemonControlState) -> bool {
     let now = Instant::now();
     let sessions = take_unoccupied_webrtc_slot_ready(state);
-    let persisted = !sessions.is_empty();
+    if sessions.is_empty() {
+        return false;
+    }
+    let cooled = state
+        .last_webrtc_empty_pump
+        .is_none_or(|last| now.saturating_duration_since(last) >= WEBRTC_BIND_OBSERVE_TICK);
+    if !cooled {
+        for session_id in &sessions {
+            state.pending_runtime.note_webrtc_slot_ready(session_id);
+        }
+        return true;
+    }
     for session_id in sessions {
         state
             .pending_runtime
@@ -6213,11 +6224,11 @@ fn observe_coalesced_webrtc_slot_ready(daemon: &HubDaemon, state: &mut DaemonCon
             .pending_runtime
             .webrtc_session_ready_to_observe(&session_id)
         {
-            state.last_webrtc_empty_pump = Some(now);
             state.pending_runtime.note_webrtc_slot_ready(&session_id);
         }
+        state.last_webrtc_empty_pump = Some(now);
     }
-    persisted
+    true
 }
 
 fn observe_starved_empty_webrtc_binds(daemon: &HubDaemon, state: &mut DaemonControlState) {
@@ -9399,8 +9410,9 @@ mod tests {
         assert!(
             coalesced.contains("webrtc_slot_ready_persist_bursts")
                 && coalesced.contains("webrtc_session_slot_occupied")
-                && coalesced.contains("note_webrtc_slot_ready"),
-            "empty persist re-notes until a slot fills; occupied persist counts toward the burst limit"
+                && coalesced.contains("note_webrtc_slot_ready")
+                && coalesced.contains("WEBRTC_BIND_OBSERVE_TICK"),
+            "empty persist re-notes until a slot fills, at most one persist burst per bind-observe tick"
         );
         let starved = production
             .split("fn observe_starved_empty_webrtc_binds")
