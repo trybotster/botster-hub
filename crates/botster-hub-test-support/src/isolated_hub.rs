@@ -323,20 +323,24 @@ fn remove_data_dir_path(data_dir: &Path) -> Result<(), IsolatedHubError> {
 
 impl Drop for IsolatedHub {
     fn drop(&mut self) {
-        self.reap_owned_session_workers();
-        if !thread::panicking() && self.shutdown_inner().is_ok() {
+        if thread::panicking() {
+            if let Some(child) = self.child.as_mut() {
+                let _ = cleanup_child(child);
+            }
+            self.child = None;
             self.reap_owned_session_workers();
             return;
         }
-        let mut child_cleaned = true;
+        if self.shutdown_inner().is_ok() {
+            self.reap_owned_session_workers();
+            return;
+        }
         if let Some(child) = self.child.as_mut() {
-            child_cleaned = cleanup_child(child).is_ok();
+            let _ = cleanup_child(child);
         }
         self.child = None;
         self.reap_owned_session_workers();
-        if child_cleaned && !thread::panicking() {
-            let _ = self.remove_data_dir();
-        }
+        let _ = self.remove_data_dir();
     }
 }
 
