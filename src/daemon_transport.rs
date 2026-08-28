@@ -6208,16 +6208,7 @@ fn observe_coalesced_webrtc_slot_ready(daemon: &HubDaemon, state: &mut DaemonCon
             continue;
         }
         persisted = true;
-        state
-            .pending_runtime
-            .extend_webrtc_bind_observe(&session_id);
         observe_one_webrtc_bind(daemon, &session_id);
-        if state
-            .pending_runtime
-            .webrtc_session_ready_to_observe(&session_id)
-        {
-            state.pending_runtime.note_webrtc_slot_ready(&session_id);
-        }
         note_webrtc_session_pumped(state, &session_id, now);
     }
     persisted
@@ -9376,10 +9367,10 @@ mod tests {
         );
         assert!(
             coalesced.contains("observe_one_webrtc_bind")
-                && coalesced.contains("note_webrtc_slot_ready")
                 && coalesced.contains("webrtc_session_pump_cooled")
+                && !coalesced.contains("extend_webrtc_bind_observe")
                 && !coalesced.contains("observe_reserved_session_until_slot_full"),
-            "SlotReady persist is one Core tick after flush, per session, never an eight-tick empty burst"
+            "SlotReady persist is one Core tick after flush; it does not re-arm the doorbell or extend the bind deadline"
         );
         let starved = production
             .split("fn observe_starved_empty_webrtc_binds")
