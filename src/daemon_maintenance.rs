@@ -1312,6 +1312,25 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
                     event_flight(&delivery, Some(scope_id), request_id.0),
                 );
             }
+            PluginAdmissionResult::Backpressured { .. } => {
+                let _ = runtime.admit_causal_op(crate::package_event_router::CausalOp::Release {
+                    scope_id,
+                    identity: crate::package_event_router::LeaseIdentity::EventInFlight {
+                        request_id: request_id.0.clone(),
+                    },
+                });
+                match runtime.package_event_router().requeue_delivery(delivery) {
+                    Ok(()) => {
+                        state.scheduler.try_wake();
+                    }
+                    Err((delivery, _)) => {
+                        let mut flight = event_flight(&delivery, None, request_id.0);
+                        if !retire_event_holder(runtime, &mut flight) {
+                            queue_event_retirement(state, flight);
+                        }
+                    }
+                }
+            }
             _ => {
                 let mut flight = event_flight(&delivery, Some(scope_id), request_id.0);
                 if !retire_event_holder(runtime, &mut flight) {
