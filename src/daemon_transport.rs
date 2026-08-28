@@ -161,6 +161,7 @@ pub(crate) const ENTITY_SUBSCRIPTION_QUEUE_CAPACITY: usize = 64;
 const ENTITY_RECONCILIATION_INTERVAL: Duration = Duration::from_millis(500);
 const WEBRTC_BIND_OBSERVE_TICK: Duration = Duration::from_millis(50);
 const WEBRTC_SLOT_READY_OBSERVE_BOUND: Duration = Duration::from_secs(60);
+const WEBRTC_SLOT_READY_OBSERVE_ATTEMPTS: usize = 8;
 static NEXT_SOCKET_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) type ControlSender = tokio_mpsc::Sender<ControlMessage>;
@@ -6208,7 +6209,7 @@ fn observe_coalesced_webrtc_slot_ready(daemon: &HubDaemon, state: &mut DaemonCon
             continue;
         }
         persisted = true;
-        observe_one_webrtc_bind(daemon, &session_id);
+        observe_reserved_session_until_slot_full(daemon, state, &session_id);
         note_webrtc_session_pumped(state, &session_id, now);
     }
     persisted
@@ -6225,7 +6226,11 @@ fn observe_starved_empty_webrtc_binds(daemon: &HubDaemon, state: &mut DaemonCont
     observe_recent_webrtc_binds(daemon, state, now_seconds);
 }
 
-fn observe_one_webrtc_bind(daemon: &HubDaemon, session_id: &str) {
+fn observe_reserved_session_until_slot_full(
+    daemon: &HubDaemon,
+    state: &DaemonControlState,
+    session_id: &str,
+) {
     let Some(runtime) = daemon.runtime() else {
         return;
     };
@@ -6233,7 +6238,15 @@ fn observe_one_webrtc_bind(daemon: &HubDaemon, session_id: &str) {
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or(0);
-    let _ = runtime.observe_session_lifecycle(&SessionId(session_id.to_string()), now);
+    for _ in 0..WEBRTC_SLOT_READY_OBSERVE_ATTEMPTS {
+        if state
+            .pending_runtime
+            .webrtc_session_slot_occupied(session_id)
+        {
+            return;
+        }
+        let _ = runtime.observe_session_lifecycle(&SessionId(session_id.to_string()), now);
+    }
 }
 
 fn observe_recent_webrtc_binds(
@@ -9288,7 +9301,7 @@ mod tests {
             slot_ready.contains("note_webrtc_slot_ready")
                 && slot_ready.contains("mark_pump")
                 && !slot_ready.contains("observe_session_lifecycle")
-                && !slot_ready.contains("observe_one_webrtc_bind"),
+                && !slot_ready.contains("observe_reserved_session_until_slot_full"),
             "SlotReady is a doorbell: coalesce and mark Pump, do not observe in the control arm"
         );
         for request in ["DaemonRequest::Status", "DaemonRequest::ListSessions"] {
@@ -9366,18 +9379,21 @@ mod tests {
             "coalesced drain observes only empty slots"
         );
         assert!(
-            coalesced.contains("observe_one_webrtc_bind")
+            coalesced.contains("observe_reserved_session_until_slot_full")
                 && coalesced.contains("webrtc_session_pump_cooled")
-                && !coalesced.contains("extend_webrtc_bind_observe")
-                && !coalesced.contains("observe_reserved_session_until_slot_full"),
-            "SlotReady persist is one Core tick after flush; it does not re-arm the doorbell or extend the bind deadline"
+                && !coalesced.contains("extend_webrtc_bind_observe"),
+            "SlotReady persist drains up to eight empty ticks after a flush and does not re-arm the doorbell"
+        );
+        assert_eq!(
+            WEBRTC_SLOT_READY_OBSERVE_ATTEMPTS, 8,
+            "coalesced SlotReady persist may take several empty ticks after a flush"
         );
         let starved = production
             .split("fn observe_starved_empty_webrtc_binds")
             .nth(1)
             .expect("starved empty-bind drain");
         let starved = starved
-            .split("fn observe_one_webrtc_bind")
+            .split("fn observe_reserved_session_until_slot_full")
             .next()
             .unwrap_or(starved);
         assert!(
