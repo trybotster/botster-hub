@@ -2662,6 +2662,11 @@ pub(crate) fn handle_control_message(
                         live_generation.0,
                     );
                     let _ = runtime.observe_session_lifecycle(&SessionId(session_id.clone()), now);
+                    state.pending_runtime.note_webrtc_slot_ready(&session_id);
+                    state
+                        .webrtc_slot_ready_burst
+                        .insert(session_id.clone(), WEBRTC_SLOT_READY_BURST_TURNS);
+                    state.webrtc_slot_ready_seen.insert(session_id.clone());
                     state
                         .pending_runtime
                         .extend_webrtc_bind_observe(&session_id);
@@ -9370,8 +9375,10 @@ mod tests {
             .next()
             .unwrap_or(bind);
         assert!(
-            !bind.contains("note_webrtc_slot_ready"),
-            "reserved bind does not start SlotReady persist; persist starts after mux flush"
+            bind.contains("note_webrtc_slot_ready")
+                && bind.contains("WEBRTC_SLOT_READY_BURST_TURNS")
+                && !bind.contains("observe_reserved_session_until_slot_full"),
+            "reserved bind notes a bounded SlotReady burst so persist can start; bind arm does not 8-tick"
         );
         assert_eq!(
             WEBRTC_SLOT_READY_OBSERVE_ATTEMPTS, 8,
