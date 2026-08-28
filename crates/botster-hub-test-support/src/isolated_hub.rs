@@ -280,6 +280,7 @@ impl IsolatedHub {
             .map_err(|source| IsolatedHubError::Wait { source })?;
         if daemon_output.status.success() {
             if shutdown_succeeded {
+                reap_session_workers_for_data_dir(&self.data_dir);
                 self.remove_data_dir()
             } else {
                 Err(IsolatedHubError::ShutdownFailed {
@@ -587,9 +588,14 @@ fn session_worker_pids_for_data_dir(data_dir: &Path) -> Vec<u32> {
             continue;
         }
         let args: Vec<&str> = parts.collect();
+        let unique = data_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
         if args.iter().any(|arg| *arg == dir.as_ref())
             || args.iter().any(|arg| data_dir_arg_matches(arg, data_dir))
             || args.iter().any(|arg| arg.contains(dir.as_ref()))
+            || (!unique.is_empty() && args.iter().any(|arg| arg.contains(unique)))
         {
             pids.push(pid);
         }
