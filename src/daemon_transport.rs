@@ -5836,6 +5836,26 @@ impl PendingRuntimeState {
         })
     }
 
+    fn webrtc_session_would_block_to_observe(&self, session_id: &str) -> bool {
+        self.webrtc_admissions.values().any(|admission| {
+            matches!(
+                admission,
+                WebrtcTerminalAdmission::Admitted { mux, .. }
+                    if mux.session_has_would_block_live_bound_slot(session_id)
+            )
+        })
+    }
+
+    fn webrtc_session_high_buffered_to_observe(&self, session_id: &str) -> bool {
+        self.webrtc_admissions.values().any(|admission| {
+            matches!(
+                admission,
+                WebrtcTerminalAdmission::Admitted { mux, .. }
+                    if mux.session_has_high_buffered_live_bound_slot(session_id)
+            )
+        })
+    }
+
     fn store_webrtc_reservation(
         &mut self,
         key: (String, String, String, u64),
@@ -6292,7 +6312,23 @@ fn observe_pressured_webrtc_binds(daemon: &HubDaemon, state: &mut DaemonControlS
         .cloned()
         .collect();
     for session_id in sessions {
-        for _ in 0..WEBRTC_PRESSURED_OBSERVE_BURST {
+        // Full with no buffered bytes is a HISTORY page waiting for mux flush:
+        // one Core tick, then SlotReady persist takes the next page. Bursting
+        // Full here burns WRITE_ATTEMPT_BUDGET before Attached. WouldBlock or
+        // this handle at AGGREGATE_BUFFERED_HIGH is a stalled flush: burst so
+        // Core can hard-stop without starving a live sibling.
+        let burst = if state
+            .pending_runtime
+            .webrtc_session_would_block_to_observe(&session_id)
+            || state
+                .pending_runtime
+                .webrtc_session_high_buffered_to_observe(&session_id)
+        {
+            WEBRTC_PRESSURED_OBSERVE_BURST
+        } else {
+            1
+        };
+        for _ in 0..burst {
             if !state
                 .pending_runtime
                 .webrtc_session_pressured_to_observe(&session_id)
@@ -9489,8 +9525,12 @@ mod tests {
         assert!(
             pressured.contains("WEBRTC_PRESSURED_OBSERVE_BURST")
                 && pressured.contains("webrtc_session_pressured_to_observe")
-                && !pressured.contains("webrtc_session_ready_to_observe"),
-            "pressured binds burst Core ticks only while Full or WouldBlock"
+                && pressured.contains("webrtc_session_would_block_to_observe")
+                && pressured.contains("webrtc_session_high_buffered_to_observe")
+                && pressured.contains("AGGREGATE_BUFFERED_HIGH")
+                && !pressured.contains("webrtc_session_ready_to_observe")
+                && !pressured.contains("from_secs(5)"),
+            "pressured binds burst only on WouldBlock or high buffered; young Full HISTORY is one tick"
         );
         let recent = production
             .split("fn observe_recent_webrtc_binds")
