@@ -580,23 +580,58 @@ pub(crate) fn worktree_session_worker_ancestor(pid: u32) -> Option<u32> {
 }
 
 pub(crate) fn worker_pid_matches_worktree_session_worker(pid: u32) -> bool {
-    let output = Command::new("ps")
-        .arg("-p")
-        .arg(pid.to_string())
-        .arg("-o")
-        .arg("command=")
-        .output();
-    let Ok(output) = output else {
-        return false;
-    };
-    let command = String::from_utf8_lossy(&output.stdout);
+    let command = linux_proc_worker_command(pid).unwrap_or_else(|| {
+        let output = Command::new("ps")
+            .arg("-p")
+            .arg(pid.to_string())
+            .arg("-o")
+            .arg("command=")
+            .output();
+        output
+            .ok()
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .unwrap_or_default()
+    });
     let argv0 = command.split_whitespace().next().unwrap_or("");
-    Path::new(argv0).file_name().and_then(|name| name.to_str()) == Some("botster-session-worker")
+    argv0_looks_like_session_worker(argv0)
         && worker_executable_from_this_worktree(&SessionWorkerProcessIdentity {
             pid,
-            command: command.trim().to_string(),
+            command,
             shell_descendant_pids: Vec::new(),
         })
+}
+
+fn argv0_looks_like_session_worker(argv0: &str) -> bool {
+    Path::new(argv0)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name == "botster-session-worker" || name.starts_with("botster-session-worker")
+        })
+}
+
+fn linux_proc_worker_command(pid: u32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let bytes = fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+        let from_cmdline = bytes
+            .split(|byte| *byte == 0)
+            .filter(|chunk| !chunk.is_empty())
+            .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !from_cmdline.is_empty() {
+            return Some(from_cmdline);
+        }
+        return fs::read_link(format!("/proc/{pid}/exe"))
+            .ok()
+            .map(|exe| exe.to_string_lossy().into_owned());
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
 }
 
 pub(crate) fn daemon_socket_path(data_dir: &Path) -> PathBuf {
