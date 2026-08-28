@@ -6208,7 +6208,7 @@ fn observe_coalesced_webrtc_slot_ready(daemon: &HubDaemon, state: &mut DaemonCon
             continue;
         }
         persisted = true;
-        observe_one_webrtc_bind(daemon, state, &session_id);
+        observe_one_webrtc_bind(daemon, &session_id);
         note_webrtc_session_pumped(state, &session_id, now);
     }
     persisted
@@ -6225,7 +6225,7 @@ fn observe_starved_empty_webrtc_binds(daemon: &HubDaemon, state: &mut DaemonCont
     observe_recent_webrtc_binds(daemon, state, now_seconds);
 }
 
-fn observe_one_webrtc_bind(daemon: &HubDaemon, state: &DaemonControlState, session_id: &str) {
+fn observe_one_webrtc_bind(daemon: &HubDaemon, session_id: &str) {
     let Some(runtime) = daemon.runtime() else {
         return;
     };
@@ -6233,15 +6233,7 @@ fn observe_one_webrtc_bind(daemon: &HubDaemon, state: &DaemonControlState, sessi
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or(0);
-    for _ in 0..2 {
-        if state
-            .pending_runtime
-            .webrtc_session_slot_occupied(session_id)
-        {
-            return;
-        }
-        let _ = runtime.observe_session_lifecycle(&SessionId(session_id.to_string()), now);
-    }
+    let _ = runtime.observe_session_lifecycle(&SessionId(session_id.to_string()), now);
 }
 
 fn observe_recent_webrtc_binds(
@@ -9378,7 +9370,7 @@ mod tests {
                 && coalesced.contains("webrtc_session_pump_cooled")
                 && !coalesced.contains("extend_webrtc_bind_observe")
                 && !coalesced.contains("observe_reserved_session_until_slot_full"),
-            "SlotReady persist is at most two empty Core ticks after flush; it does not re-arm the doorbell"
+            "SlotReady persist is one Core tick after flush; it does not re-arm the doorbell or extend the bind deadline"
         );
         let starved = production
             .split("fn observe_starved_empty_webrtc_binds")
