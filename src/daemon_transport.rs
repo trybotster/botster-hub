@@ -409,7 +409,7 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
                 }
             }
         };
-        let served_control = event.is_some();
+        let mut skip_young_full = false;
         if let Some(OwnerEvent::Control(message)) = event {
             match *message {
                 Some(ControlMessage::AcceptedConnection {
@@ -449,6 +449,14 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
                         .saturating_add(1);
                 }
                 Some(message) => {
+                    skip_young_full = matches!(
+                        &message,
+                        ControlMessage::Request { request, .. }
+                            if matches!(
+                                request.as_ref(),
+                                DaemonRequest::Status | DaemonRequest::ListSessions
+                            )
+                    );
                     if handle_control_message(
                         &mut daemon,
                         &mut control_state,
@@ -476,7 +484,7 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
         }
         observe_coalesced_webrtc_slot_ready(&daemon, &mut control_state);
         observe_starved_empty_webrtc_binds(&daemon, &mut control_state);
-        observe_pressured_webrtc_binds(&daemon, &mut control_state, served_control);
+        observe_pressured_webrtc_binds(&daemon, &mut control_state, skip_young_full);
         mark_due_reconciliation(&mut control_state, Instant::now());
         if control_state
             .background
@@ -6293,7 +6301,7 @@ fn observe_starved_empty_webrtc_binds(daemon: &HubDaemon, state: &mut DaemonCont
 fn observe_pressured_webrtc_binds(
     daemon: &HubDaemon,
     state: &mut DaemonControlState,
-    control_turn: bool,
+    skip_young_full: bool,
 ) {
     prune_webrtc_bind_observe_deadlines(state);
     let Some(runtime) = daemon.runtime() else {
@@ -6315,7 +6323,7 @@ fn observe_pressured_webrtc_binds(
                 || state
                     .pending_runtime
                     .webrtc_session_high_buffered_to_observe(session_id);
-            let idle_full = !control_turn
+            let idle_full = !skip_young_full
                 && state
                     .pending_runtime
                     .webrtc_session_pressured_to_observe(session_id);
@@ -6324,9 +6332,10 @@ fn observe_pressured_webrtc_binds(
         .cloned()
         .collect();
     for session_id in sessions {
-        // Control turns (Status/Drain) must not observe a Full page waiting
-        // for mux flush: that burns WRITE_ATTEMPT_BUDGET before Attached.
-        // Idle Reconcile still one-ticks Full so no-Status attach can drain.
+        // Status/ListSessions must not observe a Full page waiting for mux
+        // flush: IsolatedHub+web Status flood burns WRITE_ATTEMPT_BUDGET
+        // before Attached. Bind, SlotReady, Drain, and idle Reconcile still
+        // one-tick Full so HISTORY dump and no-Status attach can drain.
         // WouldBlock or this handle at AGGREGATE_BUFFERED_HIGH bursts so a
         // paused sibling can hard-stop.
         let burst = if state
@@ -9395,6 +9404,12 @@ mod tests {
             "generic control must not exact-observe in-flight WebRTC binds"
         );
         assert!(
+            control_arm.contains("skip_young_full")
+                && control_arm.contains("DaemonRequest::Status")
+                && control_arm.contains("DaemonRequest::ListSessions"),
+            "Status and ListSessions mark skip_young_full so pressured Full is not observed on those turns"
+        );
+        assert!(
             owner_loop.contains("observe_coalesced_webrtc_slot_ready(&daemon")
                 && owner_loop.contains("observe_starved_empty_webrtc_binds")
                 && owner_loop.contains("observe_pressured_webrtc_binds")
@@ -9539,12 +9554,12 @@ mod tests {
                 && pressured.contains("webrtc_session_pressured_to_observe")
                 && pressured.contains("webrtc_session_would_block_to_observe")
                 && pressured.contains("webrtc_session_high_buffered_to_observe")
-                && pressured.contains("control_turn")
+                && pressured.contains("skip_young_full")
                 && pressured.contains("idle_full")
                 && pressured.contains("AGGREGATE_BUFFERED_HIGH")
                 && !pressured.contains("webrtc_session_ready_to_observe")
                 && !pressured.contains("from_secs(5)"),
-            "pressured binds burst stalled flushes; idle Full is one tick; control turns skip young Full"
+            "pressured binds burst stalled flushes; Status/ListSessions skip young Full; other turns one-tick Full"
         );
         let recent = production
             .split("fn observe_recent_webrtc_binds")
