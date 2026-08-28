@@ -4,7 +4,8 @@
 
 - Target repository: `botster-hub` (`trybotster/botster-hub`, `/Users/jasonconigliari/Projects/botster-hub`).
 - Target id: `tgt_7e208a0c76a44980a83b63af976b1f22`.
-- Ticket: `ticket_1787894414_324976`. Run: `run_1787956038_959297`. Step: `botster_stack_plan`.
+- Ticket: `ticket_1787894414_324976`. Run: `run_1787956038_959297`. Step: `botster_stack_plan`, run step `run_step_1787957497_881798` (second Plan visit, after `changes_required`).
+- Base commit: `8137d16` (`origin/main` after the round-2 rebase). The first Plan visit used the stale base `a0c7141`.
 - The pipeline resolved the target id through `list_spawn_targets`. The plan does not infer the repository from the working directory.
 - Blocking dependency `ticket_1787894962_603665` (fanout owner-loop flake and IsolatedHub worker reaping) is `closed`. No open blocking dependency remains.
 
@@ -62,6 +63,33 @@ The remaining [[botster-planner-playbook]] must-load entries are the Project Pip
   - `crates/botster-hub-client/generated/daemon-protocol.ts` is the checked generated TypeScript artifact. `crates/botster-hub-client/src/lib.rs` holds `generated_typescript_protocol_matches_checked_artifact`, the byte-identity oracle.
   - `test.sh` runs `node packages/hub-test-support/scripts/sync-assets.mjs --check` and then `BOTSTER_ENV=test cargo test --workspace "$@"`.
   - `.github/workflows/ci.yml` pins Rust `1.97.0` and runs `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, and `./test.sh --locked`.
+
+## Refreshed Official Baseline (Plan Review Round 2)
+
+Plan Review round 1 returned `changes_required` with a high finding titled "The refreshed official baseline is not clean". The finding carried no details, so this section records an independent measurement.
+
+The real defect was base staleness. The run created its worktree at `a0c7141`, but `origin/main` had advanced fifteen commits to `8137d16`. Those fifteen commits are the merge of the closed blocking dependency `ticket_1787894962_603665`. The plan had never been verified against them.
+
+Correction applied: this branch is rebased onto `origin/main` at `8137d16`. The rebase was clean and carried only the two documentation commits.
+
+The fifteen new commits touch `crates/botster-hub-test-support/src/{isolated_hub.rs,lib.rs}`, `src/daemon_maintenance.rs`, `src/package_event_router.rs`, `src/runtime.rs`, `tests/hub_daemon_lifecycle/shutdown.rs`, and two plan documents. They touch none of the files this ticket moves code out of or into. Every line anchor cited in this plan survives the rebase unchanged: `src/daemon_transport.rs` is still 10,573 lines, `ShutdownSessionClassification` is still at line 4959, `DaemonTransportError` at 8314, `DaemonTransportResult` at 8493, and the `ShutdownSession` dispatch arm at 3893.
+
+Official gate results on the refreshed base `8137d16`, all run with `RUSTUP_TOOLCHAIN=1.97.0` and `CARGO_TARGET_DIR` unset:
+
+| Gate | Result |
+|---|---|
+| `rustc --version` | `rustc 1.97.0 (2d8144b78 2026-07-07)` |
+| `cargo fmt --all -- --check` | exit 0 |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0, zero warnings and zero errors |
+| `cargo test -p botster-hub-client --locked` | 81 passed, 0 failed; doc-tests 4 passed, 0 failed |
+| `git diff --exit-code -- crates/botster-hub-client/generated/daemon-protocol.ts` | no change |
+| `cargo build --locked -p botster-core-daemon --bin botster-session-worker` and `cargo build --locked --bin botster-hub` | both succeeded into the default worktree `target/` |
+| `./test.sh --locked` | exit 0; 1381 passed, 0 failed across all suites |
+| `git status --porcelain` | empty |
+
+Control arm: the same gate set ran green at the stale base `a0c7141` before the rebase (`./test.sh --locked` exit 0, zero failures). The baseline is therefore clean both before and after the refresh.
+
+This measurement does not reproduce a dirty refreshed baseline. Two explanations remain open and Plan Review should say which applies: the reviewer's shell may have run without the `RUSTUP_TOOLCHAIN=1.97.0` pin or with `CARGO_TARGET_DIR` inherited, or the lifecycle suite may have hit its known quiet-host sensitivity. If Plan Review holds the finding, it should attach the exact failing test name and command so the next round can attribute the failure instead of guessing.
 
 ## Scope
 
@@ -193,6 +221,7 @@ Downstream proof:
 Provenance:
 
 15. Record the exact verified commit SHA, `git status --porcelain` output showing a clean tracked worktree, and `rustc --version`. Renew review after any semantic rebase.
+16. Re-verify the base before Implement starts. Compare the worktree base against `origin/main`; if `origin/main` has advanced, rebase and rerun checks 10 through 13 before writing the move commit. The Refreshed Official Baseline section records the round-2 measurement at `8137d16`.
 
 ## Runtime-Teardown Class
 
@@ -224,3 +253,4 @@ The class applies, because the ticket moves daemon control-plane shutdown classi
 2. A note that a Hub move-only commit is reviewed with `git diff --color-moved=dimmed-zebra`, and that visibility widening to `pub(crate)` is move-forced rather than new API.
 3. A note that close-event suppression belongs to `subscription/closed_events.rs` and not to `daemon/shutdown.rs`, so migration steps 2 and 3 do not contend for the same functions.
 4. A note that the Hub client-contract oracle for a zero-DTO-change slice is `cargo test -p botster-hub-client` plus byte-identity of `crates/botster-hub-client/generated/daemon-protocol.ts`.
+5. A note that a pipeline worktree can start fifteen commits behind `origin/main`, so a Plan step must compare its base against `origin/main` and rebase before it records baseline gate evidence. This run recorded a stale-base plan in round 1 and had to redo the baseline in round 2.
