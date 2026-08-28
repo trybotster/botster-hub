@@ -263,11 +263,20 @@ fn cli_smoke_reports_missing_first_party_prerequisites() {
     assert!(failure.contains("missing_prerequisite=botster-web"));
 }
 
+struct ReapWorkersOnDrop(PathBuf);
+
+impl Drop for ReapWorkersOnDrop {
+    fn drop(&mut self) {
+        let _ = reap_session_workers_for_data_dir(&self.0);
+    }
+}
+
 #[test]
 fn external_hub_webrtc_live_output_preserves_exact_bytes() {
     let _guard = daemon_test_guard();
     let expected: &[u8] = &[0x00, 0x1b, 0xff, 0xc0];
     let hub = start_isolated_live_output_hub("webrtc-exact-bytes");
+    let _reap = ReapWorkersOnDrop(hub.data_dir().clone());
     let package_dir = unique_test_dir("webrtc-exact-bytes-web");
     write_botster_web_package(&package_dir);
     enable_supervised_package(hub.data_dir(), &package_dir);
@@ -439,6 +448,7 @@ fn external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup() {
     let _guard = daemon_test_guard();
     let expected: &[u8] = &[0x00, 0x1b, 0xff, 0xc0];
     let hub = start_isolated_live_output_hub("webrtc-sd-exit");
+    let _reap = ReapWorkersOnDrop(hub.data_dir().clone());
     let package_dir = unique_test_dir("webrtc-sd-exit-web");
     write_botster_web_package(&package_dir);
     enable_supervised_package(hub.data_dir(), &package_dir);

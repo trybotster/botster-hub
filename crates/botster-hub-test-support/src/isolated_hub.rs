@@ -313,6 +313,7 @@ fn remove_data_dir_path(data_dir: &Path) -> Result<(), IsolatedHubError> {
 
 impl Drop for IsolatedHub {
     fn drop(&mut self) {
+        reap_session_workers_for_data_dir(&self.data_dir);
         if !thread::panicking() && self.shutdown_inner().is_ok() {
             reap_session_workers_for_data_dir(&self.data_dir);
             return;

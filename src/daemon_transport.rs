@@ -457,7 +457,10 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
                 None => return Err(DaemonTransportError::ControlThreadStopped),
             }
         }
-        observe_coalesced_webrtc_slot_ready(&daemon, &mut control_state);
+        let persisted = observe_coalesced_webrtc_slot_ready(&daemon, &mut control_state);
+        if !persisted {
+            observe_starved_empty_webrtc_binds(&daemon, &mut control_state);
+        }
         mark_due_reconciliation(&mut control_state, Instant::now());
         if control_state
             .background
@@ -6175,8 +6178,11 @@ fn take_unoccupied_webrtc_slot_ready(state: &mut DaemonControlState) -> Vec<Stri
     ready
 }
 
-fn observe_coalesced_webrtc_slot_ready(daemon: &HubDaemon, state: &mut DaemonControlState) {
-    for session_id in take_unoccupied_webrtc_slot_ready(state) {
+fn observe_coalesced_webrtc_slot_ready(daemon: &HubDaemon, state: &mut DaemonControlState) -> bool {
+    let now = Instant::now();
+    let sessions = take_unoccupied_webrtc_slot_ready(state);
+    let persisted = !sessions.is_empty();
+    for session_id in sessions {
         state
             .pending_runtime
             .extend_webrtc_bind_observe(&session_id);
@@ -6185,9 +6191,30 @@ fn observe_coalesced_webrtc_slot_ready(daemon: &HubDaemon, state: &mut DaemonCon
             .pending_runtime
             .webrtc_session_ready_to_observe(&session_id)
         {
+            state.last_webrtc_empty_pump = Some(now);
             state.pending_runtime.note_webrtc_slot_ready(&session_id);
         }
     }
+    persisted
+}
+
+fn observe_starved_empty_webrtc_binds(daemon: &HubDaemon, state: &mut DaemonControlState) {
+    if !webrtc_recent_bind_needs_observe(state) {
+        return;
+    }
+    let now = Instant::now();
+    let cooled = state
+        .last_webrtc_empty_pump
+        .is_none_or(|last| now.saturating_duration_since(last) >= WEBRTC_BIND_OBSERVE_TICK);
+    if !cooled {
+        return;
+    }
+    let now_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    observe_recent_webrtc_binds(daemon, state, now_seconds);
+    state.last_webrtc_empty_pump = Some(now);
 }
 
 fn observe_reserved_session_until_slot_full(
@@ -9240,9 +9267,10 @@ mod tests {
         );
         assert!(
             owner_loop.contains("observe_coalesced_webrtc_slot_ready(&daemon")
+                && owner_loop.contains("observe_starved_empty_webrtc_binds")
                 && !owner_loop.contains("observe_due_webrtc_binds(&daemon")
                 && !owner_loop.contains("observe_flushed_webrtc_slots(&daemon"),
-            "every owner turn drains coalesced SlotReady after control, without extra due or mux-flush observe"
+            "every owner turn drains coalesced SlotReady after control; starved empty binds get one tick only when persist did not run"
         );
         assert!(
             production.contains("WEBRTC_BIND_OBSERVE_TICK"),
@@ -9333,6 +9361,20 @@ mod tests {
             coalesced.contains("take_unoccupied_webrtc_slot_ready")
                 || production.contains("fn take_unoccupied_webrtc_slot_ready"),
             "coalesced drain observes only empty slots"
+        );
+        let starved = production
+            .split("fn observe_starved_empty_webrtc_binds")
+            .nth(1)
+            .expect("starved empty-bind drain");
+        let starved = starved
+            .split("fn observe_reserved_session_until_slot_full")
+            .next()
+            .unwrap_or(starved);
+        assert!(
+            starved.contains("WEBRTC_BIND_OBSERVE_TICK")
+                && starved.contains("last_webrtc_empty_pump")
+                && starved.contains("observe_recent_webrtc_binds"),
+            "starved empty binds observe at most once per bind-observe tick, and not in Status or ListSessions"
         );
         let occupied_filter = production
             .split("fn take_unoccupied_webrtc_slot_ready")
