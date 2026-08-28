@@ -295,24 +295,28 @@ fn linux_proc_session_worker_identities()
         else {
             continue;
         };
-        let Ok(bytes) = fs::read(format!("/proc/{pid}/cmdline")) else {
-            continue;
-        };
-        if bytes.is_empty() {
-            continue;
-        }
-        let args: Vec<String> = bytes
+        let bytes = fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+        let mut args: Vec<String> = bytes
             .split(|byte| *byte == 0)
             .filter(|chunk| !chunk.is_empty())
             .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
             .collect();
+        if args.is_empty() {
+            if let Ok(exe) = fs::read_link(format!("/proc/{pid}/exe")) {
+                args.push(exe.to_string_lossy().into_owned());
+            } else {
+                continue;
+            }
+        }
         let Some(argv0) = args.first() else {
             continue;
         };
         let is_worker = Path::new(argv0)
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name == "botster-session-worker");
+            .is_some_and(|name| {
+                name == "botster-session-worker" || name.starts_with("botster-session-worker")
+            });
         if !is_worker {
             continue;
         }

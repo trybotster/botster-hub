@@ -7077,8 +7077,10 @@ done
                 && source.contains("-axww")
                 && source.contains("reap_orphaned_session_workers")
                 && source.contains("reap_named_session_workers")
-                && source.contains("/proc/{pid}/environ"),
-            "reap must match argv0 botster-session-worker and an exact data-dir argument from /proc cmdline, cwd, or environ, and reap orphaned workers, not pkill -f"
+                && source.contains("/proc/{pid}/environ")
+                && source.contains("/proc/{pid}/exe")
+                && source.contains("libc::SIGKILL"),
+            "reap must match argv0 or /proc exe botster-session-worker and an exact data-dir argument, SIGKILL leftovers, not pkill -f"
         );
     }
 

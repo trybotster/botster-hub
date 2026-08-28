@@ -161,8 +161,6 @@ pub(crate) const ENTITY_SUBSCRIPTION_QUEUE_CAPACITY: usize = 64;
 const ENTITY_RECONCILIATION_INTERVAL: Duration = Duration::from_millis(500);
 const WEBRTC_BIND_OBSERVE_TICK: Duration = Duration::from_millis(50);
 const WEBRTC_SLOT_READY_OBSERVE_BOUND: Duration = Duration::from_secs(60);
-const WEBRTC_SLOT_READY_OBSERVE_ATTEMPTS: usize = 8;
-const WEBRTC_SLOT_READY_PERSIST_BURST_LIMIT: usize = 8;
 static NEXT_SOCKET_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) type ControlSender = tokio_mpsc::Sender<ControlMessage>;
@@ -6163,14 +6161,6 @@ fn webrtc_slot_ready_has_empty_session(state: &DaemonControlState) -> bool {
         })
 }
 
-fn webrtc_slot_ready_persist_bursts(state: &DaemonControlState, session_id: &str) -> usize {
-    state
-        .webrtc_slot_ready_persist_bursts
-        .get(session_id)
-        .copied()
-        .unwrap_or(0)
-}
-
 fn webrtc_session_pump_cooled(state: &DaemonControlState, session_id: &str, now: Instant) -> bool {
     state
         .last_webrtc_empty_pump
@@ -6190,11 +6180,6 @@ fn take_unoccupied_webrtc_slot_ready(state: &mut DaemonControlState) -> Vec<Stri
         if !state
             .pending_runtime
             .webrtc_session_has_live_bound_route(&session_id)
-        {
-            continue;
-        }
-        if webrtc_slot_ready_persist_bursts(state, &session_id)
-            >= WEBRTC_SLOT_READY_PERSIST_BURST_LIMIT
         {
             continue;
         }
@@ -6226,20 +6211,8 @@ fn observe_coalesced_webrtc_slot_ready(daemon: &HubDaemon, state: &mut DaemonCon
         state
             .pending_runtime
             .extend_webrtc_bind_observe(&session_id);
-        if webrtc_slot_ready_persist_bursts(state, &session_id) == 0 {
-            observe_one_webrtc_bind(daemon, &session_id);
-        } else {
-            observe_reserved_session_until_slot_full(daemon, state, &session_id);
-        }
+        observe_one_webrtc_bind(daemon, &session_id);
         if state
-            .pending_runtime
-            .webrtc_session_slot_occupied(&session_id)
-        {
-            let bursts = webrtc_slot_ready_persist_bursts(state, &session_id).saturating_add(1);
-            state
-                .webrtc_slot_ready_persist_bursts
-                .insert(session_id.clone(), bursts);
-        } else if state
             .pending_runtime
             .webrtc_session_ready_to_observe(&session_id)
         {
@@ -6270,29 +6243,6 @@ fn observe_one_webrtc_bind(daemon: &HubDaemon, session_id: &str) {
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or(0);
     let _ = runtime.observe_session_lifecycle(&SessionId(session_id.to_string()), now);
-}
-
-fn observe_reserved_session_until_slot_full(
-    daemon: &HubDaemon,
-    state: &DaemonControlState,
-    session_id: &str,
-) {
-    let Some(runtime) = daemon.runtime() else {
-        return;
-    };
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or(0);
-    for _ in 0..WEBRTC_SLOT_READY_OBSERVE_ATTEMPTS {
-        if state
-            .pending_runtime
-            .webrtc_session_slot_occupied(session_id)
-        {
-            return;
-        }
-        let _ = runtime.observe_session_lifecycle(&SessionId(session_id.to_string()), now);
-    }
 }
 
 fn observe_recent_webrtc_binds(
@@ -6374,7 +6324,6 @@ pub(crate) struct DaemonControlState {
     pending_hub_update_reply: Option<ControlReplySender>,
     observe_resume: Option<botster_core_daemon::ObserveLifecycleCursor>,
     last_webrtc_empty_pump: BTreeMap<String, Instant>,
-    webrtc_slot_ready_persist_bursts: BTreeMap<String, usize>,
 }
 
 impl Default for DaemonControlState {
@@ -6399,7 +6348,6 @@ impl Default for DaemonControlState {
             pending_hub_update_reply: None,
             observe_resume: None,
             last_webrtc_empty_pump: BTreeMap::new(),
-            webrtc_slot_ready_persist_bursts: BTreeMap::new(),
         }
     }
 }
@@ -9348,7 +9296,8 @@ mod tests {
         assert!(
             slot_ready.contains("note_webrtc_slot_ready")
                 && slot_ready.contains("mark_pump")
-                && !slot_ready.contains("observe_reserved_session_until_slot_full"),
+                && !slot_ready.contains("observe_session_lifecycle")
+                && !slot_ready.contains("observe_one_webrtc_bind"),
             "SlotReady is a doorbell: coalesce and mark Pump, do not observe in the control arm"
         );
         for request in ["DaemonRequest::Status", "DaemonRequest::ListSessions"] {
@@ -9395,14 +9344,6 @@ mod tests {
             "reserved bind does not start SlotReady persist; persist starts after mux flush"
         );
         assert_eq!(
-            WEBRTC_SLOT_READY_OBSERVE_ATTEMPTS, 8,
-            "coalesced SlotReady persist may take several empty ticks after a flush"
-        );
-        assert_eq!(
-            WEBRTC_SLOT_READY_PERSIST_BURST_LIMIT, 8,
-            "eight occupied persist bursts cover attaching through Attached; empty persist still re-notes until a slot fills"
-        );
-        assert_eq!(
             WEBRTC_SLOT_READY_OBSERVE_BOUND,
             Duration::from_secs(60),
             "empty live bind observe deadlines outlive the 20s IsolatedHub attach wait"
@@ -9425,7 +9366,7 @@ mod tests {
             .nth(1)
             .expect("coalesced drain");
         let coalesced = coalesced
-            .split("fn observe_reserved_session_until_slot_full")
+            .split("fn observe_starved_empty_webrtc_binds")
             .next()
             .unwrap_or(coalesced);
         assert!(
@@ -9434,28 +9375,24 @@ mod tests {
             "coalesced drain observes only empty slots"
         );
         assert!(
-            coalesced.contains("webrtc_slot_ready_persist_bursts")
-                && coalesced.contains("webrtc_session_slot_occupied")
-                && coalesced.contains("note_webrtc_slot_ready")
-                && coalesced.contains("webrtc_session_pump_cooled"),
-            "empty persist re-notes until a slot fills; cooldown is per session so web Status cannot starve IsolatedHub binds"
-        );
-        assert!(
             coalesced.contains("observe_one_webrtc_bind")
-                && coalesced.contains("observe_reserved_session_until_slot_full"),
-            "first SlotReady persist is one Core tick; eight-tick persist starts only after a slot has been occupied"
+                && coalesced.contains("note_webrtc_slot_ready")
+                && coalesced.contains("webrtc_session_pump_cooled")
+                && !coalesced.contains("observe_reserved_session_until_slot_full"),
+            "SlotReady persist is one Core tick after flush, per session, never an eight-tick empty burst"
         );
         let starved = production
             .split("fn observe_starved_empty_webrtc_binds")
             .nth(1)
             .expect("starved empty-bind drain");
         let starved = starved
-            .split("fn observe_reserved_session_until_slot_full")
+            .split("fn observe_one_webrtc_bind")
             .next()
             .unwrap_or(starved);
         assert!(
             starved.contains("observe_recent_webrtc_binds")
-                && !starved.contains("observe_reserved_session_until_slot_full"),
+                && !starved.contains("observe_reserved_session_until_slot_full")
+                && !starved.contains("WEBRTC_SLOT_READY_OBSERVE_ATTEMPTS"),
             "starved empty binds observe one Core tick per bind-observe tick, never eight before first SlotReady"
         );
         let recent = production
@@ -9483,8 +9420,8 @@ mod tests {
             occupied_filter.contains("webrtc_session_slot_occupied")
                 && occupied_filter.contains("webrtc_session_has_live_bound_route")
                 && occupied_filter.contains("note_webrtc_slot_ready")
-                && occupied_filter.contains("WEBRTC_SLOT_READY_PERSIST_BURST_LIMIT"),
-            "a full live adapter slot keeps the coalesced session key until the persist-burst limit"
+                && !occupied_filter.contains("WEBRTC_SLOT_READY_PERSIST_BURST_LIMIT"),
+            "a full live adapter slot keeps the coalesced session key; closed routes drop it"
         );
         let due = production
             .split("fn mark_due_reconciliation")
