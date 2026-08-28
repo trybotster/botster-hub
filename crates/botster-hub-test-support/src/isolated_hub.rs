@@ -184,6 +184,7 @@ impl IsolatedHubBuilder {
 
         if let Err(error) = wait_for_ready(&endpoint, &mut child, self.ready_timeout) {
             cleanup_child(&mut child)?;
+            reap_session_workers_for_data_dir(&data_dir);
             remove_data_dir_path(&data_dir)?;
             return Err(error);
         }
@@ -278,9 +279,9 @@ impl IsolatedHub {
         let daemon_output = child
             .wait_with_output()
             .map_err(|source| IsolatedHubError::Wait { source })?;
+        reap_session_workers_for_data_dir(&self.data_dir);
         if daemon_output.status.success() {
             if shutdown_succeeded {
-                reap_session_workers_for_data_dir(&self.data_dir);
                 self.remove_data_dir()
             } else {
                 Err(IsolatedHubError::ShutdownFailed {
@@ -592,10 +593,12 @@ fn session_worker_pids_for_data_dir(data_dir: &Path) -> Vec<u32> {
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("");
+        let command = args.join(" ");
         if args.iter().any(|arg| *arg == dir.as_ref())
             || args.iter().any(|arg| data_dir_arg_matches(arg, data_dir))
             || args.iter().any(|arg| arg.contains(dir.as_ref()))
-            || (!unique.is_empty() && args.iter().any(|arg| arg.contains(unique)))
+            || (!unique.is_empty()
+                && (args.iter().any(|arg| arg.contains(unique)) || command.contains(unique)))
         {
             pids.push(pid);
         }
@@ -618,6 +621,38 @@ fn data_dir_arg_matches(arg: &str, data_dir: &Path) -> bool {
     }
 }
 
+fn descendant_pids(root: u32) -> Vec<u32> {
+    let Ok(output) = Command::new("ps").args(["-axo", "pid=,ppid="]).output() else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let mut edges: Vec<(u32, u32)> = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut parts = line.split_whitespace();
+        let Some(pid) = parts.next().and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(ppid) = parts.next().and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+        edges.push((pid, ppid));
+    }
+    let mut owned = vec![root];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &(pid, ppid) in &edges {
+            if owned.contains(&ppid) && !owned.contains(&pid) {
+                owned.push(pid);
+                changed = true;
+            }
+        }
+    }
+    owned
+}
+
 fn reap_session_workers_for_data_dir(data_dir: &Path) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -630,7 +665,13 @@ fn reap_session_workers_for_data_dir(data_dir: &Path) {
         } else {
             libc::SIGTERM
         };
-        for pid in pids {
+        let mut targets = pids;
+        for pid in targets.clone() {
+            targets.extend(descendant_pids(pid));
+        }
+        targets.sort_unstable();
+        targets.dedup();
+        for pid in targets {
             let raw = pid as libc::pid_t;
             if unsafe { libc::killpg(raw, signal) } != 0 {
                 let _ = unsafe { libc::kill(raw, signal) };
