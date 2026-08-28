@@ -70,7 +70,7 @@ Plan Review round 1 returned `changes_required` with a high finding titled "The 
 
 The real defect was base staleness. The run created its worktree at `a0c7141`, but `origin/main` had advanced fifteen commits to `8137d16`. Those fifteen commits are the merge of the closed blocking dependency `ticket_1787894962_603665`. The plan had never been verified against them.
 
-Correction applied: this branch is rebased onto `origin/main` at `8137d16`. The rebase was clean and carried only the two documentation commits.
+Correction applied: this branch is rebased onto `origin/main` at `8137d16`. The rebase was clean and carried the two documentation commits that existed at that moment, `c14bf70` and `f6db523`. Commit `14129c2` recorded this baseline section after the rebase, and round 3 adds `one more`. The branch therefore holds four documentation commits above `8137d16` and still holds zero code commits. The move-only code commit does not exist yet; the Implementer writes it.
 
 The fifteen new commits touch `crates/botster-hub-test-support/src/{isolated_hub.rs,lib.rs}`, `src/daemon_maintenance.rs`, `src/package_event_router.rs`, `src/runtime.rs`, `tests/hub_daemon_lifecycle/shutdown.rs`, and two plan documents. They touch none of the files this ticket moves code out of or into. Every line anchor cited in this plan survives the rebase unchanged: `src/daemon_transport.rs` is still 10,573 lines, `ShutdownSessionClassification` is still at line 4959, `DaemonTransportError` at 8314, `DaemonTransportResult` at 8493, and the `ShutdownSession` dispatch arm at 3893.
 
@@ -93,7 +93,7 @@ This measurement does not reproduce a dirty refreshed baseline. Two explanations
 
 ## Scope
 
-This ticket produces **one move-only commit** that compiles, plus a separate documentation commit for this plan.
+This ticket produces **one move-only code commit** that compiles. The plan itself lands in separate documentation commits, which are not part of the move-only commit and are excluded from every move-only proof.
 
 In scope:
 
@@ -158,16 +158,23 @@ Created:
 - `src/daemon/shutdown.rs`
 - `src/daemon/error.rs`
 
-Modified:
+Modified, with the exact reason each file changes:
 
-- `src/daemon_transport.rs` -- loses the three responsibilities and their tests; keeps transport, owner loop, control dispatch, and suppression.
-- `src/lib.rs` -- adds the `client_api_dto` module declaration and preserves the existing public re-export surface.
+- `src/daemon_transport.rs` -- loses the three responsibilities and their tests; keeps transport, owner loop, control dispatch, close-event suppression, and `PendingRuntimeState`.
+- `src/lib.rs` -- adds `pub mod client_api_dto;`, and repoints the existing `pub use daemon_transport::{...}` list at `src/lib.rs:132-153` so `DaemonTransportError` and `DaemonTransportResult` re-export from `crate::daemon::error`. The crate-root public surface is unchanged: `botster_hub::DaemonTransportError` still resolves to the same type.
 - `src/daemon.rs` -- adds the `error` and `shutdown` module declarations.
-- Call-site import lines only, in `src/daemon_attach_stream.rs`, `src/daemon_entity_subscriptions.rs`, `src/daemon_package_control.rs`, `src/local_runtime_process.rs`, `src/update.rs`, and `src/main.rs`.
-- `docs/plans/hub-decomposition-1-extract-client-dto-shutdown-and-daemon-support-modules.md` -- this plan, in its own commit.
+- `src/daemon_attach_stream.rs` -- one `use` line. This file is a **submodule of `daemon_transport`** (declared at `src/daemon_transport.rs:123`), so its `use super::{DaemonTransportError, DaemonTransportResult};` at line 22 must become a `crate::daemon::error` path.
+- `src/daemon_entity_subscriptions.rs` -- one `use` block. Also a `daemon_transport` submodule (declared at `src/daemon_transport.rs:142`); its `use super::{...}` list at line 25 splits so the two error names come from `crate::daemon::error`.
+- `src/daemon_package_control.rs` -- one `use` block. Also a `daemon_transport` submodule (declared at `src/daemon_transport.rs:134`); its `use super::{...}` list at line 14 splits for `DaemonTransportError`, `DaemonTransportResult`, and `PackageRollbackFailure`.
+- `src/daemon_event_subscriptions.rs` -- one `use` line. Its `use crate::daemon_transport::daemon_response_base;` at line 19 becomes `crate::client_api_dto::response::daemon_response_base`.
+- `docs/plans/hub-decomposition-1-extract-client-dto-shutdown-and-daemon-support-modules.md` -- this plan, in its own commits.
+
+Correction from round 2: `src/main.rs`, `src/update.rs`, and `src/local_runtime_process.rs` now move to the unchanged list. Round 2 wrongly listed them as needing import edits. They consume `botster_hub::DaemonTransportError` through the crate-root re-export, and that re-export is preserved, so they need zero changes. If any of the three does change, the move altered the public surface and the commit is wrong.
 
 Unchanged, and required to stay unchanged:
 
+- `src/main.rs`, `src/update.rs`, `src/local_runtime_process.rs` -- they consume the preserved crate-root re-export.
+- `src/daemon_event_subscriptions.rs` beyond its single `use` line, and every ownership registry listed in the late-message matrix.
 - `crates/botster-hub-client/generated/daemon-protocol.ts`
 - `crates/botster-hub-client/src/lib.rs` and `crates/botster-hub-client/src/typescript.rs`
 - `crates/botster-hub-test-support/**` and `crates/botster-ui-contract/**`
@@ -183,6 +190,8 @@ Unchanged, and required to stay unchanged:
 6. **Toolchain drift.** A pipeline shell can pin Rust below the CI pin, so a bare strict Clippy can pass on unfixed code. Mitigation: run every Rust gate with `RUSTUP_TOOLCHAIN=1.97.0` and record `rustc --version` from that shell.
 7. **Gate environment.** `CARGO_TARGET_DIR` must be unset for the official gate. The worktree path holds no `:` character, so no relocation is needed.
 8. **Suite host noise.** The lifecycle suite needs a quiet host. Mitigation: run `./test.sh --locked` on a quiet host and re-run a failing test in isolation before classifying it.
+9. **Source-scanning guard tests.** Four committed assertions read Hub source text and fail if a named item leaves the file they scan. `terminal_input_travels_as_a_json_control_request` requires `src/daemon_transport.rs` to contain `DaemonRequest::SendInput { session_id, data } =>` and `HubClientRequest::Input {`. `shutdown_suppresses_exact_route_generations_before_core_teardown` requires `src/daemon_transport.rs` to contain `fn shutdown_session_arm_installs_exact_suppression_before_core_request`. A third requires `src/daemon_attach_stream.rs` to contain `for_ready_then_history_attach()`. All four scanned items stay in place under this plan's scope, so the guards should stay green. The suppression guard is independent evidence for assumption 3: moving close-event suppression out of `daemon_transport.rs` would break a committed guard, which is a further reason to leave suppression to migration step 3. Mitigation: acceptance check 19 greps every `hub_source(` assertion before the move commit and confirms each scanned string still lives in the file it names.
+10. **Base staleness.** The pipeline worktree started fifteen commits behind `origin/main`, which invalidated the round-1 baseline claim. Mitigation: acceptance check 16 compares the base against `origin/main` and rebases before the move commit.
 
 ## Acceptance Checks And Tests
 
@@ -222,6 +231,10 @@ Provenance:
 
 15. Record the exact verified commit SHA, `git status --porcelain` output showing a clean tracked worktree, and `rustc --version`. Renew review after any semantic rebase.
 16. Re-verify the base before Implement starts. Compare the worktree base against `origin/main`; if `origin/main` has advanced, rebase and rerun checks 10 through 13 before writing the move commit. The Refreshed Official Baseline section records the round-2 measurement at `8137d16`.
+17. `git diff` shows that `src/daemon_attach_stream.rs`, `src/daemon_entity_subscriptions.rs`, and `src/daemon_event_subscriptions.rs` changed **only `use` lines**. Every other line in those three files is byte-identical, which proves no ownership-creating surface moved.
+18. Run the named production-path set directly, not only through the wrapper: `BOTSTER_ENV=test cargo test --locked --test hub_daemon_lifecycle_test -- shutdown_session_classifies_parked_exit_beyond_one_baseline_page external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable unix_shutdown_session_stuck_stopping_without_exit_evidence_stays_operator_error unix_shutdown_session_from_another_connection_classifies_attached_exit shutdown_session_exact_keys_preserve_replacement_owner_and_siblings attached_stopping_shutdown_session_suppresses_exact_generation process_exit_and_shutdown_session_do_not_emit_terminal_subscription_closed shutdown_suppresses_exact_route_generations_before_core_teardown`. All eight must pass with unmodified bodies. These drive a real `DaemonRequest::ShutdownSession` through a live daemon socket into the moved classifier, which is the production-path proof the runtime-teardown lens requires.
+19. `grep -rn "hub_source(" tests/` enumerates every source-scanning guard, and each scanned string still lives in the file that guard names. No guard is edited to accommodate the move.
+20. `git diff --exit-code` reports no change in `src/main.rs`, `src/update.rs`, and `src/local_runtime_process.rs`. A change in any of the three means the crate-root re-export surface moved, and the commit is wrong.
 
 ## Runtime-Teardown Class
 
@@ -242,8 +255,27 @@ The class applies, because the ticket moves daemon control-plane shutdown classi
 | WebRTC `Hello` terminal admission | `PendingRuntimeState.webrtc_admissions` in `src/daemon_transport.rs` | `grant_id` | Encrypted admission required before bind | `PeerClosed` occupancy uses the live attach route set | No |
 | `ShutdownSession` | Creates no durable ownership; it removes ownership | Exact `session_id` from the request | Typed `Absent` and `Err` arms stay distinct | Exact `(session_id, subscription_id, generation)` suppression before Core teardown | **Classification only.** Dispatch, suppression, and every registry above stay put |
 
-`ShutdownSession` is therefore the only row this ticket touches, and it touches the classification decision rather than any ownership-creating surface. No row in the table is created, tagged, rejected, or swept by moved code. None of `src/daemon_attach_stream.rs`, `src/daemon_entity_subscriptions.rs`, or `src/daemon_event_subscriptions.rs` appears in the affected-files list, and `PendingRuntimeState` stays in `daemon_transport.rs`. Proof: `shutdown_session_arm_installs_exact_suppression_before_core_request` and `close_event_suppression_matrix_matches_prior_predicate` stay in place and green, which is also the guard that suppression did not move by accident; `git diff --stat` must show zero changed lines in the three registry modules.
-4. **Production-path hard-stop proof.** The production path is unchanged: `DaemonRequest::ShutdownSession` at `src/daemon_transport.rs:3893` calls `classify_shutdown_session`, which after the move resolves to `crate::daemon::shutdown::classify_shutdown_session`. The production entry point therefore uses the moved code; this is not scaffold-only. Proof: the call site compiles against the new path, and `./test.sh --locked` exercises the daemon lifecycle suite.
+`ShutdownSession` is therefore the only row this ticket touches, and it touches the classification decision rather than any ownership-creating surface. No row in the table is created, tagged, rejected, or swept by moved code, and `PendingRuntimeState` stays in `daemon_transport.rs`.
+
+Round 2 stated this as "zero changed lines in the three registry modules", which contradicted the affected-files list that already expected import edits in two of them. The precise rule, which acceptance check 17 enforces, is: **`src/daemon_attach_stream.rs`, `src/daemon_entity_subscriptions.rs`, and `src/daemon_event_subscriptions.rs` may change only `use` lines.** Every other line in those three files must be byte-identical. Their registry types, owner-tag fields, insertion paths, rejection paths, and cleanup paths therefore cannot move, and no import edit can disguise a behavior change. The permitted edits are exactly the three named in Affected Surfaces And Files: one `use` line in `daemon_attach_stream.rs`, one `use` block in `daemon_entity_subscriptions.rs`, and one `use` line in `daemon_event_subscriptions.rs`.
+
+Proof: `shutdown_session_arm_installs_exact_suppression_before_core_request` and `close_event_suppression_matrix_matches_prior_predicate` stay in place and green, which is also the guard that suppression did not move by accident.
+4. **Production-path hard-stop proof.** The production path is unchanged: `DaemonRequest::ShutdownSession` at `src/daemon_transport.rs:3893` calls `classify_shutdown_session`, which after the move resolves to `crate::daemon::shutdown::classify_shutdown_session`. The production entry point therefore uses the moved code; this is not scaffold-only.
+
+Round 2 named only the full `./test.sh --locked` wrapper, which is not a production-path oracle. The named integration tests below each drive a real `DaemonRequest::ShutdownSession` through a live daemon socket into the moved classifier. Every one must stay green and unmodified, and together they cover all four classification arms:
+
+| Test | File | Classification arm it drives |
+|---|---|---|
+| `shutdown_session_classifies_parked_exit_beyond_one_baseline_page` | `tests/hub_daemon_lifecycle/sessions.rs:4213` | `Cleanup`, and specifically the exact-session query rather than baseline paging. This is the production oracle for [[host ShutdownSession classification must call the exact-session Core query]] |
+| `external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable` | `tests/hub_daemon_lifecycle/sessions.rs:3639` | `Active` with a Core error, plus the sibling-survival policy |
+| `unix_shutdown_session_stuck_stopping_without_exit_evidence_stays_operator_error` | `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs:2421` | `Active` and `Stopping` separation over Unix; proves a stuck session stays a typed operator error rather than a false cleanup |
+| `unix_shutdown_session_from_another_connection_classifies_attached_exit` | `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs:2265` | Classification requested by a connection that does not own the attach |
+| `shutdown_session_exact_keys_preserve_replacement_owner_and_siblings` | `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs:1900` | Ownership identity under a reused subscription id |
+| `attached_stopping_shutdown_session_suppresses_exact_generation` | `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs:2188` | Suppression ordering ahead of Core teardown |
+| `process_exit_and_shutdown_session_do_not_emit_terminal_subscription_closed` | `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs:1797` | Teardown and pre-READY failure keep separate lifecycle meanings |
+| `shutdown_suppresses_exact_route_generations_before_core_teardown` | `tests/hub_daemon_lifecycle/subscription_ownership_baseline.rs:727` | Live suppression proof, plus the source guard described under Risks |
+
+The harness helper `classify_shutdown_session_response` at `tests/hub_daemon_lifecycle/harness.rs:601` reads these responses and must not change. Acceptance check 18 runs this named set directly rather than relying on the wrapper alone.
 5. **Ownership identity.** Classification keys on the exact `session_id` string supplied by the request. No generation, subscription id, or peer id semantics move. Per [[host ShutdownSession classification must call the exact-session Core query]], the moved code must keep calling `observe_session_lifecycle` and must keep the typed `Absent` and `Err` arms distinct. Proof: `shutdown_unknown_session_error_while_active_is_already_exited_cleanup` and `shutdown_stopping_record_is_host_cleanup_not_active`.
 6. **Sibling and fail-closed policy.** Unchanged. One session's classification cannot affect a sibling, and no blast radius widens. Proof: the moved tests are pure-value tests over one record each.
 
