@@ -569,13 +569,85 @@ fn session_worker_pids_for_data_dir(data_dir: &Path, data_dir_arg: &Path) -> Vec
     if dir.is_empty() && arg_token.is_empty() {
         return Vec::new();
     }
-    let Ok(output) = Command::new("ps").args(["-axo", "pid=,command="]).output() else {
+    session_worker_argvs()
+        .into_iter()
+        .filter_map(|(pid, args)| {
+            let argv0 = args.first()?;
+            let is_worker = Path::new(argv0)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == "botster-session-worker");
+            if !is_worker {
+                return None;
+            }
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            if args.iter().any(|arg| *arg == dir.as_ref())
+                || (!arg_token.is_empty() && args.iter().any(|arg| *arg == arg_token.as_ref()))
+                || args.iter().any(|arg| {
+                    exact_data_dir_path(arg, data_dir) || exact_data_dir_path(arg, data_dir_arg)
+                })
+            {
+                Some(pid)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn session_worker_argvs() -> Vec<(u32, Vec<String>)> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(argvs) = linux_proc_session_worker_argvs() {
+            return argvs;
+        }
+    }
+    ps_axww_session_worker_argvs()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_proc_session_worker_argvs() -> Option<Vec<(u32, Vec<String>)>> {
+    let entries = fs::read_dir("/proc").ok()?;
+    let mut argvs = Vec::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(bytes) = fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        if bytes.is_empty() {
+            continue;
+        }
+        let args: Vec<String> = bytes
+            .split(|byte| *byte == 0)
+            .filter(|chunk| !chunk.is_empty())
+            .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+            .collect();
+        if args.is_empty() {
+            continue;
+        }
+        argvs.push((pid, args));
+    }
+    Some(argvs)
+}
+
+fn ps_axww_session_worker_argvs() -> Vec<(u32, Vec<String>)> {
+    let Ok(output) = Command::new("ps")
+        .env("COLUMNS", "65535")
+        .args(["-axww", "-o", "pid=,command="])
+        .output()
+    else {
         return Vec::new();
     };
     if !output.status.success() {
         return Vec::new();
     }
-    let mut pids = Vec::new();
+    let mut argvs = Vec::new();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         let line = line.trim();
         let mut parts = line.split_whitespace();
@@ -585,27 +657,13 @@ fn session_worker_pids_for_data_dir(data_dir: &Path, data_dir_arg: &Path) -> Vec
         let Ok(pid) = pid_token.parse::<u32>() else {
             continue;
         };
-        let Some(argv0) = parts.next() else {
-            continue;
-        };
-        let is_worker = Path::new(argv0)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name == "botster-session-worker");
-        if !is_worker {
+        let args: Vec<String> = parts.map(str::to_string).collect();
+        if args.is_empty() {
             continue;
         }
-        let args: Vec<&str> = parts.collect();
-        if args.iter().any(|arg| *arg == dir.as_ref())
-            || (!arg_token.is_empty() && args.iter().any(|arg| *arg == arg_token.as_ref()))
-            || args.iter().any(|arg| {
-                exact_data_dir_path(arg, data_dir) || exact_data_dir_path(arg, data_dir_arg)
-            })
-        {
-            pids.push(pid);
-        }
+        argvs.push((pid, args));
     }
-    pids
+    argvs
 }
 
 fn exact_data_dir_path(arg: &str, data_dir: &Path) -> bool {
