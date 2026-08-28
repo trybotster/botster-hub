@@ -309,6 +309,15 @@ Provenance:
     RUSTUP_TOOLCHAIN=1.97.0 cargo test --locked --test public_path_guard
     ```
 
+    **Verified during Plan, both arms.** Green arm: the file above compiles and passes at the base `8137d16` under `RUSTUP_TOOLCHAIN=1.97.0`, so all five paths resolve today. Red arm: rewriting the third alias to `botster_hub::PackageRollbackFailure` fails compilation with
+
+    ```
+    error[E0425]: cannot find type `PackageRollbackFailure` in crate `botster_hub`
+     --> tests/public_path_guard.rs:5:38
+    ```
+
+    That ablation earns the guard twice over. It proves the check can fail rather than passing vacuously, and it is compiler evidence — not a grep inference — that `botster_hub::daemon_transport::PackageRollbackFailure` really is that type's only public path. The scratch file was removed and the worktree left clean; the Implementer commits the real one.
+
     **Commit it before the move, in its own commit.** The test must be green at the base `8137d16` first, which establishes the control: the paths resolve today. The move-only commit must then leave it green with the file unmodified. A guard written after the move would only restate whatever the move produced and would prove nothing. Modifying this file to accommodate the move is a failure, exactly as check 19 forbids for the `hub_source()` guards.
 
 ## Runtime-Teardown Class
