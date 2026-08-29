@@ -161,10 +161,8 @@ use daemon_package_control::{
     refresh_local_packages, reload_package, remove_package,
 };
 
-#[path = "daemon_entity_subscriptions.rs"]
-mod daemon_entity_subscriptions;
-pub(crate) use daemon_entity_subscriptions::{EntityFrameSender, EntitySubscriptionState};
-use daemon_entity_subscriptions::{
+pub(crate) use crate::subscription::entity::{EntityFrameSender, EntitySubscriptionState};
+use crate::subscription::entity::{
     drive_entity_subscriptions, drive_package_entity_fanout, drive_package_entity_resync,
     entity_subscription_error, register_entity_subscription, seed_lifecycle_reconciliation,
     session_subscribers_need_delivery,
@@ -174,7 +172,7 @@ const MESSAGE_CONTENT_TYPE: &str = "application/vnd.botster.coordination.message
 const DAEMON_CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const DAEMON_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const DAEMON_INCOMPLETE_FRAME_TIMEOUT: Duration = Duration::from_secs(2);
-const DAEMON_MAX_FRAME_BYTES: usize = 1024 * 1024;
+pub(crate) const DAEMON_MAX_FRAME_BYTES: usize = 1024 * 1024;
 const DAEMON_MAX_CONNECTIONS: usize = 64;
 const DAEMON_MAX_REJECTION_TASKS: usize = 8;
 const DAEMON_CONTROL_QUEUE_CAPACITY: usize = 256;
@@ -5526,7 +5524,7 @@ pub(crate) struct DaemonControlState {
     background: BackgroundClassScheduler,
     pump: PumpScheduler,
     next_reconciliation: Instant,
-    released_entity_generations: u64,
+    pub(crate) released_entity_generations: u64,
     pub(crate) released_attach_generations: u64,
     pub(crate) live_attach_routes: BTreeSet<(String, String)>,
     pending_hub_update_reply: Option<ControlReplySender>,
@@ -5941,7 +5939,7 @@ impl AttachedSubscriptionChange {
     }
 }
 
-fn session_type_entity_snapshot(
+pub(crate) fn session_type_entity_snapshot(
     daemon: &mut HubDaemon,
 ) -> DaemonTransportResult<(u64, BTreeMap<String, Value>)> {
     let packages = daemon.package_registry().clone();

@@ -123,7 +123,7 @@ fn event_plane_saturation_source_guards_hold() {
     for relative in [
         "src/daemon_transport.rs",
         "src/daemon_maintenance.rs",
-        "src/daemon_entity_subscriptions.rs",
+        "src/subscription/entity.rs",
         "src/session_projection.rs",
     ] {
         let source = fs::read_to_string(root.join(relative)).expect("read source");

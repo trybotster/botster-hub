@@ -21,11 +21,13 @@ use botster_hub_client::{
 };
 use serde_json::Value;
 
-use super::{
-    DAEMON_MAX_FRAME_BYTES, DaemonControlState, HubDaemon, daemon_response_base,
-    daemon_session_type_from_client, session_type_entity_snapshot,
-};
+use crate::HubDaemon;
+use crate::client_api_dto::response::daemon_response_base;
+use crate::client_api_dto::session::daemon_session_type_from_client;
 use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
+use crate::daemon_transport::{
+    DAEMON_MAX_FRAME_BYTES, DaemonControlState, session_type_entity_snapshot,
+};
 
 const SESSION_DELIVERY_MAX_ITEMS: usize = 16;
 const SESSION_DELIVERY_MAX_BYTES: usize = 64 * 1024;
@@ -138,7 +140,7 @@ enum DeliveryPhase {
     Rows,
 }
 
-pub(super) fn register_entity_subscription(
+pub(crate) fn register_entity_subscription(
     daemon: &mut HubDaemon,
     state: &mut DaemonControlState,
     entity_type: String,
@@ -350,7 +352,7 @@ pub(super) fn register_entity_subscription(
     Ok(daemon_response_base(DaemonResponseKind::EntitySubscribed))
 }
 
-pub(super) fn seed_lifecycle_reconciliation(
+pub(crate) fn seed_lifecycle_reconciliation(
     daemon: &mut HubDaemon,
     state: &mut DaemonControlState,
 ) {
@@ -510,7 +512,7 @@ fn with_session_type_snapshot_seq(
     }
 }
 
-pub(super) fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
+pub(crate) fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
     if state.entity_subscriptions.is_empty() {
         return;
     }
@@ -692,14 +694,14 @@ fn note_released_entity_generations(state: &mut DaemonControlState, before: usiz
     state.lifecycle_counters.live_entity_subscriptions = state.entity_subscriptions.len() as u64;
 }
 
-pub(super) fn session_subscribers_need_delivery(state: &DaemonControlState) -> bool {
+pub(crate) fn session_subscribers_need_delivery(state: &DaemonControlState) -> bool {
     state.entity_subscriptions.values().any(|subscription| {
         subscription.entity_type == "session"
             && (subscription.needs_delivery || subscription.resync_reason.is_some())
     })
 }
 
-pub(super) fn drive_package_entity_fanout(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
+pub(crate) fn drive_package_entity_fanout(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
     let Some(runtime) = daemon.runtime() else {
         return;
     };
@@ -878,7 +880,7 @@ fn package_mutation_to_daemon_frame(
     }
 }
 
-pub(super) fn drive_package_entity_resync(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
+pub(crate) fn drive_package_entity_resync(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
     // Stagnant catching_up / overflow may keep `needed` set when not degraded.
     // Do not rearm degraded families here — only a new publish or a newly
     // catching-up subscribe may clear degradation and start another cycle.
@@ -1738,7 +1740,7 @@ fn session_entity_patch(previous: &DaemonSessionEntity, current: &DaemonSessionE
     )
 }
 
-pub(super) fn entity_subscription_error(
+pub(crate) fn entity_subscription_error(
     code: &str,
     subscription_id: &str,
     message: &str,
