@@ -5,7 +5,9 @@
 //! runtime initialization, status, and clean stop. It does not own terminal I/O,
 //! transports, provider execution, signal handling, or sockets.
 
+pub(crate) mod control;
 pub(crate) mod error;
+pub(crate) mod owner_loop;
 pub(crate) mod shutdown;
 
 use std::error::Error;

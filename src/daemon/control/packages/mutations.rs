@@ -11,9 +11,14 @@ use botster_core::PackageConfigurationValue;
 use botster_hub_client::DaemonPackagePin;
 
 use super::{
-    HubDaemon, advance_session_type_generation_if_changed, list_packages_response,
-    package_decision_response, package_pin_from_daemon, package_update_status, request_id,
-    session_type_definition_map, show_package_response, supervised_launch_contract,
+    list_packages_response, package_decision_response, package_update_status,
+    show_package_response, supervised_launch_contract,
+};
+use crate::HubDaemon;
+use crate::client_api_dto::package::package_pin_from_daemon;
+use crate::daemon::control::request_id;
+use crate::daemon::control::session_types::{
+    advance_session_type_generation_if_changed, session_type_definition_map,
 };
 use crate::daemon::error::{DaemonTransportError, DaemonTransportResult, PackageRollbackFailure};
 use crate::entrypoint_supervisor::EntrypointSupervisorError;
@@ -23,7 +28,7 @@ use crate::{
     PackageState,
 };
 
-pub(super) fn install_registry_package(
+pub(crate) fn install_registry_package(
     daemon: &mut HubDaemon,
     registry_path: PathBuf,
     entry_id: String,
@@ -48,7 +53,7 @@ pub(super) fn install_registry_package(
     package_decision_response(daemon, decision)
 }
 
-pub(super) fn install_local_package(
+pub(crate) fn install_local_package(
     daemon: &mut HubDaemon,
     path: PathBuf,
 ) -> DaemonTransportResult<botster_hub_client::DaemonResponse> {
@@ -68,7 +73,7 @@ pub(super) fn install_local_package(
     package_decision_response(daemon, decision)
 }
 
-pub(super) fn apply_package_update(
+pub(crate) fn apply_package_update(
     daemon: &mut HubDaemon,
     package_name: String,
     pin: DaemonPackagePin,
@@ -93,7 +98,7 @@ pub(super) fn apply_package_update(
     Ok(response)
 }
 
-pub(super) fn configure_package(
+pub(crate) fn configure_package(
     daemon: &mut HubDaemon,
     package_name: String,
     values: BTreeMap<String, serde_json::Value>,
@@ -127,7 +132,7 @@ pub(super) fn configure_package(
     show_package_response(daemon, &package_name)
 }
 
-pub(super) fn reload_package(
+pub(crate) fn reload_package(
     daemon: &mut HubDaemon,
     package_name: String,
 ) -> DaemonTransportResult<botster_hub_client::DaemonResponse> {
@@ -157,7 +162,7 @@ pub(super) fn reload_package(
     package_decision_response(daemon, decision)
 }
 
-pub(super) fn refresh_local_packages(
+pub(crate) fn refresh_local_packages(
     daemon: &mut HubDaemon,
 ) -> DaemonTransportResult<botster_hub_client::DaemonResponse> {
     let before_session_types = session_type_definition_map(daemon)?;
@@ -202,7 +207,7 @@ pub(super) fn refresh_local_packages(
     Ok(response)
 }
 
-pub(super) fn enable_package_local_path(
+pub(crate) fn enable_package_local_path(
     daemon: &mut HubDaemon,
     path: PathBuf,
 ) -> DaemonTransportResult<botster_hub_client::DaemonResponse> {
@@ -225,7 +230,7 @@ pub(super) fn enable_package_local_path(
     )
 }
 
-pub(super) fn enable_package(
+pub(crate) fn enable_package(
     daemon: &mut HubDaemon,
     package_name: String,
 ) -> DaemonTransportResult<botster_hub_client::DaemonResponse> {
@@ -243,7 +248,7 @@ pub(super) fn enable_package(
     )
 }
 
-pub(super) fn disable_package(
+pub(crate) fn disable_package(
     daemon: &mut HubDaemon,
     package_name: String,
 ) -> DaemonTransportResult<botster_hub_client::DaemonResponse> {
@@ -258,7 +263,7 @@ pub(super) fn disable_package(
     package_decision_response(daemon, decision)
 }
 
-pub(super) fn remove_package(
+pub(crate) fn remove_package(
     daemon: &mut HubDaemon,
     package_name: String,
 ) -> DaemonTransportResult<botster_hub_client::DaemonResponse> {
@@ -273,7 +278,7 @@ pub(super) fn remove_package(
     package_decision_response(daemon, decision)
 }
 
-fn commit_enabled_package(
+pub(crate) fn commit_enabled_package(
     daemon: &mut HubDaemon,
     previous: PackageRegistry,
     candidate: PackageRegistry,
@@ -294,7 +299,7 @@ fn commit_enabled_package(
     package_decision_response(daemon, decision)
 }
 
-fn commit_package_registry(
+pub(crate) fn commit_package_registry(
     daemon: &mut HubDaemon,
     package_registry: PackageRegistry,
 ) -> DaemonTransportResult<()> {
@@ -312,7 +317,7 @@ fn commit_package_registry(
     Ok(())
 }
 
-fn load_package_after_enable(
+pub(crate) fn load_package_after_enable(
     daemon: &mut HubDaemon,
     package_name: &str,
 ) -> DaemonTransportResult<()> {
@@ -343,7 +348,7 @@ fn load_package_after_enable(
     Ok(())
 }
 
-fn reload_package_after_reload(
+pub(crate) fn reload_package_after_reload(
     daemon: &mut HubDaemon,
     package_name: &str,
 ) -> DaemonTransportResult<()> {
@@ -366,7 +371,7 @@ fn reload_package_after_reload(
     Ok(())
 }
 
-fn record_event_plane_unload(daemon: &HubDaemon, package_name: &str) {
+pub(crate) fn record_event_plane_unload(daemon: &HubDaemon, package_name: &str) {
     let Some(runtime) = daemon.runtime() else {
         return;
     };
@@ -381,7 +386,7 @@ fn record_event_plane_unload(daemon: &HubDaemon, package_name: &str) {
     });
 }
 
-fn unload_package_after_disable(
+pub(crate) fn unload_package_after_disable(
     daemon: &mut HubDaemon,
     package_name: &str,
 ) -> DaemonTransportResult<()> {
@@ -395,7 +400,7 @@ fn unload_package_after_disable(
     Ok(())
 }
 
-fn restart_running_package_entrypoints(
+pub(crate) fn restart_running_package_entrypoints(
     daemon: &mut HubDaemon,
     registry: &PackageRegistry,
     package_name: &str,
@@ -440,7 +445,7 @@ fn restart_running_package_entrypoints(
     Ok(())
 }
 
-fn compensate_enable_load_failure(
+pub(crate) fn compensate_enable_load_failure(
     daemon: &mut HubDaemon,
     previous: PackageRegistry,
     package_name: String,
@@ -464,7 +469,7 @@ fn compensate_enable_load_failure(
     finish_compensation(original, rollbacks)
 }
 
-fn compensate_runtime_after_failure(
+pub(crate) fn compensate_runtime_after_failure(
     daemon: &mut HubDaemon,
     previous: PackageRegistry,
     original: DaemonTransportError,
@@ -503,7 +508,7 @@ fn compensate_runtime_after_failure(
     finish_compensation(original, rollbacks)
 }
 
-fn restore_plugin_from_registry(
+pub(crate) fn restore_plugin_from_registry(
     daemon: &mut HubDaemon,
     registry: &PackageRegistry,
     package_name: &str,
@@ -536,7 +541,7 @@ fn restore_plugin_from_registry(
     Ok(())
 }
 
-fn finish_compensation(
+pub(crate) fn finish_compensation(
     original: DaemonTransportError,
     rollbacks: Vec<PackageRollbackFailure>,
 ) -> DaemonTransportError {
@@ -550,7 +555,7 @@ fn finish_compensation(
     }
 }
 
-fn apply_refresh_package_side_effects(
+pub(crate) fn apply_refresh_package_side_effects(
     daemon: &mut HubDaemon,
     previous_packages: &PackageRegistry,
     decision: &PackageDecision,
@@ -583,7 +588,7 @@ fn apply_refresh_package_side_effects(
     Ok(())
 }
 
-fn apply_reload_side_effects(
+pub(crate) fn apply_reload_side_effects(
     daemon: &mut HubDaemon,
     package_name: &str,
     state: PackageState,
@@ -596,7 +601,7 @@ fn apply_reload_side_effects(
     restart_running_package_entrypoints(daemon, &live, package_name, running_entrypoints)
 }
 
-fn runnable_entrypoint_definition_changed(
+pub(crate) fn runnable_entrypoint_definition_changed(
     previous_packages: &PackageRegistry,
     refreshed_packages: &PackageRegistry,
     package_name: &str,

@@ -8,7 +8,7 @@ use webrtc::peer_connection::{PeerConnection, PeerConnectionBuilder, RTCSessionD
 use webrtc::runtime::{channel, default_runtime, timeout};
 
 use crate::admission::grants::LocalWebrtcSignalRequest;
-use crate::daemon_transport::ControlSender;
+use crate::daemon::control::message::ControlSender;
 use crate::transport::webrtc::peer::{
     LocalWebrtcHandler, LocalWebrtcPeerState, LocalWebrtcTransport,
 };

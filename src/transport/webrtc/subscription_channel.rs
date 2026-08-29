@@ -1,6 +1,6 @@
 use botster_hub_client::{DaemonEntityFrame, DaemonRequest, DaemonResponse};
 
-use crate::daemon_transport::response_records_attach_ownership;
+use crate::subscription::attach_routes::response_records_attach_ownership;
 use crate::transport::webrtc::control_channel::LocalWebrtcDataChannel;
 use crate::transport::webrtc::peer::LOCAL_WEBRTC_PEER_CLOSE_BOUND;
 pub(crate) const TEST_EXTRA_CHANNEL_CLOSE_MARKER_ENV: &str =
@@ -120,9 +120,11 @@ mod tests {
     use super::*;
     use crate::admission::budgets::ENTITY_SUBSCRIPTION_QUEUE_CAPACITY;
     use crate::admission::unix_hello::WebrtcTerminalAdmission;
-    use crate::daemon_transport::{ControlMessage, ControlSender};
-    use crate::daemon_transport::{DaemonControlState, EntityFrameSender, handle_control_message};
+    use crate::daemon::control::handle_control_message;
+    use crate::daemon::control::message::{ControlMessage, ControlSender};
+    use crate::daemon::owner_loop::DaemonControlState;
     use crate::subscription::attach_routes::negotiated_unix_capability_set;
+    use crate::subscription::entity::EntityFrameSender;
     use crate::transport::webrtc::adapter::WebRtcConnectionMux;
     use crate::transport::webrtc::control_channel::*;
     use crate::transport::webrtc::delivery::*;

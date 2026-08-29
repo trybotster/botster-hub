@@ -15,8 +15,8 @@ use botster_hub_client::{
 use crate::admission::budgets::{
     DAEMON_CLIENT_WRITE_TIMEOUT, DAEMON_INCOMPLETE_FRAME_TIMEOUT, DAEMON_MAX_FRAME_BYTES,
 };
+use crate::client_api_dto::response::daemon_response_base;
 use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
-use crate::daemon_transport::daemon_response_base;
 use crate::transport::unix::{UnixConnectionMux, UnixTerminalAdapterHandle};
 
 #[derive(Default)]
@@ -454,7 +454,7 @@ pub(crate) mod mux_write_resume_tests {
         unix_event_flush_stalled_from, unix_mux_blocks_entity_subscription,
         write_frame_bytes_resumable,
     };
-    use crate::daemon_transport::daemon_response_base;
+    use crate::client_api_dto::response::daemon_response_base;
     use crate::transport::unix::{UnixConnectionMux, UnixTerminalAdapter};
     use botster_core::contract::terminal_adapter::{TerminalAdapter, TerminalAdapterPressure};
     use botster_hub_client::{

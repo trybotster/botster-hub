@@ -17,11 +17,11 @@ use botster_hub_client::{
 
 use crate::HubDaemon;
 use crate::admission::unix_hello::{UnixTerminalAdmission, WebrtcTerminalAdmission};
+use crate::daemon::owner_loop::DaemonControlState;
 use crate::daemon_maintenance::{
     PUMP_MAX_ADMISSIONS_VISITED, PUMP_MAX_CANDIDATE_CLASSIFICATIONS,
     PUMP_MAX_ROUTE_ENTRIES_VISITED, PumpAdmissionCursor,
 };
-use crate::daemon_transport::DaemonControlState;
 use crate::transport::shared::close_progress::CloseSliceAccumulator;
 pub(crate) use crate::transport::shared::close_progress::{
     ClosedEventSliceProgress, empty_close_event_progress,
@@ -182,7 +182,7 @@ impl ClosedEventLedger {
 }
 
 pub(crate) fn suppress_unix_session_close_events(
-    pending_runtime: &crate::daemon_transport::PendingRuntimeState,
+    pending_runtime: &crate::daemon::owner_loop::PendingRuntimeState,
     session_id: &str,
 ) {
     for admission in pending_runtime.admission.unix_admissions.values() {
@@ -193,7 +193,7 @@ pub(crate) fn suppress_unix_session_close_events(
 }
 
 pub(crate) fn suppress_webrtc_session_close_events(
-    pending_runtime: &crate::daemon_transport::PendingRuntimeState,
+    pending_runtime: &crate::daemon::owner_loop::PendingRuntimeState,
     session_id: &str,
 ) {
     for admission in pending_runtime.admission.webrtc_admissions.values() {
@@ -569,7 +569,7 @@ mod tests {
 
     #[test]
     fn shutdown_session_arm_installs_exact_suppression_before_core_request() {
-        const TRANSPORT: &str = include_str!("../daemon_transport.rs");
+        const TRANSPORT: &str = include_str!("../daemon/control/sessions.rs");
         let shutdown_needle = format!(
             "{}{}{}",
             "DaemonRequest::ShutdownSession ",
