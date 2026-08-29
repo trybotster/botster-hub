@@ -10,11 +10,12 @@
 | Pipeline worktree | this run worktree |
 | Ticket | `ticket_1787894416_777916` |
 | Run | `run_1787977061_443918` |
-| Step | `botster_stack_implement` (`run_step_1787984753_947995`; prior visit `run_step_1787981023_284700`) |
+| Step | `botster_stack_implement` (`run_step_1787987449_135341`; prior visits `run_step_1787984753_947995`, `run_step_1787981023_284700`) |
 | Approved plan | `docs/plans/hub-decomposition-2-extract-admission-and-subscription-ownership.md` |
 | Merge policy | direct into `main`; do not create a PR |
 | Base | `origin/main` `fd540b6b21bdfe23f9280e13f650dff573fc5ae9` (0 behind at Implement start) |
-| Verified product commit | `f777cd542eec7392140fc30606fb3d4463463cd4` |
+| Verified product commit | `706244571980eec29e3bc02d2c54e6f7431fd84f` |
+| Prior occupancy repair | `f777cd542eec7392140fc30606fb3d4463463cd4` |
 | Prior product commit | `f7ebf6a74e709c3d8f10e603cd09c184746f4543` |
 | Runtime-teardown class | applies; every lens is implemented as a survive-the-move invariant |
 
@@ -136,7 +137,24 @@ Review with:
 
 ```
 git show --color-moved=dimmed-zebra f777cd5
+git show 7062445
 ```
+
+## Verify finding addressed
+
+Verify `review_1787987402_654728` returned this ticket to Implement. The findings array could not attach through the MCP bridge, so the finding lives in the Verify report and the review summary. Plan acceptance check 19 was only partly satisfied.
+
+Commit `7062445` adds the two missing absences to `close_events_phase_source_does_not_take_journal_wake` in `src/subscription/closed_events.rs`. The scanned region is still `fn run_close_events_phase` .. `#[cfg(test)]`. The test now also asserts the close-events phase does not contain `list_terminal_subscriptions` or `list_sessions`. Test name is unchanged.
+
+Red and green arms, each with the production seed restored afterwards:
+
+| Arm | Seed | Result |
+| --- | --- | --- |
+| A | `let _ = "list_sessions";` as the first line of `run_close_events_phase` | `close_events_phase_source_does_not_take_journal_wake` FAILED: `Pump close classification must not list sessions`. `pump_phases_do_not_list_subscriptions_or_sessions` still passed. |
+| D | `let _ = "list_terminal_subscriptions";` as the first line of `run_close_events_phase` | `close_events_phase_source_does_not_take_journal_wake` FAILED: `Pump must use the exact membership query`. `pump_phases_do_not_list_subscriptions_or_sessions` still passed. |
+| Restored | no seed | both guards passed (`2 passed; 0 failed`) |
+
+Arm D is the independent later-assertion arm required by [[an ablation that reddens at the first assertion does not vouch for later ones]].
 
 ## Deviations from plan
 
@@ -149,7 +167,7 @@ Remaining documented deviations:
 3. Unknown 8: `origin_from_local_url` moved to `admission/grants.rs`. `issue_local_webrtc_bootstrap_response` dispatch stays in `daemon_transport`.
 4. `secret_stream_key` is `pub(crate)` on grants so live WebRTC tests that act as the browser can still derive the session key from the issued secret. Production `answer_offer` does not take the secret.
 5. The unified close-event queue helper carries `#[allow(clippy::too_many_arguments, clippy::explicit_counter_loop)]` so the extracted algorithm stays the original two-copy loop.
-6. `pump_phases_do_not_list_subscriptions_or_sessions` now splits at `DaemonControlState` because `overlay_live_attach_occupancy` left `daemon_transport.rs`.
+6. `pump_phases_do_not_list_subscriptions_or_sessions` still splits at `DaemonControlState` because `overlay_live_attach_occupancy` left `daemon_transport.rs`. The two list-API absences that used to live only in that region now also live on `close_events_phase_source_does_not_take_journal_wake`, so check 19 follows the protected text.
 
 No wire, DTO, limit, or protocol change. The remaining deviations do not change occupancy ownership or the plan's test-home requirement, so the committed plan's acceptance checks still describe this branch.
 
@@ -185,9 +203,14 @@ Inventory grep at base printed `12`. After the last import-repair pair it prints
 | Review-return `cargo clippy --workspace --all-targets --locked -- -D warnings` at `f777cd5` | exit 0 |
 | Review-return lib unit tests at `f777cd5` | 495 passed (three duplicate adapter ledger tests removed) |
 | Review-return `./test.sh --locked` at `f777cd5` | exit 0 (`DONE:0`). Lifecycle 319 passed, 2 ignored. hub-client 81 passed. ui-contract 90 passed. No failures. |
-| `git status --porcelain` after the passing suite | empty |
+| Verify-return close-events self-scan red arms A and D | each FAILED the relocated guard and named the seeded string; pump-phase guard stayed green |
+| Verify-return restored close-events self-scan | `2 passed; 0 failed` |
+| Verify-return `cargo fmt --all -- --check` at `7062445` | exit 0 |
+| Verify-return `cargo clippy --workspace --all-targets --locked -- -D warnings` at `7062445` | exit 0 |
+| Verify-return official `./test.sh --locked` at `7062445` | exit 0 (`DONE:0`). Lib 495 passed. Lifecycle 319 passed, 2 ignored. hub-client 81 passed, including `generated_typescript_protocol_matches_checked_artifact`. ui-contract 90 passed. No failures. |
+| `git status --porcelain` after the passing suite | only this uncommitted report; empty after the report commit |
 
-The first suite failure is attributed to parallel-load smoke attach, not to the extraction. Isolated green plus a second default-concurrency green suite is the recorded official result for the first visit. The Review-return official result is one default-concurrency green `./test.sh --locked` on `f777cd5`.
+The first suite failure is attributed to parallel-load smoke attach, not to the extraction. Isolated green plus a second default-concurrency green suite is the recorded official result for the first visit. The Review-return official result is one default-concurrency green `./test.sh --locked` on `f777cd5`. The Verify-return official result is one default-concurrency green `./test.sh --locked` on `7062445`.
 
 ## Unverified behavior or residual risk
 
@@ -197,6 +220,6 @@ The first suite failure is attributed to parallel-load smoke attach, not to the 
 
 ## Missing vault guidance discovered
 
-Plan vault gaps 1–13 remain capture candidates. This Implement visit did not write those notes. The load-bearing new facts are: a `#[path]` submodule relocation reduces module parentage; close-event state had two near-identical owners; grant secrets must not enter WebRTC transport; peer identity is the grant id; matching lines vs repair rows; `hub_daemon_lifecycle_test` flattens submodule names.
+Plan vault gaps 1–13 remain capture candidates. Verify also named three capture candidates about region-bounded self-scans, per-assertion red arms, and `include_str!` versus path-scan clean-target rules. This Implement visit did not write those notes. The load-bearing new facts are: a `#[path]` submodule relocation reduces module parentage; close-event state had two near-identical owners; grant secrets must not enter WebRTC transport; peer identity is the grant id; matching lines vs repair rows; `hub_daemon_lifecycle_test` flattens submodule names; a self-scan whose region is bounded by two symbols loses coverage when a function between them moves.
 
 No convention conflict with loaded playbooks.
