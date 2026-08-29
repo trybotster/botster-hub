@@ -2,6 +2,18 @@
 
 ## Revision History
 
+Revision 3, Plan visit 3, answering `review_1787999655_409032`, verdict `blocked`, and the human decision in `question_1787999576_734551`.
+
+The human overruled revision 2's tracked-not-blocking call, and the reasoning is stronger than mine: the failing proof exercises **the same WebRTC delivery path this ticket moves**, so a base-versus-HEAD failure comparison plus isolated HEAD success cannot exclude a new load-only regression. Revision 2 argued from "the flake is pre-existing"; the correct frame is "the flake sits inside the blast radius of this move". The differential protocol is withdrawn as final acceptance evidence.
+
+Changes in revision 3:
+
+- The blocking dependency `dependency_1787999625_716785` on `ticket_1787999248_674913` is recorded. That ticket is now **closed**; its repair merged to `main`.
+- **Base re-pinned from `38d140c` to `ddb2de9`.** This branch was rebased onto the repaired `main`. The repair landed in `60aa4c4`, `dbaee44`, `c09f4d2`, `4390758`, and `ddb2de9`.
+- Acceptance check 7 is restored to an **absolute full-suite gate**. The differential `BASE_FAIL`/`HEAD_FAIL` protocol is deleted, not merely demoted.
+- Every base fact was re-measured on `ddb2de9` rather than carried over. See "Context Loaded".
+- "Baseline Suite State" is rewritten to record the repair and the new expectation, replacing the disposition argument that the human decision closed.
+
 Revision 2, Plan visit 2, run step `run_step_1787999007_348502`. It answers `review_1787998985_537393`, verdict `changes_required`:
 
 - `finding_1787998985_266740` (high, product): stale WebRTC 0.20 premise. Fixed. I re-verified `Cargo.toml:38` and `Cargo.lock`: the base resolves `webrtc 0.21.0-beta.2`. Revision 1 asserted 0.20 from charter prose without reading the manifest, which was my error. Non-scope item 9, the notes list, and the risks now state the verified 0.21.0-beta.2 base, and the plan states that the single `botster-daemon` channel is preserved because the ticket requires it, not because the crate prevents late channels.
@@ -16,7 +28,7 @@ Revision 2, Plan visit 2, run step `run_step_1787999007_348502`. It answers `rev
 - Target repository: `botster-hub` (`https://github.com/trybotster/botster-hub.git`).
 - `target_id`: `tgt_7e208a0c76a44980a83b63af976b1f22`.
 - Ticket: `ticket_1787894421_128594`. Run: `run_1787997552_597206`. Run step: `run_step_1787997552_126164`.
-- Base ref: `main`. Base commit: `38d140c006b8b278b3e04f98ddc37d6ec99b3b8b`.
+- Base ref: `main`. Base commit: `ddb2de9cdc11a2e3a050e477cf396685686887f2`, the repaired baseline. The branch was rebased onto it in Plan visit 3. The former base `38d140c` is superseded.
 - The target repository comes from the ticket `target_id` resolved through `list_spawn_targets`. It does not come from the process working directory.
 - Merge policy: direct to `main`.
 
@@ -96,7 +108,7 @@ Not loaded, with reason:
 - Project checklist `checklist_1787894551_481961`, "Wake-driven data-plane architecture adherence".
 - Closed dependency `ticket_1787894419_699597` (Hub decomposition 3). Its landed commit is `667648a`, which created `src/transport/shared` and `src/transport/unix` and rebuilt the WebRTC adapter over the shared slot.
 - Prior art in the target repository: `docs/plans/hub-decomposition-1-*.md`, `docs/plans/hub-decomposition-2-*.md`, `docs/plans/hub-decomposition-3-*.md` and their reports under `docs/reports/`. `docs/plans/` is the repository-confirmed plan destination.
-- Measured base state:
+- Measured base state, re-measured on the repaired base `ddb2de9` in Plan visit 3 rather than carried over from `38d140c`:
   - `src/local_webrtc.rs` is 7752 lines. Production ends at line 2437. `mod tests` spans lines 2438 to 7752 as one flat module with 54 `#[test]` functions and a large shared harness (`PeerHarness`, `TestOfferPeer`, `OwnedWorkerIdentity`, process-tree helpers).
   - `src/webrtc_terminal_adapter.rs` is 600 lines and owns `WebRtcTerminalAdapter`, `WebRtcTerminalAdapterHandle`, `WebRtcTerminalAdapterInner`, and `WebRtcConnectionMux`.
   - `src/lib.rs` exports `pub use local_webrtc::{LocalWebrtcError, LocalWebrtcTransport};` at line 167. The module itself is `pub(crate)`.
@@ -158,7 +170,7 @@ Not loaded, with reason:
 - Admission policy stays in `src/admission/`. `src/transport/webrtc/**` receives an accepted peer configuration and a session key. It does not gain grant issue, origin policy, label reservation, or budget code.
 - Subscription route ownership stays in `src/subscription/`. `ClosedEventRoute`, `ClosedHandle`, suppression, and `DaemonEvent` construction do not move into the transport tree.
 - Cross-repository dependencies: none. The closed dependency `ticket_1787894419_699597` is already merged as `667648a` and is the base for this work.
-- Same-repository follow-up registered: `ticket_1787999248_674913` owns the pre-existing `webrtc_terminal_output_is_byte_exact` base-suite flake against the same `botster-hub` target. It is cited, not added as a blocking dependency edge; see "Baseline Suite State" for the reasoning and for the oracle this ticket uses instead.
+- Blocking dependency, now satisfied: `dependency_1787999625_716785` binds this ticket to `ticket_1787999248_674913`, the `webrtc_terminal_output_is_byte_exact` baseline repair against the same `botster-hub` target. That ticket is closed and its repair is merged, so the dependency no longer blocks. See "Baseline Suite State".
 - Downstream cost: zero. The two public names keep their crate-root paths, so no generic client rebuild is required. If any public export or DTO changes, the ticket has left move-only scope and the Implementer must stop and re-plan.
 
 ## Assumptions And Unknowns
@@ -247,7 +259,7 @@ Not loaded, with reason:
 5. **Cyclic module dependencies.** `peer.rs` calls into `subscription_channel.rs` and `control_channel.rs`, while both call back into `LocalWebrtcPeerState` in `peer.rs`. Rust allows this inside one crate, but a careless move can pull peer state into the control channel. Mitigation: acceptance check 3 asserts each state machine's owning type is declared in exactly one file.
 6. **Ownership creep into transport.** A move can drag a grant, label, or route symbol into `src/transport/webrtc/**`. Mitigation: acceptance check 5 extends the existing shared-transport forbidden-identifier guard to the WebRTC tree.
 7. **Very large diff hides a semantic edit.** The move is roughly 8300 lines. Mitigation: acceptance check 18 requires `git diff --color-moved=dimmed-zebra` and a move-only commit shape.
-8. **Suite flake attributed to the move, or a real regression hidden behind a known flake.** The base suite is already red on `webrtc_terminal_output_is_byte_exact` under full-suite load, and that lane is directly relevant to this move. Both error directions are live: a pre-existing flake can be blamed on the move, and a genuine regression can hide behind the excuse. Mitigation: the differential protocol in acceptance check 7, plus the owner ticket recorded under "Baseline Suite State".
+8. **A load-only regression inside the moved path.** This is the risk the human decision named when it blocked the ticket: a fault that appears only under full-suite concurrency, in the same WebRTC delivery path this move touches. It is now testable, because the base is green after `ticket_1787999248_674913`. Mitigation: the absolute full-suite gate in acceptance check 7, with `webrtc_terminal_output_is_byte_exact` explicitly required to pass under load rather than only in isolation.
 
 ## Runtime-Teardown Class
 
@@ -285,20 +297,15 @@ Oracles preserved by name: `replacement_peer_rejects_prior_generation_frames_and
 
 ## Baseline Suite State
 
-Plan Review measured this and I accept the finding. It is recorded here so no later step treats it as new.
+The base is green. This section records how it got there, because revision 1 and revision 2 both planned against a red base.
 
-- Failing test: `webrtc_terminal_output_is_byte_exact`, `tests/hub_daemon_lifecycle/subscription_ownership_baseline.rs:826`.
-- Symptom: the assertion at line 895 fails with empty adapter frames, `got []`.
-- Conditions: `RUSTUP_TOOLCHAIN=1.97.0`, `CARGO_TARGET_DIR` unset, worker and Hub prebuilds green, full `./test.sh --locked`. A focused exact rerun passes.
-- Mechanism, from reading the test body: it drives a live PTY writer over WebRTC and polls for the expected four bytes inside a fixed `Duration::from_secs(8)` wall-clock deadline. Under full-suite concurrency the deadline can expire before the first frame arrives. This matches the charter rule that the Hub lifecycle suite needs a quiet host, and it matches the flake class in [[wall-clock ready-operation bounds through a daemon child are ambient-load-sensitive]].
-- No host-exhaustion marker names this failure, so the charter forbids calling it unrelated on assertion alone.
+**History.** Plan Review measured `webrtc_terminal_output_is_byte_exact` failing under full `./test.sh --locked` at the former base `38d140c`, passing in isolation. Its oracle polled for four expected bytes inside a fixed `Duration::from_secs(8)` wall-clock deadline over a live PTY writer, so full-suite concurrency could expire the deadline before the first frame arrived.
 
-**Disposition.** This ticket is a pure move and cannot repair a wall-clock deadline without leaving move-only scope. I therefore do both halves that are in scope:
+**Decision.** Human decision `question_1787999576_734551` ruled that this ticket blocks on the repair rather than working around it. The reason is specific and correct: the failing proof exercises the same WebRTC delivery path this ticket moves, so comparing base and HEAD failure sets cannot exclude a **new load-only regression** introduced by the move. Revision 2's differential protocol is withdrawn and must not be used as final acceptance evidence.
 
-1. **Owner ticket registered: `ticket_1787999248_674913`**, "Hub baseline flake: webrtc_terminal_output_is_byte_exact fails under full-suite load", against `botster-hub` (`tgt_7e208a0c76a44980a83b63af976b1f22`) in this project. It requires a load-tolerant oracle or a named host-exhaustion marker, forbids weakening the byte-exactness assertion, and requires a red-on-revert arm.
-2. Replace the absolute-green acceptance claim with the differential protocol in acceptance check 7, which distinguishes a regression introduced by this move from the pre-existing load failure.
+**Repair, now merged.** `ticket_1787999248_674913` is closed. Blocking dependency `dependency_1787999625_716785` is satisfied. The repair reached `main` in five commits, `60aa4c4` through `ddb2de9`, and changed only `tests/hub_daemon_lifecycle/subscription_ownership_baseline.rs` plus its plan and report documents. It replaced the ambient deadline with an explicit `wait_for_producer_ready` gate and added typed timeout messages that distinguish "no producer-ready frames" from "incomplete producer-ready marker" from "no adapter frames after release". The byte-exact assertion and the test name are both preserved, which is what the owner ticket required.
 
-**Why no dependency edge was added.** In Project Pipelines, `add_ticket_dependency` is strictly blocking: the dependent ticket cannot start a run until the dependency closes. Adding that edge would stop this move until the flake repair lands, and the flake repair itself needs suite runs to verify, which stalls the decomposition sequence behind an unrelated fix. The failure is therefore owned by `ticket_1787999248_674913` and cited here, and this ticket carries the differential protocol as its oracle instead. The failure is not waived: acceptance check 7 still fails the ticket if `HEAD_FAIL` gains any test, or if a base-failing test also fails in isolation at HEAD. If Plan Review prefers a hard block, adding the edge is one call and I will make it. I am flagging the tradeoff rather than deciding it silently.
+**Consequence for this plan.** Acceptance check 7 is an absolute full-suite gate again. There is no pre-existing failure to excuse, so any failure at HEAD is this ticket's to explain.
 
 ## Acceptance Checks And Tests
 
@@ -313,14 +320,10 @@ Ownership checks, which prove this is an extraction and not a file split:
 
 Behavior-preservation checks:
 
-7. **Differential suite proof, not an absolute-green claim.** The base is not green (see "Baseline Suite State"), so "every lane passes" is not a usable oracle. Instead:
-   - 7a. On one quiet host, in one session, run `./test.sh --locked` at base commit `38d140c` and record the exact set of failing test names as `BASE_FAIL`.
-   - 7b. Run `./test.sh --locked` at final HEAD on the same host and record `HEAD_FAIL`.
-   - 7c. Require `HEAD_FAIL` to be a subset of `BASE_FAIL`. Any test in `HEAD_FAIL` but not in `BASE_FAIL` fails this check and is attributed to the move until proven otherwise.
-   - 7d. For every test in `BASE_FAIL`, run it in isolation at HEAD with its full module path and require it to pass. A base-failing test that also fails in isolation at HEAD is a regression, not a load flake.
-   - 7e. Record both runs, both failure sets, and the isolation results in the implementation report. Do not label any failure unrelated without naming it in `BASE_FAIL` and showing 7d green.
-   - 7f. These WebRTC lanes must appear in the run and must not regress: `webrtc_proofs.rs`, `webrtc_terminal_adapter.rs`, `webrtc_fixtures.rs`, `subscription_ownership_baseline.rs`, `event_plane_saturation.rs`, `shutdown.rs`, `sessions.rs`, `cli.rs`.
-8. Exact proof-name preservation. Capture the full test inventory at base commit `38d140c` and at final HEAD with `cargo test --workspace --locked -- --list`, and store both. Compare the multiset of leaf test names, meaning the final path segment of each entry. The two multisets must be identical: no proof name may be removed, renamed, or reduced in count. Record a separate explicit rename map from each old module path to its new module path, and require every entry to keep the same leaf name. Any intentionally removed duplicate must be listed by name with its reason. An unexplained difference fails the check.
+7. **Absolute full-suite gate.** `./test.sh --locked` passes at final HEAD on a quiet host, with zero failures. The base `ddb2de9` is green, so no failure may be attributed to a pre-existing condition. If any test fails, the Implementer must either fix it inside move-only scope or stop and report; the charter rule against blanket "unrelated" excuses applies with no differential fallback. These WebRTC lanes must appear in the run and must pass: `webrtc_proofs.rs`, `webrtc_terminal_adapter.rs`, `webrtc_fixtures.rs`, `subscription_ownership_baseline.rs`, `event_plane_saturation.rs`, `shutdown.rs`, `sessions.rs`, `cli.rs`.
+   - 7a. `webrtc_terminal_output_is_byte_exact` must pass under the full suite, not only in isolation. It is the proof that most directly covers the moved delivery path, and it is the reason this ticket was blocked.
+   - 7b. Record the full-suite result in the implementation report. A green isolated rerun is not a substitute for a green suite run.
+8. Exact proof-name preservation. Capture the full test inventory at base commit `ddb2de9` and at final HEAD with `cargo test --workspace --locked -- --list`, and store both. Compare the multiset of leaf test names, meaning the final path segment of each entry. The two multisets must be identical: no proof name may be removed, renamed, or reduced in count. Record a separate explicit rename map from each old module path to its new module path, and require every entry to keep the same leaf name. Any intentionally removed duplicate must be listed by name with its reason. An unexplained difference fails the check.
 9. No protocol, DTO, serde name, encryption, framing, chunking, limit, or scheduling change. Prove with `git diff` over `src/client_api_dto/`, `src/daemon/error.rs`, and every `serde` attribute in the diff, showing zero changes, and with a `git diff` over the moved delivery functions showing pure relocation.
 10. The Core pin is unchanged. Prove with `git diff` over `Cargo.toml` and `Cargo.lock` showing no `botster-core` revision change and no `webrtc` version change.
 
@@ -358,3 +361,5 @@ Downstream proof required by the charter:
 4. The `local_webrtc` name survives in constants, environment variables, terminal record file names, and operation strings after the module is gone. Capture that a module retirement does not license renaming its wire-visible or file-visible identifiers, because those are protocol and evidence surfaces.
 5. A region-bounded self-scan loses coverage when a function between its two anchor symbols moves out of the file. The region stays green and blind, and retargeting the end anchor is not the fix. [[region bounded source guards need a required symbol anchor]] requires a positive anchor but does not state the move-driven loss case. Capture the loss case.
 6. `cargo test --exact` requires the full module path. A bare leaf name filters out every test and still reports `ok`, which turns a guard ablation arm falsely green. This ticket moves 54 tests into new module paths, so every existing exact filter is at risk. No vault note records this. Capture it.
+7. A dependency version premise must come from the manifest in the worktree, not from a vault note that records a past state. Revision 1 of this plan asserted `webrtc 0.20` from charter prose while `Cargo.toml` said `0.21.0-beta.2`. Capture the rule that a plan reads the pin, and that a note naming a version is evidence of history, not of the current tree.
+8. A pre-existing test failure inside the blast radius of a refactor is not the same class as a pre-existing failure outside it. Human decision `question_1787999576_734551` ruled that a base-versus-HEAD failure comparison plus isolated HEAD success cannot exclude a **new load-only regression** when the failing proof exercises the same path the ticket moves. Revision 2 of this plan proposed exactly that differential protocol and was overruled. Capture the distinction and the rule: when the red proof covers the moved path, block on the repair and require an absolute suite gate; a differential oracle is acceptable only when the failure lies outside the change's reach.
