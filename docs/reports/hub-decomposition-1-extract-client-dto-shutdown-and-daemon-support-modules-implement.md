@@ -10,7 +10,7 @@
 | Pipeline worktree | this run worktree |
 | Ticket | `ticket_1787894414_324976` |
 | Run | `run_1787956038_959297` |
-| Step | `botster_stack_implement` (`run_step_1787961279_454276`) |
+| Step | `botster_stack_implement` return (`run_step_1787964616_267428`) after Review `changes_required` |
 | Approved plan | `docs/plans/hub-decomposition-1-extract-client-dto-shutdown-and-daemon-support-modules.md` |
 | Merge policy | direct into `main`; do not create a PR |
 | Base | `origin/main` `8137d16907b98e60c6714a1dedc157f04e5367ae` (0 behind at Implement start) |
@@ -106,6 +106,18 @@ git show --color-moved=dimmed-zebra --color-moved-ws=allow-indentation-change 46
 ## Cross-repo routing
 
 None. No new ticket dependency. Downstream Web/TUI cost is zero because no DTO field, serde name, or protocol version changed.
+
+## Review return: finding_1787964564_384327
+
+Review sent Implement back for local absolute paths in the committed plan. This return edits only that plan. Product commit `468bf7f` is unchanged.
+
+Replacements, matching the suggested fix:
+
+- Line 5: repository identity only (`botster-hub` / `trybotster/botster-hub`).
+- Line 45: `the pipeline-provided ticket worktree`.
+- Line 53: `[[daemon transport extraction moves ownership before deleting the facade]]`.
+
+Known-positive control: before the edit, `git diff origin/main...HEAD` contained three added lines with local home-directory paths. After the edit, the same raw diff scan matches none of those paths. The scan command is recorded in this return's gate evidence, not as a username-bearing command string in this report.
 
 ## Deviations from plan
 

@@ -2,7 +2,7 @@
 
 ## Target Repository And Target Id
 
-- Target repository: `botster-hub` (`trybotster/botster-hub`, `/Users/jasonconigliari/Projects/botster-hub`).
+- Target repository: `botster-hub` (`trybotster/botster-hub`).
 - Target id: `tgt_7e208a0c76a44980a83b63af976b1f22`.
 - Ticket: `ticket_1787894414_324976`. Run: `run_1787956038_959297`. Step: `botster_stack_plan`, run step `run_step_1787960403_555931` (sixth Plan visit; the five earlier visits each returned `changes_required`).
 - Base commit: `8137d16` (`origin/main` after the round-2 rebase). The first Plan visit used the stale base `a0c7141`.
@@ -42,7 +42,7 @@ Required Botster planning context from [[botster-planner-playbook]]:
 - [[botster-architecture]] -- the Botster domain map and source of architectural truth. It names `daemon transport extraction moves ownership before deleting the facade` and `Hub extraction must reduce ownership rather than only split files` as current architecture, which confirms this ticket is migration step 2 of a ratified plan and not an opportunistic refactor.
 - [[cli-patterns]] -- Rust CLI, TUI, PTY, and terminal-layer constraints. The constraint that binds this ticket is [[integration tests should use public agent apis not crate-internal test-only helpers]]: the moved tests are crate-internal unit tests and must stay unit tests inside their new modules. They must not become `tests/` integration tests, because that would force new public API in a move-only commit.
 - [[spa-patterns]] -- React SPA and entity-store constraints. This ticket touches no SPA surface. The relevant entry is [[botster hub client state sync is entity frame only]], which holds because this ticket changes no entity frame, DTO shape, or serde name. The SPA layer therefore needs no change and no proof beyond the byte-identity oracle in check 7.
-- [[botster orchestration should spawn agents with explicit target ids]] and [[botster orchestration prompts must bind agents to explicit worktrees]] -- satisfied: this run binds `tgt_7e208a0c76a44980a83b63af976b1f22` and the worktree `/Users/jasonconigliari/botster-sessions/trybotster-botster-hub-project-pipelines-ticket_1787894414_324976`.
+- [[botster orchestration should spawn agents with explicit target ids]] and [[botster orchestration prompts must bind agents to explicit worktrees]] -- satisfied: this run binds `tgt_7e208a0c76a44980a83b63af976b1f22` and the pipeline-provided ticket worktree.
 
 The remaining [[botster-planner-playbook]] must-load entries are the Project Pipelines orchestration notes. They do not constrain this ticket, because it changes no Project Pipelines package, plugin, or operator surface.
 
@@ -50,7 +50,7 @@ The remaining [[botster-planner-playbook]] must-load entries are the Project Pip
 
 ## Context Loaded
 
-- Vault capture: `/Users/jasonconigliari/knowledge/ops/archive/inbox/2026-08-27-botster-wake-driven-data-plane-and-hub-decomposition.md` (vault commit `8ef01f56`). It freezes the target Hub directory map and puts this ticket at migration step 2.
+- Vault capture: [[daemon transport extraction moves ownership before deleting the facade]] (vault commit `8ef01f56`). It freezes the target Hub directory map and puts this ticket at migration step 2.
 - Project record `project_1787600579_585482`: decomposition order, cold-cut rules, and the rule that every extraction commits move-only before behavior changes.
 - Repository evidence at HEAD `a0c7141`:
   - `src/daemon_transport.rs` is 10,573 lines and owns the three responsibilities this ticket moves.
