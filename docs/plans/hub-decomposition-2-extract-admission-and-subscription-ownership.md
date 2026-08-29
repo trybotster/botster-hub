@@ -142,17 +142,40 @@ This ticket is move-only in behavior. It changes no wire format, no DTO, no serd
 Commit kinds are stated as an invariant rather than a fixed count, per [[express scope limits as invariants not closed enumerations]]. **Every code commit on this branch is exactly one of four kinds, and no commit mixes two kinds:**
 
 - **Relocation.** Exactly one `git mv` of one file to its owner path. The moved file's bytes do not change at all. The commit carries no other edit of any kind.
-- **Import repair.** The edits that make the tree compile again after one relocation: module declarations added or removed in `src/lib.rs`, `src/daemon.rs`, or `src/daemon_transport.rs`; `use` path rewrites, including the `use super::{...}` block whose meaning the move changed; and the `pub(crate)` visibility widening that the move forces. It changes no logic and no test body.
-- **Extraction.** One responsibility leaves its current file and lands in a named owner file, with its state, policy, and tests. No behavior changes.
-- **Guard restore.** Source-scanning guard file lists and named-file assertions follow the code they protect.
+- **Import repair.** Every edit that a single relocation forces, and nothing else. Three families, all compile-only or lookup-only, none of them logic:
+  1. Module declarations added or removed in `src/lib.rs`, `src/daemon.rs`, or `src/daemon_transport.rs`, including the `#[path = "..."]` attributes that currently mount two of the relocated files inside `daemon_transport`.
+  2. `use` path rewrites, including the `use super::{...}` block whose meaning the move changed, plus the `pub(crate)` visibility widening the move forces.
+  3. **Move-forced path references to the relocated file.** Compile-time literals such as `include_str!("...")`, and run-time path strings such as `hub_source("src/...")` or `fs::read_to_string(root.join("src/..."))`. The inventory below names all ten.
 
-Plan Review round 1 found the earlier three-kind list self-contradictory, and it was: a relocation cannot be byte-pure and also carry the module-path repair that the recorded human decision requires to stay separate. Import repair is now its own kind, and the relocation kind is narrowed to the `git mv` alone.
+  The bright line between import repair and guard restore: **import repair may rewrite the path text of a reference that already exists; it may not add or remove a reference.** Adding a scan-list entry for a newly created file is guard restore.
+- **Extraction.** One responsibility leaves its current file and lands in a named owner file, with its state, policy, and tests. No behavior changes.
+- **Guard restore.** New entries added to source-scanning guard lists for files this ticket creates, and named-file assertions relocated for code that moved by extraction rather than by relocation.
+
+Two Plan Review rounds shaped this section, and both findings were correct. Round 1 found the original three-kind list self-contradictory: a relocation cannot be byte-pure and also carry the module-path repair the recorded human decision requires to stay separate. Round 2 found that the repaired import-repair kind still excluded a compile repair the byte-pure move forces, because `src/daemon_attach_stream.rs:1129` scans itself through `include_str!("daemon_attach_stream.rs")`, and after the move that relative literal resolves to a missing `src/subscription/daemon_attach_stream.rs`.
+
+**Measured inventory of move-forced path references.** Round 2 named one. `grep -rn "daemon_attach_stream\.rs\|daemon_entity_subscriptions\.rs\|daemon_event_subscriptions\.rs" src/ tests/ crates/ script/` at `fd540b6` returns ten, in seven files. Implement must repair every row, and check 8b proves none survives.
+
+| # | Site | Reference | Fails at | Repair |
+|---|---|---|---|---|
+| 1 | `src/daemon_attach_stream.rs:1129` | `include_str!("daemon_attach_stream.rs")` self-scan inside `attach_stream_source_does_not_branch_on_snapshot_phases` | compile | `include_str!("attach_routes.rs")` |
+| 2 | `src/lib.rs:1007` | `include_str!("daemon_entity_subscriptions.rs")` | compile | `include_str!("subscription/entity.rs")` |
+| 3 | `src/lib.rs:1011` | `include_str!("daemon_attach_stream.rs")` | compile | `include_str!("subscription/attach_routes.rs")` |
+| 4 | `src/daemon_transport.rs:147` | `#[path = "daemon_attach_stream.rs"]` | compile | removed with the module declaration |
+| 5 | `src/daemon_transport.rs:166` | `#[path = "daemon_entity_subscriptions.rs"]` | compile | removed with the module declaration |
+| 6 | `src/lib.rs:1006` | display string `"src/daemon_entity_subscriptions.rs"` | test message only | `"src/subscription/entity.rs"` |
+| 7 | `src/lib.rs:1010` | display string `"src/daemon_attach_stream.rs"` | test message only | `"src/subscription/attach_routes.rs"` |
+| 8 | `tests/session_projection_owner_loop.rs:176` and `:191` | `fs::read_to_string(root.join(relative))` list entry plus its exclusion comparison | test | `"src/subscription/entity.rs"` in both places |
+| 9 | `tests/hub_daemon_lifecycle/subscription_ownership_baseline.rs:647` | `hub_source("src/daemon_attach_stream.rs")` | test | `hub_source("src/subscription/attach_routes.rs")` |
+| 10 | `tests/hub_daemon_lifecycle/event_plane_saturation.rs:126` and `:176` | `fs::read_to_string(root.join(...))` list entry and direct read | test | `"src/subscription/entity.rs"` and `"src/subscription/attach_routes.rs"` |
+
+Rows 1 through 5 break `cargo build`. Rows 8 through 10 build fine and then panic inside a test, because each one calls `.expect(...)` on a read of a path that no longer exists. Rows 6 and 7 only degrade an assertion message. All ten are the same class of edit — a path that names the relocated file — so all ten belong to that relocation's import-repair commit. Only `src/daemon_event_subscriptions.rs` has no such reference; its relocation needs module-declaration and `use` repair alone.
 
 **Pairing and greenness rule.** A byte-pure relocation cannot compile on its own, because the moved module is no longer declared where it was. Each relocation is therefore immediately followed by its own import-repair commit, with no other commit between them:
 
 - The two commits form a contiguous pair, in the order relocation then import repair.
 - The relocation commit is permitted to be non-green. It is the only commit kind on this branch with that permission, and the permission exists solely so the human-required separation stays visible in history.
-- The tree must be green at the second commit of every pair, and at every extraction and guard-restore commit.
+- **At the second commit of every pair, both `cargo build --locked` and every test that names the relocated file must pass.** The path-reference inventory is what makes the second half of that obligation reachable: without rows 8 through 10 in the import-repair commit, the pair would build and then fail three named-file tests.
+- Every extraction and guard-restore commit must be green on the same two obligations.
 - Gates run at pair boundaries and at every non-relocation commit. They do not run inside a pair.
 
 This keeps the recorded human rule ("keep each relocation separate from import repair and any necessary extraction") and keeps a bisect-usable history, because every commit except the first half of a pair is green.
@@ -226,8 +249,10 @@ Modified:
 - `src/local_webrtc.rs` -- loses the grant registry, grant validation, origin policy, and key derivation. Keeps peer creation, signaling mechanics, framing, sealing, chunking, delivery, and bounded close.
 - `src/unix_terminal_adapter.rs` and `src/webrtc_terminal_adapter.rs` -- delegate close bookkeeping to the single ledger and lose their duplicated copies.
 - `src/lib.rs` -- adds `pub(crate) mod admission;` and `pub(crate) mod subscription;`, removes `mod daemon_event_subscriptions;`, and updates the `production_sources_reject_terminal_drain_and_snapshot_phase_decode` `include_str!` list.
-- `src/host_control_fair_write.rs` -- only if a moved line changes one of its two pinned source strings.
-- `tests/hub_daemon_lifecycle/subscription_ownership_baseline.rs` -- guard file names follow the moved code.
+- `src/host_control_fair_write.rs` -- only if a moved line changes one of its two pinned source strings. It names `src/daemon_transport.rs` and `src/local_webrtc.rs`, neither of which relocates, so no path repair applies to it.
+- `tests/hub_daemon_lifecycle/subscription_ownership_baseline.rs` -- row 9 of the path-reference inventory, plus guard file names that follow extracted code.
+- `tests/session_projection_owner_loop.rs` -- row 8 of the path-reference inventory. Two sites: the scan list entry and the exclusion comparison that names the same path.
+- `tests/hub_daemon_lifecycle/event_plane_saturation.rs` -- row 10 of the path-reference inventory. Two sites: a scan list entry and a direct read.
 - `docs/plans/hub-decomposition-2-extract-admission-and-subscription-ownership.md` -- this plan, in documentation commits that touch no code.
 
 Not modified, and a change in any of them is a scope error:
@@ -241,6 +266,8 @@ Not modified, and a change in any of them is a scope error:
 
 1. **Blind guards.** This is the highest risk, and decomposition 1 already realized it once in commit `468bf7f`. Moving admission and close bookkeeping out of `daemon_transport.rs` and `local_webrtc.rs` can leave `production_sources_reject_terminal_drain_and_snapshot_phase_decode` and the `hub_source()` guards green while they no longer scan the moved code. Mitigation: acceptance checks 17 and 18, with one red ablation per added list entry.
 2. **Self-scan drift.** `src/daemon_transport.rs:6567` scans its own production text for close-event constructs, and `src/host_control_fair_write.rs` pins exact strings in two files. Moving code can make such an assertion trivially true. Mitigation: acceptance check 19 relocates each assertion to the file that now holds the protected text and proves it can still fail.
+
+2a. **Move-forced path references, which break the build or the suite rather than degrading silently.** This is the failure mode Plan Review round 2 found, and the measured inventory shows ten references in seven files rather than the one the finding named. Five break `cargo build`; three panic inside a named test through `.expect(...)` on a read of a vanished path; two only degrade an assertion message. The risk is not that they go unnoticed, because most are loud. The risk is that a plan which routes them to the wrong commit kind makes the pairing rule unsatisfiable, which is exactly what the round-1 and round-2 wordings did. Mitigation: the inventory table assigns all ten to the relocation's own import-repair commit, check 8b proves zero survive with a recorded starting count, and check 8a requires the named-file tests to pass at the pair boundary rather than only `cargo build`.
 3. **Silent behavior change inside the grant extraction.** Grant validation order matters: `redeemed`, then expiry, then secret, then origin. A reordering changes which typed error a client sees. Mitigation: acceptance check 13 asserts the arm order and the identical error text.
 4. **Secret leakage into the transport path.** The current `answer_offer` takes the grant secret. A partial extraction that leaves the secret on the peer path fails the ticket acceptance line. Mitigation: acceptance check 14 is a source assertion plus the compiler.
 5. **False unification of the close-event ledger.** The two implementations are near-identical but not identical. Forcing one code path over a real difference changes wake behavior. Mitigation: assumption 4 requires a recorded diff before unification, and acceptance check 12 requires the existing per-transport close tests to stay green unmodified.
@@ -263,8 +290,9 @@ Move-only proof:
 
 6. `git show --color-moved=dimmed-zebra <commit>` renders each extraction as moved lines. Record the command and the reviewer instruction in each commit message.
 7. Every relocation commit shows `similarity index 100%` under `git show --stat -M --summary`, and `git show --numstat -M` reports zero added and zero deleted lines for that commit. A relocation that reports any changed line has absorbed import repair and must be split.
-8. Every code commit is exactly one of the four kinds, and no commit mixes two kinds. Prove it per commit: a relocation touches exactly one path pair and zero lines; an import-repair commit changes only module declarations, `use` lines, and `pub(crate)` visibility, and changes no test body; an extraction moves one named responsibility; a guard restore touches only guard file lists and named-file assertions.
-8a. Every relocation is immediately followed by its own import-repair commit, with no commit between them. Prove the ordering with `git log --oneline --reverse` and prove the greenness rule by running `cargo build --locked` at the second commit of each pair. The relocation commit itself is the only commit permitted to fail that build.
+8. Every code commit is exactly one of the four kinds, and no commit mixes two kinds. Prove it per commit: a relocation touches exactly one path pair and zero lines; an import-repair commit changes only module declarations and `#[path]` attributes, `use` lines, `pub(crate)` visibility, and the path text of references that already name the relocated file, and it adds no reference and removes no reference and changes no assertion body; an extraction moves one named responsibility; a guard restore only adds scan-list entries for files this ticket creates, or relocates named-file assertions for extracted code.
+8a. Every relocation is immediately followed by its own import-repair commit, with no commit between them. Prove the ordering with `git log --oneline --reverse`. At the second commit of each pair, prove both obligations: `cargo build --locked` succeeds, and every test that names the relocated file passes. The relocation commit itself is the only commit permitted to fail either obligation.
+8b. No stale path reference to a relocated file survives. After each import-repair commit, `grep -rn "daemon_attach_stream\.rs\|daemon_entity_subscriptions\.rs\|daemon_event_subscriptions\.rs" src/ tests/ crates/ script/` returns zero hits for the file that commit's pair relocated. After the last pair it returns zero hits in total. Run the same grep at the base first and record the ten-row starting inventory, so the check measures a real decrease rather than an empty search. Each of the three named-file test guards in rows 8 through 10 must be executed by name, not merely compiled: `cargo test --locked --test session_projection_owner_loop owner_loop_and_projection_sources_reject_unbounded_and_product_policy`, plus the `event_plane_saturation` and `subscription_ownership_baseline` guards that read those paths.
 
 Client-contract oracle, authoritative and unchanged from decomposition 1:
 
@@ -342,3 +370,5 @@ The class applies. This ticket moves peer ownership identity, route ownership, o
 4. A note that peer ownership identity in Hub is the grant id, that no peer-generation counter exists, and that `admission/peer_generation.rs` records the existing identity rather than minting an epoch.
 5. A note that a Hub extraction which unifies two near-identical implementations must record the measured diff before unifying, so a real behavioral difference cannot disappear into a false shared path.
 6. A note that a relocated module's `use super::{...}` block changes meaning and must be rewritten with the exact reach it had before, which is the module-level companion to the `pub(super)` rule decomposition 1 captured.
+7. A note that a byte-pure relocation of a declared Rust module cannot compile alone, so a decomposition that keeps relocation separate from import repair must pair the two commits and state which one may be non-green. A commit-kind invariant that omits import repair is unsatisfiable, which two Plan Review rounds proved on this ticket.
+8. A note that a Hub relocation must enumerate move-forced path references before it moves, because Hub names its own source files in three distinct ways: compile-time `include_str!` literals, `#[path]` module attributes, and run-time path strings read through `hub_source()` or `fs::read_to_string(root.join(...))`. This ticket measured ten such references across seven files for three relocated files. The companion rule to [[hub moves must extend source scanning guard file lists]] is that a guard can also break loudly rather than go blind, and the two failure modes need separate inventories.
