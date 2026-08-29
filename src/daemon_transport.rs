@@ -6220,7 +6220,7 @@ mod tests {
             .nth(1)
             .expect("pump runner");
         let pump = pump
-            .split("fn overlay_live_attach_occupancy")
+            .split("pub(crate) struct DaemonControlState")
             .next()
             .unwrap_or(pump);
         assert!(
