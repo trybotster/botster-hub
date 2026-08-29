@@ -11,7 +11,9 @@ use std::sync::{
     Mutex,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use botster_core::{AesGcmEnvelope, AesGcmKey, decrypt_aes_gcm, encrypt_aes_gcm};
@@ -48,7 +50,6 @@ use crate::daemon_transport::{
 };
 use crate::webrtc_terminal_adapter::WebRtcConnectionMux;
 
-const GRANT_TTL_SECONDS: u64 = 120;
 const WEBRTC_SIGNAL_OPERATION: &str = "local_webrtc_signal";
 // The current Rust WebRTC peer's message receive path is bounded at 16 KiB;
 // 12 KiB leaves transport and JSON framing headroom for every first-party peer.
@@ -176,7 +177,7 @@ impl Default for SharedEventPlane {
 
 #[derive(Default)]
 pub struct LocalWebrtcTransport {
-    grants: BTreeMap<String, LocalWebrtcGrant>,
+    grants: crate::admission::grants::GrantRegistry,
     event_plane: SharedEventPlane,
     peers: BTreeMap<String, Arc<dyn PeerConnection>>,
     /// Live peer ownership records used for fail-closed sibling cleanup.
@@ -225,34 +226,9 @@ impl LocalWebrtcTransport {
         entrypoint_id: &str,
         expected_origin: &str,
     ) -> Result<DaemonLocalWebrtcBootstrap, LocalWebrtcError> {
-        let now = now_seconds();
-        self.prune_expired_grants(now);
-        let grant_id = random_token("grant")?;
-        let grant_secret = random_secret_token()?;
-        let bootstrap = DaemonLocalWebrtcBootstrap {
-            grant_id: grant_id.clone(),
-            grant_secret: grant_secret.clone(),
-            package_name: package_name.to_string(),
-            entrypoint_id: entrypoint_id.to_string(),
-            expected_origin: expected_origin.to_string(),
-            expires_at: now + GRANT_TTL_SECONDS,
-            signaling_transport: "daemon_request".to_string(),
-            data_plane: "webrtc_data_channel".to_string(),
-            ordered: true,
-            max_retransmits: None,
-            max_packet_lifetime_ms: None,
-        };
-        self.grants.insert(
-            grant_id.clone(),
-            LocalWebrtcGrant {
-                grant_id,
-                grant_secret,
-                expected_origin: expected_origin.to_string(),
-                expires_at: bootstrap.expires_at,
-                redeemed: false,
-            },
-        );
-        Ok(bootstrap)
+        self.grants
+            .issue_bootstrap(package_name, entrypoint_id, expected_origin)
+            .map_err(LocalWebrtcError::from)
     }
 
     /// Redeem one grant and create a WebRTC answer for the supplied offer.
@@ -261,17 +237,20 @@ impl LocalWebrtcTransport {
         request: LocalWebrtcSignalRequest,
         runtime_tx: ControlSender,
     ) -> LocalWebrtcResult<DaemonLocalWebrtcAnswer> {
-        let Some(grant) = self.grants.get_mut(&request.grant_id) else {
-            return Err(LocalWebrtcError::MissingGrant);
-        };
-        grant.validate(&request)?;
-        grant.redeemed = true;
-        let grant_id = grant.grant_id.clone();
+        let accepted = self
+            .grants
+            .redeem(&request)
+            .map_err(LocalWebrtcError::from)?;
+        let grant_id = accepted.grant_id.clone();
 
         let event_plane = self.event_plane.0.clone();
-        let answer = self
-            .runtime()?
-            .block_on(answer_offer(request, runtime_tx, event_plane))?;
+        let answer = self.runtime()?.block_on(answer_offer(
+            grant_id.clone(),
+            accepted.stream_key,
+            request.offer,
+            runtime_tx,
+            event_plane,
+        ))?;
         self.peers.insert(grant_id.clone(), answer.peer);
         self.peer_states.insert(grant_id.clone(), answer.peer_state);
         #[cfg(test)]
@@ -523,10 +502,6 @@ impl LocalWebrtcTransport {
         Ok(self.runtime.as_ref().expect("runtime was initialized"))
     }
 
-    fn prune_expired_grants(&mut self, now: u64) {
-        self.grants.retain(|_, grant| grant.expires_at > now);
-    }
-
     #[cfg(test)]
     pub(crate) fn active_peer_count(&self) -> usize {
         self.peers.len()
@@ -604,38 +579,7 @@ impl LocalWebrtcTransport {
     }
 }
 
-pub(crate) struct LocalWebrtcSignalRequest {
-    pub grant_id: String,
-    pub grant_secret: String,
-    pub origin: String,
-    pub offer: Value,
-}
-
-struct LocalWebrtcGrant {
-    grant_id: String,
-    grant_secret: String,
-    expected_origin: String,
-    expires_at: u64,
-    redeemed: bool,
-}
-
-impl LocalWebrtcGrant {
-    fn validate(&self, request: &LocalWebrtcSignalRequest) -> LocalWebrtcResult<()> {
-        if self.redeemed {
-            return Err(LocalWebrtcError::RedeemedGrant);
-        }
-        if self.expires_at <= now_seconds() {
-            return Err(LocalWebrtcError::ExpiredGrant);
-        }
-        if self.grant_secret != request.grant_secret {
-            return Err(LocalWebrtcError::SecretMismatch);
-        }
-        if self.expected_origin != request.origin {
-            return Err(LocalWebrtcError::OriginMismatch);
-        }
-        Ok(())
-    }
-}
+pub(crate) use crate::admission::grants::LocalWebrtcSignalRequest;
 
 struct LocalWebrtcAnswer {
     answer: Value,
@@ -1880,16 +1824,17 @@ fn apply_data_channel_event(
 }
 
 async fn answer_offer(
-    request: LocalWebrtcSignalRequest,
+    grant_id: String,
+    stream_key: AesGcmKey,
+    offer: Value,
     runtime_tx: ControlSender,
     event_plane: Arc<crate::subscription::package_events::ClientEventPlane>,
 ) -> LocalWebrtcResult<LocalWebrtcAnswer> {
     let runtime = default_runtime()
         .ok_or_else(|| LocalWebrtcError::Webrtc("no async runtime".to_string()))?;
-    let stream_key = secret_stream_key(&request.grant_secret)?;
     let (gather_complete_tx, mut gather_complete_rx) = channel::<()>(1);
     let peer_state = Arc::new(LocalWebrtcPeerState::new_with_event_plane(
-        request.grant_id.clone(),
+        grant_id.clone(),
         runtime_tx,
         event_plane,
     ));
@@ -1908,7 +1853,7 @@ async fn answer_offer(
         .await
         .map_err(|error| LocalWebrtcError::Webrtc(error.to_string()))?;
     let peer: Arc<dyn PeerConnection> = Arc::new(peer_connection);
-    let offer = serde_json::from_value::<RTCSessionDescription>(request.offer)
+    let offer = serde_json::from_value::<RTCSessionDescription>(offer)
         .map_err(|error| LocalWebrtcError::InvalidOffer(error.to_string()))?;
     peer.set_remote_description(offer)
         .await
@@ -2428,43 +2373,6 @@ fn random_token(prefix: &str) -> LocalWebrtcResult<String> {
     Ok(format!("{prefix}-{}", hex(&bytes)))
 }
 
-fn random_secret_token() -> LocalWebrtcResult<String> {
-    let mut bytes = [0_u8; 32];
-    getrandom::fill(&mut bytes).map_err(|error| LocalWebrtcError::Random(error.to_string()))?;
-    Ok(format!("secret-{}", hex(&bytes)))
-}
-
-fn secret_stream_key(secret: &str) -> LocalWebrtcResult<AesGcmKey> {
-    let encoded = secret
-        .strip_prefix("secret-")
-        .ok_or_else(|| LocalWebrtcError::Webrtc("invalid bootstrap secret".to_string()))?;
-    let bytes = decode_hex(encoded)
-        .ok_or_else(|| LocalWebrtcError::Webrtc("invalid bootstrap secret".to_string()))?;
-    AesGcmKey::from_slice(&bytes).map_err(|error| LocalWebrtcError::Webrtc(error.to_string()))
-}
-
-fn decode_hex(encoded: &str) -> Option<Vec<u8>> {
-    if !encoded.len().is_multiple_of(2) {
-        return None;
-    }
-    let mut output = Vec::with_capacity(encoded.len() / 2);
-    for pair in encoded.as_bytes().chunks_exact(2) {
-        let high = hex_value(pair[0])?;
-        let low = hex_value(pair[1])?;
-        output.push((high << 4) | low);
-    }
-    Some(output)
-}
-
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
 fn hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);
@@ -2473,13 +2381,6 @@ fn hex(bytes: &[u8]) -> String {
         output.push(HEX[(byte & 0x0f) as usize] as char);
     }
     output
-}
-
-fn now_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
 }
 
 pub(crate) type LocalWebrtcResult<T> = Result<T, LocalWebrtcError>;
@@ -2517,6 +2418,21 @@ impl fmt::Display for LocalWebrtcError {
 }
 
 impl Error for LocalWebrtcError {}
+
+impl From<crate::admission::grants::GrantAdmissionError> for LocalWebrtcError {
+    fn from(error: crate::admission::grants::GrantAdmissionError) -> Self {
+        use crate::admission::grants::GrantAdmissionError;
+        match error {
+            GrantAdmissionError::MissingGrant => Self::MissingGrant,
+            GrantAdmissionError::ExpiredGrant => Self::ExpiredGrant,
+            GrantAdmissionError::RedeemedGrant => Self::RedeemedGrant,
+            GrantAdmissionError::SecretMismatch => Self::SecretMismatch,
+            GrantAdmissionError::OriginMismatch => Self::OriginMismatch,
+            GrantAdmissionError::Random(error) => Self::Random(error),
+            GrantAdmissionError::InvalidSecret(error) => Self::Webrtc(error),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -4301,41 +4217,6 @@ mod tests {
         let mut expected_order = vec!["status"; LOCAL_WEBRTC_PENDING_REQUESTS - 1];
         expected_order.extend(["overflow", "new-request", "overflow"]);
         assert_eq!(emitted_order, expected_order);
-    }
-
-    #[test]
-    fn issuing_bootstrap_prunes_expired_grants_and_keeps_live_replay_diagnostics() {
-        let now = now_seconds();
-        let mut transport = LocalWebrtcTransport::default();
-        transport.grants.insert(
-            "grant-expired".to_string(),
-            LocalWebrtcGrant {
-                grant_id: "grant-expired".to_string(),
-                grant_secret: "secret-expired".to_string(),
-                expected_origin: "http://127.0.0.1:1".to_string(),
-                expires_at: now.saturating_sub(1),
-                redeemed: true,
-            },
-        );
-        transport.grants.insert(
-            "grant-live-redeemed".to_string(),
-            LocalWebrtcGrant {
-                grant_id: "grant-live-redeemed".to_string(),
-                grant_secret: "secret-live".to_string(),
-                expected_origin: "http://127.0.0.1:2".to_string(),
-                expires_at: now + GRANT_TTL_SECONDS,
-                redeemed: true,
-            },
-        );
-
-        let bootstrap = transport
-            .issue_bootstrap("botster-web", "web-client", "http://127.0.0.1:41739")
-            .expect("issue bootstrap");
-
-        assert!(!transport.grants.contains_key("grant-expired"));
-        assert!(transport.grants.contains_key("grant-live-redeemed"));
-        assert!(transport.grants.contains_key(&bootstrap.grant_id));
-        assert_eq!(transport.grants.len(), 2);
     }
 
     // --- Production peer_failed teardown harnesses (H1–H3) ---

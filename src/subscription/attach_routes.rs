@@ -116,10 +116,7 @@ impl AttachStream {
         {
             return true;
         }
-        match (grant_id, self.owner.grant_id.as_deref()) {
-            (Some(left), Some(right)) => left == right,
-            _ => false,
-        }
+        crate::admission::peer_generation::grant_ids_match(self.owner.grant_id.as_deref(), grant_id)
     }
 
     fn close_adapter(&mut self) {

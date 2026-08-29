@@ -4879,7 +4879,7 @@ fn issue_local_webrtc_bootstrap_response(
             format!("entrypoint {package_name}/{entrypoint_id} has no structured local_url"),
         ));
     };
-    let Some(expected_origin) = origin_from_local_url(&local_url) else {
+    let Some(expected_origin) = crate::admission::grants::origin_from_local_url(&local_url) else {
         return Ok(local_webrtc_bootstrap_issue_error(
             "local_webrtc_bootstrap_invalid_local_url",
             format!("entrypoint {package_name}/{entrypoint_id} local_url has no origin"),
@@ -4897,19 +4897,6 @@ fn issue_local_webrtc_bootstrap_response(
             .local_webrtc()
             .issue_bootstrap(package_name, entrypoint_id, &expected_origin)?;
     Ok(daemon_local_webrtc_bootstrap(bootstrap))
-}
-
-fn origin_from_local_url(local_url: &str) -> Option<String> {
-    let scheme_end = local_url.find("://")?;
-    let after_scheme = scheme_end + 3;
-    let authority_end = local_url[after_scheme..]
-        .find(['/', '?', '#'])
-        .map(|index| after_scheme + index)
-        .unwrap_or(local_url.len());
-    if authority_end == after_scheme {
-        return None;
-    }
-    Some(local_url[..authority_end].to_string())
 }
 
 fn persist_spawn_targets(
