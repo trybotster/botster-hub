@@ -128,8 +128,10 @@ Measured on this worktree at `fd540b6`, with `RUSTUP_TOOLCHAIN=1.97.0` exported 
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0 |
 | `cargo build --locked -p botster-core-daemon --bin botster-session-worker` | exit 0 |
 | `cargo build --locked --bin botster-hub` | exit 0 |
-| `./test.sh --locked` | recorded in this visit's gate evidence |
-| `git status --porcelain` | recorded in this visit's gate evidence |
+| `./test.sh --locked` | exit 0, zero failures |
+| `git status --porcelain` | empty |
+
+The `./test.sh --locked` run was captured through `tail -60`, so this record keeps the exit code and the absence of any failure line rather than a total test count. Implement must record the full count from an untruncated run.
 
 Tracked `.gitignore` is present and non-empty at HEAD, so no `git checkout HEAD -- .gitignore` restore is required.
 
