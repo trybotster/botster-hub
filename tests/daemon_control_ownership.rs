@@ -57,7 +57,7 @@ fn daemon_modules_reject_unix_transport_mechanism_symbols() {
 #[test]
 fn webrtc_liveness_gates_remain_four_distinct_sites() {
     let connection = hub_source("src/daemon/control/connection.rs");
-    let control = hub_source("src/daemon/control.rs");
+    let request = hub_source("src/daemon/control/request.rs");
     let entities = hub_source("src/daemon/control/entities.rs");
     assert!(
         connection.contains("has_live_peer(&grant_id)"),
@@ -67,27 +67,20 @@ fn webrtc_liveness_gates_remain_four_distinct_sites() {
         !connection.contains("local_webrtc_peer_gone_request_error"),
         "connection insert gate drops rather than returning a request error"
     );
-    let request_open = format!(
-        "ControlMessage::Request {}",
-        char::from_u32(0x7b).expect("left brace")
-    );
-    let request_gate = control
-        .split(&request_open)
-        .nth(1)
-        .expect("Request arm")
-        .split("        ControlMessage::HubUpdateCheckCompleted")
-        .next()
-        .expect("Request arm end");
     assert!(
-        request_gate.contains("has_live_peer(grant_id)"),
-        "Request pre-dispatch gate must stay in control.rs"
+        request.contains("has_live_peer(grant_id)"),
+        "Request pre-dispatch gate must stay in request.rs"
     );
     assert!(
-        request_gate.contains("local_webrtc_peer_gone_request_error"),
+        request.contains("local_webrtc_peer_gone_request_error"),
         "Request gate must use local_webrtc_peer_gone_request_error"
     );
-    let sessions_call = request_gate.find("handle_control_request");
-    let live_peer = request_gate.find("has_live_peer(grant_id)");
+    let request_body = request
+        .split("pub(crate) fn handle(")
+        .nth(1)
+        .expect("request owner");
+    let sessions_call = request_body.find("handle_control_request");
+    let live_peer = request_body.find("has_live_peer(grant_id)");
     assert!(
         live_peer.is_some()
             && sessions_call.is_some()
@@ -394,12 +387,40 @@ fn each_daemon_request_has_exactly_one_family_owner() {
 #[test]
 fn dispatcher_names_request_variants_only_in_delegating_arms() {
     let dispatcher = hub_source("src/daemon/control.rs");
-    for forbidden in ["HubClientApi", "FileHubStateStore"] {
+    for forbidden in [
+        "HubClientApi",
+        "FileHubStateStore",
+        "overlay_live_attach_occupancy",
+        "drain_owned_before",
+        "record_acknowledged_spawn",
+        "events::handle_client_event_request",
+        "host::handle_request",
+    ] {
         assert!(
             !dispatcher.contains(forbidden),
-            "control.rs must not call {forbidden}"
+            "control.rs must not contain request-specific {forbidden}"
         );
     }
+    let request_open = format!(
+        "ControlMessage::Request {}",
+        char::from_u32(0x7b).expect("left brace")
+    );
+    let request_arm = dispatcher
+        .split(&request_open)
+        .nth(1)
+        .expect("Request arm")
+        .split("ControlMessage::HubUpdateCheckCompleted")
+        .next()
+        .expect("Request arm end");
+    assert!(
+        request_arm.contains("request::handle("),
+        "Request arm must delegate once to request::handle"
+    );
+    assert_eq!(
+        request_arm.matches("::handle(").count(),
+        1,
+        "Request arm must contain exactly one handle delegation: {request_arm}"
+    );
     let runtime = dispatcher
         .split("pub(crate) fn handle_runtime_control_request(")
         .nth(1)
@@ -465,10 +486,14 @@ fn control_message_variants_have_one_family_or_dispatcher_owner() {
     assert!(host.contains("ControlMessage::HubUpdateCheckCompleted"));
     assert!(webrtc.contains("fn handle_peer_closed"));
     assert!(dispatcher.contains("ControlMessage::Request"));
+    assert!(dispatcher.contains("request::handle"));
     assert!(dispatcher.contains("ControlMessage::EgressWriteFailed"));
     assert!(dispatcher.contains("ControlMessage::LocalWebrtcPeerClosed"));
     assert!(dispatcher.contains("webrtc::handle_peer_closed"));
     assert!(dispatcher.contains("host::hub_update_check_completed"));
+    let request = hub_source("src/daemon/control/request.rs");
+    assert!(request.contains("overlay_live_attach_occupancy"));
+    assert!(request.contains("has_live_peer(grant_id)"));
 
     for (path, source) in [
         (
@@ -524,4 +549,21 @@ fn duplicating_a_variant_into_the_wrong_owner_fails_the_matrix() {
         "PluginMcpListTools must not remain in sessions.rs"
     );
     let _ = request_variant_names(&sessions);
+}
+
+#[test]
+fn control_rs_request_arm_rejects_inlined_post_processing() {
+    let dispatcher = hub_source("src/daemon/control.rs");
+    for needle in [
+        "overlay_live_attach_occupancy",
+        "drain_owned_before",
+        "acknowledged_spawn_ids",
+        "shutdown_error_host_close",
+        "explicit_detach",
+    ] {
+        assert!(
+            !dispatcher.contains(needle),
+            "inserting {needle} into control.rs must fail this single-delegation boundary"
+        );
+    }
 }

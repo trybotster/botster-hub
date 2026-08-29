@@ -31,7 +31,16 @@ pub(crate) fn handle_request(
             base_ref,
             metadata,
         } => create_spawn_target_response(
-            daemon, target_id, label, root, enabled, kind, base_ref, metadata,
+            daemon,
+            SpawnTargetCreate {
+                target_id,
+                label,
+                root,
+                enabled,
+                kind,
+                base_ref,
+                metadata,
+            },
         ),
         DaemonRequest::UpdateSpawnTarget {
             target_id,
@@ -42,7 +51,16 @@ pub(crate) fn handle_request(
             base_ref,
             metadata,
         } => update_spawn_target_response(
-            daemon, target_id, label, root, enabled, kind, base_ref, metadata,
+            daemon,
+            target_id,
+            SpawnTargetUpdate {
+                label,
+                root,
+                enabled,
+                kind,
+                base_ref,
+                metadata,
+            },
         ),
         DaemonRequest::DeleteSpawnTarget { target_id } => {
             delete_spawn_target_response(daemon, target_id)
@@ -305,34 +323,17 @@ pub(crate) fn emit_worktree_lifecycle_event(
 
 pub(crate) fn create_spawn_target_response(
     daemon: &mut HubDaemon,
-    target_id: Option<String>,
-    label: Option<String>,
-    root: std::path::PathBuf,
-    enabled: bool,
-    kind: Option<String>,
-    base_ref: Option<String>,
-    metadata: std::collections::BTreeMap<String, String>,
+    request: SpawnTargetCreate,
 ) -> DaemonTransportResult<DaemonResponse> {
     // Only pre-check session-types once the root is known to be a directory.
     // Non-directory roots must fall through to create_spawn_target's
     // root_not_directory rather than a misleading invalid_repo_session_types.
-    if enabled && root.is_dir() {
-        super::session_types::ensure_repo_session_types_valid_for_enabled_root(&root)?;
+    if request.enabled && request.root.is_dir() {
+        super::session_types::ensure_repo_session_types_valid_for_enabled_root(&request.root)?;
     }
     let before_session_types = super::session_types::session_type_definition_map(daemon)?;
     let response = mutate_spawn_targets_response(daemon, |targets| {
-        crate::create_spawn_target(
-            targets,
-            SpawnTargetCreate {
-                target_id,
-                label,
-                root,
-                enabled,
-                kind,
-                base_ref,
-                metadata,
-            },
-        )
+        crate::create_spawn_target(targets, request)
     })?;
     super::session_types::advance_session_type_generation_if_changed(
         daemon,
@@ -344,20 +345,15 @@ pub(crate) fn create_spawn_target_response(
 pub(crate) fn update_spawn_target_response(
     daemon: &mut HubDaemon,
     target_id: String,
-    label: Option<String>,
-    root: Option<std::path::PathBuf>,
-    enabled: Option<bool>,
-    kind: Option<String>,
-    base_ref: Option<Option<String>>,
-    metadata: Option<std::collections::BTreeMap<String, String>>,
+    request: SpawnTargetUpdate,
 ) -> DaemonTransportResult<DaemonResponse> {
-    let recovery_disable = enabled == Some(false);
+    let recovery_disable = request.enabled == Some(false);
     if !recovery_disable {
         super::session_types::ensure_update_would_not_enable_invalid_repo_session_types(
             daemon,
             &target_id,
-            root.as_ref(),
-            enabled,
+            request.root.as_ref(),
+            request.enabled,
         )?;
     }
     let before_session_types = match super::session_types::session_type_definition_map(daemon) {
@@ -371,7 +367,7 @@ pub(crate) fn update_spawn_target_response(
         Err(error) => return Err(error),
     };
     let response = mutate_spawn_targets_with_worktrees_response(daemon, |targets, worktrees| {
-        if kind.as_deref().is_some_and(|kind| kind != "git")
+        if request.kind.as_deref().is_some_and(|kind| kind != "git")
             && worktrees.iter().any(|worktree| {
                 worktree.target_id == target_id && worktree.management == "hub_managed_git"
             })
@@ -381,18 +377,7 @@ pub(crate) fn update_spawn_target_response(
                 "Git target cannot be reclassified while managed worktrees reference it",
             ));
         }
-        crate::update_spawn_target(
-            targets,
-            &target_id,
-            SpawnTargetUpdate {
-                label,
-                root,
-                enabled,
-                kind,
-                base_ref,
-                metadata,
-            },
-        )
+        crate::update_spawn_target(targets, &target_id, request)
     })?;
     match before_session_types {
         Some(before) => {

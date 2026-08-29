@@ -13,7 +13,7 @@ use crate::HubDaemon;
 use crate::client_api_dto::response::{
     daemon_local_webrtc_answer, daemon_local_webrtc_bootstrap, daemon_response_base,
 };
-use crate::daemon::control::message::ControlSender;
+use crate::daemon::control::message::{ControlMessage, ControlSender};
 use crate::daemon::control::{DaemonObservability, handle_control_request};
 use crate::daemon::error::{DaemonTransportResult, local_webrtc_bootstrap_issue_error};
 use crate::daemon::owner_loop::{DaemonControlState, PendingRuntimeState};
@@ -204,11 +204,17 @@ pub(crate) fn handle_peer_closed(
     state: &mut DaemonControlState,
     local_webrtc_terminal_record_path: &Path,
     control_tx: ControlSender,
-    grant_id: String,
-    attached_subscriptions: Vec<LocalWebrtcAttachedSubscription>,
-    entity_subscription_ids: Vec<String>,
-    terminal_record: LocalWebrtcSenderTerminalRecord,
+    message: ControlMessage,
 ) -> bool {
+    let ControlMessage::LocalWebrtcPeerClosed {
+        grant_id,
+        attached_subscriptions,
+        entity_subscription_ids,
+        terminal_record,
+    } = message
+    else {
+        unreachable!("webrtc peer-closed owner received a non-peer-closed control message");
+    };
     let cleanup_reason = format!("webrtc_{}", terminal_record.cause);
     *state
         .lifecycle_counters
