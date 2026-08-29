@@ -139,11 +139,23 @@ Tracked `.gitignore` is present and non-empty at HEAD, so no `git checkout HEAD 
 
 This ticket is move-only in behavior. It changes no wire format, no DTO, no serde name, no protocol version, no limit value, and no test name.
 
-Commit kinds are stated as an invariant rather than a fixed count, per [[express scope limits as invariants not closed enumerations]]. **Every code commit on this branch is exactly one of three kinds, and no commit mixes two kinds:**
+Commit kinds are stated as an invariant rather than a fixed count, per [[express scope limits as invariants not closed enumerations]]. **Every code commit on this branch is exactly one of four kinds, and no commit mixes two kinds:**
 
-- **Relocation.** A `git mv` of one file to its owner path, plus the module declarations that keep the crate compiling. No line inside the moved file changes except module-path repair that the move forces.
+- **Relocation.** Exactly one `git mv` of one file to its owner path. The moved file's bytes do not change at all. The commit carries no other edit of any kind.
+- **Import repair.** The edits that make the tree compile again after one relocation: module declarations added or removed in `src/lib.rs`, `src/daemon.rs`, or `src/daemon_transport.rs`; `use` path rewrites, including the `use super::{...}` block whose meaning the move changed; and the `pub(crate)` visibility widening that the move forces. It changes no logic and no test body.
 - **Extraction.** One responsibility leaves its current file and lands in a named owner file, with its state, policy, and tests. No behavior changes.
 - **Guard restore.** Source-scanning guard file lists and named-file assertions follow the code they protect.
+
+Plan Review round 1 found the earlier three-kind list self-contradictory, and it was: a relocation cannot be byte-pure and also carry the module-path repair that the recorded human decision requires to stay separate. Import repair is now its own kind, and the relocation kind is narrowed to the `git mv` alone.
+
+**Pairing and greenness rule.** A byte-pure relocation cannot compile on its own, because the moved module is no longer declared where it was. Each relocation is therefore immediately followed by its own import-repair commit, with no other commit between them:
+
+- The two commits form a contiguous pair, in the order relocation then import repair.
+- The relocation commit is permitted to be non-green. It is the only commit kind on this branch with that permission, and the permission exists solely so the human-required separation stays visible in history.
+- The tree must be green at the second commit of every pair, and at every extraction and guard-restore commit.
+- Gates run at pair boundaries and at every non-relocation commit. They do not run inside a pair.
+
+This keeps the recorded human rule ("keep each relocation separate from import repair and any necessary extraction") and keeps a bisect-usable history, because every commit except the first half of a pair is green.
 
 ### In scope
 
@@ -186,9 +198,9 @@ Commit kinds are stated as an invariant rather than a fixed count, per [[express
 
 ## Assumptions And Unknowns
 
-1. **Assumption.** The three subscription-family relocations are `git mv` operations that keep file contents byte-identical except for module-path repair. Recorded decision 1 states this. Risk if wrong: a reviewer reads a relocation as a rewrite. Acceptance check 3 measures it.
+1. **Assumption.** The three subscription-family relocations are `git mv` operations that keep the moved file byte-identical, with every compile-restoring edit deferred to the paired import-repair commit. Recorded decision 1 requires that separation. Risk if wrong: a reviewer reads a relocation as a rewrite. Acceptance checks 7 and 8a measure it.
 2. **Assumption.** `src/daemon_entity_subscriptions.rs` and `src/daemon_event_subscriptions.rs` each hold exactly one subscription family. Evidence: `daemon_entity_subscriptions.rs` exports only `EntityFrameSender` and `EntitySubscriptionState` plus entity drive functions; `daemon_event_subscriptions.rs` exports only `ClientEventPlane`, `ClientEventMailbox`, subject compilation, and event responses. Implement must confirm this file-by-file before the relocation commit and record any responsibility that falls outside the family, per recorded decision 1.
-3. **Assumption.** Relocating `daemon_entity_subscriptions.rs` out of `daemon_transport` forces rewriting its `use super::{DAEMON_MAX_FRAME_BYTES, DaemonControlState, HubDaemon, daemon_response_base, daemon_session_type_from_client, session_type_entity_snapshot}` block at line 24, because `super` changes meaning. `DAEMON_MAX_FRAME_BYTES` resolves to `crate::admission::budgets` after this ticket; the rest resolve to `crate::daemon_transport` and `crate::client_api_dto`. Some of those items are private today and must widen to `pub(crate)`. That widening is move-forced and adds no public API, exactly as decomposition 1 recorded for `pub(super)` mappers. This import repair is its own commit.
+3. **Assumption.** Relocating `daemon_entity_subscriptions.rs` out of `daemon_transport` forces rewriting its `use super::{DAEMON_MAX_FRAME_BYTES, DaemonControlState, HubDaemon, daemon_response_base, daemon_session_type_from_client, session_type_entity_snapshot}` block at line 24, because `super` changes meaning. `DAEMON_MAX_FRAME_BYTES` resolves to `crate::admission::budgets` after this ticket; the rest resolve to `crate::daemon_transport` and `crate::client_api_dto`. Some of those items are private today and must widen to `pub(crate)`. That widening is move-forced and adds no public API, exactly as decomposition 1 recorded for `pub(super)` mappers. This repair is an import-repair commit, paired with and immediately following its relocation.
 4. **Assumption.** The close-event ledger can be unified behind one wake abstraction. Evidence: the measured 24-line diff between the two implementations. Implement must diff the two blocks again on the exact base it builds on, record which lines differ, and keep any genuinely divergent line in its own transport rather than forcing a false unification. `close_events_admitted` on the WebRTC mux is close-event Hello negotiation and stays with the WebRTC mux in this ticket; moving it is a transport-split concern.
 5. **Assumption.** `admission/grants.rs` needs its own typed error rather than reusing `LocalWebrtcError`. `LocalWebrtcError` carries transport arms as well as the five grant arms `MissingGrant`, `RedeemedGrant`, `ExpiredGrant`, `SecretMismatch`, and `OriginMismatch`. The behavior-neutral seam is a `GrantAdmissionError` with exactly those five arms plus the random and key-derivation failures, and a `From` implementation in `local_webrtc.rs` that maps each arm to the identical existing `LocalWebrtcError` variant. Every `Display` string and every `DaemonResponse` mapping stays byte-identical. Acceptance check 13 proves it.
 6. **Assumption.** `answer_offer` stops receiving `grant_secret`. After the extraction, admission validates and redeems the grant, derives the session key, and hands the transport an accepted-peer value that carries the `grant_id` and the derived `AesGcmKey`. `LocalWebrtcSignalRequest` keeps its current shape, because it is the inbound request that admission consumes, not a transport input. Acceptance check 14 proves the transport no longer names the secret.
@@ -249,9 +261,10 @@ Ownership proof, which is the real acceptance test:
 
 Move-only proof:
 
-6. `git show --color-moved=dimmed-zebra <commit>` renders each relocation and extraction as moved lines. Record the command and the reviewer instruction in each commit message.
-7. Each relocation commit shows a pure rename in `git show --stat -M`, with a similarity index of 100 percent where the module-path repair is empty and a named similarity index otherwise.
-8. No commit mixes a relocation with an extraction or with a guard restore.
+6. `git show --color-moved=dimmed-zebra <commit>` renders each extraction as moved lines. Record the command and the reviewer instruction in each commit message.
+7. Every relocation commit shows `similarity index 100%` under `git show --stat -M --summary`, and `git show --numstat -M` reports zero added and zero deleted lines for that commit. A relocation that reports any changed line has absorbed import repair and must be split.
+8. Every code commit is exactly one of the four kinds, and no commit mixes two kinds. Prove it per commit: a relocation touches exactly one path pair and zero lines; an import-repair commit changes only module declarations, `use` lines, and `pub(crate)` visibility, and changes no test body; an extraction moves one named responsibility; a guard restore touches only guard file lists and named-file assertions.
+8a. Every relocation is immediately followed by its own import-repair commit, with no commit between them. Prove the ordering with `git log --oneline --reverse` and prove the greenness rule by running `cargo build --locked` at the second commit of each pair. The relocation commit itself is the only commit permitted to fail that build.
 
 Client-contract oracle, authoritative and unchanged from decomposition 1:
 
@@ -302,8 +315,8 @@ The class applies. This ticket moves peer ownership identity, route ownership, o
 
 | Message | Durable row and owner after this ticket | Owner tag | Rejection after terminal failure | Sweep on `PeerClosed` race | Moves in this ticket |
 |---|---|---|---|---|---|
-| `Attach` | `AttachStreamRegistry.streams`, `active_subscriptions`, `attach_owner_grant_ids`, `connection_bound_routes` in `src/subscription/attach_routes.rs` | `AttachStreamOwner.grant_id` for WebRTC; the connection id for Unix | Pre-READY attach failure creates no route and increments no lifecycle count | Route-aware idempotent cleanup keyed on route identity; cannot decrement another route | **Relocation only.** The file moves; no line of admission or cleanup logic changes |
-| `Detach` | Same registry, removal path | Same route identity | Detach failure cleanup stays route-aware | Shares the live attach route set | Relocation only |
+| `Attach` | `AttachStreamRegistry.streams`, `active_subscriptions`, `attach_owner_grant_ids`, `connection_bound_routes` in `src/subscription/attach_routes.rs` | `AttachStreamOwner.grant_id` for WebRTC; the connection id for Unix | Pre-READY attach failure creates no route and increments no lifecycle count | Route-aware idempotent cleanup keyed on route identity; cannot decrement another route | **Relocation plus its own import repair.** The file moves byte-pure; the paired commit repairs only module declarations, `use` lines, and move-forced `pub(crate)` visibility. No line of admission or cleanup logic changes |
+| `Detach` | Same registry, removal path | Same route identity | Detach failure cleanup stays route-aware | Shares the live attach route set | Relocation plus its own import repair |
 | `SubscribeEntities` / `UnsubscribeEntities` | Entity subscription rows in `src/subscription/entity.rs` | `owner_grant_id` | Typed operator error without dropping transport | Owner-scoped removal on peer close | Relocation plus its own import repair |
 | `SubscribeEvents` / `UnsubscribeEvents` | Connection-scoped holders and bounded mailboxes in `src/subscription/package_events.rs` | Connection-scoped holder identity, per [[Client event holders are connection-scoped]] | Bounded shed and typed rejection; at most `MAX_SUBSCRIPTIONS_PER_CONNECTION` per connection | Connection-scoped unsubscribe and cleanup | Relocation plus its own import repair |
 | `Spawn` / `SpawnSessionType` | Session ownership in Core, reached through `HubRuntime` | Core session id | Typed operator error; no Hub row on failure | Core-owned; survives peer close | No |
