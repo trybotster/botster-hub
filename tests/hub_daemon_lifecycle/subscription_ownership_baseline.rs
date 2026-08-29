@@ -444,7 +444,7 @@ fn webrtc_ready_entity_frame_defers_terminal_output() {
 #[test]
 fn terminal_input_travels_as_a_json_control_request() {
     let _guard = daemon_test_guard();
-    let transport = hub_source("src/daemon_transport.rs");
+    let transport = hub_source("src/daemon/control.rs");
     assert!(
         transport.contains("DaemonRequest::SendInput { session_id, data } =>"),
         "SendInput must stay a JSON control request"
@@ -576,7 +576,21 @@ fn no_lua_dispatch_in_terminal_input_or_output() {
         "src/transport/unix/listener.rs",
         "src/transport/unix/connection.rs",
         "src/transport/unix/mux_write.rs",
-        "src/daemon_transport.rs",
+        "src/daemon/owner_loop.rs",
+        "src/daemon/control.rs",
+        "src/daemon/control/message.rs",
+        "src/daemon/control/connection.rs",
+        "src/daemon/control/sessions.rs",
+        "src/daemon/control/session_types.rs",
+        "src/daemon/control/spawn_targets.rs",
+        "src/daemon/control/packages.rs",
+        "src/daemon/control/packages/mutations.rs",
+        "src/daemon/control/messaging.rs",
+        "src/daemon/control/plugins.rs",
+        "src/daemon/control/entities.rs",
+        "src/daemon/control/events.rs",
+        "src/daemon/control/webrtc.rs",
+        "src/daemon/control/host.rs",
         "src/client_api.rs",
     ] {
         let source = hub_source(entry);

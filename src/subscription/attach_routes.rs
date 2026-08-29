@@ -24,7 +24,7 @@ use botster_terminal_protocol::{
 use crate::HubDaemon;
 use crate::HubRuntime;
 use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
-use crate::daemon_transport::PendingRuntimeState;
+use crate::daemon::owner_loop::PendingRuntimeState;
 use crate::transport::unix::{UnixConnectionMux, UnixTerminalAdapter, UnixTerminalAdapterHandle};
 use crate::transport::webrtc::{
     WebRtcConnectionMux, WebRtcTerminalAdapter, WebRtcTerminalAdapterHandle,
@@ -1043,7 +1043,7 @@ mod tests {
         let rows = live_attach_occupancy_rows(
             &hub_routes,
             &inventory,
-            &crate::daemon_transport::PendingRuntimeState::default(),
+            &crate::daemon::owner_loop::PendingRuntimeState::default(),
         );
         assert!(
             rows.iter()
@@ -1079,7 +1079,7 @@ mod tests {
         let rows = live_attach_occupancy_rows(
             &registry.live_attach_routes,
             &[],
-            &crate::daemon_transport::PendingRuntimeState::default(),
+            &crate::daemon::owner_loop::PendingRuntimeState::default(),
         );
         assert!(
             rows.iter().any(|row| {

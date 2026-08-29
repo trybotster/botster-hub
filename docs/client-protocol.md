@@ -3,7 +3,8 @@
 The authoritative reusable client-to-hub daemon protocol lives in:
 
 - `crates/botster-hub-client/src/lib.rs`
-- `src/daemon_transport.rs`
+- `src/daemon/control/`
+- `src/daemon/owner_loop.rs`
 
 The renderer-neutral UI contract used by those protocol DTOs lives in:
 
@@ -1018,7 +1019,7 @@ botster-hub packages config set --data-dir <path> <package> '{"endpoint":{"type"
 The control-plane production route is:
 
 `botster_hub_client::DaemonConnection::request`
-to the daemon socket, then `src/daemon_transport.rs` `serve_daemon`/`handle_connection`, then `handle_runtime_control_request`, then `HubClientApi::handle_request`, then `HubRuntime` and the core daemon `SessionIo`/`ClientWorker` terminal data plane.
+to the daemon socket, then `src/daemon/owner_loop.rs` `serve_daemon` and `src/transport/unix/connection.rs` `handle_connection`, then `src/daemon/control/` `handle_runtime_control_request`, then `HubClientApi::handle_request`, then `HubRuntime` and the core daemon `SessionIo`/`ClientWorker` terminal data plane.
 
 Published client conformance drives Attach plus `ReadScreen` through
 `botster_hub_client::DaemonConnection`. `stream_attach` is a host-completion
@@ -1084,7 +1085,7 @@ later decoded `TerminalOutput` payload bytes are renderable terminal text.
 `DaemonRequest::CaptureSnapshot` are control-plane request/response readback
 operations for a running session. They route through the same production path
 as other local clients:
-`daemon_transport -> HubClientApi -> HubRuntime -> CoreDaemon`. `ReadScreen`
+`src/daemon/owner_loop.rs` / `src/daemon/control/` -> `HubClientApi` -> `HubRuntime` -> `CoreDaemon`. `ReadScreen`
 returns `DaemonReadScreen { session_id, text }`. `ReadModeFlags` returns the full
 authoritative `DaemonModeFlags` projection (`session_id`, `kitty_enabled`,
 `cursor_visible`, `bracketed_paste`, `mouse_mode`, `alt_screen`,
@@ -1204,7 +1205,7 @@ Run the ignored 32-session local case with:
 ```
 
 Both commands exercise `botster-hub-client` over the daemon socket, then
-`daemon_transport -> HubClientApi -> HubRuntime -> CoreDaemon`, and finally the
+`src/daemon/owner_loop.rs` / `src/daemon/control/` -> `HubClientApi` -> `HubRuntime` -> `CoreDaemon`, and finally the
 worker-backed `SessionIo`/`ClientWorker` terminal path. The session counts are
 bounded correctness cases, not performance targets or benchmark claims.
 

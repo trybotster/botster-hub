@@ -59,7 +59,6 @@ pub mod credentials;
 pub mod daemon;
 mod daemon_maintenance;
 mod daemon_projection;
-pub mod daemon_transport;
 pub mod entrypoint_supervisor;
 pub(crate) mod event_plane_counters;
 mod host_control_fair_write;
@@ -97,7 +96,35 @@ pub use botster_core::{
 pub const LOCAL_RUNTIME_DAEMON_READINESS_BUDGET: std::time::Duration =
     std::time::Duration::from_secs(30);
 
+pub use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
+pub use crate::daemon::owner_loop::serve_daemon;
+pub use crate::transport::unix::connection::{
+    DaemonConnection, request as daemon_transport_request, stream_attach,
+};
 pub use crate::transport::webrtc::{LocalWebrtcError, LocalWebrtcTransport};
+pub use botster_hub_client::{
+    DaemonApp, DaemonAppLaunchTarget, DaemonAttachOccupancy, DaemonAvailablePackage,
+    DaemonCapability, DaemonCompatibility, DaemonCoordination, DaemonEnvelope, DaemonEnvelopeAck,
+    DaemonEnvelopeDelivery, DaemonEnvelopePublish, DaemonEvent, DaemonHubUpdate,
+    DaemonHubUpdateExecution, DaemonHubUpdateExecutionState, DaemonHubUpdateScope,
+    DaemonHubUpdateState, DaemonIdentity, DaemonInstallationDiagnostic, DaemonInstallationIdentity,
+    DaemonInstallationMode, DaemonModeFlags, DaemonNotify, DaemonOperatorError, DaemonPackage,
+    DaemonPackageActionRequest, DaemonPackageActionRequiredReference, DaemonPackageActionState,
+    DaemonPackageActionStatus, DaemonPackageAvailability, DaemonPackageAvailabilityReason,
+    DaemonPackageAvailabilityState, DaemonPackageCompatibility, DaemonPackageConfiguration,
+    DaemonPackageDecision, DaemonPackageDependencyAvailability, DaemonPackageDiagnostic,
+    DaemonPackageEnvironmentRequirement, DaemonPackageFeatureAvailability,
+    DaemonPackageInstallEffect, DaemonPackageInstallPlan, DaemonPackageNavigationEntry,
+    DaemonPackageNavigationSource, DaemonPackagePin, DaemonPackageProcess,
+    DaemonPackageRouteDescriptor, DaemonPackageRouteTarget, DaemonPackageRunnableEntrypoint,
+    DaemonPackageWorkingDirectory, DaemonPluginLifecycle, DaemonPluginWorkerCounters,
+    DaemonRequest, DaemonResolvedAppLaunch, DaemonResolvedSessionType, DaemonResponse,
+    DaemonResponseKind, DaemonSession, DaemonSessionCleanup, DaemonSessionContext,
+    DaemonSessionType, DaemonSessionTypeContextInput, DaemonSessionTypeDefinition,
+    DaemonSessionTypeExecution, DaemonSessionTypeMutationSource, DaemonSessionTypeRequest,
+    DaemonSessionTypeWorkingDirectory, DaemonSoftwareIdentity, DaemonSpawnTarget,
+    DaemonSpawnTargetValidation, DaemonStatus, DaemonWorktree, DaemonWorktreeGitMetadata,
+};
 pub use capabilities::HubCapabilityRuntime;
 pub use client_api::{
     HubClientAdmission, HubClientApi, HubClientCapability, HubClientCaptureSnapshot,
@@ -130,31 +157,6 @@ pub use daemon::{
     HubDaemon, HubDaemonError, HubDaemonResult, HubDaemonState, HubDaemonStatus, HubStateLoadSource,
 };
 pub use daemon_maintenance::{MAX_OWNER_TURN_MS, MAX_READY_OPERATION_WAIT_MS};
-pub use daemon_transport::{
-    DaemonApp, DaemonAppLaunchTarget, DaemonAttachOccupancy, DaemonAvailablePackage,
-    DaemonCapability, DaemonCompatibility, DaemonConnection, DaemonCoordination, DaemonEnvelope,
-    DaemonEnvelopeAck, DaemonEnvelopeDelivery, DaemonEnvelopePublish, DaemonEvent, DaemonHubUpdate,
-    DaemonHubUpdateExecution, DaemonHubUpdateExecutionState, DaemonHubUpdateScope,
-    DaemonHubUpdateState, DaemonIdentity, DaemonInstallationDiagnostic, DaemonInstallationIdentity,
-    DaemonInstallationMode, DaemonModeFlags, DaemonNotify, DaemonOperatorError, DaemonPackage,
-    DaemonPackageActionRequest, DaemonPackageActionRequiredReference, DaemonPackageActionState,
-    DaemonPackageActionStatus, DaemonPackageAvailability, DaemonPackageAvailabilityReason,
-    DaemonPackageAvailabilityState, DaemonPackageCompatibility, DaemonPackageConfiguration,
-    DaemonPackageDecision, DaemonPackageDependencyAvailability, DaemonPackageDiagnostic,
-    DaemonPackageEnvironmentRequirement, DaemonPackageFeatureAvailability,
-    DaemonPackageInstallEffect, DaemonPackageInstallPlan, DaemonPackageNavigationEntry,
-    DaemonPackageNavigationSource, DaemonPackagePin, DaemonPackageProcess,
-    DaemonPackageRouteDescriptor, DaemonPackageRouteTarget, DaemonPackageRunnableEntrypoint,
-    DaemonPackageWorkingDirectory, DaemonPluginLifecycle, DaemonPluginWorkerCounters,
-    DaemonRequest, DaemonResolvedAppLaunch, DaemonResolvedSessionType, DaemonResponse,
-    DaemonResponseKind, DaemonSession, DaemonSessionCleanup, DaemonSessionContext,
-    DaemonSessionType, DaemonSessionTypeContextInput, DaemonSessionTypeDefinition,
-    DaemonSessionTypeExecution, DaemonSessionTypeMutationSource, DaemonSessionTypeRequest,
-    DaemonSessionTypeWorkingDirectory, DaemonSoftwareIdentity, DaemonSpawnTarget,
-    DaemonSpawnTargetValidation, DaemonStatus, DaemonTransportError, DaemonTransportResult,
-    DaemonWorktree, DaemonWorktreeGitMetadata, request as daemon_transport_request, serve_daemon,
-    stream_attach,
-};
 pub use entrypoint_supervisor::{
     EntrypointDiagnostic, EntrypointProcessSnapshot, EntrypointSupervisor,
     EntrypointSupervisorError, EntrypointSupervisorResult,
@@ -524,12 +526,6 @@ const HUB_CRATE_EXPORTS: &[HubCrateExport] = &[
         "pure DTO projection; already crate-private",
     ),
     HubCrateExport::new(
-        "daemon_transport",
-        HubCrateExportClass::HubPolicy,
-        HubCrateExportStability::KeepPublic,
-        "same-device server adapter: accept, handshake, control, cleanup",
-    ),
-    HubCrateExport::new(
         "entrypoint_supervisor",
         HubCrateExportClass::HubPolicy,
         HubCrateExportStability::KeepPublic,
@@ -756,7 +752,6 @@ mod tests {
             "credentials",
             "daemon",
             "daemon_projection",
-            "daemon_transport",
             "entrypoint_supervisor",
             "lifecycle",
             "lua_runtime",
@@ -788,10 +783,9 @@ mod tests {
         use crate::{
             DaemonRequest, HubClientRequest, HubRuntime, LOCAL_RUNTIME_DAEMON_READINESS_BUDGET,
             LocalWebrtcError, LocalWebrtcTransport, PackageRegistry, auth, capabilities,
-            client_api, config, credentials, daemon, daemon_transport, entrypoint_supervisor,
-            lifecycle, lua_runtime, maintenance, managed_git_worktrees, mcp, package_entity_fanout,
-            packages, persistence, profile, runtime, session_types, source_update, spawn_targets,
-            worktrees,
+            client_api, config, credentials, daemon, entrypoint_supervisor, lifecycle, lua_runtime,
+            maintenance, managed_git_worktrees, mcp, package_entity_fanout, packages, persistence,
+            profile, runtime, session_types, source_update, spawn_targets, worktrees,
         };
 
         let _: Option<DaemonRequest> = None;
@@ -1010,8 +1004,61 @@ mod tests {
             ("src/runtime.rs", include_str!("runtime.rs")),
             ("src/client_api.rs", include_str!("client_api.rs")),
             (
-                "src/daemon_transport.rs",
-                include_str!("daemon_transport.rs"),
+                "src/daemon/owner_loop.rs",
+                include_str!("daemon/owner_loop.rs"),
+            ),
+            ("src/daemon/control.rs", include_str!("daemon/control.rs")),
+            (
+                "src/daemon/control/message.rs",
+                include_str!("daemon/control/message.rs"),
+            ),
+            (
+                "src/daemon/control/connection.rs",
+                include_str!("daemon/control/connection.rs"),
+            ),
+            (
+                "src/daemon/control/sessions.rs",
+                include_str!("daemon/control/sessions.rs"),
+            ),
+            (
+                "src/daemon/control/session_types.rs",
+                include_str!("daemon/control/session_types.rs"),
+            ),
+            (
+                "src/daemon/control/spawn_targets.rs",
+                include_str!("daemon/control/spawn_targets.rs"),
+            ),
+            (
+                "src/daemon/control/packages.rs",
+                include_str!("daemon/control/packages.rs"),
+            ),
+            (
+                "src/daemon/control/packages/mutations.rs",
+                include_str!("daemon/control/packages/mutations.rs"),
+            ),
+            (
+                "src/daemon/control/messaging.rs",
+                include_str!("daemon/control/messaging.rs"),
+            ),
+            (
+                "src/daemon/control/plugins.rs",
+                include_str!("daemon/control/plugins.rs"),
+            ),
+            (
+                "src/daemon/control/entities.rs",
+                include_str!("daemon/control/entities.rs"),
+            ),
+            (
+                "src/daemon/control/events.rs",
+                include_str!("daemon/control/events.rs"),
+            ),
+            (
+                "src/daemon/control/webrtc.rs",
+                include_str!("daemon/control/webrtc.rs"),
+            ),
+            (
+                "src/daemon/control/host.rs",
+                include_str!("daemon/control/host.rs"),
             ),
             (
                 "src/subscription/entity.rs",

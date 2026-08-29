@@ -4,10 +4,11 @@
 use super::*;
 use crate::admission::budgets::ENTITY_SUBSCRIPTION_QUEUE_CAPACITY;
 use crate::admission::unix_hello::WebrtcTerminalAdmission;
-use crate::daemon_transport::{
-    ControlMessage, ControlSender, DaemonControlState, EntityFrameSender, handle_control_message,
-};
+use crate::daemon::control::handle_control_message;
+use crate::daemon::control::message::{ControlMessage, ControlSender};
+use crate::daemon::owner_loop::DaemonControlState;
 use crate::subscription::attach_routes::negotiated_unix_capability_set;
+use crate::subscription::entity::EntityFrameSender;
 use crate::transport::webrtc::adapter::WebRtcConnectionMux;
 use crate::transport::webrtc::control_channel::LocalWebrtcDataChannel;
 use crate::transport::webrtc::delivery::{

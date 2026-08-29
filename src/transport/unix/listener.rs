@@ -17,8 +17,8 @@ use tokio::sync::{Semaphore, mpsc as tokio_mpsc, watch};
 use crate::HubConfig;
 use crate::admission::budgets::{DAEMON_HANDSHAKE_TIMEOUT, DAEMON_MAX_REJECTION_TASKS};
 use crate::admission::unix_hello::daemon_hello_ack;
+use crate::daemon::control::message::ControlMessage;
 use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
-use crate::daemon_transport::ControlMessage;
 use crate::transport::unix::mux_write::{read_async_frame, write_async_frame};
 
 pub(crate) static NEXT_SOCKET_CLIENT_ID: std::sync::atomic::AtomicU64 =

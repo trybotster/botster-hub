@@ -26,11 +26,12 @@ use crate::admission::budgets::{
     DAEMON_CLIENT_WRITE_TIMEOUT, DAEMON_HANDSHAKE_TIMEOUT, ENTITY_SUBSCRIPTION_QUEUE_CAPACITY,
 };
 use crate::admission::unix_hello::{UnixTerminalAdmission, unix_hello_admission};
-use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
-use crate::daemon_transport::{
-    ControlMessage, ControlSender, DaemonControlState, DaemonDeliveryKind, DaemonObservability,
-    daemon_delivery_kind, egress_write_class, handle_control_request, tick,
+use crate::daemon::control::message::{
+    ControlMessage, ControlSender, DaemonDeliveryKind, daemon_delivery_kind, egress_write_class,
 };
+use crate::daemon::control::{DaemonObservability, handle_control_request};
+use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
+use crate::daemon::owner_loop::{DaemonControlState, tick};
 use crate::subscription::attach_routes::{
     AttachedSubscription, AttachedSubscriptionChange, UnixEofAblation,
     apply_attached_subscription_change, attached_subscription_change_for_response,

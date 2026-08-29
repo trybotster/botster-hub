@@ -6,7 +6,7 @@ use botster_hub_client::{DaemonResponse, DaemonSessionCleanup};
 
 use crate::client_api_dto::response::{daemon_session_cleanup, daemon_unknown_session_cleanup};
 use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
-use crate::daemon_transport::tick;
+use crate::daemon::owner_loop::tick;
 
 #[derive(Debug, Clone)]
 pub(crate) enum ShutdownSessionClassification {
