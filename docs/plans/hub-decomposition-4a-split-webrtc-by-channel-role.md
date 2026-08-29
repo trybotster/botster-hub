@@ -1,5 +1,16 @@
 # Hub Decomposition 4a: Split WebRTC By Channel Role And Retire local_webrtc.rs
 
+## Revision History
+
+Revision 2, Plan visit 2, run step `run_step_1787999007_348502`. It answers `review_1787998985_537393`, verdict `changes_required`:
+
+- `finding_1787998985_266740` (high, product): stale WebRTC 0.20 premise. Fixed. I re-verified `Cargo.toml:38` and `Cargo.lock`: the base resolves `webrtc 0.21.0-beta.2`. Revision 1 asserted 0.20 from charter prose without reading the manifest, which was my error. Non-scope item 9, the notes list, and the risks now state the verified 0.21.0-beta.2 base, and the plan states that the single `botster-daemon` channel is preserved because the ticket requires it, not because the crate prevents late channels.
+- `finding_1787998985_376877` (high, product): the late-message matrix grouped ownership-creating requests under one generic `DaemonRequest` row. Fixed. I traced `run_data_channel` and `cleanup_once` in `src/local_webrtc.rs` and the `LocalWebrtcPeerClosed` handler in `src/daemon_transport.rs`. The matrix now carries explicit rows for `Attach`, `Detach`, `SubscribeEntities`, `UnsubscribeEntities`, `SubscribeEvents`, `UnsubscribeEvents`, and `Spawn`, each with its owner tag, terminal rejection, and `PeerClosed` race sweep.
+- `finding_1787998985_197852` (high, product): the locked baseline suite is not green. Accepted. `webrtc_terminal_output_is_byte_exact` is recorded as a measured base-red, owner ticket `ticket_1787999248_674913` is registered against `botster-hub`, and acceptance check 7 is replaced by a differential base-versus-HEAD protocol that can distinguish this move from the pre-existing load failure. See "Baseline Suite State".
+- `finding_1787998985_198296` (high, product): the commit plan weakened the ticket. Fixed. Acceptance check 18 now requires one compiling move-only commit, matching the ticket acceptance text.
+- `finding_1787998986_615689` (medium, product): the guard census said six. Fixed. The base holds nine matching expressions across seven files. "Context Loaded" now carries the exact table and acceptance check 11 accounts for each expression.
+- `finding_1787998986_147916` (low, process): Plan step completion evidence was empty although the gate evidence and `artifact.added` event exist. Revision 2 reuses `artifact_1787998020_136225` and `checklist_1787997782_893725`, and passes the five required fields to `request_step_advance` as well as to `submit_gate`.
+
 ## Target Repository And Target Id
 
 - Target repository: `botster-hub` (`https://github.com/trybotster/botster-hub.git`).
@@ -37,12 +48,12 @@ Architecture and ownership notes:
 
 Transport topology notes that bound the non-scope of this ticket:
 
-- [[botster subscriptions use dedicated ordered DataChannels]]
-- [[the browser creates each subscription DataChannel after Hub reserves its label]]
-- [[the pinned Rust WebRTC peer cannot open a DataChannel created after the SCTP handshake]]
-- [[webrtc 0 21 restores post handshake DataChannel creation in Hub]]
+- [[botster subscriptions use dedicated ordered DataChannels]] -- the target topology, not implemented here.
+- [[the browser creates each subscription DataChannel after Hub reserves its label]] -- the target creation order, not implemented here.
+- [[webrtc 0 21 restores post handshake DataChannel creation in Hub]] -- current. The base resolves `webrtc 0.21.0-beta.2`, so post-handshake channel creation is available.
+- [[the pinned Rust WebRTC peer cannot open a DataChannel created after the SCTP handshake]] -- historical, superseded by the 0.21 note above. Recorded so no reader treats the 0.20 limit as current. This ticket keeps the single `botster-daemon` channel because the ticket requires it, not because the crate forbids a second one.
 
-Source-guard notes, required because this move retargets six guard sites:
+Source-guard notes, required because this move retargets nine guard expressions across seven files:
 
 - [[hub moves must extend source scanning guard file lists]]
 - [[fixed source guard lists need one ablation per added file]]
@@ -89,14 +100,20 @@ Not loaded, with reason:
   - `src/local_webrtc.rs` is 7752 lines. Production ends at line 2437. `mod tests` spans lines 2438 to 7752 as one flat module with 54 `#[test]` functions and a large shared harness (`PeerHarness`, `TestOfferPeer`, `OwnedWorkerIdentity`, process-tree helpers).
   - `src/webrtc_terminal_adapter.rs` is 600 lines and owns `WebRtcTerminalAdapter`, `WebRtcTerminalAdapterHandle`, `WebRtcTerminalAdapterInner`, and `WebRtcConnectionMux`.
   - `src/lib.rs` exports `pub use local_webrtc::{LocalWebrtcError, LocalWebrtcTransport};` at line 167. The module itself is `pub(crate)`.
-  - Source-guard census at base, six sites reference the two files:
-    - `src/lib.rs:1060` guard-list entry `("src/local_webrtc.rs", include_str!("local_webrtc.rs"))`.
-    - `src/host_control_fair_write.rs:163` `include_str!("local_webrtc.rs")`, asserting the WebRTC fair-write call site passes live `entity_ready`.
-    - `src/local_webrtc.rs:6389` self-scan `include_str!("local_webrtc.rs")` for the ultimate-close-failure oracles.
-    - `src/transport/shared.rs:85` `include_str!("../webrtc_terminal_adapter.rs")`, asserting `WebRtcConnectionMux` stays in the WebRTC adapter.
-    - `src/webrtc_terminal_adapter.rs:591` self-scan `include_str!("webrtc_terminal_adapter.rs")`.
-    - `tests/hub_daemon_lifecycle/subscription_ownership_baseline.rs:92` and `:429` `hub_source("src/local_webrtc.rs")`.
-    - `tests/hub_daemon_lifecycle/webrtc_terminal_adapter.rs:771` `include_str!("../../src/webrtc_terminal_adapter.rs")`.
+  - Source-guard census at base: **nine matching expressions across seven files**. Every row must be retargeted or explicitly declared unchanged.
+
+    | # | File | Line | Expression | Asserts | Post-move target |
+    |---|------|------|-----------|---------|------------------|
+    | 1 | `src/lib.rs` | 1060 | `("src/local_webrtc.rs", include_str!("local_webrtc.rs"))` | guard-list membership for the forbidden-construct scan | replaced by one entry per new `src/transport/webrtc/**` file |
+    | 2 | `src/host_control_fair_write.rs` | 163 | `include_str!("local_webrtc.rs")` | the WebRTC fair-write call site passes live `entity_ready` | `transport/webrtc/control_channel.rs` |
+    | 3 | `src/local_webrtc.rs` | 6389 | `include_str!("local_webrtc.rs")` | the two ultimate-close-failure oracles survive | `transport/webrtc/peer.rs`, self-scan |
+    | 4 | `src/transport/shared.rs` | 85 | `include_str!("../webrtc_terminal_adapter.rs")` | `WebRtcConnectionMux` stays out of shared transport | `include_str!("webrtc/adapter.rs")` |
+    | 5 | `src/webrtc_terminal_adapter.rs` | 591 | `include_str!("webrtc_terminal_adapter.rs")` | adapter self-scan | `transport/webrtc/adapter.rs`, self-scan |
+    | 6 | `tests/hub_daemon_lifecycle/subscription_ownership_baseline.rs` | 92 | `hub_source("src/local_webrtc.rs")` | production one-shot claim in `on_data_channel`; region-bounded | `hub_source("src/transport/webrtc/peer.rs")` |
+    | 7 | `tests/hub_daemon_lifecycle/subscription_ownership_baseline.rs` | 429 | `hub_source("src/local_webrtc.rs")` | exact multi-line deferred-egress needle from `run_data_channel` | `hub_source("src/transport/webrtc/control_channel.rs")` |
+    | 8 | `tests/hub_daemon_lifecycle/webrtc_terminal_adapter.rs` | 771 | `include_str!("../../src/webrtc_terminal_adapter.rs")` | adapter production source is content blind | `include_str!("../../src/transport/webrtc/adapter.rs")` |
+    | 9 | `tests/hub_daemon_lifecycle/webrtc_terminal_adapter.rs` | 772 | `include_str!("webrtc_terminal_adapter.rs")` | the sibling integration test file is content blind | unchanged; it scans a test file, not a moved source |
+
   - Scanner state at base, measured with the `scan_production_source` algorithm from `src/lib.rs:888`: `src/local_webrtc.rs` `skip_open_at_eof = false`, `src/webrtc_terminal_adapter.rs` `skip_open_at_eof = false`, `src/host_control_fair_write.rs` `skip_open_at_eof = false`. No base needle repair is required. The split can still introduce a leak in any new file whose final `#[cfg(test)]` block ends with unbalanced braces inside string needles.
   - `src/lib.rs` names `local_webrtc` in three test sites: the `HubCrateExport` row at line 546, the crate-root module list at line 770, and the internal-visibility list at line 820.
   - `src/daemon_transport.rs` holds 48 `local_webrtc` references, all import or call sites, plus `persist_local_webrtc_terminal_record` and `detach_local_webrtc_subscriptions`, which are control dispatch and stay.
@@ -116,7 +133,7 @@ Not loaded, with reason:
 2. Move every production symbol out of `src/local_webrtc.rs` and `src/webrtc_terminal_adapter.rs` into those files by state machine and channel role, using the allocation in "Affected Surfaces And Files".
 3. Move every test out of the two source files into the role file that owns the symbol under test, and move the shared `cfg(test)` harness into `src/transport/webrtc.rs`.
 4. Delete `src/local_webrtc.rs` and `src/webrtc_terminal_adapter.rs`. Leave no forwarding facade and no re-export shim inside either path.
-5. Retarget the six guard sites listed under "Context Loaded" to the new owner files, and extend the `src/lib.rs` guard list with every new `src/transport/webrtc/**` file.
+5. Retarget all nine guard expressions listed under "Context Loaded" to the new owner files, and extend the `src/lib.rs` guard list with every new `src/transport/webrtc/**` file.
 6. Update the `src/lib.rs` `architecture_summary` rows and module lists: remove the `local_webrtc` crate-root row and its two list entries, and keep the existing `transport` row.
 7. Update `src/lib.rs` so the public re-export path `botster_hub::LocalWebrtcError` and `botster_hub::LocalWebrtcTransport` stays identical, now sourced from `crate::transport::webrtc`.
 8. Update import paths in `src/daemon_transport.rs`, `src/daemon.rs`, `src/daemon/error.rs`, `src/client_api_dto/response.rs`, `src/main.rs`, `src/local_runtime_process.rs`, `src/host_control_fair_write.rs`, `src/admission/grants.rs`, `src/local_webrtc_smoke.rs`, and the affected `tests/hub_daemon_lifecycle` files.
@@ -131,7 +148,7 @@ Not loaded, with reason:
 6. No Core pin change in `Cargo.toml` or `Cargo.lock`.
 7. No public export change. No `botster-hub-client`, `botster-web`, or `botster-tui` change.
 8. No behavior repair to any bug found while moving. Any such finding becomes a separate ticket.
-9. No `webrtc` crate version change. The `0.20` post-handshake channel limit stays.
+9. No `webrtc` crate version change. The base resolves `webrtc 0.21.0-beta.2` at `Cargo.toml:38` and in `Cargo.lock`, verified in this worktree. The single `botster-daemon` DataChannel is preserved because the ticket requires it, not because the crate prevents post-handshake channel creation.
 
 ## Repository Ownership Boundaries And Cross-Repository Dependencies
 
@@ -140,7 +157,8 @@ Not loaded, with reason:
 - The Core boundary is unchanged. `src/transport/webrtc/adapter.rs` keeps the same `TerminalAdapter` implementation over the shared slot from decomposition 3, and Hub stays content blind.
 - Admission policy stays in `src/admission/`. `src/transport/webrtc/**` receives an accepted peer configuration and a session key. It does not gain grant issue, origin policy, label reservation, or budget code.
 - Subscription route ownership stays in `src/subscription/`. `ClosedEventRoute`, `ClosedHandle`, suppression, and `DaemonEvent` construction do not move into the transport tree.
-- Cross-repository dependencies: none. The closed dependency `ticket_1787894419_699597` is already merged as `667648a` and is the base for this work. No new Project Pipelines dependency is required.
+- Cross-repository dependencies: none. The closed dependency `ticket_1787894419_699597` is already merged as `667648a` and is the base for this work.
+- Same-repository follow-up registered: `ticket_1787999248_674913` owns the pre-existing `webrtc_terminal_output_is_byte_exact` base-suite flake against the same `botster-hub` target. It is cited, not added as a blocking dependency edge; see "Baseline Suite State" for the reasoning and for the oracle this ticket uses instead.
 - Downstream cost: zero. The two public names keep their crate-root paths, so no generic client rebuild is required. If any public export or DTO changes, the ticket has left move-only scope and the Implementer must stop and re-plan.
 
 ## Assumptions And Unknowns
@@ -229,7 +247,7 @@ Not loaded, with reason:
 5. **Cyclic module dependencies.** `peer.rs` calls into `subscription_channel.rs` and `control_channel.rs`, while both call back into `LocalWebrtcPeerState` in `peer.rs`. Rust allows this inside one crate, but a careless move can pull peer state into the control channel. Mitigation: acceptance check 3 asserts each state machine's owning type is declared in exactly one file.
 6. **Ownership creep into transport.** A move can drag a grant, label, or route symbol into `src/transport/webrtc/**`. Mitigation: acceptance check 5 extends the existing shared-transport forbidden-identifier guard to the WebRTC tree.
 7. **Very large diff hides a semantic edit.** The move is roughly 8300 lines. Mitigation: acceptance check 18 requires `git diff --color-moved=dimmed-zebra` and a move-only commit shape.
-8. **Suite flake attributed to the move.** The Hub lifecycle suite needs a quiet host. Mitigation: acceptance check 22 requires a named marker per failure before anyone calls a failure unrelated.
+8. **Suite flake attributed to the move, or a real regression hidden behind a known flake.** The base suite is already red on `webrtc_terminal_output_is_byte_exact` under full-suite load, and that lane is directly relevant to this move. Both error directions are live: a pre-existing flake can be blamed on the move, and a genuine regression can hide behind the excuse. Mitigation: the differential protocol in acceptance check 7, plus the owner ticket recorded under "Baseline Suite State".
 
 ## Runtime-Teardown Class
 
@@ -241,16 +259,21 @@ This ticket changes no teardown behavior. Every answer below states the behavior
 
 `teardown_bounds`: `LOCAL_WEBRTC_PEER_CLOSE_BOUND` bounds `close()`; `LOCAL_WEBRTC_PEER_CLOSE_HANDLER_JOIN_DEADLINE` bounds the handler join. A hang, not an `Err`, takes the same fail-closed path as an error: the peer moves to `stale_close_peers`, and `park_runtime_if_idle` or `stop_all` forces driver stop. Both constants and both paths move to `peer.rs` together. Oracles preserved by name: `hanging_data_channel_local_close_still_runs_cleanup_once_within_bound`, `production_on_close_hangs_local_close_and_still_cleans_up`, `hung_send_text_times_out_within_close_bound`, `ready_send_completes_before_queued_on_close`.
 
-`late_message_matrix`: no row changes. Each row states its owner file after the move.
+`late_message_matrix`: no row changes. Each row states its owner file after the move. I traced the rows through `run_data_channel` (the `ownership_request` and `entity_subscription_change` handling at `src/local_webrtc.rs:1496-1587`), `LocalWebrtcPeerState::cleanup_once` (`:1017-1041`), and the `ControlMessage::LocalWebrtcPeerClosed` handler in `src/daemon_transport.rs:950-1140`.
 
-| Message type | Owner after move | Grant or owner tag | Rejection after terminal failure | Residual sweep on PeerClosed race |
-|---|---|---|---|---|
-| Second `on_data_channel` | `peer.rs` claim, `subscription_channel.rs` reject | peer-scoped one-shot claim | `reject_extra_data_channel` closes the unclaimed channel | none needed; no ownership is created |
-| Encrypted Hello | `control_channel.rs` | session key derived from the admitted grant | decrypt failure ends the channel with a typed cause | peer cleanup drops the channel task |
-| `DaemonRequest` control frames | `control_channel.rs` | `grant_id` on `LocalWebrtcPeerState` | `daemon_transport.rs` returns `local_webrtc_peer_gone` when `has_live_peer` is false | pending queue dies with the peer state |
-| Attach and terminal subscription | `subscription_channel.rs` records, `daemon_transport.rs` detaches | `(session_id, subscription_id, generation)` | stale generation cannot bind or deliver | `remove_peer` returns `attached_subscriptions`; `detach_local_webrtc_subscriptions` sweeps them |
-| Entity subscription frames | `control_channel.rs` and `delivery.rs` | subscription id on the entity frame | prior-generation frames are rejected | entity channel closes with the peer |
-| Host events | `control_channel.rs` | negotiated close-event feature per peer | not delivered without negotiation | host-event queue dies with the peer state |
+| Message type | Creates durable ownership | Owner file after move | Owner tag | Rejection after terminal failure | Residual sweep on PeerClosed race |
+|---|---|---|---|---|---|
+| Second `on_data_channel` | no | `peer.rs` claim, `subscription_channel.rs` reject | peer-scoped one-shot claim | `reject_extra_data_channel` closes the unclaimed channel | none needed; no ownership is created |
+| Encrypted Hello | no | `control_channel.rs` | session key derived from the admitted grant | decrypt failure ends the channel with a typed cause | peer cleanup drops the channel task |
+| `Attach` | **yes** | `subscription_channel.rs` records via `apply_subscription_change`; `daemon_transport.rs` detaches | `(session_id, subscription_id)` in `peer_state.attached_subscriptions`, plus `attach_owner_grant_ids` keyed by `grant_id` in Hub state | `response_records_attach_ownership` returns false for `OperatorError` and for `attach_failed`, so no ownership row is created | `cleanup_once` snapshots `attached_subscriptions` into `LocalWebrtcPeerClosed`; `detach_local_webrtc_subscriptions` sweeps them, and `attach_owner_grant_ids.retain` drops only rows owned by a removed grant |
+| `Detach` | retires ownership | same as `Attach` | same identity | a failed `Detach` leaves the row, so cleanup still sweeps it | idempotent; the sweep tolerates an already-removed row |
+| `SubscribeEntities` | **yes** | `control_channel.rs` records via `add_entity_subscription`; `daemon_transport.rs` owns the registry | `subscription_id` on `peer_state.entity_subscription_ids`, and `owner_grant_id` on `state.entity_subscriptions` | the row is added only when the response kind is `EntitySubscribed`, so a failed subscribe creates nothing | `cleanup_once` snapshots `entity_subscription_ids`; the handler removes a snapshot id **only** when the current row is unowned or still owned by a removed grant, and independently removes every row owned by any removed grant |
+| `UnsubscribeEntities` | retires ownership | `control_channel.rs` | same identity | removal is applied only on `EntityUnsubscribed` | a late unsubscribe after cleanup is a no-op against an already-removed row |
+| `SubscribeEvents` | **yes** | `control_channel.rs` ingress; `src/subscription/package_events.rs` owns the holder | connection-scoped holder keyed by `grant_id` through `event_plane.mailbox(&grant_id)` | admission is exact `(owner, name)`; a rejected contract creates no holder | `state.event_plane.cleanup_connection(grant_id, router)` runs inside the removed-grant loop, so holders retire with the peer. Admitted jobs survive until Core completion by design. |
+| `UnsubscribeEvents` | retires ownership | `control_channel.rs` ingress; `daemon_transport.rs:3472` applies it | same connection-scoped holder identity | a late unsubscribe cannot retire another peer's holder, because the holder key includes `grant_id` | `cleanup_connection` is idempotent for an already-retired holder |
+| `Spawn` | **yes, and it is intentionally peer-independent** | `daemon_transport.rs` control dispatch; does not move | `session_id`; the session worker is durable and Hub-owned, not peer-owned | a failed spawn creates no session | **not swept by PeerClosed.** A spawned session deliberately survives peer cleanup; only `ShutdownSession` or Hub stop retires it. This is existing policy, restated here so the move does not silently acquire a session sweep. |
+| Terminal and entity frames | no | `control_channel.rs` and `delivery.rs` | subscription id on the frame | prior-generation frames are rejected | the channel closes with the peer |
+| Host events | no | `control_channel.rs` | negotiated close-event feature per peer | not delivered without negotiation | host-event queue dies with the peer state |
 
 Oracles preserved by name: `replacement_peer_rejects_prior_generation_frames_and_delivers_current_generation`, `entity_subscription_multiplexes_after_ack_and_cleans_up_with_peer`, `peer_admits_only_the_first_data_channel`, `reject_extra_data_channel_closes_the_unclaimed_channel`, `extra_channel_close_marker_requires_lost_claim_and_close_ok`.
 
@@ -259,6 +282,23 @@ Oracles preserved by name: `replacement_peer_rejects_prior_generation_frames_and
 `ownership_identity`: `grant_id` identifies the peer. `(session_id, subscription_id, generation)` identifies a terminal route. A delayed `PeerClosed` snapshot cannot delete a row now owned by a live replacement peer, because `remove_peer` snapshots the removed grant ids and the detach path is keyed on them. Both the identity fields and the snapshot logic move to `peer.rs` unchanged.
 
 `sibling_fail_closed_policy`: On successful close, siblings keep working, and the dedicated runtime survives until the peer map empties. On ultimate close failure, Hub sacrifices every peer on the dedicated runtime and sweeps all owners together, per [[webrtc peer cleanup removes every per peer owner together]]. The policy and its blast radius are unchanged and stay proven by the moved `ultimate_close_failure_sacrifices_every_peer_and_sweeps_all_owners` test.
+
+## Baseline Suite State
+
+Plan Review measured this and I accept the finding. It is recorded here so no later step treats it as new.
+
+- Failing test: `webrtc_terminal_output_is_byte_exact`, `tests/hub_daemon_lifecycle/subscription_ownership_baseline.rs:826`.
+- Symptom: the assertion at line 895 fails with empty adapter frames, `got []`.
+- Conditions: `RUSTUP_TOOLCHAIN=1.97.0`, `CARGO_TARGET_DIR` unset, worker and Hub prebuilds green, full `./test.sh --locked`. A focused exact rerun passes.
+- Mechanism, from reading the test body: it drives a live PTY writer over WebRTC and polls for the expected four bytes inside a fixed `Duration::from_secs(8)` wall-clock deadline. Under full-suite concurrency the deadline can expire before the first frame arrives. This matches the charter rule that the Hub lifecycle suite needs a quiet host, and it matches the flake class in [[wall-clock ready-operation bounds through a daemon child are ambient-load-sensitive]].
+- No host-exhaustion marker names this failure, so the charter forbids calling it unrelated on assertion alone.
+
+**Disposition.** This ticket is a pure move and cannot repair a wall-clock deadline without leaving move-only scope. I therefore do both halves that are in scope:
+
+1. **Owner ticket registered: `ticket_1787999248_674913`**, "Hub baseline flake: webrtc_terminal_output_is_byte_exact fails under full-suite load", against `botster-hub` (`tgt_7e208a0c76a44980a83b63af976b1f22`) in this project. It requires a load-tolerant oracle or a named host-exhaustion marker, forbids weakening the byte-exactness assertion, and requires a red-on-revert arm.
+2. Replace the absolute-green acceptance claim with the differential protocol in acceptance check 7, which distinguishes a regression introduced by this move from the pre-existing load failure.
+
+**Why no dependency edge was added.** In Project Pipelines, `add_ticket_dependency` is strictly blocking: the dependent ticket cannot start a run until the dependency closes. Adding that edge would stop this move until the flake repair lands, and the flake repair itself needs suite runs to verify, which stalls the decomposition sequence behind an unrelated fix. The failure is therefore owned by `ticket_1787999248_674913` and cited here, and this ticket carries the differential protocol as its oracle instead. The failure is not waived: acceptance check 7 still fails the ticket if `HEAD_FAIL` gains any test, or if a base-failing test also fails in isolation at HEAD. If Plan Review prefers a hard block, adding the edge is one call and I will make it. I am flagging the tradeoff rather than deciding it silently.
 
 ## Acceptance Checks And Tests
 
@@ -273,14 +313,20 @@ Ownership checks, which prove this is an extraction and not a file split:
 
 Behavior-preservation checks:
 
-7. Every existing `tests/hub_daemon_lifecycle` WebRTC lane passes unchanged: `webrtc_proofs.rs`, `webrtc_terminal_adapter.rs`, `webrtc_fixtures.rs`, `subscription_ownership_baseline.rs`, `event_plane_saturation.rs`, `shutdown.rs`, `sessions.rs`, and `cli.rs`.
+7. **Differential suite proof, not an absolute-green claim.** The base is not green (see "Baseline Suite State"), so "every lane passes" is not a usable oracle. Instead:
+   - 7a. On one quiet host, in one session, run `./test.sh --locked` at base commit `38d140c` and record the exact set of failing test names as `BASE_FAIL`.
+   - 7b. Run `./test.sh --locked` at final HEAD on the same host and record `HEAD_FAIL`.
+   - 7c. Require `HEAD_FAIL` to be a subset of `BASE_FAIL`. Any test in `HEAD_FAIL` but not in `BASE_FAIL` fails this check and is attributed to the move until proven otherwise.
+   - 7d. For every test in `BASE_FAIL`, run it in isolation at HEAD with its full module path and require it to pass. A base-failing test that also fails in isolation at HEAD is a regression, not a load flake.
+   - 7e. Record both runs, both failure sets, and the isolation results in the implementation report. Do not label any failure unrelated without naming it in `BASE_FAIL` and showing 7d green.
+   - 7f. These WebRTC lanes must appear in the run and must not regress: `webrtc_proofs.rs`, `webrtc_terminal_adapter.rs`, `webrtc_fixtures.rs`, `subscription_ownership_baseline.rs`, `event_plane_saturation.rs`, `shutdown.rs`, `sessions.rs`, `cli.rs`.
 8. Exact proof-name preservation. Capture the full test inventory at base commit `38d140c` and at final HEAD with `cargo test --workspace --locked -- --list`, and store both. Compare the multiset of leaf test names, meaning the final path segment of each entry. The two multisets must be identical: no proof name may be removed, renamed, or reduced in count. Record a separate explicit rename map from each old module path to its new module path, and require every entry to keep the same leaf name. Any intentionally removed duplicate must be listed by name with its reason. An unexplained difference fails the check.
 9. No protocol, DTO, serde name, encryption, framing, chunking, limit, or scheduling change. Prove with `git diff` over `src/client_api_dto/`, `src/daemon/error.rs`, and every `serde` attribute in the diff, showing zero changes, and with a `git diff` over the moved delivery functions showing pure relocation.
 10. The Core pin is unchanged. Prove with `git diff` over `Cargo.toml` and `Cargo.lock` showing no `botster-core` revision change and no `webrtc` version change.
 
 Guard checks:
 
-11. Both guard families are enumerated before and after the move with `grep -rn "include_str!" src` and `grep -rn "hub_source(" tests`, and both enumerations are recorded in the implementation report. All six base sites listed in "Context Loaded" are accounted for.
+11. Both guard families are enumerated before and after the move with `grep -rn "include_str!" src` and `grep -rn "hub_source(" tests`, and both enumerations are recorded in the implementation report. Each of the nine base expressions in the "Context Loaded" table is accounted for by row, with its post-move target path or an explicit statement that it is unchanged. A count alone does not satisfy this check.
 12. Every new `src/transport/webrtc/**` file, including `src/transport/webrtc.rs`, appears in the `src/lib.rs` forbidden-construct guard list.
 13. Each added guard-list entry has its own red-on-revert ablation, per [[fixed source guard lists need one ablation per added file]]. One representative arm is not accepted.
 14. Every region-bounded guard is re-derived after the move and carries a positive anchor assertion, so an empty or subject-free region fails, per [[region bounded source guards need a required symbol anchor]]. This covers the `on_data_channel` region split in `subscription_ownership_baseline.rs` and the retargeted self-scan for the ultimate-close-failure oracles.
@@ -290,7 +336,7 @@ Guard checks:
 
 Commit shape:
 
-18. Each slice lands as a move-only commit that changes no behavior, reviewable with `git diff --color-moved=dimmed-zebra`. A separate mechanical commit may follow for imports, module declarations, and guard retargeting. No commit mixes a move with a semantic change. The final tree must compile, so the last commit of the series is the compiling state; intermediate commits may not compile only if the series is squashed before merge. The Implementer must state which shape they used.
+18. The move lands as **one compiling move-only commit**, as the ticket acceptance requires. That single commit carries the file moves and every change made necessary by the move itself: import paths, module declarations, `src/lib.rs` wiring, and guard retargeting. It changes no behavior and must compile on its own. Review it with `git diff --color-moved=dimmed-zebra`. Guard additions that are new assertions rather than retargeting, such as the acceptance check 3 and check 5 guards, land in a separate follow-up commit so the move commit stays purely a move. No commit mixes a move with a semantic change.
 
 Gate commands, run from the worktree with `RUSTUP_TOOLCHAIN=1.97.0` and with `CARGO_TARGET_DIR` unset:
 
