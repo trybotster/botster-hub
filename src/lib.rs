@@ -52,6 +52,7 @@
 pub mod auth;
 pub mod capabilities;
 pub mod client_api;
+pub(crate) mod client_api_dto;
 pub mod config;
 pub mod credentials;
 pub mod daemon;

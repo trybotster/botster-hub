@@ -19,8 +19,8 @@ use botster_terminal_protocol::{
     FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY, TerminalCompatibility,
 };
 
-use super::{DaemonTransportError, DaemonTransportResult};
 use crate::HubRuntime;
+use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
 use crate::unix_terminal_adapter::{
     UnixConnectionMux, UnixTerminalAdapter, UnixTerminalAdapterHandle,
 };

@@ -22,9 +22,10 @@ use botster_hub_client::{
 use serde_json::Value;
 
 use super::{
-    DAEMON_MAX_FRAME_BYTES, DaemonControlState, DaemonTransportError, DaemonTransportResult,
-    HubDaemon, daemon_response_base, daemon_session_type_from_client, session_type_entity_snapshot,
+    DAEMON_MAX_FRAME_BYTES, DaemonControlState, HubDaemon, daemon_response_base,
+    daemon_session_type_from_client, session_type_entity_snapshot,
 };
+use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
 
 const SESSION_DELIVERY_MAX_ITEMS: usize = 16;
 const SESSION_DELIVERY_MAX_BYTES: usize = 64 * 1024;
