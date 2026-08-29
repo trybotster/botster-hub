@@ -1012,6 +1012,29 @@ mod tests {
             ),
             ("src/main.rs", include_str!("main.rs")),
             ("src/local_webrtc.rs", include_str!("local_webrtc.rs")),
+            ("src/client_api_dto.rs", include_str!("client_api_dto.rs")),
+            (
+                "src/client_api_dto/response.rs",
+                include_str!("client_api_dto/response.rs"),
+            ),
+            (
+                "src/client_api_dto/session.rs",
+                include_str!("client_api_dto/session.rs"),
+            ),
+            (
+                "src/client_api_dto/package.rs",
+                include_str!("client_api_dto/package.rs"),
+            ),
+            (
+                "src/client_api_dto/workspace.rs",
+                include_str!("client_api_dto/workspace.rs"),
+            ),
+            (
+                "src/client_api_dto/plugin.rs",
+                include_str!("client_api_dto/plugin.rs"),
+            ),
+            ("src/daemon/error.rs", include_str!("daemon/error.rs")),
+            ("src/daemon/shutdown.rs", include_str!("daemon/shutdown.rs")),
         ];
         for (path, source) in files {
             let production = production_source(source);
