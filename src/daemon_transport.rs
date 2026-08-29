@@ -9,7 +9,7 @@ use std::env;
 use std::fmt;
 use std::fs;
 use std::io::Write;
-use std::ops::Bound;
+
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -21,8 +21,7 @@ use std::time::{Duration, Instant};
 use botster_core::{
     ClientId, EndpointId, EnvelopeCursor, EnvelopeId, EnvelopeTarget, PackageSource, RequestId,
     RoutedEnvelope, RoutedEnvelopePayload, RunnableEntrypointKind, RunnableEntrypointLaunchMode,
-    SessionId, SubscriptionId, TerminalCapabilitySet, TerminalSubscriptionGeneration,
-    TerminalSubscriptionRecord,
+    SessionId, SubscriptionId, TerminalSubscriptionGeneration, TerminalSubscriptionRecord,
 };
 use botster_core_daemon::{DetachTerminalSubscriptionResult, ReadinessEvidence};
 use botster_hub_client::DaemonTransportError as ClientDaemonTransportError;
@@ -56,9 +55,7 @@ pub use botster_hub_client::{
     FEATURE_PLUGIN_SURFACE_ACTION, FEATURE_PLUGIN_SURFACE_RENDER, PROTOCOL, read_frame,
     read_frame_from_reader, write_frame,
 };
-use botster_terminal_protocol::{
-    TerminalCompatibility, ensure_compatible as ensure_terminal_compatible,
-};
+
 use serde_json::Value;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
@@ -87,7 +84,7 @@ use crate::maintenance::{
 use crate::packages::{PackageResolvedEntrypointLaunch, resolve_entrypoint_launch_contract};
 use crate::source_update::{current_update_execution, mark_update_failed, start_update_handoff};
 use crate::unix_terminal_adapter::{UnixConnectionMux, UnixTerminalAdapterHandle};
-use crate::webrtc_terminal_adapter::WebRtcConnectionMux;
+
 use crate::{EntrypointProcessSnapshot, EntrypointSupervisorError};
 use crate::{
     FileHubStateStore, HubClientApi, HubClientEvent, HubClientPackage, HubClientRequest,
@@ -173,15 +170,18 @@ use crate::subscription::entity::{
     session_subscribers_need_delivery,
 };
 
+use crate::admission::budgets::{
+    DAEMON_CLIENT_WRITE_TIMEOUT, DAEMON_CONTROL_QUEUE_CAPACITY, DAEMON_HANDSHAKE_TIMEOUT,
+    DAEMON_INCOMPLETE_FRAME_TIMEOUT, DAEMON_MAX_CONNECTIONS, DAEMON_MAX_FRAME_BYTES,
+    DAEMON_MAX_REJECTION_TASKS, ENTITY_SUBSCRIPTION_QUEUE_CAPACITY,
+};
+use crate::admission::unix_hello::{
+    AdmissionState, HostCompatibilityRecord, UnixTerminalAdmission, WebrtcTerminalAdmission,
+    daemon_hello_ack, next_admission_key, terminal_compatibility_attach_error,
+    unix_hello_admission,
+};
+
 const MESSAGE_CONTENT_TYPE: &str = "application/vnd.botster.coordination.message+text";
-const DAEMON_CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
-const DAEMON_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
-const DAEMON_INCOMPLETE_FRAME_TIMEOUT: Duration = Duration::from_secs(2);
-pub(crate) const DAEMON_MAX_FRAME_BYTES: usize = 1024 * 1024;
-const DAEMON_MAX_CONNECTIONS: usize = 64;
-const DAEMON_MAX_REJECTION_TASKS: usize = 8;
-const DAEMON_CONTROL_QUEUE_CAPACITY: usize = 256;
-pub(crate) const ENTITY_SUBSCRIPTION_QUEUE_CAPACITY: usize = 64;
 const ENTITY_RECONCILIATION_INTERVAL: Duration = Duration::from_millis(500);
 static NEXT_SOCKET_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -2237,6 +2237,7 @@ fn handle_connection_cleanup(
     }
     let unix_admission = state
         .pending_runtime
+        .admission
         .unix_admissions
         .remove(&cleanup.client_id);
     let ablation = unix_eof_cleanup_ablation();
@@ -2249,6 +2250,7 @@ fn handle_connection_cleanup(
     }
     state
         .pending_runtime
+        .admission
         .host_compatibility
         .remove(&cleanup.client_id);
     if let Some(runtime) = daemon.runtime() {
@@ -2444,7 +2446,7 @@ pub(crate) fn handle_control_message(
             if let UnixTerminalAdmission::Admitted { mux, .. } = &admission {
                 mux.bind_close_work(Arc::clone(&state.pending_runtime.close_work));
             }
-            state.pending_runtime.host_compatibility.insert(
+            state.pending_runtime.admission.host_compatibility.insert(
                 client_id.clone(),
                 HostCompatibilityRecord {
                     required_features: host_required_features,
@@ -2452,6 +2454,7 @@ pub(crate) fn handle_control_message(
             );
             state
                 .pending_runtime
+                .admission
                 .unix_admissions
                 .insert(client_id, admission);
             let _ = reply_tx.send(());
@@ -2466,7 +2469,7 @@ pub(crate) fn handle_control_message(
                 if let WebrtcTerminalAdmission::Admitted { mux, .. } = &admission {
                     mux.bind_close_work(Arc::clone(&state.pending_runtime.close_work));
                 }
-                state.pending_runtime.host_compatibility.insert(
+                state.pending_runtime.admission.host_compatibility.insert(
                     grant_id.clone(),
                     HostCompatibilityRecord {
                         required_features: host_required_features,
@@ -2474,6 +2477,7 @@ pub(crate) fn handle_control_message(
                 );
                 state
                     .pending_runtime
+                    .admission
                     .webrtc_admissions
                     .insert(grant_id, admission);
             }
@@ -3051,8 +3055,16 @@ pub(crate) fn handle_control_message(
                     .cancel_stream(&subscription.session_id, &subscription.subscription_id);
             }
             for grant_id in &removed_grants {
-                state.pending_runtime.webrtc_admissions.remove(grant_id);
-                state.pending_runtime.host_compatibility.remove(grant_id);
+                state
+                    .pending_runtime
+                    .admission
+                    .webrtc_admissions
+                    .remove(grant_id);
+                state
+                    .pending_runtime
+                    .admission
+                    .host_compatibility
+                    .remove(grant_id);
                 if let Some(runtime) = daemon.runtime() {
                     state
                         .event_plane
@@ -3639,7 +3651,7 @@ fn handle_runtime_control_request(
                 .unwrap_or("botster-hub-daemon-socket")
                 .to_string();
             if let Some(UnixTerminalAdmission::Rejected { code, diagnostic }) =
-                pending_runtime.unix_admissions.get(&client_id)
+                pending_runtime.admission.unix_admissions.get(&client_id)
             {
                 return Ok(terminal_compatibility_attach_error(
                     code,
@@ -3648,7 +3660,7 @@ fn handle_runtime_control_request(
             }
             if let Some(grant_id) = observability.grant_id
                 && let Some(WebrtcTerminalAdmission::Rejected { code, diagnostic }) =
-                    pending_runtime.webrtc_admissions.get(grant_id)
+                    pending_runtime.admission.webrtc_admissions.get(grant_id)
             {
                 return Ok(terminal_compatibility_attach_error(
                     code,
@@ -3690,10 +3702,18 @@ fn handle_runtime_control_request(
                     ));
                 }
             };
-            let unix_admission = pending_runtime.unix_admissions.get(&client_id).cloned();
-            let webrtc_admission = observability
-                .grant_id
-                .and_then(|grant_id| pending_runtime.webrtc_admissions.get(grant_id).cloned());
+            let unix_admission = pending_runtime
+                .admission
+                .unix_admissions
+                .get(&client_id)
+                .cloned();
+            let webrtc_admission = observability.grant_id.and_then(|grant_id| {
+                pending_runtime
+                    .admission
+                    .webrtc_admissions
+                    .get(grant_id)
+                    .cloned()
+            });
             if observability.grant_id.is_some() {
                 let Some(WebrtcTerminalAdmission::Admitted {
                     required_features,
@@ -3815,7 +3835,7 @@ fn handle_runtime_control_request(
             )?;
             if let Some(client_id) = observability.client_id
                 && let Some(UnixTerminalAdmission::Admitted { mux, .. }) =
-                    pending_runtime.unix_admissions.get(client_id)
+                    pending_runtime.admission.unix_admissions.get(client_id)
                 && let Some(generation) = generation
             {
                 mux.suppress_generation(
@@ -3826,7 +3846,7 @@ fn handle_runtime_control_request(
             }
             if let Some(grant_id) = observability.grant_id
                 && let Some(WebrtcTerminalAdmission::Admitted { mux, .. }) =
-                    pending_runtime.webrtc_admissions.get(grant_id)
+                    pending_runtime.admission.webrtc_admissions.get(grant_id)
                 && let Some(generation) = generation
             {
                 mux.suppress_generation(
@@ -4963,64 +4983,6 @@ fn events_response(body: HubClientResponseBody) -> DaemonTransportResult<DaemonR
     Ok(daemon_events(events_from_client(events)))
 }
 
-fn daemon_hello_ack(diagnostics: Vec<DaemonDiagnostic>) -> DaemonHelloAck {
-    DaemonHelloAck {
-        protocol: PROTOCOL.to_string(),
-        compatibility: DaemonCompatibility::current(),
-        terminal_compatibility: Some(TerminalCompatibility::current()),
-        diagnostics,
-    }
-}
-
-fn unix_hello_admission(hello: &DaemonHello) -> (UnixTerminalAdmission, DaemonHelloAck) {
-    let mut diagnostics = vec![DaemonDiagnostic::connected("hello")];
-    if let Some(requirement) = hello.terminal_compatibility.as_ref()
-        && let Err(error) =
-            ensure_terminal_compatible(requirement, &TerminalCompatibility::current())
-    {
-        let diagnostic = DaemonDiagnostic::compatibility_mismatch(error.diagnostic);
-        diagnostics.push(diagnostic.clone());
-        return (
-            UnixTerminalAdmission::Rejected {
-                code: "terminal_compatibility",
-                diagnostic,
-            },
-            daemon_hello_ack(diagnostics),
-        );
-    }
-    let capabilities = negotiated_unix_capability_set(
-        &hello.compatibility.required_features,
-        hello.terminal_compatibility.as_ref(),
-    )
-    .unwrap_or_else(|_| TerminalCapabilitySet::empty());
-    (
-        UnixTerminalAdmission::Admitted {
-            required_features: hello.compatibility.required_features.clone(),
-            capabilities,
-            mux: UnixConnectionMux::new(),
-        },
-        daemon_hello_ack(diagnostics),
-    )
-}
-
-fn terminal_compatibility_attach_error(
-    code: &'static str,
-    diagnostic: DaemonDiagnostic,
-) -> DaemonResponse {
-    let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
-    response.error = Some(DaemonOperatorError {
-        code: code.to_string(),
-        request_id: "daemon-attach-terminal-compatibility".to_string(),
-        operation: "attach".to_string(),
-        message: diagnostic
-            .message
-            .clone()
-            .unwrap_or_else(|| "terminal compatibility mismatch".to_string()),
-        diagnostics: vec![diagnostic],
-    });
-    response
-}
-
 fn attach_bind_operator_error(code: &'static str, message: &str) -> DaemonResponse {
     let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
     response.error = Some(DaemonOperatorError {
@@ -5213,45 +5175,11 @@ pub(crate) enum ControlMessage {
     },
 }
 
-#[derive(Clone, Debug)]
-pub(crate) enum UnixTerminalAdmission {
-    Admitted {
-        #[allow(dead_code)]
-        required_features: Vec<String>,
-        capabilities: TerminalCapabilitySet,
-        mux: UnixConnectionMux,
-    },
-    Rejected {
-        code: &'static str,
-        diagnostic: DaemonDiagnostic,
-    },
-}
-
-#[derive(Clone, Debug)]
-pub(crate) enum WebrtcTerminalAdmission {
-    Admitted {
-        required_features: Vec<String>,
-        mux: WebRtcConnectionMux,
-        terminal_requirement: Option<botster_terminal_protocol::TerminalCompatibilityRequirement>,
-    },
-    Rejected {
-        code: &'static str,
-        diagnostic: DaemonDiagnostic,
-    },
-}
-
-#[derive(Clone, Debug, Default)]
-pub(crate) struct HostCompatibilityRecord {
-    pub required_features: Vec<String>,
-}
-
 #[derive(Default)]
 pub(crate) struct PendingRuntimeState {
     pub(crate) streams: AttachStreamRegistry,
-    pub(crate) unix_admissions: BTreeMap<String, UnixTerminalAdmission>,
-    pub(crate) webrtc_admissions: BTreeMap<String, WebrtcTerminalAdmission>,
+    pub(crate) admission: AdmissionState,
     close_work: Arc<AtomicBool>,
-    host_compatibility: BTreeMap<String, HostCompatibilityRecord>,
 }
 
 impl fmt::Debug for PendingRuntimeState {
@@ -5283,19 +5211,19 @@ impl PendingRuntimeState {
     #[cfg(test)]
     pub(crate) fn webrtc_is_admitted(&self, grant_id: &str) -> bool {
         matches!(
-            self.webrtc_admissions.get(grant_id),
+            self.admission.webrtc_admissions.get(grant_id),
             Some(WebrtcTerminalAdmission::Admitted { .. })
         )
     }
 
     #[cfg(test)]
     pub(crate) fn has_webrtc_admission_row(&self, grant_id: &str) -> bool {
-        self.webrtc_admissions.contains_key(grant_id)
+        self.admission.webrtc_admissions.contains_key(grant_id)
     }
 
     #[cfg(test)]
     pub(crate) fn has_host_compatibility_row(&self, grant_id: &str) -> bool {
-        self.host_compatibility.contains_key(grant_id)
+        self.admission.host_compatibility.contains_key(grant_id)
     }
 }
 
@@ -5308,19 +5236,6 @@ fn run_one_pump_phase(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
     };
     if incomplete {
         state.background.mark_pump();
-    }
-}
-
-pub(crate) fn next_admission_key<T>(
-    map: &BTreeMap<String, T>,
-    after: Option<&str>,
-) -> Option<String> {
-    match after {
-        None => map.keys().next().cloned(),
-        Some(seen) => map
-            .range::<str, _>((Bound::Excluded(seen), Bound::Unbounded))
-            .next()
-            .map(|(key, _)| key.clone()),
     }
 }
 
@@ -5533,6 +5448,7 @@ fn handle_client_event_request(
     }
     let negotiated = state
         .pending_runtime
+        .admission
         .host_compatibility
         .get(connection_id)
         .is_some_and(|record| {

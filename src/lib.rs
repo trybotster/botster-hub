@@ -49,6 +49,7 @@
 //! crate-private modules. A later dedicated API change may hide remaining
 //! `FutureInternal` modules.
 
+pub(crate) mod admission;
 pub mod auth;
 pub mod capabilities;
 pub mod client_api;

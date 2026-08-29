@@ -16,11 +16,12 @@ use botster_hub_client::{
 };
 
 use crate::HubDaemon;
+use crate::admission::unix_hello::{UnixTerminalAdmission, WebrtcTerminalAdmission};
 use crate::daemon_maintenance::{
     PUMP_MAX_ADMISSIONS_VISITED, PUMP_MAX_CANDIDATE_CLASSIFICATIONS,
     PUMP_MAX_ROUTE_ENTRIES_VISITED, PumpAdmissionCursor,
 };
-use crate::daemon_transport::{DaemonControlState, UnixTerminalAdmission, WebrtcTerminalAdmission};
+use crate::daemon_transport::DaemonControlState;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ClosedEventSliceProgress {
@@ -201,7 +202,7 @@ pub(crate) fn suppress_unix_session_close_events(
     pending_runtime: &crate::daemon_transport::PendingRuntimeState,
     session_id: &str,
 ) {
-    for admission in pending_runtime.unix_admissions.values() {
+    for admission in pending_runtime.admission.unix_admissions.values() {
         if let UnixTerminalAdmission::Admitted { mux, .. } = admission {
             mux.suppress_session_route_generations(session_id);
         }
@@ -212,7 +213,7 @@ pub(crate) fn suppress_webrtc_session_close_events(
     pending_runtime: &crate::daemon_transport::PendingRuntimeState,
     session_id: &str,
 ) {
-    for admission in pending_runtime.webrtc_admissions.values() {
+    for admission in pending_runtime.admission.webrtc_admissions.values() {
         if let WebrtcTerminalAdmission::Admitted { mux, .. } = admission {
             mux.suppress_session_route_generations(session_id);
         }
@@ -252,8 +253,8 @@ pub(crate) fn run_close_events_phase(daemon: &HubDaemon, state: &mut DaemonContr
         let remaining_candidates = PUMP_MAX_CANDIDATE_CLASSIFICATIONS.saturating_sub(classified);
         match state.pump.close_cursor.clone() {
             PumpAdmissionCursor::Unix { after, after_route } => {
-                let next_key = crate::daemon_transport::next_admission_key(
-                    &state.pending_runtime.unix_admissions,
+                let next_key = crate::admission::unix_hello::next_admission_key(
+                    &state.pending_runtime.admission.unix_admissions,
                     after.as_deref(),
                 );
                 let Some(key) = next_key else {
@@ -264,7 +265,7 @@ pub(crate) fn run_close_events_phase(daemon: &HubDaemon, state: &mut DaemonContr
                     continue;
                 };
                 admissions_visited += 1;
-                let progress = match state.pending_runtime.unix_admissions.get(&key) {
+                let progress = match state.pending_runtime.admission.unix_admissions.get(&key) {
                     Some(UnixTerminalAdmission::Admitted { mux, .. }) => mux
                         .queue_closed_subscription_events_bounded(
                             |session_id| session_close_event_decision_for(runtime, session_id),
@@ -288,8 +289,8 @@ pub(crate) fn run_close_events_phase(daemon: &HubDaemon, state: &mut DaemonContr
                 };
             }
             PumpAdmissionCursor::Webrtc { after, after_route } => {
-                let next_key = crate::daemon_transport::next_admission_key(
-                    &state.pending_runtime.webrtc_admissions,
+                let next_key = crate::admission::unix_hello::next_admission_key(
+                    &state.pending_runtime.admission.webrtc_admissions,
                     after.as_deref(),
                 );
                 let Some(key) = next_key else {
@@ -297,7 +298,7 @@ pub(crate) fn run_close_events_phase(daemon: &HubDaemon, state: &mut DaemonContr
                     return false;
                 };
                 admissions_visited += 1;
-                let progress = match state.pending_runtime.webrtc_admissions.get(&key) {
+                let progress = match state.pending_runtime.admission.webrtc_admissions.get(&key) {
                     Some(WebrtcTerminalAdmission::Admitted { mux, .. }) => mux
                         .queue_closed_subscription_events_bounded(
                             |session_id| session_close_event_decision_for(runtime, session_id),
