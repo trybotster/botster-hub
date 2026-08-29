@@ -39,7 +39,7 @@ pub(crate) fn handle(
     }
 }
 
-pub(crate) fn register_unix_admission(
+fn register_unix_admission(
     state: &mut DaemonControlState,
     client_id: String,
     admission: UnixTerminalAdmission,
@@ -64,7 +64,7 @@ pub(crate) fn register_unix_admission(
     false
 }
 
-pub(crate) fn register_webrtc_admission(
+fn register_webrtc_admission(
     daemon: &mut HubDaemon,
     state: &mut DaemonControlState,
     grant_id: String,

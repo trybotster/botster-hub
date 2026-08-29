@@ -123,7 +123,20 @@ fn event_plane_saturation_source_guards_hold() {
     for relative in [
         "src/daemon/owner_loop.rs",
         "src/daemon/control.rs",
+        "src/daemon/control/message.rs",
+        "src/daemon/control/connection.rs",
         "src/daemon/control/sessions.rs",
+        "src/daemon/control/session_types.rs",
+        "src/daemon/control/spawn_targets.rs",
+        "src/daemon/control/packages.rs",
+        "src/daemon/control/packages/mutations.rs",
+        "src/daemon/control/messaging.rs",
+        "src/daemon/control/plugins.rs",
+        "src/daemon/control/entities.rs",
+        "src/daemon/control/events.rs",
+        "src/daemon/control/webrtc.rs",
+        "src/daemon/control/host.rs",
+        "src/daemon/control/request.rs",
         "src/daemon_maintenance.rs",
         "src/subscription/entity.rs",
         "src/session_projection.rs",
@@ -131,9 +144,16 @@ fn event_plane_saturation_source_guards_hold() {
         let source = fs::read_to_string(root.join(relative)).expect("read source");
         let production = source.split("#[cfg(test)]").next().unwrap_or(&source);
         assert!(
-            !production.contains("package_event_router().try_ingress"),
+            !production.contains("package_event_router().try_ingress")
+                || relative == "src/daemon/control/spawn_targets.rs",
             "{relative} operation handlers must not wait on router ingress"
         );
+        if relative == "src/daemon/control/spawn_targets.rs" {
+            assert!(
+                production.contains("package_event_router().try_ingress"),
+                "permitted try_ingress site must remain in {relative}"
+            );
+        }
     }
 
     let defaults = PackageEventPlaneOptions::default();

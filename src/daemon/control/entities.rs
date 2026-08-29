@@ -40,7 +40,7 @@ pub(crate) fn handle(
     }
 }
 
-pub(crate) fn subscribe(
+fn subscribe(
     daemon: &mut HubDaemon,
     state: &mut DaemonControlState,
     entity_type: String,
@@ -72,7 +72,7 @@ pub(crate) fn subscribe(
     false
 }
 
-pub(crate) fn unsubscribe(
+fn unsubscribe(
     daemon: &mut HubDaemon,
     state: &mut DaemonControlState,
     subscription_id: String,

@@ -278,7 +278,7 @@ pub(crate) fn remove_package(
     package_decision_response(daemon, decision)
 }
 
-pub(crate) fn commit_enabled_package(
+fn commit_enabled_package(
     daemon: &mut HubDaemon,
     previous: PackageRegistry,
     candidate: PackageRegistry,
@@ -299,7 +299,7 @@ pub(crate) fn commit_enabled_package(
     package_decision_response(daemon, decision)
 }
 
-pub(crate) fn commit_package_registry(
+fn commit_package_registry(
     daemon: &mut HubDaemon,
     package_registry: PackageRegistry,
 ) -> DaemonTransportResult<()> {
@@ -317,7 +317,7 @@ pub(crate) fn commit_package_registry(
     Ok(())
 }
 
-pub(crate) fn load_package_after_enable(
+fn load_package_after_enable(
     daemon: &mut HubDaemon,
     package_name: &str,
 ) -> DaemonTransportResult<()> {
@@ -348,7 +348,7 @@ pub(crate) fn load_package_after_enable(
     Ok(())
 }
 
-pub(crate) fn reload_package_after_reload(
+fn reload_package_after_reload(
     daemon: &mut HubDaemon,
     package_name: &str,
 ) -> DaemonTransportResult<()> {
@@ -371,7 +371,7 @@ pub(crate) fn reload_package_after_reload(
     Ok(())
 }
 
-pub(crate) fn record_event_plane_unload(daemon: &HubDaemon, package_name: &str) {
+fn record_event_plane_unload(daemon: &HubDaemon, package_name: &str) {
     let Some(runtime) = daemon.runtime() else {
         return;
     };
@@ -386,7 +386,7 @@ pub(crate) fn record_event_plane_unload(daemon: &HubDaemon, package_name: &str) 
     });
 }
 
-pub(crate) fn unload_package_after_disable(
+fn unload_package_after_disable(
     daemon: &mut HubDaemon,
     package_name: &str,
 ) -> DaemonTransportResult<()> {
@@ -400,7 +400,7 @@ pub(crate) fn unload_package_after_disable(
     Ok(())
 }
 
-pub(crate) fn restart_running_package_entrypoints(
+fn restart_running_package_entrypoints(
     daemon: &mut HubDaemon,
     registry: &PackageRegistry,
     package_name: &str,
@@ -445,7 +445,7 @@ pub(crate) fn restart_running_package_entrypoints(
     Ok(())
 }
 
-pub(crate) fn compensate_enable_load_failure(
+fn compensate_enable_load_failure(
     daemon: &mut HubDaemon,
     previous: PackageRegistry,
     package_name: String,
@@ -469,7 +469,7 @@ pub(crate) fn compensate_enable_load_failure(
     finish_compensation(original, rollbacks)
 }
 
-pub(crate) fn compensate_runtime_after_failure(
+fn compensate_runtime_after_failure(
     daemon: &mut HubDaemon,
     previous: PackageRegistry,
     original: DaemonTransportError,
@@ -508,7 +508,7 @@ pub(crate) fn compensate_runtime_after_failure(
     finish_compensation(original, rollbacks)
 }
 
-pub(crate) fn restore_plugin_from_registry(
+fn restore_plugin_from_registry(
     daemon: &mut HubDaemon,
     registry: &PackageRegistry,
     package_name: &str,
@@ -541,7 +541,7 @@ pub(crate) fn restore_plugin_from_registry(
     Ok(())
 }
 
-pub(crate) fn finish_compensation(
+fn finish_compensation(
     original: DaemonTransportError,
     rollbacks: Vec<PackageRollbackFailure>,
 ) -> DaemonTransportError {
@@ -555,7 +555,7 @@ pub(crate) fn finish_compensation(
     }
 }
 
-pub(crate) fn apply_refresh_package_side_effects(
+fn apply_refresh_package_side_effects(
     daemon: &mut HubDaemon,
     previous_packages: &PackageRegistry,
     decision: &PackageDecision,
@@ -588,7 +588,7 @@ pub(crate) fn apply_refresh_package_side_effects(
     Ok(())
 }
 
-pub(crate) fn apply_reload_side_effects(
+fn apply_reload_side_effects(
     daemon: &mut HubDaemon,
     package_name: &str,
     state: PackageState,
@@ -601,7 +601,7 @@ pub(crate) fn apply_reload_side_effects(
     restart_running_package_entrypoints(daemon, &live, package_name, running_entrypoints)
 }
 
-pub(crate) fn runnable_entrypoint_definition_changed(
+fn runnable_entrypoint_definition_changed(
     previous_packages: &PackageRegistry,
     refreshed_packages: &PackageRegistry,
     package_name: &str,
