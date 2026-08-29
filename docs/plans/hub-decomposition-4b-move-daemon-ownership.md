@@ -50,6 +50,8 @@ Atomic notes that constrain this ticket:
 
 ## Context Loaded
 
+Project architecture capture read in full, as the project checklist `checklist_1787894551_481961` requires: `ops/archive/inbox/2026-08-27-botster-wake-driven-data-plane-and-hub-decomposition.md` (vault commit `8ef01f56`). The frozen target Hub directory map at lines 98 to 144 names `src/daemon/{owner_loop.rs,control/,shutdown.rs,error.rs}`. The module partition in this plan matches that map exactly. Line 148 states that `daemon_transport.rs` is a migration source, not a permanent facade, and step 6 at line 175 removes it after its last responsibility moves. Line 16 records that `daemon_transport.rs` still drives terminal work through `run_pump_observe_phase`, `observe_lifecycle_slice`, and `drain_runtime_once`; this ticket moves that code without changing it, and project step 6 removes the terminal pumping later.
+
 Repository state read at `6b405b7`:
 
 - `src/daemon_transport.rs`, 5441 lines. Current owner of the owner loop, the control-message dispatcher, the control-request dispatcher, the runtime control-request dispatcher, and a large family of per-request response helpers.
