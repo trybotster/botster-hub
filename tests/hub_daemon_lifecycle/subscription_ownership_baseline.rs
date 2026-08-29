@@ -565,23 +565,31 @@ fn no_lua_dispatch_in_terminal_input_or_output() {
     }
     let mut extra = Vec::new();
     let src = root.join("src");
-    let entries = std::fs::read_dir(&src).expect("read src");
-    for entry in entries {
-        let entry = entry.expect("src entry");
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
-            continue;
-        }
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("");
-        if matches!(name, "lib.rs" | "runtime.rs") {
-            continue;
-        }
-        let source = std::fs::read_to_string(&path).expect("read rust file");
-        if source.contains("lua_runtime") {
-            extra.push(name.to_string());
+    let mut pending = vec![src];
+    while let Some(dir) = pending.pop() {
+        let entries = std::fs::read_dir(&dir).expect("read src");
+        for entry in entries {
+            let entry = entry.expect("src entry");
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(&root)
+                .expect("src path stays under the crate root")
+                .to_string_lossy()
+                .replace('\\', "/");
+            if matches!(rel.as_str(), "src/lib.rs" | "src/runtime.rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("read rust file");
+            if source.contains("lua_runtime") {
+                extra.push(rel);
+            }
         }
     }
     assert!(

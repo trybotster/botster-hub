@@ -107,6 +107,17 @@ git show --color-moved=dimmed-zebra --color-moved-ws=allow-indentation-change 46
 
 None. No new ticket dependency. Downstream Web/TUI cost is zero because no DTO field, serde name, or protocol version changed.
 
+## Verify return: source-scan coverage
+
+Verify `review_1787965903_413913` sent Implement back because the move-only commit left `src/client_api_dto/` and `src/daemon/` outside two production source-scanning guards. `daemon_event_from_client` is the HubClientEvent-to-DaemonEvent mapper those guards exist to watch.
+
+This return keeps product commit `468bf7f` and adds a follow-up code commit that:
+
+- adds every new DTO and daemon support file to `production_sources_reject_terminal_drain_and_snapshot_phase_decode`;
+- walks `src/` recursively in `no_lua_dispatch_in_terminal_input_or_output`.
+
+That is a second code commit. The ticket's one move-only commit still stands; this commit restores guard coverage the move created a hole in.
+
 ## Review return: finding_1787964564_384327
 
 Review sent Implement back for local absolute paths in the committed plan. This return edits only that plan. Product commit `468bf7f` is unchanged.
