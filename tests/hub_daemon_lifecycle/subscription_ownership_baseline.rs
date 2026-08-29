@@ -116,16 +116,18 @@ fn assert_production_second_channel_reject_source() {
         on_data_channel.contains("if !claimed"),
         "second DataChannel must take the reject path only after claim_data_channel returns false"
     );
+    let reject = hub_source("src/transport/webrtc/subscription_channel.rs");
     assert!(
-        on_data_channel.contains("let close_ok = matches!(close, Ok(Ok(())));"),
+        reject.contains("let close_ok = matches!(close, Ok(Ok(())));"),
         "close observation must require timeout(local_close) to return Ok(Ok(()))"
     );
     assert!(
-        on_data_channel.contains("extra-channel close marker requires lost_claim && close_ok"),
+        reject.contains("extra-channel close marker requires lost_claim && close_ok"),
         "close marker must require a lost claim and Ok(Ok(())) from timeout(local_close)"
     );
     assert!(
-        !on_data_channel.contains("label == EXTRA_DATA_CHANNEL_LABEL"),
+        !on_data_channel.contains("label == EXTRA_DATA_CHANNEL_LABEL")
+            && !reject.contains("label == EXTRA_DATA_CHANNEL_LABEL"),
         "close marker must not require botster-extra to lose the claim"
     );
     assert!(
