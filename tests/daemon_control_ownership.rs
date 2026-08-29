@@ -119,19 +119,409 @@ fn daemon_control_does_not_remove_grant_rows() {
     }
 }
 
+fn request_variant_names(source: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let needle = "DaemonRequest::";
+    let mut rest = source;
+    while let Some(index) = rest.find(needle) {
+        rest = &rest[index + needle.len()..];
+        let name: String = rest
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+            .collect();
+        if !name.is_empty() {
+            names.push(name);
+        }
+    }
+    names
+}
+
+fn control_message_variant_names(source: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let needle = "ControlMessage::";
+    let mut rest = source;
+    while let Some(index) = rest.find(needle) {
+        rest = &rest[index + needle.len()..];
+        let name: String = rest
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+            .collect();
+        if !name.is_empty() {
+            names.push(name);
+        }
+    }
+    names
+}
+
+fn enum_variants(source: &str, enum_name: &str) -> Vec<String> {
+    let pub_header = format!("pub enum {enum_name} ");
+    let crate_header = format!("pub(crate) enum {enum_name} ");
+    let after = source
+        .split(&pub_header)
+        .nth(1)
+        .or_else(|| source.split(&crate_header).nth(1))
+        .expect(enum_name);
+    let start = after.find('{').expect("enum body");
+    let mut depth = 0;
+    let mut body = String::new();
+    for ch in after[start..].chars() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+        if depth >= 1 {
+            body.push(ch);
+        }
+    }
+    let mut names = Vec::new();
+    let mut depth = 0;
+    for line in body.lines() {
+        let trimmed = line.trim();
+        let line_depth = depth;
+        depth += trimmed.matches('{').count() as i32 - trimmed.matches('}').count() as i32;
+        if line_depth > 1 {
+            continue;
+        }
+        if trimmed.starts_with('#') || trimmed.starts_with('/') || trimmed.is_empty() {
+            continue;
+        }
+        let ident: String = trimmed
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+            .collect();
+        if ident
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_uppercase())
+        {
+            names.push(ident);
+        }
+    }
+    names
+}
+
+const FAMILY_OWNERS: &[(&str, &str, &[&str])] = &[
+    (
+        "src/daemon/control/sessions.rs",
+        "sessions",
+        &[
+            "Status",
+            "ListSessions",
+            "RemoveSession",
+            "Spawn",
+            "Attach",
+            "Detach",
+            "SendInput",
+            "ModeGatedInput",
+            "Resize",
+            "ShutdownSession",
+            "Drain",
+            "ReadScreen",
+            "ReadModeFlags",
+            "CaptureSnapshot",
+            "ReadSessionContext",
+        ],
+    ),
+    (
+        "src/daemon/control/session_types.rs",
+        "session_types",
+        &[
+            "ListSessionTypes",
+            "ListSessionTypesForTarget",
+            "ShowSessionType",
+            "ShowSessionTypeDefinition",
+            "CreateSessionType",
+            "UpdateSessionType",
+            "DeleteSessionType",
+            "ResolveSessionType",
+            "SpawnSessionType",
+        ],
+    ),
+    (
+        "src/daemon/control/spawn_targets.rs",
+        "spawn_targets",
+        &[
+            "ListSpawnTargets",
+            "ShowSpawnTarget",
+            "CreateSpawnTarget",
+            "UpdateSpawnTarget",
+            "DeleteSpawnTarget",
+            "ValidateSpawnTarget",
+            "ListWorktrees",
+            "ShowWorktree",
+            "CreateWorktree",
+            "DeleteWorktree",
+        ],
+    ),
+    (
+        "src/daemon/control/packages.rs",
+        "packages",
+        &[
+            "ListApps",
+            "ResolveAppLaunch",
+            "ResolvePackageRoute",
+            "ListPackageNavigation",
+            "ListPackages",
+            "ListAvailablePackages",
+            "InspectAvailablePackage",
+            "PreviewPackageInstall",
+            "InstallPackageRegistryEntry",
+            "InstallPackageLocalPath",
+            "CheckPackageUpdate",
+            "PreviewPackageUpdate",
+            "ApplyPackageUpdate",
+            "ShowPackage",
+            "SetPackageConfiguration",
+            "ReloadPackage",
+            "RefreshLocalPackages",
+            "EnablePackageLocalPath",
+            "EnablePackage",
+            "DisablePackage",
+            "RemovePackage",
+            "StartPackageEntrypoint",
+            "StopPackageEntrypoint",
+            "RestartPackageEntrypoint",
+            "PackageEntrypointStatus",
+        ],
+    ),
+    (
+        "src/daemon/control/messaging.rs",
+        "messaging",
+        &[
+            "Whoami",
+            "PostMessage",
+            "ReceiveMessages",
+            "AckMessage",
+            "NotifySession",
+        ],
+    ),
+    (
+        "src/daemon/control/plugins.rs",
+        "plugins",
+        &[
+            "PluginMcpListTools",
+            "PluginMcpCallTool",
+            "PluginSurfaceRender",
+            "PluginSurfaceAction",
+            "PluginLifecycleStatus",
+        ],
+    ),
+    (
+        "src/daemon/control/entities.rs",
+        "entities",
+        &["SubscribeEntities", "UnsubscribeEntities"],
+    ),
+    (
+        "src/daemon/control/events.rs",
+        "events",
+        &["SubscribeEvents", "UnsubscribeEvents"],
+    ),
+    (
+        "src/daemon/control/webrtc.rs",
+        "webrtc",
+        &["IssueLocalWebrtcBootstrap", "LocalWebrtcSignal"],
+    ),
+    (
+        "src/daemon/control/host.rs",
+        "host",
+        &[
+            "CheckHubUpdate",
+            "StartHubUpdate",
+            "GetHubUpdateExecution",
+            "DaemonShutdown",
+        ],
+    ),
+];
+
 #[test]
-fn runtime_dispatcher_delegates_to_sessions() {
+fn each_daemon_request_has_exactly_one_family_owner() {
+    let declared = enum_variants(
+        &hub_source("crates/botster-hub-client/src/lib.rs"),
+        "DaemonRequest",
+    );
+    let mut mapped = Vec::new();
+    for (path, _family, variants) in FAMILY_OWNERS {
+        mapped.extend(variants.iter().copied().map(str::to_string));
+        let named = request_variant_names(&hub_source(path));
+        for variant in *variants {
+            assert!(
+                named.iter().any(|name| name == variant),
+                "{path} must own DaemonRequest::{variant}"
+            );
+        }
+    }
+    mapped.sort();
+    mapped.dedup();
+    let mut declared_sorted = declared.clone();
+    declared_sorted.sort();
+    assert_eq!(
+        declared_sorted, mapped,
+        "ownership matrix must cover every DaemonRequest variant exactly once"
+    );
+
+    let family_paths: Vec<&str> = FAMILY_OWNERS.iter().map(|(path, ..)| *path).collect();
+    for (owner_path, _family, variants) in FAMILY_OWNERS {
+        for other_path in &family_paths {
+            if other_path == owner_path {
+                continue;
+            }
+            let named = request_variant_names(&hub_source(other_path));
+            for variant in *variants {
+                if *other_path == "src/daemon/control/webrtc.rs" && *variant == "Detach" {
+                    continue;
+                }
+                assert!(
+                    !named.iter().any(|name| name == variant),
+                    "{other_path} must not own DaemonRequest::{variant}; owner is {owner_path}"
+                );
+            }
+        }
+    }
+
+    let webrtc = hub_source("src/daemon/control/webrtc.rs");
+    assert!(
+        webrtc.contains("DaemonRequest::Detach"),
+        "PeerClosed sweep may construct DaemonRequest::Detach"
+    );
+}
+
+#[test]
+fn dispatcher_names_request_variants_only_in_delegating_arms() {
     let dispatcher = hub_source("src/daemon/control.rs");
+    for forbidden in ["HubClientApi", "FileHubStateStore"] {
+        assert!(
+            !dispatcher.contains(forbidden),
+            "control.rs must not call {forbidden}"
+        );
+    }
     let runtime = dispatcher
         .split("pub(crate) fn handle_runtime_control_request(")
         .nth(1)
         .expect("runtime dispatcher");
     assert!(
         runtime.contains("sessions::handle_runtime("),
-        "handle_runtime_control_request must delegate"
+        "session family must be delegated"
+    );
+    assert!(
+        runtime.contains("session_types::handle_runtime("),
+        "session-type family must be delegated"
+    );
+    assert!(
+        runtime.contains("messaging::handle_runtime("),
+        "messaging family must be delegated"
+    );
+    assert!(
+        runtime.contains("plugins::handle_runtime("),
+        "plugin family must be delegated"
+    );
+    assert!(
+        runtime.contains("host::handle_runtime("),
+        "host shutdown must be delegated"
     );
     assert!(
         !runtime.contains("HubClientApi"),
         "runtime dispatcher must not construct HubClientApi"
     );
+}
+
+#[test]
+fn control_message_variants_have_one_family_or_dispatcher_owner() {
+    let declared = enum_variants(
+        &hub_source("src/daemon/control/message.rs"),
+        "ControlMessage",
+    );
+    let expected = [
+        "AcceptedConnection",
+        "RejectedConnection",
+        "SubscribeEntities",
+        "UnsubscribeEntities",
+        "Request",
+        "HubUpdateCheckCompleted",
+        "EgressWriteFailed",
+        "LocalWebrtcPeerClosed",
+        "RegisterUnixAdmission",
+        "RegisterWebrtcAdmission",
+    ];
+    assert_eq!(
+        declared, expected,
+        "ControlMessage matrix must stay complete"
+    );
+
+    let connection = hub_source("src/daemon/control/connection.rs");
+    let entities = hub_source("src/daemon/control/entities.rs");
+    let host = hub_source("src/daemon/control/host.rs");
+    let webrtc = hub_source("src/daemon/control/webrtc.rs");
+    let dispatcher = hub_source("src/daemon/control.rs");
+    assert!(connection.contains("fn register_unix_admission"));
+    assert!(connection.contains("fn register_webrtc_admission"));
+    assert!(entities.contains("fn subscribe"));
+    assert!(entities.contains("fn unsubscribe"));
+    assert!(host.contains("ControlMessage::HubUpdateCheckCompleted"));
+    assert!(webrtc.contains("fn handle_peer_closed"));
+    assert!(dispatcher.contains("ControlMessage::Request"));
+    assert!(dispatcher.contains("ControlMessage::EgressWriteFailed"));
+    assert!(dispatcher.contains("ControlMessage::LocalWebrtcPeerClosed"));
+    assert!(dispatcher.contains("webrtc::handle_peer_closed"));
+    assert!(dispatcher.contains("host::hub_update_check_completed"));
+
+    for (path, source) in [
+        (
+            "src/daemon/control/sessions.rs",
+            hub_source("src/daemon/control/sessions.rs"),
+        ),
+        (
+            "src/daemon/control/plugins.rs",
+            hub_source("src/daemon/control/plugins.rs"),
+        ),
+        (
+            "src/daemon/control/messaging.rs",
+            hub_source("src/daemon/control/messaging.rs"),
+        ),
+        (
+            "src/daemon/control/packages.rs",
+            hub_source("src/daemon/control/packages.rs"),
+        ),
+    ] {
+        for variant in [
+            "LocalWebrtcPeerClosed",
+            "HubUpdateCheckCompleted",
+            "RegisterWebrtcAdmission",
+        ] {
+            assert!(
+                !control_message_variant_names(&source)
+                    .iter()
+                    .any(|name| name == variant),
+                "{path} must not own ControlMessage::{variant}"
+            );
+        }
+    }
+}
+
+#[test]
+fn duplicating_a_variant_into_the_wrong_owner_fails_the_matrix() {
+    let sessions = hub_source("src/daemon/control/sessions.rs");
+    let plugins = hub_source("src/daemon/control/plugins.rs");
+    let host = hub_source("src/daemon/control/host.rs");
+    assert!(
+        sessions.contains("DaemonRequest::SendInput")
+            && !plugins.contains("DaemonRequest::SendInput"),
+        "SendInput must not be duplicated into plugins.rs"
+    );
+    assert!(
+        host.contains("DaemonRequest::CheckHubUpdate")
+            && !sessions.contains("DaemonRequest::CheckHubUpdate"),
+        "CheckHubUpdate must not be duplicated into sessions.rs"
+    );
+    assert!(
+        plugins.contains("DaemonRequest::PluginMcpListTools")
+            && !sessions.contains("DaemonRequest::PluginMcpListTools"),
+        "PluginMcpListTools must not remain in sessions.rs"
+    );
+    let _ = request_variant_names(&sessions);
 }
