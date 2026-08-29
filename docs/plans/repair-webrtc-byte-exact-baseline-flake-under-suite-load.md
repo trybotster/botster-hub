@@ -100,7 +100,7 @@ If Plan Review judges that the class applies, the correct action is to force the
 
 Assumptions:
 1. The Python producer prints `producer-ready` to the same PTY before it waits for the release file. `write_python_wait_then_write_script` confirms this at `package_fixtures.rs:1256`.
-2. `wait_for_producer_ready` reaches the session through the Unix endpoint while a WebRTC subscription is bound. `sessions.rs:1510` and `1548` use the helper against live sessions.
+2. `wait_for_producer_ready` reaches the session through the Unix endpoint while a WebRTC subscription is bound. `sessions.rs:1510` and `1548` use the helper against live sessions. The helper is already in scope, because `tests/hub_daemon_lifecycle/mod.rs:21` re-exports `session_fixtures::*`.
 3. A blocking `botster_hub_client::request` call inside the multi-thread `block_on` block is safe. `webrtc_terminal_adapter.rs:582` already does this inside an async block.
 4. The producer exits shortly after it writes the four bytes, so lifecycle `exited` is a reachable completion signal. `production_cleanup_after_authoritative_exit` at line 903 already depends on that exit.
 
@@ -121,7 +121,7 @@ Unknowns for Implement to resolve with measurement, not assertion:
 2. **A new hang.** An oracle that waits for exit can hang when the producer never exits. Mitigation: keep an outer backstop that always terminates the loop and always produces either the marker or the byte assertion.
 3. **Weakening the proof.** Waiting for producer-ready could look like relaxing the claim. Mitigation: the claim is byte identity, not delivery latency. The assertion text and the expected byte sequence stay identical.
 4. **Shared-constant drift.** Raising `AUTHORITATIVE_SESSION_EXIT_WAIT` or any production budget to pass the test is forbidden by [[wall-clock MAX_OWNER_TURN_MS assertions flake under default-concurrency lib load]]. Mitigation: Implement changes no production constant and no shared harness constant.
-5. **Ablation blindness.** `cargo test --exact` with a bare leaf name filters out every test and reports `ok`. Mitigation: run the ablation with the full module path and prove a one-test baseline first, per [[exact Rust test ablations require a one test baseline]].
+5. **Ablation blindness.** An exact filter that matches nothing reports `ok` and turns every ablation arm falsely green. Mitigation: prove a one-test baseline before each ablation arm, per [[exact Rust test ablations require a one test baseline]]. In this crate the correct filter is the bare test name, because `tests/hub_daemon_lifecycle_test.rs` `include!`s the file into the crate root.
 6. **Residual load failure.** The repaired oracle can still fail on a genuinely exhausted host. That outcome is acceptable only when the failure carries the named marker.
 
 ## Acceptance checks and tests
@@ -132,9 +132,9 @@ Toolchain and worktree rules for every command:
 - Prebuild before the locked wrapper: `cargo build --locked -p botster-core-daemon --bin botster-session-worker`, then `cargo build --locked --bin botster-hub`.
 
 Checks:
-1. Focused exact rerun, full module path, one-test baseline first:
-   `cargo test --locked --test hub_daemon_lifecycle_test -- --exact hub_daemon_lifecycle::subscription_ownership_baseline::webrtc_terminal_output_is_byte_exact --nocapture`
-   The baseline output must report exactly one test run.
+1. Focused exact rerun, one-test baseline first:
+   `./test.sh --locked --test hub_daemon_lifecycle_test webrtc_terminal_output_is_byte_exact -- --exact --nocapture`
+   `tests/hub_daemon_lifecycle_test.rs:87` `include!`s the test file into the crate root, so the exact filter is the bare test name and no module prefix exists. `tests/hub_daemon_lifecycle/mod.rs:1-4` documents this invocation form. The baseline output must report exactly one test run before any ablation arm starts.
 2. Full official suite on a normally loaded host: `./test.sh --locked`. The named test must pass, or its failure must print a `harness_budget_expired` marker that contains `test=webrtc_terminal_output_is_byte_exact`.
 3. **Red-on-revert, product arm.** Break byte exactness deliberately, for example by changing the producer to write one different byte, and prove the test fails on the byte-exactness assertion at line 895 with a non-empty `got [...]`. The failure must not be a harness marker. Restore the source afterward.
 4. **Red-on-revert, precondition arm.** Remove the producer-ready wait and confirm the test still passes in isolation. This shows the wait is a precondition, not the proof.
