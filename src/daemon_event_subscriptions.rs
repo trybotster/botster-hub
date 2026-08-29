@@ -15,8 +15,8 @@ use botster_hub_client::{
 use serde_json::Value;
 use tokio::sync::Notify;
 
+use crate::client_api_dto::response::daemon_response_base;
 use crate::config::PackageEventPlanePolicy;
-use crate::daemon_transport::daemon_response_base;
 use crate::event_plane_counters::{AgeIdentity, EventPlaneCounters, QueueAgeMetric};
 use crate::package_event_router::{ClientEventHolder, EventPlaneStatus, PackageEventRouter};
 use botster_hub_client::DaemonQueueKind;

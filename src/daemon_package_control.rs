@@ -11,11 +11,11 @@ use botster_core::PackageConfigurationValue;
 use botster_hub_client::DaemonPackagePin;
 
 use super::{
-    DaemonTransportError, DaemonTransportResult, HubDaemon, PackageRollbackFailure,
-    advance_session_type_generation_if_changed, list_packages_response, package_decision_response,
-    package_pin_from_daemon, package_update_status, request_id, session_type_definition_map,
-    show_package_response, supervised_launch_contract,
+    HubDaemon, advance_session_type_generation_if_changed, list_packages_response,
+    package_decision_response, package_pin_from_daemon, package_update_status, request_id,
+    session_type_definition_map, show_package_response, supervised_launch_contract,
 };
+use crate::daemon::error::{DaemonTransportError, DaemonTransportResult, PackageRollbackFailure};
 use crate::entrypoint_supervisor::EntrypointSupervisorError;
 use crate::persistence::{FileHubStateStore, HubStateStore};
 use crate::{
