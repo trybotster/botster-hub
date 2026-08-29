@@ -149,7 +149,7 @@ Commit kinds are stated as an invariant rather than a fixed count, per [[express
 
   The bright line between import repair and guard restore: **import repair may rewrite the path text of a reference that already exists; it may not add or remove a reference.** Adding a scan-list entry for a newly created file is guard restore.
 
-  **This paragraph and the four bullets above it are the only definition of the commit kinds.** No other section restates their scope. Where a later section names a commit kind, it names it and points here. Plan Review round 4 found a stale second copy of this definition inside the late-message matrix, which had frozen at the round-1 wording and would have told Implement to skip required repairs.
+  **The four commit-kind bullets in this section are the only definition of the commit kinds, and this paragraph is part of that definition.** No other section restates their scope. Where a later section names a commit kind, it names it and points here. Plan Review round 4 found a stale second copy of this definition inside the late-message matrix, which had frozen at the round-1 wording and would have told Implement to skip required repairs.
 - **Extraction.** One responsibility leaves its current file and lands in a named owner file, with its state, policy, and tests. No behavior changes.
 - **Guard restore.** New entries added to source-scanning guard lists for files this ticket creates, and named-file assertions relocated for code that moved by extraction rather than by relocation.
 
@@ -184,6 +184,16 @@ Implement must repair every row, and check 8b proves none survives.
 
 Rows by pair: **attach owns 6 matching lines** (rows 1, 3, 4, 7, 9, 11) and **entity owns 6** (rows 2, 5, 6, 8, 10, where row 8 is two lines). The `package_events` relocation owns none.
 
+**Every place that cites a row number.** Two review rounds changed this table and left citations behind, so the citing sites are enumerated here. An edit to the table must update all five, and a reviewer can check them without reading the whole plan:
+
+1. The rows-by-pair line directly above.
+2. The pairing and greenness rule, which cites the range of test-failing rows and their pairs.
+3. The Affected Surfaces list, where three test files name their rows.
+4. Acceptance check 8b, which cites the same range and maps rows to enclosing test functions.
+5. The `Attach` row of the late-message matrix, which cites the attach pair's rows.
+
+That list is itself measurable: `grep -nE "rows? [0-9]+"` over this document must return hits only inside the table, inside the paragraph above the table, and inside those five sites. The enumeration was written with four entries and the grep found the fifth, which is the point of running it.
+
 Rows 1 through 5 are 5 matching lines and break `cargo build`. Rows 8 through 11 are 5 matching lines that build fine and then fail inside a named test, because each reads a path that no longer exists. Rows 6 and 7 are 2 matching lines that only degrade an assertion message. The three groups account for all 12 matching lines.
 
 All 11 rows are the same class of edit — a path that names the relocated file — so each belongs to the import-repair commit of the pair named in its Pair column. Only `src/daemon_event_subscriptions.rs` has no such reference; its relocation needs module-declaration and `use` repair alone.
@@ -192,7 +202,7 @@ All 11 rows are the same class of edit — a path that names the relocated file 
 
 - The two commits form a contiguous pair, in the order relocation then import repair.
 - The relocation commit is permitted to be non-green. It is the only commit kind on this branch with that permission, and the permission exists solely so the human-required separation stays visible in history.
-- **At the second commit of every pair, both `cargo build --locked` and every test that names the relocated file must pass.** The path-reference inventory is what makes the second half of that obligation reachable: without rows 8 through 10 in the import-repair commit, the pair would build and then fail three named-file tests.
+- **At the second commit of every pair, both `cargo build --locked` and every test that names the relocated file must pass.** The path-reference inventory is what makes the second half of that obligation reachable: without rows 8 through 11 in the import-repair commit, the pair would build and then fail three named-file tests. Rows 8 and 10 belong to the entity pair; rows 9 and 11 belong to the attach pair.
 - Every extraction and guard-restore commit must be green on the same two obligations.
 - Gates run at pair boundaries and at every non-relocation commit. They do not run inside a pair.
 
@@ -270,7 +280,7 @@ Modified:
 - `src/host_control_fair_write.rs` -- only if a moved line changes one of its two pinned source strings. It names `src/daemon_transport.rs` and `src/local_webrtc.rs`, neither of which relocates, so no path repair applies to it.
 - `tests/hub_daemon_lifecycle/subscription_ownership_baseline.rs` -- row 9 of the path-reference inventory, plus guard file names that follow extracted code.
 - `tests/session_projection_owner_loop.rs` -- row 8 of the path-reference inventory. Two sites: the scan list entry and the exclusion comparison that names the same path.
-- `tests/hub_daemon_lifecycle/event_plane_saturation.rs` -- row 10 of the path-reference inventory. Two sites: a scan list entry and a direct read.
+- `tests/hub_daemon_lifecycle/event_plane_saturation.rs` -- rows 10 and 11 of the path-reference inventory. This is the only file that spans two pairs: line 126 is row 10 and belongs to the entity pair, line 176 is row 11 and belongs to the attach pair. Its two sites are therefore repaired in two different import-repair commits.
 - `docs/plans/hub-decomposition-2-extract-admission-and-subscription-ownership.md` -- this plan, in documentation commits that touch no code.
 
 Not modified, and a change in any of them is a scope error:
@@ -320,7 +330,7 @@ Move-only proof:
 
    At `fd540b6` that prints `12`. After each import-repair commit it must print zero for the file that commit's pair relocated, and after the last pair it must print `0` in total.
 
-   The three named-file guards in rows 8 through 10 must each be executed by exact name, not merely compiled. Each name was read from the enclosing `fn` of the matching line, so the filter and the inventory row agree:
+   The three named-file guards covering rows 8 through 11 must each be executed by exact name, not merely compiled. Each name was read from the enclosing `fn` of the matching line, so the filter and the inventory row agree:
 
    ```
    RUSTUP_TOOLCHAIN=1.97.0 BOTSTER_ENV=test cargo test --locked --test session_projection_owner_loop -- --exact owner_loop_and_projection_sources_reject_unbounded_and_product_policy
@@ -328,7 +338,7 @@ Move-only proof:
    RUSTUP_TOOLCHAIN=1.97.0 BOTSTER_ENV=test cargo test --locked --test hub_daemon_lifecycle_test -- --exact attach_ready_precedes_history_finish
    ```
 
-   Row 8 lines 176 and 191 both sit inside `owner_loop_and_projection_sources_reject_unbounded_and_product_policy`. Row 10 lines 126 and 176 both sit inside `event_plane_saturation_source_guards_hold`. Row 9 line 647 sits inside `attach_ready_precedes_history_finish`. Each name was read from the enclosing `fn` of its matching line, so the filter and the inventory row agree.
+   Row 8 lines 176 and 191 both sit inside `owner_loop_and_projection_sources_reject_unbounded_and_product_policy`. Rows 10 and 11, `event_plane_saturation.rs` lines 126 and 176, both sit inside `event_plane_saturation_source_guards_hold`; one test therefore covers two rows that belong to different pairs, so that test must pass at both pair boundaries. Row 9 line 647 sits inside `attach_ready_precedes_history_finish`. Each name was read from the enclosing `fn` of its matching line, so the filter and the inventory row agree.
 
    **All three commands were executed at base `fd540b6` while writing this plan, and each reported `1 passed; 0 failed`.** The two `hub_daemon_lifecycle_test` filters use the **bare** test name. The module-qualified form was tried first and is wrong: `--exact event_plane_saturation::event_plane_saturation_source_guards_hold` reports `0 passed; 0 failed; 321 filtered out` and exits 0, so it would have looked green while running nothing. That harness flattens submodule names, which `cargo test --locked --test hub_daemon_lifecycle_test -- --list` confirms. Every run must report `1 passed`; a `0 passed` line means the filter missed and the check did not run.
 
@@ -413,4 +423,5 @@ The class applies. This ticket moves peer ownership identity, route ownership, o
 9. A note that a plan which reports one count where two exist cannot be checked. Matching lines and repair rows are different quantities, and an acceptance check that greps for one while citing the other is unverifiable. Plan Review round 3 proved this on this ticket.
 10. A note that a repair row in a decomposition inventory must map to exactly one relocation, because each row is repaired inside that relocation's own commit. One Hub test file, `tests/hub_daemon_lifecycle/event_plane_saturation.rs`, names two different relocated modules on two lines, so grouping the file into one row put lines from two pairs in one commit and broke the pairing rule. Group an inventory by owning relocation, not by containing file.
 11. A note that restating a definition in a second place is how a plan goes stale. Four Plan Review rounds on this ticket amended the commit-kind definition, and the copy inside the late-message matrix silently kept the round-1 wording. A plan should define each rule once and have every later section name it and point back.
-10. A note that the Hub `hub_daemon_lifecycle_test` harness flattens submodule names, so a module-qualified `--exact` filter such as `event_plane_saturation::event_plane_saturation_source_guards_hold` matches nothing, prints `0 passed; 0 failed; 321 filtered out`, and exits 0. A named-test acceptance check must assert `1 passed` rather than exit status, or it certifies a run that never happened.
+12. A note that splitting a row in a plan inventory is a two-part edit, and the second part is the one that gets skipped. Two consecutive Plan Review rounds on this ticket accepted a corrected table and then found stale row citations elsewhere in the same document. A plan that carries a numbered inventory should enumerate every site that cites those numbers, next to the inventory, so the update set is mechanical rather than remembered.
+13. A note that the Hub `hub_daemon_lifecycle_test` harness flattens submodule names, so a module-qualified `--exact` filter such as `event_plane_saturation::event_plane_saturation_source_guards_hold` matches nothing, prints `0 passed; 0 failed; 321 filtered out`, and exits 0. A named-test acceptance check must assert `1 passed` rather than exit status, or it certifies a run that never happened.
