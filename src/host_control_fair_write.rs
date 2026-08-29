@@ -155,7 +155,7 @@ mod tests {
             Some(HostControlClass::Control),
             "Unix rotates Control and Event with Entity inactive"
         );
-        let unix = include_str!("daemon_transport.rs");
+        let unix = include_str!("transport/unix/mux_write.rs");
         assert!(
             unix.contains("            false,\n            event_ready,"),
             "Unix call site must pass entity_ready=false"

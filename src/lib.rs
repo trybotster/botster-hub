@@ -82,7 +82,7 @@ pub mod session_types;
 pub mod source_update;
 pub mod spawn_targets;
 pub(crate) mod subscription;
-mod unix_terminal_adapter;
+pub(crate) mod transport;
 mod webrtc_terminal_adapter;
 pub mod worktrees;
 
@@ -616,6 +616,12 @@ const HUB_CRATE_EXPORTS: &[HubCrateExport] = &[
         "already doc-hidden; used by the first-party update command",
     ),
     HubCrateExport::new(
+        "transport",
+        HubCrateExportClass::Internal,
+        HubCrateExportStability::AlreadyInternal,
+        "shared adapter slot and Unix transport; already crate-private",
+    ),
+    HubCrateExport::new(
         "spawn_targets",
         HubCrateExportClass::HubPolicy,
         HubCrateExportStability::KeepPublic,
@@ -774,6 +780,7 @@ mod tests {
             "session_types",
             "source_update",
             "spawn_targets",
+            "transport",
             "worktrees",
         ] {
             assert!(
@@ -810,7 +817,7 @@ mod tests {
     #[test]
     fn architecture_summary_defers_visibility_changes_for_internal_modules() {
         let summary = architecture_summary();
-        for name in ["daemon_projection", "local_webrtc"] {
+        for name in ["daemon_projection", "local_webrtc", "transport"] {
             let export = summary
                 .crate_exports()
                 .iter()
@@ -873,7 +880,12 @@ mod tests {
         assert!(client_api.reason().contains("not the daemon wire crate"));
     }
 
-    fn production_source(source: &str) -> String {
+    struct ProductionScan {
+        source: String,
+        skip_open_at_eof: bool,
+    }
+
+    fn scan_production_source(source: &str) -> ProductionScan {
         let mut out = String::new();
         let mut skip_depth = 0i32;
         let mut skipping_item = false;
@@ -902,7 +914,14 @@ mod tests {
             out.push_str(line);
             out.push('\n');
         }
-        out
+        ProductionScan {
+            source: out,
+            skip_open_at_eof: skipping_item,
+        }
+    }
+
+    fn production_source(source: &str) -> String {
+        scan_production_source(source).source
     }
 
     const FORBIDDEN_PRODUCTION_CONSTRUCTS: &[&str] = &[
@@ -1062,9 +1081,52 @@ mod tests {
             ),
             ("src/daemon/error.rs", include_str!("daemon/error.rs")),
             ("src/daemon/shutdown.rs", include_str!("daemon/shutdown.rs")),
+            ("src/transport.rs", include_str!("transport.rs")),
+            (
+                "src/transport/shared.rs",
+                include_str!("transport/shared.rs"),
+            ),
+            (
+                "src/transport/shared/adapter_slot.rs",
+                include_str!("transport/shared/adapter_slot.rs"),
+            ),
+            (
+                "src/transport/shared/wake.rs",
+                include_str!("transport/shared/wake.rs"),
+            ),
+            (
+                "src/transport/shared/close_reason.rs",
+                include_str!("transport/shared/close_reason.rs"),
+            ),
+            (
+                "src/transport/shared/close_progress.rs",
+                include_str!("transport/shared/close_progress.rs"),
+            ),
+            ("src/transport/unix.rs", include_str!("transport/unix.rs")),
+            (
+                "src/transport/unix/adapter.rs",
+                include_str!("transport/unix/adapter.rs"),
+            ),
+            (
+                "src/transport/unix/listener.rs",
+                include_str!("transport/unix/listener.rs"),
+            ),
+            (
+                "src/transport/unix/connection.rs",
+                include_str!("transport/unix/connection.rs"),
+            ),
+            (
+                "src/transport/unix/mux_write.rs",
+                include_str!("transport/unix/mux_write.rs"),
+            ),
         ];
         for (path, source) in files {
-            let production = production_source(source);
+            let scan = scan_production_source(source);
+            assert!(
+                !scan.skip_open_at_eof,
+                "{path} production scanner must leave cfg(test) skip mode closed"
+            );
+            let production = scan.source;
             for forbidden in FORBIDDEN_PRODUCTION_CONSTRUCTS {
                 if *forbidden == "GHOSTSNP" && path == "src/runtime.rs" {
                     continue;

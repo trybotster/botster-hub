@@ -5,54 +5,21 @@
 //! `close` and `Drop` return without waiting on DataChannel I/O or a writer lock.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, TryLockError};
 
 use botster_core::contract::terminal_adapter::{
     TerminalAdapter, TerminalAdapterPressure, TerminalAdapterWriteError,
 };
 use botster_hub_client::DaemonEvent;
 use botster_terminal_protocol::TerminalFrame;
-use tokio::sync::Notify;
 
 use crate::subscription::closed_events::{
     ClosedEventLedger, ClosedEventRoute, ClosedEventSliceProgress, ClosedHandle,
 };
-
-/// Wake that stores a permit so a write cannot be lost before the sender waits.
-#[derive(Clone)]
-struct AdapterWake {
-    notify: Arc<Notify>,
-    pending: Arc<AtomicBool>,
-}
-
-impl AdapterWake {
-    fn new() -> Self {
-        Self {
-            notify: Arc::new(Notify::new()),
-            pending: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
-    fn wake(&self) {
-        self.pending.store(true, Ordering::SeqCst);
-        self.notify.notify_waiters();
-    }
-
-    async fn wait(&self) {
-        loop {
-            if self.pending.swap(false, Ordering::SeqCst) {
-                return;
-            }
-            let notified = self.notify.notified();
-            tokio::pin!(notified);
-            if self.pending.swap(false, Ordering::SeqCst) {
-                return;
-            }
-            notified.await;
-        }
-    }
-}
+use crate::transport::shared::adapter_slot::AdapterSlot;
+use crate::transport::shared::wake::AdapterWake;
 
 /// One-slot WebRTC adapter bound to an admitted DataChannel.
 pub struct WebRtcTerminalAdapter {
@@ -66,155 +33,55 @@ pub(crate) struct WebRtcTerminalAdapterHandle {
 }
 
 struct WebRtcTerminalAdapterInner {
-    closed: AtomicBool,
-    host_closed: AtomicBool,
-    would_block: AtomicBool,
-    slot: Mutex<Option<Vec<u8>>>,
-    wake: AdapterWake,
-    close_work: Arc<AtomicBool>,
+    slot: AdapterSlot<AdapterWake>,
 }
 
 impl WebRtcTerminalAdapterInner {
     fn new() -> Self {
         Self {
-            closed: AtomicBool::new(false),
-            host_closed: AtomicBool::new(false),
-            would_block: AtomicBool::new(false),
-            slot: Mutex::new(None),
-            wake: AdapterWake::new(),
-            close_work: Arc::new(AtomicBool::new(false)),
+            slot: AdapterSlot::with_wake_and_close_work(
+                AdapterWake::new(),
+                Arc::new(AtomicBool::new(false)),
+            ),
         }
     }
 
     fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::SeqCst)
+        self.slot.is_closed()
     }
 
     fn close_from_host(&self) {
-        if !self.is_closed() {
-            self.host_closed.store(true, Ordering::SeqCst);
-        }
-        self.close();
+        self.slot.close_from_host();
     }
 
     fn host_closed(&self) -> bool {
-        self.host_closed.load(Ordering::SeqCst)
+        self.slot.host_closed()
     }
 
     fn close(&self) {
-        self.closed.store(true, Ordering::SeqCst);
-        self.close_work.store(true, Ordering::SeqCst);
-        match self.slot.try_lock() {
-            Ok(mut slot) => {
-                *slot = None;
-            }
-            Err(TryLockError::WouldBlock) => {}
-            Err(TryLockError::Poisoned(poisoned)) => {
-                *poisoned.into_inner() = None;
-            }
-        }
-        self.wake.wake();
+        self.slot.close();
     }
 
     #[cfg(test)]
     fn set_would_block(&self, pressured: bool) {
-        self.would_block.store(pressured, Ordering::SeqCst);
-        self.wake.wake();
+        self.slot.set_would_block(pressured);
+        self.slot.wake();
     }
 
     fn pressure(&self) -> TerminalAdapterPressure {
-        if self.is_closed() {
-            return TerminalAdapterPressure::Closed;
-        }
-        match self.slot.try_lock() {
-            Ok(slot) => {
-                if slot.is_some() {
-                    TerminalAdapterPressure::Full
-                } else if self.would_block.load(Ordering::SeqCst) {
-                    TerminalAdapterPressure::WouldBlock
-                } else {
-                    TerminalAdapterPressure::Ready
-                }
-            }
-            Err(TryLockError::WouldBlock) => TerminalAdapterPressure::Full,
-            Err(TryLockError::Poisoned(_)) => TerminalAdapterPressure::Closed,
-        }
+        self.slot.pressure()
     }
 
     fn try_write(&self, frame: &TerminalFrame) -> Result<(), TerminalAdapterWriteError> {
-        if self.is_closed() {
-            return Err(TerminalAdapterWriteError::Closed);
-        }
-        if self.would_block.load(Ordering::SeqCst) {
-            return Err(TerminalAdapterWriteError::WouldBlock);
-        }
-        let bytes = match frame.to_bytes() {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                self.close();
-                return Err(TerminalAdapterWriteError::Closed);
-            }
-        };
-        let mut slot = match self.slot.try_lock() {
-            Ok(slot) => slot,
-            Err(TryLockError::WouldBlock) => return Err(TerminalAdapterWriteError::Full),
-            Err(TryLockError::Poisoned(_)) => {
-                self.close();
-                return Err(TerminalAdapterWriteError::Closed);
-            }
-        };
-        if self.is_closed() {
-            *slot = None;
-            return Err(TerminalAdapterWriteError::Closed);
-        }
-        if slot.is_some() {
-            return Err(TerminalAdapterWriteError::Full);
-        }
-        *slot = Some(bytes);
-        drop(slot);
-        self.wake.wake();
-        Ok(())
+        self.slot.try_write(frame)
     }
 
     fn snapshot_active(&self) -> Option<Vec<u8>> {
-        if self.is_closed() {
-            match self.slot.try_lock() {
-                Ok(mut slot) => *slot = None,
-                Err(TryLockError::WouldBlock) => {}
-                Err(TryLockError::Poisoned(poisoned)) => {
-                    *poisoned.into_inner() = None;
-                }
-            }
-            return None;
-        }
-        match self.slot.try_lock() {
-            Ok(slot) => {
-                if self.is_closed() {
-                    return None;
-                }
-                slot.clone()
-            }
-            Err(_) => None,
-        }
+        self.slot.snapshot_active()
     }
 
     fn complete_active(&self) -> Option<Vec<u8>> {
-        if self.is_closed() {
-            return None;
-        }
-        let taken = match self.slot.try_lock() {
-            Ok(mut slot) => {
-                if self.is_closed() {
-                    *slot = None;
-                    None
-                } else {
-                    slot.take()
-                }
-            }
-            Err(_) => None,
-        };
-        self.wake.wake();
-        taken
+        self.slot.complete_active()
     }
 }
 
@@ -241,10 +108,9 @@ impl WebRtcTerminalAdapter {
         wake: AdapterWake,
         close_work: Arc<AtomicBool>,
     ) -> (Self, WebRtcTerminalAdapterHandle) {
-        let mut inner = WebRtcTerminalAdapterInner::new();
-        inner.wake = wake;
-        inner.close_work = close_work;
-        let inner = Arc::new(inner);
+        let inner = Arc::new(WebRtcTerminalAdapterInner {
+            slot: AdapterSlot::with_wake_and_close_work(wake, close_work),
+        });
         (
             Self {
                 inner: Arc::clone(&inner),

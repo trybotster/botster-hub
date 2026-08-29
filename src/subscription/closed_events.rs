@@ -22,13 +22,10 @@ use crate::daemon_maintenance::{
     PUMP_MAX_ROUTE_ENTRIES_VISITED, PumpAdmissionCursor,
 };
 use crate::daemon_transport::DaemonControlState;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ClosedEventSliceProgress {
-    pub classified: usize,
-    pub more: bool,
-    pub after_route: Option<(String, String, u64)>,
-}
+use crate::transport::shared::close_progress::CloseSliceAccumulator;
+pub(crate) use crate::transport::shared::close_progress::{
+    ClosedEventSliceProgress, empty_close_event_progress,
+};
 
 pub(crate) trait ClosedHandle {
     fn is_closed(&self) -> bool;
@@ -131,29 +128,21 @@ impl ClosedEventLedger {
             return empty_close_event_progress();
         }
         let mut queued = Vec::new();
-        let mut classified = 0;
-        let mut visited = 0;
-        let mut more = false;
-        let mut last_visited = after_route.cloned();
+        let mut accumulator =
+            CloseSliceAccumulator::new(max_candidates, after_route, max_entries_visited);
         let start = match after_route {
             Some(after) => Bound::Excluded(after.clone()),
             None => Bound::Unbounded,
         };
         for (key, route) in routes.range_mut((start, Bound::Unbounded)) {
-            if visited >= max_entries_visited {
-                more = true;
+            if !accumulator.begin_entry(!route.reported && route.handle.is_closed()) {
                 break;
             }
-            if !route.reported && route.handle.is_closed() && classified >= max_candidates {
-                more = true;
-                break;
-            }
-            visited += 1;
-            last_visited = Some(key.clone());
+            accumulator.visit(key);
             if route.reported || !route.handle.is_closed() {
                 continue;
             }
-            classified += 1;
+            accumulator.record_classified();
             if self.generation_is_suppressed(
                 &route.session_id,
                 &route.subscription_id,
@@ -188,19 +177,7 @@ impl ClosedEventLedger {
             }
             wake();
         }
-        ClosedEventSliceProgress {
-            classified,
-            more,
-            after_route: last_visited,
-        }
-    }
-}
-
-pub(crate) fn empty_close_event_progress() -> ClosedEventSliceProgress {
-    ClosedEventSliceProgress {
-        classified: 0,
-        more: false,
-        after_route: None,
+        accumulator.finish()
     }
 }
 
@@ -380,6 +357,10 @@ mod tests {
             .nth(1)
             .expect("close phase");
         let close = close.split("#[cfg(test)]").next().expect("close end");
+        assert!(
+            close.contains("queue_closed_subscription_events_bounded"),
+            "close-events region must still contain the bounded slice"
+        );
         assert!(!close.contains("take_journal_advanced_wake"));
         assert!(!close.contains("observe_session_lifecycle"));
         assert!(!close.contains("observe_lifecycle_slice"));
@@ -589,11 +570,22 @@ mod tests {
     #[test]
     fn shutdown_session_arm_installs_exact_suppression_before_core_request() {
         const TRANSPORT: &str = include_str!("../daemon_transport.rs");
+        let shutdown_needle = format!(
+            "{}{}{}",
+            "DaemonRequest::ShutdownSession ",
+            "{ session_id } => ",
+            char::from_u32(0x7b).expect("left brace"),
+        );
+        let drain_needle = format!(
+            "{}{}",
+            "DaemonRequest::Drain ",
+            char::from_u32(0x7b).expect("left brace"),
+        );
         let arm = TRANSPORT
-            .split("DaemonRequest::ShutdownSession { session_id } => {")
+            .split(&shutdown_needle)
             .nth(1)
             .expect("ShutdownSession arm")
-            .split("DaemonRequest::Drain {")
+            .split(&drain_needle)
             .next()
             .expect("ShutdownSession arm end");
         let unix_suppress = arm
