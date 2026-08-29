@@ -374,8 +374,9 @@ fn start_daemon(args: Vec<String>) -> Result<(), StartError> {
 
     // The lease is taken before the daemon binds anything and held for the
     // daemon's whole lifetime, so an installer can never switch generations
-    // underneath a live Hub. Kept here rather than in `daemon_transport.rs` so
-    // transport code stays free of installation-layout knowledge.
+    // underneath a live Hub. Kept here rather than in the daemon owner loop
+    // or control families so those modules stay free of installation-layout
+    // knowledge.
     let _installation_lease = acquire_installation_lease()?;
 
     let stopped = serve_daemon(config)?;
