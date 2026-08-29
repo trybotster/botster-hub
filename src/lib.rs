@@ -1076,6 +1076,10 @@ mod tests {
                 "src/transport/webrtc/adapter.rs",
                 include_str!("transport/webrtc/adapter.rs"),
             ),
+            (
+                "src/transport/webrtc/test_support.rs",
+                include_str!("transport/webrtc/test_support.rs"),
+            ),
             ("src/client_api_dto.rs", include_str!("client_api_dto.rs")),
             (
                 "src/client_api_dto/response.rs",

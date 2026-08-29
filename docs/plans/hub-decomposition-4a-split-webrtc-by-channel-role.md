@@ -2,6 +2,12 @@
 
 ## Revision History
 
+Implementation resync after `review_1788026828_608920` (`changes_required`):
+
+- Assumption 2 now names `src/transport/webrtc/test_support.rs` as the file body of `#[cfg(test)] pub(crate) mod test_support` declared from `src/transport/webrtc.rs`. That file is a test-only harness, not a seventh role file. It enters the same forbidden-construct inventory and ablation matrix as the other new WebRTC sources.
+- The project-capture reference is the vault inbox title `2026-08-27-botster-wake-driven-data-plane-and-hub-decomposition.md` at vault commit `8ef01f56`. It is not a local filesystem path.
+- Acceptance checks 12, 13, 15, and 16 count every new `src/transport/webrtc/**` file, including `test_support.rs`.
+
 Revision 3, Plan visit 3, answering `review_1787999655_409032`, verdict `blocked`, and the human decision in `question_1787999576_734551`.
 
 The human overruled revision 2's tracked-not-blocking call, and the reasoning is stronger than mine: the failing proof exercises **the same WebRTC delivery path this ticket moves**, so a base-versus-HEAD failure comparison plus isolated HEAD success cannot exclude a new load-only regression. Revision 2 argued from "the flake is pre-existing"; the correct frame is "the flake sits inside the blast radius of this move". The differential protocol is withdrawn as final acceptance evidence.
@@ -104,7 +110,7 @@ Not loaded, with reason:
 
 ## Context Loaded
 
-- Project capture: `/Users/jasonconigliari/knowledge/ops/archive/inbox/2026-08-27-botster-wake-driven-data-plane-and-hub-decomposition.md`, vault commit `8ef01f56`. This ticket is migration step 5 for the WebRTC half, plus step 6 for `local_webrtc.rs`.
+- Project capture: vault inbox `2026-08-27-botster-wake-driven-data-plane-and-hub-decomposition.md`, vault commit `8ef01f56`. This ticket is migration step 5 for the WebRTC half, plus step 6 for `local_webrtc.rs`.
 - Project checklist `checklist_1787894551_481961`, "Wake-driven data-plane architecture adherence".
 - Closed dependency `ticket_1787894419_699597` (Hub decomposition 3). Its landed commit is `667648a`, which created `src/transport/shared` and `src/transport/unix` and rebuilt the WebRTC adapter over the shared slot.
 - Prior art in the target repository: `docs/plans/hub-decomposition-1-*.md`, `docs/plans/hub-decomposition-2-*.md`, `docs/plans/hub-decomposition-3-*.md` and their reports under `docs/reports/`. `docs/plans/` is the repository-confirmed plan destination.
@@ -143,9 +149,9 @@ Not loaded, with reason:
    - `src/transport/webrtc/delivery.rs`
    - `src/transport/webrtc/adapter.rs`
 2. Move every production symbol out of `src/local_webrtc.rs` and `src/webrtc_terminal_adapter.rs` into those files by state machine and channel role, using the allocation in "Affected Surfaces And Files".
-3. Move every test out of the two source files into the role file that owns the symbol under test, and move the shared `cfg(test)` harness into `src/transport/webrtc.rs`.
+3. Move every test out of the two source files into the role file that owns the symbol under test, and move the shared `cfg(test)` harness into `src/transport/webrtc/test_support.rs`, declared from `src/transport/webrtc.rs` as `#[cfg(test)] pub(crate) mod test_support`.
 4. Delete `src/local_webrtc.rs` and `src/webrtc_terminal_adapter.rs`. Leave no forwarding facade and no re-export shim inside either path.
-5. Retarget all nine guard expressions listed under "Context Loaded" to the new owner files, and extend the `src/lib.rs` guard list with every new `src/transport/webrtc/**` file.
+5. Retarget all nine guard expressions listed under "Context Loaded" to the new owner files, and extend the `src/lib.rs` guard list with every new `src/transport/webrtc/**` file, including `test_support.rs`.
 6. Update the `src/lib.rs` `architecture_summary` rows and module lists: remove the `local_webrtc` crate-root row and its two list entries, and keep the existing `transport` row.
 7. Update `src/lib.rs` so the public re-export path `botster_hub::LocalWebrtcError` and `botster_hub::LocalWebrtcTransport` stays identical, now sourced from `crate::transport::webrtc`.
 8. Update import paths in `src/daemon_transport.rs`, `src/daemon.rs`, `src/daemon/error.rs`, `src/client_api_dto/response.rs`, `src/main.rs`, `src/local_runtime_process.rs`, `src/host_control_fair_write.rs`, `src/admission/grants.rs`, `src/local_webrtc_smoke.rs`, and the affected `tests/hub_daemon_lifecycle` files.
@@ -176,7 +182,7 @@ Not loaded, with reason:
 ## Assumptions And Unknowns
 
 1. **Assumption.** `src/transport/webrtc.rs` is required as the module root, in the same shape as the existing `src/transport/unix.rs`. It is not one of the six role files. It owns module declarations, crate-internal re-exports, the WebRTC error taxonomy (`LocalWebrtcError`, `LocalWebrtcResult`, and `impl From<crate::admission::grants::GrantAdmissionError> for LocalWebrtcError`), and the shared `cfg(test)` harness. The ticket names six role files and does not name an error owner. Placing the error taxonomy in one role file would make that role the de facto owner of the other five.
-2. **Assumption.** The shared `cfg(test)` harness (`PeerHarness`, `TestOfferPeer`, `TestOfferHandler`, `OwnedWorkerIdentity`, `session_worker_identities`, `worker_owned_process_tree`, `process_is_alive`, `live_pids_in_process_group`, `unique_test_data_dir`, `start_test_daemon_with_event_queue`, `wait_until`, `soft_wait_until`, and the two test locks) moves once into `src/transport/webrtc.rs` under `#[cfg(test)] mod test_support`, and the role files import it. Duplicating the harness would change proof counts, and putting it in `peer.rs` would make `peer.rs` the owner of every sibling's tests.
+2. **Assumption.** The shared `cfg(test)` harness (`PeerHarness`, `TestOfferPeer`, `TestOfferHandler`, `OwnedWorkerIdentity`, `session_worker_identities`, `worker_owned_process_tree`, `process_is_alive`, `live_pids_in_process_group`, `unique_test_data_dir`, `start_test_daemon_with_event_queue`, `wait_until`, `soft_wait_until`, `FakeDataChannel`, and the two test locks) is declared from `src/transport/webrtc.rs` as `#[cfg(test)] pub(crate) mod test_support`. The module body lives in `src/transport/webrtc/test_support.rs`, the same file layout Rust uses for a sibling module. That file is not a seventh role file and does not own a production state machine. Duplicating the harness would change proof counts, and putting it in `peer.rs` would make `peer.rs` the owner of every sibling's tests.
 3. **Assumption.** `subscription_channel.rs` owns the current second-channel path, which today is rejection, not acceptance. Hub reserves no label yet, so "subscription-channel acceptance mechanics" currently means the extra-channel reject path, its close marker, and its test observation seam. This file is live production code on `on_data_channel`, not scaffolding.
 4. **Assumption.** `claim_data_channel` stays a method on `LocalWebrtcPeerState` in `peer.rs`, and `on_data_channel` stays in `peer.rs`. Only the reject path and its label, marker, and observation mechanics move to `subscription_channel.rs`. Moving the one-shot claim would change the exact needle `let claimed = self.peer_state.claim_data_channel();` that `tests/hub_daemon_lifecycle/subscription_ownership_baseline.rs:92` asserts, which the ticket forbids.
 5. **Assumption.** A private helper used by exactly one role file moves to that file. A private helper used by two or more role files moves to the file that owns its state machine and becomes `pub(crate)` or `pub(super)` there. No helper is duplicated.
@@ -195,7 +201,7 @@ Not loaded, with reason:
 - `pub(crate) mod` declarations for the six role files.
 - `LocalWebrtcError`, `LocalWebrtcResult`, `impl fmt::Display for LocalWebrtcError`, `impl Error for LocalWebrtcError`, `impl From<GrantAdmissionError> for LocalWebrtcError`.
 - Crate-internal re-exports so `src/lib.rs` can keep `pub use`.
-- `#[cfg(test)] mod test_support` with the shared harness from assumption 2.
+- `#[cfg(test)] pub(crate) mod test_support`, with the shared harness body in `src/transport/webrtc/test_support.rs` (assumption 2).
 
 `src/transport/webrtc/peer.rs` -- peer lifecycle and ownership:
 
@@ -314,7 +320,7 @@ Ownership checks, which prove this is an extraction and not a file split:
 1. `src/local_webrtc.rs` and `src/webrtc_terminal_adapter.rs` do not exist. Prove with `git ls-files src | grep -E 'local_webrtc\.rs|webrtc_terminal_adapter\.rs'` returning no output.
 2. No forwarding facade exists. Prove that no file in `src/` re-exports a WebRTC symbol from a path outside `src/transport/webrtc/**`, and that `src/lib.rs` sources its `pub use` from `crate::transport::webrtc`.
 3. Each WebRTC state machine has exactly one owner file. Add a source guard that asserts, for each of `LocalWebrtcTransport`, `LocalWebrtcPeerState`, `LocalWebrtcFlowControl`, `WebRtcConnectionMux`, `WebRtcTerminalAdapter`, `PendingLocalWebrtcRequest`, and `LocalWebrtcAttachedSubscription`, that its `struct` or `enum` declaration appears in exactly one `src/transport/webrtc/**` file and in the file named by "Affected Surfaces And Files". Include one paired absence assertion per symbol against the other five role files, per [[code moves need paired absence and presence source guards]].
-4. Behavior-preservation needles are unchanged. Prove that the exact needle strings asserted at `tests/hub_daemon_lifecycle/subscription_ownership_baseline.rs:92` and `:429` are byte-identical to base; only the `hub_source` path argument changes. A needle edit fails this check.
+4. Behavior-preservation needles are unchanged. Prove that the exact needle strings asserted at `tests/hub_daemon_lifecycle/subscription_ownership_baseline.rs:92` and `:429` are byte-identical to base; only the `hub_source` path argument changes. Extra-channel close-marker strings that moved with `reject_extra_data_channel` are asserted from `subscription_channel.rs` in addition to the claim needle in `peer.rs`. A claim-needle edit fails this check.
 5. `src/transport/webrtc/**` contains no admission, route, grant, label, or product-policy symbol. Extend the forbidden-identifier guard pattern from `src/transport/shared.rs` to the WebRTC directory, with the same identifier list minus the WebRTC names it legitimately owns, and one red-on-revert arm.
 6. `src/lib.rs` `architecture_summary` no longer carries a `local_webrtc` crate-root row, and the crate-root module list test and the internal-visibility list test both pass without it. The `transport` row still classifies `Internal` and `AlreadyInternal`.
 
@@ -330,11 +336,11 @@ Behavior-preservation checks:
 Guard checks:
 
 11. Both guard families are enumerated before and after the move with `grep -rn "include_str!" src` and `grep -rn "hub_source(" tests`, and both enumerations are recorded in the implementation report. Each of the nine base expressions in the "Context Loaded" table is accounted for by row, with its post-move target path or an explicit statement that it is unchanged. A count alone does not satisfy this check.
-12. Every new `src/transport/webrtc/**` file, including `src/transport/webrtc.rs`, appears in the `src/lib.rs` forbidden-construct guard list.
-13. Each added guard-list entry has its own red-on-revert ablation, per [[fixed source guard lists need one ablation per added file]]. One representative arm is not accepted.
+12. Every new `src/transport/webrtc/**` file, including `src/transport/webrtc.rs` and `src/transport/webrtc/test_support.rs`, appears in the `src/lib.rs` forbidden-construct guard list.
+13. Each added guard-list entry has its own red-on-revert ablation, per [[fixed source guard lists need one ablation per added file]]. One representative arm is not accepted. The matrix includes `test_support.rs`.
 14. Every region-bounded guard is re-derived after the move and carries a positive anchor assertion, so an empty or subject-free region fails, per [[region bounded source guards need a required symbol anchor]]. This covers the `on_data_channel` region split in `subscription_ownership_baseline.rs` and the retargeted self-scan for the ultimate-close-failure oracles.
-15. The scanner final-state invariant at `src/lib.rs:1126` covers every new file: each guard-list file leaves `cfg(test)` skip mode closed at end of file. Base state is `skip_open_at_eof = false` for both split sources; the post-move measurement must also be `false` for all seven new files.
-16. Each new file that holds a moved `#[cfg(test)]` block has its own seeded-tail red arm: a forbidden production construct placed after that file's final `#[cfg(test)]` block makes the guard fail. One shared arm is not accepted.
+15. The scanner final-state invariant at `src/lib.rs:1126` covers every new file: each guard-list file leaves `cfg(test)` skip mode closed at end of file. Base state is `skip_open_at_eof = false` for both split sources; the post-move measurement must also be `false` for every listed WebRTC file, including `test_support.rs`.
+16. Each new production file that holds a moved `#[cfg(test)]` block has its own seeded-tail red arm: a forbidden production construct placed after that file's final `#[cfg(test)]` block makes the guard fail. One shared arm is not accepted. `signaling.rs` has no test block. `test_support.rs` is the harness file itself and has no trailing production region after a `#[cfg(test)]` item; check 13 covers that file.
 17. Every `cargo test --exact` filter used in any ablation arm uses the full module path and shows a one-test baseline before the ablation loop, per [[exact Rust test ablations require a one test baseline]] and vault gap 6 below.
 
 Commit shape:

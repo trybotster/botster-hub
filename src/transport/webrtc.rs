@@ -92,9 +92,6 @@ mod tests {
                 continue;
             }
             let name = path.file_name().expect("name").to_string_lossy();
-            if name == "test_support.rs" {
-                continue;
-            }
             let relative = format!("src/transport/webrtc/{name}");
             let source = fs::read_to_string(&path).expect("read webrtc source");
             files.push((relative, source));

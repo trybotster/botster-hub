@@ -564,6 +564,7 @@ fn no_lua_dispatch_in_terminal_input_or_output() {
         "src/transport/webrtc/subscription_channel.rs",
         "src/transport/webrtc/delivery.rs",
         "src/transport/webrtc/adapter.rs",
+        "src/transport/webrtc/test_support.rs",
         "src/transport.rs",
         "src/transport/shared.rs",
         "src/transport/shared/adapter_slot.rs",
