@@ -121,7 +121,9 @@ fn event_plane_saturation_source_guards_hold() {
     );
 
     for relative in [
-        "src/daemon_transport.rs",
+        "src/daemon/owner_loop.rs",
+        "src/daemon/control.rs",
+        "src/daemon/control/sessions.rs",
         "src/daemon_maintenance.rs",
         "src/subscription/entity.rs",
         "src/session_projection.rs",
@@ -129,8 +131,7 @@ fn event_plane_saturation_source_guards_hold() {
         let source = fs::read_to_string(root.join(relative)).expect("read source");
         let production = source.split("#[cfg(test)]").next().unwrap_or(&source);
         assert!(
-            !production.contains("package_event_router().try_ingress")
-                || relative == "src/daemon_transport.rs",
+            !production.contains("package_event_router().try_ingress"),
             "{relative} operation handlers must not wait on router ingress"
         );
     }

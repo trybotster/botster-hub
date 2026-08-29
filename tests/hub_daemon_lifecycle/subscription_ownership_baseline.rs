@@ -444,7 +444,7 @@ fn webrtc_ready_entity_frame_defers_terminal_output() {
 #[test]
 fn terminal_input_travels_as_a_json_control_request() {
     let _guard = daemon_test_guard();
-    let transport = hub_source("src/daemon/control.rs");
+    let transport = hub_source("src/daemon/control/sessions.rs");
     assert!(
         transport.contains("DaemonRequest::SendInput { session_id, data } =>"),
         "SendInput must stay a JSON control request"
