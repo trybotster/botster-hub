@@ -56,7 +56,6 @@ pub(crate) mod client_api_dto;
 pub mod config;
 pub mod credentials;
 pub mod daemon;
-mod daemon_event_subscriptions;
 mod daemon_maintenance;
 mod daemon_projection;
 pub mod daemon_transport;

@@ -163,12 +163,12 @@ where
 
 /// Ephemeral local WebRTC admission and peer registry.
 #[derive(Clone)]
-struct SharedEventPlane(Arc<crate::daemon_event_subscriptions::ClientEventPlane>);
+struct SharedEventPlane(Arc<crate::subscription::package_events::ClientEventPlane>);
 
 impl Default for SharedEventPlane {
     fn default() -> Self {
         Self(Arc::new(
-            crate::daemon_event_subscriptions::ClientEventPlane::default(),
+            crate::subscription::package_events::ClientEventPlane::default(),
         ))
     }
 }
@@ -213,7 +213,7 @@ pub(crate) struct PeerRemoveResult {
 
 impl LocalWebrtcTransport {
     #[must_use]
-    pub(crate) fn event_plane(&self) -> Arc<crate::daemon_event_subscriptions::ClientEventPlane> {
+    pub(crate) fn event_plane(&self) -> Arc<crate::subscription::package_events::ClientEventPlane> {
         self.event_plane.0.clone()
     }
 
@@ -690,7 +690,7 @@ impl LocalWebrtcAttachedSubscriptionChange {
 struct LocalWebrtcPeerState {
     grant_id: String,
     runtime_tx: ControlSender,
-    event_plane: Arc<crate::daemon_event_subscriptions::ClientEventPlane>,
+    event_plane: Arc<crate::subscription::package_events::ClientEventPlane>,
     attached_subscriptions: Mutex<Vec<LocalWebrtcAttachedSubscription>>,
     entity_subscription_ids: Mutex<BTreeSet<String>>,
     terminal_state: Mutex<LocalWebrtcTerminalState>,
@@ -871,14 +871,14 @@ impl LocalWebrtcPeerState {
         Self::new_with_event_plane(
             grant_id,
             runtime_tx,
-            Arc::new(crate::daemon_event_subscriptions::ClientEventPlane::default()),
+            Arc::new(crate::subscription::package_events::ClientEventPlane::default()),
         )
     }
 
     fn new_with_event_plane(
         grant_id: String,
         runtime_tx: ControlSender,
-        event_plane: Arc<crate::daemon_event_subscriptions::ClientEventPlane>,
+        event_plane: Arc<crate::subscription::package_events::ClientEventPlane>,
     ) -> Self {
         let (peer_terminal_tx, _peer_terminal_rx) = watch::channel(None);
         Self {
@@ -1881,7 +1881,7 @@ fn apply_data_channel_event(
 async fn answer_offer(
     request: LocalWebrtcSignalRequest,
     runtime_tx: ControlSender,
-    event_plane: Arc<crate::daemon_event_subscriptions::ClientEventPlane>,
+    event_plane: Arc<crate::subscription::package_events::ClientEventPlane>,
 ) -> LocalWebrtcResult<LocalWebrtcAnswer> {
     let runtime = default_runtime()
         .ok_or_else(|| LocalWebrtcError::Webrtc("no async runtime".to_string()))?;

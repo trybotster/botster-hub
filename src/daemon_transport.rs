@@ -594,7 +594,7 @@ async fn handle_connection_async(
     control_tx: ControlSender,
     cleanup_tx: SyncSender<ConnectionCleanup>,
     mut shutdown_rx: watch::Receiver<bool>,
-    event_plane: std::sync::Arc<crate::daemon_event_subscriptions::ClientEventPlane>,
+    event_plane: std::sync::Arc<crate::subscription::package_events::ClientEventPlane>,
 ) -> DaemonTransportResult<()> {
     let client_id = format!(
         "botster-hub-daemon-socket-{}",
@@ -928,7 +928,7 @@ async fn flush_pending_responses(
     mux: &UnixConnectionMux,
     write_state: &mut MuxWriteState,
     started: Instant,
-    event_mailbox: Option<&crate::daemon_event_subscriptions::ClientEventMailbox>,
+    event_mailbox: Option<&crate::subscription::package_events::ClientEventMailbox>,
 ) -> DaemonTransportResult<()> {
     loop {
         flush_unix_mux_writes(writer, mux, write_state, event_mailbox).await?;
@@ -962,7 +962,7 @@ async fn flush_unix_mux_writes(
     writer: &mut (impl tokio::io::AsyncWrite + Unpin),
     mux: &UnixConnectionMux,
     write_state: &mut MuxWriteState,
-    event_mailbox: Option<&crate::daemon_event_subscriptions::ClientEventMailbox>,
+    event_mailbox: Option<&crate::subscription::package_events::ClientEventMailbox>,
 ) -> DaemonTransportResult<()> {
     use crate::host_control_fair_write::{
         HostControlClass, MAX_HOST_FRAMES_PER_FLUSH_TURN, next_ready_host_control_class,
@@ -981,7 +981,7 @@ async fn flush_unix_mux_writes(
         let event_ready = !unix_event_flush_stalled()
             && (mux.has_pending_event()
                 || event_mailbox.is_some_and(
-                    crate::daemon_event_subscriptions::ClientEventMailbox::has_ready_event,
+                    crate::subscription::package_events::ClientEventMailbox::has_ready_event,
                 ));
         match next_ready_host_control_class(
             write_state.last_host_class,
@@ -1003,7 +1003,7 @@ async fn flush_unix_mux_writes(
             Some(HostControlClass::Event) => {
                 let event = mux.pop_pending_event().or_else(|| {
                     event_mailbox.and_then(
-                        crate::daemon_event_subscriptions::ClientEventMailbox::take_ready_event,
+                        crate::subscription::package_events::ClientEventMailbox::take_ready_event,
                     )
                 });
                 let Some(event) = event else {
@@ -1029,7 +1029,7 @@ async fn flush_unix_mux_writes(
         || (!unix_event_flush_stalled()
             && (mux.has_pending_event()
                 || event_mailbox.is_some_and(
-                    crate::daemon_event_subscriptions::ClientEventMailbox::has_ready_event,
+                    crate::subscription::package_events::ClientEventMailbox::has_ready_event,
                 )));
     if more_host {
         return Ok(());
@@ -1439,7 +1439,7 @@ mod mux_write_resume_tests {
     #[tokio::test]
     async fn partial_package_event_resumes_without_interleaving() {
         let mux = UnixConnectionMux::new();
-        let mailbox = crate::daemon_event_subscriptions::ClientEventMailbox::new(
+        let mailbox = crate::subscription::package_events::ClientEventMailbox::new(
             crate::config::PackageEventPlanePolicy::default(),
         );
         mailbox
@@ -1534,7 +1534,7 @@ mod mux_write_resume_tests {
     #[tokio::test]
     async fn one_flush_turn_writes_status_without_draining_the_event_flood() {
         let mux = UnixConnectionMux::new();
-        let mailbox = crate::daemon_event_subscriptions::ClientEventMailbox::new(
+        let mailbox = crate::subscription::package_events::ClientEventMailbox::new(
             crate::config::PackageEventPlanePolicy {
                 consumer_queue_max_events: 8,
                 ..crate::config::PackageEventPlanePolicy::default()
@@ -5517,7 +5517,7 @@ pub(crate) struct DaemonControlState {
     drain_cursors: BTreeMap<String, u64>,
     egress_diagnostics: DaemonEgressDiagnostics,
     pub(crate) entity_subscriptions: BTreeMap<String, EntitySubscriptionState>,
-    pub(crate) event_plane: std::sync::Arc<crate::daemon_event_subscriptions::ClientEventPlane>,
+    pub(crate) event_plane: std::sync::Arc<crate::subscription::package_events::ClientEventPlane>,
     pub(crate) pending_runtime: PendingRuntimeState,
     pub(crate) lifecycle_counters: DaemonLifecycleCounters,
     pub(crate) maintenance: MaintenanceState,
@@ -5539,7 +5539,7 @@ impl Default for DaemonControlState {
             egress_diagnostics: DaemonEgressDiagnostics::default(),
             entity_subscriptions: BTreeMap::new(),
             event_plane: std::sync::Arc::new(
-                crate::daemon_event_subscriptions::ClientEventPlane::default(),
+                crate::subscription::package_events::ClientEventPlane::default(),
             ),
             pending_runtime: PendingRuntimeState::default(),
             lifecycle_counters: DaemonLifecycleCounters::default(),
@@ -5784,7 +5784,7 @@ fn handle_client_event_request(
     connection_id: &str,
     request: DaemonRequest,
 ) -> DaemonResponse {
-    use crate::daemon_event_subscriptions::{
+    use crate::subscription::package_events::{
         ClientEventAdmitError, client_event_operator_error, subscribe_events_response,
         unsubscribe_events_response,
     };
@@ -6441,7 +6441,7 @@ fn handle_connection(stream: UnixStream, control_tx: ControlSender) -> DaemonTra
         control_tx,
         cleanup_tx,
         shutdown_rx,
-        std::sync::Arc::new(crate::daemon_event_subscriptions::ClientEventPlane::default()),
+        std::sync::Arc::new(crate::subscription::package_events::ClientEventPlane::default()),
     ));
     let _ = cleanup_rx.try_recv();
     result
