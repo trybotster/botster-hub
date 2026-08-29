@@ -10,11 +10,12 @@
 | Pipeline worktree | this run worktree |
 | Ticket | `ticket_1787894416_777916` |
 | Run | `run_1787977061_443918` |
-| Step | `botster_stack_implement` (`run_step_1787981023_284700`) |
+| Step | `botster_stack_implement` (`run_step_1787984753_947995`; prior visit `run_step_1787981023_284700`) |
 | Approved plan | `docs/plans/hub-decomposition-2-extract-admission-and-subscription-ownership.md` |
 | Merge policy | direct into `main`; do not create a PR |
 | Base | `origin/main` `fd540b6b21bdfe23f9280e13f650dff573fc5ae9` (0 behind at Implement start) |
-| Verified commit | `f7ebf6a74e709c3d8f10e603cd09c184746f4543` |
+| Verified product commit | `f777cd542eec7392140fc30606fb3d4463463cd4` |
+| Prior product commit | `f7ebf6a74e709c3d8f10e603cd09c184746f4543` |
 | Runtime-teardown class | applies; every lens is implemented as a survive-the-move invariant |
 
 Independent routing: `project_pipelines_current_context` ticket/run `target_id` and `list_spawn_targets` both map `tgt_7e208a0c76a44980a83b63af976b1f22` to `trybotster/botster-hub`. The approved plan used the same routing. Implementation stayed in this run worktree.
@@ -87,7 +88,7 @@ Independent routing: `project_pipelines_current_context` ticket/run `target_id` 
 | `src/admission/grants.rs` | grant issue, validation, origin, session-key derivation |
 | `src/admission/peer_generation.rs` | existing grant-id peer identity comparison |
 | `src/lib.rs` | `pub(crate) mod admission` / `subscription`; source-scan list |
-| `src/daemon_transport.rs` | loses admission, occupancy functions, close phase, budgets; keeps dispatch and owner loop |
+| `src/daemon_transport.rs` | loses admission, occupancy functions and fields, close phase, budgets; composes `pending_runtime` and `attach_close`; keeps dispatch and owner loop |
 | `src/local_webrtc.rs` | loses grant registry and secret derivation; keeps handshake, framing, peers |
 | `src/unix_terminal_adapter.rs` | mux delegates close bookkeeping |
 | `src/webrtc_terminal_adapter.rs` | mux delegates close bookkeeping; keeps `close_events_admitted` and `drop_pending_events` |
@@ -105,6 +106,7 @@ Review relocations with:
 ```
 git show --stat -M --summary 8e0dad8 e95babe e741b6d
 git show --color-moved=dimmed-zebra ddb9982 a99d35c e73299e fae9047
+git show --color-moved=dimmed-zebra f777cd5
 ```
 
 ## Ownership boundaries preserved
@@ -115,22 +117,41 @@ git show --color-moved=dimmed-zebra ddb9982 a99d35c e73299e fae9047
 - Transport modules no longer store grant secrets or origin policy. `answer_offer` takes a derived `AesGcmKey`.
 - `src/daemon_transport.rs` declares no `#[path]` submodule for attach routes or entity subscriptions.
 - `src/lib.rs` declares `pub(crate) mod admission` and `pub(crate) mod subscription` and no longer declares `mod daemon_event_subscriptions`.
+- `live_attach_routes` lives on `AttachStreamRegistry`. `released_attach_generations` lives on `closed_events::AttachCloseBookkeeping`. `DaemonControlState` composes `pending_runtime` (deref to the registry) and `attach_close`. Occupancy functions take those owners, not the full control state.
 
 ## Cross-repo routing
 
 None. No new ticket dependency. Downstream Web/TUI cost is zero because no DTO field, serde name, or protocol version changed. `generated_typescript_protocol_matches_checked_artifact` passed and `crates/botster-hub-client/generated/daemon-protocol.ts` is byte-identical.
 
+## Review findings addressed
+
+Review `review_1787984719_909687` returned this ticket to Implement with two open findings. Commit `f777cd5` applies the suggested fixes. It does not waive the plan.
+
+| Finding | Repair |
+| --- | --- |
+| `finding_1787984719_993379` (high): attach occupancy state still on `DaemonControlState` | `live_attach_routes` is a field of `AttachStreamRegistry`. `released_attach_generations` is a field of `AttachCloseBookkeeping` in `closed_events`. `DaemonControlState` holds `pending_runtime` and `attach_close`. `record_attached_subscription_change(registry, close, lifecycle, change, owner_grant_id)` and `overlay_live_attach_occupancy(status, daemon, hub_routes, pending)` take owner state. |
+| `finding_1787984719_792783` (medium): state-machine tests stayed under old owners | Occupancy unit tests moved to `subscription::attach_routes`. `admission_cursor_uses_exclusive_range_not_a_prefix_scan` moved to `admission::unix_hello`. Shared close-ledger invariants moved to `subscription::closed_events`. Unix and WebRTC copies of those ledger tests were deleted. `daemon_transport` keeps `handle_connection` tests. Adapter modules keep mux-delegation slice tests (`close_event_slice_bounds_*`) and content-blind source scans. |
+
+Review with:
+
+```
+git show --color-moved=dimmed-zebra f777cd5
+```
+
 ## Deviations from plan
 
-1. `released_attach_generations` and `live_attach_routes` remain fields on `DaemonControlState`. Occupancy *functions* moved to `attach_routes.rs` and mutate those fields. The close-event *ledger* (pending events, suppression keys, slice classification) moved to `closed_events.rs`. Splitting the occupancy counters into a second state object would have been a larger control-state reshape than the occupancy extraction required.
-2. Socket-driven route tests `client_eof_detaches_connection_subscriptions`, `attach_operator_error_does_not_detach_on_client_eof`, and `drain_does_not_inspect_legacy_attach_state_for_ownership` stay in `daemon_transport.rs` because they drive `handle_connection`. Occupancy unit tests stay in `daemon_transport` as callers of the moved functions. Test names are unchanged.
-3. Unknown 7: `peer_generation.rs` owns only `grant_ids_match`. `AttachStreamOwner` and `owner_matches` stay in `attach_routes`.
-4. Unknown 8: `origin_from_local_url` moved to `admission/grants.rs`. `issue_local_webrtc_bootstrap_response` dispatch stays in `daemon_transport`.
-5. `secret_stream_key` is `pub(crate)` on grants so live WebRTC tests that act as the browser can still derive the session key from the issued secret. Production `answer_offer` does not take the secret.
-6. The unified close-event queue helper carries `#[allow(clippy::too_many_arguments, clippy::explicit_counter_loop)]` so the extracted algorithm stays the original two-copy loop.
-7. `pump_phases_do_not_list_subscriptions_or_sessions` now splits at `DaemonControlState` because `overlay_live_attach_occupancy` left `daemon_transport.rs`.
+The occupancy-counter deviation from the first Implement visit is withdrawn. The approved plan required those fields to move with their owners. `f777cd5` does that.
 
-No wire, DTO, limit, or protocol change.
+Remaining documented deviations:
+
+1. Socket-driven route tests `client_eof_detaches_connection_subscriptions`, `attach_operator_error_does_not_detach_on_client_eof`, and `drain_does_not_inspect_legacy_attach_state_for_ownership` stay in `daemon_transport.rs` because they drive `handle_connection`. Adapter mux-delegation tests stay in the adapter modules. Test names are unchanged.
+2. Unknown 7: `peer_generation.rs` owns only `grant_ids_match`. `AttachStreamOwner` and `owner_matches` stay in `attach_routes`.
+3. Unknown 8: `origin_from_local_url` moved to `admission/grants.rs`. `issue_local_webrtc_bootstrap_response` dispatch stays in `daemon_transport`.
+4. `secret_stream_key` is `pub(crate)` on grants so live WebRTC tests that act as the browser can still derive the session key from the issued secret. Production `answer_offer` does not take the secret.
+5. The unified close-event queue helper carries `#[allow(clippy::too_many_arguments, clippy::explicit_counter_loop)]` so the extracted algorithm stays the original two-copy loop.
+6. `pump_phases_do_not_list_subscriptions_or_sessions` now splits at `DaemonControlState` because `overlay_live_attach_occupancy` left `daemon_transport.rs`.
+
+No wire, DTO, limit, or protocol change. The remaining deviations do not change occupancy ownership or the plan's test-home requirement, so the committed plan's acceptance checks still describe this branch.
 
 ## Runtime-teardown lenses
 
@@ -160,16 +181,19 @@ Inventory grep at base printed `12`. After the last import-repair pair it prints
 | Prebuild worker + `botster-hub` | exit 0 |
 | `./test.sh --locked` first run | `hub_daemon_lifecycle_test` 318 passed, 1 failed: `cli_daily_commands_share_canonical_default_data_directory` (`attach failed before adapter bind` during smoke) |
 | Same test isolated | `1 passed; 0 failed` in 3.54s |
-| `./test.sh --locked` second run | exit 0. Lib 498 passed. Lifecycle 319 passed, 2 ignored. No failures. |
+| `./test.sh --locked` second run (first Implement visit, product `f7ebf6a`) | exit 0. Lib 498 passed. Lifecycle 319 passed, 2 ignored. No failures. |
+| Review-return `cargo clippy --workspace --all-targets --locked -- -D warnings` at `f777cd5` | exit 0 |
+| Review-return lib unit tests at `f777cd5` | 495 passed (three duplicate adapter ledger tests removed) |
+| Review-return `./test.sh --locked` at `f777cd5` | exit 0 (`DONE:0`). Lifecycle 319 passed, 2 ignored. hub-client 81 passed. ui-contract 90 passed. No failures. |
 | `git status --porcelain` after the passing suite | empty |
 
-The first suite failure is attributed to parallel-load smoke attach, not to the extraction. Isolated green plus a second default-concurrency green suite is the recorded official result.
+The first suite failure is attributed to parallel-load smoke attach, not to the extraction. Isolated green plus a second default-concurrency green suite is the recorded official result for the first visit. The Review-return official result is one default-concurrency green `./test.sh --locked` on `f777cd5`.
 
 ## Unverified behavior or residual risk
 
-- `released_attach_generations` / `live_attach_routes` still sit on `DaemonControlState`. Later transport-split tickets should move those counters with the occupancy owner if they become a second writer.
-- First-run smoke attach flake can still appear under a busy host. Isolated and second-suite evidence is recorded.
+- First-run smoke attach flake can still appear under a busy host. Isolated and second-suite evidence is recorded for the first visit. The Review-return suite did not reproduce it.
 - Browser grant-secret derivation in production clients was not re-proven beyond Hub live WebRTC tests.
+- Adapter mux-delegation tests still exercise `queue_closed_subscription_events_bounded` through Unix and WebRTC mux types. The shared ledger invariants live in `closed_events`. Review should confirm that remaining adapter tests are transport-delegation, not a second ledger owner.
 
 ## Missing vault guidance discovered
 
