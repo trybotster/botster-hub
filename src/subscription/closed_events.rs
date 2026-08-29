@@ -399,6 +399,14 @@ mod tests {
             !close.contains("keys().find"),
             "CloseEvents must resume with BTreeMap::range"
         );
+        assert!(
+            !close.contains("list_terminal_subscriptions"),
+            "Pump must use the exact membership query"
+        );
+        assert!(
+            !close.contains("list_sessions"),
+            "Pump close classification must not list sessions"
+        );
         assert!(close.contains("next_admission_key"));
     }
 
