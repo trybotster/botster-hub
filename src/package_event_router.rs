@@ -12,11 +12,11 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::config::PackageEventPlanePolicy;
-use crate::daemon_event_subscriptions::ClientEventMailbox;
 use crate::event_plane_counters::{
     AgeIdentity, EventPlaneCounters, ProducerAgeList, ProducerAgeRef, QueueAgeMetric,
 };
 use crate::package_event_schema::{CompiledEventSchema, worktree_lifecycle_schema};
+use crate::subscription::package_events::ClientEventMailbox;
 use botster_hub_client::DaemonQueueKind;
 
 pub const HUB_EVENT_OWNER: &str = "hub";
@@ -2175,7 +2175,7 @@ fn lock_causal(mutex: &Mutex<CausalInner>) -> Option<std::sync::MutexGuard<'_, C
 mod tests {
     use super::*;
     use crate::config::PackageEventPlaneOptions;
-    use crate::daemon_event_subscriptions::ClientEventMailbox;
+    use crate::subscription::package_events::ClientEventMailbox;
     use std::thread;
     use std::time::Duration as StdDuration;
 
