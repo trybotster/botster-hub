@@ -8,7 +8,36 @@ use crate::HubDaemon;
 use crate::admission::unix_hello::{
     HostCompatibilityRecord, UnixTerminalAdmission, WebrtcTerminalAdmission,
 };
+use crate::daemon::control::message::ControlMessage;
 use crate::daemon::owner_loop::DaemonControlState;
+
+pub(crate) fn handle(
+    daemon: &mut HubDaemon,
+    state: &mut DaemonControlState,
+    message: ControlMessage,
+) -> bool {
+    match message {
+        ControlMessage::AcceptedConnection { .. } | ControlMessage::RejectedConnection => false,
+        ControlMessage::RegisterUnixAdmission {
+            client_id,
+            admission,
+            reply_tx,
+            host_required_features,
+        } => register_unix_admission(
+            state,
+            client_id,
+            admission,
+            reply_tx,
+            host_required_features,
+        ),
+        ControlMessage::RegisterWebrtcAdmission {
+            grant_id,
+            admission,
+            host_required_features,
+        } => register_webrtc_admission(daemon, state, grant_id, admission, host_required_features),
+        _ => unreachable!("connection family received a non-connection control message"),
+    }
+}
 
 pub(crate) fn register_unix_admission(
     state: &mut DaemonControlState,
