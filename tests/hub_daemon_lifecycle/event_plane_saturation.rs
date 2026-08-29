@@ -173,7 +173,7 @@ fn event_plane_saturation_source_guards_hold() {
     let unix =
         fs::read_to_string(root.join("src/transport/unix/adapter.rs")).expect("unix adapter");
     let webrtc =
-        fs::read_to_string(root.join("src/webrtc_terminal_adapter.rs")).expect("webrtc adapter");
+        fs::read_to_string(root.join("src/transport/webrtc/adapter.rs")).expect("webrtc adapter");
     let attach = fs::read_to_string(root.join("src/subscription/attach_routes.rs")).expect("attach");
     for (name, source) in [
         ("unix", unix.as_str()),
@@ -192,7 +192,7 @@ fn event_plane_saturation_source_guards_hold() {
         router.contains("held_lock_try_ingress_returns_shed_busy_without_blocking"),
         "ShedBusy remains a focused in-process lane"
     );
-    let webrtc_src = fs::read_to_string(root.join("src/local_webrtc.rs")).expect("webrtc");
+    let webrtc_src = fs::read_to_string(root.join("src/transport/webrtc/peer.rs")).expect("webrtc");
     assert!(
         webrtc_src.contains("timeout fail-closed must sacrifice sibling peers"),
         "fail-closed blast-radius oracle must stay in the production test body"

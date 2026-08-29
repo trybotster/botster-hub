@@ -15,7 +15,7 @@ use botster_terminal_protocol::{
 use crate::client_api_dto::response::daemon_response_base;
 use crate::subscription::attach_routes::negotiated_unix_capability_set;
 use crate::transport::unix::UnixConnectionMux;
-use crate::webrtc_terminal_adapter::WebRtcConnectionMux;
+use crate::transport::webrtc::WebRtcConnectionMux;
 
 #[derive(Clone, Debug)]
 pub(crate) enum UnixTerminalAdmission {

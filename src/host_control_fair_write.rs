@@ -160,7 +160,7 @@ mod tests {
             unix.contains("            false,\n            event_ready,"),
             "Unix call site must pass entity_ready=false"
         );
-        let webrtc = include_str!("local_webrtc.rs");
+        let webrtc = include_str!("transport/webrtc/control_channel.rs");
         assert!(
             webrtc.contains("            entity_ready,\n            host_event_ready(peer_state),"),
             "WebRTC call site must pass live entity_ready"

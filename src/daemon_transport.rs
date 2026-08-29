@@ -69,10 +69,6 @@ use crate::daemon_projection::{
     app_local_url, apps_from_registry, daemon_status_from_status, package_route_descriptors,
     package_state_label, runnable_entrypoint_kind_label, runnable_launch_mode_label,
 };
-use crate::local_webrtc::{
-    LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE, LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_MAX_BYTES,
-    LocalWebrtcAttachedSubscription, LocalWebrtcSenderTerminalRecord, LocalWebrtcSignalRequest,
-};
 use crate::maintenance::{
     HubUpdateCheckPlan, execute_managed_update_check, installation_identity, plan_hub_update_check,
     software_identity,
@@ -87,6 +83,10 @@ use crate::transport::unix::connection::{
 use crate::transport::unix::listener::{
     accept_connections, cleanup_socket_path, prepare_socket_path, rebind_missing_socket_path,
     socket_path,
+};
+use crate::transport::webrtc::{
+    LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE, LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_MAX_BYTES,
+    LocalWebrtcAttachedSubscription, LocalWebrtcSenderTerminalRecord, LocalWebrtcSignalRequest,
 };
 
 use crate::{EntrypointProcessSnapshot, EntrypointSupervisorError};

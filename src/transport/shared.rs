@@ -82,7 +82,7 @@ mod tests {
             "shared transport must not own a route registry"
         );
         let unix = include_str!("unix/adapter.rs");
-        let webrtc = include_str!("../webrtc_terminal_adapter.rs");
+        let webrtc = include_str!("webrtc/adapter.rs");
         assert!(
             unix.contains("pub(crate) struct UnixConnectionMux"),
             "Unix mux stays in the Unix adapter"

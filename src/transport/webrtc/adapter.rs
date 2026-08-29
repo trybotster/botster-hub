@@ -588,7 +588,7 @@ mod tests {
 
     #[test]
     fn production_adapter_source_does_not_name_snapshot_phases() {
-        let source = include_str!("webrtc_terminal_adapter.rs");
+        let source = include_str!("adapter.rs");
         let production = source.split("mod tests").next().expect("production source");
         for forbidden in [r#""READY""#, r#""PAGE""#, r#""FINISH""#, "GHOSTSNP"] {
             assert!(
