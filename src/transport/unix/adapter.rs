@@ -5,8 +5,9 @@
 //! `close` and `Drop` return without waiting on socket I/O or a writer lock.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, TryLockError};
 
 use botster_core::contract::terminal_adapter::{
     TerminalAdapter, TerminalAdapterPressure, TerminalAdapterWriteError,
@@ -18,6 +19,8 @@ use tokio::sync::Notify;
 use crate::subscription::closed_events::{
     ClosedEventLedger, ClosedEventRoute, ClosedEventSliceProgress, ClosedHandle,
 };
+use crate::transport::shared::adapter_slot::AdapterSlot;
+use crate::transport::shared::wake::NotifyWaiters;
 
 /// One-slot Unix adapter bound to an admitted control connection.
 pub struct UnixTerminalAdapter {
@@ -31,132 +34,47 @@ pub(crate) struct UnixTerminalAdapterHandle {
 }
 
 struct UnixTerminalAdapterInner {
-    closed: AtomicBool,
-    host_closed: AtomicBool,
-    would_block: AtomicBool,
+    slot: AdapterSlot<NotifyWaiters>,
     deferred: AtomicBool,
-    slot: Mutex<Option<Vec<u8>>>,
-    notify: Arc<Notify>,
-    close_work: Arc<AtomicBool>,
 }
 
 impl UnixTerminalAdapterInner {
     fn new() -> Self {
         Self {
-            closed: AtomicBool::new(false),
-            host_closed: AtomicBool::new(false),
-            would_block: AtomicBool::new(false),
+            slot: AdapterSlot::with_wake_and_close_work(
+                NotifyWaiters::new(),
+                Arc::new(AtomicBool::new(false)),
+            ),
             deferred: AtomicBool::new(false),
-            slot: Mutex::new(None),
-            notify: Arc::new(Notify::new()),
-            close_work: Arc::new(AtomicBool::new(false)),
         }
     }
 
     fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::SeqCst)
+        self.slot.is_closed()
     }
 
     fn close_from_host(&self) {
-        if !self.is_closed() {
-            self.host_closed.store(true, Ordering::SeqCst);
-        }
-        self.close();
+        self.slot.close_from_host();
     }
 
     fn host_closed(&self) -> bool {
-        self.host_closed.load(Ordering::SeqCst)
+        self.slot.host_closed()
     }
 
     fn close(&self) {
-        self.closed.store(true, Ordering::SeqCst);
-        self.close_work.store(true, Ordering::SeqCst);
-        match self.slot.try_lock() {
-            Ok(mut slot) => {
-                *slot = None;
-            }
-            Err(TryLockError::WouldBlock) => {}
-            Err(TryLockError::Poisoned(poisoned)) => {
-                *poisoned.into_inner() = None;
-            }
-        }
-        self.notify.notify_waiters();
+        self.slot.close();
     }
 
     fn pressure(&self) -> TerminalAdapterPressure {
-        if self.is_closed() {
-            return TerminalAdapterPressure::Closed;
-        }
-        match self.slot.try_lock() {
-            Ok(slot) => {
-                if slot.is_some() {
-                    TerminalAdapterPressure::Full
-                } else if self.would_block.load(Ordering::SeqCst) {
-                    TerminalAdapterPressure::WouldBlock
-                } else {
-                    TerminalAdapterPressure::Ready
-                }
-            }
-            Err(TryLockError::WouldBlock) => TerminalAdapterPressure::Full,
-            Err(TryLockError::Poisoned(_)) => TerminalAdapterPressure::Closed,
-        }
+        self.slot.pressure()
     }
 
     fn try_write(&self, frame: &TerminalFrame) -> Result<(), TerminalAdapterWriteError> {
-        if self.is_closed() {
-            return Err(TerminalAdapterWriteError::Closed);
-        }
-        if self.would_block.load(Ordering::SeqCst) {
-            return Err(TerminalAdapterWriteError::WouldBlock);
-        }
-        let bytes = match frame.to_bytes() {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                self.close();
-                return Err(TerminalAdapterWriteError::Closed);
-            }
-        };
-        let mut slot = match self.slot.try_lock() {
-            Ok(slot) => slot,
-            Err(TryLockError::WouldBlock) => return Err(TerminalAdapterWriteError::Full),
-            Err(TryLockError::Poisoned(_)) => {
-                self.close();
-                return Err(TerminalAdapterWriteError::Closed);
-            }
-        };
-        if self.is_closed() {
-            *slot = None;
-            return Err(TerminalAdapterWriteError::Closed);
-        }
-        if slot.is_some() {
-            return Err(TerminalAdapterWriteError::Full);
-        }
-        *slot = Some(bytes);
-        drop(slot);
-        self.notify.notify_waiters();
-        Ok(())
+        self.slot.try_write(frame)
     }
 
     fn snapshot_active(&self) -> Option<Vec<u8>> {
-        if self.is_closed() {
-            match self.slot.try_lock() {
-                Ok(mut slot) => *slot = None,
-                Err(TryLockError::WouldBlock) => {}
-                Err(TryLockError::Poisoned(poisoned)) => {
-                    *poisoned.into_inner() = None;
-                }
-            }
-            return None;
-        }
-        match self.slot.try_lock() {
-            Ok(slot) => {
-                if self.is_closed() {
-                    return None;
-                }
-                slot.clone()
-            }
-            Err(_) => None,
-        }
+        self.slot.snapshot_active()
     }
 
     fn defer_flush(&self) {
@@ -172,22 +90,7 @@ impl UnixTerminalAdapterInner {
     }
 
     fn complete_active(&self) -> Option<Vec<u8>> {
-        if self.is_closed() {
-            return None;
-        }
-        let taken = match self.slot.try_lock() {
-            Ok(mut slot) => {
-                if self.is_closed() {
-                    *slot = None;
-                    None
-                } else {
-                    slot.take()
-                }
-            }
-            Err(_) => None,
-        };
-        self.notify.notify_waiters();
-        taken
+        self.slot.complete_active()
     }
 }
 
@@ -216,10 +119,13 @@ impl UnixTerminalAdapter {
         notify: Arc<Notify>,
         close_work: Arc<AtomicBool>,
     ) -> (Self, UnixTerminalAdapterHandle) {
-        let mut inner = UnixTerminalAdapterInner::new();
-        inner.notify = notify;
-        inner.close_work = close_work;
-        let inner = Arc::new(inner);
+        let inner = Arc::new(UnixTerminalAdapterInner {
+            slot: AdapterSlot::with_wake_and_close_work(
+                NotifyWaiters::from_arc(notify),
+                close_work,
+            ),
+            deferred: AtomicBool::new(false),
+        });
         (
             Self {
                 inner: Arc::clone(&inner),
@@ -230,12 +136,12 @@ impl UnixTerminalAdapter {
 
     #[cfg(test)]
     fn force_would_block(&self) {
-        self.inner.would_block.store(true, Ordering::SeqCst);
+        self.inner.slot.set_would_block(true);
     }
 
     #[cfg(test)]
     fn clear_would_block(&self) {
-        self.inner.would_block.store(false, Ordering::SeqCst);
+        self.inner.slot.set_would_block(false);
     }
 }
 
@@ -697,7 +603,7 @@ mod tests {
 
     #[test]
     fn production_adapter_source_does_not_name_snapshot_phases() {
-        let source = include_str!("unix_terminal_adapter.rs");
+        let source = include_str!("adapter.rs");
         let production = source.split("mod tests").next().expect("production source");
         for forbidden in [r#""READY""#, r#""PAGE""#, r#""FINISH""#, "GHOSTSNP"] {
             assert!(

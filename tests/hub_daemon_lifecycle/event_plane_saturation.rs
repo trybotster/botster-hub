@@ -170,7 +170,8 @@ fn event_plane_saturation_source_guards_hold() {
         "noisy producer must be one process, not one Python process per line"
     );
 
-    let unix = fs::read_to_string(root.join("src/unix_terminal_adapter.rs")).expect("unix adapter");
+    let unix =
+        fs::read_to_string(root.join("src/transport/unix/adapter.rs")).expect("unix adapter");
     let webrtc =
         fs::read_to_string(root.join("src/webrtc_terminal_adapter.rs")).expect("webrtc adapter");
     let attach = fs::read_to_string(root.join("src/subscription/attach_routes.rs")).expect("attach");

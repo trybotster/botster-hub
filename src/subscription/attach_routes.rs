@@ -25,9 +25,7 @@ use crate::HubDaemon;
 use crate::HubRuntime;
 use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
 use crate::daemon_transport::PendingRuntimeState;
-use crate::unix_terminal_adapter::{
-    UnixConnectionMux, UnixTerminalAdapter, UnixTerminalAdapterHandle,
-};
+use crate::transport::unix::{UnixConnectionMux, UnixTerminalAdapter, UnixTerminalAdapterHandle};
 use crate::webrtc_terminal_adapter::{
     WebRtcConnectionMux, WebRtcTerminalAdapter, WebRtcTerminalAdapterHandle,
 };

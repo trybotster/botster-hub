@@ -553,7 +553,17 @@ fn no_lua_dispatch_in_terminal_input_or_output() {
     for entry in [
         "src/local_webrtc.rs",
         "src/webrtc_terminal_adapter.rs",
-        "src/unix_terminal_adapter.rs",
+        "src/transport.rs",
+        "src/transport/shared.rs",
+        "src/transport/shared/adapter_slot.rs",
+        "src/transport/shared/wake.rs",
+        "src/transport/shared/close_reason.rs",
+        "src/transport/shared/close_progress.rs",
+        "src/transport/unix.rs",
+        "src/transport/unix/adapter.rs",
+        "src/transport/unix/listener.rs",
+        "src/transport/unix/connection.rs",
+        "src/transport/unix/mux_write.rs",
         "src/daemon_transport.rs",
         "src/client_api.rs",
     ] {
