@@ -64,7 +64,6 @@ pub mod entrypoint_supervisor;
 pub(crate) mod event_plane_counters;
 mod host_control_fair_write;
 pub mod lifecycle;
-pub(crate) mod local_webrtc;
 pub mod lua_runtime;
 pub mod maintenance;
 pub mod managed_git_worktrees;
@@ -83,7 +82,6 @@ pub mod source_update;
 pub mod spawn_targets;
 pub(crate) mod subscription;
 pub(crate) mod transport;
-mod webrtc_terminal_adapter;
 pub mod worktrees;
 
 use botster_core::CapabilitySurface;
@@ -99,6 +97,7 @@ pub use botster_core::{
 pub const LOCAL_RUNTIME_DAEMON_READINESS_BUDGET: std::time::Duration =
     std::time::Duration::from_secs(30);
 
+pub use crate::transport::webrtc::{LocalWebrtcError, LocalWebrtcTransport};
 pub use capabilities::HubCapabilityRuntime;
 pub use client_api::{
     HubClientAdmission, HubClientApi, HubClientCapability, HubClientCaptureSnapshot,
@@ -164,7 +163,6 @@ pub use lifecycle::{
     HubLifecycleError, HubLifecycleResult, HubPluginLifecycle, HubPluginLifecycleStatus,
     HubPluginRuntimeBundle,
 };
-pub use local_webrtc::{LocalWebrtcError, LocalWebrtcTransport};
 pub use lua_runtime::{
     LuaPluginHostApi, LuaPluginRuntime, LuaPluginRuntimeError, SharedHubCapabilityRuntime,
 };
@@ -544,12 +542,6 @@ const HUB_CRATE_EXPORTS: &[HubCrateExport] = &[
         "plugin lifecycle policy",
     ),
     HubCrateExport::new(
-        "local_webrtc",
-        HubCrateExportClass::Internal,
-        HubCrateExportStability::AlreadyInternal,
-        "crate-private adapter; LocalWebrtcError and LocalWebrtcTransport stay public at crate root",
-    ),
-    HubCrateExport::new(
         "lua_runtime",
         HubCrateExportClass::HubPolicy,
         HubCrateExportStability::KeepPublic,
@@ -619,7 +611,7 @@ const HUB_CRATE_EXPORTS: &[HubCrateExport] = &[
         "transport",
         HubCrateExportClass::Internal,
         HubCrateExportStability::AlreadyInternal,
-        "shared adapter slot and Unix transport; already crate-private",
+        "shared adapter slot, Unix transport, and WebRTC transport; already crate-private",
     ),
     HubCrateExport::new(
         "spawn_targets",
@@ -767,7 +759,6 @@ mod tests {
             "daemon_transport",
             "entrypoint_supervisor",
             "lifecycle",
-            "local_webrtc",
             "lua_runtime",
             "maintenance",
             "managed_git_worktrees",
@@ -817,7 +808,7 @@ mod tests {
     #[test]
     fn architecture_summary_defers_visibility_changes_for_internal_modules() {
         let summary = architecture_summary();
-        for name in ["daemon_projection", "local_webrtc", "transport"] {
+        for name in ["daemon_projection", "transport"] {
             let export = summary
                 .crate_exports()
                 .iter()
@@ -1057,7 +1048,34 @@ mod tests {
                 include_str!("admission/budgets.rs"),
             ),
             ("src/main.rs", include_str!("main.rs")),
-            ("src/local_webrtc.rs", include_str!("local_webrtc.rs")),
+            (
+                "src/transport/webrtc.rs",
+                include_str!("transport/webrtc.rs"),
+            ),
+            (
+                "src/transport/webrtc/peer.rs",
+                include_str!("transport/webrtc/peer.rs"),
+            ),
+            (
+                "src/transport/webrtc/signaling.rs",
+                include_str!("transport/webrtc/signaling.rs"),
+            ),
+            (
+                "src/transport/webrtc/control_channel.rs",
+                include_str!("transport/webrtc/control_channel.rs"),
+            ),
+            (
+                "src/transport/webrtc/subscription_channel.rs",
+                include_str!("transport/webrtc/subscription_channel.rs"),
+            ),
+            (
+                "src/transport/webrtc/delivery.rs",
+                include_str!("transport/webrtc/delivery.rs"),
+            ),
+            (
+                "src/transport/webrtc/adapter.rs",
+                include_str!("transport/webrtc/adapter.rs"),
+            ),
             ("src/client_api_dto.rs", include_str!("client_api_dto.rs")),
             (
                 "src/client_api_dto/response.rs",

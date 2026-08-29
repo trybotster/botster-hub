@@ -16,12 +16,12 @@ use botster_core::SessionId;
 use crate::HubLuaPluginLoadError;
 use crate::config::HubConfig;
 use crate::entrypoint_supervisor::EntrypointSupervisor;
-use crate::local_webrtc::LocalWebrtcTransport;
 use crate::packages::{
     PackageClassification, PackageRegistry, PackageRegistrySnapshotError, PackageState,
 };
 use crate::persistence::{FileHubStateStore, HubState, HubStateStore, HubStateStoreError};
 use crate::runtime::{HubRuntime, HubRuntimeError};
+use crate::transport::webrtc::LocalWebrtcTransport;
 
 /// Local daemon lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

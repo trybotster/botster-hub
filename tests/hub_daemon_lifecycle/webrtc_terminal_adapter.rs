@@ -768,7 +768,7 @@ fn webrtc_terminal_adapter_feature_does_not_raise_default_requirement() {
 #[test]
 fn webrtc_terminal_adapter_source_does_not_name_snapshot_phases() {
     let sources = [
-        include_str!("../../src/webrtc_terminal_adapter.rs"),
+        include_str!("../../src/transport/webrtc/adapter.rs"),
         include_str!("webrtc_terminal_adapter.rs"),
     ];
     for source in sources {

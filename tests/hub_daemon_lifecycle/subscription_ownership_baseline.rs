@@ -89,7 +89,7 @@ fn wait_for_path(path: &Path, bound: Duration) -> bool {
 }
 
 fn assert_production_second_channel_reject_source() {
-    let on_data_channel = hub_source("src/local_webrtc.rs");
+    let on_data_channel = hub_source("src/transport/webrtc/peer.rs");
     assert!(
         !on_data_channel.contains("test_extra_label"),
         "extra-channel reject must not use a test-only label override"
@@ -426,7 +426,7 @@ fn webrtc_shared_channel_carries_control_entity_event_and_terminal_frames() {
 
 #[test]
 fn webrtc_ready_entity_frame_defers_terminal_output() {
-    let source = hub_source("src/local_webrtc.rs");
+    let source = hub_source("src/transport/webrtc/control_channel.rs");
     assert!(
         source.contains(
             "        if pending_entity.is_none()\n            && !host_event_ready(peer_state)\n            && let Err(failure) = flush_webrtc_adapter_frames("
@@ -551,8 +551,13 @@ fn no_lua_dispatch_in_terminal_input_or_output() {
         lua_importers.push(entry);
     }
     for entry in [
-        "src/local_webrtc.rs",
-        "src/webrtc_terminal_adapter.rs",
+        "src/transport/webrtc.rs",
+        "src/transport/webrtc/peer.rs",
+        "src/transport/webrtc/signaling.rs",
+        "src/transport/webrtc/control_channel.rs",
+        "src/transport/webrtc/subscription_channel.rs",
+        "src/transport/webrtc/delivery.rs",
+        "src/transport/webrtc/adapter.rs",
         "src/transport.rs",
         "src/transport/shared.rs",
         "src/transport/shared/adapter_slot.rs",
