@@ -22,12 +22,11 @@ use botster_hub_client::{
 use serde_json::Value;
 
 use crate::HubDaemon;
+use crate::admission::budgets::DAEMON_MAX_FRAME_BYTES;
 use crate::client_api_dto::response::daemon_response_base;
 use crate::client_api_dto::session::daemon_session_type_from_client;
 use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
-use crate::daemon_transport::{
-    DAEMON_MAX_FRAME_BYTES, DaemonControlState, session_type_entity_snapshot,
-};
+use crate::daemon_transport::{DaemonControlState, session_type_entity_snapshot};
 
 const SESSION_DELIVERY_MAX_ITEMS: usize = 16;
 const SESSION_DELIVERY_MAX_BYTES: usize = 64 * 1024;

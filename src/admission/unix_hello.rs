@@ -1,0 +1,128 @@
+//! Unix and WebRTC Hello admission registries and decisions.
+
+use std::collections::BTreeMap;
+use std::ops::Bound;
+
+use botster_core::TerminalCapabilitySet;
+use botster_hub_client::{
+    DaemonCompatibility, DaemonDiagnostic, DaemonHello, DaemonHelloAck, DaemonOperatorError,
+    DaemonResponse, DaemonResponseKind, PROTOCOL,
+};
+use botster_terminal_protocol::{
+    TerminalCompatibility, ensure_compatible as ensure_terminal_compatible,
+};
+
+use crate::client_api_dto::response::daemon_response_base;
+use crate::subscription::attach_routes::negotiated_unix_capability_set;
+use crate::unix_terminal_adapter::UnixConnectionMux;
+use crate::webrtc_terminal_adapter::WebRtcConnectionMux;
+
+#[derive(Clone, Debug)]
+pub(crate) enum UnixTerminalAdmission {
+    Admitted {
+        #[allow(dead_code)]
+        required_features: Vec<String>,
+        capabilities: TerminalCapabilitySet,
+        mux: UnixConnectionMux,
+    },
+    Rejected {
+        code: &'static str,
+        diagnostic: DaemonDiagnostic,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum WebrtcTerminalAdmission {
+    Admitted {
+        required_features: Vec<String>,
+        mux: WebRtcConnectionMux,
+        terminal_requirement: Option<botster_terminal_protocol::TerminalCompatibilityRequirement>,
+    },
+    Rejected {
+        code: &'static str,
+        diagnostic: DaemonDiagnostic,
+    },
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct HostCompatibilityRecord {
+    pub required_features: Vec<String>,
+}
+
+#[derive(Default)]
+pub(crate) struct AdmissionState {
+    pub unix_admissions: BTreeMap<String, UnixTerminalAdmission>,
+    pub webrtc_admissions: BTreeMap<String, WebrtcTerminalAdmission>,
+    pub host_compatibility: BTreeMap<String, HostCompatibilityRecord>,
+}
+
+pub(crate) fn daemon_hello_ack(diagnostics: Vec<DaemonDiagnostic>) -> DaemonHelloAck {
+    DaemonHelloAck {
+        protocol: PROTOCOL.to_string(),
+        compatibility: DaemonCompatibility::current(),
+        terminal_compatibility: Some(TerminalCompatibility::current()),
+        diagnostics,
+    }
+}
+
+pub(crate) fn unix_hello_admission(hello: &DaemonHello) -> (UnixTerminalAdmission, DaemonHelloAck) {
+    let mut diagnostics = vec![DaemonDiagnostic::connected("hello")];
+    if let Some(requirement) = hello.terminal_compatibility.as_ref()
+        && let Err(error) =
+            ensure_terminal_compatible(requirement, &TerminalCompatibility::current())
+    {
+        let diagnostic = DaemonDiagnostic::compatibility_mismatch(error.diagnostic);
+        diagnostics.push(diagnostic.clone());
+        return (
+            UnixTerminalAdmission::Rejected {
+                code: "terminal_compatibility",
+                diagnostic,
+            },
+            daemon_hello_ack(diagnostics),
+        );
+    }
+    let capabilities = negotiated_unix_capability_set(
+        &hello.compatibility.required_features,
+        hello.terminal_compatibility.as_ref(),
+    )
+    .unwrap_or_else(|_| TerminalCapabilitySet::empty());
+    (
+        UnixTerminalAdmission::Admitted {
+            required_features: hello.compatibility.required_features.clone(),
+            capabilities,
+            mux: UnixConnectionMux::new(),
+        },
+        daemon_hello_ack(diagnostics),
+    )
+}
+
+pub(crate) fn terminal_compatibility_attach_error(
+    code: &'static str,
+    diagnostic: DaemonDiagnostic,
+) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
+    response.error = Some(DaemonOperatorError {
+        code: code.to_string(),
+        request_id: "daemon-attach-terminal-compatibility".to_string(),
+        operation: "attach".to_string(),
+        message: diagnostic
+            .message
+            .clone()
+            .unwrap_or_else(|| "terminal compatibility mismatch".to_string()),
+        diagnostics: vec![diagnostic],
+    });
+    response
+}
+
+pub(crate) fn next_admission_key<T>(
+    map: &BTreeMap<String, T>,
+    after: Option<&str>,
+) -> Option<String> {
+    match after {
+        None => map.keys().next().cloned(),
+        Some(seen) => map
+            .range::<str, _>((Bound::Excluded(seen), Bound::Unbounded))
+            .next()
+            .map(|(key, _)| key.clone()),
+    }
+}
