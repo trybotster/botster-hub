@@ -211,7 +211,7 @@ Restore after the last arm: `running 1 test`, `1 passed`, exit 0.
 
 ### PII scan
 
-`rg` over the 4a plan and this report for `/Users/`, `/home/jason`, `botster-sessions`, and a personal email returned no matches. The vault inbox capture is named by title, not by a local filesystem path.
+A scan of the 4a plan and this report for local home-directory prefixes, session worktree names, and a personal email returned no live path leaks. The vault inbox capture is named by title, not by a local filesystem path. The scan patterns themselves are not committed as literal path strings.
 
 ### Downstream proof (check 24)
 
