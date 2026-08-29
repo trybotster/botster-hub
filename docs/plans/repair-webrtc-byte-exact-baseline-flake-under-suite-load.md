@@ -109,6 +109,16 @@ Unknowns for Implement to resolve with measurement, not assertion:
 2. Whether observed exit can precede the last terminal frame on the WebRTC route. Implement must size the counted quiet-turn drain after exit from observed behavior, not from a guess.
 3. Whether `AUTHORITATIVE_SESSION_EXIT_WAIT` (10 s) inside `wait_for_producer_ready` is itself load-fragile at this call site. If Implement observes that budget expiring under suite load, it must report the observation instead of silently raising a shared constant.
 
+## Implement binding
+
+Isolated one-test measurement (`./test.sh --locked --test hub_daemon_lifecycle_test webrtc_terminal_output_is_byte_exact -- --exact --nocapture`):
+
+1. After Unix `wait_for_producer_ready`, WebRTC `concatenated` held 20 bytes (`producer-ready` plus the product write). `session_exited` was still false. Delivery elapsed 14.6 ms. The byte assertion does not require `concatenated` to start at the expected window.
+2. Isolation never needed quiet drain turns. Expected bytes arrived before lifecycle `exited`. Keep eight quiet turns after exit as the load-tolerant drain, not as the success path.
+3. `AUTHORITATIVE_SESSION_EXIT_WAIT` did not expire at this call site in isolation or under the official locked suite.
+
+Binding: after the Unix producer-ready wait, drain until WebRTC shows `PRODUCER_READY_MARKER`, then clear `concatenated` before the release-file write. That keeps the starvation marker exclusive to an empty post-release window. The file-local outer backstop is 30 s and is not a product gate. No shared harness constant was raised.
+
 ## Affected surfaces and files
 
 - `tests/hub_daemon_lifecycle/subscription_ownership_baseline.rs` — the body of `webrtc_terminal_output_is_byte_exact` (lines 826 to 909), plus the imports that the new helper calls require.

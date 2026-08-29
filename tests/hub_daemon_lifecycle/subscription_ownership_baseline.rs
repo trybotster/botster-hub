@@ -823,6 +823,92 @@ fn shutdown_suppresses_exact_route_generations_before_core_teardown() {
     hub.shutdown().expect("shutdown isolated hub");
 }
 
+const WEBRTC_BYTE_EXACT_BACKSTOP: Duration = Duration::from_secs(30);
+const WEBRTC_BYTE_EXACT_QUIET_DRAIN_TURNS: usize = 8;
+
+fn webrtc_session_has_exited(
+    endpoint: &botster_hub_client::DaemonEndpoint,
+    session_id: &str,
+) -> bool {
+    let _ = botster_hub_client::request(
+        endpoint,
+        botster_hub_client::DaemonRequest::ReadScreen {
+            session_id: session_id.to_string(),
+        },
+    );
+    match botster_hub_client::request(endpoint, botster_hub_client::DaemonRequest::ListSessions) {
+        Ok(response) => response
+            .sessions
+            .iter()
+            .any(|session| session.session_id == session_id && session.lifecycle == "exited"),
+        Err(_) => false,
+    }
+}
+
+fn extend_concatenated_from_pending_webrtc_frames(
+    peer: &mut LocalWebrtcOfferPeer,
+    concatenated: &mut Vec<u8>,
+) {
+    while let Some((_, bytes)) = peer.pending_terminal_frames.pop_front() {
+        if let Ok(event) = serde_json::from_slice::<botster_hub_client::DaemonEvent>(&bytes) {
+            if let botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } = event {
+                let decoded = live_output_decoded_bytes(payload);
+                assert!(
+                    !payload_has_utf8_replacement(&decoded),
+                    "live payload must not contain U+FFFD: {decoded:?}"
+                );
+                concatenated.extend(decoded);
+            }
+        } else {
+            assert!(
+                !payload_has_utf8_replacement(&bytes),
+                "live payload must not contain U+FFFD: {bytes:?}"
+            );
+            concatenated.extend(bytes);
+        }
+    }
+}
+
+async fn drain_webrtc_live_bytes(
+    peer: &mut LocalWebrtcOfferPeer,
+    key: &botster_core::AesGcmKey,
+    session_id: &str,
+    subscription_id: &str,
+    concatenated: &mut Vec<u8>,
+) {
+    let _ = peer
+        .encrypted_request(
+            key,
+            &botster_hub_client::DaemonRequest::drain_subscription(session_id, subscription_id),
+        )
+        .await;
+    extend_concatenated_from_pending_webrtc_frames(peer, concatenated);
+}
+
+async fn await_next_webrtc_terminal_frame(
+    peer: &mut LocalWebrtcOfferPeer,
+    key: &botster_core::AesGcmKey,
+) {
+    if let Ok(Ok(bytes)) = timeout(Duration::from_millis(200), peer.next_terminal_frame(key)).await {
+        peer.pending_terminal_frames
+            .push_back((String::new(), bytes));
+    }
+}
+
+fn panic_webrtc_byte_exact_starvation(evidence: &str) -> ! {
+    let (resource, probe) = classify_budget_expiry("webrtc_byte_exact", None, Some(evidence));
+    panic!(
+        "{}",
+        format_harness_budget_expired(
+            "webrtc_byte_exact",
+            WEBRTC_BYTE_EXACT_BACKSTOP,
+            resource,
+            probe,
+            evidence,
+        )
+    );
+}
+
 #[test]
 fn webrtc_terminal_output_is_byte_exact() {
     let _guard = daemon_test_guard();
@@ -845,52 +931,76 @@ fn webrtc_terminal_output_is_byte_exact() {
             &python_script_command(&script_path),
         )
         .await;
+        wait_for_producer_ready(&endpoint, session_id);
+        let mut concatenated = Vec::new();
+        let ready_started_at = Instant::now();
+        loop {
+            drain_webrtc_live_bytes(
+                &mut peer,
+                &key,
+                session_id,
+                subscription_id,
+                &mut concatenated,
+            )
+            .await;
+            if String::from_utf8_lossy(&concatenated).contains(PRODUCER_READY_MARKER) {
+                break;
+            }
+            if ready_started_at.elapsed() >= WEBRTC_BYTE_EXACT_BACKSTOP {
+                if concatenated.is_empty() {
+                    panic_webrtc_byte_exact_starvation(
+                        "timed out waiting for WebRTC producer-ready frames; concatenated is empty",
+                    );
+                }
+                break;
+            }
+            await_next_webrtc_terminal_frame(&mut peer, &key).await;
+        }
+        concatenated.clear();
         fs::create_dir_all(release_path.parent().expect("release parent"))
             .expect("create release dir");
         fs::write(&release_path, b"go").expect("release writer");
-        let mut concatenated = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(8);
-        while Instant::now() < deadline {
-            let _ = peer
-                .encrypted_request(
-                    &key,
-                    &botster_hub_client::DaemonRequest::drain_subscription(
-                        session_id,
-                        subscription_id,
-                    ),
-                )
-                .await;
-            while let Some((_, bytes)) = peer.pending_terminal_frames.pop_front() {
-                if let Ok(event) = serde_json::from_slice::<botster_hub_client::DaemonEvent>(&bytes)
-                {
-                    if let botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } = event {
-                        let decoded = live_output_decoded_bytes(payload);
-                        assert!(
-                            !payload_has_utf8_replacement(&decoded),
-                            "live payload must not contain U+FFFD: {decoded:?}"
-                        );
-                        concatenated.extend(decoded);
-                    }
-                } else {
-                    assert!(
-                        !payload_has_utf8_replacement(&bytes),
-                        "live payload must not contain U+FFFD: {bytes:?}"
-                    );
-                    concatenated.extend(bytes);
-                }
-            }
+        let mut session_exited = false;
+        let mut quiet_turns_after_exit = 0usize;
+        let started_at = Instant::now();
+        loop {
+            let bytes_before = concatenated.len();
+            drain_webrtc_live_bytes(
+                &mut peer,
+                &key,
+                session_id,
+                subscription_id,
+                &mut concatenated,
+            )
+            .await;
             if concatenated
                 .windows(expected.len())
                 .any(|window| window == expected)
             {
                 break;
             }
-            if let Ok(Ok(bytes)) =
-                timeout(Duration::from_millis(200), peer.next_terminal_frame(&key)).await
-            {
-                peer.pending_terminal_frames
-                    .push_back((String::new(), bytes));
+            if !session_exited {
+                session_exited = webrtc_session_has_exited(&endpoint, session_id);
             }
+            if session_exited {
+                if concatenated.len() == bytes_before {
+                    quiet_turns_after_exit += 1;
+                } else {
+                    quiet_turns_after_exit = 0;
+                }
+                if quiet_turns_after_exit >= WEBRTC_BYTE_EXACT_QUIET_DRAIN_TURNS {
+                    break;
+                }
+            }
+            if started_at.elapsed() >= WEBRTC_BYTE_EXACT_BACKSTOP {
+                if concatenated.is_empty() {
+                    panic_webrtc_byte_exact_starvation(
+                        "timed out waiting for WebRTC adapter frames after producer-ready release; concatenated is empty",
+                    );
+                }
+                break;
+            }
+            await_next_webrtc_terminal_frame(&mut peer, &key).await;
         }
         assert!(
             concatenated
