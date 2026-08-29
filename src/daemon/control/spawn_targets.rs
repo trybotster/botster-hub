@@ -157,9 +157,7 @@ fn persist_worktrees(
     Ok(worktree)
 }
 
-fn list_spawn_targets_response(
-    daemon: &mut HubDaemon,
-) -> DaemonTransportResult<DaemonResponse> {
+fn list_spawn_targets_response(daemon: &mut HubDaemon) -> DaemonTransportResult<DaemonResponse> {
     let runtime = daemon
         .runtime()
         .ok_or(DaemonTransportError::DaemonNotRunning)?;
@@ -197,9 +195,7 @@ fn mutate_spawn_targets_with_worktrees_response(
     Ok(daemon_spawn_targets(vec![target]))
 }
 
-fn list_worktrees_response(
-    daemon: &mut HubDaemon,
-) -> DaemonTransportResult<DaemonResponse> {
+fn list_worktrees_response(daemon: &mut HubDaemon) -> DaemonTransportResult<DaemonResponse> {
     let runtime = daemon
         .runtime()
         .ok_or(DaemonTransportError::DaemonNotRunning)?;
