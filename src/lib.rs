@@ -1011,6 +1011,32 @@ mod tests {
                 "src/subscription/attach_routes.rs",
                 include_str!("subscription/attach_routes.rs"),
             ),
+            (
+                "src/subscription/package_events.rs",
+                include_str!("subscription/package_events.rs"),
+            ),
+            (
+                "src/subscription/closed_events.rs",
+                include_str!("subscription/closed_events.rs"),
+            ),
+            ("src/subscription.rs", include_str!("subscription.rs")),
+            ("src/admission.rs", include_str!("admission.rs")),
+            (
+                "src/admission/unix_hello.rs",
+                include_str!("admission/unix_hello.rs"),
+            ),
+            (
+                "src/admission/grants.rs",
+                include_str!("admission/grants.rs"),
+            ),
+            (
+                "src/admission/peer_generation.rs",
+                include_str!("admission/peer_generation.rs"),
+            ),
+            (
+                "src/admission/budgets.rs",
+                include_str!("admission/budgets.rs"),
+            ),
             ("src/main.rs", include_str!("main.rs")),
             ("src/local_webrtc.rs", include_str!("local_webrtc.rs")),
             ("src/client_api_dto.rs", include_str!("client_api_dto.rs")),
