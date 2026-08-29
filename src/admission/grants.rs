@@ -192,7 +192,7 @@ fn random_secret_token() -> GrantAdmissionResult<String> {
     Ok(format!("secret-{}", hex(&bytes)))
 }
 
-fn secret_stream_key(secret: &str) -> GrantAdmissionResult<AesGcmKey> {
+pub(crate) fn secret_stream_key(secret: &str) -> GrantAdmissionResult<AesGcmKey> {
     let encoded = secret.strip_prefix("secret-").ok_or_else(|| {
         GrantAdmissionError::InvalidSecret("invalid bootstrap secret".to_string())
     })?;
