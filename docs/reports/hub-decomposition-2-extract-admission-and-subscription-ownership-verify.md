@@ -10,12 +10,12 @@
 | Ticket | `ticket_1787894416_777916` |
 | Run | `run_1787977061_443918` |
 | Step | `botster_stack_verify` (`run_step_1787986430_575145`) |
-| Verified commit | `2a0d5e5eb3688c749dff07c40ff37fb2795de30d` |
-| Product commit under it | `f777cd542eec7392140fc30606fb3d4463463cd4` |
+| Verified commit | `9b70f3c4055344684552f74ade342f5fd2326274` (Verify visit 2). Visit 1 verified `2a0d5e5eb3688c749dff07c40ff37fb2795de30d`. |
+| Product commit under it | `706244571980eec29e3bc02d2c54e6f7431fd84f` (guard repair), over `f777cd542eec7392140fc30606fb3d4463463cd4` (occupancy repair) |
 | Base | `fd540b6b21bdfe23f9280e13f650dff573fc5ae9` (`git merge-base HEAD origin/main`) |
 | Worktree | clean before and after every probe (`git status --porcelain` empty) |
 | Toolchain | `RUSTUP_TOOLCHAIN=1.97.0`, `rustc 1.97.0 (2d8144b78 2026-07-07)`, `cargo 1.97.0`; `CARGO_TARGET_DIR` unset |
-| Verdict | changes required |
+| Verdict | approved (Verify visit 2). Visit 1 returned the run to Implement. |
 
 ## Playbooks and notes loaded
 
@@ -167,3 +167,85 @@ The ticket is move-only, so every lens is a survive-the-move invariant rather th
 2. A relocated guard can copy most of its assertions and still drop some. A per-assertion red arm is needed, not one red arm for the relocated test. This is the source-guard form of [[an ablation that reddens at the first assertion does not vouch for later ones]].
 3. `include_str!` guards need no fresh `CARGO_TARGET_DIR`, because the macro makes the file a compile input. The clean-target rule from [[a source scan known positive control needs a clean Cargo target directory]] applies to `env!("CARGO_MANIFEST_DIR")` path scans instead. Recording that distinction saves a full scratch build per ablation.
 4. Hub decomposition 2 confirmed that a byte-pure `git mv` plus a paired import-repair commit keeps `similarity index 100%` and `add=0 del=0`, which makes commit-kind verification a pure `git show --numstat -M` check.
+
+---
+
+# Verify visit 2: the guard finding is closed
+
+Second Verify visit at `9b70f3c`, product commit `7062445`. Base is still `fd540b6`. The worktree was clean before and after every probe.
+
+## What changed since Verify visit 1
+
+`git diff --stat 2a0d5e5 HEAD` shows three files: this report, the Implement report, and eight added lines in `src/subscription/closed_events.rs`. The eight lines land at line 402, inside the `#[cfg(test)] mod tests` block that opens at line 334. They add the two missing absences to `close_events_phase_source_does_not_take_journal_wake`:
+
+```rust
+assert!(
+    !close.contains("list_terminal_subscriptions"),
+    "Pump must use the exact membership query"
+);
+assert!(
+    !close.contains("list_sessions"),
+    "Pump close classification must not list sessions"
+);
+```
+
+No production line changed. This is the exact repair the finding suggested, and nothing else.
+
+## Per-assertion red arms
+
+Each new assertion needs its own arm, because an arm that reddens at the first assertion does not vouch for the second. Both seeds went into the first line of `run_close_events_phase`, and the file was restored after each arm.
+
+| Arm | Seed | Result |
+| --- | --- | --- |
+| control | none | `close_events_phase_source_does_not_take_journal_wake` and `pump_phases_do_not_list_subscriptions_or_sessions`: `2 passed; 0 failed` |
+| A | `let _ = "list_sessions";` | FAILED at `Pump close classification must not list sessions` |
+| D | `let _ = "list_terminal_subscriptions";` | FAILED at `Pump must use the exact membership query` |
+
+Arm A is the exact seed that stayed green at `2a0d5e5`. It is now red, so the coverage hole is closed. Neither token is a substring of the other, so the two arms are independent.
+
+The `src/subscription/closed_events.rs` entry in `production_sources_reject_terminal_drain_and_snapshot_phase_decode` was re-proved after the file changed: the seeded arm exits 101 with `src/subscription/closed_events.rs production source must not contain GHOSTSNP`, and the restored control passes.
+
+## Gates at `9b70f3c`
+
+`RUSTUP_TOOLCHAIN=1.97.0`, `rustc 1.97.0 (2d8144b78 2026-07-07)`, `CARGO_TARGET_DIR` unset.
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --all -- --check` | exit 0 |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0 |
+| `cargo build --locked -p botster-core-daemon --bin botster-session-worker` | exit 0 |
+| `cargo build --locked --bin botster-hub` | exit 0 |
+| `./test.sh --locked`, run 1 | exit 101. `hub_daemon_lifecycle_test` 318 passed, 1 failed, 2 ignored. Every other target ok. |
+| `BOTSTER_ENV=test cargo test --locked --test hub_daemon_lifecycle_test -- --exact webrtc_terminal_output_is_byte_exact` | `1 passed; 0 failed` |
+| `./test.sh --locked`, run 2 | exit 0. 32 `test result: ok` lines, zero FAILED. Lib 495 passed. Lifecycle 319 passed, 2 ignored. hub-client 81 passed. |
+
+## The one suite failure, attributed
+
+Run 1 failed `webrtc_terminal_output_is_byte_exact` at `tests/hub_daemon_lifecycle/subscription_ownership_baseline.rs:885` with `WebRTC adapter frames must preserve exact bytes, got []`.
+
+Evidence that the extraction did not cause it:
+
+1. The test body is byte-identical to base. `diff` over lines 780-900 of that file between `fd540b6` and `9b70f3c` is empty, and the whole file carries only the two path-repair lines against base.
+2. The failure signature is an empty frame vector, not wrong bytes. The loop has a fixed eight-second wall-clock deadline, so `got []` means no frame arrived in time, not that a byte differed. A broken grant, key derivation, or admission path would fail deterministically, not once.
+3. Load average was 6.41 on 12 cores at the start of run 1, against 4.72 during the green suite of Verify visit 1.
+4. The isolated rerun at the same commit passed, and run 2 at the same commit passed with the full lifecycle target green.
+5. The only delta from the green suite of Verify visit 1 is eight lines inside `#[cfg(test)] mod tests` of the library. An integration test binary links the library compiled without `cfg(test)`, so `7062445` cannot reach this test at all.
+6. Counting both Verify visits and both Implement visits, this test has four green full-suite observations on this branch and one red.
+
+Not attempted: reproducing the same failure on `fd540b6` under matched load. The claim here is a host-load flake on a fixed deadline, not a pre-existing base failure, and points 1 and 5 establish that the branch did not change the code under this test. A loaded-base reproduction would strengthen the attribution, and it stays on the residual-risk list.
+
+## Findings status after visit 2
+
+- The Verify visit 1 finding is closed, with per-assertion red arms recorded above.
+- `finding_1787984719_993379` and `finding_1787984719_792783` remain closed. Nothing in `7062445` touches the state owners or the test homes.
+- Every acceptance result from Verify visit 1 still holds, because no production line changed. That includes the eleven source-guard ablation arms, the ownership greps, the byte-identical public item lists, the commit-kind proof, and the downstream client proof.
+
+## Residual risk after visit 2
+
+- `webrtc_terminal_output_is_byte_exact` has an eight-second wall-clock deadline and fails on a loaded host. It is a pre-existing flake shape rather than a branch defect, but it will keep costing suite reruns until the deadline becomes adaptive or the test waits on a producer acknowledgement.
+- The unverified items from visit 1 are unchanged: packaged-browser grant-secret derivation, and byte-level equivalence of the unified close-event ledger beyond the existing per-transport tests.
+- `entity_subscriptions`, `event_plane`, `pending_runtime`, and `released_entity_generations` still sit on `DaemonControlState`, which the approved plan allowed.
+
+## Vault gaps after visit 2
+
+The four candidates from visit 1 stand. Add a fifth: a live WebRTC frame test that carries a fixed wall-clock deadline and asserts on an accumulated byte buffer reports an empty buffer under host load, which reads like a byte-exactness defect. The empty-versus-wrong distinction is what separates a deadline flake from a real transport regression, and it belongs beside [[live acceptance tests must not depend on a loop tick window]].
