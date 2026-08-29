@@ -24,7 +24,7 @@ use botster_terminal_protocol::{
 use crate::HubDaemon;
 use crate::HubRuntime;
 use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
-use crate::daemon_transport::{DaemonControlState, PendingRuntimeState};
+use crate::daemon_transport::PendingRuntimeState;
 use crate::unix_terminal_adapter::{
     UnixConnectionMux, UnixTerminalAdapter, UnixTerminalAdapterHandle,
 };
@@ -139,6 +139,7 @@ pub(crate) struct AttachStreamRegistry {
     streams: BTreeMap<(String, String), AttachStream>,
     pub(crate) active_subscriptions: BTreeMap<String, BTreeSet<String>>,
     pub(crate) attach_owner_grant_ids: BTreeMap<(String, String), String>,
+    pub(crate) live_attach_routes: BTreeSet<(String, String)>,
     connection_bound_routes: BTreeMap<String, BTreeSet<ConnectionBoundRoute>>,
 }
 
@@ -810,16 +811,17 @@ pub(crate) fn unix_eof_cleanup_ablation() -> UnixEofAblation {
 pub(crate) fn overlay_live_attach_occupancy(
     status: &mut DaemonStatus,
     daemon: &HubDaemon,
-    state: &DaemonControlState,
+    hub_routes: &BTreeSet<(String, String)>,
+    pending: &PendingRuntimeState,
 ) {
     status.live_attach_occupancy = live_attach_occupancy_rows(
-        &state.live_attach_routes,
+        hub_routes,
         daemon
             .runtime()
             .map(crate::HubRuntime::list_terminal_subscriptions)
             .unwrap_or_default()
             .as_slice(),
-        &state.pending_runtime,
+        pending,
     );
 }
 
@@ -873,7 +875,9 @@ pub(crate) fn apply_attached_subscription_change(
 }
 
 pub(crate) fn record_attached_subscription_change(
-    state: &mut DaemonControlState,
+    registry: &mut AttachStreamRegistry,
+    close: &mut crate::subscription::closed_events::AttachCloseBookkeeping,
+    lifecycle: &mut botster_hub_client::DaemonLifecycleCounters,
     change: Option<AttachedSubscriptionChange>,
     owner_grant_id: Option<&str>,
 ) {
@@ -886,43 +890,35 @@ pub(crate) fn record_attached_subscription_change(
                 subscription.session_id.clone(),
                 subscription.subscription_id.clone(),
             );
-            let inserted = state.live_attach_routes.insert(route.clone());
-            if !inserted && state.lifecycle_counters.live_attach_subscriptions > 0 {
+            let inserted = registry.live_attach_routes.insert(route.clone());
+            if !inserted && lifecycle.live_attach_subscriptions > 0 {
                 return;
             }
-            if state.released_attach_generations > 0 {
-                state.released_attach_generations -= 1;
-                state.lifecycle_counters.reconnect_registrations = state
-                    .lifecycle_counters
-                    .reconnect_registrations
-                    .saturating_add(1);
+            if close.released_attach_generations > 0 {
+                close.released_attach_generations -= 1;
+                lifecycle.reconnect_registrations =
+                    lifecycle.reconnect_registrations.saturating_add(1);
             }
-            state.lifecycle_counters.live_attach_subscriptions = state
-                .lifecycle_counters
-                .live_attach_subscriptions
-                .saturating_add(1);
-            state.lifecycle_counters.high_water_attach_subscriptions = state
-                .lifecycle_counters
+            lifecycle.live_attach_subscriptions =
+                lifecycle.live_attach_subscriptions.saturating_add(1);
+            lifecycle.high_water_attach_subscriptions = lifecycle
                 .high_water_attach_subscriptions
-                .max(state.lifecycle_counters.live_attach_subscriptions);
+                .max(lifecycle.live_attach_subscriptions);
             if let Some(grant_id) = owner_grant_id {
-                state
-                    .pending_runtime
+                registry
                     .attach_owner_grant_ids
                     .insert(route, grant_id.to_string());
             }
         }
         AttachedSubscriptionChange::Detach(subscription) => {
             let route = (subscription.session_id, subscription.subscription_id);
-            if !state.live_attach_routes.remove(&route) {
+            if !registry.live_attach_routes.remove(&route) {
                 return;
             }
-            state.lifecycle_counters.live_attach_subscriptions = state
-                .lifecycle_counters
-                .live_attach_subscriptions
-                .saturating_sub(1);
-            state.released_attach_generations = state.released_attach_generations.saturating_add(1);
-            state.pending_runtime.attach_owner_grant_ids.remove(&route);
+            lifecycle.live_attach_subscriptions =
+                lifecycle.live_attach_subscriptions.saturating_sub(1);
+            close.released_attach_generations = close.released_attach_generations.saturating_add(1);
+            registry.attach_owner_grant_ids.remove(&route);
         }
     }
 }
@@ -972,6 +968,127 @@ mod tests {
             client_id: "client-a".to_string(),
             grant_id: None,
         }
+    }
+
+    #[test]
+    fn drain_does_not_change_attach_occupancy() {
+        let mut registry = AttachStreamRegistry::default();
+        let mut close = crate::subscription::closed_events::AttachCloseBookkeeping::default();
+        let mut lifecycle = botster_hub_client::DaemonLifecycleCounters::default();
+        record_attached_subscription_change(
+            &mut registry,
+            &mut close,
+            &mut lifecycle,
+            Some(AttachedSubscriptionChange::Attach(AttachedSubscription {
+                session_id: "session".to_string(),
+                subscription_id: "subscription".to_string(),
+            })),
+            None,
+        );
+        assert_eq!(lifecycle.live_attach_subscriptions, 1);
+
+        let drain = DaemonRequest::drain_subscription("session", "subscription");
+        let drain_ok = crate::client_api_dto::response::daemon_events(Vec::new());
+        assert!(attached_subscription_change_for_response(&drain, &drain_ok).is_none());
+        record_attached_subscription_change(
+            &mut registry,
+            &mut close,
+            &mut lifecycle,
+            attached_subscription_change_for_response(&drain, &drain_ok),
+            None,
+        );
+        assert_eq!(lifecycle.live_attach_subscriptions, 1);
+
+        let detach = DaemonRequest::Detach {
+            session_id: "session".to_string(),
+            subscription_id: "subscription".to_string(),
+        };
+        let change = attached_subscription_change_for_response(&detach, &drain_ok);
+        record_attached_subscription_change(
+            &mut registry,
+            &mut close,
+            &mut lifecycle,
+            change.clone(),
+            None,
+        );
+        assert_eq!(lifecycle.live_attach_subscriptions, 0);
+        record_attached_subscription_change(
+            &mut registry,
+            &mut close,
+            &mut lifecycle,
+            change,
+            None,
+        );
+        assert_eq!(
+            lifecycle.live_attach_subscriptions, 0,
+            "a second Detach must not decrement another route"
+        );
+        assert!(
+            !registry
+                .live_attach_routes
+                .contains(&("session".to_string(), "subscription".to_string()))
+        );
+    }
+
+    #[test]
+    fn occupancy_rows_union_hub_routes_and_core_inventory() {
+        let mut hub_routes = BTreeSet::new();
+        hub_routes.insert(("session".to_string(), "hub-only".to_string()));
+        let inventory = vec![TerminalSubscriptionRecord {
+            client_id: ClientId("client".to_string()),
+            session_id: SessionId("session".to_string()),
+            subscription_id: SubscriptionId("core-only".to_string()),
+            generation: TerminalSubscriptionGeneration(4),
+            adapter_bound: false,
+            capabilities: None,
+        }];
+        let rows = live_attach_occupancy_rows(
+            &hub_routes,
+            &inventory,
+            &crate::daemon_transport::PendingRuntimeState::default(),
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.session_id == "session" && row.subscription_id == "hub-only"),
+            "Hub-only occupancy must stay visible: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| {
+                row.session_id == "session"
+                    && row.subscription_id == "core-only"
+                    && row.generation == 4
+            }),
+            "Core-only occupancy must stay visible: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn independent_counter_sub_does_not_clear_named_occupancy() {
+        let mut registry = AttachStreamRegistry::default();
+        let mut close = crate::subscription::closed_events::AttachCloseBookkeeping::default();
+        let mut lifecycle = botster_hub_client::DaemonLifecycleCounters::default();
+        record_attached_subscription_change(
+            &mut registry,
+            &mut close,
+            &mut lifecycle,
+            Some(AttachedSubscriptionChange::Attach(AttachedSubscription {
+                session_id: "session".to_string(),
+                subscription_id: "subscription".to_string(),
+            })),
+            None,
+        );
+        lifecycle.live_attach_subscriptions = 0;
+        let rows = live_attach_occupancy_rows(
+            &registry.live_attach_routes,
+            &[],
+            &crate::daemon_transport::PendingRuntimeState::default(),
+        );
+        assert!(
+            rows.iter().any(|row| {
+                row.session_id == "session" && row.subscription_id == "subscription"
+            }),
+            "named occupancy is the oracle, not the counter: {rows:?}"
+        );
     }
 
     #[test]

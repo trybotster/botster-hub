@@ -43,6 +43,11 @@ pub(crate) struct ClosedEventRoute<H> {
     pub reported: bool,
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct AttachCloseBookkeeping {
+    pub released_attach_generations: u64,
+}
+
 #[derive(Default)]
 pub(crate) struct ClosedEventLedger {
     pending_events: Mutex<Vec<DaemonEvent>>,
@@ -389,6 +394,187 @@ mod tests {
         assert!(
             !close.contains("queue_webrtc_subscription_closed_events"),
             "control must not scan every WebRTC mux for close events"
+        );
+        assert!(
+            !close.contains("keys().find"),
+            "CloseEvents must resume with BTreeMap::range"
+        );
+        assert!(close.contains("next_admission_key"));
+    }
+
+    #[derive(Clone)]
+    struct TestHandle {
+        closed: bool,
+        host_closed: bool,
+    }
+
+    impl ClosedHandle for TestHandle {
+        fn is_closed(&self) -> bool {
+            self.closed
+        }
+
+        fn host_closed(&self) -> bool {
+            self.host_closed
+        }
+    }
+
+    fn closed_route(
+        session: &str,
+        subscription: &str,
+        generation: u64,
+        host_closed: bool,
+    ) -> ((String, String, u64), ClosedEventRoute<TestHandle>) {
+        let key = (session.to_string(), subscription.to_string(), generation);
+        (
+            key.clone(),
+            ClosedEventRoute {
+                session_id: session.to_string(),
+                subscription_id: subscription.to_string(),
+                generation,
+                handle: TestHandle {
+                    closed: true,
+                    host_closed,
+                },
+                reported: false,
+            },
+        )
+    }
+
+    #[test]
+    fn close_event_slice_uses_keyed_suppression_without_cloning_the_prefix() {
+        let ledger = ClosedEventLedger::default();
+        for index in 0..64 {
+            ledger.suppress_generation(format!("suppressed-{index:03}"), "sub", 1);
+        }
+        let mut routes = BTreeMap::new();
+        for index in 0..8 {
+            let (key, route) = closed_route(&format!("open-{index:02}"), "sub", 1, false);
+            let mut open = route;
+            open.handle.closed = false;
+            routes.insert(key, open);
+        }
+        let (suppressed_key, suppressed) = closed_route("suppressed-000", "sub", 1, false);
+        routes.insert(suppressed_key, suppressed);
+        let (live_key, live) = closed_route("z-live", "sub", 1, false);
+        routes.insert(live_key, live);
+        let first = ledger.queue_closed_subscription_events_bounded(
+            false,
+            &mut routes,
+            |_| Some(true),
+            8,
+            None,
+            8,
+            || {},
+        );
+        assert_eq!(first.classified, 0);
+        let second = ledger.queue_closed_subscription_events_bounded(
+            false,
+            &mut routes,
+            |_| Some(true),
+            8,
+            first.after_route.as_ref(),
+            8,
+            || {},
+        );
+        assert_eq!(second.classified, 2);
+        match ledger.pop_pending_event() {
+            Some(DaemonEvent::TerminalSubscriptionClosed { session_id, .. }) => {
+                assert_eq!(session_id, "z-live");
+            }
+            other => panic!("expected live close event, got {other:?}"),
+        }
+        assert!(ledger.pop_pending_event().is_none());
+    }
+
+    #[test]
+    fn exact_generation_suppression_silences_running_close_and_preserves_later_generation() {
+        let ledger = ClosedEventLedger::default();
+        ledger.suppress_generation("s", "sub", 4);
+        let mut routes = BTreeMap::new();
+        let (key, route) = closed_route("s", "sub", 4, false);
+        routes.insert(key, route);
+        let progress = ledger.queue_closed_subscription_events_bounded(
+            false,
+            &mut routes,
+            |_| Some(true),
+            usize::MAX,
+            None,
+            usize::MAX,
+            || {},
+        );
+        assert_eq!(progress.classified, 1);
+        assert!(
+            ledger.pop_pending_event().is_none(),
+            "suppressed generation must stay silent while the classifier answers Running"
+        );
+
+        ledger.suppress_generation("s", "sub-host", 4);
+        let (host_key, host) = closed_route("s", "sub-host", 4, true);
+        routes.insert(host_key, host);
+        let host_progress = ledger.queue_closed_subscription_events_bounded(
+            false,
+            &mut routes,
+            |_| Some(true),
+            usize::MAX,
+            None,
+            usize::MAX,
+            || {},
+        );
+        assert_eq!(host_progress.classified, 1);
+        assert!(
+            ledger.pop_pending_event().is_none(),
+            "host-close under exact-key suppression must not emit"
+        );
+
+        let (later_key, later) = closed_route("s", "sub", 5, false);
+        routes.insert(later_key, later);
+        let later_progress = ledger.queue_closed_subscription_events_bounded(
+            false,
+            &mut routes,
+            |_| Some(true),
+            usize::MAX,
+            None,
+            usize::MAX,
+            || {},
+        );
+        assert_eq!(later_progress.classified, 1);
+        match ledger.pop_pending_event() {
+            Some(DaemonEvent::TerminalSubscriptionClosed {
+                session_id,
+                subscription_id,
+                generation,
+                reason,
+            }) => {
+                assert_eq!(session_id, "s");
+                assert_eq!(subscription_id, "sub");
+                assert_eq!(generation, 5);
+                assert_eq!(reason, TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER);
+            }
+            other => panic!("later generation must still emit, got {other:?}"),
+        }
+        assert!(ledger.pop_pending_event().is_none());
+    }
+
+    #[test]
+    fn empty_session_snapshot_installs_no_suppression_keys() {
+        let ledger = ClosedEventLedger::default();
+        ledger.suppress_session_keys(Vec::new());
+        let mut routes = BTreeMap::new();
+        let (key, route) = closed_route("missing", "sub", 1, false);
+        routes.insert(key, route);
+        let progress = ledger.queue_closed_subscription_events_bounded(
+            false,
+            &mut routes,
+            |_| Some(true),
+            usize::MAX,
+            None,
+            usize::MAX,
+            || {},
+        );
+        assert_eq!(progress.classified, 1);
+        assert!(
+            ledger.pop_pending_event().is_some(),
+            "a later attach after a missing-session snapshot must still emit"
         );
     }
 

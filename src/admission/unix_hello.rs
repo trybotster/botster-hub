@@ -126,3 +126,26 @@ pub(crate) fn next_admission_key<T>(
             .map(|(key, _)| key.clone()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn admission_cursor_uses_exclusive_range_not_a_prefix_scan() {
+        let mut admissions = BTreeMap::new();
+        for index in 0..20 {
+            admissions.insert(format!("client-{index:02}"), ());
+        }
+        assert_eq!(
+            next_admission_key(&admissions, None).as_deref(),
+            Some("client-00")
+        );
+        assert_eq!(
+            next_admission_key(&admissions, Some("client-09")).as_deref(),
+            Some("client-10")
+        );
+        assert_eq!(next_admission_key(&admissions, Some("client-19")), None);
+    }
+}

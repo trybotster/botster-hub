@@ -6316,7 +6316,7 @@ mod tests {
             "live attach counter must reach zero after fail-closed sibling detach"
         );
         assert!(
-            harness.state.released_attach_generations >= 1,
+            harness.state.attach_close.released_attach_generations >= 1,
             "released attach generations must account for sibling detach"
         );
         wait_until(
@@ -6354,9 +6354,9 @@ mod tests {
             "fail-closed must leave zero Core inventory rows before session shutdown: {inventory:?}"
         );
         assert!(
-            harness.state.live_attach_routes.is_empty(),
+            harness.state.pending_runtime.live_attach_routes.is_empty(),
             "fail-closed must leave zero Hub attach routes before session shutdown: {:?}",
-            harness.state.live_attach_routes
+            harness.state.pending_runtime.live_attach_routes
         );
 
         peer_a.close_offer();
@@ -7292,9 +7292,9 @@ mod tests {
             "timeout fail-closed must leave zero Core inventory rows: {inventory:?}"
         );
         assert!(
-            harness.state.live_attach_routes.is_empty(),
+            harness.state.pending_runtime.live_attach_routes.is_empty(),
             "timeout fail-closed must leave zero Hub attach routes: {:?}",
-            harness.state.live_attach_routes
+            harness.state.pending_runtime.live_attach_routes
         );
 
         peer_a.close_offer();
