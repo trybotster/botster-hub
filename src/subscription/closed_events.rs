@@ -108,6 +108,7 @@ impl ClosedEventLedger {
         }
     }
 
+    #[allow(clippy::too_many_arguments, clippy::explicit_counter_loop)]
     pub(crate) fn queue_closed_subscription_events_bounded<H: ClosedHandle>(
         &self,
         dying: bool,

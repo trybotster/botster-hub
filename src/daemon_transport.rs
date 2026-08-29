@@ -21,8 +21,10 @@ use std::time::{Duration, Instant};
 use botster_core::{
     ClientId, EndpointId, EnvelopeCursor, EnvelopeId, EnvelopeTarget, PackageSource, RequestId,
     RoutedEnvelope, RoutedEnvelopePayload, RunnableEntrypointKind, RunnableEntrypointLaunchMode,
-    SessionId, SubscriptionId, TerminalSubscriptionGeneration, TerminalSubscriptionRecord,
+    SessionId, SubscriptionId,
 };
+#[cfg(test)]
+use botster_core::{TerminalSubscriptionGeneration, TerminalSubscriptionRecord};
 use botster_core_daemon::{DetachTerminalSubscriptionResult, ReadinessEvidence};
 use botster_hub_client::DaemonTransportError as ClientDaemonTransportError;
 pub use botster_hub_client::{
@@ -137,18 +139,18 @@ pub(crate) use crate::daemon::shutdown::{
     ShutdownSessionClassification, classify_shutdown_session, recover_after_core_shutdown_error,
 };
 
+#[cfg(test)]
+use crate::subscription::attach_routes::live_attach_occupancy_rows;
 use crate::subscription::attach_routes::{
     AttachStreamOwner, AttachStreamRegistry, AttachedSubscription, AttachedSubscriptionChange,
     BoundAdapterHandle, UnixBindRequest, UnixEofAblation, WebrtcBindRequest,
     apply_attached_subscription_change, attached_subscription_change_for_response,
     bind_unix_adapter_after_attaching, bind_webrtc_adapter_after_attaching,
-    fail_closed_pre_bind_attach, forward_attach_bootstrap, live_attach_occupancy_rows,
-    live_generation_for_route, overlay_live_attach_occupancy, record_attached_subscription_change,
-    unix_eof_cleanup_ablation,
+    fail_closed_pre_bind_attach, forward_attach_bootstrap, live_generation_for_route,
+    overlay_live_attach_occupancy, record_attached_subscription_change, unix_eof_cleanup_ablation,
 };
 pub(crate) use crate::subscription::attach_routes::{
-    hello_requires_terminal_subscription_closed, negotiated_unix_capability_set,
-    response_records_attach_ownership,
+    hello_requires_terminal_subscription_closed, response_records_attach_ownership,
 };
 use crate::subscription::closed_events::{
     run_close_events_phase, suppress_unix_session_close_events,
@@ -175,10 +177,11 @@ use crate::admission::budgets::{
     DAEMON_INCOMPLETE_FRAME_TIMEOUT, DAEMON_MAX_CONNECTIONS, DAEMON_MAX_FRAME_BYTES,
     DAEMON_MAX_REJECTION_TASKS, ENTITY_SUBSCRIPTION_QUEUE_CAPACITY,
 };
+#[cfg(test)]
+use crate::admission::unix_hello::next_admission_key;
 use crate::admission::unix_hello::{
     AdmissionState, HostCompatibilityRecord, UnixTerminalAdmission, WebrtcTerminalAdmission,
-    daemon_hello_ack, next_admission_key, terminal_compatibility_attach_error,
-    unix_hello_admission,
+    daemon_hello_ack, terminal_compatibility_attach_error, unix_hello_admission,
 };
 
 const MESSAGE_CONTENT_TYPE: &str = "application/vnd.botster.coordination.message+text";
