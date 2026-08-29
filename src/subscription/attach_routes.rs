@@ -4,6 +4,7 @@
 //! Hub authorizes the route and records generation plus adapter-bound flags.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 use std::ops::Bound;
 
 use botster_core::{
@@ -12,6 +13,7 @@ use botster_core::{
 };
 use botster_core_daemon::CoreDaemonError;
 use botster_hub_client::{
+    DaemonAttachOccupancy, DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonStatus,
     FEATURE_TERMINAL_SUBSCRIPTION_CLOSED, FEATURE_UNIX_TERMINAL_ADAPTER,
     FEATURE_WEBRTC_TERMINAL_ADAPTER,
 };
@@ -19,8 +21,10 @@ use botster_terminal_protocol::{
     FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY, TerminalCompatibility,
 };
 
+use crate::HubDaemon;
 use crate::HubRuntime;
 use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
+use crate::daemon_transport::{DaemonControlState, PendingRuntimeState};
 use crate::unix_terminal_adapter::{
     UnixConnectionMux, UnixTerminalAdapter, UnixTerminalAdapterHandle,
 };
@@ -772,6 +776,194 @@ pub(crate) fn bind_webrtc_adapter_after_attaching(
         );
     }
     Ok(Some(handle))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AttachedSubscription {
+    pub session_id: String,
+    pub subscription_id: String,
+}
+
+#[derive(Clone)]
+pub(crate) enum AttachedSubscriptionChange {
+    Attach(AttachedSubscription),
+    Detach(AttachedSubscription),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnixEofAblation {
+    None,
+    LeaveRoute,
+    SkipCoreDetach,
+    PairOnlyDetach,
+}
+
+pub(crate) fn unix_eof_cleanup_ablation() -> UnixEofAblation {
+    if env::var("BOTSTER_ENV").as_deref() != Ok("test") {
+        return UnixEofAblation::None;
+    }
+    match env::var("BOTSTER_HUB_UNIX_EOF_ABLATION").as_deref() {
+        Ok("leave_route") => UnixEofAblation::LeaveRoute,
+        Ok("skip_core_detach") => UnixEofAblation::SkipCoreDetach,
+        Ok("pair_only_detach") => UnixEofAblation::PairOnlyDetach,
+        _ => UnixEofAblation::None,
+    }
+}
+
+pub(crate) fn overlay_live_attach_occupancy(
+    status: &mut DaemonStatus,
+    daemon: &HubDaemon,
+    state: &DaemonControlState,
+) {
+    status.live_attach_occupancy = live_attach_occupancy_rows(
+        &state.live_attach_routes,
+        daemon
+            .runtime()
+            .map(crate::HubRuntime::list_terminal_subscriptions)
+            .unwrap_or_default()
+            .as_slice(),
+        &state.pending_runtime,
+    );
+}
+
+pub(crate) fn live_attach_occupancy_rows(
+    hub_routes: &BTreeSet<(String, String)>,
+    inventory: &[TerminalSubscriptionRecord],
+    pending: &PendingRuntimeState,
+) -> Vec<DaemonAttachOccupancy> {
+    let mut rows = BTreeMap::new();
+    for row in inventory {
+        rows.insert(
+            (row.session_id.0.clone(), row.subscription_id.0.clone()),
+            row.generation.0,
+        );
+    }
+    for (session_id, subscription_id) in hub_routes {
+        rows.entry((session_id.clone(), subscription_id.clone()))
+            .or_insert_with(|| {
+                pending
+                    .recorded_generation(session_id, subscription_id)
+                    .map(|generation: TerminalSubscriptionGeneration| generation.0)
+                    .unwrap_or(0)
+            });
+    }
+    rows.into_iter()
+        .map(
+            |((session_id, subscription_id), generation)| DaemonAttachOccupancy {
+                session_id,
+                subscription_id,
+                generation,
+            },
+        )
+        .collect()
+}
+
+pub(crate) fn apply_attached_subscription_change(
+    attached_subscriptions: &mut Vec<AttachedSubscription>,
+    active_change: Option<AttachedSubscriptionChange>,
+) {
+    match active_change {
+        Some(AttachedSubscriptionChange::Attach(subscription)) => {
+            if !attached_subscriptions.contains(&subscription) {
+                attached_subscriptions.push(subscription);
+            }
+        }
+        Some(AttachedSubscriptionChange::Detach(subscription)) => {
+            attached_subscriptions.retain(|attached| attached != &subscription);
+        }
+        None => {}
+    }
+}
+
+pub(crate) fn record_attached_subscription_change(
+    state: &mut DaemonControlState,
+    change: Option<AttachedSubscriptionChange>,
+    owner_grant_id: Option<&str>,
+) {
+    let Some(change) = change else {
+        return;
+    };
+    match change {
+        AttachedSubscriptionChange::Attach(subscription) => {
+            let route = (
+                subscription.session_id.clone(),
+                subscription.subscription_id.clone(),
+            );
+            let inserted = state.live_attach_routes.insert(route.clone());
+            if !inserted && state.lifecycle_counters.live_attach_subscriptions > 0 {
+                return;
+            }
+            if state.released_attach_generations > 0 {
+                state.released_attach_generations -= 1;
+                state.lifecycle_counters.reconnect_registrations = state
+                    .lifecycle_counters
+                    .reconnect_registrations
+                    .saturating_add(1);
+            }
+            state.lifecycle_counters.live_attach_subscriptions = state
+                .lifecycle_counters
+                .live_attach_subscriptions
+                .saturating_add(1);
+            state.lifecycle_counters.high_water_attach_subscriptions = state
+                .lifecycle_counters
+                .high_water_attach_subscriptions
+                .max(state.lifecycle_counters.live_attach_subscriptions);
+            if let Some(grant_id) = owner_grant_id {
+                state
+                    .pending_runtime
+                    .attach_owner_grant_ids
+                    .insert(route, grant_id.to_string());
+            }
+        }
+        AttachedSubscriptionChange::Detach(subscription) => {
+            let route = (subscription.session_id, subscription.subscription_id);
+            if !state.live_attach_routes.remove(&route) {
+                return;
+            }
+            state.lifecycle_counters.live_attach_subscriptions = state
+                .lifecycle_counters
+                .live_attach_subscriptions
+                .saturating_sub(1);
+            state.released_attach_generations = state.released_attach_generations.saturating_add(1);
+            state.pending_runtime.attach_owner_grant_ids.remove(&route);
+        }
+    }
+}
+
+pub(crate) fn response_records_attach_ownership(response: &DaemonResponse) -> bool {
+    response.kind != DaemonResponseKind::OperatorError
+}
+
+pub(crate) fn attached_subscription_change_for_response(
+    request: &DaemonRequest,
+    response: &DaemonResponse,
+) -> Option<AttachedSubscriptionChange> {
+    if response.kind == DaemonResponseKind::OperatorError {
+        return None;
+    }
+    AttachedSubscriptionChange::from_request(request)
+}
+
+impl AttachedSubscriptionChange {
+    fn from_request(request: &DaemonRequest) -> Option<Self> {
+        match request {
+            DaemonRequest::Attach {
+                session_id,
+                subscription_id,
+            } => Some(Self::Attach(AttachedSubscription {
+                session_id: session_id.clone(),
+                subscription_id: subscription_id.clone(),
+            })),
+            DaemonRequest::Detach {
+                session_id,
+                subscription_id,
+            } => Some(Self::Detach(AttachedSubscription {
+                session_id: session_id.clone(),
+                subscription_id: subscription_id.clone(),
+            })),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
