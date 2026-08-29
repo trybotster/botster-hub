@@ -133,9 +133,7 @@ pub(crate) fn handle_request(
     }
 }
 
-pub(crate) fn list_packages_response(
-    daemon: &mut HubDaemon,
-) -> DaemonTransportResult<DaemonResponse> {
+fn list_packages_response(daemon: &mut HubDaemon) -> DaemonTransportResult<DaemonResponse> {
     let packages = daemon.package_registry().clone();
     let api = HubClientApi::local_operator("botster-hub-daemon-socket");
     let Some(runtime) = daemon.runtime_mut() else {
@@ -156,7 +154,7 @@ pub(crate) fn list_packages_response(
     Ok(daemon_packages(packages))
 }
 
-pub(crate) fn list_package_navigation_response(
+fn list_package_navigation_response(
     daemon: &mut HubDaemon,
 ) -> DaemonTransportResult<DaemonResponse> {
     let packages = daemon.package_registry().clone();
@@ -182,13 +180,13 @@ pub(crate) fn list_package_navigation_response(
     Ok(daemon_package_navigation(navigation, &packages))
 }
 
-pub(crate) fn list_apps_response(daemon: &mut HubDaemon) -> DaemonTransportResult<DaemonResponse> {
+fn list_apps_response(daemon: &mut HubDaemon) -> DaemonTransportResult<DaemonResponse> {
     let registry = daemon.package_registry().clone();
     let snapshots = daemon.entrypoint_supervisor().snapshots();
     Ok(daemon_apps(apps_from_registry(&registry, snapshots)))
 }
 
-pub(crate) fn resolve_package_route_response(
+fn resolve_package_route_response(
     daemon: &mut HubDaemon,
     package_name: &str,
     route_id: &str,
@@ -217,7 +215,7 @@ pub(crate) fn resolve_package_route_response(
     }
 }
 
-pub(crate) fn supervised_launch_contract(
+fn supervised_launch_contract(
     config: &HubConfig,
     registry: &PackageRegistry,
     package_name: &str,
@@ -263,7 +261,7 @@ pub(crate) fn supervised_launch_contract(
     })
 }
 
-pub(crate) fn runtime_path(path: PathBuf) -> PathBuf {
+fn runtime_path(path: PathBuf) -> PathBuf {
     if path.is_absolute() {
         path
     } else {
@@ -273,7 +271,7 @@ pub(crate) fn runtime_path(path: PathBuf) -> PathBuf {
     }
 }
 
-pub(crate) fn resolve_app_launch_response(
+fn resolve_app_launch_response(
     daemon: &mut HubDaemon,
     package_name: &str,
     entrypoint_id: &str,
@@ -359,7 +357,7 @@ pub(crate) fn resolve_app_launch_response(
     }))
 }
 
-pub(crate) fn available_packages_response(
+fn available_packages_response(
     daemon: &mut HubDaemon,
     registry_path: PathBuf,
 ) -> DaemonTransportResult<DaemonResponse> {
@@ -369,7 +367,7 @@ pub(crate) fn available_packages_response(
     Ok(daemon_available_packages(available, &registry_path))
 }
 
-pub(crate) fn inspect_available_package_response(
+fn inspect_available_package_response(
     daemon: &mut HubDaemon,
     registry_path: PathBuf,
     entry_id: &str,
@@ -380,7 +378,7 @@ pub(crate) fn inspect_available_package_response(
     Ok(daemon_available_packages(vec![available], &registry_path))
 }
 
-pub(crate) fn preview_package_install_response(
+fn preview_package_install_response(
     daemon: &mut HubDaemon,
     registry_path: PathBuf,
     entry_id: &str,
@@ -391,7 +389,7 @@ pub(crate) fn preview_package_install_response(
     Ok(daemon_package_install_plan(plan))
 }
 
-pub(crate) fn show_package_response(
+fn show_package_response(
     daemon: &mut HubDaemon,
     package_name: &str,
 ) -> DaemonTransportResult<DaemonResponse> {
@@ -412,7 +410,7 @@ pub(crate) fn show_package_response(
     Ok(daemon_packages(vec![package]))
 }
 
-pub(crate) fn start_package_entrypoint_response(
+fn start_package_entrypoint_response(
     daemon: &mut HubDaemon,
     package_name: String,
     entrypoint_id: String,
@@ -441,7 +439,7 @@ pub(crate) fn start_package_entrypoint_response(
     show_package_response(daemon, &package_name)
 }
 
-pub(crate) fn stop_package_entrypoint_response(
+fn stop_package_entrypoint_response(
     daemon: &mut HubDaemon,
     package_name: String,
     entrypoint_id: String,
@@ -452,7 +450,7 @@ pub(crate) fn stop_package_entrypoint_response(
     show_package_response(daemon, &package_name)
 }
 
-pub(crate) fn restart_package_entrypoint_response(
+fn restart_package_entrypoint_response(
     daemon: &mut HubDaemon,
     package_name: String,
     entrypoint_id: String,
@@ -480,7 +478,7 @@ pub(crate) fn restart_package_entrypoint_response(
     show_package_response(daemon, &package_name)
 }
 
-pub(crate) fn package_entrypoint_status_response(
+fn package_entrypoint_status_response(
     daemon: &mut HubDaemon,
     package_name: String,
     entrypoint_id: String,
@@ -491,7 +489,7 @@ pub(crate) fn package_entrypoint_status_response(
     show_package_response(daemon, &package_name)
 }
 
-pub(crate) fn package_decision_response(
+fn package_decision_response(
     daemon: &mut HubDaemon,
     decision: PackageDecision,
 ) -> DaemonTransportResult<DaemonResponse> {
@@ -501,7 +499,7 @@ pub(crate) fn package_decision_response(
     Ok(response)
 }
 
-pub(crate) fn apply_entrypoint_snapshots(
+fn apply_entrypoint_snapshots(
     packages: &mut [HubClientPackage],
     snapshots: Vec<EntrypointProcessSnapshot>,
 ) {
@@ -535,7 +533,7 @@ pub(crate) fn apply_entrypoint_snapshots(
     }
 }
 
-pub(crate) fn check_package_update_response(
+fn check_package_update_response(
     daemon: &mut HubDaemon,
     package_name: &str,
 ) -> DaemonTransportResult<DaemonResponse> {
@@ -543,7 +541,7 @@ pub(crate) fn check_package_update_response(
     Ok(daemon_package_update_status(update_status))
 }
 
-pub(crate) fn preview_package_update_response(
+fn preview_package_update_response(
     daemon: &mut HubDaemon,
     package_name: &str,
     pin: DaemonPackagePin,
@@ -554,7 +552,7 @@ pub(crate) fn preview_package_update_response(
     Ok(response)
 }
 
-pub(crate) fn package_update_status(
+fn package_update_status(
     daemon: &mut HubDaemon,
     package_name: &str,
     proposed_pin: Option<DaemonPackagePin>,
@@ -635,7 +633,7 @@ pub(crate) fn package_update_status(
     })
 }
 
-pub(crate) fn package_update_plan(
+fn package_update_plan(
     daemon: &mut HubDaemon,
     package_name: &str,
     pin: DaemonPackagePin,

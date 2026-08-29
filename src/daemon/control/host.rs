@@ -57,7 +57,7 @@ pub(crate) fn handle_request(
     }
 }
 
-pub(crate) fn check_hub_update(
+fn check_hub_update(
     state: &mut DaemonControlState,
     transport_handle: &tokio::runtime::Handle,
     control_tx: ControlSender,
@@ -100,7 +100,7 @@ pub(crate) fn check_hub_update(
     }
 }
 
-pub(crate) fn start_hub_update(
+fn start_hub_update(
     daemon: &HubDaemon,
     scope: DaemonHubUpdateScope,
     reply_tx: ControlReplySender,
@@ -157,7 +157,7 @@ pub(crate) fn start_hub_update(
     }
 }
 
-pub(crate) fn get_hub_update_execution(
+fn get_hub_update_execution(
     daemon: &HubDaemon,
     reply_tx: ControlReplySender,
     response_delivery_rx: Option<mpsc::Receiver<()>>,

@@ -22,9 +22,7 @@ pub(crate) fn handle_request(
     }
 }
 
-pub(crate) fn plugin_lifecycle_response(
-    daemon: &mut HubDaemon,
-) -> DaemonTransportResult<DaemonResponse> {
+fn plugin_lifecycle_response(daemon: &mut HubDaemon) -> DaemonTransportResult<DaemonResponse> {
     let packages = daemon.package_registry().clone();
     let api = HubClientApi::local_operator("botster-hub-daemon-socket");
     let Some(runtime) = daemon.runtime_mut() else {

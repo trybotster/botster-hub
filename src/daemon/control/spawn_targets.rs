@@ -93,7 +93,7 @@ pub(crate) fn handle_request(
     }
 }
 
-pub(crate) fn persist_spawn_targets(
+fn persist_spawn_targets(
     daemon: &mut HubDaemon,
     update: impl FnOnce(&mut Vec<SpawnTarget>) -> crate::SpawnTargetResult<SpawnTarget>,
 ) -> DaemonTransportResult<SpawnTarget> {
@@ -114,7 +114,7 @@ pub(crate) fn persist_spawn_targets(
     Ok(target)
 }
 
-pub(crate) fn persist_spawn_targets_with_worktrees(
+fn persist_spawn_targets_with_worktrees(
     daemon: &mut HubDaemon,
     update: impl FnOnce(&mut Vec<SpawnTarget>, &[Worktree]) -> crate::SpawnTargetResult<SpawnTarget>,
 ) -> DaemonTransportResult<SpawnTarget> {
@@ -135,7 +135,7 @@ pub(crate) fn persist_spawn_targets_with_worktrees(
     Ok(target)
 }
 
-pub(crate) fn persist_worktrees(
+fn persist_worktrees(
     daemon: &mut HubDaemon,
     update: impl FnOnce(&mut Vec<Worktree>, &[SpawnTarget]) -> crate::WorktreeResult<Worktree>,
 ) -> DaemonTransportResult<Worktree> {
@@ -157,7 +157,7 @@ pub(crate) fn persist_worktrees(
     Ok(worktree)
 }
 
-pub(crate) fn list_spawn_targets_response(
+fn list_spawn_targets_response(
     daemon: &mut HubDaemon,
 ) -> DaemonTransportResult<DaemonResponse> {
     let runtime = daemon
@@ -168,7 +168,7 @@ pub(crate) fn list_spawn_targets_response(
     )))
 }
 
-pub(crate) fn show_spawn_target_response(
+fn show_spawn_target_response(
     daemon: &mut HubDaemon,
     target_id: &str,
 ) -> DaemonTransportResult<DaemonResponse> {
@@ -181,7 +181,7 @@ pub(crate) fn show_spawn_target_response(
     )?]))
 }
 
-pub(crate) fn mutate_spawn_targets_response(
+fn mutate_spawn_targets_response(
     daemon: &mut HubDaemon,
     update: impl FnOnce(&mut Vec<SpawnTarget>) -> crate::SpawnTargetResult<SpawnTarget>,
 ) -> DaemonTransportResult<DaemonResponse> {
@@ -189,7 +189,7 @@ pub(crate) fn mutate_spawn_targets_response(
     Ok(daemon_spawn_targets(vec![target]))
 }
 
-pub(crate) fn mutate_spawn_targets_with_worktrees_response(
+fn mutate_spawn_targets_with_worktrees_response(
     daemon: &mut HubDaemon,
     update: impl FnOnce(&mut Vec<SpawnTarget>, &[Worktree]) -> crate::SpawnTargetResult<SpawnTarget>,
 ) -> DaemonTransportResult<DaemonResponse> {
@@ -197,7 +197,7 @@ pub(crate) fn mutate_spawn_targets_with_worktrees_response(
     Ok(daemon_spawn_targets(vec![target]))
 }
 
-pub(crate) fn list_worktrees_response(
+fn list_worktrees_response(
     daemon: &mut HubDaemon,
 ) -> DaemonTransportResult<DaemonResponse> {
     let runtime = daemon
@@ -209,7 +209,7 @@ pub(crate) fn list_worktrees_response(
     )))
 }
 
-pub(crate) fn show_worktree_response(
+fn show_worktree_response(
     daemon: &mut HubDaemon,
     worktree_id: &str,
 ) -> DaemonTransportResult<DaemonResponse> {
@@ -223,7 +223,7 @@ pub(crate) fn show_worktree_response(
     )?]))
 }
 
-pub(crate) fn create_worktree_response(
+fn create_worktree_response(
     daemon: &mut HubDaemon,
     request: WorktreeCreate,
 ) -> DaemonTransportResult<DaemonResponse> {
@@ -258,7 +258,7 @@ pub(crate) fn create_worktree_response(
     }
 }
 
-pub(crate) fn delete_worktree_response(
+fn delete_worktree_response(
     daemon: &mut HubDaemon,
     worktree_id: &str,
 ) -> DaemonTransportResult<DaemonResponse> {
@@ -291,14 +291,14 @@ pub(crate) fn delete_worktree_response(
     }
 }
 
-pub(crate) fn daemon_targets(daemon: &HubDaemon) -> Vec<SpawnTarget> {
+fn daemon_targets(daemon: &HubDaemon) -> Vec<SpawnTarget> {
     daemon
         .runtime()
         .map(|runtime| runtime.state().spawn_targets.clone())
         .unwrap_or_default()
 }
 
-pub(crate) fn emit_worktree_lifecycle_event(
+fn emit_worktree_lifecycle_event(
     daemon: &HubDaemon,
     response: &mut DaemonResponse,
     event: DaemonWorktreeLifecycleEvent,
@@ -321,7 +321,7 @@ pub(crate) fn emit_worktree_lifecycle_event(
         .push(DaemonEvent::WorktreeLifecycle { event });
 }
 
-pub(crate) fn create_spawn_target_response(
+fn create_spawn_target_response(
     daemon: &mut HubDaemon,
     request: SpawnTargetCreate,
 ) -> DaemonTransportResult<DaemonResponse> {
@@ -342,7 +342,7 @@ pub(crate) fn create_spawn_target_response(
     Ok(response)
 }
 
-pub(crate) fn update_spawn_target_response(
+fn update_spawn_target_response(
     daemon: &mut HubDaemon,
     target_id: String,
     request: SpawnTargetUpdate,
@@ -390,7 +390,7 @@ pub(crate) fn update_spawn_target_response(
     Ok(response)
 }
 
-pub(crate) fn delete_spawn_target_response(
+fn delete_spawn_target_response(
     daemon: &mut HubDaemon,
     target_id: String,
 ) -> DaemonTransportResult<DaemonResponse> {
@@ -421,7 +421,7 @@ pub(crate) fn delete_spawn_target_response(
     Ok(response)
 }
 
-pub(crate) fn validate_spawn_target_response(
+fn validate_spawn_target_response(
     daemon: &mut HubDaemon,
     target_id: &str,
 ) -> DaemonTransportResult<DaemonResponse> {

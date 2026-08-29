@@ -47,7 +47,7 @@ pub(crate) fn handle_request(
     }
 }
 
-pub(crate) fn persist_local_webrtc_terminal_record(
+fn persist_local_webrtc_terminal_record(
     path: &Path,
     record: &LocalWebrtcSenderTerminalRecord,
 ) -> std::io::Result<()> {
@@ -68,7 +68,7 @@ pub(crate) fn persist_local_webrtc_terminal_record(
     Ok(())
 }
 
-pub(crate) fn detach_local_webrtc_subscriptions(
+fn detach_local_webrtc_subscriptions(
     daemon: &mut HubDaemon,
     logical_clock: &mut u64,
     drain_cursors: &mut BTreeMap<String, u64>,
@@ -93,7 +93,7 @@ pub(crate) fn detach_local_webrtc_subscriptions(
     }
 }
 
-pub(crate) fn issue_local_webrtc_bootstrap_response(
+fn issue_local_webrtc_bootstrap_response(
     daemon: &mut HubDaemon,
     package_name: &str,
     entrypoint_id: &str,
@@ -181,7 +181,7 @@ pub(crate) fn local_webrtc_peer_gone_request_error(operation: &str) -> DaemonRes
     response
 }
 
-pub(crate) fn signal_response(
+fn signal_response(
     daemon: &mut HubDaemon,
     control_tx: ControlSender,
     grant_id: String,

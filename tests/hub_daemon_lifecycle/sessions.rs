@@ -3621,8 +3621,8 @@ fn shutdown_after_observed_exit_returns_session_cleanup() {
 /// the reused control connection, or a sibling session adapter.
 ///
 /// Core-error branch closes victim-session adapters
-/// (`daemon_transport.rs:3430`). Cleanup-branch keep-open
-/// (`:3406-3408`) is a different path. This test hits the Core-error
+/// (`src/daemon/control/sessions.rs`). Cleanup-branch keep-open
+/// is a different path. This test hits the Core-error
 /// branch and proves the same `DaemonConnection` plus the sibling
 /// Attach route still deliver terminal envelopes.
 ///
@@ -4452,7 +4452,7 @@ fn zero_subscribers_still_project_a_complete_ended_row() {
 fn ready_spawn_completes_when_live_sessions_exceed_one_observe_slice() {
     // Control-before-maintenance ordering is proven by
     // `queued_control_precedes_a_due_maintenance_slice` in
-    // `src/daemon_transport.rs`. End-to-end wall-clock latency through a
+    // `src/daemon/owner_loop.rs`. End-to-end wall-clock latency through a
     // daemon child measures ambient machine load and is recorded only.
     let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("observe-slice-load");
@@ -4651,7 +4651,7 @@ fn assemble_readiness_rejects_a_partial_identity_set() {
 fn ready_spawn_completes_during_session_snapshot_assembly() {
     // Control-before-maintenance ordering is proven by
     // `queued_control_precedes_a_due_maintenance_slice` in
-    // `src/daemon_transport.rs`. End-to-end wall-clock latency through a
+    // `src/daemon/owner_loop.rs`. End-to-end wall-clock latency through a
     // daemon child measures ambient machine load and is recorded only.
     // The first Snapshot is the production completeness oracle: it must
     // contain all 24 assemble identities. A later ready-spawn row is a
