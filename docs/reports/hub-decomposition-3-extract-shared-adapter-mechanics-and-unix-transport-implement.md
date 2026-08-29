@@ -6,7 +6,7 @@
 | --- | --- |
 | Target repository | `botster-hub` (`trybotster/botster-hub`) |
 | `target_id` | `tgt_7e208a0c76a44980a83b63af976b1f22` |
-| Authoritative spawn target | `list_spawn_targets` maps this id to `botster-hub` at `/Users/jasonconigliari/Projects/botster-hub` |
+| Authoritative spawn target | `list_spawn_targets` maps this id to `trybotster/botster-hub` |
 | Pipeline worktree | this run worktree |
 | Ticket | `ticket_1787894419_699597` |
 | Run | `run_1787990653_757857` |
@@ -202,3 +202,12 @@ Same four gaps the plan named. Not captured in this Implement visit; they belong
 2. Positive `contains` guards break loudly on a move; negative `!contains` guards go silently blind.
 3. Unix and WebRTC adapters still differ in wake permit storage, deferred-flush filtering, close-from-host on `close_all`, and the test-only pressure setter.
 4. Hub scanner skip-mode leaks are caused by brace counting inside string literals; concatenation is the local workaround.
+
+## Review-return repair
+
+Review `review_1787995553_805691` returned one open finding, `finding_1787995553_341237`. The first report commit recorded a local spawn-target filesystem path. This visit replaces that cell with the path-neutral statement `list_spawn_targets maps this id to trybotster/botster-hub`. Product code is unchanged.
+
+Leak scan and whitespace proof for this repair:
+
+- A raw `git diff origin/main...HEAD` scan over every committed path, plus the working-tree report, has zero local home-directory prefixes. The previous report commit is the known-positive control: that commit still contains the spawn-target filesystem path.
+- `git diff --check origin/main...HEAD` is clean. The working-tree report also has no whitespace errors.
