@@ -141,12 +141,17 @@ pub(crate) use crate::daemon::shutdown::{
 };
 
 use crate::subscription::attach_routes::{
-    AttachStreamOwner, AttachStreamRegistry, BoundAdapterHandle, UnixBindRequest,
-    WebrtcBindRequest, bind_unix_adapter_after_attaching, bind_webrtc_adapter_after_attaching,
-    fail_closed_pre_bind_attach, forward_attach_bootstrap, live_generation_for_route,
+    AttachStreamOwner, AttachStreamRegistry, AttachedSubscription, AttachedSubscriptionChange,
+    BoundAdapterHandle, UnixBindRequest, UnixEofAblation, WebrtcBindRequest,
+    apply_attached_subscription_change, attached_subscription_change_for_response,
+    bind_unix_adapter_after_attaching, bind_webrtc_adapter_after_attaching,
+    fail_closed_pre_bind_attach, forward_attach_bootstrap, live_attach_occupancy_rows,
+    live_generation_for_route, overlay_live_attach_occupancy, record_attached_subscription_change,
+    unix_eof_cleanup_ablation,
 };
 pub(crate) use crate::subscription::attach_routes::{
     hello_requires_terminal_subscription_closed, negotiated_unix_capability_set,
+    response_records_attach_ownership,
 };
 use crate::subscription::closed_events::{
     run_close_events_phase, suppress_unix_session_close_events,
@@ -2417,23 +2422,6 @@ fn cleanup_detach_failed(result: &DaemonTransportResult<DaemonResponse>) -> bool
         })) => false,
         Ok(response) => response.kind == DaemonResponseKind::OperatorError,
         Err(_) => true,
-    }
-}
-
-fn apply_attached_subscription_change(
-    attached_subscriptions: &mut Vec<AttachedSubscription>,
-    active_change: Option<AttachedSubscriptionChange>,
-) {
-    match active_change {
-        Some(AttachedSubscriptionChange::Attach(subscription)) => {
-            if !attached_subscriptions.contains(&subscription) {
-                attached_subscriptions.push(subscription);
-            }
-        }
-        Some(AttachedSubscriptionChange::Detach(subscription)) => {
-            attached_subscriptions.retain(|attached| attached != &subscription);
-        }
-        None => {}
     }
 }
 
@@ -5505,141 +5493,6 @@ fn daemon_delivery_kind(_response: &DaemonResponse) -> DaemonDeliveryKind {
     DaemonDeliveryKind::Control
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct AttachedSubscription {
-    session_id: String,
-    subscription_id: String,
-}
-
-#[derive(Clone)]
-enum AttachedSubscriptionChange {
-    Attach(AttachedSubscription),
-    Detach(AttachedSubscription),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UnixEofAblation {
-    None,
-    LeaveRoute,
-    SkipCoreDetach,
-    PairOnlyDetach,
-}
-
-fn unix_eof_cleanup_ablation() -> UnixEofAblation {
-    if env::var("BOTSTER_ENV").as_deref() != Ok("test") {
-        return UnixEofAblation::None;
-    }
-    match env::var("BOTSTER_HUB_UNIX_EOF_ABLATION").as_deref() {
-        Ok("leave_route") => UnixEofAblation::LeaveRoute,
-        Ok("skip_core_detach") => UnixEofAblation::SkipCoreDetach,
-        Ok("pair_only_detach") => UnixEofAblation::PairOnlyDetach,
-        _ => UnixEofAblation::None,
-    }
-}
-
-fn overlay_live_attach_occupancy(
-    status: &mut DaemonStatus,
-    daemon: &HubDaemon,
-    state: &DaemonControlState,
-) {
-    status.live_attach_occupancy = live_attach_occupancy_rows(
-        &state.live_attach_routes,
-        daemon
-            .runtime()
-            .map(crate::HubRuntime::list_terminal_subscriptions)
-            .unwrap_or_default()
-            .as_slice(),
-        &state.pending_runtime,
-    );
-}
-
-fn live_attach_occupancy_rows(
-    hub_routes: &BTreeSet<(String, String)>,
-    inventory: &[TerminalSubscriptionRecord],
-    pending: &PendingRuntimeState,
-) -> Vec<DaemonAttachOccupancy> {
-    let mut rows = BTreeMap::new();
-    for row in inventory {
-        rows.insert(
-            (row.session_id.0.clone(), row.subscription_id.0.clone()),
-            row.generation.0,
-        );
-    }
-    for (session_id, subscription_id) in hub_routes {
-        rows.entry((session_id.clone(), subscription_id.clone()))
-            .or_insert_with(|| {
-                pending
-                    .recorded_generation(session_id, subscription_id)
-                    .map(|generation: TerminalSubscriptionGeneration| generation.0)
-                    .unwrap_or(0)
-            });
-    }
-    rows.into_iter()
-        .map(
-            |((session_id, subscription_id), generation)| DaemonAttachOccupancy {
-                session_id,
-                subscription_id,
-                generation,
-            },
-        )
-        .collect()
-}
-
-fn record_attached_subscription_change(
-    state: &mut DaemonControlState,
-    change: Option<AttachedSubscriptionChange>,
-    owner_grant_id: Option<&str>,
-) {
-    let Some(change) = change else {
-        return;
-    };
-    match change {
-        AttachedSubscriptionChange::Attach(subscription) => {
-            let route = (
-                subscription.session_id.clone(),
-                subscription.subscription_id.clone(),
-            );
-            let inserted = state.live_attach_routes.insert(route.clone());
-            if !inserted && state.lifecycle_counters.live_attach_subscriptions > 0 {
-                return;
-            }
-            if state.released_attach_generations > 0 {
-                state.released_attach_generations -= 1;
-                state.lifecycle_counters.reconnect_registrations = state
-                    .lifecycle_counters
-                    .reconnect_registrations
-                    .saturating_add(1);
-            }
-            state.lifecycle_counters.live_attach_subscriptions = state
-                .lifecycle_counters
-                .live_attach_subscriptions
-                .saturating_add(1);
-            state.lifecycle_counters.high_water_attach_subscriptions = state
-                .lifecycle_counters
-                .high_water_attach_subscriptions
-                .max(state.lifecycle_counters.live_attach_subscriptions);
-            if let Some(grant_id) = owner_grant_id {
-                state
-                    .pending_runtime
-                    .attach_owner_grant_ids
-                    .insert(route, grant_id.to_string());
-            }
-        }
-        AttachedSubscriptionChange::Detach(subscription) => {
-            let route = (subscription.session_id, subscription.subscription_id);
-            if !state.live_attach_routes.remove(&route) {
-                return;
-            }
-            state.lifecycle_counters.live_attach_subscriptions = state
-                .lifecycle_counters
-                .live_attach_subscriptions
-                .saturating_sub(1);
-            state.released_attach_generations = state.released_attach_generations.saturating_add(1);
-            state.pending_runtime.attach_owner_grant_ids.remove(&route);
-        }
-    }
-}
-
 fn request_succeeded(response: Result<&DaemonResponse, &DaemonTransportError>) -> bool {
     matches!(
         response,
@@ -5782,42 +5635,6 @@ fn local_webrtc_peer_gone_request_error(operation: &str) -> DaemonResponse {
         )],
     });
     response
-}
-
-pub(crate) fn response_records_attach_ownership(response: &DaemonResponse) -> bool {
-    response.kind != DaemonResponseKind::OperatorError
-}
-
-fn attached_subscription_change_for_response(
-    request: &DaemonRequest,
-    response: &DaemonResponse,
-) -> Option<AttachedSubscriptionChange> {
-    if response.kind == DaemonResponseKind::OperatorError {
-        return None;
-    }
-    AttachedSubscriptionChange::from_request(request)
-}
-
-impl AttachedSubscriptionChange {
-    fn from_request(request: &DaemonRequest) -> Option<Self> {
-        match request {
-            DaemonRequest::Attach {
-                session_id,
-                subscription_id,
-            } => Some(Self::Attach(AttachedSubscription {
-                session_id: session_id.clone(),
-                subscription_id: subscription_id.clone(),
-            })),
-            DaemonRequest::Detach {
-                session_id,
-                subscription_id,
-            } => Some(Self::Detach(AttachedSubscription {
-                session_id: session_id.clone(),
-                subscription_id: subscription_id.clone(),
-            })),
-            _ => None,
-        }
-    }
 }
 
 pub(crate) fn session_type_entity_snapshot(
