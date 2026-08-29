@@ -873,7 +873,7 @@ mod tests {
     fn unix_listener_connection_and_mux_left_daemon_transport() {
         const TRANSPORT: &str = include_str!("owner_loop.rs");
         let production = TRANSPORT.split("mod tests").next().expect("production");
-        for needle in [
+        let needles = [
             "async fn accept_connections",
             "async fn handle_connection_async",
             "struct MuxWriteState",
@@ -881,11 +881,35 @@ mod tests {
             "async fn read_async_frame",
             "fn prepare_socket_path",
             "fn unix_event_flush_stalled",
-        ] {
+        ];
+        for needle in needles {
             assert!(
                 !production.contains(needle),
-                "moved {needle} must leave daemon_transport.rs"
+                "moved {needle} must leave src/daemon/**"
             );
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/daemon");
+        let mut pending = vec![root];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read src/daemon") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).expect("read daemon source");
+                let production = source.split("mod tests").next().unwrap_or(&source);
+                for needle in needles {
+                    assert!(
+                        !production.contains(needle),
+                        "{} must not contain {needle}",
+                        path.display()
+                    );
+                }
+            }
         }
         let listener = include_str!("../transport/unix/listener.rs");
         let connection = include_str!("../transport/unix/connection.rs");
