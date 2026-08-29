@@ -644,7 +644,7 @@ fn attach_ready_precedes_history_finish() {
     )
     .expect("ready_then_history hello");
     assert!(ack.terminal_compatibility.is_some());
-    let attach_source = hub_source("src/daemon_attach_stream.rs");
+    let attach_source = hub_source("src/subscription/attach_routes.rs");
     assert!(
         attach_source.contains("for_ready_then_history_attach()"),
         "Hub must advertise the ready_then_history split"

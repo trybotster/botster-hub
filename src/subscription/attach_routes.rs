@@ -1126,7 +1126,7 @@ mod tests {
 
     #[test]
     fn attach_stream_source_does_not_branch_on_snapshot_phases() {
-        let source = include_str!("daemon_attach_stream.rs");
+        let source = include_str!("attach_routes.rs");
         let production = source.split("mod tests").next().expect("production source");
         for forbidden in [r#""READY""#, r#""PAGE""#, r#""FINISH""#, "GHOSTSNP"] {
             assert!(

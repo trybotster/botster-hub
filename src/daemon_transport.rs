@@ -144,14 +144,12 @@ pub(crate) use crate::daemon::shutdown::{
     ShutdownSessionClassification, classify_shutdown_session, recover_after_core_shutdown_error,
 };
 
-#[path = "daemon_attach_stream.rs"]
-mod daemon_attach_stream;
-use daemon_attach_stream::{
+use crate::subscription::attach_routes::{
     AttachStreamOwner, AttachStreamRegistry, BoundAdapterHandle, UnixBindRequest,
     WebrtcBindRequest, bind_unix_adapter_after_attaching, bind_webrtc_adapter_after_attaching,
     fail_closed_pre_bind_attach, forward_attach_bootstrap, live_generation_for_route,
 };
-pub(crate) use daemon_attach_stream::{
+pub(crate) use crate::subscription::attach_routes::{
     hello_requires_terminal_subscription_closed, negotiated_unix_capability_set,
 };
 

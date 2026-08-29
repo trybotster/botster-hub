@@ -81,6 +81,7 @@ pub mod session_types;
 #[doc(hidden)]
 pub mod source_update;
 pub mod spawn_targets;
+pub(crate) mod subscription;
 mod unix_terminal_adapter;
 mod webrtc_terminal_adapter;
 pub mod worktrees;
@@ -1007,8 +1008,8 @@ mod tests {
                 include_str!("daemon_entity_subscriptions.rs"),
             ),
             (
-                "src/daemon_attach_stream.rs",
-                include_str!("daemon_attach_stream.rs"),
+                "src/subscription/attach_routes.rs",
+                include_str!("subscription/attach_routes.rs"),
             ),
             ("src/main.rs", include_str!("main.rs")),
             ("src/local_webrtc.rs", include_str!("local_webrtc.rs")),
