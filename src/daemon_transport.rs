@@ -24,10 +24,7 @@ use botster_core::{
     SessionId, SubscriptionId, TerminalCapabilitySet, TerminalSubscriptionGeneration,
     TerminalSubscriptionRecord,
 };
-use botster_core_daemon::{
-    CoreDaemonError, DetachTerminalSubscriptionResult, ReadinessEvidence, RegistrySessionState,
-    SessionRegistryStateLookup,
-};
+use botster_core_daemon::{DetachTerminalSubscriptionResult, ReadinessEvidence};
 use botster_hub_client::DaemonTransportError as ClientDaemonTransportError;
 pub use botster_hub_client::{
     DaemonApp, DaemonAppLaunchTarget, DaemonAttachOccupancy, DaemonAvailablePackage,
@@ -72,9 +69,8 @@ use tokio::task::JoinHandle;
 
 use crate::daemon_maintenance::{
     BackgroundClass, BackgroundClassScheduler, BackgroundTurnDecision, MaintenanceSliceKind,
-    MaintenanceState, OBSERVE_SLICE_BUDGET, PUMP_MAX_ADMISSIONS_VISITED,
-    PUMP_MAX_CANDIDATE_CLASSIFICATIONS, PUMP_MAX_ROUTE_ENTRIES_VISITED, PUMP_MAX_ROUTES_VALIDATED,
-    PumpAdmissionCursor, PumpPhase, PumpScheduler, decide_background_slice, run_maintenance_kind,
+    MaintenanceState, OBSERVE_SLICE_BUDGET, PUMP_MAX_ROUTES_VALIDATED, PumpPhase, PumpScheduler,
+    decide_background_slice, run_maintenance_kind,
 };
 use crate::daemon_projection::{
     app_local_url, apps_from_registry, daemon_status_from_status, package_route_descriptors,
@@ -151,6 +147,10 @@ use crate::subscription::attach_routes::{
 };
 pub(crate) use crate::subscription::attach_routes::{
     hello_requires_terminal_subscription_closed, negotiated_unix_capability_set,
+};
+use crate::subscription::closed_events::{
+    run_close_events_phase, suppress_unix_session_close_events,
+    suppress_webrtc_session_close_events,
 };
 
 #[path = "daemon_package_control.rs"]
@@ -5062,36 +5062,6 @@ fn missing_session_drain_error(session_id: &str) -> DaemonResponse {
     response
 }
 
-fn suppress_unix_session_close_events(pending_runtime: &PendingRuntimeState, session_id: &str) {
-    for admission in pending_runtime.unix_admissions.values() {
-        if let UnixTerminalAdmission::Admitted { mux, .. } = admission {
-            mux.suppress_session_route_generations(session_id);
-        }
-    }
-}
-
-fn suppress_webrtc_session_close_events(pending_runtime: &PendingRuntimeState, session_id: &str) {
-    for admission in pending_runtime.webrtc_admissions.values() {
-        if let WebrtcTerminalAdmission::Admitted { mux, .. } = admission {
-            mux.suppress_session_route_generations(session_id);
-        }
-    }
-}
-
-fn session_close_event_decision_for(runtime: &crate::HubRuntime, session_id: &str) -> Option<bool> {
-    session_close_event_decision(runtime.session_registry_state(&SessionId(session_id.to_string())))
-}
-
-fn session_close_event_decision(
-    lookup: Result<SessionRegistryStateLookup, CoreDaemonError>,
-) -> Option<bool> {
-    match lookup {
-        Ok(SessionRegistryStateLookup::Found(RegistrySessionState::Running)) => Some(true),
-        Ok(SessionRegistryStateLookup::Found(_)) => Some(false),
-        Ok(SessionRegistryStateLookup::Absent) | Ok(_) | Err(_) => None,
-    }
-}
-
 pub(super) fn request_id(value: &str) -> RequestId {
     RequestId(value.to_string())
 }
@@ -5290,8 +5260,8 @@ pub(crate) struct HostCompatibilityRecord {
 #[derive(Default)]
 pub(crate) struct PendingRuntimeState {
     pub(crate) streams: AttachStreamRegistry,
-    unix_admissions: BTreeMap<String, UnixTerminalAdmission>,
-    webrtc_admissions: BTreeMap<String, WebrtcTerminalAdmission>,
+    pub(crate) unix_admissions: BTreeMap<String, UnixTerminalAdmission>,
+    pub(crate) webrtc_admissions: BTreeMap<String, WebrtcTerminalAdmission>,
     close_work: Arc<AtomicBool>,
     host_compatibility: BTreeMap<String, HostCompatibilityRecord>,
 }
@@ -5353,105 +5323,16 @@ fn run_one_pump_phase(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
     }
 }
 
-fn next_admission_key<T>(map: &BTreeMap<String, T>, after: Option<&str>) -> Option<String> {
+pub(crate) fn next_admission_key<T>(
+    map: &BTreeMap<String, T>,
+    after: Option<&str>,
+) -> Option<String> {
     match after {
         None => map.keys().next().cloned(),
         Some(seen) => map
             .range::<str, _>((Bound::Excluded(seen), Bound::Unbounded))
             .next()
             .map(|(key, _)| key.clone()),
-    }
-}
-
-fn empty_close_event_progress() -> crate::unix_terminal_adapter::ClosedEventSliceProgress {
-    crate::unix_terminal_adapter::ClosedEventSliceProgress {
-        classified: 0,
-        more: false,
-        after_route: None,
-    }
-}
-
-fn run_close_events_phase(daemon: &HubDaemon, state: &mut DaemonControlState) -> bool {
-    let Some(runtime) = daemon.runtime() else {
-        state.pump.close_cursor = PumpAdmissionCursor::default();
-        return false;
-    };
-    let mut admissions_visited = 0;
-    let mut classified = 0;
-    loop {
-        if admissions_visited >= PUMP_MAX_ADMISSIONS_VISITED
-            || classified >= PUMP_MAX_CANDIDATE_CLASSIFICATIONS
-        {
-            return true;
-        }
-        let remaining_candidates = PUMP_MAX_CANDIDATE_CLASSIFICATIONS.saturating_sub(classified);
-        match state.pump.close_cursor.clone() {
-            PumpAdmissionCursor::Unix { after, after_route } => {
-                let next_key =
-                    next_admission_key(&state.pending_runtime.unix_admissions, after.as_deref());
-                let Some(key) = next_key else {
-                    state.pump.close_cursor = PumpAdmissionCursor::Webrtc {
-                        after: None,
-                        after_route: None,
-                    };
-                    continue;
-                };
-                admissions_visited += 1;
-                let progress = match state.pending_runtime.unix_admissions.get(&key) {
-                    Some(UnixTerminalAdmission::Admitted { mux, .. }) => mux
-                        .queue_closed_subscription_events_bounded(
-                            |session_id| session_close_event_decision_for(runtime, session_id),
-                            remaining_candidates,
-                            after_route.as_ref(),
-                            PUMP_MAX_ROUTE_ENTRIES_VISITED,
-                        ),
-                    _ => empty_close_event_progress(),
-                };
-                classified = classified.saturating_add(progress.classified);
-                if progress.more {
-                    state.pump.close_cursor = PumpAdmissionCursor::Unix {
-                        after,
-                        after_route: progress.after_route,
-                    };
-                    return true;
-                }
-                state.pump.close_cursor = PumpAdmissionCursor::Unix {
-                    after: Some(key),
-                    after_route: None,
-                };
-            }
-            PumpAdmissionCursor::Webrtc { after, after_route } => {
-                let next_key =
-                    next_admission_key(&state.pending_runtime.webrtc_admissions, after.as_deref());
-                let Some(key) = next_key else {
-                    state.pump.close_cursor = PumpAdmissionCursor::default();
-                    return false;
-                };
-                admissions_visited += 1;
-                let progress = match state.pending_runtime.webrtc_admissions.get(&key) {
-                    Some(WebrtcTerminalAdmission::Admitted { mux, .. }) => mux
-                        .queue_closed_subscription_events_bounded(
-                            |session_id| session_close_event_decision_for(runtime, session_id),
-                            remaining_candidates,
-                            after_route.as_ref(),
-                            PUMP_MAX_ROUTE_ENTRIES_VISITED,
-                        ),
-                    _ => empty_close_event_progress(),
-                };
-                classified = classified.saturating_add(progress.classified);
-                if progress.more {
-                    state.pump.close_cursor = PumpAdmissionCursor::Webrtc {
-                        after,
-                        after_route: progress.after_route,
-                    };
-                    return true;
-                }
-                state.pump.close_cursor = PumpAdmissionCursor::Webrtc {
-                    after: Some(key),
-                    after_route: None,
-                };
-            }
-        }
     }
 }
 
@@ -5522,7 +5403,7 @@ pub(crate) struct DaemonControlState {
     pub(crate) lifecycle_counters: DaemonLifecycleCounters,
     pub(crate) maintenance: MaintenanceState,
     background: BackgroundClassScheduler,
-    pump: PumpScheduler,
+    pub(crate) pump: PumpScheduler,
     next_reconciliation: Instant,
     pub(crate) released_entity_generations: u64,
     pub(crate) released_attach_generations: u64,
@@ -6595,15 +6476,12 @@ mod tests {
             Some("client-10")
         );
         assert_eq!(next_admission_key(&admissions, Some("client-19")), None);
-        const TRANSPORT: &str = include_str!("daemon_transport.rs");
-        let close = TRANSPORT
+        const CLOSED: &str = include_str!("subscription/closed_events.rs");
+        let close = CLOSED
             .split("fn run_close_events_phase")
             .nth(1)
             .expect("close phase");
-        let close = close
-            .split("fn run_inventory_reconcile_phase")
-            .next()
-            .unwrap_or(close);
+        let close = close.split("#[cfg(test)]").next().unwrap_or(close);
         assert!(
             !close.contains("keys().find"),
             "CloseEvents must resume with BTreeMap::range"
@@ -6634,101 +6512,6 @@ mod tests {
             !pump.contains("observe_session_lifecycle"),
             "CloseEvents must not mutate lifecycle"
         );
-    }
-
-    #[test]
-    fn shutdown_session_arm_installs_exact_suppression_before_core_request() {
-        const TRANSPORT: &str = include_str!("daemon_transport.rs");
-        let arm = TRANSPORT
-            .split("DaemonRequest::ShutdownSession { session_id } => {")
-            .nth(1)
-            .expect("ShutdownSession arm")
-            .split("DaemonRequest::Drain {")
-            .next()
-            .expect("ShutdownSession arm end");
-        let unix_suppress = arm
-            .find("suppress_unix_session_close_events")
-            .expect("unix suppression");
-        let webrtc_suppress = arm
-            .find("suppress_webrtc_session_close_events")
-            .expect("webrtc suppression");
-        let core = arm
-            .find("HubClientRequest::Shutdown")
-            .expect("Core Shutdown request");
-        let stopping = arm
-            .find("ShutdownSessionClassification::Stopping")
-            .expect("Stopping classification");
-        assert!(
-            stopping < unix_suppress,
-            "Stopping must stay on the suppress fall-through, not a pre-suppress return"
-        );
-        assert!(
-            unix_suppress < core && webrtc_suppress < core,
-            "ShutdownSession must install exact-key suppression before the Core request"
-        );
-        let after_core = &arm[core..];
-        assert!(
-            !after_core.contains("suppress_unix_session_close_events")
-                && !after_core.contains("suppress_webrtc_session_close_events"),
-            "ShutdownSession must not reinstall suppression after the Core request"
-        );
-        assert!(
-            arm.contains("suppress_unix_session_close_events")
-                && TRANSPORT.contains("suppress_session_route_generations"),
-            "helpers must snapshot exact route generations, not session-wide keys"
-        );
-    }
-
-    #[test]
-    fn close_event_suppression_matrix_matches_prior_predicate() {
-        assert_eq!(
-            session_close_event_decision(Ok(SessionRegistryStateLookup::Found(
-                RegistrySessionState::Running
-            ))),
-            Some(true)
-        );
-        assert_eq!(
-            session_close_event_decision(Ok(SessionRegistryStateLookup::Found(
-                RegistrySessionState::Exited
-            ))),
-            Some(false)
-        );
-        assert_eq!(
-            session_close_event_decision(Ok(SessionRegistryStateLookup::Found(
-                RegistrySessionState::Stopping
-            ))),
-            Some(false)
-        );
-        assert_eq!(
-            session_close_event_decision(Ok(SessionRegistryStateLookup::Found(
-                RegistrySessionState::Stale
-            ))),
-            Some(false)
-        );
-        assert_eq!(
-            session_close_event_decision(Ok(SessionRegistryStateLookup::Absent)),
-            None
-        );
-        assert_eq!(
-            session_close_event_decision(Err(CoreDaemonError::Shutdown)),
-            None
-        );
-    }
-
-    #[test]
-    fn close_events_phase_source_does_not_take_journal_wake() {
-        const TRANSPORT: &str = include_str!("daemon_transport.rs");
-        let close = TRANSPORT
-            .split("fn run_close_events_phase")
-            .nth(1)
-            .expect("close phase");
-        let close = close
-            .split("fn run_inventory_reconcile_phase")
-            .next()
-            .expect("close end");
-        assert!(!close.contains("take_journal_advanced_wake"));
-        assert!(!close.contains("observe_session_lifecycle"));
-        assert!(!close.contains("observe_lifecycle_slice"));
     }
 
     #[test]

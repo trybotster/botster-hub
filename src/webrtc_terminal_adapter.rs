@@ -4,20 +4,20 @@
 //! [`TerminalFrame`] and does not inspect snapshot phases or snapshot bodies.
 //! `close` and `Drop` return without waiting on DataChannel I/O or a writer lock.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::ops::Bound;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
 
 use botster_core::contract::terminal_adapter::{
     TerminalAdapter, TerminalAdapterPressure, TerminalAdapterWriteError,
 };
-use botster_hub_client::{
-    DaemonEvent, TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER,
-    TERMINAL_SUBSCRIPTION_CLOSED_HOST_ADAPTER,
-};
+use botster_hub_client::DaemonEvent;
 use botster_terminal_protocol::TerminalFrame;
 use tokio::sync::Notify;
+
+use crate::subscription::closed_events::{
+    ClosedEventLedger, ClosedEventRoute, ClosedEventSliceProgress, ClosedHandle,
+};
 
 /// Wake that stores a permit so a write cannot be lost before the sender waits.
 #[derive(Clone)]
@@ -308,18 +308,9 @@ struct WebRtcMuxInner {
     wake: AdapterWake,
     dying: AtomicBool,
     close_events_admitted: AtomicBool,
-    routes: Mutex<BTreeMap<(String, String, u64), WebRtcMuxRoute>>,
-    pending_events: Mutex<Vec<DaemonEvent>>,
-    suppress_generations: Mutex<BTreeSet<(String, String, u64)>>,
+    routes: Mutex<BTreeMap<(String, String, u64), ClosedEventRoute<WebRtcTerminalAdapterHandle>>>,
+    closed_events: ClosedEventLedger,
     close_work: Mutex<Arc<AtomicBool>>,
-}
-
-struct WebRtcMuxRoute {
-    session_id: String,
-    subscription_id: String,
-    generation: u64,
-    handle: WebRtcTerminalAdapterHandle,
-    reported: bool,
 }
 
 impl WebRtcConnectionMux {
@@ -330,8 +321,7 @@ impl WebRtcConnectionMux {
                 dying: AtomicBool::new(false),
                 close_events_admitted: AtomicBool::new(false),
                 routes: Mutex::new(BTreeMap::new()),
-                pending_events: Mutex::new(Vec::new()),
-                suppress_generations: Mutex::new(BTreeSet::new()),
+                closed_events: ClosedEventLedger::default(),
                 close_work: Mutex::new(Arc::new(AtomicBool::new(false))),
             }),
         }
@@ -375,7 +365,7 @@ impl WebRtcConnectionMux {
             let key = (session_id.clone(), subscription_id.clone(), generation);
             routes.insert(
                 key,
-                WebRtcMuxRoute {
+                ClosedEventRoute {
                     session_id,
                     subscription_id,
                     generation,
@@ -420,9 +410,7 @@ impl WebRtcConnectionMux {
         if keys.is_empty() {
             return;
         }
-        if let Ok(mut generations) = self.inner.suppress_generations.lock() {
-            generations.extend(keys);
-        }
+        self.inner.closed_events.suppress_session_keys(keys);
     }
 
     pub(crate) fn suppress_generation(
@@ -431,27 +419,9 @@ impl WebRtcConnectionMux {
         subscription_id: impl Into<String>,
         generation: u64,
     ) {
-        if let Ok(mut generations) = self.inner.suppress_generations.lock() {
-            generations.insert((session_id.into(), subscription_id.into(), generation));
-        }
-    }
-
-    fn generation_is_suppressed(
-        &self,
-        session_id: &str,
-        subscription_id: &str,
-        generation: u64,
-    ) -> bool {
         self.inner
-            .suppress_generations
-            .lock()
-            .is_ok_and(|generations| {
-                generations.contains(&(
-                    session_id.to_string(),
-                    subscription_id.to_string(),
-                    generation,
-                ))
-            })
+            .closed_events
+            .suppress_generation(session_id, subscription_id, generation);
     }
 
     #[cfg(test)]
@@ -470,116 +440,42 @@ impl WebRtcConnectionMux {
 
     pub(crate) fn queue_closed_subscription_events_bounded(
         &self,
-        mut classify: impl FnMut(&str) -> Option<bool>,
+        classify: impl FnMut(&str) -> Option<bool>,
         max_candidates: usize,
         after_route: Option<&(String, String, u64)>,
         max_entries_visited: usize,
-    ) -> crate::unix_terminal_adapter::ClosedEventSliceProgress {
-        if self.is_dying() {
-            if let Ok(mut routes) = self.inner.routes.lock() {
-                for route in routes.values_mut() {
-                    route.reported = true;
-                }
-            }
-            return crate::unix_terminal_adapter::ClosedEventSliceProgress {
+    ) -> ClosedEventSliceProgress {
+        let Ok(mut routes) = self.inner.routes.lock() else {
+            return ClosedEventSliceProgress {
                 classified: 0,
                 more: false,
                 after_route: None,
             };
-        }
-        let mut queued = Vec::new();
-        let mut classified = 0;
-        let mut visited = 0;
-        let mut more = false;
-        let mut last_visited = after_route.cloned();
-        if let Ok(mut routes) = self.inner.routes.lock() {
-            let start = match after_route {
-                Some(after) => Bound::Excluded(after.clone()),
-                None => Bound::Unbounded,
-            };
-            for (key, route) in routes.range_mut((start, Bound::Unbounded)) {
-                if visited >= max_entries_visited {
-                    more = true;
-                    break;
-                }
-                if !route.reported && route.handle.is_closed() && classified >= max_candidates {
-                    more = true;
-                    break;
-                }
-                visited += 1;
-                last_visited = Some(key.clone());
-                if route.reported || !route.handle.is_closed() {
-                    continue;
-                }
-                classified += 1;
-                if self.generation_is_suppressed(
-                    &route.session_id,
-                    &route.subscription_id,
-                    route.generation,
-                ) {
-                    route.reported = true;
-                    continue;
-                }
-                match classify(&route.session_id) {
-                    None => continue,
-                    Some(false) => {
-                        route.reported = true;
-                        continue;
-                    }
-                    Some(true) => route.reported = true,
-                }
-                let reason = if route.handle.host_closed() {
-                    TERMINAL_SUBSCRIPTION_CLOSED_HOST_ADAPTER
-                } else {
-                    TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER
-                };
-                queued.push(DaemonEvent::TerminalSubscriptionClosed {
-                    session_id: route.session_id.clone(),
-                    subscription_id: route.subscription_id.clone(),
-                    generation: route.generation,
-                    reason: reason.to_string(),
-                });
-            }
-        }
-        if !queued.is_empty() {
-            if let Ok(mut pending) = self.inner.pending_events.lock() {
-                pending.extend(queued);
-            }
-            self.inner.wake.wake();
-        }
-        crate::unix_terminal_adapter::ClosedEventSliceProgress {
-            classified,
-            more,
-            after_route: last_visited,
-        }
+        };
+        let wake = self.inner.wake.clone();
+        self.inner
+            .closed_events
+            .queue_closed_subscription_events_bounded(
+                self.is_dying(),
+                &mut routes,
+                classify,
+                max_candidates,
+                after_route,
+                max_entries_visited,
+                || wake.wake(),
+            )
     }
 
     pub(crate) fn has_pending_event(&self) -> bool {
-        self.inner
-            .pending_events
-            .lock()
-            .ok()
-            .is_some_and(|pending| !pending.is_empty())
+        self.inner.closed_events.has_pending_event()
     }
 
     pub(crate) fn pop_pending_event(&self) -> Option<DaemonEvent> {
-        self.inner
-            .pending_events
-            .lock()
-            .ok()
-            .and_then(|mut pending| {
-                if pending.is_empty() {
-                    None
-                } else {
-                    Some(pending.remove(0))
-                }
-            })
+        self.inner.closed_events.pop_pending_event()
     }
 
     pub(crate) fn drop_pending_events(&self) {
-        if let Ok(mut pending) = self.inner.pending_events.lock() {
-            pending.clear();
-        }
+        self.inner.closed_events.drop_pending_events();
     }
 
     pub(crate) fn snapshot_writes(
@@ -641,6 +537,16 @@ impl WebRtcTerminalAdapterHandle {
     }
 }
 
+impl ClosedHandle for WebRtcTerminalAdapterHandle {
+    fn is_closed(&self) -> bool {
+        WebRtcTerminalAdapterHandle::is_closed(self)
+    }
+
+    fn host_closed(&self) -> bool {
+        WebRtcTerminalAdapterHandle::host_closed(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -649,6 +555,7 @@ mod tests {
     use botster_core_test_support::terminal_adapter::{
         TerminalAdapterHarnessDriver, assert_terminal_adapter_conformance,
     };
+    use botster_hub_client::TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER;
 
     struct WebRtcTerminalAdapterDriver {
         adapter: WebRtcTerminalAdapter,

@@ -735,7 +735,7 @@ fn attach_ready_precedes_history_finish() {
 #[test]
 fn shutdown_suppresses_exact_route_generations_before_core_teardown() {
     let _guard = daemon_test_guard();
-    let source = hub_source("src/daemon_transport.rs");
+    let source = hub_source("src/subscription/closed_events.rs");
     assert!(
         source.contains("fn shutdown_session_arm_installs_exact_suppression_before_core_request"),
         "unit suppression-before-teardown proof must remain"
