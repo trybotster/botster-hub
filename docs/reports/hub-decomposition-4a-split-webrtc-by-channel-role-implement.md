@@ -8,13 +8,14 @@
 | `target_id` | `tgt_7e208a0c76a44980a83b63af976b1f22` |
 | Ticket | `ticket_1787894421_128594` |
 | Run | `run_1787997552_597206` |
-| Step | `botster_stack_implement` (`run_step_1788023859_574582`) |
-| Approved plan | `docs/plans/hub-decomposition-4a-split-webrtc-by-channel-role.md` revision 3 |
+| Step | `botster_stack_implement` (`run_step_1788026853_755448`, review-return) |
+| Approved plan | `docs/plans/hub-decomposition-4a-split-webrtc-by-channel-role.md` implementation resync after `review_1788026828_608920` |
 | Merge policy | direct into `main`; do not create a PR |
 | Base | `origin/main` `ddb2de9cdc11a2e3a050e477cf396685686887f2` |
 | Move commit | `15b35e3` |
 | Ownership-guard commit | `a808092` |
 | Extra-channel source retarget | `e02ae38` |
+| Review-return commit | recorded with this report |
 | Runtime-teardown class | applies; every lens is preserved as a survive-the-move invariant |
 
 Independent routing: `project_pipelines_current_context` ticket/run `target_id` and `list_spawn_targets` both map `tgt_7e208a0c76a44980a83b63af976b1f22` to `trybotster/botster-hub`. The approved plan used the same routing. Implementation stayed in this run worktree.
@@ -48,6 +49,9 @@ Independent routing: `project_pipelines_current_context` ticket/run `target_id` 
 - [[implementation artifacts must match actual git state]]
 - [[implementation steps must persist report artifacts for review]]
 - [[pipeline vault checklists must cite exact resolvable note titles]]
+- [[implementation deviations must resync committed plan acceptance checks]]
+- [[pipeline artifacts should use path neutral worktree references]]
+- [[botster review and verify must scan all committed artifacts for pii]]
 - [[botster Hub pipeline shells can override RUSTUP TOOLCHAIN below the CI pin]]
 - [[Hub official gates must not set CARGO TARGET DIR]]
 - [[Hub suite runs prebuild the session worker before the locked test wrapper]]
@@ -133,14 +137,14 @@ No lens was dropped to follow-up.
 
 ## Deviations from plan
 
-1. **Three product commits, not two.** The plan asked for one compiling move-only commit plus one follow-up for new guards. After the first suite run, extra-channel source assertions still scanned `peer.rs` for strings that moved to `subscription_channel.rs`. That retarget is `e02ae38`. It is guard retargeting made necessary by the split, not a behavior change.
-2. **Two new leaf test names.** `webrtc_state_machines_have_one_owner_file` and `webrtc_transport_does_not_declare_admission_or_unix_policy_types` were added for acceptance checks 3 and 5. Every moved leaf name is preserved. No moved proof was removed.
-3. **Harness file.** The shared harness is `src/transport/webrtc/test_support.rs`, declared from `webrtc.rs`. `FakeDataChannel` is in that harness because more than one role file uses it.
-4. **Live `PeerHarness` tests stay in `peer.rs`.** They drive `LocalWebrtcTransport` and peer teardown, including subscribe-events lanes whose ingress is in `control_channel.rs`.
-5. **`signaling.rs` has no dedicated `#[test]` functions.** Signaling is covered through `PeerHarness::signal_peer`.
-6. **`pub(crate)` widening** on types, fields, and helpers that crossed module boundaries. Required by the split. No item became `pub`.
-7. **Architecture summary `transport` row description** now names WebRTC. Classification remains `Internal` / `AlreadyInternal`. The `local_webrtc` crate-root row is gone.
-8. **Extra-channel production source guard** now reads `peer.rs` for the one-shot claim and `on_data_channel` call, and `subscription_channel.rs` for the reject eprintln and close-marker observation. The claim needle string is unchanged.
+1. **Three product commits, not two, plus this review-return.** Extra-channel source assertions needed `e02ae38`. Review then required ablation evidence, plan resync, and PII cleanup.
+2. **Two new leaf test names.** `webrtc_state_machines_have_one_owner_file` and `webrtc_transport_does_not_declare_admission_or_unix_policy_types` were added for acceptance checks 3 and 5. Every moved leaf name is preserved.
+3. **Harness file, now a plan contract.** `src/transport/webrtc/test_support.rs` is the body of `#[cfg(test)] pub(crate) mod test_support`. The committed plan now names that file. It is in the forbidden-construct list and the check-13 ablation matrix. It is not a seventh role file.
+4. **Live `PeerHarness` tests stay in `peer.rs`.**
+5. **`signaling.rs` has no dedicated `#[test]` functions.**
+6. **`pub(crate)` widening** on types, fields, and helpers that crossed module boundaries. No item became `pub`.
+7. **Architecture summary `transport` row description** now names WebRTC.
+8. **Extra-channel production source guard** reads `peer.rs` for the claim needle and `subscription_channel.rs` for the reject eprintln. The committed plan check 4 now states that split.
 
 ## Tests and downstream proof run
 
@@ -165,7 +169,7 @@ Base nine expressions, accounted by row:
 
 | # | Base | HEAD |
 | --- | --- | --- |
-| 1 | `src/lib.rs` `include_str!("local_webrtc.rs")` | replaced by seven `src/transport/webrtc/**` entries |
+| 1 | `src/lib.rs` `include_str!("local_webrtc.rs")` | replaced by eight `src/transport/webrtc/**` entries, including `test_support.rs` |
 | 2 | `src/host_control_fair_write.rs` `include_str!("local_webrtc.rs")` | `include_str!("transport/webrtc/control_channel.rs")` |
 | 3 | `src/local_webrtc.rs` self-scan | `src/transport/webrtc/peer.rs` `include_str!("peer.rs")` |
 | 4 | `src/transport/shared.rs` adapter include | `include_str!("webrtc/adapter.rs")` |
@@ -175,7 +179,39 @@ Base nine expressions, accounted by row:
 | 8 | adapter production include | `include_str!("../../src/transport/webrtc/adapter.rs")` |
 | 9 | sibling test-file include | unchanged `include_str!("webrtc_terminal_adapter.rs")` |
 
-Additional necessary retargets: extra-channel close-marker strings now also scan `subscription_channel.rs`; `event_plane_saturation.rs` reads adapter.rs and peer.rs; `no_lua_dispatch` lists the seven new files.
+Additional necessary retargets: extra-channel close-marker strings now also scan `subscription_channel.rs`; `event_plane_saturation.rs` reads adapter.rs and peer.rs; `no_lua_dispatch` lists every new WebRTC file, including `test_support.rs`.
+
+### Source-guard ablations (checks 13, 16, 17)
+
+Exact filter, one-test baseline first:
+
+```text
+BOTSTER_ENV=test cargo test --locked --package botster-hub --lib \
+  tests::production_sources_reject_terminal_drain_and_snapshot_phase_decode -- --exact
+```
+
+Baseline: `running 1 test`, `1 passed`, exit 0. `RUSTUP_TOOLCHAIN=1.97.0`. `CARGO_TARGET_DIR` unset. Each arm restored the file before the next arm.
+
+Check 13, production GHOSTSNP in each listed file. Every arm exit 101 and named that file:
+
+| File | Result |
+| --- | --- |
+| `src/transport/webrtc.rs` | `src/transport/webrtc.rs production source must not contain GHOSTSNP` |
+| `src/transport/webrtc/peer.rs` | same, names `peer.rs` |
+| `src/transport/webrtc/signaling.rs` | same, names `signaling.rs` |
+| `src/transport/webrtc/control_channel.rs` | same, names `control_channel.rs` |
+| `src/transport/webrtc/subscription_channel.rs` | same, names `subscription_channel.rs` |
+| `src/transport/webrtc/delivery.rs` | same, names `delivery.rs` |
+| `src/transport/webrtc/adapter.rs` | same, names `adapter.rs` |
+| `src/transport/webrtc/test_support.rs` | same, names `test_support.rs` |
+
+Check 16, GHOSTSNP after the final `#[cfg(test)]` block. Every arm exit 101 and named that file: `webrtc.rs`, `peer.rs`, `control_channel.rs`, `subscription_channel.rs`, `delivery.rs`, `adapter.rs`. `signaling.rs` has no test block. `test_support.rs` is the harness file; check 13 covers it.
+
+Restore after the last arm: `running 1 test`, `1 passed`, exit 0.
+
+### PII scan
+
+`rg` over the 4a plan and this report for `/Users/`, `/home/jason`, `botster-sessions`, and a personal email returned no matches. The vault inbox capture is named by title, not by a local filesystem path.
 
 ### Downstream proof (check 24)
 
@@ -185,11 +221,19 @@ Zero cost. `botster_hub::LocalWebrtcError` and `botster_hub::LocalWebrtcTranspor
 
 `LocalWebrtcHandler::on_data_channel` in `peer.rs` still claims the first channel and calls `run_data_channel` in `control_channel.rs`. Extra channels call `reject_extra_data_channel` in `subscription_channel.rs`. Peer close still uses `LOCAL_WEBRTC_PEER_CLOSE_BOUND` then `cleanup_once` / `remove_peer`. The full-suite byte-exact test and the extra-channel reject tests drive those production functions.
 
+## Review-return findings
+
+| Finding | Disposition |
+| --- | --- |
+| `finding_1788026828_663575` missing per-file ablations | Ran and recorded checks 13, 16, and 17. See the ablation table above. |
+| `finding_1788026828_613962` plan/harness mismatch | Kept `test_support.rs`. Resynced the committed plan: assumption 2, affected files, and checks 12–16. Added the file to the `src/lib.rs` inventory and the `no_lua_dispatch` list. |
+| `finding_1788026828_144063` local user path | Replaced the vault inbox absolute path with the inbox title. PII scan of the 4a plan and this report is clean. |
+
 ## Unverified behavior or residual risk
 
-- Per-file GHOSTSNP ablations for the seven new guard-list entries (checks 13, 16, 17) were not physically seeded in this visit. The locked suite includes `production_sources_reject_terminal_drain_and_snapshot_phase_decode`, which scans every listed file and asserts `skip_open_at_eof = false`. Verify should still run one red-on-revert arm per added file with a one-test baseline.
 - `signaling.rs` has no unit tests of its own. Coverage is through live `PeerHarness` signaling.
 - Load-only regressions outside the suite host used here remain possible. The required absolute suite gate passed on this host, including `webrtc_terminal_output_is_byte_exact`.
+- This review-return did not rerun the full `./test.sh --locked` after adding `test_support.rs` to `include_str!`. It did rerun the exact production-source guard (green), both ownership guards, and `cargo clippy --workspace --all-targets --locked -- -D warnings`.
 
 ## Missing vault guidance discovered
 
