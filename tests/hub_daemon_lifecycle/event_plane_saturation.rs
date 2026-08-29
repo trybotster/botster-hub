@@ -173,7 +173,7 @@ fn event_plane_saturation_source_guards_hold() {
     let unix = fs::read_to_string(root.join("src/unix_terminal_adapter.rs")).expect("unix adapter");
     let webrtc =
         fs::read_to_string(root.join("src/webrtc_terminal_adapter.rs")).expect("webrtc adapter");
-    let attach = fs::read_to_string(root.join("src/daemon_attach_stream.rs")).expect("attach");
+    let attach = fs::read_to_string(root.join("src/subscription/attach_routes.rs")).expect("attach");
     for (name, source) in [
         ("unix", unix.as_str()),
         ("webrtc", webrtc.as_str()),
