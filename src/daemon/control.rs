@@ -15,7 +15,6 @@ pub(crate) mod webrtc;
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::Arc;
 
 use botster_core::RequestId;
 use botster_hub_client::{
@@ -23,9 +22,6 @@ use botster_hub_client::{
     DaemonOperatorError, DaemonRequest, DaemonResponse, DaemonResponseKind,
 };
 
-use crate::admission::unix_hello::{
-    HostCompatibilityRecord, UnixTerminalAdmission, WebrtcTerminalAdmission,
-};
 use crate::client_api_dto::response::{
     daemon_events, daemon_hub_update, daemon_hub_update_execution, daemon_local_webrtc_answer,
     daemon_response_base,
@@ -49,7 +45,6 @@ use crate::subscription::attach_routes::{
     AttachedSubscription, AttachedSubscriptionChange, attached_subscription_change_for_response,
     overlay_live_attach_occupancy, record_attached_subscription_change,
 };
-use crate::subscription::entity::{entity_subscription_error, register_entity_subscription};
 use crate::transport::webrtc::LocalWebrtcAttachedSubscription;
 use crate::transport::webrtc::LocalWebrtcSignalRequest;
 use crate::{
@@ -157,134 +152,44 @@ pub(crate) fn handle_control_message(
             admission,
             reply_tx,
             host_required_features,
-        } => {
-            if let UnixTerminalAdmission::Admitted { mux, .. } = &admission {
-                mux.bind_close_work(Arc::clone(&state.pending_runtime.close_work));
-            }
-            state.pending_runtime.admission.host_compatibility.insert(
-                client_id.clone(),
-                HostCompatibilityRecord {
-                    required_features: host_required_features,
-                },
-            );
-            state
-                .pending_runtime
-                .admission
-                .unix_admissions
-                .insert(client_id, admission);
-            let _ = reply_tx.send(());
-            false
-        }
+        } => connection::register_unix_admission(
+            state,
+            client_id,
+            admission,
+            reply_tx,
+            host_required_features,
+        ),
         ControlMessage::RegisterWebrtcAdmission {
             grant_id,
             admission,
             host_required_features,
-        } => {
-            if daemon.local_webrtc().has_live_peer(&grant_id) {
-                if let WebrtcTerminalAdmission::Admitted { mux, .. } = &admission {
-                    mux.bind_close_work(Arc::clone(&state.pending_runtime.close_work));
-                }
-                state.pending_runtime.admission.host_compatibility.insert(
-                    grant_id.clone(),
-                    HostCompatibilityRecord {
-                        required_features: host_required_features,
-                    },
-                );
-                state
-                    .pending_runtime
-                    .admission
-                    .webrtc_admissions
-                    .insert(grant_id, admission);
-            }
-            false
-        }
+        } => connection::register_webrtc_admission(
+            daemon,
+            state,
+            grant_id,
+            admission,
+            host_required_features,
+        ),
         ControlMessage::SubscribeEntities {
             entity_type,
             subscription_id,
             frame_tx,
             reply_tx,
             grant_id,
-        } => {
-            // Late WebRTC control messages after PeerClosed must not recreate peer-owned state.
-            if let Some(grant_id) = grant_id.as_deref()
-                && !daemon.local_webrtc().has_live_peer(grant_id)
-            {
-                let _ = reply_tx.send(Ok(entity_subscription_error(
-                    "local_webrtc_peer_gone",
-                    &subscription_id,
-                    "local WebRTC peer is no longer live",
-                )));
-                return false;
-            }
-            let response = register_entity_subscription(
-                daemon,
-                state,
-                entity_type,
-                subscription_id,
-                frame_tx,
-                grant_id,
-            );
-            let _ = reply_tx.send(response);
-            false
-        }
+        } => entities::subscribe(
+            daemon,
+            state,
+            entity_type,
+            subscription_id,
+            frame_tx,
+            reply_tx,
+            grant_id,
+        ),
         ControlMessage::UnsubscribeEntities {
             subscription_id,
             reply_tx,
             grant_id,
-        } => {
-            if let Some(grant_id) = grant_id.as_deref()
-                && !daemon.local_webrtc().has_live_peer(grant_id)
-            {
-                // Peer already gone: owner-checked residual cleanup only. Never delete a row now
-                // owned by a different live grant (subscription-id reuse after PeerClosed).
-                let should_remove = match state.entity_subscriptions.get(&subscription_id) {
-                    None => false,
-                    Some(subscription) => match subscription.owner_grant_id.as_deref() {
-                        None => true,
-                        Some(owner) => owner == grant_id,
-                    },
-                };
-                if should_remove
-                    && state
-                        .entity_subscriptions
-                        .remove(&subscription_id)
-                        .is_some()
-                {
-                    state.lifecycle_counters.live_entity_subscriptions = state
-                        .lifecycle_counters
-                        .live_entity_subscriptions
-                        .saturating_sub(1);
-                    state.released_entity_generations =
-                        state.released_entity_generations.saturating_add(1);
-                }
-                if let Some(reply_tx) = reply_tx {
-                    // Idempotent unsubscribed reply for the stale client even when the row is
-                    // preserved for a replacement owner.
-                    let _ = reply_tx.send(Ok(daemon_response_base(
-                        DaemonResponseKind::EntityUnsubscribed,
-                    )));
-                }
-                return false;
-            }
-            if state
-                .entity_subscriptions
-                .remove(&subscription_id)
-                .is_some()
-            {
-                state.lifecycle_counters.live_entity_subscriptions = state
-                    .lifecycle_counters
-                    .live_entity_subscriptions
-                    .saturating_sub(1);
-                state.released_entity_generations =
-                    state.released_entity_generations.saturating_add(1);
-            }
-            if let Some(reply_tx) = reply_tx {
-                let _ = reply_tx.send(Ok(daemon_response_base(
-                    DaemonResponseKind::EntityUnsubscribed,
-                )));
-            }
-            false
-        }
+        } => entities::unsubscribe(daemon, state, subscription_id, reply_tx, grant_id),
         ControlMessage::Request {
             request,
             reply_tx,
@@ -1204,4 +1109,136 @@ pub(crate) fn handle_runtime_control_request(
         observability,
         request,
     )
+}
+
+#[cfg(test)]
+mod ownership_guards {
+    fn daemon_sources() -> Vec<(String, String)> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/daemon");
+        let mut pending = vec![root.clone()];
+        let mut files = Vec::new();
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read src/daemon") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                    continue;
+                }
+                let rel = path
+                    .strip_prefix(root.parent().expect("src"))
+                    .expect("under src")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let source = std::fs::read_to_string(&path).expect("read");
+                files.push((format!("src/{rel}"), source));
+            }
+        }
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        files
+    }
+
+    #[test]
+    fn daemon_modules_reject_unix_transport_mechanism_symbols() {
+        for (path, source) in daemon_sources() {
+            let production = source.split("mod tests").next().unwrap_or(&source);
+            for needle in [
+                "async fn accept_connections",
+                "async fn handle_connection_async",
+                "struct MuxWriteState",
+                "async fn read_async_frame",
+                "fn prepare_socket_path",
+                "fn unix_event_flush_stalled",
+            ] {
+                assert!(
+                    !production.contains(needle),
+                    "{path} must not contain {needle}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn webrtc_liveness_gates_remain_four_distinct_sites() {
+        let connection = include_str!("control/connection.rs");
+        let control = include_str!("control.rs");
+        let entities = include_str!("control/entities.rs");
+        assert!(
+            connection.contains("has_live_peer(&grant_id)"),
+            "RegisterWebrtcAdmission insert gate must stay in connection.rs"
+        );
+        assert!(
+            !connection.contains("local_webrtc_peer_gone_request_error"),
+            "connection insert gate drops rather than returning a request error"
+        );
+        let request_gate = control
+            .split("ControlMessage::Request {")
+            .nth(1)
+            .expect("Request arm")
+            .split("        ControlMessage::HubUpdateCheckCompleted")
+            .next()
+            .expect("Request arm end");
+        assert!(
+            request_gate.contains("has_live_peer(grant_id)"),
+            "Request pre-dispatch gate must stay in control.rs"
+        );
+        assert!(
+            request_gate.contains("local_webrtc_peer_gone_request_error"),
+            "Request gate must use local_webrtc_peer_gone_request_error"
+        );
+        let sessions_call = request_gate.find("handle_control_request");
+        let live_peer = request_gate.find("has_live_peer(grant_id)");
+        assert!(
+            live_peer.is_some()
+                && sessions_call.is_some()
+                && live_peer.expect("gate") < sessions_call.expect("delegate"),
+            "Request has_live_peer gate must precede family delegation"
+        );
+        assert!(
+            entities.contains("has_live_peer(grant_id)")
+                && entities.contains("local_webrtc_peer_gone"),
+            "SubscribeEntities reply gate must stay in entities.rs"
+        );
+        assert!(
+            entities.contains("EntityUnsubscribed") && entities.contains("owner_grant_id"),
+            "UnsubscribeEntities owner-checked gate must stay in entities.rs"
+        );
+    }
+
+    #[test]
+    fn daemon_control_does_not_remove_grant_rows() {
+        for (path, source) in daemon_sources() {
+            let production = source.split("#[cfg(test)]").next().unwrap_or(&source);
+            assert!(
+                !production.contains("prune_expired_grants"),
+                "{path} must not prune grant rows"
+            );
+            assert!(
+                !production.contains("GrantRegistry"),
+                "{path} must not name GrantRegistry"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_dispatcher_delegates_to_sessions() {
+        let dispatcher = include_str!("control.rs");
+        let runtime = dispatcher
+            .split("pub(crate) fn handle_runtime_control_request(")
+            .nth(1)
+            .expect("runtime dispatcher")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("runtime dispatcher end");
+        assert!(
+            runtime.contains("sessions::handle_runtime("),
+            "handle_runtime_control_request must delegate"
+        );
+        assert!(
+            !runtime.contains("HubClientApi"),
+            "runtime dispatcher must not construct HubClientApi"
+        );
+    }
 }

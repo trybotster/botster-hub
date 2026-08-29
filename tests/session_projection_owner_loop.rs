@@ -202,7 +202,8 @@ fn owner_loop_and_projection_sources_reject_unbounded_and_product_policy() {
                 .contains("lifecycle_baseline("),
             "{relative} must not call unbounded lifecycle_baseline"
         );
-        if relative != "src/subscription/entity.rs" && relative != "src/daemon/control.rs" {
+        if relative != "src/subscription/entity.rs" && relative != "src/daemon/control/sessions.rs"
+        {
             for needle in [
                 "botster-terminal-protocol-client",
                 "ProcessExited",
