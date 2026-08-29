@@ -3,11 +3,12 @@
 use crate::HubDaemon;
 use crate::client_api_dto::response::daemon_response_base;
 use crate::daemon::control::message::ControlReplySender;
+use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
 use crate::daemon::owner_loop::DaemonControlState;
 use crate::subscription::entity::{
     EntityFrameSender, entity_subscription_error, register_entity_subscription,
 };
-use botster_hub_client::DaemonResponseKind;
+use botster_hub_client::{DaemonRequest, DaemonResponse, DaemonResponseKind};
 
 pub(crate) fn subscribe(
     daemon: &mut HubDaemon,
@@ -98,4 +99,15 @@ pub(crate) fn unsubscribe(
         )));
     }
     false
+}
+
+pub(crate) fn reject_json_request(request: DaemonRequest) -> DaemonTransportResult<DaemonResponse> {
+    match request {
+        DaemonRequest::SubscribeEntities { .. } | DaemonRequest::UnsubscribeEntities { .. } => {
+            Err(DaemonTransportError::Protocol(
+                "entity subscriptions require the held-open stream handler",
+            ))
+        }
+        _ => unreachable!("entity family received a non-entity request"),
+    }
 }

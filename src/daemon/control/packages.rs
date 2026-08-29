@@ -9,7 +9,8 @@ use botster_core::{PackageSource, RunnableEntrypointKind, RunnableEntrypointLaun
 use botster_hub_client::{
     DaemonAvailablePackage, DaemonCapability, DaemonPackageCompatibility, DaemonPackageDiagnostic,
     DaemonPackageInstallEffect, DaemonPackageInstallPlan, DaemonPackagePin,
-    DaemonPackageUpdateStatus, DaemonResolvedAppLaunch, DaemonResponse, DaemonResponseKind,
+    DaemonPackageUpdateStatus, DaemonRequest, DaemonResolvedAppLaunch, DaemonResponse,
+    DaemonResponseKind,
 };
 
 use crate::HubDaemon;
@@ -21,8 +22,8 @@ use crate::client_api_dto::package::{
 };
 use crate::client_api_dto::response::{
     daemon_apps, daemon_available_packages, daemon_package_install_plan, daemon_package_navigation,
-    daemon_package_update_status, daemon_packages, daemon_plugin_lifecycle,
-    daemon_resolved_app_launch, daemon_resolved_package_route,
+    daemon_package_update_status, daemon_packages, daemon_resolved_app_launch,
+    daemon_resolved_package_route,
 };
 use crate::daemon::control::request_id;
 use crate::daemon::error::{
@@ -41,6 +42,96 @@ use crate::{
     HubConfig, PackageAction, PackageAdmissionReason, PackageDecision, PackageRegistry,
     PackageRegistryError, PackageState, resolve_foreground_launch_contract,
 };
+
+pub(crate) fn handle_request(
+    daemon: &mut HubDaemon,
+    request: DaemonRequest,
+) -> DaemonTransportResult<DaemonResponse> {
+    match request {
+        DaemonRequest::ListApps => list_apps_response(daemon),
+        DaemonRequest::ResolveAppLaunch {
+            package_name,
+            entrypoint_id,
+        } => resolve_app_launch_response(daemon, &package_name, &entrypoint_id),
+        DaemonRequest::ResolvePackageRoute {
+            package_name,
+            route_id,
+        } => resolve_package_route_response(daemon, &package_name, &route_id),
+        DaemonRequest::ListPackageNavigation => list_package_navigation_response(daemon),
+        DaemonRequest::ListPackages => list_packages_response(daemon),
+        DaemonRequest::ListAvailablePackages { registry_path } => {
+            available_packages_response(daemon, registry_path)
+        }
+        DaemonRequest::InspectAvailablePackage {
+            registry_path,
+            entry_id,
+        } => inspect_available_package_response(daemon, registry_path, &entry_id),
+        DaemonRequest::PreviewPackageInstall {
+            registry_path,
+            entry_id,
+        } => preview_package_install_response(daemon, registry_path, &entry_id),
+        DaemonRequest::InstallPackageRegistryEntry {
+            registry_path,
+            entry_id,
+        } => mutations::install_registry_package(daemon, registry_path, entry_id),
+        DaemonRequest::InstallPackageLocalPath { path } => {
+            mutations::install_local_package(daemon, path)
+        }
+        DaemonRequest::CheckPackageUpdate { package_name } => {
+            check_package_update_response(daemon, &package_name)
+        }
+        DaemonRequest::PreviewPackageUpdate { package_name, pin } => {
+            preview_package_update_response(daemon, &package_name, pin)
+        }
+        DaemonRequest::ApplyPackageUpdate { package_name, pin } => {
+            mutations::apply_package_update(daemon, package_name, pin)
+        }
+        DaemonRequest::ShowPackage { package_name } => show_package_response(daemon, &package_name),
+        DaemonRequest::SetPackageConfiguration {
+            package_name,
+            values,
+        } => mutations::configure_package(daemon, package_name, values),
+        DaemonRequest::ReloadPackage { package_name } => {
+            mutations::reload_package(daemon, package_name)
+        }
+        DaemonRequest::RefreshLocalPackages => mutations::refresh_local_packages(daemon),
+        DaemonRequest::EnablePackageLocalPath { path } => {
+            mutations::enable_package_local_path(daemon, path)
+        }
+        DaemonRequest::EnablePackage { package_name } => {
+            mutations::enable_package(daemon, package_name)
+        }
+        DaemonRequest::DisablePackage { package_name } => {
+            mutations::disable_package(daemon, package_name)
+        }
+        DaemonRequest::RemovePackage { package_name } => {
+            mutations::remove_package(daemon, package_name)
+        }
+        DaemonRequest::StartPackageEntrypoint {
+            package_name,
+            entrypoint_id,
+            environment_overrides,
+        } => start_package_entrypoint_response(
+            daemon,
+            package_name,
+            entrypoint_id,
+            environment_overrides,
+        ),
+        DaemonRequest::StopPackageEntrypoint {
+            package_name,
+            entrypoint_id,
+        } => stop_package_entrypoint_response(daemon, package_name, entrypoint_id),
+        DaemonRequest::RestartPackageEntrypoint {
+            package_name,
+            entrypoint_id,
+        } => restart_package_entrypoint_response(daemon, package_name, entrypoint_id),
+        DaemonRequest::PackageEntrypointStatus {
+            package_name,
+            entrypoint_id,
+        } => package_entrypoint_status_response(daemon, package_name, entrypoint_id),
+        _ => unreachable!("package family received a non-package request"),
+    }
+}
 
 pub(crate) fn list_packages_response(
     daemon: &mut HubDaemon,
@@ -321,25 +412,83 @@ pub(crate) fn show_package_response(
     Ok(daemon_packages(vec![package]))
 }
 
-pub(crate) fn plugin_lifecycle_response(
+pub(crate) fn start_package_entrypoint_response(
     daemon: &mut HubDaemon,
+    package_name: String,
+    entrypoint_id: String,
+    environment_overrides: BTreeMap<String, String>,
 ) -> DaemonTransportResult<DaemonResponse> {
+    let config = daemon
+        .runtime()
+        .ok_or(DaemonTransportError::DaemonNotRunning)?
+        .config()
+        .clone();
     let packages = daemon.package_registry().clone();
-    let api = HubClientApi::local_operator("botster-hub-daemon-socket");
-    let Some(runtime) = daemon.runtime_mut() else {
-        return Err(DaemonTransportError::DaemonNotRunning);
-    };
-    let response = api.handle_request(
-        runtime,
+    let launch = supervised_launch_contract(
+        &config,
         &packages,
-        HubClientRequest::PluginLifecycleStatus {
-            request_id: request_id("daemon-plugin-lifecycle-status"),
-        },
+        &package_name,
+        &entrypoint_id,
+        &environment_overrides,
     )?;
-    let HubClientResponseBody::PluginLifecycle(report) = response.body else {
-        return Err(DaemonTransportError::UnexpectedResponse);
-    };
-    Ok(daemon_plugin_lifecycle(report))
+    daemon.entrypoint_supervisor().start(
+        &packages,
+        &package_name,
+        &entrypoint_id,
+        &launch.args,
+        &launch.environment,
+    )?;
+    show_package_response(daemon, &package_name)
+}
+
+pub(crate) fn stop_package_entrypoint_response(
+    daemon: &mut HubDaemon,
+    package_name: String,
+    entrypoint_id: String,
+) -> DaemonTransportResult<DaemonResponse> {
+    daemon
+        .entrypoint_supervisor()
+        .stop(&package_name, &entrypoint_id);
+    show_package_response(daemon, &package_name)
+}
+
+pub(crate) fn restart_package_entrypoint_response(
+    daemon: &mut HubDaemon,
+    package_name: String,
+    entrypoint_id: String,
+) -> DaemonTransportResult<DaemonResponse> {
+    let config = daemon
+        .runtime()
+        .ok_or(DaemonTransportError::DaemonNotRunning)?
+        .config()
+        .clone();
+    let packages = daemon.package_registry().clone();
+    let launch = supervised_launch_contract(
+        &config,
+        &packages,
+        &package_name,
+        &entrypoint_id,
+        &BTreeMap::new(),
+    )?;
+    daemon.entrypoint_supervisor().restart(
+        &packages,
+        &package_name,
+        &entrypoint_id,
+        &launch.args,
+        &launch.environment,
+    )?;
+    show_package_response(daemon, &package_name)
+}
+
+pub(crate) fn package_entrypoint_status_response(
+    daemon: &mut HubDaemon,
+    package_name: String,
+    entrypoint_id: String,
+) -> DaemonTransportResult<DaemonResponse> {
+    daemon
+        .entrypoint_supervisor()
+        .status(&package_name, &entrypoint_id);
+    show_package_response(daemon, &package_name)
 }
 
 pub(crate) fn package_decision_response(

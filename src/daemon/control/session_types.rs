@@ -3,13 +3,26 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use botster_core::SessionId;
+use botster_hub_client::{DaemonRequest, DaemonResponse};
 use serde_json::Value;
 
 use crate::HubDaemon;
-use crate::client_api_dto::session::daemon_session_type_from_client;
-use crate::daemon::control::request_id;
+use crate::client_api::HubClientApi;
+use crate::client_api_dto::response::{
+    daemon_resolved_session_type, daemon_session_type_definition, daemon_session_types,
+    daemon_spawned,
+};
+use crate::client_api_dto::session::{
+    daemon_session_from_client, daemon_session_type_from_client,
+    session_type_definition_from_daemon, session_type_mutation_source_from_daemon,
+    session_type_request_from_daemon,
+};
+use crate::daemon::control::{DaemonObservability, request_id};
 use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
+use crate::daemon::owner_loop::PendingRuntimeState;
 use crate::persistence::{FileHubStateStore, HubStateStore};
+use crate::{HubClientRequest, HubClientResponseBody};
 
 pub(crate) fn session_type_entity_snapshot(
     daemon: &mut HubDaemon,
@@ -125,4 +138,176 @@ pub(crate) fn force_advance_session_type_generation(
     })?;
     daemon.replace_state(state);
     Ok(())
+}
+
+pub(crate) fn handle_runtime(
+    daemon: &mut HubDaemon,
+    logical_clock: &mut u64,
+    drain_cursors: &mut BTreeMap<String, u64>,
+    _pending_runtime: &mut PendingRuntimeState,
+    observability: DaemonObservability<'_>,
+    request: DaemonRequest,
+) -> DaemonTransportResult<DaemonResponse> {
+    let api = HubClientApi::local_operator(
+        observability
+            .client_id
+            .map(str::to_string)
+            .unwrap_or_else(|| super::runtime_client_id(&request)),
+    );
+    let packages = daemon.package_registry().clone();
+    let Some(runtime) = daemon.runtime_mut() else {
+        return Err(DaemonTransportError::DaemonNotRunning);
+    };
+
+    match request {
+        DaemonRequest::ListSessionTypes => {
+            let response = api.handle_request(
+                runtime,
+                &packages,
+                HubClientRequest::ListSessionTypes {
+                    request_id: request_id("daemon-session-types-list"),
+                },
+            )?;
+            let HubClientResponseBody::SessionTypes(templates) = response.body else {
+                return Err(DaemonTransportError::UnexpectedResponse);
+            };
+            Ok(daemon_session_types(templates))
+        }
+        DaemonRequest::ListSessionTypesForTarget { target_id } => {
+            let response = api.handle_request(
+                runtime,
+                &packages,
+                HubClientRequest::ListSessionTypesForTarget {
+                    request_id: request_id("daemon-session-types-list-for-target"),
+                    target_id,
+                },
+            )?;
+            let HubClientResponseBody::SessionTypes(templates) = response.body else {
+                return Err(DaemonTransportError::UnexpectedResponse);
+            };
+            Ok(daemon_session_types(templates))
+        }
+        DaemonRequest::ShowSessionType { session_type_id } => {
+            let response = api.handle_request(
+                runtime,
+                &packages,
+                HubClientRequest::ShowSessionType {
+                    request_id: request_id("daemon-session-types-show"),
+                    session_type_id,
+                },
+            )?;
+            let HubClientResponseBody::SessionTypes(templates) = response.body else {
+                return Err(DaemonTransportError::UnexpectedResponse);
+            };
+            Ok(daemon_session_types(templates))
+        }
+        DaemonRequest::ShowSessionTypeDefinition { session_type_id } => {
+            let response = api.handle_request(
+                runtime,
+                &packages,
+                HubClientRequest::ShowSessionTypeDefinition {
+                    request_id: request_id("daemon-session-types-definition"),
+                    session_type_id,
+                },
+            )?;
+            let HubClientResponseBody::SessionTypeDefinition(definition) = response.body else {
+                return Err(DaemonTransportError::UnexpectedResponse);
+            };
+            Ok(daemon_session_type_definition(*definition))
+        }
+        DaemonRequest::CreateSessionType { source, definition } => {
+            let response = api.handle_request(
+                runtime,
+                &packages,
+                HubClientRequest::CreateSessionType {
+                    request_id: request_id("daemon-session-types-create"),
+                    source: session_type_mutation_source_from_daemon(source),
+                    definition: session_type_definition_from_daemon(definition),
+                },
+            )?;
+            let HubClientResponseBody::SessionTypes(session_types) = response.body else {
+                return Err(DaemonTransportError::UnexpectedResponse);
+            };
+            Ok(daemon_session_types(session_types))
+        }
+        DaemonRequest::UpdateSessionType { source, definition } => {
+            let response = api.handle_request(
+                runtime,
+                &packages,
+                HubClientRequest::UpdateSessionType {
+                    request_id: request_id("daemon-session-types-update"),
+                    source: session_type_mutation_source_from_daemon(source),
+                    definition: session_type_definition_from_daemon(definition),
+                },
+            )?;
+            let HubClientResponseBody::SessionTypes(session_types) = response.body else {
+                return Err(DaemonTransportError::UnexpectedResponse);
+            };
+            Ok(daemon_session_types(session_types))
+        }
+        DaemonRequest::DeleteSessionType {
+            source,
+            session_type_id,
+        } => {
+            let response = api.handle_request(
+                runtime,
+                &packages,
+                HubClientRequest::DeleteSessionType {
+                    request_id: request_id("daemon-session-types-delete"),
+                    source: session_type_mutation_source_from_daemon(source),
+                    session_type_id,
+                },
+            )?;
+            let HubClientResponseBody::SessionTypes(session_types) = response.body else {
+                return Err(DaemonTransportError::UnexpectedResponse);
+            };
+            Ok(daemon_session_types(session_types))
+        }
+        DaemonRequest::ResolveSessionType {
+            session_type_id,
+            request,
+        } => {
+            let response = api.handle_request(
+                runtime,
+                &packages,
+                HubClientRequest::ResolveSessionType {
+                    request_id: request_id("daemon-session-types-resolve"),
+                    session_type_id,
+                    session_type_request: session_type_request_from_daemon(None, request),
+                },
+            )?;
+            let HubClientResponseBody::ResolvedSessionType(resolved) = response.body else {
+                return Err(DaemonTransportError::UnexpectedResponse);
+            };
+            Ok(daemon_resolved_session_type(*resolved))
+        }
+        DaemonRequest::SpawnSessionType {
+            session_type_id,
+            session_id,
+            request,
+        } => {
+            let response = api.handle_request(
+                runtime,
+                &packages,
+                HubClientRequest::SpawnSessionType {
+                    request_id: request_id("daemon-session-types-spawn"),
+                    session_type_id,
+                    session_type_request: session_type_request_from_daemon(
+                        Some(SessionId(session_id)),
+                        request,
+                    ),
+                    now_seconds: crate::daemon::owner_loop::tick(logical_clock),
+                },
+            )?;
+            let HubClientResponseBody::Spawned(spawned) = response.body else {
+                return Err(DaemonTransportError::UnexpectedResponse);
+            };
+            drain_cursors.insert(spawned.session.session_id.0.clone(), *logical_clock);
+            Ok(daemon_spawned(
+                daemon_session_from_client(spawned.session),
+                super::events::events_from_client(spawned.events),
+            ))
+        }
+        _ => unreachable!("session-type runtime family received a non-session-type request"),
+    }
 }

@@ -5,6 +5,7 @@ use botster_hub_client::{DaemonEvent, DaemonRequest, DaemonResponse};
 use crate::HubClientEvent;
 use crate::HubDaemon;
 use crate::client_api_dto::session::daemon_event_from_client;
+use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
 use crate::daemon::owner_loop::DaemonControlState;
 
 pub(crate) fn events_from_client(events: Vec<HubClientEvent>) -> Vec<DaemonEvent> {
@@ -98,5 +99,16 @@ pub(crate) fn handle_client_event_request(
             connection_id,
             "subscribe_events",
         ),
+    }
+}
+
+pub(crate) fn reject_json_request(request: DaemonRequest) -> DaemonTransportResult<DaemonResponse> {
+    match request {
+        DaemonRequest::SubscribeEvents { .. } | DaemonRequest::UnsubscribeEvents { .. } => {
+            Err(DaemonTransportError::Protocol(
+                "package event subscriptions require the host event handler",
+            ))
+        }
+        _ => unreachable!("event family received a non-event request"),
     }
 }

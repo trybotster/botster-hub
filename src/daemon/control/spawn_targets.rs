@@ -1,13 +1,79 @@
 //! Spawn-target and worktree request family.
 
-use botster_hub_client::{DaemonEvent, DaemonResponse, DaemonWorktreeLifecycleEvent};
+use botster_hub_client::{
+    DaemonEvent, DaemonRequest, DaemonResponse, DaemonWorktreeLifecycleEvent,
+};
 
 use crate::HubDaemon;
 use crate::client_api_dto::response::{daemon_spawn_targets, daemon_worktrees};
 use crate::client_api_dto::workspace::{worktree_failure_event, worktree_lifecycle_event};
 use crate::daemon::error::{DaemonTransportError, DaemonTransportResult, daemon_worktree_error};
 use crate::persistence::{FileHubStateStore, HubStateStore};
-use crate::{SpawnTarget, Worktree, WorktreeCreate};
+use crate::{
+    SpawnTarget, SpawnTargetCreate, SpawnTargetError, SpawnTargetUpdate, Worktree, WorktreeCreate,
+};
+
+pub(crate) fn handle_request(
+    daemon: &mut HubDaemon,
+    request: DaemonRequest,
+) -> DaemonTransportResult<DaemonResponse> {
+    match request {
+        DaemonRequest::ListSpawnTargets => list_spawn_targets_response(daemon),
+        DaemonRequest::ShowSpawnTarget { target_id } => {
+            show_spawn_target_response(daemon, &target_id)
+        }
+        DaemonRequest::CreateSpawnTarget {
+            target_id,
+            label,
+            root,
+            enabled,
+            kind,
+            base_ref,
+            metadata,
+        } => create_spawn_target_response(
+            daemon, target_id, label, root, enabled, kind, base_ref, metadata,
+        ),
+        DaemonRequest::UpdateSpawnTarget {
+            target_id,
+            label,
+            root,
+            enabled,
+            kind,
+            base_ref,
+            metadata,
+        } => update_spawn_target_response(
+            daemon, target_id, label, root, enabled, kind, base_ref, metadata,
+        ),
+        DaemonRequest::DeleteSpawnTarget { target_id } => {
+            delete_spawn_target_response(daemon, target_id)
+        }
+        DaemonRequest::ValidateSpawnTarget { target_id } => {
+            validate_spawn_target_response(daemon, &target_id)
+        }
+        DaemonRequest::ListWorktrees => list_worktrees_response(daemon),
+        DaemonRequest::ShowWorktree { worktree_id } => show_worktree_response(daemon, &worktree_id),
+        DaemonRequest::CreateWorktree {
+            worktree_id,
+            target_id,
+            label,
+            path,
+            metadata,
+        } => create_worktree_response(
+            daemon,
+            WorktreeCreate {
+                worktree_id,
+                target_id,
+                label,
+                path,
+                metadata,
+            },
+        ),
+        DaemonRequest::DeleteWorktree { worktree_id } => {
+            delete_worktree_response(daemon, &worktree_id)
+        }
+        _ => unreachable!("spawn-target family received a non-spawn-target request"),
+    }
+}
 
 pub(crate) fn persist_spawn_targets(
     daemon: &mut HubDaemon,
@@ -235,4 +301,155 @@ pub(crate) fn emit_worktree_lifecycle_event(
     response
         .events
         .push(DaemonEvent::WorktreeLifecycle { event });
+}
+
+pub(crate) fn create_spawn_target_response(
+    daemon: &mut HubDaemon,
+    target_id: Option<String>,
+    label: Option<String>,
+    root: std::path::PathBuf,
+    enabled: bool,
+    kind: Option<String>,
+    base_ref: Option<String>,
+    metadata: std::collections::BTreeMap<String, String>,
+) -> DaemonTransportResult<DaemonResponse> {
+    // Only pre-check session-types once the root is known to be a directory.
+    // Non-directory roots must fall through to create_spawn_target's
+    // root_not_directory rather than a misleading invalid_repo_session_types.
+    if enabled && root.is_dir() {
+        super::session_types::ensure_repo_session_types_valid_for_enabled_root(&root)?;
+    }
+    let before_session_types = super::session_types::session_type_definition_map(daemon)?;
+    let response = mutate_spawn_targets_response(daemon, |targets| {
+        crate::create_spawn_target(
+            targets,
+            SpawnTargetCreate {
+                target_id,
+                label,
+                root,
+                enabled,
+                kind,
+                base_ref,
+                metadata,
+            },
+        )
+    })?;
+    super::session_types::advance_session_type_generation_if_changed(
+        daemon,
+        &before_session_types,
+    )?;
+    Ok(response)
+}
+
+pub(crate) fn update_spawn_target_response(
+    daemon: &mut HubDaemon,
+    target_id: String,
+    label: Option<String>,
+    root: Option<std::path::PathBuf>,
+    enabled: Option<bool>,
+    kind: Option<String>,
+    base_ref: Option<Option<String>>,
+    metadata: Option<std::collections::BTreeMap<String, String>>,
+) -> DaemonTransportResult<DaemonResponse> {
+    let recovery_disable = enabled == Some(false);
+    if !recovery_disable {
+        super::session_types::ensure_update_would_not_enable_invalid_repo_session_types(
+            daemon,
+            &target_id,
+            root.as_ref(),
+            enabled,
+        )?;
+    }
+    let before_session_types = match super::session_types::session_type_definition_map(daemon) {
+        Ok(before) => Some(before),
+        Err(error)
+            if recovery_disable
+                && super::session_types::is_invalid_repo_session_types_error(&error) =>
+        {
+            None
+        }
+        Err(error) => return Err(error),
+    };
+    let response = mutate_spawn_targets_with_worktrees_response(daemon, |targets, worktrees| {
+        if kind.as_deref().is_some_and(|kind| kind != "git")
+            && worktrees.iter().any(|worktree| {
+                worktree.target_id == target_id && worktree.management == "hub_managed_git"
+            })
+        {
+            return Err(SpawnTargetError::new(
+                "managed_worktrees_exist",
+                "Git target cannot be reclassified while managed worktrees reference it",
+            ));
+        }
+        crate::update_spawn_target(
+            targets,
+            &target_id,
+            SpawnTargetUpdate {
+                label,
+                root,
+                enabled,
+                kind,
+                base_ref,
+                metadata,
+            },
+        )
+    })?;
+    match before_session_types {
+        Some(before) => {
+            super::session_types::advance_session_type_generation_if_changed(daemon, &before)?;
+        }
+        None => {
+            super::session_types::force_advance_session_type_generation(daemon)?;
+        }
+    }
+    Ok(response)
+}
+
+pub(crate) fn delete_spawn_target_response(
+    daemon: &mut HubDaemon,
+    target_id: String,
+) -> DaemonTransportResult<DaemonResponse> {
+    let before_session_types = match super::session_types::session_type_definition_map(daemon) {
+        Ok(before) => Some(before),
+        Err(error) if super::session_types::is_invalid_repo_session_types_error(&error) => None,
+        Err(error) => return Err(error),
+    };
+    let response = mutate_spawn_targets_with_worktrees_response(daemon, |targets, worktrees| {
+        if worktrees.iter().any(|worktree| {
+            worktree.target_id == target_id && worktree.management == "hub_managed_git"
+        }) {
+            return Err(SpawnTargetError::new(
+                "managed_worktrees_exist",
+                "Git target cannot be deleted while managed worktrees reference it",
+            ));
+        }
+        crate::delete_spawn_target(targets, &target_id)
+    })?;
+    match before_session_types {
+        Some(before) => {
+            super::session_types::advance_session_type_generation_if_changed(daemon, &before)?;
+        }
+        None => {
+            super::session_types::force_advance_session_type_generation(daemon)?;
+        }
+    }
+    Ok(response)
+}
+
+pub(crate) fn validate_spawn_target_response(
+    daemon: &mut HubDaemon,
+    target_id: &str,
+) -> DaemonTransportResult<DaemonResponse> {
+    Ok(
+        crate::client_api_dto::response::daemon_spawn_target_validation(
+            crate::validate_spawn_target(
+                &daemon
+                    .runtime()
+                    .ok_or(DaemonTransportError::DaemonNotRunning)?
+                    .state()
+                    .spawn_targets,
+                target_id,
+            ),
+        ),
+    )
 }
