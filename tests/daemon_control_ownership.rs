@@ -451,81 +451,116 @@ fn dispatcher_names_request_variants_only_in_delegating_arms() {
     );
 }
 
+const CONTROL_MESSAGE_OWNERS: &[(&str, &[&str])] = &[
+    (
+        "src/daemon/control/connection.rs",
+        &[
+            "AcceptedConnection",
+            "RejectedConnection",
+            "RegisterUnixAdmission",
+            "RegisterWebrtcAdmission",
+        ],
+    ),
+    (
+        "src/daemon/control/entities.rs",
+        &["SubscribeEntities", "UnsubscribeEntities"],
+    ),
+    ("src/daemon/control/request.rs", &["Request"]),
+    ("src/daemon/control/host.rs", &["HubUpdateCheckCompleted"]),
+    ("src/daemon/control/webrtc.rs", &["LocalWebrtcPeerClosed"]),
+];
+
+const CONTROL_MESSAGE_DISPATCHER_OWNED: &[&str] = &["EgressWriteFailed"];
+
+fn control_handler_modules() -> Vec<String> {
+    let mut paths = Vec::new();
+    for (path, _) in daemon_sources() {
+        if !path.starts_with("src/daemon/control/") {
+            continue;
+        }
+        if path == "src/daemon/control.rs" || path == "src/daemon/control/message.rs" {
+            continue;
+        }
+        paths.push(path);
+    }
+    paths.sort();
+    paths
+}
+
 #[test]
 fn control_message_variants_have_one_family_or_dispatcher_owner() {
     let declared = enum_variants(
         &hub_source("src/daemon/control/message.rs"),
         "ControlMessage",
     );
-    let expected = [
-        "AcceptedConnection",
-        "RejectedConnection",
-        "SubscribeEntities",
-        "UnsubscribeEntities",
-        "Request",
-        "HubUpdateCheckCompleted",
-        "EgressWriteFailed",
-        "LocalWebrtcPeerClosed",
-        "RegisterUnixAdmission",
-        "RegisterWebrtcAdmission",
-    ];
+    let mut mapped: Vec<String> = CONTROL_MESSAGE_OWNERS
+        .iter()
+        .flat_map(|(_, variants)| variants.iter().copied().map(str::to_string))
+        .chain(
+            CONTROL_MESSAGE_DISPATCHER_OWNED
+                .iter()
+                .copied()
+                .map(str::to_string),
+        )
+        .collect();
+    mapped.sort();
+    let mut declared_sorted = declared.clone();
+    declared_sorted.sort();
     assert_eq!(
-        declared, expected,
-        "ControlMessage matrix must stay complete"
+        declared_sorted, mapped,
+        "ControlMessage matrix must cover every variant exactly once"
     );
 
-    let connection = hub_source("src/daemon/control/connection.rs");
-    let entities = hub_source("src/daemon/control/entities.rs");
-    let host = hub_source("src/daemon/control/host.rs");
-    let webrtc = hub_source("src/daemon/control/webrtc.rs");
+    for (path, variants) in CONTROL_MESSAGE_OWNERS {
+        let named = control_message_variant_names(&hub_source(path));
+        for variant in *variants {
+            assert!(
+                named.iter().any(|name| name == variant),
+                "{path} must own ControlMessage::{variant}"
+            );
+        }
+    }
     let dispatcher = hub_source("src/daemon/control.rs");
-    assert!(connection.contains("fn register_unix_admission"));
-    assert!(connection.contains("fn register_webrtc_admission"));
-    assert!(entities.contains("fn subscribe"));
-    assert!(entities.contains("fn unsubscribe"));
-    assert!(host.contains("ControlMessage::HubUpdateCheckCompleted"));
-    assert!(webrtc.contains("fn handle_peer_closed"));
-    assert!(dispatcher.contains("ControlMessage::Request"));
+    let dispatcher_named = control_message_variant_names(&dispatcher);
+    for variant in CONTROL_MESSAGE_DISPATCHER_OWNED {
+        assert!(
+            dispatcher_named.iter().any(|name| name == *variant),
+            "control.rs must own ControlMessage::{variant}"
+        );
+    }
     assert!(dispatcher.contains("request::handle"));
-    assert!(dispatcher.contains("ControlMessage::EgressWriteFailed"));
-    assert!(dispatcher.contains("ControlMessage::LocalWebrtcPeerClosed"));
     assert!(dispatcher.contains("webrtc::handle_peer_closed"));
-    assert!(dispatcher.contains("host::hub_update_check_completed"));
+    assert!(dispatcher.contains("connection::handle"));
+    assert!(dispatcher.contains("entities::handle"));
     let request = hub_source("src/daemon/control/request.rs");
     assert!(request.contains("overlay_live_attach_occupancy"));
     assert!(request.contains("has_live_peer(grant_id)"));
 
-    for (path, source) in [
-        (
-            "src/daemon/control/sessions.rs",
-            hub_source("src/daemon/control/sessions.rs"),
-        ),
-        (
-            "src/daemon/control/plugins.rs",
-            hub_source("src/daemon/control/plugins.rs"),
-        ),
-        (
-            "src/daemon/control/messaging.rs",
-            hub_source("src/daemon/control/messaging.rs"),
-        ),
-        (
-            "src/daemon/control/packages.rs",
-            hub_source("src/daemon/control/packages.rs"),
-        ),
-    ] {
-        for variant in [
-            "LocalWebrtcPeerClosed",
-            "HubUpdateCheckCompleted",
-            "RegisterWebrtcAdmission",
-        ] {
+    let owner_paths: Vec<&str> = CONTROL_MESSAGE_OWNERS
+        .iter()
+        .map(|(path, _)| *path)
+        .collect();
+    for other_path in control_handler_modules() {
+        let named = control_message_variant_names(&hub_source(&other_path));
+        for (owner_path, variants) in CONTROL_MESSAGE_OWNERS {
+            if other_path == *owner_path {
+                continue;
+            }
+            for variant in *variants {
+                assert!(
+                    !named.iter().any(|name| name == variant),
+                    "{other_path} must not own ControlMessage::{variant}; owner is {owner_path}"
+                );
+            }
+        }
+        for variant in CONTROL_MESSAGE_DISPATCHER_OWNED {
             assert!(
-                !control_message_variant_names(&source)
-                    .iter()
-                    .any(|name| name == variant),
-                "{path} must not own ControlMessage::{variant}"
+                !named.iter().any(|name| name == *variant),
+                "{other_path} must not own dispatcher ControlMessage::{variant}"
             );
         }
     }
+    let _ = owner_paths;
 }
 
 #[test]
@@ -547,6 +582,16 @@ fn duplicating_a_variant_into_the_wrong_owner_fails_the_matrix() {
         plugins.contains("DaemonRequest::PluginMcpListTools")
             && !sessions.contains("DaemonRequest::PluginMcpListTools"),
         "PluginMcpListTools must not remain in sessions.rs"
+    );
+    let request = hub_source("src/daemon/control/request.rs");
+    assert!(
+        control_message_variant_names(&request)
+            .iter()
+            .any(|name| name == "Request")
+            && !control_message_variant_names(&plugins)
+                .iter()
+                .any(|name| name == "Request"),
+        "ControlMessage::Request must not be duplicated into plugins.rs"
     );
     let _ = request_variant_names(&sessions);
 }

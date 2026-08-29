@@ -2,13 +2,43 @@
 
 use crate::HubDaemon;
 use crate::client_api_dto::response::daemon_response_base;
-use crate::daemon::control::message::ControlReplySender;
+use crate::daemon::control::message::{ControlMessage, ControlReplySender};
 use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
 use crate::daemon::owner_loop::DaemonControlState;
 use crate::subscription::entity::{
     EntityFrameSender, entity_subscription_error, register_entity_subscription,
 };
 use botster_hub_client::{DaemonRequest, DaemonResponse, DaemonResponseKind};
+
+pub(crate) fn handle(
+    daemon: &mut HubDaemon,
+    state: &mut DaemonControlState,
+    message: ControlMessage,
+) -> bool {
+    match message {
+        ControlMessage::SubscribeEntities {
+            entity_type,
+            subscription_id,
+            frame_tx,
+            reply_tx,
+            grant_id,
+        } => subscribe(
+            daemon,
+            state,
+            entity_type,
+            subscription_id,
+            frame_tx,
+            reply_tx,
+            grant_id,
+        ),
+        ControlMessage::UnsubscribeEntities {
+            subscription_id,
+            reply_tx,
+            grant_id,
+        } => unsubscribe(daemon, state, subscription_id, reply_tx, grant_id),
+        _ => unreachable!("entity family received a non-entity control message"),
+    }
+}
 
 pub(crate) fn subscribe(
     daemon: &mut HubDaemon,

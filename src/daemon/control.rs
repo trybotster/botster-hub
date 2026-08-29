@@ -123,50 +123,16 @@ pub(crate) fn handle_control_message(
     message: ControlMessage,
 ) -> bool {
     match message {
-        ControlMessage::AcceptedConnection { .. } | ControlMessage::RejectedConnection => false,
-        ControlMessage::RegisterUnixAdmission {
-            client_id,
-            admission,
-            reply_tx,
-            host_required_features,
-        } => connection::register_unix_admission(
-            state,
-            client_id,
-            admission,
-            reply_tx,
-            host_required_features,
-        ),
-        ControlMessage::RegisterWebrtcAdmission {
-            grant_id,
-            admission,
-            host_required_features,
-        } => connection::register_webrtc_admission(
-            daemon,
-            state,
-            grant_id,
-            admission,
-            host_required_features,
-        ),
-        ControlMessage::SubscribeEntities {
-            entity_type,
-            subscription_id,
-            frame_tx,
-            reply_tx,
-            grant_id,
-        } => entities::subscribe(
-            daemon,
-            state,
-            entity_type,
-            subscription_id,
-            frame_tx,
-            reply_tx,
-            grant_id,
-        ),
-        ControlMessage::UnsubscribeEntities {
-            subscription_id,
-            reply_tx,
-            grant_id,
-        } => entities::unsubscribe(daemon, state, subscription_id, reply_tx, grant_id),
+        message @ ControlMessage::AcceptedConnection { .. }
+        | message @ ControlMessage::RejectedConnection
+        | message @ ControlMessage::RegisterUnixAdmission { .. }
+        | message @ ControlMessage::RegisterWebrtcAdmission { .. } => {
+            connection::handle(daemon, state, message)
+        }
+        message @ ControlMessage::SubscribeEntities { .. }
+        | message @ ControlMessage::UnsubscribeEntities { .. } => {
+            entities::handle(daemon, state, message)
+        }
         message @ ControlMessage::Request { .. } => {
             request::handle(daemon, state, transport_handle, control_tx, message)
         }
