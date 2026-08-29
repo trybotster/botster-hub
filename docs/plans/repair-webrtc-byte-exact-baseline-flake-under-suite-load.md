@@ -119,6 +119,8 @@ Isolated one-test measurement (`./test.sh --locked --test hub_daemon_lifecycle_t
 
 Binding: after the Unix producer-ready wait, drain until WebRTC shows `PRODUCER_READY_MARKER`, then clear `concatenated` before the release-file write. That keeps the starvation marker exclusive to an empty post-release window. The file-local outer backstop is 30 s and is not a product gate. No shared harness constant was raised.
 
+Review return (`review_1788002895_413318`, `finding_1788002895_328395`): the readiness backstop must not `break` into the release-file write when WebRTC has bytes but not the complete `PRODUCER_READY_MARKER`. That path contaminates the post-release window and can fail the byte assertion instead of emitting the named starvation marker. The readiness loop now leaves only when `concatenated` contains `PRODUCER_READY_MARKER`. Backstop expiry always panics through `format_harness_budget_expired`, including the non-empty incomplete-marker case. The post-release marker lane stays empty-only.
+
 ## Affected surfaces and files
 
 - `tests/hub_daemon_lifecycle/subscription_ownership_baseline.rs` — the body of `webrtc_terminal_output_is_byte_exact` (lines 826 to 909), plus the imports that the new helper calls require.

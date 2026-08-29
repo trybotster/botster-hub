@@ -952,7 +952,9 @@ fn webrtc_terminal_output_is_byte_exact() {
                         "timed out waiting for WebRTC producer-ready frames; concatenated is empty",
                     );
                 }
-                break;
+                panic_webrtc_byte_exact_starvation(&format!(
+                    "timed out waiting for complete WebRTC producer-ready marker; concatenated={concatenated:?}"
+                ));
             }
             await_next_webrtc_terminal_frame(&mut peer, &key).await;
         }

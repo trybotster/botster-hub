@@ -88,6 +88,14 @@ No scope change. Implement recorded a measurement binding in the committed plan:
 
 No shared harness constant was raised. The byte-exactness assertion text and the test name are unchanged.
 
+## Review return (`review_1788002895_413318`)
+
+Review submitted `changes_required` with high finding `finding_1788002895_328395`: the readiness backstop could `break` into the release-file write when WebRTC had bytes but not the complete `PRODUCER_READY_MARKER`. That contaminates the post-release window and can fail the byte assertion instead of emitting `harness_budget_expired`.
+
+Fix: the readiness loop leaves only when `concatenated` contains `PRODUCER_READY_MARKER`. Backstop expiry always panics through `format_harness_budget_expired`, including the non-empty incomplete-marker case. The post-release empty-only marker lane is unchanged.
+
+Partial-marker ablation: replaced the readiness `contains(PRODUCER_READY_MARKER)` check with an impossible string and set the file-local backstop to 2 s. Result: exit 101. Panic: `harness_budget_expired test=webrtc_terminal_output_is_byte_exact ... timed out waiting for complete WebRTC producer-ready marker; concatenated=[112, 114, 111, 100, 117, 99, 101, 114, 45, 114, 101, 97, 100, 121, 13, 10]`. No byte assertion. Source restored.
+
 ## Tests and downstream proof run
 
 Prebuild (same shell as the gates):
@@ -113,6 +121,8 @@ cargo build --locked --bin botster-hub
 5. Marker arm: skipped the release-file write.
    Result: exit 101. Panic: `harness_budget_expired test=webrtc_terminal_output_is_byte_exact kind=webrtc_byte_exact budget_ms=30000 resource=ETIMEDOUT probe=unconfirmed timed out waiting for WebRTC adapter frames after producer-ready release; concatenated is empty`. Source restored.
 6. Strict gates: `cargo fmt --all -- --check` exit 0. `cargo clippy --workspace --all-targets --locked -- -D warnings` exit 0. `cargo clippy --locked --test hub_daemon_lifecycle_test -- -D warnings` exit 0.
+7. Review-return focused rerun of the same exact filter: `ok. 1 passed; 320 filtered out`.
+8. Partial-marker ablation for `finding_1788002895_328395`, described in the Review return section. Source restored.
 
 Downstream proof: none required. Hub-internal test code.
 
@@ -124,6 +134,7 @@ Production-path note: this ticket is intentionally test-only. The production Web
 - The 30 s backstop can still fire on a genuinely exhausted host. That outcome is acceptable only with the named marker.
 - Sibling `Duration::from_secs(8)` wait sites remain out of scope.
 - `AUTHORITATIVE_SESSION_EXIT_WAIT` did not expire here. A later suite-load expiry of that shared Unix wait would need its own ticket.
+- The incomplete-readiness timeout path is proven by ablation, not by a permanent suite test. A permanent 30 s negative test would add suite time without strengthening the byte claim.
 
 ## Missing vault guidance discovered
 
