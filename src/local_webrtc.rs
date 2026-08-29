@@ -4230,10 +4230,9 @@ mod tests {
         default_runtime,
     };
 
-    use crate::daemon_transport::{
-        DaemonControlState, EntityFrameSender, WebrtcTerminalAdmission, handle_control_message,
-        negotiated_unix_capability_set,
-    };
+    use crate::admission::unix_hello::WebrtcTerminalAdmission;
+    use crate::daemon_transport::{DaemonControlState, EntityFrameSender, handle_control_message};
+    use crate::subscription::attach_routes::negotiated_unix_capability_set;
     use crate::{
         DataDirectoryOption, HostIdentityOptions, HubDaemon, HubStartupOptions,
         PackageEventPlaneOptions, RuntimeEnvironment, SessionDefaults,
