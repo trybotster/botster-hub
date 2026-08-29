@@ -187,6 +187,7 @@ fn owner_loop_and_projection_sources_reject_unbounded_and_product_policy() {
         "src/daemon/control/events.rs",
         "src/daemon/control/webrtc.rs",
         "src/daemon/control/host.rs",
+        "src/daemon/control/request.rs",
         "src/subscription/entity.rs",
     ] {
         let source = fs::read_to_string(root.join(relative)).expect("read source");

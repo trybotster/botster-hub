@@ -1061,6 +1061,10 @@ mod tests {
                 include_str!("daemon/control/host.rs"),
             ),
             (
+                "src/daemon/control/request.rs",
+                include_str!("daemon/control/request.rs"),
+            ),
+            (
                 "src/subscription/entity.rs",
                 include_str!("subscription/entity.rs"),
             ),

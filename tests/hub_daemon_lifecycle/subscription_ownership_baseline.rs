@@ -591,6 +591,7 @@ fn no_lua_dispatch_in_terminal_input_or_output() {
         "src/daemon/control/events.rs",
         "src/daemon/control/webrtc.rs",
         "src/daemon/control/host.rs",
+        "src/daemon/control/request.rs",
         "src/client_api.rs",
     ] {
         let source = hub_source(entry);
