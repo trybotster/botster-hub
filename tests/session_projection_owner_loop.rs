@@ -173,7 +173,7 @@ fn owner_loop_and_projection_sources_reject_unbounded_and_product_policy() {
         "src/session_projection.rs",
         "src/daemon_maintenance.rs",
         "src/daemon_transport.rs",
-        "src/daemon_entity_subscriptions.rs",
+        "src/subscription/entity.rs",
     ] {
         let source = fs::read_to_string(root.join(relative)).expect("read source");
         let production = source.split("#[cfg(test)]").next().unwrap_or(&source);
@@ -188,8 +188,7 @@ fn owner_loop_and_projection_sources_reject_unbounded_and_product_policy() {
                 .contains("lifecycle_baseline("),
             "{relative} must not call unbounded lifecycle_baseline"
         );
-        if relative != "src/daemon_transport.rs" && relative != "src/daemon_entity_subscriptions.rs"
-        {
+        if relative != "src/daemon_transport.rs" && relative != "src/subscription/entity.rs" {
             for needle in [
                 "botster-terminal-protocol-client",
                 "ProcessExited",

@@ -1004,8 +1004,8 @@ mod tests {
                 include_str!("daemon_transport.rs"),
             ),
             (
-                "src/daemon_entity_subscriptions.rs",
-                include_str!("daemon_entity_subscriptions.rs"),
+                "src/subscription/entity.rs",
+                include_str!("subscription/entity.rs"),
             ),
             (
                 "src/subscription/attach_routes.rs",
