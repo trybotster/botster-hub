@@ -73,3 +73,114 @@ impl From<crate::admission::grants::GrantAdmissionError> for LocalWebrtcError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn webrtc_sources() -> Vec<(String, String)> {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut files = vec![(
+            "src/transport/webrtc.rs".to_string(),
+            fs::read_to_string(manifest.join("src/transport/webrtc.rs")).expect("webrtc.rs"),
+        )];
+        let dir = manifest.join("src/transport/webrtc");
+        for entry in fs::read_dir(&dir).expect("read webrtc dir") {
+            let path = entry.expect("entry").path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                continue;
+            }
+            let name = path.file_name().expect("name").to_string_lossy();
+            if name == "test_support.rs" {
+                continue;
+            }
+            let relative = format!("src/transport/webrtc/{name}");
+            let source = fs::read_to_string(&path).expect("read webrtc source");
+            files.push((relative, source));
+        }
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        files
+    }
+
+    fn production(source: &str) -> &str {
+        source.split("mod tests").next().unwrap_or(source)
+    }
+
+    #[test]
+    fn webrtc_state_machines_have_one_owner_file() {
+        const OWNERS: &[(&str, &str)] = &[
+            (
+                "struct LocalWebrtcTransport",
+                "src/transport/webrtc/peer.rs",
+            ),
+            (
+                "struct LocalWebrtcPeerState",
+                "src/transport/webrtc/peer.rs",
+            ),
+            (
+                "struct LocalWebrtcFlowControl",
+                "src/transport/webrtc/control_channel.rs",
+            ),
+            (
+                "struct WebRtcConnectionMux",
+                "src/transport/webrtc/adapter.rs",
+            ),
+            (
+                "struct WebRtcTerminalAdapter",
+                "src/transport/webrtc/adapter.rs",
+            ),
+            (
+                "enum PendingLocalWebrtcRequest",
+                "src/transport/webrtc/control_channel.rs",
+            ),
+            (
+                "struct LocalWebrtcAttachedSubscription",
+                "src/transport/webrtc/subscription_channel.rs",
+            ),
+        ];
+        let files = webrtc_sources();
+        for (decl, owner) in OWNERS {
+            let present: Vec<&str> = files
+                .iter()
+                .filter(|(_, source)| production(source).contains(decl))
+                .map(|(path, _)| path.as_str())
+                .collect();
+            assert_eq!(
+                present.as_slice(),
+                &[*owner],
+                "{decl} must be declared only in {owner}, found {present:?}"
+            );
+            for (path, source) in &files {
+                if path == owner {
+                    continue;
+                }
+                assert!(
+                    !production(source).contains(decl),
+                    "{decl} must be absent from {path}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn webrtc_transport_does_not_declare_admission_or_unix_policy_types() {
+        const FORBIDDEN_DECLS: &[&str] = &[
+            "struct GrantRegistry",
+            "enum GrantRegistry",
+            "struct UnixConnectionMux",
+            "struct UnixTerminalAdmission",
+            "struct ClosedEventRoute",
+            "trait ClosedHandle",
+        ];
+        for (path, source) in webrtc_sources() {
+            let production = production(&source);
+            for forbidden in FORBIDDEN_DECLS {
+                assert!(
+                    !production.contains(forbidden),
+                    "{path} production source must not declare {forbidden}"
+                );
+            }
+        }
+    }
+}
