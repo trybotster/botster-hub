@@ -4859,8 +4859,8 @@ mod tests {
                 .local_webrtc()
                 .issue_bootstrap("botster-web", "web-client", origin)
                 .expect("issue bootstrap");
-            let stream_key =
-                secret_stream_key(&bootstrap.grant_secret).expect("bootstrap secret is stream key");
+            let stream_key = crate::admission::grants::secret_stream_key(&bootstrap.grant_secret)
+                .expect("bootstrap secret is stream key");
             let offer_runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .thread_name("botster-webrtc-offer-test")
