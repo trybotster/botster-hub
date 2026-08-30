@@ -2,7 +2,7 @@
 
 Ticket: `ticket_1787894427_525056`
 Run: `run_1788046974_604085`
-Plan visit: 3 (Plan Review returned the run at `review_1788058432_516678`, changes required)
+Plan visit: 4 (Plan Review returned the run at `review_1788059091_852326`, changes required)
 
 This plan replaces `docs/plans/drive-terminal-progress-from-core-and-adapter-wakes.md`,
 which the human decision superseded. That file stays as the historical record.
@@ -74,6 +74,7 @@ Atomic notes:
 - [[daemon event shape changes bump conformance fixture revision not protocol version]]
 - [[public dto field additions are source breaking without non exhaustive]]
 - [[scratch cargo patch redirects measure downstream dto breakage]]
+- [[WebRTC host events use unsolicited daemon-event delivery]]
 
 No other repository charter is loaded. No Project Pipelines overlay is required.
 
@@ -83,8 +84,9 @@ No other repository charter is loaded. No Project Pipelines overlay is required.
 - Human decision `question_1788048108_946530`, revised answer: no backwards compatibility,
   no compatibility window, no feature filter, no mixed pin, no fallback, no second active
   terminal route. This Hub ticket is the single Hub-side cold cut.
-- Plan Review `review_1788058432_516678` (changes required), `review_1788054175_439108`,
-  and `review_1788048365_936269`. Every open finding is addressed below.
+- Plan Review `review_1788059091_852326` (changes required, this visit),
+  `review_1788058432_516678`, `review_1788054175_439108`, and `review_1788048365_936269`.
+  Every open finding is addressed below.
 - Hub source: `src/daemon/owner_loop.rs`, `src/daemon_maintenance.rs`,
   `src/daemon/control/sessions.rs`, `src/subscription/attach_routes.rs`,
   `src/subscription/closed_events.rs`, `src/transport/shared/*`, `src/transport/unix/*`,
@@ -266,13 +268,39 @@ Transport behavior:
 - **Unix.** A successful `Attach` keeps its current response kind and returns
   `terminal_reservation = None`. Unix binds inline on the existing connection, exactly as
   today. The field is absent on the wire because of `skip_serializing_if`.
-- **Expiry.** A reservation that is not opened within `expires_in_seconds` retires with its
-  route. A later channel with that label is rejected as stale, not as unknown, so the
-  diagnostic distinguishes the two.
-- **Errors.** Every pre-reservation failure keeps the existing
-  `DaemonResponseKind::OperatorError` shape from `attach_bind_operator_error`, with
-  `operation = "attach"`. Reservation adds two typed codes: `reservation_expired` and
-  `reservation_label_conflict`. No new error envelope is introduced.
+- **Expiry retirement.** No new timer thread. A reservation whose `expires_in_seconds` has
+  passed retires lazily, at whichever comes first: the next event that touches its route, or
+  the existing bounded owner-loop inventory reconcile slice. Retirement is what bounds the
+  resource; the deadline alone is not a correctness mechanism.
+
+##### Two error codes with two different delivery paths
+
+The two codes are **not** symmetric, and only one of them can be an `Attach` response.
+
+- **`reservation_label_conflict` — synchronous, on the `Attach` response.** Allocation can
+  fail when a live, non-retired reservation already exists for the exact
+  `(session_id, subscription_id, generation, peer_generation)`, which a repeated `Attach`
+  can produce. Hub reserves nothing and returns the existing
+  `DaemonResponseKind::OperatorError` shape from `attach_bind_operator_error` with
+  `operation = "attach"` and this code. No new envelope is introduced.
+- **`reservation_expired` — asynchronous, on the late-channel admission path.** Expiry
+  happens *after* a successful `Attach` response, so it can never be an `Attach` response.
+  A late channel open is not a control request. Its delivery path is:
+  1. Hub retires the reservation atomically, so a concurrent open cannot bind.
+  2. Hub emits one unsolicited `TerminalSubscriptionClosed` daemon event on the **peer's
+     control DataChannel**, for the exact `(session_id, subscription_id, generation)`, with a
+     new reason constant `TERMINAL_SUBSCRIPTION_CLOSED_RESERVATION_EXPIRED =
+     "reservation_expired"` alongside the existing
+     `TERMINAL_SUBSCRIPTION_CLOSED_HOST_ADAPTER` and
+     `TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER`. This follows
+     [[WebRTC host events use unsolicited daemon-event delivery]] and
+     [[Unix mux host events are unsolicited control frames]].
+  3. Hub then bounded-closes the late channel through the existing
+     `reject_extra_data_channel` path.
+  That order tells the peer why before its channel dies, and it cannot bind in the gap. If
+  the control channel is already gone, the event is dropped and only the bounded close runs.
+  A late channel whose label was never reserved keeps the plain unknown-label rejection with
+  no event, so **stale and unknown stay distinguishable**.
 - **Serde.** `label` is an opaque string. Hub never derives peer-visible meaning from its
   contents, and no client parses it.
 - The browser creates one reliable ordered DataChannel with the reserved label. Hub accepts a
@@ -312,9 +340,15 @@ Transport behavior:
   let a protocol-7 client pass admission and then call an absent route or misparse the
   `Attach` response. Update `crates/botster-hub-client/src/lib.rs` `PROTOCOL_VERSION`,
   `DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION` handling, every compatibility fixture and
-  descriptor, `crates/botster-hub-test-support/src/lib.rs`, `src/mcp.rs`, the generated
-  TypeScript, `docs/client-protocol.md`, and the protocol assertions in
-  `tests/hub_daemon_lifecycle/{shutdown,sessions,unix_terminal_adapter,webrtc_terminal_adapter}.rs`.
+  descriptor, `crates/botster-hub-test-support/src/lib.rs`, the generated TypeScript,
+  `docs/client-protocol.md`, and the protocol assertions in
+  `tests/hub_daemon_lifecycle/{shutdown,sessions,unix_terminal_adapter,webrtc_terminal_adapter}.rs`
+  (`unix_terminal_adapter.rs` and `webrtc_terminal_adapter.rs` each assert the literal `7`).
+  Three unrelated constants share the substring `PROTOCOL_VERSION` and must **not** change:
+  `src/mcp.rs` `MCP_PROTOCOL_VERSION` (`"2025-06-18"`) is the Model Context Protocol version
+  and carries no daemon literal, `botster_terminal_protocol::PROTOCOL_VERSION` is the
+  terminal protocol plane, and `DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION` is the
+  conformance floor. Touch only `botster_hub_client::PROTOCOL_VERSION`.
   Also bump `CONFORMANCE_FIXTURE_REVISION` from 46 for the fixture changes: the two signals
   are separate and both apply.
 - Regenerate `crates/botster-hub-client/generated/daemon-protocol.ts`,
@@ -442,12 +476,30 @@ long-lived host thread to the terminal byte path.
   4. **Terminal action on timeout.** Hub **does not** call `CoreDaemon::shutdown`, does not
      call `join()`, and does not continue the shutdown sequence, because the driver may still
      hold the mutex. Hub records the typed `data_plane_driver_stop_timeout` diagnostic, then
-     calls `std::process::abort()`. Abort is the only action that guarantees no
-     `botster-hub-data-plane` thread survives when the thread will not stop. Recovery is a
-     supervisor restart.
+     calls `std::process::abort()`.
 
-  This is what makes "no Hub thread survives" provable rather than asserted. Acceptance
-  check 16 covers the normal path and check 16a covers the timeout path.
+  **What abort does and does not do.** Abort guarantees exactly one thing: every Hub thread,
+  including a driver that will not stop, ends with the process. It runs no Rust destructor
+  and no Hub cleanup, so it explicitly does **not** remove the Unix socket file and does
+  **not** stop or reap session-worker processes. Claiming otherwise would make this proof
+  internally inconsistent, so the plan states the residue and its owner instead:
+
+  | Residue after abort | Intentional? | Who recovers it |
+  |---|---|---|
+  | `botster-hub-data-plane` and every other Hub thread | ended by abort | nothing to recover |
+  | Session-worker processes | **yes, by design** | the next Hub start, through the existing `adoption_scan` and `adopt_session` path. Workers already outlive a Hub crash; restart adoption is the established recovery, not a leak. |
+  | Stale Unix socket file | yes | the next Hub start, through the existing `prepare_socket_path`, which probes the path and removes a socket with no live daemon behind it |
+  | Core durable state | yes | Core owns its own recovery on restart |
+
+  **Timeout sibling policy.** The driver stop timeout is the one deliberate whole-process
+  fail-closed action in this plan. It sacrifices every peer and every route on this Hub,
+  because a driver that may still hold the `CoreDaemon` mutex makes any narrower teardown
+  unsound. That is a wider blast radius than a route close or a peer close, and it is chosen
+  only because the alternative is running Core shutdown against a live mutex holder.
+
+  Acceptance check 16 covers the normal path. Check 16a asserts only what abort actually
+  guarantees, in process, and check 16b proves the recovery half separately on the next Hub
+  start.
 
 `late_message_matrix`
 
@@ -543,7 +595,7 @@ Changed:
 - `crates/botster-hub-test-support/{Cargo.toml,build.rs,src/lib.rs,src/conformance_data.rs}`
 - `packages/hub-test-support/daemon-protocol.ts`,
   `packages/hub-test-support/first-party-client-support-matrix.json`
-- `src/lib.rs`, `src/runtime.rs`, `src/main.rs`, `src/local_webrtc_smoke.rs`, `src/mcp.rs`
+- `src/lib.rs`, `src/runtime.rs`, `src/main.rs`, `src/local_webrtc_smoke.rs`
 - `src/daemon/owner_loop.rs`, `src/daemon_maintenance.rs`, `src/daemon/control.rs`,
   `src/daemon/control/request.rs`, `src/daemon/control/sessions.rs`
 - `src/subscription/attach_routes.rs`, `src/subscription/closed_events.rs`
@@ -649,9 +701,20 @@ one-test baseline before each ablation.
     that the wait ends at `DATA_PLANE_STOP_BOUND`, that `CoreDaemon::shutdown` is never
     called (proved by the absence of its observation marker while the driver-timeout marker
     is present), that the typed `data_plane_driver_stop_timeout` diagnostic is recorded, and
-    that the process terminates by abort with no surviving Hub thread, session worker,
-    zombie, or socket. Red-on-revert: replace the abort with a plain `join()`; the test must
-    hang or observe a surviving thread.
+    that the process terminates by abort. The in-process assertion is limited to what abort
+    actually guarantees: the process is gone and **no Hub thread survives**. It does not
+    assert socket removal or worker reaping, because abort runs no destructors and cannot
+    perform them. Red-on-revert: replace the abort with a plain `join()`; the test must hang
+    or observe a surviving thread.
+16b. **Abort residue recovery, on the next start.** After the aborted child, assert the
+    documented residue and its recovery rather than pretending abort cleaned up:
+    - the session workers survive, which is the intended restart-adoption behavior;
+    - the stale socket file is still present;
+    - a fresh Hub start then removes that stale socket through `prepare_socket_path` and
+      adopts the surviving workers through `adoption_scan` and `adopt_session`;
+    - after that start, the worker set is adopted, not duplicated, and no zombie remains.
+    Red-on-revert: make the timeout path attempt `CoreDaemon::shutdown` first; the
+    never-called assertion in 16a must fail.
 17. **Deletion is complete.** Source guards prove `SendInput`, `ModeGatedInput`, and `Resize`
     JSON terminal routes are absent from Hub production sources, that no second active
     terminal route exists, and that `pump_woken(` appears in exactly one production file,
@@ -671,9 +734,19 @@ one-test baseline before each ablation.
     WebRTC `Attach` returns `kind = TerminalReservation` with every
     `DaemonTerminalReservation` field present and binds nothing until the labeled channel
     opens; a Unix `Attach` omits `terminal_reservation` from the wire entirely and binds
-    inline. Prove the two typed error codes `reservation_expired` and
-    `reservation_label_conflict` through the real handler, and prove an expired reservation
-    rejects a late channel as stale rather than unknown.
+    inline. The two error codes are proved on their two different paths:
+    - `reservation_label_conflict` through the real `Attach` handler: a repeated `Attach`
+      for a route that already holds a live reservation returns `OperatorError` with
+      `operation = "attach"` and this code, and reserves nothing.
+    - `reservation_expired` on the late-channel admission path, not through `Attach`: after
+      the deadline passes and the reservation retires, opening the labeled channel emits one
+      unsolicited `TerminalSubscriptionClosed` on the peer's control DataChannel with reason
+      `reservation_expired` for the exact `(session_id, subscription_id, generation)`, then
+      bounded-closes the channel, and the channel never binds. A channel whose label was
+      never reserved is rejected with no event, which is what keeps stale distinguishable
+      from unknown.
+    Red-on-revert: emit `reservation_expired` as an `Attach` response; the asynchronous
+    delivery assertion must fail.
 19d. **Pack and consume the real downstream artifacts.** Name and exercise the exact paths
     Web and TUI consume, rather than only the in-repo generated copies:
     - Node: `npm pack` `packages/hub-test-support` and install that tarball into a scratch
