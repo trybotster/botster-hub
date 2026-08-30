@@ -2,7 +2,7 @@
 
 Ticket: `ticket_1787894427_525056`
 Run: `run_1788046974_604085`
-Plan visit: 2 (Plan Review returned the run at `review_1788054175_439108`)
+Plan visit: 3 (Plan Review returned the run at `review_1788058432_516678`, changes required)
 
 This plan replaces `docs/plans/drive-terminal-progress-from-core-and-adapter-wakes.md`,
 which the human decision superseded. That file stays as the historical record.
@@ -72,6 +72,8 @@ Atomic notes:
 - [[WebRTC DataChannel local close uses the peer close bound before cleanup]]
 - [[generated typescript dtos must encode serde field optionality]]
 - [[daemon event shape changes bump conformance fixture revision not protocol version]]
+- [[public dto field additions are source breaking without non exhaustive]]
+- [[scratch cargo patch redirects measure downstream dto breakage]]
 
 No other repository charter is loaded. No Project Pipelines overlay is required.
 
@@ -81,8 +83,8 @@ No other repository charter is loaded. No Project Pipelines overlay is required.
 - Human decision `question_1788048108_946530`, revised answer: no backwards compatibility,
   no compatibility window, no feature filter, no mixed pin, no fallback, no second active
   terminal route. This Hub ticket is the single Hub-side cold cut.
-- Plan Review `review_1788054175_439108` and `review_1788048365_936269`, and the six open
-  findings addressed below.
+- Plan Review `review_1788058432_516678` (changes required), `review_1788054175_439108`,
+  and `review_1788048365_936269`. Every open finding is addressed below.
 - Hub source: `src/daemon/owner_loop.rs`, `src/daemon_maintenance.rs`,
   `src/daemon/control/sessions.rs`, `src/subscription/attach_routes.rs`,
   `src/subscription/closed_events.rs`, `src/transport/shared/*`, `src/transport/unix/*`,
@@ -224,6 +226,55 @@ The previous bounded-queue-plus-flag design could drop an exact route key. Repla
 - `DaemonRequest::Attach` on a WebRTC peer becomes two phase. Hub admits the subscription,
   reserves an exact label bound to `(session_id, subscription_id, generation, peer_generation)`,
   and returns that reservation on the control channel. Hub does not bind yet.
+
+#### 5a. Exact Attach reservation contract
+
+`DaemonResponseKind` gains one variant, `TerminalReservation`. `DaemonResponse` gains one
+optional field in its existing flat-struct style:
+
+```rust
+#[serde(default, skip_serializing_if = "Option::is_none")]
+pub terminal_reservation: Option<DaemonTerminalReservation>,
+```
+
+```rust
+/// Hub-reserved subscription DataChannel label for one admitted terminal route.
+///
+/// Non-exhaustive so later additive fields stay source-compatible for external
+/// Rust consumers, per [[public dto field additions are source breaking without non exhaustive]].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct DaemonTerminalReservation {
+    pub session_id: String,
+    pub subscription_id: String,
+    /// Core-minted terminal subscription generation for this route.
+    pub generation: u64,
+    /// Hub peer generation that owns the reservation.
+    pub peer_generation: u64,
+    /// Exact DataChannel label the peer must create. Opaque to the peer.
+    pub label: String,
+    /// Whole seconds the peer has to open the labeled channel.
+    pub expires_in_seconds: u32,
+}
+```
+
+Transport behavior:
+
+- **WebRTC.** A successful `Attach` returns `kind = TerminalReservation` with
+  `terminal_reservation = Some(..)` and binds nothing. The peer then creates the labeled
+  channel. Terminal frames start only after Hub admits and binds that channel.
+- **Unix.** A successful `Attach` keeps its current response kind and returns
+  `terminal_reservation = None`. Unix binds inline on the existing connection, exactly as
+  today. The field is absent on the wire because of `skip_serializing_if`.
+- **Expiry.** A reservation that is not opened within `expires_in_seconds` retires with its
+  route. A later channel with that label is rejected as stale, not as unknown, so the
+  diagnostic distinguishes the two.
+- **Errors.** Every pre-reservation failure keeps the existing
+  `DaemonResponseKind::OperatorError` shape from `attach_bind_operator_error`, with
+  `operation = "attach"`. Reservation adds two typed codes: `reservation_expired` and
+  `reservation_label_conflict`. No new error envelope is introduced.
+- **Serde.** `label` is an opaque string. Hub never derives peer-visible meaning from its
+  contents, and no client parses it.
 - The browser creates one reliable ordered DataChannel with the reserved label. Hub accepts a
   remote-initiated channel **only** when its label matches a live `Reserved` route, applies
   the existing encrypted DataChannel Hello admission, then binds the duplex Core adapter.
@@ -254,6 +305,18 @@ The previous bounded-queue-plus-flag design could drop an exact route key. Repla
 - Delete the polling terminal progress path: the terminal side of
   `run_pump_observe_phase`, and `HubRuntime::bind_terminal_adapter` usage.
 - Delete the shared control-channel terminal path inside Hub.
+- **Bump `PROTOCOL_VERSION` from 7 to 8.** Deleting request variants and changing the
+  `Attach` response are breaking request and response changes.
+  [[daemon event shape changes bump conformance fixture revision not protocol version]]
+  limits conformance-only bumps to compatible shape changes, so a revision bump alone would
+  let a protocol-7 client pass admission and then call an absent route or misparse the
+  `Attach` response. Update `crates/botster-hub-client/src/lib.rs` `PROTOCOL_VERSION`,
+  `DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION` handling, every compatibility fixture and
+  descriptor, `crates/botster-hub-test-support/src/lib.rs`, `src/mcp.rs`, the generated
+  TypeScript, `docs/client-protocol.md`, and the protocol assertions in
+  `tests/hub_daemon_lifecycle/{shutdown,sessions,unix_terminal_adapter,webrtc_terminal_adapter}.rs`.
+  Also bump `CONFORMANCE_FIXTURE_REVISION` from 46 for the fixture changes: the two signals
+  are separate and both apply.
 - Regenerate `crates/botster-hub-client/generated/daemon-protocol.ts`,
   `packages/hub-test-support/daemon-protocol.ts`, and
   `packages/hub-test-support/first-party-client-support-matrix.json`, and bump the
@@ -357,9 +420,34 @@ long-lived host thread to the terminal byte path.
   frames drained.
 - WebRTC channel and peer close keep the existing `LOCAL_WEBRTC_PEER_CLOSE_BOUND` and always
   reach cleanup, per [[WebRTC DataChannel local close uses the peer close bound before cleanup]].
-- Hard stop: an `AtomicBool` stop flag plus a pushed wake ends the driver loop even when the
-  source is quiet. `HubRuntime::release_for_restart` sets the flag, wakes the source, and
-  joins with a bound before Core shutdown. A join timeout is a fail-closed diagnostic.
+- Hard stop, stated exactly, because `JoinHandle::join` has no timeout:
+
+  1. **Stop signal.** `HubRuntime::release_for_restart` sets an `AtomicBool` stop flag, then
+     pushes one wake into the shared `TerminalWakeSource`, so an in-flight
+     `wait_wakes(WATCHDOG)` returns at once. The driver tests the flag at the top of each
+     turn and again immediately after `wait_wakes` returns.
+  2. **Completion signal.** The driver owns the `SyncSender` half of a
+     `mpsc::sync_channel::<()>(1)` created at start. Sending on it is the driver's last
+     action before it returns, and it happens **after** the `CoreDaemon` mutex guard is
+     dropped. Hub waits with `rx.recv_timeout(DATA_PLANE_STOP_BOUND)`.
+     - `Ok(())` means the driver has finished all mutex work and is returning.
+     - `Err(Disconnected)` means the sender was dropped by a panic unwind. The mutex guard
+       is released by unwinding, so the driver takes no further Core work.
+     Both outcomes make the following `join()` bounded, so Hub calls `join()` next and only
+     then calls `CoreDaemon::shutdown`.
+  3. **Bound derivation.** `DATA_PLANE_STOP_BOUND = 2 * DATA_PLANE_WATCHDOG + STOP_SLACK`.
+     The loop body is non-blocking except for `wait_wakes`, and every per-turn budget is a
+     fixed constant, so the worst-case exit is one in-flight `wait_wakes` plus one bounded
+     turn. A timeout therefore signals a defect, not ordinary load.
+  4. **Terminal action on timeout.** Hub **does not** call `CoreDaemon::shutdown`, does not
+     call `join()`, and does not continue the shutdown sequence, because the driver may still
+     hold the mutex. Hub records the typed `data_plane_driver_stop_timeout` diagnostic, then
+     calls `std::process::abort()`. Abort is the only action that guarantees no
+     `botster-hub-data-plane` thread survives when the thread will not stop. Recovery is a
+     supervisor restart.
+
+  This is what makes "no Hub thread survives" provable rather than asserted. Acceptance
+  check 16 covers the normal path and check 16a covers the timeout path.
 
 `late_message_matrix`
 
@@ -455,7 +543,7 @@ Changed:
 - `crates/botster-hub-test-support/{Cargo.toml,build.rs,src/lib.rs,src/conformance_data.rs}`
 - `packages/hub-test-support/daemon-protocol.ts`,
   `packages/hub-test-support/first-party-client-support-matrix.json`
-- `src/lib.rs`, `src/runtime.rs`, `src/main.rs`, `src/local_webrtc_smoke.rs`
+- `src/lib.rs`, `src/runtime.rs`, `src/main.rs`, `src/local_webrtc_smoke.rs`, `src/mcp.rs`
 - `src/daemon/owner_loop.rs`, `src/daemon_maintenance.rs`, `src/daemon/control.rs`,
   `src/daemon/control/request.rs`, `src/daemon/control/sessions.rs`
 - `src/subscription/attach_routes.rs`, `src/subscription/closed_events.rs`
@@ -549,9 +637,21 @@ one-test baseline before each ablation.
     thread, at most 64 Hub OS threads, unchanged queue capacities, close-work and route
     counters returning to zero, and an unchanged idle CPU bound. The driver must block, not
     spin.
-16. **Shutdown ordering.** The driver stops and joins before `CoreDaemon::shutdown`; exact-key
-    suppression still holds for admitted Unix and WebRTC routes; an orderly down leaves no Hub
-    thread, session worker, zombie, or socket.
+16. **Shutdown ordering, normal path.** Assert the completion signal arrives within
+    `DATA_PLANE_STOP_BOUND`, that `join()` then returns, and that `CoreDaemon::shutdown` runs
+    strictly after the join. A thread census shows no `botster-hub-data-plane` thread, and an
+    orderly down leaves no Hub thread, session worker, zombie, or socket. Exact-key
+    suppression still holds for admitted Unix and WebRTC routes before Core shutdown.
+    Red-on-revert: call `CoreDaemon::shutdown` before the completion wait; the ordering
+    assertion must fail.
+16a. **Shutdown timeout path, deterministic.** A `BOTSTER_ENV=test` seam parks the driver
+    inside its turn so it cannot reach the completion send. On the isolated Hub child, assert
+    that the wait ends at `DATA_PLANE_STOP_BOUND`, that `CoreDaemon::shutdown` is never
+    called (proved by the absence of its observation marker while the driver-timeout marker
+    is present), that the typed `data_plane_driver_stop_timeout` diagnostic is recorded, and
+    that the process terminates by abort with no surviving Hub thread, session worker,
+    zombie, or socket. Red-on-revert: replace the abort with a plain `join()`; the test must
+    hang or observe a surviving thread.
 17. **Deletion is complete.** Source guards prove `SendInput`, `ModeGatedInput`, and `Resize`
     JSON terminal routes are absent from Hub production sources, that no second active
     terminal route exists, and that `pump_woken(` appears in exactly one production file,
@@ -562,6 +662,33 @@ one-test baseline before each ablation.
 19. **Client contract proof.** Regenerated `daemon-protocol.ts`, the hub-test-support package
     copy, and the support matrix match the Rust DTOs; the conformance fixture revision is
     bumped; the hub-test-support Node test passes.
+19b. **Protocol 8 admission.** Assert exact protocol equality separately from the conformance
+    revision floor: a protocol-7 client is rejected at admission and never reaches an absent
+    route or an unparsed `Attach` response, while a protocol-8 client at the same conformance
+    revision is admitted. Red-on-revert: leave `PROTOCOL_VERSION` at 7; the protocol-7
+    rejection assertion must fail.
+19c. **Attach reservation contract.** Prove the exact serde shape on both transports: a
+    WebRTC `Attach` returns `kind = TerminalReservation` with every
+    `DaemonTerminalReservation` field present and binds nothing until the labeled channel
+    opens; a Unix `Attach` omits `terminal_reservation` from the wire entirely and binds
+    inline. Prove the two typed error codes `reservation_expired` and
+    `reservation_label_conflict` through the real handler, and prove an expired reservation
+    rejects a late channel as stale rather than unknown.
+19d. **Pack and consume the real downstream artifacts.** Name and exercise the exact paths
+    Web and TUI consume, rather than only the in-repo generated copies:
+    - Node: `npm pack` `packages/hub-test-support` and install that tarball into a scratch
+      consumer that imports `@trybotster/hub-test-support/daemon-protocol` and
+      `/first-party-client-support-matrix`. Assert the deleted request identifiers are absent
+      and the reservation type is present.
+    - Rust: use a scratch Cargo patch redirect against the real `botster-web` and
+      `botster-tui` worktrees, per
+      [[scratch cargo patch redirects measure downstream dto breakage]], without
+      contaminating their primary checkouts.
+    Both consumers are expected to **fail** on this cut. Record each expected failure exactly:
+    the consumer, the command, and the compile or admission error it produces. That recorded
+    failure is the evidence that the break is understood and scoped, and it is the acceptance
+    input for the dependent `botster-web` and `botster-tui` tickets. An unexpected passing
+    consumer is a finding, because it would mean a deleted route survived.
 19a. **No survivor of the deleted routes.** A guard proves that `SendInput`,
     `ModeGatedInput`, and `Resize` request identifiers appear in no Hub production source, no
     `botster-hub-client` public re-export, no generated TypeScript, no fixture, no CLI help
