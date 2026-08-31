@@ -3662,15 +3662,22 @@ fn final_cleanup_accepts_already_exited_without_altering_sibling() {
 
     production_shutdown_and_remove_session(&endpoint, "final-cleanup-exited");
 
-    let sibling_after = botster_hub_client::request(
+    let sessions_after = botster_hub_client::request(
         &endpoint,
         botster_hub_client::DaemonRequest::ListSessions,
     )
     .expect("list sessions after final cleanup")
-    .sessions
-    .into_iter()
-    .find(|session| session.session_id == "final-cleanup-sibling")
-    .expect("sibling after final cleanup");
+    .sessions;
+    assert!(
+        sessions_after
+            .iter()
+            .all(|session| session.session_id != "final-cleanup-exited"),
+        "final cleanup must remove the already exited target"
+    );
+    let sibling_after = sessions_after
+        .into_iter()
+        .find(|session| session.session_id == "final-cleanup-sibling")
+        .expect("sibling after final cleanup");
     assert_eq!(
         sibling_after, sibling_before,
         "final cleanup for an already exited session must not alter its sibling"

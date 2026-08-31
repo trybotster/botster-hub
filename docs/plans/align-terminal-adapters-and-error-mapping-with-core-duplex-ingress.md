@@ -11,7 +11,7 @@ Base ref: `main` at `c674a62`
 | --- | --- |
 | Target repository | `botster-hub` (`trybotster/botster-hub`) |
 | Target id | `tgt_7e208a0c76a44980a83b63af976b1f22` |
-| Repository path | `/Users/jasonconigliari/Projects/botster-hub` |
+| Repository path | Run worktree for `trybotster/botster-hub` |
 | Repository playbook | [[botster-hub-playbook]] |
 | Current Core pin | `7eafa470a18025895995bbedc20d34b58106a03b` |
 | New Core pin | `a781556258789dea4a50ffcb17351e7294c8ff26` |
@@ -129,7 +129,7 @@ the new Core pin.
 
 | Decision | Value |
 | --- | --- |
-| Final cleanup | `production_shutdown_and_remove_session` may accept `SessionCleanup` only when its body names the expected session with outcome `already_exited`. |
+| Final cleanup | `production_shutdown_and_remove_session` may accept `SessionCleanup` only when its body names the expected session with outcome `already_exited`. It then waits for authoritative exit and calls `RemoveSession`. |
 | Live shutdown proof | Substantive live `ShutdownSession` assertions still require `Events`. The helper change must not hide control-plane, input, shutdown, or sibling-isolation failures. |
 | Sibling proof | Add a focused fixture test that proves final cleanup for an already exited session does not alter a live sibling. |
 | Routing | This is Hub fixture compatibility required by the Core pin roll. Do not create another dependency ticket. |
@@ -577,7 +577,7 @@ from that shell. The worktree path holds no `:`, so do not set
 | 13 | New Hub unit test: both new error class strings, distinct, no `/`, next to the existing bind-error test | Passes |
 | 13a | New in-crate test from section 6.5: two sibling routes bound through the real Hub attach path, ingress loss on one, real Core hard stop through the `#[cfg(test)]` drain seam | Passes. Exactly the lost `(session_id, subscription_id, generation)` route retires, and the sibling stays live and still accepts output. |
 | 13b | Confirm `src/lib.rs:917` source guard still rejects a production call to `drain_runtime_once(` | Passes unchanged. The guard was not weakened to make 13a compile. |
-| 13c | `final_cleanup_accepts_already_exited_without_altering_sibling` and `external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable` | Both pass. Final cleanup accepts only the exact typed already-exited result, and the substantive failure path plus sibling behavior remain strict. |
+| 13c | `final_cleanup_accepts_already_exited_without_altering_sibling` and `external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable` | Both pass. Final cleanup accepts only the exact typed already-exited result, removes the target row, and preserves the exact sibling. The substantive failure path remains strict. |
 | 14 | `cargo build --locked -p botster-core-daemon --bin botster-session-worker` and `cargo build --locked --bin botster-hub` | Succeed, before the locked suite |
 | 15 | `./test.sh --locked` on a quiet host with `CARGO_TARGET_DIR` unset | Green in one default-concurrency run |
 
