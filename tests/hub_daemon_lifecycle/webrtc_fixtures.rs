@@ -512,6 +512,7 @@ pub(crate) struct LocalWebrtcOfferPeer {
     pending_host: PendingHostEventState,
     pub(crate) accept_host_events: bool,
     inbound: WebrtcInboundMailbox,
+    subscription_channels: Vec<Arc<dyn DataChannel>>,
     subscription_inbounds: Vec<WebrtcInboundMailbox>,
     pub(crate) control_terminal_frame_count: u64,
 }
@@ -719,6 +720,7 @@ impl LocalWebrtcOfferPeer {
                 pending_host: PendingHostEventState::new(),
                 accept_host_events: false,
                 inbound,
+                subscription_channels: Vec::new(),
                 subscription_inbounds: Vec::new(),
                 control_terminal_frame_count: 0,
             },
@@ -1160,6 +1162,7 @@ impl LocalWebrtcOfferPeer {
             .into());
         }
         let _ack: botster_hub_client::DaemonHelloAck = serde_json::from_slice(&plaintext)?;
+        self.subscription_channels.push(Arc::clone(&channel));
         self.subscription_inbounds.push(extra.inbound);
         Ok(channel)
     }

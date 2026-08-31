@@ -790,7 +790,6 @@ pub(crate) enum AttachedSubscriptionChange {
 pub(crate) enum UnixEofAblation {
     None,
     LeaveRoute,
-    SkipCoreDetach,
     PairOnlyDetach,
 }
 
@@ -800,7 +799,6 @@ pub(crate) fn unix_eof_cleanup_ablation() -> UnixEofAblation {
     }
     match env::var("BOTSTER_HUB_UNIX_EOF_ABLATION").as_deref() {
         Ok("leave_route") => UnixEofAblation::LeaveRoute,
-        Ok("skip_core_detach") => UnixEofAblation::SkipCoreDetach,
         Ok("pair_only_detach") => UnixEofAblation::PairOnlyDetach,
         _ => UnixEofAblation::None,
     }

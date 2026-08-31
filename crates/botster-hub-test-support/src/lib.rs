@@ -262,7 +262,7 @@ pub fn run_session_lifecycle_subscription_conformance(
         endpoint,
         DaemonRequest::Spawn {
             session_id: SESSION_LIFECYCLE_SESSION_ID.to_string(),
-            command: "printf 'session-lifecycle-started\\n'; sleep 2".to_string(),
+            command: "printf 'session-lifecycle-started\\n'; IFS= read -r release".to_string(),
         },
     )
     .map_err(|error| session_lifecycle_error("spawn", error.to_string()))?;
@@ -366,6 +366,13 @@ pub fn run_session_lifecycle_subscription_conformance(
             "subscriber resize sequences diverged",
         ));
     }
+    terminal
+        .send_terminal_frame(
+            SESSION_LIFECYCLE_SESSION_ID,
+            "session-lifecycle-terminal",
+            &terminal_input_frame_bytes(b"release\n"),
+        )
+        .map_err(|error| session_lifecycle_error("lifecycle release", error.to_string()))?;
 
     let exit_deadline = Instant::now() + Duration::from_secs(10);
     let exit_sequence = loop {

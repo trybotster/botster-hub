@@ -32,6 +32,7 @@ pub(crate) fn egress_write_class(error: &DaemonTransportError) -> EgressWriteCla
 
 #[derive(Debug)]
 pub(crate) enum ControlMessage {
+    DataPlaneProgress,
     AcceptedConnection {
         stream: TokioUnixStream,
         admission_permit: OwnedSemaphorePermit,

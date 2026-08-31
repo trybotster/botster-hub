@@ -22,6 +22,9 @@ pub(crate) fn handle(
     message: ControlMessage,
 ) -> bool {
     match message {
+        ControlMessage::DataPlaneProgress => {
+            unreachable!("data-plane progress is an owner-loop message")
+        }
         ControlMessage::AcceptedConnection { .. } | ControlMessage::RejectedConnection => false,
         ControlMessage::RegisterUnixAdmission {
             client_id,

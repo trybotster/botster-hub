@@ -46,6 +46,7 @@ impl<W: WakeSink> AdapterSlot<W> {
         if let Ok(mut slot) = self.core_sink.lock() {
             *slot = Some(sink);
         }
+        self.emit_writable();
     }
 
     pub(crate) fn attach_close_hook(&self, hook: impl Fn(bool) + Send + Sync + 'static) {
@@ -291,6 +292,12 @@ impl<W: WakeSink> AdapterSlot<W> {
         }
         self.wake.wake();
         taken
+    }
+}
+
+impl AdapterSlot<super::wake::AdapterWake> {
+    pub(crate) async fn wait_for_write(&self) {
+        self.wake.wait().await;
     }
 }
 

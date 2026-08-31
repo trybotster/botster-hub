@@ -719,34 +719,32 @@ pub(crate) fn handle_connection_cleanup(
             continue;
         };
 
-        if ablation != UnixEofAblation::SkipCoreDetach {
-            let now = tick(&mut state.logical_clock);
-            match daemon.runtime_mut().map(|runtime| {
-                runtime.detach_terminal_subscription(
-                    ClientId(cleanup.client_id.clone()),
-                    SessionId(session_id.clone()),
-                    SubscriptionId(subscription_id.clone()),
-                    generation,
-                    now,
-                )
-            }) {
-                Some(Ok(
-                    DetachTerminalSubscriptionResult::Detached { .. }
-                    | DetachTerminalSubscriptionResult::AlreadyGone
-                    | DetachTerminalSubscriptionResult::GenerationMismatch { .. },
-                )) => {}
-                Some(Err(_)) => {
-                    failed = true;
-                    continue;
-                }
-                None => {}
+        let now = tick(&mut state.logical_clock);
+        match daemon.runtime_mut().map(|runtime| {
+            runtime.detach_terminal_subscription(
+                ClientId(cleanup.client_id.clone()),
+                SessionId(session_id.clone()),
+                SubscriptionId(subscription_id.clone()),
+                generation,
+                now,
+            )
+        }) {
+            Some(Ok(
+                DetachTerminalSubscriptionResult::Detached { .. }
+                | DetachTerminalSubscriptionResult::AlreadyGone
+                | DetachTerminalSubscriptionResult::GenerationMismatch { .. },
+            )) => {}
+            Some(Err(_)) => {
+                failed = true;
+                continue;
             }
-            *state
-                .lifecycle_counters
-                .cleanup_by_reason
-                .entry("cleanup_generation_detach".to_string())
-                .or_insert(0) += 1;
+            None => {}
         }
+        *state
+            .lifecycle_counters
+            .cleanup_by_reason
+            .entry("cleanup_generation_detach".to_string())
+            .or_insert(0) += 1;
 
         let was_bound = state
             .pending_runtime
