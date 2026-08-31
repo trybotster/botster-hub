@@ -56,6 +56,51 @@ pub(crate) const BOTSTER_WEB_READINESS_STARTUP_DELAY_MS: u64 = 3_000;
 pub(crate) const TEST_LOCAL_RUNTIME_READINESS_BUDGET_MS_ENV: &str =
     "BOTSTER_HUB_TEST_LOCAL_RUNTIME_READINESS_BUDGET_MS";
 
+pub(crate) fn terminal_input_frame_bytes(data: &[u8]) -> Vec<u8> {
+    let mut bytes = vec![1, 1];
+    bytes.extend_from_slice(&(u16::try_from(data.len()).unwrap_or(0)).to_be_bytes());
+    bytes.extend_from_slice(data);
+    bytes
+}
+
+pub(crate) fn terminal_resize_frame_bytes(rows: u16, cols: u16) -> Vec<u8> {
+    let mut bytes = vec![1, 3, 0, 4];
+    bytes.extend_from_slice(&rows.to_be_bytes());
+    bytes.extend_from_slice(&cols.to_be_bytes());
+    bytes
+}
+
+pub(crate) fn terminal_mode_gated_frame_bytes(
+    data: &[u8],
+    mode_generation: u64,
+    mode_revision: u64,
+) -> Vec<u8> {
+    let body_len = 16 + data.len();
+    let mut bytes = vec![1, 2];
+    bytes.extend_from_slice(&(u16::try_from(body_len).unwrap_or(0)).to_be_bytes());
+    bytes.extend_from_slice(&mode_generation.to_be_bytes());
+    bytes.extend_from_slice(&mode_revision.to_be_bytes());
+    bytes.extend_from_slice(data);
+    bytes
+}
+
+pub(crate) fn write_unix_terminal_frame(
+    stream: &mut UnixStream,
+    session_id: impl Into<String>,
+    subscription_id: impl Into<String>,
+    frame_bytes: &[u8],
+) {
+    botster_hub_client::write_frame(
+        stream,
+        &botster_hub_client::DaemonUnixTerminalEnvelope::from_frame_bytes(
+            session_id,
+            subscription_id,
+            frame_bytes,
+        ),
+    )
+    .expect("write unix terminal frame");
+}
+
 pub(crate) fn unique_test_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

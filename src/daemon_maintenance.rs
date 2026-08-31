@@ -63,11 +63,14 @@ const FANOUT_QUEUE_MAX_BYTES: usize = 64 * 1024;
 const HOST_BRIDGE_MAX_BYTES: usize = 64 * 1024;
 const CONSUMER_REFRESH_MAX: usize = 8;
 /// CloseEvents visits this many admissions per Pump slice.
+#[allow(dead_code)]
 pub const PUMP_MAX_ADMISSIONS_VISITED: usize = 8;
 /// CloseEvents classifies this many closed-route candidates per Pump slice.
+#[allow(dead_code)]
 pub const PUMP_MAX_CANDIDATE_CLASSIFICATIONS: usize = 8;
 /// CloseEvents visits this many mux route entries per Pump slice, including
 /// open and already-reported rows.
+#[allow(dead_code)]
 pub const PUMP_MAX_ROUTE_ENTRIES_VISITED: usize = 8;
 /// InventoryReconcile visits this many stream-map entries per Pump slice,
 /// including unbound rows.
@@ -174,15 +177,13 @@ pub enum BackgroundClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PumpPhase {
     Observe,
-    CloseEvents,
     InventoryReconcile,
 }
 
 impl PumpPhase {
     fn next(self) -> Self {
         match self {
-            Self::Observe => Self::CloseEvents,
-            Self::CloseEvents => Self::InventoryReconcile,
+            Self::Observe => Self::InventoryReconcile,
             Self::InventoryReconcile => Self::Observe,
         }
     }
@@ -195,6 +196,7 @@ pub enum PumpAdmissionCursor {
         after: Option<String>,
         after_route: Option<(String, String, u64)>,
     },
+    #[allow(dead_code)]
     Webrtc {
         after: Option<String>,
         after_route: Option<(String, String, u64)>,
@@ -3391,14 +3393,14 @@ mod tests {
     fn pump_phases_rotate_and_keep_cursors() {
         let mut pump = PumpScheduler::default();
         assert_eq!(pump.take_phase(), PumpPhase::Observe);
-        assert_eq!(pump.take_phase(), PumpPhase::CloseEvents);
+        assert_eq!(pump.take_phase(), PumpPhase::InventoryReconcile);
         pump.close_cursor = PumpAdmissionCursor::Unix {
             after: Some("client-a".into()),
             after_route: Some(("s".into(), "sub".into(), 1)),
         };
         pump.reconcile_after = Some(("s".into(), "sub".into()));
-        assert_eq!(pump.take_phase(), PumpPhase::InventoryReconcile);
         assert_eq!(pump.take_phase(), PumpPhase::Observe);
+        assert_eq!(pump.take_phase(), PumpPhase::InventoryReconcile);
         assert_eq!(
             pump.close_cursor,
             PumpAdmissionCursor::Unix {
@@ -3414,45 +3416,40 @@ mod tests {
         let mut classes = BackgroundClassScheduler::default();
         let mut pump = PumpScheduler::default();
         let mut observe_at = None;
-        let mut close_at = None;
         let mut reconcile_at = None;
         for turn in 0..6 {
             classes.mark_pump();
             assert_eq!(
                 classes.select(false),
                 Some(BackgroundClass::Pump),
-                "close work keeps Pump pending without inventing Maintenance priority"
+                "pump work keeps Pump pending without inventing Maintenance priority"
             );
             match pump.take_phase() {
                 PumpPhase::Observe if observe_at.is_none() => observe_at = Some(turn),
-                PumpPhase::CloseEvents if close_at.is_none() => close_at = Some(turn),
                 PumpPhase::InventoryReconcile if reconcile_at.is_none() => {
                     reconcile_at = Some(turn)
                 }
-                _ => {}
+                PumpPhase::Observe | PumpPhase::InventoryReconcile => {}
             }
         }
         assert_eq!(observe_at, Some(0));
-        assert_eq!(close_at, Some(1));
-        assert_eq!(reconcile_at, Some(2));
+        assert_eq!(reconcile_at, Some(1));
     }
 
     #[test]
-    fn inverted_close_phase_rewrite_starves_observe_and_reconcile() {
+    fn inverted_reconcile_phase_rewrite_starves_observe() {
         let mut pump = PumpScheduler::default();
         let mut saw_observe = false;
-        let mut saw_reconcile = false;
         for _ in 0..6 {
-            pump.force_next(PumpPhase::CloseEvents);
+            pump.force_next(PumpPhase::InventoryReconcile);
             match pump.take_phase() {
                 PumpPhase::Observe => saw_observe = true,
-                PumpPhase::InventoryReconcile => saw_reconcile = true,
-                PumpPhase::CloseEvents => {}
+                PumpPhase::InventoryReconcile => {}
             }
         }
         assert!(
-            !saw_observe && !saw_reconcile,
-            "rewriting next to CloseEvents every turn is the starvation this ticket forbids"
+            !saw_observe,
+            "rewriting next to InventoryReconcile every turn starves Observe"
         );
     }
 

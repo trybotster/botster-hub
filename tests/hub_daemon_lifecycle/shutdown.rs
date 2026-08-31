@@ -2542,16 +2542,6 @@ fn process_ownership_daemon_restart_adopts_then_shuts_down_worker_session() {
             .any(|session| session.session_id == session_id && session.lifecycle == "running")
     );
 
-    let resize = botster_hub::daemon_transport_request(
-        &config,
-        botster_hub::DaemonRequest::Resize {
-            session_id: session_id.to_string(),
-            rows: 30,
-            cols: 100,
-        },
-    )
-    .expect("resize after daemon restart");
-    assert_eq!(resize.kind, botster_hub::DaemonResponseKind::Events);
     let mut connection = botster_hub_client::DaemonConnection::connect(&endpoint)
         .expect("connect after daemon restart");
     connection
@@ -2560,6 +2550,13 @@ fn process_ownership_daemon_restart_adopts_then_shuts_down_worker_session() {
             subscription_id: "cli-restart-subscription-after".to_string(),
         })
         .expect("attach after daemon restart");
+    connection
+        .send_terminal_frame(
+            session_id.as_str(),
+            "cli-restart-subscription-after",
+            &terminal_resize_frame_bytes(30, 100),
+        )
+        .expect("resize after daemon restart");
     let ready_deadline = Instant::now() + Duration::from_secs(8);
     let mut attached = false;
     while Instant::now() < ready_deadline {
@@ -2590,13 +2587,13 @@ fn process_ownership_daemon_restart_adopts_then_shuts_down_worker_session() {
         }
         thread::sleep(Duration::from_millis(25));
     }
-    let send = connection
-        .request(&botster_hub_client::DaemonRequest::SendInput {
-            session_id: session_id.to_string(),
-            data: "after-restart\r".to_string(),
-        })
+    connection
+        .send_terminal_frame(
+            session_id.as_str(),
+            "cli-restart-subscription-after",
+            &terminal_input_frame_bytes(b"after-restart\r"),
+        )
         .expect("send input after daemon restart");
-    assert_eq!(send.kind, botster_hub_client::DaemonResponseKind::Events);
     let deadline = Instant::now() + Duration::from_secs(8);
     let mut screen_text = String::new();
     while Instant::now() < deadline {

@@ -229,6 +229,7 @@ pub(crate) fn handle_runtime(
             read_screen: None,
             mode_flags: None,
             mode_gated_input: None,
+            terminal_reservation: None,
             capture_snapshot: None,
             spawn_targets: Vec::new(),
             spawn_target_validation: None,

@@ -41,8 +41,8 @@ use crate::subscription::entity::EntityFrameSender;
 use crate::transport::unix::UnixConnectionMux;
 use crate::transport::unix::listener::{NEXT_SOCKET_CLIENT_ID, daemon_endpoint};
 use crate::transport::unix::mux_write::{
-    MuxWriteState, entity_subscription_mux_busy_error, flush_pending_responses,
-    flush_unix_mux_writes, read_async_frame, unix_event_flush_stalled,
+    MuxWriteState, UnixInbound, entity_subscription_mux_busy_error, flush_pending_responses,
+    flush_unix_mux_writes, read_async_frame, read_async_inbound, unix_event_flush_stalled,
     unix_mux_blocks_entity_subscription, write_async_frame,
 };
 
@@ -72,6 +72,18 @@ impl DaemonConnection {
     pub fn request(&mut self, request: &DaemonRequest) -> DaemonTransportResult<DaemonResponse> {
         self.inner
             .request(request)
+            .map_err(DaemonTransportError::from)
+    }
+
+    /// Write one opaque terminal input frame on this muxed Unix connection.
+    pub fn send_terminal_frame(
+        &mut self,
+        session_id: impl Into<String>,
+        subscription_id: impl Into<String>,
+        frame_bytes: &[u8],
+    ) -> DaemonTransportResult<()> {
+        self.inner
+            .send_terminal_frame(session_id, subscription_id, frame_bytes)
             .map_err(DaemonTransportError::from)
     }
 }
@@ -152,7 +164,7 @@ pub(crate) async fn handle_connection_async(
                 .is_some_and(|mailbox| mailbox.has_ready_event());
         let request = tokio::select! {
             biased;
-            request = read_async_frame::<DaemonRequest, _>(&mut reader, None) => request,
+            request = read_async_inbound(&mut reader, None) => request,
             _ = mux.notify().notified() => {
                 mux.clear_deferred_flushes();
                 if let Err(error) = flush_unix_mux_writes(
@@ -217,7 +229,27 @@ pub(crate) async fn handle_connection_async(
             }
         };
         let request = match request {
-            Ok(request) => request,
+            Ok(UnixInbound::Request(request)) => request,
+            Ok(UnixInbound::Terminal(envelope)) => {
+                match envelope.payload_bytes() {
+                    Ok(bytes) => {
+                        if let Some(handle) =
+                            mux.live_handle(&envelope.session_id, &envelope.subscription_id)
+                            && handle.push_ingress(bytes).is_err()
+                        {
+                            handle.close();
+                        }
+                    }
+                    Err(_) => {
+                        if let Some(handle) =
+                            mux.live_handle(&envelope.session_id, &envelope.subscription_id)
+                        {
+                            handle.close();
+                        }
+                    }
+                }
+                continue;
+            }
             Err(ClientDaemonTransportError::ClientDisconnected) => {
                 cleanup.set_reason(ConnectionTerminalReason::Eof);
                 return Ok(());

@@ -87,6 +87,42 @@ pub(crate) enum ControlMessage {
         admission: WebrtcTerminalAdmission,
         host_required_features: Vec<String>,
     },
+    InspectTerminalReservation {
+        grant_id: String,
+        label: String,
+        reply_tx: oneshot::Sender<ReservationInspectReply>,
+    },
+    BindReservedTerminal {
+        grant_id: String,
+        label: String,
+        reply_tx: oneshot::Sender<
+            Result<crate::transport::webrtc::WebRtcTerminalAdapterHandle, BindReservedError>,
+        >,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReservationInspectReply {
+    Unknown,
+    Expired {
+        session_id: String,
+        subscription_id: String,
+        generation: u64,
+    },
+    Bound,
+    Live {
+        session_id: String,
+        subscription_id: String,
+        generation: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BindReservedError {
+    Unknown,
+    Expired,
+    Bound,
+    BindFailed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

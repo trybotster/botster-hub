@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 /// Bounded close-slice progress. `after_route` is a resume cursor, not a route record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ClosedEventSliceProgress {

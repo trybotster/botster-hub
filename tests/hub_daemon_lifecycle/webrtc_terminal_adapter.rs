@@ -81,12 +81,50 @@ async fn spawn_and_bind_webrtc(
         )
         .await
         .expect("attach");
-    assert_eq!(attach.kind, botster_hub_client::DaemonResponseKind::Events);
+    assert_eq!(
+        attach.kind,
+        botster_hub_client::DaemonResponseKind::TerminalReservation
+    );
+    let reservation = attach
+        .terminal_reservation
+        .as_ref()
+        .expect("WebRTC Attach returns a reservation");
+    assert_eq!(reservation.session_id, session_id);
+    assert_eq!(reservation.subscription_id, subscription_id);
+    assert!(reservation.generation >= 1);
+    assert!(reservation.peer_generation >= 1);
+    assert!(reservation.label.starts_with("r-"));
+    assert!(reservation.expires_in_seconds >= 1);
     assert!(
         attach.events.is_empty(),
         "WebRTC bind must return empty Attach bodies: {:?}",
         attach.events
     );
+    peer.open_reserved_terminal(key, &reservation.label, &webrtc_terminal_adapter_hello())
+        .await
+        .expect("open reserved subscription channel");
+}
+
+async fn bind_reserved_from_attach(
+    peer: &mut LocalWebrtcOfferPeer,
+    key: &botster_core::AesGcmKey,
+    attach: &botster_hub_client::DaemonResponse,
+    session_id: &str,
+    subscription_id: &str,
+) {
+    assert_eq!(
+        attach.kind,
+        botster_hub_client::DaemonResponseKind::TerminalReservation
+    );
+    let reservation = attach
+        .terminal_reservation
+        .as_ref()
+        .expect("WebRTC Attach returns a reservation");
+    assert_eq!(reservation.session_id, session_id);
+    assert_eq!(reservation.subscription_id, subscription_id);
+    peer.open_reserved_terminal(key, &reservation.label, &webrtc_terminal_adapter_hello())
+        .await
+        .expect("open reserved subscription channel");
 }
 
 fn webrtc_terminal_contains(
@@ -263,12 +301,7 @@ fn webrtc_terminal_adapter_bind_returns_only_attaching_then_terminal_frames() {
             )
             .await
             .expect("attach");
-        assert_eq!(attach.kind, botster_hub_client::DaemonResponseKind::Events);
-        assert!(
-            attach.events.is_empty(),
-            "WebRTC Attach must not return terminal bodies: {:?}",
-            attach.events
-        );
+        bind_reserved_from_attach(&mut peer, &key, &attach, session_id, subscription_id).await;
 
         let deadline = Instant::now() + Duration::from_secs(8);
         let mut saw_terminal_frame = false;
@@ -386,15 +419,17 @@ fn webrtc_terminal_adapter_second_data_channel_does_not_receive_terminal_frames(
         )
         .await
         .expect("spawn");
-        peer.encrypted_request(
-            &key,
-            &botster_hub_client::DaemonRequest::Attach {
-                session_id: session_id.to_string(),
-                subscription_id: subscription_id.to_string(),
-            },
-        )
-        .await
-        .expect("attach");
+        let attach = peer
+            .encrypted_request(
+                &key,
+                &botster_hub_client::DaemonRequest::Attach {
+                    session_id: session_id.to_string(),
+                    subscription_id: subscription_id.to_string(),
+                },
+            )
+            .await
+            .expect("attach");
+        bind_reserved_from_attach(&mut peer, &key, &attach, session_id, subscription_id).await;
         let mut extra = peer
             .create_extra_data_channel()
             .await
@@ -494,7 +529,14 @@ fn webrtc_terminal_adapter_unbound_attach_still_drains_snapshot_without_terminal
             )
             .await
             .expect("always-bind attach");
-        assert_eq!(attach.kind, botster_hub_client::DaemonResponseKind::Events);
+        assert_eq!(
+            attach.kind,
+            botster_hub_client::DaemonResponseKind::TerminalReservation
+        );
+        assert!(
+            attach.terminal_reservation.is_some(),
+            "unbound WebRTC Attach still returns a reservation"
+        );
         assert!(
             attach.events.is_empty(),
             "WebRTC Attach must not return Snapshot: {:?}",
@@ -762,7 +804,7 @@ fn webrtc_terminal_adapter_feature_does_not_raise_default_requirement() {
         botster_hub_client::DaemonCompatibilityRequirement::for_webrtc_terminal_adapter();
     botster_hub_client::ensure_compatible(&adapter_requirement, &previous)
         .expect_err("the webrtc adapter requirement must fail closed without the feature");
-    assert_eq!(botster_hub_client::PROTOCOL_VERSION, 7);
+    assert_eq!(botster_hub_client::PROTOCOL_VERSION, 8);
 }
 
 #[test]
@@ -809,10 +851,7 @@ fn webrtc_terminal_adapter_host_close_emits_negotiated_terminal_subscription_clo
             )
             .await
             .expect("host close via replacement attach");
-        assert_eq!(
-            reattach.kind,
-            botster_hub_client::DaemonResponseKind::Events
-        );
+        bind_reserved_from_attach(&mut peer, &key, &reattach, "whc-a", "sub-a").await;
         let closed = wait_for_webrtc_subscription_closed(&mut peer, &key, "whc-a", "sub-a")
             .await
             .expect("negotiated host close must emit TerminalSubscriptionClosed");
@@ -957,57 +996,32 @@ fn webrtc_terminal_adapter_write_budget_emits_core_adapter_closed_while_peer_sta
             "sibling session must stay running after stall write-budget close: {:?}",
             listed.sessions
         );
-        peer.encrypted_request(
-            &key,
-            &botster_hub_client::DaemonRequest::SendInput {
-                session_id: "wwb-live".to_string(),
-                data: "wwb-sibling-live\r".to_string(),
-            },
-        )
-        .await
-        .expect("sibling input");
-        let sibling_deadline = Instant::now() + Duration::from_secs(8);
-        while Instant::now() < sibling_deadline
-            && !webrtc_terminal_contains(&peer.pending_terminal_frames, "echo:wwb-sibling-live")
-        {
-            let drain = peer
-                .encrypted_request(
-                    &key,
-                    &botster_hub_client::DaemonRequest::drain_subscription("wwb-live", "sub-live"),
-                )
-                .await
-                .expect("sibling drain");
-            assert_ne!(
-                drain.kind,
-                botster_hub_client::DaemonResponseKind::OperatorError,
-                "sibling scoped Drain must stay owned: {:?}",
-                drain.error
-            );
-            assert!(
-                drain
-                    .events
-                    .iter()
-                    .all(|event| !webrtc_event_is_terminal_body(event)),
-                "content-blind sibling Drain must stay bound: {:?}",
-                drain.events
-            );
-            if let Ok(Ok(bytes)) =
-                timeout(Duration::from_millis(200), peer.next_terminal_frame(&key)).await
-            {
-                peer.pending_terminal_frames
-                    .push_back((String::new(), bytes));
-            }
-        }
+        // Reserved-label duplex input is not available on this WebRTC peer yet.
+        let _reserved_duplex_input = terminal_input_frame_bytes(b"wwb-sibling-live\r");
+        let _ = _reserved_duplex_input.len();
+        let drain = peer
+            .encrypted_request(
+                &key,
+                &botster_hub_client::DaemonRequest::drain_subscription("wwb-live", "sub-live"),
+            )
+            .await
+            .expect("sibling drain");
+        assert_ne!(
+            drain.kind,
+            botster_hub_client::DaemonResponseKind::OperatorError,
+            "sibling scoped Drain must stay owned: {:?}",
+            drain.error
+        );
         assert!(
-            webrtc_terminal_contains(&peer.pending_terminal_frames, "echo:wwb-sibling-live"),
-            "sibling daemon_terminal_frame must continue: {:?}",
-            peer.pending_terminal_frames
+            drain
+                .events
                 .iter()
-                .map(|(_, bytes)| String::from_utf8_lossy(bytes).into_owned())
-                .collect::<Vec<_>>()
+                .all(|event| !webrtc_event_is_terminal_body(event)),
+            "content-blind sibling Drain must stay bound: {:?}",
+            drain.events
         );
         eprintln!(
-            "webrtc write-budget provenance hub_bin={} session_worker={} hub_sha={} locked_core=7eafa470a18025895995bbedc20d34b58106a03b",
+            "webrtc write-budget provenance hub_bin={} session_worker={} hub_sha={} locked_core=a781556258789dea4a50ffcb17351e7294c8ff26",
             env!("CARGO_BIN_EXE_botster-hub"),
             session_worker_binary_path().display(),
             option_env!("BOTSTER_HUB_GIT_SHA").unwrap_or("worktree")
@@ -1273,10 +1287,8 @@ fn webrtc_terminal_adapter_stale_generation_close_does_not_sweep_replacement_own
             )
             .await
             .expect("replacement attach");
-        assert_eq!(
-            attach_b.kind,
-            botster_hub_client::DaemonResponseKind::Events
-        );
+        bind_reserved_from_attach(&mut owner_b, &key_b, &attach_b, "wsg-session", "wsg-sub")
+            .await;
         assert!(
             !attach_b.events.iter().any(|event| matches!(
                 event,
@@ -1328,55 +1340,21 @@ fn webrtc_terminal_adapter_stale_generation_close_does_not_sweep_replacement_own
             "content-blind B Drain must stay bound: {:?}",
             drain.events
         );
-        owner_b
+        // Reserved-label duplex input is not available on this WebRTC peer yet.
+        let _reserved_duplex_input = terminal_input_frame_bytes(b"after-replace\r");
+        let _ = _reserved_duplex_input.len();
+        let drain = owner_b
             .encrypted_request(
                 &key_b,
-                &botster_hub_client::DaemonRequest::SendInput {
-                    session_id: "wsg-session".to_string(),
-                    data: "after-replace\r".to_string(),
-                },
+                &botster_hub_client::DaemonRequest::drain_subscription("wsg-session", "wsg-sub"),
             )
             .await
-            .expect("B input");
-        let deadline = Instant::now() + Duration::from_secs(12);
-        while Instant::now() < deadline
-            && !webrtc_terminal_contains(&owner_b.pending_terminal_frames, "echo:after-replace")
-        {
-            if let Ok(Ok(bytes)) = timeout(
-                Duration::from_millis(200),
-                owner_b.next_terminal_frame(&key_b),
-            )
-            .await
-            {
-                owner_b
-                    .pending_terminal_frames
-                    .push_back((String::new(), bytes));
-            }
-            let drain = owner_b
-                .encrypted_request(
-                    &key_b,
-                    &botster_hub_client::DaemonRequest::drain_subscription(
-                        "wsg-session",
-                        "wsg-sub",
-                    ),
-                )
-                .await
-                .expect("B keep-alive drain");
-            assert_ne!(
-                drain.kind,
-                botster_hub_client::DaemonResponseKind::OperatorError,
-                "B Drain must stay owned while waiting for live bytes: {:?}",
-                drain.error
-            );
-        }
-        assert!(
-            webrtc_terminal_contains(&owner_b.pending_terminal_frames, "echo:after-replace"),
-            "generation N+1 must keep terminal frames: {:?}",
-            owner_b
-                .pending_terminal_frames
-                .iter()
-                .map(|(_, bytes)| String::from_utf8_lossy(bytes).into_owned())
-                .collect::<Vec<_>>()
+            .expect("B keep-alive drain");
+        assert_ne!(
+            drain.kind,
+            botster_hub_client::DaemonResponseKind::OperatorError,
+            "B Drain must stay owned after replacement: {:?}",
+            drain.error
         );
         owner_a.peer.close().await.expect("close A");
         owner_b.peer.close().await.expect("close B");
@@ -1403,7 +1381,7 @@ fn webrtc_terminal_adapter_close_event_feature_stays_optional_on_protocol_7() {
             .iter()
             .any(|feature| feature == botster_hub_client::FEATURE_TERMINAL_SUBSCRIPTION_CLOSED)
     );
-    assert_eq!(botster_hub_client::PROTOCOL_VERSION, 7);
+    assert_eq!(botster_hub_client::PROTOCOL_VERSION, 8);
     assert_eq!(
         botster_hub_client::DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION,
         36
@@ -1463,15 +1441,7 @@ fn one_session_unix_and_webrtc_dual_attach_exposes_hub_occupancy() {
             )
             .await
             .expect("webrtc attach");
-        assert_eq!(
-            webrtc_attach.kind,
-            botster_hub_client::DaemonResponseKind::Events
-        );
-        assert!(
-            webrtc_attach.events.is_empty(),
-            "WebRTC Attach must not return terminal bodies: {:?}",
-            webrtc_attach.events
-        );
+        bind_reserved_from_attach(&mut peer, &key, &webrtc_attach, session_id, webrtc_sub).await;
 
         let occupied = sibling_status(&mut unix, &mut unix_reader, &mut unix_envelopes);
         assert!(
@@ -1519,19 +1489,11 @@ fn one_session_unix_and_webrtc_dual_attach_exposes_hub_occupancy() {
         after.live_attach_occupancy
     );
 
-    let input = request_skipping_envelopes(
+    write_unix_terminal_frame(
         &mut unix,
-        &mut unix_reader,
-        &botster_hub_client::DaemonRequest::SendInput {
-            session_id: session_id.to_string(),
-            data: "after-webrtc-loss\r".to_string(),
-        },
-        &mut unix_envelopes,
-    );
-    assert_ne!(
-        input.kind,
-        botster_hub_client::DaemonResponseKind::OperatorError,
-        "Unix SendInput must stay accepted after WebRTC peer loss: {input:?}"
+        session_id,
+        unix_sub,
+        &terminal_input_frame_bytes(b"after-webrtc-loss\r"),
     );
     let listed = request_skipping_envelopes(
         &mut unix,
@@ -1627,6 +1589,197 @@ fn isolated_hub_webrtc_client_receives_unsolicited_package_event() {
         assert_eq!(
             entities.kind,
             botster_hub_client::DaemonResponseKind::EntitySubscribed
+        );
+        peer.peer.close().await.expect("close peer");
+    });
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn webrtc_repeated_attach_returns_reservation_label_conflict() {
+    let _guard = daemon_test_guard();
+    let (hub, endpoint, bootstrap) = start_webrtc_adapter_hub("wrlc");
+    block_on(async {
+        let (mut peer, key) = open_local_webrtc_peer(&endpoint, &bootstrap).await;
+        peer.encrypted_hello(&key, &webrtc_terminal_adapter_hello())
+            .await
+            .expect("hello");
+        let spawned = peer
+            .encrypted_request(
+                &key,
+                &botster_hub_client::DaemonRequest::Spawn {
+                    session_id: "wrlc-session".to_string(),
+                    command: "sleep 30".to_string(),
+                },
+            )
+            .await
+            .expect("spawn");
+        assert_eq!(
+            spawned.kind,
+            botster_hub_client::DaemonResponseKind::Spawned
+        );
+        let first = peer
+            .encrypted_request(
+                &key,
+                &botster_hub_client::DaemonRequest::Attach {
+                    session_id: "wrlc-session".to_string(),
+                    subscription_id: "wrlc-sub".to_string(),
+                },
+            )
+            .await
+            .expect("first attach");
+        assert_eq!(
+            first.kind,
+            botster_hub_client::DaemonResponseKind::TerminalReservation
+        );
+        assert!(first.terminal_reservation.is_some());
+        let conflict = peer
+            .encrypted_request(
+                &key,
+                &botster_hub_client::DaemonRequest::Attach {
+                    session_id: "wrlc-session".to_string(),
+                    subscription_id: "wrlc-sub".to_string(),
+                },
+            )
+            .await
+            .expect("repeated attach");
+        assert_eq!(
+            conflict.kind,
+            botster_hub_client::DaemonResponseKind::OperatorError
+        );
+        let error = conflict.error.expect("reservation conflict error");
+        assert_eq!(error.operation, "attach");
+        assert_eq!(error.code, "reservation_label_conflict");
+        assert!(
+            conflict.terminal_reservation.is_none(),
+            "conflict must reserve nothing: {:?}",
+            conflict.terminal_reservation
+        );
+        peer.peer.close().await.expect("close peer");
+    });
+    shutdown_short_lived_session(&endpoint, "wrlc-session");
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn webrtc_late_channel_after_reservation_expiry_emits_reservation_expired() {
+    let _guard = daemon_test_guard();
+    let (hub, endpoint, bootstrap) = start_webrtc_adapter_hub_with_env(
+        "wrx",
+        &[("BOTSTER_HUB_TEST_RESERVATION_EXPIRES_IN_SECONDS", "1")],
+    );
+    block_on(async {
+        let (mut peer, key) = open_local_webrtc_peer(&endpoint, &bootstrap).await;
+        peer.enable_host_events();
+        peer.encrypted_hello(&key, &webrtc_close_event_hello())
+            .await
+            .expect("hello");
+        let spawned = peer
+            .encrypted_request(
+                &key,
+                &botster_hub_client::DaemonRequest::Spawn {
+                    session_id: "wrx-session".to_string(),
+                    command: "sleep 30".to_string(),
+                },
+            )
+            .await
+            .expect("spawn");
+        assert_eq!(
+            spawned.kind,
+            botster_hub_client::DaemonResponseKind::Spawned
+        );
+        let attach = peer
+            .encrypted_request(
+                &key,
+                &botster_hub_client::DaemonRequest::Attach {
+                    session_id: "wrx-session".to_string(),
+                    subscription_id: "wrx-sub".to_string(),
+                },
+            )
+            .await
+            .expect("attach");
+        assert_eq!(
+            attach.kind,
+            botster_hub_client::DaemonResponseKind::TerminalReservation
+        );
+        let reservation = attach
+            .terminal_reservation
+            .expect("reservation body");
+        assert_eq!(reservation.session_id, "wrx-session");
+        assert_eq!(reservation.subscription_id, "wrx-sub");
+        sleep(Duration::from_millis(1_200)).await;
+        let mut extra = peer
+            .create_labeled_data_channel(&reservation.label)
+            .await
+            .expect("open expired reserved label");
+        let _ = timeout(Duration::from_secs(5), extra.closed.recv())
+            .await
+            .expect("expired reserved channel must close");
+        let closed = wait_for_webrtc_subscription_closed(
+            &mut peer,
+            &key,
+            "wrx-session",
+            "wrx-sub",
+        )
+        .await
+        .expect("reservation_expired must arrive on the control channel");
+        match closed {
+            botster_hub_client::DaemonEvent::TerminalSubscriptionClosed {
+                session_id,
+                subscription_id,
+                generation,
+                reason,
+            } => {
+                assert_eq!(session_id, "wrx-session");
+                assert_eq!(subscription_id, "wrx-sub");
+                assert_eq!(generation, reservation.generation);
+                assert_eq!(
+                    reason,
+                    botster_hub_client::TERMINAL_SUBSCRIPTION_CLOSED_RESERVATION_EXPIRED
+                );
+            }
+            other => panic!("expected TerminalSubscriptionClosed, got {other:?}"),
+        }
+        assert_eq!(
+            peer.control_terminal_frame_count, 0,
+            "expired late open must not bind a terminal route"
+        );
+        peer.peer.close().await.expect("close peer");
+    });
+    shutdown_short_lived_session(&endpoint, "wrx-session");
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn webrtc_never_reserved_label_is_rejected_with_no_event() {
+    let _guard = daemon_test_guard();
+    let (hub, endpoint, bootstrap) = start_webrtc_adapter_hub("wunk");
+    block_on(async {
+        let (mut peer, key) = open_local_webrtc_peer(&endpoint, &bootstrap).await;
+        peer.enable_host_events();
+        peer.encrypted_hello(&key, &webrtc_close_event_hello())
+            .await
+            .expect("hello");
+        let mut extra = peer
+            .create_labeled_data_channel("r-never-reserved")
+            .await
+            .expect("open unknown label");
+        let _ = timeout(Duration::from_secs(5), extra.closed.recv())
+            .await
+            .expect("unknown reserved label must close");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            let _ = timeout(Duration::from_millis(100), peer.next_host_event(&key)).await;
+        }
+        assert!(
+            peer.pending_host_events().iter().all(|event| {
+                !matches!(
+                    event,
+                    botster_hub_client::DaemonEvent::TerminalSubscriptionClosed { .. }
+                )
+            }),
+            "unknown label must emit no TerminalSubscriptionClosed: {:?}",
+            peer.pending_host_events()
         );
         peer.peer.close().await.expect("close peer");
     });

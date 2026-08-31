@@ -192,27 +192,6 @@ pub(crate) fn daemon_protocol_typescript() -> String {
                 "detach",
                 &[("session_id", "string"), ("subscription_id", "string")],
             ),
-            (
-                "send_input",
-                &[("session_id", "string"), ("data", "string")],
-            ),
-            (
-                "mode_gated_input",
-                &[
-                    ("session_id", "string"),
-                    ("data", "string"),
-                    ("mode_generation", "number"),
-                    ("mode_revision", "number"),
-                ],
-            ),
-            (
-                "resize",
-                &[
-                    ("session_id", "string"),
-                    ("rows", "number"),
-                    ("cols", "number"),
-                ],
-            ),
             ("shutdown_session", &[("session_id", "string")]),
             (
                 "drain",
@@ -437,6 +416,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("read_screen?", "DaemonReadScreen | null"),
             ("mode_flags?", "DaemonModeFlags | null"),
             ("mode_gated_input?", "DaemonModeGatedInputResult | null"),
+            ("terminal_reservation?", "DaemonTerminalReservation | null"),
             ("capture_snapshot?", "DaemonCaptureSnapshot | null"),
             ("spawn_targets?", "DaemonSpawnTarget[]"),
             (
@@ -525,6 +505,18 @@ pub(crate) fn daemon_protocol_typescript() -> String {
     );
     emit_interface(
         &mut output,
+        "DaemonTerminalReservation",
+        &[
+            ("session_id", "string"),
+            ("subscription_id", "string"),
+            ("generation", "number"),
+            ("peer_generation", "number"),
+            ("label", "string"),
+            ("expires_in_seconds", "number"),
+        ],
+    );
+    emit_interface(
+        &mut output,
         "DaemonCaptureSnapshot",
         &[
             ("session_id", "string"),
@@ -588,7 +580,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             "session_context",
             "read_screen",
             "read_mode_flags",
-            "mode_gated_input",
+            "terminal_reservation",
             "capture_snapshot",
             "spawn_targets",
             "spawn_target_validation",

@@ -24,6 +24,13 @@ use webrtc::runtime::{
     Receiver as AsyncReceiver, Runtime, Sender as AsyncSender, channel, default_runtime, timeout,
 };
 
+fn terminal_input_frame(data: &[u8]) -> Vec<u8> {
+    let mut bytes = vec![1, 1];
+    bytes.extend_from_slice(&(data.len() as u16).to_be_bytes());
+    bytes.extend_from_slice(data);
+    bytes
+}
+
 fn webrtc_runtime() -> std::sync::Arc<dyn Runtime> {
     default_runtime().expect("webrtc default runtime")
 }
@@ -89,7 +96,7 @@ pub(crate) fn smoke_local_webrtc_round_trip(
                 },
             )
             .await?;
-        offer_peer
+        let attach = offer_peer
             .encrypted_request(
                 &stream_key,
                 &DaemonRequest::Attach {
@@ -98,13 +105,14 @@ pub(crate) fn smoke_local_webrtc_round_trip(
                 },
             )
             .await?;
+        let reservation = attach.terminal_reservation.ok_or_else(|| {
+            SmokeError::Webrtc("Attach did not return a terminal reservation".to_string())
+        })?;
         offer_peer
-            .encrypted_request(
+            .open_reserved_terminal(
                 &stream_key,
-                &DaemonRequest::SendInput {
-                    session_id: session_id.clone(),
-                    data: "from-smoke-webrtc\n".to_string(),
-                },
+                &reservation.label,
+                terminal_input_frame(b"from-smoke-webrtc\n"),
             )
             .await?;
         let mut observed = Vec::new();
@@ -324,6 +332,107 @@ impl LocalWebrtcOfferPeer {
         Ok(())
     }
 
+    async fn open_reserved_terminal(
+        &mut self,
+        key: &AesGcmKey,
+        label: &str,
+        input: Vec<u8>,
+    ) -> Result<(), SmokeError> {
+        let (open_tx, mut open_rx) = channel::<()>(1);
+        let (message_tx, mut message_rx) = channel::<String>(256);
+        let channel = self
+            .peer
+            .create_data_channel(
+                label,
+                Some(RTCDataChannelInit {
+                    ordered: true,
+                    max_retransmits: None,
+                    max_packet_life_time: None,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map_err(|error| SmokeError::Webrtc(error.to_string()))?;
+        {
+            let channel = channel.clone();
+            webrtc_runtime().spawn(Box::pin(async move {
+                while let Some(event) = channel.poll().await {
+                    match event {
+                        DataChannelEvent::OnOpen => {
+                            let _ = open_tx.try_send(());
+                        }
+                        DataChannelEvent::OnMessage(message) => {
+                            if let Ok(text) = String::from_utf8(message.data.to_vec()) {
+                                let _ = message_tx.try_send(text);
+                            }
+                        }
+                        DataChannelEvent::OnClose => break,
+                        _ => {}
+                    }
+                }
+            }));
+        }
+        timeout(
+            webrtc_runtime().as_ref(),
+            Duration::from_secs(10),
+            open_rx.recv(),
+        )
+        .await
+        .map_err(|_| SmokeError::Webrtc("reserved channel open timeout".to_string()))?;
+        let hello = DaemonHello {
+            protocol: PROTOCOL.to_string(),
+            compatibility: DaemonCompatibilityRequirement::for_webrtc_terminal_adapter(),
+            terminal_compatibility: None,
+        };
+        let plaintext =
+            serde_json::to_vec(&hello).map_err(|error| SmokeError::Webrtc(error.to_string()))?;
+        let envelope = encrypt_aes_gcm(key, &plaintext, 1)
+            .map_err(|error| SmokeError::Webrtc(error.to_string()))?;
+        channel
+            .send_text(
+                &serde_json::to_string(&envelope)
+                    .map_err(|error| SmokeError::Webrtc(error.to_string()))?,
+            )
+            .await
+            .map_err(|error| SmokeError::Webrtc(error.to_string()))?;
+        let mut encrypted = String::new();
+        loop {
+            let response = timeout(
+                webrtc_runtime().as_ref(),
+                Duration::from_secs(10),
+                message_rx.recv(),
+            )
+            .await
+            .map_err(|_| SmokeError::Webrtc("reserved hello ack timeout".to_string()))?
+            .ok_or_else(|| {
+                SmokeError::Webrtc("reserved channel closed during hello".to_string())
+            })?;
+            let chunk = serde_json::from_str::<DaemonLocalWebrtcDeliveryChunk>(&response)
+                .map_err(|error| SmokeError::Webrtc(error.to_string()))?;
+            if chunk.delivery_kind != DaemonLocalWebrtcDeliveryKind::DaemonResponse {
+                continue;
+            }
+            encrypted.push_str(&chunk.payload);
+            if chunk.chunk_index + 1 == chunk.chunk_count {
+                break;
+            }
+        }
+        let envelope = serde_json::from_str::<AesGcmEnvelope>(&encrypted)
+            .map_err(|error| SmokeError::Webrtc(error.to_string()))?;
+        let _plaintext = decrypt_aes_gcm(key, &envelope)
+            .map_err(|error| SmokeError::Webrtc(error.to_string()))?;
+        let envelope = encrypt_aes_gcm(key, &input, 1)
+            .map_err(|error| SmokeError::Webrtc(error.to_string()))?;
+        channel
+            .send_text(
+                &serde_json::to_string(&envelope)
+                    .map_err(|error| SmokeError::Webrtc(error.to_string()))?,
+            )
+            .await
+            .map_err(|error| SmokeError::Webrtc(error.to_string()))?;
+        Ok(())
+    }
+
     async fn encrypted_hello(
         &mut self,
         key: &AesGcmKey,
@@ -461,7 +570,6 @@ fn smoke_local_webrtc_request_operation(request: &DaemonRequest) -> &'static str
         DaemonRequest::Status => "status",
         DaemonRequest::Spawn { .. } => "spawn",
         DaemonRequest::Attach { .. } => "attach",
-        DaemonRequest::SendInput { .. } => "send_input",
         DaemonRequest::Drain { .. } => "drain",
         DaemonRequest::ReadScreen { .. } => "read_screen",
         DaemonRequest::ShutdownSession { .. } => "shutdown_session",

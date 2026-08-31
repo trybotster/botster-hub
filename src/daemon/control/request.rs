@@ -109,9 +109,6 @@ pub(crate) fn handle(
         request,
         DaemonRequest::Spawn { .. }
             | DaemonRequest::Attach { .. }
-            | DaemonRequest::Resize { .. }
-            | DaemonRequest::SendInput { .. }
-            | DaemonRequest::ModeGatedInput { .. }
             | DaemonRequest::ShutdownSession { .. }
             | DaemonRequest::RemoveSession { .. }
     );

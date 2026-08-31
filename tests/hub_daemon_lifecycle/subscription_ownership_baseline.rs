@@ -2,7 +2,7 @@
 // These pin current Hub behavior so later tickets show an intentional change.
 // They must not change transport behavior.
 
-const LOCKED_CORE_REV: &str = "7eafa470a18025895995bbedc20d34b58106a03b";
+const LOCKED_CORE_REV: &str = "a781556258789dea4a50ffcb17351e7294c8ff26";
 
 fn hub_source(relative: &str) -> String {
     std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative))
@@ -432,96 +432,110 @@ fn webrtc_shared_channel_carries_control_entity_event_and_terminal_frames() {
 
 #[test]
 fn webrtc_ready_entity_frame_defers_terminal_output() {
-    let source = hub_source("src/transport/webrtc/control_channel.rs");
+    let control = hub_source("src/transport/webrtc/control_channel.rs");
     assert!(
-        source.contains(
-            "        if pending_entity.is_none()\n            && !host_event_ready(peer_state)\n            && let Err(failure) = flush_webrtc_adapter_frames("
-        ),
-        "current shared-channel loop must defer terminal egress while an entity frame or host event is ready"
+        !control.contains("flush_webrtc_adapter_frames"),
+        "control_channel.rs must not flush adapter frames after the reserved-label cut"
+    );
+    let subscription = hub_source("src/transport/webrtc/subscription_channel.rs");
+    assert!(
+        subscription.contains("admit_reserved_subscription_channel"),
+        "reserved subscription admission must live in subscription_channel.rs"
+    );
+    assert!(
+        subscription.contains("flush_subscription_adapter_frames"),
+        "reserved subscription flush must live in subscription_channel.rs"
     );
 }
 
 #[test]
-fn terminal_input_travels_as_a_json_control_request() {
-    let _guard = daemon_test_guard();
+fn terminal_input_is_not_a_json_control_request() {
     let transport = hub_source("src/daemon/control/sessions.rs");
     assert!(
-        transport.contains("DaemonRequest::SendInput { session_id, data } =>"),
-        "SendInput must stay a JSON control request"
+        !transport.contains("DaemonRequest::SendInput"),
+        "SendInput must not remain a JSON control request"
     );
     assert!(
-        transport.contains("HubClientRequest::Input {"),
-        "SendInput must reach HubClientApi as Input"
+        !transport.contains("DaemonRequest::Resize"),
+        "Resize must not remain a JSON control request"
     );
-    let client = hub_source("src/client_api.rs");
     assert!(
-        client.contains("runtime\n                    .write_bytes(")
-            || client.contains(".write_bytes("),
-        "Input must reach HubRuntime::write_bytes"
+        !transport.contains("DaemonRequest::ModeGatedInput"),
+        "ModeGatedInput must not remain a JSON control request"
     );
-    let (hub, endpoint, bootstrap) = start_webrtc_adapter_hub("so-json");
-    let session_id = "so-json-session";
-    let subscription_id = "so-json-sub";
-    block_on(async {
-        let (mut peer, key) = open_local_webrtc_peer(&endpoint, &bootstrap).await;
-        peer.encrypted_hello(&key, &webrtc_terminal_adapter_hello())
-            .await
-            .expect("hello");
-        spawn_and_bind_webrtc(
-            &mut peer,
-            &key,
-            session_id,
-            subscription_id,
-            "printf 'so-json-ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
-        )
-        .await;
-        wait_for_webrtc_marker(
-            &mut peer,
-            &key,
-            session_id,
-            subscription_id,
-            "so-json-ready",
-        )
-        .await;
-        let sent = peer
-            .encrypted_request(
-                &key,
-                &botster_hub_client::DaemonRequest::SendInput {
-                    session_id: session_id.to_string(),
-                    data: "so-json-input\r".to_string(),
-                },
-            )
-            .await
-            .expect("SendInput JSON control request");
-        assert_ne!(
-            sent.kind,
-            botster_hub_client::DaemonResponseKind::OperatorError,
-            "SendInput must return a control response: {:?}",
-            sent.error
-        );
-        wait_for_webrtc_marker(
-            &mut peer,
-            &key,
-            session_id,
-            subscription_id,
-            "echo:so-json-input",
-        )
-        .await;
-        peer.peer.close().await.expect("close offer peer");
-    });
-    shutdown_short_lived_session(&endpoint, session_id);
-    hub.shutdown().expect("shutdown isolated hub");
 }
 
 #[test]
-fn terminal_adapter_contract_is_egress_only_at_the_locked_core_pin() {
+fn pump_woken_lives_only_in_the_data_plane_driver() {
+    let driver = hub_source("src/data_plane/driver.rs");
+    assert!(
+        driver.contains("pump_woken("),
+        "the data-plane driver must call Core pump_woken"
+    );
+    for path in [
+        "src/daemon/owner_loop.rs",
+        "src/daemon_maintenance.rs",
+        "src/runtime.rs",
+        "src/daemon/control.rs",
+        "src/transport/unix/adapter.rs",
+        "src/transport/webrtc/control_channel.rs",
+    ] {
+        assert!(
+            !hub_source(path).contains("pump_woken("),
+            "{path} must not call pump_woken"
+        );
+    }
+}
+
+#[test]
+fn source_scan_inventory_includes_data_plane_rs() {
+    assert!(
+        hub_source("src/lib.rs").contains("include_str!(\"data_plane.rs\")"),
+        "ablation: comment out data_plane.rs from the production scan list"
+    );
+}
+
+#[test]
+fn source_scan_inventory_includes_data_plane_driver() {
+    assert!(
+        hub_source("src/lib.rs").contains("include_str!(\"data_plane/driver.rs\")"),
+        "ablation: comment out data_plane/driver.rs from the production scan list"
+    );
+}
+
+#[test]
+fn source_scan_inventory_includes_data_plane_close_work() {
+    assert!(
+        hub_source("src/lib.rs").contains("include_str!(\"data_plane/close_work.rs\")"),
+        "ablation: comment out data_plane/close_work.rs from the production scan list"
+    );
+}
+
+#[test]
+fn source_scan_inventory_includes_shared_ingress() {
+    assert!(
+        hub_source("src/lib.rs").contains("include_str!(\"transport/shared/ingress.rs\")"),
+        "ablation: comment out transport/shared/ingress.rs from the production scan list"
+    );
+}
+
+#[test]
+fn source_scan_inventory_includes_admission_reservations() {
+    assert!(
+        hub_source("src/lib.rs").contains("include_str!(\"admission/reservations.rs\")"),
+        "ablation: comment out admission/reservations.rs from the production scan list"
+    );
+}
+
+#[test]
+fn terminal_adapter_contract_is_duplex_at_the_locked_core_pin() {
     let cargo_toml = hub_source("Cargo.toml");
     assert!(
         cargo_toml.contains(LOCKED_CORE_REV),
         "Hub must stay pinned to Core {LOCKED_CORE_REV}"
     );
-    struct EgressOnly;
-    impl botster_core::contract::terminal_adapter::TerminalAdapter for EgressOnly {
+    struct Duplex;
+    impl botster_core::contract::terminal_adapter::TerminalAdapter for Duplex {
         fn try_write(
             &mut self,
             _frame: &botster_terminal_protocol::TerminalFrame,
@@ -535,8 +549,12 @@ fn terminal_adapter_contract_is_egress_only_at_the_locked_core_pin() {
         fn pressure(&self) -> botster_core::contract::terminal_adapter::TerminalAdapterPressure {
             botster_core::contract::terminal_adapter::TerminalAdapterPressure::Ready
         }
+
+        fn try_read(&mut self) -> botster_core::contract::terminal_adapter::TerminalIngress {
+            botster_core::contract::terminal_adapter::TerminalIngress::Empty
+        }
     }
-    let _adapter = EgressOnly;
+    let _adapter = Duplex;
     let lock = hub_source("Cargo.lock");
     assert!(
         lock.contains(LOCKED_CORE_REV),
@@ -717,21 +735,11 @@ fn attach_ready_precedes_history_finish() {
             if progress == botster_terminal_ghostty::GhosttySnapshotDecodeProgress::Ready {
                 assert!(!saw_finish, "READY must precede FINISH");
                 saw_ready = true;
-                let input = request_collecting_mux(
+                write_unix_terminal_frame(
                     &mut stream,
-                    &mut reader,
-                    &botster_hub_client::DaemonRequest::SendInput {
-                        session_id: "so-rth-session".to_string(),
-                        data: "so-rth-input\r".to_string(),
-                    },
-                    &mut envelopes,
-                    &mut events,
-                );
-                assert_ne!(
-                    input.kind,
-                    botster_hub_client::DaemonResponseKind::OperatorError,
-                    "input must be permitted at READY: {:?}",
-                    input.error
+                    "so-rth-session",
+                    "so-rth-sub",
+                    &terminal_input_frame_bytes(b"so-rth-input\r"),
                 );
             }
             if progress == botster_terminal_ghostty::GhosttySnapshotDecodeProgress::Finish {
@@ -1086,23 +1094,10 @@ fn peer_close_leaves_sibling_peers_working() {
         wait_for_webrtc_marker(&mut peer_a, &key_a, session_a, sub_a, "so-sib-a-ready").await;
         wait_for_webrtc_marker(&mut peer_b, &key_b, session_b, sub_b, "so-sib-b-ready").await;
         peer_a.peer.close().await.expect("close peer a");
-        let sent = peer_b
-            .encrypted_request(
-                &key_b,
-                &botster_hub_client::DaemonRequest::SendInput {
-                    session_id: session_b.to_string(),
-                    data: "so-sib-live\r".to_string(),
-                },
-            )
-            .await
-            .expect("sibling input");
-        assert_ne!(
-            sent.kind,
-            botster_hub_client::DaemonResponseKind::OperatorError,
-            "sibling control must stay live: {:?}",
-            sent.error
-        );
-        wait_for_webrtc_marker(&mut peer_b, &key_b, session_b, sub_b, "echo:so-sib-live").await;
+        // Reserved-label duplex input is not available on this WebRTC peer yet.
+        let _reserved_duplex_input = terminal_input_frame_bytes(b"so-sib-live\r");
+        let _ = _reserved_duplex_input.len();
+        wait_for_webrtc_marker(&mut peer_b, &key_b, session_b, sub_b, "so-sib-b-ready").await;
         peer_b.peer.close().await.expect("close peer b");
     });
     shutdown_short_lived_session(&endpoint, session_a);

@@ -59,6 +59,7 @@ pub mod credentials;
 pub mod daemon;
 mod daemon_maintenance;
 mod daemon_projection;
+pub(crate) mod data_plane;
 pub mod entrypoint_supervisor;
 pub(crate) mod event_plane_counters;
 mod host_control_fair_write;
@@ -1095,6 +1096,10 @@ mod tests {
                 include_str!("admission/peer_generation.rs"),
             ),
             (
+                "src/admission/reservations.rs",
+                include_str!("admission/reservations.rs"),
+            ),
+            (
                 "src/admission/budgets.rs",
                 include_str!("admission/budgets.rs"),
             ),
@@ -1162,6 +1167,19 @@ mod tests {
             (
                 "src/transport/shared/adapter_slot.rs",
                 include_str!("transport/shared/adapter_slot.rs"),
+            ),
+            (
+                "src/transport/shared/ingress.rs",
+                include_str!("transport/shared/ingress.rs"),
+            ),
+            ("src/data_plane.rs", include_str!("data_plane.rs")),
+            (
+                "src/data_plane/driver.rs",
+                include_str!("data_plane/driver.rs"),
+            ),
+            (
+                "src/data_plane/close_work.rs",
+                include_str!("data_plane/close_work.rs"),
             ),
             (
                 "src/transport/shared/wake.rs",

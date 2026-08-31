@@ -167,6 +167,11 @@ fn unix_adapter_bind_returns_only_attaching_then_opaque_envelopes() {
     );
     assert_eq!(attach.kind, botster_hub_client::DaemonResponseKind::Events);
     assert!(
+        attach.terminal_reservation.is_none(),
+        "Unix Attach must omit terminal_reservation: {:?}",
+        attach.terminal_reservation
+    );
+    assert!(
         attach.events.is_empty(),
         "Attach must not return terminal bodies: {:?}",
         attach.events
@@ -369,10 +374,11 @@ fn unix_adapter_unbound_scoped_drain_delivers_terminal_output() {
         drain.events
     );
     connection
-        .request(&botster_hub_client::DaemonRequest::SendInput {
-            session_id: session_id.to_string(),
-            data: "from-unbound\r".to_string(),
-        })
+        .send_terminal_frame(
+            session_id,
+            subscription_id,
+            &terminal_input_frame_bytes(b"from-unbound\r"),
+        )
         .expect("send");
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut text = String::new();
@@ -617,14 +623,11 @@ fn unix_adapter_stale_disconnect_does_not_cancel_replacement_owner() {
         "A's disconnect must not close B's bound route: before={before:?} after={after:?}"
     );
 
-    request_skipping_envelopes(
+    write_unix_terminal_frame(
         &mut owner_b,
-        &mut reader_b,
-        &botster_hub_client::DaemonRequest::SendInput {
-            session_id: session_id.to_string(),
-            data: "after-a-drop\r".to_string(),
-        },
-        &mut envelopes_b,
+        session_id,
+        subscription_id,
+        &terminal_input_frame_bytes(b"after-a-drop\r"),
     );
     let marker = "echo:after-a-drop";
     let output_deadline = Instant::now() + Duration::from_secs(8);
@@ -1020,7 +1023,7 @@ fn unix_adapter_feature_does_not_raise_default_requirement() {
         botster_hub_client::DaemonCompatibilityRequirement::for_unix_terminal_adapter();
     botster_hub_client::ensure_compatible(&adapter_requirement, &previous)
         .expect_err("the unix adapter requirement must fail closed without the feature");
-    assert_eq!(botster_hub_client::PROTOCOL_VERSION, 7);
+    assert_eq!(botster_hub_client::PROTOCOL_VERSION, 8);
 }
 
 fn spawn_and_bind(
@@ -1057,6 +1060,11 @@ fn spawn_and_bind(
         events,
     );
     assert_eq!(attach.kind, botster_hub_client::DaemonResponseKind::Events);
+    assert!(
+        attach.terminal_reservation.is_none(),
+        "Unix Attach must omit terminal_reservation: {:?}",
+        attach.terminal_reservation
+    );
     assert!(
         attach.events.is_empty(),
         "bind must return empty Attach bodies: {:?}",
@@ -1543,15 +1551,11 @@ fn core_write_budget_hard_stop_emits_core_adapter_closed() {
         .iter()
         .any(|session| session.session_id == "cwb-live" && session.lifecycle == "running"));
 
-    request_collecting_mux(
+    write_unix_terminal_frame(
         &mut stream,
-        &mut reader,
-        &botster_hub_client::DaemonRequest::SendInput {
-            session_id: "cwb-live".to_string(),
-            data: "cwb-sibling-live\r".to_string(),
-        },
-        &mut envelopes,
-        &mut events,
+        "cwb-live",
+        "sub-live",
+        &terminal_input_frame_bytes(b"cwb-sibling-live\r"),
     );
     let sibling_deadline = Instant::now() + Duration::from_secs(8);
     while Instant::now() < sibling_deadline
@@ -1586,7 +1590,7 @@ fn core_write_budget_hard_stop_emits_core_adapter_closed() {
     );
 
     eprintln!(
-        "core_write_budget provenance hub_bin={} session_worker={} hub_sha={} locked_core=7eafa470a18025895995bbedc20d34b58106a03b",
+        "core_write_budget provenance hub_bin={} session_worker={} hub_sha={} locked_core=a781556258789dea4a50ffcb17351e7294c8ff26",
         env!("CARGO_BIN_EXE_botster-hub"),
         session_worker_binary_path().display(),
         option_env!("BOTSTER_HUB_GIT_SHA").unwrap_or("worktree")
@@ -1960,17 +1964,12 @@ fn shutdown_session_exact_keys_preserve_replacement_owner_and_siblings() {
     assert!(victim_generation >= 1);
     assert!(sibling_generation >= 1);
 
-    let input = request_collecting_mux(
+    write_unix_terminal_frame(
         &mut stream,
-        &mut reader,
-        &botster_hub_client::DaemonRequest::SendInput {
-            session_id: "sgk-sibling".to_string(),
-            data: "before-shutdown\r".to_string(),
-        },
-        &mut envelopes,
-        &mut events,
+        "sgk-sibling",
+        "sgk-sibling-sub",
+        &terminal_input_frame_bytes(b"before-shutdown\r"),
     );
-    assert_eq!(input.kind, botster_hub_client::DaemonResponseKind::Events);
     let deadline = Instant::now() + Duration::from_secs(8);
     while Instant::now() < deadline
         && !unix_envelope_contains_live_bytes(&envelopes, "echo:before-shutdown")
@@ -2026,19 +2025,11 @@ fn shutdown_session_exact_keys_preserve_replacement_owner_and_siblings() {
         "victim generation {victim_generation} must stay silent: {events:?}"
     );
 
-    let after_input = request_collecting_mux(
+    write_unix_terminal_frame(
         &mut stream,
-        &mut reader,
-        &botster_hub_client::DaemonRequest::SendInput {
-            session_id: "sgk-sibling".to_string(),
-            data: "after-shutdown\r".to_string(),
-        },
-        &mut envelopes,
-        &mut events,
-    );
-    assert_eq!(
-        after_input.kind,
-        botster_hub_client::DaemonResponseKind::Events
+        "sgk-sibling",
+        "sgk-sibling-sub",
+        &terminal_input_frame_bytes(b"after-shutdown\r"),
     );
     let deadline = Instant::now() + Duration::from_secs(8);
     while Instant::now() < deadline
@@ -2561,15 +2552,11 @@ fn stale_generation_close_does_not_sweep_replacement_owner() {
     });
     assert_eq!(closed_generation, Some(1));
 
-    request_collecting_mux(
+    write_unix_terminal_frame(
         &mut owner_b,
-        &mut reader_b,
-        &botster_hub_client::DaemonRequest::SendInput {
-            session_id: "sgo-session".to_string(),
-            data: "after-replace\r".to_string(),
-        },
-        &mut envelopes_b,
-        &mut events_b,
+        "sgo-session",
+        "sgo-sub",
+        &terminal_input_frame_bytes(b"after-replace\r"),
     );
     let deadline = Instant::now() + Duration::from_secs(8);
     while Instant::now() < deadline
@@ -2815,19 +2802,11 @@ fn unix_eof_releases_exact_attach_occupancy_on_sibling_status() {
         after.live_attach_occupancy
     );
 
-    let input = request_skipping_envelopes(
+    write_unix_terminal_frame(
         &mut owner_b,
-        &mut reader_b,
-        &botster_hub_client::DaemonRequest::SendInput {
-            session_id: session_id.to_string(),
-            data: "after-a-eof\r".to_string(),
-        },
-        &mut envelopes_b,
-    );
-    assert_ne!(
-        input.kind,
-        botster_hub_client::DaemonResponseKind::OperatorError,
-        "sibling SendInput must stay accepted after A EOF: {input:?}"
+        session_id,
+        sub_b,
+        &terminal_input_frame_bytes(b"after-a-eof\r"),
     );
     let listed = request_skipping_envelopes(
         &mut owner_b,

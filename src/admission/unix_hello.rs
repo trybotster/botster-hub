@@ -37,6 +37,7 @@ pub(crate) enum WebrtcTerminalAdmission {
         required_features: Vec<String>,
         mux: WebRtcConnectionMux,
         terminal_requirement: Option<botster_terminal_protocol::TerminalCompatibilityRequirement>,
+        peer_generation: u64,
     },
     Rejected {
         code: &'static str,
@@ -54,6 +55,8 @@ pub(crate) struct AdmissionState {
     pub unix_admissions: BTreeMap<String, UnixTerminalAdmission>,
     pub webrtc_admissions: BTreeMap<String, WebrtcTerminalAdmission>,
     pub host_compatibility: BTreeMap<String, HostCompatibilityRecord>,
+    pub next_peer_generation: u64,
+    pub reservations: crate::admission::reservations::TerminalReservationRegistry,
 }
 
 pub(crate) fn daemon_hello_ack(diagnostics: Vec<DaemonDiagnostic>) -> DaemonHelloAck {
@@ -114,6 +117,7 @@ pub(crate) fn terminal_compatibility_attach_error(
     response
 }
 
+#[allow(dead_code)]
 pub(crate) fn next_admission_key<T>(
     map: &BTreeMap<String, T>,
     after: Option<&str>,

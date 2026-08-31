@@ -26,7 +26,7 @@ use crate::subscription::entity::EntityFrameSender;
 use crate::transport::webrtc::adapter::WebRtcConnectionMux;
 use crate::transport::webrtc::delivery::{
     LocalWebrtcSendFailure, framed_daemon_entity_frame, framed_daemon_event,
-    framed_daemon_hello_ack, framed_daemon_response, framed_daemon_terminal_frame,
+    framed_daemon_hello_ack, framed_daemon_response,
 };
 use crate::transport::webrtc::peer::{
     LOCAL_WEBRTC_PEER_CLOSE_BOUND, LocalWebrtcPeerState, LocalWebrtcTerminalCause,
@@ -119,7 +119,6 @@ pub(crate) fn local_webrtc_request_operation(request: &DaemonRequest) -> &'stati
         DaemonRequest::Status => "status",
         DaemonRequest::Spawn { .. } => "spawn",
         DaemonRequest::Attach { .. } => "attach",
-        DaemonRequest::SendInput { .. } => "send_input",
         DaemonRequest::Drain { .. } => "drain",
         DaemonRequest::ShutdownSession { .. } => "shutdown_session",
         _ => "other",
@@ -222,22 +221,6 @@ where
             &mut last_host_class,
         )
         .await
-        {
-            eprintln!("{failure}");
-            terminal_cause = failure.cause;
-            send_failure = Some(failure);
-            break;
-        }
-        if pending_entity.is_none()
-            && !host_event_ready(peer_state)
-            && let Err(failure) = flush_webrtc_adapter_frames(
-                data_channel,
-                stream_key,
-                peer_state,
-                &mut pending_requests,
-                &mut flow_control,
-            )
-            .await
         {
             eprintln!("{failure}");
             terminal_cause = failure.cause;
@@ -364,6 +347,7 @@ where
                             peer_state.mux.clone()
                         },
                         terminal_requirement: hello.terminal_compatibility.clone(),
+                        peer_generation: 0,
                     }
                 };
                 let _ = runtime_tx
@@ -982,44 +966,6 @@ where
     }
     Ok(())
 }
-pub(crate) async fn flush_webrtc_adapter_frames<D>(
-    data_channel: &D,
-    stream_key: &AesGcmKey,
-    peer_state: &LocalWebrtcPeerState,
-    pending_requests: &mut VecDeque<PendingLocalWebrtcRequest>,
-    flow_control: &mut LocalWebrtcFlowControl,
-) -> Result<(), LocalWebrtcSendFailure>
-where
-    D: LocalWebrtcDataChannel + ?Sized,
-{
-    for (_session_id, _subscription_id, handle, bytes) in peer_state.mux.snapshot_writes() {
-        if handle.is_closed() {
-            continue;
-        }
-        peer_state.begin_operation("terminal_delivery");
-        let frames = match framed_daemon_terminal_frame(stream_key, &bytes) {
-            Ok(frames) => frames,
-            Err(_) => {
-                handle.close();
-                continue;
-            }
-        };
-        send_response_frames(
-            data_channel,
-            stream_key,
-            &frames,
-            pending_requests,
-            flow_control,
-            peer_state,
-        )
-        .await?;
-        if handle.is_closed() {
-            continue;
-        }
-        let _ = handle.complete_active();
-    }
-    Ok(())
-}
 pub(crate) fn response_with_diagnostic(diagnostic: DaemonDiagnostic) -> DaemonResponse {
     DaemonResponse {
         kind: botster_hub_client::DaemonResponseKind::OperatorError,
@@ -1032,6 +978,7 @@ pub(crate) fn response_with_diagnostic(diagnostic: DaemonDiagnostic) -> DaemonRe
         read_screen: None,
         mode_flags: None,
         mode_gated_input: None,
+        terminal_reservation: None,
         capture_snapshot: None,
         spawn_targets: Vec::new(),
         spawn_target_validation: None,

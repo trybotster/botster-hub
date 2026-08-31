@@ -3,12 +3,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, TryLockError};
 
 use botster_core::contract::terminal_adapter::{
-    TerminalAdapterPressure, TerminalAdapterWriteError,
+    TerminalAdapterPressure, TerminalAdapterWriteError, TerminalIngress,
 };
+use botster_core::contract::terminal_wake::{TerminalWakeKind, TerminalWakeSink};
 use botster_terminal_protocol::TerminalFrame;
 
 use super::close_reason::CloseCause;
+use super::ingress::IngressBuffer;
 use super::wake::WakeSink;
+
+type CloseHook = Arc<dyn Fn(bool) + Send + Sync>;
 
 /// One in-flight write slot shared by production terminal adapters.
 pub(crate) struct AdapterSlot<W: WakeSink> {
@@ -17,6 +21,10 @@ pub(crate) struct AdapterSlot<W: WakeSink> {
     slot: Mutex<Option<Vec<u8>>>,
     wake: W,
     close_work: Arc<AtomicBool>,
+    close_hook: Mutex<Option<CloseHook>>,
+    core_sink: Mutex<Option<TerminalWakeSink>>,
+    closed_woke: AtomicBool,
+    ingress: IngressBuffer,
 }
 
 impl<W: WakeSink> AdapterSlot<W> {
@@ -27,6 +35,22 @@ impl<W: WakeSink> AdapterSlot<W> {
             slot: Mutex::new(None),
             wake,
             close_work,
+            close_hook: Mutex::new(None),
+            core_sink: Mutex::new(None),
+            closed_woke: AtomicBool::new(false),
+            ingress: IngressBuffer::new(),
+        }
+    }
+
+    pub(crate) fn set_wake_sink(&self, sink: TerminalWakeSink) {
+        if let Ok(mut slot) = self.core_sink.lock() {
+            *slot = Some(sink);
+        }
+    }
+
+    pub(crate) fn attach_close_hook(&self, hook: impl Fn(bool) + Send + Sync + 'static) {
+        if let Ok(mut slot) = self.close_hook.lock() {
+            *slot = Some(Arc::new(hook));
         }
     }
 
@@ -46,6 +70,7 @@ impl<W: WakeSink> AdapterSlot<W> {
     pub(crate) fn close(&self) {
         self.cause.close();
         self.close_work.store(true, Ordering::SeqCst);
+        self.ingress.clear();
         match self.slot.try_lock() {
             Ok(mut slot) => {
                 *slot = None;
@@ -55,7 +80,35 @@ impl<W: WakeSink> AdapterSlot<W> {
                 *poisoned.into_inner() = None;
             }
         }
+        self.emit_closed();
+        if let Ok(hook) = self.close_hook.lock()
+            && let Some(hook) = hook.as_ref()
+        {
+            hook(self.host_closed());
+        }
         self.wake.wake();
+    }
+
+    fn emit_writable(&self) {
+        if self.is_closed() {
+            return;
+        }
+        if let Ok(sink) = self.core_sink.lock()
+            && let Some(sink) = sink.as_ref()
+        {
+            let _ = sink.wake(TerminalWakeKind::Writable);
+        }
+    }
+
+    fn emit_closed(&self) {
+        if self.closed_woke.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if let Ok(sink) = self.core_sink.lock()
+            && let Some(sink) = sink.as_ref()
+        {
+            let _ = sink.wake(TerminalWakeKind::Closed);
+        }
     }
 
     #[cfg(test)]
@@ -63,14 +116,21 @@ impl<W: WakeSink> AdapterSlot<W> {
         self.wake.wake();
     }
 
-    #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn set_would_block(&self, pressured: bool) {
         self.would_block.store(pressured, Ordering::SeqCst);
+        if !pressured {
+            self.emit_writable();
+            self.wake.wake();
+        }
     }
 
     pub(crate) fn pressure(&self) -> TerminalAdapterPressure {
         if self.is_closed() {
             return TerminalAdapterPressure::Closed;
+        }
+        if forced_would_block() {
+            return TerminalAdapterPressure::WouldBlock;
         }
         match self.slot.try_lock() {
             Ok(slot) => {
@@ -91,7 +151,7 @@ impl<W: WakeSink> AdapterSlot<W> {
         if self.is_closed() {
             return Err(TerminalAdapterWriteError::Closed);
         }
-        if self.would_block.load(Ordering::SeqCst) {
+        if self.would_block.load(Ordering::SeqCst) || forced_would_block() {
             return Err(TerminalAdapterWriteError::WouldBlock);
         }
         let bytes = match frame.to_bytes() {
@@ -120,6 +180,65 @@ impl<W: WakeSink> AdapterSlot<W> {
         drop(slot);
         self.wake.wake();
         Ok(())
+    }
+
+    pub(crate) fn try_read(&self) -> TerminalIngress {
+        self.ingress.try_read(self.is_closed())
+    }
+
+    pub(crate) fn push_ingress(&self, bytes: Vec<u8>) -> Result<(), ()> {
+        if self.is_closed() {
+            return Ok(());
+        }
+        match self.ingress.push_complete(bytes) {
+            Ok(true) => {
+                self.emit_writable();
+                Ok(())
+            }
+            Ok(false) => Ok(()),
+            Err(()) => {
+                self.close();
+                Err(())
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn inject_ingress_frame(&self, bytes: Vec<u8>) {
+        if self.is_closed() {
+            return;
+        }
+        if self.ingress.store_complete(bytes) {
+            self.emit_writable();
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn inject_ingress_partial(&self, bytes: Vec<u8>) {
+        if self.is_closed() {
+            return;
+        }
+        self.ingress.store_partial(bytes);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn complete_ingress_partial(&self) {
+        if self.is_closed() {
+            return;
+        }
+        if self.ingress.complete_partial() {
+            self.emit_writable();
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn drop_buffered_ingress_frame(&self) {
+        if self.is_closed() {
+            return;
+        }
+        if self.ingress.drop_one_complete() {
+            self.emit_writable();
+        }
     }
 
     pub(crate) fn snapshot_active(&self) -> Option<Vec<u8>> {
@@ -159,7 +278,15 @@ impl<W: WakeSink> AdapterSlot<W> {
             }
             Err(_) => None,
         };
+        if taken.is_some() {
+            self.emit_writable();
+        }
         self.wake.wake();
         taken
     }
+}
+
+fn forced_would_block() -> bool {
+    std::env::var("BOTSTER_ENV").as_deref() == Ok("test")
+        && std::env::var("BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK").as_deref() == Ok("1")
 }

@@ -97,7 +97,7 @@ hub-native routed envelopes and guarded notification writes:
 | Surface | Status on the product path |
 | --- | --- |
 | Attach + drain terminal egress | Product. Attach acks `attaching` on the requesting subscription. READY, HISTORY page, and FINISH `Snapshot` frames stream on scoped `Drain { subscription_id }`. `attached` means live PTY may flow. `Scrollback` is never importable as GHOSTSNP. |
-| Hub `ReadScreen` / `ReadModeFlags` / `ModeGatedInput` / `CaptureSnapshot` | Product. Routes `HubClientApi` → `HubRuntime` → `CoreDaemon` readback. `ReadScreen` returns session text; `ReadModeFlags` returns full authoritative `ModeFlags` plus `mode_generation`/`mode_revision` freshness; `ModeGatedInput` admits race-free mode-dependent Kitty/mouse input via Core's 5s default timeout; `CaptureSnapshot` returns metadata only (rows/cols/format/byte count) — never GHOSTSNP bytes. Errors stay errors rather than fabricated mouse-off results, and mode readback has no pushed event. Opaque GHOSTSNP snapshot bytes stay only on the attach/drain `DaemonEvent::Snapshot` data plane (`Scrollback` is never importable as GHOSTSNP). Hub never decodes snapshot wire magic or synthesizes OSC 10/11/12 replies — startup color baseline is applied once via Core `with_terminal_color_profile` (FG `#FFFFFF` / BG `#282C34` / cursor `#FFFFFF`) for pre-attach session-side replies. |
+| Hub `ReadScreen` / `ReadModeFlags` / `CaptureSnapshot` | Product. Routes `HubClientApi` → `HubRuntime` → `CoreDaemon` readback. `ReadScreen` returns session text; `ReadModeFlags` returns full authoritative `ModeFlags` plus `mode_generation`/`mode_revision` freshness. Mode-gated input and resize travel as Core `TerminalInputFrame` bytes on a bound Unix or WebRTC duplex subscription, not as JSON daemon requests. `CaptureSnapshot` returns metadata only (rows/cols/format/byte count) — never GHOSTSNP bytes. Errors stay errors rather than fabricated mouse-off results, and mode readback has no pushed event. Opaque GHOSTSNP snapshot bytes stay only on the attach/drain `DaemonEvent::Snapshot` data plane (`Scrollback` is never importable as GHOSTSNP). Hub never decodes snapshot wire magic or synthesizes OSC 10/11/12 replies — startup color baseline is applied once via Core `with_terminal_color_profile` (FG `#FFFFFF` / BG `#282C34` / cursor `#FFFFFF`) for pre-attach session-side replies. |
 | Subscription history | Product. History and live terminal output flow through attach/drain events, not through readback responses. |
 | `report_delivery_*` pressure helpers | Still unfinished. Not exposed on the hub client product surface yet. |
 
@@ -393,7 +393,7 @@ production runtime. Bare interactive `botster-hub` starts or reuses the daemon
 and attaches the console. `start` remains the low-level foreground daemon host;
 `up` remains the noninteractive package-refresh and daily-app orchestrator.
 `status`, `sessions list`, `sessions spawn`, `sessions attach`,
-`sessions send-input`, `sessions resize`, `sessions detach`, and `shutdown`
+`sessions detach`, and `shutdown`
 connect to that daemon over the resolved local socket. The CLI remains a thin
 adapter: daemon requests still route through `HubClientApi` instead of raw core
 routers, and the daemon stamps runtime clocks for separate stateless client
@@ -653,8 +653,8 @@ runtime=ready
 data_dir=resolved:$HOME/.botster/hub
 daemon=started
 protocol=botster-hub-daemon-v1
-protocol_version=7
-conformance_fixture_revision=46
+protocol_version=8
+conformance_fixture_revision=47
 package_count=2
 enabled_package_count=2
 app_count=2
@@ -819,10 +819,6 @@ cargo run -- sessions spawn \
   --session-id runtime-session -- "printf 'production runtime-ok\n'; sleep 1"
 cargo run -- sessions list
 cargo run -- sessions attach runtime-session
-cargo run -- sessions send-input \
-  runtime-session -- "ping\r"
-cargo run -- sessions resize \
-  runtime-session 30 100
 cargo run -- sessions detach runtime-session
 cargo run -- sessions shutdown runtime-session
 cargo run -- inspect runtime-session
@@ -850,7 +846,7 @@ package manifest and restarts any running entrypoints for that package.
 `entrypoint-status` control app entrypoint processes directly. The
 session commands also use the running daemon runtime, so a session created by
 one CLI process is visible to later `sessions list`, `sessions attach`,
-`sessions send-input`, `sessions resize`, `sessions detach`, and `sessions
+`sessions detach`, and `sessions
 shutdown` invocations.
 `attach` streams terminal bytes and currently exits after an idle window if the
 core runtime does not provide a process-exit frame. `inspect` is intentionally

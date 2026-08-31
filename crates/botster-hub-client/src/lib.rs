@@ -30,8 +30,8 @@ pub use botster_terminal_protocol::{
 mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
-pub const PROTOCOL_VERSION: u16 = 7;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 46;
+pub const PROTOCOL_VERSION: u16 = 8;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 47;
 /// Oldest conformance revision accepted by the default first-party client requirement.
 pub const DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 36;
 /// Version of the local WebRTC delivery chunk framing protocol.
@@ -62,6 +62,8 @@ pub const FEATURE_TERMINAL_SUBSCRIPTION_CLOSED: &str = "terminal_subscription_cl
 pub const TERMINAL_SUBSCRIPTION_CLOSED_HOST_ADAPTER: &str = "host_adapter_closed";
 /// Core closed this bound adapter while the connection stayed alive.
 pub const TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER: &str = "core_adapter_closed";
+/// Reserved WebRTC subscription channel opened after the reservation expired.
+pub const TERMINAL_SUBSCRIPTION_CLOSED_RESERVATION_EXPIRED: &str = "reservation_expired";
 /// Optional Hub WebRTC adapter plane. Bind happens only when DataChannel Hello requires this.
 pub const FEATURE_WEBRTC_TERMINAL_ADAPTER: &str = "webrtc_terminal_adapter";
 /// Optional named attach occupancy on `DaemonStatus`. Empty occupancy without this token is not absence proof.
@@ -241,6 +243,21 @@ impl DaemonConnection {
             &mut self.reader,
             &mut self.skipped_terminal,
             &mut self.skipped_events,
+        )
+    }
+
+    /// Write one opaque terminal input frame on this muxed Unix connection.
+    ///
+    /// This is not a control request. Hub does not send a paired response.
+    pub fn send_terminal_frame(
+        &mut self,
+        session_id: impl Into<String>,
+        subscription_id: impl Into<String>,
+        frame_bytes: &[u8],
+    ) -> DaemonTransportResult<()> {
+        write_frame(
+            &mut self.stream,
+            &DaemonUnixTerminalEnvelope::from_frame_bytes(session_id, subscription_id, frame_bytes),
         )
     }
 
@@ -1078,24 +1095,6 @@ pub enum DaemonRequest {
         session_id: String,
         subscription_id: String,
     },
-    SendInput {
-        session_id: String,
-        data: String,
-    },
-    /// Race-free mode-dependent PTY input. Requires a freshness token from
-    /// [`DaemonRequest::ReadModeFlags`]. Plain [`DaemonRequest::SendInput`] must
-    /// not be used for Kitty keyboard or mouse encodings.
-    ModeGatedInput {
-        session_id: String,
-        data: String,
-        mode_generation: u64,
-        mode_revision: u64,
-    },
-    Resize {
-        session_id: String,
-        rows: u16,
-        cols: u16,
-    },
     ShutdownSession {
         session_id: String,
     },
@@ -1366,6 +1365,8 @@ pub struct DaemonResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode_gated_input: Option<DaemonModeGatedInputResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_reservation: Option<DaemonTerminalReservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_snapshot: Option<DaemonCaptureSnapshot>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spawn_targets: Vec<DaemonSpawnTarget>,
@@ -1454,7 +1455,7 @@ pub enum DaemonResponseKind {
     SessionContext,
     ReadScreen,
     ReadModeFlags,
-    ModeGatedInput,
+    TerminalReservation,
     CaptureSnapshot,
     SpawnTargets,
     SpawnTargetValidation,
@@ -1542,6 +1543,47 @@ impl DaemonModeFlags {
             application_cursor,
             mode_generation,
             mode_revision,
+        }
+    }
+}
+
+/// Hub-reserved subscription DataChannel label for one admitted terminal route.
+///
+/// Non-exhaustive so later additive fields stay source-compatible for external
+/// Rust consumers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct DaemonTerminalReservation {
+    pub session_id: String,
+    pub subscription_id: String,
+    /// Core-minted terminal subscription generation for this route.
+    pub generation: u64,
+    /// Hub peer generation that owns the reservation.
+    pub peer_generation: u64,
+    /// Exact DataChannel label the peer must create. Opaque to the peer.
+    pub label: String,
+    /// Whole seconds the peer has to open the labeled channel.
+    pub expires_in_seconds: u32,
+}
+
+impl DaemonTerminalReservation {
+    /// Build a reservation body.
+    #[must_use]
+    pub fn new(
+        session_id: impl Into<String>,
+        subscription_id: impl Into<String>,
+        generation: u64,
+        peer_generation: u64,
+        label: impl Into<String>,
+        expires_in_seconds: u32,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            subscription_id: subscription_id.into(),
+            generation,
+            peer_generation,
+            label: label.into(),
+            expires_in_seconds,
         }
     }
 }
@@ -4296,29 +4338,29 @@ mod tests {
     }
 
     #[test]
-    fn protocol_seven_rejects_protocol_six_and_accepts_conformance_floor_thirty_five() {
-        assert_eq!(PROTOCOL_VERSION, 7);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 46);
+    fn protocol_eight_rejects_protocol_seven_and_accepts_conformance_floor_thirty_six() {
+        assert_eq!(PROTOCOL_VERSION, 8);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 47);
 
-        let protocol_six = DaemonCompatibilityRequirement {
-            protocol_version: 6,
-            minimum_conformance_fixture_revision: 35,
+        let protocol_seven = DaemonCompatibilityRequirement {
+            protocol_version: 7,
+            minimum_conformance_fixture_revision: 36,
             ..DaemonCompatibilityRequirement::current()
         };
-        let error = ensure_compatible(&protocol_six, &DaemonCompatibility::current())
-            .expect_err("protocol-6 client must fail closed against protocol 7");
-        assert!(error.diagnostic.contains("unsupported protocol version 7"));
+        let error = ensure_compatible(&protocol_seven, &DaemonCompatibility::current())
+            .expect_err("protocol-7 client must fail closed against protocol 8");
+        assert!(error.diagnostic.contains("unsupported protocol version 8"));
 
-        let protocol_seven_floor_thirty_five = DaemonCompatibilityRequirement {
-            protocol_version: 7,
-            minimum_conformance_fixture_revision: 35,
+        let protocol_eight_floor_thirty_six = DaemonCompatibilityRequirement {
+            protocol_version: 8,
+            minimum_conformance_fixture_revision: 36,
             ..DaemonCompatibilityRequirement::current()
         };
         ensure_compatible(
-            &protocol_seven_floor_thirty_five,
+            &protocol_eight_floor_thirty_six,
             &DaemonCompatibility::current(),
         )
-        .expect("protocol-7 client with conformance floor 35 accepts hub revision 36");
+        .expect("protocol-8 client with conformance floor 36 accepts hub revision 47");
     }
 
     #[test]
@@ -4701,68 +4743,34 @@ mod tests {
         assert!(generated.contains("mode_flags?: DaemonModeFlags | null;"));
         assert!(generated.contains("mode_generation: number;"));
         assert!(generated.contains("mode_revision: number;"));
-        assert!(generated.contains(r#"| { type: "mode_gated_input"; session_id: string; data: string; mode_generation: number; mode_revision: number }"#));
-        assert!(generated.contains("mode_gated_input?: DaemonModeGatedInputResult | null;"));
-        assert!(generated.contains("export interface DaemonModeGatedInputResult"));
+        assert!(!generated.contains(r#"| { type: "mode_gated_input"; session_id: string; data: string; mode_generation: number; mode_revision: number }"#));
+        assert!(generated.contains("terminal_reservation?: DaemonTerminalReservation | null;"));
+        assert!(generated.contains("export interface DaemonTerminalReservation"));
         assert!(generated.contains(FEATURE_MODE_GATED_INPUT));
     }
 
     #[test]
-    fn mode_gated_input_protocol_is_serde_stable_and_generated() {
-        let request = DaemonRequest::ModeGatedInput {
-            session_id: "mode-session".to_string(),
-            data: "x".to_string(),
-            mode_generation: 1,
-            mode_revision: 2,
-        };
-        assert_eq!(
-            serde_json::to_value(&request).expect("mode gated request serializes"),
-            serde_json::json!({
-                "type": "mode_gated_input",
-                "session_id": "mode-session",
-                "data": "x",
-                "mode_generation": 1,
-                "mode_revision": 2,
-            })
-        );
-
+    fn terminal_reservation_protocol_is_serde_stable_and_generated() {
+        let reservation =
+            DaemonTerminalReservation::new("session", "subscription", 4, 2, "r-opaque", 30);
         let response = DaemonResponse {
-            kind: DaemonResponseKind::ModeGatedInput,
-            mode_gated_input: Some(DaemonModeGatedInputResult::new(
-                "mode-session",
-                true,
-                1,
-                false,
-                true,
-                false,
-                9,
-                false,
-                false,
-                false,
-                1,
-                2,
-                None,
-            )),
-            ..daemon_response_example(DaemonResponseKind::ModeGatedInput)
+            kind: DaemonResponseKind::TerminalReservation,
+            terminal_reservation: Some(reservation),
+            ..daemon_response_example(DaemonResponseKind::TerminalReservation)
         };
-        let value = serde_json::to_value(response).expect("mode gated response serializes");
+        let value = serde_json::to_value(response).expect("reservation serializes");
         assert_eq!(
-            value["mode_gated_input"],
+            value["terminal_reservation"],
             serde_json::json!({
-                "session_id": "mode-session",
-                "admitted": true,
-                "bytes_written": 1,
-                "kitty_enabled": false,
-                "cursor_visible": true,
-                "bracketed_paste": false,
-                "mouse_mode": 9,
-                "alt_screen": false,
-                "focus_reporting": false,
-                "application_cursor": false,
-                "mode_generation": 1,
-                "mode_revision": 2,
+                "session_id": "session",
+                "subscription_id": "subscription",
+                "generation": 4,
+                "peer_generation": 2,
+                "label": "r-opaque",
+                "expires_in_seconds": 30,
             })
         );
+        assert_eq!(value["kind"], "terminal_reservation");
     }
 
     #[test]
@@ -4973,8 +4981,8 @@ mod tests {
         assert!(generated.contains("export type DaemonQueueKind ="));
         assert!(generated.contains("export type DaemonQueueAgeState ="));
         assert!(generated.contains("| (string & {});"));
-        assert_eq!(PROTOCOL_VERSION, 7);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 46);
+        assert_eq!(PROTOCOL_VERSION, 8);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 47);
         assert_eq!(DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION, 36);
     }
 
@@ -5971,21 +5979,6 @@ mod tests {
                 session_id: "session".to_string(),
                 subscription_id: "subscription".to_string(),
             },
-            DaemonRequest::SendInput {
-                session_id: "session".to_string(),
-                data: "input".to_string(),
-            },
-            DaemonRequest::ModeGatedInput {
-                session_id: "session".to_string(),
-                data: "input".to_string(),
-                mode_generation: 1,
-                mode_revision: 1,
-            },
-            DaemonRequest::Resize {
-                session_id: "session".to_string(),
-                rows: 24,
-                cols: 80,
-            },
             DaemonRequest::ShutdownSession {
                 session_id: "session".to_string(),
             },
@@ -6217,9 +6210,6 @@ mod tests {
             DaemonRequest::Spawn { .. } => "spawn",
             DaemonRequest::Attach { .. } => "attach",
             DaemonRequest::Detach { .. } => "detach",
-            DaemonRequest::SendInput { .. } => "send_input",
-            DaemonRequest::ModeGatedInput { .. } => "mode_gated_input",
-            DaemonRequest::Resize { .. } => "resize",
             DaemonRequest::ShutdownSession { .. } => "shutdown_session",
             DaemonRequest::Drain { .. } => "drain",
             DaemonRequest::ReadScreen { .. } => "read_screen",
@@ -6300,7 +6290,7 @@ mod tests {
             DaemonResponseKind::SessionContext,
             DaemonResponseKind::ReadScreen,
             DaemonResponseKind::ReadModeFlags,
-            DaemonResponseKind::ModeGatedInput,
+            DaemonResponseKind::TerminalReservation,
             DaemonResponseKind::CaptureSnapshot,
             DaemonResponseKind::SpawnTargets,
             DaemonResponseKind::SpawnTargetValidation,
@@ -6351,7 +6341,7 @@ mod tests {
             DaemonResponseKind::SessionContext => "session_context",
             DaemonResponseKind::ReadScreen => "read_screen",
             DaemonResponseKind::ReadModeFlags => "read_mode_flags",
-            DaemonResponseKind::ModeGatedInput => "mode_gated_input",
+            DaemonResponseKind::TerminalReservation => "terminal_reservation",
             DaemonResponseKind::CaptureSnapshot => "capture_snapshot",
             DaemonResponseKind::SpawnTargets => "spawn_targets",
             DaemonResponseKind::SpawnTargetValidation => "spawn_target_validation",
@@ -6457,6 +6447,14 @@ mod tests {
             )),
             mode_gated_input: Some(DaemonModeGatedInputResult::new(
                 "session", true, 1, false, true, false, 9, false, false, false, 1, 1, None,
+            )),
+            terminal_reservation: Some(DaemonTerminalReservation::new(
+                "session",
+                "subscription",
+                1,
+                1,
+                "r-example",
+                30,
             )),
             capture_snapshot: Some(DaemonCaptureSnapshot {
                 session_id: "session".to_string(),
@@ -7025,8 +7023,8 @@ mod tests {
 
     #[test]
     fn protocol_six_and_conformance_thirty_two_define_the_cold_cut_boundary() {
-        assert_eq!(PROTOCOL_VERSION, 7);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 46);
+        assert_eq!(PROTOCOL_VERSION, 8);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 47);
 
         let requirement = DaemonCompatibilityRequirement::current();
         let protocol_error = ensure_compatible(
@@ -7079,7 +7077,7 @@ mod tests {
         .expect("serialize current status");
         let stale: StaleStatus =
             serde_json::from_value(status_value).expect("stale status ignores additive identity");
-        assert_eq!(stale.compatibility.protocol_version, 7);
+        assert_eq!(stale.compatibility.protocol_version, 8);
         assert_eq!(stale.host_id, "hub");
         assert_eq!(stale.schema_version, 1);
     }
@@ -7090,8 +7088,8 @@ mod tests {
         // conformance revision with a floor, so an additive request must ride the
         // conformance revision: bumping the protocol would break every existing
         // first-party client that never issues this request.
-        assert_eq!(PROTOCOL_VERSION, 7);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 46);
+        assert_eq!(PROTOCOL_VERSION, 8);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 47);
         assert_eq!(DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION, 36);
         assert_eq!(
             current_feature_list(),

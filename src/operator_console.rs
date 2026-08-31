@@ -550,7 +550,7 @@ mod tests {
         ])));
         assert!(!contains_data_dir_override(&words(&[
             "sessions",
-            "send-input",
+            "shutdown",
             "--",
             "--data-dir"
         ])));

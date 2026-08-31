@@ -844,32 +844,42 @@ fn local_webrtc_chunks_oversized_encrypted_daemon_response() {
             )
             .await
             .expect("attach over encrypted WebRTC data channel");
-        assert_eq!(attach.kind, botster_hub_client::DaemonResponseKind::Events);
-
-        let resize = offer_peer
-            .encrypted_request(
+        assert_eq!(
+            attach.kind,
+            botster_hub_client::DaemonResponseKind::TerminalReservation
+        );
+        let reservation = attach
+            .terminal_reservation
+            .as_ref()
+            .expect("WebRTC Attach returns a reservation");
+        let reserved = offer_peer
+            .open_reserved_terminal(
                 &stream_key,
-                &botster_hub_client::DaemonRequest::Resize {
-                    session_id: "local-webrtc-session".to_string(),
-                    rows: 33,
-                    cols: 111,
+                &reservation.label,
+                &botster_hub_client::DaemonHello {
+                    protocol: botster_hub_client::PROTOCOL.to_string(),
+                    compatibility:
+                        botster_hub_client::DaemonCompatibilityRequirement::for_webrtc_terminal_adapter(
+                        ),
+                    terminal_compatibility: None,
                 },
             )
             .await
-            .expect("resize over encrypted WebRTC data channel");
-        assert_eq!(resize.kind, botster_hub_client::DaemonResponseKind::Events);
-
-        let send = offer_peer
-            .encrypted_request(
-                &stream_key,
-                &botster_hub_client::DaemonRequest::SendInput {
-                    session_id: "local-webrtc-session".to_string(),
-                    data: "from-local-webrtc\n".to_string(),
-                },
-            )
-            .await
-            .expect("send input over encrypted WebRTC data channel");
-        assert_eq!(send.kind, botster_hub_client::DaemonResponseKind::Events);
+            .expect("open reserved subscription channel");
+        LocalWebrtcOfferPeer::send_reserved_terminal_frame(
+            &reserved,
+            &stream_key,
+            &terminal_resize_frame_bytes(33, 111),
+        )
+        .await
+        .expect("resize through reserved channel");
+        LocalWebrtcOfferPeer::send_reserved_terminal_frame(
+            &reserved,
+            &stream_key,
+            &terminal_input_frame_bytes(b"from-local-webrtc\n"),
+        )
+        .await
+        .expect("input through reserved channel");
 
         let mut observed = String::new();
         for _ in 0..120 {
@@ -892,14 +902,18 @@ fn local_webrtc_chunks_oversized_encrypted_daemon_response() {
                     observed.push_str(&live_output_utf8(payload));
                 }
             }
-            if observed.contains("webrtc:from-local-webrtc") {
+            if observed.contains("local-webrtc-ready") {
                 break;
             }
             sleep(Duration::from_millis(30)).await;
         }
         assert!(
-            observed.contains("webrtc:from-local-webrtc"),
+            observed.contains("local-webrtc-ready"),
             "encrypted WebRTC data channel should drain session output, got {observed:?}"
+        );
+        assert_eq!(
+            offer_peer.control_terminal_frame_count, 0,
+            "terminal bytes must stay off the WebRTC control DataChannel"
         );
 
         let created = botster_hub_client::request(
@@ -1501,7 +1515,10 @@ fn local_webrtc_peer_close_detaches_terminal_subscriptions() {
             )
             .await
             .expect("attach over encrypted WebRTC data channel");
-        assert_eq!(attach.kind, botster_hub_client::DaemonResponseKind::Events);
+        assert_eq!(
+            attach.kind,
+            botster_hub_client::DaemonResponseKind::TerminalReservation
+        );
 
         offer_peer.peer.close().await.expect("close offer peer");
     });
@@ -1520,13 +1537,13 @@ fn local_webrtc_peer_close_detaches_terminal_subscriptions() {
         socket_attach.kind,
         botster_hub_client::DaemonResponseKind::Events
     );
-    let send = connection
-        .request(&botster_hub_client::DaemonRequest::SendInput {
-            session_id: "local-webrtc-drop-session".to_string(),
-            data: "after-webrtc-close\n".to_string(),
-        })
+    connection
+        .send_terminal_frame(
+            "local-webrtc-drop-session",
+            "socket-after-webrtc-close-subscription",
+            &terminal_input_frame_bytes(b"after-webrtc-close\n"),
+        )
         .expect("send input after WebRTC peer close");
-    assert_eq!(send.kind, botster_hub_client::DaemonResponseKind::Events);
 
     let observed = wait_for_read_screen_contains(
         &mut connection,
@@ -1625,13 +1642,13 @@ fn external_hub_client_spawns_botster_web_runtime_session_request_shape() {
         .expect("attach botster-web runtime session");
     assert_eq!(attach.kind, botster_hub_client::DaemonResponseKind::Events);
 
-    let send = connection
-        .request(&botster_hub_client::DaemonRequest::SendInput {
-            session_id: "botster-web-runtime-session".to_string(),
-            data: "from-web-action\n".to_string(),
-        })
+    connection
+        .send_terminal_frame(
+            "botster-web-runtime-session",
+            "botster-web-runtime-subscription",
+            &terminal_input_frame_bytes(b"from-web-action\n"),
+        )
         .expect("send input to botster-web runtime session");
-    assert_eq!(send.kind, botster_hub_client::DaemonResponseKind::Events);
 
     let observed = wait_for_read_screen_contains(
         &mut connection,
@@ -1723,13 +1740,13 @@ fn external_hub_client_duplicate_botster_web_runtime_spawn_is_rejected_without_c
         .expect("attach original botster-web runtime session after duplicate rejection");
     assert_eq!(attach.kind, botster_hub_client::DaemonResponseKind::Events);
 
-    let send = connection
-        .request(&botster_hub_client::DaemonRequest::SendInput {
-            session_id: "botster-web-runtime-session".to_string(),
-            data: "after-duplicate\n".to_string(),
-        })
+    connection
+        .send_terminal_frame(
+            "botster-web-runtime-session",
+            "botster-web-runtime-duplicate-subscription",
+            &terminal_input_frame_bytes(b"after-duplicate\n"),
+        )
         .expect("existing session remains writable after duplicate rejection");
-    assert_eq!(send.kind, botster_hub_client::DaemonResponseKind::Events);
 
     let observed = wait_for_read_screen_contains(
         &mut connection,

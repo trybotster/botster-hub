@@ -92,6 +92,8 @@ pub struct HubRuntime {
     // hold a read guard across `replace_state`, which takes the write guard.
     state: RwLock<HubState>,
     core_daemon: SharedCoreDaemon,
+    close_work: crate::data_plane::CloseWorkSource,
+    data_plane: Option<crate::data_plane::DataPlaneDriver>,
     reconciliation: HubSessionReconciliation,
     plugin_lifecycle: HubPluginLifecycle,
     capability_runtime: SharedHubCapabilityRuntime,
@@ -145,7 +147,10 @@ enum PendingTestEvent {
     },
 }
 
-type SharedCoreDaemon = Mutex<CoreDaemon>;
+// CoreDaemon is !Send because worker state uses Rc. All access is mutex
+// serialized and Core is dropped only after the data-plane driver joins.
+#[allow(clippy::arc_with_non_send_sync)]
+type SharedCoreDaemon = Arc<Mutex<CoreDaemon>>;
 type SharedSessionContexts = Arc<Mutex<BTreeMap<String, HubSessionContext>>>;
 const SESSION_TYPE_SPAWN_TIMEOUT_MS: u64 = 30_000;
 const PLUGIN_EVENT_TIMEOUT_MS: u64 = 1_000;
@@ -277,7 +282,9 @@ impl HubRuntime {
         let test_seams = hub_test_seams();
         let core_config = core_daemon_config(&config, &test_seams);
         let plugin_worker_config = config.plugin_worker_config();
-        let core_daemon = Mutex::new(CoreDaemon::new(core_config));
+        #[allow(clippy::arc_with_non_send_sync)]
+        let core_daemon = Arc::new(Mutex::new(CoreDaemon::new(core_config)));
+        let (close_work, data_plane) = start_data_plane(&core_daemon);
         let package_event_router = Arc::new(crate::package_event_router::PackageEventRouter::new(
             config.package_event_plane,
         ));
@@ -296,6 +303,8 @@ impl HubRuntime {
             config,
             state: RwLock::new(state),
             core_daemon,
+            close_work,
+            data_plane: Some(data_plane),
             reconciliation: HubSessionReconciliation::default(),
             plugin_lifecycle: HubPluginLifecycle::with_config(plugin_worker_config),
             last_capability_cleanup: None,
@@ -383,7 +392,9 @@ impl HubRuntime {
         let test_seams = hub_test_seams();
         let core_config = core_daemon_config(&config, &test_seams);
         let plugin_worker_config = config.plugin_worker_config();
-        let core_daemon = Mutex::new(CoreDaemon::new(core_config));
+        #[allow(clippy::arc_with_non_send_sync)]
+        let core_daemon = Arc::new(Mutex::new(CoreDaemon::new(core_config)));
+        let (close_work, data_plane) = start_data_plane(&core_daemon);
         let package_event_router = Arc::new(crate::package_event_router::PackageEventRouter::new(
             config.package_event_plane,
         ));
@@ -402,6 +413,8 @@ impl HubRuntime {
             config,
             state: RwLock::new(state),
             core_daemon,
+            close_work,
+            data_plane: Some(data_plane),
             reconciliation: HubSessionReconciliation::default(),
             plugin_lifecycle: HubPluginLifecycle::with_config(plugin_worker_config),
             last_capability_cleanup: None,
@@ -3626,7 +3639,7 @@ impl HubRuntime {
         )
     }
 
-    /// Bind a content-blind terminal adapter to a live attach generation.
+    /// Bind a waking duplex terminal adapter to a live attach generation.
     pub fn bind_terminal_adapter(
         &mut self,
         client_id: ClientId,
@@ -3634,12 +3647,12 @@ impl HubRuntime {
         subscription_id: SubscriptionId,
         generation: TerminalSubscriptionGeneration,
         capabilities: TerminalCapabilitySet,
-        adapter: Box<dyn botster_core::contract::terminal_adapter::TerminalAdapter + Send>,
+        adapter: Box<dyn botster_core::contract::terminal_wake::WakingTerminalAdapter + Send>,
     ) -> Result<(), CoreDaemonError> {
         self.core_daemon
             .lock()
             .expect("core daemon mutex")
-            .bind_terminal_adapter(
+            .bind_waking_terminal_adapter(
                 client_id,
                 session_id,
                 subscription_id,
@@ -3647,6 +3660,10 @@ impl HubRuntime {
                 capabilities,
                 adapter,
             )
+    }
+
+    pub(crate) fn close_work_source(&self) -> crate::data_plane::CloseWorkSource {
+        self.close_work.clone()
     }
 
     /// Control-plane terminal subscription inventory. No terminal bodies.
@@ -3758,6 +3775,7 @@ impl HubRuntime {
     }
 
     /// Exact non-mutating registry state for one session.
+    #[allow(dead_code)]
     pub(crate) fn session_registry_state(
         &self,
         session_id: &SessionId,
@@ -3936,7 +3954,17 @@ impl HubRuntime {
 
     /// Release worker-backed sessions before an intentional hub restart.
     pub fn release_for_restart(&mut self) {
+        self.stop_data_plane();
         self.release_sessions_for_restart();
+    }
+
+    pub(crate) fn stop_data_plane(&mut self) {
+        if let Some(mut driver) = self.data_plane.take()
+            && let Err(reason) = driver.stop_and_join()
+        {
+            let _ = reason;
+            std::process::abort();
+        }
     }
 
     /// Scan daemon registry records for worker-backed restart/adoption evidence.
@@ -4291,6 +4319,7 @@ fn managed_session_core_error_class(error: &CoreDaemonError) -> &'static str {
         CoreDaemonError::Shutdown => "shutdown",
         CoreDaemonError::MissingScreenResponse(_) => "missing_screen_response",
         CoreDaemonError::MissingModeFlagsResponse(_) => "missing_mode_flags_response",
+        CoreDaemonError::ControlPlaneFailed(_) => "control_plane_failed",
         CoreDaemonError::BindTerminalAdapter(error) => match error {
             BindTerminalAdapterError::BindBeforeAttach { .. } => {
                 "bind_terminal_adapter.bind_before_attach"
@@ -4302,6 +4331,9 @@ fn managed_session_core_error_class(error: &CoreDaemonError) -> &'static str {
                 "bind_terminal_adapter.stale_generation"
             }
             BindTerminalAdapterError::AlreadyBound { .. } => "bind_terminal_adapter.already_bound",
+            BindTerminalAdapterError::ControlPlaneFailed { .. } => {
+                "bind_terminal_adapter.control_plane_failed"
+            }
         },
     }
 }
@@ -4688,6 +4720,26 @@ pub struct HubTestSeams {
     pub event_invocation_timeout_ms: Option<u64>,
     pub event_handler_hold_ms: Option<u64>,
     pub hold_journal_pull: Option<PathBuf>,
+}
+
+fn start_data_plane(
+    core_daemon: &Arc<Mutex<CoreDaemon>>,
+) -> (
+    crate::data_plane::CloseWorkSource,
+    crate::data_plane::DataPlaneDriver,
+) {
+    let close_work = crate::data_plane::CloseWorkSource::new();
+    let wake_source = core_daemon
+        .lock()
+        .expect("core daemon mutex")
+        .wake_source()
+        .clone();
+    let driver = crate::data_plane::DataPlaneDriver::start(
+        Arc::clone(core_daemon),
+        wake_source,
+        close_work.clone(),
+    );
+    (close_work, driver)
 }
 
 fn hub_test_seams() -> HubTestSeams {

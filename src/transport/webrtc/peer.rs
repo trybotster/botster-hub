@@ -29,7 +29,6 @@ use crate::transport::webrtc::control_channel::{
 };
 use crate::transport::webrtc::subscription_channel::{
     LocalWebrtcAttachedSubscription, LocalWebrtcAttachedSubscriptionChange,
-    reject_extra_data_channel,
 };
 use crate::transport::webrtc::{LocalWebrtcError, LocalWebrtcResult};
 pub(crate) fn webrtc_runtime() -> Arc<dyn Runtime> {
@@ -818,13 +817,19 @@ impl PeerConnectionEventHandler for LocalWebrtcHandler {
         let claimed = self.peer_state.claim_data_channel();
         if !claimed {
             let label = data_channel.label().await.unwrap_or_else(|_| String::new());
-            reject_extra_data_channel(
-                &self.peer_state.grant_id,
-                claimed,
-                &label,
-                data_channel.as_ref(),
-            )
-            .await;
+            let grant_id = self.peer_state.grant_id.clone();
+            let peer_state = self.peer_state.clone();
+            let stream_key = self.stream_key.clone();
+            self.runtime.spawn(Box::pin(async move {
+                crate::transport::webrtc::subscription_channel::admit_reserved_subscription_channel(
+                    &grant_id,
+                    &label,
+                    data_channel.as_ref(),
+                    &stream_key,
+                    peer_state.as_ref(),
+                )
+                .await;
+            }));
             return;
         }
         let peer_state = self.peer_state.clone();
@@ -2545,10 +2550,11 @@ mod tests {
         );
         assert_eq!(
             attach_b.kind,
-            botster_hub_client::DaemonResponseKind::Events,
-            "replacement owner B must attach successfully: {:?}",
+            botster_hub_client::DaemonResponseKind::TerminalReservation,
+            "replacement owner B must reserve successfully: {:?}",
             attach_b.error
         );
+        assert!(attach_b.terminal_reservation.is_some());
         assert_eq!(
             harness
                 .state
