@@ -112,11 +112,6 @@ impl<W: WakeSink> AdapterSlot<W> {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn wake(&self) {
-        self.wake.wake();
-    }
-
     #[allow(dead_code)]
     pub(crate) fn set_would_block(&self, pressured: bool) {
         self.would_block.store(pressured, Ordering::SeqCst);

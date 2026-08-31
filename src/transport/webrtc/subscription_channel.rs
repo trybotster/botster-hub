@@ -11,7 +11,8 @@ use tokio::sync::oneshot;
 use crate::daemon::control::message::{BindReservedError, ControlMessage, ReservationInspectReply};
 use crate::transport::webrtc::adapter::WebRtcTerminalAdapterHandle;
 use crate::transport::webrtc::control_channel::{
-    DataChannelPlaintext, LocalWebrtcFlowControl, decrypt_data_channel_plaintext,
+    DataChannelPlaintext, LOCAL_WEBRTC_BUFFERED_AMOUNT_HIGH, LOCAL_WEBRTC_BUFFERED_AMOUNT_LOW,
+    decrypt_data_channel_plaintext,
 };
 use crate::transport::webrtc::delivery::{framed_daemon_hello_ack, framed_daemon_terminal_frame};
 use crate::transport::webrtc::peer::LocalWebrtcPeerState;
@@ -242,7 +243,19 @@ async fn run_bound_subscription_channel<C>(
 ) where
     C: LocalWebrtcDataChannel + ?Sized,
 {
-    let _ = LocalWebrtcFlowControl::default();
+    if data_channel
+        .local_set_buffered_amount_low_threshold(LOCAL_WEBRTC_BUFFERED_AMOUNT_LOW)
+        .await
+        .is_err()
+        || data_channel
+            .local_set_buffered_amount_high_threshold(LOCAL_WEBRTC_BUFFERED_AMOUNT_HIGH)
+            .await
+            .is_err()
+    {
+        handle.close();
+        let _ = data_channel.local_close().await;
+        return;
+    }
     loop {
         if let Err(()) = flush_subscription_adapter_frames(data_channel, stream_key, &handle).await
         {
@@ -273,6 +286,10 @@ async fn run_bound_subscription_channel<C>(
                             return;
                         }
                     }
+                    Some(event @ (webrtc::data_channel::DataChannelEvent::OnBufferedAmountHigh
+                    | webrtc::data_channel::DataChannelEvent::OnBufferedAmountLow)) => {
+                        apply_subscription_pressure_event(&handle, &event);
+                    }
                     Some(webrtc::data_channel::DataChannelEvent::OnClose)
                     | Some(webrtc::data_channel::DataChannelEvent::OnError)
                     | None => {
@@ -283,6 +300,21 @@ async fn run_bound_subscription_channel<C>(
                 }
             }
         }
+    }
+}
+
+fn apply_subscription_pressure_event(
+    handle: &WebRtcTerminalAdapterHandle,
+    event: &webrtc::data_channel::DataChannelEvent,
+) {
+    match event {
+        webrtc::data_channel::DataChannelEvent::OnBufferedAmountHigh => {
+            handle.set_would_block(true);
+        }
+        webrtc::data_channel::DataChannelEvent::OnBufferedAmountLow => {
+            handle.set_would_block(false);
+        }
+        _ => {}
     }
 }
 
@@ -377,6 +409,21 @@ mod tests {
         Receiver as AsyncReceiver, Sender as AsyncSender, channel as webrtc_channel,
         default_runtime, timeout,
     };
+
+    #[test]
+    fn terminal_channel_pressure_targets_one_adapter_and_low_water_resumes_it() {
+        let (adapter, handle) = crate::transport::webrtc::adapter::WebRtcTerminalAdapter::pair();
+        let (sibling, _sibling_handle) =
+            crate::transport::webrtc::adapter::WebRtcTerminalAdapter::pair();
+
+        apply_subscription_pressure_event(&handle, &DataChannelEvent::OnBufferedAmountHigh);
+        assert_eq!(adapter.pressure(), TerminalAdapterPressure::WouldBlock);
+        assert_eq!(sibling.pressure(), TerminalAdapterPressure::Ready);
+
+        apply_subscription_pressure_event(&handle, &DataChannelEvent::OnBufferedAmountLow);
+        assert_eq!(adapter.pressure(), TerminalAdapterPressure::Ready);
+        assert_eq!(sibling.pressure(), TerminalAdapterPressure::Ready);
+    }
     #[test]
     fn reject_extra_data_channel_closes_the_unclaimed_channel() {
         let extra = FakeDataChannel::default();
