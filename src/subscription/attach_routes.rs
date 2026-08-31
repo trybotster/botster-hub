@@ -960,12 +960,161 @@ impl AttachedSubscriptionChange {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use botster_core::{
+        CoreSessionMetadata, ResizePayload, SessionSpawnRequest, SpawnEnvironment,
+        SpawnWorkingDirectory,
+    };
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn owner() -> AttachStreamOwner {
         AttachStreamOwner {
             client_id: "client-a".to_string(),
             grant_id: None,
         }
+    }
+
+    #[test]
+    fn ingress_loss_hard_stops_exact_bound_route_and_preserves_sibling() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let data_directory = std::env::temp_dir().join(format!(
+            "hub-adapter-ingress-loss-{}-{nonce}",
+            std::process::id()
+        ));
+        let config = crate::HubStartupOptions {
+            host: crate::HostIdentityOptions {
+                id: "adapter-ingress-loss".to_string(),
+                display_name: "Adapter ingress loss".to_string(),
+                fingerprint: None,
+            },
+            data_directory: crate::DataDirectoryOption::Explicit(data_directory.clone()),
+            session_defaults: crate::SessionDefaults {
+                shell: "/bin/sh".to_string(),
+                working_directory: Some(".".into()),
+                initial_rows: 24,
+                initial_cols: 80,
+            },
+            transports: crate::TransportBindings::default(),
+            ..crate::HubStartupOptions::default()
+        }
+        .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
+        .expect("config");
+        let mut runtime = HubRuntime::new(config);
+        let session_id = SessionId("ingress-loss-session".to_string());
+        runtime
+            .spawn_session(
+                SessionSpawnRequest {
+                    request_id: botster_core::RequestId("ingress-loss-spawn".to_string()),
+                    session_id: session_id.clone(),
+                    executable: "/bin/sleep".to_string(),
+                    arguments: vec!["8".to_string()],
+                    working_directory: SpawnWorkingDirectory {
+                        path: ".".to_string(),
+                    },
+                    environment: SpawnEnvironment::default(),
+                    initial_pty_size: Some(ResizePayload { rows: 24, cols: 80 }),
+                },
+                CoreSessionMetadata::new(),
+                1,
+            )
+            .expect("spawn session");
+
+        let mut registry = AttachStreamRegistry::default();
+        for (client_id, subscription_id) in [
+            ("lost-client", "lost-subscription"),
+            ("sibling-client", "sibling-subscription"),
+        ] {
+            registry.start_attach(
+                AttachStreamOwner {
+                    client_id: client_id.to_string(),
+                    grant_id: None,
+                },
+                session_id.0.clone(),
+                subscription_id.to_string(),
+            );
+            registry
+                .begin_core_attach(&mut runtime, &session_id.0, subscription_id, 2)
+                .expect("attach through Core");
+        }
+
+        let mux = UnixConnectionMux::new();
+        let capabilities = negotiated_unix_capability_set(&[], None).expect("capabilities");
+        for (client_id, subscription_id) in [
+            ("lost-client", "lost-subscription"),
+            ("sibling-client", "sibling-subscription"),
+        ] {
+            bind_unix_adapter_after_attaching(
+                &mut registry,
+                &mut runtime,
+                UnixBindRequest {
+                    client_id,
+                    session_id: &session_id.0,
+                    subscription_id,
+                    capabilities: capabilities.clone(),
+                    now_seconds: 3,
+                    mux: Some(&mux),
+                },
+            )
+            .expect("bind through Hub")
+            .expect("bound handle");
+        }
+
+        let lost_generation = registry
+            .recorded_generation(&session_id.0, "lost-subscription")
+            .expect("lost generation");
+        let sibling_generation = registry
+            .recorded_generation(&session_id.0, "sibling-subscription")
+            .expect("sibling generation");
+        let lost = mux
+            .route_handle(&session_id.0, "lost-subscription", lost_generation.0)
+            .expect("production-registered lost handle");
+        let sibling = mux
+            .route_handle(&session_id.0, "sibling-subscription", sibling_generation.0)
+            .expect("production-registered sibling handle");
+
+        lost.mark_ingress_lost();
+        // This is the guarded Hub test seam, not a production Hub loop. It proves
+        // Core hard-stop behavior and Hub adapter isolation, not production reachability.
+        runtime
+            .drain_runtime_once(&session_id, 4)
+            .expect("drive real Core ingress intake");
+
+        let inventory = runtime.list_terminal_subscriptions();
+        assert!(
+            !inventory.iter().any(|row| {
+                row.session_id == session_id
+                    && row.subscription_id.0 == "lost-subscription"
+                    && row.generation == lost_generation
+            }),
+            "Core must retire exactly the route whose adapter reported loss"
+        );
+        assert!(lost.is_closed(), "hard stop must close the lost adapter");
+        assert!(
+            inventory.iter().any(|row| {
+                row.session_id == session_id
+                    && row.subscription_id.0 == "sibling-subscription"
+                    && row.generation == sibling_generation
+                    && row.adapter_bound
+            }),
+            "the sibling route must remain bound"
+        );
+        assert!(!sibling.is_closed(), "the sibling adapter must stay live");
+        let output = botster_terminal_protocol::TerminalFrame::from_bytes(
+            br#"{"type":"terminal_output","marker":"sibling-live"}"#,
+        )
+        .expect("opaque terminal output");
+        sibling.write_opaque_frame(&output);
+        assert!(
+            sibling.snapshot_active().is_some(),
+            "the surviving sibling must still accept terminal output"
+        );
+
+        runtime
+            .shutdown_session(session_id, 5)
+            .expect("shutdown session");
+        let _ = std::fs::remove_dir_all(data_directory);
     }
 
     #[test]

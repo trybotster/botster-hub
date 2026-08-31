@@ -5538,11 +5538,17 @@ mod tests {
             ),
             (
                 BindTerminalAdapterError::AlreadyBound {
-                    session_id,
-                    subscription_id,
+                    session_id: session_id.clone(),
+                    subscription_id: subscription_id.clone(),
                     generation: TerminalSubscriptionGeneration(1),
                 },
                 "bind_terminal_adapter.already_bound",
+            ),
+            (
+                BindTerminalAdapterError::ControlPlaneFailed {
+                    session_id: session_id.clone(),
+                },
+                "bind_terminal_adapter.control_plane_failed",
             ),
         ];
         for (error, class) in mapped {
@@ -5551,6 +5557,21 @@ mod tests {
                 class
             );
         }
+        let control_plane =
+            managed_session_core_error_class(&CoreDaemonError::ControlPlaneFailed(session_id));
+        let bind_control_plane = managed_session_core_error_class(
+            &CoreDaemonError::BindTerminalAdapter(BindTerminalAdapterError::ControlPlaneFailed {
+                session_id: SessionId("session".to_string()),
+            }),
+        );
+        assert_eq!(control_plane, "control_plane_failed");
+        assert_eq!(
+            bind_control_plane,
+            "bind_terminal_adapter.control_plane_failed"
+        );
+        assert_ne!(control_plane, bind_control_plane);
+        assert!(!control_plane.contains('/'));
+        assert!(!bind_control_plane.contains('/'));
     }
     #[test]
     fn hub_core_daemon_config_always_supplies_worker_path() {

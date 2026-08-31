@@ -288,6 +288,24 @@ impl UnixConnectionMux {
         self.inner.notify.notify_waiters();
     }
 
+    #[cfg(test)]
+    pub(crate) fn route_handle(
+        &self,
+        session_id: &str,
+        subscription_id: &str,
+        generation: u64,
+    ) -> Option<UnixTerminalAdapterHandle> {
+        self.inner.routes.lock().ok().and_then(|routes| {
+            routes
+                .get(&(
+                    session_id.to_string(),
+                    subscription_id.to_string(),
+                    generation,
+                ))
+                .map(|route| route.handle.clone())
+        })
+    }
+
     pub(crate) fn close_all(&self) {
         self.inner.dying.store(true, Ordering::SeqCst);
         if let Ok(mut routes) = self.inner.routes.lock() {
@@ -507,6 +525,11 @@ impl UnixTerminalAdapterHandle {
 
     pub(crate) fn push_ingress(&self, bytes: Vec<u8>) -> Result<(), ()> {
         self.inner.slot.push_ingress(bytes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_ingress_lost(&self) {
+        self.inner.slot.mark_ingress_lost();
     }
 }
 
