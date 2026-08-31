@@ -209,6 +209,9 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
     let (shutdown_tx, _) = watch::channel(false);
     install_signal_forwarder(control_tx.clone())?;
     let mut daemon = HubDaemon::start(config)?;
+    if let Some(runtime) = daemon.runtime() {
+        runtime.bind_data_plane_owner_wake(control_tx.clone());
+    }
     let mut control_state = DaemonControlState {
         event_plane: daemon.local_webrtc().event_plane(),
         pending_runtime: PendingRuntimeState {

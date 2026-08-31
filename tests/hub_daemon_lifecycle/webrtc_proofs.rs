@@ -341,6 +341,14 @@ fn external_hub_webrtc_live_output_preserves_exact_bytes() {
             "WebRTC Attach must not return terminal bodies: {:?}",
             attach.events
         );
+        bind_reserved_from_attach(
+            &mut offer_peer,
+            &stream_key,
+            &attach,
+            "webrtc-exact-bytes-session",
+            "webrtc-exact-bytes-sub",
+        )
+        .await;
         fs::create_dir_all(release_path.parent().expect("release parent"))
             .expect("create webrtc release dir");
         fs::write(&release_path, b"go").expect("release webrtc write(2) producer");
@@ -355,6 +363,16 @@ fn external_hub_webrtc_live_output_preserves_exact_bytes() {
                     },
                 )
                 .await;
+            if let Ok(Ok(bytes)) = timeout(
+                Duration::from_millis(200),
+                offer_peer.next_terminal_frame(&stream_key),
+            )
+            .await
+            {
+                offer_peer
+                    .pending_terminal_frames
+                    .push_back((String::new(), bytes));
+            }
             while let Some((_, bytes)) = offer_peer.pending_terminal_frames.pop_front() {
                 if let Ok(event) = serde_json::from_slice::<botster_hub_client::DaemonEvent>(&bytes)
                 {
@@ -531,6 +549,14 @@ fn external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup() {
                 "WebRTC Attach must not return terminal bodies: {:?}",
                 attach.events
             );
+            bind_reserved_from_attach(
+                &mut offer_peer,
+                &stream_key,
+                &attach,
+                &session_id,
+                &subscription_id,
+            )
+            .await;
             fs::create_dir_all(release_path.parent().expect("release parent"))
                 .expect("create webrtc release dir");
             fs::write(&release_path, b"go").expect("release webrtc write(2) producer");
@@ -545,6 +571,16 @@ fn external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup() {
                         },
                     )
                     .await;
+                if let Ok(Ok(bytes)) = timeout(
+                    Duration::from_millis(200),
+                    offer_peer.next_terminal_frame(&stream_key),
+                )
+                .await
+                {
+                    offer_peer
+                        .pending_terminal_frames
+                        .push_back((String::new(), bytes));
+                }
                 while let Some((_, bytes)) = offer_peer.pending_terminal_frames.pop_front() {
                     if let Ok(event) =
                         serde_json::from_slice::<botster_hub_client::DaemonEvent>(&bytes)

@@ -3666,6 +3666,15 @@ impl HubRuntime {
         self.close_work.clone()
     }
 
+    pub(crate) fn bind_data_plane_owner_wake(
+        &self,
+        sender: crate::daemon::control::message::ControlSender,
+    ) {
+        if let Some(driver) = self.data_plane.as_ref() {
+            driver.bind_owner_wake(sender);
+        }
+    }
+
     /// Control-plane terminal subscription inventory. No terminal bodies.
     #[must_use]
     pub fn list_terminal_subscriptions(&self) -> Vec<TerminalSubscriptionRecord> {

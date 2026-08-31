@@ -240,7 +240,7 @@ impl WebRtcConnectionMux {
             .ok()
             .map(|slot| Arc::clone(&*slot))
             .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-        WebRtcTerminalAdapter::pair_with_wake_and_close_work(self.inner.wake.clone(), close_work)
+        WebRtcTerminalAdapter::pair_with_wake_and_close_work(AdapterWake::new(), close_work)
     }
 
     pub(crate) fn admit_close_events(&self) {
@@ -449,6 +449,10 @@ impl WebRtcConnectionMux {
 }
 
 impl WebRtcTerminalAdapterHandle {
+    pub(crate) async fn wait_for_write(&self) {
+        self.inner.slot.wait_for_write().await;
+    }
+
     pub(crate) fn close(&self) {
         self.inner.close();
     }
@@ -606,7 +610,7 @@ mod tests {
     fn wait_observes_a_write_that_happens_after_an_empty_scan() {
         let mux = WebRtcConnectionMux::new();
         let (mut adapter, handle) = mux.create_adapter();
-        mux.register("s".into(), "sub".into(), 1, handle);
+        mux.register("s".into(), "sub".into(), 1, handle.clone());
         assert!(
             mux.snapshot_writes().is_empty(),
             "scan is empty before the race write"
@@ -619,7 +623,7 @@ mod tests {
             .build()
             .expect("runtime");
         runtime.block_on(async {
-            tokio::time::timeout(Duration::from_millis(50), mux.wait_for_write())
+            tokio::time::timeout(Duration::from_millis(50), handle.wait_for_write())
                 .await
                 .expect("write after empty scan must store a wake permit");
         });

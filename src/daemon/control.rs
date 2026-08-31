@@ -120,6 +120,15 @@ pub(crate) fn handle_control_message(
     message: ControlMessage,
 ) -> bool {
     match message {
+        ControlMessage::DataPlaneProgress => {
+            if daemon
+                .runtime()
+                .is_some_and(crate::HubRuntime::take_journal_advanced_wake)
+            {
+                state.maintenance.note_authoritative_mutation();
+            }
+            false
+        }
         message @ ControlMessage::AcceptedConnection { .. }
         | message @ ControlMessage::RejectedConnection
         | message @ ControlMessage::RegisterUnixAdmission { .. }

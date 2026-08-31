@@ -10,6 +10,7 @@ use botster_core::SessionId;
 use botster_core::contract::terminal_wake::TerminalWakeSource;
 use botster_core_daemon::CoreDaemon;
 
+use crate::daemon::control::message::{ControlMessage, ControlSender};
 use crate::data_plane::close_work::CloseWorkSource;
 use crate::subscription::closed_events::session_close_event_decision;
 
@@ -43,12 +44,15 @@ pub(crate) struct DataPlaneDriver {
     wake_source: TerminalWakeSource,
     done: Receiver<()>,
     thread: Option<JoinHandle<()>>,
+    owner_wake: Arc<Mutex<Option<ControlSender>>>,
 }
 
 #[derive(Default)]
 struct DriverCounters {
     pumps: AtomicU64,
     close_keys: AtomicU64,
+    owner_wakes: AtomicU64,
+    adapter_routes: AtomicU64,
 }
 
 impl DataPlaneDriver {
@@ -62,10 +66,18 @@ impl DataPlaneDriver {
         let thread_stop = Arc::clone(&stop);
         let thread_wakes = wake_source.clone();
         let shared = SharedCore(core_daemon);
+        let owner_wake = Arc::new(Mutex::new(None));
+        let thread_owner_wake = Arc::clone(&owner_wake);
         let thread = std::thread::Builder::new()
             .name("botster-hub-data-plane".to_string())
             .spawn(move || {
-                run_loop(shared, thread_wakes, close_work, thread_stop);
+                run_loop(
+                    shared,
+                    thread_wakes,
+                    close_work,
+                    thread_stop,
+                    thread_owner_wake,
+                );
                 let _ = done_tx.send(());
             })
             .expect("start botster-hub-data-plane");
@@ -74,6 +86,13 @@ impl DataPlaneDriver {
             wake_source,
             done: done_rx,
             thread: Some(thread),
+            owner_wake,
+        }
+    }
+
+    pub(crate) fn bind_owner_wake(&self, sender: ControlSender) {
+        if let Ok(mut slot) = self.owner_wake.lock() {
+            *slot = Some(sender);
         }
     }
 
@@ -113,6 +132,7 @@ fn run_loop(
     wake_source: TerminalWakeSource,
     close_work: CloseWorkSource,
     stop: Arc<AtomicBool>,
+    owner_wake: Arc<Mutex<Option<ControlSender>>>,
 ) {
     let counters = DriverCounters::default();
     let _stop_handle = wake_source.session_handle(SessionId(STOP_SESSION_ID.to_string()));
@@ -129,6 +149,10 @@ fn run_loop(
             continue;
         }
         let batch = wake_source.wait_wakes(watchdog());
+        counters.adapter_routes.fetch_add(
+            u64::try_from(batch.adapter_routes.len()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
         if stop.load(Ordering::SeqCst) {
             break;
         }
@@ -136,10 +160,12 @@ fn run_loop(
             .duration_since(UNIX_EPOCH)
             .map(|elapsed| elapsed.as_secs())
             .unwrap_or(0);
+        let mut pumped = false;
         {
             let mut core = core_daemon.0.lock().expect("core daemon mutex");
             if core.pump_woken(&batch, now_seconds).is_ok() {
                 counters.pumps.fetch_add(1, Ordering::Relaxed);
+                pumped = !batch.adapter_routes.is_empty() || !batch.ingress_sessions.is_empty();
             }
             let close_batch = close_work.take_batch(DATA_PLANE_MAX_CLOSE_KEYS);
             counters
@@ -153,6 +179,13 @@ fn run_loop(
                     None => {}
                 }
             }
+        }
+        if pumped
+            && let Ok(slot) = owner_wake.lock()
+            && let Some(sender) = slot.as_ref()
+            && sender.try_send(ControlMessage::DataPlaneProgress).is_ok()
+        {
+            counters.owner_wakes.fetch_add(1, Ordering::Relaxed);
         }
         observe_for_test(&counters, close_work.live_count());
     }
@@ -194,6 +227,8 @@ fn observe_for_test(counters: &DriverCounters, live_close_routes: usize) {
     let body = serde_json::json!({
         "pumps": counters.pumps.load(Ordering::Relaxed),
         "close_keys": counters.close_keys.load(Ordering::Relaxed),
+        "owner_wakes": counters.owner_wakes.load(Ordering::Relaxed),
+        "adapter_routes": counters.adapter_routes.load(Ordering::Relaxed),
         "live_close_routes": live_close_routes,
     })
     .to_string();

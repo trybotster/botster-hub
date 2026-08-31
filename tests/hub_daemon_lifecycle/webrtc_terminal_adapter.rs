@@ -611,7 +611,7 @@ fn webrtc_terminal_adapter_bound_peer_loss_closes_adapter_without_hub_detach() {
         )
         .await
         .expect("spawn");
-        peer.encrypted_request(
+        let attach = peer.encrypted_request(
             &key,
             &botster_hub_client::DaemonRequest::Attach {
                 session_id: session_id.to_string(),
@@ -620,6 +620,7 @@ fn webrtc_terminal_adapter_bound_peer_loss_closes_adapter_without_hub_detach() {
         )
         .await
         .expect("attach");
+        bind_reserved_from_attach(&mut peer, &key, &attach, session_id, subscription_id).await;
         let attached =
             botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
                 .expect("status after attach")
@@ -1042,17 +1043,22 @@ fn webrtc_terminal_adapter_unnegotiated_adapter_never_receives_or_decodes_daemon
         peer.encrypted_hello(&key, &webrtc_terminal_adapter_hello())
             .await
             .expect("unnegotiated adapter hello");
-        spawn_and_bind_webrtc(&mut peer, &key, "wun-a", "sub-a", "sleep 30").await;
-        spawn_and_bind_webrtc(&mut peer, &key, "wun-b", "sub-b", "sleep 30").await;
-        peer.encrypted_request(
+        spawn_and_bind_webrtc(
+            &mut peer,
             &key,
-            &botster_hub_client::DaemonRequest::Attach {
-                session_id: "wun-a".to_string(),
-                subscription_id: "sub-a".to_string(),
-            },
+            "wun-a",
+            "sub-a",
+            "printf 'wun-a-ready\\n'; sleep 30",
         )
-        .await
-        .expect("host close of unnegotiated generation");
+        .await;
+        spawn_and_bind_webrtc(
+            &mut peer,
+            &key,
+            "wun-b",
+            "sub-b",
+            "printf 'wun-b-ready\\n'; sleep 30",
+        )
+        .await;
         let deadline = Instant::now() + Duration::from_secs(6);
         let mut saw_sibling = false;
         while Instant::now() < deadline {
@@ -1079,6 +1085,7 @@ fn webrtc_terminal_adapter_unnegotiated_adapter_never_receives_or_decodes_daemon
             "unnegotiated sibling terminal frames must still arrive"
         );
         assert!(peer.pending_host_events().is_empty());
+        assert_eq!(peer.control_terminal_frame_count, 0);
         peer.peer.close().await.expect("close offer peer");
     });
     shutdown_short_lived_session(&endpoint, "wun-a");

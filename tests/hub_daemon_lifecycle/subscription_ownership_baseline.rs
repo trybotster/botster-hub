@@ -135,8 +135,12 @@ fn assert_production_second_channel_reject_source() {
         "extra DataChannel must not wait in the Hub handler"
     );
     assert!(
-        on_data_channel.contains("reject_extra_data_channel("),
-        "unclaimed DataChannel must call the subscription-channel reject path"
+        on_data_channel.contains("admit_reserved_subscription_channel("),
+        "unclaimed DataChannel must enter reserved subscription admission"
+    );
+    assert!(
+        reject.contains("reject_extra_data_channel("),
+        "unknown reserved labels must call the subscription-channel reject path"
     );
     assert!(
         reject.contains("local WebRTC rejecting extra DataChannel"),

@@ -175,7 +175,7 @@ pub(crate) async fn admit_reserved_subscription_channel<C>(
     }
     match bind_rx.await {
         Ok(Ok(handle)) => {
-            run_bound_subscription_channel(data_channel, stream_key, peer_state, handle).await;
+            run_bound_subscription_channel(data_channel, stream_key, handle).await;
         }
         Ok(Err(BindReservedError::Expired)) | Ok(Err(_)) | Err(_) => {
             reject_extra_data_channel(grant_id, false, label, data_channel).await;
@@ -238,7 +238,6 @@ where
 async fn run_bound_subscription_channel<C>(
     data_channel: &C,
     stream_key: &AesGcmKey,
-    peer_state: &LocalWebrtcPeerState,
     handle: WebRtcTerminalAdapterHandle,
 ) where
     C: LocalWebrtcDataChannel + ?Sized,
@@ -252,7 +251,7 @@ async fn run_bound_subscription_channel<C>(
             return;
         }
         tokio::select! {
-            _ = peer_state.mux.wait_for_write() => {}
+            _ = handle.wait_for_write() => {}
             inbound = data_channel.local_poll() => {
                 match inbound {
                     Some(webrtc::data_channel::DataChannelEvent::OnMessage(message)) => {

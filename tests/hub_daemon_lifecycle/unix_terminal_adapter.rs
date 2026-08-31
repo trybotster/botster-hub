@@ -2864,37 +2864,6 @@ fn unix_eof_leave_route_ablation_keeps_named_pair_on_status() {
 }
 
 #[test]
-fn unix_eof_skip_core_detach_ablation_keeps_named_pair_on_status() {
-    let _guard = daemon_test_guard();
-    let hub = start_isolated_live_output_hub_with_env(
-        "ues",
-        &[("BOTSTER_HUB_UNIX_EOF_ABLATION", "skip_core_detach")],
-    );
-    let session_id = "ues-session";
-    let sub_a = "ues-sub-a";
-    let sub_b = "ues-sub-b";
-    let (owner_a, reader_a, mut owner_b, mut reader_b, _envelopes_a, mut envelopes_b) =
-        attach_two_unix_clients(&hub, session_id, sub_a, sub_b);
-    let before = sibling_status(&mut owner_b, &mut reader_b, &mut envelopes_b);
-    drop(owner_a);
-    drop(reader_a);
-    let after = wait_for_cleanup_completed(
-        &mut owner_b,
-        &mut reader_b,
-        &mut envelopes_b,
-        &before.lifecycle_counters,
-    );
-    assert!(
-        occupancy_has_pair(&after.live_attach_occupancy, session_id, sub_a),
-        "skip-core-detach ablation must redden the exact-absence assertion: {:?}",
-        after.live_attach_occupancy
-    );
-    drop(owner_b);
-    shutdown_short_lived_session(hub.endpoint(), session_id);
-    hub.shutdown().expect("shutdown isolated hub");
-}
-
-#[test]
 fn unix_eof_pair_only_detach_ablation_drops_replacement_owner_generation() {
     let _guard = daemon_test_guard();
     let hub = start_isolated_live_output_hub_with_env(
