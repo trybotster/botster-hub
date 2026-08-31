@@ -166,13 +166,17 @@ impl<W: WakeSink> AdapterSlot<W> {
 
     #[allow(dead_code)]
     pub(crate) fn push_ingress_frame(&self, bytes: Vec<u8>) {
+        self.push_ingress_frame_after_admission(bytes, || {});
+    }
+
+    fn push_ingress_frame_after_admission(&self, bytes: Vec<u8>, admitted: impl FnOnce()) {
         if self.is_closed() {
             return;
         }
         let mut ingress = match self.ingress.try_lock() {
             Ok(ingress) => ingress,
             Err(TryLockError::WouldBlock) => {
-                self.ingress_lost.store(true, Ordering::SeqCst);
+                self.mark_ingress_lost_if_open();
                 return;
             }
             Err(TryLockError::Poisoned(_)) => {
@@ -184,17 +188,32 @@ impl<W: WakeSink> AdapterSlot<W> {
             ingress.clear();
             return;
         }
+        admitted();
         if ingress.len() >= MIN_ADAPTER_INGRESS_BUFFER_FRAMES {
-            self.ingress_lost.store(true, Ordering::SeqCst);
+            self.mark_ingress_lost_if_open();
+            if self.is_closed() {
+                ingress.clear();
+            }
             return;
         }
         ingress.push_back(bytes);
+        if self.is_closed() {
+            ingress.clear();
+            self.ingress_lost.store(false, Ordering::SeqCst);
+        }
     }
 
     #[allow(dead_code)]
     pub(crate) fn mark_ingress_lost(&self) {
+        self.mark_ingress_lost_if_open();
+    }
+
+    fn mark_ingress_lost_if_open(&self) {
         if !self.is_closed() {
             self.ingress_lost.store(true, Ordering::SeqCst);
+            if self.is_closed() {
+                self.ingress_lost.store(false, Ordering::SeqCst);
+            }
         }
     }
 
@@ -206,10 +225,13 @@ impl<W: WakeSink> AdapterSlot<W> {
         match self.ingress.try_lock() {
             Ok(mut ingress) => {
                 if !self.is_closed() && ingress.pop_back().is_some() {
-                    self.ingress_lost.store(true, Ordering::SeqCst);
+                    self.mark_ingress_lost_if_open();
+                    if self.is_closed() {
+                        ingress.clear();
+                    }
                 }
             }
-            Err(TryLockError::WouldBlock) => self.ingress_lost.store(true, Ordering::SeqCst),
+            Err(TryLockError::WouldBlock) => self.mark_ingress_lost_if_open(),
             Err(TryLockError::Poisoned(_)) => self.close(),
         }
     }
@@ -308,5 +330,38 @@ mod tests {
         for _ in 0..256 {
             assert_eq!(idle.try_read(), TerminalIngress::Empty);
         }
+    }
+
+    #[test]
+    fn close_discards_ingress_for_both_close_and_push_queue_orders() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        let close_first = new_slot();
+        close_first.close();
+        close_first.push_ingress_frame(b"after-close".to_vec());
+        assert!(close_first.ingress.lock().expect("ingress lock").is_empty());
+
+        let push_first = Arc::new(new_slot());
+        let admitted = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let producer_slot = Arc::clone(&push_first);
+        let producer_admitted = Arc::clone(&admitted);
+        let producer_release = Arc::clone(&release);
+        let producer = thread::spawn(move || {
+            producer_slot.push_ingress_frame_after_admission(b"racing-close".to_vec(), || {
+                producer_admitted.wait();
+                producer_release.wait();
+            });
+        });
+
+        admitted.wait();
+        push_first.close();
+        release.wait();
+        producer.join().expect("producer thread");
+
+        assert_eq!(push_first.try_read(), TerminalIngress::Closed);
+        assert!(push_first.ingress.lock().expect("ingress lock").is_empty());
+        assert!(!push_first.ingress_lost.load(Ordering::SeqCst));
     }
 }

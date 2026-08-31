@@ -326,34 +326,53 @@ pub(crate) fn production_shutdown_and_remove_session(
         },
     )
     .expect("production ShutdownSession");
-    let needs_remove = match shutdown.kind {
-        botster_hub_client::DaemonResponseKind::Events => true,
+    match shutdown.kind {
+        botster_hub_client::DaemonResponseKind::Events => {}
         botster_hub_client::DaemonResponseKind::SessionCleanup => {
             assert_session_cleanup_already_exited(
                 &shutdown,
                 session_id,
                 "final production session cleanup",
             );
-            false
+            wait_for_authoritative_session_exit(endpoint, session_id);
         }
         _ => panic!(
             "final ShutdownSession must return Events or SessionCleanup for {session_id}, got kind={:?} error={:?} cleanup={:?}",
             shutdown.kind, shutdown.error, shutdown.cleanup
         ),
-    };
-    if needs_remove {
-        let remove = botster_hub_client::request(
-            endpoint,
-            botster_hub_client::DaemonRequest::RemoveSession {
-                session_id: session_id.to_string(),
-            },
-        )
-        .expect("production RemoveSession");
-        assert_eq!(
-            remove.kind,
-            botster_hub_client::DaemonResponseKind::SessionRemoved,
-            "RemoveSession should remove {session_id}"
-        );
+    }
+    let remove = botster_hub_client::request(
+        endpoint,
+        botster_hub_client::DaemonRequest::RemoveSession {
+            session_id: session_id.to_string(),
+        },
+    )
+    .expect("production RemoveSession");
+    match remove.kind {
+        botster_hub_client::DaemonResponseKind::SessionRemoved => {}
+        botster_hub_client::DaemonResponseKind::OperatorError => {
+            let error = remove
+                .error
+                .as_ref()
+                .expect("already absent RemoveSession error body");
+            assert_eq!(error.code, "session_not_terminal");
+            assert_eq!(error.request_id, "daemon-session-remove");
+            assert_eq!(error.operation, "subscribe_entities");
+            assert_eq!(
+                error.message,
+                "session must be terminal before it can be removed"
+            );
+            assert!(
+                session_ids_from_list(endpoint)
+                    .iter()
+                    .all(|listed_id| listed_id != session_id),
+                "RemoveSession OperatorError is valid only when {session_id} is already absent"
+            );
+        }
+        _ => panic!(
+            "RemoveSession should remove or confirm an absent {session_id}, got kind={:?} error={:?}",
+            remove.kind, remove.error
+        ),
     }
 }
 

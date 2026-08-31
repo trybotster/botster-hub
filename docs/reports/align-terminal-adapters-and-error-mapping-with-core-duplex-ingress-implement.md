@@ -58,7 +58,7 @@ The runtime maps both new `ControlPlaneFailed` variants to distinct error classe
 
 The route test uses the sanctioned test seam. It proves that ingress loss retires the exact route and preserves a sibling.
 
-The session cleanup fixture accepts `SessionCleanup` only for the expected session and the `already_exited` outcome. Live shutdown checks still require `Events`.
+The session cleanup fixture accepts `SessionCleanup` only for the expected session and the `already_exited` outcome. It waits for authoritative exit and then calls `RemoveSession`. Live shutdown checks still require `Events`.
 
 ## Files changed
 
@@ -113,6 +113,15 @@ Human answer `question_1788142641_571879` replaced the stale red/green proof wit
 
 Advisor answer `question_1788144097_297699` approved the narrow cleanup fixture change. The committed plan now records this change and acceptance check `13c`.
 
+## Review repair
+
+Review `review_1788150881_521801` returned four findings.
+
+- `finding_1788150881_471943`: A producer could enqueue ingress after `close` failed to acquire the occupied queue lock. The producer now clears the queue after a post-insert close check. Loss marking also clears a flag that races with close. A deterministic test covers both close and push orders.
+- `finding_1788150881_203541`: Typed cleanup skipped the promised registry removal. The helper now waits for authoritative exit, calls `RemoveSession`, proves target absence, and preserves the exact sibling row.
+- `finding_1788150881_173921`: The plan contained a personal absolute path. The plan now uses a path-neutral repository reference. The committed-artifact path scan is clean.
+- `finding_1788150881_687191`: The report had an extra blank line at end of file. The blank line is removed. The raw `git diff --check main...HEAD` gate runs after the repair commit.
+
 ## Verification
 
 The toolchain was `rustc 1.97.0 (2d8144b78 2026-07-07)`.
@@ -136,7 +145,7 @@ The following checks passed:
 - `env -u CARGO_TARGET_DIR RUSTUP_TOOLCHAIN=1.97.0 ./test.sh --locked`
 - `git diff --check`
 
-The official locked suite passed with exit code 0. It included 503 library tests and 322 lifecycle test cases before later workspace suites and doc tests.
+The repaired official locked suite passed with exit code 0. It included 504 library tests and 322 lifecycle test cases before later workspace suites and doc tests.
 
 The first sandbox run failed because the sandbox denied socket and WebRTC operations. That result was an environment failure.
 
@@ -150,6 +159,8 @@ Four red ablations failed as required:
 2. Returning a frame before a pending loss failed the Unix conformance check.
 3. Using capacity `N - 1` failed the capacity floor check.
 4. Using one error class for both variants failed the exact error mapping check.
+
+The review repair added a fifth red ablation. Removing the post-insert close check made the deterministic close-race test retain `racing-close` bytes and fail.
 
 The implementation restored each source change after its ablation.
 
@@ -200,4 +211,3 @@ The implementation did not write these notes to the vault. The approved plan and
 The implementation assumes that Core will merge the exact candidate unchanged.
 
 The implementation assumes that the cold-cut ticket will keep its registered production proof obligation.
-
