@@ -326,23 +326,35 @@ pub(crate) fn production_shutdown_and_remove_session(
         },
     )
     .expect("production ShutdownSession");
-    assert_eq!(
-        shutdown.kind,
-        botster_hub_client::DaemonResponseKind::Events,
-        "ShutdownSession should return events for {session_id}"
-    );
-    let remove = botster_hub_client::request(
-        endpoint,
-        botster_hub_client::DaemonRequest::RemoveSession {
-            session_id: session_id.to_string(),
-        },
-    )
-    .expect("production RemoveSession");
-    assert_eq!(
-        remove.kind,
-        botster_hub_client::DaemonResponseKind::SessionRemoved,
-        "RemoveSession should remove {session_id}"
-    );
+    let needs_remove = match shutdown.kind {
+        botster_hub_client::DaemonResponseKind::Events => true,
+        botster_hub_client::DaemonResponseKind::SessionCleanup => {
+            assert_session_cleanup_already_exited(
+                &shutdown,
+                session_id,
+                "final production session cleanup",
+            );
+            false
+        }
+        _ => panic!(
+            "final ShutdownSession must return Events or SessionCleanup for {session_id}, got kind={:?} error={:?} cleanup={:?}",
+            shutdown.kind, shutdown.error, shutdown.cleanup
+        ),
+    };
+    if needs_remove {
+        let remove = botster_hub_client::request(
+            endpoint,
+            botster_hub_client::DaemonRequest::RemoveSession {
+                session_id: session_id.to_string(),
+            },
+        )
+        .expect("production RemoveSession");
+        assert_eq!(
+            remove.kind,
+            botster_hub_client::DaemonResponseKind::SessionRemoved,
+            "RemoveSession should remove {session_id}"
+        );
+    }
 }
 
 pub(crate) fn session_ids_from_list(endpoint: &botster_hub_client::DaemonEndpoint) -> Vec<String> {

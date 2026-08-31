@@ -106,16 +106,42 @@ Plan-time evidence, produced in this worktree and then reverted to a clean tree.
    `crates/botster-core-test-support/src/terminal_adapter/`, and
    `crates/botster-core-daemon/src/daemon.rs` is empty. The alignment work in
    this ticket is therefore identical for both revisions.
-5. Baseline: at the current pin `7eafa470`,
-   `RUSTUP_TOOLCHAIN=1.97.0 ./test.sh --locked -p botster-hub --test hub_daemon_lifecycle_test unix_adapter_unbound_scoped_drain_delivers_terminal_output -- --exact --nocapture`
-   passes. The reproduction is a new Core regression at `3672c667`, not a
-   pre-existing Hub failure.
+5. Implementation correction, accepted in `question_1788142641_571879`: after
+   rolling every literal and lock source to `3672c667`, fully rebuilding both
+   worker and Hub binaries at that revision, and running the exact lifecycle
+   wrapper twice, both runs passed. The same exact test also passes at
+   `a781556`. The earlier attribution of this test's failure to `3672c667` was
+   not reproducible after a clean full pin roll and rebuild. This green/green
+   pair is Hub compatibility evidence only; the Core ticket's targeted-input
+   tests and red ablations own proof of the Core behavior change.
 
 ## 3. Product decisions taken by the human
 
-Two answered questions govern this plan: `question_1788138575_832281` and
-`question_1788139680_730932`. The second was asked after Plan Review
-`review_1788139424_854213` returned changes required.
+Four answered questions govern this plan: `question_1788138575_832281`,
+`question_1788139680_730932`, `question_1788142641_571879`, and
+`question_1788144097_297699`. The second was
+asked after Plan Review `review_1788139424_854213` returned changes required;
+the third corrects downstream evidence after a clean implementation-time pin
+roll and rebuild. The fourth accepts a narrow Hub fixture update required by
+the new Core pin.
+
+**From `question_1788144097_297699` (Implement fixture correction):**
+
+| Decision | Value |
+| --- | --- |
+| Final cleanup | `production_shutdown_and_remove_session` may accept `SessionCleanup` only when its body names the expected session with outcome `already_exited`. |
+| Live shutdown proof | Substantive live `ShutdownSession` assertions still require `Events`. The helper change must not hide control-plane, input, shutdown, or sibling-isolation failures. |
+| Sibling proof | Add a focused fixture test that proves final cleanup for an already exited session does not alter a live sibling. |
+| Routing | This is Hub fixture compatibility required by the Core pin roll. Do not create another dependency ticket. |
+
+**From `question_1788142641_571879` (Implement correction, supersedes the old
+red/green requirement):**
+
+| Decision | Value |
+| --- | --- |
+| Downstream proof | Record green/green at exact Core revisions `3672c667` and `a781556`, including both repeated `3672c667` passes after full rebuild. Treat it as Hub compatibility evidence, not proof of the Core input fix. |
+| Core behavior proof | The Core ticket's dedicated targeted-input tests and red ablations prove the Core change. This Hub ticket proves its compile correction, sanctioned ingress-loss behavior, error mapping, and full locked gates. |
+| Evidence integrity | Do not invent a failing fixture. State that the earlier lifecycle-test attribution was not reproducible after a clean full pin roll and rebuild. |
 
 **From `question_1788139680_730932` (second visit, supersedes where they differ):**
 
@@ -133,7 +159,7 @@ Two answered questions govern this plan: `question_1788138575_832281` and
 | Core pin strategy | Option C. Pin every Hub Core site and lock source to the exact candidate `a781556`. |
 | Red main | Not allowed. Do not merge a red Hub `main`. |
 | Reproduction test | Do not mark it `#[ignore]`. |
-| Downstream proof | Run the reproduction against both `3672c667` and `a781556` and record the fail/pass pair. |
+| Downstream proof | Superseded by `question_1788142641_571879`; use the documented green/green compatibility pair. |
 | Candidate stability | The Core run must merge `a781556` unchanged. If Core Review changes the candidate, stop both runs, update the Hub pin, and repeat the proof. |
 | After Core merge | The exact pin stays valid once `main` contains `a781556`. Do not create a no-op re-pin. |
 | Adapter ingress | Option 1. Add the conformance-complete bounded ingress buffer and the required harness methods. Do not wire Unix or WebRTC producers here. |
@@ -159,8 +185,11 @@ Two answered questions govern this plan: `question_1788138575_832281` and
    sibling routes through the real Hub attach and bind path, ingress loss on one
    route, the real Core hard-stop path, exact route retirement, and sibling
    survival.
-7. Produce the downstream reproduction proof pair against `3672c667` and
-   `a781556`.
+7. Produce the downstream compatibility proof pair against `3672c667` and
+   `a781556`, including two repeated passes at `3672c667` after full rebuild.
+8. Adapt the final session-cleanup fixture to accept the candidate Core's typed
+   `SessionCleanup { outcome: "already_exited" }` result. Keep live shutdown
+   assertions strict, and prove a sibling stays unchanged.
 
 ### Non-scope
 
@@ -391,6 +420,10 @@ must not be edited.
 | `src/transport/unix/adapter.rs` | `try_read` on the adapter, ingress methods on `UnixTerminalAdapterHandle`, four driver methods, driver `partial` field |
 | `src/transport/webrtc/adapter.rs` | Same shape for `WebRtcTerminalAdapter` and `WebRtcTerminalAdapterHandle` |
 | `src/runtime.rs` | Two new error class arms plus unit coverage near the existing bind-error test at line 5467 |
+| `src/subscription/attach_routes.rs` | Sanctioned test-only exact-route teardown proof through the real attach/bind path |
+| `tests/hub_daemon_lifecycle/subscription_ownership_baseline.rs` | Compile fixture updated for the duplex `TerminalAdapter` contract |
+| `tests/hub_daemon_lifecycle/session_fixtures.rs` | Final cleanup accepts only the exact typed already-exited result; live shutdown assertions stay strict |
+| `tests/hub_daemon_lifecycle/sessions.rs` | Focused already-exited cleanup proof with an unchanged live sibling |
 
 ## 8. Assumptions and unknowns
 
@@ -418,7 +451,7 @@ Unknowns for Implement and Verify:
   pin, with exact evidence. A pre-existing failure is not an excuse without that
   comparison.
 - Whether the `a781556` Core fix changes any other Hub-visible behavior beyond
-  the reproduction. The `3672c667`-to-`a781556` diff touches
+  the targeted compatibility check. The `3672c667`-to-`a781556` diff touches
   `client_worker.rs`, `managed_session_runtime.rs`, `control_queue.rs`,
   `runtime/mod.rs`, and `worker_process.rs`. The full Hub suite at the new pin is
   the check.
@@ -544,20 +577,21 @@ from that shell. The worktree path holds no `:`, so do not set
 | 13 | New Hub unit test: both new error class strings, distinct, no `/`, next to the existing bind-error test | Passes |
 | 13a | New in-crate test from section 6.5: two sibling routes bound through the real Hub attach path, ingress loss on one, real Core hard stop through the `#[cfg(test)]` drain seam | Passes. Exactly the lost `(session_id, subscription_id, generation)` route retires, and the sibling stays live and still accepts output. |
 | 13b | Confirm `src/lib.rs:917` source guard still rejects a production call to `drain_runtime_once(` | Passes unchanged. The guard was not weakened to make 13a compile. |
+| 13c | `final_cleanup_accepts_already_exited_without_altering_sibling` and `external_hub_shutdown_session_failure_keeps_daemon_and_sibling_usable` | Both pass. Final cleanup accepts only the exact typed already-exited result, and the substantive failure path plus sibling behavior remain strict. |
 | 14 | `cargo build --locked -p botster-core-daemon --bin botster-session-worker` and `cargo build --locked --bin botster-hub` | Succeed, before the locked suite |
 | 15 | `./test.sh --locked` on a quiet host with `CARGO_TARGET_DIR` unset | Green in one default-concurrency run |
 
-### Downstream proof pair, required by the human answer
+### Downstream compatibility pair, corrected by the human answer
 
 | # | Command | Expected result |
 | --- | --- | --- |
-| 16 | With all literals at `3672c667`: `RUSTUP_TOOLCHAIN=1.97.0 ./test.sh --locked -p botster-hub --test hub_daemon_lifecycle_test unix_adapter_unbound_scoped_drain_delivers_terminal_output -- --exact --nocapture` | Fails. No `echo:from-unbound` on `ReadScreen`. This is the reproduction for `ticket_1788128130_441301`. |
-| 17 | With all literals at the candidate: the same command | Passes |
-| 18 | Baseline already recorded at plan time, at `7eafa470` on base `c674a62` | Passed, so the reproduction is a new Core regression and not a pre-existing Hub failure |
+| 16 | With all literals and lock sources at `3672c667`, after rebuilding `botster-session-worker` and `botster-hub`: `RUSTUP_TOOLCHAIN=1.97.0 ./test.sh --locked -p botster-hub --test hub_daemon_lifecycle_test unix_adapter_unbound_scoped_drain_delivers_terminal_output -- --exact --nocapture` | Passes twice. Record both `1 passed; 0 failed` results. |
+| 17 | With all literals and lock sources at `a781556`, after rebuilding both binaries: the same exact wrapper command | Passes (`1 passed; 0 failed`). This is Hub compatibility evidence only. |
+| 18 | Evidence interpretation | The earlier failure attribution was not reproducible after a clean full pin roll and rebuild. Core's targeted-input tests and red ablations, not this lifecycle test, prove the Core behavior change. |
 
 Steps 16 and 17 use a scratch roll of the same literal inventory. Only the
 candidate pin is committed. Both results go in the Implement report with exact
-command text, the `rustc --version` line, and the pass or fail counts.
+commands, full rebuild provenance, the `rustc --version` line, and pass counts.
 
 ### Red ablations
 
