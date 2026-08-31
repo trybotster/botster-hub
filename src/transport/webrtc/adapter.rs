@@ -73,10 +73,8 @@ impl WebRtcTerminalAdapterInner {
         self.slot.close();
     }
 
-    #[cfg(test)]
     fn set_would_block(&self, pressured: bool) {
         self.slot.set_would_block(pressured);
-        self.slot.wake();
     }
 
     fn pressure(&self) -> TerminalAdapterPressure {
@@ -468,6 +466,10 @@ impl WebRtcTerminalAdapterHandle {
 
     pub(crate) fn is_closed(&self) -> bool {
         self.inner.is_closed()
+    }
+
+    pub(crate) fn set_would_block(&self, pressured: bool) {
+        self.inner.set_would_block(pressured);
     }
 
     pub(crate) fn snapshot_active(&self) -> Option<Vec<u8>> {

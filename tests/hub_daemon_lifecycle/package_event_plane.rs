@@ -45,7 +45,7 @@ fn isolated_hub_two_packages_emit_and_consume_exact_event_without_blocking_workt
         .unwrap_or_default();
     let lock_core_sha = lockfile_core_revision();
     assert_eq!(
-        lock_core_sha, "a781556258789dea4a50ffcb17351e7294c8ff26",
+        lock_core_sha, "873df1c4084bfe81949cf1bbe53ad7327ad99d4b",
         "live proof must use the pinned Core revision"
     );
     eprintln!(

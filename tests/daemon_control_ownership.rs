@@ -469,7 +469,7 @@ const CONTROL_MESSAGE_OWNERS: &[(&str, &[&str])] = &[
     ("src/daemon/control/webrtc.rs", &["LocalWebrtcPeerClosed"]),
 ];
 
-const CONTROL_MESSAGE_DISPATCHER_OWNED: &[&str] = &["EgressWriteFailed"];
+const CONTROL_MESSAGE_DISPATCHER_OWNED: &[&str] = &["DataPlaneProgress", "EgressWriteFailed"];
 
 fn control_handler_modules() -> Vec<String> {
     let mut paths = Vec::new();
