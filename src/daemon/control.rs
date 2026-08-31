@@ -100,10 +100,7 @@ pub(crate) fn control_request_operation_label(request: &DaemonRequest) -> &'stat
         DaemonRequest::Spawn { .. } => "spawn",
         DaemonRequest::Attach { .. } => "attach",
         DaemonRequest::Detach { .. } => "detach",
-        DaemonRequest::SendInput { .. } => "send_input",
-        DaemonRequest::ModeGatedInput { .. } => "mode_gated_input",
         DaemonRequest::Drain { .. } => "drain",
-        DaemonRequest::Resize { .. } => "resize",
         DaemonRequest::ShutdownSession { .. } => "shutdown_session",
         DaemonRequest::RemoveSession { .. } => "remove_session",
         DaemonRequest::DaemonShutdown => "daemon_shutdown",
@@ -126,7 +123,9 @@ pub(crate) fn handle_control_message(
         message @ ControlMessage::AcceptedConnection { .. }
         | message @ ControlMessage::RejectedConnection
         | message @ ControlMessage::RegisterUnixAdmission { .. }
-        | message @ ControlMessage::RegisterWebrtcAdmission { .. } => {
+        | message @ ControlMessage::RegisterWebrtcAdmission { .. }
+        | message @ ControlMessage::InspectTerminalReservation { .. }
+        | message @ ControlMessage::BindReservedTerminal { .. } => {
             connection::handle(daemon, state, message)
         }
         message @ ControlMessage::SubscribeEntities { .. }
@@ -246,9 +245,6 @@ pub(crate) fn handle_runtime_control_request(
         | DaemonRequest::Spawn { .. }
         | DaemonRequest::Attach { .. }
         | DaemonRequest::Detach { .. }
-        | DaemonRequest::SendInput { .. }
-        | DaemonRequest::ModeGatedInput { .. }
-        | DaemonRequest::Resize { .. }
         | DaemonRequest::ShutdownSession { .. }
         | DaemonRequest::Drain { .. }
         | DaemonRequest::ReadScreen { .. }

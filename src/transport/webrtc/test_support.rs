@@ -23,9 +23,9 @@ use crate::{
 use async_trait::async_trait;
 use botster_core::{AesGcmEnvelope, AesGcmKey, decrypt_aes_gcm, encrypt_aes_gcm};
 use botster_hub_client::{
-    DaemonDiagnostic, DaemonEvent, DaemonHello, DaemonHelloAck, DaemonLocalWebrtcDeliveryChunk,
-    DaemonLocalWebrtcDeliveryKind, DaemonRequest, DaemonResponse, LOCAL_WEBRTC_MAX_DELIVERY_BYTES,
-    PROTOCOL,
+    DaemonCompatibilityRequirement, DaemonDiagnostic, DaemonEvent, DaemonHello, DaemonHelloAck,
+    DaemonLocalWebrtcDeliveryChunk, DaemonLocalWebrtcDeliveryKind, DaemonRequest, DaemonResponse,
+    LOCAL_WEBRTC_MAX_DELIVERY_BYTES, PROTOCOL,
 };
 use serde_json::Value;
 use std::collections::{BTreeSet, VecDeque};
@@ -461,6 +461,86 @@ impl TestOfferPeer {
             serde_json::from_str(&encrypted).expect("parse hello ack envelope");
         let plaintext = decrypt_aes_gcm(key, &envelope).expect("decrypt hello ack");
         serde_json::from_slice(&plaintext).expect("parse daemon hello ack")
+    }
+
+    pub(crate) async fn open_reserved_terminal(
+        &mut self,
+        key: &AesGcmKey,
+        label: &str,
+        hello: &DaemonHello,
+    ) {
+        let runtime = webrtc_runtime();
+        let (open_tx, mut open_rx) = webrtc_channel::<()>(1);
+        let (message_tx, mut message_rx) = webrtc_channel::<String>(256);
+        let channel = self
+            .peer
+            .create_data_channel(
+                label,
+                Some(RTCDataChannelInit {
+                    ordered: true,
+                    max_retransmits: None,
+                    max_packet_life_time: None,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("create reserved subscription channel");
+        {
+            let channel = channel.clone();
+            runtime.spawn(Box::pin(async move {
+                while let Some(event) = channel.poll().await {
+                    match event {
+                        DataChannelEvent::OnOpen => {
+                            let _ = open_tx.try_send(());
+                        }
+                        DataChannelEvent::OnMessage(message) => {
+                            if let Ok(text) = String::from_utf8(message.data.to_vec()) {
+                                let _ = message_tx.try_send(text);
+                            }
+                        }
+                        DataChannelEvent::OnClose => break,
+                        _ => {}
+                    }
+                }
+            }));
+        }
+        timeout(runtime.as_ref(), Duration::from_secs(10), open_rx.recv())
+            .await
+            .expect("timed out waiting for reserved channel open")
+            .expect("reserved channel open signal");
+        let plaintext = serde_json::to_vec(hello).expect("serialize reserved hello");
+        let envelope = encrypt_aes_gcm(key, &plaintext, 1).expect("encrypt reserved hello");
+        channel
+            .send_text(
+                &serde_json::to_string(&envelope).expect("serialize reserved hello envelope"),
+            )
+            .await
+            .expect("send reserved hello");
+        let mut encrypted = String::new();
+        let mut next_chunk_index = 0u32;
+        loop {
+            let response = timeout(runtime.as_ref(), Duration::from_secs(10), message_rx.recv())
+                .await
+                .expect("reserved hello ack timeout")
+                .expect("reserved channel remains open for hello ack");
+            let chunk: DaemonLocalWebrtcDeliveryChunk =
+                serde_json::from_str(&response).expect("parse reserved hello ack chunk");
+            assert_eq!(
+                chunk.delivery_kind,
+                DaemonLocalWebrtcDeliveryKind::DaemonResponse
+            );
+            assert_eq!(chunk.chunk_index, next_chunk_index);
+            encrypted.push_str(&chunk.payload);
+            next_chunk_index += 1;
+            if chunk.chunk_index + 1 == chunk.chunk_count {
+                break;
+            }
+        }
+        let envelope: AesGcmEnvelope =
+            serde_json::from_str(&encrypted).expect("parse reserved hello ack envelope");
+        let plaintext = decrypt_aes_gcm(key, &envelope).expect("decrypt reserved hello ack");
+        let _: DaemonHelloAck =
+            serde_json::from_slice(&plaintext).expect("parse reserved hello ack");
     }
 }
 
@@ -1004,6 +1084,94 @@ impl PeerHarness {
         ack
     }
 
+    pub(crate) fn bind_reserved_on_peer(&mut self, peer: &mut LiveSignaledPeer, label: &str) {
+        let key = peer.stream_key.clone();
+        let hello = DaemonHello {
+            protocol: PROTOCOL.to_string(),
+            compatibility: DaemonCompatibilityRequirement::for_webrtc_terminal_adapter(),
+            terminal_compatibility: None,
+        };
+        let mut offer_peer = peer
+            .offer_peer
+            .take()
+            .expect("offer peer available for reserved-channel bind");
+        let reserved_label = label.to_string();
+        let (response_tx, response_rx) = std::sync::mpsc::channel();
+        let offer_handle = peer.offer_runtime.handle().clone();
+        let worker = thread::spawn(move || {
+            offer_handle.block_on(offer_peer.open_reserved_terminal(&key, &reserved_label, &hello));
+            response_tx
+                .send(offer_peer)
+                .expect("return reserved-channel offer peer");
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let offer_peer = loop {
+            if let Ok(result) = response_rx.try_recv() {
+                break result;
+            }
+            if Instant::now() >= deadline {
+                panic!("timed out waiting for reserved-channel bind");
+            }
+            match self.control_rx.try_recv() {
+                Ok(message) => {
+                    handle_control_message(
+                        &mut self.daemon,
+                        &mut self.state,
+                        &self.terminal_path,
+                        &self.transport_handle,
+                        self.control_tx.clone(),
+                        message,
+                    );
+                }
+                Err(tokio_mpsc::error::TryRecvError::Empty) => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(tokio_mpsc::error::TryRecvError::Disconnected) => {
+                    panic!("control channel closed during reserved-channel bind");
+                }
+            }
+        };
+        worker.join().expect("reserved-channel worker joins");
+        peer.offer_peer = Some(offer_peer);
+    }
+
+    pub(crate) fn wait_until_adapter_bound(&mut self, session_id: &str, subscription_id: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if self
+                .state
+                .pending_runtime
+                .is_adapter_bound(session_id, subscription_id)
+            {
+                return;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "timed out waiting for reserved-channel adapter bind session={session_id} subscription={subscription_id}"
+                );
+            }
+            match self.control_rx.try_recv() {
+                Ok(message) => {
+                    handle_control_message(
+                        &mut self.daemon,
+                        &mut self.state,
+                        &self.terminal_path,
+                        &self.transport_handle,
+                        self.control_tx.clone(),
+                        message,
+                    );
+                }
+                Err(tokio_mpsc::error::TryRecvError::Empty) => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(tokio_mpsc::error::TryRecvError::Disconnected) => {
+                    panic!("control channel closed while waiting for reserved-channel bind");
+                }
+            }
+        }
+    }
+
     pub(crate) fn subscribe_entities(
         &mut self,
         peer: &mut LiveSignaledPeer,
@@ -1043,7 +1211,8 @@ impl PeerHarness {
         assert_eq!(
             spawn.kind,
             botster_hub_client::DaemonResponseKind::Spawned,
-            "spawn over local WebRTC must succeed for attach proof"
+            "spawn over local WebRTC must succeed for attach proof: {:?}",
+            spawn.error
         );
         // Arm panic-safe cleanup immediately after Spawn readiness.
         self.owned_sessions.push(session_id.to_string());
@@ -1146,9 +1315,16 @@ impl PeerHarness {
         );
         assert_eq!(
             attach.kind,
-            botster_hub_client::DaemonResponseKind::Events,
+            botster_hub_client::DaemonResponseKind::TerminalReservation,
             "attach over local WebRTC must succeed"
         );
+        let reservation = attach
+            .terminal_reservation
+            .as_ref()
+            .expect("WebRTC Attach must return a reservation body")
+            .clone();
+        self.bind_reserved_on_peer(peer, &reservation.label);
+        self.wait_until_adapter_bound(session_id, subscription_id);
         assert!(
             self.state
                 .pending_runtime

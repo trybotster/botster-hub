@@ -6,14 +6,15 @@ use botster_core::{ClientId, SessionId, SubscriptionId};
 use botster_hub_client::{DaemonRequest, DaemonResponse, DaemonResponseKind};
 
 use crate::HubDaemon;
+use crate::admission::reservations::{ReserveError, now_seconds};
 use crate::admission::unix_hello::{
     UnixTerminalAdmission, WebrtcTerminalAdmission, terminal_compatibility_attach_error,
 };
 use crate::client_api::HubClientApi;
 use crate::client_api_dto::response::{
-    daemon_capture_snapshot, daemon_events, daemon_mode_flags, daemon_mode_gated_input,
-    daemon_read_screen, daemon_response_base, daemon_session_cleanup, daemon_session_context,
-    daemon_sessions, daemon_spawned, daemon_status, daemon_unknown_session_cleanup,
+    daemon_capture_snapshot, daemon_events, daemon_mode_flags, daemon_read_screen,
+    daemon_response_base, daemon_session_cleanup, daemon_session_context, daemon_sessions,
+    daemon_spawned, daemon_status, daemon_terminal_reservation, daemon_unknown_session_cleanup,
 };
 use crate::client_api_dto::session::daemon_session_from_client;
 use crate::daemon::control::{DaemonObservability, request_id};
@@ -23,8 +24,7 @@ use crate::daemon::shutdown::{
     ShutdownSessionClassification, classify_shutdown_session, recover_after_core_shutdown_error,
 };
 use crate::subscription::attach_routes::{
-    AttachStreamOwner, BoundAdapterHandle, UnixBindRequest, WebrtcBindRequest,
-    bind_unix_adapter_after_attaching, bind_webrtc_adapter_after_attaching,
+    AttachStreamOwner, BoundAdapterHandle, UnixBindRequest, bind_unix_adapter_after_attaching,
     fail_closed_pre_bind_attach, forward_attach_bootstrap, live_generation_for_route,
 };
 use crate::subscription::closed_events::{
@@ -158,6 +158,22 @@ pub(crate) fn handle_runtime(
                     diagnostic.clone(),
                 ));
             }
+            if let Some(grant_id) = observability.grant_id
+                && let Some(WebrtcTerminalAdmission::Admitted {
+                    peer_generation, ..
+                }) = pending_runtime.admission.webrtc_admissions.get(grant_id)
+                && pending_runtime.admission.reservations.has_live_for_route(
+                    &session_id,
+                    &subscription_id,
+                    *peer_generation,
+                    now_seconds(),
+                )
+            {
+                return Ok(super::attach_bind_operator_error(
+                    "reservation_label_conflict",
+                    "a live reservation already exists for this route",
+                ));
+            }
             let owner = AttachStreamOwner {
                 client_id: client_id.clone(),
                 grant_id: observability.grant_id.map(str::to_string),
@@ -207,9 +223,7 @@ pub(crate) fn handle_runtime(
             });
             if observability.grant_id.is_some() {
                 let Some(WebrtcTerminalAdmission::Admitted {
-                    required_features,
-                    mux,
-                    terminal_requirement,
+                    peer_generation, ..
                 }) = webrtc_admission.as_ref()
                 else {
                     fail_closed_pre_bind_attach(
@@ -226,31 +240,39 @@ pub(crate) fn handle_runtime(
                         "Attach requires an admitted WebRTC adapter",
                     ));
                 };
-                return match bind_webrtc_adapter_after_attaching(
-                    pending_runtime,
-                    runtime,
-                    WebrtcBindRequest {
-                        client_id: &client_id,
-                        session_id: &session_id,
-                        subscription_id: &subscription_id,
-                        required_features,
-                        terminal_requirement: terminal_requirement.as_ref(),
-                        now_seconds: now,
-                        mux: Some(mux),
-                    },
-                ) {
-                    Ok(handle) => {
-                        if let Some(handle) = handle {
-                            forward_attach_bootstrap(
-                                &BoundAdapterHandle::WebRtc(handle),
-                                &bootstrap_egress,
-                            );
-                        }
-                        Ok(daemon_events(Vec::new()))
-                    }
-                    Err(_) => Ok(super::attach_bind_operator_error(
+                let Some(generation) = live_generation_for_route(
+                    &runtime.list_terminal_subscriptions(),
+                    &client_id,
+                    &session_id,
+                    &subscription_id,
+                ) else {
+                    fail_closed_pre_bind_attach(
+                        pending_runtime,
+                        runtime,
+                        &client_id,
+                        &session_id,
+                        &subscription_id,
+                        now,
+                        None,
+                    );
+                    return Ok(super::attach_bind_operator_error(
                         "invalid_request",
-                        "Attach failed to bind a WebRTC adapter",
+                        "attach failed before adapter bind",
+                    ));
+                };
+                let _ = bootstrap_egress;
+                pending_runtime.record_generation(&session_id, &subscription_id, generation);
+                return match pending_runtime.admission.reservations.reserve(
+                    session_id.clone(),
+                    subscription_id.clone(),
+                    generation.0,
+                    *peer_generation,
+                    now_seconds(),
+                ) {
+                    Ok(reservation) => Ok(daemon_terminal_reservation(reservation)),
+                    Err(ReserveError::LabelConflict) => Ok(super::attach_bind_operator_error(
+                        "reservation_label_conflict",
+                        "a live reservation already exists for this route",
                     )),
                 };
             }
@@ -347,66 +369,11 @@ pub(crate) fn handle_runtime(
                 );
             }
             pending_runtime.close_adapter(&tracked_session_id, &tracked_subscription_id);
+            pending_runtime
+                .admission
+                .reservations
+                .forget_route(&tracked_session_id, &tracked_subscription_id);
             pending_runtime.cancel_stream(&tracked_session_id, &tracked_subscription_id);
-            super::events_response(response.body)
-        }
-        DaemonRequest::SendInput { session_id, data } => {
-            let data = data.into_bytes();
-            let now = crate::daemon::owner_loop::tick(logical_clock);
-            let response = api.handle_request(
-                runtime,
-                &packages,
-                HubClientRequest::Input {
-                    request_id: request_id("daemon-sessions-send-input"),
-                    session_id: SessionId(session_id),
-                    data,
-                    now_seconds: now,
-                },
-            )?;
-            super::events_response(response.body)
-        }
-        DaemonRequest::ModeGatedInput {
-            session_id,
-            data,
-            mode_generation,
-            mode_revision,
-        } => {
-            let data = data.into_bytes();
-            let now = crate::daemon::owner_loop::tick(logical_clock);
-            let response = api.handle_request(
-                runtime,
-                &packages,
-                HubClientRequest::ModeGatedInput {
-                    request_id: request_id("daemon-sessions-mode-gated-input"),
-                    session_id: SessionId(session_id),
-                    data,
-                    mode_generation,
-                    mode_revision,
-                    now_seconds: now,
-                },
-            )?;
-            let HubClientResponseBody::ModeGatedInput(result) = response.body else {
-                return Err(DaemonTransportError::UnexpectedResponse);
-            };
-            Ok(daemon_mode_gated_input(result))
-        }
-        DaemonRequest::Resize {
-            session_id,
-            rows,
-            cols,
-        } => {
-            let now = crate::daemon::owner_loop::tick(logical_clock);
-            let response = api.handle_request(
-                runtime,
-                &packages,
-                HubClientRequest::Resize {
-                    request_id: request_id("daemon-sessions-resize"),
-                    session_id: SessionId(session_id),
-                    rows,
-                    cols,
-                    now_seconds: now,
-                },
-            )?;
             super::events_response(response.body)
         }
         DaemonRequest::ShutdownSession { session_id } => {

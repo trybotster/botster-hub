@@ -10,12 +10,14 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use botster_core::contract::terminal_adapter::{
-    TerminalAdapter, TerminalAdapterPressure, TerminalAdapterWriteError,
+    TerminalAdapter, TerminalAdapterPressure, TerminalAdapterWriteError, TerminalIngress,
 };
+use botster_core::contract::terminal_wake::{TerminalWakeSink, WakingTerminalAdapter};
 use botster_hub_client::DaemonEvent;
 use botster_terminal_protocol::TerminalFrame;
 use tokio::sync::Notify;
 
+use crate::data_plane::CloseWorkSource;
 use crate::subscription::closed_events::{
     ClosedEventLedger, ClosedEventRoute, ClosedEventSliceProgress, ClosedHandle,
 };
@@ -57,6 +59,7 @@ impl UnixTerminalAdapterInner {
         self.slot.close_from_host();
     }
 
+    #[allow(dead_code)]
     fn host_closed(&self) -> bool {
         self.slot.host_closed()
     }
@@ -71,6 +74,10 @@ impl UnixTerminalAdapterInner {
 
     fn try_write(&self, frame: &TerminalFrame) -> Result<(), TerminalAdapterWriteError> {
         self.slot.try_write(frame)
+    }
+
+    fn try_read(&self) -> TerminalIngress {
+        self.slot.try_read()
     }
 
     fn snapshot_active(&self) -> Option<Vec<u8>> {
@@ -169,6 +176,16 @@ impl TerminalAdapter for UnixTerminalAdapter {
     fn pressure(&self) -> TerminalAdapterPressure {
         self.inner.pressure()
     }
+
+    fn try_read(&mut self) -> TerminalIngress {
+        self.inner.try_read()
+    }
+}
+
+impl WakingTerminalAdapter for UnixTerminalAdapter {
+    fn set_wake_sink(&mut self, sink: TerminalWakeSink) {
+        self.inner.slot.set_wake_sink(sink);
+    }
 }
 
 /// Per-connection mux of bound Unix adapter write handles.
@@ -191,6 +208,7 @@ struct UnixMuxInner {
     routes: Mutex<BTreeMap<(String, String, u64), ClosedEventRoute<UnixTerminalAdapterHandle>>>,
     closed_events: ClosedEventLedger,
     close_work: Mutex<Arc<AtomicBool>>,
+    close_source: Mutex<Option<CloseWorkSource>>,
 }
 
 impl UnixConnectionMux {
@@ -202,6 +220,7 @@ impl UnixConnectionMux {
                 routes: Mutex::new(BTreeMap::new()),
                 closed_events: ClosedEventLedger::default(),
                 close_work: Mutex::new(Arc::new(AtomicBool::new(false))),
+                close_source: Mutex::new(None),
             }),
         }
     }
@@ -209,6 +228,12 @@ impl UnixConnectionMux {
     pub(crate) fn bind_close_work(&self, flag: Arc<AtomicBool>) {
         if let Ok(mut slot) = self.inner.close_work.lock() {
             *slot = flag;
+        }
+    }
+
+    pub(crate) fn bind_close_source(&self, source: CloseWorkSource) {
+        if let Ok(mut slot) = self.inner.close_source.lock() {
+            *slot = Some(source);
         }
     }
 
@@ -239,13 +264,26 @@ impl UnixConnectionMux {
             routes.insert(
                 key,
                 ClosedEventRoute {
-                    session_id,
-                    subscription_id,
+                    session_id: session_id.clone(),
+                    subscription_id: subscription_id.clone(),
                     generation,
-                    handle,
+                    handle: handle.clone(),
                     reported: false,
                 },
             );
+        }
+        if let Ok(source) = self.inner.close_source.lock()
+            && let Some(source) = source.as_ref()
+        {
+            let notify = self.notify_arc();
+            let hook = source.register(
+                session_id,
+                subscription_id,
+                generation,
+                self.inner.closed_events.clone(),
+                Arc::new(move || notify.notify_waiters()),
+            );
+            handle.attach_close_hook(move |host_closed| hook.notify_closed(host_closed));
         }
         self.inner.notify.notify_waiters();
     }
@@ -260,6 +298,7 @@ impl UnixConnectionMux {
         self.inner.notify.notify_waiters();
     }
 
+    #[allow(dead_code)]
     pub(crate) fn is_dying(&self) -> bool {
         self.inner.dying.load(Ordering::SeqCst)
     }
@@ -304,6 +343,7 @@ impl UnixConnectionMux {
         .classified
     }
 
+    #[allow(dead_code)]
     pub(crate) fn queue_closed_subscription_events_bounded(
         &self,
         classify: impl FnMut(&str) -> Option<bool>,
@@ -360,6 +400,26 @@ impl UnixConnectionMux {
             .is_ok_and(|routes| !routes.is_empty())
     }
 
+    pub(crate) fn live_handle(
+        &self,
+        session_id: &str,
+        subscription_id: &str,
+    ) -> Option<UnixTerminalAdapterHandle> {
+        let Ok(routes) = self.inner.routes.lock() else {
+            return None;
+        };
+        routes.values().rev().find_map(|route| {
+            if route.session_id == session_id
+                && route.subscription_id == subscription_id
+                && !route.handle.is_closed()
+            {
+                Some(route.handle.clone())
+            } else {
+                None
+            }
+        })
+    }
+
     pub(crate) fn snapshot_writes(
         &self,
     ) -> Vec<(String, String, UnixTerminalAdapterHandle, Vec<u8>)> {
@@ -408,6 +468,7 @@ impl UnixTerminalAdapterHandle {
         self.inner.close_from_host();
     }
 
+    #[allow(dead_code)]
     pub(crate) fn host_closed(&self) -> bool {
         self.inner.host_closed()
     }
@@ -438,6 +499,14 @@ impl UnixTerminalAdapterHandle {
 
     pub(crate) fn is_flush_deferred(&self) -> bool {
         self.inner.is_flush_deferred()
+    }
+
+    pub(crate) fn attach_close_hook(&self, hook: impl Fn(bool) + Send + Sync + 'static) {
+        self.inner.slot.attach_close_hook(hook);
+    }
+
+    pub(crate) fn push_ingress(&self, bytes: Vec<u8>) -> Result<(), ()> {
+        self.inner.slot.push_ingress(bytes)
     }
 }
 
@@ -501,6 +570,22 @@ mod tests {
 
         fn delivered_frame_bytes(&self) -> &[Vec<u8>] {
             &self.delivered
+        }
+
+        fn inject_ingress_frame(&mut self, bytes: Vec<u8>) {
+            self.adapter.inner.slot.inject_ingress_frame(bytes);
+        }
+
+        fn inject_ingress_partial(&mut self, bytes: Vec<u8>) {
+            self.adapter.inner.slot.inject_ingress_partial(bytes);
+        }
+
+        fn complete_ingress_partial(&mut self) {
+            self.adapter.inner.slot.complete_ingress_partial();
+        }
+
+        fn drop_buffered_ingress_frame(&mut self) {
+            self.adapter.inner.slot.drop_buffered_ingress_frame();
         }
     }
 

@@ -2860,7 +2860,7 @@ fn phase_dataset_body(
         "host_validity": host_validity.json(),
         "revisions": {
             "source_revision": source_revision,
-            "botster_core": "7eafa470a18025895995bbedc20d34b58106a03b",
+            "botster_core": "a781556258789dea4a50ffcb17351e7294c8ff26",
             "calibration_dataset_commit": git_path_commit(&calibration_path()),
             "acceptance_revision": match phase {
                 CampaignPhase::Acceptance => std::env::var("SUBJECT_SHA").ok(),
@@ -3911,12 +3911,11 @@ fn run_measurement_workers(
                 tx.send(MeasurementSample::Start("terminal_input".to_string()))
                     .expect("send terminal input start");
             }
-            let sent = noisy
-                .connection
-                .request(&botster_hub_client::DaemonRequest::SendInput {
-                    session_id: EVENT_PLANE_NOISY_SESSION.to_string(),
-                    data: payload,
-                });
+            let sent = noisy.connection.send_terminal_frame(
+                EVENT_PLANE_NOISY_SESSION,
+                EVENT_PLANE_NOISY_SUB,
+                &terminal_input_frame_bytes(payload.as_bytes()),
+            );
             let echo_marker = format!("ns-echo:{token}");
             let echoed = collect_noisy_attach(noisy, Some(&echo_marker));
             let ok = match echoed {
@@ -4071,23 +4070,28 @@ fn perform_cycle_operation(
             botster_hub_client::DaemonRequest::drain_subscription(session_id, sub_id),
             botster_hub_client::DaemonResponseKind::Events,
         ),
-        "input" => expect_kind(
-            endpoint,
-            botster_hub_client::DaemonRequest::SendInput {
-                session_id: session_id.to_string(),
-                data: format!("{}\r", "i".repeat(64)),
-            },
-            botster_hub_client::DaemonResponseKind::Events,
-        ),
-        "resize" => expect_kind(
-            endpoint,
-            botster_hub_client::DaemonRequest::Resize {
-                session_id: session_id.to_string(),
-                rows: 24,
-                cols: 80,
-            },
-            botster_hub_client::DaemonResponseKind::Events,
-        ),
+        "input" => {
+            let mut connection = botster_hub_client::DaemonConnection::connect(endpoint)
+                .map_err(|error| error.to_string())?;
+            connection
+                .send_terminal_frame(
+                    session_id,
+                    sub_id,
+                    &terminal_input_frame_bytes(format!("{}\r", "i".repeat(64)).as_bytes()),
+                )
+                .map_err(|error| error.to_string())
+        }
+        "resize" => {
+            let mut connection = botster_hub_client::DaemonConnection::connect(endpoint)
+                .map_err(|error| error.to_string())?;
+            connection
+                .send_terminal_frame(
+                    session_id,
+                    sub_id,
+                    &terminal_resize_frame_bytes(24, 80),
+                )
+                .map_err(|error| error.to_string())
+        }
         "mcp" => expect_kind(
             endpoint,
             botster_hub_client::DaemonRequest::PluginMcpListTools,
@@ -4960,14 +4964,14 @@ fn prove_north_star(endpoint: &botster_hub_client::DaemonEndpoint, noisy: &mut N
         }),
         "noisy session must preserve exact non-UTF-8 bytes"
     );
-    let input = noisy
+    noisy
         .connection
-        .request(&botster_hub_client::DaemonRequest::SendInput {
-            session_id: EVENT_PLANE_NOISY_SESSION.to_string(),
-            data: "ns-probe\r".to_string(),
-        })
+        .send_terminal_frame(
+            EVENT_PLANE_NOISY_SESSION,
+            EVENT_PLANE_NOISY_SUB,
+            &terminal_input_frame_bytes(b"ns-probe\r"),
+        )
         .expect("input noisy");
-    assert_eq!(input.kind, botster_hub_client::DaemonResponseKind::Events);
     let echoed = collect_attach_events(
         &mut noisy.connection,
         EVENT_PLANE_NOISY_SESSION,
@@ -4989,15 +4993,14 @@ fn prove_north_star(endpoint: &botster_hub_client::DaemonEndpoint, noisy: &mut N
         )
     });
     assert!(ready_at.is_some() && echo_at.is_some(), "ordering oracles");
-    let resize = noisy
+    noisy
         .connection
-        .request(&botster_hub_client::DaemonRequest::Resize {
-            session_id: EVENT_PLANE_NOISY_SESSION.to_string(),
-            rows: 30,
-            cols: 100,
-        })
+        .send_terminal_frame(
+            EVENT_PLANE_NOISY_SESSION,
+            EVENT_PLANE_NOISY_SUB,
+            &terminal_resize_frame_bytes(30, 100),
+        )
         .expect("resize noisy");
-    assert_eq!(resize.kind, botster_hub_client::DaemonResponseKind::Events);
     let detached = noisy
         .connection
         .request(&botster_hub_client::DaemonRequest::Detach {

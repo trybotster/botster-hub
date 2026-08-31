@@ -27,6 +27,20 @@ use botster_ui_contract::{
 };
 use serde::{Deserialize, Serialize};
 
+fn terminal_input_frame_bytes(data: &[u8]) -> Vec<u8> {
+    let mut bytes = vec![1, 1];
+    bytes.extend_from_slice(&(u16::try_from(data.len()).unwrap_or(0)).to_be_bytes());
+    bytes.extend_from_slice(data);
+    bytes
+}
+
+fn terminal_resize_frame_bytes(rows: u16, cols: u16) -> Vec<u8> {
+    let mut bytes = vec![1, 3, 0, 4];
+    bytes.extend_from_slice(&rows.to_be_bytes());
+    bytes.extend_from_slice(&cols.to_be_bytes());
+    bytes
+}
+
 mod isolated_hub;
 pub use isolated_hub::{
     IsolatedHub, IsolatedHubBuilder, IsolatedHubError, IsolatedHubStartGuard, TeardownPhase,
@@ -300,15 +314,21 @@ pub fn run_session_lifecycle_subscription_conformance(
         ));
     }
 
-    botster_hub_client::request(
-        endpoint,
-        DaemonRequest::Resize {
+    let mut terminal = DaemonConnection::connect(endpoint)
+        .map_err(|error| session_lifecycle_error("lifecycle attach", error.to_string()))?;
+    terminal
+        .request(&DaemonRequest::Attach {
             session_id: SESSION_LIFECYCLE_SESSION_ID.to_string(),
-            rows: 31,
-            cols: 101,
-        },
-    )
-    .map_err(|error| session_lifecycle_error("lifecycle patch", error.to_string()))?;
+            subscription_id: "session-lifecycle-terminal".to_string(),
+        })
+        .map_err(|error| session_lifecycle_error("lifecycle attach", error.to_string()))?;
+    terminal
+        .send_terminal_frame(
+            SESSION_LIFECYCLE_SESSION_ID,
+            "session-lifecycle-terminal",
+            &terminal_resize_frame_bytes(31, 101),
+        )
+        .map_err(|error| session_lifecycle_error("lifecycle patch", error.to_string()))?;
     let resize_deadline = Instant::now() + Duration::from_secs(5);
     let resize_sequence = loop {
         match next_session_lifecycle_frame(&mut first, resize_deadline, "lifecycle patch")? {
@@ -768,21 +788,19 @@ fn run_many_pty_client_attach_scenario(
         ));
     }
 
-    let input = many_pty_request(
-        connection,
-        &DaemonRequest::SendInput {
-            session_id: MANY_PTY_NOISY_SESSION_ID.to_string(),
-            data: format!("{MANY_PTY_INPUT}\n"),
-        },
-        ManyPtyConformanceStage::Input,
-        MANY_PTY_NOISY_SESSION_ID,
-    )?;
-    many_pty_expect_kind(
-        &input,
-        DaemonResponseKind::Events,
-        ManyPtyConformanceStage::Input,
-        MANY_PTY_NOISY_SESSION_ID,
-    )?;
+    connection
+        .send_terminal_frame(
+            MANY_PTY_NOISY_SESSION_ID,
+            MANY_PTY_SUBSCRIPTION_ID,
+            &terminal_input_frame_bytes(format!("{MANY_PTY_INPUT}\n").as_bytes()),
+        )
+        .map_err(|error| {
+            many_pty_error(
+                ManyPtyConformanceStage::Input,
+                MANY_PTY_NOISY_SESSION_ID,
+                error.to_string(),
+            )
+        })?;
     let deadline = Instant::now() + MANY_PTY_DEADLINE;
     let mut live_screen = String::new();
     while Instant::now() < deadline {
@@ -1549,33 +1567,26 @@ pub fn run_client_conformance(
         thread::sleep(Duration::from_millis(25));
     }
 
-    expect_kind(
-        &terminal
-            .request(&DaemonRequest::Resize {
-                session_id: CONFORMANCE_SESSION_ID.to_string(),
-                rows: 33,
-                cols: 102,
-            })
-            .map_err(|source| ConformanceError::Client {
-                operation: "resize",
-                source,
-            })?,
-        DaemonResponseKind::Events,
-        "resize",
-    )?;
-    expect_kind(
-        &terminal
-            .request(&DaemonRequest::SendInput {
-                session_id: CONFORMANCE_SESSION_ID.to_string(),
-                data: "from-conformance\r".to_string(),
-            })
-            .map_err(|source| ConformanceError::Client {
-                operation: "send_input",
-                source,
-            })?,
-        DaemonResponseKind::Events,
-        "send_input",
-    )?;
+    terminal
+        .send_terminal_frame(
+            CONFORMANCE_SESSION_ID,
+            CONFORMANCE_SUBSCRIPTION_ID,
+            &terminal_resize_frame_bytes(33, 102),
+        )
+        .map_err(|source| ConformanceError::Client {
+            operation: "resize",
+            source,
+        })?;
+    terminal
+        .send_terminal_frame(
+            CONFORMANCE_SESSION_ID,
+            CONFORMANCE_SUBSCRIPTION_ID,
+            &terminal_input_frame_bytes(b"from-conformance\r"),
+        )
+        .map_err(|source| ConformanceError::Client {
+            operation: "send_input",
+            source,
+        })?;
     let echo_deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < echo_deadline {
         append_read_screen(&mut terminal, &mut drain_output)?;
@@ -1584,19 +1595,16 @@ pub fn run_client_conformance(
         }
         thread::sleep(Duration::from_millis(25));
     }
-    expect_kind(
-        &terminal
-            .request(&DaemonRequest::SendInput {
-                session_id: CONFORMANCE_SESSION_ID.to_string(),
-                data: "size-check\r".to_string(),
-            })
-            .map_err(|source| ConformanceError::Client {
-                operation: "send_size_check",
-                source,
-            })?,
-        DaemonResponseKind::Events,
-        "send_size_check",
-    )?;
+    terminal
+        .send_terminal_frame(
+            CONFORMANCE_SESSION_ID,
+            CONFORMANCE_SUBSCRIPTION_ID,
+            &terminal_input_frame_bytes(b"size-check\r"),
+        )
+        .map_err(|source| ConformanceError::Client {
+            operation: "send_size_check",
+            source,
+        })?;
     let resize_needle = format!("{CONFORMANCE_WINSIZE_PREFIX}33 102");
     let size_deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < size_deadline {
@@ -1606,19 +1614,16 @@ pub fn run_client_conformance(
         }
         thread::sleep(Duration::from_millis(25));
     }
-    expect_kind(
-        &terminal
-            .request(&DaemonRequest::SendInput {
-                session_id: CONFORMANCE_SESSION_ID.to_string(),
-                data: "quit\r".to_string(),
-            })
-            .map_err(|source| ConformanceError::Client {
-                operation: "send_quit",
-                source,
-            })?,
-        DaemonResponseKind::Events,
-        "send_quit",
-    )?;
+    terminal
+        .send_terminal_frame(
+            CONFORMANCE_SESSION_ID,
+            CONFORMANCE_SUBSCRIPTION_ID,
+            &terminal_input_frame_bytes(b"quit\r"),
+        )
+        .map_err(|source| ConformanceError::Client {
+            operation: "send_quit",
+            source,
+        })?;
     let output = drain_output;
     let stream_contains_ready = output.contains(CONFORMANCE_READY);
     let stream_contains_echo = output.contains(CONFORMANCE_ECHO);
@@ -6430,7 +6435,7 @@ mod tests {
         assert_eq!(provenance.protocol_git, LATE_ATTACH_GHOSTSNP_PROTOCOL_GIT);
         assert_eq!(
             LATE_ATTACH_GHOSTSNP_CORE_PIN,
-            "7eafa470a18025895995bbedc20d34b58106a03b"
+            "a781556258789dea4a50ffcb17351e7294c8ff26"
         );
         assert_eq!(provenance.core_pin, LATE_ATTACH_GHOSTSNP_CORE_PIN);
         assert_eq!(

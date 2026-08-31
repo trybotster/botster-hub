@@ -512,6 +512,8 @@ pub(crate) struct LocalWebrtcOfferPeer {
     pending_host: PendingHostEventState,
     pub(crate) accept_host_events: bool,
     inbound: WebrtcInboundMailbox,
+    subscription_inbounds: Vec<WebrtcInboundMailbox>,
+    pub(crate) control_terminal_frame_count: u64,
 }
 
 pub(crate) struct ExtraWebrtcDataChannel {
@@ -717,6 +719,8 @@ impl LocalWebrtcOfferPeer {
                 pending_host: PendingHostEventState::new(),
                 accept_host_events: false,
                 inbound,
+                subscription_inbounds: Vec::new(),
+                control_terminal_frame_count: 0,
             },
             extra_channel,
             offer,
@@ -870,6 +874,7 @@ impl LocalWebrtcOfferPeer {
                         .push_back(serde_json::from_slice(&plaintext)?);
                 }
                 botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonTerminalFrame => {
+                    self.control_terminal_frame_count += 1;
                     self.pending_terminal_frames
                         .push_back((String::new(), plaintext));
                 }
@@ -900,6 +905,7 @@ impl LocalWebrtcOfferPeer {
                     .into());
                 }
                 botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonTerminalFrame => {
+                    self.control_terminal_frame_count += 1;
                     self.pending_terminal_frames
                         .push_back((String::new(), plaintext));
                 }
@@ -938,9 +944,17 @@ impl LocalWebrtcOfferPeer {
             return Ok(bytes);
         }
         loop {
-            let (delivery_kind, plaintext, _) = self.receive_delivery(key).await?;
+            let from_control = self.subscription_inbounds.is_empty();
+            let (delivery_kind, plaintext, _) = if from_control {
+                self.receive_delivery(key).await?
+            } else {
+                self.receive_subscription_delivery(key).await?
+            };
             match delivery_kind {
                 botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonTerminalFrame => {
+                    if from_control {
+                        self.control_terminal_frame_count += 1;
+                    }
                     return Ok(plaintext);
                 }
                 botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonEntityFrame => {
@@ -1035,6 +1049,7 @@ impl LocalWebrtcOfferPeer {
                     return Ok(serde_json::from_slice(&plaintext)?);
                 }
                 botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonTerminalFrame => {
+                    self.control_terminal_frame_count += 1;
                     self.pending_terminal_frames
                         .push_back((String::new(), plaintext));
                 }
@@ -1069,6 +1084,13 @@ impl LocalWebrtcOfferPeer {
     pub(crate) async fn create_extra_data_channel(
         &mut self,
     ) -> Result<ExtraWebrtcDataChannel, Box<dyn std::error::Error>> {
+        self.create_labeled_data_channel("botster-extra").await
+    }
+
+    pub(crate) async fn create_labeled_data_channel(
+        &mut self,
+        label: &str,
+    ) -> Result<ExtraWebrtcDataChannel, Box<dyn std::error::Error>> {
         let runtime =
             default_runtime().ok_or_else(|| std::io::Error::other("no async runtime found"))?;
         let (open_tx, open_rx) = channel::<()>(1);
@@ -1079,7 +1101,7 @@ impl LocalWebrtcOfferPeer {
         let extra = self
             .peer
             .create_data_channel(
-                "botster-extra",
+                label,
                 Some(RTCDataChannelInit {
                     ordered: true,
                     max_retransmits: None,
@@ -1098,7 +1120,7 @@ impl LocalWebrtcOfferPeer {
             Some(closed_tx),
         );
         let mut extra_channel = ExtraWebrtcDataChannel {
-            label: "botster-extra".to_string(),
+            label: label.to_string(),
             data_channel: extra,
             inbound,
             messages: message_rx,
@@ -1111,9 +1133,85 @@ impl LocalWebrtcOfferPeer {
             extra_channel.open_rx.recv(),
         )
         .await
-        .map_err(|_| std::io::Error::other("timed out waiting for extra DataChannel open"))?
-        .ok_or_else(|| std::io::Error::other("extra DataChannel closed before open"))?;
+        .map_err(|_| std::io::Error::other("timed out waiting for labeled DataChannel open"))?
+        .ok_or_else(|| std::io::Error::other("labeled DataChannel closed before open"))?;
         Ok(extra_channel)
+    }
+
+    pub(crate) async fn open_reserved_terminal(
+        &mut self,
+        key: &AesGcmKey,
+        label: &str,
+        hello: &botster_hub_client::DaemonHello,
+    ) -> Result<Arc<dyn DataChannel>, Box<dyn std::error::Error>> {
+        let extra = self.create_labeled_data_channel(label).await?;
+        let channel = extra.data_channel.clone();
+        let plaintext = serde_json::to_vec(hello)?;
+        let envelope = encrypt_aes_gcm(key, &plaintext, 1)?;
+        channel
+            .send_text(&serde_json::to_string(&envelope)?)
+            .await?;
+        let mut extra = extra;
+        let (delivery_kind, plaintext, _) = extra.inbound.receive_delivery(key).await?;
+        if delivery_kind != botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonResponse {
+            return Err(std::io::Error::other(format!(
+                "reserved hello ack used unexpected delivery kind {delivery_kind:?}"
+            ))
+            .into());
+        }
+        let _ack: botster_hub_client::DaemonHelloAck = serde_json::from_slice(&plaintext)?;
+        self.subscription_inbounds.push(extra.inbound);
+        Ok(channel)
+    }
+
+    pub(crate) async fn send_reserved_terminal_frame(
+        channel: &Arc<dyn DataChannel>,
+        key: &AesGcmKey,
+        frame: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let envelope = encrypt_aes_gcm(key, frame, 1)?;
+        channel
+            .send_text(&serde_json::to_string(&envelope)?)
+            .await?;
+        Ok(())
+    }
+
+    async fn receive_subscription_delivery(
+        &mut self,
+        key: &AesGcmKey,
+    ) -> Result<
+        (
+            botster_hub_client::DaemonLocalWebrtcDeliveryKind,
+            Vec<u8>,
+            LocalWebrtcResponseMetrics,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        if self.subscription_inbounds.is_empty() {
+            return Err(std::io::Error::other("no reserved subscription channel").into());
+        }
+        loop {
+            for inbound in &mut self.subscription_inbounds {
+                if let Ok(delivery) = timeout(
+                    webrtc_runtime().as_ref(),
+                    Duration::from_millis(50),
+                    inbound.receive_delivery(key),
+                )
+                .await
+                {
+                    return delivery;
+                }
+            }
+            if let Ok(delivery) = timeout(
+                webrtc_runtime().as_ref(),
+                Duration::from_millis(50),
+                self.inbound.receive_delivery(key),
+            )
+            .await
+            {
+                return delivery;
+            }
+        }
     }
 }
 

@@ -1,5 +1,5 @@
 {
-  "conformance_fixture_revision": 46,
+  "conformance_fixture_revision": 47,
   "entity_type": "session",
   "fresh_subscription": {
     "prior_generation_frames_discarded": true,

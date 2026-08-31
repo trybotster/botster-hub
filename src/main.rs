@@ -1326,31 +1326,6 @@ fn operator_sessions(args: Vec<String>) -> Result<(), OperatorError> {
         } => {
             stream_attach(&config, session_id, subscription_id, &mut io::stdout())?;
         }
-        SessionAction::SendInput { session_id, data } => {
-            let response = daemon_transport_request(
-                &config,
-                DaemonRequest::SendInput {
-                    session_id: session_id.0,
-                    data: String::from_utf8_lossy(&data).to_string(),
-                },
-            )?;
-            print_daemon_response(response)?;
-        }
-        SessionAction::Resize {
-            session_id,
-            rows,
-            cols,
-        } => {
-            let response = daemon_transport_request(
-                &config,
-                DaemonRequest::Resize {
-                    session_id: session_id.0,
-                    rows,
-                    cols,
-                },
-            )?;
-            print_daemon_response(response)?;
-        }
         SessionAction::Detach {
             session_id,
             subscription_id,
@@ -2681,16 +2656,15 @@ fn print_daemon_response(response: DaemonResponse) -> Result<(), OperatorError> 
                 println!("mode_revision={}", mode_flags.mode_revision);
             }
         }
-        DaemonResponseKind::ModeGatedInput => {
-            println!("response=mode_gated_input");
-            if let Some(result) = response.mode_gated_input {
-                println!("session_id={}", result.session_id);
-                println!("admitted={}", result.admitted);
-                println!("bytes_written={}", result.bytes_written);
-                println!("mouse_mode={}", result.mouse_mode);
-                println!("mode_generation={}", result.mode_generation);
-                println!("mode_revision={}", result.mode_revision);
-                println!("error_kind={:?}", result.error_kind);
+        DaemonResponseKind::TerminalReservation => {
+            println!("response=terminal_reservation");
+            if let Some(reservation) = response.terminal_reservation {
+                println!("session_id={}", reservation.session_id);
+                println!("subscription_id={}", reservation.subscription_id);
+                println!("generation={}", reservation.generation);
+                println!("peer_generation={}", reservation.peer_generation);
+                println!("label={}", reservation.label);
+                println!("expires_in_seconds={}", reservation.expires_in_seconds);
             }
         }
         DaemonResponseKind::CaptureSnapshot => {
@@ -3478,15 +3452,6 @@ enum SessionAction {
         session_id: SessionId,
         subscription_id: SubscriptionId,
     },
-    SendInput {
-        session_id: SessionId,
-        data: Vec<u8>,
-    },
-    Resize {
-        session_id: SessionId,
-        rows: u16,
-        cols: u16,
-    },
     Detach {
         session_id: SessionId,
         subscription_id: SubscriptionId,
@@ -3557,42 +3522,6 @@ impl SessionCommand {
                     action: SessionAction::Attach {
                         session_id,
                         subscription_id,
-                    },
-                })
-            }
-            "send-input" => {
-                if args.len() < 6 {
-                    return Err(OperatorError::Usage("sessions send-input"));
-                }
-                let options = DataArgs::parse(args[1..3].to_vec(), "sessions send-input")?;
-                if args.get(4).map(String::as_str) != Some("--") {
-                    return Err(OperatorError::Usage("sessions send-input"));
-                }
-                Ok(Self {
-                    data_directory: options.data_directory,
-                    action: SessionAction::SendInput {
-                        session_id: SessionId(args[3].clone()),
-                        data: args[5..].join(" ").into_bytes(),
-                    },
-                })
-            }
-            "resize" => {
-                if args.len() != 6 {
-                    return Err(OperatorError::Usage("sessions resize"));
-                }
-                let options = DataArgs::parse(args[1..3].to_vec(), "sessions resize")?;
-                let rows = args[4]
-                    .parse::<u16>()
-                    .map_err(|_| OperatorError::Usage("sessions resize"))?;
-                let cols = args[5]
-                    .parse::<u16>()
-                    .map_err(|_| OperatorError::Usage("sessions resize"))?;
-                Ok(Self {
-                    data_directory: options.data_directory,
-                    action: SessionAction::Resize {
-                        session_id: SessionId(args[3].clone()),
-                        rows,
-                        cols,
                     },
                 })
             }
@@ -4697,7 +4626,7 @@ Packages:
         "check-update" => "usage: botster-hub check-update [--data-dir <path>]",
         "version" => "usage: botster-hub version",
         "sessions" => {
-            "usage: botster-hub sessions <list|spawn|attach|send-input|resize|detach|shutdown> ..."
+            "usage: botster-hub sessions <list|spawn|attach|detach|shutdown> ..."
         }
         "session-types" => {
             "usage: botster-hub session-types <list|show|definition|resolve|spawn> ..."
@@ -4745,14 +4674,8 @@ Packages:
         "sessions attach" => {
             "usage: botster-hub sessions attach [--data-dir <path>] <session-id> [--subscription-id <id>]"
         }
-        "sessions resize" => {
-            "usage: botster-hub sessions resize [--data-dir <path>] <session-id> <rows> <cols>"
-        }
         "sessions detach" => {
             "usage: botster-hub sessions detach [--data-dir <path>] <session-id> [--subscription-id <id>]"
-        }
-        "sessions send-input" => {
-            "usage: botster-hub sessions send-input [--data-dir <path>] <session-id> -- <bytes>"
         }
         "sessions shutdown" => {
             "usage: botster-hub sessions shutdown [--data-dir <path>] <session-id>"

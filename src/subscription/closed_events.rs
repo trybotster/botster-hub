@@ -4,9 +4,11 @@
 //! pending `TerminalSubscriptionClosed` events, suppression keys, and bounded
 //! slice classification to this ledger.
 
+#![allow(dead_code)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use botster_core::SessionId;
 use botster_core_daemon::{CoreDaemonError, RegistrySessionState, SessionRegistryStateLookup};
@@ -45,10 +47,10 @@ pub(crate) struct AttachCloseBookkeeping {
     pub released_attach_generations: u64,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct ClosedEventLedger {
-    pending_events: Mutex<Vec<DaemonEvent>>,
-    suppress_generations: Mutex<BTreeSet<(String, String, u64)>>,
+    pending_events: Arc<Mutex<Vec<DaemonEvent>>>,
+    suppress_generations: Arc<Mutex<BTreeSet<(String, String, u64)>>>,
 }
 
 impl ClosedEventLedger {
@@ -107,6 +109,12 @@ impl ClosedEventLedger {
     pub(crate) fn drop_pending_events(&self) {
         if let Ok(mut pending) = self.pending_events.lock() {
             pending.clear();
+        }
+    }
+
+    pub(crate) fn push_event(&self, event: DaemonEvent) {
+        if let Ok(mut pending) = self.pending_events.lock() {
+            pending.push(event);
         }
     }
 

@@ -1772,3 +1772,28 @@ event for that owner and name. Version-one ceilings: 16 values, 256
 UTF-8 bytes each, 4,096 aggregate bytes, and 64 active subscriptions
 per connection. There is no public sequence, cursor, replay request, or
 durable-history field.
+
+## Cold-cut wake-driven duplex terminal transports
+
+Deleting JSON `SendInput`, `ModeGatedInput`, and `Resize` plus adding
+the Attach reservation DTO advances `PROTOCOL_VERSION` to 8 and
+`CONFORMANCE_FIXTURE_REVISION` to 47. A protocol-7 client fails closed
+at `ensure_compatible()`. `MCP_PROTOCOL_VERSION` and
+`botster_terminal_protocol::PROTOCOL_VERSION` stay unchanged.
+`DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION` stays 36.
+
+Unix Attach still returns `Events` and omits `terminal_reservation` on
+the wire. WebRTC Attach returns `DaemonResponseKind::TerminalReservation`
+with `session_id`, `subscription_id`, `generation`, `peer_generation`,
+opaque `label`, and `expires_in_seconds`. The browser then opens one
+labeled reliable ordered DataChannel, completes encrypted Hello on that
+channel, and binds. Terminal frames travel only on that subscription
+channel. The control DataChannel carries no terminal frames.
+
+Terminal input exists only as a Core `TerminalInputFrame` on a bound
+Unix or WebRTC subscription. Hub validates the header and does not
+decode the body. Late reserved-channel open after expiry emits
+unsolicited `TerminalSubscriptionClosed` with reason
+`reservation_expired` on the peer control channel, then closes that
+channel. Unknown labels close without an event. A live reservation
+conflict on Attach returns `reservation_label_conflict`.

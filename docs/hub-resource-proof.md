@@ -16,6 +16,10 @@ sanitized aggregate `active_timer_resources` observation.
 - queue capacity is `256` and executor concurrency is `2`;
 - four loaded owners materialize exactly eight executor workers, never 1,024;
 - the Hub process has at most 64 OS threads;
+- the Hub adds exactly one `botster-hub-data-plane` thread;
+- each terminal ingress buffer holds at most 64 complete frames;
+- the route close-work queue holds at most 64 ready routes;
+- the route close-work registry returns to zero after route teardown;
 - queued jobs, in-flight jobs, entity subscriptions, terminal attaches, and
   timer resources return to zero;
 - reload returns to the four-owner baseline;
@@ -35,6 +39,10 @@ The loaded workflow exposes `focused-plugin-resource-bounds`. It requires
 selector records Hub process CPU ticks for five seconds after deterministic
 counter convergence and enforces at most 250 ms growth. Ordinary full-suite
 runs record the same observation but do not use it as a pass/fail gate.
+
+The data-plane driver blocks on the Core wake source. Its one-second watchdog
+is a hang bound. The watchdog does not cause terminal progress. The lifecycle
+tests pause the driver and set a longer watchdog to prove this property.
 
 ## Exact four-package campaign
 

@@ -10,11 +10,13 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use botster_core::contract::terminal_adapter::{
-    TerminalAdapter, TerminalAdapterPressure, TerminalAdapterWriteError,
+    TerminalAdapter, TerminalAdapterPressure, TerminalAdapterWriteError, TerminalIngress,
 };
+use botster_core::contract::terminal_wake::{TerminalWakeSink, WakingTerminalAdapter};
 use botster_hub_client::DaemonEvent;
 use botster_terminal_protocol::TerminalFrame;
 
+use crate::data_plane::CloseWorkSource;
 use crate::subscription::closed_events::{
     ClosedEventLedger, ClosedEventRoute, ClosedEventSliceProgress, ClosedHandle,
 };
@@ -30,6 +32,14 @@ pub struct WebRtcTerminalAdapter {
 #[derive(Clone)]
 pub(crate) struct WebRtcTerminalAdapterHandle {
     inner: Arc<WebRtcTerminalAdapterInner>,
+}
+
+impl std::fmt::Debug for WebRtcTerminalAdapterHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WebRtcTerminalAdapterHandle")
+            .finish_non_exhaustive()
+    }
 }
 
 struct WebRtcTerminalAdapterInner {
@@ -54,6 +64,7 @@ impl WebRtcTerminalAdapterInner {
         self.slot.close_from_host();
     }
 
+    #[allow(dead_code)]
     fn host_closed(&self) -> bool {
         self.slot.host_closed()
     }
@@ -74,6 +85,10 @@ impl WebRtcTerminalAdapterInner {
 
     fn try_write(&self, frame: &TerminalFrame) -> Result<(), TerminalAdapterWriteError> {
         self.slot.try_write(frame)
+    }
+
+    fn try_read(&self) -> TerminalIngress {
+        self.slot.try_read()
     }
 
     fn snapshot_active(&self) -> Option<Vec<u8>> {
@@ -154,6 +169,16 @@ impl TerminalAdapter for WebRtcTerminalAdapter {
     fn pressure(&self) -> TerminalAdapterPressure {
         self.inner.pressure()
     }
+
+    fn try_read(&mut self) -> TerminalIngress {
+        self.inner.try_read()
+    }
+}
+
+impl WakingTerminalAdapter for WebRtcTerminalAdapter {
+    fn set_wake_sink(&mut self, sink: TerminalWakeSink) {
+        self.inner.slot.set_wake_sink(sink);
+    }
 }
 
 /// Per-peer mux of bound WebRTC adapter write handles.
@@ -177,6 +202,7 @@ struct WebRtcMuxInner {
     routes: Mutex<BTreeMap<(String, String, u64), ClosedEventRoute<WebRtcTerminalAdapterHandle>>>,
     closed_events: ClosedEventLedger,
     close_work: Mutex<Arc<AtomicBool>>,
+    close_source: Mutex<Option<CloseWorkSource>>,
 }
 
 impl WebRtcConnectionMux {
@@ -189,6 +215,7 @@ impl WebRtcConnectionMux {
                 routes: Mutex::new(BTreeMap::new()),
                 closed_events: ClosedEventLedger::default(),
                 close_work: Mutex::new(Arc::new(AtomicBool::new(false))),
+                close_source: Mutex::new(None),
             }),
         }
     }
@@ -196,6 +223,12 @@ impl WebRtcConnectionMux {
     pub(crate) fn bind_close_work(&self, flag: Arc<AtomicBool>) {
         if let Ok(mut slot) = self.inner.close_work.lock() {
             *slot = flag;
+        }
+    }
+
+    pub(crate) fn bind_close_source(&self, source: CloseWorkSource) {
+        if let Ok(mut slot) = self.inner.close_source.lock() {
+            *slot = Some(source);
         }
     }
 
@@ -232,13 +265,26 @@ impl WebRtcConnectionMux {
             routes.insert(
                 key,
                 ClosedEventRoute {
-                    session_id,
-                    subscription_id,
+                    session_id: session_id.clone(),
+                    subscription_id: subscription_id.clone(),
                     generation,
-                    handle,
+                    handle: handle.clone(),
                     reported: false,
                 },
             );
+        }
+        if let Ok(source) = self.inner.close_source.lock()
+            && let Some(source) = source.as_ref()
+        {
+            let wake = self.inner.wake.clone();
+            let hook = source.register(
+                session_id,
+                subscription_id,
+                generation,
+                self.inner.closed_events.clone(),
+                Arc::new(move || wake.wake()),
+            );
+            handle.attach_close_hook(move |host_closed| hook.notify_closed(host_closed));
         }
         self.inner.wake.wake();
     }
@@ -260,6 +306,7 @@ impl WebRtcConnectionMux {
         self.inner.wake.wake();
     }
 
+    #[allow(dead_code)]
     pub(crate) fn is_dying(&self) -> bool {
         self.inner.dying.load(Ordering::SeqCst)
     }
@@ -304,6 +351,7 @@ impl WebRtcConnectionMux {
         .classified
     }
 
+    #[allow(dead_code)]
     pub(crate) fn queue_closed_subscription_events_bounded(
         &self,
         classify: impl FnMut(&str) -> Option<bool>,
@@ -340,10 +388,37 @@ impl WebRtcConnectionMux {
         self.inner.closed_events.pop_pending_event()
     }
 
+    pub(crate) fn push_host_event(&self, event: DaemonEvent) {
+        self.inner.closed_events.push_event(event);
+        self.inner.wake.wake();
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn live_handle(
+        &self,
+        session_id: &str,
+        subscription_id: &str,
+    ) -> Option<WebRtcTerminalAdapterHandle> {
+        let Ok(routes) = self.inner.routes.lock() else {
+            return None;
+        };
+        routes.values().rev().find_map(|route| {
+            if route.session_id == session_id
+                && route.subscription_id == subscription_id
+                && !route.handle.is_closed()
+            {
+                Some(route.handle.clone())
+            } else {
+                None
+            }
+        })
+    }
+
     pub(crate) fn drop_pending_events(&self) {
         self.inner.closed_events.drop_pending_events();
     }
 
+    #[allow(dead_code)]
     pub(crate) fn snapshot_writes(
         &self,
     ) -> Vec<(String, String, WebRtcTerminalAdapterHandle, Vec<u8>)> {
@@ -382,6 +457,7 @@ impl WebRtcTerminalAdapterHandle {
         self.inner.close_from_host();
     }
 
+    #[allow(dead_code)]
     pub(crate) fn host_closed(&self) -> bool {
         self.inner.host_closed()
     }
@@ -400,6 +476,14 @@ impl WebRtcTerminalAdapterHandle {
 
     pub(crate) fn write_opaque_frame(&self, frame: &TerminalFrame) {
         let _ = self.inner.try_write(frame);
+    }
+
+    pub(crate) fn attach_close_hook(&self, hook: impl Fn(bool) + Send + Sync + 'static) {
+        self.inner.slot.attach_close_hook(hook);
+    }
+
+    pub(crate) fn push_ingress(&self, bytes: Vec<u8>) -> Result<(), ()> {
+        self.inner.slot.push_ingress(bytes)
     }
 }
 
@@ -467,6 +551,22 @@ mod tests {
 
         fn delivered_frame_bytes(&self) -> &[Vec<u8>] {
             &self.delivered
+        }
+
+        fn inject_ingress_frame(&mut self, bytes: Vec<u8>) {
+            self.adapter.inner.slot.inject_ingress_frame(bytes);
+        }
+
+        fn inject_ingress_partial(&mut self, bytes: Vec<u8>) {
+            self.adapter.inner.slot.inject_ingress_partial(bytes);
+        }
+
+        fn complete_ingress_partial(&mut self) {
+            self.adapter.inner.slot.complete_ingress_partial();
+        }
+
+        fn drop_buffered_ingress_frame(&mut self) {
+            self.adapter.inner.slot.drop_buffered_ingress_frame();
         }
     }
 

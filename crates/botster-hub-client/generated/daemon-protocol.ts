@@ -97,9 +97,6 @@ export type DaemonRequest =
   | { type: "spawn"; session_id: string; command: string }
   | { type: "attach"; session_id: string; subscription_id: string }
   | { type: "detach"; session_id: string; subscription_id: string }
-  | { type: "send_input"; session_id: string; data: string }
-  | { type: "mode_gated_input"; session_id: string; data: string; mode_generation: number; mode_revision: number }
-  | { type: "resize"; session_id: string; rows: number; cols: number }
   | { type: "shutdown_session"; session_id: string }
   | { type: "drain"; session_id: string; subscription_id?: string }
   | { type: "read_screen"; session_id: string }
@@ -170,6 +167,7 @@ export interface DaemonResponse {
   read_screen?: DaemonReadScreen | null;
   mode_flags?: DaemonModeFlags | null;
   mode_gated_input?: DaemonModeGatedInputResult | null;
+  terminal_reservation?: DaemonTerminalReservation | null;
   capture_snapshot?: DaemonCaptureSnapshot | null;
   spawn_targets?: DaemonSpawnTarget[];
   spawn_target_validation?: DaemonSpawnTargetValidation | null;
@@ -235,6 +233,15 @@ export interface DaemonModeGatedInputResult {
   error_kind?: string | null;
 }
 
+export interface DaemonTerminalReservation {
+  session_id: string;
+  subscription_id: string;
+  generation: number;
+  peer_generation: number;
+  label: string;
+  expires_in_seconds: number;
+}
+
 export interface DaemonCaptureSnapshot {
   session_id: string;
   rows: number;
@@ -285,7 +292,7 @@ export type DaemonResponseKind =
   | "session_context"
   | "read_screen"
   | "read_mode_flags"
-  | "mode_gated_input"
+  | "terminal_reservation"
   | "capture_snapshot"
   | "spawn_targets"
   | "spawn_target_validation"

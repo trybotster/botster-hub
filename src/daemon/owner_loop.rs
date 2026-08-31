@@ -39,7 +39,6 @@ use crate::daemon_maintenance::{
     decide_background_slice, run_maintenance_kind,
 };
 use crate::subscription::attach_routes::AttachStreamRegistry;
-use crate::subscription::closed_events::run_close_events_phase;
 use crate::subscription::entity::{
     EntitySubscriptionState, drive_entity_subscriptions, drive_package_entity_fanout,
     drive_package_entity_resync, seed_lifecycle_reconciliation, session_subscribers_need_delivery,
@@ -125,9 +124,6 @@ fn mark_due_reconciliation(state: &mut DaemonControlState, now: Instant) {
         state.background.mark_pump();
         state.maintenance.try_wake();
         state.next_reconciliation = now + ENTITY_RECONCILIATION_INTERVAL;
-    }
-    if state.pending_runtime.take_close_work() {
-        state.background.mark_pump();
     }
 }
 
@@ -215,6 +211,13 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
     let mut daemon = HubDaemon::start(config)?;
     let mut control_state = DaemonControlState {
         event_plane: daemon.local_webrtc().event_plane(),
+        pending_runtime: PendingRuntimeState {
+            close_source: daemon
+                .runtime()
+                .map(|runtime| runtime.close_work_source())
+                .unwrap_or_default(),
+            ..PendingRuntimeState::default()
+        },
         ..DaemonControlState::default()
     };
     seed_lifecycle_reconciliation(&mut daemon, &mut control_state);
@@ -412,6 +415,7 @@ pub(crate) struct PendingRuntimeState {
     pub(crate) streams: AttachStreamRegistry,
     pub(crate) admission: AdmissionState,
     pub(crate) close_work: Arc<AtomicBool>,
+    pub(crate) close_source: crate::data_plane::CloseWorkSource,
 }
 
 impl fmt::Debug for PendingRuntimeState {
@@ -436,6 +440,7 @@ impl std::ops::DerefMut for PendingRuntimeState {
 }
 
 impl PendingRuntimeState {
+    #[allow(dead_code)]
     fn take_close_work(&self) -> bool {
         self.close_work.swap(false, Ordering::SeqCst)
     }
@@ -462,8 +467,14 @@ impl PendingRuntimeState {
 fn run_one_pump_phase(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
     let phase = state.pump.take_phase();
     let incomplete = match phase {
-        PumpPhase::CloseEvents => run_close_events_phase(daemon, state),
-        PumpPhase::InventoryReconcile => run_inventory_reconcile_phase(daemon, state),
+        PumpPhase::InventoryReconcile => {
+            state
+                .pending_runtime
+                .admission
+                .reservations
+                .retire_expired(crate::admission::reservations::now_seconds());
+            run_inventory_reconcile_phase(daemon, state)
+        }
         PumpPhase::Observe => run_pump_observe_phase(daemon, state),
     };
     if incomplete {
@@ -852,8 +863,12 @@ mod tests {
             .next()
             .unwrap_or(pump);
         assert!(
-            pump.contains("run_close_events_phase"),
-            "Pump region must still contain the close-events phase"
+            !pump.contains("run_close_events_phase"),
+            "Pump region must not contain the retired close-events phase"
+        );
+        assert!(
+            pump.contains("run_inventory_reconcile_phase"),
+            "Pump region must keep inventory reconcile"
         );
         assert!(
             !pump.contains("list_terminal_subscriptions"),
@@ -865,7 +880,7 @@ mod tests {
         );
         assert!(
             !pump.contains("observe_session_lifecycle"),
-            "CloseEvents must not mutate lifecycle"
+            "Observe must not mutate lifecycle through the retired session API"
         );
     }
 

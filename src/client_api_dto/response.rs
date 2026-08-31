@@ -8,7 +8,7 @@ use botster_hub_client::{
     DaemonPackageUpdateStatus, DaemonPluginResourceCounters, DaemonPluginSurface, DaemonReadScreen,
     DaemonResolvedAppLaunch, DaemonResolvedSessionType, DaemonResponse, DaemonResponseKind,
     DaemonSession, DaemonSessionCleanup, DaemonSessionContext, DaemonSessionTypeEditableDefinition,
-    DaemonSpawnTargetValidation, DaemonUiTreeSnapshot,
+    DaemonSpawnTargetValidation, DaemonTerminalReservation, DaemonUiTreeSnapshot,
 };
 use botster_ui_contract::{UiActionResult, UiActionResultState};
 use serde_json::Value;
@@ -45,6 +45,7 @@ pub(crate) fn daemon_response_base(kind: DaemonResponseKind) -> DaemonResponse {
         read_screen: None,
         mode_flags: None,
         mode_gated_input: None,
+        terminal_reservation: None,
         capture_snapshot: None,
         spawn_targets: Vec::new(),
         spawn_target_validation: None,
@@ -133,6 +134,14 @@ pub(crate) fn daemon_events(events: Vec<DaemonEvent>) -> DaemonResponse {
     response
 }
 
+pub(crate) fn daemon_terminal_reservation(
+    reservation: DaemonTerminalReservation,
+) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::TerminalReservation);
+    response.terminal_reservation = Some(reservation);
+    response
+}
+
 pub(crate) fn daemon_read_screen(screen: HubClientReadScreen) -> DaemonResponse {
     let mut response = daemon_response_base(DaemonResponseKind::ReadScreen);
     response.read_screen = Some(DaemonReadScreen {
@@ -155,28 +164,6 @@ pub(crate) fn daemon_mode_flags(mode_flags: HubClientModeFlags) -> DaemonRespons
         mode_flags.application_cursor,
         mode_flags.mode_generation,
         mode_flags.mode_revision,
-    ));
-    response
-}
-
-pub(crate) fn daemon_mode_gated_input(
-    result: crate::HubClientModeGatedInputResult,
-) -> DaemonResponse {
-    let mut response = daemon_response_base(DaemonResponseKind::ModeGatedInput);
-    response.mode_gated_input = Some(botster_hub_client::DaemonModeGatedInputResult::new(
-        result.session_id.0,
-        result.admitted,
-        result.bytes_written,
-        result.kitty_enabled,
-        result.cursor_visible,
-        result.bracketed_paste,
-        result.mouse_mode,
-        result.alt_screen,
-        result.focus_reporting,
-        result.application_cursor,
-        result.mode_generation,
-        result.mode_revision,
-        result.error_kind,
     ));
     response
 }

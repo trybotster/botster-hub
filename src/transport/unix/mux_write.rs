@@ -9,8 +9,10 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader as Async
 
 use botster_hub_client::DaemonTransportError as ClientDaemonTransportError;
 use botster_hub_client::{
-    DaemonDiagnostic, DaemonOperatorError, DaemonResponse, DaemonResponseKind,
+    DaemonDiagnostic, DaemonOperatorError, DaemonRequest, DaemonResponse, DaemonResponseKind,
+    DaemonUnixTerminalEnvelope,
 };
+use serde_json::Value;
 
 use crate::admission::budgets::{
     DAEMON_CLIENT_WRITE_TIMEOUT, DAEMON_INCOMPLETE_FRAME_TIMEOUT, DAEMON_MAX_FRAME_BYTES,
@@ -424,6 +426,32 @@ where
         ));
     }
     serde_json::from_slice(&bytes).map_err(ClientDaemonTransportError::Json)
+}
+
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum UnixInbound {
+    Request(DaemonRequest),
+    Terminal(DaemonUnixTerminalEnvelope),
+}
+
+pub(crate) async fn read_async_inbound<R>(
+    reader: &mut AsyncBufReader<R>,
+    first_byte_timeout: Option<Duration>,
+) -> Result<UnixInbound, ClientDaemonTransportError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let value: Value = read_async_frame(reader, first_byte_timeout).await?;
+    if value.get("plane").and_then(Value::as_str) == Some(botster_hub_client::UNIX_TERMINAL_PLANE)
+        && value.get("kind").and_then(Value::as_str) == Some(botster_hub_client::UNIX_TERMINAL_KIND)
+    {
+        return serde_json::from_value(value)
+            .map(UnixInbound::Terminal)
+            .map_err(ClientDaemonTransportError::Json);
+    }
+    serde_json::from_value(value)
+        .map(UnixInbound::Request)
+        .map_err(ClientDaemonTransportError::Json)
 }
 
 pub(crate) async fn write_async_frame<T>(

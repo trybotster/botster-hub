@@ -210,9 +210,6 @@ const FAMILY_OWNERS: &[(&str, &str, &[&str])] = &[
             "Spawn",
             "Attach",
             "Detach",
-            "SendInput",
-            "ModeGatedInput",
-            "Resize",
             "ShutdownSession",
             "Drain",
             "ReadScreen",
@@ -459,6 +456,8 @@ const CONTROL_MESSAGE_OWNERS: &[(&str, &[&str])] = &[
             "RejectedConnection",
             "RegisterUnixAdmission",
             "RegisterWebrtcAdmission",
+            "InspectTerminalReservation",
+            "BindReservedTerminal",
         ],
     ),
     (
@@ -569,10 +568,19 @@ fn duplicating_a_variant_into_the_wrong_owner_fails_the_matrix() {
     let plugins = hub_source("src/daemon/control/plugins.rs");
     let host = hub_source("src/daemon/control/host.rs");
     assert!(
-        sessions.contains("DaemonRequest::SendInput")
-            && !plugins.contains("DaemonRequest::SendInput"),
-        "SendInput must not be duplicated into plugins.rs"
+        sessions.contains("DaemonRequest::Attach") && !plugins.contains("DaemonRequest::Attach"),
+        "Attach must not be duplicated into plugins.rs"
     );
+    for deleted in [
+        "DaemonRequest::SendInput",
+        "DaemonRequest::ModeGatedInput",
+        "DaemonRequest::Resize",
+    ] {
+        assert!(
+            !sessions.contains(deleted) && !plugins.contains(deleted) && !host.contains(deleted),
+            "{deleted} must not remain a JSON control request"
+        );
+    }
     assert!(
         host.contains("DaemonRequest::CheckHubUpdate")
             && !sessions.contains("DaemonRequest::CheckHubUpdate"),
