@@ -3617,6 +3617,69 @@ fn shutdown_after_observed_exit_returns_session_cleanup() {
     shutdown_cli_daemon(&data_dir, child);
 }
 
+#[test]
+fn final_cleanup_accepts_already_exited_without_altering_sibling() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("final-cleanup-already-exited");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("test config has local socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: "final-cleanup-exited".to_string(),
+            command: "sleep 0.1".to_string(),
+        },
+    )
+    .expect("spawn short-lived cleanup session");
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: "final-cleanup-sibling".to_string(),
+            command: "sleep 8".to_string(),
+        },
+    )
+    .expect("spawn cleanup sibling");
+    wait_for_authoritative_session_exit(&endpoint, "final-cleanup-exited");
+
+    let sibling_before = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::ListSessions,
+    )
+    .expect("list sessions before final cleanup")
+    .sessions
+    .into_iter()
+    .find(|session| session.session_id == "final-cleanup-sibling")
+    .expect("sibling before final cleanup");
+
+    production_shutdown_and_remove_session(&endpoint, "final-cleanup-exited");
+
+    let sibling_after = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::ListSessions,
+    )
+    .expect("list sessions after final cleanup")
+    .sessions
+    .into_iter()
+    .find(|session| session.session_id == "final-cleanup-sibling")
+    .expect("sibling after final cleanup");
+    assert_eq!(
+        sibling_after, sibling_before,
+        "final cleanup for an already exited session must not alter its sibling"
+    );
+
+    production_shutdown_and_remove_session(&endpoint, "final-cleanup-sibling");
+    shutdown_cli_daemon(&data_dir, child);
+}
+
 /// Live ShutdownSession Runtime/State failure must not sacrifice the daemon,
 /// the reused control connection, or a sibling session adapter.
 ///

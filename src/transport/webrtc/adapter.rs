@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use botster_core::contract::terminal_adapter::{
-    TerminalAdapter, TerminalAdapterPressure, TerminalAdapterWriteError,
+    TerminalAdapter, TerminalAdapterPressure, TerminalAdapterWriteError, TerminalIngress,
 };
 use botster_hub_client::DaemonEvent;
 use botster_terminal_protocol::TerminalFrame;
@@ -74,6 +74,10 @@ impl WebRtcTerminalAdapterInner {
 
     fn try_write(&self, frame: &TerminalFrame) -> Result<(), TerminalAdapterWriteError> {
         self.slot.try_write(frame)
+    }
+
+    fn try_read(&self) -> TerminalIngress {
+        self.slot.try_read()
     }
 
     fn snapshot_active(&self) -> Option<Vec<u8>> {
@@ -153,6 +157,10 @@ impl TerminalAdapter for WebRtcTerminalAdapter {
 
     fn pressure(&self) -> TerminalAdapterPressure {
         self.inner.pressure()
+    }
+
+    fn try_read(&mut self) -> TerminalIngress {
+        self.inner.try_read()
     }
 }
 
@@ -398,6 +406,21 @@ impl WebRtcTerminalAdapterHandle {
         self.inner.complete_active()
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn push_ingress_frame(&self, bytes: Vec<u8>) {
+        self.inner.slot.push_ingress_frame(bytes);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn mark_ingress_lost(&self) {
+        self.inner.slot.mark_ingress_lost();
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn drop_newest_ingress_frame(&self) {
+        self.inner.slot.drop_newest_ingress_frame();
+    }
+
     pub(crate) fn write_opaque_frame(&self, frame: &TerminalFrame) {
         let _ = self.inner.try_write(frame);
     }
@@ -427,6 +450,7 @@ mod tests {
         adapter: WebRtcTerminalAdapter,
         handle: WebRtcTerminalAdapterHandle,
         delivered: Vec<Vec<u8>>,
+        partial: Option<Vec<u8>>,
     }
 
     impl Default for WebRtcTerminalAdapterDriver {
@@ -436,6 +460,7 @@ mod tests {
                 adapter,
                 handle,
                 delivered: Vec::new(),
+                partial: None,
             }
         }
     }
@@ -467,6 +492,24 @@ mod tests {
 
         fn delivered_frame_bytes(&self) -> &[Vec<u8>] {
             &self.delivered
+        }
+
+        fn inject_ingress_frame(&mut self, bytes: Vec<u8>) {
+            self.handle.push_ingress_frame(bytes);
+        }
+
+        fn inject_ingress_partial(&mut self, bytes: Vec<u8>) {
+            self.partial = Some(bytes);
+        }
+
+        fn complete_ingress_partial(&mut self) {
+            if let Some(bytes) = self.partial.take() {
+                self.handle.push_ingress_frame(bytes);
+            }
+        }
+
+        fn drop_buffered_ingress_frame(&mut self) {
+            self.handle.drop_newest_ingress_frame();
         }
     }
 

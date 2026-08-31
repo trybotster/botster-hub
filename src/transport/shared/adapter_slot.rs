@@ -1,9 +1,11 @@
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, TryLockError};
 
 use botster_core::contract::terminal_adapter::{
-    TerminalAdapterPressure, TerminalAdapterWriteError,
+    MIN_ADAPTER_INGRESS_BUFFER_FRAMES, TerminalAdapterPressure, TerminalAdapterWriteError,
+    TerminalIngress,
 };
 use botster_terminal_protocol::TerminalFrame;
 
@@ -15,6 +17,8 @@ pub(crate) struct AdapterSlot<W: WakeSink> {
     cause: CloseCause,
     would_block: AtomicBool,
     slot: Mutex<Option<Vec<u8>>>,
+    ingress: Mutex<VecDeque<Vec<u8>>>,
+    ingress_lost: AtomicBool,
     wake: W,
     close_work: Arc<AtomicBool>,
 }
@@ -25,6 +29,8 @@ impl<W: WakeSink> AdapterSlot<W> {
             cause: CloseCause::new(),
             would_block: AtomicBool::new(false),
             slot: Mutex::new(None),
+            ingress: Mutex::new(VecDeque::new()),
+            ingress_lost: AtomicBool::new(false),
             wake,
             close_work,
         }
@@ -54,6 +60,12 @@ impl<W: WakeSink> AdapterSlot<W> {
             Err(TryLockError::Poisoned(poisoned)) => {
                 *poisoned.into_inner() = None;
             }
+        }
+        self.ingress_lost.store(false, Ordering::SeqCst);
+        match self.ingress.try_lock() {
+            Ok(mut ingress) => ingress.clear(),
+            Err(TryLockError::WouldBlock) => {}
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner().clear(),
         }
         self.wake.wake();
     }
@@ -122,6 +134,86 @@ impl<W: WakeSink> AdapterSlot<W> {
         Ok(())
     }
 
+    pub(crate) fn try_read(&self) -> TerminalIngress {
+        if self.is_closed() {
+            return TerminalIngress::Closed;
+        }
+        if self.ingress_lost.swap(false, Ordering::SeqCst) {
+            return if self.is_closed() {
+                TerminalIngress::Closed
+            } else {
+                TerminalIngress::Lost
+            };
+        }
+        match self.ingress.try_lock() {
+            Ok(mut ingress) => {
+                if self.is_closed() {
+                    ingress.clear();
+                    TerminalIngress::Closed
+                } else {
+                    ingress
+                        .pop_front()
+                        .map_or(TerminalIngress::Empty, TerminalIngress::Frame)
+                }
+            }
+            Err(TryLockError::WouldBlock) => TerminalIngress::Empty,
+            Err(TryLockError::Poisoned(_)) => {
+                self.close();
+                TerminalIngress::Closed
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn push_ingress_frame(&self, bytes: Vec<u8>) {
+        if self.is_closed() {
+            return;
+        }
+        let mut ingress = match self.ingress.try_lock() {
+            Ok(ingress) => ingress,
+            Err(TryLockError::WouldBlock) => {
+                self.ingress_lost.store(true, Ordering::SeqCst);
+                return;
+            }
+            Err(TryLockError::Poisoned(_)) => {
+                self.close();
+                return;
+            }
+        };
+        if self.is_closed() {
+            ingress.clear();
+            return;
+        }
+        if ingress.len() >= MIN_ADAPTER_INGRESS_BUFFER_FRAMES {
+            self.ingress_lost.store(true, Ordering::SeqCst);
+            return;
+        }
+        ingress.push_back(bytes);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn mark_ingress_lost(&self) {
+        if !self.is_closed() {
+            self.ingress_lost.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn drop_newest_ingress_frame(&self) {
+        if self.is_closed() {
+            return;
+        }
+        match self.ingress.try_lock() {
+            Ok(mut ingress) => {
+                if !self.is_closed() && ingress.pop_back().is_some() {
+                    self.ingress_lost.store(true, Ordering::SeqCst);
+                }
+            }
+            Err(TryLockError::WouldBlock) => self.ingress_lost.store(true, Ordering::SeqCst),
+            Err(TryLockError::Poisoned(_)) => self.close(),
+        }
+    }
+
     pub(crate) fn snapshot_active(&self) -> Option<Vec<u8>> {
         if self.is_closed() {
             match self.slot.try_lock() {
@@ -161,5 +253,60 @@ impl<W: WakeSink> AdapterSlot<W> {
         };
         self.wake.wake();
         taken
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone)]
+    struct TestWake;
+
+    impl WakeSink for TestWake {
+        fn wake(&self) {}
+    }
+
+    fn new_slot() -> AdapterSlot<TestWake> {
+        AdapterSlot::with_wake_and_close_work(TestWake, Arc::new(AtomicBool::new(false)))
+    }
+
+    #[test]
+    fn ingress_precedence_is_closed_lost_frame_empty() {
+        let slot = new_slot();
+        assert_eq!(slot.try_read(), TerminalIngress::Empty);
+        slot.push_ingress_frame(b"keep".to_vec());
+        slot.push_ingress_frame(b"drop".to_vec());
+        slot.drop_newest_ingress_frame();
+        assert_eq!(slot.try_read(), TerminalIngress::Lost);
+        assert_eq!(slot.try_read(), TerminalIngress::Frame(b"keep".to_vec()));
+        assert_eq!(slot.try_read(), TerminalIngress::Empty);
+
+        slot.push_ingress_frame(b"discard".to_vec());
+        slot.mark_ingress_lost();
+        slot.close();
+        assert_eq!(slot.try_read(), TerminalIngress::Closed);
+        assert_eq!(slot.try_read(), TerminalIngress::Closed);
+    }
+
+    #[test]
+    fn ingress_capacity_floor_and_idle_reads_are_lossless() {
+        let slot = new_slot();
+        for index in 0..MIN_ADAPTER_INGRESS_BUFFER_FRAMES {
+            slot.push_ingress_frame(vec![index as u8]);
+        }
+        assert_eq!(slot.try_read(), TerminalIngress::Frame(vec![0]));
+
+        let overflow = new_slot();
+        for index in 0..=MIN_ADAPTER_INGRESS_BUFFER_FRAMES {
+            overflow.push_ingress_frame(vec![index as u8]);
+        }
+        assert_eq!(overflow.try_read(), TerminalIngress::Lost);
+        assert_eq!(overflow.try_read(), TerminalIngress::Frame(vec![0]));
+
+        let idle = new_slot();
+        for _ in 0..256 {
+            assert_eq!(idle.try_read(), TerminalIngress::Empty);
+        }
     }
 }
