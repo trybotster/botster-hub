@@ -320,7 +320,7 @@ neighbouring assertion at `src/runtime.rs:5447` already checks.
 ### 6.5 Sanctioned test-seam teardown proof
 
 Plan Review `finding_1788139424_468510` requires a live hard-stop and
-sibling-survival proof. Section 9 records why a Hub production-path version is
+sibling-survival proof. Section 9b records why a Hub production-path version is
 not achievable in this ticket. This is the strongest proof that is achievable,
 and the human approved it as option B in `question_1788139680_730932`.
 
@@ -515,7 +515,7 @@ route teardown.
 | `build.rs` panics because `PROTOCOL_REV` did not roll. | It is line 10 in the section 7 inventory, and the failure is loud at build time. |
 | Pinning an unmerged Core candidate leaves Hub `main` depending on a branch tip. | Section 5 merge-order constraint, restated in gate evidence and in the Implement and Verify reports. |
 | The Core candidate changes during review, so the Hub pin and the proof pair go stale. | The human instruction: stop both runs, update the pin, repeat the proof. Implement re-runs `git rev-parse` and the contract diff before pinning. |
-| A dead ingress buffer with no producer reads as unwired scaffolding. | Section 3 records the explicit human decision and names the owning ticket. Section 9 records the live Core call site that already exercises `try_read` in production. |
+| A dead ingress buffer with no producer reads as unwired scaffolding. | It **is** scaffolding, and the plan says so rather than dressing it up. Sections 3 and 9b record the approved scaffold-only scope. Acceptance check 13a proves the adapter and Core teardown behavior through the sanctioned test seam. `checklist_1788139722_173987` on `ticket_1787894427_525056` owns the true production proof through the wired Unix and WebRTC producers and the wake pump. |
 | Hub suite flake on a busy host produces a false red. | Run the locked gate on a quiet host, and compare any failure against `c674a62` at the old pin. |
 | The section 6.5 test is mistaken for a production-path proof, so the reachability gap is forgotten. | Section 9b states the limit, the test carries the same comment, the Implement report must repeat it, and `checklist_1788139722_173987` holds the obligation on `ticket_1787894427_525056`. |
 | Adding a `#[cfg(test)]` mux handle lookup tempts a widening of production visibility. | Keep the lookup `#[cfg(test)]` and keyed by the exact route triple. Do not make the `routes` map or the handles public. |
