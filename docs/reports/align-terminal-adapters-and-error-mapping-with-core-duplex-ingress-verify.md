@@ -146,7 +146,8 @@ so the guard was not weakened to let the new test compile.
 
 ## 9. Production path, stated exactly
 
-Live half. Hub reaches both new Core rejections in production.
+Live rejection path, separate from the class mapping. Hub reaches both new Core
+rejections in production.
 `CoreDaemon::attach` calls `ensure_control_plane_live` and can return
 `CoreDaemonError::ControlPlaneFailed`. `CoreDaemon::bind_terminal_adapter` and
 `CoreDaemon::bind_waking_terminal_adapter` can return
@@ -161,9 +162,9 @@ plugin-managed session path. `CoreDaemon::spawn` cannot return either new
 variant, because `ensure_control_plane_live` has one caller, `CoreDaemon::attach`,
 and `spawn` binds no adapter. So the two new arms complete an exhaustive match
 and keep the crate compiling, but no production path emits either new class
-string today. The plan sentence "Both new arms run on real rejections" and the
-report sentence "The live bind paths use these mappings" overstate this. The
-shipped behavior is correct and unchanged; only the two claims are imprecise.
+string today. Earlier plan and implementation report statements overstate this.
+Those artifacts now state the verified call-site limit. The shipped behavior is
+correct and unchanged.
 
 Scaffold half. The ingress buffer has no production producer.
 `push_ingress_frame`, `mark_ingress_lost`, and `drop_newest_ingress_frame` carry

@@ -469,7 +469,7 @@ path feeds Core teardown decisions.
 | `teardown_isolation` | Ingress state lives in one `AdapterSlot`, which is per subscription route and per generation. One route's loss or close cannot reach a sibling route, because the mux keys routes by `(session_id, subscription_id, generation)`. |
 | `teardown_bounds` | The queue holds at most `MIN_ADAPTER_INGRESS_BUFFER_FRAMES` frames. Overflow drops one frame and sets one flag. `try_read` does bounded constant work, never blocks, and never waits on the transport writer. Core reads at most `INTAKE_FRAMES_PER_SUBSCRIPTION_PER_TICK` frames per tick. No unbounded growth and no spin. |
 | `late_message_matrix` | See the expanded table below. It now covers the ownership-creating Attach and bind surface, which the first plan revision omitted. |
-| `production_path_proof` | **Corrected. Hub cannot reach `try_read` in production today.** See the dedicated subsection below. The error-mapping half is live; the ingress half is intentionally scaffold-only. |
+| `production_path_proof` | **Corrected. Hub cannot reach `try_read` in production today.** Neither new `ControlPlaneFailed` class string has a production path. Live bind rejection uses a separate fail-closed path. See the dedicated subsection below. |
 | `ownership_identity` | The adapter is owned by the Core-side bound route. The handle is owned by the Hub connection. Both point at the same `Arc<…Inner>`, so identity is the `Arc`, not a name lookup. Route identity in the mux stays `(session_id, subscription_id, generation)`. |
 | `sibling_fail_closed_policy` | Fail closed on doubt. A dropped or overflowed frame sets `ingress_lost`, which makes Core hard stop that one route rather than deliver a gap. A closed adapter reports `Closed` permanently and never returns to `Empty`. No sibling route is torn down by another route's loss. |
 
@@ -524,7 +524,7 @@ blur them:
 
 | Half | Production oracle | Status |
 | --- | --- | --- |
-| `ControlPlaneFailed` error mapping | `CoreDaemon::attach` calls `ensure_control_plane_live`; `bind_terminal_adapter` and `bind_waking_terminal_adapter` return `BindTerminalAdapterError::ControlPlaneFailed`. Hub reaches all three on the live Unix and WebRTC attach paths. | **Live.** Both new arms run on real rejections. |
+| `ControlPlaneFailed` match arms | `managed_session_core_error_class` has one production call site on `CoreDaemon::spawn` failure. `spawn` cannot return `CoreDaemonError::ControlPlaneFailed` or `BindTerminalAdapterError::ControlPlaneFailed`. Live Unix and WebRTC bind paths handle bind errors through the separate `fail_closed_pre_bind_attach` path. | **Exhaustive only.** The arms keep the match total, but no production path emits either new class string. |
 | Adapter ingress buffer and `try_read` | None in Hub today. `ticket_1787894427_525056` will supply it by wiring the producers and the wake pump. | **Intentionally scaffold-only**, by human decision `question_1788138575_832281` option 1 and `question_1788139680_730932` option B. |
 
 The ingress buffer must not be described as active production input in any

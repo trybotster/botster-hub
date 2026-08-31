@@ -54,7 +54,7 @@ The change rolls all Hub Core pins to the exact candidate revision. The dependen
 
 The Unix and WebRTC adapters implement `TerminalAdapter::try_read`. Their harness drivers implement all required ingress operations.
 
-The runtime maps both new `ControlPlaneFailed` variants to distinct error classes. The live bind paths use these mappings.
+The runtime maps both new `ControlPlaneFailed` variants to distinct error classes for exhaustive matching. `managed_session_core_error_class` has one production call site on `CoreDaemon::spawn` failure. `spawn` cannot return either variant. Live bind paths fail closed through a separate path and do not use these mappings.
 
 The route test uses the sanctioned test seam. It proves that ingress loss retires the exact route and preserves a sibling.
 
@@ -112,6 +112,10 @@ The implementation did not make an unapproved deviation.
 Human answer `question_1788142641_571879` replaced the stale red/green proof with green/green compatibility proof. The committed plan now records this change.
 
 Advisor answer `question_1788144097_297699` approved the narrow cleanup fixture change. The committed plan now records this change and acceptance check `13c`.
+
+## Merge-gate documentation correction
+
+The Verify report found an overstatement in the plan and this report. `managed_session_core_error_class` runs in production only after `CoreDaemon::spawn` fails. `spawn` cannot return either new `ControlPlaneFailed` variant. The new arms provide exhaustive mapping, but neither class string is production-reachable. Unix and WebRTC bind errors use a separate fail-closed path. This correction changes no production code.
 
 ## Review repair
 
@@ -181,7 +185,7 @@ The Core branch tip still resolved to `a781556258789dea4a50ffcb17351e7294c8ff26`
 - Late messages: A closed slot discards buffered and new ingress. A retired generation cannot feed a replacement generation.
 - Ownership identity: Core owns the bound route. The Hub handle and Core adapter share one `Arc`.
 - Fail-closed policy: A loss hard-stops only the exact route. A closed adapter always reports `Closed`.
-- Production path: The error mapping is live. The ingress buffer is scaffold-only in Hub production.
+- Production path: Neither new error class string is production-reachable. Live bind errors use a separate fail-closed path. The ingress buffer is scaffold-only in Hub production.
 
 Hub production does not call `pump_woken` or `drain`. The route test uses a test-only drain seam. It does not prove production reachability.
 
