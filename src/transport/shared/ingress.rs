@@ -5,8 +5,8 @@
 //! frames and makes later reads permanently closed.
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, TryLockError};
 
 use botster_core::contract::terminal_adapter::{
     MIN_ADAPTER_INGRESS_BUFFER_FRAMES, TerminalIngress,
@@ -32,11 +32,15 @@ impl IngressBuffer {
     }
 
     pub(crate) fn clear(&self) {
-        if let Ok(mut frames) = self.frames.lock() {
-            frames.clear();
+        match self.frames.try_lock() {
+            Ok(mut frames) => frames.clear(),
+            Err(TryLockError::WouldBlock) => {}
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner().clear(),
         }
-        if let Ok(mut partial) = self.partial.lock() {
-            *partial = None;
+        match self.partial.try_lock() {
+            Ok(mut partial) => *partial = None,
+            Err(TryLockError::WouldBlock) => {}
+            Err(TryLockError::Poisoned(poisoned)) => *poisoned.into_inner() = None,
         }
         self.lost.store(false, Ordering::SeqCst);
         self.lost_reported.store(false, Ordering::SeqCst);
@@ -47,24 +51,58 @@ impl IngressBuffer {
     /// Returns `Err(())` when the header is malformed so the caller can close
     /// the route. Returns `Ok(true)` when a complete frame was stored or loss
     /// was latched, so Core should receive a writable wake.
-    pub(crate) fn push_complete(&self, bytes: Vec<u8>) -> Result<bool, ()> {
+    pub(crate) fn push_complete(
+        &self,
+        bytes: Vec<u8>,
+        is_closed: impl Fn() -> bool,
+    ) -> Result<bool, ()> {
         if TerminalInputFrame::from_bytes(&bytes).is_err() {
             return Err(());
         }
-        Ok(self.store_complete(bytes))
+        Ok(self.store_complete(bytes, is_closed))
     }
 
-    pub(crate) fn store_complete(&self, bytes: Vec<u8>) -> bool {
-        let Ok(mut frames) = self.frames.lock() else {
-            self.lost.store(true, Ordering::SeqCst);
-            return true;
-        };
-        if frames.len() >= MIN_ADAPTER_INGRESS_BUFFER_FRAMES {
-            self.lost.store(true, Ordering::SeqCst);
-            return true;
+    pub(crate) fn store_complete(&self, bytes: Vec<u8>, is_closed: impl Fn() -> bool) -> bool {
+        self.store_complete_after_admission(bytes, is_closed, || {})
+    }
+
+    fn store_complete_after_admission(
+        &self,
+        bytes: Vec<u8>,
+        is_closed: impl Fn() -> bool,
+        admitted: impl FnOnce(),
+    ) -> bool {
+        if is_closed() {
+            return false;
         }
-        frames.push_back(bytes);
-        true
+        let mut frames = match self.frames.try_lock() {
+            Ok(frames) => frames,
+            Err(TryLockError::WouldBlock) => {
+                if !is_closed() {
+                    self.lost.store(true, Ordering::SeqCst);
+                }
+                return !is_closed();
+            }
+            Err(TryLockError::Poisoned(_)) => return false,
+        };
+        if is_closed() {
+            frames.clear();
+            return false;
+        }
+        admitted();
+        let stored = if frames.len() >= MIN_ADAPTER_INGRESS_BUFFER_FRAMES {
+            self.lost.store(true, Ordering::SeqCst);
+            false
+        } else {
+            frames.push_back(bytes);
+            true
+        };
+        drop(frames);
+        if is_closed() {
+            self.clear();
+            return false;
+        }
+        stored || self.lost.load(Ordering::SeqCst)
     }
 
     #[allow(dead_code)]
@@ -75,13 +113,13 @@ impl IngressBuffer {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn complete_partial(&self) -> bool {
+    pub(crate) fn complete_partial(&self, is_closed: impl Fn() -> bool) -> bool {
         let bytes = match self.partial.lock() {
             Ok(mut partial) => partial.take(),
             Err(_) => None,
         };
         match bytes {
-            Some(bytes) => self.store_complete(bytes),
+            Some(bytes) => self.store_complete(bytes, is_closed),
             None => false,
         }
     }
@@ -96,6 +134,12 @@ impl IngressBuffer {
             self.lost.store(true, Ordering::SeqCst);
         }
         dropped
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_lost(&self) {
+        self.lost.store(true, Ordering::SeqCst);
+        self.lost_reported.store(false, Ordering::SeqCst);
     }
 
     pub(crate) fn try_read(&self, closed: bool) -> TerminalIngress {
@@ -118,6 +162,9 @@ impl IngressBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::Barrier;
+    use std::thread;
 
     fn input_frame(data: &[u8]) -> Vec<u8> {
         let mut bytes = vec![1, 1, 0, 0];
@@ -130,7 +177,7 @@ mod tests {
     #[test]
     fn malformed_header_is_rejected_without_buffering() {
         let buffer = IngressBuffer::new();
-        assert_eq!(buffer.push_complete(vec![0, 1, 0, 1, 1]), Err(()));
+        assert_eq!(buffer.push_complete(vec![0, 1, 0, 1, 1], || false), Err(()));
         assert_eq!(buffer.try_read(false), TerminalIngress::Empty);
     }
 
@@ -138,9 +185,15 @@ mod tests {
     fn overflow_latches_lost_once() {
         let buffer = IngressBuffer::new();
         for index in 0..MIN_ADAPTER_INGRESS_BUFFER_FRAMES {
-            assert_eq!(buffer.push_complete(input_frame(&[index as u8])), Ok(true));
+            assert_eq!(
+                buffer.push_complete(input_frame(&[index as u8]), || false),
+                Ok(true)
+            );
         }
-        assert_eq!(buffer.push_complete(input_frame(&[0xff])), Ok(true));
+        assert_eq!(
+            buffer.push_complete(input_frame(&[0xff]), || false),
+            Ok(true)
+        );
         assert_eq!(buffer.try_read(false), TerminalIngress::Lost);
         assert_eq!(
             buffer.try_read(false),
@@ -151,9 +204,49 @@ mod tests {
     #[test]
     fn close_makes_later_reads_closed() {
         let buffer = IngressBuffer::new();
-        assert_eq!(buffer.push_complete(input_frame(b"x")), Ok(true));
+        assert_eq!(buffer.push_complete(input_frame(b"x"), || false), Ok(true));
         buffer.clear();
         assert_eq!(buffer.try_read(true), TerminalIngress::Closed);
         assert_eq!(buffer.try_read(true), TerminalIngress::Closed);
+    }
+
+    #[test]
+    fn close_discards_ingress_in_both_queue_orders() {
+        let closed = AtomicBool::new(true);
+        let close_first = IngressBuffer::new();
+        assert!(
+            !close_first.store_complete(input_frame(b"after-close"), || {
+                closed.load(Ordering::SeqCst)
+            })
+        );
+
+        let buffer = Arc::new(IngressBuffer::new());
+        let closed = Arc::new(AtomicBool::new(false));
+        let admitted = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let producer_buffer = Arc::clone(&buffer);
+        let producer_closed = Arc::clone(&closed);
+        let producer_admitted = Arc::clone(&admitted);
+        let producer_release = Arc::clone(&release);
+        let producer = thread::spawn(move || {
+            producer_buffer.store_complete_after_admission(
+                input_frame(b"racing-close"),
+                || producer_closed.load(Ordering::SeqCst),
+                || {
+                    producer_admitted.wait();
+                    producer_release.wait();
+                },
+            );
+        });
+
+        admitted.wait();
+        closed.store(true, Ordering::SeqCst);
+        buffer.clear();
+        release.wait();
+        producer.join().expect("producer thread");
+
+        assert_eq!(buffer.try_read(true), TerminalIngress::Closed);
+        assert!(buffer.frames.lock().expect("frames lock").is_empty());
+        assert!(!buffer.lost.load(Ordering::SeqCst));
     }
 }

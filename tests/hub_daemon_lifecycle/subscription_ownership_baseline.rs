@@ -554,7 +554,11 @@ fn terminal_adapter_contract_is_duplex_at_the_locked_core_pin() {
             botster_core::contract::terminal_adapter::TerminalIngress::Empty
         }
     }
-    let _adapter = Duplex;
+    let mut adapter = Duplex;
+    assert_eq!(
+        botster_core::contract::terminal_adapter::TerminalAdapter::try_read(&mut adapter),
+        botster_core::contract::terminal_adapter::TerminalIngress::Empty
+    );
     let lock = hub_source("Cargo.lock");
     assert!(
         lock.contains(LOCKED_CORE_REV),

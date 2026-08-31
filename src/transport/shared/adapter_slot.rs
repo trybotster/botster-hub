@@ -190,7 +190,7 @@ impl<W: WakeSink> AdapterSlot<W> {
         if self.is_closed() {
             return Ok(());
         }
-        match self.ingress.push_complete(bytes) {
+        match self.ingress.push_complete(bytes, || self.is_closed()) {
             Ok(true) => {
                 self.emit_writable();
                 Ok(())
@@ -203,12 +203,20 @@ impl<W: WakeSink> AdapterSlot<W> {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn mark_ingress_lost(&self) {
+        if !self.is_closed() {
+            self.ingress.mark_lost();
+            self.emit_writable();
+        }
+    }
+
     #[allow(dead_code)]
     pub(crate) fn inject_ingress_frame(&self, bytes: Vec<u8>) {
         if self.is_closed() {
             return;
         }
-        if self.ingress.store_complete(bytes) {
+        if self.ingress.store_complete(bytes, || self.is_closed()) {
             self.emit_writable();
         }
     }
@@ -226,7 +234,7 @@ impl<W: WakeSink> AdapterSlot<W> {
         if self.is_closed() {
             return;
         }
-        if self.ingress.complete_partial() {
+        if self.ingress.complete_partial(|| self.is_closed()) {
             self.emit_writable();
         }
     }
