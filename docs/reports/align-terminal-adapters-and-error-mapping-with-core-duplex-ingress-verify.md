@@ -195,10 +195,6 @@ production proof obligation.
 - The adapter ingress half stays unreachable until `ticket_1787894427_525056`
   wires the producers and the wake pump. A wrong `Lost` becomes a live route
   teardown on the day that lands.
-- The two imprecise reachability sentences in section 9 could mislead the
-  cold-cut ticket into assuming the error-class strings already appear in
-  production diagnostics.
-
 ## 12. Vault gaps worth capturing
 
 1. Hub adapter `try_read` precedence is `Closed`, `Lost`, `Frame`, `Empty`, and
