@@ -14,7 +14,7 @@ Base ref: `main` at `c674a62`
 | Repository path | `/Users/jasonconigliari/Projects/botster-hub` |
 | Repository playbook | [[botster-hub-playbook]] |
 | Current Core pin | `7eafa470a18025895995bbedc20d34b58106a03b` |
-| New Core pin | `d47ede0` (exact 40-character SHA resolved at Implement time) |
+| New Core pin | `a781556258789dea4a50ffcb17351e7294c8ff26` |
 
 Repository routing came from the ticket `target_id`, resolved through
 `list_spawn_targets`. The process working directory was not used to select the
@@ -40,6 +40,21 @@ repository.
 - [[colon worktree paths break cargo dyld library paths]] — worktree hygiene.
 - [[pipeline vault checklists must cite exact resolvable note titles]] — note
   identity discipline for gate evidence.
+- [[botster-architecture]] — Botster domain map and source of architectural truth.
+- [[cli-patterns]] — Rust CLI, TUI, PTY, and terminal-layer constraints.
+- [[project-pipelines-playbook]] — loaded because a registered cross-repository
+  dependency governs this seam. See section 5.
+- [[each acceptance condition names its authoritative production oracle]] — every
+  acceptance proof names its production owner and API. This is the note that
+  forced the section 9 correction.
+- [[dependency closure must requeue the blocked parent step]] — closing this Hub
+  ticket resumes the blocked Core ticket.
+- [[core owns duplex terminal transport while Hub stays content blind]] — the
+  ratified decision that extends the adapter contract to ingress and retires
+  `mode_gated_input` as a Hub JSON-RPC request.
+- [[core terminal progress is wake driven and targeted]] — Core advances only
+  subscriptions named by adapter or ingress wakes, which is the pump Hub does
+  not yet drive.
 
 The runtime-teardown lens note was considered and is answered in section 9.
 
@@ -56,7 +71,7 @@ The runtime-teardown lens note was considered and is answered in section 9.
 - `test.sh`.
 - Prior art: `docs/plans/roll-core-pin-after-incremental-attach-local-runtime-gate.md`,
   which holds the authoritative Core pin-roll literal inventory and its guard test.
-- Core source at revisions `7eafa470`, `3672c667`, and `d47ede0`.
+- Core source at revisions `7eafa470`, `3672c667`, and `a781556`.
 
 ## 2. Problem, established by compile and test evidence
 
@@ -86,8 +101,8 @@ Plan-time evidence, produced in this worktree and then reverted to a clean tree.
    "cargo metadata did not include botster-terminal-protocol at rev …" unless
    its `PROTOCOL_REV` constant rolls with the manifests.
 4. The Core adapter contract, the conformance harness, and the daemon error
-   enums are byte-identical between `3672c667` and `d47ede0`.
-   `git diff 3672c667 d47ede0` over `crates/botster-core/src/contract/`,
+   enums are byte-identical between `3672c667` and `a781556`.
+   `git diff 3672c667 a781556` over `crates/botster-core/src/contract/`,
    `crates/botster-core-test-support/src/terminal_adapter/`, and
    `crates/botster-core-daemon/src/daemon.rs` is empty. The alignment work in
    this ticket is therefore identical for both revisions.
@@ -98,23 +113,36 @@ Plan-time evidence, produced in this worktree and then reverted to a clean tree.
 
 ## 3. Product decisions taken by the human
 
-Question `question_1788138575_832281`, answered before this plan was written.
+Two answered questions govern this plan: `question_1788138575_832281` and
+`question_1788139680_730932`. The second was asked after Plan Review
+`review_1788139424_854213` returned changes required.
+
+**From `question_1788139680_730932` (second visit, supersedes where they differ):**
 
 | Decision | Value |
 | --- | --- |
-| Core pin | Option C. Pin every Hub Core site and lock source to the exact candidate `d47ede0`. |
+| Core pin value | The pin moves from `d47ede0` to the current frozen candidate `a781556258789dea4a50ffcb17351e7294c8ff26`. |
+| Ingress proof | Option B. Add the strongest sanctioned test-seam proof in this ticket. State plainly that it does not prove Hub production reachability. Do not describe the ingress buffer as active production input. |
+| Production proof owner | `ticket_1787894427_525056` must prove a real Hub wake pump reaches `try_read` through the wired Unix and WebRTC producers, retires only the lost route, and preserves the sibling. Recorded as checklist `checklist_1788139722_173987`, items `check_1788139727_933838` and `check_1788139731_744972`. |
+| Scope guard | Do not expand this alignment ticket into the wake pump or the transport cutover. |
+
+**From `question_1788138575_832281` (first visit, still in force):**
+
+| Decision | Value |
+| --- | --- |
+| Core pin strategy | Option C. Pin every Hub Core site and lock source to the exact candidate `a781556`. |
 | Red main | Not allowed. Do not merge a red Hub `main`. |
 | Reproduction test | Do not mark it `#[ignore]`. |
-| Downstream proof | Run the reproduction against both `3672c667` and `d47ede0` and record the fail/pass pair. |
-| Candidate stability | The Core run must merge `d47ede0` unchanged. If Core Review changes the candidate, stop both runs, update the Hub pin, and repeat the proof. |
-| After Core merge | The exact pin stays valid once `main` contains `d47ede0`. Do not create a no-op re-pin. |
+| Downstream proof | Run the reproduction against both `3672c667` and `a781556` and record the fail/pass pair. |
+| Candidate stability | The Core run must merge `a781556` unchanged. If Core Review changes the candidate, stop both runs, update the Hub pin, and repeat the proof. |
+| After Core merge | The exact pin stays valid once `main` contains `a781556`. Do not create a no-op re-pin. |
 | Adapter ingress | Option 1. Add the conformance-complete bounded ingress buffer and the required harness methods. Do not wire Unix or WebRTC producers here. |
 | Production duplex cutover | Owned by the active Hub cold-cut ticket `ticket_1787894427_525056`. Do not build a second competing implementation, and do not retain the control-plane terminal route in the final cold cut. |
 
 ## 4. Scope
 
 1. Roll every Core revision literal and lock source from `7eafa470` to
-   `d47ede0`. The inventory is in section 7.
+   `a781556`. The inventory is in section 7.
 2. Add a bounded ingress buffer to the shared adapter slot, and implement
    `TerminalAdapter::try_read` on `UnixTerminalAdapter` and
    `WebRtcTerminalAdapter` against it.
@@ -127,8 +155,12 @@ Question `question_1788138575_832281`, answered before this plan was written.
    `BindTerminalAdapterError::ControlPlaneFailed` arms to
    `managed_session_core_error_class` in `src/runtime.rs`, with distinct class
    strings and unit coverage.
-6. Produce the downstream reproduction proof pair against `3672c667` and
-   `d47ede0`.
+6. Add the sanctioned test-seam teardown proof described in section 6.5: two
+   sibling routes through the real Hub attach and bind path, ingress loss on one
+   route, the real Core hard-stop path, exact route retirement, and sibling
+   survival.
+7. Produce the downstream reproduction proof pair against `3672c667` and
+   `a781556`.
 
 ### Non-scope
 
@@ -160,21 +192,42 @@ Question `question_1788138575_832281`, answered before this plan was written.
 
 ### Cross-repository merge-order constraint
 
-`botster-hub` will pin `d47ede0`, which is the unmerged tip of Core branch
+`botster-hub` will pin `a781556`, which is the unmerged tip of Core branch
 `project-pipelines/ticket_1788128130_441301` and a descendant of Core `main` at
 `3672c667`. The constraint is:
 
-1. Hub merges first, pinned at `d47ede0`.
-2. The Core run for `ticket_1788128130_441301` then merges `d47ede0` unchanged
+1. Hub merges first, pinned at `a781556`.
+2. The Core run for `ticket_1788128130_441301` then merges `a781556` unchanged
    to Core `main`.
 3. If Core Review changes the candidate, both runs stop, the Hub pin moves to
    the new candidate, and the proof pair is repeated.
 
-I did not register a Project Pipelines blocking dependency on
-`ticket_1788128130_441301`. A blocking dependency states that this ticket cannot
-start until the Core ticket closes, which is the opposite of the required order
-and of the human's explicit instruction. The constraint is recorded here and in
-gate evidence instead. Implement and Verify must restate it in their reports.
+The correct dependency edge is already registered, in the correct direction, and
+I confirmed it with `project_pipelines_list_ticket_dependencies`:
+
+| Field | Value |
+| --- | --- |
+| Dependency id | `dependency_1788137138_804385` |
+| Dependent ticket | `ticket_1788128130_441301` (Core) |
+| Depends on | `ticket_1788137128_417142` (this Hub ticket) |
+| Dependency repository target | `botster-core`, `tgt_1f7bce66eb304881980f9b4a2a5ae3fe` |
+| Direction | Core waits on Hub, which matches the required merge order |
+
+I added no second dependency in the reverse direction. An edge from this Hub
+ticket onto the Core ticket would state that Hub cannot start until Core closes,
+which inverts the order above and would deadlock the pair against the existing
+edge. My first plan revision said no dependency was registered at all. That was
+wrong: `dependency_1788137138_804385` already existed, and Plan Review
+`finding_1788139424_837637` correctly caught the omission.
+
+Because a cross-repository Project Pipelines dependency governs this seam,
+[[project-pipelines-playbook]] is in scope and is loaded. Two of its notes apply
+directly: [[each acceptance condition names its authoritative production oracle]]
+drives the honest production-oracle statement in section 9, and
+[[dependency closure must requeue the blocked parent step]] means the Core
+ticket resumes once this Hub ticket closes.
+
+Implement and Verify must restate the merge-order constraint in their reports.
 
 ## 6. Design
 
@@ -264,11 +317,50 @@ Core rejections: a control-plane call refused on a failed session, and a bind
 refused on a failed session. Keep the existing no-slash invariant that the
 neighbouring assertion at `src/runtime.rs:5447` already checks.
 
-## 7. Affected surfaces and files
+### 6.5 Sanctioned test-seam teardown proof
+
+Plan Review `finding_1788139424_468510` requires a live hard-stop and
+sibling-survival proof. Section 9 records why a Hub production-path version is
+not achievable in this ticket. This is the strongest proof that is achievable,
+and the human approved it as option B in `question_1788139680_730932`.
+
+Add one in-crate test beside the existing attach-route tests in
+`src/subscription/attach_routes.rs`, so it can reach the `pub(crate)` handles and
+the `#[cfg(test)]` drain seam. The test:
+
+1. Starts an isolated Hub and spawns one session.
+2. Drives the **real** Hub attach and bind path twice, for two sibling
+   subscriptions on that one session, so both routes are bound through
+   production code and both handles are registered in the mux.
+3. Calls `mark_ingress_lost` on exactly one route's registered handle.
+4. Calls the sanctioned `#[cfg(test)]` `HubRuntime::drain_runtime_once` seam.
+   That runs **real Core code**: `CoreDaemon::drain`, `apply_terminal_input`,
+   `ClientWorker::intake_terminal_input`, `adapter.try_read`, the
+   `TerminalIngress::Lost` arm, and `hard_stop_key`.
+5. Asserts that Core retired exactly the lost `(session_id, subscription_id,
+   generation)` route.
+6. Asserts that the sibling route on the same session is still live and still
+   accepts terminal output.
+
+The test must carry a comment, and the Implement report must carry a sentence,
+stating this exact limit: the driver is the Hub test seam, not a Hub production
+loop, so the test proves Core's teardown behavior and Hub's adapter behavior, but
+it does not prove Hub production reachability. The production-path obligation
+lives on `ticket_1787894427_525056`.
+
+Two mechanics to settle during Implement:
+
+- The mux stores handles in a private `routes` map. Add a small `#[cfg(test)]`
+  lookup by `(session_id, subscription_id, generation)` rather than keeping a
+  side copy of the handle, so the test reads the handle the production bind path
+  actually registered.
+- `src/lib.rs:917` guards production paths against calling `drain_runtime_once(`.
+  Confirm the guard's scanned file set still excludes `#[cfg(test)]` modules, and
+  do not weaken the guard to make the test compile.
 
 ### Core revision literal sites
 
-All change `7eafa470a18025895995bbedc20d34b58106a03b` to `d47ede0…`.
+All change `7eafa470a18025895995bbedc20d34b58106a03b` to `a781556258789dea4a50ffcb17351e7294c8ff26`.
 
 | File | Line(s) | Purpose |
 | --- | --- | --- |
@@ -304,10 +396,12 @@ must not be edited.
 
 Assumptions:
 
-- `d47ede0` stays the Core candidate tip. Implement resolves and records the full
-  40-character SHA with `git rev-parse` before editing any literal, and refuses
-  to pin a different revision without a new human answer.
-- The Core adapter contract stays identical between `3672c667` and `d47ede0`.
+- `a781556258789dea4a50ffcb17351e7294c8ff26` is the current frozen Core
+  candidate, confirmed by `git ls-remote` at plan time. It replaced `d47ede0`
+  during this Plan step, so treat candidate movement as likely, not theoretical.
+  Implement re-runs `git ls-remote` immediately before editing any literal and
+  refuses to pin a different revision without a new human answer.
+- The Core adapter contract stays identical between `3672c667` and `a781556`.
   Verified at plan time by an empty diff over the three contract paths. Implement
   re-checks after any candidate change.
 - The existing guard test `git_visible_hub_members_share_one_exact_core_revision`
@@ -323,8 +417,8 @@ Unknowns for Implement and Verify:
   Any failure needs isolation plus a base comparison at `c674a62` with the old
   pin, with exact evidence. A pre-existing failure is not an excuse without that
   comparison.
-- Whether the `d47ede0` Core fix changes any other Hub-visible behavior beyond
-  the reproduction. The `3672c667`-to-`d47ede0` diff touches
+- Whether the `a781556` Core fix changes any other Hub-visible behavior beyond
+  the reproduction. The `3672c667`-to-`a781556` diff touches
   `client_worker.rs`, `managed_session_runtime.rs`, `control_queue.rs`,
   `runtime/mod.rs`, and `worker_process.rs`. The full Hub suite at the new pin is
   the check.
@@ -341,10 +435,75 @@ path feeds Core teardown decisions.
 | `teardown_class_applies` | Yes. The ticket changes bound-adapter ingress, and `TerminalIngress::Lost` drives a Core hard stop in `ClientWorker::intake_terminal_input_keys`. |
 | `teardown_isolation` | Ingress state lives in one `AdapterSlot`, which is per subscription route and per generation. One route's loss or close cannot reach a sibling route, because the mux keys routes by `(session_id, subscription_id, generation)`. |
 | `teardown_bounds` | The queue holds at most `MIN_ADAPTER_INGRESS_BUFFER_FRAMES` frames. Overflow drops one frame and sets one flag. `try_read` does bounded constant work, never blocks, and never waits on the transport writer. Core reads at most `INTAKE_FRAMES_PER_SUBSCRIPTION_PER_TICK` frames per tick. No unbounded growth and no spin. |
-| `late_message_matrix` | Push after local `close`: dropped, and `try_read` stays `Closed`. Push after transport-side close: dropped, `try_read` stays `Closed`. `try_read` after close with frames buffered: `Closed`, buffered ingress discarded. `try_read` after close with a pending loss: `Closed`, because closed outranks loss. Loss marked then close: `Closed`. Read on a fresh adapter: `Empty`. Read on a drained adapter: `Empty`, never a spurious `Lost`. |
-| `production_path_proof` | Core calls `TerminalAdapter::try_read` on every bound Hub adapter during wake intake at `crates/botster-core/src/engine/client_worker.rs:771`. Hub binds adapters on the live Unix and WebRTC attach paths, so the new method runs in production on every bound route, not only in tests. The error mapping is also live: `CoreDaemon::attach` calls `ensure_control_plane_live`, and both `bind_terminal_adapter` and `bind_waking_terminal_adapter` return `BindTerminalAdapterError::ControlPlaneFailed`, so Hub's `managed_session_core_error_class` receives both new variants on real rejections. The ingress producer is intentionally absent in this ticket, by the human decision in section 3, and `ticket_1787894427_525056` owns it. |
+| `late_message_matrix` | See the expanded table below. It now covers the ownership-creating Attach and bind surface, which the first plan revision omitted. |
+| `production_path_proof` | **Corrected. Hub cannot reach `try_read` in production today.** See the dedicated subsection below. The error-mapping half is live; the ingress half is intentionally scaffold-only. |
 | `ownership_identity` | The adapter is owned by the Core-side bound route. The handle is owned by the Hub connection. Both point at the same `Arc<…Inner>`, so identity is the `Arc`, not a name lookup. Route identity in the mux stays `(session_id, subscription_id, generation)`. |
 | `sibling_fail_closed_policy` | Fail closed on doubt. A dropped or overflowed frame sets `ingress_lost`, which makes Core hard stop that one route rather than deliver a gap. A closed adapter reports `Closed` permanently and never returns to `Empty`. No sibling route is torn down by another route's loss. |
+
+### 9a. Expanded late-message matrix
+
+Rows 1 to 7 are the adapter ingress states. Rows 8 to 12 are the
+ownership-creating Attach and bind surface that the first plan revision omitted,
+which Plan Review `finding_1788139424_468510` correctly required.
+
+| # | Late event | Required behavior |
+| --- | --- | --- |
+| 1 | Push after local `close` | Bytes dropped. `try_read` stays `Closed`. |
+| 2 | Push after transport-side close | Bytes dropped. `try_read` stays `Closed`. |
+| 3 | `try_read` after close with frames buffered | `Closed`. Buffered ingress discarded. |
+| 4 | `try_read` after close with a pending loss | `Closed`. Closed outranks loss. |
+| 5 | Loss marked, then close | `Closed`. |
+| 6 | Read on a fresh adapter | `Empty`. |
+| 7 | Read on a drained adapter | `Empty`, never a spurious `Lost`. |
+| 8 | Push arrives for a route whose generation was already retired | The retired generation's `AdapterSlot` is closed, so the bytes are dropped and `try_read` stays `Closed`. A retired generation can never feed a live route, because the mux keys handles by `(session_id, subscription_id, generation)`. |
+| 9 | Attach creates a new generation while an old handle still holds buffered ingress | The old generation's adapter is closed by the existing detach and rebind path. Its ingress is discarded. The new generation starts with an empty queue and no pending loss. Ingress never crosses a generation boundary. |
+| 10 | Bind is rejected after the adapter was created | `attach_routes` already calls `fail_closed_pre_bind_attach` with the `BoundAdapterHandle`. That path closes the adapter, so any ingress pushed between creation and rejection is dropped. `BindTerminalAdapterError::ControlPlaneFailed` now takes this same path, and Core also calls `adapter.close()` before returning it. |
+| 11 | Push races an in-flight `close` from the connection reader | `close` and `push_ingress_frame` take the same non-blocking lock discipline. `close` sets the closed cause first, so a push that observes the closed cause drops the bytes. A push that already holds the lock cannot resurrect a closed adapter, because `try_read` checks closed before it pops. |
+| 12 | Loss marked on a retired route, then a sibling is read | The sibling has its own `AdapterSlot` and its own flag. Its `try_read` returns `Empty` or `Frame`. Sibling survival is asserted by the section 6.5 test. |
+
+### 9b. Production-path proof, corrected
+
+My first plan revision claimed that Core calls `TerminalAdapter::try_read` on
+every bound Hub adapter in production, citing Core's wake intake. **That claim
+was wrong.** The corrected, verified position:
+
+`try_read` is reachable only through two Core entry points:
+
+1. `CoreDaemon::pump_woken`, the wake intake path.
+2. `CoreDaemon::drain`, which calls `apply_terminal_input`, then
+   `ClientWorker::intake_terminal_input`, then `adapter.try_read`.
+
+Hub drives neither today:
+
+- Hub source contains no call to `pump_woken` or `wait_wakes`.
+- Hub's only wrapper for `CoreDaemon::drain` is
+  `HubRuntime::drain_runtime_once` at `src/runtime.rs:3786`. It is `#[cfg(test)]`
+  and its own doc comment reads "Test helper for Core terminal Drain. Production
+  daemon paths must not call this."
+- `src/lib.rs:917` carries a source guard that fails if a production path calls
+  `drain_runtime_once(` or `drain_subscription(`.
+- Core's `observe_session` calls `engine.drain_runtime_once`, which skips
+  `apply_terminal_input`. So Hub's observe pump and `ReadScreen` do not reach
+  `try_read` either.
+
+So the two halves of this ticket have different standing, and the plan must not
+blur them:
+
+| Half | Production oracle | Status |
+| --- | --- | --- |
+| `ControlPlaneFailed` error mapping | `CoreDaemon::attach` calls `ensure_control_plane_live`; `bind_terminal_adapter` and `bind_waking_terminal_adapter` return `BindTerminalAdapterError::ControlPlaneFailed`. Hub reaches all three on the live Unix and WebRTC attach paths. | **Live.** Both new arms run on real rejections. |
+| Adapter ingress buffer and `try_read` | None in Hub today. `ticket_1787894427_525056` will supply it by wiring the producers and the wake pump. | **Intentionally scaffold-only**, by human decision `question_1788138575_832281` option 1 and `question_1788139680_730932` option B. |
+
+The ingress buffer must not be described as active production input in any
+report. The section 6.5 test proves Core's teardown behavior and Hub's adapter
+behavior through real Core code, but its driver is the Hub test seam, so it does
+not prove Hub production reachability. The production-path obligation is
+registered on `ticket_1787894427_525056` as checklist
+`checklist_1788139722_173987`.
+
+`try_read` still has to be correct now, even while unreachable, because the
+moment `ticket_1787894427_525056` wires the pump, a wrong `Lost` becomes a live
+route teardown.
 
 ## 10. Risks
 
@@ -358,6 +517,9 @@ path feeds Core teardown decisions.
 | The Core candidate changes during review, so the Hub pin and the proof pair go stale. | The human instruction: stop both runs, update the pin, repeat the proof. Implement re-runs `git rev-parse` and the contract diff before pinning. |
 | A dead ingress buffer with no producer reads as unwired scaffolding. | Section 3 records the explicit human decision and names the owning ticket. Section 9 records the live Core call site that already exercises `try_read` in production. |
 | Hub suite flake on a busy host produces a false red. | Run the locked gate on a quiet host, and compare any failure against `c674a62` at the old pin. |
+| The section 6.5 test is mistaken for a production-path proof, so the reachability gap is forgotten. | Section 9b states the limit, the test carries the same comment, the Implement report must repeat it, and `checklist_1788139722_173987` holds the obligation on `ticket_1787894427_525056`. |
+| Adding a `#[cfg(test)]` mux handle lookup tempts a widening of production visibility. | Keep the lookup `#[cfg(test)]` and keyed by the exact route triple. Do not make the `routes` map or the handles public. |
+| The Core candidate already moved once, from `d47ede0` to `a781556`, during this Plan step. | Implement re-runs `git ls-remote` for the branch immediately before editing literals, and repeats the section 11 check 2 contract diff. If the tip moved again, stop and repeat the proof per the human rule. |
 
 ## 11. Acceptance checks
 
@@ -367,7 +529,7 @@ from that shell. The worktree path holds no `:`, so do not set
 
 | # | Command or check | Expected result |
 | --- | --- | --- |
-| 1 | `git rev-parse` the Core candidate and record the 40-character SHA | Matches `d47ede0…` and is the tip of `project-pipelines/ticket_1788128130_441301` |
+| 1 | `git rev-parse` the Core candidate and record the 40-character SHA | Matches `a781556258789dea4a50ffcb17351e7294c8ff26` and is the tip of `project-pipelines/ticket_1788128130_441301` |
 | 2 | `git diff <sha> 3672c667 -- crates/botster-core/src/contract/ crates/botster-core-test-support/src/terminal_adapter/ crates/botster-core-daemon/src/daemon.rs` | Empty, so the alignment work is valid for both revisions |
 | 3 | `grep -rn 7eafa470 --exclude-dir=target --exclude-dir=.git .` | Hits only under `docs/plans/` and `docs/reports/` |
 | 4 | `cargo tree -e normal -i botster-terminal-protocol --locked` | Exactly one source, at the new rev |
@@ -380,6 +542,8 @@ from that shell. The worktree path holds no `:`, so do not set
 | 11 | New Hub unit test: `MIN_ADAPTER_INGRESS_BUFFER_FRAMES` frames buffer without `Lost`, and frame `N + 1` sets `Lost` | Passes |
 | 12 | New Hub unit test: an idle bound adapter returns `Empty` on repeated reads and never `Lost` | Passes |
 | 13 | New Hub unit test: both new error class strings, distinct, no `/`, next to the existing bind-error test | Passes |
+| 13a | New in-crate test from section 6.5: two sibling routes bound through the real Hub attach path, ingress loss on one, real Core hard stop through the `#[cfg(test)]` drain seam | Passes. Exactly the lost `(session_id, subscription_id, generation)` route retires, and the sibling stays live and still accepts output. |
+| 13b | Confirm `src/lib.rs:917` source guard still rejects a production call to `drain_runtime_once(` | Passes unchanged. The guard was not weakened to make 13a compile. |
 | 14 | `cargo build --locked -p botster-core-daemon --bin botster-session-worker` and `cargo build --locked --bin botster-hub` | Succeed, before the locked suite |
 | 15 | `./test.sh --locked` on a quiet host with `CARGO_TARGET_DIR` unset | Green in one default-concurrency run |
 
@@ -421,3 +585,12 @@ out and reports `ok`. Do not run an ablation while another Hub suite is running.
 3. "Hub Core pin rolls have fourteen literal sites and six lock sources" — the
    current inventory has grown past the older plan's twelve rows, and
    `git_visible_hub_members_share_one_exact_core_revision` is the guard.
+4. "Hub cannot reach TerminalAdapter::try_read in production" — Hub calls neither
+   `CoreDaemon::pump_woken` nor `CoreDaemon::drain`, and `drain_runtime_once` is
+   a guarded `#[cfg(test)]` seam. This is the fact that made the first plan
+   revision's production-path claim wrong, and it stays true until
+   `ticket_1787894427_525056` wires the pump.
+5. "A frozen Core candidate can move during a single Plan step" — the candidate
+   moved from `d47ede0` to `a781556` between the first and second Plan visits.
+   Consumers that pin an unmerged candidate must re-resolve the tip immediately
+   before editing literals, not once at plan time.
