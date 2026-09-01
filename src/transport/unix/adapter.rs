@@ -38,6 +38,7 @@ pub(crate) struct UnixTerminalAdapterHandle {
 struct UnixTerminalAdapterInner {
     slot: AdapterSlot<NotifyWaiters>,
     deferred: AtomicBool,
+    clear_pressure_after_rejection: AtomicBool,
 }
 
 impl UnixTerminalAdapterInner {
@@ -48,6 +49,7 @@ impl UnixTerminalAdapterInner {
                 Arc::new(AtomicBool::new(false)),
             ),
             deferred: AtomicBool::new(false),
+            clear_pressure_after_rejection: AtomicBool::new(false),
         }
     }
 
@@ -73,7 +75,16 @@ impl UnixTerminalAdapterInner {
     }
 
     fn try_write(&self, frame: &TerminalFrame) -> Result<(), TerminalAdapterWriteError> {
-        self.slot.try_write(frame)
+        let result = self.slot.try_write(frame);
+        if matches!(result, Err(TerminalAdapterWriteError::WouldBlock))
+            && self
+                .clear_pressure_after_rejection
+                .swap(false, Ordering::SeqCst)
+        {
+            self.slot.set_would_block(false);
+            record_forced_pressure("writable");
+        }
+        result
     }
 
     fn try_read(&self) -> TerminalIngress {
@@ -132,6 +143,7 @@ impl UnixTerminalAdapter {
                 close_work,
             ),
             deferred: AtomicBool::new(false),
+            clear_pressure_after_rejection: AtomicBool::new(false),
         });
         (
             Self {
@@ -260,6 +272,16 @@ impl UnixConnectionMux {
         handle: UnixTerminalAdapterHandle,
     ) {
         let forced_would_block_delay = forced_would_block_delay(&session_id);
+        if forced_would_block_delay.is_some()
+            && std::env::var("BOTSTER_HUB_TEST_CLEAR_ADAPTER_WOULD_BLOCK_AFTER_REJECTION")
+                .as_deref()
+                == Ok("1")
+        {
+            handle
+                .inner
+                .clear_pressure_after_rejection
+                .store(true, Ordering::SeqCst);
+        }
         if let Ok(mut routes) = self.inner.routes.lock() {
             let key = (session_id.clone(), subscription_id.clone(), generation);
             routes.insert(
@@ -294,6 +316,7 @@ impl UnixConnectionMux {
                     std::thread::sleep(delay);
                     if let Some(inner) = inner.upgrade() {
                         inner.slot.set_would_block(true);
+                        record_forced_pressure("would_block");
                     }
                 })
                 .expect("start test pressure timer");
@@ -501,6 +524,17 @@ impl UnixConnectionMux {
         for route in routes.values() {
             route.handle.clear_defer_flush();
         }
+    }
+}
+
+fn record_forced_pressure(name: &str) {
+    if std::env::var("BOTSTER_ENV").as_deref() != Ok("test") {
+        return;
+    }
+    if let Ok(directory) = std::env::var("BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_OBSERVATION")
+        && !directory.is_empty()
+    {
+        let _ = std::fs::write(std::path::Path::new(&directory).join(name), name);
     }
 }
 

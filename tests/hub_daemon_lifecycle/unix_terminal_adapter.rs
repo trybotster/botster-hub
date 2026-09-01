@@ -66,6 +66,23 @@ fn unix_envelope_is_process_exit(
         == Some("process_exit")
 }
 
+fn unix_envelope_is_attached(
+    envelope: &botster_hub_client::DaemonUnixTerminalEnvelope,
+    session_id: &str,
+    subscription_id: &str,
+) -> bool {
+    if envelope.session_id != session_id || envelope.subscription_id != subscription_id {
+        return false;
+    }
+    let Ok(bytes) = envelope.payload_bytes() else {
+        return false;
+    };
+    serde_json::from_slice::<serde_json::Value>(&bytes).is_ok_and(|value| {
+        value.get("type").and_then(serde_json::Value::as_str) == Some("attach_state")
+            && value.get("state").and_then(serde_json::Value::as_str) == Some("attached")
+    })
+}
+
 fn assert_host_session_retained(
     connection: &mut botster_hub_client::DaemonConnection,
     session_id: &str,
@@ -130,6 +147,56 @@ fn event_is_terminal_body(event: &botster_hub_client::DaemonEvent) -> bool {
             | botster_hub_client::DaemonEvent::TerminalOutput { .. }
             | botster_hub_client::DaemonEvent::ProcessExit { .. }
     )
+}
+
+fn opaque_terminal_bytes(
+    envelopes: &[botster_hub_client::DaemonUnixTerminalEnvelope],
+) -> Vec<u8> {
+    let mut output = Vec::new();
+    for envelope in envelopes {
+        let Ok(bytes) = envelope.payload_bytes() else {
+            continue;
+        };
+        match serde_json::from_slice::<botster_hub_client::DaemonEvent>(&bytes) {
+            Ok(botster_hub_client::DaemonEvent::TerminalOutput { payload, .. }) => {
+                if let Ok(decoded) = payload.decoded_bytes() {
+                    output.extend_from_slice(&decoded);
+                }
+            }
+            _ => output.extend_from_slice(&bytes),
+        }
+    }
+    output
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn read_unsolicited_terminal_until(
+    reader: &mut std::io::BufReader<std::os::unix::net::UnixStream>,
+    envelopes: &mut Vec<botster_hub_client::DaemonUnixTerminalEnvelope>,
+    deadline: Instant,
+    marker: &str,
+) {
+    reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .expect("set unsolicited terminal timeout");
+    while Instant::now() < deadline && !unix_envelope_contains_live_bytes(envelopes, marker) {
+        match botster_hub_client::read_unix_mux_frame_from_reader(reader) {
+            Ok(botster_hub_client::DaemonUnixMuxFrame::Terminal(envelope)) => {
+                envelopes.push(envelope);
+            }
+            Ok(botster_hub_client::DaemonUnixMuxFrame::Event(_)) => {}
+            Ok(botster_hub_client::DaemonUnixMuxFrame::Response(response)) => {
+                panic!("unsolicited terminal wait received a control response: {response:?}")
+            }
+            Err(_) => {}
+        }
+    }
 }
 
 #[test]
@@ -404,6 +471,200 @@ fn unix_adapter_unbound_scoped_drain_delivers_terminal_output() {
     );
     shutdown_short_lived_session(&endpoint, session_id);
     hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn paused_data_plane_keeps_control_requests_from_driving_terminal_progress() {
+    let _guard = daemon_test_guard();
+    let seam_dir = unique_short_test_dir("data-plane-pause");
+    fs::create_dir_all(&seam_dir).expect("create data-plane pause seam directory");
+    let pause = seam_dir.join("pause");
+    let pause_value = pause.display().to_string();
+    let hub = start_isolated_live_output_hub_with_env(
+        "data-plane-pause",
+        &[("BOTSTER_HUB_TEST_PAUSE_DATA_PLANE", pause_value.as_str())],
+    );
+    let endpoint = hub.endpoint().clone();
+    let session_id = "data-plane-pause-session";
+    let subscription_id = "data-plane-pause-sub";
+    let (mut stream, mut reader) = unix_adapter_connection(&endpoint);
+    let mut envelopes = Vec::new();
+    let mut events = Vec::new();
+    spawn_and_bind(
+        &mut stream,
+        &mut reader,
+        session_id,
+        subscription_id,
+        "printf 'pause-baseline-ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
+        &mut envelopes,
+        &mut events,
+    );
+    let baseline_deadline = Instant::now() + Duration::from_secs(5);
+    while !unix_envelope_contains_live_bytes(&envelopes, "pause-baseline-ready")
+        || !envelopes
+            .iter()
+            .any(|envelope| unix_envelope_is_attached(envelope, session_id, subscription_id))
+    {
+        assert!(
+            Instant::now() < baseline_deadline,
+            "baseline terminal output must arrive before the pause"
+        );
+        request_collecting_mux(
+            &mut stream,
+            &mut reader,
+            &botster_hub_client::DaemonRequest::Status,
+            &mut envelopes,
+            &mut events,
+        );
+    }
+    envelopes.clear();
+    fs::write(&pause, b"pause").expect("arm data-plane pause");
+    let entered = pause.with_extension("entered");
+    let entered_deadline = Instant::now() + Duration::from_secs(3);
+    while !entered.is_file() {
+        assert!(
+            Instant::now() < entered_deadline,
+            "data-plane driver must acknowledge the pause"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    botster_hub_client::write_frame(
+        &mut stream,
+        &botster_hub_client::DaemonUnixTerminalEnvelope::from_frame_bytes(
+            session_id,
+            subscription_id,
+            &terminal_input_frame_bytes(b"retained-one\rretained-two\r"),
+        ),
+    )
+    .expect("send retained compact terminal input");
+    thread::sleep(Duration::from_millis(100));
+
+    let requests = [
+        botster_hub_client::DaemonRequest::Status,
+        botster_hub_client::DaemonRequest::ListSessions,
+        botster_hub_client::DaemonRequest::ReadScreen {
+            session_id: session_id.to_string(),
+        },
+        botster_hub_client::DaemonRequest::ReadModeFlags {
+            session_id: session_id.to_string(),
+        },
+        botster_hub_client::DaemonRequest::CaptureSnapshot {
+            session_id: session_id.to_string(),
+        },
+        botster_hub_client::DaemonRequest::ShutdownSession {
+            session_id: "data-plane-pause-missing".to_string(),
+        },
+    ];
+    for request in requests {
+        request_collecting_mux(
+            &mut stream,
+            &mut reader,
+            &request,
+            &mut envelopes,
+            &mut events,
+        );
+        assert!(
+            envelopes.is_empty(),
+            "generic control and readback must not drive terminal progress: request={request:?} envelopes={envelopes:?}"
+        );
+    }
+
+    fs::remove_file(&pause).expect("resume data-plane driver");
+    read_unsolicited_terminal_until(
+        &mut reader,
+        &mut envelopes,
+        Instant::now() + Duration::from_secs(5),
+        "echo:retained-two",
+    );
+    let bytes = opaque_terminal_bytes(&envelopes);
+    let first = find_bytes(&bytes, b"echo:retained-one").expect("first retained frame delivered");
+    let second =
+        find_bytes(&bytes, b"echo:retained-two").expect("second retained frame delivered");
+    assert!(first < second, "retained terminal input must preserve order");
+
+    drop(stream);
+    shutdown_short_lived_session(&endpoint, session_id);
+    hub.shutdown().expect("shutdown isolated hub");
+    let _ = fs::remove_dir_all(seam_dir);
+}
+
+#[test]
+fn unix_writable_wake_resumes_output_before_the_watchdog() {
+    let _guard = daemon_test_guard();
+    let observation = unique_short_test_dir("writable-wake");
+    fs::create_dir_all(&observation).expect("create writable-wake observation directory");
+    let observation_value = observation.display().to_string();
+    let driver_observation = observation.join("driver.json");
+    let driver_observation_value = driver_observation.display().to_string();
+    let hub = start_isolated_live_output_hub_with_env(
+        "writable-wake",
+        &[
+            (
+                "BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_SESSION",
+                "writable-wake-session",
+            ),
+            ("BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_DELAY_MS", "500"),
+            (
+                "BOTSTER_HUB_TEST_CLEAR_ADAPTER_WOULD_BLOCK_AFTER_REJECTION",
+                "1",
+            ),
+            (
+                "BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_OBSERVATION",
+                observation_value.as_str(),
+            ),
+            ("BOTSTER_HUB_TEST_DATA_PLANE_WATCHDOG_MS", "10000"),
+            (
+                "BOTSTER_HUB_TEST_DATA_PLANE_OBSERVATION",
+                driver_observation_value.as_str(),
+            ),
+        ],
+    );
+    let endpoint = hub.endpoint().clone();
+    let session_id = "writable-wake-session";
+    let subscription_id = "writable-wake-sub";
+    let (mut stream, mut reader) = unix_adapter_connection(&endpoint);
+    let mut envelopes = Vec::new();
+    let mut events = Vec::new();
+    let started = Instant::now();
+    spawn_and_bind(
+        &mut stream,
+        &mut reader,
+        session_id,
+        subscription_id,
+        "sleep 1; printf 'writable-wake-resumed\\n'; sleep 30",
+        &mut envelopes,
+        &mut events,
+    );
+    envelopes.clear();
+    read_unsolicited_terminal_until(
+        &mut reader,
+        &mut envelopes,
+        Instant::now() + Duration::from_secs(5),
+        "writable-wake-resumed",
+    );
+    assert!(
+        observation.join("would_block").is_file(),
+        "the route must enter WouldBlock before delivery resumes"
+    );
+    assert!(
+        observation.join("writable").is_file(),
+        "clearing pressure must emit the writable transition"
+    );
+    assert!(
+        unix_envelope_contains_live_bytes(&envelopes, "writable-wake-resumed"),
+        "the writable wake must resume opaque terminal delivery: driver={:?}",
+        fs::read_to_string(&driver_observation)
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "delivery must precede the ten-second data-plane watchdog"
+    );
+
+    drop(stream);
+    shutdown_short_lived_session(&endpoint, session_id);
+    hub.shutdown().expect("shutdown isolated hub");
+    let _ = fs::remove_dir_all(observation);
 }
 
 #[test]
@@ -2940,6 +3201,37 @@ fn unix_eof_leave_route_ablation_keeps_named_pair_on_status() {
     assert!(
         occupancy_has_pair(&after.live_attach_occupancy, session_id, sub_a),
         "leave-route ablation must redden the exact-absence assertion: {:?}",
+        after.live_attach_occupancy
+    );
+    drop(owner_b);
+    shutdown_short_lived_session(hub.endpoint(), session_id);
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn unix_eof_skip_core_detach_ablation_keeps_named_pair_on_status() {
+    let _guard = daemon_test_guard();
+    let hub = start_isolated_live_output_hub_with_env(
+        "ues",
+        &[("BOTSTER_HUB_UNIX_EOF_ABLATION", "skip_core_detach")],
+    );
+    let session_id = "ues-session";
+    let sub_a = "ues-sub-a";
+    let sub_b = "ues-sub-b";
+    let (owner_a, reader_a, mut owner_b, mut reader_b, _envelopes_a, mut envelopes_b) =
+        attach_two_unix_clients(&hub, session_id, sub_a, sub_b);
+    let before = sibling_status(&mut owner_b, &mut reader_b, &mut envelopes_b);
+    drop(owner_a);
+    drop(reader_a);
+    let after = wait_for_cleanup_completed(
+        &mut owner_b,
+        &mut reader_b,
+        &mut envelopes_b,
+        &before.lifecycle_counters,
+    );
+    assert!(
+        occupancy_has_pair(&after.live_attach_occupancy, session_id, sub_a),
+        "skip-core-detach ablation must redden the exact-absence assertion: {:?}",
         after.live_attach_occupancy
     );
     drop(owner_b);

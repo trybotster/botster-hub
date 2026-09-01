@@ -53,6 +53,36 @@ pub(crate) fn start_cli_daemon(data_dir: &Path) -> PanicSafeCliDaemon {
     start_cli_daemon_with_worker_egress_capacity(data_dir, None)
 }
 
+pub(crate) fn start_cli_daemon_with_env(
+    data_dir: &Path,
+    environment: &[(&str, &str)],
+) -> PanicSafeCliDaemon {
+    let _guard = daemon_test_guard();
+    check_harness_taint();
+    ensure_session_worker_binary();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    command
+        .arg("start")
+        .arg("--data-dir")
+        .arg(data_dir)
+        .arg("--session-worker-bin")
+        .arg(session_worker_binary_path())
+        .env("BOTSTER_ENV", "test")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (key, value) in environment {
+        command.env(key, value);
+    }
+    configure_test_process_group(&mut command);
+    let child = command
+        .spawn()
+        .expect("spawn botster-hub start with test environment");
+    let mut daemon =
+        PanicSafeCliDaemon::from_child(data_dir, child, "environment-scoped lifecycle daemon");
+    wait_for_status(data_dir, daemon.child_mut());
+    daemon
+}
+
 pub(crate) fn start_cli_daemon_with_worker_egress_capacity(
     data_dir: &Path,
     egress_capacity: Option<usize>,

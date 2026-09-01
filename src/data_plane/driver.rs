@@ -27,6 +27,7 @@ pub(crate) const TEST_PAUSE_DATA_PLANE_ENV: &str = "BOTSTER_HUB_TEST_PAUSE_DATA_
 pub(crate) const TEST_PARK_DATA_PLANE_TURN_ENV: &str = "BOTSTER_HUB_TEST_PARK_DATA_PLANE_TURN";
 pub(crate) const TEST_DATA_PLANE_WATCHDOG_MS_ENV: &str = "BOTSTER_HUB_TEST_DATA_PLANE_WATCHDOG_MS";
 pub(crate) const TEST_DATA_PLANE_OBSERVATION_ENV: &str = "BOTSTER_HUB_TEST_DATA_PLANE_OBSERVATION";
+pub(crate) const TEST_CORE_SHUTDOWN_MARKER_ENV: &str = "BOTSTER_HUB_TEST_CORE_SHUTDOWN_MARKER";
 pub(crate) const DATA_PLANE_DRIVER_STOP_TIMEOUT: &str = "data_plane_driver_stop_timeout";
 
 pub(crate) struct DataPlaneDriver {
@@ -35,6 +36,7 @@ pub(crate) struct DataPlaneDriver {
     done: Receiver<()>,
     thread: Option<JoinHandle<()>>,
     owner_wake: Arc<Mutex<Option<ControlSender>>>,
+    test_park_on_stop: Arc<AtomicBool>,
 }
 
 type CoreRequest = Box<dyn FnOnce(&mut CoreDaemon) + Send + 'static>;
@@ -109,6 +111,8 @@ impl DataPlaneDriver {
         let thread_stop_action = Arc::clone(&stop_action);
         let owner_wake = Arc::new(Mutex::new(None));
         let thread_owner_wake = Arc::clone(&owner_wake);
+        let test_park_on_stop = Arc::new(AtomicBool::new(false));
+        let thread_test_park_on_stop = Arc::clone(&test_park_on_stop);
         let thread = std::thread::Builder::new()
             .name("botster-hub-data-plane".to_string())
             .spawn(move || {
@@ -122,10 +126,12 @@ impl DataPlaneDriver {
                     thread_owner_wake,
                     thread_request_pending,
                     thread_owner_waiting,
+                    thread_test_park_on_stop,
                 );
                 if thread_stop_action.load(Ordering::Acquire) == STOP_ACTION_RELEASE_FOR_RESTART {
                     daemon.release_for_restart();
                 } else {
+                    record_core_shutdown();
                     let _ = daemon.shutdown(None, current_unix_seconds());
                 }
                 let _ = done_tx.send(());
@@ -145,6 +151,7 @@ impl DataPlaneDriver {
             done: done_rx,
             thread: Some(thread),
             owner_wake,
+            test_park_on_stop,
         };
         (driver, core)
     }
@@ -170,6 +177,9 @@ impl DataPlaneDriver {
             },
             Ordering::Release,
         );
+        if test_stop_park_directory().is_some() {
+            self.test_park_on_stop.store(true, Ordering::Release);
+        }
         self.core.control.request_stop();
         if let Some(thread) = self.thread.as_ref() {
             thread.thread().unpark();
@@ -208,10 +218,16 @@ fn run_loop(
     owner_wake: Arc<Mutex<Option<ControlSender>>>,
     request_pending: Arc<AtomicBool>,
     owner_waiting: Arc<AtomicBool>,
+    test_park_on_stop: Arc<AtomicBool>,
 ) {
     let counters = DriverCounters::default();
     loop {
-        park_turn_for_test();
+        if pause_data_plane() {
+            owner_waiting.store(false, Ordering::Release);
+            std::thread::park_timeout(Duration::from_millis(10));
+            run_core_requests(core_daemon, &requests);
+            continue;
+        }
         owner_waiting.store(true, Ordering::Release);
         let wait_timeout = if request_pending.swap(false, Ordering::AcqRel) {
             owner_waiting.store(false, Ordering::Release);
@@ -219,16 +235,6 @@ fn run_loop(
         } else {
             watchdog()
         };
-        if pause_data_plane() {
-            match core_daemon.wait_pump(wait_timeout) {
-                WakePumpWait::Stopped => break,
-                WakePumpWait::Interrupted | WakePumpWait::Wakes(_) => {}
-                _ => {}
-            }
-            owner_waiting.store(false, Ordering::Release);
-            run_core_requests(core_daemon, &requests);
-            continue;
-        }
         let waited = core_daemon.wait_pump(wait_timeout);
         owner_waiting.store(false, Ordering::Release);
         let waited = if matches!(waited, WakePumpWait::Interrupted) {
@@ -236,6 +242,7 @@ fn run_loop(
         } else {
             waited
         };
+        park_stopped_turn_for_test(&test_park_on_stop);
         let batch = match waited {
             WakePumpWait::Wakes(batch) => Some(batch),
             WakePumpWait::Interrupted => None,
@@ -314,15 +321,50 @@ fn watchdog() -> Duration {
 }
 
 fn pause_data_plane() -> bool {
-    std::env::var("BOTSTER_ENV").as_deref() == Ok("test")
-        && std::env::var(TEST_PAUSE_DATA_PLANE_ENV).as_deref() == Ok("1")
+    if std::env::var("BOTSTER_ENV").as_deref() != Ok("test") {
+        return false;
+    }
+    match std::env::var(TEST_PAUSE_DATA_PLANE_ENV) {
+        Ok(value) if value == "1" => true,
+        Ok(path) if !path.is_empty() => {
+            let path = std::path::PathBuf::from(path);
+            if !path.is_file() {
+                return false;
+            }
+            let _ = std::fs::write(path.with_extension("entered"), b"paused");
+            true
+        }
+        _ => false,
+    }
 }
 
-fn park_turn_for_test() {
-    if std::env::var("BOTSTER_ENV").as_deref() == Ok("test")
-        && std::env::var(TEST_PARK_DATA_PLANE_TURN_ENV).as_deref() == Ok("1")
-    {
-        std::thread::park();
+fn test_stop_park_directory() -> Option<std::path::PathBuf> {
+    if std::env::var("BOTSTER_ENV").as_deref() != Ok("test") {
+        return None;
+    }
+    let directory = std::env::var(TEST_PARK_DATA_PLANE_TURN_ENV).ok()?;
+    if directory.is_empty() || directory == "1" {
+        return None;
+    }
+    let directory = std::path::PathBuf::from(directory);
+    let park = directory.join("park");
+    if !park.is_file() {
+        return None;
+    }
+    Some(directory)
+}
+
+fn park_stopped_turn_for_test(test_park_on_stop: &AtomicBool) {
+    if !test_park_on_stop.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let Some(directory) = test_stop_park_directory() else {
+        return;
+    };
+    let park = directory.join("park");
+    let _ = std::fs::write(directory.join("entered"), b"parked");
+    while park.is_file() {
+        std::thread::sleep(Duration::from_millis(25));
     }
 }
 
@@ -355,5 +397,16 @@ fn record_stop_timeout() {
         && !path.is_empty()
     {
         let _ = std::fs::write(path, DATA_PLANE_DRIVER_STOP_TIMEOUT);
+    }
+}
+
+fn record_core_shutdown() {
+    if std::env::var("BOTSTER_ENV").as_deref() != Ok("test") {
+        return;
+    }
+    if let Ok(path) = std::env::var(TEST_CORE_SHUTDOWN_MARKER_ENV)
+        && !path.is_empty()
+    {
+        let _ = std::fs::write(path, b"core_shutdown");
     }
 }

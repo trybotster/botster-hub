@@ -1550,6 +1550,7 @@ pub fn run_client_conformance(
         });
     }
     let mut drain_output = String::new();
+    let mut terminal_attached = false;
     let attached_deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < attached_deadline {
         let drain = terminal
@@ -1567,11 +1568,19 @@ pub fn run_client_conformance(
                 output: format!("{:?}", drain.events),
             });
         }
+        terminal_attached |= take_attached_terminal_frame(&mut terminal);
         append_read_screen(&mut terminal, &mut drain_output)?;
-        if drain_output.contains(CONFORMANCE_READY) {
+        terminal_attached |= take_attached_terminal_frame(&mut terminal);
+        if terminal_attached && drain_output.contains(CONFORMANCE_READY) {
             break;
         }
         thread::sleep(Duration::from_millis(25));
+    }
+    if !terminal_attached {
+        return Err(ConformanceError::MissingOutput {
+            needle: "opaque attached terminal frame",
+            output: drain_output,
+        });
     }
 
     terminal
@@ -4510,6 +4519,29 @@ fn append_read_screen(
         *output = screen.text;
     }
     Ok(())
+}
+
+fn take_attached_terminal_frame(terminal: &mut DaemonConnection) -> bool {
+    terminal
+        .take_skipped_terminal()
+        .into_iter()
+        .any(|envelope| {
+            if envelope.session_id != CONFORMANCE_SESSION_ID
+                || envelope.subscription_id != CONFORMANCE_SUBSCRIPTION_ID
+            {
+                return false;
+            }
+            envelope
+                .payload_bytes()
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<DaemonEvent>(&bytes).ok())
+                .is_some_and(|event| {
+                    matches!(
+                        event,
+                        DaemonEvent::AttachState { state, .. } if state == "attached"
+                    )
+                })
+        })
 }
 
 fn request(
