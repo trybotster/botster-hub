@@ -216,7 +216,7 @@ pub(crate) fn handle_client_event_request(
                             .pending_runtime
                             .admission
                             .reservations
-                            .forget_subscription(
+                            .forget_unbound_subscription(
                                 crate::admission::connection_budget::ChannelClass::Event,
                                 &subscription_id,
                                 peer_generation,

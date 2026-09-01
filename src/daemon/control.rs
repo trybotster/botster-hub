@@ -136,7 +136,8 @@ pub(crate) fn handle_control_message(
         | message @ ControlMessage::InspectReservation { .. }
         | message @ ControlMessage::BindReservedSubscription { .. }
         | message @ ControlMessage::RetireReservedSubscription { .. }
-        | message @ ControlMessage::AuthorizeSubscriptionSend { .. } => {
+        | message @ ControlMessage::AuthorizeSubscriptionSend { .. }
+        | message @ ControlMessage::AuthorizeSubscriptionHelloAck { .. } => {
             connection::handle(daemon, state, message)
         }
         message @ ControlMessage::SubscribeEntities { .. }

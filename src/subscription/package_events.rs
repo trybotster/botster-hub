@@ -146,6 +146,7 @@ pub(crate) struct ClientEventMailbox {
     slots: Mutex<HashMap<String, Arc<ClientGapSlot>>>,
     wake: Notify,
     wake_bit: AtomicBool,
+    retired: AtomicBool,
     event_max: usize,
     byte_max: usize,
     queue_age: std::time::Duration,
@@ -209,6 +210,7 @@ impl ClientEventMailbox {
             slots: Mutex::new(HashMap::new()),
             wake: Notify::new(),
             wake_bit: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
             event_max: test_client_event_queue_max().unwrap_or(policy.consumer_queue_max_events),
             byte_max: policy.consumer_queue_max_bytes,
             queue_age: policy.queue_age,
@@ -397,6 +399,9 @@ impl ClientEventMailbox {
     }
 
     pub(crate) fn take_ready_event(&self) -> Option<DaemonEvent> {
+        if self.is_retired() {
+            return None;
+        }
         if let Some(event) = self.take_gap() {
             return Some(event);
         }
@@ -504,6 +509,16 @@ impl ClientEventMailbox {
             }
         }
         true
+    }
+
+    pub(crate) fn retire(&self) {
+        self.retired.store(true, Ordering::Release);
+        self.signal_wake();
+    }
+
+    #[must_use]
+    pub(crate) fn is_retired(&self) -> bool {
+        self.retired.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
@@ -673,10 +688,11 @@ impl ClientEventPlane {
             return Err(ClientEventAdmitError::Router(status));
         }
         state.subscriptions.remove(subscription_id);
-        if let Some(mailbox) = state.mailboxes.remove(subscription_id)
-            && !mailbox.try_drop_subscription(subscription_id)
-        {
-            self.queue_residency_cleanup(subscription_id, mailbox);
+        if let Some(mailbox) = state.mailboxes.remove(subscription_id) {
+            mailbox.retire();
+            if !mailbox.try_drop_subscription(subscription_id) {
+                self.queue_residency_cleanup(subscription_id, mailbox);
+            }
         }
         if state.subscriptions.is_empty()
             && let Some(removed) = connections.remove(connection_id)
@@ -779,6 +795,7 @@ impl ClientEventPlane {
                 EventPlaneStatus::Accepted => {
                     if let Some(removed) = connections.remove(connection_id) {
                         for (subscription_id, mailbox) in &removed.mailboxes {
+                            mailbox.retire();
                             if !mailbox.try_drop_subscription(subscription_id) {
                                 self.queue_residency_cleanup(subscription_id, Arc::clone(mailbox));
                             }
@@ -1080,6 +1097,9 @@ mod tests {
             worker_plane.try_unsubscribe("connection", "sub", &worker_router)
         })
         .expect("unsubscribe");
+        assert!(mailbox.is_retired());
+        assert!(mailbox.take_wake());
+        assert!(mailbox.take_ready_event().is_none());
         plane.retry_residency_cleanups();
         assert_pool_empty(&pool, 0);
     }

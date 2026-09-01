@@ -460,6 +460,7 @@ const CONTROL_MESSAGE_OWNERS: &[(&str, &[&str])] = &[
             "BindReservedSubscription",
             "RetireReservedSubscription",
             "AuthorizeSubscriptionSend",
+            "AuthorizeSubscriptionHelloAck",
         ],
     ),
     (

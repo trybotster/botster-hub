@@ -1546,6 +1546,38 @@ mod tests {
             }
             other => panic!("live emit after drain must be PackageEvent: {other:?}"),
         }
+        let unsubscribed = harness.request_on_peer(
+            &mut peer,
+            DaemonRequest::UnsubscribeEvents {
+                subscription_id: "sub-live".to_string(),
+            },
+            "UnsubscribeEvents",
+        );
+        assert_eq!(
+            unsubscribed.kind,
+            botster_hub_client::DaemonResponseKind::EventUnsubscribed
+        );
+        harness.wait_for_reserved_close(&mut peer, &reservation_label);
+        assert_eq!(
+            harness
+                .state
+                .pending_runtime
+                .admission
+                .reservations
+                .lookup_label(&reservation_label, reservation.peer_generation, u64::MAX),
+            crate::admission::reservations::ReservationLookup::Unknown
+        );
+        assert!(
+            harness
+                .state
+                .pending_runtime
+                .admission
+                .connection_budgets
+                .get(&reservation.peer_generation)
+                .and_then(|budget| budget.usage(&reservation_label))
+                .is_none(),
+            "event budget must release after the bound host closes"
+        );
         let status = harness.request_on_peer(&mut peer, DaemonRequest::Status, "Status");
         assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
         let entities = harness.subscribe_entities(&mut peer, "entity-under-event-pressure");
