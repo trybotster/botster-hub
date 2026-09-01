@@ -61,3 +61,59 @@ pub fn validate_cli_daemon_shutdown(shutdown: &Output, daemon: &Output) -> Resul
 pub fn recovering_mutex_guard(lock: &'static Mutex<()>) -> MutexGuard<'static, ()> {
     lock.lock().unwrap_or_else(|error| error.into_inner())
 }
+
+#[allow(dead_code)]
+pub fn bind_shared_terminal_adapter(
+    runtime: &mut botster_hub::HubRuntime,
+    client_id: botster_core::ClientId,
+    session_id: botster_core::SessionId,
+    subscription_id: botster_core::SubscriptionId,
+) -> botster_core_test_support::terminal_adapter::SharedFakeTerminalAdapter {
+    let generation = runtime
+        .list_terminal_subscriptions()
+        .into_iter()
+        .find(|row| row.session_id == session_id && row.subscription_id == subscription_id)
+        .map(|row| row.generation)
+        .expect("live terminal generation");
+    let adapter =
+        botster_core_test_support::terminal_adapter::SharedFakeTerminalAdapter::auto_complete();
+    runtime
+        .bind_terminal_adapter(
+            client_id,
+            session_id,
+            subscription_id,
+            generation,
+            botster_core::TerminalCapabilitySet::from_tokens(["terminal_streaming", "resize"])
+                .expect("terminal capabilities"),
+            Box::new(adapter.clone()),
+        )
+        .expect("bind shared terminal adapter");
+    adapter
+}
+
+#[allow(dead_code)]
+pub fn send_terminal_input(
+    adapter: &botster_core_test_support::terminal_adapter::SharedFakeTerminalAdapter,
+    data: &[u8],
+) {
+    let body_len = u16::try_from(data.len()).expect("test terminal input fits u16");
+    let mut frame = Vec::with_capacity(4 + data.len());
+    frame.extend_from_slice(&[1, 1]);
+    frame.extend_from_slice(&body_len.to_be_bytes());
+    frame.extend_from_slice(data);
+    adapter.inject_ingress_frame(frame);
+    let _ = adapter.wake(botster_core::TerminalWakeKind::Writable);
+}
+
+#[allow(dead_code)]
+pub fn send_terminal_resize(
+    adapter: &botster_core_test_support::terminal_adapter::SharedFakeTerminalAdapter,
+    rows: u16,
+    cols: u16,
+) {
+    let mut frame = vec![1, 3, 0, 4];
+    frame.extend_from_slice(&rows.to_be_bytes());
+    frame.extend_from_slice(&cols.to_be_bytes());
+    adapter.inject_ingress_frame(frame);
+    let _ = adapter.wake(botster_core::TerminalWakeKind::Writable);
+}

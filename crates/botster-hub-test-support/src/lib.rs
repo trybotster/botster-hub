@@ -1581,7 +1581,7 @@ pub fn run_client_conformance(
             &terminal_resize_frame_bytes(33, 102),
         )
         .map_err(|source| ConformanceError::Client {
-            operation: "resize",
+            operation: "terminal_resize_frame",
             source,
         })?;
     terminal
@@ -1591,7 +1591,7 @@ pub fn run_client_conformance(
             &terminal_input_frame_bytes(b"from-conformance\r"),
         )
         .map_err(|source| ConformanceError::Client {
-            operation: "send_input",
+            operation: "terminal_input_frame",
             source,
         })?;
     let echo_deadline = Instant::now() + Duration::from_secs(5);
@@ -1609,7 +1609,7 @@ pub fn run_client_conformance(
             &terminal_input_frame_bytes(b"size-check\r"),
         )
         .map_err(|source| ConformanceError::Client {
-            operation: "send_size_check",
+            operation: "terminal_size_check_frame",
             source,
         })?;
     let resize_needle = format!("{CONFORMANCE_WINSIZE_PREFIX}33 102");
@@ -5989,7 +5989,6 @@ mod tests {
                     botster_hub_client::FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
                     botster_hub_client::FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS,
                     botster_hub_client::FEATURE_PLUGIN_ENTITY_SUBSCRIPTIONS,
-                    botster_hub_client::FEATURE_MODE_GATED_INPUT,
                 ],
                 "supported_features": [
                     botster_hub_client::FEATURE_SESSIONS,
@@ -6003,7 +6002,6 @@ mod tests {
                     botster_hub_client::FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
                     botster_hub_client::FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS,
                     botster_hub_client::FEATURE_PLUGIN_ENTITY_SUBSCRIPTIONS,
-                    botster_hub_client::FEATURE_MODE_GATED_INPUT,
                     botster_hub_client::FEATURE_HUB_SOURCE_UPDATE,
                     botster_hub_client::FEATURE_UNIX_TERMINAL_ADAPTER,
                     botster_hub_client::FEATURE_TERMINAL_SUBSCRIPTION_CLOSED,
@@ -6031,8 +6029,6 @@ mod tests {
                     "spawn",
                     "attach",
                     "drain",
-                    "send_input",
-                    "resize",
                     "shutdown_session",
                 ],
                 "terminal_streaming": {

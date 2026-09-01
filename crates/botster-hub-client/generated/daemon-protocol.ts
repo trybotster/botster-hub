@@ -166,7 +166,6 @@ export interface DaemonResponse {
   session_context?: DaemonSessionContext | null;
   read_screen?: DaemonReadScreen | null;
   mode_flags?: DaemonModeFlags | null;
-  mode_gated_input?: DaemonModeGatedInputResult | null;
   terminal_reservation?: DaemonTerminalReservation | null;
   capture_snapshot?: DaemonCaptureSnapshot | null;
   spawn_targets?: DaemonSpawnTarget[];
@@ -215,22 +214,6 @@ export interface DaemonModeFlags {
   application_cursor: boolean;
   mode_generation: number;
   mode_revision: number;
-}
-
-export interface DaemonModeGatedInputResult {
-  session_id: string;
-  admitted: boolean;
-  bytes_written: number;
-  kitty_enabled: boolean;
-  cursor_visible: boolean;
-  bracketed_paste: boolean;
-  mouse_mode: number;
-  alt_screen: boolean;
-  focus_reporting: boolean;
-  application_cursor: boolean;
-  mode_generation: number;
-  mode_revision: number;
-  error_kind?: string | null;
 }
 
 export interface DaemonTerminalReservation {

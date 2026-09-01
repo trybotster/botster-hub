@@ -126,22 +126,27 @@ fn inspect_terminal_reservation(
     reply_tx: oneshot::Sender<ReservationInspectReply>,
 ) -> bool {
     let _ = daemon;
+    let Some(peer_generation) = admitted_peer_generation(state, &grant_id) else {
+        let _ = reply_tx.send(ReservationInspectReply::Unknown);
+        return false;
+    };
     let now = now_seconds();
-    let lookup = state
-        .pending_runtime
-        .admission
-        .reservations
-        .lookup_label(&label, now);
+    let lookup =
+        state
+            .pending_runtime
+            .admission
+            .reservations
+            .lookup_label(&label, peer_generation, now);
     let reply = match lookup {
         ReservationLookup::Unknown => ReservationInspectReply::Unknown,
         ReservationLookup::Bound => ReservationInspectReply::Bound,
         ReservationLookup::Expired => {
-            emit_reservation_expired(state, &grant_id, &label, now);
+            emit_reservation_expired(state, &grant_id, peer_generation, &label, now);
             match state
                 .pending_runtime
                 .admission
                 .reservations
-                .reservation_for_label(&label)
+                .reservation_for_label(&label, peer_generation)
             {
                 Some(reservation) => ReservationInspectReply::Expired {
                     session_id: reservation.session_id.clone(),
@@ -155,7 +160,7 @@ fn inspect_terminal_reservation(
             .pending_runtime
             .admission
             .reservations
-            .reservation_for_label(&label)
+            .reservation_for_label(&label, peer_generation)
         {
             Some(reservation) => ReservationInspectReply::Live {
                 session_id: reservation.session_id.clone(),
@@ -178,12 +183,16 @@ fn bind_reserved_terminal(
         Result<crate::transport::webrtc::WebRtcTerminalAdapterHandle, BindReservedError>,
     >,
 ) -> bool {
+    let Some(peer_generation) = admitted_peer_generation(state, &grant_id) else {
+        let _ = reply_tx.send(Err(BindReservedError::Unknown));
+        return false;
+    };
     let now = now_seconds();
     match state
         .pending_runtime
         .admission
         .reservations
-        .lookup_label(&label, now)
+        .lookup_label(&label, peer_generation, now)
     {
         ReservationLookup::Unknown => {
             let _ = reply_tx.send(Err(BindReservedError::Unknown));
@@ -194,7 +203,7 @@ fn bind_reserved_terminal(
             return false;
         }
         ReservationLookup::Expired => {
-            emit_reservation_expired(state, &grant_id, &label, now);
+            emit_reservation_expired(state, &grant_id, peer_generation, &label, now);
             let _ = reply_tx.send(Err(BindReservedError::Expired));
             return false;
         }
@@ -204,7 +213,7 @@ fn bind_reserved_terminal(
         .pending_runtime
         .admission
         .reservations
-        .reservation_for_label(&label)
+        .reservation_for_label(&label, peer_generation)
         .cloned()
     else {
         let _ = reply_tx.send(Err(BindReservedError::Unknown));
@@ -256,7 +265,7 @@ fn bind_reserved_terminal(
                 .pending_runtime
                 .admission
                 .reservations
-                .mark_bound(&label);
+                .mark_bound(&label, peer_generation);
             let _ = reply_tx.send(Ok(handle));
         }
         Ok(None) | Err(()) => {
@@ -266,12 +275,33 @@ fn bind_reserved_terminal(
     false
 }
 
-fn emit_reservation_expired(state: &mut DaemonControlState, grant_id: &str, label: &str, now: u64) {
-    let Some(reservation) = state
+fn admitted_peer_generation(state: &DaemonControlState, grant_id: &str) -> Option<u64> {
+    match state
         .pending_runtime
         .admission
-        .reservations
-        .expire_label(label, now)
+        .webrtc_admissions
+        .get(grant_id)
+    {
+        Some(WebrtcTerminalAdmission::Admitted {
+            peer_generation, ..
+        }) => Some(*peer_generation),
+        _ => None,
+    }
+}
+
+fn emit_reservation_expired(
+    state: &mut DaemonControlState,
+    grant_id: &str,
+    peer_generation: u64,
+    label: &str,
+    now: u64,
+) {
+    let Some(reservation) =
+        state
+            .pending_runtime
+            .admission
+            .reservations
+            .expire_label(label, peer_generation, now)
     else {
         return;
     };

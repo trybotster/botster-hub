@@ -977,7 +977,6 @@ pub(crate) fn response_with_diagnostic(diagnostic: DaemonDiagnostic) -> DaemonRe
         session_context: None,
         read_screen: None,
         mode_flags: None,
-        mode_gated_input: None,
         terminal_reservation: None,
         capture_snapshot: None,
         spawn_targets: Vec::new(),

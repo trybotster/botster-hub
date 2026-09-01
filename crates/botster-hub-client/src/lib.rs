@@ -51,8 +51,6 @@ pub const FEATURE_TERMINAL_READBACK: &str = "terminal_readback";
 pub const FEATURE_SESSION_ENTITY_SUBSCRIPTIONS: &str = "session_entity_subscriptions";
 pub const FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS: &str = "session_type_entity_subscriptions";
 pub const FEATURE_PLUGIN_ENTITY_SUBSCRIPTIONS: &str = "plugin_entity_subscriptions";
-/// Race-free mode-dependent terminal input via `ModeGatedInput` + mode freshness.
-pub const FEATURE_MODE_GATED_INPUT: &str = "mode_gated_input";
 pub const FEATURE_HUB_SOURCE_UPDATE: &str = "hub_source_update";
 /// Optional Hub Unix adapter plane. Bind happens only when Hello requires this.
 pub const FEATURE_UNIX_TERMINAL_ADAPTER: &str = "unix_terminal_adapter";
@@ -1026,7 +1024,6 @@ fn default_required_feature_list() -> Vec<&'static str> {
         FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
         FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS,
         FEATURE_PLUGIN_ENTITY_SUBSCRIPTIONS,
-        FEATURE_MODE_GATED_INPUT,
     ]
 }
 
@@ -1363,8 +1360,6 @@ pub struct DaemonResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode_flags: Option<DaemonModeFlags>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mode_gated_input: Option<DaemonModeGatedInputResult>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_reservation: Option<DaemonTerminalReservation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_snapshot: Option<DaemonCaptureSnapshot>,
@@ -1584,65 +1579,6 @@ impl DaemonTerminalReservation {
             peer_generation,
             label: label.into(),
             expires_in_seconds,
-        }
-    }
-}
-
-/// Result of a race-free mode-gated terminal input admit attempt.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct DaemonModeGatedInputResult {
-    pub session_id: String,
-    /// Whether the worker wrote **all** input bytes to the PTY.
-    pub admitted: bool,
-    /// Number of request payload bytes actually written to the PTY.
-    pub bytes_written: usize,
-    pub kitty_enabled: bool,
-    pub cursor_visible: bool,
-    pub bracketed_paste: bool,
-    pub mouse_mode: u8,
-    pub alt_screen: bool,
-    pub focus_reporting: bool,
-    pub application_cursor: bool,
-    pub mode_generation: u64,
-    pub mode_revision: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error_kind: Option<String>,
-}
-
-impl DaemonModeGatedInputResult {
-    /// Build a full mode-gated input result body.
-    #[must_use]
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        session_id: impl Into<String>,
-        admitted: bool,
-        bytes_written: usize,
-        kitty_enabled: bool,
-        cursor_visible: bool,
-        bracketed_paste: bool,
-        mouse_mode: u8,
-        alt_screen: bool,
-        focus_reporting: bool,
-        application_cursor: bool,
-        mode_generation: u64,
-        mode_revision: u64,
-        error_kind: Option<String>,
-    ) -> Self {
-        Self {
-            session_id: session_id.into(),
-            admitted,
-            bytes_written,
-            kitty_enabled,
-            cursor_visible,
-            bracketed_paste,
-            mouse_mode,
-            alt_screen,
-            focus_reporting,
-            application_cursor,
-            mode_generation,
-            mode_revision,
-            error_kind,
         }
     }
 }
@@ -2924,7 +2860,7 @@ impl DaemonDiagnostic {
         Self {
             kind: DaemonDiagnosticKind::WorkerCompatibility,
             operation: Some(operation.into()),
-            feature: Some(FEATURE_MODE_GATED_INPUT.to_string()),
+            feature: Some(FEATURE_TERMINAL_READBACK.to_string()),
             message: Some(message.into()),
         }
     }
@@ -4746,7 +4682,7 @@ mod tests {
         assert!(!generated.contains(r#"| { type: "mode_gated_input"; session_id: string; data: string; mode_generation: number; mode_revision: number }"#));
         assert!(generated.contains("terminal_reservation?: DaemonTerminalReservation | null;"));
         assert!(generated.contains("export interface DaemonTerminalReservation"));
-        assert!(generated.contains(FEATURE_MODE_GATED_INPUT));
+        assert!(!generated.contains("mode_gated_input"));
     }
 
     #[test]
@@ -4771,37 +4707,6 @@ mod tests {
             })
         );
         assert_eq!(value["kind"], "terminal_reservation");
-    }
-
-    #[test]
-    fn new_client_rejects_hub_missing_mode_gated_input_feature() {
-        let requirement = DaemonCompatibilityRequirement::current();
-        // Keep conformance at the current floor so the feature-token check is the
-        // first rejection (not the conf floor). Models old Hub on protocol 6 that
-        // never advertised mode_gated_input.
-        let mut old_hub = DaemonCompatibility::current();
-        old_hub
-            .features
-            .retain(|feature| feature != FEATURE_MODE_GATED_INPUT);
-        let error = ensure_compatible(&requirement, &old_hub).expect_err("missing feature");
-        assert!(
-            error
-                .diagnostic
-                .contains("missing required feature(s): mode_gated_input"),
-            "unexpected diagnostic: {}",
-            error.diagnostic
-        );
-    }
-
-    #[test]
-    fn old_client_accepts_hub_with_mode_gated_input_at_protocol_6() {
-        let mut old_client = DaemonCompatibilityRequirement::current();
-        old_client
-            .required_features
-            .retain(|feature| feature != FEATURE_MODE_GATED_INPUT);
-        old_client.minimum_conformance_fixture_revision = 33;
-        ensure_compatible(&old_client, &DaemonCompatibility::current())
-            .expect("old client accepts newer hub with extra feature and conf floor");
     }
 
     #[test]
@@ -6445,9 +6350,6 @@ mod tests {
             mode_flags: Some(DaemonModeFlags::new(
                 "session", false, true, false, 9, false, false, false, 1, 1,
             )),
-            mode_gated_input: Some(DaemonModeGatedInputResult::new(
-                "session", true, 1, false, true, false, 9, false, false, false, 1, 1, None,
-            )),
             terminal_reservation: Some(DaemonTerminalReservation::new(
                 "session",
                 "subscription",
@@ -7105,7 +7007,6 @@ mod tests {
                 FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
                 FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS,
                 FEATURE_PLUGIN_ENTITY_SUBSCRIPTIONS,
-                FEATURE_MODE_GATED_INPUT,
                 FEATURE_HUB_SOURCE_UPDATE,
                 FEATURE_UNIX_TERMINAL_ADAPTER,
                 FEATURE_TERMINAL_SUBSCRIPTION_CLOSED,
@@ -7129,7 +7030,6 @@ mod tests {
                 FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
                 FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS,
                 FEATURE_PLUGIN_ENTITY_SUBSCRIPTIONS,
-                FEATURE_MODE_GATED_INPUT,
             ],
             "the default client requirement excludes optional capabilities",
         );

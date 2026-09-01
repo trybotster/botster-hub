@@ -180,62 +180,6 @@ impl HubClientApi {
                     .map_err(|error| runtime_error(request_id.clone(), operation, error))?;
                 HubClientResponseBody::Events(Vec::new())
             }
-            HubClientRequest::Input {
-                session_id,
-                data,
-                now_seconds,
-                ..
-            } => {
-                runtime
-                    .write_bytes(
-                        self.identity.client_id.clone(),
-                        session_id,
-                        data,
-                        now_seconds,
-                    )
-                    .map_err(|error| runtime_error(request_id.clone(), operation, error))?;
-                HubClientResponseBody::Events(Vec::new())
-            }
-            HubClientRequest::ModeGatedInput {
-                session_id,
-                data,
-                mode_generation,
-                mode_revision,
-                now_seconds,
-                ..
-            } => {
-                let outcome = runtime
-                    .mode_gated_input(
-                        self.identity.client_id.clone(),
-                        session_id.clone(),
-                        data,
-                        mode_generation,
-                        mode_revision,
-                        now_seconds,
-                    )
-                    .map_err(|error| runtime_error(request_id.clone(), operation, error))?;
-                HubClientResponseBody::ModeGatedInput(HubClientModeGatedInputResult::from_outcome(
-                    session_id, outcome,
-                ))
-            }
-            HubClientRequest::Resize {
-                session_id,
-                rows,
-                cols,
-                now_seconds,
-                ..
-            } => {
-                runtime
-                    .resize(
-                        self.identity.client_id.clone(),
-                        session_id,
-                        rows,
-                        cols,
-                        now_seconds,
-                    )
-                    .map_err(|error| runtime_error(request_id.clone(), operation, error))?;
-                HubClientResponseBody::Events(Vec::new())
-            }
             HubClientRequest::DrainRuntime { .. } => HubClientResponseBody::Events(Vec::new()),
             HubClientRequest::Shutdown {
                 session_id,
@@ -723,9 +667,6 @@ impl HubClientAdmission {
             | HubClientOperation::RemoveSession
             | HubClientOperation::Attach
             | HubClientOperation::Detach
-            | HubClientOperation::Input
-            | HubClientOperation::ModeGatedInput
-            | HubClientOperation::Resize
             | HubClientOperation::DrainRuntime
             | HubClientOperation::Shutdown
             | HubClientOperation::GuardedNotificationWrite
@@ -801,30 +742,6 @@ pub enum HubClientRequest {
         request_id: RequestId,
         session_id: SessionId,
         subscription_id: SubscriptionId,
-        now_seconds: u64,
-    },
-    /// Send terminal input bytes to one session.
-    Input {
-        request_id: RequestId,
-        session_id: SessionId,
-        data: Vec<u8>,
-        now_seconds: u64,
-    },
-    /// Race-free mode-dependent terminal input with Core mode freshness.
-    ModeGatedInput {
-        request_id: RequestId,
-        session_id: SessionId,
-        data: Vec<u8>,
-        mode_generation: u64,
-        mode_revision: u64,
-        now_seconds: u64,
-    },
-    /// Resize one session terminal.
-    Resize {
-        request_id: RequestId,
-        session_id: SessionId,
-        rows: u16,
-        cols: u16,
         now_seconds: u64,
     },
     /// Drain runtime output for one session through the core subscription path.
@@ -979,9 +896,6 @@ impl HubClientRequest {
             | Self::Spawn { request_id, .. }
             | Self::Attach { request_id, .. }
             | Self::Detach { request_id, .. }
-            | Self::Input { request_id, .. }
-            | Self::ModeGatedInput { request_id, .. }
-            | Self::Resize { request_id, .. }
             | Self::DrainRuntime { request_id, .. }
             | Self::Shutdown { request_id, .. }
             | Self::GuardedNotificationWrite { request_id, .. }
@@ -1020,9 +934,6 @@ impl HubClientRequest {
             Self::Spawn { .. } => HubClientOperation::Spawn,
             Self::Attach { .. } => HubClientOperation::Attach,
             Self::Detach { .. } => HubClientOperation::Detach,
-            Self::Input { .. } => HubClientOperation::Input,
-            Self::ModeGatedInput { .. } => HubClientOperation::ModeGatedInput,
-            Self::Resize { .. } => HubClientOperation::Resize,
             Self::DrainRuntime { .. } => HubClientOperation::DrainRuntime,
             Self::Shutdown { .. } => HubClientOperation::Shutdown,
             Self::GuardedNotificationWrite { .. } => HubClientOperation::GuardedNotificationWrite,
@@ -1063,9 +974,6 @@ pub enum HubClientOperation {
     Spawn,
     Attach,
     Detach,
-    Input,
-    ModeGatedInput,
-    Resize,
     DrainRuntime,
     Shutdown,
     GuardedNotificationWrite,
@@ -1117,7 +1025,6 @@ pub enum HubClientResponseBody {
     RoutedEnvelopeAck(HubClientRoutedEnvelopeAck),
     ReadScreen(HubClientReadScreen),
     ModeFlags(HubClientModeFlags),
-    ModeGatedInput(HubClientModeGatedInputResult),
     CaptureSnapshot(HubClientCaptureSnapshot),
     Packages(Vec<HubClientPackage>),
     PackageNavigation(Vec<HubClientPackageNavigationEntry>),
@@ -1267,68 +1174,6 @@ impl From<botster_core_daemon::ReadModeFlagsResult> for HubClientModeFlags {
             application_cursor: mode.application_cursor,
             mode_generation: freshness.mode_generation,
             mode_revision: freshness.mode_revision,
-        }
-    }
-}
-
-/// Client-facing mode-gated input admit result.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HubClientModeGatedInputResult {
-    pub session_id: SessionId,
-    pub admitted: bool,
-    pub bytes_written: usize,
-    pub kitty_enabled: bool,
-    pub cursor_visible: bool,
-    pub bracketed_paste: bool,
-    pub mouse_mode: u8,
-    pub alt_screen: bool,
-    pub focus_reporting: bool,
-    pub application_cursor: bool,
-    pub mode_generation: u64,
-    pub mode_revision: u64,
-    pub error_kind: Option<String>,
-}
-
-impl HubClientModeGatedInputResult {
-    fn from_outcome(
-        session_id: SessionId,
-        outcome: botster_core_daemon::ModeGatedInputOutcome,
-    ) -> Self {
-        match outcome {
-            botster_core_daemon::ModeGatedInputOutcome::PlainWritten => Self {
-                session_id,
-                admitted: true,
-                bytes_written: 0,
-                kitty_enabled: false,
-                cursor_visible: true,
-                bracketed_paste: false,
-                mouse_mode: 0,
-                alt_screen: false,
-                focus_reporting: false,
-                application_cursor: false,
-                mode_generation: 0,
-                mode_revision: 0,
-                error_kind: Some("plain_written_without_mode_token".to_string()),
-            },
-            botster_core_daemon::ModeGatedInputOutcome::Gated(result) => {
-                let mode = result.mode_flags;
-                let freshness = result.mode_freshness;
-                Self {
-                    session_id,
-                    admitted: result.admitted,
-                    bytes_written: result.bytes_written,
-                    kitty_enabled: mode.kitty_enabled,
-                    cursor_visible: mode.cursor_visible,
-                    bracketed_paste: mode.bracketed_paste,
-                    mouse_mode: mode.mouse_mode,
-                    alt_screen: mode.alt_screen,
-                    focus_reporting: mode.focus_reporting,
-                    application_cursor: mode.application_cursor,
-                    mode_generation: freshness.mode_generation,
-                    mode_revision: freshness.mode_revision,
-                    error_kind: result.error_kind,
-                }
-            }
         }
     }
 }

@@ -13,8 +13,7 @@
     "terminal_readback",
     "session_entity_subscriptions",
     "session_type_entity_subscriptions",
-    "plugin_entity_subscriptions",
-    "mode_gated_input"
+    "plugin_entity_subscriptions"
   ],
   "supported_features": [
     "sessions",
@@ -28,7 +27,6 @@
     "session_entity_subscriptions",
     "session_type_entity_subscriptions",
     "plugin_entity_subscriptions",
-    "mode_gated_input",
     "hub_source_update",
     "unix_terminal_adapter",
     "terminal_subscription_closed",
@@ -56,8 +54,6 @@
     "spawn",
     "attach",
     "drain",
-    "send_input",
-    "resize",
     "shutdown_session"
   ],
   "terminal_streaming": {

@@ -1080,8 +1080,7 @@ backend-opaque state. Their payloads, formats, and byte counts must never be use
 as evidence that visible terminal history exists. Only `ReadScreen.text` and
 later decoded `TerminalOutput` payload bytes are renderable terminal text.
 
-`DaemonRequest::ReadScreen`, `DaemonRequest::ReadModeFlags`,
-`DaemonRequest::ModeGatedInput`, and
+`DaemonRequest::ReadScreen`, `DaemonRequest::ReadModeFlags`, and
 `DaemonRequest::CaptureSnapshot` are control-plane request/response readback
 operations for a running session. They route through the same production path
 as other local clients:
@@ -1092,9 +1091,10 @@ authoritative `DaemonModeFlags` projection (`session_id`, `kitty_enabled`,
 `focus_reporting`, `application_cursor`) plus mode freshness
 (`mode_generation`, `mode_revision`). `mouse_mode` is the exact authoritative
 `u8` bitmask (`0` is off and combined tracking plus SGR reporting is `9`).
-Kitty keyboard and mouse encodings must use `ModeGatedInput` with the freshness
-token from `ReadModeFlags`; plain `SendInput` is only for non-mode-dependent
-input. Unknown sessions and backend failures return `operator_error` with no
+Clients send input, mode-gated input, and resize as compact binary frames on
+the bound duplex terminal route. Mode-gated input uses the freshness token from
+`ReadModeFlags`. The daemon protocol has no JSON terminal input route. Unknown
+sessions and backend failures return `operator_error` with no
 `mode_flags` body; clients must not substitute a successful zero value.
 `CaptureSnapshot` returns metadata only and never GHOSTSNP control-path bytes;
 current palette/special colors after session start are restored from data-plane

@@ -21,7 +21,10 @@ use botster_hub::{
 };
 
 mod support;
-use support::ensure_session_worker_binary;
+use support::{
+    bind_shared_terminal_adapter, ensure_session_worker_binary, send_terminal_input,
+    send_terminal_resize,
+};
 
 fn explicit_config() -> botster_hub::HubConfig {
     explicit_config_with_data_dir("target/botster-hub-test-data/runtime")
@@ -198,6 +201,12 @@ fn hub_runtime_routes_production_session_verbs_through_core_daemon() {
         )
         .expect("attach fake client through core daemon");
     logical_clock += 1;
+    let adapter = bind_shared_terminal_adapter(
+        &mut runtime,
+        client_id.clone(),
+        session_id.clone(),
+        subscription_id.clone(),
+    );
 
     drain_until(
         &mut runtime,
@@ -208,28 +217,21 @@ fn hub_runtime_routes_production_session_verbs_through_core_daemon() {
         &mut logical_clock,
     );
 
-    runtime
-        .resize(
-            client_id.clone(),
-            session_id.clone(),
-            30,
-            100,
-            logical_clock,
-        )
-        .expect("resize through core daemon");
+    send_terminal_resize(&adapter, 30, 100);
     logical_clock += 1;
-    let listed = runtime.list_sessions().expect("daemon list after resize");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let listed = loop {
+        let listed = runtime.list_sessions().expect("daemon list after resize");
+        if listed[0].size.rows == 30 && listed[0].size.cols == 100 {
+            break listed;
+        }
+        assert!(Instant::now() < deadline, "resize must reach the session");
+        thread::sleep(Duration::from_millis(10));
+    };
     assert_eq!(listed[0].size.rows, 30);
     assert_eq!(listed[0].size.cols, 100);
 
-    runtime
-        .write_bytes(
-            client_id.clone(),
-            session_id.clone(),
-            b"ping-hub\n".to_vec(),
-            logical_clock,
-        )
-        .expect("write input through core daemon");
+    send_terminal_input(&adapter, b"ping-hub\n");
     logical_clock += 1;
     drain_until(
         &mut runtime,
@@ -426,14 +428,13 @@ fn hub_runtime_uses_worker_backed_sessions_and_adopts_after_daemon_restart() {
         )
         .expect("attach through adopted worker");
     logical_clock += 1;
-    restarted
-        .write_bytes(
-            client_id.clone(),
-            session_id.clone(),
-            b"after-adopt\n".to_vec(),
-            logical_clock,
-        )
-        .expect("input through adopted worker");
+    let adapter = bind_shared_terminal_adapter(
+        &mut restarted,
+        client_id.clone(),
+        session_id.clone(),
+        subscription_id.clone(),
+    );
+    send_terminal_input(&adapter, b"after-adopt\n");
     logical_clock += 1;
     drain_until(
         &mut restarted,

@@ -174,9 +174,12 @@ fn run_loop(
             for state in close_batch {
                 let lookup = core.session_registry_state(&SessionId(state.key.session_id.clone()));
                 match session_close_event_decision(lookup) {
-                    Some(true) => state.report_if_live(true),
-                    Some(false) => state.report_if_live(false),
-                    None => {}
+                    Some(emit) => {
+                        let key = state.key.clone();
+                        state.report_if_live(emit);
+                        close_work.retire(&key.session_id, &key.subscription_id, key.generation);
+                    }
+                    None => close_work.requeue(state),
                 }
             }
         }

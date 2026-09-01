@@ -15,7 +15,7 @@ use botster_hub::{
 };
 
 mod support;
-use support::ensure_session_worker_binary;
+use support::{bind_shared_terminal_adapter, ensure_session_worker_binary, send_terminal_input};
 
 const RUNTIME_PACKAGE: &str = "runtime.synthetic-plugin";
 const RUNTIME_SESSION: &str = "runtime-local-session";
@@ -270,23 +270,12 @@ fn spawn_attach_input_and_drain(
         )
         .expect("runtime attach");
     *logical_clock += 1;
-    let generation = runtime
-        .list_terminal_subscriptions()
-        .into_iter()
-        .find(|row| row.session_id == session_id && row.subscription_id == subscription_id)
-        .map(|row| row.generation)
-        .expect("live generation");
-    runtime
-        .bind_terminal_adapter(
-            api.identity().client_id.clone(),
-            session_id.clone(),
-            subscription_id.clone(),
-            generation,
-            botster_core::TerminalCapabilitySet::from_tokens(["terminal_streaming", "resize"])
-                .expect("tokens"),
-            Box::new(botster_core_test_support::terminal_adapter::FakeTerminalAdapter::default()),
-        )
-        .expect("bind test adapter");
+    let terminal_adapter = bind_shared_terminal_adapter(
+        runtime,
+        api.identity().client_id.clone(),
+        session_id.clone(),
+        subscription_id.clone(),
+    );
     *logical_clock += 1;
     read_screen_until(
         runtime,
@@ -297,17 +286,7 @@ fn spawn_attach_input_and_drain(
         logical_clock,
     );
 
-    api.handle_request(
-        runtime,
-        packages,
-        HubClientRequest::Input {
-            request_id: request_id("runtime-input"),
-            session_id: session_id.clone(),
-            data: b"from-input\n".to_vec(),
-            now_seconds: *logical_clock,
-        },
-    )
-    .expect("send input through client api");
+    send_terminal_input(&terminal_adapter, b"from-input\n");
     *logical_clock += 1;
 
     let observed = drain_until(

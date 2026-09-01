@@ -243,12 +243,11 @@ the only operation that makes a retained reference unavailable.
 | `spawn_session` | Exposed | Host-admitted local session creation through CoreDaemon. |
 | `attach_client` | Exposed on the Unix/WebRTC daemon bind path | Local `HubClientApi::Attach` fail-closes. Successful Attach always binds an adapter. |
 | `detach_client` | Exposed | Explicit client subscription teardown through CoreDaemon. |
-| `write_bytes` | Exposed | Explicit client terminal input path through CoreDaemon. |
-| `resize` | Exposed | Explicit client terminal resize path through CoreDaemon. |
+| Bound terminal adapter input | Exposed on Unix and WebRTC terminal routes | Compact binary input, mode-gated input, and resize stay on the duplex adapter path. |
 | `guarded_write` | Exposed | Hub admits the request; CoreDaemon owns readiness and delivery states. |
 | `publish` / `drain` / `acknowledge` routed envelope | Exposed | Single CoreDaemon coordination bus for native MCP and Lua. |
 | `release_sessions_for_restart` / `adoption_scan` / `adopt_session` | Exposed | Explicit daemon restart/adoption over worker-backed sessions. |
-| `read_screen` / `read_mode_flags` / `mode_gated_input` / `capture_snapshot` | Exposed | Daemon-backed terminal readback and mode-gated input through `HubRuntime` and `CoreDaemon`; `read_mode_flags` returns full `ModeFlags` + freshness and preserves errors; `mode_gated_input` is the only mode-dependent input path (feature `mode_gated_input`, conf rev 34, protocol 6); `capture_snapshot` returns metadata only, keeping opaque GHOSTSNP bytes on the attach/drain Snapshot data plane. |
+| `read_screen` / `read_mode_flags` / `capture_snapshot` | Exposed | Daemon-backed terminal readback goes through `HubRuntime` and `CoreDaemon`. `read_mode_flags` returns full `ModeFlags` and freshness. `capture_snapshot` returns metadata only. Opaque GHOSTSNP bytes stay on the attach data plane. |
 | `report_delivery_*` | Deferred | Delivery-pressure reporting is not exposed on the production hub path yet. |
 | `PluginCapabilityRuntime::submit` | Exposed | Hub owns concrete local capability policy and submits through core request contracts. |
 | `PluginCapabilityRuntime::drain_events` | Exposed | Plugin capability completions and timer events are drained through a hub-owned path. |

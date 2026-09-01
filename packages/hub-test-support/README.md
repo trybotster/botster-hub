@@ -88,12 +88,12 @@ Use this exact package spec in npm-based client repos:
 
 `@trybotster/hub-test-support@0.1.42` carries byte-faithful live
 `terminal_output` payloads (`payload_base64`, `payload_encoding`, `bytes`)
-and authentic dual GHOSTSNP late-attach fixtures (conformance revision 46).
+and authentic dual GHOSTSNP late-attach fixtures (conformance revision 47).
 History attach uses incremental READY, PAGE, and FINISH Snapshot frames.
 No-history attach uses READY then FINISH. Import-visible state matches the
 ReadScreen oracles; do not dual-use a history-bearing golden as no-history.
-Protocol version is 7, including the live-output envelope, the
-`mode_gated_input` feature, full `ModeFlags` freshness fields, explicit
+Protocol version is 8. The package includes the live-output envelope, full
+`ModeFlags` freshness fields, explicit
 session-type execution modes, spawn-point session-type listing
 (`list_session_types_for_target`), and the session-type authoring view
 (`show_session_type_definition`). First-party clients should pin this
@@ -112,7 +112,7 @@ appended as terminal text. Version 0.1.6 / conformance revision 13 uses
 superseded JSON number arrays, while version 0.1.5 / revision 12 exposes
 lossy string history. Neither is current binary-history contract authority.
 
-Version 0.1.42 carries protocol version 7 / conformance revision 46 with
+Version 0.1.42 carries protocol version 8 / conformance revision 47 with
 advertised optional `unix_terminal_adapter`,
 `terminal_subscription_closed`, `webrtc_terminal_adapter`,
 `attach_occupancy`,
@@ -120,10 +120,10 @@ advertised optional `unix_terminal_adapter`,
 negotiated WebRTC `daemon_event` close delivery, and
 `snapshot_delivery=ready_then_history` support,
 byte-faithful live `terminal_output` payloads, incremental GHOSTSNP
-READY/PAGE/FINISH goldens, `mode_gated_input` ModeGatedInput +
-ModeFlags freshness, Snapshot-only GHOSTSNP rules, and the
+READY/PAGE/FINISH goldens, ModeFlags freshness, Snapshot-only GHOSTSNP rules,
+and the
 `DaemonSessionTypeExecution` contract. Version 0.1.35 is the prior published
-coordinate at protocol 7 / revision 40. Protocol 7 Hello must require
+coordinate at protocol 7 / revision 40. A compatible Hello must require
 `terminal_subscription_closed`
 (`FEATURE_TERMINAL_SUBSCRIPTION_CLOSED` /
 `DaemonCompatibilityRequirement::for_webrtc_terminal_subscription_closed()`)
