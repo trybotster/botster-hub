@@ -62,6 +62,8 @@ pub(crate) struct FakeDataChannel {
     pub(crate) send_hangs: AtomicBool,
     pub(crate) close_hangs: AtomicBool,
     pub(crate) close_started: AtomicBool,
+    pub(crate) close_probe: Mutex<Option<Arc<dyn Fn() -> bool + Send + Sync>>>,
+    pub(crate) close_probe_passed: AtomicBool,
     pub(crate) threshold_fails: AtomicBool,
     pub(crate) outstanding_bytes: std::sync::atomic::AtomicUsize,
     pub(crate) sent_before_low_water: AtomicBool,
@@ -133,6 +135,9 @@ impl LocalWebrtcDataChannel for FakeDataChannel {
 
     async fn local_close(&self) -> Result<(), String> {
         self.close_started.store(true, Ordering::Release);
+        if let Some(probe) = self.close_probe.lock().unwrap().as_ref() {
+            self.close_probe_passed.store(probe(), Ordering::Release);
+        }
         while self.close_hangs.load(Ordering::Acquire) {
             self.send_notify.notified().await;
         }

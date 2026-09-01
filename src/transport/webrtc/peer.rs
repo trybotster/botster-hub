@@ -1313,7 +1313,7 @@ mod tests {
         let previous_botster_env = std::env::var("BOTSTER_ENV").ok();
         unsafe {
             std::env::set_var("BOTSTER_ENV", "test");
-            std::env::set_var("BOTSTER_HUB_TEST_RESERVATION_EXPIRES_IN_SECONDS", "1");
+            std::env::set_var("BOTSTER_HUB_TEST_RESERVATION_EXPIRES_IN_SECONDS", "30");
         }
         let mut harness = PeerHarness::new("reservation-matrix");
         let mut peer_a = harness.signal_peer("http://127.0.0.1:41904");
@@ -1387,7 +1387,13 @@ mod tests {
                 .contains_key("matrix-over-limit")
         );
 
+        unsafe {
+            std::env::set_var("BOTSTER_HUB_TEST_RESERVATION_EXPIRES_IN_SECONDS", "1");
+        }
         let late = harness.subscribe_entities(&mut peer_a, "matrix-late");
+        unsafe {
+            std::env::set_var("BOTSTER_HUB_TEST_RESERVATION_EXPIRES_IN_SECONDS", "30");
+        }
         let late_reservation = late.subscription_reservation.expect("late reservation");
         std::thread::sleep(Duration::from_millis(1_100));
         assert!(matches!(
