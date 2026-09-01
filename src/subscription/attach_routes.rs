@@ -171,12 +171,30 @@ impl AttachStreamRegistry {
         let Some(client_id) = self.stream_owner_client_id(session_id, subscription_id) else {
             return Ok(Vec::new());
         };
-        let attached = runtime.attach_client(
-            ClientId(client_id),
-            SessionId(session_id.to_string()),
-            SubscriptionId(subscription_id.to_string()),
-            now_seconds,
+        let client_id = ClientId(client_id);
+        let session_id = SessionId(session_id.to_string());
+        let subscription_id = SubscriptionId(subscription_id.to_string());
+        runtime.expect_terminal_adapter(
+            client_id.clone(),
+            session_id.clone(),
+            subscription_id.clone(),
         )?;
+        let attached = match runtime.attach_client(
+            client_id.clone(),
+            session_id.clone(),
+            subscription_id.clone(),
+            now_seconds,
+        ) {
+            Ok(attached) => attached,
+            Err(error) => {
+                let _ = runtime.cancel_expected_terminal_adapter(
+                    client_id,
+                    session_id,
+                    subscription_id,
+                );
+                return Err(error);
+            }
+        };
         Ok(attached
             .client_egress
             .into_iter()

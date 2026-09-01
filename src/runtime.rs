@@ -3585,6 +3585,30 @@ impl HubRuntime {
             .cloned()
     }
 
+    /// Tell Core that the next attach will bind a terminal adapter.
+    pub fn expect_terminal_adapter(
+        &mut self,
+        client_id: ClientId,
+        session_id: SessionId,
+        subscription_id: SubscriptionId,
+    ) -> Result<(), CoreDaemonError> {
+        self.core_daemon.call(move |daemon| {
+            daemon.expect_terminal_adapter(client_id, session_id, subscription_id)
+        })
+    }
+
+    /// Retire a terminal adapter declaration that Core did not consume.
+    pub fn cancel_expected_terminal_adapter(
+        &mut self,
+        client_id: ClientId,
+        session_id: SessionId,
+        subscription_id: SubscriptionId,
+    ) -> Result<(), CoreDaemonError> {
+        self.core_daemon.call(move |daemon| {
+            daemon.cancel_expected_terminal_adapter(&client_id, session_id, subscription_id)
+        })
+    }
+
     /// Attach a client subscription to a session through the core daemon.
     pub fn attach_client(
         &mut self,
