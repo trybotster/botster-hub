@@ -37,6 +37,39 @@ Role playbooks:
 - `[[botster-hub-client-playbook]]` -- loaded because this ticket adds a public
   `botster-hub-client` DTO.
 
+Required Botster architecture context, from the `[[botster-planner-playbook]]`
+Must Load list:
+
+- `[[botster-architecture]]` -- the Botster domain map and source of architectural
+  truth. It already records this project's channel decisions, so the plan is
+  checked against it and not against the frozen artifact alone.
+- `[[cli-patterns]]` -- Rust CLI, TUI, PTY, and terminal-layer constraints.
+- `[[spa-patterns]]` -- React and entity-store frontend constraints, which bound
+  what the Web consumer ticket can rely on.
+- `[[botster orchestration should spawn agents with explicit target ids]]`
+- `[[botster orchestration prompts must bind agents to explicit worktrees]]`
+- `[[current botster is a modular repository family not the legacy trybotster monorepo]]`
+- `[[botster hub is a first party host profile over core]]`
+- `[[botster Hub Rust stays a trusted host kernel]]`
+- `[[lua plugins are the hub composition layer]]`
+- `[[concrete terminal transports stay in hub until a second host needs them]]`
+
+The three Project Pipelines notes in that Must Load list
+(`[[project pipeline orchestration belongs in a device-level botster plugin]]`,
+`[[project pipelines needs an operator workbench not more primitives]]`,
+`[[project pipelines ui contract belongs in the plugin readme]]`) were read and
+found not applicable: this ticket changes no Project Pipelines package, plugin, or
+workflow policy.
+
+Downstream DTO consumer proof:
+
+- `[[tui shaped Hub consumer proofs must include hub test support]]`
+- `[[a ui contract import line change costs one test line in each generic client]]`
+- `[[clean consumer smokes resolve exported root entrypoints not package json]]`
+- `[[Hub test support capability cutovers use a new unpublished package version]]`
+- `[[closed dependency tickets signal merged source not a consumable release]]`
+- `[[registry integrity compared against a pack of the intended commit retires stale tree publish risk]]`
+
 Class overlay:
 
 - `[[botster runtime teardown lenses]]` -- the runtime-teardown class applies.
@@ -167,6 +200,37 @@ queued mailbox memory. The aggregate policy must preserve isolation:
 
 64 MiB per peer is not accepted as residual risk.
 
+### 5.4 `question_1788281660_218527`, answer Option B
+
+Raised after Plan Review `finding_1788281488_295603` showed my `floor(cap / live_N)`
+share did not protect a later sibling.
+
+Decision: use an elastic connection pool with a fixed reserve of 4 events and
+65,536 bytes for each admitted package-event subscription. A subscription may
+borrow only capacity that is not reserved for another admitted subscription.
+Before admitting a new subscription, require its full event reserve and byte
+reserve to be free; if either is unavailable, reject `SubscribeEvents` immediately
+with one typed capacity reason. Do not evict, gap, close, or shrink an existing
+subscription. Do not add a waiting admission queue; the client retries after
+capacity drains. After admission the reservation is generation-scoped and released
+exactly once on rejection rollback, timeout, close, replacement, and retirement.
+
+Five proof cases were named and are acceptance check 9 arms (a) through (e).
+
+## 5.5 Plan Review response
+
+`review_1788281488_310273` returned `changes_required` with six findings. This
+revision answers all six.
+
+| Finding | Severity | Fix |
+|---------|----------|-----|
+| `finding_1788281488_295603` -- the live-N mailbox share does not protect a later sibling | high | Accepted; the defect was real. Redesigned in 5.4 and 6.5 as an elastic pool with a fixed reserve and fair admission rejection. Acceptance check 9 now has six arms and a red-on-revert control that restores the broken share and asserts arm (d) fails first |
+| `finding_1788281488_909963` -- the plan leaves required terminal aggregate behavior unowned | high | Accepted. A26, A27, and A27b moved from non-scope into scope as section 6.10 and acceptance checks 15, 16, and 17. `WRITE_ATTEMPT_BUDGET` re-verified as 512 at the current pin `e5a927c`, at `client_worker.rs:34` rather than the artifact's cited line 30 |
+| `finding_1788281488_393109` -- the public DTO change lacks required downstream source proof | high | Accepted. Acceptance check 12 now separates serde wire proof from downstream source proof, requires a TUI-shaped consumer worktree through a local Cargo patch redirect, records TUI and Web client costs, and adds an exported-root clean-install smoke |
+| `finding_1788281488_533842` -- the plan omits an open same-target publication conflict | high | Accepted. Section 8.1 records all five open `botster-hub` siblings, names the `hub-test-support` 0.1.42 publication conflict, keeps 0.1.42 unmutated, and registers `ticket_1788280618_295967` as a blocking dependency ahead of the 0.1.43 bump |
+| `finding_1788281488_593455` -- required Botster architecture context is absent from the recorded note list | medium | Accepted. Section 3 now records the `[[botster-planner-playbook]]` Must Load set, including `[[botster-architecture]]`, `[[cli-patterns]]`, and `[[spa-patterns]]`, and states why the three Project Pipelines notes do not apply |
+| `finding_1788281488_917063` -- Plan gate evidence omitted required fields | low | Partly a visibility defect, not a missing submission. `gate_result_1788281113_199176` carried all twelve required fields and passed, but the `step.completed` event for `run_step_1788280061_415917` recorded `evidence: {}` because `request_step_advance` was called without an evidence argument. This revision passes the evidence object to `request_step_advance` as well as `submit_gate`, and states the checklist id inline |
+
 ## 6. Scope
 
 ### 6.1 Connection budget, one table and one owner
@@ -231,6 +295,12 @@ There is one accounting site. No second limit path is added.
   unchanged, so the shipped terminal contract and the open Web terminal ticket
   `ticket_1787600676_914408` are not disturbed.
 
+This is a public Rust DTO field addition, so `[[botster-hub-client-playbook]]`
+requires serde wire proof and downstream **source** proof to stay separate, and
+requires representative consumer worktrees to build through a local Cargo patch
+redirect. Section 13 check 12 names both. The npm coordinate is constrained by an
+open publication ticket; see section 8.1.
+
 Hub returns the reservation on the `EntitySubscribed` and `EventSubscribed`
 responses over the control channel, immediately, without waiting for channel
 `open`.
@@ -262,14 +332,27 @@ responses over the control channel, immediately, without waiting for channel
   `consumer_queue_max_bytes` = 2 MiB.
 - A new per-connection residency ceiling of 128 events and 2 MiB spans all
   package-event mailboxes on one connection.
-- Fair share: with `N` live package-event subscriptions on a connection, each
-  subscription holds a reserved share of `floor(cap / N)` events and
-  `floor(cap / N)` bytes. A push beyond a subscription's reserved share succeeds
-  only from connection capacity that is not reserved for another subscription's
-  unmet share. This makes a noisy subscription unable to consume every sibling's
-  usable capacity.
-- Refusal sets the gap bit for the requesting subscription only, using the shipped
-  `event_gap` policy. No sibling is evicted, reordered, gapped, or closed.
+- **Elastic pool with a fixed reserve and fair admission.** An earlier draft used
+  a share of `floor(cap / live_N)` recomputed at push time. Plan Review correctly
+  rejected it (`finding_1788281488_295603`): a subscription admitted alone can
+  fill all 128 events, and a later sibling's share is then already occupied, so
+  the guarantee never covered later siblings. Human decision
+  `question_1788281660_218527` Option B replaces it:
+  - Each admitted package-event subscription holds a **fixed reserve** of 4 events
+    and 65,536 bytes.
+  - A subscription may **borrow** only capacity that is not reserved for another
+    admitted subscription. One subscription alone can therefore still use the full
+    128-event and 2 MiB depth.
+  - Before admitting a new subscription, both its event reserve and its byte
+    reserve must be free. If either is unavailable, `SubscribeEvents` is rejected
+    immediately with one typed capacity reason.
+  - No existing subscription is evicted, gapped, closed, or shrunk to make room.
+  - There is **no waiting admission queue**. The client retries after capacity
+    drains.
+  - The reservation is generation-scoped and released exactly once on rejection
+    rollback, timeout, close, replacement, and retirement.
+- A push refusal sets the gap bit for the requesting subscription only, using the
+  shipped `event_gap` policy. No sibling is evicted, reordered, gapped, or closed.
 - Both the subscription charge and the connection charge are released exactly once
   on send, drop, gap recovery, close, timeout, and generation retirement.
 - Every Hub-owned event bound in `src/config.rs:345-361` -- payload, fanout, rate,
@@ -356,9 +439,43 @@ delivery.
 - Changing the label scheme, encryption derivation, or chunking of the shipped
   terminal subscription channel.
 - Rolling the Core pin. It stays at `e5a927c3`.
-- Artifact rows A26, A27, and A27b. They are terminal-class aggregate rows owned
-  by the superseded `ticket_1787600674_500120`. This ticket implements the budget
-  they depend on but does not own their terminal proofs. See section 13.
+Artifact rows A26, A27, and A27b were previously listed here as non-scope. That
+was wrong and Plan Review rejected it (`finding_1788281488_909963`). This ticket
+puts the aggregate ceiling into the terminal write path, so it owns the terminal
+consequences of its own change. They are now in scope as section 6.10 and
+acceptance checks 15, 16, and 17.
+
+### 6.10 Terminal consequences of the aggregate, in scope
+
+The human decision in 5.1 covers the terminal class explicitly. Putting the
+aggregate predicate in the terminal write path changes terminal behavior, so this
+ticket owns and proves that behavior instead of leaving it to a superseded ticket.
+
+- A refused terminal send is **backpressure, not loss**. `try_write` returns
+  `TerminalAdapterWriteError::WouldBlock`, not `Full`, because the single
+  active-write slot is empty while the transport is not ready. `pressure()`
+  reports `TerminalAdapterPressure::WouldBlock`. Core retains the frame and the
+  Hub adapter must not retain it. Hub queues nothing, drops nothing, reorders
+  nothing, and retries nothing.
+- The aggregate is evaluated only on an **attempted** send. Saturation on its own
+  never calls the terminal adapter, so a test that asserts terminal pressure
+  without offering a frame exercises nothing.
+- The aggregate does not drift: after a full drain, `aggregate_buffered()` returns
+  to 0 and held classes resume. This is the property the derived sum of artifact
+  section 9.2 has and a stored counter does not.
+- **Sustained saturation converts to terminal route teardown, and this plan
+  accepts that deliberately.** At the current Core pin `e5a927c`,
+  `crates/botster-core/src/engine/client_worker.rs:34` sets
+  `WRITE_ATTEMPT_BUDGET = 512`. Every `WouldBlock` or `Full` result increments
+  `unsuccessful_writes`; a successful write resets it, so the budget counts
+  consecutive failures. At the budget Core calls `hard_stop` and tears the route
+  down. Core retention is therefore bounded, and no claim of unbounded retention
+  is made anywhere in this plan. The artifact cited this as `7eafa47:30`; the
+  value is still 512 at the current pin but the line is now 34. Verified by
+  reading the pinned crate source, not by trusting the artifact.
+- Mitigations: keep `AGGREGATE_BUFFERED_LOW` reachable quickly, and keep control
+  outside the aggregate (artifact section 9.1) so the teardown notice stays
+  sendable.
 
 ## 7. Repository ownership boundaries
 
@@ -382,8 +499,54 @@ delivery.
   section 9 obligations transfer to this ticket by the human decision in 5.1.
 - `ticket_1787894427_525056` -- closed and merged. This ticket builds on its
   reservation registry, subscription channel host, and per-channel pressure.
-- No new cross-repository prerequisite exists. No new dependency ticket is
-  registered.
+- No new cross-repository prerequisite exists. One **same-repository** blocking
+  dependency is registered; see section 8.1.
+
+### 8.1 Open same-target siblings, including a publication conflict
+
+The first sibling scan in this run was taken at about epoch 1788280300 and found
+one open `botster-hub` ticket. Two more were created during this Plan step. Plan
+Review was right that the plan omitted them (`finding_1788281488_533842`). A
+rescan through `search_tickets(target_id, status=open)` gives the current set.
+
+| Ticket | Title | Interaction |
+|--------|-------|-------------|
+| `ticket_1788280618_295967` | Hub: publish `@trybotster/hub-test-support` 0.1.42 with the terminal reservation DTO | **Blocking publication conflict.** Registered as a dependency |
+| `ticket_1788280452_111197` | Hub: move bound-adapter test progress off Core drain onto wake pumps | Semantic-rebase risk. It rewrites about 66 test call sites, including `tests/hub_daemon_lifecycle/webrtc_terminal_adapter.rs` and `src/subscription/attach_routes.rs`, which this ticket also changes. Renew review after any semantic rebase |
+| `ticket_1788206393_323469` | Hub: reproduce targeted `pump_woken` resize with merged Core | Low. It rolls the Core pin and resize behavior, not channel topology |
+| `ticket_1787600679_990088` | Integration: cold-cut the old terminal route and prove isolation | Downstream consumer of this merge, not a prerequisite |
+| `ticket_1787600691_401181` | Hub: enforce the Rust kernel and Lua composition boundary | Downstream audit of this merge, not a prerequisite |
+
+**The publication conflict.** `main` already carries
+`packages/hub-test-support` at 0.1.42 with `PROTOCOL_VERSION` 8,
+`CONFORMANCE_FIXTURE_REVISION` 47, and `DaemonTerminalReservation`, but npm
+publishes at most 0.1.41. `ticket_1788280618_295967` exists to publish 0.1.42, and
+`botster-web` `ticket_1787600676_914408` stays blocked until it does.
+
+An earlier draft of this plan bumped the repository straight to 0.1.43. That would
+have stranded 0.1.42 as a version that never matches a published artifact, and it
+would have broken the premise of `ticket_1788280618_295967`, whose acceptance
+requires the published `daemon-protocol.ts` and metadata sha256 values to equal
+the repository artifacts at 0.1.42.
+
+Resolution, in order:
+
+1. Do **not** mutate `packages/hub-test-support` at 0.1.42. Per
+   `[[Hub test support capability cutovers use a new unpublished package version]]`
+   a new capability takes a new version, and 0.1.42 additionally carries a pending
+   publish coordinate that another ticket and a Web consumer depend on.
+2. `ticket_1788280618_295967` is registered as a **blocking dependency** of this
+   ticket, so 0.1.42 publishes before this ticket bumps to 0.1.43.
+3. Then bump to 0.1.43 with `CONFORMANCE_FIXTURE_REVISION` 48 and the
+   `subscription_reservation` DTO.
+4. Per `[[closed dependency tickets signal merged source not a consumable release]]`,
+   the workspace-internal Rust change needs only a merged `origin/main` commit,
+   while the npm coordinate needs an actual publish. Those are different
+   availability proofs and this plan does not conflate them.
+5. Independently re-verify the dependency's output instead of trusting this plan's
+   text: read the published 0.1.42 metadata, and compare registry integrity
+   against a pack of the intended commit per
+   `[[registry integrity compared against a pack of the intended commit retires stale tree publish risk]]`.
 - Downstream consumers of this merge, already registered as separate tickets:
   `ticket_1787600684_892051` (Web entity and event channels) and
   `ticket_1787600679_990088` (Integration cold cut). They are consumers, not
@@ -478,7 +641,8 @@ Changed:
   remove `src/host_control_fair_write.rs`.
 - `crates/botster-hub-client/src/lib.rs` and `src/typescript.rs` -- the new DTO,
   `CONFORMANCE_FIXTURE_REVISION` 47 to 48.
-- `packages/hub-test-support/package.json` 0.1.42 to 0.1.43,
+- `packages/hub-test-support/package.json` 0.1.42 to 0.1.43, only after
+  `ticket_1788280618_295967` publishes 0.1.42 (see section 8.1);
   `packages/hub-test-support/README.md`, and every version, protocol, and revision
   literal in `packages/hub-test-support/test.mjs` (lines 135, 138, 178, 383, 421,
   and 738 today).
@@ -494,11 +658,12 @@ Changed:
 2. **The derived aggregate reads transport state from admission.** A blocking read
    on the owner thread would be a control-plane stall. Mitigation: assumption 9.6
    requires the atomic usage cell if the direct read can block.
-3. **Per-subscription mailboxes with a shared connection ceiling reintroduce a
-   bounded interaction.** At the ceiling a subscription can be gapped because
-   siblings hold capacity. Mitigation: reserved shares guarantee each subscription
-   `floor(cap / N)`; acceptance check 9 asserts a saturated subscription cannot
-   change a sibling's order, gap state, queue, or close state.
+3. **Fair admission can reject a subscribe that would have succeeded before this
+   change**, when a noisy sibling holds borrowed capacity. This is a deliberate,
+   visible, typed failure chosen over silent starvation, and there is no waiting
+   admission queue, so the client must retry. Mitigation: acceptance check 9 arms
+   (b) and (c) assert the rejection is typed, that no existing subscription is
+   evicted or shrunk, and that admission succeeds once capacity drains.
 4. **Folding lifecycle close events into the single control writer changes their
    ordering relative to responses.** Today the fair writer rotates between them.
    After the change they share one FIFO. A continuous request stream must not
@@ -507,14 +672,25 @@ Changed:
    traffic, with a bounded number of frames per turn.
 5. **A9 cannot be met as written.** The file is deleted but the behavior is
    deferred, per human decision 5.2. Recorded, not hidden.
-6. **Semantic rebase.** `ticket_1788206393_323469` is open against `botster-hub`.
-   If it merges first, review must be renewed after the rebase, per the project's
-   delivery rules.
+6. **Semantic rebase.** Four other tickets are open against `botster-hub`; see
+   section 8.1. `ticket_1788280452_111197` is the sharpest risk, because it
+   rewrites about 66 test call sites in files this ticket also changes. Renew
+   review after any semantic rebase, per the project's delivery rules.
 7. **Test count and runtime.** This ticket adds a 31-channel saturation harness.
    `[[source guard ablations must not overlap a running full suite]]` applies:
    complete and restore every source mutation before starting the official locked
    gate. Nested `cargo test` children recompile from the live tree, so a mid-suite
    source edit invalidates the run.
+8. **The aggregate ceiling converts sustained saturation into terminal route
+   teardown** after 512 consecutive unsuccessful attempts. This is a real behavior
+   change, not a test artifact. Section 6.10 accepts it deliberately, acceptance
+   check 17 proves the documented end state, and keeping
+   `AGGREGATE_BUFFERED_LOW` reachable plus control outside the aggregate are the
+   mitigations.
+9. **Package version ordering.** Bumping `hub-test-support` before
+   `ticket_1788280618_295967` publishes 0.1.42 would strand that coordinate and
+   keep the Web consumer blocked. Mitigation: the registered blocking dependency
+   and the section 8.1 step order.
 
 ## 12. Runtime-teardown lens answers
 
@@ -674,12 +850,26 @@ Every check is a deterministic Rust gate. Wall-clock values are observations onl
    first wait for a known payload marker on the surviving channel in the same
    traffic window, and prove every isolation channel reached `Open`, before any
    zero-frame assertion on the rejected channel.
-9. **Package-event isolation and the per-connection ceiling.** With 32
-   package-event subscriptions on one connection, assert total residency never
-   exceeds 128 events and 2 MiB; assert a saturated subscription is gapped alone;
-   and assert no sibling's order, gap state, queue, or close state changes.
-   Red-on-revert: remove the reserved-share rule and assert a noisy subscription
-   then starves a sibling, failing this check first.
+9. **Package-event isolation, reserve, and fair admission.** Five named arms from
+   human decision `question_1788281660_218527`, plus the ceiling arm:
+   a. One subscription alone uses the full 128-event and 2 MiB depth.
+   b. A later `SubscribeEvents` is rejected with one typed capacity reason while
+      its 4-event or 65,536-byte reserve is unavailable. Assert no existing
+      subscription was evicted, gapped, closed, or shrunk, and that no waiting
+      admission queue exists.
+   c. After capacity drains, that later subscription is admitted and keeps its
+      reserve.
+   d. A noisy admitted subscription cannot consume an admitted sibling's reserve:
+      the sibling still accepts its full 4 events and 65,536 bytes while the noisy
+      one sits at its own limit.
+   e. Count and byte accounting do not drift across every teardown path:
+      rejection rollback, timeout, close, replacement, and retirement, each
+      released exactly once.
+   f. With 32 admitted subscriptions, total residency never exceeds 128 events and
+      2 MiB.
+   Red-on-revert: restore the earlier `floor(cap / live_N)` push-time share and
+   assert arm (d) fails first, because a subscription admitted alone then occupies
+   a later sibling's guarantee.
 10. **Control writer does not starve lifecycle events.** Under a continuous
     control request stream, assert a pending lifecycle close event still reaches
     the client, and that the writer emits a bounded number of frames per turn.
@@ -691,12 +881,30 @@ Every check is a deterministic Rust gate. Wall-clock values are observations onl
     and that the entity and event framing symbols left
     `src/transport/webrtc/control_channel.rs` and entered
     `src/transport/webrtc/subscription_channel.rs`. No forwarding wrapper remains.
-12. **DTO gates.** Serde wire proof for `subscription_reservation` separate from
-    downstream source proof; generated TypeScript regenerated and asserted;
-    `CONFORMANCE_FIXTURE_REVISION` 48; `@trybotster/hub-test-support` 0.1.43 as a
-    new unpublished version; every version, protocol, and revision literal in
-    `packages/hub-test-support/test.mjs` updated; `npm install --no-save` then
-    `npm test` in `packages/hub-test-support`.
+12. **DTO gates, wire proof and source proof kept separate.**
+    a. *Serde wire proof:* `subscription_reservation` round-trips, is omitted when
+       `None`, and an older client that does not know the field still decodes the
+       response.
+    b. *Downstream source proof:* build representative consumer worktrees through
+       a local Cargo `[patch]` redirect, not the workspace path. The consumer must
+       be TUI-shaped per
+       `[[tui shaped Hub consumer proofs must include hub test support]]`: it
+       declares `botster-hub-client`, `botster-ui-contract`, and
+       `botster-hub-test-support` as a dev-dependency, and it is built in a mode
+       that actually compiles the dev-dependency. A client-only consumer cannot
+       observe a `botster-hub-test-support` build failure.
+    c. *Client cost measurement:* record both the TUI all-target cost and the Web
+       exact-artifact cost per
+       `[[a ui contract import line change costs one test line in each generic client]]`.
+    d. *Package gates, only after the section 8.1 dependency publishes 0.1.42:*
+       regenerate and assert the TypeScript, set `CONFORMANCE_FIXTURE_REVISION`
+       48, take `@trybotster/hub-test-support` 0.1.43 as a new unpublished
+       version, update every version, protocol, and revision literal in
+       `packages/hub-test-support/test.mjs`, then run `npm install --no-save` and
+       `npm test` in `packages/hub-test-support`.
+    e. *Clean-consumer smoke:* resolve the installed scoped package through its
+       exported root entrypoint, not `package.json`, per
+       `[[clean consumer smokes resolve exported root entrypoints not package json]]`.
 13. **Live Hub proof.** Prove the contract through the exact Hub binary, recording
     the Hub SHA and its lockfile-pinned worker Core SHA separately, per
     `[[live hub proof records distinct hub and locked core binary provenance]]`.
@@ -711,6 +919,31 @@ Every check is a deterministic Rust gate. Wall-clock values are observations onl
     - `RUSTUP_TOOLCHAIN=1.97.0 cargo build --locked --bin botster-hub`
     - `RUSTUP_TOOLCHAIN=1.97.0 ./test.sh --locked`
 
+15. **A26, the aggregate does not drift.** Reach the exact ceiling with the
+    section 14.3 setup, drain every channel fully, and assert
+    `aggregate_buffered()` returns to 0 and held classes resume. Red-on-revert:
+    replace the derived sum with a counter incremented on send and decremented on
+    `bufferedAmountLow`, and assert this check fails first, because the low-water
+    event carries no byte delta and transport drains are never subtracted.
+16. **A27, a refused terminal send is backpressure, not loss.** Substitute one
+    terminal channel for one of the 29 entity channels in the section 14.3 setup,
+    keeping 31 channels and exactly 2,097,152 B, so the free-slot and ceiling
+    properties of check 5 are preserved. Then offer one 65,536 B terminal frame
+    and assert, in order: the aggregate predicate refuses it; `try_write` returns
+    `WouldBlock` and not `Full`; `pressure()` is `WouldBlock`; Core retains the
+    frame while the Hub adapter does not; `aggregate_buffered()` is still exactly
+    2,097,152 B; and after draining below 1,048,576 B the same frame is delivered
+    byte-exact, in order, with no duplicate from the refused attempt. Drive at
+    most 8 attempts before the drain, two orders of magnitude below Core's 512, so
+    a slow drain on a loaded runner cannot silently convert this into a teardown
+    test. Also assert Hub drops, reorders, and retries no terminal frame at any
+    point in the sequence.
+17. **A27b, sustained pressure reaches Core's documented hard stop.** Hold
+    aggregate pressure through 512 consecutive unsuccessful attempts without
+    draining, and assert Core calls `hard_stop`, emits `ClientWorkerTeardown`, and
+    Hub retires the corresponding route. This proves the real end state instead of
+    asserting retention that the Core contract does not provide.
+
 Every exact `cargo test` filter uses the full module path and shows a one-test
 baseline before an ablation loop, per
 `[[exact Rust test ablations require a one test baseline]]`. A bare leaf name
@@ -718,13 +951,14 @@ filters out every test and still reports `ok`, which turns an ablation arm false
 green. Every source mutation is completed and restored before the official locked
 gate starts, per `[[source guard ablations must not overlap a running full suite]]`.
 
-**Artifact rows carried by this ticket:** A5 (shared with the superseded 674), A9
-(partially, see 6.8), A10, and A25 (shared with 674). Rows A4, A6, A7, A8, A8b,
-A8c, A26, A27, and A27b were owned by the superseded `ticket_1787600674_500120`.
-This ticket implements the budget those rows depend on, and checks 3, 4, 6, and 8
-above cover A7, A8b, and A6 for the entity and package-event classes. The
-terminal-class rows A26, A27, and A27b remain unowned and are named in section 15
-as a project gap for the orchestrator, not silently absorbed here.
+**Artifact rows carried by this ticket:** A5, A6, A7, A8b, A9 (partially, see
+6.8), A10, A25, A26, A27, and A27b. Every row that depends on the section 9 budget
+is now owned here, because this ticket builds that budget. Checks 3, 4, and 6
+cover A7 and A8b; check 8 covers A5, A6, and A10; check 5 covers A25; checks 15,
+16, and 17 cover A26, A27, and A27b. Rows A4, A8, and A8c already landed through
+the merged cold cut `ticket_1787894427_525056` for the terminal class, and checks
+2 and 3 extend the same guards to the entity and package-event classes. No row
+that depends on this ticket's budget is left unowned.
 
 ## 14. Vault gaps worth capturing
 
