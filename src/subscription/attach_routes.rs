@@ -220,6 +220,19 @@ impl AttachStreamRegistry {
     pub(crate) fn cancel_stream(&mut self, session_id: &str, subscription_id: &str) {
         self.forget_connection_bound_route(session_id, subscription_id);
         self.close_adapter(session_id, subscription_id);
+        self.remove_stream_metadata(session_id, subscription_id);
+    }
+
+    pub(crate) fn forget_stream_without_adapter_close(
+        &mut self,
+        session_id: &str,
+        subscription_id: &str,
+    ) {
+        self.forget_connection_bound_route(session_id, subscription_id);
+        self.remove_stream_metadata(session_id, subscription_id);
+    }
+
+    fn remove_stream_metadata(&mut self, session_id: &str, subscription_id: &str) {
         self.streams
             .remove(&(session_id.to_string(), subscription_id.to_string()));
         if let Some(subscriptions) = self.active_subscriptions.get_mut(session_id) {
@@ -790,6 +803,7 @@ pub(crate) enum AttachedSubscriptionChange {
 pub(crate) enum UnixEofAblation {
     None,
     LeaveRoute,
+    SkipCoreDetach,
     PairOnlyDetach,
 }
 
@@ -799,6 +813,7 @@ pub(crate) fn unix_eof_cleanup_ablation() -> UnixEofAblation {
     }
     match env::var("BOTSTER_HUB_UNIX_EOF_ABLATION").as_deref() {
         Ok("leave_route") => UnixEofAblation::LeaveRoute,
+        Ok("skip_core_detach") => UnixEofAblation::SkipCoreDetach,
         Ok("pair_only_detach") => UnixEofAblation::PairOnlyDetach,
         _ => UnixEofAblation::None,
     }

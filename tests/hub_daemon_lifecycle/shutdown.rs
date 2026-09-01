@@ -2603,6 +2603,147 @@ fn process_ownership_daemon_restart_adopts_then_shuts_down_worker_session() {
 }
 
 #[test]
+fn data_plane_stop_timeout_aborts_then_restart_adopts_residue() {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::process::ExitStatusExt;
+
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("data-plane-stop-timeout");
+    let seam_dir = unique_short_test_dir("data-plane-stop-timeout-seams");
+    fs::create_dir_all(&seam_dir).expect("create data-plane stop seam directory");
+    let park_value = seam_dir.display().to_string();
+    let stop_marker = seam_dir.join("stop-timeout");
+    let stop_marker_value = stop_marker.display().to_string();
+    let core_shutdown_marker = seam_dir.join("core-shutdown");
+    let core_shutdown_marker_value = core_shutdown_marker.display().to_string();
+    let daemon = start_cli_daemon_with_env(
+        &data_dir,
+        &[
+            (
+                "BOTSTER_HUB_TEST_PARK_DATA_PLANE_TURN",
+                park_value.as_str(),
+            ),
+            (
+                "BOTSTER_HUB_TEST_DATA_PLANE_STOP_MARKER",
+                stop_marker_value.as_str(),
+            ),
+            (
+                "BOTSTER_HUB_TEST_CORE_SHUTDOWN_MARKER",
+                core_shutdown_marker_value.as_str(),
+            ),
+        ],
+    );
+    let endpoint = botster_hub_client::DaemonEndpoint::new(daemon_socket_path(&data_dir));
+    let session_id = "data-plane-stop-timeout-session";
+    let spawn = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: session_id.to_string(),
+            command: "sleep 30".to_string(),
+        },
+    )
+    .expect("spawn worker-backed session before abort");
+    assert_eq!(spawn.kind, botster_hub_client::DaemonResponseKind::Spawned);
+    let before_identity = wait_for_registry_worker(&data_dir);
+    let command_pid = before_identity.pid.expect("command pid before abort");
+    let worker_pid = worktree_session_worker_ancestor(command_pid)
+        .expect("session worker ancestor before abort");
+    assert!(process_exists(worker_pid));
+
+    let stale_socket = daemon_socket_path(&data_dir);
+    let stale_socket_ino = fs::metadata(&stale_socket)
+        .expect("socket exists before abort")
+        .ino();
+    fs::write(seam_dir.join("park"), b"park").expect("park data-plane turn");
+    let hub_pid = daemon.id();
+    let mut child = daemon.disarm();
+    let stop_started = Instant::now();
+    let shutdown_request = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("shutdown")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start shutdown request without waiting for Hub exit");
+    let entered_deadline = Instant::now() + Duration::from_secs(3);
+    while !seam_dir.join("entered").is_file() {
+        assert!(
+            Instant::now() < entered_deadline,
+            "data-plane driver must enter the deterministic parked stop turn"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let exit_deadline = Instant::now() + Duration::from_secs(6);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll aborted Hub child") {
+            break status;
+        }
+        assert!(
+            Instant::now() < exit_deadline,
+            "parked data-plane shutdown must terminate within its stop bound"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        stop_started.elapsed() >= Duration::from_secs(2)
+            && stop_started.elapsed() < Duration::from_secs(6),
+        "abort must occur at the documented 2.5 second data-plane stop bound: elapsed={:?}",
+        stop_started.elapsed()
+    );
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGABRT),
+        "the terminal timeout action must abort the Hub process: {status:?}"
+    );
+    let shutdown_output = shutdown_request
+        .wait_with_output()
+        .expect("shutdown request exits after Hub abort");
+    assert!(
+        shutdown_output.status.success(),
+        "shutdown request must observe the Hub exit: stdout={} stderr={}",
+        String::from_utf8_lossy(&shutdown_output.stdout),
+        String::from_utf8_lossy(&shutdown_output.stderr)
+    );
+    assert!(!process_exists(hub_pid), "no Hub process may survive abort");
+    assert_eq!(
+        fs::read_to_string(&stop_marker).expect("stop-timeout marker"),
+        "data_plane_driver_stop_timeout"
+    );
+    assert!(
+        !core_shutdown_marker.exists(),
+        "CoreDaemon::shutdown must not run while the data-plane owner can still run"
+    );
+    assert!(process_exists(worker_pid), "abort intentionally leaves the worker for adoption");
+    assert!(stale_socket.exists(), "abort intentionally leaves the stale socket");
+
+    fs::remove_file(seam_dir.join("park")).expect("release obsolete parked-turn seam");
+    let restarted = start_cli_daemon(&data_dir);
+    let replacement_socket_ino = fs::metadata(&stale_socket)
+        .expect("replacement socket exists after restart")
+        .ino();
+    assert_ne!(
+        replacement_socket_ino, stale_socket_ino,
+        "next start must replace the stale socket"
+    );
+    let after_identity = wait_for_registry_worker(&data_dir);
+    let adopted_command_pid = after_identity.pid.expect("adopted command pid");
+    let adopted_worker_pid = worktree_session_worker_ancestor(adopted_command_pid)
+        .expect("adopted session worker ancestor");
+    assert_eq!(adopted_worker_pid, worker_pid, "restart must adopt, not duplicate, the worker");
+    assert!(
+        process_snapshot(worker_pid).is_some_and(|snapshot| !snapshot.stat.starts_with('Z')),
+        "the adopted worker must not be a zombie"
+    );
+
+    shutdown_short_lived_session(&endpoint, session_id);
+    restarted.shutdown();
+    assert!(!process_exists(worker_pid), "orderly successor shutdown must reap the worker");
+    assert!(!stale_socket.exists(), "orderly successor shutdown must remove the socket");
+    let _ = fs::remove_dir_all(seam_dir);
+}
+
+#[test]
 fn daemon_resolves_terminal_app_foreground_launch_contract() {
     let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("resolve-terminal-app");
