@@ -68,6 +68,13 @@ pub(crate) fn observe_rejected_data_channel_for_test(
     let lost_claim = !claimed;
     let close_ok = matches!(close, Ok(Ok(())));
     // extra-channel close marker requires lost_claim && close_ok
+    if lost_claim
+        && close_ok
+        && let Ok(path) = std::env::var(TEST_EXTRA_CHANNEL_CLOSE_MARKER_ENV)
+        && !path.is_empty()
+    {
+        let _ = std::fs::write(path, "closed\n");
+    }
     if let Ok(path) = std::env::var(TEST_EXTRA_CHANNEL_OBSERVATION_ENV)
         && !path.is_empty()
     {
@@ -77,14 +84,11 @@ pub(crate) fn observe_rejected_data_channel_for_test(
             "label": label,
         })
         .to_string();
-        let _ = std::fs::write(path, body);
-    }
-    if lost_claim
-        && close_ok
-        && let Ok(path) = std::env::var(TEST_EXTRA_CHANNEL_CLOSE_MARKER_ENV)
-        && !path.is_empty()
-    {
-        let _ = std::fs::write(path, "closed\n");
+        let path = std::path::PathBuf::from(path);
+        let temporary = path.with_extension("tmp");
+        if std::fs::write(&temporary, body).is_ok() {
+            let _ = std::fs::rename(temporary, path);
+        }
     }
 }
 pub(crate) async fn reject_extra_data_channel<C>(
@@ -1053,6 +1057,16 @@ mod tests {
         assert!(
             marker.exists(),
             "close marker must write for any rejected label after lost_claim and Ok(Ok(()))"
+        );
+        let observed: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&observation).expect("read complete observation"),
+        )
+        .expect("observation must contain complete JSON");
+        assert_eq!(observed["lost_claim"], true);
+        assert_eq!(observed["close_ok"], true);
+        assert!(
+            !observation.with_extension("tmp").exists(),
+            "atomic observation publication must retire its temporary file"
         );
         std::fs::remove_file(&marker).expect("reset close marker");
         observe_rejected_data_channel_for_test(false, &close, EXTRA_DATA_CHANNEL_LABEL);
