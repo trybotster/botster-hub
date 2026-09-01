@@ -259,6 +259,7 @@ impl UnixConnectionMux {
         generation: u64,
         handle: UnixTerminalAdapterHandle,
     ) {
+        let forced_would_block_delay = forced_would_block_delay(&session_id);
         if let Ok(mut routes) = self.inner.routes.lock() {
             let key = (session_id.clone(), subscription_id.clone(), generation);
             routes.insert(
@@ -284,6 +285,18 @@ impl UnixConnectionMux {
                 Arc::new(move || notify.notify_waiters()),
             );
             handle.attach_close_hook(move |host_closed| hook.notify_closed(host_closed));
+        }
+        if let Some(delay) = forced_would_block_delay {
+            let inner = Arc::downgrade(&handle.inner);
+            std::thread::Builder::new()
+                .name("botster-hub-test-pressure".to_string())
+                .spawn(move || {
+                    std::thread::sleep(delay);
+                    if let Some(inner) = inner.upgrade() {
+                        inner.slot.set_would_block(true);
+                    }
+                })
+                .expect("start test pressure timer");
         }
         self.inner.notify.notify_waiters();
     }
@@ -489,6 +502,20 @@ impl UnixConnectionMux {
             route.handle.clear_defer_flush();
         }
     }
+}
+
+fn forced_would_block_delay(session_id: &str) -> Option<std::time::Duration> {
+    if std::env::var("BOTSTER_ENV").as_deref() != Ok("test")
+        || std::env::var("BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_SESSION").as_deref()
+            != Ok(session_id)
+    {
+        return None;
+    }
+    let delay_ms = std::env::var("BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_DELAY_MS")
+        .ok()
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or(0);
+    Some(std::time::Duration::from_millis(delay_ms))
 }
 
 impl UnixTerminalAdapterHandle {

@@ -1234,6 +1234,33 @@ mod tests {
     }
 
     #[test]
+    fn data_plane_keeps_core_daemon_on_its_owner_thread() {
+        let source = production_source(include_str!("data_plane/driver.rs"));
+        for forbidden in [
+            "unsafe impl Send",
+            "unsafe impl Sync",
+            "Arc<Mutex<CoreDaemon",
+            "SharedCore",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "data-plane driver must not override CoreDaemon thread ownership with {forbidden}"
+            );
+        }
+        for required in [
+            "CoreDaemon::new(core_config)",
+            "daemon.wake_pump_control()",
+            "core_daemon.wait_pump(",
+            "self.core.control.request_stop()",
+        ] {
+            assert!(
+                source.contains(required),
+                "data-plane driver must keep the supported Core owner seam: {required}"
+            );
+        }
+    }
+
+    #[test]
     fn two_argument_drain_scan_is_independent_of_local_variable_names() {
         assert!(contains_two_argument_drain("core.drain(&id, now_seconds);"));
         assert!(contains_two_argument_drain(

@@ -95,7 +95,7 @@ No other repository charter is loaded. No Project Pipelines overlay is required.
 - Hub gates: `test.sh`, `docs/hub-resource-proof.md`, `docs/lifecycle-suite-harness.md`,
   `tests/hub_daemon_lifecycle/*`.
 - Dependency repository source at `botster-core` `origin/main` =
-  `b292c382e0a04847054e40a079974d125817d583`, including
+  `786f61c5aeec42b416826af6ca0b4be9f3cc3c0f`, including
   `docs/architecture/core-daemon.md`, `docs/architecture/terminal-adapter.md`,
   `crates/botster-core/src/contract/terminal_adapter.rs`,
   `crates/botster-core/src/contract/terminal_wake.rs`,
@@ -124,7 +124,7 @@ No other repository charter is loaded. No Project Pipelines overlay is required.
    four-byte header (scheme version `1`, kind `1` input / `2` mode-gated input / `3` resize,
    `u16` body length) plus an opaque body. Hub validates the header only and must not decode
    the body. Core owns semantic decode.
-6. `TerminalCompatibility::current()` at `b292c38` again requires
+6. `TerminalCompatibility::current()` at `786f61c` requires
    `transport=duplex_binary` in the default required-feature list. There is no legacy
    requirement path to select.
 7. WebRTC terminal output today is encrypted and sent on the **control** DataChannel by
@@ -151,7 +151,9 @@ No other repository charter is loaded. No Project Pipelines overlay is required.
 ### 1. Core pin roll (one family, one revision)
 
 Pin every `botster-core` dependency to
-`b292c382e0a04847054e40a079974d125817d583`. No mixed revisions.
+`786f61c5aeec42b416826af6ca0b4be9f3cc3c0f`. No mixed revisions. This revision
+adds the supported single-owner wake-pump seam from Core dependency
+`ticket_1788220245_689733`.
 
 Surfaces: `Cargo.toml` (5 rev literals), `crates/botster-hub-test-support/Cargo.toml` (3),
 `crates/botster-hub-client/Cargo.toml` (1),
@@ -186,18 +188,19 @@ and `WakingTerminalAdapter` through this shared inner. Hub stays content blind.
 ### 3. Wake-driven data-plane driver
 
 New `src/data_plane.rs` and `src/data_plane/driver.rs`. One thread named
-`botster-hub-data-plane`:
+`botster-hub-data-plane` constructs, owns, mutates, shuts down, and drops `CoreDaemon`.
 
-- clones `TerminalWakeSource` at start;
-- blocks in `wait_wakes(WATCHDOG)` **without** holding the `CoreDaemon` mutex;
-- locks the mutex only for `pump_woken(&batch, now_seconds)` and releases it;
-- drains a bounded slice of route-specific close work;
-- exits on an explicit stop flag plus a pushed wake, and is joined before
-  `CoreDaemon::shutdown`.
+- The thread calls `wake_pump_control()` once and returns only its thread-safe control handle.
+- The thread blocks in `wait_pump(WATCHDOG)` and calls `pump_woken` for real wake batches.
+- `HubRuntime` sends bounded host operations through a 64-slot request channel.
+- A host request marks pending work and interrupts only a blocked wait. It never gains direct
+  daemon access.
+- One turn executes at most 64 host requests and eight route-close keys.
+- `request_stop()` interrupts the wait. The owner pumps the one permitted collision batch,
+  observes `WakePumpWait::Stopped`, finishes accepted requests, and then performs Core shutdown.
 
-`HubRuntime.core_daemon` becomes `Arc<Mutex<CoreDaemon>>`. The driver thread receives only
-that `Arc`, the wake source, and the close-work source. There remains exactly one
-`CoreDaemon`, one owner, and one mutex.
+No `CoreDaemon`, `Rc`, or `RefCell` value crosses a thread boundary. Hub adds no unsafe
+`Send` or `Sync` implementation and no shared mutable daemon wrapper.
 
 ### 4. Route-specific close progress (repairs `finding_1788048365_134036`)
 
@@ -425,6 +428,8 @@ route deletion and the Attach reservation, both of which the cold cut requires.
   - `ticket_1787894965_150479` (Hub decomposition 4b).
   - `ticket_1788054075_697438` (Core: restore the direct duplex requirement) — output is
     `botster-core` `b292c38`.
+  - `ticket_1788220245_689733` (Core: expose a supported thread-safe wake-pump host seam) —
+    output is `botster-core` `786f61c` and supersedes the earlier Hub mutex design.
 - Downstream consumers `botster-web` and `botster-tui` must be registered as dependent
   tickets against their own repository targets, because this merge removes the JSON terminal
   routes they use today.
@@ -446,36 +451,30 @@ long-lived host thread to the terminal byte path.
   because those routes share the socket or the peer.
 
 `teardown_bounds`
-- The driver never blocks on transport I/O. `wait_wakes` uses a watchdog timeout that is a
+- The driver never blocks on transport I/O. `wait_pump` uses a watchdog timeout that is a
   hang bound, not a progress mechanism.
-- The `CoreDaemon` mutex is held only across one `pump_woken` call and one bounded close
-  slice, never across `wait_wakes`.
+- One data-plane thread owns `CoreDaemon`. A bounded request bridge serializes Hub host work
+  on that same thread. No mutex shares the daemon across threads.
 - Per-turn work is bounded by explicit constants: pumped routes, close keys, and ingress
   frames drained.
 - WebRTC channel and peer close keep the existing `LOCAL_WEBRTC_PEER_CLOSE_BOUND` and always
   reach cleanup, per [[WebRTC DataChannel local close uses the peer close bound before cleanup]].
 - Hard stop, stated exactly, because `JoinHandle::join` has no timeout:
 
-  1. **Stop signal.** `HubRuntime::release_for_restart` sets an `AtomicBool` stop flag, then
-     pushes one wake into the shared `TerminalWakeSource`, so an in-flight
-     `wait_wakes(WATCHDOG)` returns at once. The driver tests the flag at the top of each
-     turn and again immediately after `wait_wakes` returns.
-  2. **Completion signal.** The driver owns the `SyncSender` half of a
-     `mpsc::sync_channel::<()>(1)` created at start. Sending on it is the driver's last
-     action before it returns, and it happens **after** the `CoreDaemon` mutex guard is
-     dropped. Hub waits with `rx.recv_timeout(DATA_PLANE_STOP_BOUND)`.
-     - `Ok(())` means the driver has finished all mutex work and is returning.
-     - `Err(Disconnected)` means the sender was dropped by a panic unwind. The mutex guard
-       is released by unwinding, so the driver takes no further Core work.
-     Both outcomes make the following `join()` bounded, so Hub calls `join()` next and only
-     then calls `CoreDaemon::shutdown`.
+  1. **Stop signal.** `HubRuntime::release_for_restart` stops request admission, selects the
+     restart-release action, and calls `WakePumpControl::request_stop()`. This call interrupts
+     an in-flight `wait_pump(WATCHDOG)`.
+  2. **Completion signal.** The Core owner pumps the one permitted stop-collision batch,
+     observes `WakePumpWait::Stopped`, finishes accepted requests, performs the selected Core
+     shutdown or restart release, and sends one completion signal. Hub waits with
+     `rx.recv_timeout(DATA_PLANE_STOP_BOUND)`, then joins the completed owner thread.
   3. **Bound derivation.** `DATA_PLANE_STOP_BOUND = 2 * DATA_PLANE_WATCHDOG + STOP_SLACK`.
-     The loop body is non-blocking except for `wait_wakes`, and every per-turn budget is a
-     fixed constant, so the worst-case exit is one in-flight `wait_wakes` plus one bounded
+     The loop body is non-blocking except for `wait_pump`, and every per-turn budget is a
+     fixed constant, so the worst-case exit is one in-flight `wait_pump` plus one bounded
      turn. A timeout therefore signals a defect, not ordinary load.
-  4. **Terminal action on timeout.** Hub **does not** call `CoreDaemon::shutdown`, does not
-     call `join()`, and does not continue the shutdown sequence, because the driver may still
-     hold the mutex. Hub records the typed `data_plane_driver_stop_timeout` diagnostic, then
+  4. **Terminal action on timeout.** Hub does not call `join()` and does not continue the
+     shutdown sequence, because the Core owner thread can still be live. Hub records the
+     typed `data_plane_driver_stop_timeout` diagnostic, then
      calls `std::process::abort()`.
 
   **What abort does and does not do.** Abort guarantees exactly one thing: every Hub thread,
@@ -493,9 +492,8 @@ long-lived host thread to the terminal byte path.
 
   **Timeout sibling policy.** The driver stop timeout is the one deliberate whole-process
   fail-closed action in this plan. It sacrifices every peer and every route on this Hub,
-  because a driver that may still hold the `CoreDaemon` mutex makes any narrower teardown
-  unsound. That is a wider blast radius than a route close or a peer close, and it is chosen
-  only because the alternative is running Core shutdown against a live mutex holder.
+  because a Core owner thread that did not complete makes any narrower teardown unsound.
+  That is a wider blast radius than a route close or a peer close.
 
   Acceptance check 16 covers the normal path. Check 16a asserts only what abort actually
   guarantees, in process, and check 16b proves the recovery half separately on the next Hub
@@ -517,8 +515,8 @@ long-lived host thread to the terminal byte path.
 | Ingress wake for a stopping session | `SessionId` in the Core live-session registry | wake stays live through `Stopping`; `ProcessExited` or runtime removal retires it | Core `forget_session` after teardown commits |
 
 `production_path_proof`
-- Output: PTY or worker output -> Core ingress wake -> `TerminalWakeSource` ->
-  `DataPlaneDriver::wait_wakes` -> `CoreDaemon::pump_woken` -> `try_write` on the exact bound
+- Output: PTY or worker output -> Core ingress wake -> `CoreDaemon::wait_pump` ->
+  `CoreDaemon::pump_woken` -> `try_write` on the exact bound
   adapter -> `AdapterSlot` -> Unix mux writer or that subscription's DataChannel -> client.
 - Input: client `TerminalInputFrame` -> Unix terminal route or that subscription's
   DataChannel -> adapter ingress buffer -> adapter `Writable` wake -> driver ->
@@ -551,8 +549,8 @@ long-lived host thread to the terminal byte path.
 
 Assumptions:
 
-1. The pin is `botster-core` `b292c38`, the output of dependency
-   `ticket_1788054075_697438`. `TerminalCompatibility::current()` there again requires
+1. The pin is `botster-core` `786f61c`, the output of dependency
+   `ticket_1788220245_689733`. `TerminalCompatibility::current()` there requires
    `transport=duplex_binary` by default, so Hub advertises duplex with no feature filter.
 2. Hub proves the WebRTC subscription-channel contract with its own test peer in
    `tests/hub_daemon_lifecycle`, because browser implementation is non-scope. The test peer
@@ -616,7 +614,8 @@ Changed:
 3. **Ingress buffer as a hidden policy queue.** The 64-frame buffer must stay a transport
    buffer, not a retry or reorder queue. Mitigation: `Lost` is latched and fail-closed;
    guard tests assert no retry and no reorder.
-4. **Mutex contention** between driver and owner loop in both directions.
+4. **Host-request pressure.** Owner-loop Core operations cross the bounded data-plane request
+   bridge. The wake-pump interrupt prevents watchdog-scale request latency.
 5. **Downstream breakage.** `botster-web` and `botster-tui` stop working against this Hub
    until their own tickets land. Mitigation: register both as dependent tickets and state the
    break explicitly; the human decision accepts it.
@@ -625,8 +624,8 @@ Changed:
    back-references, reservation expiry, and the resource-bound proof.
 7. **Close-work registry growth.** A route state that never retires leaks. Mitigation:
    retirement at route teardown plus the resource-bound counters returning to zero.
-8. **Shutdown race.** `CoreDaemon::shutdown` itself waits on `wait_wakes` plus `pump_woken`,
-   so the driver must stop and join first.
+8. **Shutdown race.** The Core owner must observe `WakePumpWait::Stopped` before it calls
+   `CoreDaemon::shutdown`. Hub joins only after that owner reports completion.
 9. **Conformance revision churn.** Deleting DTO variants changes the fixture revision and
    every generated consumer artifact.
 
@@ -689,13 +688,14 @@ one-test baseline before each ablation.
     thread, at most 64 Hub OS threads, unchanged queue capacities, close-work and route
     counters returning to zero, and an unchanged idle CPU bound. The driver must block, not
     spin.
-16. **Shutdown ordering, normal path.** Assert the completion signal arrives within
-    `DATA_PLANE_STOP_BOUND`, that `join()` then returns, and that `CoreDaemon::shutdown` runs
-    strictly after the join. A thread census shows no `botster-hub-data-plane` thread, and an
+16. **Shutdown ordering, normal path.** Assert the owner observes
+    `WakePumpWait::Stopped`, completes the selected Core shutdown action, and sends the
+    completion signal within `DATA_PLANE_STOP_BOUND`. Assert that `join()` then returns. A
+    thread census shows no `botster-hub-data-plane` thread, and an
     orderly down leaves no Hub thread, session worker, zombie, or socket. Exact-key
     suppression still holds for admitted Unix and WebRTC routes before Core shutdown.
-    Red-on-revert: call `CoreDaemon::shutdown` before the completion wait; the ordering
-    assertion must fail.
+    Red-on-revert: call `CoreDaemon::shutdown` before the stopped state; Core must return
+    `CoreDaemonError::WakePump`.
 16a. **Shutdown timeout path, deterministic.** A `BOTSTER_ENV=test` seam parks the driver
     inside its turn so it cannot reach the completion send. On the isolated Hub child, assert
     that the wait ends at `DATA_PLANE_STOP_BOUND`, that `CoreDaemon::shutdown` is never
@@ -768,7 +768,7 @@ one-test baseline before each ablation.
     text, no example, and no documentation page. Tests that proved only a deleted one-shot
     route are removed, and bound-route tests for input, mode-gated input, and resize replace
     them on both transports.
-20. **Pin-roll completeness.** Zero `7eafa47` matches outside `docs/plans` and `docs/reports`;
+20. **Pin-roll completeness.** Zero prior active Core SHA matches outside `docs/plans` and `docs/reports`;
     all six `Cargo.lock` sources rolled; every active revision literal rolled; one Core family
     revision everywhere.
 
@@ -789,8 +789,9 @@ Gate hygiene: the official `./test.sh --locked` gate runs in a colon-free worktr
 
 ## Vault gaps worth capturing
 
-1. **Hub drives the Core data plane from one owned driver thread** — cloned wake source
-   outside the `CoreDaemon` mutex, `pump_woken` inside it, stop and join before Core shutdown.
+1. **Hub drives the Core data plane from one owned driver thread** — the thread constructs
+   and exclusively owns `CoreDaemon`; other Hub threads use bounded requests and
+   `WakePumpControl`; the owner observes stopped before Core shutdown and thread completion.
 2. **`observe_lifecycle_slice` retains terminal egress and does not pump bound adapters at the
    published revision** — the fact that makes the pin roll a cold cut.
 3. **Hub close work uses a registry with a queued and retired filter, not an admission scan** —
@@ -799,7 +800,7 @@ Gate hygiene: the official `./test.sh --locked` gate runs in a colon-free worktr
    content blind on the input direction as well as the output direction.
 5. **Two-phase WebRTC Attach: Hub reserves the label, the peer opens it, Hub binds** — the
    first shipped Hub implementation of the frozen topology.
-6. **Pin the direct duplex revision `b292c38`** — the deferred-default branch was reverted and
-   must not be reintroduced.
+6. **Pin the supported wake-pump revision `786f61c`** — it preserves the direct duplex
+   requirement and removes the need for any Hub unsafe thread override.
 
 Capture is deferred to Verify so no unproven design enters the vault.

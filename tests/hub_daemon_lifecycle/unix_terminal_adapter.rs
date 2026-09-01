@@ -1118,7 +1118,9 @@ fn spawn_and_bind(
     );
     assert_eq!(
         spawned.kind,
-        botster_hub_client::DaemonResponseKind::Spawned
+        botster_hub_client::DaemonResponseKind::Spawned,
+        "spawn must succeed for {session_id}: error={:?}",
+        spawned.error
     );
     let attach = request_collecting_mux(
         stream,
@@ -1445,25 +1447,37 @@ fn host_adapter_close_emits_terminal_subscription_closed_for_one_route() {
 #[test]
 fn core_write_budget_hard_stop_emits_core_adapter_closed() {
     let _guard = daemon_test_guard();
-    let hub = start_isolated_live_output_hub("cwb");
+    let hub = start_isolated_live_output_hub_with_env(
+        "cwb",
+        &[
+            (
+                "BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_SESSION",
+                "cwb-stall",
+            ),
+            (
+                "BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_DELAY_MS",
+                "500",
+            ),
+        ],
+    );
     let (mut stream, mut reader) = unix_adapter_connection(hub.endpoint());
     let mut envelopes = Vec::new();
     let mut events = Vec::new();
     spawn_and_bind(
         &mut stream,
         &mut reader,
-        "cwb-stall",
-        "sub-stall",
-        "yes write-budget-stall",
+        "cwb-live",
+        "sub-live",
+        "while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
         &mut envelopes,
         &mut events,
     );
     spawn_and_bind(
         &mut stream,
         &mut reader,
-        "cwb-live",
-        "sub-live",
-        "while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
+        "cwb-stall",
+        "sub-stall",
+        "sleep 3; exec yes write-budget-stall",
         &mut envelopes,
         &mut events,
     );
@@ -1660,7 +1674,7 @@ fn core_write_budget_hard_stop_emits_core_adapter_closed() {
     );
 
     eprintln!(
-        "core_write_budget provenance hub_bin={} session_worker={} hub_sha={} locked_core=873df1c4084bfe81949cf1bbe53ad7327ad99d4b",
+        "core_write_budget provenance hub_bin={} session_worker={} hub_sha={} locked_core=786f61c5aeec42b416826af6ca0b4be9f3cc3c0f",
         env!("CARGO_BIN_EXE_botster-hub"),
         session_worker_binary_path().display(),
         option_env!("BOTSTER_HUB_GIT_SHA").unwrap_or("worktree")

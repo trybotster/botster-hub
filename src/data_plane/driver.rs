@@ -1,29 +1,16 @@
 //! One owned Hub thread that waits on Core wakes and drives targeted pumps.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use botster_core::SessionId;
-use botster_core::contract::terminal_wake::TerminalWakeSource;
-use botster_core_daemon::CoreDaemon;
+use botster_core_daemon::{CoreDaemon, CoreDaemonConfig, WakePumpControl, WakePumpWait};
 
 use crate::daemon::control::message::{ControlMessage, ControlSender};
 use crate::data_plane::close_work::CloseWorkSource;
 use crate::subscription::closed_events::session_close_event_decision;
-
-/// `CoreDaemon` holds `Rc` worker state and is therefore `!Send`.
-///
-/// Every driver access goes through this mutex, the owner thread does not
-/// touch Core while the driver holds the lock, and `CoreDaemon` is dropped
-/// only after the driver joins. That is the Send bound the host can prove.
-#[derive(Clone)]
-struct SharedCore(Arc<Mutex<CoreDaemon>>);
-
-unsafe impl Send for SharedCore {}
-unsafe impl Sync for SharedCore {}
 
 pub(crate) const DATA_PLANE_WATCHDOG: Duration = Duration::from_secs(1);
 pub(crate) const DATA_PLANE_STOP_SLACK: Duration = Duration::from_millis(500);
@@ -31,7 +18,10 @@ pub(crate) const DATA_PLANE_STOP_BOUND: Duration = Duration::from_millis(
     DATA_PLANE_WATCHDOG.as_millis() as u64 * 2 + DATA_PLANE_STOP_SLACK.as_millis() as u64,
 );
 pub(crate) const DATA_PLANE_MAX_CLOSE_KEYS: usize = 8;
-const STOP_SESSION_ID: &str = "hub-data-plane-stop";
+const CORE_REQUEST_CAPACITY: usize = 64;
+const CORE_REQUESTS_PER_TURN: usize = CORE_REQUEST_CAPACITY;
+const STOP_ACTION_SHUTDOWN: u8 = 0;
+const STOP_ACTION_RELEASE_FOR_RESTART: u8 = 1;
 
 pub(crate) const TEST_PAUSE_DATA_PLANE_ENV: &str = "BOTSTER_HUB_TEST_PAUSE_DATA_PLANE";
 pub(crate) const TEST_PARK_DATA_PLANE_TURN_ENV: &str = "BOTSTER_HUB_TEST_PARK_DATA_PLANE_TURN";
@@ -40,11 +30,57 @@ pub(crate) const TEST_DATA_PLANE_OBSERVATION_ENV: &str = "BOTSTER_HUB_TEST_DATA_
 pub(crate) const DATA_PLANE_DRIVER_STOP_TIMEOUT: &str = "data_plane_driver_stop_timeout";
 
 pub(crate) struct DataPlaneDriver {
-    stop: Arc<AtomicBool>,
-    wake_source: TerminalWakeSource,
+    core: CoreDaemonHandle,
+    stop_action: Arc<AtomicU8>,
     done: Receiver<()>,
     thread: Option<JoinHandle<()>>,
     owner_wake: Arc<Mutex<Option<ControlSender>>>,
+}
+
+type CoreRequest = Box<dyn FnOnce(&mut CoreDaemon) + Send + 'static>;
+
+/// Hub-owned bounded request bridge to the single Core owner thread.
+#[derive(Clone)]
+pub(crate) struct CoreDaemonHandle {
+    requests: SyncSender<CoreRequest>,
+    control: WakePumpControl,
+    accepting: Arc<AtomicBool>,
+    admission: Arc<Mutex<()>>,
+    request_pending: Arc<AtomicBool>,
+    owner_waiting: Arc<AtomicBool>,
+}
+
+impl CoreDaemonHandle {
+    pub(crate) fn call<T, F>(&self, operation: F) -> T
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut CoreDaemon) -> T + Send + 'static,
+    {
+        let (completed_tx, completed_rx) = mpsc::sync_channel(1);
+        let request: CoreRequest = Box::new(move |daemon| {
+            let _ = completed_tx.send(operation(daemon));
+        });
+        let _admission = self.admission.lock().expect("Core request admission mutex");
+        assert!(
+            self.accepting.load(Ordering::Acquire),
+            "Core owner thread stopped accepting requests"
+        );
+        match self.requests.try_send(request) {
+            Ok(()) => {}
+            Err(TrySendError::Full(request)) => {
+                self.requests
+                    .send(request)
+                    .expect("Core owner request channel");
+            }
+            Err(TrySendError::Disconnected(_)) => panic!("Core owner request channel"),
+        }
+        self.request_pending.store(true, Ordering::Release);
+        if self.owner_waiting.swap(false, Ordering::AcqRel) {
+            self.control.interrupt();
+        }
+        drop(_admission);
+        completed_rx.recv().expect("Core owner request completion")
+    }
 }
 
 #[derive(Default)]
@@ -57,37 +93,60 @@ struct DriverCounters {
 
 impl DataPlaneDriver {
     pub(crate) fn start(
-        core_daemon: Arc<Mutex<CoreDaemon>>,
-        wake_source: TerminalWakeSource,
+        core_config: CoreDaemonConfig,
         close_work: CloseWorkSource,
-    ) -> Self {
-        let stop = Arc::new(AtomicBool::new(false));
+    ) -> (Self, CoreDaemonHandle) {
         let (done_tx, done_rx) = mpsc::sync_channel(1);
-        let thread_stop = Arc::clone(&stop);
-        let thread_wakes = wake_source.clone();
-        let shared = SharedCore(core_daemon);
+        let (request_tx, request_rx) = mpsc::sync_channel(CORE_REQUEST_CAPACITY);
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let accepting = Arc::new(AtomicBool::new(true));
+        let admission = Arc::new(Mutex::new(()));
+        let request_pending = Arc::new(AtomicBool::new(false));
+        let owner_waiting = Arc::new(AtomicBool::new(false));
+        let thread_request_pending = Arc::clone(&request_pending);
+        let thread_owner_waiting = Arc::clone(&owner_waiting);
+        let stop_action = Arc::new(AtomicU8::new(STOP_ACTION_SHUTDOWN));
+        let thread_stop_action = Arc::clone(&stop_action);
         let owner_wake = Arc::new(Mutex::new(None));
         let thread_owner_wake = Arc::clone(&owner_wake);
         let thread = std::thread::Builder::new()
             .name("botster-hub-data-plane".to_string())
             .spawn(move || {
+                let mut daemon = CoreDaemon::new(core_config);
+                let control = daemon.wake_pump_control();
+                ready_tx.send(control).expect("publish Core pump control");
                 run_loop(
-                    shared,
-                    thread_wakes,
+                    &mut daemon,
+                    request_rx,
                     close_work,
-                    thread_stop,
                     thread_owner_wake,
+                    thread_request_pending,
+                    thread_owner_waiting,
                 );
+                if thread_stop_action.load(Ordering::Acquire) == STOP_ACTION_RELEASE_FOR_RESTART {
+                    daemon.release_for_restart();
+                } else {
+                    let _ = daemon.shutdown(None, current_unix_seconds());
+                }
                 let _ = done_tx.send(());
             })
             .expect("start botster-hub-data-plane");
-        Self {
-            stop,
-            wake_source,
+        let core = CoreDaemonHandle {
+            requests: request_tx,
+            control: ready_rx.recv().expect("receive Core pump control"),
+            accepting,
+            admission,
+            request_pending,
+            owner_waiting,
+        };
+        let driver = Self {
+            core: core.clone(),
+            stop_action,
             done: done_rx,
             thread: Some(thread),
             owner_wake,
-        }
+        };
+        (driver, core)
     }
 
     pub(crate) fn bind_owner_wake(&self, sender: ControlSender) {
@@ -96,11 +155,26 @@ impl DataPlaneDriver {
         }
     }
 
-    pub(crate) fn stop_and_join(&mut self) -> Result<(), &'static str> {
-        self.stop.store(true, Ordering::SeqCst);
-        self.wake_source
-            .session_handle(SessionId(STOP_SESSION_ID.to_string()))
-            .notify();
+    pub(crate) fn stop_and_join(&mut self, release_for_restart: bool) -> Result<(), &'static str> {
+        let _admission = self
+            .core
+            .admission
+            .lock()
+            .expect("Core request admission mutex");
+        self.core.accepting.store(false, Ordering::Release);
+        self.stop_action.store(
+            if release_for_restart {
+                STOP_ACTION_RELEASE_FOR_RESTART
+            } else {
+                STOP_ACTION_SHUTDOWN
+            },
+            Ordering::Release,
+        );
+        self.core.control.request_stop();
+        if let Some(thread) = self.thread.as_ref() {
+            thread.thread().unpark();
+        }
+        drop(_admission);
         match self.done.recv_timeout(DATA_PLANE_STOP_BOUND) {
             Ok(()) | Err(RecvTimeoutError::Disconnected) => {
                 if let Some(thread) = self.thread.take() {
@@ -119,7 +193,7 @@ impl DataPlaneDriver {
 impl Drop for DataPlaneDriver {
     fn drop(&mut self) {
         if self.thread.is_some() {
-            match self.stop_and_join() {
+            match self.stop_and_join(false) {
                 Ok(()) => {}
                 Err(_) => std::process::abort(),
             }
@@ -128,51 +202,70 @@ impl Drop for DataPlaneDriver {
 }
 
 fn run_loop(
-    core_daemon: SharedCore,
-    wake_source: TerminalWakeSource,
+    core_daemon: &mut CoreDaemon,
+    requests: Receiver<CoreRequest>,
     close_work: CloseWorkSource,
-    stop: Arc<AtomicBool>,
     owner_wake: Arc<Mutex<Option<ControlSender>>>,
+    request_pending: Arc<AtomicBool>,
+    owner_waiting: Arc<AtomicBool>,
 ) {
     let counters = DriverCounters::default();
-    let _stop_handle = wake_source.session_handle(SessionId(STOP_SESSION_ID.to_string()));
     loop {
-        if stop.load(Ordering::SeqCst) {
-            break;
-        }
         park_turn_for_test();
-        if stop.load(Ordering::SeqCst) {
-            break;
-        }
+        owner_waiting.store(true, Ordering::Release);
+        let wait_timeout = if request_pending.swap(false, Ordering::AcqRel) {
+            owner_waiting.store(false, Ordering::Release);
+            Duration::ZERO
+        } else {
+            watchdog()
+        };
         if pause_data_plane() {
-            let _ = wake_source.wait_wakes(watchdog());
+            match core_daemon.wait_pump(wait_timeout) {
+                WakePumpWait::Stopped => break,
+                WakePumpWait::Interrupted | WakePumpWait::Wakes(_) => {}
+                _ => {}
+            }
+            owner_waiting.store(false, Ordering::Release);
+            run_core_requests(core_daemon, &requests);
             continue;
         }
-        let batch = wake_source.wait_wakes(watchdog());
-        counters.adapter_routes.fetch_add(
-            u64::try_from(batch.adapter_routes.len()).unwrap_or(u64::MAX),
-            Ordering::Relaxed,
-        );
-        if stop.load(Ordering::SeqCst) {
-            break;
-        }
+        let waited = core_daemon.wait_pump(wait_timeout);
+        owner_waiting.store(false, Ordering::Release);
+        let waited = if matches!(waited, WakePumpWait::Interrupted) {
+            core_daemon.wait_pump(Duration::ZERO)
+        } else {
+            waited
+        };
+        let batch = match waited {
+            WakePumpWait::Wakes(batch) => Some(batch),
+            WakePumpWait::Interrupted => None,
+            WakePumpWait::Stopped => break,
+            _ => None,
+        };
         let now_seconds = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|elapsed| elapsed.as_secs())
             .unwrap_or(0);
         let mut pumped = false;
-        {
-            let mut core = core_daemon.0.lock().expect("core daemon mutex");
-            if core.pump_woken(&batch, now_seconds).is_ok() {
+        if let Some(batch) = batch {
+            counters.adapter_routes.fetch_add(
+                u64::try_from(batch.adapter_routes.len()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            if core_daemon.pump_woken(&batch, now_seconds).is_ok() {
                 counters.pumps.fetch_add(1, Ordering::Relaxed);
                 pumped = !batch.adapter_routes.is_empty() || !batch.ingress_sessions.is_empty();
             }
+        }
+        run_core_requests(core_daemon, &requests);
+        {
             let close_batch = close_work.take_batch(DATA_PLANE_MAX_CLOSE_KEYS);
             counters
                 .close_keys
                 .fetch_add(close_batch.len() as u64, Ordering::Relaxed);
             for state in close_batch {
-                let lookup = core.session_registry_state(&SessionId(state.key.session_id.clone()));
+                let lookup = core_daemon
+                    .session_registry_state(&botster_core::SessionId(state.key.session_id.clone()));
                 match session_close_event_decision(lookup) {
                     Some(emit) => {
                         let key = state.key.clone();
@@ -192,6 +285,22 @@ fn run_loop(
         }
         observe_for_test(&counters, close_work.live_count());
     }
+    for request in requests.try_iter().take(CORE_REQUEST_CAPACITY) {
+        request(core_daemon);
+    }
+}
+
+fn run_core_requests(core_daemon: &mut CoreDaemon, requests: &Receiver<CoreRequest>) {
+    for request in requests.try_iter().take(CORE_REQUESTS_PER_TURN) {
+        request(core_daemon);
+    }
+}
+
+fn current_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
 }
 
 fn watchdog() -> Duration {

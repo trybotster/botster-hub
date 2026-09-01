@@ -19,7 +19,7 @@ use botster_core::{
 };
 use botster_core_daemon::{
     AcknowledgeRoutedEnvelopeRequest, AttachedSession, CaptureSnapshotRequest,
-    CaptureSnapshotResult, CoreDaemon, CoreDaemonConfig, CoreDaemonError, DaemonSession,
+    CaptureSnapshotResult, CoreDaemonConfig, CoreDaemonError, DaemonSession,
     DetachTerminalSubscriptionResult, DrainRoutedEnvelopesRequest, GuardedWriteRequest,
     GuardedWriteResult, LifecycleBaselineBudget, ObserveLifecycleBudget, ObserveLifecycleCursor,
     ObserveLifecycleSlice, PublishRoutedEnvelopeRequest, ReadModeFlagsRequest, ReadModeFlagsResult,
@@ -146,10 +146,7 @@ enum PendingTestEvent {
     },
 }
 
-// CoreDaemon is !Send because worker state uses Rc. All access is mutex
-// serialized and Core is dropped only after the data-plane driver joins.
-#[allow(clippy::arc_with_non_send_sync)]
-type SharedCoreDaemon = Arc<Mutex<CoreDaemon>>;
+type SharedCoreDaemon = crate::data_plane::driver::CoreDaemonHandle;
 type SharedSessionContexts = Arc<Mutex<BTreeMap<String, HubSessionContext>>>;
 const SESSION_TYPE_SPAWN_TIMEOUT_MS: u64 = 30_000;
 const PLUGIN_EVENT_TIMEOUT_MS: u64 = 1_000;
@@ -281,9 +278,7 @@ impl HubRuntime {
         let test_seams = hub_test_seams();
         let core_config = core_daemon_config(&config, &test_seams);
         let plugin_worker_config = config.plugin_worker_config();
-        #[allow(clippy::arc_with_non_send_sync)]
-        let core_daemon = Arc::new(Mutex::new(CoreDaemon::new(core_config)));
-        let (close_work, data_plane) = start_data_plane(&core_daemon);
+        let (close_work, data_plane, core_daemon) = start_data_plane(core_config);
         let package_event_router = Arc::new(crate::package_event_router::PackageEventRouter::new(
             config.package_event_plane,
         ));
@@ -391,9 +386,7 @@ impl HubRuntime {
         let test_seams = hub_test_seams();
         let core_config = core_daemon_config(&config, &test_seams);
         let plugin_worker_config = config.plugin_worker_config();
-        #[allow(clippy::arc_with_non_send_sync)]
-        let core_daemon = Arc::new(Mutex::new(CoreDaemon::new(core_config)));
-        let (close_work, data_plane) = start_data_plane(&core_daemon);
+        let (close_work, data_plane, core_daemon) = start_data_plane(core_config);
         let package_event_router = Arc::new(crate::package_event_router::PackageEventRouter::new(
             config.package_event_plane,
         ));
@@ -2163,15 +2156,15 @@ impl HubRuntime {
         }
         let outcome = self
             .core_daemon
-            .lock()
-            .map_err(|_| ManagedGitError::new("spawn_failed", "core daemon is unavailable"))?
-            .spawn(
-                SpawnSessionRequest {
-                    request: materialized.spawn_request,
-                    metadata,
-                },
-                current_unix_seconds(),
-            )
+            .call(move |daemon| {
+                daemon.spawn(
+                    SpawnSessionRequest {
+                        request: materialized.spawn_request,
+                        metadata,
+                    },
+                    current_unix_seconds(),
+                )
+            })
             .map_err(|error| {
                 eprintln!(
                     "managed_session_spawn_failed session_id={} core_error={}",
@@ -2200,9 +2193,10 @@ impl HubRuntime {
 
     fn cleanup_managed_session(&self, spawned: &PluginManagedSessionSpawned) {
         let session_id = SessionId(spawned.session_id.clone());
-        if let Ok(mut daemon) = self.core_daemon.lock() {
-            let _ = daemon.shutdown(Some(session_id.clone()), current_unix_seconds());
-        }
+        let shutdown_session_id = session_id.clone();
+        let _ = self
+            .core_daemon
+            .call(move |daemon| daemon.shutdown(Some(shutdown_session_id), current_unix_seconds()));
         if let Ok(mut contexts) = self.session_contexts.lock() {
             contexts.remove(&session_id.0);
             contexts.remove(&format!("ctx-{}", session_id.0));
@@ -2776,50 +2770,40 @@ impl HubRuntime {
     fn fulfill_pending_coordination_requests(&self) {
         while let Some(pending) = self.coordination_bridge.take_pending() {
             let result = match pending.operation {
-                PendingCoordinationOperation::Publish { envelope } => self
-                    .core_daemon
-                    .lock()
-                    .map_err(|_| "core daemon lock poisoned".to_string())
-                    .and_then(|mut daemon| {
+                PendingCoordinationOperation::Publish { envelope } => {
+                    self.core_daemon.call(move |daemon| {
                         daemon
                             .publish_routed_envelope(PublishRoutedEnvelopeRequest { envelope })
                             .map(HubCoordinationResponse::Publish)
                             .map_err(|error| error.to_string())
-                    }),
+                    })
+                }
                 PendingCoordinationOperation::Drain {
                     target,
                     after,
                     limit,
-                } => self
-                    .core_daemon
-                    .lock()
-                    .map_err(|_| "core daemon lock poisoned".to_string())
-                    .and_then(|mut daemon| {
-                        daemon
-                            .drain_routed_envelopes(DrainRoutedEnvelopesRequest {
-                                target,
-                                after,
-                                limit,
-                            })
-                            .map(HubCoordinationResponse::Drain)
-                            .map_err(|error| error.to_string())
-                    }),
+                } => self.core_daemon.call(move |daemon| {
+                    daemon
+                        .drain_routed_envelopes(DrainRoutedEnvelopesRequest {
+                            target,
+                            after,
+                            limit,
+                        })
+                        .map(HubCoordinationResponse::Drain)
+                        .map_err(|error| error.to_string())
+                }),
                 PendingCoordinationOperation::Acknowledge {
                     target,
                     envelope_id,
-                } => self
-                    .core_daemon
-                    .lock()
-                    .map_err(|_| "core daemon lock poisoned".to_string())
-                    .and_then(|mut daemon| {
-                        daemon
-                            .acknowledge_routed_envelope(AcknowledgeRoutedEnvelopeRequest {
-                                target,
-                                envelope_id,
-                            })
-                            .map(HubCoordinationResponse::Acknowledge)
-                            .map_err(|error| error.to_string())
-                    }),
+                } => self.core_daemon.call(move |daemon| {
+                    daemon
+                        .acknowledge_routed_envelope(AcknowledgeRoutedEnvelopeRequest {
+                            target,
+                            envelope_id,
+                        })
+                        .map(HubCoordinationResponse::Acknowledge)
+                        .map_err(|error| error.to_string())
+                }),
             };
             let _ = pending.response.send(result);
         }
@@ -2827,9 +2811,10 @@ impl HubRuntime {
 
     fn cleanup_undelivered_session_type_spawn(&self, spawned: &PluginSessionTypeSpawned) {
         let session_id = SessionId(spawned.session_id.clone());
-        if let Ok(mut daemon) = self.core_daemon.lock() {
-            let _ = daemon.shutdown(Some(session_id.clone()), current_unix_seconds());
-        }
+        let shutdown_session_id = session_id.clone();
+        let _ = self
+            .core_daemon
+            .call(move |daemon| daemon.shutdown(Some(shutdown_session_id), current_unix_seconds()));
         if let Ok(mut contexts) = self.session_contexts.lock() {
             contexts.remove(&spawned.context_id);
             contexts.remove(&session_id.0);
@@ -2868,15 +2853,15 @@ impl HubRuntime {
 
         let outcome = self
             .core_daemon
-            .lock()
-            .map_err(|_| "core daemon lock poisoned".to_string())?
-            .spawn(
-                SpawnSessionRequest {
-                    request: materialized.spawn_request,
-                    metadata,
-                },
-                current_unix_seconds(),
-            )
+            .call(move |daemon| {
+                daemon.spawn(
+                    SpawnSessionRequest {
+                        request: materialized.spawn_request,
+                        metadata,
+                    },
+                    current_unix_seconds(),
+                )
+            })
             .map_err(|error| match self.session_contexts.lock() {
                 Ok(mut contexts) => {
                     contexts.remove(&context.context_id);
@@ -3186,18 +3171,17 @@ impl HubRuntime {
         &self,
         session_id: &SessionId,
     ) -> Result<Option<DaemonSession>, CoreDaemonError> {
+        let session_id = session_id.clone();
         Ok(self
             .core_daemon
-            .lock()
-            .expect("core daemon mutex")
-            .list()?
+            .call(|daemon| daemon.list())?
             .into_iter()
-            .find(|session| &session.session_id == session_id))
+            .find(|session| session.session_id == session_id))
     }
 
     /// Return daemon-recorded sessions for host visibility without exposing core's command router.
     pub fn list_sessions(&self) -> Result<Vec<DaemonSession>, CoreDaemonError> {
-        self.core_daemon.lock().expect("core daemon mutex").list()
+        self.core_daemon.call(|daemon| daemon.list())
     }
 
     /// Return one bounded owner-loop observe slice.
@@ -3207,10 +3191,10 @@ impl HubRuntime {
         resume: Option<&ObserveLifecycleCursor>,
         budget: ObserveLifecycleBudget,
     ) -> Result<ObserveLifecycleSlice, SessionLifecyclePageError> {
-        self.core_daemon
-            .lock()
-            .expect("core daemon mutex")
-            .observe_lifecycle_slice(now_seconds, resume, budget)
+        let resume = resume.cloned();
+        self.core_daemon.call(move |daemon| {
+            daemon.observe_lifecycle_slice(now_seconds, resume.as_ref(), budget)
+        })
     }
 
     /// Return one bounded lifecycle baseline page.
@@ -3220,10 +3204,11 @@ impl HubRuntime {
         after: Option<&SessionId>,
         budget: LifecycleBaselineBudget,
     ) -> Result<SessionLifecycleBaselinePage, SessionLifecyclePageError> {
-        self.core_daemon
-            .lock()
-            .expect("core daemon mutex")
-            .lifecycle_baseline_page(snapshot, after, budget)
+        let snapshot = snapshot.cloned();
+        let after = after.cloned();
+        self.core_daemon.call(move |daemon| {
+            daemon.lifecycle_baseline_page(snapshot.as_ref(), after.as_ref(), budget)
+        })
     }
 
     /// Return one bounded lifecycle journal page after a cursor.
@@ -3233,10 +3218,9 @@ impl HubRuntime {
         max_changes: usize,
         max_bytes: usize,
     ) -> Result<SessionLifecyclePage, SessionLifecyclePageError> {
+        let after = after.clone();
         self.core_daemon
-            .lock()
-            .expect("core daemon mutex")
-            .lifecycle_changes_page(after, max_changes, max_bytes)
+            .call(move |daemon| daemon.lifecycle_changes_page(&after, max_changes, max_bytes))
     }
 
     /// Take the coalesced Core journal-advanced wake bit.
@@ -3244,9 +3228,7 @@ impl HubRuntime {
     pub fn take_journal_advanced_wake(&self) -> bool {
         let woke = self
             .core_daemon
-            .lock()
-            .expect("core daemon mutex")
-            .take_journal_advanced_wake();
+            .call(|daemon| daemon.take_journal_advanced_wake());
         if woke
             && self
                 .drop_journal_wakes_remaining
@@ -3527,10 +3509,9 @@ impl HubRuntime {
         &mut self,
         session_id: &SessionId,
     ) -> Result<bool, CoreDaemonError> {
+        let session_id = session_id.clone();
         self.core_daemon
-            .lock()
-            .expect("core daemon mutex")
-            .remove_session(session_id)
+            .call(move |daemon| daemon.remove_session(&session_id))
     }
 
     /// Spawn a daemon-owned session through core from a host-owned request.
@@ -3541,11 +3522,9 @@ impl HubRuntime {
         now_seconds: u64,
     ) -> Result<CoreSession, CoreDaemonError> {
         let requested_id = request.session_id.0.clone();
-        let session = self
-            .core_daemon
-            .lock()
-            .expect("core daemon mutex")
-            .spawn(SpawnSessionRequest { request, metadata }, now_seconds)?;
+        let session = self.core_daemon.call(move |daemon| {
+            daemon.spawn(SpawnSessionRequest { request, metadata }, now_seconds)
+        })?;
         self.record_acknowledged_spawn(requested_id);
         self.record_acknowledged_spawn(session.session_id.0.clone());
         Ok(session)
@@ -3614,12 +3593,8 @@ impl HubRuntime {
         subscription_id: SubscriptionId,
         now_seconds: u64,
     ) -> Result<AttachedSession, CoreDaemonError> {
-        self.core_daemon.lock().expect("core daemon mutex").attach(
-            client_id,
-            session_id,
-            subscription_id,
-            now_seconds,
-        )
+        self.core_daemon
+            .call(move |daemon| daemon.attach(client_id, session_id, subscription_id, now_seconds))
     }
 
     /// Detach a client subscription from a session through the core daemon.
@@ -3630,12 +3605,8 @@ impl HubRuntime {
         subscription_id: SubscriptionId,
         now_seconds: u64,
     ) -> Result<(), CoreDaemonError> {
-        self.core_daemon.lock().expect("core daemon mutex").detach(
-            client_id,
-            session_id,
-            subscription_id,
-            now_seconds,
-        )
+        self.core_daemon
+            .call(move |daemon| daemon.detach(client_id, session_id, subscription_id, now_seconds))
     }
 
     /// Bind a waking duplex terminal adapter to a live attach generation.
@@ -3648,10 +3619,8 @@ impl HubRuntime {
         capabilities: TerminalCapabilitySet,
         adapter: Box<dyn botster_core::contract::terminal_wake::WakingTerminalAdapter + Send>,
     ) -> Result<(), CoreDaemonError> {
-        self.core_daemon
-            .lock()
-            .expect("core daemon mutex")
-            .bind_waking_terminal_adapter(
+        self.core_daemon.call(move |daemon| {
+            daemon.bind_waking_terminal_adapter(
                 client_id,
                 session_id,
                 subscription_id,
@@ -3659,6 +3628,7 @@ impl HubRuntime {
                 capabilities,
                 adapter,
             )
+        })
     }
 
     pub(crate) fn close_work_source(&self) -> crate::data_plane::CloseWorkSource {
@@ -3678,9 +3648,7 @@ impl HubRuntime {
     #[must_use]
     pub fn list_terminal_subscriptions(&self) -> Vec<TerminalSubscriptionRecord> {
         self.core_daemon
-            .lock()
-            .expect("core daemon mutex")
-            .list_terminal_subscriptions()
+            .call(|daemon| daemon.list_terminal_subscriptions())
     }
 
     /// Detach one subscription generation without deleting a newer owner.
@@ -3692,16 +3660,15 @@ impl HubRuntime {
         generation: TerminalSubscriptionGeneration,
         now_seconds: u64,
     ) -> Result<DetachTerminalSubscriptionResult, CoreDaemonError> {
-        self.core_daemon
-            .lock()
-            .expect("core daemon mutex")
-            .detach_terminal_subscription(
+        self.core_daemon.call(move |daemon| {
+            daemon.detach_terminal_subscription(
                 client_id,
                 session_id,
                 subscription_id,
                 generation,
                 now_seconds,
             )
+        })
     }
 }
 
@@ -3715,10 +3682,9 @@ impl HubRuntime {
         session_id: &SessionId,
         now_seconds: u64,
     ) -> Result<SessionLifecycleLookup, CoreDaemonError> {
+        let session_id = session_id.clone();
         self.core_daemon
-            .lock()
-            .expect("core daemon mutex")
-            .observe_session_lifecycle(session_id, now_seconds)
+            .call(move |daemon| daemon.observe_session_lifecycle(&session_id, now_seconds))
     }
 
     /// Exact non-mutating registry state for one session.
@@ -3727,10 +3693,9 @@ impl HubRuntime {
         &self,
         session_id: &SessionId,
     ) -> Result<SessionRegistryStateLookup, CoreDaemonError> {
+        let session_id = session_id.clone();
         self.core_daemon
-            .lock()
-            .expect("core daemon mutex")
-            .session_registry_state(session_id)
+            .call(move |daemon| daemon.session_registry_state(&session_id))
     }
 
     /// Exact live generation for one subscription, or `None`.
@@ -3740,10 +3705,11 @@ impl HubRuntime {
         session_id: &SessionId,
         subscription_id: &SubscriptionId,
     ) -> Option<TerminalSubscriptionGeneration> {
-        self.core_daemon
-            .lock()
-            .expect("core daemon mutex")
-            .terminal_subscription_generation(session_id, subscription_id)
+        let session_id = session_id.clone();
+        let subscription_id = subscription_id.clone();
+        self.core_daemon.call(move |daemon| {
+            daemon.terminal_subscription_generation(&session_id, &subscription_id)
+        })
     }
 
     /// Test helper for Core terminal Drain. Production daemon paths must not call this.
@@ -3753,10 +3719,9 @@ impl HubRuntime {
         session_id: &SessionId,
         last_output_at: u64,
     ) -> Result<botster_core_daemon::DrainResult, CoreDaemonError> {
+        let session_id = session_id.clone();
         self.core_daemon
-            .lock()
-            .expect("core daemon mutex")
-            .drain(session_id, last_output_at)
+            .call(move |daemon| daemon.drain(&session_id, last_output_at))
     }
 
     /// Test helper for Core terminal Drain. Production daemon paths must not call this.
@@ -3768,10 +3733,12 @@ impl HubRuntime {
         subscription_id: &SubscriptionId,
         last_output_at: u64,
     ) -> Result<botster_core_daemon::DrainResult, CoreDaemonError> {
-        self.core_daemon
-            .lock()
-            .expect("core daemon mutex")
-            .drain_subscription(client_id, session_id, subscription_id, last_output_at)
+        let client_id = client_id.clone();
+        let session_id = session_id.clone();
+        let subscription_id = subscription_id.clone();
+        self.core_daemon.call(move |daemon| {
+            daemon.drain_subscription(&client_id, &session_id, &subscription_id, last_output_at)
+        })
     }
 
     /// Read the current daemon-owned terminal screen through the production core path.
@@ -3781,14 +3748,13 @@ impl HubRuntime {
         session_id: SessionId,
         now_seconds: u64,
     ) -> Result<ReadScreenResult, CoreDaemonError> {
-        self.core_daemon
-            .lock()
-            .expect("core daemon mutex")
-            .read_screen(ReadScreenRequest {
+        self.core_daemon.call(move |daemon| {
+            daemon.read_screen(ReadScreenRequest {
                 request_id,
                 session_id,
                 now_seconds,
             })
+        })
     }
 
     /// Read authoritative terminal mode flags through the production core path.
@@ -3798,14 +3764,13 @@ impl HubRuntime {
         session_id: SessionId,
         now_seconds: u64,
     ) -> Result<ReadModeFlagsResult, CoreDaemonError> {
-        self.core_daemon
-            .lock()
-            .expect("core daemon mutex")
-            .read_mode_flags(ReadModeFlagsRequest {
+        self.core_daemon.call(move |daemon| {
+            daemon.read_mode_flags(ReadModeFlagsRequest {
                 request_id,
                 session_id,
                 now_seconds,
             })
+        })
     }
 
     /// Capture daemon-owned terminal snapshot metadata through the production core path.
@@ -3815,14 +3780,13 @@ impl HubRuntime {
         session_id: SessionId,
         now_seconds: u64,
     ) -> Result<CaptureSnapshotResult, CoreDaemonError> {
-        self.core_daemon
-            .lock()
-            .expect("core daemon mutex")
-            .capture_snapshot(CaptureSnapshotRequest {
+        self.core_daemon.call(move |daemon| {
+            daemon.capture_snapshot(CaptureSnapshotRequest {
                 request_id,
                 session_id,
                 now_seconds,
             })
+        })
     }
 
     /// Evaluate guarded-write readiness and inject only through the core daemon.
@@ -3831,9 +3795,7 @@ impl HubRuntime {
         request: GuardedWriteRequest,
     ) -> Result<GuardedWriteResult, CoreDaemonError> {
         self.core_daemon
-            .lock()
-            .expect("core daemon mutex")
-            .guarded_write(request)
+            .call(move |daemon| daemon.guarded_write(request))
     }
 
     /// Publish one coordination envelope through the CoreDaemon routed-envelope router.
@@ -3841,10 +3803,9 @@ impl HubRuntime {
         &mut self,
         envelope: RoutedEnvelope,
     ) -> Result<RoutedEnvelopePublishOutcome, CoreDaemonError> {
-        self.core_daemon
-            .lock()
-            .expect("core daemon mutex")
-            .publish_routed_envelope(PublishRoutedEnvelopeRequest { envelope })
+        self.core_daemon.call(move |daemon| {
+            daemon.publish_routed_envelope(PublishRoutedEnvelopeRequest { envelope })
+        })
     }
 
     /// Drain coordination envelopes for one routed target through CoreDaemon cursor semantics.
@@ -3854,14 +3815,13 @@ impl HubRuntime {
         after: Option<botster_core::EnvelopeCursor>,
         limit: usize,
     ) -> Result<RoutedEnvelopeDrainOutcome, CoreDaemonError> {
-        self.core_daemon
-            .lock()
-            .expect("core daemon mutex")
-            .drain_routed_envelopes(DrainRoutedEnvelopesRequest {
+        self.core_daemon.call(move |daemon| {
+            daemon.drain_routed_envelopes(DrainRoutedEnvelopesRequest {
                 target,
                 after,
                 limit,
             })
+        })
     }
 
     /// Acknowledge one routed envelope delivery through CoreDaemon.
@@ -3870,13 +3830,12 @@ impl HubRuntime {
         target: EnvelopeTarget,
         envelope_id: EnvelopeId,
     ) -> Result<RoutedEnvelopeDeliveryStateResult, CoreDaemonError> {
-        self.core_daemon
-            .lock()
-            .expect("core daemon mutex")
-            .acknowledge_routed_envelope(AcknowledgeRoutedEnvelopeRequest {
+        self.core_daemon.call(move |daemon| {
+            daemon.acknowledge_routed_envelope(AcknowledgeRoutedEnvelopeRequest {
                 target,
                 envelope_id,
             })
+        })
     }
 
     /// Return one CoreDaemon routed-envelope delivery state without mutation.
@@ -3885,29 +3844,25 @@ impl HubRuntime {
         target: &EnvelopeTarget,
         envelope_id: &EnvelopeId,
     ) -> RoutedEnvelopeDeliveryStateResult {
+        let target = target.clone();
+        let envelope_id = envelope_id.clone();
         self.core_daemon
-            .lock()
-            .expect("core daemon mutex")
-            .routed_envelope_delivery_state(target, envelope_id)
+            .call(move |daemon| daemon.routed_envelope_delivery_state(&target, &envelope_id))
     }
 
     /// Release worker-backed sessions before an intentional daemon restart.
     pub fn release_sessions_for_restart(&mut self) {
-        self.core_daemon
-            .lock()
-            .expect("core daemon mutex")
-            .release_for_restart();
+        self.stop_data_plane_with_release(true);
     }
 
     /// Release worker-backed sessions before an intentional hub restart.
     pub fn release_for_restart(&mut self) {
-        self.stop_data_plane();
         self.release_sessions_for_restart();
     }
 
-    pub(crate) fn stop_data_plane(&mut self) {
+    fn stop_data_plane_with_release(&mut self, release_for_restart: bool) {
         if let Some(mut driver) = self.data_plane.take()
-            && let Err(reason) = driver.stop_and_join()
+            && let Err(reason) = driver.stop_and_join(release_for_restart)
         {
             let _ = reason;
             std::process::abort();
@@ -3916,10 +3871,7 @@ impl HubRuntime {
 
     /// Scan daemon registry records for worker-backed restart/adoption evidence.
     pub fn adoption_scan(&self) -> Result<Vec<SessionAdoptionReport>, CoreDaemonError> {
-        self.core_daemon
-            .lock()
-            .expect("core daemon mutex")
-            .adoption_scan()
+        self.core_daemon.call(|daemon| daemon.adoption_scan())
     }
 
     pub(crate) fn mark_session_stale(
@@ -3927,10 +3879,9 @@ impl HubRuntime {
         session_id: &SessionId,
         now_seconds: u64,
     ) -> Result<(), CoreDaemonError> {
+        let session_id = session_id.clone();
         self.core_daemon
-            .lock()
-            .expect("core daemon mutex")
-            .mark_stale(session_id, now_seconds)
+            .call(move |daemon| daemon.mark_stale(&session_id, now_seconds))
     }
 
     /// Reattach one live worker-backed session after daemon restart.
@@ -3939,10 +3890,9 @@ impl HubRuntime {
         session_id: &SessionId,
         now_seconds: u64,
     ) -> Result<CoreSession, CoreDaemonError> {
+        let session_id = session_id.clone();
         self.core_daemon
-            .lock()
-            .expect("core daemon mutex")
-            .adopt_session(session_id, now_seconds)
+            .call(move |daemon| daemon.adopt_session(&session_id, now_seconds))
     }
 
     /// Shut down one daemon-owned session through core.
@@ -3952,25 +3902,19 @@ impl HubRuntime {
         now_seconds: u64,
     ) -> Result<(), CoreDaemonError> {
         self.core_daemon
-            .lock()
-            .expect("core daemon mutex")
-            .shutdown(Some(session_id), now_seconds)
+            .call(move |daemon| daemon.shutdown(Some(session_id), now_seconds))
     }
 
     fn reconcile_sessions(&mut self, now_seconds: u64) -> Result<(), CoreDaemonError> {
         self.reconciliation = HubSessionReconciliation::default();
-        let reports = self
-            .core_daemon
-            .lock()
-            .expect("core daemon mutex")
-            .adoption_scan()?;
+        let reports = self.core_daemon.call(|daemon| daemon.adoption_scan())?;
         for report in reports {
             match report.state {
                 SessionAdoptionState::Adoptable => {
-                    let adoption_result = {
-                        let mut core_daemon = self.core_daemon.lock().expect("core daemon mutex");
-                        core_daemon.adopt_session(&report.record.session_id, now_seconds)
-                    };
+                    let session_id = report.record.session_id.clone();
+                    let adoption_result = self.core_daemon.call(move |daemon| {
+                        daemon.adopt_session(&session_id, now_seconds)
+                    });
                     match adoption_result {
                         Ok(session) => {
                             self.reconciliation
@@ -4264,6 +4208,7 @@ fn managed_session_core_error_class(error: &CoreDaemonError) -> &'static str {
         CoreDaemonError::SessionNotReadable(_) => "session_not_readable",
         CoreDaemonError::MissingWorkerPath => "missing_worker_path",
         CoreDaemonError::Shutdown => "shutdown",
+        CoreDaemonError::WakePump(_) => "wake_pump",
         CoreDaemonError::MissingScreenResponse(_) => "missing_screen_response",
         CoreDaemonError::MissingModeFlagsResponse(_) => "missing_mode_flags_response",
         CoreDaemonError::ControlPlaneFailed(_) => "control_plane_failed",
@@ -4670,23 +4615,16 @@ pub struct HubTestSeams {
 }
 
 fn start_data_plane(
-    core_daemon: &Arc<Mutex<CoreDaemon>>,
+    core_config: CoreDaemonConfig,
 ) -> (
     crate::data_plane::CloseWorkSource,
     crate::data_plane::DataPlaneDriver,
+    SharedCoreDaemon,
 ) {
     let close_work = crate::data_plane::CloseWorkSource::new();
-    let wake_source = core_daemon
-        .lock()
-        .expect("core daemon mutex")
-        .wake_source()
-        .clone();
-    let driver = crate::data_plane::DataPlaneDriver::start(
-        Arc::clone(core_daemon),
-        wake_source,
-        close_work.clone(),
-    );
-    (close_work, driver)
+    let (driver, core_daemon) =
+        crate::data_plane::DataPlaneDriver::start(core_config, close_work.clone());
+    (close_work, driver, core_daemon)
 }
 
 fn hub_test_seams() -> HubTestSeams {
