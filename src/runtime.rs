@@ -8,26 +8,25 @@
 use botster_core::{
     BindTerminalAdapterError, BotsterEngineObservation, BotsterEngineOutput, BoundaryJson,
     ClientId, CoreSession, CoreSessionMetadata, EntityContract, EntityFrame, EntityKind,
-    EnvelopeId, EnvelopeTarget, ManagedSessionRuntimeError, ModeFreshnessToken,
-    MultiplexerEngineError, PluginAdmissionResult, PluginCapabilityRuntime, PluginCleanupResult,
-    PluginCompletionDrain, PluginHandlerKind, PluginInvocationClass, PluginInvocationFailure,
-    PluginInvocationFailureKind, PluginInvocationOutcome, PluginInvocationRequest,
-    PluginInvocationResult, PluginKey, PluginWorkerDebugSnapshot, RequestId, Rgb, RoutedEnvelope,
-    RoutedEnvelopeDrainOutcome, RoutedEnvelopePublishOutcome, SessionId, SessionLifecycleState,
-    SessionRuntimeErrorKind, SessionSpawnRequest, SubscriptionId, TerminalCapabilitySet,
-    TerminalColorProfile, TerminalSubscriptionGeneration, TerminalSubscriptionRecord,
+    EnvelopeId, EnvelopeTarget, ManagedSessionRuntimeError, MultiplexerEngineError,
+    PluginAdmissionResult, PluginCapabilityRuntime, PluginCleanupResult, PluginCompletionDrain,
+    PluginHandlerKind, PluginInvocationClass, PluginInvocationFailure, PluginInvocationFailureKind,
+    PluginInvocationOutcome, PluginInvocationRequest, PluginInvocationResult, PluginKey,
+    PluginWorkerDebugSnapshot, RequestId, Rgb, RoutedEnvelope, RoutedEnvelopeDrainOutcome,
+    RoutedEnvelopePublishOutcome, SessionId, SessionLifecycleState, SessionRuntimeErrorKind,
+    SessionSpawnRequest, SubscriptionId, TerminalCapabilitySet, TerminalColorProfile,
+    TerminalSubscriptionGeneration, TerminalSubscriptionRecord,
 };
 use botster_core_daemon::{
     AcknowledgeRoutedEnvelopeRequest, AttachedSession, CaptureSnapshotRequest,
     CaptureSnapshotResult, CoreDaemon, CoreDaemonConfig, CoreDaemonError, DaemonSession,
     DetachTerminalSubscriptionResult, DrainRoutedEnvelopesRequest, GuardedWriteRequest,
-    GuardedWriteResult, LifecycleBaselineBudget, ModeGatedInputOutcome, ObserveLifecycleBudget,
-    ObserveLifecycleCursor, ObserveLifecycleSlice, PublishRoutedEnvelopeRequest,
-    ReadModeFlagsRequest, ReadModeFlagsResult, ReadScreenRequest, ReadScreenResult,
-    RegistrySessionState, RoutedEnvelopeDeliveryStateResult, SessionAdoptionReport,
-    SessionAdoptionState, SessionLifecycleBaselinePage, SessionLifecycleCursor,
-    SessionLifecycleLookup, SessionLifecyclePage, SessionLifecyclePageError,
-    SessionRegistryStateLookup, SpawnSessionRequest,
+    GuardedWriteResult, LifecycleBaselineBudget, ObserveLifecycleBudget, ObserveLifecycleCursor,
+    ObserveLifecycleSlice, PublishRoutedEnvelopeRequest, ReadModeFlagsRequest, ReadModeFlagsResult,
+    ReadScreenRequest, ReadScreenResult, RegistrySessionState, RoutedEnvelopeDeliveryStateResult,
+    SessionAdoptionReport, SessionAdoptionState, SessionLifecycleBaselinePage,
+    SessionLifecycleCursor, SessionLifecycleLookup, SessionLifecyclePage,
+    SessionLifecyclePageError, SessionRegistryStateLookup, SpawnSessionRequest,
 };
 use botster_ui_contract::{UiActionRequest, UiActionResult, UiNode};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -3703,67 +3702,6 @@ impl HubRuntime {
                 generation,
                 now_seconds,
             )
-    }
-
-    /// Write terminal bytes into a session through the core daemon.
-    pub fn write_bytes(
-        &mut self,
-        client_id: ClientId,
-        session_id: SessionId,
-        data: impl Into<Vec<u8>>,
-        now_seconds: u64,
-    ) -> Result<(), CoreDaemonError> {
-        self.core_daemon.lock().expect("core daemon mutex").input(
-            client_id,
-            session_id,
-            data,
-            now_seconds,
-        )
-    }
-
-    /// Admit mode-dependent PTY input under Core's race-free mode-gated path.
-    ///
-    /// Production uses Core's default 5s timeout. Hub does not override that bound.
-    pub fn mode_gated_input(
-        &mut self,
-        client_id: ClientId,
-        session_id: SessionId,
-        data: impl Into<Vec<u8>>,
-        mode_generation: u64,
-        mode_revision: u64,
-        now_seconds: u64,
-    ) -> Result<ModeGatedInputOutcome, CoreDaemonError> {
-        self.core_daemon
-            .lock()
-            .expect("core daemon mutex")
-            .mode_gated_input(
-                client_id,
-                session_id,
-                data,
-                Some(ModeFreshnessToken {
-                    mode_generation,
-                    mode_revision,
-                }),
-                now_seconds,
-            )
-    }
-
-    /// Resize a session terminal through the core daemon.
-    pub fn resize(
-        &mut self,
-        client_id: ClientId,
-        session_id: SessionId,
-        rows: u16,
-        cols: u16,
-        now_seconds: u64,
-    ) -> Result<(), CoreDaemonError> {
-        self.core_daemon.lock().expect("core daemon mutex").resize(
-            client_id,
-            session_id,
-            rows,
-            cols,
-            now_seconds,
-        )
     }
 }
 

@@ -118,13 +118,21 @@ impl TerminalReservationRegistry {
         ))
     }
 
-    pub(crate) fn lookup_label(&self, label: &str, now_seconds: u64) -> ReservationLookup {
+    pub(crate) fn lookup_label(
+        &self,
+        label: &str,
+        peer_generation: u64,
+        now_seconds: u64,
+    ) -> ReservationLookup {
         let Some(key) = self.by_label.get(label) else {
             return ReservationLookup::Unknown;
         };
         let Some(reservation) = self.by_key.get(key) else {
             return ReservationLookup::Unknown;
         };
+        if reservation.peer_generation != peer_generation {
+            return ReservationLookup::Unknown;
+        }
         match reservation.state {
             ReservationState::Bound => ReservationLookup::Bound,
             ReservationState::Expired => ReservationLookup::Expired,
@@ -135,18 +143,28 @@ impl TerminalReservationRegistry {
         }
     }
 
-    pub(crate) fn reservation_for_label(&self, label: &str) -> Option<&TerminalReservation> {
+    pub(crate) fn reservation_for_label(
+        &self,
+        label: &str,
+        peer_generation: u64,
+    ) -> Option<&TerminalReservation> {
         let key = self.by_label.get(label)?;
-        self.by_key.get(key)
+        self.by_key
+            .get(key)
+            .filter(|reservation| reservation.peer_generation == peer_generation)
     }
 
     pub(crate) fn expire_label(
         &mut self,
         label: &str,
+        peer_generation: u64,
         now_seconds: u64,
     ) -> Option<TerminalReservation> {
         let key = self.by_label.get(label)?.clone();
         let reservation = self.by_key.get_mut(&key)?;
+        if reservation.peer_generation != peer_generation {
+            return None;
+        }
         if reservation.state == ReservationState::Bound {
             return None;
         }
@@ -159,10 +177,16 @@ impl TerminalReservationRegistry {
         Some(reservation.clone())
     }
 
-    pub(crate) fn mark_bound(&mut self, label: &str) -> Option<TerminalReservation> {
+    pub(crate) fn mark_bound(
+        &mut self,
+        label: &str,
+        peer_generation: u64,
+    ) -> Option<TerminalReservation> {
         let key = self.by_label.get(label)?.clone();
         let reservation = self.by_key.get_mut(&key)?;
-        if reservation.state != ReservationState::Live {
+        if reservation.peer_generation != peer_generation
+            || reservation.state != ReservationState::Live
+        {
             return None;
         }
         reservation.state = ReservationState::Bound;
@@ -264,7 +288,7 @@ mod tests {
             Err(ReserveError::LabelConflict)
         );
         assert_eq!(
-            registry.lookup_label(&first.label, 100),
+            registry.lookup_label(&first.label, 9, 100),
             ReservationLookup::Live
         );
     }
@@ -277,12 +301,58 @@ mod tests {
             .expect("reserve");
         registry.retire_expired(10 + u64::from(reserved.expires_in_seconds));
         assert_eq!(
-            registry.lookup_label(&reserved.label, 10 + u64::from(reserved.expires_in_seconds)),
+            registry.lookup_label(
+                &reserved.label,
+                3,
+                10 + u64::from(reserved.expires_in_seconds)
+            ),
             ReservationLookup::Expired
         );
         assert_eq!(
-            registry.lookup_label("never-reserved", 10),
+            registry.lookup_label("never-reserved", 3, 10),
             ReservationLookup::Unknown
+        );
+    }
+
+    #[test]
+    fn wrong_peer_cannot_inspect_expire_or_bind_a_reservation() {
+        let mut registry = TerminalReservationRegistry::default();
+        let reserved = registry
+            .reserve("session".into(), "sub".into(), 2, 3, 10)
+            .expect("reserve");
+
+        assert_eq!(
+            registry.lookup_label(&reserved.label, 4, u64::MAX),
+            ReservationLookup::Unknown
+        );
+        assert!(registry.reservation_for_label(&reserved.label, 4).is_none());
+        assert!(
+            registry
+                .expire_label(&reserved.label, 4, u64::MAX)
+                .is_none()
+        );
+        assert!(registry.mark_bound(&reserved.label, 4).is_none());
+        assert_eq!(
+            registry.lookup_label(&reserved.label, 3, 10),
+            ReservationLookup::Live
+        );
+    }
+
+    #[test]
+    fn reused_grant_generation_cannot_bind_an_old_reservation() {
+        let mut registry = TerminalReservationRegistry::default();
+        let reserved = registry
+            .reserve("session".into(), "sub".into(), 2, 3, 10)
+            .expect("reserve");
+
+        assert_eq!(
+            registry.lookup_label(&reserved.label, 5, 10),
+            ReservationLookup::Unknown
+        );
+        assert!(registry.mark_bound(&reserved.label, 5).is_none());
+        assert_eq!(
+            registry.lookup_label(&reserved.label, 3, 10),
+            ReservationLookup::Live
         );
     }
 }

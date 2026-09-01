@@ -5550,8 +5550,6 @@ fn process_ownership_external_hub_test_support_cleans_up_isolated_daemon() {
             "spawn",
             "attach",
             "drain",
-            "send_input",
-            "resize",
             "shutdown_session",
         ]
     );

@@ -174,6 +174,9 @@ assert.equal(metadata.conformance_fixture_revision, 47);
     ...readme.matchAll(/"@trybotster\/hub-test-support":\s*"([^"]+)"/g),
   ].map((match) => match[1]);
   assert.deepEqual(packageSpecPins, [version]);
+  assert.match(readme, /protocol version 8/);
+  assert.match(readme, /conformance revision 47/);
+  assert.doesNotMatch(readme, /mode_gated_input|ModeGatedInput|SendInput/);
 }
 assert.deepEqual(metadata.ui_contract, {
   conformance_fixture_export: "@trybotster/ui-contract/conformance-fixtures",

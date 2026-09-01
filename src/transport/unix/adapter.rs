@@ -333,6 +333,13 @@ impl UnixConnectionMux {
         if keys.is_empty() {
             return;
         }
+        if let Ok(source) = self.inner.close_source.lock()
+            && let Some(source) = source.as_ref()
+        {
+            for (_, subscription_id, generation) in &keys {
+                source.retire(session_id, subscription_id, *generation);
+            }
+        }
         self.inner.closed_events.suppress_session_keys(keys);
     }
 
@@ -342,6 +349,13 @@ impl UnixConnectionMux {
         subscription_id: impl Into<String>,
         generation: u64,
     ) {
+        let session_id = session_id.into();
+        let subscription_id = subscription_id.into();
+        if let Ok(source) = self.inner.close_source.lock()
+            && let Some(source) = source.as_ref()
+        {
+            source.retire(&session_id, &subscription_id, generation);
+        }
         self.inner
             .closed_events
             .suppress_generation(session_id, subscription_id, generation);

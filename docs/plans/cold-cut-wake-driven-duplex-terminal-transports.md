@@ -11,7 +11,7 @@ which the human decision superseded. That file stays as the historical record.
 
 - Target repository: `botster-hub` (`trybotster/botster-hub`).
 - `target_id`: `tgt_7e208a0c76a44980a83b63af976b1f22`.
-- Repository path of record: `/Users/jasonconigliari/Projects/botster-hub`.
+- Repository path of record: the routed `botster-hub` run worktree.
 - Base ref: `main`. Verification base commit: `1664312` on branch
   `project-pipelines/ticket_1787894427_525056`, clean tracked worktree.
 - The target repository comes from the ticket `target_id` through `list_spawn_targets`,

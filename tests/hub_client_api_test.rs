@@ -31,7 +31,10 @@ use botster_ui_contract::{
 };
 
 mod support;
-use support::ensure_session_worker_binary;
+use support::{
+    bind_shared_terminal_adapter, ensure_session_worker_binary, send_terminal_input,
+    send_terminal_resize,
+};
 
 fn explicit_runtime(name: &str) -> HubRuntime {
     ensure_session_worker_binary();
@@ -71,7 +74,7 @@ fn attach_bound_subscription(
     session_id: &SessionId,
     subscription_id: &SubscriptionId,
     now_seconds: u64,
-) {
+) -> botster_core_test_support::terminal_adapter::SharedFakeTerminalAdapter {
     runtime
         .attach_client(
             api.identity().client_id.clone(),
@@ -80,23 +83,12 @@ fn attach_bound_subscription(
             now_seconds,
         )
         .expect("production adapter path attach");
-    let generation = runtime
-        .list_terminal_subscriptions()
-        .into_iter()
-        .find(|row| row.session_id == *session_id && row.subscription_id == *subscription_id)
-        .map(|row| row.generation)
-        .expect("live generation");
-    runtime
-        .bind_terminal_adapter(
-            api.identity().client_id.clone(),
-            session_id.clone(),
-            subscription_id.clone(),
-            generation,
-            botster_core::TerminalCapabilitySet::from_tokens(["terminal_streaming", "resize"])
-                .expect("tokens"),
-            Box::new(botster_core_test_support::terminal_adapter::FakeTerminalAdapter::default()),
-        )
-        .expect("bind test adapter");
+    bind_shared_terminal_adapter(
+        runtime,
+        api.identity().client_id.clone(),
+        session_id.clone(),
+        subscription_id.clone(),
+    )
 }
 
 #[test]
@@ -3064,7 +3056,7 @@ fn late_attach_receives_opaque_history_before_later_live_output() {
         .expect("spawn late-history session");
     logical_clock += 1;
 
-    attach_bound_subscription(
+    let first_adapter = attach_bound_subscription(
         &mut runtime,
         &first_api,
         &session_id,
@@ -3112,18 +3104,7 @@ fn late_attach_receives_opaque_history_before_later_live_output() {
         screen.text
     );
 
-    first_api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::Input {
-                request_id: request_id("late-history-input"),
-                session_id: session_id.clone(),
-                data: b"live-after-late\n".to_vec(),
-                now_seconds: logical_clock,
-            },
-        )
-        .expect("send live output after late attach");
+    send_terminal_input(&first_adapter, b"live-after-late\n");
     logical_clock += 1;
     read_screen_until(
         &late_api,
@@ -3168,7 +3149,7 @@ fn late_attach_without_prior_output_does_not_fabricate_history() {
         .expect("spawn no-history session");
     logical_clock += 1;
 
-    attach_bound_subscription(
+    let first_adapter = attach_bound_subscription(
         &mut runtime,
         &first_api,
         &session_id,
@@ -3207,18 +3188,7 @@ fn late_attach_without_prior_output_does_not_fabricate_history() {
         screen.text
     );
 
-    first_api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::Input {
-                request_id: request_id("no-history-input"),
-                session_id: session_id.clone(),
-                data: b"live-only\n".to_vec(),
-                now_seconds: logical_clock,
-            },
-        )
-        .expect("send live output after no-history late attach");
+    send_terminal_input(&first_adapter, b"live-only\n");
     logical_clock += 1;
     read_screen_until(
         &late_api,
@@ -3238,7 +3208,7 @@ fn late_attach_without_prior_output_does_not_fabricate_history() {
 }
 
 #[test]
-fn local_client_api_exercises_status_spawn_attach_input_resize_detach_shutdown_and_events() {
+fn local_client_api_exercises_status_spawn_attach_detach_shutdown_and_events() {
     let api = HubClientApi::local_operator("local-client-api-test");
     let second_api = HubClientApi::local_operator("local-client-api-test-two");
     let packages = empty_registry();
@@ -3296,7 +3266,7 @@ fn local_client_api_exercises_status_spawn_attach_input_resize_detach_shutdown_a
     assert_eq!(spawned.session.lifecycle, SessionLifecycleState::Running);
     assert!(spawned.events.is_empty());
 
-    attach_bound_subscription(
+    let first_adapter = attach_bound_subscription(
         &mut runtime,
         &api,
         &session_id,
@@ -3304,7 +3274,7 @@ fn local_client_api_exercises_status_spawn_attach_input_resize_detach_shutdown_a
         logical_clock,
     );
     logical_clock += 1;
-    attach_bound_subscription(
+    let second_adapter = attach_bound_subscription(
         &mut runtime,
         &second_api,
         &session_id,
@@ -3322,31 +3292,10 @@ fn local_client_api_exercises_status_spawn_attach_input_resize_detach_shutdown_a
         &mut logical_clock,
     );
 
-    api.handle_request(
-        &mut runtime,
-        &packages,
-        HubClientRequest::Resize {
-            request_id: request_id("resize"),
-            session_id: session_id.clone(),
-            rows: 30,
-            cols: 100,
-            now_seconds: logical_clock,
-        },
-    )
-    .expect("resize through client api");
+    send_terminal_resize(&first_adapter, 30, 100);
     logical_clock += 1;
 
-    api.handle_request(
-        &mut runtime,
-        &packages,
-        HubClientRequest::Input {
-            request_id: request_id("input"),
-            session_id: session_id.clone(),
-            data: b"ping-hub\n".to_vec(),
-            now_seconds: logical_clock,
-        },
-    )
-    .expect("input through client api");
+    send_terminal_input(&first_adapter, b"ping-hub\n");
     logical_clock += 1;
 
     read_screen_until(
@@ -3380,18 +3329,7 @@ fn local_client_api_exercises_status_spawn_attach_input_resize_detach_shutdown_a
     .expect("detach through client api");
     logical_clock += 1;
 
-    second_api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::Input {
-                request_id: request_id("input-after-detach"),
-                session_id: session_id.clone(),
-                data: b"after-detach\n".to_vec(),
-                now_seconds: logical_clock,
-            },
-        )
-        .expect("input from still-attached client through client api");
+    send_terminal_input(&second_adapter, b"after-detach\n");
     logical_clock += 1;
 
     read_screen_until(

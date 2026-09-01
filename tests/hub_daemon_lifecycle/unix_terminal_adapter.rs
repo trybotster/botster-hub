@@ -502,6 +502,77 @@ fn unix_adapter_explicit_detach_is_separate_from_connection_death() {
 }
 
 #[test]
+fn unix_adapter_detach_retires_close_work_to_the_live_route_baseline() {
+    let _guard = daemon_test_guard();
+    let observation = unique_short_test_dir("close-work-observation");
+    let observation_value = observation.display().to_string();
+    let hub = start_isolated_live_output_hub_with_env(
+        "close-work-retire",
+        &[(
+            "BOTSTER_HUB_TEST_DATA_PLANE_OBSERVATION",
+            observation_value.as_str(),
+        )],
+    );
+    let endpoint = hub.endpoint().clone();
+    let session_id = "close-work-session";
+    let subscription_id = "close-work-sub";
+    let (mut stream, mut reader) = unix_adapter_connection(&endpoint);
+    let mut envelopes = Vec::new();
+
+    request_skipping_envelopes(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::Spawn {
+            session_id: session_id.to_string(),
+            command: "sleep 30".to_string(),
+        },
+        &mut envelopes,
+    );
+    request_skipping_envelopes(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::Attach {
+            session_id: session_id.to_string(),
+            subscription_id: subscription_id.to_string(),
+        },
+        &mut envelopes,
+    );
+    wait_for_live_close_routes(&observation, 1);
+
+    request_skipping_envelopes(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::Detach {
+            session_id: session_id.to_string(),
+            subscription_id: subscription_id.to_string(),
+        },
+        &mut envelopes,
+    );
+    wait_for_live_close_routes(&observation, 0);
+
+    shutdown_short_lived_session(&endpoint, session_id);
+    hub.shutdown().expect("shutdown isolated hub");
+    let _ = fs::remove_file(observation);
+}
+
+fn wait_for_live_close_routes(path: &Path, expected: u64) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(body) = fs::read_to_string(path)
+            && let Ok(value) = serde_json::from_str::<serde_json::Value>(&body)
+            && value["live_close_routes"].as_u64() == Some(expected)
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "data-plane close registry must reach {expected} live routes"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
 fn unix_adapter_stale_disconnect_does_not_cancel_replacement_owner() {
     let _guard = daemon_test_guard();
     let hub = start_isolated_live_output_hub("uso");
@@ -1166,7 +1237,6 @@ fn tui_shaped_hello_status_succeeds_without_host_terminal_tokens() {
             botster_hub_client::FEATURE_PLUGIN_SURFACE_ACTION.to_string(),
             botster_hub_client::FEATURE_TERMINAL_READBACK.to_string(),
             botster_hub_client::FEATURE_SESSION_ENTITY_SUBSCRIPTIONS.to_string(),
-            botster_hub_client::FEATURE_MODE_GATED_INPUT.to_string(),
             botster_hub_client::FEATURE_UNIX_TERMINAL_ADAPTER.to_string(),
             botster_hub_client::FEATURE_TERMINAL_SUBSCRIPTION_CLOSED.to_string(),
         ],

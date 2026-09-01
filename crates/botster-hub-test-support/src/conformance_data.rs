@@ -552,8 +552,6 @@ pub fn first_party_client_support_matrix() -> FirstPartyClientSupportMatrix {
             "spawn".to_string(),
             "attach".to_string(),
             "drain".to_string(),
-            "send_input".to_string(),
-            "resize".to_string(),
             "shutdown_session".to_string(),
         ],
         terminal_streaming: TerminalStreamingSupport {

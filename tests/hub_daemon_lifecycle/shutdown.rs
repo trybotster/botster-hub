@@ -2113,35 +2113,14 @@ fn daemon_restart_reconnects_worker_backed_session_through_client_api() {
         )
         .expect("reattach after restart through runtime attach");
     logical_clock += 1;
-    let generation = runtime
-        .list_terminal_subscriptions()
-        .into_iter()
-        .find(|row| row.session_id == session_id && row.subscription_id == subscription_id)
-        .map(|row| row.generation)
-        .expect("live generation after restart");
-    runtime
-        .bind_terminal_adapter(
-            api.identity().client_id.clone(),
-            session_id.clone(),
-            subscription_id.clone(),
-            generation,
-            botster_core::TerminalCapabilitySet::from_tokens(["terminal_streaming", "resize"])
-                .expect("tokens"),
-            Box::new(botster_core_test_support::terminal_adapter::FakeTerminalAdapter::default()),
-        )
-        .expect("bind after restart");
+    let terminal_adapter = bind_shared_terminal_adapter(
+        runtime,
+        api.identity().client_id.clone(),
+        session_id.clone(),
+        subscription_id.clone(),
+    );
     logical_clock += 1;
-    api.handle_request(
-        restarted.runtime_mut().expect("runtime initialized"),
-        &packages,
-        HubClientRequest::Input {
-            request_id: RequestId("hub-daemon-restart-input".to_string()),
-            session_id: session_id.clone(),
-            data: b"after-restart\r".to_vec(),
-            now_seconds: logical_clock,
-        },
-    )
-    .expect("input after restart through client api");
+    send_terminal_input(&terminal_adapter, b"after-restart\r");
     logical_clock += 1;
     let mut screen = String::new();
     for _ in 0..100 {
@@ -3245,4 +3224,3 @@ fn isolated_hub_shutdown_reaps_live_session_workers() {
         "IsolatedHub shutdown must reap owned session workers, leftover={leftover:?}"
     );
 }
-

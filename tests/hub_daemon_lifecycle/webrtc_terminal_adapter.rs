@@ -1792,3 +1792,68 @@ fn webrtc_never_reserved_label_is_rejected_with_no_event() {
     });
     hub.shutdown().expect("shutdown isolated hub");
 }
+
+#[test]
+fn webrtc_wrong_peer_cannot_consume_or_expire_an_owned_reservation() {
+    let _guard = daemon_test_guard();
+    let (hub, endpoint, bootstrap_a) = start_webrtc_adapter_hub("wrong-peer-reservation");
+    let bootstrap_b = issue_second_webrtc_bootstrap(&endpoint, &bootstrap_a);
+    block_on(async {
+        let (mut owner_a, key_a) = open_local_webrtc_peer(&endpoint, &bootstrap_a).await;
+        owner_a
+            .encrypted_hello(&key_a, &webrtc_close_event_hello())
+            .await
+            .expect("owner A hello");
+        let attach = owner_a
+            .encrypted_request(
+                &key_a,
+                &botster_hub_client::DaemonRequest::Spawn {
+                    session_id: "wrong-peer-session".to_string(),
+                    command: "sleep 30".to_string(),
+                },
+            )
+            .await
+            .expect("spawn");
+        assert_eq!(
+            attach.kind,
+            botster_hub_client::DaemonResponseKind::Spawned
+        );
+        let attach = owner_a
+            .encrypted_request(
+                &key_a,
+                &botster_hub_client::DaemonRequest::Attach {
+                    session_id: "wrong-peer-session".to_string(),
+                    subscription_id: "wrong-peer-sub".to_string(),
+                },
+            )
+            .await
+            .expect("reserve on owner A");
+        let reservation = attach.terminal_reservation.expect("reservation body");
+
+        let (mut owner_b, key_b) = open_local_webrtc_peer(&endpoint, &bootstrap_b).await;
+        owner_b
+            .encrypted_hello(&key_b, &webrtc_close_event_hello())
+            .await
+            .expect("owner B hello");
+        let mut wrong_channel = owner_b
+            .create_labeled_data_channel(&reservation.label)
+            .await
+            .expect("open wrong-peer channel");
+        timeout(Duration::from_secs(5), wrong_channel.closed.recv())
+            .await
+            .expect("wrong-peer channel must close");
+
+        owner_a
+            .open_reserved_terminal(
+                &key_a,
+                &reservation.label,
+                &webrtc_terminal_adapter_hello(),
+            )
+            .await
+            .expect("owner A can still bind its reservation");
+        owner_a.peer.close().await.expect("close owner A");
+        owner_b.peer.close().await.expect("close owner B");
+    });
+    shutdown_short_lived_session(&endpoint, "wrong-peer-session");
+    hub.shutdown().expect("shutdown isolated hub");
+}

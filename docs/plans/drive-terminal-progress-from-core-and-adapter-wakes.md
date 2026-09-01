@@ -8,7 +8,7 @@ Pipeline: Botster Stack Delivery (`botster_stack_delivery`)
 
 - Target repository: `botster-hub` (`trybotster/botster-hub`).
 - `target_id`: `tgt_7e208a0c76a44980a83b63af976b1f22`.
-- Repository path of record: `/Users/jasonconigliari/Projects/botster-hub`.
+- Repository path of record: the routed `botster-hub` run worktree.
 - Base ref: `main`. Verification base commit: `c674a62ac505b990e06f4aca34db1daf586996dc`.
 - The target repository comes from the ticket `target_id` through `list_spawn_targets`. It does not come from the process working directory.
 

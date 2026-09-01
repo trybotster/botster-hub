@@ -93,6 +93,16 @@ impl CloseWorkHook {
             }
         }
     }
+
+    #[cfg(test)]
+    fn notify_closed_through_overflow(&self, host_closed: bool) {
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        state.host_closed.store(host_closed, Ordering::SeqCst);
+        state.queued.store(true, Ordering::Release);
+        self.overflow.store(true, Ordering::Release);
+    }
 }
 
 struct CloseWorkInner {
@@ -154,7 +164,6 @@ impl CloseWorkSource {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn retire(&self, session_id: &str, subscription_id: &str, generation: u64) {
         let key = RouteCloseKey {
             session_id: session_id.to_string(),
@@ -170,10 +179,16 @@ impl CloseWorkSource {
 
     pub(crate) fn take_batch(&self, max_keys: usize) -> Vec<Arc<RouteCloseState>> {
         let mut batch = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         if let Ok(rx) = self.inner.rx.lock() {
             while batch.len() < max_keys {
                 match rx.try_recv() {
-                    Ok(state) if !state.retired.load(Ordering::Acquire) => batch.push(state),
+                    Ok(state)
+                        if !state.retired.load(Ordering::Acquire)
+                            && seen.insert(Arc::as_ptr(&state) as usize) =>
+                    {
+                        batch.push(state)
+                    }
                     Ok(_) => {}
                     Err(_) => break,
                 }
@@ -186,17 +201,37 @@ impl CloseWorkSource {
                 if state.retired.load(Ordering::Acquire) {
                     continue;
                 }
-                if state.queued.load(Ordering::Acquire) {
+                if batch.len() < max_keys
+                    && state.queued.load(Ordering::Acquire)
+                    && seen.insert(Arc::as_ptr(state) as usize)
+                {
                     batch.push(Arc::clone(state));
                 }
             }
+            if registry.values().any(|state| {
+                !state.retired.load(Ordering::Acquire)
+                    && state.queued.load(Ordering::Acquire)
+                    && !seen.contains(&(Arc::as_ptr(state) as usize))
+            }) {
+                self.inner.overflow.store(true, Ordering::Release);
+            }
         }
-        let mut seen = std::collections::HashSet::new();
         batch
-            .into_iter()
-            .filter(|state| seen.insert(Arc::as_ptr(state) as usize))
-            .take(max_keys)
-            .collect()
+    }
+
+    pub(crate) fn requeue(&self, state: Arc<RouteCloseState>) {
+        if state.retired.load(Ordering::Acquire) || !state.queued.load(Ordering::Acquire) {
+            return;
+        }
+        match self.inner.tx.try_send(state) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                self.inner.overflow.store(true, Ordering::Release);
+            }
+            Err(TrySendError::Disconnected(state)) => {
+                state.queued.store(false, Ordering::Release);
+            }
+        }
     }
 
     pub(crate) fn live_count(&self) -> usize {
@@ -286,5 +321,56 @@ mod tests {
         assert!(!keys.iter().any(|key| key.session_id == "idle"));
         assert!(!keys.iter().any(|key| key.session_id == "dead"));
         drop(idle);
+    }
+
+    #[test]
+    fn overflow_preserves_queued_routes_after_the_batch_limit() {
+        let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let source = CloseWorkSource::new();
+        let hooks: Vec<_> = (0..10)
+            .map(|generation| {
+                source.register(
+                    format!("session-{generation}"),
+                    "sub".into(),
+                    generation,
+                    ClosedEventLedger::default(),
+                    Arc::clone(&wake),
+                )
+            })
+            .collect();
+        for hook in &hooks {
+            hook.notify_closed_through_overflow(false);
+        }
+
+        let first = source.take_batch(8);
+        assert_eq!(first.len(), 8);
+        for state in first {
+            source.retire(
+                &state.key.session_id,
+                &state.key.subscription_id,
+                state.key.generation,
+            );
+        }
+        let second = source.take_batch(8);
+        assert_eq!(second.len(), 2);
+    }
+
+    #[test]
+    fn retire_returns_the_registry_to_its_baseline() {
+        let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let source = CloseWorkSource::new();
+        let baseline = source.live_count();
+        let hook = source.register(
+            "session".into(),
+            "sub".into(),
+            7,
+            ClosedEventLedger::default(),
+            wake,
+        );
+        assert_eq!(source.live_count(), baseline + 1);
+        source.retire("session", "sub", 7);
+        assert_eq!(source.live_count(), baseline);
+        hook.notify_closed(false);
+        assert!(source.take_batch(8).is_empty());
     }
 }

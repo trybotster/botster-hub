@@ -21,7 +21,7 @@ use botster_hub::{
 };
 
 mod support;
-use support::ensure_session_worker_binary;
+use support::{bind_shared_terminal_adapter, ensure_session_worker_binary, send_terminal_input};
 
 fn explicit_runtime(name: &str) -> HubRuntime {
     ensure_session_worker_binary();
@@ -677,6 +677,12 @@ fn hub_runtime_reports_bounded_http_failures_without_blocking_hot_path() {
         )
         .expect("attach through core");
     logical_clock += 1;
+    let terminal_adapter = bind_shared_terminal_adapter(
+        &mut runtime,
+        client_id.clone(),
+        session_id.clone(),
+        subscription_id.clone(),
+    );
 
     runtime
         .submit_capability_request(request(
@@ -699,14 +705,7 @@ fn hub_runtime_reports_bounded_http_failures_without_blocking_hot_path() {
         b"ready",
         &mut logical_clock,
     );
-    runtime
-        .write_bytes(
-            client_id.clone(),
-            session_id.clone(),
-            b"ping-http-capability\n".to_vec(),
-            logical_clock,
-        )
-        .expect("write while HTTP work is pending");
+    send_terminal_input(&terminal_adapter, b"ping-http-capability\n");
     logical_clock += 1;
     drain_session_until(
         &mut runtime,
@@ -886,6 +885,12 @@ fn hub_runtime_keeps_session_hot_path_responsive_during_failing_http_transport()
         )
         .expect("attach through core");
     logical_clock += 1;
+    let terminal_adapter = bind_shared_terminal_adapter(
+        &mut runtime,
+        client_id.clone(),
+        session_id.clone(),
+        subscription_id.clone(),
+    );
 
     runtime
         .submit_capability_request(request(
@@ -908,14 +913,7 @@ fn hub_runtime_keeps_session_hot_path_responsive_during_failing_http_transport()
         b"ready",
         &mut logical_clock,
     );
-    runtime
-        .write_bytes(
-            client_id.clone(),
-            session_id.clone(),
-            b"ping-http-failure-capability\n".to_vec(),
-            logical_clock,
-        )
-        .expect("write while failing HTTP work is pending");
+    send_terminal_input(&terminal_adapter, b"ping-http-failure-capability\n");
     logical_clock += 1;
     drain_session_until(
         &mut runtime,
@@ -1056,6 +1054,12 @@ fn capability_operations_do_not_block_session_hot_path() {
         )
         .expect("attach through core");
     logical_clock += 1;
+    let terminal_adapter = bind_shared_terminal_adapter(
+        &mut runtime,
+        client_id.clone(),
+        session_id.clone(),
+        subscription_id.clone(),
+    );
 
     for index in 0..32 {
         runtime
@@ -1082,14 +1086,7 @@ fn capability_operations_do_not_block_session_hot_path() {
         b"ready",
         &mut logical_clock,
     );
-    runtime
-        .write_bytes(
-            client_id.clone(),
-            session_id.clone(),
-            b"ping-capability\n".to_vec(),
-            logical_clock,
-        )
-        .expect("write while capability work is pending");
+    send_terminal_input(&terminal_adapter, b"ping-capability\n");
     logical_clock += 1;
     drain_session_until(
         &mut runtime,
