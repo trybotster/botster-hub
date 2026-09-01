@@ -108,7 +108,7 @@ pub(crate) enum ControlMessage {
         grant_id: String,
         label: String,
         frame_len: usize,
-        reply_tx: oneshot::Sender<bool>,
+        reply_tx: oneshot::Sender<Option<crate::admission::connection_budget::AggregateSendPermit>>,
     },
 }
 

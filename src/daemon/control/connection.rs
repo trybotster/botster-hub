@@ -7,6 +7,7 @@ use tokio::sync::oneshot;
 use botster_hub_client::{DaemonEvent, TERMINAL_SUBSCRIPTION_CLOSED_RESERVATION_EXPIRED};
 
 use crate::HubDaemon;
+use crate::admission::connection_budget::AggregateSendPermit;
 use crate::admission::connection_budget::ChannelClass;
 use crate::admission::reservations::ReservationBinding;
 use crate::admission::reservations::{ReservationLookup, now_seconds};
@@ -476,10 +477,10 @@ fn authorize_subscription_send(
     grant_id: &str,
     label: &str,
     frame_len: usize,
-    reply_tx: oneshot::Sender<bool>,
+    reply_tx: oneshot::Sender<Option<AggregateSendPermit>>,
 ) -> bool {
     let Some(peer_generation) = admitted_peer_generation(state, grant_id) else {
-        let _ = reply_tx.send(false);
+        let _ = reply_tx.send(None);
         return false;
     };
     let bound = state
@@ -490,14 +491,15 @@ fn authorize_subscription_send(
         .is_some_and(|reservation| {
             reservation.state == crate::admission::reservations::ReservationState::Bound
         });
-    let permitted = bound
-        && state
+    let permit = bound.then(|| {
+        state
             .pending_runtime
             .admission
             .connection_budgets
-            .get(&peer_generation)
-            .is_some_and(|budget| budget.permits_send(frame_len));
-    let _ = reply_tx.send(permitted);
+            .get(&peer_generation)?
+            .authorize_send(label, frame_len)
+    });
+    let _ = reply_tx.send(permit.flatten());
     false
 }
 

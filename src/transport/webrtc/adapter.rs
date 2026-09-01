@@ -45,6 +45,7 @@ impl std::fmt::Debug for WebRtcTerminalAdapterHandle {
 struct WebRtcTerminalAdapterInner {
     slot: AdapterSlot<AdapterWake>,
     aggregate: Option<Arc<crate::admission::connection_budget::ConnectionAggregate>>,
+    aggregate_permit: Mutex<Option<crate::admission::connection_budget::AggregateSendPermit>>,
     aggregate_blocked: AtomicBool,
 }
 
@@ -56,6 +57,7 @@ impl WebRtcTerminalAdapterInner {
                 Arc::new(AtomicBool::new(false)),
             ),
             aggregate: None,
+            aggregate_permit: Mutex::new(None),
             aggregate_blocked: AtomicBool::new(false),
         }
     }
@@ -65,6 +67,7 @@ impl WebRtcTerminalAdapterInner {
     }
 
     fn close_from_host(&self) {
+        self.release_aggregate_permit();
         self.slot.close_from_host();
     }
 
@@ -74,6 +77,7 @@ impl WebRtcTerminalAdapterInner {
     }
 
     fn close(&self) {
+        self.release_aggregate_permit();
         self.slot.close();
     }
 
@@ -90,17 +94,32 @@ impl WebRtcTerminalAdapterInner {
     }
 
     fn try_write(&self, frame: &TerminalFrame) -> Result<(), TerminalAdapterWriteError> {
-        if let Some(aggregate) = self.aggregate.as_ref() {
+        let permit = if let Some(aggregate) = self.aggregate.as_ref() {
             let frame_len = frame
                 .to_bytes()
                 .map_err(|_| TerminalAdapterWriteError::Closed)?
                 .len();
-            if !aggregate.permits_send(frame_len) {
+            let Some(permit) = aggregate.try_authorize(frame_len) else {
                 self.aggregate_blocked.store(true, Ordering::Release);
                 return Err(TerminalAdapterWriteError::WouldBlock);
-            }
+            };
+            Some(permit)
+        } else {
+            None
+        };
+        let mut aggregate_permit = self
+            .aggregate_permit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if aggregate_permit.is_some() {
+            return Err(TerminalAdapterWriteError::Full);
         }
-        self.slot.try_write(frame)
+        *aggregate_permit = permit;
+        let result = self.slot.try_write(frame);
+        if result.is_err() {
+            aggregate_permit.take();
+        }
+        result
     }
 
     fn refresh_aggregate_pressure(&self) {
@@ -122,7 +141,32 @@ impl WebRtcTerminalAdapterInner {
     }
 
     fn complete_active(&self) -> Option<Vec<u8>> {
-        self.slot.complete_active()
+        let completed = self.slot.complete_active();
+        if completed.is_some() {
+            self.release_aggregate_permit();
+        }
+        completed
+    }
+
+    fn resize_aggregate_permit(&self, frame_len: usize) -> bool {
+        let mut permit = self
+            .aggregate_permit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let permitted = permit
+            .as_mut()
+            .is_none_or(|permit| permit.try_resize(frame_len));
+        if !permitted {
+            self.aggregate_blocked.store(true, Ordering::Release);
+        }
+        permitted
+    }
+
+    fn release_aggregate_permit(&self) {
+        self.aggregate_permit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
     }
 }
 
@@ -160,6 +204,7 @@ impl WebRtcTerminalAdapter {
         let inner = Arc::new(WebRtcTerminalAdapterInner {
             slot: AdapterSlot::with_wake_and_close_work(wake, close_work),
             aggregate,
+            aggregate_permit: Mutex::new(None),
             aggregate_blocked: AtomicBool::new(false),
         });
         (
@@ -548,6 +593,10 @@ impl WebRtcTerminalAdapterHandle {
 
     pub(crate) fn complete_active(&self) -> Option<Vec<u8>> {
         self.inner.complete_active()
+    }
+
+    pub(crate) fn resize_aggregate_permit(&self, frame_len: usize) -> bool {
+        self.inner.resize_aggregate_permit(frame_len)
     }
 
     pub(crate) fn write_opaque_frame(&self, frame: &TerminalFrame) {
