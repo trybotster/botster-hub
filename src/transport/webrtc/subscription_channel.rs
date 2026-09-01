@@ -1005,6 +1005,302 @@ mod tests {
     }
 
     #[test]
+    fn entity_overflow_reports_before_close_then_retires_only_the_target_route() {
+        let _teardown_guard = teardown_test_lock();
+        let mut harness = PeerHarness::new("entity-overflow-matrix");
+        let mut peer = harness.signal_peer("http://127.0.0.1:41918");
+        harness.ensure_webrtc_adapter_hello(&mut peer);
+        peer.enable_host_events();
+
+        let mut reservations = Vec::new();
+        for index in 0..31 {
+            let response = harness.subscribe_entities(&mut peer, &format!("overflow-{index}"));
+            assert_eq!(
+                response.kind,
+                botster_hub_client::DaemonResponseKind::EntitySubscribed
+            );
+            reservations.push(
+                response
+                    .subscription_reservation
+                    .expect("entity reservation"),
+            );
+        }
+        let target = reservations.last().expect("target reservation").clone();
+        let peer_generation = target.peer_generation;
+
+        let (bind_tx, bind_rx) = oneshot::channel();
+        handle_control_message(
+            &mut harness.daemon,
+            &mut harness.state,
+            &harness.terminal_path,
+            &harness.transport_handle,
+            harness.control_tx.clone(),
+            ControlMessage::BindReservedSubscription {
+                grant_id: peer.grant_id.clone(),
+                label: target.label.clone(),
+                reply_tx: bind_tx,
+            },
+        );
+        let BoundSubscription::Entity {
+            receiver: target_receiver,
+            usage: target_usage,
+        } = bind_rx
+            .blocking_recv()
+            .expect("target bind reply")
+            .expect("target bind")
+        else {
+            panic!("target reservation must bind as an entity route");
+        };
+        drop(target_receiver);
+
+        {
+            let budget = harness
+                .state
+                .pending_runtime
+                .admission
+                .connection_budgets
+                .get(&peer_generation)
+                .expect("peer budget");
+            for (index, reservation) in reservations.iter().enumerate() {
+                budget
+                    .usage(&reservation.label)
+                    .expect("entity route usage")
+                    .store(if index < 29 { 65_536 } else { 98_304 }, Ordering::Release);
+            }
+            assert_eq!(
+                budget.aggregate_buffered(),
+                crate::admission::connection_budget::AGGREGATE_BUFFERED_HIGH
+            );
+            assert_eq!(budget.channel_count(), 32);
+        }
+
+        let refused = harness.subscribe_entities(&mut peer, "overflow-31");
+        assert_eq!(
+            refused.kind,
+            botster_hub_client::DaemonResponseKind::OperatorError
+        );
+        assert_eq!(
+            refused.error.as_ref().map(|error| error.code.as_str()),
+            Some("connection_channel_limit")
+        );
+        let budget = harness
+            .state
+            .pending_runtime
+            .admission
+            .connection_budgets
+            .get(&peer_generation)
+            .expect("peer budget");
+        assert_eq!(
+            budget.aggregate_buffered(),
+            crate::admission::connection_budget::AGGREGATE_BUFFERED_HIGH
+        );
+        assert_eq!(
+            budget.channel_count(),
+            crate::admission::connection_budget::MAX_TOTAL_CHANNELS - 1,
+            "aggregate admission must reject while one subscription slot remains free"
+        );
+
+        let (authorize_tx, authorize_rx) = oneshot::channel();
+        handle_control_message(
+            &mut harness.daemon,
+            &mut harness.state,
+            &harness.terminal_path,
+            &harness.transport_handle,
+            harness.control_tx.clone(),
+            ControlMessage::AuthorizeSubscriptionSend {
+                grant_id: peer.grant_id.clone(),
+                label: target.label.clone(),
+                frame_len: 65_536,
+                reply_tx: authorize_tx,
+            },
+        );
+        assert!(
+            authorize_rx
+                .blocking_recv()
+                .expect("65,536-byte authorization reply")
+                .is_none(),
+            "C_cross must refuse a 65,536-byte frame before transport write"
+        );
+
+        let peer_state = harness
+            .daemon
+            .local_webrtc()
+            .peer_states
+            .get(&peer.grant_id)
+            .expect("live peer state")
+            .clone();
+        let channel = Arc::new(FakeDataChannel::default());
+        let event_mux = peer_state.mux.clone();
+        *channel.close_probe.lock().expect("close probe mutex") =
+            Some(Arc::new(move || event_mux.has_pending_event()));
+        let (frame_tx, frame_rx) = tokio_mpsc::channel(1);
+        frame_tx
+            .try_send(DaemonEntityFrame::Snapshot {
+                subscription_id: target.subscription_id.clone(),
+                entity_type: "session".to_string(),
+                snapshot_seq: 1,
+                items: vec![serde_json::json!({"payload": "x".repeat(65_536)})],
+                resync_reason: None,
+            })
+            .expect("queue overflowing entity frame");
+        drop(frame_tx);
+        let key = peer.stream_key.clone();
+        let grant_id = peer.grant_id.clone();
+        let label = target.label.clone();
+        let subscription_id = target.subscription_id.clone();
+        let generation = target.generation;
+        let handler_channel = Arc::clone(&channel);
+        let handler_peer_state = Arc::clone(&peer_state);
+        let handler = harness.transport_handle.spawn(async move {
+            let route = BoundSubscriptionRoute {
+                peer_state: handler_peer_state.as_ref(),
+                grant_id: &grant_id,
+                label: &label,
+                subscription_id: &subscription_id,
+                generation,
+            };
+            run_bound_entity_channel(
+                handler_channel.as_ref(),
+                &key,
+                route,
+                frame_rx,
+                target_usage,
+            )
+            .await;
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let authorization = loop {
+            match harness.control_rx.try_recv() {
+                Ok(message) => break message,
+                Err(tokio_mpsc::error::TryRecvError::Empty)
+                    if std::time::Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("entity authorization was not queued: {error}"),
+            }
+        };
+        assert!(matches!(
+            authorization,
+            ControlMessage::AuthorizeSubscriptionSend { .. }
+        ));
+        handle_control_message(
+            &mut harness.daemon,
+            &mut harness.state,
+            &harness.terminal_path,
+            &harness.transport_handle,
+            harness.control_tx.clone(),
+            authorization,
+        );
+        harness
+            ._transport_runtime
+            .block_on(handler)
+            .expect("entity handler joins");
+        assert!(channel.sent.lock().expect("sent frames").is_empty());
+        assert!(channel.close_started.load(Ordering::Acquire));
+        assert!(channel.closed.load(Ordering::Acquire));
+        assert!(
+            channel.close_probe_passed.load(Ordering::Acquire),
+            "the typed control event must enter the control send path before local_close starts"
+        );
+        assert_eq!(
+            harness
+                .state
+                .pending_runtime
+                .admission
+                .connection_budgets
+                .get(&peer_generation)
+                .expect("peer budget")
+                .aggregate_buffered(),
+            crate::admission::connection_budget::AGGREGATE_BUFFERED_HIGH,
+            "the aggregate must stay exact through refusal and control reporting"
+        );
+
+        handle_control_message(
+            &mut harness.daemon,
+            &mut harness.state,
+            &harness.terminal_path,
+            &harness.transport_handle,
+            harness.control_tx.clone(),
+            ControlMessage::RetireReservedSubscription {
+                grant_id: peer.grant_id.clone(),
+                label: target.label.clone(),
+            },
+        );
+        let budget = harness
+            .state
+            .pending_runtime
+            .admission
+            .connection_budgets
+            .get(&peer_generation)
+            .expect("peer budget");
+        assert_eq!(budget.aggregate_buffered(), 1_998_848);
+        assert!(budget.usage(&target.label).is_none());
+        assert!(
+            harness
+                .state
+                .pending_runtime
+                .admission
+                .reservations
+                .reservation_for_label(&target.label, peer_generation)
+                .is_none()
+        );
+        assert!(
+            !harness
+                .state
+                .entity_subscriptions
+                .contains_key(&target.subscription_id)
+        );
+        for (index, reservation) in reservations.iter().take(30).enumerate() {
+            assert_eq!(
+                budget
+                    .usage(&reservation.label)
+                    .expect("sibling usage")
+                    .load(Ordering::Acquire),
+                if index < 29 { 65_536 } else { 98_304 }
+            );
+            assert!(
+                harness
+                    .state
+                    .pending_runtime
+                    .admission
+                    .reservations
+                    .reservation_for_label(&reservation.label, peer_generation)
+                    .is_some(),
+                "sibling reservation must remain live"
+            );
+            assert!(
+                harness
+                    .state
+                    .entity_subscriptions
+                    .contains_key(&reservation.subscription_id),
+                "sibling entity subscription must remain live"
+            );
+        }
+        let replacement = harness.subscribe_entities(&mut peer, "overflow-replacement");
+        assert_eq!(
+            replacement.kind,
+            botster_hub_client::DaemonResponseKind::EntitySubscribed
+        );
+        assert!(replacement.subscription_reservation.is_some());
+
+        let event = harness.wait_for_host_event(&mut peer, "entity overflow");
+        assert_eq!(
+            event,
+            botster_hub_client::DaemonEvent::RuntimeObservation {
+                kind: format!(
+                    "entity_subscription_closed:{}:{}:entity_subscription_overflow",
+                    target.subscription_id, target.generation
+                ),
+            }
+        );
+
+        peer.close_offer();
+        harness.cleanup();
+    }
+
+    #[test]
     fn reject_extra_data_channel_closes_the_unclaimed_channel() {
         let extra = FakeDataChannel::default();
         let runtime = tokio::runtime::Builder::new_current_thread()
