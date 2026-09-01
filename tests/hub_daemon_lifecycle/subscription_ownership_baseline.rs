@@ -35,9 +35,8 @@ async fn wait_for_webrtc_marker(
     marker: &str,
 ) {
     let deadline = Instant::now() + Duration::from_secs(45);
-    while Instant::now() < deadline
-        && !webrtc_terminal_contains(&peer.pending_terminal_frames, marker)
-    {
+    let mut retained = std::mem::take(&mut peer.pending_terminal_frames);
+    while Instant::now() < deadline && !webrtc_terminal_contains(&retained, marker) {
         let drain = peer
             .encrypted_request(
                 key,
@@ -56,13 +55,28 @@ async fn wait_for_webrtc_marker(
         if let Ok(Ok(bytes)) =
             timeout(Duration::from_millis(200), peer.next_terminal_frame(key)).await
         {
-            peer.pending_terminal_frames
-                .push_back((String::new(), bytes));
+            retained.push_back((String::new(), bytes));
         }
     }
+    peer.pending_terminal_frames = retained;
+    let screen_text = if webrtc_terminal_contains(&peer.pending_terminal_frames, marker) {
+        String::new()
+    } else {
+        peer.encrypted_request(
+            key,
+            &botster_hub_client::DaemonRequest::ReadScreen {
+                session_id: session_id.to_string(),
+            },
+        )
+        .await
+        .ok()
+        .and_then(|response| response.read_screen)
+        .map(|screen| screen.text)
+        .unwrap_or_default()
+    };
     assert!(
         webrtc_terminal_contains(&peer.pending_terminal_frames, marker),
-        "missing terminal marker {marker:?} in {:?}",
+        "missing terminal marker {marker:?} with screen {screen_text:?} in {:?}",
         peer.pending_terminal_frames
             .iter()
             .map(|(_, bytes)| String::from_utf8_lossy(bytes).into_owned())
@@ -1072,6 +1086,18 @@ fn peer_close_leaves_sibling_peers_working() {
     let session_b = "so-sib-b";
     let sub_a = "so-sib-sub-a";
     let sub_b = "so-sib-sub-b";
+    let gate_dir = unique_test_dir("so-sib-output-gates");
+    fs::create_dir_all(&gate_dir).expect("create sibling output gate directory");
+    let gate_a = gate_dir.join("a");
+    let gate_b = gate_dir.join("b");
+    let command_a = format!(
+        "while [ ! -f '{}' ]; do sleep 0.01; done; printf 'so-sib-a-ready\\n'; sleep 30",
+        gate_a.display()
+    );
+    let command_b = format!(
+        "while [ ! -f '{}' ]; do sleep 0.01; done; printf 'so-sib-b-ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
+        gate_b.display()
+    );
     block_on(async {
         let (mut peer_a, key_a) = open_local_webrtc_peer(&endpoint, &bootstrap_a).await;
         let (mut peer_b, key_b) = open_local_webrtc_peer(&endpoint, &bootstrap_b).await;
@@ -1088,17 +1114,19 @@ fn peer_close_leaves_sibling_peers_working() {
             &key_a,
             session_a,
             sub_a,
-            "printf 'so-sib-a-ready\\n'; sleep 30",
+            &command_a,
         )
         .await;
+        fs::write(&gate_a, b"release").expect("release peer A output");
         spawn_and_bind_webrtc(
             &mut peer_b,
             &key_b,
             session_b,
             sub_b,
-            "printf 'so-sib-b-ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
+            &command_b,
         )
         .await;
+        fs::write(&gate_b, b"release").expect("release peer B output");
         wait_for_webrtc_marker(&mut peer_a, &key_a, session_a, sub_a, "so-sib-a-ready").await;
         wait_for_webrtc_marker(&mut peer_b, &key_b, session_b, sub_b, "so-sib-b-ready").await;
         peer_a.peer.close().await.expect("close peer a");
