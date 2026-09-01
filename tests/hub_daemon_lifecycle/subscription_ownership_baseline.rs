@@ -189,6 +189,7 @@ fn webrtc_peer_rejects_a_second_data_channel() {
     block_on(async {
         let (mut peer, extra, key) =
             open_local_webrtc_peer_with_extra_channel(&endpoint, &bootstrap).await;
+        peer.enable_host_events();
         let mut rejected = peer
             .admit_surviving_dual_channel(extra, &key, &webrtc_terminal_adapter_hello())
             .await
@@ -349,7 +350,7 @@ fn webrtc_peer_post_handshake_data_channel_reaches_production_reject() {
 }
 
 #[test]
-fn webrtc_shared_channel_carries_control_entity_event_and_terminal_frames() {
+fn webrtc_dedicated_channels_carry_control_entity_event_and_terminal_frames() {
     let _guard = daemon_test_guard();
     let (hub, endpoint, bootstrap) = start_webrtc_adapter_hub("so-4cls");
     enable_event_plane_producer_on_hub(&endpoint, "so-4cls");
@@ -435,12 +436,12 @@ fn webrtc_shared_channel_carries_control_entity_event_and_terminal_frames() {
         }
         assert!(
             !peer.pending_entity_frames.is_empty(),
-            "one shared channel must carry entity frames"
+            "the entity channel must carry entity frames"
         );
-        assert!(saw_host_event, "one shared channel must carry host events");
+        assert!(saw_host_event, "the event channel must carry host events");
         assert!(
             webrtc_terminal_contains(&peer.pending_terminal_frames, "so-4cls-ready"),
-            "one shared channel must carry terminal frames"
+            "the terminal channel must carry terminal frames"
         );
         peer.peer.close().await.expect("close offer peer");
     });

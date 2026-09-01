@@ -8,13 +8,18 @@ use botster_terminal_protocol::{
 };
 use tokio::sync::oneshot;
 
-use crate::daemon::control::message::{BindReservedError, ControlMessage, ReservationInspectReply};
+use crate::daemon::control::message::{
+    BindReservedError, BoundSubscription, ControlMessage, ReservationInspectReply,
+};
 use crate::transport::webrtc::adapter::WebRtcTerminalAdapterHandle;
 use crate::transport::webrtc::control_channel::{
     DataChannelPlaintext, LOCAL_WEBRTC_BUFFERED_AMOUNT_HIGH, LOCAL_WEBRTC_BUFFERED_AMOUNT_LOW,
     decrypt_data_channel_plaintext,
 };
-use crate::transport::webrtc::delivery::{framed_daemon_hello_ack, framed_daemon_terminal_frame};
+use crate::transport::webrtc::delivery::{
+    framed_daemon_entity_frame, framed_daemon_event, framed_daemon_hello_ack,
+    framed_daemon_terminal_frame,
+};
 use crate::transport::webrtc::peer::LocalWebrtcPeerState;
 
 use crate::subscription::attach_routes::response_records_attach_ownership;
@@ -26,6 +31,31 @@ pub(crate) const TEST_EXTRA_CHANNEL_OBSERVATION_ENV: &str =
     "BOTSTER_HUB_TEST_EXTRA_CHANNEL_OBSERVATION";
 #[cfg(test)]
 pub(crate) const EXTRA_DATA_CHANNEL_LABEL: &str = "botster-extra";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubscriptionChannelRejectReason {
+    Late,
+    Stale,
+    Duplicate,
+    Unreserved,
+    OverLimit,
+    InvalidHello,
+    BindFailed,
+}
+
+impl SubscriptionChannelRejectReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Late => "late",
+            Self::Stale => "stale",
+            Self::Duplicate => "duplicate",
+            Self::Unreserved => "unreserved",
+            Self::OverLimit => "over_limit",
+            Self::InvalidHello => "invalid_hello",
+            Self::BindFailed => "bind_failed",
+        }
+    }
+}
 
 pub(crate) fn observe_rejected_data_channel_for_test(
     claimed: bool,
@@ -69,6 +99,23 @@ pub(crate) async fn reject_extra_data_channel<C>(
     let close =
         tokio::time::timeout(LOCAL_WEBRTC_PEER_CLOSE_BOUND, data_channel.local_close()).await;
     observe_rejected_data_channel_for_test(claimed, &close, label);
+}
+
+async fn reject_reserved_data_channel<C>(
+    grant_id: &str,
+    label: &str,
+    reason: SubscriptionChannelRejectReason,
+    data_channel: &C,
+    peer_state: &LocalWebrtcPeerState,
+) where
+    C: LocalWebrtcDataChannel + ?Sized,
+{
+    peer_state
+        .mux
+        .push_host_event(botster_hub_client::DaemonEvent::RuntimeObservation {
+            kind: format!("subscription_channel_rejected:{}:{label}", reason.as_str()),
+        });
+    reject_extra_data_channel(grant_id, false, label, data_channel).await;
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LocalWebrtcAttachedSubscription {
@@ -124,7 +171,7 @@ pub(crate) async fn admit_reserved_subscription_channel<C>(
     let (inspect_tx, inspect_rx) = oneshot::channel();
     if peer_state
         .runtime_tx
-        .send(ControlMessage::InspectTerminalReservation {
+        .send(ControlMessage::InspectReservation {
             grant_id: grant_id.to_string(),
             label: label.to_string(),
             reply_tx: inspect_tx,
@@ -142,28 +189,86 @@ pub(crate) async fn admit_reserved_subscription_channel<C>(
             return;
         }
     };
-    match inspect {
-        ReservationInspectReply::Unknown | ReservationInspectReply::Bound => {
-            reject_extra_data_channel(grant_id, false, label, data_channel).await;
+    let (subscription_id, generation) = match inspect {
+        ReservationInspectReply::Unknown => {
+            reject_reserved_data_channel(
+                grant_id,
+                label,
+                SubscriptionChannelRejectReason::Unreserved,
+                data_channel,
+                peer_state,
+            )
+            .await;
+            return;
+        }
+        ReservationInspectReply::Stale => {
+            reject_reserved_data_channel(
+                grant_id,
+                label,
+                SubscriptionChannelRejectReason::Stale,
+                data_channel,
+                peer_state,
+            )
+            .await;
+            return;
+        }
+        ReservationInspectReply::Bound => {
+            reject_reserved_data_channel(
+                grant_id,
+                label,
+                SubscriptionChannelRejectReason::Duplicate,
+                data_channel,
+                peer_state,
+            )
+            .await;
+            return;
+        }
+        ReservationInspectReply::OverLimit => {
+            reject_reserved_data_channel(
+                grant_id,
+                label,
+                SubscriptionChannelRejectReason::OverLimit,
+                data_channel,
+                peer_state,
+            )
+            .await;
             return;
         }
         ReservationInspectReply::Expired { .. } => {
-            reject_extra_data_channel(grant_id, false, label, data_channel).await;
+            reject_reserved_data_channel(
+                grant_id,
+                label,
+                SubscriptionChannelRejectReason::Late,
+                data_channel,
+                peer_state,
+            )
+            .await;
             return;
         }
-        ReservationInspectReply::Live { .. } => {}
-    }
+        ReservationInspectReply::Live {
+            subscription_id,
+            generation,
+            ..
+        } => (subscription_id, generation),
+    };
     if admit_subscription_hello(data_channel, stream_key)
         .await
         .is_err()
     {
-        reject_extra_data_channel(grant_id, false, label, data_channel).await;
+        reject_reserved_data_channel(
+            grant_id,
+            label,
+            SubscriptionChannelRejectReason::InvalidHello,
+            data_channel,
+            peer_state,
+        )
+        .await;
         return;
     }
     let (bind_tx, bind_rx) = oneshot::channel();
     if peer_state
         .runtime_tx
-        .send(ControlMessage::BindReservedTerminal {
+        .send(ControlMessage::BindReservedSubscription {
             grant_id: grant_id.to_string(),
             label: label.to_string(),
             reply_tx: bind_tx,
@@ -175,11 +280,43 @@ pub(crate) async fn admit_reserved_subscription_channel<C>(
         return;
     }
     match bind_rx.await {
-        Ok(Ok(handle)) => {
-            run_bound_subscription_channel(data_channel, stream_key, handle).await;
+        Ok(Ok(bound)) => {
+            let route = BoundSubscriptionRoute {
+                peer_state,
+                grant_id,
+                label,
+                subscription_id: &subscription_id,
+                generation,
+            };
+            run_bound_subscription_channel(data_channel, stream_key, route, bound).await;
+            let _ = peer_state
+                .runtime_tx
+                .send(ControlMessage::RetireReservedSubscription {
+                    grant_id: grant_id.to_string(),
+                    label: label.to_string(),
+                })
+                .await;
         }
-        Ok(Err(BindReservedError::Expired)) | Ok(Err(_)) | Err(_) => {
-            reject_extra_data_channel(grant_id, false, label, data_channel).await;
+        Ok(Err(error)) => {
+            let reason = match error {
+                BindReservedError::Unknown => SubscriptionChannelRejectReason::Unreserved,
+                BindReservedError::Stale => SubscriptionChannelRejectReason::Stale,
+                BindReservedError::OverLimit => SubscriptionChannelRejectReason::OverLimit,
+                BindReservedError::Expired => SubscriptionChannelRejectReason::Late,
+                BindReservedError::Bound => SubscriptionChannelRejectReason::Duplicate,
+                BindReservedError::BindFailed => SubscriptionChannelRejectReason::BindFailed,
+            };
+            reject_reserved_data_channel(grant_id, label, reason, data_channel, peer_state).await;
+        }
+        Err(_) => {
+            reject_reserved_data_channel(
+                grant_id,
+                label,
+                SubscriptionChannelRejectReason::BindFailed,
+                data_channel,
+                peer_state,
+            )
+            .await;
         }
     }
 }
@@ -236,10 +373,20 @@ where
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct BoundSubscriptionRoute<'a> {
+    peer_state: &'a LocalWebrtcPeerState,
+    grant_id: &'a str,
+    label: &'a str,
+    subscription_id: &'a str,
+    generation: u64,
+}
+
 async fn run_bound_subscription_channel<C>(
     data_channel: &C,
     stream_key: &AesGcmKey,
-    handle: WebRtcTerminalAdapterHandle,
+    route: BoundSubscriptionRoute<'_>,
+    bound: BoundSubscription,
 ) where
     C: LocalWebrtcDataChannel + ?Sized,
 {
@@ -252,10 +399,35 @@ async fn run_bound_subscription_channel<C>(
             .await
             .is_err()
     {
-        handle.close();
+        if let BoundSubscription::Terminal { handle, .. } = &bound {
+            handle.close();
+        }
         let _ = data_channel.local_close().await;
         return;
     }
+    match bound {
+        BoundSubscription::Terminal { handle, usage } => {
+            run_bound_terminal_channel(data_channel, stream_key, route.peer_state, handle, usage)
+                .await;
+        }
+        BoundSubscription::Entity { receiver, usage } => {
+            run_bound_entity_channel(data_channel, stream_key, route, receiver, usage).await;
+        }
+        BoundSubscription::Event { mailbox, usage } => {
+            run_bound_event_channel(data_channel, stream_key, route, mailbox, usage).await;
+        }
+    }
+}
+
+async fn run_bound_terminal_channel<C>(
+    data_channel: &C,
+    stream_key: &AesGcmKey,
+    peer_state: &LocalWebrtcPeerState,
+    handle: WebRtcTerminalAdapterHandle,
+    usage: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) where
+    C: LocalWebrtcDataChannel + ?Sized,
+{
     loop {
         if let Err(()) = flush_subscription_adapter_frames(data_channel, stream_key, &handle).await
         {
@@ -263,6 +435,8 @@ async fn run_bound_subscription_channel<C>(
             let _ = data_channel.local_close().await;
             return;
         }
+        publish_channel_usage(data_channel, &usage).await;
+        peer_state.mux.refresh_aggregate_pressure();
         tokio::select! {
             _ = handle.wait_for_write() => {}
             inbound = data_channel.local_poll() => {
@@ -289,6 +463,8 @@ async fn run_bound_subscription_channel<C>(
                     Some(event @ (webrtc::data_channel::DataChannelEvent::OnBufferedAmountHigh
                     | webrtc::data_channel::DataChannelEvent::OnBufferedAmountLow)) => {
                         apply_subscription_pressure_event(&handle, &event);
+                        publish_channel_usage(data_channel, &usage).await;
+                        peer_state.mux.refresh_aggregate_pressure();
                     }
                     Some(webrtc::data_channel::DataChannelEvent::OnClose)
                     | Some(webrtc::data_channel::DataChannelEvent::OnError)
@@ -300,6 +476,173 @@ async fn run_bound_subscription_channel<C>(
                 }
             }
         }
+    }
+}
+
+async fn run_bound_entity_channel<C>(
+    data_channel: &C,
+    stream_key: &AesGcmKey,
+    route: BoundSubscriptionRoute<'_>,
+    mut receiver: tokio::sync::mpsc::Receiver<DaemonEntityFrame>,
+    usage: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) where
+    C: LocalWebrtcDataChannel + ?Sized,
+{
+    let mut peer_terminal_rx = route.peer_state.subscribe_peer_terminal();
+    'driver: loop {
+        tokio::select! {
+            biased;
+            frame = receiver.recv() => {
+                let Some(frame) = frame else { break };
+                let Ok(frames) = framed_daemon_entity_frame(stream_key, &frame) else { break };
+                for frame in frames {
+                    if !authorize_subscription_send(
+                        route.peer_state,
+                        route.grant_id,
+                        route.label,
+                        frame.len(),
+                    ).await {
+                        route.peer_state.mux.push_host_event(
+                            botster_hub_client::DaemonEvent::RuntimeObservation {
+                                kind: format!(
+                                    "entity_subscription_closed:{}:{}:entity_subscription_overflow",
+                                    route.subscription_id,
+                                    route.generation,
+                                ),
+                            },
+                        );
+                        break 'driver;
+                    }
+                    if data_channel.local_send_text(&frame).await.is_err() { break 'driver; }
+                    publish_channel_usage(data_channel, &usage).await;
+                    route.peer_state.mux.refresh_aggregate_pressure();
+                }
+            }
+            event = crate::transport::webrtc::control_channel::poll_data_channel_or_peer_terminal(
+                data_channel,
+                &mut peer_terminal_rx,
+            ) => {
+                match event {
+                    Ok(Some(webrtc::data_channel::DataChannelEvent::OnBufferedAmountHigh
+                        | webrtc::data_channel::DataChannelEvent::OnBufferedAmountLow)) => {
+                        publish_channel_usage(data_channel, &usage).await;
+                        route.peer_state.mux.refresh_aggregate_pressure();
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => break,
+                }
+            }
+        }
+    }
+    let _ = tokio::time::timeout(LOCAL_WEBRTC_PEER_CLOSE_BOUND, data_channel.local_close()).await;
+}
+
+async fn authorize_subscription_send(
+    peer_state: &LocalWebrtcPeerState,
+    grant_id: &str,
+    label: &str,
+    frame_len: usize,
+) -> bool {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if peer_state
+        .runtime_tx
+        .send(ControlMessage::AuthorizeSubscriptionSend {
+            grant_id: grant_id.to_string(),
+            label: label.to_string(),
+            frame_len,
+            reply_tx,
+        })
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    reply_rx.await.unwrap_or(false)
+}
+
+async fn run_bound_event_channel<C>(
+    data_channel: &C,
+    stream_key: &AesGcmKey,
+    route: BoundSubscriptionRoute<'_>,
+    mailbox: std::sync::Arc<crate::subscription::package_events::ClientEventMailbox>,
+    usage: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) where
+    C: LocalWebrtcDataChannel + ?Sized,
+{
+    let mut peer_terminal_rx = route.peer_state.subscribe_peer_terminal();
+    'driver: loop {
+        while let Some(event) = mailbox.take_ready_event() {
+            let Ok(frames) = framed_daemon_event(stream_key, &event) else {
+                break 'driver;
+            };
+            for frame in frames {
+                if !authorize_subscription_send(
+                    route.peer_state,
+                    route.grant_id,
+                    route.label,
+                    frame.len(),
+                )
+                .await
+                {
+                    if let botster_hub_client::DaemonEvent::PackageEvent {
+                        subscription_id,
+                        owner,
+                        name,
+                        ..
+                    } = &event
+                    {
+                        mailbox.set_gap(subscription_id, owner, name);
+                    }
+                    route.peer_state.mux.push_host_event(
+                        botster_hub_client::DaemonEvent::RuntimeObservation {
+                            kind: format!(
+                                "package_event_subscription_closed:{}:{}:aggregate_overflow",
+                                route.subscription_id, route.generation,
+                            ),
+                        },
+                    );
+                    break 'driver;
+                }
+                if data_channel.local_send_text(&frame).await.is_err() {
+                    break 'driver;
+                }
+                publish_channel_usage(data_channel, &usage).await;
+                route.peer_state.mux.refresh_aggregate_pressure();
+            }
+        }
+        let notified = mailbox.notify().notified();
+        tokio::pin!(notified);
+        if mailbox.take_wake() || mailbox.has_ready_event() {
+            continue;
+        }
+        tokio::select! {
+            biased;
+            () = &mut notified => {}
+            event = crate::transport::webrtc::control_channel::poll_data_channel_or_peer_terminal(
+                data_channel,
+                &mut peer_terminal_rx,
+            ) => {
+                match event {
+                    Ok(Some(webrtc::data_channel::DataChannelEvent::OnBufferedAmountHigh
+                        | webrtc::data_channel::DataChannelEvent::OnBufferedAmountLow)) => {
+                        publish_channel_usage(data_channel, &usage).await;
+                        route.peer_state.mux.refresh_aggregate_pressure();
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => break,
+                }
+            }
+        }
+    }
+    let _ = tokio::time::timeout(LOCAL_WEBRTC_PEER_CLOSE_BOUND, data_channel.local_close()).await;
+}
+
+async fn publish_channel_usage<C>(data_channel: &C, usage: &std::sync::atomic::AtomicUsize)
+where
+    C: LocalWebrtcDataChannel + ?Sized,
+{
+    if let Ok(bytes) = data_channel.local_outstanding_bytes().await {
+        usage.store(bytes, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -342,25 +685,6 @@ where
     Ok(())
 }
 
-pub(crate) fn entity_frame_subscription_id(frame: &DaemonEntityFrame) -> &str {
-    match frame {
-        DaemonEntityFrame::Snapshot {
-            subscription_id, ..
-        }
-        | DaemonEntityFrame::Upsert {
-            subscription_id, ..
-        }
-        | DaemonEntityFrame::Patch {
-            subscription_id, ..
-        }
-        | DaemonEntityFrame::Remove {
-            subscription_id, ..
-        }
-        | DaemonEntityFrame::Error {
-            subscription_id, ..
-        } => subscription_id,
-    }
-}
 #[cfg(test)]
 #[allow(unused_imports)]
 mod tests {
@@ -499,5 +823,21 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reserved_channel_rejection_reasons_are_distinct() {
+        let reasons = [
+            SubscriptionChannelRejectReason::Late,
+            SubscriptionChannelRejectReason::Stale,
+            SubscriptionChannelRejectReason::Duplicate,
+            SubscriptionChannelRejectReason::Unreserved,
+            SubscriptionChannelRejectReason::OverLimit,
+        ];
+        let tokens = reasons
+            .into_iter()
+            .map(SubscriptionChannelRejectReason::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(tokens.len(), reasons.len());
     }
 }

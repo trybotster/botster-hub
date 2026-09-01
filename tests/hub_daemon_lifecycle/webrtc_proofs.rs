@@ -1189,6 +1189,10 @@ fn botster_web_same_url_reload_issues_fresh_local_webrtc_bootstrap() {
 
     block_on(async {
         let (mut first_peer, first_key) = open_local_webrtc_peer(&endpoint, &bootstrap_a).await;
+        first_peer
+            .encrypted_hello(&first_key, &webrtc_terminal_adapter_hello())
+            .await
+            .expect("first WebRTC generation hello");
         let status = first_peer
             .encrypted_request(&first_key, &botster_hub_client::DaemonRequest::Status)
             .await
@@ -1257,6 +1261,10 @@ fn botster_web_same_url_reload_issues_fresh_local_webrtc_bootstrap() {
         );
 
         let (mut reload_peer, reload_key) = open_local_webrtc_peer(&endpoint, &bootstrap_b).await;
+        reload_peer
+            .encrypted_hello(&reload_key, &webrtc_terminal_adapter_hello())
+            .await
+            .expect("second WebRTC generation hello");
         let status = reload_peer
             .encrypted_request(&reload_key, &botster_hub_client::DaemonRequest::Status)
             .await
@@ -1357,6 +1365,10 @@ fn botster_web_same_url_reload_issues_fresh_local_webrtc_bootstrap() {
         reload_peer.peer.close().await.expect("close reload peer");
 
         let (mut final_peer, final_key) = open_local_webrtc_peer(&endpoint, &bootstrap_c).await;
+        final_peer
+            .encrypted_hello(&final_key, &webrtc_terminal_adapter_hello())
+            .await
+            .expect("third WebRTC generation hello");
         let subscribed = final_peer
             .encrypted_request(
                 &final_key,
@@ -1873,6 +1885,10 @@ fn daemon_package_entity_held_open_fanout_over_local_webrtc() {
 
     block_on(async {
         let (mut offer_peer, stream_key) = open_local_webrtc_peer(&endpoint, &bootstrap).await;
+        offer_peer
+            .encrypted_hello(&stream_key, &webrtc_terminal_adapter_hello())
+            .await
+            .expect("entity subscription hello");
         let subscribed = offer_peer
             .encrypted_request(
                 &stream_key,

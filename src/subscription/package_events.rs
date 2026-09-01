@@ -25,6 +25,10 @@ pub const MAX_SUBJECTS_PER_SUBSCRIPTION: usize = 16;
 pub const MAX_SUBJECT_UTF8_BYTES: usize = 256;
 pub const MAX_SUBJECT_AGGREGATE_BYTES: usize = 4_096;
 pub const MAX_SUBSCRIPTIONS_PER_CONNECTION: usize = 64;
+pub(crate) const CONNECTION_EVENT_MAX: usize = 128;
+pub(crate) const CONNECTION_BYTE_MAX: usize = 2 * 1024 * 1024;
+pub(crate) const SUBSCRIPTION_EVENT_RESERVE: usize = 4;
+pub(crate) const SUBSCRIPTION_BYTE_RESERVE: usize = 65_536;
 
 const GLOB_CHARS: [char; 6] = ['*', '?', '[', ']', '{', '}'];
 
@@ -40,6 +44,7 @@ pub(crate) enum ClientEventAdmitError {
     DuplicateSubscription,
     UnknownSubscription,
     NotNegotiated,
+    ConnectionCapacity,
     Router(EventPlaneStatus),
 }
 
@@ -57,6 +62,7 @@ impl ClientEventAdmitError {
             Self::DuplicateSubscription => "duplicate_event_subscription",
             Self::UnknownSubscription => "unknown_event_subscription",
             Self::NotNegotiated => "package_event_subscriptions_not_negotiated",
+            Self::ConnectionCapacity => "package_event_connection_capacity",
             Self::Router(status) => status.as_str(),
         }
     }
@@ -79,6 +85,9 @@ impl ClientEventAdmitError {
             Self::UnknownSubscription => "no event subscription exists on this connection",
             Self::NotNegotiated => {
                 "package_event_subscriptions was not negotiated on this host Hello"
+            }
+            Self::ConnectionCapacity => {
+                "the connection cannot reserve package-event mailbox capacity"
             }
             Self::Router(status) => match status {
                 EventPlaneStatus::RejectedUndeclared => "event is not an admitted contract",
@@ -143,18 +152,43 @@ pub(crate) struct ClientEventMailbox {
     counters: Option<Arc<EventPlaneCounters>>,
     age_cell: Arc<QueueAgeMetric>,
     identity: String,
+    subscription_id: Option<String>,
+    connection_pool: Option<Arc<ConnectionEventPool>>,
+}
+
+impl std::fmt::Debug for ClientEventMailbox {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ClientEventMailbox")
+            .field("identity", &self.identity)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Default)]
+struct ConnectionEventPool {
+    inner: Mutex<ConnectionResidency>,
+}
+
+#[derive(Debug, Default)]
+struct ConnectionResidency {
+    events: usize,
+    bytes: usize,
+    subscriptions: HashMap<String, (usize, usize)>,
 }
 
 impl ClientEventMailbox {
     #[cfg(test)]
     pub(crate) fn new(policy: PackageEventPlanePolicy) -> Self {
-        Self::new_with_counters(policy, None, "mailbox")
+        Self::new_with_counters(policy, None, "mailbox", None, None)
     }
 
-    pub(crate) fn new_with_counters(
+    fn new_with_counters(
         policy: PackageEventPlanePolicy,
         counters: Option<Arc<EventPlaneCounters>>,
         identity: &str,
+        connection_pool: Option<Arc<ConnectionEventPool>>,
+        subscription_id: Option<String>,
     ) -> Self {
         let age_cell = Arc::new(QueueAgeMetric::new(0));
         if let Some(counters) = counters.as_ref() {
@@ -181,6 +215,8 @@ impl ClientEventMailbox {
             counters,
             age_cell,
             identity: identity.to_string(),
+            subscription_id,
+            connection_pool,
         }
     }
 
@@ -237,6 +273,39 @@ impl ClientEventMailbox {
         size: usize,
     ) -> Result<(), EventPlaneStatus> {
         let mut inner = lock_mailbox(&self.inner)?;
+        let mut residency = match self.connection_pool.as_ref() {
+            Some(pool) => Some(
+                pool.inner
+                    .try_lock()
+                    .map_err(|_| EventPlaneStatus::ShedBusy)?,
+            ),
+            None => None,
+        };
+        let connection_full = residency.as_ref().is_some_and(|residency| {
+            let protected_events = residency
+                .subscriptions
+                .iter()
+                .filter(|(id, _)| Some(id.as_str()) != self.subscription_id.as_deref())
+                .map(|(_, (events, _))| SUBSCRIPTION_EVENT_RESERVE.saturating_sub(*events))
+                .sum::<usize>();
+            let protected_bytes = residency
+                .subscriptions
+                .iter()
+                .filter(|(id, _)| Some(id.as_str()) != self.subscription_id.as_deref())
+                .map(|(_, (_, bytes))| SUBSCRIPTION_BYTE_RESERVE.saturating_sub(*bytes))
+                .sum::<usize>();
+            residency.events + 1 > CONNECTION_EVENT_MAX.saturating_sub(protected_events)
+                || residency.bytes + size > CONNECTION_BYTE_MAX.saturating_sub(protected_bytes)
+        });
+        if connection_full {
+            drop(residency);
+            drop(inner);
+            if let Some(counters) = &self.counters {
+                counters.record_mailbox_overflow_gap();
+            }
+            self.mark_gap(subscription_id, owner, name);
+            return Err(EventPlaneStatus::ShedFull);
+        }
         if inner.events.len() + 1 > self.event_max || inner.bytes + size > self.byte_max {
             drop(inner);
             if let Some(counters) = &self.counters {
@@ -246,6 +315,16 @@ impl ClientEventMailbox {
             return Err(EventPlaneStatus::ShedFull);
         }
         inner.bytes += size;
+        if let Some(residency) = residency.as_mut() {
+            residency.events += 1;
+            residency.bytes += size;
+            if let Some(subscription_id) = self.subscription_id.as_ref()
+                && let Some((events, bytes)) = residency.subscriptions.get_mut(subscription_id)
+            {
+                *events += 1;
+                *bytes += size;
+            }
+        }
         inner.events.push_back(QueuedClientEvent {
             subscription_id: subscription_id.to_string(),
             owner: owner.to_string(),
@@ -324,6 +403,18 @@ impl ClientEventMailbox {
         let mut inner = lock_mailbox(&self.inner).ok()?;
         let queued = inner.events.pop_front()?;
         inner.bytes = inner.bytes.saturating_sub(queued.size);
+        if let Some(pool) = self.connection_pool.as_ref()
+            && let Ok(mut residency) = pool.inner.try_lock()
+        {
+            residency.events = residency.events.saturating_sub(1);
+            residency.bytes = residency.bytes.saturating_sub(queued.size);
+            if let Some(subscription_id) = self.subscription_id.as_ref()
+                && let Some((events, bytes)) = residency.subscriptions.get_mut(subscription_id)
+            {
+                *events = events.saturating_sub(1);
+                *bytes = bytes.saturating_sub(queued.size);
+            }
+        }
         self.publish_age(&inner);
         if queued.enqueued_at.elapsed() > self.queue_age {
             drop(inner);
@@ -371,6 +462,17 @@ impl ClientEventMailbox {
             slots.remove(subscription_id);
         }
         if let Ok(mut inner) = lock_mailbox(&self.inner) {
+            let removed_events = inner
+                .events
+                .iter()
+                .filter(|queued| queued.subscription_id == subscription_id)
+                .count();
+            let removed_bytes = inner
+                .events
+                .iter()
+                .filter(|queued| queued.subscription_id == subscription_id)
+                .map(|queued| queued.size)
+                .sum::<usize>();
             let mut bytes = inner.bytes;
             inner.events.retain(|queued| {
                 if queued.subscription_id == subscription_id {
@@ -382,6 +484,15 @@ impl ClientEventMailbox {
             });
             inner.bytes = bytes;
             self.publish_age(&inner);
+            if let Some(pool) = self.connection_pool.as_ref()
+                && let Ok(mut residency) = pool.inner.try_lock()
+            {
+                residency.events = residency.events.saturating_sub(removed_events);
+                residency.bytes = residency.bytes.saturating_sub(removed_bytes);
+                if let Some(subscription_id) = self.subscription_id.as_ref() {
+                    residency.subscriptions.remove(subscription_id);
+                }
+            }
         }
     }
 
@@ -408,7 +519,8 @@ impl Drop for ClientEventMailbox {
 }
 
 struct ConnectionEventState {
-    mailbox: Arc<ClientEventMailbox>,
+    pool: Arc<ConnectionEventPool>,
+    mailboxes: HashMap<String, Arc<ClientEventMailbox>>,
     subscriptions: HashMap<String, (String, String)>,
 }
 
@@ -417,6 +529,7 @@ struct ConnectionEventState {
 pub(crate) struct ClientEventPlane {
     connections: Mutex<HashMap<String, ConnectionEventState>>,
     pending_cleanup: Mutex<HashSet<String>>,
+    pending_subscription_cleanup: Mutex<HashSet<(String, String)>>,
 }
 
 impl std::fmt::Debug for ClientEventPlane {
@@ -431,9 +544,28 @@ impl ClientEventPlane {
     #[must_use]
     pub(crate) fn mailbox(&self, connection_id: &str) -> Option<Arc<ClientEventMailbox>> {
         let connections = lock_plane(&self.connections).ok()?;
+        connections.get(connection_id).and_then(|state| {
+            state
+                .mailboxes
+                .values()
+                .find(|mailbox| mailbox.has_ready_event())
+                .or_else(|| state.mailboxes.values().next())
+                .cloned()
+        })
+    }
+
+    #[must_use]
+    pub(crate) fn subscription_mailbox(
+        &self,
+        connection_id: &str,
+        subscription_id: &str,
+    ) -> Option<Arc<ClientEventMailbox>> {
+        let connections = lock_plane(&self.connections).ok()?;
         connections
-            .get(connection_id)
-            .map(|state| state.mailbox.clone())
+            .get(connection_id)?
+            .mailboxes
+            .get(subscription_id)
+            .cloned()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -453,11 +585,8 @@ impl ClientEventPlane {
         let state = connections
             .entry(connection_id.to_string())
             .or_insert_with(|| ConnectionEventState {
-                mailbox: Arc::new(ClientEventMailbox::new_with_counters(
-                    policy,
-                    Some(Arc::clone(router.counters())),
-                    connection_id,
-                )),
+                pool: Arc::new(ConnectionEventPool::default()),
+                mailboxes: HashMap::new(),
                 subscriptions: HashMap::new(),
             });
         if state.subscriptions.contains_key(subscription_id) {
@@ -466,7 +595,28 @@ impl ClientEventPlane {
         if state.subscriptions.len() >= MAX_SUBSCRIPTIONS_PER_CONNECTION {
             return Err(ClientEventAdmitError::TooManySubscriptions);
         }
-        let mailbox = state.mailbox.clone();
+        {
+            let mut residency = state
+                .pool
+                .inner
+                .try_lock()
+                .map_err(|_| ClientEventAdmitError::Router(EventPlaneStatus::ShedBusy))?;
+            if residency.events > CONNECTION_EVENT_MAX.saturating_sub(SUBSCRIPTION_EVENT_RESERVE)
+                || residency.bytes > CONNECTION_BYTE_MAX.saturating_sub(SUBSCRIPTION_BYTE_RESERVE)
+            {
+                return Err(ClientEventAdmitError::ConnectionCapacity);
+            }
+            residency
+                .subscriptions
+                .insert(subscription_id.to_string(), (0, 0));
+        }
+        let mailbox = Arc::new(ClientEventMailbox::new_with_counters(
+            policy,
+            Some(Arc::clone(router.counters())),
+            &format!("{connection_id}/{subscription_id}"),
+            Some(Arc::clone(&state.pool)),
+            Some(subscription_id.to_string()),
+        ));
         let gap = mailbox
             .register_gap_slot(subscription_id, owner, name)
             .map_err(ClientEventAdmitError::Router)?;
@@ -483,6 +633,7 @@ impl ClientEventPlane {
             mailbox.drop_subscription(subscription_id);
             return Err(ClientEventAdmitError::Router(status));
         }
+        state.mailboxes.insert(subscription_id.to_string(), mailbox);
         state.subscriptions.insert(
             subscription_id.to_string(),
             (owner.to_string(), name.to_string()),
@@ -509,11 +660,15 @@ impl ClientEventPlane {
             return Err(ClientEventAdmitError::Router(status));
         }
         state.subscriptions.remove(subscription_id);
-        state.mailbox.drop_subscription(subscription_id);
+        if let Some(mailbox) = state.mailboxes.remove(subscription_id) {
+            mailbox.drop_subscription(subscription_id);
+        }
         if state.subscriptions.is_empty()
             && let Some(removed) = connections.remove(connection_id)
         {
-            removed.mailbox.retire_from_registry();
+            for mailbox in removed.mailboxes.values() {
+                mailbox.retire_from_registry();
+            }
         }
         Ok(())
     }
@@ -525,12 +680,36 @@ impl ClientEventPlane {
         let _ = self.apply_pending_cleanups(router);
     }
 
+    pub(crate) fn cleanup_subscription(
+        &self,
+        connection_id: &str,
+        subscription_id: &str,
+        router: &PackageEventRouter,
+    ) {
+        if self
+            .try_unsubscribe(connection_id, subscription_id, router)
+            .is_ok()
+        {
+            return;
+        }
+        if let Ok(mut pending) = self.pending_subscription_cleanup.lock() {
+            pending.insert((connection_id.to_string(), subscription_id.to_string()));
+        }
+    }
+
     #[must_use]
     pub(crate) fn has_pending_cleanup(&self) -> bool {
-        self.pending_cleanup
+        let connection_pending = self
+            .pending_cleanup
             .lock()
             .map(|pending| !pending.is_empty())
-            .unwrap_or(true)
+            .unwrap_or(true);
+        let subscription_pending = self
+            .pending_subscription_cleanup
+            .lock()
+            .map(|pending| !pending.is_empty())
+            .unwrap_or(true);
+        connection_pending || subscription_pending
     }
 
     /// Retry no-wait disconnect cleanup until router removal returns Accepted.
@@ -544,6 +723,26 @@ impl ClientEventPlane {
         router: &PackageEventRouter,
         after_snapshot: impl FnOnce(&Self),
     ) -> bool {
+        let subscription_snapshot = match self.pending_subscription_cleanup.lock() {
+            Ok(pending) => pending.iter().cloned().collect::<HashSet<_>>(),
+            Err(_) => return true,
+        };
+        let mut remaining_subscriptions = HashSet::new();
+        for (connection_id, subscription_id) in &subscription_snapshot {
+            if self
+                .try_unsubscribe(connection_id, subscription_id, router)
+                .is_err()
+            {
+                remaining_subscriptions.insert((connection_id.clone(), subscription_id.clone()));
+            }
+        }
+        if let Ok(mut pending) = self.pending_subscription_cleanup.lock() {
+            pending.retain(|route| {
+                !subscription_snapshot.contains(route) || remaining_subscriptions.contains(route)
+            });
+        } else {
+            return true;
+        }
         let snapshot = match self.pending_cleanup.lock() {
             Ok(pending) => pending.iter().cloned().collect::<HashSet<_>>(),
             Err(_) => return true,
@@ -558,7 +757,9 @@ impl ClientEventPlane {
             match router.try_cleanup_client_connection(connection_id) {
                 EventPlaneStatus::Accepted => {
                     if let Some(removed) = connections.remove(connection_id) {
-                        removed.mailbox.retire_from_registry();
+                        for mailbox in removed.mailboxes.values() {
+                            mailbox.retire_from_registry();
+                        }
                     }
                 }
                 _ => {
@@ -571,7 +772,7 @@ impl ClientEventPlane {
                 pending.retain(|connection_id| {
                     !snapshot.contains(connection_id) || remaining.contains(connection_id)
                 });
-                !pending.is_empty()
+                !pending.is_empty() || !remaining_subscriptions.is_empty()
             }
             Err(_) => true,
         }
@@ -582,6 +783,18 @@ impl ClientEventPlane {
         if let Ok(mut pending) = self.pending_cleanup.lock() {
             pending.insert(connection_id.to_string());
         }
+    }
+
+    #[cfg(test)]
+    fn test_residency(&self, connection_id: &str) -> Option<(usize, usize, usize)> {
+        let connections = self.connections.try_lock().ok()?;
+        let state = connections.get(connection_id)?;
+        let residency = state.pool.inner.try_lock().ok()?;
+        Some((
+            residency.events,
+            residency.bytes,
+            residency.subscriptions.len(),
+        ))
     }
 }
 
@@ -687,6 +900,102 @@ mod tests {
             }])
             .expect("register");
         router
+    }
+
+    #[test]
+    fn admitted_siblings_keep_fixed_event_reserves() {
+        let router = admitted_router(EventAudience::Clients);
+        let plane = ClientEventPlane::default();
+        let policy = PackageEventPlanePolicy::default();
+        for subscription_id in ["noisy", "sibling"] {
+            plane
+                .try_subscribe(
+                    "connection",
+                    subscription_id,
+                    "owner",
+                    "ready",
+                    Vec::new(),
+                    policy,
+                    &router,
+                )
+                .expect("subscribe");
+        }
+        let noisy = plane
+            .subscription_mailbox("connection", "noisy")
+            .expect("noisy mailbox");
+        let sibling = plane
+            .subscription_mailbox("connection", "sibling")
+            .expect("sibling mailbox");
+        for index in 0..(CONNECTION_EVENT_MAX - SUBSCRIPTION_EVENT_RESERVE) {
+            noisy
+                .try_push("noisy", "owner", "ready", serde_json::json!(index), 1)
+                .expect("noisy borrows only unreserved capacity");
+        }
+        assert_eq!(
+            noisy.try_push("noisy", "owner", "ready", serde_json::json!("full"), 1),
+            Err(EventPlaneStatus::ShedFull)
+        );
+        for index in 0..SUBSCRIPTION_EVENT_RESERVE {
+            sibling
+                .try_push("sibling", "owner", "ready", serde_json::json!(index), 1)
+                .expect("sibling reserve remains usable");
+        }
+        assert_eq!(
+            plane.test_residency("connection"),
+            Some((CONNECTION_EVENT_MAX, CONNECTION_EVENT_MAX, 2))
+        );
+    }
+
+    #[test]
+    fn later_subscription_is_rejected_until_capacity_drains() {
+        let router = admitted_router(EventAudience::Clients);
+        let plane = ClientEventPlane::default();
+        let policy = PackageEventPlanePolicy::default();
+        plane
+            .try_subscribe(
+                "connection",
+                "first",
+                "owner",
+                "ready",
+                Vec::new(),
+                policy,
+                &router,
+            )
+            .expect("first subscribe");
+        let first = plane
+            .subscription_mailbox("connection", "first")
+            .expect("first mailbox");
+        for index in 0..CONNECTION_EVENT_MAX {
+            first
+                .try_push("first", "owner", "ready", serde_json::json!(index), 1)
+                .expect("one subscription uses full depth");
+        }
+        assert_eq!(
+            plane.try_subscribe(
+                "connection",
+                "later",
+                "owner",
+                "ready",
+                Vec::new(),
+                policy,
+                &router,
+            ),
+            Err(ClientEventAdmitError::ConnectionCapacity)
+        );
+        for _ in 0..SUBSCRIPTION_EVENT_RESERVE {
+            assert!(first.take_ready_event().is_some());
+        }
+        plane
+            .try_subscribe(
+                "connection",
+                "later",
+                "owner",
+                "ready",
+                Vec::new(),
+                policy,
+                &router,
+            )
+            .expect("later subscribe after drain");
     }
 
     #[test]
@@ -957,13 +1266,12 @@ mod tests {
                     policy,
                     &router
                 ),
-                Err(ClientEventAdmitError::Router(EventPlaneStatus::ShedBusy))
+                Ok(())
             );
         });
-        assert_eq!(
-            plane.try_unsubscribe("conn", "sub-b", &router),
-            Err(ClientEventAdmitError::UnknownSubscription)
-        );
+        plane
+            .try_unsubscribe("conn", "sub-b", &router)
+            .expect("sibling mailbox admission is isolated");
         let payload = json!({ "ok": true });
         assert_eq!(
             router.try_ingress("owner", "ready", &payload, Instant::now()),
@@ -1077,7 +1385,7 @@ mod tests {
             .try_push("sub", "owner", "ready", json!({ "ok": true }), 8)
             .expect("push");
         let counters = router.counters();
-        let row = mailbox_row(counters, "conn");
+        let row = mailbox_row(counters, "conn/sub");
         assert_eq!(row.state, botster_hub_client::DaemonQueueAgeState::Usable);
         assert_eq!(row.queue_count, Some(1));
         assert!(row.oldest_age_us.is_some());
@@ -1085,7 +1393,7 @@ mod tests {
             Some(DaemonEvent::PackageEvent { .. }) => {}
             other => panic!("expected event: {other:?}"),
         }
-        let row = mailbox_row(counters, "conn");
+        let row = mailbox_row(counters, "conn/sub");
         assert_eq!(row.state, botster_hub_client::DaemonQueueAgeState::Empty);
         assert_eq!(row.queue_count, Some(0));
         assert!(row.oldest_age_us.is_none());
@@ -1093,7 +1401,7 @@ mod tests {
             .try_unsubscribe("conn", "sub", &router)
             .expect("unsubscribe");
         assert!(plane.mailbox("conn").is_none());
-        let row = mailbox_row(counters, "conn");
+        let row = mailbox_row(counters, "conn/sub");
         assert_eq!(row.state, botster_hub_client::DaemonQueueAgeState::Empty);
         assert_eq!(row.queue_count, Some(0));
     }
@@ -1140,7 +1448,7 @@ mod tests {
             other => panic!("expired mailbox event must become a gap: {other:?}"),
         }
         let counters = router.counters();
-        let row = mailbox_row(counters, "conn-old");
+        let row = mailbox_row(counters, "conn-old/sub");
         assert_eq!(row.state, botster_hub_client::DaemonQueueAgeState::Empty);
         assert_eq!(row.queue_count, Some(0));
         drop(mailbox);
@@ -1193,7 +1501,7 @@ mod tests {
             1,
             "next admission must prune retired mailbox rows: {live_mailboxes:?}"
         );
-        assert_eq!(live_mailboxes[0].identity, "conn-live");
+        assert_eq!(live_mailboxes[0].identity, "conn-live/sub");
     }
 
     #[test]
@@ -1231,7 +1539,7 @@ mod tests {
         new.try_push("sub-new", "owner", "ready", json!({ "ok": true }), 8)
             .expect("new push");
         drop(old);
-        let row = mailbox_row(router.counters(), "conn");
+        let row = mailbox_row(router.counters(), "conn/sub-new");
         assert_eq!(row.state, botster_hub_client::DaemonQueueAgeState::Usable);
         assert_eq!(row.queue_count, Some(1));
         assert!(row.oldest_age_us.is_some());

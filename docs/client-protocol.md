@@ -1758,10 +1758,12 @@ does not require it. Clients that want live package events Hello with
 44. The default client requirement stays at revision 36.
 
 `SubscribeEvents` and `UnsubscribeEvents` are ordinary one-shot host
-requests. They do not take over a Unix socket. Delivery uses unsolicited
+requests. They do not take over a Unix socket. Unix delivery uses unsolicited
 `DaemonEvent::PackageEvent` and `DaemonEvent::EventGap`. Unix classifies
 those frames as `DaemonUnixMuxFrame::Event`. WebRTC sends them as
-`DaemonLocalWebrtcDeliveryKind::DaemonEvent`. `DaemonConnection::next_event`
+`DaemonLocalWebrtcDeliveryKind::DaemonEvent`. WebRTC delivery uses the
+reserved package-event subscription DataChannel described below.
+`DaemonConnection::next_event`
 waits for those frames without sending another control request. Hub stores
 host Hello `required_features` on a per-connection host record. Terminal
 admission rejection does not clear that record.
@@ -1777,7 +1779,7 @@ durable-history field.
 
 Deleting JSON `SendInput`, `ModeGatedInput`, and `Resize` plus adding
 the Attach reservation DTO advances `PROTOCOL_VERSION` to 8 and
-`CONFORMANCE_FIXTURE_REVISION` to 47. A protocol-7 client fails closed
+`CONFORMANCE_FIXTURE_REVISION` to 48. A protocol-7 client fails closed
 at `ensure_compatible()`. `MCP_PROTOCOL_VERSION` and
 `botster_terminal_protocol::PROTOCOL_VERSION` stay unchanged.
 `DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION` stays 36.
@@ -1797,3 +1799,22 @@ unsolicited `TerminalSubscriptionClosed` with reason
 `reservation_expired` on the peer control channel, then closes that
 channel. Unknown labels close without an event. A live reservation
 conflict on Attach returns `reservation_label_conflict`.
+
+## Dedicated entity and package-event channels
+
+WebRTC `SubscribeEntities` and `SubscribeEvents` responses can include
+`subscription_reservation`. The field is absent on Unix responses. The field
+contains `kind`, `subscription_id`, `generation`, `peer_generation`, an opaque
+`label`, and `expires_in_seconds`.
+
+The browser creates one reliable ordered DataChannel with that exact label.
+The browser sends the encrypted Hello on the new channel. Hub binds only a
+live reservation for the current peer generation and matching channel class.
+
+Hub sends entity frames only on the entity subscription channel. Hub sends
+package events and event gaps only on the package-event subscription channel.
+The control channel keeps requests, responses, and small lifecycle events.
+
+Each package-event subscription has one mailbox. A connection keeps the
+existing 128-event and 2 MiB aggregate limits. Each admitted subscription
+reserves four events and 65,536 bytes from those limits.

@@ -150,8 +150,9 @@ pub(crate) fn handle_runtime(
                 ));
             }
             if let Some(grant_id) = observability.grant_id
-                && let Some(WebrtcTerminalAdmission::Rejected { code, diagnostic }) =
-                    pending_runtime.admission.webrtc_admissions.get(grant_id)
+                && let Some(WebrtcTerminalAdmission::Rejected {
+                    code, diagnostic, ..
+                }) = pending_runtime.admission.webrtc_admissions.get(grant_id)
             {
                 return Ok(terminal_compatibility_attach_error(
                     code,
@@ -269,7 +270,42 @@ pub(crate) fn handle_runtime(
                     *peer_generation,
                     now_seconds(),
                 ) {
-                    Ok(reservation) => Ok(daemon_terminal_reservation(reservation)),
+                    Ok(reservation) => {
+                        let budget_result = pending_runtime
+                            .admission
+                            .connection_budgets
+                            .get_mut(peer_generation)
+                            .ok_or(crate::admission::connection_budget::ChannelBudgetError::ChannelLimit)
+                            .and_then(|budget| {
+                                budget
+                                    .reserve(
+                                        reservation.label.clone(),
+                                        crate::admission::connection_budget::ChannelClass::Terminal,
+                                    )
+                                    .map(|_| ())
+                            });
+                        if budget_result.is_err() {
+                            let _ = pending_runtime
+                                .admission
+                                .reservations
+                                .forget_label(&reservation.label, *peer_generation);
+                            fail_closed_pre_bind_attach(
+                                pending_runtime,
+                                runtime,
+                                &client_id,
+                                &session_id,
+                                &subscription_id,
+                                now,
+                                None,
+                            );
+                            Ok(super::attach_bind_operator_error(
+                                "connection_channel_limit",
+                                "the WebRTC connection channel budget rejected the reservation",
+                            ))
+                        } else {
+                            Ok(daemon_terminal_reservation(reservation))
+                        }
+                    }
                     Err(ReserveError::LabelConflict) => Ok(super::attach_bind_operator_error(
                         "reservation_label_conflict",
                         "a live reservation already exists for this route",

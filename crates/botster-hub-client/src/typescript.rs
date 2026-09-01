@@ -416,6 +416,10 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("read_screen?", "DaemonReadScreen | null"),
             ("mode_flags?", "DaemonModeFlags | null"),
             ("terminal_reservation?", "DaemonTerminalReservation | null"),
+            (
+                "subscription_reservation?",
+                "DaemonSubscriptionReservation | null",
+            ),
             ("capture_snapshot?", "DaemonCaptureSnapshot | null"),
             ("spawn_targets?", "DaemonSpawnTarget[]"),
             (
@@ -494,6 +498,23 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("label", "string"),
             ("expires_in_seconds", "number"),
         ],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonSubscriptionReservation",
+        &[
+            ("kind", "DaemonSubscriptionReservationKind"),
+            ("subscription_id", "string"),
+            ("generation", "number"),
+            ("peer_generation", "number"),
+            ("label", "string"),
+            ("expires_in_seconds", "number"),
+        ],
+    );
+    emit_string_union(
+        &mut output,
+        "DaemonSubscriptionReservationKind",
+        &["entity", "package_event"],
     );
     emit_interface(
         &mut output,

@@ -44,6 +44,8 @@ impl std::fmt::Debug for WebRtcTerminalAdapterHandle {
 
 struct WebRtcTerminalAdapterInner {
     slot: AdapterSlot<AdapterWake>,
+    aggregate: Option<Arc<crate::admission::connection_budget::ConnectionAggregate>>,
+    aggregate_blocked: AtomicBool,
 }
 
 impl WebRtcTerminalAdapterInner {
@@ -53,6 +55,8 @@ impl WebRtcTerminalAdapterInner {
                 AdapterWake::new(),
                 Arc::new(AtomicBool::new(false)),
             ),
+            aggregate: None,
+            aggregate_blocked: AtomicBool::new(false),
         }
     }
 
@@ -78,11 +82,35 @@ impl WebRtcTerminalAdapterInner {
     }
 
     fn pressure(&self) -> TerminalAdapterPressure {
+        self.refresh_aggregate_pressure();
+        if self.aggregate_blocked.load(Ordering::Acquire) {
+            return TerminalAdapterPressure::WouldBlock;
+        }
         self.slot.pressure()
     }
 
     fn try_write(&self, frame: &TerminalFrame) -> Result<(), TerminalAdapterWriteError> {
+        if let Some(aggregate) = self.aggregate.as_ref() {
+            let frame_len = frame
+                .to_bytes()
+                .map_err(|_| TerminalAdapterWriteError::Closed)?
+                .len();
+            if !aggregate.permits_send(frame_len) {
+                self.aggregate_blocked.store(true, Ordering::Release);
+                return Err(TerminalAdapterWriteError::WouldBlock);
+            }
+        }
         self.slot.try_write(frame)
+    }
+
+    fn refresh_aggregate_pressure(&self) {
+        let can_resume = self
+            .aggregate
+            .as_ref()
+            .is_none_or(|aggregate| aggregate.below_low_water());
+        if can_resume && self.aggregate_blocked.swap(false, Ordering::AcqRel) {
+            self.slot.notify_writable();
+        }
     }
 
     fn try_read(&self) -> TerminalIngress {
@@ -121,8 +149,18 @@ impl WebRtcTerminalAdapter {
         wake: AdapterWake,
         close_work: Arc<AtomicBool>,
     ) -> (Self, WebRtcTerminalAdapterHandle) {
+        Self::pair_with_wake_close_work_and_aggregate(wake, close_work, None)
+    }
+
+    fn pair_with_wake_close_work_and_aggregate(
+        wake: AdapterWake,
+        close_work: Arc<AtomicBool>,
+        aggregate: Option<Arc<crate::admission::connection_budget::ConnectionAggregate>>,
+    ) -> (Self, WebRtcTerminalAdapterHandle) {
         let inner = Arc::new(WebRtcTerminalAdapterInner {
             slot: AdapterSlot::with_wake_and_close_work(wake, close_work),
+            aggregate,
+            aggregate_blocked: AtomicBool::new(false),
         });
         (
             Self {
@@ -230,7 +268,17 @@ impl WebRtcConnectionMux {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn create_adapter(&self) -> (WebRtcTerminalAdapter, WebRtcTerminalAdapterHandle) {
+        self.create_adapter_with_aggregate(
+            crate::admission::connection_budget::ConnectionBudget::default().aggregate(),
+        )
+    }
+
+    pub(crate) fn create_adapter_with_aggregate(
+        &self,
+        aggregate: Arc<crate::admission::connection_budget::ConnectionAggregate>,
+    ) -> (WebRtcTerminalAdapter, WebRtcTerminalAdapterHandle) {
         let close_work = self
             .inner
             .close_work
@@ -238,7 +286,11 @@ impl WebRtcConnectionMux {
             .ok()
             .map(|slot| Arc::clone(&*slot))
             .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-        WebRtcTerminalAdapter::pair_with_wake_and_close_work(AdapterWake::new(), close_work)
+        WebRtcTerminalAdapter::pair_with_wake_close_work_and_aggregate(
+            AdapterWake::new(),
+            close_work,
+            Some(aggregate),
+        )
     }
 
     pub(crate) fn admit_close_events(&self) {
@@ -285,6 +337,14 @@ impl WebRtcConnectionMux {
             handle.attach_close_hook(move |host_closed| hook.notify_closed(host_closed));
         }
         self.inner.wake.wake();
+    }
+
+    pub(crate) fn refresh_aggregate_pressure(&self) {
+        if let Ok(routes) = self.inner.routes.lock() {
+            for route in routes.values() {
+                route.handle.inner.refresh_aggregate_pressure();
+            }
+        }
     }
 
     pub(crate) fn has_bound_routes(&self) -> bool {
@@ -424,10 +484,6 @@ impl WebRtcConnectionMux {
                 None
             }
         })
-    }
-
-    pub(crate) fn drop_pending_events(&self) {
-        self.inner.closed_events.drop_pending_events();
     }
 
     #[allow(dead_code)]
@@ -620,6 +676,116 @@ mod tests {
         assert!(handle.complete_active().is_some());
         assert!(handle.complete_active().is_none());
         assert_eq!(adapter.pressure(), TerminalAdapterPressure::Ready);
+    }
+
+    #[test]
+    fn aggregate_refusal_returns_would_block_without_retaining_the_frame() {
+        use crate::admission::connection_budget::{
+            AGGREGATE_BUFFERED_HIGH, ChannelClass, ConnectionBudget,
+        };
+
+        let mut budget = ConnectionBudget::default();
+        let filled = budget
+            .reserve("entity".into(), ChannelClass::Entity)
+            .expect("entity budget");
+        filled.store(AGGREGATE_BUFFERED_HIGH, Ordering::Release);
+        let mux = WebRtcConnectionMux::new();
+        let (mut adapter, handle) = mux.create_adapter_with_aggregate(budget.aggregate());
+        mux.register("session".into(), "terminal".into(), 1, handle.clone());
+        let frame =
+            TerminalFrame::from_bytes(br#"{"type":"terminal_output","marker":"aggregate"}"#)
+                .expect("opaque frame");
+
+        assert_eq!(
+            adapter.try_write(&frame),
+            Err(TerminalAdapterWriteError::WouldBlock)
+        );
+        assert_eq!(adapter.pressure(), TerminalAdapterPressure::WouldBlock);
+        assert!(handle.snapshot_active().is_none());
+
+        filled.store(0, Ordering::Release);
+        mux.refresh_aggregate_pressure();
+        assert_eq!(adapter.pressure(), TerminalAdapterPressure::Ready);
+        assert_eq!(adapter.try_write(&frame), Ok(()));
+        assert_eq!(
+            handle.complete_active(),
+            Some(frame.to_bytes().expect("bytes"))
+        );
+    }
+
+    #[test]
+    fn sustained_aggregate_pressure_reaches_core_hard_stop_and_retires_route() {
+        use crate::admission::connection_budget::{
+            AGGREGATE_BUFFERED_HIGH, ChannelClass, ConnectionBudget,
+        };
+        use botster_core::{
+            ClientId, ClientWorker, SessionId, SubscriptionId, TerminalCapabilitySet,
+            TransportEgress,
+        };
+
+        let mut budget = ConnectionBudget::default();
+        let filled = budget
+            .reserve("entity".into(), ChannelClass::Entity)
+            .expect("entity budget");
+        filled.store(AGGREGATE_BUFFERED_HIGH, Ordering::Release);
+
+        let mux = WebRtcConnectionMux::new();
+        let (adapter, handle) = mux.create_adapter_with_aggregate(budget.aggregate());
+        let client_id = ClientId("client".into());
+        let session_id = SessionId("session".into());
+        let subscription_id = SubscriptionId("terminal".into());
+        let mut worker = ClientWorker::new();
+        let (generation, replacements) = worker.record_attach(
+            client_id.clone(),
+            session_id.clone(),
+            subscription_id.clone(),
+        );
+        assert!(replacements.is_empty());
+        mux.register(
+            session_id.0.clone(),
+            subscription_id.0.clone(),
+            generation.0,
+            handle.clone(),
+        );
+        worker
+            .bind_terminal_adapter(
+                &client_id,
+                session_id.clone(),
+                subscription_id.clone(),
+                generation,
+                TerminalCapabilitySet::empty(),
+                Box::new(adapter),
+            )
+            .expect("bind aggregate-backed adapter");
+
+        let mut egress = vec![(
+            client_id.clone(),
+            TransportEgress::TerminalOutput {
+                session_id: session_id.clone(),
+                subscription_id: subscription_id.clone(),
+                data: b"held-by-core".to_vec(),
+            },
+        )];
+        assert!(worker.ingest_bound_terminal_frames(&mut egress).is_empty());
+        assert!(egress.is_empty());
+
+        for attempt in 1..512 {
+            assert!(
+                worker.pump().is_empty(),
+                "attempt {attempt} must retain the Core route"
+            );
+            assert!(worker.has_subscription(&session_id, &subscription_id));
+        }
+        let teardowns = worker.pump();
+        assert_eq!(teardowns.len(), 1);
+        assert_eq!(teardowns[0].client_id, client_id);
+        assert_eq!(teardowns[0].session_id, session_id);
+        assert_eq!(teardowns[0].subscription_id, subscription_id);
+        assert_eq!(teardowns[0].generation, generation);
+        assert!(handle.is_closed());
+        assert!(!worker.has_subscription(&teardowns[0].session_id, &teardowns[0].subscription_id));
+        assert_eq!(mux.queue_closed_subscription_events(|_| true), 1);
+        assert!(mux.live_handle("session", "terminal").is_none());
     }
 
     #[test]

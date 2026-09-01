@@ -363,6 +363,38 @@ pub(crate) fn handle_peer_closed(
             .cancel_stream(&subscription.session_id, &subscription.subscription_id);
     }
     for grant_id in &removed_grants {
+        let peer_generation = state
+            .pending_runtime
+            .admission
+            .webrtc_admissions
+            .get(grant_id)
+            .map(|admission| match admission {
+                crate::admission::unix_hello::WebrtcTerminalAdmission::Admitted {
+                    peer_generation,
+                    ..
+                }
+                | crate::admission::unix_hello::WebrtcTerminalAdmission::Rejected {
+                    peer_generation,
+                    ..
+                } => *peer_generation,
+            });
+        if let Some(peer_generation) = peer_generation {
+            let labels = state
+                .pending_runtime
+                .admission
+                .reservations
+                .forget_peer(peer_generation);
+            if let Some(mut budget) = state
+                .pending_runtime
+                .admission
+                .connection_budgets
+                .remove(&peer_generation)
+            {
+                for label in labels {
+                    let _ = budget.release(&label);
+                }
+            }
+        }
         state
             .pending_runtime
             .admission

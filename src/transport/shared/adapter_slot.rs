@@ -101,6 +101,11 @@ impl<W: WakeSink> AdapterSlot<W> {
         }
     }
 
+    pub(crate) fn notify_writable(&self) {
+        self.emit_writable();
+        self.wake.wake();
+    }
+
     fn emit_closed(&self) {
         if self.closed_woke.swap(true, Ordering::SeqCst) {
             return;

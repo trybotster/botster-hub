@@ -133,8 +133,10 @@ pub(crate) fn handle_control_message(
         | message @ ControlMessage::RejectedConnection
         | message @ ControlMessage::RegisterUnixAdmission { .. }
         | message @ ControlMessage::RegisterWebrtcAdmission { .. }
-        | message @ ControlMessage::InspectTerminalReservation { .. }
-        | message @ ControlMessage::BindReservedTerminal { .. } => {
+        | message @ ControlMessage::InspectReservation { .. }
+        | message @ ControlMessage::BindReservedSubscription { .. }
+        | message @ ControlMessage::RetireReservedSubscription { .. }
+        | message @ ControlMessage::AuthorizeSubscriptionSend { .. } => {
             connection::handle(daemon, state, message)
         }
         message @ ControlMessage::SubscribeEntities { .. }

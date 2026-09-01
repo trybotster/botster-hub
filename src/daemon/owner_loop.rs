@@ -25,9 +25,7 @@ use crate::HubDaemonStatus;
 use crate::admission::budgets::{
     DAEMON_CLIENT_WRITE_TIMEOUT, DAEMON_CONTROL_QUEUE_CAPACITY, DAEMON_MAX_CONNECTIONS,
 };
-use crate::admission::unix_hello::AdmissionState;
-#[cfg(test)]
-use crate::admission::unix_hello::WebrtcTerminalAdmission;
+use crate::admission::unix_hello::{AdmissionState, WebrtcTerminalAdmission};
 use crate::daemon::control::handle_control_message;
 use crate::daemon::control::message::{
     ControlMessage, ControlReplySender, ControlSender, DaemonDeliveryKind, EgressWriteClass,
@@ -471,11 +469,93 @@ fn run_one_pump_phase(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
     let phase = state.pump.take_phase();
     let incomplete = match phase {
         PumpPhase::InventoryReconcile => {
-            state
+            let expired = state
                 .pending_runtime
                 .admission
                 .reservations
                 .retire_expired(crate::admission::reservations::now_seconds());
+            for reservation in expired {
+                let grant_id = state
+                    .pending_runtime
+                    .admission
+                    .webrtc_admissions
+                    .iter()
+                    .find_map(|(grant_id, admission)| match admission {
+                        WebrtcTerminalAdmission::Admitted {
+                            peer_generation, ..
+                        }
+                        | WebrtcTerminalAdmission::Rejected {
+                            peer_generation, ..
+                        } if *peer_generation == reservation.peer_generation => {
+                            Some(grant_id.clone())
+                        }
+                        _ => None,
+                    });
+                if let Some(grant_id) = grant_id.as_deref() {
+                    crate::daemon::control::connection::retire_route_owner(
+                        daemon,
+                        state,
+                        grant_id,
+                        &reservation,
+                    );
+                }
+                if let Some(budget) = state
+                    .pending_runtime
+                    .admission
+                    .connection_budgets
+                    .get_mut(&reservation.peer_generation)
+                {
+                    let _ = budget.release(&reservation.label);
+                }
+                if let Some(mux) = state
+                    .pending_runtime
+                    .admission
+                    .webrtc_admissions
+                    .values()
+                    .find_map(|admission| match admission {
+                        WebrtcTerminalAdmission::Admitted {
+                            mux,
+                            peer_generation,
+                            ..
+                        }
+                        | WebrtcTerminalAdmission::Rejected {
+                            mux,
+                            peer_generation,
+                            ..
+                        } if *peer_generation == reservation.peer_generation => Some(mux),
+                        _ => None,
+                    })
+                {
+                    let event = match reservation.class {
+                        crate::admission::connection_budget::ChannelClass::Terminal => {
+                            botster_hub_client::DaemonEvent::TerminalSubscriptionClosed {
+                                session_id: reservation.session_id,
+                                subscription_id: reservation.subscription_id,
+                                generation: reservation.generation,
+                                reason: botster_hub_client::TERMINAL_SUBSCRIPTION_CLOSED_RESERVATION_EXPIRED.to_string(),
+                            }
+                        }
+                        crate::admission::connection_budget::ChannelClass::Entity => {
+                            botster_hub_client::DaemonEvent::RuntimeObservation {
+                                kind: format!(
+                                    "entity_subscription_closed:{}:{}:reservation_expired",
+                                    reservation.subscription_id, reservation.generation
+                                ),
+                            }
+                        }
+                        crate::admission::connection_budget::ChannelClass::Event => {
+                            botster_hub_client::DaemonEvent::RuntimeObservation {
+                                kind: format!(
+                                    "package_event_subscription_closed:{}:{}:reservation_expired",
+                                    reservation.subscription_id, reservation.generation
+                                ),
+                            }
+                        }
+                        crate::admission::connection_budget::ChannelClass::Control => continue,
+                    };
+                    mux.push_host_event(event);
+                }
+            }
             run_inventory_reconcile_phase(daemon, state)
         }
         PumpPhase::Observe => run_pump_observe_phase(daemon, state),
