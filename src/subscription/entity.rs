@@ -133,6 +133,13 @@ pub(crate) struct EntitySubscriptionState {
     needs_delivery: bool,
 }
 
+#[cfg(test)]
+impl EntitySubscriptionState {
+    pub(crate) fn send_frame_for_test(&self, frame: DaemonEntityFrame) -> Result<(), ()> {
+        self.sender.try_send(frame)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeliveryPhase {
     Assembling { source_seq: u64 },

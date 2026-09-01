@@ -293,15 +293,14 @@ pub(crate) async fn admit_reserved_subscription_channel<C>(
                 subscription_id: &subscription_id,
                 generation,
             };
-            run_bound_subscription_channel(data_channel, stream_key, route, bound, hello_permits)
-                .await;
-            let _ = peer_state
-                .runtime_tx
-                .send(ControlMessage::RetireReservedSubscription {
-                    grant_id: grant_id.to_string(),
-                    label: label.to_string(),
-                })
-                .await;
+            run_bound_subscription_channel_and_retire(
+                data_channel,
+                stream_key,
+                route,
+                bound,
+                hello_permits,
+            )
+            .await;
         }
         Ok(Err(error)) => {
             let reason = match error {
@@ -325,6 +324,26 @@ pub(crate) async fn admit_reserved_subscription_channel<C>(
             .await;
         }
     }
+}
+
+async fn run_bound_subscription_channel_and_retire<C>(
+    data_channel: &C,
+    stream_key: &AesGcmKey,
+    route: BoundSubscriptionRoute<'_>,
+    bound: BoundSubscription,
+    hello_permits: Vec<crate::admission::connection_budget::AggregateSendPermit>,
+) where
+    C: LocalWebrtcDataChannel + ?Sized,
+{
+    run_bound_subscription_channel(data_channel, stream_key, route, bound, hello_permits).await;
+    let _ = route
+        .peer_state
+        .runtime_tx
+        .send(ControlMessage::RetireReservedSubscription {
+            grant_id: route.grant_id.to_string(),
+            label: route.label.to_string(),
+        })
+        .await;
 }
 
 async fn admit_subscription_hello<C>(
@@ -1296,6 +1315,385 @@ mod tests {
             }
         );
 
+        peer.close_offer();
+        harness.cleanup();
+    }
+
+    fn pump_test_control_until(
+        harness: &mut PeerHarness,
+        label: &str,
+        mut complete: impl FnMut(&PeerHarness) -> bool,
+    ) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !complete(harness) {
+            match harness.control_rx.try_recv() {
+                Ok(message) => {
+                    handle_control_message(
+                        &mut harness.daemon,
+                        &mut harness.state,
+                        &harness.terminal_path,
+                        &harness.transport_handle,
+                        harness.control_tx.clone(),
+                        message,
+                    );
+                }
+                Err(tokio_mpsc::error::TryRecvError::Empty)
+                    if std::time::Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("timed out waiting for {label}: {error}"),
+            };
+        }
+    }
+
+    #[test]
+    fn entity_overflow_full_host_auto_retires_target_and_keeps_sibling_hosts_usable() {
+        let _teardown_guard = teardown_test_lock();
+        let mut harness = PeerHarness::new("entity-overflow-full-host");
+        let mut peer = harness.signal_peer("http://127.0.0.1:41919");
+        harness.ensure_webrtc_adapter_hello(&mut peer);
+        peer.enable_host_events();
+
+        let mut reservations = Vec::new();
+        for index in 0..31 {
+            let response = harness.request_on_peer(
+                &mut peer,
+                DaemonRequest::SubscribeEntities {
+                    entity_type: "session_type".to_string(),
+                    subscription_id: format!("host-overflow-{index}"),
+                },
+                "SubscribeEntities",
+            );
+            assert_eq!(
+                response.kind,
+                botster_hub_client::DaemonResponseKind::EntitySubscribed
+            );
+            reservations.push(
+                response
+                    .subscription_reservation
+                    .expect("entity reservation"),
+            );
+        }
+        let target = reservations.last().expect("target reservation").clone();
+        let peer_generation = target.peer_generation;
+        let peer_state = harness
+            .daemon
+            .local_webrtc()
+            .peer_states
+            .get(&peer.grant_id)
+            .expect("live peer state")
+            .clone();
+        let hello = DaemonHello {
+            protocol: PROTOCOL.to_string(),
+            compatibility: botster_hub_client::DaemonCompatibilityRequirement::current(),
+            terminal_compatibility: None,
+        };
+        let mut channels = Vec::new();
+        let mut hosts = Vec::new();
+        for reservation in &reservations {
+            let channel = Arc::new(FakeDataChannel::default());
+            channel.push_event(encrypted_hello_event(&peer.stream_key, &hello));
+            let host_channel = Arc::clone(&channel);
+            let host_peer_state = Arc::clone(&peer_state);
+            let grant_id = peer.grant_id.clone();
+            let label = reservation.label.clone();
+            let key = peer.stream_key.clone();
+            hosts.push(harness.transport_handle.spawn(async move {
+                admit_reserved_subscription_channel(
+                    &grant_id,
+                    &label,
+                    host_channel.as_ref(),
+                    &key,
+                    host_peer_state.as_ref(),
+                )
+                .await;
+            }));
+            channels.push(channel);
+        }
+        pump_test_control_until(&mut harness, "all entity channel hosts to bind", |_| {
+            channels
+                .iter()
+                .all(|channel| channel.sent.lock().expect("sent frames").len() >= 2)
+        });
+
+        {
+            let budget = harness
+                .state
+                .pending_runtime
+                .admission
+                .connection_budgets
+                .get(&peer_generation)
+                .expect("peer budget");
+            for (index, (reservation, channel)) in
+                reservations.iter().zip(channels.iter()).enumerate()
+            {
+                let bytes = if index < 29 { 65_536 } else { 98_304 };
+                channel.outstanding_bytes.store(bytes, Ordering::Release);
+                budget
+                    .usage(&reservation.label)
+                    .expect("entity route usage")
+                    .store(bytes, Ordering::Release);
+            }
+            assert_eq!(
+                budget.aggregate_buffered(),
+                crate::admission::connection_budget::AGGREGATE_BUFFERED_HIGH
+            );
+            assert_eq!(budget.channel_count(), 32);
+        }
+
+        let refused = harness.request_on_peer(
+            &mut peer,
+            DaemonRequest::SubscribeEntities {
+                entity_type: "session_type".to_string(),
+                subscription_id: "host-overflow-31".to_string(),
+            },
+            "SubscribeEntities",
+        );
+        assert_eq!(
+            refused.error.as_ref().map(|error| error.code.as_str()),
+            Some("connection_channel_limit")
+        );
+        let budget = harness
+            .state
+            .pending_runtime
+            .admission
+            .connection_budgets
+            .get(&peer_generation)
+            .expect("peer budget");
+        assert_eq!(
+            budget.channel_count(),
+            crate::admission::connection_budget::MAX_TOTAL_CHANNELS - 1
+        );
+        assert_eq!(
+            budget.aggregate_buffered(),
+            crate::admission::connection_budget::AGGREGATE_BUFFERED_HIGH
+        );
+
+        let (authorize_tx, authorize_rx) = oneshot::channel();
+        handle_control_message(
+            &mut harness.daemon,
+            &mut harness.state,
+            &harness.terminal_path,
+            &harness.transport_handle,
+            harness.control_tx.clone(),
+            ControlMessage::AuthorizeSubscriptionSend {
+                grant_id: peer.grant_id.clone(),
+                label: target.label.clone(),
+                frame_len: 65_536,
+                reply_tx: authorize_tx,
+            },
+        );
+        assert!(
+            authorize_rx
+                .blocking_recv()
+                .expect("65,536-byte authorization reply")
+                .is_none()
+        );
+
+        let target_channel = channels.last().expect("target channel");
+        let sent_before_overflow = target_channel
+            .sent
+            .lock()
+            .expect("target sent frames")
+            .len();
+        let event_mux = peer_state.mux.clone();
+        *target_channel
+            .close_probe
+            .lock()
+            .expect("close probe mutex") = Some(Arc::new(move || event_mux.has_pending_event()));
+        harness
+            .state
+            .entity_subscriptions
+            .get(&target.subscription_id)
+            .expect("target entity subscription")
+            .send_frame_for_test(DaemonEntityFrame::Snapshot {
+                subscription_id: target.subscription_id.clone(),
+                entity_type: "session_type".to_string(),
+                snapshot_seq: 2,
+                items: vec![serde_json::json!({"payload": "x".repeat(65_536)})],
+                resync_reason: None,
+            })
+            .expect("queue target overflow frame");
+        let authorization_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let authorization = loop {
+            match harness.control_rx.try_recv() {
+                Ok(message @ ControlMessage::AuthorizeSubscriptionSend { .. }) => break message,
+                Ok(other) => {
+                    handle_control_message(
+                        &mut harness.daemon,
+                        &mut harness.state,
+                        &harness.terminal_path,
+                        &harness.transport_handle,
+                        harness.control_tx.clone(),
+                        other,
+                    );
+                }
+                Err(tokio_mpsc::error::TryRecvError::Empty)
+                    if std::time::Instant::now() < authorization_deadline =>
+                {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(tokio_mpsc::error::TryRecvError::Empty) => {
+                    panic!("timed out waiting for target authorization")
+                }
+                Err(error) => panic!("target authorization was not queued: {error}"),
+            }
+        };
+        handle_control_message(
+            &mut harness.daemon,
+            &mut harness.state,
+            &harness.terminal_path,
+            &harness.transport_handle,
+            harness.control_tx.clone(),
+            authorization,
+        );
+        let target_host = hosts.pop().expect("target host");
+        harness
+            ._transport_runtime
+            .block_on(target_host)
+            .expect("target host joins");
+        assert_eq!(
+            target_channel
+                .sent
+                .lock()
+                .expect("target sent frames")
+                .len(),
+            sent_before_overflow,
+            "the refused entity frame must not reach the transport"
+        );
+        assert!(target_channel.closed.load(Ordering::Acquire));
+        assert!(target_channel.close_probe_passed.load(Ordering::Acquire));
+        assert_eq!(
+            harness
+                .state
+                .pending_runtime
+                .admission
+                .connection_budgets
+                .get(&peer_generation)
+                .expect("peer budget")
+                .aggregate_buffered(),
+            crate::admission::connection_budget::AGGREGATE_BUFFERED_HIGH
+        );
+
+        let retirement_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let automatic_retirement = loop {
+            match harness.control_rx.try_recv() {
+                Ok(message @ ControlMessage::RetireReservedSubscription { .. }) => break message,
+                Ok(other) => panic!("expected automatic retirement, got {other:?}"),
+                Err(tokio_mpsc::error::TryRecvError::Empty)
+                    if std::time::Instant::now() < retirement_deadline =>
+                {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(tokio_mpsc::error::TryRecvError::Empty) => {
+                    panic!("timed out waiting for automatic retirement")
+                }
+                Err(error) => panic!("automatic retirement was not queued: {error}"),
+            }
+        };
+        assert!(matches!(
+            &automatic_retirement,
+            ControlMessage::RetireReservedSubscription { grant_id, label }
+                if grant_id == &peer.grant_id && label == &target.label
+        ));
+        handle_control_message(
+            &mut harness.daemon,
+            &mut harness.state,
+            &harness.terminal_path,
+            &harness.transport_handle,
+            harness.control_tx.clone(),
+            automatic_retirement,
+        );
+        let budget = harness
+            .state
+            .pending_runtime
+            .admission
+            .connection_budgets
+            .get(&peer_generation)
+            .expect("peer budget");
+        assert_eq!(budget.aggregate_buffered(), 1_998_848);
+        assert!(budget.usage(&target.label).is_none());
+
+        let sibling_sent_before = channels
+            .iter()
+            .take(30)
+            .map(|channel| channel.sent.lock().expect("sibling sent frames").len())
+            .collect::<Vec<_>>();
+        for (index, reservation) in reservations.iter().take(30).enumerate() {
+            assert!(!channels[index].close_started.load(Ordering::Acquire));
+            assert!(!hosts[index].is_finished());
+            harness
+                .state
+                .entity_subscriptions
+                .get(&reservation.subscription_id)
+                .expect("sibling entity subscription")
+                .send_frame_for_test(DaemonEntityFrame::Error {
+                    subscription_id: reservation.subscription_id.clone(),
+                    entity_type: "session_type".to_string(),
+                    code: "sibling_probe".to_string(),
+                    message: "sibling remains usable".to_string(),
+                })
+                .expect("queue sibling probe");
+        }
+        pump_test_control_until(&mut harness, "all sibling payload controls", |_| {
+            channels
+                .iter()
+                .take(30)
+                .enumerate()
+                .all(|(index, channel)| {
+                    channel.sent.lock().expect("sibling sent frames").len()
+                        > sibling_sent_before[index]
+                })
+        });
+        for (index, channel) in channels.iter().take(30).enumerate() {
+            assert!(!channel.close_started.load(Ordering::Acquire));
+            assert!(!hosts[index].is_finished());
+        }
+
+        let replacement = harness.request_on_peer(
+            &mut peer,
+            DaemonRequest::SubscribeEntities {
+                entity_type: "session_type".to_string(),
+                subscription_id: "host-overflow-replacement".to_string(),
+            },
+            "SubscribeEntities",
+        );
+        assert_eq!(
+            replacement.kind,
+            botster_hub_client::DaemonResponseKind::EntitySubscribed
+        );
+        let event = harness.wait_for_host_event(&mut peer, "entity overflow");
+        assert_eq!(
+            event,
+            botster_hub_client::DaemonEvent::RuntimeObservation {
+                kind: format!(
+                    "entity_subscription_closed:{}:{}:entity_subscription_overflow",
+                    target.subscription_id, target.generation
+                ),
+            }
+        );
+
+        for channel in channels.iter().take(30) {
+            channel.poll_ends.store(true, Ordering::Release);
+            channel.event_notify.notify_waiters();
+        }
+        for host in hosts {
+            harness
+                ._transport_runtime
+                .block_on(host)
+                .expect("sibling host joins");
+        }
+        while let Ok(message) = harness.control_rx.try_recv() {
+            handle_control_message(
+                &mut harness.daemon,
+                &mut harness.state,
+                &harness.terminal_path,
+                &harness.transport_handle,
+                harness.control_tx.clone(),
+                message,
+            );
+        }
         peer.close_offer();
         harness.cleanup();
     }

@@ -171,6 +171,16 @@ pub(crate) fn encrypted_request_event(
     })
 }
 
+pub(crate) fn encrypted_hello_event(key: &AesGcmKey, hello: &DaemonHello) -> DataChannelEvent {
+    let plaintext = serde_json::to_vec(hello).unwrap();
+    let envelope = encrypt_aes_gcm(key, &plaintext, 1).unwrap();
+    let data = serde_json::to_vec(&envelope).unwrap();
+    DataChannelEvent::OnMessage(RTCDataChannelMessage {
+        is_string: true,
+        data: data.as_slice().into(),
+    })
+}
+
 pub(crate) fn test_peer_state(grant_id: &str) -> LocalWebrtcPeerState {
     let (runtime_tx, _runtime_rx) = tokio_mpsc::channel(64);
     LocalWebrtcPeerState::new(grant_id.to_string(), runtime_tx)
