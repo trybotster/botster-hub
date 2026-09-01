@@ -861,6 +861,22 @@ mod tests {
         default_runtime, timeout,
     };
 
+    fn require_host_event_before_close(
+        mux: &WebRtcConnectionMux,
+        channel: &FakeDataChannel,
+        expected: botster_hub_client::DaemonEvent,
+    ) {
+        let event_admitted = Arc::new(AtomicBool::new(false));
+        let observer_flag = Arc::clone(&event_admitted);
+        mux.set_host_event_observer(Some(Arc::new(move |event| {
+            if event == &expected {
+                observer_flag.store(true, Ordering::Release);
+            }
+        })));
+        *channel.close_probe.lock().expect("close probe mutex") =
+            Some(Arc::new(move || event_admitted.load(Ordering::Acquire)));
+    }
+
     #[test]
     fn terminal_channel_pressure_targets_one_adapter_and_low_water_resumes_it() {
         let (adapter, handle) = crate::transport::webrtc::adapter::WebRtcTerminalAdapter::pair();
@@ -1149,9 +1165,16 @@ mod tests {
             .expect("live peer state")
             .clone();
         let channel = Arc::new(FakeDataChannel::default());
-        let event_mux = peer_state.mux.clone();
-        *channel.close_probe.lock().expect("close probe mutex") =
-            Some(Arc::new(move || event_mux.has_pending_event()));
+        require_host_event_before_close(
+            &peer_state.mux,
+            channel.as_ref(),
+            botster_hub_client::DaemonEvent::RuntimeObservation {
+                kind: format!(
+                    "entity_subscription_closed:{}:{}:entity_subscription_overflow",
+                    target.subscription_id, target.generation
+                ),
+            },
+        );
         let (frame_tx, frame_rx) = tokio_mpsc::channel(1);
         frame_tx
             .try_send(DaemonEntityFrame::Snapshot {
@@ -1497,11 +1520,16 @@ mod tests {
             .lock()
             .expect("target sent frames")
             .len();
-        let event_mux = peer_state.mux.clone();
-        *target_channel
-            .close_probe
-            .lock()
-            .expect("close probe mutex") = Some(Arc::new(move || event_mux.has_pending_event()));
+        require_host_event_before_close(
+            &peer_state.mux,
+            target_channel.as_ref(),
+            botster_hub_client::DaemonEvent::RuntimeObservation {
+                kind: format!(
+                    "entity_subscription_closed:{}:{}:entity_subscription_overflow",
+                    target.subscription_id, target.generation
+                ),
+            },
+        );
         harness
             .state
             .entity_subscriptions

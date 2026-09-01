@@ -268,6 +268,9 @@ pub(crate) struct WebRtcConnectionMux {
     inner: Arc<WebRtcMuxInner>,
 }
 
+#[cfg(test)]
+type HostEventObserver = Arc<dyn Fn(&DaemonEvent) + Send + Sync>;
+
 impl std::fmt::Debug for WebRtcConnectionMux {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -282,6 +285,8 @@ struct WebRtcMuxInner {
     close_events_admitted: AtomicBool,
     routes: Mutex<BTreeMap<(String, String, u64), ClosedEventRoute<WebRtcTerminalAdapterHandle>>>,
     closed_events: ClosedEventLedger,
+    #[cfg(test)]
+    host_event_observer: Mutex<Option<HostEventObserver>>,
     close_work: Mutex<Arc<AtomicBool>>,
     close_source: Mutex<Option<CloseWorkSource>>,
 }
@@ -295,6 +300,8 @@ impl WebRtcConnectionMux {
                 close_events_admitted: AtomicBool::new(false),
                 routes: Mutex::new(BTreeMap::new()),
                 closed_events: ClosedEventLedger::default(),
+                #[cfg(test)]
+                host_event_observer: Mutex::new(None),
                 close_work: Mutex::new(Arc::new(AtomicBool::new(false))),
                 close_source: Mutex::new(None),
             }),
@@ -506,8 +513,25 @@ impl WebRtcConnectionMux {
     }
 
     pub(crate) fn push_host_event(&self, event: DaemonEvent) {
+        #[cfg(test)]
+        let observed_event = event.clone();
         self.inner.closed_events.push_event(event);
+        #[cfg(test)]
+        if let Ok(observer) = self.inner.host_event_observer.lock()
+            && let Some(observer) = observer.as_ref()
+        {
+            observer(&observed_event);
+        }
         self.inner.wake.wake();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_host_event_observer(&self, observer: Option<HostEventObserver>) {
+        *self
+            .inner
+            .host_event_observer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = observer;
     }
 
     #[allow(dead_code)]
