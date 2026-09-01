@@ -1086,3 +1086,28 @@ that depends on this ticket's budget is left unowned.
    residency unless a connection ceiling with reserved shares is added. Candidate
    note: isolation splits must restate the aggregate bound and the fair-share rule
    together.
+5. **A share computed from the live subscription count does not protect a later
+   sibling.** `floor(cap / live_N)` at push time gives no guarantee to a
+   subscription admitted after the queue filled, and eviction is forbidden.
+   Isolation needs a fixed reserve deducted at admission plus fair admission
+   rejection. Candidate note: fair-share bounds must be reserved at admission, not
+   recomputed at use.
+6. **A sibling scan taken once at plan start goes stale.** Two same-target tickets
+   were created during this Plan step, one of them a publication conflict. The
+   scan must be repeated before gate submission, not only at plan start.
+7. **A required dependency cannot be replaced by a prose gate, and a start-order
+   edge on the wrong ticket stalls the run.** A Project Pipelines dependency
+   blocks advance with reason `ticket_dependencies`. Revision 2 put the edge on
+   this ticket and stalled it; revision 3 substituted prose and Plan Review
+   rejected that, correctly, because the engine cannot enforce prose. The
+   resolution is neither: split the dependent work into its own ticket and put the
+   formal edge there. Candidate note: when a prerequisite blocks one late step of
+   a ticket, split that step out and order the split ticket, rather than ordering
+   or prose-gating the whole ticket.
+8. **An official gate can force a file the ticket boundary tried to exclude.**
+   `sync-assets.mjs --check` byte-compares checked-in package artifacts against
+   assets regenerated from Rust, so a public DTO change cannot leave the package
+   artifact untouched. A boundary drawn around "the package files" is not
+   implementable; the boundary has to be drawn around *publication*. Candidate
+   note: generated-artifact sync checks make source and package scope inseparable,
+   so split on publication, not on files.
