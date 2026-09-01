@@ -1,0 +1,38 @@
+{
+  "ticket_id": "ticket_1788280618_295967",
+  "run_id": "run_1788280945_468802",
+  "target_repository": "trybotster/botster-hub",
+  "target_id": "tgt_7e208a0c76a44980a83b63af976b1f22",
+  "published_hub_commit": "b4020a976010f4ec495c89efd6ea66271e02712f",
+  "coordinate": "@trybotster/hub-test-support@0.1.42",
+  "protocol_version": 8,
+  "conformance_fixture_revision": 47,
+  "ui_contract_coordinate": "@trybotster/ui-contract@0.3.3",
+  "daemon_protocol_sha256": "8940d99b2e1035b77a9ce94fae8597d246490e5d9673ab084cff8ff04749989a",
+  "expected_pack_integrity": "sha512-Sorc7CFj7K5E4YZ+2wYJm5ONprALZ5fn0YiByJfNdIRwrUBhXMPZNTJUKQ0NEAcS5dvT/4qWnLUq0AVk2+YvHg==",
+  "registry_integrity": "sha512-Sorc7CFj7K5E4YZ+2wYJm5ONprALZ5fn0YiByJfNdIRwrUBhXMPZNTJUKQ0NEAcS5dvT/4qWnLUq0AVk2+YvHg==",
+  "registry_tarball": "https://registry.npmjs.org/@trybotster/hub-test-support/-/hub-test-support-0.1.42.tgz",
+  "operator_publish_path": "botster-hub/script/publish-npm-packages",
+  "operator_console_output_available": false,
+  "checks": {
+    "repository_asset_check": "passed",
+    "repository_package_test": "passed",
+    "registry_integrity_matches_intended_commit_pack": true,
+    "external_clean_install": "passed",
+    "workspace_link_absent": true,
+    "local_tarball_absent": true,
+    "installed_asset_verification": "passed",
+    "installed_daemon_protocol_sha256_matches_metadata": true,
+    "terminal_reservation_dto_present": true,
+    "mode_gated_input_absent": true,
+    "prior_0_1_41_mode_gated_input_positive_control": "passed",
+    "prior_0_1_41_terminal_reservation_absence_control": "passed"
+  },
+  "cross_repo_dependency": {
+    "repository": "trybotster/botster-web",
+    "target_id": "tgt_40abcf71ccf049f4ac0c99953a799869",
+    "ticket_id": "ticket_1787600676_914408",
+    "status": "unblocked by publication"
+  },
+  "runtime_teardown_class_applies": false
+}
