@@ -60,6 +60,9 @@ pub(crate) struct FakeDataChannel {
     pub(crate) closed: AtomicBool,
     pub(crate) send_fails: AtomicBool,
     pub(crate) send_hangs: AtomicBool,
+    pub(crate) close_hangs: AtomicBool,
+    pub(crate) close_started: AtomicBool,
+    pub(crate) threshold_fails: AtomicBool,
     pub(crate) outstanding_bytes: std::sync::atomic::AtomicUsize,
     pub(crate) sent_before_low_water: AtomicBool,
     pub(crate) poll_ends: AtomicBool,
@@ -70,6 +73,9 @@ pub(crate) struct FakeDataChannel {
 #[async_trait]
 impl LocalWebrtcDataChannel for FakeDataChannel {
     async fn local_set_buffered_amount_low_threshold(&self, _threshold: u32) -> Result<(), String> {
+        if self.threshold_fails.load(Ordering::Acquire) {
+            return Err("fixture threshold failure".to_string());
+        }
         Ok(())
     }
 
@@ -77,6 +83,9 @@ impl LocalWebrtcDataChannel for FakeDataChannel {
         &self,
         _threshold: u32,
     ) -> Result<(), String> {
+        if self.threshold_fails.load(Ordering::Acquire) {
+            return Err("fixture threshold failure".to_string());
+        }
         Ok(())
     }
 
@@ -123,6 +132,10 @@ impl LocalWebrtcDataChannel for FakeDataChannel {
     }
 
     async fn local_close(&self) -> Result<(), String> {
+        self.close_started.store(true, Ordering::Release);
+        while self.close_hangs.load(Ordering::Acquire) {
+            self.send_notify.notified().await;
+        }
         self.closed.store(true, Ordering::Release);
         Ok(())
     }
