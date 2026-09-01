@@ -596,6 +596,21 @@ impl TestOfferPeer {
         let plaintext = decrypt_aes_gcm(key, &envelope).expect("decrypt reserved event");
         serde_json::from_slice(&plaintext).expect("parse reserved daemon event")
     }
+
+    pub(crate) async fn wait_reserved_closed(&mut self, label: &str) {
+        let reserved = self
+            .reserved_channels
+            .get_mut(label)
+            .expect("reserved channel exists");
+        let next = timeout(
+            webrtc_runtime().as_ref(),
+            Duration::from_secs(10),
+            reserved.message_rx.recv(),
+        )
+        .await
+        .expect("reserved channel close timeout");
+        assert!(next.is_none(), "closed channel must end its message stream");
+    }
 }
 
 pub(crate) fn unique_test_data_dir(label: &str) -> PathBuf {
@@ -1241,6 +1256,49 @@ impl PeerHarness {
         offer_peer = returned_peer;
         peer.offer_peer = Some(offer_peer);
         event
+    }
+
+    pub(crate) fn wait_for_reserved_close(&mut self, peer: &mut LiveSignaledPeer, label: &str) {
+        let mut offer_peer = peer
+            .offer_peer
+            .take()
+            .expect("offer peer available for reserved close");
+        let reserved_label = label.to_string();
+        let (close_tx, close_rx) = std::sync::mpsc::channel();
+        let offer_handle = peer.offer_runtime.handle().clone();
+        let worker = thread::spawn(move || {
+            offer_handle.block_on(offer_peer.wait_reserved_closed(&reserved_label));
+            close_tx.send(offer_peer).expect("return closed peer");
+        });
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let returned_peer = loop {
+            if let Ok(result) = close_rx.try_recv() {
+                break result;
+            }
+            if Instant::now() >= deadline {
+                panic!("timed out waiting for reserved close");
+            }
+            match self.control_rx.try_recv() {
+                Ok(message) => {
+                    handle_control_message(
+                        &mut self.daemon,
+                        &mut self.state,
+                        &self.terminal_path,
+                        &self.transport_handle,
+                        self.control_tx.clone(),
+                        message,
+                    );
+                }
+                Err(tokio_mpsc::error::TryRecvError::Empty) => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(tokio_mpsc::error::TryRecvError::Disconnected) => {
+                    panic!("control channel closed while waiting for reserved close");
+                }
+            }
+        };
+        worker.join().expect("reserved close worker joins");
+        peer.offer_peer = Some(returned_peer);
     }
 
     pub(crate) fn wait_until_reservation_bound(&mut self, grant_id: &str, label: &str) {

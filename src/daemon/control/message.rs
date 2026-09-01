@@ -110,6 +110,12 @@ pub(crate) enum ControlMessage {
         frame_len: usize,
         reply_tx: oneshot::Sender<Option<crate::admission::connection_budget::AggregateSendPermit>>,
     },
+    AuthorizeSubscriptionHelloAck {
+        grant_id: String,
+        label: String,
+        frame_len: usize,
+        reply_tx: oneshot::Sender<Option<crate::admission::connection_budget::AggregateSendPermit>>,
+    },
 }
 
 #[derive(Debug)]

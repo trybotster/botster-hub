@@ -251,20 +251,22 @@ pub(crate) async fn admit_reserved_subscription_channel<C>(
             ..
         } => (subscription_id, generation),
     };
-    if admit_subscription_hello(data_channel, stream_key)
-        .await
-        .is_err()
-    {
-        reject_reserved_data_channel(
-            grant_id,
-            label,
-            SubscriptionChannelRejectReason::InvalidHello,
-            data_channel,
-            peer_state,
-        )
-        .await;
-        return;
-    }
+    let hello_permits =
+        match admit_subscription_hello(data_channel, stream_key, peer_state, grant_id, label).await
+        {
+            Ok(permits) => permits,
+            Err(()) => {
+                reject_reserved_data_channel(
+                    grant_id,
+                    label,
+                    SubscriptionChannelRejectReason::InvalidHello,
+                    data_channel,
+                    peer_state,
+                )
+                .await;
+                return;
+            }
+        };
     let (bind_tx, bind_rx) = oneshot::channel();
     if peer_state
         .runtime_tx
@@ -288,7 +290,8 @@ pub(crate) async fn admit_reserved_subscription_channel<C>(
                 subscription_id: &subscription_id,
                 generation,
             };
-            run_bound_subscription_channel(data_channel, stream_key, route, bound).await;
+            run_bound_subscription_channel(data_channel, stream_key, route, bound, hello_permits)
+                .await;
             let _ = peer_state
                 .runtime_tx
                 .send(ControlMessage::RetireReservedSubscription {
@@ -321,7 +324,13 @@ pub(crate) async fn admit_reserved_subscription_channel<C>(
     }
 }
 
-async fn admit_subscription_hello<C>(data_channel: &C, stream_key: &AesGcmKey) -> Result<(), ()>
+async fn admit_subscription_hello<C>(
+    data_channel: &C,
+    stream_key: &AesGcmKey,
+    peer_state: &LocalWebrtcPeerState,
+    grant_id: &str,
+    label: &str,
+) -> Result<Vec<crate::admission::connection_budget::AggregateSendPermit>, ()>
 where
     C: LocalWebrtcDataChannel + ?Sized,
 {
@@ -330,8 +339,15 @@ where
             Some(webrtc::data_channel::DataChannelEvent::OnMessage(message)) => {
                 match decrypt_data_channel_plaintext(stream_key, message.data.as_ref()) {
                     Some(DataChannelPlaintext::Hello(hello)) => {
-                        return acknowledge_subscription_hello(data_channel, stream_key, &hello)
-                            .await;
+                        return acknowledge_subscription_hello(
+                            data_channel,
+                            stream_key,
+                            &hello,
+                            peer_state,
+                            grant_id,
+                            label,
+                        )
+                        .await;
                     }
                     _ => return Err(()),
                 }
@@ -348,7 +364,10 @@ async fn acknowledge_subscription_hello<C>(
     data_channel: &C,
     stream_key: &AesGcmKey,
     hello: &DaemonHello,
-) -> Result<(), ()>
+    peer_state: &LocalWebrtcPeerState,
+    grant_id: &str,
+    label: &str,
+) -> Result<Vec<crate::admission::connection_budget::AggregateSendPermit>, ()>
 where
     C: LocalWebrtcDataChannel + ?Sized,
 {
@@ -367,10 +386,15 @@ where
         diagnostics: vec![DaemonDiagnostic::connected("hello")],
     };
     let frames = framed_daemon_hello_ack(stream_key, &ack).map_err(|_| ())?;
+    let mut permits = Vec::with_capacity(frames.len());
     for frame in frames {
+        let permit = authorize_subscription_hello_ack(peer_state, grant_id, label, frame.len())
+            .await
+            .ok_or(())?;
         data_channel.local_send_text(&frame).await.map_err(|_| ())?;
+        permits.push(permit);
     }
-    Ok(())
+    Ok(permits)
 }
 
 #[derive(Clone, Copy)]
@@ -387,6 +411,7 @@ async fn run_bound_subscription_channel<C>(
     stream_key: &AesGcmKey,
     route: BoundSubscriptionRoute<'_>,
     bound: BoundSubscription,
+    hello_permits: Vec<crate::admission::connection_budget::AggregateSendPermit>,
 ) where
     C: LocalWebrtcDataChannel + ?Sized,
 {
@@ -418,6 +443,7 @@ async fn run_bound_subscription_channel<C>(
             tokio::time::timeout(LOCAL_WEBRTC_PEER_CLOSE_BOUND, data_channel.local_close()).await;
         return;
     }
+    drop(hello_permits);
     match bound {
         BoundSubscription::Terminal { handle, usage } => {
             run_bound_terminal_channel(data_channel, stream_key, route.peer_state, handle, usage)
@@ -592,6 +618,29 @@ async fn authorize_subscription_send(
     reply_rx.await.unwrap_or(None)
 }
 
+async fn authorize_subscription_hello_ack(
+    peer_state: &LocalWebrtcPeerState,
+    grant_id: &str,
+    label: &str,
+    frame_len: usize,
+) -> Option<crate::admission::connection_budget::AggregateSendPermit> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if peer_state
+        .runtime_tx
+        .send(ControlMessage::AuthorizeSubscriptionHelloAck {
+            grant_id: grant_id.to_string(),
+            label: label.to_string(),
+            frame_len,
+            reply_tx,
+        })
+        .await
+        .is_err()
+    {
+        return None;
+    }
+    reply_rx.await.unwrap_or(None)
+}
+
 async fn run_bound_event_channel<C>(
     data_channel: &C,
     stream_key: &AesGcmKey,
@@ -603,6 +652,9 @@ async fn run_bound_event_channel<C>(
 {
     let mut peer_terminal_rx = route.peer_state.subscribe_peer_terminal();
     'driver: loop {
+        if mailbox.is_retired() {
+            break;
+        }
         while let Some(event) = mailbox.take_ready_event() {
             let Ok(frames) = framed_daemon_event(stream_key, &event) else {
                 break 'driver;
@@ -659,6 +711,9 @@ async fn run_bound_event_channel<C>(
         }
         let notified = mailbox.notify().notified();
         tokio::pin!(notified);
+        if mailbox.is_retired() {
+            break;
+        }
         if mailbox.take_wake() || mailbox.has_ready_event() {
             continue;
         }
@@ -842,6 +897,62 @@ mod tests {
         initial_usage_blocks_first_payload(
             crate::admission::connection_budget::ChannelClass::Event,
         );
+    }
+
+    #[test]
+    fn subscription_hello_ack_is_refused_before_write_at_aggregate_ceiling() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build HelloAck runtime");
+        runtime.block_on(async {
+            let (runtime_tx, mut runtime_rx) = tokio_mpsc::channel(4);
+            let peer_state = LocalWebrtcPeerState::new("grant".to_string(), runtime_tx);
+            let mut budget = crate::admission::connection_budget::ConnectionBudget::default();
+            let usage = budget
+                .reserve(
+                    "route".to_string(),
+                    crate::admission::connection_budget::ChannelClass::Entity,
+                )
+                .expect("reserve route");
+            usage.store(
+                crate::admission::connection_budget::AGGREGATE_BUFFERED_HIGH - 1,
+                Ordering::Release,
+            );
+            let responder = tokio::spawn(async move {
+                let Some(ControlMessage::AuthorizeSubscriptionHelloAck {
+                    label,
+                    frame_len,
+                    reply_tx,
+                    ..
+                }) = runtime_rx.recv().await
+                else {
+                    panic!("expected HelloAck authorization");
+                };
+                let _ = reply_tx.send(budget.authorize_send(&label, frame_len));
+            });
+            let channel = FakeDataChannel::default();
+            let key = AesGcmKey::from_slice(&[31; 32]).expect("test key");
+            let hello = DaemonHello {
+                protocol: PROTOCOL.to_string(),
+                compatibility: botster_hub_client::DaemonCompatibilityRequirement::current(),
+                terminal_compatibility: None,
+            };
+            assert!(
+                acknowledge_subscription_hello(
+                    &channel,
+                    &key,
+                    &hello,
+                    &peer_state,
+                    "grant",
+                    "route",
+                )
+                .await
+                .is_err()
+            );
+            responder.await.expect("authorization responder");
+            assert!(channel.sent.lock().expect("sent frames").is_empty());
+        });
     }
 
     #[test]

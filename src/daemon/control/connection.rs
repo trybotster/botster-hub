@@ -65,6 +65,12 @@ pub(crate) fn handle(
             frame_len,
             reply_tx,
         } => authorize_subscription_send(state, &grant_id, &label, frame_len, reply_tx),
+        ControlMessage::AuthorizeSubscriptionHelloAck {
+            grant_id,
+            label,
+            frame_len,
+            reply_tx,
+        } => authorize_subscription_hello_ack(state, &grant_id, &label, frame_len, reply_tx),
         _ => unreachable!("connection family received a non-connection control message"),
     }
 }
@@ -492,6 +498,37 @@ fn authorize_subscription_send(
             reservation.state == crate::admission::reservations::ReservationState::Bound
         });
     let permit = bound.then(|| {
+        state
+            .pending_runtime
+            .admission
+            .connection_budgets
+            .get(&peer_generation)?
+            .authorize_send(label, frame_len)
+    });
+    let _ = reply_tx.send(permit.flatten());
+    false
+}
+
+fn authorize_subscription_hello_ack(
+    state: &mut DaemonControlState,
+    grant_id: &str,
+    label: &str,
+    frame_len: usize,
+    reply_tx: oneshot::Sender<Option<AggregateSendPermit>>,
+) -> bool {
+    let Some(peer_generation) = admitted_peer_generation(state, grant_id) else {
+        let _ = reply_tx.send(None);
+        return false;
+    };
+    let live = state
+        .pending_runtime
+        .admission
+        .reservations
+        .reservation_for_label(label, peer_generation)
+        .is_some_and(|reservation| {
+            reservation.state == crate::admission::reservations::ReservationState::Live
+        });
+    let permit = live.then(|| {
         state
             .pending_runtime
             .admission

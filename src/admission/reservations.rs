@@ -320,6 +320,29 @@ impl TerminalReservationRegistry {
         labels
     }
 
+    pub(crate) fn forget_unbound_subscription(
+        &mut self,
+        class: ChannelClass,
+        subscription_id: &str,
+        peer_generation: u64,
+    ) -> Vec<String> {
+        let labels: Vec<_> = self
+            .by_key
+            .values()
+            .filter(|reservation| {
+                reservation.class == class
+                    && reservation.subscription_id == subscription_id
+                    && reservation.peer_generation == peer_generation
+                    && reservation.state != ReservationState::Bound
+            })
+            .map(|reservation| reservation.label.clone())
+            .collect();
+        for label in &labels {
+            let _ = self.forget_label(label, peer_generation);
+        }
+        labels
+    }
+
     pub(crate) fn retire_expired(&mut self, now_seconds: u64) -> Vec<TerminalReservation> {
         let mut expired = Vec::new();
         for reservation in self.by_key.values_mut() {
