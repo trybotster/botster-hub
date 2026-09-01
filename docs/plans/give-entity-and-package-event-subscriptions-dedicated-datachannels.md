@@ -511,7 +511,7 @@ rescan through `search_tickets(target_id, status=open)` gives the current set.
 
 | Ticket | Title | Interaction |
 |--------|-------|-------------|
-| `ticket_1788280618_295967` | Hub: publish `@trybotster/hub-test-support` 0.1.42 with the terminal reservation DTO | **Blocking publication conflict.** Registered as a dependency |
+| `ticket_1788280618_295967` | Hub: publish `@trybotster/hub-test-support` 0.1.42 with the terminal reservation DTO | **Publication conflict.** Enforced as a merge-order gate, not a pipeline dependency edge; see below |
 | `ticket_1788280452_111197` | Hub: move bound-adapter test progress off Core drain onto wake pumps | Semantic-rebase risk. It rewrites about 66 test call sites, including `tests/hub_daemon_lifecycle/webrtc_terminal_adapter.rs` and `src/subscription/attach_routes.rs`, which this ticket also changes. Renew review after any semantic rebase |
 | `ticket_1788206393_323469` | Hub: reproduce targeted `pump_woken` resize with merged Core | Low. It rolls the Core pin and resize behavior, not channel topology |
 | `ticket_1787600679_990088` | Integration: cold-cut the old terminal route and prove isolation | Downstream consumer of this merge, not a prerequisite |
@@ -535,8 +535,27 @@ Resolution, in order:
    `[[Hub test support capability cutovers use a new unpublished package version]]`
    a new capability takes a new version, and 0.1.42 additionally carries a pending
    publish coordinate that another ticket and a Web consumer depend on.
-2. `ticket_1788280618_295967` is registered as a **blocking dependency** of this
-   ticket, so 0.1.42 publishes before this ticket bumps to 0.1.43.
+2. The ordering is enforced as a **merge-order gate inside this ticket**, not as a
+   Project Pipelines dependency edge. This was tested rather than assumed: the
+   edge was registered as `dependency_1788281992_869734`, and
+   `request_step_advance` then returned
+   `{"ok": false, "reason": "ticket_dependencies", "status": "blocked"}` for the
+   Plan to Plan Review transition. A Project Pipelines dependency means "this
+   ticket cannot start a pipeline run until the dependency closes", which is a
+   start-order constraint. The real constraint here is a **merge-order** one: only
+   acceptance check 12(d), the package bump, needs the publish. Plan, Implement,
+   the section 9 budget, the channel work, and 16 of the 17 acceptance checks do
+   not. Registering the edge therefore stalled the entire ticket behind an
+   unrelated npm publish and delivered nothing. The edge was removed. The
+   constraint is instead binding here, in the plan:
+
+   > **Merge-order gate.** Do not change any file under
+   > `packages/hub-test-support/` or bump `CONFORMANCE_FIXTURE_REVISION` until
+   > `ticket_1788280618_295967` has published 0.1.42 and the published artifact
+   > sha256 values have been compared against a pack of the intended commit. If
+   > this ticket is otherwise complete and 0.1.42 is still unpublished, Implement
+   > stops at that boundary and Verify records the package gate as blocked with
+   > the exact reason. Do not work around it by mutating 0.1.42.
 3. Then bump to 0.1.43 with `CONFORMANCE_FIXTURE_REVISION` 48 and the
    `subscription_reservation` DTO.
 4. Per `[[closed dependency tickets signal merged source not a consumable release]]`,
