@@ -4,8 +4,8 @@
 //! body. Overflow latches [`TerminalIngress::Lost`] once. Close drops buffered
 //! frames and makes later reads permanently closed.
 
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::sync::{Mutex, TryLockError};
 
 use botster_core::contract::terminal_adapter::{
@@ -15,7 +15,8 @@ use botster_terminal_protocol::TerminalInputFrame;
 
 /// Bounded complete-frame ingress plus one partial assembly slot.
 pub(crate) struct IngressBuffer {
-    frames: Mutex<VecDeque<Vec<u8>>>,
+    frames_tx: SyncSender<Vec<u8>>,
+    frames_rx: Mutex<Receiver<Vec<u8>>>,
     partial: Mutex<Option<Vec<u8>>>,
     lost: AtomicBool,
     lost_reported: AtomicBool,
@@ -23,8 +24,10 @@ pub(crate) struct IngressBuffer {
 
 impl IngressBuffer {
     pub(crate) fn new() -> Self {
+        let (frames_tx, frames_rx) = sync_channel(MIN_ADAPTER_INGRESS_BUFFER_FRAMES);
         Self {
-            frames: Mutex::new(VecDeque::new()),
+            frames_tx,
+            frames_rx: Mutex::new(frames_rx),
             partial: Mutex::new(None),
             lost: AtomicBool::new(false),
             lost_reported: AtomicBool::new(false),
@@ -32,10 +35,10 @@ impl IngressBuffer {
     }
 
     pub(crate) fn clear(&self) {
-        match self.frames.try_lock() {
-            Ok(mut frames) => frames.clear(),
+        match self.frames_rx.try_lock() {
+            Ok(frames) => drain_frames(&frames),
             Err(TryLockError::WouldBlock) => {}
-            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner().clear(),
+            Err(TryLockError::Poisoned(poisoned)) => drain_frames(&poisoned.into_inner()),
         }
         match self.partial.try_lock() {
             Ok(mut partial) => *partial = None,
@@ -75,23 +78,18 @@ impl IngressBuffer {
         if is_closed() {
             return false;
         }
-        let mut frames = match self.frames.lock() {
-            Ok(frames) => frames,
-            Err(_) => return false,
-        };
+        admitted();
         if is_closed() {
-            frames.clear();
             return false;
         }
-        admitted();
-        let stored = if frames.len() >= MIN_ADAPTER_INGRESS_BUFFER_FRAMES {
-            self.lost.store(true, Ordering::SeqCst);
-            false
-        } else {
-            frames.push_back(bytes);
-            true
+        let stored = match self.frames_tx.try_send(bytes) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => {
+                self.lost.store(true, Ordering::SeqCst);
+                false
+            }
+            Err(TrySendError::Disconnected(_)) => false,
         };
-        drop(frames);
         if is_closed() {
             self.clear();
             return false;
@@ -120,8 +118,18 @@ impl IngressBuffer {
 
     #[allow(dead_code)]
     pub(crate) fn drop_one_complete(&self) -> bool {
-        let dropped = match self.frames.lock() {
-            Ok(mut frames) => frames.pop_back().is_some(),
+        let mut buffered = Vec::new();
+        let dropped = match self.frames_rx.lock() {
+            Ok(frames) => {
+                while let Ok(frame) = frames.try_recv() {
+                    buffered.push(frame);
+                }
+                let dropped = buffered.pop().is_some();
+                for frame in buffered.drain(..) {
+                    let _ = self.frames_tx.try_send(frame);
+                }
+                dropped
+            }
             Err(_) => false,
         };
         if dropped {
@@ -143,14 +151,19 @@ impl IngressBuffer {
         if self.lost.load(Ordering::SeqCst) && !self.lost_reported.swap(true, Ordering::SeqCst) {
             return TerminalIngress::Lost;
         }
-        match self.frames.lock() {
-            Ok(mut frames) => match frames.pop_front() {
-                Some(frame) => TerminalIngress::Frame(frame),
-                None => TerminalIngress::Empty,
+        match self.frames_rx.lock() {
+            Ok(frames) => match frames.try_recv() {
+                Ok(frame) => TerminalIngress::Frame(frame),
+                Err(TryRecvError::Empty) => TerminalIngress::Empty,
+                Err(TryRecvError::Disconnected) => TerminalIngress::Closed,
             },
             Err(_) => TerminalIngress::Closed,
         }
     }
+}
+
+fn drain_frames(frames: &Receiver<Vec<u8>>) {
+    while frames.try_recv().is_ok() {}
 }
 
 #[cfg(test)]
@@ -196,9 +209,9 @@ mod tests {
     }
 
     #[test]
-    fn producer_contention_waits_without_latching_frame_loss() {
+    fn producer_does_not_wait_for_the_consumer_lock() {
         let buffer = Arc::new(IngressBuffer::new());
-        let held = buffer.frames.lock().expect("hold ingress consumer lock");
+        let held = buffer.frames_rx.lock().expect("hold ingress consumer lock");
         let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
         let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
         let producer_buffer = Arc::clone(&buffer);
@@ -211,12 +224,11 @@ mod tests {
         started_rx.recv().expect("producer starts");
         assert!(
             done_rx
-                .recv_timeout(std::time::Duration::from_millis(50))
-                .is_err(),
-            "the producer must wait for the bounded ingress lock"
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("producer must not wait for the consumer lock"),
+            "the producer stores while the consumer lock is held"
         );
         drop(held);
-        assert!(done_rx.recv().expect("producer stores after contention"));
         producer.join().expect("producer thread");
         assert_eq!(
             buffer.try_read(false),
@@ -270,7 +282,10 @@ mod tests {
         producer.join().expect("producer thread");
 
         assert_eq!(buffer.try_read(true), TerminalIngress::Closed);
-        assert!(buffer.frames.lock().expect("frames lock").is_empty());
+        assert!(matches!(
+            buffer.frames_rx.lock().expect("frames lock").try_recv(),
+            Err(TryRecvError::Empty)
+        ));
         assert!(!buffer.lost.load(Ordering::SeqCst));
     }
 }

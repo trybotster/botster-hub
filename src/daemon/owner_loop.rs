@@ -708,6 +708,7 @@ mod tests {
     use crate::HubStateStore;
     use crate::PackageState;
     use crate::admission::budgets::DAEMON_CONTROL_QUEUE_CAPACITY;
+    use crate::admission::unix_hello::UnixTerminalAdmission;
     use crate::client_api_dto::response::{daemon_events, daemon_response_base};
     use crate::daemon::control::message::{daemon_delivery_kind, egress_write_class};
     use crate::daemon::control::{
@@ -718,10 +719,14 @@ mod tests {
     use crate::subscription::entity::entity_subscription_error;
     use crate::transport::unix::connection::{cleanup_detach_failed, handle_connection};
     use botster_core::RequestId;
+    use botster_core::contract::terminal_adapter::TerminalAdapter;
     use botster_hub_client::{
         DaemonHello, DaemonHelloAck, DaemonRequest, DaemonResponse, DaemonResponseKind, PROTOCOL,
         read_frame, write_frame,
     };
+    use botster_terminal_protocol::TerminalFrame;
+    use serde_json::Value;
+    use std::io::Write;
     use std::net::Shutdown;
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
@@ -1086,6 +1091,89 @@ mod tests {
             .send(Ok(daemon_response_base(DaemonResponseKind::Status)))
             .expect("reply to status");
         let _: DaemonResponse = read_frame(&mut client).expect("read status response");
+        client
+            .shutdown(Shutdown::Both)
+            .expect("disconnect daemon client");
+        connection
+            .join()
+            .expect("join daemon connection")
+            .expect("client disconnect is a clean connection close");
+    }
+
+    #[test]
+    fn unix_writer_wake_preserves_a_partial_inbound_request() {
+        let (server, mut client) = UnixStream::pair().expect("create daemon socket pair");
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("bound daemon client reads");
+        let (control_tx, mut control_rx) = tokio_mpsc::channel(DAEMON_CONTROL_QUEUE_CAPACITY);
+        let connection = thread::spawn(move || handle_connection(server, control_tx));
+
+        write_frame(
+            &mut client,
+            &DaemonHello {
+                protocol: PROTOCOL.to_string(),
+                compatibility: botster_hub_client::DaemonCompatibilityRequirement::current(),
+                terminal_compatibility: None,
+            },
+        )
+        .expect("write daemon hello");
+        let _: DaemonHelloAck = read_frame(&mut client).expect("read daemon hello ack");
+
+        let ControlMessage::RegisterUnixAdmission {
+            admission,
+            reply_tx,
+            ..
+        } = receive_test_control_message(&mut control_rx)
+        else {
+            panic!("expected RegisterUnixAdmission after Hello");
+        };
+        let UnixTerminalAdmission::Admitted { mux, .. } = admission else {
+            panic!("expected terminal admission");
+        };
+        let (mut adapter, handle) = mux.create_adapter();
+        mux.register(
+            "partial-session".to_string(),
+            "partial-subscription".to_string(),
+            1,
+            handle,
+        );
+
+        let mut request_bytes =
+            serde_json::to_vec(&DaemonRequest::Status).expect("encode status request");
+        request_bytes.push(b'\n');
+        let split = request_bytes.len() / 2;
+        client
+            .write_all(&request_bytes[..split])
+            .expect("write partial status request");
+
+        let frame =
+            TerminalFrame::from_bytes(br#"{"type":"terminal_output","marker":"writer-wake"}"#)
+                .expect("create terminal output frame");
+        adapter.try_write(&frame).expect("store terminal output");
+        reply_tx.send(()).expect("ack unix admission");
+        let terminal: Value = read_frame(&mut client).expect("read terminal output");
+        assert_eq!(
+            terminal.get("plane").and_then(Value::as_str),
+            Some(botster_hub_client::UNIX_TERMINAL_PLANE)
+        );
+
+        client
+            .write_all(&request_bytes[split..])
+            .expect("complete status request");
+        let ControlMessage::Request {
+            request, reply_tx, ..
+        } = receive_test_control_request(&mut control_rx)
+        else {
+            panic!("expected complete Status request");
+        };
+        assert!(matches!(*request, DaemonRequest::Status));
+        reply_tx
+            .send(Ok(daemon_response_base(DaemonResponseKind::Status)))
+            .expect("reply to status");
+        let response: DaemonResponse = read_frame(&mut client).expect("read status response");
+        assert_eq!(response.kind, DaemonResponseKind::Status);
+
         client
             .shutdown(Shutdown::Both)
             .expect("disconnect daemon client");
