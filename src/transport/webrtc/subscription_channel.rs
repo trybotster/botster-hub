@@ -405,6 +405,19 @@ async fn run_bound_subscription_channel<C>(
         let _ = data_channel.local_close().await;
         return;
     }
+    let usage = match &bound {
+        BoundSubscription::Terminal { usage, .. }
+        | BoundSubscription::Entity { usage, .. }
+        | BoundSubscription::Event { usage, .. } => usage,
+    };
+    if publish_channel_usage(data_channel, usage).await.is_err() {
+        if let BoundSubscription::Terminal { handle, .. } = &bound {
+            handle.close();
+        }
+        let _ =
+            tokio::time::timeout(LOCAL_WEBRTC_PEER_CLOSE_BOUND, data_channel.local_close()).await;
+        return;
+    }
     match bound {
         BoundSubscription::Terminal { handle, usage } => {
             run_bound_terminal_channel(data_channel, stream_key, route.peer_state, handle, usage)
@@ -794,6 +807,43 @@ mod tests {
         assert_eq!(adapter.pressure(), TerminalAdapterPressure::Ready);
         assert_eq!(sibling.pressure(), TerminalAdapterPressure::Ready);
     }
+
+    fn initial_usage_blocks_first_payload(
+        class: crate::admission::connection_budget::ChannelClass,
+    ) {
+        let mut budget = crate::admission::connection_budget::ConnectionBudget::default();
+        let usage = budget
+            .reserve("route".to_string(), class)
+            .expect("reserve route");
+        let channel = FakeDataChannel::default();
+        channel.outstanding_bytes.store(
+            crate::admission::connection_budget::AGGREGATE_BUFFERED_HIGH - 1,
+            Ordering::Release,
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build usage runtime");
+        runtime
+            .block_on(publish_channel_usage(&channel, &usage))
+            .expect("publish HelloAck usage");
+        assert!(budget.authorize_send("route", 2).is_none());
+    }
+
+    #[test]
+    fn entity_route_counts_hello_ack_before_first_payload() {
+        initial_usage_blocks_first_payload(
+            crate::admission::connection_budget::ChannelClass::Entity,
+        );
+    }
+
+    #[test]
+    fn event_route_counts_hello_ack_before_first_payload() {
+        initial_usage_blocks_first_payload(
+            crate::admission::connection_budget::ChannelClass::Event,
+        );
+    }
+
     #[test]
     fn reject_extra_data_channel_closes_the_unclaimed_channel() {
         let extra = FakeDataChannel::default();

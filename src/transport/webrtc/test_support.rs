@@ -60,6 +60,7 @@ pub(crate) struct FakeDataChannel {
     pub(crate) closed: AtomicBool,
     pub(crate) send_fails: AtomicBool,
     pub(crate) send_hangs: AtomicBool,
+    pub(crate) outstanding_bytes: std::sync::atomic::AtomicUsize,
     pub(crate) sent_before_low_water: AtomicBool,
     pub(crate) poll_ends: AtomicBool,
     pub(crate) event_notify: tokio::sync::Notify,
@@ -77,6 +78,10 @@ impl LocalWebrtcDataChannel for FakeDataChannel {
         _threshold: u32,
     ) -> Result<(), String> {
         Ok(())
+    }
+
+    async fn local_outstanding_bytes(&self) -> Result<usize, String> {
+        Ok(self.outstanding_bytes.load(Ordering::Acquire))
     }
 
     async fn local_send_text(&self, text: &str) -> Result<(), String> {
