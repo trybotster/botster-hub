@@ -157,75 +157,78 @@ pub(crate) async fn handle_connection_async(
         .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
 
     loop {
-        let event_mailbox = event_plane.mailbox(&client_id);
-        let event_output_ready = !unix_event_flush_stalled()
-            && event_mailbox
-                .as_ref()
-                .is_some_and(|mailbox| mailbox.has_ready_event());
-        let request = tokio::select! {
-            biased;
-            request = read_async_inbound(&mut reader, None) => request,
-            _ = mux.notify().notified() => {
-                mux.clear_deferred_flushes();
-                if let Err(error) = flush_unix_mux_writes(
-                    &mut write_half,
-                    &mux,
-                    &mut mux_write,
-                    event_mailbox.as_deref(),
-                ).await {
-                    cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
-                    mux.close_all();
-                    return Err(error);
-                }
-                continue;
-            }
-            _ = async {
-                if unix_event_flush_stalled() {
-                    std::future::pending::<()>().await;
-                    return;
-                }
-                if let Some(mailbox) = event_mailbox.as_ref() {
-                    let notified = mailbox.notify().notified();
-                    tokio::pin!(notified);
-                    if mailbox.take_wake() || mailbox.has_ready_event() {
-                        return;
+        let request = {
+            let inbound = read_async_inbound(&mut reader, None);
+            tokio::pin!(inbound);
+            loop {
+                let event_mailbox = event_plane.mailbox(&client_id);
+                let event_output_ready = !unix_event_flush_stalled()
+                    && event_mailbox
+                        .as_ref()
+                        .is_some_and(|mailbox| mailbox.has_ready_event());
+                tokio::select! {
+                    biased;
+                    request = &mut inbound => break request,
+                    _ = mux.wait_for_write() => {
+                        mux.clear_deferred_flushes();
+                        if let Err(error) = flush_unix_mux_writes(
+                            &mut write_half,
+                            &mux,
+                            &mut mux_write,
+                            event_mailbox.as_deref(),
+                        ).await {
+                            cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
+                            mux.close_all();
+                            return Err(error);
+                        }
                     }
-                    notified.await;
-                } else {
-                    std::future::pending::<()>().await;
+                    _ = async {
+                        if unix_event_flush_stalled() {
+                            std::future::pending::<()>().await;
+                            return;
+                        }
+                        if let Some(mailbox) = event_mailbox.as_ref() {
+                            let notified = mailbox.notify().notified();
+                            tokio::pin!(notified);
+                            if mailbox.take_wake() || mailbox.has_ready_event() {
+                                return;
+                            }
+                            notified.await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    } => {
+                        mux.clear_deferred_flushes();
+                        if let Err(error) = flush_unix_mux_writes(
+                            &mut write_half,
+                            &mux,
+                            &mut mux_write,
+                            event_mailbox.as_deref(),
+                        ).await {
+                            cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
+                            mux.close_all();
+                            return Err(error);
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(25)), if mux.has_unsent_mux_writes() || mux_write.has_pending() || event_output_ready || (unix_event_flush_stalled() && event_mailbox.as_ref().is_some_and(|mailbox| mailbox.has_ready_event())) => {
+                        mux.clear_deferred_flushes();
+                        if let Err(error) = flush_unix_mux_writes(
+                            &mut write_half,
+                            &mux,
+                            &mut mux_write,
+                            event_mailbox.as_deref(),
+                        ).await {
+                            cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
+                            mux.close_all();
+                            return Err(error);
+                        }
+                    }
+                    changed = shutdown_rx.changed() => {
+                        let _ = changed;
+                        cleanup.set_reason(ConnectionTerminalReason::Shutdown);
+                        return Ok(());
+                    }
                 }
-            } => {
-                mux.clear_deferred_flushes();
-                if let Err(error) = flush_unix_mux_writes(
-                    &mut write_half,
-                    &mux,
-                    &mut mux_write,
-                    event_mailbox.as_deref(),
-                ).await {
-                    cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
-                    mux.close_all();
-                    return Err(error);
-                }
-                continue;
-            }
-            _ = tokio::time::sleep(Duration::from_millis(25)), if mux.has_unsent_mux_writes() || mux_write.has_pending() || event_output_ready || (unix_event_flush_stalled() && event_mailbox.as_ref().is_some_and(|mailbox| mailbox.has_ready_event())) => {
-                mux.clear_deferred_flushes();
-                if let Err(error) = flush_unix_mux_writes(
-                    &mut write_half,
-                    &mux,
-                    &mut mux_write,
-                    event_mailbox.as_deref(),
-                ).await {
-                    cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
-                    mux.close_all();
-                    return Err(error);
-                }
-                continue;
-            }
-            changed = shutdown_rx.changed() => {
-                let _ = changed;
-                cleanup.set_reason(ConnectionTerminalReason::Shutdown);
-                return Ok(());
             }
         };
         let request = match request {
