@@ -25,7 +25,7 @@ impl AdapterWake {
 
     pub(crate) fn wake(&self) {
         self.pending.store(true, Ordering::SeqCst);
-        self.notify.notify_waiters();
+        self.notify.notify_one();
     }
 
     pub(crate) async fn wait(&self) {
@@ -66,5 +66,29 @@ impl NotifyWaiters {
 impl WakeSink for NotifyWaiters {
     fn wake(&self) {
         self.0.notify_waiters();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn wake_between_the_last_flag_check_and_wait_stores_a_permit() {
+        let wake = AdapterWake::new();
+        assert!(!wake.pending.swap(false, Ordering::SeqCst));
+        wake.wake();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_millis(50), wake.notify.notified())
+                .await
+                .expect("a wake before waiter registration must store a permit");
+        });
     }
 }
