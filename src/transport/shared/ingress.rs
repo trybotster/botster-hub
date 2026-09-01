@@ -75,15 +75,9 @@ impl IngressBuffer {
         if is_closed() {
             return false;
         }
-        let mut frames = match self.frames.try_lock() {
+        let mut frames = match self.frames.lock() {
             Ok(frames) => frames,
-            Err(TryLockError::WouldBlock) => {
-                if !is_closed() {
-                    self.lost.store(true, Ordering::SeqCst);
-                }
-                return !is_closed();
-            }
-            Err(TryLockError::Poisoned(_)) => return false,
+            Err(_) => return false,
         };
         if is_closed() {
             frames.clear();
@@ -199,6 +193,36 @@ mod tests {
             buffer.try_read(false),
             TerminalIngress::Frame(input_frame(&[0]))
         );
+    }
+
+    #[test]
+    fn producer_contention_waits_without_latching_frame_loss() {
+        let buffer = Arc::new(IngressBuffer::new());
+        let held = buffer.frames.lock().expect("hold ingress consumer lock");
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let producer_buffer = Arc::clone(&buffer);
+        let producer = thread::spawn(move || {
+            started_tx.send(()).expect("publish producer attempt");
+            let stored = producer_buffer.store_complete(input_frame(b"contended"), || false);
+            done_tx.send(stored).expect("publish producer result");
+        });
+
+        started_rx.recv().expect("producer starts");
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "the producer must wait for the bounded ingress lock"
+        );
+        drop(held);
+        assert!(done_rx.recv().expect("producer stores after contention"));
+        producer.join().expect("producer thread");
+        assert_eq!(
+            buffer.try_read(false),
+            TerminalIngress::Frame(input_frame(b"contended"))
+        );
+        assert!(!buffer.lost.load(Ordering::SeqCst));
     }
 
     #[test]

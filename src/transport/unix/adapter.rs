@@ -9,20 +9,18 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::data_plane::CloseWorkSource;
+use crate::subscription::closed_events::{
+    ClosedEventLedger, ClosedEventRoute, ClosedEventSliceProgress, ClosedHandle,
+};
+use crate::transport::shared::adapter_slot::AdapterSlot;
+use crate::transport::shared::wake::AdapterWake;
 use botster_core::contract::terminal_adapter::{
     TerminalAdapter, TerminalAdapterPressure, TerminalAdapterWriteError, TerminalIngress,
 };
 use botster_core::contract::terminal_wake::{TerminalWakeSink, WakingTerminalAdapter};
 use botster_hub_client::DaemonEvent;
 use botster_terminal_protocol::TerminalFrame;
-use tokio::sync::Notify;
-
-use crate::data_plane::CloseWorkSource;
-use crate::subscription::closed_events::{
-    ClosedEventLedger, ClosedEventRoute, ClosedEventSliceProgress, ClosedHandle,
-};
-use crate::transport::shared::adapter_slot::AdapterSlot;
-use crate::transport::shared::wake::NotifyWaiters;
 
 /// One-slot Unix adapter bound to an admitted control connection.
 pub struct UnixTerminalAdapter {
@@ -36,7 +34,7 @@ pub(crate) struct UnixTerminalAdapterHandle {
 }
 
 struct UnixTerminalAdapterInner {
-    slot: AdapterSlot<NotifyWaiters>,
+    slot: AdapterSlot<AdapterWake>,
     deferred: AtomicBool,
     clear_pressure_after_rejection: AtomicBool,
 }
@@ -45,7 +43,7 @@ impl UnixTerminalAdapterInner {
     fn new() -> Self {
         Self {
             slot: AdapterSlot::with_wake_and_close_work(
-                NotifyWaiters::new(),
+                AdapterWake::new(),
                 Arc::new(AtomicBool::new(false)),
             ),
             deferred: AtomicBool::new(false),
@@ -124,24 +122,21 @@ impl UnixTerminalAdapter {
     /// Create the production adapter and the connection-owned write handle.
     #[must_use]
     pub(crate) fn pair() -> (Self, UnixTerminalAdapterHandle) {
-        Self::pair_with_notify(Arc::new(Notify::new()))
+        Self::pair_with_wake(AdapterWake::new())
     }
 
-    /// Create an adapter that wakes `notify` on write or close.
+    /// Create an adapter that stores one wake permit on write or close.
     #[must_use]
-    pub(crate) fn pair_with_notify(notify: Arc<Notify>) -> (Self, UnixTerminalAdapterHandle) {
-        Self::pair_with_notify_and_close_work(notify, Arc::new(AtomicBool::new(false)))
+    pub(crate) fn pair_with_wake(wake: AdapterWake) -> (Self, UnixTerminalAdapterHandle) {
+        Self::pair_with_wake_and_close_work(wake, Arc::new(AtomicBool::new(false)))
     }
 
-    fn pair_with_notify_and_close_work(
-        notify: Arc<Notify>,
+    fn pair_with_wake_and_close_work(
+        wake: AdapterWake,
         close_work: Arc<AtomicBool>,
     ) -> (Self, UnixTerminalAdapterHandle) {
         let inner = Arc::new(UnixTerminalAdapterInner {
-            slot: AdapterSlot::with_wake_and_close_work(
-                NotifyWaiters::from_arc(notify),
-                close_work,
-            ),
+            slot: AdapterSlot::with_wake_and_close_work(wake, close_work),
             deferred: AtomicBool::new(false),
             clear_pressure_after_rejection: AtomicBool::new(false),
         });
@@ -215,7 +210,7 @@ impl std::fmt::Debug for UnixConnectionMux {
 }
 
 struct UnixMuxInner {
-    notify: Arc<Notify>,
+    wake: AdapterWake,
     dying: AtomicBool,
     routes: Mutex<BTreeMap<(String, String, u64), ClosedEventRoute<UnixTerminalAdapterHandle>>>,
     closed_events: ClosedEventLedger,
@@ -227,7 +222,7 @@ impl UnixConnectionMux {
     pub(crate) fn new() -> Self {
         Self {
             inner: Arc::new(UnixMuxInner {
-                notify: Arc::new(Notify::new()),
+                wake: AdapterWake::new(),
                 dying: AtomicBool::new(false),
                 routes: Mutex::new(BTreeMap::new()),
                 closed_events: ClosedEventLedger::default(),
@@ -249,10 +244,6 @@ impl UnixConnectionMux {
         }
     }
 
-    pub(crate) fn notify_arc(&self) -> Arc<Notify> {
-        Arc::clone(&self.inner.notify)
-    }
-
     pub(crate) fn create_adapter(&self) -> (UnixTerminalAdapter, UnixTerminalAdapterHandle) {
         let close_work = self
             .inner
@@ -261,7 +252,7 @@ impl UnixConnectionMux {
             .ok()
             .map(|slot| Arc::clone(&*slot))
             .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-        UnixTerminalAdapter::pair_with_notify_and_close_work(self.notify_arc(), close_work)
+        UnixTerminalAdapter::pair_with_wake_and_close_work(self.inner.wake.clone(), close_work)
     }
 
     pub(crate) fn register(
@@ -298,13 +289,13 @@ impl UnixConnectionMux {
         if let Ok(source) = self.inner.close_source.lock()
             && let Some(source) = source.as_ref()
         {
-            let notify = self.notify_arc();
+            let wake = self.inner.wake.clone();
             let hook = source.register(
                 session_id,
                 subscription_id,
                 generation,
                 self.inner.closed_events.clone(),
-                Arc::new(move || notify.notify_waiters()),
+                Arc::new(move || wake.wake()),
             );
             handle.attach_close_hook(move |host_closed| hook.notify_closed(host_closed));
         }
@@ -321,7 +312,7 @@ impl UnixConnectionMux {
                 })
                 .expect("start test pressure timer");
         }
-        self.inner.notify.notify_waiters();
+        self.inner.wake.wake();
     }
 
     #[cfg(test)]
@@ -349,7 +340,7 @@ impl UnixConnectionMux {
                 route.handle.close_from_host();
             }
         }
-        self.inner.notify.notify_waiters();
+        self.inner.wake.wake();
     }
 
     #[allow(dead_code)]
@@ -426,7 +417,7 @@ impl UnixConnectionMux {
                 after_route: None,
             };
         };
-        let notify = Arc::clone(&self.inner.notify);
+        let wake = self.inner.wake.clone();
         self.inner
             .closed_events
             .queue_closed_subscription_events_bounded(
@@ -436,7 +427,7 @@ impl UnixConnectionMux {
                 max_candidates,
                 after_route,
                 max_entries_visited,
-                || notify.notify_waiters(),
+                || wake.wake(),
             )
     }
 
@@ -512,8 +503,8 @@ impl UnixConnectionMux {
             .collect()
     }
 
-    pub(crate) fn notify(&self) -> &Notify {
-        self.inner.notify.as_ref()
+    pub(crate) async fn wait_for_write(&self) {
+        self.inner.wake.wait().await;
     }
 
     /// Allow a later flush to retry a route that yielded to a host response.
@@ -723,6 +714,19 @@ mod tests {
         mux.clear_deferred_flushes();
         assert_eq!(mux.snapshot_writes().len(), 1);
         assert!(handle.snapshot_active().is_some());
+    }
+
+    #[tokio::test]
+    async fn unix_mux_retains_a_write_wake_before_the_connection_waits() {
+        let mux = UnixConnectionMux::new();
+        let (mut adapter, _handle) = mux.create_adapter();
+        let frame = TerminalFrame::from_bytes(br#"{"type":"terminal_output","marker":"early"}"#)
+            .expect("opaque frame");
+
+        assert_eq!(adapter.try_write(&frame), Ok(()));
+        tokio::time::timeout(std::time::Duration::from_millis(50), mux.wait_for_write())
+            .await
+            .expect("a Unix adapter write before waiter registration must retain its wake");
     }
 
     #[test]

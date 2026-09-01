@@ -49,26 +49,6 @@ impl WakeSink for AdapterWake {
     }
 }
 
-/// Unix flavor: notify waiters with no stored permit.
-#[derive(Clone)]
-pub(crate) struct NotifyWaiters(Arc<Notify>);
-
-impl NotifyWaiters {
-    pub(crate) fn new() -> Self {
-        Self(Arc::new(Notify::new()))
-    }
-
-    pub(crate) fn from_arc(notify: Arc<Notify>) -> Self {
-        Self(notify)
-    }
-}
-
-impl WakeSink for NotifyWaiters {
-    fn wake(&self) {
-        self.0.notify_waiters();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
