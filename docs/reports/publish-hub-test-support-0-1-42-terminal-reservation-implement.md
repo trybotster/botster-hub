@@ -203,4 +203,3 @@ The vault does not yet record these durable facts:
 
 This run did not write outside its routed Hub worktree. The implementation
 checklist records these three capture candidates for a later vault pipeline.
-
