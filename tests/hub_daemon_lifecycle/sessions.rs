@@ -23,6 +23,51 @@ fn terminal_envelope_contains_marker(
     }
 }
 
+fn wait_for_terminal_json(
+    connection: &mut botster_hub_client::DaemonConnection,
+    session_id: &str,
+    subscription_id: &str,
+    description: &str,
+    matches: impl Fn(&serde_json::Value) -> bool,
+) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if connection.take_skipped_terminal().iter().any(|envelope| {
+            if envelope.session_id != session_id || envelope.subscription_id != subscription_id {
+                return false;
+            }
+            let Ok(bytes) = envelope.payload_bytes() else {
+                return false;
+            };
+            serde_json::from_slice::<serde_json::Value>(&bytes).is_ok_and(|value| matches(&value))
+        }) {
+            return;
+        }
+        let response = connection
+            .request(&botster_hub_client::DaemonRequest::drain_subscription(
+                session_id,
+                subscription_id,
+            ))
+            .expect("read terminal frame");
+        assert!(
+            response.events.iter().all(|event| !matches!(
+                event,
+                botster_hub_client::DaemonEvent::AttachState { .. }
+                    | botster_hub_client::DaemonEvent::Snapshot { .. }
+                    | botster_hub_client::DaemonEvent::Scrollback { .. }
+                    | botster_hub_client::DaemonEvent::TerminalOutput { .. }
+                    | botster_hub_client::DaemonEvent::ProcessExit { .. }
+            )),
+            "host Drain must not return terminal bodies: {:?}",
+            response.events
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!(
+        "timed out waiting for {description} session={session_id} subscription={subscription_id}"
+    );
+}
+
 fn lifecycle_counters(
     endpoint: &botster_hub_client::DaemonEndpoint,
     label: &str,
@@ -883,6 +928,21 @@ fn external_hub_client_read_mode_flags_drives_real_daemon_socket_protocol() {
         })
         .expect("external attach request");
     assert_eq!(attach.kind, botster_hub_client::DaemonResponseKind::Events);
+    wait_for_terminal_json(
+        &mut connection,
+        "external-client-session",
+        "external-client-subscription",
+        "terminal attached",
+        |value| {
+            value.get("type").and_then(serde_json::Value::as_str) == Some("attach_state")
+                && value.get("state").and_then(serde_json::Value::as_str) == Some("attached")
+        },
+    );
+    wait_for_read_screen_contains(
+        &mut connection,
+        "external-client-session",
+        "external-ready",
+    );
 
     connection
         .send_terminal_frame(
@@ -891,11 +951,22 @@ fn external_hub_client_read_mode_flags_drives_real_daemon_socket_protocol() {
             &terminal_resize_frame_bytes(31, 101),
         )
         .expect("external resize frame");
+    wait_for_terminal_json(
+        &mut connection,
+        "external-client-session",
+        "external-client-subscription",
+        "admitted resize input result",
+        |value| {
+            value.get("type").and_then(serde_json::Value::as_str) == Some("input_result")
+                && value.get("kind").and_then(serde_json::Value::as_str) == Some("resize")
+                && value.get("admitted").and_then(serde_json::Value::as_bool) == Some(true)
+        },
+    );
     connection
         .send_terminal_frame(
             "external-client-session",
             "external-client-subscription",
-            &terminal_input_frame_bytes(b"external-input\n"),
+            &terminal_input_frame_bytes(b"external-input\r"),
         )
         .expect("external input frame");
 
