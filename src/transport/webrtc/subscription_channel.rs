@@ -429,13 +429,15 @@ async fn run_bound_terminal_channel<C>(
     C: LocalWebrtcDataChannel + ?Sized,
 {
     loop {
-        if let Err(()) = flush_subscription_adapter_frames(data_channel, stream_key, &handle).await
+        if let Err(()) =
+            flush_subscription_adapter_frames(data_channel, stream_key, &handle, &usage).await
         {
+            let _ = tokio::time::timeout(LOCAL_WEBRTC_PEER_CLOSE_BOUND, data_channel.local_close())
+                .await;
             handle.close();
-            let _ = data_channel.local_close().await;
             return;
         }
-        publish_channel_usage(data_channel, &usage).await;
+        let _ = publish_channel_usage(data_channel, &usage).await;
         peer_state.mux.refresh_aggregate_pressure();
         tokio::select! {
             _ = handle.wait_for_write() => {}
@@ -463,7 +465,7 @@ async fn run_bound_terminal_channel<C>(
                     Some(event @ (webrtc::data_channel::DataChannelEvent::OnBufferedAmountHigh
                     | webrtc::data_channel::DataChannelEvent::OnBufferedAmountLow)) => {
                         apply_subscription_pressure_event(&handle, &event);
-                        publish_channel_usage(data_channel, &usage).await;
+                        let _ = publish_channel_usage(data_channel, &usage).await;
                         peer_state.mux.refresh_aggregate_pressure();
                     }
                     Some(webrtc::data_channel::DataChannelEvent::OnClose)
@@ -496,12 +498,12 @@ async fn run_bound_entity_channel<C>(
                 let Some(frame) = frame else { break };
                 let Ok(frames) = framed_daemon_entity_frame(stream_key, &frame) else { break };
                 for frame in frames {
-                    if !authorize_subscription_send(
+                    let Some(permit) = authorize_subscription_send(
                         route.peer_state,
                         route.grant_id,
                         route.label,
                         frame.len(),
-                    ).await {
+                    ).await else {
                         route.peer_state.mux.push_host_event(
                             botster_hub_client::DaemonEvent::RuntimeObservation {
                                 kind: format!(
@@ -512,9 +514,26 @@ async fn run_bound_entity_channel<C>(
                             },
                         );
                         break 'driver;
+                    };
+                    if data_channel.local_send_text(&frame).await.is_err() {
+                        let _ = tokio::time::timeout(
+                            LOCAL_WEBRTC_PEER_CLOSE_BOUND,
+                            data_channel.local_close(),
+                        )
+                        .await;
+                        drop(permit);
+                        return;
                     }
-                    if data_channel.local_send_text(&frame).await.is_err() { break 'driver; }
-                    publish_channel_usage(data_channel, &usage).await;
+                    if publish_channel_usage(data_channel, &usage).await.is_err() {
+                        let _ = tokio::time::timeout(
+                            LOCAL_WEBRTC_PEER_CLOSE_BOUND,
+                            data_channel.local_close(),
+                        )
+                        .await;
+                        drop(permit);
+                        return;
+                    }
+                    drop(permit);
                     route.peer_state.mux.refresh_aggregate_pressure();
                 }
             }
@@ -525,7 +544,7 @@ async fn run_bound_entity_channel<C>(
                 match event {
                     Ok(Some(webrtc::data_channel::DataChannelEvent::OnBufferedAmountHigh
                         | webrtc::data_channel::DataChannelEvent::OnBufferedAmountLow)) => {
-                        publish_channel_usage(data_channel, &usage).await;
+                        let _ = publish_channel_usage(data_channel, &usage).await;
                         route.peer_state.mux.refresh_aggregate_pressure();
                     }
                     Ok(Some(_)) => {}
@@ -542,7 +561,7 @@ async fn authorize_subscription_send(
     grant_id: &str,
     label: &str,
     frame_len: usize,
-) -> bool {
+) -> Option<crate::admission::connection_budget::AggregateSendPermit> {
     let (reply_tx, reply_rx) = oneshot::channel();
     if peer_state
         .runtime_tx
@@ -555,9 +574,9 @@ async fn authorize_subscription_send(
         .await
         .is_err()
     {
-        return false;
+        return None;
     }
-    reply_rx.await.unwrap_or(false)
+    reply_rx.await.unwrap_or(None)
 }
 
 async fn run_bound_event_channel<C>(
@@ -576,14 +595,14 @@ async fn run_bound_event_channel<C>(
                 break 'driver;
             };
             for frame in frames {
-                if !authorize_subscription_send(
+                let Some(permit) = authorize_subscription_send(
                     route.peer_state,
                     route.grant_id,
                     route.label,
                     frame.len(),
                 )
                 .await
-                {
+                else {
                     if let botster_hub_client::DaemonEvent::PackageEvent {
                         subscription_id,
                         owner,
@@ -602,11 +621,26 @@ async fn run_bound_event_channel<C>(
                         },
                     );
                     break 'driver;
-                }
+                };
                 if data_channel.local_send_text(&frame).await.is_err() {
-                    break 'driver;
+                    let _ = tokio::time::timeout(
+                        LOCAL_WEBRTC_PEER_CLOSE_BOUND,
+                        data_channel.local_close(),
+                    )
+                    .await;
+                    drop(permit);
+                    return;
                 }
-                publish_channel_usage(data_channel, &usage).await;
+                if publish_channel_usage(data_channel, &usage).await.is_err() {
+                    let _ = tokio::time::timeout(
+                        LOCAL_WEBRTC_PEER_CLOSE_BOUND,
+                        data_channel.local_close(),
+                    )
+                    .await;
+                    drop(permit);
+                    return;
+                }
+                drop(permit);
                 route.peer_state.mux.refresh_aggregate_pressure();
             }
         }
@@ -625,7 +659,7 @@ async fn run_bound_event_channel<C>(
                 match event {
                     Ok(Some(webrtc::data_channel::DataChannelEvent::OnBufferedAmountHigh
                         | webrtc::data_channel::DataChannelEvent::OnBufferedAmountLow)) => {
-                        publish_channel_usage(data_channel, &usage).await;
+                        let _ = publish_channel_usage(data_channel, &usage).await;
                         route.peer_state.mux.refresh_aggregate_pressure();
                     }
                     Ok(Some(_)) => {}
@@ -637,13 +671,19 @@ async fn run_bound_event_channel<C>(
     let _ = tokio::time::timeout(LOCAL_WEBRTC_PEER_CLOSE_BOUND, data_channel.local_close()).await;
 }
 
-async fn publish_channel_usage<C>(data_channel: &C, usage: &std::sync::atomic::AtomicUsize)
+async fn publish_channel_usage<C>(
+    data_channel: &C,
+    usage: &std::sync::atomic::AtomicUsize,
+) -> Result<(), ()>
 where
     C: LocalWebrtcDataChannel + ?Sized,
 {
-    if let Ok(bytes) = data_channel.local_outstanding_bytes().await {
-        usage.store(bytes, std::sync::atomic::Ordering::Release);
-    }
+    let bytes = data_channel
+        .local_outstanding_bytes()
+        .await
+        .map_err(|_| ())?;
+    usage.store(bytes, std::sync::atomic::Ordering::Release);
+    Ok(())
 }
 
 fn apply_subscription_pressure_event(
@@ -665,6 +705,7 @@ async fn flush_subscription_adapter_frames<C>(
     data_channel: &C,
     stream_key: &AesGcmKey,
     handle: &WebRtcTerminalAdapterHandle,
+    usage: &std::sync::atomic::AtomicUsize,
 ) -> Result<(), ()>
 where
     C: LocalWebrtcDataChannel + ?Sized,
@@ -676,9 +717,14 @@ where
         return Ok(());
     };
     let frames = framed_daemon_terminal_frame(stream_key, &bytes).map_err(|_| ())?;
+    let wire_len = frames.iter().map(String::len).sum();
+    if !handle.resize_aggregate_permit(wire_len) {
+        return Err(());
+    }
     for frame in frames {
         data_channel.local_send_text(&frame).await.map_err(|_| ())?;
     }
+    publish_channel_usage(data_channel, usage).await?;
     if !handle.is_closed() {
         let _ = handle.complete_active();
     }

@@ -40,6 +40,13 @@ struct ChannelUsage {
 #[derive(Debug)]
 pub(crate) struct ConnectionAggregate {
     slots: Box<[Arc<AtomicUsize>]>,
+    authorized: AtomicUsize,
+}
+
+#[derive(Debug)]
+pub(crate) struct AggregateSendPermit {
+    aggregate: Arc<ConnectionAggregate>,
+    frame_len: usize,
 }
 
 impl ConnectionAggregate {
@@ -48,11 +55,11 @@ impl ConnectionAggregate {
             slots: (0..MAX_SUBSCRIPTION_CHANNELS)
                 .map(|_| Arc::new(AtomicUsize::new(0)))
                 .collect(),
+            authorized: AtomicUsize::new(0),
         }
     }
 
-    #[must_use]
-    pub(crate) fn buffered(&self) -> usize {
+    fn published_buffered(&self) -> usize {
         self.slots
             .iter()
             .map(|slot| slot.load(Ordering::Acquire))
@@ -60,13 +67,76 @@ impl ConnectionAggregate {
     }
 
     #[must_use]
-    pub(crate) fn permits_send(&self, frame_len: usize) -> bool {
-        self.buffered().saturating_add(frame_len) <= AGGREGATE_BUFFERED_HIGH
+    pub(crate) fn buffered(&self) -> usize {
+        self.published_buffered()
+            .saturating_add(self.authorized.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn try_authorize(self: &Arc<Self>, frame_len: usize) -> Option<AggregateSendPermit> {
+        self.try_extend_authorized(frame_len)
+            .then(|| AggregateSendPermit {
+                aggregate: Arc::clone(self),
+                frame_len,
+            })
+    }
+
+    fn try_extend_authorized(&self, frame_len: usize) -> bool {
+        // A sender publishes channel usage before it drops its permit. The
+        // transition can count bytes twice, but it cannot omit them.
+        let mut authorized = self.authorized.load(Ordering::Acquire);
+        loop {
+            if self
+                .published_buffered()
+                .saturating_add(authorized)
+                .saturating_add(frame_len)
+                > AGGREGATE_BUFFERED_HIGH
+            {
+                return false;
+            }
+            match self.authorized.compare_exchange_weak(
+                authorized,
+                authorized.saturating_add(frame_len),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(current) => authorized = current,
+            }
+        }
     }
 
     #[must_use]
     pub(crate) fn below_low_water(&self) -> bool {
         self.buffered() < AGGREGATE_BUFFERED_LOW
+    }
+}
+
+impl AggregateSendPermit {
+    pub(crate) fn try_resize(&mut self, frame_len: usize) -> bool {
+        if frame_len > self.frame_len {
+            if !self
+                .aggregate
+                .try_extend_authorized(frame_len - self.frame_len)
+            {
+                return false;
+            }
+        } else if frame_len < self.frame_len {
+            self.aggregate
+                .authorized
+                .fetch_sub(self.frame_len - frame_len, Ordering::AcqRel);
+        }
+        self.frame_len = frame_len;
+        true
+    }
+}
+
+impl Drop for AggregateSendPermit {
+    fn drop(&mut self) {
+        let previous = self
+            .aggregate
+            .authorized
+            .fetch_sub(self.frame_len, Ordering::AcqRel);
+        debug_assert!(previous >= self.frame_len);
     }
 }
 
@@ -155,9 +225,13 @@ impl ConnectionBudget {
         self.aggregate.buffered()
     }
 
-    #[must_use]
-    pub(crate) fn permits_send(&self, frame_len: usize) -> bool {
-        self.aggregate.permits_send(frame_len)
+    pub(crate) fn authorize_send(
+        &self,
+        label: &str,
+        frame_len: usize,
+    ) -> Option<AggregateSendPermit> {
+        self.channels.contains_key(label).then_some(())?;
+        self.aggregate.try_authorize(frame_len)
     }
 
     pub(crate) fn aggregate(&self) -> Arc<ConnectionAggregate> {
@@ -243,7 +317,7 @@ mod tests {
             budget.reserve("entity-31".into(), ChannelClass::Entity),
             Err(ChannelBudgetError::AggregateBuffered)
         ));
-        assert!(!budget.permits_send(65_536));
+        assert!(budget.authorize_send("entity-0", 65_536).is_none());
         assert_eq!(budget.aggregate_buffered(), AGGREGATE_BUFFERED_HIGH);
 
         assert!(budget.release("entity-30"));
@@ -258,5 +332,70 @@ mod tests {
         let _ = budget.release("replacement");
         assert_eq!(budget.aggregate_buffered(), 0);
         assert_eq!(usages[30].load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn concurrent_authorizations_cannot_both_claim_the_last_capacity() {
+        use std::sync::Barrier;
+        use std::sync::mpsc;
+        use std::thread;
+
+        let mut budget = ConnectionBudget::default();
+        let usage = budget
+            .reserve("entity".into(), ChannelClass::Entity)
+            .expect("entity");
+        usage.store(AGGREGATE_BUFFERED_HIGH - 100, Ordering::Release);
+        let aggregate = budget.aggregate();
+        let start = Arc::new(Barrier::new(3));
+        let finish = Arc::new(Barrier::new(3));
+        let (result_tx, result_rx) = mpsc::channel();
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let aggregate = Arc::clone(&aggregate);
+            let start = Arc::clone(&start);
+            let finish = Arc::clone(&finish);
+            let result_tx = result_tx.clone();
+            workers.push(thread::spawn(move || {
+                start.wait();
+                let permit = aggregate.try_authorize(100);
+                result_tx
+                    .send(permit.is_some())
+                    .expect("report authorization");
+                finish.wait();
+                drop(permit);
+            }));
+        }
+        start.wait();
+        let results = [
+            result_rx.recv().expect("first result"),
+            result_rx.recv().expect("second result"),
+        ];
+        assert_eq!(
+            results.into_iter().filter(|permitted| *permitted).count(),
+            1
+        );
+        assert_eq!(aggregate.buffered(), AGGREGATE_BUFFERED_HIGH);
+        finish.wait();
+        for worker in workers {
+            worker.join().expect("authorization worker");
+        }
+        assert_eq!(aggregate.buffered(), AGGREGATE_BUFFERED_HIGH - 100);
+    }
+
+    #[test]
+    fn authorization_stays_accounted_until_published_usage_replaces_it() {
+        let mut budget = ConnectionBudget::default();
+        let usage = budget
+            .reserve("entity".into(), ChannelClass::Entity)
+            .expect("entity");
+        let aggregate = budget.aggregate();
+        let mut permit = aggregate.try_authorize(100).expect("initial permit");
+        assert_eq!(aggregate.buffered(), 100);
+        assert!(permit.try_resize(140));
+        assert_eq!(aggregate.buffered(), 140);
+        usage.store(140, Ordering::Release);
+        assert_eq!(aggregate.buffered(), 280);
+        drop(permit);
+        assert_eq!(aggregate.buffered(), 140);
     }
 }

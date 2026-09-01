@@ -403,9 +403,13 @@ impl ClientEventMailbox {
         let mut inner = lock_mailbox(&self.inner).ok()?;
         let queued = inner.events.pop_front()?;
         inner.bytes = inner.bytes.saturating_sub(queued.size);
-        if let Some(pool) = self.connection_pool.as_ref()
-            && let Ok(mut residency) = pool.inner.try_lock()
-        {
+        if let Some(pool) = self.connection_pool.as_ref() {
+            // Ingress uses try_lock. Removal waits for that short critical
+            // section so mailbox and pool residency cannot diverge.
+            let mut residency = pool
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             residency.events = residency.events.saturating_sub(1);
             residency.bytes = residency.bytes.saturating_sub(queued.size);
             if let Some(subscription_id) = self.subscription_id.as_ref()
@@ -458,40 +462,45 @@ impl ClientEventMailbox {
     }
 
     fn drop_subscription(&self, subscription_id: &str) {
-        if let Ok(mut slots) = self.slots.try_lock() {
-            slots.remove(subscription_id);
-        }
-        if let Ok(mut inner) = lock_mailbox(&self.inner) {
-            let removed_events = inner
-                .events
-                .iter()
-                .filter(|queued| queued.subscription_id == subscription_id)
-                .count();
-            let removed_bytes = inner
-                .events
-                .iter()
-                .filter(|queued| queued.subscription_id == subscription_id)
-                .map(|queued| queued.size)
-                .sum::<usize>();
-            let mut bytes = inner.bytes;
-            inner.events.retain(|queued| {
-                if queued.subscription_id == subscription_id {
-                    bytes = bytes.saturating_sub(queued.size);
-                    false
-                } else {
-                    true
-                }
-            });
-            inner.bytes = bytes;
-            self.publish_age(&inner);
-            if let Some(pool) = self.connection_pool.as_ref()
-                && let Ok(mut residency) = pool.inner.try_lock()
-            {
-                residency.events = residency.events.saturating_sub(removed_events);
-                residency.bytes = residency.bytes.saturating_sub(removed_bytes);
-                if let Some(subscription_id) = self.subscription_id.as_ref() {
-                    residency.subscriptions.remove(subscription_id);
-                }
+        self.slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(subscription_id);
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let removed_events = inner
+            .events
+            .iter()
+            .filter(|queued| queued.subscription_id == subscription_id)
+            .count();
+        let removed_bytes = inner
+            .events
+            .iter()
+            .filter(|queued| queued.subscription_id == subscription_id)
+            .map(|queued| queued.size)
+            .sum::<usize>();
+        let mut bytes = inner.bytes;
+        inner.events.retain(|queued| {
+            if queued.subscription_id == subscription_id {
+                bytes = bytes.saturating_sub(queued.size);
+                false
+            } else {
+                true
+            }
+        });
+        inner.bytes = bytes;
+        self.publish_age(&inner);
+        if let Some(pool) = self.connection_pool.as_ref() {
+            let mut residency = pool
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            residency.events = residency.events.saturating_sub(removed_events);
+            residency.bytes = residency.bytes.saturating_sub(removed_bytes);
+            if let Some(subscription_id) = self.subscription_id.as_ref() {
+                residency.subscriptions.remove(subscription_id);
             }
         }
     }
@@ -757,7 +766,8 @@ impl ClientEventPlane {
             match router.try_cleanup_client_connection(connection_id) {
                 EventPlaneStatus::Accepted => {
                     if let Some(removed) = connections.remove(connection_id) {
-                        for mailbox in removed.mailboxes.values() {
+                        for (subscription_id, mailbox) in &removed.mailboxes {
+                            mailbox.drop_subscription(subscription_id);
                             mailbox.retire_from_registry();
                         }
                     }
@@ -883,6 +893,9 @@ mod tests {
     use crate::package_event_schema::CompiledEventSchema;
     use serde_json::json;
     use std::collections::BTreeSet;
+    use std::sync::Barrier;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     fn admitted_router(audience: EventAudience) -> PackageEventRouter {
         let router = PackageEventRouter::new(PackageEventPlanePolicy::default());
@@ -900,6 +913,171 @@ mod tests {
             }])
             .expect("register");
         router
+    }
+
+    fn run_while_pool_is_contended<R: Send + 'static>(
+        pool: &Arc<ConnectionEventPool>,
+        operation: impl FnOnce() -> R + Send + 'static,
+    ) -> R {
+        let guard = pool
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let start = Arc::new(Barrier::new(2));
+        let worker_start = Arc::clone(&start);
+        let (result_tx, result_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            worker_start.wait();
+            result_tx.send(operation()).expect("send result");
+        });
+        start.wait();
+        assert!(
+            matches!(
+                result_rx.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "exact residency update must wait for the contended pool"
+        );
+        drop(guard);
+        let result = result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("operation finishes after pool release");
+        worker.join().expect("contention worker");
+        result
+    }
+
+    fn assert_pool_empty(pool: &ConnectionEventPool, expected_subscriptions: usize) {
+        let residency = pool
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(residency.events, 0);
+        assert_eq!(residency.bytes, 0);
+        assert_eq!(residency.subscriptions.len(), expected_subscriptions);
+    }
+
+    #[test]
+    fn dequeue_waits_for_pool_contention_and_releases_exact_residency() {
+        let router = admitted_router(EventAudience::Clients);
+        let plane = ClientEventPlane::default();
+        let policy = PackageEventPlanePolicy::default();
+        plane
+            .try_subscribe(
+                "connection",
+                "sub",
+                "owner",
+                "ready",
+                Vec::new(),
+                policy,
+                &router,
+            )
+            .expect("subscribe");
+        let mailbox = plane
+            .subscription_mailbox("connection", "sub")
+            .expect("mailbox");
+        mailbox
+            .try_push("sub", "owner", "ready", json!({"value": 1}), 17)
+            .expect("push");
+        let pool = mailbox.connection_pool.as_ref().expect("pool").clone();
+        let event = run_while_pool_is_contended(&pool, move || mailbox.take_ready_event());
+        assert!(matches!(event, Some(DaemonEvent::PackageEvent { .. })));
+        assert_pool_empty(&pool, 1);
+    }
+
+    #[test]
+    fn expiry_waits_for_pool_contention_and_releases_exact_residency() {
+        let router = admitted_router(EventAudience::Clients);
+        let plane = ClientEventPlane::default();
+        let policy = PackageEventPlanePolicy {
+            queue_age: Duration::from_millis(1),
+            ..PackageEventPlanePolicy::default()
+        };
+        plane
+            .try_subscribe(
+                "connection",
+                "sub",
+                "owner",
+                "ready",
+                Vec::new(),
+                policy,
+                &router,
+            )
+            .expect("subscribe");
+        let mailbox = plane
+            .subscription_mailbox("connection", "sub")
+            .expect("mailbox");
+        mailbox
+            .try_push("sub", "owner", "ready", json!({"value": 1}), 19)
+            .expect("push");
+        std::thread::sleep(Duration::from_millis(3));
+        let pool = mailbox.connection_pool.as_ref().expect("pool").clone();
+        let event = run_while_pool_is_contended(&pool, move || mailbox.take_ready_event());
+        assert!(matches!(event, Some(DaemonEvent::EventGap { .. })));
+        assert_pool_empty(&pool, 1);
+    }
+
+    #[test]
+    fn unsubscribe_waits_for_pool_contention_and_releases_exact_residency() {
+        let router = Arc::new(admitted_router(EventAudience::Clients));
+        let plane = Arc::new(ClientEventPlane::default());
+        let policy = PackageEventPlanePolicy::default();
+        plane
+            .try_subscribe(
+                "connection",
+                "sub",
+                "owner",
+                "ready",
+                Vec::new(),
+                policy,
+                &router,
+            )
+            .expect("subscribe");
+        let mailbox = plane
+            .subscription_mailbox("connection", "sub")
+            .expect("mailbox");
+        mailbox
+            .try_push("sub", "owner", "ready", json!({"value": 1}), 23)
+            .expect("push");
+        let pool = mailbox.connection_pool.as_ref().expect("pool").clone();
+        let worker_plane = Arc::clone(&plane);
+        let worker_router = Arc::clone(&router);
+        run_while_pool_is_contended(&pool, move || {
+            worker_plane.try_unsubscribe("connection", "sub", &worker_router)
+        })
+        .expect("unsubscribe");
+        assert_pool_empty(&pool, 0);
+    }
+
+    #[test]
+    fn connection_cleanup_waits_for_pool_contention_and_releases_exact_residency() {
+        let router = Arc::new(admitted_router(EventAudience::Clients));
+        let plane = Arc::new(ClientEventPlane::default());
+        let policy = PackageEventPlanePolicy::default();
+        plane
+            .try_subscribe(
+                "connection",
+                "sub",
+                "owner",
+                "ready",
+                Vec::new(),
+                policy,
+                &router,
+            )
+            .expect("subscribe");
+        let mailbox = plane
+            .subscription_mailbox("connection", "sub")
+            .expect("mailbox");
+        mailbox
+            .try_push("sub", "owner", "ready", json!({"value": 1}), 29)
+            .expect("push");
+        let pool = mailbox.connection_pool.as_ref().expect("pool").clone();
+        let worker_plane = Arc::clone(&plane);
+        let worker_router = Arc::clone(&router);
+        run_while_pool_is_contended(&pool, move || {
+            worker_plane.cleanup_connection("connection", &worker_router);
+        });
+        assert_pool_empty(&pool, 0);
+        assert!(plane.mailbox("connection").is_none());
     }
 
     #[test]
