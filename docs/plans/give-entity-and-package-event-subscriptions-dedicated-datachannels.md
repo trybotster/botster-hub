@@ -217,6 +217,45 @@ exactly once on rejection rollback, timeout, close, replacement, and retirement.
 
 Five proof cases were named and are acceptance check 9 arms (a) through (e).
 
+### 5.6 `question_1788282560_533056` and `question_1788282830_333505`
+
+Plan Review `review_1788282697_267096` rejected revision 3's prose merge-order
+gate, and the human agreed: a required dependency must be formal, and Project
+Pipelines cannot enforce prose. Two binding answers follow.
+
+`question_1788282560_533056`, Option B: split the 0.1.43 package bump and
+downstream artifact proof into a separate `botster-hub` ticket, so this source
+ticket can merge before publication. The new ticket depends formally on
+`ticket_1788280618_295967`; the Web consumer depends formally on the new ticket;
+the new ticket uses the merged source commit, publishes only after explicit user
+approval, and proves a clean downstream install. Do not replace a required
+dependency with a prose gate.
+
+`question_1788282830_333505`, Option B1, after I showed that the literal wording
+was unsatisfiable. `./test.sh` runs
+`node packages/hub-test-support/scripts/sync-assets.mjs --check` as its first
+command. That script regenerates the package assets from the Rust crate and
+byte-compares them with the checked-in files. `crates/botster-hub-client/generated/daemon-protocol.ts`
+and `packages/hub-test-support/daemon-protocol.ts` are byte-identical today at
+sha256 `8940d99b2e1035b77a9ce94fae8597d246490e5d9673ab084cff8ff04749989a`, and
+`metadata.json` records that sha. So adding the DTO without regenerating the
+package artifact fails the official gate before any test runs, and "add the DTO"
+and "do not change the package artifact" cannot both hold.
+
+The binding answer: **this ticket adds the public DTO, regenerates
+`daemon-protocol.ts` and `metadata.json`, and bumps `package.json` to 0.1.43.
+This ticket publishes no npm package.** The release ticket verifies or
+regenerates the artifact from the exact merged source commit, confirms the README
+and `test.mjs` literals, publishes only after explicit user approval, and proves a
+clean downstream install. The human recorded that the earlier ban on a package
+version change was too strict, because the official source gate requires
+synchronized checked-in artifacts, and that the intended boundary is **no
+publication and no downstream package proof in this source ticket**.
+
+Web edge corrected as I proposed: `ticket_1787600684_892051` depends on the
+0.1.43 release ticket, while `ticket_1787600676_914408` needs only 0.1.42 and
+stays tied to `ticket_1788280618_295967`.
+
 ## 5.5 Plan Review response
 
 `review_1788281488_310273` returned `changes_required` with six findings. This
@@ -439,6 +478,15 @@ delivery.
 - Changing the label scheme, encryption derivation, or chunking of the shipped
   terminal subscription channel.
 - Rolling the Core pin. It stays at `e5a927c3`.
+- **Publishing any npm package.** This ticket publishes nothing.
+  `ticket_1788282899_502914` owns the 0.1.43 publish and
+  `ticket_1788280618_295967` owns the 0.1.42 publish.
+- **Downstream package proof.** The clean-install smoke, the registry integrity
+  comparison against a pack of the intended commit, and the published-metadata
+  assertions belong to `ticket_1788282899_502914`. The in-repository downstream
+  *source* proof, a TUI-shaped consumer through a local Cargo patch redirect,
+  stays here because it needs no published artifact.
+
 Artifact rows A26, A27, and A27b were previously listed here as non-scope. That
 was wrong and Plan Review rejected it (`finding_1788281488_909963`). This ticket
 puts the aggregate ceiling into the terminal write path, so it owns the terminal
@@ -535,27 +583,26 @@ Resolution, in order:
    `[[Hub test support capability cutovers use a new unpublished package version]]`
    a new capability takes a new version, and 0.1.42 additionally carries a pending
    publish coordinate that another ticket and a Web consumer depend on.
-2. The ordering is enforced as a **merge-order gate inside this ticket**, not as a
-   Project Pipelines dependency edge. This was tested rather than assumed: the
-   edge was registered as `dependency_1788281992_869734`, and
-   `request_step_advance` then returned
-   `{"ok": false, "reason": "ticket_dependencies", "status": "blocked"}` for the
-   Plan to Plan Review transition. A Project Pipelines dependency means "this
-   ticket cannot start a pipeline run until the dependency closes", which is a
-   start-order constraint. The real constraint here is a **merge-order** one: only
-   acceptance check 12(d), the package bump, needs the publish. Plan, Implement,
-   the section 9 budget, the channel work, and 16 of the 17 acceptance checks do
-   not. Registering the edge therefore stalled the entire ticket behind an
-   unrelated npm publish and delivered nothing. The edge was removed. The
-   constraint is instead binding here, in the plan:
+2. **Publication is split into its own ticket with formal dependency edges.**
+   Revision 3 used a prose merge-order gate here. Plan Review rejected it in
+   `review_1788282697_267096` because Project Pipelines cannot enforce prose, and
+   the human confirmed. The structure is now:
 
-   > **Merge-order gate.** Do not change any file under
-   > `packages/hub-test-support/` or bump `CONFORMANCE_FIXTURE_REVISION` until
-   > `ticket_1788280618_295967` has published 0.1.42 and the published artifact
-   > sha256 values have been compared against a pack of the intended commit. If
-   > this ticket is otherwise complete and 0.1.42 is still unpublished, Implement
-   > stops at that boundary and Verify records the package gate as blocked with
-   > the exact reason. Do not work around it by mutating 0.1.42.
+   | Ticket | Owns | Formal edge |
+   |--------|------|-------------|
+   | `ticket_1788280618_295967` | Publish `@trybotster/hub-test-support` 0.1.42 | none |
+   | `ticket_1788282899_502914` (created by this plan) | Verify or regenerate the 0.1.43 artifact from the merged source commit, confirm README and `test.mjs` literals, publish 0.1.43 after explicit user approval, prove a clean downstream install | `dependency_1788282904_402822`: depends on `ticket_1788280618_295967` |
+   | `ticket_1787600684_892051` (Web entity and event channels) | Consume the subscription reservation DTO | `dependency_1788282910_763299`: depends on `ticket_1788282899_502914` |
+   | **This ticket** | Hub source only, including the DTO and the regenerated in-repo package artifact. Publishes nothing | no edge, so the source can merge before publication |
+
+   Why this ticket still touches `packages/hub-test-support/`: the regeneration is
+   forced by the official gate, not chosen. `./test.sh` runs
+   `sync-assets.mjs --check` first, and it byte-compares the checked-in package
+   artifacts against assets regenerated from the Rust crate. A DTO change without
+   regeneration fails before any test runs. The human recorded that the earlier
+   ban on a package version change was too strict for exactly this reason, and
+   that the intended boundary is **no publication and no downstream package proof
+   in this source ticket**.
 3. Then bump to 0.1.43 with `CONFORMANCE_FIXTURE_REVISION` 48 and the
    `subscription_reservation` DTO.
 4. Per `[[closed dependency tickets signal merged source not a consumable release]]`,
@@ -660,11 +707,27 @@ Changed:
   remove `src/host_control_fair_write.rs`.
 - `crates/botster-hub-client/src/lib.rs` and `src/typescript.rs` -- the new DTO,
   `CONFORMANCE_FIXTURE_REVISION` 47 to 48.
-- `packages/hub-test-support/package.json` 0.1.42 to 0.1.43, only after
-  `ticket_1788280618_295967` publishes 0.1.42 (see section 8.1);
-  `packages/hub-test-support/README.md`, and every version, protocol, and revision
+- `packages/hub-test-support/daemon-protocol.ts` and
+  `packages/hub-test-support/metadata.json` -- regenerated, not hand-edited. The
+  official gate forces this: `sync-assets.mjs --check` byte-compares them against
+  assets regenerated from the Rust crate.
+- `packages/hub-test-support/package.json` 0.1.42 to 0.1.43.
+- `packages/hub-test-support/README.md` and every version, protocol, and revision
   literal in `packages/hub-test-support/test.mjs` (lines 135, 138, 178, 383, 421,
   and 738 today).
+  **Interpretation, flagged for Plan Review.** The human's answer assigns
+  "confirm README and `test.mjs` literals" to `ticket_1788282899_502914`. This
+  plan updates them *here* anyway, because `metadata.json` derives
+  `package_version` from `package.json`, so bumping the version without moving the
+  literals leaves `npm test` in `packages/hub-test-support` red in the repository
+  between the two tickets, and
+  `[[Hub test support version bumps must update the Node mirror test literals]]`
+  requires every bump to move them. Updating an in-repository test literal is
+  neither publication nor downstream package proof, so it sits inside the stated
+  boundary. `ticket_1788282899_502914` then *confirms* them against the merged
+  commit and repairs any drift, which is what its description says. If Plan Review
+  reads the boundary more strictly, say so and I will leave the literals to the
+  release ticket and record the red `npm test` window as a known state.
 - `crates/botster-hub-test-support/src/lib.rs` -- fixture updates.
 - `docs/client-protocol.md` -- the new response field.
 
@@ -706,10 +769,24 @@ Changed:
    check 17 proves the documented end state, and keeping
    `AGGREGATE_BUFFERED_LOW` reachable plus control outside the aggregate are the
    mitigations.
-9. **Package version ordering.** Bumping `hub-test-support` before
-   `ticket_1788280618_295967` publishes 0.1.42 would strand that coordinate and
-   keep the Web consumer blocked. Mitigation: the registered blocking dependency
-   and the section 8.1 step order.
+9. **Package version ordering.** This ticket sets `package.json` to 0.1.43 in the
+   repository while npm still publishes at most 0.1.41 and
+   `ticket_1788280618_295967` has yet to publish 0.1.42. That is intended: the
+   official gate forces the in-repository bump, and publication is ordered by
+   `dependency_1788282904_402822`. The residual hazard is that
+   `ticket_1788280618_295967` must publish 0.1.42 from a Hub commit **at or before
+   this ticket's merge**, since after the merge the tree carries 0.1.43. Its own
+   description already requires recording the exact published commit, so this is a
+   constraint on that ticket, and it is named here rather than left implicit. If
+   0.1.42 has not published by the time this merges, that ticket publishes from its
+   recorded earlier commit; it must not publish 0.1.42 from a tree that says
+   0.1.43.
+10. **A knowingly staged repository state.** Between this merge and the 0.1.43
+    publish, the repository declares a package version that npm does not carry.
+    `npm test` stays green because this ticket moves the literals with the bump,
+    but no external consumer can install 0.1.43 yet. `ticket_1787600684_892051` is
+    formally blocked on `ticket_1788282899_502914`, so no consumer can merge
+    against a coordinate that does not exist.
 
 ## 12. Runtime-teardown lens answers
 
@@ -915,15 +992,21 @@ Every check is a deterministic Rust gate. Wall-clock values are observations onl
     c. *Client cost measurement:* record both the TUI all-target cost and the Web
        exact-artifact cost per
        `[[a ui contract import line change costs one test line in each generic client]]`.
-    d. *Package gates, only after the section 8.1 dependency publishes 0.1.42:*
-       regenerate and assert the TypeScript, set `CONFORMANCE_FIXTURE_REVISION`
-       48, take `@trybotster/hub-test-support` 0.1.43 as a new unpublished
-       version, update every version, protocol, and revision literal in
-       `packages/hub-test-support/test.mjs`, then run `npm install --no-save` and
-       `npm test` in `packages/hub-test-support`.
-    e. *Clean-consumer smoke:* resolve the installed scoped package through its
-       exported root entrypoint, not `package.json`, per
-       `[[clean consumer smokes resolve exported root entrypoints not package json]]`.
+    d. *In-repository package synchronization, required by the official gate:*
+       regenerate `crates/botster-hub-client/generated/daemon-protocol.ts`,
+       `packages/hub-test-support/daemon-protocol.ts`, and
+       `packages/hub-test-support/metadata.json`; set
+       `CONFORMANCE_FIXTURE_REVISION` to 48; set
+       `packages/hub-test-support/package.json` to 0.1.43 as a new unpublished
+       version per
+       `[[Hub test support capability cutovers use a new unpublished package version]]`;
+       update the README and every `test.mjs` literal; then run
+       `npm install --no-save` and `npm test` in `packages/hub-test-support`.
+       Assert `node packages/hub-test-support/scripts/sync-assets.mjs --check`
+       passes, which is also the first command of `./test.sh`.
+    e. *Publication and clean-install proof are NOT in this ticket.* They belong
+       to `ticket_1788282899_502914`, which depends formally on
+       `ticket_1788280618_295967`. This ticket publishes nothing.
 13. **Live Hub proof.** Prove the contract through the exact Hub binary, recording
     the Hub SHA and its lockfile-pinned worker Core SHA separately, per
     `[[live hub proof records distinct hub and locked core binary provenance]]`.
