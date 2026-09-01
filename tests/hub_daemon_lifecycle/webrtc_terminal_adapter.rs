@@ -430,6 +430,7 @@ fn webrtc_terminal_adapter_second_data_channel_does_not_receive_terminal_frames(
             .await
             .expect("attach");
         bind_reserved_from_attach(&mut peer, &key, &attach, session_id, subscription_id).await;
+        peer.enable_host_events();
         let mut extra = peer
             .create_extra_data_channel()
             .await

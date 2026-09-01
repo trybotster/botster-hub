@@ -28,7 +28,7 @@ use botster_hub_client::{
     LOCAL_WEBRTC_MAX_DELIVERY_BYTES, PROTOCOL,
 };
 use serde_json::Value;
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -200,6 +200,12 @@ pub(crate) struct TestOfferPeer {
     pub(crate) data_channel_message_rx: AsyncReceiver<String>,
     pub(crate) accept_host_events: bool,
     pub(crate) pending_host_events: VecDeque<DaemonEvent>,
+    pub(crate) reserved_channels: HashMap<String, ReservedTestChannel>,
+}
+
+pub(crate) struct ReservedTestChannel {
+    pub(crate) channel: Arc<dyn DataChannel>,
+    pub(crate) message_rx: AsyncReceiver<String>,
 }
 
 impl TestOfferPeer {
@@ -276,6 +282,7 @@ impl TestOfferPeer {
                 data_channel_message_rx,
                 accept_host_events: false,
                 pending_host_events: VecDeque::new(),
+                reserved_channels: HashMap::new(),
             },
             serde_json::to_value(offer).expect("serialize offer"),
         )
@@ -541,6 +548,48 @@ impl TestOfferPeer {
         let plaintext = decrypt_aes_gcm(key, &envelope).expect("decrypt reserved hello ack");
         let _: DaemonHelloAck =
             serde_json::from_slice(&plaintext).expect("parse reserved hello ack");
+        self.reserved_channels.insert(
+            label.to_string(),
+            ReservedTestChannel {
+                channel,
+                message_rx,
+            },
+        );
+    }
+
+    pub(crate) async fn next_reserved_event(
+        &mut self,
+        key: &AesGcmKey,
+        label: &str,
+    ) -> DaemonEvent {
+        let reserved = self
+            .reserved_channels
+            .get_mut(label)
+            .expect("reserved channel remains open");
+        let mut encrypted = String::new();
+        let mut next_chunk_index = 0u32;
+        loop {
+            let response = timeout(
+                webrtc_runtime().as_ref(),
+                Duration::from_secs(10),
+                reserved.message_rx.recv(),
+            )
+            .await
+            .expect("reserved event timeout")
+            .expect("reserved channel remains open for event");
+            let chunk: DaemonLocalWebrtcDeliveryChunk =
+                serde_json::from_str(&response).expect("parse reserved event chunk");
+            assert_eq!(chunk.chunk_index, next_chunk_index);
+            encrypted.push_str(&chunk.payload);
+            next_chunk_index += 1;
+            if chunk.chunk_index + 1 == chunk.chunk_count {
+                break;
+            }
+        }
+        let envelope: AesGcmEnvelope =
+            serde_json::from_str(&encrypted).expect("parse reserved event envelope");
+        let plaintext = decrypt_aes_gcm(key, &envelope).expect("decrypt reserved event");
+        serde_json::from_slice(&plaintext).expect("parse reserved daemon event")
     }
 }
 
@@ -1136,6 +1185,115 @@ impl PeerHarness {
         peer.offer_peer = Some(offer_peer);
     }
 
+    pub(crate) fn wait_for_reserved_event(
+        &mut self,
+        peer: &mut LiveSignaledPeer,
+        label: &str,
+    ) -> DaemonEvent {
+        let key = peer.stream_key.clone();
+        let mut offer_peer = peer
+            .offer_peer
+            .take()
+            .expect("offer peer available for reserved event");
+        let reserved_label = label.to_string();
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let offer_handle = peer.offer_runtime.handle().clone();
+        let worker = thread::spawn(move || {
+            let event =
+                offer_handle.block_on(offer_peer.next_reserved_event(&key, &reserved_label));
+            event_tx
+                .send((offer_peer, event))
+                .expect("return reserved event");
+        });
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let (returned_peer, event) = loop {
+            if let Ok(result) = event_rx.try_recv() {
+                break result;
+            }
+            if Instant::now() >= deadline {
+                panic!("timed out waiting for reserved event");
+            }
+            match self.control_rx.try_recv() {
+                Ok(message) => {
+                    handle_control_message(
+                        &mut self.daemon,
+                        &mut self.state,
+                        &self.terminal_path,
+                        &self.transport_handle,
+                        self.control_tx.clone(),
+                        message,
+                    );
+                }
+                Err(tokio_mpsc::error::TryRecvError::Empty) => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(tokio_mpsc::error::TryRecvError::Disconnected) => {
+                    panic!("control channel closed while waiting for reserved event");
+                }
+            }
+        };
+        worker.join().expect("reserved event worker joins");
+        offer_peer = returned_peer;
+        peer.offer_peer = Some(offer_peer);
+        event
+    }
+
+    pub(crate) fn wait_until_reservation_bound(&mut self, grant_id: &str, label: &str) {
+        let peer_generation = match self
+            .state
+            .pending_runtime
+            .admission
+            .webrtc_admissions
+            .get(grant_id)
+        {
+            Some(WebrtcTerminalAdmission::Admitted {
+                peer_generation, ..
+            })
+            | Some(WebrtcTerminalAdmission::Rejected {
+                peer_generation, ..
+            }) => *peer_generation,
+            None => panic!("WebRTC admission must be live"),
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if self
+                .state
+                .pending_runtime
+                .admission
+                .reservations
+                .lookup_label(
+                    label,
+                    peer_generation,
+                    crate::admission::reservations::now_seconds(),
+                )
+                == crate::admission::reservations::ReservationLookup::Bound
+            {
+                return;
+            }
+            if Instant::now() >= deadline {
+                panic!("timed out waiting for reserved subscription bind");
+            }
+            match self.control_rx.try_recv() {
+                Ok(message) => {
+                    handle_control_message(
+                        &mut self.daemon,
+                        &mut self.state,
+                        &self.terminal_path,
+                        &self.transport_handle,
+                        self.control_tx.clone(),
+                        message,
+                    );
+                }
+                Err(tokio_mpsc::error::TryRecvError::Empty) => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(tokio_mpsc::error::TryRecvError::Disconnected) => {
+                    panic!("control channel closed while waiting for reservation bind");
+                }
+            }
+        }
+    }
+
     pub(crate) fn wait_until_adapter_bound(&mut self, session_id: &str, subscription_id: &str) {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -1177,6 +1335,13 @@ impl PeerHarness {
         peer: &mut LiveSignaledPeer,
         subscription_id: &str,
     ) -> DaemonResponse {
+        if !self
+            .state
+            .pending_runtime
+            .has_webrtc_admission_row(&peer.grant_id)
+        {
+            self.ensure_webrtc_adapter_hello(peer);
+        }
         self.request_on_peer(
             peer,
             DaemonRequest::SubscribeEntities {

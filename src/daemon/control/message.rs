@@ -7,6 +7,7 @@ use botster_hub_client::{DaemonHubUpdate, DaemonRequest, DaemonResponse};
 use tokio::net::UnixStream as TokioUnixStream;
 use tokio::sync::{OwnedSemaphorePermit, mpsc as tokio_mpsc, oneshot};
 
+use crate::admission::connection_budget::ChannelClass;
 use crate::admission::unix_hello::{UnixTerminalAdmission, WebrtcTerminalAdmission};
 use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
 use crate::subscription::entity::EntityFrameSender;
@@ -42,6 +43,7 @@ pub(crate) enum ControlMessage {
         entity_type: String,
         subscription_id: String,
         frame_tx: EntityFrameSender,
+        frame_rx: Option<tokio_mpsc::Receiver<botster_hub_client::DaemonEntityFrame>>,
         reply_tx: ControlReplySender,
         /// When set, admission requires a still-live local WebRTC peer for this grant.
         /// Socket-path subscriptions leave this `None`.
@@ -88,23 +90,49 @@ pub(crate) enum ControlMessage {
         admission: WebrtcTerminalAdmission,
         host_required_features: Vec<String>,
     },
-    InspectTerminalReservation {
+    InspectReservation {
         grant_id: String,
         label: String,
         reply_tx: oneshot::Sender<ReservationInspectReply>,
     },
-    BindReservedTerminal {
+    BindReservedSubscription {
         grant_id: String,
         label: String,
-        reply_tx: oneshot::Sender<
-            Result<crate::transport::webrtc::WebRtcTerminalAdapterHandle, BindReservedError>,
-        >,
+        reply_tx: oneshot::Sender<Result<BoundSubscription, BindReservedError>>,
+    },
+    RetireReservedSubscription {
+        grant_id: String,
+        label: String,
+    },
+    AuthorizeSubscriptionSend {
+        grant_id: String,
+        label: String,
+        frame_len: usize,
+        reply_tx: oneshot::Sender<bool>,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) enum BoundSubscription {
+    Terminal {
+        handle: crate::transport::webrtc::WebRtcTerminalAdapterHandle,
+        usage: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    },
+    Entity {
+        receiver: tokio_mpsc::Receiver<botster_hub_client::DaemonEntityFrame>,
+        usage: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    },
+    Event {
+        mailbox: std::sync::Arc<crate::subscription::package_events::ClientEventMailbox>,
+        usage: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReservationInspectReply {
     Unknown,
+    Stale,
+    OverLimit,
     Expired {
         session_id: String,
         subscription_id: String,
@@ -112,6 +140,7 @@ pub(crate) enum ReservationInspectReply {
     },
     Bound,
     Live {
+        class: ChannelClass,
         session_id: String,
         subscription_id: String,
         generation: u64,
@@ -121,6 +150,8 @@ pub(crate) enum ReservationInspectReply {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BindReservedError {
     Unknown,
+    Stale,
+    OverLimit,
     Expired,
     Bound,
     BindFailed,

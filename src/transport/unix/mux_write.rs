@@ -25,7 +25,7 @@ use crate::transport::unix::{UnixConnectionMux, UnixTerminalAdapterHandle};
 pub(crate) struct MuxWriteState {
     pending: Option<PendingMuxFrame>,
     queued_responses: VecDeque<PendingMuxFrame>,
-    last_host_class: Option<crate::host_control_fair_write::HostControlClass>,
+    last_host_class: Option<crate::transport::unix::host_write_order::HostControlClass>,
 }
 
 impl MuxWriteState {
@@ -157,7 +157,7 @@ pub(crate) async fn flush_unix_mux_writes(
     write_state: &mut MuxWriteState,
     event_mailbox: Option<&crate::subscription::package_events::ClientEventMailbox>,
 ) -> DaemonTransportResult<()> {
-    use crate::host_control_fair_write::{
+    use crate::transport::unix::host_write_order::{
         HostControlClass, MAX_HOST_FRAMES_PER_FLUSH_TURN, next_ready_host_control_class,
     };
 
@@ -176,12 +176,8 @@ pub(crate) async fn flush_unix_mux_writes(
                 || event_mailbox.is_some_and(
                     crate::subscription::package_events::ClientEventMailbox::has_ready_event,
                 ));
-        match next_ready_host_control_class(
-            write_state.last_host_class,
-            control_ready,
-            false,
-            event_ready,
-        ) {
+        match next_ready_host_control_class(write_state.last_host_class, control_ready, event_ready)
+        {
             Some(HostControlClass::Control) => {
                 let Some(frame) = write_state.queued_responses.pop_front() else {
                     break;
@@ -215,7 +211,7 @@ pub(crate) async fn flush_unix_mux_writes(
                     return Ok(());
                 }
             }
-            Some(HostControlClass::Entity) | None => break,
+            None => break,
         }
     }
     let more_host = !write_state.queued_responses.is_empty()
@@ -888,7 +884,7 @@ pub(crate) mod mux_write_resume_tests {
             .expect("bounded turn");
         let lines = parse_written_mux_lines(&writer.written);
         assert!(
-            lines.len() <= crate::host_control_fair_write::MAX_HOST_FRAMES_PER_FLUSH_TURN,
+            lines.len() <= crate::transport::unix::host_write_order::MAX_HOST_FRAMES_PER_FLUSH_TURN,
             "one flush turn must not drain the flood: {lines:?}"
         );
         assert!(

@@ -700,6 +700,7 @@ pub(crate) struct WebrtcBindRequest<'a> {
         Option<&'a botster_terminal_protocol::TerminalCompatibilityRequirement>,
     pub now_seconds: u64,
     pub mux: Option<&'a WebRtcConnectionMux>,
+    pub aggregate: Option<std::sync::Arc<crate::admission::connection_budget::ConnectionAggregate>>,
 }
 
 pub(crate) fn bind_webrtc_adapter_after_attaching(
@@ -745,7 +746,7 @@ pub(crate) fn bind_webrtc_adapter_after_attaching(
         }
     };
     let (adapter, handle) = match request.mux {
-        Some(mux) => mux.create_adapter(),
+        Some(mux) => mux.create_adapter_with_aggregate(request.aggregate.ok_or(())?),
         None => WebRtcTerminalAdapter::pair(),
     };
     if runtime

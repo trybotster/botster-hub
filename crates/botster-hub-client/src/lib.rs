@@ -31,7 +31,7 @@ mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 pub const PROTOCOL_VERSION: u16 = 8;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 47;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 48;
 /// Oldest conformance revision accepted by the default first-party client requirement.
 pub const DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 36;
 /// Version of the local WebRTC delivery chunk framing protocol.
@@ -1362,6 +1362,8 @@ pub struct DaemonResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_reservation: Option<DaemonTerminalReservation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_reservation: Option<DaemonSubscriptionReservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_snapshot: Option<DaemonCaptureSnapshot>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spawn_targets: Vec<DaemonSpawnTarget>,
@@ -1559,6 +1561,46 @@ pub struct DaemonTerminalReservation {
     pub label: String,
     /// Whole seconds the peer has to open the labeled channel.
     pub expires_in_seconds: u32,
+}
+
+/// Hub-reserved DataChannel label for one entity or package-event subscription.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct DaemonSubscriptionReservation {
+    pub kind: DaemonSubscriptionReservationKind,
+    pub subscription_id: String,
+    pub generation: u64,
+    pub peer_generation: u64,
+    pub label: String,
+    pub expires_in_seconds: u32,
+}
+
+impl DaemonSubscriptionReservation {
+    #[must_use]
+    pub fn new(
+        kind: DaemonSubscriptionReservationKind,
+        subscription_id: impl Into<String>,
+        generation: u64,
+        peer_generation: u64,
+        label: impl Into<String>,
+        expires_in_seconds: u32,
+    ) -> Self {
+        Self {
+            kind,
+            subscription_id: subscription_id.into(),
+            generation,
+            peer_generation,
+            label: label.into(),
+            expires_in_seconds,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonSubscriptionReservationKind {
+    Entity,
+    PackageEvent,
 }
 
 impl DaemonTerminalReservation {
@@ -4276,7 +4318,7 @@ mod tests {
     #[test]
     fn protocol_eight_rejects_protocol_seven_and_accepts_conformance_floor_thirty_six() {
         assert_eq!(PROTOCOL_VERSION, 8);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 47);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 48);
 
         let protocol_seven = DaemonCompatibilityRequirement {
             protocol_version: 7,
@@ -4296,7 +4338,7 @@ mod tests {
             &protocol_eight_floor_thirty_six,
             &DaemonCompatibility::current(),
         )
-        .expect("protocol-8 client with conformance floor 36 accepts hub revision 47");
+        .expect("protocol-8 client with conformance floor 36 accepts hub revision 48");
     }
 
     #[test]
@@ -4710,6 +4752,48 @@ mod tests {
     }
 
     #[test]
+    fn subscription_reservation_is_optional_round_trips_and_is_forward_readable() {
+        let response = DaemonResponse {
+            kind: DaemonResponseKind::EntitySubscribed,
+            subscription_reservation: Some(DaemonSubscriptionReservation::new(
+                DaemonSubscriptionReservationKind::Entity,
+                "entities",
+                7,
+                3,
+                "r-subscription",
+                30,
+            )),
+            ..daemon_response_example(DaemonResponseKind::EntitySubscribed)
+        };
+        let value = serde_json::to_value(&response).expect("reservation serializes");
+        assert_eq!(value["subscription_reservation"]["kind"], "entity");
+        let round_trip: DaemonResponse =
+            serde_json::from_value(value.clone()).expect("reservation round trips");
+        assert_eq!(round_trip, response);
+
+        let omitted = serde_json::to_value(daemon_response_example(
+            DaemonResponseKind::EntitySubscribed,
+        ))
+        .expect("response serializes");
+        assert!(omitted.get("subscription_reservation").is_none());
+
+        #[derive(Deserialize)]
+        struct PreviousResponse {
+            kind: DaemonResponseKind,
+        }
+        let previous: PreviousResponse =
+            serde_json::from_value(value).expect("older reader ignores additive field");
+        assert_eq!(previous.kind, DaemonResponseKind::EntitySubscribed);
+
+        let generated = daemon_protocol_typescript();
+        assert!(
+            generated.contains("subscription_reservation?: DaemonSubscriptionReservation | null;")
+        );
+        assert!(generated.contains("export interface DaemonSubscriptionReservation"));
+        assert!(generated.contains("export type DaemonSubscriptionReservationKind ="));
+    }
+
+    #[test]
     fn plugin_worker_counters_are_optional_sanitized_and_generated() {
         let response = DaemonResponse {
             plugin_worker_counters: None,
@@ -4887,7 +4971,7 @@ mod tests {
         assert!(generated.contains("export type DaemonQueueAgeState ="));
         assert!(generated.contains("| (string & {});"));
         assert_eq!(PROTOCOL_VERSION, 8);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 47);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 48);
         assert_eq!(DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION, 36);
     }
 
@@ -6358,6 +6442,7 @@ mod tests {
                 "r-example",
                 30,
             )),
+            subscription_reservation: None,
             capture_snapshot: Some(DaemonCaptureSnapshot {
                 session_id: "session".to_string(),
                 rows: 24,
@@ -6926,7 +7011,7 @@ mod tests {
     #[test]
     fn protocol_six_and_conformance_thirty_two_define_the_cold_cut_boundary() {
         assert_eq!(PROTOCOL_VERSION, 8);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 47);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 48);
 
         let requirement = DaemonCompatibilityRequirement::current();
         let protocol_error = ensure_compatible(
@@ -6991,7 +7076,7 @@ mod tests {
         // conformance revision: bumping the protocol would break every existing
         // first-party client that never issues this request.
         assert_eq!(PROTOCOL_VERSION, 8);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 47);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 48);
         assert_eq!(DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION, 36);
         assert_eq!(
             current_feature_list(),

@@ -456,8 +456,10 @@ const CONTROL_MESSAGE_OWNERS: &[(&str, &[&str])] = &[
             "RejectedConnection",
             "RegisterUnixAdmission",
             "RegisterWebrtcAdmission",
-            "InspectTerminalReservation",
-            "BindReservedTerminal",
+            "InspectReservation",
+            "BindReservedSubscription",
+            "RetireReservedSubscription",
+            "AuthorizeSubscriptionSend",
         ],
     ),
     (

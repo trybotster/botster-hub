@@ -869,7 +869,26 @@ impl LocalWebrtcOfferPeer {
             let (delivery_kind, plaintext, metrics) = self.receive_delivery(key).await?;
             match delivery_kind {
                 botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonResponse => {
-                    return Ok((serde_json::from_slice(&plaintext)?, metrics));
+                    let response: botster_hub_client::DaemonResponse =
+                        serde_json::from_slice(&plaintext)?;
+                    if let Some(reservation) = response.subscription_reservation.as_ref() {
+                        let compatibility = match reservation.kind {
+                            botster_hub_client::DaemonSubscriptionReservationKind::Entity => {
+                                botster_hub_client::DaemonCompatibilityRequirement::for_webrtc_terminal_adapter()
+                            }
+                            botster_hub_client::DaemonSubscriptionReservationKind::PackageEvent => {
+                                botster_hub_client::DaemonCompatibilityRequirement::for_package_event_subscriptions()
+                            }
+                        };
+                        let hello = botster_hub_client::DaemonHello {
+                            protocol: botster_hub_client::PROTOCOL.to_string(),
+                            compatibility,
+                            terminal_compatibility: None,
+                        };
+                        self.open_reserved_subscription(key, &reservation.label, &hello)
+                            .await?;
+                    }
+                    return Ok((response, metrics));
                 }
                 botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonEntityFrame => {
                     self.pending_entity_frames
@@ -895,7 +914,11 @@ impl LocalWebrtcOfferPeer {
             return Ok(frame);
         }
         loop {
-            let (delivery_kind, plaintext, _) = self.receive_delivery(key).await?;
+            let (delivery_kind, plaintext, _) = if self.subscription_inbounds.is_empty() {
+                self.receive_delivery(key).await?
+            } else {
+                self.receive_subscription_delivery(key).await?
+            };
             match delivery_kind {
                 botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonEntityFrame => {
                     return Ok(serde_json::from_slice(&plaintext)?);
@@ -928,14 +951,23 @@ impl LocalWebrtcOfferPeer {
         self.data_channel
             .send_text(&serde_json::to_string(&envelope)?)
             .await?;
-        let (delivery_kind, plaintext, _) = self.receive_delivery(key).await?;
-        if delivery_kind != botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonResponse {
-            return Err(std::io::Error::other(format!(
-                "hello ack used unexpected delivery kind {delivery_kind:?}"
-            ))
-            .into());
+        loop {
+            let (delivery_kind, plaintext, _) = self.receive_delivery(key).await?;
+            match delivery_kind {
+                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonResponse => {
+                    return Ok(serde_json::from_slice(&plaintext)?);
+                }
+                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonEvent => {
+                    self.park_or_reject_host_event(&plaintext)?;
+                }
+                _ => {
+                    return Err(std::io::Error::other(format!(
+                        "hello ack used unexpected delivery kind {delivery_kind:?}"
+                    ))
+                    .into());
+                }
+            }
         }
-        Ok(serde_json::from_slice(&plaintext)?)
     }
 
     pub(crate) async fn next_terminal_frame(
@@ -1045,7 +1077,11 @@ impl LocalWebrtcOfferPeer {
             return Ok(event);
         }
         loop {
-            let (delivery_kind, plaintext, _) = self.receive_delivery(key).await?;
+            let (delivery_kind, plaintext, _) = if self.subscription_inbounds.is_empty() {
+                self.receive_delivery(key).await?
+            } else {
+                self.receive_subscription_delivery(key).await?
+            };
             match delivery_kind {
                 botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonEvent => {
                     return Ok(serde_json::from_slice(&plaintext)?);
@@ -1146,6 +1182,15 @@ impl LocalWebrtcOfferPeer {
         label: &str,
         hello: &botster_hub_client::DaemonHello,
     ) -> Result<Arc<dyn DataChannel>, Box<dyn std::error::Error>> {
+        self.open_reserved_subscription(key, label, hello).await
+    }
+
+    pub(crate) async fn open_reserved_subscription(
+        &mut self,
+        key: &AesGcmKey,
+        label: &str,
+        hello: &botster_hub_client::DaemonHello,
+    ) -> Result<Arc<dyn DataChannel>, Box<dyn std::error::Error>> {
         let extra = self.create_labeled_data_channel(label).await?;
         let channel = extra.data_channel.clone();
         let plaintext = serde_json::to_vec(hello)?;
@@ -1165,6 +1210,20 @@ impl LocalWebrtcOfferPeer {
         self.subscription_channels.push(Arc::clone(&channel));
         self.subscription_inbounds.push(extra.inbound);
         Ok(channel)
+    }
+
+    pub(crate) async fn bind_subscription_reservation(
+        &mut self,
+        key: &AesGcmKey,
+        response: &botster_hub_client::DaemonResponse,
+        hello: &botster_hub_client::DaemonHello,
+    ) -> Result<Arc<dyn DataChannel>, Box<dyn std::error::Error>> {
+        let label = &response
+            .subscription_reservation
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("response has no subscription reservation"))?
+            .label;
+        self.open_reserved_subscription(key, label, hello).await
     }
 
     pub(crate) async fn send_reserved_terminal_frame(
@@ -1194,15 +1253,21 @@ impl LocalWebrtcOfferPeer {
             return Err(std::io::Error::other("no reserved subscription channel").into());
         }
         loop {
-            for inbound in &mut self.subscription_inbounds {
-                if let Ok(delivery) = timeout(
+            let mut index = 0;
+            while index < self.subscription_inbounds.len() {
+                match timeout(
                     webrtc_runtime().as_ref(),
                     Duration::from_millis(50),
-                    inbound.receive_delivery(key),
+                    self.subscription_inbounds[index].receive_delivery(key),
                 )
                 .await
                 {
-                    return delivery;
+                    Ok(Ok(delivery)) => return Ok(delivery),
+                    Ok(Err(_)) => {
+                        self.subscription_channels.remove(index);
+                        self.subscription_inbounds.remove(index);
+                    }
+                    Err(_) => index += 1,
                 }
             }
             if let Ok(delivery) = timeout(

@@ -13,14 +13,13 @@ use async_trait::async_trait;
 use botster_core::AesGcmKey;
 use botster_hub_client::DaemonRequest;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc as tokio_mpsc, watch};
+use tokio::sync::watch;
 use webrtc::data_channel::DataChannel;
 use webrtc::peer_connection::{
     PeerConnection, PeerConnectionEventHandler, RTCIceGatheringState, RTCPeerConnectionState,
 };
 use webrtc::runtime::{Runtime, Sender as AsyncSender, default_runtime};
 
-use crate::admission::budgets::ENTITY_SUBSCRIPTION_QUEUE_CAPACITY;
 use crate::daemon::control::message::{ControlMessage, ControlSender};
 use crate::transport::webrtc::adapter::WebRtcConnectionMux;
 use crate::transport::webrtc::control_channel::{
@@ -427,7 +426,6 @@ impl LocalWebrtcTransport {
 pub(crate) struct LocalWebrtcPeerState {
     pub(crate) grant_id: String,
     pub(crate) runtime_tx: ControlSender,
-    pub(crate) event_plane: Arc<crate::subscription::package_events::ClientEventPlane>,
     pub(crate) attached_subscriptions: Mutex<Vec<LocalWebrtcAttachedSubscription>>,
     pub(crate) entity_subscription_ids: Mutex<BTreeSet<String>>,
     pub(crate) terminal_state: Mutex<LocalWebrtcTerminalState>,
@@ -549,13 +547,12 @@ impl LocalWebrtcPeerState {
     pub(crate) fn new_with_event_plane(
         grant_id: String,
         runtime_tx: ControlSender,
-        event_plane: Arc<crate::subscription::package_events::ClientEventPlane>,
+        _event_plane: Arc<crate::subscription::package_events::ClientEventPlane>,
     ) -> Self {
         let (peer_terminal_tx, _peer_terminal_rx) = watch::channel(None);
         Self {
             grant_id,
             runtime_tx,
-            event_plane,
             attached_subscriptions: Mutex::new(Vec::new()),
             entity_subscription_ids: Mutex::new(BTreeSet::new()),
             terminal_state: Mutex::new(LocalWebrtcTerminalState::default()),
@@ -615,13 +612,6 @@ impl LocalWebrtcPeerState {
         self.data_channel_claimed
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
-    }
-
-    pub(crate) fn owns_entity_subscription(&self, subscription_id: &str) -> bool {
-        self.entity_subscription_ids
-            .lock()
-            .expect("local WebRTC entity subscription mutex")
-            .contains(subscription_id)
     }
 
     pub(crate) fn begin_request(&self, request: &DaemonRequest) {
@@ -835,8 +825,6 @@ impl PeerConnectionEventHandler for LocalWebrtcHandler {
         let peer_state = self.peer_state.clone();
         let runtime_tx = peer_state.runtime_tx.clone();
         let stream_key = self.stream_key.clone();
-        let (entity_frame_tx, entity_frame_rx) =
-            tokio_mpsc::channel(ENTITY_SUBSCRIPTION_QUEUE_CAPACITY);
         self.runtime.spawn(Box::pin(async move {
             if let Err(error) = data_channel
                 .local_set_buffered_amount_low_threshold(LOCAL_WEBRTC_BUFFERED_AMOUNT_LOW)
@@ -866,8 +854,6 @@ impl PeerConnectionEventHandler for LocalWebrtcHandler {
                 &stream_key,
                 peer_state.as_ref(),
                 &runtime_tx,
-                entity_frame_tx,
-                entity_frame_rx,
             )
             .await;
         }));
@@ -880,7 +866,7 @@ mod tests {
     use crate::admission::budgets::ENTITY_SUBSCRIPTION_QUEUE_CAPACITY;
     use crate::admission::unix_hello::WebrtcTerminalAdmission;
     use crate::daemon::control::handle_control_message;
-    use crate::daemon::control::message::{ControlMessage, ControlSender};
+    use crate::daemon::control::message::{ControlMessage, ControlSender, ReservationInspectReply};
     use crate::daemon::owner_loop::DaemonControlState;
     use crate::subscription::attach_routes::negotiated_unix_capability_set;
     use crate::subscription::entity::EntityFrameSender;
@@ -999,8 +985,6 @@ mod tests {
         peer_state
             .force_local_close_hang
             .store(true, Ordering::SeqCst);
-        let (entity_frame_tx, entity_frame_rx) =
-            tokio_mpsc::channel(ENTITY_SUBSCRIPTION_QUEUE_CAPACITY);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1011,8 +995,6 @@ mod tests {
             &key,
             peer_state.as_ref(),
             &runtime_tx,
-            entity_frame_tx,
-            entity_frame_rx,
         ));
         let elapsed = started.elapsed();
         assert!(failure.is_none());
@@ -1241,6 +1223,214 @@ mod tests {
     }
 
     #[test]
+    fn webrtc_entity_subscription_returns_and_binds_a_dedicated_channel() {
+        let _teardown_guard = teardown_test_lock();
+        let mut harness = PeerHarness::new("entity-dedicated");
+        let mut peer = harness.signal_peer("http://127.0.0.1:41903");
+        harness.ensure_webrtc_adapter_hello(&mut peer);
+
+        let subscribed = harness.subscribe_entities(&mut peer, "entity-dedicated-sub");
+        assert_eq!(
+            subscribed.kind,
+            botster_hub_client::DaemonResponseKind::EntitySubscribed
+        );
+        let reservation = subscribed
+            .subscription_reservation
+            .expect("entity subscribe returns a reserved channel");
+        assert_eq!(
+            reservation.kind,
+            botster_hub_client::DaemonSubscriptionReservationKind::Entity
+        );
+        assert!(!reservation.label.is_empty());
+        assert!(reservation.generation > 0);
+        assert_eq!(
+            harness
+                .state
+                .pending_runtime
+                .admission
+                .connection_budgets
+                .get(&reservation.peer_generation)
+                .expect("peer budget")
+                .channel_count(),
+            2
+        );
+
+        harness.bind_reserved_on_peer(&mut peer, &reservation.label);
+        harness.wait_until_reservation_bound(&peer.grant_id, &reservation.label);
+        assert!(
+            harness
+                .state
+                .entity_subscriptions
+                .contains_key("entity-dedicated-sub")
+        );
+
+        let unsubscribed = harness.request_on_peer(
+            &mut peer,
+            DaemonRequest::UnsubscribeEntities {
+                subscription_id: "entity-dedicated-sub".to_string(),
+            },
+            "UnsubscribeEntities",
+        );
+        assert_eq!(
+            unsubscribed.kind,
+            botster_hub_client::DaemonResponseKind::EntityUnsubscribed
+        );
+        assert!(
+            !harness
+                .state
+                .entity_subscriptions
+                .contains_key("entity-dedicated-sub")
+        );
+        assert!(
+            harness
+                .state
+                .pending_runtime
+                .admission
+                .reservations
+                .reservation_for_label(&reservation.label, reservation.peer_generation)
+                .is_none()
+        );
+        assert_eq!(
+            harness
+                .state
+                .pending_runtime
+                .admission
+                .connection_budgets
+                .get(&reservation.peer_generation)
+                .expect("peer budget remains for control")
+                .channel_count(),
+            1
+        );
+
+        peer.close_offer();
+        harness.cleanup();
+    }
+
+    #[test]
+    fn reservation_rejection_states_and_timeout_release_are_distinct() {
+        let _teardown_guard = teardown_test_lock();
+        let previous_expiry = std::env::var("BOTSTER_HUB_TEST_RESERVATION_EXPIRES_IN_SECONDS").ok();
+        let previous_botster_env = std::env::var("BOTSTER_ENV").ok();
+        unsafe {
+            std::env::set_var("BOTSTER_ENV", "test");
+            std::env::set_var("BOTSTER_HUB_TEST_RESERVATION_EXPIRES_IN_SECONDS", "1");
+        }
+        let mut harness = PeerHarness::new("reservation-matrix");
+        let mut peer_a = harness.signal_peer("http://127.0.0.1:41904");
+        let mut peer_b = harness.signal_peer("http://127.0.0.1:41905");
+        harness.ensure_webrtc_adapter_hello(&mut peer_a);
+        harness.ensure_webrtc_adapter_hello(&mut peer_b);
+
+        let inspect = |harness: &mut PeerHarness, grant_id: &str, label: &str| {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            handle_control_message(
+                &mut harness.daemon,
+                &mut harness.state,
+                &harness.terminal_path,
+                &harness.transport_handle,
+                harness.control_tx.clone(),
+                ControlMessage::InspectReservation {
+                    grant_id: grant_id.to_string(),
+                    label: label.to_string(),
+                    reply_tx,
+                },
+            );
+            reply_rx.blocking_recv().expect("reservation inspection")
+        };
+
+        let live = harness.subscribe_entities(&mut peer_a, "matrix-live");
+        let live_reservation = live.subscription_reservation.expect("live reservation");
+        assert!(matches!(
+            inspect(&mut harness, &peer_a.grant_id, &live_reservation.label),
+            ReservationInspectReply::Live { .. }
+        ));
+        assert_eq!(
+            inspect(&mut harness, &peer_b.grant_id, &live_reservation.label),
+            ReservationInspectReply::Stale
+        );
+        assert_eq!(
+            inspect(&mut harness, &peer_a.grant_id, "never-reserved"),
+            ReservationInspectReply::Unknown
+        );
+
+        harness.bind_reserved_on_peer(&mut peer_a, &live_reservation.label);
+        harness.wait_until_reservation_bound(&peer_a.grant_id, &live_reservation.label);
+        assert_eq!(
+            inspect(&mut harness, &peer_a.grant_id, &live_reservation.label),
+            ReservationInspectReply::Bound
+        );
+
+        let over_limit = harness.subscribe_entities(&mut peer_a, "matrix-over-limit");
+        let over_limit_reservation = over_limit
+            .subscription_reservation
+            .expect("over-limit backstop reservation");
+        harness
+            .state
+            .pending_runtime
+            .admission
+            .connection_budgets
+            .get_mut(&over_limit_reservation.peer_generation)
+            .expect("peer budget")
+            .release(&over_limit_reservation.label);
+        assert_eq!(
+            inspect(
+                &mut harness,
+                &peer_a.grant_id,
+                &over_limit_reservation.label,
+            ),
+            ReservationInspectReply::OverLimit
+        );
+        assert!(
+            !harness
+                .state
+                .entity_subscriptions
+                .contains_key("matrix-over-limit")
+        );
+
+        let late = harness.subscribe_entities(&mut peer_a, "matrix-late");
+        let late_reservation = late.subscription_reservation.expect("late reservation");
+        std::thread::sleep(Duration::from_millis(1_100));
+        assert!(matches!(
+            inspect(&mut harness, &peer_a.grant_id, &late_reservation.label),
+            ReservationInspectReply::Expired { .. }
+        ));
+        assert!(
+            !harness
+                .state
+                .entity_subscriptions
+                .contains_key("matrix-late")
+        );
+        assert_eq!(
+            harness
+                .state
+                .pending_runtime
+                .admission
+                .connection_budgets
+                .get(&late_reservation.peer_generation)
+                .expect("peer budget")
+                .channel_count(),
+            2,
+            "control and the bound live route remain after timeout cleanup"
+        );
+
+        unsafe {
+            match previous_botster_env {
+                Some(value) => std::env::set_var("BOTSTER_ENV", value),
+                None => std::env::remove_var("BOTSTER_ENV"),
+            }
+            match previous_expiry {
+                Some(value) => {
+                    std::env::set_var("BOTSTER_HUB_TEST_RESERVATION_EXPIRES_IN_SECONDS", value)
+                }
+                None => std::env::remove_var("BOTSTER_HUB_TEST_RESERVATION_EXPIRES_IN_SECONDS"),
+            }
+        }
+        peer_a.close_offer();
+        peer_b.close_offer();
+        harness.cleanup();
+    }
+
+    #[test]
     fn webrtc_negotiated_peer_receives_package_event_and_gap_without_later_traffic() {
         let _teardown_guard = teardown_test_lock();
         let mut harness = PeerHarness::new_with_event_queue("evt-live", Some(1));
@@ -1278,6 +1468,15 @@ mod tests {
             subscribed.kind,
             botster_hub_client::DaemonResponseKind::EventSubscribed
         );
+        let reservation = subscribed
+            .subscription_reservation
+            .as_ref()
+            .expect("event subscribe returns a reserved channel");
+        assert_eq!(
+            reservation.kind,
+            botster_hub_client::DaemonSubscriptionReservationKind::PackageEvent
+        );
+        assert!(!reservation.label.is_empty());
         assert!(
             !harness
                 .state
@@ -1309,7 +1508,10 @@ mod tests {
             }
         }
         assert!(saw_full, "one-event mailbox must shed and set a gap bit");
-        let first = harness.wait_for_host_event(&mut peer, "event-gap");
+        let reservation_label = reservation.label.clone();
+        harness.bind_reserved_on_peer(&mut peer, &reservation_label);
+        harness.wait_until_reservation_bound(&peer.grant_id, &reservation_label);
+        let first = harness.wait_for_reserved_event(&mut peer, &reservation_label);
         match first {
             DaemonEvent::EventGap {
                 subscription_id,
@@ -1322,7 +1524,7 @@ mod tests {
             }
             other => panic!("full mailbox must emit EventGap first: {other:?}"),
         }
-        let queued = harness.wait_for_host_event(&mut peer, "queued-package-event");
+        let queued = harness.wait_for_reserved_event(&mut peer, &reservation_label);
         match queued {
             DaemonEvent::PackageEvent {
                 subscription_id, ..
@@ -1332,7 +1534,7 @@ mod tests {
             other => panic!("queued event remains after gap: {other:?}"),
         }
         harness.emit_sample_ready("after-drain");
-        let live = harness.wait_for_host_event(&mut peer, "live-package-event");
+        let live = harness.wait_for_reserved_event(&mut peer, &reservation_label);
         match live {
             DaemonEvent::PackageEvent {
                 subscription_id,
@@ -1392,6 +1594,14 @@ mod tests {
             subscribed.kind,
             botster_hub_client::DaemonResponseKind::EventSubscribed
         );
+        let reservation_label = subscribed
+            .subscription_reservation
+            .as_ref()
+            .expect("event subscribe returns a reserved channel")
+            .label
+            .clone();
+        harness.bind_reserved_on_peer(&mut peer, &reservation_label);
+        harness.wait_until_reservation_bound(&peer.grant_id, &reservation_label);
         let mailbox = harness
             .daemon
             .local_webrtc()
@@ -1399,15 +1609,25 @@ mod tests {
             .mailbox(&peer.grant_id)
             .expect("subscribed connection has a mailbox");
         for index in 0..8 {
-            mailbox
-                .try_push(
+            'admit: for attempt in 0..1_000 {
+                match mailbox.try_push(
                     "sub-flood",
                     "event-plane-producer",
                     "sample.ready",
                     serde_json::json!({ "ok": true, "token": format!("flood-{index}") }),
                     8,
-                )
-                .expect("admit flood event");
+                ) {
+                    Ok(()) => break 'admit,
+                    Err(crate::package_event_router::EventPlaneStatus::ShedBusy) => {
+                        assert!(
+                            attempt < 999,
+                            "mailbox stayed busy while admitting flood event"
+                        );
+                        std::thread::yield_now();
+                    }
+                    Err(status) => panic!("admit flood event: {status:?}"),
+                }
+            }
         }
         let status = harness.request_on_peer(&mut peer, DaemonRequest::Status, "Status");
         assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
@@ -1565,6 +1785,7 @@ mod tests {
                 entity_type: "session".to_string(),
                 subscription_id: subscription_id.clone(),
                 frame_tx: EntityFrameSender::Async(frame_tx),
+                frame_rx: None,
                 reply_tx,
                 grant_id: Some(grant_id.clone()),
             },
@@ -1949,12 +2170,13 @@ mod tests {
         let mut harness = PeerHarness::new("stale-snapshot");
         let origin = "http://127.0.0.1:41797";
         let mut peer_a = harness.signal_peer(origin);
-        let peer_b = harness.signal_peer(origin);
+        let mut peer_b = harness.signal_peer(origin);
         let grant_a = peer_a.grant_id.clone();
         let grant_b = peer_b.grant_id.clone();
         let subscription_id = "reused-entity-id".to_string();
 
         let _ = harness.subscribe_entities(&mut peer_a, &subscription_id);
+        harness.ensure_webrtc_adapter_hello(&mut peer_b);
         assert_eq!(
             harness
                 .state
@@ -1989,6 +2211,7 @@ mod tests {
                 entity_type: "session".to_string(),
                 subscription_id: subscription_id.clone(),
                 frame_tx: EntityFrameSender::Async(frame_tx),
+                frame_rx: None,
                 reply_tx,
                 grant_id: Some(grant_b.clone()),
             },
@@ -2085,6 +2308,7 @@ mod tests {
                 entity_type: "session".to_string(),
                 subscription_id: subscription_id.clone(),
                 frame_tx: EntityFrameSender::Async(frame_tx),
+                frame_rx: None,
                 reply_tx,
                 grant_id: Some(grant_id.clone()),
             },
@@ -2314,6 +2538,7 @@ mod tests {
                 entity_type: "session".to_string(),
                 subscription_id: subscription_id.clone(),
                 frame_tx: EntityFrameSender::Async(frame_tx_a),
+                frame_rx: None,
                 reply_tx,
                 grant_id: Some(grant_a.clone()),
             },
@@ -2350,6 +2575,7 @@ mod tests {
                 entity_type: "session".to_string(),
                 subscription_id: subscription_id.clone(),
                 frame_tx: EntityFrameSender::Async(frame_tx_b),
+                frame_rx: None,
                 reply_tx,
                 grant_id: Some(grant_b.clone()),
             },
@@ -3182,6 +3408,8 @@ mod tests {
                 admission: WebrtcTerminalAdmission::Rejected {
                     code: "test_admission_row",
                     diagnostic: DaemonDiagnostic::connected("hello"),
+                    mux: WebRtcConnectionMux::new(),
+                    peer_generation: 0,
                 },
                 host_required_features: vec!["host-feature".to_string()],
             },

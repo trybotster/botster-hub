@@ -42,6 +42,8 @@ pub(crate) enum WebrtcTerminalAdmission {
     Rejected {
         code: &'static str,
         diagnostic: DaemonDiagnostic,
+        mux: WebRtcConnectionMux,
+        peer_generation: u64,
     },
 }
 
@@ -56,7 +58,9 @@ pub(crate) struct AdmissionState {
     pub webrtc_admissions: BTreeMap<String, WebrtcTerminalAdmission>,
     pub host_compatibility: BTreeMap<String, HostCompatibilityRecord>,
     pub next_peer_generation: u64,
+    pub next_subscription_generation: u64,
     pub reservations: crate::admission::reservations::TerminalReservationRegistry,
+    pub connection_budgets: BTreeMap<u64, crate::admission::connection_budget::ConnectionBudget>,
 }
 
 pub(crate) fn daemon_hello_ack(diagnostics: Vec<DaemonDiagnostic>) -> DaemonHelloAck {

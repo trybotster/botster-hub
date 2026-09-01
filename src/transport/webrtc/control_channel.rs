@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use botster_core::{AesGcmEnvelope, AesGcmKey, decrypt_aes_gcm};
 use botster_hub_client::{
-    DaemonCompatibility, DaemonDiagnostic, DaemonEntityFrame, DaemonEvent, DaemonHello,
-    DaemonHelloAck, DaemonLocalWebrtcDeliveryChunk, DaemonRequest, DaemonResponse,
-    LOCAL_WEBRTC_MAX_FRAME_BYTES, PROTOCOL,
+    DaemonCompatibility, DaemonDiagnostic, DaemonEvent, DaemonHello, DaemonHelloAck,
+    DaemonLocalWebrtcDeliveryChunk, DaemonRequest, DaemonResponse, LOCAL_WEBRTC_MAX_FRAME_BYTES,
+    PROTOCOL,
 };
 use serde_json::Value;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot, watch};
@@ -25,16 +25,13 @@ use crate::subscription::attach_routes::hello_requires_terminal_subscription_clo
 use crate::subscription::entity::EntityFrameSender;
 use crate::transport::webrtc::adapter::WebRtcConnectionMux;
 use crate::transport::webrtc::delivery::{
-    LocalWebrtcSendFailure, framed_daemon_entity_frame, framed_daemon_event,
-    framed_daemon_hello_ack, framed_daemon_response,
+    LocalWebrtcSendFailure, framed_daemon_event, framed_daemon_hello_ack, framed_daemon_response,
 };
 use crate::transport::webrtc::peer::{
     LOCAL_WEBRTC_PEER_CLOSE_BOUND, LocalWebrtcPeerState, LocalWebrtcTerminalCause,
     TEST_CLOSE_LOCAL_WEBRTC_OPERATION_ENV, webrtc_runtime,
 };
-use crate::transport::webrtc::subscription_channel::{
-    entity_frame_subscription_id, local_webrtc_attach_change_for_response,
-};
+use crate::transport::webrtc::subscription_channel::local_webrtc_attach_change_for_response;
 pub(crate) const LOCAL_WEBRTC_PENDING_REQUESTS: usize = 16;
 pub(crate) const LOCAL_WEBRTC_EVENT_PROBE: Duration = Duration::ZERO;
 pub(crate) const LOCAL_WEBRTC_BUFFERED_AMOUNT_LOW: u32 = LOCAL_WEBRTC_MAX_FRAME_BYTES as u32;
@@ -43,6 +40,9 @@ pub(crate) const LOCAL_WEBRTC_BUFFERED_AMOUNT_HIGH: u32 = (LOCAL_WEBRTC_MAX_FRAM
 pub(crate) trait LocalWebrtcDataChannel: Send + Sync {
     async fn local_set_buffered_amount_low_threshold(&self, threshold: u32) -> Result<(), String>;
     async fn local_set_buffered_amount_high_threshold(&self, threshold: u32) -> Result<(), String>;
+    async fn local_outstanding_bytes(&self) -> Result<usize, String> {
+        Ok(0)
+    }
     async fn local_send_text(&self, text: &str) -> Result<(), String>;
     async fn local_poll(&self) -> Option<DataChannelEvent>;
     async fn local_close(&self) -> Result<(), String>;
@@ -65,6 +65,12 @@ where
             .map_err(|error| error.to_string())
     }
 
+    async fn local_outstanding_bytes(&self) -> Result<usize, String> {
+        self.outstanding_bytes()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     async fn local_send_text(&self, text: &str) -> Result<(), String> {
         self.send_text(text)
             .await
@@ -82,15 +88,12 @@ where
 pub(crate) enum PendingLocalWebrtcRequest {
     Request(Box<DaemonRequest>),
     Hello(Box<DaemonHello>),
-    EntityFrame(Box<DaemonEntityFrame>),
     QueueOverflow(usize),
 }
 
 pub(crate) enum LocalWebrtcInbound {
     Channel(Result<Option<DataChannelEvent>, LocalWebrtcTerminalCause>),
-    Entity(DaemonEntityFrame),
     AdapterReady,
-    HostEventReady,
 }
 
 pub(crate) enum DataChannelPlaintext {
@@ -195,8 +198,6 @@ pub(crate) async fn run_data_channel<D>(
     stream_key: &AesGcmKey,
     peer_state: &LocalWebrtcPeerState,
     runtime_tx: &ControlSender,
-    entity_frame_tx: tokio_mpsc::Sender<DaemonEntityFrame>,
-    mut entity_frame_rx: tokio_mpsc::Receiver<DaemonEntityFrame>,
 ) -> Option<LocalWebrtcSendFailure>
 where
     D: LocalWebrtcDataChannel + ?Sized,
@@ -206,8 +207,6 @@ where
     let mut send_failure = None;
     let mut terminal_cause = LocalWebrtcTerminalCause::PollEnded;
     let mut peer_terminal_rx = peer_state.subscribe_peer_terminal();
-    let mut last_host_class = None;
-    let mut pending_entity = None;
     let mut open = true;
     while open {
         if let Err(failure) = flush_ready_webrtc_host_control(
@@ -216,9 +215,6 @@ where
             peer_state,
             &mut pending_requests,
             &mut flow_control,
-            &mut entity_frame_rx,
-            &mut pending_entity,
-            &mut last_host_class,
         )
         .await
         {
@@ -230,11 +226,7 @@ where
         let pending = if let Some(request) = pop_pending_request(&mut pending_requests) {
             request
         } else {
-            let mailbox = peer_state.event_plane.mailbox(&peer_state.grant_id);
-            if pending_entity.is_some()
-                || host_event_ready(peer_state)
-                || mailbox.as_ref().is_some_and(|mailbox| mailbox.take_wake())
-            {
+            if host_event_ready(peer_state) {
                 continue;
             }
             let inbound = tokio::select! {
@@ -242,39 +234,15 @@ where
                 channel = poll_data_channel_or_peer_terminal(data_channel, &mut peer_terminal_rx) => {
                     LocalWebrtcInbound::Channel(channel)
                 }
-                frame = entity_frame_rx.recv() => {
-                    LocalWebrtcInbound::Entity(
-                        frame.expect("local WebRTC peer owns its entity subscription sender")
-                    )
-                }
-                _ = async {
-                    if let Some(mailbox) = mailbox.as_ref() {
-                        let notified = mailbox.notify().notified();
-                        tokio::pin!(notified);
-                        if mailbox.take_wake() || mailbox.has_ready_event() {
-                            return;
-                        }
-                        notified.await;
-                    } else {
-                        std::future::pending::<()>().await;
-                    }
-                } => LocalWebrtcInbound::HostEventReady,
                 _ = peer_state.mux.wait_for_write() => {
                     LocalWebrtcInbound::AdapterReady
                 }
             };
             match inbound {
-                LocalWebrtcInbound::Entity(frame) => {
-                    if !peer_state.owns_entity_subscription(entity_frame_subscription_id(&frame)) {
-                        continue;
-                    }
-                    PendingLocalWebrtcRequest::EntityFrame(Box::new(frame))
-                }
                 LocalWebrtcInbound::Channel(Err(cause)) => {
                     terminal_cause = cause;
                     break;
                 }
-                LocalWebrtcInbound::HostEventReady => continue,
                 LocalWebrtcInbound::AdapterReady => continue,
                 LocalWebrtcInbound::Channel(Ok(Some(DataChannelEvent::OnMessage(message)))) => {
                     match decrypt_data_channel_plaintext(stream_key, message.data.as_ref()) {
@@ -334,6 +302,8 @@ where
                     WebrtcTerminalAdmission::Rejected {
                         code: "terminal_compatibility",
                         diagnostic: DaemonDiagnostic::compatibility_mismatch(error.diagnostic),
+                        mux: peer_state.mux.clone(),
+                        peer_generation: 0,
                     }
                 } else {
                     WebrtcTerminalAdmission::Admitted {
@@ -389,36 +359,10 @@ where
             }
         }
 
-        if let PendingLocalWebrtcRequest::EntityFrame(frame) = &pending {
-            peer_state.begin_operation("entity_delivery");
-            let Ok(frames) = framed_daemon_entity_frame(stream_key, frame) else {
-                terminal_cause = LocalWebrtcTerminalCause::ResponseFraming;
-                break;
-            };
-            match send_response_frames(
-                data_channel,
-                stream_key,
-                &frames,
-                &mut pending_requests,
-                &mut flow_control,
-                peer_state,
-            )
-            .await
-            {
-                Ok(()) => continue,
-                Err(failure) => {
-                    eprintln!("{failure}");
-                    terminal_cause = failure.cause;
-                    send_failure = Some(failure);
-                    break;
-                }
-            }
-        }
-
         let request = match pending {
             PendingLocalWebrtcRequest::Request(request) => request,
-            PendingLocalWebrtcRequest::Hello(_) | PendingLocalWebrtcRequest::EntityFrame(_) => {
-                unreachable!("hello and entity frame handled above")
+            PendingLocalWebrtcRequest::Hello(_) => {
+                unreachable!("hello handled above")
             }
             PendingLocalWebrtcRequest::QueueOverflow(_) => {
                 peer_state.begin_overflow_response();
@@ -480,11 +424,15 @@ where
                 entity_type,
                 subscription_id,
             } => {
+                let (frame_tx, frame_rx) = tokio_mpsc::channel(
+                    crate::admission::budgets::ENTITY_SUBSCRIPTION_QUEUE_CAPACITY,
+                );
                 runtime_tx
                     .send(ControlMessage::SubscribeEntities {
                         entity_type,
                         subscription_id,
-                        frame_tx: EntityFrameSender::Async(entity_frame_tx.clone()),
+                        frame_tx: EntityFrameSender::Async(frame_tx),
+                        frame_rx: Some(frame_rx),
                         reply_tx,
                         grant_id: Some(peer_state.grant_id.clone()),
                     })
@@ -807,165 +755,45 @@ pub(crate) fn decrypt_data_channel_plaintext(
 }
 pub(crate) fn host_event_ready(peer_state: &LocalWebrtcPeerState) -> bool {
     peer_state.mux.has_pending_event()
-        || peer_state
-            .event_plane
-            .mailbox(&peer_state.grant_id)
-            .is_some_and(|mailbox| mailbox.has_ready_event())
 }
 
 pub(crate) fn take_host_event(peer_state: &LocalWebrtcPeerState) -> Option<DaemonEvent> {
-    if let Some(event) = peer_state.mux.pop_pending_event() {
-        return Some(event);
-    }
-    peer_state
-        .event_plane
-        .mailbox(&peer_state.grant_id)
-        .and_then(|mailbox| mailbox.take_ready_event())
+    peer_state.mux.pop_pending_event()
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn flush_ready_webrtc_host_control<D>(
     data_channel: &D,
     stream_key: &AesGcmKey,
     peer_state: &LocalWebrtcPeerState,
     pending_requests: &mut VecDeque<PendingLocalWebrtcRequest>,
     flow_control: &mut LocalWebrtcFlowControl,
-    entity_frame_rx: &mut tokio_mpsc::Receiver<DaemonEntityFrame>,
-    pending_entity: &mut Option<DaemonEntityFrame>,
-    last_host_class: &mut Option<crate::host_control_fair_write::HostControlClass>,
 ) -> Result<(), LocalWebrtcSendFailure>
 where
     D: LocalWebrtcDataChannel + ?Sized,
 {
-    use crate::host_control_fair_write::{
-        HostControlClass, MAX_HOST_FRAMES_PER_FLUSH_TURN, next_ready_host_control_class,
+    let Some(event) = take_host_event(peer_state) else {
+        return Ok(());
     };
-
-    let mut host_frames = 0;
-    loop {
-        if pending_entity.is_none()
-            && let Ok(frame) = entity_frame_rx.try_recv()
-        {
-            *pending_entity = Some(frame);
-        }
-        let entity_ready = pending_entity.as_ref().is_some_and(|frame| {
-            peer_state.owns_entity_subscription(entity_frame_subscription_id(frame))
-        });
-        if pending_entity.is_some() && !entity_ready {
-            *pending_entity = None;
-            continue;
-        }
-        let control_ready = webrtc_control_request_ready(pending_requests);
-        match next_ready_host_control_class(
-            *last_host_class,
-            control_ready,
-            entity_ready,
-            host_event_ready(peer_state),
-        ) {
-            Some(HostControlClass::Control) => return Ok(()),
-            Some(HostControlClass::Entity) => {
-                if host_frames >= MAX_HOST_FRAMES_PER_FLUSH_TURN {
-                    return Ok(());
-                }
-                let Some(frame) = pending_entity.take() else {
-                    return Ok(());
-                };
-                *last_host_class = Some(HostControlClass::Entity);
-                let frames = match framed_daemon_entity_frame(stream_key, &frame) {
-                    Ok(frames) => frames,
-                    Err(_) => continue,
-                };
-                send_response_frames(
-                    data_channel,
-                    stream_key,
-                    &frames,
-                    pending_requests,
-                    flow_control,
-                    peer_state,
-                )
-                .await?;
-                host_frames += 1;
-            }
-            Some(HostControlClass::Event) => {
-                if host_frames >= MAX_HOST_FRAMES_PER_FLUSH_TURN {
-                    return Ok(());
-                }
-                let Some(event) = take_host_event(peer_state) else {
-                    return Ok(());
-                };
-                if matches!(event, DaemonEvent::TerminalSubscriptionClosed { .. })
-                    && !peer_state.mux.close_events_admitted()
-                {
-                    continue;
-                }
-                *last_host_class = Some(HostControlClass::Event);
-                peer_state.begin_operation("host_event_delivery");
-                let frames = match framed_daemon_event(stream_key, &event) {
-                    Ok(frames) => frames,
-                    Err(_) => continue,
-                };
-                send_response_frames(
-                    data_channel,
-                    stream_key,
-                    &frames,
-                    pending_requests,
-                    flow_control,
-                    peer_state,
-                )
-                .await?;
-                host_frames += 1;
-            }
-            None => return Ok(()),
-        }
-    }
-}
-
-pub(crate) fn webrtc_control_request_ready(
-    pending_requests: &VecDeque<PendingLocalWebrtcRequest>,
-) -> bool {
-    pending_requests.iter().any(|pending| {
-        matches!(
-            pending,
-            PendingLocalWebrtcRequest::Request(_)
-                | PendingLocalWebrtcRequest::Hello(_)
-                | PendingLocalWebrtcRequest::QueueOverflow(_)
-        )
-    })
-}
-
-#[allow(dead_code)]
-pub(crate) async fn flush_webrtc_host_events<D>(
-    data_channel: &D,
-    stream_key: &AesGcmKey,
-    peer_state: &LocalWebrtcPeerState,
-    pending_requests: &mut VecDeque<PendingLocalWebrtcRequest>,
-    flow_control: &mut LocalWebrtcFlowControl,
-) -> Result<(), LocalWebrtcSendFailure>
-where
-    D: LocalWebrtcDataChannel + ?Sized,
-{
-    if !peer_state.mux.close_events_admitted() {
-        peer_state.mux.drop_pending_events();
+    if matches!(event, DaemonEvent::TerminalSubscriptionClosed { .. })
+        && !peer_state.mux.close_events_admitted()
+    {
         return Ok(());
     }
-    while let Some(event) = peer_state.mux.pop_pending_event() {
-        peer_state.begin_operation("host_event_delivery");
-        let frames = match framed_daemon_event(stream_key, &event) {
-            Ok(frames) => frames,
-            Err(_) => continue,
-        };
-        send_response_frames(
-            data_channel,
-            stream_key,
-            &frames,
-            pending_requests,
-            flow_control,
-            peer_state,
-        )
-        .await?;
-    }
-    Ok(())
+    peer_state.begin_operation("host_event_delivery");
+    let Ok(frames) = framed_daemon_event(stream_key, &event) else {
+        return Ok(());
+    };
+    send_response_frames(
+        data_channel,
+        stream_key,
+        &frames,
+        pending_requests,
+        flow_control,
+        peer_state,
+    )
+    .await
 }
+
 pub(crate) fn response_with_diagnostic(diagnostic: DaemonDiagnostic) -> DaemonResponse {
     DaemonResponse {
         kind: botster_hub_client::DaemonResponseKind::OperatorError,
@@ -978,6 +806,7 @@ pub(crate) fn response_with_diagnostic(diagnostic: DaemonDiagnostic) -> DaemonRe
         read_screen: None,
         mode_flags: None,
         terminal_reservation: None,
+        subscription_reservation: None,
         capture_snapshot: None,
         spawn_targets: Vec::new(),
         spawn_target_validation: None,
@@ -1108,17 +937,9 @@ mod tests {
             .build()
             .unwrap();
         let runtime_sender = peer_state.runtime_tx.clone();
-        let (entity_frame_tx, entity_frame_rx) =
-            tokio_mpsc::channel(ENTITY_SUBSCRIPTION_QUEUE_CAPACITY);
         let failure = runtime.block_on(async {
-            let delivery = run_data_channel(
-                &data_channel,
-                &key,
-                peer_state.as_ref(),
-                &runtime_sender,
-                entity_frame_tx,
-                entity_frame_rx,
-            );
+            let delivery =
+                run_data_channel(&data_channel, &key, peer_state.as_ref(), &runtime_sender);
             tokio::pin!(delivery);
             if let Some(cause) = terminal_cause {
                 assert!(
@@ -1194,15 +1015,11 @@ mod tests {
             .build()
             .unwrap();
         let runtime_sender = peer_state.runtime_tx.clone();
-        let (entity_frame_tx, entity_frame_rx) =
-            tokio_mpsc::channel(ENTITY_SUBSCRIPTION_QUEUE_CAPACITY);
         let failure = runtime.block_on(run_data_channel(
             &data_channel,
             &key,
             peer_state.as_ref(),
             &runtime_sender,
-            entity_frame_tx,
-            entity_frame_rx,
         ));
         responder.join().unwrap();
         (data_channel, failure)
@@ -1214,244 +1031,6 @@ mod tests {
 
         assert!(failure.is_none());
         assert!(!data_channel.sent.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn entity_subscription_multiplexes_after_ack_and_cleans_up_with_peer() {
-        let key = AesGcmKey::from_slice(&[21; 32]).unwrap();
-        let data_channel = Arc::new(FakeDataChannel::default());
-        {
-            let mut events = data_channel.events.lock().unwrap();
-            events.push_back(encrypted_request_event(
-                &key,
-                &DaemonRequest::SubscribeEntities {
-                    entity_type: "session".to_string(),
-                    subscription_id: "entity-fixture".to_string(),
-                },
-            ));
-        }
-        let (runtime_tx, mut runtime_rx) = tokio_mpsc::channel(64);
-        let peer_state = Arc::new(LocalWebrtcPeerState::new(
-            "grant-entity-fixture".to_string(),
-            runtime_tx,
-        ));
-        let responder_peer_state = peer_state.clone();
-        let responder_data_channel = data_channel.clone();
-        let responder_key = key.clone();
-        let responder = std::thread::spawn(move || {
-            let ControlMessage::SubscribeEntities {
-                entity_type,
-                subscription_id,
-                frame_tx,
-                reply_tx,
-                grant_id,
-            } = receive_test_runtime_message(&mut runtime_rx)
-            else {
-                panic!("expected WebRTC entity subscription registration");
-            };
-            assert_eq!(entity_type, "session");
-            assert_eq!(subscription_id, "entity-fixture");
-            assert_eq!(grant_id.as_deref(), Some("grant-entity-fixture"));
-            let mut subscribed = response_with_diagnostic(DaemonDiagnostic::connected("fixture"));
-            subscribed.kind = botster_hub_client::DaemonResponseKind::EntitySubscribed;
-            reply_tx.send(Ok(subscribed)).unwrap();
-            frame_tx
-                .try_send(DaemonEntityFrame::Snapshot {
-                    subscription_id: "entity-fixture".to_string(),
-                    entity_type: "session".to_string(),
-                    snapshot_seq: 1,
-                    items: Vec::new(),
-                    resync_reason: None,
-                })
-                .unwrap();
-            frame_tx
-                .try_send(DaemonEntityFrame::Snapshot {
-                    subscription_id: "entity-fixture".to_string(),
-                    entity_type: "session".to_string(),
-                    snapshot_seq: 2,
-                    items: Vec::new(),
-                    resync_reason: Some("subscriber_overflow".to_string()),
-                })
-                .unwrap();
-
-            let deadline = Instant::now() + Duration::from_secs(1);
-            while responder_data_channel.sent.lock().unwrap().len() < 3 {
-                assert!(
-                    Instant::now() < deadline,
-                    "subscribe ack and encrypted overflow recovery must complete"
-                );
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            responder_data_channel
-                .events
-                .lock()
-                .unwrap()
-                .push_back(encrypted_request_event(
-                    &responder_key,
-                    &DaemonRequest::Status,
-                ));
-            responder_data_channel.event_notify.notify_one();
-
-            let ControlMessage::Request {
-                request, reply_tx, ..
-            } = receive_test_runtime_message(&mut runtime_rx)
-            else {
-                panic!("expected ordinary request while entity subscription is active");
-            };
-            assert_eq!(*request, DaemonRequest::Status);
-            let mut status = response_with_diagnostic(DaemonDiagnostic::connected("fixture"));
-            status.kind = botster_hub_client::DaemonResponseKind::Status;
-            reply_tx.send(Ok(status)).unwrap();
-
-            let deadline = Instant::now() + Duration::from_secs(1);
-            while responder_data_channel.sent.lock().unwrap().len() < 4 {
-                assert!(
-                    Instant::now() < deadline,
-                    "all multiplexed deliveries complete"
-                );
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            responder_peer_state.publish_peer_terminal(LocalWebrtcTerminalCause::PeerClosed);
-            let ControlMessage::LocalWebrtcPeerClosed {
-                entity_subscription_ids,
-                ..
-            } = receive_test_runtime_message(&mut runtime_rx)
-            else {
-                panic!("expected peer cleanup");
-            };
-            assert_eq!(entity_subscription_ids, vec!["entity-fixture"]);
-        });
-
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let runtime_sender = peer_state.runtime_tx.clone();
-        let (entity_frame_tx, entity_frame_rx) =
-            tokio_mpsc::channel(ENTITY_SUBSCRIPTION_QUEUE_CAPACITY);
-        let failure = runtime.block_on(run_data_channel(
-            data_channel.as_ref(),
-            &key,
-            peer_state.as_ref(),
-            &runtime_sender,
-            entity_frame_tx,
-            entity_frame_rx,
-        ));
-        responder.join().unwrap();
-        assert!(failure.is_none());
-
-        let deliveries = data_channel
-            .sent
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|serialized| {
-                let chunk =
-                    serde_json::from_str::<DaemonLocalWebrtcDeliveryChunk>(serialized).unwrap();
-                assert_eq!(chunk.chunk_count, 1);
-                let envelope = serde_json::from_str::<AesGcmEnvelope>(&chunk.payload).unwrap();
-                let plaintext = decrypt_aes_gcm(&key, &envelope).unwrap();
-                (chunk.delivery_kind, plaintext)
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            deliveries.iter().map(|(kind, _)| *kind).collect::<Vec<_>>(),
-            vec![
-                DaemonLocalWebrtcDeliveryKind::DaemonResponse,
-                DaemonLocalWebrtcDeliveryKind::DaemonEntityFrame,
-                DaemonLocalWebrtcDeliveryKind::DaemonEntityFrame,
-                DaemonLocalWebrtcDeliveryKind::DaemonResponse,
-            ]
-        );
-        let snapshot: DaemonEntityFrame = serde_json::from_slice(&deliveries[1].1).unwrap();
-        assert_eq!(entity_frame_subscription_id(&snapshot), "entity-fixture");
-        let resync: DaemonEntityFrame = serde_json::from_slice(&deliveries[2].1).unwrap();
-        assert!(matches!(
-            resync,
-            DaemonEntityFrame::Snapshot {
-                snapshot_seq: 2,
-                ref items,
-                resync_reason: Some(ref reason),
-                ..
-            } if items.is_empty() && reason == "subscriber_overflow"
-        ));
-    }
-
-    #[test]
-    fn replacement_peer_rejects_prior_generation_frames_and_delivers_current_generation() {
-        let key = AesGcmKey::from_slice(&[22; 32]).unwrap();
-        let data_channel = Arc::new(FakeDataChannel::default());
-        let (runtime_tx, mut runtime_rx) = tokio_mpsc::channel(64);
-        let peer_state = Arc::new(LocalWebrtcPeerState::new(
-            "replacement-grant".to_string(),
-            runtime_tx,
-        ));
-        peer_state.add_entity_subscription("generation-2".to_string());
-        let responder_peer_state = peer_state.clone();
-        let responder_data_channel = data_channel.clone();
-        let runtime_sender = peer_state.runtime_tx.clone();
-        let (entity_frame_tx, entity_frame_rx) = tokio_mpsc::channel(2);
-        entity_frame_tx
-            .try_send(DaemonEntityFrame::Snapshot {
-                subscription_id: "generation-1".to_string(),
-                entity_type: "session".to_string(),
-                snapshot_seq: 1,
-                items: Vec::new(),
-                resync_reason: None,
-            })
-            .unwrap();
-        entity_frame_tx
-            .try_send(DaemonEntityFrame::Snapshot {
-                subscription_id: "generation-2".to_string(),
-                entity_type: "session".to_string(),
-                snapshot_seq: 2,
-                items: Vec::new(),
-                resync_reason: None,
-            })
-            .unwrap();
-        let responder = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(1);
-            while responder_data_channel.sent.lock().unwrap().is_empty() {
-                assert!(
-                    Instant::now() < deadline,
-                    "current-generation frame is delivered"
-                );
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            responder_peer_state.publish_peer_terminal(LocalWebrtcTerminalCause::PeerClosed);
-            assert!(matches!(
-                receive_test_runtime_message(&mut runtime_rx),
-                ControlMessage::LocalWebrtcPeerClosed { grant_id, .. }
-                    if grant_id == "replacement-grant"
-            ));
-        });
-
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let failure = runtime.block_on(run_data_channel(
-            data_channel.as_ref(),
-            &key,
-            peer_state.as_ref(),
-            &runtime_sender,
-            entity_frame_tx,
-            entity_frame_rx,
-        ));
-        responder.join().unwrap();
-        assert!(failure.is_none());
-
-        let sent = data_channel.sent.lock().unwrap();
-        assert_eq!(sent.len(), 1, "the prior-generation frame must be dropped");
-        let chunk: DaemonLocalWebrtcDeliveryChunk = serde_json::from_str(&sent[0]).unwrap();
-        assert_eq!(
-            chunk.delivery_kind,
-            DaemonLocalWebrtcDeliveryKind::DaemonEntityFrame
-        );
-        let envelope: AesGcmEnvelope = serde_json::from_str(&chunk.payload).unwrap();
-        let plaintext = decrypt_aes_gcm(&key, &envelope).unwrap();
-        let frame: DaemonEntityFrame = serde_json::from_slice(&plaintext).unwrap();
-        assert_eq!(entity_frame_subscription_id(&frame), "generation-2");
     }
 
     #[test]
@@ -1548,15 +1127,11 @@ mod tests {
             .build()
             .unwrap();
         let runtime_sender = peer_state.runtime_tx.clone();
-        let (entity_frame_tx, entity_frame_rx) =
-            tokio_mpsc::channel(ENTITY_SUBSCRIPTION_QUEUE_CAPACITY);
         let failure = runtime.block_on(run_data_channel(
             data_channel.as_ref(),
             &key,
             peer_state.as_ref(),
             &runtime_sender,
-            entity_frame_tx,
-            entity_frame_rx,
         ));
 
         responder.join().unwrap();
@@ -1894,6 +1469,48 @@ mod tests {
             &["first", "second"]
         );
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn one_lifecycle_event_precedes_queued_control_work_per_turn() {
+        let data_channel = FakeDataChannel::default();
+        let key = AesGcmKey::from_slice(&[19; 32]).unwrap();
+        let peer_state = test_peer_state("grant-lifecycle-fairness");
+        peer_state
+            .mux
+            .push_host_event(DaemonEvent::RuntimeObservation {
+                kind: "first-lifecycle".to_string(),
+            });
+        peer_state
+            .mux
+            .push_host_event(DaemonEvent::RuntimeObservation {
+                kind: "second-lifecycle".to_string(),
+            });
+        let mut pending = VecDeque::from([PendingLocalWebrtcRequest::Request(Box::new(
+            DaemonRequest::Status,
+        ))]);
+        let mut flow_control = LocalWebrtcFlowControl::default();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        runtime
+            .block_on(flush_ready_webrtc_host_control(
+                &data_channel,
+                &key,
+                &peer_state,
+                &mut pending,
+                &mut flow_control,
+            ))
+            .expect("lifecycle event write");
+
+        assert_eq!(pending.len(), 1, "the writer does not consume control work");
+        assert!(
+            peer_state.mux.has_pending_event(),
+            "one event remains because one turn writes at most one lifecycle event"
+        );
+        assert!(!data_channel.sent.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -2367,7 +1984,6 @@ mod tests {
                 }
                 PendingLocalWebrtcRequest::Request(_) => "status",
                 PendingLocalWebrtcRequest::Hello(_) => "hello",
-                PendingLocalWebrtcRequest::EntityFrame(_) => "entity",
                 PendingLocalWebrtcRequest::QueueOverflow(_) => "overflow",
             })
             .collect::<Vec<_>>();

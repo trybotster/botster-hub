@@ -62,7 +62,6 @@ mod daemon_projection;
 pub(crate) mod data_plane;
 pub mod entrypoint_supervisor;
 pub(crate) mod event_plane_counters;
-mod host_control_fair_write;
 pub mod lifecycle;
 pub mod lua_runtime;
 pub mod maintenance;
@@ -124,7 +123,8 @@ pub use botster_hub_client::{
     DaemonSessionType, DaemonSessionTypeContextInput, DaemonSessionTypeDefinition,
     DaemonSessionTypeExecution, DaemonSessionTypeMutationSource, DaemonSessionTypeRequest,
     DaemonSessionTypeWorkingDirectory, DaemonSoftwareIdentity, DaemonSpawnTarget,
-    DaemonSpawnTargetValidation, DaemonStatus, DaemonWorktree, DaemonWorktreeGitMetadata,
+    DaemonSpawnTargetValidation, DaemonStatus, DaemonSubscriptionReservation,
+    DaemonSubscriptionReservationKind, DaemonWorktree, DaemonWorktreeGitMetadata,
 };
 pub use capabilities::HubCapabilityRuntime;
 pub use client_api::{
@@ -1102,6 +1102,10 @@ mod tests {
                 "src/admission/budgets.rs",
                 include_str!("admission/budgets.rs"),
             ),
+            (
+                "src/admission/connection_budget.rs",
+                include_str!("admission/connection_budget.rs"),
+            ),
             ("src/main.rs", include_str!("main.rs")),
             (
                 "src/transport/webrtc.rs",
@@ -1209,6 +1213,10 @@ mod tests {
                 "src/transport/unix/mux_write.rs",
                 include_str!("transport/unix/mux_write.rs"),
             ),
+            (
+                "src/transport/unix/host_write_order.rs",
+                include_str!("transport/unix/host_write_order.rs"),
+            ),
         ];
         for (path, source) in files {
             let scan = scan_production_source(source);
@@ -1231,6 +1239,40 @@ mod tests {
                 "{path} production source must not call two-argument Core drain"
             );
         }
+    }
+
+    #[test]
+    fn dedicated_channel_budget_and_unix_scheduler_have_one_owner_each() {
+        let budget = include_str!("admission/connection_budget.rs");
+        for required in [
+            "pub(crate) const MAX_CONTROL_CHANNELS: usize = 1;",
+            "pub(crate) const MAX_SUBSCRIPTION_CHANNELS: usize = 32;",
+            "pub(crate) const MAX_TOTAL_CHANNELS: usize = MAX_CONTROL_CHANNELS + MAX_SUBSCRIPTION_CHANNELS;",
+            "pub(crate) const AGGREGATE_BUFFERED_HIGH: usize = 2_097_152;",
+            "pub(crate) const AGGREGATE_BUFFERED_LOW: usize = 1_048_576;",
+            "pub(crate) struct ConnectionBudget",
+        ] {
+            assert!(
+                budget.contains(required),
+                "missing budget owner anchor: {required}"
+            );
+        }
+
+        let unix_order = include_str!("transport/unix/host_write_order.rs");
+        assert!(unix_order.contains("pub(crate) enum HostControlClass"));
+        assert!(unix_order.contains("Control"));
+        assert!(unix_order.contains("Event"));
+        assert!(!unix_order.contains("Entity"));
+
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert!(!manifest.join("src/host_control_fair_write.rs").exists());
+        let control = include_str!("transport/webrtc/control_channel.rs");
+        assert!(!control.contains("HostControlClass::Entity"));
+        assert!(!control.contains("entity_ready"));
+        assert!(!control.contains("framed_daemon_entity_frame"));
+        let subscriptions = include_str!("transport/webrtc/subscription_channel.rs");
+        assert!(subscriptions.contains("framed_daemon_entity_frame"));
+        assert!(subscriptions.contains("framed_daemon_event"));
     }
 
     #[test]

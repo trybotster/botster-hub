@@ -106,12 +106,6 @@ impl ClosedEventLedger {
         })
     }
 
-    pub(crate) fn drop_pending_events(&self) {
-        if let Ok(mut pending) = self.pending_events.lock() {
-            pending.clear();
-        }
-    }
-
     pub(crate) fn push_event(&self, event: DaemonEvent) {
         if let Ok(mut pending) = self.pending_events.lock() {
             pending.push(event);

@@ -378,6 +378,7 @@ pub(crate) async fn handle_entity_subscription_async(
             entity_type,
             subscription_id: subscription_id.clone(),
             frame_tx: EntityFrameSender::Async(frame_tx),
+            frame_rx: None,
             reply_tx,
             grant_id: None,
         })

@@ -167,6 +167,7 @@ export interface DaemonResponse {
   read_screen?: DaemonReadScreen | null;
   mode_flags?: DaemonModeFlags | null;
   terminal_reservation?: DaemonTerminalReservation | null;
+  subscription_reservation?: DaemonSubscriptionReservation | null;
   capture_snapshot?: DaemonCaptureSnapshot | null;
   spawn_targets?: DaemonSpawnTarget[];
   spawn_target_validation?: DaemonSpawnTargetValidation | null;
@@ -224,6 +225,19 @@ export interface DaemonTerminalReservation {
   label: string;
   expires_in_seconds: number;
 }
+
+export interface DaemonSubscriptionReservation {
+  kind: DaemonSubscriptionReservationKind;
+  subscription_id: string;
+  generation: number;
+  peer_generation: number;
+  label: string;
+  expires_in_seconds: number;
+}
+
+export type DaemonSubscriptionReservationKind =
+  | "entity"
+  | "package_event";
 
 export interface DaemonCaptureSnapshot {
   session_id: string;
