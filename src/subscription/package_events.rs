@@ -728,6 +728,28 @@ impl ClientEventPlane {
         }
     }
 
+    pub(crate) fn cleanup_subscription_if_mailbox(
+        &self,
+        connection_id: &str,
+        subscription_id: &str,
+        expected_mailbox: &Arc<ClientEventMailbox>,
+        router: &PackageEventRouter,
+    ) {
+        let current_matches = lock_plane(&self.connections)
+            .ok()
+            .and_then(|connections| {
+                connections
+                    .get(connection_id)?
+                    .mailboxes
+                    .get(subscription_id)
+                    .cloned()
+            })
+            .is_some_and(|mailbox| Arc::ptr_eq(&mailbox, expected_mailbox));
+        if current_matches {
+            self.cleanup_subscription(connection_id, subscription_id, router);
+        }
+    }
+
     #[must_use]
     pub(crate) fn has_pending_cleanup(&self) -> bool {
         let connection_pending = self
@@ -1102,6 +1124,83 @@ mod tests {
         assert!(mailbox.take_ready_event().is_none());
         plane.retry_residency_cleanups();
         assert_pool_empty(&pool, 0);
+    }
+
+    #[test]
+    fn old_mailbox_retirement_preserves_same_id_replacement() {
+        let router = admitted_router(EventAudience::Clients);
+        let plane = ClientEventPlane::default();
+        let policy = PackageEventPlanePolicy::default();
+        plane
+            .try_subscribe(
+                "connection",
+                "sub",
+                "owner",
+                "ready",
+                Vec::new(),
+                policy,
+                &router,
+            )
+            .expect("subscribe old");
+        let old = plane
+            .subscription_mailbox("connection", "sub")
+            .expect("old mailbox");
+        plane
+            .try_unsubscribe("connection", "sub", &router)
+            .expect("unsubscribe old");
+        plane
+            .try_subscribe(
+                "connection",
+                "sub",
+                "owner",
+                "ready",
+                Vec::new(),
+                policy,
+                &router,
+            )
+            .expect("subscribe replacement");
+        let replacement = plane
+            .subscription_mailbox("connection", "sub")
+            .expect("replacement mailbox");
+        plane.cleanup_subscription_if_mailbox("connection", "sub", &old, &router);
+        let current = plane
+            .subscription_mailbox("connection", "sub")
+            .expect("replacement survives old retirement");
+        assert!(Arc::ptr_eq(&current, &replacement));
+    }
+
+    #[test]
+    fn old_mailbox_retirement_before_resubscribe_allows_replacement() {
+        let router = admitted_router(EventAudience::Clients);
+        let plane = ClientEventPlane::default();
+        let policy = PackageEventPlanePolicy::default();
+        plane
+            .try_subscribe(
+                "connection",
+                "sub",
+                "owner",
+                "ready",
+                Vec::new(),
+                policy,
+                &router,
+            )
+            .expect("subscribe old");
+        let old = plane
+            .subscription_mailbox("connection", "sub")
+            .expect("old mailbox");
+        plane.cleanup_subscription_if_mailbox("connection", "sub", &old, &router);
+        assert!(plane.subscription_mailbox("connection", "sub").is_none());
+        plane
+            .try_subscribe(
+                "connection",
+                "sub",
+                "owner",
+                "ready",
+                Vec::new(),
+                policy,
+                &router,
+            )
+            .expect("subscribe replacement after retirement");
     }
 
     #[test]

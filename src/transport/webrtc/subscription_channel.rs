@@ -96,8 +96,7 @@ pub(crate) async fn reject_extra_data_channel<C>(
     C: LocalWebrtcDataChannel + ?Sized,
 {
     eprintln!("local WebRTC rejecting extra DataChannel: grant_id={grant_id}");
-    let close =
-        tokio::time::timeout(LOCAL_WEBRTC_PEER_CLOSE_BOUND, data_channel.local_close()).await;
+    let close = close_subscription_channel(data_channel).await;
     observe_rejected_data_channel_for_test(claimed, &close, label);
 }
 
@@ -427,7 +426,7 @@ async fn run_bound_subscription_channel<C>(
         if let BoundSubscription::Terminal { handle, .. } = &bound {
             handle.close();
         }
-        let _ = data_channel.local_close().await;
+        let _ = close_subscription_channel(data_channel).await;
         return;
     }
     let usage = match &bound {
@@ -439,8 +438,7 @@ async fn run_bound_subscription_channel<C>(
         if let BoundSubscription::Terminal { handle, .. } = &bound {
             handle.close();
         }
-        let _ =
-            tokio::time::timeout(LOCAL_WEBRTC_PEER_CLOSE_BOUND, data_channel.local_close()).await;
+        let _ = close_subscription_channel(data_channel).await;
         return;
     }
     drop(hello_permits);
@@ -471,8 +469,7 @@ async fn run_bound_terminal_channel<C>(
         if let Err(()) =
             flush_subscription_adapter_frames(data_channel, stream_key, &handle, &usage).await
         {
-            let _ = tokio::time::timeout(LOCAL_WEBRTC_PEER_CLOSE_BOUND, data_channel.local_close())
-                .await;
+            let _ = close_subscription_channel(data_channel).await;
             handle.close();
             return;
         }
@@ -487,17 +484,17 @@ async fn run_bound_terminal_channel<C>(
                             std::str::from_utf8(message.data.as_ref()).unwrap_or(""),
                         ) else {
                             handle.close();
-                            let _ = data_channel.local_close().await;
+                            let _ = close_subscription_channel(data_channel).await;
                             return;
                         };
                         let Ok(bytes) = botster_core::decrypt_aes_gcm(stream_key, &envelope) else {
                             handle.close();
-                            let _ = data_channel.local_close().await;
+                            let _ = close_subscription_channel(data_channel).await;
                             return;
                         };
                         if handle.push_ingress(bytes).is_err() {
                             handle.close();
-                            let _ = data_channel.local_close().await;
+                            let _ = close_subscription_channel(data_channel).await;
                             return;
                         }
                     }
@@ -555,20 +552,12 @@ async fn run_bound_entity_channel<C>(
                         break 'driver;
                     };
                     if data_channel.local_send_text(&frame).await.is_err() {
-                        let _ = tokio::time::timeout(
-                            LOCAL_WEBRTC_PEER_CLOSE_BOUND,
-                            data_channel.local_close(),
-                        )
-                        .await;
+                        let _ = close_subscription_channel(data_channel).await;
                         drop(permit);
                         return;
                     }
                     if publish_channel_usage(data_channel, &usage).await.is_err() {
-                        let _ = tokio::time::timeout(
-                            LOCAL_WEBRTC_PEER_CLOSE_BOUND,
-                            data_channel.local_close(),
-                        )
-                        .await;
+                        let _ = close_subscription_channel(data_channel).await;
                         drop(permit);
                         return;
                     }
@@ -592,7 +581,7 @@ async fn run_bound_entity_channel<C>(
             }
         }
     }
-    let _ = tokio::time::timeout(LOCAL_WEBRTC_PEER_CLOSE_BOUND, data_channel.local_close()).await;
+    let _ = close_subscription_channel(data_channel).await;
 }
 
 async fn authorize_subscription_send(
@@ -688,20 +677,12 @@ async fn run_bound_event_channel<C>(
                     break 'driver;
                 };
                 if data_channel.local_send_text(&frame).await.is_err() {
-                    let _ = tokio::time::timeout(
-                        LOCAL_WEBRTC_PEER_CLOSE_BOUND,
-                        data_channel.local_close(),
-                    )
-                    .await;
+                    let _ = close_subscription_channel(data_channel).await;
                     drop(permit);
                     return;
                 }
                 if publish_channel_usage(data_channel, &usage).await.is_err() {
-                    let _ = tokio::time::timeout(
-                        LOCAL_WEBRTC_PEER_CLOSE_BOUND,
-                        data_channel.local_close(),
-                    )
-                    .await;
+                    let _ = close_subscription_channel(data_channel).await;
                     drop(permit);
                     return;
                 }
@@ -736,7 +717,16 @@ async fn run_bound_event_channel<C>(
             }
         }
     }
-    let _ = tokio::time::timeout(LOCAL_WEBRTC_PEER_CLOSE_BOUND, data_channel.local_close()).await;
+    let _ = close_subscription_channel(data_channel).await;
+}
+
+async fn close_subscription_channel<C>(
+    data_channel: &C,
+) -> Result<Result<(), String>, tokio::time::error::Elapsed>
+where
+    C: LocalWebrtcDataChannel + ?Sized,
+{
+    tokio::time::timeout(LOCAL_WEBRTC_PEER_CLOSE_BOUND, data_channel.local_close()).await
 }
 
 async fn publish_channel_usage<C>(
@@ -861,6 +851,61 @@ mod tests {
         apply_subscription_pressure_event(&handle, &DataChannelEvent::OnBufferedAmountLow);
         assert_eq!(adapter.pressure(), TerminalAdapterPressure::Ready);
         assert_eq!(sibling.pressure(), TerminalAdapterPressure::Ready);
+    }
+
+    fn run_hanging_close_error_path(channel: &FakeDataChannel, threshold_fails: bool) {
+        channel.close_hangs.store(true, Ordering::Release);
+        channel
+            .threshold_fails
+            .store(threshold_fails, Ordering::Release);
+        if !threshold_fails {
+            channel.push_event(DataChannelEvent::OnMessage(RTCDataChannelMessage {
+                is_string: true,
+                data: b"not-json".as_slice().into(),
+            }));
+        }
+        let peer_state = test_peer_state("grant-close-bound");
+        let (_adapter, handle) = crate::transport::webrtc::adapter::WebRtcTerminalAdapter::pair();
+        let usage = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let key = AesGcmKey::from_slice(&[13; 32]).expect("test key");
+        let route = BoundSubscriptionRoute {
+            peer_state: &peer_state,
+            grant_id: "grant-close-bound",
+            label: "route-close-bound",
+            subscription_id: "sub-close-bound",
+            generation: 1,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build close-bound runtime");
+        let started = std::time::Instant::now();
+        runtime.block_on(run_bound_subscription_channel(
+            channel,
+            &key,
+            route,
+            BoundSubscription::Terminal {
+                handle: handle.clone(),
+                usage,
+            },
+            Vec::new(),
+        ));
+        assert!(channel.close_started.load(Ordering::Acquire));
+        assert!(handle.is_closed());
+        assert!(
+            started.elapsed() < LOCAL_WEBRTC_PEER_CLOSE_BOUND + Duration::from_secs(1),
+            "subscription close must finish within its close bound"
+        );
+    }
+
+    #[test]
+    fn threshold_failure_bounds_a_hanging_subscription_close() {
+        run_hanging_close_error_path(&FakeDataChannel::default(), true);
+    }
+
+    #[test]
+    fn terminal_ingress_failure_bounds_a_hanging_subscription_close() {
+        run_hanging_close_error_path(&FakeDataChannel::default(), false);
     }
 
     fn initial_usage_blocks_first_payload(

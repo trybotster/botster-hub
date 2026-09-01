@@ -466,10 +466,14 @@ pub(crate) fn retire_route_owner(
             }
         }
         ChannelClass::Event => {
-            if let Some(runtime) = daemon.runtime() {
-                state.event_plane.cleanup_subscription(
+            if let Some(runtime) = daemon.runtime()
+                && let crate::admission::reservations::ReservationBinding::Event { mailbox } =
+                    &reservation.binding
+            {
+                state.event_plane.cleanup_subscription_if_mailbox(
                     grant_id,
                     &reservation.subscription_id,
+                    mailbox,
                     runtime.package_event_router(),
                 );
             }
