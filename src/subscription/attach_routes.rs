@@ -996,7 +996,8 @@ mod tests {
         CoreSessionMetadata, ResizePayload, SessionSpawnRequest, SpawnEnvironment,
         SpawnWorkingDirectory,
     };
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::thread;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     fn owner() -> AttachStreamOwner {
         AttachStreamOwner {
@@ -1107,13 +1108,25 @@ mod tests {
             .expect("production-registered sibling handle");
 
         lost.mark_ingress_lost();
-        // This is the guarded Hub test seam, not a production Hub loop. It proves
-        // Core hard-stop behavior and Hub adapter isolation, not production reachability.
-        runtime
-            .drain_runtime_once(&session_id, 4)
-            .expect("drive real Core ingress intake");
-
-        let inventory = runtime.list_terminal_subscriptions();
+        // The production data-plane driver consumes the adapter wake and pumps
+        // only the affected Core route. Inventory reads do not advance progress.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let inventory = loop {
+            let inventory = runtime.list_terminal_subscriptions();
+            let lost_route_present = inventory.iter().any(|row| {
+                row.session_id == session_id
+                    && row.subscription_id.0 == "lost-subscription"
+                    && row.generation == lost_generation
+            });
+            if !lost_route_present {
+                break inventory;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "production wake pump did not retire the lost route; last inventory: {inventory:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
         assert!(
             !inventory.iter().any(|row| {
                 row.session_id == session_id

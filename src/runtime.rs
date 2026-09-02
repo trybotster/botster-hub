@@ -3736,35 +3736,6 @@ impl HubRuntime {
         })
     }
 
-    /// Test helper for Core terminal Drain. Production daemon paths must not call this.
-    #[cfg(test)]
-    pub fn drain_runtime_once(
-        &mut self,
-        session_id: &SessionId,
-        last_output_at: u64,
-    ) -> Result<botster_core_daemon::DrainResult, CoreDaemonError> {
-        let session_id = session_id.clone();
-        self.core_daemon
-            .call(move |daemon| daemon.drain(&session_id, last_output_at))
-    }
-
-    /// Test helper for Core terminal Drain. Production daemon paths must not call this.
-    #[cfg(test)]
-    pub fn drain_subscription(
-        &mut self,
-        client_id: &ClientId,
-        session_id: &SessionId,
-        subscription_id: &SubscriptionId,
-        last_output_at: u64,
-    ) -> Result<botster_core_daemon::DrainResult, CoreDaemonError> {
-        let client_id = client_id.clone();
-        let session_id = session_id.clone();
-        let subscription_id = subscription_id.clone();
-        self.core_daemon.call(move |daemon| {
-            daemon.drain_subscription(&client_id, &session_id, &subscription_id, last_output_at)
-        })
-    }
-
     /// Read the current daemon-owned terminal screen through the production core path.
     pub fn read_screen(
         &mut self,
