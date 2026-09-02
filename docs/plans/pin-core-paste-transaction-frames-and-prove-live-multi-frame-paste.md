@@ -5,6 +5,15 @@ Run: `run_1788326546_496759`
 Step: `botster_stack_plan`
 Pipeline: `botster_stack_delivery` (direct merge into `main`, no PR)
 Parent (closed): `ticket_1788287678_207209` — Core: bounded atomic multi-frame terminal input transactions
+Plan **revision 2** after Plan Review `review_1788328352_202496`
+
+## Plan Review corrections (rev 2)
+
+| Finding | Status |
+| --- | --- |
+| `finding_1788328352_438396` content-blind source guard omits production file tails | **Locked.** The guard no longer splits at the first `mod tests`. It scans every byte of every `.rs` file under the four roots, so scanner state cannot skip a tail. The guard takes a scan root, returns the scanned file set, requires anchor files and the `push_complete` anchor symbol, and ships with a permanent seeded-EOF red control that scans a mutated scratch copy. Loaded [[a source scanner can stay in cfg test skip mode through end of file]], [[a known positive control proves a scan is live not that its pattern set is complete]], and [[hub moves must extend source scanning guard file lists]]. See Scope item 5. |
+| `finding_1788328352_902303` plan base stale (`080ca9a` vs `origin/main` `db2c43c`) | **Locked.** Branch rebased onto `db2c43c` (plan commit only; clean). `db2c43c` removes `drain_runtime_once` from `src/runtime.rs` and moves the adapter-loss unit test in `src/subscription/attach_routes.rs` onto the production wake driver. The planned live tests already drive the production driver through the isolated Hub, so no plan step depended on the removed helper. Pin inventory re-run on the new base: 24 active matches (18 source sites + 6 lock sources), unchanged. Cited paths re-checked. |
+| `finding_1788328352_269589` Plan completion evidence empty | **Locked.** Gate evidence and completion evidence on this visit carry `plan_uri`, `artifact_id` (new rev-2 artifact), `checklist_id`, `target_id`, and `target_repository`. |
 
 ## Target repository and target_id
 
@@ -12,7 +21,7 @@ Parent (closed): `ticket_1788287678_207209` — Core: bounded atomic multi-frame
 | --- | --- |
 | Target repository | `botster-hub` (`trybotster/botster-hub`) |
 | Target id | `tgt_7e208a0c76a44980a83b63af976b1f22` |
-| Plan worktree | `botster-sessions/trybotster-botster-hub-project-pipelines-ticket_1788313897_932611`, branch `project-pipelines/ticket_1788313897_932611`, base `080ca9a` |
+| Plan worktree | `botster-sessions/trybotster-botster-hub-project-pipelines-ticket_1788313897_932611`, branch `project-pipelines/ticket_1788313897_932611`, base `db2c43c` (rebased from `080ca9a` in rev 2) |
 | Worktree hygiene | tracked `.gitignore` has 5 lines; path has no `:`; no `CARGO_TARGET_DIR` override is allowed for the official gate |
 | Merge policy | direct into `main`; do not create a PR |
 
@@ -57,6 +66,9 @@ Pin roll and gate discipline:
 - [[unused test environment seams signal skipped acceptance checks]]
 - [[fixed source guard lists need one ablation per added file]]
 - [[region bounded source guards need a required symbol anchor]]
+- [[a source scanner can stay in cfg test skip mode through end of file]]
+- [[a known positive control proves a scan is live not that its pattern set is complete]]
+- [[hub moves must extend source scanning guard file lists]]
 
 Runtime-teardown class decision: **does not apply**. This ticket adds no peer, session, ClientWorker, or SessionIo teardown behavior, no new ownership-creating message, and no close path. It rolls a dependency pin and adds live data-path proof over existing bound routes. [[botster runtime teardown lenses]] was read to make this decision. If Plan Review forces the class, the answers are: isolation and ownership identity are unchanged from `bind-content-blind-webrtc-terminal-adapters-at-admission`; the only hard stop this ticket touches is the existing Core `TerminalIngress::Lost` hard stop, which retires exactly one `(session, subscription, generation)` route and is exercised as a control arm below.
 
@@ -114,7 +126,7 @@ No Lua, SPA, TUI, MCP, or package changes.
 3. **Live multi-frame paste proof over the WebRTC terminal DataChannel adapter.** Same payload, fixture, and oracles, through `start_webrtc_adapter_hub` + `spawn_and_bind_webrtc` + `send_reserved_terminal_frame` for each of the 19 frames on the reserved terminal channel. Read `input_result` through `next_terminal_frame` on the same subscription channel; assert the control channel carries zero terminal frames (`control_terminal_frame_count == 0`) and no `TerminalSubscriptionClosed` host event arrives. Mode token comes from `encrypted_request(ReadModeFlags)` after `paste-sink-ready`.
 4. **Ingress buffer hold proof (64 ≥ 19, no `Lost`).** Unix arm with the existing pause seam: start the isolated Hub with `BOTSTER_HUB_TEST_PAUSE_DATA_PLANE=<file>`, bind and reach `paste-sink-ready`, arm the pause file and wait for the `.entered` acknowledgement, send all 19 frames while Core cannot intake, hold ≥ 500 ms, assert no `TerminalSubscriptionClosed` and no `input_result` arrived, remove the pause file, then require the single admitted `input_result` with `bytes_written = 1048576` and the byte-exact sink. Because Core sees Begin only after resume, the 5 s assembly timeout cannot start during the hold. This proves the `IngressBuffer` held the full burst without latching `Lost`.
    - **Control arm (proves the oracle can go red):** same paused setup, send `MIN_ADAPTER_INGRESS_BUFFER_FRAMES + 1 = 65` valid single-byte kind-1 input frames, resume, and require `TerminalSubscriptionClosed` with reason `core_adapter_closed` for exactly that route while a sibling route on the same session stays live. This is the live counterpart of the unit test `overflow_latches_lost_once`.
-5. **Content-blind source guard.** In `paste_transaction.rs`, walk `src/transport/**`, `src/subscription/**`, `src/data_plane/**`, and `src/admission/**` recursively (no fixed file list), split each file at the first `mod tests`, require the anchor symbol `push_complete` inside `src/transport/shared/ingress.rs`, and assert the production region contains none of: `KIND_PASTE`, `PASTE_BEGIN`, `PASTE_CHUNK`, `PASTE_COMMIT`, `PASTE_ABORT`, `MAX_PASTE`, `operation_id`, `encode_paste`, `botster_terminal_protocol_client`. `bracketed_paste` (a mode flag DTO field) is not a forbidden token. Prove the guard with a seeded-token ablation on a scratch copy, per [[fixed source guard lists need one ablation per added file]].
+5. **Content-blind source guard (rev 2).** In `paste_transaction.rs`, a helper `assert_hub_source_paste_blind(root: &Path) -> Result<BTreeSet<PathBuf>, String>` walks `<root>/transport/**`, `<root>/subscription/**`, `<root>/data_plane/**`, and `<root>/admission/**` recursively with no fixed file list and scans **every byte of every `.rs` file**, including inline `#[cfg(test)]` modules. There is no `mod tests` split and no brace-state scanner, so no tail can be skipped; Hub source may not name paste-transaction internals even in its own unit tests. Forbidden tokens: `KIND_PASTE`, `PASTE_BEGIN`, `PASTE_CHUNK`, `PASTE_COMMIT`, `PASTE_ABORT`, `MAX_PASTE`, `operation_id`, `encode_paste`, `botster_terminal_protocol_client`. `bracketed_paste` (a mode flag DTO field) is not forbidden. Positive invariants: the returned set must contain `transport/shared/ingress.rs`, `transport/shared/adapter_slot.rs`, `transport/unix/connection.rs`, and `transport/webrtc/subscription_channel.rs`, and `ingress.rs` must contain the anchor symbol `push_complete`, so an empty or mis-rooted walk fails. Two tests: `hub_transport_source_stays_paste_blind` runs the helper on the real `src/` (via `CARGO_MANIFEST_DIR`); `paste_blind_guard_fails_on_seeded_eof_token` copies the four roots into a scratch directory, appends `operation_id` as the **last line of `transport/shared/ingress.rs`, after its final `#[cfg(test)] mod tests` block**, runs the helper on the scratch root, and requires an `Err` that names that file. That red control is permanent in the suite, not a manual ablation, and it proves tail coverage because the seeded token sits where a `cfg(test)` skipper would have stopped scanning. The existing `FORBIDDEN_PRODUCTION_CONSTRUCTS` list in `src/lib.rs` is not extended; its fixed file list would need one ablation per file and it lives in production source.
 6. **Docs.** `docs/client-protocol.md` line ~1094: extend "Clients send input, mode-gated input, and resize as compact binary frames" to name paste transaction frames (`paste_begin`, `paste_chunk`, `paste_commit`, `paste_abort`) as Core-owned opaque frames that Hub header-validates only. `README.md` line ~100 gains the same one clause if it enumerates frame kinds. No new docs file.
 7. **Plan document.** This file, committed on the run branch.
 
@@ -195,6 +207,7 @@ Focused live proofs (each must pass at default concurrency inside the lifecycle 
 ./test.sh --test hub_daemon_lifecycle_test paused_ingress_holds_nineteen_paste_frames_without_lost -- --exact --nocapture
 ./test.sh --test hub_daemon_lifecycle_test paused_ingress_sixty_fifth_frame_latches_lost_and_closes_only_that_route -- --exact --nocapture
 ./test.sh --test hub_daemon_lifecycle_test hub_transport_source_stays_paste_blind -- --exact --nocapture
+./test.sh --test hub_daemon_lifecycle_test paste_blind_guard_fails_on_seeded_eof_token -- --exact --nocapture
 ```
 
 Required assertions inside those tests: 19 frames encoded; one and only one `input_result` for the operation id with `admitted:true` and `bytes_written:1048576`; sink file equals payload; `paste-sink-done` observed; no `TerminalSubscriptionClosed` for the paste route; WebRTC control channel terminal frame count is 0; control arm emits `core_adapter_closed` for exactly one route while the sibling stays live.
@@ -202,7 +215,7 @@ Required assertions inside those tests: 19 frames encoded; one and only one `inp
 Red arms (record command and failure text):
 
 - Pre-roll red: on a temporary commit that restores the `e5a927c` manifests and lock, run the Unix live test once. Expected failure: Hub rejects kind `4` at `push_complete`, closes the route, and the test sees `TerminalSubscriptionClosed` or no `input_result`. Restore the roll afterwards; never use bare `git stash`.
-- Source-guard red: seed `operation_id` into a scratch copy of `src/transport/shared/ingress.rs` production region and show the guard fails, then restore. Complete before the official suite starts.
+- Source-guard red: covered permanently by `paste_blind_guard_fails_on_seeded_eof_token` (seeded token after the final `cfg(test)` block of a scratch `ingress.rs`; the helper scans the scratch root). No manual source mutation is needed, so it cannot overlap the official suite.
 
 Official gates (after all ablations are restored and `git status` shows only intended changes):
 
@@ -223,7 +236,8 @@ Downstream proof: none required by the charter for a Hub pin roll. Record the me
 
 - Plan gate evidence includes `plan_uri`, `artifact_id`, `checklist_id`, `target_id`, and `target_repository`.
 - Implement attaches the pre-roll red output, the five focused test outputs, the zero-match grep, the official gate outputs, and binary provenance.
-- Plan Review should reject: any production `src/**` change, a payload below 65,536 bytes or fewer than 19 frames, an `input_result` oracle that accepts any count other than one, a hold proof that relies on wall clock without the paused arm, a fixed guard file list, or a partial pin roll.
+- Plan Review should reject: any production `src/**` change, a payload below 65,536 bytes or fewer than 19 frames, an `input_result` oracle that accepts any count other than one, a hold proof that relies on wall clock without the paused arm, a fixed guard file list, a guard that skips any file region, a guard red control that does not scan the mutated root, or a partial pin roll.
+- Implement must rebase onto current `origin/main` before the official gate and renew review if that rebase is semantic.
 
 ## Vault gaps worth capturing
 
