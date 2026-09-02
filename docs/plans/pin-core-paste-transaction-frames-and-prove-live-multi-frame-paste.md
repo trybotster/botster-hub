@@ -168,6 +168,7 @@ No Lua, SPA, TUI, MCP, or package changes.
 - `tests/hub_daemon_lifecycle/subscription_ownership_baseline.rs`, `unix_terminal_adapter.rs`, `webrtc_terminal_adapter.rs`, `package_event_plane.rs`, `event_plane_saturation.rs` (literal only)
 - `tests/hub_daemon_lifecycle/common.rs` (new `terminal_paste_frame_bytes` helper)
 - `src/transport/webrtc/delivery.rs`, `src/transport/webrtc/subscription_channel.rs` (bounded opaque inbound envelope reassembly)
+- `src/local_webrtc_smoke.rs` (Hub-owned smoke client sends version 2 terminal delivery chunks)
 - `tests/hub_daemon_lifecycle/webrtc_fixtures.rs` (versioned inbound chunk sender)
 - `tests/hub_daemon_lifecycle/paste_transaction.rs` (new: Unix live paste, WebRTC live paste, paused-hold arm, 65-frame `Lost` control, content-blind source guard)
 - `tests/hub_daemon_lifecycle_test.rs` (one `include!` line)
