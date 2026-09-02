@@ -8,7 +8,7 @@
 | `target_id` | `tgt_7e208a0c76a44980a83b63af976b1f22` |
 | Ticket | `ticket_1788313897_932611` |
 | Run | `run_1788326546_496759` |
-| Candidate commit | `648e444d761e5158222a467efa5b872fc38f552f` |
+| Candidate commit | `9fb35027d55a83785e859a4f68e73b9188ebd880` |
 | Base | `db2c43c51513c02dd32ecd7ba85a9112f769c3e8` |
 | Core pin | `48a437032791e678010254708259568ce4ad02bf` |
 | Merge policy | Direct merge. No pull request is required. |
@@ -46,6 +46,9 @@ The main constraints came from these notes:
 - [[release file gated producers flush readiness before release]]
 - [[webrtc starvation markers must drop pre release producer ready bytes]]
 - [[live byte delivery proofs need producer readiness and a completion oracle]]
+- [[process group absence requires membership proof not leader pid absence]]
+- [[worker shutdown completion requires lifecycle transport and process termination]]
+- [[subprocess harnesses must kill child on failed readiness]]
 - [[live acceptance tests must not depend on a loop tick window]]
 - [[suite wide acceptance criteria make every observed test failure in scope]]
 
@@ -70,10 +73,13 @@ The runtime teardown class does not apply because this change does not create or
 - The WebRTC live-byte proofs share one byte-or-authoritative-exit completion path.
 - The second-channel and peer-loss proofs hold their producers until the reserved route is bound.
 - The Unix detach and connection-death proof waits for route-specific terminal markers before cleanup.
+- Three WebRTC proofs use their route as the only observer for a post-bind readiness marker.
 - `src/transport/webrtc/adapter.rs` adds persistent test-only pressure for one named route.
 - `tests/hub_daemon_lifecycle/webrtc_terminal_adapter.rs` replaces two unbounded output producers with deterministic pressure proofs.
 - `tests/hub_daemon_lifecycle/harness.rs` reconciles a missing worker ancestor with the existing registry reread budget.
-- `tests/hub_daemon_lifecycle/harness_isolation.rs` proves that a concurrent registry exit does not taint the harness.
+- `tests/hub_daemon_lifecycle/harness.rs` also gives exiting owned processes a bounded two-second settle interval.
+- `tests/hub_daemon_lifecycle/harness_isolation.rs` proves concurrent registry exit and bounded ownership rechecks.
+- `tests/hub_daemon_lifecycle/webrtc_terminal_adapter.rs` proves stable pre-attach history without a later host drain.
 - `tests/hub_daemon_lifecycle_test.rs` includes the new lifecycle proof file.
 - `README.md` and `docs/client-protocol.md` document the ownership and framing rules.
 - The approved plan records the human-approved WebRTC scope change.
@@ -155,6 +161,22 @@ That run exposed `connection_death_and_detach_do_not_emit_terminal_subscription_
 The test had not proved that either Unix route was live before Detach or connection death.
 Both Unix producers now stay held until their route receives a distinct terminal marker.
 
+Verify review `review_1788387684_908449` returned two aggregate-load roots.
+The shutdown WebRTC proof could wait for a readiness marker that the producer emitted before route binding.
+The worker absence proof checked each owned PID once while the worker could still exit.
+
+The first repair removed duplicate server-side readiness observations from three WebRTC proofs.
+The WebRTC route is now the only observer for each live readiness marker.
+The worker proof now polls the complete PID, process-group, and data-directory absence oracle for two seconds.
+
+The first official run after that repair disproved the removal-only WebRTC repair.
+The shutdown proof still received zero route bytes after 30 seconds.
+The same run exposed an in-scope pre-attach history race in `webrtc_terminal_adapter_attach_emits_a_nonempty_frame_without_host_drain`.
+
+The shutdown producer now waits until its reserved route is bound before it emits its readiness marker.
+The attach proof now confirms historical output before `Attach` and issues no later `Drain` or `ReadScreen` request.
+These changes preserve each proof's production boundary.
+
 ## Verification
 
 The following focused tests pass:
@@ -205,16 +227,27 @@ The five WebRTC focused tests pass:
 
 The exact Unix test `connection_death_and_detach_do_not_emit_terminal_subscription_closed` also passes.
 
+The returned worker cleanup root has a permanent control test.
+`owned_process_absence_rechecks_until_clean` reports two live observations before it reports absence.
+The test failed with exit 101 when the bounded poll was replaced with one check.
+The failure was `ownership proof must recheck until the worker exits: "owned worker still live"`.
+
+Verify supplied the WebRTC red control at commit `026027ca86b9a575150f7e164bd2d5586cb6e2d9`.
+`external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup` failed after 30 seconds with `concatenated=[]`.
+The first official run from `c3ae6da04b95f34185dbe68531d228bb15b52fdc` repeated that failure.
+That run also failed `webrtc_terminal_adapter_attach_emits_a_nonempty_frame_without_host_drain`.
+
 Fresh Git checks show that Hub `origin/main` remains `db2c43c51513c02dd32ecd7ba85a9112f769c3e8`.
 Core `origin/main` remains `48a437032791e678010254708259568ce4ad02bf`.
 The Core branch containment check includes `origin/main`.
 The active source and lock inventory contains no old Core revision.
 `Cargo.lock` contains six exact new Core sources.
 
-The final official gate used Rust 1.97.0 and no `CARGO_TARGET_DIR` override.
+The final official gates used Rust 1.97.0 and no `CARGO_TARGET_DIR` override.
 Both required binary builds, formatting, and Clippy with warnings denied passed.
-`env -u CARGO_TARGET_DIR RUSTUP_TOOLCHAIN=1.97.0 ./test.sh --locked` passed at default concurrency.
-The lifecycle suite passed 341 tests and ignored 2 documented tests.
+`env -u CARGO_TARGET_DIR RUSTUP_TOOLCHAIN=1.97.0 ./test.sh --locked` passed twice at default concurrency.
+Both commands returned exit 0.
+Each lifecycle suite passed 342 tests and ignored 2 documented tests.
 The library suite passed 544 tests.
 All other workspace tests and doctests passed.
 
@@ -237,14 +270,16 @@ This result proves the Hub smoke client and merged Web sender use the same cold-
 
 ## Provenance and residual risk
 
-The tested Hub commit is `648e444d761e5158222a467efa5b872fc38f552f`.
+The tested Hub commit is `9fb35027d55a83785e859a4f68e73b9188ebd880`.
 The locked Core commit is `48a437032791e678010254708259568ce4ad02bf`.
 The merged Web commit is `6dc32b32d9842070742272577483275aceb71ea3`.
 The test used the worktree `target/debug/botster-hub` and `target/debug/botster-session-worker` binaries.
 The tracked code changes matched the tested candidate before the official gate.
 
-No known ticket behavior remains unverified.
-Review must confirm the bounded receiver rules and the content-blind ownership boundary.
+The ignored event-plane saturation campaign did not run.
+The larger local adversarial conformance proof did not run.
+No browser-level Web arm ran in this repair visit.
+The existing source and fixture proof still pins merged Web commit `6dc32b32d9842070742272577483275aceb71ea3`.
 
 ## Missing vault guidance
 
@@ -255,3 +290,9 @@ A zero-old-pin invariant is safer than a fixed source count.
 No vault note records this WebRTC size boundary.
 A maximum Core frame fits Core but its encrypted JSON envelope exceeds `LOCAL_WEBRTC_MAX_FRAME_BYTES`.
 The durable rule must state that Hub reassembles opaque ciphertext without owning Core transaction meaning.
+
+No vault note states that a route readiness marker must be emitted after that route binds.
+A server-side observation does not replace route-specific readiness.
+
+No vault note states that an ownership oracle can use a bounded exit settle interval.
+The final oracle must still prove PID, process-group, and data-directory absence.
