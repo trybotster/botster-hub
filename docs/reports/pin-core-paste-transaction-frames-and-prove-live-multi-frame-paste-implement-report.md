@@ -8,7 +8,7 @@
 | `target_id` | `tgt_7e208a0c76a44980a83b63af976b1f22` |
 | Ticket | `ticket_1788313897_932611` |
 | Run | `run_1788326546_496759` |
-| Candidate commit | `af06529bf0f1f496c5a0013ecbfdb4d26590bea3` |
+| Candidate commit | `648e444d761e5158222a467efa5b872fc38f552f` |
 | Base | `db2c43c51513c02dd32ecd7ba85a9112f769c3e8` |
 | Core pin | `48a437032791e678010254708259568ce4ad02bf` |
 | Merge policy | Direct merge. No pull request is required. |
@@ -46,6 +46,7 @@ The main constraints came from these notes:
 - [[release file gated producers flush readiness before release]]
 - [[webrtc starvation markers must drop pre release producer ready bytes]]
 - [[live byte delivery proofs need producer readiness and a completion oracle]]
+- [[live acceptance tests must not depend on a loop tick window]]
 - [[suite wide acceptance criteria make every observed test failure in scope]]
 
 The Rails conventions do not apply because this repository contains Rust code.
@@ -66,6 +67,9 @@ The runtime teardown class does not apply because this change does not create or
 - `tests/hub_daemon_lifecycle/common.rs` adds the test-only Core paste frame encoder.
 - `tests/hub_daemon_lifecycle/paste_transaction.rs` adds six lifecycle proofs and two source guards.
 - Three WebRTC proof files separate producer readiness, route binding, and product-byte release.
+- The WebRTC live-byte proofs share one byte-or-authoritative-exit completion path.
+- The second-channel and peer-loss proofs hold their producers until the reserved route is bound.
+- The Unix detach and connection-death proof waits for route-specific terminal markers before cleanup.
 - `src/transport/webrtc/adapter.rs` adds persistent test-only pressure for one named route.
 - `tests/hub_daemon_lifecycle/webrtc_terminal_adapter.rs` replaces two unbounded output producers with deterministic pressure proofs.
 - `tests/hub_daemon_lifecycle/harness.rs` reconciles a missing worker ancestor with the existing registry reread budget.
@@ -140,6 +144,17 @@ The same review found that the committed candidate failed Rustfmt in the new low
 Rustfmt applied the required line wrap.
 The exact format gate now passes against the committed candidate.
 
+Review `review_1788381602_871891` found three tests that failed under aggregate load.
+The shutdown-after-exit proof had not drained the producer-ready bytes before release.
+It now uses the shared readiness drain and byte-or-authoritative-exit completion path.
+The second-channel proof now holds its producer until the reserved route is bound.
+The peer-loss proof now receives a route-specific terminal marker before it closes the peer.
+
+The first full run after those repairs passed all three Review failures.
+That run exposed `connection_death_and_detach_do_not_emit_terminal_subscription_closed`.
+The test had not proved that either Unix route was live before Detach or connection death.
+Both Unix producers now stay held until their route receives a distinct terminal marker.
+
 ## Verification
 
 The following focused tests pass:
@@ -168,6 +183,27 @@ It reported `keep-reading observer must see core_adapter_closed` after 22.93 sec
 The direct low-water unit test proves that a low-water event cannot clear test pressure.
 The prior helper-thread implementation also failed the 250 ms scheduling control after 22.61 seconds.
 It reported `keep-reading observer must see core_adapter_closed`.
+
+Review commit `af06529bf0f1f496c5a0013ecbfdb4d26590bea3` failed these aggregate-load tests:
+
+- `external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup`
+- `webrtc_peer_rejects_a_second_data_channel`
+- `webrtc_terminal_adapter_bound_peer_loss_closes_adapter_without_hub_detach`
+
+The official run from `dcbfcc82d60c896f8fa1c756941b3e01efd1091d` passed those three tests.
+The same run failed `connection_death_and_detach_do_not_emit_terminal_subscription_closed`.
+It received `TerminalSubscriptionClosed` with reason `core_adapter_closed` during explicit Detach.
+This result is the red-on-revert evidence for the Unix route-readiness repair.
+
+The five WebRTC focused tests pass:
+
+- `external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup`
+- `webrtc_peer_rejects_a_second_data_channel`
+- `webrtc_terminal_adapter_bound_peer_loss_closes_adapter_without_hub_detach`
+- `external_hub_webrtc_live_output_preserves_exact_bytes`
+- `webrtc_terminal_output_is_byte_exact`
+
+The exact Unix test `connection_death_and_detach_do_not_emit_terminal_subscription_closed` also passes.
 
 Fresh Git checks show that Hub `origin/main` remains `db2c43c51513c02dd32ecd7ba85a9112f769c3e8`.
 Core `origin/main` remains `48a437032791e678010254708259568ce4ad02bf`.
@@ -201,7 +237,7 @@ This result proves the Hub smoke client and merged Web sender use the same cold-
 
 ## Provenance and residual risk
 
-The tested Hub commit is `af06529bf0f1f496c5a0013ecbfdb4d26590bea3`.
+The tested Hub commit is `648e444d761e5158222a467efa5b872fc38f552f`.
 The locked Core commit is `48a437032791e678010254708259568ce4ad02bf`.
 The merged Web commit is `6dc32b32d9842070742272577483275aceb71ea3`.
 The test used the worktree `target/debug/botster-hub` and `target/debug/botster-session-worker` binaries.
