@@ -15,6 +15,89 @@ use crate::transport::webrtc::{LocalWebrtcError, LocalWebrtcResult};
 // The current Rust WebRTC peer's message receive path is bounded at 16 KiB;
 // 12 KiB leaves transport and JSON framing headroom for every first-party peer.
 pub(crate) const LOCAL_WEBRTC_CHUNK_PAYLOAD_BYTES: usize = 12 * 1024;
+
+#[derive(Debug, Default)]
+pub(crate) struct InboundTerminalEnvelopeAssembly {
+    message_id: Option<String>,
+    completed_message_id: Option<String>,
+    chunk_count: u32,
+    total_bytes: usize,
+    next_chunk_index: u32,
+    encrypted: String,
+}
+
+impl InboundTerminalEnvelopeAssembly {
+    pub(crate) fn push(&mut self, serialized: &[u8]) -> Result<Option<String>, ()> {
+        if serialized.len() >= LOCAL_WEBRTC_MAX_FRAME_BYTES {
+            return Err(());
+        }
+        let serialized = std::str::from_utf8(serialized).map_err(|_| ())?;
+        let chunk =
+            serde_json::from_str::<DaemonLocalWebrtcDeliveryChunk>(serialized).map_err(|_| ())?;
+        if chunk.version != LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION
+            || chunk.delivery_kind != DaemonLocalWebrtcDeliveryKind::DaemonTerminalFrame
+            || chunk.message_id.is_empty()
+            || chunk.message_id.len() > 256
+            || self.completed_message_id.as_deref() == Some(chunk.message_id.as_str())
+            || chunk.chunk_count == 0
+            || chunk.total_bytes == 0
+            || chunk.total_bytes as usize > LOCAL_WEBRTC_MAX_DELIVERY_BYTES
+            || chunk.chunk_count > chunk.total_bytes
+            || chunk.payload.is_empty()
+            || chunk.payload.len() > chunk.total_bytes as usize
+        {
+            return Err(());
+        }
+        if chunk.chunk_index >= chunk.chunk_count {
+            return Err(());
+        }
+
+        match self.message_id.as_deref() {
+            None if chunk.chunk_index == 0 => {
+                self.message_id = Some(chunk.message_id.clone());
+                self.chunk_count = chunk.chunk_count;
+                self.total_bytes = chunk.total_bytes as usize;
+            }
+            Some(message_id)
+                if message_id == chunk.message_id
+                    && self.chunk_count == chunk.chunk_count
+                    && self.total_bytes == chunk.total_bytes as usize => {}
+            _ => return Err(()),
+        }
+        if chunk.chunk_index != self.next_chunk_index
+            || self.encrypted.len() + chunk.payload.len() > self.total_bytes
+        {
+            return Err(());
+        }
+        self.encrypted.push_str(&chunk.payload);
+        self.next_chunk_index += 1;
+
+        if self.next_chunk_index == self.chunk_count {
+            if self.encrypted.len() != self.total_bytes {
+                return Err(());
+            }
+            let encrypted = std::mem::take(&mut self.encrypted);
+            self.completed_message_id = self.message_id.take();
+            self.chunk_count = 0;
+            self.total_bytes = 0;
+            self.next_chunk_index = 0;
+            Ok(Some(encrypted))
+        } else {
+            let remaining_chunks = (self.chunk_count - self.next_chunk_index) as usize;
+            if self.encrypted.len() >= self.total_bytes
+                || self.total_bytes - self.encrypted.len() < remaining_chunks
+            {
+                return Err(());
+            }
+            Ok(None)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_partial(&self) -> bool {
+        self.message_id.is_some()
+    }
+}
 #[derive(Debug)]
 pub(crate) struct LocalWebrtcSendFailure {
     pub(crate) message_id: String,
@@ -347,6 +430,81 @@ mod tests {
         )
         .expect_err("over-budget response must fail before framing");
         assert!(error.to_string().contains("exceeded 16777216 byte limit"));
+    }
+
+    #[test]
+    fn terminal_input_assembly_reassembles_one_large_opaque_envelope() {
+        let encrypted = "a".repeat(96 * 1024);
+        let frames = frame_encrypted_daemon_delivery(
+            DaemonLocalWebrtcDeliveryKind::DaemonTerminalFrame,
+            "terminal-large",
+            &encrypted,
+        )
+        .expect("frame large terminal envelope");
+        assert!(frames.len() > 1);
+        assert!(
+            frames
+                .iter()
+                .all(|frame| frame.len() < LOCAL_WEBRTC_MAX_FRAME_BYTES)
+        );
+
+        let mut assembly = InboundTerminalEnvelopeAssembly::default();
+        let mut complete = None;
+        for frame in &frames {
+            complete = assembly
+                .push(frame.as_bytes())
+                .expect("ordered bounded chunk");
+        }
+        assert_eq!(complete.as_deref(), Some(encrypted.as_str()));
+        assert!(!assembly.is_partial());
+        assert_eq!(assembly.push(frames[0].as_bytes()), Err(()));
+    }
+
+    #[test]
+    fn terminal_input_assembly_fails_closed_on_malformed_or_unbounded_chunks() {
+        let encrypted = "a".repeat(LOCAL_WEBRTC_CHUNK_PAYLOAD_BYTES + 1);
+        let frames = frame_encrypted_daemon_delivery(
+            DaemonLocalWebrtcDeliveryKind::DaemonTerminalFrame,
+            "terminal-bounds",
+            &encrypted,
+        )
+        .expect("frame terminal envelope");
+
+        let mut duplicate = InboundTerminalEnvelopeAssembly::default();
+        assert_eq!(duplicate.push(frames[0].as_bytes()), Ok(None));
+        assert!(duplicate.is_partial());
+        assert_eq!(duplicate.push(frames[0].as_bytes()), Err(()));
+
+        let other = frame_encrypted_daemon_delivery(
+            DaemonLocalWebrtcDeliveryKind::DaemonTerminalFrame,
+            "terminal-other",
+            &encrypted,
+        )
+        .expect("frame other terminal envelope");
+        let mut interleaved = InboundTerminalEnvelopeAssembly::default();
+        assert_eq!(interleaved.push(frames[0].as_bytes()), Ok(None));
+        assert_eq!(interleaved.push(other[1].as_bytes()), Err(()));
+
+        let mut oversized: DaemonLocalWebrtcDeliveryChunk =
+            serde_json::from_str(&frames[0]).expect("parse first chunk");
+        oversized.total_bytes = (LOCAL_WEBRTC_MAX_DELIVERY_BYTES + 1) as u32;
+        oversized.chunk_count = oversized
+            .total_bytes
+            .div_ceil(LOCAL_WEBRTC_CHUNK_PAYLOAD_BYTES as u32);
+        let oversized = serde_json::to_vec(&oversized).expect("serialize oversized chunk");
+        assert_eq!(
+            InboundTerminalEnvelopeAssembly::default().push(&oversized),
+            Err(())
+        );
+
+        let mut wrong_kind: DaemonLocalWebrtcDeliveryChunk =
+            serde_json::from_str(&frames[0]).expect("parse first chunk");
+        wrong_kind.delivery_kind = DaemonLocalWebrtcDeliveryKind::DaemonResponse;
+        let wrong_kind = serde_json::to_vec(&wrong_kind).expect("serialize wrong-kind chunk");
+        assert_eq!(
+            InboundTerminalEnvelopeAssembly::default().push(&wrong_kind),
+            Err(())
+        );
     }
 
     #[test]

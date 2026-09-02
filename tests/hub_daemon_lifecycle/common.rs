@@ -84,6 +84,37 @@ pub(crate) fn terminal_mode_gated_frame_bytes(
     bytes
 }
 
+pub(crate) fn terminal_paste_frame_bytes(
+    operation_id: u32,
+    mode_generation: u64,
+    mode_revision: u64,
+    data: &[u8],
+) -> Vec<Vec<u8>> {
+    const CHUNK_BYTES: usize = 65_527;
+
+    let mut begin = vec![1, 4, 0, 24];
+    begin.extend_from_slice(&operation_id.to_be_bytes());
+    begin.extend_from_slice(&mode_generation.to_be_bytes());
+    begin.extend_from_slice(&mode_revision.to_be_bytes());
+    begin.extend_from_slice(&(data.len() as u32).to_be_bytes());
+
+    let mut frames = vec![begin];
+    for (index, chunk_data) in data.chunks(CHUNK_BYTES).enumerate() {
+        let body_len = u16::try_from(8 + chunk_data.len()).expect("paste chunk body fits");
+        let mut chunk = vec![1, 5];
+        chunk.extend_from_slice(&body_len.to_be_bytes());
+        chunk.extend_from_slice(&operation_id.to_be_bytes());
+        chunk.extend_from_slice(&(index as u32).to_be_bytes());
+        chunk.extend_from_slice(chunk_data);
+        frames.push(chunk);
+    }
+
+    let mut commit = vec![1, 6, 0, 4];
+    commit.extend_from_slice(&operation_id.to_be_bytes());
+    frames.push(commit);
+    frames
+}
+
 pub(crate) fn write_unix_terminal_frame(
     stream: &mut UnixStream,
     session_id: impl Into<String>,

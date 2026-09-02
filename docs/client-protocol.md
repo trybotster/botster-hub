@@ -1091,11 +1091,19 @@ authoritative `DaemonModeFlags` projection (`session_id`, `kitty_enabled`,
 `focus_reporting`, `application_cursor`) plus mode freshness
 (`mode_generation`, `mode_revision`). `mouse_mode` is the exact authoritative
 `u8` bitmask (`0` is off and combined tracking plus SGR reporting is `9`).
-Clients send input, mode-gated input, and resize as compact binary frames on
-the bound duplex terminal route. Mode-gated input uses the freshness token from
-`ReadModeFlags`. The daemon protocol has no JSON terminal input route. Unknown
+Clients send input, mode-gated input, resize, and paste transaction frames
+(`paste_begin`, `paste_chunk`, `paste_commit`, and `paste_abort`) as compact
+binary frames on the bound duplex terminal route. Hub validates only each
+opaque frame header. Core owns the paste transaction. Mode-gated input uses the
+freshness token from `ReadModeFlags`. The daemon protocol has no JSON terminal input route. Unknown
 sessions and backend failures return `operator_error` with no
-`mode_flags` body; clients must not substitute a successful zero value.
+`mode_flags` body. Clients must not substitute a successful zero value.
+
+On WebRTC terminal routes, clients first encrypt one complete opaque Core frame.
+Clients then use versioned `daemon_terminal_frame` delivery chunks when the
+serialized envelope exceeds the WebRTC frame bound. Hub reassembles one bounded
+opaque ciphertext envelope per subscription route before decryption and header
+validation. Hub does not inspect the Core frame body.
 `CaptureSnapshot` returns metadata only and never GHOSTSNP control-path bytes;
 current palette/special colors after session start are restored from data-plane
 GHOSTSNP install only. The Hub startup color profile (FG `#FFFFFF`, BG

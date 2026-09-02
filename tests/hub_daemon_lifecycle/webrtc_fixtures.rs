@@ -1231,10 +1231,40 @@ impl LocalWebrtcOfferPeer {
         key: &AesGcmKey,
         frame: &[u8],
     ) -> Result<(), Box<dyn std::error::Error>> {
+        const CHUNK_BYTES: usize = 12 * 1024;
+        static NEXT_MESSAGE_ID: AtomicU64 = AtomicU64::new(1);
+
         let envelope = encrypt_aes_gcm(key, frame, 1)?;
-        channel
-            .send_text(&serde_json::to_string(&envelope)?)
-            .await?;
+        let encrypted = serde_json::to_string(&envelope)?;
+        if encrypted.len() > botster_hub_client::LOCAL_WEBRTC_MAX_DELIVERY_BYTES {
+            return Err(
+                std::io::Error::other("terminal frame exceeds WebRTC delivery bound").into(),
+            );
+        }
+        let message_id = format!(
+            "test-terminal-{}",
+            NEXT_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        let chunk_count = encrypted.len().max(1).div_ceil(CHUNK_BYTES);
+        for (chunk_index, payload) in encrypted.as_bytes().chunks(CHUNK_BYTES).enumerate() {
+            let chunk = botster_hub_client::DaemonLocalWebrtcDeliveryChunk {
+                version: botster_hub_client::LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION,
+                delivery_kind:
+                    botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonTerminalFrame,
+                message_id: message_id.clone(),
+                chunk_index: chunk_index as u32,
+                chunk_count: chunk_count as u32,
+                total_bytes: encrypted.len() as u32,
+                payload: std::str::from_utf8(payload)?.to_string(),
+            };
+            let serialized = serde_json::to_string(&chunk)?;
+            if serialized.len() >= botster_hub_client::LOCAL_WEBRTC_MAX_FRAME_BYTES {
+                return Err(
+                    std::io::Error::other("terminal chunk exceeds WebRTC frame bound").into(),
+                );
+            }
+            channel.send_text(&serialized).await?;
+        }
         Ok(())
     }
 
