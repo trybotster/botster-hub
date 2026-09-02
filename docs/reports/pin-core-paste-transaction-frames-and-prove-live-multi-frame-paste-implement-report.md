@@ -8,7 +8,7 @@
 | `target_id` | `tgt_7e208a0c76a44980a83b63af976b1f22` |
 | Ticket | `ticket_1788313897_932611` |
 | Run | `run_1788326546_496759` |
-| Candidate commit | `1e460bf147ce963a141d9a1cface989b9bba4314` |
+| Candidate commit | `af06529bf0f1f496c5a0013ecbfdb4d26590bea3` |
 | Base | `db2c43c51513c02dd32ecd7ba85a9112f769c3e8` |
 | Core pin | `48a437032791e678010254708259568ce4ad02bf` |
 | Merge policy | Direct merge. No pull request is required. |
@@ -130,6 +130,16 @@ The new test records the session exit concurrently in the registry.
 The harness now uses its existing eight-attempt registry reread before it reports unresolved ownership.
 The harness still reports an error for a live, nonterminal command with no verified worker.
 
+Review `review_1788379959_143996` found that a helper thread armed WebRTC test pressure after route registration.
+Core could drain the one-frame producer before the helper thread armed pressure.
+The mux now arms route pressure synchronously before it inserts and wakes the route.
+The write-budget test sets a 250 ms helper delay as a scheduling control.
+The control stays green because the fixed path does not use the helper thread.
+
+The same review found that the committed candidate failed Rustfmt in the new low-water unit test.
+Rustfmt applied the required line wrap.
+The exact format gate now passes against the committed candidate.
+
 ## Verification
 
 The following focused tests pass:
@@ -156,6 +166,8 @@ It reported `unresolved worktree session-worker ancestor for command ... session
 The WebRTC write-budget test failed with the route pressure fix reverted.
 It reported `keep-reading observer must see core_adapter_closed` after 22.93 seconds.
 The direct low-water unit test proves that a low-water event cannot clear test pressure.
+The prior helper-thread implementation also failed the 250 ms scheduling control after 22.61 seconds.
+It reported `keep-reading observer must see core_adapter_closed`.
 
 Fresh Git checks show that Hub `origin/main` remains `db2c43c51513c02dd32ecd7ba85a9112f769c3e8`.
 Core `origin/main` remains `48a437032791e678010254708259568ce4ad02bf`.
@@ -165,10 +177,14 @@ The active source and lock inventory contains no old Core revision.
 
 The final official gate used Rust 1.97.0 and no `CARGO_TARGET_DIR` override.
 Both required binary builds, formatting, and Clippy with warnings denied passed.
-`RUSTUP_TOOLCHAIN=1.97.0 ./test.sh --locked` passed at default concurrency.
+`env -u CARGO_TARGET_DIR RUSTUP_TOOLCHAIN=1.97.0 ./test.sh --locked` passed at default concurrency.
 The lifecycle suite passed 341 tests and ignored 2 documented tests.
 The library suite passed 544 tests.
 All other workspace tests and doctests passed.
+
+`RUSTUP_TOOLCHAIN=1.97.0 cargo fmt --all -- --check` passed.
+`RUSTUP_TOOLCHAIN=1.97.0 cargo clippy --locked --all-targets --all-features -- -D warnings` passed.
+The exact 250 ms scheduling control passed in 2.83 seconds.
 
 The first returned full run failed these WebRTC tests:
 
@@ -185,7 +201,7 @@ This result proves the Hub smoke client and merged Web sender use the same cold-
 
 ## Provenance and residual risk
 
-The tested Hub commit is `1e460bf147ce963a141d9a1cface989b9bba4314`.
+The tested Hub commit is `af06529bf0f1f496c5a0013ecbfdb4d26590bea3`.
 The locked Core commit is `48a437032791e678010254708259568ce4ad02bf`.
 The merged Web commit is `6dc32b32d9842070742272577483275aceb71ea3`.
 The test used the worktree `target/debug/botster-hub` and `target/debug/botster-session-worker` binaries.
