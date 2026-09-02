@@ -8,7 +8,7 @@
 | `target_id` | `tgt_7e208a0c76a44980a83b63af976b1f22` |
 | Ticket | `ticket_1788313897_932611` |
 | Run | `run_1788326546_496759` |
-| Candidate commit | `b5b9fca952c5c7d8c81d4c4c1360cbf2e372c6a2` |
+| Candidate commit | `1cd5d6c4c9f46176baa07c4d619864b5ce5b6a8f` |
 | Base | `db2c43c51513c02dd32ecd7ba85a9112f769c3e8` |
 | Core pin | `48a437032791e678010254708259568ce4ad02bf` |
 | Merge policy | Direct merge. No pull request is required. |
@@ -43,6 +43,10 @@ The main constraints came from these notes:
 - [[fixed source guard lists need one ablation per added file]]
 - [[a source scanner can stay in cfg test skip mode through end of file]]
 - [[region bounded source guards need a required symbol anchor]]
+- [[release file gated producers flush readiness before release]]
+- [[webrtc starvation markers must drop pre release producer ready bytes]]
+- [[live byte delivery proofs need producer readiness and a completion oracle]]
+- [[suite wide acceptance criteria make every observed test failure in scope]]
 
 The Rails conventions do not apply because this repository contains Rust code.
 The runtime teardown class does not apply because this change does not create or change peer ownership.
@@ -54,10 +58,14 @@ The runtime teardown class does not apply because this change does not create or
 - Five lifecycle proof files and `tests/session_projection_owner_loop.rs` update exact Core provenance.
 - `src/transport/webrtc/delivery.rs` adds one bounded opaque inbound envelope assembly.
 - `src/transport/webrtc/subscription_channel.rs` connects the assembly to the production terminal channel.
+- `src/transport/shared/ingress.rs` reports test-only stored and Lost admission outcomes.
+- `src/transport/shared/adapter_slot.rs`, `src/transport/unix/adapter.rs`, and
+  `src/transport/unix/connection.rs` publish route-specific outcomes to an append-only test journal.
 - `src/local_webrtc_smoke.rs` sends every Hub smoke terminal input through version 2 chunks.
 - `tests/hub_daemon_lifecycle/webrtc_fixtures.rs` sends version 2 terminal delivery chunks.
 - `tests/hub_daemon_lifecycle/common.rs` adds the test-only Core paste frame encoder.
 - `tests/hub_daemon_lifecycle/paste_transaction.rs` adds six lifecycle proofs and two source guards.
+- Three WebRTC proof files separate producer readiness, route binding, and product-byte release.
 - `tests/hub_daemon_lifecycle_test.rs` includes the new lifecycle proof file.
 - `README.md` and `docs/client-protocol.md` document the ownership and framing rules.
 - The approved plan records the human-approved WebRTC scope change.
@@ -94,6 +102,18 @@ The next gate found the same raw path in the Hub-owned Rust smoke client.
 The final change moved `src/local_webrtc_smoke.rs` to version 2 terminal chunks.
 This change stays inside Hub transport ownership and removes the final raw terminal sender.
 
+Review `review_1788374640_664771` found no observation of actual buffer admission.
+The Unix route now writes one append-only JSON row after each `IngressBuffer` store attempt.
+Each row includes the session, subscription, and `stored` or `lost` outcome.
+The 19-frame test waits for exactly 19 stored outcomes.
+The 65-frame control waits for exactly 64 stored outcomes and one Lost outcome.
+
+The same review found three WebRTC producer tests that failed under full-suite load.
+The release-file producers now prove Core readiness before product-byte release.
+The byte-exact WebRTC test also starts the readiness marker only after route binding.
+The public protocol guide now requires version 2 chunks for every encrypted envelope.
+The plan uses a path-neutral worktree description.
+
 ## Verification
 
 The following focused tests pass:
@@ -121,18 +141,24 @@ The Core branch containment check includes `origin/main`.
 The active source and lock inventory contains no old Core revision.
 `Cargo.lock` contains six exact new Core sources.
 
-The final official gate used Rust 1.97.0 and no `CARGO_TARGET_DIR` override.
+The final post-review official gate used Rust 1.97.0 and no `CARGO_TARGET_DIR` override.
 Both required binary builds, formatting, and Clippy with warnings denied passed.
 `RUSTUP_TOOLCHAIN=1.97.0 ./test.sh --locked` passed at default concurrency.
 The lifecycle suite passed 340 tests and ignored 2 documented tests.
 All other workspace tests and doctests passed.
+
+The three WebRTC tests from Review pass alone and in the final full suite.
+The first post-review full run passed those three tests.
+That run found two other load-sensitive WebRTC close-event timeouts.
+Both tests passed in exact isolated runs.
+The unchanged second full run passed both tests and the complete official gate.
 
 The two prior smoke failures pass inside the final full suite.
 This result proves the Hub smoke client and merged Web sender use the same cold-cut chunk contract.
 
 ## Provenance and residual risk
 
-The tested Hub commit is `b5b9fca952c5c7d8c81d4c4c1360cbf2e372c6a2`.
+The tested Hub commit is `1cd5d6c4c9f46176baa07c4d619864b5ce5b6a8f`.
 The locked Core commit is `48a437032791e678010254708259568ce4ad02bf`.
 The merged Web commit is `6dc32b32d9842070742272577483275aceb71ea3`.
 The test used the worktree `target/debug/botster-hub` and `target/debug/botster-session-worker` binaries.
