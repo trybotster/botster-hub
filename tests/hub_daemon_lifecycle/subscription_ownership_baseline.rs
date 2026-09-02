@@ -186,6 +186,11 @@ fn webrtc_peer_rejects_a_second_data_channel() {
     );
     let session_id = "so-2ch-session";
     let subscription_id = "so-2ch-sub";
+    let producer_release = marker_dir.join("producer-release");
+    let producer_command = format!(
+        "while [ ! -f '{}' ]; do sleep 0.01; done; printf 'so-2ch-ready\\n'; sleep 30",
+        producer_release.display()
+    );
     block_on(async {
         let (mut peer, extra, key) =
             open_local_webrtc_peer_with_extra_channel(&endpoint, &bootstrap).await;
@@ -229,9 +234,14 @@ fn webrtc_peer_rejects_a_second_data_channel() {
             &key,
             session_id,
             subscription_id,
-            "printf 'so-2ch-ready\\n'; sleep 30",
+            &producer_command,
         )
         .await;
+        assert!(
+            !producer_release.exists(),
+            "the second-channel producer must stay held until the reserved route is bound"
+        );
+        fs::write(&producer_release, b"go").expect("release second-channel producer");
         wait_for_webrtc_marker(&mut peer, &key, session_id, subscription_id, "so-2ch-ready")
             .await;
         assert_eq!(
@@ -967,6 +977,90 @@ fn panic_webrtc_byte_exact_starvation(evidence: &str) -> ! {
     );
 }
 
+async fn wait_for_webrtc_producer_ready_frames(
+    peer: &mut LocalWebrtcOfferPeer,
+    key: &botster_core::AesGcmKey,
+    session_id: &str,
+    subscription_id: &str,
+    context: &str,
+) {
+    let mut concatenated = Vec::new();
+    let started_at = Instant::now();
+    loop {
+        drain_webrtc_live_bytes(
+            peer,
+            key,
+            session_id,
+            subscription_id,
+            &mut concatenated,
+        )
+        .await;
+        if String::from_utf8_lossy(&concatenated).contains(PRODUCER_READY_MARKER) {
+            return;
+        }
+        if started_at.elapsed() >= WEBRTC_BYTE_EXACT_BACKSTOP {
+            panic_webrtc_byte_exact_starvation(&format!(
+                "{context}: timed out waiting for WebRTC producer-ready frames; concatenated={concatenated:?}"
+            ));
+        }
+        await_next_webrtc_terminal_frame(peer, key).await;
+    }
+}
+
+async fn collect_expected_webrtc_bytes_or_authoritative_exit(
+    peer: &mut LocalWebrtcOfferPeer,
+    key: &botster_core::AesGcmKey,
+    endpoint: &botster_hub_client::DaemonEndpoint,
+    session_id: &str,
+    subscription_id: &str,
+    expected: &[u8],
+    context: &str,
+) -> Vec<u8> {
+    let mut concatenated = Vec::new();
+    let mut session_exited = false;
+    let mut quiet_turns_after_exit = 0usize;
+    let started_at = Instant::now();
+    loop {
+        let bytes_before = concatenated.len();
+        drain_webrtc_live_bytes(
+            peer,
+            key,
+            session_id,
+            subscription_id,
+            &mut concatenated,
+        )
+        .await;
+        if concatenated
+            .windows(expected.len())
+            .any(|window| window == expected)
+        {
+            return concatenated;
+        }
+        if !session_exited {
+            session_exited = webrtc_session_has_exited(endpoint, session_id);
+        }
+        if session_exited {
+            if concatenated.len() == bytes_before {
+                quiet_turns_after_exit += 1;
+            } else {
+                quiet_turns_after_exit = 0;
+            }
+            if quiet_turns_after_exit >= WEBRTC_BYTE_EXACT_QUIET_DRAIN_TURNS {
+                return concatenated;
+            }
+        }
+        if started_at.elapsed() >= WEBRTC_BYTE_EXACT_BACKSTOP {
+            if concatenated.is_empty() {
+                panic_webrtc_byte_exact_starvation(&format!(
+                    "{context}: timed out waiting for WebRTC adapter frames after producer-ready release; concatenated is empty"
+                ));
+            }
+            return concatenated;
+        }
+        await_next_webrtc_terminal_frame(peer, key).await;
+    }
+}
+
 #[test]
 fn webrtc_terminal_output_is_byte_exact() {
     let _guard = daemon_test_guard();
@@ -994,78 +1088,27 @@ fn webrtc_terminal_output_is_byte_exact() {
             .expect("create start dir");
         fs::write(&start_path, b"go").expect("start producer");
         wait_for_producer_ready(&endpoint, session_id);
-        let mut concatenated = Vec::new();
-        let ready_started_at = Instant::now();
-        loop {
-            drain_webrtc_live_bytes(
-                &mut peer,
-                &key,
-                session_id,
-                subscription_id,
-                &mut concatenated,
-            )
-            .await;
-            if String::from_utf8_lossy(&concatenated).contains(PRODUCER_READY_MARKER) {
-                break;
-            }
-            if ready_started_at.elapsed() >= WEBRTC_BYTE_EXACT_BACKSTOP {
-                if concatenated.is_empty() {
-                    panic_webrtc_byte_exact_starvation(
-                        "timed out waiting for WebRTC producer-ready frames; concatenated is empty",
-                    );
-                }
-                panic_webrtc_byte_exact_starvation(&format!(
-                    "timed out waiting for complete WebRTC producer-ready marker; concatenated={concatenated:?}"
-                ));
-            }
-            await_next_webrtc_terminal_frame(&mut peer, &key).await;
-        }
-        concatenated.clear();
+        wait_for_webrtc_producer_ready_frames(
+            &mut peer,
+            &key,
+            session_id,
+            subscription_id,
+            "subscription-ownership byte-exact",
+        )
+        .await;
         fs::create_dir_all(release_path.parent().expect("release parent"))
             .expect("create release dir");
         fs::write(&release_path, b"go").expect("release writer");
-        let mut session_exited = false;
-        let mut quiet_turns_after_exit = 0usize;
-        let started_at = Instant::now();
-        loop {
-            let bytes_before = concatenated.len();
-            drain_webrtc_live_bytes(
-                &mut peer,
-                &key,
-                session_id,
-                subscription_id,
-                &mut concatenated,
-            )
-            .await;
-            if concatenated
-                .windows(expected.len())
-                .any(|window| window == expected)
-            {
-                break;
-            }
-            if !session_exited {
-                session_exited = webrtc_session_has_exited(&endpoint, session_id);
-            }
-            if session_exited {
-                if concatenated.len() == bytes_before {
-                    quiet_turns_after_exit += 1;
-                } else {
-                    quiet_turns_after_exit = 0;
-                }
-                if quiet_turns_after_exit >= WEBRTC_BYTE_EXACT_QUIET_DRAIN_TURNS {
-                    break;
-                }
-            }
-            if started_at.elapsed() >= WEBRTC_BYTE_EXACT_BACKSTOP {
-                if concatenated.is_empty() {
-                    panic_webrtc_byte_exact_starvation(
-                        "timed out waiting for WebRTC adapter frames after producer-ready release; concatenated is empty",
-                    );
-                }
-                break;
-            }
-            await_next_webrtc_terminal_frame(&mut peer, &key).await;
-        }
+        let concatenated = collect_expected_webrtc_bytes_or_authoritative_exit(
+            &mut peer,
+            &key,
+            &endpoint,
+            session_id,
+            subscription_id,
+            expected,
+            "subscription-ownership byte-exact",
+        )
+        .await;
         assert!(
             concatenated
                 .windows(expected.len())
