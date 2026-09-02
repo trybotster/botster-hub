@@ -16,6 +16,7 @@ static HARNESS_TAINT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 const FD_LIMIT_PROBE_MARGIN: u64 = 8;
 const HUB_STOP_TERM_GRACE: Duration = Duration::from_millis(500);
 const HUB_STOP_KILL_GRACE: Duration = Duration::from_secs(2);
+const OWNED_PROCESS_EXIT_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GuardCleanupMode {
@@ -859,26 +860,49 @@ fn prove_owned_absence(
     if !expect_workers_gone {
         return Ok(());
     }
+    wait_for_owned_absence(OWNED_PROCESS_EXIT_GRACE, || {
+        owned_processes_absence_error(data_dir, owned)
+    })
+}
+
+pub(crate) fn wait_for_owned_absence(
+    grace: Duration,
+    mut probe: impl FnMut() -> Result<Option<String>, String>,
+) -> Result<(), String> {
+    let deadline = Instant::now() + grace;
+    loop {
+        match probe()? {
+            None => return Ok(()),
+            Some(error) if Instant::now() >= deadline => return Err(error),
+            Some(_) => thread::sleep(Duration::from_millis(20)),
+        }
+    }
+}
+
+fn owned_processes_absence_error(
+    data_dir: &Path,
+    owned: &OwnedSessionProcesses,
+) -> Result<Option<String>, String> {
     for pid in &owned.pids {
         if process_exists(*pid) {
-            return Err(format!("owned worker pid {pid} still live"));
+            return Ok(Some(format!("owned worker pid {pid} still live")));
         }
         if let Some(snapshot) = process_snapshot(*pid)
             && snapshot.stat.contains('Z')
         {
-            return Err(format!(
+            return Ok(Some(format!(
                 "owned worker pid {pid} is a zombie: {}",
                 snapshot.command
-            ));
+            )));
         }
     }
     for pgid in &owned.pgids {
         match process_group_probe(*pgid as libc::pid_t) {
             Ok(true) => {
-                return Err(format!(
+                return Ok(Some(format!(
                     "owned process group {pgid} still has members: {:?}",
                     process_group_census(*pgid as libc::pid_t).unwrap_or_default()
-                ));
+                )));
             }
             Ok(false) => {}
             Err(error) => return Err(error),
@@ -889,9 +913,11 @@ fn prove_owned_absence(
         .filter(|worker| worker_belongs_to_data_dir(worker, data_dir))
         .collect::<Vec<_>>();
     if !leftover.is_empty() {
-        return Err(format!("data-dir session workers still live: {leftover:?}"));
+        return Ok(Some(format!(
+            "data-dir session workers still live: {leftover:?}"
+        )));
     }
-    Ok(())
+    Ok(None)
 }
 
 #[test]

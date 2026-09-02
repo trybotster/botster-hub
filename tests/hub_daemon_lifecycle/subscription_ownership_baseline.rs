@@ -1087,7 +1087,6 @@ fn webrtc_terminal_output_is_byte_exact() {
         fs::create_dir_all(start_path.parent().expect("start parent"))
             .expect("create start dir");
         fs::write(&start_path, b"go").expect("start producer");
-        wait_for_producer_ready(&endpoint, session_id);
         wait_for_webrtc_producer_ready_frames(
             &mut peer,
             &key,
