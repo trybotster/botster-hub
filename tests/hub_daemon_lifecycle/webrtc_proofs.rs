@@ -349,7 +349,6 @@ fn external_hub_webrtc_live_output_preserves_exact_bytes() {
             "webrtc-exact-bytes-sub",
         )
         .await;
-        wait_for_producer_ready(&endpoint, "webrtc-exact-bytes-session");
         wait_for_webrtc_producer_ready_frames(
             &mut offer_peer,
             &stream_key,
@@ -529,7 +528,6 @@ fn external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup() {
                 &subscription_id,
             )
             .await;
-            wait_for_producer_ready(&endpoint, &session_id);
             wait_for_webrtc_producer_ready_frames(
                 &mut offer_peer,
                 &stream_key,

@@ -942,6 +942,18 @@ fn process_group_proof_detects_member_after_leader_exit() {
 }
 
 #[test]
+fn owned_process_absence_rechecks_until_clean() {
+    let probes = std::cell::Cell::new(0);
+    wait_for_owned_absence(Duration::from_secs(1), || {
+        let count = probes.get() + 1;
+        probes.set(count);
+        Ok((count < 3).then(|| "owned worker still live".to_string()))
+    })
+    .expect("ownership proof must recheck until the worker exits");
+    assert_eq!(probes.get(), 3, "proof must observe the clean state");
+}
+
+#[test]
 fn disarmed_guard_leaves_survivor_for_red_on_revert() {
     let _lock = daemon_test_guard();
     let data_dir = unique_short_test_dir("gdr");
