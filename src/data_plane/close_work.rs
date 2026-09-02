@@ -37,6 +37,14 @@ pub(crate) struct RouteCloseState {
 
 impl RouteCloseState {
     fn enqueue_closed_event(&self) {
+        if self.ledger.generation_is_suppressed(
+            &self.key.session_id,
+            &self.key.subscription_id,
+            self.key.generation,
+        ) {
+            self.reported.store(true, Ordering::SeqCst);
+            return;
+        }
         if self.reported.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -372,5 +380,43 @@ mod tests {
         assert_eq!(source.live_count(), baseline);
         hook.notify_closed(false);
         assert!(source.take_batch(8).is_empty());
+    }
+
+    #[test]
+    fn exact_suppression_blocks_the_direct_close_work_path() {
+        let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let source = CloseWorkSource::new();
+        let ledger = ClosedEventLedger::default();
+        let hook = source.register("session".into(), "sub".into(), 7, ledger.clone(), wake);
+        ledger.suppress_generation("session", "sub", 7);
+        hook.notify_closed(false);
+        let state = source.take_batch(1).pop().expect("queued close work");
+        state.report_if_live(true);
+        assert!(
+            ledger.pop_pending_event().is_none(),
+            "exact suppression must cover the direct close-work path"
+        );
+    }
+
+    #[test]
+    fn rolled_back_suppression_preserves_the_direct_close_work_path() {
+        let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let source = CloseWorkSource::new();
+        let ledger = ClosedEventLedger::default();
+        let hook = source.register("session".into(), "sub".into(), 7, ledger.clone(), wake);
+        ledger.suppress_generation("session", "sub", 7);
+        ledger.unsuppress_generation("session", "sub", 7);
+        hook.notify_closed(false);
+        let state = source.take_batch(1).pop().expect("queued close work");
+        state.report_if_live(true);
+        assert!(matches!(
+            ledger.pop_pending_event(),
+            Some(DaemonEvent::TerminalSubscriptionClosed {
+                session_id,
+                subscription_id,
+                generation: 7,
+                ..
+            }) if session_id == "session" && subscription_id == "sub"
+        ));
     }
 }

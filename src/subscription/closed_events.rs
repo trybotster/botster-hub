@@ -74,7 +74,22 @@ impl ClosedEventLedger {
         }
     }
 
-    fn generation_is_suppressed(
+    pub(crate) fn unsuppress_generation(
+        &self,
+        session_id: &str,
+        subscription_id: &str,
+        generation: u64,
+    ) {
+        if let Ok(mut generations) = self.suppress_generations.lock() {
+            generations.remove(&(
+                session_id.to_string(),
+                subscription_id.to_string(),
+                generation,
+            ));
+        }
+    }
+
+    pub(crate) fn generation_is_suppressed(
         &self,
         session_id: &str,
         subscription_id: &str,
@@ -547,6 +562,35 @@ mod tests {
     }
 
     #[test]
+    fn rolled_back_exact_generation_suppression_preserves_a_later_close() {
+        let ledger = ClosedEventLedger::default();
+        ledger.suppress_generation("s", "sub", 4);
+        ledger.unsuppress_generation("s", "sub", 4);
+        let mut routes = BTreeMap::new();
+        let (key, route) = closed_route("s", "sub", 4, false);
+        routes.insert(key, route);
+        let progress = ledger.queue_closed_subscription_events_bounded(
+            false,
+            &mut routes,
+            |_| Some(true),
+            usize::MAX,
+            None,
+            usize::MAX,
+            || {},
+        );
+        assert_eq!(progress.classified, 1);
+        assert!(matches!(
+            ledger.pop_pending_event(),
+            Some(DaemonEvent::TerminalSubscriptionClosed {
+                session_id,
+                subscription_id,
+                generation: 4,
+                ..
+            }) if session_id == "s" && subscription_id == "sub"
+        ));
+    }
+
+    #[test]
     fn empty_session_snapshot_installs_no_suppression_keys() {
         let ledger = ClosedEventLedger::default();
         ledger.suppress_session_keys(Vec::new());
@@ -621,6 +665,45 @@ mod tests {
             arm.contains("suppress_unix_session_close_events")
                 && CLOSED.contains("suppress_session_route_generations"),
             "helpers must snapshot exact route generations, not session-wide keys"
+        );
+    }
+
+    #[test]
+    fn detach_arm_installs_exact_suppression_before_core_request_and_rolls_back_errors() {
+        const TRANSPORT: &str = include_str!("../daemon/control/sessions.rs");
+        let detach_needle = format!(
+            "{}{}{}",
+            "DaemonRequest::Detach ",
+            "{\n            session_id,\n            subscription_id,\n        } => ",
+            char::from_u32(0x7b).expect("left brace"),
+        );
+        let shutdown_needle = "DaemonRequest::ShutdownSession { session_id } =>";
+        let arm = TRANSPORT
+            .split(&detach_needle)
+            .nth(1)
+            .expect("Detach arm")
+            .split(shutdown_needle)
+            .next()
+            .expect("Detach arm end");
+        let core = arm
+            .find("HubClientRequest::Detach")
+            .expect("Core Detach request");
+        assert_eq!(
+            arm[..core].matches("mux.suppress_generation").count(),
+            2,
+            "Detach must suppress the Unix and WebRTC generations before the Core request"
+        );
+        assert_eq!(
+            arm[core..].matches("mux.unsuppress_generation").count(),
+            2,
+            "a rejected Detach must roll back the Unix and WebRTC suppression keys"
+        );
+        assert_eq!(
+            arm[core..]
+                .matches("mux.commit_generation_suppression")
+                .count(),
+            2,
+            "a successful Detach must retire Unix and WebRTC direct close work"
         );
     }
 }

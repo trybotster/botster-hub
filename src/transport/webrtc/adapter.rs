@@ -466,14 +466,33 @@ impl WebRtcConnectionMux {
     ) {
         let session_id = session_id.into();
         let subscription_id = subscription_id.into();
-        if let Ok(source) = self.inner.close_source.lock()
-            && let Some(source) = source.as_ref()
-        {
-            source.retire(&session_id, &subscription_id, generation);
-        }
         self.inner
             .closed_events
             .suppress_generation(session_id, subscription_id, generation);
+    }
+
+    pub(crate) fn commit_generation_suppression(
+        &self,
+        session_id: &str,
+        subscription_id: &str,
+        generation: u64,
+    ) {
+        if let Ok(source) = self.inner.close_source.lock()
+            && let Some(source) = source.as_ref()
+        {
+            source.retire(session_id, subscription_id, generation);
+        }
+    }
+
+    pub(crate) fn unsuppress_generation(
+        &self,
+        session_id: &str,
+        subscription_id: &str,
+        generation: u64,
+    ) {
+        self.inner
+            .closed_events
+            .unsuppress_generation(session_id, subscription_id, generation);
     }
 
     #[cfg(test)]
