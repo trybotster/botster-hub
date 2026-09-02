@@ -421,9 +421,20 @@ fn collect_registry_record(
         capture.owned.push_pgid(snapshot.pgid);
         match worktree_session_worker_ancestor(command_pid) {
             Some(worker_pid) => retain_verified_worker(capture, &session_id, worker_pid),
-            None => capture.errors.push(format!(
-                "unresolved worktree session-worker ancestor for command {command_pid} session {session_id}"
-            )),
+            None => match reread_until_exited_or_bound(registry, &record.session_id) {
+                Ok(None) => {}
+                Ok(Some(latest)) if matches!(latest.state, RegistrySessionState::Exited) => {}
+                Ok(Some(latest)) => {
+                    if let Some(worker_pid) = recovery_worker_pid(&latest) {
+                        retain_recovery_worker(capture, &session_id, command_pid, worker_pid);
+                    } else {
+                        capture.errors.push(format!(
+                            "unresolved worktree session-worker ancestor for command {command_pid} session {session_id}"
+                        ));
+                    }
+                }
+                Err(error) => capture.errors.push(error),
+            },
         }
         return;
     }

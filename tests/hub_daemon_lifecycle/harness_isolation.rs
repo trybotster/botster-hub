@@ -628,6 +628,45 @@ fn unresolved_worker_ancestor_taints_and_retains_command_pid() {
     reset_harness_taint_after_proof();
 }
 
+#[test]
+fn live_command_without_worker_ancestor_accepts_concurrent_registry_exit() {
+    let _lock = daemon_test_guard();
+    reset_harness_taint_after_proof();
+    let data_dir = unique_short_test_dir("gce");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+    let mut decoy = ChildCleanup::spawn_non_botster_decoy();
+    let command_pid = decoy.id();
+    let registry = SessionRegistry::new(data_dir.clone());
+    let mut record = RegistryRecord::running(
+        SessionId("concurrent-exit".to_string()),
+        Some(ProcessIdentity {
+            pid: Some(command_pid),
+            runtime_id: Some("concurrent-exit-runtime".to_string()),
+        }),
+        ResizePayload { rows: 24, cols: 80 },
+        "sleep".to_string(),
+        1,
+    );
+    registry.save(&record).expect("save running registry fixture");
+
+    let updater = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(100));
+        record.state = botster_core_daemon::RegistrySessionState::Exited;
+        registry.save(&record).expect("save exited registry fixture");
+    });
+    let capture = collect_owned_session_processes(&data_dir).expect("concurrent exit capture");
+    updater.join().expect("join registry exit updater");
+
+    assert!(
+        capture.errors.is_empty(),
+        "a concurrent registry exit must resolve a missing worker ancestor: {:?}",
+        capture.errors
+    );
+    assert!(capture.owned.pids.contains(&command_pid));
+    decoy.assert_alive();
+    reset_harness_taint_after_proof();
+}
+
 fn spawn_and_reap_sleep() -> u32 {
     let mut child = Command::new("sleep")
         .arg("30")

@@ -928,7 +928,13 @@ fn webrtc_terminal_adapter_host_close_emits_negotiated_terminal_subscription_clo
 #[test]
 fn webrtc_terminal_adapter_write_budget_emits_core_adapter_closed_while_peer_stays_readable() {
     let _guard = daemon_test_guard();
-    let (hub, endpoint, bootstrap) = start_webrtc_adapter_hub("wwb");
+    let (hub, endpoint, bootstrap) = start_webrtc_adapter_hub_with_env(
+        "wwb",
+        &[(
+            "BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_SESSION",
+            "wwb-stall",
+        )],
+    );
     block_on(async {
         let (mut peer, key) = open_local_webrtc_peer(&endpoint, &bootstrap).await;
         peer.enable_host_events();
@@ -940,7 +946,7 @@ fn webrtc_terminal_adapter_write_budget_emits_core_adapter_closed_while_peer_sta
             &key,
             "wwb-stall",
             "sub-stall",
-            "yes write-budget-stall",
+            "printf 'write-budget-stall\\n'; sleep 30",
         )
         .await;
         spawn_and_bind_webrtc(
@@ -1201,7 +1207,13 @@ fn webrtc_terminal_adapter_detach_peer_death_process_exit_and_shutdown_do_not_em
 #[test]
 fn webrtc_terminal_adapter_failed_remove_session_does_not_suppress_later_core_close() {
     let _guard = daemon_test_guard();
-    let (hub, endpoint, bootstrap) = start_webrtc_adapter_hub("wrm");
+    let (hub, endpoint, bootstrap) = start_webrtc_adapter_hub_with_env(
+        "wrm",
+        &[(
+            "BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_SESSION",
+            "wrm-stall",
+        )],
+    );
     block_on(async {
         let (mut peer, key) = open_local_webrtc_peer(&endpoint, &bootstrap).await;
         peer.enable_host_events();
@@ -1213,7 +1225,7 @@ fn webrtc_terminal_adapter_failed_remove_session_does_not_suppress_later_core_cl
             &key,
             "wrm-stall",
             "sub-stall",
-            "yes remove-session-still-live",
+            "printf 'remove-session-still-live\\n'; sleep 30",
         )
         .await;
         let removed = peer
