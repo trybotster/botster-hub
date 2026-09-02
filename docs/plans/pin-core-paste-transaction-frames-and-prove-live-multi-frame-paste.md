@@ -21,7 +21,7 @@ Plan **revision 2** after Plan Review `review_1788328352_202496`
 | --- | --- |
 | Target repository | `botster-hub` (`trybotster/botster-hub`) |
 | Target id | `tgt_7e208a0c76a44980a83b63af976b1f22` |
-| Plan worktree | `botster-sessions/trybotster-botster-hub-project-pipelines-ticket_1788313897_932611`, branch `project-pipelines/ticket_1788313897_932611`, base `db2c43c` (rebased from `080ca9a` in rev 2) |
+| Plan worktree | Pipeline-provided ticket worktree, branch `project-pipelines/ticket_1788313897_932611`, base `db2c43c` (rebased from `080ca9a` in rev 2) |
 | Worktree hygiene | tracked `.gitignore` has 5 lines; path has no `:`; no `CARGO_TARGET_DIR` override is allowed for the official gate |
 | Merge policy | direct into `main`; do not create a PR |
 

@@ -22,6 +22,12 @@ pub(crate) struct IngressBuffer {
     lost_reported: AtomicBool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IngressAdmission {
+    Stored,
+    Lost,
+}
+
 impl IngressBuffer {
     pub(crate) fn new() -> Self {
         let (frames_tx, frames_rx) = sync_channel(MIN_ADAPTER_INGRESS_BUFFER_FRAMES);
@@ -54,26 +60,56 @@ impl IngressBuffer {
     /// Returns `Err(())` when the header is malformed so the caller can close
     /// the route. Returns `Ok(true)` when a complete frame was stored or loss
     /// was latched, so Core should receive a writable wake.
+    #[allow(dead_code)]
     pub(crate) fn push_complete(
         &self,
         bytes: Vec<u8>,
         is_closed: impl Fn() -> bool,
     ) -> Result<bool, ()> {
+        self.push_complete_observed(bytes, is_closed, |_| {})
+    }
+
+    pub(crate) fn push_complete_observed(
+        &self,
+        bytes: Vec<u8>,
+        is_closed: impl Fn() -> bool,
+        observed: impl FnOnce(IngressAdmission),
+    ) -> Result<bool, ()> {
         if TerminalInputFrame::from_bytes(&bytes).is_err() {
             return Err(());
         }
-        Ok(self.store_complete(bytes, is_closed))
+        Ok(self.store_complete_observed(bytes, is_closed, observed))
     }
 
     pub(crate) fn store_complete(&self, bytes: Vec<u8>, is_closed: impl Fn() -> bool) -> bool {
-        self.store_complete_after_admission(bytes, is_closed, || {})
+        self.store_complete_with_hooks(bytes, is_closed, || {}, |_| {})
     }
 
+    fn store_complete_observed(
+        &self,
+        bytes: Vec<u8>,
+        is_closed: impl Fn() -> bool,
+        observed: impl FnOnce(IngressAdmission),
+    ) -> bool {
+        self.store_complete_with_hooks(bytes, is_closed, || {}, observed)
+    }
+
+    #[cfg(test)]
     fn store_complete_after_admission(
         &self,
         bytes: Vec<u8>,
         is_closed: impl Fn() -> bool,
         admitted: impl FnOnce(),
+    ) -> bool {
+        self.store_complete_with_hooks(bytes, is_closed, admitted, |_| {})
+    }
+
+    fn store_complete_with_hooks(
+        &self,
+        bytes: Vec<u8>,
+        is_closed: impl Fn() -> bool,
+        admitted: impl FnOnce(),
+        observed: impl FnOnce(IngressAdmission),
     ) -> bool {
         if is_closed() {
             return false;
@@ -82,14 +118,17 @@ impl IngressBuffer {
         if is_closed() {
             return false;
         }
-        let stored = match self.frames_tx.try_send(bytes) {
-            Ok(()) => true,
+        let (stored, observation) = match self.frames_tx.try_send(bytes) {
+            Ok(()) => (true, Some(IngressAdmission::Stored)),
             Err(TrySendError::Full(_)) => {
                 self.lost.store(true, Ordering::SeqCst);
-                false
+                (false, Some(IngressAdmission::Lost))
             }
-            Err(TrySendError::Disconnected(_)) => false,
+            Err(TrySendError::Disconnected(_)) => (false, None),
         };
+        if let Some(observation) = observation {
+            observed(observation);
+        }
         if is_closed() {
             self.clear();
             return false;

@@ -1264,6 +1264,27 @@ pub(crate) fn write_python_wait_then_write_script(release_path: &Path, bytes: &[
     script_path
 }
 
+pub(crate) fn write_python_start_then_write_script(
+    start_path: &Path,
+    release_path: &Path,
+    bytes: &[u8],
+) -> PathBuf {
+    let script_path = unique_short_test_dir("started-live-output-script").join("write.py");
+    fs::create_dir_all(script_path.parent().expect("script parent")).expect("create script dir");
+    fs::write(
+        &script_path,
+        format!(
+            "import os\nimport time\ns = {start:?}\nwhile not os.path.exists(s):\n    time.sleep(0.01)\nprint({ready:?}, flush=True)\np = {release:?}\nwhile not os.path.exists(p):\n    time.sleep(0.01)\nos.write(1, bytes([{bytes}]))\n",
+            start = start_path,
+            ready = PRODUCER_READY_MARKER,
+            release = release_path,
+            bytes = python_bytes_literal(bytes),
+        ),
+    )
+    .expect("write start-then-write script");
+    script_path
+}
+
 pub(crate) fn write_python_held_live_script(
     release_path: &Path,
     exit_release_path: &Path,

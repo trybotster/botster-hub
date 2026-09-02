@@ -974,8 +974,9 @@ fn webrtc_terminal_output_is_byte_exact() {
     let (hub, endpoint, bootstrap) = start_webrtc_adapter_hub("so-bytes");
     let session_id = "so-bytes-session";
     let subscription_id = "so-bytes-sub";
+    let start_path = unique_short_test_dir("so-bytes-start").join("go");
     let release_path = unique_short_test_dir("so-bytes-release").join("go");
-    let script_path = write_python_wait_then_write_script(&release_path, expected);
+    let script_path = write_python_start_then_write_script(&start_path, &release_path, expected);
     block_on(async {
         let (mut peer, key) = open_local_webrtc_peer(&endpoint, &bootstrap).await;
         peer.encrypted_hello(&key, &webrtc_terminal_adapter_hello())
@@ -989,6 +990,9 @@ fn webrtc_terminal_output_is_byte_exact() {
             &python_script_command(&script_path),
         )
         .await;
+        fs::create_dir_all(start_path.parent().expect("start parent"))
+            .expect("create start dir");
+        fs::write(&start_path, b"go").expect("start producer");
         wait_for_producer_ready(&endpoint, session_id);
         let mut concatenated = Vec::new();
         let ready_started_at = Instant::now();

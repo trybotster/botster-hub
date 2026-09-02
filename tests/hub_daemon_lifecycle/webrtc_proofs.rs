@@ -349,6 +349,7 @@ fn external_hub_webrtc_live_output_preserves_exact_bytes() {
             "webrtc-exact-bytes-sub",
         )
         .await;
+        wait_for_producer_ready(&endpoint, "webrtc-exact-bytes-session");
         fs::create_dir_all(release_path.parent().expect("release parent"))
             .expect("create webrtc release dir");
         fs::write(&release_path, b"go").expect("release webrtc write(2) producer");
@@ -557,6 +558,7 @@ fn external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup() {
                 &subscription_id,
             )
             .await;
+            wait_for_producer_ready(&endpoint, &session_id);
             fs::create_dir_all(release_path.parent().expect("release parent"))
                 .expect("create webrtc release dir");
             fs::write(&release_path, b"go").expect("release webrtc write(2) producer");
