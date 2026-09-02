@@ -372,16 +372,6 @@ pub(crate) fn handle_runtime(
                     &tracked_subscription_id,
                 )
             });
-            let response = api.handle_request(
-                runtime,
-                &packages,
-                HubClientRequest::Detach {
-                    request_id: request_id("daemon-sessions-detach"),
-                    session_id: SessionId(session_id),
-                    subscription_id: SubscriptionId(subscription_id),
-                    now_seconds: now,
-                },
-            )?;
             if let Some(client_id) = observability.client_id
                 && let Some(UnixTerminalAdmission::Admitted { mux, .. }) =
                     pending_runtime.admission.unix_admissions.get(client_id)
@@ -404,6 +394,68 @@ pub(crate) fn handle_runtime(
                     generation.0,
                 );
             }
+            let response = api.handle_request(
+                runtime,
+                &packages,
+                HubClientRequest::Detach {
+                    request_id: request_id("daemon-sessions-detach"),
+                    session_id: SessionId(session_id),
+                    subscription_id: SubscriptionId(subscription_id),
+                    now_seconds: now,
+                },
+            );
+            let response = match response {
+                Ok(response) => {
+                    if let Some(client_id) = observability.client_id
+                        && let Some(UnixTerminalAdmission::Admitted { mux, .. }) =
+                            pending_runtime.admission.unix_admissions.get(client_id)
+                        && let Some(generation) = generation
+                    {
+                        mux.commit_generation_suppression(
+                            &tracked_session_id,
+                            &tracked_subscription_id,
+                            generation.0,
+                        );
+                    }
+                    if let Some(grant_id) = observability.grant_id
+                        && let Some(WebrtcTerminalAdmission::Admitted { mux, .. }) =
+                            pending_runtime.admission.webrtc_admissions.get(grant_id)
+                        && let Some(generation) = generation
+                    {
+                        mux.commit_generation_suppression(
+                            &tracked_session_id,
+                            &tracked_subscription_id,
+                            generation.0,
+                        );
+                    }
+                    response
+                }
+                Err(error) => {
+                    if let Some(client_id) = observability.client_id
+                        && let Some(UnixTerminalAdmission::Admitted { mux, .. }) =
+                            pending_runtime.admission.unix_admissions.get(client_id)
+                        && let Some(generation) = generation
+                    {
+                        mux.unsuppress_generation(
+                            &tracked_session_id,
+                            &tracked_subscription_id,
+                            generation.0,
+                        );
+                    }
+                    if let Some(grant_id) = observability.grant_id
+                        && let Some(WebrtcTerminalAdmission::Admitted { mux, .. }) =
+                            pending_runtime.admission.webrtc_admissions.get(grant_id)
+                        && let Some(generation) = generation
+                    {
+                        mux.unsuppress_generation(
+                            &tracked_session_id,
+                            &tracked_subscription_id,
+                            generation.0,
+                        );
+                    }
+                    return Err(error.into());
+                }
+            };
             pending_runtime.close_adapter(&tracked_session_id, &tracked_subscription_id);
             pending_runtime
                 .admission
