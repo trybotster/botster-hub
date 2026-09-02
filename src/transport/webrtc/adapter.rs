@@ -47,6 +47,7 @@ struct WebRtcTerminalAdapterInner {
     aggregate: Option<Arc<crate::admission::connection_budget::ConnectionAggregate>>,
     aggregate_permit: Mutex<Option<crate::admission::connection_budget::AggregateSendPermit>>,
     aggregate_blocked: AtomicBool,
+    test_forced_would_block: AtomicBool,
 }
 
 impl WebRtcTerminalAdapterInner {
@@ -59,6 +60,7 @@ impl WebRtcTerminalAdapterInner {
             aggregate: None,
             aggregate_permit: Mutex::new(None),
             aggregate_blocked: AtomicBool::new(false),
+            test_forced_would_block: AtomicBool::new(false),
         }
     }
 
@@ -86,6 +88,9 @@ impl WebRtcTerminalAdapterInner {
     }
 
     fn pressure(&self) -> TerminalAdapterPressure {
+        if self.test_forced_would_block.load(Ordering::Acquire) {
+            return TerminalAdapterPressure::WouldBlock;
+        }
         self.refresh_aggregate_pressure();
         if self.aggregate_blocked.load(Ordering::Acquire) {
             return TerminalAdapterPressure::WouldBlock;
@@ -94,6 +99,9 @@ impl WebRtcTerminalAdapterInner {
     }
 
     fn try_write(&self, frame: &TerminalFrame) -> Result<(), TerminalAdapterWriteError> {
+        if self.test_forced_would_block.load(Ordering::Acquire) {
+            return Err(TerminalAdapterWriteError::WouldBlock);
+        }
         let permit = if let Some(aggregate) = self.aggregate.as_ref() {
             let frame_len = frame
                 .to_bytes()
@@ -206,6 +214,7 @@ impl WebRtcTerminalAdapter {
             aggregate,
             aggregate_permit: Mutex::new(None),
             aggregate_blocked: AtomicBool::new(false),
+            test_forced_would_block: AtomicBool::new(false),
         });
         (
             Self {
@@ -362,6 +371,7 @@ impl WebRtcConnectionMux {
         generation: u64,
         handle: WebRtcTerminalAdapterHandle,
     ) {
+        let forced_would_block_delay = forced_would_block_delay(&session_id);
         if let Ok(mut routes) = self.inner.routes.lock() {
             let key = (session_id.clone(), subscription_id.clone(), generation);
             routes.insert(
@@ -387,6 +397,18 @@ impl WebRtcConnectionMux {
                 Arc::new(move || wake.wake()),
             );
             handle.attach_close_hook(move |host_closed| hook.notify_closed(host_closed));
+        }
+        if let Some(delay) = forced_would_block_delay {
+            let inner = Arc::downgrade(&handle.inner);
+            std::thread::Builder::new()
+                .name("botster-hub-test-webrtc-pressure".to_string())
+                .spawn(move || {
+                    std::thread::sleep(delay);
+                    if let Some(inner) = inner.upgrade() {
+                        inner.test_forced_would_block.store(true, Ordering::Release);
+                    }
+                })
+                .expect("start WebRTC test pressure timer");
         }
         self.inner.wake.wake();
     }
@@ -646,6 +668,20 @@ impl ClosedHandle for WebRtcTerminalAdapterHandle {
     }
 }
 
+fn forced_would_block_delay(session_id: &str) -> Option<std::time::Duration> {
+    if std::env::var("BOTSTER_ENV").as_deref() != Ok("test")
+        || std::env::var("BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_SESSION").as_deref()
+            != Ok(session_id)
+    {
+        return None;
+    }
+    let delay_ms = std::env::var("BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_DELAY_MS")
+        .ok()
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or(0);
+    Some(std::time::Duration::from_millis(delay_ms))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -749,6 +785,24 @@ mod tests {
         assert!(handle.complete_active().is_some());
         assert!(handle.complete_active().is_none());
         assert_eq!(adapter.pressure(), TerminalAdapterPressure::Ready);
+    }
+
+    #[test]
+    fn data_channel_low_water_does_not_clear_test_forced_route_pressure() {
+        let (mut adapter, handle) = WebRtcTerminalAdapter::pair();
+        handle
+            .inner
+            .test_forced_would_block
+            .store(true, Ordering::Release);
+        handle.set_would_block(false);
+        let frame = TerminalFrame::from_bytes(br#"{"type":"terminal_output"}"#)
+            .expect("opaque frame");
+
+        assert_eq!(adapter.pressure(), TerminalAdapterPressure::WouldBlock);
+        assert_eq!(
+            adapter.try_write(&frame),
+            Err(TerminalAdapterWriteError::WouldBlock)
+        );
     }
 
     #[test]
