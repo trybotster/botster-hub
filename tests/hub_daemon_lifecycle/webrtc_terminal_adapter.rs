@@ -928,11 +928,16 @@ fn webrtc_terminal_adapter_host_close_emits_negotiated_terminal_subscription_clo
 #[test]
 fn webrtc_terminal_adapter_write_budget_emits_core_adapter_closed_while_peer_stays_readable() {
     let _guard = daemon_test_guard();
+    // WebRTC pressure must arm synchronously when the shared delay variable is set.
     let (hub, endpoint, bootstrap) = start_webrtc_adapter_hub_with_env(
         "wwb",
         &[(
             "BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_SESSION",
             "wwb-stall",
+        ),
+        (
+            "BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_DELAY_MS",
+            "250",
         )],
     );
     block_on(async {
