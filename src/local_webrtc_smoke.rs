@@ -423,13 +423,39 @@ impl LocalWebrtcOfferPeer {
             .map_err(|error| SmokeError::Webrtc(error.to_string()))?;
         let envelope = encrypt_aes_gcm(key, &input, 1)
             .map_err(|error| SmokeError::Webrtc(error.to_string()))?;
-        channel
-            .send_text(
-                &serde_json::to_string(&envelope)
-                    .map_err(|error| SmokeError::Webrtc(error.to_string()))?,
-            )
-            .await
+        let encrypted = serde_json::to_string(&envelope)
             .map_err(|error| SmokeError::Webrtc(error.to_string()))?;
+        if encrypted.len() > LOCAL_WEBRTC_MAX_DELIVERY_BYTES {
+            return Err(SmokeError::Webrtc(
+                "local WebRTC terminal input exceeded delivery bound".to_string(),
+            ));
+        }
+        const CHUNK_BYTES: usize = 12 * 1024;
+        let chunk_count = encrypted.len().max(1).div_ceil(CHUNK_BYTES);
+        for (chunk_index, payload) in encrypted.as_bytes().chunks(CHUNK_BYTES).enumerate() {
+            let chunk = DaemonLocalWebrtcDeliveryChunk {
+                version: LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION,
+                delivery_kind: DaemonLocalWebrtcDeliveryKind::DaemonTerminalFrame,
+                message_id: "smoke-terminal-input".to_string(),
+                chunk_index: chunk_index as u32,
+                chunk_count: chunk_count as u32,
+                total_bytes: encrypted.len() as u32,
+                payload: std::str::from_utf8(payload)
+                    .map_err(|error| SmokeError::Webrtc(error.to_string()))?
+                    .to_string(),
+            };
+            let serialized = serde_json::to_string(&chunk)
+                .map_err(|error| SmokeError::Webrtc(error.to_string()))?;
+            if serialized.len() >= LOCAL_WEBRTC_MAX_FRAME_BYTES {
+                return Err(SmokeError::Webrtc(
+                    "local WebRTC terminal input chunk exceeded frame bound".to_string(),
+                ));
+            }
+            channel
+                .send_text(&serialized)
+                .await
+                .map_err(|error| SmokeError::Webrtc(error.to_string()))?;
+        }
         Ok(())
     }
 
