@@ -8,7 +8,7 @@
 | `target_id` | `tgt_7e208a0c76a44980a83b63af976b1f22` |
 | Ticket | `ticket_1788313897_932611` |
 | Run | `run_1788326546_496759` |
-| Candidate commit | `1cd5d6c4c9f46176baa07c4d619864b5ce5b6a8f` |
+| Candidate commit | `1e460bf147ce963a141d9a1cface989b9bba4314` |
 | Base | `db2c43c51513c02dd32ecd7ba85a9112f769c3e8` |
 | Core pin | `48a437032791e678010254708259568ce4ad02bf` |
 | Merge policy | Direct merge. No pull request is required. |
@@ -66,6 +66,10 @@ The runtime teardown class does not apply because this change does not create or
 - `tests/hub_daemon_lifecycle/common.rs` adds the test-only Core paste frame encoder.
 - `tests/hub_daemon_lifecycle/paste_transaction.rs` adds six lifecycle proofs and two source guards.
 - Three WebRTC proof files separate producer readiness, route binding, and product-byte release.
+- `src/transport/webrtc/adapter.rs` adds persistent test-only pressure for one named route.
+- `tests/hub_daemon_lifecycle/webrtc_terminal_adapter.rs` replaces two unbounded output producers with deterministic pressure proofs.
+- `tests/hub_daemon_lifecycle/harness.rs` reconciles a missing worker ancestor with the existing registry reread budget.
+- `tests/hub_daemon_lifecycle/harness_isolation.rs` proves that a concurrent registry exit does not taint the harness.
 - `tests/hub_daemon_lifecycle_test.rs` includes the new lifecycle proof file.
 - `README.md` and `docs/client-protocol.md` document the ownership and framing rules.
 - The approved plan records the human-approved WebRTC scope change.
@@ -114,6 +118,18 @@ The byte-exact WebRTC test also starts the readiness marker only after route bin
 The public protocol guide now requires version 2 chunks for every encrypted envelope.
 The plan uses a path-neutral worktree description.
 
+Review `review_1788377731_757118` found three first-failure roots in required full runs.
+Two WebRTC tests depended on high-volume `yes` output to cause DataChannel pressure.
+The WebRTC mux now applies persistent test-only pressure to one named route.
+DataChannel low-water events cannot clear this test pressure.
+The two tests now use one output frame and preserve their Core close assertions.
+
+The third root was `cli_short_lived_session_shutdown_returns_structured_cleanup`.
+The harness saw a live command but could not resolve its worker ancestor.
+The new test records the session exit concurrently in the registry.
+The harness now uses its existing eight-attempt registry reread before it reports unresolved ownership.
+The harness still reports an error for a live, nonterminal command with no verified worker.
+
 ## Verification
 
 The following focused tests pass:
@@ -135,34 +151,45 @@ The old Core pin red control failed with `core_adapter_closed` and no `input_res
 The old single-message WebRTC red control failed with `rejection=operation_incomplete`.
 The permanent source guard red control detects a forbidden token after the final test module.
 
+The concurrent registry exit test failed with the harness fix reverted.
+It reported `unresolved worktree session-worker ancestor for command ... session concurrent-exit`.
+The WebRTC write-budget test failed with the route pressure fix reverted.
+It reported `keep-reading observer must see core_adapter_closed` after 22.93 seconds.
+The direct low-water unit test proves that a low-water event cannot clear test pressure.
+
 Fresh Git checks show that Hub `origin/main` remains `db2c43c51513c02dd32ecd7ba85a9112f769c3e8`.
 Core `origin/main` remains `48a437032791e678010254708259568ce4ad02bf`.
 The Core branch containment check includes `origin/main`.
 The active source and lock inventory contains no old Core revision.
 `Cargo.lock` contains six exact new Core sources.
 
-The final post-review official gate used Rust 1.97.0 and no `CARGO_TARGET_DIR` override.
+The final official gate used Rust 1.97.0 and no `CARGO_TARGET_DIR` override.
 Both required binary builds, formatting, and Clippy with warnings denied passed.
 `RUSTUP_TOOLCHAIN=1.97.0 ./test.sh --locked` passed at default concurrency.
-The lifecycle suite passed 340 tests and ignored 2 documented tests.
+The lifecycle suite passed 341 tests and ignored 2 documented tests.
+The library suite passed 544 tests.
 All other workspace tests and doctests passed.
 
-The three WebRTC tests from Review pass alone and in the final full suite.
-The first post-review full run passed those three tests.
-That run found two other load-sensitive WebRTC close-event timeouts.
-Both tests passed in exact isolated runs.
-The unchanged second full run passed both tests and the complete official gate.
+The first returned full run failed these WebRTC tests:
+
+- `webrtc_terminal_adapter_failed_remove_session_does_not_suppress_later_core_close`
+- `webrtc_terminal_adapter_write_budget_emits_core_adapter_closed_while_peer_stays_readable`
+
+Independent Review then found one harness taint root in `cli_short_lived_session_shutdown_returns_structured_cleanup`.
+The first full run after the initial pressure change passed 340 lifecycle tests and failed the write-budget test.
+That run proved that low-water events could clear the initial injected pressure.
+The final unchanged full run passed all three prior roots and the complete official gate.
 
 The two prior smoke failures pass inside the final full suite.
 This result proves the Hub smoke client and merged Web sender use the same cold-cut chunk contract.
 
 ## Provenance and residual risk
 
-The tested Hub commit is `1cd5d6c4c9f46176baa07c4d619864b5ce5b6a8f`.
+The tested Hub commit is `1e460bf147ce963a141d9a1cface989b9bba4314`.
 The locked Core commit is `48a437032791e678010254708259568ce4ad02bf`.
 The merged Web commit is `6dc32b32d9842070742272577483275aceb71ea3`.
 The test used the worktree `target/debug/botster-hub` and `target/debug/botster-session-worker` binaries.
-The tracked worktree was clean before the official gate.
+The tracked code changes matched the tested candidate before the official gate.
 
 No known ticket behavior remains unverified.
 Review must confirm the bounded receiver rules and the content-blind ownership boundary.
