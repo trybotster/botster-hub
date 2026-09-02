@@ -2083,14 +2083,36 @@ fn connection_death_and_detach_do_not_emit_terminal_subscription_closed() {
     let (mut stream, mut reader) = unix_adapter_connection(&endpoint);
     let mut envelopes = Vec::new();
     let mut events = Vec::new();
+    let producer_dir = unique_short_test_dir("cdn-producers");
+    fs::create_dir_all(&producer_dir).expect("create connection-death producer directory");
+    let detach_release = producer_dir.join("detach-release");
+    let detach_command = format!(
+        "while [ ! -f '{}' ]; do sleep 0.01; done; printf 'cdn-detach-ready\\n'; sleep 30",
+        detach_release.display()
+    );
     spawn_and_bind(
         &mut stream,
         &mut reader,
         "cdn-session",
         "cdn-sub",
-        "sleep 30",
+        &detach_command,
         &mut envelopes,
         &mut events,
+    );
+    assert!(
+        !detach_release.exists(),
+        "the detach producer must stay held until the Unix route is bound"
+    );
+    fs::write(&detach_release, b"go").expect("release detach producer");
+    read_unsolicited_terminal_until(
+        &mut reader,
+        &mut envelopes,
+        Instant::now() + Duration::from_secs(10),
+        "cdn-detach-ready",
+    );
+    assert!(
+        unix_envelope_contains_live_bytes(&envelopes, "cdn-detach-ready"),
+        "the Unix route must deliver the detach producer marker before Detach"
     );
     let detach = request_collecting_mux(
         &mut stream,
@@ -2117,14 +2139,34 @@ fn connection_death_and_detach_do_not_emit_terminal_subscription_closed() {
     let (mut replacement, mut replacement_reader) = unix_adapter_connection(&endpoint);
     let mut replacement_events = Vec::new();
     let mut replacement_envelopes = Vec::new();
+    let death_release = producer_dir.join("death-release");
+    let death_command = format!(
+        "while [ ! -f '{}' ]; do sleep 0.01; done; printf 'cdn-death-ready\\n'; sleep 30",
+        death_release.display()
+    );
     spawn_and_bind(
         &mut replacement,
         &mut replacement_reader,
         "cdn-death",
         "cdn-death-sub",
-        "sleep 30",
+        &death_command,
         &mut replacement_envelopes,
         &mut replacement_events,
+    );
+    assert!(
+        !death_release.exists(),
+        "the connection-death producer must stay held until the Unix route is bound"
+    );
+    fs::write(&death_release, b"go").expect("release connection-death producer");
+    read_unsolicited_terminal_until(
+        &mut replacement_reader,
+        &mut replacement_envelopes,
+        Instant::now() + Duration::from_secs(10),
+        "cdn-death-ready",
+    );
+    assert!(
+        unix_envelope_contains_live_bytes(&replacement_envelopes, "cdn-death-ready"),
+        "the Unix route must deliver the connection-death marker before EOF"
     );
     drop(replacement);
     thread::sleep(Duration::from_millis(200));
