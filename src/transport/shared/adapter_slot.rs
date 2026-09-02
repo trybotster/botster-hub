@@ -9,7 +9,7 @@ use botster_core::contract::terminal_wake::{TerminalWakeKind, TerminalWakeSink};
 use botster_terminal_protocol::TerminalFrame;
 
 use super::close_reason::CloseCause;
-use super::ingress::IngressBuffer;
+use super::ingress::{IngressAdmission, IngressBuffer};
 use super::wake::WakeSink;
 
 type CloseHook = Arc<dyn Fn(bool) + Send + Sync>;
@@ -188,10 +188,21 @@ impl<W: WakeSink> AdapterSlot<W> {
     }
 
     pub(crate) fn push_ingress(&self, bytes: Vec<u8>) -> Result<(), ()> {
+        self.push_ingress_observed(bytes, |_| {})
+    }
+
+    pub(crate) fn push_ingress_observed(
+        &self,
+        bytes: Vec<u8>,
+        observed: impl FnOnce(IngressAdmission),
+    ) -> Result<(), ()> {
         if self.is_closed() {
             return Ok(());
         }
-        match self.ingress.push_complete(bytes, || self.is_closed()) {
+        match self
+            .ingress
+            .push_complete_observed(bytes, || self.is_closed(), observed)
+        {
             Ok(true) => {
                 self.emit_writable();
                 Ok(())

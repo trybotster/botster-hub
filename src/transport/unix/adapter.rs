@@ -5,6 +5,7 @@
 //! `close` and `Drop` return without waiting on socket I/O or a writer lock.
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,6 +15,7 @@ use crate::subscription::closed_events::{
     ClosedEventLedger, ClosedEventRoute, ClosedEventSliceProgress, ClosedHandle,
 };
 use crate::transport::shared::adapter_slot::AdapterSlot;
+use crate::transport::shared::ingress::IngressAdmission;
 use crate::transport::shared::wake::AdapterWake;
 use botster_core::contract::terminal_adapter::{
     TerminalAdapter, TerminalAdapterPressure, TerminalAdapterWriteError, TerminalIngress,
@@ -529,6 +531,39 @@ fn record_forced_pressure(name: &str) {
     }
 }
 
+fn observe_ingress_admission_for_test(
+    session_id: &str,
+    subscription_id: &str,
+    admission: IngressAdmission,
+) {
+    if std::env::var("BOTSTER_ENV").as_deref() != Ok("test") {
+        return;
+    }
+    let Ok(path) = std::env::var("BOTSTER_HUB_TEST_INGRESS_ADMISSION_OBSERVATION") else {
+        return;
+    };
+    if path.is_empty() {
+        return;
+    }
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return;
+    };
+    let outcome = match admission {
+        IngressAdmission::Stored => "stored",
+        IngressAdmission::Lost => "lost",
+    };
+    let row = serde_json::json!({
+        "session_id": session_id,
+        "subscription_id": subscription_id,
+        "outcome": outcome,
+    });
+    let _ = writeln!(file, "{row}");
+}
+
 fn forced_would_block_delay(session_id: &str) -> Option<std::time::Duration> {
     if std::env::var("BOTSTER_ENV").as_deref() != Ok("test")
         || std::env::var("BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_SESSION").as_deref()
@@ -589,8 +624,20 @@ impl UnixTerminalAdapterHandle {
         self.inner.slot.attach_close_hook(hook);
     }
 
+    #[allow(dead_code)]
     pub(crate) fn push_ingress(&self, bytes: Vec<u8>) -> Result<(), ()> {
         self.inner.slot.push_ingress(bytes)
+    }
+
+    pub(crate) fn push_ingress_for_route(
+        &self,
+        bytes: Vec<u8>,
+        session_id: &str,
+        subscription_id: &str,
+    ) -> Result<(), ()> {
+        self.inner.slot.push_ingress_observed(bytes, |admission| {
+            observe_ingress_admission_for_test(session_id, subscription_id, admission);
+        })
     }
 
     #[cfg(test)]

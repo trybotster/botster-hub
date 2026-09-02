@@ -1100,10 +1100,11 @@ sessions and backend failures return `operator_error` with no
 `mode_flags` body. Clients must not substitute a successful zero value.
 
 On WebRTC terminal routes, clients first encrypt one complete opaque Core frame.
-Clients then use versioned `daemon_terminal_frame` delivery chunks when the
-serialized envelope exceeds the WebRTC frame bound. Hub reassembles one bounded
-opaque ciphertext envelope per subscription route before decryption and header
-validation. Hub does not inspect the Core frame body.
+Clients then send every encrypted envelope as version 2 `daemon_terminal_frame`
+delivery chunks. A small envelope uses `chunk_count=1`. Clients must not send a
+raw encrypted envelope. Hub reassembles one bounded opaque ciphertext envelope
+per subscription route before decryption and header validation. Hub does not
+inspect the Core frame body.
 `CaptureSnapshot` returns metadata only and never GHOSTSNP control-path bytes;
 current palette/special colors after session start are restored from data-plane
 GHOSTSNP install only. The Hub startup color profile (FG `#FFFFFF`, BG

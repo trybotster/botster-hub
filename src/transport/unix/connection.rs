@@ -238,7 +238,13 @@ pub(crate) async fn handle_connection_async(
                     Ok(bytes) => {
                         if let Some(handle) =
                             mux.live_handle(&envelope.session_id, &envelope.subscription_id)
-                            && handle.push_ingress(bytes).is_err()
+                            && handle
+                                .push_ingress_for_route(
+                                    bytes,
+                                    &envelope.session_id,
+                                    &envelope.subscription_id,
+                                )
+                                .is_err()
                         {
                             handle.close();
                         }

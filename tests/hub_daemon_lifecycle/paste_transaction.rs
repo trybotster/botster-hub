@@ -2,6 +2,55 @@ use std::collections::BTreeSet;
 
 const LIVE_PASTE_BYTES: usize = 1_048_576;
 
+fn ingress_admission_counts(path: &Path, session_id: &str, subscription_id: &str) -> (usize, usize) {
+    let body = fs::read_to_string(path).unwrap_or_default();
+    body.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|row| {
+            row.get("session_id").and_then(serde_json::Value::as_str) == Some(session_id)
+                && row
+                    .get("subscription_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(subscription_id)
+        })
+        .fold((0, 0), |(stored, lost), row| {
+            match row.get("outcome").and_then(serde_json::Value::as_str) {
+                Some("stored") => (stored + 1, lost),
+                Some("lost") => (stored, lost + 1),
+                _ => (stored, lost),
+            }
+        })
+}
+
+fn wait_for_ingress_admissions(
+    path: &Path,
+    session_id: &str,
+    subscription_id: &str,
+    expected_stored: usize,
+    expected_lost: usize,
+) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let counts = ingress_admission_counts(path, session_id, subscription_id);
+        assert!(
+            counts.0 <= expected_stored && counts.1 <= expected_lost,
+            "unexpected ingress admission counts: stored={} lost={}",
+            counts.0,
+            counts.1
+        );
+        if counts == (expected_stored, expected_lost) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "ingress admission counts did not reach stored={expected_stored} lost={expected_lost}; observed stored={} lost={}",
+            counts.0,
+            counts.1
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn live_paste_payload() -> Vec<u8> {
     (0..LIVE_PASTE_BYTES).map(|index| index as u8).collect()
 }
@@ -409,10 +458,18 @@ fn paused_ingress_holds_nineteen_paste_frames_without_lost() {
     fs::create_dir_all(&test_dir).expect("create paste test directory");
     let pause = test_dir.join("pause");
     let pause_value = pause.display().to_string();
+    let admission_log = test_dir.join("ingress-admissions.jsonl");
+    let admission_log_value = admission_log.display().to_string();
     let sink = test_dir.join("paste.bin");
     let hub = start_isolated_live_output_hub_with_env(
         "paused-paste",
-        &[("BOTSTER_HUB_TEST_PAUSE_DATA_PLANE", pause_value.as_str())],
+        &[
+            ("BOTSTER_HUB_TEST_PAUSE_DATA_PLANE", pause_value.as_str()),
+            (
+                "BOTSTER_HUB_TEST_INGRESS_ADMISSION_OBSERVATION",
+                admission_log_value.as_str(),
+            ),
+        ],
     );
     let endpoint = hub.endpoint().clone();
     let session_id = "paused-paste-session";
@@ -461,6 +518,7 @@ fn paused_ingress_holds_nineteen_paste_frames_without_lost() {
     for frame in &frames {
         write_unix_terminal_frame(&mut stream, session_id, subscription_id, frame);
     }
+    wait_for_ingress_admissions(&admission_log, session_id, subscription_id, 19, 0);
     collect_unix_mux_for(
         &mut reader,
         &mut envelopes,
@@ -494,9 +552,17 @@ fn paused_ingress_sixty_fifth_frame_latches_lost_and_closes_only_that_route() {
     fs::create_dir_all(&test_dir).expect("create overflow test directory");
     let pause = test_dir.join("pause");
     let pause_value = pause.display().to_string();
+    let admission_log = test_dir.join("ingress-admissions.jsonl");
+    let admission_log_value = admission_log.display().to_string();
     let hub = start_isolated_live_output_hub_with_env(
         "paused-overflow",
-        &[("BOTSTER_HUB_TEST_PAUSE_DATA_PLANE", pause_value.as_str())],
+        &[
+            ("BOTSTER_HUB_TEST_PAUSE_DATA_PLANE", pause_value.as_str()),
+            (
+                "BOTSTER_HUB_TEST_INGRESS_ADMISSION_OBSERVATION",
+                admission_log_value.as_str(),
+            ),
+        ],
     );
     let endpoint = hub.endpoint().clone();
     let session_id = "paused-overflow-session";
@@ -573,6 +639,7 @@ fn paused_ingress_sixty_fifth_frame_latches_lost_and_closes_only_that_route() {
             &terminal_input_frame_bytes(b"x"),
         );
     }
+    wait_for_ingress_admissions(&admission_log, session_id, primary_id, 64, 1);
     collect_unix_mux_for(
         &mut primary_reader,
         &mut primary_envelopes,
