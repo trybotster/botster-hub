@@ -8,7 +8,7 @@
 | `target_id` | `tgt_7e208a0c76a44980a83b63af976b1f22` |
 | Ticket | `ticket_1788313897_932611` |
 | Run | `run_1788326546_496759` |
-| Candidate commit | `0417317412804ee172c6abe29cf03b80e195554a` |
+| Candidate commit | `b5b9fca952c5c7d8c81d4c4c1360cbf2e372c6a2` |
 | Base | `db2c43c51513c02dd32ecd7ba85a9112f769c3e8` |
 | Core pin | `48a437032791e678010254708259568ce4ad02bf` |
 | Merge policy | Direct merge. No pull request is required. |
@@ -54,6 +54,7 @@ The runtime teardown class does not apply because this change does not create or
 - Five lifecycle proof files and `tests/session_projection_owner_loop.rs` update exact Core provenance.
 - `src/transport/webrtc/delivery.rs` adds one bounded opaque inbound envelope assembly.
 - `src/transport/webrtc/subscription_channel.rs` connects the assembly to the production terminal channel.
+- `src/local_webrtc_smoke.rs` sends every Hub smoke terminal input through version 2 chunks.
 - `tests/hub_daemon_lifecycle/webrtc_fixtures.rs` sends version 2 terminal delivery chunks.
 - `tests/hub_daemon_lifecycle/common.rs` adds the test-only Core paste frame encoder.
 - `tests/hub_daemon_lifecycle/paste_transaction.rs` adds six lifecycle proofs and two source guards.
@@ -81,13 +82,17 @@ The live WebRTC proof disproved that assumption.
 Human answer `question_1788330311_325612` approved bounded Hub reassembly of opaque ciphertext.
 The committed plan records this material change.
 
-The official gate then proved that the current Botster Web sender still uses the old raw envelope path.
+The first official gate proved that the current Botster Web sender still used the old raw envelope path.
 Human answer `question_1788332467_932381` rejected a dual Hub reader.
 The answer requires one cold-cut version 2 chunk path for all WebRTC terminal input.
 
-The pipeline now has blocking dependency `dependency_1788332665_513105` on Web ticket `ticket_1788332653_879489`.
-That ticket targets `trybotster/botster-web` through `tgt_40abcf71ccf049f4ac0c99953a799869`.
-The Web ticket must not depend on this Hub ticket because that dependency would create a cycle.
+The project orchestrator fulfilled the sender dependency through existing Web ticket `ticket_1787600676_914408`.
+Dependency `dependency_1788360616_179633` is closed.
+Web `origin/main` contains the cold-cut sender at `6dc32b32d9842070742272577483275aceb71ea3`.
+
+The next gate found the same raw path in the Hub-owned Rust smoke client.
+The final change moved `src/local_webrtc_smoke.rs` to version 2 terminal chunks.
+This change stays inside Hub transport ownership and removes the final raw terminal sender.
 
 ## Verification
 
@@ -116,33 +121,25 @@ The Core branch containment check includes `origin/main`.
 The active source and lock inventory contains no old Core revision.
 `Cargo.lock` contains six exact new Core sources.
 
-The official gate used Rust 1.97.0 and no `CARGO_TARGET_DIR` override.
+The final official gate used Rust 1.97.0 and no `CARGO_TARGET_DIR` override.
 Both required binary builds, formatting, and Clippy with warnings denied passed.
-The library suite passed 543 tests.
-The lifecycle suite passed 338 tests, failed 2 tests, and ignored 2 tests.
+`RUSTUP_TOOLCHAIN=1.97.0 ./test.sh --locked` passed at default concurrency.
+The lifecycle suite passed 340 tests and ignored 2 documented tests.
+All other workspace tests and doctests passed.
 
-The two failures are:
-
-- `cli_daily_commands_share_canonical_default_data_directory`
-- `cli_smoke_proves_local_runtime_daemon_package_app_session_and_webrtc`
-
-Both failures report `local WebRTC terminal marker not observed`.
-The current Web sender sends raw encrypted terminal envelopes.
-The Hub candidate accepts only version 2 delivery chunks.
-
-The official suite must run again after Web ticket `ticket_1788332653_879489` merges.
-No downstream proof is complete until that gate passes.
+The two prior smoke failures pass inside the final full suite.
+This result proves the Hub smoke client and merged Web sender use the same cold-cut chunk contract.
 
 ## Provenance and residual risk
 
-The tested Hub commit is `0417317412804ee172c6abe29cf03b80e195554a`.
+The tested Hub commit is `b5b9fca952c5c7d8c81d4c4c1360cbf2e372c6a2`.
 The locked Core commit is `48a437032791e678010254708259568ce4ad02bf`.
+The merged Web commit is `6dc32b32d9842070742272577483275aceb71ea3`.
 The test used the worktree `target/debug/botster-hub` and `target/debug/botster-session-worker` binaries.
 The tracked worktree was clean before the official gate.
 
-The only unverified behavior is the merged Web sender with the Hub candidate.
-The blocking Web ticket owns that sender change.
-The Hub official gate must prove the combined cold-cut path before Review.
+No known ticket behavior remains unverified.
+Review must confirm the bounded receiver rules and the content-blind ownership boundary.
 
 ## Missing vault guidance
 
