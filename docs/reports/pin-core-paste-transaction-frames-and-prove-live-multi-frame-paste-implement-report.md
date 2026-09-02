@@ -8,7 +8,7 @@
 | `target_id` | `tgt_7e208a0c76a44980a83b63af976b1f22` |
 | Ticket | `ticket_1788313897_932611` |
 | Run | `run_1788326546_496759` |
-| Candidate commit | `9fb35027d55a83785e859a4f68e73b9188ebd880` |
+| Candidate commit | `0fc4721d7346f34e37a48e28085bf7637ad592c3` |
 | Base | `db2c43c51513c02dd32ecd7ba85a9112f769c3e8` |
 | Core pin | `48a437032791e678010254708259568ce4ad02bf` |
 | Merge policy | Direct merge. No pull request is required. |
@@ -51,9 +51,15 @@ The main constraints came from these notes:
 - [[subprocess harnesses must kill child on failed readiness]]
 - [[live acceptance tests must not depend on a loop tick window]]
 - [[suite wide acceptance criteria make every observed test failure in scope]]
+- [[botster runtime teardown lenses]]
+- [[ShutdownSession suppresses exact route generations before Core teardown]]
+- [[ShutdownSession suppression live tests are not a red oracle]]
+- [[Core terminal subscription ownership is session, subscription, and generation]]
+- [[host reconciliation must not rewrite a completed Core adapter close reason]]
 
 The Rails conventions do not apply because this repository contains Rust code.
-The runtime teardown class does not apply because this change does not create or change peer ownership.
+The returned Detach repair is in the runtime teardown class because it changes route teardown ordering.
+The implementation applies all six teardown lenses to that repair.
 
 ## Files changed
 
@@ -75,6 +81,11 @@ The runtime teardown class does not apply because this change does not create or
 - The Unix detach and connection-death proof waits for route-specific terminal markers before cleanup.
 - Three WebRTC proofs use their route as the only observer for a post-bind readiness marker.
 - `src/transport/webrtc/adapter.rs` adds persistent test-only pressure for one named route.
+- `src/daemon/control/sessions.rs` installs exact Detach suppression before the Core request.
+- `src/daemon/control/sessions.rs` commits suppression after success and rolls it back after failure.
+- `src/subscription/closed_events.rs` adds reversible exact-generation suppression and source-order proof.
+- `src/data_plane/close_work.rs` applies exact suppression to the direct close-work path.
+- The Unix and WebRTC muxes separate suppression staging from close-work retirement.
 - `tests/hub_daemon_lifecycle/webrtc_terminal_adapter.rs` replaces two unbounded output producers with deterministic pressure proofs.
 - `tests/hub_daemon_lifecycle/harness.rs` reconciles a missing worker ancestor with the existing registry reread budget.
 - `tests/hub_daemon_lifecycle/harness.rs` also gives exiting owned processes a bounded two-second settle interval.
@@ -93,6 +104,16 @@ Hub decrypts the complete envelope and calls the existing shared ingress boundar
 Core owns paste frame kinds, paste assembly, ordering, timeout, write admission, and `input_result`.
 Hub does not inspect the Core frame body.
 Hub does not keep paste operation state.
+
+The Detach repair suppresses only the exact `(session_id, subscription_id, generation)` owner.
+A successful Detach retires direct close work and closes only that adapter route.
+A failed Detach removes the suppression key and keeps direct close work active.
+A later generation and all sibling routes remain unaffected.
+
+The existing bounded Core request bridge supplies the teardown bound.
+The existing `close_adapter`, route-forget, and stream-cancel path supplies the production hard stop.
+Existing Unix EOF and WebRTC peer-close tests cover late Attach and owner sweeps.
+Existing stale-generation and sibling tests cover both queue orders and replacement owners.
 
 The implementation changes no file in another repository.
 
@@ -177,6 +198,15 @@ The shutdown producer now waits until its reserved route is bound before it emit
 The attach proof now confirms historical output before `Attach` and issues no later `Drain` or `ReadScreen` request.
 These changes preserve each proof's production boundary.
 
+Review `review_1788390503_447884` found that explicit Detach called Core before Hub installed close-event suppression.
+The official gate and its isolated rerun received `core_adapter_closed` during explicit Unix Detach.
+The repair now stages Unix and WebRTC suppression before `HubClientRequest::Detach`.
+It commits direct close-work retirement only after Core accepts Detach.
+It rolls back the exact suppression key if Core rejects Detach.
+
+The production change is a required deviation from the original paste-only plan.
+Review exposed the defect in the required official gate, so the suite-wide acceptance rule made the repair in scope.
+
 ## Verification
 
 The following focused tests pass:
@@ -227,6 +257,24 @@ The five WebRTC focused tests pass:
 
 The exact Unix test `connection_death_and_detach_do_not_emit_terminal_subscription_closed` also passes.
 
+The returned Detach repair has these focused results:
+
+- `./test.sh --locked --lib suppression` passed 9 tests.
+- `connection_death_and_detach_do_not_emit_terminal_subscription_closed` passed through the live Unix adapter.
+- `webrtc_terminal_adapter_detach_peer_death_process_exit_and_shutdown_do_not_emit_close_event` passed through the live WebRTC adapter.
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` passed.
+- `cargo clippy --locked --all-targets --all-features -- -D warnings` passed.
+
+The source-order ablation removed both pre-Core suppression calls.
+`detach_arm_installs_exact_suppression_before_core_request_and_rolls_back_errors` then failed with 0 calls instead of 2.
+The ablation command returned exit 101 after it selected one test.
+The first command used `--exact` with an incomplete test path and selected zero tests.
+That zero-test command is not evidence.
+
+`exact_suppression_blocks_the_direct_close_work_path` proves the concurrent close-work path stays silent.
+`rolled_back_suppression_preserves_the_direct_close_work_path` proves a failed Detach keeps a later close reportable.
+`exact_generation_suppression_silences_running_close_and_preserves_later_generation` proves replacement-owner isolation.
+
 The returned worker cleanup root has a permanent control test.
 `owned_process_absence_rechecks_until_clean` reports two live observations before it reports absence.
 The test failed with exit 101 when the bounded poll was replaced with one check.
@@ -248,7 +296,7 @@ Both required binary builds, formatting, and Clippy with warnings denied passed.
 `env -u CARGO_TARGET_DIR RUSTUP_TOOLCHAIN=1.97.0 ./test.sh --locked` passed twice at default concurrency.
 Both commands returned exit 0.
 Each lifecycle suite passed 342 tests and ignored 2 documented tests.
-The library suite passed 544 tests.
+The library suite passed 548 tests.
 All other workspace tests and doctests passed.
 
 `RUSTUP_TOOLCHAIN=1.97.0 cargo fmt --all -- --check` passed.
@@ -270,7 +318,7 @@ This result proves the Hub smoke client and merged Web sender use the same cold-
 
 ## Provenance and residual risk
 
-The tested Hub commit is `9fb35027d55a83785e859a4f68e73b9188ebd880`.
+The tested Hub commit is `0fc4721d7346f34e37a48e28085bf7637ad592c3`.
 The locked Core commit is `48a437032791e678010254708259568ce4ad02bf`.
 The merged Web commit is `6dc32b32d9842070742272577483275aceb71ea3`.
 The test used the worktree `target/debug/botster-hub` and `target/debug/botster-session-worker` binaries.
@@ -296,3 +344,6 @@ A server-side observation does not replace route-specific readiness.
 
 No vault note states that an ownership oracle can use a bounded exit settle interval.
 The final oracle must still prove PID, process-group, and data-directory absence.
+
+No vault note defines reversible pre-Core suppression for explicit Detach.
+The durable rule must require exact-generation staging before Core, commit after success, and rollback after rejection.
