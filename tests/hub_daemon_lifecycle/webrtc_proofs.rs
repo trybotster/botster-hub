@@ -350,57 +350,28 @@ fn external_hub_webrtc_live_output_preserves_exact_bytes() {
         )
         .await;
         wait_for_producer_ready(&endpoint, "webrtc-exact-bytes-session");
+        wait_for_webrtc_producer_ready_frames(
+            &mut offer_peer,
+            &stream_key,
+            "webrtc-exact-bytes-session",
+            "webrtc-exact-bytes-sub",
+            "WebRTC exact-bytes",
+        )
+        .await;
         fs::create_dir_all(release_path.parent().expect("release parent"))
             .expect("create webrtc release dir");
         fs::write(&release_path, b"go").expect("release webrtc write(2) producer");
 
-        let mut concatenated = Vec::new();
-        for _ in 0..120 {
-            let _ = offer_peer
-                .encrypted_request(
-                    &stream_key,
-                    &botster_hub_client::DaemonRequest::ReadScreen {
-                        session_id: "webrtc-exact-bytes-session".to_string(),
-                    },
-                )
-                .await;
-            if let Ok(Ok(bytes)) = timeout(
-                Duration::from_millis(200),
-                offer_peer.next_terminal_frame(&stream_key),
-            )
-            .await
-            {
-                offer_peer
-                    .pending_terminal_frames
-                    .push_back((String::new(), bytes));
-            }
-            while let Some((_, bytes)) = offer_peer.pending_terminal_frames.pop_front() {
-                if let Ok(event) = serde_json::from_slice::<botster_hub_client::DaemonEvent>(&bytes)
-                {
-                    if let botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } = event {
-                        let decoded = live_output_decoded_bytes(payload);
-                        assert!(
-                            !payload_has_utf8_replacement(&decoded),
-                            "WebRTC live payload must not contain U+FFFD: {decoded:?}"
-                        );
-                        concatenated.extend(decoded);
-                    }
-                } else {
-                    assert!(
-                        !payload_has_utf8_replacement(&bytes),
-                        "WebRTC live payload must not contain U+FFFD: {bytes:?}"
-                    );
-                    concatenated.extend(bytes);
-                }
-            }
-            if concatenated
-                .windows(expected.len())
-                .any(|window| window == expected)
-            {
-                break;
-            }
-            sleep(Duration::from_millis(30)).await;
-        }
+        let concatenated = collect_expected_webrtc_bytes_or_authoritative_exit(
+            &mut offer_peer,
+            &stream_key,
+            &endpoint,
+            "webrtc-exact-bytes-session",
+            "webrtc-exact-bytes-sub",
+            expected,
+            "WebRTC exact-bytes",
+        )
+        .await;
         assert!(
             concatenated
                 .windows(expected.len())
@@ -559,51 +530,28 @@ fn external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup() {
             )
             .await;
             wait_for_producer_ready(&endpoint, &session_id);
+            wait_for_webrtc_producer_ready_frames(
+                &mut offer_peer,
+                &stream_key,
+                &session_id,
+                &subscription_id,
+                &format!("round {round}"),
+            )
+            .await;
             fs::create_dir_all(release_path.parent().expect("release parent"))
                 .expect("create webrtc release dir");
             fs::write(&release_path, b"go").expect("release webrtc write(2) producer");
 
-            let mut concatenated = Vec::new();
-            for _ in 0..120 {
-                let _ = offer_peer
-                    .encrypted_request(
-                        &stream_key,
-                        &botster_hub_client::DaemonRequest::ReadScreen {
-                            session_id: session_id.clone(),
-                        },
-                    )
-                    .await;
-                if let Ok(Ok(bytes)) = timeout(
-                    Duration::from_millis(200),
-                    offer_peer.next_terminal_frame(&stream_key),
-                )
-                .await
-                {
-                    offer_peer
-                        .pending_terminal_frames
-                        .push_back((String::new(), bytes));
-                }
-                while let Some((_, bytes)) = offer_peer.pending_terminal_frames.pop_front() {
-                    if let Ok(event) =
-                        serde_json::from_slice::<botster_hub_client::DaemonEvent>(&bytes)
-                    {
-                        if let botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } =
-                            event
-                        {
-                            concatenated.extend(live_output_decoded_bytes(payload));
-                        }
-                    } else {
-                        concatenated.extend(bytes);
-                    }
-                }
-                if concatenated
-                    .windows(expected.len())
-                    .any(|window| window == expected)
-                {
-                    break;
-                }
-                sleep(Duration::from_millis(30)).await;
-            }
+            let concatenated = collect_expected_webrtc_bytes_or_authoritative_exit(
+                &mut offer_peer,
+                &stream_key,
+                &endpoint,
+                &session_id,
+                &subscription_id,
+                expected,
+                &format!("round {round}"),
+            )
+            .await;
             assert!(
                 concatenated
                     .windows(expected.len())

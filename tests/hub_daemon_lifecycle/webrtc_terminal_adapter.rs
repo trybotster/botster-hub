@@ -593,6 +593,13 @@ fn webrtc_terminal_adapter_bound_peer_loss_closes_adapter_without_hub_detach() {
     let (hub, endpoint, bootstrap) = start_webrtc_adapter_hub("wpl");
     let session_id = "wpl-session";
     let subscription_id = "wpl-sub";
+    let producer_dir = unique_short_test_dir("wpl-producer");
+    fs::create_dir_all(&producer_dir).expect("create peer-loss producer directory");
+    let producer_release = producer_dir.join("release");
+    let producer_command = format!(
+        "while [ ! -f '{}' ]; do sleep 0.01; done; printf 'wpl-bound-ready\\n'; sleep 30",
+        producer_release.display()
+    );
     let before = botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
         .expect("status before")
         .status
@@ -607,7 +614,7 @@ fn webrtc_terminal_adapter_bound_peer_loss_closes_adapter_without_hub_detach() {
             &key,
             &botster_hub_client::DaemonRequest::Spawn {
                 session_id: session_id.to_string(),
-                command: "sleep 30".to_string(),
+                command: producer_command,
             },
         )
         .await
@@ -622,6 +629,19 @@ fn webrtc_terminal_adapter_bound_peer_loss_closes_adapter_without_hub_detach() {
         .await
         .expect("attach");
         bind_reserved_from_attach(&mut peer, &key, &attach, session_id, subscription_id).await;
+        assert!(
+            !producer_release.exists(),
+            "the peer-loss producer must stay held until the reserved route is bound"
+        );
+        fs::write(&producer_release, b"go").expect("release peer-loss producer");
+        wait_for_webrtc_marker(
+            &mut peer,
+            &key,
+            session_id,
+            subscription_id,
+            "wpl-bound-ready",
+        )
+        .await;
         let attached =
             botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
                 .expect("status after attach")
