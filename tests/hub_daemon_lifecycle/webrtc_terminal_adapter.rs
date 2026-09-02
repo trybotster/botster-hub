@@ -369,14 +369,32 @@ fn webrtc_terminal_adapter_attach_emits_a_nonempty_frame_without_host_drain() {
         peer.encrypted_hello(&key, &webrtc_terminal_adapter_hello())
             .await
             .expect("datachannel hello");
-        spawn_and_bind_webrtc(
-            &mut peer,
-            &key,
-            session_id,
-            subscription_id,
-            "printf 'webrtc-attach-pumped\\n'; sleep 30",
-        )
-        .await;
+        let spawned = peer
+            .encrypted_request(
+                &key,
+                &botster_hub_client::DaemonRequest::Spawn {
+                    session_id: session_id.to_string(),
+                    command: "printf 'producer-ready\\n'; sleep 30".to_string(),
+                },
+            )
+            .await
+            .expect("spawn");
+        assert_eq!(
+            spawned.kind,
+            botster_hub_client::DaemonResponseKind::Spawned
+        );
+        wait_for_producer_ready(&endpoint, session_id);
+        let attach = peer
+            .encrypted_request(
+                &key,
+                &botster_hub_client::DaemonRequest::Attach {
+                    session_id: session_id.to_string(),
+                    subscription_id: subscription_id.to_string(),
+                },
+            )
+            .await
+            .expect("attach");
+        bind_reserved_from_attach(&mut peer, &key, &attach, session_id, subscription_id).await;
 
         let deadline = Instant::now() + Duration::from_secs(8);
         let mut saw_terminal_frame = false;
