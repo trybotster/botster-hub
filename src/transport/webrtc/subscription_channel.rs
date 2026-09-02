@@ -17,8 +17,8 @@ use crate::transport::webrtc::control_channel::{
     decrypt_data_channel_plaintext,
 };
 use crate::transport::webrtc::delivery::{
-    framed_daemon_entity_frame, framed_daemon_event, framed_daemon_hello_ack,
-    framed_daemon_terminal_frame,
+    InboundTerminalEnvelopeAssembly, framed_daemon_entity_frame, framed_daemon_event,
+    framed_daemon_hello_ack, framed_daemon_terminal_frame,
 };
 use crate::transport::webrtc::peer::LocalWebrtcPeerState;
 
@@ -488,6 +488,7 @@ async fn run_bound_terminal_channel<C>(
 ) where
     C: LocalWebrtcDataChannel + ?Sized,
 {
+    let mut inbound_assembly = InboundTerminalEnvelopeAssembly::default();
     loop {
         if let Err(()) =
             flush_subscription_adapter_frames(data_channel, stream_key, &handle, &usage).await
@@ -503,8 +504,17 @@ async fn run_bound_terminal_channel<C>(
             inbound = data_channel.local_poll() => {
                 match inbound {
                     Some(webrtc::data_channel::DataChannelEvent::OnMessage(message)) => {
+                        let encrypted = match inbound_assembly.push(message.data.as_ref()) {
+                            Ok(Some(encrypted)) => encrypted,
+                            Ok(None) => continue,
+                            Err(()) => {
+                                handle.close();
+                                let _ = close_subscription_channel(data_channel).await;
+                                return;
+                            }
+                        };
                         let Ok(envelope) = serde_json::from_str::<botster_core::AesGcmEnvelope>(
-                            std::str::from_utf8(message.data.as_ref()).unwrap_or(""),
+                            &encrypted,
                         ) else {
                             handle.close();
                             let _ = close_subscription_channel(data_channel).await;

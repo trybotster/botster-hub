@@ -243,7 +243,7 @@ the only operation that makes a retained reference unavailable.
 | `spawn_session` | Exposed | Host-admitted local session creation through CoreDaemon. |
 | `attach_client` | Exposed on the Unix/WebRTC daemon bind path | Local `HubClientApi::Attach` fail-closes. Successful Attach always binds an adapter. |
 | `detach_client` | Exposed | Explicit client subscription teardown through CoreDaemon. |
-| Bound terminal adapter input | Exposed on Unix and WebRTC terminal routes | Compact binary input, mode-gated input, and resize stay on the duplex adapter path. |
+| Bound terminal adapter input | Exposed on Unix and WebRTC terminal routes | Compact binary input, mode-gated input, resize, and Core-owned paste transaction frames stay opaque on the duplex adapter path. WebRTC reassembles one bounded encrypted envelope before Hub validates the opaque Core frame header. |
 | `guarded_write` | Exposed | Hub admits the request; CoreDaemon owns readiness and delivery states. |
 | `publish` / `drain` / `acknowledge` routed envelope | Exposed | Single CoreDaemon coordination bus for native MCP and Lua. |
 | `release_sessions_for_restart` / `adoption_scan` / `adopt_session` | Exposed | Explicit daemon restart/adoption over worker-backed sessions. |
