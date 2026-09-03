@@ -1072,7 +1072,7 @@ fn webrtc_terminal_adapter_write_budget_emits_core_adapter_closed_while_peer_sta
             drain.events
         );
         eprintln!(
-            "webrtc write-budget provenance hub_bin={} session_worker={} hub_sha={} locked_core=48a437032791e678010254708259568ce4ad02bf",
+            "webrtc write-budget provenance hub_bin={} session_worker={} hub_sha={} locked_core=72d1c7571bc229dbb2cbd67aa979b6504ac150a5",
             env!("CARGO_BIN_EXE_botster-hub"),
             session_worker_binary_path().display(),
             option_env!("BOTSTER_HUB_GIT_SHA").unwrap_or("worktree")
@@ -1081,6 +1081,92 @@ fn webrtc_terminal_adapter_write_budget_emits_core_adapter_closed_while_peer_sta
     });
     shutdown_short_lived_session(&endpoint, "wwb-stall");
     shutdown_short_lived_session(&endpoint, "wwb-live");
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn webrtc_forced_would_block_on_one_route_keeps_sibling_open_and_delivering() {
+    let _guard = daemon_test_guard();
+    let (hub, endpoint, bootstrap) = start_webrtc_adapter_hub_with_env(
+        "wso",
+        &[(
+            "BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_SESSION",
+            "wso-held",
+        )],
+    );
+    block_on(async {
+        let (mut peer, key) = open_local_webrtc_peer(&endpoint, &bootstrap).await;
+        peer.enable_host_events();
+        peer.encrypted_hello(&key, &webrtc_close_event_hello())
+            .await
+            .expect("negotiated hello");
+        spawn_and_bind_webrtc(
+            &mut peer,
+            &key,
+            "wso-held",
+            "sub-held",
+            "printf 'held-ready\\n'; sleep 30",
+        )
+        .await;
+        spawn_and_bind_webrtc(
+            &mut peer,
+            &key,
+            "wso-live",
+            "sub-live",
+            "printf 'sib-open-ready\\n'; sleep 30",
+        )
+        .await;
+
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut collected = std::mem::take(&mut peer.pending_terminal_frames);
+        while Instant::now() < deadline && !webrtc_terminal_contains(&collected, "sib-open-ready") {
+            if let Ok(Ok(bytes)) =
+                timeout(Duration::from_millis(200), peer.next_terminal_frame(&key)).await
+            {
+                collected.push_back((String::new(), bytes));
+            }
+        }
+        peer.pending_terminal_frames = collected;
+        assert!(
+            webrtc_terminal_contains(&peer.pending_terminal_frames, "sib-open-ready"),
+            "same-peer sibling must deliver bytes while the held route stays open: {:?}",
+            peer.pending_terminal_frames
+        );
+
+        let status = peer
+            .encrypted_request(&key, &botster_hub_client::DaemonRequest::Status)
+            .await
+            .expect("status while held route is open");
+        assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
+        let occupancy = status
+            .status
+            .expect("status body")
+            .live_attach_occupancy;
+        assert!(
+            occupancy_has_pair(&occupancy, "wso-held", "sub-held"),
+            "held route must stay Bound: {occupancy:?}"
+        );
+        assert!(
+            occupancy_has_pair(&occupancy, "wso-live", "sub-live"),
+            "sibling route must stay Bound: {occupancy:?}"
+        );
+        assert!(
+            peer.pending_host_events().iter().all(|event| {
+                !matches!(
+                    event,
+                    botster_hub_client::DaemonEvent::TerminalSubscriptionClosed {
+                        session_id,
+                        ..
+                    } if session_id == "wso-held"
+                )
+            }),
+            "held route must stay below the close budget: {:?}",
+            peer.pending_host_events()
+        );
+        peer.peer.close().await.expect("close offer peer");
+    });
+    shutdown_short_lived_session(&endpoint, "wso-held");
+    shutdown_short_lived_session(&endpoint, "wso-live");
     hub.shutdown().expect("shutdown isolated hub");
 }
 
