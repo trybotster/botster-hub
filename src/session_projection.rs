@@ -54,6 +54,9 @@ impl SessionProjection {
             Some(SessionLifecycleState::Failed { reason }) => {
                 (Some("failed".to_string()), None, Some(reason.clone()))
             }
+            None if record.session.registry_state == RegistrySessionState::Exited => {
+                (Some("exited".to_string()), None, None)
+            }
             None => (None, None, None),
         };
         let lifecycle_class =
@@ -241,6 +244,7 @@ fn session_lifecycle_class(
             Some(SessionLifecycleState::Exited { .. } | SessionLifecycleState::Failed { .. }) => {
                 "ended"
             }
+            None if registry_state == &RegistrySessionState::Exited => "ended",
             None => "indeterminate",
         }
     }
@@ -402,6 +406,36 @@ mod tests {
             )],
         );
         assert!(baseline.is_ended("baseline-ended"));
+    }
+
+    #[test]
+    fn complete_baseline_exited_registry_without_engine_lifecycle_is_ended() {
+        let mut projection = SessionProjection::default();
+        projection.replace_complete_baseline(
+            cursor(1),
+            [record(
+                "restarted-ended",
+                RegistrySessionState::Exited,
+                None,
+            )],
+        );
+        assert!(
+            projection.is_ended("restarted-ended"),
+            "a complete baseline exited registry row is ended evidence after restart"
+        );
+        let entity = SessionProjection::project_entity(
+            &projection
+                .rows
+                .get("restarted-ended")
+                .expect("projected restarted row")
+                .record,
+        );
+        assert_eq!(entity.lifecycle.as_deref(), Some("exited"));
+        assert_eq!(entity.lifecycle_class, "ended");
+        assert_eq!(
+            session_lifecycle_class(&RegistrySessionState::Running, None),
+            "indeterminate"
+        );
     }
 
     #[test]

@@ -137,10 +137,11 @@ Facts verified in this Plan visit:
 | Deterministic correctness gates | both answers | Required and unchanged: isolation, byte order, pressure, reconnect, old-route deletion, current-revision compatibility (Core `72d1c75`), and north-star ownership. The waiver applies only to timing observations. |
 | Defaults | this plan | Cold cut only; no compatibility path; no npm publication; TUI durable roll is a registered consumer ticket. |
 | Ask-human threshold | this plan | Implement asks before any change outside `botster-hub`, before any npm or crate publication, and before touching the local trybotster repository. |
+| Review-return consumer lanes | `question_1788465866_563736` | Do not waive durable, shared-session cancel ablation, or `ghostty-shared` late-history. Keep the durable-session failure in this Hub run. Add the smallest Hub persistence repair plus a daemon-restart ended-row regression test. Do not add compatibility behavior or a second persistence path. Create exactly one botster-web ticket for cancel ablation and exactly one botster-tui ticket for `ghostty-shared` late-history. This integration ticket depends on those two tickets. Each consumer ticket runs repository gates and one focused integration proof. This run reruns the complete matrix once after both merges. |
 
 ## 6. Scope
 
-Invariant: this run changes Hub only. Every changed Hub line traces to the Core pin roll, the residual-route proof, the ownership audit, or the proof reports.
+Invariant: this run changes Hub only. Every changed Hub line traces to the Core pin roll, the residual-route proof, the ownership audit, the proof reports, or the Review-return persistence repair in F.
 
 ### A. Core pin roll to `72d1c7571bc229dbb2cbd67aa979b6504ac150a5`
 
@@ -227,7 +228,20 @@ Frozen-format observation (waived, `question_1788461094_542980`): no timing capt
 
 ### E. Reports and evidence
 
-- `docs/reports/cold-cut-the-old-terminal-route-and-prove-isolation-implement.md`: pin roll diff summary, guard inventory with ablations, ownership audit table, gate outputs with `rustc --version`, consumer proof outputs, TUI scratch diff, the two waivers with rerun steps and prerequisites, and provenance (`hub_sha`, `locked_core_sha`).
+- `docs/reports/cold-cut-the-old-terminal-route-and-prove-isolation-implement.md`: pin roll diff summary, guard inventory with ablations, ownership audit table, gate outputs with `rustc --version`, consumer proof outputs, TUI scratch diff, the two waivers with rerun steps and prerequisites, provenance (`hub_sha`, `locked_core_sha`), and the Review-return persistence repair.
+
+### F. Review-return persistence repair (accepted `question_1788465866_563736`)
+
+Keep one persistence path: Core's session registry under the Hub data directory. After `ShutdownSession` the registry row is `Exited`. After Hub process restart, Core `list()` still returns that row, but the engine session is gone, so `lifecycle_record` omits `lifecycle`. Hub projection must treat `registry_state=Exited` with omitted engine lifecycle as ended evidence and project `lifecycle=exited` / `lifecycle_class=ended`. Running rows with omitted lifecycle stay `indeterminate`. Do not add a Hub-owned session store.
+
+Required test: `process_ownership_daemon_restart_lists_ended_session_row`. Spawn, `ShutdownSession`, production Hub shutdown, restart on the same data directory. Assert `Status.session_count >= 1`, `ListSessions` keeps `lifecycle=exited`, and a later entity subscriber receives the ended row.
+
+Consumer tickets (created by Implement; this ticket depends on them):
+
+- `ticket_1788467459_333288` (`tgt_40abcf71ccf049f4ac0c99953a799869`): Web cancel ablation. `BOTSTER_LIVE_ABLATE_CANCEL_DETACH=1` must fail for the intended reason. Preserve the dedicated channel path.
+- `ticket_1788467460_864070` (`tgt_c3d470bab78549df920a41e8fb0e58d8`): TUI `ghostty-shared` late-history. Reproduce the integrated failure first. Preserve isolated `script/test-live-hub ghostty` and the ready-then-history contract.
+
+Do not create a second Web ticket for durable restore. Do not create another Hub ticket. The complete consumer matrix in D reruns once after both consumer merges.
 
 ### Non-scope
 
@@ -244,11 +258,18 @@ Frozen-format observation (waived, `question_1788461094_542980`): no timing capt
 - `botster-hub` owns admission (grants, key derivation, labels, peer generations, budgets, route policy), subscription route state (Reserved, Bound, Retired), concrete Unix and WebRTC mechanics (framing, sealing, chunking, bounded close), the hosting process, and the data-plane driver. Hub does not decode terminal bodies.
 - `botster-hub-client` (in-repo member) owns the external DTO boundary. Only a test guard changes; if the generated TypeScript changes, the [[botster-hub-client-playbook]] gates apply.
 - Lua plugins compose commands, hooks, workflows, lifecycle policy, defaults, and customization outside transport hot paths.
-- `botster-web` and `botster-tui` are equal clients. Web needs no change. TUI needs a durable pin roll after this merge.
+- `botster-web` and `botster-tui` are equal clients. Web owns cancel ablation (`ticket_1788467459_333288`). TUI owns `ghostty-shared` late-history (`ticket_1788467460_864070`) and the durable pin roll after this merge. Hub owns persisted exited-row projection after daemon restart.
 
 Upstream dependencies: all closed (section 4, item 1).
 
 Downstream consumer registration (different repository, blocks its own live gate): create `TUI: roll Hub and Core pins to the integration cold cut` against `tgt_c3d470bab78549df920a41e8fb0e58d8` with a dependency on this ticket. Scope: roll `botster-hub-client` and `botster-hub-test-support` to the merged Hub commit, roll every Core pin to `72d1c75`, update `app.rs` live-lane defaults and README pin prose per [[pin rolls update live lane provenance defaults and README pin prose]], and run `script/test-live-hub ghostty`. This is a durable-pin follow-up, not a finding ticket.
+
+This integration ticket now depends on two later consumer tickets from `question_1788465866_563736`:
+
+- `ticket_1788467459_333288` botster-web cancel ablation (`tgt_40abcf71ccf049f4ac0c99953a799869`)
+- `ticket_1788467460_864070` botster-tui `ghostty-shared` late-history (`tgt_c3d470bab78549df920a41e8fb0e58d8`)
+
+Those tickets must close before a later pipeline run of this ticket starts. The current Implement visit may finish the Hub persistence repair. The complete matrix in section 6.D reruns once after both merges.
 
 ## 8. Affected surfaces and files
 
@@ -275,7 +296,13 @@ Guards and docs:
 - `docs/reports/cold-cut-the-old-terminal-route-and-prove-isolation-implement.md`
 - vault inbox capture for the final ownership statement (outside this repository; cite by note title, not a home path)
 
-Unchanged by design: `src/transport/**`, `src/data_plane/**`, `src/subscription/**`, `src/admission/**`, `src/daemon/**` unless the inventory (6.B.3) finds a residual old-route symbol.
+Persistence repair (section 6.F):
+
+- `src/session_projection.rs` (ended class and `lifecycle=exited` when the registry is Exited and engine lifecycle is omitted)
+- `src/subscription/entity.rs` (matching test-only projection copy)
+- `tests/hub_daemon_lifecycle/shutdown.rs` (`process_ownership_daemon_restart_lists_ended_session_row`)
+
+Unchanged by design: `src/transport/**`, `src/data_plane/**`, `src/admission/**`, `src/daemon/**` unless the inventory (6.B.3) finds a residual old-route symbol. Production `src/subscription/` stays unchanged except the cfg(test) projection copy in `entity.rs`.
 
 ## 9. Assumptions and unknowns
 
@@ -309,7 +336,9 @@ Unchanged by design: `src/transport/**`, `src/data_plane/**`, `src/subscription/
 9. `botster-hub smoke` green on a fresh data dir.
 10. Implement report contains the "Timing observations: waived" section with both waivers, rerun commands, and the authentication, database, OAuth, and clean-checkout prerequisites; no timing number appears as a gate.
 11. README responsibility text updated; inbox capture path recorded.
-12. Consumer TUI ticket created with a dependency edge on this ticket.
+12. Consumer TUI pin-roll ticket created with a dependency edge on this ticket.
+13. Daemon-restart ended-row test green: `process_ownership_daemon_restart_lists_ended_session_row`. Complete-baseline `registry_state=Exited` with omitted engine lifecycle is ended evidence. Running + omitted lifecycle stays indeterminate.
+14. Web cancel-ablation ticket `ticket_1788467459_333288` and TUI late-history ticket `ticket_1788467460_864070` exist. This ticket depends on both. The complete matrix in section 6.D reruns once after both merge.
 
 ## 12. Runtime-teardown lenses
 
