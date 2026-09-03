@@ -188,3 +188,5 @@ The correction replaces all binary paths with path-neutral references. The repos
 Verify review `review_1788416923_415327` found a race in the WebRTC shutdown proof. The migration had removed the post-bind producer start gate. Under load, producer output could arrive before route readiness.
 
 Commit `5ef47a691e53d7fc71ef6bb3ffb0fa80af700abe` restores the start gate and keeps the separate exit gate. The exact current-pin test, the full current-pin locked suite, and the exact Core-candidate test passed.
+
+The Verify artifact also found that the plan revision 3 header understated the seven-proof residual migration. Plan revision 4 corrects the header and records this Verify return.
