@@ -57,6 +57,17 @@ async fn spawn_and_bind_webrtc(
     subscription_id: &str,
     command: &str,
 ) {
+    let _channel =
+        spawn_and_bind_webrtc_channel(peer, key, session_id, subscription_id, command).await;
+}
+
+async fn spawn_and_bind_webrtc_channel(
+    peer: &mut LocalWebrtcOfferPeer,
+    key: &botster_core::AesGcmKey,
+    session_id: &str,
+    subscription_id: &str,
+    command: &str,
+) -> std::sync::Arc<dyn DataChannel> {
     let spawned = peer
         .encrypted_request(
             key,
@@ -102,7 +113,7 @@ async fn spawn_and_bind_webrtc(
     );
     peer.open_reserved_terminal(key, &reservation.label, &webrtc_terminal_adapter_hello())
         .await
-        .expect("open reserved subscription channel");
+        .expect("open reserved subscription channel")
 }
 
 async fn bind_reserved_from_attach(
@@ -1117,22 +1128,35 @@ fn webrtc_forced_would_block_on_one_route_keeps_sibling_open_and_delivering() {
             "printf 'held-ready\\n'; sleep 30",
         )
         .await;
+        let pressure_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < pressure_deadline && !observation.join("would_block").is_file() {
+            sleep(Duration::from_millis(10)).await;
+        }
         assert!(
             observation.join("would_block").is_file(),
             "held route must enter WouldBlock before sibling delivery"
         );
-        spawn_and_bind_webrtc(
+        let sibling_channel = spawn_and_bind_webrtc_channel(
             &mut peer,
             &key,
             "wso-live",
             "sub-live",
-            "printf 'sib-open-ready\\n'; sleep 30",
+            "while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
         )
         .await;
+        LocalWebrtcOfferPeer::send_reserved_terminal_frame(
+            &sibling_channel,
+            &key,
+            &terminal_input_frame_bytes(b"wso-sibling-live\r"),
+        )
+        .await
+        .expect("sibling input after bind");
 
         let deadline = Instant::now() + Duration::from_secs(8);
         let mut collected = std::mem::take(&mut peer.pending_terminal_frames);
-        while Instant::now() < deadline && !webrtc_terminal_contains(&collected, "sib-open-ready") {
+        while Instant::now() < deadline
+            && !webrtc_terminal_contains(&collected, "echo:wso-sibling-live")
+        {
             if let Ok(Ok(bytes)) =
                 timeout(Duration::from_millis(200), peer.next_terminal_frame(&key)).await
             {
@@ -1141,7 +1165,7 @@ fn webrtc_forced_would_block_on_one_route_keeps_sibling_open_and_delivering() {
         }
         peer.pending_terminal_frames = collected;
         assert!(
-            webrtc_terminal_contains(&peer.pending_terminal_frames, "sib-open-ready"),
+            webrtc_terminal_contains(&peer.pending_terminal_frames, "echo:wso-sibling-live"),
             "same-peer sibling must deliver bytes while the held route stays open: {:?}",
             peer.pending_terminal_frames
         );
