@@ -1949,6 +1949,9 @@ fn core_write_budget_hard_stop_emits_core_adapter_closed() {
 #[test]
 fn forced_would_block_on_one_unix_route_keeps_sibling_open_and_delivering() {
     let _guard = daemon_test_guard();
+    let observation = unique_short_test_dir("sso-pressure");
+    fs::create_dir_all(&observation).expect("create WouldBlock observation directory");
+    let observation_value = observation.display().to_string();
     let hub = start_isolated_live_output_hub_with_env(
         "sso",
         &[
@@ -1959,6 +1962,10 @@ fn forced_would_block_on_one_unix_route_keeps_sibling_open_and_delivering() {
             (
                 "BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_DELAY_MS",
                 "0",
+            ),
+            (
+                "BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_OBSERVATION",
+                observation_value.as_str(),
             ),
         ],
     );
@@ -1973,6 +1980,14 @@ fn forced_would_block_on_one_unix_route_keeps_sibling_open_and_delivering() {
         "printf 'held-ready\\n'; sleep 30",
         &mut envelopes,
         &mut events,
+    );
+    let pressure_deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < pressure_deadline && !observation.join("would_block").is_file() {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        observation.join("would_block").is_file(),
+        "held route must enter WouldBlock before sibling delivery"
     );
     spawn_and_bind(
         &mut stream,
@@ -2055,6 +2070,7 @@ fn forced_would_block_on_one_unix_route_keeps_sibling_open_and_delivering() {
     shutdown_short_lived_session(hub.endpoint(), "sso-held");
     shutdown_short_lived_session(hub.endpoint(), "sso-live");
     hub.shutdown().expect("shutdown isolated hub");
+    let _ = fs::remove_dir_all(observation);
 }
 
 #[test]

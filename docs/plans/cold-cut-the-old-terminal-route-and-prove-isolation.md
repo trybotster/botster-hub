@@ -13,7 +13,7 @@ Human decisions: `question_1788460117_825061` and `question_1788461094_542980` (
 | --- | --- |
 | Target repository | `botster-hub` (`trybotster/botster-hub`) |
 | Target id | `tgt_7e208a0c76a44980a83b63af976b1f22` |
-| Spawn target name | `botster-hub` (`list_spawn_targets` path `/Users/jasonconigliari/Projects/botster-hub`) |
+| Spawn target name | `botster-hub` (canonical spawn-target checkout; no machine path) |
 | Plan worktree | this pipeline worktree; path has no `:`; tracked `.gitignore` has content |
 | Base commit | `ae6a0b1fe99d97215fa82d796da8f01a904171f0` (revision 1 used `bb1a330`; main advanced through `ticket_1788206393_323469`) |
 | Locked Core pin at base | `48a437032791e678010254708259568ce4ad02bf` |
@@ -125,7 +125,7 @@ Facts verified in this Plan visit:
 9. TUI `origin/main` (`b051c67`) pins Hub `bb1a330` and Core `48a4370` in `crates/botster-tui/Cargo.toml`, in `crates/botster-tui/src/app.rs` live-lane defaults, and in README prose. The TUI live lane asserts `fixture core_pin == worker rev`.
 10. Web `origin/main` (`e5573a2`) pins `@trybotster/hub-test-support@0.1.43`, `@trybotster/terminal-protocol@0.3.0`, and `@trybotster/ui-contract@0.3.3`. Web pins no Hub Git revision. Web live lanes take `BOTSTER_HUB_BIN` and `BOTSTER_SESSION_WORKER_BIN`.
 11. `gh api repos/trybotster/botster-hub/actions/runners` returns zero runners. No `botster-ubuntu-24.04-16core` runner exists. No post-Restty controlled baseline exists (botster-web `docs/terminal-baseline-observation-format.md`, version 3).
-12. The legacy repository `/Users/jasonconigliari/Rails/trybotster` contains `f598075e6c143ef14b34d3a3dffdf2ec6a8d9eb6` and has a dirty `main` checkout.
+12. The local trybotster repository contains `f598075e6c143ef14b34d3a3dffdf2ec6a8d9eb6` and has a dirty `main` checkout.
 13. Hub strict gates come from `.github/workflows/ci.yml`: Rust 1.97.0, Zig 0.16.0, `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `./test.sh --locked`, plus `node packages/hub-test-support/scripts/sync-assets.mjs --check`.
 
 ## 5. Human decisions (product decision ledger)
@@ -136,7 +136,7 @@ Facts verified in this Plan visit:
 | Two-arm `format_version=3` local timing record | `question_1788461094_542980` (supersedes the option B choice in `question_1788460117_825061` after Plan Review found the authentication prerequisite) | Waived for this ticket. The report records the exact rerun steps, the GitHub sign-in prerequisite (`completeLegacyNewSession` fails closed at "Sign in with GitHub"), the missing Playwright storage-state input in the harness, and the separate legacy database and GitHub OAuth app requirements. No Web harness, legacy application, authentication path, or credential handling change. No ticket for this observation. |
 | Deterministic correctness gates | both answers | Required and unchanged: isolation, byte order, pressure, reconnect, old-route deletion, current-revision compatibility (Core `72d1c75`), and north-star ownership. The waiver applies only to timing observations. |
 | Defaults | this plan | Cold cut only; no compatibility path; no npm publication; TUI durable roll is a registered consumer ticket. |
-| Ask-human threshold | this plan | Implement asks before any change outside `botster-hub`, before any npm or crate publication, and before touching `/Users/jasonconigliari/Rails/trybotster`. |
+| Ask-human threshold | this plan | Implement asks before any change outside `botster-hub`, before any npm or crate publication, and before touching the local trybotster repository. |
 
 ## 6. Scope
 
@@ -174,7 +174,7 @@ Holes to close in this run (smallest change that makes the row exist):
 2. Confirm `daemon_transport.rs` and `local_webrtc.rs` do not exist, and `daemon_modules_reject_unix_transport_mechanism_symbols` still holds.
 3. Confirm Lua: the recursive `no_lua_dispatch_in_terminal_input_or_output` guard is the architecture check. Add `src/data_plane.rs`, `src/data_plane/driver.rs`, `src/data_plane/close_work.rs`, and `src/transport/shared/ingress.rs` (if present) to its fixed list so each named hot-path file has an explicit row, and run one ablation per added entry per [[fixed source guard lists need one ablation per added file]].
 4. Update `README.md` "Responsibility split" `botster-hub` row to state the final split in one sentence each: Hub Rust owns admission, security, persistence, process and package supervision, WebRTC setup, adapter creation, plugin isolation, and safe Lua primitives; Core owns terminal lifecycle and duplex transport mechanics; Lua composes commands, hooks, workflows, lifecycle policy, defaults, and customization and never runs in terminal input or output hot paths. Update the "Product today" sentence that lists `input/resize` under the daemon protocol to say input and resize travel on the bound adapter plane.
-5. Playbook updates are vault work. Implement writes one inbox capture under `~/knowledge/inbox/` with the exact proposed additions for [[botster-hub-playbook]] (Required Gates rows: "Lua absent from terminal hot paths is a recursive source guard", "old terminal JSON route absence guards"), [[botster-core-playbook]] (Core owns terminal lifecycle and duplex transport; polling adapter path deleted at `72d1c75`), and [[botster-architecture]] (final ownership statement). The capture records the vault path in gate evidence. No knowledge-repo ticket is created.
+5. Playbook updates are vault work. Implement writes one inbox capture with the exact proposed additions for [[botster-hub-playbook]] (Required Gates rows: "Lua absent from terminal hot paths is a recursive source guard", "old terminal JSON route absence guards"), [[botster-core-playbook]] (Core owns terminal lifecycle and duplex transport; polling adapter path deleted at `72d1c75`), and [[botster-architecture]] (final ownership statement). Gate evidence cites the capture by wiki-link or inbox filename, not a home path. No knowledge-repo ticket is created.
 
 ### D. Full-stack proof matrix, run once here
 
@@ -213,15 +213,15 @@ D.1 New deterministic test, required: the inventory above has no test where a sl
 
 Downstream consumer proofs (current-revision compatibility) against the candidate Hub build (`target/debug/botster-hub` and `target/debug/botster-session-worker` from the pin-rolled commit):
 
-- Web (`/Users/jasonconigliari/Projects/botster-web` at `origin/main`, no edits): `npm ci`, `npm test` (drift check against `@trybotster/hub-test-support@0.1.43`; the Core roll changes no Hub DTO, so no republish is expected), then `npm run smoke:live-packaged-protocol`, `npm run smoke:live-packaged-protocol:durable`, `npm run smoke:live-packaged-protocol:shared-session`, and `npm run smoke:plugin-contract-matrix` with `BOTSTER_HUB_BIN` and `BOTSTER_SESSION_WORKER_BIN`. Real browser through the production engine types (the harness uses the shipped WebRTC data plane).
-- TUI (scratch worktree of `/Users/jasonconigliari/Projects/botster-tui` at `origin/main`): roll `botster-hub-client` and `botster-hub-test-support` to the Hub candidate commit and every Core pin to `72d1c75` in `crates/botster-tui/Cargo.toml`, `Cargo.lock`, and the `app.rs` live-lane defaults, uncommitted, for proof only. Run `script/test-live-hub ghostty` with `BOTSTER_HUB_BIN_REV=<candidate>` and `BOTSTER_SESSION_WORKER_BIN_REV=72d1c75...`. Record the exact TUI diff in the report. The durable TUI roll is the consumer ticket in section 7.
+- Web (`botster-web` at `origin/main`, no edits): `npm ci`, `npm test` (drift check against `@trybotster/hub-test-support@0.1.43`; the Core roll changes no Hub DTO, so no republish is expected), then `npm run smoke:live-packaged-protocol`, `npm run smoke:live-packaged-protocol:durable`, `npm run smoke:live-packaged-protocol:shared-session`, and `npm run smoke:plugin-contract-matrix` with `BOTSTER_HUB_BIN` and `BOTSTER_SESSION_WORKER_BIN`. Real browser through the production engine types (the harness uses the shipped WebRTC data plane).
+- TUI (scratch worktree of `botster-tui` at `origin/main`): roll `botster-hub-client` and `botster-hub-test-support` to the Hub candidate commit and every Core pin to `72d1c75` in `crates/botster-tui/Cargo.toml`, `Cargo.lock`, and the `app.rs` live-lane defaults, uncommitted, for proof only. Run `script/test-live-hub ghostty` with `BOTSTER_HUB_BIN_REV=<candidate>` and `BOTSTER_SESSION_WORKER_BIN_REV=72d1c75...`. Record the exact TUI diff in the report. The durable TUI roll is the consumer ticket in section 7.
 - Unix and local Hub: Hub `unix_terminal_adapter` module, `botster-hub smoke` against a fresh data dir, and `webrtc_proofs::cli_smoke_proves_local_runtime_daemon_package_app_session_and_webrtc`.
 - North-star same-session ownership: `script/prove-north-star-shared-session` with `BOTSTER_WEB_CHECKOUT`, `BOTSTER_TUI_CHECKOUT` (the scratch TUI worktree), and `BOTSTER_SHARED_SESSION_ID=north-star-shared`; then Web `drive:live-packaged-protocol:shared-session` and TUI `ghostty-shared` and `ghostty-shared-exit` as the script documents.
 
 Frozen-format observation (waived, `question_1788461094_542980`): no timing capture runs in this ticket. The Implement report carries a "Timing observations: waived" section with:
 
 1. The exact rerun command from botster-web `README.md` (`BOTSTER_LEGACY_CHECKOUT=<clean f598075e> BOTSTER_HUB_SOURCE=<hub> npm run observe:terminal-baseline`, then `observe:terminal-baseline:validate`), keeping `format_version=3`.
-2. The prerequisites that block it today: a signed-in GitHub session on the legacy arm (the harness has no storage-state or cookie input), a provisioned legacy development database, GitHub OAuth application credentials, and a clean `f598075e` checkout (a detached worktree of `/Users/jasonconigliari/Rails/trybotster` is one way to obtain it).
+2. The prerequisites that block it today: a signed-in GitHub session on the legacy arm (the harness has no storage-state or cookie input), a provisioned legacy development database, GitHub OAuth application credentials, and a clean `f598075e` checkout (a detached worktree of the local trybotster repository is one way to obtain it).
 3. The controlled-runner rerun steps and the fact that zero runners are registered.
 4. The statement that no row of any future record is transport causality (`product_baseline_only`).
 
@@ -273,7 +273,7 @@ Guards and docs:
 - `README.md` ("Responsibility split", "Product today" sentences)
 - `docs/plans/cold-cut-the-old-terminal-route-and-prove-isolation.md` (this plan)
 - `docs/reports/cold-cut-the-old-terminal-route-and-prove-isolation-implement.md`
-- `~/knowledge/inbox/<date>-botster-final-terminal-ownership-boundaries.md` (capture, outside this repository)
+- vault inbox capture for the final ownership statement (outside this repository; cite by note title, not a home path)
 
 Unchanged by design: `src/transport/**`, `src/data_plane/**`, `src/subscription/**`, `src/admission/**`, `src/daemon/**` unless the inventory (6.B.3) finds a residual old-route symbol.
 

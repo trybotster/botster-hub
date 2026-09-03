@@ -376,6 +376,7 @@ impl WebRtcConnectionMux {
                 .inner
                 .test_forced_would_block
                 .store(true, Ordering::Release);
+            record_forced_pressure("would_block");
         }
         if let Ok(mut routes) = self.inner.routes.lock() {
             let key = (session_id.clone(), subscription_id.clone(), generation);
@@ -684,6 +685,17 @@ fn forced_would_block(session_id: &str) -> bool {
     std::env::var("BOTSTER_ENV").as_deref() == Ok("test")
         && std::env::var("BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_SESSION").as_deref()
             == Ok(session_id)
+}
+
+fn record_forced_pressure(name: &str) {
+    if std::env::var("BOTSTER_ENV").as_deref() != Ok("test") {
+        return;
+    }
+    if let Ok(directory) = std::env::var("BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_OBSERVATION")
+        && !directory.is_empty()
+    {
+        let _ = std::fs::write(std::path::Path::new(&directory).join(name), name);
+    }
 }
 
 #[cfg(test)]
