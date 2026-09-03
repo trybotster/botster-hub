@@ -1087,12 +1087,21 @@ fn webrtc_terminal_adapter_write_budget_emits_core_adapter_closed_while_peer_sta
 #[test]
 fn webrtc_forced_would_block_on_one_route_keeps_sibling_open_and_delivering() {
     let _guard = daemon_test_guard();
+    let observation = unique_short_test_dir("wso-pressure");
+    fs::create_dir_all(&observation).expect("create WouldBlock observation directory");
+    let observation_value = observation.display().to_string();
     let (hub, endpoint, bootstrap) = start_webrtc_adapter_hub_with_env(
         "wso",
-        &[(
-            "BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_SESSION",
-            "wso-held",
-        )],
+        &[
+            (
+                "BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_SESSION",
+                "wso-held",
+            ),
+            (
+                "BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_OBSERVATION",
+                observation_value.as_str(),
+            ),
+        ],
     );
     block_on(async {
         let (mut peer, key) = open_local_webrtc_peer(&endpoint, &bootstrap).await;
@@ -1108,6 +1117,10 @@ fn webrtc_forced_would_block_on_one_route_keeps_sibling_open_and_delivering() {
             "printf 'held-ready\\n'; sleep 30",
         )
         .await;
+        assert!(
+            observation.join("would_block").is_file(),
+            "held route must enter WouldBlock before sibling delivery"
+        );
         spawn_and_bind_webrtc(
             &mut peer,
             &key,
@@ -1168,6 +1181,7 @@ fn webrtc_forced_would_block_on_one_route_keeps_sibling_open_and_delivering() {
     shutdown_short_lived_session(&endpoint, "wso-held");
     shutdown_short_lived_session(&endpoint, "wso-live");
     hub.shutdown().expect("shutdown isolated hub");
+    let _ = fs::remove_dir_all(observation);
 }
 
 #[test]

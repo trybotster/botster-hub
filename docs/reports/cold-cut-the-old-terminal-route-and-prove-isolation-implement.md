@@ -61,7 +61,7 @@ Committed on `8634018`:
 
 Unchanged production transport, data-plane, subscription, admission, and daemon modules. Inventory found no remaining production old-route symbol.
 
-Vault capture (outside this repository): `~/knowledge/inbox/2026-09-03-botster-final-terminal-ownership-boundaries.md`
+Vault capture (outside this repository): inbox `2026-09-03-botster-final-terminal-ownership-boundaries.md`. Review found [[Hub terminal cold cut consumed Core 72d1c75]] overstated shipment; a pending correction is in the vault inbox.
 
 ## Ownership boundaries preserved
 
