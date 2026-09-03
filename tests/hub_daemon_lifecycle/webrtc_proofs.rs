@@ -487,11 +487,17 @@ fn external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup() {
                 .await
                 .expect("offer peer accepts answer");
 
+            let start_path =
+                unique_short_test_dir(&format!("webrtc-sd-start-{round}")).join("go");
             let release_path = unique_short_test_dir(&format!("webrtc-sd-rel-{round}")).join("go");
             let exit_release_path =
                 unique_short_test_dir(&format!("webrtc-sd-exit-rel-{round}")).join("go");
-            let script_path =
-                write_python_held_live_script(&release_path, &exit_release_path, expected);
+            let script_path = write_python_started_held_live_script(
+                &start_path,
+                &release_path,
+                &exit_release_path,
+                expected,
+            );
             botster_hub_client::request(
                 &endpoint,
                 botster_hub_client::DaemonRequest::Spawn {
@@ -537,6 +543,9 @@ fn external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup() {
                 &subscription_id,
             )
             .await;
+            fs::create_dir_all(start_path.parent().expect("start parent"))
+                .expect("create webrtc start dir");
+            fs::write(&start_path, b"go").expect("start webrtc producer");
             wait_for_webrtc_producer_ready_frames(
                 &mut offer_peer,
                 &stream_key,
