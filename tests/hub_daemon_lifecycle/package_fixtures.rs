@@ -1248,22 +1248,6 @@ pub(crate) fn write_local_runtime_daemon_metadata(data_dir: &Path, pid: u32) {
     assert!(metadata_path.exists(), "daemon metadata should exist");
 }
 
-pub(crate) fn write_python_wait_then_write_script(release_path: &Path, bytes: &[u8]) -> PathBuf {
-    let script_path = unique_short_test_dir("live-output-script").join("write.py");
-    fs::create_dir_all(script_path.parent().expect("script parent")).expect("create script dir");
-    fs::write(
-        &script_path,
-        format!(
-            "import os\nimport time\nprint({ready:?}, flush=True)\np = {path:?}\nwhile not os.path.exists(p):\n    time.sleep(0.01)\nos.write(1, bytes([{bytes}]))\n",
-            ready = PRODUCER_READY_MARKER,
-            path = release_path,
-            bytes = python_bytes_literal(bytes),
-        ),
-    )
-    .expect("write wait-then-write script");
-    script_path
-}
-
 pub(crate) fn write_python_start_then_write_script(
     start_path: &Path,
     release_path: &Path,
@@ -1309,15 +1293,17 @@ pub(crate) fn write_python_held_live_script(
 pub(crate) fn write_python_split_utf8_script(
     first_release: &Path,
     second_release: &Path,
+    exit_release: &Path,
 ) -> PathBuf {
     let script_path = unique_short_test_dir("live-split-script").join("write.py");
     fs::create_dir_all(script_path.parent().expect("script parent")).expect("create script dir");
     fs::write(
         &script_path,
         format!(
-            "import os\nimport time\na = {first:?}\nb = {second:?}\nwhile not os.path.exists(a):\n    time.sleep(0.01)\nos.write(1, bytes([226]))\nwhile not os.path.exists(b):\n    time.sleep(0.01)\nos.write(1, bytes([130, 172]))\n",
+            "import os\nimport time\na = {first:?}\nb = {second:?}\ne = {exit_release:?}\nwhile not os.path.exists(a):\n    time.sleep(0.01)\nos.write(1, bytes([226]))\nwhile not os.path.exists(b):\n    time.sleep(0.01)\nos.write(1, bytes([130, 172]))\nwhile not os.path.exists(e):\n    time.sleep(0.01)\n",
             first = first_release,
             second = second_release,
+            exit_release = exit_release,
         ),
     )
     .expect("write split UTF-8 script");

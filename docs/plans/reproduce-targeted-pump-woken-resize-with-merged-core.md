@@ -1,9 +1,12 @@
 # Prove targeted wake progress and migrate residual polling test seams
 
-Revision 2. Plan Review `review_1788405975_230755` returned revision 1 because
+Revision 3. Plan Review `review_1788405975_230755` returned revision 1 because
 its red arm was described as failing before the resize request. The ticket was
 also rewritten during that review to add the Core candidate arm and three test
-migrations. This revision covers the rewritten ticket.
+migrations. This revision covers the rewritten ticket. During Implement, the
+Core candidate full suite exposed one more polling-dependent WebRTC fixture.
+Human answer `question_1788410756_336404` approved its migration after
+diagnosis, with no polling seam, timeout increase, or new ticket.
 
 ## Routing
 
@@ -176,7 +179,39 @@ waking-contract pattern for the two WebRTC lifecycle tests.
    the candidate commit in the report.
 7. Full locked Hub suite at default concurrency on this branch through
    `script/run-lifecycle-suite` and `./test.sh --locked`.
-8. Report at
+8. Migrate
+   `external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup` from
+   an immediate-exit producer to the existing held-live producer. Keep the
+   producer live until WebRTC receives the exact bytes. Then release the
+   producer exit and require authoritative exact-session exit before peer
+   close and cleanup. This removes immediate exit as the obsolete final
+   progress trigger. Keep five rounds, byte exactness, process exit, peer
+   close, idempotent cleanup, and session removal.
+9. Migrate `external_hub_live_output_preserves_split_utf8_frames`. Keep its
+   split writes and release gates. Add a third gate that keeps the producer
+   live after the second write. Release and verify authoritative process exit
+   only after the exact second fragment arrives. This removes drain-time
+   polling as the final-fragment progress trigger. Keep the no-early-frame,
+   exact subscription, byte concatenation, UTF-8 replacement, cleanup, and
+   session removal assertions.
+10. Remove the residual immediate-exit live-output fixture after the Core
+    candidate exposes both remaining Unix users under suite load. Migrate
+    `external_hub_live_output_preserves_exact_bytes`,
+    `external_hub_live_output_keeps_ghostsnp_then_attached_then_bytes`,
+    `external_hub_finite_producer_completion_uses_production_lifecycle_signal`,
+    and `external_hub_webrtc_live_output_preserves_exact_bytes` to the
+    existing held-live fixture. Keep each producer live until its output
+    assertion passes. Then release and verify authoritative process exit.
+    Keep all byte, order, ownership, lifecycle, and cleanup assertions.
+11. Migrate
+    `unix_shutdown_session_from_another_connection_classifies_attached_exit`.
+    Its post-exit loop polls `Drain`, which does not perform exact-session
+    lifecycle observation. After the exit release, call the existing
+    production `ReadScreen` plus `ListSessions` helper. Then collect and
+    require the same exact-owner `process_exit` frame before `ShutdownSession`.
+    Keep the bound route, separate shutdown connection, strict natural-exit
+    classification, terminal listing, cleanup, and close assertions.
+12. Report at
    `docs/reports/reproduce-targeted-pump-woken-resize-with-merged-core-implement-report.md`
    with Hub commit, committed Core pin, candidate commit, `rustc --version`,
    both binary realpaths per arm, and every arm's tally.
@@ -192,9 +227,10 @@ waking-contract pattern for the two WebRTC lifecycle tests.
 - No Hub workaround for resize and no terminal-content policy. Hub stays
   content blind.
 - No change to `src/session_projection.rs`.
-- No change to the Unix tests, which already follow the waking contract.
+- No change to Unix or WebRTC production transport code.
 - No change to hub-test-support conformance fixtures or the npm package.
 - No new dependency edges. The Core ticket already depends on this one.
+- No timeout increase for the added WebRTC fixture migration.
 
 ## Ownership boundaries and cross-repository dependencies
 
@@ -232,7 +268,14 @@ waking-contract pattern for the two WebRTC lifecycle tests.
   aggregate pressure test.
 - `tests/hub_daemon_lifecycle/webrtc_terminal_adapter.rs`: two stall fixture
   commands.
-- `tests/hub_daemon_lifecycle/sessions.rs`: one record assertion.
+- `tests/hub_daemon_lifecycle/package_fixtures.rs`: remove the obsolete
+  immediate-exit fixture and hold split UTF-8 output until an exit gate.
+- `tests/hub_daemon_lifecycle/sessions.rs`: add one record assertion and
+  migrate three Unix live-output fixture users plus the split UTF-8 fixture.
+- `tests/hub_daemon_lifecycle/webrtc_proofs.rs`: migrate two WebRTC
+  immediate-exit fixture users to held-live output and authoritative exit.
+- `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs`: use production
+  exact-session observation before collecting the process-exit frame.
 - `docs/reports/reproduce-targeted-pump-woken-resize-with-merged-core-implement-report.md`:
   new evidence report.
 - `docs/plans/reproduce-targeted-pump-woken-resize-with-merged-core.md`:
@@ -363,6 +406,56 @@ node packages/hub-test-support/scripts/sync-assets.mjs --check
 script/run-lifecycle-suite      # verdict=clean on a quiet host
 ./test.sh --locked              # default concurrency
 ```
+
+Arm F, residual WebRTC fixture on this branch and the Core candidate:
+
+```sh
+./test.sh --locked --test hub_daemon_lifecycle_test \
+  external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup \
+  -- --exact hub_daemon_lifecycle::webrtc_proofs::external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup
+```
+
+Require one baseline test and three passes on each revision. On the Core
+candidate, restore only the immediate-exit fixture and require the exact test
+to fail before the live-byte assertion. Then restore the held-live fixture.
+
+Arm G, residual split UTF-8 fixture on this branch and the Core candidate:
+
+```sh
+./test.sh --locked --test hub_daemon_lifecycle_test \
+  external_hub_live_output_preserves_split_utf8_frames \
+  -- --exact hub_daemon_lifecycle::sessions::external_hub_live_output_preserves_split_utf8_frames
+```
+
+Require one baseline test and three passes on each revision. Keep the
+candidate full-suite failure at `drain_until_subscription_deadline` as the
+load-shaped red-on-revert proof.
+
+Arm H, removed immediate-exit fixture users on this branch and the Core
+candidate:
+
+```sh
+./test.sh --locked --test hub_daemon_lifecycle_test \
+  external_hub_live_output_preserves_exact_bytes \
+  external_hub_live_output_keeps_ghostsnp_then_attached_then_bytes \
+  external_hub_finite_producer_completion_uses_production_lifecycle_signal \
+  external_hub_webrtc_live_output_preserves_exact_bytes
+```
+
+Require all four selected tests to pass. The candidate full-suite failures
+for the exact-byte and finite-producer tests are the load-shaped red proof.
+
+Arm I, exact-owner Unix process-exit proof on this branch and the Core
+candidate:
+
+```sh
+./test.sh --locked --test hub_daemon_lifecycle_test \
+  unix_shutdown_session_from_another_connection_classifies_attached_exit \
+  -- --exact hub_daemon_lifecycle::unix_terminal_adapter::unix_shutdown_session_from_another_connection_classifies_attached_exit
+```
+
+Require one selected test to pass. The candidate full-suite failure at the
+process-exit assertion is the load-shaped red-on-revert proof.
 
 Provenance for the report, per arm: Hub `git rev-parse HEAD`,
 `grep -c <core sha> Cargo.lock` equal to 6, and `realpath` of

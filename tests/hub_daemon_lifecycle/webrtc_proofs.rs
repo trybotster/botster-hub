@@ -302,7 +302,9 @@ fn external_hub_webrtc_live_output_preserves_exact_bytes() {
             .expect("offer peer accepts answer");
 
         let release_path = unique_short_test_dir("webrtc-exact-release").join("go");
-        let script_path = write_python_wait_then_write_script(&release_path, expected);
+        let exit_release_path = unique_short_test_dir("webrtc-exact-exit").join("go");
+        let script_path =
+            write_python_held_live_script(&release_path, &exit_release_path, expected);
         botster_hub_client::request(
             &endpoint,
             botster_hub_client::DaemonRequest::Spawn {
@@ -377,6 +379,10 @@ fn external_hub_webrtc_live_output_preserves_exact_bytes() {
                 .any(|window| window == expected),
             "encrypted WebRTC adapter frames must preserve exact live bytes, got {concatenated:?}"
         );
+        fs::create_dir_all(exit_release_path.parent().expect("exit release parent"))
+            .expect("create exit release dir");
+        fs::write(&exit_release_path, b"go").expect("release WebRTC exact-byte producer exit");
+        wait_for_authoritative_session_exit(&endpoint, "webrtc-exact-bytes-session");
         let _ = offer_peer.peer.close().await;
     });
 
@@ -481,11 +487,11 @@ fn external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup() {
                 .await
                 .expect("offer peer accepts answer");
 
-            let start_path =
-                unique_short_test_dir(&format!("webrtc-sd-start-{round}")).join("go");
             let release_path = unique_short_test_dir(&format!("webrtc-sd-rel-{round}")).join("go");
+            let exit_release_path =
+                unique_short_test_dir(&format!("webrtc-sd-exit-rel-{round}")).join("go");
             let script_path =
-                write_python_start_then_write_script(&start_path, &release_path, expected);
+                write_python_held_live_script(&release_path, &exit_release_path, expected);
             botster_hub_client::request(
                 &endpoint,
                 botster_hub_client::DaemonRequest::Spawn {
@@ -531,9 +537,6 @@ fn external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup() {
                 &subscription_id,
             )
             .await;
-            fs::create_dir_all(start_path.parent().expect("start parent"))
-                .expect("create webrtc start dir");
-            fs::write(&start_path, b"go").expect("start webrtc producer");
             wait_for_webrtc_producer_ready_frames(
                 &mut offer_peer,
                 &stream_key,
@@ -562,6 +565,10 @@ fn external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup() {
                     .any(|window| window == expected),
                 "round {round} must observe live bytes before shutdown, got {concatenated:?}"
             );
+            fs::create_dir_all(exit_release_path.parent().expect("exit release parent"))
+                .expect("create webrtc exit release dir");
+            fs::write(&exit_release_path, b"go").expect("release webrtc producer exit");
+            wait_for_authoritative_session_exit(&endpoint, &session_id);
             let _ = offer_peer.peer.close().await;
         });
 

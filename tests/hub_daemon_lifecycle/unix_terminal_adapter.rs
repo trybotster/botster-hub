@@ -2720,6 +2720,7 @@ fn unix_shutdown_session_from_another_connection_classifies_attached_exit() {
         "attached adapter must see live output before process exit: {envelopes:?}"
     );
     fs::write(&exit_release, b"go").expect("release Unix natural-exit process");
+    wait_for_authoritative_session_exit(&endpoint, session_id);
     let exit_deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < exit_deadline
         && !envelopes

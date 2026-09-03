@@ -1190,7 +1190,9 @@ fn external_hub_live_output_preserves_exact_bytes() {
     let hub = start_isolated_live_output_hub("live-exact-bytes");
     let endpoint = hub.endpoint().clone();
     let release_path = unique_short_test_dir("live-exact-bytes-release").join("go");
-    let script_path = write_python_wait_then_write_script(&release_path, expected);
+    let exit_release_path = unique_short_test_dir("live-exact-bytes-exit").join("go");
+    let script_path =
+        write_python_held_live_script(&release_path, &exit_release_path, expected);
     let mut connection = botster_hub_client::DaemonConnection::connect(&endpoint).expect("connect");
     connection
         .request(&botster_hub_client::DaemonRequest::Spawn {
@@ -1238,6 +1240,11 @@ fn external_hub_live_output_preserves_exact_bytes() {
         "concatenated live bytes must preserve the write(2) sequence, got {concatenated:?}"
     );
 
+    fs::create_dir_all(exit_release_path.parent().expect("exit release parent"))
+        .expect("create exit release dir");
+    fs::write(&exit_release_path, b"go").expect("release exact-byte producer exit");
+    wait_for_authoritative_session_exit(&endpoint, "exact-bytes-session");
+
     production_cleanup_after_authoritative_exit(
         &endpoint,
         "exact-bytes-session",
@@ -1257,7 +1264,9 @@ fn external_hub_live_output_preserves_split_utf8_frames() {
     let mut connection = botster_hub_client::DaemonConnection::connect(&endpoint).expect("connect");
     let first_release = unique_short_test_dir("live-split-first").join("go");
     let second_release = unique_short_test_dir("live-split-second").join("go");
-    let script_path = write_python_split_utf8_script(&first_release, &second_release);
+    let exit_release = unique_short_test_dir("live-split-exit").join("go");
+    let script_path =
+        write_python_split_utf8_script(&first_release, &second_release, &exit_release);
     connection
         .request(&botster_hub_client::DaemonRequest::Spawn {
             session_id: "split-utf8-session".to_string(),
@@ -1341,6 +1350,11 @@ fn external_hub_live_output_preserves_split_utf8_frames() {
     assert_eq!(concatenated, [0xE2, 0x82, 0xAC]);
     assert!(!payload_has_utf8_replacement(&concatenated));
 
+    fs::create_dir_all(exit_release.parent().expect("exit release parent"))
+        .expect("create exit release dir");
+    fs::write(&exit_release, b"go").expect("release split UTF-8 producer exit");
+    wait_for_authoritative_session_exit(&endpoint, "split-utf8-session");
+
     production_cleanup_after_authoritative_exit(
         &endpoint,
         "split-utf8-session",
@@ -1357,7 +1371,9 @@ fn external_hub_live_output_keeps_ghostsnp_then_attached_then_bytes() {
     let hub = start_isolated_live_output_hub("live-order-bytes");
     let endpoint = hub.endpoint().clone();
     let release_path = unique_short_test_dir("live-order-release").join("go");
-    let script_path = write_python_wait_then_write_script(&release_path, expected);
+    let exit_release_path = unique_short_test_dir("live-order-exit").join("go");
+    let script_path =
+        write_python_held_live_script(&release_path, &exit_release_path, expected);
     let mut connection = botster_hub_client::DaemonConnection::connect(&endpoint).expect("connect");
     connection
         .request(&botster_hub_client::DaemonRequest::Spawn {
@@ -1416,6 +1432,11 @@ fn external_hub_live_output_keeps_ghostsnp_then_attached_then_bytes() {
         }
     }
 
+    fs::create_dir_all(exit_release_path.parent().expect("exit release parent"))
+        .expect("create exit release dir");
+    fs::write(&exit_release_path, b"go").expect("release ordered-byte producer exit");
+    wait_for_authoritative_session_exit(&endpoint, "order-bytes-session");
+
     production_cleanup_after_authoritative_exit(
         &endpoint,
         "order-bytes-session",
@@ -1464,7 +1485,9 @@ fn external_hub_finite_producer_completion_uses_production_lifecycle_signal() {
     let hub = start_isolated_live_output_hub("finite-producer-exit");
     let endpoint = hub.endpoint().clone();
     let release_path = unique_short_test_dir("finite-producer-release").join("go");
-    let script_path = write_python_wait_then_write_script(&release_path, expected);
+    let exit_release_path = unique_short_test_dir("finite-producer-exit-release").join("go");
+    let script_path =
+        write_python_held_live_script(&release_path, &exit_release_path, expected);
     let mut connection = botster_hub_client::DaemonConnection::connect(&endpoint).expect("connect");
     connection
         .request(&botster_hub_client::DaemonRequest::Spawn {
@@ -1484,6 +1507,10 @@ fn external_hub_finite_producer_completion_uses_production_lifecycle_signal() {
     fs::write(&release_path, b"go").expect("release finite producer");
 
     observe_exact_live_byte_window(&mut connection, "finite-producer-exit", expected);
+    fs::create_dir_all(exit_release_path.parent().expect("exit release parent"))
+        .expect("create exit release dir");
+    fs::write(&exit_release_path, b"go").expect("release finite producer exit");
+    wait_for_authoritative_session_exit(&endpoint, "finite-producer-exit");
     production_cleanup_after_authoritative_exit(
         &endpoint,
         "finite-producer-exit",
