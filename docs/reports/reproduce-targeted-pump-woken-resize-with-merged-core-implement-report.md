@@ -6,7 +6,7 @@
 - Run: `run_1788405008_320393`
 - Target repository: `botster-hub` (`trybotster/botster-hub`)
 - Target id: `tgt_7e208a0c76a44980a83b63af976b1f22`
-- Implementation commits: `6e82219c381843c2814a1ef8f0c6e1251b992ead` and `ceb0823eba6d902f7b0dad12df68e774e8fb0e01`
+- Implementation commits: `6e82219c381843c2814a1ef8f0c6e1251b992ead`, `ceb0823eba6d902f7b0dad12df68e774e8fb0e01`, and `5ef47a691e53d7fc71ef6bb3ffb0fa80af700abe`
 - Committed Core pin: `48a437032791e678010254708259568ce4ad02bf`
 - Wake-only Core candidate: `05464a186c974e2d1b21b190679a0486f066f8d6`
 - Merge policy: direct. This run does not require a pull request.
@@ -73,6 +73,8 @@ The Core candidate full suite exposed residual live-output fixtures. Those fixtu
 
 The migrated fixtures keep each producer live until the asserted output arrives. The tests then release and verify authoritative process exit. The implementation removed the unused immediate-exit fixture.
 
+The WebRTC shutdown proof keeps its post-bind producer start gate. This gate prevents producer output before the route can receive it. The producer still waits for a separate exit release after delivery.
+
 The exact-owner Unix process-exit proof now performs production exact-session observation after the exit release. It then requires the same `process_exit` frame before `ShutdownSession`.
 
 No production code changed.
@@ -133,6 +135,8 @@ Current Core pin:
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`: passed.
 - `node packages/hub-test-support/scripts/sync-assets.mjs --check`: passed.
 - `./test.sh --locked`: passed at default concurrency. The lifecycle binary reported 342 passed, 0 failed, and 2 ignored.
+- After the Verify return, the corrected WebRTC shutdown proof passed its exact five-round run.
+- After the Verify return, `./test.sh --locked` passed again at default concurrency. The lifecycle binary reported 342 passed, 0 failed, and 2 ignored.
 
 Wake-only Core candidate:
 
@@ -140,6 +144,7 @@ Wake-only Core candidate:
 - `cargo fmt --all -- --check`: passed.
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`: passed.
 - Final `./test.sh --locked`: passed at default concurrency. The lifecycle binary reported 342 passed, 0 failed, and 2 ignored.
+- After the Verify return, the corrected WebRTC shutdown proof passed with Core candidate `05464a1`.
 
 Red evidence:
 
@@ -179,3 +184,7 @@ The implementation captured one durable gap at `ops/inbox/2026-09-02-wake-only-c
 Review finding `finding_1788414851_436900` found user-specific absolute paths in this report.
 
 The correction replaces all binary paths with path-neutral references. The repository PII scanner checked the raw `origin/main` branch diff. Its known-positive controls passed, and it returned `ok: true` with no findings.
+
+Verify review `review_1788416923_415327` found a race in the WebRTC shutdown proof. The migration had removed the post-bind producer start gate. Under load, producer output could arrive before route readiness.
+
+Commit `5ef47a691e53d7fc71ef6bb3ffb0fa80af700abe` restores the start gate and keeps the separate exit gate. The exact current-pin test, the full current-pin locked suite, and the exact Core-candidate test passed.
