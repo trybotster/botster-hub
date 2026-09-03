@@ -259,6 +259,42 @@ Production-path durable census (no `BOTSTER_ENV=test`): spawn `durable-exited-1`
 
 Review `review_1788465266_290355`: D.1 WouldBlock oracle is `13074b6`. Path-neutral artifacts are `13074b6`. Vault cold-cut note stays pending in inbox. Durable Hub projection is `4d558e9`. Cancel ablation is Web `062e314`. TUI late-history ticket closed without a merge on `origin/main`.
 
+## Review-return visit (`review_1788477306_734887`, `question_1788477409_664609`)
+
+Human answer C: one consolidated botster-web ticket for both remaining Web live failures. Keep the WebRTC WouldBlock wait in this Hub run. After the Web merge, rerun durable dashboard, north-star, TUI `ghostty-shared`, and the complete matrix once. Do not waive either product lane. Do not mark ended as current. Do not add another TUI ticket.
+
+Constraints applied: Hub-only source edits. Web and TUI source stay on their own tickets.
+
+### Finding `finding_1788477307_457400` (Hub)
+
+The WebRTC isolation test now waits up to 2s for `observation/would_block` after `spawn_and_bind` of `wso-held`, then asserts before sibling delivery. The wait matches the Unix test (`thread::sleep` 10ms). The sibling oracle now matches Unix: bind an echo loop, then write `wso-sibling-live` on the reserved channel after hello ack. Spawn-time `printf` raced attach and produced attaching/attached frames without live bytes.
+
+| Arm | Result |
+| --- | --- |
+| Exact filter | 1 test selected |
+| Green `FORCE=wso-held` | 5/5 pass after the echo-after-bind oracle, then 1 more pass after ablation restore |
+| Disabled-seam `FORCE=no-such-session` | fail at `held route must enter WouldBlock before sibling delivery` (`ABLATION_EXIT=101`). Restored to `wso-held` |
+
+Commands:
+
+```sh
+RUSTUP_TOOLCHAIN=1.97.0
+unset CARGO_TARGET_DIR
+BOTSTER_ENV=test ./test.sh --locked --test hub_daemon_lifecycle_test webrtc_forced_would_block_on_one_route_keeps_sibling_open_and_delivering -- --exact
+```
+
+`cargo fmt --all -- --check` pass on this visit.
+
+### Findings `finding_1788477306_952608` and `finding_1788477306_100800` (Web)
+
+Registered `ticket_1788477497_716720` against `tgt_40abcf71ccf049f4ac0c99953a799869` (botster-web): show Hub-authored ended sessions through an explicit ended-session presentation path, and complete caller-owned alt-exited keep-alive. Dependency `dependency_1788477513_382774`. Web run `run_1788477522_704573`. This Hub run does not edit Web source.
+
+### Residual after this visit
+
+- Durable dashboard and north-star keep-alive stay open until `ticket_1788477497_716720` merges.
+- Then this Hub ticket reruns durable dashboard, north-star shared session, TUI `ghostty-shared`, and the complete matrix once.
+- Hub persistence repair remains `4d558e9`. Do not classify ended rows as current.
+
 ## Missing vault guidance discovered
 
 Recorded in the inbox capture: final ownership statement, D.1 oracle names, 18-site pin count vs the "eleven" note title, runner registration check, and the full two-arm authentication prerequisite list.
