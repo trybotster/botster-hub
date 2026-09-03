@@ -192,6 +192,51 @@ Controlled runner rerun (verbatim from botster-web `docs/terminal-baseline-obser
 - Foreign Botster processes were present during Hub suites. The passing retry is the official gate evidence.
 - TUI scratch used path deps; the durable Git pin is the consumer ticket.
 
+## Review-return visit (`question_1788465866_563736`)
+
+Human answer: do not waive the three remaining consumer lanes. Keep durable restore in this Hub run. Create one Web ticket and one TUI ticket. This ticket depends on both. Rerun the complete matrix once after both merges.
+
+### Hub persistence repair
+
+Core already persists `Exited` registry rows under the Hub data directory. After Hub process restart, `ListSessions` still returns those rows. Core `lifecycle_record` copies engine lifecycle only, so a restarted exited row arrives with `lifecycle=None`. Hub projection treated that as `lifecycle_class=indeterminate` and omitted `lifecycle`. Web home dashboard lists only `lifecycle_class=current` and does not infer class from `registry_state`.
+
+Smallest repair, one persistence path: when `registry_state=Exited` and engine lifecycle is omitted, project `lifecycle=exited` and `lifecycle_class=ended`. Running + omitted lifecycle stays `indeterminate`. No Hub-owned session store.
+
+| Path | Change |
+| --- | --- |
+| `src/session_projection.rs` | Ended class and `lifecycle=exited` for registry Exited without engine lifecycle. Unit test `complete_baseline_exited_registry_without_engine_lifecycle_is_ended`. |
+| `src/subscription/entity.rs` | Matching cfg(test) projection copy. |
+| `tests/hub_daemon_lifecycle/shutdown.rs` | `process_ownership_daemon_restart_lists_ended_session_row` |
+
+Red before the repair: the new process test failed with snapshot `lifecycle_class=indeterminate` and no `lifecycle` field, while `ListSessions` already had `lifecycle=exited`. Green after the repair.
+
+Commands:
+
+```sh
+RUSTUP_TOOLCHAIN=1.97.0 BOTSTER_ENV=test cargo fmt --all -- --check
+./test.sh --locked -p botster-hub --lib complete_baseline_exited_registry_without_engine_lifecycle_is_ended
+./test.sh --locked -p botster-hub --lib session_lifecycle_class_is_total_and_stale_first
+./test.sh --locked --test hub_daemon_lifecycle_test process_ownership_daemon_restart_lists_ended_session_row -- --exact
+./test.sh --locked --test hub_daemon_lifecycle_test
+```
+
+Lifecycle suite: `346 passed; 0 failed; 2 ignored`.
+
+### Consumer tickets
+
+| Ticket | Target | Role |
+| --- | --- | --- |
+| `ticket_1788467459_333288` | `tgt_40abcf71ccf049f4ac0c99953a799869` (botster-web) | `BOTSTER_LIVE_ABLATE_CANCEL_DETACH=1` must fail for the intended reason. Preserve the dedicated channel path. |
+| `ticket_1788467460_864070` | `tgt_c3d470bab78549df920a41e8fb0e58d8` (botster-tui) | Reproduce `ghostty-shared` late-history, then restore ready-then-history. Preserve isolated `script/test-live-hub ghostty`. |
+
+Dependencies from this ticket: `dependency_1788467479_559280` and `dependency_1788467481_242462`. No second Web ticket for durable restore. No second Hub ticket.
+
+### Residual after this visit
+
+- Complete consumer matrix still waits for those two merges, then one rerun here.
+- Web home dashboard still filters `lifecycle_class === "current"`. Hub now authors ended rows. Durable dashboard visibility remains a live-lane assertion for the final matrix, not a second Web ticket.
+- Shared-session cancel ablation and `ghostty-shared` late-history remain consumer-owned.
+
 ## Missing vault guidance discovered
 
 Recorded in the inbox capture: final ownership statement, D.1 oracle names, 18-site pin count vs the "eleven" note title, runner registration check, and the full two-arm authentication prerequisite list.

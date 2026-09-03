@@ -1676,6 +1676,9 @@ fn project_session_entity(record: &SessionLifecycleRecord) -> DaemonSessionEntit
         Some(SessionLifecycleState::Failed { reason }) => {
             (Some("failed".to_string()), None, Some(reason.clone()))
         }
+        None if record.session.registry_state == RegistrySessionState::Exited => {
+            (Some("exited".to_string()), None, None)
+        }
         None => (None, None, None),
     };
     let lifecycle_class =
@@ -1727,6 +1730,7 @@ fn session_lifecycle_class(
             Some(SessionLifecycleState::Exited { .. } | SessionLifecycleState::Failed { .. }) => {
                 "ended"
             }
+            None if registry_state == &RegistrySessionState::Exited => "ended",
             None => "indeterminate",
         }
     }
@@ -1811,6 +1815,10 @@ mod tests {
         assert_eq!(
             session_lifecycle_class(&RegistrySessionState::Running, None),
             "indeterminate"
+        );
+        assert_eq!(
+            session_lifecycle_class(&RegistrySessionState::Exited, None),
+            "ended"
         );
         assert_eq!(
             session_lifecycle_class(&RegistrySessionState::Stale, None),

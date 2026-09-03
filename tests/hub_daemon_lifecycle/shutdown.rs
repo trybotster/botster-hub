@@ -2603,6 +2603,177 @@ fn process_ownership_daemon_restart_adopts_then_shuts_down_worker_session() {
 }
 
 #[test]
+fn process_ownership_daemon_restart_lists_ended_session_row() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("cli-restart-ended-row");
+    let config = explicit_config(&data_dir);
+    let session_id = format!("cli-restart-ended-{}", std::process::id());
+    let child = start_cli_daemon(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("test config has local socket")
+            .path
+            .clone(),
+    );
+
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: session_id.clone(),
+            command: "sleep 30".to_string(),
+        },
+    )
+    .expect("spawn session that will exit through ShutdownSession");
+    let shutdown = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::ShutdownSession {
+            session_id: session_id.clone(),
+        },
+    )
+    .expect("ShutdownSession before hub restart");
+    assert!(
+        matches!(
+            shutdown.kind,
+            botster_hub_client::DaemonResponseKind::Events
+                | botster_hub_client::DaemonResponseKind::SessionCleanup
+        ),
+        "ShutdownSession must complete without removing the registry row, got kind={:?} error={:?}",
+        shutdown.kind,
+        shutdown.error
+    );
+    wait_for_authoritative_session_exit(&endpoint, &session_id);
+
+    let before = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ListSessions,
+    )
+    .expect("list exited row before hub restart");
+    assert!(
+        before.sessions.iter().any(|session| {
+            session.session_id == session_id && session.lifecycle == "exited"
+        }),
+        "pre-restart list must keep the exited row, sessions={:?}",
+        before.sessions
+    );
+
+    shutdown_cli_daemon(&data_dir, child.transfer_sessions());
+    let registry_files = session_registry_json_names(&data_dir);
+    assert!(
+        !registry_files.is_empty(),
+        "Core session registry files must survive production hub shutdown, files={registry_files:?}"
+    );
+    let restarted_child = start_cli_daemon(&data_dir);
+
+    let status = botster_hub::daemon_transport_request(&config, botster_hub::DaemonRequest::Status)
+        .expect("status after daemon restart");
+    let status = status.status.expect("status response body");
+    assert_eq!(status.lifecycle_state, "running");
+    assert!(status.core_initialized);
+    assert_eq!(status.state_source, "loaded");
+    assert!(
+        status.session_count >= 1,
+        "restarted hub must count the persisted exited row, session_count={} recovered={:?} stale={:?} registry_files={registry_files:?}",
+        status.session_count,
+        status.recovered_sessions,
+        status.stale_sessions
+    );
+    assert!(
+        !status
+            .recovered_sessions
+            .iter()
+            .any(|recovered| recovered == &session_id),
+        "an already-exited row is not a recovered live worker"
+    );
+
+    let list =
+        botster_hub::daemon_transport_request(&config, botster_hub::DaemonRequest::ListSessions)
+            .expect("list ended row after daemon restart");
+    assert!(
+        list.sessions.iter().any(|session| {
+            session.session_id == session_id && session.lifecycle == "exited"
+        }),
+        "restarted hub must list the persisted exited row, sessions={:?} registry_files={registry_files:?}",
+        list.sessions
+    );
+
+    let mut subscription = botster_hub_client::subscribe_session_entities(
+        &endpoint,
+        "cli-restart-ended-entities",
+    )
+    .expect("subscribe session entities after restart");
+    subscription
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound post-restart snapshot reads");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut snapshot_items = Vec::new();
+    let mut saw_ended = false;
+    while Instant::now() < deadline {
+        match subscription.next_frame() {
+            Ok(botster_hub_client::DaemonEntityFrame::Snapshot { items, .. }) => {
+                saw_ended = items.iter().any(|item| {
+                    item.get("session_uuid").and_then(serde_json::Value::as_str)
+                        == Some(session_id.as_str())
+                        && item.get("lifecycle").and_then(serde_json::Value::as_str)
+                            == Some("exited")
+                        && item
+                            .get("lifecycle_class")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("ended")
+                });
+                snapshot_items = items;
+                if saw_ended {
+                    break;
+                }
+            }
+            Ok(botster_hub_client::DaemonEntityFrame::Upsert { id, entity, .. })
+                if id == session_id
+                    && entity
+                        .get("lifecycle")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("exited")
+                    && entity
+                        .get("lifecycle_class")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("ended") =>
+            {
+                saw_ended = true;
+                snapshot_items = vec![entity];
+                break;
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    assert!(
+        saw_ended,
+        "later subscriber after hub restart must receive the ended row, items={snapshot_items:?} list={:?}",
+        list.sessions
+    );
+    subscription
+        .unsubscribe()
+        .expect("unsubscribe post-restart entity stream");
+    shutdown_cli_daemon(&data_dir, restarted_child);
+}
+
+fn session_registry_json_names(data_dir: &Path) -> Vec<String> {
+    let root = data_dir.join("sessions");
+    let Ok(entries) = fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("json"))
+        .filter_map(|path| path.file_name().map(|name| name.to_string_lossy().into_owned()))
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
 fn data_plane_stop_timeout_aborts_then_restart_adopts_residue() {
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::process::ExitStatusExt;
