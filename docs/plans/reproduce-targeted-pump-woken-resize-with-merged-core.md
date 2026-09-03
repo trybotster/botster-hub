@@ -1,12 +1,15 @@
 # Prove targeted wake progress and migrate residual polling test seams
 
-Revision 3. Plan Review `review_1788405975_230755` returned revision 1 because
+Revision 4. Plan Review `review_1788405975_230755` returned revision 1 because
 its red arm was described as failing before the resize request. The ticket was
 also rewritten during that review to add the Core candidate arm and three test
 migrations. This revision covers the rewritten ticket. During Implement, the
-Core candidate full suite exposed one more polling-dependent WebRTC fixture.
-Human answer `question_1788410756_336404` approved its migration after
-diagnosis, with no polling seam, timeout increase, or new ticket.
+Core candidate full suite exposed five more affected proofs. Human answer
+`question_1788410756_336404` approved the added WebRTC migration after
+diagnosis. The answer prohibited a polling seam, timeout increase, or new
+ticket. Verify review `review_1788416923_415327` found that this migration also
+removed a required post-bind start gate. Revision 4 restores that readiness
+gate while it keeps the separate exit gate.
 
 ## Routing
 
