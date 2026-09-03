@@ -45,6 +45,8 @@ The implementation used these atomic notes:
 - [[webrtc starvation markers must drop pre release producer ready bytes]]
 - [[observed-exit waits must issue a production exact-session observe turn]]
 - [[counted quiet drain oracles still carry a wall clock floor]]
+- [[pipeline artifacts should use path neutral worktree references]]
+- [[botster review and verify must scan all committed artifacts for pii]]
 
 The implementation also used the project identity and goals notes. No convention conflict occurred.
 
@@ -104,12 +106,12 @@ Plan revision 3 records the added files, tests, red evidence, and acceptance che
 - Official Rust: `rustc 1.97.0 (2d8144b78 2026-07-07)`
 - Zig: `0.16.0`
 - `CARGO_TARGET_DIR`: unset for every official command
-- Current Hub binary: `/Users/jasonconigliari/botster-sessions/trybotster-botster-hub-project-pipelines-ticket_1788206393_323469/target/debug/botster-hub`
-- Current worker binary: `/Users/jasonconigliari/botster-sessions/trybotster-botster-hub-project-pipelines-ticket_1788206393_323469/target/debug/botster-session-worker`
-- Candidate Hub binary: `/private/tmp/botster-hub-candidate.oaUdJT/repo/target/debug/botster-hub`
-- Candidate worker binary: `/private/tmp/botster-hub-candidate.oaUdJT/repo/target/debug/botster-session-worker`
-- Old-pin Hub binary: `/private/tmp/botster-hub-old.MnpPVC/repo/target/debug/botster-hub`
-- Old-pin worker binary: `/private/tmp/botster-hub-old.MnpPVC/repo/target/debug/botster-session-worker`
+- Current Hub binary: `target/debug/botster-hub` in the ticket worktree
+- Current worker binary: `target/debug/botster-session-worker` in the ticket worktree
+- Candidate Hub binary: `target/debug/botster-hub` in the Core-candidate scratch clone
+- Candidate worker binary: `target/debug/botster-session-worker` in the Core-candidate scratch clone
+- Old-pin Hub binary: `target/debug/botster-hub` in the old-pin scratch clone
+- Old-pin worker binary: `target/debug/botster-session-worker` in the old-pin scratch clone
 
 The current lockfile has six `48a4370` Core sources. The candidate lockfile has six `05464a1` Core sources and zero old-SHA matches outside `docs/`.
 
@@ -171,3 +173,9 @@ The residual fixture red proofs are load-shaped. Their focused old-fixture forms
 No missing vault guidance blocked the work.
 
 The implementation captured one durable gap at `ops/inbox/2026-09-02-wake-only-core-live-output-tests-hold-producer-until-delivery.md`. The note records the held-live output rule and the exact-session process-exit rule.
+
+## Review return
+
+Review finding `finding_1788414851_436900` found user-specific absolute paths in this report.
+
+The correction replaces all binary paths with path-neutral references. The repository PII scanner checked the raw `origin/main` branch diff. Its known-positive controls passed, and it returned `ok: true` with no findings.
