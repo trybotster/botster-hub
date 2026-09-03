@@ -1290,6 +1290,29 @@ pub(crate) fn write_python_held_live_script(
     script_path
 }
 
+pub(crate) fn write_python_started_held_live_script(
+    start_path: &Path,
+    release_path: &Path,
+    exit_release_path: &Path,
+    bytes: &[u8],
+) -> PathBuf {
+    let script_path = unique_short_test_dir("started-held-live-script").join("write.py");
+    fs::create_dir_all(script_path.parent().expect("script parent")).expect("create script dir");
+    fs::write(
+        &script_path,
+        format!(
+            "import os\nimport time\ns = {start:?}\nwhile not os.path.exists(s):\n    time.sleep(0.01)\nprint({ready:?}, flush=True)\np = {release:?}\nwhile not os.path.exists(p):\n    time.sleep(0.01)\nos.write(1, bytes([{bytes}]))\ne = {exit_release:?}\nwhile not os.path.exists(e):\n    time.sleep(0.01)\n",
+            start = start_path,
+            ready = PRODUCER_READY_MARKER,
+            release = release_path,
+            exit_release = exit_release_path,
+            bytes = python_bytes_literal(bytes),
+        ),
+    )
+    .expect("write started held-live script");
+    script_path
+}
+
 pub(crate) fn write_python_split_utf8_script(
     first_release: &Path,
     second_release: &Path,
