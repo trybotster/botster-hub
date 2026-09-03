@@ -989,7 +989,7 @@ fn webrtc_terminal_adapter_write_budget_emits_core_adapter_closed_while_peer_sta
             &key,
             "wwb-stall",
             "sub-stall",
-            "printf 'write-budget-stall\\n'; sleep 30",
+            "sleep 3; exec yes write-budget-stall",
         )
         .await;
         spawn_and_bind_webrtc(
@@ -1268,7 +1268,7 @@ fn webrtc_terminal_adapter_failed_remove_session_does_not_suppress_later_core_cl
             &key,
             "wrm-stall",
             "sub-stall",
-            "printf 'remove-session-still-live\\n'; sleep 30",
+            "sleep 3; exec yes remove-session-still-live",
         )
         .await;
         let removed = peer
