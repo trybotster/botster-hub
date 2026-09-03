@@ -2563,6 +2563,13 @@ fn session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnec
         second_resize_sequence, resize_sequence,
         "subscriber resize sequences diverged: first={first_resize:?} second={second_resize:?}"
     );
+    let persisted: serde_json::Value = serde_json::from_slice(
+        &fs::read(data_dir.join("sessions").join("entity-session.json"))
+            .expect("read resized session record"),
+    )
+    .expect("parse resized session record");
+    assert_eq!(persisted.get("rows").and_then(serde_json::Value::as_u64), Some(31));
+    assert_eq!(persisted.get("cols").and_then(serde_json::Value::as_u64), Some(101));
 
     terminal
         .send_terminal_frame(

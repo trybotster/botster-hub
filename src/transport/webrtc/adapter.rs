@@ -851,7 +851,7 @@ mod tests {
         };
         use botster_core::{
             ClientId, ClientWorker, SessionId, SubscriptionId, TerminalCapabilitySet,
-            TransportEgress,
+            TerminalWakeBatch, TerminalWakeRoute, TerminalWakeSource, TransportEgress,
         };
 
         let mut budget = ConnectionBudget::default();
@@ -866,6 +866,7 @@ mod tests {
         let session_id = SessionId("session".into());
         let subscription_id = SubscriptionId("terminal".into());
         let mut worker = ClientWorker::new();
+        worker.set_wake_source(TerminalWakeSource::new());
         let (generation, replacements) = worker.record_attach(
             client_id.clone(),
             session_id.clone(),
@@ -879,7 +880,7 @@ mod tests {
             handle.clone(),
         );
         worker
-            .bind_terminal_adapter(
+            .bind_waking_terminal_adapter(
                 &client_id,
                 session_id.clone(),
                 subscription_id.clone(),
@@ -888,6 +889,13 @@ mod tests {
                 Box::new(adapter),
             )
             .expect("bind aggregate-backed adapter");
+        let route_only = TerminalWakeBatch {
+            adapter_routes: vec![TerminalWakeRoute {
+                session_id: session_id.clone(),
+                subscription_id: subscription_id.clone(),
+            }],
+            ingress_sessions: Vec::new(),
+        };
 
         let mut egress = vec![(
             client_id.clone(),
@@ -902,12 +910,12 @@ mod tests {
 
         for attempt in 1..512 {
             assert!(
-                worker.pump().is_empty(),
+                worker.pump_woken(&route_only).is_empty(),
                 "attempt {attempt} must retain the Core route"
             );
             assert!(worker.has_subscription(&session_id, &subscription_id));
         }
-        let teardowns = worker.pump();
+        let teardowns = worker.pump_woken(&route_only);
         assert_eq!(teardowns.len(), 1);
         assert_eq!(teardowns[0].client_id, client_id);
         assert_eq!(teardowns[0].session_id, session_id);
