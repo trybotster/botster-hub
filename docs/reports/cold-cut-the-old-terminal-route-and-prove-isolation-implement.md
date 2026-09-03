@@ -237,6 +237,28 @@ Dependencies from this ticket: `dependency_1788467479_559280` and `dependency_17
 - Web home dashboard still filters `lifecycle_class === "current"`. Hub now authors ended rows. Durable dashboard visibility remains a live-lane assertion for the final matrix, not a second Web ticket.
 - Shared-session cancel ablation and `ghostty-shared` late-history remain consumer-owned.
 
+## Final matrix after consumer merges
+
+Web consumed at exact `062e314a27c1f04c7cd67884307af4a432ee3e5b` (`ticket_1788467459_333288` closed). TUI consumed at `origin/main` `b051c67` in a scratch worktree with uncommitted path pins to this Hub worktree. Hub candidate `4d558e9`. Core pin `72d1c75`. Toolchain `rustc 1.97.0`, Zig `0.16.0`. `CARGO_TARGET_DIR` unset.
+
+Production-path durable census (no `BOTSTER_ENV=test`): spawn `durable-exited-1`, `ShutdownSession`, Hub process restart on the same data directory. After restart: `state_source=loaded`, `session_count=1`, `sessions list` shows `lifecycle=exited`, registry file present. Hub provides the ended row.
+
+| Lane | Result |
+| --- | --- |
+| `cargo fmt --all -- --check` | pass |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | pass |
+| `./test.sh --locked` | pass. Lib `549 passed`. Lifecycle `346 passed; 0 failed; 2 ignored`. |
+| `packages/hub-test-support` `npm test` | pass at `0.1.43` |
+| Web `npm test` at `062e314` | pass |
+| `smoke:live-packaged-protocol` | pass (`live packaged protocol harness passed (webrtc)`) |
+| `smoke:live-packaged-protocol:shared-session` | pass (`live-shared-session-coordinator-passed` with `cancel_ablation=true`, keep-alive 2, exit pass) |
+| `smoke:plugin-contract-matrix` | pass |
+| TUI `script/test-live-hub ghostty` | pass (`ghostty-live-complete` hub_rev=`4d558e9` worker_rev=`72d1c75`) |
+| `smoke:live-packaged-protocol:durable` | fail: dashboard wait for `botster-web-durable-exited-1`. Hub list after restart is green. Web `currentDashboardSessions` keeps `lifecycle_class === "current"` only. |
+| `script/prove-north-star-shared-session` | fail twice at web keep-alive 1: `timed out waiting for mounted terminal renderer write botster-web-production-alt-exited`. Spawned `north-star-shared`. Did not reach TUI `ghostty-shared`. Standalone Web coordinator on a Hub-owned session passed. |
+
+Review `review_1788465266_290355`: D.1 WouldBlock oracle is `13074b6`. Path-neutral artifacts are `13074b6`. Vault cold-cut note stays pending in inbox. Durable Hub projection is `4d558e9`. Cancel ablation is Web `062e314`. TUI late-history ticket closed without a merge on `origin/main`.
+
 ## Missing vault guidance discovered
 
 Recorded in the inbox capture: final ownership statement, D.1 oracle names, 18-site pin count vs the "eleven" note title, runner registration check, and the full two-arm authentication prerequisite list.
