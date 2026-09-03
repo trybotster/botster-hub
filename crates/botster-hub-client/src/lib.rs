@@ -4722,9 +4722,12 @@ mod tests {
         assert!(generated.contains("mode_generation: number;"));
         assert!(generated.contains("mode_revision: number;"));
         assert!(!generated.contains(r#"| { type: "mode_gated_input"; session_id: string; data: string; mode_generation: number; mode_revision: number }"#));
+        assert!(!generated.contains(r#"| { type: "send_input""#));
+        assert!(!generated.contains(r#"| { type: "resize""#));
         assert!(generated.contains("terminal_reservation?: DaemonTerminalReservation | null;"));
         assert!(generated.contains("export interface DaemonTerminalReservation"));
         assert!(!generated.contains("mode_gated_input"));
+        assert!(!generated.contains("send_input"));
     }
 
     #[test]

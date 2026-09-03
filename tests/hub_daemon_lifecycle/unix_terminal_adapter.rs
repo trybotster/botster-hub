@@ -1935,7 +1935,7 @@ fn core_write_budget_hard_stop_emits_core_adapter_closed() {
     );
 
     eprintln!(
-        "core_write_budget provenance hub_bin={} session_worker={} hub_sha={} locked_core=48a437032791e678010254708259568ce4ad02bf",
+        "core_write_budget provenance hub_bin={} session_worker={} hub_sha={} locked_core=72d1c7571bc229dbb2cbd67aa979b6504ac150a5",
         env!("CARGO_BIN_EXE_botster-hub"),
         session_worker_binary_path().display(),
         option_env!("BOTSTER_HUB_GIT_SHA").unwrap_or("worktree")
@@ -1943,6 +1943,117 @@ fn core_write_budget_hard_stop_emits_core_adapter_closed() {
 
     shutdown_short_lived_session(hub.endpoint(), "cwb-stall");
     shutdown_short_lived_session(hub.endpoint(), "cwb-live");
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn forced_would_block_on_one_unix_route_keeps_sibling_open_and_delivering() {
+    let _guard = daemon_test_guard();
+    let hub = start_isolated_live_output_hub_with_env(
+        "sso",
+        &[
+            (
+                "BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_SESSION",
+                "sso-held",
+            ),
+            (
+                "BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_DELAY_MS",
+                "0",
+            ),
+        ],
+    );
+    let (mut stream, mut reader) = unix_adapter_connection(hub.endpoint());
+    let mut envelopes = Vec::new();
+    let mut events = Vec::new();
+    spawn_and_bind(
+        &mut stream,
+        &mut reader,
+        "sso-held",
+        "sub-held",
+        "printf 'held-ready\\n'; sleep 30",
+        &mut envelopes,
+        &mut events,
+    );
+    spawn_and_bind(
+        &mut stream,
+        &mut reader,
+        "sso-live",
+        "sub-live",
+        "while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
+        &mut envelopes,
+        &mut events,
+    );
+
+    write_unix_terminal_frame(
+        &mut stream,
+        "sso-live",
+        "sub-live",
+        &terminal_input_frame_bytes(b"sso-sibling-live\r"),
+    );
+    let sibling_deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < sibling_deadline
+        && !unix_envelope_contains_live_bytes(&envelopes, "echo:sso-sibling-live")
+    {
+        let drain = request_collecting_mux(
+            &mut stream,
+            &mut reader,
+            &botster_hub_client::DaemonRequest::drain_subscription("sso-live", "sub-live"),
+            &mut envelopes,
+            &mut events,
+        );
+        assert_ne!(
+            drain.kind,
+            botster_hub_client::DaemonResponseKind::OperatorError,
+            "sibling scoped Drain must stay owned: {:?}",
+            drain.error
+        );
+        assert!(
+            drain
+                .events
+                .iter()
+                .all(|event| !event_is_terminal_body(event)),
+            "content-blind sibling Drain must stay bound: {:?}",
+            drain.events
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        unix_envelope_contains_live_bytes(&envelopes, "echo:sso-sibling-live"),
+        "same-connection sibling must produce a new terminal envelope while the held route stays open: {envelopes:?}"
+    );
+
+    let status = request_collecting_mux(
+        &mut stream,
+        &mut reader,
+        &botster_hub_client::DaemonRequest::Status,
+        &mut envelopes,
+        &mut events,
+    );
+    assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
+    let occupancy = status.status.expect("status body").live_attach_occupancy;
+    assert!(
+        occupancy_has_pair(&occupancy, "sso-held", "sub-held"),
+        "held route must stay Bound: {occupancy:?}"
+    );
+    assert!(
+        occupancy_has_pair(&occupancy, "sso-live", "sub-live"),
+        "sibling route must stay Bound: {occupancy:?}"
+    );
+    assert!(
+        events.iter().all(|event| {
+            !matches!(
+                event,
+                botster_hub_client::DaemonEvent::TerminalSubscriptionClosed {
+                    session_id,
+                    ..
+                } if session_id == "sso-held"
+            )
+        }),
+        "held route must stay below the close budget: {events:?}"
+    );
+
+    shutdown_short_lived_session(hub.endpoint(), "sso-held");
+    shutdown_short_lived_session(hub.endpoint(), "sso-live");
     hub.shutdown().expect("shutdown isolated hub");
 }
 

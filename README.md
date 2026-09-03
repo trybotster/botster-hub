@@ -111,7 +111,7 @@ downstream clients must consume the post-cutover restty/WASM stack.
 ### Product today vs still unfinished
 
 **Product on this path:** explicit data-dir daemon lifecycle; worker-backed
-local PTY sessions (spawn/list/attach/input/resize/detach/session-shutdown);
+local PTY sessions (spawn/list/attach/detach/session-shutdown) with input and resize on the bound adapter plane;
 attach/drain history; hub client screen, mode-flags, and snapshot readback through CoreDaemon;
 package install/enable/disable/reload and entrypoint supervision for local
 packages; `HubClientApi` + daemon socket protocol; native MCP coordination
@@ -132,7 +132,7 @@ builtins; broad monolith migration import.
 | Layer | Owns |
 | --- | --- |
 | `botster-core` / `botster-core-daemon` | Policy-free reusable local engine mechanics and transport-neutral primitives: session spawning, PTY/process mechanics (via worker path), lifecycle, activity, fanout, `TransportIngress`/`TransportEgress`, `SessionIo`, client stream contracts, notifications, **routed-envelope coordination**, plugin worker primitives, reusable crypto/identity mechanisms, package manifests, `Capability`, `CapabilitySurface`, host-profile admission contracts, and capability runtime primitives. Production supervisor: `CoreDaemon` + `botster-session-worker`. |
-| `botster-hub` | Trusted first-party host profile policy over core contracts: config locations, persistence policy, auth hooks, startup composition, admission/enforcement, package install/enable/pin/update policy, lifecycle ordering, timeout/failure policy, and audit hooks. |
+| `botster-hub` | Hub Rust owns admission, security, persistence, process and package supervision, WebRTC setup, adapter creation, plugin isolation, and safe Lua primitives. Core owns terminal lifecycle and duplex transport mechanics. Lua composes commands, hooks, workflows, lifecycle policy, defaults, and customization and never runs in terminal input or output hot paths. |
 | CLI | Thin operator entrypoints that start, discover, or attach to a hub without owning profile policy. |
 | Clients | Browser, TUI, socket, and custom renderers that consume hub contracts. Clients do not own provider behavior. |
 | Plugins/providers | Installable behavior packages that declare capabilities, compatibility, entrypoints, provenance, checksums, enabled state, and update policy. |
@@ -1032,8 +1032,8 @@ and `mcp-serve` over one data directory as every other production package.
 Production runtime-ready today: explicit local daemon lifecycle, file-backed hub/package
 state, local package admission from a manifest path, typed status/package reads,
 plugin lifecycle observation/invocation through the hub facade, daemon-backed
-PTY spawn/list/attach/input/resize/detach/session-shutdown through
-`HubClientApi`, attach/drain history plus screen/snapshot readback through
+PTY spawn/list/attach/detach/session-shutdown through
+`HubClientApi` with input and resize on the bound adapter plane, attach/drain history plus screen/snapshot readback through
 CoreDaemon, and cross-process daemon transport proof for hub restart recovery.
 
 The production-shaped restart proof lives in `hub_daemon_lifecycle_test`: it

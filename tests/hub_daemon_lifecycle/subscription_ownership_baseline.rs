@@ -2,7 +2,7 @@
 // These pin current Hub behavior so later tickets show an intentional change.
 // They must not change transport behavior.
 
-const LOCKED_CORE_REV: &str = "48a437032791e678010254708259568ce4ad02bf";
+const LOCKED_CORE_REV: &str = "72d1c7571bc229dbb2cbd67aa979b6504ac150a5";
 
 fn hub_source(relative: &str) -> String {
     std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative))
@@ -622,6 +622,10 @@ fn no_lua_dispatch_in_terminal_input_or_output() {
         "src/transport/shared/wake.rs",
         "src/transport/shared/close_reason.rs",
         "src/transport/shared/close_progress.rs",
+        "src/transport/shared/ingress.rs",
+        "src/data_plane.rs",
+        "src/data_plane/driver.rs",
+        "src/data_plane/close_work.rs",
         "src/transport/unix.rs",
         "src/transport/unix/adapter.rs",
         "src/transport/unix/listener.rs",
@@ -683,6 +687,73 @@ fn no_lua_dispatch_in_terminal_input_or_output() {
     assert!(
         extra.is_empty(),
         "unexpected lua_runtime importers in src/: {extra:?}"
+    );
+}
+
+#[test]
+fn transport_and_data_plane_reject_terminal_retry_and_scheduling_tokens() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let forbidden = [
+        "retry_terminal",
+        "reschedule_terminal",
+        "terminal_backoff",
+        "requeue_frame",
+    ];
+    let mut hits = Vec::new();
+    let mut combined = String::new();
+    let mut pending = vec![root.join("src/transport"), root.join("src/data_plane")];
+    while let Some(dir) = pending.pop() {
+        let entries = std::fs::read_dir(&dir).expect("read transport or data_plane");
+        for entry in entries {
+            let entry = entry.expect("dir entry");
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(&root)
+                .expect("path stays under the crate root")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let source = std::fs::read_to_string(&path).expect("read rust file");
+            combined.push_str(&source);
+            for token in forbidden {
+                if source.contains(token) {
+                    hits.push(format!("{rel}:{token}"));
+                }
+            }
+        }
+    }
+    for parent in ["src/transport.rs", "src/data_plane.rs"] {
+        let source = hub_source(parent);
+        combined.push_str(&source);
+        for token in forbidden {
+            if source.contains(token) {
+                hits.push(format!("{parent}:{token}"));
+            }
+        }
+    }
+    assert!(
+        combined.contains("pump_woken") && combined.contains("try_write"),
+        "transport and data_plane region must still contain pump_woken and try_write"
+    );
+    let peer = hub_source("src/transport/webrtc/peer.rs");
+    assert!(
+        peer.contains("retrying once"),
+        "peer close retry is a named host-control exemption, not a terminal retry token"
+    );
+    let mux = hub_source("src/transport/unix/mux_write.rs");
+    assert!(
+        mux.contains("retry the original deferred frame"),
+        "mux write retry is a named host-control exemption, not a terminal retry token"
+    );
+    assert!(
+        hits.is_empty(),
+        "transport and data_plane must not schedule or retry terminal bytes: {hits:?}"
     );
 }
 
