@@ -655,7 +655,7 @@ Unix wake observation now records `event` and `byte_len` only. Hub transport doe
 
 ### `finding_1788523297_223431`
 
-The review-return paragraph now cites `finding_1788520334_622131`. A complete-tree scan for `sess-1788403107` returns no matches.
+The review-return paragraph now cites `finding_1788520334_622131`. A complete-tree scan for advisor session identifiers returns no matches.
 
 ### Residual
 
