@@ -314,13 +314,6 @@ impl<W: WakeSink> AdapterSlot<W> {
         taken
     }
 
-    pub(crate) fn peek_late_egress(&self) -> Option<Vec<u8>> {
-        self.late_egress
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-    }
-
     pub(crate) fn take_late_egress(&self) -> Option<Vec<u8>> {
         self.late_egress
             .lock()
