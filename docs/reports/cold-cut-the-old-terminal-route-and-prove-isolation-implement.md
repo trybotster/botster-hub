@@ -12,10 +12,10 @@ Pipeline: `botster_stack_delivery` (direct merge, no PR)
 | Target repository | `botster-hub` (`trybotster/botster-hub`) |
 | Target id | `tgt_7e208a0c76a44980a83b63af976b1f22` |
 | Independent routing | `list_spawn_targets` maps this id to spawn target `botster-hub` |
-| Implement commit | `8634018bc2fa1f4af2e079a0dde4963dd2b94e0d` |
+| Implement commit | `d099d43e9d705a7153064b9af75f211757ead5f9` |
 | Branch | `project-pipelines/ticket_1787600679_990088` |
 | Base | `ae6a0b1fe99d97215fa82d796da8f01a904171f0` |
-| `hub_sha` | `8634018bc2fa1f4af2e079a0dde4963dd2b94e0d` |
+| `hub_sha` | `d099d43e9d705a7153064b9af75f211757ead5f9` |
 | `locked_core_sha` | `72d1c7571bc229dbb2cbd67aa979b6504ac150a5` |
 | Toolchain | `rustc 1.97.0 (2d8144b78 2026-07-07)`, Zig `0.16.0` |
 | `teardown_class_applies` | yes |
@@ -58,6 +58,15 @@ Committed on `8634018`:
 | `crates/botster-hub-client/src/lib.rs` | TypeScript absence of `send_input` and `resize` request members |
 | `README.md` | Responsibility split and adapter-plane input/resize |
 | `docs/reports/cold-cut-the-old-terminal-route-and-prove-isolation-implement.md` | This report |
+
+Later Hub-only test repairs on this branch:
+
+| Commit | Path | Change |
+| --- | --- | --- |
+| `b52d43c` | `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs` | Wait for ListSessions `lifecycle=exited`, then collect unsolicited mux `process_exit` |
+| `099c74e` | `src/managed_git_worktrees.rs` | Write the Git timeout child's pid before the sleep starts |
+| `3d1613e` | `tests/hub_daemon_lifecycle/subscription_ownership_baseline.rs` | Keep draining WebRTC bytes after ListSessions reports exited |
+| `d099d43` | `tests/hub_daemon_lifecycle/subscription_ownership_baseline.rs` | Hold the byte-exact producer until the payload is observed |
 
 Unchanged production transport, data-plane, subscription, admission, and daemon modules. Inventory found no remaining production old-route symbol.
 
@@ -311,6 +320,60 @@ Web `ticket_1788477497_716720` merged at `9e18b1046b75438e971b9fe56a16137581ac2d
 | `script/prove-north-star-shared-session` | pass (`north-star-shared-session-complete`). Keep-alive 2×, `ghostty-shared-complete`, `ghostty-shared-exit-complete`. After alt-exit, primary screen showed `NORTH_STAR_HISTORY`. |
 
 No remaining consumer-lane residual. Timing observations stay waived.
+
+## Review `review_1788487490_710702` return
+
+Review sent Implement back with two open high findings. This visit repaired the Hub suite roots and reran one complete post-merge matrix with no component retries.
+
+### `finding_1788487490_179474` Hub locked suite
+
+| Root | Repair | Commit |
+| --- | --- | --- |
+| `unix_adapter_bound_printf_stream_attach_delivers_process_exit` missed unsolicited mux `process_exit` after attach frames | Wait for ListSessions `lifecycle=exited`, then drain and collect unsolicited `process_exit` | `b52d43c` |
+| `controlled_git_runner_reports_unavailable_and_kills_timed_out_child` lost the descendant pid when timeout killed the group before `printf $!` | Write `$$` first, start `sleep 30`, then overwrite with `$!` | `099c74e` |
+| `webrtc_terminal_output_is_byte_exact` returned `[]` after ListSessions `lifecycle=exited` | Stop treating quiet-after-exit as end of payload; hold the producer until the four live bytes are observed, matching the sibling WebRTC exact-bytes proof | `3d1613e` then `d099d43` |
+
+`./test.sh --locked` then passed on the first try in the complete matrix at `d099d43`. Lib `549`. Lifecycle `346 passed; 0 failed; 2 ignored`. Log `/tmp/botster-hub-matrix-d099d43-7.log`.
+
+### `finding_1788487490_969290` shared-session and complete matrix
+
+Lane-owned leftovers only: this-worktree session-workers. Foreign workers `14620`, `15125` (`ticket_1788313897`) and `51084` (`ticket_1787894967`) were left running. Playwright from Rails invitation tests was not killed.
+
+Plugin-contract-matrix leaked IsolatedHub workers after a passing arm. The complete-matrix wrapper reaped only this-worktree `botster-hub` and `botster-session-worker` after every arm. After `web_plugin` it reaped pids `99481`, `99483`, `99488`. TUI `ghostty` then started with census `3` (foreign only).
+
+Host load was recorded before and after each arm. The complete matrix at `d099d43` used no component retries.
+
+| Arm | Before load | After load | Census after | Result |
+| --- | --- | --- | --- | --- |
+| fmt | 7.93 6.58 8.16 | 7.93 6.58 8.16 | 3 | pass |
+| clippy | 7.93 6.58 8.16 | 7.79 6.60 8.14 | 3 | pass |
+| locked | 7.79 6.60 8.14 | 4.09 5.56 7.01 | 3 | pass |
+| hub_ts | 4.09 5.56 7.01 | 4.09 5.56 7.01 | 3 | pass |
+| web_unit | 4.09 5.56 7.01 | 4.43 5.56 6.98 | 3 | pass |
+| web_live | 4.43 5.56 6.98 | 8.51 6.80 7.32 | 3 | pass |
+| web_durable | 8.51 6.80 7.32 | 9.90 7.76 7.64 | 3 | pass |
+| web_shared | 9.90 7.76 7.64 | 7.71 8.41 8.27 | 3 | pass first try |
+| web_plugin | 7.71 8.41 8.27 | 6.35 8.08 8.16 | 3 after reap | pass |
+| tui_ghostty | 6.35 8.08 8.16 | 5.76 7.53 7.94 | 3 | pass |
+| north_star | 5.76 7.53 7.94 | 7.40 7.15 7.48 | 3 | pass |
+
+Consumer env (`BOTSTER_HUB_BIN`, `BOTSTER_SESSION_WORKER_BIN`, `BOTSTER_WEB_CHECKOUT`, `BOTSTER_TUI_CHECKOUT`, `BOTSTER_SHARED_SESSION_ID`) was unset during Hub fmt/clippy/locked. Web used `npm --prefix`. TUI used `env -C`.
+
+| Lane | Result |
+| --- | --- |
+| `cargo fmt --all -- --check` | pass |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | pass |
+| `./test.sh --locked` | pass first try. Lib `549`. Lifecycle `346/0/2` |
+| `packages/hub-test-support` `npm test` | pass at `0.1.43` |
+| Web `npm test` at `9e18b10` | pass |
+| `smoke:live-packaged-protocol` | pass, including `alternate_screen_exit` |
+| `smoke:live-packaged-protocol:durable` | pass. `botster-web-durable-exited-1` through `-5`. `state_source=loaded` |
+| `smoke:live-packaged-protocol:shared-session` | pass first try: `live-shared-session-coordinator-passed` `keep_alive_runs=2` `cancel_ablation=true` `exit_pass=true` |
+| `smoke:plugin-contract-matrix` | pass |
+| TUI `script/test-live-hub ghostty` | pass (`ghostty-live-complete`, `core_adapter_closed`, worker_rev=`72d1c75`, hub binary from this worktree). Provenance literal still `hub_rev=8634018` |
+| `script/prove-north-star-shared-session` | pass (`north-star-shared-session-complete`). `ghostty-shared-complete`, `ghostty-shared-exit-complete`. After alt-exit, primary screen showed `NORTH_STAR_HISTORY` |
+
+Web `9e18b10`. TUI scratch `b051c67` with uncommitted path pins. Direct merge, no PR. Timing observations stay waived.
 
 ## Missing vault guidance discovered
 
