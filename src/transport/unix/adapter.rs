@@ -101,6 +101,16 @@ impl UnixTerminalAdapterInner {
             .take()
     }
 
+    fn restore_late_egress(&self, bytes: Vec<u8>) {
+        let mut late = self
+            .late_egress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if late.is_none() {
+            *late = Some(bytes);
+        }
+    }
+
     fn pressure(&self) -> TerminalAdapterPressure {
         self.slot.pressure()
     }
@@ -534,7 +544,7 @@ impl UnixConnectionMux {
 
     pub(crate) fn snapshot_writes(
         &self,
-    ) -> Vec<(String, String, UnixTerminalAdapterHandle, Vec<u8>)> {
+    ) -> Vec<(String, String, UnixTerminalAdapterHandle, Vec<u8>, bool)> {
         let Ok(routes) = self.inner.routes.lock() else {
             return Vec::new();
         };
@@ -544,18 +554,25 @@ impl UnixConnectionMux {
                 if route.handle.is_flush_deferred() {
                     return None;
                 }
-                route
-                    .handle
-                    .snapshot_active()
-                    .or_else(|| route.handle.peek_late_egress())
-                    .map(|bytes| {
+                if let Some(bytes) = route.handle.snapshot_active() {
+                    Some((
+                        route.session_id.clone(),
+                        route.subscription_id.clone(),
+                        route.handle.clone(),
+                        bytes,
+                        false,
+                    ))
+                } else {
+                    route.handle.peek_late_egress().map(|bytes| {
                         (
                             route.session_id.clone(),
                             route.subscription_id.clone(),
                             route.handle.clone(),
                             bytes,
+                            true,
                         )
                     })
+                }
             })
             .collect()
     }
@@ -665,6 +682,10 @@ impl UnixTerminalAdapterHandle {
 
     pub(crate) fn take_late_egress(&self) -> Option<Vec<u8>> {
         self.inner.take_late_egress()
+    }
+
+    pub(crate) fn restore_late_egress(&self, bytes: Vec<u8>) {
+        self.inner.restore_late_egress(bytes);
     }
 
     pub(crate) fn write_opaque_frame(&self, frame: &botster_terminal_protocol::TerminalFrame) {
