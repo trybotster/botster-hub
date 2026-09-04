@@ -149,9 +149,7 @@ fn event_is_terminal_body(event: &botster_hub_client::DaemonEvent) -> bool {
     )
 }
 
-fn opaque_terminal_bytes(
-    envelopes: &[botster_hub_client::DaemonUnixTerminalEnvelope],
-) -> Vec<u8> {
+fn opaque_terminal_bytes(envelopes: &[botster_hub_client::DaemonUnixTerminalEnvelope]) -> Vec<u8> {
     let mut output = Vec::new();
     for envelope in envelopes {
         let Ok(bytes) = envelope.payload_bytes() else {
@@ -197,6 +195,10 @@ fn read_unsolicited_terminal_until(
             Err(_) => {}
         }
     }
+    reader
+        .get_ref()
+        .set_read_timeout(None)
+        .expect("clear unsolicited terminal timeout");
 }
 
 fn read_unsolicited_until_process_exit(
@@ -226,6 +228,10 @@ fn read_unsolicited_until_process_exit(
             Err(_) => {}
         }
     }
+    reader
+        .get_ref()
+        .set_read_timeout(None)
+        .expect("clear unsolicited process_exit timeout");
 }
 
 #[test]
@@ -608,9 +614,11 @@ fn paused_data_plane_keeps_control_requests_from_driving_terminal_progress() {
     );
     let bytes = opaque_terminal_bytes(&envelopes);
     let first = find_bytes(&bytes, b"echo:retained-one").expect("first retained frame delivered");
-    let second =
-        find_bytes(&bytes, b"echo:retained-two").expect("second retained frame delivered");
-    assert!(first < second, "retained terminal input must preserve order");
+    let second = find_bytes(&bytes, b"echo:retained-two").expect("second retained frame delivered");
+    assert!(
+        first < second,
+        "retained terminal input must preserve order"
+    );
 
     drop(stream);
     shutdown_short_lived_session(&endpoint, session_id);
@@ -782,10 +790,12 @@ fn unix_adapter_explicit_detach_is_separate_from_connection_death() {
         &botster_hub_client::DaemonRequest::ListSessions,
         &mut envelopes,
     );
-    assert!(listed
-        .sessions
-        .iter()
-        .any(|session| session.session_id == session_id));
+    assert!(
+        listed
+            .sessions
+            .iter()
+            .any(|session| session.session_id == session_id)
+    );
 
     shutdown_short_lived_session(&endpoint, session_id);
     hub.shutdown().expect("shutdown isolated hub");
@@ -1510,9 +1520,10 @@ fn hello_ack_advertises_independent_terminal_compatibility() {
         botster_terminal_protocol::PROTOCOL_VERSION
     );
     assert_ne!(terminal.protocol, ack.compatibility.protocol);
-    assert!(ack
-        .compatibility
-        .supports_feature(botster_hub_client::FEATURE_TERMINAL_SUBSCRIPTION_CLOSED));
+    assert!(
+        ack.compatibility
+            .supports_feature(botster_hub_client::FEATURE_TERMINAL_SUBSCRIPTION_CLOSED)
+    );
     assert!(
         !botster_hub_client::DaemonCompatibilityRequirement::current()
             .required_features
@@ -1732,10 +1743,12 @@ fn host_adapter_close_emits_terminal_subscription_closed_for_one_route() {
         &mut envelopes,
         &mut events,
     );
-    assert!(listed
-        .sessions
-        .iter()
-        .any(|session| session.session_id == "hac-b"));
+    assert!(
+        listed
+            .sessions
+            .iter()
+            .any(|session| session.session_id == "hac-b")
+    );
     shutdown_short_lived_session(hub.endpoint(), "hac-a");
     shutdown_short_lived_session(hub.endpoint(), "hac-b");
     hub.shutdown().expect("shutdown isolated hub");
@@ -1751,10 +1764,7 @@ fn core_write_budget_hard_stop_emits_core_adapter_closed() {
                 "BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_SESSION",
                 "cwb-stall",
             ),
-            (
-                "BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_DELAY_MS",
-                "500",
-            ),
+            ("BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_DELAY_MS", "500"),
         ],
     );
     let (mut stream, mut reader) = unix_adapter_connection(hub.endpoint());
@@ -1927,10 +1937,12 @@ fn core_write_budget_hard_stop_emits_core_adapter_closed() {
         &mut envelopes,
         &mut events,
     );
-    assert!(listed
-        .sessions
-        .iter()
-        .any(|session| session.session_id == "cwb-live" && session.lifecycle == "running"));
+    assert!(
+        listed
+            .sessions
+            .iter()
+            .any(|session| session.session_id == "cwb-live" && session.lifecycle == "running")
+    );
 
     write_unix_terminal_frame(
         &mut stream,
@@ -1995,10 +2007,7 @@ fn forced_would_block_on_one_unix_route_keeps_sibling_open_and_delivering() {
                 "BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_SESSION",
                 "sso-held",
             ),
-            (
-                "BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_DELAY_MS",
-                "0",
-            ),
+            ("BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_DELAY_MS", "0"),
             (
                 "BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_OBSERVATION",
                 observation_value.as_str(),
@@ -2791,12 +2800,7 @@ fn attached_stopping_shutdown_session_suppresses_exact_generation() {
     );
     assert_eq!(late.kind, botster_hub_client::DaemonResponseKind::Status);
     assert!(
-        no_terminal_subscription_closed(
-            &events,
-            "stp-session",
-            Some("stp-sub"),
-            Some(generation)
-        ),
+        no_terminal_subscription_closed(&events, "stp-session", Some("stp-sub"), Some(generation)),
         "attached Stopping ShutdownSession must not emit TerminalSubscriptionClosed for generation {generation}: {events:?}"
     );
     hub.shutdown().expect("shutdown isolated hub");
