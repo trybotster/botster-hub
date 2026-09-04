@@ -170,16 +170,21 @@ pub(crate) async fn handle_connection_async(
                     biased;
                     request = &mut inbound => break request,
                     _ = mux.wait_for_write() => {
-                        mux.clear_deferred_flushes();
-                        if let Err(error) = flush_unix_mux_writes(
-                            &mut write_half,
-                            &mux,
-                            &mut mux_write,
-                            event_mailbox.as_deref(),
-                        ).await {
-                            cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
-                            mux.close_all();
-                            return Err(error);
+                        for _ in 0..16 {
+                            mux.clear_deferred_flushes();
+                            if let Err(error) = flush_unix_mux_writes(
+                                &mut write_half,
+                                &mux,
+                                &mut mux_write,
+                                event_mailbox.as_deref(),
+                            ).await {
+                                cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
+                                mux.close_all();
+                                return Err(error);
+                            }
+                            if mux_write.has_pending() || !mux.has_unsent_mux_writes() {
+                                break;
+                            }
                         }
                     }
                     _ = async {

@@ -302,7 +302,7 @@ BOTSTER_ENV=test ./test.sh --locked --test hub_daemon_lifecycle_test webrtc_forc
 
 Registered `ticket_1788477497_716720` against `tgt_40abcf71ccf049f4ac0c99953a799869` (botster-web): show Hub-authored ended sessions through an explicit ended-session presentation path, and complete caller-owned alt-exited keep-alive. Dependency `dependency_1788477513_382774`. Web run `run_1788477522_704573`. This Hub run does not edit Web source.
 
-Advisor `sess-1788403107-0006-b32c6439f0082e5ade0aae9963dbdf77`: the north-star keep-alive timeout is a Hub producer gap. `script/prove-north-star-shared-session` `PRODUCER_SCRIPT` now handles `botster-web-production-alt-exit` by sending `ESC[?1049l` and echoing `botster-web-production-alt-exited`, then stays on the primary screen for later TUI attach. No extra Hub ticket. Alternate-screen and `ghostty-shared` assertions stay unchanged.
+Advisor question `question_1788477409_664609`: the north-star keep-alive timeout is a Hub producer gap. `script/prove-north-star-shared-session` `PRODUCER_SCRIPT` now handles `botster-web-production-alt-exit` by sending `ESC[?1049l` and echoing `botster-web-production-alt-exited`, then stays on the primary screen for later TUI attach. No extra Hub ticket. Alternate-screen and `ghostty-shared` assertions stay unchanged.
 
 ## Final matrix after Web `9e18b10`
 

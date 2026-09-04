@@ -244,6 +244,7 @@ pub(crate) async fn flush_unix_mux_writes(
             if resume_pending_mux_write(writer, write_state).await? == MuxWrite::Pending {
                 return Ok(());
             }
+            crate::transport::unix::adapter::observe_unix_adapter_wake("flush", &bytes);
         }
     }
     Ok(())
@@ -304,9 +305,6 @@ pub(crate) async fn resume_pending_mux_write(
                 let _ = delivery_ack.send(());
             }
             if let Some(handle) = pending.complete_envelope {
-                if pending.backpressured {
-                    handle.defer_flush();
-                }
                 if !handle.is_closed() && !pending.released_slot {
                     let _ = handle.complete_active();
                 }
@@ -1098,6 +1096,39 @@ pub(crate) mod mux_write_resume_tests {
             "parked process_exit must still reach the socket: {lines:?}"
         );
         assert!(handle.peek_late_egress().is_none());
+    }
+
+    #[tokio::test]
+    pub(crate) async fn finishing_a_partial_live_write_does_not_defer_the_next_frame() {
+        let mux = UnixConnectionMux::new();
+        let (mut adapter, handle) = mux.create_adapter();
+        mux.register("s".to_string(), "sub".to_string(), 1, handle.clone());
+        let output = TerminalFrame::from_bytes(br#"{"type":"terminal_output","marker":"out"}"#)
+            .expect("opaque output");
+        assert_eq!(adapter.try_write(&output), Ok(()));
+        let mut writer = PrefixStallWriter {
+            written: Vec::new(),
+            stall_after: 8,
+            allow_remainder: false,
+        };
+        let mut write_state = MuxWriteState::default();
+        flush_unix_mux_writes(&mut writer, &mux, &mut write_state, None)
+            .await
+            .expect("partial live write");
+        assert!(write_state.has_pending());
+        writer.allow_remainder = true;
+        writer.stall_after = usize::MAX;
+        flush_unix_mux_writes(&mut writer, &mux, &mut write_state, None)
+            .await
+            .expect("finish live write");
+        let exit = TerminalFrame::from_bytes(br#"{"type":"process_exit","status":0}"#)
+            .expect("opaque process_exit");
+        assert_eq!(adapter.try_write(&exit), Ok(()));
+        assert_eq!(
+            mux.snapshot_writes().len(),
+            1,
+            "a completed live send must not defer the next occupant"
+        );
     }
 
     #[tokio::test]

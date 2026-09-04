@@ -201,6 +201,19 @@ fn read_unsolicited_terminal_until(
         .expect("clear unsolicited terminal timeout");
 }
 
+fn unix_wake_log_has(path: &std::path::Path, event: &str, frame_type: &str) -> bool {
+    let Ok(text) = fs::read_to_string(path) else {
+        return false;
+    };
+    text.lines().any(|line| {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            return false;
+        };
+        value.get("event").and_then(serde_json::Value::as_str) == Some(event)
+            && value.get("frame_type").and_then(serde_json::Value::as_str) == Some(frame_type)
+    })
+}
+
 fn read_unsolicited_until_process_exit(
     reader: &mut std::io::BufReader<std::os::unix::net::UnixStream>,
     envelopes: &mut Vec<botster_hub_client::DaemonUnixTerminalEnvelope>,
@@ -1202,7 +1215,21 @@ fn unix_adapter_unbound_printf_stream_attach_completes() {
 #[test]
 fn unix_adapter_bound_printf_stream_attach_delivers_process_exit() {
     let _guard = daemon_test_guard();
-    let hub = start_isolated_live_output_hub("uapb");
+    let wake_path = std::env::temp_dir().join(format!(
+        "unix-wake-uapb-{}-{}.jsonl",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let hub = start_isolated_live_output_hub_with_env(
+        "uapb",
+        &[(
+            "BOTSTER_HUB_TEST_UNIX_WAKE_OBSERVATION",
+            wake_path.to_str().expect("utf8 wake path"),
+        )],
+    );
     let endpoint = hub.endpoint().clone();
     let session_id = "uapb-session";
     let subscription_id = "uapb-sub";
@@ -1267,11 +1294,20 @@ fn unix_adapter_bound_printf_stream_attach_delivers_process_exit() {
         subscription_id,
         Instant::now() + Duration::from_secs(5),
     );
+    let wake_log = fs::read_to_string(&wake_path).unwrap_or_default();
     assert!(
         envelopes
             .iter()
             .any(|envelope| unix_envelope_is_process_exit(envelope, session_id, subscription_id)),
-        "attached terminal subscription must deliver unsolicited process_exit from the Unix writer wake without ReadScreen or ListSessions: {envelopes:?}"
+        "attached terminal subscription must deliver unsolicited process_exit from the Unix writer wake without ReadScreen or ListSessions: envelopes={envelopes:?} wake={wake_log}"
+    );
+    assert!(
+        unix_wake_log_has(&wake_path, "try_write", "process_exit"),
+        "Core must occupy the adapter slot with process_exit: {wake_log}"
+    );
+    assert!(
+        unix_wake_log_has(&wake_path, "flush", "process_exit"),
+        "the Unix writer must flush process_exit after the adapter wake: {wake_log}"
     );
     wait_for_authoritative_session_exit(&endpoint, session_id);
     assert_host_session_retained(&mut connection, session_id);
@@ -2789,7 +2825,21 @@ fn attached_stopping_shutdown_session_suppresses_exact_generation() {
 #[test]
 fn unix_shutdown_session_from_another_connection_classifies_attached_exit() {
     let _guard = daemon_test_guard();
-    let hub = start_isolated_live_output_hub("pse");
+    let wake_path = std::env::temp_dir().join(format!(
+        "unix-wake-pse-{}-{}.jsonl",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let hub = start_isolated_live_output_hub_with_env(
+        "pse",
+        &[(
+            "BOTSTER_HUB_TEST_UNIX_WAKE_OBSERVATION",
+            wake_path.to_str().expect("utf8 wake path"),
+        )],
+    );
     let endpoint = hub.endpoint().clone();
     let session_id = "pse-session";
     let subscription_id = "pse-sub";
@@ -2874,11 +2924,20 @@ fn unix_shutdown_session_from_another_connection_classifies_attached_exit() {
         subscription_id,
         Instant::now() + Duration::from_secs(5),
     );
+    let wake_log = fs::read_to_string(&wake_path).unwrap_or_default();
     assert!(
         envelopes
             .iter()
             .any(|envelope| unix_envelope_is_process_exit(envelope, session_id, subscription_id)),
-        "attached adapter must see unsolicited process_exit from the Unix writer wake without ReadScreen or ListSessions: {envelopes:?}"
+        "attached adapter must see unsolicited process_exit from the Unix writer wake without ReadScreen or ListSessions: envelopes={envelopes:?} wake={wake_log}"
+    );
+    assert!(
+        unix_wake_log_has(&wake_path, "try_write", "process_exit"),
+        "Core must occupy the adapter slot with process_exit: {wake_log}"
+    );
+    assert!(
+        unix_wake_log_has(&wake_path, "flush", "process_exit"),
+        "the Unix writer must flush process_exit after the adapter wake: {wake_log}"
     );
     wait_for_authoritative_session_exit(&endpoint, session_id);
 

@@ -78,6 +78,7 @@ impl UnixTerminalAdapterInner {
         let Some(bytes) = self.slot.snapshot_active() else {
             return;
         };
+        observe_unix_adapter_wake("park", &bytes);
         let mut late = self
             .late_egress
             .lock()
@@ -107,6 +108,11 @@ impl UnixTerminalAdapterInner {
 
     fn try_write(&self, frame: &TerminalFrame) -> Result<(), TerminalAdapterWriteError> {
         let result = self.slot.try_write(frame);
+        if result.is_ok()
+            && let Ok(bytes) = frame.to_bytes()
+        {
+            observe_unix_adapter_wake("try_write", &bytes);
+        }
         if matches!(result, Err(TerminalAdapterWriteError::WouldBlock))
             && self
                 .clear_pressure_after_rejection
@@ -139,7 +145,11 @@ impl UnixTerminalAdapterInner {
     }
 
     fn complete_active(&self) -> Option<Vec<u8>> {
-        self.slot.complete_active()
+        let bytes = self.slot.complete_active();
+        if let Some(ref bytes) = bytes {
+            observe_unix_adapter_wake("complete", bytes);
+        }
+        bytes
     }
 }
 
@@ -501,7 +511,12 @@ impl UnixConnectionMux {
             return false;
         };
         routes.values().any(|route| {
-            route.handle.snapshot_active().is_some() || route.handle.peek_late_egress().is_some()
+            if route.handle.is_closed() {
+                route.handle.peek_late_egress().is_some()
+            } else {
+                route.handle.snapshot_active().is_some()
+                    || route.handle.peek_late_egress().is_some()
+            }
         })
     }
 
@@ -580,6 +595,44 @@ impl UnixConnectionMux {
             route.handle.clear_defer_flush();
         }
     }
+}
+
+pub(crate) fn observe_unix_adapter_wake(event: &str, frame_bytes: &[u8]) {
+    if std::env::var("BOTSTER_ENV").as_deref() != Ok("test") {
+        return;
+    }
+    let Ok(path) = std::env::var("BOTSTER_HUB_TEST_UNIX_WAKE_OBSERVATION") else {
+        return;
+    };
+    if path.is_empty() {
+        return;
+    }
+    let frame_type = serde_json::from_slice::<serde_json::Value>(frame_bytes)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    let row = serde_json::json!({
+        "event": event,
+        "frame_type": frame_type,
+    });
+    let line = format!("{row}\n");
+    static LOCK: Mutex<()> = Mutex::new(());
+    let _guard = LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return;
+    };
+    let _ = file.write_all(line.as_bytes());
 }
 
 fn record_forced_pressure(name: &str) {
