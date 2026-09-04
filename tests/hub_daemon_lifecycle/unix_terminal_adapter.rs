@@ -1261,7 +1261,7 @@ fn unix_adapter_bound_printf_stream_attach_delivers_process_exit() {
     );
     fs::write(&release_path, b"go").expect("release held printf");
     wait_for_authoritative_session_exit(&endpoint, session_id);
-    let exit_deadline = Instant::now() + Duration::from_secs(15);
+    let exit_deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < exit_deadline {
         if envelopes
             .iter()
@@ -2888,7 +2888,7 @@ fn unix_shutdown_session_from_another_connection_classifies_attached_exit() {
     );
     fs::write(&exit_release, b"go").expect("release Unix natural-exit process");
     wait_for_authoritative_session_exit(&endpoint, session_id);
-    let exit_deadline = Instant::now() + Duration::from_secs(15);
+    let exit_deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < exit_deadline
         && !envelopes
             .iter()

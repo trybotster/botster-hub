@@ -214,15 +214,6 @@ pub(crate) async fn flush_unix_mux_writes(
             None => break,
         }
     }
-    let more_host = !write_state.queued_responses.is_empty()
-        || (!unix_event_flush_stalled()
-            && (mux.has_pending_event()
-                || event_mailbox.is_some_and(
-                    crate::subscription::package_events::ClientEventMailbox::has_ready_event,
-                )));
-    if more_host {
-        return Ok(());
-    }
     for (session_id, subscription_id, handle, bytes) in mux.snapshot_writes() {
         let envelope = botster_hub_client::DaemonUnixTerminalEnvelope::from_frame_bytes(
             session_id,
@@ -939,6 +930,68 @@ pub(crate) mod mux_write_resume_tests {
                 ..
             }) if session_id == "sibling"
         ));
+    }
+
+    #[tokio::test]
+    pub(crate) async fn remaining_host_events_do_not_skip_parked_late_terminal() {
+        let mux = UnixConnectionMux::new();
+        let mailbox = crate::subscription::package_events::ClientEventMailbox::new(
+            crate::config::PackageEventPlanePolicy {
+                consumer_queue_max_events: 8,
+                ..crate::config::PackageEventPlanePolicy::default()
+            },
+        );
+        for index in 0..8 {
+            mailbox
+                .try_push(
+                    "sub",
+                    "owner",
+                    "ready",
+                    serde_json::json!({ "ok": true, "n": index }),
+                    8,
+                )
+                .expect("admit event");
+        }
+        let (mut adapter, handle) = mux.create_adapter();
+        mux.register(
+            "late".to_string(),
+            "sub-late".to_string(),
+            1,
+            handle.clone(),
+        );
+        let frame = TerminalFrame::from_bytes(br#"{"type":"process_exit","status":0}"#)
+            .expect("opaque frame");
+        assert_eq!(adapter.try_write(&frame), Ok(()));
+        handle.close();
+        assert!(handle.peek_late_egress().is_some());
+
+        let mut writer = PrefixStallWriter {
+            written: Vec::new(),
+            stall_after: usize::MAX,
+            allow_remainder: true,
+        };
+        let mut write_state = MuxWriteState::default();
+        flush_unix_mux_writes(&mut writer, &mux, &mut write_state, Some(&mailbox))
+            .await
+            .expect("flush remaining host plus late terminal");
+        let lines = parse_written_mux_lines(&writer.written);
+        assert!(
+            lines.iter().any(|line| matches!(
+                line,
+                botster_hub_client::DaemonUnixMuxFrame::Event(
+                    botster_hub_client::DaemonEvent::PackageEvent { .. }
+                )
+            )),
+            "host events still flush first: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| matches!(
+                line,
+                botster_hub_client::DaemonUnixMuxFrame::Terminal(envelope)
+                    if envelope.session_id == "late"
+            )),
+            "parked late terminal must flush in the same turn as remaining host events: {lines:?}"
+        );
     }
 
     #[tokio::test]
