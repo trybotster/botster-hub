@@ -963,7 +963,6 @@ fn shutdown_suppresses_exact_route_generations_before_core_teardown() {
 }
 
 const WEBRTC_BYTE_EXACT_BACKSTOP: Duration = Duration::from_secs(30);
-const WEBRTC_BYTE_EXACT_QUIET_DRAIN_TURNS: usize = 8;
 
 fn webrtc_session_has_exited(
     endpoint: &botster_hub_client::DaemonEndpoint,
@@ -1088,11 +1087,8 @@ async fn collect_expected_webrtc_bytes_or_authoritative_exit(
     context: &str,
 ) -> Vec<u8> {
     let mut concatenated = Vec::new();
-    let mut session_exited = false;
-    let mut quiet_turns_after_exit = 0usize;
     let started_at = Instant::now();
     loop {
-        let bytes_before = concatenated.len();
         drain_webrtc_live_bytes(
             peer,
             key,
@@ -1107,23 +1103,11 @@ async fn collect_expected_webrtc_bytes_or_authoritative_exit(
         {
             return concatenated;
         }
-        if !session_exited {
-            session_exited = webrtc_session_has_exited(endpoint, session_id);
-        }
-        if session_exited {
-            if concatenated.len() == bytes_before {
-                quiet_turns_after_exit += 1;
-            } else {
-                quiet_turns_after_exit = 0;
-            }
-            if quiet_turns_after_exit >= WEBRTC_BYTE_EXACT_QUIET_DRAIN_TURNS {
-                return concatenated;
-            }
-        }
         if started_at.elapsed() >= WEBRTC_BYTE_EXACT_BACKSTOP {
+            let session_exited = webrtc_session_has_exited(endpoint, session_id);
             if concatenated.is_empty() {
                 panic_webrtc_byte_exact_starvation(&format!(
-                    "{context}: timed out waiting for WebRTC adapter frames after producer-ready release; concatenated is empty"
+                    "{context}: timed out waiting for WebRTC adapter frames after producer-ready release; concatenated is empty; session_exited={session_exited}"
                 ));
             }
             return concatenated;
