@@ -1052,9 +1052,10 @@ from hub-owned state are recovered from core daemon/session-worker evidence.
 The readiness boundary is documented in
 [`docs/adr/local-runtime-production-readiness.md`](docs/adr/local-runtime-production-readiness.md).
 
-In the daemon-backed model, attach, detach, input, and resize requests are
-control-plane acknowledgements. Terminal egress arrives on the bound Unix or
-WebRTC adapter path, not through `DrainRuntime` or other control responses.
+In the daemon-backed model, attach and detach are host control-plane
+acknowledgements. Live terminal input, resize, paste frames, and terminal
+egress travel on the bound Unix or WebRTC adapter path, not through control
+responses.
 
 Ready for daily local use today: explicit daemon lifecycle, daemon-backed local
 PTY session operations including attach and adapter history and screen/snapshot

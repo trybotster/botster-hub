@@ -1104,10 +1104,7 @@ fn runtime_error_diagnostics(
     }
 
     if kind == crate::HubClientRuntimeErrorKind::UnknownSession
-        && matches!(
-            operation,
-            crate::HubClientOperation::Attach | crate::HubClientOperation::DrainRuntime
-        )
+        && matches!(operation, crate::HubClientOperation::Attach)
     {
         return vec![DaemonDiagnostic::terminal_stream_unavailable(
             operation_label(operation),
@@ -1137,7 +1134,6 @@ fn operation_label(operation: crate::HubClientOperation) -> &'static str {
         crate::HubClientOperation::Spawn => "spawn",
         crate::HubClientOperation::Attach => "attach",
         crate::HubClientOperation::Detach => "detach",
-        crate::HubClientOperation::DrainRuntime => "drain_runtime",
         crate::HubClientOperation::Shutdown => "shutdown",
         crate::HubClientOperation::GuardedNotificationWrite => "guarded_notification_write",
         crate::HubClientOperation::NotifySession => "notify_session",

@@ -12,7 +12,7 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 #[cfg(test)]
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use botster_ui_contract::{
@@ -332,6 +332,7 @@ impl DaemonConnection {
     /// Receive the next unsolicited terminal envelope, or `None` when `timeout` elapses.
     ///
     /// Does not write a control request. Restores the previous socket read timeout.
+    /// `timeout` is an absolute deadline: skipped host events do not restart it.
     /// A timeout keeps any partial mux line for the next read.
     pub fn poll_terminal(
         &mut self,
@@ -340,26 +341,50 @@ impl DaemonConnection {
         if !self.skipped_terminal.is_empty() {
             return Ok(Some(self.skipped_terminal.remove(0)));
         }
+        let deadline = Instant::now() + timeout;
         let previous = self
             .stream
             .read_timeout()
             .map_err(normalize_socket_io_error)?;
-        self.set_read_timeout(Some(timeout))?;
-        let result = self.next_terminal();
+        let result = loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break Ok(None);
+            }
+            if let Err(error) = self.set_read_timeout(Some(remaining)) {
+                break Err(error);
+            }
+            match read_value_frame_from_reader(&mut self.reader, &mut self.incomplete_line) {
+                Ok(value) => {
+                    if status_missing_compatibility(&value) {
+                        break Err(precompatibility_hub_error());
+                    }
+                    match parse_unix_mux_value(value).map_err(DaemonTransportError::Json) {
+                        Ok(DaemonUnixMuxFrame::Terminal(envelope)) => break Ok(Some(envelope)),
+                        Ok(DaemonUnixMuxFrame::Event(event)) => {
+                            self.skipped_events.push(event);
+                        }
+                        Ok(DaemonUnixMuxFrame::Response(_)) => {
+                            break Err(DaemonTransportError::Protocol(
+                                "unexpected control response while waiting for a terminal envelope",
+                            ));
+                        }
+                        Err(error) => break Err(error),
+                    }
+                }
+                Err(DaemonTransportError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(error) => break Err(error),
+            }
+        };
         let restore = self.set_read_timeout(previous);
         match result {
-            Ok(envelope) => {
+            Ok(value) => {
                 restore?;
-                Ok(Some(envelope))
-            }
-            Err(DaemonTransportError::Io(error))
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                restore?;
-                Ok(None)
+                Ok(value)
             }
             Err(error) => {
                 let _ = restore;
@@ -643,11 +668,14 @@ fn read_value_frame_from_reader(
 }
 
 /// Read one muxed Unix line: a control response or an opaque terminal envelope.
+///
+/// `incomplete` must outlive every timed-out read on `reader`. A timeout keeps
+/// any partial newline-delimited JSON line in that buffer.
 pub fn read_unix_mux_frame_from_reader(
     reader: &mut BufReader<UnixStream>,
+    incomplete: &mut String,
 ) -> DaemonTransportResult<DaemonUnixMuxFrame> {
-    let mut incomplete = String::new();
-    let value = read_value_frame_from_reader(reader, &mut incomplete)?;
+    let value = read_value_frame_from_reader(reader, incomplete)?;
     parse_unix_mux_value(value).map_err(DaemonTransportError::Json)
 }
 
@@ -3969,6 +3997,118 @@ mod tests {
             other => panic!("expected PackageEvent, got {other:?}"),
         }
         server_handle.join().expect("server writes");
+    }
+
+    fn test_connection(client: UnixStream) -> DaemonConnection {
+        let reader = BufReader::new(client.try_clone().expect("clone"));
+        DaemonConnection {
+            stream: client,
+            reader,
+            skipped_terminal: Vec::new(),
+            skipped_events: Vec::new(),
+            required_features: Vec::new(),
+            incomplete_line: String::new(),
+        }
+    }
+
+    fn terminal_envelope_line() -> Vec<u8> {
+        let envelope = DaemonUnixTerminalEnvelope::from_frame_bytes("s", "sub", b"a");
+        let mut line = serde_json::to_vec(&envelope).expect("encode envelope");
+        line.push(b'\n');
+        line
+    }
+
+    #[test]
+    fn read_unix_mux_frame_keeps_a_split_line_across_timeout() {
+        let (mut server, client) = UnixStream::pair().expect("pair");
+        client
+            .set_read_timeout(Some(Duration::from_millis(30)))
+            .expect("timeout");
+        let mut reader = BufReader::new(client);
+        let mut incomplete = String::new();
+        let line = terminal_envelope_line();
+        assert!(line.len() > 9);
+        server.write_all(&line[..9]).expect("write prefix");
+        let first = read_unix_mux_frame_from_reader(&mut reader, &mut incomplete);
+        assert!(
+            matches!(
+                &first,
+                Err(DaemonTransportError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    )
+            ),
+            "prefix must time out, got {first:?}"
+        );
+        assert!(!incomplete.is_empty());
+        server.write_all(&line[9..]).expect("write suffix");
+        match read_unix_mux_frame_from_reader(&mut reader, &mut incomplete).expect("complete line")
+        {
+            DaemonUnixMuxFrame::Terminal(envelope) => {
+                assert_eq!(envelope.payload_bytes().expect("payload"), b"a");
+            }
+            other => panic!("expected terminal envelope, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn poll_terminal_keeps_a_split_line_and_returns_none_on_timeout() {
+        let (mut server, client) = UnixStream::pair().expect("pair");
+        let mut connection = test_connection(client);
+        let line = terminal_envelope_line();
+        server.write_all(&line[..9]).expect("write prefix");
+        assert!(
+            connection
+                .poll_terminal(Duration::from_millis(30))
+                .expect("prefix poll")
+                .is_none()
+        );
+        server.write_all(&line[9..]).expect("write suffix");
+        let envelope = connection
+            .poll_terminal(Duration::from_secs(1))
+            .expect("suffix poll")
+            .expect("terminal envelope");
+        assert_eq!(envelope.payload_bytes().expect("payload"), b"a");
+    }
+
+    #[test]
+    fn poll_terminal_deadline_covers_continuous_nonterminal_events() {
+        let (mut server, client) = UnixStream::pair().expect("pair");
+        let mut connection = test_connection(client);
+        let event = DaemonEvent::PackageEvent {
+            subscription_id: "sub".to_string(),
+            owner: "owner".to_string(),
+            name: "ready".to_string(),
+            payload: serde_json::json!({ "ok": true }),
+        };
+        let server_handle = thread::spawn(move || {
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_millis(600) {
+                if write_frame(&mut server, &event).is_err() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            thread::sleep(Duration::from_millis(250));
+        });
+        let started = Instant::now();
+        let polled = connection
+            .poll_terminal(Duration::from_millis(80))
+            .expect("poll events-only stream");
+        assert!(polled.is_none(), "events must not count as terminal");
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "absolute deadline must not restart on events, elapsed={:?}",
+            started.elapsed()
+        );
+        assert!(
+            !server_handle.is_finished(),
+            "poll must return while the event writer is still alive"
+        );
+        assert!(!connection.take_skipped_events().is_empty());
+        drop(connection);
+        let _ = server_handle.join();
     }
 
     #[test]

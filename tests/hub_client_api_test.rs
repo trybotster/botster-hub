@@ -18,12 +18,12 @@ use botster_core_daemon::{
 };
 use botster_hub::{
     DataDirectoryOption, DeviceSessionTypeSource, FileHubStateStore, HostIdentityOptions,
-    HubClientAdmission, HubClientApi, HubClientError, HubClientEvent, HubClientIdentity,
-    HubClientOperation, HubClientPackageClassification, HubClientPackageState, HubClientRequest,
-    HubClientResponseBody, HubClientRole, HubPackageManifest, HubRuntime, HubStartupOptions,
-    HubStateStore, PackageProvenance, PackageRegistry, PackageSessionType,
-    PackageSessionTypeExecution, PackageSessionTypeWorkingDirectory, RuntimeEnvironment,
-    SessionDefaults, SessionTypeMutationSource, SpawnTarget, TransportBindings,
+    HubClientAdmission, HubClientApi, HubClientError, HubClientIdentity, HubClientOperation,
+    HubClientPackageClassification, HubClientPackageState, HubClientRequest, HubClientResponseBody,
+    HubClientRole, HubPackageManifest, HubRuntime, HubStartupOptions, HubStateStore,
+    PackageProvenance, PackageRegistry, PackageSessionType, PackageSessionTypeExecution,
+    PackageSessionTypeWorkingDirectory, RuntimeEnvironment, SessionDefaults,
+    SessionTypeMutationSource, SpawnTarget, TransportBindings,
 };
 use botster_ui_contract::{
     PackageNavigationEntry, PackageNavigationTarget, PackageSurfaceDescriptor, PackageSurfaceKind,
@@ -2910,25 +2910,6 @@ fn drain_until(
                 max_elapsed: Duration::from_millis(25),
             },
         );
-        let drain = api
-            .handle_request(
-                runtime,
-                packages,
-                HubClientRequest::DrainRuntime {
-                    request_id: request_id("drain"),
-                    session_id: session_id.clone(),
-                    last_output_at: *logical_clock,
-                },
-            )
-            .expect("host DrainRuntime");
-        *logical_clock += 1;
-        let HubClientResponseBody::Events(events) = drain.body else {
-            panic!("drain should return events");
-        };
-        assert!(
-            events.is_empty(),
-            "DrainRuntime must not return terminal bodies: {events:?}"
-        );
         let response = api
             .handle_request(
                 runtime,
@@ -2995,40 +2976,21 @@ fn read_screen_until(
     panic!("timed out waiting for {needle:?} in ReadScreen");
 }
 
-fn drain_events_for(
-    api: &HubClientApi,
-    runtime: &mut HubRuntime,
-    packages: &PackageRegistry,
-    session_id: &SessionId,
-    logical_clock: &mut u64,
-    duration: Duration,
-) -> Vec<HubClientEvent> {
+fn observe_for(runtime: &mut HubRuntime, logical_clock: &mut u64, duration: Duration) {
     let deadline = Instant::now() + duration;
-    let mut observed = Vec::new();
-
     while Instant::now() < deadline {
-        let response = api
-            .handle_request(
-                runtime,
-                packages,
-                HubClientRequest::DrainRuntime {
-                    request_id: request_id("drain-extra"),
-                    session_id: session_id.clone(),
-                    last_output_at: *logical_clock,
-                },
-            )
-            .expect("extra drain through client api");
+        let _ = runtime.observe_lifecycle_slice(
+            *logical_clock,
+            None,
+            botster_core_daemon::ObserveLifecycleBudget {
+                max_sessions: 32,
+                max_encoded_result_bytes: 64 * 1024,
+                max_elapsed: Duration::from_millis(25),
+            },
+        );
         *logical_clock += 1;
-
-        let HubClientResponseBody::Events(events) = response.body else {
-            panic!("drain should return events");
-        };
-        observed.extend(events);
-
         thread::sleep(Duration::from_millis(20));
     }
-
-    observed
 }
 
 #[test]
@@ -3340,18 +3302,7 @@ fn local_client_api_exercises_status_spawn_attach_detach_shutdown_and_events() {
         "echo:after-detach",
         &mut logical_clock,
     );
-    let extra_after_detach = drain_events_for(
-        &second_api,
-        &mut runtime,
-        &packages,
-        &session_id,
-        &mut logical_clock,
-        Duration::from_millis(200),
-    );
-    assert!(
-        extra_after_detach.is_empty(),
-        "host DrainRuntime must stay empty after detach: {extra_after_detach:?}"
-    );
+    observe_for(&mut runtime, &mut logical_clock, Duration::from_millis(200));
 
     let shutdown = second_api
         .handle_request(

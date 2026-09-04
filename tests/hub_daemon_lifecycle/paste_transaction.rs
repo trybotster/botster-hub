@@ -110,6 +110,7 @@ fn unix_terminal_has_marker(
 
 fn collect_unix_mux_for(
     reader: &mut BufReader<UnixStream>,
+    incomplete: &mut String,
     envelopes: &mut Vec<botster_hub_client::DaemonUnixTerminalEnvelope>,
     events: &mut Vec<botster_hub_client::DaemonEvent>,
     duration: Duration,
@@ -120,7 +121,7 @@ fn collect_unix_mux_for(
         .expect("set paste mux timeout");
     let deadline = Instant::now() + duration;
     while Instant::now() < deadline {
-        match botster_hub_client::read_unix_mux_frame_from_reader(reader) {
+        match botster_hub_client::read_unix_mux_frame_from_reader(reader, incomplete) {
             Ok(botster_hub_client::DaemonUnixMuxFrame::Terminal(envelope)) => {
                 envelopes.push(envelope)
             }
@@ -139,6 +140,7 @@ fn collect_unix_mux_for(
 
 fn collect_unix_paste_completion(
     reader: &mut BufReader<UnixStream>,
+    incomplete: &mut String,
     envelopes: &mut Vec<botster_hub_client::DaemonUnixTerminalEnvelope>,
     events: &mut Vec<botster_hub_client::DaemonEvent>,
     operation_id: u32,
@@ -146,11 +148,23 @@ fn collect_unix_paste_completion(
 ) {
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
-        collect_unix_mux_for(reader, envelopes, events, Duration::from_millis(100));
+        collect_unix_mux_for(
+            reader,
+            incomplete,
+            envelopes,
+            events,
+            Duration::from_millis(100),
+        );
         if unix_paste_results(envelopes, operation_id).len() == 1
             && unix_terminal_has_marker(envelopes, done)
         {
-            collect_unix_mux_for(reader, envelopes, events, Duration::from_millis(500));
+            collect_unix_mux_for(
+                reader,
+                incomplete,
+                envelopes,
+                events,
+                Duration::from_millis(500),
+            );
             return;
         }
     }
@@ -198,6 +212,7 @@ fn assert_no_route_close(
 fn wait_for_unix_ready_and_mode(
     stream: &mut UnixStream,
     reader: &mut BufReader<UnixStream>,
+    incomplete: &mut String,
     session_id: &str,
     ready: &str,
     envelopes: &mut Vec<botster_hub_client::DaemonUnixTerminalEnvelope>,
@@ -208,6 +223,7 @@ fn wait_for_unix_ready_and_mode(
         let response = request_collecting_mux(
             stream,
             reader,
+            incomplete,
             &botster_hub_client::DaemonRequest::ReadModeFlags {
                 session_id: session_id.to_string(),
             },
@@ -247,12 +263,13 @@ fn unix_paste_transaction_delivers_one_result_and_byte_exact_pty_content() {
     let done = "unix-paste-sink-done";
     let operation_id = 4101;
     let payload = live_paste_payload();
-    let (mut stream, mut reader) = unix_adapter_connection(&endpoint);
+    let (mut stream, mut reader, mut incomplete) = unix_adapter_connection(&endpoint);
     let mut envelopes = Vec::new();
     let mut events = Vec::new();
     spawn_and_bind(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         session_id,
         subscription_id,
         &paste_sink_command(&sink, ready, done),
@@ -262,6 +279,7 @@ fn unix_paste_transaction_delivers_one_result_and_byte_exact_pty_content() {
     let mode = wait_for_unix_ready_and_mode(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         session_id,
         ready,
         &mut envelopes,
@@ -282,6 +300,7 @@ fn unix_paste_transaction_delivers_one_result_and_byte_exact_pty_content() {
     }
     collect_unix_paste_completion(
         &mut reader,
+        &mut incomplete,
         &mut envelopes,
         &mut events,
         operation_id,
@@ -294,6 +313,7 @@ fn unix_paste_transaction_delivers_one_result_and_byte_exact_pty_content() {
     let status = request_collecting_mux(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::Status,
         &mut envelopes,
         &mut events,
@@ -478,12 +498,13 @@ fn paused_ingress_holds_nineteen_paste_frames_without_lost() {
     let done = "paused-paste-sink-done";
     let operation_id = 4301;
     let payload = live_paste_payload();
-    let (mut stream, mut reader) = unix_adapter_connection(&endpoint);
+    let (mut stream, mut reader, mut incomplete) = unix_adapter_connection(&endpoint);
     let mut envelopes = Vec::new();
     let mut events = Vec::new();
     spawn_and_bind(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         session_id,
         subscription_id,
         &paste_sink_command(&sink, ready, done),
@@ -493,6 +514,7 @@ fn paused_ingress_holds_nineteen_paste_frames_without_lost() {
     let mode = wait_for_unix_ready_and_mode(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         session_id,
         ready,
         &mut envelopes,
@@ -521,6 +543,7 @@ fn paused_ingress_holds_nineteen_paste_frames_without_lost() {
     wait_for_ingress_admissions(&admission_log, session_id, subscription_id, 19, 0);
     collect_unix_mux_for(
         &mut reader,
+        &mut incomplete,
         &mut envelopes,
         &mut events,
         Duration::from_millis(500),
@@ -531,6 +554,7 @@ fn paused_ingress_holds_nineteen_paste_frames_without_lost() {
     fs::remove_file(&pause).expect("resume data-plane driver");
     collect_unix_paste_completion(
         &mut reader,
+        &mut incomplete,
         &mut envelopes,
         &mut events,
         operation_id,
@@ -568,12 +592,13 @@ fn paused_ingress_sixty_fifth_frame_latches_lost_and_closes_only_that_route() {
     let session_id = "paused-overflow-session";
     let primary_id = "paused-overflow-primary";
     let sibling_id = "paused-overflow-sibling";
-    let (mut primary, mut primary_reader) = unix_adapter_connection(&endpoint);
+    let (mut primary, mut primary_reader, mut incomplete_primary) = unix_adapter_connection(&endpoint);
     let mut primary_envelopes = Vec::new();
     let mut primary_events = Vec::new();
     spawn_and_bind(
         &mut primary,
         &mut primary_reader,
+        &mut incomplete_primary,
         session_id,
         primary_id,
         "printf 'overflow-ready'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
@@ -583,18 +608,20 @@ fn paused_ingress_sixty_fifth_frame_latches_lost_and_closes_only_that_route() {
     let _ = wait_for_unix_ready_and_mode(
         &mut primary,
         &mut primary_reader,
+        &mut incomplete_primary,
         session_id,
         "overflow-ready",
         &mut primary_envelopes,
         &mut primary_events,
     );
 
-    let (mut sibling, mut sibling_reader) = unix_adapter_connection(&endpoint);
+    let (mut sibling, mut sibling_reader, mut incomplete_sibling) = unix_adapter_connection(&endpoint);
     let mut sibling_envelopes = Vec::new();
     let mut sibling_events = Vec::new();
     let attach = request_collecting_mux(
         &mut sibling,
         &mut sibling_reader,
+        &mut incomplete_sibling,
         &botster_hub_client::DaemonRequest::Attach {
             session_id: session_id.to_string(),
             subscription_id: sibling_id.to_string(),
@@ -608,6 +635,7 @@ fn paused_ingress_sixty_fifth_frame_latches_lost_and_closes_only_that_route() {
         let status = request_collecting_mux(
             &mut sibling,
             &mut sibling_reader,
+            &mut incomplete_sibling,
             &botster_hub_client::DaemonRequest::Status,
             &mut sibling_envelopes,
             &mut sibling_events,
@@ -642,6 +670,7 @@ fn paused_ingress_sixty_fifth_frame_latches_lost_and_closes_only_that_route() {
     wait_for_ingress_admissions(&admission_log, session_id, primary_id, 64, 1);
     collect_unix_mux_for(
         &mut primary_reader,
+        &mut incomplete_primary,
         &mut primary_envelopes,
         &mut primary_events,
         Duration::from_millis(500),
@@ -652,6 +681,7 @@ fn paused_ingress_sixty_fifth_frame_latches_lost_and_closes_only_that_route() {
     assert!(wait_for_subscription_closed(
         &mut primary,
         &mut primary_reader,
+        &mut incomplete_primary,
         session_id,
         primary_id,
         &mut primary_envelopes,
@@ -681,6 +711,7 @@ fn paused_ingress_sixty_fifth_frame_latches_lost_and_closes_only_that_route() {
     );
     read_unsolicited_terminal_until(
         &mut sibling_reader,
+        &mut incomplete_sibling,
         &mut sibling_envelopes,
         Instant::now() + Duration::from_secs(8),
         "echo:sibling-live",
@@ -689,6 +720,7 @@ fn paused_ingress_sixty_fifth_frame_latches_lost_and_closes_only_that_route() {
     let status = request_collecting_mux(
         &mut sibling,
         &mut sibling_reader,
+        &mut incomplete_sibling,
         &botster_hub_client::DaemonRequest::Status,
         &mut sibling_envelopes,
         &mut sibling_events,

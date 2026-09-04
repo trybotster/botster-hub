@@ -180,7 +180,6 @@ impl HubClientApi {
                     .map_err(|error| runtime_error(request_id.clone(), operation, error))?;
                 HubClientResponseBody::Events(Vec::new())
             }
-            HubClientRequest::DrainRuntime { .. } => HubClientResponseBody::Events(Vec::new()),
             HubClientRequest::Shutdown {
                 session_id,
                 now_seconds,
@@ -667,7 +666,6 @@ impl HubClientAdmission {
             | HubClientOperation::RemoveSession
             | HubClientOperation::Attach
             | HubClientOperation::Detach
-            | HubClientOperation::DrainRuntime
             | HubClientOperation::Shutdown
             | HubClientOperation::GuardedNotificationWrite
             | HubClientOperation::NotifySession
@@ -743,13 +741,6 @@ pub enum HubClientRequest {
         session_id: SessionId,
         subscription_id: SubscriptionId,
         now_seconds: u64,
-    },
-    /// Host-only runtime drain. Returns empty events. Terminal bytes travel on
-    /// the bound Unix or WebRTC adapter, not through this request.
-    DrainRuntime {
-        request_id: RequestId,
-        session_id: SessionId,
-        last_output_at: u64,
     },
     /// Shut down one session through the hub runtime.
     Shutdown {
@@ -897,7 +888,6 @@ impl HubClientRequest {
             | Self::Spawn { request_id, .. }
             | Self::Attach { request_id, .. }
             | Self::Detach { request_id, .. }
-            | Self::DrainRuntime { request_id, .. }
             | Self::Shutdown { request_id, .. }
             | Self::GuardedNotificationWrite { request_id, .. }
             | Self::NotifySession { request_id, .. }
@@ -935,7 +925,6 @@ impl HubClientRequest {
             Self::Spawn { .. } => HubClientOperation::Spawn,
             Self::Attach { .. } => HubClientOperation::Attach,
             Self::Detach { .. } => HubClientOperation::Detach,
-            Self::DrainRuntime { .. } => HubClientOperation::DrainRuntime,
             Self::Shutdown { .. } => HubClientOperation::Shutdown,
             Self::GuardedNotificationWrite { .. } => HubClientOperation::GuardedNotificationWrite,
             Self::NotifySession { .. } => HubClientOperation::NotifySession,
@@ -975,7 +964,6 @@ pub enum HubClientOperation {
     Spawn,
     Attach,
     Detach,
-    DrainRuntime,
     Shutdown,
     GuardedNotificationWrite,
     NotifySession,

@@ -3,6 +3,7 @@ fn unix_adapter_connection(
 ) -> (
     std::os::unix::net::UnixStream,
     std::io::BufReader<std::os::unix::net::UnixStream>,
+    String,
 ) {
     let stream = botster_hub_client::connect_and_hello_with_requirement(
         endpoint,
@@ -10,29 +11,31 @@ fn unix_adapter_connection(
     )
     .expect("unix adapter hello");
     let reader = std::io::BufReader::new(stream.try_clone().expect("clone stream"));
-    (stream, reader)
+    (stream, reader, String::new())
 }
 
 fn request_skipping_envelopes(
     stream: &mut std::os::unix::net::UnixStream,
     reader: &mut std::io::BufReader<std::os::unix::net::UnixStream>,
+    incomplete: &mut String,
     request: &botster_hub_client::DaemonRequest,
     envelopes: &mut Vec<botster_hub_client::DaemonUnixTerminalEnvelope>,
 ) -> botster_hub_client::DaemonResponse {
     let mut events = Vec::new();
-    request_collecting_mux(stream, reader, request, envelopes, &mut events)
+    request_collecting_mux(stream, reader, incomplete, request, envelopes, &mut events)
 }
 
 fn poll_unsolicited_envelopes(
     stream: &mut std::os::unix::net::UnixStream,
     reader: &mut std::io::BufReader<std::os::unix::net::UnixStream>,
+    incomplete: &mut String,
     envelopes: &mut Vec<botster_hub_client::DaemonUnixTerminalEnvelope>,
 ) {
     stream
         .set_read_timeout(Some(Duration::from_millis(50)))
         .expect("set unsolicited mux timeout");
     loop {
-        match botster_hub_client::read_unix_mux_frame_from_reader(reader) {
+        match botster_hub_client::read_unix_mux_frame_from_reader(reader, incomplete) {
             Ok(botster_hub_client::DaemonUnixMuxFrame::Terminal(envelope)) => {
                 assert!(envelope.is_unix_terminal_plane());
                 envelopes.push(envelope);
@@ -52,13 +55,14 @@ fn poll_unsolicited_envelopes(
 fn request_collecting_mux(
     stream: &mut std::os::unix::net::UnixStream,
     reader: &mut std::io::BufReader<std::os::unix::net::UnixStream>,
+    incomplete: &mut String,
     request: &botster_hub_client::DaemonRequest,
     envelopes: &mut Vec<botster_hub_client::DaemonUnixTerminalEnvelope>,
     events: &mut Vec<botster_hub_client::DaemonEvent>,
 ) -> botster_hub_client::DaemonResponse {
     botster_hub_client::write_frame(stream, request).expect("write request");
     loop {
-        match botster_hub_client::read_unix_mux_frame_from_reader(reader).expect("read mux") {
+        match botster_hub_client::read_unix_mux_frame_from_reader(reader, incomplete).expect("read mux") {
             botster_hub_client::DaemonUnixMuxFrame::Response(response) => return *response,
             botster_hub_client::DaemonUnixMuxFrame::Terminal(envelope) => {
                 assert!(envelope.is_unix_terminal_plane());
@@ -201,6 +205,7 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 fn read_unsolicited_terminal_until(
     reader: &mut std::io::BufReader<std::os::unix::net::UnixStream>,
+    incomplete: &mut String,
     envelopes: &mut Vec<botster_hub_client::DaemonUnixTerminalEnvelope>,
     deadline: Instant,
     marker: &str,
@@ -210,7 +215,7 @@ fn read_unsolicited_terminal_until(
         .set_read_timeout(Some(Duration::from_millis(200)))
         .expect("set unsolicited terminal timeout");
     while Instant::now() < deadline && !unix_envelope_contains_live_bytes(envelopes, marker) {
-        match botster_hub_client::read_unix_mux_frame_from_reader(reader) {
+        match botster_hub_client::read_unix_mux_frame_from_reader(reader, incomplete) {
             Ok(botster_hub_client::DaemonUnixMuxFrame::Terminal(envelope)) => {
                 envelopes.push(envelope);
             }
@@ -255,6 +260,7 @@ fn unix_process_exit_payload_len(
 
 fn read_unsolicited_until_process_exit(
     reader: &mut std::io::BufReader<std::os::unix::net::UnixStream>,
+    incomplete: &mut String,
     envelopes: &mut Vec<botster_hub_client::DaemonUnixTerminalEnvelope>,
     session_id: &str,
     subscription_id: &str,
@@ -269,7 +275,7 @@ fn read_unsolicited_until_process_exit(
             .iter()
             .any(|envelope| unix_envelope_is_process_exit(envelope, session_id, subscription_id))
     {
-        match botster_hub_client::read_unix_mux_frame_from_reader(reader) {
+        match botster_hub_client::read_unix_mux_frame_from_reader(reader, incomplete) {
             Ok(botster_hub_client::DaemonUnixMuxFrame::Terminal(envelope)) => {
                 envelopes.push(envelope);
             }
@@ -293,12 +299,13 @@ fn unix_adapter_bind_returns_only_attaching_then_opaque_envelopes() {
     let endpoint = hub.endpoint().clone();
     let session_id = "uab-session";
     let subscription_id = "uab-sub";
-    let (mut stream, mut reader) = unix_adapter_connection(&endpoint);
+    let (mut stream, mut reader, mut incomplete) = unix_adapter_connection(&endpoint);
     let mut envelopes = Vec::new();
 
     let spawned = request_skipping_envelopes(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::Spawn {
             session_id: session_id.to_string(),
             command: "printf 'unix-adapter-ready\\n'; sleep 30".to_string(),
@@ -313,6 +320,7 @@ fn unix_adapter_bind_returns_only_attaching_then_opaque_envelopes() {
     let attach = request_skipping_envelopes(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::Attach {
             session_id: session_id.to_string(),
             subscription_id: subscription_id.to_string(),
@@ -333,7 +341,7 @@ fn unix_adapter_bind_returns_only_attaching_then_opaque_envelopes() {
 
     let deadline = Instant::now() + Duration::from_secs(8);
     while envelopes.is_empty() && Instant::now() < deadline {
-        poll_unsolicited_envelopes(&mut stream, &mut reader, &mut envelopes);
+        poll_unsolicited_envelopes(&mut stream, &mut reader, &mut incomplete, &mut envelopes);
         thread::sleep(Duration::from_millis(50));
     }
     assert!(
@@ -348,6 +356,7 @@ fn unix_adapter_bind_returns_only_attaching_then_opaque_envelopes() {
     let listed = request_skipping_envelopes(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::ListSessions,
         &mut envelopes,
     );
@@ -452,11 +461,12 @@ fn unix_adapter_bind_returns_only_attaching_then_opaque_envelopes() {
         "connection death must not shut down the host session"
     );
 
-    let (mut replacement, mut replacement_reader) = unix_adapter_connection(&endpoint);
+    let (mut replacement, mut replacement_reader, mut incomplete_replacement) = unix_adapter_connection(&endpoint);
     let mut replacement_envelopes = Vec::new();
     let reattach = request_skipping_envelopes(
         &mut replacement,
         &mut replacement_reader,
+        &mut incomplete_replacement,
         &botster_hub_client::DaemonRequest::Attach {
             session_id: session_id.to_string(),
             subscription_id: subscription_id.to_string(),
@@ -558,12 +568,13 @@ fn paused_data_plane_keeps_control_requests_from_driving_terminal_progress() {
     let endpoint = hub.endpoint().clone();
     let session_id = "data-plane-pause-session";
     let subscription_id = "data-plane-pause-sub";
-    let (mut stream, mut reader) = unix_adapter_connection(&endpoint);
+    let (mut stream, mut reader, mut incomplete) = unix_adapter_connection(&endpoint);
     let mut envelopes = Vec::new();
     let mut events = Vec::new();
     spawn_and_bind(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         session_id,
         subscription_id,
         "printf 'pause-baseline-ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
@@ -583,6 +594,7 @@ fn paused_data_plane_keeps_control_requests_from_driving_terminal_progress() {
         request_collecting_mux(
             &mut stream,
             &mut reader,
+            &mut incomplete,
             &botster_hub_client::DaemonRequest::Status,
             &mut envelopes,
             &mut events,
@@ -631,6 +643,7 @@ fn paused_data_plane_keeps_control_requests_from_driving_terminal_progress() {
         request_collecting_mux(
             &mut stream,
             &mut reader,
+            &mut incomplete,
             &request,
             &mut envelopes,
             &mut events,
@@ -644,6 +657,7 @@ fn paused_data_plane_keeps_control_requests_from_driving_terminal_progress() {
     fs::remove_file(&pause).expect("resume data-plane driver");
     read_unsolicited_terminal_until(
         &mut reader,
+        &mut incomplete,
         &mut envelopes,
         Instant::now() + Duration::from_secs(5),
         "echo:retained-two",
@@ -670,12 +684,13 @@ fn live_generic_core_requests_do_not_drive_idle_terminal_output() {
     let session_id = "idle-ctrl-session";
     let subscription_id = "idle-ctrl-sub";
     let hold = hub.data_dir().join("idle-ctrl-hold");
-    let (mut stream, mut reader) = unix_adapter_connection(&endpoint);
+    let (mut stream, mut reader, mut incomplete) = unix_adapter_connection(&endpoint);
     let mut envelopes = Vec::new();
     let mut events = Vec::new();
     spawn_and_bind(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         session_id,
         subscription_id,
         &format!(
@@ -687,6 +702,7 @@ fn live_generic_core_requests_do_not_drive_idle_terminal_output() {
     );
     read_unsolicited_terminal_until(
         &mut reader,
+        &mut incomplete,
         &mut envelopes,
         Instant::now() + Duration::from_secs(5),
         "idle-ctrl-ready",
@@ -701,7 +717,7 @@ fn live_generic_core_requests_do_not_drive_idle_terminal_output() {
             .get_ref()
             .set_read_timeout(Some(Duration::from_millis(200)))
             .expect("set attached wait timeout");
-        match botster_hub_client::read_unix_mux_frame_from_reader(&mut reader) {
+        match botster_hub_client::read_unix_mux_frame_from_reader(&mut reader, &mut incomplete) {
             Ok(botster_hub_client::DaemonUnixMuxFrame::Terminal(envelope)) => {
                 envelopes.push(envelope);
             }
@@ -731,7 +747,7 @@ fn live_generic_core_requests_do_not_drive_idle_terminal_output() {
         .set_read_timeout(Some(Duration::from_millis(200)))
         .expect("set quiet drain timeout");
     loop {
-        match botster_hub_client::read_unix_mux_frame_from_reader(&mut reader) {
+        match botster_hub_client::read_unix_mux_frame_from_reader(&mut reader, &mut incomplete) {
             Ok(botster_hub_client::DaemonUnixMuxFrame::Terminal(envelope)) => {
                 envelopes.push(envelope);
             }
@@ -764,6 +780,7 @@ fn live_generic_core_requests_do_not_drive_idle_terminal_output() {
         request_collecting_mux(
             &mut stream,
             &mut reader,
+            &mut incomplete,
             &request,
             &mut envelopes,
             &mut events,
@@ -813,13 +830,14 @@ fn unix_writable_wake_resumes_output_before_the_watchdog() {
     let endpoint = hub.endpoint().clone();
     let session_id = "writable-wake-session";
     let subscription_id = "writable-wake-sub";
-    let (mut stream, mut reader) = unix_adapter_connection(&endpoint);
+    let (mut stream, mut reader, mut incomplete) = unix_adapter_connection(&endpoint);
     let mut envelopes = Vec::new();
     let mut events = Vec::new();
     let started = Instant::now();
     spawn_and_bind(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         session_id,
         subscription_id,
         "sleep 1; printf 'writable-wake-resumed\\n'; sleep 30",
@@ -829,6 +847,7 @@ fn unix_writable_wake_resumes_output_before_the_watchdog() {
     envelopes.clear();
     read_unsolicited_terminal_until(
         &mut reader,
+        &mut incomplete,
         &mut envelopes,
         Instant::now() + Duration::from_secs(5),
         "writable-wake-resumed",
@@ -864,12 +883,13 @@ fn unix_adapter_explicit_detach_is_separate_from_connection_death() {
     let endpoint = hub.endpoint().clone();
     let session_id = "uad-session";
     let subscription_id = "uad-sub";
-    let (mut stream, mut reader) = unix_adapter_connection(&endpoint);
+    let (mut stream, mut reader, mut incomplete) = unix_adapter_connection(&endpoint);
     let mut envelopes = Vec::new();
 
     request_skipping_envelopes(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::Spawn {
             session_id: session_id.to_string(),
             command: "sleep 30".to_string(),
@@ -879,6 +899,7 @@ fn unix_adapter_explicit_detach_is_separate_from_connection_death() {
     let attach = request_skipping_envelopes(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::Attach {
             session_id: session_id.to_string(),
             subscription_id: subscription_id.to_string(),
@@ -895,6 +916,7 @@ fn unix_adapter_explicit_detach_is_separate_from_connection_death() {
     let detach = request_skipping_envelopes(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::Detach {
             session_id: session_id.to_string(),
             subscription_id: subscription_id.to_string(),
@@ -905,6 +927,7 @@ fn unix_adapter_explicit_detach_is_separate_from_connection_death() {
     let status = request_skipping_envelopes(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::Status,
         &mut envelopes,
     );
@@ -926,6 +949,7 @@ fn unix_adapter_explicit_detach_is_separate_from_connection_death() {
     let second = request_skipping_envelopes(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::Detach {
             session_id: session_id.to_string(),
             subscription_id: subscription_id.to_string(),
@@ -940,6 +964,7 @@ fn unix_adapter_explicit_detach_is_separate_from_connection_death() {
     let listed = request_skipping_envelopes(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::ListSessions,
         &mut envelopes,
     );
@@ -969,12 +994,13 @@ fn unix_adapter_detach_retires_close_work_to_the_live_route_baseline() {
     let endpoint = hub.endpoint().clone();
     let session_id = "close-work-session";
     let subscription_id = "close-work-sub";
-    let (mut stream, mut reader) = unix_adapter_connection(&endpoint);
+    let (mut stream, mut reader, mut incomplete) = unix_adapter_connection(&endpoint);
     let mut envelopes = Vec::new();
 
     request_skipping_envelopes(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::Spawn {
             session_id: session_id.to_string(),
             command: "sleep 30".to_string(),
@@ -984,6 +1010,7 @@ fn unix_adapter_detach_retires_close_work_to_the_live_route_baseline() {
     request_skipping_envelopes(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::Attach {
             session_id: session_id.to_string(),
             subscription_id: subscription_id.to_string(),
@@ -995,6 +1022,7 @@ fn unix_adapter_detach_retires_close_work_to_the_live_route_baseline() {
     request_skipping_envelopes(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::Detach {
             session_id: session_id.to_string(),
             subscription_id: subscription_id.to_string(),
@@ -1033,11 +1061,12 @@ fn unix_adapter_stale_disconnect_does_not_cancel_replacement_owner() {
     let session_id = "uso-session";
     let subscription_id = "uso-sub";
 
-    let (mut owner_a, mut reader_a) = unix_adapter_connection(&endpoint);
+    let (mut owner_a, mut reader_a, mut incomplete_a) = unix_adapter_connection(&endpoint);
     let mut envelopes_a = Vec::new();
     request_skipping_envelopes(
         &mut owner_a,
         &mut reader_a,
+        &mut incomplete_a,
         &botster_hub_client::DaemonRequest::Spawn {
             session_id: session_id.to_string(),
             command: "while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done".to_string(),
@@ -1047,6 +1076,7 @@ fn unix_adapter_stale_disconnect_does_not_cancel_replacement_owner() {
     let attach_a = request_skipping_envelopes(
         &mut owner_a,
         &mut reader_a,
+        &mut incomplete_a,
         &botster_hub_client::DaemonRequest::Attach {
             session_id: session_id.to_string(),
             subscription_id: subscription_id.to_string(),
@@ -1065,6 +1095,7 @@ fn unix_adapter_stale_disconnect_does_not_cancel_replacement_owner() {
     let detach_a = request_skipping_envelopes(
         &mut owner_a,
         &mut reader_a,
+        &mut incomplete_a,
         &botster_hub_client::DaemonRequest::Detach {
             session_id: session_id.to_string(),
             subscription_id: subscription_id.to_string(),
@@ -1076,11 +1107,12 @@ fn unix_adapter_stale_disconnect_does_not_cancel_replacement_owner() {
         botster_hub_client::DaemonResponseKind::Events
     );
 
-    let (mut owner_b, mut reader_b) = unix_adapter_connection(&endpoint);
+    let (mut owner_b, mut reader_b, mut incomplete_b) = unix_adapter_connection(&endpoint);
     let mut envelopes_b = Vec::new();
     let attach_b = request_skipping_envelopes(
         &mut owner_b,
         &mut reader_b,
+        &mut incomplete_b,
         &botster_hub_client::DaemonRequest::Attach {
             session_id: session_id.to_string(),
             subscription_id: subscription_id.to_string(),
@@ -1100,6 +1132,7 @@ fn unix_adapter_stale_disconnect_does_not_cancel_replacement_owner() {
     let before = request_skipping_envelopes(
         &mut owner_b,
         &mut reader_b,
+        &mut incomplete_b,
         &botster_hub_client::DaemonRequest::Status,
         &mut envelopes_b,
     )
@@ -1114,6 +1147,7 @@ fn unix_adapter_stale_disconnect_does_not_cancel_replacement_owner() {
         let status = request_skipping_envelopes(
             &mut owner_b,
             &mut reader_b,
+            &mut incomplete_b,
             &botster_hub_client::DaemonRequest::Status,
             &mut envelopes_b,
         );
@@ -1158,7 +1192,7 @@ fn unix_adapter_stale_disconnect_does_not_cancel_replacement_owner() {
     while Instant::now() < output_deadline
         && !unix_envelope_contains_live_bytes(&envelopes_b, marker)
     {
-        poll_unsolicited_envelopes(&mut owner_b, &mut reader_b, &mut envelopes_b);
+        poll_unsolicited_envelopes(&mut owner_b, &mut reader_b, &mut incomplete_b, &mut envelopes_b);
         thread::sleep(Duration::from_millis(50));
     }
     assert!(
@@ -1168,6 +1202,7 @@ fn unix_adapter_stale_disconnect_does_not_cancel_replacement_owner() {
     let confirm = request_skipping_envelopes(
         &mut owner_b,
         &mut reader_b,
+        &mut incomplete_b,
         &botster_hub_client::DaemonRequest::Status,
         &mut envelopes_b,
     );
@@ -1182,6 +1217,7 @@ fn unix_adapter_stale_disconnect_does_not_cancel_replacement_owner() {
     let occupancy = request_skipping_envelopes(
         &mut owner_b,
         &mut reader_b,
+        &mut incomplete_b,
         &botster_hub_client::DaemonRequest::Status,
         &mut envelopes_b,
     )
@@ -1365,11 +1401,12 @@ fn unix_adapter_bound_printf_stream_attach_delivers_process_exit() {
     );
     let mut session_cleanup = SessionCleanupGuard::new(hub.data_dir(), session_id);
 
-    let (mut term_stream, mut term_reader) = unix_adapter_connection(&endpoint);
+    let (mut term_stream, mut term_reader, mut incomplete_term) = unix_adapter_connection(&endpoint);
     let mut envelopes = Vec::new();
     let term_attach = request_skipping_envelopes(
         &mut term_stream,
         &mut term_reader,
+        &mut incomplete_term,
         &botster_hub_client::DaemonRequest::Attach {
             session_id: session_id.to_string(),
             subscription_id: subscription_id.to_string(),
@@ -1385,10 +1422,11 @@ fn unix_adapter_bound_printf_stream_attach_delivers_process_exit() {
         "unix adapter Attach must bind without terminal bodies: {:?}",
         term_attach.events
     );
-    poll_unsolicited_envelopes(&mut term_stream, &mut term_reader, &mut envelopes);
+    poll_unsolicited_envelopes(&mut term_stream, &mut term_reader, &mut incomplete_term, &mut envelopes);
     fs::write(&release_path, b"go").expect("release held printf");
     read_unsolicited_until_process_exit(
         &mut term_reader,
+        &mut incomplete_term,
         &mut envelopes,
         session_id,
         subscription_id,
@@ -1422,6 +1460,7 @@ fn unix_adapter_bound_printf_stream_attach_delivers_process_exit() {
     let status = request_skipping_envelopes(
         &mut term_stream,
         &mut term_reader,
+        &mut incomplete_term,
         &botster_hub_client::DaemonRequest::Status,
         &mut envelopes,
     );
@@ -1522,9 +1561,11 @@ fn unix_adapter_feature_does_not_raise_default_requirement() {
     assert_eq!(botster_hub_client::PROTOCOL_VERSION, 8);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_and_bind(
     stream: &mut std::os::unix::net::UnixStream,
     reader: &mut std::io::BufReader<std::os::unix::net::UnixStream>,
+    incomplete: &mut String,
     session_id: &str,
     subscription_id: &str,
     command: &str,
@@ -1534,6 +1575,7 @@ fn spawn_and_bind(
     let spawned = request_collecting_mux(
         stream,
         reader,
+        incomplete,
         &botster_hub_client::DaemonRequest::Spawn {
             session_id: session_id.to_string(),
             command: command.to_string(),
@@ -1550,6 +1592,7 @@ fn spawn_and_bind(
     let attach = request_collecting_mux(
         stream,
         reader,
+        incomplete,
         &botster_hub_client::DaemonRequest::Attach {
             session_id: session_id.to_string(),
             subscription_id: subscription_id.to_string(),
@@ -1573,6 +1616,7 @@ fn spawn_and_bind(
 fn wait_for_subscription_closed(
     stream: &mut std::os::unix::net::UnixStream,
     reader: &mut std::io::BufReader<std::os::unix::net::UnixStream>,
+    incomplete: &mut String,
     session_id: &str,
     subscription_id: &str,
     envelopes: &mut Vec<botster_hub_client::DaemonUnixTerminalEnvelope>,
@@ -1596,7 +1640,7 @@ fn wait_for_subscription_closed(
         stream
             .set_read_timeout(Some(Duration::from_millis(100)))
             .expect("read timeout");
-        match botster_hub_client::read_unix_mux_frame_from_reader(reader) {
+        match botster_hub_client::read_unix_mux_frame_from_reader(reader, incomplete) {
             Ok(botster_hub_client::DaemonUnixMuxFrame::Terminal(envelope)) => {
                 assert!(envelope.is_unix_terminal_plane());
                 envelopes.push(envelope);
@@ -1608,6 +1652,7 @@ fn wait_for_subscription_closed(
                 let _ = request_collecting_mux(
                     stream,
                     reader,
+                    incomplete,
                     &botster_hub_client::DaemonRequest::Status,
                     envelopes,
                     events,
@@ -1724,11 +1769,13 @@ fn mismatched_terminal_hello_rejects_attach_before_core_ownership() {
         ack.diagnostics
     );
     let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
+    let mut incomplete = String::new();
     let mut envelopes = Vec::new();
     let mut events = Vec::new();
     request_collecting_mux(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::Spawn {
             session_id: "htm-session".to_string(),
             command: "sleep 30".to_string(),
@@ -1739,6 +1786,7 @@ fn mismatched_terminal_hello_rejects_attach_before_core_ownership() {
     let attach = request_collecting_mux(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::Attach {
             session_id: "htm-session".to_string(),
             subscription_id: "htm-sub".to_string(),
@@ -1764,6 +1812,7 @@ fn mismatched_terminal_hello_rejects_attach_before_core_ownership() {
     let status = request_collecting_mux(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::Status,
         &mut envelopes,
         &mut events,
@@ -1781,12 +1830,13 @@ fn mismatched_terminal_hello_rejects_attach_before_core_ownership() {
 fn host_adapter_close_emits_terminal_subscription_closed_for_one_route() {
     let _guard = daemon_test_guard();
     let hub = start_isolated_live_output_hub("hac");
-    let (mut stream, mut reader) = unix_adapter_connection(hub.endpoint());
+    let (mut stream, mut reader, mut incomplete) = unix_adapter_connection(hub.endpoint());
     let mut envelopes = Vec::new();
     let mut events = Vec::new();
     spawn_and_bind(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         "hac-a",
         "sub-a",
         "sleep 30",
@@ -1796,6 +1846,7 @@ fn host_adapter_close_emits_terminal_subscription_closed_for_one_route() {
     spawn_and_bind(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         "hac-b",
         "sub-b",
         "sleep 30",
@@ -1805,6 +1856,7 @@ fn host_adapter_close_emits_terminal_subscription_closed_for_one_route() {
     let reattach = request_collecting_mux(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::Attach {
             session_id: "hac-a".to_string(),
             subscription_id: "sub-a".to_string(),
@@ -1820,6 +1872,7 @@ fn host_adapter_close_emits_terminal_subscription_closed_for_one_route() {
         wait_for_subscription_closed(
             &mut stream,
             &mut reader,
+            &mut incomplete,
             "hac-a",
             "sub-a",
             &mut envelopes,
@@ -1849,6 +1902,7 @@ fn host_adapter_close_emits_terminal_subscription_closed_for_one_route() {
     let sibling = request_collecting_mux(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::Status,
         &mut envelopes,
         &mut events,
@@ -1857,6 +1911,7 @@ fn host_adapter_close_emits_terminal_subscription_closed_for_one_route() {
     let listed = request_collecting_mux(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::ListSessions,
         &mut envelopes,
         &mut events,
@@ -1885,12 +1940,13 @@ fn core_write_budget_hard_stop_emits_core_adapter_closed() {
             ("BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_DELAY_MS", "500"),
         ],
     );
-    let (mut stream, mut reader) = unix_adapter_connection(hub.endpoint());
+    let (mut stream, mut reader, mut incomplete) = unix_adapter_connection(hub.endpoint());
     let mut envelopes = Vec::new();
     let mut events = Vec::new();
     spawn_and_bind(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         "cwb-live",
         "sub-live",
         "while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
@@ -1900,6 +1956,7 @@ fn core_write_budget_hard_stop_emits_core_adapter_closed() {
     spawn_and_bind(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         "cwb-stall",
         "sub-stall",
         "sleep 3; exec yes write-budget-stall",
@@ -1932,6 +1989,7 @@ fn core_write_budget_hard_stop_emits_core_adapter_closed() {
             let stall_drain = request_collecting_mux(
                 &mut stream,
                 &mut reader,
+                &mut incomplete,
                 &botster_hub_client::DaemonRequest::Status,
                 &mut envelopes,
                 &mut events,
@@ -1965,6 +2023,7 @@ fn core_write_budget_hard_stop_emits_core_adapter_closed() {
             let status = request_collecting_mux(
                 &mut stream,
                 &mut reader,
+                &mut incomplete,
                 &botster_hub_client::DaemonRequest::Status,
                 &mut envelopes,
                 &mut events,
@@ -1990,7 +2049,7 @@ fn core_write_budget_hard_stop_emits_core_adapter_closed() {
         if stall_closed {
             break;
         }
-        match botster_hub_client::read_unix_mux_frame_from_reader(&mut reader) {
+        match botster_hub_client::read_unix_mux_frame_from_reader(&mut reader, &mut incomplete) {
             Ok(botster_hub_client::DaemonUnixMuxFrame::Terminal(envelope)) => {
                 assert!(envelope.is_unix_terminal_plane());
                 envelopes.push(envelope);
@@ -2043,6 +2102,7 @@ fn core_write_budget_hard_stop_emits_core_adapter_closed() {
     let status = request_collecting_mux(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::Status,
         &mut envelopes,
         &mut events,
@@ -2051,6 +2111,7 @@ fn core_write_budget_hard_stop_emits_core_adapter_closed() {
     let listed = request_collecting_mux(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::ListSessions,
         &mut envelopes,
         &mut events,
@@ -2075,6 +2136,7 @@ fn core_write_budget_hard_stop_emits_core_adapter_closed() {
         let drain = request_collecting_mux(
             &mut stream,
             &mut reader,
+            &mut incomplete,
             &botster_hub_client::DaemonRequest::Status,
             &mut envelopes,
             &mut events,
@@ -2132,12 +2194,13 @@ fn forced_would_block_on_one_unix_route_keeps_sibling_open_and_delivering() {
             ),
         ],
     );
-    let (mut stream, mut reader) = unix_adapter_connection(hub.endpoint());
+    let (mut stream, mut reader, mut incomplete) = unix_adapter_connection(hub.endpoint());
     let mut envelopes = Vec::new();
     let mut events = Vec::new();
     spawn_and_bind(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         "sso-held",
         "sub-held",
         "printf 'held-ready\\n'; sleep 30",
@@ -2155,6 +2218,7 @@ fn forced_would_block_on_one_unix_route_keeps_sibling_open_and_delivering() {
     spawn_and_bind(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         "sso-live",
         "sub-live",
         "while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
@@ -2175,6 +2239,7 @@ fn forced_would_block_on_one_unix_route_keeps_sibling_open_and_delivering() {
         let drain = request_collecting_mux(
             &mut stream,
             &mut reader,
+            &mut incomplete,
             &botster_hub_client::DaemonRequest::Status,
             &mut envelopes,
             &mut events,
@@ -2203,6 +2268,7 @@ fn forced_would_block_on_one_unix_route_keeps_sibling_open_and_delivering() {
     let status = request_collecting_mux(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::Status,
         &mut envelopes,
         &mut events,
@@ -2240,12 +2306,13 @@ fn forced_would_block_on_one_unix_route_keeps_sibling_open_and_delivering() {
 fn subscribe_entities_on_bound_unix_mux_returns_operator_error_and_keeps_route() {
     let _guard = daemon_test_guard();
     let hub = start_isolated_live_output_hub("sem");
-    let (mut stream, mut reader) = unix_adapter_connection(hub.endpoint());
+    let (mut stream, mut reader, mut incomplete) = unix_adapter_connection(hub.endpoint());
     let mut envelopes = Vec::new();
     let mut events = Vec::new();
     spawn_and_bind(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         "sem-live",
         "sub-live",
         "sleep 30",
@@ -2256,6 +2323,7 @@ fn subscribe_entities_on_bound_unix_mux_returns_operator_error_and_keeps_route()
     let subscribe = request_collecting_mux(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::SubscribeEntities {
             entity_type: "session".to_string(),
             subscription_id: "sem-entities".to_string(),
@@ -2276,6 +2344,7 @@ fn subscribe_entities_on_bound_unix_mux_returns_operator_error_and_keeps_route()
     let status = request_collecting_mux(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::Status,
         &mut envelopes,
         &mut events,
@@ -2284,6 +2353,7 @@ fn subscribe_entities_on_bound_unix_mux_returns_operator_error_and_keeps_route()
     let drain = request_collecting_mux(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::Status,
         &mut envelopes,
         &mut events,
@@ -2311,12 +2381,13 @@ fn subscribe_entities_on_bound_unix_mux_returns_operator_error_and_keeps_route()
 fn failed_remove_session_does_not_suppress_later_core_close() {
     let _guard = daemon_test_guard();
     let hub = start_isolated_live_output_hub("frm");
-    let (mut stream, mut reader) = unix_adapter_connection(hub.endpoint());
+    let (mut stream, mut reader, mut incomplete) = unix_adapter_connection(hub.endpoint());
     let mut envelopes = Vec::new();
     let mut events = Vec::new();
     spawn_and_bind(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         "frm-stall",
         "sub-stall",
         "yes remove-session-still-live",
@@ -2326,6 +2397,7 @@ fn failed_remove_session_does_not_suppress_later_core_close() {
     let removed = request_collecting_mux(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::RemoveSession {
             session_id: "frm-stall".to_string(),
         },
@@ -2345,6 +2417,7 @@ fn failed_remove_session_does_not_suppress_later_core_close() {
         wait_for_subscription_closed(
             &mut stream,
             &mut reader,
+            &mut incomplete,
             "frm-stall",
             "sub-stall",
             &mut envelopes,
@@ -2370,7 +2443,7 @@ fn connection_death_and_detach_do_not_emit_terminal_subscription_closed() {
     let _guard = daemon_test_guard();
     let hub = start_isolated_live_output_hub("cdn");
     let endpoint = hub.endpoint().clone();
-    let (mut stream, mut reader) = unix_adapter_connection(&endpoint);
+    let (mut stream, mut reader, mut incomplete) = unix_adapter_connection(&endpoint);
     let mut envelopes = Vec::new();
     let mut events = Vec::new();
     let producer_dir = unique_short_test_dir("cdn-producers");
@@ -2383,6 +2456,7 @@ fn connection_death_and_detach_do_not_emit_terminal_subscription_closed() {
     spawn_and_bind(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         "cdn-session",
         "cdn-sub",
         &detach_command,
@@ -2396,6 +2470,7 @@ fn connection_death_and_detach_do_not_emit_terminal_subscription_closed() {
     fs::write(&detach_release, b"go").expect("release detach producer");
     read_unsolicited_terminal_until(
         &mut reader,
+        &mut incomplete,
         &mut envelopes,
         Instant::now() + Duration::from_secs(10),
         "cdn-detach-ready",
@@ -2407,6 +2482,7 @@ fn connection_death_and_detach_do_not_emit_terminal_subscription_closed() {
     let detach = request_collecting_mux(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::Detach {
             session_id: "cdn-session".to_string(),
             subscription_id: "cdn-sub".to_string(),
@@ -2426,7 +2502,7 @@ fn connection_death_and_detach_do_not_emit_terminal_subscription_closed() {
     );
     drop(stream);
     drop(reader);
-    let (mut replacement, mut replacement_reader) = unix_adapter_connection(&endpoint);
+    let (mut replacement, mut replacement_reader, mut incomplete_replacement) = unix_adapter_connection(&endpoint);
     let mut replacement_events = Vec::new();
     let mut replacement_envelopes = Vec::new();
     let death_release = producer_dir.join("death-release");
@@ -2437,6 +2513,7 @@ fn connection_death_and_detach_do_not_emit_terminal_subscription_closed() {
     spawn_and_bind(
         &mut replacement,
         &mut replacement_reader,
+        &mut incomplete_replacement,
         "cdn-death",
         "cdn-death-sub",
         &death_command,
@@ -2450,6 +2527,7 @@ fn connection_death_and_detach_do_not_emit_terminal_subscription_closed() {
     fs::write(&death_release, b"go").expect("release connection-death producer");
     read_unsolicited_terminal_until(
         &mut replacement_reader,
+        &mut incomplete_replacement,
         &mut replacement_envelopes,
         Instant::now() + Duration::from_secs(10),
         "cdn-death-ready",
@@ -2478,12 +2556,13 @@ fn connection_death_and_detach_do_not_emit_terminal_subscription_closed() {
 fn process_exit_and_shutdown_session_do_not_emit_terminal_subscription_closed() {
     let _guard = daemon_test_guard();
     let hub = start_isolated_live_output_hub("pex");
-    let (mut stream, mut reader) = unix_adapter_connection(hub.endpoint());
+    let (mut stream, mut reader, mut incomplete) = unix_adapter_connection(hub.endpoint());
     let mut envelopes = Vec::new();
     let mut events = Vec::new();
     spawn_and_bind(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         "pex-exit",
         "sub-exit",
         "printf 'done\\n'",
@@ -2494,6 +2573,7 @@ fn process_exit_and_shutdown_session_do_not_emit_terminal_subscription_closed() 
     spawn_and_bind(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         "pex-shutdown",
         "sub-shutdown",
         "sleep 30",
@@ -2505,6 +2585,7 @@ fn process_exit_and_shutdown_session_do_not_emit_terminal_subscription_closed() 
     let before = request_collecting_mux(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::Status,
         &mut envelopes,
         &mut events,
@@ -2522,6 +2603,7 @@ fn process_exit_and_shutdown_session_do_not_emit_terminal_subscription_closed() 
     let shutdown = request_collecting_mux(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::ShutdownSession {
             session_id: "pex-shutdown".to_string(),
         },
@@ -2535,6 +2617,7 @@ fn process_exit_and_shutdown_session_do_not_emit_terminal_subscription_closed() 
     let listed = request_collecting_mux(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::ListSessions,
         &mut envelopes,
         &mut events,
@@ -2549,6 +2632,7 @@ fn process_exit_and_shutdown_session_do_not_emit_terminal_subscription_closed() 
     let late = request_collecting_mux(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::Status,
         &mut envelopes,
         &mut events,
@@ -2582,13 +2666,14 @@ fn shutdown_session_exact_keys_preserve_replacement_owner_and_siblings() {
     let _guard = daemon_test_guard();
     let hub = start_isolated_live_output_hub("sgk");
     let endpoint = hub.endpoint().clone();
-    let (mut stream, mut reader) = unix_adapter_connection(&endpoint);
+    let (mut stream, mut reader, mut incomplete) = unix_adapter_connection(&endpoint);
     let mut envelopes = Vec::new();
     let mut events = Vec::new();
 
     let missing = request_collecting_mux(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::ShutdownSession {
             session_id: "sgk-missing".to_string(),
         },
@@ -2607,6 +2692,7 @@ fn shutdown_session_exact_keys_preserve_replacement_owner_and_siblings() {
     spawn_and_bind(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         "sgk-victim",
         "sgk-victim-sub",
         "sleep 30",
@@ -2616,6 +2702,7 @@ fn shutdown_session_exact_keys_preserve_replacement_owner_and_siblings() {
     spawn_and_bind(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         "sgk-sibling",
         "sgk-sibling-sub",
         "while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
@@ -2625,6 +2712,7 @@ fn shutdown_session_exact_keys_preserve_replacement_owner_and_siblings() {
     let before = request_collecting_mux(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::Status,
         &mut envelopes,
         &mut events,
@@ -2654,6 +2742,7 @@ fn shutdown_session_exact_keys_preserve_replacement_owner_and_siblings() {
         let _ = request_collecting_mux(
             &mut stream,
             &mut reader,
+            &mut incomplete,
             &botster_hub_client::DaemonRequest::Status,
             &mut envelopes,
             &mut events,
@@ -2668,6 +2757,7 @@ fn shutdown_session_exact_keys_preserve_replacement_owner_and_siblings() {
     let shutdown = request_collecting_mux(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::ShutdownSession {
             session_id: "sgk-victim".to_string(),
         },
@@ -2684,6 +2774,7 @@ fn shutdown_session_exact_keys_preserve_replacement_owner_and_siblings() {
     let late = request_collecting_mux(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::Status,
         &mut envelopes,
         &mut events,
@@ -2712,6 +2803,7 @@ fn shutdown_session_exact_keys_preserve_replacement_owner_and_siblings() {
         let _ = request_collecting_mux(
             &mut stream,
             &mut reader,
+            &mut incomplete,
             &botster_hub_client::DaemonRequest::Status,
             &mut envelopes,
             &mut events,
@@ -2726,6 +2818,7 @@ fn shutdown_session_exact_keys_preserve_replacement_owner_and_siblings() {
     let remove = request_collecting_mux(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::RemoveSession {
             session_id: "sgk-victim".to_string(),
         },
@@ -2742,6 +2835,7 @@ fn shutdown_session_exact_keys_preserve_replacement_owner_and_siblings() {
     spawn_and_bind(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         "sgk-victim",
         "sgk-victim-sub",
         "sleep 30",
@@ -2751,6 +2845,7 @@ fn shutdown_session_exact_keys_preserve_replacement_owner_and_siblings() {
     let replaced = request_collecting_mux(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::Status,
         &mut envelopes,
         &mut events,
@@ -2772,6 +2867,7 @@ fn shutdown_session_exact_keys_preserve_replacement_owner_and_siblings() {
     let reattach = request_collecting_mux(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::Attach {
             session_id: "sgk-victim".to_string(),
             subscription_id: "sgk-victim-sub".to_string(),
@@ -2787,6 +2883,7 @@ fn shutdown_session_exact_keys_preserve_replacement_owner_and_siblings() {
         wait_for_subscription_closed(
             &mut stream,
             &mut reader,
+            &mut incomplete,
             "sgk-victim",
             "sgk-victim-sub",
             &mut envelopes,
@@ -2808,6 +2905,7 @@ fn shutdown_session_exact_keys_preserve_replacement_owner_and_siblings() {
     spawn_and_bind(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         "sgk-missing",
         "sgk-missing-sub",
         "sleep 30",
@@ -2817,6 +2915,7 @@ fn shutdown_session_exact_keys_preserve_replacement_owner_and_siblings() {
     let missing_reattach = request_collecting_mux(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::Attach {
             session_id: "sgk-missing".to_string(),
             subscription_id: "sgk-missing-sub".to_string(),
@@ -2832,6 +2931,7 @@ fn shutdown_session_exact_keys_preserve_replacement_owner_and_siblings() {
         wait_for_subscription_closed(
             &mut stream,
             &mut reader,
+            &mut incomplete,
             "sgk-missing",
             "sgk-missing-sub",
             &mut envelopes,
@@ -2857,12 +2957,13 @@ fn attached_stopping_shutdown_session_suppresses_exact_generation() {
         )],
     );
     let endpoint = hub.endpoint().clone();
-    let (mut stream, mut reader) = unix_adapter_connection(&endpoint);
+    let (mut stream, mut reader, mut incomplete) = unix_adapter_connection(&endpoint);
     let mut envelopes = Vec::new();
     let mut events = Vec::new();
     spawn_and_bind(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         "stp-session",
         "stp-sub",
         "sleep 30",
@@ -2872,6 +2973,7 @@ fn attached_stopping_shutdown_session_suppresses_exact_generation() {
     let before = request_collecting_mux(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::Status,
         &mut envelopes,
         &mut events,
@@ -2889,6 +2991,7 @@ fn attached_stopping_shutdown_session_suppresses_exact_generation() {
     let shutdown = request_collecting_mux(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::ShutdownSession {
             session_id: "stp-session".to_string(),
         },
@@ -2906,6 +3009,7 @@ fn attached_stopping_shutdown_session_suppresses_exact_generation() {
     let late = request_collecting_mux(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::Status,
         &mut envelopes,
         &mut events,
@@ -2958,12 +3062,13 @@ fn unix_shutdown_session_from_another_connection_classifies_attached_exit() {
         botster_hub_client::DaemonResponseKind::Spawned
     );
 
-    let (mut stream, mut reader) = unix_adapter_connection(&endpoint);
+    let (mut stream, mut reader, mut incomplete) = unix_adapter_connection(&endpoint);
     let mut envelopes = Vec::new();
     let mut events = Vec::new();
     let term_attach = request_skipping_envelopes(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::Attach {
             session_id: session_id.to_string(),
             subscription_id: subscription_id.to_string(),
@@ -2982,6 +3087,7 @@ fn unix_shutdown_session_from_another_connection_classifies_attached_exit() {
     let primed = request_skipping_envelopes(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::Status,
         &mut envelopes,
     );
@@ -2995,7 +3101,7 @@ fn unix_shutdown_session_from_another_connection_classifies_attached_exit() {
     while Instant::now() < print_deadline
         && !unix_envelope_contains_live_bytes(&envelopes, "pse-ready")
     {
-        poll_unsolicited_envelopes(&mut stream, &mut reader, &mut envelopes);
+        poll_unsolicited_envelopes(&mut stream, &mut reader, &mut incomplete, &mut envelopes);
         thread::sleep(Duration::from_millis(25));
     }
     assert!(
@@ -3005,6 +3111,7 @@ fn unix_shutdown_session_from_another_connection_classifies_attached_exit() {
     fs::write(&exit_release, b"go").expect("release Unix natural-exit process");
     read_unsolicited_until_process_exit(
         &mut reader,
+        &mut incomplete,
         &mut envelopes,
         session_id,
         subscription_id,
@@ -3059,6 +3166,7 @@ fn unix_shutdown_session_from_another_connection_classifies_attached_exit() {
     let drain = request_collecting_mux(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::Status,
         &mut envelopes,
         &mut events,
@@ -3159,12 +3267,13 @@ fn stale_generation_close_does_not_sweep_replacement_owner() {
     let _guard = daemon_test_guard();
     let hub = start_isolated_live_output_hub("sgo");
     let endpoint = hub.endpoint().clone();
-    let (mut owner_a, mut reader_a) = unix_adapter_connection(&endpoint);
+    let (mut owner_a, mut reader_a, mut incomplete_a) = unix_adapter_connection(&endpoint);
     let mut envelopes_a = Vec::new();
     let mut events_a = Vec::new();
     spawn_and_bind(
         &mut owner_a,
         &mut reader_a,
+        &mut incomplete_a,
         "sgo-session",
         "sgo-sub",
         "while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
@@ -3172,12 +3281,13 @@ fn stale_generation_close_does_not_sweep_replacement_owner() {
         &mut events_a,
     );
 
-    let (mut owner_b, mut reader_b) = unix_adapter_connection(&endpoint);
+    let (mut owner_b, mut reader_b, mut incomplete_b) = unix_adapter_connection(&endpoint);
     let mut envelopes_b = Vec::new();
     let mut events_b = Vec::new();
     let attach_b = request_collecting_mux(
         &mut owner_b,
         &mut reader_b,
+        &mut incomplete_b,
         &botster_hub_client::DaemonRequest::Attach {
             session_id: "sgo-session".to_string(),
             subscription_id: "sgo-sub".to_string(),
@@ -3202,6 +3312,7 @@ fn stale_generation_close_does_not_sweep_replacement_owner() {
         wait_for_subscription_closed(
             &mut owner_a,
             &mut reader_a,
+            &mut incomplete_a,
             "sgo-session",
             "sgo-sub",
             &mut envelopes_a,
@@ -3232,6 +3343,7 @@ fn stale_generation_close_does_not_sweep_replacement_owner() {
         let drain = request_collecting_mux(
             &mut owner_b,
             &mut reader_b,
+            &mut incomplete_b,
             &botster_hub_client::DaemonRequest::Status,
             &mut envelopes_b,
             &mut events_b,
@@ -3321,11 +3433,13 @@ where
 fn sibling_status(
     stream: &mut std::os::unix::net::UnixStream,
     reader: &mut std::io::BufReader<std::os::unix::net::UnixStream>,
+    incomplete: &mut String,
     envelopes: &mut Vec<botster_hub_client::DaemonUnixTerminalEnvelope>,
 ) -> botster_hub_client::DaemonStatus {
     request_skipping_envelopes(
         stream,
         reader,
+        incomplete,
         &botster_hub_client::DaemonRequest::Status,
         envelopes,
     )
@@ -3336,21 +3450,23 @@ fn sibling_status(
 fn wait_for_cleanup_completed(
     stream: &mut std::os::unix::net::UnixStream,
     reader: &mut std::io::BufReader<std::os::unix::net::UnixStream>,
+    incomplete: &mut String,
     envelopes: &mut Vec<botster_hub_client::DaemonUnixTerminalEnvelope>,
     before: &botster_hub_client::DaemonLifecycleCounters,
 ) -> botster_hub_client::DaemonStatus {
     let deadline = Instant::now() + Duration::from_secs(3);
-    let mut status = sibling_status(stream, reader, envelopes);
+    let mut status = sibling_status(stream, reader, incomplete, envelopes);
     while Instant::now() < deadline {
         if status.lifecycle_counters.cleanup_completed > before.cleanup_completed {
             return status;
         }
         thread::sleep(Duration::from_millis(20));
-        status = sibling_status(stream, reader, envelopes);
+        status = sibling_status(stream, reader, incomplete, envelopes);
     }
     status
 }
 
+#[allow(clippy::type_complexity)]
 fn attach_two_unix_clients(
     hub: &botster_hub_test_support::IsolatedHub,
     session_id: &str,
@@ -3359,17 +3475,20 @@ fn attach_two_unix_clients(
 ) -> (
     std::os::unix::net::UnixStream,
     std::io::BufReader<std::os::unix::net::UnixStream>,
+    String,
     std::os::unix::net::UnixStream,
     std::io::BufReader<std::os::unix::net::UnixStream>,
+    String,
     Vec<botster_hub_client::DaemonUnixTerminalEnvelope>,
     Vec<botster_hub_client::DaemonUnixTerminalEnvelope>,
 ) {
     let endpoint = hub.endpoint();
-    let (mut owner_a, mut reader_a) = unix_adapter_connection(endpoint);
+    let (mut owner_a, mut reader_a, mut incomplete_a) = unix_adapter_connection(endpoint);
     let mut envelopes_a = Vec::new();
     let spawned = request_skipping_envelopes(
         &mut owner_a,
         &mut reader_a,
+        &mut incomplete_a,
         &botster_hub_client::DaemonRequest::Spawn {
             session_id: session_id.to_string(),
             command: "while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done".to_string(),
@@ -3383,6 +3502,7 @@ fn attach_two_unix_clients(
     let attach_a = request_skipping_envelopes(
         &mut owner_a,
         &mut reader_a,
+        &mut incomplete_a,
         &botster_hub_client::DaemonRequest::Attach {
             session_id: session_id.to_string(),
             subscription_id: sub_a.to_string(),
@@ -3393,11 +3513,12 @@ fn attach_two_unix_clients(
         attach_a.kind,
         botster_hub_client::DaemonResponseKind::Events
     );
-    let (mut owner_b, mut reader_b) = unix_adapter_connection(endpoint);
+    let (mut owner_b, mut reader_b, mut incomplete_b) = unix_adapter_connection(endpoint);
     let mut envelopes_b = Vec::new();
     let attach_b = request_skipping_envelopes(
         &mut owner_b,
         &mut reader_b,
+        &mut incomplete_b,
         &botster_hub_client::DaemonRequest::Attach {
             session_id: session_id.to_string(),
             subscription_id: sub_b.to_string(),
@@ -3411,8 +3532,10 @@ fn attach_two_unix_clients(
     (
         owner_a,
         reader_a,
+        incomplete_a,
         owner_b,
         reader_b,
+        incomplete_b,
         envelopes_a,
         envelopes_b,
     )
@@ -3425,10 +3548,10 @@ fn unix_eof_releases_exact_attach_occupancy_on_sibling_status() {
     let session_id = "ueo-session";
     let sub_a = "ueo-sub-a";
     let sub_b = "ueo-sub-b";
-    let (owner_a, reader_a, mut owner_b, mut reader_b, _envelopes_a, mut envelopes_b) =
+    let (owner_a, reader_a, _incomplete_a, mut owner_b, mut reader_b, mut incomplete_b, _envelopes_a, mut envelopes_b) =
         attach_two_unix_clients(&hub, session_id, sub_a, sub_b);
 
-    let before = sibling_status(&mut owner_b, &mut reader_b, &mut envelopes_b);
+    let before = sibling_status(&mut owner_b, &mut reader_b, &mut incomplete_b, &mut envelopes_b);
     assert!(
         before
             .compatibility
@@ -3454,6 +3577,7 @@ fn unix_eof_releases_exact_attach_occupancy_on_sibling_status() {
     let after = wait_for_cleanup_completed(
         &mut owner_b,
         &mut reader_b,
+        &mut incomplete_b,
         &mut envelopes_b,
         &before.lifecycle_counters,
     );
@@ -3478,6 +3602,7 @@ fn unix_eof_releases_exact_attach_occupancy_on_sibling_status() {
     let listed = request_skipping_envelopes(
         &mut owner_b,
         &mut reader_b,
+        &mut incomplete_b,
         &botster_hub_client::DaemonRequest::ListSessions,
         &mut envelopes_b,
     );
@@ -3509,14 +3634,15 @@ fn unix_eof_leave_route_ablation_keeps_named_pair_on_status() {
     let session_id = "uel-session";
     let sub_a = "uel-sub-a";
     let sub_b = "uel-sub-b";
-    let (owner_a, reader_a, mut owner_b, mut reader_b, _envelopes_a, mut envelopes_b) =
+    let (owner_a, reader_a, _incomplete_a, mut owner_b, mut reader_b, mut incomplete_b, _envelopes_a, mut envelopes_b) =
         attach_two_unix_clients(&hub, session_id, sub_a, sub_b);
-    let before = sibling_status(&mut owner_b, &mut reader_b, &mut envelopes_b);
+    let before = sibling_status(&mut owner_b, &mut reader_b, &mut incomplete_b, &mut envelopes_b);
     drop(owner_a);
     drop(reader_a);
     let after = wait_for_cleanup_completed(
         &mut owner_b,
         &mut reader_b,
+        &mut incomplete_b,
         &mut envelopes_b,
         &before.lifecycle_counters,
     );
@@ -3540,14 +3666,15 @@ fn unix_eof_skip_core_detach_ablation_keeps_named_pair_on_status() {
     let session_id = "ues-session";
     let sub_a = "ues-sub-a";
     let sub_b = "ues-sub-b";
-    let (owner_a, reader_a, mut owner_b, mut reader_b, _envelopes_a, mut envelopes_b) =
+    let (owner_a, reader_a, _incomplete_a, mut owner_b, mut reader_b, mut incomplete_b, _envelopes_a, mut envelopes_b) =
         attach_two_unix_clients(&hub, session_id, sub_a, sub_b);
-    let before = sibling_status(&mut owner_b, &mut reader_b, &mut envelopes_b);
+    let before = sibling_status(&mut owner_b, &mut reader_b, &mut incomplete_b, &mut envelopes_b);
     drop(owner_a);
     drop(reader_a);
     let after = wait_for_cleanup_completed(
         &mut owner_b,
         &mut reader_b,
+        &mut incomplete_b,
         &mut envelopes_b,
         &before.lifecycle_counters,
     );
@@ -3571,11 +3698,12 @@ fn unix_eof_pair_only_detach_ablation_drops_replacement_owner_generation() {
     let endpoint = hub.endpoint().clone();
     let session_id = "uep-session";
     let subscription_id = "uep-sub";
-    let (mut owner_a, mut reader_a) = unix_adapter_connection(&endpoint);
+    let (mut owner_a, mut reader_a, mut incomplete_a) = unix_adapter_connection(&endpoint);
     let mut envelopes_a = Vec::new();
     request_skipping_envelopes(
         &mut owner_a,
         &mut reader_a,
+        &mut incomplete_a,
         &botster_hub_client::DaemonRequest::Spawn {
             session_id: session_id.to_string(),
             command: "while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done".to_string(),
@@ -3585,24 +3713,26 @@ fn unix_eof_pair_only_detach_ablation_drops_replacement_owner_generation() {
     request_skipping_envelopes(
         &mut owner_a,
         &mut reader_a,
+        &mut incomplete_a,
         &botster_hub_client::DaemonRequest::Attach {
             session_id: session_id.to_string(),
             subscription_id: subscription_id.to_string(),
         },
         &mut envelopes_a,
     );
-    let (mut owner_b, mut reader_b) = unix_adapter_connection(&endpoint);
+    let (mut owner_b, mut reader_b, mut incomplete_b) = unix_adapter_connection(&endpoint);
     let mut envelopes_b = Vec::new();
     request_skipping_envelopes(
         &mut owner_b,
         &mut reader_b,
+        &mut incomplete_b,
         &botster_hub_client::DaemonRequest::Attach {
             session_id: session_id.to_string(),
             subscription_id: subscription_id.to_string(),
         },
         &mut envelopes_b,
     );
-    let before = sibling_status(&mut owner_b, &mut reader_b, &mut envelopes_b);
+    let before = sibling_status(&mut owner_b, &mut reader_b, &mut incomplete_b, &mut envelopes_b);
     let before_generation = before
         .live_attach_occupancy
         .iter()
@@ -3613,6 +3743,7 @@ fn unix_eof_pair_only_detach_ablation_drops_replacement_owner_generation() {
     let after = wait_for_cleanup_completed(
         &mut owner_b,
         &mut reader_b,
+        &mut incomplete_b,
         &mut envelopes_b,
         &before.lifecycle_counters,
     );
@@ -3636,11 +3767,12 @@ fn unix_spawn_then_eof_keeps_host_session() {
     let hub = start_isolated_live_output_hub("usp");
     let endpoint = hub.endpoint().clone();
     let session_id = "usp-session";
-    let (mut owner_a, mut reader_a) = unix_adapter_connection(&endpoint);
+    let (mut owner_a, mut reader_a, mut incomplete_a) = unix_adapter_connection(&endpoint);
     let mut envelopes_a = Vec::new();
     let spawned = request_skipping_envelopes(
         &mut owner_a,
         &mut reader_a,
+        &mut incomplete_a,
         &botster_hub_client::DaemonRequest::Spawn {
             session_id: session_id.to_string(),
             command: "sleep 30".to_string(),
