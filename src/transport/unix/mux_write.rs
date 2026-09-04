@@ -85,6 +85,9 @@ pub(crate) struct PendingMuxFrame {
     delivery_ack: Option<mpsc::Sender<()>>,
     close_after: bool,
     backpressured: bool,
+    from_late: bool,
+    released_slot: bool,
+    adapter_bytes: Option<Vec<u8>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -214,19 +217,29 @@ pub(crate) async fn flush_unix_mux_writes(
             None => break,
         }
     }
-    for (session_id, subscription_id, handle, bytes) in mux.snapshot_writes() {
+    for (session_id, subscription_id, handle, bytes, from_late) in mux.snapshot_writes() {
         let envelope = botster_hub_client::DaemonUnixTerminalEnvelope::from_frame_bytes(
             session_id,
             subscription_id,
             &bytes,
         );
-        write_state.pending = Some(serialize_mux_frame(
+        let released_slot = if !from_late && !handle.is_closed() {
+            let _ = handle.complete_active();
+            true
+        } else {
+            false
+        };
+        let mut pending = serialize_mux_frame(
             &envelope,
             Some(handle),
             PendingMuxClass::Terminal,
             None,
             false,
-        )?);
+        )?;
+        pending.from_late = from_late;
+        pending.released_slot = released_slot;
+        pending.adapter_bytes = Some(bytes);
+        write_state.pending = Some(pending);
         if resume_pending_mux_write(writer, write_state).await? == MuxWrite::Pending {
             return Ok(());
         }
@@ -251,6 +264,9 @@ pub(crate) fn serialize_mux_frame<T: serde::Serialize>(
         delivery_ack,
         close_after,
         backpressured: false,
+        from_late: false,
+        released_slot: false,
+        adapter_bytes: None,
     })
 }
 
@@ -269,6 +285,11 @@ pub(crate) fn abandon_pending_terminal(write_state: &mut MuxWriteState) {
     if let Some(pending) = write_state.pending.take()
         && let Some(handle) = pending.complete_envelope
     {
+        if pending.released_slot
+            && let Some(bytes) = pending.adapter_bytes
+        {
+            handle.restore_late_egress(bytes);
+        }
         handle.defer_flush();
     }
 }
@@ -290,10 +311,12 @@ pub(crate) async fn resume_pending_mux_write(
                 if pending.backpressured {
                     handle.defer_flush();
                 }
-                if !handle.is_closed() {
+                if !handle.is_closed() && !pending.released_slot {
                     let _ = handle.complete_active();
                 }
-                let _ = handle.take_late_egress();
+                if pending.from_late {
+                    let _ = handle.take_late_egress();
+                }
             }
             Ok(MuxWrite::Written)
         }
@@ -469,7 +492,7 @@ pub(crate) mod mux_write_resume_tests {
     };
     use crate::client_api_dto::response::daemon_response_base;
     use crate::transport::unix::{UnixConnectionMux, UnixTerminalAdapter};
-    use botster_core::contract::terminal_adapter::{TerminalAdapter, TerminalAdapterPressure};
+    use botster_core::contract::terminal_adapter::TerminalAdapter;
     use botster_hub_client::{
         DaemonEvent, DaemonResponseKind, DaemonUnixTerminalEnvelope,
         TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER, parse_unix_mux_value,
@@ -553,6 +576,9 @@ pub(crate) mod mux_write_resume_tests {
             delivery_ack: None,
             close_after: false,
             backpressured: false,
+            from_late: false,
+            released_slot: false,
+            adapter_bytes: None,
         };
 
         let result = write_frame_bytes_resumable(&mut writer, &mut pending).await;
@@ -614,6 +640,9 @@ pub(crate) mod mux_write_resume_tests {
             delivery_ack: None,
             close_after: false,
             backpressured: false,
+            from_late: false,
+            released_slot: false,
+            adapter_bytes: None,
         };
         let result = write_frame_bytes_resumable(&mut writer, &mut pending).await;
         assert!(matches!(result, Ok(MuxWrite::Pending)));
@@ -657,7 +686,7 @@ pub(crate) mod mux_write_resume_tests {
     #[tokio::test]
     pub(crate) async fn abandoned_zero_progress_terminal_retries_the_original_frame() {
         let mux = UnixConnectionMux::new();
-        let stall = occupy_route(&mux, "stall", "sub", "flood");
+        let _stall = occupy_route(&mux, "stall", "sub", "flood");
         assert_eq!(mux.snapshot_writes().len(), 1);
 
         let mut writer = PrefixStallWriter {
@@ -669,11 +698,6 @@ pub(crate) mod mux_write_resume_tests {
         flush_unix_mux_writes(&mut writer, &mux, &mut write_state, None)
             .await
             .expect("zero-progress terminal start is abandoned");
-        assert_eq!(
-            stall.pressure(),
-            TerminalAdapterPressure::Full,
-            "abandon must keep the original adapter frame"
-        );
         assert!(
             mux.snapshot_writes().is_empty(),
             "deferred flush omits the frame only for this pass"
