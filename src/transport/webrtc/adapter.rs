@@ -48,20 +48,21 @@ struct WebRtcTerminalAdapterInner {
     aggregate_permit: Mutex<Option<crate::admission::connection_budget::AggregateSendPermit>>,
     aggregate_blocked: AtomicBool,
     test_forced_would_block: AtomicBool,
+    late_egress: Mutex<Option<Vec<u8>>>,
 }
 
 impl WebRtcTerminalAdapterInner {
     fn new() -> Self {
         Self {
-            slot: AdapterSlot::with_wake_close_work_and_late_egress(
+            slot: AdapterSlot::with_wake_and_close_work(
                 AdapterWake::new(),
                 Arc::new(AtomicBool::new(false)),
-                true,
             ),
             aggregate: None,
             aggregate_permit: Mutex::new(None),
             aggregate_blocked: AtomicBool::new(false),
             test_forced_would_block: AtomicBool::new(false),
+            late_egress: Mutex::new(None),
         }
     }
 
@@ -71,6 +72,7 @@ impl WebRtcTerminalAdapterInner {
 
     fn close_from_host(&self) {
         self.release_aggregate_permit();
+        self.park_late_egress();
         self.slot.close_from_host();
     }
 
@@ -81,7 +83,28 @@ impl WebRtcTerminalAdapterInner {
 
     fn close(&self) {
         self.release_aggregate_permit();
+        self.park_late_egress();
         self.slot.close();
+    }
+
+    fn park_late_egress(&self) {
+        let Some(bytes) = self.slot.snapshot_active() else {
+            return;
+        };
+        let mut late = self
+            .late_egress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if late.is_none() {
+            *late = Some(bytes);
+        }
+    }
+
+    fn take_late_egress(&self) -> Option<Vec<u8>> {
+        self.late_egress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 
     fn set_would_block(&self, pressured: bool) {
@@ -211,11 +234,12 @@ impl WebRtcTerminalAdapter {
         aggregate: Option<Arc<crate::admission::connection_budget::ConnectionAggregate>>,
     ) -> (Self, WebRtcTerminalAdapterHandle) {
         let inner = Arc::new(WebRtcTerminalAdapterInner {
-            slot: AdapterSlot::with_wake_close_work_and_late_egress(wake, close_work, true),
+            slot: AdapterSlot::with_wake_and_close_work(wake, close_work),
             aggregate,
             aggregate_permit: Mutex::new(None),
             aggregate_blocked: AtomicBool::new(false),
             test_forced_would_block: AtomicBool::new(false),
+            late_egress: Mutex::new(None),
         });
         (
             Self {
@@ -656,7 +680,7 @@ impl WebRtcTerminalAdapterHandle {
     }
 
     pub(crate) fn take_late_egress(&self) -> Option<Vec<u8>> {
-        self.inner.slot.take_late_egress()
+        self.inner.take_late_egress()
     }
 
     pub(crate) fn resize_aggregate_permit(&self, frame_len: usize) -> bool {

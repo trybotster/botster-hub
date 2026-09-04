@@ -25,20 +25,10 @@ pub(crate) struct AdapterSlot<W: WakeSink> {
     core_sink: Mutex<Option<TerminalWakeSink>>,
     closed_woke: AtomicBool,
     ingress: IngressBuffer,
-    late_egress: Mutex<Option<Vec<u8>>>,
-    late_egress_enabled: bool,
 }
 
 impl<W: WakeSink> AdapterSlot<W> {
     pub(crate) fn with_wake_and_close_work(wake: W, close_work: Arc<AtomicBool>) -> Self {
-        Self::with_wake_close_work_and_late_egress(wake, close_work, false)
-    }
-
-    pub(crate) fn with_wake_close_work_and_late_egress(
-        wake: W,
-        close_work: Arc<AtomicBool>,
-        late_egress_enabled: bool,
-    ) -> Self {
         Self {
             cause: CloseCause::new(),
             would_block: AtomicBool::new(false),
@@ -49,8 +39,6 @@ impl<W: WakeSink> AdapterSlot<W> {
             core_sink: Mutex::new(None),
             closed_woke: AtomicBool::new(false),
             ingress: IngressBuffer::new(),
-            late_egress: Mutex::new(None),
-            late_egress_enabled,
         }
     }
 
@@ -84,17 +72,13 @@ impl<W: WakeSink> AdapterSlot<W> {
         self.cause.close();
         self.close_work.store(true, Ordering::SeqCst);
         self.ingress.clear();
-        if self.late_egress_enabled {
-            self.park_occupied_into_late_egress();
-        } else {
-            match self.slot.try_lock() {
-                Ok(mut slot) => {
-                    *slot = None;
-                }
-                Err(TryLockError::WouldBlock) => {}
-                Err(TryLockError::Poisoned(poisoned)) => {
-                    *poisoned.into_inner() = None;
-                }
+        match self.slot.try_lock() {
+            Ok(mut slot) => {
+                *slot = None;
+            }
+            Err(TryLockError::WouldBlock) => {}
+            Err(TryLockError::Poisoned(poisoned)) => {
+                *poisoned.into_inner() = None;
             }
         }
         self.emit_closed();
@@ -277,35 +261,13 @@ impl<W: WakeSink> AdapterSlot<W> {
         }
     }
 
-    fn park_occupied_into_late_egress(&self) {
-        let occupied = match self.slot.try_lock() {
-            Ok(mut slot) => slot.take(),
-            Err(TryLockError::WouldBlock) => None,
-            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner().take(),
-        };
-        let Some(bytes) = occupied else {
-            return;
-        };
-        let mut late = self
-            .late_egress
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if late.is_none() {
-            *late = Some(bytes);
-        }
-    }
-
     pub(crate) fn snapshot_active(&self) -> Option<Vec<u8>> {
         if self.is_closed() {
-            if self.late_egress_enabled {
-                self.park_occupied_into_late_egress();
-            } else {
-                match self.slot.try_lock() {
-                    Ok(mut slot) => *slot = None,
-                    Err(TryLockError::WouldBlock) => {}
-                    Err(TryLockError::Poisoned(poisoned)) => {
-                        *poisoned.into_inner() = None;
-                    }
+            match self.slot.try_lock() {
+                Ok(mut slot) => *slot = None,
+                Err(TryLockError::WouldBlock) => {}
+                Err(TryLockError::Poisoned(poisoned)) => {
+                    *poisoned.into_inner() = None;
                 }
             }
             return None;
@@ -313,10 +275,6 @@ impl<W: WakeSink> AdapterSlot<W> {
         match self.slot.try_lock() {
             Ok(slot) => {
                 if self.is_closed() {
-                    drop(slot);
-                    if self.late_egress_enabled {
-                        self.park_occupied_into_late_egress();
-                    }
                     return None;
                 }
                 slot.clone()
@@ -327,22 +285,13 @@ impl<W: WakeSink> AdapterSlot<W> {
 
     pub(crate) fn complete_active(&self) -> Option<Vec<u8>> {
         if self.is_closed() {
-            if self.late_egress_enabled {
-                self.park_occupied_into_late_egress();
-            }
             return None;
         }
         let taken = match self.slot.try_lock() {
             Ok(mut slot) => {
                 if self.is_closed() {
-                    if self.late_egress_enabled {
-                        drop(slot);
-                        self.park_occupied_into_late_egress();
-                        None
-                    } else {
-                        *slot = None;
-                        None
-                    }
+                    *slot = None;
+                    None
                 } else {
                     slot.take()
                 }
@@ -354,13 +303,6 @@ impl<W: WakeSink> AdapterSlot<W> {
         }
         self.wake.wake();
         taken
-    }
-
-    pub(crate) fn take_late_egress(&self) -> Option<Vec<u8>> {
-        self.late_egress
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
     }
 }
 
