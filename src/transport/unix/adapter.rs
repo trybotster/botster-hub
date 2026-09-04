@@ -39,6 +39,7 @@ struct UnixTerminalAdapterInner {
     slot: AdapterSlot<AdapterWake>,
     deferred: AtomicBool,
     clear_pressure_after_rejection: AtomicBool,
+    late_egress: Mutex<Option<Vec<u8>>>,
 }
 
 impl UnixTerminalAdapterInner {
@@ -50,6 +51,7 @@ impl UnixTerminalAdapterInner {
             ),
             deferred: AtomicBool::new(false),
             clear_pressure_after_rejection: AtomicBool::new(false),
+            late_egress: Mutex::new(None),
         }
     }
 
@@ -58,6 +60,7 @@ impl UnixTerminalAdapterInner {
     }
 
     fn close_from_host(&self) {
+        self.park_late_egress();
         self.slot.close_from_host();
     }
 
@@ -67,7 +70,35 @@ impl UnixTerminalAdapterInner {
     }
 
     fn close(&self) {
+        self.park_late_egress();
         self.slot.close();
+    }
+
+    fn park_late_egress(&self) {
+        let Some(bytes) = self.slot.snapshot_active() else {
+            return;
+        };
+        let mut late = self
+            .late_egress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if late.is_none() {
+            *late = Some(bytes);
+        }
+    }
+
+    fn peek_late_egress(&self) -> Option<Vec<u8>> {
+        self.late_egress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn take_late_egress(&self) -> Option<Vec<u8>> {
+        self.late_egress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 
     fn pressure(&self) -> TerminalAdapterPressure {
@@ -141,6 +172,7 @@ impl UnixTerminalAdapter {
             slot: AdapterSlot::with_wake_and_close_work(wake, close_work),
             deferred: AtomicBool::new(false),
             clear_pressure_after_rejection: AtomicBool::new(false),
+            late_egress: Mutex::new(None),
         });
         (
             Self {
@@ -468,9 +500,9 @@ impl UnixConnectionMux {
         let Ok(routes) = self.inner.routes.lock() else {
             return false;
         };
-        routes
-            .values()
-            .any(|route| route.handle.snapshot_active().is_some())
+        routes.values().any(|route| {
+            route.handle.snapshot_active().is_some() || route.handle.peek_late_egress().is_some()
+        })
     }
 
     pub(crate) fn has_bound_routes(&self) -> bool {
@@ -512,14 +544,18 @@ impl UnixConnectionMux {
                 if route.handle.is_flush_deferred() {
                     return None;
                 }
-                route.handle.snapshot_active().map(|bytes| {
-                    (
-                        route.session_id.clone(),
-                        route.subscription_id.clone(),
-                        route.handle.clone(),
-                        bytes,
-                    )
-                })
+                route
+                    .handle
+                    .snapshot_active()
+                    .or_else(|| route.handle.peek_late_egress())
+                    .map(|bytes| {
+                        (
+                            route.session_id.clone(),
+                            route.subscription_id.clone(),
+                            route.handle.clone(),
+                            bytes,
+                        )
+                    })
             })
             .collect()
     }
@@ -621,6 +657,14 @@ impl UnixTerminalAdapterHandle {
 
     pub(crate) fn complete_active(&self) -> Option<Vec<u8>> {
         self.inner.complete_active()
+    }
+
+    pub(crate) fn peek_late_egress(&self) -> Option<Vec<u8>> {
+        self.inner.peek_late_egress()
+    }
+
+    pub(crate) fn take_late_egress(&self) -> Option<Vec<u8>> {
+        self.inner.take_late_egress()
     }
 
     pub(crate) fn write_opaque_frame(&self, frame: &botster_terminal_protocol::TerminalFrame) {
