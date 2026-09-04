@@ -12,10 +12,10 @@ Pipeline: `botster_stack_delivery` (direct merge, no PR)
 | Target repository | `botster-hub` (`trybotster/botster-hub`) |
 | Target id | `tgt_7e208a0c76a44980a83b63af976b1f22` |
 | Independent routing | `list_spawn_targets` maps this id to spawn target `botster-hub` |
-| Implement commit | `d3049777fc567c0c0ceee8d72191365f864bff66` |
+| Implement commit | `65b8c70ddbbdef5136fc2ff468b6b9e1304a7ac3` |
 | Branch | `project-pipelines/ticket_1787600679_990088` |
 | Base | `ae6a0b1fe99d97215fa82d796da8f01a904171f0` |
-| `hub_sha` | `d3049777fc567c0c0ceee8d72191365f864bff66` |
+| `hub_sha` | `65b8c70ddbbdef5136fc2ff468b6b9e1304a7ac3` |
 | `locked_core_sha` | `72d1c7571bc229dbb2cbd67aa979b6504ac150a5` |
 | Toolchain | `rustc 1.97.0 (2d8144b78 2026-07-07)`, Zig `0.16.0` |
 | `teardown_class_applies` | yes |
@@ -68,8 +68,10 @@ Later Hub-only test repairs on this branch:
 | `3d1613e` | `tests/hub_daemon_lifecycle/subscription_ownership_baseline.rs` | Keep draining WebRTC bytes after ListSessions reports exited |
 | `e2e7787` | `src/transport/webrtc/adapter.rs`, `src/transport/webrtc/subscription_channel.rs` | Restore write-then-exit WebRTC byte-exact. Copy occupied WebRTC bytes on the adapter inner before slot close, then flush them on the subscription channel |
 | `4905534` | `src/transport/unix/adapter.rs`, `src/transport/unix/mux_write.rs` | Copy occupied Unix bytes on close and send them after host events. The mux no longer skips closed handles for that late frame |
+| `77d0445` | `src/transport/unix/mux_write.rs`, `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs` | Flush parked Unix terminal after the host-turn cap. Restore five-second hard stops |
+| `65b8c70` | `src/data_plane/driver.rs`, `src/runtime.rs`, `src/transport/unix/{adapter,connection,mux_write}.rs` | Pump the observed session after exact-session observe. Keep late Unix bytes until that frame is sent. Flush occupied slots before control |
 
-Unchanged production transport, data-plane, subscription, admission, and daemon modules. Inventory found no remaining production old-route symbol.
+Inventory found no remaining production old-route symbol.
 
 Vault capture (outside this repository): inbox `2026-09-03-botster-final-terminal-ownership-boundaries.md`. Review found [[Hub terminal cold cut consumed Core 72d1c75]] overstated shipment; a pending correction is in the vault inbox.
 
@@ -488,6 +490,49 @@ Log `/tmp/botster-hub-matrix-d304977-13.log`. Start and end `MATRIX_BOUNDARY` co
 | web_durable | pass |
 | web_shared | pass first try. `keep_alive_runs=2` `cancel_ablation=true` `exit_pass=true` |
 | web_plugin | pass. Reaped this-worktree IsolatedHub workers `70645`, `70647`, `70651` |
+| tui_ghostty | skipped. `ticket_1788460430_647093` |
+| north_star | skipped. `ticket_1788460430_647093` |
+
+Direct merge, no PR. Timing observations stay waived. Foreign session-workers were not killed.
+
+## Review `review_1788514476_724417` return
+
+Review sent Implement back with one high finding: widening two Unix `process_exit` waits to 15s did not repair attached delivery. Isolated `unix_shutdown_session_from_another_connection_classifies_attached_exit` still missed `process_exit` after attaching, `terminal_output`, and attached.
+
+### `finding_1788514476_587313`
+
+The original five-second hard stops are restored (`77d0445`). Remaining host events no longer skip parked late terminal in the same flush turn.
+
+Production repair `65b8c70`:
+
+1. Exact-session observe can queue `process_exit` on a Ready bound adapter without a later writable or ingress wake. `HubRuntime::observe_session_lifecycle` now uses `CoreDaemonHandle::call_then_pump_session`, which calls `pump_woken` for that session on the data-plane thread before the driver waits again.
+2. Unix mux `take_late_egress` runs only after a late frame is sent. Completing a live output frame no longer drops a `process_exit` parked during that send. Oracle: `live_output_completion_does_not_take_parked_process_exit`.
+3. Occupied Unix slots flush before a control round-trip, so Drain cannot hold the slot Full across Core observe.
+
+Rejected occupancy-at-snapshot (`ff4efe9`, reverted `cf2e858`): completing the slot before a zero-offset abandon violates Full-on-abandon and made IsolatedHub printf worse.
+
+Isolated at `65b8c70`, load averages about `3/3/3`:
+
+| Test | Result |
+| --- | --- |
+| `unix_shutdown_session_from_another_connection_classifies_attached_exit` | 8/8 pass |
+| `unix_adapter_bound_printf_stream_attach_delivers_process_exit` | 8/8 pass |
+
+### Complete matrix at `65b8c70`
+
+Log `/tmp/botster-hub-matrix-65b8c70.log`. Start and end `MATRIX_BOUNDARY` commit `65b8c70ddbbdef5136fc2ff468b6b9e1304a7ac3` dirty `0`. No component retries. TUI ghostty and north-star `ghostty-shared` skipped per `question_1788503817_293195`.
+
+| Arm | Result |
+| --- | --- |
+| fmt | pass |
+| clippy | pass |
+| locked | pass first try. Lib `554`. Lifecycle `346/0/2`. `live_output_completion_does_not_take_parked_process_exit` ok. `unix_adapter_bound_printf_stream_attach_delivers_process_exit` ok. `unix_shutdown_session_from_another_connection_classifies_attached_exit` ok |
+| hub_ts | pass |
+| web_unit | pass |
+| web_live | pass |
+| web_durable | pass |
+| web_shared | pass first try. `keep_alive_runs=2` `cancel_ablation=true` `exit_pass=true` |
+| web_plugin | pass. Reaped this-worktree IsolatedHub workers `56241`, `56243`, `56247` |
 | tui_ghostty | skipped. `ticket_1788460430_647093` |
 | north_star | skipped. `ticket_1788460430_647093` |
 
