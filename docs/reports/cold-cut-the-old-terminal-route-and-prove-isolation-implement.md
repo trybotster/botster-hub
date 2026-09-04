@@ -12,10 +12,10 @@ Pipeline: `botster_stack_delivery` (direct merge, no PR)
 | Target repository | `botster-hub` (`trybotster/botster-hub`) |
 | Target id | `tgt_7e208a0c76a44980a83b63af976b1f22` |
 | Independent routing | `list_spawn_targets` maps this id to spawn target `botster-hub` |
-| Implement commit | `4905534a10cd607f5f319819b7c20e1ed73bc562` |
+| Implement commit | `43d080e1b2fc601b1272a5822c5cc05967ef14b5` |
 | Branch | `project-pipelines/ticket_1787600679_990088` |
 | Base | `ae6a0b1fe99d97215fa82d796da8f01a904171f0` |
-| `hub_sha` | `4905534a10cd607f5f319819b7c20e1ed73bc562` |
+| `hub_sha` | `43d080e1b2fc601b1272a5822c5cc05967ef14b5` |
 | `locked_core_sha` | `72d1c7571bc229dbb2cbd67aa979b6504ac150a5` |
 | Toolchain | `rustc 1.97.0 (2d8144b78 2026-07-07)`, Zig `0.16.0` |
 | `teardown_class_applies` | yes |
@@ -410,6 +410,56 @@ Human/advisor `question_1788503817_293195`: do not change Hub for this TUI failu
 TUI ghostty acceptance moves to existing pin-roll ticket `ticket_1788460430_647093`. That ticket must diagnose this exact close-evidence failure, keep the wake-driven duplex contract, and require isolated `script/test-live-hub ghostty` plus north-star `ghostty-shared` against the final merged Hub SHA. This is an acceptance ownership correction, not a waiver. Do not add polling or JSON fallback.
 
 This Hub run keeps Hub, Web, Unix, WebRTC, durable-session, WouldBlock, old-route deletion, and ownership gates. North-star TUI `ghostty-shared` waits with the TUI pin-roll ticket.
+
+## Review `review_1788504718_269664` return
+
+Review sent Implement back with two high findings. Hub-only repairs. Core `complete_active` after close stays a no-op.
+
+### `finding_1788504718_843979` late WebRTC bytes and aggregate budget
+
+Close parked occupied bytes after it dropped `aggregate_permit`. `flush_subscription_adapter_frames` treated a missing permit as permitted, so late `local_send_text` was unaccounted.
+
+Repair `6ff7414`:
+
+- Park occupied bytes, then close the slot. Keep the existing permit when bytes are parked.
+- A second close does not release that permit while late egress remains.
+- `resize_aggregate_permit` authorizes wire length when no permit is held.
+- Flush releases the permit only after usage publication.
+- Failed encode or resize restores taken late bytes.
+
+Oracle: `occupied_close_keeps_aggregate_permit_from_a_sibling_write`. A sibling write at the remaining 32-byte gap returns `WouldBlock` while parked bytes still occupy the budget.
+
+### `finding_1788504718_415927` fast-exit ablation
+
+Review removed `park_late_egress` from both close paths. IsolatedHub `webrtc_terminal_output_is_byte_exact` still passed because the driver often flushed before Core close.
+
+Oracle: `flush_after_close_sends_parked_late_egress_under_the_existing_permit`. The test writes, closes, then calls the production flush. Ablation that makes `park_late_egress` return without storing bytes turns this test red (FLUSH_EXIT=101, OCCUPIED_EXIT=101). Restoration turns it green.
+
+An IsolatedHub hold-until-close env seam was tried and removed. It held a trailing PTY frame or lost the payload on session teardown. That unused seam is not in production source.
+
+`43d080e` keeps late flush on the write-wake loop only. An OnClose flush dropped IsolatedHub occupied frames (isolated byte-exact 1/5 red). After the revert, isolated byte-exact was 5/5 green.
+
+Unix helper `a1871eb`: `read_unsolicited_terminal_until` left a 200ms `SO_RCVTIMEO`. The next control read returned `WouldBlock` (`connection_death_and_detach_do_not_emit_terminal_subscription_closed`). The helper now clears the timeout. Isolated 5/5 green after the clear.
+
+### Complete matrix at `43d080e`
+
+Log `/tmp/botster-hub-matrix-43d080e-9.log`. Start and end `MATRIX_BOUNDARY` commit `43d080e1b2fc601b1272a5822c5cc05967ef14b5` dirty `0`. No component retries. TUI ghostty and north-star `ghostty-shared` skipped per `question_1788503817_293195`.
+
+| Arm | Result |
+| --- | --- |
+| fmt | pass |
+| clippy | pass |
+| locked | pass first try. Lib `551`. Lifecycle `346/0/2`. `webrtc_terminal_output_is_byte_exact` ok. `unix_adapter_bound_printf_stream_attach_delivers_process_exit` ok |
+| hub_ts | pass |
+| web_unit | pass |
+| web_live | pass |
+| web_durable | pass |
+| web_shared | pass first try. `keep_alive_runs=2` `cancel_ablation=true` `exit_pass=true` |
+| web_plugin | pass. Reaped this-worktree IsolatedHub workers `83890`, `83892`, `83896` |
+| tui_ghostty | skipped. `ticket_1788460430_647093` |
+| north_star | skipped. `ticket_1788460430_647093` |
+
+Direct merge, no PR. Timing observations stay waived. Foreign session-workers were not killed.
 
 ## Missing vault guidance discovered
 
