@@ -674,7 +674,11 @@ Isolated at `b164ca1`:
 
 Complete matrix `/tmp/botster-hub-matrix-b164ca1.log` failed the locked arm. `subscription::entity::tests::live_session_entity_subscription_emits_exact_stale_transition_patch` failed 5/5 isolated in 4.0s: `worker session shutdown did not complete before the daemon deadline: stale-transition-session`. `mark_session_stale` then `shutdown_session` forgets the session wake because the registry is already Stale and no adapter frames are undelivered. `wait_wakes_bounded` then misses worker EOF. This path passed on Core `72d1c75`.
 
-Registered Core `ticket_1788537020_814817`. Dependency `dependency_1788537029_689954`. Core run `run_1788537030_383590`. Hub stays on `5ed369f`. No compatibility path back to `72d1c75`. Do not request Review until that Core merge, a Hub pin of that revision if it moves, locked suite green, and a clean matrix.
+Registered Core `ticket_1788537020_814817`. Dependency `dependency_1788537029_689954`. Core run `run_1788537030_383590`. Hub stays on `5ed369f`. No compatibility path back to `72d1c75`.
+
+Fable confirmed `ticket_1788537020_814817` is necessary. After that Core merge and the Hub pin, the final matrix must unskip `script/test-live-hub ghostty` and `script/prove-north-star-shared-session`. Both must pass before Hub merge. Do not transfer another Core or Hub close-evidence defect to TUI. Durable TUI pin-roll `ticket_1788460430_647093` remains the consumer Cargo pin after this merge.
+
+Do not request Review until that Core merge, the Hub pin, locked suite green, isolated Unix `process_exit` 8/8, a clean Hub/Web matrix, and both Ghostty and north-star scripts green.
 
 ## Missing vault guidance discovered
 
