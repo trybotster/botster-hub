@@ -801,11 +801,14 @@ async fn flush_subscription_adapter_frames<C>(
 where
     C: LocalWebrtcDataChannel + ?Sized,
 {
-    if handle.is_closed() {
-        return Err(());
-    }
-    let Some(bytes) = handle.snapshot_active() else {
-        return Ok(());
+    let bytes = match handle.snapshot_active() {
+        Some(bytes) => bytes,
+        None => match handle.take_late_egress() {
+            Some(bytes) => bytes,
+            None => {
+                return if handle.is_closed() { Err(()) } else { Ok(()) };
+            }
+        },
     };
     let frames = framed_daemon_terminal_frame(stream_key, &bytes).map_err(|_| ())?;
     let wire_len = frames.iter().map(String::len).sum();
@@ -816,9 +819,8 @@ where
         data_channel.local_send_text(&frame).await.map_err(|_| ())?;
     }
     publish_channel_usage(data_channel, usage).await?;
-    if !handle.is_closed() {
-        let _ = handle.complete_active();
-    }
+    let _ = handle.complete_active();
+    let _ = handle.take_late_egress();
     Ok(())
 }
 
