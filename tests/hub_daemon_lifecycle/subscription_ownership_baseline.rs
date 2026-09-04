@@ -177,7 +177,10 @@ fn webrtc_peer_rejects_a_second_data_channel() {
     let (hub, endpoint, bootstrap) = start_webrtc_adapter_hub_with_env(
         "so-2ch",
         &[
-            ("BOTSTER_HUB_TEST_EXTRA_CHANNEL_CLOSE_MARKER", marker.as_str()),
+            (
+                "BOTSTER_HUB_TEST_EXTRA_CHANNEL_CLOSE_MARKER",
+                marker.as_str(),
+            ),
             (
                 "BOTSTER_HUB_TEST_EXTRA_CHANNEL_OBSERVATION",
                 observation_path.as_str(),
@@ -242,8 +245,7 @@ fn webrtc_peer_rejects_a_second_data_channel() {
             "the second-channel producer must stay held until the reserved route is bound"
         );
         fs::write(&producer_release, b"go").expect("release second-channel producer");
-        wait_for_webrtc_marker(&mut peer, &key, session_id, subscription_id, "so-2ch-ready")
-            .await;
+        wait_for_webrtc_marker(&mut peer, &key, session_id, subscription_id, "so-2ch-ready").await;
         assert_eq!(
             rejected
                 .count_terminal_frames(Duration::from_millis(400))
@@ -274,7 +276,10 @@ fn webrtc_peer_rejects_a_second_data_channel_requires_one_shot_claim() {
         "so-2ch-neg",
         &[
             ("BOTSTER_HUB_TEST_DISABLE_ONE_SHOT_CLAIM", "1"),
-            ("BOTSTER_HUB_TEST_EXTRA_CHANNEL_CLOSE_MARKER", marker.as_str()),
+            (
+                "BOTSTER_HUB_TEST_EXTRA_CHANNEL_CLOSE_MARKER",
+                marker.as_str(),
+            ),
             (
                 "BOTSTER_HUB_TEST_EXTRA_CHANNEL_OBSERVATION",
                 observation_path.as_str(),
@@ -317,7 +322,10 @@ fn webrtc_peer_post_handshake_data_channel_reaches_production_reject() {
     let (hub, endpoint, bootstrap) = start_webrtc_adapter_hub_with_env(
         "so-post-hs",
         &[
-            ("BOTSTER_HUB_TEST_EXTRA_CHANNEL_CLOSE_MARKER", marker.as_str()),
+            (
+                "BOTSTER_HUB_TEST_EXTRA_CHANNEL_CLOSE_MARKER",
+                marker.as_str(),
+            ),
             (
                 "BOTSTER_HUB_TEST_EXTRA_CHANNEL_OBSERVATION",
                 observation_path.as_str(),
@@ -426,7 +434,8 @@ fn webrtc_dedicated_channels_carry_control_entity_event_and_terminal_frames() {
         emit_sample_ready(&endpoint, "so-4cls");
         let entity_deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < entity_deadline && peer.pending_entity_frames.is_empty() {
-            if let Ok(Ok(frame)) = timeout(Duration::from_millis(250), peer.next_entity_frame(&key)).await
+            if let Ok(Ok(frame)) =
+                timeout(Duration::from_millis(250), peer.next_entity_frame(&key)).await
             {
                 peer.pending_entity_frames.push_back(frame);
             }
@@ -440,7 +449,8 @@ fn webrtc_dedicated_channels_carry_control_entity_event_and_terminal_frames() {
                 emit_sample_ready(&endpoint, "so-4cls-retry");
                 reemitted = true;
             }
-            if let Ok(Ok(_)) = timeout(Duration::from_millis(250), peer.next_host_event(&key)).await {
+            if let Ok(Ok(_)) = timeout(Duration::from_millis(250), peer.next_host_event(&key)).await
+            {
                 saw_host_event = true;
             }
         }
@@ -500,6 +510,10 @@ fn pump_woken_lives_only_in_the_data_plane_driver() {
     assert!(
         driver.contains("pump_woken("),
         "the data-plane driver must call Core pump_woken"
+    );
+    assert!(
+        !driver.contains("call_then_pump_session"),
+        "lifecycle observation must not synthesize a data-plane pump"
     );
     for path in [
         "src/daemon/owner_loop.rs",
@@ -1027,7 +1041,8 @@ async fn await_next_webrtc_terminal_frame(
     peer: &mut LocalWebrtcOfferPeer,
     key: &botster_core::AesGcmKey,
 ) {
-    if let Ok(Ok(bytes)) = timeout(Duration::from_millis(200), peer.next_terminal_frame(key)).await {
+    if let Ok(Ok(bytes)) = timeout(Duration::from_millis(200), peer.next_terminal_frame(key)).await
+    {
         peer.pending_terminal_frames
             .push_back((String::new(), bytes));
     }
@@ -1057,14 +1072,7 @@ async fn wait_for_webrtc_producer_ready_frames(
     let mut concatenated = Vec::new();
     let started_at = Instant::now();
     loop {
-        drain_webrtc_live_bytes(
-            peer,
-            key,
-            session_id,
-            subscription_id,
-            &mut concatenated,
-        )
-        .await;
+        drain_webrtc_live_bytes(peer, key, session_id, subscription_id, &mut concatenated).await;
         if String::from_utf8_lossy(&concatenated).contains(PRODUCER_READY_MARKER) {
             return;
         }
@@ -1089,14 +1097,7 @@ async fn collect_expected_webrtc_bytes_or_authoritative_exit(
     let mut concatenated = Vec::new();
     let started_at = Instant::now();
     loop {
-        drain_webrtc_live_bytes(
-            peer,
-            key,
-            session_id,
-            subscription_id,
-            &mut concatenated,
-        )
-        .await;
+        drain_webrtc_live_bytes(peer, key, session_id, subscription_id, &mut concatenated).await;
         if concatenated
             .windows(expected.len())
             .any(|window| window == expected)
@@ -1139,8 +1140,7 @@ fn webrtc_terminal_output_is_byte_exact() {
             &python_script_command(&script_path),
         )
         .await;
-        fs::create_dir_all(start_path.parent().expect("start parent"))
-            .expect("create start dir");
+        fs::create_dir_all(start_path.parent().expect("start parent")).expect("create start dir");
         fs::write(&start_path, b"go").expect("start producer");
         wait_for_webrtc_producer_ready_frames(
             &mut peer,
@@ -1212,23 +1212,9 @@ fn peer_close_leaves_sibling_peers_working() {
             .encrypted_hello(&key_b, &webrtc_baseline_hello())
             .await
             .expect("hello b");
-        spawn_and_bind_webrtc(
-            &mut peer_a,
-            &key_a,
-            session_a,
-            sub_a,
-            &command_a,
-        )
-        .await;
+        spawn_and_bind_webrtc(&mut peer_a, &key_a, session_a, sub_a, &command_a).await;
         fs::write(&gate_a, b"release").expect("release peer A output");
-        spawn_and_bind_webrtc(
-            &mut peer_b,
-            &key_b,
-            session_b,
-            sub_b,
-            &command_b,
-        )
-        .await;
+        spawn_and_bind_webrtc(&mut peer_b, &key_b, session_b, sub_b, &command_b).await;
         fs::write(&gate_b, b"release").expect("release peer B output");
         wait_for_webrtc_marker(&mut peer_a, &key_a, session_a, sub_a, "so-sib-a-ready").await;
         wait_for_webrtc_marker(&mut peer_b, &key_b, session_b, sub_b, "so-sib-b-ready").await;

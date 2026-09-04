@@ -1260,40 +1260,20 @@ fn unix_adapter_bound_printf_stream_attach_delivers_process_exit() {
         primed.events
     );
     fs::write(&release_path, b"go").expect("release held printf");
-    wait_for_authoritative_session_exit(&endpoint, session_id);
-    let exit_deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < exit_deadline {
-        if envelopes
-            .iter()
-            .any(|envelope| unix_envelope_is_process_exit(envelope, session_id, subscription_id))
-        {
-            break;
-        }
-        let drain = request_skipping_envelopes(
-            &mut term_stream,
-            &mut term_reader,
-            &botster_hub_client::DaemonRequest::drain_subscription(session_id, subscription_id),
-            &mut envelopes,
-        );
-        assert!(
-            drain.events.is_empty(),
-            "host Drain must not return terminal bodies: {:?}",
-            drain.events
-        );
-        read_unsolicited_until_process_exit(
-            &mut term_reader,
-            &mut envelopes,
-            session_id,
-            subscription_id,
-            Instant::now() + Duration::from_millis(200),
-        );
-    }
+    read_unsolicited_until_process_exit(
+        &mut term_reader,
+        &mut envelopes,
+        session_id,
+        subscription_id,
+        Instant::now() + Duration::from_secs(5),
+    );
     assert!(
         envelopes
             .iter()
             .any(|envelope| unix_envelope_is_process_exit(envelope, session_id, subscription_id)),
-        "attached terminal subscription must deliver process_exit: {envelopes:?}"
+        "attached terminal subscription must deliver unsolicited process_exit from the Unix writer wake without ReadScreen or ListSessions: {envelopes:?}"
     );
+    wait_for_authoritative_session_exit(&endpoint, session_id);
     assert_host_session_retained(&mut connection, session_id);
     let text =
         wait_for_read_screen_contains(&mut connection, session_id, &format!("smoke:{marker}"));
@@ -2887,38 +2867,20 @@ fn unix_shutdown_session_from_another_connection_classifies_attached_exit() {
         "attached adapter must see live output before process exit: {envelopes:?}"
     );
     fs::write(&exit_release, b"go").expect("release Unix natural-exit process");
-    wait_for_authoritative_session_exit(&endpoint, session_id);
-    let exit_deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < exit_deadline
-        && !envelopes
-            .iter()
-            .any(|envelope| unix_envelope_is_process_exit(envelope, session_id, subscription_id))
-    {
-        let drain = request_skipping_envelopes(
-            &mut stream,
-            &mut reader,
-            &botster_hub_client::DaemonRequest::drain_subscription(session_id, subscription_id),
-            &mut envelopes,
-        );
-        assert!(
-            drain.events.is_empty(),
-            "host Drain must not return terminal bodies: {:?}",
-            drain.events
-        );
-        read_unsolicited_until_process_exit(
-            &mut reader,
-            &mut envelopes,
-            session_id,
-            subscription_id,
-            Instant::now() + Duration::from_millis(200),
-        );
-    }
+    read_unsolicited_until_process_exit(
+        &mut reader,
+        &mut envelopes,
+        session_id,
+        subscription_id,
+        Instant::now() + Duration::from_secs(5),
+    );
     assert!(
         envelopes
             .iter()
             .any(|envelope| unix_envelope_is_process_exit(envelope, session_id, subscription_id)),
-        "attached adapter must see process_exit before ShutdownSession: {envelopes:?}"
+        "attached adapter must see unsolicited process_exit from the Unix writer wake without ReadScreen or ListSessions: {envelopes:?}"
     );
+    wait_for_authoritative_session_exit(&endpoint, session_id);
 
     let shutdown = botster_hub_client::request(
         &endpoint,
