@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use botster_core::contract::terminal_wake::{TerminalWakeBatch, TerminalWakeRoute};
 use botster_core_daemon::{CoreDaemon, CoreDaemonConfig, WakePumpControl, WakePumpWait};
 
 use crate::daemon::control::message::{ControlMessage, ControlSender};
@@ -225,7 +226,7 @@ fn run_loop(
         if pause_data_plane() {
             owner_waiting.store(false, Ordering::Release);
             std::thread::park_timeout(Duration::from_millis(10));
-            run_core_requests(core_daemon, &requests);
+            let _ = run_core_requests(core_daemon, &requests);
             continue;
         }
         owner_waiting.store(true, Ordering::Release);
@@ -264,7 +265,9 @@ fn run_loop(
                 pumped = !batch.adapter_routes.is_empty() || !batch.ingress_sessions.is_empty();
             }
         }
-        run_core_requests(core_daemon, &requests);
+        if run_core_requests(core_daemon, &requests) > 0 {
+            pump_bound_adapter_routes(core_daemon, now_seconds);
+        }
         {
             let close_batch = close_work.take_batch(DATA_PLANE_MAX_CLOSE_KEYS);
             counters
@@ -297,10 +300,33 @@ fn run_loop(
     }
 }
 
-fn run_core_requests(core_daemon: &mut CoreDaemon, requests: &Receiver<CoreRequest>) {
+fn run_core_requests(core_daemon: &mut CoreDaemon, requests: &Receiver<CoreRequest>) -> usize {
+    let mut ran = 0;
     for request in requests.try_iter().take(CORE_REQUESTS_PER_TURN) {
         request(core_daemon);
+        ran += 1;
     }
+    ran
+}
+
+fn pump_bound_adapter_routes(core_daemon: &mut CoreDaemon, now_seconds: u64) {
+    let adapter_routes: Vec<TerminalWakeRoute> = core_daemon
+        .list_terminal_subscriptions()
+        .into_iter()
+        .filter(|row| row.adapter_bound)
+        .map(|row| TerminalWakeRoute {
+            session_id: row.session_id,
+            subscription_id: row.subscription_id,
+        })
+        .collect();
+    if adapter_routes.is_empty() {
+        return;
+    }
+    let batch = TerminalWakeBatch {
+        adapter_routes,
+        ingress_sessions: Vec::new(),
+    };
+    let _ = core_daemon.pump_woken(&batch, now_seconds);
 }
 
 fn current_unix_seconds() -> u64 {
