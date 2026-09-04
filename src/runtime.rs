@@ -3708,7 +3708,9 @@ impl HubRuntime {
     ) -> Result<SessionLifecycleLookup, CoreDaemonError> {
         let session_id = session_id.clone();
         self.core_daemon
-            .call(move |daemon| daemon.observe_session_lifecycle(&session_id, now_seconds))
+            .call_then_pump_session(session_id.clone(), move |daemon| {
+                daemon.observe_session_lifecycle(&session_id, now_seconds)
+            })
     }
 
     /// Exact non-mutating registry state for one session.
