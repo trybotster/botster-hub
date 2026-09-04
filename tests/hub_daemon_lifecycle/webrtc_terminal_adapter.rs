@@ -1083,7 +1083,7 @@ fn webrtc_terminal_adapter_write_budget_emits_core_adapter_closed_while_peer_sta
             drain.events
         );
         eprintln!(
-            "webrtc write-budget provenance hub_bin={} session_worker={} hub_sha={} locked_core=5ed369fc4a536d7cfa99547262561fcea7ef41e5",
+            "webrtc write-budget provenance hub_bin={} session_worker={} hub_sha={} locked_core=93acae3f98adbc21dc981d113c4eb2f31ead4ad0",
             env!("CARGO_BIN_EXE_botster-hub"),
             session_worker_binary_path().display(),
             option_env!("BOTSTER_HUB_GIT_SHA").unwrap_or("worktree")
