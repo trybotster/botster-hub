@@ -224,9 +224,6 @@ pub(crate) async fn flush_unix_mux_writes(
         return Ok(());
     }
     for (session_id, subscription_id, handle, bytes) in mux.snapshot_writes() {
-        if handle.is_closed() {
-            continue;
-        }
         let envelope = botster_hub_client::DaemonUnixTerminalEnvelope::from_frame_bytes(
             session_id,
             subscription_id,
@@ -305,6 +302,7 @@ pub(crate) async fn resume_pending_mux_write(
                 if !handle.is_closed() {
                     let _ = handle.complete_active();
                 }
+                let _ = handle.take_late_egress();
             }
             Ok(MuxWrite::Written)
         }
