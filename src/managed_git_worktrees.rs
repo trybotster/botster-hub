@@ -1126,7 +1126,8 @@ mod tests {
         fs::write(
             &descendant,
             format!(
-                "#!/bin/sh\nsleep 5 &\nprintf '%s\\n' \"$!\" > '{}'\nwait\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$$\" > '{}'\nsleep 30 &\nprintf '%s\\n' \"$!\" > '{}'\nwait\n",
+                descendant_pid_file.display(),
                 descendant_pid_file.display()
             ),
         )
@@ -1140,7 +1141,7 @@ mod tests {
             descendant.as_os_str(),
             None,
             &[],
-            Instant::now() + Duration::from_secs(2),
+            Instant::now() + Duration::from_secs(5),
         )
         .expect_err("descendant Git runner must time out");
         assert_eq!(timeout.kind, "ensure_timed_out");
