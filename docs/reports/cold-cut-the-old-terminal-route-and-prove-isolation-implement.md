@@ -12,10 +12,10 @@ Pipeline: `botster_stack_delivery` (direct merge, no PR)
 | Target repository | `botster-hub` (`trybotster/botster-hub`) |
 | Target id | `tgt_7e208a0c76a44980a83b63af976b1f22` |
 | Independent routing | `list_spawn_targets` maps this id to spawn target `botster-hub` |
-| Implement commit | `d099d43e9d705a7153064b9af75f211757ead5f9` |
+| Implement commit | `4905534a10cd607f5f319819b7c20e1ed73bc562` |
 | Branch | `project-pipelines/ticket_1787600679_990088` |
 | Base | `ae6a0b1fe99d97215fa82d796da8f01a904171f0` |
-| `hub_sha` | `d099d43e9d705a7153064b9af75f211757ead5f9` |
+| `hub_sha` | `4905534a10cd607f5f319819b7c20e1ed73bc562` |
 | `locked_core_sha` | `72d1c7571bc229dbb2cbd67aa979b6504ac150a5` |
 | Toolchain | `rustc 1.97.0 (2d8144b78 2026-07-07)`, Zig `0.16.0` |
 | `teardown_class_applies` | yes |
@@ -66,7 +66,8 @@ Later Hub-only test repairs on this branch:
 | `b52d43c` | `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs` | Wait for ListSessions `lifecycle=exited`, then collect unsolicited mux `process_exit` |
 | `099c74e` | `src/managed_git_worktrees.rs` | Write the Git timeout child's pid before the sleep starts |
 | `3d1613e` | `tests/hub_daemon_lifecycle/subscription_ownership_baseline.rs` | Keep draining WebRTC bytes after ListSessions reports exited |
-| `d099d43` | `tests/hub_daemon_lifecycle/subscription_ownership_baseline.rs` | Hold the byte-exact producer until the payload is observed |
+| `e2e7787` | `src/transport/webrtc/adapter.rs`, `src/transport/webrtc/subscription_channel.rs` | Restore write-then-exit WebRTC byte-exact. Copy occupied WebRTC bytes on the adapter inner before slot close, then flush them on the subscription channel |
+| `4905534` | `src/transport/unix/adapter.rs`, `src/transport/unix/mux_write.rs` | Copy occupied Unix bytes on close and send them after host events. The mux no longer skips closed handles for that late frame |
 
 Unchanged production transport, data-plane, subscription, admission, and daemon modules. Inventory found no remaining production old-route symbol.
 
@@ -374,6 +375,41 @@ Consumer env (`BOTSTER_HUB_BIN`, `BOTSTER_SESSION_WORKER_BIN`, `BOTSTER_WEB_CHEC
 | `script/prove-north-star-shared-session` | pass (`north-star-shared-session-complete`). `ghostty-shared-complete`, `ghostty-shared-exit-complete`. After alt-exit, primary screen showed `NORTH_STAR_HISTORY` |
 
 Web `9e18b10`. TUI scratch `b051c67` with uncommitted path pins. Direct merge, no PR. Timing observations stay waived.
+
+## Review `review_1788495189_656238` return
+
+Review sent Implement back with two high findings.
+
+### `finding_1788495189_353292` fast-exit coverage
+
+`webrtc_terminal_output_is_byte_exact` uses `write_python_start_then_write_script` again. The producer writes the four bytes and exits without waiting for the consumer. The held-producer case remains the sibling WebRTC exact-bytes proof.
+
+Hub copies occupied WebRTC adapter bytes before slot close (`e2e7787`) and flushes them on the subscription channel. Unix copies occupied bytes on close and sends them after host events (`4905534`). Core `complete_active` after close stays a no-op.
+
+`./test.sh --locked` at `4905534` passed on the first try, including `webrtc_terminal_output_is_byte_exact` and `unix_adapter_bound_printf_stream_attach_delivers_process_exit`. Lib `549`. Lifecycle `346/0/2`. Log `/tmp/botster-hub-matrix-4905534-8.log`.
+
+### `finding_1788495189_398466` matrix end-state and TUI ghostty
+
+The `4905534` matrix recorded `git rev-parse HEAD` and `git status --short` at start: commit `4905534a10cd607f5f319819b7c20e1ed73bc562`, dirty `0`. After the Hub and Web arms, the worktree is still that commit and still clean.
+
+| Arm | Result |
+| --- | --- |
+| fmt | pass |
+| clippy | pass |
+| locked | pass first try, including write-then-exit WebRTC and Unix `process_exit` |
+| hub_ts | pass |
+| web_unit | pass |
+| web_live | pass |
+| web_durable | pass. `botster-web-durable-exited-1` through `-5` |
+| web_shared | pass first try. `keep_alive_runs=2` `cancel_ablation=true` `exit_pass=true` |
+| web_plugin | pass. Reaped this-worktree IsolatedHub workers `21963`, `21965`, `21970` |
+| tui_ghostty | fail. `core_adapter_closed evidence=None` after 30s |
+
+Human/advisor `question_1788503817_293195`: do not change Hub for this TUI failure. Do not create another TUI ticket. Isolated `script/test-live-hub ghostty` fails with the same close-evidence miss against Hub `4905534` and Hub `d099d43`. That matched pair does not distinguish the integration Hub change.
+
+TUI ghostty acceptance moves to existing pin-roll ticket `ticket_1788460430_647093`. That ticket must diagnose this exact close-evidence failure, keep the wake-driven duplex contract, and require isolated `script/test-live-hub ghostty` plus north-star `ghostty-shared` against the final merged Hub SHA. This is an acceptance ownership correction, not a waiver. Do not add polling or JSON fallback.
+
+This Hub run keeps Hub, Web, Unix, WebRTC, durable-session, WouldBlock, old-route deletion, and ownership gates. North-star TUI `ghostty-shared` waits with the TUI pin-roll ticket.
 
 ## Missing vault guidance discovered
 
