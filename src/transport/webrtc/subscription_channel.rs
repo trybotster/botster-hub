@@ -500,6 +500,7 @@ async fn run_bound_terminal_channel<C>(
         let _ = publish_channel_usage(data_channel, &usage).await;
         peer_state.mux.refresh_aggregate_pressure();
         tokio::select! {
+            biased;
             _ = handle.wait_for_write() => {}
             inbound = data_channel.local_poll() => {
                 match inbound {
@@ -540,6 +541,13 @@ async fn run_bound_terminal_channel<C>(
                     Some(webrtc::data_channel::DataChannelEvent::OnClose)
                     | Some(webrtc::data_channel::DataChannelEvent::OnError)
                     | None => {
+                        let _ = flush_subscription_adapter_frames(
+                            data_channel,
+                            stream_key,
+                            &handle,
+                            &usage,
+                        )
+                        .await;
                         handle.close();
                         return;
                     }
@@ -801,18 +809,30 @@ async fn flush_subscription_adapter_frames<C>(
 where
     C: LocalWebrtcDataChannel + ?Sized,
 {
-    let bytes = match handle.snapshot_active() {
-        Some(bytes) => bytes,
+    let (bytes, from_late) = match handle.snapshot_active() {
+        Some(bytes) => (bytes, false),
         None => match handle.take_late_egress() {
-            Some(bytes) => bytes,
+            Some(bytes) => (bytes, true),
             None => {
+                handle.release_aggregate_permit();
                 return if handle.is_closed() { Err(()) } else { Ok(()) };
             }
         },
     };
-    let frames = framed_daemon_terminal_frame(stream_key, &bytes).map_err(|_| ())?;
+    let frames = match framed_daemon_terminal_frame(stream_key, &bytes) {
+        Ok(frames) => frames,
+        Err(_) => {
+            if from_late {
+                handle.restore_late_egress(bytes);
+            }
+            return Err(());
+        }
+    };
     let wire_len = frames.iter().map(String::len).sum();
     if !handle.resize_aggregate_permit(wire_len) {
+        if from_late {
+            handle.restore_late_egress(bytes);
+        }
         return Err(());
     }
     for frame in frames {
@@ -821,6 +841,7 @@ where
     publish_channel_usage(data_channel, usage).await?;
     let _ = handle.complete_active();
     let _ = handle.take_late_egress();
+    handle.release_aggregate_permit();
     Ok(())
 }
 
@@ -957,6 +978,50 @@ mod tests {
     #[test]
     fn terminal_ingress_failure_bounds_a_hanging_subscription_close() {
         run_hanging_close_error_path(&FakeDataChannel::default(), false);
+    }
+
+    #[test]
+    fn flush_after_close_sends_parked_late_egress_under_the_existing_permit() {
+        use crate::admission::connection_budget::{ChannelClass, ConnectionBudget};
+        use botster_core::contract::terminal_adapter::TerminalAdapter;
+        use botster_terminal_protocol::TerminalFrame;
+
+        let mut budget = ConnectionBudget::default();
+        let usage = budget
+            .reserve("route".to_string(), ChannelClass::Terminal)
+            .expect("reserve terminal route");
+        let mux = WebRtcConnectionMux::new();
+        let (mut adapter, handle) = mux.create_adapter_with_aggregate(budget.aggregate());
+        mux.register("late".into(), "terminal".into(), 1, handle.clone());
+        let frame = TerminalFrame::from_bytes(br#"{"type":"terminal_output","marker":"late"}"#)
+            .expect("opaque frame");
+        assert_eq!(adapter.try_write(&frame), Ok(()));
+        let authorized_before_close = budget.aggregate_buffered();
+        assert!(authorized_before_close > 0);
+        handle.close();
+        assert!(handle.snapshot_active().is_none());
+        assert_eq!(budget.aggregate_buffered(), authorized_before_close);
+        let channel = FakeDataChannel::default();
+        let key = AesGcmKey::from_slice(&[7; 32]).expect("test key");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("flush runtime");
+        runtime
+            .block_on(flush_subscription_adapter_frames(
+                &channel, &key, &handle, &usage,
+            ))
+            .expect("flush parked late egress");
+        assert!(
+            !channel.sent.lock().expect("sent frames").is_empty(),
+            "production flush must send parked late bytes after close"
+        );
+        assert_eq!(
+            budget.aggregate_buffered(),
+            usage.load(Ordering::Acquire),
+            "usage publication must replace the close-time permit"
+        );
+        assert!(handle.take_late_egress().is_none());
     }
 
     fn initial_usage_blocks_first_payload(
