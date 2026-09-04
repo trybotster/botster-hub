@@ -6,8 +6,6 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use botster_core::SessionId;
-use botster_core::contract::terminal_wake::TerminalWakeBatch;
 use botster_core_daemon::{CoreDaemon, CoreDaemonConfig, WakePumpControl, WakePumpWait};
 
 use crate::daemon::control::message::{ControlMessage, ControlSender};
@@ -84,26 +82,6 @@ impl CoreDaemonHandle {
         }
         drop(_admission);
         completed_rx.recv().expect("Core owner request completion")
-    }
-
-    /// Run a Core operation, then pump adapters on that session.
-    ///
-    /// Control-plane observe can queue `process_exit` without a later wake.
-    /// The data-plane driver must try_write those frames before it waits again.
-    pub(crate) fn call_then_pump_session<T, F>(&self, session_id: SessionId, operation: F) -> T
-    where
-        T: Send + 'static,
-        F: FnOnce(&mut CoreDaemon) -> T + Send + 'static,
-    {
-        self.call(move |daemon| {
-            let result = operation(daemon);
-            let batch = TerminalWakeBatch {
-                adapter_routes: Vec::new(),
-                ingress_sessions: vec![session_id],
-            };
-            let _ = daemon.pump_woken(&batch, current_unix_seconds());
-            result
-        })
     }
 }
 
