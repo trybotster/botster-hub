@@ -744,7 +744,8 @@ pub enum HubClientRequest {
         subscription_id: SubscriptionId,
         now_seconds: u64,
     },
-    /// Drain runtime output for one session through the core subscription path.
+    /// Host-only runtime drain. Returns empty events. Terminal bytes travel on
+    /// the bound Unix or WebRTC adapter, not through this request.
     DrainRuntime {
         request_id: RequestId,
         session_id: SessionId,

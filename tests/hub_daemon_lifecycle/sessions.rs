@@ -2955,9 +2955,10 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
                 .expect("clone pressure-fixture response reader"),
         );
         flood_readers.push(thread::spawn(move || {
+            let mut incomplete = String::new();
             for _ in 0..FLOOD_REQUESTS_PER_CONNECTION {
                 let _: botster_hub_client::DaemonResponse =
-                    botster_hub_client::read_frame_from_reader(&mut reader)
+                    botster_hub_client::read_frame_from_reader(&mut reader, &mut incomplete)
                         .expect("drain pipelined status response");
             }
         }));

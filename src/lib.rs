@@ -1272,6 +1272,10 @@ mod tests {
             !readme.contains("attach/drain"),
             "README must not claim attach/drain history as the terminal path"
         );
+        assert!(
+            !readme.contains("`DrainRuntime` calls over the session-backed"),
+            "README must not claim DrainRuntime as terminal egress"
+        );
         let test_support = production_source(include_str!(
             "../crates/botster-hub-test-support/src/lib.rs"
         ));

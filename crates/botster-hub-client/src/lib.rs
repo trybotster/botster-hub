@@ -156,6 +156,7 @@ pub struct DaemonConnection {
     skipped_terminal: Vec<DaemonUnixTerminalEnvelope>,
     skipped_events: Vec<DaemonEvent>,
     required_features: Vec<String>,
+    incomplete_line: String,
 }
 
 impl DaemonConnection {
@@ -190,6 +191,7 @@ impl DaemonConnection {
             skipped_terminal: Vec::new(),
             skipped_events: Vec::new(),
             required_features: requirement.required_features.clone(),
+            incomplete_line: String::new(),
         })
     }
 
@@ -239,6 +241,7 @@ impl DaemonConnection {
         write_frame(&mut self.stream, request)?;
         read_daemon_response_collecting(
             &mut self.reader,
+            &mut self.incomplete_line,
             &mut self.skipped_terminal,
             &mut self.skipped_events,
         )
@@ -285,7 +288,7 @@ impl DaemonConnection {
             return Ok(self.skipped_events.remove(0));
         }
         loop {
-            let value = read_value_frame_from_reader(&mut self.reader)?;
+            let value = read_value_frame_from_reader(&mut self.reader, &mut self.incomplete_line)?;
             if status_missing_compatibility(&value) {
                 return Err(precompatibility_hub_error());
             }
@@ -310,7 +313,7 @@ impl DaemonConnection {
             return Ok(self.skipped_terminal.remove(0));
         }
         loop {
-            let value = read_value_frame_from_reader(&mut self.reader)?;
+            let value = read_value_frame_from_reader(&mut self.reader, &mut self.incomplete_line)?;
             if status_missing_compatibility(&value) {
                 return Err(precompatibility_hub_error());
             }
@@ -329,6 +332,7 @@ impl DaemonConnection {
     /// Receive the next unsolicited terminal envelope, or `None` when `timeout` elapses.
     ///
     /// Does not write a control request. Restores the previous socket read timeout.
+    /// A timeout keeps any partial mux line for the next read.
     pub fn poll_terminal(
         &mut self,
         timeout: Duration,
@@ -370,6 +374,7 @@ pub struct DaemonEntitySubscription {
     stream: UnixStream,
     reader: BufReader<UnixStream>,
     subscription_id: String,
+    incomplete_line: String,
 }
 
 impl DaemonEntitySubscription {
@@ -382,7 +387,7 @@ impl DaemonEntitySubscription {
 
     /// Read the next authoritative snapshot or ordered entity delta.
     pub fn next_frame(&mut self) -> DaemonTransportResult<DaemonEntityFrame> {
-        read_frame_from_reader(&mut self.reader)
+        read_frame_from_reader(&mut self.reader, &mut self.incomplete_line)
     }
 
     /// Explicitly end this connection-owned subscription.
@@ -394,7 +399,7 @@ impl DaemonEntitySubscription {
             },
         )?;
         loop {
-            let value = read_value_frame_from_reader(&mut self.reader)?;
+            let value = read_value_frame_from_reader(&mut self.reader, &mut self.incomplete_line)?;
             if value.get("kind").is_none() {
                 let _: DaemonEntityFrame =
                     serde_json::from_value(value).map_err(DaemonTransportError::Json)?;
@@ -447,6 +452,7 @@ pub fn subscribe_entities(
         stream,
         reader,
         subscription_id,
+        incomplete_line: String::new(),
     })
 }
 
@@ -603,31 +609,36 @@ pub fn read_frame<T: for<'de> Deserialize<'de>>(
     stream: &mut UnixStream,
 ) -> DaemonTransportResult<T> {
     let mut reader = BufReader::new(stream.try_clone().map_err(normalize_socket_io_error)?);
-    read_frame_from_reader(&mut reader)
+    let mut incomplete = String::new();
+    read_frame_from_reader(&mut reader, &mut incomplete)
 }
 
 pub fn read_frame_from_reader<T: for<'de> Deserialize<'de>>(
     reader: &mut BufReader<UnixStream>,
+    incomplete: &mut String,
 ) -> DaemonTransportResult<T> {
-    let line = read_frame_line(reader)?;
+    let line = read_frame_line(reader, incomplete)?;
     serde_json::from_str(&line).map_err(DaemonTransportError::Json)
 }
 
-fn read_frame_line(reader: &mut BufReader<UnixStream>) -> DaemonTransportResult<String> {
-    let mut line = String::new();
-    let bytes = reader
-        .read_line(&mut line)
-        .map_err(normalize_socket_io_error)?;
-    if bytes == 0 {
-        return Err(DaemonTransportError::ClientDisconnected);
+fn read_frame_line(
+    reader: &mut BufReader<UnixStream>,
+    incomplete: &mut String,
+) -> DaemonTransportResult<String> {
+    match reader.read_line(incomplete) {
+        Ok(0) if incomplete.is_empty() => Err(DaemonTransportError::ClientDisconnected),
+        Ok(0) => Err(DaemonTransportError::Protocol("truncated mux line")),
+        Ok(_) if incomplete.ends_with('\n') => Ok(std::mem::take(incomplete)),
+        Ok(_) => Err(DaemonTransportError::Protocol("truncated mux line")),
+        Err(error) => Err(normalize_socket_io_error(error)),
     }
-    Ok(line)
 }
 
 fn read_value_frame_from_reader(
     reader: &mut BufReader<UnixStream>,
+    incomplete: &mut String,
 ) -> DaemonTransportResult<Value> {
-    let line = read_frame_line(reader)?;
+    let line = read_frame_line(reader, incomplete)?;
     serde_json::from_str(&line).map_err(DaemonTransportError::Json)
 }
 
@@ -635,13 +646,15 @@ fn read_value_frame_from_reader(
 pub fn read_unix_mux_frame_from_reader(
     reader: &mut BufReader<UnixStream>,
 ) -> DaemonTransportResult<DaemonUnixMuxFrame> {
-    let value = read_value_frame_from_reader(reader)?;
+    let mut incomplete = String::new();
+    let value = read_value_frame_from_reader(reader, &mut incomplete)?;
     parse_unix_mux_value(value).map_err(DaemonTransportError::Json)
 }
 
 fn read_hello_ack(stream: &mut UnixStream) -> DaemonTransportResult<DaemonHelloAck> {
     let mut reader = BufReader::new(stream.try_clone().map_err(normalize_socket_io_error)?);
-    let value = read_value_frame_from_reader(&mut reader)?;
+    let mut incomplete = String::new();
+    let value = read_value_frame_from_reader(&mut reader, &mut incomplete)?;
     if hello_ack_missing_compatibility(&value) {
         return Err(precompatibility_hub_error());
     }
@@ -658,16 +671,18 @@ fn read_daemon_response_from_reader(
 ) -> DaemonTransportResult<DaemonResponse> {
     let mut terminals = Vec::new();
     let mut events = Vec::new();
-    read_daemon_response_collecting(reader, &mut terminals, &mut events)
+    let mut incomplete = String::new();
+    read_daemon_response_collecting(reader, &mut incomplete, &mut terminals, &mut events)
 }
 
 fn read_daemon_response_collecting(
     reader: &mut BufReader<UnixStream>,
+    incomplete: &mut String,
     terminals: &mut Vec<DaemonUnixTerminalEnvelope>,
     events: &mut Vec<DaemonEvent>,
 ) -> DaemonTransportResult<DaemonResponse> {
     loop {
-        let value = read_value_frame_from_reader(reader)?;
+        let value = read_value_frame_from_reader(reader, incomplete)?;
         if status_missing_compatibility(&value) {
             return Err(precompatibility_hub_error());
         }
@@ -3940,6 +3955,7 @@ mod tests {
             skipped_terminal: Vec::new(),
             skipped_events: Vec::new(),
             required_features: vec![FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS.to_string()],
+            incomplete_line: String::new(),
         };
         match connection.next_event().expect("next event") {
             DaemonEvent::PackageEvent {
