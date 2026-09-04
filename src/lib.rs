@@ -1273,8 +1273,21 @@ mod tests {
             "README must not claim attach/drain history as the terminal path"
         );
         assert!(
-            !readme.contains("`DrainRuntime` calls over the session-backed"),
-            "README must not claim DrainRuntime as terminal egress"
+            !readme.contains("DrainRuntime"),
+            "README must not name the deleted DrainRuntime interface"
+        );
+        assert!(
+            !readme.contains("input, and resize requests are"),
+            "README must not describe live input or resize as control-plane requests"
+        );
+        let client_api = production_source(include_str!("client_api.rs"));
+        assert!(
+            !client_api.contains("HubClientRequest::DrainRuntime"),
+            "HubClientRequest must not expose DrainRuntime"
+        );
+        assert!(
+            !client_api.contains("HubClientOperation::DrainRuntime"),
+            "HubClientOperation must not expose DrainRuntime"
         );
         let test_support = production_source(include_str!(
             "../crates/botster-hub-test-support/src/lib.rs"

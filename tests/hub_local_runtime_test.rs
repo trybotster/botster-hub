@@ -369,25 +369,6 @@ fn drain_until(
                 max_elapsed: Duration::from_millis(20),
             },
         );
-        let drain = api
-            .handle_request(
-                runtime,
-                packages,
-                HubClientRequest::DrainRuntime {
-                    request_id: request_id("runtime-drain"),
-                    session_id: session_id.clone(),
-                    last_output_at: *logical_clock,
-                },
-            )
-            .expect("host DrainRuntime");
-        *logical_clock += 1;
-        let HubClientResponseBody::Events(events) = drain.body else {
-            panic!("drain should return events");
-        };
-        assert!(
-            events.is_empty(),
-            "DrainRuntime must not return terminal bodies: {events:?}"
-        );
         let response = api
             .handle_request(
                 runtime,

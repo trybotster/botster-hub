@@ -820,11 +820,13 @@ fn attach_ready_precedes_history_finish() {
         "Hub must advertise the ready_then_history split"
     );
     let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
+    let mut incomplete = String::new();
     let mut envelopes = Vec::new();
     let mut events = Vec::new();
     spawn_and_bind(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         "so-rth-session",
         "so-rth-sub",
         "printf 'so-rth-ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
@@ -869,6 +871,7 @@ fn attach_ready_precedes_history_finish() {
         let drain = request_collecting_mux(
             &mut stream,
             &mut reader,
+            &mut incomplete,
             &botster_hub_client::DaemonRequest::Status,
             &mut envelopes,
             &mut events,
@@ -911,11 +914,13 @@ fn shutdown_suppresses_exact_route_generations_before_core_teardown() {
         .expect("unix+occupancy hello");
     let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
     let mut stream = stream;
+    let mut incomplete = String::new();
     let mut envelopes = Vec::new();
     let mut events = Vec::new();
     spawn_and_bind(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         "so-sup-session",
         "so-sup-sub",
         "sleep 30",
@@ -925,6 +930,7 @@ fn shutdown_suppresses_exact_route_generations_before_core_teardown() {
     let before = request_collecting_mux(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::Status,
         &mut envelopes,
         &mut events,
@@ -942,6 +948,7 @@ fn shutdown_suppresses_exact_route_generations_before_core_teardown() {
     let shutdown = request_collecting_mux(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::ShutdownSession {
             session_id: "so-sup-session".to_string(),
         },
@@ -957,6 +964,7 @@ fn shutdown_suppresses_exact_route_generations_before_core_teardown() {
     let _after = request_collecting_mux(
         &mut stream,
         &mut reader,
+        &mut incomplete,
         &botster_hub_client::DaemonRequest::Status,
         &mut envelopes,
         &mut events,

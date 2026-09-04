@@ -1535,12 +1535,13 @@ fn one_session_unix_and_webrtc_dual_attach_exposes_hub_occupancy() {
     let session_id = "nsd-session";
     let unix_sub = "nsd-unix";
     let webrtc_sub = "nsd-webrtc";
-    let (mut unix, mut unix_reader) = unix_adapter_connection(&endpoint);
+    let (mut unix, mut unix_reader, mut unix_incomplete) = unix_adapter_connection(&endpoint);
     let mut unix_envelopes = Vec::new();
 
     let spawned = request_skipping_envelopes(
         &mut unix,
         &mut unix_reader,
+        &mut unix_incomplete,
         &botster_hub_client::DaemonRequest::Spawn {
             session_id: session_id.to_string(),
             command: "while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done".to_string(),
@@ -1554,6 +1555,7 @@ fn one_session_unix_and_webrtc_dual_attach_exposes_hub_occupancy() {
     let unix_attach = request_skipping_envelopes(
         &mut unix,
         &mut unix_reader,
+        &mut unix_incomplete,
         &botster_hub_client::DaemonRequest::Attach {
             session_id: session_id.to_string(),
             subscription_id: unix_sub.to_string(),
@@ -1582,7 +1584,7 @@ fn one_session_unix_and_webrtc_dual_attach_exposes_hub_occupancy() {
             .expect("webrtc attach");
         bind_reserved_from_attach(&mut peer, &key, &webrtc_attach, session_id, webrtc_sub).await;
 
-        let occupied = sibling_status(&mut unix, &mut unix_reader, &mut unix_envelopes);
+        let occupied = sibling_status(&mut unix, &mut unix_reader, &mut unix_incomplete, &mut unix_envelopes);
         assert!(
             occupied
                 .compatibility
@@ -1607,7 +1609,7 @@ fn one_session_unix_and_webrtc_dual_attach_exposes_hub_occupancy() {
     });
 
     let deadline = Instant::now() + Duration::from_secs(15);
-    let mut after = sibling_status(&mut unix, &mut unix_reader, &mut unix_envelopes);
+    let mut after = sibling_status(&mut unix, &mut unix_reader, &mut unix_incomplete, &mut unix_envelopes);
     while Instant::now() < deadline {
         if !occupancy_has_pair(&after.live_attach_occupancy, session_id, webrtc_sub)
             && occupancy_has_pair(&after.live_attach_occupancy, session_id, unix_sub)
@@ -1615,7 +1617,7 @@ fn one_session_unix_and_webrtc_dual_attach_exposes_hub_occupancy() {
             break;
         }
         thread::sleep(Duration::from_millis(20));
-        after = sibling_status(&mut unix, &mut unix_reader, &mut unix_envelopes);
+        after = sibling_status(&mut unix, &mut unix_reader, &mut unix_incomplete, &mut unix_envelopes);
     }
     assert!(
         !occupancy_has_pair(&after.live_attach_occupancy, session_id, webrtc_sub),
@@ -1637,6 +1639,7 @@ fn one_session_unix_and_webrtc_dual_attach_exposes_hub_occupancy() {
     let listed = request_skipping_envelopes(
         &mut unix,
         &mut unix_reader,
+        &mut unix_incomplete,
         &botster_hub_client::DaemonRequest::ListSessions,
         &mut unix_envelopes,
     );
