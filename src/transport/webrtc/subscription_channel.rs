@@ -500,7 +500,6 @@ async fn run_bound_terminal_channel<C>(
         let _ = publish_channel_usage(data_channel, &usage).await;
         peer_state.mux.refresh_aggregate_pressure();
         tokio::select! {
-            biased;
             _ = handle.wait_for_write() => {}
             inbound = data_channel.local_poll() => {
                 match inbound {
@@ -541,13 +540,6 @@ async fn run_bound_terminal_channel<C>(
                     Some(webrtc::data_channel::DataChannelEvent::OnClose)
                     | Some(webrtc::data_channel::DataChannelEvent::OnError)
                     | None => {
-                        let _ = flush_subscription_adapter_frames(
-                            data_channel,
-                            stream_key,
-                            &handle,
-                            &usage,
-                        )
-                        .await;
                         handle.close();
                         return;
                     }
