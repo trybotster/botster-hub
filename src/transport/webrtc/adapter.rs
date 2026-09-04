@@ -654,10 +654,6 @@ impl WebRtcTerminalAdapterHandle {
         self.inner.complete_active()
     }
 
-    pub(crate) fn peek_late_egress(&self) -> Option<Vec<u8>> {
-        self.inner.slot.peek_late_egress()
-    }
-
     pub(crate) fn take_late_egress(&self) -> Option<Vec<u8>> {
         self.inner.slot.take_late_egress()
     }
