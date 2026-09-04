@@ -111,10 +111,7 @@ impl UnixTerminalAdapterInner {
         self.slot.complete_active()
     }
 
-    fn peek_late_egress(&self) -> Option<Vec<u8>> {
-        self.slot.peek_late_egress()
-    }
-
+    #[cfg(test)]
     fn take_late_egress(&self) -> Option<Vec<u8>> {
         self.slot.take_late_egress()
     }
@@ -476,9 +473,9 @@ impl UnixConnectionMux {
         let Ok(routes) = self.inner.routes.lock() else {
             return false;
         };
-        routes.values().any(|route| {
-            route.handle.snapshot_active().is_some() || route.handle.peek_late_egress().is_some()
-        })
+        routes
+            .values()
+            .any(|route| route.handle.snapshot_active().is_some())
     }
 
     pub(crate) fn has_bound_routes(&self) -> bool {
@@ -520,18 +517,14 @@ impl UnixConnectionMux {
                 if route.handle.is_flush_deferred() {
                     return None;
                 }
-                route
-                    .handle
-                    .snapshot_active()
-                    .or_else(|| route.handle.peek_late_egress())
-                    .map(|bytes| {
-                        (
-                            route.session_id.clone(),
-                            route.subscription_id.clone(),
-                            route.handle.clone(),
-                            bytes,
-                        )
-                    })
+                route.handle.snapshot_active().map(|bytes| {
+                    (
+                        route.session_id.clone(),
+                        route.subscription_id.clone(),
+                        route.handle.clone(),
+                        bytes,
+                    )
+                })
             })
             .collect()
     }
@@ -635,10 +628,7 @@ impl UnixTerminalAdapterHandle {
         self.inner.complete_active()
     }
 
-    pub(crate) fn peek_late_egress(&self) -> Option<Vec<u8>> {
-        self.inner.peek_late_egress()
-    }
-
+    #[cfg(test)]
     pub(crate) fn take_late_egress(&self) -> Option<Vec<u8>> {
         self.inner.take_late_egress()
     }
