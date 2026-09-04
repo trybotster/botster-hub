@@ -3961,10 +3961,7 @@ fn run_measurement_workers(
         let started_output = output_start >= start_at;
         let drain = noisy
             .connection
-            .request(&botster_hub_client::DaemonRequest::drain_subscription(
-                EVENT_PLANE_NOISY_SESSION,
-                EVENT_PLANE_NOISY_SUB,
-            ));
+            .request(&botster_hub_client::DaemonRequest::Status);
         if drain.is_err() {
             terminal.apply_output_failure();
             if started_output {
@@ -4067,7 +4064,7 @@ fn perform_cycle_operation(
         ),
         "drain" => expect_kind(
             endpoint,
-            botster_hub_client::DaemonRequest::drain_subscription(session_id, sub_id),
+            botster_hub_client::DaemonRequest::Status,
             botster_hub_client::DaemonResponseKind::Events,
         ),
         "input" => {
@@ -4542,10 +4539,7 @@ impl OutputStreamFold {
         while Instant::now() < deadline && self.first_post_window_seq.is_none() {
             let drain = noisy
                 .connection
-                .request(&botster_hub_client::DaemonRequest::drain_subscription(
-                    EVENT_PLANE_NOISY_SESSION,
-                    EVENT_PLANE_NOISY_SUB,
-                ));
+                .request(&botster_hub_client::DaemonRequest::Status);
             if drain.is_err() {
                 terminal.apply_output_failure();
                 break;

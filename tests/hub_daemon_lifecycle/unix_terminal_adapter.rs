@@ -23,6 +23,32 @@ fn request_skipping_envelopes(
     request_collecting_mux(stream, reader, request, envelopes, &mut events)
 }
 
+fn poll_unsolicited_envelopes(
+    stream: &mut std::os::unix::net::UnixStream,
+    reader: &mut std::io::BufReader<std::os::unix::net::UnixStream>,
+    envelopes: &mut Vec<botster_hub_client::DaemonUnixTerminalEnvelope>,
+) {
+    stream
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .expect("set unsolicited mux timeout");
+    loop {
+        match botster_hub_client::read_unix_mux_frame_from_reader(reader) {
+            Ok(botster_hub_client::DaemonUnixMuxFrame::Terminal(envelope)) => {
+                assert!(envelope.is_unix_terminal_plane());
+                envelopes.push(envelope);
+            }
+            Ok(botster_hub_client::DaemonUnixMuxFrame::Event(_)) => {}
+            Ok(botster_hub_client::DaemonUnixMuxFrame::Response(response)) => {
+                panic!("unsolicited mux wait received a control response: {response:?}")
+            }
+            Err(_) => break,
+        }
+    }
+    stream
+        .set_read_timeout(None)
+        .expect("clear unsolicited mux timeout");
+}
+
 fn request_collecting_mux(
     stream: &mut std::os::unix::net::UnixStream,
     reader: &mut std::io::BufReader<std::os::unix::net::UnixStream>,
@@ -307,20 +333,7 @@ fn unix_adapter_bind_returns_only_attaching_then_opaque_envelopes() {
 
     let deadline = Instant::now() + Duration::from_secs(8);
     while envelopes.is_empty() && Instant::now() < deadline {
-        let drain = request_skipping_envelopes(
-            &mut stream,
-            &mut reader,
-            &botster_hub_client::DaemonRequest::drain_subscription(session_id, subscription_id),
-            &mut envelopes,
-        );
-        assert!(
-            drain
-                .events
-                .iter()
-                .all(|event| !event_is_terminal_body(event)),
-            "bound drain must not emit terminal bodies: {:?}",
-            drain.events
-        );
+        poll_unsolicited_envelopes(&mut stream, &mut reader, &mut envelopes);
         thread::sleep(Duration::from_millis(50));
     }
     assert!(
@@ -465,7 +478,7 @@ fn unix_adapter_bind_returns_only_attaching_then_opaque_envelopes() {
 }
 
 #[test]
-fn unix_adapter_unbound_scoped_drain_delivers_terminal_output() {
+fn unix_adapter_unbound_attach_delivers_terminal_output_on_adapter() {
     let _guard = daemon_test_guard();
     let hub = start_isolated_live_output_hub("uud");
     let endpoint = hub.endpoint().clone();
@@ -491,14 +504,11 @@ fn unix_adapter_unbound_scoped_drain_delivers_terminal_output() {
         attach.events
     );
     let drain = connection
-        .request(&botster_hub_client::DaemonRequest::drain_subscription(
-            session_id,
-            subscription_id,
-        ))
-        .expect("host drain");
+        .request(&botster_hub_client::DaemonRequest::Status)
+        .expect("host status");
     assert!(
         drain.events.is_empty(),
-        "host Drain must not translate Snapshot: {:?}",
+        "host Status must not translate Snapshot: {:?}",
         drain.events
     );
     connection
@@ -1148,20 +1158,7 @@ fn unix_adapter_stale_disconnect_does_not_cancel_replacement_owner() {
     while Instant::now() < output_deadline
         && !unix_envelope_contains_live_bytes(&envelopes_b, marker)
     {
-        let drain = request_skipping_envelopes(
-            &mut owner_b,
-            &mut reader_b,
-            &botster_hub_client::DaemonRequest::drain_subscription(session_id, subscription_id),
-            &mut envelopes_b,
-        );
-        assert!(
-            drain
-                .events
-                .iter()
-                .all(|event| !event_is_terminal_body(event)),
-            "B's scoped Drain must stay bound after A's disconnect; terminal bodies mean Hub cancelled B: {:?}",
-            drain.events
-        );
+        poll_unsolicited_envelopes(&mut owner_b, &mut reader_b, &mut envelopes_b);
         thread::sleep(Duration::from_millis(50));
     }
     assert!(
@@ -1171,7 +1168,7 @@ fn unix_adapter_stale_disconnect_does_not_cancel_replacement_owner() {
     let confirm = request_skipping_envelopes(
         &mut owner_b,
         &mut reader_b,
-        &botster_hub_client::DaemonRequest::drain_subscription(session_id, subscription_id),
+        &botster_hub_client::DaemonRequest::Status,
         &mut envelopes_b,
     );
     assert!(
@@ -1179,7 +1176,7 @@ fn unix_adapter_stale_disconnect_does_not_cancel_replacement_owner() {
             .events
             .iter()
             .all(|event| !event_is_terminal_body(event)),
-        "B's scoped Drain must stay bound after live echo; terminal bodies mean Hub cancelled B: {:?}",
+        "B's bound adapter must stay bound after live echo; terminal bodies mean Hub cancelled B: {:?}",
         confirm.events
     );
     let occupancy = request_skipping_envelopes(
@@ -1232,14 +1229,11 @@ fn unix_adapter_unbound_attach_still_drains_snapshot() {
         attach.events
     );
     let drain = connection
-        .request(&botster_hub_client::DaemonRequest::drain_subscription(
-            session_id,
-            subscription_id,
-        ))
-        .expect("host drain");
+        .request(&botster_hub_client::DaemonRequest::Status)
+        .expect("host status");
     assert!(
         drain.events.is_empty(),
-        "host Drain must not reconstruct Snapshot: {:?}",
+        "host Status must not reconstruct Snapshot: {:?}",
         drain.events
     );
 
@@ -1290,17 +1284,6 @@ fn unix_adapter_unbound_printf_stream_attach_completes() {
     let deadline = Instant::now() + Duration::from_secs(8);
     let mut text = String::new();
     while Instant::now() < deadline {
-        let drain = connection
-            .request(&botster_hub_client::DaemonRequest::drain_subscription(
-                session_id,
-                subscription_id,
-            ))
-            .expect("host drain");
-        assert!(
-            drain.events.is_empty(),
-            "host Drain must not return terminal bodies: {:?}",
-            drain.events
-        );
         let screen = connection
             .request(&botster_hub_client::DaemonRequest::ReadScreen {
                 session_id: session_id.to_string(),
@@ -1321,21 +1304,18 @@ fn unix_adapter_unbound_printf_stream_attach_completes() {
         "visible text is on ReadScreen: {text:?}"
     );
     assert_host_session_retained(&mut connection, session_id);
-    let drain = connection
-        .request(&botster_hub_client::DaemonRequest::drain_subscription(
-            session_id,
-            subscription_id,
-        ))
-        .expect("host drain");
+    let status = connection
+        .request(&botster_hub_client::DaemonRequest::Status)
+        .expect("host status after exit");
     assert_eq!(
-        drain.kind,
-        botster_hub_client::DaemonResponseKind::Events,
-        "host Drain must stay serviceable after exit: {drain:?}"
+        status.kind,
+        botster_hub_client::DaemonResponseKind::Status,
+        "host Status must stay serviceable after exit: {status:?}"
     );
     assert!(
-        drain.events.is_empty(),
-        "host Drain must not return terminal bodies: {:?}",
-        drain.events
+        status.events.is_empty(),
+        "host Status must not return terminal bodies: {:?}",
+        status.events
     );
 
     session_cleanup.disarm();
@@ -1367,7 +1347,7 @@ fn unix_adapter_bound_printf_stream_attach_delivers_process_exit() {
     let release_path = hub.data_dir().join("uapb-release");
     let mut connection =
         botster_hub_client::DaemonConnection::connect(&endpoint).expect("default hello");
-    // The release file holds the child until Attach and the first Drain
+    // The release file holds the child until Attach and the first adapter wait
     // complete. sleep 1 after printf keeps the bound adapter attached while
     // Core emits process_exit; it is not an attach deadline.
     let spawned = connection
@@ -1405,17 +1385,7 @@ fn unix_adapter_bound_printf_stream_attach_delivers_process_exit() {
         "unix adapter Attach must bind without terminal bodies: {:?}",
         term_attach.events
     );
-    let primed = request_skipping_envelopes(
-        &mut term_stream,
-        &mut term_reader,
-        &botster_hub_client::DaemonRequest::drain_subscription(session_id, subscription_id),
-        &mut envelopes,
-    );
-    assert!(
-        primed.events.is_empty(),
-        "host Drain must not return terminal bodies: {:?}",
-        primed.events
-    );
+    poll_unsolicited_envelopes(&mut term_stream, &mut term_reader, &mut envelopes);
     fs::write(&release_path, b"go").expect("release held printf");
     read_unsolicited_until_process_exit(
         &mut term_reader,
@@ -1449,21 +1419,21 @@ fn unix_adapter_bound_printf_stream_attach_delivers_process_exit() {
         text.contains(&format!("smoke:{marker}")),
         "visible text is on ReadScreen: {text:?}"
     );
-    let drain = request_skipping_envelopes(
+    let status = request_skipping_envelopes(
         &mut term_stream,
         &mut term_reader,
-        &botster_hub_client::DaemonRequest::drain_subscription(session_id, subscription_id),
+        &botster_hub_client::DaemonRequest::Status,
         &mut envelopes,
     );
     assert_eq!(
-        drain.kind,
-        botster_hub_client::DaemonResponseKind::Events,
-        "host Drain must stay serviceable after exit: {drain:?}"
+        status.kind,
+        botster_hub_client::DaemonResponseKind::Status,
+        "host Status must stay serviceable after exit: {status:?}"
     );
     assert!(
-        drain.events.is_empty(),
-        "host Drain must not return terminal bodies: {:?}",
-        drain.events
+        status.events.is_empty(),
+        "host Status must not return terminal bodies: {:?}",
+        status.events
     );
 
     session_cleanup.disarm();
@@ -1962,14 +1932,14 @@ fn core_write_budget_hard_stop_emits_core_adapter_closed() {
             let stall_drain = request_collecting_mux(
                 &mut stream,
                 &mut reader,
-                &botster_hub_client::DaemonRequest::drain_subscription("cwb-stall", "sub-stall"),
+                &botster_hub_client::DaemonRequest::Status,
                 &mut envelopes,
                 &mut events,
             );
             assert_ne!(
                 stall_drain.kind,
                 botster_hub_client::DaemonResponseKind::OperatorError,
-                "stalled adapter Drain must stay owned before Status: {:?}",
+                "stalled adapter occupancy must stay owned before Status: {:?}",
                 stall_drain.error
             );
             assert!(
@@ -1977,7 +1947,7 @@ fn core_write_budget_hard_stop_emits_core_adapter_closed() {
                     .events
                     .iter()
                     .all(|event| !event_is_terminal_body(event)),
-                "content-blind stall Drain must stay bound before Status: {:?}",
+                "content-blind stall adapter must stay bound before Status: {:?}",
                 stall_drain.events
             );
             assert!(
@@ -1990,7 +1960,7 @@ fn core_write_budget_hard_stop_emits_core_adapter_closed() {
                         } if session_id == "cwb-stall"
                     )
                 }),
-                "owned stall Drain must precede core_adapter_closed: {events:?}"
+                "owned stall occupancy must precede core_adapter_closed: {events:?}"
             );
             let status = request_collecting_mux(
                 &mut stream,
@@ -2105,14 +2075,14 @@ fn core_write_budget_hard_stop_emits_core_adapter_closed() {
         let drain = request_collecting_mux(
             &mut stream,
             &mut reader,
-            &botster_hub_client::DaemonRequest::drain_subscription("cwb-live", "sub-live"),
+            &botster_hub_client::DaemonRequest::Status,
             &mut envelopes,
             &mut events,
         );
         assert_ne!(
             drain.kind,
             botster_hub_client::DaemonResponseKind::OperatorError,
-            "sibling scoped Drain must stay owned: {:?}",
+            "sibling bound adapter must stay owned: {:?}",
             drain.error
         );
         assert!(
@@ -2120,7 +2090,7 @@ fn core_write_budget_hard_stop_emits_core_adapter_closed() {
                 .events
                 .iter()
                 .all(|event| !event_is_terminal_body(event)),
-            "content-blind sibling Drain must stay bound: {:?}",
+            "content-blind sibling adapter must stay bound: {:?}",
             drain.events
         );
         thread::sleep(Duration::from_millis(50));
@@ -2205,14 +2175,14 @@ fn forced_would_block_on_one_unix_route_keeps_sibling_open_and_delivering() {
         let drain = request_collecting_mux(
             &mut stream,
             &mut reader,
-            &botster_hub_client::DaemonRequest::drain_subscription("sso-live", "sub-live"),
+            &botster_hub_client::DaemonRequest::Status,
             &mut envelopes,
             &mut events,
         );
         assert_ne!(
             drain.kind,
             botster_hub_client::DaemonResponseKind::OperatorError,
-            "sibling scoped Drain must stay owned: {:?}",
+            "sibling bound adapter must stay owned: {:?}",
             drain.error
         );
         assert!(
@@ -2220,7 +2190,7 @@ fn forced_would_block_on_one_unix_route_keeps_sibling_open_and_delivering() {
                 .events
                 .iter()
                 .all(|event| !event_is_terminal_body(event)),
-            "content-blind sibling Drain must stay bound: {:?}",
+            "content-blind sibling adapter must stay bound: {:?}",
             drain.events
         );
         thread::sleep(Duration::from_millis(50));
@@ -2314,14 +2284,14 @@ fn subscribe_entities_on_bound_unix_mux_returns_operator_error_and_keeps_route()
     let drain = request_collecting_mux(
         &mut stream,
         &mut reader,
-        &botster_hub_client::DaemonRequest::drain_subscription("sem-live", "sub-live"),
+        &botster_hub_client::DaemonRequest::Status,
         &mut envelopes,
         &mut events,
     );
     assert_ne!(
         drain.kind,
         botster_hub_client::DaemonResponseKind::OperatorError,
-        "bound Drain must stay owned after rejected SubscribeEntities: {:?}",
+        "bound adapter must stay owned after rejected SubscribeEntities: {:?}",
         drain.error
     );
     assert!(
@@ -2329,7 +2299,7 @@ fn subscribe_entities_on_bound_unix_mux_returns_operator_error_and_keeps_route()
             .events
             .iter()
             .all(|event| !event_is_terminal_body(event)),
-        "content-blind Drain must stay bound: {:?}",
+        "content-blind adapter must stay bound: {:?}",
         drain.events
     );
 
@@ -2684,10 +2654,7 @@ fn shutdown_session_exact_keys_preserve_replacement_owner_and_siblings() {
         let _ = request_collecting_mux(
             &mut stream,
             &mut reader,
-            &botster_hub_client::DaemonRequest::drain_subscription(
-                "sgk-sibling",
-                "sgk-sibling-sub",
-            ),
+            &botster_hub_client::DaemonRequest::Status,
             &mut envelopes,
             &mut events,
         );
@@ -2745,10 +2712,7 @@ fn shutdown_session_exact_keys_preserve_replacement_owner_and_siblings() {
         let _ = request_collecting_mux(
             &mut stream,
             &mut reader,
-            &botster_hub_client::DaemonRequest::drain_subscription(
-                "sgk-sibling",
-                "sgk-sibling-sub",
-            ),
+            &botster_hub_client::DaemonRequest::Status,
             &mut envelopes,
             &mut events,
         );
@@ -3018,12 +2982,12 @@ fn unix_shutdown_session_from_another_connection_classifies_attached_exit() {
     let primed = request_skipping_envelopes(
         &mut stream,
         &mut reader,
-        &botster_hub_client::DaemonRequest::drain_subscription(session_id, subscription_id),
+        &botster_hub_client::DaemonRequest::Status,
         &mut envelopes,
     );
     assert!(
         primed.events.is_empty(),
-        "host Drain must not return terminal bodies: {:?}",
+        "host Status must not return terminal bodies: {:?}",
         primed.events
     );
     fs::write(&print_release, b"go").expect("release Unix natural-exit printf");
@@ -3031,17 +2995,7 @@ fn unix_shutdown_session_from_another_connection_classifies_attached_exit() {
     while Instant::now() < print_deadline
         && !unix_envelope_contains_live_bytes(&envelopes, "pse-ready")
     {
-        let drain = request_skipping_envelopes(
-            &mut stream,
-            &mut reader,
-            &botster_hub_client::DaemonRequest::drain_subscription(session_id, subscription_id),
-            &mut envelopes,
-        );
-        assert!(
-            drain.events.is_empty(),
-            "host Drain must not return terminal bodies: {:?}",
-            drain.events
-        );
+        poll_unsolicited_envelopes(&mut stream, &mut reader, &mut envelopes);
         thread::sleep(Duration::from_millis(25));
     }
     assert!(
@@ -3105,10 +3059,7 @@ fn unix_shutdown_session_from_another_connection_classifies_attached_exit() {
     let drain = request_collecting_mux(
         &mut stream,
         &mut reader,
-        &botster_hub_client::DaemonRequest::Drain {
-            session_id: session_id.to_string(),
-            subscription_id: None,
-        },
+        &botster_hub_client::DaemonRequest::Status,
         &mut envelopes,
         &mut events,
     );
@@ -3118,7 +3069,7 @@ fn unix_shutdown_session_from_another_connection_classifies_attached_exit() {
             botster_hub_client::DaemonEvent::ProcessExit { .. }
                 | botster_hub_client::DaemonEvent::TerminalOutput { .. }
         )),
-        "host Drain must not translate ProcessExit after ShutdownSession: {:?}",
+        "host Status must not translate ProcessExit after ShutdownSession: {:?}",
         drain.events
     );
     hub.shutdown().expect("shutdown isolated hub");
@@ -3281,7 +3232,7 @@ fn stale_generation_close_does_not_sweep_replacement_owner() {
         let drain = request_collecting_mux(
             &mut owner_b,
             &mut reader_b,
-            &botster_hub_client::DaemonRequest::drain_subscription("sgo-session", "sgo-sub"),
+            &botster_hub_client::DaemonRequest::Status,
             &mut envelopes_b,
             &mut events_b,
         );
@@ -3290,7 +3241,7 @@ fn stale_generation_close_does_not_sweep_replacement_owner() {
                 .events
                 .iter()
                 .all(|event| !event_is_terminal_body(event)),
-            "B's scoped Drain must stay bound after A's stale close: {:?}",
+            "B's bound adapter must stay bound after A's stale close: {:?}",
             drain.events
         );
         thread::sleep(Duration::from_millis(50));

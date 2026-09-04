@@ -525,7 +525,7 @@ pub struct ClientConformanceReport {
 pub enum ManyPtyConformanceStage {
     Spawn,
     Attach,
-    Drain,
+    Live,
     Input,
     History,
     Cleanup,
@@ -538,7 +538,7 @@ impl ManyPtyConformanceStage {
         match self {
             Self::Spawn => "spawn",
             Self::Attach => "attach",
-            Self::Drain => "drain",
+            Self::Live => "live",
             Self::Input => "input",
             Self::History => "history",
             Self::Cleanup => "cleanup",
@@ -811,43 +811,12 @@ fn run_many_pty_client_attach_scenario(
     let deadline = Instant::now() + MANY_PTY_DEADLINE;
     let mut live_screen = String::new();
     while Instant::now() < deadline {
-        let drain = many_pty_request(
-            connection,
-            &DaemonRequest::Drain {
-                session_id: MANY_PTY_NOISY_SESSION_ID.to_string(),
-                subscription_id: None,
-            },
-            ManyPtyConformanceStage::Drain,
-            MANY_PTY_NOISY_SESSION_ID,
-        )?;
-        many_pty_expect_kind(
-            &drain,
-            DaemonResponseKind::Events,
-            ManyPtyConformanceStage::Drain,
-            MANY_PTY_NOISY_SESSION_ID,
-        )?;
-        if drain.events.iter().any(|event| {
-            matches!(
-                event,
-                DaemonEvent::AttachState { .. }
-                    | DaemonEvent::Snapshot { .. }
-                    | DaemonEvent::Scrollback { .. }
-                    | DaemonEvent::TerminalOutput { .. }
-                    | DaemonEvent::ProcessExit { .. }
-            )
-        }) {
-            return Err(many_pty_error(
-                ManyPtyConformanceStage::Drain,
-                MANY_PTY_NOISY_SESSION_ID,
-                "host Drain must not return terminal bodies",
-            ));
-        }
         let screen = many_pty_request(
             connection,
             &DaemonRequest::ReadScreen {
                 session_id: MANY_PTY_NOISY_SESSION_ID.to_string(),
             },
-            ManyPtyConformanceStage::Drain,
+            ManyPtyConformanceStage::Live,
             MANY_PTY_NOISY_SESSION_ID,
         )?;
         if let Some(body) = screen.read_screen {
@@ -860,7 +829,7 @@ fn run_many_pty_client_attach_scenario(
     }
     if !live_screen.contains(MANY_PTY_LIVE_MARKER) {
         return Err(many_pty_error(
-            ManyPtyConformanceStage::Drain,
+            ManyPtyConformanceStage::Live,
             MANY_PTY_NOISY_SESSION_ID,
             format!(
                 "ReadScreen did not observe the input-driven live marker; text={live_screen:?}"
@@ -887,23 +856,6 @@ fn wait_for_quiet_sessions(
     let deadline = Instant::now() + MANY_PTY_DEADLINE;
     let mut observed_lifecycles = BTreeMap::new();
     while Instant::now() < deadline {
-        for session_id in quiet_session_ids {
-            let drain = many_pty_request(
-                connection,
-                &DaemonRequest::Drain {
-                    session_id: session_id.clone(),
-                    subscription_id: None,
-                },
-                ManyPtyConformanceStage::Spawn,
-                session_id,
-            )?;
-            many_pty_expect_kind(
-                &drain,
-                DaemonResponseKind::Events,
-                ManyPtyConformanceStage::Spawn,
-                session_id,
-            )?;
-        }
         let list = many_pty_request(
             connection,
             &DaemonRequest::ListSessions,
@@ -964,21 +916,6 @@ fn wait_for_many_pty_screen_marker(
     let deadline = Instant::now() + MANY_PTY_DEADLINE;
     let mut last_screen = String::new();
     while Instant::now() < deadline {
-        let drain = many_pty_request(
-            connection,
-            &DaemonRequest::Drain {
-                session_id: MANY_PTY_NOISY_SESSION_ID.to_string(),
-                subscription_id: None,
-            },
-            ManyPtyConformanceStage::History,
-            MANY_PTY_NOISY_SESSION_ID,
-        )?;
-        many_pty_expect_kind(
-            &drain,
-            DaemonResponseKind::Events,
-            ManyPtyConformanceStage::History,
-            MANY_PTY_NOISY_SESSION_ID,
-        )?;
         let response = many_pty_request(
             connection,
             &DaemonRequest::ReadScreen {
@@ -1459,7 +1396,7 @@ pub struct ForegroundTerminalAppOpenConformanceReport {
 /// Run the hub-owned conformance flow for same-device external clients.
 ///
 /// The flow starts from an already isolated hub, then exercises status, session
-/// list, spawn, `DaemonConnection` Attach plus scoped Drain, input, resize,
+/// list, spawn, `DaemonConnection` Attach plus bound adapter frames, input, resize,
 /// validation error handling, and session teardown using only public
 /// `botster-hub-client` calls. Held-open `botster_hub_client::stream_attach` is
 /// a separate production helper; live IsolatedHub proof lives in
@@ -1480,7 +1417,7 @@ pub struct ForegroundTerminalAppOpenConformanceReport {
 ///
 /// let report = run_client_conformance(&hub).expect("client conformance");
 /// assert_eq!(report.lifecycle_state, "running");
-/// assert_eq!(report.validation_error_operation, "drain_runtime");
+/// assert_eq!(report.validation_error_operation, "attach");
 /// assert!(report.stream_contains_resize);
 /// hub.shutdown().expect("shutdown isolated hub");
 /// ```
@@ -1553,24 +1490,9 @@ pub fn run_client_conformance(
     let mut terminal_attached = false;
     let attached_deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < attached_deadline {
-        let drain = terminal
-            .request(&DaemonRequest::drain_subscription(
-                CONFORMANCE_SESSION_ID,
-                CONFORMANCE_SUBSCRIPTION_ID,
-            ))
-            .map_err(|source| ConformanceError::Client {
-                operation: "attach_drain",
-                source,
-            })?;
-        if !drain.events.is_empty() {
-            return Err(ConformanceError::MissingOutput {
-                needle: "empty host drain",
-                output: format!("{:?}", drain.events),
-            });
-        }
-        terminal_attached |= take_attached_terminal_frame(&mut terminal);
+        terminal_attached |= take_attached_terminal_frame(&mut terminal)?;
         append_read_screen(&mut terminal, &mut drain_output)?;
-        terminal_attached |= take_attached_terminal_frame(&mut terminal);
+        terminal_attached |= take_attached_terminal_frame(&mut terminal)?;
         if terminal_attached && drain_output.contains(CONFORMANCE_READY) {
             break;
         }
@@ -1666,9 +1588,9 @@ pub fn run_client_conformance(
 
     let validation = request(
         hub.endpoint(),
-        DaemonRequest::Drain {
+        DaemonRequest::Attach {
             session_id: "missing-conformance-session".to_string(),
-            subscription_id: None,
+            subscription_id: "missing-conformance-sub".to_string(),
         },
         "validation_error",
     )?;
@@ -1679,7 +1601,7 @@ pub fn run_client_conformance(
     )?;
     let validation_diagnostic_kind = diagnostic_kind(
         &validation,
-        DaemonDiagnosticKind::TerminalStreamUnavailable,
+        DaemonDiagnosticKind::ActionFailure,
         "validation_error",
     )?;
     let validation_error = validation
@@ -4521,27 +4443,41 @@ fn append_read_screen(
     Ok(())
 }
 
-fn take_attached_terminal_frame(terminal: &mut DaemonConnection) -> bool {
-    terminal
+fn envelope_is_attached_frame(envelope: &botster_hub_client::DaemonUnixTerminalEnvelope) -> bool {
+    if envelope.session_id != CONFORMANCE_SESSION_ID
+        || envelope.subscription_id != CONFORMANCE_SUBSCRIPTION_ID
+    {
+        return false;
+    }
+    envelope
+        .payload_bytes()
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<DaemonEvent>(&bytes).ok())
+        .is_some_and(|event| {
+            matches!(
+                event,
+                DaemonEvent::AttachState { state, .. } if state == "attached"
+            )
+        })
+}
+
+fn take_attached_terminal_frame(terminal: &mut DaemonConnection) -> Result<bool, ConformanceError> {
+    while let Some(envelope) =
+        terminal
+            .poll_terminal(Duration::from_millis(25))
+            .map_err(|source| ConformanceError::Client {
+                operation: "attach_wait",
+                source,
+            })?
+    {
+        if envelope_is_attached_frame(&envelope) {
+            return Ok(true);
+        }
+    }
+    Ok(terminal
         .take_skipped_terminal()
         .into_iter()
-        .any(|envelope| {
-            if envelope.session_id != CONFORMANCE_SESSION_ID
-                || envelope.subscription_id != CONFORMANCE_SUBSCRIPTION_ID
-            {
-                return false;
-            }
-            envelope
-                .payload_bytes()
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<DaemonEvent>(&bytes).ok())
-                .is_some_and(|event| {
-                    matches!(
-                        event,
-                        DaemonEvent::AttachState { state, .. } if state == "attached"
-                    )
-                })
-        })
+        .any(|envelope| envelope_is_attached_frame(&envelope)))
 }
 
 fn request(
@@ -5343,13 +5279,13 @@ mod tests {
             [
                 ManyPtyConformanceStage::Spawn,
                 ManyPtyConformanceStage::Attach,
-                ManyPtyConformanceStage::Drain,
+                ManyPtyConformanceStage::Live,
                 ManyPtyConformanceStage::Input,
                 ManyPtyConformanceStage::History,
                 ManyPtyConformanceStage::Cleanup,
             ]
             .map(ManyPtyConformanceStage::as_str),
-            ["spawn", "attach", "drain", "input", "history", "cleanup"]
+            ["spawn", "attach", "live", "input", "history", "cleanup"]
         );
     }
 
@@ -6060,7 +5996,6 @@ mod tests {
                     "remove_session",
                     "spawn",
                     "attach",
-                    "drain",
                     "shutdown_session",
                 ],
                 "terminal_streaming": {
@@ -6070,7 +6005,7 @@ mod tests {
                     "held_open_stream": true,
                     "conformance_ready_output": CONFORMANCE_READY,
                     "conformance_echo_output": CONFORMANCE_ECHO,
-                    "missing_session_diagnostic_kind": "terminal_stream_unavailable",
+                    "missing_session_diagnostic_kind": "action_failure",
                 },
                 "session_entities": {
                     "supported": true,

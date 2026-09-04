@@ -300,6 +300,69 @@ impl DaemonConnection {
             }
         }
     }
+
+    /// Receive the next unsolicited terminal envelope without sending a control request.
+    ///
+    /// Returns envelopes already skipped while waiting for a response first. Does
+    /// not write to the socket.
+    pub fn next_terminal(&mut self) -> DaemonTransportResult<DaemonUnixTerminalEnvelope> {
+        if !self.skipped_terminal.is_empty() {
+            return Ok(self.skipped_terminal.remove(0));
+        }
+        loop {
+            let value = read_value_frame_from_reader(&mut self.reader)?;
+            if status_missing_compatibility(&value) {
+                return Err(precompatibility_hub_error());
+            }
+            match parse_unix_mux_value(value).map_err(DaemonTransportError::Json)? {
+                DaemonUnixMuxFrame::Terminal(envelope) => return Ok(envelope),
+                DaemonUnixMuxFrame::Event(event) => self.skipped_events.push(event),
+                DaemonUnixMuxFrame::Response(_) => {
+                    return Err(DaemonTransportError::Protocol(
+                        "unexpected control response while waiting for a terminal envelope",
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Receive the next unsolicited terminal envelope, or `None` when `timeout` elapses.
+    ///
+    /// Does not write a control request. Restores the previous socket read timeout.
+    pub fn poll_terminal(
+        &mut self,
+        timeout: Duration,
+    ) -> DaemonTransportResult<Option<DaemonUnixTerminalEnvelope>> {
+        if !self.skipped_terminal.is_empty() {
+            return Ok(Some(self.skipped_terminal.remove(0)));
+        }
+        let previous = self
+            .stream
+            .read_timeout()
+            .map_err(normalize_socket_io_error)?;
+        self.set_read_timeout(Some(timeout))?;
+        let result = self.next_terminal();
+        let restore = self.set_read_timeout(previous);
+        match result {
+            Ok(envelope) => {
+                restore?;
+                Ok(Some(envelope))
+            }
+            Err(DaemonTransportError::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                restore?;
+                Ok(None)
+            }
+            Err(error) => {
+                let _ = restore;
+                Err(error)
+            }
+        }
+    }
 }
 
 /// One held-open, connection-scoped session entity subscription.
@@ -1095,11 +1158,6 @@ pub enum DaemonRequest {
     ShutdownSession {
         session_id: String,
     },
-    Drain {
-        session_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        subscription_id: Option<String>,
-    },
     ReadScreen {
         session_id: String,
     },
@@ -1318,27 +1376,6 @@ pub enum DaemonRequest {
         request: UiActionRequest,
     },
     DaemonShutdown,
-}
-
-impl DaemonRequest {
-    #[must_use]
-    pub fn drain_session(session_id: impl Into<String>) -> Self {
-        Self::Drain {
-            session_id: session_id.into(),
-            subscription_id: None,
-        }
-    }
-
-    #[must_use]
-    pub fn drain_subscription(
-        session_id: impl Into<String>,
-        subscription_id: impl Into<String>,
-    ) -> Self {
-        Self::Drain {
-            session_id: session_id.into(),
-            subscription_id: Some(subscription_id.into()),
-        }
-    }
 }
 
 /// Server response variants for one local daemon request.
@@ -4595,6 +4632,17 @@ mod tests {
     }
 
     #[test]
+    fn retired_drain_json_request_does_not_deserialize() {
+        let err = serde_json::from_str::<DaemonRequest>(
+            r#"{"type":"drain","session_id":"missing-session"}"#,
+        );
+        assert!(
+            err.is_err(),
+            "retired drain JSON must not deserialize: {err:?}"
+        );
+    }
+
+    #[test]
     fn generated_typescript_protocol_matches_checked_artifact() {
         let generated = daemon_protocol_typescript();
         let checked = std::fs::read_to_string(concat!(
@@ -4724,6 +4772,9 @@ mod tests {
         assert!(!generated.contains(r#"| { type: "mode_gated_input"; session_id: string; data: string; mode_generation: number; mode_revision: number }"#));
         assert!(!generated.contains(r#"| { type: "send_input""#));
         assert!(!generated.contains(r#"| { type: "resize""#));
+        assert!(!generated.contains(r#"| { type: "drain""#));
+        assert!(!generated.contains("drain_session"));
+        assert!(!generated.contains("drain_subscription"));
         assert!(generated.contains("terminal_reservation?: DaemonTerminalReservation | null;"));
         assert!(generated.contains("export interface DaemonTerminalReservation"));
         assert!(!generated.contains("mode_gated_input"));
@@ -5974,10 +6025,6 @@ mod tests {
             DaemonRequest::ShutdownSession {
                 session_id: "session".to_string(),
             },
-            DaemonRequest::Drain {
-                session_id: "session".to_string(),
-                subscription_id: None,
-            },
             DaemonRequest::ReadScreen {
                 session_id: "session".to_string(),
             },
@@ -6203,7 +6250,6 @@ mod tests {
             DaemonRequest::Attach { .. } => "attach",
             DaemonRequest::Detach { .. } => "detach",
             DaemonRequest::ShutdownSession { .. } => "shutdown_session",
-            DaemonRequest::Drain { .. } => "drain",
             DaemonRequest::ReadScreen { .. } => "read_screen",
             DaemonRequest::ReadModeFlags { .. } => "read_mode_flags",
             DaemonRequest::CaptureSnapshot { .. } => "capture_snapshot",

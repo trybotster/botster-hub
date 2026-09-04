@@ -13,12 +13,12 @@
   "daemon_protocol": {
     "artifact_path": "daemon-protocol.ts",
     "source_artifact_path": "crates/botster-hub-client/generated/daemon-protocol.ts",
-    "sha256": "33c0c27941c0e9751342cfdbeb53d27bb4a1225e5ce7f4be280d9f0dc11ad7f3"
+    "sha256": "6a4c5ace7f111f01c83ff238f589b695367c5bc0c6c3fa4e3352752f811f4681"
   },
   "first_party_client_support_matrix": {
     "artifact_path": "first-party-client-support-matrix.json",
     "source_artifact_path": "botster_hub_test_support::first_party_client_support_matrix()",
-    "sha256": "9604820a7843da30b61c0b17faca5ddac7cdfd97cadea74a04f57a908f19f078"
+    "sha256": "598860ce89f4041dff20288ac03b78466c20ed8bc69793e70c3f2418fb907e54"
   },
   "session_lifecycle_subscription_conformance_fixture": {
     "artifact_path": "session-lifecycle-subscription-conformance-fixture.json",

@@ -551,7 +551,6 @@ pub fn first_party_client_support_matrix() -> FirstPartyClientSupportMatrix {
             "remove_session".to_string(),
             "spawn".to_string(),
             "attach".to_string(),
-            "drain".to_string(),
             "shutdown_session".to_string(),
         ],
         terminal_streaming: TerminalStreamingSupport {
@@ -562,7 +561,7 @@ pub fn first_party_client_support_matrix() -> FirstPartyClientSupportMatrix {
             conformance_ready_output: CONFORMANCE_READY.to_string(),
             conformance_echo_output: CONFORMANCE_ECHO.to_string(),
             missing_session_diagnostic_kind: crate::diagnostic_kind_label(
-                DaemonDiagnosticKind::TerminalStreamUnavailable,
+                DaemonDiagnosticKind::ActionFailure,
             )
             .to_string(),
         },

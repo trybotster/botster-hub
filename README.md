@@ -96,9 +96,9 @@ hub-native routed envelopes and guarded notification writes:
 
 | Surface | Status on the product path |
 | --- | --- |
-| Attach + drain terminal egress | Product. Attach acks `attaching` on the requesting subscription. READY, HISTORY page, and FINISH `Snapshot` frames stream on scoped `Drain { subscription_id }`. `attached` means live PTY may flow. `Scrollback` is never importable as GHOSTSNP. |
-| Hub `ReadScreen` / `ReadModeFlags` / `CaptureSnapshot` | Product. Routes `HubClientApi` → `HubRuntime` → `CoreDaemon` readback. `ReadScreen` returns session text; `ReadModeFlags` returns full authoritative `ModeFlags` plus `mode_generation`/`mode_revision` freshness. Mode-gated input and resize travel as Core `TerminalInputFrame` bytes on a bound Unix or WebRTC duplex subscription, not as JSON daemon requests. `CaptureSnapshot` returns metadata only (rows/cols/format/byte count) — never GHOSTSNP bytes. Errors stay errors rather than fabricated mouse-off results, and mode readback has no pushed event. Opaque GHOSTSNP snapshot bytes stay only on the attach/drain `DaemonEvent::Snapshot` data plane (`Scrollback` is never importable as GHOSTSNP). Hub never decodes snapshot wire magic or synthesizes OSC 10/11/12 replies — startup color baseline is applied once via Core `with_terminal_color_profile` (FG `#FFFFFF` / BG `#282C34` / cursor `#FFFFFF`) for pre-attach session-side replies. |
-| Subscription history | Product. History and live terminal output flow through attach/drain events, not through readback responses. |
+| Attach + bound adapter egress | Product. Attach acks `attaching` on the requesting subscription. READY, HISTORY page, FINISH, and live output stream as opaque frames on the bound Unix or WebRTC adapter. `attached` means live PTY may flow. `Scrollback` is never importable as GHOSTSNP. |
+| Hub `ReadScreen` / `ReadModeFlags` / `CaptureSnapshot` | Product. Routes `HubClientApi` → `HubRuntime` → `CoreDaemon` readback. `ReadScreen` returns session text; `ReadModeFlags` returns full authoritative `ModeFlags` plus `mode_generation`/`mode_revision` freshness. Mode-gated input and resize travel as Core `TerminalInputFrame` bytes on a bound Unix or WebRTC duplex subscription, not as JSON daemon requests. `CaptureSnapshot` returns metadata only (rows/cols/format/byte count) — never GHOSTSNP bytes. Errors stay errors rather than fabricated mouse-off results, and mode readback has no pushed event. Opaque GHOSTSNP snapshot bytes stay only on the bound adapter data plane (`Scrollback` is never importable as GHOSTSNP). Hub never decodes snapshot wire magic or synthesizes OSC 10/11/12 replies — startup color baseline is applied once via Core `with_terminal_color_profile` (FG `#FFFFFF` / BG `#282C34` / cursor `#FFFFFF`) for pre-attach session-side replies. |
+| Subscription history | Product. History and live terminal output flow through bound Unix or WebRTC adapter frames, not through readback responses. |
 | `report_delivery_*` pressure helpers | Still unfinished. Not exposed on the hub client product surface yet. |
 
 **Ghostty snapshot cutover:** locking hub to a core rev that emits
@@ -112,7 +112,7 @@ downstream clients must consume the post-cutover restty/WASM stack.
 
 **Product on this path:** explicit data-dir daemon lifecycle; worker-backed
 local PTY sessions (spawn/list/attach/detach/session-shutdown) with input and resize on the bound adapter plane;
-attach/drain history; hub client screen, mode-flags, and snapshot readback through CoreDaemon;
+attach and adapter history; hub client screen, mode-flags, and snapshot readback through CoreDaemon;
 package install/enable/disable/reload and entrypoint supervision for local
 packages; `HubClientApi` + daemon socket protocol; native MCP coordination
 tools; Lua plugin runtime including constrained Project Pipelines; local
@@ -201,7 +201,7 @@ embeds the typed CoreDaemon API; it must not shell out to the thin core daemon
 CLI or parse CLI output for session routing. Screen and snapshot requests route
 through `HubRuntime -> CoreDaemon` and return typed readback response DTOs.
 Snapshot readback returns metadata only; opaque snapshot bytes stay on the
-attach/drain data plane. Subscription history still flows through attach/drain
+attach and adapter data plane. Subscription history still flows through attach and adapter
 events rather than through readback responses.
 
 The renderer-neutral plugin UI wire contract is owned by Hub Git tag
@@ -1033,7 +1033,7 @@ Production runtime-ready today: explicit local daemon lifecycle, file-backed hub
 state, local package admission from a manifest path, typed status/package reads,
 plugin lifecycle observation/invocation through the hub facade, daemon-backed
 PTY spawn/list/attach/detach/session-shutdown through
-`HubClientApi` with input and resize on the bound adapter plane, attach/drain history plus screen/snapshot readback through
+`HubClientApi` with input and resize on the bound adapter plane, attach and adapter history plus screen/snapshot readback through
 CoreDaemon, and cross-process daemon transport proof for hub restart recovery.
 
 The production-shaped restart proof lives in `hub_daemon_lifecycle_test`: it
@@ -1058,7 +1058,7 @@ control-plane acknowledgements. Terminal egress is delivered by explicit
 from those control operations.
 
 Ready for daily local use today: explicit daemon lifecycle, daemon-backed local
-PTY session operations including attach/drain history and screen/snapshot
+PTY session operations including attach and adapter history and screen/snapshot
 readback, minimal daemon-backed TUI attach/reconnect, native MCP coordination
 tools, and constrained Project Pipelines MCP workflow tools over the Lua plugin
 runtime.
@@ -1101,7 +1101,7 @@ is a tool-call error, not a template fallback.
 
 Terminal attach or scrollback issues: use `botster-hub sessions list`, attach
 only to a running session, and expect
-terminal output to arrive through the session-backed drain/subscription path.
+terminal output to arrive through the bound Unix or WebRTC adapter path.
 Late attach may replay existing terminal output as ordinary terminal data rather
 than a distinct scrollback frame, and current long-running attach signal
 handling is still listed as pending readiness work.

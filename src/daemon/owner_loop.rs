@@ -1317,7 +1317,7 @@ mod tests {
     }
 
     #[test]
-    fn drain_does_not_inspect_legacy_attach_state_for_ownership() {
+    fn status_after_pre_bind_attach_error_does_not_enqueue_detach() {
         let (server, mut client) = UnixStream::pair().expect("create daemon socket pair");
         let (control_tx, mut control_rx) = tokio_mpsc::channel(DAEMON_CONTROL_QUEUE_CAPACITY);
         let connection = thread::spawn(move || handle_connection(server, control_tx));
@@ -1356,22 +1356,18 @@ mod tests {
             .expect("reply with attach operator error");
         let _: DaemonResponse = read_frame(&mut client).expect("read attach operator error");
 
-        write_frame(
-            &mut client,
-            &DaemonRequest::drain_subscription("session", "subscription"),
-        )
-        .expect("write scoped drain");
+        write_frame(&mut client, &DaemonRequest::Status).expect("write status");
         let ControlMessage::Request {
             request, reply_tx, ..
         } = receive_test_control_request(&mut control_rx)
         else {
-            panic!("expected drain control request");
+            panic!("expected status control request");
         };
-        assert!(matches!(*request, DaemonRequest::Drain { .. }));
+        assert!(matches!(*request, DaemonRequest::Status));
         reply_tx
             .send(Ok(daemon_events(Vec::new())))
-            .expect("reply with host drain");
-        let _: DaemonResponse = read_frame(&mut client).expect("read host drain");
+            .expect("reply with status");
+        let _: DaemonResponse = read_frame(&mut client).expect("read status");
 
         client
             .shutdown(Shutdown::Both)
@@ -1382,7 +1378,7 @@ mod tests {
             .expect("client disconnect is a clean connection close");
         assert!(
             control_rx.try_recv().is_err(),
-            "pre-bind OperatorError plus host Drain must not enqueue Detach cleanup"
+            "pre-bind OperatorError plus Status must not enqueue Detach cleanup"
         );
     }
 

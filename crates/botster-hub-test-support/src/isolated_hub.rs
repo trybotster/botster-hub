@@ -61,7 +61,7 @@ const SESSION_WORKER_BASENAME: &str = "botster-session-worker";
 /// assert!(report.stream_contains_ready);
 /// assert!(report.stream_contains_echo);
 /// assert!(report.stream_contains_resize);
-/// assert_eq!(report.validation_error_operation, "drain_runtime");
+/// assert_eq!(report.validation_error_operation, "attach");
 /// hub.shutdown().expect("shutdown isolated hub");
 /// ```
 #[derive(Debug, Clone)]

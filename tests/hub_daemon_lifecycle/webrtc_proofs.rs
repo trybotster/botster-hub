@@ -1573,10 +1573,7 @@ fn local_webrtc_peer_close_detaches_terminal_subscriptions() {
         "socket client should observe output after WebRTC close, got {observed:?}"
     );
     let closed_peer_drain = connection
-        .request(&botster_hub_client::DaemonRequest::drain_subscription(
-            "local-webrtc-drop-session",
-            "local-webrtc-drop-subscription",
-        ))
+        .request(&botster_hub_client::DaemonRequest::Status)
         .expect("drain closed WebRTC subscription");
     let events_after_close = closed_peer_drain.events;
     assert!(

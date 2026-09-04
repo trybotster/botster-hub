@@ -506,28 +506,6 @@ pub(crate) fn handle_runtime(
             };
             super::events_response(response.body)
         }
-        DaemonRequest::Drain {
-            session_id,
-            subscription_id,
-        } => {
-            let session_known = runtime.list_sessions().ok().is_some_and(|sessions| {
-                sessions
-                    .iter()
-                    .any(|session| session.session_id.0 == session_id)
-            });
-            if !session_known {
-                return Ok(super::missing_session_drain_error(&session_id));
-            }
-            if let Some(subscription_id) = subscription_id {
-                pending_runtime.authorize_drain(
-                    &session_id,
-                    &subscription_id,
-                    observability.client_id,
-                    observability.grant_id,
-                )?;
-            }
-            Ok(daemon_events(Vec::new()))
-        }
         DaemonRequest::ReadScreen { session_id } => {
             let now = crate::daemon::owner_loop::tick(logical_clock);
             let _ = runtime.observe_session_lifecycle(&SessionId(session_id.clone()), now);
