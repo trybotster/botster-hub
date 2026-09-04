@@ -110,11 +110,6 @@ impl UnixTerminalAdapterInner {
     fn complete_active(&self) -> Option<Vec<u8>> {
         self.slot.complete_active()
     }
-
-    #[cfg(test)]
-    fn take_late_egress(&self) -> Option<Vec<u8>> {
-        self.slot.take_late_egress()
-    }
 }
 
 impl UnixTerminalAdapter {
@@ -628,11 +623,6 @@ impl UnixTerminalAdapterHandle {
         self.inner.complete_active()
     }
 
-    #[cfg(test)]
-    pub(crate) fn take_late_egress(&self) -> Option<Vec<u8>> {
-        self.inner.take_late_egress()
-    }
-
     pub(crate) fn write_opaque_frame(&self, frame: &botster_terminal_protocol::TerminalFrame) {
         let _ = self.inner.try_write(frame);
     }
@@ -811,19 +801,13 @@ mod tests {
         let frame =
             TerminalFrame::from_bytes(br#"{"type":"terminal_output","marker":"in-flight"}"#)
                 .expect("opaque frame");
-        let expected = frame.to_bytes().expect("bytes");
         assert_eq!(adapter.try_write(&frame), Ok(()));
         assert_eq!(adapter.pressure(), TerminalAdapterPressure::Full);
         handle.close();
         assert_eq!(adapter.pressure(), TerminalAdapterPressure::Closed);
         assert!(handle.snapshot_active().is_none());
         assert!(handle.complete_active().is_none());
-        assert_eq!(handle.take_late_egress(), Some(expected));
-        assert!(handle.take_late_egress().is_none());
-        assert_eq!(
-            adapter.try_write(&frame),
-            Err(TerminalAdapterWriteError::Closed)
-        );
+        assert!(handle.snapshot_active().is_none());
     }
 
     #[test]

@@ -53,9 +53,10 @@ struct WebRtcTerminalAdapterInner {
 impl WebRtcTerminalAdapterInner {
     fn new() -> Self {
         Self {
-            slot: AdapterSlot::with_wake_and_close_work(
+            slot: AdapterSlot::with_wake_close_work_and_late_egress(
                 AdapterWake::new(),
                 Arc::new(AtomicBool::new(false)),
+                true,
             ),
             aggregate: None,
             aggregate_permit: Mutex::new(None),
@@ -210,7 +211,7 @@ impl WebRtcTerminalAdapter {
         aggregate: Option<Arc<crate::admission::connection_budget::ConnectionAggregate>>,
     ) -> (Self, WebRtcTerminalAdapterHandle) {
         let inner = Arc::new(WebRtcTerminalAdapterInner {
-            slot: AdapterSlot::with_wake_and_close_work(wake, close_work),
+            slot: AdapterSlot::with_wake_close_work_and_late_egress(wake, close_work, true),
             aggregate,
             aggregate_permit: Mutex::new(None),
             aggregate_blocked: AtomicBool::new(false),
