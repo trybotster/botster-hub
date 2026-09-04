@@ -12,10 +12,10 @@ Pipeline: `botster_stack_delivery` (direct merge, no PR)
 | Target repository | `botster-hub` (`trybotster/botster-hub`) |
 | Target id | `tgt_7e208a0c76a44980a83b63af976b1f22` |
 | Independent routing | `list_spawn_targets` maps this id to spawn target `botster-hub` |
-| Implement commit | `8a02885f5b96023f6474f423524e1b7f51ae0f6d` |
+| Implement commit | `9879211a57bcfb0356833449e2ab928955da422b` |
 | Branch | `project-pipelines/ticket_1787600679_990088` |
 | Base | `ae6a0b1fe99d97215fa82d796da8f01a904171f0` |
-| `hub_sha` | `8a02885f5b96023f6474f423524e1b7f51ae0f6d` |
+| `hub_sha` | `9879211a57bcfb0356833449e2ab928955da422b` |
 | `locked_core_sha` | `72d1c7571bc229dbb2cbd67aa979b6504ac150a5` |
 | Toolchain | `rustc 1.97.0 (2d8144b78 2026-07-07)`, Zig `0.16.0` |
 | `teardown_class_applies` | yes |
@@ -71,6 +71,8 @@ Later Hub-only test repairs on this branch:
 | `77d0445` | `src/transport/unix/mux_write.rs`, `tests/hub_daemon_lifecycle/unix_terminal_adapter.rs` | Flush parked Unix terminal after the host-turn cap. Restore five-second hard stops |
 | `65b8c70` | `src/data_plane/driver.rs`, `src/runtime.rs`, `src/transport/unix/{adapter,connection,mux_write}.rs` | Pump the observed session after exact-session observe. Review rejected this synthetic wake |
 | `8a02885` | `src/data_plane/driver.rs`, `src/runtime.rs`, `src/transport/unix/connection.rs`, `tests/hub_daemon_lifecycle/{unix_terminal_adapter,subscription_ownership_baseline}.rs` | Remove the observe pump and pre-control flush. Collect unsolicited `process_exit` without ReadScreen or ListSessions |
+| `8d92d75` | `src/data_plane/driver.rs`, `src/transport/unix/{adapter,connection,mux_write}.rs`, tests, plan, report | Pump bound adapter routes after Core requests. Do not defer the next mux frame after a completed live send. Record try_write and flush. Replace advisor session UUIDs |
+| `9879211` | `src/data_plane/driver.rs` | Skip forced WouldBlock routes when pumping bound adapters |
 
 Inventory found no remaining production old-route symbol.
 
@@ -576,6 +578,48 @@ Log `/tmp/botster-hub-matrix-8a02885.log`. Start and end `MATRIX_BOUNDARY` commi
 | web_durable | pass |
 | web_shared | pass first try. `keep_alive_runs=2` `cancel_ablation=true` `exit_pass=true` |
 | web_plugin | pass. Reaped this-worktree IsolatedHub workers `37652`, `37654`, `37659` |
+| tui_ghostty | skipped. `ticket_1788460430_647093` |
+| north_star | skipped. `ticket_1788460430_647093` |
+
+Direct merge, no PR. Timing observations stay waived. Foreign session-workers were not killed.
+
+## Review `review_1788520334_663466` return
+
+Review sent Implement back with two findings. The unsolicited `process_exit` proof still failed 2/8 outside the sandbox. Committed plan and report contained advisor session UUID `sess-1788403107-0006-b32c6439f0082e5ade0aae9963dbdf77`.
+
+### `finding_1788520334_167722`
+
+Wake-boundary logs on the failing runs showed attaching, `terminal_output`, and attached `try_write`/`complete`/`flush`, and no `process_exit` `try_write`. Core never occupied the adapter. Owner-loop `observe_lifecycle_slice` can ingest `process_exit` onto a Ready bound adapter without a later wake.
+
+Repair `8d92d75` plus `9879211`:
+
+- After Core requests run on the data-plane thread, pump existing bound `adapter_routes`. This is not a fabricated `ingress_sessions` wake and is not attached to `observe_session_lifecycle` / ReadScreen.
+- Skip `BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_SESSION` routes so sibling isolation does not spend the 512-tick budget.
+- A completed live mux send no longer defers the next occupant.
+- After a writer wake, keep flushing while the mux still has unsent frames.
+- Attached proofs record `try_write` and `flush` for `process_exit` at the wake boundary. They still wait five seconds with no ReadScreen, ListSessions, or Drain.
+
+Isolated at `9879211`: both attached Unix `process_exit` tests 8/8, then another 8/8. Isolation oracles `forced_would_block_on_one_unix_route_keeps_sibling_open_and_delivering` and `webrtc_forced_would_block_on_one_route_keeps_sibling_open_and_delivering` pass.
+
+### `finding_1788520334_622131`
+
+Plan and report now cite `question_1788477409_664609` instead of the advisor session UUID.
+
+### Complete matrix at `9879211`
+
+Log `/tmp/botster-hub-matrix-9879211.log`. Start and end `MATRIX_BOUNDARY` commit `9879211a57bcfb0356833449e2ab928955da422b` dirty `0`. No component retries. TUI ghostty and north-star `ghostty-shared` skipped per `question_1788503817_293195`.
+
+| Arm | Result |
+| --- | --- |
+| fmt | pass |
+| clippy | pass |
+| locked | pass first try. Lib `555`. Lifecycle `346/0/2` |
+| hub_ts | pass |
+| web_unit | pass |
+| web_live | pass |
+| web_durable | pass |
+| web_shared | pass first try. `keep_alive_runs=2` `cancel_ablation=true` `exit_pass=true` |
+| web_plugin | pass. Reaped this-worktree IsolatedHub workers `93633`, `93635`, `93639` |
 | tui_ghostty | skipped. `ticket_1788460430_647093` |
 | north_star | skipped. `ticket_1788460430_647093` |
 
