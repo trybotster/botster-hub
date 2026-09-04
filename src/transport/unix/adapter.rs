@@ -607,18 +607,9 @@ pub(crate) fn observe_unix_adapter_wake(event: &str, frame_bytes: &[u8]) {
     if path.is_empty() {
         return;
     }
-    let frame_type = serde_json::from_slice::<serde_json::Value>(frame_bytes)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("type")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        })
-        .unwrap_or_else(|| "unknown".to_string());
     let row = serde_json::json!({
         "event": event,
-        "frame_type": frame_type,
+        "byte_len": frame_bytes.len(),
     });
     let line = format!("{row}\n");
     static LOCK: Mutex<()> = Mutex::new(());

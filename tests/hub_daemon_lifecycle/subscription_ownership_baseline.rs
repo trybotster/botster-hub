@@ -515,6 +515,18 @@ fn pump_woken_lives_only_in_the_data_plane_driver() {
         !driver.contains("call_then_pump_session"),
         "lifecycle observation must not synthesize a data-plane pump"
     );
+    assert!(
+        !driver.contains("pump_bound_adapter_routes"),
+        "Core requests must not scan bound adapter routes"
+    );
+    assert!(
+        !driver.contains("list_terminal_subscriptions"),
+        "the data-plane driver must not fabricate adapter wakes from subscription inventory"
+    );
+    assert!(
+        !driver.contains("forced_would_block_session"),
+        "production route selection must not skip pressured routes in test mode"
+    );
     for path in [
         "src/daemon/owner_loop.rs",
         "src/daemon_maintenance.rs",

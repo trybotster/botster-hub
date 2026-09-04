@@ -201,7 +201,7 @@ fn read_unsolicited_terminal_until(
         .expect("clear unsolicited terminal timeout");
 }
 
-fn unix_wake_log_has(path: &std::path::Path, event: &str, frame_type: &str) -> bool {
+fn unix_wake_log_has(path: &std::path::Path, event: &str, byte_len: usize) -> bool {
     let Ok(text) = fs::read_to_string(path) else {
         return false;
     };
@@ -210,7 +210,20 @@ fn unix_wake_log_has(path: &std::path::Path, event: &str, frame_type: &str) -> b
             return false;
         };
         value.get("event").and_then(serde_json::Value::as_str) == Some(event)
-            && value.get("frame_type").and_then(serde_json::Value::as_str) == Some(frame_type)
+            && value.get("byte_len").and_then(serde_json::Value::as_u64) == Some(byte_len as u64)
+    })
+}
+
+fn unix_process_exit_payload_len(
+    envelopes: &[botster_hub_client::DaemonUnixTerminalEnvelope],
+    session_id: &str,
+    subscription_id: &str,
+) -> Option<usize> {
+    envelopes.iter().find_map(|envelope| {
+        if !unix_envelope_is_process_exit(envelope, session_id, subscription_id) {
+            return None;
+        }
+        envelope.payload_bytes().ok().map(|bytes| bytes.len())
     })
 }
 
@@ -637,6 +650,123 @@ fn paused_data_plane_keeps_control_requests_from_driving_terminal_progress() {
     shutdown_short_lived_session(&endpoint, session_id);
     hub.shutdown().expect("shutdown isolated hub");
     let _ = fs::remove_dir_all(seam_dir);
+}
+
+#[test]
+fn live_generic_core_requests_do_not_drive_idle_terminal_output() {
+    let _guard = daemon_test_guard();
+    let hub = start_isolated_live_output_hub("idle-ctrl");
+    let endpoint = hub.endpoint().clone();
+    let session_id = "idle-ctrl-session";
+    let subscription_id = "idle-ctrl-sub";
+    let hold = hub.data_dir().join("idle-ctrl-hold");
+    let (mut stream, mut reader) = unix_adapter_connection(&endpoint);
+    let mut envelopes = Vec::new();
+    let mut events = Vec::new();
+    spawn_and_bind(
+        &mut stream,
+        &mut reader,
+        session_id,
+        subscription_id,
+        &format!(
+            "printf 'idle-ctrl-ready\\n'; while [ ! -e '{}' ]; do sleep 0.01; done",
+            hold.display()
+        ),
+        &mut envelopes,
+        &mut events,
+    );
+    read_unsolicited_terminal_until(
+        &mut reader,
+        &mut envelopes,
+        Instant::now() + Duration::from_secs(5),
+        "idle-ctrl-ready",
+    );
+    let attached_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < attached_deadline
+        && !envelopes.iter().any(|envelope| {
+            unix_envelope_is_attached(envelope, session_id, subscription_id)
+        })
+    {
+        reader
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("set attached wait timeout");
+        match botster_hub_client::read_unix_mux_frame_from_reader(&mut reader) {
+            Ok(botster_hub_client::DaemonUnixMuxFrame::Terminal(envelope)) => {
+                envelopes.push(envelope);
+            }
+            Ok(botster_hub_client::DaemonUnixMuxFrame::Event(_)) => {}
+            Ok(botster_hub_client::DaemonUnixMuxFrame::Response(response)) => {
+                panic!("attached wait received a control response: {response:?}")
+            }
+            Err(_) => {}
+        }
+    }
+    reader
+        .get_ref()
+        .set_read_timeout(None)
+        .expect("clear attached wait timeout");
+    assert!(
+        unix_envelope_contains_live_bytes(&envelopes, "idle-ctrl-ready"),
+        "idle session must deliver ready bytes before control probes: {envelopes:?}"
+    );
+    assert!(
+        envelopes
+            .iter()
+            .any(|envelope| unix_envelope_is_attached(envelope, session_id, subscription_id)),
+        "idle session must attach before control probes: {envelopes:?}"
+    );
+    reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .expect("set quiet drain timeout");
+    loop {
+        match botster_hub_client::read_unix_mux_frame_from_reader(&mut reader) {
+            Ok(botster_hub_client::DaemonUnixMuxFrame::Terminal(envelope)) => {
+                envelopes.push(envelope);
+            }
+            Ok(botster_hub_client::DaemonUnixMuxFrame::Event(_)) => {}
+            Ok(botster_hub_client::DaemonUnixMuxFrame::Response(response)) => {
+                panic!("quiet drain received a control response: {response:?}")
+            }
+            Err(_) => break,
+        }
+    }
+    reader
+        .get_ref()
+        .set_read_timeout(None)
+        .expect("clear quiet drain timeout");
+    envelopes.clear();
+    let requests = [
+        botster_hub_client::DaemonRequest::Status,
+        botster_hub_client::DaemonRequest::ListSessions,
+        botster_hub_client::DaemonRequest::ReadScreen {
+            session_id: session_id.to_string(),
+        },
+        botster_hub_client::DaemonRequest::ReadModeFlags {
+            session_id: session_id.to_string(),
+        },
+        botster_hub_client::DaemonRequest::CaptureSnapshot {
+            session_id: session_id.to_string(),
+        },
+    ];
+    for request in requests {
+        request_collecting_mux(
+            &mut stream,
+            &mut reader,
+            &request,
+            &mut envelopes,
+            &mut events,
+        );
+        assert!(
+            envelopes.is_empty(),
+            "generic Core requests must not drive terminal delivery on an idle bound adapter: request={request:?} envelopes={envelopes:?}"
+        );
+    }
+    fs::write(&hold, b"go").expect("release idle session");
+    drop(stream);
+    shutdown_short_lived_session(&endpoint, session_id);
+    hub.shutdown().expect("shutdown isolated hub");
 }
 
 #[test]
@@ -1301,13 +1431,15 @@ fn unix_adapter_bound_printf_stream_attach_delivers_process_exit() {
             .any(|envelope| unix_envelope_is_process_exit(envelope, session_id, subscription_id)),
         "attached terminal subscription must deliver unsolicited process_exit from the Unix writer wake without ReadScreen or ListSessions: envelopes={envelopes:?} wake={wake_log}"
     );
+    let process_exit_len = unix_process_exit_payload_len(&envelopes, session_id, subscription_id)
+        .expect("process_exit envelope payload length");
     assert!(
-        unix_wake_log_has(&wake_path, "try_write", "process_exit"),
-        "Core must occupy the adapter slot with process_exit: {wake_log}"
+        unix_wake_log_has(&wake_path, "try_write", process_exit_len),
+        "Core must occupy the adapter slot with the received process_exit bytes: {wake_log}"
     );
     assert!(
-        unix_wake_log_has(&wake_path, "flush", "process_exit"),
-        "the Unix writer must flush process_exit after the adapter wake: {wake_log}"
+        unix_wake_log_has(&wake_path, "flush", process_exit_len),
+        "the Unix writer must flush the received process_exit bytes after the adapter wake: {wake_log}"
     );
     wait_for_authoritative_session_exit(&endpoint, session_id);
     assert_host_session_retained(&mut connection, session_id);
@@ -2931,13 +3063,15 @@ fn unix_shutdown_session_from_another_connection_classifies_attached_exit() {
             .any(|envelope| unix_envelope_is_process_exit(envelope, session_id, subscription_id)),
         "attached adapter must see unsolicited process_exit from the Unix writer wake without ReadScreen or ListSessions: envelopes={envelopes:?} wake={wake_log}"
     );
+    let process_exit_len = unix_process_exit_payload_len(&envelopes, session_id, subscription_id)
+        .expect("process_exit envelope payload length");
     assert!(
-        unix_wake_log_has(&wake_path, "try_write", "process_exit"),
-        "Core must occupy the adapter slot with process_exit: {wake_log}"
+        unix_wake_log_has(&wake_path, "try_write", process_exit_len),
+        "Core must occupy the adapter slot with the received process_exit bytes: {wake_log}"
     );
     assert!(
-        unix_wake_log_has(&wake_path, "flush", "process_exit"),
-        "the Unix writer must flush process_exit after the adapter wake: {wake_log}"
+        unix_wake_log_has(&wake_path, "flush", process_exit_len),
+        "the Unix writer must flush the received process_exit bytes after the adapter wake: {wake_log}"
     );
     wait_for_authoritative_session_exit(&endpoint, session_id);
 

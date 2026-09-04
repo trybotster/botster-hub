@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use botster_core::contract::terminal_wake::{TerminalWakeBatch, TerminalWakeRoute};
 use botster_core_daemon::{CoreDaemon, CoreDaemonConfig, WakePumpControl, WakePumpWait};
 
 use crate::daemon::control::message::{ControlMessage, ControlSender};
@@ -265,9 +264,7 @@ fn run_loop(
                 pumped = !batch.adapter_routes.is_empty() || !batch.ingress_sessions.is_empty();
             }
         }
-        if run_core_requests(core_daemon, &requests) > 0 {
-            pump_bound_adapter_routes(core_daemon, now_seconds);
-        }
+        let _ = run_core_requests(core_daemon, &requests);
         {
             let close_batch = close_work.take_batch(DATA_PLANE_MAX_CLOSE_KEYS);
             counters
@@ -307,37 +304,6 @@ fn run_core_requests(core_daemon: &mut CoreDaemon, requests: &Receiver<CoreReque
         ran += 1;
     }
     ran
-}
-
-fn forced_would_block_session(session_id: &str) -> bool {
-    if std::env::var("BOTSTER_ENV").as_deref() != Ok("test") {
-        return false;
-    }
-    if std::env::var("BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK").as_deref() == Ok("1") {
-        return true;
-    }
-    std::env::var("BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_SESSION")
-        .is_ok_and(|held| held == session_id)
-}
-
-fn pump_bound_adapter_routes(core_daemon: &mut CoreDaemon, now_seconds: u64) {
-    let adapter_routes: Vec<TerminalWakeRoute> = core_daemon
-        .list_terminal_subscriptions()
-        .into_iter()
-        .filter(|row| row.adapter_bound && !forced_would_block_session(&row.session_id.0))
-        .map(|row| TerminalWakeRoute {
-            session_id: row.session_id,
-            subscription_id: row.subscription_id,
-        })
-        .collect();
-    if adapter_routes.is_empty() {
-        return;
-    }
-    let batch = TerminalWakeBatch {
-        adapter_routes,
-        ingress_sessions: Vec::new(),
-    };
-    let _ = core_daemon.pump_woken(&batch, now_seconds);
 }
 
 fn current_unix_seconds() -> u64 {
