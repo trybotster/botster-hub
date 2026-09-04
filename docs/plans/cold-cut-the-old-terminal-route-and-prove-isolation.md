@@ -17,7 +17,7 @@ Human decisions: `question_1788460117_825061` and `question_1788461094_542980` (
 | Plan worktree | this pipeline worktree; path has no `:`; tracked `.gitignore` has content |
 | Base commit | `ae6a0b1fe99d97215fa82d796da8f01a904171f0` (revision 1 used `bb1a330`; main advanced through `ticket_1788206393_323469`) |
 | Locked Core pin at base | `48a437032791e678010254708259568ce4ad02bf` |
-| Published Core revision to consume | `72d1c7571bc229dbb2cbd67aa979b6504ac150a5` (merge commit of `ticket_1787894967_973951`, `artifact_1788459695_462764`) |
+| Published Core revision to consume | `5ed369fc4a536d7cfa99547262561fcea7ef41e5` (supersedes `72d1c75`; observe bound-queue wake from `ticket_1788523929_630135`). Residual stale-shutdown wake retirement is `ticket_1788537020_814817`. |
 | Merge policy | direct into `main` |
 | Session-type eligibility consumer | no |
 | `teardown_class_applies` | yes (section 12) |
@@ -342,6 +342,7 @@ Unchanged by design: `src/transport/**`, `src/data_plane/**`, `src/admission/**`
 13. Daemon-restart ended-row test green: `process_ownership_daemon_restart_lists_ended_session_row`. Complete-baseline `registry_state=Exited` with omitted engine lifecycle is ended evidence. Running + omitted lifecycle stays indeterminate.
 14. Web cancel-ablation ticket `ticket_1788467459_333288` and TUI late-history ticket `ticket_1788467460_864070` exist. This ticket depends on both. The complete matrix in section 6.D reruns once after both merge.
 15. Core ticket `ticket_1788523929_630135` exists. This ticket depends on it. After that Core merge, Hub pins the new Core revision, keeps wake-only pumps, and reruns isolated Unix `process_exit` 8/8 then the complete matrix. Generic Core requests must not advance terminal delivery.
+16. Core `5ed369f` is the Hub pin. Stale-then-shutdown wake retirement is `ticket_1788537020_814817`. Hub stays on `5ed369f` and does not restore `72d1c75`.
 
 ## 12. Runtime-teardown lenses
 

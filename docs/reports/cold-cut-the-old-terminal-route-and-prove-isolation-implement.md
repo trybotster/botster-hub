@@ -12,11 +12,11 @@ Pipeline: `botster_stack_delivery` (direct merge, no PR)
 | Target repository | `botster-hub` (`trybotster/botster-hub`) |
 | Target id | `tgt_7e208a0c76a44980a83b63af976b1f22` |
 | Independent routing | `list_spawn_targets` maps this id to spawn target `botster-hub` |
-| Implement commit | `f80e9027b7838e755994c552ed10ab3b352baae9` |
+| Implement commit | `b164ca1a8e0c2b77ccfbc1c9ea83e158b6a3c928` |
 | Branch | `project-pipelines/ticket_1787600679_990088` |
 | Base | `ae6a0b1fe99d97215fa82d796da8f01a904171f0` |
-| `hub_sha` | `f80e9027b7838e755994c552ed10ab3b352baae9` |
-| `locked_core_sha` | `72d1c7571bc229dbb2cbd67aa979b6504ac150a5` |
+| `hub_sha` | `b164ca1a8e0c2b77ccfbc1c9ea83e158b6a3c928` |
+| `locked_core_sha` | `5ed369fc4a536d7cfa99547262561fcea7ef41e5` |
 | Toolchain | `rustc 1.97.0 (2d8144b78 2026-07-07)`, Zig `0.16.0` |
 | `teardown_class_applies` | yes |
 
@@ -74,6 +74,7 @@ Later Hub-only test repairs on this branch:
 | `8d92d75` | `src/data_plane/driver.rs`, `src/transport/unix/{adapter,connection,mux_write}.rs`, tests, plan, report | Pump bound adapter routes after Core requests. Do not defer the next mux frame after a completed live send. Record try_write and flush. Replace advisor session UUIDs |
 | `9879211` | `src/data_plane/driver.rs` | Skip forced WouldBlock routes when pumping bound adapters |
 | `f80e902` | `src/data_plane/driver.rs`, `src/transport/unix/adapter.rs`, tests, plan | Remove the post-request global adapter pump and test-only WouldBlock skip. Log opaque wake byte lengths. Register Core `ticket_1788523929_630135` |
+| `b164ca1` | Core-family manifests, `Cargo.lock`, pin literals | Pin Core `5ed369f`. Zero `72d1c75` matches outside `docs/` |
 
 Inventory found no remaining production old-route symbol.
 
@@ -658,6 +659,22 @@ The review-return paragraph now cites `finding_1788520334_622131`. A complete-tr
 ### Residual
 
 Do not request Review until Core `ticket_1788523929_630135` merges, Hub pins that revision, isolated Unix `process_exit` is 8/8 then 8/8 at a clean feature SHA, and the complete matrix has clean `MATRIX_BOUNDARY` markers.
+
+## Core `5ed369f` pin
+
+Core main `5ed369fc4a536d7cfa99547262561fcea7ef41e5` supersedes `72d1c75`. `72d1c75` is an ancestor. The revision emits a targeted session ingress wake after observe/drain queues bound frames. Hub pin commit `b164ca1`. Zero `72d1c75` matches remain outside `docs/`. `Cargo.lock` has 6 `5ed369f` sources.
+
+Isolated at `b164ca1`:
+
+- `unix_adapter_bound_printf_stream_attach_delivers_process_exit` 8/8 then 8/8
+- `unix_shutdown_session_from_another_connection_classifies_attached_exit` 8/8 then 8/8
+- WouldBlock isolation Unix and WebRTC pass
+- Live idle-control negative and paused data-plane negative pass
+- fmt and Clippy pass on `rustc 1.97.0`
+
+Complete matrix `/tmp/botster-hub-matrix-b164ca1.log` failed the locked arm. `subscription::entity::tests::live_session_entity_subscription_emits_exact_stale_transition_patch` failed 5/5 isolated in 4.0s: `worker session shutdown did not complete before the daemon deadline: stale-transition-session`. `mark_session_stale` then `shutdown_session` forgets the session wake because the registry is already Stale and no adapter frames are undelivered. `wait_wakes_bounded` then misses worker EOF. This path passed on Core `72d1c75`.
+
+Registered Core `ticket_1788537020_814817`. Dependency `dependency_1788537029_689954`. Core run `run_1788537030_383590`. Hub stays on `5ed369f`. No compatibility path back to `72d1c75`. Do not request Review until that Core merge, a Hub pin of that revision if it moves, locked suite green, and a clean matrix.
 
 ## Missing vault guidance discovered
 
