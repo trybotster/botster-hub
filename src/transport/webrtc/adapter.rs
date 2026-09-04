@@ -71,8 +71,7 @@ impl WebRtcTerminalAdapterInner {
     }
 
     fn close_from_host(&self) {
-        self.release_aggregate_permit();
-        self.park_late_egress();
+        self.close_retaining_occupied_budget();
         self.slot.close_from_host();
     }
 
@@ -82,15 +81,39 @@ impl WebRtcTerminalAdapterInner {
     }
 
     fn close(&self) {
-        self.release_aggregate_permit();
-        self.park_late_egress();
+        self.close_retaining_occupied_budget();
         self.slot.close();
     }
 
-    fn park_late_egress(&self) {
-        let Some(bytes) = self.slot.snapshot_active() else {
+    fn close_retaining_occupied_budget(&self) {
+        if self.park_late_egress() || self.peek_late_egress().is_some() {
             return;
+        }
+        self.release_aggregate_permit();
+    }
+
+    fn park_late_egress(&self) -> bool {
+        let Some(bytes) = self.slot.snapshot_active() else {
+            return false;
         };
+        let mut late = self
+            .late_egress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if late.is_none() {
+            *late = Some(bytes);
+        }
+        true
+    }
+
+    fn peek_late_egress(&self) -> Option<Vec<u8>> {
+        self.late_egress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn restore_late_egress(&self, bytes: Vec<u8>) {
         let mut late = self
             .late_egress
             .lock()
@@ -185,13 +208,26 @@ impl WebRtcTerminalAdapterInner {
             .aggregate_permit
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let permitted = permit
-            .as_mut()
-            .is_none_or(|permit| permit.try_resize(frame_len));
-        if !permitted {
-            self.aggregate_blocked.store(true, Ordering::Release);
+        match permit.as_mut() {
+            Some(existing) => {
+                let permitted = existing.try_resize(frame_len);
+                if !permitted {
+                    self.aggregate_blocked.store(true, Ordering::Release);
+                }
+                permitted
+            }
+            None => {
+                let Some(aggregate) = self.aggregate.as_ref() else {
+                    return true;
+                };
+                let Some(authorized) = aggregate.try_authorize(frame_len) else {
+                    self.aggregate_blocked.store(true, Ordering::Release);
+                    return false;
+                };
+                *permit = Some(authorized);
+                true
+            }
         }
-        permitted
     }
 
     fn release_aggregate_permit(&self) {
@@ -403,6 +439,7 @@ impl WebRtcConnectionMux {
                 .store(true, Ordering::Release);
             record_forced_pressure("would_block");
         }
+
         if let Ok(mut routes) = self.inner.routes.lock() {
             let key = (session_id.clone(), subscription_id.clone(), generation);
             routes.insert(
@@ -683,8 +720,16 @@ impl WebRtcTerminalAdapterHandle {
         self.inner.take_late_egress()
     }
 
+    pub(crate) fn restore_late_egress(&self, bytes: Vec<u8>) {
+        self.inner.restore_late_egress(bytes);
+    }
+
     pub(crate) fn resize_aggregate_permit(&self, frame_len: usize) -> bool {
         self.inner.resize_aggregate_permit(frame_len)
+    }
+
+    pub(crate) fn release_aggregate_permit(&self) {
+        self.inner.release_aggregate_permit();
     }
 
     pub(crate) fn write_opaque_frame(&self, frame: &TerminalFrame) {
@@ -825,6 +870,60 @@ mod tests {
             adapter.try_write(&frame),
             Err(TerminalAdapterWriteError::Closed)
         );
+    }
+
+    #[test]
+    fn occupied_close_keeps_aggregate_permit_from_a_sibling_write() {
+        use crate::admission::connection_budget::{
+            AGGREGATE_BUFFERED_HIGH, ChannelClass, ConnectionBudget,
+        };
+
+        let mut budget = ConnectionBudget::default();
+        let filled = budget
+            .reserve("entity".into(), ChannelClass::Entity)
+            .expect("entity budget");
+        let mux = WebRtcConnectionMux::new();
+        let (mut first, first_handle) = mux.create_adapter_with_aggregate(budget.aggregate());
+        let (mut sibling, sibling_handle) = mux.create_adapter_with_aggregate(budget.aggregate());
+        mux.register("first".into(), "terminal".into(), 1, first_handle.clone());
+        mux.register(
+            "sibling".into(),
+            "terminal".into(),
+            1,
+            sibling_handle.clone(),
+        );
+        let occupied = TerminalFrame::from_bytes(
+            br#"{"type":"terminal_output","marker":"occupied-late-budget"}"#,
+        )
+        .expect("occupied opaque frame");
+        let occupied_len = occupied.to_bytes().expect("occupied bytes").len();
+        let sibling_frame = TerminalFrame::from_bytes(
+            br#"{"type":"terminal_output","marker":"sibling-late-budget"}"#,
+        )
+        .expect("sibling opaque frame");
+        filled.store(
+            AGGREGATE_BUFFERED_HIGH - occupied_len - 32,
+            Ordering::Release,
+        );
+
+        assert_eq!(first.try_write(&occupied), Ok(()));
+        assert_eq!(budget.aggregate_buffered(), AGGREGATE_BUFFERED_HIGH - 32);
+        first_handle.close();
+        assert!(first_handle.snapshot_active().is_none());
+        assert_eq!(
+            first_handle.take_late_egress().as_deref(),
+            Some(occupied.to_bytes().expect("occupied bytes").as_slice())
+        );
+        assert_eq!(
+            budget.aggregate_buffered(),
+            AGGREGATE_BUFFERED_HIGH - 32,
+            "parked late bytes must keep their aggregate permit"
+        );
+        assert_eq!(
+            sibling.try_write(&sibling_frame),
+            Err(TerminalAdapterWriteError::WouldBlock)
+        );
+        assert!(sibling_handle.snapshot_active().is_none());
     }
 
     #[test]
