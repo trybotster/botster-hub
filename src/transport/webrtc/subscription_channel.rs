@@ -801,30 +801,19 @@ async fn flush_subscription_adapter_frames<C>(
 where
     C: LocalWebrtcDataChannel + ?Sized,
 {
-    let (bytes, from_late) = match handle.snapshot_active() {
-        Some(bytes) => (bytes, false),
-        None => match handle.take_late_egress() {
-            Some(bytes) => (bytes, true),
+    let bytes = match handle.snapshot_active() {
+        Some(bytes) => bytes,
+        None => match handle.peek_late_egress() {
+            Some(bytes) => bytes,
             None => {
                 handle.release_aggregate_permit();
                 return if handle.is_closed() { Err(()) } else { Ok(()) };
             }
         },
     };
-    let frames = match framed_daemon_terminal_frame(stream_key, &bytes) {
-        Ok(frames) => frames,
-        Err(_) => {
-            if from_late {
-                handle.restore_late_egress(bytes);
-            }
-            return Err(());
-        }
-    };
+    let frames = framed_daemon_terminal_frame(stream_key, &bytes).map_err(|_| ())?;
     let wire_len = frames.iter().map(String::len).sum();
     if !handle.resize_aggregate_permit(wire_len) {
-        if from_late {
-            handle.restore_late_egress(bytes);
-        }
         return Err(());
     }
     for frame in frames {
@@ -1014,6 +1003,72 @@ mod tests {
             "usage publication must replace the close-time permit"
         );
         assert!(handle.take_late_egress().is_none());
+    }
+
+    #[test]
+    fn second_close_during_late_send_keeps_the_aggregate_permit() {
+        use crate::admission::connection_budget::{ChannelClass, ConnectionBudget};
+        use botster_core::contract::terminal_adapter::TerminalAdapter;
+        use botster_terminal_protocol::TerminalFrame;
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let mut budget = ConnectionBudget::default();
+        let usage = budget
+            .reserve("route".to_string(), ChannelClass::Terminal)
+            .expect("reserve terminal route");
+        let mux = WebRtcConnectionMux::new();
+        let (mut adapter, handle) = mux.create_adapter_with_aggregate(budget.aggregate());
+        mux.register("late-send".into(), "terminal".into(), 1, handle.clone());
+        let frame = TerminalFrame::from_bytes(br#"{"type":"terminal_output","marker":"inflight"}"#)
+            .expect("opaque frame");
+        assert_eq!(adapter.try_write(&frame), Ok(()));
+        handle.close();
+        assert!(budget.aggregate_buffered() > 0);
+        let channel = Arc::new(FakeDataChannel::default());
+        channel.send_hangs.store(true, Ordering::Release);
+        let key = AesGcmKey::from_slice(&[11; 32]).expect("test key");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("flush runtime");
+        let flush = runtime.spawn({
+            let channel = Arc::clone(&channel);
+            let handle = handle.clone();
+            let usage = Arc::clone(&usage);
+            async move {
+                flush_subscription_adapter_frames(channel.as_ref(), &key, &handle, &usage).await
+            }
+        });
+        let entered = Instant::now() + Duration::from_secs(2);
+        while !channel.send_entered.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < entered,
+                "late send must reach local_send_text"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let authorized_during_send = budget.aggregate_buffered();
+        handle.close_from_host();
+        assert_eq!(
+            budget.aggregate_buffered(),
+            authorized_during_send,
+            "a second close during late send must keep the aggregate permit"
+        );
+        assert!(handle.peek_late_egress().is_some());
+        channel.send_hangs.store(false, Ordering::Release);
+        channel.send_notify.notify_waiters();
+        runtime
+            .block_on(flush)
+            .expect("flush task")
+            .expect("flush parked late egress after second close");
+        assert!(!channel.sent.lock().expect("sent frames").is_empty());
+        assert_eq!(
+            budget.aggregate_buffered(),
+            usage.load(Ordering::Acquire),
+            "usage publication must replace the close-time permit"
+        );
     }
 
     fn initial_usage_blocks_first_payload(

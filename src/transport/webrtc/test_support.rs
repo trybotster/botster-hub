@@ -60,6 +60,7 @@ pub(crate) struct FakeDataChannel {
     pub(crate) closed: AtomicBool,
     pub(crate) send_fails: AtomicBool,
     pub(crate) send_hangs: AtomicBool,
+    pub(crate) send_entered: AtomicBool,
     pub(crate) close_hangs: AtomicBool,
     pub(crate) close_started: AtomicBool,
     pub(crate) close_probe: Mutex<Option<Arc<dyn Fn() -> bool + Send + Sync>>>,
@@ -96,6 +97,7 @@ impl LocalWebrtcDataChannel for FakeDataChannel {
     }
 
     async fn local_send_text(&self, text: &str) -> Result<(), String> {
+        self.send_entered.store(true, Ordering::Release);
         while self.send_hangs.load(Ordering::Acquire) {
             let notified = self.send_notify.notified();
             tokio::pin!(notified);

@@ -113,16 +113,6 @@ impl WebRtcTerminalAdapterInner {
             .clone()
     }
 
-    fn restore_late_egress(&self, bytes: Vec<u8>) {
-        let mut late = self
-            .late_egress
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if late.is_none() {
-            *late = Some(bytes);
-        }
-    }
-
     fn take_late_egress(&self) -> Option<Vec<u8>> {
         self.late_egress
             .lock()
@@ -716,12 +706,12 @@ impl WebRtcTerminalAdapterHandle {
         self.inner.complete_active()
     }
 
-    pub(crate) fn take_late_egress(&self) -> Option<Vec<u8>> {
-        self.inner.take_late_egress()
+    pub(crate) fn peek_late_egress(&self) -> Option<Vec<u8>> {
+        self.inner.peek_late_egress()
     }
 
-    pub(crate) fn restore_late_egress(&self, bytes: Vec<u8>) {
-        self.inner.restore_late_egress(bytes);
+    pub(crate) fn take_late_egress(&self) -> Option<Vec<u8>> {
+        self.inner.take_late_egress()
     }
 
     pub(crate) fn resize_aggregate_permit(&self, frame_len: usize) -> bool {
