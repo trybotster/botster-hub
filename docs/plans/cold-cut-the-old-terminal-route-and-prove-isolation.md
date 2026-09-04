@@ -256,7 +256,7 @@ Do not create a second Web ticket for durable restore. Do not create another Hub
 
 ## 7. Repository ownership boundaries and cross-repository dependencies
 
-- `botster-core` owns terminal subscription identity, attach phases, duplex bytes, mode-gated input, resize, ordering, bounded queues, pressure, generation fencing, teardown, wakes, and targeted pumping. Published at `72d1c75`; consumed here by pin only.
+- `botster-core` owns terminal subscription identity, attach phases, duplex bytes, mode-gated input, resize, ordering, bounded queues, pressure, generation fencing, teardown, wakes, and targeted pumping. Published at `72d1c75`; consumed here by pin only. `review_1788523297_801440` requires a Core repair when observe/drain queues bound adapter frames without a targeted wake. That work is `ticket_1788523929_630135` (`tgt_1f7bce66eb304881980f9b4a2a5ae3fe`). This Hub ticket depends on it (`dependency_1788523941_772682`). Hub must not restore a post-request global adapter pump.
 - `botster-hub` owns admission (grants, key derivation, labels, peer generations, budgets, route policy), subscription route state (Reserved, Bound, Retired), concrete Unix and WebRTC mechanics (framing, sealing, chunking, bounded close), the hosting process, and the data-plane driver. Hub does not decode terminal bodies.
 - `botster-hub-client` (in-repo member) owns the external DTO boundary. Only a test guard changes; if the generated TypeScript changes, the [[botster-hub-client-playbook]] gates apply.
 - Lua plugins compose commands, hooks, workflows, lifecycle policy, defaults, and customization outside transport hot paths.
@@ -341,6 +341,7 @@ Unchanged by design: `src/transport/**`, `src/data_plane/**`, `src/admission/**`
 12. Consumer TUI pin-roll ticket created with a dependency edge on this ticket.
 13. Daemon-restart ended-row test green: `process_ownership_daemon_restart_lists_ended_session_row`. Complete-baseline `registry_state=Exited` with omitted engine lifecycle is ended evidence. Running + omitted lifecycle stays indeterminate.
 14. Web cancel-ablation ticket `ticket_1788467459_333288` and TUI late-history ticket `ticket_1788467460_864070` exist. This ticket depends on both. The complete matrix in section 6.D reruns once after both merge.
+15. Core ticket `ticket_1788523929_630135` exists. This ticket depends on it. After that Core merge, Hub pins the new Core revision, keeps wake-only pumps, and reruns isolated Unix `process_exit` 8/8 then the complete matrix. Generic Core requests must not advance terminal delivery.
 
 ## 12. Runtime-teardown lenses
 
