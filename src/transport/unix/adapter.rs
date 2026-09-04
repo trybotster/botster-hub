@@ -110,6 +110,14 @@ impl UnixTerminalAdapterInner {
     fn complete_active(&self) -> Option<Vec<u8>> {
         self.slot.complete_active()
     }
+
+    fn peek_late_egress(&self) -> Option<Vec<u8>> {
+        self.slot.peek_late_egress()
+    }
+
+    fn take_late_egress(&self) -> Option<Vec<u8>> {
+        self.slot.take_late_egress()
+    }
 }
 
 impl UnixTerminalAdapter {
@@ -468,9 +476,9 @@ impl UnixConnectionMux {
         let Ok(routes) = self.inner.routes.lock() else {
             return false;
         };
-        routes
-            .values()
-            .any(|route| route.handle.snapshot_active().is_some())
+        routes.values().any(|route| {
+            route.handle.snapshot_active().is_some() || route.handle.peek_late_egress().is_some()
+        })
     }
 
     pub(crate) fn has_bound_routes(&self) -> bool {
@@ -512,14 +520,18 @@ impl UnixConnectionMux {
                 if route.handle.is_flush_deferred() {
                     return None;
                 }
-                route.handle.snapshot_active().map(|bytes| {
-                    (
-                        route.session_id.clone(),
-                        route.subscription_id.clone(),
-                        route.handle.clone(),
-                        bytes,
-                    )
-                })
+                route
+                    .handle
+                    .snapshot_active()
+                    .or_else(|| route.handle.peek_late_egress())
+                    .map(|bytes| {
+                        (
+                            route.session_id.clone(),
+                            route.subscription_id.clone(),
+                            route.handle.clone(),
+                            bytes,
+                        )
+                    })
             })
             .collect()
     }
@@ -621,6 +633,14 @@ impl UnixTerminalAdapterHandle {
 
     pub(crate) fn complete_active(&self) -> Option<Vec<u8>> {
         self.inner.complete_active()
+    }
+
+    pub(crate) fn peek_late_egress(&self) -> Option<Vec<u8>> {
+        self.inner.peek_late_egress()
+    }
+
+    pub(crate) fn take_late_egress(&self) -> Option<Vec<u8>> {
+        self.inner.take_late_egress()
     }
 
     pub(crate) fn write_opaque_frame(&self, frame: &botster_terminal_protocol::TerminalFrame) {
@@ -801,13 +821,19 @@ mod tests {
         let frame =
             TerminalFrame::from_bytes(br#"{"type":"terminal_output","marker":"in-flight"}"#)
                 .expect("opaque frame");
+        let expected = frame.to_bytes().expect("bytes");
         assert_eq!(adapter.try_write(&frame), Ok(()));
         assert_eq!(adapter.pressure(), TerminalAdapterPressure::Full);
         handle.close();
         assert_eq!(adapter.pressure(), TerminalAdapterPressure::Closed);
         assert!(handle.snapshot_active().is_none());
         assert!(handle.complete_active().is_none());
-        assert!(handle.snapshot_active().is_none());
+        assert_eq!(handle.take_late_egress(), Some(expected));
+        assert!(handle.take_late_egress().is_none());
+        assert_eq!(
+            adapter.try_write(&frame),
+            Err(TerminalAdapterWriteError::Closed)
+        );
     }
 
     #[test]

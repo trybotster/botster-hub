@@ -654,6 +654,14 @@ impl WebRtcTerminalAdapterHandle {
         self.inner.complete_active()
     }
 
+    pub(crate) fn peek_late_egress(&self) -> Option<Vec<u8>> {
+        self.inner.slot.peek_late_egress()
+    }
+
+    pub(crate) fn take_late_egress(&self) -> Option<Vec<u8>> {
+        self.inner.slot.take_late_egress()
+    }
+
     pub(crate) fn resize_aggregate_permit(&self, frame_len: usize) -> bool {
         self.inner.resize_aggregate_permit(frame_len)
     }
@@ -783,13 +791,19 @@ mod tests {
         let frame =
             TerminalFrame::from_bytes(br#"{"type":"terminal_output","marker":"in-flight"}"#)
                 .expect("opaque frame");
+        let expected = frame.to_bytes().expect("bytes");
         assert_eq!(adapter.try_write(&frame), Ok(()));
         assert_eq!(adapter.pressure(), TerminalAdapterPressure::Full);
         handle.close();
         assert_eq!(adapter.pressure(), TerminalAdapterPressure::Closed);
         assert!(handle.snapshot_active().is_none());
         assert!(handle.complete_active().is_none());
-        assert!(handle.snapshot_active().is_none());
+        assert_eq!(handle.take_late_egress(), Some(expected));
+        assert!(handle.take_late_egress().is_none());
+        assert_eq!(
+            adapter.try_write(&frame),
+            Err(TerminalAdapterWriteError::Closed)
+        );
     }
 
     #[test]

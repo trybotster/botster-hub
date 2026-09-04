@@ -1125,13 +1125,7 @@ fn webrtc_terminal_output_is_byte_exact() {
     let subscription_id = "so-bytes-sub";
     let start_path = unique_short_test_dir("so-bytes-start").join("go");
     let release_path = unique_short_test_dir("so-bytes-release").join("go");
-    let exit_release_path = unique_short_test_dir("so-bytes-exit").join("go");
-    let script_path = write_python_started_held_live_script(
-        &start_path,
-        &release_path,
-        &exit_release_path,
-        expected,
-    );
+    let script_path = write_python_start_then_write_script(&start_path, &release_path, expected);
     block_on(async {
         let (mut peer, key) = open_local_webrtc_peer(&endpoint, &bootstrap).await;
         peer.encrypted_hello(&key, &webrtc_terminal_adapter_hello())
@@ -1175,9 +1169,6 @@ fn webrtc_terminal_output_is_byte_exact() {
                 .any(|window| window == expected),
             "WebRTC adapter frames must preserve exact bytes, got {concatenated:?}"
         );
-        fs::create_dir_all(exit_release_path.parent().expect("exit release parent"))
-            .expect("create exit release dir");
-        fs::write(&exit_release_path, b"go").expect("release producer exit");
         wait_for_authoritative_session_exit(&endpoint, session_id);
         peer.peer.close().await.expect("close offer peer");
     });
