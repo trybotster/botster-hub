@@ -751,9 +751,37 @@ Direct merge, no PR. Timing observations stay waived. Close-evidence stayed on H
 
 Residual after this complete matrix:
 
-- Earlier aborted or spliced matrices are not evidence.
-- Web live Playwright popover clicks and 45s alt-screen renderer-write waits still fail under higher host load. This complete run passed first try at load about `10` to `12`.
+- Earlier aborted or spliced matrices are not passing product evidence.
 - TUI proof uses Hub path pins. Durable Git pin remains `ticket_1788460430_647093`.
+
+## Review `review_1788548922_449717` return
+
+Review sent Implement back with `finding_1788548922_130878`. Sequence 29. The one-shot matrix at `99d9a9e` stayed complete and clean. Review required attribution or repair of the two earlier lane failures before merge.
+
+### `finding_1788548922_130878`
+
+The spliced `e50e0f0` matrix is not the merge-gate subject. It recorded two failures. Those runs are not passing product evidence.
+
+1. `web_live` at load `55.82 34.78 20.09`. Playwright `locator.click` timeout `30000ms` in `botster-web` `scripts/live-packaged-protocol-harness.mjs` `setSessionTypeFormSelect` (about line 5529). Locator `ion-popover` / `ion-radio` text `Relative path under source root` resolved, then stayed outside the viewport after scroll. The stack never entered Hub terminal transport.
+2. `north_star` at load `12.58 22.96 39.68`. `waitForTerminalRendererWrite` timeout `45000ms` for `alt-13-mtn908yf-live` in the same Web harness (about line 6998). That wait inspects browser `renderer_write` telemetry. It does not wait for daemon `terminal_output`. A later `/tmp/botster-hub-matrix-99d9a9e-rerun.log` durable fail used the same wait at `alt-19-mtnai3mr-live`.
+
+Human `question_1788549952_531189` chose B. Do not open a Web ticket. Classify those two signatures as Web-harness and host-load failures outside this Hub change.
+
+Attribution commands used Web `9e18b10`, `RUSTUP_TOOLCHAIN=1.97.0`, `CARGO_TARGET_DIR` unset, `BOTSTER_ENV=test`. Logs `/tmp/botster-hub-attr-ae6a0b1.log` and `/tmp/botster-hub-attr-continue.log`.
+
+| Arm | Hub | Worker | Load | Result |
+| --- | --- | --- | --- | --- |
+| `smoke:live-packaged-protocol` | head `63a36ce` | `93acae3` | `9.03 9.50 10.41` | pass |
+| `smoke:live-packaged-protocol:durable` | head `63a36ce` | `93acae3` | `11.33 9.92 10.45` | fail. Different signature: `waitForDaemonTerminalOutputBytes` `nul/esc/invalid` at 45s |
+| same durable retry | head `63a36ce` | `93acae3` | `10.60 10.17 10.42` | pass |
+| `smoke:live-packaged-protocol` | base `ae6a0b1` | `48a4370` | `10.35 10.06 10.34` | pass |
+| `smoke:live-packaged-protocol:durable` | base `ae6a0b1` | `48a4370` | `15.76 11.84 10.97` | fail. `timed out waiting for durable seeded session botster-web-durable-exited-1 lifecycle_class ended`. This is the ended-row gap this Hub branch already repaired |
+
+The original two signatures did not reproduce on those isolated arms. The matched-base ended-row failure is evidence for the Hub product repair. It is not the Playwright popover signature and it is not the renderer-write signature.
+
+Merge gate remains `/tmp/botster-hub-matrix-99d9a9e-final.log` at clean Hub `99d9a9efee4e1fd35a100431e1bfe96d61da2a88` and TUI `38e5717e2253cfafa6718d8b7424ff68fd9fda88`. `11` `ARM_PASS`. `0` `ARM_FAIL`. Start and end boundaries match. Do not require another full matrix unless Hub source or a consumed revision changes after `99d9a9e`. This report commit is docs-only.
+
+Direct merge, no PR. Timing observations stay waived.
 
 ## Missing vault guidance discovered
 
