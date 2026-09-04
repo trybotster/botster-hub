@@ -12,10 +12,10 @@ Pipeline: `botster_stack_delivery` (direct merge, no PR)
 | Target repository | `botster-hub` (`trybotster/botster-hub`) |
 | Target id | `tgt_7e208a0c76a44980a83b63af976b1f22` |
 | Independent routing | `list_spawn_targets` maps this id to spawn target `botster-hub` |
-| Implement commit | `9879211a57bcfb0356833449e2ab928955da422b` |
+| Implement commit | `f80e9027b7838e755994c552ed10ab3b352baae9` |
 | Branch | `project-pipelines/ticket_1787600679_990088` |
 | Base | `ae6a0b1fe99d97215fa82d796da8f01a904171f0` |
-| `hub_sha` | `9879211a57bcfb0356833449e2ab928955da422b` |
+| `hub_sha` | `f80e9027b7838e755994c552ed10ab3b352baae9` |
 | `locked_core_sha` | `72d1c7571bc229dbb2cbd67aa979b6504ac150a5` |
 | Toolchain | `rustc 1.97.0 (2d8144b78 2026-07-07)`, Zig `0.16.0` |
 | `teardown_class_applies` | yes |
@@ -73,6 +73,7 @@ Later Hub-only test repairs on this branch:
 | `8a02885` | `src/data_plane/driver.rs`, `src/runtime.rs`, `src/transport/unix/connection.rs`, `tests/hub_daemon_lifecycle/{unix_terminal_adapter,subscription_ownership_baseline}.rs` | Remove the observe pump and pre-control flush. Collect unsolicited `process_exit` without ReadScreen or ListSessions |
 | `8d92d75` | `src/data_plane/driver.rs`, `src/transport/unix/{adapter,connection,mux_write}.rs`, tests, plan, report | Pump bound adapter routes after Core requests. Do not defer the next mux frame after a completed live send. Record try_write and flush. Replace advisor session UUIDs |
 | `9879211` | `src/data_plane/driver.rs` | Skip forced WouldBlock routes when pumping bound adapters |
+| `f80e902` | `src/data_plane/driver.rs`, `src/transport/unix/adapter.rs`, tests, plan | Remove the post-request global adapter pump and test-only WouldBlock skip. Log opaque wake byte lengths. Register Core `ticket_1788523929_630135` |
 
 Inventory found no remaining production old-route symbol.
 
@@ -585,7 +586,7 @@ Direct merge, no PR. Timing observations stay waived. Foreign session-workers we
 
 ## Review `review_1788520334_663466` return
 
-Review sent Implement back with two findings. The unsolicited `process_exit` proof still failed 2/8 outside the sandbox. Committed plan and report contained advisor session UUID `sess-1788403107-0006-b32c6439f0082e5ade0aae9963dbdf77`.
+Review sent Implement back with two findings. The unsolicited `process_exit` proof still failed 2/8 outside the sandbox. Committed plan and report contained the advisor identity recorded by `finding_1788520334_622131`.
 
 ### `finding_1788520334_167722`
 
@@ -624,6 +625,39 @@ Log `/tmp/botster-hub-matrix-9879211.log`. Start and end `MATRIX_BOUNDARY` commi
 | north_star | skipped. `ticket_1788460430_647093` |
 
 Direct merge, no PR. Timing observations stay waived. Foreign session-workers were not killed.
+
+## Review `review_1788523297_801440` return
+
+Review sent Implement back with three findings. Sequence 25.
+
+### `finding_1788523297_189742`
+
+Removed `pump_bound_adapter_routes` and `forced_would_block_session` from `src/data_plane/driver.rs`. Core requests no longer scan bound adapter routes. Isolation tests now use production route selection.
+
+The missing `process_exit` `try_write` is a Core ingest miss. `observe_session` / `observe_lifecycle_slice` call `drain_runtime_once`, which `ingest_bound_terminal_frames` onto a Ready bound adapter without `pump_woken` and without `notify_session`. Isolated `unix_adapter_bound_printf_stream_attach_delivers_process_exit` failed 4/8 after the Hub pump was removed. The failing run received attaching, `terminal_output`, and attached frames, with wake log `try_write`/`complete`/`flush` for those three frames only.
+
+Registered Core ticket `ticket_1788523929_630135` against `tgt_1f7bce66eb304881980f9b4a2a5ae3fe`. This Hub ticket depends on it (`dependency_1788523941_772682`). Core run `run_1788523950_844880` started. Hub will pin the merged Core revision. Hub will not restore a post-request global adapter pump.
+
+Negative controls:
+
+- `pump_woken_lives_only_in_the_data_plane_driver` forbids `pump_bound_adapter_routes`, `list_terminal_subscriptions`, `forced_would_block_session`, and `call_then_pump_session` in the driver.
+- `paused_data_plane_keeps_control_requests_from_driving_terminal_progress` still passes.
+- `live_generic_core_requests_do_not_drive_idle_terminal_output` passes. After ready and attached, Status, ListSessions, ReadScreen, ReadModeFlags, and CaptureSnapshot add no terminal envelopes.
+- `forced_would_block_on_one_unix_route_keeps_sibling_open_and_delivering` and `webrtc_forced_would_block_on_one_route_keeps_sibling_open_and_delivering` pass.
+
+Five-second unsolicited `process_exit` proofs stay in place. They are not Review-ready until the Core pin lands.
+
+### `finding_1788523297_138209`
+
+Unix wake observation now records `event` and `byte_len` only. Hub transport does not parse terminal JSON. Tests decode received Unix envelopes and match opaque byte lengths.
+
+### `finding_1788523297_223431`
+
+The review-return paragraph now cites `finding_1788520334_622131`. A complete-tree scan for `sess-1788403107` returns no matches.
+
+### Residual
+
+Do not request Review until Core `ticket_1788523929_630135` merges, Hub pins that revision, isolated Unix `process_exit` is 8/8 then 8/8 at a clean feature SHA, and the complete matrix has clean `MATRIX_BOUNDARY` markers.
 
 ## Missing vault guidance discovered
 
