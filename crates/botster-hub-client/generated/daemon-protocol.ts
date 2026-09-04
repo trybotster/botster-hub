@@ -98,7 +98,6 @@ export type DaemonRequest =
   | { type: "attach"; session_id: string; subscription_id: string }
   | { type: "detach"; session_id: string; subscription_id: string }
   | { type: "shutdown_session"; session_id: string }
-  | { type: "drain"; session_id: string; subscription_id?: string }
   | { type: "read_screen"; session_id: string }
   | { type: "read_mode_flags"; session_id: string }
   | { type: "capture_snapshot"; session_id: string }

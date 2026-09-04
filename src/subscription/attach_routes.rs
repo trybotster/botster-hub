@@ -23,7 +23,6 @@ use botster_terminal_protocol::{
 
 use crate::HubDaemon;
 use crate::HubRuntime;
-use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
 use crate::daemon::owner_loop::PendingRuntimeState;
 use crate::transport::unix::{UnixConnectionMux, UnixTerminalAdapter, UnixTerminalAdapterHandle};
 use crate::transport::webrtc::{
@@ -106,15 +105,6 @@ impl AttachStream {
 
     pub(crate) fn owner_client_id(&self) -> String {
         self.owner.client_id.clone()
-    }
-
-    fn owner_matches(&self, client_id: Option<&str>, grant_id: Option<&str>) -> bool {
-        if let Some(client_id) = client_id
-            && self.owner.client_id == client_id
-        {
-            return true;
-        }
-        crate::admission::peer_generation::grant_ids_match(self.owner.grant_id.as_deref(), grant_id)
     }
 
     fn close_adapter(&mut self) {
@@ -210,29 +200,6 @@ impl AttachStreamRegistry {
         self.streams
             .get(&(session_id.to_string(), subscription_id.to_string()))
             .map(AttachStream::owner_client_id)
-    }
-
-    pub(crate) fn authorize_drain(
-        &self,
-        session_id: &str,
-        subscription_id: &str,
-        client_id: Option<&str>,
-        grant_id: Option<&str>,
-    ) -> DaemonTransportResult<()> {
-        let Some(stream) = self
-            .streams
-            .get(&(session_id.to_string(), subscription_id.to_string()))
-        else {
-            return Ok(());
-        };
-        if stream.owner_matches(client_id, grant_id) {
-            Ok(())
-        } else {
-            Err(DaemonTransportError::SnapshotStreamForbidden {
-                session_id: session_id.to_string(),
-                subscription_id: subscription_id.to_string(),
-            })
-        }
     }
 
     pub(crate) fn cancel_stream(&mut self, session_id: &str, subscription_id: &str) {
@@ -1163,7 +1130,7 @@ mod tests {
     }
 
     #[test]
-    fn drain_does_not_change_attach_occupancy() {
+    fn status_does_not_change_attach_occupancy() {
         let mut registry = AttachStreamRegistry::default();
         let mut close = crate::subscription::closed_events::AttachCloseBookkeeping::default();
         let mut lifecycle = botster_hub_client::DaemonLifecycleCounters::default();
@@ -1179,14 +1146,14 @@ mod tests {
         );
         assert_eq!(lifecycle.live_attach_subscriptions, 1);
 
-        let drain = DaemonRequest::drain_subscription("session", "subscription");
-        let drain_ok = crate::client_api_dto::response::daemon_events(Vec::new());
-        assert!(attached_subscription_change_for_response(&drain, &drain_ok).is_none());
+        let status = DaemonRequest::Status;
+        let events_ok = crate::client_api_dto::response::daemon_events(Vec::new());
+        assert!(attached_subscription_change_for_response(&status, &events_ok).is_none());
         record_attached_subscription_change(
             &mut registry,
             &mut close,
             &mut lifecycle,
-            attached_subscription_change_for_response(&drain, &drain_ok),
+            attached_subscription_change_for_response(&status, &events_ok),
             None,
         );
         assert_eq!(lifecycle.live_attach_subscriptions, 1);
@@ -1195,7 +1162,7 @@ mod tests {
             session_id: "session".to_string(),
             subscription_id: "subscription".to_string(),
         };
-        let change = attached_subscription_change_for_response(&detach, &drain_ok);
+        let change = attached_subscription_change_for_response(&detach, &events_ok);
         record_attached_subscription_change(
             &mut registry,
             &mut close,
@@ -1280,22 +1247,6 @@ mod tests {
                 row.session_id == "session" && row.subscription_id == "subscription"
             }),
             "named occupancy is the oracle, not the counter: {rows:?}"
-        );
-    }
-
-    #[test]
-    fn foreign_owner_cannot_drain() {
-        let mut registry = AttachStreamRegistry::default();
-        registry.start_attach(owner(), "s".into(), "sub".into());
-        assert!(
-            registry
-                .authorize_drain("s", "sub", Some("other"), None)
-                .is_err()
-        );
-        assert!(
-            registry
-                .authorize_drain("s", "sub", Some("client-a"), None)
-                .is_ok()
         );
     }
 

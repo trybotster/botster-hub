@@ -622,16 +622,12 @@ mod tests {
             "{ session_id } => ",
             char::from_u32(0x7b).expect("left brace"),
         );
-        let drain_needle = format!(
-            "{}{}",
-            "DaemonRequest::Drain ",
-            char::from_u32(0x7b).expect("left brace"),
-        );
+        let read_screen_needle = "DaemonRequest::ReadScreen { session_id } =>";
         let arm = TRANSPORT
             .split(&shutdown_needle)
             .nth(1)
             .expect("ShutdownSession arm")
-            .split(&drain_needle)
+            .split(read_screen_needle)
             .next()
             .expect("ShutdownSession arm end");
         let unix_suppress = arm

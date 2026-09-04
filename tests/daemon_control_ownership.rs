@@ -211,7 +211,6 @@ const FAMILY_OWNERS: &[(&str, &str, &[&str])] = &[
             "Attach",
             "Detach",
             "ShutdownSession",
-            "Drain",
             "ReadScreen",
             "ReadModeFlags",
             "CaptureSnapshot",

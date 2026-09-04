@@ -5,8 +5,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod support;
 use support::ensure_session_worker_binary;
@@ -743,14 +742,22 @@ fn collect_attach_events(
     subscription_id: &str,
 ) -> Vec<botster_hub_client::DaemonEvent> {
     let mut events = Vec::new();
-    for _ in 0..200 {
-        let response = connection
-            .request(&botster_hub_client::DaemonRequest::drain_subscription(
-                session_id,
-                subscription_id,
-            ))
-            .expect("drain attach events");
-        events.extend(response.events);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if let Ok(Some(envelope)) = connection.poll_terminal(Duration::from_millis(25))
+            && let Ok(bytes) = envelope.payload_bytes()
+            && let Ok(event) = serde_json::from_slice::<botster_hub_client::DaemonEvent>(&bytes)
+        {
+            events.push(event);
+        }
+        events.extend(connection.take_skipped_events());
+        for envelope in connection.take_skipped_terminal() {
+            if let Ok(bytes) = envelope.payload_bytes()
+                && let Ok(event) = serde_json::from_slice::<botster_hub_client::DaemonEvent>(&bytes)
+            {
+                events.push(event);
+            }
+        }
         if events.iter().any(|event| {
             matches!(event,
             botster_hub_client::DaemonEvent::AttachState { subscription_id: id, state, .. }
@@ -760,7 +767,7 @@ fn collect_attach_events(
         }
         thread::sleep(Duration::from_millis(25));
     }
-    panic!("attach did not complete: {events:?}");
+    panic!("attach did not complete for {session_id}: {events:?}");
 }
 
 fn event_position(

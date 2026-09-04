@@ -1062,8 +1062,8 @@ it, although no production core component emits it as of the core revision
 recorded in `Cargo.lock`.
 `stream_attach` writes current `ReadScreen` text and returns. Clients that need
 opaque adapter frames or host events should use `DaemonConnection` with
-`Attach` plus the bound mux plane. Host `Drain` stays readable and returns no
-terminal bodies.
+`Attach` plus the bound mux plane. Host `Status` stays a still-alive check and
+returns no terminal bodies. There is no host `Drain` request.
 
 Each socket attach cycle owns a fresh transport-local `subscription_id`.
 When a persistent daemon socket closes without an explicit `Detach`, the hub
@@ -1184,22 +1184,21 @@ fidelity, and the no-history case.
 production path into one adversarial correctness proof. It starts many sessions
 through public `DaemonRequest::Spawn` calls on an isolated hub configured with
 the real session-worker binary. One noisy PTY remains interactive while the
-other PTYs exit. Public `Drain` requests advance lifecycle reconciliation for
-each quiet session without attaching it, then bounded public `ListSessions`
-polling must observe `exited`. The proof does not attach to quiet sessions or
-use a sleep as its success condition.
+other PTYs exit. Bounded public `ListSessions` polling must observe `exited`
+for each quiet session without attaching it. The proof does not attach to quiet
+sessions or use a sleep as its success condition.
 
 After the quiet sessions exit, the same public client connection attaches late
-to the noisy session, drains opaque initial state, checks `ReadScreen` and
+to the noisy session, waits on adapter frames and `ReadScreen`, checks
 `CaptureSnapshot`, sends labeled input, and observes the later live marker after
 the restored history. Every requested session receives an explicit
 `ShutdownSession` cleanup attempt. Failures use one of the stable labels
-`spawn`, `attach`, `drain`, `input`, `history`, or `cleanup`, with synthetic
+`spawn`, `attach`, `live`, `input`, `history`, or `cleanup`, with synthetic
 session IDs and path-neutral details. A label names the phase of the proof, not
-necessarily the daemon request that failed. In particular, quiet-session
-reconciliation maps `Drain` failures to `spawn`, the pre-attach screen wait maps
-`Drain` failures to `history`, and the post-input live-output loop maps `Drain`
-failures to `drain`.
+necessarily the daemon request that failed. Quiet-session reconciliation maps
+list failures to `spawn`, the pre-attach screen wait maps `ReadScreen` failures
+to `history`, and the post-input live-output loop maps `ReadScreen` failures to
+`live`.
 
 Run the CI-safe eight-session case with:
 
@@ -1608,10 +1607,9 @@ does not claim shipped Web/TUI rendering: browser ticket
 `ticket_1785298229_125024` and terminal ticket
 `ticket_1785438029_926883` owns those production entity-store/binding paths.
 
-Making `Drain.subscription_id` optional advances `CONFORMANCE_FIXTURE_REVISION`
-to 38. `PROTOCOL_VERSION` remains 7. Attach returns `AttachState attaching` for
-the requesting subscription. Snapshot frames and `attached` stream on a
-subscription-owned drain. Hub does not inspect Snapshot payload bytes.
+`PROTOCOL_VERSION` remains 7. Attach returns `AttachState attaching` for
+the requesting subscription. Snapshot frames and `attached` stream on the
+bound Unix or WebRTC adapter. Hub does not inspect Snapshot payload bytes.
 
 Core owns the incremental phase machine. The success order is READY, PAGE*,
 FINISH, `attached`, then `TerminalOutput`. A pre-READY failure is Core
@@ -1625,7 +1623,8 @@ frames, `AttachState snapshot_history_incomplete`, `attached`, then
 clients that need incremental READY-then-history use
 `DaemonCompatibilityRequirement::for_ready_then_history_attach()`. On the
 success path a real opaque FINISH Snapshot precedes `attached`. A production
-socket Drain receives READY before later PAGE/FINISH frames.
+socket adapter receives READY before later PAGE/FINISH frames. There is no
+host `Drain` JSON request.
 
 ## Unix terminal adapter plane
 
@@ -1678,16 +1677,17 @@ When Hello requires `unix_terminal_adapter` and Attach succeeds:
    `DaemonUnixTerminalEnvelope` JSON lines: `plane=terminal`, `kind=frame`,
    plus opaque `payload_base64` from `TerminalFrame::to_bytes()`. Hub does
    not inspect READY, PAGE, FINISH, later AttachState, or GHOSTSNP bodies.
-5. Bound-route Drain still advances control-plane lifecycle. It must not
-   return AttachState, Snapshot, TerminalOutput, or ProcessExited.
+5. Host `Status` stays a still-alive check. It must not return AttachState,
+   Snapshot, TerminalOutput, or ProcessExited. There is no host `Drain`
+   request and no Drain-translation fallback.
 6. Bound-route connection death closes the adapter only. Hub does not send
    Detach. Explicit client Detach remains a separate authorized request.
    Neither path shuts down the host session.
 
-Current clients that omit the feature stay on Drain translation until the
-cold-cut ticket. WebRTC attaches (`grant_id` present) do not receive a Unix
-adapter. Use `parse_unix_mux_value` to separate control responses from
-opaque adapter envelopes.
+Clients that omit `unix_terminal_adapter` do not receive adapter frames and
+do not receive a Drain-translation fallback. WebRTC attaches (`grant_id`
+present) do not receive a Unix adapter. Use `parse_unix_mux_value` to
+separate control responses from opaque adapter envelopes.
 
 ## WebRTC terminal adapter plane
 
@@ -1724,8 +1724,9 @@ succeeds:
    occupies the adapter slot until every chunk of that delivery is sent.
    Hub does not inspect READY, PAGE, FINISH, later AttachState, or
    GHOSTSNP bodies.
-5. Bound-route Drain still advances control-plane lifecycle. It must not
-   return AttachState, Snapshot, TerminalOutput, or ProcessExited.
+5. Host `Status` stays a still-alive check. It must not return AttachState,
+   Snapshot, TerminalOutput, or ProcessExited. There is no host `Drain`
+   request and no Drain-translation fallback.
 6. Bound-route DataChannel close, peer failure, and grant `remove_peer`
    close the adapter only. Hub does not send Detach. `local_close` waits
    at most `LOCAL_WEBRTC_PEER_CLOSE_BOUND` and then continues cleanup.
@@ -1752,9 +1753,9 @@ That helper requires both `webrtc_terminal_adapter` and
 `terminal_subscription_closed`. `for_webrtc_terminal_adapter()` and
 `DaemonCompatibilityRequirement::current()` do not add the close feature.
 
-Current WebRTC clients that omit DataChannel Hello stay on Drain
-translation until the Web decoder ticket. They must not receive
-`daemon_terminal_frame` or `daemon_event`.
+Current WebRTC clients that omit DataChannel Hello do not receive a
+Drain-translation fallback. They must not receive `daemon_terminal_frame`
+or `daemon_event`.
 
 ## Package event subscriptions
 

@@ -596,7 +596,6 @@ fn smoke_local_webrtc_request_operation(request: &DaemonRequest) -> &'static str
         DaemonRequest::Status => "status",
         DaemonRequest::Spawn { .. } => "spawn",
         DaemonRequest::Attach { .. } => "attach",
-        DaemonRequest::Drain { .. } => "drain",
         DaemonRequest::ReadScreen { .. } => "read_screen",
         DaemonRequest::ShutdownSession { .. } => "shutdown_session",
         _ => "other",

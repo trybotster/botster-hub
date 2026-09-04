@@ -2464,10 +2464,7 @@ fn process_ownership_daemon_restart_adopts_then_shuts_down_worker_session() {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut text = String::new();
         while Instant::now() < deadline {
-            let _ = pre_restart.request(&botster_hub_client::DaemonRequest::drain_subscription(
-                session_id.as_str(),
-                "cli-restart-subscription-before",
-            ));
+            let _ = pre_restart.request(&botster_hub_client::DaemonRequest::Status);
             text = pre_restart
                 .request(&botster_hub_client::DaemonRequest::ReadScreen {
                     session_id: session_id.to_string(),
@@ -2540,10 +2537,7 @@ fn process_ownership_daemon_restart_adopts_then_shuts_down_worker_session() {
     let mut attached = false;
     while Instant::now() < ready_deadline {
         let drain = connection
-            .request(&botster_hub_client::DaemonRequest::drain_subscription(
-                session_id.as_str(),
-                "cli-restart-subscription-after",
-            ))
+            .request(&botster_hub_client::DaemonRequest::Status)
             .ok();
         attached |= drain.is_some_and(|response| {
             response.events.iter().any(|event| {
@@ -2576,10 +2570,7 @@ fn process_ownership_daemon_restart_adopts_then_shuts_down_worker_session() {
     let deadline = Instant::now() + Duration::from_secs(8);
     let mut screen_text = String::new();
     while Instant::now() < deadline {
-        let _ = connection.request(&botster_hub_client::DaemonRequest::drain_subscription(
-            session_id.as_str(),
-            "cli-restart-subscription-after",
-        ));
+        let _ = connection.request(&botster_hub_client::DaemonRequest::Status);
         let screen = connection
             .request(&botster_hub_client::DaemonRequest::ReadScreen {
                 session_id: session_id.to_string(),

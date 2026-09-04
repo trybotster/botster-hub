@@ -122,7 +122,6 @@ pub(crate) fn local_webrtc_request_operation(request: &DaemonRequest) -> &'stati
         DaemonRequest::Status => "status",
         DaemonRequest::Spawn { .. } => "spawn",
         DaemonRequest::Attach { .. } => "attach",
-        DaemonRequest::Drain { .. } => "drain",
         DaemonRequest::ShutdownSession { .. } => "shutdown_session",
         _ => "other",
     }
@@ -479,8 +478,8 @@ where
                 "runtime request timed out",
             )),
         };
-        // OperatorError and Attach attach_failed create no ownership. Drain attach_failed
-        // releases any pending route so PeerClosed does not send Detach for a failed attach.
+        // OperatorError and Attach attach_failed create no ownership. PeerClosed
+        // must not send Detach for a failed attach.
         peer_state.apply_subscription_change(local_webrtc_attach_change_for_response(
             &ownership_request,
             &response,

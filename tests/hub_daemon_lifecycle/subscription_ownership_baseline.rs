@@ -31,27 +31,12 @@ async fn wait_for_webrtc_marker(
     peer: &mut LocalWebrtcOfferPeer,
     key: &botster_core::AesGcmKey,
     session_id: &str,
-    subscription_id: &str,
+    _subscription_id: &str,
     marker: &str,
 ) {
     let deadline = Instant::now() + Duration::from_secs(45);
     let mut retained = std::mem::take(&mut peer.pending_terminal_frames);
     while Instant::now() < deadline && !webrtc_terminal_contains(&retained, marker) {
-        let drain = peer
-            .encrypted_request(
-                key,
-                &botster_hub_client::DaemonRequest::drain_subscription(session_id, subscription_id),
-            )
-            .await
-            .expect("drain");
-        assert!(
-            drain
-                .events
-                .iter()
-                .all(|event| !webrtc_event_is_terminal_body(event)),
-            "content-blind drain must not return terminal bodies: {:?}",
-            drain.events
-        );
         if let Ok(Ok(bytes)) =
             timeout(Duration::from_millis(200), peer.next_terminal_frame(key)).await
         {
@@ -884,7 +869,7 @@ fn attach_ready_precedes_history_finish() {
         let drain = request_collecting_mux(
             &mut stream,
             &mut reader,
-            &botster_hub_client::DaemonRequest::drain_subscription("so-rth-session", "so-rth-sub"),
+            &botster_hub_client::DaemonRequest::Status,
             &mut envelopes,
             &mut events,
         );
@@ -1037,15 +1022,18 @@ async fn drain_webrtc_live_bytes(
     peer: &mut LocalWebrtcOfferPeer,
     key: &botster_core::AesGcmKey,
     session_id: &str,
-    subscription_id: &str,
+    _subscription_id: &str,
     concatenated: &mut Vec<u8>,
 ) {
     let _ = peer
         .encrypted_request(
             key,
-            &botster_hub_client::DaemonRequest::drain_subscription(session_id, subscription_id),
+            &botster_hub_client::DaemonRequest::ReadScreen {
+                session_id: session_id.to_string(),
+            },
         )
         .await;
+    await_next_webrtc_terminal_frame(peer, key).await;
     extend_concatenated_from_pending_webrtc_frames(peer, concatenated);
 }
 

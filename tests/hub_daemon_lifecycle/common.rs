@@ -792,67 +792,16 @@ pub(crate) fn wait_for_managed_git_session_exit(data_dir: &Path, session_id: &st
     let started_at = Instant::now();
     let mut ever_observed = false;
     let mut last_listing = "<no ListSessions response>".to_string();
-    let mut last_drain = "<no Drain response>".to_string();
-    let mut drained_events = Vec::new();
 
     loop {
         let elapsed = started_at.elapsed();
         assert!(
             elapsed < LOCAL_RUNTIME_DAEMON_READINESS_BUDGET,
-            "managed Git session {session_id} did not emit SessionLifecycle exited and remain \
-             retained at lifecycle exited within {:?}; elapsed={elapsed:?} \
-             ever_observed={ever_observed} last_listing={last_listing} \
-             last_drain={last_drain} drained_events={drained_events:?}",
+            "managed Git session {session_id} did not remain retained at lifecycle exited \
+             within {:?}; elapsed={elapsed:?} ever_observed={ever_observed} \
+             last_listing={last_listing}",
             LOCAL_RUNTIME_DAEMON_READINESS_BUDGET,
         );
-
-        let drain = botster_hub::daemon_transport_request(
-            &explicit_config(data_dir),
-            botster_hub::DaemonRequest::Drain {
-                session_id: session_id.to_string(),
-                subscription_id: None,
-            },
-        )
-        .unwrap_or_else(|error| {
-            panic!(
-                "Drain failed while waiting for managed Git session {session_id} to exit; \
-                 elapsed={elapsed:?} ever_observed={ever_observed} \
-                 last_listing={last_listing}; last_drain={last_drain}; \
-                 drained_events={drained_events:?}; error={error}"
-            )
-        });
-        assert_eq!(
-            drain.kind,
-            botster_hub::DaemonResponseKind::Events,
-            "unexpected Drain response while waiting for managed Git session {session_id} to \
-             exit; elapsed={elapsed:?} response={drain:?}"
-        );
-        last_drain = format!("{drain:?}");
-        drained_events.extend(drain.events.iter().map(|event| format!("{event:?}")));
-
-        let mut observed_exited_lifecycle = false;
-        for event in &drain.events {
-            match event {
-                botster_hub::DaemonEvent::SessionLifecycle {
-                    session_id: event_session_id,
-                    state,
-                } if event_session_id == session_id => match state.as_str() {
-                    "starting" | "running" | "stopping" => {}
-                    "exited" => observed_exited_lifecycle = true,
-                    "failed" => panic!(
-                        "managed Git session {session_id} emitted lifecycle failed while \
-                         draining; elapsed={elapsed:?} last_drain={last_drain} \
-                         drained_events={drained_events:?}"
-                    ),
-                    lifecycle => panic!(
-                        "managed Git session {session_id} emitted unexpected lifecycle \
-                         {lifecycle:?}; elapsed={elapsed:?} last_drain={last_drain} \
-                         drained_events={drained_events:?}"
-                    ),
-                },
-                _ => {}
-            }
-        }
 
         let response = botster_hub::daemon_transport_request(
             &explicit_config(data_dir),
@@ -883,37 +832,26 @@ pub(crate) fn wait_for_managed_git_session_exit(data_dir: &Path, session_id: &st
                 "exited" => {
                     println!(
                         "managed_git_session_ready session_id={session_id} \
-                         drain_lifecycle=exited retained_lifecycle=exited elapsed={:?} \
-                         listing={last_listing} \
-                         drained_events={drained_events:?}",
+                         retained_lifecycle=exited elapsed={:?} listing={last_listing}",
                         started_at.elapsed()
                     );
                     return;
                 }
-                lifecycle if observed_exited_lifecycle => panic!(
-                    "managed Git session {session_id} emitted SessionLifecycle exited but was \
-                     retained with lifecycle {lifecycle:?}; elapsed={elapsed:?} \
-                     full_listing={last_listing} last_drain={last_drain} \
-                     drained_events={drained_events:?}"
-                ),
                 "running" | "stopping" => {}
                 "failed" => panic!(
                     "managed Git session {session_id} reached lifecycle failed; ListSessions maps \
                      a stale daemon registry row to failed; elapsed={elapsed:?} \
-                     full_listing={last_listing} last_drain={last_drain} \
-                     drained_events={drained_events:?}"
+                     full_listing={last_listing}"
                 ),
                 lifecycle => panic!(
                     "managed Git session {session_id} reached unexpected lifecycle {lifecycle:?}; \
-                     elapsed={elapsed:?} full_listing={last_listing} last_drain={last_drain} \
-                     drained_events={drained_events:?}"
+                     elapsed={elapsed:?} full_listing={last_listing}"
                 ),
             }
         } else if ever_observed {
             panic!(
                 "managed Git session {session_id} disappeared after first observation; \
-                 elapsed={elapsed:?} full_listing={last_listing} last_drain={last_drain} \
-                 drained_events={drained_events:?}"
+                 elapsed={elapsed:?} full_listing={last_listing}"
             );
         }
 

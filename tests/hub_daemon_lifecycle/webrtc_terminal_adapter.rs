@@ -317,24 +317,6 @@ fn webrtc_terminal_adapter_bind_returns_only_attaching_then_terminal_frames() {
         let deadline = Instant::now() + Duration::from_secs(8);
         let mut saw_terminal_frame = false;
         while Instant::now() < deadline && !saw_terminal_frame {
-            let drain = peer
-                .encrypted_request(
-                    &key,
-                    &botster_hub_client::DaemonRequest::drain_subscription(
-                        session_id,
-                        subscription_id,
-                    ),
-                )
-                .await
-                .expect("bound drain");
-            assert!(
-                drain
-                    .events
-                    .iter()
-                    .all(|event| !webrtc_event_is_terminal_body(event)),
-                "bound drain must not emit terminal bodies: {:?}",
-                drain.events
-            );
             if let Ok(bytes) =
                 timeout(Duration::from_millis(200), peer.next_terminal_frame(&key)).await
             {
@@ -370,7 +352,7 @@ fn webrtc_terminal_adapter_bind_returns_only_attaching_then_terminal_frames() {
 }
 
 #[test]
-fn webrtc_terminal_adapter_attach_emits_a_nonempty_frame_without_host_drain() {
+fn webrtc_terminal_adapter_attach_emits_a_nonempty_frame_without_host_status() {
     let _guard = daemon_test_guard();
     let (hub, endpoint, bootstrap) = start_webrtc_adapter_hub("wac");
     let session_id = "wac-session";
@@ -420,7 +402,7 @@ fn webrtc_terminal_adapter_attach_emits_a_nonempty_frame_without_host_drain() {
         }
         assert!(
             saw_terminal_frame,
-            "Attach must emit a nonempty adapter frame without a later host Drain or ReadScreen"
+            "Attach must emit a nonempty adapter frame without a later host Status or ReadScreen"
         );
         peer.peer.close().await.expect("close offer peer");
     });
@@ -467,24 +449,6 @@ fn webrtc_terminal_adapter_second_data_channel_does_not_receive_terminal_frames(
         let deadline = Instant::now() + Duration::from_secs(8);
         let mut saw_terminal_frame = false;
         while Instant::now() < deadline && !saw_terminal_frame {
-            let drain = peer
-                .encrypted_request(
-                    &key,
-                    &botster_hub_client::DaemonRequest::drain_subscription(
-                        session_id,
-                        subscription_id,
-                    ),
-                )
-                .await
-                .expect("bound drain");
-            assert!(
-                drain
-                    .events
-                    .iter()
-                    .all(|event| !webrtc_event_is_terminal_body(event)),
-                "bound drain must not emit terminal bodies: {:?}",
-                drain.events
-            );
             if let Ok(bytes) =
                 timeout(Duration::from_millis(200), peer.next_terminal_frame(&key)).await
             {
@@ -571,18 +535,6 @@ fn webrtc_terminal_adapter_unbound_attach_still_drains_snapshot_without_terminal
             attach.events.is_empty(),
             "WebRTC Attach must not return Snapshot: {:?}",
             attach.events
-        );
-        let drain = peer
-            .encrypted_request(
-                &key,
-                &botster_hub_client::DaemonRequest::drain_subscription(session_id, subscription_id),
-            )
-            .await
-            .expect("host drain");
-        assert!(
-            drain.events.is_empty(),
-            "host Drain must not return Snapshot: {:?}",
-            drain.events
         );
         let deadline = Instant::now() + Duration::from_secs(8);
         let mut text = String::new();
@@ -1064,14 +1016,14 @@ fn webrtc_terminal_adapter_write_budget_emits_core_adapter_closed_while_peer_sta
         let drain = peer
             .encrypted_request(
                 &key,
-                &botster_hub_client::DaemonRequest::drain_subscription("wwb-live", "sub-live"),
+                &botster_hub_client::DaemonRequest::Status,
             )
             .await
             .expect("sibling drain");
         assert_ne!(
             drain.kind,
             botster_hub_client::DaemonResponseKind::OperatorError,
-            "sibling scoped Drain must stay owned: {:?}",
+            "sibling bound adapter must stay owned: {:?}",
             drain.error
         );
         assert!(
@@ -1079,7 +1031,7 @@ fn webrtc_terminal_adapter_write_budget_emits_core_adapter_closed_while_peer_sta
                 .events
                 .iter()
                 .all(|event| !webrtc_event_is_terminal_body(event)),
-            "content-blind sibling Drain must stay bound: {:?}",
+            "content-blind sibling adapter must stay bound: {:?}",
             drain.events
         );
         eprintln!(
@@ -1509,14 +1461,14 @@ fn webrtc_terminal_adapter_stale_generation_close_does_not_sweep_replacement_own
         let drain = owner_b
             .encrypted_request(
                 &key_b,
-                &botster_hub_client::DaemonRequest::drain_subscription("wsg-session", "wsg-sub"),
+                &botster_hub_client::DaemonRequest::Status,
             )
             .await
             .expect("B drain");
         assert_ne!(
             drain.kind,
             botster_hub_client::DaemonResponseKind::OperatorError,
-            "B's scoped Drain must stay owned after A's stale close: {:?}",
+            "B's bound adapter must stay owned after A's stale close: {:?}",
             drain.error
         );
         assert!(
@@ -1524,7 +1476,7 @@ fn webrtc_terminal_adapter_stale_generation_close_does_not_sweep_replacement_own
                 .events
                 .iter()
                 .all(|event| !webrtc_event_is_terminal_body(event)),
-            "content-blind B Drain must stay bound: {:?}",
+            "content-blind B adapter must stay bound: {:?}",
             drain.events
         );
         // Reserved-label duplex input is not available on this WebRTC peer yet.
@@ -1533,14 +1485,14 @@ fn webrtc_terminal_adapter_stale_generation_close_does_not_sweep_replacement_own
         let drain = owner_b
             .encrypted_request(
                 &key_b,
-                &botster_hub_client::DaemonRequest::drain_subscription("wsg-session", "wsg-sub"),
+                &botster_hub_client::DaemonRequest::Status,
             )
             .await
             .expect("B keep-alive drain");
         assert_ne!(
             drain.kind,
             botster_hub_client::DaemonResponseKind::OperatorError,
-            "B Drain must stay owned after replacement: {:?}",
+            "B adapter must stay owned after replacement: {:?}",
             drain.error
         );
         owner_a.peer.close().await.expect("close A");

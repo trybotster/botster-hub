@@ -53,7 +53,6 @@
     "remove_session",
     "spawn",
     "attach",
-    "drain",
     "shutdown_session"
   ],
   "terminal_streaming": {
@@ -63,7 +62,7 @@
     "held_open_stream": true,
     "conformance_ready_output": "conformance-ready",
     "conformance_echo_output": "echo:from-conformance",
-    "missing_session_diagnostic_kind": "terminal_stream_unavailable"
+    "missing_session_diagnostic_kind": "action_failure"
   },
   "session_entities": {
     "supported": true,

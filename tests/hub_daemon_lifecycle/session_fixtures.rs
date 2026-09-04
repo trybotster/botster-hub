@@ -136,7 +136,7 @@ pub(crate) const GHOSTSNP_MAGIC: &[u8] = b"GHOSTSNP";
 pub(crate) fn wait_for_mode_flags<F>(
     connection: &mut botster_hub_client::DaemonConnection,
     session_id: &str,
-    subscription_id: &str,
+    _subscription_id: &str,
     mut predicate: F,
 ) -> botster_hub_client::DaemonModeFlags
 where
@@ -144,13 +144,6 @@ where
 {
     let deadline = Instant::now() + Duration::from_secs(8);
     loop {
-        let _ = connection.request(&botster_hub_client::DaemonRequest::drain_subscription(
-            session_id,
-            subscription_id,
-        ));
-        let _ = connection.request(&botster_hub_client::DaemonRequest::ReadScreen {
-            session_id: session_id.to_string(),
-        });
         let response = connection
             .request(&botster_hub_client::DaemonRequest::ReadModeFlags {
                 session_id: session_id.to_string(),
@@ -187,38 +180,12 @@ pub(crate) fn collect_attach_events(
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut events = Vec::new();
     while Instant::now() < deadline {
-        let drain = connection
-            .request(&botster_hub_client::DaemonRequest::drain_subscription(
-                session_id,
-                subscription_id,
-            ))
-            .expect("drain");
-        assert!(
-            drain.events.iter().all(|event| !matches!(
-                event,
-                botster_hub_client::DaemonEvent::AttachState { .. }
-                    | botster_hub_client::DaemonEvent::Snapshot { .. }
-                    | botster_hub_client::DaemonEvent::Scrollback { .. }
-                    | botster_hub_client::DaemonEvent::TerminalOutput { .. }
-                    | botster_hub_client::DaemonEvent::ProcessExit { .. }
-            )),
-            "host Drain must not return terminal bodies: {:?}",
-            drain.events
-        );
+        if let Ok(Some(envelope)) = connection.poll_terminal(Duration::from_millis(20)) {
+            push_terminal_envelope_event(&mut events, session_id, Some(subscription_id), envelope);
+        }
         events.extend(connection.take_skipped_events());
         for envelope in connection.take_skipped_terminal() {
-            if let Ok(bytes) = envelope.payload_bytes() {
-                if let Ok(event) = serde_json::from_slice::<botster_hub_client::DaemonEvent>(&bytes)
-                {
-                    events.push(event);
-                } else {
-                    events.push(botster_hub_client::DaemonEvent::TerminalOutput {
-                        session_id: session_id.to_string(),
-                        subscription_id: subscription_id.to_string(),
-                        payload: botster_hub_client::DaemonLiveOutputPayload::from_bytes(&bytes),
-                    });
-                }
-            }
+            push_terminal_envelope_event(&mut events, session_id, Some(subscription_id), envelope);
         }
         let saw_live = until_live_marker.is_none_or(|marker| {
             events.iter().any(|event| {
@@ -685,21 +652,21 @@ pub(crate) fn python_script_command(script_path: &Path) -> String {
     format!("python3 -u {}", script_path.display())
 }
 
-pub(crate) fn drain_until(
+pub(crate) fn wait_until_adapter_event(
     connection: &mut botster_hub_client::DaemonConnection,
     session_id: &str,
     predicate: impl FnMut(&botster_hub_client::DaemonEvent) -> bool,
 ) -> Vec<botster_hub_client::DaemonEvent> {
-    drain_until_subscription(connection, session_id, None, predicate)
+    wait_until_adapter_event_for_subscription(connection, session_id, None, predicate)
 }
 
-pub(crate) fn drain_until_subscription(
+pub(crate) fn wait_until_adapter_event_for_subscription(
     connection: &mut botster_hub_client::DaemonConnection,
     session_id: &str,
     subscription_id: Option<&str>,
     predicate: impl FnMut(&botster_hub_client::DaemonEvent) -> bool,
 ) -> Vec<botster_hub_client::DaemonEvent> {
-    drain_until_subscription_deadline(
+    wait_until_adapter_event_until(
         connection,
         session_id,
         subscription_id,
@@ -708,7 +675,7 @@ pub(crate) fn drain_until_subscription(
     )
 }
 
-pub(crate) fn drain_until_subscription_deadline(
+pub(crate) fn wait_until_adapter_event_until(
     connection: &mut botster_hub_client::DaemonConnection,
     session_id: &str,
     subscription_id: Option<&str>,
@@ -718,37 +685,54 @@ pub(crate) fn drain_until_subscription_deadline(
     let deadline = Instant::now() + timeout;
     let mut events = Vec::new();
     while Instant::now() < deadline {
-        let drain = connection
-            .request(&match subscription_id {
-                Some(subscription_id) => botster_hub_client::DaemonRequest::drain_subscription(
-                    session_id,
-                    subscription_id,
-                ),
-                None => botster_hub_client::DaemonRequest::drain_session(session_id),
-            })
-            .expect("drain live output");
-        events.extend(drain.events);
+        if let Ok(Some(envelope)) = connection.poll_terminal(Duration::from_millis(20)) {
+            push_terminal_envelope_event(&mut events, session_id, subscription_id, envelope);
+        }
         events.extend(connection.take_skipped_events());
         for envelope in connection.take_skipped_terminal() {
-            if let Ok(bytes) = envelope.payload_bytes() {
-                if let Ok(event) = serde_json::from_slice::<botster_hub_client::DaemonEvent>(&bytes)
-                {
-                    events.push(event);
-                } else {
-                    events.push(botster_hub_client::DaemonEvent::TerminalOutput {
-                        session_id: session_id.to_string(),
-                        subscription_id: subscription_id.unwrap_or("").to_string(),
-                        payload: botster_hub_client::DaemonLiveOutputPayload::from_bytes(&bytes),
-                    });
-                }
-            }
+            push_terminal_envelope_event(&mut events, session_id, subscription_id, envelope);
         }
         if events.iter().any(&mut predicate) {
             return events;
         }
-        thread::sleep(Duration::from_millis(20));
     }
     panic!("timed out waiting for live output predicate, events={events:?}");
+}
+
+pub(crate) fn poll_adapter_events(
+    connection: &mut botster_hub_client::DaemonConnection,
+    session_id: &str,
+    subscription_id: Option<&str>,
+) -> Vec<botster_hub_client::DaemonEvent> {
+    let mut events = Vec::new();
+    while let Ok(Some(envelope)) = connection.poll_terminal(Duration::from_millis(20)) {
+        push_terminal_envelope_event(&mut events, session_id, subscription_id, envelope);
+    }
+    events.extend(connection.take_skipped_events());
+    for envelope in connection.take_skipped_terminal() {
+        push_terminal_envelope_event(&mut events, session_id, subscription_id, envelope);
+    }
+    events
+}
+
+fn push_terminal_envelope_event(
+    events: &mut Vec<botster_hub_client::DaemonEvent>,
+    session_id: &str,
+    subscription_id: Option<&str>,
+    envelope: botster_hub_client::DaemonUnixTerminalEnvelope,
+) {
+    let Ok(bytes) = envelope.payload_bytes() else {
+        return;
+    };
+    if let Ok(event) = serde_json::from_slice::<botster_hub_client::DaemonEvent>(&bytes) {
+        events.push(event);
+        return;
+    }
+    events.push(botster_hub_client::DaemonEvent::TerminalOutput {
+        session_id: session_id.to_string(),
+        subscription_id: subscription_id.unwrap_or("").to_string(),
+        payload: botster_hub_client::DaemonLiveOutputPayload::from_bytes(&bytes),
+    });
 }
 
 pub(crate) fn wait_for_session_type_metadata(

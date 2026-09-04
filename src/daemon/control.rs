@@ -73,23 +73,9 @@ pub(crate) fn attach_bind_operator_error(code: &'static str, message: &str) -> D
         message: message.to_string(),
         diagnostics: vec![DaemonDiagnostic::action_failure("attach", message)],
     });
-    response
-}
-
-pub(crate) fn missing_session_drain_error(session_id: &str) -> DaemonResponse {
-    let message = format!("unknown session: {session_id}");
-    let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
-    response.diagnostics = vec![DaemonDiagnostic::terminal_stream_unavailable(
-        "drain_runtime",
-        message.clone(),
-    )];
-    response.error = Some(DaemonOperatorError {
-        code: "unknown_session".to_string(),
-        request_id: "daemon-sessions-drain".to_string(),
-        operation: "drain_runtime".to_string(),
-        message,
-        diagnostics: response.diagnostics.clone(),
-    });
+    if let Some(error) = &response.error {
+        response.diagnostics = error.diagnostics.clone();
+    }
     response
 }
 
@@ -100,7 +86,6 @@ pub(crate) fn control_request_operation_label(request: &DaemonRequest) -> &'stat
         DaemonRequest::Spawn { .. } => "spawn",
         DaemonRequest::Attach { .. } => "attach",
         DaemonRequest::Detach { .. } => "detach",
-        DaemonRequest::Drain { .. } => "drain",
         DaemonRequest::ShutdownSession { .. } => "shutdown_session",
         DaemonRequest::RemoveSession { .. } => "remove_session",
         DaemonRequest::DaemonShutdown => "daemon_shutdown",
@@ -258,7 +243,6 @@ pub(crate) fn handle_runtime_control_request(
         | DaemonRequest::Attach { .. }
         | DaemonRequest::Detach { .. }
         | DaemonRequest::ShutdownSession { .. }
-        | DaemonRequest::Drain { .. }
         | DaemonRequest::ReadScreen { .. }
         | DaemonRequest::ReadModeFlags { .. }
         | DaemonRequest::CaptureSnapshot { .. }

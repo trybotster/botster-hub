@@ -22,8 +22,8 @@ use crate::daemon::owner_loop::{
 };
 use crate::maintenance::software_identity;
 use crate::subscription::attach_routes::{
-    AttachedSubscriptionChange, attached_subscription_change_for_response,
-    overlay_live_attach_occupancy, record_attached_subscription_change,
+    attached_subscription_change_for_response, overlay_live_attach_occupancy,
+    record_attached_subscription_change,
 };
 
 pub(crate) fn handle(
@@ -95,16 +95,6 @@ pub(crate) fn handle(
         .expect("host family");
     }
     let request = *request;
-    let drain_owned_before = match &request {
-        DaemonRequest::Drain {
-            session_id,
-            subscription_id: Some(subscription_id),
-        } => state
-            .pending_runtime
-            .stream_owner_client_id(session_id, subscription_id)
-            .is_some(),
-        _ => false,
-    };
     let reconcile_after_request = matches!(
         request,
         DaemonRequest::Spawn { .. }
@@ -179,14 +169,6 @@ pub(crate) fn handle(
     }
     if let Ok(response) = response.as_ref() {
         let change = attached_subscription_change_for_response(&request, response);
-        let change = match change {
-            Some(AttachedSubscriptionChange::Detach(_))
-                if matches!(request, DaemonRequest::Drain { .. }) && !drain_owned_before =>
-            {
-                None
-            }
-            change => change,
-        };
         record_attached_subscription_change(
             &mut state.pending_runtime,
             &mut state.attach_close,
@@ -263,7 +245,8 @@ pub(crate) fn handle(
         );
     }
     // Reply first so surface-action publish can return before fanout delivery.
-    // Attach writes `attaching` before Core attach work; Drain advances the stream.
+    // Attach writes `attaching` before Core attach work. Bound adapters then
+    // carry terminal frames without a later host control pulse.
     // Authoritative mutations already set one coalesced wake. Status and
     // other reads must not force an extra owner-loop slice.
     send_control_response(reply_tx, response, response_delivery_rx)

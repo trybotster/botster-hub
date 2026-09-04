@@ -915,6 +915,9 @@ mod tests {
         r#""FINISH""#,
         "GHOSTSNP",
         "drain_subscription(",
+        "DaemonRequest::Drain",
+        "drain_session(",
+        r#""type": "drain""#,
         "drain_runtime_once(",
         ".drain(session_id",
         "lifecycle_baseline()",
@@ -1239,6 +1242,60 @@ mod tests {
                 "{path} production source must not call two-argument Core drain"
             );
         }
+
+        let client = production_source(include_str!("../crates/botster-hub-client/src/lib.rs"));
+        for forbidden in [
+            "DaemonRequest::Drain",
+            "fn drain_session(",
+            "fn drain_subscription(",
+        ] {
+            assert!(
+                !client.contains(forbidden),
+                "botster-hub-client production must not contain {forbidden}"
+            );
+        }
+        let generated = include_str!("../crates/botster-hub-client/generated/daemon-protocol.ts");
+        assert!(
+            !generated.contains(r#"{ type: "drain""#),
+            "generated TypeScript must not expose drain"
+        );
+        let readme = include_str!("../README.md");
+        assert!(
+            !readme.contains("scoped `Drain"),
+            "README must not claim scoped Drain terminal egress"
+        );
+        assert!(
+            !readme.contains("drain/subscription path"),
+            "README must not claim a drain/subscription terminal path"
+        );
+        assert!(
+            !readme.contains("attach/drain"),
+            "README must not claim attach/drain history as the terminal path"
+        );
+        let test_support = production_source(include_str!(
+            "../crates/botster-hub-test-support/src/lib.rs"
+        ));
+        assert!(
+            !test_support.contains("DaemonRequest::Drain"),
+            "test-support production must not send Drain"
+        );
+        assert!(
+            !test_support.contains("drain_subscription("),
+            "test-support production must not call drain_subscription"
+        );
+        assert!(
+            !test_support.contains(".next_terminal()"),
+            "test-support must poll adapter frames instead of blocking next_terminal"
+        );
+        let protocol = include_str!("../docs/client-protocol.md");
+        assert!(
+            !protocol.contains("Public `Drain` requests"),
+            "client-protocol must not treat host Drain as a current many-PTY pulse"
+        );
+        assert!(
+            !protocol.contains("Bound-route Drain still advances"),
+            "client-protocol must not treat host Drain as a current bound-route control pulse"
+        );
     }
 
     #[test]
