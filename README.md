@@ -1053,9 +1053,8 @@ The readiness boundary is documented in
 [`docs/adr/local-runtime-production-readiness.md`](docs/adr/local-runtime-production-readiness.md).
 
 In the daemon-backed model, attach, detach, input, and resize requests are
-control-plane acknowledgements. Terminal egress is delivered by explicit
-`DrainRuntime` calls over the session-backed CoreDaemon path, not synchronously
-from those control operations.
+control-plane acknowledgements. Terminal egress arrives on the bound Unix or
+WebRTC adapter path, not through `DrainRuntime` or other control responses.
 
 Ready for daily local use today: explicit daemon lifecycle, daemon-backed local
 PTY session operations including attach and adapter history and screen/snapshot
