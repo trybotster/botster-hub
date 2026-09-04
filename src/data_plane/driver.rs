@@ -309,11 +309,22 @@ fn run_core_requests(core_daemon: &mut CoreDaemon, requests: &Receiver<CoreReque
     ran
 }
 
+fn forced_would_block_session(session_id: &str) -> bool {
+    if std::env::var("BOTSTER_ENV").as_deref() != Ok("test") {
+        return false;
+    }
+    if std::env::var("BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK").as_deref() == Ok("1") {
+        return true;
+    }
+    std::env::var("BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_SESSION")
+        .is_ok_and(|held| held == session_id)
+}
+
 fn pump_bound_adapter_routes(core_daemon: &mut CoreDaemon, now_seconds: u64) {
     let adapter_routes: Vec<TerminalWakeRoute> = core_daemon
         .list_terminal_subscriptions()
         .into_iter()
-        .filter(|row| row.adapter_bound)
+        .filter(|row| row.adapter_bound && !forced_would_block_session(&row.session_id.0))
         .map(|row| TerminalWakeRoute {
             session_id: row.session_id,
             subscription_id: row.subscription_id,
