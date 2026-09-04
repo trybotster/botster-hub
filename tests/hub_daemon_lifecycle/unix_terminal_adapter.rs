@@ -199,6 +199,35 @@ fn read_unsolicited_terminal_until(
     }
 }
 
+fn read_unsolicited_until_process_exit(
+    reader: &mut std::io::BufReader<std::os::unix::net::UnixStream>,
+    envelopes: &mut Vec<botster_hub_client::DaemonUnixTerminalEnvelope>,
+    session_id: &str,
+    subscription_id: &str,
+    deadline: Instant,
+) {
+    reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .expect("set unsolicited process_exit timeout");
+    while Instant::now() < deadline
+        && !envelopes
+            .iter()
+            .any(|envelope| unix_envelope_is_process_exit(envelope, session_id, subscription_id))
+    {
+        match botster_hub_client::read_unix_mux_frame_from_reader(reader) {
+            Ok(botster_hub_client::DaemonUnixMuxFrame::Terminal(envelope)) => {
+                envelopes.push(envelope);
+            }
+            Ok(botster_hub_client::DaemonUnixMuxFrame::Event(_)) => {}
+            Ok(botster_hub_client::DaemonUnixMuxFrame::Response(response)) => {
+                panic!("unsolicited process_exit wait received a control response: {response:?}")
+            }
+            Err(_) => {}
+        }
+    }
+}
+
 #[test]
 fn unix_adapter_bind_returns_only_attaching_then_opaque_envelopes() {
     let _guard = daemon_test_guard();
@@ -1221,6 +1250,7 @@ fn unix_adapter_bound_printf_stream_attach_delivers_process_exit() {
         primed.events
     );
     fs::write(&release_path, b"go").expect("release held printf");
+    wait_for_authoritative_session_exit(&endpoint, session_id);
     let exit_deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < exit_deadline {
         if envelopes
@@ -1240,7 +1270,13 @@ fn unix_adapter_bound_printf_stream_attach_delivers_process_exit() {
             "host Drain must not return terminal bodies: {:?}",
             drain.events
         );
-        thread::sleep(Duration::from_millis(25));
+        read_unsolicited_until_process_exit(
+            &mut term_reader,
+            &mut envelopes,
+            session_id,
+            subscription_id,
+            Instant::now() + Duration::from_millis(200),
+        );
     }
     assert!(
         envelopes
