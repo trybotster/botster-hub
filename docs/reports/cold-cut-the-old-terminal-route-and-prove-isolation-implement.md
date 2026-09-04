@@ -12,10 +12,10 @@ Pipeline: `botster_stack_delivery` (direct merge, no PR)
 | Target repository | `botster-hub` (`trybotster/botster-hub`) |
 | Target id | `tgt_7e208a0c76a44980a83b63af976b1f22` |
 | Independent routing | `list_spawn_targets` maps this id to spawn target `botster-hub` |
-| Implement commit | `43d080e1b2fc601b1272a5822c5cc05967ef14b5` |
+| Implement commit | `d3049777fc567c0c0ceee8d72191365f864bff66` |
 | Branch | `project-pipelines/ticket_1787600679_990088` |
 | Base | `ae6a0b1fe99d97215fa82d796da8f01a904171f0` |
-| `hub_sha` | `43d080e1b2fc601b1272a5822c5cc05967ef14b5` |
+| `hub_sha` | `d3049777fc567c0c0ceee8d72191365f864bff66` |
 | `locked_core_sha` | `72d1c7571bc229dbb2cbd67aa979b6504ac150a5` |
 | Toolchain | `rustc 1.97.0 (2d8144b78 2026-07-07)`, Zig `0.16.0` |
 | `teardown_class_applies` | yes |
@@ -456,6 +456,38 @@ Log `/tmp/botster-hub-matrix-43d080e-9.log`. Start and end `MATRIX_BOUNDARY` com
 | web_durable | pass |
 | web_shared | pass first try. `keep_alive_runs=2` `cancel_ablation=true` `exit_pass=true` |
 | web_plugin | pass. Reaped this-worktree IsolatedHub workers `83890`, `83892`, `83896` |
+| tui_ghostty | skipped. `ticket_1788460430_647093` |
+| north_star | skipped. `ticket_1788460430_647093` |
+
+Direct merge, no PR. Timing observations stay waived. Foreign session-workers were not killed.
+
+## Review `review_1788508622_226112` return
+
+Review sent Implement back with one high finding: a second close can drop the aggregate permit while late WebRTC bytes are in `local_send_text`.
+
+### `finding_1788508622_126127`
+
+`flush_subscription_adapter_frames` took `late_egress` before the send await. `close_retaining_occupied_budget` then saw no slot and no late bytes, so it released the permit.
+
+Repair `ec056c9`: peek parked bytes during send. Clear them only after usage publication. `second_close_during_late_send_keeps_the_aggregate_permit` hangs `FakeDataChannel::local_send_text`, calls `close_from_host`, and asserts `aggregate_buffered()` is unchanged.
+
+Unix collect `d304977`: the attached-exit ShutdownSession test now reads unsolicited `process_exit` after authoritative exit, matching the printf attach test. Outer wait is 15s.
+
+### Complete matrix at `d304977`
+
+Log `/tmp/botster-hub-matrix-d304977-13.log`. Start and end `MATRIX_BOUNDARY` commit `d3049777fc567c0c0ceee8d72191365f864bff66` dirty `0`. No component retries. TUI ghostty and north-star `ghostty-shared` skipped per `question_1788503817_293195`.
+
+| Arm | Result |
+| --- | --- |
+| fmt | pass |
+| clippy | pass |
+| locked | pass first try. Lib `552`. Lifecycle `346/0/2`. `second_close_during_late_send_keeps_the_aggregate_permit` ok. `webrtc_terminal_output_is_byte_exact` ok. `unix_adapter_bound_printf_stream_attach_delivers_process_exit` ok |
+| hub_ts | pass |
+| web_unit | pass |
+| web_live | pass |
+| web_durable | pass |
+| web_shared | pass first try. `keep_alive_runs=2` `cancel_ablation=true` `exit_pass=true` |
+| web_plugin | pass. Reaped this-worktree IsolatedHub workers `70645`, `70647`, `70651` |
 | tui_ghostty | skipped. `ticket_1788460430_647093` |
 | north_star | skipped. `ticket_1788460430_647093` |
 
