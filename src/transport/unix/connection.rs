@@ -257,6 +257,19 @@ pub(crate) async fn handle_connection_async(
                         }
                     }
                 }
+                mux.clear_deferred_flushes();
+                if let Err(error) = flush_unix_mux_writes(
+                    &mut write_half,
+                    &mux,
+                    &mut mux_write,
+                    event_plane.mailbox(&client_id).as_deref(),
+                )
+                .await
+                {
+                    cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
+                    mux.close_all();
+                    return Err(error);
+                }
                 continue;
             }
             Err(ClientDaemonTransportError::ClientDisconnected) => {
@@ -300,6 +313,19 @@ pub(crate) async fn handle_connection_async(
                 shutdown_rx,
             )
             .await;
+        }
+        mux.clear_deferred_flushes();
+        if let Err(error) = flush_unix_mux_writes(
+            &mut write_half,
+            &mux,
+            &mut mux_write,
+            event_plane.mailbox(&client_id).as_deref(),
+        )
+        .await
+        {
+            cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
+            mux.close_all();
+            return Err(error);
         }
         let (reply_tx, reply_rx) = oneshot::channel();
         let close_after_response = matches!(request, DaemonRequest::DaemonShutdown);

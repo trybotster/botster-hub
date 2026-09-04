@@ -534,7 +534,7 @@ impl UnixConnectionMux {
 
     pub(crate) fn snapshot_writes(
         &self,
-    ) -> Vec<(String, String, UnixTerminalAdapterHandle, Vec<u8>)> {
+    ) -> Vec<(String, String, UnixTerminalAdapterHandle, Vec<u8>, bool)> {
         let Ok(routes) = self.inner.routes.lock() else {
             return Vec::new();
         };
@@ -544,18 +544,25 @@ impl UnixConnectionMux {
                 if route.handle.is_flush_deferred() {
                     return None;
                 }
-                route
-                    .handle
-                    .snapshot_active()
-                    .or_else(|| route.handle.peek_late_egress())
-                    .map(|bytes| {
+                if let Some(bytes) = route.handle.snapshot_active() {
+                    Some((
+                        route.session_id.clone(),
+                        route.subscription_id.clone(),
+                        route.handle.clone(),
+                        bytes,
+                        false,
+                    ))
+                } else {
+                    route.handle.peek_late_egress().map(|bytes| {
                         (
                             route.session_id.clone(),
                             route.subscription_id.clone(),
                             route.handle.clone(),
                             bytes,
+                            true,
                         )
                     })
+                }
             })
             .collect()
     }
