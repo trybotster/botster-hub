@@ -289,13 +289,28 @@ BOTSTER_ENV=test ./test.sh --locked --test hub_daemon_lifecycle_test webrtc_forc
 
 Registered `ticket_1788477497_716720` against `tgt_40abcf71ccf049f4ac0c99953a799869` (botster-web): show Hub-authored ended sessions through an explicit ended-session presentation path, and complete caller-owned alt-exited keep-alive. Dependency `dependency_1788477513_382774`. Web run `run_1788477522_704573`. This Hub run does not edit Web source.
 
-Advisor `sess-1788403107-0006-b32c6439f0082e5ade0aae9963dbdf77`: the north-star keep-alive timeout is a Hub producer gap. `script/prove-north-star-shared-session` `PRODUCER_SCRIPT` now handles `botster-web-production-alt-exit` by sending `ESC[?1049l` and echoing `botster-web-production-alt-exited`, then stays on the primary screen for later TUI attach. No extra Hub ticket. The complete north-star lane still waits for that Web merge. Alternate-screen and `ghostty-shared` assertions stay unchanged.
+Advisor `sess-1788403107-0006-b32c6439f0082e5ade0aae9963dbdf77`: the north-star keep-alive timeout is a Hub producer gap. `script/prove-north-star-shared-session` `PRODUCER_SCRIPT` now handles `botster-web-production-alt-exit` by sending `ESC[?1049l` and echoing `botster-web-production-alt-exited`, then stays on the primary screen for later TUI attach. No extra Hub ticket. Alternate-screen and `ghostty-shared` assertions stay unchanged.
 
-### Residual after this visit
+## Final matrix after Web `9e18b10`
 
-- Durable dashboard and north-star keep-alive stay open until `ticket_1788477497_716720` merges.
-- Then this Hub ticket reruns durable dashboard, north-star shared session, TUI `ghostty-shared`, and the complete matrix once.
-- Hub persistence repair remains `4d558e9`. Do not classify ended rows as current.
+Web `ticket_1788477497_716720` merged at `9e18b1046b75438e971b9fe56a16137581ac2d1b`. Dependency `dependency_1788477513_382774` is closed. Hub candidate `d7bd2c7`. Core pin `72d1c75`. Toolchain `rustc 1.97.0`, Zig `0.16.0`. `CARGO_TARGET_DIR` unset. TUI proof used a scratch checkout of `origin/main` `b051c67` with uncommitted path pins to this Hub worktree.
+
+| Lane | Result |
+| --- | --- |
+| `cargo fmt --all -- --check` | pass |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | pass |
+| WebRTC WouldBlock exact | pass. Green `FORCE=wso-held`. Producer alt-exit arm present. |
+| `./test.sh --locked` | first run failed `unix_adapter_bound_printf_stream_attach_delivers_process_exit` (process_exit missed after printf). Isolated exact 3/4. Retry locked suite pass. Lib `549`. Lifecycle `346 passed; 0 failed; 2 ignored`. |
+| `packages/hub-test-support` `npm test` | pass at `0.1.43` |
+| Web `npm test` at `9e18b10` | pass |
+| `smoke:live-packaged-protocol` | pass (`live packaged protocol harness passed (webrtc)`), including `alternate_screen_exit` |
+| `smoke:live-packaged-protocol:durable` | pass. `botster-web-durable-exited-1` through `-5` present. Hub restart `state_source=loaded`. |
+| `smoke:live-packaged-protocol:shared-session` | first run failed at second keep-alive. Retry pass: `live-shared-session-coordinator-passed` `keep_alive_runs=2` `cancel_ablation=true` `exit_pass=true` |
+| `smoke:plugin-contract-matrix` | pass |
+| TUI `script/test-live-hub ghostty` | pass (`ghostty-live-complete`, worker_rev=`72d1c75`, hub binary from this worktree) |
+| `script/prove-north-star-shared-session` | pass (`north-star-shared-session-complete`). Keep-alive 2×, `ghostty-shared-complete`, `ghostty-shared-exit-complete`. After alt-exit, primary screen showed `NORTH_STAR_HISTORY`. |
+
+No remaining consumer-lane residual. Timing observations stay waived.
 
 ## Missing vault guidance discovered
 
