@@ -24,9 +24,9 @@ botster-hub-client = { path = "crates/botster-hub-client" }
 botster-hub-installation = { path = "crates/botster-hub-installation" }
 botster-ui-contract = { path = "crates/botster-ui-contract" }
 # Protocol identity and Hub runtime Core share this rev so TerminalFrame stays one crate.
-botster-core = { git = "https://github.com/trybotster/botster-core.git", rev = "72d1c7571bc229dbb2cbd67aa979b6504ac150a5" }
-botster-core-daemon = { git = "https://github.com/trybotster/botster-core.git", rev = "72d1c7571bc229dbb2cbd67aa979b6504ac150a5" }
-botster-terminal-protocol = { git = "https://github.com/trybotster/botster-core.git", rev = "72d1c7571bc229dbb2cbd67aa979b6504ac150a5" }
+botster-core = { git = "https://github.com/trybotster/botster-core.git", rev = "5ed369fc4a536d7cfa99547262561fcea7ef41e5" }
+botster-core-daemon = { git = "https://github.com/trybotster/botster-core.git", rev = "5ed369fc4a536d7cfa99547262561fcea7ef41e5" }
+botster-terminal-protocol = { git = "https://github.com/trybotster/botster-core.git", rev = "5ed369fc4a536d7cfa99547262561fcea7ef41e5" }
 libc = "0.2.177"
 mlua = { version = "0.11.6", features = ["lua54", "vendored", "serialize", "send"] }
 serde = { version = "1.0.228", features = ["derive"] }
@@ -43,8 +43,8 @@ keyring = "4.1.2"
 notify = "8.2.0"
 
 [dev-dependencies]
-botster-core-test-support = { git = "https://github.com/trybotster/botster-core.git", rev = "72d1c7571bc229dbb2cbd67aa979b6504ac150a5" }
-botster-terminal-ghostty = { git = "https://github.com/trybotster/botster-core.git", rev = "72d1c7571bc229dbb2cbd67aa979b6504ac150a5", features = ["libghostty-vt"] }
+botster-core-test-support = { git = "https://github.com/trybotster/botster-core.git", rev = "5ed369fc4a536d7cfa99547262561fcea7ef41e5" }
+botster-terminal-ghostty = { git = "https://github.com/trybotster/botster-core.git", rev = "5ed369fc4a536d7cfa99547262561fcea7ef41e5", features = ["libghostty-vt"] }
 botster-hub-test-support = { path = "crates/botster-hub-test-support" }
 portable-pty = "0.9.0"
 
