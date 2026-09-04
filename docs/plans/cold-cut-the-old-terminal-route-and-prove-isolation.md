@@ -17,7 +17,7 @@ Human decisions: `question_1788460117_825061` and `question_1788461094_542980` (
 | Plan worktree | this pipeline worktree; path has no `:`; tracked `.gitignore` has content |
 | Base commit | `ae6a0b1fe99d97215fa82d796da8f01a904171f0` (revision 1 used `bb1a330`; main advanced through `ticket_1788206393_323469`) |
 | Locked Core pin at base | `48a437032791e678010254708259568ce4ad02bf` |
-| Published Core revision to consume | `5ed369fc4a536d7cfa99547262561fcea7ef41e5` (supersedes `72d1c75`; observe bound-queue wake from `ticket_1788523929_630135`). Residual stale-shutdown wake retirement is `ticket_1788537020_814817`. |
+| Published Core revision to consume | `93acae3f98adbc21dc981d113c4eb2f31ead4ad0` (supersedes `5ed369f`; stale-shutdown wake from `ticket_1788537020_814817`) |
 | Merge policy | direct into `main` |
 | Session-type eligibility consumer | no |
 | `teardown_class_applies` | yes (section 12) |

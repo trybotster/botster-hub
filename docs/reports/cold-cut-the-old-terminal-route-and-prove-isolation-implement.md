@@ -12,11 +12,11 @@ Pipeline: `botster_stack_delivery` (direct merge, no PR)
 | Target repository | `botster-hub` (`trybotster/botster-hub`) |
 | Target id | `tgt_7e208a0c76a44980a83b63af976b1f22` |
 | Independent routing | `list_spawn_targets` maps this id to spawn target `botster-hub` |
-| Implement commit | `b164ca1a8e0c2b77ccfbc1c9ea83e158b6a3c928` |
+| Implement commit | `e50e0f04885205522aa46936b6863dc732a3224d` |
 | Branch | `project-pipelines/ticket_1787600679_990088` |
 | Base | `ae6a0b1fe99d97215fa82d796da8f01a904171f0` |
-| `hub_sha` | `b164ca1a8e0c2b77ccfbc1c9ea83e158b6a3c928` |
-| `locked_core_sha` | `5ed369fc4a536d7cfa99547262561fcea7ef41e5` |
+| `hub_sha` | `e50e0f04885205522aa46936b6863dc732a3224d` |
+| `locked_core_sha` | `93acae3f98adbc21dc981d113c4eb2f31ead4ad0` |
 | Toolchain | `rustc 1.97.0 (2d8144b78 2026-07-07)`, Zig `0.16.0` |
 | `teardown_class_applies` | yes |
 
@@ -75,6 +75,7 @@ Later Hub-only test repairs on this branch:
 | `9879211` | `src/data_plane/driver.rs` | Skip forced WouldBlock routes when pumping bound adapters |
 | `f80e902` | `src/data_plane/driver.rs`, `src/transport/unix/adapter.rs`, tests, plan | Remove the post-request global adapter pump and test-only WouldBlock skip. Log opaque wake byte lengths. Register Core `ticket_1788523929_630135` |
 | `b164ca1` | Core-family manifests, `Cargo.lock`, pin literals | Pin Core `5ed369f`. Zero `72d1c75` matches outside `docs/` |
+| `e50e0f0` | Core-family manifests, `Cargo.lock`, pin literals | Pin Core `93acae3`. Zero `5ed369f` matches outside `docs/` |
 
 Inventory found no remaining production old-route symbol.
 
@@ -679,6 +680,35 @@ Registered Core `ticket_1788537020_814817`. Dependency `dependency_1788537029_68
 Fable confirmed `ticket_1788537020_814817` is necessary. After that Core merge and the Hub pin, the final matrix must unskip `script/test-live-hub ghostty` and `script/prove-north-star-shared-session`. Both must pass before Hub merge. Do not transfer another Core or Hub close-evidence defect to TUI. Durable TUI pin-roll `ticket_1788460430_647093` remains the consumer Cargo pin after this merge.
 
 Do not request Review until that Core merge, the Hub pin, locked suite green, isolated Unix `process_exit` 8/8, a clean Hub/Web matrix, and both Ghostty and north-star scripts green.
+
+## Core `93acae3` pin
+
+Core main `93acae3f98adbc21dc981d113c4eb2f31ead4ad0` supersedes `5ed369f`. Session wakes stay live after registry Stale until the engine is terminal. Hub pin commit `e50e0f0`. Zero `5ed369f` matches remain outside `docs/`. `Cargo.lock` has 6 `93acae3` sources. No compatibility path.
+
+Isolated at `e50e0f0`:
+
+- stale-transition shutdown pass
+- Unix `process_exit` 8/8 then 8/8
+- WouldBlock isolation Unix and WebRTC pass
+- Live idle-control and paused data-plane negatives pass
+
+Matrix log `/tmp/botster-hub-matrix-e50e0f0.log`. Start `MATRIX_BOUNDARY` commit `e50e0f04885205522aa46936b6863dc732a3224d` dirty `0`. Toolchain `rustc 1.97.0`. TUI scratch `/tmp/botster-tui-ticket-1787600679` at `b051c67` with uncommitted Core `93acae3` path pins. Web `9e18b10`. Foreign session-workers were not killed.
+
+| Arm | Result |
+| --- | --- |
+| fmt | pass |
+| clippy | pass |
+| locked | pass. Lib `555`. Lifecycle `347/0/2` |
+| hub_ts | pass |
+| web_unit | pass |
+| web_live | first try failed under load 60: Playwright popover click timeout. Resume pass |
+| web_durable | pass |
+| web_shared | pass. `keep_alive_runs=2` `cancel_ablation=true` `exit_pass=true` |
+| web_plugin | pass. Reaped this-worktree IsolatedHub workers `47795`, `47797`, `47802` |
+| tui_ghostty | pass. `ghostty-live-complete` `hub_rev=e50e0f0` `worker_rev=93acae3` `core_adapter_closed` |
+| north_star | first try failed: web keep-alive 1 timeout waiting for renderer write `alt-13` at 45s. Isolated retry pass: `north-star-shared-session-complete`, `ghostty-shared-complete`, `ghostty-shared-exit-complete`, keep-alive 2× |
+
+Close-evidence stayed on Hub/Core. TUI ghostty and north-star were not skipped. Durable TUI pin-roll remains `ticket_1788460430_647093`. Direct merge, no PR. Timing observations stay waived.
 
 ## Missing vault guidance discovered
 
