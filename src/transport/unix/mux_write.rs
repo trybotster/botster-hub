@@ -302,7 +302,9 @@ pub(crate) async fn resume_pending_mux_write(
                 if pending.backpressured {
                     handle.defer_flush();
                 }
-                let _ = handle.complete_active();
+                if !handle.is_closed() {
+                    let _ = handle.complete_active();
+                }
             }
             Ok(MuxWrite::Written)
         }

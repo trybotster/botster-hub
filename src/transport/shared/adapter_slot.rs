@@ -187,6 +187,7 @@ impl<W: WakeSink> AdapterSlot<W> {
             }
         };
         if self.is_closed() {
+            *slot = None;
             return Err(TerminalAdapterWriteError::Closed);
         }
         if slot.is_some() {
@@ -313,7 +314,9 @@ impl<W: WakeSink> AdapterSlot<W> {
             Ok(slot) => {
                 if self.is_closed() {
                     drop(slot);
-                    self.park_occupied_into_late_egress();
+                    if self.late_egress_enabled {
+                        self.park_occupied_into_late_egress();
+                    }
                     return None;
                 }
                 slot.clone()
@@ -332,9 +335,14 @@ impl<W: WakeSink> AdapterSlot<W> {
         let taken = match self.slot.try_lock() {
             Ok(mut slot) => {
                 if self.is_closed() {
-                    drop(slot);
-                    self.park_occupied_into_late_egress();
-                    None
+                    if self.late_egress_enabled {
+                        drop(slot);
+                        self.park_occupied_into_late_egress();
+                        None
+                    } else {
+                        *slot = None;
+                        None
+                    }
                 } else {
                     slot.take()
                 }
