@@ -43,7 +43,7 @@ Did not load [[project-pipelines-playbook]]. No Project Pipelines package or plu
 
 ## Constraints applied before edits
 
-Hub-only change. Work stayed in this run worktree. Core, Web, and TUI source were not edited. TUI scratch pin used an uncommitted worktree. Consumer TUI durable roll is `ticket_1788460430_647093`.
+Hub-only change. Work stayed in this run worktree. Core, Web, and TUI source were not edited. Temporary TUI proof lives at `/tmp/botster-tui-ticket-1787600679` on local branch `proof/ticket_1787600679-e50e0f0` commit `38e5717`. That branch is not merged or pushed. Consumer TUI durable roll is `ticket_1788460430_647093`.
 
 ## Files changed
 
@@ -76,6 +76,7 @@ Later Hub-only test repairs on this branch:
 | `f80e902` | `src/data_plane/driver.rs`, `src/transport/unix/adapter.rs`, tests, plan | Remove the post-request global adapter pump and test-only WouldBlock skip. Log opaque wake byte lengths. Register Core `ticket_1788523929_630135` |
 | `b164ca1` | Core-family manifests, `Cargo.lock`, pin literals | Pin Core `5ed369f`. Zero `72d1c75` matches outside `docs/` |
 | `e50e0f0` | Core-family manifests, `Cargo.lock`, pin literals | Pin Core `93acae3`. Zero `5ed369f` matches outside `docs/` |
+| `99d9a9e` | this report | Replace remaining advisor-session identifier wording |
 
 Inventory found no remaining production old-route symbol.
 
@@ -106,7 +107,7 @@ No unclassified module. No recorded drift.
 
 - Core consumed by pin only.
 - Web consumer proof against `origin/main` `e5573a2` in a scratch worktree. No Web edits.
-- TUI consumer proof against `origin/main` `b051c67` in a scratch worktree. Uncommitted path pin to this Hub worktree plus Core `72d1c75`. Durable TUI roll: `ticket_1788460430_647093` (`tgt_c3d470bab78549df920a41e8fb0e58d8`).
+- TUI consumer proof against local committed scratch `38e5717` (`proof/ticket_1787600679-e50e0f0`). Path pin to this Hub worktree plus Core `93acae3`. Do not merge or push that branch. Durable TUI roll: `ticket_1788460430_647093` (`tgt_c3d470bab78549df920a41e8fb0e58d8`).
 - No npm publication.
 
 ## Deviations from plan
@@ -709,6 +710,50 @@ Matrix log `/tmp/botster-hub-matrix-e50e0f0.log`. Start `MATRIX_BOUNDARY` commit
 | north_star | first try failed: web keep-alive 1 timeout waiting for renderer write `alt-13` at 45s. Isolated retry pass: `north-star-shared-session-complete`, `ghostty-shared-complete`, `ghostty-shared-exit-complete`, keep-alive 2× |
 
 Close-evidence stayed on Hub/Core. TUI ghostty and north-star were not skipped. Durable TUI pin-roll remains `ticket_1788460430_647093`. Direct merge, no PR. Timing observations stay waived.
+
+## Review `review_1788545287_586937` return
+
+Review sent Implement back with two high findings. Sequence 27. Existing medium finding `finding_1788523297_223431` stayed open.
+
+### `finding_1788545287_923360`
+
+The bounced `e50e0f0` matrix had `ARM_FAIL` on `web_live` and `north_star`, no end `MATRIX_BOUNDARY`, and spliced isolated retries. That log is not the Review subject.
+
+The Review-ready subject is one complete run: `/tmp/botster-hub-matrix-99d9a9e-final.log`. Start and end `MATRIX_BOUNDARY` Hub `99d9a9efee4e1fd35a100431e1bfe96d61da2a88` dirty `0`, TUI `38e5717e2253cfafa6718d8b7424ff68fd9fda88` dirty `0`. `ARM_FAIL` count is `0`. Every arm is `ARM_PASS` on first try. `MATRIX_COMPLETE` start and end SHAs match. Feature pin stays `e50e0f0`. This report commit is docs-only after that matrix.
+
+### `finding_1788545287_970173`
+
+TUI proof is now a committed local revision. Path `/tmp/botster-tui-ticket-1787600679`, branch `proof/ticket_1787600679-e50e0f0`, commit `38e5717e2253cfafa6718d8b7424ff68fd9fda88`. `git status --porcelain` is empty at both matrix boundaries. The branch path-pins Hub crates in this worktree and Core `93acae3`. Do not merge or push that TUI branch. Durable consumer pin-roll remains `ticket_1788460430_647093`. Both TUI lanes ran inside the same complete matrix.
+
+### `finding_1788523297_223431`
+
+Hub commit `99d9a9e` already replaced the remaining identifier wording. A complete-tree scan for advisor session identifiers returns no matches on this worktree, including this report.
+
+### Complete matrix at `99d9a9e`
+
+Log `/tmp/botster-hub-matrix-99d9a9e-final.log`. Toolchain `rustc 1.97.0`. Web `9e18b1046b75438e971b9fe56a16137581ac2d1b`. Foreign session-workers were not killed. Start load `10.52 9.54 10.52`. End load `11.75 10.08 9.84`.
+
+| Arm | Result |
+| --- | --- |
+| fmt | pass first try |
+| clippy | pass first try |
+| locked | pass first try. Lib `555` in 17.12s. Lifecycle `347/0/2` in 300.09s |
+| hub_ts | pass first try |
+| web_unit | pass first try |
+| web_live | pass first try |
+| web_durable | pass first try |
+| web_shared | pass first try. `keep_alive_runs=2` `cancel_ablation=true` `exit_pass=true` |
+| web_plugin | pass first try. Reaped this-worktree IsolatedHub workers `86544`, `86546`, `86550` |
+| tui_ghostty | pass first try. `ghostty-live-complete` `hub_rev=99d9a9efee4e1fd35a100431e1bfe96d61da2a88` `worker_rev=93acae3f98adbc21dc981d113c4eb2f31ead4ad0` `ghostty_rev=eb72ec61304ea256be1d86ed8fa961c84e43ecbd`. Write-budget `core_adapter_closed generation=Some(1)` |
+| north_star | pass first try. `north-star-shared-session-complete` `ghostty-shared-complete` `ghostty-shared-exit-complete` |
+
+Direct merge, no PR. Timing observations stay waived. Close-evidence stayed on Hub/Core. Do not splice earlier failed runs as evidence.
+
+Residual after this complete matrix:
+
+- Earlier aborted or spliced matrices are not evidence.
+- Web live Playwright popover clicks and 45s alt-screen renderer-write waits still fail under higher host load. This complete run passed first try at load about `10` to `12`.
+- TUI proof uses Hub path pins. Durable Git pin remains `ticket_1788460430_647093`.
 
 ## Missing vault guidance discovered
 
