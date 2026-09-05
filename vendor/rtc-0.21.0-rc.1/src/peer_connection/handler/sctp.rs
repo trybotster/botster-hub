@@ -136,6 +136,78 @@ impl<'a> SctpHandler<'a> {
             .saturating_sub(self.ctx.read_outs.len())
     }
 
+    /// Forward one association event to the handler's event queue.
+    ///
+    /// `Readable` is the one event the handler acts on instead of forwarding: its stream id is
+    /// returned so the caller can drain that stream against its own budget. Shared by
+    /// `handle_read` and `resume_pending_reads`, because a resumed drain can produce events of
+    /// its own: the `sctp` crate performs a deferred stream reset inside the read that drains
+    /// the last message, and queues `AssociationLost` for it there. Only `handle_read` used to
+    /// poll that queue, so a close produced by a resumed drain waited for the next inbound
+    /// datagram, which a peer that has already sent its reset need not send.
+    fn forward_association_event(
+        event_outs: &mut VecDeque<TaggedRTCEventInternal>,
+        now: Instant,
+        ch: AssociationHandle,
+        event: Event,
+    ) -> Option<StreamId> {
+        match event {
+            Event::HandshakeFailed { reason } => {
+                debug!(
+                    "association_handle {} handshake failed due to {}",
+                    ch.0, reason
+                );
+                //TODO: put it into event_outs?
+            }
+            Event::Connected => {
+                debug!("association_handle {} is connected", ch.0);
+                event_outs.push_back(TaggedRTCEventInternal {
+                    now,
+                    event: RTCEventInternal::SCTPHandshakeComplete(ch.0),
+                });
+            }
+            Event::AssociationLost { reason, id } => {
+                debug!("association_handle {} is closed due to {}", ch.0, reason);
+                event_outs.push_back(TaggedRTCEventInternal {
+                    now,
+                    event: RTCEventInternal::SCTPStreamClosed(ch.0, id),
+                });
+            }
+            Event::Stream(StreamEvent::Readable { id }) => return Some(id),
+            Event::Stream(StreamEvent::BufferedAmountLow { id }) => {
+                debug!(
+                    "association_handle {} stream id {} is buffered amount low",
+                    ch.0, id
+                );
+                event_outs.push_back(TaggedRTCEventInternal {
+                    now,
+                    event: RTCEventInternal::SCTPBufferedAmountLow(ch.0, id),
+                });
+            }
+            Event::Stream(StreamEvent::BufferedAmountHigh { id }) => {
+                debug!(
+                    "association_handle {} stream id {} is buffered amount high",
+                    ch.0, id
+                );
+                event_outs.push_back(TaggedRTCEventInternal {
+                    now,
+                    event: RTCEventInternal::SCTPBufferedAmountHigh(ch.0, id),
+                });
+            }
+            Event::Stream(StreamEvent::BufferedAmountReleased { id, n_bytes }) => {
+                // Forward the exact released byte count so the data
+                // channel handler can decrement its synchronous
+                // send back-pressure counter (see DataChannelHandler).
+                event_outs.push_back(TaggedRTCEventInternal {
+                    now,
+                    event: RTCEventInternal::SCTPBufferReleased(ch.0, id, n_bytes),
+                });
+            }
+            _ => {}
+        }
+        None
+    }
+
     /// Drain one stream while budget allows, recording it as pending if data is left behind.
     ///
     /// Returns the messages read. The budget is checked **before** each `read_sctp()` because
@@ -257,6 +329,26 @@ impl<'a> SctpHandler<'a> {
                 &mut budget,
                 &mut messages,
             )?;
+
+            // The drain can perform a deferred stream reset, which queues `AssociationLost`
+            // on the association. Forward what it produced now: nothing else polls that
+            // queue until the next inbound datagram, and a peer that has already sent its
+            // reset may send nothing more.
+            while let Some(event) = conn.poll() {
+                if let Some(readable) =
+                    Self::forward_association_event(&mut self.ctx.event_outs, now, ch, event)
+                {
+                    Self::drain_stream(
+                        &mut self.ctx.pending_readable,
+                        conn,
+                        ch,
+                        readable,
+                        max_len,
+                        &mut budget,
+                        &mut messages,
+                    )?;
+                }
+            }
 
             for message in messages {
                 if let SctpMessage::Inbound(message) = message {
@@ -390,71 +482,23 @@ impl<'a>
                     }
 
                     while let Some(event) = conn.poll() {
-                        match event {
-                            Event::HandshakeFailed { reason } => {
-                                debug!(
-                                    "association_handle {} handshake failed due to {}",
-                                    ch.0, reason
-                                );
-                                //TODO: put it into event_outs?
-                            }
-                            Event::Connected => {
-                                debug!("association_handle {} is connected", ch.0);
-                                self.ctx.event_outs.push_back(TaggedRTCEventInternal {
-                                    now,
-                                    event: RTCEventInternal::SCTPHandshakeComplete(ch.0),
-                                });
-                            }
-                            Event::AssociationLost { reason, id } => {
-                                debug!("association_handle {} is closed due to {}", ch.0, reason);
-                                self.ctx.event_outs.push_back(TaggedRTCEventInternal {
-                                    now,
-                                    event: RTCEventInternal::SCTPStreamClosed(ch.0, id),
-                                });
-                            }
-                            Event::Stream(StreamEvent::Readable { id }) => {
-                                // Bounded: what is not read stays in the reassembly queue,
-                                // which is what lowers `a_rwnd` and throttles the peer.
-                                Self::drain_stream(
-                                    &mut self.ctx.pending_readable,
-                                    conn,
-                                    *ch,
-                                    id,
-                                    max_len,
-                                    &mut budget,
-                                    &mut messages,
-                                )?;
-                            }
-                            Event::Stream(StreamEvent::BufferedAmountLow { id }) => {
-                                debug!(
-                                    "association_handle {} stream id {} is buffered amount low",
-                                    ch.0, id
-                                );
-                                self.ctx.event_outs.push_back(TaggedRTCEventInternal {
-                                    now,
-                                    event: RTCEventInternal::SCTPBufferedAmountLow(ch.0, id),
-                                });
-                            }
-                            Event::Stream(StreamEvent::BufferedAmountHigh { id }) => {
-                                debug!(
-                                    "association_handle {} stream id {} is buffered amount high",
-                                    ch.0, id
-                                );
-                                self.ctx.event_outs.push_back(TaggedRTCEventInternal {
-                                    now,
-                                    event: RTCEventInternal::SCTPBufferedAmountHigh(ch.0, id),
-                                });
-                            }
-                            Event::Stream(StreamEvent::BufferedAmountReleased { id, n_bytes }) => {
-                                // Forward the exact released byte count so the data
-                                // channel handler can decrement its synchronous
-                                // send back-pressure counter (see DataChannelHandler).
-                                self.ctx.event_outs.push_back(TaggedRTCEventInternal {
-                                    now,
-                                    event: RTCEventInternal::SCTPBufferReleased(ch.0, id, n_bytes),
-                                });
-                            }
-                            _ => {}
+                        if let Some(id) = Self::forward_association_event(
+                            &mut self.ctx.event_outs,
+                            now,
+                            *ch,
+                            event,
+                        ) {
+                            // Bounded: what is not read stays in the reassembly queue,
+                            // which is what lowers `a_rwnd` and throttles the peer.
+                            Self::drain_stream(
+                                &mut self.ctx.pending_readable,
+                                conn,
+                                *ch,
+                                id,
+                                max_len,
+                                &mut budget,
+                                &mut messages,
+                            )?;
                         }
                     }
 
@@ -804,6 +848,19 @@ impl<'a>
             if let Some(timeout) = conn.poll_timeout() {
                 eto = Some(eto.map_or(timeout, |e: Instant| e.min(timeout)));
             }
+        }
+
+        // Deliverable work this pass has already gone past. The driver polls events before
+        // reads, so an event a resumed drain queues from `poll_read` — the `SCTPStreamClosed`
+        // for a reset performed inside that drain — is consumed by no stage of the pass that
+        // produced it. The peer owes no further datagram: it has sent its reset, and its
+        // reconfig timer stops on the in-progress reply. Report the last observed logical
+        // instant so the driver runs another pass now. That pass's `poll_event` empties the
+        // queue, which clears this. Parked data alone never sets it, and the association
+        // deadlines above are kept: see `poll_timeout_reports_nothing_for_a_parked_stream`.
+        if !self.ctx.event_outs.is_empty() {
+            let now = self.ctx.now;
+            eto = Some(eto.map_or(now, |e: Instant| e.min(now)));
         }
 
         eto
@@ -1838,6 +1895,23 @@ mod tests {
             .count()
     }
 
+    /// First payload byte of every inbound message on `stream_id`, in delivery order. The
+    /// server helper fills message `i` with byte `i`, so this is the sent sequence.
+    fn inbound_sequence<'m>(
+        messages: impl IntoIterator<Item = &'m TaggedRTCMessageInternal>,
+        stream_id: StreamId,
+    ) -> Vec<u8> {
+        messages
+            .into_iter()
+            .filter_map(|m| match &m.message {
+                RTCMessageInternal::Dtls(DTLSMessage::Sctp(m)) if m.stream_id == stream_id => {
+                    Some(m.payload[0])
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     fn stream_closed_events(ctx: &SctpHandlerContext, stream_id: StreamId) -> usize {
         ctx.event_outs
             .iter()
@@ -1902,6 +1976,11 @@ mod tests {
             "every accepted message must reach read_outs, including the batch drained by the \
              read that performed the reset"
         );
+        assert_eq!(
+            inbound_sequence(&ctx.read_outs, 1),
+            [0, 0, 1, 2],
+            "the primed message and the batch must arrive intact, in order, without duplication"
+        );
         assert!(
             !client_has_stream(&ctx, ch, 1),
             "the deferred reset must have been performed by the drain"
@@ -1910,10 +1989,13 @@ mod tests {
             ctx.pending_readable.is_empty(),
             "a stream removed by its own drain must not stay parked"
         );
+        // `read_outs` and `event_outs` are separate queues. This asserts that the close is
+        // still reported once; it does not assert public data-before-close ordering, which
+        // is proved at the peer-connection boundary.
         assert_eq!(
             stream_closed_events(&ctx, 1),
             1,
-            "the close must still be reported once, after the data"
+            "the close must still be reported once"
         );
     }
 
@@ -1921,7 +2003,10 @@ mod tests {
     /// is parked. The reset arrives next and is deferred because the parked data is still
     /// unread. When the pipeline asks for data, the resumed drain reads the whole batch,
     /// performs the deferred reset inside its last read, and sees `ErrStreamClosed` on the
-    /// read after it. The batch must be delivered and the parked entry must be cleared.
+    /// read after it. The batch must be delivered, the parked entry must be cleared, and the
+    /// close the resumed drain produced must reach `event_outs` with no further datagram:
+    /// `poll_read` is the only call the pipeline makes here, and the peer, having sent its
+    /// reset, sends nothing more.
     #[test]
     fn a_stream_reset_while_parked_delivers_its_batch_on_resume() {
         let now = Instant::now();
@@ -1966,6 +2051,11 @@ mod tests {
             "the resumed drain must deliver the whole parked batch, not lose it to the reset \
              its last read performed"
         );
+        assert_eq!(
+            inbound_sequence(&resumed, 1),
+            [0, 1, 2],
+            "the parked batch must arrive intact, in order, without duplication"
+        );
         assert!(
             !client_has_stream(&ctx, ch, 1),
             "the deferred reset must have been performed by the resumed drain"
@@ -1974,6 +2064,41 @@ mod tests {
             ctx.pending_readable.is_empty(),
             "a stream removed by its own drain must not stay parked"
         );
+        assert_eq!(
+            stream_closed_events(&ctx, 1),
+            1,
+            "the close produced by the resumed drain must be forwarded without waiting for \
+             another inbound datagram"
+        );
+        assert!(
+            ctx.flush_dirty,
+            "the reset reply and the raised window must be flushed on the next poll_write"
+        );
+
+        // The driver has already run this pass's event stage, so the queued close needs a
+        // wake: a deadline at or before the retained logical instant, which a caller reads as
+        // zero delay. Consuming the event must clear it, and the association's own deadlines
+        // must stay in place.
+        let retained = ctx.now;
+        {
+            let mut handler = SctpHandler::new(&mut ctx, 0);
+            let wake = handler.poll_timeout();
+            assert!(
+                wake.is_some_and(|instant| instant <= retained),
+                "a queued close from a resumed drain must wake the driver now, got {wake:?} \
+                 against retained {retained:?}"
+            );
+            let mut consumed = 0;
+            while handler.poll_event().is_some() {
+                consumed += 1;
+            }
+            assert_eq!(consumed, 1, "exactly the one close is queued");
+            let after = handler.poll_timeout();
+            assert!(
+                after.is_none_or(|instant| instant > retained),
+                "the wake must clear once the event is consumed, got {after:?}"
+            );
+        }
     }
 
     /// A parked entry can name a stream the association no longer has. The drain must forget

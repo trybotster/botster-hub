@@ -70,12 +70,23 @@ The repair treats two results as normal terminal states of one stream:
 - `Association::stream()` reports `ErrStreamNotExisted`: the parked entry names a stream the association no longer has. The drain forgets the entry and reads nothing.
 - `read_sctp()` reports `ErrStreamClosed` after an earlier read in the same loop: the drain forgets the entry and returns the messages it already collected.
 
-Every other error is returned unchanged. The `AssociationLost` event queued by the reset still reaches the caller's event loop, so `SCTPStreamClosed` follows the drained data in the same pass.
-The repair changes no signature, no queue, and no timer.
+Every other error is returned unchanged.
+
+The reset performed inside the drain queues `AssociationLost` on the association. `handle_read` polls that queue after its own drain, so on the immediate path `SCTPStreamClosed` enters `event_outs` in the same `handle_read`.
+The published `resume_pending_reads` never polled that queue, so a close produced by a resumed drain waited for the next inbound datagram, which a peer that has already sent its reset need not send.
+The repair moves the event translation of `handle_read` into one shared function, `forward_association_event`, and calls it from `resume_pending_reads` after each drain. The resumed drain therefore places `SCTPStreamClosed` into `event_outs` inside the same `poll_read`.
+
+An event placed into `event_outs` during `poll_read` is consumed by the peer connection's next `poll_event`. The `webrtc` driver runs writes, then events, then reads in each pass, so no stage of the pass that produced the event consumes it. The next pass follows the driver's next wake. The peer does not guarantee that wake: it has sent its reset, and `rtc-sctp` stops its reconfig timer when the in-progress reply arrives, without reading the reply's result.
+
+The repair therefore adds one local readiness wake. `SctpHandler::poll_timeout` reports the last observed logical instant while `event_outs` is not empty, in addition to the association deadlines it already reports. A caller reads that instant as zero delay and runs another pass. That pass's `poll_event` empties the queue, which clears the wake. The drain also marks the transport for flush, so the reset reply and the raised window leave in that pass's `poll_write`.
+The wake is set by queued events only. Parked unread data never sets it, which the published test `poll_timeout_reports_nothing_for_a_parked_stream` continues to check. Events produced by `handle_read` are consumed by the pass that follows the read, before `poll_timeout` runs, so the wake does not fire for them.
+
+The repair changes no signature and no queue.
 
 Changed upstream files:
 
-- `src/peer_connection/handler/sctp.rs`: the two terminal arms in `drain_stream`, and tests for the immediate drain with a reset that overtook its data, the parked drain with a reset deferred against parked data, a stale parked entry for a missing stream, and an unrelated `ErrShortBuffer` that must still fail the read. The two drain tests run with a read budget above one.
+- `src/peer_connection/handler/sctp.rs`: `forward_association_event` shared by `handle_read` and `resume_pending_reads`; the two terminal arms in `drain_stream`; the event forward after a resumed drain; the readiness wake in `poll_timeout`; and tests for the immediate drain with a reset that overtook its data, the parked drain with a reset deferred against parked data (payload sequence, cleared entry, the close forwarded without another datagram, the wake while that close waits, and the wake cleared once it is consumed), a stale parked entry for a missing stream, and an unrelated `ErrShortBuffer` that must still fail the read. The two drain tests run with a read budget above one.
+- The immediate-path test asserts a data count and a close count on two separate queues. It does not prove public data-before-close ordering; that proof belongs to the peer-connection boundary and the real-peer tests.
 
 ## Workspace notes
 
