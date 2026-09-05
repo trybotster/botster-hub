@@ -481,6 +481,7 @@ async fn accepted_payload_under_pressure_precedes_remote_close() -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut open = false;
     let mut high_seen = false;
+    let mut pressure_active = false;
     let mut close_sent = false;
     let mut remote_closed = false;
     let mut consuming = false;
@@ -513,6 +514,12 @@ async fn accepted_payload_under_pressure_precedes_remote_close() -> Result<()> {
                     RTCDataChannelEvent::OnBufferedAmountHigh(_),
                 ) => {
                     high_seen = true;
+                    pressure_active = true;
+                }
+                RTCPeerConnectionEvent::OnDataChannel(
+                    RTCDataChannelEvent::OnBufferedAmountLow(_),
+                ) => {
+                    pressure_active = false;
                 }
                 _ => {}
             }
@@ -562,13 +569,19 @@ async fn accepted_payload_under_pressure_precedes_remote_close() -> Result<()> {
                 );
                 let mut payload = vec![0u8; PRESSURE_PAYLOAD_BYTES];
                 payload[..8].copy_from_slice(&(sent.len() as u64).to_be_bytes());
-                if channel
-                    .send(Instant::now(), bytes::BytesMut::from(&payload[..]))
-                    .is_ok()
-                {
-                    sent.push(payload);
-                }
+                // Hub configures no wrapper send-buffer limit, so every send must be
+                // accepted; an error here is a real failure, not back-pressure.
+                channel.send(Instant::now(), bytes::BytesMut::from(&payload[..]))?;
+                sent.push(payload);
             } else {
+                // Pressure must still be active at this instant: the high-water event
+                // has not been followed by low-water, and unreleased bytes stay at or
+                // above the Hub threshold.
+                let outstanding = channel.outstanding_bytes();
+                assert!(
+                    pressure_active && outstanding >= HUB_BUFFERED_AMOUNT_HIGH as usize,
+                    "pressure lapsed before the final send: pressure_active={pressure_active} outstanding={outstanding} threshold={HUB_BUFFERED_AMOUNT_HIGH}"
+                );
                 // Accepted under pressure, then closed with no pipeline write in between.
                 let payload = b"final-under-pressure".to_vec();
                 channel.send(Instant::now(), bytes::BytesMut::from(&payload[..]))?;
@@ -592,8 +605,8 @@ async fn accepted_payload_under_pressure_precedes_remote_close() -> Result<()> {
             .saturating_duration_since(Instant::now())
             .min(Duration::from_millis(5));
         if delay.is_zero() {
-            p.offer_pc.handle_timeout(Instant::now()).ok();
-            p.answer_pc.handle_timeout(Instant::now()).ok();
+            p.offer_pc.handle_timeout(Instant::now())?;
+            p.answer_pc.handle_timeout(Instant::now())?;
             continue;
         }
         let incoming = tokio::time::timeout(delay, async {
@@ -621,8 +634,8 @@ async fn accepted_payload_under_pressure_precedes_remote_close() -> Result<()> {
         match incoming {
             Ok(result) => result?,
             Err(_) => {
-                p.offer_pc.handle_timeout(Instant::now()).ok();
-                p.answer_pc.handle_timeout(Instant::now()).ok();
+                p.offer_pc.handle_timeout(Instant::now())?;
+                p.answer_pc.handle_timeout(Instant::now())?;
             }
         }
     }

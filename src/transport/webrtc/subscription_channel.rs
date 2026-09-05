@@ -1318,10 +1318,18 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         // The owner loop's inventory reconcile phase is the production registry cleanup.
+        let reconcile_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut reconcile_passes = 0usize;
         while crate::daemon::owner_loop::run_inventory_reconcile_phase(
             &harness.daemon,
             &mut harness.state,
-        ) {}
+        ) {
+            reconcile_passes += 1;
+            assert!(
+                std::time::Instant::now() < reconcile_deadline && reconcile_passes < 1024,
+                "owner-loop inventory reconcile did not complete: passes={reconcile_passes}"
+            );
+        }
         assert!(
             !harness
                 .state
