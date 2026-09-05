@@ -1,3 +1,13 @@
+fn webrtc_attach_error_context(response: &botster_hub_client::DaemonResponse) -> String {
+    let mut context = serde_json::to_string(&response.error).expect("serialize operator error");
+    for (_, value) in std::env::vars() {
+        if value.len() >= 8 {
+            context = context.replace(&value, "[REDACTED]");
+        }
+    }
+    context
+}
+
 fn webrtc_terminal_adapter_hello() -> botster_hub_client::DaemonHello {
     botster_hub_client::DaemonHello {
         protocol: botster_hub_client::PROTOCOL.to_string(),
@@ -80,7 +90,9 @@ async fn spawn_and_bind_webrtc_channel(
         .expect("spawn");
     assert_eq!(
         spawned.kind,
-        botster_hub_client::DaemonResponseKind::Spawned
+        botster_hub_client::DaemonResponseKind::Spawned,
+        "Spawn subcase={session_id} session={session_id} subscription={subscription_id} kind={:?} error={}",
+        spawned.kind, webrtc_attach_error_context(&spawned),
     );
     let attach = peer
         .encrypted_request(
@@ -94,7 +106,9 @@ async fn spawn_and_bind_webrtc_channel(
         .expect("attach");
     assert_eq!(
         attach.kind,
-        botster_hub_client::DaemonResponseKind::TerminalReservation
+        botster_hub_client::DaemonResponseKind::TerminalReservation,
+        "Attach subcase={session_id} session={session_id} subscription={subscription_id} kind={:?} error={}",
+        attach.kind, webrtc_attach_error_context(&attach),
     );
     let reservation = attach
         .terminal_reservation
@@ -1219,6 +1233,54 @@ fn webrtc_terminal_adapter_unnegotiated_adapter_never_receives_or_decodes_daemon
     hub.shutdown().expect("shutdown isolated hub");
 }
 
+async fn wait_for_webrtc_exit_fixture_event(
+    peer: &mut LocalWebrtcOfferPeer,
+    key: &botster_core::AesGcmKey,
+    exited: bool,
+) {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut retained = VecDeque::new();
+    let mut bytes_seen = 0;
+    let mut outcome = "deadline expired".to_string();
+    let mut found = false;
+    while Instant::now() < deadline {
+        let bytes = match timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            peer.next_terminal_frame(key),
+        ).await {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(error)) => { outcome = format!("receive error: {error}"); break; }
+            Err(_) => { outcome = "receive timeout".to_string(); break; }
+        };
+        bytes_seen += bytes.len();
+        assert!(retained.len() < 256 && bytes_seen <= 4 * 1024 * 1024,
+            "exit fixture evidence exceeded its storage bound");
+        let event = serde_json::from_slice::<botster_hub_client::DaemonEvent>(&bytes);
+        match &event {
+            Ok(botster_hub_client::DaemonEvent::AttachState { session_id, subscription_id, state })
+                if !exited && session_id == "wnx-exit" && subscription_id == "sub-exit" && state == "attached" => {
+                    found = true;
+                }
+            Ok(botster_hub_client::DaemonEvent::ProcessExit { session_id, subscription_id, code })
+                if session_id == "wnx-exit" && subscription_id == "sub-exit" => {
+                    assert!(exited, "exit fixture ended before Attached");
+                    assert_eq!(*code, Some(0), "exit fixture must exit successfully");
+                    found = true;
+                }
+            _ => {}
+        }
+        if found { break; }
+        retained.push_back((String::new(), bytes));
+    }
+    let evidence: Vec<_> = retained.iter().map(|(_, bytes)| {
+        serde_json::from_slice::<serde_json::Value>(bytes)
+            .unwrap_or_else(|_| serde_json::json!({"malformed_frame_bytes": bytes}))
+    }).collect();
+    // These frames still belong to their original consumers.
+    peer.pending_terminal_frames.extend(retained);
+    assert!(found, "wnx-exit/sub-exit missing event exited={exited}; {outcome}; retained={evidence:?}");
+}
+
 #[test]
 fn webrtc_terminal_adapter_detach_peer_death_process_exit_and_shutdown_do_not_emit_close_event() {
     let _guard = daemon_test_guard();
@@ -1231,7 +1293,20 @@ fn webrtc_terminal_adapter_detach_peer_death_process_exit_and_shutdown_do_not_em
             .await
             .expect("hello");
         spawn_and_bind_webrtc(&mut peer, &key, "wnx-detach", "sub-detach", "sleep 30").await;
-        spawn_and_bind_webrtc(&mut peer, &key, "wnx-exit", "sub-exit", "printf 'done\\n'").await;
+        // The producer cannot exit until this route reaches Attached and receives release input.
+        let exit_channel = spawn_and_bind_webrtc_channel(
+            &mut peer, &key, "wnx-exit", "sub-exit",
+            "IFS= read -r release && [ \"$release\" = \"wnx-release\" ] && printf 'done\\n'",
+        ).await;
+        wait_for_webrtc_exit_fixture_event(&mut peer, &key, false).await;
+        let live = peer.encrypted_request(&key, &botster_hub_client::DaemonRequest::ListSessions)
+            .await.expect("live state before exit release");
+        assert!(live.sessions.iter().any(|row| row.session_id == "wnx-exit" && row.lifecycle == "running"));
+        LocalWebrtcOfferPeer::send_reserved_terminal_frame(
+            &exit_channel, &key, &terminal_input_frame_bytes(b"wnx-release\r"),
+        ).await.expect("release exit through the bound terminal route");
+        wait_for_webrtc_exit_fixture_event(&mut peer, &key, true).await;
+        wait_for_authoritative_session_exit(&endpoint, "wnx-exit");
         spawn_and_bind_webrtc(&mut peer, &key, "wnx-shutdown", "sub-shutdown", "sleep 30").await;
         let before = peer
             .encrypted_request(&key, &botster_hub_client::DaemonRequest::Status)
@@ -1991,4 +2066,38 @@ fn webrtc_wrong_peer_cannot_consume_or_expire_an_owned_reservation() {
     });
     shutdown_short_lived_session(&endpoint, "wrong-peer-session");
     hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn webrtc_terminal_adapter_attach_after_authoritative_exit_rejects() {
+    let _guard = daemon_test_guard();
+    let (hub, endpoint, bootstrap) = start_webrtc_adapter_hub("wnx-ended");
+    block_on(async {
+        let (mut peer, key) = open_local_webrtc_peer(&endpoint, &bootstrap).await;
+        peer.encrypted_hello(&key, &webrtc_close_event_hello()).await.expect("hello");
+        let spawned = peer.encrypted_request(&key, &botster_hub_client::DaemonRequest::Spawn {
+            session_id: "wnx-ended".to_string(), command: "printf 'done\\n'".to_string(),
+        }).await.expect("spawn ended-session control");
+        assert_eq!(spawned.kind, botster_hub_client::DaemonResponseKind::Spawned,
+            "Spawn session=wnx-ended subscription=sub-ended kind={:?} error={}",
+            spawned.kind, webrtc_attach_error_context(&spawned));
+        wait_for_authoritative_session_exit(&endpoint, "wnx-ended");
+        let attach = peer.encrypted_request(&key, &botster_hub_client::DaemonRequest::Attach {
+            session_id: "wnx-ended".to_string(), subscription_id: "sub-ended".to_string(),
+        }).await.expect("attach after authoritative exit");
+        assert_eq!(attach.kind, botster_hub_client::DaemonResponseKind::OperatorError,
+            "Attach session=wnx-ended subscription=sub-ended kind={:?} error={}",
+            attach.kind, webrtc_attach_error_context(&attach));
+        let error = attach.error.as_ref().expect("ended-session rejection");
+        assert_eq!(error.code, "invalid_request");
+        assert_eq!(error.operation, "attach");
+        assert_eq!(error.message, "attach failed before adapter bind");
+        assert!(attach.terminal_reservation.is_none());
+        let status = peer.encrypted_request(&key, &botster_hub_client::DaemonRequest::Status)
+            .await.expect("status after rejected attach");
+        assert!(!status.status.expect("status body").live_attach_occupancy.iter()
+            .any(|row| row.session_id == "wnx-ended" && row.subscription_id == "sub-ended"));
+        peer.peer.close().await.expect("close ended-session peer");
+    });
+    hub.shutdown().expect("shutdown ended-session fixture");
 }
