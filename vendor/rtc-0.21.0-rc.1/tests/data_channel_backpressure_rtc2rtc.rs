@@ -330,10 +330,16 @@ async fn accepted_final_payload_precedes_remote_close() -> Result<()> {
         negotiated: Some(NEGOTIATED_ID),
         ..Default::default()
     };
-    p.offer_pc
-        .create_data_channel("final-payload", Some(init.clone()))?;
-    p.answer_pc
-        .create_data_channel("final-payload", Some(init))?;
+    // `NEGOTIATED_ID` is the wire stream id. The public handle each side addresses its
+    // channel by, and that its events and messages carry, comes from `create_data_channel`.
+    let offer_dc = p
+        .offer_pc
+        .create_data_channel("final-payload", Some(init.clone()))?
+        .id();
+    let answer_dc = p
+        .answer_pc
+        .create_data_channel("final-payload", Some(init))?
+        .id();
     let offer = p.offer_pc.create_offer(None)?;
     p.offer_pc
         .set_local_description(Instant::now(), offer.clone())?;
@@ -369,7 +375,7 @@ async fn accepted_final_payload_precedes_remote_close() -> Result<()> {
             {
                 let mut channel = p
                     .offer_pc
-                    .data_channel(NEGOTIATED_ID)
+                    .data_channel(offer_dc)
                     .expect("open channel");
                 channel.send_text(Instant::now(), "final-payload")?;
                 // Do not drive pipeline writes between acceptance and close.
@@ -384,7 +390,7 @@ async fn accepted_final_payload_precedes_remote_close() -> Result<()> {
             ..
         }) = p.answer_pc.poll_read()
         {
-            assert_eq!(id, NEGOTIATED_ID);
+            assert_eq!(id, answer_dc);
             received.push(message.data.to_vec());
         }
         while let Some(event) = p.answer_pc.poll_event() {
@@ -472,10 +478,14 @@ async fn accepted_payload_under_pressure_precedes_remote_close() -> Result<()> {
         negotiated: Some(NEGOTIATED_ID),
         ..Default::default()
     };
-    p.offer_pc
-        .create_data_channel("pressure-close", Some(init.clone()))?;
-    p.answer_pc
-        .create_data_channel("pressure-close", Some(init))?;
+    let offer_dc = p
+        .offer_pc
+        .create_data_channel("pressure-close", Some(init.clone()))?
+        .id();
+    let answer_dc = p
+        .answer_pc
+        .create_data_channel("pressure-close", Some(init))?
+        .id();
     let offer = p.offer_pc.create_offer(None)?;
     p.offer_pc
         .set_local_description(Instant::now(), offer.clone())?;
@@ -512,7 +522,7 @@ async fn accepted_payload_under_pressure_precedes_remote_close() -> Result<()> {
                 RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnOpen(_)) => {
                     let mut channel = p
                         .offer_pc
-                        .data_channel(NEGOTIATED_ID)
+                        .data_channel(offer_dc)
                         .expect("open channel");
                     channel.set_buffered_amount_high_threshold(HUB_BUFFERED_AMOUNT_HIGH);
                     open = true;
@@ -539,7 +549,7 @@ async fn accepted_payload_under_pressure_precedes_remote_close() -> Result<()> {
                 ..
             }) = p.answer_pc.poll_read()
             {
-                assert_eq!(id, NEGOTIATED_ID);
+                assert_eq!(id, answer_dc);
                 received.push(message.data.to_vec());
             }
         }
@@ -567,7 +577,7 @@ async fn accepted_payload_under_pressure_precedes_remote_close() -> Result<()> {
         if open && !close_sent {
             let mut channel = p
                 .offer_pc
-                .data_channel(NEGOTIATED_ID)
+                .data_channel(offer_dc)
                 .expect("open channel");
             if !high_seen {
                 assert!(
