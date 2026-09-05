@@ -435,7 +435,7 @@ Current diagnostic kinds are:
 - `unsupported_feature` for missing handshake features or unsupported daemon
   operations;
 - `terminal_stream_unavailable` when a terminal stream request has a distinct
-  runtime signal such as missing session on attach/drain;
+  runtime signal such as missing session on attach;
 - `action_failure` when a plugin surface action returns a rejected or error
   result;
 - `daemon_startup_failure` for startup failures reported by client/test-support
@@ -1479,9 +1479,9 @@ daemon shutdown on drop with a kill fallback for failed tests. Tests should stil
 call `shutdown()` explicitly when they need teardown failures to be visible.
 
 `run_client_conformance` returns a stable report instead of raw event streams.
-It covers status, empty session list, spawn, terminal attach/drain through
-`stream_attach`, input echo, resize observation through `stty size`, a missing
-session validation error, connected diagnostics, terminal-unavailable
+It covers status, empty session list, spawn, terminal attach and unsolicited
+adapter frames through `stream_attach`, input echo, resize observation through
+`stty size`, a missing session validation error, connected diagnostics, terminal-unavailable
 diagnostics, and teardown. Downstream CI can run it twice against two fresh
 isolated hubs and compare the reports to prove deterministic fixture output.
 
