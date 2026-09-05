@@ -435,6 +435,63 @@ struct BoundSubscriptionRoute<'a> {
     generation: u64,
 }
 
+/// Why the terminal channel driver stopped. Recorded once per driver termination
+/// as a `RuntimeObservation` so a close can be attributed without changing flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalDriverExit {
+    /// The driver observed a closed adapter before sending. It does not say who closed it.
+    AdapterClosed,
+    /// The driver observed a closed adapter while a frame send was in flight.
+    AdapterClosedInFlight,
+    ThresholdFailed,
+    UsageFailed,
+    FrameEncode,
+    PermitRefused,
+    SendFailed,
+    IngressAssembly,
+    IngressEnvelope,
+    IngressDecrypt,
+    IngressRejected,
+    RemoteClose,
+    RemoteError,
+    PollEnded,
+}
+
+impl TerminalDriverExit {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::AdapterClosed => "adapter_closed",
+            Self::AdapterClosedInFlight => "adapter_closed_in_flight",
+            Self::ThresholdFailed => "threshold_failed",
+            Self::UsageFailed => "usage_failed",
+            Self::FrameEncode => "frame_encode",
+            Self::PermitRefused => "permit_refused",
+            Self::SendFailed => "send_failed",
+            Self::IngressAssembly => "ingress_assembly",
+            Self::IngressEnvelope => "ingress_envelope",
+            Self::IngressDecrypt => "ingress_decrypt",
+            Self::IngressRejected => "ingress_rejected",
+            Self::RemoteClose => "remote_close",
+            Self::RemoteError => "remote_error",
+            Self::PollEnded => "poll_ended",
+        }
+    }
+}
+
+fn observe_terminal_driver_exit(route: &BoundSubscriptionRoute<'_>, exit: TerminalDriverExit) {
+    route
+        .peer_state
+        .mux
+        .push_host_event(botster_hub_client::DaemonEvent::RuntimeObservation {
+            kind: format!(
+                "terminal_channel_closed:{}:{}:{}",
+                route.subscription_id,
+                route.generation,
+                exit.as_str(),
+            ),
+        });
+}
+
 async fn run_bound_subscription_channel<C>(
     data_channel: &C,
     stream_key: &AesGcmKey,
@@ -455,6 +512,7 @@ async fn run_bound_subscription_channel<C>(
     {
         if let BoundSubscription::Terminal { handle, .. } = &bound {
             handle.close();
+            observe_terminal_driver_exit(&route, TerminalDriverExit::ThresholdFailed);
         }
         close_subscription_channel_or_fail_peer(data_channel, route.peer_state).await;
         return;
@@ -467,6 +525,7 @@ async fn run_bound_subscription_channel<C>(
     if publish_channel_usage(data_channel, usage).await.is_err() {
         if let BoundSubscription::Terminal { handle, .. } = &bound {
             handle.close();
+            observe_terminal_driver_exit(&route, TerminalDriverExit::UsageFailed);
         }
         close_subscription_channel_or_fail_peer(data_channel, route.peer_state).await;
         return;
@@ -474,8 +533,15 @@ async fn run_bound_subscription_channel<C>(
     drop(hello_permits);
     match bound {
         BoundSubscription::Terminal { handle, usage } => {
-            run_bound_terminal_channel(data_channel, stream_key, route.peer_state, handle, usage)
-                .await;
+            let exit = run_bound_terminal_channel(
+                data_channel,
+                stream_key,
+                route.peer_state,
+                handle,
+                usage,
+            )
+            .await;
+            observe_terminal_driver_exit(&route, exit);
         }
         BoundSubscription::Entity { receiver, usage } => {
             run_bound_entity_channel(data_channel, stream_key, route, receiver, usage).await;
@@ -492,17 +558,18 @@ async fn run_bound_terminal_channel<C>(
     peer_state: &LocalWebrtcPeerState,
     handle: WebRtcTerminalAdapterHandle,
     usage: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-) where
+) -> TerminalDriverExit
+where
     C: LocalWebrtcDataChannel + ?Sized,
 {
     let mut inbound_assembly = InboundTerminalEnvelopeAssembly::default();
     loop {
-        if let Err(()) =
+        if let Err(exit) =
             flush_subscription_adapter_frames(data_channel, stream_key, &handle, &usage).await
         {
             close_subscription_channel_or_fail_peer(data_channel, peer_state).await;
             handle.close();
-            return;
+            return exit;
         }
         let _ = publish_channel_usage(data_channel, &usage).await;
         peer_state.mux.refresh_aggregate_pressure();
@@ -517,7 +584,7 @@ async fn run_bound_terminal_channel<C>(
                             Err(()) => {
                                 handle.close();
                                 close_subscription_channel_or_fail_peer(data_channel, peer_state).await;
-                                return;
+                                return TerminalDriverExit::IngressAssembly;
                             }
                         };
                         let Ok(envelope) = serde_json::from_str::<botster_core::AesGcmEnvelope>(
@@ -525,17 +592,17 @@ async fn run_bound_terminal_channel<C>(
                         ) else {
                             handle.close();
                             close_subscription_channel_or_fail_peer(data_channel, peer_state).await;
-                            return;
+                            return TerminalDriverExit::IngressEnvelope;
                         };
                         let Ok(bytes) = botster_core::decrypt_aes_gcm(stream_key, &envelope) else {
                             handle.close();
                             close_subscription_channel_or_fail_peer(data_channel, peer_state).await;
-                            return;
+                            return TerminalDriverExit::IngressDecrypt;
                         };
                         if handle.push_ingress(bytes).is_err() {
                             handle.close();
                             close_subscription_channel_or_fail_peer(data_channel, peer_state).await;
-                            return;
+                            return TerminalDriverExit::IngressRejected;
                         }
                     }
                     Some(event @ (webrtc::data_channel::DataChannelEvent::OnBufferedAmountHigh
@@ -544,12 +611,20 @@ async fn run_bound_terminal_channel<C>(
                         let _ = publish_channel_usage(data_channel, &usage).await;
                         peer_state.mux.refresh_aggregate_pressure();
                     }
-                    Some(webrtc::data_channel::DataChannelEvent::OnClose)
-                    | Some(webrtc::data_channel::DataChannelEvent::OnError)
-                    | None => {
+                    Some(webrtc::data_channel::DataChannelEvent::OnClose) => {
                         handle.close();
                         close_subscription_channel_or_fail_peer(data_channel, peer_state).await;
-                        return;
+                        return TerminalDriverExit::RemoteClose;
+                    }
+                    Some(webrtc::data_channel::DataChannelEvent::OnError) => {
+                        handle.close();
+                        close_subscription_channel_or_fail_peer(data_channel, peer_state).await;
+                        return TerminalDriverExit::RemoteError;
+                    }
+                    None => {
+                        handle.close();
+                        close_subscription_channel_or_fail_peer(data_channel, peer_state).await;
+                        return TerminalDriverExit::PollEnded;
                     }
                     Some(_) => {}
                 }
@@ -818,17 +893,26 @@ async fn flush_subscription_adapter_frames<C>(
     stream_key: &AesGcmKey,
     handle: &WebRtcTerminalAdapterHandle,
     usage: &std::sync::atomic::AtomicUsize,
-) -> Result<(), ()>
+) -> Result<(), TerminalDriverExit>
 where
     C: LocalWebrtcDataChannel + ?Sized,
 {
     let Some(bytes) = handle.snapshot_active() else {
-        return if handle.is_closed() { Err(()) } else { Ok(()) };
+        return if handle.is_closed() {
+            Err(TerminalDriverExit::AdapterClosed)
+        } else {
+            Ok(())
+        };
     };
-    let frames = framed_daemon_terminal_frame(stream_key, &bytes).map_err(|_| ())?;
+    let frames = framed_daemon_terminal_frame(stream_key, &bytes)
+        .map_err(|_| TerminalDriverExit::FrameEncode)?;
     let wire_len = frames.iter().map(String::len).sum();
     if !handle.transfer_aggregate_permit(wire_len, usage) {
-        return Err(());
+        return Err(if handle.is_closed() {
+            TerminalDriverExit::AdapterClosed
+        } else {
+            TerminalDriverExit::PermitRefused
+        });
     }
     let sent = async {
         for frame in frames {
@@ -836,13 +920,13 @@ where
             tokio::pin!(send);
             loop {
                 if handle.is_closed() {
-                    return Err(());
+                    return Err(TerminalDriverExit::AdapterClosedInFlight);
                 }
                 tokio::select! {
                     biased;
                     _ = handle.wait_for_write() => {}
                     result = &mut send => {
-                        result.map_err(|_| ())?;
+                        result.map_err(|_| TerminalDriverExit::SendFailed)?;
                         break;
                     }
                 }
@@ -852,7 +936,9 @@ where
     }
     .await;
     // Cancellation keeps the conservative count until this refresh succeeds.
-    let published = publish_channel_usage(data_channel, usage).await;
+    let published = publish_channel_usage(data_channel, usage)
+        .await
+        .map_err(|()| TerminalDriverExit::UsageFailed);
     sent?;
     published?;
     let _ = handle.complete_active();

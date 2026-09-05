@@ -1302,7 +1302,19 @@ async fn wait_for_webrtc_exit_fixture_event(
         .filter(|(label, _)| label == exit_label)
         .map(|(_, error)| error.as_str())
         .collect();
-    assert!(found, "wnx-exit/sub-exit missing event exited={exited}; {outcome}; exit_label={exit_label}; exit_channel_errors={exit_channel_errors:?}; retained={evidence:?}; subscription_receive_errors={:?}", peer.subscription_receive_errors);
+    let terminal_channel_closed: Vec<&str> = peer
+        .pending_host_events()
+        .iter()
+        .filter_map(|event| match event {
+            botster_hub_client::DaemonEvent::RuntimeObservation { kind }
+                if kind.starts_with("terminal_channel_closed:") =>
+            {
+                Some(kind.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(found, "wnx-exit/sub-exit missing event exited={exited}; {outcome}; exit_label={exit_label}; exit_channel_errors={exit_channel_errors:?}; terminal_channel_closed={terminal_channel_closed:?}; retained={evidence:?}; subscription_receive_errors={:?}", peer.subscription_receive_errors);
 }
 
 #[test]
