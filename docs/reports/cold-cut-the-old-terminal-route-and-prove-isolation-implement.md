@@ -1125,3 +1125,33 @@ Provenance requirement: four vendor files change (`handler/mod.rs`, the two test
 - Tests, public `RTCPeerConnection` API polled events-first: event order for one channel; two channels with one back-pressured; both read APIs (`poll_data_read` and public `poll_read`); no timer spin under back-pressure across repeated `poll_timeout` calls; duplicate close notification handled once; connection teardown with a held close (no leak, no late event after `close()`); the real-peer rtc2rtc events-first case; acceptance by the exact combined Hub lifecycle test.
 
 Handoff: the ticket write claim is released for a fresh worktree-scoped implementation session. No source was edited for this plan.
+
+### 2026-09-05 receive-side close barrier: implemented in the vendored rtc public queue boundary
+
+Source revision: HEAD `eff54e3` plus four uncommitted files under `vendor/rtc-0.21.0-beta.2`: `src/peer_connection/handler/mod.rs`, `src/peer_connection/internal.rs`, `tests/data_channel_backpressure_rtc2rtc.rs`, `BOTSTER-PATCH.md`. The send-side ordered-close repair files are unchanged. Diff `target/.botster-foundation-evidence/receive-barrier.diff` (sha256 `9f78630d…5a61`, 934 insertions, 73 deletions).
+
+Mechanism, as approved by the coordinator: `route_read_out` is the single counted enqueue into `data_read_outs`; `pop_data_read_out` serves `poll_data_read` and both data branches of the public `poll_read`; the public `poll_event` holds `OnDataChannel(OnClose(id))` only while channel `id` has a pending count, releases eligible held closes first in held order, and recomputes the readiness flag from the entries that remain; `poll_timeout` keeps every handler deadline and folds in the datachannel context's last observed instant only while a held close is eligible; `close()` moves held closes into `event_outs` ahead of the `Closed` state event and clears counts and flag; after teardown a close is never held again and no wake is scheduled. Duplicate `OnClose` for an already-held channel is dropped; the datachannel handler already emits at most one per stream. `OnClosing` is not held.
+
+Complexity note for review: when a channel's count reaches zero, `pop_data_read_out` scans `held_data_channel_closes` for that channel. That scan is bounded by the number of channels with a held close, not O(1). Its comment overstates the guarantee; it is not rewritten during this frozen validation group.
+
+The vendored crate cannot be tested in place: it is excluded from the Hub workspace and also patched by path, so `cargo test -p rtc` and `--manifest-path` both fail. All rtc checks ran in a disposable copy at `target/.botster-foundation-evidence/rtc-unit/` (rsync of the vendor directory, `target/` excluded, one appended empty `[workspace]` table; `diff -rq` against the vendor directory shows only that `Cargo.toml` line). Rust 1.97.0, `-j 2`, one check per command.
+
+| Check | Command (copy unless noted) | Result | Log |
+| --- | --- | --- | --- |
+| barrier units | `cargo test --lib -j 2 botster_receive_close_barrier` | 8 passed | `01-unit-barrier.log` |
+| handler module | `cargo test --lib -j 2 peer_connection::handler::` | 45 passed, includes both `botster_enqueue_close_probe` sender-repair tests and the rerouted `handler_test` fixtures | `02-unit-handler-module.log` |
+| real peer, events first | `cargo test -j 2 --test data_channel_backpressure_rtc2rtc accepted_final_payload_precedes_remote_close_when_events_are_polled_first` | 1 passed | `03-rtc2rtc-events-first.log` |
+| fmt | `cargo fmt --check` after `rustfmt --edition 2024` on the three changed files | clean | `04-fmt-check.log` |
+| strict clippy on rtc | `cargo clippy -j 2 --lib --tests -- -D warnings` | exit 101, 11 diagnostics, all in upstream files outside this repair (`sdp_semantics.rs`, `rtp_receiver/internal.rs`, `statistics/accumulator/*`, examples, `tests/save_to_disk_vpx_interop`) | `05-clippy.log` |
+| Hub check (worktree root) | `cargo check -j 2 --workspace --tests` | exit 0 | `06-hub-cargo-check.log` |
+
+Negative controls, all in the copy, hashes in `A0`, `A1`, `A3`, `B1`, `B4`:
+
+- Arm A, red on revert isolating the receive repair: the copy's `handler/mod.rs` and `internal.rs` replaced by their HEAD `eff54e3` blobs (hashes `955d6fb9…`, `51a1ef92…` match `git show HEAD:`), sender repair files untouched, new test file kept. Attempt 1 of 5 rebuilt (`Compiling rtc` present) and failed at `tests/data_channel_backpressure_rtc2rtc.rs:515` with `close surfaced before the accepted payload was readable`, left `[]`, right the payload. Stopped at the first expected failure. `A2-attempt1.log`.
+- Invalid restoration check, preserved: after `rsync -a` restore the first green rerun failed with no `Compiling rtc` line, so it reran the arm A binary. This is not a source regression. `A4-green.log`. The restored files were touched; the rebuilt rerun passed, `Compiling rtc` present. `A5-green-rebuilt.log`.
+- Arm B, ablation (not a revert): `hold_close_behind_pending_data` returns the event unconditionally in the copy. Rebuilt; 8 of 8 barrier units failed with real assertions: single channel `close must not surface while the payload is unread: [OnClose(1)]`; sibling `only the drained channel closes now` 2 versus 1; multiple eligible 3 closes versus 1; the remaining five at the no-close-before-read assertion. `B2-ablation.log`, `B3-assertions.txt`. Restored, touched, hashes match delivery, 8 passed with `Compiling rtc` present. `B5-green.log`.
+
+Acceptance, Hub worktree root, source hashes unchanged from the pre-A snapshot, `cargo tree --locked -p botster-hub -i rtc` resolving to `vendor/rtc-0.21.0-beta.2`:
+`RUSTUP_TOOLCHAIN=1.97.0 ./test.sh --locked -j 2 --test hub_daemon_lifecycle_test webrtc_terminal_adapter_detach_peer_death_process_exit_and_shutdown_do_not_emit_close_event -- --exact --nocapture`, six separate executions, stop at first failure. Execution 1 rebuilt `rtc`, `webrtc`, and `botster-hub`. Every execution: `running 1 test`, `1 passed`, exit 0. Binaries `target/debug/botster-hub` `200fba23…7b21` and `target/debug/botster-session-worker` `7358688b…631b`, unchanged across executions. Logs `C0-pre.txt` to `C8-cleanup-and-hashes.txt`. Before this repair the unprobed build failed 4 of 6 single executions. No process from this worktree remained after execution 6.
+
+Not run: optional real-peer cases D, the Hub workspace lint gate, the locked suites, and the matrix. The strict clippy failure evidence for the vendored crate is preserved and the workspace lint gate stays pending.
