@@ -1115,3 +1115,13 @@ Tests, all through the public `RTCPeerConnection` API with events polled before 
 - acceptance: the exact combined Hub lifecycle test under the bounded tally on the delivery build.
 
 Provenance requirement: four vendor files change (`handler/mod.rs`, the two test files, and `BOTSTER-PATCH.md`); the send-side ordered-close repair is unchanged.
+
+#### Barrier plan amendments (coordinator review)
+
+- Pending counts, not queue scans: `PipelineContext` keeps `pending_data_by_channel: HashMap<RTCDataChannelId, usize>`. The single enqueue site in `handle_read` (the `DataChannelMessage` push into `data_read_outs`, about line 294) increments; both dequeue paths, `poll_data_read` (about line 180) and the data branch of the public `poll_read` (about line 304), decrement and remove the entry at zero. A held close for channel `id` becomes eligible when its count is absent. No work is proportional to sibling backlog: an unrelated channel's read touches only its own entry.
+- Held-close state bounded by channel lifecycle: at most one held close per channel, keyed by `id` in insertion order (`VecDeque<(id, event)>` plus the count map). A second close event for a channel that already holds one is dropped once, since the datachannel handler already emits `OnClose` at most once per stream (`close_emitted`), and this is the single duplicate-handling point. Entries are removed on release and on connection `close()`.
+- `OnClosing` is not held: the vendored `rtc` source never emits `RTCDataChannelEvent::OnClosing` on any path (defined in `event/data_channel_event.rs`, no producer), so holding it would be untested behavior. Only `OnClose` ordering is the demonstrated defect; local close semantics are unchanged.
+- Logical time preserved: the held event is the original event; `poll_timeout` returns `Some(ctx.now)` from the datachannel handler context's last observed instant only while at least one held close is eligible and not yet released (`held_close_ready`), and nothing otherwise. No timer is due while a channel's data stays undrained under back-pressure.
+- Tests, public `RTCPeerConnection` API polled events-first: event order for one channel; two channels with one back-pressured; both read APIs (`poll_data_read` and public `poll_read`); no timer spin under back-pressure across repeated `poll_timeout` calls; duplicate close notification handled once; connection teardown with a held close (no leak, no late event after `close()`); the real-peer rtc2rtc events-first case; acceptance by the exact combined Hub lifecycle test.
+
+Handoff: the ticket write claim is released for a fresh worktree-scoped implementation session. No source was edited for this plan.
