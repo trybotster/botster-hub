@@ -3167,7 +3167,7 @@ fn decode_validated_base64_payload(
     Ok(payload)
 }
 
-/// Events returned by daemon attach and drain requests.
+/// Host events and decoded terminal observations.
 ///
 /// `Snapshot` and `Scrollback` carry opaque binary engine state for a terminal
 /// subscription. Their payloads are not terminal text and must not be rendered.
