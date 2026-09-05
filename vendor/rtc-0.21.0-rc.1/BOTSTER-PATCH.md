@@ -88,6 +88,32 @@ Changed upstream files:
 - `src/peer_connection/handler/sctp.rs`: `forward_association_event` shared by `handle_read` and `resume_pending_reads`; the two terminal arms in `drain_stream`; the event forward after a resumed drain; the readiness wake in `poll_timeout`; and tests for the immediate drain with a reset that overtook its data, the parked drain with a reset deferred against parked data (payload sequence, cleared entry, the close forwarded without another datagram, the wake while that close waits, and the wake cleared once it is consumed), a stale parked entry for a missing stream, and an unrelated `ErrShortBuffer` that must still fail the read. The two drain tests run with a read budget above one.
 - The immediate-path test asserts a data count and a close count on two separate queues. It does not prove public data-before-close ordering; that proof belongs to the peer-connection boundary and the real-peer tests.
 
+## Repair 3: receive-side close barrier at the public queue boundary
+
+`RTCPeerConnection::handle_read` drains every handler's `poll_read` into the public `data_read_outs` queue in one pass.
+The datachannel handler's `OnClose` for that channel waits in its own event queue at the same time.
+The `webrtc` driver polls events before reads on every pass.
+When the final payload and the close marker are processed in one intake, the driver sees `OnClose` while the accepted payload still waits in `data_read_outs`.
+A consumer that stops at `OnClose` never reads that payload.
+
+The barrier holds a channel's `OnClose` at the public queue boundary until that channel's accepted data has been read.
+Both barrier maps are keyed by the public channel handle (`RTCDataChannelId`), which the rc.1 registry allocates monotonically and never reuses.
+A successor channel on the same SCTP stream id therefore has its own count and its own held close. No stream-id parking or generation tracking exists.
+
+- `PipelineContext` keeps a per-handle pending count. The single enqueue site into `data_read_outs`, `route_read_out`, increments it. Both public dequeue paths, `poll_data_read` and the data branches of `poll_read`, go through `pop_data_read_out`, which decrements it and removes the entry at zero.
+- The public `poll_event` holds `OnDataChannel(OnClose(handle))` while that handle has a pending count. Every other event, including a close for a drained channel, passes unchanged. One channel's backlog never blocks another channel's close.
+- The read that brings a handle's count to zero moves that handle's held close into the ordinary `event_outs` queue, behind whatever is already queued there. Held closes therefore surface in read order, one per `poll_event`.
+- A held close exists only while its handle has a pending count, at most one per handle, so the number of held closes never exceeds the number of unread data-channel messages. A second `OnClose` for a handle that already holds one is dropped; the datachannel handler emits `OnClose` at most once per channel.
+- `poll_timeout` keeps every handler deadline. While `event_outs` is not empty it also reports the datachannel handler's last observed logical instant, so the driver runs another pass now; that pass's `poll_event` empties the queue, which clears the wake. `event_outs` is otherwise empty when `poll_timeout` runs, because the driver drains events before reads. A held close whose data stays undrained schedules nothing.
+- Whole-connection `close()` is a separate teardown case. Queued events and accepted data stay pollable after `close()`, as before. `close()` moves every held close into the event queue in held order, ahead of the `Closed` state event, and clears the counts. Retained data stays readable through both read APIs. A close that reaches the public queue after teardown is never held again. Explicit teardown can therefore expose closure before retained data. That is teardown behavior, not proof of graceful delivery.
+- Local close semantics are unchanged. `OnClosing` has no producer in this crate and is not held.
+
+Changed upstream files for this repair:
+
+- `src/peer_connection/handler/mod.rs`: pending counts, held closes, `route_read_out`, `pop_data_read_out`, `hold_close_behind_pending_data`, the `poll_timeout` wake, the `close()` flush, and unit tests through the public API with events polled first: one channel, a reused stream id with distinct handles, a back-pressured sibling, both `poll_read` data branches, no added deadline while data stays undrained, two released closes in read order, duplicate close, and whole-connection teardown.
+- `src/peer_connection/internal.rs`: initialize the barrier state.
+- `tests/data_channel_backpressure_rtc2rtc.rs`: real-peer case in which the receiver polls events before reads and drains every datagram already at its socket in one intake.
+
 ## Workspace notes
 
 Hub selects this directory through its workspace-root `[patch.crates-io]` entry.
