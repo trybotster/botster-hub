@@ -941,3 +941,24 @@ The skipped restored test is the one already executed in the exact retry. It was
 
 Status: the vendor repair is a separate commit. The restored remote-close test stays uncommitted as preserved evidence.
 No complete matrix, downstream rerun, merge, push, pin change, or gate advancement occurred. The implementer does not approve this candidate.
+
+#### Correction: vendored lockfile and retirement assessment
+
+Codex review of `fb58248` found that `vendor/rtc-0.21.0-beta.2/.gitignore` excluded the vendored `Cargo.lock` from that commit.
+Commit `4c8fa76` tracks the file explicitly. No dependency version was regenerated.
+SHA-256 of the committed file: `e6697428d8d79939f1e071e44eaece9b0f4272e5a7079374595524a1878a5b02`.
+The same hash matches the lockfile in the standalone proof directory `/tmp/hub-hard-close/rtc-repair` and the registry copy of the published crate.
+The earlier proof artifact did not record a lockfile hash; it recorded "exact published lock" and listed no lockfile change. The match above is the verification.
+A clean-checkout repeat of the two standalone rtc tests is prepared at `/tmp/hub-hard-close/fable-clean-checkout/run.py` and has not run.
+
+Retirement assessment including the production owner path:
+
+- Hub driver observes `OnClose` on a bound terminal channel, calls `handle.close()`, and sends `RetireReservedSubscription`.
+- Pinned Core `client_worker.rs` `pump_one` treats adapter pressure `Closed` as `retire_and_hard_stop`, so Core retires the route and drops it from `list_terminal_subscriptions`.
+- `retire_reserved_subscription` forgets the label and releases budget; its Terminal arm does no registry cleanup by design.
+- The Hub registry row is cleared by the owner loop `run_inventory_reconcile_phase` (`src/daemon/owner_loop.rs`), which calls `reconcile_inventory_slice`; a route absent from Core inventory is stale and receives `close_adapter` and `cancel_stream`.
+- The unit fixture pumps only control messages and never runs the owner loop reconcile phase, so `is_adapter_bound` cannot clear there.
+
+The control-only fixture timeout is therefore not proof of a leaked adapter. It is also not proof that the Hub observed the remote close.
+An unapplied diagnostic patch at `/tmp/hub-hard-close/fable-instrumentation/` records received control messages, reservation state, the Core inventory row, and the Hub registry row during the wait. It keeps the acceptance condition unchanged and has not run.
+A later fixture correction must keep the real sibling-traffic assertion and prove adapter cleanup through the production owner path, not through label removal alone.
