@@ -4207,6 +4207,7 @@ fn managed_session_core_error_class(error: &CoreDaemonError) -> &'static str {
         CoreDaemonError::MissingScreenResponse(_) => "missing_screen_response",
         CoreDaemonError::MissingModeFlagsResponse(_) => "missing_mode_flags_response",
         CoreDaemonError::ControlPlaneFailed(_) => "control_plane_failed",
+        CoreDaemonError::ExplicitResizeBusy(_) => "explicit_resize_busy",
         CoreDaemonError::BindTerminalAdapter(error) => match error {
             BindTerminalAdapterError::BindBeforeAttach { .. } => {
                 "bind_terminal_adapter.bind_before_attach"
@@ -5387,6 +5388,21 @@ mod tests {
         assert_eq!(
             managed_session_core_error_class(&generic),
             "runtime.spawn_failed"
+        );
+    }
+
+    #[test]
+    fn explicit_resize_busy_class_is_path_neutral_and_distinct_from_control_plane_failure() {
+        let session_id = SessionId("/private/session/resize-busy".to_string());
+        assert_eq!(
+            managed_session_core_error_class(&CoreDaemonError::ExplicitResizeBusy(
+                session_id.clone()
+            )),
+            "explicit_resize_busy"
+        );
+        assert_eq!(
+            managed_session_core_error_class(&CoreDaemonError::ControlPlaneFailed(session_id)),
+            "control_plane_failed"
         );
     }
 
