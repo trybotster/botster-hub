@@ -1209,3 +1209,29 @@ Earlier attempts preserved: `b1-attempt1-import-compile-failed.log` (a bare `sct
 Unit tests: one channel with the wake absent while data is unread and due after the read; a reused stream id whose successor gets a distinct handle and its own count; a back-pressured sibling; both `poll_read` data branches; no timer spin with a surviving DCEP handshake deadline; two released closes in read order with the wake due until both are consumed; duplicate close notifications; whole-connection teardown flushing ahead of `Closed` with retained data readable through both APIs and a post-teardown close never held.
 
 Limits. The events-first real-peer case passes on the barrier build, but its batch intake does not force the failing schedule in every run; the ablation arm is the sensitivity evidence. Hub workspace build and lifecycle execution remain pending, as above.
+
+### 2026-09-05 combined candidate: Core bf6e7d99 pin roll, consumer consolidation, build, and focused checks
+
+Commits, each with a clean status: `d7ba579` rolls all eighteen literal Core pin sites from `93acae3f` to `bf6e7d996bca2786ad4142c870a13c57a490e241` and re-resolves only the six Core git packages in `Cargo.lock` (one added edge, `sha2 0.11.0` on `botster-core-daemon`, already locked; 148 other entries unchanged; `cargo-lock-core-roll.diff`); `c16d9db` ports the root consumer preparation (base `11facecf`, an ancestor; `git apply` clean, no manual edits): registry-identity worker lookup in `src/update.rs` and the `ExplicitResizeBusy` class in `src/runtime.rs`, with their tests; `a2704b3` consolidates the four absent root plans, the consumer report, the original patch under `docs/plans/pending`, and the worktree ownership note. Codex source-cleared `d7ba579` and `c16d9db` at `a2704b3`.
+
+Builds on `a2704b3`, Rust 1.97.0, `--locked -j 2`:
+
+| Step | Command | Result | Log |
+| --- | --- | --- | --- |
+| H1 root package | `cargo build --locked -j 2` | rtc rc.1 from `vendor/rtc-0.21.0-rc.1`, Core crates at `bf6e7d99`, Finished 1m40s | `h1-hub-build.log` |
+| H2 workspace | `cargo build --workspace --locked -j 2` | installer and test-support built, Finished | `h2-hub-workspace-build.log` |
+| H3 worker | `cargo build --locked -j 2 -p botster-core-daemon --bin botster-session-worker` | no prior binary; built from `bf6e7d99` | `h3-worker-build.log` |
+
+Identity (`h4-binary-identity.txt`, `h5-final-binary-identity.txt`): `botster-hub` `0db7ea0e…db28d`, `botster-session-worker` `59760bd1…d221`; `cargo tree --locked -p botster-hub -i rtc` resolves the vendor path under `webrtc 0.21.0-rc.1`; `botster-core` and `botster-core-daemon` resolve to the git revision. The lifecycle test build recompiled `botster-hub` for the test profile (`d8b6277a…`, dev-dependency feature unification); the final plain workspace build uplifted the dev artifact back to `0db7ea0e…` without recompiling, and the worker hash never changed.
+
+Focused checks, one at a time:
+
+| Check | Command | Result | Log |
+| --- | --- | --- | --- |
+| F1a consumer identity | `./test.sh --locked -j 2 --bin botster-hub -- update::tests::durable_worker_identity` | 2 passed (a `--lib` attempt selected 0: `update` is a bin module; `f1a-attempt1-lib-target-zero-selected.log`) | `f1a-durable-identity.log` |
+| F1b resize class | `./test.sh --locked -j 2 --lib -- runtime::tests::explicit_resize_busy_class_is_path_neutral_and_distinct_from_control_plane_failure --exact` | 1 passed | `f1b-resize-class.log` |
+| F2 lifecycle, three separate executions | `./test.sh --locked -j 2 --test hub_daemon_lifecycle_test webrtc_terminal_adapter_detach_peer_death_process_exit_and_shutdown_do_not_emit_close_event -- --exact --nocapture` | 1 passed each, 6.93 s, 6.67 s, 6.69 s | `f2-1..3-lifecycle.log` |
+| F3 fmt | `cargo fmt --all -- --check` | clean | `f3-fmt-check.log` |
+| F3 clippy | `cargo clippy --workspace --all-targets --locked -j 2 -- -D warnings` | exit 0, no warnings | `f3-clippy.log` |
+
+The old-Core collision negative control was not run: it would require re-pinning, and the coordinator ruled the published Core and consumer regression evidence sufficient. Not run: the full matrix, any push or merge, and the Web live run, which the coordinator schedules against the handoff hashes above.
