@@ -855,3 +855,31 @@ Evidence is under `/tmp/hub-hard-close/final-focused`, `/tmp/hub-hard-close/abla
 The final supervisor reports no owned survivors before or after cleanup. No cleanup signal was needed. The five approved foreign workers remain unchanged, and the Botster zombie census is empty. The build window was released to the coordinator after the failed arm. No later build or test ran.
 
 Residual blocker: unsolicited ProcessExit delivery remains intermittent and unattributed. This candidate is for source and log review; it cannot advance the pipeline. No complete matrix, downstream rerun, merge, or pin change occurred. No lens is waived. Missing durable guidance was the conflict between earlier Hub retention reports and Core close semantics; Core now documents the boundary, and this report supersedes the invalid local requirements. No new vault exception was created.
+
+### 2026-09-04 idempotent close correction
+
+Target: `trybotster/botster-hub`, `tgt_7e208a0c76a44980a83b63af976b1f22`.
+The coordinator authorized this separate correction after review of `bbecda6`.
+
+`LocalWebrtcDataChannel::local_close` now treats only typed `ErrDataChannelClosed` as successful cleanup.
+Other errors and the existing close timeout still trigger peer cleanup.
+The change preserves Hub transport ownership and the pinned Core contract.
+It changes no terminal protocol, dependency, or sibling repository.
+
+The new test uses a real removed DataChannel handle and the production subscription cleanup helper.
+The test requires the dependency's absent-channel error and then successful request/response traffic on the host sibling.
+The test passed. The existing genuine-error and timeout tests also passed.
+A negative control removed only the correction. The new test then failed at the peer-cleanup assertion.
+The correction was restored exactly.
+Evidence: `/tmp/hub-hard-close/idempotent-absent` and `/tmp/hub-hard-close/idempotent-ablation`.
+Both supervisors recorded no owned survivors and no cleanup signals.
+
+This helper test does not verify the whole remote-close lifecycle.
+Earlier entity-shaped and terminal-shaped tests timed out while waiting for Hub target retirement.
+Those failures remain preserved in `idempotent-focused` and `idempotent-terminal` under the same evidence root.
+The coordinator requires one terminal-shaped retry after the separate dependency repair.
+No matrix or gate advancement occurred.
+
+The implementer, Botster implementer, and Hub playbooks constrained this correction.
+The runtime teardown lenses and peer-cleanup notes require explicit sibling and failure-path evidence.
+No convention was waived. No missing guidance was discovered for this correction.
