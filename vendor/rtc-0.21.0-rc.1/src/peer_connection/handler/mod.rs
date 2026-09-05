@@ -671,22 +671,21 @@ mod botster_enqueue_close_probe {
             .with_configuration(RTCConfigurationBuilder::new().build())
             .build(now)
             .unwrap();
-        let mut dc = RTCDataChannelInternal::new(
-            1,
-            DataChannelParameters {
-                label: "enqueue-close-probe".to_owned(),
-                protocol: String::new(),
-                ordered: true,
-                max_packet_life_time: None,
-                max_retransmits: None,
-                negotiated: Some(1),
-            },
-        );
+        // Out-of-band: `negotiated` fixes stream id 1, so the channel can dial at once. The
+        // registry assigns the public handle on insert; every later call uses that handle.
+        let mut dc = RTCDataChannelInternal::new(DataChannelParameters {
+            label: "enqueue-close-probe".to_owned(),
+            protocol: String::new(),
+            ordered: true,
+            max_packet_life_time: None,
+            max_retransmits: None,
+            negotiated: Some(1),
+        });
         // This check establishes only the local queue path. It creates no peer.
         dc.dial(0).unwrap();
-        pc.data_channels.insert(1, dc);
+        let id = pc.data_channels.insert(dc);
         while pc.get_datachannel_handler().poll_write().is_some() {}
-        pc.data_channel(1)
+        pc.data_channel(id)
             .unwrap()
             .send_text(now, "exit-probe")
             .unwrap();
@@ -694,10 +693,10 @@ mod botster_enqueue_close_probe {
             let queued = pc.get_endpoint_handler().poll_write().unwrap();
             pc.get_datachannel_handler().handle_write(queued).unwrap();
         }
-        pc.data_channel(1).unwrap().close().unwrap();
-        pc.data_channel(1).unwrap().close().unwrap();
+        pc.data_channel(id).unwrap().close().unwrap();
+        pc.data_channel(id).unwrap().close().unwrap();
         assert!(matches!(
-            pc.data_channel(1).unwrap().send_text(now, "late"),
+            pc.data_channel(id).unwrap().send_text(now, "late"),
             Err(shared::error::Error::ErrDataChannelClosed)
         ));
         while let Some(queued) = pc.get_endpoint_handler().poll_write() {
@@ -746,24 +745,25 @@ mod botster_enqueue_close_probe {
             .with_configuration(RTCConfigurationBuilder::new().build())
             .build(now)
             .unwrap();
-        let mut dc = RTCDataChannelInternal::new(
-            1,
-            DataChannelParameters {
-                label: "close-before-open".to_owned(),
-                protocol: String::new(),
-                ordered: true,
-                max_packet_life_time: None,
-                max_retransmits: None,
-                negotiated: None,
-            },
-        );
-        dc.dial(0).unwrap();
-        pc.data_channels.insert(1, dc);
+        // In-band: the stream id waits for the DTLS role in production. This check has no
+        // association, so it binds stream id 1 the way the connected procedure would, then
+        // dials. The public handle comes from the registry on insert.
+        let dc = RTCDataChannelInternal::new(DataChannelParameters {
+            label: "close-before-open".to_owned(),
+            protocol: String::new(),
+            ordered: true,
+            max_packet_life_time: None,
+            max_retransmits: None,
+            negotiated: None,
+        });
+        let id = pc.data_channels.insert(dc);
+        pc.data_channels.assign_stream_id(id, 1);
+        pc.data_channels.get_mut(&id).unwrap().dial(0).unwrap();
         // Nothing is drained: the DCEP OPEN stays queued when the public close runs.
-        pc.data_channel(1).unwrap().close().unwrap();
-        pc.data_channel(1).unwrap().close().unwrap();
+        pc.data_channel(id).unwrap().close().unwrap();
+        pc.data_channel(id).unwrap().close().unwrap();
         assert!(matches!(
-            pc.data_channel(1).unwrap().send_text(now, "late"),
+            pc.data_channel(id).unwrap().send_text(now, "late"),
             Err(shared::error::Error::ErrDataChannelClosed)
         ));
         // A late ACK reaches the handler while the queued close is still pending.
@@ -787,7 +787,7 @@ mod botster_enqueue_close_probe {
             pc.get_datachannel_handler().handle_write(queued).unwrap();
         }
         assert_eq!(
-            pc.data_channels.get(&1).unwrap().ready_state,
+            pc.data_channels.get(&id).unwrap().ready_state,
             RTCDataChannelState::Closed
         );
         let mut opens = 0;
