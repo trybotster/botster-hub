@@ -1208,6 +1208,90 @@ mod tests {
     }
 
     #[test]
+    fn removed_subscription_channel_keeps_host_sibling_live() {
+        let _teardown_guard = teardown_test_lock();
+        let mut harness = PeerHarness::new("remote-closed-subscription");
+        let mut peer = harness.signal_peer("http://127.0.0.1:41919");
+        let target = harness
+            .subscribe_entities(&mut peer, "removed-close-target")
+            .subscription_reservation
+            .expect("target reservation");
+        let label = target.label;
+        harness.bind_reserved_on_peer(&mut peer, &label);
+        harness.wait_until_reservation_bound(&peer.grant_id, &label);
+        let peer_state = harness
+            .daemon
+            .local_webrtc()
+            .peer_states
+            .get(&peer.grant_id)
+            .expect("live peer state")
+            .clone();
+        let channel = Arc::clone(
+            &peer
+                .offer_peer
+                .as_ref()
+                .expect("offer peer")
+                .reserved_channels
+                .get(&label)
+                .expect("target channel")
+                .channel,
+        );
+        peer.offer_runtime
+            .block_on(channel.close())
+            .expect("remote close");
+        peer.offer_runtime.block_on(async {
+            let receiver = &mut peer
+                .offer_peer
+                .as_mut()
+                .expect("offer peer")
+                .reserved_channels
+                .get_mut(&label)
+                .expect("target channel")
+                .message_rx;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let mut frames = 0;
+                while receiver.recv().await.is_some() {
+                    frames += 1;
+                    assert!(frames <= 256, "bounded pending frames");
+                }
+            })
+            .await
+            .expect("local channel poll task must end");
+            assert!(
+                matches!(
+                    channel.close().await,
+                    Err(webrtc::error::Error::ErrDataChannelClosed)
+                ),
+                "the dependency must report the removed channel"
+            );
+            close_subscription_channel_or_fail_peer(channel.as_ref(), &peer_state).await;
+        });
+        assert!(
+            !peer_state.cleanup_sent.load(Ordering::Acquire),
+            "an absent channel must not clean up the peer"
+        );
+        let sibling_response = harness.subscribe_entities(&mut peer, "live-host-sibling");
+        assert_eq!(
+            sibling_response.kind,
+            botster_hub_client::DaemonResponseKind::EntitySubscribed,
+            "the host sibling must carry a request and response after channel removal"
+        );
+        peer.offer_runtime.block_on(async {
+            assert!(
+                matches!(
+                    channel.close().await,
+                    Err(webrtc::error::Error::ErrDataChannelClosed)
+                ),
+                "the dependency must report the removed channel"
+            );
+            channel.local_close().await.expect("idempotent local close");
+        });
+        assert!(!peer_state.cleanup_sent.load(Ordering::Acquire));
+        peer.close_offer();
+        harness.cleanup();
+    }
+
+    #[test]
     fn failed_channel_close_keeps_usage_until_peer_cleanup() {
         assert_failed_channel_close_keeps_usage(false);
     }

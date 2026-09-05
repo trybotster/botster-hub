@@ -82,7 +82,10 @@ where
     }
 
     async fn local_close(&self) -> Result<(), String> {
-        self.close().await.map_err(|error| error.to_string())
+        match self.close().await {
+            Ok(()) | Err(webrtc::error::Error::ErrDataChannelClosed) => Ok(()),
+            Err(error) => Err(error.to_string()),
+        }
     }
 }
 pub(crate) enum PendingLocalWebrtcRequest {
