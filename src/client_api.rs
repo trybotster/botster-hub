@@ -1947,6 +1947,13 @@ fn runtime_error(
                 botster_core::MultiplexerEngineError::SessionAlreadyExists { .. },
             ),
         )) => HubClientRuntimeErrorKind::SessionAlreadyExists,
+        HubRuntimeError::CoreDaemon(botster_core_daemon::CoreDaemonError::Engine(
+            botster_core::DefaultBotsterEngineError::Multiplexer(
+                botster_core::MultiplexerEngineError::Runtime(error),
+            ),
+        )) if error.kind == SessionRuntimeErrorKind::SpawnFailed => {
+            HubClientRuntimeErrorKind::SpawnFailed
+        }
         HubRuntimeError::CoreDaemon(_) if operation == HubClientOperation::ReadModeFlags => {
             HubClientRuntimeErrorKind::ModeReadFailed
         }
@@ -1958,6 +1965,73 @@ fn runtime_error(
         request_id,
         operation,
         kind,
+    }
+}
+
+#[cfg(test)]
+mod runtime_error_tests {
+    use super::*;
+    use botster_core::SessionRuntimeError;
+
+    #[test]
+    fn nested_multiplexer_spawn_failed_maps_to_spawn_failed() {
+        let error = runtime_error(
+            RequestId("runtime-spawn".to_string()),
+            HubClientOperation::Spawn,
+            HubRuntimeError::CoreDaemon(botster_core_daemon::CoreDaemonError::Engine(
+                botster_core::DefaultBotsterEngineError::Multiplexer(
+                    botster_core::MultiplexerEngineError::Runtime(SessionRuntimeError {
+                        kind: SessionRuntimeErrorKind::SpawnFailed,
+                        message: "/tmp/host-path/botster-session-worker".to_string(),
+                    }),
+                ),
+            )),
+        );
+        let rendered = format!("{error:?}");
+        match error {
+            HubClientError::Runtime {
+                request_id,
+                operation: HubClientOperation::Spawn,
+                kind: HubClientRuntimeErrorKind::SpawnFailed,
+            } => {
+                assert_eq!(request_id.0, "runtime-spawn");
+                assert!(
+                    !rendered.contains("/tmp/host-path"),
+                    "public Runtime error must not expose host paths: {rendered}"
+                );
+                assert!(
+                    !rendered.contains("botster-session-worker"),
+                    "public Runtime error must not expose the raw Core message: {rendered}"
+                );
+            }
+            other => {
+                panic!("nested multiplexer SpawnFailed must classify as SpawnFailed, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn direct_engine_spawn_failed_still_maps_to_spawn_failed() {
+        let error = runtime_error(
+            RequestId("runtime-spawn".to_string()),
+            HubClientOperation::Spawn,
+            HubRuntimeError::CoreDaemon(botster_core_daemon::CoreDaemonError::Engine(
+                botster_core::DefaultBotsterEngineError::Runtime(SessionRuntimeError {
+                    kind: SessionRuntimeErrorKind::SpawnFailed,
+                    message: "direct".to_string(),
+                }),
+            )),
+        );
+        match error {
+            HubClientError::Runtime {
+                kind: HubClientRuntimeErrorKind::SpawnFailed,
+                operation: HubClientOperation::Spawn,
+                ..
+            } => {}
+            other => {
+                panic!("direct Engine Runtime SpawnFailed must stay SpawnFailed, got {other:?}")
+            }
+        }
     }
 }
 
