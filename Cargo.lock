@@ -2343,8 +2343,6 @@ dependencies = [
 [[package]]
 name = "rtc"
 version = "0.21.0-beta.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18b8cc79ca0599ef8b851f8b2b1ac30334e2f51a8a792e67829c6b29f533d15a"
 dependencies = [
  "bytes",
  "hex",

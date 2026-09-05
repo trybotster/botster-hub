@@ -1,4 +1,5 @@
 [workspace]
+exclude = ["vendor/rtc-0.21.0-beta.2"]
 members = [
   ".",
   "crates/botster-hub-client",
@@ -55,3 +56,7 @@ loom = "0.7.2"
 # inherit this patch; they resolve tag botster-ui-contract-v0.3.3.
 [patch."https://github.com/trybotster/botster-hub.git"]
 botster-ui-contract = { path = "crates/botster-ui-contract" }
+
+# Hub runtime builds use the ordered channel close fix documented in this directory.
+[patch.crates-io]
+rtc = { path = "vendor/rtc-0.21.0-beta.2" }
