@@ -336,6 +336,13 @@ async fn run_bound_subscription_channel_and_retire<C>(
     C: LocalWebrtcDataChannel + ?Sized,
 {
     run_bound_subscription_channel(data_channel, stream_key, route, bound, hello_permits).await;
+    if route
+        .peer_state
+        .cleanup_sent
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return;
+    }
     let _ = route
         .peer_state
         .runtime_tx
@@ -449,7 +456,7 @@ async fn run_bound_subscription_channel<C>(
         if let BoundSubscription::Terminal { handle, .. } = &bound {
             handle.close();
         }
-        let _ = close_subscription_channel(data_channel).await;
+        close_subscription_channel_or_fail_peer(data_channel, route.peer_state).await;
         return;
     }
     let usage = match &bound {
@@ -461,7 +468,7 @@ async fn run_bound_subscription_channel<C>(
         if let BoundSubscription::Terminal { handle, .. } = &bound {
             handle.close();
         }
-        let _ = close_subscription_channel(data_channel).await;
+        close_subscription_channel_or_fail_peer(data_channel, route.peer_state).await;
         return;
     }
     drop(hello_permits);
@@ -493,7 +500,7 @@ async fn run_bound_terminal_channel<C>(
         if let Err(()) =
             flush_subscription_adapter_frames(data_channel, stream_key, &handle, &usage).await
         {
-            let _ = close_subscription_channel(data_channel).await;
+            close_subscription_channel_or_fail_peer(data_channel, peer_state).await;
             handle.close();
             return;
         }
@@ -509,7 +516,7 @@ async fn run_bound_terminal_channel<C>(
                             Ok(None) => continue,
                             Err(()) => {
                                 handle.close();
-                                let _ = close_subscription_channel(data_channel).await;
+                                close_subscription_channel_or_fail_peer(data_channel, peer_state).await;
                                 return;
                             }
                         };
@@ -517,17 +524,17 @@ async fn run_bound_terminal_channel<C>(
                             &encrypted,
                         ) else {
                             handle.close();
-                            let _ = close_subscription_channel(data_channel).await;
+                            close_subscription_channel_or_fail_peer(data_channel, peer_state).await;
                             return;
                         };
                         let Ok(bytes) = botster_core::decrypt_aes_gcm(stream_key, &envelope) else {
                             handle.close();
-                            let _ = close_subscription_channel(data_channel).await;
+                            close_subscription_channel_or_fail_peer(data_channel, peer_state).await;
                             return;
                         };
                         if handle.push_ingress(bytes).is_err() {
                             handle.close();
-                            let _ = close_subscription_channel(data_channel).await;
+                            close_subscription_channel_or_fail_peer(data_channel, peer_state).await;
                             return;
                         }
                     }
@@ -541,6 +548,7 @@ async fn run_bound_terminal_channel<C>(
                     | Some(webrtc::data_channel::DataChannelEvent::OnError)
                     | None => {
                         handle.close();
+                        close_subscription_channel_or_fail_peer(data_channel, peer_state).await;
                         return;
                     }
                     Some(_) => {}
@@ -585,12 +593,12 @@ async fn run_bound_entity_channel<C>(
                         break 'driver;
                     };
                     if data_channel.local_send_text(&frame).await.is_err() {
-                        let _ = close_subscription_channel(data_channel).await;
+                        close_subscription_channel_or_fail_peer(data_channel, route.peer_state).await;
                         drop(permit);
                         return;
                     }
                     if publish_channel_usage(data_channel, &usage).await.is_err() {
-                        let _ = close_subscription_channel(data_channel).await;
+                        close_subscription_channel_or_fail_peer(data_channel, route.peer_state).await;
                         drop(permit);
                         return;
                     }
@@ -614,7 +622,7 @@ async fn run_bound_entity_channel<C>(
             }
         }
     }
-    let _ = close_subscription_channel(data_channel).await;
+    close_subscription_channel_or_fail_peer(data_channel, route.peer_state).await;
 }
 
 async fn authorize_subscription_send(
@@ -710,12 +718,12 @@ async fn run_bound_event_channel<C>(
                     break 'driver;
                 };
                 if data_channel.local_send_text(&frame).await.is_err() {
-                    let _ = close_subscription_channel(data_channel).await;
+                    close_subscription_channel_or_fail_peer(data_channel, route.peer_state).await;
                     drop(permit);
                     return;
                 }
                 if publish_channel_usage(data_channel, &usage).await.is_err() {
-                    let _ = close_subscription_channel(data_channel).await;
+                    close_subscription_channel_or_fail_peer(data_channel, route.peer_state).await;
                     drop(permit);
                     return;
                 }
@@ -750,7 +758,20 @@ async fn run_bound_event_channel<C>(
             }
         }
     }
-    let _ = close_subscription_channel(data_channel).await;
+    close_subscription_channel_or_fail_peer(data_channel, route.peer_state).await;
+}
+
+async fn close_subscription_channel_or_fail_peer<C>(
+    data_channel: &C,
+    peer_state: &LocalWebrtcPeerState,
+) where
+    C: LocalWebrtcDataChannel + ?Sized,
+{
+    if !matches!(close_subscription_channel(data_channel).await, Ok(Ok(()))) {
+        let cause = crate::transport::webrtc::peer::LocalWebrtcTerminalCause::ChannelError;
+        peer_state.publish_peer_terminal(cause);
+        peer_state.cleanup_once(cause).await;
+    }
 }
 
 async fn close_subscription_channel<C>(
@@ -801,28 +822,40 @@ async fn flush_subscription_adapter_frames<C>(
 where
     C: LocalWebrtcDataChannel + ?Sized,
 {
-    let bytes = match handle.snapshot_active() {
-        Some(bytes) => bytes,
-        None => match handle.peek_late_egress() {
-            Some(bytes) => bytes,
-            None => {
-                handle.release_aggregate_permit();
-                return if handle.is_closed() { Err(()) } else { Ok(()) };
-            }
-        },
+    let Some(bytes) = handle.snapshot_active() else {
+        return if handle.is_closed() { Err(()) } else { Ok(()) };
     };
     let frames = framed_daemon_terminal_frame(stream_key, &bytes).map_err(|_| ())?;
     let wire_len = frames.iter().map(String::len).sum();
-    if !handle.resize_aggregate_permit(wire_len) {
+    if !handle.transfer_aggregate_permit(wire_len, usage) {
         return Err(());
     }
-    for frame in frames {
-        data_channel.local_send_text(&frame).await.map_err(|_| ())?;
+    let sent = async {
+        for frame in frames {
+            let send = data_channel.local_send_text(&frame);
+            tokio::pin!(send);
+            loop {
+                if handle.is_closed() {
+                    return Err(());
+                }
+                tokio::select! {
+                    biased;
+                    _ = handle.wait_for_write() => {}
+                    result = &mut send => {
+                        result.map_err(|_| ())?;
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
-    publish_channel_usage(data_channel, usage).await?;
+    .await;
+    // Cancellation keeps the conservative count until this refresh succeeds.
+    let published = publish_channel_usage(data_channel, usage).await;
+    sent?;
+    published?;
     let _ = handle.complete_active();
-    let _ = handle.take_late_egress();
-    handle.release_aggregate_permit();
     Ok(())
 }
 
@@ -962,69 +995,55 @@ mod tests {
     }
 
     #[test]
-    fn flush_after_close_sends_parked_late_egress_under_the_existing_permit() {
+    fn hard_close_abandons_occupied_frame_before_flush() {
         use crate::admission::connection_budget::{ChannelClass, ConnectionBudget};
-        use botster_core::contract::terminal_adapter::TerminalAdapter;
         use botster_terminal_protocol::TerminalFrame;
-
         let mut budget = ConnectionBudget::default();
         let usage = budget
             .reserve("route".to_string(), ChannelClass::Terminal)
-            .expect("reserve terminal route");
+            .expect("reserve route");
         let mux = WebRtcConnectionMux::new();
         let (mut adapter, handle) = mux.create_adapter_with_aggregate(budget.aggregate());
-        mux.register("late".into(), "terminal".into(), 1, handle.clone());
-        let frame = TerminalFrame::from_bytes(br#"{"type":"terminal_output","marker":"late"}"#)
-            .expect("opaque frame");
+        let frame =
+            TerminalFrame::from_bytes(br#"{"type":"terminal_output"}"#).expect("opaque frame");
         assert_eq!(adapter.try_write(&frame), Ok(()));
-        let authorized_before_close = budget.aggregate_buffered();
-        assert!(authorized_before_close > 0);
+        assert!(budget.aggregate_buffered() > 0);
         handle.close();
-        assert!(handle.snapshot_active().is_none());
-        assert_eq!(budget.aggregate_buffered(), authorized_before_close);
         let channel = FakeDataChannel::default();
         let key = AesGcmKey::from_slice(&[7; 32]).expect("test key");
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .expect("flush runtime");
-        runtime
-            .block_on(flush_subscription_adapter_frames(
-                &channel, &key, &handle, &usage,
-            ))
-            .expect("flush parked late egress");
+            .expect("runtime");
         assert!(
-            !channel.sent.lock().expect("sent frames").is_empty(),
-            "production flush must send parked late bytes after close"
+            runtime
+                .block_on(flush_subscription_adapter_frames(
+                    &channel, &key, &handle, &usage
+                ))
+                .is_err()
         );
+        assert!(channel.sent.lock().expect("sent frames").is_empty());
+        assert_eq!(budget.aggregate_buffered(), 0);
+        assert!(handle.snapshot_active().is_none());
         assert_eq!(
-            budget.aggregate_buffered(),
-            usage.load(Ordering::Acquire),
-            "usage publication must replace the close-time permit"
+            adapter.try_write(&frame),
+            Err(botster_core::contract::terminal_adapter::TerminalAdapterWriteError::Closed)
         );
-        assert!(handle.take_late_egress().is_none());
     }
 
     #[test]
-    fn second_close_during_late_send_keeps_the_aggregate_permit() {
+    fn hard_close_cancels_pending_send_without_replay() {
         use crate::admission::connection_budget::{ChannelClass, ConnectionBudget};
-        use botster_core::contract::terminal_adapter::TerminalAdapter;
         use botster_terminal_protocol::TerminalFrame;
-        use std::sync::Arc;
-        use std::time::{Duration, Instant};
-
         let mut budget = ConnectionBudget::default();
         let usage = budget
             .reserve("route".to_string(), ChannelClass::Terminal)
-            .expect("reserve terminal route");
+            .expect("reserve route");
         let mux = WebRtcConnectionMux::new();
         let (mut adapter, handle) = mux.create_adapter_with_aggregate(budget.aggregate());
-        mux.register("late-send".into(), "terminal".into(), 1, handle.clone());
-        let frame = TerminalFrame::from_bytes(br#"{"type":"terminal_output","marker":"inflight"}"#)
-            .expect("opaque frame");
+        let frame =
+            TerminalFrame::from_bytes(br#"{"type":"terminal_output"}"#).expect("opaque frame");
         assert_eq!(adapter.try_write(&frame), Ok(()));
-        handle.close();
-        assert!(budget.aggregate_buffered() > 0);
         let channel = Arc::new(FakeDataChannel::default());
         channel.send_hangs.store(true, Ordering::Release);
         let key = AesGcmKey::from_slice(&[11; 32]).expect("test key");
@@ -1032,42 +1051,229 @@ mod tests {
             .worker_threads(2)
             .enable_all()
             .build()
-            .expect("flush runtime");
+            .expect("runtime");
         let flush = runtime.spawn({
             let channel = Arc::clone(&channel);
             let handle = handle.clone();
             let usage = Arc::clone(&usage);
+            let key = key.clone();
             async move {
                 flush_subscription_adapter_frames(channel.as_ref(), &key, &handle, &usage).await
             }
         });
-        let entered = Instant::now() + Duration::from_secs(2);
-        while !channel.send_entered.load(Ordering::Acquire) {
-            assert!(
-                Instant::now() < entered,
-                "late send must reach local_send_text"
-            );
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        let authorized_during_send = budget.aggregate_buffered();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !channel.send_entered.load(Ordering::Acquire) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("send entered");
+        });
         handle.close_from_host();
-        assert_eq!(
-            budget.aggregate_buffered(),
-            authorized_during_send,
-            "a second close during late send must keep the aggregate permit"
-        );
-        assert!(handle.peek_late_egress().is_some());
+        handle.close();
+        let result = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), flush)
+                .await
+                .expect("close cancels pending send")
+                .expect("flush task")
+        });
+        assert!(result.is_err());
+        assert!(handle.host_closed());
+        assert!(channel.sent.lock().expect("sent frames").is_empty());
+        assert_eq!(budget.aggregate_buffered(), 0);
         channel.send_hangs.store(false, Ordering::Release);
         channel.send_notify.notify_waiters();
+        assert!(
+            runtime
+                .block_on(flush_subscription_adapter_frames(
+                    channel.as_ref(),
+                    &key,
+                    &handle,
+                    &usage
+                ))
+                .is_err()
+        );
+        assert!(channel.sent.lock().expect("sent frames").is_empty());
+        let (mut sibling, sibling_handle) = mux.create_adapter_with_aggregate(budget.aggregate());
+        assert_eq!(sibling.try_write(&frame), Ok(()));
         runtime
-            .block_on(flush)
-            .expect("flush task")
-            .expect("flush parked late egress after second close");
-        assert!(!channel.sent.lock().expect("sent frames").is_empty());
+            .block_on(flush_subscription_adapter_frames(
+                channel.as_ref(),
+                &key,
+                &sibling_handle,
+                &usage,
+            ))
+            .expect("sibling sends");
+        assert_eq!(channel.sent.lock().expect("sent frames").len(), 1);
+    }
+
+    #[test]
+    fn hard_close_keeps_accepted_chunks_budgeted_until_usage_refresh() {
+        use crate::admission::connection_budget::{
+            AGGREGATE_BUFFERED_HIGH, ChannelClass, ConnectionBudget,
+        };
+        use botster_terminal_protocol::TerminalFrame;
+        let mut budget = ConnectionBudget::default();
+        let usage = budget
+            .reserve("route".to_string(), ChannelClass::Terminal)
+            .expect("reserve route");
+        let mux = WebRtcConnectionMux::new();
+        let (mut adapter, handle) = mux.create_adapter_with_aggregate(budget.aggregate());
+        let bytes = serde_json::to_vec(
+            &serde_json::json!({"type": "terminal_output", "opaque": "x".repeat(40_000)}),
+        )
+        .expect("opaque bytes");
+        assert_eq!(
+            adapter.try_write(&TerminalFrame::from_bytes(&bytes).expect("opaque frame")),
+            Ok(())
+        );
+        let channel = Arc::new(FakeDataChannel::default());
+        channel.hang_after_first_send.store(true, Ordering::Release);
+        channel.usage_hangs.store(true, Ordering::Release);
+        let key = AesGcmKey::from_slice(&[13; 32]).expect("test key");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let flush = runtime.spawn({
+            let channel = Arc::clone(&channel);
+            let handle = handle.clone();
+            let usage = Arc::clone(&usage);
+            let key = key.clone();
+            async move {
+                flush_subscription_adapter_frames(channel.as_ref(), &key, &handle, &usage).await
+            }
+        });
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !channel.send_entered.load(Ordering::Acquire)
+                    || channel.sent.lock().expect("sent").len() != 1
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("first chunk accepted and second send pending");
+        });
+        let accepted = channel.outstanding_bytes.load(Ordering::Acquire);
+        assert!(accepted > 0);
+        assert!(budget.aggregate_buffered() >= accepted);
+        handle.close();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !channel.usage_entered.load(Ordering::Acquire) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cancelled send reaches usage refresh");
+        });
+        assert!(
+            budget.aggregate_buffered() >= accepted,
+            "close must retain accounting for accepted chunks"
+        );
+        assert!(
+            budget
+                .aggregate()
+                .try_authorize(AGGREGATE_BUFFERED_HIGH - accepted + 1)
+                .is_none(),
+            "concurrent admission must include accepted bytes"
+        );
+        assert_eq!(channel.sent.lock().expect("sent").len(), 1);
+        channel.usage_hangs.store(false, Ordering::Release);
+        channel.usage_notify.notify_waiters();
+        assert!(
+            runtime
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(2), flush)
+                        .await
+                        .expect("refresh completes")
+                        .expect("flush task")
+                })
+                .is_err()
+        );
+        assert_eq!(budget.aggregate_buffered(), accepted);
+        channel.outstanding_bytes.store(0, Ordering::Release);
+        runtime
+            .block_on(publish_channel_usage(channel.as_ref(), &usage))
+            .expect("drained channel refresh");
+        assert_eq!(budget.aggregate_buffered(), 0);
+        assert_eq!(
+            channel.sent.lock().expect("sent").len(),
+            1,
+            "cancelled chunk must not replay"
+        );
+    }
+
+    #[test]
+    fn failed_channel_close_keeps_usage_until_peer_cleanup() {
+        assert_failed_channel_close_keeps_usage(false);
+    }
+
+    #[test]
+    fn timed_out_channel_close_keeps_usage_until_peer_cleanup() {
+        assert_failed_channel_close_keeps_usage(true);
+    }
+
+    fn assert_failed_channel_close_keeps_usage(hang: bool) {
+        use crate::admission::connection_budget::{ChannelClass, ConnectionBudget};
+        let (tx, mut rx) = tokio_mpsc::channel(8);
+        let peer_state = LocalWebrtcPeerState::new("grant".to_string(), tx);
+        let mut budget = ConnectionBudget::default();
+        let usage = budget
+            .reserve("route".to_string(), ChannelClass::Terminal)
+            .expect("reserve route");
+        usage.store(4096, Ordering::Release);
+        let (_adapter, handle) = peer_state
+            .mux
+            .create_adapter_with_aggregate(budget.aggregate());
+        handle.close();
+        let channel = FakeDataChannel::default();
+        channel.outstanding_bytes.store(4096, Ordering::Release);
+        channel.close_hangs.store(hang, Ordering::Release);
+        channel.close_fails.store(!hang, Ordering::Release);
+        let key = AesGcmKey::from_slice(&[17; 32]).expect("test key");
+        let route = BoundSubscriptionRoute {
+            peer_state: &peer_state,
+            grant_id: "grant",
+            label: "route",
+            subscription_id: "sub",
+            generation: 1,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                run_bound_subscription_channel_and_retire(
+                    &channel,
+                    &key,
+                    route,
+                    BoundSubscription::Terminal { handle, usage },
+                    Vec::new(),
+                ),
+            )
+            .await
+            .expect("bounded channel failure");
+        });
+        assert!(channel.close_started.load(Ordering::Acquire));
+        assert!(!channel.closed.load(Ordering::Acquire));
         assert_eq!(
             budget.aggregate_buffered(),
-            usage.load(Ordering::Acquire),
-            "usage publication must replace the close-time permit"
+            4096,
+            "live channel bytes must remain counted"
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(ControlMessage::LocalWebrtcPeerClosed { terminal_record, .. })
+            if terminal_record.cause == crate::transport::webrtc::peer::LocalWebrtcTerminalCause::ChannelError)
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "failed close must not queue ordinary channel retirement"
         );
     }
 

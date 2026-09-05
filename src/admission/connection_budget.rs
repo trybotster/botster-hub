@@ -49,6 +49,11 @@ pub(crate) struct AggregateSendPermit {
     frame_len: usize,
 }
 
+#[cfg(test)]
+thread_local! {
+    static BETWEEN_BUFFERED_READS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
 impl ConnectionAggregate {
     fn new() -> Self {
         Self {
@@ -68,8 +73,16 @@ impl ConnectionAggregate {
 
     #[must_use]
     pub(crate) fn buffered(&self) -> usize {
-        self.published_buffered()
-            .saturating_add(self.authorized.load(Ordering::Acquire))
+        // A release of authorization follows publication of transferred bytes.
+        // Read authorization first so the later usage read includes that transfer.
+        let authorized = self.authorized.load(Ordering::Acquire);
+        #[cfg(test)]
+        BETWEEN_BUFFERED_READS.with(|observer| {
+            if let Some(observer) = observer.borrow_mut().take() {
+                observer();
+            }
+        });
+        self.published_buffered().saturating_add(authorized)
     }
 
     pub(crate) fn try_authorize(self: &Arc<Self>, frame_len: usize) -> Option<AggregateSendPermit> {
@@ -247,6 +260,32 @@ impl ConnectionBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_counts_a_permit_transferred_between_its_reads() {
+        let mut budget = ConnectionBudget::default();
+        let usage = budget
+            .reserve("route".to_string(), ChannelClass::Terminal)
+            .expect("route");
+        let aggregate = budget.aggregate();
+        let permit = aggregate.try_authorize(64).expect("authorize frame");
+        BETWEEN_BUFFERED_READS.with(|observer| {
+            *observer.borrow_mut() = Some(Box::new(move || {
+                usage.store(64, Ordering::Release);
+                drop(permit);
+            }));
+        });
+        assert!(
+            aggregate.buffered() >= 64,
+            "a concurrent transfer must not disappear from the snapshot"
+        );
+        assert_eq!(aggregate.buffered(), 64);
+        assert!(
+            aggregate
+                .try_authorize(AGGREGATE_BUFFERED_HIGH - 63)
+                .is_none()
+        );
+    }
 
     #[test]
     fn control_is_not_part_of_the_aggregate() {
