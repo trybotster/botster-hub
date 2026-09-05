@@ -514,6 +514,8 @@ pub(crate) struct LocalWebrtcOfferPeer {
     inbound: WebrtcInboundMailbox,
     subscription_channels: Vec<Arc<dyn DataChannel>>,
     subscription_inbounds: Vec<WebrtcInboundMailbox>,
+    subscription_labels: Vec<String>,
+    pub(crate) subscription_receive_errors: Vec<(String, String)>,
     pub(crate) control_terminal_frame_count: u64,
 }
 
@@ -722,6 +724,8 @@ impl LocalWebrtcOfferPeer {
                 inbound,
                 subscription_channels: Vec::new(),
                 subscription_inbounds: Vec::new(),
+                subscription_labels: Vec::new(),
+                subscription_receive_errors: Vec::new(),
                 control_terminal_frame_count: 0,
             },
             extra_channel,
@@ -1209,6 +1213,7 @@ impl LocalWebrtcOfferPeer {
         let _ack: botster_hub_client::DaemonHelloAck = serde_json::from_slice(&plaintext)?;
         self.subscription_channels.push(Arc::clone(&channel));
         self.subscription_inbounds.push(extra.inbound);
+        self.subscription_labels.push(label.to_string());
         Ok(channel)
     }
 
@@ -1293,7 +1298,14 @@ impl LocalWebrtcOfferPeer {
                 .await
                 {
                     Ok(Ok(delivery)) => return Ok(delivery),
-                    Ok(Err(_)) => {
+                    Ok(Err(error)) => {
+                        let label = self.subscription_labels.remove(index);
+                        assert!(
+                            self.subscription_receive_errors.len() < 256,
+                            "subscription receive errors exceeded the fixture storage bound: label={label}; error={error}"
+                        );
+                        self.subscription_receive_errors
+                            .push((label, error.to_string()));
                         self.subscription_channels.remove(index);
                         self.subscription_inbounds.remove(index);
                     }

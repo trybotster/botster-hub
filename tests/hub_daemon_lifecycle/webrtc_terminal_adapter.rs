@@ -1278,7 +1278,7 @@ async fn wait_for_webrtc_exit_fixture_event(
     }).collect();
     // These frames still belong to their original consumers.
     peer.pending_terminal_frames.extend(retained);
-    assert!(found, "wnx-exit/sub-exit missing event exited={exited}; {outcome}; retained={evidence:?}");
+    assert!(found, "wnx-exit/sub-exit missing event exited={exited}; {outcome}; retained={evidence:?}; subscription_receive_errors={:?}", peer.subscription_receive_errors);
 }
 
 #[test]

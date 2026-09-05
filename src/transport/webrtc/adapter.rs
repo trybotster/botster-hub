@@ -48,7 +48,6 @@ struct WebRtcTerminalAdapterInner {
     aggregate_permit: Mutex<Option<crate::admission::connection_budget::AggregateSendPermit>>,
     aggregate_blocked: AtomicBool,
     test_forced_would_block: AtomicBool,
-    late_egress: Mutex<Option<Vec<u8>>>,
 }
 
 impl WebRtcTerminalAdapterInner {
@@ -62,7 +61,6 @@ impl WebRtcTerminalAdapterInner {
             aggregate_permit: Mutex::new(None),
             aggregate_blocked: AtomicBool::new(false),
             test_forced_would_block: AtomicBool::new(false),
-            late_egress: Mutex::new(None),
         }
     }
 
@@ -71,8 +69,8 @@ impl WebRtcTerminalAdapterInner {
     }
 
     fn close_from_host(&self) {
-        self.close_retaining_occupied_budget();
         self.slot.close_from_host();
+        self.release_aggregate_permit();
     }
 
     #[allow(dead_code)]
@@ -81,43 +79,8 @@ impl WebRtcTerminalAdapterInner {
     }
 
     fn close(&self) {
-        self.close_retaining_occupied_budget();
         self.slot.close();
-    }
-
-    fn close_retaining_occupied_budget(&self) {
-        if self.park_late_egress() || self.peek_late_egress().is_some() {
-            return;
-        }
         self.release_aggregate_permit();
-    }
-
-    fn park_late_egress(&self) -> bool {
-        let Some(bytes) = self.slot.snapshot_active() else {
-            return false;
-        };
-        let mut late = self
-            .late_egress
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if late.is_none() {
-            *late = Some(bytes);
-        }
-        true
-    }
-
-    fn peek_late_egress(&self) -> Option<Vec<u8>> {
-        self.late_egress
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-    }
-
-    fn take_late_egress(&self) -> Option<Vec<u8>> {
-        self.late_egress
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
     }
 
     fn set_would_block(&self, pressured: bool) {
@@ -125,6 +88,9 @@ impl WebRtcTerminalAdapterInner {
     }
 
     fn pressure(&self) -> TerminalAdapterPressure {
+        if self.is_closed() {
+            return TerminalAdapterPressure::Closed;
+        }
         if self.test_forced_would_block.load(Ordering::Acquire) {
             return TerminalAdapterPressure::WouldBlock;
         }
@@ -136,6 +102,9 @@ impl WebRtcTerminalAdapterInner {
     }
 
     fn try_write(&self, frame: &TerminalFrame) -> Result<(), TerminalAdapterWriteError> {
+        if self.is_closed() {
+            return Err(TerminalAdapterWriteError::Closed);
+        }
         if self.test_forced_would_block.load(Ordering::Acquire) {
             return Err(TerminalAdapterWriteError::WouldBlock);
         }
@@ -152,17 +121,36 @@ impl WebRtcTerminalAdapterInner {
         } else {
             None
         };
-        let mut aggregate_permit = self
-            .aggregate_permit
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut aggregate_permit = match self.aggregate_permit.try_lock() {
+            Ok(permit) => permit,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(TerminalAdapterWriteError::Full);
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(TerminalAdapterWriteError::Closed);
+            }
+        };
+        if self.is_closed() {
+            aggregate_permit.take();
+            return Err(TerminalAdapterWriteError::Closed);
+        }
         if aggregate_permit.is_some() {
+            drop(aggregate_permit);
+            if self.is_closed() {
+                self.release_aggregate_permit();
+                return Err(TerminalAdapterWriteError::Closed);
+            }
             return Err(TerminalAdapterWriteError::Full);
         }
         *aggregate_permit = permit;
         let result = self.slot.try_write(frame);
         if result.is_err() {
             aggregate_permit.take();
+        }
+        drop(aggregate_permit);
+        if self.is_closed() {
+            self.release_aggregate_permit();
+            return Err(TerminalAdapterWriteError::Closed);
         }
         result
     }
@@ -186,45 +174,67 @@ impl WebRtcTerminalAdapterInner {
     }
 
     fn complete_active(&self) -> Option<Vec<u8>> {
-        let completed = self.slot.complete_active();
-        if completed.is_some() {
-            self.release_aggregate_permit();
-        }
-        completed
-    }
-
-    fn resize_aggregate_permit(&self, frame_len: usize) -> bool {
         let mut permit = self
             .aggregate_permit
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match permit.as_mut() {
-            Some(existing) => {
-                let permitted = existing.try_resize(frame_len);
-                if !permitted {
-                    self.aggregate_blocked.store(true, Ordering::Release);
-                }
-                permitted
-            }
-            None => {
-                let Some(aggregate) = self.aggregate.as_ref() else {
-                    return true;
-                };
-                let Some(authorized) = aggregate.try_authorize(frame_len) else {
-                    self.aggregate_blocked.store(true, Ordering::Release);
-                    return false;
-                };
-                *permit = Some(authorized);
-                true
-            }
+        let completed = self.slot.complete_active();
+        if completed.is_some() || self.is_closed() {
+            permit.take();
         }
+        drop(permit);
+        if self.is_closed() {
+            self.release_aggregate_permit();
+        } else if completed.is_some() {
+            self.slot.notify_writable();
+        }
+        completed
+    }
+
+    fn transfer_aggregate_permit(
+        &self,
+        frame_len: usize,
+        usage: &std::sync::atomic::AtomicUsize,
+    ) -> bool {
+        let mut permit = self
+            .aggregate_permit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let permitted = if self.is_closed() {
+            permit.take();
+            false
+        } else if let Some(existing) = permit.as_mut() {
+            let permitted = existing.try_resize(frame_len);
+            if !permitted {
+                self.aggregate_blocked.store(true, Ordering::Release);
+            }
+            permitted
+        } else {
+            self.aggregate.is_none()
+        };
+        if permitted {
+            // Publish the full wire bound before releasing its authorization.
+            usage.fetch_add(frame_len, Ordering::Release);
+            permit.take();
+        }
+        drop(permit);
+        if self.is_closed() {
+            self.release_aggregate_permit();
+        }
+        permitted
     }
 
     fn release_aggregate_permit(&self) {
-        self.aggregate_permit
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
+        // A contended holder releases the permit after it drops its guard.
+        match self.aggregate_permit.try_lock() {
+            Ok(mut permit) => {
+                permit.take();
+            }
+            Err(std::sync::TryLockError::Poisoned(error)) => {
+                error.into_inner().take();
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
     }
 }
 
@@ -265,7 +275,6 @@ impl WebRtcTerminalAdapter {
             aggregate_permit: Mutex::new(None),
             aggregate_blocked: AtomicBool::new(false),
             test_forced_would_block: AtomicBool::new(false),
-            late_egress: Mutex::new(None),
         });
         (
             Self {
@@ -706,20 +715,12 @@ impl WebRtcTerminalAdapterHandle {
         self.inner.complete_active()
     }
 
-    pub(crate) fn peek_late_egress(&self) -> Option<Vec<u8>> {
-        self.inner.peek_late_egress()
-    }
-
-    pub(crate) fn take_late_egress(&self) -> Option<Vec<u8>> {
-        self.inner.take_late_egress()
-    }
-
-    pub(crate) fn resize_aggregate_permit(&self, frame_len: usize) -> bool {
-        self.inner.resize_aggregate_permit(frame_len)
-    }
-
-    pub(crate) fn release_aggregate_permit(&self) {
-        self.inner.release_aggregate_permit();
+    pub(crate) fn transfer_aggregate_permit(
+        &self,
+        frame_len: usize,
+        usage: &std::sync::atomic::AtomicUsize,
+    ) -> bool {
+        self.inner.transfer_aggregate_permit(frame_len, usage)
     }
 
     pub(crate) fn write_opaque_frame(&self, frame: &TerminalFrame) {
@@ -847,15 +848,12 @@ mod tests {
         let frame =
             TerminalFrame::from_bytes(br#"{"type":"terminal_output","marker":"in-flight"}"#)
                 .expect("opaque frame");
-        let expected = frame.to_bytes().expect("bytes");
         assert_eq!(adapter.try_write(&frame), Ok(()));
         assert_eq!(adapter.pressure(), TerminalAdapterPressure::Full);
         handle.close();
         assert_eq!(adapter.pressure(), TerminalAdapterPressure::Closed);
         assert!(handle.snapshot_active().is_none());
         assert!(handle.complete_active().is_none());
-        assert_eq!(handle.take_late_egress(), Some(expected));
-        assert!(handle.take_late_egress().is_none());
         assert_eq!(
             adapter.try_write(&frame),
             Err(TerminalAdapterWriteError::Closed)
@@ -863,7 +861,7 @@ mod tests {
     }
 
     #[test]
-    fn occupied_close_keeps_aggregate_permit_from_a_sibling_write() {
+    fn occupied_close_releases_aggregate_budget_for_a_sibling_write() {
         use crate::admission::connection_budget::{
             AGGREGATE_BUFFERED_HIGH, ChannelClass, ConnectionBudget,
         };
@@ -900,20 +898,36 @@ mod tests {
         assert_eq!(budget.aggregate_buffered(), AGGREGATE_BUFFERED_HIGH - 32);
         first_handle.close();
         assert!(first_handle.snapshot_active().is_none());
-        assert_eq!(
-            first_handle.take_late_egress().as_deref(),
-            Some(occupied.to_bytes().expect("occupied bytes").as_slice())
-        );
-        assert_eq!(
-            budget.aggregate_buffered(),
-            AGGREGATE_BUFFERED_HIGH - 32,
-            "parked late bytes must keep their aggregate permit"
-        );
-        assert_eq!(
-            sibling.try_write(&sibling_frame),
-            Err(TerminalAdapterWriteError::WouldBlock)
-        );
-        assert!(sibling_handle.snapshot_active().is_none());
+        assert_eq!(budget.aggregate_buffered(), filled.load(Ordering::Acquire));
+        assert_eq!(sibling.try_write(&sibling_frame), Ok(()));
+        assert!(sibling_handle.snapshot_active().is_some());
+    }
+
+    #[test]
+    fn close_does_not_wait_for_the_aggregate_permit_lock() {
+        let (mut adapter, handle) = WebRtcTerminalAdapter::pair();
+        let frame =
+            TerminalFrame::from_bytes(br#"{"type":"terminal_output"}"#).expect("opaque frame");
+        assert_eq!(adapter.try_write(&frame), Ok(()));
+        let guard = handle
+            .inner
+            .aggregate_permit
+            .lock()
+            .expect("hold permit lock");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let closer = std::thread::spawn({
+            let handle = handle.clone();
+            move || {
+                handle.close();
+                tx.send(()).expect("close result");
+            }
+        });
+        let result = rx.recv_timeout(Duration::from_secs(1));
+        drop(guard);
+        closer.join().expect("close thread");
+        result.expect("close must not wait for the permit lock");
+        assert!(handle.is_closed());
+        assert!(!handle.transfer_aggregate_permit(1, &std::sync::atomic::AtomicUsize::new(0)));
     }
 
     #[test]

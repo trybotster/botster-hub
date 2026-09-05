@@ -61,7 +61,12 @@ pub(crate) struct FakeDataChannel {
     pub(crate) send_fails: AtomicBool,
     pub(crate) send_hangs: AtomicBool,
     pub(crate) send_entered: AtomicBool,
+    pub(crate) hang_after_first_send: AtomicBool,
+    pub(crate) usage_hangs: AtomicBool,
+    pub(crate) usage_entered: AtomicBool,
+    pub(crate) usage_notify: tokio::sync::Notify,
     pub(crate) close_hangs: AtomicBool,
+    pub(crate) close_fails: AtomicBool,
     pub(crate) close_started: AtomicBool,
     pub(crate) close_probe: Mutex<Option<Arc<dyn Fn() -> bool + Send + Sync>>>,
     pub(crate) close_probe_passed: AtomicBool,
@@ -93,6 +98,15 @@ impl LocalWebrtcDataChannel for FakeDataChannel {
     }
 
     async fn local_outstanding_bytes(&self) -> Result<usize, String> {
+        self.usage_entered.store(true, Ordering::Release);
+        while self.usage_hangs.load(Ordering::Acquire) {
+            let notified = self.usage_notify.notified();
+            tokio::pin!(notified);
+            if !self.usage_hangs.load(Ordering::Acquire) {
+                break;
+            }
+            notified.await;
+        }
         Ok(self.outstanding_bytes.load(Ordering::Acquire))
     }
 
@@ -119,6 +133,12 @@ impl LocalWebrtcDataChannel for FakeDataChannel {
             self.sent_before_low_water.store(true, Ordering::Release);
         }
         self.sent.lock().unwrap().push(text.to_string());
+        if self.hang_after_first_send.load(Ordering::Acquire) {
+            self.outstanding_bytes
+                .fetch_add(text.len(), Ordering::AcqRel);
+            self.send_entered.store(false, Ordering::Release);
+            self.send_hangs.store(true, Ordering::Release);
+        }
         Ok(())
     }
 
@@ -142,6 +162,9 @@ impl LocalWebrtcDataChannel for FakeDataChannel {
         }
         while self.close_hangs.load(Ordering::Acquire) {
             self.send_notify.notified().await;
+        }
+        if self.close_fails.load(Ordering::Acquire) {
+            return Err("fixture close failure".to_string());
         }
         self.closed.store(true, Ordering::Release);
         Ok(())

@@ -786,3 +786,72 @@ Direct merge, no PR. Timing observations stay waived.
 ## Missing vault guidance discovered
 
 Recorded in the inbox capture: final ownership statement, D.1 oracle names, 18-site pin count vs the "eleven" note title, runner registration check, and the full two-arm authentication prerequisite list.
+
+
+## 2026-09-04 hard-close correction and focused verification
+
+This correction supersedes earlier sections that require `late_egress` after adapter close. Those requirements conflict with Core's contract.
+
+Target: `botster-hub`, target_id `tgt_7e208a0c76a44980a83b63af976b1f22`. Run `run_1788459722_264752` uses the registered Hub worktree and branch `project-pipelines/ticket_1787600679_990088`. The approved plan routes to this same target. The starting commit was `11facecf371271907f7d20d83e390601c4011966`.
+
+Applied guidance: `implementer-playbook`, `botster-implementer-playbook`, `botster-hub-playbook`, and `botster runtime teardown lenses`. Targeted notes include `Core subscription hard-stop is synchronous close and drop on the host tick`, `terminal adapters emit coalesced writable and closed wakes`, and `a ready WebRTC send must win over a queued DataChannel close`. Earlier client, wrapper, exact-pin, and process-ownership guidance still applies. This correction changes no Project Pipelines package or plugin path.
+
+The coordinator authorized removal of the invalid replay workaround in `msg_plugin-w_1788586011_ef7122`. The coordinator clarified partial-envelope completion in `msg_plugin-w_1788586619_fbc1fa`. Core published that clarification at `c47eadbf476501ec611e18572d8e4afc87d4304d`, in `crates/botster-core/src/contract/terminal_adapter.rs`. This is contract documentation authority, not a dependency roll. Hub remains pinned to Core `93acae3f98adbc21dc981d113c4eb2f31ead4ad0`.
+
+Changed files and behavior:
+
+- `src/transport/unix/adapter.rs`: remove occupied-frame parking and post-close snapshots.
+- `src/transport/unix/mux_write.rs`: abandon unsent copies after close. Keep the slot Full until the complete envelope is written. Finish an already-started envelope once from its existing buffer before host and sibling frames.
+- `src/transport/webrtc/adapter.rs`: remove occupied-frame parking. Close uses a nonblocking permit-lock attempt. Contended holders release abandoned authorization after unlocking. Write admission returns Full on lock contention. Completion releases authorization before the final writable wake.
+- `src/transport/webrtc/subscription_channel.rs`: cancel pending sends on adapter close. Transfer the authorized wire-byte bound into channel usage before sending. Refresh usage after completion or cancellation. Failed or timed-out channel close invokes existing peer supervision. The wrapper does not request ordinary channel retirement after peer cleanup starts.
+- `src/admission/connection_budget.rs`: read authorization before published usage. Add a deterministic transfer-between-reads test.
+- `src/transport/webrtc/test_support.rs`: add bounded fake-channel controls for partial-send and failed-close proofs.
+- `tests/hub_daemon_lifecycle/webrtc_fixtures.rs`: preserve the label and underlying receive error before removing a failed subscription mailbox.
+- `tests/hub_daemon_lifecycle/webrtc_terminal_adapter.rs`: include those errors in the existing ProcessExit failure report.
+- This implementation report records the corrected contract and evidence.
+
+Ownership boundaries remain intact. Hub handles opaque terminal bytes and transport accounting. Hub adds no semantic decoder, retry queue, compatibility path, public API, manifest change, or dependency pin change. Core, TUI, and Web source remain unchanged. TUI ticket `ticket_1788460430_647093` remains separately routed. The coordinator controls subsequent consumer repinning and the complete matrix. This run uses direct merge; no PR is required.
+
+Ordering argument: the old inner completion could not release a successor permit while the old permit still occupied its mutex. The later unconditional flush release had no such ownership protection. The correction removes that release. For transfer, the writer adds the complete wire bound to usage before releasing authorization. A reader that sees the old authorization counts that bound. A reader that acquires the released authorization then reads the prior usage publication. `try_extend_authorized` already reads authorization first, reads usage, and uses compare-exchange; a changed authorization retries. The new snapshot test forces a transfer between the actual reads. Restoring the old usage-first order makes its assertion fail.
+
+Normal channel retirement follows the channel driver and successful local close. Failed close publishes `ChannelError` and invokes `cleanup_once`. The wrapper suppresses ordinary retirement when cleanup has started. The production `LocalWebrtcPeerClosed` handler calls `remove_peer` before removing the connection budget (`src/daemon/control/webrtc.rs`). Existing peer supervision closes the peer or drops the dedicated runtime on ultimate failure. The new fake-channel tests prove the driver retains usage and requests supervision while the fake transport remains live. Existing real-peer module tests prove the subsequent handler and runtime teardown. These are separate proof stages.
+
+Runtime teardown lenses:
+
+- `teardown_isolation`: a successful adapter close abandons that route's unsent bytes. Unix host and sibling frames continue. WebRTC cancellation leaves a sibling adapter writable.
+- `teardown_bounds`: Core close performs no I/O wait and does not wait for the writer's permit lock. Channel close retains the existing three-second production bound and 200-millisecond unit-test bound. Failure enters existing peer supervision.
+- `late_message_matrix`: the approved plan's grant, peer-generation, route-generation, and owner-tagged admission matrix remains unchanged. Closed adapters reject further writes. Copied but unsent Unix frames cannot start after close. Failed-channel cleanup follows the existing peer admission rejection and owner sweep.
+- `production_path_proof`: `connection.rs` calls `flush_unix_mux_writes`; the bound WebRTC driver calls `flush_subscription_adapter_frames`. Tests use those functions. Real lifecycle checks use the built Hub and pinned worker. The WebRTC module also exercises real peer-close supervision and worker teardown.
+- `ownership_identity`: this correction preserves reservation labels, route generations, host/Core close causes, and existing replacement-owner checks. The failure path uses the existing peer cleanup identity rather than fabricating a route owner.
+- `sibling_fail_closed_policy`: successful close preserves healthy siblings. A failed local channel close requests peer supervision. Only ultimate peer-close failure invokes the existing dedicated-runtime sacrifice policy. No Unix socket-wide failure was added for adapter close.
+
+The partial-write rule does not retract bytes from a nonblocking write already in progress when close occurs. If that attempt accepts bytes, its existing envelope can finish. If it makes no progress, no new attempt starts after close. The deterministic Unix test requires one complete envelope, then host response/close event and sibling output, with no replay.
+
+Verification used Rust 1.97.0, two Cargo jobs, `BOTSTER_ENV=test`, the repository `./test.sh --locked` wrapper, and the default target directory. Every supervised arm had a 300-second watchdog and identity-scoped cleanup. The six negative controls each failed at the intended assertion: pending-send cancellation, accepted-byte transfer, failed-close supervision, unsent Unix copy, partial-write Full, and snapshot read order. Each ran one test with 562 filtered tests. Source restoration was exact.
+
+Final focused results:
+
+| Check | Result |
+| --- | --- |
+| Pinned worker build and Hub build | pass |
+| `cargo fmt --all -- --check` | pass |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | pass |
+| WebRTC module | 85 passed, 478 filtered; its child proof also passed 1 test |
+| Unix module | 25 passed, 538 filtered |
+| Connection budget module | 7 passed, 556 filtered |
+| Unix printf ProcessExit | 1 passed, 349 filtered |
+| WebRTC exact bytes | 1 passed, 349 filtered |
+| Combined WebRTC detach/peer-death/ProcessExit/shutdown | 1 failed, 349 filtered |
+| Ended-session rejection and host-close positive | not run in this final sequence because the previous arm failed |
+
+The final ProcessExit failure includes admitted input, 19 bytes of terminal output, and an underlying `channel_closed` error. The label is `r-0f18b190a958e6ec40453e76456cb38c`; the recorded chunk state is `message_id=pending next_chunk=0 expected_chunks=pending`. The output decodes to `wnx-release\r\ndone\r\n`. No ProcessExit arrived. The log does not map that channel label back to a reservation owner, so this report does not attribute the closed channel to `sub-exit`.
+
+An earlier focused run passed all five lifecycle checks before the complete accounting correction. That pass does not attribute the historical failure or waive the final failure. Earlier setup errors (`MissingType` in the new fake frame and an incorrect outer pressure call) were corrected; their failed logs remain preserved.
+
+Final lifecycle Hub SHA256: `6ab3c4217f32ea0a3aac86242736739780adb5a6e1668efb588bf9736fcbdcbc`. Worker SHA256: `7358688b9025fe3bdeda74fe7df8edbfa3f242af8cbc556bd7955b7fae98631b`. The build and unit arms used the separately recorded build hash. Receipts preserve each arm's binary identity.
+
+Evidence is under `/tmp/hub-hard-close/final-focused`, `/tmp/hub-hard-close/ablations`, and `/tmp/hub-hard-close/partial-conflict`. The original rejected retention patch and controls remain under `/tmp/hub-write-ownership`; `artifact_1788585929_754863` records that stopped approach. The strict no-more-bytes partial-Unix experiment failed before the Core owner clarified framing. That temporary test was removed and replaced with the explicit framing test.
+
+The final supervisor reports no owned survivors before or after cleanup. No cleanup signal was needed. The five approved foreign workers remain unchanged, and the Botster zombie census is empty. The build window was released to the coordinator after the failed arm. No later build or test ran.
+
+Residual blocker: unsolicited ProcessExit delivery remains intermittent and unattributed. This candidate is for source and log review; it cannot advance the pipeline. No complete matrix, downstream rerun, merge, or pin change occurred. No lens is waived. Missing durable guidance was the conflict between earlier Hub retention reports and Core close semantics; Core now documents the boundary, and this report supersedes the invalid local requirements. No new vault exception was created.
