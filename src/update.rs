@@ -869,20 +869,14 @@ fn durable_worker_identity(
     data_directory: &Path,
     session_id: &str,
 ) -> Option<WorkerRecoveryIdentity> {
-    let session_path = Path::new(session_id);
-    if session_path.components().count() != 1
-        || !matches!(session_path.components().next(), Some(Component::Normal(_)))
-    {
+    let requested = botster_core::SessionId(session_id.to_string());
+    let record = botster_core_daemon::SessionRegistry::new(data_directory)
+        .load(&requested)
+        .ok()??;
+    if record.session_id != requested {
         return None;
     }
-    let bytes = fs::read(
-        data_directory
-            .join("sessions")
-            .join(format!("{session_id}.json")),
-    )
-    .ok()?;
-    let record: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let recovery = record.get("recovery_identity")?;
+    let recovery = record.recovery_identity?;
     Some(WorkerRecoveryIdentity {
         pid: recovery.get("worker_pid")?.as_u64()?.try_into().ok()?,
         control_socket: PathBuf::from(recovery.get("worker_control_socket")?.as_str()?),
@@ -1372,6 +1366,76 @@ fn usage() -> String {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct RegistryFixture(PathBuf);
+
+    impl RegistryFixture {
+        fn new() -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "botster-update-registry-{}-{nonce}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn save_worker(&self, session_id: &str, pid: u32) {
+            let mut record = botster_core_daemon::RegistryRecord::running(
+                botster_core::SessionId(session_id.to_string()),
+                None,
+                botster_core::ResizePayload { rows: 24, cols: 80 },
+                "test-worker".to_string(),
+                1,
+            );
+            record.recovery_identity = Some(serde_json::json!({
+                "worker_pid": pid,
+                "worker_control_socket": format!("/fixture/worker-{pid}.sock"),
+            }));
+            botster_core_daemon::SessionRegistry::new(&self.0)
+                .save(&record)
+                .unwrap();
+        }
+    }
+
+    impl Drop for RegistryFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn durable_worker_identity_uses_registry_identity_not_a_filename() {
+        let fixture = RegistryFixture::new();
+        fixture.save_worker("audit:終端/a", 101);
+        assert_eq!(
+            durable_worker_identity(&fixture.0, "audit:終端/a"),
+            Some(WorkerRecoveryIdentity {
+                pid: 101,
+                control_socket: PathBuf::from("/fixture/worker-101.sock"),
+            })
+        );
+        assert_eq!(durable_worker_identity(&fixture.0, "missing"), None);
+    }
+
+    #[test]
+    fn durable_worker_identity_never_selects_a_colliding_sibling() {
+        let fixture = RegistryFixture::new();
+        fixture.save_worker("audit_a", 202);
+        assert_eq!(durable_worker_identity(&fixture.0, "audit:a"), None);
+        fixture.save_worker("audit:a", 101);
+        assert_eq!(
+            durable_worker_identity(&fixture.0, "audit:a").unwrap().pid,
+            101
+        );
+        assert_eq!(
+            durable_worker_identity(&fixture.0, "audit_a").unwrap().pid,
+            202
+        );
+    }
 
     #[test]
     fn scopes_are_explicit() {
