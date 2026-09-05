@@ -962,3 +962,30 @@ Retirement assessment including the production owner path:
 The control-only fixture timeout is therefore not proof of a leaked adapter. It is also not proof that the Hub observed the remote close.
 An unapplied diagnostic patch at `/tmp/hub-hard-close/fable-instrumentation/` records received control messages, reservation state, the Core inventory row, and the Hub registry row during the wait. It keeps the acceptance condition unchanged and has not run.
 A later fixture correction must keep the real sibling-traffic assertion and prove adapter cleanup through the production owner path, not through label removal alone.
+
+### 2026-09-05 close-state coverage and production-owner retirement proof
+
+Commits: `c0ccbba` (vendor tests only), `fbc3c5f` (Hub test and crate-visible reconcile phase), `5ac1b69` (error propagation, live-pressure assertion, bounded reconcile loop).
+Group executed once on `5ac1b69` under `/tmp/hub-hard-close/fable-close-states-run.py`; evidence in `/tmp/hub-hard-close/fable-close-states/` and `/tmp/hub-hard-close/fable-clean-checkout/`.
+
+| Arm | Result |
+| --- | --- |
+| clean-checkout vendor: `git archive` of HEAD, 346 files, lockfile hash matches the proof | exported |
+| `accepted_final_payload_precedes_remote_close` (real peer) | 1 passed |
+| `accepted_payload_under_pressure_precedes_remote_close` (real peer, Hub high-water threshold, live pressure asserted before the final send) | 1 passed |
+| `enqueue_then_close_preserves_payload_order` (lib) | not executed: filter lacked the module path, 0 passed, 271 filtered out |
+| `public_close_before_open_ignores_late_ack_and_orders_close_after_open` (lib) | not executed: same filter defect; compiled, never run |
+| `remote_closed_subscription_keeps_host_sibling_live` (production owner path) | 1 passed in 1.00 s |
+| `webrtc_terminal_adapter_detach_peer_death_process_exit_and_shutdown_do_not_emit_close_event` | FAILED, exit 101 |
+| `cargo fmt --all -- --check` | exit 0 |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0 |
+
+The two lib arms are not evidence. The command list passed the bare probe-module path instead of `peer_connection::handler::botster_enqueue_close_probe::...`.
+A corrected script with the full module path is prepared at `/tmp/hub-hard-close/fable-clean-checkout-units-run.py` and has not run.
+
+The remote-close test now proves cleanup through the production owner path: Core retired the route on adapter pressure `Closed`, the reservation reached `Unknown`, the owner-loop inventory reconcile cleared the registry route, the budget slot released, the peer was not cleaned up, and the host sibling carried a request and response.
+The earlier control-only timeouts remain preserved under `idempotent-focused`, `idempotent-terminal`, and `fable-remote-close-retry`.
+
+The combined lifecycle failure is now attributed to its channel.
+The exit channel label was `r-9b4557bde1add9ba40c6caf155a6367b`, and that exact label recorded `cause=channel_closed message_id=pending next_chunk=0 expected_chunks=pending`.
+The terminal channel for `wnx-exit/sub-exit` closed after its `done` output frame and before any `ProcessExit` event. The cause of that close is not yet established.
