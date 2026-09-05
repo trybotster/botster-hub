@@ -1091,3 +1091,27 @@ Source attribution after acceptance:
 - Consumers stop at `OnClose` (the Hub terminal driver and the test fixture), so the queued message is never read.
 
 Proposed minimal production fix, in the already-vendored `rtc` crate: hold `OnClose` for a stream while `read_outs` still holds a message for that stream, emit it from `poll_event` once those messages are drained, and report `poll_timeout = now` while holding so the driver runs the next iteration immediately. Not implemented.
+
+#### Receive-side close barrier: source-only plan (vendored rtc, not implemented)
+
+Layer: `RTCPeerConnection` in `vendor/rtc-0.21.0-beta.2/src/peer_connection/handler/mod.rs`. The handler-level guard is wrong because `handle_read` (about lines 255-300) drains every handler's `poll_read` at once into `pipeline_context.data_read_outs`; by the time a driver polls events, the datachannel handler's own queue is already empty while application data still waits in the public queue.
+
+State added to `PipelineContext`: `held_data_channel_closes: VecDeque<(RTCDataChannelId, RTCPeerConnectionEvent)>` and `held_close_ready: bool`.
+
+Barrier in the public `poll_event` (about line 384):
+
+1. Before popping `event_outs`, release any held close whose channel has no message left in `data_read_outs`; release preserves the held order and returns the first released event.
+2. When the next `event_outs` entry is `OnDataChannel(OnClose(id))` or `OnClosing(id)` and `data_read_outs` still contains a `DataChannelMessage(id, _)`, move it to the held queue and continue with the following event. Events for other channels and all non-channel events pass unchanged, so one channel's backlog never blocks another channel's close.
+
+Eligibility and wake: in `poll_data_read` and in the data branch of the public `poll_read`, after popping a message for channel `id`, if a close for `id` is held and no message for `id` remains, set `held_close_ready = true`. The public `poll_timeout` returns `Some(now)` only while `held_close_ready` is true; `poll_event` clears it when it releases. While a consumer intentionally leaves data undrained (back-pressure), no timer is due and no spin occurs; the close becomes due exactly when the last relevant read drains. Handshake-timeout closes from `handle_timeout` never coexist with delivered data and are unaffected. `close()` of the whole connection flushes held closes unchanged.
+
+Tests, all through the public `RTCPeerConnection` API with events polled before reads, as the wrapper does:
+
+- single channel: DATA then reset in one intake; `poll_event` yields no close; `poll_data_read` yields the message; `poll_timeout` is due; `poll_event` then yields `OnClose`.
+- two channels: A has pending data and a reset, B has a reset only; `poll_event` yields B's close immediately and holds A's; A's close follows A's read.
+- back-pressured consumer: with A's data undrained, `poll_timeout` reports no due timer across repeated polls; after the read it is due once.
+- public `poll_read` variant of the single-channel case.
+- real-peer `data_channel_backpressure_rtc2rtc.rs` case that drains events before reads.
+- acceptance: the exact combined Hub lifecycle test under the bounded tally on the delivery build.
+
+Provenance requirement: four vendor files change (`handler/mod.rs`, the two test files, and `BOTSTER-PATCH.md`); the send-side ordered-close repair is unchanged.
