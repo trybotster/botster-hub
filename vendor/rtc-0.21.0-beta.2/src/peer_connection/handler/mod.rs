@@ -727,6 +727,7 @@ mod botster_enqueue_close_probe {
         };
         use ::datachannel::data_channel::DataChannelMessage;
         use ::datachannel::message::message_channel_ack::DataChannelAck;
+        use ::datachannel::message::message_channel_threshold::DataChannelThreshold;
         use bytes::BytesMut;
         use shared::TransportContext;
         use shared::marshal::Marshal;
@@ -792,6 +793,10 @@ mod botster_enqueue_close_probe {
             }
         }
         assert_eq!(opens, 0, "a late ACK must not open a closing channel");
+        // `RTCDataChannelInternal::dial` queues the DCEP OPEN and then the low and
+        // high threshold controls (`write_data_channel_low_threshold`,
+        // `write_data_channel_high_threshold` in rtc-datachannel). The queued close
+        // must follow all three; any other marker is a defect.
         let mut order = Vec::new();
         while let Some(message) = pc.get_datachannel_handler().poll_write() {
             if let RTCMessageInternal::Dtls(DTLSMessage::Sctp(message)) = message.message {
@@ -799,15 +804,19 @@ mod botster_enqueue_close_probe {
                 let mut payload = &message.payload[..];
                 order.push(match Message::unmarshal(&mut payload).unwrap() {
                     Message::DataChannelOpen(_) => "open",
+                    Message::DataChannelThreshold(DataChannelThreshold::Low(_)) => "threshold-low",
+                    Message::DataChannelThreshold(DataChannelThreshold::High(_)) => {
+                        "threshold-high"
+                    }
                     Message::DataChannelClose(_) => "close",
-                    _ => "other",
+                    other => panic!("unexpected DCEP marker before close: {other:?}"),
                 });
             }
         }
         assert_eq!(
             order,
-            ["open", "close"],
-            "one close marker after the open marker"
+            ["open", "threshold-low", "threshold-high", "close"],
+            "one close marker after the open marker and the dial threshold controls"
         );
     }
 
