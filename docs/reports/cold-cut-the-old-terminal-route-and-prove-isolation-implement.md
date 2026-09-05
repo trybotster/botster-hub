@@ -1077,3 +1077,17 @@ Limits: the failure did not reproduce under the probe in ten executions, while t
 `run5-control`: the exact run4 binaries (`botster-hub` `669d20f8…`, `botster-session-worker` `b5cb95ee…`, unchanged after the group), `BOTSTER_CORE_PROBE_HARD_STOP` and its sink path unset, no sink produced.
 Executions: 1 to 3 passed with one selected test each; execution 4 failed (exit 101) with the delivery signature: missing `ProcessExit` on `wnx-exit/sub-exit`, `cause=channel_closed`, `terminal_channel_closed:sub-exit:1:adapter_closed`. The group stopped there.
 Reading: the probe build reproduces the delivery failure when the recorder is inactive (1 of 4) and did not fail in ten executions with the recorder active. The synchronous record on the pumping thread suppresses the race. No Core owner state exists for a failing execution.
+
+#### Probe v3 (post-close recorder): failing owner state captured
+
+`run6` on probe v3 (`client_worker.rs` `ef7e6ffe…`, resolution proven, binaries `botster-hub` `71183765…`, `botster-session-worker` `37e13a89…`, unchanged after the group): execution 1 failed with the delivery signature (`terminal_channel_closed:sub-exit:1:adapter_closed`) and the sink recorded the exit owner at hard stop: site `client_worker.rs:1500` (the `process_exit_delivered` retirement in `pump_one`), `process_exit_enqueued=true process_exit_delivered=true in_flight=false unsuccessful_writes=0 queue_len=0 queue_process_exit=0 held_len=0 input_queue_len=0 adapter_bound=true`.
+Reading: Core completed its ProcessExit bookkeeping normally. The Hub adapter reports Ready only after `local_send_text` returned Ok for every frame, so the dependency wrapper accepted the ProcessExit frame before the ordered close. The premature hard-stop scenario is excluded for this execution.
+
+Source attribution after acceptance:
+
+- Sender SCTP ordering is sound: `rtc-sctp` `send_reset_request` queues an empty EOS DATA chunk behind pending payload, and the receiver defers a reset on `sender_last_tsn` and unread data.
+- The receiving `webrtc` wrapper driver runs `poll_writes`, `poll_events`, `poll_reads` in that order every iteration after a batch datagram drain. `poll_events` delivers `OnClose`; `poll_reads` delivers `OnMessage`. When the final DATA and the stream reset are processed in one iteration, the channel receives `OnClose` before the message. The driver's own comment requires the opposite order but enforces it only inside the per-channel retain queue.
+- `rtc`'s `DataChannelHandler` keeps `read_outs` and `event_outs` as separate queues; `SCTPStreamClosed` pushes `OnClose` into `event_outs` while the last payload still sits in `read_outs`.
+- Consumers stop at `OnClose` (the Hub terminal driver and the test fixture), so the queued message is never read.
+
+Proposed minimal production fix, in the already-vendored `rtc` crate: hold `OnClose` for a stream while `read_outs` still holds a message for that stream, emit it from `poll_event` once those messages are drained, and report `poll_timeout = now` while holding so the driver runs the next iteration immediately. Not implemented.
