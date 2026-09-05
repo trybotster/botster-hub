@@ -989,3 +989,29 @@ The earlier control-only timeouts remain preserved under `idempotent-focused`, `
 The combined lifecycle failure is now attributed to its channel.
 The exit channel label was `r-9b4557bde1add9ba40c6caf155a6367b`, and that exact label recorded `cause=channel_closed message_id=pending next_chunk=0 expected_chunks=pending`.
 The terminal channel for `wnx-exit/sub-exit` closed after its `done` output frame and before any `ProcessExit` event. The cause of that close is not yet established.
+
+### 2026-09-05 corrected vendor unit arms and exit-channel owner inspection
+
+Commit `b22d25d` corrects the close-before-open case to the exact DCEP sequence that `RTCDataChannelInternal::dial` queues: open, low threshold, high threshold, then one close. The old failed log stays in `/tmp/hub-hard-close/fable-clean-checkout-units/close_before_open.log`.
+The corrected unit arms ran once on archived `5ac1b69` under `/tmp/hub-hard-close/fable-clean-checkout-units-run.py`:
+`enqueue_then_close_preserves_payload_order` executed once and passed; `public_close_before_open_ignores_late_ack_and_orders_close_after_open` executed once and failed on the threshold markers described above. The corrected expectation in `b22d25d` has not run.
+
+Exit-channel owner inspection (source only, pinned Core `93acae3`, Hub `b22d25d`). Observed: `terminal_output` `done` reached the client on the exit channel, then that exact channel closed with no `ProcessExit`.
+
+Hub-owned closes of a bound terminal channel, all in `run_bound_terminal_channel` and `flush_subscription_adapter_frames` (`src/transport/webrtc/subscription_channel.rs`):
+
+- `adapter_closed`: `snapshot_active` returns none and the handle is closed. The Hub follows a Core close. Any frame Core had not yet handed to `local_send_text` is abandoned by contract.
+- `flush_permit`: `transfer_aggregate_permit` returns false when the stored permit is absent while an aggregate exists, or when `try_resize` to the wire length is refused. The Hub then closes the channel and abandons the active frame. This close is Hub-owned.
+- `flush_send`, `flush_frame`: `local_send_text` or `framed_daemon_terminal_frame` fails.
+- ingress decode, ingress push, threshold, and usage failures; and the dependency reporting `OnClose`, `OnError`, or end of events.
+
+Core-owned adapter closes that drop a queued or in-flight `ProcessExit` before delivery (`crates/botster-core/src/engine`):
+
+- `client_worker.rs` `pump_one`: `WRITE_ATTEMPT_BUDGET` (512) unsuccessful writes while the adapter reports `Full` or `WouldBlock`.
+- `managed_session_runtime.rs:388`: `ControlAdmission::Sealed` while a woken route still holds terminal input calls `hard_stop_owner`. `probe_ordinary` returns `Sealed` for a sealed or missing session, which is the state after process exit. `hard_stop` clears the owner queue and closes the adapter.
+- `client_worker.rs` `hard_stop_key` on queue capacity, encode failure, or a `ProcessExit` for an unbound route.
+- The normal path, `process_exit_delivered` after adapter `Ready`, retires the route only after the Hub accepted the frame into the dependency queue, and the vendored dependency now orders the close after that payload.
+
+The normal path cannot produce the observed result with the vendored dependency. The `flush_permit` and `Sealed` paths can. The existing logs cannot distinguish them because the Hub records no reason when it closes a terminal channel.
+
+Proposed next step, not implemented: push one `RuntimeObservation` host event, `terminal_channel_closed:{session}:{subscription}:{reason}`, from the terminal driver at every Hub-initiated channel close, using the same pattern as the entity overflow observation. The combined lifecycle test already retains host events, so its failure text can then name the closer. No sleep, replay, or timeout change.
