@@ -1873,8 +1873,7 @@ mod tests {
 
     /// Split a server's datagrams into (RECONFIG, DATA) by first chunk type.
     fn split_reset(dgrams: Vec<Bytes>) -> (Vec<Bytes>, Vec<Bytes>) {
-        let (reconfig, data): (Vec<Bytes>, Vec<Bytes>) =
-            dgrams.into_iter().partition(is_reconfig);
+        let (reconfig, data): (Vec<Bytes>, Vec<Bytes>) = dgrams.into_iter().partition(is_reconfig);
         assert!(!data.is_empty(), "server produced no DATA");
         assert!(!reconfig.is_empty(), "server produced no RECONFIG");
         (reconfig, data)
@@ -1915,9 +1914,9 @@ mod tests {
     fn stream_closed_events(ctx: &SctpHandlerContext, stream_id: StreamId) -> usize {
         ctx.event_outs
             .iter()
-            .filter(|e| {
-                matches!(e.event, RTCEventInternal::SCTPStreamClosed(_, id) if id == stream_id)
-            })
+            .filter(
+                |e| matches!(e.event, RTCEventInternal::SCTPStreamClosed(_, id) if id == stream_id),
+            )
             .count()
     }
 
@@ -2130,7 +2129,10 @@ mod tests {
         )
         .expect("a missing stream is a terminal state, not a failure");
 
-        assert!(messages.is_empty(), "nothing can be read from a missing stream");
+        assert!(
+            messages.is_empty(),
+            "nothing can be read from a missing stream"
+        );
         assert_eq!(budget, 4, "no budget is spent on a missing stream");
         assert!(
             ctx.pending_readable.is_empty(),
