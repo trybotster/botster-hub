@@ -1071,3 +1071,9 @@ Resolution proof recorded each run: six crates to the export, rtc to vendor. Loc
 Every `sub-exit` teardown in run4 recorded the same state at the patched-file site `client_worker.rs:1500`, which is the `process_exit_delivered` retirement in `pump_one`: `process_exit_enqueued=true process_exit_delivered=true in_flight=false unsuccessful_writes=0 queue_len=0 queue_process_exit=0`. The only other site was `client_worker.rs:1357` (`detach_live`) for the explicit Detach routes.
 
 Limits: the failure did not reproduce under the probe in ten executions, while the unprobed build failed four of six single executions. The probe's synchronous write sits on Core's pumping thread immediately before the adapter close, so a passing probe run is inconclusive about the race. The run4 records establish the normal-completion signature only. No Core owner state was captured for a failing execution.
+
+#### Control tally on the probe build with the probe gate unset
+
+`run5-control`: the exact run4 binaries (`botster-hub` `669d20f8…`, `botster-session-worker` `b5cb95ee…`, unchanged after the group), `BOTSTER_CORE_PROBE_HARD_STOP` and its sink path unset, no sink produced.
+Executions: 1 to 3 passed with one selected test each; execution 4 failed (exit 101) with the delivery signature: missing `ProcessExit` on `wnx-exit/sub-exit`, `cause=channel_closed`, `terminal_channel_closed:sub-exit:1:adapter_closed`. The group stopped there.
+Reading: the probe build reproduces the delivery failure when the recorder is inactive (1 of 4) and did not fail in ten executions with the recorder active. The synchronous record on the pumping thread suppresses the race. No Core owner state exists for a failing execution.
