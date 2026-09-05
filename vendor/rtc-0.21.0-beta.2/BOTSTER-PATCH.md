@@ -22,8 +22,8 @@ Changed upstream files:
 
 - `src/data_channel/mod.rs`: queue close and reject sends after close starts.
 - `src/peer_connection/handler/datachannel.rs`: apply queued close and expose logical time within the crate.
-- `src/peer_connection/handler/mod.rs`: test both queue schedules, repeated close, and rejected late sends.
-- `tests/data_channel_backpressure_rtc2rtc.rs`: test final payload delivery before remote close over a real peer connection.
+- `src/peer_connection/handler/mod.rs`: test both queue schedules, repeated close, rejected late sends, and public close before open with a late ACK.
+- `tests/data_channel_backpressure_rtc2rtc.rs`: test final payload delivery before remote close over a real peer connection, and accepted payload under the Hub high-water pressure signal before remote close.
 
 Hub selects this directory through its workspace-root `[patch.crates-io]` entry.
 Cargo does not inherit that patch into another workspace root.
