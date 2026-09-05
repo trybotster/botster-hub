@@ -168,6 +168,9 @@ impl RTCPeerConnection {
             data_read_outs: VecDeque::new(),
             write_outs: VecDeque::new(),
             event_outs: VecDeque::new(),
+            pending_data_by_channel: HashMap::new(),
+            held_data_channel_closes: VecDeque::new(),
+            held_close_ready: false,
             stats: RTCStatsAccumulator::default(),
         };
 
