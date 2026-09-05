@@ -78,6 +78,20 @@ async fn spawn_and_bind_webrtc_channel(
     subscription_id: &str,
     command: &str,
 ) -> std::sync::Arc<dyn DataChannel> {
+    spawn_and_bind_webrtc_channel_with_label(peer, key, session_id, subscription_id, command)
+        .await
+        .0
+}
+
+/// Same as `spawn_and_bind_webrtc_channel`, and also returns the exact reserved
+/// DataChannel label so a later channel-level failure can be attributed.
+async fn spawn_and_bind_webrtc_channel_with_label(
+    peer: &mut LocalWebrtcOfferPeer,
+    key: &botster_core::AesGcmKey,
+    session_id: &str,
+    subscription_id: &str,
+    command: &str,
+) -> (std::sync::Arc<dyn DataChannel>, String) {
     let spawned = peer
         .encrypted_request(
             key,
@@ -125,9 +139,12 @@ async fn spawn_and_bind_webrtc_channel(
         "WebRTC bind must return empty Attach bodies: {:?}",
         attach.events
     );
-    peer.open_reserved_terminal(key, &reservation.label, &webrtc_terminal_adapter_hello())
+    let label = reservation.label.clone();
+    let channel = peer
+        .open_reserved_terminal(key, &reservation.label, &webrtc_terminal_adapter_hello())
         .await
-        .expect("open reserved subscription channel")
+        .expect("open reserved subscription channel");
+    (channel, label)
 }
 
 async fn bind_reserved_from_attach(
@@ -1237,6 +1254,7 @@ async fn wait_for_webrtc_exit_fixture_event(
     peer: &mut LocalWebrtcOfferPeer,
     key: &botster_core::AesGcmKey,
     exited: bool,
+    exit_label: &str,
 ) {
     let deadline = Instant::now() + Duration::from_secs(8);
     let mut retained = VecDeque::new();
@@ -1278,7 +1296,13 @@ async fn wait_for_webrtc_exit_fixture_event(
     }).collect();
     // These frames still belong to their original consumers.
     peer.pending_terminal_frames.extend(retained);
-    assert!(found, "wnx-exit/sub-exit missing event exited={exited}; {outcome}; retained={evidence:?}; subscription_receive_errors={:?}", peer.subscription_receive_errors);
+    let exit_channel_errors: Vec<&str> = peer
+        .subscription_receive_errors
+        .iter()
+        .filter(|(label, _)| label == exit_label)
+        .map(|(_, error)| error.as_str())
+        .collect();
+    assert!(found, "wnx-exit/sub-exit missing event exited={exited}; {outcome}; exit_label={exit_label}; exit_channel_errors={exit_channel_errors:?}; retained={evidence:?}; subscription_receive_errors={:?}", peer.subscription_receive_errors);
 }
 
 #[test]
@@ -1294,18 +1318,18 @@ fn webrtc_terminal_adapter_detach_peer_death_process_exit_and_shutdown_do_not_em
             .expect("hello");
         spawn_and_bind_webrtc(&mut peer, &key, "wnx-detach", "sub-detach", "sleep 30").await;
         // The producer cannot exit until this route reaches Attached and receives release input.
-        let exit_channel = spawn_and_bind_webrtc_channel(
+        let (exit_channel, exit_label) = spawn_and_bind_webrtc_channel_with_label(
             &mut peer, &key, "wnx-exit", "sub-exit",
             "IFS= read -r release && [ \"$release\" = \"wnx-release\" ] && printf 'done\\n'",
         ).await;
-        wait_for_webrtc_exit_fixture_event(&mut peer, &key, false).await;
+        wait_for_webrtc_exit_fixture_event(&mut peer, &key, false, &exit_label).await;
         let live = peer.encrypted_request(&key, &botster_hub_client::DaemonRequest::ListSessions)
             .await.expect("live state before exit release");
         assert!(live.sessions.iter().any(|row| row.session_id == "wnx-exit" && row.lifecycle == "running"));
         LocalWebrtcOfferPeer::send_reserved_terminal_frame(
             &exit_channel, &key, &terminal_input_frame_bytes(b"wnx-release\r"),
         ).await.expect("release exit through the bound terminal route");
-        wait_for_webrtc_exit_fixture_event(&mut peer, &key, true).await;
+        wait_for_webrtc_exit_fixture_event(&mut peer, &key, true, &exit_label).await;
         wait_for_authoritative_session_exit(&endpoint, "wnx-exit");
         spawn_and_bind_webrtc(&mut peer, &key, "wnx-shutdown", "sub-shutdown", "sleep 30").await;
         let before = peer
