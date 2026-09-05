@@ -925,7 +925,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1808,7 +1808,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2139,7 +2139,7 @@ dependencies = [
  "libc",
  "log",
  "socket2",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2342,7 +2342,7 @@ dependencies = [
 
 [[package]]
 name = "rtc"
-version = "0.21.0-beta.2"
+version = "0.21.0-rc.1"
 dependencies = [
  "bytes",
  "hex",
@@ -2376,9 +2376,9 @@ dependencies = [
 
 [[package]]
 name = "rtc-crypto"
-version = "0.21.0-beta.2"
+version = "0.21.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df0f2e4801a79469b8094f715f563d946c76826336f8d9fefb47dc6628524f11"
+checksum = "bb09bbf5cc31a6f8aa7fc9ec1d29fc9ef451943032be2d7ff555eb53b715f0a7"
 dependencies = [
  "aes",
  "ccm",
@@ -2395,9 +2395,9 @@ dependencies = [
 
 [[package]]
 name = "rtc-datachannel"
-version = "0.21.0-beta.2"
+version = "0.21.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0180e434128b3a3e9d8552ea958fd588839266cf08a2625741fbe65c292d1cb8"
+checksum = "04e47846f9b966400f1dcfba90632207c6525c37d9b0689886c7ff3e26a21831"
 dependencies = [
  "bytes",
  "log",
@@ -2408,9 +2408,9 @@ dependencies = [
 
 [[package]]
 name = "rtc-dtls"
-version = "0.21.0-beta.2"
+version = "0.21.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6cb87e1ec1b828914aace884307974a9ed40747e2f6ccaab93a4fff42528a73"
+checksum = "c5d24b04ea94f43e9954945acc1ec3d1ff3aa60c72c0b350321e131776318ac5"
 dependencies = [
  "bytecheck",
  "byteorder",
@@ -2428,9 +2428,9 @@ dependencies = [
 
 [[package]]
 name = "rtc-ice"
-version = "0.21.0-beta.2"
+version = "0.21.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "54629e23001460c167cc7389716b5ebdf2d03d070a80da6fd81279ddbb2fa25e"
+checksum = "83144d5a1e024abc5ecf1cb1f4722928bc88faa182ebaad8b401580c5ed6d5fc"
 dependencies = [
  "bytes",
  "crc",
@@ -2447,9 +2447,9 @@ dependencies = [
 
 [[package]]
 name = "rtc-interceptor"
-version = "0.21.0-beta.2"
+version = "0.21.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b2e30edc9210d3d8e71bf965089b9f265b61ad908cbf884103ba9ecae3a4445"
+checksum = "5542d3adc85fc54b3d4323fb6f6b7c45bfcf6205cb940e6377dcc9f3893a2187"
 dependencies = [
  "log",
  "rand",
@@ -2461,9 +2461,9 @@ dependencies = [
 
 [[package]]
 name = "rtc-mdns"
-version = "0.21.0-beta.2"
+version = "0.21.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf90f43afd8b7dcf277feca9b213d4cfc9470adcd7551c5a38fae8e7746d3649"
+checksum = "80b653fc94391ae039494538592063ef06fa9dd62341d46dcd4c04ecf065e8b2"
 dependencies = [
  "bytes",
  "log",
@@ -2474,9 +2474,9 @@ dependencies = [
 
 [[package]]
 name = "rtc-media"
-version = "0.21.0-beta.2"
+version = "0.21.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc573887274b26192f4440685194e8f9b9d7f39116cd96c75158893e97f6e14a"
+checksum = "3ea4c517928271a5ec44abda29c96a5eceb76e6833c2faed5435c12a8d62d673"
 dependencies = [
  "byteorder",
  "bytes",
@@ -2488,9 +2488,9 @@ dependencies = [
 
 [[package]]
 name = "rtc-rtcp"
-version = "0.21.0-beta.2"
+version = "0.21.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3967809f2a02083fcaece90d1c057d291964ec0beb3d37a249779d9168eaf97f"
+checksum = "c362f897ddf93eca1aeef832116c3bd47935a81810dd4e870b4bd364ee3d757d"
 dependencies = [
  "bytes",
  "rtc-shared",
@@ -2498,9 +2498,9 @@ dependencies = [
 
 [[package]]
 name = "rtc-rtp"
-version = "0.21.0-beta.2"
+version = "0.21.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30cb3758d1d52534675c7e904cac4b2ea8955713aa0c2efd27d53fd50ccc91b8"
+checksum = "9a318d08b1a61bd195acde83f248d059c6bbeedde3d69fcf46815f296c954ac9"
 dependencies = [
  "bytes",
  "memchr",
@@ -2511,9 +2511,9 @@ dependencies = [
 
 [[package]]
 name = "rtc-sctp"
-version = "0.21.0-beta.2"
+version = "0.21.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d9dabdca726a7c5eed4d4ae5f3f9d4e9baf7a2ed53efaedaae35b4bcc24bc2a"
+checksum = "8823005e23738c18e7ddf86ed15e4e539565ec07de1609017fab3422988a7587"
 dependencies = [
  "bytes",
  "crc32c",
@@ -2527,9 +2527,9 @@ dependencies = [
 
 [[package]]
 name = "rtc-sdp"
-version = "0.21.0-beta.2"
+version = "0.21.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e815082d639cbf4ebe4a2c2a1d5f85a22b4dff56fec5132b71962866e505fbec"
+checksum = "e265cdb020ced9b2711c2e93b764a82486ea7240a7d6e160f7c3b60cbb305216"
 dependencies = [
  "rand",
  "rtc-shared",
@@ -2538,9 +2538,9 @@ dependencies = [
 
 [[package]]
 name = "rtc-shared"
-version = "0.21.0-beta.2"
+version = "0.21.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "998b045d95d158251842c5146918f3213346ca7724e8c6ac750c37d467dbbcdd"
+checksum = "e9cb3827cf45aaeacf955b1577ff3d13f55f24319cffe94efe7d6345035b564e"
 dependencies = [
  "bitflags 1.3.2",
  "bytes",
@@ -2555,9 +2555,9 @@ dependencies = [
 
 [[package]]
 name = "rtc-srtp"
-version = "0.21.0-beta.2"
+version = "0.21.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2bd6c867faf2643826bd0c17c0eb07161ee183ebf2cdd40717c16659cdbb3ae8"
+checksum = "47333e36d1d2551d4f41fad31040ab9ac7ec6825bc76d3da489ca37225235322"
 dependencies = [
  "byteorder",
  "bytes",
@@ -2569,9 +2569,9 @@ dependencies = [
 
 [[package]]
 name = "rtc-stun"
-version = "0.21.0-beta.2"
+version = "0.21.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "394eab466ab73a7016e8895af2a90fbdb8557f7d979d20549070404315d631cb"
+checksum = "e48f8f1c5a025cddc50d7f042862ae264ca47ecb54b4124ab13f8b02b77a838d"
 dependencies = [
  "base64",
  "bytes",
@@ -2586,9 +2586,9 @@ dependencies = [
 
 [[package]]
 name = "rtc-turn"
-version = "0.21.0-beta.2"
+version = "0.21.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6cb3d1992ba1885c5d97795dc3a0f7552fa7a8f539c1d441da79bf7d061b7c5f"
+checksum = "776aff367180ee29227f0db44a3c1ab2dfe69be90a207b93f5f107a78b2d46db"
 dependencies = [
  "bytes",
  "log",
@@ -2632,7 +2632,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2935,7 +2935,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3020,10 +3020,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3267,7 +3267,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset",
  "tempfile",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3526,9 +3526,9 @@ dependencies = [
 
 [[package]]
 name = "webrtc"
-version = "0.21.0-beta.2"
+version = "0.21.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c626e35ca3bcb7155ebbbd94fd207829ba63d84bca1bfbd839926ff3e6bc31cb"
+checksum = "58f5fb2584f39cea75e2918b513c4ebc7dadc9f543391e4a5a1919c58270e756"
 dependencies = [
  "async-broadcast",
  "async-channel",
@@ -3573,7 +3573,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
