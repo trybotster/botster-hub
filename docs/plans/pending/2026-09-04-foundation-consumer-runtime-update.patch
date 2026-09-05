@@ -1,0 +1,142 @@
+diff --git a/src/runtime.rs b/src/runtime.rs
+index c9bf80d..06387d7 100644
+--- a/src/runtime.rs
++++ b/src/runtime.rs
+@@ -4207,6 +4207,7 @@ fn managed_session_core_error_class(error: &CoreDaemonError) -> &'static str {
+         CoreDaemonError::MissingScreenResponse(_) => "missing_screen_response",
+         CoreDaemonError::MissingModeFlagsResponse(_) => "missing_mode_flags_response",
+         CoreDaemonError::ControlPlaneFailed(_) => "control_plane_failed",
++        CoreDaemonError::ExplicitResizeBusy(_) => "explicit_resize_busy",
+         CoreDaemonError::BindTerminalAdapter(error) => match error {
+             BindTerminalAdapterError::BindBeforeAttach { .. } => {
+                 "bind_terminal_adapter.bind_before_attach"
+@@ -5390,6 +5391,21 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn explicit_resize_busy_class_is_path_neutral_and_distinct_from_control_plane_failure() {
++        let session_id = SessionId("/private/session/resize-busy".to_string());
++        assert_eq!(
++            managed_session_core_error_class(&CoreDaemonError::ExplicitResizeBusy(
++                session_id.clone()
++            )),
++            "explicit_resize_busy"
++        );
++        assert_eq!(
++            managed_session_core_error_class(&CoreDaemonError::ControlPlaneFailed(session_id)),
++            "control_plane_failed"
++        );
++    }
++
+     #[test]
+     fn bind_terminal_adapter_mapping_is_total_over_published_variants() {
+         let session_id = SessionId("session".to_string());
+diff --git a/src/update.rs b/src/update.rs
+index c39a95a..219e27a 100644
+--- a/src/update.rs
++++ b/src/update.rs
+@@ -869,20 +869,14 @@ fn durable_worker_identity(
+     data_directory: &Path,
+     session_id: &str,
+ ) -> Option<WorkerRecoveryIdentity> {
+-    let session_path = Path::new(session_id);
+-    if session_path.components().count() != 1
+-        || !matches!(session_path.components().next(), Some(Component::Normal(_)))
+-    {
++    let requested = botster_core::SessionId(session_id.to_string());
++    let record = botster_core_daemon::SessionRegistry::new(data_directory)
++        .load(&requested)
++        .ok()??;
++    if record.session_id != requested {
+         return None;
+     }
+-    let bytes = fs::read(
+-        data_directory
+-            .join("sessions")
+-            .join(format!("{session_id}.json")),
+-    )
+-    .ok()?;
+-    let record: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+-    let recovery = record.get("recovery_identity")?;
++    let recovery = record.recovery_identity?;
+     Some(WorkerRecoveryIdentity {
+         pid: recovery.get("worker_pid")?.as_u64()?.try_into().ok()?,
+         control_socket: PathBuf::from(recovery.get("worker_control_socket")?.as_str()?),
+@@ -1373,6 +1367,76 @@ mod tests {
+     use super::*;
+     use std::time::{SystemTime, UNIX_EPOCH};
+ 
++    struct RegistryFixture(PathBuf);
++
++    impl RegistryFixture {
++        fn new() -> Self {
++            let nonce = SystemTime::now()
++                .duration_since(UNIX_EPOCH)
++                .unwrap()
++                .as_nanos();
++            let path = std::env::temp_dir().join(format!(
++                "botster-update-registry-{}-{nonce}",
++                std::process::id()
++            ));
++            fs::create_dir(&path).unwrap();
++            Self(path)
++        }
++
++        fn save_worker(&self, session_id: &str, pid: u32) {
++            let mut record = botster_core_daemon::RegistryRecord::running(
++                botster_core::SessionId(session_id.to_string()),
++                None,
++                botster_core::ResizePayload { rows: 24, cols: 80 },
++                "test-worker".to_string(),
++                1,
++            );
++            record.recovery_identity = Some(serde_json::json!({
++                "worker_pid": pid,
++                "worker_control_socket": format!("/fixture/worker-{pid}.sock"),
++            }));
++            botster_core_daemon::SessionRegistry::new(&self.0)
++                .save(&record)
++                .unwrap();
++        }
++    }
++
++    impl Drop for RegistryFixture {
++        fn drop(&mut self) {
++            let _ = fs::remove_dir_all(&self.0);
++        }
++    }
++
++    #[test]
++    fn durable_worker_identity_uses_registry_identity_not_a_filename() {
++        let fixture = RegistryFixture::new();
++        fixture.save_worker("audit:終端/a", 101);
++        assert_eq!(
++            durable_worker_identity(&fixture.0, "audit:終端/a"),
++            Some(WorkerRecoveryIdentity {
++                pid: 101,
++                control_socket: PathBuf::from("/fixture/worker-101.sock"),
++            })
++        );
++        assert_eq!(durable_worker_identity(&fixture.0, "missing"), None);
++    }
++
++    #[test]
++    fn durable_worker_identity_never_selects_a_colliding_sibling() {
++        let fixture = RegistryFixture::new();
++        fixture.save_worker("audit_a", 202);
++        assert_eq!(durable_worker_identity(&fixture.0, "audit:a"), None);
++        fixture.save_worker("audit:a", 101);
++        assert_eq!(
++            durable_worker_identity(&fixture.0, "audit:a").unwrap().pid,
++            101
++        );
++        assert_eq!(
++            durable_worker_identity(&fixture.0, "audit_a").unwrap().pid,
++            202
++        );
++    }
++
+     #[test]
+     fn scopes_are_explicit() {
+         assert_eq!(UpdateScope::parse("core").unwrap(), UpdateScope::Core);
