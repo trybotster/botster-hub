@@ -1053,3 +1053,21 @@ Remaining scenarios:
 - P: Core closed the adapter before writing `ProcessExit` into the slot, through a hard-stop path.
 
 The driver treats egress frames as opaque and records no count, so this evidence cannot separate N from P. A further narrow observation (frames completed, and whether the last completed frame was a `process_exit`) was proposed to the coordinator and is not implemented.
+
+### 2026-09-05 isolated Core hard-stop probe: ten passing executions, no failure captured
+
+Provenance under `/tmp/hub-hard-close/fable-core-probe/` (`PROVENANCE.md`, `hashes.txt`, `core-hard-stop-probe.diff`, `fixture-hashes.txt`, `build-rs-applied.sha256`).
+Core export at exact `93acae3` with the Ghostty gitlink `eb72ec6` filled from the verified cached submodule; only `client_worker.rs` differs from the pinned checkout.
+Hub probe worktree detached at `c112fb5` with an untracked Cargo config patching the six pinned Core crates to the export; the vendored rtc repair unchanged; one coordinator-applied disposable edit to `crates/botster-hub-test-support/build.rs` (hash `0ef19b1d…`) that accepts the protocol crate only at the exact exported manifest path.
+Resolution proof recorded each run: six crates to the export, rtc to vendor. Lock delta, source hashes, and binary hashes recorded; binaries unchanged across executions.
+
+| Run | Probe | Executions | Result |
+| --- | --- | --- | --- |
+| run | stderr probe | build only | stopped: build script rejected path-sourced protocol crate before the override |
+| run2 | stderr probe | 1 | zero selection, same build-script rejection, preserved |
+| run3 | stderr probe (`db9c83b0…`) | 5 | 5 passed, one selected test each |
+| run4 | stderr plus bounded file sink (`cc262630…`) | 5 | 5 passed, one selected test each, sink present each time |
+
+Every `sub-exit` teardown in run4 recorded the same state at the patched-file site `client_worker.rs:1500`, which is the `process_exit_delivered` retirement in `pump_one`: `process_exit_enqueued=true process_exit_delivered=true in_flight=false unsuccessful_writes=0 queue_len=0 queue_process_exit=0`. The only other site was `client_worker.rs:1357` (`detach_live`) for the explicit Detach routes.
+
+Limits: the failure did not reproduce under the probe in ten executions, while the unprobed build failed four of six single executions. The probe's synchronous write sits on Core's pumping thread immediately before the adapter close, so a passing probe run is inconclusive about the race. The run4 records establish the normal-completion signature only. No Core owner state was captured for a failing execution.
