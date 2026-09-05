@@ -373,10 +373,7 @@ async fn accepted_final_payload_precedes_remote_close() -> Result<()> {
                 RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnOpen(_))
             ) && !sent
             {
-                let mut channel = p
-                    .offer_pc
-                    .data_channel(offer_dc)
-                    .expect("open channel");
+                let mut channel = p.offer_pc.data_channel(offer_dc).expect("open channel");
                 channel.send_text(Instant::now(), "final-payload")?;
                 // Do not drive pipeline writes between acceptance and close.
                 channel.close()?;
@@ -520,10 +517,7 @@ async fn accepted_payload_under_pressure_precedes_remote_close() -> Result<()> {
         while let Some(event) = p.offer_pc.poll_event() {
             match event {
                 RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnOpen(_)) => {
-                    let mut channel = p
-                        .offer_pc
-                        .data_channel(offer_dc)
-                        .expect("open channel");
+                    let mut channel = p.offer_pc.data_channel(offer_dc).expect("open channel");
                     channel.set_buffered_amount_high_threshold(HUB_BUFFERED_AMOUNT_HIGH);
                     open = true;
                 }
@@ -575,10 +569,7 @@ async fn accepted_payload_under_pressure_precedes_remote_close() -> Result<()> {
         }
         let mut queued_now = false;
         if open && !close_sent {
-            let mut channel = p
-                .offer_pc
-                .data_channel(offer_dc)
-                .expect("open channel");
+            let mut channel = p.offer_pc.data_channel(offer_dc).expect("open channel");
             if !high_seen {
                 assert!(
                     sent.len() < PRESSURE_PAYLOAD_CAP,
