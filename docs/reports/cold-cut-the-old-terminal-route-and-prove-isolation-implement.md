@@ -1037,3 +1037,19 @@ Group executed once on `39443fc` under `/tmp/hub-hard-close/fable-attributed-exi
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0 |
 
 The combined lifecycle test passed on this execution, so no close observation was captured. Across the recorded single executions it has now passed twice and failed three times. One execution does not decide the natural-exit condition; the close reason can be read only from a failing execution.
+
+### 2026-09-05 bounded tally: first execution attributed
+
+Plan: at most five single executions of the combined lifecycle test on frozen `c65f2f0`, stopping at the first failure. Supervisor `/tmp/hub-hard-close/fable-exit-tally-run.py`; evidence `/tmp/hub-hard-close/fable-exit-tally/`.
+Execution 1 failed (exit 101, 0 passed, 1 failed, 11.4 s). The tally stopped there. Source and binary hashes are in the receipt.
+
+Failure text: `exit_label=r-84e1a0d22c74f83d6db991d8b36df9f7`, `exit_channel_errors=[cause=channel_closed message_id=pending next_chunk=0 expected_chunks=pending]`, `terminal_channel_closed=["terminal_channel_closed:sub-exit:1:adapter_closed"]`.
+
+Reading within the documented limits: the exit channel's driver terminated because it observed a closed adapter while no frame was active. The driver did not abandon an in-flight frame, did not refuse a permit, did not fail a send, and did not react to a remote close. The channel close was the driver's ordered follow-up to an adapter close. The observation does not say who closed the adapter.
+
+Remaining scenarios:
+
+- N: Core retired the route after the Hub completed a `ProcessExit` send. The frame was accepted by the dependency before the ordered close and was lost between acceptance and the client.
+- P: Core closed the adapter before writing `ProcessExit` into the slot, through a hard-stop path.
+
+The driver treats egress frames as opaque and records no count, so this evidence cannot separate N from P. A further narrow observation (frames completed, and whether the last completed frame was a `process_exit`) was proposed to the coordinator and is not implemented.
