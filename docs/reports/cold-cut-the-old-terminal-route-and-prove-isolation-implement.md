@@ -1015,3 +1015,25 @@ Core-owned adapter closes that drop a queued or in-flight `ProcessExit` before d
 The normal path cannot produce the observed result with the vendored dependency. The `flush_permit` and `Sealed` paths can. The existing logs cannot distinguish them because the Hub records no reason when it closes a terminal channel.
 
 Proposed next step, not implemented: push one `RuntimeObservation` host event, `terminal_channel_closed:{session}:{subscription}:{reason}`, from the terminal driver at every Hub-initiated channel close, using the same pattern as the entity overflow observation. The combined lifecycle test already retains host events, so its failure text can then name the closer. No sleep, replay, or timeout change.
+
+### 2026-09-05 close-reason observation and attributed run
+
+Commit `39443fc` adds `TerminalDriverExit` and one `RuntimeObservation` per terminal driver termination, `terminal_channel_closed:{subscription}:{generation}:{reason}`, with no change to close actions, ordering, adapter state, budgets, or protocol shape. The exit fixture waiter prints those observations in its failure text.
+
+Reason meanings, as bounded by the Codex review:
+
+- `adapter_closed` and `adapter_closed_in_flight` mean only that the driver observed a closed adapter, before or after starting a send. `adapter_closed_in_flight` can occur before the send future's first poll, so it does not prove that bytes were accepted or sent.
+- `permit_refused` means the transfer or resize was refused while the handle read as open at the recheck. A close that races with that recheck is not distinguished atomically.
+- `remote_close` means the driver observed `OnClose`; it is not proof of remote initiation.
+- Publication follows the bounded close and possible peer cleanup, so a missing observation does not prove that the driver did not terminate.
+
+Group executed once on `39443fc` under `/tmp/hub-hard-close/fable-attributed-exit-run.py`; evidence in `/tmp/hub-hard-close/fable-attributed-exit/` and `/tmp/hub-hard-close/fable-clean-checkout-cbo/`.
+
+| Arm | Result |
+| --- | --- |
+| `public_close_before_open_ignores_late_ack_and_orders_close_after_open` (archived `39443fc`, full module path) | 1 executed, 1 passed |
+| `webrtc_terminal_adapter_detach_peer_death_process_exit_and_shutdown_do_not_emit_close_event` | 1 executed, 1 passed in 6.50 s |
+| `cargo fmt --all -- --check` | exit 0 |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0 |
+
+The combined lifecycle test passed on this execution, so no close observation was captured. Across the recorded single executions it has now passed twice and failed three times. One execution does not decide the natural-exit condition; the close reason can be read only from a failing execution.
