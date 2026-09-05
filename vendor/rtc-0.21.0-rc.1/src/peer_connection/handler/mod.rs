@@ -212,9 +212,13 @@ impl RTCPeerConnection {
     /// Pop the next data-channel message and keep the pending count in step.
     ///
     /// The pop that empties a channel releases that channel's held `OnClose`, if any, into
-    /// `event_outs` behind whatever is already queued there. Only this channel's entries are
-    /// touched: an unrelated channel's backlog costs nothing here, and a successor channel on
-    /// the same stream id has its own handle and its own count.
+    /// `event_outs` behind whatever is already queued there. Only this channel's entries
+    /// change: an unrelated channel's count is untouched, and a successor channel on the same
+    /// stream id has its own handle and its own count. Cost: the count update is a map lookup;
+    /// the zero-count path scans and removes from `held_data_channel_closes`, which is linear
+    /// in the number of held closes, as is the duplicate check in
+    /// `hold_close_behind_pending_data`. That number never exceeds the unread data-channel
+    /// messages, so the scan is bounded by the back-pressure the caller is already applying.
     fn pop_data_read_out(&mut self) -> Option<TaggedRTCMessage> {
         let tagged = self.pipeline_context.data_read_outs.pop_front()?;
         if let RTCMessage::DataChannelMessage(id, _) = &tagged.message {
