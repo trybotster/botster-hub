@@ -1384,8 +1384,10 @@ mod botster_receive_close_barrier {
         let b = open_channel(&mut pc, 2);
         let c = open_channel(&mut pc, 3);
 
-        deliver(&mut pc, 1, now, "one");
+        // b's payload is queued ahead of a's, but a's close is held first: the public data
+        // queue is FIFO, so the reads come out b then a, while the hold order is a then b.
         deliver(&mut pc, 2, now, "two");
+        deliver(&mut pc, 1, now, "one");
         remote_close(&mut pc, 1, now);
         remote_close(&mut pc, 2, now);
         remote_close(&mut pc, 3, now);
@@ -1396,7 +1398,7 @@ mod botster_receive_close_barrier {
         assert!(is_close(closes[0], c));
         assert_eq!(held_ids(&pc), vec![a, b]);
 
-        // Read b first, then a: the closes follow the reads, not the hold order.
+        // The reads come out b then a: the closes follow the reads, not the hold order.
         assert_eq!(text(&pc.poll_data_read().unwrap()), (b, "two".to_owned()));
         assert_eq!(text(&pc.poll_data_read().unwrap()), (a, "one".to_owned()));
         assert!(held_ids(&pc).is_empty());
