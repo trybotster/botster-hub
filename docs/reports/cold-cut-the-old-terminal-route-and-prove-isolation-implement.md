@@ -883,3 +883,61 @@ No matrix or gate advancement occurred.
 The implementer, Botster implementer, and Hub playbooks constrained this correction.
 The runtime teardown lenses and peer-cleanup notes require explicit sibling and failure-path evidence.
 No convention was waived. No missing guidance was discovered for this correction.
+
+### 2026-09-04 vendored rtc ordered-close repair: build, retry, and focused gates
+
+Target: `trybotster/botster-hub`, `tgt_7e208a0c76a44980a83b63af976b1f22`.
+Implementer: Fable session `sess-1788590641-004c-c690f3f33319fb80558a0ef4f7de8dc6`, after the Codex release in `artifact_1788590263_218370`.
+Base: `1d489646a02ee3bca6e51e206b310eca70be68a8`. Core pin `93acae3` unchanged.
+
+Dependency change: `vendor/rtc-0.21.0-beta.2` with `BOTSTER-PATCH.md`, a workspace `exclude` for that directory, and a root `[patch.crates-io]` entry.
+`Cargo.lock` loses only the registry source and checksum of the `rtc` entry.
+The four changed upstream files, provenance, licenses, and the real-peer positive and negative evidence are recorded in `artifact_1788590134_343889`.
+This commit does not include the restored remote-close test.
+
+Environment for every command: Rust 1.97.0, Zig 0.16.0, `CARGO_BUILD_JOBS=2`, `CARGO_TARGET_DIR` unset, worktree root, repository `test.sh` wrapper for tests, bounded supervisor with 300-second limits and process census.
+
+Build proof, `/tmp/hub-hard-close/fable-build/`:
+
+- `cargo metadata --locked --offline` selects `rtc 0.21.0-beta.2` with `source = None` from `vendor/rtc-0.21.0-beta.2`; `rtc` is not a workspace member.
+- `cargo build --locked -p botster-core-daemon --bin botster-session-worker`: exit 0.
+- `cargo build --locked --bin botster-hub`: exit 0. The log shows `Compiling rtc v0.21.0-beta.2 (.../vendor/rtc-0.21.0-beta.2)`.
+
+Exact retry, `/tmp/hub-hard-close/fable-remote-close-retry/`, one execution:
+
+- `./test.sh --locked --lib transport::webrtc::subscription_channel::tests::remote_closed_subscription_keeps_host_sibling_live -- --exact --nocapture`: exit 101 in 11.56 s.
+- Panic: `timed out waiting for target retirement: receiving on an empty channel` at the `pump_test_control_until` deadline.
+- No owned survivors before or after cleanup. Source diff unchanged.
+
+Source finding for the retry (no fixture change, no further run):
+The test waits for `pending_runtime.is_adapter_bound` to become false while pumping only `control_rx`.
+The production remote-close path is driver exit, then `RetireReservedSubscription`, then `retire_reserved_subscription` in `src/daemon/control/connection.rs`.
+Its `retire_route_owner` arm for `ChannelClass::Terminal` is empty. The function forgets the label and releases budget. It never calls `pending_runtime.close_adapter`.
+`adapter_bound` is cleared only by Detach and ShutdownSession request handling, `fail_closed_pre_bind_attach`, grant or session adapter closes, and inventory reconcile.
+None of those run from this fixture's control pump. The panic text is the post-deadline Empty branch and does not show whether `RetireReservedSubscription` arrived.
+The fixture oracle is therefore not a control-plane-observable outcome for a Terminal reservation. This does not prove that the Hub observed the remote close.
+rtc-sctp surfaces a peer stream reset as `AssociationLost { reason: Reset }`, which rtc maps to `SCTPStreamClosed` and then `OnClose`, and it retransmits reconfig requests.
+
+Focused gates, `/tmp/hub-hard-close/fable-focused-gates/`, one execution of each arm:
+
+| Arm | Command | Result |
+| --- | --- | --- |
+| webrtc_unit | `./test.sh --locked --lib transport::webrtc:: -- --nocapture --skip remote_closed_subscription_keeps_host_sibling_live` | 86 passed |
+| unix_unit | `./test.sh --locked --lib transport::unix::` | 25 passed |
+| budget_unit | `./test.sh --locked --lib admission::connection_budget::` | 7 passed |
+| unix_exit | `unix_adapter_bound_printf_stream_attach_delivers_process_exit` | passed |
+| webrtc_bytes | `webrtc_terminal_output_is_byte_exact` | passed |
+| webrtc_exit | `webrtc_terminal_adapter_detach_peer_death_process_exit_and_shutdown_do_not_emit_close_event` | FAILED, exit 101 |
+| ended | `webrtc_terminal_adapter_attach_after_authoritative_exit_rejects` | passed |
+| host_close | `webrtc_terminal_adapter_host_close_emits_negotiated_terminal_subscription_closed` | passed |
+| fmt | `cargo fmt --all -- --check` | exit 0 |
+| clippy | `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0 |
+
+The `webrtc_exit` failure is identical to the `final-focused` failure before the dependency repair.
+The retained frames end with `terminal_output` bytes `done`. No `ProcessExit` arrives before the receive timeout.
+`subscription_receive_errors` records `cause=channel_closed message_id=pending next_chunk=0 expected_chunks=pending`.
+The vendored queue-order repair does not clear this failure. The failure remains unattributed.
+The skipped restored test is the one already executed in the exact retry. It was not run a second time.
+
+Status: the vendor repair is a separate commit. The restored remote-close test stays uncommitted as preserved evidence.
+No complete matrix, downstream rerun, merge, push, pin change, or gate advancement occurred. The implementer does not approve this candidate.
