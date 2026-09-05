@@ -565,7 +565,10 @@ fn run_one_pump_phase(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
     }
 }
 
-fn run_inventory_reconcile_phase(daemon: &HubDaemon, state: &mut DaemonControlState) -> bool {
+pub(crate) fn run_inventory_reconcile_phase(
+    daemon: &HubDaemon,
+    state: &mut DaemonControlState,
+) -> bool {
     let Some(runtime) = daemon.runtime() else {
         state.pump.reconcile_after = None;
         return false;

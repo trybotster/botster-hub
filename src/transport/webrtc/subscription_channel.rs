@@ -1208,6 +1208,164 @@ mod tests {
     }
 
     #[test]
+    fn remote_closed_subscription_keeps_host_sibling_live() {
+        let _teardown_guard = teardown_test_lock();
+        let mut harness = PeerHarness::new("remote-closed-subscription");
+        let mut peer = harness.signal_peer("http://127.0.0.1:41919");
+        harness.ensure_webrtc_adapter_hello(&mut peer);
+        let session_id = "remote-close-session";
+        let subscription_id = "remote-close-target";
+        harness.spawn_and_attach_on_peer(&mut peer, session_id, subscription_id);
+        let label = peer
+            .offer_peer
+            .as_ref()
+            .expect("offer peer")
+            .reserved_channels
+            .keys()
+            .next()
+            .expect("terminal channel label")
+            .clone();
+        let peer_state = harness
+            .daemon
+            .local_webrtc()
+            .peer_states
+            .get(&peer.grant_id)
+            .expect("live peer state")
+            .clone();
+        let channel = Arc::clone(
+            &peer
+                .offer_peer
+                .as_ref()
+                .expect("offer peer")
+                .reserved_channels
+                .get(&label)
+                .expect("target channel")
+                .channel,
+        );
+        let peer_generation = match harness
+            .state
+            .pending_runtime
+            .admission
+            .webrtc_admissions
+            .get(&peer.grant_id)
+        {
+            Some(WebrtcTerminalAdmission::Admitted {
+                peer_generation, ..
+            }) => *peer_generation,
+            _ => panic!("WebRTC admission must be live"),
+        };
+        assert!(
+            harness
+                .state
+                .pending_runtime
+                .admission
+                .connection_budgets
+                .get(&peer_generation)
+                .and_then(|budget| budget.usage(&label))
+                .is_some(),
+            "a bound terminal label must hold a budget slot before the remote close"
+        );
+        peer.offer_runtime
+            .block_on(channel.close())
+            .expect("remote close");
+        // Production owner path. The Hub driver observes the remote close and closes
+        // the adapter; pinned Core retires the route on adapter pressure `Closed`;
+        // the driver's RetireReservedSubscription releases the label and budget.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            while let Ok(message) = harness.control_rx.try_recv() {
+                handle_control_message(
+                    &mut harness.daemon,
+                    &mut harness.state,
+                    &harness.terminal_path,
+                    &harness.transport_handle,
+                    harness.control_tx.clone(),
+                    message,
+                );
+            }
+            let runtime = harness.daemon.runtime_mut().expect("runtime");
+            let _ = runtime.observe_lifecycle_slice(
+                1,
+                None,
+                botster_core_daemon::ObserveLifecycleBudget {
+                    max_sessions: 32,
+                    max_encoded_result_bytes: 64 * 1024,
+                    max_elapsed: Duration::from_millis(25),
+                },
+            );
+            let core_present = runtime.list_terminal_subscriptions().iter().any(|row| {
+                row.session_id.0 == session_id && row.subscription_id.0 == subscription_id
+            });
+            let reservation = harness
+                .state
+                .pending_runtime
+                .admission
+                .reservations
+                .lookup_label(
+                    &label,
+                    peer_generation,
+                    crate::admission::reservations::now_seconds(),
+                );
+            if !core_present
+                && reservation == crate::admission::reservations::ReservationLookup::Unknown
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for Core route retirement and reservation release: core_present={core_present} reservation={reservation:?}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        // The owner loop's inventory reconcile phase is the production registry cleanup.
+        while crate::daemon::owner_loop::run_inventory_reconcile_phase(
+            &harness.daemon,
+            &mut harness.state,
+        ) {}
+        assert!(
+            !harness
+                .state
+                .pending_runtime
+                .is_adapter_bound(session_id, subscription_id),
+            "owner-loop reconcile must remove the retired terminal adapter route"
+        );
+        assert!(
+            harness
+                .state
+                .pending_runtime
+                .admission
+                .connection_budgets
+                .get(&peer_generation)
+                .and_then(|budget| budget.usage(&label))
+                .is_none(),
+            "the retired label must release its budget slot"
+        );
+        assert!(
+            !peer_state.cleanup_sent.load(Ordering::Acquire),
+            "remote channel close must not clean up the peer"
+        );
+        let sibling_response = harness.subscribe_entities(&mut peer, "live-host-sibling");
+        assert_eq!(
+            sibling_response.kind,
+            botster_hub_client::DaemonResponseKind::EntitySubscribed,
+            "the host sibling must carry a request and response after remote close"
+        );
+        peer.offer_runtime.block_on(async {
+            assert!(
+                matches!(
+                    channel.close().await,
+                    Err(webrtc::error::Error::ErrDataChannelClosed)
+                ),
+                "the dependency must report the removed channel"
+            );
+            channel.local_close().await.expect("idempotent local close");
+        });
+        assert!(!peer_state.cleanup_sent.load(Ordering::Acquire));
+        peer.close_offer();
+        harness.cleanup();
+    }
+
+    #[test]
     fn removed_subscription_channel_keeps_host_sibling_live() {
         let _teardown_guard = teardown_test_lock();
         let mut harness = PeerHarness::new("remote-closed-subscription");
