@@ -487,7 +487,8 @@ fn external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup() {
                 .await
                 .expect("offer peer accepts answer");
 
-            let start_path = unique_short_test_dir(&format!("webrtc-sd-start-{round}")).join("go");
+            let start_path =
+                unique_short_test_dir(&format!("webrtc-sd-start-{round}")).join("go");
             let release_path = unique_short_test_dir(&format!("webrtc-sd-rel-{round}")).join("go");
             let exit_release_path =
                 unique_short_test_dir(&format!("webrtc-sd-exit-rel-{round}")).join("go");
@@ -1012,40 +1013,58 @@ fn local_webrtc_chunks_oversized_encrypted_daemon_response() {
             botster_hub_client::DaemonResponseKind::SessionRemoved
         );
         // Core closed the terminal adapter when the session was shut down, so the channel
-        // driver must have stopped on the closed adapter: `adapter_closed` from its flush
-        // check, or `adapter_closed_in_flight` if a frame was mid-send. This peer never
-        // closed the channel itself, so `remote_close` is not allowed, and any ingress,
-        // send, or usage exit would be a product defect. Exactly one such report, for this
-        // subscription and its reservation's route generation.
+        // driver must stop on the closed adapter: `adapter_closed` from its flush check, or
+        // `adapter_closed_in_flight` if a frame was mid-send. This peer never closed the
+        // channel itself, so `remote_close` is not allowed, and any ingress, send, or usage
+        // exit would be a product defect. The driver runs on its own task and nothing makes
+        // the SessionRemoved reply wait for its report, so receive it through the bounded
+        // host-event path rather than inspecting an instantaneous queue snapshot.
         let observation_prefix = format!(
             "terminal_channel_closed:{}:{}:",
             reservation.subscription_id, reservation.generation
         );
-        let driver_exits: Vec<String> = offer_peer
-            .pending_host_events()
-            .iter()
-            .filter_map(|event| match event {
+        let is_driver_exit_report = |event: &botster_hub_client::DaemonEvent| {
+            matches!(
+                event,
                 botster_hub_client::DaemonEvent::RuntimeObservation { kind }
-                    if kind.starts_with("terminal_channel_closed:") =>
-                {
-                    Some(kind.clone())
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            driver_exits.len(),
-            1,
-            "exactly one terminal driver exit report is expected: {driver_exits:?}"
-        );
-        let reason = driver_exits[0]
-            .strip_prefix(&observation_prefix)
-            .unwrap_or_else(|| {
-                panic!(
-                    "driver exit report must name this subscription and route generation: {} (expected prefix {observation_prefix})",
-                    driver_exits[0]
-                )
-            });
+                    if kind.starts_with("terminal_channel_closed:")
+            )
+        };
+        let driver_exit_deadline = Instant::now() + Duration::from_secs(20);
+        let driver_exit = loop {
+            if let Some(index) = offer_peer
+                .pending_host_events()
+                .iter()
+                .position(is_driver_exit_report)
+            {
+                break offer_peer
+                    .take_pending_host_event_at(index)
+                    .expect("parked driver exit report");
+            }
+            assert!(
+                Instant::now() < driver_exit_deadline,
+                "timed out waiting for the terminal driver's exit report; parked host events: {:?}",
+                offer_peer.pending_host_events()
+            );
+            match tokio::time::timeout(
+                Duration::from_millis(200),
+                offer_peer.next_host_event(&stream_key),
+            )
+            .await
+            {
+                Ok(Ok(event)) if is_driver_exit_report(&event) => break event,
+                // Unrelated host events and receive timeouts keep the wait going.
+                Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {}
+            }
+        };
+        let botster_hub_client::DaemonEvent::RuntimeObservation { kind } = &driver_exit else {
+            unreachable!("driver exit reports are runtime observations");
+        };
+        let reason = kind.strip_prefix(&observation_prefix).unwrap_or_else(|| {
+            panic!(
+                "driver exit report must name this subscription and route generation: {kind} (expected prefix {observation_prefix})"
+            )
+        });
         assert!(
             matches!(reason, "adapter_closed" | "adapter_closed_in_flight"),
             "the driver must stop on the Core-closed adapter, got {reason}"
