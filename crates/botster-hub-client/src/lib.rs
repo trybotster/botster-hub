@@ -3,11 +3,27 @@
 //! This crate owns the client-to-hub daemon socket request, response, event,
 //! handshake, and connection helpers. It intentionally contains no hub runtime,
 //! TUI, Lua, or daemon-to-session-worker protocol dependencies.
+//!
+//! # Host-control protocol 9
+//!
+//! Every frame on the Unix socket is one length-prefixed container:
+//!
+//! ```text
+//! UnixFrame = [u32 LE frame_len][u8 container][payload]    frame_len = 1 + payload.len()
+//! container 1 CONTROL   payload = UTF-8 JSON `ClientFrame` (client to Hub) or `ServerFrame` (Hub to client)
+//! container 2 TERMINAL  payload = [u16 LE route_len][route UTF-8][u64 LE generation][body]
+//! ```
+//!
+//! A terminal container body is opaque to this crate. Hub to client it is one
+//! Core terminal-stream body; client to Hub it is one Core terminal input frame.
+//! Control requests carry a client-chosen `request_id` (canonical decimal `u64`,
+//! strictly increasing per connection). Hub may complete requests out of order;
+//! the response echoes the id.
 
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 #[cfg(test)]
@@ -30,16 +46,72 @@ pub use botster_terminal_protocol::{
 mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
-pub const PROTOCOL_VERSION: u16 = 8;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 48;
+/// Host-control protocol version. Any other version is rejected at Hello; there is no negotiation.
+pub const PROTOCOL_VERSION: u16 = 9;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 49;
 /// Oldest conformance revision accepted by the default first-party client requirement.
-pub const DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 36;
+///
+/// Protocol 9 is a cold cut: the floor equals the current revision.
+pub const DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 49;
+/// Maximum byte length of a `request_id`: a canonical positive decimal `u64`, no leading zeros.
+pub const MAX_REQUEST_ID_BYTES: usize = 20;
+/// Outstanding (unanswered) control requests one connection may hold.
+///
+/// A valid request beyond this bound receives a correlated `too_many_requests`
+/// operator error response. Terminal streams on that connection are unaffected.
+pub const MAX_OUTSTANDING_REQUESTS: usize = 32;
+/// Maximum control request frame payload. A larger declared frame closes the connection.
+pub const MAX_CONTROL_REQUEST_BYTES: usize = 1 << 20;
+/// Maximum control response frame payload. Large data is paged, never oversized.
+pub const MAX_CONTROL_RESPONSE_BYTES: usize = 1 << 20;
+/// Bytes per `ReadSnapshotPage` payload.
+pub const SNAPSHOT_PAGE_BYTES: usize = 256 * 1024;
+/// Open snapshot captures one connection may hold.
+pub const MAX_OPEN_CAPTURES_PER_CONNECTION: usize = 4;
+/// Seconds a snapshot capture stays readable after `CaptureSnapshot`.
+pub const SNAPSHOT_CAPTURE_TTL_SECONDS: u32 = 60;
+/// Operator error code for the 33rd outstanding request on one connection.
+pub const OPERATOR_ERROR_TOO_MANY_REQUESTS: &str = "too_many_requests";
+/// Bytes of the Unix frame length prefix.
+pub const UNIX_FRAME_LENGTH_PREFIX_BYTES: usize = 4;
+/// Unix container tag for UTF-8 JSON `ClientFrame` / `ServerFrame` payloads.
+pub const UNIX_CONTAINER_CONTROL: u8 = 1;
+/// Unix container tag for one routed terminal body.
+pub const UNIX_CONTAINER_TERMINAL: u8 = 2;
+/// Maximum route id length inside a terminal container (UTF-8 bytes).
+pub const MAX_UNIX_TERMINAL_ROUTE_BYTES: usize = 1024;
+/// Fixed terminal container header bytes before the route: `u16` route length plus `u64` generation.
+pub const UNIX_TERMINAL_CONTAINER_FIXED_BYTES: usize = 2 + 8;
+/// Largest Unix frame (container byte plus payload) this crate reads or writes.
+///
+/// Control payloads are bounded separately by [`MAX_CONTROL_REQUEST_BYTES`] and
+/// [`MAX_CONTROL_RESPONSE_BYTES`]. A terminal body is bounded by the Core
+/// route egress cap (4 MiB); this ceiling adds the container header and the
+/// longest route so no Core body is ever too large to frame.
+pub const MAX_UNIX_FRAME_BYTES: usize =
+    (4 << 20) + 1 + UNIX_TERMINAL_CONTAINER_FIXED_BYTES + MAX_UNIX_TERMINAL_ROUTE_BYTES;
 /// Version of the local WebRTC delivery chunk framing protocol.
 pub const LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION: u16 = 2;
 /// Serialized local WebRTC delivery frames must remain strictly below this size.
 pub const LOCAL_WEBRTC_MAX_FRAME_BYTES: usize = 64 * 1024;
 /// Maximum serialized encrypted delivery envelope accepted for reassembly.
 pub const LOCAL_WEBRTC_MAX_DELIVERY_BYTES: usize = 16 * 1024 * 1024;
+/// Fixed header bytes of one binary local WebRTC terminal chunk.
+///
+/// ```text
+/// WebrtcTerminalChunk = [u8 version = 2][u64 LE message_id][u32 LE chunk_index]
+///                       [u32 LE chunk_count][u32 LE total_bytes][u64 LE generation]
+///                       [sealed slice: 12-byte nonce || AES-GCM ciphertext || 16-byte tag]
+/// ```
+///
+/// The route is the subscription DataChannel label. `total_bytes` is the
+/// plaintext body length; each sealed slice decrypts to one contiguous slice of
+/// that body, in `chunk_index` order.
+pub const LOCAL_WEBRTC_TERMINAL_CHUNK_HEADER_BYTES: usize = 1 + 8 + 4 + 4 + 4 + 8;
+/// AES-GCM nonce bytes in a sealed terminal chunk slice.
+pub const LOCAL_WEBRTC_TERMINAL_CHUNK_NONCE_BYTES: usize = 12;
+/// AES-GCM tag bytes in a sealed terminal chunk slice.
+pub const LOCAL_WEBRTC_TERMINAL_CHUNK_TAG_BYTES: usize = 16;
 pub const FEATURE_SESSIONS: &str = "sessions";
 pub const FEATURE_PLUGIN_SURFACE_RENDER: &str = "plugin_surface_render";
 pub const FEATURE_PLUGIN_SURFACE_ACTION: &str = "plugin_surface_action";
@@ -68,25 +140,16 @@ pub const FEATURE_WEBRTC_TERMINAL_ADAPTER: &str = "webrtc_terminal_adapter";
 pub const FEATURE_ATTACH_OCCUPANCY: &str = "attach_occupancy";
 /// Optional host-control package-event subscriptions. Not a terminal feature.
 pub const FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS: &str = "package_event_subscriptions";
-/// Mux envelope plane tag. Not a Snapshot/READY/PAGE/FINISH field.
-pub const UNIX_TERMINAL_PLANE: &str = "terminal";
-/// Mux envelope kind tag. The payload stays an opaque `TerminalFrame` blob.
-pub const UNIX_TERMINAL_KIND: &str = "frame";
-/// Wire `AttachState.state` for the initial pre-bind handshake.
-pub const ATTACH_STATE_ATTACHING: &str = "attaching";
-/// Wire `AttachState.state` after a post-READY history failure.
-pub const ATTACH_STATE_SNAPSHOT_HISTORY_INCOMPLETE: &str = "snapshot_history_incomplete";
-/// Wire `AttachState.state` when attach fails before any READY Snapshot.
-pub const ATTACH_STATE_ATTACH_FAILED: &str = "attach_failed";
 
-/// Authenticated plaintext carried by one complete local WebRTC delivery.
+/// Authenticated plaintext carried by one complete local WebRTC control delivery.
+///
+/// Terminal bodies never travel in JSON chunks; they use the binary chunk
+/// layout documented on [`LOCAL_WEBRTC_TERMINAL_CHUNK_HEADER_BYTES`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DaemonLocalWebrtcDeliveryKind {
-    DaemonResponse,
-    DaemonEntityFrame,
-    DaemonTerminalFrame,
-    DaemonEvent,
+    /// One serialized [`ServerFrame`]: a correlated response, hello ack, event, entity frame, or close.
+    ServerFrame,
 }
 
 /// One frame of an encrypted daemon delivery sent over the local WebRTC DataChannel.
@@ -94,6 +157,8 @@ pub enum DaemonLocalWebrtcDeliveryKind {
 /// `payload` is a contiguous UTF-8 slice of the serialized encrypted AES-GCM
 /// envelope. Clients must validate all declared bounds before concatenating the
 /// payloads and decrypt only after the complete envelope has been reassembled.
+/// The chunk header exists for reassembly only; request correlation uses the
+/// `request_id` inside the decrypted [`ServerFrame`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonLocalWebrtcDeliveryChunk {
     pub version: u16,
@@ -103,6 +168,452 @@ pub struct DaemonLocalWebrtcDeliveryChunk {
     pub chunk_count: u32,
     pub total_bytes: u32,
     pub payload: String,
+}
+
+/// One control frame sent by a client. Serialized as JSON with a `frame` tag.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "frame", rename_all = "snake_case")]
+pub enum ClientFrame {
+    /// First frame on a connection.
+    Hello { hello: DaemonHello },
+    /// One operator request. `request_id` is a canonical decimal `u64`,
+    /// strictly increasing for the connection lifetime.
+    Request {
+        request_id: String,
+        request: DaemonRequest,
+    },
+}
+
+/// One control frame sent by Hub. Serialized as JSON with a `frame` tag.
+///
+/// Hub may complete requests out of order. Events on one subscription stay
+/// ordered relative to each other; no other cross-frame ordering is promised.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "frame", rename_all = "snake_case")]
+pub enum ServerFrame {
+    /// Reply to [`ClientFrame::Hello`].
+    HelloAck { ack: DaemonHelloAck },
+    /// Correlated reply to one [`ClientFrame::Request`].
+    Response {
+        request_id: String,
+        response: DaemonResponse,
+    },
+    /// Unsolicited host event.
+    Event { event: DaemonEvent },
+    /// One entity subscription frame.
+    Entity { entity: DaemonEntityFrame },
+    /// Typed reason sent before Hub closes this connection, when Hub can still write.
+    Close { reason: DaemonCloseReason },
+}
+
+/// Typed reason for a Hub-initiated connection close.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum DaemonCloseReason {
+    /// The client violated the framing or correlation contract.
+    ProtocolError { code: DaemonProtocolErrorCode },
+    /// Hub is shutting down.
+    DaemonShutdown,
+}
+
+/// Protocol violations that close the offending connection.
+///
+/// Closing one connection never affects another connection's sessions or routes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonProtocolErrorCode {
+    /// A frame did not decode as its declared container.
+    MalformedFrame,
+    /// A declared frame length exceeded the request bound.
+    FrameTooLarge,
+    /// An unknown container tag.
+    UnknownContainer,
+    /// An unknown `frame` tag.
+    UnknownFrame,
+    /// A `request_id` that is not a canonical decimal `u64`.
+    InvalidRequestId,
+    /// A `request_id` that did not increase.
+    NonincreasingRequestId,
+    /// A request before or instead of Hello, or a second Hello.
+    HandshakeOrder,
+    /// A terminal container with an invalid route or generation.
+    InvalidRoute,
+    /// A terminal input body that failed the fixed header check.
+    InvalidInputHeader,
+}
+
+impl DaemonProtocolErrorCode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MalformedFrame => "malformed_frame",
+            Self::FrameTooLarge => "frame_too_large",
+            Self::UnknownContainer => "unknown_container",
+            Self::UnknownFrame => "unknown_frame",
+            Self::InvalidRequestId => "invalid_request_id",
+            Self::NonincreasingRequestId => "nonincreasing_request_id",
+            Self::HandshakeOrder => "handshake_order",
+            Self::InvalidRoute => "invalid_route",
+            Self::InvalidInputHeader => "invalid_input_header",
+        }
+    }
+}
+
+/// Encode a request id in its canonical wire form.
+#[must_use]
+pub fn encode_request_id(request_id: u64) -> String {
+    request_id.to_string()
+}
+
+/// Parse a canonical request id: 1..=20 ASCII digits, no leading zero, nonzero.
+#[must_use]
+pub fn parse_request_id(request_id: &str) -> Option<u64> {
+    let bytes = request_id.as_bytes();
+    if bytes.is_empty() || bytes.len() > MAX_REQUEST_ID_BYTES || bytes[0] == b'0' {
+        return None;
+    }
+    if !bytes.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    request_id.parse::<u64>().ok()
+}
+
+/// Strictly increasing request id source for one connection.
+#[derive(Debug, Default, Clone)]
+pub struct RequestIdSequence {
+    last: u64,
+}
+
+impl RequestIdSequence {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { last: 0 }
+    }
+
+    /// Next id. Ids start at 1 and never repeat within one connection.
+    pub fn next(&mut self) -> u64 {
+        self.last = self.last.saturating_add(1);
+        self.last
+    }
+
+    /// Last id handed out, or 0 before the first request.
+    #[must_use]
+    pub const fn last(&self) -> u64 {
+        self.last
+    }
+}
+
+/// Client-side outcome of one submitted request that did not receive a response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonRequestError {
+    /// The caller's deadline passed before the correlated response arrived.
+    DeadlineExpired,
+    /// The caller cancelled the request locally. Hub may still complete it.
+    Cancelled,
+    /// The connection closed before the correlated response arrived.
+    ConnectionClosed,
+    /// The local guard refused a 33rd outstanding request.
+    TooManyOutstandingRequests,
+}
+
+impl fmt::Display for DaemonRequestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DeadlineExpired => write!(formatter, "daemon request deadline expired"),
+            Self::Cancelled => write!(formatter, "daemon request cancelled"),
+            Self::ConnectionClosed => {
+                write!(formatter, "daemon connection closed before the response")
+            }
+            Self::TooManyOutstandingRequests => write!(
+                formatter,
+                "daemon connection already holds {MAX_OUTSTANDING_REQUESTS} outstanding requests"
+            ),
+        }
+    }
+}
+
+impl Error for DaemonRequestError {}
+
+/// One decoded terminal container. The body stays opaque to this crate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonUnixTerminalFrame {
+    /// Subscription id of the route. 1..=1024 UTF-8 bytes.
+    pub route: String,
+    /// Route generation minted by Core at attach.
+    pub generation: u64,
+    /// Hub to client: one Core terminal-stream body. Client to Hub: one Core input frame.
+    pub body: Vec<u8>,
+}
+
+/// Header of one Unix terminal container, built on the stack for `writev`.
+///
+/// Layout: `[u32 LE frame_len][u8 container = 2][u16 LE route_len][route][u64 LE generation]`.
+#[derive(Debug, Clone)]
+pub struct UnixTerminalContainerHeader {
+    bytes: [u8; UNIX_FRAME_LENGTH_PREFIX_BYTES
+        + 1
+        + UNIX_TERMINAL_CONTAINER_FIXED_BYTES
+        + MAX_UNIX_TERMINAL_ROUTE_BYTES],
+    len: usize,
+}
+
+impl UnixTerminalContainerHeader {
+    /// Build the header for a body of `body_len` bytes.
+    ///
+    /// Returns `None` when the route is empty, longer than
+    /// [`MAX_UNIX_TERMINAL_ROUTE_BYTES`], or the frame would exceed
+    /// [`MAX_UNIX_FRAME_BYTES`].
+    #[must_use]
+    pub fn new(route: &str, generation: u64, body_len: usize) -> Option<Self> {
+        let route_bytes = route.as_bytes();
+        if route_bytes.is_empty() || route_bytes.len() > MAX_UNIX_TERMINAL_ROUTE_BYTES {
+            return None;
+        }
+        let payload_len = UNIX_TERMINAL_CONTAINER_FIXED_BYTES + route_bytes.len() + body_len;
+        let frame_len = 1 + payload_len;
+        if frame_len > MAX_UNIX_FRAME_BYTES {
+            return None;
+        }
+        let mut bytes = [0u8; UNIX_FRAME_LENGTH_PREFIX_BYTES
+            + 1
+            + UNIX_TERMINAL_CONTAINER_FIXED_BYTES
+            + MAX_UNIX_TERMINAL_ROUTE_BYTES];
+        let mut cursor = 0;
+        bytes[cursor..cursor + 4].copy_from_slice(&(frame_len as u32).to_le_bytes());
+        cursor += 4;
+        bytes[cursor] = UNIX_CONTAINER_TERMINAL;
+        cursor += 1;
+        bytes[cursor..cursor + 2].copy_from_slice(&(route_bytes.len() as u16).to_le_bytes());
+        cursor += 2;
+        bytes[cursor..cursor + route_bytes.len()].copy_from_slice(route_bytes);
+        cursor += route_bytes.len();
+        bytes[cursor..cursor + 8].copy_from_slice(&generation.to_le_bytes());
+        cursor += 8;
+        Some(Self { bytes, len: cursor })
+    }
+
+    /// The encoded header bytes, ready for the first `writev` slice.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+/// Encode one complete terminal container (header plus body) into a new buffer.
+#[must_use]
+pub fn encode_unix_terminal_frame(route: &str, generation: u64, body: &[u8]) -> Option<Vec<u8>> {
+    let header = UnixTerminalContainerHeader::new(route, generation, body.len())?;
+    let mut frame = Vec::with_capacity(header.as_bytes().len() + body.len());
+    frame.extend_from_slice(header.as_bytes());
+    frame.extend_from_slice(body);
+    Some(frame)
+}
+
+/// Encode one control container carrying `frame` as UTF-8 JSON.
+pub fn encode_control_frame<T: Serialize>(frame: &T) -> DaemonTransportResult<Vec<u8>> {
+    let json = serde_json::to_vec(frame).map_err(DaemonTransportError::Json)?;
+    if json.len() > MAX_CONTROL_REQUEST_BYTES.max(MAX_CONTROL_RESPONSE_BYTES) {
+        return Err(DaemonTransportError::Protocol(
+            "control frame exceeds the protocol byte bound",
+        ));
+    }
+    let frame_len = 1 + json.len();
+    let mut bytes = Vec::with_capacity(UNIX_FRAME_LENGTH_PREFIX_BYTES + frame_len);
+    bytes.extend_from_slice(&(frame_len as u32).to_le_bytes());
+    bytes.push(UNIX_CONTAINER_CONTROL);
+    bytes.extend_from_slice(&json);
+    Ok(bytes)
+}
+
+/// Encode one [`ClientFrame`] as a control container.
+pub fn encode_client_frame(frame: &ClientFrame) -> DaemonTransportResult<Vec<u8>> {
+    encode_control_frame(frame)
+}
+
+/// Encode one [`ServerFrame`] as a control container.
+pub fn encode_server_frame(frame: &ServerFrame) -> DaemonTransportResult<Vec<u8>> {
+    encode_control_frame(frame)
+}
+
+/// Decode the payload of one Unix frame (container byte plus payload) without the length prefix.
+///
+/// `decode_control` turns a control payload into the caller's frame type so the
+/// same decoder serves Hub (expects `ClientFrame`) and clients (expect `ServerFrame`).
+pub fn decode_unix_frame<T: for<'de> Deserialize<'de>>(
+    frame: &[u8],
+) -> Result<DaemonUnixFrame<T>, DaemonProtocolErrorCode> {
+    let Some((&container, payload)) = frame.split_first() else {
+        return Err(DaemonProtocolErrorCode::MalformedFrame);
+    };
+    match container {
+        UNIX_CONTAINER_CONTROL => serde_json::from_slice(payload)
+            .map(DaemonUnixFrame::Control)
+            .map_err(|_| DaemonProtocolErrorCode::MalformedFrame),
+        UNIX_CONTAINER_TERMINAL => {
+            if payload.len() < UNIX_TERMINAL_CONTAINER_FIXED_BYTES {
+                return Err(DaemonProtocolErrorCode::MalformedFrame);
+            }
+            let route_len = usize::from(u16::from_le_bytes([payload[0], payload[1]]));
+            if route_len == 0
+                || route_len > MAX_UNIX_TERMINAL_ROUTE_BYTES
+                || payload.len() < 2 + route_len + 8
+            {
+                return Err(DaemonProtocolErrorCode::InvalidRoute);
+            }
+            let route = std::str::from_utf8(&payload[2..2 + route_len])
+                .map_err(|_| DaemonProtocolErrorCode::InvalidRoute)?;
+            if route.chars().any(char::is_control) {
+                return Err(DaemonProtocolErrorCode::InvalidRoute);
+            }
+            let generation_start = 2 + route_len;
+            let mut generation = [0u8; 8];
+            generation.copy_from_slice(&payload[generation_start..generation_start + 8]);
+            Ok(DaemonUnixFrame::Terminal(DaemonUnixTerminalFrame {
+                route: route.to_string(),
+                generation: u64::from_le_bytes(generation),
+                body: payload[generation_start + 8..].to_vec(),
+            }))
+        }
+        _ => Err(DaemonProtocolErrorCode::UnknownContainer),
+    }
+}
+
+/// One decoded Unix frame, generic over the control payload type.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DaemonUnixFrame<T> {
+    Control(T),
+    Terminal(DaemonUnixTerminalFrame),
+}
+
+/// Incremental reader for length-prefixed Unix frames.
+///
+/// A read timeout keeps the partial frame in the reader; the next call resumes.
+/// One reader belongs to one socket.
+#[derive(Debug, Default)]
+pub struct DaemonUnixFrameReader {
+    prefix: [u8; UNIX_FRAME_LENGTH_PREFIX_BYTES],
+    prefix_filled: usize,
+    frame: Vec<u8>,
+    frame_len: usize,
+    frame_filled: usize,
+}
+
+impl DaemonUnixFrameReader {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// True when a partial frame is buffered.
+    #[must_use]
+    pub fn has_partial_frame(&self) -> bool {
+        self.prefix_filled > 0 || self.frame_filled > 0
+    }
+
+    /// Read one complete raw frame (container byte plus payload).
+    ///
+    /// `max_frame_bytes` bounds the declared length; a larger declaration is a
+    /// protocol error and the caller closes the socket.
+    pub fn read_raw_frame<R: Read>(
+        &mut self,
+        reader: &mut R,
+        max_frame_bytes: usize,
+    ) -> DaemonTransportResult<Vec<u8>> {
+        while self.prefix_filled < UNIX_FRAME_LENGTH_PREFIX_BYTES {
+            let read = reader
+                .read(&mut self.prefix[self.prefix_filled..])
+                .map_err(normalize_socket_io_error)?;
+            if read == 0 {
+                return Err(if self.prefix_filled == 0 {
+                    DaemonTransportError::ClientDisconnected
+                } else {
+                    DaemonTransportError::Protocol("truncated unix frame length prefix")
+                });
+            }
+            self.prefix_filled += read;
+            if self.prefix_filled == UNIX_FRAME_LENGTH_PREFIX_BYTES {
+                if self.prefix[0] == b'{' {
+                    return Err(precompatibility_hub_error());
+                }
+                let declared = u32::from_le_bytes(self.prefix) as usize;
+                if declared == 0 || declared > max_frame_bytes {
+                    return Err(DaemonTransportError::Protocol(
+                        "unix frame length is zero or exceeds the bound",
+                    ));
+                }
+                self.frame_len = declared;
+                self.frame = vec![0u8; declared];
+                self.frame_filled = 0;
+            }
+        }
+        while self.frame_filled < self.frame_len {
+            let read = reader
+                .read(&mut self.frame[self.frame_filled..])
+                .map_err(normalize_socket_io_error)?;
+            if read == 0 {
+                return Err(DaemonTransportError::Protocol("truncated unix frame"));
+            }
+            self.frame_filled += read;
+        }
+        self.prefix_filled = 0;
+        self.frame_len = 0;
+        self.frame_filled = 0;
+        Ok(std::mem::take(&mut self.frame))
+    }
+
+    /// Read and decode one frame whose control payload is a [`ServerFrame`].
+    pub fn read_frame<R: Read>(
+        &mut self,
+        reader: &mut R,
+    ) -> DaemonTransportResult<DaemonUnixMuxFrame> {
+        let raw = self.read_raw_frame(reader, MAX_UNIX_FRAME_BYTES)?;
+        match decode_unix_frame::<ServerFrame>(&raw) {
+            Ok(DaemonUnixFrame::Control(frame)) => Ok(DaemonUnixMuxFrame::Server(frame)),
+            Ok(DaemonUnixFrame::Terminal(frame)) => Ok(DaemonUnixMuxFrame::Terminal(frame)),
+            Err(code) => Err(DaemonTransportError::ProtocolViolation(code)),
+        }
+    }
+}
+
+/// One decoded frame on a client's Unix connection.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DaemonUnixMuxFrame {
+    Server(ServerFrame),
+    Terminal(DaemonUnixTerminalFrame),
+}
+
+/// Write one [`ClientFrame`] to the socket.
+pub fn write_client_frame(
+    stream: &mut UnixStream,
+    frame: &ClientFrame,
+) -> DaemonTransportResult<()> {
+    let bytes = encode_client_frame(frame)?;
+    stream.write_all(&bytes).map_err(normalize_socket_io_error)
+}
+
+/// Write one [`ServerFrame`] to the socket.
+pub fn write_server_frame(
+    stream: &mut UnixStream,
+    frame: &ServerFrame,
+) -> DaemonTransportResult<()> {
+    let bytes = encode_server_frame(frame)?;
+    stream.write_all(&bytes).map_err(normalize_socket_io_error)
+}
+
+/// Write one terminal container (header then body) to the socket.
+pub fn write_unix_terminal_frame(
+    stream: &mut UnixStream,
+    route: &str,
+    generation: u64,
+    body: &[u8],
+) -> DaemonTransportResult<()> {
+    let header = UnixTerminalContainerHeader::new(route, generation, body.len()).ok_or(
+        DaemonTransportError::Protocol("invalid terminal route or frame size"),
+    )?;
+    stream
+        .write_all(header.as_bytes())
+        .map_err(normalize_socket_io_error)?;
+    stream.write_all(body).map_err(normalize_socket_io_error)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,9 +648,8 @@ pub fn request_with_requirement(
     request: DaemonRequest,
     requirement: &DaemonCompatibilityRequirement,
 ) -> DaemonTransportResult<DaemonResponse> {
-    let mut stream = connect_and_hello_with_requirement(endpoint, requirement)?;
-    write_frame(&mut stream, &request)?;
-    read_daemon_response(&mut stream)
+    let mut connection = DaemonConnection::connect_with_requirement(endpoint, requirement)?;
+    connection.request(&request)
 }
 
 /// Persistent daemon connection for clients that own attach subscription state.
@@ -150,13 +660,23 @@ pub fn request_with_requirement(
 /// let response = connection.request(&botster_hub_client::DaemonRequest::Status)?;
 /// # Ok::<(), botster_hub_client::DaemonTransportError>(())
 /// ```
+///
+/// Requests are correlated by `request_id`. [`Self::submit`] sends one request
+/// and returns its id; [`Self::wait_response`] blocks for that id and parks any
+/// other correlated response, event, entity frame, or terminal frame that
+/// arrives first. [`Self::request`] combines both.
 pub struct DaemonConnection {
     stream: UnixStream,
     reader: BufReader<UnixStream>,
-    skipped_terminal: Vec<DaemonUnixTerminalEnvelope>,
+    frames: DaemonUnixFrameReader,
+    ids: RequestIdSequence,
+    outstanding: Vec<u64>,
+    parked_responses: Vec<(u64, DaemonResponse)>,
+    skipped_terminal: Vec<DaemonUnixTerminalFrame>,
     skipped_events: Vec<DaemonEvent>,
+    skipped_entity_frames: Vec<DaemonEntityFrame>,
     required_features: Vec<String>,
-    incomplete_line: String,
+    closed: Option<DaemonCloseReason>,
 }
 
 impl DaemonConnection {
@@ -184,15 +704,232 @@ impl DaemonConnection {
             requirement,
             terminal_compatibility,
         )?;
+        Self::from_hello_complete_stream(stream, requirement.required_features.clone())
+    }
+
+    /// Wrap a stream whose Hello handshake already completed.
+    pub fn from_hello_complete_stream(
+        stream: UnixStream,
+        required_features: Vec<String>,
+    ) -> DaemonTransportResult<Self> {
         let reader = BufReader::new(stream.try_clone().map_err(normalize_socket_io_error)?);
         Ok(Self {
             stream,
             reader,
+            frames: DaemonUnixFrameReader::new(),
+            ids: RequestIdSequence::new(),
+            outstanding: Vec::new(),
+            parked_responses: Vec::new(),
             skipped_terminal: Vec::new(),
             skipped_events: Vec::new(),
-            required_features: requirement.required_features.clone(),
-            incomplete_line: String::new(),
+            skipped_entity_frames: Vec::new(),
+            required_features,
+            closed: None,
         })
+    }
+
+    /// Ids submitted on this connection that have no response yet.
+    #[must_use]
+    pub fn outstanding_request_ids(&self) -> &[u64] {
+        &self.outstanding
+    }
+
+    /// Typed close reason Hub sent before closing, when one arrived.
+    #[must_use]
+    pub fn close_reason(&self) -> Option<&DaemonCloseReason> {
+        self.closed.as_ref()
+    }
+
+    /// Send one request without waiting. Returns its `request_id`.
+    ///
+    /// Refuses locally when [`MAX_OUTSTANDING_REQUESTS`] ids are unanswered.
+    pub fn submit(&mut self, request: &DaemonRequest) -> DaemonTransportResult<u64> {
+        if self.outstanding.len() >= MAX_OUTSTANDING_REQUESTS {
+            return Err(DaemonTransportError::Request(
+                DaemonRequestError::TooManyOutstandingRequests,
+            ));
+        }
+        let request_id = self.ids.next();
+        write_client_frame(
+            &mut self.stream,
+            &ClientFrame::Request {
+                request_id: encode_request_id(request_id),
+                request: request.clone(),
+            },
+        )?;
+        self.outstanding.push(request_id);
+        Ok(request_id)
+    }
+
+    /// Forget a submitted id. A later response for it is discarded.
+    pub fn cancel(&mut self, request_id: u64) -> bool {
+        let before = self.outstanding.len();
+        self.outstanding.retain(|id| *id != request_id);
+        self.parked_responses.retain(|(id, _)| *id != request_id);
+        before != self.outstanding.len()
+    }
+
+    /// Block until the correlated response for `request_id` arrives.
+    pub fn wait_response(&mut self, request_id: u64) -> DaemonTransportResult<DaemonResponse> {
+        if let Some(index) = self
+            .parked_responses
+            .iter()
+            .position(|(id, _)| *id == request_id)
+        {
+            return Ok(self.parked_responses.remove(index).1);
+        }
+        if !self.outstanding.contains(&request_id) {
+            return Err(DaemonTransportError::Request(DaemonRequestError::Cancelled));
+        }
+        loop {
+            match self.read_next_frame()? {
+                DaemonUnixMuxFrame::Server(ServerFrame::Response {
+                    request_id: id,
+                    response,
+                }) => {
+                    let Some(id) = parse_request_id(&id) else {
+                        return Err(DaemonTransportError::ProtocolViolation(
+                            DaemonProtocolErrorCode::InvalidRequestId,
+                        ));
+                    };
+                    if id == request_id {
+                        return Ok(response);
+                    }
+                    if self.outstanding.contains(&id) {
+                        self.parked_responses.push((id, response));
+                    }
+                }
+                DaemonUnixMuxFrame::Server(ServerFrame::Event { event }) => {
+                    self.skipped_events.push(event);
+                }
+                DaemonUnixMuxFrame::Server(ServerFrame::Entity { entity: frame }) => {
+                    self.skipped_entity_frames.push(frame);
+                }
+                DaemonUnixMuxFrame::Server(ServerFrame::Close { reason }) => {
+                    self.closed = Some(reason.clone());
+                    return Err(DaemonTransportError::ClosedByHub(reason));
+                }
+                DaemonUnixMuxFrame::Server(ServerFrame::HelloAck { .. }) => {
+                    return Err(DaemonTransportError::Protocol(
+                        "unexpected hello ack after the handshake",
+                    ));
+                }
+                DaemonUnixMuxFrame::Terminal(frame) => self.skipped_terminal.push(frame),
+            }
+        }
+    }
+
+    /// Send one request over this persistent connection and wait for its response.
+    pub fn request(&mut self, request: &DaemonRequest) -> DaemonTransportResult<DaemonResponse> {
+        let request_id = self.submit(request)?;
+        self.wait_response(request_id)
+    }
+
+    fn read_next_frame(&mut self) -> DaemonTransportResult<DaemonUnixMuxFrame> {
+        let frame = self.frames.read_frame(&mut self.reader)?;
+        if let DaemonUnixMuxFrame::Server(ServerFrame::Response { request_id, .. }) = &frame
+            && let Some(id) = parse_request_id(request_id)
+        {
+            self.outstanding.retain(|outstanding| *outstanding != id);
+        }
+        Ok(frame)
+    }
+
+    /// Read the next frame of any kind. Parked frames are returned first.
+    ///
+    /// A `Response` frame removes its id from the outstanding set. Responses
+    /// for ids this connection never submitted are still returned; callers
+    /// discard them.
+    pub fn next_frame(&mut self) -> DaemonTransportResult<DaemonUnixMuxFrame> {
+        if let Some((id, response)) = self.parked_responses.pop() {
+            return Ok(DaemonUnixMuxFrame::Server(ServerFrame::Response {
+                request_id: encode_request_id(id),
+                response,
+            }));
+        }
+        if !self.skipped_events.is_empty() {
+            return Ok(DaemonUnixMuxFrame::Server(ServerFrame::Event {
+                event: self.skipped_events.remove(0),
+            }));
+        }
+        if !self.skipped_entity_frames.is_empty() {
+            return Ok(DaemonUnixMuxFrame::Server(ServerFrame::Entity {
+                entity: self.skipped_entity_frames.remove(0),
+            }));
+        }
+        if !self.skipped_terminal.is_empty() {
+            return Ok(DaemonUnixMuxFrame::Terminal(
+                self.skipped_terminal.remove(0),
+            ));
+        }
+        let frame = self.read_next_frame()?;
+        if let DaemonUnixMuxFrame::Server(ServerFrame::Close { reason }) = &frame {
+            self.closed = Some(reason.clone());
+        }
+        Ok(frame)
+    }
+
+    /// Read the next frame, or `None` when `timeout` elapses first.
+    ///
+    /// Restores the previous socket read timeout. A timeout keeps any partial
+    /// frame for the next read.
+    pub fn poll_frame(
+        &mut self,
+        timeout: Duration,
+    ) -> DaemonTransportResult<Option<DaemonUnixMuxFrame>> {
+        let previous = self
+            .stream
+            .read_timeout()
+            .map_err(normalize_socket_io_error)?;
+        self.set_read_timeout(Some(timeout.max(Duration::from_millis(1))))?;
+        let result = match self.next_frame() {
+            Ok(frame) => Ok(Some(frame)),
+            Err(DaemonTransportError::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        };
+        let restore = self.set_read_timeout(previous);
+        match result {
+            Ok(value) => {
+                restore?;
+                Ok(value)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Write one opaque terminal input frame for one route on this muxed connection.
+    ///
+    /// This is not a control request. Hub does not send a paired response;
+    /// results arrive on the terminal stream.
+    pub fn send_terminal_frame(
+        &mut self,
+        route: &str,
+        generation: u64,
+        body: &[u8],
+    ) -> DaemonTransportResult<()> {
+        write_unix_terminal_frame(&mut self.stream, route, generation, body)
+    }
+
+    /// Opaque terminal frames skipped while waiting for a host response.
+    pub fn take_skipped_terminal(&mut self) -> Vec<DaemonUnixTerminalFrame> {
+        std::mem::take(&mut self.skipped_terminal)
+    }
+
+    /// Host events skipped while waiting for a host response.
+    pub fn take_skipped_events(&mut self) -> Vec<DaemonEvent> {
+        std::mem::take(&mut self.skipped_events)
+    }
+
+    /// Entity frames skipped while waiting for a host response.
+    pub fn take_skipped_entity_frames(&mut self) -> Vec<DaemonEntityFrame> {
+        std::mem::take(&mut self.skipped_entity_frames)
     }
 
     /// Host Hello `required_features` from the connection handshake.
@@ -236,42 +973,6 @@ impl DaemonConnection {
         })
     }
 
-    /// Send one request over this persistent connection.
-    pub fn request(&mut self, request: &DaemonRequest) -> DaemonTransportResult<DaemonResponse> {
-        write_frame(&mut self.stream, request)?;
-        read_daemon_response_collecting(
-            &mut self.reader,
-            &mut self.incomplete_line,
-            &mut self.skipped_terminal,
-            &mut self.skipped_events,
-        )
-    }
-
-    /// Write one opaque terminal input frame on this muxed Unix connection.
-    ///
-    /// This is not a control request. Hub does not send a paired response.
-    pub fn send_terminal_frame(
-        &mut self,
-        session_id: impl Into<String>,
-        subscription_id: impl Into<String>,
-        frame_bytes: &[u8],
-    ) -> DaemonTransportResult<()> {
-        write_frame(
-            &mut self.stream,
-            &DaemonUnixTerminalEnvelope::from_frame_bytes(session_id, subscription_id, frame_bytes),
-        )
-    }
-
-    /// Opaque adapter frames skipped while waiting for a host response.
-    pub fn take_skipped_terminal(&mut self) -> Vec<DaemonUnixTerminalEnvelope> {
-        std::mem::take(&mut self.skipped_terminal)
-    }
-
-    /// Host events skipped while waiting for a host response.
-    pub fn take_skipped_events(&mut self) -> Vec<DaemonEvent> {
-        std::mem::take(&mut self.skipped_events)
-    }
-
     /// Bound how long a caller waits for the next unsolicited host event.
     pub fn set_read_timeout(&self, timeout: Option<Duration>) -> DaemonTransportResult<()> {
         self.stream
@@ -288,56 +989,88 @@ impl DaemonConnection {
             return Ok(self.skipped_events.remove(0));
         }
         loop {
-            let value = read_value_frame_from_reader(&mut self.reader, &mut self.incomplete_line)?;
-            if status_missing_compatibility(&value) {
-                return Err(precompatibility_hub_error());
-            }
-            match parse_unix_mux_value(value).map_err(DaemonTransportError::Json)? {
-                DaemonUnixMuxFrame::Event(event) => return Ok(event),
-                DaemonUnixMuxFrame::Terminal(envelope) => self.skipped_terminal.push(envelope),
-                DaemonUnixMuxFrame::Response(_) => {
+            match self.read_next_frame()? {
+                DaemonUnixMuxFrame::Server(ServerFrame::Event { event }) => return Ok(event),
+                DaemonUnixMuxFrame::Server(ServerFrame::Entity { entity: frame }) => {
+                    self.skipped_entity_frames.push(frame);
+                }
+                DaemonUnixMuxFrame::Server(ServerFrame::Response {
+                    request_id,
+                    response,
+                }) => self.park_response(&request_id, response)?,
+                DaemonUnixMuxFrame::Server(ServerFrame::Close { reason }) => {
+                    self.closed = Some(reason.clone());
+                    return Err(DaemonTransportError::ClosedByHub(reason));
+                }
+                DaemonUnixMuxFrame::Server(ServerFrame::HelloAck { .. }) => {
                     return Err(DaemonTransportError::Protocol(
-                        "unexpected control response while waiting for a host event",
+                        "unexpected hello ack after the handshake",
                     ));
                 }
+                DaemonUnixMuxFrame::Terminal(frame) => self.skipped_terminal.push(frame),
             }
         }
     }
 
-    /// Receive the next unsolicited terminal envelope without sending a control request.
+    fn park_response(
+        &mut self,
+        request_id: &str,
+        response: DaemonResponse,
+    ) -> DaemonTransportResult<()> {
+        let Some(id) = parse_request_id(request_id) else {
+            return Err(DaemonTransportError::ProtocolViolation(
+                DaemonProtocolErrorCode::InvalidRequestId,
+            ));
+        };
+        if self.outstanding.contains(&id) || self.ids.last() >= id {
+            self.parked_responses.push((id, response));
+        }
+        Ok(())
+    }
+
+    /// Receive the next unsolicited terminal frame without sending a control request.
     ///
-    /// Returns envelopes already skipped while waiting for a response first. Does
+    /// Returns frames already skipped while waiting for a response first. Does
     /// not write to the socket.
-    pub fn next_terminal(&mut self) -> DaemonTransportResult<DaemonUnixTerminalEnvelope> {
+    pub fn next_terminal(&mut self) -> DaemonTransportResult<DaemonUnixTerminalFrame> {
         if !self.skipped_terminal.is_empty() {
             return Ok(self.skipped_terminal.remove(0));
         }
         loop {
-            let value = read_value_frame_from_reader(&mut self.reader, &mut self.incomplete_line)?;
-            if status_missing_compatibility(&value) {
-                return Err(precompatibility_hub_error());
-            }
-            match parse_unix_mux_value(value).map_err(DaemonTransportError::Json)? {
-                DaemonUnixMuxFrame::Terminal(envelope) => return Ok(envelope),
-                DaemonUnixMuxFrame::Event(event) => self.skipped_events.push(event),
-                DaemonUnixMuxFrame::Response(_) => {
+            match self.read_next_frame()? {
+                DaemonUnixMuxFrame::Terminal(frame) => return Ok(frame),
+                DaemonUnixMuxFrame::Server(ServerFrame::Event { event }) => {
+                    self.skipped_events.push(event);
+                }
+                DaemonUnixMuxFrame::Server(ServerFrame::Entity { entity: frame }) => {
+                    self.skipped_entity_frames.push(frame);
+                }
+                DaemonUnixMuxFrame::Server(ServerFrame::Response {
+                    request_id,
+                    response,
+                }) => self.park_response(&request_id, response)?,
+                DaemonUnixMuxFrame::Server(ServerFrame::Close { reason }) => {
+                    self.closed = Some(reason.clone());
+                    return Err(DaemonTransportError::ClosedByHub(reason));
+                }
+                DaemonUnixMuxFrame::Server(ServerFrame::HelloAck { .. }) => {
                     return Err(DaemonTransportError::Protocol(
-                        "unexpected control response while waiting for a terminal envelope",
+                        "unexpected hello ack after the handshake",
                     ));
                 }
             }
         }
     }
 
-    /// Receive the next unsolicited terminal envelope, or `None` when `timeout` elapses.
+    /// Receive the next unsolicited terminal frame, or `None` when `timeout` elapses.
     ///
     /// Does not write a control request. Restores the previous socket read timeout.
     /// `timeout` is an absolute deadline: skipped host events do not restart it.
-    /// A timeout keeps any partial mux line for the next read.
+    /// A timeout keeps any partial frame for the next read.
     pub fn poll_terminal(
         &mut self,
         timeout: Duration,
-    ) -> DaemonTransportResult<Option<DaemonUnixTerminalEnvelope>> {
+    ) -> DaemonTransportResult<Option<DaemonUnixTerminalFrame>> {
         if !self.skipped_terminal.is_empty() {
             return Ok(Some(self.skipped_terminal.remove(0)));
         }
@@ -354,23 +1087,30 @@ impl DaemonConnection {
             if let Err(error) = self.set_read_timeout(Some(remaining)) {
                 break Err(error);
             }
-            match read_value_frame_from_reader(&mut self.reader, &mut self.incomplete_line) {
-                Ok(value) => {
-                    if status_missing_compatibility(&value) {
-                        break Err(precompatibility_hub_error());
+            match self.read_next_frame() {
+                Ok(DaemonUnixMuxFrame::Terminal(frame)) => break Ok(Some(frame)),
+                Ok(DaemonUnixMuxFrame::Server(ServerFrame::Event { event })) => {
+                    self.skipped_events.push(event);
+                }
+                Ok(DaemonUnixMuxFrame::Server(ServerFrame::Entity { entity: frame })) => {
+                    self.skipped_entity_frames.push(frame);
+                }
+                Ok(DaemonUnixMuxFrame::Server(ServerFrame::Response {
+                    request_id,
+                    response,
+                })) => {
+                    if let Err(error) = self.park_response(&request_id, response) {
+                        break Err(error);
                     }
-                    match parse_unix_mux_value(value).map_err(DaemonTransportError::Json) {
-                        Ok(DaemonUnixMuxFrame::Terminal(envelope)) => break Ok(Some(envelope)),
-                        Ok(DaemonUnixMuxFrame::Event(event)) => {
-                            self.skipped_events.push(event);
-                        }
-                        Ok(DaemonUnixMuxFrame::Response(_)) => {
-                            break Err(DaemonTransportError::Protocol(
-                                "unexpected control response while waiting for a terminal envelope",
-                            ));
-                        }
-                        Err(error) => break Err(error),
-                    }
+                }
+                Ok(DaemonUnixMuxFrame::Server(ServerFrame::Close { reason })) => {
+                    self.closed = Some(reason.clone());
+                    break Err(DaemonTransportError::ClosedByHub(reason));
+                }
+                Ok(DaemonUnixMuxFrame::Server(ServerFrame::HelloAck { .. })) => {
+                    break Err(DaemonTransportError::Protocol(
+                        "unexpected hello ack after the handshake",
+                    ));
                 }
                 Err(DaemonTransportError::Io(error))
                     if matches!(
@@ -396,49 +1136,44 @@ impl DaemonConnection {
 
 /// One held-open, connection-scoped session entity subscription.
 pub struct DaemonEntitySubscription {
-    stream: UnixStream,
-    reader: BufReader<UnixStream>,
+    connection: DaemonConnection,
     subscription_id: String,
-    incomplete_line: String,
 }
 
 impl DaemonEntitySubscription {
     /// Bound how long a caller waits for the next pushed frame.
     pub fn set_read_timeout(&self, timeout: Option<Duration>) -> DaemonTransportResult<()> {
-        self.stream
-            .set_read_timeout(timeout)
-            .map_err(normalize_socket_io_error)
+        self.connection.set_read_timeout(timeout)
     }
 
     /// Read the next authoritative snapshot or ordered entity delta.
     pub fn next_frame(&mut self) -> DaemonTransportResult<DaemonEntityFrame> {
-        read_frame_from_reader(&mut self.reader, &mut self.incomplete_line)
+        loop {
+            match self.connection.next_frame()? {
+                DaemonUnixMuxFrame::Server(ServerFrame::Entity { entity: frame }) => {
+                    return Ok(frame);
+                }
+                DaemonUnixMuxFrame::Server(ServerFrame::Close { reason }) => {
+                    return Err(DaemonTransportError::ClosedByHub(reason));
+                }
+                DaemonUnixMuxFrame::Server(_) | DaemonUnixMuxFrame::Terminal(_) => {}
+            }
+        }
     }
 
     /// Explicitly end this connection-owned subscription.
     pub fn unsubscribe(mut self) -> DaemonTransportResult<()> {
-        write_frame(
-            &mut self.stream,
-            &DaemonRequest::UnsubscribeEntities {
+        let response = self
+            .connection
+            .request(&DaemonRequest::UnsubscribeEntities {
                 subscription_id: self.subscription_id.clone(),
-            },
-        )?;
-        loop {
-            let value = read_value_frame_from_reader(&mut self.reader, &mut self.incomplete_line)?;
-            if value.get("kind").is_none() {
-                let _: DaemonEntityFrame =
-                    serde_json::from_value(value).map_err(DaemonTransportError::Json)?;
-                continue;
-            }
-            let response: DaemonResponse =
-                serde_json::from_value(value).map_err(DaemonTransportError::Json)?;
-            if response.kind != DaemonResponseKind::EntityUnsubscribed {
-                return Err(DaemonTransportError::Protocol(
-                    "unexpected entity unsubscribe response",
-                ));
-            }
-            return Ok(());
+            })?;
+        if response.kind != DaemonResponseKind::EntityUnsubscribed {
+            return Err(DaemonTransportError::Protocol(
+                "unexpected entity unsubscribe response",
+            ));
         }
+        Ok(())
     }
 }
 
@@ -458,26 +1193,19 @@ pub fn subscribe_entities(
 ) -> DaemonTransportResult<DaemonEntitySubscription> {
     let entity_type = entity_type.into();
     let subscription_id = subscription_id.into();
-    let mut stream = connect_and_hello(endpoint)?;
-    let mut reader = BufReader::new(stream.try_clone().map_err(normalize_socket_io_error)?);
-    write_frame(
-        &mut stream,
-        &DaemonRequest::SubscribeEntities {
-            entity_type,
-            subscription_id: subscription_id.clone(),
-        },
-    )?;
-    let response = read_daemon_response_from_reader(&mut reader)?;
+    let mut connection = DaemonConnection::connect(endpoint)?;
+    let response = connection.request(&DaemonRequest::SubscribeEntities {
+        entity_type,
+        subscription_id: subscription_id.clone(),
+    })?;
     if response.kind != DaemonResponseKind::EntitySubscribed {
         return Err(DaemonTransportError::Protocol(
             "entity subscription was not accepted",
         ));
     }
     Ok(DaemonEntitySubscription {
-        stream,
-        reader,
+        connection,
         subscription_id,
-        incomplete_line: String::new(),
     })
 }
 
@@ -488,48 +1216,40 @@ pub fn stream_attach(
     subscription_id: &str,
     output: &mut impl Write,
 ) -> DaemonTransportResult<()> {
-    let mut stream = connect_and_hello(endpoint)?;
-    let result = stream_attach_connected(&mut stream, session_id, subscription_id, output);
-    detach_stream_subscription(&mut stream, session_id, subscription_id);
+    let mut connection = DaemonConnection::connect(endpoint)?;
+    let result = stream_attach_connected(&mut connection, session_id, subscription_id, output);
+    detach_stream_subscription(&mut connection, session_id, subscription_id);
     result
 }
 
 fn stream_attach_connected(
-    stream: &mut UnixStream,
+    connection: &mut DaemonConnection,
     session_id: &str,
     subscription_id: &str,
     output: &mut impl Write,
 ) -> DaemonTransportResult<()> {
-    let mut reader = BufReader::new(stream.try_clone().map_err(normalize_socket_io_error)?);
-    write_frame(
-        stream,
-        &DaemonRequest::Attach {
-            session_id: session_id.to_string(),
-            subscription_id: subscription_id.to_string(),
-        },
-    )?;
-    let response = read_daemon_response_from_reader(&mut reader)?;
+    let response = connection.request(&DaemonRequest::Attach {
+        session_id: session_id.to_string(),
+        subscription_id: subscription_id.to_string(),
+    })?;
     if response.kind == DaemonResponseKind::OperatorError {
         return Err(DaemonTransportError::Protocol(
             "attach failed before adapter bind",
         ));
     }
-    let _ = write_read_screen(&mut reader, stream, session_id, output)?;
+    let _ = write_read_screen(connection, session_id, output)?;
     Ok(())
 }
 
-fn detach_stream_subscription(stream: &mut UnixStream, session_id: &str, subscription_id: &str) {
-    if write_frame(
-        stream,
-        &DaemonRequest::Detach {
-            session_id: session_id.to_string(),
-            subscription_id: subscription_id.to_string(),
-        },
-    )
-    .is_ok()
-    {
-        let _ = read_frame::<DaemonResponse>(stream);
-    }
+fn detach_stream_subscription(
+    connection: &mut DaemonConnection,
+    session_id: &str,
+    subscription_id: &str,
+) {
+    let _ = connection.request(&DaemonRequest::Detach {
+        session_id: session_id.to_string(),
+        subscription_id: subscription_id.to_string(),
+    });
 }
 
 /// Connect to the daemon with the current first-party compatibility requirement.
@@ -554,32 +1274,7 @@ pub fn connect_and_hello_with_requirement(
     endpoint: &DaemonEndpoint,
     requirement: &DaemonCompatibilityRequirement,
 ) -> DaemonTransportResult<UnixStream> {
-    let mut stream = UnixStream::connect(&endpoint.socket_path).map_err(|error| {
-        if matches!(
-            error.kind(),
-            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-        ) {
-            DaemonTransportError::NotRunning
-        } else {
-            normalize_socket_io_error(error)
-        }
-    })?;
-    write_frame(
-        &mut stream,
-        &DaemonHello {
-            protocol: PROTOCOL.to_string(),
-            compatibility: requirement.clone(),
-            terminal_compatibility: None,
-        },
-    )?;
-    let ack = read_hello_ack(&mut stream)?;
-    if ack.protocol != PROTOCOL {
-        return Err(DaemonTransportError::Protocol(
-            "unexpected hello ack protocol",
-        ));
-    }
-    ensure_compatible(requirement, &ack.compatibility)
-        .map_err(DaemonTransportError::Compatibility)?;
+    let (stream, _ack) = connect_and_hello_with_terminal_requirement(endpoint, requirement, None)?;
     Ok(stream)
 }
 
@@ -603,12 +1298,14 @@ pub fn connect_and_hello_with_terminal_requirement(
             normalize_socket_io_error(error)
         }
     })?;
-    write_frame(
+    write_client_frame(
         &mut stream,
-        &DaemonHello {
-            protocol: PROTOCOL.to_string(),
-            compatibility: requirement.clone(),
-            terminal_compatibility: terminal_compatibility.cloned(),
+        &ClientFrame::Hello {
+            hello: DaemonHello {
+                protocol: PROTOCOL.to_string(),
+                compatibility: requirement.clone(),
+                terminal_compatibility: terminal_compatibility.cloned(),
+            },
         },
     )?;
     let ack = read_hello_ack(&mut stream)?;
@@ -622,103 +1319,17 @@ pub fn connect_and_hello_with_terminal_requirement(
     Ok((stream, ack))
 }
 
-pub fn write_frame<T: Serialize>(stream: &mut UnixStream, frame: &T) -> DaemonTransportResult<()> {
-    let bytes = serde_json::to_vec(frame).map_err(DaemonTransportError::Json)?;
-    stream
-        .write_all(&bytes)
-        .map_err(normalize_socket_io_error)?;
-    stream.write_all(b"\n").map_err(normalize_socket_io_error)
-}
-
-pub fn read_frame<T: for<'de> Deserialize<'de>>(
-    stream: &mut UnixStream,
-) -> DaemonTransportResult<T> {
-    let mut reader = BufReader::new(stream.try_clone().map_err(normalize_socket_io_error)?);
-    let mut incomplete = String::new();
-    read_frame_from_reader(&mut reader, &mut incomplete)
-}
-
-pub fn read_frame_from_reader<T: for<'de> Deserialize<'de>>(
-    reader: &mut BufReader<UnixStream>,
-    incomplete: &mut String,
-) -> DaemonTransportResult<T> {
-    let line = read_frame_line(reader, incomplete)?;
-    serde_json::from_str(&line).map_err(DaemonTransportError::Json)
-}
-
-fn read_frame_line(
-    reader: &mut BufReader<UnixStream>,
-    incomplete: &mut String,
-) -> DaemonTransportResult<String> {
-    match reader.read_line(incomplete) {
-        Ok(0) if incomplete.is_empty() => Err(DaemonTransportError::ClientDisconnected),
-        Ok(0) => Err(DaemonTransportError::Protocol("truncated mux line")),
-        Ok(_) if incomplete.ends_with('\n') => Ok(std::mem::take(incomplete)),
-        Ok(_) => Err(DaemonTransportError::Protocol("truncated mux line")),
-        Err(error) => Err(normalize_socket_io_error(error)),
-    }
-}
-
-fn read_value_frame_from_reader(
-    reader: &mut BufReader<UnixStream>,
-    incomplete: &mut String,
-) -> DaemonTransportResult<Value> {
-    let line = read_frame_line(reader, incomplete)?;
-    serde_json::from_str(&line).map_err(DaemonTransportError::Json)
-}
-
-/// Read one muxed Unix line: a control response or an opaque terminal envelope.
-///
-/// `incomplete` must outlive every timed-out read on `reader`. A timeout keeps
-/// any partial newline-delimited JSON line in that buffer.
-pub fn read_unix_mux_frame_from_reader(
-    reader: &mut BufReader<UnixStream>,
-    incomplete: &mut String,
-) -> DaemonTransportResult<DaemonUnixMuxFrame> {
-    let value = read_value_frame_from_reader(reader, incomplete)?;
-    parse_unix_mux_value(value).map_err(DaemonTransportError::Json)
-}
-
+/// Read the Hello ack directly from the stream, without buffering past it.
 fn read_hello_ack(stream: &mut UnixStream) -> DaemonTransportResult<DaemonHelloAck> {
-    let mut reader = BufReader::new(stream.try_clone().map_err(normalize_socket_io_error)?);
-    let mut incomplete = String::new();
-    let value = read_value_frame_from_reader(&mut reader, &mut incomplete)?;
-    if hello_ack_missing_compatibility(&value) {
-        return Err(precompatibility_hub_error());
-    }
-    serde_json::from_value(value).map_err(DaemonTransportError::Json)
-}
-
-fn read_daemon_response(stream: &mut UnixStream) -> DaemonTransportResult<DaemonResponse> {
-    let mut reader = BufReader::new(stream.try_clone().map_err(normalize_socket_io_error)?);
-    read_daemon_response_from_reader(&mut reader)
-}
-
-fn read_daemon_response_from_reader(
-    reader: &mut BufReader<UnixStream>,
-) -> DaemonTransportResult<DaemonResponse> {
-    let mut terminals = Vec::new();
-    let mut events = Vec::new();
-    let mut incomplete = String::new();
-    read_daemon_response_collecting(reader, &mut incomplete, &mut terminals, &mut events)
-}
-
-fn read_daemon_response_collecting(
-    reader: &mut BufReader<UnixStream>,
-    incomplete: &mut String,
-    terminals: &mut Vec<DaemonUnixTerminalEnvelope>,
-    events: &mut Vec<DaemonEvent>,
-) -> DaemonTransportResult<DaemonResponse> {
-    loop {
-        let value = read_value_frame_from_reader(reader, incomplete)?;
-        if status_missing_compatibility(&value) {
-            return Err(precompatibility_hub_error());
+    let mut frames = DaemonUnixFrameReader::new();
+    match frames.read_frame(stream)? {
+        DaemonUnixMuxFrame::Server(ServerFrame::HelloAck { ack }) => Ok(ack),
+        DaemonUnixMuxFrame::Server(ServerFrame::Close { reason }) => {
+            Err(DaemonTransportError::ClosedByHub(reason))
         }
-        match parse_unix_mux_value(value).map_err(DaemonTransportError::Json)? {
-            DaemonUnixMuxFrame::Response(response) => return Ok(*response),
-            DaemonUnixMuxFrame::Terminal(envelope) => terminals.push(envelope),
-            DaemonUnixMuxFrame::Event(event) => events.push(event),
-        }
+        DaemonUnixMuxFrame::Server(_) | DaemonUnixMuxFrame::Terminal(_) => Err(
+            DaemonTransportError::Protocol("expected a hello ack as the first server frame"),
+        ),
     }
 }
 
@@ -735,62 +1346,27 @@ fn normalize_socket_io_error(error: std::io::Error) -> DaemonTransportError {
     }
 }
 
-fn hello_ack_missing_compatibility(value: &Value) -> bool {
-    value.as_object().is_some_and(|object| {
-        object.contains_key("protocol") && !object.contains_key("compatibility")
-    })
-}
-
-fn status_missing_compatibility(value: &Value) -> bool {
-    value
-        .get("status")
-        .and_then(Value::as_object)
-        .is_some_and(|status| !status.contains_key("compatibility"))
-}
-
 fn precompatibility_hub_error() -> DaemonTransportError {
     DaemonTransportError::Compatibility(DaemonCompatibilityError {
-        diagnostic: "hub predates compatibility handshake".to_string(),
+        diagnostic: "hub predates host-control protocol 9 framing".to_string(),
         diagnostics: vec![DaemonDiagnostic::compatibility_mismatch(
-            "hub predates compatibility handshake",
+            "hub predates host-control protocol 9 framing",
         )],
     })
 }
 
-#[cfg(test)]
-fn write_terminal_events(
-    events: &[DaemonEvent],
-    output: &mut impl Write,
-) -> DaemonTransportResult<()> {
-    for event in events {
-        if let DaemonEvent::TerminalOutput { payload, .. } = event {
-            let data = payload
-                .decoded_bytes()
-                .map_err(|error| DaemonTransportError::Io(std::io::Error::other(error)))?;
-            output.write_all(&data).map_err(DaemonTransportError::Io)?;
-            output.flush().map_err(DaemonTransportError::Io)?;
-        }
-    }
-    Ok(())
-}
-
 fn write_read_screen(
-    reader: &mut BufReader<UnixStream>,
-    stream: &mut UnixStream,
+    connection: &mut DaemonConnection,
     session_id: &str,
     output: &mut impl Write,
 ) -> DaemonTransportResult<bool> {
-    write_frame(
-        stream,
-        &DaemonRequest::ReadScreen {
-            session_id: session_id.to_string(),
-        },
-    )?;
-    let response = read_daemon_response_from_reader(reader)?;
+    let response = connection.request(&DaemonRequest::ReadScreen {
+        session_id: session_id.to_string(),
+    })?;
     let Some(screen) = response.read_screen else {
         return Ok(false);
     };
-    if screen.text.trim().is_empty() {
+    if screen.unavailable.is_some() || screen.text.trim().is_empty() {
         return Ok(false);
     }
     output
@@ -1207,8 +1783,15 @@ pub enum DaemonRequest {
     ReadModeFlags {
         session_id: String,
     },
+    /// Open a paged GHOSTSNP capture. The response describes pages; no bytes travel here.
     CaptureSnapshot {
         session_id: String,
+    },
+    /// Read one page of an open capture. At most [`SNAPSHOT_PAGE_BYTES`] per response.
+    ReadSnapshotPage {
+        session_id: String,
+        capture_id: String,
+        page: u32,
     },
     ListSessionTypes,
     ListSessionTypesForTarget {
@@ -1440,11 +2023,15 @@ pub struct DaemonResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode_flags: Option<DaemonModeFlags>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_attach: Option<DaemonTerminalAttach>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_reservation: Option<DaemonTerminalReservation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription_reservation: Option<DaemonSubscriptionReservation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_snapshot: Option<DaemonCaptureSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_page: Option<DaemonSnapshotPage>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spawn_targets: Vec<DaemonSpawnTarget>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1532,8 +2119,10 @@ pub enum DaemonResponseKind {
     SessionContext,
     ReadScreen,
     ReadModeFlags,
+    TerminalAttached,
     TerminalReservation,
     CaptureSnapshot,
+    SnapshotPage,
     SpawnTargets,
     SpawnTargetValidation,
     Worktrees,
@@ -1563,16 +2152,49 @@ pub enum DaemonResponseKind {
     Shutdown,
 }
 
+/// Why a readback has no terminal history to return.
+///
+/// The session's registry exit record and exit code stay readable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryUnavailableReason {
+    /// Retained ended history was evicted by the retention policy.
+    Evicted,
+    /// Hub restarted after the session ended; retained history is Core RAM only.
+    Restart,
+    /// The final state exceeded the per-object retention cap and was not stored.
+    Oversize,
+    /// The worker snapshot export or capture failed.
+    CaptureFailed,
+}
+
+impl HistoryUnavailableReason {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Evicted => "evicted",
+            Self::Restart => "restart",
+            Self::Oversize => "oversize",
+            Self::CaptureFailed => "capture_failed",
+        }
+    }
+}
+
+/// Backend-neutral restored screen text. Fits one response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonReadScreen {
     pub session_id: String,
+    /// Empty when `unavailable` is set.
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable: Option<HistoryUnavailableReason>,
 }
 
-/// Authoritative terminal mode flags plus mode-freshness token for gated input.
+/// Authoritative terminal mode flags and geometry for one session.
 ///
-/// Marked non-exhaustive so additive mode fields remain source-compatible for
-/// external Rust consumers that construct this DTO.
+/// Live mode changes travel on the terminal stream (Core `MODES`); this is the
+/// host readback. Marked non-exhaustive so additive mode fields remain
+/// source-compatible for external Rust consumers that construct this DTO.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct DaemonModeFlags {
@@ -1584,10 +2206,10 @@ pub struct DaemonModeFlags {
     pub alt_screen: bool,
     pub focus_reporting: bool,
     pub application_cursor: bool,
-    /// Worker/session mode-owner epoch. Changes only on new worker ownership.
-    pub mode_generation: u64,
-    /// Monotonic complete-mode counter within [`Self::mode_generation`].
-    pub mode_revision: u64,
+    pub rows: u16,
+    pub cols: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable: Option<HistoryUnavailableReason>,
 }
 
 impl DaemonModeFlags {
@@ -1606,8 +2228,9 @@ impl DaemonModeFlags {
         alt_screen: bool,
         focus_reporting: bool,
         application_cursor: bool,
-        mode_generation: u64,
-        mode_revision: u64,
+        rows: u16,
+        cols: u16,
+        unavailable: Option<HistoryUnavailableReason>,
     ) -> Self {
         Self {
             session_id: session_id.into(),
@@ -1618,8 +2241,38 @@ impl DaemonModeFlags {
             alt_screen,
             focus_reporting,
             application_cursor,
-            mode_generation,
-            mode_revision,
+            rows,
+            cols,
+            unavailable,
+        }
+    }
+}
+
+/// One admitted Unix terminal route, returned by `Attach` on a muxed Unix connection.
+///
+/// The client sends `generation` in every terminal input container for this
+/// route and adopts a higher generation only from `ATTACH_STATE` or
+/// `ROUTE_RESYNC` frames on the stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct DaemonTerminalAttach {
+    pub session_id: String,
+    pub subscription_id: String,
+    /// Core-minted route generation at attach.
+    pub generation: u64,
+}
+
+impl DaemonTerminalAttach {
+    #[must_use]
+    pub fn new(
+        session_id: impl Into<String>,
+        subscription_id: impl Into<String>,
+        generation: u64,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            subscription_id: subscription_id.into(),
+            generation,
         }
     }
 }
@@ -1705,14 +2358,32 @@ impl DaemonTerminalReservation {
     }
 }
 
+/// One open paged snapshot capture.
+///
+/// A capture lives [`SNAPSHOT_CAPTURE_TTL_SECONDS`] or until the connection
+/// closes; at most [`MAX_OPEN_CAPTURES_PER_CONNECTION`] are open per connection.
+/// When `unavailable` is set, `capture_id` is empty and `pages` is zero.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonCaptureSnapshot {
     pub session_id: String,
+    pub capture_id: String,
+    pub total_bytes: u64,
+    pub page_bytes: u32,
+    pub pages: u32,
     pub rows: u16,
     pub cols: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub payload_format: Option<String>,
-    pub payload_bytes: usize,
+    pub unavailable: Option<HistoryUnavailableReason>,
+}
+
+/// One page of an open capture. Opaque GHOSTSNP bytes; must not be rendered as text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonSnapshotPage {
+    pub session_id: String,
+    pub capture_id: String,
+    pub page: u32,
+    #[serde(flatten)]
+    pub payload: DaemonOpaqueHistoryPayload,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2470,8 +3141,22 @@ pub struct DaemonStatus {
     /// Bounded event-plane and owner-loop observations. Omitted when empty.
     #[serde(default, skip_serializing_if = "DaemonObservabilityCounters::is_empty")]
     pub observability: DaemonObservabilityCounters,
+    /// Retained ended-session history policy and accounting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<DaemonRetentionAccounting>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<DaemonDiagnostic>,
+}
+
+/// Retained ended-session history: configured policy and current accounting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonRetentionAccounting {
+    pub max_object_bytes: u64,
+    pub max_total_bytes: u64,
+    pub max_sessions: u32,
+    pub total_bytes: u64,
+    pub sessions: u32,
+    pub evictions: u64,
 }
 
 /// One live attach occupancy row visible to a sibling Unix client.
@@ -3086,70 +3771,6 @@ impl<'de> Deserialize<'de> for DaemonOpaqueHistoryPayload {
     }
 }
 
-/// Validated live PTY output serialized as flat daemon event fields.
-///
-/// Field names match Snapshot/Scrollback so generated clients share one envelope,
-/// but these bytes are renderable terminal output and must be concatenated without
-/// UTF-8 repair. Do not reuse [`DaemonOpaqueHistoryPayload`] here: that type is
-/// opaque engine state that must not be rendered.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct DaemonLiveOutputPayload {
-    pub payload_base64: String,
-    pub payload_encoding: DaemonHistoryEncoding,
-    pub bytes: usize,
-}
-
-#[derive(Deserialize)]
-struct UncheckedDaemonLiveOutputPayload {
-    payload_base64: String,
-    payload_encoding: DaemonHistoryEncoding,
-    bytes: usize,
-    #[serde(flatten)]
-    extra: BTreeMap<String, Value>,
-}
-
-impl DaemonLiveOutputPayload {
-    #[must_use]
-    pub fn from_bytes(payload: &[u8]) -> Self {
-        Self {
-            payload_base64: base64::engine::general_purpose::STANDARD.encode(payload),
-            payload_encoding: DaemonHistoryEncoding::Base64,
-            bytes: payload.len(),
-        }
-    }
-
-    /// Decode the live output bytes after validating their declared length.
-    pub fn decoded_bytes(&self) -> Result<Vec<u8>, String> {
-        decode_validated_base64_payload(&self.payload_base64, self.bytes, "live output")
-    }
-}
-
-impl TryFrom<UncheckedDaemonLiveOutputPayload> for DaemonLiveOutputPayload {
-    type Error = String;
-
-    fn try_from(payload: UncheckedDaemonLiveOutputPayload) -> Result<Self, Self::Error> {
-        if payload.extra.contains_key("data") {
-            return Err("legacy terminal_output data field is rejected".to_string());
-        }
-        decode_validated_base64_payload(&payload.payload_base64, payload.bytes, "live output")?;
-        Ok(Self {
-            payload_base64: payload.payload_base64,
-            payload_encoding: payload.payload_encoding,
-            bytes: payload.bytes,
-        })
-    }
-}
-
-impl<'de> Deserialize<'de> for DaemonLiveOutputPayload {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let payload = UncheckedDaemonLiveOutputPayload::deserialize(deserializer)?;
-        Self::try_from(payload).map_err(serde::de::Error::custom)
-    }
-}
-
 fn decode_validated_base64_payload(
     payload_base64: &str,
     bytes: usize,
@@ -3167,78 +3788,16 @@ fn decode_validated_base64_payload(
     Ok(payload)
 }
 
-/// Host events and decoded terminal observations.
+/// Unsolicited host events.
 ///
-/// `Snapshot` and `Scrollback` carry opaque binary engine state for a terminal
-/// subscription. Their payloads are not terminal text and must not be rendered.
-/// Clients use `ReadScreen` for backend-neutral restored text, then append later
-/// `TerminalOutput` for the same subscription.
-///
-/// ```
-/// let snapshot = botster_hub_client::DaemonEvent::Snapshot {
-///     session_id: "session".to_string(),
-///     subscription_id: "subscription".to_string(),
-///     history: botster_hub_client::DaemonOpaqueHistoryPayload::from_bytes(
-///         &[0, 255, 71, 84, 89, 1],
-///     ),
-/// };
-///
-/// let live = botster_hub_client::DaemonEvent::TerminalOutput {
-///     session_id: "session".to_string(),
-///     subscription_id: "subscription".to_string(),
-///     payload: botster_hub_client::DaemonLiveOutputPayload::from_bytes(b"live output\r\n"),
-/// };
-///
-/// let events = vec![snapshot, live];
-/// assert!(matches!(events[0], botster_hub_client::DaemonEvent::Snapshot { .. }));
-/// assert!(matches!(events[1], botster_hub_client::DaemonEvent::TerminalOutput { .. }));
-/// ```
+/// Terminal output, snapshots, attach state, input results, mode changes, and
+/// process exit never appear here. They travel only on the terminal stream as
+/// Core scheme 2 bodies inside terminal containers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonEvent {
     SessionLifecycle {
         session_id: String,
-        state: String,
-    },
-    /// Live PTY bytes for a subscription.
-    ///
-    /// `payload` serializes to validated base64 fields. Clients concatenate the
-    /// decoded bytes without UTF-8 repair. Legacy `{ "data": "..." }` JSON is
-    /// rejected.
-    TerminalOutput {
-        session_id: String,
-        subscription_id: String,
-        #[serde(flatten)]
-        payload: DaemonLiveOutputPayload,
-    },
-    /// Initial opaque engine state for a subscription.
-    ///
-    /// `history` serializes to validated base64 fields and must not be rendered.
-    /// Clients use `ReadScreen` when they need backend-neutral restored text.
-    Snapshot {
-        session_id: String,
-        subscription_id: String,
-        #[serde(flatten)]
-        history: DaemonOpaqueHistoryPayload,
-    },
-    /// Additional opaque engine state for a subscription.
-    ///
-    /// Semantics match `Snapshot`; only `TerminalOutput` and `ReadScreen.text`
-    /// are renderable terminal text.
-    Scrollback {
-        session_id: String,
-        subscription_id: String,
-        #[serde(flatten)]
-        history: DaemonOpaqueHistoryPayload,
-    },
-    ProcessExit {
-        session_id: String,
-        subscription_id: String,
-        code: Option<i32>,
-    },
-    AttachState {
-        session_id: String,
-        subscription_id: String,
         state: String,
     },
     RuntimeObservation {
@@ -3272,77 +3831,80 @@ pub enum DaemonEvent {
     },
 }
 
-impl DaemonEvent {
+/// Header of one binary local WebRTC terminal chunk. See
+/// [`LOCAL_WEBRTC_TERMINAL_CHUNK_HEADER_BYTES`] for the byte layout.
+///
+/// The route is the subscription DataChannel label. Both directions use this
+/// header: Hub to client carries slices of one Core terminal-stream body;
+/// client to Hub carries slices of one Core terminal input frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalWebrtcTerminalChunkHeader {
+    /// Per-channel, per-direction message counter. Strictly increasing.
+    pub message_id: u64,
+    pub chunk_index: u32,
+    pub chunk_count: u32,
+    /// Plaintext body length of the whole message.
+    pub total_bytes: u32,
+    /// Route generation. A chunk whose generation differs from the bound route is discarded.
+    pub generation: u64,
+}
+
+impl LocalWebrtcTerminalChunkHeader {
+    /// Write the header into the first [`LOCAL_WEBRTC_TERMINAL_CHUNK_HEADER_BYTES`] of `out`.
     #[must_use]
-    pub fn is_process_exit(&self) -> bool {
-        matches!(self, Self::ProcessExit { .. })
+    pub fn encode(&self) -> [u8; LOCAL_WEBRTC_TERMINAL_CHUNK_HEADER_BYTES] {
+        let mut bytes = [0u8; LOCAL_WEBRTC_TERMINAL_CHUNK_HEADER_BYTES];
+        bytes[0] = LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION as u8;
+        bytes[1..9].copy_from_slice(&self.message_id.to_le_bytes());
+        bytes[9..13].copy_from_slice(&self.chunk_index.to_le_bytes());
+        bytes[13..17].copy_from_slice(&self.chunk_count.to_le_bytes());
+        bytes[17..21].copy_from_slice(&self.total_bytes.to_le_bytes());
+        bytes[21..29].copy_from_slice(&self.generation.to_le_bytes());
+        bytes
     }
-}
 
-/// Content-blind Unix adapter envelope. Plane and kind are tags only.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct DaemonUnixTerminalEnvelope {
-    pub plane: String,
-    pub kind: String,
-    pub session_id: String,
-    pub subscription_id: String,
-    pub payload_base64: String,
-}
-
-impl DaemonUnixTerminalEnvelope {
-    /// Wrap opaque terminal-frame bytes. Does not inspect the payload.
+    /// Split one DataChannel message into its header and sealed slice.
+    ///
+    /// Returns `None` when the version is wrong, the message is shorter than
+    /// the header plus nonce plus tag, or the declared counts are inconsistent.
     #[must_use]
-    pub fn from_frame_bytes(
-        session_id: impl Into<String>,
-        subscription_id: impl Into<String>,
-        frame_bytes: &[u8],
-    ) -> Self {
-        Self {
-            plane: UNIX_TERMINAL_PLANE.to_string(),
-            kind: UNIX_TERMINAL_KIND.to_string(),
-            session_id: session_id.into(),
-            subscription_id: subscription_id.into(),
-            payload_base64: base64::engine::general_purpose::STANDARD.encode(frame_bytes),
+    pub fn decode(message: &[u8]) -> Option<(Self, &[u8])> {
+        let sealed_min =
+            LOCAL_WEBRTC_TERMINAL_CHUNK_NONCE_BYTES + LOCAL_WEBRTC_TERMINAL_CHUNK_TAG_BYTES;
+        if message.len() < LOCAL_WEBRTC_TERMINAL_CHUNK_HEADER_BYTES + sealed_min
+            || message.len() >= LOCAL_WEBRTC_MAX_FRAME_BYTES
+            || message[0] != LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION as u8
+        {
+            return None;
         }
+        let read_u32 = |start: usize| {
+            u32::from_le_bytes([
+                message[start],
+                message[start + 1],
+                message[start + 2],
+                message[start + 3],
+            ])
+        };
+        let mut message_id = [0u8; 8];
+        message_id.copy_from_slice(&message[1..9]);
+        let mut generation = [0u8; 8];
+        generation.copy_from_slice(&message[21..29]);
+        let header = Self {
+            message_id: u64::from_le_bytes(message_id),
+            chunk_index: read_u32(9),
+            chunk_count: read_u32(13),
+            total_bytes: read_u32(17),
+            generation: u64::from_le_bytes(generation),
+        };
+        if header.chunk_count == 0
+            || header.chunk_index >= header.chunk_count
+            || header.total_bytes as usize > LOCAL_WEBRTC_MAX_DELIVERY_BYTES
+            || header.chunk_count > header.total_bytes.max(1)
+        {
+            return None;
+        }
+        Some((header, &message[LOCAL_WEBRTC_TERMINAL_CHUNK_HEADER_BYTES..]))
     }
-
-    /// Decode the opaque payload. Does not interpret Snapshot or attach phases.
-    pub fn payload_bytes(&self) -> Result<Vec<u8>, String> {
-        base64::engine::general_purpose::STANDARD
-            .decode(&self.payload_base64)
-            .map_err(|error| format!("invalid unix terminal payload base64: {error}"))
-    }
-
-    #[must_use]
-    pub fn is_unix_terminal_plane(&self) -> bool {
-        self.plane == UNIX_TERMINAL_PLANE && self.kind == UNIX_TERMINAL_KIND
-    }
-}
-
-/// One JSON line on a muxed Unix adapter connection.
-#[derive(Debug, Clone, PartialEq)]
-pub enum DaemonUnixMuxFrame {
-    Response(Box<DaemonResponse>),
-    Terminal(DaemonUnixTerminalEnvelope),
-    Event(DaemonEvent),
-}
-
-/// Classify one decoded JSON line without inspecting terminal payload bytes.
-pub fn parse_unix_mux_value(value: Value) -> Result<DaemonUnixMuxFrame, serde_json::Error> {
-    if value.get("plane").and_then(Value::as_str) == Some(UNIX_TERMINAL_PLANE)
-        && value.get("kind").and_then(Value::as_str) == Some(UNIX_TERMINAL_KIND)
-    {
-        return serde_json::from_value(value).map(DaemonUnixMuxFrame::Terminal);
-    }
-    if let Some("terminal_subscription_closed" | "package_event" | "event_gap") =
-        value.get("type").and_then(Value::as_str)
-    {
-        return serde_json::from_value(value).map(DaemonUnixMuxFrame::Event);
-    }
-    serde_json::from_value(value)
-        .map(Box::new)
-        .map(DaemonUnixMuxFrame::Response)
 }
 
 pub type DaemonTransportResult<T> = Result<T, DaemonTransportError>;
@@ -3362,6 +3924,12 @@ pub enum DaemonTransportError {
     NotRunning,
     ClientDisconnected,
     Protocol(&'static str),
+    /// A typed framing or correlation violation observed on the wire.
+    ProtocolViolation(DaemonProtocolErrorCode),
+    /// Hub sent a typed close reason before closing.
+    ClosedByHub(DaemonCloseReason),
+    /// A submitted request did not complete.
+    Request(DaemonRequestError),
     Compatibility(DaemonCompatibilityError),
     ControlThreadStopped,
 }
@@ -3378,6 +3946,20 @@ impl fmt::Display for DaemonTransportError {
             Self::NotRunning => write!(formatter, "botster-hub daemon is not running"),
             Self::ClientDisconnected => write!(formatter, "daemon client disconnected"),
             Self::Protocol(message) => write!(formatter, "daemon protocol error: {message}"),
+            Self::ProtocolViolation(code) => {
+                write!(formatter, "daemon protocol violation: {}", code.as_str())
+            }
+            Self::ClosedByHub(reason) => match reason {
+                DaemonCloseReason::ProtocolError { code } => write!(
+                    formatter,
+                    "daemon closed the connection: protocol_error {}",
+                    code.as_str()
+                ),
+                DaemonCloseReason::DaemonShutdown => {
+                    write!(formatter, "daemon closed the connection: daemon_shutdown")
+                }
+            },
+            Self::Request(error) => write!(formatter, "{error}"),
             Self::Compatibility(error) => write!(formatter, "{error}"),
             Self::ControlThreadStopped => write!(formatter, "daemon control thread stopped"),
         }
@@ -3390,11 +3972,14 @@ impl Error for DaemonTransportError {
             Self::Io(error) => Some(error),
             Self::Json(error) => Some(error),
             Self::Compatibility(error) => Some(error),
+            Self::Request(error) => Some(error),
             Self::MissingSocketBinding
             | Self::AlreadyRunning
             | Self::NotRunning
             | Self::ClientDisconnected
             | Self::Protocol(_)
+            | Self::ProtocolViolation(_)
+            | Self::ClosedByHub(_)
             | Self::ControlThreadStopped => None,
         }
     }
@@ -3471,110 +4056,297 @@ mod tests {
         }
     }
 
-    fn empty_test_response(sessions: Vec<DaemonSession>, events: Vec<DaemonEvent>) -> Value {
-        serde_json::json!({
-            "kind": "events",
-            "status": null,
-            "sessions": sessions,
-            "packages": [],
-            "package_decision": null,
-            "lifecycle": [],
-            "events": events,
-            "cleanup": null,
-            "coordination": null,
-            "error": null
-        })
+    fn empty_test_response(kind: DaemonResponseKind) -> DaemonResponse {
+        DaemonResponse {
+            kind,
+            status: None,
+            sessions: Vec::new(),
+            session_types: Vec::new(),
+            session_type_definition: None,
+            resolved_session_type: None,
+            session_context: None,
+            read_screen: None,
+            mode_flags: None,
+            terminal_attach: None,
+            terminal_reservation: None,
+            subscription_reservation: None,
+            capture_snapshot: None,
+            snapshot_page: None,
+            spawn_targets: Vec::new(),
+            spawn_target_validation: None,
+            worktrees: Vec::new(),
+            apps: Vec::new(),
+            resolved_app_launch: None,
+            resolved_package_route: None,
+            package_navigation: Vec::new(),
+            packages: Vec::new(),
+            available_packages: Vec::new(),
+            install_plan: None,
+            update_status: None,
+            hub_update: None,
+            hub_update_execution: None,
+            package_decision: None,
+            lifecycle: Vec::new(),
+            plugin_worker_counters: None,
+            plugin_resource_counters: None,
+            plugin_tools: Vec::new(),
+            plugin_tool_result: Value::Null,
+            plugin_surface: None,
+            plugin_action_result: None,
+            local_webrtc_bootstrap: None,
+            local_webrtc_answer: None,
+            events: Vec::new(),
+            cleanup: None,
+            coordination: None,
+            error: None,
+            diagnostics: Vec::new(),
+        }
     }
 
-    fn expect_request(stream: &mut UnixStream, expected: &DaemonRequest) {
-        let request: DaemonRequest = read_frame(stream).expect("read scripted client request");
-        assert_eq!(&request, expected);
-    }
-
-    fn read_screen_response(session_id: &str, text: &str) -> Value {
-        serde_json::json!({
-            "kind": "read_screen",
-            "status": null,
-            "sessions": [],
-            "packages": [],
-            "package_decision": null,
-            "lifecycle": [],
-            "events": [],
-            "cleanup": null,
-            "coordination": null,
-            "error": null,
-            "read_screen": {
-                "session_id": session_id,
-                "text": text
+    /// Read one scripted client request and return its id.
+    fn expect_request(
+        frames: &mut DaemonUnixFrameReader,
+        stream: &mut UnixStream,
+        expected: &DaemonRequest,
+    ) -> String {
+        let raw = frames
+            .read_raw_frame(stream, MAX_UNIX_FRAME_BYTES)
+            .expect("read scripted client frame");
+        match decode_unix_frame::<ClientFrame>(&raw).expect("decode client frame") {
+            DaemonUnixFrame::Control(ClientFrame::Request {
+                request_id,
+                request,
+            }) => {
+                assert_eq!(&request, expected);
+                request_id
             }
-        })
+            other => panic!("expected a client request, got {other:?}"),
+        }
+    }
+
+    fn read_screen_response(session_id: &str, text: &str) -> DaemonResponse {
+        DaemonResponse {
+            read_screen: Some(DaemonReadScreen {
+                session_id: session_id.to_string(),
+                text: text.to_string(),
+                unavailable: None,
+            }),
+            ..empty_test_response(DaemonResponseKind::ReadScreen)
+        }
+    }
+
+    fn test_connection(client: UnixStream) -> DaemonConnection {
+        DaemonConnection::from_hello_complete_stream(client, Vec::new()).expect("connection")
     }
 
     #[test]
     fn stream_attach_retains_late_output_across_running_lifecycle_readbacks() {
-        let (mut server, mut client) = UnixStream::pair().expect("pair unix streams");
+        let (mut server, client) = UnixStream::pair().expect("pair unix streams");
         let server_handle = thread::spawn(move || {
-            expect_request(
+            let mut frames = DaemonUnixFrameReader::new();
+            let attach_id = expect_request(
+                &mut frames,
                 &mut server,
                 &DaemonRequest::Attach {
                     session_id: "session".to_string(),
                     subscription_id: "subscription".to_string(),
                 },
             );
-            write_frame(&mut server, &empty_test_response(Vec::new(), Vec::new()))
-                .expect("write attach response");
-            expect_request(
+            write_server_frame(
+                &mut server,
+                &ServerFrame::Response {
+                    request_id: attach_id,
+                    response: empty_test_response(DaemonResponseKind::Events),
+                },
+            )
+            .expect("write attach response");
+            let read_id = expect_request(
+                &mut frames,
                 &mut server,
                 &DaemonRequest::ReadScreen {
                     session_id: "session".to_string(),
                 },
             );
-            write_frame(&mut server, &read_screen_response("session", "late-output"))
-                .expect("write read_screen response");
+            write_server_frame(
+                &mut server,
+                &ServerFrame::Response {
+                    request_id: read_id,
+                    response: read_screen_response("session", "late-output"),
+                },
+            )
+            .expect("write read_screen response");
         });
         let mut output = Vec::new();
+        let mut connection = test_connection(client);
 
-        stream_attach_connected(&mut client, "session", "subscription", &mut output)
+        stream_attach_connected(&mut connection, "session", "subscription", &mut output)
             .expect("stream attach writes current ReadScreen text");
-        drop(client);
+        drop(connection);
         server_handle.join().expect("scripted server completes");
 
         assert_eq!(output, b"late-output\n");
     }
 
     #[test]
-    fn stream_attach_completes_when_idle_session_is_exited() {
-        let (mut server, mut client) = UnixStream::pair().expect("pair unix streams");
+    fn stream_attach_prints_nothing_when_history_is_unavailable() {
+        let (mut server, client) = UnixStream::pair().expect("pair unix streams");
         let server_handle = thread::spawn(move || {
-            expect_request(
+            let mut frames = DaemonUnixFrameReader::new();
+            let attach_id = expect_request(
+                &mut frames,
                 &mut server,
                 &DaemonRequest::Attach {
                     session_id: "session".to_string(),
                     subscription_id: "subscription".to_string(),
                 },
             );
-            write_frame(&mut server, &empty_test_response(Vec::new(), Vec::new()))
-                .expect("write attach response");
-            expect_request(
+            write_server_frame(
+                &mut server,
+                &ServerFrame::Response {
+                    request_id: attach_id,
+                    response: empty_test_response(DaemonResponseKind::Events),
+                },
+            )
+            .expect("write attach response");
+            let read_id = expect_request(
+                &mut frames,
                 &mut server,
                 &DaemonRequest::ReadScreen {
                     session_id: "session".to_string(),
                 },
             );
-            write_frame(
+            let mut response = read_screen_response("session", "");
+            response.read_screen.as_mut().expect("screen").unavailable =
+                Some(HistoryUnavailableReason::Restart);
+            write_server_frame(
                 &mut server,
-                &read_screen_response("session", "final-output"),
+                &ServerFrame::Response {
+                    request_id: read_id,
+                    response,
+                },
             )
             .expect("write read_screen response");
         });
         let mut output = Vec::new();
+        let mut connection = test_connection(client);
 
-        stream_attach_connected(&mut client, "session", "subscription", &mut output)
-            .expect("exited session still returns current ReadScreen text");
-        drop(client);
+        stream_attach_connected(&mut connection, "session", "subscription", &mut output)
+            .expect("unavailable history is not an attach failure");
+        drop(connection);
         server_handle.join().expect("scripted server completes");
 
-        assert_eq!(output, b"final-output\n");
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn wait_response_parks_out_of_order_responses_and_skips_other_frames() {
+        let (mut server, client) = UnixStream::pair().expect("pair unix streams");
+        let mut connection = test_connection(client);
+        let first = connection
+            .submit(&DaemonRequest::Status)
+            .expect("submit first");
+        let second = connection
+            .submit(&DaemonRequest::ListSessions)
+            .expect("submit second");
+        assert_eq!(connection.outstanding_request_ids(), &[first, second]);
+
+        let server_handle = thread::spawn(move || {
+            let mut frames = DaemonUnixFrameReader::new();
+            let first_id = expect_request(&mut frames, &mut server, &DaemonRequest::Status);
+            let second_id = expect_request(&mut frames, &mut server, &DaemonRequest::ListSessions);
+            write_unix_terminal_frame(&mut server, "route", 5, b"opaque").expect("terminal");
+            write_server_frame(
+                &mut server,
+                &ServerFrame::Event {
+                    event: DaemonEvent::SessionLifecycle {
+                        session_id: "session".to_string(),
+                        state: "running".to_string(),
+                    },
+                },
+            )
+            .expect("event");
+            write_server_frame(
+                &mut server,
+                &ServerFrame::Response {
+                    request_id: second_id,
+                    response: empty_test_response(DaemonResponseKind::Sessions),
+                },
+            )
+            .expect("second response first");
+            write_server_frame(
+                &mut server,
+                &ServerFrame::Response {
+                    request_id: "999".to_string(),
+                    response: empty_test_response(DaemonResponseKind::Status),
+                },
+            )
+            .expect("unknown id response");
+            write_server_frame(
+                &mut server,
+                &ServerFrame::Response {
+                    request_id: first_id,
+                    response: empty_test_response(DaemonResponseKind::Status),
+                },
+            )
+            .expect("first response last");
+        });
+
+        let response = connection.wait_response(first).expect("first completes");
+        assert_eq!(response.kind, DaemonResponseKind::Status);
+        assert_eq!(connection.outstanding_request_ids(), &[] as &[u64]);
+        let response = connection.wait_response(second).expect("parked second");
+        assert_eq!(response.kind, DaemonResponseKind::Sessions);
+        assert_eq!(connection.take_skipped_terminal().len(), 1);
+        assert_eq!(connection.take_skipped_events().len(), 1);
+        assert!(matches!(
+            connection.wait_response(999),
+            Err(DaemonTransportError::Request(DaemonRequestError::Cancelled))
+        ));
+        server_handle.join().expect("scripted server completes");
+    }
+
+    #[test]
+    fn submit_refuses_a_thirty_third_outstanding_request_locally() {
+        let (server, client) = UnixStream::pair().expect("pair unix streams");
+        let mut connection = test_connection(client);
+        for _ in 0..MAX_OUTSTANDING_REQUESTS {
+            connection.submit(&DaemonRequest::Status).expect("submit");
+        }
+        assert!(matches!(
+            connection.submit(&DaemonRequest::Status),
+            Err(DaemonTransportError::Request(
+                DaemonRequestError::TooManyOutstandingRequests
+            ))
+        ));
+        assert!(connection.cancel(1));
+        assert!(!connection.cancel(1));
+        connection
+            .submit(&DaemonRequest::Status)
+            .expect("a cancelled slot frees the guard");
+        drop(server);
+    }
+
+    #[test]
+    fn hub_close_frame_surfaces_a_typed_reason() {
+        let (mut server, client) = UnixStream::pair().expect("pair unix streams");
+        let mut connection = test_connection(client);
+        write_server_frame(
+            &mut server,
+            &ServerFrame::Close {
+                reason: DaemonCloseReason::ProtocolError {
+                    code: DaemonProtocolErrorCode::InvalidRequestId,
+                },
+            },
+        )
+        .expect("close");
+        let error = connection.next_event().expect_err("close ends the wait");
+        assert!(matches!(
+            error,
+            DaemonTransportError::ClosedByHub(DaemonCloseReason::ProtocolError {
+                code: DaemonProtocolErrorCode::InvalidRequestId
+            })
+        ));
+        assert!(connection.close_reason().is_some());
     }
 
     #[test]
@@ -3859,56 +4631,28 @@ mod tests {
     }
 
     #[test]
-    fn unix_mux_helper_is_content_blind() {
-        let envelope = DaemonUnixTerminalEnvelope::from_frame_bytes(
-            "session",
-            "sub",
-            br#"{"type":"terminal_output","marker":"opaque"}"#,
-        );
-        assert!(envelope.is_unix_terminal_plane());
-        let value = serde_json::to_value(&envelope).expect("envelope serializes");
-        assert_eq!(value["plane"], UNIX_TERMINAL_PLANE);
-        assert_eq!(value["kind"], UNIX_TERMINAL_KIND);
-        assert!(value.get("history").is_none());
-        assert!(value.get("state").is_none());
-        let parsed = parse_unix_mux_value(value).expect("parse envelope");
-        match parsed {
-            DaemonUnixMuxFrame::Terminal(parsed) => {
-                assert_eq!(
-                    parsed.payload_bytes().expect("payload decodes"),
-                    br#"{"type":"terminal_output","marker":"opaque"}"#
-                );
-            }
-            DaemonUnixMuxFrame::Response(_) | DaemonUnixMuxFrame::Event(_) => {
-                panic!("envelope must not parse as a response or host event")
-            }
-        }
-    }
-
-    #[test]
-    fn terminal_subscription_closed_is_a_mux_event_not_a_request_reply() {
+    fn terminal_subscription_closed_is_a_server_event_not_a_request_reply() {
         let event = DaemonEvent::TerminalSubscriptionClosed {
             session_id: "session".to_string(),
             subscription_id: "sub".to_string(),
             generation: 2,
             reason: TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER.to_string(),
         };
-        let value = serde_json::to_value(&event).expect("event serializes");
-        assert_eq!(value["type"], "terminal_subscription_closed");
-        assert!(value.get("kind").is_none());
-        match parse_unix_mux_value(value).expect("parse event") {
-            DaemonUnixMuxFrame::Event(DaemonEvent::TerminalSubscriptionClosed {
-                session_id,
-                subscription_id,
-                generation,
-                reason,
-            }) => {
-                assert_eq!(session_id, "session");
-                assert_eq!(subscription_id, "sub");
-                assert_eq!(generation, 2);
-                assert_eq!(reason, TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER);
+        let frame = ServerFrame::Event {
+            event: event.clone(),
+        };
+        let value = serde_json::to_value(&frame).expect("frame serializes");
+        assert_eq!(value["frame"], "event");
+        assert_eq!(value["event"]["type"], "terminal_subscription_closed");
+        assert!(value.get("request_id").is_none());
+        let encoded = encode_server_frame(&frame).expect("encode");
+        match decode_unix_frame::<ServerFrame>(&encoded[UNIX_FRAME_LENGTH_PREFIX_BYTES..])
+            .expect("decode")
+        {
+            DaemonUnixFrame::Control(ServerFrame::Event { event: decoded }) => {
+                assert_eq!(decoded, event);
             }
-            other => panic!("close event must not parse as {other:?}"),
+            other => panic!("close event must not decode as {other:?}"),
         }
     }
 
@@ -3939,12 +4683,6 @@ mod tests {
         assert!(event_value.get("sequence").is_none());
         assert!(event_value.get("cursor").is_none());
         assert!(event_value.get("replay").is_none());
-        match parse_unix_mux_value(event_value).expect("parse package event") {
-            DaemonUnixMuxFrame::Event(DaemonEvent::PackageEvent { name, .. }) => {
-                assert_eq!(name, "ready");
-            }
-            other => panic!("package event must not parse as {other:?}"),
-        }
 
         let gap = DaemonEvent::EventGap {
             subscription_id: "sub".to_string(),
@@ -3954,14 +4692,6 @@ mod tests {
         let gap_value = serde_json::to_value(&gap).expect("gap serializes");
         assert_eq!(gap_value["type"], "event_gap");
         assert!(gap_value.get("sequence").is_none());
-        match parse_unix_mux_value(gap_value).expect("parse gap") {
-            DaemonUnixMuxFrame::Event(DaemonEvent::EventGap {
-                subscription_id, ..
-            }) => {
-                assert_eq!(subscription_id, "sub");
-            }
-            other => panic!("event gap must not parse as {other:?}"),
-        }
     }
 
     #[test]
@@ -3974,17 +4704,14 @@ mod tests {
             payload: serde_json::json!({ "ok": true }),
         };
         let server_handle = thread::spawn(move || {
-            write_frame(&mut server, &event).expect("write unsolicited event");
+            write_server_frame(&mut server, &ServerFrame::Event { event })
+                .expect("write unsolicited event");
         });
-        let reader = BufReader::new(client.try_clone().expect("clone"));
-        let mut connection = DaemonConnection {
-            stream: client,
-            reader,
-            skipped_terminal: Vec::new(),
-            skipped_events: Vec::new(),
-            required_features: vec![FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS.to_string()],
-            incomplete_line: String::new(),
-        };
+        let mut connection = DaemonConnection::from_hello_complete_stream(
+            client,
+            vec![FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS.to_string()],
+        )
+        .expect("connection");
         match connection.next_event().expect("next event") {
             DaemonEvent::PackageEvent {
                 subscription_id,
@@ -3999,77 +4726,25 @@ mod tests {
         server_handle.join().expect("server writes");
     }
 
-    fn test_connection(client: UnixStream) -> DaemonConnection {
-        let reader = BufReader::new(client.try_clone().expect("clone"));
-        DaemonConnection {
-            stream: client,
-            reader,
-            skipped_terminal: Vec::new(),
-            skipped_events: Vec::new(),
-            required_features: Vec::new(),
-            incomplete_line: String::new(),
-        }
-    }
-
-    fn terminal_envelope_line() -> Vec<u8> {
-        let envelope = DaemonUnixTerminalEnvelope::from_frame_bytes("s", "sub", b"a");
-        let mut line = serde_json::to_vec(&envelope).expect("encode envelope");
-        line.push(b'\n');
-        line
-    }
-
     #[test]
-    fn read_unix_mux_frame_keeps_a_split_line_across_timeout() {
-        let (mut server, client) = UnixStream::pair().expect("pair");
-        client
-            .set_read_timeout(Some(Duration::from_millis(30)))
-            .expect("timeout");
-        let mut reader = BufReader::new(client);
-        let mut incomplete = String::new();
-        let line = terminal_envelope_line();
-        assert!(line.len() > 9);
-        server.write_all(&line[..9]).expect("write prefix");
-        let first = read_unix_mux_frame_from_reader(&mut reader, &mut incomplete);
-        assert!(
-            matches!(
-                &first,
-                Err(DaemonTransportError::Io(error))
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    )
-            ),
-            "prefix must time out, got {first:?}"
-        );
-        assert!(!incomplete.is_empty());
-        server.write_all(&line[9..]).expect("write suffix");
-        match read_unix_mux_frame_from_reader(&mut reader, &mut incomplete).expect("complete line")
-        {
-            DaemonUnixMuxFrame::Terminal(envelope) => {
-                assert_eq!(envelope.payload_bytes().expect("payload"), b"a");
-            }
-            other => panic!("expected terminal envelope, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn poll_terminal_keeps_a_split_line_and_returns_none_on_timeout() {
+    fn poll_terminal_keeps_a_split_frame_and_returns_none_on_timeout() {
         let (mut server, client) = UnixStream::pair().expect("pair");
         let mut connection = test_connection(client);
-        let line = terminal_envelope_line();
-        server.write_all(&line[..9]).expect("write prefix");
+        let frame = encode_unix_terminal_frame("sub", 1, b"a").expect("encode");
+        server.write_all(&frame[..9]).expect("write prefix");
         assert!(
             connection
                 .poll_terminal(Duration::from_millis(30))
                 .expect("prefix poll")
                 .is_none()
         );
-        server.write_all(&line[9..]).expect("write suffix");
-        let envelope = connection
+        server.write_all(&frame[9..]).expect("write suffix");
+        let decoded = connection
             .poll_terminal(Duration::from_secs(1))
             .expect("suffix poll")
-            .expect("terminal envelope");
-        assert_eq!(envelope.payload_bytes().expect("payload"), b"a");
+            .expect("terminal frame");
+        assert_eq!(decoded.route, "sub");
+        assert_eq!(decoded.body, b"a");
     }
 
     #[test]
@@ -4085,7 +4760,14 @@ mod tests {
         let server_handle = thread::spawn(move || {
             let started = Instant::now();
             while started.elapsed() < Duration::from_millis(600) {
-                if write_frame(&mut server, &event).is_err() {
+                if write_server_frame(
+                    &mut server,
+                    &ServerFrame::Event {
+                        event: event.clone(),
+                    },
+                )
+                .is_err()
+                {
                     return;
                 }
                 thread::sleep(Duration::from_millis(5));
@@ -4269,228 +4951,125 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_and_scrollback_events_round_trip_opaque_binary_payloads() {
-        let events = vec![
-            DaemonEvent::Snapshot {
-                session_id: "session".to_string(),
-                subscription_id: "subscription".to_string(),
-                history: DaemonOpaqueHistoryPayload::from_bytes(&[0, 255, 1]),
-            },
-            DaemonEvent::Scrollback {
-                session_id: "session".to_string(),
-                subscription_id: "subscription".to_string(),
-                history: DaemonOpaqueHistoryPayload::from_bytes(&[255, 0, 2]),
-            },
-        ];
-
-        let value = serde_json::to_value(&events).expect("events serialize");
-
+    fn snapshot_pages_round_trip_opaque_binary_payloads() {
+        let page = DaemonSnapshotPage {
+            session_id: "session".to_string(),
+            capture_id: "capture-1".to_string(),
+            page: 2,
+            payload: DaemonOpaqueHistoryPayload::from_bytes(&[0, 255, 1]),
+        };
+        let value = serde_json::to_value(&page).expect("page serializes");
         assert_eq!(
             value,
-            serde_json::json!([
-                {
-                    "type": "snapshot",
-                    "session_id": "session",
-                    "subscription_id": "subscription",
-                    "payload_base64": "AP8B",
-                    "payload_encoding": "base64",
-                    "bytes": 3
-                },
-                {
-                    "type": "scrollback",
-                    "session_id": "session",
-                    "subscription_id": "subscription",
-                    "payload_base64": "/wAC",
-                    "payload_encoding": "base64",
-                    "bytes": 3
-                }
-            ])
+            serde_json::json!({
+                "session_id": "session",
+                "capture_id": "capture-1",
+                "page": 2,
+                "payload_base64": "AP8B",
+                "payload_encoding": "base64",
+                "bytes": 3
+            })
         );
-
-        let round_tripped: Vec<DaemonEvent> =
-            serde_json::from_value(value).expect("events deserialize");
-        assert_eq!(round_tripped, events);
+        let round_tripped: DaemonSnapshotPage =
+            serde_json::from_value(value).expect("page deserializes");
+        assert_eq!(round_tripped, page);
+        assert_eq!(
+            round_tripped.payload.decoded_bytes().expect("decode"),
+            vec![0, 255, 1]
+        );
     }
 
     #[test]
     fn opaque_history_rejects_invalid_base64_and_mismatched_length() {
         for value in [
             serde_json::json!({
-                "type": "snapshot",
                 "session_id": "session",
-                "subscription_id": "subscription",
+                "capture_id": "capture-1",
+                "page": 0,
                 "payload_base64": "not base64",
                 "payload_encoding": "base64",
                 "bytes": 3
             }),
             serde_json::json!({
-                "type": "snapshot",
                 "session_id": "session",
-                "subscription_id": "subscription",
+                "capture_id": "capture-1",
+                "page": 0,
                 "payload_base64": "AP8B",
                 "payload_encoding": "base64",
                 "bytes": 4
             }),
         ] {
-            serde_json::from_value::<DaemonEvent>(value)
+            serde_json::from_value::<DaemonSnapshotPage>(value)
                 .expect_err("invalid opaque history metadata must fail deserialization");
         }
     }
 
     #[test]
-    fn terminal_writer_ignores_opaque_history_and_preserves_live_output() {
-        let events = vec![
-            DaemonEvent::Snapshot {
-                session_id: "session".to_string(),
-                subscription_id: "subscription".to_string(),
-                history: DaemonOpaqueHistoryPayload::from_bytes(b"must-not-render"),
-            },
-            DaemonEvent::TerminalOutput {
-                session_id: "session".to_string(),
-                subscription_id: "subscription".to_string(),
-                payload: DaemonLiveOutputPayload::from_bytes(b"live-output"),
-            },
-        ];
-        let mut output = Vec::new();
-
-        write_terminal_events(&events, &mut output).expect("terminal events write");
-
-        assert_eq!(output, b"live-output");
-    }
-
-    #[test]
-    fn live_output_events_round_trip_exact_bytes() {
-        let cases: &[&[u8]] = &[
-            b"",
-            b"ascii",
-            b"\x00",
-            b"\x1b[31mred\x1b[0m",
-            b"\xff",
-            b"\xc0",
-            "€".as_bytes(),
-        ];
-        for payload in cases {
-            let event = DaemonEvent::TerminalOutput {
-                session_id: "session".to_string(),
-                subscription_id: "subscription".to_string(),
-                payload: DaemonLiveOutputPayload::from_bytes(payload),
-            };
-            let value = serde_json::to_value(&event).expect("live output serializes");
-            assert_eq!(value["type"], "terminal_output");
-            assert_eq!(value["payload_encoding"], "base64");
-            assert_eq!(value["bytes"], payload.len());
-            assert!(value.get("data").is_none());
-            let round_tripped: DaemonEvent =
-                serde_json::from_value(value).expect("live output deserializes");
-            let DaemonEvent::TerminalOutput {
-                payload: decoded, ..
-            } = round_tripped
-            else {
-                panic!("expected terminal output");
-            };
+    fn capture_snapshot_and_readbacks_carry_typed_unavailable_reasons() {
+        let request = DaemonRequest::ReadSnapshotPage {
+            session_id: "session".to_string(),
+            capture_id: "capture-1".to_string(),
+            page: 3,
+        };
+        assert_eq!(
+            serde_json::to_value(&request).expect("request serializes"),
+            serde_json::json!({
+                "type": "read_snapshot_page",
+                "session_id": "session",
+                "capture_id": "capture-1",
+                "page": 3
+            })
+        );
+        let capture = DaemonCaptureSnapshot {
+            session_id: "session".to_string(),
+            capture_id: String::new(),
+            total_bytes: 0,
+            page_bytes: SNAPSHOT_PAGE_BYTES as u32,
+            pages: 0,
+            rows: 24,
+            cols: 80,
+            unavailable: Some(HistoryUnavailableReason::Oversize),
+        };
+        let value = serde_json::to_value(&capture).expect("capture serializes");
+        assert_eq!(value["unavailable"], "oversize");
+        assert_eq!(value["page_bytes"], 262_144);
+        let available = DaemonCaptureSnapshot {
+            capture_id: "capture-1".to_string(),
+            total_bytes: 600_000,
+            pages: 3,
+            unavailable: None,
+            ..capture
+        };
+        let value = serde_json::to_value(&available).expect("capture serializes");
+        assert!(value.get("unavailable").is_none());
+        for reason in [
+            HistoryUnavailableReason::Evicted,
+            HistoryUnavailableReason::Restart,
+            HistoryUnavailableReason::Oversize,
+            HistoryUnavailableReason::CaptureFailed,
+        ] {
             assert_eq!(
-                decoded.decoded_bytes().expect("validated payload"),
-                *payload
+                serde_json::to_value(reason).expect("reason serializes"),
+                serde_json::json!(reason.as_str())
             );
         }
-    }
-
-    #[test]
-    fn live_output_split_utf8_frames_concatenate_without_replacement() {
-        let first = DaemonLiveOutputPayload::from_bytes(&[0xE2]);
-        let second = DaemonLiveOutputPayload::from_bytes(&[0x82, 0xAC]);
-        let mut concatenated = first.decoded_bytes().expect("first fragment");
-        concatenated.extend(second.decoded_bytes().expect("second fragment"));
-        assert_eq!(concatenated, "€".as_bytes());
-        assert!(
-            !concatenated
-                .windows(3)
-                .any(|window| window == [0xEF, 0xBF, 0xBD])
-        );
-    }
-
-    #[test]
-    fn live_output_rejects_invalid_base64_unknown_encoding_and_length_mismatch() {
-        for value in [
-            serde_json::json!({
-                "type": "terminal_output",
-                "session_id": "session",
-                "subscription_id": "subscription",
-                "payload_base64": "not base64",
-                "payload_encoding": "base64",
-                "bytes": 3
-            }),
-            serde_json::json!({
-                "type": "terminal_output",
-                "session_id": "session",
-                "subscription_id": "subscription",
-                "payload_base64": "AP8B",
-                "payload_encoding": "hex",
-                "bytes": 3
-            }),
-            serde_json::json!({
-                "type": "terminal_output",
-                "session_id": "session",
-                "subscription_id": "subscription",
-                "payload_base64": "AP8B",
-                "payload_encoding": "base64",
-                "bytes": 4
-            }),
-        ] {
-            serde_json::from_value::<DaemonEvent>(value)
-                .expect_err("invalid live output metadata must fail deserialization");
-        }
-    }
-
-    #[test]
-    fn live_output_rejects_retired_data_key_on_an_otherwise_valid_envelope() {
-        let event = DaemonEvent::TerminalOutput {
+        let screen = DaemonReadScreen {
             session_id: "session".to_string(),
-            subscription_id: "subscription".to_string(),
-            payload: DaemonLiveOutputPayload::from_bytes(b"live-after-attach\r\n"),
+            text: String::new(),
+            unavailable: Some(HistoryUnavailableReason::Restart),
         };
-        let mut value = serde_json::to_value(&event).expect("serialize current live envelope");
-        assert!(value.get("data").is_none());
-        value["data"] = serde_json::json!("live-after-attach\r\n");
-        value["future_hint"] = serde_json::json!(1);
-
-        let error = serde_json::from_value::<DaemonEvent>(value)
-            .expect_err("retired data key must fail even when the current envelope is valid");
-        assert!(
-            error
-                .to_string()
-                .contains("legacy terminal_output data field is rejected"),
-            "expected retired-field rejection, got {error}"
+        assert_eq!(
+            serde_json::to_value(&screen).expect("screen serializes")["unavailable"],
+            "restart"
         );
-
-        let mut forward = serde_json::to_value(&event).expect("serialize current live envelope");
-        forward["future_hint"] = serde_json::json!(1);
-        serde_json::from_value::<DaemonEvent>(forward)
-            .expect("unrelated unknown fields remain forward-tolerant");
-    }
-
-    #[test]
-    fn terminal_writer_writes_decoded_payload_bytes() {
-        let events = vec![
-            DaemonEvent::Snapshot {
-                session_id: "session".to_string(),
-                subscription_id: "subscription".to_string(),
-                history: DaemonOpaqueHistoryPayload::from_bytes(b"must-not-render"),
-            },
-            DaemonEvent::Scrollback {
-                session_id: "session".to_string(),
-                subscription_id: "subscription".to_string(),
-                history: DaemonOpaqueHistoryPayload::from_bytes(&[0xff]),
-            },
-            DaemonEvent::TerminalOutput {
-                session_id: "session".to_string(),
-                subscription_id: "subscription".to_string(),
-                payload: DaemonLiveOutputPayload::from_bytes(&[0x00, 0x1b, 0xff, 0xc0]),
-            },
-        ];
-        let mut output = Vec::new();
-        write_terminal_events(&events, &mut output).expect("terminal events write");
-        assert_eq!(output, [0x00, 0x1b, 0xff, 0xc0]);
+        let generated = daemon_protocol_typescript();
+        assert!(generated.contains("export type HistoryUnavailableReason ="));
+        assert!(generated.contains("export interface DaemonSnapshotPage"));
+        assert!(generated.contains("snapshot_page?: DaemonSnapshotPage | null;"));
+        assert!(generated.contains(
+            r#"| { type: "read_snapshot_page"; session_id: string; capture_id: string; page: number }"#
+        ));
+        assert!(generated.contains("unavailable?: HistoryUnavailableReason | null;"));
     }
 
     #[test]
@@ -4509,94 +5088,71 @@ mod tests {
     }
 
     #[test]
-    fn protocol_eight_rejects_protocol_seven_and_accepts_conformance_floor_thirty_six() {
-        assert_eq!(PROTOCOL_VERSION, 8);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 48);
+    fn protocol_nine_rejects_protocol_eight_and_pins_the_conformance_floor() {
+        assert_eq!(PROTOCOL_VERSION, 9);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 49);
 
-        let protocol_seven = DaemonCompatibilityRequirement {
-            protocol_version: 7,
-            minimum_conformance_fixture_revision: 36,
+        let protocol_eight = DaemonCompatibilityRequirement {
+            protocol_version: 8,
+            minimum_conformance_fixture_revision: 48,
             ..DaemonCompatibilityRequirement::current()
         };
-        let error = ensure_compatible(&protocol_seven, &DaemonCompatibility::current())
-            .expect_err("protocol-7 client must fail closed against protocol 8");
-        assert!(error.diagnostic.contains("unsupported protocol version 8"));
+        let error = ensure_compatible(&protocol_eight, &DaemonCompatibility::current())
+            .expect_err("protocol-8 client must fail closed against protocol 9");
+        assert!(error.diagnostic.contains("unsupported protocol version 9"));
 
-        let protocol_eight_floor_thirty_six = DaemonCompatibilityRequirement {
-            protocol_version: 8,
-            minimum_conformance_fixture_revision: 36,
-            ..DaemonCompatibilityRequirement::current()
+        let hub_at_forty_eight = DaemonCompatibility {
+            conformance_fixture_revision: 48,
+            ..DaemonCompatibility::current()
         };
         ensure_compatible(
-            &protocol_eight_floor_thirty_six,
-            &DaemonCompatibility::current(),
+            &DaemonCompatibilityRequirement::current(),
+            &hub_at_forty_eight,
         )
-        .expect("protocol-8 client with conformance floor 36 accepts hub revision 48");
+        .expect_err("a protocol-9 client rejects a revision-48 Hub");
     }
 
     #[test]
-    fn generated_typescript_terminal_output_uses_payload_fields() {
-        let generated = daemon_protocol_typescript();
-        assert!(generated.contains(
-            "{ type: \"terminal_output\"; session_id: string; subscription_id: string; payload_base64: string; payload_encoding: \"base64\"; bytes: number }"
-        ));
-        assert!(!generated.contains(
-            "{ type: \"terminal_output\"; session_id: string; subscription_id: string; data: string }"
-        ));
-    }
-
-    #[test]
-    fn history_events_deserialize_before_later_terminal_output() {
-        let value = serde_json::json!([
-            {
-                "type": "snapshot",
+    fn terminal_stream_events_are_absent_from_host_events() {
+        for legacy in [
+            "terminal_output",
+            "snapshot",
+            "scrollback",
+            "process_exit",
+            "attach_state",
+        ] {
+            let value = serde_json::json!({
+                "type": legacy,
                 "session_id": "session",
                 "subscription_id": "subscription",
                 "payload_base64": "AP8B",
                 "payload_encoding": "base64",
-                "bytes": 3
-            },
-            {
-                "type": "scrollback",
-                "session_id": "session",
-                "subscription_id": "subscription",
-                "payload_base64": "/wAC",
-                "payload_encoding": "base64",
-                "bytes": 3
-            },
-            {
-                "type": "terminal_output",
-                "session_id": "session",
-                "subscription_id": "subscription",
-                "payload_base64": "bGl2ZS1kYXRh",
-                "payload_encoding": "base64",
-                "bytes": 9
-            }
-        ]);
-
-        let events: Vec<DaemonEvent> =
-            serde_json::from_value(value).expect("ordered terminal events deserialize");
-
-        assert!(matches!(events[0], DaemonEvent::Snapshot { .. }));
-        assert!(matches!(events[1], DaemonEvent::Scrollback { .. }));
-        assert!(matches!(events[2], DaemonEvent::TerminalOutput { .. }));
-    }
-
-    #[test]
-    fn history_json_without_binary_payload_is_not_current_dto_shape() {
-        let value = serde_json::json!({
-            "type": "snapshot",
-            "session_id": "session",
-            "subscription_id": "subscription",
-            "bytes": 13
-        });
-
-        let error = serde_json::from_value::<DaemonEvent>(value)
-            .expect_err("current history events require an opaque payload");
+                "bytes": 3,
+                "code": 0,
+                "state": "attached"
+            });
+            serde_json::from_value::<DaemonEvent>(value)
+                .expect_err("terminal stream kinds are not host events");
+        }
+        let generated = daemon_protocol_typescript();
+        assert!(!generated.contains("\"terminal_output\""));
+        assert!(!generated.contains("\"attach_state\""));
+        assert!(!generated.contains("DaemonUnixTerminalEnvelope"));
+        assert!(generated.contains("export type ClientFrame ="));
+        assert!(generated.contains("export type ServerFrame ="));
+        assert!(generated.contains("export type DaemonCloseReason ="));
+        assert!(generated.contains("export type DaemonProtocolErrorCode ="));
         assert!(
-            error.to_string().contains("payload"),
-            "missing payload should fail loudly, got {error}"
+            generated
+                .contains("| { frame: \"request\"; request_id: string; request: DaemonRequest }")
         );
+        assert!(
+            generated.contains(
+                "| { frame: \"response\"; request_id: string; response: DaemonResponse }"
+            )
+        );
+        assert!(generated.contains("export const PROTOCOL_VERSION = 9;"));
+        assert!(generated.contains("export const MAX_OUTSTANDING_REQUESTS = 32;"));
     }
 
     #[test]
@@ -4898,8 +5454,9 @@ mod tests {
                 false,
                 false,
                 false,
-                1,
-                2,
+                40,
+                120,
+                None,
             )),
             ..daemon_response_example(DaemonResponseKind::ReadModeFlags)
         };
@@ -4915,16 +5472,16 @@ mod tests {
                 "alt_screen": false,
                 "focus_reporting": false,
                 "application_cursor": false,
-                "mode_generation": 1,
-                "mode_revision": 2,
+                "rows": 40,
+                "cols": 120,
             })
         );
 
         let generated = daemon_protocol_typescript();
         assert!(generated.contains(r#"| { type: "read_mode_flags"; session_id: string }"#));
         assert!(generated.contains("mode_flags?: DaemonModeFlags | null;"));
-        assert!(generated.contains("mode_generation: number;"));
-        assert!(generated.contains("mode_revision: number;"));
+        assert!(!generated.contains("mode_generation"));
+        assert!(!generated.contains("mode_revision"));
         assert!(!generated.contains(r#"| { type: "mode_gated_input"; session_id: string; data: string; mode_generation: number; mode_revision: number }"#));
         assert!(!generated.contains(r#"| { type: "send_input""#));
         assert!(!generated.contains(r#"| { type: "resize""#));
@@ -6190,6 +6747,11 @@ mod tests {
             DaemonRequest::CaptureSnapshot {
                 session_id: "session".to_string(),
             },
+            DaemonRequest::ReadSnapshotPage {
+                session_id: "session".to_string(),
+                capture_id: "capture-1".to_string(),
+                page: 0,
+            },
             DaemonRequest::ListSessionTypes,
             DaemonRequest::ListSessionTypesForTarget {
                 target_id: "repo:main".to_string(),
@@ -6409,6 +6971,7 @@ mod tests {
             DaemonRequest::ReadScreen { .. } => "read_screen",
             DaemonRequest::ReadModeFlags { .. } => "read_mode_flags",
             DaemonRequest::CaptureSnapshot { .. } => "capture_snapshot",
+            DaemonRequest::ReadSnapshotPage { .. } => "read_snapshot_page",
             DaemonRequest::ListSessionTypes => "list_session_types",
             DaemonRequest::ListSessionTypesForTarget { .. } => "list_session_types_for_target",
             DaemonRequest::ShowSessionType { .. } => "show_session_type",
@@ -6484,8 +7047,10 @@ mod tests {
             DaemonResponseKind::SessionContext,
             DaemonResponseKind::ReadScreen,
             DaemonResponseKind::ReadModeFlags,
+            DaemonResponseKind::TerminalAttached,
             DaemonResponseKind::TerminalReservation,
             DaemonResponseKind::CaptureSnapshot,
+            DaemonResponseKind::SnapshotPage,
             DaemonResponseKind::SpawnTargets,
             DaemonResponseKind::SpawnTargetValidation,
             DaemonResponseKind::Worktrees,
@@ -6535,8 +7100,10 @@ mod tests {
             DaemonResponseKind::SessionContext => "session_context",
             DaemonResponseKind::ReadScreen => "read_screen",
             DaemonResponseKind::ReadModeFlags => "read_mode_flags",
+            DaemonResponseKind::TerminalAttached => "terminal_attached",
             DaemonResponseKind::TerminalReservation => "terminal_reservation",
             DaemonResponseKind::CaptureSnapshot => "capture_snapshot",
+            DaemonResponseKind::SnapshotPage => "snapshot_page",
             DaemonResponseKind::SpawnTargets => "spawn_targets",
             DaemonResponseKind::SpawnTargetValidation => "spawn_target_validation",
             DaemonResponseKind::Worktrees => "worktrees",
@@ -6602,6 +7169,14 @@ mod tests {
                 lifecycle_counters: DaemonLifecycleCounters::default(),
                 live_attach_occupancy: Vec::new(),
                 observability: DaemonObservabilityCounters::default(),
+                retention: Some(DaemonRetentionAccounting {
+                    max_object_bytes: 16 << 20,
+                    max_total_bytes: 64 << 20,
+                    max_sessions: 200,
+                    total_bytes: 4096,
+                    sessions: 1,
+                    evictions: 0,
+                }),
                 diagnostics: vec![DaemonDiagnostic::connected("status")],
             }),
             sessions: vec![DaemonSession {
@@ -6635,10 +7210,12 @@ mod tests {
             read_screen: Some(DaemonReadScreen {
                 session_id: "session".to_string(),
                 text: "ready".to_string(),
+                unavailable: None,
             }),
             mode_flags: Some(DaemonModeFlags::new(
-                "session", false, true, false, 9, false, false, false, 1, 1,
+                "session", false, true, false, 9, false, false, false, 24, 80, None,
             )),
+            terminal_attach: Some(DaemonTerminalAttach::new("session", "subscription", 1)),
             terminal_reservation: Some(DaemonTerminalReservation::new(
                 "session",
                 "subscription",
@@ -6650,10 +7227,19 @@ mod tests {
             subscription_reservation: None,
             capture_snapshot: Some(DaemonCaptureSnapshot {
                 session_id: "session".to_string(),
+                capture_id: "capture-1".to_string(),
+                total_bytes: 5,
+                page_bytes: SNAPSHOT_PAGE_BYTES as u32,
+                pages: 1,
                 rows: 24,
                 cols: 80,
-                payload_format: Some("opaque-snapshot-example-v1".to_string()),
-                payload_bytes: 5,
+                unavailable: None,
+            }),
+            snapshot_page: Some(DaemonSnapshotPage {
+                session_id: "session".to_string(),
+                capture_id: "capture-1".to_string(),
+                page: 0,
+                payload: DaemonOpaqueHistoryPayload::from_bytes(&[0, 255, 71, 84, 89]),
             }),
             spawn_targets: vec![DaemonSpawnTarget {
                 target_id: "tgt_example".to_string(),
@@ -6990,31 +7576,6 @@ mod tests {
                 session_id: "session".to_string(),
                 state: "running".to_string(),
             },
-            DaemonEvent::TerminalOutput {
-                session_id: "session".to_string(),
-                subscription_id: "subscription".to_string(),
-                payload: DaemonLiveOutputPayload::from_bytes(b"output"),
-            },
-            DaemonEvent::Snapshot {
-                session_id: "session".to_string(),
-                subscription_id: "subscription".to_string(),
-                history: DaemonOpaqueHistoryPayload::from_bytes(b"snapshot"),
-            },
-            DaemonEvent::Scrollback {
-                session_id: "session".to_string(),
-                subscription_id: "subscription".to_string(),
-                history: DaemonOpaqueHistoryPayload::from_bytes(b"scrollback"),
-            },
-            DaemonEvent::ProcessExit {
-                session_id: "session".to_string(),
-                subscription_id: "subscription".to_string(),
-                code: Some(0),
-            },
-            DaemonEvent::AttachState {
-                session_id: "session".to_string(),
-                subscription_id: "subscription".to_string(),
-                state: "attached".to_string(),
-            },
             DaemonEvent::RuntimeObservation {
                 kind: "observation".to_string(),
             },
@@ -7047,11 +7608,6 @@ mod tests {
     fn daemon_event_tag(event: &DaemonEvent) -> &'static str {
         match event {
             DaemonEvent::SessionLifecycle { .. } => "session_lifecycle",
-            DaemonEvent::TerminalOutput { .. } => "terminal_output",
-            DaemonEvent::Snapshot { .. } => "snapshot",
-            DaemonEvent::Scrollback { .. } => "scrollback",
-            DaemonEvent::ProcessExit { .. } => "process_exit",
-            DaemonEvent::AttachState { .. } => "attach_state",
             DaemonEvent::RuntimeObservation { .. } => "runtime_observation",
             DaemonEvent::WorktreeLifecycle { .. } => "worktree_lifecycle",
             DaemonEvent::TerminalSubscriptionClosed { .. } => "terminal_subscription_closed",
@@ -7061,68 +7617,304 @@ mod tests {
     }
 
     #[test]
-    fn hello_ack_missing_compatibility_reports_precompatibility_hub() {
+    fn newline_json_hello_ack_reports_a_protocol_nine_predating_hub() {
         let (mut server, mut client) = UnixStream::pair().expect("pair unix streams");
         server
-            .write_all(br#"{"protocol":"botster-hub-daemon-v1"}"#)
+            .write_all(br#"{"protocol":"botster-hub-daemon-v1","compatibility":{}}"#)
             .expect("write old hello ack");
         server.write_all(b"\n").expect("write newline");
 
         let error = read_hello_ack(&mut client).expect_err("old hello ack should fail");
 
         assert!(matches!(error, DaemonTransportError::Compatibility(_)));
-        assert_eq!(error.to_string(), "hub predates compatibility handshake");
+        assert_eq!(
+            error.to_string(),
+            "hub predates host-control protocol 9 framing"
+        );
     }
 
     #[test]
-    fn status_missing_compatibility_reports_precompatibility_hub() {
+    fn malformed_hello_ack_frame_reports_a_typed_protocol_violation() {
         let (mut server, mut client) = UnixStream::pair().expect("pair unix streams");
+        let payload = br#"{"frame":"hello_ack","ack":{"protocol":1}}"#;
+        let frame_len = (1 + payload.len()) as u32;
         server
-            .write_all(
-                br#"{"kind":"status","status":{"lifecycle_state":"running","host_id":"hub","host_display_name":"Hub","schema_version":1,"data_dir_configured":true,"core_initialized":true,"state_source":"initialized","package_count":0,"enabled_package_count":0,"provider_count":0,"enabled_provider_count":0,"session_count":0,"recovered_sessions":[],"stale_sessions":[]},"sessions":[],"packages":[],"lifecycle":[],"events":[],"package_decision":null,"cleanup":null,"coordination":null,"error":null}"#,
-            )
-            .expect("write old status response");
-        server.write_all(b"\n").expect("write newline");
-
-        let error = read_daemon_response(&mut client).expect_err("old status response should fail");
-
-        assert!(matches!(error, DaemonTransportError::Compatibility(_)));
-        assert_eq!(error.to_string(), "hub predates compatibility handshake");
-    }
-
-    #[test]
-    fn malformed_hello_ack_still_reports_json_error() {
-        let (mut server, mut client) = UnixStream::pair().expect("pair unix streams");
+            .write_all(&frame_len.to_le_bytes())
+            .expect("write length prefix");
         server
-            .write_all(br#"{"protocol":"botster-hub-daemon-v1","compatibility":"wrong"}"#)
+            .write_all(&[UNIX_CONTAINER_CONTROL])
+            .expect("write container");
+        server
+            .write_all(payload)
             .expect("write malformed hello ack");
-        server.write_all(b"\n").expect("write newline");
 
         let error = read_hello_ack(&mut client).expect_err("malformed ack should fail");
 
-        assert!(matches!(error, DaemonTransportError::Json(_)));
+        assert!(matches!(
+            error,
+            DaemonTransportError::ProtocolViolation(DaemonProtocolErrorCode::MalformedFrame)
+        ));
     }
 
     #[test]
-    fn malformed_status_still_reports_json_error() {
+    fn unknown_container_and_oversized_length_are_protocol_errors() {
         let (mut server, mut client) = UnixStream::pair().expect("pair unix streams");
         server
-            .write_all(
-                br#"{"kind":"status","status":{"compatibility":"wrong"},"sessions":[],"packages":[],"lifecycle":[],"events":[],"package_decision":null,"cleanup":null,"coordination":null,"error":null}"#,
-            )
-            .expect("write malformed status response");
-        server.write_all(b"\n").expect("write newline");
+            .write_all(&3u32.to_le_bytes())
+            .expect("write length prefix");
+        server
+            .write_all(&[9, 0, 0])
+            .expect("write unknown container");
+        let mut frames = DaemonUnixFrameReader::new();
+        let error = frames
+            .read_frame(&mut client)
+            .expect_err("unknown container must fail");
+        assert!(matches!(
+            error,
+            DaemonTransportError::ProtocolViolation(DaemonProtocolErrorCode::UnknownContainer)
+        ));
 
-        let error = read_daemon_response(&mut client).expect_err("malformed status should fail");
+        let (mut server, mut client) = UnixStream::pair().expect("pair unix streams");
+        server
+            .write_all(&((MAX_UNIX_FRAME_BYTES as u32) + 1).to_le_bytes())
+            .expect("write oversized prefix");
+        let mut frames = DaemonUnixFrameReader::new();
+        let error = frames
+            .read_frame(&mut client)
+            .expect_err("oversized declared length must fail before any allocation");
+        assert!(matches!(error, DaemonTransportError::Protocol(_)));
+    }
 
-        assert!(matches!(error, DaemonTransportError::Json(_)));
+    #[test]
+    fn request_ids_are_canonical_decimal_u64_values() {
+        assert_eq!(parse_request_id("1"), Some(1));
+        assert_eq!(parse_request_id("18446744073709551615"), Some(u64::MAX));
+        assert_eq!(parse_request_id(""), None);
+        assert_eq!(parse_request_id("0"), None);
+        assert_eq!(parse_request_id("01"), None);
+        assert_eq!(parse_request_id("-1"), None);
+        assert_eq!(parse_request_id("1a"), None);
+        assert_eq!(parse_request_id("18446744073709551616"), None);
+        assert_eq!(parse_request_id("100000000000000000000"), None);
+        assert_eq!(encode_request_id(42), "42");
+        assert_eq!(encode_request_id(42).len() <= MAX_REQUEST_ID_BYTES, true);
+
+        let mut ids = RequestIdSequence::new();
+        assert_eq!(ids.last(), 0);
+        assert_eq!(ids.next(), 1);
+        assert_eq!(ids.next(), 2);
+        assert_eq!(ids.last(), 2);
+    }
+
+    #[test]
+    fn client_and_server_frames_are_tagged_by_frame() {
+        let request = ClientFrame::Request {
+            request_id: "7".to_string(),
+            request: DaemonRequest::Status,
+        };
+        let value = serde_json::to_value(&request).expect("client frame serializes");
+        assert_eq!(value["frame"], "request");
+        assert_eq!(value["request_id"], "7");
+        assert_eq!(value["request"]["type"], "status");
+        assert_eq!(
+            serde_json::from_value::<ClientFrame>(value).expect("client frame deserializes"),
+            request
+        );
+
+        let hello = ClientFrame::Hello {
+            hello: DaemonHello {
+                protocol: PROTOCOL.to_string(),
+                compatibility: DaemonCompatibilityRequirement::current(),
+                terminal_compatibility: None,
+            },
+        };
+        let value = serde_json::to_value(&hello).expect("hello serializes");
+        assert_eq!(value["frame"], "hello");
+        assert_eq!(value["hello"]["protocol"], PROTOCOL);
+
+        let frames = vec![
+            ServerFrame::HelloAck {
+                ack: DaemonHelloAck {
+                    protocol: PROTOCOL.to_string(),
+                    compatibility: DaemonCompatibility::current(),
+                    terminal_compatibility: None,
+                    diagnostics: Vec::new(),
+                },
+            },
+            ServerFrame::Response {
+                request_id: "7".to_string(),
+                response: daemon_response_example(DaemonResponseKind::Status),
+            },
+            ServerFrame::Event {
+                event: DaemonEvent::SessionLifecycle {
+                    session_id: "session".to_string(),
+                    state: "running".to_string(),
+                },
+            },
+            ServerFrame::Entity {
+                entity: DaemonEntityFrame::Remove {
+                    subscription_id: "subscription".to_string(),
+                    entity_type: "session".to_string(),
+                    snapshot_seq: 4,
+                    id: "session".to_string(),
+                },
+            },
+            ServerFrame::Close {
+                reason: DaemonCloseReason::ProtocolError {
+                    code: DaemonProtocolErrorCode::NonincreasingRequestId,
+                },
+            },
+        ];
+        let tags = ["hello_ack", "response", "event", "entity", "close"];
+        for (frame, tag) in frames.into_iter().zip(tags) {
+            let value = serde_json::to_value(&frame).expect("server frame serializes");
+            assert_eq!(value["frame"], tag);
+            assert_eq!(
+                serde_json::from_value::<ServerFrame>(value).expect("server frame deserializes"),
+                frame
+            );
+        }
+        let close = serde_json::to_value(ServerFrame::Close {
+            reason: DaemonCloseReason::ProtocolError {
+                code: DaemonProtocolErrorCode::FrameTooLarge,
+            },
+        })
+        .expect("close serializes");
+        assert_eq!(close["reason"]["reason"], "protocol_error");
+        assert_eq!(close["reason"]["code"], "frame_too_large");
+    }
+
+    #[test]
+    fn terminal_container_round_trips_route_generation_and_opaque_body() {
+        let body = [2u8, 1, 0, 0, 3, 0, 0, 0, b'a', b'b', b'c'];
+        let frame = encode_unix_terminal_frame("sub-1", 9, &body).expect("encode container");
+        let frame_len = u32::from_le_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
+        assert_eq!(frame_len, frame.len() - UNIX_FRAME_LENGTH_PREFIX_BYTES);
+        assert_eq!(frame[4], UNIX_CONTAINER_TERMINAL);
+        let header = UnixTerminalContainerHeader::new("sub-1", 9, body.len()).expect("header");
+        assert_eq!(&frame[..header.as_bytes().len()], header.as_bytes());
+        assert_eq!(
+            header.as_bytes().len(),
+            UNIX_FRAME_LENGTH_PREFIX_BYTES + 1 + UNIX_TERMINAL_CONTAINER_FIXED_BYTES + 5
+        );
+
+        match decode_unix_frame::<ServerFrame>(&frame[UNIX_FRAME_LENGTH_PREFIX_BYTES..])
+            .expect("decode container")
+        {
+            DaemonUnixFrame::Terminal(decoded) => {
+                assert_eq!(decoded.route, "sub-1");
+                assert_eq!(decoded.generation, 9);
+                assert_eq!(decoded.body, body);
+            }
+            DaemonUnixFrame::Control(_) => panic!("terminal container decoded as control"),
+        }
+
+        assert!(UnixTerminalContainerHeader::new("", 1, 0).is_none());
+        let long_route = "r".repeat(MAX_UNIX_TERMINAL_ROUTE_BYTES + 1);
+        assert!(UnixTerminalContainerHeader::new(&long_route, 1, 0).is_none());
+        let max_route = "r".repeat(MAX_UNIX_TERMINAL_ROUTE_BYTES);
+        assert!(UnixTerminalContainerHeader::new(&max_route, 1, 0).is_some());
+        assert!(UnixTerminalContainerHeader::new("route", 1, MAX_UNIX_FRAME_BYTES).is_none());
+
+        let mut control_route = frame.clone();
+        control_route[UNIX_FRAME_LENGTH_PREFIX_BYTES + 1 + 2] = b'\n';
+        assert_eq!(
+            decode_unix_frame::<ServerFrame>(&control_route[UNIX_FRAME_LENGTH_PREFIX_BYTES..])
+                .expect_err("control characters are not a route"),
+            DaemonProtocolErrorCode::InvalidRoute
+        );
+    }
+
+    #[test]
+    fn frame_reader_keeps_a_partial_frame_across_read_timeouts() {
+        let (mut server, mut client) = UnixStream::pair().expect("pair");
+        client
+            .set_read_timeout(Some(Duration::from_millis(30)))
+            .expect("timeout");
+        let frame = encode_unix_terminal_frame("sub", 3, b"a").expect("encode");
+        let mut frames = DaemonUnixFrameReader::new();
+        server.write_all(&frame[..3]).expect("write partial prefix");
+        let first = frames.read_frame(&mut client);
+        assert!(
+            matches!(
+                &first,
+                Err(DaemonTransportError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    )
+            ),
+            "partial prefix must time out, got {first:?}"
+        );
+        assert!(frames.has_partial_frame());
+        server.write_all(&frame[3..9]).expect("write partial body");
+        let second = frames.read_frame(&mut client);
+        assert!(second.is_err(), "partial body must time out");
+        assert!(frames.has_partial_frame());
+        server.write_all(&frame[9..]).expect("write rest");
+        match frames.read_frame(&mut client).expect("complete frame") {
+            DaemonUnixMuxFrame::Terminal(decoded) => {
+                assert_eq!(decoded.route, "sub");
+                assert_eq!(decoded.generation, 3);
+                assert_eq!(decoded.body, b"a");
+            }
+            other => panic!("expected terminal frame, got {other:?}"),
+        }
+        assert!(!frames.has_partial_frame());
+    }
+
+    #[test]
+    fn local_webrtc_terminal_chunk_header_round_trips_and_bounds_declared_counts() {
+        let header = LocalWebrtcTerminalChunkHeader {
+            message_id: 7,
+            chunk_index: 1,
+            chunk_count: 3,
+            total_bytes: 30_000,
+            generation: 11,
+        };
+        let sealed =
+            vec![
+                0u8;
+                LOCAL_WEBRTC_TERMINAL_CHUNK_NONCE_BYTES + 5 + LOCAL_WEBRTC_TERMINAL_CHUNK_TAG_BYTES
+            ];
+        let mut message = header.encode().to_vec();
+        message.extend_from_slice(&sealed);
+        assert_eq!(
+            message.len(),
+            LOCAL_WEBRTC_TERMINAL_CHUNK_HEADER_BYTES + sealed.len()
+        );
+        let (decoded, slice) = LocalWebrtcTerminalChunkHeader::decode(&message).expect("decode");
+        assert_eq!(decoded, header);
+        assert_eq!(slice, &sealed[..]);
+
+        let mut wrong_version = message.clone();
+        wrong_version[0] = 1;
+        assert!(LocalWebrtcTerminalChunkHeader::decode(&wrong_version).is_none());
+        let short = &message[..LOCAL_WEBRTC_TERMINAL_CHUNK_HEADER_BYTES + 3];
+        assert!(LocalWebrtcTerminalChunkHeader::decode(short).is_none());
+        let inverted = LocalWebrtcTerminalChunkHeader {
+            chunk_index: 3,
+            ..header
+        };
+        let mut inverted_message = inverted.encode().to_vec();
+        inverted_message.extend_from_slice(&sealed);
+        assert!(LocalWebrtcTerminalChunkHeader::decode(&inverted_message).is_none());
+        let oversized = LocalWebrtcTerminalChunkHeader {
+            total_bytes: (LOCAL_WEBRTC_MAX_DELIVERY_BYTES + 1) as u32,
+            chunk_count: u32::MAX,
+            chunk_index: 0,
+            ..header
+        };
+        let mut oversized_message = oversized.encode().to_vec();
+        oversized_message.extend_from_slice(&sealed);
+        assert!(LocalWebrtcTerminalChunkHeader::decode(&oversized_message).is_none());
     }
 
     #[test]
     fn local_webrtc_delivery_chunk_is_serde_stable_and_generated() {
         let chunk = DaemonLocalWebrtcDeliveryChunk {
             version: LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION,
-            delivery_kind: DaemonLocalWebrtcDeliveryKind::DaemonEntityFrame,
+            delivery_kind: DaemonLocalWebrtcDeliveryKind::ServerFrame,
             message_id: "response-fixture".to_string(),
             chunk_index: 1,
             chunk_count: 3,
@@ -7214,9 +8006,9 @@ mod tests {
     }
 
     #[test]
-    fn protocol_six_and_conformance_thirty_two_define_the_cold_cut_boundary() {
-        assert_eq!(PROTOCOL_VERSION, 8);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 48);
+    fn protocol_nine_and_conformance_forty_nine_define_the_cold_cut_boundary() {
+        assert_eq!(PROTOCOL_VERSION, 9);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 49);
 
         let requirement = DaemonCompatibilityRequirement::current();
         let protocol_error = ensure_compatible(
@@ -7269,7 +8061,7 @@ mod tests {
         .expect("serialize current status");
         let stale: StaleStatus =
             serde_json::from_value(status_value).expect("stale status ignores additive identity");
-        assert_eq!(stale.compatibility.protocol_version, 8);
+        assert_eq!(stale.compatibility.protocol_version, 9);
         assert_eq!(stale.host_id, "hub");
         assert_eq!(stale.schema_version, 1);
     }
@@ -7277,12 +8069,11 @@ mod tests {
     #[test]
     fn additive_session_type_definition_read_rides_the_conformance_floor() {
         // `ensure_compatible` compares protocol version with exact equality and
-        // conformance revision with a floor, so an additive request must ride the
-        // conformance revision: bumping the protocol would break every existing
-        // first-party client that never issues this request.
-        assert_eq!(PROTOCOL_VERSION, 8);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 48);
-        assert_eq!(DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION, 36);
+        // conformance revision with a floor. Protocol 9 is a cold cut, so the
+        // default floor equals the current revision.
+        assert_eq!(PROTOCOL_VERSION, 9);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 49);
+        assert_eq!(DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION, 49);
         assert_eq!(
             current_feature_list(),
             vec![
@@ -7324,12 +8115,12 @@ mod tests {
             "the default client requirement excludes optional capabilities",
         );
 
-        let pinned_at_thirty_one = DaemonCompatibilityRequirement {
-            minimum_conformance_fixture_revision: 31,
+        let pinned_at_forty_nine = DaemonCompatibilityRequirement {
+            minimum_conformance_fixture_revision: 49,
             ..DaemonCompatibilityRequirement::current()
         };
-        ensure_compatible(&pinned_at_thirty_one, &DaemonCompatibility::current())
-            .expect("a protocol-6 client pinned at conformance 31 still accepts a revision-32 Hub");
+        ensure_compatible(&pinned_at_forty_nine, &DaemonCompatibility::current())
+            .expect("a protocol-9 client pinned at conformance 49 accepts a revision-49 Hub");
 
         assert_eq!(
             daemon_request_tag(&DaemonRequest::ShowSessionTypeDefinition {
