@@ -714,11 +714,13 @@ fn create_real_build_update_source(root: &Path) -> PathBuf {
 }
 
 fn read_worker_identity(data_dir: &Path, session_id: &str) -> (u32, PathBuf) {
-    let record: serde_json::Value = serde_json::from_slice(
-        &fs::read(data_dir.join("sessions").join(format!("{session_id}.json"))).unwrap(),
-    )
-    .unwrap();
-    let recovery = &record["recovery_identity"];
+    // Core owns the registry filename encoding; read the record through its identity-checked
+    // loader rather than a privately constructed path.
+    let record = botster_core_daemon::SessionRegistry::new(data_dir)
+        .load(&botster_core::SessionId(session_id.to_string()))
+        .unwrap()
+        .unwrap();
+    let recovery = record.recovery_identity.unwrap();
     (
         recovery["worker_pid"].as_u64().unwrap() as u32,
         PathBuf::from(recovery["worker_control_socket"].as_str().unwrap()),

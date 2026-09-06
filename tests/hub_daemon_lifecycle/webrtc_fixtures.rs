@@ -1065,9 +1065,10 @@ impl LocalWebrtcOfferPeer {
         plaintext: &[u8],
     ) -> Result<(), Box<dyn std::error::Error>> {
         if !self.accept_host_events {
-            return Err(std::io::Error::other(
-                "unnegotiated IsolatedHub receive path must not decode daemon_event",
-            )
+            return Err(std::io::Error::other(format!(
+                "unnegotiated IsolatedHub receive path must not decode daemon_event: {}",
+                String::from_utf8_lossy(plaintext)
+            ))
             .into());
         }
         self.pending_host.try_park(plaintext)
