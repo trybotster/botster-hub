@@ -1299,6 +1299,10 @@ mod tests {
         let mut harness = PeerHarness::new("remote-closed-subscription");
         let mut peer = harness.signal_peer("http://127.0.0.1:41919");
         harness.ensure_webrtc_adapter_hello(&mut peer);
+        // The driver reports why a terminal channel stopped as a RuntimeObservation host
+        // event to the owning peer, admission-free (`observe_terminal_driver_exit`). This
+        // peer parks host events so that report can be asserted after the remote close.
+        peer.enable_host_events();
         let session_id = "remote-close-session";
         let subscription_id = "remote-close-target";
         harness.spawn_and_attach_on_peer(&mut peer, session_id, subscription_id);
@@ -1351,6 +1355,18 @@ mod tests {
                 .is_some(),
             "a bound terminal label must hold a budget slot before the remote close"
         );
+        // The route generation the driver will name in its exit observation, read from the
+        // live Core inventory for this exact route rather than assumed.
+        let route_generation = harness
+            .daemon
+            .runtime_mut()
+            .expect("runtime")
+            .list_terminal_subscriptions()
+            .iter()
+            .find(|row| row.session_id.0 == session_id && row.subscription_id.0 == subscription_id)
+            .expect("the bound route must be live before the remote close")
+            .generation
+            .0;
         peer.offer_runtime
             .block_on(channel.close())
             .expect("remote close");
@@ -1443,6 +1459,18 @@ mod tests {
             sibling_response.kind,
             botster_hub_client::DaemonResponseKind::EntitySubscribed,
             "the host sibling must carry a request and response after remote close"
+        );
+        // The driver's exit report for this route is the positive proof that the Hub
+        // observed the remote close on the production owner path.
+        let observed = harness.wait_for_host_event(&mut peer, "remote close observation");
+        assert_eq!(
+            observed,
+            botster_hub_client::DaemonEvent::RuntimeObservation {
+                kind: format!(
+                    "terminal_channel_closed:{subscription_id}:{route_generation}:remote_close"
+                ),
+            },
+            "the owning peer must receive exactly the driver's remote-close observation"
         );
         peer.offer_runtime.block_on(async {
             assert!(
