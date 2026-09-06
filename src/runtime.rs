@@ -18,15 +18,16 @@ use botster_core::{
     TerminalSubscriptionGeneration, TerminalSubscriptionRecord,
 };
 use botster_core_daemon::{
-    AcknowledgeRoutedEnvelopeRequest, AttachedSession, CaptureSnapshotRequest,
-    CaptureSnapshotResult, CoreDaemonConfig, CoreDaemonError, DaemonSession,
+    AcknowledgeRoutedEnvelopeRequest, CaptureId, CaptureOwner, CaptureSnapshotRequest,
+    CoreCompletion, CoreDaemonConfig, CoreDaemonError, CoreOperation, DaemonSession,
     DetachTerminalSubscriptionResult, DrainRoutedEnvelopesRequest, GuardedWriteRequest,
     GuardedWriteResult, LifecycleBaselineBudget, ObserveLifecycleBudget, ObserveLifecycleCursor,
-    ObserveLifecycleSlice, PublishRoutedEnvelopeRequest, ReadModeFlagsRequest, ReadModeFlagsResult,
-    ReadScreenRequest, ReadScreenResult, RegistrySessionState, RoutedEnvelopeDeliveryStateResult,
-    SessionAdoptionReport, SessionAdoptionState, SessionLifecycleBaselinePage,
-    SessionLifecycleCursor, SessionLifecycleLookup, SessionLifecyclePage,
-    SessionLifecyclePageError, SessionRegistryStateLookup, SpawnSessionRequest,
+    ObserveLifecycleSlice, PendingOperationId, PublishRoutedEnvelopeRequest, ReadModeFlagsRequest,
+    ReadScreenRequest, RegistrySessionState, RetentionAccounting, RetentionPolicy,
+    RoutedEnvelopeDeliveryStateResult, SessionAdoptionReport, SessionAdoptionState,
+    SessionLifecycleBaselinePage, SessionLifecycleCursor, SessionLifecycleLookup,
+    SessionLifecyclePage, SessionLifecyclePageError, SessionRegistryStateLookup, SnapshotPage,
+    SpawnSessionRequest,
 };
 use botster_ui_contract::{UiActionRequest, UiActionResult, UiNode};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -43,6 +44,9 @@ use crate::config::HubConfig;
 use crate::credentials::{
     CredentialPolicyError, CredentialProviderKind, OsKeychainCredentialStore,
     validate_hub_credentials,
+};
+use crate::data_plane::driver::{
+    CoreCompletionReceiver, CoreTicket, CoreTicketError, CoreTicketPoll,
 };
 use crate::lifecycle::{
     HubLifecycleResult, HubPluginLifecycle, HubPluginLifecycleStatus, HubPluginRuntimeBundle,
@@ -91,6 +95,10 @@ pub struct HubRuntime {
     // hold a read guard across `replace_state`, which takes the write guard.
     state: RwLock<HubState>,
     core_daemon: SharedCoreDaemon,
+    core_completions: CoreCompletionReceiver,
+    completed_operations: Mutex<BTreeMap<PendingOperationId, CoreCompletion>>,
+    detached_operations: Mutex<Vec<CoreOperationTracker>>,
+    inflight_plugin_core: Mutex<Vec<InflightPluginCore>>,
     close_work: crate::data_plane::CloseWorkSource,
     data_plane: Option<crate::data_plane::DataPlaneDriver>,
     reconciliation: HubSessionReconciliation,
@@ -109,8 +117,6 @@ pub struct HubRuntime {
     session_contexts: SharedSessionContexts,
     package_event_router: Arc<crate::package_event_router::PackageEventRouter>,
     event_plane_counters: Arc<crate::event_plane_counters::EventPlaneCounters>,
-    test_seams: HubTestSeams,
-    drop_journal_wakes_remaining: std::sync::atomic::AtomicU32,
     causal_scopes: Arc<crate::package_event_router::CausalScopeTable>,
     unfinished_finishes: Mutex<VecDeque<CausalOp>>,
     unfinished_overflow: Mutex<VecDeque<CausalOp>>,
@@ -222,7 +228,15 @@ type ManagedGitSubmission = (
 
 enum ManagedGitOwnerPhase {
     Preparing,
+    /// Core is launching the session; the owner polls the spawn tracker.
+    Spawning(ManagedSessionSpawnStart),
     Finalizing,
+}
+
+/// One managed session spawn in flight on the Core owner thread.
+struct ManagedSessionSpawnStart {
+    tracker: CoreOperationTracker,
+    context: HubSessionContext,
 }
 
 struct PendingManagedGitOperation {
@@ -268,23 +282,28 @@ pub struct HubSessionReconciliation {
     pub recovered_sessions: Vec<SessionId>,
     /// Registry-backed sessions that were marked stale by hub startup policy.
     pub stale_sessions: Vec<SessionId>,
+    /// Live workers whose protocol evidence did not match this Hub.
+    pub incompatible_sessions: Vec<SessionId>,
 }
 
 impl HubRuntime {
     /// Build a hub runtime from explicit, already-validated hub config.
-    #[must_use]
-    pub fn new(config: HubConfig) -> Self {
+    ///
+    /// # Errors
+    /// Returns an error when the plugin database cannot be opened.
+    pub fn new(config: HubConfig) -> HubRuntimeResult<Self> {
         let state = HubState::from_config(&config);
-        let test_seams = hub_test_seams();
-        let core_config = core_daemon_config(&config, &test_seams);
+        let core_config = core_daemon_config(&config);
         let plugin_worker_config = config.plugin_worker_config();
-        let (close_work, data_plane, core_daemon) = start_data_plane(core_config);
+        let (close_work, data_plane, core_daemon, core_completions) = start_data_plane(core_config);
         let package_event_router = Arc::new(crate::package_event_router::PackageEventRouter::new(
             config.package_event_plane,
         ));
         let event_plane_counters = Arc::clone(package_event_router.counters());
-        Self {
-            capability_runtime: Arc::new(Mutex::new(HubCapabilityRuntime::from_config(&config))),
+        Ok(Self {
+            capability_runtime: Arc::new(Mutex::new(
+                HubCapabilityRuntime::from_config(&config).map_err(HubRuntimeError::Capability)?,
+            )),
             spawn_targets: Arc::new(Mutex::new(state.spawn_targets.clone())),
             worktrees: Arc::new(Mutex::new(state.worktrees.clone())),
             session_type_spawner: Arc::new(HubSessionTypeSpawner::new()),
@@ -297,6 +316,10 @@ impl HubRuntime {
             config,
             state: RwLock::new(state),
             core_daemon,
+            core_completions,
+            completed_operations: Mutex::new(BTreeMap::new()),
+            detached_operations: Mutex::new(Vec::new()),
+            inflight_plugin_core: Mutex::new(Vec::new()),
             close_work,
             data_plane: Some(data_plane),
             reconciliation: HubSessionReconciliation::default(),
@@ -305,10 +328,6 @@ impl HubRuntime {
             session_contexts: Arc::new(Mutex::new(BTreeMap::new())),
             package_event_router,
             event_plane_counters,
-            drop_journal_wakes_remaining: std::sync::atomic::AtomicU32::new(
-                test_seams.drop_journal_wakes.unwrap_or(0),
-            ),
-            test_seams,
             causal_scopes: Arc::new(crate::package_event_router::CausalScopeTable::new()),
             unfinished_finishes: Mutex::new(VecDeque::new()),
             unfinished_overflow: Mutex::new(VecDeque::new()),
@@ -329,7 +348,7 @@ impl HubRuntime {
             force_plugin_admit_backpressure: std::sync::atomic::AtomicBool::new(false),
             pending_test_event_settlements: Mutex::new(Vec::new()),
             force_park_test_events: std::sync::atomic::AtomicBool::new(false),
-        }
+        })
     }
 
     /// Load durable hub state from the resolved data directory before building runtime.
@@ -383,16 +402,17 @@ impl HubRuntime {
     }
 
     fn from_validated_state(config: HubConfig, state: HubState) -> HubRuntimeResult<Self> {
-        let test_seams = hub_test_seams();
-        let core_config = core_daemon_config(&config, &test_seams);
+        let core_config = core_daemon_config(&config);
         let plugin_worker_config = config.plugin_worker_config();
-        let (close_work, data_plane, core_daemon) = start_data_plane(core_config);
+        let (close_work, data_plane, core_daemon, core_completions) = start_data_plane(core_config);
         let package_event_router = Arc::new(crate::package_event_router::PackageEventRouter::new(
             config.package_event_plane,
         ));
         let event_plane_counters = Arc::clone(package_event_router.counters());
         let mut runtime = Self {
-            capability_runtime: Arc::new(Mutex::new(HubCapabilityRuntime::from_config(&config))),
+            capability_runtime: Arc::new(Mutex::new(
+                HubCapabilityRuntime::from_config(&config).map_err(HubRuntimeError::Capability)?,
+            )),
             spawn_targets: Arc::new(Mutex::new(state.spawn_targets.clone())),
             worktrees: Arc::new(Mutex::new(state.worktrees.clone())),
             session_type_spawner: Arc::new(HubSessionTypeSpawner::new()),
@@ -405,6 +425,10 @@ impl HubRuntime {
             config,
             state: RwLock::new(state),
             core_daemon,
+            core_completions,
+            completed_operations: Mutex::new(BTreeMap::new()),
+            detached_operations: Mutex::new(Vec::new()),
+            inflight_plugin_core: Mutex::new(Vec::new()),
             close_work,
             data_plane: Some(data_plane),
             reconciliation: HubSessionReconciliation::default(),
@@ -413,10 +437,6 @@ impl HubRuntime {
             session_contexts: Arc::new(Mutex::new(BTreeMap::new())),
             package_event_router,
             event_plane_counters,
-            drop_journal_wakes_remaining: std::sync::atomic::AtomicU32::new(
-                test_seams.drop_journal_wakes.unwrap_or(0),
-            ),
-            test_seams,
             causal_scopes: Arc::new(crate::package_event_router::CausalScopeTable::new()),
             unfinished_finishes: Mutex::new(VecDeque::new()),
             unfinished_overflow: Mutex::new(VecDeque::new()),
@@ -439,6 +459,16 @@ impl HubRuntime {
             force_park_test_events: std::sync::atomic::AtomicBool::new(false),
         };
         runtime.reconcile_sessions(0)?;
+        if !runtime.reconciliation.incompatible_sessions.is_empty() {
+            return Err(HubRuntimeError::IncompatibleWorkers {
+                sessions: runtime
+                    .reconciliation
+                    .incompatible_sessions
+                    .iter()
+                    .map(|session_id| session_id.0.clone())
+                    .collect(),
+            });
+        }
         Ok(runtime)
     }
 
@@ -537,7 +567,6 @@ impl HubRuntime {
             worktrees: self.worktrees.clone(),
             package_event_router: self.package_event_router.clone(),
             causal_scopes: self.causal_scopes.clone(),
-            event_handler_hold_ms: self.test_seams.event_handler_hold_ms,
         }
     }
 
@@ -554,25 +583,6 @@ impl HubRuntime {
     #[must_use]
     pub fn event_plane_counters_snapshot(&self) -> botster_hub_client::DaemonObservabilityCounters {
         self.event_plane_counters.snapshot()
-    }
-
-    #[must_use]
-    pub fn test_seams(&self) -> &HubTestSeams {
-        &self.test_seams
-    }
-
-    /// True while the startup-parsed hold path exists. Production stays on `None`.
-    #[must_use]
-    pub fn journal_pull_held(&self) -> bool {
-        self.test_seams
-            .hold_journal_pull
-            .as_ref()
-            .is_some_and(|path| path.exists())
-    }
-
-    #[cfg(test)]
-    pub fn test_set_seams(&mut self, seams: HubTestSeams) {
-        self.test_seams = seams;
     }
 
     #[must_use]
@@ -1823,13 +1833,68 @@ impl HubRuntime {
 
     fn fulfill_pending_session_type_spawns(&self) {
         while let Some(pending) = self.session_type_spawner.take_pending() {
-            let result = self.fulfill_session_type_spawn(&pending);
-            if pending.response.send(result.clone()).is_err()
-                && let Ok(spawned) = result
-            {
-                self.cleanup_undelivered_session_type_spawn(&spawned);
+            match self.fulfill_session_type_spawn(&pending) {
+                Ok(start) => {
+                    if let Ok(mut inflight) = self.inflight_plugin_core.lock() {
+                        inflight.push(InflightPluginCore::SessionTypeSpawn {
+                            start,
+                            response: pending.response,
+                        });
+                    }
+                }
+                Err(error) => {
+                    let _ = pending.response.send(Err(error));
+                }
             }
         }
+        self.advance_inflight_plugin_core();
+    }
+
+    /// Poll every plugin-facing Core operation and deliver finished results.
+    fn advance_inflight_plugin_core(&self) {
+        let Ok(mut inflight) = self.inflight_plugin_core.lock() else {
+            return;
+        };
+        let mut retained = Vec::with_capacity(inflight.len());
+        for mut entry in inflight.drain(..) {
+            match &mut entry {
+                InflightPluginCore::Coordination { ticket, .. } => match ticket.poll() {
+                    CoreTicketPoll::Pending => retained.push(entry),
+                    CoreTicketPoll::Ready(result) => {
+                        if let InflightPluginCore::Coordination { response, .. } = entry {
+                            let _ = response.send(result);
+                        }
+                    }
+                    CoreTicketPoll::Lost => {
+                        if let InflightPluginCore::Coordination { response, .. } = entry {
+                            let _ = response.send(Err(CoreTicketError::DriverStopped.to_string()));
+                        }
+                    }
+                },
+                InflightPluginCore::SessionTypeSpawn { start, .. } => {
+                    let completion = match start.tracker.poll(self) {
+                        CoreTicketPoll::Pending => {
+                            retained.push(entry);
+                            continue;
+                        }
+                        CoreTicketPoll::Lost => Err(CoreDaemonError::Shutdown),
+                        CoreTicketPoll::Ready(Err(error)) => Err(error),
+                        CoreTicketPoll::Ready(Ok(CoreCompletion::Spawn { result, .. })) => result,
+                        CoreTicketPoll::Ready(Ok(_)) => Err(CoreDaemonError::Shutdown),
+                    };
+                    let InflightPluginCore::SessionTypeSpawn { start, response } = entry else {
+                        continue;
+                    };
+                    let result = self.finish_session_type_spawn(&start, completion);
+                    if response.send(result.clone()).is_err()
+                        && let Ok(spawned) = result
+                    {
+                        self.cleanup_undelivered_session_type_spawn(&spawned);
+                    }
+                }
+            }
+        }
+        *inflight = retained;
     }
 
     fn fulfill_pending_session_type_reads(&self) {
@@ -1943,6 +2008,9 @@ impl HubRuntime {
                 ManagedGitOwnerPhase::Preparing => {
                     self.advance_preparing_managed_operation(&mut operation)
                 }
+                ManagedGitOwnerPhase::Spawning(_) => {
+                    self.advance_spawning_managed_operation(&mut operation)
+                }
                 ManagedGitOwnerPhase::Finalizing => {
                     self.advance_finalizing_managed_operation(&mut operation)
                 }
@@ -1983,9 +2051,42 @@ impl HubRuntime {
             operation.phase = ManagedGitOwnerPhase::Finalizing;
             return false;
         }
-        let result = self
+        let started = self
             .persist_managed_worktree(&prepared)
             .and_then(|()| self.spawn_prepared_managed_session(&operation.pending, &prepared));
+        match started {
+            Ok(start) => {
+                operation.phase = ManagedGitOwnerPhase::Spawning(start);
+                return false;
+            }
+            Err(error) => {
+                operation.deferred_error = Some(error);
+                let _ = operation.decision.send(ManagedGitDecision::Rollback);
+            }
+        }
+        operation.phase = ManagedGitOwnerPhase::Finalizing;
+        false
+    }
+
+    fn advance_spawning_managed_operation(
+        &self,
+        operation: &mut PendingManagedGitOperation,
+    ) -> bool {
+        let ManagedGitOwnerPhase::Spawning(start) = &mut operation.phase else {
+            return false;
+        };
+        let completion = match start.tracker.poll(self) {
+            CoreTicketPoll::Pending => return false,
+            CoreTicketPoll::Lost => Err(CoreDaemonError::Shutdown),
+            CoreTicketPoll::Ready(Err(error)) => Err(error),
+            CoreTicketPoll::Ready(Ok(CoreCompletion::Spawn { result, .. })) => result,
+            CoreTicketPoll::Ready(Ok(_)) => Err(CoreDaemonError::Shutdown),
+        };
+        let prepared = operation
+            .prepared
+            .clone()
+            .expect("spawning managed operation has prepared worktree");
+        let result = self.finish_managed_session_spawn(start, &prepared, completion);
         match result {
             Ok(spawned) => {
                 if Instant::now() >= operation.pending.accepted_at + MANAGED_GIT_OPERATION_TIMEOUT {
@@ -2123,7 +2224,7 @@ impl HubRuntime {
         &self,
         pending: &PendingManagedSessionSpawn,
         prepared: &PreparedManagedWorktree,
-    ) -> Result<PluginManagedSessionSpawned, ManagedGitError> {
+    ) -> Result<ManagedSessionSpawnStart, ManagedGitError> {
         let session_id = generated_session_uuid()?;
         let records = pending.package_records.iter().collect::<Vec<_>>();
         let state = self.state();
@@ -2154,29 +2255,30 @@ impl HubRuntime {
             contexts.insert(context.context_id.clone(), context.clone());
             contexts.insert(context.session_id.0.clone(), context.clone());
         }
-        let outcome = self
-            .core_daemon
-            .call(move |daemon| {
-                daemon.spawn(
-                    SpawnSessionRequest {
-                        request: materialized.spawn_request,
-                        metadata,
-                    },
-                    current_unix_seconds(),
-                )
-            })
-            .map_err(|error| {
-                eprintln!(
-                    "managed_session_spawn_failed session_id={} core_error={}",
-                    context.session_id.0,
-                    managed_session_core_error_class(&error)
-                );
-                if let Ok(mut contexts) = self.session_contexts.lock() {
-                    contexts.remove(&context.context_id);
-                    contexts.remove(&context.session_id.0);
-                }
-                ManagedGitError::new("spawn_failed", "configured session could not be spawned")
-            })?;
+        let tracker = self.begin_spawn(materialized.spawn_request, metadata);
+        Ok(ManagedSessionSpawnStart { tracker, context })
+    }
+
+    /// Finish one managed session spawn from its Core completion.
+    fn finish_managed_session_spawn(
+        &self,
+        start: &ManagedSessionSpawnStart,
+        prepared: &PreparedManagedWorktree,
+        result: Result<CoreSession, CoreDaemonError>,
+    ) -> Result<PluginManagedSessionSpawned, ManagedGitError> {
+        let context = &start.context;
+        let outcome = result.map_err(|error| {
+            eprintln!(
+                "managed_session_spawn_failed session_id={} core_error={}",
+                context.session_id.0,
+                managed_session_core_error_class(&error)
+            );
+            if let Ok(mut contexts) = self.session_contexts.lock() {
+                contexts.remove(&context.context_id);
+                contexts.remove(&context.session_id.0);
+            }
+            ManagedGitError::new("spawn_failed", "configured session could not be spawned")
+        })?;
         Ok(PluginManagedSessionSpawned {
             session_id: outcome.session_id.0,
             target_id: prepared.target_id.clone(),
@@ -2193,10 +2295,7 @@ impl HubRuntime {
 
     fn cleanup_managed_session(&self, spawned: &PluginManagedSessionSpawned) {
         let session_id = SessionId(spawned.session_id.clone());
-        let shutdown_session_id = session_id.clone();
-        let _ = self
-            .core_daemon
-            .call(move |daemon| daemon.shutdown(Some(shutdown_session_id), current_unix_seconds()));
+        self.shutdown_session_detached(session_id.clone());
         if let Ok(mut contexts) = self.session_contexts.lock() {
             contexts.remove(&session_id.0);
             contexts.remove(&format!("ctx-{}", session_id.0));
@@ -2769,9 +2868,9 @@ impl HubRuntime {
 
     fn fulfill_pending_coordination_requests(&self) {
         while let Some(pending) = self.coordination_bridge.take_pending() {
-            let result = match pending.operation {
+            let ticket = match pending.operation {
                 PendingCoordinationOperation::Publish { envelope } => {
-                    self.core_daemon.call(move |daemon| {
+                    self.core_daemon.submit(move |daemon| {
                         daemon
                             .publish_routed_envelope(PublishRoutedEnvelopeRequest { envelope })
                             .map(HubCoordinationResponse::Publish)
@@ -2782,7 +2881,7 @@ impl HubRuntime {
                     target,
                     after,
                     limit,
-                } => self.core_daemon.call(move |daemon| {
+                } => self.core_daemon.submit(move |daemon| {
                     daemon
                         .drain_routed_envelopes(DrainRoutedEnvelopesRequest {
                             target,
@@ -2795,7 +2894,7 @@ impl HubRuntime {
                 PendingCoordinationOperation::Acknowledge {
                     target,
                     envelope_id,
-                } => self.core_daemon.call(move |daemon| {
+                } => self.core_daemon.submit(move |daemon| {
                     daemon
                         .acknowledge_routed_envelope(AcknowledgeRoutedEnvelopeRequest {
                             target,
@@ -2805,16 +2904,19 @@ impl HubRuntime {
                         .map_err(|error| error.to_string())
                 }),
             };
-            let _ = pending.response.send(result);
+            if let Ok(mut inflight) = self.inflight_plugin_core.lock() {
+                inflight.push(InflightPluginCore::Coordination {
+                    ticket,
+                    response: pending.response,
+                });
+            }
         }
+        self.advance_inflight_plugin_core();
     }
 
     fn cleanup_undelivered_session_type_spawn(&self, spawned: &PluginSessionTypeSpawned) {
         let session_id = SessionId(spawned.session_id.clone());
-        let shutdown_session_id = session_id.clone();
-        let _ = self
-            .core_daemon
-            .call(move |daemon| daemon.shutdown(Some(shutdown_session_id), current_unix_seconds()));
+        self.shutdown_session_detached(session_id.clone());
         if let Ok(mut contexts) = self.session_contexts.lock() {
             contexts.remove(&spawned.context_id);
             contexts.remove(&session_id.0);
@@ -2824,7 +2926,7 @@ impl HubRuntime {
     fn fulfill_session_type_spawn(
         &self,
         pending: &PendingSessionTypeSpawn,
-    ) -> Result<PluginSessionTypeSpawned, String> {
+    ) -> Result<SessionTypeSpawnStart, String> {
         if !package_allows_session_type_spawn(&pending.package_records, &pending.plugin_key) {
             return Err("plugin package lacks session_type_spawn capability".to_string());
         }
@@ -2851,36 +2953,40 @@ impl HubRuntime {
             contexts.insert(context.session_id.0.clone(), context.clone());
         }
 
-        let outcome = self
-            .core_daemon
-            .call(move |daemon| {
-                daemon.spawn(
-                    SpawnSessionRequest {
-                        request: materialized.spawn_request,
-                        metadata,
-                    },
-                    current_unix_seconds(),
-                )
-            })
-            .map_err(|error| match self.session_contexts.lock() {
-                Ok(mut contexts) => {
-                    contexts.remove(&context.context_id);
-                    contexts.remove(&context.session_id.0);
-                    format!("session type spawn failed: {error}")
-                }
-                Err(_) => {
-                    format!(
-                        "session type spawn failed: {error}; session context rollback lock poisoned"
-                    )
-                }
-            })?;
-
-        Ok(PluginSessionTypeSpawned {
-            session_id: outcome.session_id.0,
-            lifecycle: session_lifecycle_label(outcome.lifecycle).to_string(),
+        let tracker = self.begin_spawn(materialized.spawn_request, metadata);
+        Ok(SessionTypeSpawnStart {
+            tracker,
+            context,
             session_type_id: materialized.resolved.session_type.session_type_id,
             context_id: materialized.resolved.context_id,
             context_keys: materialized.resolved.context_keys,
+        })
+    }
+
+    fn finish_session_type_spawn(
+        &self,
+        start: &SessionTypeSpawnStart,
+        result: Result<CoreSession, CoreDaemonError>,
+    ) -> Result<PluginSessionTypeSpawned, String> {
+        let context = &start.context;
+        let outcome = result.map_err(|error| match self.session_contexts.lock() {
+            Ok(mut contexts) => {
+                contexts.remove(&context.context_id);
+                contexts.remove(&context.session_id.0);
+                format!("session type spawn failed: {error}")
+            }
+            Err(_) => {
+                format!(
+                    "session type spawn failed: {error}; session context rollback lock poisoned"
+                )
+            }
+        })?;
+        Ok(PluginSessionTypeSpawned {
+            session_id: outcome.session_id.0,
+            lifecycle: session_lifecycle_label(outcome.lifecycle).to_string(),
+            session_type_id: start.session_type_id.clone(),
+            context_id: start.context_id.clone(),
+            context_keys: start.context_keys.clone(),
         })
     }
 
@@ -3167,21 +3273,12 @@ impl HubRuntime {
     }
 
     /// Return a daemon-recorded session summary.
-    pub fn session(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<Option<DaemonSession>, CoreDaemonError> {
-        let session_id = session_id.clone();
-        Ok(self
-            .core_daemon
-            .call(|daemon| daemon.list())?
-            .into_iter()
-            .find(|session| session.session_id == session_id))
-    }
-
-    /// Return daemon-recorded sessions for host visibility without exposing core's command router.
-    pub fn list_sessions(&self) -> Result<Vec<DaemonSession>, CoreDaemonError> {
-        self.core_daemon.call(|daemon| daemon.list())
+    /// Durable daemon session records, read on the Core owner thread.
+    ///
+    /// The owner loop serves session listings from its projection; this
+    /// ticket exists for threads outside the owner loop.
+    pub fn list_sessions(&self) -> CoreTicket<Result<Vec<DaemonSession>, CoreDaemonError>> {
+        self.core_daemon.submit(|daemon| daemon.list())
     }
 
     /// Return one bounded owner-loop observe slice.
@@ -3190,9 +3287,9 @@ impl HubRuntime {
         now_seconds: u64,
         resume: Option<&ObserveLifecycleCursor>,
         budget: ObserveLifecycleBudget,
-    ) -> Result<ObserveLifecycleSlice, SessionLifecyclePageError> {
+    ) -> CoreTicket<Result<ObserveLifecycleSlice, SessionLifecyclePageError>> {
         let resume = resume.cloned();
-        self.core_daemon.call(move |daemon| {
+        self.core_daemon.submit(move |daemon| {
             daemon.observe_lifecycle_slice(now_seconds, resume.as_ref(), budget)
         })
     }
@@ -3203,10 +3300,10 @@ impl HubRuntime {
         snapshot: Option<&SessionLifecycleCursor>,
         after: Option<&SessionId>,
         budget: LifecycleBaselineBudget,
-    ) -> Result<SessionLifecycleBaselinePage, SessionLifecyclePageError> {
+    ) -> CoreTicket<Result<SessionLifecycleBaselinePage, SessionLifecyclePageError>> {
         let snapshot = snapshot.cloned();
         let after = after.cloned();
-        self.core_daemon.call(move |daemon| {
+        self.core_daemon.submit(move |daemon| {
             daemon.lifecycle_baseline_page(snapshot.as_ref(), after.as_ref(), budget)
         })
     }
@@ -3217,29 +3314,10 @@ impl HubRuntime {
         after: &SessionLifecycleCursor,
         max_changes: usize,
         max_bytes: usize,
-    ) -> Result<SessionLifecyclePage, SessionLifecyclePageError> {
+    ) -> CoreTicket<Result<SessionLifecyclePage, SessionLifecyclePageError>> {
         let after = after.clone();
         self.core_daemon
-            .call(move |daemon| daemon.lifecycle_changes_page(&after, max_changes, max_bytes))
-    }
-
-    /// Take the coalesced Core journal-advanced wake bit.
-    #[must_use]
-    pub fn take_journal_advanced_wake(&self) -> bool {
-        let woke = self
-            .core_daemon
-            .call(|daemon| daemon.take_journal_advanced_wake());
-        if woke
-            && self
-                .drop_journal_wakes_remaining
-                .load(std::sync::atomic::Ordering::Relaxed)
-                > 0
-        {
-            self.drop_journal_wakes_remaining
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            return false;
-        }
-        woke
+            .submit(move |daemon| daemon.lifecycle_changes_page(&after, max_changes, max_bytes))
     }
 
     /// Admit ready package-event deliveries and wait for completions.
@@ -3504,30 +3582,26 @@ impl HubRuntime {
             .insert_test_event_handler(plugin_key, event_name);
     }
 
-    /// Forget one terminal session through CoreDaemon's lifecycle authority.
-    pub fn remove_terminal_session(
-        &mut self,
-        session_id: &SessionId,
-    ) -> Result<bool, CoreDaemonError> {
-        let session_id = session_id.clone();
-        self.core_daemon
-            .call(move |daemon| daemon.remove_session(&session_id))
+    /// Start forgetting one terminal session. Core answers with
+    /// `CoreCompletion::RemoveSession`.
+    pub fn begin_remove_session(&self, session_id: &SessionId) -> CoreOperationTracker {
+        CoreOperationTracker::new(
+            self.core_daemon
+                .begin(CoreOperation::RemoveSession(session_id.clone())),
+        )
     }
 
-    /// Spawn a daemon-owned session through core from a host-owned request.
-    pub fn spawn_session(
-        &mut self,
+    /// Start one daemon-owned session spawn. Core answers with
+    /// `CoreCompletion::Spawn`; the caller records the acknowledged spawn id
+    /// once it returns the response.
+    pub fn begin_spawn(
+        &self,
         request: SessionSpawnRequest,
         metadata: CoreSessionMetadata,
-        now_seconds: u64,
-    ) -> Result<CoreSession, CoreDaemonError> {
-        let requested_id = request.session_id.0.clone();
-        let session = self.core_daemon.call(move |daemon| {
-            daemon.spawn(SpawnSessionRequest { request, metadata }, now_seconds)
-        })?;
-        self.record_acknowledged_spawn(requested_id);
-        self.record_acknowledged_spawn(session.session_id.0.clone());
-        Ok(session)
+    ) -> CoreOperationTracker {
+        CoreOperationTracker::new(self.core_daemon.begin(CoreOperation::Spawn(
+            SpawnSessionRequest { request, metadata },
+        )))
     }
 
     /// Record one session id this process already returned from a successful Spawn.
@@ -3585,73 +3659,89 @@ impl HubRuntime {
             .cloned()
     }
 
-    /// Tell Core that the next attach will bind a terminal adapter.
-    pub fn expect_terminal_adapter(
-        &mut self,
-        client_id: ClientId,
-        session_id: SessionId,
-        subscription_id: SubscriptionId,
-    ) -> Result<(), CoreDaemonError> {
-        self.core_daemon.call(move |daemon| {
-            daemon.expect_terminal_adapter(client_id, session_id, subscription_id)
-        })
+    /// Attach one route and bind its terminal adapter in one Core owner turn.
+    ///
+    /// The sequence is: detach the same client's previous generation when one
+    /// exists, declare the adapter, attach, look up the new generation, bind
+    /// the adapter. Any failure after attach detaches again so Core holds no
+    /// route without an adapter. Nothing here waits on the owner thread.
+    pub(crate) fn attach_and_bind_terminal(
+        &self,
+        plan: AttachBindPlan,
+    ) -> CoreTicket<Result<TerminalSubscriptionGeneration, AttachBindFailure>> {
+        self.core_daemon
+            .submit(move |daemon| attach_and_bind_on_core(daemon, plan))
     }
 
-    /// Retire a terminal adapter declaration that Core did not consume.
-    pub fn cancel_expected_terminal_adapter(
-        &mut self,
-        client_id: ClientId,
-        session_id: SessionId,
-        subscription_id: SubscriptionId,
-    ) -> Result<(), CoreDaemonError> {
-        self.core_daemon.call(move |daemon| {
-            daemon.cancel_expected_terminal_adapter(&client_id, session_id, subscription_id)
-        })
-    }
-
-    /// Attach a client subscription to a session through the core daemon.
-    pub fn attach_client(
-        &mut self,
+    /// Attach one route without an adapter. Core holds the route's frames
+    /// until [`Self::bind_route_adapter`] binds one (WebRTC reserved channel).
+    pub(crate) fn attach_route(
+        &self,
         client_id: ClientId,
         session_id: SessionId,
         subscription_id: SubscriptionId,
         now_seconds: u64,
-    ) -> Result<AttachedSession, CoreDaemonError> {
-        self.core_daemon
-            .call(move |daemon| daemon.attach(client_id, session_id, subscription_id, now_seconds))
+    ) -> CoreTicket<Result<TerminalSubscriptionGeneration, AttachBindFailure>> {
+        self.core_daemon.submit(move |daemon| {
+            attach_route_on_core(daemon, client_id, session_id, subscription_id, now_seconds)
+        })
     }
 
-    /// Detach a client subscription from a session through the core daemon.
+    /// Bind an adapter to an attached generation. On failure Core detaches
+    /// that generation so no route stays without an adapter.
+    pub(crate) fn bind_route_adapter(
+        &self,
+        plan: BindRoutePlan,
+    ) -> CoreTicket<Result<(), AttachBindFailure>> {
+        self.core_daemon
+            .submit(move |daemon| bind_route_on_core(daemon, plan))
+    }
+
+    /// Detach one subscription through Core's client detach path.
     pub fn detach_client(
-        &mut self,
+        &self,
         client_id: ClientId,
         session_id: SessionId,
         subscription_id: SubscriptionId,
         now_seconds: u64,
-    ) -> Result<(), CoreDaemonError> {
-        self.core_daemon
-            .call(move |daemon| daemon.detach(client_id, session_id, subscription_id, now_seconds))
+    ) -> CoreTicket<Result<(), CoreDaemonError>> {
+        self.core_daemon.submit(move |daemon| {
+            daemon.detach(client_id, session_id, subscription_id, now_seconds)
+        })
     }
 
-    /// Bind a waking duplex terminal adapter to a live attach generation.
-    pub fn bind_terminal_adapter(
-        &mut self,
+    /// Detach the live generation one client owns for a route, when any.
+    ///
+    /// Returns the detached generation. `None` means the client owned no live
+    /// generation for the route.
+    pub(crate) fn detach_owned_generation(
+        &self,
         client_id: ClientId,
         session_id: SessionId,
         subscription_id: SubscriptionId,
-        generation: TerminalSubscriptionGeneration,
-        capabilities: TerminalCapabilitySet,
-        adapter: Box<dyn botster_core::contract::terminal_wake::WakingTerminalAdapter + Send>,
-    ) -> Result<(), CoreDaemonError> {
-        self.core_daemon.call(move |daemon| {
-            daemon.bind_waking_terminal_adapter(
+        now_seconds: u64,
+    ) -> CoreTicket<Result<Option<TerminalSubscriptionGeneration>, CoreDaemonError>> {
+        self.core_daemon.submit(move |daemon| {
+            let generation = daemon
+                .list_terminal_subscriptions()
+                .into_iter()
+                .find(|row| {
+                    row.client_id == client_id
+                        && row.session_id == session_id
+                        && row.subscription_id == subscription_id
+                })
+                .map(|row| row.generation);
+            let Some(generation) = generation else {
+                return Ok(None);
+            };
+            daemon.detach_terminal_subscription(
                 client_id,
                 session_id,
                 subscription_id,
                 generation,
-                capabilities,
-                adapter,
-            )
+                now_seconds,
+            )?;
+            Ok(Some(generation))
         })
     }
 
@@ -3670,9 +3760,9 @@ impl HubRuntime {
 
     /// Control-plane terminal subscription inventory. No terminal bodies.
     #[must_use]
-    pub fn list_terminal_subscriptions(&self) -> Vec<TerminalSubscriptionRecord> {
+    pub fn list_terminal_subscriptions(&self) -> CoreTicket<Vec<TerminalSubscriptionRecord>> {
         self.core_daemon
-            .call(|daemon| daemon.list_terminal_subscriptions())
+            .submit(|daemon| daemon.list_terminal_subscriptions())
     }
 
     /// Detach one subscription generation without deleting a newer owner.
@@ -3683,8 +3773,8 @@ impl HubRuntime {
         subscription_id: SubscriptionId,
         generation: TerminalSubscriptionGeneration,
         now_seconds: u64,
-    ) -> Result<DetachTerminalSubscriptionResult, CoreDaemonError> {
-        self.core_daemon.call(move |daemon| {
+    ) -> CoreTicket<Result<DetachTerminalSubscriptionResult, CoreDaemonError>> {
+        self.core_daemon.submit(move |daemon| {
             daemon.detach_terminal_subscription(
                 client_id,
                 session_id,
@@ -3705,10 +3795,10 @@ impl HubRuntime {
         &self,
         session_id: &SessionId,
         now_seconds: u64,
-    ) -> Result<SessionLifecycleLookup, CoreDaemonError> {
+    ) -> CoreTicket<Result<SessionLifecycleLookup, CoreDaemonError>> {
         let session_id = session_id.clone();
         self.core_daemon
-            .call(move |daemon| daemon.observe_session_lifecycle(&session_id, now_seconds))
+            .submit(move |daemon| daemon.observe_session_lifecycle(&session_id, now_seconds))
     }
 
     /// Exact non-mutating registry state for one session.
@@ -3716,101 +3806,108 @@ impl HubRuntime {
     pub(crate) fn session_registry_state(
         &self,
         session_id: &SessionId,
-    ) -> Result<SessionRegistryStateLookup, CoreDaemonError> {
+    ) -> CoreTicket<Result<SessionRegistryStateLookup, CoreDaemonError>> {
         let session_id = session_id.clone();
         self.core_daemon
-            .call(move |daemon| daemon.session_registry_state(&session_id))
+            .submit(move |daemon| daemon.session_registry_state(&session_id))
     }
 
-    /// Exact live generation for one subscription, or `None`.
-    #[must_use]
-    pub(crate) fn terminal_subscription_generation(
+    /// Start a plain-text screen read. Core answers with
+    /// `CoreCompletion::ReadScreen`.
+    pub fn begin_read_screen(
         &self,
-        session_id: &SessionId,
-        subscription_id: &SubscriptionId,
-    ) -> Option<TerminalSubscriptionGeneration> {
-        let session_id = session_id.clone();
-        let subscription_id = subscription_id.clone();
-        self.core_daemon.call(move |daemon| {
-            daemon.terminal_subscription_generation(&session_id, &subscription_id)
-        })
-    }
-
-    /// Read the current daemon-owned terminal screen through the production core path.
-    pub fn read_screen(
-        &mut self,
         request_id: RequestId,
         session_id: SessionId,
         now_seconds: u64,
-    ) -> Result<ReadScreenResult, CoreDaemonError> {
-        self.core_daemon.call(move |daemon| {
-            daemon.read_screen(ReadScreenRequest {
+    ) -> CoreOperationTracker {
+        CoreOperationTracker::new(self.core_daemon.begin(CoreOperation::ReadScreen(
+            ReadScreenRequest {
                 request_id,
                 session_id,
                 now_seconds,
-            })
-        })
+            },
+        )))
     }
 
-    /// Read authoritative terminal mode flags through the production core path.
-    pub fn read_mode_flags(
-        &mut self,
+    /// Start a mode-flags read. Core answers with `CoreCompletion::ReadModeFlags`.
+    pub fn begin_read_mode_flags(
+        &self,
         request_id: RequestId,
         session_id: SessionId,
         now_seconds: u64,
-    ) -> Result<ReadModeFlagsResult, CoreDaemonError> {
-        self.core_daemon.call(move |daemon| {
-            daemon.read_mode_flags(ReadModeFlagsRequest {
+    ) -> CoreOperationTracker {
+        CoreOperationTracker::new(self.core_daemon.begin(CoreOperation::ReadModeFlags(
+            ReadModeFlagsRequest {
                 request_id,
                 session_id,
                 now_seconds,
-            })
-        })
+            },
+        )))
     }
 
-    /// Capture daemon-owned terminal snapshot metadata through the production core path.
-    pub fn capture_snapshot(
-        &mut self,
+    /// Start a GHOSTSNP capture for paging. Core answers with
+    /// `CoreCompletion::CaptureSnapshot`; the capture counts against `owner`.
+    pub fn begin_capture_snapshot(
+        &self,
         request_id: RequestId,
         session_id: SessionId,
         now_seconds: u64,
-    ) -> Result<CaptureSnapshotResult, CoreDaemonError> {
-        self.core_daemon.call(move |daemon| {
-            daemon.capture_snapshot(CaptureSnapshotRequest {
+        owner: CaptureOwner,
+    ) -> CoreOperationTracker {
+        CoreOperationTracker::new(self.core_daemon.begin(CoreOperation::CaptureSnapshot {
+            request: CaptureSnapshotRequest {
                 request_id,
                 session_id,
                 now_seconds,
-            })
-        })
+            },
+            owner,
+        }))
+    }
+
+    /// Read one page of an open capture. The page shares the capture buffer.
+    pub fn read_snapshot_page(
+        &self,
+        capture: CaptureId,
+        page: u32,
+    ) -> CoreTicket<Result<SnapshotPage, CoreDaemonError>> {
+        self.core_daemon
+            .submit(move |daemon| daemon.read_snapshot_page(&capture, page))
+    }
+
+    /// Release every open capture one client owns, at disconnect.
+    pub fn release_owner_captures(&self, owner: CaptureOwner) {
+        let _ = self
+            .core_daemon
+            .submit(move |daemon| daemon.release_owner_captures(&owner));
     }
 
     /// Evaluate guarded-write readiness and inject only through the core daemon.
     pub fn guarded_write(
-        &mut self,
+        &self,
         request: GuardedWriteRequest,
-    ) -> Result<GuardedWriteResult, CoreDaemonError> {
+    ) -> CoreTicket<Result<GuardedWriteResult, CoreDaemonError>> {
         self.core_daemon
-            .call(move |daemon| daemon.guarded_write(request))
+            .submit(move |daemon| daemon.guarded_write(request))
     }
 
     /// Publish one coordination envelope through the CoreDaemon routed-envelope router.
     pub fn publish_routed_envelope(
-        &mut self,
+        &self,
         envelope: RoutedEnvelope,
-    ) -> Result<RoutedEnvelopePublishOutcome, CoreDaemonError> {
-        self.core_daemon.call(move |daemon| {
+    ) -> CoreTicket<Result<RoutedEnvelopePublishOutcome, CoreDaemonError>> {
+        self.core_daemon.submit(move |daemon| {
             daemon.publish_routed_envelope(PublishRoutedEnvelopeRequest { envelope })
         })
     }
 
     /// Drain coordination envelopes for one routed target through CoreDaemon cursor semantics.
     pub fn drain_routed_envelopes(
-        &mut self,
+        &self,
         target: EnvelopeTarget,
         after: Option<botster_core::EnvelopeCursor>,
         limit: usize,
-    ) -> Result<RoutedEnvelopeDrainOutcome, CoreDaemonError> {
-        self.core_daemon.call(move |daemon| {
+    ) -> CoreTicket<Result<RoutedEnvelopeDrainOutcome, CoreDaemonError>> {
+        self.core_daemon.submit(move |daemon| {
             daemon.drain_routed_envelopes(DrainRoutedEnvelopesRequest {
                 target,
                 after,
@@ -3821,11 +3918,11 @@ impl HubRuntime {
 
     /// Acknowledge one routed envelope delivery through CoreDaemon.
     pub fn acknowledge_routed_envelope(
-        &mut self,
+        &self,
         target: EnvelopeTarget,
         envelope_id: EnvelopeId,
-    ) -> Result<RoutedEnvelopeDeliveryStateResult, CoreDaemonError> {
-        self.core_daemon.call(move |daemon| {
+    ) -> CoreTicket<Result<RoutedEnvelopeDeliveryStateResult, CoreDaemonError>> {
+        self.core_daemon.submit(move |daemon| {
             daemon.acknowledge_routed_envelope(AcknowledgeRoutedEnvelopeRequest {
                 target,
                 envelope_id,
@@ -3838,11 +3935,11 @@ impl HubRuntime {
         &self,
         target: &EnvelopeTarget,
         envelope_id: &EnvelopeId,
-    ) -> RoutedEnvelopeDeliveryStateResult {
+    ) -> CoreTicket<RoutedEnvelopeDeliveryStateResult> {
         let target = target.clone();
         let envelope_id = envelope_id.clone();
         self.core_daemon
-            .call(move |daemon| daemon.routed_envelope_delivery_state(&target, &envelope_id))
+            .submit(move |daemon| daemon.routed_envelope_delivery_state(&target, &envelope_id))
     }
 
     /// Release worker-backed sessions before an intentional daemon restart.
@@ -3865,51 +3962,65 @@ impl HubRuntime {
     }
 
     /// Scan daemon registry records for worker-backed restart/adoption evidence.
-    pub fn adoption_scan(&self) -> Result<Vec<SessionAdoptionReport>, CoreDaemonError> {
-        self.core_daemon.call(|daemon| daemon.adoption_scan())
+    pub fn adoption_scan(&self) -> CoreTicket<Result<Vec<SessionAdoptionReport>, CoreDaemonError>> {
+        self.core_daemon.submit(|daemon| daemon.adoption_scan())
     }
 
     pub(crate) fn mark_session_stale(
         &self,
         session_id: &SessionId,
         now_seconds: u64,
-    ) -> Result<(), CoreDaemonError> {
+    ) -> CoreTicket<Result<(), CoreDaemonError>> {
         let session_id = session_id.clone();
         self.core_daemon
-            .call(move |daemon| daemon.mark_stale(&session_id, now_seconds))
+            .submit(move |daemon| daemon.mark_stale(&session_id, now_seconds))
     }
 
-    /// Reattach one live worker-backed session after daemon restart.
-    pub fn adopt_session(
-        &mut self,
-        session_id: &SessionId,
-        now_seconds: u64,
-    ) -> Result<CoreSession, CoreDaemonError> {
-        let session_id = session_id.clone();
-        self.core_daemon
-            .call(move |daemon| daemon.adopt_session(&session_id, now_seconds))
+    /// Start adopting one live worker-backed session after daemon restart.
+    /// Core answers with `CoreCompletion::Adopt`.
+    pub fn begin_adopt_session(&self, session_id: &SessionId) -> CoreOperationTracker {
+        CoreOperationTracker::new(
+            self.core_daemon
+                .begin(CoreOperation::Adopt(session_id.clone())),
+        )
     }
 
-    /// Shut down one daemon-owned session through core.
-    pub fn shutdown_session(
-        &mut self,
-        session_id: SessionId,
-        now_seconds: u64,
-    ) -> Result<(), CoreDaemonError> {
-        self.core_daemon
-            .call(move |daemon| daemon.shutdown(Some(session_id), now_seconds))
+    /// Start an orderly shutdown of one session. Core answers with
+    /// `CoreCompletion::ShutdownSession`.
+    pub fn begin_shutdown_session(&self, session_id: SessionId) -> CoreOperationTracker {
+        CoreOperationTracker::new(
+            self.core_daemon
+                .begin(CoreOperation::ShutdownSession(session_id)),
+        )
     }
 
+    /// Shut down one session and forget the outcome. Used by cleanup paths
+    /// whose caller cannot act on the result.
+    pub(crate) fn shutdown_session_detached(&self, session_id: SessionId) {
+        let tracker = self.begin_shutdown_session(session_id);
+        if let Ok(mut detached) = self.detached_operations.lock() {
+            detached.push(tracker);
+        }
+    }
+
+    /// Startup reconciliation runs before the owner loop exists and may wait.
     fn reconcile_sessions(&mut self, now_seconds: u64) -> Result<(), CoreDaemonError> {
         self.reconciliation = HubSessionReconciliation::default();
-        let reports = self.core_daemon.call(|daemon| daemon.adoption_scan())?;
+        let reports = self
+            .core_daemon
+            .submit(|daemon| daemon.adoption_scan())
+            .wait(STARTUP_CORE_WAIT)
+            .map_err(core_bridge_error)??;
         for report in reports {
             match report.state {
                 SessionAdoptionState::Adoptable => {
                     let session_id = report.record.session_id.clone();
-                    let adoption_result = self.core_daemon.call(move |daemon| {
-                        daemon.adopt_session(&session_id, now_seconds)
-                    });
+                    let adoption_result = self
+                        .core_daemon
+                        .submit(move |daemon| daemon.adopt_session(&session_id, now_seconds))
+                        .wait(STARTUP_CORE_WAIT)
+                        .map_err(core_bridge_error)
+                        .and_then(|result| result);
                     match adoption_result {
                         Ok(session) => {
                             self.reconciliation
@@ -3917,7 +4028,7 @@ impl HubRuntime {
                                 .push(session.session_id);
                         }
                         Err(error) if is_stale_worker_control_socket_adoption_error(&error) => {
-                            self.mark_session_stale(&report.record.session_id, now_seconds)?;
+                            self.mark_session_stale_now(&report.record.session_id, now_seconds)?;
                             self.reconciliation
                                 .stale_sessions
                                 .push(report.record.session_id);
@@ -3925,21 +4036,28 @@ impl HubRuntime {
                         Err(error) => return Err(error),
                     }
                 }
+                SessionAdoptionState::MissingProtocolEvidence => {
+                    // A live worker without matching protocol evidence is
+                    // incompatible with this Hub. Record it; startup refuses
+                    // and deletes nothing.
+                    self.reconciliation
+                        .incompatible_sessions
+                        .push(report.record.session_id);
+                }
                 SessionAdoptionState::InProcessDaemonNotRestartDurable
                 // Hub always builds CoreDaemonConfig with a worker path, so this is
                 // only reachable for stale records written by an older or invalid embedder.
-                | SessionAdoptionState::MissingProtocolEvidence
                 | SessionAdoptionState::StaleWorker { .. }
                 | SessionAdoptionState::UnhealthyWorker { .. }
                 | SessionAdoptionState::DuplicateWorker { .. } => {
-                    self.mark_session_stale(&report.record.session_id, now_seconds)?;
+                    self.mark_session_stale_now(&report.record.session_id, now_seconds)?;
                     self.reconciliation
                         .stale_sessions
                         .push(report.record.session_id);
                 }
                 SessionAdoptionState::Terminal => {
                     if report.record.state == RegistrySessionState::Running {
-                        self.mark_session_stale(&report.record.session_id, now_seconds)?;
+                        self.mark_session_stale_now(&report.record.session_id, now_seconds)?;
                         self.reconciliation
                             .stale_sessions
                             .push(report.record.session_id);
@@ -4431,6 +4549,11 @@ pub type HubRuntimeOutput = BotsterEngineOutput;
 pub enum HubRuntimeError {
     /// Core daemon operation failed.
     CoreDaemon(CoreDaemonError),
+    /// The Hub capability runtime could not open its plugin database.
+    Capability(botster_core::CapabilityRuntimeError),
+    /// Registry records name live workers whose protocol evidence does not
+    /// match this Hub. Startup stops; nothing is terminated or deleted.
+    IncompatibleWorkers { sessions: Vec<String> },
     /// Durable hub state failed to load.
     State(HubStateStoreError),
     /// Credential provider or persisted credential references failed validation.
@@ -4441,6 +4564,12 @@ impl fmt::Display for HubRuntimeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::CoreDaemon(error) => write!(formatter, "{error}"),
+            Self::Capability(error) => write!(formatter, "{error}"),
+            Self::IncompatibleWorkers { sessions } => write!(
+                formatter,
+                "incompatible session workers: {}; stop them before starting this Hub",
+                sessions.join(",")
+            ),
             Self::State(error) => write!(formatter, "{error}"),
             Self::Credentials(error) => write!(formatter, "{error}"),
         }
@@ -4451,6 +4580,8 @@ impl Error for HubRuntimeError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::CoreDaemon(error) => Some(error),
+            Self::Capability(error) => Some(error),
+            Self::IncompatibleWorkers { .. } => None,
             Self::State(error) => Some(error),
             Self::Credentials(error) => Some(error),
         }
@@ -4575,6 +4706,391 @@ fn settle_entity_publish_op(
     }
 }
 
+/// Bound on Core waits that run before the owner loop exists (startup
+/// reconciliation) or on threads that never serve it (in-process CLI).
+pub(crate) const STARTUP_CORE_WAIT: Duration = Duration::from_secs(30);
+
+/// Map a lost or timed-out bridge wait onto the Core error surface.
+pub(crate) fn core_bridge_error(error: CoreTicketError) -> CoreDaemonError {
+    let _ = error;
+    CoreDaemonError::Shutdown
+}
+
+/// One Core operation from `begin` to its completion.
+///
+/// Stage one waits for the pending id on the begin ticket; stage two waits
+/// for the matching [`CoreCompletion`] the owner absorbed. Neither stage
+/// blocks.
+#[derive(Debug)]
+pub struct CoreOperationTracker {
+    stage: CoreOperationStage,
+}
+
+#[derive(Debug)]
+enum CoreOperationStage {
+    Begin(CoreTicket<Result<PendingOperationId, CoreDaemonError>>),
+    Pending(PendingOperationId),
+    Done,
+}
+
+impl CoreOperationTracker {
+    pub(crate) fn new(ticket: CoreTicket<Result<PendingOperationId, CoreDaemonError>>) -> Self {
+        Self {
+            stage: CoreOperationStage::Begin(ticket),
+        }
+    }
+
+    /// Pending id once `begin` returned it.
+    #[must_use]
+    pub fn pending_id(&self) -> Option<PendingOperationId> {
+        match self.stage {
+            CoreOperationStage::Pending(id) => Some(id),
+            _ => None,
+        }
+    }
+
+    /// Non-blocking progress. `Ready(Err)` carries a `begin` rejection or a
+    /// completion error; `Ready(Ok)` carries the completion.
+    pub fn poll(
+        &mut self,
+        runtime: &HubRuntime,
+    ) -> CoreTicketPoll<Result<CoreCompletion, CoreDaemonError>> {
+        runtime.absorb_core_completions();
+        if let CoreOperationStage::Begin(ticket) = &mut self.stage {
+            match ticket.poll() {
+                CoreTicketPoll::Pending => return CoreTicketPoll::Pending,
+                CoreTicketPoll::Lost => {
+                    self.stage = CoreOperationStage::Done;
+                    return CoreTicketPoll::Lost;
+                }
+                CoreTicketPoll::Ready(Err(error)) => {
+                    self.stage = CoreOperationStage::Done;
+                    return CoreTicketPoll::Ready(Err(error));
+                }
+                CoreTicketPoll::Ready(Ok(id)) => {
+                    self.stage = CoreOperationStage::Pending(id);
+                }
+            }
+        }
+        match self.stage {
+            CoreOperationStage::Pending(id) => match runtime.take_completed_operation(id) {
+                Some(completion) => {
+                    self.stage = CoreOperationStage::Done;
+                    CoreTicketPoll::Ready(Ok(completion))
+                }
+                None => CoreTicketPoll::Pending,
+            },
+            CoreOperationStage::Done => CoreTicketPoll::Lost,
+            CoreOperationStage::Begin(_) => CoreTicketPoll::Pending,
+        }
+    }
+
+    /// Bounded blocking completion for threads that do not serve the owner loop.
+    pub fn wait(
+        mut self,
+        runtime: &HubRuntime,
+        timeout: Duration,
+    ) -> Result<CoreCompletion, CoreDaemonError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.poll(runtime) {
+                CoreTicketPoll::Ready(result) => return result,
+                CoreTicketPoll::Lost => {
+                    return Err(core_bridge_error(CoreTicketError::DriverStopped));
+                }
+                CoreTicketPoll::Pending => {
+                    if Instant::now() >= deadline {
+                        return Err(core_bridge_error(CoreTicketError::Timeout));
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+    }
+}
+
+/// Plugin-facing Core work the owner polls between plugin invocations.
+enum InflightPluginCore {
+    Coordination {
+        ticket: CoreTicket<Result<HubCoordinationResponse, String>>,
+        response: mpsc::Sender<Result<HubCoordinationResponse, String>>,
+    },
+    SessionTypeSpawn {
+        start: SessionTypeSpawnStart,
+        response: mpsc::Sender<Result<PluginSessionTypeSpawned, String>>,
+    },
+}
+
+/// One session-type spawn in flight on the Core owner thread.
+struct SessionTypeSpawnStart {
+    tracker: CoreOperationTracker,
+    context: HubSessionContext,
+    session_type_id: String,
+    context_id: String,
+    context_keys: Vec<String>,
+}
+
+/// Inputs for one attach-and-bind turn on the Core owner thread.
+pub(crate) struct AttachBindPlan {
+    pub client_id: ClientId,
+    pub session_id: SessionId,
+    pub subscription_id: SubscriptionId,
+    pub capabilities: TerminalCapabilitySet,
+    pub now_seconds: u64,
+    pub adapter: Box<dyn botster_core::contract::terminal_wake::WakingTerminalAdapter + Send>,
+}
+
+/// Where an attach-and-bind turn failed. Core holds no route afterwards.
+#[derive(Debug)]
+pub(crate) enum AttachBindFailure {
+    /// `attach` itself failed; the adapter declaration was cancelled.
+    Attach(CoreDaemonError),
+    /// Attach succeeded but no live generation was visible; the route was detached.
+    MissingGeneration,
+    /// Adapter bind failed; the route was detached.
+    Bind(CoreDaemonError),
+}
+
+/// Adapter bind inputs for one attached generation.
+pub(crate) struct BindRoutePlan {
+    pub client_id: ClientId,
+    pub session_id: SessionId,
+    pub subscription_id: SubscriptionId,
+    pub generation: TerminalSubscriptionGeneration,
+    pub capabilities: TerminalCapabilitySet,
+    pub now_seconds: u64,
+    pub adapter: Box<dyn botster_core::contract::terminal_wake::WakingTerminalAdapter + Send>,
+}
+
+fn attach_and_bind_on_core(
+    daemon: &mut botster_core_daemon::CoreDaemon,
+    plan: AttachBindPlan,
+) -> Result<TerminalSubscriptionGeneration, AttachBindFailure> {
+    let AttachBindPlan {
+        client_id,
+        session_id,
+        subscription_id,
+        capabilities,
+        now_seconds,
+        mut adapter,
+    } = plan;
+    let generation = match attach_route_on_core(
+        daemon,
+        client_id.clone(),
+        session_id.clone(),
+        subscription_id.clone(),
+        now_seconds,
+    ) {
+        Ok(generation) => generation,
+        Err(error) => {
+            adapter.close();
+            return Err(error);
+        }
+    };
+    bind_route_on_core(
+        daemon,
+        BindRoutePlan {
+            client_id,
+            session_id,
+            subscription_id,
+            generation,
+            capabilities,
+            now_seconds,
+            adapter,
+        },
+    )?;
+    Ok(generation)
+}
+
+fn attach_route_on_core(
+    daemon: &mut botster_core_daemon::CoreDaemon,
+    client_id: ClientId,
+    session_id: SessionId,
+    subscription_id: SubscriptionId,
+    now_seconds: u64,
+) -> Result<TerminalSubscriptionGeneration, AttachBindFailure> {
+    let previous = daemon
+        .list_terminal_subscriptions()
+        .into_iter()
+        .find(|row| {
+            row.client_id == client_id
+                && row.session_id == session_id
+                && row.subscription_id == subscription_id
+        })
+        .map(|row| row.generation);
+    if let Some(generation) = previous {
+        let _ = daemon.detach_terminal_subscription(
+            client_id.clone(),
+            session_id.clone(),
+            subscription_id.clone(),
+            generation,
+            now_seconds,
+        );
+    }
+    if let Err(error) = daemon.expect_terminal_adapter(
+        client_id.clone(),
+        session_id.clone(),
+        subscription_id.clone(),
+    ) {
+        return Err(AttachBindFailure::Attach(error));
+    }
+    if let Err(error) = daemon.attach(
+        client_id.clone(),
+        session_id.clone(),
+        subscription_id.clone(),
+        now_seconds,
+    ) {
+        let _ = daemon.cancel_expected_terminal_adapter(
+            &client_id,
+            session_id.clone(),
+            subscription_id.clone(),
+        );
+        return Err(AttachBindFailure::Attach(error));
+    }
+    let Some(generation) = daemon.terminal_subscription_generation(&session_id, &subscription_id)
+    else {
+        let _ = daemon.cancel_expected_terminal_adapter(
+            &client_id,
+            session_id.clone(),
+            subscription_id.clone(),
+        );
+        let _ = daemon.detach(client_id, session_id, subscription_id, now_seconds);
+        return Err(AttachBindFailure::MissingGeneration);
+    };
+    Ok(generation)
+}
+
+fn bind_route_on_core(
+    daemon: &mut botster_core_daemon::CoreDaemon,
+    plan: BindRoutePlan,
+) -> Result<(), AttachBindFailure> {
+    let BindRoutePlan {
+        client_id,
+        session_id,
+        subscription_id,
+        generation,
+        capabilities,
+        now_seconds,
+        adapter,
+    } = plan;
+    if let Err(error) = daemon.bind_waking_terminal_adapter(
+        client_id.clone(),
+        session_id.clone(),
+        subscription_id.clone(),
+        generation,
+        capabilities,
+        adapter,
+    ) {
+        let _ = daemon.detach_terminal_subscription(
+            client_id,
+            session_id,
+            subscription_id,
+            generation,
+            now_seconds,
+        );
+        return Err(AttachBindFailure::Bind(error));
+    }
+    Ok(())
+}
+
+impl HubRuntime {
+    /// Move every completion the data plane published into the owner map and
+    /// drop the ones no caller waits for.
+    pub(crate) fn absorb_core_completions(&self) {
+        let completions = self.core_completions.take();
+        if completions.is_empty() {
+            return;
+        }
+        if let Ok(mut map) = self.completed_operations.lock() {
+            for completion in completions {
+                map.insert(completion.id(), completion);
+            }
+        }
+        self.reap_detached_operations();
+    }
+
+    fn reap_detached_operations(&self) {
+        let Ok(mut detached) = self.detached_operations.lock() else {
+            return;
+        };
+        let mut ids = Vec::new();
+        for tracker in detached.iter_mut() {
+            if let CoreOperationStage::Begin(ticket) = &mut tracker.stage {
+                match ticket.poll() {
+                    CoreTicketPoll::Ready(Ok(id)) => {
+                        tracker.stage = CoreOperationStage::Pending(id)
+                    }
+                    CoreTicketPoll::Ready(Err(_)) | CoreTicketPoll::Lost => {
+                        tracker.stage = CoreOperationStage::Done;
+                    }
+                    CoreTicketPoll::Pending => {}
+                }
+            }
+            if let CoreOperationStage::Pending(id) = tracker.stage {
+                ids.push(id);
+            }
+        }
+        if let Ok(mut map) = self.completed_operations.lock() {
+            for tracker in detached.iter_mut() {
+                if let CoreOperationStage::Pending(id) = tracker.stage
+                    && map.remove(&id).is_some()
+                {
+                    tracker.stage = CoreOperationStage::Done;
+                }
+            }
+        }
+        detached.retain(|tracker| !matches!(tracker.stage, CoreOperationStage::Done));
+        let _ = ids;
+    }
+
+    /// Take the completion for one pending id, when it has arrived.
+    pub(crate) fn take_completed_operation(
+        &self,
+        id: PendingOperationId,
+    ) -> Option<CoreCompletion> {
+        self.completed_operations
+            .lock()
+            .ok()
+            .and_then(|mut map| map.remove(&id))
+    }
+
+    /// Start one Core operation of any kind.
+    pub(crate) fn begin_operation(&self, operation: CoreOperation) -> CoreOperationTracker {
+        CoreOperationTracker::new(self.core_daemon.begin(operation))
+    }
+
+    /// Run one closure on the Core owner thread and read its result later.
+    pub(crate) fn submit_core<T, F>(&self, operation: F) -> CoreTicket<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut botster_core_daemon::CoreDaemon) -> T + Send + 'static,
+    {
+        self.core_daemon.submit(operation)
+    }
+
+    /// Current retention accounting, read on the Core owner thread.
+    pub fn retention_accounting(&self) -> CoreTicket<RetentionAccounting> {
+        self.core_daemon
+            .submit(|daemon| daemon.retention_accounting())
+    }
+
+    /// Retention policy this runtime handed to Core.
+    #[must_use]
+    pub fn retention_policy(&self) -> RetentionPolicy {
+        self.config.retention.core_policy()
+    }
+
+    fn mark_session_stale_now(
+        &self,
+        session_id: &SessionId,
+        now_seconds: u64,
+    ) -> Result<(), CoreDaemonError> {
+        self.mark_session_stale(session_id, now_seconds)
+            .wait(STARTUP_CORE_WAIT)
+            .map_err(core_bridge_error)?
+    }
+}
+
 fn json_null() -> serde_json::Value {
     serde_json::Value::Null
 }
@@ -4601,141 +5117,28 @@ pub fn with_test_lifecycle_journal_capacity<R>(capacity: usize, f: impl FnOnce()
     })
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct HubTestSeams {
-    pub drop_journal_wakes: Option<u32>,
-    pub lifecycle_journal_capacity: Option<usize>,
-    pub event_invocation_timeout_ms: Option<u64>,
-    pub event_handler_hold_ms: Option<u64>,
-    pub hold_journal_pull: Option<PathBuf>,
-}
-
 fn start_data_plane(
     core_config: CoreDaemonConfig,
 ) -> (
     crate::data_plane::CloseWorkSource,
     crate::data_plane::DataPlaneDriver,
     SharedCoreDaemon,
+    CoreCompletionReceiver,
 ) {
     let close_work = crate::data_plane::CloseWorkSource::new();
-    let (driver, core_daemon) =
+    let (driver, core_daemon, completions) =
         crate::data_plane::DataPlaneDriver::start(core_config, close_work.clone());
-    (close_work, driver, core_daemon)
+    (close_work, driver, core_daemon, completions)
 }
 
-fn hub_test_seams() -> HubTestSeams {
-    let env = std::env::var("BOTSTER_ENV").ok();
-    HubTestSeams {
-        drop_journal_wakes: drop_journal_wakes_from(
-            env.as_deref(),
-            std::env::var("BOTSTER_HUB_TEST_DROP_JOURNAL_WAKES")
-                .ok()
-                .as_deref(),
-        ),
-        lifecycle_journal_capacity: lifecycle_journal_capacity_from(
-            env.as_deref(),
-            std::env::var("BOTSTER_HUB_TEST_LIFECYCLE_JOURNAL_CAPACITY")
-                .ok()
-                .as_deref(),
-        ),
-        event_invocation_timeout_ms: event_invocation_timeout_ms_from(
-            env.as_deref(),
-            std::env::var("BOTSTER_HUB_TEST_EVENT_INVOCATION_TIMEOUT_MS")
-                .ok()
-                .as_deref(),
-        ),
-        event_handler_hold_ms: event_handler_hold_ms_from(
-            env.as_deref(),
-            std::env::var("BOTSTER_HUB_TEST_EVENT_HANDLER_HOLD_MS")
-                .ok()
-                .as_deref(),
-        ),
-        hold_journal_pull: hold_journal_pull_from(
-            env.as_deref(),
-            std::env::var_os("BOTSTER_HUB_TEST_HOLD_JOURNAL_PULL").as_deref(),
-        ),
-    }
-}
-
-#[must_use]
-pub fn drop_journal_wakes_from(botster_env: Option<&str>, raw: Option<&str>) -> Option<u32> {
-    if botster_env != Some("test") {
-        return None;
-    }
-    raw.and_then(|value| value.parse().ok())
-        .filter(|count| *count > 0)
-        .map(|count: u32| count.min(64))
-}
-
-#[must_use]
-pub fn lifecycle_journal_capacity_from(
-    botster_env: Option<&str>,
-    raw: Option<&str>,
-) -> Option<usize> {
-    if botster_env != Some("test") {
-        return None;
-    }
-    raw.and_then(|value| value.parse().ok())
-        .filter(|cap| *cap > 0)
-}
-
-#[must_use]
-pub fn event_invocation_timeout_ms_from(
-    botster_env: Option<&str>,
-    raw: Option<&str>,
-) -> Option<u64> {
-    if botster_env != Some("test") {
-        return None;
-    }
-    raw.and_then(|value| value.parse().ok())
-        .map(|ms: u64| ms.clamp(1, 10_000))
-}
-
-#[must_use]
-pub fn event_handler_hold_ms_from(botster_env: Option<&str>, raw: Option<&str>) -> Option<u64> {
-    if botster_env != Some("test") {
-        return None;
-    }
-    raw.and_then(|value| value.parse().ok())
-        .map(|ms: u64| ms.min(5_000))
-}
-
-/// Parse the optional journal-pull hold path. Production returns `None`.
-#[must_use]
-pub fn hold_journal_pull_from(botster_env: Option<&str>, path: Option<&OsStr>) -> Option<PathBuf> {
-    if botster_env != Some("test") {
-        return None;
-    }
-    path.filter(|value| !value.is_empty()).map(PathBuf::from)
-}
-
-fn core_daemon_config(config: &HubConfig, test_seams: &HubTestSeams) -> CoreDaemonConfig {
+fn core_daemon_config(config: &HubConfig) -> CoreDaemonConfig {
     // Host profile supplies the initial/reset Ghostty color baseline. After
     // attach, current colors come from data-plane GHOSTSNP only.
+    #[allow(unused_mut)]
     let mut core = CoreDaemonConfig::new(&config.data_directory)
         .with_worker_path(session_worker_path(config))
-        .with_terminal_color_profile(default_terminal_color_profile());
-    if let Ok(raw) = std::env::var("BOTSTER_HUB_TEST_WORKER_EGRESS_CAPACITY")
-        && let Ok(capacity) = raw.parse::<usize>()
-    {
-        core = core.with_test_worker_egress_capacity(Some(capacity));
-    }
-    if let Ok(session_id) = std::env::var("BOTSTER_HUB_TEST_FAIL_RUNTIME_DRAIN_FOR")
-        && !session_id.is_empty()
-    {
-        core = core.with_test_fail_runtime_drain_for(Some(SessionId(session_id)));
-        if let Ok(message) = std::env::var("BOTSTER_HUB_TEST_FAIL_RUNTIME_DRAIN_MESSAGE")
-            && !message.is_empty()
-        {
-            core = core.with_test_fail_runtime_drain_message(Some(message));
-        }
-    }
-    if std::env::var("BOTSTER_HUB_TEST_FAIL_SNAPSHOT_HISTORY_AFTER_READY").as_deref() == Ok("1") {
-        core = core.with_test_fail_snapshot_history_after_ready(true);
-    }
-    if let Some(capacity) = test_seams.lifecycle_journal_capacity {
-        core = core.with_lifecycle_journal_capacity(capacity);
-    }
+        .with_terminal_color_profile(default_terminal_color_profile())
+        .with_retention_policy(config.retention.core_policy());
     #[cfg(test)]
     if let Some(capacity) = TEST_LIFECYCLE_JOURNAL_CAPACITY.with(std::cell::Cell::get) {
         core = core.with_lifecycle_journal_capacity(capacity);

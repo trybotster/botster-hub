@@ -276,21 +276,23 @@ The initial capability helper is:
 `plugin_db` helpers always use the loaded plugin key as the namespace; Lua code
 cannot select another plugin's namespace. The synchronous Lua helpers prepare
 the admitted operation under `HubCapabilityRuntime`, release its shared lock,
-and execute the filesystem operation inside that plugin's isolated worker before
+and execute the store operation inside that plugin's isolated worker before
 returning. The general asynchronous `CapabilityOperation::PluginStore`
 submit/event surface remains single-record.
 
+Records live in the Hub plugin database, `plugin-db.redb` under the Hub data
+directory, through Core's keyed store. Each plugin key maps to one store
+namespace; each record is one JSON `PluginStoreRecord` value under its key.
+Core owns durability and the store ceilings (512-byte keys, 1 MiB values, 256
+operations per batch, 1 000 items or 4 MiB per range page). Hub owns the
+record rules above those ceilings: revisions, merge patches,
+`max_record_bytes`, `max_plugin_keys`, and `max_plugin_bytes`.
+
 `plugin_db.batch` validates revisions, patches, record size, final record count,
-and final aggregate namespace size before staging any durable change. It holds
-the concrete backend mutex continuously from restart recovery and snapshot load
-through staging, whole-namespace promotion, parent-directory synchronization,
-and cleanup, so existing single-record helpers cannot interleave or observe a
-partial generation. Staging and backup are private non-JSON sibling directories
-outside the live namespace. If a process stops between filesystem promotion
-steps, the next store access—including `get` or `list`—repairs the transaction
-shape under the same mutex and exposes either the complete old generation or
-the complete new generation. A successful return means the promoted namespace
-and its parent-directory durability barrier completed; a caller timeout remains
+and final aggregate namespace size, then applies every mutation as one atomic
+Core batch under the concrete backend mutex, so single-record helpers cannot
+interleave or observe a partial generation. A failed batch changes no record. A
+successful return means the batch committed; a caller timeout remains
 ambiguous and should be reconciled with an authoritative read.
 
 `config.get` follows the same loaded-plugin namespace rule. It accepts no

@@ -6,19 +6,23 @@ use botster_core::contract::terminal_adapter::{
     TerminalAdapterPressure, TerminalAdapterWriteError, TerminalIngress,
 };
 use botster_core::contract::terminal_wake::{TerminalWakeKind, TerminalWakeSink};
-use botster_terminal_protocol::TerminalFrame;
+use botster_terminal_protocol::RoutedTerminalFrame;
 
 use super::close_reason::CloseCause;
-use super::ingress::{IngressAdmission, IngressBuffer};
+use super::ingress::IngressBuffer;
 use super::wake::WakeSink;
 
 type CloseHook = Arc<dyn Fn(bool) + Send + Sync>;
 
 /// One in-flight write slot shared by production terminal adapters.
+///
+/// The slot holds the routed envelope by `Arc` clones. The shared
+/// `TerminalBody` bytes are never copied into the slot; a transport reads
+/// them through [`RoutedTerminalFrame::frame`].
 pub(crate) struct AdapterSlot<W: WakeSink> {
     cause: CloseCause,
     would_block: AtomicBool,
-    slot: Mutex<Option<Vec<u8>>>,
+    slot: Mutex<Option<RoutedTerminalFrame>>,
     wake: W,
     close_work: Arc<AtomicBool>,
     close_hook: Mutex<Option<CloseHook>>,
@@ -117,7 +121,7 @@ impl<W: WakeSink> AdapterSlot<W> {
         }
     }
 
-    #[allow(dead_code)]
+    /// Record transport backpressure. Clearing it wakes Core and the writer.
     pub(crate) fn set_would_block(&self, pressured: bool) {
         self.would_block.store(pressured, Ordering::SeqCst);
         if !pressured {
@@ -129,9 +133,6 @@ impl<W: WakeSink> AdapterSlot<W> {
     pub(crate) fn pressure(&self) -> TerminalAdapterPressure {
         if self.is_closed() {
             return TerminalAdapterPressure::Closed;
-        }
-        if forced_would_block() {
-            return TerminalAdapterPressure::WouldBlock;
         }
         match self.slot.try_lock() {
             Ok(slot) => {
@@ -148,20 +149,16 @@ impl<W: WakeSink> AdapterSlot<W> {
         }
     }
 
-    pub(crate) fn try_write(&self, frame: &TerminalFrame) -> Result<(), TerminalAdapterWriteError> {
+    pub(crate) fn try_write(
+        &self,
+        frame: &RoutedTerminalFrame,
+    ) -> Result<(), TerminalAdapterWriteError> {
         if self.is_closed() {
             return Err(TerminalAdapterWriteError::Closed);
         }
-        if self.would_block.load(Ordering::SeqCst) || forced_would_block() {
+        if self.would_block.load(Ordering::SeqCst) {
             return Err(TerminalAdapterWriteError::WouldBlock);
         }
-        let bytes = match frame.to_bytes() {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                self.close();
-                return Err(TerminalAdapterWriteError::Closed);
-            }
-        };
         let mut slot = match self.slot.try_lock() {
             Ok(slot) => slot,
             Err(TryLockError::WouldBlock) => return Err(TerminalAdapterWriteError::Full),
@@ -177,7 +174,7 @@ impl<W: WakeSink> AdapterSlot<W> {
         if slot.is_some() {
             return Err(TerminalAdapterWriteError::Full);
         }
-        *slot = Some(bytes);
+        *slot = Some(frame.clone());
         drop(slot);
         self.wake.wake();
         Ok(())
@@ -187,22 +184,15 @@ impl<W: WakeSink> AdapterSlot<W> {
         self.ingress.try_read(self.is_closed())
     }
 
+    /// Validate the input header and buffer one complete frame.
+    ///
+    /// Returns `Err(())` when the header is malformed so the caller can close
+    /// the route.
     pub(crate) fn push_ingress(&self, bytes: Vec<u8>) -> Result<(), ()> {
-        self.push_ingress_observed(bytes, |_| {})
-    }
-
-    pub(crate) fn push_ingress_observed(
-        &self,
-        bytes: Vec<u8>,
-        observed: impl FnOnce(IngressAdmission),
-    ) -> Result<(), ()> {
         if self.is_closed() {
             return Ok(());
         }
-        match self
-            .ingress
-            .push_complete_observed(bytes, || self.is_closed(), observed)
-        {
+        match self.ingress.push_complete(bytes, || self.is_closed()) {
             Ok(true) => {
                 self.emit_writable();
                 Ok(())
@@ -261,7 +251,8 @@ impl<W: WakeSink> AdapterSlot<W> {
         }
     }
 
-    pub(crate) fn snapshot_active(&self) -> Option<Vec<u8>> {
+    /// The occupying routed frame, by `Arc` clones. `None` when empty or closed.
+    pub(crate) fn snapshot_active(&self) -> Option<RoutedTerminalFrame> {
         if self.is_closed() {
             match self.slot.try_lock() {
                 Ok(mut slot) => *slot = None,
@@ -283,7 +274,8 @@ impl<W: WakeSink> AdapterSlot<W> {
         }
     }
 
-    pub(crate) fn complete_active(&self) -> Option<Vec<u8>> {
+    /// Release the occupying frame after the transport finished its write.
+    pub(crate) fn complete_active(&self) -> Option<RoutedTerminalFrame> {
         if self.is_closed() {
             return None;
         }
@@ -310,9 +302,4 @@ impl AdapterSlot<super::wake::AdapterWake> {
     pub(crate) async fn wait_for_write(&self) {
         self.wake.wait().await;
     }
-}
-
-fn forced_would_block() -> bool {
-    std::env::var("BOTSTER_ENV").as_deref() == Ok("test")
-        && std::env::var("BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK").as_deref() == Ok("1")
 }

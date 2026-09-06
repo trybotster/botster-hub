@@ -1,11 +1,11 @@
 use std::path::PathBuf;
 
 use botster_hub_client::{
-    DaemonApp, DaemonCaptureSnapshot, DaemonCoordination, DaemonDiagnostic, DaemonEvent,
-    DaemonHubUpdate, DaemonHubUpdateExecution, DaemonLifecycleCounters, DaemonLocalWebrtcAnswer,
+    DaemonApp, DaemonCoordination, DaemonDiagnostic, DaemonEvent, DaemonHubUpdate,
+    DaemonHubUpdateExecution, DaemonLifecycleCounters, DaemonLocalWebrtcAnswer,
     DaemonLocalWebrtcBootstrap, DaemonModeFlags, DaemonOperatorError, DaemonPackageDiagnostic,
     DaemonPackageInstallEffect, DaemonPackageInstallPlan, DaemonPackageRouteDescriptor,
-    DaemonPackageUpdateStatus, DaemonPluginResourceCounters, DaemonPluginSurface, DaemonReadScreen,
+    DaemonPackageUpdateStatus, DaemonPluginResourceCounters, DaemonPluginSurface,
     DaemonResolvedAppLaunch, DaemonResolvedSessionType, DaemonResponse, DaemonResponseKind,
     DaemonSession, DaemonSessionCleanup, DaemonSessionContext, DaemonSessionTypeEditableDefinition,
     DaemonSpawnTargetValidation, DaemonTerminalReservation, DaemonUiTreeSnapshot,
@@ -27,10 +27,10 @@ use crate::client_api_dto::workspace::{daemon_spawn_target, daemon_worktree};
 use crate::daemon_projection::{daemon_status_from_status, package_navigation_entries};
 use crate::maintenance::{installation_identity, software_identity};
 use crate::{
-    AvailablePackage, HubClientCaptureSnapshot, HubClientModeFlags, HubClientPackage,
-    HubClientPackageNavigationEntry, HubClientPluginLifecycleReport, HubClientPluginSurface,
-    HubClientReadScreen, HubClientSession, HubDaemonStatus, McpToolDescriptor, PackageInstallPlan,
-    ResolvedSessionType, SpawnTarget, SpawnTargetValidation, Worktree,
+    AvailablePackage, HubClientPackage, HubClientPackageNavigationEntry,
+    HubClientPluginLifecycleReport, HubClientPluginSurface, HubClientSession, HubDaemonStatus,
+    McpToolDescriptor, PackageInstallPlan, ResolvedSessionType, SpawnTarget, SpawnTargetValidation,
+    Worktree,
 };
 
 pub(crate) fn daemon_response_base(kind: DaemonResponseKind) -> DaemonResponse {
@@ -44,6 +44,8 @@ pub(crate) fn daemon_response_base(kind: DaemonResponseKind) -> DaemonResponse {
         session_context: None,
         read_screen: None,
         mode_flags: None,
+        terminal_attach: None,
+        snapshot_page: None,
         terminal_reservation: None,
         subscription_reservation: None,
         capture_snapshot: None,
@@ -84,6 +86,7 @@ pub(crate) fn daemon_status(
     mut egress_diagnostics: Vec<DaemonDiagnostic>,
     lifecycle_counters: DaemonLifecycleCounters,
     observability_counters: botster_hub_client::DaemonObservabilityCounters,
+    retention: Option<botster_hub_client::DaemonRetentionAccounting>,
 ) -> DaemonResponse {
     let mut response = daemon_response_base(DaemonResponseKind::Status);
     response.status = Some(daemon_status_from_status(
@@ -94,6 +97,7 @@ pub(crate) fn daemon_status(
         software_identity(),
         installation_identity(),
         observability_counters,
+        retention,
     ));
     response.diagnostics = vec![DaemonDiagnostic::connected("status")];
     response.diagnostics.append(&mut egress_diagnostics);
@@ -139,44 +143,6 @@ pub(crate) fn daemon_terminal_reservation(
 ) -> DaemonResponse {
     let mut response = daemon_response_base(DaemonResponseKind::TerminalReservation);
     response.terminal_reservation = Some(reservation);
-    response
-}
-
-pub(crate) fn daemon_read_screen(screen: HubClientReadScreen) -> DaemonResponse {
-    let mut response = daemon_response_base(DaemonResponseKind::ReadScreen);
-    response.read_screen = Some(DaemonReadScreen {
-        session_id: screen.session_id.0,
-        text: screen.text,
-    });
-    response
-}
-
-pub(crate) fn daemon_mode_flags(mode_flags: HubClientModeFlags) -> DaemonResponse {
-    let mut response = daemon_response_base(DaemonResponseKind::ReadModeFlags);
-    response.mode_flags = Some(DaemonModeFlags::new(
-        mode_flags.session_id.0,
-        mode_flags.kitty_enabled,
-        mode_flags.cursor_visible,
-        mode_flags.bracketed_paste,
-        mode_flags.mouse_mode,
-        mode_flags.alt_screen,
-        mode_flags.focus_reporting,
-        mode_flags.application_cursor,
-        mode_flags.mode_generation,
-        mode_flags.mode_revision,
-    ));
-    response
-}
-
-pub(crate) fn daemon_capture_snapshot(snapshot: HubClientCaptureSnapshot) -> DaemonResponse {
-    let mut response = daemon_response_base(DaemonResponseKind::CaptureSnapshot);
-    response.capture_snapshot = Some(DaemonCaptureSnapshot {
-        session_id: snapshot.session_id.0,
-        rows: snapshot.rows,
-        cols: snapshot.cols,
-        payload_format: snapshot.payload_format,
-        payload_bytes: snapshot.payload_bytes,
-    });
     response
 }
 

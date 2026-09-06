@@ -1,7 +1,14 @@
+//! Reserved local WebRTC subscription DataChannels.
+//!
+//! One reserved channel carries one bound subscription: a terminal route
+//! (binary sealed chunks both ways), an entity subscription, or a package
+//! event subscription (encrypted JSON [`ServerFrame`] deliveries). The
+//! channel opens with one encrypted `ClientFrame::Hello` and one
+//! `ServerFrame::HelloAck`; it carries no requests.
 use botster_core::AesGcmKey;
 use botster_hub_client::{
-    DaemonCompatibility, DaemonDiagnostic, DaemonEntityFrame, DaemonHello, DaemonHelloAck,
-    DaemonRequest, DaemonResponse, PROTOCOL,
+    ClientFrame, DaemonCompatibility, DaemonDiagnostic, DaemonEntityFrame, DaemonHello,
+    DaemonHelloAck, DaemonRequest, DaemonResponse, PROTOCOL, PROTOCOL_VERSION, ServerFrame,
 };
 use botster_terminal_protocol::{
     TerminalCompatibility, ensure_compatible as ensure_terminal_compatible,
@@ -13,22 +20,16 @@ use crate::daemon::control::message::{
 };
 use crate::transport::webrtc::adapter::WebRtcTerminalAdapterHandle;
 use crate::transport::webrtc::control_channel::{
-    DataChannelPlaintext, LOCAL_WEBRTC_BUFFERED_AMOUNT_HIGH, LOCAL_WEBRTC_BUFFERED_AMOUNT_LOW,
-    decrypt_data_channel_plaintext,
+    LOCAL_WEBRTC_BUFFERED_AMOUNT_HIGH, LOCAL_WEBRTC_BUFFERED_AMOUNT_LOW, decrypt_client_frame,
 };
 use crate::transport::webrtc::delivery::{
-    InboundTerminalEnvelopeAssembly, framed_daemon_entity_frame, framed_daemon_event,
-    framed_daemon_hello_ack, framed_daemon_terminal_frame,
+    InboundTerminalChunkAssembly, framed_server_frame, sealed_terminal_chunks,
 };
 use crate::transport::webrtc::peer::LocalWebrtcPeerState;
 
 use crate::subscription::attach_routes::response_records_attach_ownership;
 use crate::transport::webrtc::control_channel::LocalWebrtcDataChannel;
 use crate::transport::webrtc::peer::LOCAL_WEBRTC_PEER_CLOSE_BOUND;
-pub(crate) const TEST_EXTRA_CHANNEL_CLOSE_MARKER_ENV: &str =
-    "BOTSTER_HUB_TEST_EXTRA_CHANNEL_CLOSE_MARKER";
-pub(crate) const TEST_EXTRA_CHANNEL_OBSERVATION_ENV: &str =
-    "BOTSTER_HUB_TEST_EXTRA_CHANNEL_OBSERVATION";
 #[cfg(test)]
 pub(crate) const EXTRA_DATA_CHANNEL_LABEL: &str = "botster-extra";
 
@@ -57,102 +58,12 @@ impl SubscriptionChannelRejectReason {
     }
 }
 
-pub(crate) fn observe_rejected_data_channel_for_test(
-    claimed: bool,
-    close: &Result<Result<(), String>, tokio::time::error::Elapsed>,
-    label: &str,
-) {
-    if std::env::var("BOTSTER_ENV").as_deref() != Ok("test") {
-        return;
-    }
-    let lost_claim = !claimed;
-    let close_ok = matches!(close, Ok(Ok(())));
-    // extra-channel close marker requires lost_claim && close_ok
-    if lost_claim
-        && close_ok
-        && let Ok(path) = std::env::var(TEST_EXTRA_CHANNEL_CLOSE_MARKER_ENV)
-        && !path.is_empty()
-    {
-        let _ = std::fs::write(path, "closed\n");
-    }
-    if let Ok(path) = std::env::var(TEST_EXTRA_CHANNEL_OBSERVATION_ENV)
-        && !path.is_empty()
-    {
-        let body = serde_json::json!({
-            "lost_claim": lost_claim,
-            "close_ok": close_ok,
-            "label": label,
-        })
-        .to_string();
-        let path = std::path::PathBuf::from(path);
-        let temporary = path.with_extension("tmp");
-        if std::fs::write(&temporary, body).is_ok() {
-            let _ = std::fs::rename(temporary, path);
-        }
-    }
-}
-pub(crate) const TEST_RESERVED_CHANNEL_RECEIPT_ENV: &str =
-    "BOTSTER_HUB_TEST_RESERVED_CHANNEL_RECEIPT";
-
-/// Test-only receipt that a reserved-label DataChannel reached admission-task entry.
-///
-/// Records entry to `admit_reserved_subscription_channel`, which the peer handler spawns
-/// from its `on_data_channel` callback; it is not the callback instant and says nothing
-/// about wire transmission of the DCEP ACK. Gated on `BOTSTER_ENV=test` and an explicit
-/// path, restricted to reservation labels (the `r-` prefix the Hub assigns at Attach), and
-/// written at most once per process: the fixture that enables it opens exactly one
-/// reserved channel, and the reader matches the recorded label against that fixture's
-/// Attach reservation; a mismatch makes the record irrelevant, not evidence about the
-/// target. The instant is captured before the write is scheduled, and the append runs on
-/// the blocking pool, so neither the admission task nor the channel driver waits on file
-/// I/O. A present record is positive evidence; an absent one is inconclusive, because the
-/// detached write may not run or may fail.
-pub(crate) fn observe_reserved_channel_receipt_for_test(label: &str) {
-    static SCHEDULED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !label.starts_with("r-") {
-        return;
-    }
-    if std::env::var("BOTSTER_ENV").as_deref() != Ok("test") {
-        return;
-    }
-    let Ok(path) = std::env::var(TEST_RESERVED_CHANNEL_RECEIPT_ENV) else {
-        return;
-    };
-    if path.is_empty() || SCHEDULED.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        return;
-    }
-    let admission_entry_unix_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis())
-        .unwrap_or(0);
-    let line = serde_json::json!({
-        "label": label,
-        "admission_entry_unix_ms": admission_entry_unix_ms,
-    })
-    .to_string();
-    tokio::task::spawn_blocking(move || {
-        use std::io::Write;
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
-            let _ = writeln!(file, "{line}");
-        }
-    });
-}
-
-pub(crate) async fn reject_extra_data_channel<C>(
-    grant_id: &str,
-    claimed: bool,
-    label: &str,
-    data_channel: &C,
-) where
+pub(crate) async fn reject_extra_data_channel<C>(grant_id: &str, label: &str, data_channel: &C)
+where
     C: LocalWebrtcDataChannel + ?Sized,
 {
-    eprintln!("local WebRTC rejecting extra DataChannel: grant_id={grant_id}");
-    let close = close_subscription_channel(data_channel).await;
-    observe_rejected_data_channel_for_test(claimed, &close, label);
+    eprintln!("local WebRTC rejecting extra DataChannel: grant_id={grant_id} label={label}");
+    let _ = close_subscription_channel(data_channel).await;
 }
 
 async fn reject_reserved_data_channel<C>(
@@ -169,7 +80,7 @@ async fn reject_reserved_data_channel<C>(
         .push_host_event(botster_hub_client::DaemonEvent::RuntimeObservation {
             kind: format!("subscription_channel_rejected:{}:{label}", reason.as_str()),
         });
-    reject_extra_data_channel(grant_id, false, label, data_channel).await;
+    reject_extra_data_channel(grant_id, label, data_channel).await;
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LocalWebrtcAttachedSubscription {
@@ -222,7 +133,6 @@ pub(crate) async fn admit_reserved_subscription_channel<C>(
 ) where
     C: LocalWebrtcDataChannel + ?Sized,
 {
-    observe_reserved_channel_receipt_for_test(label);
     let (inspect_tx, inspect_rx) = oneshot::channel();
     if peer_state
         .runtime_tx
@@ -234,13 +144,13 @@ pub(crate) async fn admit_reserved_subscription_channel<C>(
         .await
         .is_err()
     {
-        reject_extra_data_channel(grant_id, false, label, data_channel).await;
+        reject_extra_data_channel(grant_id, label, data_channel).await;
         return;
     }
     let inspect = match inspect_rx.await {
         Ok(inspect) => inspect,
         Err(_) => {
-            reject_extra_data_channel(grant_id, false, label, data_channel).await;
+            reject_extra_data_channel(grant_id, label, data_channel).await;
             return;
         }
     };
@@ -333,7 +243,7 @@ pub(crate) async fn admit_reserved_subscription_channel<C>(
         .await
         .is_err()
     {
-        reject_extra_data_channel(grant_id, false, label, data_channel).await;
+        reject_extra_data_channel(grant_id, label, data_channel).await;
         return;
     }
     match bind_rx.await {
@@ -418,8 +328,8 @@ where
     loop {
         match data_channel.local_poll().await {
             Some(webrtc::data_channel::DataChannelEvent::OnMessage(message)) => {
-                match decrypt_data_channel_plaintext(stream_key, message.data.as_ref()) {
-                    Some(DataChannelPlaintext::Hello(hello)) => {
+                match decrypt_client_frame(stream_key, message.data.as_ref()) {
+                    Some(ClientFrame::Hello { hello }) => {
                         return acknowledge_subscription_hello(
                             data_channel,
                             stream_key,
@@ -452,7 +362,7 @@ async fn acknowledge_subscription_hello<C>(
 where
     C: LocalWebrtcDataChannel + ?Sized,
 {
-    if hello.protocol != PROTOCOL {
+    if hello.protocol != PROTOCOL || hello.compatibility.protocol_version != PROTOCOL_VERSION {
         return Err(());
     }
     if let Some(requirement) = hello.terminal_compatibility.as_ref()
@@ -466,7 +376,7 @@ where
         terminal_compatibility: Some(TerminalCompatibility::current()),
         diagnostics: vec![DaemonDiagnostic::connected("hello")],
     };
-    let frames = framed_daemon_hello_ack(stream_key, &ack).map_err(|_| ())?;
+    let frames = framed_server_frame(stream_key, &ServerFrame::HelloAck { ack }).map_err(|_| ())?;
     let mut permits = Vec::with_capacity(frames.len());
     for frame in frames {
         let permit = authorize_subscription_hello_ack(peer_state, grant_id, label, frame.len())
@@ -500,9 +410,9 @@ pub(crate) enum TerminalDriverExit {
     FrameEncode,
     PermitRefused,
     SendFailed,
+    /// An inbound chunk failed the header, order, generation, size, or
+    /// authentication rules of the binary terminal channel contract.
     IngressAssembly,
-    IngressEnvelope,
-    IngressDecrypt,
     IngressRejected,
     RemoteClose,
     RemoteError,
@@ -520,8 +430,6 @@ impl TerminalDriverExit {
             Self::PermitRefused => "permit_refused",
             Self::SendFailed => "send_failed",
             Self::IngressAssembly => "ingress_assembly",
-            Self::IngressEnvelope => "ingress_envelope",
-            Self::IngressDecrypt => "ingress_decrypt",
             Self::IngressRejected => "ingress_rejected",
             Self::RemoteClose => "remote_close",
             Self::RemoteError => "remote_error",
@@ -589,6 +497,7 @@ async fn run_bound_subscription_channel<C>(
                 data_channel,
                 stream_key,
                 route.peer_state,
+                route.generation,
                 handle,
                 usage,
             )
@@ -608,16 +517,25 @@ async fn run_bound_terminal_channel<C>(
     data_channel: &C,
     stream_key: &AesGcmKey,
     peer_state: &LocalWebrtcPeerState,
+    generation: u64,
     handle: WebRtcTerminalAdapterHandle,
     usage: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) -> TerminalDriverExit
 where
     C: LocalWebrtcDataChannel + ?Sized,
 {
-    let mut inbound_assembly = InboundTerminalEnvelopeAssembly::default();
+    let mut inbound_assembly = InboundTerminalChunkAssembly::new(generation);
+    // Per-channel outbound message id; the first Hub-to-client message is 1.
+    let mut next_message_id: u64 = 1;
     loop {
-        if let Err(exit) =
-            flush_subscription_adapter_frames(data_channel, stream_key, &handle, &usage).await
+        if let Err(exit) = flush_subscription_adapter_frames(
+            data_channel,
+            stream_key,
+            &handle,
+            &usage,
+            &mut next_message_id,
+        )
+        .await
         {
             close_subscription_channel_or_fail_peer(data_channel, peer_state).await;
             handle.close();
@@ -630,26 +548,14 @@ where
             inbound = data_channel.local_poll() => {
                 match inbound {
                     Some(webrtc::data_channel::DataChannelEvent::OnMessage(message)) => {
-                        let encrypted = match inbound_assembly.push(message.data.as_ref()) {
-                            Ok(Some(encrypted)) => encrypted,
+                        let bytes = match inbound_assembly.push(stream_key, message.data.as_ref()) {
+                            Ok(Some(bytes)) => bytes,
                             Ok(None) => continue,
                             Err(()) => {
                                 handle.close();
                                 close_subscription_channel_or_fail_peer(data_channel, peer_state).await;
                                 return TerminalDriverExit::IngressAssembly;
                             }
-                        };
-                        let Ok(envelope) = serde_json::from_str::<botster_core::AesGcmEnvelope>(
-                            &encrypted,
-                        ) else {
-                            handle.close();
-                            close_subscription_channel_or_fail_peer(data_channel, peer_state).await;
-                            return TerminalDriverExit::IngressEnvelope;
-                        };
-                        let Ok(bytes) = botster_core::decrypt_aes_gcm(stream_key, &envelope) else {
-                            handle.close();
-                            close_subscription_channel_or_fail_peer(data_channel, peer_state).await;
-                            return TerminalDriverExit::IngressDecrypt;
                         };
                         if handle.push_ingress(bytes).is_err() {
                             handle.close();
@@ -699,8 +605,9 @@ async fn run_bound_entity_channel<C>(
         tokio::select! {
             biased;
             frame = receiver.recv() => {
-                let Some(frame) = frame else { break };
-                let Ok(frames) = framed_daemon_entity_frame(stream_key, &frame) else { break };
+                let Some(entity) = frame else { break };
+                let Ok(frames) = framed_server_frame(stream_key, &ServerFrame::Entity { entity })
+                else { break };
                 for frame in frames {
                     let Some(permit) = authorize_subscription_send(
                         route.peer_state,
@@ -813,7 +720,12 @@ async fn run_bound_event_channel<C>(
             break;
         }
         while let Some(event) = mailbox.take_ready_event() {
-            let Ok(frames) = framed_daemon_event(stream_key, &event) else {
+            let Ok(frames) = framed_server_frame(
+                stream_key,
+                &ServerFrame::Event {
+                    event: event.clone(),
+                },
+            ) else {
                 break 'driver;
             };
             for frame in frames {
@@ -940,25 +852,31 @@ fn apply_subscription_pressure_event(
     }
 }
 
+/// Seal and send the adapter's active routed frame as ordered binary chunks.
+///
+/// The frame body is sealed slice by slice straight from the shared
+/// `TerminalBody` bytes; nothing is re-serialized or text-encoded.
 async fn flush_subscription_adapter_frames<C>(
     data_channel: &C,
     stream_key: &AesGcmKey,
     handle: &WebRtcTerminalAdapterHandle,
     usage: &std::sync::atomic::AtomicUsize,
+    next_message_id: &mut u64,
 ) -> Result<(), TerminalDriverExit>
 where
     C: LocalWebrtcDataChannel + ?Sized,
 {
-    let Some(bytes) = handle.snapshot_active() else {
+    let Some(frame) = handle.snapshot_active() else {
         return if handle.is_closed() {
             Err(TerminalDriverExit::AdapterClosed)
         } else {
             Ok(())
         };
     };
-    let frames = framed_daemon_terminal_frame(stream_key, &bytes)
+    let message_id = *next_message_id;
+    let chunks = sealed_terminal_chunks(stream_key, &frame, message_id)
         .map_err(|_| TerminalDriverExit::FrameEncode)?;
-    let wire_len = frames.iter().map(String::len).sum();
+    let wire_len = chunks.iter().map(Vec::len).sum();
     if !handle.transfer_aggregate_permit(wire_len, usage) {
         return Err(if handle.is_closed() {
             TerminalDriverExit::AdapterClosed
@@ -966,9 +884,12 @@ where
             TerminalDriverExit::PermitRefused
         });
     }
+    // The id is consumed once sealing succeeds; a failed send closes the
+    // channel, so the gap is never observed.
+    *next_message_id = message_id.wrapping_add(1);
     let sent = async {
-        for frame in frames {
-            let send = data_channel.local_send_text(&frame);
+        for chunk in &chunks {
+            let send = data_channel.local_send_binary(chunk);
             tokio::pin!(send);
             loop {
                 if handle.is_closed() {

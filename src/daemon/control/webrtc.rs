@@ -13,10 +13,11 @@ use crate::HubDaemon;
 use crate::client_api_dto::response::{
     daemon_local_webrtc_answer, daemon_local_webrtc_bootstrap, daemon_response_base,
 };
+use crate::daemon::control::DaemonObservability;
 use crate::daemon::control::message::{ControlMessage, ControlSender};
-use crate::daemon::control::{DaemonObservability, handle_control_request};
+use crate::daemon::control::pending::{ControlPoll, ControlStep};
 use crate::daemon::error::{DaemonTransportResult, local_webrtc_bootstrap_issue_error};
-use crate::daemon::owner_loop::{DaemonControlState, PendingRuntimeState};
+use crate::daemon::owner_loop::DaemonControlState;
 use crate::daemon_projection::app_local_url;
 use crate::subscription::attach_routes::{
     AttachedSubscription, AttachedSubscriptionChange, record_attached_subscription_change,
@@ -68,28 +69,37 @@ fn persist_local_webrtc_terminal_record(
     Ok(())
 }
 
+/// Detach every subscription a closed peer still owned. Each detach runs
+/// through the session family; Core-bound steps continue as owner work and
+/// their responses are dropped because no peer waits for them.
 fn detach_local_webrtc_subscriptions(
     daemon: &mut HubDaemon,
-    logical_clock: &mut u64,
-    drain_cursors: &mut BTreeMap<String, u64>,
-    pending_runtime: &mut PendingRuntimeState,
-    control_tx: ControlSender,
-    observability: DaemonObservability<'_>,
+    state: &mut DaemonControlState,
     attached_subscriptions: Vec<LocalWebrtcAttachedSubscription>,
 ) {
     for subscription in attached_subscriptions {
-        let _ = handle_control_request(
+        let observability = DaemonObservability {
+            egress: Vec::new(),
+            lifecycle: state.lifecycle_counters.clone(),
+            client_id: None,
+            grant_id: None,
+        };
+        let step = crate::daemon::control::sessions::handle_runtime(
             daemon,
-            logical_clock,
-            drain_cursors,
-            pending_runtime,
+            state,
             observability,
-            control_tx.clone(),
             DaemonRequest::Detach {
                 session_id: subscription.session_id,
                 subscription_id: subscription.subscription_id,
             },
         );
+        if let ControlStep::Pending(mut continuation) = step {
+            state
+                .pending_owner_work
+                .push(Box::new(move |daemon, state| {
+                    !matches!(continuation(daemon, state), ControlPoll::Pending)
+                }));
+        }
     }
 }
 
@@ -417,19 +427,7 @@ pub(crate) fn handle_peer_closed(
         .pending_runtime
         .attach_owner_grant_ids
         .retain(|_, owner| !removed_grants.contains(owner.as_str()));
-    detach_local_webrtc_subscriptions(
-        daemon,
-        &mut state.logical_clock,
-        &mut state.drain_cursors,
-        &mut state.pending_runtime,
-        control_tx,
-        DaemonObservability {
-            egress: &state.egress_diagnostics,
-            lifecycle: &state.lifecycle_counters,
-            client_id: None,
-            grant_id: None,
-        },
-        unbound_detach,
-    );
+    let _ = control_tx;
+    detach_local_webrtc_subscriptions(daemon, state, unbound_detach);
     false
 }

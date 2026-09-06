@@ -28,6 +28,7 @@ use botster_core_daemon::{
 };
 
 use crate::HubRuntime;
+use crate::data_plane::driver::{CoreTicket, CoreTicketPoll};
 use crate::session_projection::SessionProjection;
 
 /// Published owner-turn budget after isolated-path measurement.
@@ -52,6 +53,8 @@ pub const BASELINE_PAGE_BUDGET: LifecycleBaselineBudget = LifecycleBaselineBudge
 const JOURNAL_PAGE_MAX_CHANGES: usize = 16;
 const JOURNAL_PAGE_MAX_BYTES: usize = 64 * 1024;
 const APPLY_MAX_CHANGES: usize = 16;
+/// Plugin event handler invocation bound for maintenance-driven deliveries.
+const EVENT_INVOCATION_TIMEOUT_MS: u64 = 1_000;
 const SESSION_CHUNK_MAX_ITEMS: usize = 8;
 const SESSION_CHUNK_MAX_BYTES: usize = 32 * 1024;
 const COMPLETION_DRAIN_MAX_ITEMS: usize = 8;
@@ -626,6 +629,32 @@ pub struct MaintenanceState {
     pub projection_dirty: bool,
     pub event_in_flight: BTreeMap<String, EventDeliveryFlight>,
     pub pending_retirements: VecDeque<EventDeliveryFlight>,
+    /// Core reported a lifecycle-journal advance since the last consumer read it.
+    pub journal_wake_pending: bool,
+}
+
+/// Core lifecycle reads the maintenance slices have in flight.
+///
+/// Each slice requests one read on one owner turn and applies it on a later
+/// turn; the owner never waits for Core. Held outside [`MaintenanceState`]
+/// because tickets are neither clonable nor comparable.
+#[derive(Debug, Default)]
+pub struct MaintenanceCoreReads {
+    observe: Option<CoreTicket<Result<ObserveLifecycleSlice, SessionLifecyclePageError>>>,
+    /// Journal page read plus the journal-advanced flag observed when it started.
+    journal: Option<(
+        CoreTicket<Result<SessionLifecyclePage, SessionLifecyclePageError>>,
+        bool,
+    )>,
+    baseline: Option<CoreTicket<Result<SessionLifecycleBaselinePage, SessionLifecyclePageError>>>,
+}
+
+impl MaintenanceCoreReads {
+    /// True while any lifecycle read waits on Core.
+    #[must_use]
+    pub fn in_flight(&self) -> bool {
+        self.observe.is_some() || self.journal.is_some() || self.baseline.is_some()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -669,6 +698,16 @@ impl MaintenanceState {
     /// Coalesce one O(1) wake after an authoritative mutation.
     pub fn try_wake(&mut self) {
         self.scheduler.try_wake();
+    }
+
+    /// Record Core's coalesced journal-advanced wake for the next consumer.
+    pub fn note_journal_advanced(&mut self) {
+        self.journal_wake_pending = true;
+    }
+
+    /// Take the journal-advanced wake. Mirrors Core's coalesced bit.
+    pub fn take_journal_wake(&mut self) -> bool {
+        std::mem::take(&mut self.journal_wake_pending)
     }
 
     /// After an authoritative mutation, pull the journal on the next idle turn.
@@ -880,13 +919,14 @@ pub(crate) fn pack_session_chunk(
 pub fn run_maintenance_kind(
     runtime: &HubRuntime,
     state: &mut MaintenanceState,
+    reads: &mut MaintenanceCoreReads,
     kind: MaintenanceSliceKind,
 ) {
     match kind {
-        MaintenanceSliceKind::Observe => run_observe_slice(runtime, state),
-        MaintenanceSliceKind::JournalPull => run_journal_pull_slice(runtime, state),
+        MaintenanceSliceKind::Observe => run_observe_slice(runtime, state, reads),
+        MaintenanceSliceKind::JournalPull => run_journal_pull_slice(runtime, state, reads),
         MaintenanceSliceKind::ProjectionApply => run_projection_apply_slice(Some(runtime), state),
-        MaintenanceSliceKind::Baseline => run_baseline_slice(runtime, state),
+        MaintenanceSliceKind::Baseline => run_baseline_slice(runtime, state, reads),
         MaintenanceSliceKind::HostBridge => run_host_bridge_slice(runtime, state),
         MaintenanceSliceKind::CompletionDrain => run_completion_drain_slice(runtime, state),
         MaintenanceSliceKind::PackageEventDelivery => {
@@ -928,9 +968,30 @@ fn now_seconds() -> u64 {
         .as_secs()
 }
 
-fn run_observe_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
-    let resume = state.observe_resume.clone();
-    match runtime.observe_lifecycle_slice(now_seconds(), resume.as_ref(), OBSERVE_SLICE_BUDGET) {
+fn run_observe_slice(
+    runtime: &HubRuntime,
+    state: &mut MaintenanceState,
+    reads: &mut MaintenanceCoreReads,
+) {
+    let Some(ticket) = reads.observe.as_mut() else {
+        let resume = state.observe_resume.clone();
+        reads.observe = Some(runtime.observe_lifecycle_slice(
+            now_seconds(),
+            resume.as_ref(),
+            OBSERVE_SLICE_BUDGET,
+        ));
+        return;
+    };
+    let result = match ticket.poll() {
+        CoreTicketPoll::Pending => return,
+        CoreTicketPoll::Lost => {
+            reads.observe = None;
+            return;
+        }
+        CoreTicketPoll::Ready(result) => result,
+    };
+    reads.observe = None;
+    match result {
         Ok(slice) => {
             if let Some(reason) = slice.resync_required {
                 if matches!(reason, SessionLifecycleResyncReason::SourceChanged) {
@@ -941,10 +1002,11 @@ fn run_observe_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
                 }
                 return;
             }
+            let journal_advanced = state.take_journal_wake();
             apply_observe_pass_result(
                 state,
                 slice.complete,
-                runtime.take_journal_advanced_wake(),
+                journal_advanced,
                 if slice.complete {
                     None
                 } else {
@@ -962,25 +1024,50 @@ fn run_observe_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
     }
 }
 
-fn run_journal_pull_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
-    if runtime.journal_pull_held() {
-        return;
-    }
-    let woke = runtime.take_journal_advanced_wake();
-    if state.baseline.is_some() || !state.projection.baseline_complete {
-        if woke && state.baseline.is_none() && !state.session_family.need_gap_pass {
-            start_baseline_recovery(state);
+fn run_journal_pull_slice(
+    runtime: &HubRuntime,
+    state: &mut MaintenanceState,
+    reads: &mut MaintenanceCoreReads,
+) {
+    let (result, woke) = match reads.journal.as_mut() {
+        Some((ticket, woke)) => match ticket.poll() {
+            CoreTicketPoll::Pending => return,
+            CoreTicketPoll::Lost => {
+                reads.journal = None;
+                return;
+            }
+            CoreTicketPoll::Ready(result) => {
+                let woke = *woke;
+                reads.journal = None;
+                (result, woke)
+            }
+        },
+        None => {
+            let woke = state.take_journal_wake();
+            if state.baseline.is_some() || !state.projection.baseline_complete {
+                if woke && state.baseline.is_none() && !state.session_family.need_gap_pass {
+                    start_baseline_recovery(state);
+                }
+                return;
+            }
+            let Some(cursor) = state.projection.cursor.clone() else {
+                if woke {
+                    start_baseline_recovery(state);
+                }
+                return;
+            };
+            reads.journal = Some((
+                runtime.lifecycle_changes_page(
+                    &cursor,
+                    JOURNAL_PAGE_MAX_CHANGES,
+                    JOURNAL_PAGE_MAX_BYTES,
+                ),
+                woke,
+            ));
+            return;
         }
-        return;
-    }
-    let Some(cursor) = state.projection.cursor.clone() else {
-        if woke {
-            start_baseline_recovery(state);
-        }
-        return;
     };
-    match runtime.lifecycle_changes_page(&cursor, JOURNAL_PAGE_MAX_CHANGES, JOURNAL_PAGE_MAX_BYTES)
-    {
+    match result {
         Ok(page) => {
             state.journal_page_reads = state.journal_page_reads.saturating_add(1);
             if let Some(reason) = page.resync_required {
@@ -990,7 +1077,7 @@ fn run_journal_pull_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
             state.journal_source_watermark = Some(page.source_watermark.clone());
             let received = !page.changes.is_empty();
             let at_watermark = page.next == page.source_watermark;
-            let journal_advanced = woke || runtime.take_journal_advanced_wake();
+            let journal_advanced = woke || state.take_journal_wake();
             // An empty page can still be stale when a journal-advanced wake
             // arrives in the same slice. Confirmation must wait for a later
             // pull that sees no wake.
@@ -1037,17 +1124,38 @@ fn run_projection_apply_slice(runtime: Option<&HubRuntime>, state: &mut Maintena
     }
 }
 
-fn run_baseline_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
-    let Some(recovery) = state.baseline.as_ref() else {
-        return;
+fn run_baseline_slice(
+    runtime: &HubRuntime,
+    state: &mut MaintenanceState,
+    reads: &mut MaintenanceCoreReads,
+) {
+    let result = match reads.baseline.as_mut() {
+        Some(ticket) => match ticket.poll() {
+            CoreTicketPoll::Pending => return,
+            CoreTicketPoll::Lost => {
+                reads.baseline = None;
+                return;
+            }
+            CoreTicketPoll::Ready(result) => {
+                reads.baseline = None;
+                result
+            }
+        },
+        None => {
+            let Some(recovery) = state.baseline.as_ref() else {
+                return;
+            };
+            let snapshot_ref = recovery.snapshot.clone();
+            let after_ref = recovery.after.clone();
+            reads.baseline = Some(runtime.lifecycle_baseline_page(
+                snapshot_ref.as_ref(),
+                after_ref.as_ref(),
+                BASELINE_PAGE_BUDGET,
+            ));
+            return;
+        }
     };
-    let snapshot_ref = recovery.snapshot.clone();
-    let after_ref = recovery.after.clone();
-    match runtime.lifecycle_baseline_page(
-        snapshot_ref.as_ref(),
-        after_ref.as_ref(),
-        BASELINE_PAGE_BUDGET,
-    ) {
+    match result {
         Ok(page) => {
             state.baseline_page_reads = state.baseline_page_reads.saturating_add(1);
             if let Some(reason) = page.resync_required {
@@ -1125,10 +1233,7 @@ fn run_host_bridge_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
         PluginInvocationRequest {
             request_id: request_id.clone(),
             handler,
-            timeout_ms: runtime
-                .test_seams()
-                .event_invocation_timeout_ms
-                .unwrap_or(1_000),
+            timeout_ms: EVENT_INVOCATION_TIMEOUT_MS,
             context: PluginInvocationContext {
                 client_id: None,
                 session_id: None,
@@ -1281,10 +1386,7 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
             PluginInvocationRequest {
                 request_id: request_id.clone(),
                 handler: handler.handler,
-                timeout_ms: runtime
-                    .test_seams()
-                    .event_invocation_timeout_ms
-                    .unwrap_or(1_000),
+                timeout_ms: EVENT_INVOCATION_TIMEOUT_MS,
                 context: PluginInvocationContext {
                     client_id: None,
                     session_id: None,

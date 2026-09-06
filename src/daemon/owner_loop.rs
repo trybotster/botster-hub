@@ -9,7 +9,6 @@ use std::sync::mpsc::{self};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use botster_core::{SessionId, SubscriptionId};
 use botster_hub_client::{
     DaemonDiagnostic, DaemonLifecycleCounters, DaemonRequest, DaemonResponse, DaemonResponseKind,
 };
@@ -46,12 +45,29 @@ use crate::transport::unix::connection::{
     wait_for_connection_tasks,
 };
 use crate::transport::unix::listener::{
-    accept_connections, cleanup_socket_path, prepare_socket_path, rebind_missing_socket_path,
-    socket_path,
+    accept_connections, acquire_socket_owner_lock, cleanup_socket_path, prepare_socket_path,
+    rebind_missing_socket_path, socket_path,
 };
 use crate::transport::webrtc::LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE;
 
 const ENTITY_RECONCILIATION_INTERVAL: Duration = Duration::from_millis(500);
+
+/// One owner continuation that returns `true` when its work is complete.
+pub(crate) type OwnerWork = Box<dyn FnMut(&mut HubDaemon, &mut DaemonControlState) -> bool + Send>;
+
+/// Poll every pending owner work item once; finished items are dropped.
+pub(crate) fn poll_owner_work(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
+    if state.pending_owner_work.is_empty() {
+        return;
+    }
+    if let Some(runtime) = daemon.runtime() {
+        runtime.absorb_core_completions();
+    }
+    let mut work = std::mem::take(&mut state.pending_owner_work);
+    work.retain_mut(|item| !item(daemon, state));
+    work.append(&mut state.pending_owner_work);
+    state.pending_owner_work = work;
+}
 
 enum OwnerEvent {
     Control(Box<Option<ControlMessage>>),
@@ -161,6 +177,7 @@ fn run_one_owner_maintenance_slice(daemon: &mut HubDaemon, state: &mut DaemonCon
                 run_maintenance_kind(
                     runtime,
                     &mut state.maintenance,
+                    &mut state.maintenance_reads,
                     MaintenanceSliceKind::PackageEventDelivery,
                 );
             }
@@ -173,7 +190,12 @@ fn run_one_owner_maintenance_slice(daemon: &mut HubDaemon, state: &mut DaemonCon
                 {
                     state.maintenance.try_wake();
                 }
-                run_maintenance_kind(runtime, &mut state.maintenance, other);
+                run_maintenance_kind(
+                    runtime,
+                    &mut state.maintenance,
+                    &mut state.maintenance_reads,
+                    other,
+                );
             }
         }
     }
@@ -196,7 +218,8 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
     let local_webrtc_terminal_record_path = config
         .data_directory
         .join(LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE);
-    prepare_socket_path(&socket_path)?;
+    let socket_owner = acquire_socket_owner_lock(&socket_path)?;
+    prepare_socket_path(&socket_path, &socket_owner)?;
     let listener = UnixListener::bind(&socket_path).map_err(DaemonTransportError::Io)?;
     listener
         .set_nonblocking(true)
@@ -232,11 +255,13 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
         let _runtime = transport_runtime.enter();
         TokioUnixListener::from_std(listener).map_err(DaemonTransportError::Io)?
     };
+    let (rebind_tx, rebind_rx) = tokio_mpsc::channel(1);
     let mut connection_tasks = vec![transport_runtime.spawn(accept_connections(
         listener,
         control_tx.clone(),
         shutdown_tx.subscribe(),
         Arc::new(Semaphore::new(DAEMON_MAX_CONNECTIONS)),
+        rebind_rx,
     ))];
     loop {
         reap_finished_connection_tasks(&mut connection_tasks);
@@ -317,7 +342,7 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
                             control_tx.clone(),
                         );
                         let status = daemon.stop();
-                        cleanup_socket_path(&socket_path);
+                        cleanup_socket_path(&socket_path, socket_owner);
                         return Ok(status);
                     }
                 }
@@ -331,8 +356,23 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
         {
             run_one_owner_background_slice(&mut daemon, &mut control_state);
         }
+        poll_owner_work(&mut daemon, &mut control_state);
+        if crate::daemon::control::request::poll_deferred(&mut daemon, &mut control_state) {
+            let _ = shutdown_tx.send(true);
+            wait_for_connection_tasks(
+                &transport_runtime,
+                &mut connection_tasks,
+                &cleanup_rx,
+                &mut daemon,
+                &mut control_state,
+                control_tx.clone(),
+            );
+            let status = daemon.stop();
+            cleanup_socket_path(&socket_path, socket_owner);
+            return Ok(status);
+        }
         if !socket_path.exists() {
-            rebind_missing_socket_path(&socket_path);
+            rebind_missing_socket_path(&rebind_tx, &socket_path);
         }
     }
 }
@@ -565,19 +605,40 @@ fn run_one_pump_phase(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
     }
 }
 
+/// Validate owner route bookkeeping against one Core inventory read.
+///
+/// The read is requested on one pump turn and consumed on a later one; the
+/// owner never waits for it. Returns `true` while more work is pending.
 pub(crate) fn run_inventory_reconcile_phase(
     daemon: &HubDaemon,
     state: &mut DaemonControlState,
 ) -> bool {
+    use crate::data_plane::driver::CoreTicketPoll;
+
     let Some(runtime) = daemon.runtime() else {
         state.pump.reconcile_after = None;
+        state.reconcile_inventory = None;
         return false;
     };
+    let Some(ticket) = state.reconcile_inventory.as_mut() else {
+        state.reconcile_inventory = Some(runtime.list_terminal_subscriptions());
+        return true;
+    };
+    let inventory = match ticket.poll() {
+        CoreTicketPoll::Pending => return true,
+        CoreTicketPoll::Lost => {
+            state.reconcile_inventory = None;
+            state.pump.reconcile_after = None;
+            return false;
+        }
+        CoreTicketPoll::Ready(inventory) => inventory,
+    };
+    state.reconcile_inventory = None;
     let lookup = |session_id: &str, subscription_id: &str| {
-        runtime.terminal_subscription_generation(
-            &SessionId(session_id.to_string()),
-            &SubscriptionId(subscription_id.to_string()),
-        )
+        inventory
+            .iter()
+            .find(|row| row.session_id.0 == session_id && row.subscription_id.0 == subscription_id)
+            .map(|row| row.generation)
     };
     let progress = state.pending_runtime.reconcile_inventory_slice(
         lookup,
@@ -593,14 +654,36 @@ pub(crate) fn run_inventory_reconcile_phase(
     }
 }
 
+/// Drive one bounded observe slice through a Core ticket.
+///
+/// Returns `true` while the pass is incomplete or the read is in flight.
 fn run_pump_observe_phase(daemon: &HubDaemon, state: &mut DaemonControlState) -> bool {
+    use crate::data_plane::driver::CoreTicketPoll;
+
     let Some(runtime) = daemon.runtime() else {
         state.observe_resume = None;
+        state.observe_read = None;
         return false;
     };
-    let now = tick(&mut state.logical_clock);
-    let resume = state.observe_resume.as_ref();
-    let slice = runtime.observe_lifecycle_slice(now, resume, OBSERVE_SLICE_BUDGET);
+    let Some(ticket) = state.observe_read.as_mut() else {
+        let now = tick(&mut state.logical_clock);
+        state.observe_read = Some(runtime.observe_lifecycle_slice(
+            now,
+            state.observe_resume.as_ref(),
+            OBSERVE_SLICE_BUDGET,
+        ));
+        return true;
+    };
+    let slice = match ticket.poll() {
+        CoreTicketPoll::Pending => return true,
+        CoreTicketPoll::Lost => {
+            state.observe_read = None;
+            state.observe_resume = None;
+            return false;
+        }
+        CoreTicketPoll::Ready(slice) => slice,
+    };
+    state.observe_read = None;
     if let Ok(slice) = slice {
         state.lifecycle_counters.lifecycle_session_drains = state
             .lifecycle_counters
@@ -614,7 +697,7 @@ fn run_pump_observe_phase(daemon: &HubDaemon, state: &mut DaemonControlState) ->
                 last_visited: slice.last_visited,
             })
         };
-        if runtime.take_journal_advanced_wake() {
+        if state.maintenance.take_journal_wake() {
             state.maintenance.note_authoritative_mutation();
             state.background.mark_pump();
         }
@@ -641,7 +724,31 @@ pub(crate) struct DaemonControlState {
     pub(crate) released_entity_generations: u64,
     pub(crate) attach_close: crate::subscription::closed_events::AttachCloseBookkeeping,
     pub(crate) pending_hub_update_reply: Option<ControlReplySender>,
+    /// Requests whose response waits on a Core owner-thread result.
+    pub(crate) pending_requests: Vec<crate::daemon::control::pending::PendingControlRequest>,
+    /// Owner work that waits on a Core owner-thread result but answers no
+    /// request: reserved-channel binds, connection cleanup detaches.
+    pub(crate) pending_owner_work: Vec<OwnerWork>,
+    /// Lifecycle reads the maintenance slices have in flight.
+    pub(crate) maintenance_reads: crate::daemon_maintenance::MaintenanceCoreReads,
+    /// Close-event registry decisions cached for the current pump pass.
+    pub(crate) close_event_decisions: crate::subscription::closed_events::CloseEventDecisions,
+    /// Session-type catalog built off the owner thread.
+    pub(crate) session_type_catalog: crate::subscription::entity::SessionTypeCatalogCache,
+    /// Inventory read in flight for the pump reconcile phase.
+    reconcile_inventory: Option<
+        crate::data_plane::driver::CoreTicket<Vec<botster_core::TerminalSubscriptionRecord>>,
+    >,
     observe_resume: Option<botster_core_daemon::ObserveLifecycleCursor>,
+    /// Observe slice in flight for the pump observe phase.
+    observe_read: Option<
+        crate::data_plane::driver::CoreTicket<
+            Result<
+                botster_core_daemon::ObserveLifecycleSlice,
+                botster_core_daemon::SessionLifecyclePageError,
+            >,
+        >,
+    >,
 }
 
 impl Default for DaemonControlState {
@@ -663,7 +770,15 @@ impl Default for DaemonControlState {
             released_entity_generations: 0,
             attach_close: crate::subscription::closed_events::AttachCloseBookkeeping::default(),
             pending_hub_update_reply: None,
+            pending_requests: Vec::new(),
+            pending_owner_work: Vec::new(),
+            maintenance_reads: crate::daemon_maintenance::MaintenanceCoreReads::default(),
+            close_event_decisions: crate::subscription::closed_events::CloseEventDecisions::default(
+            ),
+            session_type_catalog: crate::subscription::entity::SessionTypeCatalogCache::default(),
+            reconcile_inventory: None,
             observe_resume: None,
+            observe_read: None,
         }
     }
 }

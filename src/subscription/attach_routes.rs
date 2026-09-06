@@ -4,14 +4,11 @@
 //! Hub authorizes the route and records generation plus adapter-bound flags.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::env;
 use std::ops::Bound;
 
 use botster_core::{
-    ClientId, SessionId, SubscriptionId, TerminalCapabilitySet, TerminalSubscriptionGeneration,
-    TerminalSubscriptionRecord,
+    TerminalCapabilitySet, TerminalSubscriptionGeneration, TerminalSubscriptionRecord,
 };
-use botster_core_daemon::CoreDaemonError;
 use botster_hub_client::{
     DaemonAttachOccupancy, DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonStatus,
     FEATURE_TERMINAL_SUBSCRIPTION_CLOSED, FEATURE_UNIX_TERMINAL_ADAPTER,
@@ -35,29 +32,7 @@ pub(crate) enum BoundAdapterHandle {
     WebRtc(WebRtcTerminalAdapterHandle),
 }
 
-pub(crate) fn forward_attach_bootstrap(
-    handle: &BoundAdapterHandle,
-    egress: &[botster_core::TransportEgress],
-) {
-    for frame in egress {
-        let Ok(bytes) = serde_json::to_vec(frame) else {
-            continue;
-        };
-        let Ok(opaque) = botster_terminal_protocol::TerminalFrame::from_bytes(&bytes) else {
-            continue;
-        };
-        handle.write_opaque_frame(&opaque);
-    }
-}
-
 impl BoundAdapterHandle {
-    pub(crate) fn write_opaque_frame(&self, frame: &botster_terminal_protocol::TerminalFrame) {
-        match self {
-            Self::Unix(handle) => handle.write_opaque_frame(frame),
-            Self::WebRtc(handle) => handle.write_opaque_frame(frame),
-        }
-    }
-
     pub(crate) fn close(&self) {
         match self {
             Self::Unix(handle) => handle.close(),
@@ -149,47 +124,6 @@ impl AttachStreamRegistry {
             .insert(subscription_id.clone());
         self.streams
             .insert((session_id, subscription_id), AttachStream::new(owner));
-    }
-
-    pub(crate) fn begin_core_attach(
-        &self,
-        runtime: &mut HubRuntime,
-        session_id: &str,
-        subscription_id: &str,
-        now_seconds: u64,
-    ) -> Result<Vec<botster_core::TransportEgress>, CoreDaemonError> {
-        let Some(client_id) = self.stream_owner_client_id(session_id, subscription_id) else {
-            return Ok(Vec::new());
-        };
-        let client_id = ClientId(client_id);
-        let session_id = SessionId(session_id.to_string());
-        let subscription_id = SubscriptionId(subscription_id.to_string());
-        runtime.expect_terminal_adapter(
-            client_id.clone(),
-            session_id.clone(),
-            subscription_id.clone(),
-        )?;
-        let attached = match runtime.attach_client(
-            client_id.clone(),
-            session_id.clone(),
-            subscription_id.clone(),
-            now_seconds,
-        ) {
-            Ok(attached) => attached,
-            Err(error) => {
-                let _ = runtime.cancel_expected_terminal_adapter(
-                    client_id,
-                    session_id,
-                    subscription_id,
-                );
-                return Err(error);
-            }
-        };
-        Ok(attached
-            .client_egress
-            .into_iter()
-            .map(|(_, egress)| egress)
-            .collect())
     }
 
     pub(crate) fn stream_owner_client_id(
@@ -568,211 +502,6 @@ pub(crate) fn live_generation_for_route(
     })
 }
 
-pub(crate) fn fail_closed_pre_bind_attach(
-    registry: &mut AttachStreamRegistry,
-    runtime: &mut HubRuntime,
-    client_id: &str,
-    session_id: &str,
-    subscription_id: &str,
-    now_seconds: u64,
-    adapter: Option<BoundAdapterHandle>,
-) {
-    if let Some(adapter) = adapter {
-        adapter.close();
-    }
-    registry.close_adapter(session_id, subscription_id);
-    let generation = live_generation_for_route(
-        &runtime.list_terminal_subscriptions(),
-        client_id,
-        session_id,
-        subscription_id,
-    );
-    if let Some(generation) = generation {
-        let _ = runtime.detach_terminal_subscription(
-            ClientId(client_id.to_string()),
-            SessionId(session_id.to_string()),
-            SubscriptionId(subscription_id.to_string()),
-            generation,
-            now_seconds,
-        );
-    }
-    registry.cancel_stream(session_id, subscription_id);
-}
-
-pub(crate) struct UnixBindRequest<'a> {
-    pub client_id: &'a str,
-    pub session_id: &'a str,
-    pub subscription_id: &'a str,
-    pub capabilities: TerminalCapabilitySet,
-    pub now_seconds: u64,
-    pub mux: Option<&'a UnixConnectionMux>,
-}
-
-pub(crate) fn bind_unix_adapter_after_attaching(
-    registry: &mut AttachStreamRegistry,
-    runtime: &mut HubRuntime,
-    request: UnixBindRequest<'_>,
-) -> Result<Option<UnixTerminalAdapterHandle>, ()> {
-    let inventory = runtime.list_terminal_subscriptions();
-    let Some(generation) = live_generation_for_route(
-        &inventory,
-        request.client_id,
-        request.session_id,
-        request.subscription_id,
-    ) else {
-        fail_closed_pre_bind_attach(
-            registry,
-            runtime,
-            request.client_id,
-            request.session_id,
-            request.subscription_id,
-            request.now_seconds,
-            None,
-        );
-        return Err(());
-    };
-    registry.record_generation(request.session_id, request.subscription_id, generation);
-    let capabilities = request.capabilities.clone();
-    let (adapter, handle) = match request.mux {
-        Some(mux) => mux.create_adapter(),
-        None => UnixTerminalAdapter::pair(),
-    };
-    if runtime
-        .bind_terminal_adapter(
-            ClientId(request.client_id.to_string()),
-            SessionId(request.session_id.to_string()),
-            SubscriptionId(request.subscription_id.to_string()),
-            generation,
-            capabilities,
-            Box::new(adapter),
-        )
-        .is_err()
-    {
-        fail_closed_pre_bind_attach(
-            registry,
-            runtime,
-            request.client_id,
-            request.session_id,
-            request.subscription_id,
-            request.now_seconds,
-            Some(BoundAdapterHandle::Unix(handle)),
-        );
-        return Err(());
-    }
-    registry.mark_adapter_bound(
-        request.session_id,
-        request.subscription_id,
-        generation,
-        BoundAdapterHandle::Unix(handle.clone()),
-    );
-    if let Some(mux) = request.mux {
-        mux.register(
-            request.session_id.to_string(),
-            request.subscription_id.to_string(),
-            generation.0,
-            handle.clone(),
-        );
-    }
-    Ok(Some(handle))
-}
-
-pub(crate) struct WebrtcBindRequest<'a> {
-    pub client_id: &'a str,
-    pub session_id: &'a str,
-    pub subscription_id: &'a str,
-    pub required_features: &'a [String],
-    pub terminal_requirement:
-        Option<&'a botster_terminal_protocol::TerminalCompatibilityRequirement>,
-    pub now_seconds: u64,
-    pub mux: Option<&'a WebRtcConnectionMux>,
-    pub aggregate: Option<std::sync::Arc<crate::admission::connection_budget::ConnectionAggregate>>,
-}
-
-pub(crate) fn bind_webrtc_adapter_after_attaching(
-    registry: &mut AttachStreamRegistry,
-    runtime: &mut HubRuntime,
-    request: WebrtcBindRequest<'_>,
-) -> Result<Option<WebRtcTerminalAdapterHandle>, ()> {
-    let inventory = runtime.list_terminal_subscriptions();
-    let Some(generation) = live_generation_for_route(
-        &inventory,
-        request.client_id,
-        request.session_id,
-        request.subscription_id,
-    ) else {
-        fail_closed_pre_bind_attach(
-            registry,
-            runtime,
-            request.client_id,
-            request.session_id,
-            request.subscription_id,
-            request.now_seconds,
-            None,
-        );
-        return Err(());
-    };
-    registry.record_generation(request.session_id, request.subscription_id, generation);
-    let capabilities = match negotiated_unix_capability_set(
-        request.required_features,
-        request.terminal_requirement,
-    ) {
-        Ok(capabilities) => capabilities,
-        Err(_) => {
-            fail_closed_pre_bind_attach(
-                registry,
-                runtime,
-                request.client_id,
-                request.session_id,
-                request.subscription_id,
-                request.now_seconds,
-                None,
-            );
-            return Err(());
-        }
-    };
-    let (adapter, handle) = match request.mux {
-        Some(mux) => mux.create_adapter_with_aggregate(request.aggregate.ok_or(())?),
-        None => WebRtcTerminalAdapter::pair(),
-    };
-    if runtime
-        .bind_terminal_adapter(
-            ClientId(request.client_id.to_string()),
-            SessionId(request.session_id.to_string()),
-            SubscriptionId(request.subscription_id.to_string()),
-            generation,
-            capabilities,
-            Box::new(adapter),
-        )
-        .is_err()
-    {
-        fail_closed_pre_bind_attach(
-            registry,
-            runtime,
-            request.client_id,
-            request.session_id,
-            request.subscription_id,
-            request.now_seconds,
-            Some(BoundAdapterHandle::WebRtc(handle)),
-        );
-        return Err(());
-    }
-    registry.mark_adapter_bound(
-        request.session_id,
-        request.subscription_id,
-        generation,
-        BoundAdapterHandle::WebRtc(handle.clone()),
-    );
-    if let Some(mux) = request.mux {
-        mux.register(
-            request.session_id.to_string(),
-            request.subscription_id.to_string(),
-            generation.0,
-            handle.clone(),
-        );
-    }
-    Ok(Some(handle))
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AttachedSubscription {
     pub session_id: String,
@@ -785,41 +514,15 @@ pub(crate) enum AttachedSubscriptionChange {
     Detach(AttachedSubscription),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UnixEofAblation {
-    None,
-    LeaveRoute,
-    SkipCoreDetach,
-    PairOnlyDetach,
-}
-
-pub(crate) fn unix_eof_cleanup_ablation() -> UnixEofAblation {
-    if env::var("BOTSTER_ENV").as_deref() != Ok("test") {
-        return UnixEofAblation::None;
-    }
-    match env::var("BOTSTER_HUB_UNIX_EOF_ABLATION").as_deref() {
-        Ok("leave_route") => UnixEofAblation::LeaveRoute,
-        Ok("skip_core_detach") => UnixEofAblation::SkipCoreDetach,
-        Ok("pair_only_detach") => UnixEofAblation::PairOnlyDetach,
-        _ => UnixEofAblation::None,
-    }
-}
-
+/// Overlay live attach occupancy from one Core inventory read the caller
+/// already holds. Status handlers fetch the inventory through a ticket.
 pub(crate) fn overlay_live_attach_occupancy(
     status: &mut DaemonStatus,
-    daemon: &HubDaemon,
+    inventory: &[TerminalSubscriptionRecord],
     hub_routes: &BTreeSet<(String, String)>,
     pending: &PendingRuntimeState,
 ) {
-    status.live_attach_occupancy = live_attach_occupancy_rows(
-        hub_routes,
-        daemon
-            .runtime()
-            .map(crate::HubRuntime::list_terminal_subscriptions)
-            .unwrap_or_default()
-            .as_slice(),
-        pending,
-    );
+    status.live_attach_occupancy = live_attach_occupancy_rows(hub_routes, inventory, pending);
 }
 
 pub(crate) fn live_attach_occupancy_rows(

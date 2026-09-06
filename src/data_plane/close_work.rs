@@ -87,10 +87,6 @@ impl CloseWorkHook {
         {
             return;
         }
-        if force_close_work_overflow() {
-            self.overflow.store(true, Ordering::Release);
-            return;
-        }
         match self.tx.try_send(Arc::clone(&state)) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
@@ -280,11 +276,6 @@ impl RouteCloseState {
             self.reported.store(true, Ordering::SeqCst);
         }
     }
-}
-
-fn force_close_work_overflow() -> bool {
-    std::env::var("BOTSTER_ENV").as_deref() == Ok("test")
-        && std::env::var("BOTSTER_HUB_TEST_FORCE_CLOSE_WORK_OVERFLOW").as_deref() == Ok("1")
 }
 
 #[cfg(test)]

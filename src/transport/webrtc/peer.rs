@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use botster_core::AesGcmKey;
-use botster_hub_client::DaemonRequest;
+use botster_hub_client::{DaemonProtocolErrorCode, DaemonRequest};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use webrtc::data_channel::DataChannel;
@@ -45,9 +45,6 @@ pub(crate) const LOCAL_WEBRTC_PEER_CLOSE_BOUND: Duration = Duration::from_millis
 /// Must be strictly greater than [`LOCAL_WEBRTC_PEER_CLOSE_BOUND`].
 #[cfg(test)]
 pub(crate) const LOCAL_WEBRTC_PEER_CLOSE_HANDLER_JOIN_DEADLINE: Duration = Duration::from_secs(2);
-pub(crate) const TEST_CLOSE_LOCAL_WEBRTC_OPERATION_ENV: &str =
-    "BOTSTER_HUB_TEST_CLOSE_LOCAL_WEBRTC_OPERATION";
-pub(crate) const TEST_DISABLE_ONE_SHOT_CLAIM_ENV: &str = "BOTSTER_HUB_TEST_DISABLE_ONE_SHOT_CLAIM";
 pub(crate) const LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE: &str =
     "local-webrtc-sender-terminal.json";
 pub(crate) const LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_MAX_BYTES: usize = 4096;
@@ -454,6 +451,14 @@ pub(crate) enum LocalWebrtcTerminalCause {
     PeerDisconnected,
     PeerFailed,
     PeerClosed,
+    /// The client broke a host-control protocol rule; Hub sent the typed
+    /// close reason before closing the channel.
+    ProtocolViolation(DaemonProtocolErrorCode),
+    /// The hello named another protocol version; Hub answered the ack and
+    /// closed without request service.
+    ProtocolVersionMismatch,
+    /// Hub delivered a `shutdown` response and closed the channel.
+    DaemonShutdown,
 }
 
 impl fmt::Display for LocalWebrtcTerminalCause {
@@ -470,6 +475,11 @@ impl fmt::Display for LocalWebrtcTerminalCause {
             Self::ResponseFraming => "response_framing",
             Self::LowWaterThresholdSetup => "low_water_threshold_setup",
             Self::HighWaterThresholdSetup => "high_water_threshold_setup",
+            Self::ProtocolViolation(code) => {
+                return write!(formatter, "protocol_violation:{}", code.as_str());
+            }
+            Self::ProtocolVersionMismatch => "protocol_version_mismatch",
+            Self::DaemonShutdown => "daemon_shutdown",
             Self::PeerDisconnected => "peer_disconnected",
             Self::PeerFailed => "peer_failed",
             Self::PeerClosed => "peer_closed",
@@ -604,11 +614,6 @@ impl LocalWebrtcPeerState {
     }
 
     pub(crate) fn claim_data_channel(&self) -> bool {
-        if std::env::var("BOTSTER_ENV").as_deref() == Ok("test")
-            && std::env::var(TEST_DISABLE_ONE_SHOT_CLAIM_ENV).as_deref() == Ok("1")
-        {
-            return true;
-        }
         self.data_channel_claimed
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()

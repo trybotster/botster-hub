@@ -20,7 +20,7 @@ repository.
 
 Implementation baseline before this split: `9b39f1607144319138151cdf776e8909f35a63d4`. The pipeline implementation commit should be treated as the final protocol revision once merged.
 
-External same-device clients should depend on the `botster-hub-client` crate and use `DaemonEndpoint`, `DaemonConnection`, `request`, or `stream_attach` to talk to a running `botster-hub` daemon socket. The crate owns the client-facing handshake, request, response, event, and JSON frame helpers.
+External same-device clients should depend on the `botster-hub-client` crate and use `DaemonEndpoint`, `DaemonConnection`, `request`, or `stream_attach` to talk to a running `botster-hub` daemon socket. The crate owns the client-facing handshake, correlated request and response frames, event frames, the Unix container framing, and the WebRTC chunk headers described under "Host-control protocol 9" below.
 
 Browser clients should import the checked generated TypeScript protocol artifact
 instead of maintaining handwritten DTO mirrors:
@@ -125,7 +125,7 @@ The current descriptor includes:
 - supported features: sessions, session and plugin entity subscriptions, terminal streaming, resize, terminal readback,
   plugin surface render, plugin surface action dispatch, package navigation
   discovery, and hub-owned spawn targets;
-- conformance fixture revision 46.
+- conformance fixture revision 49.
 
 `DaemonPackage.notice_reactions` is an additive optional field. Empty vectors
 are omitted on the wire. Each projected descriptor always carries a required
@@ -1626,136 +1626,147 @@ success path a real opaque FINISH Snapshot precedes `attached`. A production
 socket adapter receives READY before later PAGE/FINISH frames. There is no
 host `Drain` JSON request.
 
-## Unix terminal adapter plane
+## Host-control protocol 9
 
-`unix_terminal_adapter` is an optional Hub daemon feature. The daemon
-advertises it. `DaemonCompatibilityRequirement::current()` does not require
-it. Clients that want the adapter plane use
-`DaemonCompatibilityRequirement::for_unix_terminal_adapter()`.
-`PROTOCOL_VERSION` remains 7. Advertising this feature,
-`terminal_subscription_closed`, and `webrtc_terminal_adapter` advances
-`CONFORMANCE_FIXTURE_REVISION` to 41. The default client requirement stays
-at revision 36.
+`PROTOCOL_VERSION` is 9 and `CONFORMANCE_FIXTURE_REVISION` is 49. This is a
+cold cut: a protocol-8 client fails closed at `ensure_compatible()`. There is
+no negotiation and no fallback path. `MCP_PROTOCOL_VERSION` and
+`botster_terminal_protocol::PROTOCOL_VERSION` stay unchanged.
 
-`DaemonHello` may send a Core `TerminalCompatibilityRequirement`. Absence is
-not a mismatch. `DaemonHelloAck` always advertises independent
-`TerminalCompatibility`. Host `DaemonCompatibility` stays a separate field.
-A present terminal requirement that fails `ensure_compatible` stores
-`UnixTerminalAdmission::Rejected` and returns `OperatorError` on the next
-Attach. The socket stays up for host operations.
+Every control message is one typed frame:
 
-When a bound adapter or Core write-budget hard-stop closes a live generation
-and the connection stays up, Hub emits unsolicited
-`DaemonEvent::TerminalSubscriptionClosed` with `session_id`,
-`subscription_id`, `generation`, and reason `host_adapter_closed` or
-`core_adapter_closed`. Host Response and Event frames stay readable on the
-same connection. A sibling adapter on that connection may keep writing
-terminal envelopes. `host_adapter_closed` is host egress close. It is not
-the Core write-budget oracle. `parse_unix_mux_value` classifies that frame as
-`DaemonUnixMuxFrame::Event`, not a request reply. Connection death, Detach,
-process exit, and session removal do not emit this event.
+- `ClientFrame::Hello { hello }` once per connection, first.
+- `ClientFrame::Request { request_id, request }`.
+- `ServerFrame::HelloAck { ack }`, `ServerFrame::Response { request_id,
+  response }`, `ServerFrame::Event { event }`, `ServerFrame::Entity { entity }`,
+  and `ServerFrame::Close { reason }`.
 
-Unix admission is Hello plus LocalOperator. There is no WebRTC-style
-`BootstrapGrant` on the local Unix socket. The admission lifetime is the
-connection lifetime. EOF, write failure, or close revokes that admission.
+`request_id` is a canonical decimal `u64`: one through twenty ASCII digits,
+no leading zero, nonzero, strictly increasing per connection. Hub may answer
+requests out of order; clients correlate by `request_id`. A connection holds
+at most 32 outstanding requests; the 33rd request is answered with a
+correlated `too_many_requests` operator error and is never serviced. Control
+requests and responses are bounded at 1 MiB each; larger data (snapshot
+history) is paged.
 
-When Hello requires `unix_terminal_adapter` and Attach succeeds:
+Hub closes a connection with `ServerFrame::Close { reason: protocol_error {
+code } }` for `malformed_frame`, `frame_too_large`, `unknown_container`,
+`unknown_frame`, `invalid_request_id`, `nonincreasing_request_id`,
+`handshake_order`, `invalid_route`, or `invalid_input_header`, and with
+`daemon_shutdown` after a `shutdown` response. Closing one connection never
+affects another connection's sessions or routes.
 
-1. The Attach response may carry only the initial `AttachState attaching`
-   event. That one-frame exception is transitional.
-   `ticket_1786661010_198387` removes it.
-2. Any other pre-bind terminal event (Snapshot, later AttachState,
-   TerminalOutput, ProcessExit) is fail-closed: Hub cancels the route, closes
-   any adapter candidate, detaches the live generation, and returns
-   `attach_failed`. Hub does not drop those frames.
-3. Hub intersects `TerminalCompatibility` advertised tokens with LocalOperator
-   admission, includes `snapshot_delivery=ready_then_history` only when Hello
-   or the terminal requirement asked for that feature, and binds the stored
-   Hello-time `TerminalCapabilitySet` into Core. Attach does not recompute a
-   different set.
-4. Later terminal frames leave only as unsolicited
-   `DaemonUnixTerminalEnvelope` JSON lines: `plane=terminal`, `kind=frame`,
-   plus opaque `payload_base64` from `TerminalFrame::to_bytes()`. Hub does
-   not inspect READY, PAGE, FINISH, later AttachState, or GHOSTSNP bodies.
-5. Host `Status` stays a still-alive check. It must not return AttachState,
-   Snapshot, TerminalOutput, or ProcessExited. There is no host `Drain`
-   request and no Drain-translation fallback.
-6. Bound-route connection death closes the adapter only. Hub does not send
-   Detach. Explicit client Detach remains a separate authorized request.
-   Neither path shuts down the host session.
+### Unix framing
 
-Clients that omit `unix_terminal_adapter` do not receive adapter frames and
-do not receive a Drain-translation fallback. WebRTC attaches (`grant_id`
-present) do not receive a Unix adapter. Use `parse_unix_mux_value` to
-separate control responses from opaque adapter envelopes.
+The Unix socket carries length-prefixed binary frames:
 
-## WebRTC terminal adapter plane
+```
+[u32 LE frame_len][u8 container][payload]
+```
 
-`webrtc_terminal_adapter` is an optional Hub daemon feature. The daemon
-advertises it. `DaemonCompatibilityRequirement::current()` does not require
-it. Clients that want the adapter plane send an encrypted DataChannel
-`DaemonHello` whose `required_features` include
-`webrtc_terminal_adapter`, then call
-`DaemonCompatibilityRequirement::for_webrtc_terminal_adapter()`.
-`PROTOCOL_VERSION` remains 7. Advertising this feature and the negotiated
-`daemon_event` close delivery advances `CONFORMANCE_FIXTURE_REVISION` to 41.
+`frame_len` counts the container byte plus the payload. Container 1 is
+control: the payload is one JSON `ClientFrame` or `ServerFrame`. Container 2
+is terminal:
 
-WebRTC protocol admission is DataChannel Hello after pairing, grant,
-origin, and AES-GCM crypto. Hub replies with encrypted `DaemonHelloAck`
-plaintext framed as a `daemon_response` delivery. Hello never creates a
-route. Attach binds only when that Hello required the feature and
-`grant_id` is present.
+```
+[u16 LE route_len][route UTF-8][u64 LE generation][u32 LE stream_epoch][body]
+```
 
-When DataChannel Hello requires `webrtc_terminal_adapter` and Attach
-succeeds:
+Offsets are relative to the payload start: `route_len` at 0, `route` at 2,
+`generation` at `2 + route_len`, `stream_epoch` at `10 + route_len`, and the
+opaque scheme 2 `TerminalBody` at `14 + route_len`. `MAX_UNIX_FRAME_BYTES`
+bounds one frame at 4 MiB plus the fixed header and the 1024-byte route
+ceiling. `DaemonUnixFrameReader` and `encode_unix_terminal_frame` in
+`botster-hub-client` implement this framing.
 
-1. The Attach response may carry only the initial `AttachState attaching`
-   event. That one-frame exception is transitional.
-   `ticket_1786661010_198387` removes it.
-2. Any other pre-bind terminal event is fail-closed: Hub cancels the
-   route, closes any adapter candidate, detaches the live generation, and
-   returns `attach_failed`.
-3. Hub intersects `TerminalCompatibility` advertised tokens with Hello
-   admission, includes `snapshot_delivery=ready_then_history` only when
-   Hello required that feature, and binds the resulting
-   `TerminalCapabilitySet` into Core.
-4. Later terminal frames leave only as encrypted
-   `DaemonLocalWebrtcDeliveryKind::DaemonTerminalFrame` chunks. One frame
-   occupies the adapter slot until every chunk of that delivery is sent.
-   Hub does not inspect READY, PAGE, FINISH, later AttachState, or
-   GHOSTSNP bodies.
-5. Host `Status` stays a still-alive check. It must not return AttachState,
-   Snapshot, TerminalOutput, or ProcessExited. There is no host `Drain`
-   request and no Drain-translation fallback.
-6. Bound-route DataChannel close, peer failure, and grant `remove_peer`
-   close the adapter only. Hub does not send Detach. `local_close` waits
-   at most `LOCAL_WEBRTC_PEER_CLOSE_BOUND` and then continues cleanup.
-   Explicit client Detach remains a separate authorized request.
-   Neither path shuts down the host session.
+`generation` is the fixed attachment generation Core minted at attach.
+`stream_epoch` is Core routing metadata: Hub copies it from
+`RoutedTerminalFrame` and never advances it. A fresh attachment starts at
+epoch 0; the client adopts a new epoch only from a `ROUTE_RESYNC` body
+`[u32 LE from_epoch][u32 LE to_epoch]` whose `from_epoch` matches its accepted
+epoch and whose envelope `stream_epoch` equals `to_epoch`, and drops any data
+frame whose `stream_epoch` differs from the accepted epoch. Client-to-Hub
+input containers use the same layout with `stream_epoch` encoded as 0; Hub
+validates the route and the fixed generation only and never rejects input on
+that field.
 
-When a bound WebRTC adapter or Core write-budget hard-stop closes a live
-generation and the peer stays up, Hub emits unsolicited
-`DaemonEvent::TerminalSubscriptionClosed` with `session_id`,
-`subscription_id`, `generation`, and reason `host_adapter_closed` or
-`core_adapter_closed`. Hub sends that event only as
-`DaemonLocalWebrtcDeliveryKind::DaemonEvent`, and only after encrypted
-DataChannel Hello required `terminal_subscription_closed`. Protocol stays
-7. Unnegotiated protocol-7 adapter clients never receive or decode the
-new delivery kind. Host Status and ListSessions stay available on the
-same peer. A sibling adapter on that peer may keep writing
-`daemon_terminal_frame`. `host_adapter_closed` is host egress close. It is
-not the Core write-budget oracle. Connection death, Detach, process exit,
-and session removal do not emit this event.
+### WebRTC framing
 
-Clients that want the close event use
-`DaemonCompatibilityRequirement::for_webrtc_terminal_subscription_closed()`.
-That helper requires both `webrtc_terminal_adapter` and
-`terminal_subscription_closed`. `for_webrtc_terminal_adapter()` and
-`DaemonCompatibilityRequirement::current()` do not add the close feature.
+The control DataChannel carries encrypted JSON: each `ClientFrame` is one
+`AesGcmEnvelope` text message; each `ServerFrame` is chunked into
+`DaemonLocalWebrtcDeliveryChunk` text messages with `delivery_kind`
+`server_frame`, at most 12 KiB of payload per chunk and 16 MiB per delivery.
 
-Current WebRTC clients that omit DataChannel Hello do not receive a
-Drain-translation fallback. They must not receive `daemon_terminal_frame`
-or `daemon_event`.
+Reserved terminal DataChannels carry binary chunks only:
+
+```
+[u8 version=2][u64 LE message_id][u32 LE chunk_index][u32 LE chunk_count]
+[u32 LE total_bytes][u64 LE generation][u32 LE stream_epoch]
+[12-byte nonce][AES-GCM ciphertext || 16-byte tag]
+```
+
+The header is 33 bytes (`LOCAL_WEBRTC_TERMINAL_CHUNK_HEADER_BYTES`). Each
+chunk seals at most 12 KiB of plaintext with Core `seal_aes_gcm`; the
+reassembly identity is (channel label, direction, `message_id`), chunk indexes
+are contiguous, and every chunk of one message repeats `generation` and
+`stream_epoch`. A mismatch drops the message and closes that channel only.
+Client-to-Hub input chunks encode `stream_epoch` as 0. Entity and package-event
+channels keep encrypted JSON `ServerFrame` deliveries.
+
+## Terminal routes
+
+Terminal data is opaque to Hub on every hop. Hub validates the 12-byte scheme
+2 input header and forwards the body to Core; Core and the session worker own
+parsing, snapshot capture, and the terminal codecs. Hub never re-encodes,
+base64-wraps, or inspects `TerminalBody` bytes.
+
+Unix `Attach` binds the connection's adapter in one Core turn and answers
+`DaemonResponseKind::TerminalAttached` with `terminal_attach { session_id,
+subscription_id, generation }`. WebRTC `Attach` answers
+`DaemonResponseKind::TerminalReservation`; the browser opens one reliable
+ordered DataChannel with the reserved label, completes `ClientFrame::Hello`
+on it, and Hub binds the adapter when that channel is admitted. Terminal
+frames travel only on the bound route. The control channel carries no
+terminal frames.
+
+Capture and paging replace inline snapshots. `CaptureSnapshot` starts a Core
+capture and answers `capture_snapshot { capture_id, total_bytes, page_bytes,
+pages, rows, cols, unavailable? }`. `ReadSnapshotPage { session_id,
+capture_id, page }` answers `snapshot_page` with one opaque GHOSTSNP page of
+at most 256 KiB (`SNAPSHOT_PAGE_BYTES`). A connection may hold at most four
+open captures; each capture expires after 60 idle seconds. `ReadScreen` and
+`ReadModeFlags` carry `unavailable` (`evicted`, `restart`, `oversize`, or
+`capture_failed`) when Core holds no history for the session.
+
+Bound-route connection death, DataChannel close, peer failure, and grant
+removal close the adapter only; Hub does not send Detach. Explicit `Detach`
+remains a separate request. `ShutdownSession` classifies the session on the
+Core owner thread and then starts the orderly shutdown; the response arrives
+when Core completes it.
+
+## Retention and restart
+
+Ended sessions keep their final screen, mode bits, and GHOSTSNP snapshot in
+Core under the Hub retention policy: 16 MiB per retained object, 64 MiB and
+200 sessions in total. An oversize object is not stored and later reads
+answer `history_unavailable { oversize }`; past the totals Core evicts the
+oldest exit and later reads answer `evicted`. `DaemonStatus.retention`
+reports the policy and the live accounting.
+
+A Hub restart adopts live workers from the registry. A worker whose protocol
+evidence does not match the running Hub stops startup with
+`incompatible session workers`; Hub terminates and deletes nothing, and the
+operator stops those sessions first. History that lived only in the previous
+Hub process answers `history_unavailable { restart }`.
+
+## Socket ownership
+
+The daemon holds a nonblocking `flock` on `<socket>.owner` for its lifetime.
+A second daemon fails with `AlreadyRunning`. Before binding, Hub validates
+that the socket path's parent directory and any existing path are owned by
+the daemon's user and that an existing path is a socket; an unrelated path is
+never unlinked. A stale socket whose owner lock is free is replaced; a socket
+that disappears while the daemon runs is rebound.
 
 ## Package event subscriptions
 
@@ -1763,20 +1774,16 @@ or `daemon_event`.
 The daemon advertises it. `DaemonCompatibilityRequirement::current()`
 does not require it. Clients that want live package events Hello with
 `DaemonCompatibilityRequirement::for_package_event_subscriptions()` or
-`connect_for_package_event_subscriptions()`. `PROTOCOL_VERSION` remains
-7. Advertising this feature advances `CONFORMANCE_FIXTURE_REVISION` to
-44. The default client requirement stays at revision 36.
+`connect_for_package_event_subscriptions()`.
 
 `SubscribeEvents` and `UnsubscribeEvents` are ordinary one-shot host
-requests. They do not take over a Unix socket. Unix delivery uses unsolicited
-`DaemonEvent::PackageEvent` and `DaemonEvent::EventGap`. Unix classifies
-those frames as `DaemonUnixMuxFrame::Event`. WebRTC sends them as
-`DaemonLocalWebrtcDeliveryKind::DaemonEvent`. WebRTC delivery uses the
-reserved package-event subscription DataChannel described below.
-`DaemonConnection::next_event`
-waits for those frames without sending another control request. Hub stores
-host Hello `required_features` on a per-connection host record. Terminal
-admission rejection does not clear that record.
+requests. Unix delivery uses unsolicited `ServerFrame::Event` frames carrying
+`DaemonEvent::PackageEvent` and `DaemonEvent::EventGap`. WebRTC sends them
+as `server_frame` deliveries on the reserved package-event subscription
+DataChannel described below. `DaemonConnection::next_event` waits for those
+frames without sending another control request. Hub stores host Hello
+`required_features` on a per-connection host record. Terminal admission
+rejection does not clear that record.
 
 Subject filters are exact `payload.subject` strings compiled at
 subscribe time. Empty `subjects` omits the field and matches every live
@@ -1784,31 +1791,6 @@ event for that owner and name. Version-one ceilings: 16 values, 256
 UTF-8 bytes each, 4,096 aggregate bytes, and 64 active subscriptions
 per connection. There is no public sequence, cursor, replay request, or
 durable-history field.
-
-## Cold-cut wake-driven duplex terminal transports
-
-Deleting JSON `SendInput`, `ModeGatedInput`, and `Resize` plus adding
-the Attach reservation DTO advances `PROTOCOL_VERSION` to 8 and
-`CONFORMANCE_FIXTURE_REVISION` to 48. A protocol-7 client fails closed
-at `ensure_compatible()`. `MCP_PROTOCOL_VERSION` and
-`botster_terminal_protocol::PROTOCOL_VERSION` stay unchanged.
-`DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION` stays 36.
-
-Unix Attach still returns `Events` and omits `terminal_reservation` on
-the wire. WebRTC Attach returns `DaemonResponseKind::TerminalReservation`
-with `session_id`, `subscription_id`, `generation`, `peer_generation`,
-opaque `label`, and `expires_in_seconds`. The browser then opens one
-labeled reliable ordered DataChannel, completes encrypted Hello on that
-channel, and binds. Terminal frames travel only on that subscription
-channel. The control DataChannel carries no terminal frames.
-
-Terminal input exists only as a Core `TerminalInputFrame` on a bound
-Unix or WebRTC subscription. Hub validates the header and does not
-decode the body. Late reserved-channel open after expiry emits
-unsolicited `TerminalSubscriptionClosed` with reason
-`reservation_expired` on the peer control channel, then closes that
-channel. Unknown labels close without an event. A live reservation
-conflict on Attach returns `reservation_label_conflict`.
 
 ## Dedicated entity and package-event channels
 
@@ -1818,12 +1800,18 @@ contains `kind`, `subscription_id`, `generation`, `peer_generation`, an opaque
 `label`, and `expires_in_seconds`.
 
 The browser creates one reliable ordered DataChannel with that exact label.
-The browser sends the encrypted Hello on the new channel. Hub binds only a
-live reservation for the current peer generation and matching channel class.
+The browser sends the encrypted `ClientFrame::Hello` on the new channel. Hub
+binds only a live reservation for the current peer generation and matching
+channel class. Late reserved-channel open after expiry emits unsolicited
+`TerminalSubscriptionClosed` with reason `reservation_expired` on the peer
+control channel, then closes that channel. Unknown labels close without an
+event. A live reservation conflict on Attach returns
+`reservation_label_conflict`.
 
-Hub sends entity frames only on the entity subscription channel. Hub sends
-package events and event gaps only on the package-event subscription channel.
-The control channel keeps requests, responses, and small lifecycle events.
+Hub sends entity frames only on the entity subscription channel, as
+`ServerFrame::Entity`. Hub sends package events and event gaps only on the
+package-event subscription channel. The control channel keeps requests,
+responses, and small lifecycle events.
 
 Each package-event subscription has one mailbox. A connection keeps the
 existing 128-event and 2 MiB aggregate limits. Each admitted subscription

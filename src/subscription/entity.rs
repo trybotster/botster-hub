@@ -25,7 +25,7 @@ use crate::HubDaemon;
 use crate::admission::budgets::DAEMON_MAX_FRAME_BYTES;
 use crate::client_api_dto::response::daemon_response_base;
 use crate::client_api_dto::session::daemon_session_type_from_client;
-use crate::daemon::control::session_types::session_type_entity_snapshot;
+use crate::daemon::control::session_types::session_type_catalog_entities;
 use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
 use crate::daemon::owner_loop::DaemonControlState;
 
@@ -109,6 +109,9 @@ pub(crate) struct EntitySubscriptionState {
     entities: BTreeMap<String, DaemonSessionEntity>,
     definition_generation: u64,
     definition_entities: BTreeMap<String, Value>,
+    /// A session-type subscriber registered while the catalog was being
+    /// rebuilt off the owner; the first delivered catalog is its snapshot.
+    awaiting_initial_snapshot: bool,
     resync_reason: Option<String>,
     /// Local WebRTC grant that owns this subscription, when registered over DataChannel.
     /// Used so PeerClosed can sweep rows that arrived after cleanup_once's id snapshot.
@@ -147,6 +150,79 @@ enum DeliveryPhase {
     Rows,
 }
 
+/// Session-type catalog built off the owner thread and cached by generation.
+///
+/// The owner never lists session types itself. When the generation moves, it
+/// hands the package records and durable state to one worker thread and
+/// applies the catalog on a later turn.
+#[derive(Default)]
+pub(crate) struct SessionTypeCatalogCache {
+    generation: Option<u64>,
+    entities: BTreeMap<String, Value>,
+    pending: Option<(
+        u64,
+        std::sync::mpsc::Receiver<DaemonTransportResult<BTreeMap<String, Value>>>,
+    )>,
+}
+
+impl SessionTypeCatalogCache {
+    /// The catalog for `generation` when it is ready. Starts or polls the
+    /// off-owner build otherwise and returns `None` for this turn.
+    pub(crate) fn refresh(
+        &mut self,
+        daemon: &HubDaemon,
+        generation: u64,
+    ) -> Option<(u64, &BTreeMap<String, Value>)> {
+        if let Some((pending_generation, receiver)) = self.pending.as_ref() {
+            match receiver.try_recv() {
+                Ok(Ok(entities)) => {
+                    self.generation = Some(*pending_generation);
+                    self.entities = entities;
+                    self.pending = None;
+                }
+                Ok(Err(error)) => {
+                    eprintln!("session type catalog build failed: {error}");
+                    self.pending = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.pending = None;
+                }
+            }
+        }
+        if self.generation == Some(generation) {
+            return Some((generation, &self.entities));
+        }
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|(pending, _)| *pending == generation)
+        {
+            return None;
+        }
+        let Some(runtime) = daemon.runtime() else {
+            return None;
+        };
+        let records = daemon
+            .package_registry()
+            .packages()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let state = runtime.state().clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("botster-hub-session-type-catalog".to_string())
+            .spawn(move || {
+                let _ = sender.send(session_type_catalog_entities(&records, &state));
+            });
+        if spawned.is_ok() {
+            self.pending = Some((generation, receiver));
+        }
+        None
+    }
+}
+
 pub(crate) fn register_entity_subscription(
     daemon: &mut HubDaemon,
     state: &mut DaemonControlState,
@@ -163,36 +239,42 @@ pub(crate) fn register_entity_subscription(
         ));
     }
     if entity_type == "session_type" {
-        let (snapshot_seq, entities) = match session_type_entity_snapshot(daemon) {
-            Ok(snapshot) => snapshot,
-            Err(DaemonTransportError::Client(crate::HubClientError::SessionType {
-                kind,
-                message,
-                ..
-            })) => {
-                // Keep entity-subscription operator frames on the subscribe_entities
-                // convention (request_id = subscription_id), not list_session_types.
-                return Ok(entity_subscription_error(kind, &subscription_id, &message));
+        // The catalog is built off the owner thread. A fresh cache answers
+        // with the snapshot now; otherwise the subscription starts empty and
+        // the drive loop sends the initial snapshot when the build lands.
+        let generation = daemon
+            .runtime()
+            .map(|runtime| runtime.state().session_type_generation)
+            .ok_or(DaemonTransportError::DaemonNotRunning)?;
+        let catalog = state
+            .session_type_catalog
+            .refresh(daemon, generation)
+            .map(|(generation, entities)| (generation, entities.clone()));
+        if let Some((generation, entities)) = catalog {
+            let snapshot = DaemonEntityFrame::Snapshot {
+                subscription_id: subscription_id.clone(),
+                entity_type: entity_type.clone(),
+                snapshot_seq: generation,
+                items: entities.values().cloned().collect(),
+                resync_reason: None,
+            };
+            if entity_frame_exceeds_limit(&snapshot) {
+                return Ok(entity_subscription_error(
+                    "entity_provider_frame_too_large",
+                    &subscription_id,
+                    "session type snapshot exceeds daemon frame limit",
+                ));
             }
-            Err(error) => return Err(error),
-        };
-        let snapshot = DaemonEntityFrame::Snapshot {
-            subscription_id: subscription_id.clone(),
-            entity_type: entity_type.clone(),
-            snapshot_seq,
-            items: entities.values().cloned().collect(),
-            resync_reason: None,
-        };
-        if entity_frame_exceeds_limit(&snapshot) {
-            return Ok(entity_subscription_error(
-                "entity_provider_frame_too_large",
-                &subscription_id,
-                "session type snapshot exceeds daemon frame limit",
-            ));
+            sender
+                .try_send(snapshot)
+                .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
+        } else {
+            state.maintenance.try_wake();
         }
-        sender
-            .try_send(snapshot)
-            .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
+        let (snapshot_seq, entities, awaiting_initial_snapshot) = match catalog {
+            Some((generation, entities)) => (generation, entities, false),
+            None => (0, BTreeMap::new(), true),
+        };
         state.entity_subscriptions.insert(
             subscription_id.clone(),
             EntitySubscriptionState {
@@ -202,6 +284,7 @@ pub(crate) fn register_entity_subscription(
                 entities: BTreeMap::new(),
                 definition_generation: snapshot_seq,
                 definition_entities: entities,
+                awaiting_initial_snapshot,
                 resync_reason: None,
                 owner_grant_id,
                 package_last_applied_seq: None,
@@ -302,18 +385,9 @@ pub(crate) fn register_entity_subscription(
         drive_package_entity_fanout(daemon, state);
         return Ok(daemon_response_base(DaemonResponseKind::EntitySubscribed));
     }
-    if let Some(runtime) = daemon.runtime() {
-        crate::daemon_maintenance::run_maintenance_kind(
-            runtime,
-            &mut state.maintenance,
-            crate::daemon_maintenance::MaintenanceSliceKind::JournalPull,
-        );
-        crate::daemon_maintenance::run_maintenance_kind(
-            runtime,
-            &mut state.maintenance,
-            crate::daemon_maintenance::MaintenanceSliceKind::ProjectionApply,
-        );
-    }
+    // The journal pull runs on the Core owner thread; the maintenance
+    // scheduler pulls and applies it on the next owner slices.
+    state.maintenance.note_authoritative_mutation();
     let cursor = state.maintenance.projection.cursor.clone();
     let snapshot_seq = cursor.as_ref().map(|cursor| cursor.sequence).unwrap_or(0);
     let subscription = EntitySubscriptionState {
@@ -379,14 +453,19 @@ fn drive_session_type_subscriptions(
             return true;
         }
 
-        if let Some(reason) = subscription.resync_reason.clone() {
-            let snapshot_seq = subscription.next_seq.saturating_add(1);
+        if subscription.awaiting_initial_snapshot || subscription.resync_reason.is_some() {
+            let initial = subscription.awaiting_initial_snapshot;
+            let snapshot_seq = if initial {
+                generation
+            } else {
+                subscription.next_seq.saturating_add(1)
+            };
             let frame = DaemonEntityFrame::Snapshot {
                 subscription_id: subscription_id.clone(),
                 entity_type: "session_type".to_string(),
                 snapshot_seq,
                 items: entities.values().cloned().collect(),
-                resync_reason: Some(reason),
+                resync_reason: subscription.resync_reason.clone(),
             };
             if entity_frame_exceeds_limit(&frame) {
                 let error = DaemonEntityFrame::Error {
@@ -406,6 +485,7 @@ fn drive_session_type_subscriptions(
                     subscription.definition_generation = generation;
                     subscription.definition_entities = entities.clone();
                     subscription.resync_reason = None;
+                    subscription.awaiting_initial_snapshot = false;
                     true
                 }
                 Err(EntityFrameTrySendError::Full(_)) => true,
@@ -541,27 +621,16 @@ pub(crate) fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut Dae
         .values()
         .any(|subscription| subscription.entity_type == "session_type")
     {
-        let records = packages.packages();
-        let runtime_state = runtime.state();
-        let generation = runtime_state.session_type_generation;
-        if let Ok(session_types) =
-            crate::session_types::list_session_types(&records, &runtime_state)
-        {
-            let entities = session_types
-                .into_iter()
-                .map(daemon_session_type_from_client)
-                .filter_map(|session_type| {
-                    let id = session_type.session_type_id.clone();
-                    serde_json::to_value(session_type)
-                        .ok()
-                        .map(|value| (id, value))
-                })
-                .collect::<BTreeMap<_, _>>();
-            drive_session_type_subscriptions(
-                &mut state.entity_subscriptions,
-                generation,
-                &entities,
-            );
+        let generation = runtime.state().session_type_generation;
+        match state.session_type_catalog.refresh(daemon, generation) {
+            Some((generation, entities)) => {
+                drive_session_type_subscriptions(
+                    &mut state.entity_subscriptions,
+                    generation,
+                    entities,
+                );
+            }
+            None => state.maintenance.try_wake(),
         }
     }
 

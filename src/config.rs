@@ -45,6 +45,8 @@ pub struct HubStartupOptions {
     pub core_engine: CoreEngineOptions,
     #[serde(default)]
     pub package_event_plane: PackageEventPlaneOptions,
+    #[serde(default)]
+    pub retention: RetentionOptions,
 }
 
 impl Default for HubStartupOptions {
@@ -58,7 +60,54 @@ impl Default for HubStartupOptions {
             transports: TransportBindings::default(),
             core_engine: CoreEngineOptions::default(),
             package_event_plane: PackageEventPlaneOptions::default(),
+            retention: RetentionOptions::default(),
         }
+    }
+}
+
+/// Retention limits for ended-session terminal history that Hub hands to Core.
+///
+/// Values are the section 6 limits of the cold-cut plan: one retained object
+/// is not stored past `max_object_bytes` (`history_unavailable{oversize}`);
+/// past `max_total_bytes` or `max_sessions` Core evicts the oldest exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetentionOptions {
+    pub max_object_bytes: usize,
+    pub max_total_bytes: usize,
+    pub max_sessions: usize,
+}
+
+impl Default for RetentionOptions {
+    fn default() -> Self {
+        Self {
+            max_object_bytes: 16 * 1024 * 1024,
+            max_total_bytes: 64 * 1024 * 1024,
+            max_sessions: 200,
+        }
+    }
+}
+
+impl RetentionOptions {
+    /// Core retention policy for these limits.
+    #[must_use]
+    pub const fn core_policy(self) -> botster_core_daemon::RetentionPolicy {
+        botster_core_daemon::RetentionPolicy {
+            max_object_bytes: self.max_object_bytes,
+            max_total_bytes: self.max_total_bytes,
+            max_sessions: self.max_sessions,
+        }
+    }
+
+    fn validate(&self) -> Result<(), HubConfigError> {
+        if self.max_object_bytes == 0 || self.max_total_bytes == 0 || self.max_sessions == 0 {
+            return Err(HubConfigError::InvalidCapacity { field: "retention" });
+        }
+        if self.max_object_bytes > self.max_total_bytes {
+            return Err(HubConfigError::InvalidCapacity {
+                field: "retention.max_object_bytes",
+            });
+        }
+        Ok(())
     }
 }
 
@@ -100,6 +149,7 @@ impl HubStartupOptions {
             transports,
             core_engine: self.core_engine,
             package_event_plane: self.package_event_plane.into_policy()?,
+            retention: self.retention,
         })
     }
 
@@ -107,7 +157,8 @@ impl HubStartupOptions {
         self.session_defaults.validate()?;
         self.core_engine.validate()?;
         self.transports.validate()?;
-        self.package_event_plane.validate()
+        self.package_event_plane.validate()?;
+        self.retention.validate()
     }
 }
 
@@ -128,6 +179,8 @@ pub struct HubConfig {
     pub core_engine: CoreEngineOptions,
     #[serde(default)]
     pub package_event_plane: PackageEventPlanePolicy,
+    #[serde(default)]
+    pub retention: RetentionOptions,
 }
 
 impl HubConfig {

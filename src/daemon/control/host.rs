@@ -4,21 +4,22 @@ use std::sync::mpsc;
 
 use botster_hub_client::{
     DaemonDiagnostic, DaemonHubUpdate, DaemonHubUpdateScope, DaemonHubUpdateState, DaemonRequest,
-    DaemonResponse, DaemonResponseKind,
+    DaemonResponseKind, DaemonRetentionAccounting,
 };
-use serde_json::Value;
 
 use crate::HubDaemon;
-use crate::client_api_dto::response::{daemon_hub_update, daemon_hub_update_execution};
+use crate::client_api_dto::response::{
+    daemon_hub_update, daemon_hub_update_execution, daemon_response_base,
+};
 use crate::daemon::control::DaemonObservability;
 use crate::daemon::control::message::{ControlReplySender, ControlSender};
-use crate::daemon::error::{
-    DaemonTransportError, DaemonTransportResult, hub_update_execution_error,
-};
+use crate::daemon::control::pending::{ControlPoll, ControlStep};
+use crate::daemon::error::{DaemonTransportError, hub_update_execution_error};
 use crate::daemon::owner_loop::{
     DaemonControlState, send_control_response, wait_for_response_delivery,
 };
 use crate::daemon_projection::daemon_status_from_status;
+use crate::data_plane::driver::CoreTicketPoll;
 use crate::maintenance::{
     HubUpdateCheckPlan, execute_managed_update_check, installation_identity, plan_hub_update_check,
     software_identity,
@@ -199,67 +200,51 @@ pub(crate) fn hub_update_check_completed(
 
 pub(crate) fn handle_runtime(
     daemon: &mut HubDaemon,
-    observability: DaemonObservability<'_>,
+    state: &mut DaemonControlState,
+    observability: DaemonObservability,
     request: DaemonRequest,
-) -> DaemonTransportResult<DaemonResponse> {
+) -> ControlStep {
     let status = daemon.status();
-    let Some(runtime) = daemon.runtime_mut() else {
-        return Err(DaemonTransportError::DaemonNotRunning);
+    let Some(runtime) = daemon.runtime() else {
+        return ControlStep::Ready(Err(DaemonTransportError::DaemonNotRunning));
     };
     match request {
-        DaemonRequest::DaemonShutdown => Ok(DaemonResponse {
-            kind: DaemonResponseKind::Shutdown,
-            status: Some(daemon_status_from_status(
-                &status,
-                runtime
-                    .list_sessions()
-                    .map_err(crate::HubRuntimeError::from)?
-                    .len(),
-                Vec::new(),
-                observability.lifecycle.clone(),
-                software_identity(),
-                installation_identity(),
-                runtime.event_plane_counters_snapshot(),
-            )),
-            sessions: Vec::new(),
-            session_types: Vec::new(),
-            session_type_definition: None,
-            resolved_session_type: None,
-            session_context: None,
-            read_screen: None,
-            mode_flags: None,
-            terminal_reservation: None,
-            subscription_reservation: None,
-            capture_snapshot: None,
-            spawn_targets: Vec::new(),
-            spawn_target_validation: None,
-            worktrees: Vec::new(),
-            apps: Vec::new(),
-            resolved_app_launch: None,
-            resolved_package_route: None,
-            package_navigation: Vec::new(),
-            packages: Vec::new(),
-            available_packages: Vec::new(),
-            install_plan: None,
-            update_status: None,
-            hub_update: None,
-            hub_update_execution: None,
-            package_decision: None,
-            lifecycle: Vec::new(),
-            plugin_worker_counters: None,
-            plugin_resource_counters: None,
-            plugin_tools: Vec::new(),
-            plugin_tool_result: Value::Null,
-            plugin_surface: None,
-            plugin_action_result: None,
-            local_webrtc_bootstrap: None,
-            local_webrtc_answer: None,
-            events: Vec::new(),
-            cleanup: None,
-            coordination: None,
-            error: None,
-            diagnostics: vec![DaemonDiagnostic::connected("shutdown")],
-        }),
+        DaemonRequest::DaemonShutdown => {
+            let policy = runtime.retention_policy();
+            let mut ticket = runtime.retention_accounting();
+            let session_count = state.maintenance.projection.rows.len();
+            let lifecycle = observability.lifecycle.clone();
+            ControlStep::pending(move |daemon, _| {
+                let accounting = match ticket.poll() {
+                    CoreTicketPoll::Pending => return ControlPoll::Pending,
+                    CoreTicketPoll::Lost => None,
+                    CoreTicketPoll::Ready(accounting) => Some(accounting),
+                };
+                let Some(runtime) = daemon.runtime() else {
+                    return ControlPoll::Ready(Err(DaemonTransportError::DaemonNotRunning));
+                };
+                let mut response = daemon_response_base(DaemonResponseKind::Shutdown);
+                response.status = Some(daemon_status_from_status(
+                    &status,
+                    session_count,
+                    Vec::new(),
+                    lifecycle.clone(),
+                    software_identity(),
+                    installation_identity(),
+                    runtime.event_plane_counters_snapshot(),
+                    accounting.map(|accounting| DaemonRetentionAccounting {
+                        max_object_bytes: policy.max_object_bytes as u64,
+                        max_total_bytes: policy.max_total_bytes as u64,
+                        max_sessions: u32::try_from(policy.max_sessions).unwrap_or(u32::MAX),
+                        total_bytes: accounting.total_bytes as u64,
+                        sessions: u32::try_from(accounting.sessions).unwrap_or(u32::MAX),
+                        evictions: accounting.evictions,
+                    }),
+                ));
+                response.diagnostics = vec![DaemonDiagnostic::connected("shutdown")];
+                ControlPoll::Ready(Ok(response))
+            })
+        }
         _ => unreachable!("host runtime family received a non-host request"),
     }
 }

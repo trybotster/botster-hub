@@ -7,6 +7,7 @@ pub(crate) mod host;
 pub(crate) mod message;
 pub(crate) mod messaging;
 pub(crate) mod packages;
+pub(crate) mod pending;
 pub(crate) mod plugins;
 pub(crate) mod request;
 pub(crate) mod session_types;
@@ -14,7 +15,6 @@ pub(crate) mod sessions;
 pub(crate) mod spawn_targets;
 pub(crate) mod webrtc;
 
-use std::collections::BTreeMap;
 use std::path::Path;
 
 use botster_core::RequestId;
@@ -24,19 +24,20 @@ use botster_hub_client::{
 };
 
 use crate::client_api_dto::response::{daemon_events, daemon_response_base};
+use crate::daemon::control::pending::ControlStep;
 use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
-use crate::daemon::owner_loop::{
-    DaemonControlState, DaemonEgressDiagnostics, PendingRuntimeState, record_egress_write_failure,
-};
+use crate::daemon::owner_loop::{DaemonControlState, record_egress_write_failure};
 use crate::{HubClientResponseBody, HubDaemon};
 pub(crate) use message::{ControlMessage, ControlSender};
 
-#[derive(Clone, Copy)]
-pub(crate) struct DaemonObservability<'a> {
-    pub(crate) egress: &'a DaemonEgressDiagnostics,
-    pub(crate) lifecycle: &'a DaemonLifecycleCounters,
-    pub(crate) client_id: Option<&'a str>,
-    pub(crate) grant_id: Option<&'a str>,
+/// Owned snapshot of owner diagnostics and connection identity for one
+/// request. Owned so a deferred continuation can keep it past the turn.
+#[derive(Clone)]
+pub(crate) struct DaemonObservability {
+    pub(crate) egress: Vec<DaemonDiagnostic>,
+    pub(crate) lifecycle: DaemonLifecycleCounters,
+    pub(crate) client_id: Option<String>,
+    pub(crate) grant_id: Option<String>,
 }
 
 pub(crate) fn request_id(value: &str) -> RequestId {
@@ -105,14 +106,18 @@ pub(crate) fn handle_control_message(
     message: ControlMessage,
 ) -> bool {
     match message {
-        ControlMessage::DataPlaneProgress => {
-            if daemon
-                .runtime()
-                .is_some_and(crate::HubRuntime::take_journal_advanced_wake)
-            {
+        ControlMessage::DataPlaneProgress { journal_advanced } => {
+            if let Some(runtime) = daemon.runtime() {
+                runtime.absorb_core_completions();
+            }
+            if journal_advanced {
+                state.maintenance.note_journal_advanced();
                 state.maintenance.note_authoritative_mutation();
             }
-            false
+            if state.maintenance_reads.in_flight() {
+                state.maintenance.try_wake();
+            }
+            request::poll_deferred(daemon, state)
         }
         message @ ControlMessage::AcceptedConnection { .. }
         | message @ ControlMessage::RejectedConnection
@@ -160,13 +165,11 @@ pub(crate) fn handle_control_message(
 
 pub(crate) fn handle_control_request(
     daemon: &mut HubDaemon,
-    logical_clock: &mut u64,
-    drain_cursors: &mut BTreeMap<String, u64>,
-    pending_runtime: &mut PendingRuntimeState,
-    observability: DaemonObservability<'_>,
+    state: &mut DaemonControlState,
+    observability: DaemonObservability,
     control_tx: ControlSender,
     request: DaemonRequest,
-) -> DaemonTransportResult<DaemonResponse> {
+) -> ControlStep {
     match request {
         DaemonRequest::ListApps
         | DaemonRequest::ResolveAppLaunch { .. }
@@ -193,7 +196,7 @@ pub(crate) fn handle_control_request(
         | DaemonRequest::StopPackageEntrypoint { .. }
         | DaemonRequest::RestartPackageEntrypoint { .. }
         | DaemonRequest::PackageEntrypointStatus { .. } => {
-            packages::handle_request(daemon, request)
+            packages::handle_request(daemon, request).into()
         }
         DaemonRequest::ListSpawnTargets
         | DaemonRequest::ShowSpawnTarget { .. }
@@ -204,37 +207,30 @@ pub(crate) fn handle_control_request(
         | DaemonRequest::ListWorktrees
         | DaemonRequest::ShowWorktree { .. }
         | DaemonRequest::CreateWorktree { .. }
-        | DaemonRequest::DeleteWorktree { .. } => spawn_targets::handle_request(daemon, request),
-        DaemonRequest::PluginLifecycleStatus => plugins::handle_request(daemon, request),
+        | DaemonRequest::DeleteWorktree { .. } => {
+            spawn_targets::handle_request(daemon, request).into()
+        }
+        DaemonRequest::PluginLifecycleStatus => plugins::handle_request(daemon, request).into(),
         DaemonRequest::IssueLocalWebrtcBootstrap { .. }
         | DaemonRequest::LocalWebrtcSignal { .. } => {
-            webrtc::handle_request(daemon, control_tx, request)
+            webrtc::handle_request(daemon, control_tx, request).into()
         }
-        other => handle_runtime_control_request(
-            daemon,
-            logical_clock,
-            drain_cursors,
-            pending_runtime,
-            observability,
-            other,
-        ),
+        other => handle_runtime_control_request(daemon, state, observability, other),
     }
 }
 
 pub(crate) fn handle_runtime_control_request(
     daemon: &mut HubDaemon,
-    logical_clock: &mut u64,
-    drain_cursors: &mut BTreeMap<String, u64>,
-    pending_runtime: &mut PendingRuntimeState,
-    observability: DaemonObservability<'_>,
+    state: &mut DaemonControlState,
+    observability: DaemonObservability,
     request: DaemonRequest,
-) -> DaemonTransportResult<DaemonResponse> {
+) -> ControlStep {
     match request {
         DaemonRequest::SubscribeEntities { .. } | DaemonRequest::UnsubscribeEntities { .. } => {
-            entities::reject_json_request(request)
+            entities::reject_json_request(request).into()
         }
         DaemonRequest::SubscribeEvents { .. } | DaemonRequest::UnsubscribeEvents { .. } => {
-            events::reject_json_request(request)
+            events::reject_json_request(request).into()
         }
         DaemonRequest::Status
         | DaemonRequest::ListSessions
@@ -246,14 +242,10 @@ pub(crate) fn handle_runtime_control_request(
         | DaemonRequest::ReadScreen { .. }
         | DaemonRequest::ReadModeFlags { .. }
         | DaemonRequest::CaptureSnapshot { .. }
-        | DaemonRequest::ReadSessionContext { .. } => sessions::handle_runtime(
-            daemon,
-            logical_clock,
-            drain_cursors,
-            pending_runtime,
-            observability,
-            request,
-        ),
+        | DaemonRequest::ReadSnapshotPage { .. }
+        | DaemonRequest::ReadSessionContext { .. } => {
+            sessions::handle_runtime(daemon, state, observability, request)
+        }
         DaemonRequest::ListSessionTypes
         | DaemonRequest::ListSessionTypesForTarget { .. }
         | DaemonRequest::ShowSessionType { .. }
@@ -262,30 +254,29 @@ pub(crate) fn handle_runtime_control_request(
         | DaemonRequest::UpdateSessionType { .. }
         | DaemonRequest::DeleteSessionType { .. }
         | DaemonRequest::ResolveSessionType { .. }
-        | DaemonRequest::SpawnSessionType { .. } => session_types::handle_runtime(
-            daemon,
-            logical_clock,
-            drain_cursors,
-            pending_runtime,
-            observability,
-            request,
-        ),
+        | DaemonRequest::SpawnSessionType { .. } => {
+            session_types::handle_runtime(daemon, state, observability, request)
+        }
         DaemonRequest::Whoami { .. }
         | DaemonRequest::PostMessage { .. }
         | DaemonRequest::ReceiveMessages { .. }
         | DaemonRequest::AckMessage { .. }
         | DaemonRequest::NotifySession { .. } => {
-            messaging::handle_runtime(daemon, logical_clock, observability, request)
+            messaging::handle_runtime(daemon, state, observability, request)
         }
         DaemonRequest::PluginMcpListTools
         | DaemonRequest::PluginMcpCallTool { .. }
         | DaemonRequest::PluginSurfaceRender { .. }
         | DaemonRequest::PluginSurfaceAction { .. } => {
-            plugins::handle_runtime(daemon, observability, request)
+            plugins::handle_runtime(daemon, observability, request).into()
         }
-        DaemonRequest::DaemonShutdown => host::handle_runtime(daemon, observability, request),
+        DaemonRequest::DaemonShutdown => {
+            host::handle_runtime(daemon, state, observability, request)
+        }
         DaemonRequest::IssueLocalWebrtcBootstrap { .. }
-        | DaemonRequest::LocalWebrtcSignal { .. } => Err(DaemonTransportError::UnexpectedResponse),
+        | DaemonRequest::LocalWebrtcSignal { .. } => {
+            ControlStep::Ready(Err(DaemonTransportError::UnexpectedResponse))
+        }
         DaemonRequest::CheckHubUpdate
         | DaemonRequest::StartHubUpdate { .. }
         | DaemonRequest::GetHubUpdateExecution => {

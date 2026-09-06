@@ -1,11 +1,11 @@
 //! Production Unix terminal adapter and Core harness driver.
 //!
-//! The adapter owns one in-flight write slot. `try_write` serializes an opaque
-//! [`TerminalFrame`] and does not inspect snapshot phases or snapshot bodies.
-//! `close` and `Drop` return without waiting on socket I/O or a writer lock.
+//! The adapter owns one in-flight write slot holding a [`RoutedTerminalFrame`]
+//! by `Arc` clones. It reads route and generation from the envelope and never
+//! inspects the shared `TerminalBody` beyond its length. `close` and `Drop`
+//! return without waiting on socket I/O or a writer lock.
 
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,14 +15,13 @@ use crate::subscription::closed_events::{
     ClosedEventLedger, ClosedEventRoute, ClosedEventSliceProgress, ClosedHandle,
 };
 use crate::transport::shared::adapter_slot::AdapterSlot;
-use crate::transport::shared::ingress::IngressAdmission;
 use crate::transport::shared::wake::AdapterWake;
 use botster_core::contract::terminal_adapter::{
     TerminalAdapter, TerminalAdapterPressure, TerminalAdapterWriteError, TerminalIngress,
 };
 use botster_core::contract::terminal_wake::{TerminalWakeSink, WakingTerminalAdapter};
 use botster_hub_client::DaemonEvent;
-use botster_terminal_protocol::TerminalFrame;
+use botster_terminal_protocol::RoutedTerminalFrame;
 
 /// One-slot Unix adapter bound to an admitted control connection.
 pub struct UnixTerminalAdapter {
@@ -38,7 +37,6 @@ pub(crate) struct UnixTerminalAdapterHandle {
 struct UnixTerminalAdapterInner {
     slot: AdapterSlot<AdapterWake>,
     deferred: AtomicBool,
-    clear_pressure_after_rejection: AtomicBool,
 }
 
 impl UnixTerminalAdapterInner {
@@ -49,7 +47,6 @@ impl UnixTerminalAdapterInner {
                 Arc::new(AtomicBool::new(false)),
             ),
             deferred: AtomicBool::new(false),
-            clear_pressure_after_rejection: AtomicBool::new(false),
         }
     }
 
@@ -61,7 +58,6 @@ impl UnixTerminalAdapterInner {
         self.slot.close_from_host();
     }
 
-    #[allow(dead_code)]
     fn host_closed(&self) -> bool {
         self.slot.host_closed()
     }
@@ -74,29 +70,15 @@ impl UnixTerminalAdapterInner {
         self.slot.pressure()
     }
 
-    fn try_write(&self, frame: &TerminalFrame) -> Result<(), TerminalAdapterWriteError> {
-        let result = self.slot.try_write(frame);
-        if result.is_ok()
-            && let Ok(bytes) = frame.to_bytes()
-        {
-            observe_unix_adapter_wake("try_write", &bytes);
-        }
-        if matches!(result, Err(TerminalAdapterWriteError::WouldBlock))
-            && self
-                .clear_pressure_after_rejection
-                .swap(false, Ordering::SeqCst)
-        {
-            self.slot.set_would_block(false);
-            record_forced_pressure("writable");
-        }
-        result
+    fn try_write(&self, frame: &RoutedTerminalFrame) -> Result<(), TerminalAdapterWriteError> {
+        self.slot.try_write(frame)
     }
 
     fn try_read(&self) -> TerminalIngress {
         self.slot.try_read()
     }
 
-    fn snapshot_active(&self) -> Option<Vec<u8>> {
+    fn snapshot_active(&self) -> Option<RoutedTerminalFrame> {
         self.slot.snapshot_active()
     }
 
@@ -112,12 +94,8 @@ impl UnixTerminalAdapterInner {
         self.deferred.load(Ordering::SeqCst)
     }
 
-    fn complete_active(&self) -> Option<Vec<u8>> {
-        let bytes = self.slot.complete_active();
-        if let Some(ref bytes) = bytes {
-            observe_unix_adapter_wake("complete", bytes);
-        }
-        bytes
+    fn complete_active(&self) -> Option<RoutedTerminalFrame> {
+        self.slot.complete_active()
     }
 }
 
@@ -149,7 +127,6 @@ impl UnixTerminalAdapter {
         let inner = Arc::new(UnixTerminalAdapterInner {
             slot: AdapterSlot::with_wake_and_close_work(wake, close_work),
             deferred: AtomicBool::new(false),
-            clear_pressure_after_rejection: AtomicBool::new(false),
         });
         (
             Self {
@@ -183,7 +160,7 @@ impl Drop for UnixTerminalAdapter {
 }
 
 impl TerminalAdapter for UnixTerminalAdapter {
-    fn try_write(&mut self, frame: &TerminalFrame) -> Result<(), TerminalAdapterWriteError> {
+    fn try_write(&mut self, frame: &RoutedTerminalFrame) -> Result<(), TerminalAdapterWriteError> {
         self.inner.try_write(frame)
     }
 
@@ -273,17 +250,6 @@ impl UnixConnectionMux {
         generation: u64,
         handle: UnixTerminalAdapterHandle,
     ) {
-        let forced_would_block_delay = forced_would_block_delay(&session_id);
-        if forced_would_block_delay.is_some()
-            && std::env::var("BOTSTER_HUB_TEST_CLEAR_ADAPTER_WOULD_BLOCK_AFTER_REJECTION")
-                .as_deref()
-                == Ok("1")
-        {
-            handle
-                .inner
-                .clear_pressure_after_rejection
-                .store(true, Ordering::SeqCst);
-        }
         if let Ok(mut routes) = self.inner.routes.lock() {
             let key = (session_id.clone(), subscription_id.clone(), generation);
             routes.insert(
@@ -309,19 +275,6 @@ impl UnixConnectionMux {
                 Arc::new(move || wake.wake()),
             );
             handle.attach_close_hook(move |host_closed| hook.notify_closed(host_closed));
-        }
-        if let Some(delay) = forced_would_block_delay {
-            let inner = Arc::downgrade(&handle.inner);
-            std::thread::Builder::new()
-                .name("botster-hub-test-pressure".to_string())
-                .spawn(move || {
-                    std::thread::sleep(delay);
-                    if let Some(inner) = inner.upgrade() {
-                        inner.slot.set_would_block(true);
-                        record_forced_pressure("would_block");
-                    }
-                })
-                .expect("start test pressure timer");
         }
         self.inner.wake.wake();
     }
@@ -489,29 +442,32 @@ impl UnixConnectionMux {
             .is_ok_and(|routes| !routes.is_empty())
     }
 
-    pub(crate) fn live_handle(
+    /// Live handle for an ingress container addressed to `route` at `generation`.
+    ///
+    /// A generation that does not match a live route yields `None`; the
+    /// caller discards that frame for this key only.
+    pub(crate) fn live_handle_for_route(
         &self,
-        session_id: &str,
-        subscription_id: &str,
+        route: &str,
+        generation: u64,
     ) -> Option<UnixTerminalAdapterHandle> {
         let Ok(routes) = self.inner.routes.lock() else {
             return None;
         };
-        routes.values().rev().find_map(|route| {
-            if route.session_id == session_id
-                && route.subscription_id == subscription_id
-                && !route.handle.is_closed()
+        routes.values().rev().find_map(|candidate| {
+            if candidate.subscription_id == route
+                && candidate.generation == generation
+                && !candidate.handle.is_closed()
             {
-                Some(route.handle.clone())
+                Some(candidate.handle.clone())
             } else {
                 None
             }
         })
     }
 
-    pub(crate) fn snapshot_writes(
-        &self,
-    ) -> Vec<(String, String, UnixTerminalAdapterHandle, Vec<u8>)> {
+    /// Occupied, non-deferred write slots. Frames are `Arc` clones.
+    pub(crate) fn snapshot_writes(&self) -> Vec<(UnixTerminalAdapterHandle, RoutedTerminalFrame)> {
         let Ok(routes) = self.inner.routes.lock() else {
             return Vec::new();
         };
@@ -521,14 +477,10 @@ impl UnixConnectionMux {
                 if route.handle.is_flush_deferred() {
                     return None;
                 }
-                route.handle.snapshot_active().map(|bytes| {
-                    (
-                        route.session_id.clone(),
-                        route.subscription_id.clone(),
-                        route.handle.clone(),
-                        bytes,
-                    )
-                })
+                route
+                    .handle
+                    .snapshot_active()
+                    .map(|frame| (route.handle.clone(), frame))
             })
             .collect()
     }
@@ -548,93 +500,6 @@ impl UnixConnectionMux {
     }
 }
 
-pub(crate) fn observe_unix_adapter_wake(event: &str, frame_bytes: &[u8]) {
-    if std::env::var("BOTSTER_ENV").as_deref() != Ok("test") {
-        return;
-    }
-    let Ok(path) = std::env::var("BOTSTER_HUB_TEST_UNIX_WAKE_OBSERVATION") else {
-        return;
-    };
-    if path.is_empty() {
-        return;
-    }
-    let row = serde_json::json!({
-        "event": event,
-        "byte_len": frame_bytes.len(),
-    });
-    let line = format!("{row}\n");
-    static LOCK: Mutex<()> = Mutex::new(());
-    let _guard = LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    else {
-        return;
-    };
-    let _ = file.write_all(line.as_bytes());
-}
-
-fn record_forced_pressure(name: &str) {
-    if std::env::var("BOTSTER_ENV").as_deref() != Ok("test") {
-        return;
-    }
-    if let Ok(directory) = std::env::var("BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_OBSERVATION")
-        && !directory.is_empty()
-    {
-        let _ = std::fs::write(std::path::Path::new(&directory).join(name), name);
-    }
-}
-
-fn observe_ingress_admission_for_test(
-    session_id: &str,
-    subscription_id: &str,
-    admission: IngressAdmission,
-) {
-    if std::env::var("BOTSTER_ENV").as_deref() != Ok("test") {
-        return;
-    }
-    let Ok(path) = std::env::var("BOTSTER_HUB_TEST_INGRESS_ADMISSION_OBSERVATION") else {
-        return;
-    };
-    if path.is_empty() {
-        return;
-    }
-    let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    else {
-        return;
-    };
-    let outcome = match admission {
-        IngressAdmission::Stored => "stored",
-        IngressAdmission::Lost => "lost",
-    };
-    let row = serde_json::json!({
-        "session_id": session_id,
-        "subscription_id": subscription_id,
-        "outcome": outcome,
-    });
-    let _ = writeln!(file, "{row}");
-}
-
-fn forced_would_block_delay(session_id: &str) -> Option<std::time::Duration> {
-    if std::env::var("BOTSTER_ENV").as_deref() != Ok("test")
-        || std::env::var("BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_SESSION").as_deref()
-            != Ok(session_id)
-    {
-        return None;
-    }
-    let delay_ms = std::env::var("BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_DELAY_MS")
-        .ok()
-        .and_then(|raw| raw.parse().ok())
-        .unwrap_or(0);
-    Some(std::time::Duration::from_millis(delay_ms))
-}
-
 impl UnixTerminalAdapterHandle {
     pub(crate) fn close(&self) {
         self.inner.close();
@@ -644,7 +509,6 @@ impl UnixTerminalAdapterHandle {
         self.inner.close_from_host();
     }
 
-    #[allow(dead_code)]
     pub(crate) fn host_closed(&self) -> bool {
         self.inner.host_closed()
     }
@@ -653,15 +517,15 @@ impl UnixTerminalAdapterHandle {
         self.inner.is_closed()
     }
 
-    pub(crate) fn snapshot_active(&self) -> Option<Vec<u8>> {
+    pub(crate) fn snapshot_active(&self) -> Option<RoutedTerminalFrame> {
         self.inner.snapshot_active()
     }
 
-    pub(crate) fn complete_active(&self) -> Option<Vec<u8>> {
+    pub(crate) fn complete_active(&self) -> Option<RoutedTerminalFrame> {
         self.inner.complete_active()
     }
 
-    pub(crate) fn write_opaque_frame(&self, frame: &botster_terminal_protocol::TerminalFrame) {
+    pub(crate) fn write_opaque_frame(&self, frame: &RoutedTerminalFrame) {
         let _ = self.inner.try_write(frame);
     }
 
@@ -681,20 +545,9 @@ impl UnixTerminalAdapterHandle {
         self.inner.slot.attach_close_hook(hook);
     }
 
-    #[allow(dead_code)]
+    /// Validate the input header and buffer one complete ingress frame.
     pub(crate) fn push_ingress(&self, bytes: Vec<u8>) -> Result<(), ()> {
         self.inner.slot.push_ingress(bytes)
-    }
-
-    pub(crate) fn push_ingress_for_route(
-        &self,
-        bytes: Vec<u8>,
-        session_id: &str,
-        subscription_id: &str,
-    ) -> Result<(), ()> {
-        self.inner.slot.push_ingress_observed(bytes, |admission| {
-            observe_ingress_admission_for_test(session_id, subscription_id, admission);
-        })
     }
 
     #[cfg(test)]
@@ -719,6 +572,17 @@ mod tests {
     use botster_core_test_support::terminal_adapter::{
         TerminalAdapterHarnessDriver, assert_terminal_adapter_conformance,
     };
+    use botster_terminal_protocol::{RouteId, encode_output};
+
+    pub(crate) fn output_frame(route: &str, marker: &str) -> RoutedTerminalFrame {
+        RoutedTerminalFrame::new(
+            RouteId::new(route).expect("route"),
+            1,
+            0,
+            encode_output(marker.as_bytes()).expect("output frame"),
+        )
+    }
+
     struct UnixTerminalAdapterDriver {
         adapter: UnixTerminalAdapter,
         handle: UnixTerminalAdapterHandle,
@@ -752,8 +616,8 @@ mod tests {
         }
 
         fn complete_active_write(&mut self) {
-            if let Some(bytes) = self.handle.complete_active() {
-                self.delivered.push(bytes);
+            if let Some(frame) = self.handle.complete_active() {
+                self.delivered.push(frame.frame.as_bytes().to_vec());
             }
         }
 
@@ -807,9 +671,7 @@ mod tests {
         let mux = UnixConnectionMux::new();
         let (mut adapter, handle) = mux.create_adapter();
         mux.register("stall".to_string(), "sub".to_string(), 1, handle.clone());
-        let frame = TerminalFrame::from_bytes(br#"{"type":"terminal_output","marker":"flood"}"#)
-            .expect("opaque frame");
-        assert_eq!(adapter.try_write(&frame), Ok(()));
+        assert_eq!(adapter.try_write(&output_frame("sub", "flood")), Ok(()));
         assert_eq!(mux.snapshot_writes().len(), 1);
         handle.defer_flush();
         assert!(mux.snapshot_writes().is_empty());
@@ -820,14 +682,40 @@ mod tests {
         assert!(handle.snapshot_active().is_some());
     }
 
+    #[test]
+    fn slot_shares_the_body_without_copying_it() {
+        let (mut adapter, handle) = UnixTerminalAdapter::pair();
+        let frame = output_frame("sub", "shared");
+        assert_eq!(adapter.try_write(&frame), Ok(()));
+        let active = handle.snapshot_active().expect("occupied slot");
+        assert!(Arc::ptr_eq(
+            active.frame.shared_bytes(),
+            frame.frame.shared_bytes()
+        ));
+        assert_eq!(active.route.as_str(), "sub");
+        assert_eq!(active.generation, 1);
+    }
+
+    #[test]
+    fn ingress_lookup_requires_the_live_generation() {
+        let mux = UnixConnectionMux::new();
+        let (_adapter, handle) = mux.create_adapter();
+        mux.register("session".to_string(), "sub".to_string(), 3, handle.clone());
+        assert!(mux.live_handle_for_route("sub", 3).is_some());
+        assert!(
+            mux.live_handle_for_route("sub", 2).is_none(),
+            "a stale generation is discarded for that key only"
+        );
+        assert!(mux.live_handle_for_route("other", 3).is_none());
+        handle.close();
+        assert!(mux.live_handle_for_route("sub", 3).is_none());
+    }
+
     #[tokio::test]
     async fn unix_mux_retains_a_write_wake_before_the_connection_waits() {
         let mux = UnixConnectionMux::new();
         let (mut adapter, _handle) = mux.create_adapter();
-        let frame = TerminalFrame::from_bytes(br#"{"type":"terminal_output","marker":"early"}"#)
-            .expect("opaque frame");
-
-        assert_eq!(adapter.try_write(&frame), Ok(()));
+        assert_eq!(adapter.try_write(&output_frame("sub", "early")), Ok(()));
         tokio::time::timeout(std::time::Duration::from_millis(50), mux.wait_for_write())
             .await
             .expect("a Unix adapter write before waiter registration must retain its wake");
@@ -836,10 +724,7 @@ mod tests {
     #[test]
     fn close_does_not_wait_on_occupied_slot() {
         let (mut adapter, handle) = UnixTerminalAdapter::pair();
-        let frame =
-            TerminalFrame::from_bytes(br#"{"type":"terminal_output","marker":"in-flight"}"#)
-                .expect("opaque frame");
-        assert_eq!(adapter.try_write(&frame), Ok(()));
+        assert_eq!(adapter.try_write(&output_frame("sub", "in-flight")), Ok(()));
         assert_eq!(adapter.pressure(), TerminalAdapterPressure::Full);
         handle.close();
         assert_eq!(adapter.pressure(), TerminalAdapterPressure::Closed);

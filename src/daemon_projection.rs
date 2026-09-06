@@ -792,6 +792,7 @@ pub(crate) fn daemon_status_from_status(
     software: DaemonSoftwareIdentity,
     installation: DaemonInstallationIdentity,
     observability: botster_hub_client::DaemonObservabilityCounters,
+    retention: Option<botster_hub_client::DaemonRetentionAccounting>,
 ) -> DaemonStatus {
     DaemonStatus {
         lifecycle_state: match status.lifecycle_state {
@@ -831,6 +832,7 @@ pub(crate) fn daemon_status_from_status(
         lifecycle_counters,
         live_attach_occupancy: Vec::new(),
         observability,
+        retention,
         diagnostics,
     }
 }

@@ -1,3 +1,11 @@
+//! Local WebRTC control DataChannel driver.
+//!
+//! The control channel carries host-control protocol 9: encrypted JSON
+//! [`ClientFrame`] messages in, chunked encrypted [`ServerFrame`] deliveries
+//! out. Requests are correlated by `request_id`; Hub serves them in arrival
+//! order and answers requests beyond the outstanding limit with a correlated
+//! `too_many_requests` operator error. Protocol violations close the channel
+//! after one `ServerFrame::Close` carrying the typed reason.
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
@@ -6,11 +14,13 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use botster_core::{AesGcmEnvelope, AesGcmKey, decrypt_aes_gcm};
 use botster_hub_client::{
-    DaemonCompatibility, DaemonDiagnostic, DaemonEvent, DaemonHello, DaemonHelloAck,
-    DaemonLocalWebrtcDeliveryChunk, DaemonRequest, DaemonResponse, LOCAL_WEBRTC_MAX_FRAME_BYTES,
-    PROTOCOL,
+    ClientFrame, DaemonCloseReason, DaemonCompatibility, DaemonDiagnostic, DaemonEvent,
+    DaemonHello, DaemonHelloAck, DaemonLocalWebrtcDeliveryChunk, DaemonOperatorError,
+    DaemonProtocolErrorCode, DaemonRequest, DaemonResponse, DaemonResponseKind,
+    LOCAL_WEBRTC_MAX_FRAME_BYTES, MAX_CONTROL_REQUEST_BYTES, MAX_OUTSTANDING_REQUESTS,
+    OPERATOR_ERROR_TOO_MANY_REQUESTS, PROTOCOL, PROTOCOL_VERSION, ServerFrame, parse_request_id,
 };
-use serde_json::Value;
+use bytes::BytesMut;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot, watch};
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
 use webrtc::runtime::timeout;
@@ -20,19 +30,25 @@ use botster_terminal_protocol::{
 };
 
 use crate::admission::unix_hello::WebrtcTerminalAdmission;
+use crate::client_api_dto::response::daemon_response_base;
+use crate::daemon::control::control_request_operation_label;
 use crate::daemon::control::message::{ControlMessage, ControlSender};
 use crate::subscription::attach_routes::hello_requires_terminal_subscription_closed;
 use crate::subscription::entity::EntityFrameSender;
 use crate::transport::webrtc::adapter::WebRtcConnectionMux;
 use crate::transport::webrtc::delivery::{
-    LocalWebrtcSendFailure, framed_daemon_event, framed_daemon_hello_ack, framed_daemon_response,
+    LocalWebrtcSendFailure, framed_daemon_response, framed_server_frame,
 };
 use crate::transport::webrtc::peer::{
-    LOCAL_WEBRTC_PEER_CLOSE_BOUND, LocalWebrtcPeerState, LocalWebrtcTerminalCause,
-    TEST_CLOSE_LOCAL_WEBRTC_OPERATION_ENV, webrtc_runtime,
+    LOCAL_WEBRTC_PEER_CLOSE_BOUND, LocalWebrtcPeerState, LocalWebrtcTerminalCause, webrtc_runtime,
 };
 use crate::transport::webrtc::subscription_channel::local_webrtc_attach_change_for_response;
-pub(crate) const LOCAL_WEBRTC_PENDING_REQUESTS: usize = 16;
+
+/// Requests held in the inbound queue while one request is in service.
+pub(crate) const LOCAL_WEBRTC_PENDING_REQUESTS: usize = MAX_OUTSTANDING_REQUESTS;
+/// Correlated `too_many_requests` rejections held beyond the request limit.
+/// A client that exceeds this bound as well is closed as a flood.
+pub(crate) const LOCAL_WEBRTC_PENDING_REJECTIONS: usize = MAX_OUTSTANDING_REQUESTS;
 pub(crate) const LOCAL_WEBRTC_EVENT_PROBE: Duration = Duration::ZERO;
 pub(crate) const LOCAL_WEBRTC_BUFFERED_AMOUNT_LOW: u32 = LOCAL_WEBRTC_MAX_FRAME_BYTES as u32;
 pub(crate) const LOCAL_WEBRTC_BUFFERED_AMOUNT_HIGH: u32 = (LOCAL_WEBRTC_MAX_FRAME_BYTES * 2) as u32;
@@ -44,6 +60,7 @@ pub(crate) trait LocalWebrtcDataChannel: Send + Sync {
         Ok(0)
     }
     async fn local_send_text(&self, text: &str) -> Result<(), String>;
+    async fn local_send_binary(&self, bytes: &[u8]) -> Result<(), String>;
     async fn local_poll(&self) -> Option<DataChannelEvent>;
     async fn local_close(&self) -> Result<(), String>;
 }
@@ -77,6 +94,12 @@ where
             .map_err(|error| error.to_string())
     }
 
+    async fn local_send_binary(&self, bytes: &[u8]) -> Result<(), String> {
+        self.send(BytesMut::from(bytes))
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     async fn local_poll(&self) -> Option<DataChannelEvent> {
         self.poll().await
     }
@@ -88,10 +111,20 @@ where
         }
     }
 }
+
+/// One admitted inbound control frame waiting for service.
 pub(crate) enum PendingLocalWebrtcRequest {
-    Request(Box<DaemonRequest>),
     Hello(Box<DaemonHello>),
-    QueueOverflow(usize),
+    Request {
+        request_id: String,
+        request: Box<DaemonRequest>,
+    },
+    /// A request that arrived past the outstanding limit. Hub answers it with
+    /// a correlated `too_many_requests` operator error and never services it.
+    TooManyRequests {
+        request_id: String,
+        operation: &'static str,
+    },
 }
 
 pub(crate) enum LocalWebrtcInbound {
@@ -99,26 +132,20 @@ pub(crate) enum LocalWebrtcInbound {
     AdapterReady,
 }
 
-pub(crate) enum DataChannelPlaintext {
-    Hello(Box<DaemonHello>),
-    Request(Box<DaemonRequest>),
-}
-
+/// Per-channel protocol state shared by the driver and its send paths.
 #[derive(Debug, Default)]
 pub(crate) struct LocalWebrtcFlowControl {
     pub(crate) pressured: bool,
+    /// Set when the first `ClientFrame::Hello` is admitted. Requests before
+    /// it, and a second hello, are `handshake_order` violations.
+    pub(crate) hello_accepted: bool,
+    /// Last admitted request id; every request id must exceed it.
+    pub(crate) last_request_id: u64,
 }
 pub(crate) fn pop_pending_request(
     pending_requests: &mut VecDeque<PendingLocalWebrtcRequest>,
 ) -> Option<PendingLocalWebrtcRequest> {
-    let pending = pending_requests.pop_front()?;
-    let PendingLocalWebrtcRequest::QueueOverflow(count) = pending else {
-        return Some(pending);
-    };
-    if count > 1 {
-        pending_requests.push_front(PendingLocalWebrtcRequest::QueueOverflow(count - 1));
-    }
-    Some(PendingLocalWebrtcRequest::QueueOverflow(1))
+    pending_requests.pop_front()
 }
 pub(crate) fn local_webrtc_request_operation(request: &DaemonRequest) -> &'static str {
     match request {
@@ -247,15 +274,10 @@ where
                 }
                 LocalWebrtcInbound::AdapterReady => continue,
                 LocalWebrtcInbound::Channel(Ok(Some(DataChannelEvent::OnMessage(message)))) => {
-                    match decrypt_data_channel_plaintext(stream_key, message.data.as_ref()) {
-                        Some(DataChannelPlaintext::Hello(hello)) => {
-                            PendingLocalWebrtcRequest::Hello(hello)
-                        }
-                        Some(DataChannelPlaintext::Request(request)) => {
-                            PendingLocalWebrtcRequest::Request(request)
-                        }
-                        None => {
-                            terminal_cause = LocalWebrtcTerminalCause::InvalidEncryptedRequest;
+                    match admit_client_frame(stream_key, message.data.as_ref(), &mut flow_control) {
+                        Ok(pending) => pending,
+                        Err(cause) => {
+                            terminal_cause = cause;
                             break;
                         }
                     }
@@ -291,85 +313,92 @@ where
             }
         };
 
-        if let PendingLocalWebrtcRequest::Hello(hello) = &pending {
-            if hello.protocol != PROTOCOL {
-                terminal_cause = LocalWebrtcTerminalCause::InvalidRequest;
-                break;
-            }
-            if !peer_state.cleanup_sent.load(Ordering::Acquire) {
-                let admission = if let Some(requirement) = hello.terminal_compatibility.as_ref()
-                    && let Err(error) =
-                        ensure_terminal_compatible(requirement, &TerminalCompatibility::current())
-                {
-                    WebrtcTerminalAdmission::Rejected {
-                        code: "terminal_compatibility",
-                        diagnostic: DaemonDiagnostic::compatibility_mismatch(error.diagnostic),
-                        mux: peer_state.mux.clone(),
-                        peer_generation: 0,
-                    }
-                } else {
-                    WebrtcTerminalAdmission::Admitted {
-                        required_features: hello.compatibility.required_features.clone(),
-                        mux: {
-                            if hello_requires_terminal_subscription_closed(
-                                &hello.compatibility.required_features,
-                            ) {
-                                peer_state.mux.admit_close_events();
-                            }
-                            peer_state.mux.clone()
-                        },
-                        terminal_requirement: hello.terminal_compatibility.clone(),
-                        peer_generation: 0,
-                    }
-                };
-                let _ = runtime_tx
-                    .send(ControlMessage::RegisterWebrtcAdmission {
-                        grant_id: peer_state.grant_id.clone(),
-                        admission,
-                        host_required_features: hello.compatibility.required_features.clone(),
-                    })
-                    .await;
-            }
-            peer_state.begin_operation("hello");
-            let ack = DaemonHelloAck {
-                protocol: PROTOCOL.to_string(),
-                compatibility: DaemonCompatibility::current(),
-                terminal_compatibility: Some(TerminalCompatibility::current()),
-                diagnostics: vec![DaemonDiagnostic::connected("hello")],
-            };
-            let Ok(frames) = framed_daemon_hello_ack(stream_key, &ack) else {
-                terminal_cause = LocalWebrtcTerminalCause::ResponseFraming;
-                break;
-            };
-            match send_response_frames(
-                data_channel,
-                stream_key,
-                &frames,
-                &mut pending_requests,
-                &mut flow_control,
-                peer_state,
-            )
-            .await
-            {
-                Ok(()) => continue,
-                Err(failure) => {
-                    eprintln!("{failure}");
-                    terminal_cause = failure.cause;
-                    send_failure = Some(failure);
+        let (request_id, request) = match pending {
+            PendingLocalWebrtcRequest::Hello(hello) => {
+                if hello.protocol != PROTOCOL {
+                    terminal_cause = LocalWebrtcTerminalCause::InvalidRequest;
                     break;
                 }
+                let version_matches = hello.compatibility.protocol_version == PROTOCOL_VERSION;
+                if version_matches && !peer_state.cleanup_sent.load(Ordering::Acquire) {
+                    let admission = if let Some(requirement) = hello.terminal_compatibility.as_ref()
+                        && let Err(error) = ensure_terminal_compatible(
+                            requirement,
+                            &TerminalCompatibility::current(),
+                        ) {
+                        WebrtcTerminalAdmission::Rejected {
+                            code: "terminal_compatibility",
+                            diagnostic: DaemonDiagnostic::compatibility_mismatch(error.diagnostic),
+                            mux: peer_state.mux.clone(),
+                            peer_generation: 0,
+                        }
+                    } else {
+                        WebrtcTerminalAdmission::Admitted {
+                            required_features: hello.compatibility.required_features.clone(),
+                            mux: {
+                                if hello_requires_terminal_subscription_closed(
+                                    &hello.compatibility.required_features,
+                                ) {
+                                    peer_state.mux.admit_close_events();
+                                }
+                                peer_state.mux.clone()
+                            },
+                            terminal_requirement: hello.terminal_compatibility.clone(),
+                            peer_generation: 0,
+                        }
+                    };
+                    let _ = runtime_tx
+                        .send(ControlMessage::RegisterWebrtcAdmission {
+                            grant_id: peer_state.grant_id.clone(),
+                            admission,
+                            host_required_features: hello.compatibility.required_features.clone(),
+                        })
+                        .await;
+                }
+                peer_state.begin_operation("hello");
+                let ack = DaemonHelloAck {
+                    protocol: PROTOCOL.to_string(),
+                    compatibility: DaemonCompatibility::current(),
+                    terminal_compatibility: Some(TerminalCompatibility::current()),
+                    diagnostics: vec![DaemonDiagnostic::connected("hello")],
+                };
+                let Ok(frames) = framed_server_frame(stream_key, &ServerFrame::HelloAck { ack })
+                else {
+                    terminal_cause = LocalWebrtcTerminalCause::ResponseFraming;
+                    break;
+                };
+                match send_response_frames(
+                    data_channel,
+                    stream_key,
+                    &frames,
+                    &mut pending_requests,
+                    &mut flow_control,
+                    peer_state,
+                )
+                .await
+                {
+                    Ok(()) if version_matches => continue,
+                    Ok(()) => {
+                        // The ack carries the running descriptor; the client
+                        // reports the mismatch. There is no request service.
+                        terminal_cause = LocalWebrtcTerminalCause::ProtocolVersionMismatch;
+                        break;
+                    }
+                    Err(failure) => {
+                        eprintln!("{failure}");
+                        terminal_cause = failure.cause;
+                        send_failure = Some(failure);
+                        break;
+                    }
+                }
             }
-        }
-
-        let request = match pending {
-            PendingLocalWebrtcRequest::Request(request) => request,
-            PendingLocalWebrtcRequest::Hello(_) => {
-                unreachable!("hello handled above")
-            }
-            PendingLocalWebrtcRequest::QueueOverflow(_) => {
+            PendingLocalWebrtcRequest::TooManyRequests {
+                request_id,
+                operation,
+            } => {
                 peer_state.begin_overflow_response();
-                let response = queued_request_overflow_response();
-                let Ok(frames) = framed_daemon_response(stream_key, &response) else {
+                let response = too_many_requests_response(&request_id, operation);
+                let Ok(frames) = framed_daemon_response(stream_key, &request_id, &response) else {
                     terminal_cause = LocalWebrtcTerminalCause::ResponseFraming;
                     break;
                 };
@@ -393,16 +422,13 @@ where
                 }
                 continue;
             }
+            PendingLocalWebrtcRequest::Request {
+                request_id,
+                request,
+            } => (request_id, request),
         };
 
         peer_state.begin_request(&request);
-        if std::env::var(TEST_CLOSE_LOCAL_WEBRTC_OPERATION_ENV).as_deref()
-            == Ok(local_webrtc_request_operation(&request))
-        {
-            let _ = data_channel.local_close().await;
-            terminal_cause = LocalWebrtcTerminalCause::ChannelClosed;
-            break;
-        }
         let ownership_request = request.as_ref().clone();
         let entity_subscription_change = match request.as_ref() {
             DaemonRequest::SubscribeEntities {
@@ -413,14 +439,14 @@ where
             }
             _ => None,
         };
+        let daemon_shutdown = matches!(*request, DaemonRequest::DaemonShutdown);
         let (reply_tx, reply_rx) = oneshot::channel();
-        let (response_delivery_tx, response_delivery_rx) =
-            if matches!(*request, DaemonRequest::DaemonShutdown) {
-                let (tx, rx) = mpsc::channel();
-                (Some(tx), Some(rx))
-            } else {
-                (None, None)
-            };
+        let (response_delivery_tx, response_delivery_rx) = if daemon_shutdown {
+            let (tx, rx) = mpsc::channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
         let request_sent = match *request {
             DaemonRequest::SubscribeEntities {
                 entity_type,
@@ -488,17 +514,13 @@ where
             &response,
         ));
         if let Some((subscribed, subscription_id)) = entity_subscription_change {
-            if subscribed
-                && response.kind == botster_hub_client::DaemonResponseKind::EntitySubscribed
-            {
+            if subscribed && response.kind == DaemonResponseKind::EntitySubscribed {
                 peer_state.add_entity_subscription(subscription_id);
-            } else if !subscribed
-                && response.kind == botster_hub_client::DaemonResponseKind::EntityUnsubscribed
-            {
+            } else if !subscribed && response.kind == DaemonResponseKind::EntityUnsubscribed {
                 peer_state.remove_entity_subscription(&subscription_id);
             }
         }
-        let Ok(frames) = framed_daemon_response(stream_key, &response) else {
+        let Ok(frames) = framed_daemon_response(stream_key, &request_id, &response) else {
             if let Some(response_delivery_tx) = response_delivery_tx {
                 let _ = response_delivery_tx.send(());
             }
@@ -518,6 +540,10 @@ where
             let _ = response_delivery_tx.send(());
         }
         match delivery {
+            Ok(()) if daemon_shutdown && response.kind == DaemonResponseKind::Shutdown => {
+                terminal_cause = LocalWebrtcTerminalCause::DaemonShutdown;
+                open = false;
+            }
             Ok(()) => open = true,
             Err(failure) => {
                 eprintln!("{failure}");
@@ -529,6 +555,7 @@ where
     }
     close_data_channel(
         data_channel,
+        stream_key,
         &mut pending_requests,
         peer_state,
         terminal_cause,
@@ -537,8 +564,22 @@ where
     send_failure
 }
 
+/// Typed close frame for causes the client must learn from Hub itself.
+fn close_frame_for_cause(cause: LocalWebrtcTerminalCause) -> Option<ServerFrame> {
+    match cause {
+        LocalWebrtcTerminalCause::ProtocolViolation(code) => Some(ServerFrame::Close {
+            reason: DaemonCloseReason::ProtocolError { code },
+        }),
+        LocalWebrtcTerminalCause::DaemonShutdown => Some(ServerFrame::Close {
+            reason: DaemonCloseReason::DaemonShutdown,
+        }),
+        _ => None,
+    }
+}
+
 pub(crate) async fn close_data_channel<D>(
     data_channel: &D,
+    stream_key: &AesGcmKey,
     pending_requests: &mut VecDeque<PendingLocalWebrtcRequest>,
     peer_state: &LocalWebrtcPeerState,
     cause: LocalWebrtcTerminalCause,
@@ -547,6 +588,20 @@ pub(crate) async fn close_data_channel<D>(
 {
     pending_requests.clear();
     peer_state.mux.close_all();
+    if let Some(frame) = close_frame_for_cause(cause)
+        && let Ok(frames) = framed_server_frame(stream_key, &frame)
+    {
+        // Best effort: the channel closes below whether or not the peer
+        // receives the reason.
+        let _ = tokio::time::timeout(LOCAL_WEBRTC_PEER_CLOSE_BOUND, async {
+            for frame in &frames {
+                if data_channel.local_send_text(frame).await.is_err() {
+                    break;
+                }
+            }
+        })
+        .await;
+    }
     #[cfg(test)]
     let force_hang = peer_state
         .force_local_close_hang
@@ -697,35 +752,31 @@ pub(crate) fn apply_data_channel_event(
             Ok(())
         }
         DataChannelEvent::OnMessage(message) => {
-            let pending = match decrypt_data_channel_plaintext(stream_key, message.data.as_ref()) {
-                Some(DataChannelPlaintext::Hello(hello)) => PendingLocalWebrtcRequest::Hello(hello),
-                Some(DataChannelPlaintext::Request(request)) => {
-                    PendingLocalWebrtcRequest::Request(request)
+            let pending = admit_client_frame(stream_key, message.data.as_ref(), flow_control)?;
+            let mut requests = 0usize;
+            let mut rejections = 0usize;
+            for queued in pending_requests.iter() {
+                match queued {
+                    PendingLocalWebrtcRequest::Request { .. }
+                    | PendingLocalWebrtcRequest::Hello(_) => requests += 1,
+                    PendingLocalWebrtcRequest::TooManyRequests { .. } => rejections += 1,
                 }
-                None => return Err(LocalWebrtcTerminalCause::InvalidRequest),
-            };
-            let request_count = pending_requests
-                .iter()
-                .filter(|queued| {
-                    matches!(
-                        queued,
-                        PendingLocalWebrtcRequest::Request(_) | PendingLocalWebrtcRequest::Hello(_)
-                    )
-                })
-                .count();
-            if request_count >= LOCAL_WEBRTC_PENDING_REQUESTS {
-                if let Some(PendingLocalWebrtcRequest::QueueOverflow(count)) =
-                    pending_requests.back_mut()
-                {
-                    let Some(next_count) = count.checked_add(1) else {
-                        return Err(LocalWebrtcTerminalCause::RequestQueueOverflow);
-                    };
-                    *count = next_count;
-                } else {
-                    pending_requests.push_back(PendingLocalWebrtcRequest::QueueOverflow(1));
-                }
-                return Ok(());
             }
+            let pending = match pending {
+                PendingLocalWebrtcRequest::Request {
+                    request_id,
+                    request,
+                } if requests >= LOCAL_WEBRTC_PENDING_REQUESTS => {
+                    if rejections >= LOCAL_WEBRTC_PENDING_REJECTIONS {
+                        return Err(LocalWebrtcTerminalCause::RequestQueueOverflow);
+                    }
+                    PendingLocalWebrtcRequest::TooManyRequests {
+                        request_id,
+                        operation: control_request_operation_label(&request),
+                    }
+                }
+                pending => pending,
+            };
             pending_requests.push_back(pending);
             Ok(())
         }
@@ -736,24 +787,63 @@ pub(crate) fn apply_data_channel_event(
         _ => Ok(()),
     }
 }
-pub(crate) fn decrypt_data_channel_plaintext(
+
+/// Decrypt one control message and apply the protocol 9 admission rules:
+/// hello first and once, canonical strictly increasing request ids.
+pub(crate) fn admit_client_frame(
     key: &AesGcmKey,
     bytes: &[u8],
-) -> Option<DataChannelPlaintext> {
+    flow_control: &mut LocalWebrtcFlowControl,
+) -> Result<PendingLocalWebrtcRequest, LocalWebrtcTerminalCause> {
+    let Some(frame) = decrypt_client_frame(key, bytes) else {
+        return Err(LocalWebrtcTerminalCause::InvalidEncryptedRequest);
+    };
+    match frame {
+        ClientFrame::Hello { hello } => {
+            if flow_control.hello_accepted {
+                return Err(LocalWebrtcTerminalCause::ProtocolViolation(
+                    DaemonProtocolErrorCode::HandshakeOrder,
+                ));
+            }
+            flow_control.hello_accepted = true;
+            Ok(PendingLocalWebrtcRequest::Hello(Box::new(hello)))
+        }
+        ClientFrame::Request {
+            request_id,
+            request,
+        } => {
+            if !flow_control.hello_accepted {
+                return Err(LocalWebrtcTerminalCause::ProtocolViolation(
+                    DaemonProtocolErrorCode::HandshakeOrder,
+                ));
+            }
+            let Some(parsed) = parse_request_id(&request_id) else {
+                return Err(LocalWebrtcTerminalCause::ProtocolViolation(
+                    DaemonProtocolErrorCode::InvalidRequestId,
+                ));
+            };
+            if parsed <= flow_control.last_request_id {
+                return Err(LocalWebrtcTerminalCause::ProtocolViolation(
+                    DaemonProtocolErrorCode::NonincreasingRequestId,
+                ));
+            }
+            flow_control.last_request_id = parsed;
+            Ok(PendingLocalWebrtcRequest::Request {
+                request_id,
+                request: Box::new(request),
+            })
+        }
+    }
+}
+
+/// Decrypt one JSON `AesGcmEnvelope` text message into a [`ClientFrame`].
+pub(crate) fn decrypt_client_frame(key: &AesGcmKey, bytes: &[u8]) -> Option<ClientFrame> {
     let envelope = serde_json::from_slice::<AesGcmEnvelope>(bytes).ok()?;
     let plaintext = decrypt_aes_gcm(key, &envelope).ok()?;
-    let value = serde_json::from_slice::<Value>(&plaintext).ok()?;
-    if value.get("type").is_none() && value.get("protocol").is_some() {
-        serde_json::from_value::<DaemonHello>(value)
-            .ok()
-            .map(Box::new)
-            .map(DataChannelPlaintext::Hello)
-    } else {
-        serde_json::from_value::<DaemonRequest>(value)
-            .ok()
-            .map(Box::new)
-            .map(DataChannelPlaintext::Request)
+    if plaintext.len() > MAX_CONTROL_REQUEST_BYTES {
+        return None;
     }
+    serde_json::from_slice::<ClientFrame>(&plaintext).ok()
 }
 pub(crate) fn host_event_ready(peer_state: &LocalWebrtcPeerState) -> bool {
     peer_state.mux.has_pending_event()
@@ -782,7 +872,7 @@ where
         return Ok(());
     }
     peer_state.begin_operation("host_event_delivery");
-    let Ok(frames) = framed_daemon_event(stream_key, &event) else {
+    let Ok(frames) = framed_server_frame(stream_key, &ServerFrame::Event { event }) else {
         return Ok(());
     };
     send_response_frames(
@@ -797,55 +887,24 @@ where
 }
 
 pub(crate) fn response_with_diagnostic(diagnostic: DaemonDiagnostic) -> DaemonResponse {
-    DaemonResponse {
-        kind: botster_hub_client::DaemonResponseKind::OperatorError,
-        status: None,
-        sessions: Vec::new(),
-        session_types: Vec::new(),
-        session_type_definition: None,
-        resolved_session_type: None,
-        session_context: None,
-        read_screen: None,
-        mode_flags: None,
-        terminal_reservation: None,
-        subscription_reservation: None,
-        capture_snapshot: None,
-        spawn_targets: Vec::new(),
-        spawn_target_validation: None,
-        worktrees: Vec::new(),
-        apps: Vec::new(),
-        resolved_app_launch: None,
-        resolved_package_route: None,
-        package_navigation: Vec::new(),
-        packages: Vec::new(),
-        available_packages: Vec::new(),
-        install_plan: None,
-        update_status: None,
-        hub_update: None,
-        hub_update_execution: None,
-        package_decision: None,
-        lifecycle: Vec::new(),
-        plugin_worker_counters: None,
-        plugin_resource_counters: None,
-        plugin_tools: Vec::new(),
-        plugin_tool_result: Value::Null,
-        plugin_surface: None,
-        plugin_action_result: None,
-        local_webrtc_bootstrap: None,
-        local_webrtc_answer: None,
-        events: Vec::new(),
-        cleanup: None,
-        coordination: None,
-        error: None,
-        diagnostics: vec![diagnostic],
-    }
+    let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
+    response.diagnostics = vec![diagnostic];
+    response
 }
 
-pub(crate) fn queued_request_overflow_response() -> DaemonResponse {
-    response_with_diagnostic(DaemonDiagnostic::action_failure(
-        "local_webrtc_data_channel",
-        "inbound request queue capacity exceeded; request was rejected",
-    ))
+/// Correlated rejection for a request past the outstanding limit.
+pub(crate) fn too_many_requests_response(request_id: &str, operation: &str) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
+    response.error = Some(DaemonOperatorError {
+        code: OPERATOR_ERROR_TOO_MANY_REQUESTS.to_string(),
+        request_id: request_id.to_string(),
+        operation: operation.to_string(),
+        message: format!(
+            "connection already holds {MAX_OUTSTANDING_REQUESTS} outstanding requests"
+        ),
+        diagnostics: Vec::new(),
+    });
+    response
 }
 #[cfg(test)]
 #[allow(unused_imports)]

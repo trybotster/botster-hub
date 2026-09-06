@@ -441,6 +441,7 @@ dependencies = [
  "botster-hub-test-support",
  "botster-terminal-ghostty",
  "botster-terminal-protocol",
+ "botster-terminal-protocol-client",
  "botster-ui-contract",
  "bytes",
  "getrandom 0.3.4",

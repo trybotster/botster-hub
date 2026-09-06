@@ -220,11 +220,73 @@ pub(crate) fn suppress_webrtc_session_close_events(
     }
 }
 
-pub(crate) fn session_close_event_decision_for(
-    runtime: &crate::HubRuntime,
-    session_id: &str,
-) -> Option<bool> {
-    session_close_event_decision(runtime.session_registry_state(&SessionId(session_id.to_string())))
+/// Owner-side cache of close-event decisions for one close-events pass.
+///
+/// Registry lookups run on the Core owner thread. The pass classifies from
+/// the cache, records the session ids it lacks, requests them in one ticket,
+/// and revisits the same cursor once the ticket resolves. The cache empties
+/// when the cursor wraps so a later pass sees fresh registry state.
+#[derive(Default)]
+pub(crate) struct CloseEventDecisions {
+    cache: BTreeMap<String, Option<bool>>,
+    missing: BTreeSet<String>,
+    read: Option<crate::data_plane::driver::CoreTicket<Vec<(String, Option<bool>)>>>,
+}
+
+impl CloseEventDecisions {
+    fn decision(&mut self, session_id: &str) -> Option<bool> {
+        if let Some(decision) = self.cache.get(session_id) {
+            return *decision;
+        }
+        self.missing.insert(session_id.to_string());
+        None
+    }
+
+    /// Request the missing lookups. Returns `true` when a read is now in flight.
+    fn request_missing(&mut self, runtime: &crate::HubRuntime) -> bool {
+        if self.read.is_some() {
+            return true;
+        }
+        if self.missing.is_empty() {
+            return false;
+        }
+        let session_ids: Vec<String> = std::mem::take(&mut self.missing).into_iter().collect();
+        self.read = Some(runtime.submit_core(move |daemon| {
+            session_ids
+                .into_iter()
+                .map(|session_id| {
+                    let lookup = daemon.session_registry_state(&SessionId(session_id.clone()));
+                    (session_id, session_close_event_decision(lookup))
+                })
+                .collect()
+        }));
+        true
+    }
+
+    /// Absorb a resolved read. Returns `true` while the read is still pending.
+    fn poll(&mut self) -> bool {
+        use crate::data_plane::driver::CoreTicketPoll;
+        let Some(ticket) = self.read.as_mut() else {
+            return false;
+        };
+        match ticket.poll() {
+            CoreTicketPoll::Pending => true,
+            CoreTicketPoll::Lost => {
+                self.read = None;
+                false
+            }
+            CoreTicketPoll::Ready(rows) => {
+                self.read = None;
+                self.cache.extend(rows);
+                false
+            }
+        }
+    }
+
+    fn reset(&mut self) {
+        self.cache.clear();
+        self.missing.clear();
+    }
 }
 
 pub(crate) fn session_close_event_decision(
@@ -240,10 +302,15 @@ pub(crate) fn session_close_event_decision(
 pub(crate) fn run_close_events_phase(daemon: &HubDaemon, state: &mut DaemonControlState) -> bool {
     let Some(runtime) = daemon.runtime() else {
         state.pump.close_cursor = PumpAdmissionCursor::default();
+        state.close_event_decisions.reset();
         return false;
     };
+    if state.close_event_decisions.poll() {
+        return true;
+    }
     let mut admissions_visited = 0;
     let mut classified = 0;
+    let decisions = &mut state.close_event_decisions;
     loop {
         if admissions_visited >= PUMP_MAX_ADMISSIONS_VISITED
             || classified >= PUMP_MAX_CANDIDATE_CLASSIFICATIONS
@@ -268,7 +335,7 @@ pub(crate) fn run_close_events_phase(daemon: &HubDaemon, state: &mut DaemonContr
                 let progress = match state.pending_runtime.admission.unix_admissions.get(&key) {
                     Some(UnixTerminalAdmission::Admitted { mux, .. }) => mux
                         .queue_closed_subscription_events_bounded(
-                            |session_id| session_close_event_decision_for(runtime, session_id),
+                            |session_id| decisions.decision(session_id),
                             remaining_candidates,
                             after_route.as_ref(),
                             PUMP_MAX_ROUTE_ENTRIES_VISITED,
@@ -276,6 +343,11 @@ pub(crate) fn run_close_events_phase(daemon: &HubDaemon, state: &mut DaemonContr
                     _ => empty_close_event_progress(),
                 };
                 classified = classified.saturating_add(progress.classified);
+                if decisions.request_missing(runtime) {
+                    // Revisit this admission once the registry answers.
+                    state.pump.close_cursor = PumpAdmissionCursor::Unix { after, after_route };
+                    return true;
+                }
                 if progress.more {
                     state.pump.close_cursor = PumpAdmissionCursor::Unix {
                         after,
@@ -295,13 +367,14 @@ pub(crate) fn run_close_events_phase(daemon: &HubDaemon, state: &mut DaemonContr
                 );
                 let Some(key) = next_key else {
                     state.pump.close_cursor = PumpAdmissionCursor::default();
+                    decisions.reset();
                     return false;
                 };
                 admissions_visited += 1;
                 let progress = match state.pending_runtime.admission.webrtc_admissions.get(&key) {
                     Some(WebrtcTerminalAdmission::Admitted { mux, .. }) => mux
                         .queue_closed_subscription_events_bounded(
-                            |session_id| session_close_event_decision_for(runtime, session_id),
+                            |session_id| decisions.decision(session_id),
                             remaining_candidates,
                             after_route.as_ref(),
                             PUMP_MAX_ROUTE_ENTRIES_VISITED,
@@ -309,6 +382,10 @@ pub(crate) fn run_close_events_phase(daemon: &HubDaemon, state: &mut DaemonContr
                     _ => empty_close_event_progress(),
                 };
                 classified = classified.saturating_add(progress.classified);
+                if decisions.request_missing(runtime) {
+                    state.pump.close_cursor = PumpAdmissionCursor::Webrtc { after, after_route };
+                    return true;
+                }
                 if progress.more {
                     state.pump.close_cursor = PumpAdmissionCursor::Webrtc {
                         after,
