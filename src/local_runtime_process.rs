@@ -21,8 +21,6 @@ use super::{
 };
 
 const LOCAL_RUNTIME_DAEMON_METADATA_FILE: &str = ".botster-hub-runtime-daemon.json";
-const TEST_LOCAL_RUNTIME_READINESS_BUDGET_MS_ENV: &str =
-    "BOTSTER_HUB_TEST_LOCAL_RUNTIME_READINESS_BUDGET_MS";
 
 pub(crate) struct StartedRuntimeCleanup<'a> {
     config: &'a botster_hub::HubConfig,
@@ -221,13 +219,7 @@ fn drain_runtime_stderr(stderr_rx: &mpsc::Receiver<String>, stderr_tail: &mut St
     }
 }
 
-fn local_runtime_daemon_readiness_budget() -> Duration {
-    if env::var("BOTSTER_ENV").as_deref() == Ok("test")
-        && let Some(milliseconds) = env::var_os(TEST_LOCAL_RUNTIME_READINESS_BUDGET_MS_ENV)
-            .and_then(|value| value.to_str().and_then(|value| value.parse::<u64>().ok()))
-    {
-        return Duration::from_millis(milliseconds);
-    }
+const fn local_runtime_daemon_readiness_budget() -> Duration {
     LOCAL_RUNTIME_DAEMON_READINESS_BUDGET
 }
 

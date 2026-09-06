@@ -18,9 +18,6 @@ use crate::subscription::package_events::ClientEventMailbox;
 /// Whole seconds a peer has to open a reserved subscription channel.
 pub(crate) const TERMINAL_RESERVATION_EXPIRES_IN_SECONDS: u32 = 30;
 
-const TEST_RESERVATION_EXPIRES_IN_SECONDS_ENV: &str =
-    "BOTSTER_HUB_TEST_RESERVATION_EXPIRES_IN_SECONDS";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReservationState {
     Live,
@@ -397,13 +394,7 @@ pub(crate) fn now_seconds() -> u64 {
         .unwrap_or(0)
 }
 
-fn reservation_expires_in_seconds() -> u32 {
-    if env::var("BOTSTER_ENV").as_deref() == Ok("test")
-        && let Ok(value) = env::var(TEST_RESERVATION_EXPIRES_IN_SECONDS_ENV)
-        && let Ok(seconds) = value.parse::<u32>()
-    {
-        return seconds;
-    }
+const fn reservation_expires_in_seconds() -> u32 {
     TERMINAL_RESERVATION_EXPIRES_IN_SECONDS
 }
 

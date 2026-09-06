@@ -17,19 +17,23 @@ use botster_core::{
     SubscriptionId,
 };
 use botster_core_daemon::{
-    GuardedWriteDecision, GuardedWriteDeliveryState, GuardedWriteRequest, GuardedWriteResult,
-    LifecycleBaselineBudget, ReadinessEvidence, SessionLifecycleBaselinePage,
+    CoreCompletion, CoreDaemonError, GuardedWriteDecision, GuardedWriteDeliveryState,
+    GuardedWriteRequest, GuardedWriteResult, LifecycleBaselineBudget, ReadinessEvidence,
+    SessionLifecycleBaselinePage,
 };
+use botster_hub_client::HistoryUnavailableReason;
 use botster_ui_contract::{
     PackageNavigationTarget, PackageNoticeReactionDescriptor, PackageSurfaceDescriptor,
     PackageSurfaceKind, PackageSurfaceOperation, UiActionRequest, UiActionResult, UiNode,
 };
 
+use crate::data_plane::driver::{CoreTicket, CoreTicketError, CoreTicketPoll};
 use crate::lifecycle::HubPluginLifecycleStatus;
 use crate::packages::{
     PackageClassification, PackageConfigurationView, PackageRecord, PackageRegistry,
     PackageRunnableProcessState, PackageRunnableWorkingDirectory, PackageState,
 };
+use crate::runtime::{CoreOperationTracker, STARTUP_CORE_WAIT, core_bridge_error};
 use crate::session_types::{
     HubSessionContext, HubSessionType, HubSessionTypeDefinition, PackageSessionType,
     ResolvedSessionType, SessionTypeMutation, SessionTypeMutationSource, SessionTypeRequest,
@@ -37,6 +41,182 @@ use crate::session_types::{
     show_session_type_definition,
 };
 use crate::{HubRuntime, HubRuntimeError, daemon_session_to_core_session, host_profile};
+
+/// Outcome of starting one client request.
+///
+/// Requests that touch Core return [`Self::Pending`]; the owner loop polls
+/// it and threads that do not serve the owner loop wait on it.
+pub enum HubClientStep {
+    Ready(HubClientResult<HubClientResponse>),
+    Pending(HubClientPending),
+}
+
+impl HubClientStep {
+    /// The result of a request that never touches Core.
+    ///
+    /// # Errors
+    /// Returns the request error, or `InvalidRequest` when the request was
+    /// Core-bound and the caller expected a synchronous answer.
+    pub fn ready(self) -> HubClientResult<HubClientResponse> {
+        match self {
+            Self::Ready(result) => result,
+            Self::Pending(pending) => Err(HubClientError::InvalidRequest {
+                request_id: pending.request_id.clone(),
+                operation: pending.operation,
+                message: "request runs on the Core owner thread; poll or wait for it".to_string(),
+            }),
+        }
+    }
+
+    /// Bounded blocking completion for threads that do not serve the owner loop.
+    ///
+    /// # Errors
+    /// Returns the request error or a runtime error when the bound elapses.
+    pub fn wait(self, runtime: &HubRuntime) -> HubClientResult<HubClientResponse> {
+        match self {
+            Self::Ready(result) => result,
+            Self::Pending(pending) => pending.wait(runtime, STARTUP_CORE_WAIT),
+        }
+    }
+}
+
+/// One Core-bound client request in flight.
+pub struct HubClientPending {
+    request_id: RequestId,
+    operation: HubClientOperation,
+    stage: HubClientPendingStage,
+}
+
+enum HubClientPendingStage {
+    Ticket(CoreTicket<HubClientResult<HubClientResponse>>),
+    Operation {
+        tracker: CoreOperationTracker,
+        finish: Box<dyn FnOnce(CoreCompletion) -> HubClientResult<HubClientResponse> + Send>,
+    },
+    Done,
+}
+
+impl HubClientPending {
+    fn ticket(
+        request_id: RequestId,
+        operation: HubClientOperation,
+        ticket: CoreTicket<HubClientResult<HubClientResponse>>,
+    ) -> Self {
+        Self {
+            request_id,
+            operation,
+            stage: HubClientPendingStage::Ticket(ticket),
+        }
+    }
+
+    fn operation(
+        request_id: RequestId,
+        operation: HubClientOperation,
+        tracker: CoreOperationTracker,
+        finish: impl FnOnce(CoreCompletion) -> HubClientResult<HubClientResponse> + Send + 'static,
+    ) -> Self {
+        Self {
+            request_id,
+            operation,
+            stage: HubClientPendingStage::Operation {
+                tracker,
+                finish: Box::new(finish),
+            },
+        }
+    }
+
+    fn lost(&self) -> HubClientError {
+        runtime_error(
+            self.request_id.clone(),
+            self.operation,
+            core_bridge_error(CoreTicketError::DriverStopped),
+        )
+    }
+
+    /// Non-blocking progress; owner-loop use.
+    pub fn poll(&mut self, runtime: &HubRuntime) -> Option<HubClientResult<HubClientResponse>> {
+        match &mut self.stage {
+            HubClientPendingStage::Ticket(ticket) => match ticket.poll() {
+                CoreTicketPoll::Pending => None,
+                CoreTicketPoll::Lost => {
+                    self.stage = HubClientPendingStage::Done;
+                    Some(Err(self.lost()))
+                }
+                CoreTicketPoll::Ready(result) => {
+                    self.stage = HubClientPendingStage::Done;
+                    Some(result)
+                }
+            },
+            HubClientPendingStage::Operation { tracker, .. } => match tracker.poll(runtime) {
+                CoreTicketPoll::Pending => None,
+                CoreTicketPoll::Lost => {
+                    self.stage = HubClientPendingStage::Done;
+                    Some(Err(self.lost()))
+                }
+                CoreTicketPoll::Ready(Err(error)) => {
+                    self.stage = HubClientPendingStage::Done;
+                    Some(Err(runtime_error(
+                        self.request_id.clone(),
+                        self.operation,
+                        error,
+                    )))
+                }
+                CoreTicketPoll::Ready(Ok(completion)) => {
+                    let stage = std::mem::replace(&mut self.stage, HubClientPendingStage::Done);
+                    let HubClientPendingStage::Operation { finish, .. } = stage else {
+                        return Some(Err(self.lost()));
+                    };
+                    Some(finish(completion))
+                }
+            },
+            HubClientPendingStage::Done => Some(Err(self.lost())),
+        }
+    }
+
+    /// Bounded blocking completion for threads that do not serve the owner loop.
+    ///
+    /// # Errors
+    /// Returns the request error or a runtime error when the bound elapses.
+    pub fn wait(
+        mut self,
+        runtime: &HubRuntime,
+        timeout: Duration,
+    ) -> HubClientResult<HubClientResponse> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(result) = self.poll(runtime) {
+                return result;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(runtime_error(
+                    self.request_id.clone(),
+                    self.operation,
+                    core_bridge_error(CoreTicketError::Timeout),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+fn history_unavailable_dto(
+    reason: Option<botster_terminal_protocol::HistoryUnavailableReason>,
+) -> Option<HistoryUnavailableReason> {
+    reason.map(|reason| match reason {
+        botster_terminal_protocol::HistoryUnavailableReason::Evicted => {
+            HistoryUnavailableReason::Evicted
+        }
+        botster_terminal_protocol::HistoryUnavailableReason::Restart => {
+            HistoryUnavailableReason::Restart
+        }
+        botster_terminal_protocol::HistoryUnavailableReason::Oversize => {
+            HistoryUnavailableReason::Oversize
+        }
+        botster_terminal_protocol::HistoryUnavailableReason::CaptureFailed => {
+            HistoryUnavailableReason::CaptureFailed
+        }
+    })
+}
 
 /// Transport-neutral local client API handler.
 #[derive(Debug, Clone)]
@@ -74,12 +254,27 @@ impl HubClientApi {
     }
 
     /// Handle one local client request through hub-owned facades.
+    ///
+    /// Requests that need Core return [`HubClientStep::Pending`]. Everything
+    /// else answers at once.
     pub fn handle_request(
         &self,
         runtime: &mut HubRuntime,
         packages: &PackageRegistry,
         request: HubClientRequest,
-    ) -> HubClientResult<HubClientResponse> {
+    ) -> HubClientStep {
+        match self.start_request(runtime, packages, request) {
+            Ok(step) => step,
+            Err(error) => HubClientStep::Ready(Err(error)),
+        }
+    }
+
+    fn start_request(
+        &self,
+        runtime: &mut HubRuntime,
+        packages: &PackageRegistry,
+        request: HubClientRequest,
+    ) -> HubClientResult<HubClientStep> {
         let operation = request.operation();
         let request_id = request.request_id().clone();
         if !self.admission.allows(operation) {
@@ -89,26 +284,65 @@ impl HubClientApi {
                 role: self.identity.role,
             });
         }
+        let respond = {
+            let request_id = request_id.clone();
+            move |body: HubClientResponseBody| HubClientResponse {
+                request_id: request_id.clone(),
+                body,
+            }
+        };
+        let core_error = {
+            let request_id = request_id.clone();
+            move |error: CoreDaemonError| runtime_error(request_id.clone(), operation, error)
+        };
+        let profile_id = host_profile().id.to_string();
+        let host_id = runtime.config().host.id.clone();
+        let package_count = packages.packages().len();
 
         let body = match request {
-            HubClientRequest::Status { .. } => HubClientResponseBody::Status(HubClientStatus {
-                profile_id: host_profile().id.to_string(),
-                host_id: runtime.config().host.id.clone(),
-                session_count: runtime
-                    .list_sessions()
-                    .map_err(|error| runtime_error(request_id.clone(), operation, error))?
-                    .len(),
-                package_count: packages.packages().len(),
-            }),
-            HubClientRequest::ListSessions { .. } => HubClientResponseBody::Sessions(
-                runtime
-                    .list_sessions()
-                    .map_err(|error| runtime_error(request_id.clone(), operation, error))?
-                    .into_iter()
-                    .map(daemon_session_to_core_session)
-                    .map(HubClientSession::from)
-                    .collect(),
-            ),
+            HubClientRequest::Status { .. } => {
+                let respond = respond.clone();
+                let core_error = core_error.clone();
+                return Ok(HubClientStep::Pending(HubClientPending::ticket(
+                    request_id,
+                    operation,
+                    runtime.submit_core(move |daemon| {
+                        daemon
+                            .list()
+                            .map(|sessions| {
+                                respond(HubClientResponseBody::Status(HubClientStatus {
+                                    profile_id: profile_id.clone(),
+                                    host_id: host_id.clone(),
+                                    session_count: sessions.len(),
+                                    package_count,
+                                }))
+                            })
+                            .map_err(&core_error)
+                    }),
+                )));
+            }
+            HubClientRequest::ListSessions { .. } => {
+                let respond = respond.clone();
+                let core_error = core_error.clone();
+                return Ok(HubClientStep::Pending(HubClientPending::ticket(
+                    request_id,
+                    operation,
+                    runtime.submit_core(move |daemon| {
+                        daemon
+                            .list()
+                            .map(|sessions| {
+                                respond(HubClientResponseBody::Sessions(
+                                    sessions
+                                        .into_iter()
+                                        .map(daemon_session_to_core_session)
+                                        .map(HubClientSession::from)
+                                        .collect(),
+                                ))
+                            })
+                            .map_err(&core_error)
+                    }),
+                )));
+            }
             HubClientRequest::SubscribeEntities { entity_type, .. } => {
                 if entity_type != "session" {
                     return Err(HubClientError::InvalidRequest {
@@ -117,44 +351,73 @@ impl HubClientApi {
                         message: format!("unsupported entity type: {entity_type}"),
                     });
                 }
-                HubClientResponseBody::SessionLifecycleBaselinePage(
-                    runtime
-                        .lifecycle_baseline_page(
-                            None,
-                            None,
-                            LifecycleBaselineBudget {
-                                max_rows: 32,
-                                max_bytes: 64 * 1024,
-                                max_elapsed: Duration::from_millis(25),
-                            },
-                        )
-                        .map_err(|_| botster_core_daemon::CoreDaemonError::Shutdown)
-                        .map_err(|error| runtime_error(request_id.clone(), operation, error))?,
-                )
+                let respond = respond.clone();
+                let core_error = core_error.clone();
+                return Ok(HubClientStep::Pending(HubClientPending::ticket(
+                    request_id,
+                    operation,
+                    runtime.submit_core(move |daemon| {
+                        daemon
+                            .lifecycle_baseline_page(
+                                None,
+                                None,
+                                LifecycleBaselineBudget {
+                                    max_rows: 32,
+                                    max_bytes: 64 * 1024,
+                                    max_elapsed: Duration::from_millis(25),
+                                },
+                            )
+                            .map(|page| {
+                                respond(HubClientResponseBody::SessionLifecycleBaselinePage(page))
+                            })
+                            .map_err(|_| core_error(CoreDaemonError::Shutdown))
+                    }),
+                )));
             }
             HubClientRequest::UnsubscribeEntities { .. } => {
                 HubClientResponseBody::Events(Vec::new())
             }
             HubClientRequest::RemoveSession { session_id, .. } => {
-                let removed = runtime
-                    .remove_terminal_session(&session_id)
-                    .map_err(|error| runtime_error(request_id.clone(), operation, error))?;
-                HubClientResponseBody::SessionRemoved(removed)
+                let tracker = runtime.begin_remove_session(&session_id);
+                let respond = respond.clone();
+                let core_error = core_error.clone();
+                return Ok(HubClientStep::Pending(HubClientPending::operation(
+                    request_id,
+                    operation,
+                    tracker,
+                    move |completion| match completion {
+                        CoreCompletion::RemoveSession { result, .. } => result
+                            .map(|removed| respond(HubClientResponseBody::SessionRemoved(removed)))
+                            .map_err(core_error),
+                        _ => Err(core_error(CoreDaemonError::Shutdown)),
+                    },
+                )));
             }
             HubClientRequest::Spawn {
                 session_id,
                 command,
-                now_seconds,
                 ..
             } => {
                 let request = spawn_request(runtime, request_id.clone(), session_id, command);
-                let outcome = runtime
-                    .spawn_session(request, client_session_metadata(), now_seconds)
-                    .map_err(|error| runtime_error(request_id.clone(), operation, error))?;
-                HubClientResponseBody::Spawned(HubClientSpawned {
-                    session: HubClientSession::from(outcome),
-                    events: Vec::new(),
-                })
+                let tracker = runtime.begin_spawn(request, client_session_metadata());
+                let respond = respond.clone();
+                let core_error = core_error.clone();
+                return Ok(HubClientStep::Pending(HubClientPending::operation(
+                    request_id,
+                    operation,
+                    tracker,
+                    move |completion| match completion {
+                        CoreCompletion::Spawn { result, .. } => result
+                            .map(|outcome| {
+                                respond(HubClientResponseBody::Spawned(HubClientSpawned {
+                                    session: HubClientSession::from(outcome),
+                                    events: Vec::new(),
+                                }))
+                            })
+                            .map_err(core_error),
+                        _ => Err(core_error(CoreDaemonError::Shutdown)),
+                    },
+                )));
             }
             HubClientRequest::Attach { .. } => {
                 return Err(HubClientError::InvalidRequest {
@@ -170,25 +433,35 @@ impl HubClientApi {
                 now_seconds,
                 ..
             } => {
-                runtime
-                    .detach_client(
-                        self.identity.client_id.clone(),
-                        session_id,
-                        subscription_id,
-                        now_seconds,
-                    )
-                    .map_err(|error| runtime_error(request_id.clone(), operation, error))?;
-                HubClientResponseBody::Events(Vec::new())
+                let client_id = self.identity.client_id.clone();
+                let respond = respond.clone();
+                let core_error = core_error.clone();
+                return Ok(HubClientStep::Pending(HubClientPending::ticket(
+                    request_id,
+                    operation,
+                    runtime.submit_core(move |daemon| {
+                        daemon
+                            .detach(client_id, session_id, subscription_id, now_seconds)
+                            .map(|()| respond(HubClientResponseBody::Events(Vec::new())))
+                            .map_err(&core_error)
+                    }),
+                )));
             }
-            HubClientRequest::Shutdown {
-                session_id,
-                now_seconds,
-                ..
-            } => {
-                runtime
-                    .shutdown_session(session_id, now_seconds)
-                    .map_err(|error| runtime_error(request_id.clone(), operation, error))?;
-                HubClientResponseBody::Events(Vec::new())
+            HubClientRequest::Shutdown { session_id, .. } => {
+                let tracker = runtime.begin_shutdown_session(session_id);
+                let respond = respond.clone();
+                let core_error = core_error.clone();
+                return Ok(HubClientStep::Pending(HubClientPending::operation(
+                    request_id,
+                    operation,
+                    tracker,
+                    move |completion| match completion {
+                        CoreCompletion::ShutdownSession { result, .. } => result
+                            .map(|()| respond(HubClientResponseBody::Events(Vec::new())))
+                            .map_err(core_error),
+                        _ => Err(core_error(CoreDaemonError::Shutdown)),
+                    },
+                )));
             }
             HubClientRequest::GuardedNotificationWrite {
                 session_id,
@@ -205,16 +478,29 @@ impl HubClientApi {
                         package_name,
                     });
                 }
-                let result = runtime
-                    .guarded_write(GuardedWriteRequest {
-                        session_id,
-                        client_id: self.identity.client_id.clone(),
-                        data,
-                        readiness,
-                        now_seconds,
-                    })
-                    .map_err(|error| runtime_error(request_id.clone(), operation, error))?;
-                HubClientResponseBody::GuardedWrite(HubClientGuardedWrite::from(result))
+                let request = GuardedWriteRequest {
+                    session_id,
+                    client_id: self.identity.client_id.clone(),
+                    data,
+                    readiness,
+                    now_seconds,
+                };
+                let respond = respond.clone();
+                let core_error = core_error.clone();
+                return Ok(HubClientStep::Pending(HubClientPending::ticket(
+                    request_id,
+                    operation,
+                    runtime.submit_core(move |daemon| {
+                        daemon
+                            .guarded_write(request)
+                            .map(|result| {
+                                respond(HubClientResponseBody::GuardedWrite(
+                                    HubClientGuardedWrite::from(result),
+                                ))
+                            })
+                            .map_err(&core_error)
+                    }),
+                )));
             }
             HubClientRequest::NotifySession {
                 session_id,
@@ -223,24 +509,49 @@ impl HubClientApi {
                 now_seconds,
                 ..
             } => {
-                let result = runtime
-                    .guarded_write(GuardedWriteRequest {
-                        session_id,
-                        client_id: self.identity.client_id.clone(),
-                        data,
-                        readiness,
-                        now_seconds,
-                    })
-                    .map_err(|error| runtime_error(request_id.clone(), operation, error))?;
-                HubClientResponseBody::GuardedWrite(HubClientGuardedWrite::from(result))
+                let request = GuardedWriteRequest {
+                    session_id,
+                    client_id: self.identity.client_id.clone(),
+                    data,
+                    readiness,
+                    now_seconds,
+                };
+                let respond = respond.clone();
+                let core_error = core_error.clone();
+                return Ok(HubClientStep::Pending(HubClientPending::ticket(
+                    request_id,
+                    operation,
+                    runtime.submit_core(move |daemon| {
+                        daemon
+                            .guarded_write(request)
+                            .map(|result| {
+                                respond(HubClientResponseBody::GuardedWrite(
+                                    HubClientGuardedWrite::from(result),
+                                ))
+                            })
+                            .map_err(&core_error)
+                    }),
+                )));
             }
             HubClientRequest::PublishRoutedEnvelope { envelope, .. } => {
-                let outcome = runtime
-                    .publish_routed_envelope(envelope)
-                    .map_err(|error| runtime_error(request_id.clone(), operation, error))?;
-                HubClientResponseBody::RoutedEnvelopePublish(HubClientRoutedEnvelopePublish::from(
-                    outcome,
-                ))
+                let respond = respond.clone();
+                let core_error = core_error.clone();
+                return Ok(HubClientStep::Pending(HubClientPending::ticket(
+                    request_id,
+                    operation,
+                    runtime.submit_core(move |daemon| {
+                        daemon
+                            .publish_routed_envelope(
+                                botster_core_daemon::PublishRoutedEnvelopeRequest { envelope },
+                            )
+                            .map(|outcome| {
+                                respond(HubClientResponseBody::RoutedEnvelopePublish(
+                                    HubClientRoutedEnvelopePublish::from(outcome),
+                                ))
+                            })
+                            .map_err(&core_error)
+                    }),
+                )));
             }
             HubClientRequest::DrainRoutedEnvelopes {
                 target,
@@ -248,51 +559,162 @@ impl HubClientApi {
                 limit,
                 ..
             } => {
-                let outcome = runtime
-                    .drain_routed_envelopes(target, after, limit)
-                    .map_err(|error| runtime_error(request_id.clone(), operation, error))?;
-                HubClientResponseBody::RoutedEnvelopeDrain(HubClientRoutedEnvelopeDrain::from(
-                    outcome,
-                ))
+                let respond = respond.clone();
+                let core_error = core_error.clone();
+                return Ok(HubClientStep::Pending(HubClientPending::ticket(
+                    request_id,
+                    operation,
+                    runtime.submit_core(move |daemon| {
+                        daemon
+                            .drain_routed_envelopes(
+                                botster_core_daemon::DrainRoutedEnvelopesRequest {
+                                    target,
+                                    after,
+                                    limit,
+                                },
+                            )
+                            .map(|outcome| {
+                                respond(HubClientResponseBody::RoutedEnvelopeDrain(
+                                    HubClientRoutedEnvelopeDrain::from(outcome),
+                                ))
+                            })
+                            .map_err(&core_error)
+                    }),
+                )));
             }
             HubClientRequest::AcknowledgeRoutedEnvelope {
                 target,
                 envelope_id,
                 ..
             } => {
-                let state = runtime
-                    .acknowledge_routed_envelope(target, envelope_id)
-                    .map_err(|error| runtime_error(request_id.clone(), operation, error))?
-                    .state;
-                HubClientResponseBody::RoutedEnvelopeAck(HubClientRoutedEnvelopeAck { state })
+                let respond = respond.clone();
+                let core_error = core_error.clone();
+                return Ok(HubClientStep::Pending(HubClientPending::ticket(
+                    request_id,
+                    operation,
+                    runtime.submit_core(move |daemon| {
+                        daemon
+                            .acknowledge_routed_envelope(
+                                botster_core_daemon::AcknowledgeRoutedEnvelopeRequest {
+                                    target,
+                                    envelope_id,
+                                },
+                            )
+                            .map(|result| {
+                                respond(HubClientResponseBody::RoutedEnvelopeAck(
+                                    HubClientRoutedEnvelopeAck {
+                                        state: result.state,
+                                    },
+                                ))
+                            })
+                            .map_err(&core_error)
+                    }),
+                )));
             }
             HubClientRequest::ReadScreen {
                 request_id: read_request_id,
                 session_id,
                 now_seconds,
-            } => HubClientResponseBody::ReadScreen(HubClientReadScreen::from(
-                runtime
-                    .read_screen(read_request_id, session_id, now_seconds)
-                    .map_err(|error| runtime_error(request_id.clone(), operation, error))?,
-            )),
+            } => {
+                let tracker =
+                    runtime.begin_read_screen(read_request_id, session_id.clone(), now_seconds);
+                let respond = respond.clone();
+                let core_error = core_error.clone();
+                return Ok(HubClientStep::Pending(HubClientPending::operation(
+                    request_id,
+                    operation,
+                    tracker,
+                    move |completion| match completion {
+                        CoreCompletion::ReadScreen { result, .. } => result
+                            .map(|screen| {
+                                respond(HubClientResponseBody::ReadScreen(HubClientReadScreen {
+                                    session_id,
+                                    text: screen.text.to_string(),
+                                    unavailable: history_unavailable_dto(screen.unavailable),
+                                }))
+                            })
+                            .map_err(core_error),
+                        _ => Err(core_error(CoreDaemonError::Shutdown)),
+                    },
+                )));
+            }
             HubClientRequest::ReadModeFlags {
                 request_id: read_request_id,
                 session_id,
                 now_seconds,
-            } => HubClientResponseBody::ModeFlags(HubClientModeFlags::from(
-                runtime
-                    .read_mode_flags(read_request_id, session_id, now_seconds)
-                    .map_err(|error| runtime_error(request_id.clone(), operation, error))?,
-            )),
+            } => {
+                let tracker =
+                    runtime.begin_read_mode_flags(read_request_id, session_id.clone(), now_seconds);
+                let respond = respond.clone();
+                let core_error = core_error.clone();
+                return Ok(HubClientStep::Pending(HubClientPending::operation(
+                    request_id,
+                    operation,
+                    tracker,
+                    move |completion| match completion {
+                        CoreCompletion::ReadModeFlags { result, .. } => result
+                            .map(|readback| {
+                                let mode = readback.mode_flags;
+                                respond(HubClientResponseBody::ModeFlags(HubClientModeFlags {
+                                    session_id,
+                                    kitty_enabled: mode.kitty_enabled,
+                                    cursor_visible: mode.cursor_visible,
+                                    bracketed_paste: mode.bracketed_paste,
+                                    mouse_mode: mode.mouse_mode,
+                                    alt_screen: mode.alt_screen,
+                                    focus_reporting: mode.focus_reporting,
+                                    application_cursor: mode.application_cursor,
+                                    rows: readback.rows,
+                                    cols: readback.cols,
+                                    unavailable: history_unavailable_dto(readback.unavailable),
+                                }))
+                            })
+                            .map_err(core_error),
+                        _ => Err(core_error(CoreDaemonError::Shutdown)),
+                    },
+                )));
+            }
             HubClientRequest::CaptureSnapshot {
                 request_id: snapshot_request_id,
                 session_id,
                 now_seconds,
-            } => HubClientResponseBody::CaptureSnapshot(HubClientCaptureSnapshot::from(
-                runtime
-                    .capture_snapshot(snapshot_request_id, session_id, now_seconds)
-                    .map_err(|error| runtime_error(request_id.clone(), operation, error))?,
-            )),
+            } => {
+                let tracker = runtime.begin_capture_snapshot(
+                    snapshot_request_id,
+                    session_id.clone(),
+                    now_seconds,
+                    botster_core_daemon::CaptureOwner(format!(
+                        "client:{}",
+                        self.identity.client_id.0
+                    )),
+                );
+                let respond = respond.clone();
+                let core_error = core_error.clone();
+                return Ok(HubClientStep::Pending(HubClientPending::operation(
+                    request_id,
+                    operation,
+                    tracker,
+                    move |completion| match completion {
+                        CoreCompletion::CaptureSnapshot { result, .. } => result
+                            .map(|capture| {
+                                respond(HubClientResponseBody::CaptureSnapshot(
+                                    HubClientCaptureSnapshot {
+                                        session_id,
+                                        capture_id: capture.capture_id.0,
+                                        total_bytes: capture.total_bytes,
+                                        page_bytes: capture.page_bytes,
+                                        pages: capture.pages,
+                                        rows: capture.rows,
+                                        cols: capture.cols,
+                                        unavailable: history_unavailable_dto(capture.unavailable),
+                                    },
+                                ))
+                            })
+                            .map_err(core_error),
+                        _ => Err(core_error(CoreDaemonError::Shutdown)),
+                    },
+                )));
+            }
             HubClientRequest::ListPackages { .. } => HubClientResponseBody::Packages(
                 packages
                     .packages()
@@ -483,21 +905,34 @@ impl HubClientApi {
                 let context = materialized.context.clone();
                 let metadata = session_type_client_metadata(materialized.metadata);
                 runtime.record_session_context(context.clone());
-                let outcome = match runtime.spawn_session(
-                    materialized.spawn_request,
-                    metadata,
-                    now_seconds,
-                ) {
-                    Ok(outcome) => outcome,
-                    Err(error) => {
-                        runtime.remove_session_context(&context);
-                        return Err(runtime_error(request_id.clone(), operation, error));
-                    }
-                };
-                HubClientResponseBody::Spawned(HubClientSpawned {
-                    session: HubClientSession::from(outcome),
-                    events: Vec::new(),
-                })
+                let _ = now_seconds;
+                let tracker = runtime.begin_spawn(materialized.spawn_request, metadata);
+                let respond = respond.clone();
+                let core_error = core_error.clone();
+                let contexts = runtime.session_contexts_handle();
+                return Ok(HubClientStep::Pending(HubClientPending::operation(
+                    request_id,
+                    operation,
+                    tracker,
+                    move |completion| match completion {
+                        CoreCompletion::Spawn { result, .. } => match result {
+                            Ok(outcome) => {
+                                Ok(respond(HubClientResponseBody::Spawned(HubClientSpawned {
+                                    session: HubClientSession::from(outcome),
+                                    events: Vec::new(),
+                                })))
+                            }
+                            Err(error) => {
+                                if let Ok(mut contexts) = contexts.lock() {
+                                    contexts.remove(&context.context_id);
+                                    contexts.remove(&context.session_id.0);
+                                }
+                                Err(core_error(error))
+                            }
+                        },
+                        _ => Err(core_error(CoreDaemonError::Shutdown)),
+                    },
+                )));
             }
             HubClientRequest::ReadSessionContext {
                 session_id,
@@ -603,7 +1038,10 @@ impl HubClientApi {
             }
         };
 
-        Ok(HubClientResponse { request_id, body })
+        Ok(HubClientStep::Ready(Ok(HubClientResponse {
+            request_id,
+            body,
+        })))
     }
 }
 
@@ -1121,16 +1559,9 @@ pub struct HubClientRoutedEnvelopeAck {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HubClientReadScreen {
     pub session_id: SessionId,
+    /// Empty when `unavailable` is set.
     pub text: String,
-}
-
-impl From<botster_core_daemon::ReadScreenResult> for HubClientReadScreen {
-    fn from(result: botster_core_daemon::ReadScreenResult) -> Self {
-        Self {
-            session_id: result.screen.session_id,
-            text: result.screen.text,
-        }
-    }
+    pub unavailable: Option<HistoryUnavailableReason>,
 }
 
 /// Client-facing authoritative terminal mode response.
@@ -1144,49 +1575,22 @@ pub struct HubClientModeFlags {
     pub alt_screen: bool,
     pub focus_reporting: bool,
     pub application_cursor: bool,
-    pub mode_generation: u64,
-    pub mode_revision: u64,
+    pub rows: u16,
+    pub cols: u16,
+    pub unavailable: Option<HistoryUnavailableReason>,
 }
 
-impl From<botster_core_daemon::ReadModeFlagsResult> for HubClientModeFlags {
-    fn from(result: botster_core_daemon::ReadModeFlagsResult) -> Self {
-        let mode = result.mode_flags.mode_flags;
-        let freshness = result.mode_flags.mode_freshness;
-        Self {
-            session_id: result.mode_flags.session_id,
-            kitty_enabled: mode.kitty_enabled,
-            cursor_visible: mode.cursor_visible,
-            bracketed_paste: mode.bracketed_paste,
-            mouse_mode: mode.mouse_mode,
-            alt_screen: mode.alt_screen,
-            focus_reporting: mode.focus_reporting,
-            application_cursor: mode.application_cursor,
-            mode_generation: freshness.mode_generation,
-            mode_revision: freshness.mode_revision,
-        }
-    }
-}
-
-/// Client-facing snapshot metadata response.
+/// Client-facing snapshot capture summary. Pages are read by capture id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HubClientCaptureSnapshot {
     pub session_id: SessionId,
+    pub capture_id: String,
+    pub total_bytes: u64,
+    pub page_bytes: u32,
+    pub pages: u32,
     pub rows: u16,
     pub cols: u16,
-    pub payload_format: Option<String>,
-    pub payload_bytes: usize,
-}
-
-impl From<botster_core_daemon::CaptureSnapshotResult> for HubClientCaptureSnapshot {
-    fn from(result: botster_core_daemon::CaptureSnapshotResult) -> Self {
-        Self {
-            session_id: result.snapshot.session_id,
-            rows: result.snapshot.rows,
-            cols: result.snapshot.cols,
-            payload_format: result.payload.format,
-            payload_bytes: result.payload.bytes.len(),
-        }
-    }
+    pub unavailable: Option<HistoryUnavailableReason>,
 }
 
 /// Client event stream emitted from hub runtime output.
@@ -1920,7 +2324,7 @@ pub enum HubClientRuntimeErrorKind {
     State,
 }
 
-fn runtime_error(
+pub(crate) fn runtime_error(
     request_id: RequestId,
     operation: HubClientOperation,
     error: impl Into<HubRuntimeError>,
@@ -2048,7 +2452,7 @@ fn plugin_error(
     }
 }
 
-fn spawn_request(
+pub(crate) fn spawn_request(
     runtime: &HubRuntime,
     request_id: RequestId,
     session_id: SessionId,
@@ -2076,7 +2480,7 @@ fn spawn_request(
     }
 }
 
-fn client_session_metadata() -> CoreSessionMetadata {
+pub(crate) fn client_session_metadata() -> CoreSessionMetadata {
     CoreSessionMetadata::from_entries(BTreeMap::from([(
         "session_type".to_string(),
         "local_client_api".to_string(),

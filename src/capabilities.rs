@@ -5,7 +5,7 @@
 //! limits, policy-gated HTTP execution, and plugin cleanup.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::fs::{self, File};
+use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc;
@@ -29,6 +29,9 @@ use botster_core::{
     TimerCapabilityRequest, WebSocketCapabilityRuntimeConfig, apply_plugin_store_merge_patch,
     plugin_store_payload_bytes,
 };
+use botster_core::{
+    KeyedStore, MAX_RANGE_BYTES, MAX_RANGE_ITEMS, Namespace, RedbStore, StoreError, StoreOp,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::config::HubConfig;
@@ -37,12 +40,14 @@ const DEFAULT_FILESYSTEM_SCOPE: &str = "workspace";
 const DEFAULT_CAPABILITY_EVENT_CAPACITY: usize = 256;
 const DEFAULT_CAPABILITY_OPERATION_CAPACITY: usize = 128;
 const DEFAULT_HTTP_TIMEOUT_MS: u64 = 5_000;
+/// Plugin database file under the Hub data directory.
+const PLUGIN_DB_FILE: &str = "plugin-db.redb";
 
 /// Hub-owned concrete capability runtime.
 pub struct HubCapabilityRuntime {
     grants: CapabilitySet,
     filesystem_grants: BTreeMap<String, HubFilesystemScope>,
-    plugin_store: Arc<LocalPluginStoreBackend>,
+    plugin_store: Arc<KeyedPluginStore>,
     plugin_store_limits: PluginStoreLimits,
     http: HttpCapabilityRuntime,
     websocket: InMemoryWebSocketCapabilityRuntime,
@@ -55,7 +60,7 @@ pub struct HubCapabilityRuntime {
 }
 
 pub(crate) struct PreparedPluginStoreOperation {
-    backend: Arc<LocalPluginStoreBackend>,
+    backend: Arc<KeyedPluginStore>,
     plugin_key: PluginKey,
     operation: PluginStoreOperation,
     limits: PluginStoreLimits,
@@ -146,7 +151,7 @@ impl PluginStoreBatchResult {
 }
 
 pub(crate) struct PreparedPluginStoreBatch {
-    backend: Arc<LocalPluginStoreBackend>,
+    backend: Arc<KeyedPluginStore>,
     plugin_key: PluginKey,
     mutations: Vec<PluginStoreBatchMutation>,
     limits: PluginStoreLimits,
@@ -172,8 +177,14 @@ impl PreparedPluginStoreOperation {
 
 impl HubCapabilityRuntime {
     /// Build the local concrete runtime from explicit hub config.
-    #[must_use]
-    pub fn from_config(config: &HubConfig) -> Self {
+    ///
+    /// # Errors
+    /// Returns an error when the plugin database under the data directory
+    /// cannot be opened.
+    pub fn from_config(config: &HubConfig) -> Result<Self, CapabilityRuntimeError> {
+        let plugin_store = Arc::new(KeyedPluginStore::open(
+            &config.data_directory.join(PLUGIN_DB_FILE),
+        )?);
         let grants = default_hub_capability_grants();
         let filesystem_grants = BTreeMap::from([(
             DEFAULT_FILESYSTEM_SCOPE.to_string(),
@@ -212,12 +223,10 @@ impl HubCapabilityRuntime {
         );
         let (completions_sender, completions_receiver) = mpsc::channel();
 
-        Self {
+        Ok(Self {
             grants,
             filesystem_grants,
-            plugin_store: Arc::new(LocalPluginStoreBackend::new(
-                config.data_directory.join("plugin-data"),
-            )),
+            plugin_store,
             plugin_store_limits: PluginStoreLimits::default(),
             http,
             websocket,
@@ -227,19 +236,13 @@ impl HubCapabilityRuntime {
             completions_receiver,
             operation_capacity: DEFAULT_CAPABILITY_OPERATION_CAPACITY,
             event_capacity: DEFAULT_CAPABILITY_EVENT_CAPACITY,
-        }
+        })
     }
 
     /// Return the exact scoped grants accepted by the local runtime.
     #[must_use]
     pub fn granted_capabilities(&self) -> &CapabilitySet {
         &self.grants
-    }
-
-    /// Return the hub-owned plugin store root.
-    #[must_use]
-    pub fn plugin_store_root(&self) -> &Path {
-        self.plugin_store.root()
     }
 
     /// Return the current number of Hub-owned timer resources.
@@ -944,152 +947,136 @@ fn min_optional_limit(request: Option<u64>, grant: Option<u64>) -> Option<u64> {
     }
 }
 
-struct LocalPluginStoreBackend {
-    root: PathBuf,
+/// `plugin_db` records over Core's keyed store: one namespace per plugin,
+/// one JSON [`PluginStoreRecord`] per key.
+///
+/// Every mutation is one atomic Core batch. Reads page the namespace with
+/// Core's range bounds. Revision, quota, and merge-patch rules stay in the
+/// Hub helpers below; Core owns durability and the byte limits of the store.
+pub(crate) struct KeyedPluginStore {
+    store: Box<dyn KeyedStore>,
     lock: Mutex<()>,
-    #[cfg(test)]
-    batch_test_hook: Mutex<Option<BatchTestHook>>,
 }
 
-impl std::fmt::Debug for LocalPluginStoreBackend {
+impl std::fmt::Debug for KeyedPluginStore {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("LocalPluginStoreBackend")
-            .field("root", &self.root)
+            .debug_struct("KeyedPluginStore")
             .finish_non_exhaustive()
     }
 }
 
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BatchCommitPoint {
-    UnchangedRecordLinkAttempt,
-    RecordStaged(usize),
-    NamespaceBackedUp,
+fn store_error(error: StoreError) -> CapabilityRuntimeError {
+    CapabilityRuntimeError::new(
+        CapabilityRuntimeErrorKind::BackendFailed,
+        format!("plugin database failed: {error}"),
+    )
 }
 
-#[cfg(test)]
-type BatchTestHook =
-    Arc<dyn Fn(BatchCommitPoint) -> Result<(), CapabilityRuntimeError> + Send + Sync + 'static>;
-
-impl LocalPluginStoreBackend {
-    fn new(root: PathBuf) -> Self {
-        Self {
-            root,
-            lock: Mutex::new(()),
-            #[cfg(test)]
-            batch_test_hook: Mutex::new(None),
-        }
-    }
-
-    #[cfg(test)]
-    fn set_batch_test_hook(&self, hook: BatchTestHook) {
-        *self.batch_test_hook.lock().expect("batch test hook lock") = Some(hook);
-    }
-
-    #[cfg(test)]
-    fn run_batch_test_hook(&self, point: BatchCommitPoint) -> Result<(), CapabilityRuntimeError> {
-        let hook = self
-            .batch_test_hook
-            .lock()
-            .expect("batch test hook lock")
-            .clone();
-        match hook {
-            Some(hook) => hook(point),
-            None => Ok(()),
-        }
-    }
-
-    fn root(&self) -> &Path {
-        &self.root
-    }
-
-    fn namespace_dir(&self, plugin_key: &PluginKey) -> PathBuf {
-        self.root.join(sanitize_plugin_key(plugin_key))
-    }
-
-    fn record_path(&self, plugin_key: &PluginKey, key: &PluginStoreKey) -> PathBuf {
-        self.namespace_dir(plugin_key)
-            .join(format!("{}.json", encode_key(&key.0)))
-    }
-
-    fn transaction_paths(&self, plugin_key: &PluginKey) -> (PathBuf, PathBuf) {
-        let namespace = sanitize_plugin_key(plugin_key);
-        (
-            self.root.join(format!(".{namespace}.batch-staging")),
-            self.root.join(format!(".{namespace}.batch-backup")),
-        )
-    }
-
-    fn recover_transaction(&self, plugin_key: &PluginKey) -> Result<(), CapabilityRuntimeError> {
-        let namespace = self.namespace_dir(plugin_key);
-        let (staging, backup) = self.transaction_paths(plugin_key);
-        if !self.root.exists() || (!staging.exists() && !backup.exists()) {
-            return Ok(());
-        }
-
-        if namespace.exists() {
-            remove_dir_if_exists(&staging)?;
-            remove_dir_if_exists(&backup)?;
-        } else if backup.exists() {
-            fs::rename(&backup, &namespace).map_err(backend_error)?;
-            remove_dir_if_exists(&staging)?;
-        } else {
-            remove_dir_if_exists(&staging)?;
-        }
-
-        sync_directory(&self.root)
-    }
-
-    fn read_records(
-        &self,
-        plugin_key: &PluginKey,
-    ) -> Result<BTreeMap<PluginStoreKey, PluginStoreRecord>, CapabilityRuntimeError> {
-        let namespace = self.namespace_dir(plugin_key);
-        if !namespace.exists() {
-            return Ok(BTreeMap::new());
-        }
-
-        let mut records = BTreeMap::new();
-        for entry in fs::read_dir(namespace).map_err(backend_error)? {
-            let entry = entry.map_err(backend_error)?;
-            if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
-                continue;
-            }
-            let bytes = fs::read(entry.path()).map_err(backend_error)?;
-            let record = serde_json::from_slice::<PluginStoreRecord>(&bytes).map_err(|error| {
+impl KeyedPluginStore {
+    fn open(path: &Path) -> Result<Self, CapabilityRuntimeError> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
                 CapabilityRuntimeError::new(
                     CapabilityRuntimeErrorKind::BackendFailed,
-                    format!("plugin-store record could not be decoded: {error}"),
+                    format!("plugin database directory could not be created: {error}"),
                 )
             })?;
-            records.insert(record.key.clone(), record);
         }
-        Ok(records)
+        let store = RedbStore::open(path).map_err(store_error)?;
+        Ok(Self::over(Box::new(store)))
     }
 
-    fn write_record(&self, record: &PluginStoreRecord) -> Result<(), CapabilityRuntimeError> {
-        let namespace = self.namespace_dir(&record.plugin_key);
-        self.write_record_to(&namespace, record)
+    fn over(store: Box<dyn KeyedStore>) -> Self {
+        Self {
+            store,
+            lock: Mutex::new(()),
+        }
     }
 
-    fn write_record_to(
-        &self,
-        namespace: &Path,
-        record: &PluginStoreRecord,
-    ) -> Result<(), CapabilityRuntimeError> {
-        fs::create_dir_all(namespace).map_err(backend_error)?;
-        let bytes = serde_json::to_vec_pretty(record).map_err(|error| {
+    fn namespace(plugin_key: &PluginKey) -> Result<Namespace, CapabilityRuntimeError> {
+        Namespace::new(&sanitize_plugin_key(plugin_key)).map_err(|error| {
+            CapabilityRuntimeError::new(
+                CapabilityRuntimeErrorKind::InvalidRequest,
+                format!("plugin key is not a valid plugin database namespace: {error}"),
+            )
+        })
+    }
+
+    fn decode_record(bytes: &[u8]) -> Result<PluginStoreRecord, CapabilityRuntimeError> {
+        serde_json::from_slice(bytes).map_err(|error| {
             CapabilityRuntimeError::new(
                 CapabilityRuntimeErrorKind::BackendFailed,
-                format!("plugin-store record could not be encoded: {error}"),
+                format!("plugin database record could not be decoded: {error}"),
             )
-        })?;
-        let path = namespace.join(format!("{}.json", encode_key(&record.key.0)));
-        fs::write(&path, bytes).map_err(backend_error)?;
-        File::open(path)
-            .and_then(|file| file.sync_all())
-            .map_err(backend_error)
+        })
+    }
+
+    fn encode_record(record: &PluginStoreRecord) -> Result<Vec<u8>, CapabilityRuntimeError> {
+        serde_json::to_vec(record).map_err(|error| {
+            CapabilityRuntimeError::new(
+                CapabilityRuntimeErrorKind::BackendFailed,
+                format!("plugin database record could not be encoded: {error}"),
+            )
+        })
+    }
+
+    fn read_record(
+        &self,
+        namespace: &Namespace,
+        key: &PluginStoreKey,
+    ) -> Result<Option<PluginStoreRecord>, CapabilityRuntimeError> {
+        self.store
+            .get(namespace, key.0.as_bytes())
+            .map_err(store_error)?
+            .map(|bytes| Self::decode_record(&bytes))
+            .transpose()
+    }
+
+    /// Every record in one plugin namespace, in key order.
+    fn read_records(
+        &self,
+        namespace: &Namespace,
+    ) -> Result<BTreeMap<PluginStoreKey, PluginStoreRecord>, CapabilityRuntimeError> {
+        let mut records = BTreeMap::new();
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let page = self
+                .store
+                .range(
+                    namespace,
+                    b"",
+                    after.as_deref(),
+                    MAX_RANGE_ITEMS,
+                    MAX_RANGE_BYTES,
+                )
+                .map_err(store_error)?;
+            let next = page.next_after().map(<[u8]>::to_vec);
+            for item in page.items {
+                let record = Self::decode_record(&item.value)?;
+                records.insert(record.key.clone(), record);
+            }
+            match next {
+                Some(next) => after = Some(next),
+                None => return Ok(records),
+            }
+        }
+    }
+
+    fn write_record(
+        &self,
+        namespace: &Namespace,
+        record: &PluginStoreRecord,
+    ) -> Result<(), CapabilityRuntimeError> {
+        self.store
+            .batch(
+                namespace,
+                &[StoreOp::Put {
+                    key: record.key.0.as_bytes().to_vec(),
+                    value: Self::encode_record(record)?,
+                }],
+            )
+            .map_err(store_error)
     }
 
     fn batch(
@@ -1099,10 +1086,11 @@ impl LocalPluginStoreBackend {
         limits: PluginStoreLimits,
     ) -> PluginStoreBatchResult {
         let _guard = self.lock.lock().expect("plugin store lock poisoned");
-        if let Err(error) = self.recover_transaction(plugin_key) {
-            return PluginStoreBatchResult::failure(error, None, None);
-        }
-        let records = match self.read_records(plugin_key) {
+        let namespace = match Self::namespace(plugin_key) {
+            Ok(namespace) => namespace,
+            Err(error) => return PluginStoreBatchResult::failure(error, None, None),
+        };
+        let records = match self.read_records(&namespace) {
             Ok(records) => records,
             Err(error) => return PluginStoreBatchResult::failure(error, None, None),
         };
@@ -1111,89 +1099,39 @@ impl LocalPluginStoreBackend {
                 Ok(candidate) => candidate,
                 Err(failure) => return failure,
             };
-        let mutated_keys = mutations
-            .iter()
-            .map(|mutation| mutation.key().clone())
-            .collect::<BTreeSet<_>>();
-        if let Err(error) = self.commit_records(plugin_key, &candidate, &mutated_keys) {
-            return match self.recover_transaction(plugin_key) {
-                Ok(()) => PluginStoreBatchResult::failure(error, None, None),
-                Err(recovery_error) => PluginStoreBatchResult::failure(recovery_error, None, None),
+        let mut ops = Vec::with_capacity(mutations.len());
+        for mutation in &mutations {
+            let key = mutation.key();
+            let op = match candidate.get(key) {
+                Some(record) => match Self::encode_record(record) {
+                    Ok(value) => StoreOp::Put {
+                        key: key.0.as_bytes().to_vec(),
+                        value,
+                    },
+                    Err(error) => return PluginStoreBatchResult::failure(error, None, None),
+                },
+                None => StoreOp::Delete {
+                    key: key.0.as_bytes().to_vec(),
+                },
             };
+            ops.push(op);
         }
-        PluginStoreBatchResult::success(results)
-    }
-
-    fn commit_records(
-        &self,
-        plugin_key: &PluginKey,
-        records: &BTreeMap<PluginStoreKey, PluginStoreRecord>,
-        mutated_keys: &BTreeSet<PluginStoreKey>,
-    ) -> Result<(), CapabilityRuntimeError> {
-        fs::create_dir_all(&self.root).map_err(backend_error)?;
-        let namespace = self.namespace_dir(plugin_key);
-        let (staging, backup) = self.transaction_paths(plugin_key);
-        remove_dir_if_exists(&staging)?;
-        remove_dir_if_exists(&backup)?;
-        fs::create_dir(&staging).map_err(backend_error)?;
-        #[cfg(test)]
-        let mut staged_record_count = 0;
-        for (key, record) in records {
-            if namespace.exists() && !mutated_keys.contains(key) {
-                let destination = staging.join(format!("{}.json", encode_key(&key.0)));
-                #[cfg(test)]
-                let linked = self
-                    .run_batch_test_hook(BatchCommitPoint::UnchangedRecordLinkAttempt)
-                    .and_then(|()| {
-                        fs::hard_link(self.record_path(plugin_key, key), &destination)
-                            .map_err(backend_error)
-                    });
-                #[cfg(not(test))]
-                let linked = fs::hard_link(self.record_path(plugin_key, key), &destination)
-                    .map_err(backend_error);
-                if linked.is_err() {
-                    self.write_record_to(&staging, record)?;
-                }
-            } else {
-                self.write_record_to(&staging, record)?;
-            }
-            #[cfg(test)]
-            {
-                staged_record_count += 1;
-                self.run_batch_test_hook(BatchCommitPoint::RecordStaged(staged_record_count))?;
-            }
+        match self.store.batch(&namespace, &ops) {
+            Ok(()) => PluginStoreBatchResult::success(results),
+            Err(error) => PluginStoreBatchResult::failure(store_error(error), None, None),
         }
-        sync_directory(&staging)?;
-
-        let had_namespace = namespace.exists();
-        if had_namespace {
-            fs::rename(&namespace, &backup).map_err(backend_error)?;
-            sync_directory(&self.root)?;
-            #[cfg(test)]
-            self.run_batch_test_hook(BatchCommitPoint::NamespaceBackedUp)?;
-        }
-        if let Err(error) = fs::rename(&staging, &namespace).map_err(backend_error) {
-            if had_namespace {
-                let _ = fs::rename(&backup, &namespace);
-                let _ = sync_directory(&self.root);
-            }
-            return Err(error);
-        }
-        sync_directory(&self.root)?;
-        remove_dir_if_exists(&backup)?;
-        sync_directory(&self.root)
     }
 }
 
-impl PluginStoreBackend for LocalPluginStoreBackend {
+impl PluginStoreBackend for KeyedPluginStore {
     fn get(
         &self,
         plugin_key: &PluginKey,
         key: &PluginStoreKey,
     ) -> Result<Option<PluginStoreRecord>, CapabilityRuntimeError> {
         let _guard = self.lock.lock().expect("plugin store lock poisoned");
-        self.recover_transaction(plugin_key)?;
-        Ok(self.read_records(plugin_key)?.get(key).cloned())
+        let namespace = Self::namespace(plugin_key)?;
+        self.read_record(&namespace, key)
     }
 
     fn set(
@@ -1206,8 +1144,8 @@ impl PluginStoreBackend for LocalPluginStoreBackend {
         limits: PluginStoreLimits,
     ) -> Result<PluginStoreRecord, CapabilityRuntimeError> {
         let _guard = self.lock.lock().expect("plugin store lock poisoned");
-        self.recover_transaction(plugin_key)?;
-        let records = self.read_records(plugin_key)?;
+        let namespace = Self::namespace(plugin_key)?;
+        let records = self.read_records(&namespace)?;
         let revision = revision_for_write(records.get(&key), expected_revision)?;
         enforce_plugin_store_limits(&records, &key, &payload, limits)?;
         let record = PluginStoreRecord {
@@ -1217,7 +1155,7 @@ impl PluginStoreBackend for LocalPluginStoreBackend {
             revision,
             payload,
         };
-        self.write_record(&record)?;
+        self.write_record(&namespace, &record)?;
         Ok(record)
     }
 
@@ -1227,18 +1165,21 @@ impl PluginStoreBackend for LocalPluginStoreBackend {
         key: &PluginStoreKey,
     ) -> Result<PluginStoreRecord, CapabilityRuntimeError> {
         let _guard = self.lock.lock().expect("plugin store lock poisoned");
-        self.recover_transaction(plugin_key)?;
-        let record = self
-            .read_records(plugin_key)?
-            .get(key)
-            .cloned()
-            .ok_or_else(|| {
-                CapabilityRuntimeError::new(
-                    CapabilityRuntimeErrorKind::StoreNotFound,
-                    "plugin-store record was not found",
-                )
-            })?;
-        fs::remove_file(self.record_path(plugin_key, key)).map_err(backend_error)?;
+        let namespace = Self::namespace(plugin_key)?;
+        let record = self.read_record(&namespace, key)?.ok_or_else(|| {
+            CapabilityRuntimeError::new(
+                CapabilityRuntimeErrorKind::StoreNotFound,
+                "plugin-store record was not found",
+            )
+        })?;
+        self.store
+            .batch(
+                &namespace,
+                &[StoreOp::Delete {
+                    key: key.0.as_bytes().to_vec(),
+                }],
+            )
+            .map_err(store_error)?;
         Ok(record)
     }
 
@@ -1248,9 +1189,9 @@ impl PluginStoreBackend for LocalPluginStoreBackend {
         prefix: Option<&str>,
     ) -> Result<Vec<PluginStoreEntry>, CapabilityRuntimeError> {
         let _guard = self.lock.lock().expect("plugin store lock poisoned");
-        self.recover_transaction(plugin_key)?;
+        let namespace = Self::namespace(plugin_key)?;
         Ok(self
-            .read_records(plugin_key)?
+            .read_records(&namespace)?
             .values()
             .filter(|record| {
                 prefix
@@ -1270,8 +1211,8 @@ impl PluginStoreBackend for LocalPluginStoreBackend {
         limits: PluginStoreLimits,
     ) -> Result<PluginStoreRecord, CapabilityRuntimeError> {
         let _guard = self.lock.lock().expect("plugin store lock poisoned");
-        self.recover_transaction(plugin_key)?;
-        let records = self.read_records(plugin_key)?;
+        let namespace = Self::namespace(plugin_key)?;
+        let records = self.read_records(&namespace)?;
         let current = records.get(key).cloned().ok_or_else(|| {
             CapabilityRuntimeError::new(
                 CapabilityRuntimeErrorKind::StoreNotFound,
@@ -1287,7 +1228,7 @@ impl PluginStoreBackend for LocalPluginStoreBackend {
             payload,
             ..current
         };
-        self.write_record(&record)?;
+        self.write_record(&namespace, &record)?;
         Ok(record)
     }
 }
@@ -1462,20 +1403,6 @@ fn enforce_plugin_store_snapshot_limits(
         ));
     }
     Ok(())
-}
-
-fn remove_dir_if_exists(path: &Path) -> Result<(), CapabilityRuntimeError> {
-    match fs::remove_dir_all(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(backend_error(error)),
-    }
-}
-
-fn sync_directory(path: &Path) -> Result<(), CapabilityRuntimeError> {
-    File::open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(backend_error)
 }
 
 fn execute_plugin_store(
@@ -1859,20 +1786,6 @@ fn sanitize_plugin_key(plugin_key: &PluginKey) -> String {
     } else {
         sanitized
     }
-}
-
-fn encode_key(key: &str) -> String {
-    key.as_bytes()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-fn backend_error(error: std::io::Error) -> CapabilityRuntimeError {
-    CapabilityRuntimeError::new(
-        CapabilityRuntimeErrorKind::BackendFailed,
-        format!("local capability backend failed: {error}"),
-    )
 }
 
 fn scoped_capability(surface: CapabilitySurface, scope: impl Into<String>) -> Capability {

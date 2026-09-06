@@ -211,7 +211,7 @@ impl ClientEventMailbox {
             wake: Notify::new(),
             wake_bit: AtomicBool::new(false),
             retired: AtomicBool::new(false),
-            event_max: test_client_event_queue_max().unwrap_or(policy.consumer_queue_max_events),
+            event_max: policy.consumer_queue_max_events,
             byte_max: policy.consumer_queue_max_bytes,
             queue_age: policy.queue_age,
             counters,
@@ -920,23 +920,6 @@ fn lock_plane(
             Err(EventPlaneStatus::ShedBusy)
         }
     }
-}
-
-fn test_client_event_queue_max() -> Option<usize> {
-    test_client_event_queue_max_from(
-        std::env::var("BOTSTER_ENV").ok().as_deref(),
-        std::env::var("BOTSTER_HUB_TEST_CLIENT_EVENT_QUEUE_MAX")
-            .ok()
-            .as_deref(),
-    )
-}
-
-fn test_client_event_queue_max_from(botster_env: Option<&str>, raw: Option<&str>) -> Option<usize> {
-    if botster_env != Some("test") {
-        return None;
-    }
-    raw.and_then(|value| value.parse().ok())
-        .filter(|max| *max > 0)
 }
 
 fn lock_mailbox(

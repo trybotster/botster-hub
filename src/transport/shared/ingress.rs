@@ -212,18 +212,36 @@ mod tests {
     use std::sync::Barrier;
     use std::thread;
 
+    /// One scheme 2 `RAW_BYTES` input frame, built from the Core header
+    /// constants and validated by the Core header check.
     fn input_frame(data: &[u8]) -> Vec<u8> {
-        let mut bytes = vec![1, 1, 0, 0];
+        use botster_terminal_protocol::{
+            INPUT_HEADER_BYTES, TERMINAL_INPUT_SCHEME_VERSION, TerminalInputKind,
+        };
         let len = u16::try_from(data.len()).expect("fixture body fits");
-        bytes[2..4].copy_from_slice(&len.to_be_bytes());
+        let mut bytes = Vec::with_capacity(INPUT_HEADER_BYTES + data.len());
+        bytes.push(TERMINAL_INPUT_SCHEME_VERSION);
+        bytes.push(TerminalInputKind::RawBytes.as_byte());
+        bytes.extend_from_slice(&len.to_be_bytes());
+        bytes.extend_from_slice(&1u64.to_be_bytes());
         bytes.extend_from_slice(data);
+        TerminalInputFrame::from_bytes(&bytes).expect("fixture frame has a valid header");
         bytes
     }
 
     #[test]
     fn malformed_header_is_rejected_without_buffering() {
         let buffer = IngressBuffer::new();
-        assert_eq!(buffer.push_complete(vec![0, 1, 0, 1, 1], || false), Err(()));
+        assert_eq!(
+            buffer.push_complete(vec![1, 1, 0, 1, 1], || false),
+            Err(()),
+            "scheme 1 headers are rejected"
+        );
+        assert_eq!(
+            buffer.push_complete(vec![2, 1, 0, 5, 0, 0, 0, 0, 0, 0, 0, 1, 1], || false),
+            Err(()),
+            "a body length mismatch is rejected"
+        );
         assert_eq!(buffer.try_read(false), TerminalIngress::Empty);
     }
 

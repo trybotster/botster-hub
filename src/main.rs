@@ -29,7 +29,6 @@ use botster_hub_client::{
 
 const SMOKE_MARKER: &str = "botster-hub-smoke-ok";
 const SMOKE_TIMEOUT: Duration = Duration::from_secs(5);
-const TEST_INCOMPATIBLE_DAEMON_ENV: &str = "BOTSTER_HUB_TEST_INCOMPATIBLE_DAEMON";
 
 mod local_runtime_process;
 mod local_webrtc_smoke;
@@ -363,14 +362,6 @@ fn command_usage(command: &str) -> &'static str {
 fn start_daemon(args: Vec<String>) -> Result<(), StartError> {
     let options = StartOptions::parse(args)?;
     let config = explicit_config_with_worker(options.data_directory, options.session_worker_bin)?;
-
-    // Integration tests run the production binary, so keep the incompatible
-    // daemon fixture behind both an explicit fixture opt-in and test mode.
-    if env::var_os(TEST_INCOMPATIBLE_DAEMON_ENV).is_some()
-        && env::var("BOTSTER_ENV").as_deref() == Ok("test")
-    {
-        return serve_test_incompatible_daemon(&config).map_err(StartError::Transport);
-    }
 
     // The lease is taken before the daemon binds anything and held for the
     // daemon's whole lifetime, so an installer can never switch generations
@@ -1035,38 +1026,6 @@ fn prepare_operator_console_runtime(
         daemon_ownership,
         packages,
     })
-}
-
-fn serve_test_incompatible_daemon(
-    config: &botster_hub::HubConfig,
-) -> Result<(), botster_hub::DaemonTransportError> {
-    let socket_path = config
-        .transports
-        .local_socket
-        .as_ref()
-        .map(|binding| binding.path.clone())
-        .ok_or(botster_hub::DaemonTransportError::MissingSocketBinding)?;
-    if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent).map_err(botster_hub::DaemonTransportError::Io)?;
-    }
-    let _ = std::fs::remove_file(&socket_path);
-    let listener =
-        UnixListener::bind(&socket_path).map_err(botster_hub::DaemonTransportError::Io)?;
-    loop {
-        let (mut stream, _) = listener
-            .accept()
-            .map_err(botster_hub::DaemonTransportError::Io)?;
-        let mut reader = BufReader::new(
-            stream
-                .try_clone()
-                .map_err(botster_hub::DaemonTransportError::Io)?,
-        );
-        let mut hello = String::new();
-        let _ = reader.read_line(&mut hello);
-        stream
-            .write_all(b"{\"protocol\":\"botster-hub-daemon-v1\"}\n")
-            .map_err(botster_hub::DaemonTransportError::Io)?;
-    }
 }
 
 struct RuntimeWebLaunch {
@@ -2415,13 +2374,15 @@ fn operator_inspect(args: Vec<String>) -> Result<(), OperatorError> {
     let runtime = daemon
         .runtime_mut()
         .ok_or(OperatorError::DaemonNotRunning)?;
-    let response = api.handle_request(
-        runtime,
-        &packages,
-        HubClientRequest::ListSessions {
-            request_id: request_id("cli-inspect-sessions"),
-        },
-    )?;
+    let response = api
+        .handle_request(
+            runtime,
+            &packages,
+            HubClientRequest::ListSessions {
+                request_id: request_id("cli-inspect-sessions"),
+            },
+        )
+        .wait(runtime)?;
     let HubClientResponseBody::Sessions(sessions) = response.body else {
         return Err(OperatorError::UnexpectedResponse("sessions"));
     };
@@ -2652,8 +2613,11 @@ fn print_daemon_response(response: DaemonResponse) -> Result<(), OperatorError> 
                 println!("alt_screen={}", mode_flags.alt_screen);
                 println!("focus_reporting={}", mode_flags.focus_reporting);
                 println!("application_cursor={}", mode_flags.application_cursor);
-                println!("mode_generation={}", mode_flags.mode_generation);
-                println!("mode_revision={}", mode_flags.mode_revision);
+                println!("rows={}", mode_flags.rows);
+                println!("cols={}", mode_flags.cols);
+                if let Some(reason) = mode_flags.unavailable {
+                    println!("unavailable={reason:?}");
+                }
             }
         }
         DaemonResponseKind::TerminalReservation => {
@@ -2671,10 +2635,15 @@ fn print_daemon_response(response: DaemonResponse) -> Result<(), OperatorError> 
             println!("response=capture_snapshot");
             if let Some(snapshot) = response.capture_snapshot {
                 println!("session_id={}", snapshot.session_id);
+                println!("capture_id={}", snapshot.capture_id);
                 println!("rows={}", snapshot.rows);
                 println!("cols={}", snapshot.cols);
-                println!("payload_format={:?}", snapshot.payload_format);
-                println!("payload_bytes={}", snapshot.payload_bytes);
+                println!("total_bytes={}", snapshot.total_bytes);
+                println!("page_bytes={}", snapshot.page_bytes);
+                println!("pages={}", snapshot.pages);
+                if let Some(reason) = snapshot.unavailable {
+                    println!("unavailable={reason:?}");
+                }
             }
         }
         DaemonResponseKind::SpawnTargets => {
@@ -4046,11 +4015,23 @@ fn run_one(args: Vec<String>) -> Result<(), RunOneError> {
     let session_id = request.session_id.clone();
     let mut logical_clock = 1;
 
-    let spawn = runtime.spawn_session(request, CoreSessionMetadata::new(), logical_clock)?;
+    let spawn = match runtime
+        .begin_spawn(request, CoreSessionMetadata::new())
+        .wait(&runtime, SMOKE_TIMEOUT)?
+    {
+        botster_core_daemon::CoreCompletion::Spawn { result, .. } => result?,
+        _ => return Err(RunOneError::TimedOut),
+    };
     logical_clock += 1;
 
     let observed = read_screen_until_marker(&mut runtime, &session_id, &mut logical_clock)?;
-    runtime.shutdown_session(session_id.clone(), logical_clock)?;
+    match runtime
+        .begin_shutdown_session(session_id.clone())
+        .wait(&runtime, SMOKE_TIMEOUT)?
+    {
+        botster_core_daemon::CoreCompletion::ShutdownSession { result, .. } => result?,
+        _ => return Err(RunOneError::TimedOut),
+    }
 
     println!(
         "{} first-party host profile booted for {} through CoreDaemon",
@@ -4073,22 +4054,19 @@ fn read_screen_until_marker(
     let marker = SMOKE_MARKER.as_bytes();
 
     while Instant::now() < deadline {
-        let _ = runtime.observe_lifecycle_slice(
-            *logical_clock,
-            None,
-            botster_core_daemon::ObserveLifecycleBudget {
-                max_sessions: 32,
-                max_encoded_result_bytes: 64 * 1024,
-                max_elapsed: Duration::from_millis(25),
-            },
-        );
-        let output = runtime.read_screen(
-            RequestId(format!("botster-hub-smoke-read-{}", *logical_clock)),
-            session_id.clone(),
-            *logical_clock,
-        )?;
+        let screen = match runtime
+            .begin_read_screen(
+                RequestId(format!("botster-hub-smoke-read-{}", *logical_clock)),
+                session_id.clone(),
+                *logical_clock,
+            )
+            .wait(runtime, SMOKE_TIMEOUT)?
+        {
+            botster_core_daemon::CoreCompletion::ReadScreen { result, .. } => result?,
+            _ => return Err(RunOneError::TimedOut),
+        };
         *logical_clock += 1;
-        let observed = output.screen.text.into_bytes();
+        let observed = screen.text.as_bytes().to_vec();
         if observed
             .windows(marker.len())
             .any(|window| window == marker)

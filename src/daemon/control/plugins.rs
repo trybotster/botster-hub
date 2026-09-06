@@ -28,13 +28,15 @@ fn plugin_lifecycle_response(daemon: &mut HubDaemon) -> DaemonTransportResult<Da
     let Some(runtime) = daemon.runtime_mut() else {
         return Err(DaemonTransportError::DaemonNotRunning);
     };
-    let response = api.handle_request(
-        runtime,
-        &packages,
-        HubClientRequest::PluginLifecycleStatus {
-            request_id: request_id("daemon-plugin-lifecycle-status"),
-        },
-    )?;
+    let response = api
+        .handle_request(
+            runtime,
+            &packages,
+            HubClientRequest::PluginLifecycleStatus {
+                request_id: request_id("daemon-plugin-lifecycle-status"),
+            },
+        )
+        .ready()?;
     let HubClientResponseBody::PluginLifecycle(report) = response.body else {
         return Err(DaemonTransportError::UnexpectedResponse);
     };
@@ -43,13 +45,13 @@ fn plugin_lifecycle_response(daemon: &mut HubDaemon) -> DaemonTransportResult<Da
 
 pub(crate) fn handle_runtime(
     daemon: &mut HubDaemon,
-    observability: DaemonObservability<'_>,
+    observability: DaemonObservability,
     request: DaemonRequest,
 ) -> DaemonTransportResult<DaemonResponse> {
     let api = HubClientApi::local_operator(
         observability
             .client_id
-            .map(str::to_string)
+            .clone()
             .unwrap_or_else(|| super::runtime_client_id(&request)),
     );
     let packages = daemon.package_registry().clone();
@@ -72,16 +74,18 @@ pub(crate) fn handle_runtime(
             surface_id,
             payload,
         } => {
-            let response = api.handle_request(
-                runtime,
-                &packages,
-                HubClientRequest::PluginSurfaceRender {
-                    request_id: request_id("daemon-plugin-surface-render"),
-                    package_name,
-                    surface_id,
-                    payload,
-                },
-            )?;
+            let response = api
+                .handle_request(
+                    runtime,
+                    &packages,
+                    HubClientRequest::PluginSurfaceRender {
+                        request_id: request_id("daemon-plugin-surface-render"),
+                        package_name,
+                        surface_id,
+                        payload,
+                    },
+                )
+                .ready()?;
             let HubClientResponseBody::PluginSurface(surface) = response.body else {
                 return Err(DaemonTransportError::UnexpectedResponse);
             };
@@ -91,15 +95,17 @@ pub(crate) fn handle_runtime(
             package_name,
             request,
         } => {
-            let response = api.handle_request(
-                runtime,
-                &packages,
-                HubClientRequest::PluginSurfaceAction {
-                    request_id: request_id("daemon-plugin-surface-action"),
-                    package_name,
-                    action: request,
-                },
-            )?;
+            let response = api
+                .handle_request(
+                    runtime,
+                    &packages,
+                    HubClientRequest::PluginSurfaceAction {
+                        request_id: request_id("daemon-plugin-surface-action"),
+                        package_name,
+                        action: request,
+                    },
+                )
+                .ready()?;
             let HubClientResponseBody::PluginActionResult(result) = response.body else {
                 return Err(DaemonTransportError::UnexpectedResponse);
             };

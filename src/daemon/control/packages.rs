@@ -139,13 +139,15 @@ fn list_packages_response(daemon: &mut HubDaemon) -> DaemonTransportResult<Daemo
     let Some(runtime) = daemon.runtime_mut() else {
         return Err(DaemonTransportError::DaemonNotRunning);
     };
-    let response = api.handle_request(
-        runtime,
-        &packages,
-        HubClientRequest::ListPackages {
-            request_id: request_id("daemon-packages-list"),
-        },
-    )?;
+    let response = api
+        .handle_request(
+            runtime,
+            &packages,
+            HubClientRequest::ListPackages {
+                request_id: request_id("daemon-packages-list"),
+            },
+        )
+        .ready()?;
     let HubClientResponseBody::Packages(mut packages) = response.body else {
         return Err(DaemonTransportError::UnexpectedResponse);
     };
@@ -162,13 +164,15 @@ fn list_package_navigation_response(
     let Some(runtime) = daemon.runtime_mut() else {
         return Err(DaemonTransportError::DaemonNotRunning);
     };
-    let response = api.handle_request(
-        runtime,
-        &packages,
-        HubClientRequest::ListPackageNavigation {
-            request_id: request_id("daemon-package-navigation-list"),
-        },
-    )?;
+    let response = api
+        .handle_request(
+            runtime,
+            &packages,
+            HubClientRequest::ListPackageNavigation {
+                request_id: request_id("daemon-package-navigation-list"),
+            },
+        )
+        .ready()?;
     let HubClientResponseBody::PackageNavigation(navigation) = response.body else {
         return Err(DaemonTransportError::UnexpectedResponse);
     };

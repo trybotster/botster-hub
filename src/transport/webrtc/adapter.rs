@@ -1,7 +1,8 @@
 //! Production WebRTC terminal adapter and Core harness driver.
 //!
-//! The adapter owns one in-flight write slot. `try_write` serializes an opaque
-//! [`TerminalFrame`] and does not inspect snapshot phases or snapshot bodies.
+//! The adapter owns one in-flight write slot. `try_write` holds one routed
+//! opaque [`RoutedTerminalFrame`] by shared reference and does not inspect
+//! snapshot phases or snapshot bodies.
 //! `close` and `Drop` return without waiting on DataChannel I/O or a writer lock.
 
 use std::collections::BTreeMap;
@@ -14,7 +15,7 @@ use botster_core::contract::terminal_adapter::{
 };
 use botster_core::contract::terminal_wake::{TerminalWakeSink, WakingTerminalAdapter};
 use botster_hub_client::DaemonEvent;
-use botster_terminal_protocol::TerminalFrame;
+use botster_terminal_protocol::RoutedTerminalFrame;
 
 use crate::data_plane::CloseWorkSource;
 use crate::subscription::closed_events::{
@@ -47,7 +48,6 @@ struct WebRtcTerminalAdapterInner {
     aggregate: Option<Arc<crate::admission::connection_budget::ConnectionAggregate>>,
     aggregate_permit: Mutex<Option<crate::admission::connection_budget::AggregateSendPermit>>,
     aggregate_blocked: AtomicBool,
-    test_forced_would_block: AtomicBool,
 }
 
 impl WebRtcTerminalAdapterInner {
@@ -60,7 +60,6 @@ impl WebRtcTerminalAdapterInner {
             aggregate: None,
             aggregate_permit: Mutex::new(None),
             aggregate_blocked: AtomicBool::new(false),
-            test_forced_would_block: AtomicBool::new(false),
         }
     }
 
@@ -91,9 +90,6 @@ impl WebRtcTerminalAdapterInner {
         if self.is_closed() {
             return TerminalAdapterPressure::Closed;
         }
-        if self.test_forced_would_block.load(Ordering::Acquire) {
-            return TerminalAdapterPressure::WouldBlock;
-        }
         self.refresh_aggregate_pressure();
         if self.aggregate_blocked.load(Ordering::Acquire) {
             return TerminalAdapterPressure::WouldBlock;
@@ -101,19 +97,12 @@ impl WebRtcTerminalAdapterInner {
         self.slot.pressure()
     }
 
-    fn try_write(&self, frame: &TerminalFrame) -> Result<(), TerminalAdapterWriteError> {
+    fn try_write(&self, frame: &RoutedTerminalFrame) -> Result<(), TerminalAdapterWriteError> {
         if self.is_closed() {
             return Err(TerminalAdapterWriteError::Closed);
         }
-        if self.test_forced_would_block.load(Ordering::Acquire) {
-            return Err(TerminalAdapterWriteError::WouldBlock);
-        }
         let permit = if let Some(aggregate) = self.aggregate.as_ref() {
-            let frame_len = frame
-                .to_bytes()
-                .map_err(|_| TerminalAdapterWriteError::Closed)?
-                .len();
-            let Some(permit) = aggregate.try_authorize(frame_len) else {
+            let Some(permit) = aggregate.try_authorize(frame.frame.len()) else {
                 self.aggregate_blocked.store(true, Ordering::Release);
                 return Err(TerminalAdapterWriteError::WouldBlock);
             };
@@ -169,11 +158,11 @@ impl WebRtcTerminalAdapterInner {
         self.slot.try_read()
     }
 
-    fn snapshot_active(&self) -> Option<Vec<u8>> {
+    fn snapshot_active(&self) -> Option<RoutedTerminalFrame> {
         self.slot.snapshot_active()
     }
 
-    fn complete_active(&self) -> Option<Vec<u8>> {
+    fn complete_active(&self) -> Option<RoutedTerminalFrame> {
         let mut permit = self
             .aggregate_permit
             .lock()
@@ -274,7 +263,6 @@ impl WebRtcTerminalAdapter {
             aggregate,
             aggregate_permit: Mutex::new(None),
             aggregate_blocked: AtomicBool::new(false),
-            test_forced_would_block: AtomicBool::new(false),
         });
         (
             Self {
@@ -308,7 +296,7 @@ impl Drop for WebRtcTerminalAdapter {
 }
 
 impl TerminalAdapter for WebRtcTerminalAdapter {
-    fn try_write(&mut self, frame: &TerminalFrame) -> Result<(), TerminalAdapterWriteError> {
+    fn try_write(&mut self, frame: &RoutedTerminalFrame) -> Result<(), TerminalAdapterWriteError> {
         self.inner.try_write(frame)
     }
 
@@ -431,14 +419,6 @@ impl WebRtcConnectionMux {
         generation: u64,
         handle: WebRtcTerminalAdapterHandle,
     ) {
-        if forced_would_block(&session_id) {
-            handle
-                .inner
-                .test_forced_would_block
-                .store(true, Ordering::Release);
-            record_forced_pressure("would_block");
-        }
-
         if let Ok(mut routes) = self.inner.routes.lock() {
             let key = (session_id.clone(), subscription_id.clone(), generation);
             routes.insert(
@@ -654,7 +634,12 @@ impl WebRtcConnectionMux {
     #[allow(dead_code)]
     pub(crate) fn snapshot_writes(
         &self,
-    ) -> Vec<(String, String, WebRtcTerminalAdapterHandle, Vec<u8>)> {
+    ) -> Vec<(
+        String,
+        String,
+        WebRtcTerminalAdapterHandle,
+        RoutedTerminalFrame,
+    )> {
         let Ok(routes) = self.inner.routes.lock() else {
             return Vec::new();
         };
@@ -664,12 +649,12 @@ impl WebRtcConnectionMux {
                 if route.handle.is_closed() {
                     return None;
                 }
-                route.handle.snapshot_active().map(|bytes| {
+                route.handle.snapshot_active().map(|frame| {
                     (
                         route.session_id.clone(),
                         route.subscription_id.clone(),
                         route.handle.clone(),
-                        bytes,
+                        frame,
                     )
                 })
             })
@@ -707,11 +692,11 @@ impl WebRtcTerminalAdapterHandle {
         self.inner.set_would_block(pressured);
     }
 
-    pub(crate) fn snapshot_active(&self) -> Option<Vec<u8>> {
+    pub(crate) fn snapshot_active(&self) -> Option<RoutedTerminalFrame> {
         self.inner.snapshot_active()
     }
 
-    pub(crate) fn complete_active(&self) -> Option<Vec<u8>> {
+    pub(crate) fn complete_active(&self) -> Option<RoutedTerminalFrame> {
         self.inner.complete_active()
     }
 
@@ -723,7 +708,7 @@ impl WebRtcTerminalAdapterHandle {
         self.inner.transfer_aggregate_permit(frame_len, usage)
     }
 
-    pub(crate) fn write_opaque_frame(&self, frame: &TerminalFrame) {
+    pub(crate) fn write_opaque_frame(&self, frame: &RoutedTerminalFrame) {
         let _ = self.inner.try_write(frame);
     }
 
@@ -743,23 +728,6 @@ impl ClosedHandle for WebRtcTerminalAdapterHandle {
 
     fn host_closed(&self) -> bool {
         WebRtcTerminalAdapterHandle::host_closed(self)
-    }
-}
-
-fn forced_would_block(session_id: &str) -> bool {
-    std::env::var("BOTSTER_ENV").as_deref() == Ok("test")
-        && std::env::var("BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_SESSION").as_deref()
-            == Ok(session_id)
-}
-
-fn record_forced_pressure(name: &str) {
-    if std::env::var("BOTSTER_ENV").as_deref() != Ok("test") {
-        return;
-    }
-    if let Ok(directory) = std::env::var("BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_OBSERVATION")
-        && !directory.is_empty()
-    {
-        let _ = std::fs::write(std::path::Path::new(&directory).join(name), name);
     }
 }
 
